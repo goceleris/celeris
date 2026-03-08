@@ -20,7 +20,7 @@ jobs:
           go-version: "1.26"
       - uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.1
+          version: v2.9
 
   test:
     name: Test
