@@ -40,33 +40,31 @@ func readKernelVersionLinux() (string, error) {
 
 func probeIOUringLinux() (uint32, []uint8, error) {
 	params := &ioUringParams{
-		sq_entries: 1,
-		flags:      0,
+		sqEntries: 1,
+		flags:     0,
 	}
 	fd, err := ioUringSetup(1, params)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 
-	features := params.features
-
-	ops, _ := ioUringProbeOps(fd)
-
-	return features, ops, nil
+	return params.features, nil, nil
 }
 
+// ioUringParams mirrors the kernel io_uring_params struct layout.
+// Field order and sizes must match exactly for the syscall interface.
 type ioUringParams struct {
-	sq_entries     uint32
-	cq_entries     uint32
-	flags          uint32
-	sq_thread_cpu  uint32
-	sq_thread_idle uint32
-	features       uint32
-	wq_fd          uint32
-	resv           [3]uint32
-	sq_off         [10]uint32
-	cq_off         [10]uint32
+	sqEntries    uint32
+	cqEntries    uint32
+	flags        uint32
+	sqThreadCPU  uint32
+	sqThreadIdle uint32
+	features     uint32
+	wqFD         uint32
+	resv         [3]uint32
+	sqOff        [10]uint32
+	cqOff        [10]uint32
 }
 
 func ioUringSetup(entries uint32, params *ioUringParams) (int, error) {
@@ -77,22 +75,12 @@ func ioUringSetup(entries uint32, params *ioUringParams) (int, error) {
 	return int(fd), nil
 }
 
-func ioUringProbeOps(fd int) ([]uint8, error) {
-	const probeSize = 256 + 8
-	buf := make([]byte, probeSize*8)
-	_, _, errno := unix.Syscall6(unix.SYS_IO_URING_REGISTER, uintptr(fd), 8, uintptr(unsafe.Pointer(&buf[0])), 256, 0, 0)
-	if errno != 0 {
-		return nil, errno
-	}
-	return nil, nil
-}
-
 func probeEpollLinux() bool {
 	fd, err := unix.EpollCreate1(0)
 	if err != nil {
 		return false
 	}
-	unix.Close(fd)
+	_ = unix.Close(fd)
 	return true
 }
 
