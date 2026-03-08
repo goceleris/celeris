@@ -93,27 +93,41 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 	e.tier = tier
 
-	e.mu.Lock()
-	var workers []*Worker
 	workers, err := e.createWorkers(tier, cpus, objective, resolved)
 	if err != nil {
-		e.mu.Unlock()
 		return fmt.Errorf("worker init: %w", err)
 	}
-	e.workers = workers
-	if len(e.workers) > 0 {
-		e.addr = boundAddr(e.workers[0].listenFD)
-	}
-	e.mu.Unlock()
+
+	// Inner context allows canceling workers if any fail during init.
+	innerCtx, innerCancel := context.WithCancel(ctx)
+	defer innerCancel()
 
 	var wg sync.WaitGroup
-	for _, w := range e.workers {
+	for _, w := range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.run(ctx)
+			w.run(innerCtx)
 		}()
 	}
+
+	// Wait for all workers to finish ring initialization (done inside run()
+	// after LockOSThread, required by SINGLE_ISSUER).
+	for _, w := range workers {
+		if initErr := <-w.ready; initErr != nil {
+			// A worker failed to create its ring. Cancel all workers.
+			innerCancel()
+			wg.Wait()
+			return initErr
+		}
+	}
+
+	e.mu.Lock()
+	e.workers = workers
+	if len(workers) > 0 {
+		e.addr = boundAddr(workers[0].listenFD)
+	}
+	e.mu.Unlock()
 
 	e.cfg.Logger.Info("io_uring engine listening", "addr", e.cfg.Addr, "tier", tier.Tier().String(), "workers", resolved.Workers)
 

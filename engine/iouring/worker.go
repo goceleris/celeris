@@ -37,6 +37,7 @@ type Worker struct {
 	bufGroup  *BufferGroup
 	logger    *slog.Logger
 	cfg       resource.Config
+	ready     chan error
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -68,6 +69,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		reqCount:    reqCount,
 		activeConns: activeConns,
 		errCount:    errCount,
+		ready: make(chan error, 1),
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
@@ -88,7 +90,7 @@ func (w *Worker) run(ctx context.Context) {
 	// operations from the same OS thread.
 	ring, err := NewRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags())
 	if err != nil {
-		w.logger.Error("ring setup failed", "worker", w.id, "err", err)
+		w.ready <- fmt.Errorf("worker %d ring setup: %w", w.id, err)
 		return
 	}
 	w.ring = ring
@@ -104,9 +106,11 @@ func (w *Worker) run(ctx context.Context) {
 
 	w.tier.PrepareAccept(w.ring, w.listenFD)
 	if _, err := w.ring.Submit(); err != nil {
-		w.logger.Error("initial submit failed", "worker", w.id, "err", err)
+		w.ready <- fmt.Errorf("worker %d initial submit: %w", w.id, err)
 		return
 	}
+
+	w.ready <- nil
 
 	for {
 		if ctx.Err() != nil {

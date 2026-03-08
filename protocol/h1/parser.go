@@ -52,7 +52,7 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 	remaining := p.buf[p.pos:]
 	// Quick check: if remaining starts with \r\n, headers are empty (no headers).
 	// Otherwise use SIMD-accelerated findHeaderEnd to verify \r\n\r\n is present.
-	if !(len(remaining) >= 2 && remaining[0] == '\r' && remaining[1] == '\n') {
+	if len(remaining) < 2 || remaining[0] != '\r' || remaining[1] != '\n' {
 		if findHeaderEnd(remaining) < 0 {
 			return 0, nil
 		}
