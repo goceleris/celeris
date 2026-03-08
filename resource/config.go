@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/overload"
 )
 
 // Config holds server configuration including protocol, engine, address, and resource settings.
@@ -25,6 +26,7 @@ type Config struct {
 	WriteTimeout         time.Duration
 	IdleTimeout          time.Duration
 	DisableKeepAlive     bool
+	Overload             overload.Config
 	Logger               *slog.Logger
 }
 
@@ -82,6 +84,9 @@ func (c Config) Validate() []error {
 		if c.Engine == engine.IOUring || c.Engine == engine.Epoll {
 			errs = append(errs, fmt.Errorf("engine %s requires Linux", c.Engine))
 		}
+		if c.Engine == engine.Adaptive {
+			errs = append(errs, fmt.Errorf("engine adaptive requires Linux"))
+		}
 	}
 
 	return errs
@@ -115,6 +120,9 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 600 * time.Second
+	}
+	if c.Overload == (overload.Config{}) {
+		c.Overload = overload.DefaultConfig()
 	}
 	return c
 }
