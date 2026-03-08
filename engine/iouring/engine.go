@@ -20,14 +20,15 @@ import (
 
 // Engine implements the io_uring-based I/O engine.
 type Engine struct {
-	workers []*Worker
-	tier    TierStrategy
-	profile engine.CapabilityProfile
-	cfg     resource.Config
-	handler stream.Handler
-	addr    net.Addr
-	mu      sync.Mutex
-	metrics struct {
+	workers      []*Worker
+	tier         TierStrategy
+	profile      engine.CapabilityProfile
+	cfg          resource.Config
+	handler      stream.Handler
+	addr         net.Addr
+	mu           sync.Mutex
+	acceptPaused atomic.Bool
+	metrics      struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		errCount    atomic.Uint64
@@ -144,7 +145,8 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 	for i := range workers {
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			objective, resolved, e.cfg,
-			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount)
+			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
+			&e.acceptPaused)
 		if err != nil {
 			// Clean up already-created workers.
 			for _, prev := range workers[:i] {
@@ -191,6 +193,18 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 // Type returns the engine type.
 func (e *Engine) Type() engine.EngineType {
 	return engine.IOUring
+}
+
+// PauseAccept stops accepting new connections while keeping existing ones alive.
+func (e *Engine) PauseAccept() error {
+	e.acceptPaused.Store(true)
+	return nil
+}
+
+// ResumeAccept starts accepting new connections again.
+func (e *Engine) ResumeAccept() error {
+	e.acceptPaused.Store(false)
+	return nil
 }
 
 // Addr returns the bound listener address.

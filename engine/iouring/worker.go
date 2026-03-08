@@ -24,20 +24,21 @@ import (
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
-	id        int
-	cpuID     int
-	ring      *Ring
-	listenFD  int
-	tier      TierStrategy
-	conns     map[int]*connState
-	handler   stream.Handler
-	objective resource.ObjectiveParams
-	resolved  resource.ResolvedResources
-	sockOpts  sockopts.Options
-	bufGroup  *BufferGroup
-	logger    *slog.Logger
-	cfg       resource.Config
-	ready     chan error
+	id           int
+	cpuID        int
+	ring         *Ring
+	listenFD     int
+	tier         TierStrategy
+	conns        map[int]*connState
+	handler      stream.Handler
+	objective    resource.ObjectiveParams
+	resolved     resource.ResolvedResources
+	sockOpts     sockopts.Options
+	bufGroup     *BufferGroup
+	logger       *slog.Logger
+	cfg          resource.Config
+	ready        chan error
+	acceptPaused *atomic.Bool
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -46,7 +47,8 @@ type Worker struct {
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
-	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64) (*Worker, error) {
+	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
+	acceptPaused *atomic.Bool) (*Worker, error) {
 
 	// Only create the listen socket here. Ring creation is deferred to run()
 	// because SINGLE_ISSUER requires all ring operations from the creating thread.
@@ -56,20 +58,21 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	}
 
 	return &Worker{
-		id:          id,
-		cpuID:       cpuID,
-		listenFD:    listenFD,
-		tier:        tier,
-		conns:       make(map[int]*connState),
-		handler:     handler,
-		objective:   objective,
-		resolved:    resolved,
-		cfg:         cfg,
-		logger:      cfg.Logger,
-		reqCount:    reqCount,
-		activeConns: activeConns,
-		errCount:    errCount,
-		ready:       make(chan error, 1),
+		id:           id,
+		cpuID:        cpuID,
+		listenFD:     listenFD,
+		tier:         tier,
+		conns:        make(map[int]*connState),
+		handler:      handler,
+		objective:    objective,
+		resolved:     resolved,
+		cfg:          cfg,
+		logger:       cfg.Logger,
+		reqCount:     reqCount,
+		activeConns:  activeConns,
+		errCount:     errCount,
+		acceptPaused: acceptPaused,
+		ready:        make(chan error, 1),
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
@@ -174,6 +177,15 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, listenFD 
 	}
 
 	newFD := int(c.Res)
+
+	if w.acceptPaused.Load() {
+		_ = unix.Close(newFD)
+		if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() {
+			w.tier.PrepareAccept(w.ring, listenFD)
+		}
+		return
+	}
+
 	_ = sockopts.ApplyFD(newFD, w.sockOpts)
 
 	cs := newConnState(ctx, newFD, w.resolved.BufferSize)

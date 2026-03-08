@@ -13,6 +13,18 @@ type Engine interface {
 	Type() EngineType
 }
 
+// AcceptController is implemented by engines that support dynamic accept control.
+type AcceptController interface {
+	PauseAccept() error
+	ResumeAccept() error
+}
+
+// SwitchFreezer is implemented by the adaptive engine.
+type SwitchFreezer interface {
+	FreezeSwitching()
+	UnfreezeSwitching()
+}
+
 // EngineMetrics is a snapshot of engine performance counters.
 // Each engine implementation maintains internal atomic counters and
 // populates a snapshot on Metrics() calls.
