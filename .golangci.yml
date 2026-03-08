@@ -1,0 +1,38 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - revive
+    - gosimple
+    - ineffassign
+    - unused
+    - misspell
+    - gofmt
+    - goimports
+    - unconvert
+    - unparam
+    - prealloc
+    - nolintlint
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/goceleris/celeris
+  nolintlint:
+    require-explanation: true
+    require-specific: true
+  prealloc:
+    simple: true
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - unparam
+    - path: _test\.go
+      linters:
+        - revive
+      text: "dot-imports"
