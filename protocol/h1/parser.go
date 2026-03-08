@@ -49,6 +49,10 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 		return 0, nil
 	}
 
+	if findHeaderEnd(p.buf[p.pos:]) < 0 {
+		return 0, nil
+	}
+
 	if p.noStringHeaders {
 		req.Headers = req.Headers[:0]
 	} else {
@@ -160,6 +164,10 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 		case "host":
 			req.Host = value
 		case "content-length":
+			if req.ChunkedEncoding {
+				// RFC 7230 §3.3.3: if Transfer-Encoding is present, Content-Length is ignored
+				return nil
+			}
 			cl, ok := parseInt64Bytes(rawValue)
 			if !ok {
 				return ErrInvalidContentLength
@@ -184,6 +192,10 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 		return nil
 	}
 	if asciiEqualFold(rawName, "Content-Length") {
+		if req.ChunkedEncoding {
+			// RFC 7230 §3.3.3: if Transfer-Encoding is present, Content-Length is ignored
+			return nil
+		}
 		if cl, ok := parseInt64Bytes(rawValue); ok {
 			req.ContentLength = cl
 		} else {

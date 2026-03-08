@@ -199,20 +199,20 @@ func TestWithDefaults(t *testing.T) {
 	if d.MaxConcurrentStreams != 100 {
 		t.Errorf("MaxConcurrentStreams = %d, want 100", d.MaxConcurrentStreams)
 	}
-	if d.MaxHeaderBytes != 1<<20 {
-		t.Errorf("MaxHeaderBytes = %d, want %d", d.MaxHeaderBytes, 1<<20)
+	if d.MaxHeaderBytes != 16<<20 {
+		t.Errorf("MaxHeaderBytes = %d, want %d", d.MaxHeaderBytes, 16<<20)
 	}
 	if d.Logger == nil {
 		t.Error("Logger should not be nil after WithDefaults")
 	}
-	if d.ReadTimeout != 30*time.Second {
-		t.Errorf("ReadTimeout = %v, want 30s", d.ReadTimeout)
+	if d.ReadTimeout != 300*time.Second {
+		t.Errorf("ReadTimeout = %v, want 5m0s", d.ReadTimeout)
 	}
-	if d.WriteTimeout != 30*time.Second {
-		t.Errorf("WriteTimeout = %v, want 30s", d.WriteTimeout)
+	if d.WriteTimeout != 300*time.Second {
+		t.Errorf("WriteTimeout = %v, want 5m0s", d.WriteTimeout)
 	}
-	if d.IdleTimeout != 120*time.Second {
-		t.Errorf("IdleTimeout = %v, want 120s", d.IdleTimeout)
+	if d.IdleTimeout != 600*time.Second {
+		t.Errorf("IdleTimeout = %v, want 10m0s", d.IdleTimeout)
 	}
 }
 
@@ -231,6 +231,50 @@ func TestWithDefaultsPreservesExisting(t *testing.T) {
 	}
 	if d.ReadTimeout != 5*time.Second {
 		t.Errorf("ReadTimeout = %v, want 5s (should preserve)", d.ReadTimeout)
+	}
+}
+
+func TestValidateMaxHeaderBytesTooSmall(t *testing.T) {
+	c := Config{MaxHeaderBytes: 2048}
+	errs := c.Validate()
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "maxHeaderBytes") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected maxHeaderBytes validation error for value 2048")
+	}
+}
+
+func TestValidateMaxHeaderBytesAtMinimum(t *testing.T) {
+	c := Config{MaxHeaderBytes: 4096}
+	errs := c.Validate()
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "maxHeaderBytes") {
+			t.Error("maxHeaderBytes=4096 should not produce error")
+		}
+	}
+}
+
+func TestValidateMaxHeaderBytesZeroIsValid(t *testing.T) {
+	c := Config{MaxHeaderBytes: 0}
+	errs := c.Validate()
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "maxHeaderBytes") {
+			t.Error("maxHeaderBytes=0 means use default and should not produce error")
+		}
+	}
+}
+
+func TestValidateMaxConcurrentStreamsZeroIsValid(t *testing.T) {
+	c := Config{MaxConcurrentStreams: 0}
+	errs := c.Validate()
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "maxConcurrentStreams") {
+			t.Error("maxConcurrentStreams=0 means use default and should not produce error")
+		}
 	}
 }
 

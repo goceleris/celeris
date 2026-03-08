@@ -38,6 +38,9 @@ func NewHeaderEncoder() *HeaderEncoder {
 func (e *HeaderEncoder) Encode(headers [][2]string) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.buf == nil {
+		return nil, fmt.Errorf("encoder closed")
+	}
 	e.buf.Reset()
 	for _, h := range headers {
 		if err := e.encoder.WriteField(hpack.HeaderField{Name: h[0], Value: h[1]}); err != nil {
@@ -55,6 +58,9 @@ func (e *HeaderEncoder) Encode(headers [][2]string) ([]byte, error) {
 func (e *HeaderEncoder) EncodeBorrow(headers [][2]string) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.buf == nil {
+		return nil, fmt.Errorf("encoder closed")
+	}
 	e.buf.Reset()
 	for _, h := range headers {
 		if err := e.encoder.WriteField(hpack.HeaderField{Name: h[0], Value: h[1]}); err != nil {
@@ -72,7 +78,7 @@ func (e *HeaderEncoder) Close() {
 		e.buf.Reset()
 		headerBufPool.Put(e.buf)
 		e.buf = nil
-		e.encoder = hpack.NewEncoder(new(bytes.Buffer))
+		e.encoder = nil
 	}
 }
 

@@ -38,7 +38,7 @@ block_scan:
 	BGE  simd_next_from_r3
 	ADD  R0, R7, R6
 	MOVWU (R6), R10
-	MOVD $0x0A0D0A0D, R11
+	MOVD $0x0A0D0A0D, R11     // 0x0A0D0A0D = \r\n\r\n in little-endian byte order
 	CMP  R11, R10
 	BEQ  found_at_r7
 	ADD  $1, R7
@@ -68,7 +68,7 @@ scalar_loop:
 	BGE  not_found
 	ADD  R0, R3, R6
 	MOVWU (R6), R5
-	MOVD $0x0A0D0A0D, R7
+	MOVD $0x0A0D0A0D, R7      // 0x0A0D0A0D = \r\n\r\n in little-endian byte order
 	CMP  R7, R5
 	BEQ  scalar_found
 	ADD  $1, R3

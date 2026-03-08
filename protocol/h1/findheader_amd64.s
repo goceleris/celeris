@@ -34,7 +34,7 @@ check_bits:
 	CMPQ  R9, CX
 	JG    clear_and_continue
 	MOVL  (SI)(R8*1), R10
-	CMPL  R10, $0x0A0D0A0D
+	CMPL  R10, $0x0A0D0A0D    // 0x0A0D0A0D = \r\n\r\n in little-endian byte order
 	JE    found_at_r8
 	BTRL  BX, AX
 	TESTL AX, AX
@@ -64,7 +64,7 @@ scalar_loop:
 	CMPQ DI, DX
 	JGE  not_found
 	MOVL (SI)(DI*1), AX
-	CMPL AX, $0x0A0D0A0D
+	CMPL AX, $0x0A0D0A0D      // 0x0A0D0A0D = \r\n\r\n in little-endian byte order
 	JE   scalar_found
 	INCQ DI
 	JMP  scalar_loop

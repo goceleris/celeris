@@ -51,7 +51,7 @@ func NewStream(id uint32) *Stream {
 		Data:              getBuf(),
 		OutboundBuffer:    getBuf(),
 		WindowSize:        65535,
-		ReceivedWindowUpd: make(chan int32, 1),
+		ReceivedWindowUpd: make(chan int32, 16),
 		ctx:               ctx,
 		cancel:            cancel,
 		phase:             PhaseInit,

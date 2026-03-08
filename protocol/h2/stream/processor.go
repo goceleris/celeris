@@ -98,19 +98,13 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 		header := frame.Header()
 		if header.StreamID == expectingStreamID {
 			if _, isContinuation := frame.(*http2.ContinuationFrame); !isContinuation {
-				_ = p.SendGoAway(0, http2.ErrCodeProtocol, []byte("non-CONTINUATION on stream expecting CONTINUATION"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("received non-CONTINUATION frame on stream %d while expecting CONTINUATION", header.StreamID)
+				return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("non-CONTINUATION on stream expecting CONTINUATION"),
+					fmt.Errorf("received non-CONTINUATION frame on stream %d while expecting CONTINUATION", header.StreamID))
 			}
 		} else {
 			if _, isHeaders := frame.(*http2.HeadersFrame); isHeaders {
-				_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("HEADERS on another stream during header block"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("HEADERS on stream %d while header block is open on %d", header.StreamID, expectingStreamID)
+				return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("HEADERS on another stream during header block"),
+					fmt.Errorf("HEADERS on stream %d while header block is open on %d", header.StreamID, expectingStreamID))
 			}
 		}
 	}
@@ -124,25 +118,17 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 	case *http2.DataFrame:
 		if header.Length > maxFrameSize {
 			if header.StreamID == 0 {
-				_ = p.SendGoAway(0, http2.ErrCodeFrameSize, []byte("DATA frame too large"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize)
+				return p.goAwayErr(0, http2.ErrCodeFrameSize, []byte("DATA frame too large"),
+					fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize))
 			}
 			_ = p.writer.WriteRSTStream(header.StreamID, http2.ErrCodeFrameSize)
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
+			p.flush()
 			return fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize)
 		}
 	case *http2.HeadersFrame:
 		if header.Length > maxFrameSize {
-			_ = p.SendGoAway(0, http2.ErrCodeFrameSize, []byte("HEADERS frame too large"))
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
-			return fmt.Errorf("HEADERS frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize)
+			return p.goAwayErr(0, http2.ErrCodeFrameSize, []byte("HEADERS frame too large"),
+				fmt.Errorf("HEADERS frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize))
 		}
 	}
 
@@ -166,13 +152,8 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 	case *http2.ContinuationFrame:
 		return p.handleContinuation(ctx, f)
 	case *http2.PushPromiseFrame:
-		if err := p.SendGoAway(0, http2.ErrCodeProtocol, []byte("client sent PUSH_PROMISE")); err != nil {
-			return err
-		}
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("client sent PUSH_PROMISE frame")
+		return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("client sent PUSH_PROMISE"),
+			fmt.Errorf("client sent PUSH_PROMISE frame"))
 	default:
 		return nil
 	}
@@ -255,24 +236,15 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	})
 
 	if validationErr != nil {
-		if err := p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
-			[]byte(validationErr.Error())); err != nil {
-			return err
-		}
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return validationErr
+		return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+			[]byte(validationErr.Error()), validationErr)
 	}
 
 	if err := p.writer.WriteSettingsAck(); err != nil {
 		return err
 	}
 
-	if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-		return flusher.Flush()
-	}
-
+	p.flush()
 	return nil
 }
 
@@ -298,9 +270,7 @@ func (p *Processor) runHandler(stream *Stream) {
 				return
 			default:
 				_ = p.writer.WriteRSTStream(stream.ID, http2.ErrCodeInternal)
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
+				p.flush()
 			}
 		} else {
 			stream.mu.RLock()
@@ -325,9 +295,7 @@ func (p *Processor) runHandler(stream *Stream) {
 				}
 
 				_ = p.writer.WriteData(stream.ID, true, nil)
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
+				p.flush()
 				if state == StateHalfClosedRemote {
 					stream.SetState(StateClosed)
 				} else {
@@ -371,13 +339,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		}
 
 		if err := validateStreamID(f.StreamID, lastClientStream, false); err != nil {
-			if err2 := p.SendGoAway(lastClientStream, http2.ErrCodeProtocol, []byte(err.Error())); err2 != nil {
-				return err2
-			}
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
-			return err
+			return p.goAwayErr(lastClientStream, http2.ErrCodeProtocol, []byte(err.Error()), err)
 		}
 
 		p.manager.mu.Lock()
@@ -400,11 +362,8 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 
 		if existingStream.ReceivedInitialHeaders {
 			if !f.StreamEnded() {
-				_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("second HEADERS without END_STREAM"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("second HEADERS without END_STREAM on stream %d", f.StreamID)
+				return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("second HEADERS without END_STREAM"),
+					fmt.Errorf("second HEADERS without END_STREAM on stream %d", f.StreamID))
 			}
 			headerBlock := f.HeaderBlockFragment()
 			if !f.HeadersEnded() {
@@ -432,18 +391,12 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				trailers = append(trailers, [2]string{hf.Name, hf.Value})
 			})
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
-				_ = p.SendGoAway(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("failed to decode trailers: %w", err)
+				return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+					fmt.Errorf("failed to decode trailers: %w", err))
 			}
 			if err := p.hpackDecoder.Close(); err != nil {
-				_ = p.SendGoAway(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("failed to finalize trailers: %w", err)
+				return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+					fmt.Errorf("failed to finalize trailers: %w", err))
 			}
 			if err := validateTrailerHeaders(trailers); err != nil {
 				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
@@ -481,11 +434,8 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 
 	if dependency, weight, exclusive, hasPriority := ParsePriorityFromHeaders(f); hasPriority {
 		if dependency == f.StreamID {
-			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"))
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
-			return fmt.Errorf("stream %d depends on itself", f.StreamID)
+			return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"),
+				fmt.Errorf("stream %d depends on itself", f.StreamID))
 		}
 		p.manager.priorityTree.UpdateFromFrame(f.StreamID, dependency, weight, exclusive)
 	}
@@ -527,18 +477,12 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		headers = append(headers, [2]string{hf.Name, hf.Value})
 	})
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
-		_ = p.SendGoAway(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("failed to decode headers: %w", err)
+		return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to decode headers: %w", err))
 	}
 	if err := p.hpackDecoder.Close(); err != nil {
-		_ = p.SendGoAway(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("failed to finalize headers: %w", err)
+		return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 
 	if err := validateRequestHeaders(headers); err != nil {
@@ -569,19 +513,14 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
-		_ = p.SendGoAway(0, http2.ErrCodeProtocol, []byte("DATA on idle stream"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("DATA frame on idle stream %d", f.StreamID)
+		return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("DATA on idle stream"),
+			fmt.Errorf("DATA frame on idle stream %d", f.StreamID))
 	}
 
 	state := stream.GetState()
 	if state == StateClosed {
 		_ = p.writer.WriteRSTStream(f.StreamID, http2.ErrCodeStreamClosed)
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
+		p.flush()
 		return fmt.Errorf("DATA frame on closed stream %d", f.StreamID)
 	}
 
@@ -625,17 +564,11 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	if f.Increment == 0 {
 		if f.StreamID == 0 {
-			_ = p.SendGoAway(0, http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"))
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
-			return fmt.Errorf("WINDOW_UPDATE with 0 increment")
+			return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"),
+				fmt.Errorf("WINDOW_UPDATE with 0 increment"))
 		}
-		_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("WINDOW_UPDATE with 0 increment on stream"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("WINDOW_UPDATE with 0 increment on stream %d", f.StreamID)
+		return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("WINDOW_UPDATE with 0 increment on stream"),
+			fmt.Errorf("WINDOW_UPDATE with 0 increment on stream %d", f.StreamID))
 	}
 
 	if f.StreamID == 0 {
@@ -643,11 +576,8 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			oldWin := atomic.LoadInt32(&p.manager.connectionWindow)
 			newWin := int64(oldWin) + int64(f.Increment)
 			if newWin > 0x7fffffff {
-				_ = p.SendGoAway(0, http2.ErrCodeFlowControl, []byte("connection window overflow"))
-				if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-					_ = flusher.Flush()
-				}
-				return fmt.Errorf("connection window overflow: %d + %d > 2^31-1", oldWin, f.Increment)
+				return p.goAwayErr(0, http2.ErrCodeFlowControl, []byte("connection window overflow"),
+					fmt.Errorf("connection window overflow: %d + %d > 2^31-1", oldWin, f.Increment))
 			}
 			//nolint:gosec // G115: safe conversion, newWin validated above
 			if atomic.CompareAndSwapInt32(&p.manager.connectionWindow, oldWin, int32(newWin)) {
@@ -660,14 +590,9 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			if f.StreamID <= p.manager.GetLastClientStreamID() {
 				return nil
 			}
-			if err := p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
-				[]byte("WINDOW_UPDATE on idle stream")); err != nil {
-				return err
-			}
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
-			return fmt.Errorf("WINDOW_UPDATE on idle stream %d", f.StreamID)
+			return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+				[]byte("WINDOW_UPDATE on idle stream"),
+				fmt.Errorf("WINDOW_UPDATE on idle stream %d", f.StreamID))
 		}
 
 		if stream.GetState() == StateClosed {
@@ -679,9 +604,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		if newWindow > 0x7fffffff {
 			stream.mu.Unlock()
 			_ = p.writer.WriteRSTStream(f.StreamID, http2.ErrCodeFlowControl)
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
+			p.flush()
 			return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, stream.WindowSize, f.Increment)
 		}
 		//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
@@ -701,14 +624,9 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
-		if err := p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
-			[]byte("RST_STREAM on idle stream")); err != nil {
-			return err
-		}
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID)
+		return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+			[]byte("RST_STREAM on idle stream"),
+			fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID))
 	}
 
 	stream.SetState(StateClosed)
@@ -725,11 +643,8 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 // handlePriority processes PRIORITY frames.
 func (p *Processor) handlePriority(f *http2.PriorityFrame) error {
 	if f.StreamDep == f.StreamID {
-		_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("stream %d depends on itself", f.StreamID)
+		return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"),
+			fmt.Errorf("stream %d depends on itself", f.StreamID))
 	}
 
 	_, exists := p.manager.GetStream(f.StreamID)
@@ -771,20 +686,15 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 // handlePing processes PING frames.
 func (p *Processor) handlePing(f *http2.PingFrame) error {
 	if f.Header().StreamID != 0 {
-		_ = p.SendGoAway(0, http2.ErrCodeProtocol, []byte("PING on non-zero stream"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("PING frame with non-zero stream id: %d", f.Header().StreamID)
+		return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("PING on non-zero stream"),
+			fmt.Errorf("PING frame with non-zero stream id: %d", f.Header().StreamID))
 	}
 
 	if !f.IsAck() {
 		if err := p.writer.WritePing(true, f.Data); err != nil {
 			return err
 		}
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			return flusher.Flush()
-		}
+		p.flush()
 	}
 	return nil
 }
@@ -795,20 +705,14 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 	defer p.continuationStateMu.Unlock()
 
 	if p.continuationState == nil || !p.continuationState.expectingMore {
-		_ = p.SendGoAway(0, http2.ErrCodeProtocol, []byte("unexpected CONTINUATION"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("unexpected CONTINUATION frame on stream %d", f.StreamID)
+		return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("unexpected CONTINUATION"),
+			fmt.Errorf("unexpected CONTINUATION frame on stream %d", f.StreamID))
 	}
 
 	if p.continuationState.streamID != f.StreamID {
-		_ = p.SendGoAway(0, http2.ErrCodeProtocol, []byte("CONTINUATION on wrong stream"))
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
-		return fmt.Errorf("CONTINUATION frame on wrong stream: expected %d, got %d",
-			p.continuationState.streamID, f.StreamID)
+		return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("CONTINUATION on wrong stream"),
+			fmt.Errorf("CONTINUATION frame on wrong stream: expected %d, got %d",
+				p.continuationState.streamID, f.StreamID))
 	}
 
 	p.continuationState.headerBlock = append(
@@ -831,20 +735,14 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		})
 
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
-			_ = p.SendGoAway(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"))
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
 			p.continuationState = nil
-			return fmt.Errorf("failed to decode headers: %w", err)
+			return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+				fmt.Errorf("failed to decode headers: %w", err))
 		}
 		if err := p.hpackDecoder.Close(); err != nil {
-			_ = p.SendGoAway(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"))
-			if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-				_ = flusher.Flush()
-			}
 			p.continuationState = nil
-			return fmt.Errorf("failed to finalize headers: %w", err)
+			return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+				fmt.Errorf("failed to finalize headers: %w", err))
 		}
 
 		if p.continuationState.isTrailers {
@@ -913,6 +811,20 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 	return nil
 }
 
+// flush flushes the writer if it supports the Flush method.
+func (p *Processor) flush() {
+	if flusher, ok := p.writer.(interface{ Flush() error }); ok {
+		_ = flusher.Flush()
+	}
+}
+
+// goAwayErr sends a GOAWAY frame, flushes, and returns the given error.
+func (p *Processor) goAwayErr(lastStreamID uint32, code http2.ErrCode, debug []byte, err error) error {
+	_ = p.SendGoAway(lastStreamID, code, debug)
+	p.flush()
+	return err
+}
+
 // SendGoAway sends a GOAWAY frame.
 func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugData []byte) error {
 	if p.connWriter != nil {
@@ -921,9 +833,7 @@ func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugDat
 	if err := p.writer.WriteGoAway(lastStreamID, code, debugData); err != nil {
 		return err
 	}
-	if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-		return flusher.Flush()
-	}
+	p.flush()
 	return nil
 }
 
@@ -947,9 +857,7 @@ func (p *Processor) sendRSTStreamAndMarkClosed(streamID uint32, code http2.ErrCo
 		if err := p.writer.WriteRSTStream(streamID, code); err != nil {
 			return err
 		}
-		if flusher, ok := p.writer.(interface{ Flush() error }); ok {
-			_ = flusher.Flush()
-		}
+		p.flush()
 	}
 
 	if s, ok := p.manager.GetStream(streamID); ok {

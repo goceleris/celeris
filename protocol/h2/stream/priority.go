@@ -112,6 +112,9 @@ func (pt *PriorityTree) removeDependency(streamID, parentID uint32) {
 		for i, childID := range children {
 			if childID == streamID {
 				pt.dependencies[parentID] = append(children[:i], children[i+1:]...)
+				if len(pt.dependencies[parentID]) == 0 {
+					delete(pt.dependencies, parentID)
+				}
 				break
 			}
 		}

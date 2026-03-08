@@ -52,6 +52,14 @@ func (c Config) Validate() []error {
 		errs = append(errs, fmt.Errorf("initialWindowSize must be 0-2147483647, got %d", c.InitialWindowSize))
 	}
 
+	if c.MaxConcurrentStreams != 0 && c.MaxConcurrentStreams < 1 {
+		errs = append(errs, fmt.Errorf("maxConcurrentStreams must be >= 1 if set, got %d", c.MaxConcurrentStreams))
+	}
+
+	if c.MaxHeaderBytes != 0 && c.MaxHeaderBytes < 4096 {
+		errs = append(errs, fmt.Errorf("maxHeaderBytes must be >= 4096 if set, got %d", c.MaxHeaderBytes))
+	}
+
 	if c.Resources.Workers != 0 && c.Resources.Workers < MinWorkers {
 		errs = append(errs, fmt.Errorf("workers must be >= %d if set, got %d", MinWorkers, c.Resources.Workers))
 	}
@@ -94,19 +102,19 @@ func (c Config) WithDefaults() Config {
 		c.MaxConcurrentStreams = 100
 	}
 	if c.MaxHeaderBytes == 0 {
-		c.MaxHeaderBytes = 1 << 20
+		c.MaxHeaderBytes = 16 << 20
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
 	if c.ReadTimeout == 0 {
-		c.ReadTimeout = 30 * time.Second
+		c.ReadTimeout = 300 * time.Second
 	}
 	if c.WriteTimeout == 0 {
-		c.WriteTimeout = 30 * time.Second
+		c.WriteTimeout = 300 * time.Second
 	}
 	if c.IdleTimeout == 0 {
-		c.IdleTimeout = 120 * time.Second
+		c.IdleTimeout = 600 * time.Second
 	}
 	return c
 }

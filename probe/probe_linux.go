@@ -100,7 +100,7 @@ func readNUMANodesLinux() int {
 	}
 	count := 0
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "node") {
+		if strings.HasPrefix(e.Name(), "node") && e.IsDir() {
 			count++
 		}
 	}

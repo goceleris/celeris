@@ -81,11 +81,14 @@ func TestProbeWithHighTier(t *testing.T) {
 	if !profile.ProvidedBuffers {
 		t.Fatal("expected ProvidedBuffers")
 	}
-	if profile.CoopTaskrun {
-		t.Fatal("expected no CoopTaskrun")
+	if !profile.CoopTaskrun {
+		t.Fatal("expected CoopTaskrun")
 	}
 	if profile.SingleIssuer {
 		t.Fatal("expected no SingleIssuer")
+	}
+	if profile.SQPoll {
+		t.Fatal("expected no SQPoll")
 	}
 }
 
@@ -99,8 +102,11 @@ func TestProbeWithMidTier(t *testing.T) {
 	if profile.IOUringTier != engine.Mid {
 		t.Fatalf("expected Mid tier, got %s", profile.IOUringTier)
 	}
-	if !profile.ProvidedBuffers {
-		t.Fatal("expected ProvidedBuffers")
+	if !profile.CoopTaskrun {
+		t.Fatal("expected CoopTaskrun")
+	}
+	if profile.ProvidedBuffers {
+		t.Fatal("expected no ProvidedBuffers")
 	}
 	if profile.MultishotAccept {
 		t.Fatal("expected no MultishotAccept")
