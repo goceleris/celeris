@@ -278,6 +278,20 @@ func TestValidateMaxConcurrentStreamsZeroIsValid(t *testing.T) {
 	}
 }
 
+func TestValidateMaxConcurrentStreamsTooLarge(t *testing.T) {
+	c := Config{MaxConcurrentStreams: 0x80000000}
+	errs := c.Validate()
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "maxConcurrentStreams") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected maxConcurrentStreams validation error for value > 2147483647")
+	}
+}
+
 func TestValidateZeroPort(t *testing.T) {
 	c := Config{Addr: ":0"}
 	errs := c.Validate()

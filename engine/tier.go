@@ -8,9 +8,9 @@ type Tier uint8
 const (
 	None     Tier = iota // no io_uring support
 	Base                 // kernel 5.10+
-	Mid                  // kernel 5.13+ (provided buffers)
-	High                 // kernel 5.19+ (multishot accept/recv)
-	Optional             // kernel 6.0+ (coop taskrun, single issuer)
+	Mid                  // kernel 5.13+ (COOP_TASKRUN)
+	High                 // kernel 5.19+ (multishot accept/recv, provided buffers)
+	Optional             // kernel 6.0+ (SINGLE_ISSUER, SQPOLL)
 )
 
 func (t Tier) String() string {

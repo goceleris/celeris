@@ -818,10 +818,10 @@ func (p *Processor) flush() {
 	}
 }
 
-// goAwayErr sends a GOAWAY frame, flushes, and returns the given error.
+// goAwayErr sends a GOAWAY frame and returns the given error.
+// SendGoAway handles flushing internally.
 func (p *Processor) goAwayErr(lastStreamID uint32, code http2.ErrCode, debug []byte, err error) error {
 	_ = p.SendGoAway(lastStreamID, code, debug)
-	p.flush()
 	return err
 }
 

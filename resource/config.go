@@ -52,8 +52,8 @@ func (c Config) Validate() []error {
 		errs = append(errs, fmt.Errorf("initialWindowSize must be 0-2147483647, got %d", c.InitialWindowSize))
 	}
 
-	if c.MaxConcurrentStreams != 0 && c.MaxConcurrentStreams < 1 {
-		errs = append(errs, fmt.Errorf("maxConcurrentStreams must be >= 1 if set, got %d", c.MaxConcurrentStreams))
+	if c.MaxConcurrentStreams > 0x7fffffff {
+		errs = append(errs, fmt.Errorf("maxConcurrentStreams must be <= 2147483647, got %d", c.MaxConcurrentStreams))
 	}
 
 	if c.MaxHeaderBytes != 0 && c.MaxHeaderBytes < 4096 {

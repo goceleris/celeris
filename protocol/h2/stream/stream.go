@@ -30,7 +30,7 @@ type Stream struct {
 	HandlerStarted         bool
 	DeferResponse          bool
 	WindowSize             int32
-	ReceivedWindowUpd      chan int32
+	ReceivedWindowUpd      chan int32 // buffered; consumed by engine layer during DATA writes
 	mu                     sync.RWMutex
 	writeMu                sync.Mutex
 	ResponseWriter         ResponseWriter

@@ -38,7 +38,7 @@ func NewHeaderEncoder() *HeaderEncoder {
 func (e *HeaderEncoder) Encode(headers [][2]string) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.buf == nil {
+	if e.buf == nil || e.encoder == nil {
 		return nil, fmt.Errorf("encoder closed")
 	}
 	e.buf.Reset()
@@ -58,7 +58,7 @@ func (e *HeaderEncoder) Encode(headers [][2]string) ([]byte, error) {
 func (e *HeaderEncoder) EncodeBorrow(headers [][2]string) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.buf == nil {
+	if e.buf == nil || e.encoder == nil {
 		return nil, fmt.Errorf("encoder closed")
 	}
 	e.buf.Reset()
