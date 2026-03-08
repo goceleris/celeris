@@ -69,7 +69,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		reqCount:    reqCount,
 		activeConns: activeConns,
 		errCount:    errCount,
-		ready: make(chan error, 1),
+		ready:       make(chan error, 1),
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
