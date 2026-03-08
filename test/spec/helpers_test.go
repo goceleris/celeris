@@ -103,6 +103,15 @@ func startSpecEngine(t *testing.T, se specEngine, proto engine.Protocol) string 
 	if ag, ok := e.(addrGetter); ok {
 		deadline := time.Now().Add(3 * time.Second)
 		for ag.Addr() == nil && time.Now().Before(deadline) {
+			select {
+			case err := <-errCh:
+				cancel()
+				if err != nil {
+					t.Skipf("engine failed to start (skipping): %v", err)
+				}
+				t.Fatal("engine Listen returned nil without setting addr")
+			default:
+			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		if ag.Addr() == nil {

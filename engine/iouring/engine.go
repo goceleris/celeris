@@ -181,5 +181,7 @@ func (e *Engine) Type() engine.EngineType {
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.addr
 }

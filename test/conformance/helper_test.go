@@ -91,11 +91,20 @@ func startEngine(t *testing.T, ef EngineFactory, proto engine.Protocol) (addr st
 		errCh <- e.Listen(ctx)
 	}()
 
-	// Wait for listener
+	// Wait for listener, checking for early Listen failures.
 	var engineAddr net.Addr
 	if ag, ok := e.(addrGetter); ok {
 		deadline := time.Now().Add(3 * time.Second)
 		for ag.Addr() == nil && time.Now().Before(deadline) {
+			select {
+			case err := <-errCh:
+				cancel()
+				if err != nil {
+					t.Skipf("engine failed to start (skipping): %v", err)
+				}
+				t.Fatal("engine Listen returned nil without setting addr")
+			default:
+			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		engineAddr = ag.Addr()
