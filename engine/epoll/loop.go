@@ -23,18 +23,19 @@ import (
 
 // Loop is an epoll-based event loop worker.
 type Loop struct {
-	id        int
-	cpuID     int
-	epollFD   int
-	listenFD  int
-	events    []unix.EpollEvent
-	conns     map[int]*connState
-	handler   stream.Handler
-	objective resource.ObjectiveParams
-	resolved  resource.ResolvedResources
-	sockOpts  sockopts.Options
-	cfg       resource.Config
-	logger    *slog.Logger
+	id           int
+	cpuID        int
+	epollFD      int
+	listenFD     int
+	events       []unix.EpollEvent
+	conns        map[int]*connState
+	handler      stream.Handler
+	objective    resource.ObjectiveParams
+	resolved     resource.ResolvedResources
+	sockOpts     sockopts.Options
+	cfg          resource.Config
+	logger       *slog.Logger
+	acceptPaused *atomic.Bool
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -43,7 +44,8 @@ type Loop struct {
 
 func newLoop(id, cpuID int, handler stream.Handler,
 	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
-	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64) (*Loop, error) {
+	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
+	acceptPaused *atomic.Bool) (*Loop, error) {
 
 	epollFD, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -66,17 +68,18 @@ func newLoop(id, cpuID int, handler stream.Handler,
 	}
 
 	return &Loop{
-		id:        id,
-		cpuID:     cpuID,
-		epollFD:   epollFD,
-		listenFD:  listenFD,
-		events:    make([]unix.EpollEvent, resolved.MaxEvents),
-		conns:     make(map[int]*connState),
-		handler:   handler,
-		objective: objective,
-		resolved:  resolved,
-		cfg:       cfg,
-		logger:    cfg.Logger,
+		id:           id,
+		cpuID:        cpuID,
+		epollFD:      epollFD,
+		listenFD:     listenFD,
+		events:       make([]unix.EpollEvent, resolved.MaxEvents),
+		conns:        make(map[int]*connState),
+		handler:      handler,
+		objective:    objective,
+		resolved:     resolved,
+		cfg:          cfg,
+		logger:       cfg.Logger,
+		acceptPaused: acceptPaused,
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
@@ -149,6 +152,10 @@ func (l *Loop) run(ctx context.Context) {
 }
 
 func (l *Loop) acceptAll(ctx context.Context) {
+	if l.acceptPaused.Load() {
+		return
+	}
+
 	for {
 		newFD, _, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
