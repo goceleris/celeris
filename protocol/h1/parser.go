@@ -1,0 +1,226 @@
+package h1
+
+import (
+	"bytes"
+	"errors"
+	"strings"
+)
+
+var (
+	ErrBufferExhausted    = errors.New("buffer exhausted")
+	ErrInvalidRequestLine = errors.New("invalid request line")
+	ErrInvalidHeader      = errors.New("invalid header line")
+	ErrMissingHost        = errors.New("missing Host header")
+	ErrUnsupportedVersion = errors.New("unsupported HTTP version")
+	ErrHeadersTooLarge    = errors.New("headers too large")
+	ErrInvalidContentLength = errors.New("invalid content-length")
+)
+
+type Parser struct {
+	buf []byte
+	pos int
+	noStringHeaders bool
+}
+
+func NewParser() *Parser {
+	return &Parser{}
+}
+
+func (p *Parser) Reset(buf []byte) {
+	p.buf = buf
+	p.pos = 0
+}
+
+func (p *Parser) ParseRequest(req *Request) (int, error) {
+	if p.pos >= len(p.buf) {
+		return 0, ErrBufferExhausted
+	}
+
+	complete, err := p.parseRequestLine(req)
+	if err != nil {
+		return 0, err
+	}
+	if !complete {
+		return 0, nil
+	}
+
+	if p.noStringHeaders {
+		req.Headers = req.Headers[:0]
+	} else {
+		if cap(req.Headers) >= 16 {
+			req.Headers = req.Headers[:0]
+		} else {
+			req.Headers = make([][2]string, 0, 16)
+		}
+	}
+	req.ContentLength = -1
+	req.KeepAlive = req.Version == sHTTP11
+
+	complete, err = p.parseHeaders(req)
+	if err != nil {
+		return 0, err
+	}
+	if !complete {
+		return 0, nil
+	}
+
+	if req.Host == "" {
+		return 0, ErrMissingHost
+	}
+	return p.pos, nil
+}
+
+func (p *Parser) parseRequestLine(req *Request) (bool, error) {
+	lineEnd := bytes.Index(p.buf[p.pos:], bCRLF)
+	if lineEnd == -1 {
+		return false, nil
+	}
+	line := p.buf[p.pos : p.pos+lineEnd]
+	p.pos += lineEnd + 2
+
+	sp1 := bytes.IndexByte(line, ' ')
+	if sp1 == -1 {
+		return false, ErrInvalidRequestLine
+	}
+	methodBytes := line[:sp1]
+
+	rest := line[sp1+1:]
+	sp2 := bytes.IndexByte(rest, ' ')
+	if sp2 == -1 {
+		return false, ErrInvalidRequestLine
+	}
+	pathBytes := rest[:sp2]
+	versionBytes := rest[sp2+1:]
+
+	req.Method = internMethod(methodBytes)
+	req.Path = internPath(pathBytes)
+	req.Version = internVersion(versionBytes)
+
+	if req.Version != sHTTP11 && req.Version != sHTTP10 {
+		return false, ErrUnsupportedVersion
+	}
+	return true, nil
+}
+
+func (p *Parser) parseHeaders(req *Request) (bool, error) {
+	var totalHeaderBytes int
+	for {
+		lineEnd := bytes.Index(p.buf[p.pos:], bCRLF)
+		if lineEnd == -1 {
+			return false, nil
+		}
+		line := p.buf[p.pos : p.pos+lineEnd]
+		p.pos += lineEnd + 2
+
+		totalHeaderBytes += lineEnd + 2
+		if totalHeaderBytes > MaxHeaderSize {
+			return false, ErrHeadersTooLarge
+		}
+
+		if len(line) == 0 {
+			req.HeadersComplete = true
+			return true, nil
+		}
+		colonIdx := bytes.IndexByte(line, ':')
+		if colonIdx == -1 {
+			return false, ErrInvalidHeader
+		}
+		rawName := trimSpace(line[:colonIdx])
+		rawValue := trimSpace(line[colonIdx+1:])
+		if err := p.appendHeader(req, rawName, rawValue); err != nil {
+			return false, err
+		}
+	}
+}
+
+func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
+	req.RawHeaders = append(req.RawHeaders, [2][]byte{rawName, rawValue})
+	if !p.noStringHeaders {
+		var name string
+		switch {
+		case asciiEqualFold(rawName, "Host"):
+			name = "host"
+		case asciiEqualFold(rawName, "Content-Length"):
+			name = "content-length"
+		case asciiEqualFold(rawName, "Transfer-Encoding"):
+			name = "transfer-encoding"
+		case asciiEqualFold(rawName, "Connection"):
+			name = "connection"
+		default:
+			name = strings.ToLower(string(rawName))
+		}
+		value := string(rawValue)
+		req.Headers = append(req.Headers, [2]string{name, value})
+		switch name {
+		case "host":
+			req.Host = value
+		case "content-length":
+			cl, ok := parseInt64Bytes(rawValue)
+			if !ok {
+				return ErrInvalidContentLength
+			}
+			req.ContentLength = cl
+		case "transfer-encoding":
+			if asciiContainsFoldString(value, "chunked") {
+				req.ChunkedEncoding = true
+				req.ContentLength = -1
+			}
+		case "connection":
+			if asciiContainsFoldString(value, "close") {
+				req.KeepAlive = false
+			} else if asciiContainsFoldString(value, "keep-alive") {
+				req.KeepAlive = true
+			}
+		}
+		return nil
+	}
+	if asciiEqualFold(rawName, "Host") {
+		req.Host = string(rawValue)
+		return nil
+	}
+	if asciiEqualFold(rawName, "Content-Length") {
+		if cl, ok := parseInt64Bytes(rawValue); ok {
+			req.ContentLength = cl
+		} else {
+			return ErrInvalidContentLength
+		}
+		return nil
+	}
+	if asciiEqualFold(rawName, "Transfer-Encoding") {
+		if asciiContainsFoldBytes(rawValue, "chunked") {
+			req.ChunkedEncoding = true
+			req.ContentLength = -1
+		}
+		return nil
+	}
+	if asciiEqualFold(rawName, "Connection") {
+		if asciiContainsFoldBytes(rawValue, "close") {
+			req.KeepAlive = false
+		} else if asciiContainsFoldBytes(rawValue, "keep-alive") {
+			req.KeepAlive = true
+		}
+		return nil
+	}
+	return nil
+}
+
+func (p *Parser) Remaining() int {
+	return len(p.buf) - p.pos
+}
+
+func (p *Parser) GetBody(contentLength int64) []byte {
+	if contentLength <= 0 {
+		return nil
+	}
+	available := len(p.buf) - p.pos
+	if int64(available) < contentLength {
+		return p.buf[p.pos:]
+	}
+	body := p.buf[p.pos : p.pos+int(contentLength)]
+	p.pos += int(contentLength)
+	return body
+}
+
+func (p *Parser) ConsumeBody(n int) {
+	p.pos += n
+}
