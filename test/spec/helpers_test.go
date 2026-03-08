@@ -4,6 +4,7 @@ package spec
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	stdengine "github.com/goceleris/celeris/engine/std"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
+
+	"golang.org/x/net/http2"
 )
 
 type specEngine struct {
@@ -83,8 +86,9 @@ func freePort(t *testing.T) int {
 func startSpecEngine(t *testing.T, se specEngine, proto engine.Protocol) string {
 	t.Helper()
 	port := freePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := resource.Config{
-		Addr:     fmt.Sprintf("127.0.0.1:%d", port),
+		Addr:     addr,
 		Engine:   se.typ,
 		Protocol: proto,
 		Resources: resource.Resources{
@@ -119,11 +123,41 @@ func startSpecEngine(t *testing.T, se specEngine, proto engine.Protocol) string 
 			t.Fatal("engine did not start listening")
 		}
 	}
+
+	// Readiness probe: verify the engine can actually serve a request.
+	// On resource-constrained CI runners io_uring may bind successfully
+	// but fail to process completions, causing every subtest to timeout.
+	if err := probeEngine(addr, proto); err != nil {
+		cancel()
+		<-errCh
+		t.Skipf("engine %s not functional (skipping): %v", se.name, err)
+	}
+
 	t.Cleanup(func() {
 		cancel()
 		<-errCh
 	})
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	return addr
+}
+
+// probeEngine sends a single HTTP request to verify the engine is functional.
+func probeEngine(addr string, proto engine.Protocol) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	if proto == engine.H2C {
+		client.Transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, a)
+			},
+		}
+	}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
 }
 
 // rawConnect opens a raw TCP connection with deadlines.

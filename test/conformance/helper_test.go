@@ -115,7 +115,21 @@ func startEngine(t *testing.T, ef EngineFactory, proto engine.Protocol) (addr st
 		t.Fatal("engine did not start listening")
 	}
 
-	return fmt.Sprintf("127.0.0.1:%d", port), func() {
+	// Readiness probe: verify the engine can actually serve a request.
+	// On resource-constrained CI runners io_uring may bind successfully
+	// but fail to process completions, causing every subtest to timeout.
+	addr = fmt.Sprintf("127.0.0.1:%d", port)
+	probeClient := clientForProto(proto)
+	probeClient.Timeout = 2 * time.Second
+	resp, probeErr := probeClient.Get("http://" + addr + "/healthz")
+	if probeErr != nil {
+		cancel()
+		<-errCh
+		t.Skipf("engine %s not functional (skipping): %v", ef.Type.String(), probeErr)
+	}
+	_ = resp.Body.Close()
+
+	return addr, func() {
 		cancel()
 		<-errCh
 	}

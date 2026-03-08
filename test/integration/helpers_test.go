@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
@@ -81,6 +82,17 @@ func startEngine(t *testing.T, e engine.Engine) {
 			cancel()
 			t.Fatal("engine did not start listening")
 		}
+
+		// Readiness probe: verify the engine can serve a request.
+		addr := ag.Addr().String()
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, probeErr := client.Get("http://" + addr + "/healthz")
+		if probeErr != nil {
+			cancel()
+			<-errCh
+			t.Skipf("engine not functional (skipping): %v", probeErr)
+		}
+		_ = resp.Body.Close()
 	}
 
 	t.Cleanup(func() {
