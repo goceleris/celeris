@@ -16,7 +16,7 @@ func BenchmarkParseRequest_SimpleGET(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		p.Reset(raw)
 		req.Reset()
-		p.ParseRequest(&req)
+		_, _ = p.ParseRequest(&req)
 	}
 }
 
@@ -48,7 +48,7 @@ func BenchmarkParseRequest_ManyHeaders(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		p.Reset(raw)
 		req.Reset()
-		p.ParseRequest(&req)
+		_, _ = p.ParseRequest(&req)
 	}
 }
 
@@ -63,7 +63,7 @@ func BenchmarkGetBody_ZeroCopy(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		p.Reset(raw)
 		req.Reset()
-		p.ParseRequest(&req)
+		_, _ = p.ParseRequest(&req)
 		p.GetBody(req.ContentLength)
 	}
 }
@@ -80,7 +80,7 @@ func BenchmarkParseRequest_Pipelined(b *testing.B) {
 		p.Reset(pipelined)
 		for j := 0; j < 10; j++ {
 			req.Reset()
-			p.ParseRequest(&req)
+			_, _ = p.ParseRequest(&req)
 		}
 	}
 }

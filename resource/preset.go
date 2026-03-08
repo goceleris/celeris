@@ -1,5 +1,6 @@
 package resource
 
+// Resource limit constants for validation and clamping.
 const (
 	MinWorkers    = 2
 	MaxSQERing    = 65536

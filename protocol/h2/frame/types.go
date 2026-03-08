@@ -1,8 +1,10 @@
+// Package frame provides HTTP/2 frame type definitions, parsing, writing, and HPACK integration.
 package frame
 
 // Type represents HTTP/2 frame types.
 type Type uint8
 
+// HTTP/2 frame type constants as defined in RFC 7540 Section 6.
 const (
 	FrameData         Type = 0x0
 	FrameHeaders      Type = 0x1
@@ -39,6 +41,7 @@ func (t Type) String() string {
 // Flags represents HTTP/2 frame flags.
 type Flags uint8
 
+// HTTP/2 frame flag constants as defined in RFC 7540 Section 6.
 const (
 	FlagAck        Flags = 0x1
 	FlagEndStream  Flags = 0x1

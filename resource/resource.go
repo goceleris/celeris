@@ -1,9 +1,11 @@
 package resource
 
-type ResourcePreset uint8
+// ResourcePreset selects a predefined resource allocation profile.
+type ResourcePreset uint8 //nolint:revive // ResourcePreset is clearer than Preset for cross-package use
 
+// Resource preset constants.
 const (
-	Greedy   ResourcePreset = iota
+	Greedy ResourcePreset = iota
 	Balanced
 	Minimal
 )

@@ -17,7 +17,7 @@ func newMockFrameWriter() *mockFrameWriter {
 }
 
 func (m *mockFrameWriter) WriteSettings(_ ...http2.Setting) error { return nil }
-func (m *mockFrameWriter) WriteSettingsAck() error                 { return nil }
+func (m *mockFrameWriter) WriteSettingsAck() error                { return nil }
 func (m *mockFrameWriter) WriteHeaders(_ uint32, _ bool, _ []byte, _ uint32) error {
 	return nil
 }

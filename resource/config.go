@@ -10,23 +10,25 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
+// Config holds server configuration including protocol, engine, address, and resource settings.
 type Config struct {
-	Protocol            engine.Protocol
-	Engine              engine.EngineType
-	Addr                string
-	Resources           Resources
-	Objective           ObjectiveProfile
-	MaxHeaderBytes      int
+	Protocol             engine.Protocol
+	Engine               engine.EngineType
+	Addr                 string
+	Resources            Resources
+	Objective            ObjectiveProfile
+	MaxHeaderBytes       int
 	MaxConcurrentStreams uint32
-	MaxFrameSize        uint32
-	InitialWindowSize   uint32
-	ReadTimeout         time.Duration
-	WriteTimeout        time.Duration
-	IdleTimeout         time.Duration
-	DisableKeepAlive    bool
-	Logger              *slog.Logger
+	MaxFrameSize         uint32
+	InitialWindowSize    uint32
+	ReadTimeout          time.Duration
+	WriteTimeout         time.Duration
+	IdleTimeout          time.Duration
+	DisableKeepAlive     bool
+	Logger               *slog.Logger
 }
 
+// Validate checks all config fields and returns any validation errors.
 func (c Config) Validate() []error {
 	var errs []error
 
@@ -43,29 +45,29 @@ func (c Config) Validate() []error {
 	}
 
 	if c.MaxFrameSize != 0 && (c.MaxFrameSize < 16384 || c.MaxFrameSize > 16777215) {
-		errs = append(errs, fmt.Errorf("MaxFrameSize must be 16384-16777215, got %d", c.MaxFrameSize))
+		errs = append(errs, fmt.Errorf("maxFrameSize must be 16384-16777215, got %d", c.MaxFrameSize))
 	}
 
 	if c.InitialWindowSize > 2147483647 {
-		errs = append(errs, fmt.Errorf("InitialWindowSize must be 0-2147483647, got %d", c.InitialWindowSize))
+		errs = append(errs, fmt.Errorf("initialWindowSize must be 0-2147483647, got %d", c.InitialWindowSize))
 	}
 
 	if c.Resources.Workers != 0 && c.Resources.Workers < MinWorkers {
-		errs = append(errs, fmt.Errorf("Workers must be >= %d if set, got %d", MinWorkers, c.Resources.Workers))
+		errs = append(errs, fmt.Errorf("workers must be >= %d if set, got %d", MinWorkers, c.Resources.Workers))
 	}
 
 	if c.Resources.BufferSize != 0 && c.Resources.BufferSize < MinBufferSize {
-		errs = append(errs, fmt.Errorf("BufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
+		errs = append(errs, fmt.Errorf("bufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
 	}
 
 	if c.ReadTimeout < 0 {
-		errs = append(errs, fmt.Errorf("ReadTimeout must be >= 0, got %v", c.ReadTimeout))
+		errs = append(errs, fmt.Errorf("readTimeout must be >= 0, got %v", c.ReadTimeout))
 	}
 	if c.WriteTimeout < 0 {
-		errs = append(errs, fmt.Errorf("WriteTimeout must be >= 0, got %v", c.WriteTimeout))
+		errs = append(errs, fmt.Errorf("writeTimeout must be >= 0, got %v", c.WriteTimeout))
 	}
 	if c.IdleTimeout < 0 {
-		errs = append(errs, fmt.Errorf("IdleTimeout must be >= 0, got %v", c.IdleTimeout))
+		errs = append(errs, fmt.Errorf("idleTimeout must be >= 0, got %v", c.IdleTimeout))
 	}
 
 	if runtime.GOOS != "linux" {
@@ -77,6 +79,7 @@ func (c Config) Validate() []error {
 	return errs
 }
 
+// WithDefaults returns a copy of Config with zero-value fields set to sensible defaults.
 func (c Config) WithDefaults() Config {
 	if c.Addr == "" {
 		c.Addr = ":8080"

@@ -1,8 +1,10 @@
+// Package stream manages HTTP/2 stream lifecycle, state transitions, flow control, and frame processing.
 package stream
 
 // State represents the state of an HTTP/2 stream as defined in RFC 7540.
 type State int
 
+// HTTP/2 stream state constants as defined in RFC 7540 Section 5.1.
 const (
 	StateIdle State = iota
 	StateOpen
@@ -29,6 +31,7 @@ func (s State) String() string {
 // Phase represents the response phase for a stream to ensure proper write ordering.
 type Phase int
 
+// Response phase constants for ensuring correct write ordering.
 const (
 	PhaseInit Phase = iota
 	PhaseHeadersSent

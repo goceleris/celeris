@@ -6,31 +6,36 @@ import (
 	"strings"
 )
 
+// H1 parser sentinel errors.
 var (
-	ErrBufferExhausted    = errors.New("buffer exhausted")
-	ErrInvalidRequestLine = errors.New("invalid request line")
-	ErrInvalidHeader      = errors.New("invalid header line")
-	ErrMissingHost        = errors.New("missing Host header")
-	ErrUnsupportedVersion = errors.New("unsupported HTTP version")
-	ErrHeadersTooLarge    = errors.New("headers too large")
+	ErrBufferExhausted      = errors.New("buffer exhausted")
+	ErrInvalidRequestLine   = errors.New("invalid request line")
+	ErrInvalidHeader        = errors.New("invalid header line")
+	ErrMissingHost          = errors.New("missing Host header")
+	ErrUnsupportedVersion   = errors.New("unsupported HTTP version")
+	ErrHeadersTooLarge      = errors.New("headers too large")
 	ErrInvalidContentLength = errors.New("invalid content-length")
 )
 
+// Parser is a zero-allocation HTTP/1.x request parser.
 type Parser struct {
-	buf []byte
-	pos int
+	buf             []byte
+	pos             int
 	noStringHeaders bool
 }
 
+// NewParser returns a new Parser ready for use.
 func NewParser() *Parser {
 	return &Parser{}
 }
 
+// Reset reinitializes the parser with a new input buffer.
 func (p *Parser) Reset(buf []byte) {
 	p.buf = buf
 	p.pos = 0
 }
 
+// ParseRequest parses a complete HTTP/1.x request from the buffer into req.
 func (p *Parser) ParseRequest(req *Request) (int, error) {
 	if p.pos >= len(p.buf) {
 		return 0, ErrBufferExhausted
@@ -204,10 +209,12 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 	return nil
 }
 
+// Remaining returns the number of unconsumed bytes in the buffer.
 func (p *Parser) Remaining() int {
 	return len(p.buf) - p.pos
 }
 
+// GetBody returns a zero-copy slice of the request body for the given content length.
 func (p *Parser) GetBody(contentLength int64) []byte {
 	if contentLength <= 0 {
 		return nil
@@ -221,6 +228,7 @@ func (p *Parser) GetBody(contentLength int64) []byte {
 	return body
 }
 
+// ConsumeBody advances the parser position by n bytes.
 func (p *Parser) ConsumeBody(n int) {
 	p.pos += n
 }

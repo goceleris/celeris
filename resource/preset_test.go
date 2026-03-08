@@ -35,11 +35,11 @@ func TestResolvePresetGreedy(t *testing.T) {
 
 func TestResolvePresetBalanced(t *testing.T) {
 	tests := []struct {
-		numCPU      int
-		sqeRing     int
-		bufferPool  int
-		maxEvents   int
-		maxConns    int
+		numCPU     int
+		sqeRing    int
+		bufferPool int
+		maxEvents  int
+		maxConns   int
 	}{
 		{1, 2048, 512, 1024, 512},
 		{4, 8192, 2048, 4096, 2048},

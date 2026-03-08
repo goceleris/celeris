@@ -2,7 +2,8 @@ package probe
 
 import "github.com/goceleris/celeris/engine"
 
-func determineTier(kv KernelVersion, features uint32, ops []uint8) (tier engine.Tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs bool) {
+//nolint:unparam // sqpoll will be set based on io_uring feature flags in future
+func determineTier(kv KernelVersion, _ uint32, _ []uint8) (tier engine.Tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs bool) {
 	if !kv.AtLeast(5, 10) {
 		return engine.None, false, false, false, false, false, false, false
 	}

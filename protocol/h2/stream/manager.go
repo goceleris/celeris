@@ -7,18 +7,18 @@ import (
 
 // Manager manages multiple HTTP/2 streams.
 type Manager struct {
-	streams           map[uint32]*Stream
-	nextStreamID      uint32
-	lastClientStream  uint32
-	mu                sync.RWMutex
-	connectionWindow  int32
-	maxStreams         uint32
-	priorityTree      *PriorityTree
-	pushEnabled       bool
-	nextPushID        uint32
-	maxFrameSize      uint32
-	initialWindowSize uint32
-	activeStreams     uint32
+	streams                 map[uint32]*Stream
+	nextStreamID            uint32
+	lastClientStream        uint32
+	mu                      sync.RWMutex
+	connectionWindow        int32
+	maxStreams              uint32
+	priorityTree            *PriorityTree
+	pushEnabled             bool
+	nextPushID              uint32
+	maxFrameSize            uint32
+	initialWindowSize       uint32
+	activeStreams           uint32
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]*uint32
 	windowUpdateMu          sync.Mutex
@@ -31,13 +31,13 @@ func NewManager() *Manager {
 		streams:                 make(map[uint32]*Stream),
 		nextStreamID:            1,
 		connectionWindow:        65535,
-		maxStreams:               100,
+		maxStreams:              100,
 		priorityTree:            NewPriorityTree(),
 		pushEnabled:             true,
 		nextPushID:              2,
 		maxFrameSize:            16384,
 		initialWindowSize:       65535,
-		activeStreams:            0,
+		activeStreams:           0,
 		pendingConnWindowUpdate: 0,
 		pendingStreamUpdates:    make(map[uint32]*uint32),
 		streamsWithData:         make(map[uint32]struct{}),

@@ -8,6 +8,7 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
+// DiagnosticReport logs the capability profile as structured key-value pairs.
 func DiagnosticReport(profile engine.CapabilityProfile, logger *slog.Logger) {
 	logger.Info("capability probe complete",
 		"os", profile.OS,
@@ -31,6 +32,7 @@ func DiagnosticReport(profile engine.CapabilityProfile, logger *slog.Logger) {
 	}
 }
 
+// FormatDiagnostic returns a human-readable string representation of the capability profile.
 func FormatDiagnostic(profile engine.CapabilityProfile) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "OS: %s\n", profile.OS)

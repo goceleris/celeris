@@ -12,14 +12,14 @@ import (
 )
 
 type testFrameWriter struct {
-	mu              sync.Mutex
-	settingsAcked   bool
-	goAwaysSent     []goAwayRecord
-	rstStreamsSent  []rstStreamRecord
-	pingSent        []pingRecord
-	windowUpdates   map[uint32]uint32
-	dataSent        []dataRecord
-	headersSent     []headersRecord
+	mu             sync.Mutex
+	settingsAcked  bool
+	goAwaysSent    []goAwayRecord
+	rstStreamsSent []rstStreamRecord
+	pingSent       []pingRecord
+	windowUpdates  map[uint32]uint32
+	dataSent       []dataRecord
+	headersSent    []headersRecord
 }
 
 type goAwayRecord struct {
@@ -216,22 +216,6 @@ func makeHeadersFrame(t *testing.T, streamID uint32, endStream bool, endHeaders 
 		t.Fatalf("ReadFrame: %v", err)
 	}
 	return f
-}
-
-func makeContinuationFrame(t *testing.T, streamID uint32, endHeaders bool, headerBlock []byte) http2.Frame {
-	t.Helper()
-	var buf bytes.Buffer
-	framer := http2.NewFramer(&buf, nil)
-	var flags http2.Flags
-	if endHeaders {
-		flags |= http2.FlagContinuationEndHeaders
-	}
-	if err := framer.WriteRawFrame(http2.FrameContinuation, flags, streamID, headerBlock); err != nil {
-		t.Fatalf("WriteRawFrame CONTINUATION: %v", err)
-	}
-	// Must read through a framer that has seen the HEADERS first.
-	// Use a combined approach: write HEADERS without END_HEADERS then CONTINUATION.
-	return nil // We'll handle this differently
 }
 
 func makeDataFrame(t *testing.T, streamID uint32, endStream bool, data []byte) http2.Frame {

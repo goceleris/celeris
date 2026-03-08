@@ -2,8 +2,10 @@ package resource
 
 import "time"
 
+// ObjectiveProfile selects a tuning profile that controls I/O and networking parameters.
 type ObjectiveProfile uint8
 
+// Objective profile constants for server tuning.
 const (
 	BalancedObjective ObjectiveProfile = iota
 	LatencyOptimized
@@ -23,8 +25,10 @@ func (o ObjectiveProfile) String() string {
 	}
 }
 
+// WriteStrategy controls whether writes are issued immediately or batched.
 type WriteStrategy uint8
 
+// Write strategy constants.
 const (
 	WriteImmediate WriteStrategy = iota
 	WriteBatched
@@ -41,6 +45,7 @@ func (w WriteStrategy) String() string {
 	}
 }
 
+// ObjectiveParams holds the resolved I/O and networking parameters for an objective profile.
 type ObjectiveParams struct {
 	CQBatch      int
 	EpollTimeout time.Duration
@@ -53,6 +58,7 @@ type ObjectiveParams struct {
 	TCPQuickAck  bool
 }
 
+// ResolveObjective returns the concrete I/O parameters for the given objective profile.
 func ResolveObjective(profile ObjectiveProfile) ObjectiveParams {
 	switch profile {
 	case LatencyOptimized:

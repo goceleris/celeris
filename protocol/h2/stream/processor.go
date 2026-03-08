@@ -84,7 +84,7 @@ func (p *Processor) GetExpectedContinuationStreamID() (uint32, bool) {
 
 // ProcessFrame processes an incoming HTTP/2 frame.
 //
-//nolint:gocyclo
+//nolint:gocyclo // complex frame dispatch logic
 func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 	p.continuationStateMu.Lock()
 	inContinuation := p.continuationState != nil && p.continuationState.expectingMore
@@ -188,7 +188,7 @@ func (p *Processor) ProcessFrameWithConn(ctx context.Context, frame http2.Frame,
 
 // handleSettings processes SETTINGS frames.
 //
-//nolint:gocyclo
+//nolint:gocyclo // complex settings negotiation logic
 func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	if f.IsAck() {
 		return nil
@@ -340,7 +340,7 @@ func (p *Processor) runHandler(stream *Stream) {
 
 // handleHeaders processes HEADERS frames.
 //
-//nolint:gocyclo
+//nolint:gocyclo // complex header block assembly and stream lifecycle logic
 func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) error {
 	existingStream, exists := p.manager.GetStream(f.StreamID)
 
@@ -969,7 +969,7 @@ func (p *Processor) sendRSTStreamAndMarkClosed(streamID uint32, code http2.ErrCo
 }
 
 // FlushBufferedData exposes flushBufferedData for external callers.
-func (p *Processor) FlushBufferedData(streamID uint32) {
+func (p *Processor) FlushBufferedData(_ uint32) {
 	// Placeholder for transport-layer integration
 }
 

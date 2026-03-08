@@ -3,10 +3,11 @@ package engine
 // Protocol represents the HTTP protocol version.
 type Protocol uint8
 
+// HTTP protocol version constants.
 const (
-	HTTP1 Protocol = iota
-	H2C
-	Auto
+	HTTP1 Protocol = iota // HTTP/1.1
+	H2C                   // HTTP/2 cleartext
+	Auto                  // auto-negotiate
 )
 
 func (p Protocol) String() string {

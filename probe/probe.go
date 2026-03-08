@@ -6,11 +6,13 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
+// Probe detects system capabilities using the platform-default syscall prober.
 func Probe() engine.CapabilityProfile {
 	return ProbeWith(defaultProber())
 }
 
-func ProbeWith(sp *SyscallProber) engine.CapabilityProfile {
+// ProbeWith detects system capabilities using the provided SyscallProber.
+func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // ProbeWith is clearer than With for public API
 	profile := engine.NewDefaultProfile()
 	profile.OS = runtime.GOOS
 	profile.NumCPU = runtime.NumCPU()

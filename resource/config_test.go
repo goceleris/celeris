@@ -65,7 +65,7 @@ func TestValidateMaxFrameSizeTooSmall(t *testing.T) {
 	errs := c.Validate()
 	found := false
 	for _, e := range errs {
-		if strings.Contains(e.Error(), "MaxFrameSize") {
+		if strings.Contains(e.Error(), "maxFrameSize") {
 			found = true
 		}
 	}
@@ -79,7 +79,7 @@ func TestValidateMaxFrameSizeTooLarge(t *testing.T) {
 	errs := c.Validate()
 	found := false
 	for _, e := range errs {
-		if strings.Contains(e.Error(), "MaxFrameSize") {
+		if strings.Contains(e.Error(), "maxFrameSize") {
 			found = true
 		}
 	}
@@ -93,7 +93,7 @@ func TestValidateInitialWindowSizeOverflow(t *testing.T) {
 	errs := c.Validate()
 	found := false
 	for _, e := range errs {
-		if strings.Contains(e.Error(), "InitialWindowSize") {
+		if strings.Contains(e.Error(), "initialWindowSize") {
 			found = true
 		}
 	}
@@ -111,7 +111,7 @@ func TestValidateNegativeTimeouts(t *testing.T) {
 	errs := c.Validate()
 	timeoutErrors := 0
 	for _, e := range errs {
-		if strings.Contains(e.Error(), "Timeout") {
+		if strings.Contains(e.Error(), "imeout") {
 			timeoutErrors++
 		}
 	}
@@ -127,7 +127,7 @@ func TestValidateWorkersBelowMin(t *testing.T) {
 	errs := c.Validate()
 	found := false
 	for _, e := range errs {
-		if strings.Contains(e.Error(), "Workers") {
+		if strings.Contains(e.Error(), "workers") {
 			found = true
 		}
 	}
@@ -143,7 +143,7 @@ func TestValidateBufferSizeBelowMin(t *testing.T) {
 	errs := c.Validate()
 	found := false
 	for _, e := range errs {
-		if strings.Contains(e.Error(), "BufferSize") {
+		if strings.Contains(e.Error(), "bufferSize") {
 			found = true
 		}
 	}

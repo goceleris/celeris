@@ -1,13 +1,14 @@
 package engine
 
 // EngineType identifies which I/O engine implementation is in use.
-type EngineType uint8
+type EngineType uint8 //nolint:revive // user-approved name
 
+// I/O engine implementation types.
 const (
-	IOUring  EngineType = iota
-	Epoll
-	Adaptive
-	Std
+	IOUring  EngineType = iota // io_uring-based engine
+	Epoll                      // epoll-based engine
+	Adaptive                   // runtime-adaptive engine selection
+	Std                        // net/http stdlib engine
 )
 
 func (t EngineType) String() string {

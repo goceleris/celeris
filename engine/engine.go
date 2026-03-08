@@ -16,7 +16,7 @@ type Engine interface {
 // EngineMetrics is a snapshot of engine performance counters.
 // Each engine implementation maintains internal atomic counters and
 // populates a snapshot on Metrics() calls.
-type EngineMetrics struct {
+type EngineMetrics struct { //nolint:revive // user-approved name
 	RequestCount      uint64
 	ActiveConnections int64
 	ErrorCount        uint64

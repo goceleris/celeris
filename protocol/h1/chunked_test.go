@@ -38,7 +38,7 @@ func TestParseChunkedBody_MultipleChunks(t *testing.T) {
 	p := NewParser()
 	p.Reset([]byte(raw))
 
-	var result []byte
+	result := make([]byte, 0, 64)
 
 	chunk, _, err := p.ParseChunkedBody()
 	if err != nil {

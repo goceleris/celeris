@@ -130,6 +130,8 @@ func sendStreamError(writer FrameWriter, streamID uint32, code http2.ErrCode) {
 }
 
 // validateStreamID validates HTTP/2 stream ID according to RFC 7540 specifications.
+//
+//nolint:unparam // isClient is designed for both client and server validation
 func validateStreamID(streamID uint32, lastClientStream uint32, isClient bool) error {
 	if streamID == 0 {
 		return fmt.Errorf("stream ID 0 is reserved")

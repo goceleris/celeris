@@ -6,6 +6,7 @@ import (
 	"strings"
 )
 
+// KernelVersion represents a parsed Linux kernel version with major, minor, and patch components.
 type KernelVersion struct {
 	Major int
 	Minor int
@@ -13,6 +14,7 @@ type KernelVersion struct {
 	Extra string
 }
 
+// ParseKernelVersion parses a kernel version string such as "5.19.3-arch1".
 func ParseKernelVersion(s string) (KernelVersion, error) {
 	s = strings.TrimSpace(s)
 	if idx := strings.IndexByte(s, ' '); idx != -1 {
@@ -55,6 +57,7 @@ func ParseKernelVersion(s string) (KernelVersion, error) {
 	return kv, nil
 }
 
+// AtLeast reports whether kv is at least major.minor.
 func (kv KernelVersion) AtLeast(major, minor int) bool {
 	if kv.Major != major {
 		return kv.Major > major

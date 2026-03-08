@@ -4,12 +4,13 @@ package engine
 // Ordering forms a strict hierarchy suitable for >= comparisons.
 type Tier uint8
 
+// io_uring capability tiers in ascending order of feature availability.
 const (
-	None     Tier = iota
-	Base
-	Mid
-	High
-	Optional
+	None     Tier = iota // no io_uring support
+	Base                 // kernel 5.10+
+	Mid                  // kernel 5.13+ (provided buffers)
+	High                 // kernel 5.19+ (multishot accept/recv)
+	Optional             // kernel 6.0+ (coop taskrun, single issuer)
 )
 
 func (t Tier) String() string {

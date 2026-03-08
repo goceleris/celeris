@@ -73,7 +73,7 @@ func TestHeaderEncoderLargeBlock(t *testing.T) {
 	encoder := NewHeaderEncoder()
 	defer encoder.Close()
 
-	var headers [][2]string
+	headers := make([][2]string, 0, 50)
 	for i := range 50 {
 		headers = append(headers, [2]string{
 			"x-custom-header-" + string(rune('a'+i%26)),

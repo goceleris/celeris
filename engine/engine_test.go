@@ -8,10 +8,10 @@ import (
 
 type mockEngine struct{}
 
-func (m *mockEngine) Listen(_ context.Context) error { return nil }
+func (m *mockEngine) Listen(_ context.Context) error   { return nil }
 func (m *mockEngine) Shutdown(_ context.Context) error { return nil }
-func (m *mockEngine) Metrics() EngineMetrics            { return EngineMetrics{} }
-func (m *mockEngine) Type() EngineType                  { return Std }
+func (m *mockEngine) Metrics() EngineMetrics           { return EngineMetrics{} }
+func (m *mockEngine) Type() EngineType                 { return Std }
 
 var _ Engine = (*mockEngine)(nil)
 
