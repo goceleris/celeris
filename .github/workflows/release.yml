@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-tag:
+    name: Validate Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check semver format
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not valid semver (expected vX.Y.Z)"
+            exit 1
+          fi
+          echo "Tag $TAG is valid"
+
+  test:
+    name: Test
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Build
+        run: go build ./...
+      - name: Test with race detector
+        run: go test -race -count=1 -timeout=120s ./...
+
+  notify-proxy:
+    name: Notify Go Proxy
+    needs: [validate-tag, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Request module version from proxy
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          MODULE="github.com/goceleris/celeris"
+          for attempt in 1 2 3; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info")
+            if [ "$STATUS" = "200" ]; then
+              echo "Proxy responded with 200 for ${VERSION}"
+              break
+            fi
+            echo "Attempt $attempt: proxy returned $STATUS, retrying in 10s..."
+            sleep 10
+          done
+      - name: Verify module availability
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          go list -m "github.com/goceleris/celeris@${VERSION}" || echo "Module not yet indexed (may take a few minutes)"
