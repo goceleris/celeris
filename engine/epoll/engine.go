@@ -21,7 +21,7 @@ type Engine struct {
 	loops        []*Loop
 	cfg          resource.Config
 	handler      stream.Handler
-	addr         net.Addr
+	addr         atomic.Pointer[net.Addr]
 	mu           sync.Mutex
 	acceptPaused atomic.Bool
 	metrics      struct {
@@ -64,10 +64,11 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 		e.loops[i] = l
 	}
-	if len(e.loops) > 0 {
-		e.addr = boundAddr(e.loops[0].listenFD)
-	}
 	e.mu.Unlock()
+	if len(e.loops) > 0 {
+		addr := boundAddr(e.loops[0].listenFD)
+		e.addr.Store(&addr)
+	}
 
 	var wg sync.WaitGroup
 	for _, l := range e.loops {
@@ -116,7 +117,8 @@ func (e *Engine) ResumeAccept() error {
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.addr
+	if p := e.addr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }

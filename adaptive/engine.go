@@ -33,7 +33,7 @@ type Engine struct {
 	ctrl      *controller
 	cfg       resource.Config
 	handler   stream.Handler
-	addr      net.Addr
+	addr      atomic.Pointer[net.Addr]
 	mu        sync.Mutex
 	frozen    atomic.Bool
 	logger    *slog.Logger
@@ -153,9 +153,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 		return fmt.Errorf("sub-engines failed to initialize")
 	}
 
-	e.mu.Lock()
-	e.addr = e.primary.Addr()
-	e.mu.Unlock()
+	addr := e.primary.Addr()
+	e.addr.Store(&addr)
 
 	// Pause standby engine's accept.
 	if e.ctrl.state.activeIsPrimary {
@@ -272,9 +271,10 @@ func (e *Engine) Type() engine.EngineType {
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.addr
+	if p := e.addr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // FreezeSwitching prevents the controller from switching engines.

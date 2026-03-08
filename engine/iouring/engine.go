@@ -25,7 +25,7 @@ type Engine struct {
 	profile      engine.CapabilityProfile
 	cfg          resource.Config
 	handler      stream.Handler
-	addr         net.Addr
+	addr         atomic.Pointer[net.Addr]
 	mu           sync.Mutex
 	acceptPaused atomic.Bool
 	metrics      struct {
@@ -92,8 +92,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 		)
 		tier = lower
 	}
-	e.tier = tier
-
 	workers, err := e.createWorkers(tier, cpus, objective, resolved)
 	if err != nil {
 		return fmt.Errorf("worker init: %w", err)
@@ -124,11 +122,13 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	e.mu.Lock()
+	e.tier = tier
 	e.workers = workers
-	if len(workers) > 0 {
-		e.addr = boundAddr(workers[0].listenFD)
-	}
 	e.mu.Unlock()
+	if len(workers) > 0 {
+		addr := boundAddr(workers[0].listenFD)
+		e.addr.Store(&addr)
+	}
 
 	e.cfg.Logger.Info("io_uring engine listening", "addr", e.cfg.Addr, "tier", tier.Tier().String(), "workers", resolved.Workers)
 
@@ -209,7 +209,8 @@ func (e *Engine) ResumeAccept() error {
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.addr
+	if p := e.addr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
