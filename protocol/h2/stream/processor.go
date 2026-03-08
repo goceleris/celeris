@@ -102,10 +102,11 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 					fmt.Errorf("received non-CONTINUATION frame on stream %d while expecting CONTINUATION", header.StreamID))
 			}
 		} else {
-			if _, isHeaders := frame.(*http2.HeadersFrame); isHeaders {
-				return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("HEADERS on another stream during header block"),
-					fmt.Errorf("HEADERS on stream %d while header block is open on %d", header.StreamID, expectingStreamID))
-			}
+			// RFC 7540 §6.10: any frame on a different stream during a header
+			// block is a connection error of type PROTOCOL_ERROR.
+			return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+				[]byte("frame on another stream during header block"),
+				fmt.Errorf("frame type %T on stream %d while header block is open on %d", frame, header.StreamID, expectingStreamID))
 		}
 	}
 
@@ -175,7 +176,15 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 		return nil
 	}
 
+	type bufferedFlush struct {
+		streamID  uint32
+		data      []byte
+		endStream bool
+	}
+
 	var validationErr error
+	var pendingFlushes []bufferedFlush
+
 	_ = f.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
 		case http2.SettingHeaderTableSize:
@@ -214,6 +223,34 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 					return validationErr
 				}
 				stream.WindowSize += delta
+
+				// If window became positive and there's buffered data, prepare to flush.
+				if stream.WindowSize > 0 && stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
+					buffered := stream.OutboundBuffer.Bytes()
+					sendLen := len(buffered)
+					if int32(sendLen) > stream.WindowSize {
+						sendLen = int(stream.WindowSize)
+					}
+					isEnd := sendLen == len(buffered) && stream.OutboundEndStream
+					data := make([]byte, sendLen)
+					copy(data, buffered[:sendLen])
+					stream.WindowSize -= int32(sendLen)
+
+					if sendLen == len(buffered) {
+						stream.OutboundBuffer.Reset()
+					} else {
+						remaining := make([]byte, len(buffered)-sendLen)
+						copy(remaining, buffered[sendLen:])
+						stream.OutboundBuffer.Reset()
+						stream.OutboundBuffer.Write(remaining)
+					}
+
+					pendingFlushes = append(pendingFlushes, bufferedFlush{
+						streamID:  sid,
+						data:      data,
+						endStream: isEnd,
+					})
+				}
 				stream.mu.Unlock()
 			}
 			p.manager.mu.Unlock()
@@ -240,70 +277,76 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			[]byte(validationErr.Error()), validationErr)
 	}
 
+	// Send SETTINGS_ACK before flushing any pending DATA frames.
+	// Peers expect the ACK to confirm settings are applied before
+	// seeing frames that depend on the new settings.
 	if err := p.writer.WriteSettingsAck(); err != nil {
 		return err
 	}
-
 	p.flush()
+
+	for _, pf := range pendingFlushes {
+		_ = p.writer.WriteData(pf.streamID, pf.endStream, pf.data)
+		p.flush()
+	}
+
 	return nil
 }
 
-// runHandler runs the stream handler in a goroutine.
+// runHandler runs the stream handler synchronously.
+// Running synchronously ensures response data is written to the output buffer
+// before ProcessFrame returns, so the caller can flush it to the wire.
 func (p *Processor) runHandler(stream *Stream) {
 	if p.handler == nil {
 		return
 	}
-	go func() {
+
+	select {
+	case <-stream.ctx.Done():
+		return
+	default:
+	}
+
+	stream.mu.Lock()
+	stream.HandlerStarted = true
+	stream.mu.Unlock()
+
+	if err := p.handler.HandleStream(stream.ctx, stream); err != nil {
 		select {
 		case <-stream.ctx.Done():
 			return
 		default:
+			_ = p.writer.WriteRSTStream(stream.ID, http2.ErrCodeInternal)
+			p.flush()
+		}
+	} else {
+		stream.mu.RLock()
+		headersSent := stream.HeadersSent
+		state := stream.State
+		stream.mu.RUnlock()
+
+		if !headersSent {
+			if stream.ResponseWriter != nil {
+				_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
+			}
+			return
 		}
 
-		stream.mu.Lock()
-		stream.HandlerStarted = true
-		stream.mu.Unlock()
-
-		if err := p.handler.HandleStream(stream.ctx, stream); err != nil {
-			select {
-			case <-stream.ctx.Done():
-				return
-			default:
-				_ = p.writer.WriteRSTStream(stream.ID, http2.ErrCodeInternal)
-				p.flush()
-			}
-		} else {
-			stream.mu.RLock()
-			headersSent := stream.HeadersSent
-			state := stream.State
-			stream.mu.RUnlock()
-
-			if !headersSent {
-				if stream.ResponseWriter != nil {
-					_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
-				}
+		if state == StateOpen || state == StateHalfClosedRemote {
+			if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
+				// Data still buffered (flow control); will be flushed on WINDOW_UPDATE.
 				return
 			}
 
-			if state == StateOpen || state == StateHalfClosedRemote {
-				hasBufferedData := false
-				if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-					hasBufferedData = true
-				}
-				if hasBufferedData {
-					return
-				}
-
-				_ = p.writer.WriteData(stream.ID, true, nil)
-				p.flush()
-				if state == StateHalfClosedRemote {
-					stream.SetState(StateClosed)
-				} else {
-					stream.SetState(StateHalfClosedLocal)
-				}
+			// WriteResponse already sent DATA with END_STREAM, so just
+			// transition the stream state without sending a duplicate frame.
+			if state == StateHalfClosedRemote {
+				stream.SetState(StateClosed)
+			} else {
+				stream.SetState(StateHalfClosedLocal)
 			}
 		}
-	}()
+	}
 }
 
 // handleHeaders processes HEADERS frames.
@@ -457,17 +500,6 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		if stream.ResponseWriter == nil {
 			stream.ResponseWriter = p.connWriter
 		}
-		if p.handler != nil {
-			stream.mu.Lock()
-			started := stream.HandlerStarted
-			if !started {
-				stream.HandlerStarted = true
-			}
-			stream.mu.Unlock()
-			if !started {
-				p.runHandler(stream)
-			}
-		}
 		return nil
 	}
 
@@ -609,7 +641,34 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		}
 		//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
 		stream.WindowSize = int32(newWindow)
-		stream.mu.Unlock()
+
+		// Flush buffered outbound data now that window space is available.
+		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 && stream.WindowSize > 0 {
+			buffered := stream.OutboundBuffer.Bytes()
+			sendLen := len(buffered)
+			if int32(sendLen) > stream.WindowSize {
+				sendLen = int(stream.WindowSize)
+			}
+			isEnd := sendLen == len(buffered) && stream.OutboundEndStream
+			stream.WindowSize -= int32(sendLen)
+			stream.mu.Unlock()
+
+			_ = p.writer.WriteData(f.StreamID, isEnd, buffered[:sendLen])
+			p.flush()
+
+			stream.mu.Lock()
+			if sendLen == len(buffered) {
+				stream.OutboundBuffer.Reset()
+			} else {
+				remaining := make([]byte, len(buffered)-sendLen)
+				copy(remaining, buffered[sendLen:])
+				stream.OutboundBuffer.Reset()
+				stream.OutboundBuffer.Write(remaining)
+			}
+			stream.mu.Unlock()
+		} else {
+			stream.mu.Unlock()
+		}
 
 		select {
 		//nolint:gosec // G115: safe conversion
@@ -766,31 +825,6 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 			stream.ReceivedInitialHeaders = true
 			if stream.ResponseWriter == nil {
 				stream.ResponseWriter = p.connWriter
-			}
-			if p.handler != nil {
-				stream.mu.Lock()
-				already := stream.HandlerStarted
-				if !already {
-					stream.HandlerStarted = true
-				}
-				stream.mu.Unlock()
-				if !already {
-					go func() {
-						select {
-						case <-stream.ctx.Done():
-							return
-						default:
-						}
-						if err := p.handler.HandleStream(stream.ctx, stream); err != nil {
-							select {
-							case <-stream.ctx.Done():
-								return
-							default:
-								_ = p.writer.WriteRSTStream(stream.ID, http2.ErrCodeInternal)
-							}
-						}
-					}()
-				}
 			}
 		}
 

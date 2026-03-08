@@ -144,6 +144,24 @@ func (s *Stream) GetWindowSize() int32 {
 	return s.WindowSize
 }
 
+// DeductWindow subtracts n from the flow control window.
+func (s *Stream) DeductWindow(n int32) {
+	s.mu.Lock()
+	s.WindowSize -= n
+	s.mu.Unlock()
+}
+
+// BufferOutbound stores data that couldn't be sent due to flow control.
+func (s *Stream) BufferOutbound(data []byte, endStream bool) {
+	s.mu.Lock()
+	if s.OutboundBuffer == nil {
+		s.OutboundBuffer = new(bytes.Buffer)
+	}
+	s.OutboundBuffer.Write(data)
+	s.OutboundEndStream = endStream
+	s.mu.Unlock()
+}
+
 // SetPhase sets the stream phase.
 func (s *Stream) SetPhase(p Phase) {
 	s.mu.Lock()
