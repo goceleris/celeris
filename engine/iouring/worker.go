@@ -185,6 +185,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, listenFD 
 		}
 		return
 	}
+
 	_ = sockopts.ApplyFD(newFD, w.sockOpts)
 
 	cs := newConnState(ctx, newFD, w.resolved.BufferSize)
