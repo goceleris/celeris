@@ -23,7 +23,7 @@ jobs:
           version: v2.9
 
   test:
-    name: Test
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -33,10 +33,48 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - run: go run mage.go test
+      - name: Unit and engine tests
+        run: >-
+          go test -race -count=1 -timeout=120s
+          $(go list ./... | grep -v /test/)
+
+  conformance:
+    name: Conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Conformance matrix (engines × protocols)
+        run: go test -v -race -count=1 -timeout=120s ./test/conformance/...
+
+  spec:
+    name: Spec Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Install h2spec
+        run: go run mage.go tools
+      - name: H1 spec (RFC 9112)
+        run: >-
+          go test -v -race -count=1 -timeout=120s
+          -run TestH1Spec ./test/spec/...
+      - name: H2 spec (h2spec strict, iouring + epoll)
+        run: >-
+          go test -v -count=1 -timeout=120s
+          -run "TestH2SpecFull/(iouring|epoll)" ./test/spec/...
+      - name: Integration (parallel requests, streams, protocol detection)
+        run: >-
+          go test -v -race -count=1 -timeout=120s
+          -run "TestHTTP1Parallel|TestH2CParallel|TestAutoProtocolDetection|TestH2CMultipleStreams|TestHTTP1LargeBodyParallel"
+          ./test/spec/...
 
   build:
-    name: Build
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -46,7 +84,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - run: go run mage.go build
+      - run: go build ./...
 
   bench:
     name: Bench
@@ -56,4 +94,4 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - run: go run mage.go bench
+      - run: go test -bench=. -benchmem -run=^$ -timeout=120s ./...
