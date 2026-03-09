@@ -15,7 +15,6 @@ const (
 	udRecv    uint64 = 0x02 << 56
 	udSend    uint64 = 0x03 << 56
 	udClose   uint64 = 0x04 << 56
-	udPeek    uint64 = 0x05 << 56
 	udProvide uint64 = 0x06 << 56
 	udMask    uint64 = 0xFF << 56
 	fdMask    uint64 = (1 << 56) - 1

@@ -164,8 +164,6 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry) {
 		w.handleSend(c, fd)
 	case udClose:
 		w.handleClose(fd)
-	case udPeek:
-		w.handlePeek(c, fd)
 	case udProvide:
 		// Buffer provide completion, no action needed
 	}
@@ -196,57 +194,36 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, listenFD 
 	w.conns[newFD] = cs
 	w.activeConns.Add(1)
 
-	if w.cfg.Protocol == engine.Auto {
-		sqe := w.ring.GetSQE()
-		if sqe != nil {
-			prepRecvPeek(sqe, newFD, cs.buf[:detect.MinPeekBytes])
-			setSQEUserData(sqe, encodeUserData(udPeek, newFD))
-		}
-	} else {
+	if w.cfg.Protocol != engine.Auto {
 		cs.protocol = w.cfg.Protocol
 		cs.detected = true
 		w.initProtocol(cs)
-		w.tier.PrepareRecv(w.ring, newFD, cs.buf)
 	}
+	// For Auto mode, cs.detected is false; the first handleRecv will
+	// detect the protocol from the received data before processing it.
+	w.tier.PrepareRecv(w.ring, newFD, cs.buf)
 
 	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() {
 		w.tier.PrepareAccept(w.ring, listenFD)
 	}
 }
 
-func (w *Worker) handlePeek(c *completionEntry, fd int) {
-	cs, ok := w.conns[fd]
-	if !ok {
-		return
-	}
-
-	if c.Res < int32(detect.MinPeekBytes) {
-		sqe := w.ring.GetSQE()
-		if sqe != nil {
-			prepRecvPeek(sqe, fd, cs.buf[:24])
-			setSQEUserData(sqe, encodeUserData(udPeek, fd))
-		}
-		return
-	}
-
-	proto, err := detect.Detect(cs.buf[:c.Res])
-	if err == detect.ErrInsufficientData {
-		sqe := w.ring.GetSQE()
-		if sqe != nil {
-			prepRecvPeek(sqe, fd, cs.buf[:24])
-			setSQEUserData(sqe, encodeUserData(udPeek, fd))
-		}
-		return
-	}
+// detectProtocol performs protocol detection on the first received bytes.
+// Returns true if detection succeeded and the data should be processed.
+func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
+	proto, err := detect.Detect(data)
 	if err != nil {
-		w.closeConn(fd)
-		return
+		if err == detect.ErrInsufficientData {
+			// Need more data — re-arm recv. The data is already in cs.buf
+			// so we don't lose it; the next recv appends after it.
+			return false
+		}
+		return false
 	}
-
 	cs.protocol = proto
 	cs.detected = true
 	w.initProtocol(cs)
-	w.tier.PrepareRecv(w.ring, fd, cs.buf)
+	return true
 }
 
 func (w *Worker) initProtocol(cs *connState) {
@@ -282,6 +259,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		if provBuf != nil {
 			data = provBuf[:c.Res]
 			defer func() { _ = w.bufGroup.ReturnBuffer(w.ring, bufID) }()
+		}
+	}
+
+	// Auto protocol detection on first recv (no MSG_PEEK needed).
+	if !cs.detected {
+		if !w.detectProtocol(cs, data) {
+			// Need more data or unknown protocol — re-arm recv.
+			w.tier.PrepareRecv(w.ring, fd, cs.buf)
+			return
 		}
 	}
 

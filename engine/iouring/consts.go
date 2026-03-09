@@ -55,7 +55,6 @@ const (
 // Recv flags.
 const (
 	recvMultishot = 1 << 1
-	msgPeek       = 0x2
 )
 
 // Mmap offsets for ring buffers.
