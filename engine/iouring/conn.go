@@ -9,19 +9,25 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 )
 
+// maxSendQueueBytes is the per-connection back-pressure limit.
+// When pending send data exceeds this, the connection is closed to prevent
+// unbounded memory growth when the SQ ring is full under sustained load.
+const maxSendQueueBytes = 4 << 20 // 4 MiB
+
 // connState holds per-connection state for the io_uring engine.
 type connState struct {
-	fd        int
-	protocol  engine.Protocol
-	buf       []byte
-	h1State   *conn.H1State
-	h2State   *conn.H2State
-	ctx       context.Context
-	cancel    context.CancelFunc
-	detected  bool
-	sendQueue [][]byte // FIFO queue of pending SEND buffers
-	sending   bool     // true when a SEND SQE is in-flight for this connection
-	closing   bool     // defers close until all in-flight sends complete
+	fd             int
+	protocol       engine.Protocol
+	buf            []byte
+	h1State        *conn.H1State
+	h2State        *conn.H2State
+	ctx            context.Context
+	cancel         context.CancelFunc
+	detected       bool
+	sendQueue      [][]byte // FIFO queue of pending SEND buffers
+	sendQueueBytes int      // total bytes across all sendQueue entries
+	sending        bool     // true when a SEND SQE is in-flight for this connection
+	closing        bool     // defers close until all in-flight sends complete
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {

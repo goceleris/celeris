@@ -137,6 +137,7 @@ func handleH1Request(ctx context.Context, req *h1.Request, body []byte, handler 
 	write func([]byte)) error {
 
 	s := requestToStream(req, body)
+	defer s.Release()
 	rw := &h1ResponseAdapter{write: write, keepAlive: req.KeepAlive}
 	s.ResponseWriter = rw
 
@@ -149,7 +150,12 @@ func handleH1Request(ctx context.Context, req *h1.Request, body []byte, handler 
 
 func requestToStream(req *h1.Request, body []byte) *stream.Stream {
 	s := stream.NewStream(1)
-	hdrs := make([][2]string, 0, len(req.Headers)+4)
+	// Reuse the stream's existing header slice capacity from the pool.
+	hdrs := s.Headers[:0]
+	needed := len(req.Headers) + 4
+	if cap(hdrs) < needed {
+		hdrs = make([][2]string, 0, needed)
+	}
 	hdrs = append(hdrs,
 		[2]string{":method", req.Method},
 		[2]string{":path", req.Path},

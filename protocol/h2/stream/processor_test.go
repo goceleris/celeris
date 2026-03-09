@@ -470,15 +470,11 @@ func TestProcessRSTStream(t *testing.T) {
 		t.Fatalf("ProcessFrame RST_STREAM: %v", err)
 	}
 
-	if s.GetState() != StateClosed {
-		t.Errorf("Stream state: got %v, want Closed", s.GetState())
+	// Stream should be removed from the manager after RST_STREAM.
+	if _, ok := p.manager.GetStream(1); ok {
+		t.Error("Stream 1 should be removed after RST_STREAM")
 	}
-	s.mu.RLock()
-	closedByReset := s.ClosedByReset
-	s.mu.RUnlock()
-	if !closedByReset {
-		t.Error("Stream should be marked as closed by reset")
-	}
+	_ = s // stream reference is no longer valid after deletion
 }
 
 func TestProcessRSTStreamIdleStream(t *testing.T) {
@@ -500,7 +496,9 @@ func TestProcessRSTStreamIdleStream(t *testing.T) {
 func TestProcessHeadersNewStream(t *testing.T) {
 	fw := newTestFrameWriter()
 	rw := newTestResponseWriter()
-	handler := HandlerFunc(func(_ context.Context, _ *Stream) error {
+	var handlerState State
+	handler := HandlerFunc(func(_ context.Context, s *Stream) error {
+		handlerState = s.GetState()
 		return nil
 	})
 	p := NewProcessor(handler, fw, rw)
@@ -518,19 +516,20 @@ func TestProcessHeadersNewStream(t *testing.T) {
 		t.Fatalf("ProcessFrame HEADERS: %v", err)
 	}
 
-	s, ok := p.manager.GetStream(1)
-	if !ok {
-		t.Fatal("Stream 1 not found")
-	}
-	if s.GetState() != StateHalfClosedRemote {
-		t.Errorf("Stream state: got %v, want HalfClosedRemote", s.GetState())
+	// Stream is cleaned up after handler completes; verify state was correct during handling.
+	if handlerState != StateHalfClosedRemote {
+		t.Errorf("Stream state during handler: got %v, want HalfClosedRemote", handlerState)
 	}
 }
 
 func TestProcessData(t *testing.T) {
 	fw := newTestFrameWriter()
 	rw := newTestResponseWriter()
-	handler := HandlerFunc(func(_ context.Context, _ *Stream) error {
+	var handlerData string
+	var handlerState State
+	handler := HandlerFunc(func(_ context.Context, s *Stream) error {
+		handlerData = string(s.GetData())
+		handlerState = s.GetState()
 		return nil
 	})
 	p := NewProcessor(handler, fw, rw)
@@ -554,15 +553,12 @@ func TestProcessData(t *testing.T) {
 		t.Fatalf("ProcessFrame DATA: %v", err)
 	}
 
-	s, ok := p.manager.GetStream(1)
-	if !ok {
-		t.Fatal("Stream 1 not found")
+	// Stream is cleaned up after handler completes; verify state was correct during handling.
+	if handlerData != "hello" {
+		t.Errorf("Stream data during handler: got %q, want %q", handlerData, "hello")
 	}
-	if string(s.GetData()) != "hello" {
-		t.Errorf("Stream data: got %q, want %q", s.GetData(), "hello")
-	}
-	if s.GetState() != StateHalfClosedRemote {
-		t.Errorf("Stream state: got %v, want HalfClosedRemote", s.GetState())
+	if handlerState != StateHalfClosedRemote {
+		t.Errorf("Stream state during handler: got %v, want HalfClosedRemote", handlerState)
 	}
 }
 
@@ -676,7 +672,9 @@ func TestProcessConcurrentStreamsLimit(t *testing.T) {
 func TestProcessHeadersContinuation(t *testing.T) {
 	fw := newTestFrameWriter()
 	rw := newTestResponseWriter()
-	handler := HandlerFunc(func(_ context.Context, _ *Stream) error {
+	var handlerHeaderCount int
+	handler := HandlerFunc(func(_ context.Context, s *Stream) error {
+		handlerHeaderCount = s.HeadersLen()
 		return nil
 	})
 	p := NewProcessor(handler, fw, rw)
@@ -739,13 +737,9 @@ func TestProcessHeadersContinuation(t *testing.T) {
 		t.Error("Should not be expecting CONTINUATION after END_HEADERS")
 	}
 
-	// Stream should exist and have headers
-	s, ok := p.manager.GetStream(1)
-	if !ok {
-		t.Fatal("Stream 1 not found")
-	}
-	if s.HeadersLen() == 0 {
-		t.Error("Stream should have headers")
+	// Stream is cleaned up after handler completes; verify headers were present during handling.
+	if handlerHeaderCount == 0 {
+		t.Error("Stream should have had headers during handler execution")
 	}
 }
 

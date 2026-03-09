@@ -98,14 +98,11 @@ func (w *Worker) run(ctx context.Context) {
 	}
 	w.ring = ring
 
-	if w.tier.SupportsProvidedBuffers() {
-		bg, bgErr := NewBufferGroup(w.ring, 0, w.resolved.BufferPool, w.resolved.BufferSize)
-		if bgErr != nil {
-			w.logger.Warn("failed to setup provided buffers, falling back", "err", bgErr)
-		} else {
-			w.bufGroup = bg
-		}
-	}
+	// Provided buffers are supported by the tier but not yet wired into
+	// PrepareRecv (requires multishot recv with IOSQE_BUFFER_SELECT).
+	// Allocating the BufferGroup inflates Go's GC heap accounting
+	// (count×size bytes from Go heap), causing GC to never trigger on
+	// actual request allocations. Skip until multishot recv is implemented.
 
 	w.tier.PrepareAccept(w.ring, w.listenFD)
 	if _, err := w.ring.Submit(); err != nil {
@@ -314,6 +311,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		return
 	}
 
+	// Back-pressure: close connection if sendQueue grew too large.
+	if cs.sendQueueBytes > maxSendQueueBytes {
+		w.closeConn(fd)
+		return
+	}
+
 	w.flushSend(fd)
 
 	if !cqeHasMore(c.Flags) {
@@ -332,6 +335,7 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 	if c.Res < 0 {
 		w.errCount.Add(1)
 		cs.sendQueue = cs.sendQueue[:0]
+		cs.sendQueueBytes = 0
 		if cs.closing {
 			w.finishClose(fd)
 		} else {
@@ -346,7 +350,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 		buf := cs.sendQueue[0]
 		if sent < len(buf) {
 			cs.sendQueue[0] = buf[sent:]
+			cs.sendQueueBytes -= sent
 		} else {
+			cs.sendQueueBytes -= len(buf)
 			cs.sendQueue = cs.sendQueue[1:]
 		}
 	}
@@ -408,13 +414,21 @@ func (w *Worker) finishClose(fd int) {
 
 func (w *Worker) makeWriteFn(fd int) func([]byte) {
 	return func(data []byte) {
+		cs, ok := w.conns[fd]
+		if !ok {
+			return
+		}
+		// Back-pressure: drop writes when sendQueue exceeds limit.
+		// The connection will be closed after processing completes.
+		if cs.sendQueueBytes > maxSendQueueBytes {
+			return
+		}
 		// Copy data — the caller may reuse the underlying buffer (e.g. sync.Pool)
 		// before the kernel processes the SEND SQE.
 		copied := make([]byte, len(data))
 		copy(copied, data)
-		if cs, ok := w.conns[fd]; ok {
-			cs.sendQueue = append(cs.sendQueue, copied)
-		}
+		cs.sendQueue = append(cs.sendQueue, copied)
+		cs.sendQueueBytes += len(copied)
 		// Don't submit a SEND SQE here. Sends are serialized per-connection
 		// via flushSend, called after recv processing and send completion.
 	}
