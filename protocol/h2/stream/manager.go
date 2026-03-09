@@ -102,6 +102,10 @@ func (m *Manager) DeleteStream(id uint32) {
 	}
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
+
+	m.windowUpdateMu.Lock()
+	delete(m.pendingStreamUpdates, id)
+	m.windowUpdateMu.Unlock()
 }
 
 // StreamCount returns the number of streams in the manager.

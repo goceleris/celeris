@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 )
 
-const windowUpdateThreshold = 16384
+const windowUpdateThreshold = 1024
 
 // ConsumeSendWindow decrements connection and stream windows after sending DATA.
 func (m *Manager) ConsumeSendWindow(streamID uint32, n int32) {
@@ -51,39 +51,24 @@ func (m *Manager) AccumulateWindowUpdate(streamID uint32, increment uint32) {
 // Returns true if updates were sent.
 func (m *Manager) FlushWindowUpdates(writer FrameWriter, force bool) bool {
 	m.windowUpdateMu.Lock()
-
-	connUpdate := m.pendingConnWindowUpdate
-	needsConnFlush := force || connUpdate >= windowUpdateThreshold
-
-	streamUpdates := make(map[uint32]uint32)
-	for sid, pending := range m.pendingStreamUpdates {
-		if pending != nil && *pending > 0 {
-			if force || *pending >= windowUpdateThreshold {
-				streamUpdates[sid] = *pending
-			}
-		}
-	}
-
-	if needsConnFlush {
-		m.pendingConnWindowUpdate = 0
-	}
-	for sid := range streamUpdates {
-		if m.pendingStreamUpdates[sid] != nil {
-			*m.pendingStreamUpdates[sid] = 0
-		}
-	}
-
-	m.windowUpdateMu.Unlock()
+	defer m.windowUpdateMu.Unlock()
 
 	flushed := false
-	if needsConnFlush && connUpdate > 0 {
+
+	connUpdate := m.pendingConnWindowUpdate
+	if connUpdate > 0 && (force || connUpdate >= windowUpdateThreshold) {
+		m.pendingConnWindowUpdate = 0
 		_ = writer.WriteWindowUpdate(0, connUpdate)
 		flushed = true
 	}
 
-	for sid, increment := range streamUpdates {
-		_ = writer.WriteWindowUpdate(sid, increment)
-		flushed = true
+	for sid, pending := range m.pendingStreamUpdates {
+		if pending != nil && *pending > 0 && (force || *pending >= windowUpdateThreshold) {
+			val := *pending
+			*pending = 0
+			_ = writer.WriteWindowUpdate(sid, val)
+			flushed = true
+		}
 	}
 
 	return flushed

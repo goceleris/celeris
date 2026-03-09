@@ -63,17 +63,6 @@ func prepProvideBuffers(sqePtr unsafe.Pointer, addr unsafe.Pointer, bufLen int, 
 	*(*uint16)(unsafe.Pointer(&sqe[28])) = bufID
 }
 
-func prepRecvPeek(sqePtr unsafe.Pointer, fd int, buf []byte) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opRECV
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
-	if len(buf) > 0 {
-		*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(unsafe.Pointer(&buf[0])))
-		*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(len(buf))
-	}
-	*(*uint32)(unsafe.Pointer(&sqe[28])) = msgPeek // msg_flags at offset 28
-}
-
 func setSQEUserData(sqePtr unsafe.Pointer, data uint64) {
 	*(*uint64)(unsafe.Pointer(uintptr(sqePtr) + 32)) = data
 }
