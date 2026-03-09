@@ -65,7 +65,7 @@ func startEngine(t *testing.T, e engine.Engine) {
 	}()
 
 	if ag, ok := e.(addrGetter); ok {
-		deadline := time.Now().Add(15 * time.Second)
+		deadline := time.Now().Add(25 * time.Second)
 		for ag.Addr() == nil && time.Now().Before(deadline) {
 			select {
 			case err := <-errCh:
