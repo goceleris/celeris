@@ -2,7 +2,7 @@ package resource
 
 // Resource limit constants for validation and clamping.
 const (
-	MinWorkers    = 2
+	MinWorkers    = 1
 	MaxSQERing    = 65536
 	MinBufferSize = 4096
 	MaxBufferSize = 262144

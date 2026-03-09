@@ -99,9 +99,9 @@ func (l *Loop) run(ctx context.Context) {
 
 	_ = platform.PinToCPU(l.cpuID)
 
-	timeoutMs := int(l.objective.EpollTimeout.Milliseconds())
-	if timeoutMs <= 0 {
-		timeoutMs = 1
+	activeTimeoutMs := int(l.objective.EpollTimeout.Milliseconds())
+	if activeTimeoutMs <= 0 {
+		activeTimeoutMs = 1
 	}
 
 	for {
@@ -110,6 +110,11 @@ func (l *Loop) run(ctx context.Context) {
 			l.shutdown()
 			return
 		default:
+		}
+
+		timeoutMs := activeTimeoutMs
+		if l.acceptPaused.Load() && len(l.conns) == 0 {
+			timeoutMs = 500
 		}
 
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
