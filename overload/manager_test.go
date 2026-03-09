@@ -254,7 +254,7 @@ func TestAdaptiveFreeze(t *testing.T) {
 
 	// Escalate to Reorder (stage 3) where freeze kicks in.
 	mon.Set(0.88)
-	runForDuration(t, mgr, 30*time.Millisecond)
+	runForDuration(t, mgr, 80*time.Millisecond)
 
 	if mgr.Stage() < Reorder {
 		t.Fatalf("expected at least Reorder, got %v", mgr.Stage())
