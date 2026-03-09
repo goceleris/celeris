@@ -689,6 +689,12 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
+		// RFC 7540 §6.4: RST_STREAM on an idle stream is a connection error,
+		// but RST_STREAM on a recently closed stream (already deleted from the
+		// manager after handler completion) must be silently ignored.
+		if f.StreamID <= p.manager.GetLastClientStreamID() {
+			return nil
+		}
 		return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
 			[]byte("RST_STREAM on idle stream"),
 			fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID))
