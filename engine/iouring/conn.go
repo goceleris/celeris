@@ -19,7 +19,8 @@ type connState struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	detected  bool
-	sendQueue [][]byte // FIFO queue of in-flight SEND buffers for partial send retry
+	sendQueue [][]byte // FIFO queue of pending SEND buffers
+	sending   bool     // true when a SEND SQE is in-flight for this connection
 	closing   bool     // defers close until all in-flight sends complete
 }
 
