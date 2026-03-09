@@ -50,6 +50,7 @@ func putResponseBuffer(p *[]byte) {
 type h1ResponseAdapter struct {
 	write     func([]byte)
 	keepAlive bool
+	isHEAD    bool
 }
 
 func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
@@ -88,7 +89,10 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 
 	buf = append(buf, crlf...)
 
-	if len(body) > 0 {
+	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
+	// Content-Length is still included above to indicate the size that
+	// would be returned for a GET, but no bytes are sent.
+	if len(body) > 0 && !a.isHEAD {
 		buf = append(buf, body...)
 	}
 

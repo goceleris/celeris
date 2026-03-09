@@ -138,7 +138,7 @@ func handleH1Request(ctx context.Context, req *h1.Request, body []byte, handler 
 
 	s := requestToStream(req, body)
 	defer s.Release()
-	rw := &h1ResponseAdapter{write: write, keepAlive: req.KeepAlive}
+	rw := &h1ResponseAdapter{write: write, keepAlive: req.KeepAlive, isHEAD: req.Method == "HEAD"}
 	s.ResponseWriter = rw
 
 	if err := handler.HandleStream(ctx, s); err != nil {
