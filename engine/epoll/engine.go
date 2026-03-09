@@ -110,8 +110,20 @@ func (e *Engine) PauseAccept() error {
 }
 
 // ResumeAccept starts accepting new connections again.
+// Wakes any suspended loops so they re-create listen sockets.
 func (e *Engine) ResumeAccept() error {
 	e.acceptPaused.Store(false)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, l := range e.loops {
+		l.wakeMu.Lock()
+		if l.suspended.Load() {
+			close(l.wake)
+			l.wake = make(chan struct{})
+			l.suspended.Store(false)
+		}
+		l.wakeMu.Unlock()
+	}
 	return nil
 }
 
