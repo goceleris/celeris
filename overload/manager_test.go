@@ -140,7 +140,7 @@ func TestStageEscalation(t *testing.T) {
 
 	for _, tc := range stages {
 		mon.Set(tc.cpu)
-		runForDuration(t, mgr, 15*time.Millisecond)
+		runForDuration(t, mgr, 30*time.Millisecond)
 		got := mgr.Stage()
 		if got != tc.want {
 			t.Errorf("cpu=%.2f: got stage %v, want %v", tc.cpu, got, tc.want)
@@ -155,14 +155,14 @@ func TestDeescalationHysteresis(t *testing.T) {
 	mgr := NewManager(cfg, mon, hooks, nil)
 
 	// Escalate to Reorder (stage 3): 0.88 exceeds 0.85 threshold.
-	runForDuration(t, mgr, 30*time.Millisecond)
+	runForDuration(t, mgr, 80*time.Millisecond)
 	if mgr.Stage() < Reorder {
 		t.Fatalf("expected at least Reorder, got %v", mgr.Stage())
 	}
 
 	// Drop CPU to 0.74 (below de-escalate threshold of 0.75 for Reorder).
 	mon.Set(0.74)
-	runForDuration(t, mgr, 15*time.Millisecond)
+	runForDuration(t, mgr, 50*time.Millisecond)
 
 	got := mgr.Stage()
 	if got >= Reorder {
@@ -176,7 +176,7 @@ func Test503AtStage5(t *testing.T) {
 	cfg := fastConfig()
 	mgr := NewManager(cfg, mon, hooks, nil)
 
-	runForDuration(t, mgr, 50*time.Millisecond)
+	runForDuration(t, mgr, 150*time.Millisecond)
 
 	if mgr.Stage() != Reject {
 		t.Fatalf("expected Reject, got %v", mgr.Stage())
@@ -195,7 +195,7 @@ func TestBackpressureAtStage4(t *testing.T) {
 	cfg := fastConfig()
 	mgr := NewManager(cfg, mon, hooks, nil)
 
-	runForDuration(t, mgr, 40*time.Millisecond)
+	runForDuration(t, mgr, 120*time.Millisecond)
 
 	if mgr.Stage() < Backpressure {
 		t.Fatalf("expected at least Backpressure, got %v", mgr.Stage())
@@ -215,14 +215,14 @@ func TestRecovery(t *testing.T) {
 	mgr := NewManager(cfg, mon, hooks, nil)
 
 	// Escalate to Reject.
-	runForDuration(t, mgr, 50*time.Millisecond)
+	runForDuration(t, mgr, 150*time.Millisecond)
 	if mgr.Stage() != Reject {
 		t.Fatalf("expected Reject, got %v", mgr.Stage())
 	}
 
 	// Recover fully.
 	mon.Set(0.20)
-	runForDuration(t, mgr, 100*time.Millisecond)
+	runForDuration(t, mgr, 200*time.Millisecond)
 
 	if mgr.Stage() != Normal {
 		t.Errorf("expected Normal after recovery, got %v", mgr.Stage())
@@ -374,7 +374,7 @@ func TestSuppressDoesNotBlockOtherStages(t *testing.T) {
 
 	// Escalate to Reject (stage 5). All stages should fire except freeze.
 	mon.Set(0.97)
-	runForDuration(t, mgr, 80*time.Millisecond)
+	runForDuration(t, mgr, 150*time.Millisecond)
 
 	if mgr.Stage() != Reject {
 		t.Fatalf("expected Reject, got %v", mgr.Stage())

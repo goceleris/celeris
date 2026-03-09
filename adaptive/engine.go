@@ -140,7 +140,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 	})
 
 	// Wait for both engines to bind their addresses.
-	deadline := time.Now().Add(5 * time.Second)
+	// io_uring may need multiple tier fallback attempts, so allow ample time.
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if e.primary.Addr() != nil && e.secondary.Addr() != nil {
 			break

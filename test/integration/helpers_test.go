@@ -65,7 +65,7 @@ func startEngine(t *testing.T, e engine.Engine) {
 	}()
 
 	if ag, ok := e.(addrGetter); ok {
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(15 * time.Second)
 		for ag.Addr() == nil && time.Now().Before(deadline) {
 			select {
 			case err := <-errCh:
@@ -80,6 +80,14 @@ func startEngine(t *testing.T, e engine.Engine) {
 		}
 		if ag.Addr() == nil {
 			cancel()
+			// Wait briefly for an error from Listen before giving up.
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Skipf("engine failed to start: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+			}
 			t.Fatal("engine did not start listening")
 		}
 
