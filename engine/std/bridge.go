@@ -23,6 +23,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.engine.metrics.reqCount.Add(1)
 
 	s := stream.NewStream(1)
+	defer s.Release()
 
 	scheme := "http"
 	if r.TLS != nil {

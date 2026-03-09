@@ -92,11 +92,14 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	return s, true
 }
 
-// DeleteStream removes a stream.
+// DeleteStream removes a stream and releases its pooled buffers.
 func (m *Manager) DeleteStream(id uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if s, ok := m.streams[id]; ok {
+		s.Release()
+	}
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
 }

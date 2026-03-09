@@ -314,38 +314,44 @@ func (p *Processor) runHandler(stream *Stream) {
 	if err := p.handler.HandleStream(stream.ctx, stream); err != nil {
 		select {
 		case <-stream.ctx.Done():
-			return
 		default:
 			_ = p.writer.WriteRSTStream(stream.ID, http2.ErrCodeInternal)
 			p.flush()
 		}
-	} else {
-		stream.mu.RLock()
-		headersSent := stream.HeadersSent
-		state := stream.State
-		stream.mu.RUnlock()
+		p.manager.DeleteStream(stream.ID)
+		return
+	}
 
-		if !headersSent {
-			if stream.ResponseWriter != nil {
-				_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
-			}
+	stream.mu.RLock()
+	headersSent := stream.HeadersSent
+	state := stream.State
+	stream.mu.RUnlock()
+
+	if !headersSent {
+		if stream.ResponseWriter != nil {
+			_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
+		}
+		p.manager.DeleteStream(stream.ID)
+		return
+	}
+
+	if state == StateOpen || state == StateHalfClosedRemote {
+		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
+			// Data still buffered (flow control); will be flushed on WINDOW_UPDATE.
 			return
 		}
 
-		if state == StateOpen || state == StateHalfClosedRemote {
-			if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-				// Data still buffered (flow control); will be flushed on WINDOW_UPDATE.
-				return
-			}
-
-			// WriteResponse already sent DATA with END_STREAM, so just
-			// transition the stream state without sending a duplicate frame.
-			if state == StateHalfClosedRemote {
-				stream.SetState(StateClosed)
-			} else {
-				stream.SetState(StateHalfClosedLocal)
-			}
+		// WriteResponse already sent DATA with END_STREAM, so just
+		// transition the stream state without sending a duplicate frame.
+		if state == StateHalfClosedRemote {
+			stream.SetState(StateClosed)
+		} else {
+			stream.SetState(StateHalfClosedLocal)
 		}
+	}
+
+	if stream.GetState() == StateClosed {
+		p.manager.DeleteStream(stream.ID)
 	}
 }
 
@@ -692,10 +698,8 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 	stream.mu.Lock()
 	stream.ClosedByReset = true
 	stream.mu.Unlock()
-	if stream.cancel != nil {
-		stream.cancel()
-	}
 
+	p.manager.DeleteStream(f.StreamID)
 	return nil
 }
 
@@ -735,7 +739,9 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 			stream.State = StateClosed
 			stream.mu.Unlock()
 			p.manager.markActiveTransition(prev, StateClosed)
+			stream.Release()
 			delete(p.manager.streams, streamID)
+			p.manager.priorityTree.RemoveStream(streamID)
 		}
 	}
 
@@ -894,19 +900,7 @@ func (p *Processor) sendRSTStreamAndMarkClosed(streamID uint32, code http2.ErrCo
 		p.flush()
 	}
 
-	if s, ok := p.manager.GetStream(streamID); ok {
-		s.mu.Lock()
-		s.HeadersSent = false
-		s.IsStreaming = false
-		s.OutboundEndStream = false
-		if s.OutboundBuffer != nil {
-			s.OutboundBuffer.Reset()
-		}
-		s.OutboundBuffer = nil
-		s.phase = PhaseHeadersSent
-		s.mu.Unlock()
-	}
-
+	p.manager.DeleteStream(streamID)
 	return nil
 }
 

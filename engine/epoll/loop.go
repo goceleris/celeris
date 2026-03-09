@@ -146,6 +146,8 @@ func (l *Loop) run(ctx context.Context) {
 		for _, cs := range l.conns {
 			if err := flushWrites(cs); err != nil {
 				l.closeConn(cs.fd)
+			} else {
+				cs.pendingBytes = 0
 			}
 		}
 	}
@@ -246,6 +248,12 @@ func (l *Loop) drainRead(fd int) {
 		if processErr != nil {
 			// Flush any pending writes (e.g. error responses) before closing.
 			_ = flushWrites(cs)
+			cs.pendingBytes = 0
+			l.closeConn(fd)
+			return
+		}
+
+		if cs.pendingBytes > maxPendingBytes {
 			l.closeConn(fd)
 			return
 		}
@@ -268,9 +276,13 @@ func (l *Loop) initProtocol(cs *connState) {
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
+		if cs.pendingBytes > maxPendingBytes {
+			return
+		}
 		copied := make([]byte, len(data))
 		copy(copied, data)
 		cs.pending = append(cs.pending, copied)
+		cs.pendingBytes += len(copied)
 	}
 }
 

@@ -14,6 +14,12 @@ func getBuf() *bytes.Buffer {
 	return b
 }
 
+var streamPool = sync.Pool{New: func() any {
+	return &Stream{
+		ReceivedWindowUpd: make(chan int32, 16),
+	}
+}}
+
 // Stream represents an HTTP/2 stream with its associated state and data.
 type Stream struct {
 	ID                     uint32
@@ -44,18 +50,17 @@ type Stream struct {
 
 // NewStream creates a new stream.
 func NewStream(id uint32) *Stream {
+	s := streamPool.Get().(*Stream)
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Stream{
-		ID:                id,
-		State:             StateIdle,
-		Data:              getBuf(),
-		OutboundBuffer:    getBuf(),
-		WindowSize:        65535,
-		ReceivedWindowUpd: make(chan int32, 16),
-		ctx:               ctx,
-		cancel:            cancel,
-		phase:             PhaseInit,
-	}
+	s.ID = id
+	s.State = StateIdle
+	s.Data = getBuf()
+	s.OutboundBuffer = getBuf()
+	s.WindowSize = 65535
+	s.ctx = ctx
+	s.cancel = cancel
+	s.phase = PhaseInit
+	return s
 }
 
 // Context returns the stream's context.
@@ -68,6 +73,55 @@ func (s *Stream) Cancel() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+}
+
+// Release returns pooled buffers, cancels the context, and returns the stream
+// to its pool. Safe to call multiple times; subsequent calls are no-ops.
+func (s *Stream) Release() {
+	if s.ctx == nil {
+		return // already released
+	}
+	s.Cancel()
+	if s.Data != nil {
+		s.Data.Reset()
+		bufferPool.Put(s.Data)
+		s.Data = nil
+	}
+	if s.OutboundBuffer != nil {
+		s.OutboundBuffer.Reset()
+		bufferPool.Put(s.OutboundBuffer)
+		s.OutboundBuffer = nil
+	}
+	// Clear all fields to avoid retaining references.
+	s.ID = 0
+	s.State = 0
+	s.manager = nil
+	s.Headers = s.Headers[:0]
+	s.Trailers = s.Trailers[:0]
+	s.OutboundEndStream = false
+	s.HeadersSent = false
+	s.EndStream = false
+	s.IsStreaming = false
+	s.HandlerStarted = false
+	s.DeferResponse = false
+	s.WindowSize = 0
+	s.ResponseWriter = nil
+	s.ReceivedDataLen = 0
+	s.ReceivedInitialHeaders = false
+	s.ClosedByReset = false
+	s.ctx = nil
+	s.cancel = nil
+	s.phase = 0
+	// Drain the channel without blocking.
+	for {
+		select {
+		case <-s.ReceivedWindowUpd:
+		default:
+			goto drained
+		}
+	}
+drained:
+	streamPool.Put(s)
 }
 
 // AddHeader adds a header to the stream.

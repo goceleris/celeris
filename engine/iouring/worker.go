@@ -98,14 +98,11 @@ func (w *Worker) run(ctx context.Context) {
 	}
 	w.ring = ring
 
-	if w.tier.SupportsProvidedBuffers() {
-		bg, bgErr := NewBufferGroup(w.ring, 0, w.resolved.BufferPool, w.resolved.BufferSize)
-		if bgErr != nil {
-			w.logger.Warn("failed to setup provided buffers, falling back", "err", bgErr)
-		} else {
-			w.bufGroup = bg
-		}
-	}
+	// Provided buffers are supported by the tier but not yet wired into
+	// PrepareRecv (requires multishot recv with IOSQE_BUFFER_SELECT).
+	// Allocating the BufferGroup inflates Go's GC heap accounting
+	// (count×size bytes from Go heap), causing GC to never trigger on
+	// actual request allocations. Skip until multishot recv is implemented.
 
 	w.tier.PrepareAccept(w.ring, w.listenFD)
 	if _, err := w.ring.Submit(); err != nil {
@@ -307,6 +304,14 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		return
 	}
 
+	// Back-pressure: close connection if sendQueue grew too large.
+	if cs.sendQueueBytes > maxSendQueueBytes {
+		w.closeConn(fd)
+		return
+	}
+
+	w.flushSend(fd)
+
 	if !cqeHasMore(c.Flags) {
 		w.tier.PrepareRecv(w.ring, fd, cs.buf)
 	}
@@ -321,6 +326,7 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 	if c.Res < 0 {
 		w.errCount.Add(1)
 		cs.sendQueue = cs.sendQueue[:0]
+		cs.sendQueueBytes = 0
 		if cs.closing {
 			w.finishClose(fd)
 		} else {
@@ -331,22 +337,35 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 
 	// Handle partial sends by re-sending the remainder.
 	sent := int(c.Res)
+	cs.sending = false
 	if len(cs.sendQueue) > 0 {
 		buf := cs.sendQueue[0]
 		if sent < len(buf) {
-			remaining := buf[sent:]
-			newBuf := make([]byte, len(remaining))
-			copy(newBuf, remaining)
-			cs.sendQueue[0] = newBuf
-			w.tier.PrepareSend(w.ring, fd, newBuf, false)
-			return
+			cs.sendQueue[0] = buf[sent:]
+			cs.sendQueueBytes -= sent
+		} else {
+			cs.sendQueueBytes -= len(buf)
+			cs.sendQueue = cs.sendQueue[1:]
 		}
-		cs.sendQueue = cs.sendQueue[1:]
 	}
 
 	if cs.closing && len(cs.sendQueue) == 0 {
 		w.finishClose(fd)
+		return
 	}
+
+	w.flushSend(fd)
+}
+
+// flushSend submits a SEND SQE for the next queued buffer if one is pending
+// and no send is already in-flight for this connection.
+func (w *Worker) flushSend(fd int) {
+	cs, ok := w.conns[fd]
+	if !ok || cs.sending || len(cs.sendQueue) == 0 {
+		return
+	}
+	cs.sending = true
+	w.tier.PrepareSend(w.ring, fd, cs.sendQueue[0], false)
 }
 
 func (w *Worker) handleClose(fd int) {
@@ -395,14 +414,21 @@ func (w *Worker) finishClose(fd int) {
 
 func (w *Worker) makeWriteFn(fd int) func([]byte) {
 	return func(data []byte) {
+		cs, ok := w.conns[fd]
+		if !ok {
+			return
+		}
+		// Back-pressure: drop writes when sendQueue exceeds limit.
+		// The connection will be closed after processing completes.
+		if cs.sendQueueBytes > maxSendQueueBytes {
+			return
+		}
 		// Copy data — the caller may reuse the underlying buffer (e.g. sync.Pool)
 		// before the kernel processes the SEND SQE.
 		copied := make([]byte, len(data))
 		copy(copied, data)
-		if cs, ok := w.conns[fd]; ok {
-			cs.sendQueue = append(cs.sendQueue, copied)
-		}
-		w.tier.PrepareSend(w.ring, fd, copied, false)
+		cs.sendQueue = append(cs.sendQueue, copied)
+		cs.sendQueueBytes += len(copied)
 	}
 }
 
