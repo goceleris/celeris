@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -36,6 +37,9 @@ type Loop struct {
 	cfg          resource.Config
 	logger       *slog.Logger
 	acceptPaused *atomic.Bool
+	wake         chan struct{}
+	wakeMu       sync.Mutex
+	suspended    atomic.Bool
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -80,6 +84,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		cfg:          cfg,
 		logger:       cfg.Logger,
 		acceptPaused: acceptPaused,
+		wake:         make(chan struct{}),
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
@@ -112,8 +117,35 @@ func (l *Loop) run(ctx context.Context) {
 		default:
 		}
 
+		// ACTIVE → DRAINING: close listen socket to leave SO_REUSEPORT group.
+		if l.listenFD >= 0 && l.acceptPaused.Load() {
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
+			_ = unix.Close(l.listenFD)
+			l.listenFD = -1
+		}
+
+		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
+		if l.listenFD < 0 && !l.acceptPaused.Load() {
+			fd, err := createListenSocket(l.cfg.Addr)
+			if err != nil {
+				l.logger.Error("re-create listen socket", "loop", l.id, "err", err)
+				l.shutdown()
+				return
+			}
+			if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
+				Events: unix.EPOLLIN | unix.EPOLLET,
+				Fd:     int32(fd),
+			}); err != nil {
+				l.logger.Error("epoll_ctl re-add listen", "loop", l.id, "err", err)
+				_ = unix.Close(fd)
+				l.shutdown()
+				return
+			}
+			l.listenFD = fd
+		}
+
 		timeoutMs := activeTimeoutMs
-		if l.acceptPaused.Load() && len(l.conns) == 0 {
+		if l.listenFD < 0 {
 			timeoutMs = 500
 		}
 
@@ -130,7 +162,7 @@ func (l *Loop) run(ctx context.Context) {
 			ev := &l.events[i]
 			fd := int(ev.Fd)
 
-			if fd == l.listenFD {
+			if fd == l.listenFD && l.listenFD >= 0 {
 				l.acceptAll(ctx)
 				continue
 			}
@@ -155,14 +187,30 @@ func (l *Loop) run(ctx context.Context) {
 				cs.pendingBytes = 0
 			}
 		}
+
+		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
+		if l.listenFD < 0 && len(l.conns) == 0 && l.acceptPaused.Load() {
+			l.wakeMu.Lock()
+			if !l.acceptPaused.Load() {
+				l.wakeMu.Unlock()
+				continue
+			}
+			l.suspended.Store(true)
+			wake := l.wake
+			l.wakeMu.Unlock()
+
+			select {
+			case <-wake:
+			case <-ctx.Done():
+				l.shutdown()
+				return
+			}
+			continue
+		}
 	}
 }
 
 func (l *Loop) acceptAll(ctx context.Context) {
-	if l.acceptPaused.Load() {
-		return
-	}
-
 	for {
 		newFD, _, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
@@ -318,7 +366,9 @@ func (l *Loop) shutdown() {
 		cs.cancel()
 		_ = unix.Close(fd)
 	}
-	_ = unix.Close(l.listenFD)
+	if l.listenFD >= 0 {
+		_ = unix.Close(l.listenFD)
+	}
 	_ = unix.Close(l.epollFD)
 }
 

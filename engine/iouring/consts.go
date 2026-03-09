@@ -31,6 +31,7 @@ const (
 	opACCEPT         = 13
 	opRECV           = 27
 	opSEND           = 26
+	opASYNCCANCEL    = 14
 	opCLOSE          = 19
 	opPROVIDEBUFFERS = 31
 )
@@ -50,6 +51,12 @@ const (
 // Accept flags.
 const (
 	acceptMultishot = 1 << 0
+)
+
+// Async cancel flags.
+const (
+	cancelFD  = 1 << 1 // IORING_ASYNC_CANCEL_FD
+	cancelAll = 1 << 0 // IORING_ASYNC_CANCEL_ALL
 )
 
 // Mmap offsets for ring buffers.

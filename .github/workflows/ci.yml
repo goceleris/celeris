@@ -74,6 +74,19 @@ jobs:
           -run "TestHTTP1Parallel|TestH2CParallel|TestAutoProtocolDetection|TestH2CMultipleStreams|TestHTTP1LargeBodyParallel"
           ./test/spec/...
 
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Integration tests
+        run: go test -v -race -count=1 -timeout=120s ./test/integration/...
+      - name: Integration tests (constrained)
+        run: taskset -c 0 go test -v -count=1 -timeout=120s -run TestAdaptiveAutoSingleWorker ./test/integration/...
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

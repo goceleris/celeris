@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,56 +27,35 @@ type addrEngine interface {
 
 // Engine is an adaptive meta-engine that switches between io_uring and epoll.
 type Engine struct {
-	primary   addrEngine // io_uring
-	secondary addrEngine // epoll
-	active    atomic.Pointer[engine.Engine]
-	ctrl      *controller
-	cfg       resource.Config
-	handler   stream.Handler
-	addr      atomic.Pointer[net.Addr]
-	mu        sync.Mutex
-	frozen    atomic.Bool
-	logger    *slog.Logger
-}
-
-// splitResources resolves the full resource config and halves shared resources
-// so each sub-engine gets roughly half the total footprint. Per-connection
-// settings (BufferSize, SocketRecv, SocketSend) are unchanged.
-func splitResources(cfg resource.Config) (iouringCfg, epollCfg resource.Config) {
-	full := cfg.Resources.Resolve(runtime.NumCPU())
-	half := resource.Resources{
-		Preset:      cfg.Resources.Preset,
-		Workers:     max(full.Workers/2, 1),
-		SQERingSize: max(full.SQERingSize/2, 1024),
-		BufferPool:  max(full.BufferPool/2, 256),
-		MaxEvents:   max(full.MaxEvents/2, 128),
-		MaxConns:    max(full.MaxConns/2, 256),
-		BufferSize:  cfg.Resources.BufferSize,
-		SocketRecv:  cfg.Resources.SocketRecv,
-		SocketSend:  cfg.Resources.SocketSend,
-	}
-	iouringCfg = cfg
-	iouringCfg.Resources = half
-	epollCfg = cfg
-	epollCfg.Resources = half
-	return
+	primary        addrEngine // io_uring
+	secondary      addrEngine // epoll
+	active         atomic.Pointer[engine.Engine]
+	ctrl           *controller
+	cfg            resource.Config
+	handler        stream.Handler
+	addr           atomic.Pointer[net.Addr]
+	mu             sync.Mutex
+	switchMu       sync.Mutex // protects evaluate + performSwitch coordination
+	frozen         atomic.Bool
+	logger         *slog.Logger
+	suppressFreeze func(time.Duration)
 }
 
 // New creates a new adaptive engine with io_uring as primary and epoll as secondary.
+// Both sub-engines get the full resource config. This is safe because standby
+// workers are fully suspended (zero CPU, zero connections, listen sockets closed).
 func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	cfg = cfg.WithDefaults()
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	iouringCfg, epollCfg := splitResources(cfg)
-
-	primary, err := iouring.New(iouringCfg, handler)
+	primary, err := iouring.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
 
-	secondary, err := epoll.New(epollCfg, handler)
+	secondary, err := epoll.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("epoll sub-engine: %w", err)
 	}
@@ -162,7 +140,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 	})
 
 	// Wait for both engines to bind their addresses.
-	deadline := time.Now().Add(5 * time.Second)
+	// io_uring may need multiple tier fallback attempts, so allow ample time.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if e.primary.Addr() != nil && e.secondary.Addr() != nil {
 			break
@@ -222,7 +201,10 @@ func (e *Engine) runEvalLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if e.ctrl.evaluate(now, e.frozen.Load()) {
+			e.switchMu.Lock()
+			shouldSwitch := e.ctrl.evaluate(now, e.frozen.Load())
+			e.switchMu.Unlock()
+			if shouldSwitch {
 				e.performSwitch()
 			}
 		}
@@ -235,6 +217,7 @@ func (e *Engine) performSwitch() {
 
 	now := time.Now()
 
+	e.switchMu.Lock()
 	var newActive, newStandby addrEngine
 	if e.ctrl.state.activeIsPrimary {
 		// Switching: primary → secondary.
@@ -245,23 +228,34 @@ func (e *Engine) performSwitch() {
 		newActive = e.primary
 		newStandby = e.secondary
 	}
+	e.switchMu.Unlock()
 
-	// Pause standby (was active), resume new active.
-	if ac, ok := newStandby.(engine.AcceptController); ok {
-		_ = ac.PauseAccept()
-	}
+	// Resume new active BEFORE pausing old — this creates a brief overlap
+	// where both engines listen (via SO_REUSEPORT), which is correct. The
+	// alternative (pause first) creates a window where NEITHER listens,
+	// because io_uring ASYNC_CANCEL and epoll listen socket re-creation
+	// are asynchronous.
 	if ac, ok := newActive.(engine.AcceptController); ok {
 		_ = ac.ResumeAccept()
+	}
+	if ac, ok := newStandby.(engine.AcceptController); ok {
+		_ = ac.PauseAccept()
 	}
 
 	var eng engine.Engine = newActive
 	e.active.Store(&eng)
+	e.switchMu.Lock()
 	e.ctrl.recordSwitch(now)
+	e.switchMu.Unlock()
 
 	e.logger.Info("engine switch completed",
 		"now_active", newActive.Type().String(),
 		"now_standby", newStandby.Type().String(),
 	)
+
+	if e.suppressFreeze != nil {
+		e.suppressFreeze(5 * time.Second)
+	}
 }
 
 // Shutdown gracefully shuts down both sub-engines.
@@ -313,4 +307,17 @@ func (e *Engine) UnfreezeSwitching() {
 // ActiveEngine returns the currently active engine.
 func (e *Engine) ActiveEngine() engine.Engine {
 	return *e.active.Load()
+}
+
+// SetFreezeSuppressor registers a callback to suppress overload freeze
+// during engine switches.
+func (e *Engine) SetFreezeSuppressor(fn func(time.Duration)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.suppressFreeze = fn
+}
+
+// ForceSwitch triggers an immediate engine switch (for testing).
+func (e *Engine) ForceSwitch() {
+	e.performSwitch()
 }
