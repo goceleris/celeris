@@ -52,11 +52,6 @@ const (
 	acceptMultishot = 1 << 0
 )
 
-// Recv flags.
-const (
-	recvMultishot = 1 << 1
-)
-
 // Mmap offsets for ring buffers.
 const (
 	offSQRing = 0
