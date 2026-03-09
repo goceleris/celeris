@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +40,9 @@ type Worker struct {
 	cfg          resource.Config
 	ready        chan error
 	acceptPaused *atomic.Bool
+	wake         chan struct{}
+	wakeMu       sync.Mutex
+	suspended    atomic.Bool
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -72,6 +76,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		activeConns:  activeConns,
 		errCount:     errCount,
 		acceptPaused: acceptPaused,
+		wake:         make(chan struct{}),
 		ready:        make(chan error, 1),
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
@@ -118,10 +123,54 @@ func (w *Worker) run(ctx context.Context) {
 			return
 		}
 
+		// ACTIVE → DRAINING: cancel pending io_uring operations on the listen
+		// socket, then close it. The cancel releases the kernel's io_uring
+		// reference to the underlying file, allowing the socket to leave the
+		// SO_REUSEPORT group immediately. Without this, unix.Close alone
+		// leaves a phantom socket that intercepts connections.
+		if w.listenFD >= 0 && w.acceptPaused.Load() {
+			if sqe := w.ring.GetSQE(); sqe != nil {
+				prepCancelFD(sqe, w.listenFD)
+				setSQEUserData(sqe, 0)
+				// Submit and wait for the cancel to complete before closing.
+				_ = w.ring.SubmitAndWaitTimeout(50 * time.Millisecond)
+				// Process CQEs: skip cancel completions (userData=0),
+				// handle everything else normally to avoid breaking
+				// active connections.
+				for {
+					entry := w.ring.peekCQE()
+					if entry == nil {
+						break
+					}
+					if entry.UserData != 0 {
+						w.processCQE(ctx, entry)
+					}
+					w.ring.AdvanceCQ()
+				}
+			}
+			_ = unix.Close(w.listenFD)
+			w.listenFD = -1
+		}
+
+		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
+		if w.listenFD < 0 && !w.acceptPaused.Load() {
+			fd, err := createListenSocket(w.cfg.Addr)
+			if err != nil {
+				w.logger.Error("re-create listen socket", "worker", w.id, "err", err)
+				w.shutdown()
+				return
+			}
+			w.listenFD = fd
+			w.tier.PrepareAccept(w.ring, w.listenFD)
+			if _, err := w.ring.Submit(); err != nil {
+				w.logger.Error("submit after listen re-create", "worker", w.id, "err", err)
+			}
+		}
+
 		// Non-blocking peek for CQEs, fall back to timed wait.
 		if w.ring.peekCQE() == nil {
 			waitTimeout := 100 * time.Millisecond
-			if w.acceptPaused.Load() && len(w.conns) == 0 {
+			if w.listenFD < 0 {
 				waitTimeout = 1 * time.Second
 			}
 			if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
@@ -151,6 +200,28 @@ func (w *Worker) run(ctx context.Context) {
 		if _, err := w.ring.Submit(); err != nil {
 			w.logger.Error("submit failed", "worker", w.id, "err", err)
 		}
+
+		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
+		// Checked after CQE processing so accept CQEs for connections that
+		// completed before the listen socket close are served, not leaked.
+		if w.listenFD < 0 && len(w.conns) == 0 && w.acceptPaused.Load() {
+			w.wakeMu.Lock()
+			if !w.acceptPaused.Load() {
+				w.wakeMu.Unlock()
+				continue
+			}
+			w.suspended.Store(true)
+			wake := w.wake
+			w.wakeMu.Unlock()
+
+			select {
+			case <-wake:
+			case <-ctx.Done():
+				w.shutdown()
+				return
+			}
+			continue
+		}
 	}
 }
 
@@ -172,24 +243,20 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry) {
 	}
 }
 
-func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, listenFD int) {
+func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 	if c.Res < 0 {
 		w.errCount.Add(1)
-		if !w.tier.SupportsMultishotAccept() {
-			w.tier.PrepareAccept(w.ring, listenFD)
+		if w.listenFD >= 0 && !w.tier.SupportsMultishotAccept() {
+			w.tier.PrepareAccept(w.ring, w.listenFD)
 		}
 		return
 	}
 
 	newFD := int(c.Res)
 
-	if w.acceptPaused.Load() {
-		_ = unix.Close(newFD)
-		if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() {
-			w.tier.PrepareAccept(w.ring, listenFD)
-		}
-		return
-	}
+	// Don't discard accepted connections even when paused — the TCP handshake
+	// already completed and the client expects a response. The listen socket
+	// will be closed within one event loop iteration to prevent further accepts.
 
 	_ = sockopts.ApplyFD(newFD, w.sockOpts)
 
@@ -206,8 +273,8 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, listenFD 
 	// detect the protocol from the received data before processing it.
 	w.tier.PrepareRecv(w.ring, newFD, cs.buf)
 
-	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() {
-		w.tier.PrepareAccept(w.ring, listenFD)
+	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() && w.listenFD >= 0 {
+		w.tier.PrepareAccept(w.ring, w.listenFD)
 	}
 }
 
@@ -357,8 +424,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 }
 
 func (w *Worker) handleClose(fd int) {
+	// finishClose already removed from conns and decremented activeConns.
+	// This is a no-op for the normal path but kept as a safety guard.
 	delete(w.conns, fd)
-	w.activeConns.Add(-1)
 }
 
 func (w *Worker) closeConn(fd int) {
@@ -468,7 +536,9 @@ func (w *Worker) shutdown() {
 		cs.cancel()
 		_ = unix.Close(fd)
 	}
-	_ = unix.Close(w.listenFD)
+	if w.listenFD >= 0 {
+		_ = unix.Close(w.listenFD)
+	}
 	if w.ring != nil {
 		_ = w.ring.Close()
 	}
