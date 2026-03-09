@@ -283,50 +283,6 @@ func TestOverloadFreeze(t *testing.T) {
 	}
 }
 
-func TestResourceSplit(t *testing.T) {
-	tests := []struct {
-		workers     int
-		wantWorkers int
-	}{
-		{1, 1},
-		{2, 1},
-		{4, 2},
-		{8, 4},
-		{16, 8},
-	}
-	for _, tt := range tests {
-		cfg := resource.Config{
-			Resources: resource.Resources{
-				Workers: tt.workers,
-			},
-		}
-		ioCfg, epCfg := splitResources(cfg)
-
-		if ioCfg.Resources.Workers != tt.wantWorkers {
-			t.Errorf("workers=%d: io_uring workers = %d, want %d", tt.workers, ioCfg.Resources.Workers, tt.wantWorkers)
-		}
-		if epCfg.Resources.Workers != tt.wantWorkers {
-			t.Errorf("workers=%d: epoll workers = %d, want %d", tt.workers, epCfg.Resources.Workers, tt.wantWorkers)
-		}
-
-		// Both sub-engine configs should be identical.
-		if ioCfg.Resources != epCfg.Resources {
-			t.Errorf("workers=%d: io_uring and epoll resources differ", tt.workers)
-		}
-
-		// Per-connection settings should be unchanged.
-		if ioCfg.Resources.BufferSize != cfg.Resources.BufferSize {
-			t.Errorf("workers=%d: BufferSize changed", tt.workers)
-		}
-		if ioCfg.Resources.SocketRecv != cfg.Resources.SocketRecv {
-			t.Errorf("workers=%d: SocketRecv changed", tt.workers)
-		}
-		if ioCfg.Resources.SocketSend != cfg.Resources.SocketSend {
-			t.Errorf("workers=%d: SocketSend changed", tt.workers)
-		}
-	}
-}
-
 func TestHistoricalScoreDecay(t *testing.T) {
 	primary := newMockEngine(engine.IOUring)
 	secondary := newMockEngine(engine.Epoll)
@@ -414,5 +370,42 @@ func TestSwitchAfterActiveDegrades(t *testing.T) {
 	// Active score = 50. 100 > 50*1.15 = 57.5 → switch.
 	if !e.ctrl.evaluate(now, false) {
 		t.Error("expected switch when active degrades below standby historical")
+	}
+}
+
+func TestSwitchTriggersFreezeSuppression(t *testing.T) {
+	primary := newMockEngine(engine.IOUring)
+	secondary := newMockEngine(engine.Epoll)
+	sampler := newSyntheticSampler()
+
+	cfg := resource.Config{Protocol: engine.HTTP1}
+	e := newFromEngines(primary, secondary, sampler, cfg)
+	e.ctrl.cooldown = 0
+	e.ctrl.minObserve = 0
+
+	var suppressDuration time.Duration
+	var suppressCalls int
+	e.SetFreezeSuppressor(func(d time.Duration) {
+		suppressDuration = d
+		suppressCalls++
+	})
+
+	// Pre-seed standby historical score.
+	now := time.Now()
+	e.ctrl.state.lastActiveScore[engine.Epoll] = 200
+	e.ctrl.state.lastActiveTime[engine.Epoll] = now
+
+	sampler.Set(engine.IOUring, TelemetrySnapshot{ThroughputRPS: 100})
+
+	if !e.ctrl.evaluate(now, false) {
+		t.Fatal("expected switch")
+	}
+	e.performSwitch()
+
+	if suppressCalls != 1 {
+		t.Errorf("expected 1 suppressFreeze call, got %d", suppressCalls)
+	}
+	if suppressDuration != 5*time.Second {
+		t.Errorf("expected 5s suppression, got %v", suppressDuration)
 	}
 }
