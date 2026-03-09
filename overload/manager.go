@@ -22,6 +22,7 @@ type Manager struct {
 	escalateAboveSince   time.Time
 	deescalateBelowSince time.Time
 	cooldownUntil        time.Time
+	freezeSuppressUntil  time.Time
 
 	baseWorkers int
 }
@@ -45,6 +46,14 @@ func (m *Manager) SetFreezeHook(fn func(frozen bool)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.freezeHook = fn
+}
+
+// SuppressFreeze defers freeze escalation for the given duration.
+// Other escalation stages (Expand, Reap, Backpressure, Reject) fire normally.
+func (m *Manager) SuppressFreeze(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.freezeSuppressUntil = time.Now().Add(d)
 }
 
 // Stage returns the current overload stage.
@@ -135,7 +144,7 @@ func (m *Manager) escalateTo(stage Stage, now time.Time) {
 		m.hooks.ReapIdleConnections(30 * time.Second)
 	case Reorder:
 		m.hooks.SetSchedulingMode(true)
-		if m.freezeHook != nil {
+		if m.freezeHook != nil && !now.Before(m.freezeSuppressUntil) {
 			m.freezeHook(true)
 		}
 	case Backpressure:

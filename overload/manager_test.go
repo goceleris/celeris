@@ -292,3 +292,94 @@ func TestNoEscalationWithoutSustained(t *testing.T) {
 		t.Errorf("expected Normal (not sustained), got %v", mgr.Stage())
 	}
 }
+
+func TestFreezeSuppression(t *testing.T) {
+	mon := cpumon.NewSynthetic(0.0)
+	hooks := newMockHooks()
+	cfg := fastConfig()
+	mgr := NewManager(cfg, mon, hooks, nil)
+
+	var frozenMu sync.Mutex
+	frozen := false
+	mgr.SetFreezeHook(func(f bool) {
+		frozenMu.Lock()
+		frozen = f
+		frozenMu.Unlock()
+	})
+
+	getFrozen := func() bool {
+		frozenMu.Lock()
+		defer frozenMu.Unlock()
+		return frozen
+	}
+
+	// Suppress freeze for a long duration.
+	mgr.SuppressFreeze(5 * time.Second)
+
+	// Escalate to Reorder (stage 3). Freeze hook should NOT fire.
+	mon.Set(0.88)
+	runForDuration(t, mgr, 80*time.Millisecond)
+
+	if mgr.Stage() < Reorder {
+		t.Fatalf("expected at least Reorder, got %v", mgr.Stage())
+	}
+	if getFrozen() {
+		t.Error("freeze hook should be suppressed during suppression period")
+	}
+}
+
+func TestFreezeFiringAfterSuppressionExpiry(t *testing.T) {
+	mon := cpumon.NewSynthetic(0.0)
+	hooks := newMockHooks()
+	cfg := fastConfig()
+	mgr := NewManager(cfg, mon, hooks, nil)
+
+	var frozenMu sync.Mutex
+	frozen := false
+	mgr.SetFreezeHook(func(f bool) {
+		frozenMu.Lock()
+		frozen = f
+		frozenMu.Unlock()
+	})
+
+	getFrozen := func() bool {
+		frozenMu.Lock()
+		defer frozenMu.Unlock()
+		return frozen
+	}
+
+	// Suppress for a very short duration (already expired).
+	mgr.SuppressFreeze(0)
+
+	// Escalate to Reorder. Freeze hook SHOULD fire (suppression expired).
+	mon.Set(0.88)
+	runForDuration(t, mgr, 80*time.Millisecond)
+
+	if mgr.Stage() < Reorder {
+		t.Fatalf("expected at least Reorder, got %v", mgr.Stage())
+	}
+	if !getFrozen() {
+		t.Error("freeze hook should fire after suppression expiry")
+	}
+}
+
+func TestSuppressDoesNotBlockOtherStages(t *testing.T) {
+	mon := cpumon.NewSynthetic(0.0)
+	hooks := newMockHooks()
+	cfg := fastConfig()
+	mgr := NewManager(cfg, mon, hooks, nil)
+
+	// Suppress freeze for a long duration.
+	mgr.SuppressFreeze(5 * time.Second)
+
+	// Escalate to Reject (stage 5). All stages should fire except freeze.
+	mon.Set(0.97)
+	runForDuration(t, mgr, 80*time.Millisecond)
+
+	if mgr.Stage() != Reject {
+		t.Fatalf("expected Reject, got %v", mgr.Stage())
+	}
+	if !hooks.getAcceptPaused() {
+		t.Error("SetAcceptPaused should still be called at Reject stage")
+	}
+}
