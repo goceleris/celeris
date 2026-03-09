@@ -117,6 +117,47 @@ func TestOverloadFreezesAdaptive(t *testing.T) {
 	}
 }
 
+func TestSwitchDuringHighCPU(t *testing.T) {
+	mon := cpumon.NewSynthetic(0.87)
+	hooks := &testHooks{workers: 4}
+	cfg := overload.DefaultConfig()
+	cfg.Interval = 1 * time.Millisecond
+	for i := range cfg.Stages {
+		cfg.Stages[i].EscalateSustained = 3 * time.Millisecond
+		cfg.Stages[i].DeescalateSustained = 3 * time.Millisecond
+		cfg.Stages[i].Cooldown = 0
+	}
+
+	mgr := overload.NewManager(cfg, mon, hooks, nil)
+
+	var frozenMu sync.Mutex
+	frozen := false
+	mgr.SetFreezeHook(func(f bool) {
+		frozenMu.Lock()
+		frozen = f
+		frozenMu.Unlock()
+	})
+
+	getFrozen := func() bool {
+		frozenMu.Lock()
+		defer frozenMu.Unlock()
+		return frozen
+	}
+
+	// Suppress freeze (simulating an adaptive engine switch).
+	mgr.SuppressFreeze(500 * time.Millisecond)
+
+	// Run at 0.87 CPU — above Reorder threshold (0.85).
+	runManager(t, mgr, 30*time.Millisecond)
+
+	if mgr.Stage() < overload.Reorder {
+		t.Fatalf("expected at least Reorder, got %v", mgr.Stage())
+	}
+	if getFrozen() {
+		t.Error("freeze should be suppressed during adaptive switch grace period")
+	}
+}
+
 func TestStateCombinationMatrix(t *testing.T) {
 	mon := cpumon.NewSynthetic(0.0)
 	hooks := &testHooks{workers: 4}
