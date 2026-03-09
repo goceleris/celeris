@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,29 @@ type Engine struct {
 	logger    *slog.Logger
 }
 
+// splitResources resolves the full resource config and halves shared resources
+// so each sub-engine gets roughly half the total footprint. Per-connection
+// settings (BufferSize, SocketRecv, SocketSend) are unchanged.
+func splitResources(cfg resource.Config) (iouringCfg, epollCfg resource.Config) {
+	full := cfg.Resources.Resolve(runtime.NumCPU())
+	half := resource.Resources{
+		Preset:      cfg.Resources.Preset,
+		Workers:     max(full.Workers/2, 1),
+		SQERingSize: max(full.SQERingSize/2, 1024),
+		BufferPool:  max(full.BufferPool/2, 256),
+		MaxEvents:   max(full.MaxEvents/2, 128),
+		MaxConns:    max(full.MaxConns/2, 256),
+		BufferSize:  cfg.Resources.BufferSize,
+		SocketRecv:  cfg.Resources.SocketRecv,
+		SocketSend:  cfg.Resources.SocketSend,
+	}
+	iouringCfg = cfg
+	iouringCfg.Resources = half
+	epollCfg = cfg
+	epollCfg.Resources = half
+	return
+}
+
 // New creates a new adaptive engine with io_uring as primary and epoll as secondary.
 func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	cfg = cfg.WithDefaults()
@@ -46,8 +70,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	iouringCfg := cfg
-	epollCfg := cfg
+	iouringCfg, epollCfg := splitResources(cfg)
 
 	primary, err := iouring.New(iouringCfg, handler)
 	if err != nil {

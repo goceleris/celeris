@@ -120,8 +120,11 @@ func (w *Worker) run(ctx context.Context) {
 
 		// Non-blocking peek for CQEs, fall back to timed wait.
 		if w.ring.peekCQE() == nil {
-			// Submit+Wait with timeout so we periodically check for cancellation.
-			if err := w.ring.SubmitAndWaitTimeout(100 * time.Millisecond); err != nil {
+			waitTimeout := 100 * time.Millisecond
+			if w.acceptPaused.Load() && len(w.conns) == 0 {
+				waitTimeout = 1 * time.Second
+			}
+			if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
 				w.shutdown()
 				return
 			}

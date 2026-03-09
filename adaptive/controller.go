@@ -17,6 +17,8 @@ type controllerState struct {
 	switchCount     int
 	locked          bool
 	lockUntil       time.Time
+	lastActiveScore map[engine.EngineType]float64
+	lastActiveTime  map[engine.EngineType]time.Time
 }
 
 type controller struct {
@@ -46,6 +48,8 @@ func newController(primary, secondary engine.Engine, sampler TelemetrySampler, l
 		logger:       logger,
 		state: controllerState{
 			activeIsPrimary: true,
+			lastActiveScore: make(map[engine.EngineType]float64),
+			lastActiveTime:  make(map[engine.EngineType]time.Time),
 		},
 	}
 }
@@ -82,10 +86,20 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	}
 
 	activeSnap := c.sampler.Sample(active)
-	standbySnap := c.sampler.Sample(standby)
-
 	activeScore := computeScore(activeSnap, c.weights)
-	standbyScore := computeScore(standbySnap, c.weights)
+
+	// Store active's score for historical reference.
+	c.state.lastActiveScore[active.Type()] = activeScore
+	c.state.lastActiveTime[active.Type()] = now
+
+	// Seed standby with 80% of active if no history exists.
+	if _, ok := c.state.lastActiveScore[standby.Type()]; !ok {
+		c.state.lastActiveScore[standby.Type()] = activeScore * 0.80
+		c.state.lastActiveTime[standby.Type()] = now
+	}
+
+	// Use historical score for standby (with 1%/sec decay).
+	standbyScore := c.historicalScore(standby.Type(), now)
 
 	if standbyScore > activeScore*(1.0+c.threshold) {
 		c.logger.Info("switch recommended",
@@ -98,6 +112,17 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	}
 
 	return false
+}
+
+// historicalScore returns the last known score for an engine type, decayed
+// at 1% per second since the score was recorded.
+func (c *controller) historicalScore(et engine.EngineType, now time.Time) float64 {
+	score, ok := c.state.lastActiveScore[et]
+	if !ok {
+		return 0
+	}
+	elapsed := now.Sub(c.state.lastActiveTime[et]).Seconds()
+	return score * max(0, 1.0-0.01*elapsed)
 }
 
 // recordSwitch updates controller state after a switch has been performed.

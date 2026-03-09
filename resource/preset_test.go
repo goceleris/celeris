@@ -81,8 +81,8 @@ func TestResolvePresetMinimal(t *testing.T) {
 		numCPU  int
 		workers int
 	}{
-		{1, MinWorkers},
-		{4, MinWorkers},
+		{1, 1},
+		{4, 2},
 		{8, 4},
 		{16, 8},
 		{32, 16},

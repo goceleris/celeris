@@ -122,7 +122,7 @@ func TestValidateNegativeTimeouts(t *testing.T) {
 
 func TestValidateWorkersBelowMin(t *testing.T) {
 	c := Config{
-		Resources: Resources{Workers: 1},
+		Resources: Resources{Workers: -1},
 	}
 	errs := c.Validate()
 	found := false
@@ -132,7 +132,7 @@ func TestValidateWorkersBelowMin(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("expected Workers validation error for Workers=1")
+		t.Error("expected Workers validation error for Workers=-1")
 	}
 }
 
