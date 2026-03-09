@@ -138,6 +138,13 @@ func (w *Worker) run(ctx context.Context) {
 			processed++
 		}
 
+		// Retry pending sends that failed due to SQ ring being full.
+		for fd, cs := range w.conns {
+			if !cs.sending && len(cs.sendQueue) > 0 {
+				w.flushSend(fd)
+			}
+		}
+
 		if _, err := w.ring.Submit(); err != nil {
 			w.logger.Error("submit failed", "worker", w.id, "err", err)
 		}
@@ -295,8 +302,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 	w.reqCount.Add(1)
 
 	if processErr != nil {
-		// Submit pending SEND SQEs (e.g. error responses) before closing
-		// so the kernel processes the send before the close.
+		// Flush pending writes (e.g. error responses) before closing.
+		w.flushSend(fd)
 		if _, err := w.ring.Submit(); err != nil {
 			w.logger.Error("submit failed", "worker", w.id, "err", err)
 		}
@@ -323,6 +330,8 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 		return
 	}
 
+	cs.sending = false
+
 	if c.Res < 0 {
 		w.errCount.Add(1)
 		cs.sendQueue = cs.sendQueue[:0]
@@ -335,9 +344,8 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 		return
 	}
 
-	// Handle partial sends by re-sending the remainder.
+	// Handle partial sends by updating the front buffer with the remainder.
 	sent := int(c.Res)
-	cs.sending = false
 	if len(cs.sendQueue) > 0 {
 		buf := cs.sendQueue[0]
 		if sent < len(buf) {
@@ -354,18 +362,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 		return
 	}
 
+	// Submit the next send (handles both partial-send retries and new data
+	// that arrived while this send was in flight).
 	w.flushSend(fd)
-}
-
-// flushSend submits a SEND SQE for the next queued buffer if one is pending
-// and no send is already in-flight for this connection.
-func (w *Worker) flushSend(fd int) {
-	cs, ok := w.conns[fd]
-	if !ok || cs.sending || len(cs.sendQueue) == 0 {
-		return
-	}
-	cs.sending = true
-	w.tier.PrepareSend(w.ring, fd, cs.sendQueue[0], false)
 }
 
 func (w *Worker) handleClose(fd int) {
@@ -383,10 +382,11 @@ func (w *Worker) closeConn(fd int) {
 	}
 	cs.cancel()
 
-	// Defer actual close until all in-flight SEND SQEs complete,
+	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
-	if len(cs.sendQueue) > 0 {
+	if cs.sending || len(cs.sendQueue) > 0 {
 		cs.closing = true
+		w.flushSend(fd)
 		return
 	}
 
@@ -429,7 +429,46 @@ func (w *Worker) makeWriteFn(fd int) func([]byte) {
 		copy(copied, data)
 		cs.sendQueue = append(cs.sendQueue, copied)
 		cs.sendQueueBytes += len(copied)
+		// Don't submit a SEND SQE here. Sends are serialized per-connection
+		// via flushSend, called after recv processing and send completion.
 	}
+}
+
+// flushSend submits one coalesced SEND SQE for pending data on this connection.
+// Only one SEND is in-flight per connection at a time; if a send is already
+// in progress, this is a no-op and the next send will be triggered when the
+// current one completes.
+func (w *Worker) flushSend(fd int) {
+	cs, ok := w.conns[fd]
+	if !ok || cs.sending || len(cs.sendQueue) == 0 {
+		return
+	}
+
+	// Coalesce all pending buffers into one to minimize SQEs.
+	var buf []byte
+	if len(cs.sendQueue) == 1 {
+		buf = cs.sendQueue[0]
+	} else {
+		total := 0
+		for _, b := range cs.sendQueue {
+			total += len(b)
+		}
+		buf = make([]byte, 0, total)
+		for _, b := range cs.sendQueue {
+			buf = append(buf, b...)
+		}
+		cs.sendQueue = cs.sendQueue[:1]
+		cs.sendQueue[0] = buf
+	}
+
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		// SQ ring full — will retry on next loop iteration.
+		return
+	}
+	prepSend(sqe, fd, buf, false)
+	setSQEUserData(sqe, encodeUserData(udSend, fd))
+	cs.sending = true
 }
 
 func (w *Worker) shutdown() {
