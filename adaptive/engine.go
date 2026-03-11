@@ -236,7 +236,7 @@ func (e *Engine) performSwitch() {
 		_ = ac.PauseAccept()
 	}
 
-	var eng engine.Engine = newActive
+	eng := engine.Engine(newActive)
 	e.active.Store(&eng)
 	e.switchMu.Lock()
 	e.ctrl.recordSwitch(now)
