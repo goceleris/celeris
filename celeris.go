@@ -24,6 +24,10 @@ var ErrAlreadyStarted = errors.New("celeris: server already started")
 // name has been registered.
 var ErrRouteNotFound = errors.New("celeris: named route not found")
 
+// ErrDuplicateRouteName is returned by [Route.TryName] when a route with the
+// given name has already been registered.
+var ErrDuplicateRouteName = errors.New("celeris: duplicate route name")
+
 // RouteInfo describes a registered route. Returned by [Server.Routes].
 type RouteInfo struct {
 	// Method is the HTTP method (e.g. "GET", "POST").
@@ -152,49 +156,22 @@ func (s *Server) URL(name string, params ...string) (string, error) {
 		return "", ErrRouteNotFound
 	}
 
-	path := route.path
-	buf := make([]byte, 0, len(path))
 	paramIdx := 0
-
-	for i := 0; i < len(path); {
-		switch path[i] {
-		case ':':
-			if paramIdx >= len(params) {
-				return "", fmt.Errorf("celeris: not enough params for route %q", name)
-			}
-			buf = append(buf, params[paramIdx]...)
-			paramIdx++
-			i++
-			for i < len(path) && path[i] != '/' {
-				i++
-			}
-		case '*':
-			if paramIdx >= len(params) {
-				return "", fmt.Errorf("celeris: not enough params for route %q", name)
-			}
-			val := params[paramIdx]
-			if len(val) == 0 {
-				// Trim trailing slash when catchAll value is empty.
-				if len(buf) > 0 && buf[len(buf)-1] == '/' {
-					buf = buf[:len(buf)-1]
-				}
-			} else if len(buf) > 0 && buf[len(buf)-1] == '/' && val[0] == '/' {
-				val = val[1:]
-			}
-			buf = append(buf, val...)
-			paramIdx++
-			i = len(path)
-		default:
-			buf = append(buf, path[i])
-			i++
+	u, err := buildURL(name, route.path, func(_ string) (string, bool) {
+		if paramIdx >= len(params) {
+			return "", false
 		}
+		v := params[paramIdx]
+		paramIdx++
+		return v, true
+	})
+	if err != nil {
+		return "", fmt.Errorf("celeris: not enough params for route %q", name)
 	}
-
 	if paramIdx != len(params) {
 		return "", fmt.Errorf("celeris: too many params for route %q: expected %d, got %d", name, paramIdx, len(params))
 	}
-
-	return string(buf), nil
+	return u, nil
 }
 
 // URLMap generates a URL for the named route by substituting named parameters
@@ -209,27 +186,31 @@ func (s *Server) URLMap(name string, params map[string]string) (string, error) {
 		return "", ErrRouteNotFound
 	}
 
-	path := route.path
-	buf := make([]byte, 0, len(path))
+	return buildURL(name, route.path, func(key string) (string, bool) {
+		v, ok := params[key]
+		return v, ok
+	})
+}
 
+func buildURL(name, path string, lookup func(key string) (string, bool)) (string, error) {
+	buf := make([]byte, 0, len(path))
 	for i := 0; i < len(path); {
 		switch path[i] {
 		case ':':
-			i++ // skip ':'
+			i++
 			nameStart := i
 			for i < len(path) && path[i] != '/' {
 				i++
 			}
-			key := path[nameStart:i]
-			val, ok := params[key]
+			val, ok := lookup(path[nameStart:i])
 			if !ok {
-				return "", fmt.Errorf("celeris: missing param %q for route %q", key, name)
+				return "", fmt.Errorf("celeris: missing param %q for route %q", path[nameStart:i], name)
 			}
 			buf = append(buf, val...)
 		case '*':
-			i++ // skip '*'
+			i++
 			key := path[i:]
-			val, ok := params[key]
+			val, ok := lookup(key)
 			if !ok {
 				return "", fmt.Errorf("celeris: missing param %q for route %q", key, name)
 			}
@@ -247,7 +228,6 @@ func (s *Server) URLMap(name string, params map[string]string) (string, error) {
 			i++
 		}
 	}
-
 	return string(buf), nil
 }
 
@@ -271,7 +251,9 @@ func (s *Server) prepare() (engine.Engine, error) {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	s.collector = observe.NewCollector()
+	if !s.config.DisableMetrics {
+		s.collector = observe.NewCollector()
+	}
 
 	var handler stream.Handler = &routerAdapter{server: s}
 	eng, err := createEngine(cfg, handler)
@@ -280,9 +262,11 @@ func (s *Server) prepare() (engine.Engine, error) {
 	}
 	s.engine = eng
 
-	s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {
-		return eng.Metrics()
-	})
+	if s.collector != nil {
+		s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {
+			return eng.Metrics()
+		})
+	}
 
 	logger := cfg.Logger
 	if logger == nil {

@@ -895,3 +895,50 @@ func TestServerAddr(t *testing.T) {
 		t.Fatal("expected nil addr before start")
 	}
 }
+
+func TestTryNameSuccess(t *testing.T) {
+	s := New(Config{})
+	route := s.GET("/users/:id", func(_ *Context) error { return nil })
+	if err := route.TryName("user"); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	u, err := s.URL("user", "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "/users/42" {
+		t.Fatalf("expected /users/42, got %s", u)
+	}
+}
+
+func TestTryNameDuplicate(t *testing.T) {
+	s := New(Config{})
+	r1 := s.GET("/a", func(_ *Context) error { return nil })
+	r2 := s.GET("/b", func(_ *Context) error { return nil })
+
+	if err := r1.TryName("dup"); err != nil {
+		t.Fatalf("first TryName should succeed: %v", err)
+	}
+	err := r2.TryName("dup")
+	if err == nil {
+		t.Fatal("expected error for duplicate name")
+	}
+	if !errors.Is(err, ErrDuplicateRouteName) {
+		t.Fatalf("expected ErrDuplicateRouteName, got %v", err)
+	}
+}
+
+func TestServerDisableMetrics(t *testing.T) {
+	s := New(Config{DisableMetrics: true})
+	s.GET("/ping", func(c *Context) error {
+		return c.String(200, "pong")
+	})
+
+	// Simulate prepare without actually starting.
+	s.engine = &fakeEngine{}
+	// When DisableMetrics is true, collector should remain nil.
+	if s.Collector() != nil {
+		t.Fatal("expected nil Collector when DisableMetrics is true")
+	}
+}

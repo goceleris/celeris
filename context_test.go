@@ -1850,3 +1850,26 @@ func TestContextAddParam(t *testing.T) {
 		t.Fatalf("expected 42, got %s", c.Param("id"))
 	}
 }
+
+func TestContextMaxFormSizeUnlimited(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("data", strings.Repeat("x", 1024))
+	_ = w.Close()
+
+	s, _ := newTestStream("POST", "/form")
+	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
+	s.Data.Write(buf.Bytes())
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+	c.maxFormSize = -1
+
+	if c.FormValue("data") == "" {
+		t.Fatal("expected form data to be parsed with maxFormSize=-1")
+	}
+	if len(c.FormValue("data")) != 1024 {
+		t.Fatalf("expected 1024 bytes, got %d", len(c.FormValue("data")))
+	}
+}

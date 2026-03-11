@@ -196,6 +196,10 @@
 //
 //	return c.Stream(200, "text/plain", reader)
 //
+// All response methods currently buffer the full body before sending.
+// True incremental streaming (e.g. Server-Sent Events) is planned for
+// a future release. The current API is forward-compatible.
+//
 // # Cookies
 //
 // Read and write cookies:

@@ -295,9 +295,6 @@ func (c *Context) Query(key string) string {
 		c.queryCache, _ = url.ParseQuery(c.rawQuery)
 		c.queryCached = true
 	}
-	if c.queryCache == nil {
-		return ""
-	}
 	return c.queryCache.Get(key)
 }
 
@@ -700,7 +697,11 @@ func (c *Context) parseForm() error {
 			return errors.New("celeris: missing multipart boundary")
 		}
 		r := multipart.NewReader(bytes.NewReader(body), boundary)
-		form, err := r.ReadForm(c.maxFormSize)
+		limit := c.maxFormSize
+		if limit < 0 {
+			limit = math.MaxInt64
+		}
+		form, err := r.ReadForm(limit)
 		if err != nil {
 			return err
 		}

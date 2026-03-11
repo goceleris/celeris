@@ -19,7 +19,7 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 	c := acquireContext(s)
 	defer releaseContext(c)
 
-	if a.server.config.MaxFormSize > 0 {
+	if a.server.config.MaxFormSize != 0 {
 		c.maxFormSize = a.server.config.MaxFormSize
 	}
 

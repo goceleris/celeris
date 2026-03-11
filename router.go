@@ -1,6 +1,9 @@
 package celeris
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 type nodeType uint8
 
@@ -49,6 +52,23 @@ func (r *Route) Name(name string) *Route {
 		r.router.namedMu.Unlock()
 	}
 	return r
+}
+
+// TryName is like [Route.Name] but returns an error instead of panicking when
+// a route with the same name already exists.
+func (r *Route) TryName(name string) error {
+	if r.router == nil {
+		r.name = name
+		return nil
+	}
+	r.router.namedMu.Lock()
+	defer r.router.namedMu.Unlock()
+	if _, exists := r.router.namedRoutes[name]; exists {
+		return fmt.Errorf("%w: %s", ErrDuplicateRouteName, name)
+	}
+	r.name = name
+	r.router.namedRoutes[name] = r
+	return nil
 }
 
 func newRouter() *router {

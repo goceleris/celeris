@@ -83,6 +83,11 @@ type Config struct {
 	// (default 32 MB). Set to -1 to disable the limit.
 	MaxFormSize int64
 
+	// DisableMetrics disables the built-in metrics collector. When true,
+	// [Server.Collector] returns nil and per-request metric recording is skipped.
+	// Default false (metrics enabled).
+	DisableMetrics bool
+
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
 }
