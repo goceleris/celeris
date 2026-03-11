@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"net"
 	"time"
 )
 
@@ -11,6 +12,8 @@ type Engine interface {
 	Shutdown(ctx context.Context) error
 	Metrics() EngineMetrics
 	Type() EngineType
+	// Addr returns the bound listener address, or nil if not yet listening.
+	Addr() net.Addr
 }
 
 // AcceptController is implemented by engines that support dynamic accept control.

@@ -77,9 +77,9 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	}
 
 	for _, h := range headers {
-		buf = append(buf, h[0]...)
+		buf = appendSanitizedHeaderField(buf, h[0])
 		buf = append(buf, ": "...)
-		buf = append(buf, h[1]...)
+		buf = appendSanitizedHeaderField(buf, h[1])
 		buf = append(buf, crlf...)
 	}
 
@@ -132,6 +132,16 @@ type h2ResponseAdapter struct {
 func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers [][2]string, body []byte) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
+	if len(body) > 0 {
+		for _, h := range s.Headers {
+			if h[0] == ":method" && h[1] == "HEAD" {
+				body = nil
+				break
+			}
+		}
+	}
 
 	responseHeaders := make([][2]string, 0, len(headers)+1)
 	responseHeaders = append(responseHeaders, [2]string{":status", strconv.Itoa(status)})
@@ -281,6 +291,19 @@ func statusText(code int) string {
 	default:
 		return "Unknown"
 	}
+}
+
+// appendSanitizedHeaderField appends s to buf, stripping any \r or \n bytes
+// to prevent HTTP response splitting (CWE-113). This is a defense-in-depth
+// measure; the public API (Context.SetHeader) also strips CRLF.
+func appendSanitizedHeaderField(buf []byte, s string) []byte {
+	for i := range len(s) {
+		b := s[i]
+		if b != '\r' && b != '\n' {
+			buf = append(buf, b)
+		}
+	}
+	return buf
 }
 
 func buildErrorResponse(status int, message string) []byte {

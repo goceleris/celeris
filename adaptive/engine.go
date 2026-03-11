@@ -19,16 +19,10 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
-// addrEngine is an engine that also exposes its bound address.
-type addrEngine interface {
-	engine.Engine
-	Addr() net.Addr
-}
-
 // Engine is an adaptive meta-engine that switches between io_uring and epoll.
 type Engine struct {
-	primary        addrEngine // io_uring
-	secondary      addrEngine // epoll
+	primary        engine.Engine // io_uring
+	secondary      engine.Engine // epoll
 	active         atomic.Pointer[engine.Engine]
 	ctrl           *controller
 	cfg            resource.Config
@@ -77,10 +71,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	var initialActive engine.Engine
 	switch cfg.Protocol {
 	case engine.H2C:
-		initialActive = engine.Engine(secondary)
+		initialActive = secondary
 		e.ctrl.state.activeIsPrimary = false
 	default: // HTTP1, Auto → io_uring
-		initialActive = engine.Engine(primary)
+		initialActive = primary
 		e.ctrl.state.activeIsPrimary = true
 	}
 	e.active.Store(&initialActive)
@@ -89,7 +83,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 }
 
 // newFromEngines creates an adaptive engine from pre-built engines (for testing).
-func newFromEngines(primary, secondary addrEngine, sampler TelemetrySampler, cfg resource.Config) *Engine {
+func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, cfg resource.Config) *Engine {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -107,10 +101,10 @@ func newFromEngines(primary, secondary addrEngine, sampler TelemetrySampler, cfg
 	var initialActive engine.Engine
 	switch cfg.Protocol {
 	case engine.H2C:
-		initialActive = engine.Engine(secondary)
+		initialActive = secondary
 		e.ctrl.state.activeIsPrimary = false
 	default:
-		initialActive = engine.Engine(primary)
+		initialActive = primary
 		e.ctrl.state.activeIsPrimary = true
 	}
 	e.active.Store(&initialActive)
@@ -218,7 +212,7 @@ func (e *Engine) performSwitch() {
 	now := time.Now()
 
 	e.switchMu.Lock()
-	var newActive, newStandby addrEngine
+	var newActive, newStandby engine.Engine
 	if e.ctrl.state.activeIsPrimary {
 		// Switching: primary → secondary.
 		newActive = e.secondary
