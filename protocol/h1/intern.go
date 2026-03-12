@@ -257,4 +257,3 @@ func internOrLowerHeader(raw []byte) string {
 	}
 	return strings.ToLower(string(raw))
 }
-

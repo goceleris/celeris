@@ -44,14 +44,14 @@ type Worker struct {
 	ring         *Ring
 	listenFD     int
 	tier         TierStrategy
-	fixedFiles   bool          // runtime flag: true if ACCEPT_DIRECT is working
+	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
 	conns        map[int]*connState
 	handler      stream.Handler
 	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
-	bufGroup     *BufferGroup  // legacy provided buffers (unused with ring-mapped)
-	bufRing      *BufferRing   // ring-mapped provided buffers for multishot recv
+	bufGroup     *BufferGroup // legacy provided buffers (unused with ring-mapped)
+	bufRing      *BufferRing  // ring-mapped provided buffers for multishot recv
 	logger       *slog.Logger
 	cfg          resource.Config
 	ready        chan error
@@ -424,8 +424,8 @@ func (w *Worker) initProtocol(cs *connState) {
 		writeFn := w.makeWriteFn(cs.fd)
 		cs.h2State = conn.NewH2State(w.handler, conn.H2Config{
 			MaxConcurrentStreams: w.cfg.MaxConcurrentStreams,
-			InitialWindowSize:   w.cfg.InitialWindowSize,
-			MaxFrameSize:        w.cfg.MaxFrameSize,
+			InitialWindowSize:    w.cfg.InitialWindowSize,
+			MaxFrameSize:         w.cfg.MaxFrameSize,
 		}, writeFn)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
@@ -502,8 +502,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 	case engine.H2C:
 		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, writeFn, conn.H2Config{
 			MaxConcurrentStreams: w.cfg.MaxConcurrentStreams,
-			InitialWindowSize:   w.cfg.InitialWindowSize,
-			MaxFrameSize:        w.cfg.MaxFrameSize,
+			InitialWindowSize:    w.cfg.InitialWindowSize,
+			MaxFrameSize:         w.cfg.MaxFrameSize,
 		})
 	}
 
