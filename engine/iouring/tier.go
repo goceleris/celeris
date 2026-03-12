@@ -153,7 +153,7 @@ func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
 
-func (t *highTier) PrepareRecv(ring *Ring, fd int, buf []byte) {
+func (t *highTier) PrepareRecv(ring *Ring, fd int, _ []byte) {
 	sqe := ring.GetSQE()
 	if sqe == nil {
 		return
@@ -208,7 +208,7 @@ func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
 
-func (t *optionalTier) PrepareRecv(ring *Ring, fd int, buf []byte) {
+func (t *optionalTier) PrepareRecv(ring *Ring, fd int, _ []byte) {
 	sqe := ring.GetSQE()
 	if sqe == nil {
 		return

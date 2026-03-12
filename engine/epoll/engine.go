@@ -128,7 +128,7 @@ func (e *Engine) ResumeAccept() error {
 }
 
 var (
-	_ engine.Engine          = (*Engine)(nil)
+	_ engine.Engine           = (*Engine)(nil)
 	_ engine.AcceptController = (*Engine)(nil)
 )
 

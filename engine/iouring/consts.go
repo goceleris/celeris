@@ -39,10 +39,10 @@ const (
 
 // SQE flags.
 const (
-	sqeFixedFile       = 1 << 0
-	sqeIOLink          = 1 << 2
-	sqeBufferSelect    = 1 << 5
-	sqeCQESkipSuccess  = 1 << 6
+	sqeFixedFile      = 1 << 0
+	sqeIOLink         = 1 << 2
+	sqeBufferSelect   = 1 << 5
+	sqeCQESkipSuccess = 1 << 6
 )
 
 // CQE flags.
