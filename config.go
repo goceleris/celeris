@@ -111,6 +111,13 @@ type Config struct {
 	// Default false (metrics enabled).
 	DisableMetrics bool
 
+	// OnConnect is called when a new connection is accepted. The addr is the
+	// remote peer address. Must be fast — blocks the event loop.
+	OnConnect func(addr string)
+	// OnDisconnect is called when a connection is closed. The addr is the
+	// remote peer address. Must be fast — blocks the event loop.
+	OnDisconnect func(addr string)
+
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
 }
@@ -159,6 +166,8 @@ func (c Config) toResourceConfig() resource.Config {
 	}
 
 	rc.Objective = resource.ObjectiveProfile(c.Objective)
+	rc.OnConnect = c.OnConnect
+	rc.OnDisconnect = c.OnDisconnect
 
 	return rc
 }

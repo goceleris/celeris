@@ -19,6 +19,11 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
+var (
+	_ engine.Engine        = (*Engine)(nil)
+	_ engine.SwitchFreezer = (*Engine)(nil)
+)
+
 // Engine is an adaptive meta-engine that switches between io_uring and epoll.
 type Engine struct {
 	primary   engine.Engine // io_uring
@@ -32,6 +37,10 @@ type Engine struct {
 	switchMu  sync.Mutex // protects evaluate + performSwitch coordination
 	frozen    atomic.Bool
 	logger    *slog.Logger
+
+	// freezeCooldown is the duration to suppress further switches after a switch.
+	// Zero means no cooldown (default).
+	freezeCooldown time.Duration
 }
 
 // New creates a new adaptive engine with io_uring as primary and epoll as secondary.
@@ -245,6 +254,15 @@ func (e *Engine) performSwitch() {
 		"now_active", newActive.Type().String(),
 		"now_standby", newStandby.Type().String(),
 	)
+
+	// Suppress further switches for the cooldown period.
+	if e.freezeCooldown > 0 {
+		e.frozen.Store(true)
+		go func() {
+			time.Sleep(e.freezeCooldown)
+			e.frozen.Store(false)
+		}()
+	}
 }
 
 // Shutdown gracefully shuts down both sub-engines.
@@ -291,6 +309,12 @@ func (e *Engine) FreezeSwitching() {
 // UnfreezeSwitching allows the controller to switch engines again.
 func (e *Engine) UnfreezeSwitching() {
 	e.frozen.Store(false)
+}
+
+// SetFreezeCooldown sets the duration to suppress further switches after a switch.
+// Zero disables the cooldown (default). This prevents oscillation under unstable load.
+func (e *Engine) SetFreezeCooldown(d time.Duration) {
+	e.freezeCooldown = d
 }
 
 // ActiveEngine returns the currently active engine.

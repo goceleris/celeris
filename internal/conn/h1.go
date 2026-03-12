@@ -19,6 +19,10 @@ var ErrHijacked = errors.New("celeris: connection hijacked")
 // maxRequestBodySize is the maximum allowed request body (100 MB), matching H2.
 const maxRequestBodySize = 100 << 20
 
+// continue100Response is sent when the client sends "Expect: 100-continue"
+// to signal that the server is willing to accept the request body.
+var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
 	parser     *h1.Parser
@@ -28,10 +32,12 @@ type H1State struct {
 	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
 }
 
-// NewH1State creates a new H1 connection state.
+// NewH1State creates a new H1 connection state with zero-copy header parsing.
 func NewH1State() *H1State {
+	p := h1.NewParser()
+	p.SetZeroCopy(true)
 	return &H1State{
-		parser: h1.NewParser(),
+		parser: p,
 	}
 }
 
@@ -63,6 +69,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			}
 
 			if bodyNeeded > 0 || bodyNeeded == -1 {
+				if state.req.ExpectContinue {
+					write(continue100Response)
+					state.req.ExpectContinue = false
+				}
 				state.buffer.Write(data[offset:])
 				break
 			}
@@ -97,6 +107,11 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			bodyNeeded = -1
 		} else if state.req.ContentLength > 0 {
 			bodyNeeded = state.req.ContentLength
+		}
+
+		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
+			write(continue100Response)
+			state.req.ExpectContinue = false
 		}
 
 		var bodyData []byte
@@ -173,11 +188,11 @@ func handleH1Request(ctx context.Context, req *h1.Request, body []byte, remoteAd
 }
 
 func requestToStream(req *h1.Request, body []byte, remoteAddr string) *stream.Stream {
-	s := stream.NewStream(1)
+	s := stream.NewH1Stream(1)
 	s.RemoteAddr = remoteAddr
 	// Reuse the stream's existing header slice capacity from the pool.
 	hdrs := s.Headers[:0]
-	needed := len(req.Headers) + 4
+	needed := len(req.RawHeaders) + 4
 	if cap(hdrs) < needed {
 		hdrs = make([][2]string, 0, needed)
 	}
@@ -187,11 +202,20 @@ func requestToStream(req *h1.Request, body []byte, remoteAddr string) *stream.St
 		[2]string{":scheme", "http"},
 		[2]string{":authority", req.Host},
 	)
-	hdrs = append(hdrs, req.Headers...)
+	// Zero-copy header conversion: lowercase names in-place, then create
+	// strings backed by the read buffer. Safe because H1 handlers run
+	// synchronously — the buffer isn't reused until after the stream is released.
+	for _, rh := range req.RawHeaders {
+		hdrs = append(hdrs, [2]string{
+			h1.UnsafeLowerHeader(rh[0]),
+			h1.UnsafeString(rh[1]),
+		})
+	}
 	s.Headers = hdrs
+	s.IsHEAD = req.Method == "HEAD"
 
 	if len(body) > 0 {
-		_, _ = s.Data.Write(body)
+		_, _ = s.GetBuf().Write(body)
 	}
 	s.EndStream = true
 	s.SetState(stream.StateHalfClosedRemote)

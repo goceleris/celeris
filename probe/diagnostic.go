@@ -28,6 +28,8 @@ func DiagnosticReport(profile engine.CapabilityProfile, logger *slog.Logger) {
 			"coop_taskrun", profile.CoopTaskrun,
 			"single_issuer", profile.SingleIssuer,
 			"linked_sqes", profile.LinkedSQEs,
+			"defer_taskrun", profile.DeferTaskrun,
+			"fixed_files", profile.FixedFiles,
 		)
 	}
 }
@@ -50,6 +52,8 @@ func FormatDiagnostic(profile engine.CapabilityProfile) string {
 		fmt.Fprintf(&b, "CoopTaskrun: %t\n", profile.CoopTaskrun)
 		fmt.Fprintf(&b, "SingleIssuer: %t\n", profile.SingleIssuer)
 		fmt.Fprintf(&b, "LinkedSQEs: %t\n", profile.LinkedSQEs)
+		fmt.Fprintf(&b, "DeferTaskrun: %t\n", profile.DeferTaskrun)
+		fmt.Fprintf(&b, "FixedFiles: %t\n", profile.FixedFiles)
 	}
 
 	return b.String()

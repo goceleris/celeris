@@ -14,6 +14,14 @@ var defaultBucketBounds = []float64{
 	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 5,
 }
 
+var defaultBucketBoundsNS [bucketCount]int64
+
+func init() {
+	for i, bound := range defaultBucketBounds {
+		defaultBucketBoundsNS[i] = int64(bound * 1e9)
+	}
+}
+
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
 type EngineMetrics = engine.EngineMetrics
 
@@ -66,9 +74,9 @@ func (c *Collector) RecordRequest(duration time.Duration, status int) {
 	if status >= 500 {
 		c.errorsTotal.Add(1)
 	}
-	secs := duration.Seconds()
-	for i, bound := range defaultBucketBounds {
-		if secs <= bound {
+	ns := duration.Nanoseconds()
+	for i, bound := range defaultBucketBoundsNS {
+		if ns <= bound {
 			c.latencyBuckets[i].Add(1)
 			return
 		}

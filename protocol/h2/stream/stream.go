@@ -44,12 +44,13 @@ type Stream struct {
 	ReceivedDataLen        int
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
+	IsHEAD                 bool
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	phase                  Phase
 }
 
-// NewStream creates a new stream.
+// NewStream creates a new stream with full H2 initialization (context, buffers).
 func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -62,6 +63,26 @@ func NewStream(id uint32) *Stream {
 	s.cancel = cancel
 	s.phase = PhaseInit
 	return s
+}
+
+// NewH1Stream creates a lightweight stream optimized for H1 requests.
+// It uses context.Background() directly (no WithCancel), leaves Data and
+// OutboundBuffer nil (lazy-allocated only when body data arrives), and skips
+// H2-specific window initialization. This eliminates 2+ allocs per H1 request.
+func NewH1Stream(id uint32) *Stream {
+	s := streamPool.Get().(*Stream)
+	s.ID = id
+	s.State = StateIdle
+	s.ctx = context.Background()
+	return s
+}
+
+// GetBuf lazily allocates the Data buffer and returns it.
+func (s *Stream) GetBuf() *bytes.Buffer {
+	if s.Data == nil {
+		s.Data = getBuf()
+	}
+	return s.Data
 }
 
 // Context returns the stream's context.
@@ -111,6 +132,7 @@ func (s *Stream) Release() {
 	s.ReceivedDataLen = 0
 	s.ReceivedInitialHeaders = false
 	s.ClosedByReset = false
+	s.IsHEAD = false
 	s.ctx = nil
 	s.cancel = nil
 	s.phase = 0
@@ -137,6 +159,9 @@ func (s *Stream) AddHeader(name, value string) {
 func (s *Stream) AddData(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.Data == nil {
+		s.Data = getBuf()
+	}
 	_, err := s.Data.Write(data)
 	return err
 }
@@ -145,6 +170,9 @@ func (s *Stream) AddData(data []byte) error {
 func (s *Stream) GetData() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.Data == nil {
+		return nil
+	}
 	return s.Data.Bytes()
 }
 

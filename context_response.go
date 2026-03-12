@@ -87,7 +87,11 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		c.capturedStatus = code
 		c.capturedType = contentType
 	}
-	headers := make([][2]string, 0, len(c.respHeaders)+2)
+	var hdrBuf [8][2]string
+	headers := hdrBuf[:0:8]
+	if len(c.respHeaders)+2 > 8 {
+		headers = make([][2]string, 0, len(c.respHeaders)+2)
+	}
 	headers = append(headers, [2]string{"content-type", contentType})
 	headers = append(headers, [2]string{"content-length", strconv.Itoa(len(data))})
 	headers = append(headers, c.respHeaders...)
@@ -124,7 +128,7 @@ func (c *Context) NoContent(code int) error {
 // Keys are lowercased for HTTP/2 compliance (RFC 7540 §8.1.2).
 // CRLF characters are stripped to prevent header injection.
 func (c *Context) SetHeader(key, value string) {
-	k := stripCRLF(strings.ToLower(key))
+	k := sanitizeHeaderKey(key)
 	v := stripCRLF(value)
 	for i, h := range c.respHeaders {
 		if h[0] == k {
@@ -140,9 +144,21 @@ func (c *Context) SetHeader(key, value string) {
 // (e.g. set-cookie).
 func (c *Context) AddHeader(key, value string) {
 	c.respHeaders = append(c.respHeaders, [2]string{
-		stripCRLF(strings.ToLower(key)),
+		sanitizeHeaderKey(key),
 		stripCRLF(value),
 	})
+}
+
+// sanitizeHeaderKey lowercases and strips CRLF. Fast path avoids allocation
+// when the key is already lowercase and clean (common case).
+func sanitizeHeaderKey(s string) string {
+	for i := range len(s) {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c == '\r' || c == '\n' {
+			return stripCRLF(strings.ToLower(s))
+		}
+	}
+	return s
 }
 
 // stripCRLF removes \r and \n to prevent HTTP response splitting (CWE-113).
@@ -453,6 +469,22 @@ func (c *Context) Hijack() (net.Conn, error) {
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
 func (c *Context) Detach() (done func()) {
+	// Materialize any unsafe string headers (zero-copy H1 headers backed by
+	// the connection's read buffer) before the handler returns and the buffer
+	// is reused for the next recv. Pseudo-headers (:method, :path, etc.) are
+	// literal strings and don't need copying.
+	for i, h := range c.stream.Headers {
+		if len(h[0]) > 0 && h[0][0] == ':' {
+			continue
+		}
+		c.stream.Headers[i][0] = strings.Clone(h[0])
+		c.stream.Headers[i][1] = strings.Clone(h[1])
+	}
+	// Also materialize extracted fields that may reference the buffer.
+	c.method = strings.Clone(c.method)
+	c.path = strings.Clone(c.path)
+	c.rawQuery = strings.Clone(c.rawQuery)
+
 	c.detached = true
 	ch := make(chan struct{})
 	c.detachDone = ch

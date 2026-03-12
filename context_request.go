@@ -23,6 +23,10 @@ func (c *Context) Method() string { return c.method }
 // Path returns the request path without query string.
 func (c *Context) Path() string { return c.path }
 
+// SetPath overrides the request path. This is useful in middleware that
+// rewrites URLs (e.g. prefix stripping) before downstream handlers see the path.
+func (c *Context) SetPath(p string) { c.path = p }
+
 // FullPath returns the matched route pattern (e.g. "/users/:id").
 // Returns empty string if no route was matched.
 func (c *Context) FullPath() string { return c.fullPath }

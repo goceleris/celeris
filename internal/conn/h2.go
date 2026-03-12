@@ -179,9 +179,9 @@ func CloseH2(state *H2State) {
 
 func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
 	if buf.Len() > 0 {
-		out := make([]byte, buf.Len())
-		copy(out, buf.Bytes())
+		// Write directly from buffer — safe because makeWriteFn copies into its
+		// own queue before returning. The buffer is reset after write returns.
+		write(buf.Bytes())
 		buf.Reset()
-		write(out)
 	}
 }

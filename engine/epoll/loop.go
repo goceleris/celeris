@@ -48,6 +48,8 @@ type Loop struct {
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
 	tw          *timer.Wheel
+
+	dirtyHead *connState // head of intrusive doubly-linked dirty list
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -188,12 +190,20 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
-		for _, cs := range l.conns {
+		for cs := l.dirtyHead; cs != nil; {
+			next := cs.dirtyNext // save before removeDirty clears it
 			if err := flushWrites(cs); err != nil {
+				l.removeDirty(cs)
 				l.closeConn(cs.fd)
 			} else {
 				cs.pendingBytes = 0
+				l.removeDirty(cs)
+				// Writes flushed; restore idle timeout (cancels write timeout).
+				if l.cfg.IdleTimeout > 0 {
+					l.tw.Schedule(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout)
+				}
 			}
+			cs = next
 		}
 
 		l.tw.Tick()
@@ -246,6 +256,10 @@ func (l *Loop) acceptAll(ctx context.Context) {
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
 		l.activeConns.Add(1)
+
+		if l.cfg.OnConnect != nil {
+			l.cfg.OnConnect(cs.remoteAddr)
+		}
 
 		if l.cfg.IdleTimeout > 0 {
 			l.tw.Schedule(newFD, l.cfg.IdleTimeout, timer.IdleTimeout)
@@ -320,8 +334,10 @@ func (l *Loop) drainRead(fd int) {
 
 		l.reqCount.Add(1)
 
-		// Reschedule idle timeout after request processing.
-		if l.cfg.IdleTimeout > 0 {
+		// Schedule write timeout if response data is pending.
+		if l.cfg.WriteTimeout > 0 && len(cs.writeBuf) > 0 {
+			l.tw.Schedule(fd, l.cfg.WriteTimeout, timer.WriteTimeout)
+		} else if l.cfg.IdleTimeout > 0 {
 			l.tw.Schedule(fd, l.cfg.IdleTimeout, timer.IdleTimeout)
 		}
 
@@ -383,11 +399,40 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 		if cs.pendingBytes > maxPendingBytes {
 			return
 		}
-		copied := make([]byte, len(data))
-		copy(copied, data)
-		cs.pending = append(cs.pending, copied)
-		cs.pendingBytes += len(copied)
+		cs.writeBuf = append(cs.writeBuf, data...)
+		cs.pendingBytes += len(data)
+		l.markDirty(cs)
 	}
+}
+
+func (l *Loop) markDirty(cs *connState) {
+	if cs.dirty {
+		return
+	}
+	cs.dirty = true
+	cs.dirtyNext = l.dirtyHead
+	cs.dirtyPrev = nil
+	if l.dirtyHead != nil {
+		l.dirtyHead.dirtyPrev = cs
+	}
+	l.dirtyHead = cs
+}
+
+func (l *Loop) removeDirty(cs *connState) {
+	if !cs.dirty {
+		return
+	}
+	cs.dirty = false
+	if cs.dirtyPrev != nil {
+		cs.dirtyPrev.dirtyNext = cs.dirtyNext
+	} else {
+		l.dirtyHead = cs.dirtyNext
+	}
+	if cs.dirtyNext != nil {
+		cs.dirtyNext.dirtyPrev = cs.dirtyPrev
+	}
+	cs.dirtyNext = nil
+	cs.dirtyPrev = nil
 }
 
 func (l *Loop) closeConn(fd int) {
@@ -395,6 +440,7 @@ func (l *Loop) closeConn(fd int) {
 	if !ok {
 		return
 	}
+	l.removeDirty(cs)
 	l.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
@@ -402,12 +448,14 @@ func (l *Loop) closeConn(fd int) {
 	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	// Drain receive buffer to prevent RST from discarding unsent data
-	// (close() with unread data in recv buffer causes RST instead of FIN).
 	drainRecvBuffer(fd)
 	_ = unix.Close(fd)
 	delete(l.conns, fd)
 	l.activeConns.Add(-1)
+
+	if l.cfg.OnDisconnect != nil {
+		l.cfg.OnDisconnect(cs.remoteAddr)
+	}
 }
 
 func (l *Loop) shutdown() {
@@ -498,13 +546,35 @@ func sockaddrString(sa unix.Sockaddr) string {
 
 func parseAddr(addr string) (unix.Sockaddr, error) {
 	host, portStr := "", addr
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			host = addr[:i]
-			portStr = addr[i+1:]
-			break
+
+	// Handle IPv6 bracket notation: [::1]:8080, [::]:8080
+	if len(addr) > 0 && addr[0] == '[' {
+		closeBracket := -1
+		for i := 1; i < len(addr); i++ {
+			if addr[i] == ']' {
+				closeBracket = i
+				break
+			}
+		}
+		if closeBracket < 0 {
+			return nil, fmt.Errorf("invalid addr: missing closing bracket: %s", addr)
+		}
+		host = addr[1:closeBracket]
+		if closeBracket+1 < len(addr) && addr[closeBracket+1] == ':' {
+			portStr = addr[closeBracket+2:]
+		} else {
+			return nil, fmt.Errorf("invalid addr: missing port after bracket: %s", addr)
+		}
+	} else {
+		for i := len(addr) - 1; i >= 0; i-- {
+			if addr[i] == ':' {
+				host = addr[:i]
+				portStr = addr[i+1:]
+				break
+			}
 		}
 	}
+
 	port := 0
 	for _, c := range portStr {
 		if c < '0' || c > '9' {
@@ -515,6 +585,19 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 
 	if host == "" || host == "0.0.0.0" {
 		return &unix.SockaddrInet4{Port: port}, nil
+	}
+
+	// IPv6 addresses
+	if host == "::" {
+		return &unix.SockaddrInet6{Port: port}, nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
+			sa := &unix.SockaddrInet6{Port: port}
+			copy(sa.Addr[:], ip6)
+			return sa, nil
+		}
 	}
 
 	sa := &unix.SockaddrInet4{Port: port}

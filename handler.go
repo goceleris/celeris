@@ -16,7 +16,10 @@ type routerAdapter struct {
 }
 
 func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
-	start := time.Now()
+	var start time.Time
+	if a.server.collector != nil {
+		start = time.Now()
+	}
 
 	c := acquireContext(s)
 
@@ -24,11 +27,8 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 		c.maxFormSize = a.server.config.MaxFormSize
 	}
 
-	if a.server.config.WriteTimeout > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), a.server.config.WriteTimeout)
-		defer cancel()
-		c.ctx = ctx
-	}
+	// WriteTimeout is enforced at the engine level via timer wheel (epoll/iouring)
+	// or http.Server.WriteTimeout (std), avoiding a goroutine+timer alloc per request.
 
 	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
 

@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris/protocol/h2/frame"
@@ -13,6 +14,40 @@ import (
 
 	"golang.org/x/net/http2"
 )
+
+// cachedDateValue holds the pre-formatted HTTP Date header line, updated every second.
+var cachedDateValue atomic.Value
+
+func init() {
+	updateCachedDate()
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		for range ticker.C {
+			updateCachedDate()
+		}
+	}()
+}
+
+func updateCachedDate() {
+	now := time.Now().UTC()
+	var buf [64]byte
+	b := buf[:0]
+	b = append(b, "date: "...)
+	b = now.AppendFormat(b, time.RFC1123)
+	b = append(b, "\r\n"...)
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	cachedDateValue.Store(cp)
+}
+
+func appendCachedDate(buf []byte) []byte {
+	if v := cachedDateValue.Load(); v != nil {
+		return append(buf, v.([]byte)...)
+	}
+	buf = append(buf, "date: "...)
+	buf = time.Now().UTC().AppendFormat(buf, time.RFC1123)
+	return append(buf, crlf...)
+}
 
 var (
 	statusLine200 = []byte("HTTP/1.1 200 OK\r\n")
@@ -79,9 +114,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 
 	buf = appendStatusLine(buf, status)
 
-	buf = append(buf, "date: "...)
-	buf = time.Now().UTC().AppendFormat(buf, time.RFC1123)
-	buf = append(buf, crlf...)
+	buf = appendCachedDate(buf)
 
 	hasContentLength := false
 	for _, h := range headers {
@@ -153,17 +186,17 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	defer a.mu.Unlock()
 
 	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
-	if len(body) > 0 {
-		for _, h := range s.Headers {
-			if h[0] == ":method" && h[1] == "HEAD" {
-				body = nil
-				break
-			}
-		}
+	if len(body) > 0 && s.IsHEAD {
+		body = nil
 	}
 
-	responseHeaders := make([][2]string, 0, len(headers)+1)
-	responseHeaders = append(responseHeaders, [2]string{":status", strconv.Itoa(status)})
+	// Stack-allocated header buffer for common case (≤7 response headers).
+	var buf [8][2]string
+	responseHeaders := buf[:0:8]
+	if len(headers)+1 > 8 {
+		responseHeaders = make([][2]string, 0, len(headers)+1)
+	}
+	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
 	responseHeaders = append(responseHeaders, headers...)
 
 	headerBlock, err := a.encoder.Encode(responseHeaders)
@@ -270,6 +303,39 @@ func appendStatusLine(buf []byte, status int) []byte {
 		buf = append(buf, ' ')
 		buf = append(buf, statusText(status)...)
 		return append(buf, crlf...)
+	}
+}
+
+func statusCodeString(code int) string {
+	switch code {
+	case 200:
+		return "200"
+	case 201:
+		return "201"
+	case 204:
+		return "204"
+	case 301:
+		return "301"
+	case 302:
+		return "302"
+	case 304:
+		return "304"
+	case 400:
+		return "400"
+	case 401:
+		return "401"
+	case 403:
+		return "403"
+	case 404:
+		return "404"
+	case 500:
+		return "500"
+	case 502:
+		return "502"
+	case 503:
+		return "503"
+	default:
+		return strconv.Itoa(code)
 	}
 }
 

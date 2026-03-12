@@ -5,6 +5,7 @@ import (
 	"math"
 	"mime/multipart"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
@@ -86,29 +87,26 @@ func releaseContext(c *Context) {
 }
 
 func (c *Context) extractRequestInfo() {
+	found := 0
 	for _, h := range c.stream.Headers {
 		switch h[0] {
 		case ":method":
 			c.method = h[1]
+			found++
 		case ":path":
 			p := h[1]
-			if i := indexOf(p, '?'); i >= 0 {
+			if i := strings.IndexByte(p, '?'); i >= 0 {
 				c.path = p[:i]
 				c.rawQuery = p[i+1:]
 			} else {
 				c.path = p
 			}
+			found++
+		}
+		if found == 2 {
+			return
 		}
 	}
-}
-
-func indexOf(s string, b byte) int {
-	for i := range len(s) {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
 }
 
 // Next executes the next handler in the chain. It returns the first non-nil
@@ -200,7 +198,7 @@ func (c *Context) reset() {
 	c.rawQuery = ""
 	c.fullPath = ""
 	c.statusCode = 200
-	c.respHeaders = c.respHeaders[:0:0]
+	c.respHeaders = c.respHeaders[:0]
 	c.written = false
 	c.aborted = false
 	c.queryCache = nil

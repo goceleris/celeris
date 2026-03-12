@@ -236,7 +236,9 @@ func TestContextAddParam(t *testing.T) {
 	}
 }
 
-func TestContextDeadlineFromWriteTimeout(t *testing.T) {
+func TestContextNoDeadlineFromWriteTimeout(t *testing.T) {
+	// WriteTimeout is enforced at the engine level via timer wheel, not
+	// via context.WithTimeout. The handler's context should NOT have a deadline.
 	s := New(Config{WriteTimeout: 5 * time.Second})
 	var hadDeadline bool
 	s.GET("/test", func(c *Context) error {
@@ -250,8 +252,8 @@ func TestContextDeadlineFromWriteTimeout(t *testing.T) {
 	if err := adapter.HandleStream(context.Background(), st); err != nil {
 		t.Fatal(err)
 	}
-	if !hadDeadline {
-		t.Fatal("expected context to have deadline from WriteTimeout")
+	if hadDeadline {
+		t.Fatal("expected no context deadline — WriteTimeout is engine-level")
 	}
 	st.Release()
 }

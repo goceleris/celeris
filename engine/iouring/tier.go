@@ -16,6 +16,7 @@ type TierStrategy interface {
 	SupportsProvidedBuffers() bool
 	SupportsMultishotAccept() bool
 	SupportsMultishotRecv() bool
+	SupportsFixedFiles() bool
 	SQPollIdle() uint32
 }
 
@@ -23,9 +24,16 @@ type TierStrategy interface {
 func SelectTier(profile engine.CapabilityProfile) TierStrategy {
 	switch {
 	case profile.IOUringTier >= engine.Optional && profile.SQPoll:
-		return &optionalTier{sqPollIdle: 2000}
+		return &optionalTier{
+			sqPollIdle:   2000,
+			deferTaskrun: profile.DeferTaskrun,
+			fixedFiles:   profile.FixedFiles,
+		}
 	case profile.IOUringTier >= engine.High && profile.ProvidedBuffers:
-		return &highTier{}
+		return &highTier{
+			deferTaskrun: profile.DeferTaskrun,
+			fixedFiles:   profile.FixedFiles,
+		}
 	case profile.IOUringTier >= engine.Mid && profile.CoopTaskrun:
 		return &midTier{}
 	case profile.IOUringTier >= engine.Base:
@@ -43,6 +51,7 @@ func (t *baseTier) SetupFlags() uint32            { return 0 }
 func (t *baseTier) SupportsProvidedBuffers() bool { return false }
 func (t *baseTier) SupportsMultishotAccept() bool { return false }
 func (t *baseTier) SupportsMultishotRecv() bool   { return false }
+func (t *baseTier) SupportsFixedFiles() bool      { return false }
 func (t *baseTier) SQPollIdle() uint32            { return 0 }
 
 func (t *baseTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -80,6 +89,7 @@ func (t *midTier) SetupFlags() uint32            { return setupCoopTaskrun }
 func (t *midTier) SupportsProvidedBuffers() bool { return false }
 func (t *midTier) SupportsMultishotAccept() bool { return false }
 func (t *midTier) SupportsMultishotRecv() bool   { return false }
+func (t *midTier) SupportsFixedFiles() bool      { return false }
 func (t *midTier) SQPollIdle() uint32            { return 0 }
 
 func (t *midTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -109,14 +119,25 @@ func (t *midTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }
 
-// highTier: kernel 5.19+, adds SINGLE_ISSUER, multishot accept/recv, provided buffers.
-type highTier struct{}
+// highTier: kernel 5.19+, adds SINGLE_ISSUER, multishot accept, provided buffers.
+// With kernel 6.1+: adds DEFER_TASKRUN (replaces COOP_TASKRUN), fixed files,
+// and multishot recv with ring-mapped provided buffers.
+type highTier struct {
+	deferTaskrun bool
+	fixedFiles   bool
+}
 
-func (t *highTier) Tier() engine.Tier             { return engine.High }
-func (t *highTier) SetupFlags() uint32            { return setupCoopTaskrun | setupSingleIssuer }
+func (t *highTier) Tier() engine.Tier { return engine.High }
+func (t *highTier) SetupFlags() uint32 {
+	if t.deferTaskrun {
+		return setupDeferTaskrun | setupSingleIssuer
+	}
+	return setupCoopTaskrun | setupSingleIssuer
+}
 func (t *highTier) SupportsProvidedBuffers() bool { return true }
 func (t *highTier) SupportsMultishotAccept() bool { return true }
 func (t *highTier) SupportsMultishotRecv() bool   { return true }
+func (t *highTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *highTier) SQPollIdle() uint32            { return 0 }
 
 func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -124,7 +145,11 @@ func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
 	if sqe == nil {
 		return
 	}
-	prepMultishotAccept(sqe, listenFD)
+	if t.fixedFiles {
+		prepMultishotAcceptDirect(sqe, listenFD)
+	} else {
+		prepMultishotAccept(sqe, listenFD)
+	}
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
 
@@ -133,7 +158,7 @@ func (t *highTier) PrepareRecv(ring *Ring, fd int, buf []byte) {
 	if sqe == nil {
 		return
 	}
-	prepRecv(sqe, fd, buf)
+	prepMultishotRecv(sqe, fd, 0, t.fixedFiles)
 	setSQEUserData(sqe, encodeUserData(udRecv, fd))
 }
 
@@ -143,21 +168,31 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 		return
 	}
 	prepSend(sqe, fd, buf, linked)
+	if t.fixedFiles {
+		setSQEFixedFile(sqe)
+	}
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }
 
-// optionalTier: kernel 6.0+, adds SQPOLL.
+// optionalTier: kernel 6.0+, adds SQPOLL. With 6.1+: DEFER_TASKRUN, fixed files,
+// multishot recv.
 type optionalTier struct {
-	sqPollIdle uint32
+	sqPollIdle   uint32
+	deferTaskrun bool
+	fixedFiles   bool
 }
 
 func (t *optionalTier) Tier() engine.Tier { return engine.Optional }
 func (t *optionalTier) SetupFlags() uint32 {
+	if t.deferTaskrun {
+		return setupDeferTaskrun | setupSingleIssuer | setupSQPoll
+	}
 	return setupCoopTaskrun | setupSingleIssuer | setupSQPoll
 }
 func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
 func (t *optionalTier) SupportsMultishotAccept() bool { return true }
 func (t *optionalTier) SupportsMultishotRecv() bool   { return true }
+func (t *optionalTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *optionalTier) SQPollIdle() uint32            { return t.sqPollIdle }
 
 func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -165,7 +200,11 @@ func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
 	if sqe == nil {
 		return
 	}
-	prepMultishotAccept(sqe, listenFD)
+	if t.fixedFiles {
+		prepMultishotAcceptDirect(sqe, listenFD)
+	} else {
+		prepMultishotAccept(sqe, listenFD)
+	}
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
 
@@ -174,7 +213,7 @@ func (t *optionalTier) PrepareRecv(ring *Ring, fd int, buf []byte) {
 	if sqe == nil {
 		return
 	}
-	prepRecv(sqe, fd, buf)
+	prepMultishotRecv(sqe, fd, 0, t.fixedFiles)
 	setSQEUserData(sqe, encodeUserData(udRecv, fd))
 }
 
@@ -184,5 +223,8 @@ func (t *optionalTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) 
 		return
 	}
 	prepSend(sqe, fd, buf, linked)
+	if t.fixedFiles {
+		setSQEFixedFile(sqe)
+	}
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }

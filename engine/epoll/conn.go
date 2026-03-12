@@ -22,9 +22,12 @@ type connState struct {
 	h2State      *conn.H2State
 	ctx          context.Context
 	cancel       context.CancelFunc
-	pending      [][]byte
+	writeBuf     []byte // single append buffer for pending writes
 	pendingBytes int
 	remoteAddr   string
+	dirty        bool       // true when writeBuf has data to flush
+	dirtyNext    *connState // intrusive doubly-linked dirty list
+	dirtyPrev    *connState
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {

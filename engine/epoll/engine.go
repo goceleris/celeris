@@ -127,6 +127,11 @@ func (e *Engine) ResumeAccept() error {
 	return nil
 }
 
+var (
+	_ engine.Engine          = (*Engine)(nil)
+	_ engine.AcceptController = (*Engine)(nil)
+)
+
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {
 	if p := e.addr.Load(); p != nil {

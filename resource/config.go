@@ -26,6 +26,8 @@ type Config struct {
 	IdleTimeout          time.Duration
 	DisableKeepAlive     bool
 	Listener             net.Listener
+	OnConnect            func(addr string)
+	OnDisconnect         func(addr string)
 	Logger               *slog.Logger
 }
 

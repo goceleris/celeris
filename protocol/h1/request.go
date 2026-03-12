@@ -16,6 +16,7 @@ type Request struct {
 	KeepAlive       bool
 	HeadersComplete bool
 	BodyRead        int64
+	ExpectContinue  bool
 }
 
 // Reset clears all fields, reusing existing header slice capacity.
@@ -31,4 +32,5 @@ func (r *Request) Reset() {
 	r.KeepAlive = false
 	r.HeadersComplete = false
 	r.BodyRead = 0
+	r.ExpectContinue = false
 }

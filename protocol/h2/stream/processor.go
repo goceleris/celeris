@@ -536,6 +536,9 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		return fmt.Errorf("invalid headers: %w", err)
 	}
 	for _, h := range headers {
+		if h[0] == ":method" && h[1] == "HEAD" {
+			stream.IsHEAD = true
+		}
 		stream.AddHeader(h[0], h[1])
 	}
 	stream.ReceivedInitialHeaders = true
@@ -847,6 +850,9 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 				return fmt.Errorf("invalid headers: %w", err)
 			}
 			for _, h := range headers {
+				if h[0] == ":method" && h[1] == "HEAD" {
+					stream.IsHEAD = true
+				}
 				stream.AddHeader(h[0], h[1])
 			}
 			stream.ReceivedInitialHeaders = true
