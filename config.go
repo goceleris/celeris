@@ -69,11 +69,14 @@ type Config struct {
 	// Objective is the tuning profile (default Balanced).
 	Objective Objective
 
-	// ReadTimeout is the max duration for reading the entire request (zero = no timeout).
+	// ReadTimeout is the max duration for reading the entire request.
+	// Zero uses the default (300s). Set to -1 for no timeout.
 	ReadTimeout time.Duration
-	// WriteTimeout is the max duration for writing the response (zero = no timeout).
+	// WriteTimeout is the max duration for writing the response.
+	// Zero uses the default (300s). Set to -1 for no timeout.
 	WriteTimeout time.Duration
-	// IdleTimeout is the max duration a keep-alive connection may be idle (zero = no timeout).
+	// IdleTimeout is the max duration a keep-alive connection may be idle.
+	// Zero uses the default (600s). Set to -1 for no timeout.
 	IdleTimeout time.Duration
 	// ShutdownTimeout is the max duration to wait for in-flight requests during
 	// graceful shutdown via StartWithContext (default 30s).
@@ -83,10 +86,37 @@ type Config struct {
 	// (default 32 MB). Set to -1 to disable the limit.
 	MaxFormSize int64
 
+	// MaxConcurrentStreams limits simultaneous H2 streams per connection (default 100).
+	MaxConcurrentStreams uint32
+	// MaxFrameSize is the max H2 frame payload size (default 16384, range 16384-16777215).
+	MaxFrameSize uint32
+	// InitialWindowSize is the H2 initial stream window size (default 65535).
+	InitialWindowSize uint32
+	// MaxHeaderBytes is the max header block size (default 16 MB, min 4096).
+	MaxHeaderBytes int
+
+	// DisableKeepAlive disables HTTP keep-alive; each request gets its own connection.
+	DisableKeepAlive bool
+	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
+	BufferSize int
+	// SocketRecvBuf sets SO_RCVBUF for accepted connections (0 = OS default).
+	SocketRecvBuf int
+	// SocketSendBuf sets SO_SNDBUF for accepted connections (0 = OS default).
+	SocketSendBuf int
+	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
+	MaxConns int
+
 	// DisableMetrics disables the built-in metrics collector. When true,
 	// [Server.Collector] returns nil and per-request metric recording is skipped.
 	// Default false (metrics enabled).
 	DisableMetrics bool
+
+	// OnConnect is called when a new connection is accepted. The addr is the
+	// remote peer address. Must be fast — blocks the event loop.
+	OnConnect func(addr string)
+	// OnDisconnect is called when a connection is closed. The addr is the
+	// remote peer address. Must be fast — blocks the event loop.
+	OnDisconnect func(addr string)
 
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
@@ -105,20 +135,39 @@ type EngineInfo struct {
 
 func (c Config) toResourceConfig() resource.Config {
 	rc := resource.Config{
-		Addr:         c.Addr,
-		Protocol:     engine.Protocol(c.Protocol),
-		Engine:       engine.EngineType(c.Engine),
-		ReadTimeout:  c.ReadTimeout,
-		WriteTimeout: c.WriteTimeout,
-		IdleTimeout:  c.IdleTimeout,
-		Logger:       c.Logger,
+		Addr:                 c.Addr,
+		Protocol:             engine.Protocol(c.Protocol),
+		Engine:               engine.EngineType(c.Engine),
+		ReadTimeout:          c.ReadTimeout,
+		WriteTimeout:         c.WriteTimeout,
+		IdleTimeout:          c.IdleTimeout,
+		MaxHeaderBytes:       c.MaxHeaderBytes,
+		MaxConcurrentStreams: c.MaxConcurrentStreams,
+		MaxFrameSize:         c.MaxFrameSize,
+		InitialWindowSize:    c.InitialWindowSize,
+		DisableKeepAlive:     c.DisableKeepAlive,
+		Logger:               c.Logger,
 	}
 
 	if c.Workers > 0 {
 		rc.Resources.Workers = c.Workers
 	}
+	if c.BufferSize > 0 {
+		rc.Resources.BufferSize = c.BufferSize
+	}
+	if c.SocketRecvBuf > 0 {
+		rc.Resources.SocketRecv = c.SocketRecvBuf
+	}
+	if c.SocketSendBuf > 0 {
+		rc.Resources.SocketSend = c.SocketSendBuf
+	}
+	if c.MaxConns > 0 {
+		rc.Resources.MaxConns = c.MaxConns
+	}
 
 	rc.Objective = resource.ObjectiveProfile(c.Objective)
+	rc.OnConnect = c.OnConnect
+	rc.OnDisconnect = c.OnDisconnect
 
 	return rc
 }

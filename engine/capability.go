@@ -15,6 +15,8 @@ type CapabilityProfile struct {
 	CoopTaskrun     bool
 	SingleIssuer    bool
 	LinkedSQEs      bool
+	DeferTaskrun    bool
+	FixedFiles      bool
 	NumCPU          int
 	NUMANodes       int
 }

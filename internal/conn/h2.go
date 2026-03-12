@@ -58,10 +58,16 @@ type H2State struct {
 	processor   *stream.Processor
 	parser      *frame.Parser
 	writer      *frame.Writer
-	encoder     *frame.HeaderEncoder
 	outBuf      *bytes.Buffer
 	inBuf       *frameBuffer
 	mu          sync.Mutex
+	adapter     *h2ResponseAdapter
+}
+
+// SetRemoteAddr sets the remote address on the H2 stream manager so that
+// all streams created on this connection inherit the peer address.
+func (s *H2State) SetRemoteAddr(addr string) {
+	s.processor.GetManager().RemoteAddr = addr
 }
 
 // NewH2State creates a new H2 connection state.
@@ -77,7 +83,6 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte)) *H2Sta
 		outBuf:  &outBuf,
 		writer:  fw,
 		encoder: frame.NewHeaderEncoder(),
-		closed:  make(map[uint32]bool),
 	}
 
 	proc := stream.NewProcessor(handler, fw, rw)
@@ -91,9 +96,9 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte)) *H2Sta
 		processor: proc,
 		parser:    p,
 		writer:    fw,
-		encoder:   frame.NewHeaderEncoder(),
 		outBuf:    &outBuf,
 		inBuf:     &inBuf,
+		adapter:   rw,
 	}
 }
 
@@ -167,16 +172,16 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 
 // CloseH2 cleans up H2 state.
 func CloseH2(state *H2State) {
-	if state.encoder != nil {
-		state.encoder.Close()
+	if state.adapter != nil && state.adapter.encoder != nil {
+		state.adapter.encoder.Close()
 	}
 }
 
 func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
 	if buf.Len() > 0 {
-		out := make([]byte, buf.Len())
-		copy(out, buf.Bytes())
+		// Write directly from buffer — safe because makeWriteFn copies into its
+		// own queue before returning. The buffer is reset after write returns.
+		write(buf.Bytes())
 		buf.Reset()
-		write(out)
 	}
 }

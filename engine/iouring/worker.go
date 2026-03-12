@@ -4,9 +4,11 @@ package iouring
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,12 +18,24 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/timer"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 
 	"golang.org/x/sys/unix"
 )
+
+// fixedFileTableSize is the number of slots in the fixed file table.
+// Must accommodate the maximum number of concurrent connections per worker.
+const fixedFileTableSize = 65536
+
+// bufRingGroupID is the provided buffer ring group ID.
+const bufRingGroupID = 0
+
+// bufRingCount is the number of buffers in the provided buffer ring.
+// Must be a power of 2.
+const bufRingCount = 4096
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
@@ -30,12 +44,14 @@ type Worker struct {
 	ring         *Ring
 	listenFD     int
 	tier         TierStrategy
+	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
 	conns        map[int]*connState
 	handler      stream.Handler
 	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
-	bufGroup     *BufferGroup
+	bufGroup     *BufferGroup // legacy provided buffers (unused with ring-mapped)
+	bufRing      *BufferRing  // ring-mapped provided buffers for multishot recv
 	logger       *slog.Logger
 	cfg          resource.Config
 	ready        chan error
@@ -47,6 +63,9 @@ type Worker struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
+	tw          *timer.Wheel
+
+	dirtyHead *connState // head of intrusive doubly-linked dirty list
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -103,13 +122,32 @@ func (w *Worker) run(ctx context.Context) {
 	}
 	w.ring = ring
 
-	// Provided buffers are supported by the tier but not yet wired into
-	// PrepareRecv (requires multishot recv with IOSQE_BUFFER_SELECT).
-	// Allocating the BufferGroup inflates Go's GC heap accounting
-	// (count×size bytes from Go heap), causing GC to never trigger on
-	// actual request allocations. Skip until multishot recv is implemented.
+	// Register fixed file table if the tier supports it.
+	if w.tier.SupportsFixedFiles() {
+		if err := w.ring.RegisterFiles(fixedFileTableSize); err != nil {
+			w.logger.Warn("fixed file table registration failed, falling back",
+				"worker", w.id, "err", err)
+		} else {
+			w.fixedFiles = true
+		}
+	}
 
-	w.tier.PrepareAccept(w.ring, w.listenFD)
+	// Register ring-mapped provided buffers for multishot recv.
+	if w.tier.SupportsMultishotRecv() {
+		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
+		if err != nil {
+			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
+				"worker", w.id, "err", err)
+		} else {
+			w.bufRing = br
+		}
+	}
+
+	w.tw = timer.New(func(fd int, _ timer.TimeoutKind) {
+		w.closeConn(fd)
+	})
+
+	w.prepareAccept()
 	if _, err := w.ring.Submit(); err != nil {
 		w.ready <- fmt.Errorf("worker %d initial submit: %w", w.id, err)
 		return
@@ -161,7 +199,7 @@ func (w *Worker) run(ctx context.Context) {
 				return
 			}
 			w.listenFD = fd
-			w.tier.PrepareAccept(w.ring, w.listenFD)
+			w.prepareAccept()
 			if _, err := w.ring.Submit(); err != nil {
 				w.logger.Error("submit after listen re-create", "worker", w.id, "err", err)
 			}
@@ -190,12 +228,20 @@ func (w *Worker) run(ctx context.Context) {
 			processed++
 		}
 
-		// Retry pending sends that failed due to SQ ring being full.
-		for fd, cs := range w.conns {
-			if !cs.sending && len(cs.sendQueue) > 0 {
-				w.flushSend(fd)
+		// Retry pending sends on dirty connections (SQ ring was full earlier).
+		for cs := w.dirtyHead; cs != nil; {
+			next := cs.dirtyNext
+			if !cs.sending {
+				w.flushSend(cs.fd)
 			}
+			// Remove from dirty list if fully flushed (no pending data).
+			if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+				w.removeDirty(cs)
+			}
+			cs = next
 		}
+
+		w.tw.Tick()
 
 		if _, err := w.ring.Submit(); err != nil {
 			w.logger.Error("submit failed", "worker", w.id, "err", err)
@@ -245,24 +291,71 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry) {
 
 func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 	if c.Res < 0 {
+		// EINVAL with fixed files: ACCEPT_DIRECT not supported on this kernel.
+		// Disable fixed files and retry with regular multishot accept.
+		if c.Res == -22 && w.fixedFiles {
+			w.logger.Warn("ACCEPT_DIRECT failed (EINVAL), disabling fixed files",
+				"worker", w.id)
+			w.fixedFiles = false
+			if w.listenFD >= 0 {
+				sqe := w.ring.GetSQE()
+				if sqe != nil {
+					prepMultishotAccept(sqe, w.listenFD)
+					setSQEUserData(sqe, encodeUserData(udAccept, w.listenFD))
+				}
+			}
+			return
+		}
 		w.errCount.Add(1)
 		if w.listenFD >= 0 && !w.tier.SupportsMultishotAccept() {
-			w.tier.PrepareAccept(w.ring, w.listenFD)
+			w.prepareAccept()
 		}
 		return
 	}
 
 	newFD := int(c.Res)
+	isFixedFile := w.fixedFiles
 
 	// Don't discard accepted connections even when paused — the TCP handshake
 	// already completed and the client expects a response. The listen socket
 	// will be closed within one event loop iteration to prevent further accepts.
 
-	_ = sockopts.ApplyFD(newFD, w.sockOpts)
+	if !isFixedFile {
+		_ = sockopts.ApplyFD(newFD, w.sockOpts)
+	}
+	// For fixed files, socket options were applied by the kernel at accept time
+	// via inherited options. TCP_NODELAY etc. must be set post-accept for
+	// non-inherited options — but with fixed files (ACCEPT_DIRECT), the fd field
+	// is actually a fixed file index and we can't call setsockopt on it directly.
+	// Socket options that require per-connection setsockopt are skipped for fixed files.
 
 	cs := newConnState(ctx, newFD, w.resolved.BufferSize)
+	cs.fixedFile = isFixedFile
+
+	// When using multishot recv with ring-mapped buffers, we don't need a
+	// per-connection recv buffer.
+	if w.bufRing != nil {
+		cs.buf = nil
+	}
+
+	if !isFixedFile {
+		if sa, err := unix.Getpeername(newFD); err == nil {
+			cs.remoteAddr = sockaddrString(sa)
+		}
+	}
+	// For fixed files (ACCEPT_DIRECT), the CQE result is a fixed file index,
+	// not a real FD. getpeername is not available without a real FD.
+
 	w.conns[newFD] = cs
 	w.activeConns.Add(1)
+
+	if w.cfg.OnConnect != nil {
+		w.cfg.OnConnect(cs.remoteAddr)
+	}
+
+	if w.cfg.IdleTimeout > 0 {
+		w.tw.Schedule(newFD, w.cfg.IdleTimeout, timer.IdleTimeout)
+	}
 
 	if w.cfg.Protocol != engine.Auto {
 		cs.protocol = w.cfg.Protocol
@@ -271,10 +364,10 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 	}
 	// For Auto mode, cs.detected is false; the first handleRecv will
 	// detect the protocol from the received data before processing it.
-	w.tier.PrepareRecv(w.ring, newFD, cs.buf)
+	w.prepareRecv(newFD, cs.buf)
 
 	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() && w.listenFD >= 0 {
-		w.tier.PrepareAccept(w.ring, w.listenFD)
+		w.prepareAccept()
 	}
 }
 
@@ -296,10 +389,37 @@ func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
 	return true
 }
 
+func (w *Worker) hijackConn(fd int) (net.Conn, error) {
+	cs, ok := w.conns[fd]
+	if !ok {
+		return nil, errors.New("celeris: connection not found")
+	}
+	if cs.fixedFile {
+		return nil, errors.New("celeris: cannot hijack fixed file connection")
+	}
+	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
+		return nil, errors.New("celeris: cannot hijack with pending sends")
+	}
+	w.tw.Cancel(fd)
+	cs.cancel()
+	delete(w.conns, fd)
+	w.activeConns.Add(-1)
+	f := os.NewFile(uintptr(fd), "tcp")
+	c, err := net.FileConn(f)
+	_ = f.Close()
+	return c, err
+}
+
 func (w *Worker) initProtocol(cs *connState) {
 	switch cs.protocol {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
+		cs.h1State.RemoteAddr = cs.remoteAddr
+		if !cs.fixedFile {
+			cs.h1State.HijackFn = func() (net.Conn, error) {
+				return w.hijackConn(cs.fd)
+			}
+		}
 	case engine.H2C:
 		writeFn := w.makeWriteFn(cs.fd)
 		cs.h2State = conn.NewH2State(w.handler, conn.H2Config{
@@ -307,36 +427,68 @@ func (w *Worker) initProtocol(cs *connState) {
 			InitialWindowSize:    w.cfg.InitialWindowSize,
 			MaxFrameSize:         w.cfg.MaxFrameSize,
 		}, writeFn)
+		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
 
 func (w *Worker) handleRecv(c *completionEntry, fd int) {
 	cs, ok := w.conns[fd]
 	if !ok || cs.closing {
+		// If multishot recv with provided buffers, return the buffer even
+		// for unknown/closing connections to prevent buffer leak.
+		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+			w.bufRing.ReturnBuffer(cqeBufferID(c.Flags))
+		}
 		return
 	}
 
 	if c.Res <= 0 {
+		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+			w.bufRing.ReturnBuffer(cqeBufferID(c.Flags))
+		}
 		w.closeConn(fd)
 		return
 	}
 
-	data := cs.buf[:c.Res]
+	var data []byte
+	var providedBufID uint16
+	hasProvidedBuf := false
 
-	if cqeHasBuffer(c.Flags) && w.bufGroup != nil {
+	if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+		// Multishot recv with ring-mapped provided buffers.
+		providedBufID = cqeBufferID(c.Flags)
+		data = w.bufRing.GetBuffer(providedBufID, int(c.Res))
+		hasProvidedBuf = true
+	} else if cqeHasBuffer(c.Flags) && w.bufGroup != nil {
+		// Legacy provided buffers fallback.
 		bufID := cqeBufferID(c.Flags)
 		provBuf := w.bufGroup.GetBuffer(bufID)
 		if provBuf != nil {
 			data = provBuf[:c.Res]
 			defer func() { _ = w.bufGroup.ReturnBuffer(w.ring, bufID) }()
 		}
+	} else {
+		// Per-connection buffer (single-shot recv).
+		data = cs.buf[:c.Res]
+	}
+
+	// Cancel idle timer; we're actively receiving data.
+	if w.cfg.ReadTimeout > 0 {
+		w.tw.Schedule(fd, w.cfg.ReadTimeout, timer.ReadTimeout)
+	} else {
+		w.tw.Cancel(fd)
 	}
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
 		if !w.detectProtocol(cs, data) {
 			// Need more data or unknown protocol — re-arm recv.
-			w.tier.PrepareRecv(w.ring, fd, cs.buf)
+			if hasProvidedBuf {
+				w.bufRing.ReturnBuffer(providedBufID)
+			}
+			if !cqeHasMore(c.Flags) {
+				w.prepareRecv(fd, cs.buf)
+			}
 			return
 		}
 	}
@@ -355,9 +507,25 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		})
 	}
 
+	// Return the provided buffer after processing. The data has been consumed
+	// by the protocol handler (H1 copies into stream, H2 copies into frames).
+	if hasProvidedBuf {
+		w.bufRing.ReturnBuffer(providedBufID)
+	}
+
 	w.reqCount.Add(1)
 
+	// Schedule write timeout if response data is pending; otherwise idle timeout.
+	if w.cfg.WriteTimeout > 0 && len(cs.writeBuf) > 0 {
+		w.tw.Schedule(fd, w.cfg.WriteTimeout, timer.WriteTimeout)
+	} else if w.cfg.IdleTimeout > 0 {
+		w.tw.Schedule(fd, w.cfg.IdleTimeout, timer.IdleTimeout)
+	}
+
 	if processErr != nil {
+		if errors.Is(processErr, conn.ErrHijacked) {
+			return // FD already detached
+		}
 		// Flush pending writes (e.g. error responses) before closing.
 		w.flushSend(fd)
 		if _, err := w.ring.Submit(); err != nil {
@@ -367,16 +535,18 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		return
 	}
 
-	// Back-pressure: close connection if sendQueue grew too large.
-	if cs.sendQueueBytes > maxSendQueueBytes {
+	// Back-pressure: close connection if pending data grew too large.
+	if len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes {
 		w.closeConn(fd)
 		return
 	}
 
 	w.flushSend(fd)
 
+	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
+	// without needing a new SQE. Only re-arm if multishot ended.
 	if !cqeHasMore(c.Flags) {
-		w.tier.PrepareRecv(w.ring, fd, cs.buf)
+		w.prepareRecv(fd, cs.buf)
 	}
 }
 
@@ -390,8 +560,8 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 
 	if c.Res < 0 {
 		w.errCount.Add(1)
-		cs.sendQueue = cs.sendQueue[:0]
-		cs.sendQueueBytes = 0
+		cs.sendBuf = cs.sendBuf[:0]
+		cs.writeBuf = cs.writeBuf[:0]
 		if cs.closing {
 			w.finishClose(fd)
 		} else {
@@ -400,32 +570,37 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 		return
 	}
 
-	// Handle partial sends by updating the front buffer with the remainder.
+	// Handle partial sends by shifting remaining data to the front.
 	sent := int(c.Res)
-	if len(cs.sendQueue) > 0 {
-		buf := cs.sendQueue[0]
-		if sent < len(buf) {
-			cs.sendQueue[0] = buf[sent:]
-			cs.sendQueueBytes -= sent
-		} else {
-			cs.sendQueueBytes -= len(buf)
-			cs.sendQueue = cs.sendQueue[1:]
-		}
+	if sent < len(cs.sendBuf) {
+		remaining := len(cs.sendBuf) - sent
+		copy(cs.sendBuf, cs.sendBuf[sent:])
+		cs.sendBuf = cs.sendBuf[:remaining]
+	} else {
+		cs.sendBuf = cs.sendBuf[:0]
 	}
 
-	if cs.closing && len(cs.sendQueue) == 0 {
+	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.finishClose(fd)
 		return
 	}
 
-	// Submit the next send (handles both partial-send retries and new data
-	// that arrived while this send was in flight).
+	// All data sent — remove from dirty list, cancel write timeout, restore idle timeout.
+	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+		w.removeDirty(cs)
+		if w.cfg.IdleTimeout > 0 {
+			w.tw.Schedule(fd, w.cfg.IdleTimeout, timer.IdleTimeout)
+		}
+	}
+
+	// Re-send remainder or flush new data.
 	w.flushSend(fd)
 }
 
 func (w *Worker) handleClose(fd int) {
 	// finishClose already removed from conns and decremented activeConns.
-	// This is a no-op for the normal path but kept as a safety guard.
+	// With CQE_SKIP_SUCCESS, this handler may not fire for successful close.
+	// Kept as a safety guard for error CQEs.
 	delete(w.conns, fd)
 }
 
@@ -434,6 +609,8 @@ func (w *Worker) closeConn(fd int) {
 	if !ok {
 		return
 	}
+	w.removeDirty(cs)
+	w.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -441,7 +618,7 @@ func (w *Worker) closeConn(fd int) {
 
 	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
-	if cs.sending || len(cs.sendQueue) > 0 {
+	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
 		w.flushSend(fd)
 		return
@@ -451,8 +628,23 @@ func (w *Worker) closeConn(fd int) {
 }
 
 func (w *Worker) finishClose(fd int) {
+	cs := w.conns[fd]
 	delete(w.conns, fd)
 	w.activeConns.Add(-1)
+
+	if w.cfg.OnDisconnect != nil && cs != nil {
+		w.cfg.OnDisconnect(cs.remoteAddr)
+	}
+
+	if cs != nil && cs.fixedFile {
+		// Fixed file: close via io_uring direct close (no real FD to shutdown).
+		sqe := w.ring.GetSQE()
+		if sqe != nil {
+			prepCloseDirect(sqe, fd)
+			setSQEUserData(sqe, encodeUserData(udClose, fd))
+		}
+		return
+	}
 
 	// Half-close before full close: shutdown(SHUT_WR) sends FIN after all
 	// pending data in the socket buffer, preventing RST from discarding
@@ -475,55 +667,127 @@ func (w *Worker) makeWriteFn(fd int) func([]byte) {
 		if !ok {
 			return
 		}
-		// Back-pressure: drop writes when sendQueue exceeds limit.
+		// Back-pressure: drop writes when total pending data exceeds limit.
 		// The connection will be closed after processing completes.
-		if cs.sendQueueBytes > maxSendQueueBytes {
+		if len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes {
 			return
 		}
-		// Copy data — the caller may reuse the underlying buffer (e.g. sync.Pool)
-		// before the kernel processes the SEND SQE.
-		copied := make([]byte, len(data))
-		copy(copied, data)
-		cs.sendQueue = append(cs.sendQueue, copied)
-		cs.sendQueueBytes += len(copied)
+		// Append to writeBuf — no per-write allocation. The kernel holds
+		// sendBuf (not writeBuf), so appending here is safe.
+		cs.writeBuf = append(cs.writeBuf, data...)
+		w.markDirty(cs)
 		// Don't submit a SEND SQE here. Sends are serialized per-connection
 		// via flushSend, called after recv processing and send completion.
 	}
 }
 
-// flushSend submits one coalesced SEND SQE for pending data on this connection.
+// prepareAccept submits an accept SQE using the best available mode.
+func (w *Worker) prepareAccept() {
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		return
+	}
+	if w.fixedFiles {
+		prepMultishotAcceptDirect(sqe, w.listenFD)
+	} else if w.tier.SupportsMultishotAccept() {
+		prepMultishotAccept(sqe, w.listenFD)
+	} else {
+		prepAccept(sqe, w.listenFD, 0)
+	}
+	setSQEUserData(sqe, encodeUserData(udAccept, w.listenFD))
+}
+
+// prepareRecv submits a recv SQE. Uses multishot recv with ring-mapped provided
+// buffers when available; falls back to single-shot per-connection buffer recv.
+func (w *Worker) prepareRecv(fd int, buf []byte) {
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		return
+	}
+	if w.bufRing != nil {
+		prepMultishotRecv(sqe, fd, bufRingGroupID, w.fixedFiles)
+	} else {
+		prepRecv(sqe, fd, buf)
+	}
+	setSQEUserData(sqe, encodeUserData(udRecv, fd))
+}
+
+func (w *Worker) markDirty(cs *connState) {
+	if cs.dirty {
+		return
+	}
+	cs.dirty = true
+	cs.dirtyNext = w.dirtyHead
+	cs.dirtyPrev = nil
+	if w.dirtyHead != nil {
+		w.dirtyHead.dirtyPrev = cs
+	}
+	w.dirtyHead = cs
+}
+
+func (w *Worker) removeDirty(cs *connState) {
+	if !cs.dirty {
+		return
+	}
+	cs.dirty = false
+	if cs.dirtyPrev != nil {
+		cs.dirtyPrev.dirtyNext = cs.dirtyNext
+	} else {
+		w.dirtyHead = cs.dirtyNext
+	}
+	if cs.dirtyNext != nil {
+		cs.dirtyNext.dirtyPrev = cs.dirtyPrev
+	}
+	cs.dirtyNext = nil
+	cs.dirtyPrev = nil
+}
+
+// flushSend submits one SEND SQE for pending data on this connection.
 // Only one SEND is in-flight per connection at a time; if a send is already
 // in progress, this is a no-op and the next send will be triggered when the
 // current one completes.
+//
+// Double-buffer strategy: writeBuf accumulates handler writes; sendBuf holds
+// data the kernel is currently processing. On flush, writeBuf is swapped into
+// sendBuf, and the old sendBuf's capacity is reused for the next writeBuf.
 func (w *Worker) flushSend(fd int) {
 	cs, ok := w.conns[fd]
-	if !ok || cs.sending || len(cs.sendQueue) == 0 {
+	if !ok || cs.sending {
 		return
 	}
 
-	// Coalesce all pending buffers into one to minimize SQEs.
-	var buf []byte
-	if len(cs.sendQueue) == 1 {
-		buf = cs.sendQueue[0]
-	} else {
-		total := 0
-		for _, b := range cs.sendQueue {
-			total += len(b)
+	// If sendBuf still has data (partial send remainder), re-send it.
+	if len(cs.sendBuf) > 0 {
+		sqe := w.ring.GetSQE()
+		if sqe == nil {
+			return // SQ ring full — will retry next iteration
 		}
-		buf = make([]byte, 0, total)
-		for _, b := range cs.sendQueue {
-			buf = append(buf, b...)
+		prepSend(sqe, fd, cs.sendBuf, false)
+		if cs.fixedFile {
+			setSQEFixedFile(sqe)
 		}
-		cs.sendQueue = cs.sendQueue[:1]
-		cs.sendQueue[0] = buf
+		setSQEUserData(sqe, encodeUserData(udSend, fd))
+		cs.sending = true
+		return
 	}
+
+	// No in-flight data; swap writeBuf → sendBuf if there's new data.
+	if len(cs.writeBuf) == 0 {
+		return
+	}
+
+	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
-		// SQ ring full — will retry on next loop iteration.
+		// SQ ring full — swap back; will retry next iteration.
+		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
 		return
 	}
-	prepSend(sqe, fd, buf, false)
+	prepSend(sqe, fd, cs.sendBuf, false)
+	if cs.fixedFile {
+		setSQEFixedFile(sqe)
+	}
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 	cs.sending = true
 }
@@ -534,10 +798,15 @@ func (w *Worker) shutdown() {
 			conn.CloseH2(cs.h2State)
 		}
 		cs.cancel()
-		_ = unix.Close(fd)
+		if !cs.fixedFile {
+			_ = unix.Close(fd)
+		}
 	}
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
+	}
+	if w.bufRing != nil && w.ring != nil {
+		w.bufRing.Close(w.ring)
 	}
 	if w.ring != nil {
 		_ = w.ring.Close()
@@ -607,15 +876,47 @@ func boundAddr(fd int) net.Addr {
 	return nil
 }
 
+func sockaddrString(sa unix.Sockaddr) string {
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return fmt.Sprintf("%s:%d", net.IP(v.Addr[:]), v.Port)
+	case *unix.SockaddrInet6:
+		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
+	}
+	return ""
+}
+
 func parseAddr(addr string) (unix.Sockaddr, error) {
 	host, portStr := "", addr
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			host = addr[:i]
-			portStr = addr[i+1:]
-			break
+
+	// Handle IPv6 bracket notation: [::1]:8080, [::]:8080
+	if len(addr) > 0 && addr[0] == '[' {
+		closeBracket := -1
+		for i := 1; i < len(addr); i++ {
+			if addr[i] == ']' {
+				closeBracket = i
+				break
+			}
+		}
+		if closeBracket < 0 {
+			return nil, fmt.Errorf("invalid addr: missing closing bracket: %s", addr)
+		}
+		host = addr[1:closeBracket]
+		if closeBracket+1 < len(addr) && addr[closeBracket+1] == ':' {
+			portStr = addr[closeBracket+2:]
+		} else {
+			return nil, fmt.Errorf("invalid addr: missing port after bracket: %s", addr)
+		}
+	} else {
+		for i := len(addr) - 1; i >= 0; i-- {
+			if addr[i] == ':' {
+				host = addr[:i]
+				portStr = addr[i+1:]
+				break
+			}
 		}
 	}
+
 	port := 0
 	for _, c := range portStr {
 		if c < '0' || c > '9' {
@@ -628,8 +929,17 @@ func parseAddr(addr string) (unix.Sockaddr, error) {
 		return &unix.SockaddrInet4{Port: port}, nil
 	}
 
+	// IPv6 addresses
 	if host == "::" {
 		return &unix.SockaddrInet6{Port: port}, nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip6 := ip.To16(); ip6 != nil && ip.To4() == nil {
+			sa := &unix.SockaddrInet6{Port: port}
+			copy(sa.Addr[:], ip6)
+			return sa, nil
+		}
 	}
 
 	sa := &unix.SockaddrInet4{Port: port}

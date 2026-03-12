@@ -16,18 +16,23 @@ const maxSendQueueBytes = 4 << 20 // 4 MiB
 
 // connState holds per-connection state for the io_uring engine.
 type connState struct {
-	fd             int
-	protocol       engine.Protocol
-	buf            []byte
-	h1State        *conn.H1State
-	h2State        *conn.H2State
-	ctx            context.Context
-	cancel         context.CancelFunc
-	detected       bool
-	sendQueue      [][]byte // FIFO queue of pending SEND buffers
-	sendQueueBytes int      // total bytes across all sendQueue entries
-	sending        bool     // true when a SEND SQE is in-flight for this connection
-	closing        bool     // defers close until all in-flight sends complete
+	fd         int // real FD, or fixed file index when fixedFile is true
+	protocol   engine.Protocol
+	buf        []byte // per-connection recv buffer (nil when using multishot recv)
+	h1State    *conn.H1State
+	h2State    *conn.H2State
+	ctx        context.Context
+	cancel     context.CancelFunc
+	detected   bool
+	fixedFile  bool   // true when fd is a fixed file index
+	writeBuf   []byte // append buffer: handler writes accumulate here
+	sendBuf    []byte // in-flight buffer: kernel holds this until CQE
+	sending    bool   // true when a SEND SQE is in-flight for this connection
+	closing    bool   // defers close until all in-flight sends complete
+	remoteAddr string
+	dirty      bool       // true when data needs to be flushed
+	dirtyNext  *connState // intrusive doubly-linked dirty list
+	dirtyPrev  *connState
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {

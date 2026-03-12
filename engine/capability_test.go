@@ -22,7 +22,7 @@ func TestNewDefaultProfile(t *testing.T) {
 	if p.KernelVersion != "" {
 		t.Errorf("KernelVersion = %q, want empty", p.KernelVersion)
 	}
-	if p.MultishotAccept || p.MultishotRecv || p.ProvidedBuffers || p.SQPoll || p.CoopTaskrun || p.SingleIssuer || p.LinkedSQEs {
+	if p.MultishotAccept || p.MultishotRecv || p.ProvidedBuffers || p.SQPoll || p.CoopTaskrun || p.SingleIssuer || p.LinkedSQEs || p.DeferTaskrun || p.FixedFiles {
 		t.Error("boolean capabilities should default to false")
 	}
 }
@@ -42,6 +42,8 @@ func TestCapabilityProfileCustomValues(t *testing.T) {
 		CoopTaskrun:     true,
 		SingleIssuer:    true,
 		LinkedSQEs:      true,
+		DeferTaskrun:    true,
+		FixedFiles:      true,
 		NumCPU:          16,
 		NUMANodes:       2,
 	}
@@ -63,7 +65,7 @@ func TestCapabilityProfileCustomValues(t *testing.T) {
 	if p.NUMANodes != 2 {
 		t.Errorf("NUMANodes = %d, want 2", p.NUMANodes)
 	}
-	if !p.MultishotAccept || !p.MultishotRecv || !p.ProvidedBuffers || !p.SQPoll || !p.CoopTaskrun || !p.SingleIssuer || !p.LinkedSQEs {
+	if !p.MultishotAccept || !p.MultishotRecv || !p.ProvidedBuffers || !p.SQPoll || !p.CoopTaskrun || !p.SingleIssuer || !p.LinkedSQEs || !p.DeferTaskrun || !p.FixedFiles {
 		t.Error("all boolean capabilities should be true")
 	}
 }

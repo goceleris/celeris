@@ -19,20 +19,28 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
+var (
+	_ engine.Engine        = (*Engine)(nil)
+	_ engine.SwitchFreezer = (*Engine)(nil)
+)
+
 // Engine is an adaptive meta-engine that switches between io_uring and epoll.
 type Engine struct {
-	primary        engine.Engine // io_uring
-	secondary      engine.Engine // epoll
-	active         atomic.Pointer[engine.Engine]
-	ctrl           *controller
-	cfg            resource.Config
-	handler        stream.Handler
-	addr           atomic.Pointer[net.Addr]
-	mu             sync.Mutex
-	switchMu       sync.Mutex // protects evaluate + performSwitch coordination
-	frozen         atomic.Bool
-	logger         *slog.Logger
-	suppressFreeze func(time.Duration)
+	primary   engine.Engine // io_uring
+	secondary engine.Engine // epoll
+	active    atomic.Pointer[engine.Engine]
+	ctrl      *controller
+	cfg       resource.Config
+	handler   stream.Handler
+	addr      atomic.Pointer[net.Addr]
+	mu        sync.Mutex
+	switchMu  sync.Mutex // protects evaluate + performSwitch coordination
+	frozen    atomic.Bool
+	logger    *slog.Logger
+
+	// freezeCooldown is the duration to suppress further switches after a switch.
+	// Zero means no cooldown (default).
+	freezeCooldown time.Duration
 }
 
 // New creates a new adaptive engine with io_uring as primary and epoll as secondary.
@@ -247,8 +255,13 @@ func (e *Engine) performSwitch() {
 		"now_standby", newStandby.Type().String(),
 	)
 
-	if e.suppressFreeze != nil {
-		e.suppressFreeze(5 * time.Second)
+	// Suppress further switches for the cooldown period.
+	if e.freezeCooldown > 0 {
+		e.frozen.Store(true)
+		go func() {
+			time.Sleep(e.freezeCooldown)
+			e.frozen.Store(false)
+		}()
 	}
 }
 
@@ -298,17 +311,15 @@ func (e *Engine) UnfreezeSwitching() {
 	e.frozen.Store(false)
 }
 
+// SetFreezeCooldown sets the duration to suppress further switches after a switch.
+// Zero disables the cooldown (default). This prevents oscillation under unstable load.
+func (e *Engine) SetFreezeCooldown(d time.Duration) {
+	e.freezeCooldown = d
+}
+
 // ActiveEngine returns the currently active engine.
 func (e *Engine) ActiveEngine() engine.Engine {
 	return *e.active.Load()
-}
-
-// SetFreezeSuppressor registers a callback to suppress overload freeze
-// during engine switches.
-func (e *Engine) SetFreezeSuppressor(fn func(time.Duration)) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.suppressFreeze = fn
 }
 
 // ForceSwitch triggers an immediate engine switch (for testing).

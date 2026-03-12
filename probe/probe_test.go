@@ -51,6 +51,12 @@ func TestProbeWithOptionalTier(t *testing.T) {
 	if !profile.LinkedSQEs {
 		t.Fatal("expected LinkedSQEs")
 	}
+	if !profile.DeferTaskrun {
+		t.Fatal("expected DeferTaskrun on kernel 6.1+")
+	}
+	if !profile.FixedFiles {
+		t.Fatal("expected FixedFiles on kernel 5.19+")
+	}
 	if !profile.SQPoll {
 		t.Fatal("expected SQPoll with CAP_SYS_NICE")
 	}
@@ -84,6 +90,12 @@ func TestProbeWithHighTier(t *testing.T) {
 	if !profile.CoopTaskrun {
 		t.Fatal("expected CoopTaskrun")
 	}
+	if !profile.FixedFiles {
+		t.Fatal("expected FixedFiles on kernel 5.19+")
+	}
+	if profile.DeferTaskrun {
+		t.Fatal("expected no DeferTaskrun on kernel 5.19")
+	}
 	if profile.SingleIssuer {
 		t.Fatal("expected no SingleIssuer")
 	}
@@ -110,6 +122,12 @@ func TestProbeWithMidTier(t *testing.T) {
 	}
 	if profile.MultishotAccept {
 		t.Fatal("expected no MultishotAccept")
+	}
+	if profile.FixedFiles {
+		t.Fatal("expected no FixedFiles on kernel 5.13")
+	}
+	if profile.DeferTaskrun {
+		t.Fatal("expected no DeferTaskrun on kernel 5.13")
 	}
 }
 

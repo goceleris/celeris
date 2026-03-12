@@ -3,6 +3,8 @@ package celeris
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -14,19 +16,30 @@ type routerAdapter struct {
 }
 
 func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
-	start := time.Now()
+	var start time.Time
+	if a.server.collector != nil {
+		start = time.Now()
+	}
 
 	c := acquireContext(s)
-	defer releaseContext(c)
 
 	if a.server.config.MaxFormSize != 0 {
 		c.maxFormSize = a.server.config.MaxFormSize
 	}
 
+	// WriteTimeout is enforced at the engine level via timer wheel (epoll/iouring)
+	// or http.Server.WriteTimeout (std), avoiding a goroutine+timer alloc per request.
+
 	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
 
 	defer func() {
 		if r := recover(); r != nil {
+			a.server.logger().Error("handler panic recovered",
+				"error", fmt.Sprint(r),
+				"method", c.method,
+				"path", c.path,
+				"stack", string(debug.Stack()),
+			)
 			c.statusCode = 500
 			if !c.written && s.ResponseWriter != nil {
 				_ = s.ResponseWriter.WriteResponse(s, 500, [][2]string{
@@ -35,6 +48,20 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 				c.written = true
 			}
 		}
+		if c.detached {
+			go func() {
+				<-c.detachDone
+				if a.server.collector != nil {
+					status := c.statusCode
+					if status == 0 {
+						status = 200
+					}
+					a.server.collector.RecordRequest(time.Since(start), status)
+				}
+				releaseContext(c)
+			}()
+			return
+		}
 		if a.server.collector != nil {
 			status := c.statusCode
 			if status == 0 {
@@ -42,6 +69,7 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 			}
 			a.server.collector.RecordRequest(time.Since(start), status)
 		}
+		releaseContext(c)
 	}()
 
 	if handlers == nil {
@@ -53,6 +81,10 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 	c.fullPath = fullPath
 
 	a.handleError(c, s, c.Next())
+	if c.buffered && !c.written {
+		c.bufferDepth = 1
+		_ = c.FlushResponse()
+	}
 	return nil
 }
 
@@ -65,21 +97,25 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 			c.SetHeader("allow", allowVal)
 			c.handlers = []HandlerFunc{a.server.methodNotAllowedHandler}
 			a.handleError(c, s, c.Next())
-		} else if s.ResponseWriter != nil {
+		}
+		if !c.written && s.ResponseWriter != nil {
 			_ = s.ResponseWriter.WriteResponse(s, 405, [][2]string{
 				{"content-type", "text/plain"},
 				{"allow", allowVal},
 			}, []byte("405 Method Not Allowed"))
+			c.written = true
 		}
 	} else {
 		c.statusCode = 404
 		if a.server.notFoundHandler != nil {
 			c.handlers = []HandlerFunc{a.server.notFoundHandler}
 			a.handleError(c, s, c.Next())
-		} else if s.ResponseWriter != nil {
+		}
+		if !c.written && s.ResponseWriter != nil {
 			_ = s.ResponseWriter.WriteResponse(s, 404, [][2]string{
 				{"content-type", "text/plain"},
 			}, []byte("404 Not Found"))
+			c.written = true
 		}
 	}
 }

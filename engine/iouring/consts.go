@@ -14,6 +14,7 @@ const (
 	setupSQPoll       = 1 << 1
 	setupCoopTaskrun  = 1 << 8
 	setupSingleIssuer = 1 << 12
+	setupDeferTaskrun = 1 << 13
 )
 
 // io_uring enter flags.
@@ -29,17 +30,19 @@ const (
 	opREADV          = 1
 	opWRITEV         = 2
 	opACCEPT         = 13
-	opRECV           = 27
-	opSEND           = 26
 	opASYNCCANCEL    = 14
 	opCLOSE          = 19
+	opSEND           = 26
+	opRECV           = 27
 	opPROVIDEBUFFERS = 31
 )
 
 // SQE flags.
 const (
-	sqeIOLink       = 1 << 2
-	sqeBufferSelect = 1 << 5
+	sqeFixedFile      = 1 << 0
+	sqeIOLink         = 1 << 2
+	sqeBufferSelect   = 1 << 5
+	sqeCQESkipSuccess = 1 << 6
 )
 
 // CQE flags.
@@ -52,6 +55,22 @@ const (
 const (
 	acceptMultishot = 1 << 0
 )
+
+// Recv flags (ioprio field).
+const (
+	recvMultishot = 1 << 1
+)
+
+// io_uring_register opcodes.
+const (
+	registerFiles       = 2
+	registerFilesUpdate = 6
+	registerPbufRing    = 22
+	unregisterPbufRing  = 23
+)
+
+// Fixed file index sentinel for auto-allocation (IORING_FILE_INDEX_ALLOC).
+const fileIndexAlloc = ^uint32(0)
 
 // Async cancel flags.
 const (

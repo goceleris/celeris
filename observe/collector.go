@@ -14,6 +14,14 @@ var defaultBucketBounds = []float64{
 	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 5,
 }
 
+var defaultBucketBoundsNS [bucketCount]int64
+
+func init() {
+	for i, bound := range defaultBucketBounds {
+		defaultBucketBoundsNS[i] = int64(bound * 1e9)
+	}
+}
+
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
 type EngineMetrics = engine.EngineMetrics
 
@@ -41,7 +49,6 @@ type Snapshot struct {
 type Collector struct {
 	requestsTotal   atomic.Uint64
 	errorsTotal     atomic.Uint64
-	activeConns     atomic.Int64
 	engineSwitches  atomic.Uint64
 	latencyBuckets  [bucketCount]atomic.Uint64
 	mu              sync.Mutex
@@ -67,9 +74,9 @@ func (c *Collector) RecordRequest(duration time.Duration, status int) {
 	if status >= 500 {
 		c.errorsTotal.Add(1)
 	}
-	secs := duration.Seconds()
-	for i, bound := range defaultBucketBounds {
-		if secs <= bound {
+	ns := duration.Nanoseconds()
+	for i, bound := range defaultBucketBoundsNS {
+		if ns <= bound {
 			c.latencyBuckets[i].Add(1)
 			return
 		}
@@ -84,16 +91,6 @@ func (c *Collector) RecordRequest(duration time.Duration, status int) {
 // (e.g., connection-level failures).
 func (c *Collector) RecordError() {
 	c.errorsTotal.Add(1)
-}
-
-// ConnOpened increments the active connection gauge.
-func (c *Collector) ConnOpened() {
-	c.activeConns.Add(1)
-}
-
-// ConnClosed decrements the active connection gauge.
-func (c *Collector) ConnClosed() {
-	c.activeConns.Add(-1)
 }
 
 // RecordSwitch increments the engine switch counter.
@@ -113,7 +110,6 @@ func (c *Collector) Snapshot() Snapshot {
 	snap := Snapshot{
 		RequestsTotal:  c.requestsTotal.Load(),
 		ErrorsTotal:    c.errorsTotal.Load(),
-		ActiveConns:    c.activeConns.Load(),
 		EngineSwitches: c.engineSwitches.Load(),
 		LatencyBuckets: buckets,
 		BucketBounds:   bounds,
@@ -123,6 +119,7 @@ func (c *Collector) Snapshot() Snapshot {
 	c.mu.Unlock()
 	if fn != nil {
 		snap.EngineMetrics = fn()
+		snap.ActiveConns = snap.EngineMetrics.ActiveConnections
 	}
 	return snap
 }

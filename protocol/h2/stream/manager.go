@@ -23,6 +23,7 @@ type Manager struct {
 	pendingStreamUpdates    map[uint32]*uint32
 	windowUpdateMu          sync.Mutex
 	streamsWithData         map[uint32]struct{}
+	RemoteAddr              string
 }
 
 // NewManager creates a new stream manager.
@@ -51,6 +52,7 @@ func (m *Manager) CreateStream(id uint32) *Stream {
 
 	stream := NewStream(id)
 	stream.manager = m
+	stream.RemoteAddr = m.RemoteAddr
 	//nolint:gosec // G115: safe conversion, initialWindowSize validated by protocol
 	stream.WindowSize = int32(m.initialWindowSize)
 	m.streams[id] = stream
@@ -84,6 +86,7 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 
 	s := NewStream(id)
 	s.manager = m
+	s.RemoteAddr = m.RemoteAddr
 	//nolint:gosec // G115: safe conversion, initialWindowSize validated by protocol
 	s.WindowSize = int32(m.initialWindowSize)
 	s.State = StateOpen
@@ -136,18 +139,14 @@ func (m *Manager) GetLastClientStreamID() uint32 {
 	return m.lastClientStream
 }
 
-// UpdateConnectionWindow updates the connection-level flow control window.
+// UpdateConnectionWindow atomically updates the connection-level flow control window.
 func (m *Manager) UpdateConnectionWindow(delta int32) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.connectionWindow += delta
+	atomic.AddInt32(&m.connectionWindow, delta)
 }
 
-// GetConnectionWindow returns the current connection window size.
+// GetConnectionWindow atomically returns the current connection window size.
 func (m *Manager) GetConnectionWindow() int32 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.connectionWindow
+	return atomic.LoadInt32(&m.connectionWindow)
 }
 
 // CountActiveStreams returns number of streams considered active for concurrency limits.

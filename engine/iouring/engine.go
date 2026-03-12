@@ -55,7 +55,9 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	cfg.Logger.Info("io_uring engine selected",
 		"tier", tier.Tier().String(),
 		"multishot_accept", tier.SupportsMultishotAccept(),
+		"multishot_recv", tier.SupportsMultishotRecv(),
 		"provided_buffers", tier.SupportsProvidedBuffers(),
+		"fixed_files", tier.SupportsFixedFiles(),
 	)
 
 	return &Engine{
@@ -162,12 +164,12 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 }
 
 func fallbackTier(current TierStrategy) TierStrategy {
-	switch current.Tier() {
-	case engine.Optional:
-		return &highTier{}
-	case engine.High:
+	switch t := current.(type) {
+	case *optionalTier:
+		return &highTier{deferTaskrun: t.deferTaskrun, fixedFiles: t.fixedFiles}
+	case *highTier:
 		return &midTier{}
-	case engine.Mid:
+	case *midTier:
 		return &baseTier{}
 	default:
 		return nil
@@ -218,6 +220,11 @@ func (e *Engine) ResumeAccept() error {
 	}
 	return nil
 }
+
+var (
+	_ engine.Engine           = (*Engine)(nil)
+	_ engine.AcceptController = (*Engine)(nil)
+)
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {

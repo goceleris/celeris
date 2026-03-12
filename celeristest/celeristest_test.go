@@ -152,3 +152,56 @@ func TestResponseRecorderBodyString(t *testing.T) {
 		t.Fatalf("expected empty, got %s", empty.BodyString())
 	}
 }
+
+func TestWithBasicAuth(t *testing.T) {
+	ctx, _ := NewContext("GET", "/admin",
+		WithBasicAuth("alice", "secret"),
+	)
+	defer ReleaseContext(ctx)
+
+	user, pass, ok := ctx.BasicAuth()
+	if !ok {
+		t.Fatal("expected BasicAuth to succeed")
+	}
+	if user != "alice" {
+		t.Fatalf("expected user alice, got %s", user)
+	}
+	if pass != "secret" {
+		t.Fatalf("expected pass secret, got %s", pass)
+	}
+}
+
+func TestWithCookie(t *testing.T) {
+	ctx, _ := NewContext("GET", "/test",
+		WithCookie("session", "abc123"),
+		WithCookie("theme", "dark"),
+	)
+	defer ReleaseContext(ctx)
+
+	v, err := ctx.Cookie("session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "abc123" {
+		t.Fatalf("expected abc123, got %s", v)
+	}
+
+	v, err = ctx.Cookie("theme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "dark" {
+		t.Fatalf("expected dark, got %s", v)
+	}
+}
+
+func TestWithRemoteAddr(t *testing.T) {
+	ctx, _ := NewContext("GET", "/test",
+		WithRemoteAddr("192.168.1.1:54321"),
+	)
+	defer ReleaseContext(ctx)
+
+	if ctx.RemoteAddr() != "192.168.1.1:54321" {
+		t.Fatalf("expected 192.168.1.1:54321, got %s", ctx.RemoteAddr())
+	}
+}

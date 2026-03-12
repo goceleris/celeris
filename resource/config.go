@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/overload"
 )
 
 // Config holds server configuration including protocol, engine, address, and resource settings.
@@ -26,7 +25,9 @@ type Config struct {
 	WriteTimeout         time.Duration
 	IdleTimeout          time.Duration
 	DisableKeepAlive     bool
-	Overload             overload.Config
+	Listener             net.Listener
+	OnConnect            func(addr string)
+	OnDisconnect         func(addr string)
 	Logger               *slog.Logger
 }
 
@@ -40,8 +41,8 @@ func (c Config) Validate() []error {
 			errs = append(errs, fmt.Errorf("invalid addr %q: %w", c.Addr, err))
 		} else {
 			var p int
-			if _, err := fmt.Sscanf(port, "%d", &p); err != nil || p < 1 || p > 65535 {
-				errs = append(errs, fmt.Errorf("port must be 1-65535, got %q", port))
+			if _, err := fmt.Sscanf(port, "%d", &p); err != nil || p < 0 || p > 65535 {
+				errs = append(errs, fmt.Errorf("port must be 0-65535, got %q", port))
 			}
 		}
 	}
@@ -70,14 +71,14 @@ func (c Config) Validate() []error {
 		errs = append(errs, fmt.Errorf("bufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
 	}
 
-	if c.ReadTimeout < 0 {
-		errs = append(errs, fmt.Errorf("readTimeout must be >= 0, got %v", c.ReadTimeout))
+	if c.ReadTimeout < -1 {
+		errs = append(errs, fmt.Errorf("readTimeout must be >= -1, got %v", c.ReadTimeout))
 	}
-	if c.WriteTimeout < 0 {
-		errs = append(errs, fmt.Errorf("writeTimeout must be >= 0, got %v", c.WriteTimeout))
+	if c.WriteTimeout < -1 {
+		errs = append(errs, fmt.Errorf("writeTimeout must be >= -1, got %v", c.WriteTimeout))
 	}
-	if c.IdleTimeout < 0 {
-		errs = append(errs, fmt.Errorf("idleTimeout must be >= 0, got %v", c.IdleTimeout))
+	if c.IdleTimeout < -1 {
+		errs = append(errs, fmt.Errorf("idleTimeout must be >= -1, got %v", c.IdleTimeout))
 	}
 
 	if runtime.GOOS != "linux" {
@@ -112,17 +113,23 @@ func (c Config) WithDefaults() Config {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
-	if c.ReadTimeout == 0 {
+	switch {
+	case c.ReadTimeout == 0:
 		c.ReadTimeout = 300 * time.Second
+	case c.ReadTimeout < 0:
+		c.ReadTimeout = 0 // -1 → no timeout
 	}
-	if c.WriteTimeout == 0 {
+	switch {
+	case c.WriteTimeout == 0:
 		c.WriteTimeout = 300 * time.Second
+	case c.WriteTimeout < 0:
+		c.WriteTimeout = 0 // -1 → no timeout
 	}
-	if c.IdleTimeout == 0 {
+	switch {
+	case c.IdleTimeout == 0:
 		c.IdleTimeout = 600 * time.Second
-	}
-	if c.Overload == (overload.Config{}) {
-		c.Overload = overload.DefaultConfig()
+	case c.IdleTimeout < 0:
+		c.IdleTimeout = 0 // -1 → no timeout
 	}
 	return c
 }

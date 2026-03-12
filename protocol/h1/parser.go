@@ -3,7 +3,6 @@ package h1
 import (
 	"bytes"
 	"errors"
-	"strings"
 )
 
 // H1 parser sentinel errors.
@@ -27,6 +26,13 @@ type Parser struct {
 // NewParser returns a new Parser ready for use.
 func NewParser() *Parser {
 	return &Parser{}
+}
+
+// SetZeroCopy enables zero-copy header parsing. When enabled, the parser
+// only populates RawHeaders (not Headers). The caller must convert
+// RawHeaders to strings — typically via unsafe.String for zero allocation.
+func (p *Parser) SetZeroCopy(enabled bool) {
+	p.noStringHeaders = enabled
 }
 
 // Reset reinitializes the parser with a new input buffer.
@@ -150,19 +156,7 @@ func (p *Parser) parseHeaders(req *Request) (bool, error) {
 func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 	req.RawHeaders = append(req.RawHeaders, [2][]byte{rawName, rawValue})
 	if !p.noStringHeaders {
-		var name string
-		switch {
-		case asciiEqualFold(rawName, "Host"):
-			name = "host"
-		case asciiEqualFold(rawName, "Content-Length"):
-			name = "content-length"
-		case asciiEqualFold(rawName, "Transfer-Encoding"):
-			name = "transfer-encoding"
-		case asciiEqualFold(rawName, "Connection"):
-			name = "connection"
-		default:
-			name = strings.ToLower(string(rawName))
-		}
+		name := internOrLowerHeader(rawName)
 		value := string(rawValue)
 		req.Headers = append(req.Headers, [2]string{name, value})
 		switch name {
@@ -188,6 +182,10 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 				req.KeepAlive = false
 			} else if asciiContainsFoldString(value, "keep-alive") {
 				req.KeepAlive = true
+			}
+		case "expect":
+			if asciiContainsFoldString(value, "100-continue") {
+				req.ExpectContinue = true
 			}
 		}
 		return nil
@@ -220,6 +218,12 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 			req.KeepAlive = false
 		} else if asciiContainsFoldBytes(rawValue, "keep-alive") {
 			req.KeepAlive = true
+		}
+		return nil
+	}
+	if asciiEqualFold(rawName, "Expect") {
+		if asciiContainsFoldBytes(rawValue, "100-continue") {
+			req.ExpectContinue = true
 		}
 		return nil
 	}
