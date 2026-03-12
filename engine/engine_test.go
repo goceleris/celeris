@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 )
@@ -12,6 +13,7 @@ func (m *mockEngine) Listen(_ context.Context) error   { return nil }
 func (m *mockEngine) Shutdown(_ context.Context) error { return nil }
 func (m *mockEngine) Metrics() EngineMetrics           { return EngineMetrics{} }
 func (m *mockEngine) Type() EngineType                 { return Std }
+func (m *mockEngine) Addr() net.Addr                   { return nil }
 
 var _ Engine = (*mockEngine)(nil)
 

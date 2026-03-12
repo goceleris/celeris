@@ -19,6 +19,10 @@ type ContinuationState struct {
 	isTrailers    bool
 }
 
+// maxRequestBodySize is the maximum allowed request body (100 MB).
+// Streams exceeding this limit are rejected with RST_STREAM.
+const maxRequestBodySize = 100 << 20
+
 var headerBlockPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
 
 var headersSlicePoolIn = sync.Pool{New: func() any { s := make([][2]string, 0, 16); return &s }}
@@ -570,6 +574,12 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	dataLen := len(f.Data())
 	stream.ReceivedDataLen += dataLen
 
+	// Reject streams that exceed the maximum request body size (100 MB).
+	if stream.ReceivedDataLen > maxRequestBodySize {
+		_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeCancel)
+		return fmt.Errorf("request body exceeds %d bytes on stream %d", maxRequestBodySize, f.StreamID)
+	}
+
 	if err := stream.AddData(f.Data()); err != nil {
 		return err
 	}
@@ -605,8 +615,9 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			return p.goAwayErr(0, http2.ErrCodeProtocol, []byte("WINDOW_UPDATE increment is 0"),
 				fmt.Errorf("WINDOW_UPDATE with 0 increment"))
 		}
-		return p.goAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("WINDOW_UPDATE with 0 increment on stream"),
-			fmt.Errorf("WINDOW_UPDATE with 0 increment on stream %d", f.StreamID))
+		// RFC 7540 §6.9.1: zero increment on a stream is a stream error.
+		_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
+		return fmt.Errorf("WINDOW_UPDATE with 0 increment on stream %d", f.StreamID)
 	}
 
 	if f.StreamID == 0 {

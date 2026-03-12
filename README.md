@@ -5,17 +5,35 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/goceleris/celeris)](https://goreportcard.com/report/github.com/goceleris/celeris)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uring & epoll) designed for high-throughput infrastructure and zero-allocation microservices.
+Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uring & epoll) designed for high-throughput infrastructure and zero-allocation microservices. It provides a familiar route-group and middleware API similar to Gin and Echo, so teams can adopt it without learning a new programming model.
 
 ## Features
 
 - **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept, provided buffers, SQ poll) for your kernel
 - **Edge-triggered epoll** — per-core event loops with CPU pinning
 - **Adaptive meta-engine** — dynamically switches between io_uring and epoll based on runtime telemetry
-- **Overload manager** — 5-stage degradation ladder (expand → reap → reorder → backpressure → reject)
+- **Overload manager** — 5-stage degradation ladder (expand, reap, reorder, backpressure, reject)
 - **SIMD HTTP parser** — SSE2 (amd64) and NEON (arm64) with generic SWAR fallback
 - **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK
 - **Auto-detect** — protocol negotiation from the first bytes on the wire
+- **Error-returning handlers** — `HandlerFunc` returns `error`; structured `HTTPError` for status codes
+- **Serialization** — JSON and XML response methods (`JSON`, `XML`); Protocol Buffers available via [`github.com/goceleris/middlewares`](https://github.com/goceleris/middlewares); `Bind` auto-detects request format from Content-Type
+- **net/http compatibility** — wrap existing `http.Handler` via `celeris.Adapt()`
+- **Built-in metrics collector** — atomic counters, always-on `Server.Collector().Snapshot()`
+
+## API Overview
+
+| Type | Package | Description |
+|------|---------|-------------|
+| `Server` | `celeris` | Top-level entry point; owns config, router, engine |
+| `Config` | `celeris` | Server configuration (addr, engine, protocol, timeouts) |
+| `Context` | `celeris` | Per-request context with params, headers, body, response methods |
+| `HandlerFunc` | `celeris` | `func(*Context) error` — handler/middleware signature |
+| `HTTPError` | `celeris` | Structured error carrying HTTP status code and message |
+| `RouteGroup` | `celeris` | Group of routes sharing a prefix and middleware |
+| `Route` | `celeris` | Opaque handle to a registered route |
+| `Collector` | `observe` | Lock-free request metrics aggregator |
+| `Snapshot` | `observe` | Point-in-time copy of all collected metrics |
 
 ## Architecture
 
@@ -43,54 +61,202 @@ Requires **Go 1.26+**. Linux for io_uring/epoll engines; any OS for the std engi
 package main
 
 import (
-	"context"
 	"log"
-	"os/signal"
-	"syscall"
 
-	"github.com/goceleris/celeris/engine/std"
-	"github.com/goceleris/celeris/protocol/h2/stream"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris"
 )
 
 func main() {
-	handler := stream.HandlerFunc(func(ctx context.Context, s *stream.Stream) error {
-		return s.ResponseWriter.WriteResponse(s, 200, [][2]string{
-			{"content-type", "text/plain"},
-		}, []byte("Hello, World!"))
+	s := celeris.New(celeris.Config{Addr: ":8080"})
+	s.GET("/hello", func(c *celeris.Context) error {
+		return c.String(200, "Hello, World!")
 	})
+	log.Fatal(s.Start())
+}
+```
 
-	cfg := resource.Config{Addr: ":8080"}
-	e, err := std.New(cfg, handler)
-	if err != nil {
-		log.Fatal(err)
+## Routing
+
+```go
+s := celeris.New(celeris.Config{Addr: ":8080"})
+
+// Static routes
+s.GET("/health", healthHandler)
+
+// Named parameters
+s.GET("/users/:id", func(c *celeris.Context) error {
+	id := c.Param("id")
+	return c.JSON(200, map[string]string{"id": id})
+})
+
+// Catch-all wildcards
+s.GET("/files/*path", staticFileHandler)
+
+// Route groups
+api := s.Group("/api")
+api.GET("/items", listItems)
+api.POST("/items", createItem)
+
+// Nested groups
+v2 := api.Group("/v2")
+v2.GET("/items", listItemsV2)
+```
+
+## Middleware
+
+Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module — one subpackage per middleware, individually importable.
+
+```go
+import (
+	"github.com/goceleris/middlewares/logger"
+	"github.com/goceleris/middlewares/recovery"
+	"github.com/goceleris/middlewares/cors"
+	"github.com/goceleris/middlewares/ratelimit"
+)
+
+s := celeris.New(celeris.Config{Addr: ":8080"})
+s.Use(recovery.New())
+s.Use(logger.New(slog.Default()))
+
+api := s.Group("/api")
+api.Use(ratelimit.New(1000))
+api.Use(cors.New(cors.Config{
+	AllowOrigins: []string{"https://example.com"},
+}))
+```
+
+See the [middlewares repo](https://github.com/goceleris/middlewares) for the full list: Logger, Recovery, CORS, RateLimit, RequestID, Timeout, BodyLimit, BasicAuth, JWT, CSRF, Session, Metrics, Debug, Compress, and more.
+
+### Writing Custom Middleware
+
+Middleware is just a `HandlerFunc` that calls `c.Next()`:
+
+```go
+func Timing() celeris.HandlerFunc {
+	return func(c *celeris.Context) error {
+		start := time.Now()
+		err := c.Next()
+		dur := time.Since(start)
+		slog.Info("request", "path", c.Path(), "duration", dur, "error", err)
+		return err
 	}
+}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+s.Use(Timing())
+```
 
-	if err := e.Listen(ctx); err != nil {
-		log.Fatal(err)
+The `error` returned by `c.Next()` is the first non-nil error from any downstream handler. Middleware can inspect, wrap, or swallow the error before returning.
+
+## Error Handling
+
+`HandlerFunc` has the signature `func(*Context) error`. Returning a non-nil error propagates it up through the middleware chain. If no middleware handles the error, the router's safety net converts it to an HTTP response:
+
+- `*HTTPError` — responds with `Code` and `Message` from the error.
+- Any other `error` — responds with `500 Internal Server Error`.
+
+```go
+// Return a structured HTTP error
+s.GET("/item/:id", func(c *celeris.Context) error {
+	item, err := store.Find(c.Param("id"))
+	if err != nil {
+		return celeris.NewHTTPError(404, "item not found").WithError(err)
+	}
+	return c.JSON(200, item)
+})
+
+// Middleware can intercept errors from downstream handlers
+func ErrorLogger() celeris.HandlerFunc {
+	return func(c *celeris.Context) error {
+		err := c.Next()
+		if err != nil {
+			slog.Error("handler error", "path", c.Path(), "error", err)
+		}
+		return err
 	}
 }
 ```
+
+## Configuration
+
+```go
+s := celeris.New(celeris.Config{
+	Addr:            ":8080",
+	Protocol:        celeris.Auto,       // HTTP1, H2C, or Auto
+	Engine:          celeris.Adaptive,    // IOUring, Epoll, Adaptive, or Std
+	Workers:         8,
+	Objective:       celeris.Latency,    // Latency, Throughput, or Balanced
+	ReadTimeout:     30 * time.Second,
+	WriteTimeout:    30 * time.Second,
+	IdleTimeout:     120 * time.Second,
+	ShutdownTimeout: 10 * time.Second,   // max wait for in-flight requests (default 30s)
+	Logger:          slog.Default(),
+})
+```
+
+## net/http Compatibility
+
+Wrap existing `net/http` handlers and middleware:
+
+```go
+// Wrap http.Handler
+s.GET("/legacy", celeris.Adapt(legacyHandler))
+
+// Wrap http.HandlerFunc
+s.GET("/func", celeris.AdaptFunc(func(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("from stdlib"))
+}))
+```
+
+The bridge buffers the adapted handler's response in memory, capped at **100 MB**. Responses exceeding this limit return an error.
 
 ## Engine Selection
 
 | Engine | Platform | Use Case |
 |--------|----------|----------|
-| `io_uring` | Linux 5.10+ | Lowest latency, highest throughput |
-| `epoll` | Linux | Broad kernel support, proven stability |
-| `adaptive` | Linux | Auto-switch based on telemetry |
-| `std` | Any OS | Development, compatibility, non-Linux deploys |
+| `IOUring` | Linux 5.10+ | Lowest latency, highest throughput |
+| `Epoll` | Linux | Broad kernel support, proven stability |
+| `Adaptive` | Linux | Auto-switch based on telemetry |
+| `Std` | Any OS | Development, compatibility, non-Linux deploys |
+
+Use Adaptive (the default on Linux) unless you have a specific reason to pin an engine. On non-Linux platforms, only Std is available.
 
 ## Performance Profiles
 
 | Profile | Optimizes For | Key Tuning |
 |---------|---------------|------------|
-| `LatencyOptimized` | P99 tail latency | TCP_NODELAY, small batches, SO_BUSY_POLL |
-| `ThroughputOptimized` | Max RPS | Large CQ batches, write batching |
-| `Balanced` | Mixed workloads | Default settings |
+| `celeris.Latency` | P99 tail latency | TCP_NODELAY, small batches, SO_BUSY_POLL |
+| `celeris.Throughput` | Max RPS | Large CQ batches, write batching |
+| `celeris.Balanced` | Mixed workloads | Default settings |
+
+## Graceful Shutdown
+
+Use `StartWithContext` for production deployments. When the context is canceled, the server drains in-flight requests up to `ShutdownTimeout` (default 30s).
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+s := celeris.New(celeris.Config{
+	Addr:            ":8080",
+	ShutdownTimeout: 15 * time.Second,
+})
+s.GET("/hello", helloHandler)
+
+if err := s.StartWithContext(ctx); err != nil {
+	log.Fatal(err)
+}
+```
+
+## Observability
+
+The core provides a lightweight metrics collector accessible via `Server.Collector()`:
+
+```go
+snap := server.Collector().Snapshot()
+fmt.Println(snap.RequestsTotal, snap.ErrorsTotal, snap.ActiveConns)
+```
+
+For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](https://github.com/goceleris/middlewares) and [`middlewares/debug`](https://github.com/goceleris/middlewares) packages.
 
 ## Feature Matrix
 
@@ -103,6 +269,18 @@ func main() {
 | Provided buffers | yes (5.19+) | no | no |
 | Multishot accept | yes (5.19+) | no | no |
 | Overload shedding | yes | yes | partial |
+
+## Benchmarks
+
+Framework overhead on 8 vCPU (arm64 c6g.2xlarge, x86 c5a.2xlarge):
+
+- **<1.5%** overhead vs raw engine (balanced mode)
+- All 3 engines within **0.3%** of each other (adaptive fully matches dedicated)
+- Beats Fiber by **+1.4-2.1%** (arm64), **+0.7-1.3%** (x86)
+- Beats echo/chi/gin/iris by **5-6%**
+- H2 overhead: **1.5%** vs Go frameworks' **16.6%** (11x smaller)
+
+Methodology: 27 server configurations (3 engines x 3 objectives x 3 protocols) tested with `wrk2` at fixed request rates. Full results and reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/benchmarks).
 
 ## Requirements
 
@@ -117,7 +295,7 @@ func main() {
 adaptive/       Adaptive meta-engine (Linux)
 engine/         Engine interface + implementations (iouring, epoll, std)
 internal/       Shared internals (conn, cpumon, platform, sockopts)
-observe/        Observability (planned)
+observe/        Lightweight metrics collector (atomic counters, Snapshot)
 overload/       Overload manager with 5-stage degradation
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)
@@ -128,10 +306,11 @@ test/           Conformance, spec compliance, integration, benchmarks
 ## Contributing
 
 ```bash
-go run mage.go build   # build all targets
-go run mage.go test    # run tests
-go run mage.go lint    # run linters
-go run mage.go bench   # run benchmarks
+go install github.com/magefile/mage@latest  # one-time setup
+mage build   # build all targets
+mage test    # run tests
+mage lint    # run linters
+mage bench   # run benchmarks
 ```
 
 Pull requests should target `main`.
