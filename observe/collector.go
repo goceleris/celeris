@@ -41,7 +41,6 @@ type Snapshot struct {
 type Collector struct {
 	requestsTotal   atomic.Uint64
 	errorsTotal     atomic.Uint64
-	activeConns     atomic.Int64
 	engineSwitches  atomic.Uint64
 	latencyBuckets  [bucketCount]atomic.Uint64
 	mu              sync.Mutex
@@ -86,16 +85,6 @@ func (c *Collector) RecordError() {
 	c.errorsTotal.Add(1)
 }
 
-// ConnOpened increments the active connection gauge.
-func (c *Collector) ConnOpened() {
-	c.activeConns.Add(1)
-}
-
-// ConnClosed decrements the active connection gauge.
-func (c *Collector) ConnClosed() {
-	c.activeConns.Add(-1)
-}
-
 // RecordSwitch increments the engine switch counter.
 func (c *Collector) RecordSwitch() {
 	c.engineSwitches.Add(1)
@@ -113,7 +102,6 @@ func (c *Collector) Snapshot() Snapshot {
 	snap := Snapshot{
 		RequestsTotal:  c.requestsTotal.Load(),
 		ErrorsTotal:    c.errorsTotal.Load(),
-		ActiveConns:    c.activeConns.Load(),
 		EngineSwitches: c.engineSwitches.Load(),
 		LatencyBuckets: buckets,
 		BucketBounds:   bounds,
@@ -123,6 +111,7 @@ func (c *Collector) Snapshot() Snapshot {
 	c.mu.Unlock()
 	if fn != nil {
 		snap.EngineMetrics = fn()
+		snap.ActiveConns = snap.EngineMetrics.ActiveConnections
 	}
 	return snap
 }

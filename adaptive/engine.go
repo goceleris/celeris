@@ -21,18 +21,17 @@ import (
 
 // Engine is an adaptive meta-engine that switches between io_uring and epoll.
 type Engine struct {
-	primary        engine.Engine // io_uring
-	secondary      engine.Engine // epoll
-	active         atomic.Pointer[engine.Engine]
-	ctrl           *controller
-	cfg            resource.Config
-	handler        stream.Handler
-	addr           atomic.Pointer[net.Addr]
-	mu             sync.Mutex
-	switchMu       sync.Mutex // protects evaluate + performSwitch coordination
-	frozen         atomic.Bool
-	logger         *slog.Logger
-	suppressFreeze func(time.Duration)
+	primary   engine.Engine // io_uring
+	secondary engine.Engine // epoll
+	active    atomic.Pointer[engine.Engine]
+	ctrl      *controller
+	cfg       resource.Config
+	handler   stream.Handler
+	addr      atomic.Pointer[net.Addr]
+	mu        sync.Mutex
+	switchMu  sync.Mutex // protects evaluate + performSwitch coordination
+	frozen    atomic.Bool
+	logger    *slog.Logger
 }
 
 // New creates a new adaptive engine with io_uring as primary and epoll as secondary.
@@ -246,10 +245,6 @@ func (e *Engine) performSwitch() {
 		"now_active", newActive.Type().String(),
 		"now_standby", newStandby.Type().String(),
 	)
-
-	if e.suppressFreeze != nil {
-		e.suppressFreeze(5 * time.Second)
-	}
 }
 
 // Shutdown gracefully shuts down both sub-engines.
@@ -301,14 +296,6 @@ func (e *Engine) UnfreezeSwitching() {
 // ActiveEngine returns the currently active engine.
 func (e *Engine) ActiveEngine() engine.Engine {
 	return *e.active.Load()
-}
-
-// SetFreezeSuppressor registers a callback to suppress overload freeze
-// during engine switches.
-func (e *Engine) SetFreezeSuppressor(fn func(time.Duration)) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.suppressFreeze = fn
 }
 
 // ForceSwitch triggers an immediate engine switch (for testing).

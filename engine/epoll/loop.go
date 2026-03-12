@@ -4,9 +4,11 @@ package epoll
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/timer"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -44,6 +47,7 @@ type Loop struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
+	tw          *timer.Wheel
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -103,6 +107,10 @@ func (l *Loop) run(ctx context.Context) {
 	defer runtime.UnlockOSThread()
 
 	_ = platform.PinToCPU(l.cpuID)
+
+	l.tw = timer.New(func(fd int, _ timer.TimeoutKind) {
+		l.closeConn(fd)
+	})
 
 	activeTimeoutMs := int(l.objective.EpollTimeout.Milliseconds())
 	if activeTimeoutMs <= 0 {
@@ -188,6 +196,8 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		l.tw.Tick()
+
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
 		if l.listenFD < 0 && len(l.conns) == 0 && l.acceptPaused.Load() {
 			l.wakeMu.Lock()
@@ -212,7 +222,7 @@ func (l *Loop) run(ctx context.Context) {
 
 func (l *Loop) acceptAll(ctx context.Context) {
 	for {
-		newFD, _, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
@@ -233,8 +243,13 @@ func (l *Loop) acceptAll(ctx context.Context) {
 		}
 
 		cs := newConnState(ctx, newFD, l.resolved.BufferSize)
+		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
 		l.activeConns.Add(1)
+
+		if l.cfg.IdleTimeout > 0 {
+			l.tw.Schedule(newFD, l.cfg.IdleTimeout, timer.IdleTimeout)
+		}
 
 		if l.cfg.Protocol != engine.Auto {
 			cs.protocol = l.cfg.Protocol
@@ -268,6 +283,13 @@ func (l *Loop) drainRead(fd int) {
 
 		data := cs.buf[:n]
 
+		// Cancel idle timer; schedule read timeout while processing request.
+		if l.cfg.ReadTimeout > 0 {
+			l.tw.Schedule(fd, l.cfg.ReadTimeout, timer.ReadTimeout)
+		} else {
+			l.tw.Cancel(fd)
+		}
+
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)
 			if detectErr == detect.ErrInsufficientData {
@@ -298,7 +320,15 @@ func (l *Loop) drainRead(fd int) {
 
 		l.reqCount.Add(1)
 
+		// Reschedule idle timeout after request processing.
+		if l.cfg.IdleTimeout > 0 {
+			l.tw.Schedule(fd, l.cfg.IdleTimeout, timer.IdleTimeout)
+		}
+
 		if processErr != nil {
+			if errors.Is(processErr, conn.ErrHijacked) {
+				return // FD already detached — do not close or flush
+			}
 			// Flush any pending writes (e.g. error responses) before closing.
 			_ = flushWrites(cs)
 			cs.pendingBytes = 0
@@ -313,10 +343,30 @@ func (l *Loop) drainRead(fd int) {
 	}
 }
 
+func (l *Loop) hijackConn(fd int) (net.Conn, error) {
+	cs, ok := l.conns[fd]
+	if !ok {
+		return nil, errors.New("celeris: connection not found")
+	}
+	l.tw.Cancel(fd)
+	cs.cancel()
+	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
+	delete(l.conns, fd)
+	l.activeConns.Add(-1)
+	f := os.NewFile(uintptr(fd), "tcp")
+	c, err := net.FileConn(f)
+	_ = f.Close()
+	return c, err
+}
+
 func (l *Loop) initProtocol(cs *connState) {
 	switch cs.protocol {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
+		cs.h1State.RemoteAddr = cs.remoteAddr
+		cs.h1State.HijackFn = func() (net.Conn, error) {
+			return l.hijackConn(cs.fd)
+		}
 	case engine.H2C:
 		writeFn := l.makeWriteFn(cs)
 		cs.h2State = conn.NewH2State(l.handler, conn.H2Config{
@@ -324,6 +374,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			InitialWindowSize:    l.cfg.InitialWindowSize,
 			MaxFrameSize:         l.cfg.MaxFrameSize,
 		}, writeFn)
+		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
 
@@ -344,6 +395,7 @@ func (l *Loop) closeConn(fd int) {
 	if !ok {
 		return
 	}
+	l.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -432,6 +484,16 @@ func boundAddr(fd int) net.Addr {
 		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: fmt.Sprintf("%d", v.ZoneId)}
 	}
 	return nil
+}
+
+func sockaddrString(sa unix.Sockaddr) string {
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return fmt.Sprintf("%s:%d", net.IP(v.Addr[:]), v.Port)
+	case *unix.SockaddrInet6:
+		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
+	}
+	return ""
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {

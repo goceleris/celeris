@@ -6,11 +6,16 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/observe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/resource"
 )
 
 // Version is the semantic version of the celeris module.
@@ -50,6 +55,9 @@ type Server struct {
 
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
+
+	startOnce sync.Once
+	startErr  error
 }
 
 // New creates a Server with the given configuration.
@@ -138,7 +146,19 @@ func (s *Server) MethodNotAllowed(handler HandlerFunc) *Server {
 	return s
 }
 
+// Static registers a GET handler that serves files from root under the given
+// prefix. Uses FileFromDir for path traversal protection.
+//
+//	s.Static("/assets", "./public")
+func (s *Server) Static(prefix, root string) *Route {
+	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	return s.GET(p, func(c *Context) error {
+		return c.FileFromDir(root, c.Param("filepath"))
+	})
+}
+
 // Routes returns information about all registered routes.
+// Output is sorted by method, then path for deterministic results.
 func (s *Server) Routes() []RouteInfo {
 	return s.router.walk()
 }
@@ -242,43 +262,7 @@ func (s *Server) Group(prefix string, middleware ...HandlerFunc) *RouteGroup {
 }
 
 func (s *Server) prepare() (engine.Engine, error) {
-	if s.engine != nil {
-		return nil, ErrAlreadyStarted
-	}
-
-	cfg := s.config.toResourceConfig().WithDefaults()
-	if errs := cfg.Validate(); len(errs) > 0 {
-		return nil, fmt.Errorf("config validation: %w", errs[0])
-	}
-
-	if !s.config.DisableMetrics {
-		s.collector = observe.NewCollector()
-	}
-
-	var handler stream.Handler = &routerAdapter{server: s}
-	eng, err := createEngine(cfg, handler)
-	if err != nil {
-		return nil, fmt.Errorf("create engine: %w", err)
-	}
-	s.engine = eng
-
-	if s.collector != nil {
-		s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {
-			return eng.Metrics()
-		})
-	}
-
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	logger.Info("celeris starting",
-		"addr", cfg.Addr,
-		"engine", eng.Type().String(),
-		"protocol", cfg.Protocol.String(),
-	)
-
-	return eng, nil
+	return s.doPrepare(nil)
 }
 
 // Start initializes and starts the server, blocking until Shutdown is called or
@@ -324,9 +308,139 @@ func (s *Server) EngineInfo() *EngineInfo {
 	}
 }
 
-// Collector returns the metrics collector, or nil if the server has not been started.
+// Collector returns the metrics collector, or nil if the server has not been
+// started or if Config.DisableMetrics is true.
 func (s *Server) Collector() *observe.Collector {
 	return s.collector
+}
+
+// logger returns the configured logger or slog.Default().
+func (s *Server) logger() *slog.Logger {
+	if s.config.Logger != nil {
+		return s.config.Logger
+	}
+	return slog.Default()
+}
+
+func (s *Server) prepareWithListener(ln net.Listener) (engine.Engine, error) {
+	return s.doPrepare(func(cfg *resource.Config) {
+		cfg.Listener = ln
+	})
+}
+
+// doPrepare is the shared implementation for prepare and prepareWithListener.
+// The optional configureFn is called after defaults are applied but before
+// validation, allowing callers to set fields like Listener.
+func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engine, error) {
+	var eng engine.Engine
+	s.startOnce.Do(func() {
+		cfg := s.config.toResourceConfig().WithDefaults()
+		if configureFn != nil {
+			configureFn(&cfg)
+		}
+		if errs := cfg.Validate(); len(errs) > 0 {
+			s.startErr = fmt.Errorf("config validation: %w", errs[0])
+			return
+		}
+
+		if !s.config.DisableMetrics {
+			s.collector = observe.NewCollector()
+		}
+
+		var handler stream.Handler = &routerAdapter{server: s}
+		var err error
+		eng, err = createEngine(cfg, handler)
+		if err != nil {
+			s.startErr = fmt.Errorf("create engine: %w", err)
+			return
+		}
+		s.engine = eng
+
+		if s.collector != nil {
+			s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {
+				return eng.Metrics()
+			})
+		}
+
+		logger := cfg.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		addr := cfg.Addr
+		msg := "celeris starting"
+		if cfg.Listener != nil {
+			addr = cfg.Listener.Addr().String()
+			msg = "celeris starting with listener"
+		}
+		logger.Info(msg,
+			"addr", addr,
+			"engine", eng.Type().String(),
+			"protocol", cfg.Protocol.String(),
+		)
+	})
+	if s.startErr != nil {
+		return nil, s.startErr
+	}
+	if eng == nil {
+		return nil, ErrAlreadyStarted
+	}
+	return eng, nil
+}
+
+// StartWithListener starts the server using an existing [net.Listener].
+// This enables zero-downtime restarts via socket inheritance (e.g., passing
+// the listener FD to a child process via environment variable).
+//
+// Returns [ErrAlreadyStarted] if called more than once.
+func (s *Server) StartWithListener(ln net.Listener) error {
+	eng, err := s.prepareWithListener(ln)
+	if err != nil {
+		return err
+	}
+	return eng.Listen(context.Background())
+}
+
+// StartWithListenerAndContext combines [Server.StartWithListener] and
+// [Server.StartWithContext]. When the context is canceled, the server shuts
+// down gracefully using [Config.ShutdownTimeout].
+func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listener) error {
+	eng, err := s.prepareWithListener(ln)
+	if err != nil {
+		return err
+	}
+
+	shutdownTimeout := s.config.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30 * time.Second
+	}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		_ = eng.Shutdown(shutCtx)
+	}()
+
+	return eng.Listen(ctx)
+}
+
+// InheritListener returns a [net.Listener] from the file descriptor in the
+// named environment variable. Returns nil, nil if the variable is not set.
+// Used for zero-downtime restart patterns.
+func InheritListener(envVar string) (net.Listener, error) {
+	fdStr := os.Getenv(envVar)
+	if fdStr == "" {
+		return nil, nil
+	}
+	fd, err := strconv.Atoi(fdStr)
+	if err != nil {
+		return nil, fmt.Errorf("celeris: invalid fd in %s: %w", envVar, err)
+	}
+	f := os.NewFile(uintptr(fd), "inherited-listener")
+	if f == nil {
+		return nil, fmt.Errorf("celeris: invalid fd %d", fd)
+	}
+	defer func() { _ = f.Close() }()
+	return net.FileListener(f)
 }
 
 // StartWithContext starts the server with the given context for lifecycle management.
@@ -342,7 +456,7 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 	}
 
 	shutdownTimeout := s.config.ShutdownTimeout
-	if shutdownTimeout == 0 {
+	if shutdownTimeout <= 0 {
 		shutdownTimeout = 30 * time.Second
 	}
 	go func() {

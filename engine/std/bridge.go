@@ -3,6 +3,7 @@ package std
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,10 +48,17 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Headers = hdrs
 
 	if r.Body != nil && r.Body != http.NoBody {
-		body, err := io.ReadAll(r.Body)
+		const maxBridgeBodySize = 100 << 20 // 100 MB — matches H2 processor limit
+		body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBridgeBodySize)+1))
+		_ = r.Body.Close()
 		if err != nil {
 			b.engine.metrics.errCount.Add(1)
 			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+		if len(body) > maxBridgeBodySize {
+			b.engine.metrics.errCount.Add(1)
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		if len(body) > 0 {
@@ -58,6 +66,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.RemoteAddr = r.RemoteAddr
 	s.EndStream = true
 	s.SetState(stream.StateHalfClosedRemote)
 
@@ -86,7 +95,7 @@ type stdResponseWriter struct {
 func (rw *stdResponseWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	h := rw.w.Header()
 	for _, hdr := range headers {
-		h.Add(hdr[0], hdr[1])
+		h.Add(sanitizeHeaderValue(hdr[0]), sanitizeHeaderValue(hdr[1]))
 	}
 
 	if len(body) > 0 && h.Get("Content-Length") == "" {
@@ -125,3 +134,55 @@ func (rw *stdResponseWriter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) e
 func (rw *stdResponseWriter) CloseConn() error {
 	return nil
 }
+
+// Streaming support — stdResponseWriter implements stream.Streamer.
+
+func (rw *stdResponseWriter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
+	h := rw.w.Header()
+	for _, hdr := range headers {
+		h.Add(sanitizeHeaderValue(hdr[0]), sanitizeHeaderValue(hdr[1]))
+	}
+	rw.w.WriteHeader(status)
+	rw.flushed = true
+	return nil
+}
+
+// sanitizeHeaderValue strips \r and \n to prevent HTTP response splitting.
+// Defense-in-depth: the public API (Context.SetHeader) also strips CRLF.
+func sanitizeHeaderValue(s string) string {
+	if strings.ContainsAny(s, "\r\n") {
+		return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+	}
+	return s
+}
+
+func (rw *stdResponseWriter) Write(_ *stream.Stream, data []byte) error {
+	_, err := rw.w.Write(data)
+	return err
+}
+
+func (rw *stdResponseWriter) Flush(_ *stream.Stream) error {
+	if f, ok := rw.w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
+func (rw *stdResponseWriter) Close(_ *stream.Stream) error {
+	return nil
+}
+
+func (rw *stdResponseWriter) Hijack(_ *stream.Stream) (net.Conn, error) {
+	h, ok := rw.w.(http.Hijacker)
+	if !ok {
+		return nil, stream.ErrHijackNotSupported
+	}
+	conn, _, err := h.Hijack()
+	if err == nil {
+		rw.flushed = true
+	}
+	return conn, err
+}
+
+var _ stream.Hijacker = (*stdResponseWriter)(nil)
+var _ stream.Streamer = (*stdResponseWriter)(nil)

@@ -10,7 +10,9 @@
 package celeristest
 
 import (
+	"encoding/base64"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/goceleris/celeris"
@@ -75,10 +77,12 @@ var _ stream.ResponseWriter = (*recorderWriter)(nil)
 type Option func(*config)
 
 type config struct {
-	body    []byte
-	headers [][2]string
-	queries [][2]string
-	params  [][2]string
+	body       []byte
+	headers    [][2]string
+	queries    [][2]string
+	params     [][2]string
+	cookies    [][2]string
+	remoteAddr string
 }
 
 // WithBody sets the request body.
@@ -104,6 +108,24 @@ func WithParam(key, value string) Option {
 // WithContentType is a shorthand for WithHeader("content-type", ct).
 func WithContentType(ct string) Option {
 	return WithHeader("content-type", ct)
+}
+
+// WithBasicAuth sets the Authorization header for HTTP Basic auth.
+func WithBasicAuth(user, pass string) Option {
+	encoded := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+	return WithHeader("authorization", "Basic "+encoded)
+}
+
+// WithCookie adds a cookie to the request.
+func WithCookie(name, value string) Option {
+	return func(c *config) {
+		c.cookies = append(c.cookies, [2]string{name, value})
+	}
+}
+
+// WithRemoteAddr sets the remote address on the test stream.
+func WithRemoteAddr(addr string) Option {
+	return func(c *config) { c.remoteAddr = addr }
 }
 
 // ReleaseContext returns a [celeris.Context] to the pool. The context must not
@@ -147,12 +169,23 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		{":authority", "localhost"},
 	}
 	s.Headers = append(s.Headers, cfg.headers...)
+	if len(cfg.cookies) > 0 {
+		parts := make([]string, 0, len(cfg.cookies))
+		for _, kv := range cfg.cookies {
+			parts = append(parts, kv[0]+"="+kv[1])
+		}
+		s.Headers = append(s.Headers, [2]string{"cookie", strings.Join(parts, "; ")})
+	}
 	if len(cfg.body) > 0 {
 		s.Data.Write(cfg.body)
 	}
 
 	rec := &ResponseRecorder{}
 	s.ResponseWriter = &recorderWriter{rec: rec}
+
+	if cfg.remoteAddr != "" {
+		s.RemoteAddr = cfg.remoteAddr
+	}
 
 	ctx := ctxkit.NewContext(s).(*celeris.Context)
 	for _, p := range cfg.params {

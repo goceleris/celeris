@@ -40,6 +40,7 @@ type Stream struct {
 	mu                     sync.RWMutex
 	writeMu                sync.Mutex
 	ResponseWriter         ResponseWriter
+	RemoteAddr             string
 	ReceivedDataLen        int
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
@@ -106,6 +107,7 @@ func (s *Stream) Release() {
 	s.DeferResponse = false
 	s.WindowSize = 0
 	s.ResponseWriter = nil
+	s.RemoteAddr = ""
 	s.ReceivedDataLen = 0
 	s.ReceivedInitialHeaders = false
 	s.ClosedByReset = false

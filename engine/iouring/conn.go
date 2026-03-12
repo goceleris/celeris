@@ -28,6 +28,7 @@ type connState struct {
 	sendQueueBytes int      // total bytes across all sendQueue entries
 	sending        bool     // true when a SEND SQE is in-flight for this connection
 	closing        bool     // defers close until all in-flight sends complete
+	remoteAddr     string
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"os"
 	"testing"
 
 	"github.com/goceleris/celeris/engine"
@@ -270,8 +272,10 @@ func TestServerDoubleStart(t *testing.T) {
 		return c.String(200, "pong")
 	})
 
-	// Simulate engine already set (as if Start() was called).
-	s.engine = &fakeEngine{}
+	// Simulate engine already set by firing the startOnce.
+	s.startOnce.Do(func() {
+		s.engine = &fakeEngine{}
+	})
 
 	err := s.Start()
 	if err == nil {
@@ -929,6 +933,182 @@ func TestTryNameDuplicate(t *testing.T) {
 	}
 }
 
+// Phase 1.2 tests
+
+func TestConfigSurfacePassthrough(t *testing.T) {
+	cfg := Config{
+		Addr:                 ":9090",
+		MaxConcurrentStreams: 200,
+		MaxFrameSize:         32768,
+		InitialWindowSize:    131072,
+		MaxHeaderBytes:       1 << 20,
+		DisableKeepAlive:     true,
+		BufferSize:           65536,
+		SocketRecvBuf:        262144,
+		SocketSendBuf:        262144,
+		MaxConns:             1000,
+		Workers:              4,
+	}
+
+	rc := cfg.toResourceConfig()
+
+	if rc.MaxConcurrentStreams != 200 {
+		t.Fatalf("MaxConcurrentStreams: got %d", rc.MaxConcurrentStreams)
+	}
+	if rc.MaxFrameSize != 32768 {
+		t.Fatalf("MaxFrameSize: got %d", rc.MaxFrameSize)
+	}
+	if rc.InitialWindowSize != 131072 {
+		t.Fatalf("InitialWindowSize: got %d", rc.InitialWindowSize)
+	}
+	if rc.MaxHeaderBytes != 1<<20 {
+		t.Fatalf("MaxHeaderBytes: got %d", rc.MaxHeaderBytes)
+	}
+	if !rc.DisableKeepAlive {
+		t.Fatal("DisableKeepAlive not mapped")
+	}
+	if rc.Resources.BufferSize != 65536 {
+		t.Fatalf("BufferSize: got %d", rc.Resources.BufferSize)
+	}
+	if rc.Resources.SocketRecv != 262144 {
+		t.Fatalf("SocketRecv: got %d", rc.Resources.SocketRecv)
+	}
+	if rc.Resources.SocketSend != 262144 {
+		t.Fatalf("SocketSend: got %d", rc.Resources.SocketSend)
+	}
+	if rc.Resources.MaxConns != 1000 {
+		t.Fatalf("MaxConns: got %d", rc.Resources.MaxConns)
+	}
+	if rc.Resources.Workers != 4 {
+		t.Fatalf("Workers: got %d", rc.Resources.Workers)
+	}
+}
+
+func TestConfigZeroValuesNotMapped(t *testing.T) {
+	cfg := Config{Addr: ":8080"}
+	rc := cfg.toResourceConfig()
+
+	if rc.Resources.BufferSize != 0 {
+		t.Fatalf("expected 0 BufferSize, got %d", rc.Resources.BufferSize)
+	}
+	if rc.Resources.SocketRecv != 0 {
+		t.Fatalf("expected 0 SocketRecv, got %d", rc.Resources.SocketRecv)
+	}
+	if rc.Resources.SocketSend != 0 {
+		t.Fatalf("expected 0 SocketSend, got %d", rc.Resources.SocketSend)
+	}
+	if rc.Resources.MaxConns != 0 {
+		t.Fatalf("expected 0 MaxConns, got %d", rc.Resources.MaxConns)
+	}
+}
+
+// Phase 2.1 tests
+
+func TestRouteUseMiddleware(t *testing.T) {
+	s := New(Config{})
+	var routeMWCalled bool
+
+	s.GET("/a", func(c *Context) error {
+		return c.String(200, "a")
+	}).Use(func(c *Context) error {
+		routeMWCalled = true
+		return c.Next()
+	})
+
+	s.GET("/b", func(c *Context) error {
+		return c.String(200, "b")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	// Route with middleware.
+	routeMWCalled = false
+	st, rw := newTestStream("GET", "/a")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 200 || string(rw.body) != "a" {
+		t.Fatalf("expected 200 a, got %d %s", rw.status, string(rw.body))
+	}
+	if !routeMWCalled {
+		t.Fatal("expected route middleware to be called")
+	}
+	st.Release()
+
+	// Route without middleware — should not trigger route-specific middleware.
+	routeMWCalled = false
+	st2, rw2 := newTestStream("GET", "/b")
+	if err := adapter.HandleStream(context.Background(), st2); err != nil {
+		t.Fatal(err)
+	}
+	if rw2.status != 200 || string(rw2.body) != "b" {
+		t.Fatalf("expected 200 b, got %d %s", rw2.status, string(rw2.body))
+	}
+	if routeMWCalled {
+		t.Fatal("route middleware should not affect other routes")
+	}
+	st2.Release()
+}
+
+func TestRouteUseChainOrder(t *testing.T) {
+	s := New(Config{})
+	var order []string
+
+	s.Use(func(c *Context) error {
+		order = append(order, "server")
+		return c.Next()
+	})
+
+	s.GET("/test", func(c *Context) error {
+		order = append(order, "handler")
+		return c.String(200, "ok")
+	}).Use(func(c *Context) error {
+		order = append(order, "route")
+		return c.Next()
+	})
+
+	adapter := &routerAdapter{server: s}
+	st, _ := newTestStream("GET", "/test")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 3 || order[0] != "server" || order[1] != "route" || order[2] != "handler" {
+		t.Fatalf("expected [server route handler], got %v", order)
+	}
+	st.Release()
+}
+
+// Phase 5.1 tests
+
+func TestInheritListenerNotSet(t *testing.T) {
+	ln, err := InheritListener("CELERIS_TEST_NONEXISTENT_ENV_VAR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ln != nil {
+		t.Fatal("expected nil listener when env var not set")
+	}
+}
+
+func TestStartWithListenerDoubleStart(t *testing.T) {
+	s := New(Config{})
+	// Simulate engine already set by firing the startOnce.
+	s.startOnce.Do(func() {
+		s.engine = &fakeEngine{}
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	err = s.StartWithListener(ln)
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("expected ErrAlreadyStarted, got %v", err)
+	}
+}
+
 func TestServerDisableMetrics(t *testing.T) {
 	s := New(Config{DisableMetrics: true})
 	s.GET("/ping", func(c *Context) error {
@@ -936,9 +1116,191 @@ func TestServerDisableMetrics(t *testing.T) {
 	})
 
 	// Simulate prepare without actually starting.
-	s.engine = &fakeEngine{}
+	s.startOnce.Do(func() {
+		s.engine = &fakeEngine{}
+	})
 	// When DisableMetrics is true, collector should remain nil.
 	if s.Collector() != nil {
 		t.Fatal("expected nil Collector when DisableMetrics is true")
+	}
+}
+
+func TestRoutesOutputOrder(t *testing.T) {
+	s := New(Config{})
+	s.GET("/b", func(_ *Context) error { return nil })
+	s.POST("/a", func(_ *Context) error { return nil })
+	s.DELETE("/c", func(_ *Context) error { return nil })
+	s.GET("/a", func(_ *Context) error { return nil })
+
+	routes := s.Routes()
+	if len(routes) != 4 {
+		t.Fatalf("expected 4 routes, got %d", len(routes))
+	}
+
+	// Verify deterministic order: sorted by method first.
+	// DELETE < GET < POST
+	if routes[0].Method != "DELETE" {
+		t.Fatalf("expected first method DELETE, got %s", routes[0].Method)
+	}
+	if routes[1].Method != "GET" {
+		t.Fatalf("expected second method GET, got %s", routes[1].Method)
+	}
+
+	// Call again and verify same order.
+	routes2 := s.Routes()
+	for i := range routes {
+		if routes[i].Method != routes2[i].Method || routes[i].Path != routes2[i].Path {
+			t.Fatalf("Routes() output not deterministic at index %d", i)
+		}
+	}
+}
+
+func TestAdaptHandler(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Adapted", "true")
+		w.WriteHeader(201)
+		_, _ = w.Write([]byte("adapted"))
+	})
+	adapted := Adapt(h)
+	if adapted == nil {
+		t.Fatal("expected non-nil handler from Adapt")
+	}
+
+	s := New(Config{})
+	s.GET("/adapt", adapted)
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/adapt")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 201 {
+		t.Fatalf("expected 201, got %d", rw.status)
+	}
+	if string(rw.body) != "adapted" {
+		t.Fatalf("expected body 'adapted', got %q", string(rw.body))
+	}
+	var found bool
+	for _, h := range rw.headers {
+		if h[0] == "x-adapted" && h[1] == "true" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected x-adapted header")
+	}
+	st.Release()
+}
+
+func TestAdaptFuncHandler(t *testing.T) {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello from " + r.Method))
+	}
+	adapted := AdaptFunc(fn)
+	if adapted == nil {
+		t.Fatal("expected non-nil handler from AdaptFunc")
+	}
+
+	s := New(Config{})
+	s.POST("/func", adapted)
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("POST", "/func")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 200 {
+		t.Fatalf("expected 200, got %d", rw.status)
+	}
+	if string(rw.body) != "hello from POST" {
+		t.Fatalf("expected 'hello from POST', got %q", string(rw.body))
+	}
+	st.Release()
+}
+
+func TestPrepareFailedThenRetry(t *testing.T) {
+	// Use an invalid addr to trigger config validation failure.
+	s := New(Config{Addr: "not-a-valid-addr"})
+	s.GET("/ping", func(c *Context) error {
+		return c.String(200, "pong")
+	})
+
+	// First call should fail with config validation error.
+	_, err := s.prepare()
+	if err == nil {
+		t.Fatal("expected error from invalid config")
+	}
+	if !containsStr(err.Error(), "config validation") {
+		t.Fatalf("expected config validation error, got %v", err)
+	}
+
+	// Second call should return the same config error (not ErrAlreadyStarted),
+	// because sync.Once remembers the first execution's outcome.
+	_, err2 := s.prepare()
+	if err2 == nil {
+		t.Fatal("expected error on retry")
+	}
+	if err2.Error() != err.Error() {
+		t.Fatalf("expected same error on retry, got %v (original: %v)", err2, err)
+	}
+}
+
+func TestStaticFileServing(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(dir+"/style.css", []byte("body{}"), 0644)
+
+	s := New(Config{})
+	s.Static("/assets", dir)
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/assets/style.css")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 200 {
+		t.Fatalf("expected 200, got %d", rw.status)
+	}
+	if string(rw.body) != "body{}" {
+		t.Fatalf("expected body{}, got %s", string(rw.body))
+	}
+	st.Release()
+
+	// Directory traversal should fail.
+	st2, rw2 := newTestStream("GET", "/assets/../../../etc/passwd")
+	if err := adapter.HandleStream(context.Background(), st2); err != nil {
+		t.Fatal(err)
+	}
+	if rw2.status != 400 {
+		t.Fatalf("expected 400 for traversal, got %d", rw2.status)
+	}
+	st2.Release()
+}
+
+func TestStartRaceGuard(t *testing.T) {
+	s := New(Config{Addr: ":0"})
+	s.GET("/ping", func(c *Context) error {
+		return c.String(200, "pong")
+	})
+
+	// Fire the once to prevent actual engine creation.
+	s.startOnce.Do(func() {
+		s.engine = &fakeEngine{}
+	})
+
+	// Multiple concurrent calls should all get ErrAlreadyStarted, no race.
+	errs := make(chan error, 10)
+	for range 10 {
+		go func() {
+			_, err := s.prepare()
+			errs <- err
+		}()
+	}
+	for range 10 {
+		err := <-errs
+		if !errors.Is(err, ErrAlreadyStarted) {
+			t.Fatalf("expected ErrAlreadyStarted, got %v", err)
+		}
 	}
 }

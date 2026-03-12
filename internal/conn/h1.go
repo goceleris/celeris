@@ -4,17 +4,28 @@ package conn
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net"
 
 	h1 "github.com/goceleris/celeris/protocol/h1"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
+// ErrHijacked is returned by ProcessH1 when the connection was hijacked.
+// The engine must not close or reuse the FD after receiving this error.
+var ErrHijacked = errors.New("celeris: connection hijacked")
+
+// maxRequestBodySize is the maximum allowed request body (100 MB), matching H2.
+const maxRequestBodySize = 100 << 20
+
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
-	parser *h1.Parser
-	buffer bytes.Buffer
-	req    h1.Request
+	parser     *h1.Parser
+	buffer     bytes.Buffer
+	req        h1.Request
+	RemoteAddr string
+	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
 }
 
 // NewH1State creates a new H1 connection state.
@@ -56,7 +67,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				break
 			}
 
-			if err := handleH1Request(ctx, &state.req, nil, handler, write); err != nil {
+			if err := handleH1Request(ctx, &state.req, nil, state.RemoteAddr, handler, write, state.HijackFn); err != nil {
 				return err
 			}
 			if !state.req.KeepAlive {
@@ -117,13 +128,17 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					break
 				}
 				chunks.Write(chunk)
+				if chunks.Len() > maxRequestBodySize {
+					write(buildErrorResponse(413, "Request body too large"))
+					return fmt.Errorf("chunked body exceeds %d byte limit", maxRequestBodySize)
+				}
 			}
 			bodyData = chunks.Bytes()
 		default:
 			state.buffer.Next(consumed)
 		}
 
-		if err := handleH1Request(ctx, &state.req, bodyData, handler, write); err != nil {
+		if err := handleH1Request(ctx, &state.req, bodyData, state.RemoteAddr, handler, write, state.HijackFn); err != nil {
 			return err
 		}
 		if !state.req.KeepAlive {
@@ -133,23 +148,33 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	return nil
 }
 
-func handleH1Request(ctx context.Context, req *h1.Request, body []byte, handler stream.Handler,
-	write func([]byte)) error {
+func handleH1Request(ctx context.Context, req *h1.Request, body []byte, remoteAddr string,
+	handler stream.Handler, write func([]byte), hijackFn func() (net.Conn, error)) error {
 
-	s := requestToStream(req, body)
+	s := requestToStream(req, body, remoteAddr)
 	defer s.Release()
-	rw := &h1ResponseAdapter{write: write, keepAlive: req.KeepAlive, isHEAD: req.Method == "HEAD"}
+	rw := &h1ResponseAdapter{
+		write: write, keepAlive: req.KeepAlive,
+		isHEAD: req.Method == "HEAD", hijackFn: hijackFn,
+	}
 	s.ResponseWriter = rw
 
 	if err := handler.HandleStream(ctx, s); err != nil {
+		if rw.hijacked {
+			return ErrHijacked
+		}
 		write(buildErrorResponse(500, "Internal Server Error"))
 		return err
+	}
+	if rw.hijacked {
+		return ErrHijacked
 	}
 	return nil
 }
 
-func requestToStream(req *h1.Request, body []byte) *stream.Stream {
+func requestToStream(req *h1.Request, body []byte, remoteAddr string) *stream.Stream {
 	s := stream.NewStream(1)
+	s.RemoteAddr = remoteAddr
 	// Reuse the stream's existing header slice capacity from the pool.
 	hdrs := s.Headers[:0]
 	needed := len(req.Headers) + 4

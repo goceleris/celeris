@@ -24,6 +24,7 @@ type connState struct {
 	cancel       context.CancelFunc
 	pending      [][]byte
 	pendingBytes int
+	remoteAddr   string
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {

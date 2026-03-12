@@ -295,6 +295,16 @@ func TestValidateMaxConcurrentStreamsTooLarge(t *testing.T) {
 func TestValidateZeroPort(t *testing.T) {
 	c := Config{Addr: ":0"}
 	errs := c.Validate()
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "port") {
+			t.Error("port 0 should be allowed for OS-assigned port, got error:", e)
+		}
+	}
+}
+
+func TestValidateNegativePort(t *testing.T) {
+	c := Config{Addr: ":-1"}
+	errs := c.Validate()
 	found := false
 	for _, e := range errs {
 		if strings.Contains(e.Error(), "port") {
@@ -302,6 +312,6 @@ func TestValidateZeroPort(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("expected port validation error for :0")
+		t.Error("expected port validation error for :-1")
 	}
 }

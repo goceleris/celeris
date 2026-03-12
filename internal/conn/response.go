@@ -3,6 +3,7 @@ package conn
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -43,6 +44,10 @@ func getResponseBuffer() *[]byte {
 }
 
 func putResponseBuffer(p *[]byte) {
+	const maxPoolBufferCap = 128 << 10 // 128 KB
+	if cap(*p) > maxPoolBufferCap {
+		return // let GC reclaim; pool will allocate fresh 32KB
+	}
 	*p = (*p)[:0]
 	responseBufferPool.Put(p)
 }
@@ -51,7 +56,22 @@ type h1ResponseAdapter struct {
 	write     func([]byte)
 	keepAlive bool
 	isHEAD    bool
+	hijackFn  func() (net.Conn, error)
+	hijacked  bool
 }
+
+func (a *h1ResponseAdapter) Hijack(_ *stream.Stream) (net.Conn, error) {
+	if a.hijackFn == nil {
+		return nil, stream.ErrHijackNotSupported
+	}
+	conn, err := a.hijackFn()
+	if err == nil {
+		a.hijacked = true
+	}
+	return conn, err
+}
+
+var _ stream.Hijacker = (*h1ResponseAdapter)(nil)
 
 func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	pooled := getResponseBuffer()
@@ -125,7 +145,6 @@ type h2ResponseAdapter struct {
 	outBuf  *bytes.Buffer
 	writer  *frame.Writer
 	encoder *frame.HeaderEncoder
-	closed  map[uint32]bool
 	mu      sync.Mutex
 }
 
@@ -198,16 +217,10 @@ func (a *h2ResponseAdapter) SendGoAway(lastStreamID uint32, code http2.ErrCode, 
 	return a.writer.Flush()
 }
 
-func (a *h2ResponseAdapter) MarkStreamClosed(streamID uint32) {
-	a.mu.Lock()
-	a.closed[streamID] = true
-	a.mu.Unlock()
-}
+func (a *h2ResponseAdapter) MarkStreamClosed(_ uint32) {}
 
-func (a *h2ResponseAdapter) IsStreamClosed(streamID uint32) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.closed[streamID]
+func (a *h2ResponseAdapter) IsStreamClosed(_ uint32) bool {
+	return false
 }
 
 func (a *h2ResponseAdapter) WriteRSTStreamPriority(streamID uint32, code http2.ErrCode) error {
@@ -296,6 +309,97 @@ func statusText(code int) string {
 // appendSanitizedHeaderField appends s to buf, stripping any \r or \n bytes
 // to prevent HTTP response splitting (CWE-113). This is a defense-in-depth
 // measure; the public API (Context.SetHeader) also strips CRLF.
+// h1 streaming support — h1ResponseAdapter implements stream.Streamer.
+
+func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
+	pooled := getResponseBuffer()
+	buf := (*pooled)[:0]
+	buf = appendStatusLine(buf, status)
+	buf = append(buf, "date: "...)
+	buf = time.Now().UTC().AppendFormat(buf, time.RFC1123)
+	buf = append(buf, crlf...)
+	buf = append(buf, "transfer-encoding: chunked\r\n"...)
+	for _, h := range headers {
+		buf = appendSanitizedHeaderField(buf, h[0])
+		buf = append(buf, ": "...)
+		buf = appendSanitizedHeaderField(buf, h[1])
+		buf = append(buf, crlf...)
+	}
+	if !a.keepAlive {
+		buf = append(buf, "connection: close\r\n"...)
+	}
+	buf = append(buf, crlf...)
+	a.write(buf)
+	*pooled = buf
+	putResponseBuffer(pooled)
+	return nil
+}
+
+func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
+	// Chunked transfer encoding: hex(len)\r\n data \r\n
+	chunk := fmt.Appendf(nil, "%x\r\n", len(data))
+	chunk = append(chunk, data...)
+	chunk = append(chunk, crlf...)
+	a.write(chunk)
+	return nil
+}
+
+func (a *h1ResponseAdapter) Flush(_ *stream.Stream) error {
+	return nil // write() is synchronous
+}
+
+func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
+	a.write([]byte("0\r\n\r\n"))
+	return nil
+}
+
+// h2 streaming support — h2ResponseAdapter implements stream.Streamer.
+
+func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers [][2]string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	responseHeaders := make([][2]string, 0, len(headers)+1)
+	responseHeaders = append(responseHeaders, [2]string{":status", strconv.Itoa(status)})
+	responseHeaders = append(responseHeaders, headers...)
+
+	headerBlock, err := a.encoder.Encode(responseHeaders)
+	if err != nil {
+		return fmt.Errorf("HPACK encode error: %w", err)
+	}
+
+	// endStream=false — body follows
+	if err := a.writer.WriteHeaders(s.ID, false, headerBlock, 16384); err != nil {
+		return err
+	}
+	s.HeadersSent = true
+	return a.writer.Flush()
+}
+
+func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.writer.WriteData(s.ID, false, data)
+}
+
+func (a *h2ResponseAdapter) Flush(_ *stream.Stream) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.writer.Flush()
+}
+
+func (a *h2ResponseAdapter) Close(s *stream.Stream) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.writer.WriteData(s.ID, true, nil); err != nil {
+		return err
+	}
+	return a.writer.Flush()
+}
+
+var _ stream.Streamer = (*h1ResponseAdapter)(nil)
+var _ stream.Streamer = (*h2ResponseAdapter)(nil)
+
 func appendSanitizedHeaderField(buf []byte, s string) []byte {
 	for i := range len(s) {
 		b := s[i]

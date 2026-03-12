@@ -515,6 +515,10 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 
 	pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
 	headers := (*pooledHeadersIn)[:0]
+	defer func() {
+		*pooledHeadersIn = headers[:0]
+		headersSlicePoolIn.Put(pooledHeadersIn)
+	}()
 	p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
 		headers = append(headers, [2]string{hf.Name, hf.Value})
 	})

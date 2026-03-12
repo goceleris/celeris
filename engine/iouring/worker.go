@@ -4,9 +4,11 @@ package iouring
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/timer"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -47,6 +50,7 @@ type Worker struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
+	tw          *timer.Wheel
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -108,6 +112,10 @@ func (w *Worker) run(ctx context.Context) {
 	// Allocating the BufferGroup inflates Go's GC heap accounting
 	// (count×size bytes from Go heap), causing GC to never trigger on
 	// actual request allocations. Skip until multishot recv is implemented.
+
+	w.tw = timer.New(func(fd int, _ timer.TimeoutKind) {
+		w.closeConn(fd)
+	})
 
 	w.tier.PrepareAccept(w.ring, w.listenFD)
 	if _, err := w.ring.Submit(); err != nil {
@@ -197,6 +205,8 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
+		w.tw.Tick()
+
 		if _, err := w.ring.Submit(); err != nil {
 			w.logger.Error("submit failed", "worker", w.id, "err", err)
 		}
@@ -261,8 +271,15 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 	_ = sockopts.ApplyFD(newFD, w.sockOpts)
 
 	cs := newConnState(ctx, newFD, w.resolved.BufferSize)
+	if sa, err := unix.Getpeername(newFD); err == nil {
+		cs.remoteAddr = sockaddrString(sa)
+	}
 	w.conns[newFD] = cs
 	w.activeConns.Add(1)
+
+	if w.cfg.IdleTimeout > 0 {
+		w.tw.Schedule(newFD, w.cfg.IdleTimeout, timer.IdleTimeout)
+	}
 
 	if w.cfg.Protocol != engine.Auto {
 		cs.protocol = w.cfg.Protocol
@@ -296,10 +313,32 @@ func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
 	return true
 }
 
+func (w *Worker) hijackConn(fd int) (net.Conn, error) {
+	cs, ok := w.conns[fd]
+	if !ok {
+		return nil, errors.New("celeris: connection not found")
+	}
+	if cs.sending || len(cs.sendQueue) > 0 {
+		return nil, errors.New("celeris: cannot hijack with pending sends")
+	}
+	w.tw.Cancel(fd)
+	cs.cancel()
+	delete(w.conns, fd)
+	w.activeConns.Add(-1)
+	f := os.NewFile(uintptr(fd), "tcp")
+	c, err := net.FileConn(f)
+	_ = f.Close()
+	return c, err
+}
+
 func (w *Worker) initProtocol(cs *connState) {
 	switch cs.protocol {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
+		cs.h1State.RemoteAddr = cs.remoteAddr
+		cs.h1State.HijackFn = func() (net.Conn, error) {
+			return w.hijackConn(cs.fd)
+		}
 	case engine.H2C:
 		writeFn := w.makeWriteFn(cs.fd)
 		cs.h2State = conn.NewH2State(w.handler, conn.H2Config{
@@ -307,6 +346,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			InitialWindowSize:    w.cfg.InitialWindowSize,
 			MaxFrameSize:         w.cfg.MaxFrameSize,
 		}, writeFn)
+		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
 
@@ -330,6 +370,13 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 			data = provBuf[:c.Res]
 			defer func() { _ = w.bufGroup.ReturnBuffer(w.ring, bufID) }()
 		}
+	}
+
+	// Cancel idle timer; we're actively receiving data.
+	if w.cfg.ReadTimeout > 0 {
+		w.tw.Schedule(fd, w.cfg.ReadTimeout, timer.ReadTimeout)
+	} else {
+		w.tw.Cancel(fd)
 	}
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
@@ -357,7 +404,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 
 	w.reqCount.Add(1)
 
+	// Reschedule idle timeout after request processing.
+	if w.cfg.IdleTimeout > 0 {
+		w.tw.Schedule(fd, w.cfg.IdleTimeout, timer.IdleTimeout)
+	}
+
 	if processErr != nil {
+		if errors.Is(processErr, conn.ErrHijacked) {
+			return // FD already detached
+		}
 		// Flush pending writes (e.g. error responses) before closing.
 		w.flushSend(fd)
 		if _, err := w.ring.Submit(); err != nil {
@@ -434,6 +489,7 @@ func (w *Worker) closeConn(fd int) {
 	if !ok {
 		return
 	}
+	w.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -605,6 +661,16 @@ func boundAddr(fd int) net.Addr {
 		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: fmt.Sprintf("%d", v.ZoneId)}
 	}
 	return nil
+}
+
+func sockaddrString(sa unix.Sockaddr) string {
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return fmt.Sprintf("%s:%d", net.IP(v.Addr[:]), v.Port)
+	case *unix.SockaddrInet6:
+		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
+	}
+	return ""
 }
 
 func parseAddr(addr string) (unix.Sockaddr, error) {

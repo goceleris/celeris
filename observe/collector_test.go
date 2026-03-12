@@ -66,15 +66,14 @@ func TestRecordError(t *testing.T) {
 	}
 }
 
-func TestConnOpenedClosed(t *testing.T) {
+func TestActiveConnsFromEngineMetrics(t *testing.T) {
 	c := NewCollector()
-	c.ConnOpened()
-	c.ConnOpened()
-	c.ConnOpened()
-	c.ConnClosed()
+	c.SetEngineMetricsFn(func() EngineMetrics {
+		return EngineMetrics{ActiveConnections: 42}
+	})
 	snap := c.Snapshot()
-	if snap.ActiveConns != 2 {
-		t.Fatalf("expected 2, got %d", snap.ActiveConns)
+	if snap.ActiveConns != 42 {
+		t.Fatalf("expected ActiveConns=42 from EngineMetrics, got %d", snap.ActiveConns)
 	}
 }
 
@@ -130,8 +129,6 @@ func TestConcurrentAccess(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			c.RecordRequest(time.Duration(n)*time.Microsecond, 200)
-			c.ConnOpened()
-			c.ConnClosed()
 			c.RecordSwitch()
 		}(i)
 	}
@@ -139,9 +136,6 @@ func TestConcurrentAccess(t *testing.T) {
 	snap := c.Snapshot()
 	if snap.RequestsTotal != 100 {
 		t.Fatalf("expected 100 requests, got %d", snap.RequestsTotal)
-	}
-	if snap.ActiveConns != 0 {
-		t.Fatalf("expected 0 active conns, got %d", snap.ActiveConns)
 	}
 	if snap.EngineSwitches != 100 {
 		t.Fatalf("expected 100 switches, got %d", snap.EngineSwitches)

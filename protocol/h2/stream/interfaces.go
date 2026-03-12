@@ -2,9 +2,21 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"net"
 
 	"golang.org/x/net/http2"
 )
+
+// ErrHijackNotSupported is returned when the engine does not support
+// connection takeover.
+var ErrHijackNotSupported = errors.New("celeris: hijack not supported by this engine")
+
+// Hijacker is implemented by ResponseWriters that support connection takeover.
+// This enables protocols like WebSocket that require raw TCP access.
+type Hijacker interface {
+	Hijack(stream *Stream) (net.Conn, error)
+}
 
 // Handler interface for processing streams.
 type Handler interface {
@@ -40,4 +52,18 @@ type ResponseWriter interface {
 	IsStreamClosed(streamID uint32) bool
 	WriteRSTStreamPriority(streamID uint32, code http2.ErrCode) error
 	CloseConn() error
+}
+
+// Streamer supports incremental response writing. Engines that support
+// streaming implement this interface on their ResponseWriter. The existing
+// WriteResponse path is preserved for non-streaming responses (hot path).
+type Streamer interface {
+	// WriteHeader sends the status line and headers. Must be called once before Write.
+	WriteHeader(stream *Stream, status int, headers [][2]string) error
+	// Write sends a chunk of the response body. May be called multiple times.
+	Write(stream *Stream, data []byte) error
+	// Flush ensures buffered data is sent to the network.
+	Flush(stream *Stream) error
+	// Close signals end of the response body.
+	Close(stream *Stream) error
 }
