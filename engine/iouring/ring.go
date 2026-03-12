@@ -284,6 +284,107 @@ func (r *Ring) WakeupSQPoll() error {
 	return nil
 }
 
+// RegisterFiles pre-registers a fixed file table with the kernel. Each entry
+// is initialized to -1 (empty). Use UpdateFixedFile to install FDs into slots.
+func (r *Ring) RegisterFiles(count int) error {
+	fds := make([]int32, count)
+	for i := range fds {
+		fds[i] = -1
+	}
+	_, _, errno := unix.Syscall6(
+		uintptr(sysIOUringRegister),
+		uintptr(r.fd),
+		uintptr(registerFiles),
+		uintptr(unsafe.Pointer(&fds[0])),
+		uintptr(count),
+		0, 0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("io_uring_register files: %w", errno)
+	}
+	return nil
+}
+
+// filesUpdate mirrors struct io_uring_files_update.
+type filesUpdate struct {
+	Offset uint32
+	Resv   uint32
+	FDs    uint64
+}
+
+// UpdateFixedFile installs or removes a file descriptor in a fixed file slot.
+// Set fd to -1 to clear a slot.
+func (r *Ring) UpdateFixedFile(slot int, fd int) error {
+	fds := [1]int32{int32(fd)}
+	arg := filesUpdate{
+		Offset: uint32(slot),
+		FDs:    uint64(uintptr(unsafe.Pointer(&fds[0]))),
+	}
+	_, _, errno := unix.Syscall6(
+		uintptr(sysIOUringRegister),
+		uintptr(r.fd),
+		uintptr(registerFilesUpdate),
+		uintptr(unsafe.Pointer(&arg)),
+		1,
+		0, 0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("io_uring_register files_update slot %d: %w", slot, errno)
+	}
+	return nil
+}
+
+// pbufRingSetup mirrors struct io_uring_buf_reg for IORING_REGISTER_PBUF_RING.
+type pbufRingSetup struct {
+	RingAddr    uint64
+	RingEntries uint32
+	Bgid        uint16
+	Pad         uint16
+	Resv        [3]uint64
+}
+
+// RegisterPbufRing registers a ring-mapped provided buffer ring with the kernel.
+// The ring memory is allocated by the caller via mmap and passed in ringAddr.
+// The caller is responsible for munmapping the ring memory after unregistering.
+func (r *Ring) RegisterPbufRing(groupID uint16, entries uint32, ringAddr unsafe.Pointer) error {
+	arg := pbufRingSetup{
+		RingAddr:    uint64(uintptr(ringAddr)),
+		RingEntries: entries,
+		Bgid:        groupID,
+	}
+	_, _, errno := unix.Syscall6(
+		uintptr(sysIOUringRegister),
+		uintptr(r.fd),
+		uintptr(registerPbufRing),
+		uintptr(unsafe.Pointer(&arg)),
+		1,
+		0, 0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("io_uring_register pbuf_ring: %w", errno)
+	}
+	return nil
+}
+
+// UnregisterPbufRing unregisters a ring-mapped provided buffer ring.
+func (r *Ring) UnregisterPbufRing(groupID uint16) error {
+	arg := pbufRingSetup{
+		Bgid: groupID,
+	}
+	_, _, errno := unix.Syscall6(
+		uintptr(sysIOUringRegister),
+		uintptr(r.fd),
+		uintptr(unregisterPbufRing),
+		uintptr(unsafe.Pointer(&arg)),
+		1,
+		0, 0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("io_uring_unregister pbuf_ring: %w", errno)
+	}
+	return nil
+}
+
 // Close closes the ring and unmaps memory.
 func (r *Ring) Close() error {
 	if r.sqes != nil {

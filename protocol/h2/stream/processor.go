@@ -515,6 +515,10 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 
 	pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
 	headers := (*pooledHeadersIn)[:0]
+	defer func() {
+		*pooledHeadersIn = headers[:0]
+		headersSlicePoolIn.Put(pooledHeadersIn)
+	}()
 	p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
 		headers = append(headers, [2]string{hf.Name, hf.Value})
 	})
@@ -532,6 +536,9 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		return fmt.Errorf("invalid headers: %w", err)
 	}
 	for _, h := range headers {
+		if h[0] == ":method" && h[1] == "HEAD" {
+			stream.IsHEAD = true
+		}
 		stream.AddHeader(h[0], h[1])
 	}
 	stream.ReceivedInitialHeaders = true
@@ -843,6 +850,9 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 				return fmt.Errorf("invalid headers: %w", err)
 			}
 			for _, h := range headers {
+				if h[0] == ":method" && h[1] == "HEAD" {
+					stream.IsHEAD = true
+				}
 				stream.AddHeader(h[0], h[1])
 			}
 			stream.ReceivedInitialHeaders = true

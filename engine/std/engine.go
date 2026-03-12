@@ -127,6 +127,8 @@ func (e *Engine) Addr() net.Addr {
 	return nil
 }
 
+var _ engine.Engine = (*Engine)(nil)
+
 func (e *Engine) connStateHook(_ net.Conn, state http.ConnState) {
 	switch state {
 	case http.StateNew:

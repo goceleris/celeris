@@ -22,6 +22,12 @@ func TestSelectTierBase(t *testing.T) {
 	if tier.SetupFlags() != 0 {
 		t.Errorf("expected 0 flags for base tier")
 	}
+	if tier.SupportsFixedFiles() {
+		t.Error("base tier should not support fixed files")
+	}
+	if tier.SupportsMultishotRecv() {
+		t.Error("base tier should not support multishot recv")
+	}
 }
 
 func TestSelectTierMid(t *testing.T) {
@@ -35,6 +41,9 @@ func TestSelectTierMid(t *testing.T) {
 	}
 	if tier.Tier() != engine.Mid {
 		t.Errorf("expected Mid tier, got %v", tier.Tier())
+	}
+	if tier.SupportsFixedFiles() {
+		t.Error("mid tier should not support fixed files")
 	}
 }
 
@@ -60,6 +69,58 @@ func TestSelectTierHigh(t *testing.T) {
 	if !tier.SupportsMultishotAccept() {
 		t.Error("expected multishot accept support")
 	}
+	if !tier.SupportsMultishotRecv() {
+		t.Error("expected multishot recv support")
+	}
+	// Without FixedFiles in profile, should not support.
+	if tier.SupportsFixedFiles() {
+		t.Error("high tier without FixedFiles profile should not support fixed files")
+	}
+}
+
+func TestSelectTierHighWithFixedFiles(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.High,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		FixedFiles:      true,
+	}
+	tier := SelectTier(profile)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	if !tier.SupportsFixedFiles() {
+		t.Error("high tier with FixedFiles should support fixed files")
+	}
+}
+
+func TestSelectTierHighWithDeferTaskrun(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.High,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		DeferTaskrun:    true,
+	}
+	tier := SelectTier(profile)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	flags := tier.SetupFlags()
+	if flags&setupDeferTaskrun == 0 {
+		t.Error("expected DEFER_TASKRUN in setup flags")
+	}
+	if flags&setupCoopTaskrun != 0 {
+		t.Error("DEFER_TASKRUN should replace COOP_TASKRUN")
+	}
+	if flags&setupSingleIssuer == 0 {
+		t.Error("expected SINGLE_ISSUER (required by DEFER_TASKRUN)")
+	}
 }
 
 func TestSelectTierOptional(t *testing.T) {
@@ -78,6 +139,37 @@ func TestSelectTierOptional(t *testing.T) {
 	}
 	if tier.Tier() != engine.Optional {
 		t.Errorf("expected Optional tier, got %v", tier.Tier())
+	}
+}
+
+func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.Optional,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		SQPoll:          true,
+		DeferTaskrun:    true,
+		FixedFiles:      true,
+	}
+	tier := SelectTier(profile)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	flags := tier.SetupFlags()
+	if flags&setupDeferTaskrun == 0 {
+		t.Error("expected DEFER_TASKRUN in setup flags")
+	}
+	if flags&setupCoopTaskrun != 0 {
+		t.Error("DEFER_TASKRUN should replace COOP_TASKRUN")
+	}
+	if flags&setupSQPoll == 0 {
+		t.Error("expected SQPOLL in setup flags")
+	}
+	if !tier.SupportsFixedFiles() {
+		t.Error("expected fixed files support")
 	}
 }
 

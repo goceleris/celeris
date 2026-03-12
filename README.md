@@ -12,7 +12,6 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 - **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept, provided buffers, SQ poll) for your kernel
 - **Edge-triggered epoll** — per-core event loops with CPU pinning
 - **Adaptive meta-engine** — dynamically switches between io_uring and epoll based on runtime telemetry
-- **Overload manager** — 5-stage degradation ladder (expand, reap, reorder, backpressure, reject)
 - **SIMD HTTP parser** — SSE2 (amd64) and NEON (arm64) with generic SWAR fallback
 - **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK
 - **Auto-detect** — protocol negotiation from the first bytes on the wire
@@ -41,7 +40,7 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 block-beta
   columns 3
   A["celeris (public API)"]:3
-  B["adaptive"]:1 C["overload"]:1 D["observe"]:1
+  B["adaptive"]:1 C["observe"]:2
   E["engine/iouring"]:1 F["engine/epoll"]:1 G["engine/std"]:1
   H["protocol/h1"]:1 I["protocol/h2"]:1 J["protocol/detect"]:1
   K["probe"]:1 L["resource"]:1 M["internal"]:1
@@ -268,7 +267,6 @@ For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](h
 | CPU pinning | yes | yes | no |
 | Provided buffers | yes (5.19+) | no | no |
 | Multishot accept | yes (5.19+) | no | no |
-| Overload shedding | yes | yes | partial |
 
 ## Benchmarks
 
@@ -296,7 +294,6 @@ adaptive/       Adaptive meta-engine (Linux)
 engine/         Engine interface + implementations (iouring, epoll, std)
 internal/       Shared internals (conn, cpumon, platform, sockopts)
 observe/        Lightweight metrics collector (atomic counters, Snapshot)
-overload/       Overload manager with 5-stage degradation
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)
 resource/       Configuration, presets, objectives

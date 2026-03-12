@@ -1,5 +1,7 @@
 package celeris
 
+import "strings"
+
 // RouteGroup is a collection of routes that share a common path prefix and
 // middleware. Use [Server.Group] to create one. A RouteGroup must not be used
 // after [Server.Start] is called.
@@ -73,6 +75,15 @@ func (g *RouteGroup) Any(path string, handlers ...HandlerFunc) *RouteGroup {
 // Handle registers a handler for the given HTTP method and path pattern.
 func (g *RouteGroup) Handle(method, path string, handlers ...HandlerFunc) *Route {
 	return g.handle(method, path, handlers...)
+}
+
+// Static registers a GET handler that serves files from root under the given
+// prefix. Uses FileFromDir for path traversal protection.
+func (g *RouteGroup) Static(prefix, root string) *Route {
+	p := strings.TrimRight(prefix, "/") + "/*filepath"
+	return g.GET(p, func(c *Context) error {
+		return c.FileFromDir(root, c.Param("filepath"))
+	})
 }
 
 // Group creates a sub-group with the given path prefix. The sub-group inherits
