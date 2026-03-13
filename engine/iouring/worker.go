@@ -326,6 +326,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 			w.logger.Warn("ACCEPT_DIRECT failed (EINVAL), disabling fixed files",
 				"worker", w.id)
 			w.fixedFiles = false
+			w.prepSend = prepSendPlain
 			if w.listenFD >= 0 {
 				sqe := w.ring.GetSQE()
 				if sqe != nil {
@@ -474,6 +475,19 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 	if c.Res <= 0 {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+		}
+		// ENOBUFS (-105): provided buffer ring exhausted. The multishot recv
+		// is terminated by the kernel but the connection is healthy. Re-arm
+		// multishot recv — buffers will be available after current batch is
+		// returned via PublishBuffers().
+		if c.Res == -105 && w.bufRing != nil {
+			w.bufRing.PublishBuffers()
+			sqe := w.ring.GetSQE()
+			if sqe != nil {
+				prepMultishotRecv(sqe, fd, bufRingGroupID, cs.fixedFile)
+				setSQEUserData(sqe, encodeUserData(udRecv, fd))
+			}
+			return
 		}
 		w.closeConn(fd)
 		return
@@ -701,15 +715,6 @@ func (w *Worker) makeWriteFn(fd int) func([]byte) {
 		// Append to writeBuf — no per-write allocation. The kernel holds
 		// sendBuf (not writeBuf), so appending here is safe.
 		cs.writeBuf = append(cs.writeBuf, data...)
-
-		// Immediate flush for the common single-response case (P10):
-		// If no send is in-flight and connection isn't already dirty, submit
-		// the SEND SQE immediately. This bypasses the dirty list traversal
-		// for the vast majority of requests.
-		if !cs.sending && !cs.dirty {
-			w.flushSend(fd)
-			return
-		}
 		w.markDirty(cs)
 	}
 }
