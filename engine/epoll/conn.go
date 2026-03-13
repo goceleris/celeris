@@ -17,13 +17,13 @@ const maxPendingBytes = 4 << 20 // 4 MiB
 // Fields are ordered for cache line optimization (P4): hot fields first.
 type connState struct {
 	// Hot path — first cache line:
-	fd           int             // 8 bytes
-	protocol     engine.Protocol // 1 byte
-	detected     bool            // 1 byte
-	dirty        bool            // 1 byte: true when writeBuf has data to flush
-	_            [5]byte         // padding to 8-byte alignment
-	buf          []byte          // 24 bytes
-	writeBuf     []byte          // 24 bytes: single append buffer for pending writes
+	fd       int             // 8 bytes
+	protocol engine.Protocol // 1 byte
+	detected bool            // 1 byte
+	dirty    bool            // 1 byte: true when writeBuf has data to flush
+	_        [5]byte         // padding to 8-byte alignment
+	buf      []byte          // 24 bytes
+	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 
 	// Warm — second cache line:
 	pendingBytes int        // 8 bytes

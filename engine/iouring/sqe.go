@@ -94,16 +94,6 @@ func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {
 	*(*uint32)(unsafe.Pointer(&sqe[44])) = uint32(fileIndex)
 }
 
-// prepCancelFD cancels all pending io_uring operations on a file descriptor.
-// This releases the kernel's io_uring reference to the underlying file,
-// allowing listen sockets to leave the SO_REUSEPORT group immediately.
-func prepCancelFD(sqePtr unsafe.Pointer, fd int) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opASYNCCANCEL
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
-	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
-}
-
 func prepProvideBuffers(sqePtr unsafe.Pointer, addr unsafe.Pointer, bufLen int, count int, groupID uint16, bufID uint16) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[0] = opPROVIDEBUFFERS
