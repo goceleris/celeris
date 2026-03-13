@@ -48,6 +48,9 @@ type Context struct {
 	queryCache  url.Values
 	queryCached bool
 
+	cookieCache  [][2]string
+	cookieCached bool
+
 	formParsed    bool
 	formValues    url.Values
 	multipartForm *multipart.Form
@@ -221,7 +224,11 @@ func (c *Context) Keys() map[string]any {
 func (c *Context) reset() {
 	c.stream = nil
 	c.index = -1
-	c.handlers = nil
+	if cap(c.handlers) > 64 {
+		c.handlers = nil
+	} else {
+		c.handlers = c.handlers[:0]
+	}
 	c.params = c.params[:0]
 	c.keys = nil
 	c.ctx = nil
@@ -235,6 +242,8 @@ func (c *Context) reset() {
 	c.aborted = false
 	c.queryCache = nil
 	c.queryCached = false
+	c.cookieCache = c.cookieCache[:0]
+	c.cookieCached = false
 	if c.multipartForm != nil {
 		_ = c.multipartForm.RemoveAll()
 		c.multipartForm = nil

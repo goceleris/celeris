@@ -10,6 +10,7 @@ type Manager struct {
 	streams                 map[uint32]*Stream
 	nextStreamID            uint32
 	lastClientStream        uint32
+	maxStreamID             uint32
 	mu                      sync.RWMutex
 	connectionWindow        int32
 	maxStreams              uint32
@@ -56,6 +57,9 @@ func (m *Manager) CreateStream(id uint32) *Stream {
 	//nolint:gosec // G115: safe conversion, initialWindowSize validated by protocol
 	stream.WindowSize = int32(m.initialWindowSize)
 	m.streams[id] = stream
+	if id > m.maxStreamID {
+		m.maxStreamID = id
+	}
 	return stream
 }
 
@@ -91,6 +95,9 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	s.WindowSize = int32(m.initialWindowSize)
 	s.State = StateOpen
 	m.streams[id] = s
+	if id > m.maxStreamID {
+		m.maxStreamID = id
+	}
 	m.activeStreams++
 	return s, true
 }
@@ -121,15 +128,9 @@ func (m *Manager) StreamCount() int {
 // GetLastStreamID returns the highest stream ID.
 func (m *Manager) GetLastStreamID() uint32 {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var lastID uint32
-	for id := range m.streams {
-		if id > lastID {
-			lastID = id
-		}
-	}
-	return lastID
+	id := m.maxStreamID
+	m.mu.RUnlock()
+	return id
 }
 
 // GetLastClientStreamID returns the highest client-initiated stream ID observed.
