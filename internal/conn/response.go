@@ -15,8 +15,9 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// cachedDateValue holds the pre-formatted HTTP Date header line, updated every second.
-var cachedDateValue atomic.Value
+// cachedDatePtr holds the pre-formatted HTTP Date header line, updated every second.
+// Using atomic.Pointer avoids the type assertion cost of atomic.Value (P6).
+var cachedDatePtr atomic.Pointer[[]byte]
 
 func init() {
 	updateCachedDate()
@@ -37,12 +38,12 @@ func updateCachedDate() {
 	b = append(b, "\r\n"...)
 	cp := make([]byte, len(b))
 	copy(cp, b)
-	cachedDateValue.Store(cp)
+	cachedDatePtr.Store(&cp)
 }
 
 func appendCachedDate(buf []byte) []byte {
-	if v := cachedDateValue.Load(); v != nil {
-		return append(buf, v.([]byte)...)
+	if p := cachedDatePtr.Load(); p != nil {
+		return append(buf, (*p)...)
 	}
 	buf = append(buf, "date: "...)
 	buf = time.Now().UTC().AppendFormat(buf, time.RFC1123)

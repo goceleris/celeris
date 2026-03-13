@@ -128,7 +128,16 @@ func (c *Context) NoContent(code int) error {
 // Keys are lowercased for HTTP/2 compliance (RFC 7540 §8.1.2).
 // CRLF characters are stripped to prevent header injection.
 func (c *Context) SetHeader(key, value string) {
-	k := sanitizeHeaderKey(key)
+	// Inline fast path: most programmatic header keys are already lowercase
+	// and clean. Scan for uppercase/CRLF and skip function call if clean (P8).
+	k := key
+	for i := range len(key) {
+		b := key[i]
+		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' {
+			k = sanitizeHeaderKey(key)
+			break
+		}
+	}
 	v := stripCRLF(value)
 	for i, h := range c.respHeaders {
 		if h[0] == k {

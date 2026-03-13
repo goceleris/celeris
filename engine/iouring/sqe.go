@@ -94,16 +94,6 @@ func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {
 	*(*uint32)(unsafe.Pointer(&sqe[44])) = uint32(fileIndex)
 }
 
-// prepCancelFD cancels all pending io_uring operations on a file descriptor.
-// This releases the kernel's io_uring reference to the underlying file,
-// allowing listen sockets to leave the SO_REUSEPORT group immediately.
-func prepCancelFD(sqePtr unsafe.Pointer, fd int) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opASYNCCANCEL
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
-	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
-}
-
 func prepProvideBuffers(sqePtr unsafe.Pointer, addr unsafe.Pointer, bufLen int, count int, groupID uint16, bufID uint16) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[0] = opPROVIDEBUFFERS
@@ -122,4 +112,25 @@ func setSQEUserData(sqePtr unsafe.Pointer, data uint64) {
 func setSQEFixedFile(sqePtr unsafe.Pointer) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[1] |= sqeFixedFile
+}
+
+// prepSendPlain prepares a SEND SQE for a regular (non-fixed) file descriptor.
+func prepSendPlain(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSend(sqePtr, fd, buf, linked)
+}
+
+// prepSendFixed prepares a SEND SQE for a fixed file descriptor.
+func prepSendFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSend(sqePtr, fd, buf, linked)
+	setSQEFixedFile(sqePtr)
+}
+
+// prepCancelFDSkipSuccess prepares an ASYNC_CANCEL SQE with CQE_SKIP_SUCCESS
+// to suppress the success CQE (P11).
+func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = sqeCQESkipSuccess
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
 }

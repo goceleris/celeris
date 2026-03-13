@@ -15,24 +15,32 @@ import (
 const maxSendQueueBytes = 4 << 20 // 4 MiB
 
 // connState holds per-connection state for the io_uring engine.
+// Fields are ordered for cache line optimization (P4): hot fields in the first
+// 64-byte cache line, warm in the second, cold in the third.
 type connState struct {
-	fd         int // real FD, or fixed file index when fixedFile is true
-	protocol   engine.Protocol
-	buf        []byte // per-connection recv buffer (nil when using multishot recv)
+	// Hot path — first cache line (~62 bytes on x86/arm64):
+	fd        int             // 8 bytes: real FD, or fixed file index when fixedFile is true
+	protocol  engine.Protocol // 1 byte
+	detected  bool            // 1 byte
+	sending   bool            // 1 byte: true when a SEND SQE is in-flight
+	closing   bool            // 1 byte: defers close until all in-flight sends complete
+	dirty     bool            // 1 byte: true when data needs to be flushed
+	fixedFile bool            // 1 byte: true when fd is a fixed file index
+	_         [2]byte         // padding to 8-byte alignment
+	buf       []byte          // 24 bytes: per-connection recv buffer (nil when using multishot recv)
+	writeBuf  []byte          // 24 bytes: append buffer: handler writes accumulate here
+
+	// Warm — second cache line:
+	sendBuf   []byte     // 24 bytes: in-flight buffer: kernel holds this until CQE
+	dirtyNext *connState // 8 bytes: intrusive doubly-linked dirty list
+	dirtyPrev *connState // 8 bytes
+
+	// Cold — third cache line:
 	h1State    *conn.H1State
 	h2State    *conn.H2State
 	ctx        context.Context
 	cancel     context.CancelFunc
-	detected   bool
-	fixedFile  bool   // true when fd is a fixed file index
-	writeBuf   []byte // append buffer: handler writes accumulate here
-	sendBuf    []byte // in-flight buffer: kernel holds this until CQE
-	sending    bool   // true when a SEND SQE is in-flight for this connection
-	closing    bool   // defers close until all in-flight sends complete
 	remoteAddr string
-	dirty      bool       // true when data needs to be flushed
-	dirtyNext  *connState // intrusive doubly-linked dirty list
-	dirtyPrev  *connState
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {
