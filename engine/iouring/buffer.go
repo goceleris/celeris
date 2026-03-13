@@ -130,6 +130,18 @@ func (br *BufferRing) ReturnBuffer(bufID uint16) {
 	br.publishTail()
 }
 
+// PushBuffer queues a buffer for return without publishing to the kernel.
+// Call PublishBuffers once after batching multiple PushBuffer calls.
+func (br *BufferRing) PushBuffer(bufID uint16) {
+	br.pushEntry(bufID)
+}
+
+// PublishBuffers makes all pushed entries visible to the kernel with a single
+// atomic store. Call after one or more PushBuffer calls.
+func (br *BufferRing) PublishBuffers() {
+	br.publishTail()
+}
+
 // Close unregisters the buffer ring and releases mmap'd memory.
 func (br *BufferRing) Close(ring *Ring) {
 	_ = ring.UnregisterPbufRing(br.groupID)

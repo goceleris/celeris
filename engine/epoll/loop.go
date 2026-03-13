@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -48,6 +49,7 @@ type Loop struct {
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
 	tw          *timer.Wheel
+	tickCounter uint32
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
 }
@@ -200,13 +202,18 @@ func (l *Loop) run(ctx context.Context) {
 				l.removeDirty(cs)
 				// Writes flushed; restore idle timeout (cancels write timeout).
 				if l.cfg.IdleTimeout > 0 {
-					l.tw.Schedule(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout)
+					l.tw.ScheduleAt(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
 				}
 			}
 			cs = next
 		}
 
-		l.tw.Tick()
+		// Throttle timer wheel tick: 100ms granularity doesn't need per-iteration
+		// calls. Tick every 1024 iterations to amortize time.Now() cost (P1).
+		l.tickCounter++
+		if l.tickCounter&0x3FF == 0 {
+			l.tw.Tick()
+		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
 		if l.listenFD < 0 && len(l.conns) == 0 && l.acceptPaused.Load() {
@@ -262,7 +269,7 @@ func (l *Loop) acceptAll(ctx context.Context) {
 		}
 
 		if l.cfg.IdleTimeout > 0 {
-			l.tw.Schedule(newFD, l.cfg.IdleTimeout, timer.IdleTimeout)
+			l.tw.ScheduleAt(newFD, l.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
 		}
 
 		if l.cfg.Protocol != engine.Auto {
@@ -298,8 +305,9 @@ func (l *Loop) drainRead(fd int) {
 		data := cs.buf[:n]
 
 		// Cancel idle timer; schedule read timeout while processing request.
+		now := time.Now().UnixNano()
 		if l.cfg.ReadTimeout > 0 {
-			l.tw.Schedule(fd, l.cfg.ReadTimeout, timer.ReadTimeout)
+			l.tw.ScheduleAt(fd, l.cfg.ReadTimeout, timer.ReadTimeout, now)
 		} else {
 			l.tw.Cancel(fd)
 		}
@@ -335,10 +343,11 @@ func (l *Loop) drainRead(fd int) {
 		l.reqCount.Add(1)
 
 		// Schedule write timeout if response data is pending.
+		// Reuse the timestamp captured above (P9).
 		if l.cfg.WriteTimeout > 0 && len(cs.writeBuf) > 0 {
-			l.tw.Schedule(fd, l.cfg.WriteTimeout, timer.WriteTimeout)
+			l.tw.ScheduleAt(fd, l.cfg.WriteTimeout, timer.WriteTimeout, now)
 		} else if l.cfg.IdleTimeout > 0 {
-			l.tw.Schedule(fd, l.cfg.IdleTimeout, timer.IdleTimeout)
+			l.tw.ScheduleAt(fd, l.cfg.IdleTimeout, timer.IdleTimeout, now)
 		}
 
 		if processErr != nil {

@@ -75,7 +75,14 @@ func (w *Wheel) slotIndex(deadline int64) uint64 {
 // Schedule registers a timeout for the given FD. Any previous timeout for
 // the same FD is logically cancelled (the old entry is ignored on expiry).
 func (w *Wheel) Schedule(fd int, timeout time.Duration, kind TimeoutKind) {
-	deadline := time.Now().UnixNano() + int64(timeout)
+	w.ScheduleAt(fd, timeout, kind, time.Now().UnixNano())
+}
+
+// ScheduleAt is like Schedule but accepts a pre-computed now timestamp (UnixNano)
+// to avoid redundant time.Now() calls when scheduling multiple timeouts in the
+// same request processing cycle.
+func (w *Wheel) ScheduleAt(fd int, timeout time.Duration, kind TimeoutKind, nowNs int64) {
+	deadline := nowNs + int64(timeout)
 	slot := w.slotIndex(deadline)
 
 	e := getEntry()

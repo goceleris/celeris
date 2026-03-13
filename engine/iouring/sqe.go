@@ -123,3 +123,24 @@ func setSQEFixedFile(sqePtr unsafe.Pointer) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[1] |= sqeFixedFile
 }
+
+// prepSendPlain prepares a SEND SQE for a regular (non-fixed) file descriptor.
+func prepSendPlain(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSend(sqePtr, fd, buf, linked)
+}
+
+// prepSendFixed prepares a SEND SQE for a fixed file descriptor.
+func prepSendFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSend(sqePtr, fd, buf, linked)
+	setSQEFixedFile(sqePtr)
+}
+
+// prepCancelFDSkipSuccess prepares an ASYNC_CANCEL SQE with CQE_SKIP_SUCCESS
+// to suppress the success CQE (P11).
+func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = sqeCQESkipSuccess
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
+}
