@@ -1,4 +1,6 @@
-// Package main runs load tests against all 27 celeris engine configurations.
+//go:build linux
+
+// Package main runs load tests against all 36 celeris engine configurations.
 // Must be run on Linux with io_uring support (kernel 5.10+).
 package main
 
@@ -57,7 +59,7 @@ type testResult struct {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	var results []testResult
+	results := make([]testResult, 0, len(engines)*len(objectives)*len(protocols))
 
 	for _, eng := range engines {
 		for oi, obj := range objectives {
@@ -69,9 +71,10 @@ func main() {
 				results = append(results, r)
 
 				status := r.status
-				if r.status == "FAIL" {
+				switch r.status {
+				case "FAIL":
 					status = "\033[31mFAIL\033[0m"
-				} else if r.status == "PASS" {
+				case "PASS":
 					status = "\033[32mPASS\033[0m"
 				}
 				log.Printf("[%s] %s: %d reqs, %d errs, %s — %s",
@@ -197,7 +200,7 @@ func waitForReady(addr string, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -266,7 +269,7 @@ func loadTest(addr string, endpoints []string, h2c bool) (totalReqs, totalErrs i
 					continue
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
+				_ = resp.Body.Close()
 
 				if resp.StatusCode != 200 {
 					errs.Add(1)

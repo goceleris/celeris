@@ -195,7 +195,7 @@ func (l *Loop) run(ctx context.Context) {
 		now := time.Now().UnixNano()
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
-			_, err := flushWrites(cs)
+			err := flushWrites(cs)
 			if err != nil {
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
@@ -295,12 +295,12 @@ func (l *Loop) drainRead(fd int) {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
 			}
-			_, _ = flushWrites(cs)
+			_ = flushWrites(cs)
 			l.closeConn(fd)
 			return
 		}
 		if n == 0 {
-			_, _ = flushWrites(cs)
+			_ = flushWrites(cs)
 			l.closeConn(fd)
 			return
 		}
@@ -358,7 +358,7 @@ func (l *Loop) drainRead(fd int) {
 				return // FD already detached — do not close or flush
 			}
 			// Flush any pending writes (e.g. error responses) before closing.
-			_, _ = flushWrites(cs)
+			_ = flushWrites(cs)
 			cs.pendingBytes = 0
 			l.closeConn(fd)
 			return
