@@ -6,42 +6,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func flushWrites(cs *connState) error {
+// flushWrites attempts a single non-blocking write of pending data.
+// Returns the number of bytes written and any error. Does not block.
+func flushWrites(cs *connState) (int, error) {
 	if len(cs.writeBuf) == 0 {
-		return nil
+		return 0, nil
 	}
-	if err := writeAll(cs.fd, cs.writeBuf); err != nil {
-		cs.writeBuf = cs.writeBuf[:0]
-		return err
-	}
-	cs.writeBuf = cs.writeBuf[:0]
-	return nil
-}
-
-// writeAll writes the entire buffer, polling for writability on EAGAIN.
-func writeAll(fd int, data []byte) error {
-	for len(data) > 0 {
-		n, err := unix.Write(fd, data)
-		if err != nil {
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				if pollErr := pollWrite(fd); pollErr != nil {
-					return pollErr
-				}
-				continue
-			}
-			return err
+	n, err := unix.Write(cs.fd, cs.writeBuf)
+	if err != nil {
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			return 0, nil // socket buffer full, will retry
 		}
-		data = data[n:]
+		cs.writeBuf = cs.writeBuf[:0]
+		return 0, err
 	}
-	return nil
-}
-
-// pollWrite blocks until fd is writable or timeout (100ms).
-func pollWrite(fd int) error {
-	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
-	_, err := unix.Poll(fds, 100)
-	if err != nil && err != unix.EINTR {
-		return err
+	if n >= len(cs.writeBuf) {
+		cs.writeBuf = cs.writeBuf[:0]
+	} else {
+		remaining := len(cs.writeBuf) - n
+		copy(cs.writeBuf, cs.writeBuf[n:])
+		cs.writeBuf = cs.writeBuf[:remaining]
 	}
-	return nil
+	return n, nil
 }

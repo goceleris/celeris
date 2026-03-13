@@ -36,6 +36,7 @@ type connState struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	remoteAddr string
+	writeFn    func([]byte) // cached write function
 }
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {
