@@ -32,45 +32,7 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 
 	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
 
-	defer func() {
-		if r := recover(); r != nil {
-			a.server.logger().Error("handler panic recovered",
-				"error", fmt.Sprint(r),
-				"method", c.method,
-				"path", c.path,
-				"stack", string(debug.Stack()),
-			)
-			c.statusCode = 500
-			if !c.written && s.ResponseWriter != nil {
-				_ = s.ResponseWriter.WriteResponse(s, 500, [][2]string{
-					{"content-type", "text/plain"},
-				}, []byte("Internal Server Error"))
-				c.written = true
-			}
-		}
-		if c.detached {
-			go func() {
-				<-c.detachDone
-				if a.server.collector != nil {
-					status := c.statusCode
-					if status == 0 {
-						status = 200
-					}
-					a.server.collector.RecordRequest(time.Since(start), status)
-				}
-				releaseContext(c)
-			}()
-			return
-		}
-		if a.server.collector != nil {
-			status := c.statusCode
-			if status == 0 {
-				status = 200
-			}
-			a.server.collector.RecordRequest(time.Since(start), status)
-		}
-		releaseContext(c)
-	}()
+	defer a.recoverAndRelease(c, s, start)
 
 	if handlers == nil {
 		a.handleUnmatched(c, s)
@@ -86,6 +48,59 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 		_ = c.FlushResponse()
 	}
 	return nil
+}
+
+// recoverAndRelease handles panic recovery and context release. Extracted to a
+// separate noinline function so that HandleStream's stack frame is not inflated
+// by the deferred closure and debug.Stack() call (P5).
+//
+//go:noinline
+func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream, start time.Time) {
+	if r := recover(); r != nil {
+		a.handlePanic(c, s, r)
+	}
+	if c.detached {
+		go func() {
+			<-c.detachDone
+			if a.server.collector != nil {
+				status := c.statusCode
+				if status == 0 {
+					status = 200
+				}
+				a.server.collector.RecordRequest(time.Since(start), status)
+			}
+			releaseContext(c)
+		}()
+		return
+	}
+	if a.server.collector != nil {
+		status := c.statusCode
+		if status == 0 {
+			status = 200
+		}
+		a.server.collector.RecordRequest(time.Since(start), status)
+	}
+	releaseContext(c)
+}
+
+// handlePanic logs the panic and writes a 500 response. Separated from
+// recoverAndRelease so debug.Stack() only runs when a panic actually occurs.
+//
+//go:noinline
+func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
+	a.server.logger().Error("handler panic recovered",
+		"error", fmt.Sprint(r),
+		"method", c.method,
+		"path", c.path,
+		"stack", string(debug.Stack()),
+	)
+	c.statusCode = 500
+	if !c.written && s.ResponseWriter != nil {
+		_ = s.ResponseWriter.WriteResponse(s, 500, [][2]string{
+			{"content-type", "text/plain"},
+		}, []byte("Internal Server Error"))
+		c.written = true
+	}
 }
 
 func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {

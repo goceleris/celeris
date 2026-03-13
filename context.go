@@ -87,8 +87,40 @@ func releaseContext(c *Context) {
 }
 
 func (c *Context) extractRequestInfo() {
+	headers := c.stream.Headers
+
+	// Fast path: per HTTP/2 spec (RFC 9113 §8.3), pseudo-headers appear before
+	// regular headers. Our H1 parser also places them at indices 0-3. Check the
+	// first few positions directly to avoid a loop for 99.99% of requests (P7).
+	if len(headers) >= 2 {
+		found := 0
+		for i := range min(len(headers), 4) {
+			switch headers[i][0] {
+			case ":method":
+				c.method = headers[i][1]
+				found++
+			case ":path":
+				p := headers[i][1]
+				if i := strings.IndexByte(p, '?'); i >= 0 {
+					c.path = p[:i]
+					c.rawQuery = p[i+1:]
+				} else {
+					c.path = p
+				}
+				found++
+			}
+			if found == 2 {
+				return
+			}
+		}
+		if found == 2 {
+			return
+		}
+	}
+
+	// Slow fallback: scan all headers.
 	found := 0
-	for _, h := range c.stream.Headers {
+	for _, h := range headers {
 		switch h[0] {
 		case ":method":
 			c.method = h[1]
