@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 )
 
-const windowUpdateThreshold = 1024
+const windowUpdateThreshold = 8192
 
 // ConsumeSendWindow decrements connection and stream windows after sending DATA.
 func (m *Manager) ConsumeSendWindow(streamID uint32, n int32) {

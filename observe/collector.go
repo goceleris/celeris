@@ -75,13 +75,16 @@ func (c *Collector) RecordRequest(duration time.Duration, status int) {
 		c.errorsTotal.Add(1)
 	}
 	ns := duration.Nanoseconds()
-	for i, bound := range defaultBucketBoundsNS {
-		if ns <= bound {
-			c.latencyBuckets[i].Add(1)
-			return
+	lo, hi := 0, bucketCount-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if ns <= defaultBucketBoundsNS[mid] {
+			hi = mid
+		} else {
+			lo = mid + 1
 		}
 	}
-	c.latencyBuckets[bucketCount-1].Add(1)
+	c.latencyBuckets[lo].Add(1)
 }
 
 // RecordError increments the error counter.

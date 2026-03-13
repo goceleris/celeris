@@ -192,19 +192,21 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		now := time.Now().UnixNano()
 		for cs := l.dirtyHead; cs != nil; {
-			next := cs.dirtyNext // save before removeDirty clears it
-			if err := flushWrites(cs); err != nil {
+			next := cs.dirtyNext
+			err := flushWrites(cs)
+			if err != nil {
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
-			} else {
+			} else if len(cs.writeBuf) == 0 {
 				cs.pendingBytes = 0
 				l.removeDirty(cs)
-				// Writes flushed; restore idle timeout (cancels write timeout).
 				if l.cfg.IdleTimeout > 0 {
-					l.tw.ScheduleAt(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
+					l.tw.ScheduleAt(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout, now)
 				}
 			}
+			// else: partial write, keep on dirty list for next iteration
 			cs = next
 		}
 
@@ -238,7 +240,7 @@ func (l *Loop) run(ctx context.Context) {
 }
 
 func (l *Loop) acceptAll(ctx context.Context) {
-	for {
+	for i := 0; i < 64; i++ {
 		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
@@ -262,6 +264,7 @@ func (l *Loop) acceptAll(ctx context.Context) {
 		cs := newConnState(ctx, newFD, l.resolved.BufferSize)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
+		cs.writeFn = l.makeWriteFn(cs)
 		l.activeConns.Add(1)
 
 		if l.cfg.OnConnect != nil {
@@ -326,7 +329,7 @@ func (l *Loop) drainRead(fd int) {
 			l.initProtocol(cs)
 		}
 
-		writeFn := l.makeWriteFn(cs)
+		writeFn := cs.writeFn
 
 		var processErr error
 		switch cs.protocol {
@@ -393,12 +396,11 @@ func (l *Loop) initProtocol(cs *connState) {
 			return l.hijackConn(cs.fd)
 		}
 	case engine.H2C:
-		writeFn := l.makeWriteFn(cs)
 		cs.h2State = conn.NewH2State(l.handler, conn.H2Config{
 			MaxConcurrentStreams: l.cfg.MaxConcurrentStreams,
 			InitialWindowSize:    l.cfg.InitialWindowSize,
 			MaxFrameSize:         l.cfg.MaxFrameSize,
-		}, writeFn)
+		}, cs.writeFn)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }

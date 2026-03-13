@@ -65,20 +65,21 @@ type cqRingOffsets struct {
 
 // Ring is an io_uring instance with mmap'd SQ/CQ rings and SQE array.
 type Ring struct {
-	fd       int
-	sqRing   []byte
-	cqRing   []byte
-	sqes     []byte
-	params   ioUringParams
-	sqMask   uint32
-	cqMask   uint32
-	pending  uint32
-	sqHead   unsafe.Pointer
-	sqTail   unsafe.Pointer
-	sqArray  unsafe.Pointer
-	cqHead   unsafe.Pointer
-	cqTail   unsafe.Pointer
-	cqesBase unsafe.Pointer
+	fd           int
+	sqRing       []byte
+	cqRing       []byte
+	sqes         []byte
+	params       ioUringParams
+	sqMask       uint32
+	cqMask       uint32
+	pending      uint32
+	singleIssuer bool
+	sqHead       unsafe.Pointer
+	sqTail       unsafe.Pointer
+	sqArray      unsafe.Pointer
+	cqHead       unsafe.Pointer
+	cqTail       unsafe.Pointer
+	cqesBase     unsafe.Pointer
 }
 
 // NewRing creates a new io_uring instance.
@@ -97,8 +98,9 @@ func NewRing(entries uint32, flags uint32) (*Ring, error) {
 	}
 
 	r := &Ring{
-		fd:     int(fd),
-		params: params,
+		fd:           int(fd),
+		params:       params,
+		singleIssuer: flags&setupSingleIssuer != 0,
 	}
 
 	if err := r.mmap(); err != nil {
@@ -152,8 +154,14 @@ func (r *Ring) mmap() error {
 
 // GetSQE returns a pointer to the next available SQE, or nil if the ring is full.
 func (r *Ring) GetSQE() unsafe.Pointer {
-	tail := atomic.LoadUint32((*uint32)(r.sqTail))
-	head := atomic.LoadUint32((*uint32)(r.sqHead))
+	var tail, head uint32
+	if r.singleIssuer {
+		tail = *(*uint32)(r.sqTail)
+		head = *(*uint32)(r.sqHead)
+	} else {
+		tail = atomic.LoadUint32((*uint32)(r.sqTail))
+		head = atomic.LoadUint32((*uint32)(r.sqHead))
+	}
 	if tail-head >= r.params.sqEntries {
 		return nil
 	}

@@ -112,6 +112,9 @@ func (c *Context) QueryInt(key string, defaultValue int) int {
 // QueryValues returns all values for the given query parameter key.
 // Returns nil if the key is not present.
 func (c *Context) QueryValues(key string) []string {
+	if c.rawQuery == "" {
+		return nil
+	}
 	if !c.queryCached {
 		c.queryCache, _ = url.ParseQuery(c.rawQuery)
 		c.queryCached = true
@@ -121,6 +124,9 @@ func (c *Context) QueryValues(key string) []string {
 
 // QueryParams returns all query parameters as url.Values.
 func (c *Context) QueryParams() url.Values {
+	if c.rawQuery == "" {
+		return nil
+	}
 	if !c.queryCached {
 		c.queryCache, _ = url.ParseQuery(c.rawQuery)
 		c.queryCached = true
@@ -194,21 +200,47 @@ func (c *Context) BindXML(v any) error {
 // Cookie returns the value of the named cookie from the request, or
 // ErrNoCookie if not found. Values are returned as-is without decoding.
 func (c *Context) Cookie(name string) (string, error) {
-	raw := c.Header("cookie")
-	if raw == "" {
-		return "", ErrNoCookie
+	if !c.cookieCached {
+		c.parseCookies()
 	}
-	for _, part := range strings.Split(raw, ";") {
-		part = strings.TrimSpace(part)
-		eq := strings.IndexByte(part, '=')
-		if eq < 0 {
-			continue
-		}
-		if part[:eq] == name {
-			return part[eq+1:], nil
+	for _, ck := range c.cookieCache {
+		if ck[0] == name {
+			return ck[1], nil
 		}
 	}
 	return "", ErrNoCookie
+}
+
+func (c *Context) parseCookies() {
+	c.cookieCached = true
+	raw := c.Header("cookie")
+	if raw == "" {
+		return
+	}
+	for len(raw) > 0 {
+		i := 0
+		for i < len(raw) && (raw[i] == ' ' || raw[i] == ';') {
+			i++
+		}
+		raw = raw[i:]
+		if raw == "" {
+			break
+		}
+		end := strings.IndexByte(raw, ';')
+		var pair string
+		if end < 0 {
+			pair = raw
+			raw = ""
+		} else {
+			pair = raw[:end]
+			raw = raw[end+1:]
+		}
+		eq := strings.IndexByte(pair, '=')
+		if eq < 0 {
+			continue
+		}
+		c.cookieCache = append(c.cookieCache, [2]string{pair[:eq], pair[eq+1:]})
+	}
 }
 
 // Scheme returns the request scheme ("http" or "https"). It checks the

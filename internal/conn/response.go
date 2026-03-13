@@ -192,15 +192,15 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	}
 
 	// Stack-allocated header buffer for common case (≤7 response headers).
-	var buf [8][2]string
-	responseHeaders := buf[:0:8]
-	if len(headers)+1 > 8 {
+	var buf [16][2]string
+	responseHeaders := buf[:0:16]
+	if len(headers)+1 > 16 {
 		responseHeaders = make([][2]string, 0, len(headers)+1)
 	}
 	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
 	responseHeaders = append(responseHeaders, headers...)
 
-	headerBlock, err := a.encoder.Encode(responseHeaders)
+	headerBlock, err := a.encoder.EncodeBorrow(responseHeaders)
 	if err != nil {
 		return fmt.Errorf("HPACK encode error: %w", err)
 	}
@@ -404,7 +404,8 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 
 func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	// Chunked transfer encoding: hex(len)\r\n data \r\n
-	chunk := fmt.Appendf(nil, "%x\r\n", len(data))
+	chunk := strconv.AppendInt(nil, int64(len(data)), 16)
+	chunk = append(chunk, '\r', '\n')
 	chunk = append(chunk, data...)
 	chunk = append(chunk, crlf...)
 	a.write(chunk)
@@ -468,13 +469,20 @@ var _ stream.Streamer = (*h1ResponseAdapter)(nil)
 var _ stream.Streamer = (*h2ResponseAdapter)(nil)
 
 func appendSanitizedHeaderField(buf []byte, s string) []byte {
+	// Fast path: most header fields have no CRLF.
 	for i := range len(s) {
-		b := s[i]
-		if b != '\r' && b != '\n' {
-			buf = append(buf, b)
+		if s[i] == '\r' || s[i] == '\n' {
+			// Slow path: copy bytes, skipping CR/LF.
+			for j := range len(s) {
+				b := s[j]
+				if b != '\r' && b != '\n' {
+					buf = append(buf, b)
+				}
+			}
+			return buf
 		}
 	}
-	return buf
+	return append(buf, s...)
 }
 
 func buildErrorResponse(status int, message string) []byte {

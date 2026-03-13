@@ -189,13 +189,14 @@ func (w *Worker) run(ctx context.Context) {
 				// Process CQEs: skip cancel completions (userData=0),
 				// handle everything else normally to avoid breaking
 				// active connections.
+				cancelNow := time.Now().UnixNano()
 				for {
 					entry := w.ring.peekCQE()
 					if entry == nil {
 						break
 					}
 					if entry.UserData != 0 {
-						w.processCQE(ctx, entry)
+						w.processCQE(ctx, entry, cancelNow)
 					}
 					w.ring.AdvanceCQ()
 				}
@@ -231,6 +232,7 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
+		now := time.Now().UnixNano()
 		processed := 0
 		hasBufReturns := false
 		for processed < w.objective.CQBatch {
@@ -238,8 +240,7 @@ func (w *Worker) run(ctx context.Context) {
 			if entry == nil {
 				break
 			}
-			w.processCQE(ctx, entry)
-			// Track whether any buffer returns were batched (P0).
+			w.processCQE(ctx, entry, now)
 			if decodeOp(entry.UserData) == udRecv && cqeHasBuffer(entry.Flags) && w.bufRing != nil {
 				hasBufReturns = true
 			}
@@ -300,25 +301,24 @@ func (w *Worker) run(ctx context.Context) {
 	}
 }
 
-func (w *Worker) processCQE(ctx context.Context, c *completionEntry) {
+func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) {
 	op := decodeOp(c.UserData)
 	fd := decodeFD(c.UserData)
 
 	switch op {
 	case udAccept:
-		w.handleAccept(ctx, c, fd)
+		w.handleAccept(ctx, c, fd, now)
 	case udRecv:
-		w.handleRecv(c, fd)
+		w.handleRecv(c, fd, now)
 	case udSend:
-		w.handleSend(c, fd)
+		w.handleSend(c, fd, now)
 	case udClose:
 		w.handleClose(fd)
 	case udProvide:
-		// Buffer provide completion, no action needed
 	}
 }
 
-func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
+func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, now int64) {
 	if c.Res < 0 {
 		// EINVAL with fixed files: ACCEPT_DIRECT not supported on this kernel.
 		// Disable fixed files and retry with regular multishot accept.
@@ -326,6 +326,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 			w.logger.Warn("ACCEPT_DIRECT failed (EINVAL), disabling fixed files",
 				"worker", w.id)
 			w.fixedFiles = false
+			w.prepSend = prepSendPlain
 			if w.listenFD >= 0 {
 				sqe := w.ring.GetSQE()
 				if sqe != nil {
@@ -376,6 +377,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 	// not a real FD. getpeername is not available without a real FD.
 
 	w.conns[newFD] = cs
+	cs.writeFn = w.makeWriteFn(newFD)
 	w.activeConns.Add(1)
 
 	if w.cfg.OnConnect != nil {
@@ -383,7 +385,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int) {
 	}
 
 	if w.cfg.IdleTimeout > 0 {
-		w.tw.ScheduleAt(newFD, w.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
+		w.tw.ScheduleAt(newFD, w.cfg.IdleTimeout, timer.IdleTimeout, now)
 	}
 
 	if w.cfg.Protocol != engine.Auto {
@@ -450,17 +452,16 @@ func (w *Worker) initProtocol(cs *connState) {
 			}
 		}
 	case engine.H2C:
-		writeFn := w.makeWriteFn(cs.fd)
 		cs.h2State = conn.NewH2State(w.handler, conn.H2Config{
 			MaxConcurrentStreams: w.cfg.MaxConcurrentStreams,
 			InitialWindowSize:    w.cfg.InitialWindowSize,
 			MaxFrameSize:         w.cfg.MaxFrameSize,
-		}, writeFn)
+		}, cs.writeFn)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
 
-func (w *Worker) handleRecv(c *completionEntry, fd int) {
+func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	cs, ok := w.conns[fd]
 	if !ok || cs.closing {
 		// If multishot recv with provided buffers, batch-return the buffer
@@ -474,6 +475,19 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 	if c.Res <= 0 {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+		}
+		// ENOBUFS (-105): provided buffer ring exhausted. The multishot recv
+		// is terminated by the kernel but the connection is healthy. Re-arm
+		// multishot recv — buffers will be available after current batch is
+		// returned via PublishBuffers().
+		if c.Res == -105 && w.bufRing != nil {
+			w.bufRing.PublishBuffers()
+			sqe := w.ring.GetSQE()
+			if sqe != nil {
+				prepMultishotRecv(sqe, fd, bufRingGroupID, cs.fixedFile)
+				setSQEUserData(sqe, encodeUserData(udRecv, fd))
+			}
+			return
 		}
 		w.closeConn(fd)
 		return
@@ -493,8 +507,6 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		data = cs.buf[:c.Res]
 	}
 
-	// Cancel idle timer; we're actively receiving data.
-	now := time.Now().UnixNano()
 	if w.cfg.ReadTimeout > 0 {
 		w.tw.ScheduleAt(fd, w.cfg.ReadTimeout, timer.ReadTimeout, now)
 	} else {
@@ -517,14 +529,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 		}
 	}
 
-	writeFn := w.makeWriteFn(fd)
-
 	var processErr error
 	switch cs.protocol {
 	case engine.HTTP1:
-		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, writeFn)
+		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 	case engine.H2C:
-		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, writeFn, conn.H2Config{
+		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, conn.H2Config{
 			MaxConcurrentStreams: w.cfg.MaxConcurrentStreams,
 			InitialWindowSize:    w.cfg.InitialWindowSize,
 			MaxFrameSize:         w.cfg.MaxFrameSize,
@@ -576,7 +586,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int) {
 	}
 }
 
-func (w *Worker) handleSend(c *completionEntry, fd int) {
+func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	cs, ok := w.conns[fd]
 	if !ok {
 		return
@@ -615,7 +625,7 @@ func (w *Worker) handleSend(c *completionEntry, fd int) {
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.removeDirty(cs)
 		if w.cfg.IdleTimeout > 0 {
-			w.tw.ScheduleAt(fd, w.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
+			w.tw.ScheduleAt(fd, w.cfg.IdleTimeout, timer.IdleTimeout, now)
 		}
 	}
 
@@ -701,15 +711,6 @@ func (w *Worker) makeWriteFn(fd int) func([]byte) {
 		// Append to writeBuf — no per-write allocation. The kernel holds
 		// sendBuf (not writeBuf), so appending here is safe.
 		cs.writeBuf = append(cs.writeBuf, data...)
-
-		// Immediate flush for the common single-response case (P10):
-		// If no send is in-flight and connection isn't already dirty, submit
-		// the SEND SQE immediately. This bypasses the dirty list traversal
-		// for the vast majority of requests.
-		if !cs.sending && !cs.dirty {
-			w.flushSend(fd)
-			return
-		}
 		w.markDirty(cs)
 	}
 }

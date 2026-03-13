@@ -47,6 +47,8 @@ func prepRecv(sqePtr unsafe.Pointer, fd int, buf []byte) {
 // prepMultishotRecv prepares a multishot recv that uses provided buffers from
 // the buffer ring identified by groupID. The kernel selects a buffer per
 // completion; the buffer ID is returned in the CQE flags.
+//
+//nolint:unparam // groupID is currently always 0 but kept for multi-ring support
 func prepMultishotRecv(sqePtr unsafe.Pointer, fd int, groupID uint16, fixedFile bool) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[0] = opRECV

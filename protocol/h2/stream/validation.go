@@ -21,7 +21,7 @@ func validateRequestHeaders(headers [][2]string) error {
 		name := h[0]
 		value := h[1]
 
-		if name != strings.ToLower(name) {
+		if !isASCIILower(name) {
 			return fmt.Errorf("header field name must be lowercase: %s", name)
 		}
 
@@ -51,7 +51,7 @@ func validateRequestHeaders(headers [][2]string) error {
 			}
 		} else {
 			seenRegular = true
-			nameLower := strings.ToLower(name)
+			nameLower := name
 
 			switch nameLower {
 			case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
@@ -83,7 +83,7 @@ func validateTrailerHeaders(headers [][2]string) error {
 		name := h[0]
 		value := h[1]
 
-		if name != strings.ToLower(name) {
+		if !isASCIILower(name) {
 			return fmt.Errorf("header field name must be lowercase: %s", name)
 		}
 
@@ -91,7 +91,7 @@ func validateTrailerHeaders(headers [][2]string) error {
 			return fmt.Errorf("pseudo-header not allowed in trailers: %s", name)
 		}
 
-		switch strings.ToLower(name) {
+		switch name {
 		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
 			return fmt.Errorf("connection-specific header not allowed in trailers: %s", name)
 		case "te":
@@ -107,7 +107,7 @@ func validateTrailerHeaders(headers [][2]string) error {
 // validateContentLength validates that the Content-Length header matches the actual body length.
 func validateContentLength(headers [][2]string, bodyLength int) error {
 	for _, h := range headers {
-		if strings.ToLower(h[0]) == "content-length" {
+		if h[0] == "content-length" {
 			var expectedLength int
 			if _, err := fmt.Sscanf(h[1], "%d", &expectedLength); err != nil {
 				return fmt.Errorf("invalid content-length value: %s", h[1])
@@ -170,4 +170,13 @@ func validateStreamState(state State, frameType http2.FrameType, _ bool) error {
 	}
 
 	return nil
+}
+
+func isASCIILower(s string) bool {
+	for i := range len(s) {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return false
+		}
+	}
+	return true
 }

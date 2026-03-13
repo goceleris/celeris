@@ -1,6 +1,7 @@
 package celeris
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -13,10 +14,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
+
+var jsonBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
 
 // Status sets the response status code and returns the Context for chaining.
 // Note: response methods (JSON, Blob, etc.) take their own status code
@@ -29,11 +38,33 @@ func (c *Context) Status(code int) *Context {
 // JSON serializes v as JSON and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) JSON(code int, v any) error {
-	data, err := json.Marshal(v)
+	bp := jsonBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	var err error
+	buf, err = appendJSON(buf, v)
 	if err != nil {
+		*bp = buf
+		jsonBufPool.Put(bp)
 		return err
 	}
-	return c.Blob(code, "application/json", data)
+	err = c.Blob(code, "application/json", buf)
+	*bp = buf
+	jsonBufPool.Put(bp)
+	return err
+}
+
+func appendJSON(buf []byte, v any) ([]byte, error) {
+	w := bytes.NewBuffer(buf)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return buf, err
+	}
+	b := w.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	return b, nil
 }
 
 // XML serializes v as XML and writes it with the given status code.
