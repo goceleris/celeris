@@ -78,7 +78,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// Probe for the highest working tier by test-creating a ring.
 	tier := e.tier
 	for {
-		testRing, err := NewRing(uint32(resolved.SQERingSize), tier.SetupFlags())
+		testRing, err := NewRing(uint32(resolved.SQERingSize), tier.SetupFlags(), tier.SQPollIdle())
 		if err == nil {
 			_ = testRing.Close()
 			break

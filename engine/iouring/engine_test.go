@@ -69,8 +69,8 @@ func TestSelectTierHigh(t *testing.T) {
 	if !tier.SupportsMultishotAccept() {
 		t.Error("expected multishot accept support")
 	}
-	if !tier.SupportsMultishotRecv() {
-		t.Error("expected multishot recv support")
+	if tier.SupportsMultishotRecv() {
+		t.Error("high tier should not support multishot recv (disabled for cache locality)")
 	}
 	// Without FixedFiles in profile, should not support.
 	if tier.SupportsFixedFiles() {
@@ -143,6 +143,8 @@ func TestSelectTierOptional(t *testing.T) {
 }
 
 func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
+	// SQPOLL + DEFER_TASKRUN is incompatible (kernel returns EINVAL).
+	// Optional tier must always use COOP_TASKRUN regardless of DeferTaskrun profile.
 	profile := engine.CapabilityProfile{
 		IOUringTier:     engine.Optional,
 		CoopTaskrun:     true,
@@ -159,11 +161,11 @@ func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
 		t.Fatal("expected non-nil tier")
 	}
 	flags := tier.SetupFlags()
-	if flags&setupDeferTaskrun == 0 {
-		t.Error("expected DEFER_TASKRUN in setup flags")
+	if flags&setupDeferTaskrun != 0 {
+		t.Error("DEFER_TASKRUN must not be set with SQPOLL (incompatible)")
 	}
-	if flags&setupCoopTaskrun != 0 {
-		t.Error("DEFER_TASKRUN should replace COOP_TASKRUN")
+	if flags&setupCoopTaskrun == 0 {
+		t.Error("expected COOP_TASKRUN with SQPOLL")
 	}
 	if flags&setupSQPoll == 0 {
 		t.Error("expected SQPOLL in setup flags")
