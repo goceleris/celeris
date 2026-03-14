@@ -171,7 +171,7 @@ func (r *Ring) GetSQE() unsafe.Pointer {
 	arrayPtr := (*uint32)(unsafe.Add(r.sqArray, uintptr(idx)*4))
 	*arrayPtr = idx
 	sqePtr := unsafe.Add(unsafe.Pointer(&r.sqes[0]), uintptr(idx)*sqeSize)
-	clear(unsafe.Slice((*byte)(sqePtr), sqeSize))
+	*(*[64]byte)(sqePtr) = [64]byte{}
 	if r.singleIssuer {
 		*(*uint32)(r.sqTail) = tail + 1
 	} else {
