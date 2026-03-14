@@ -141,15 +141,18 @@ func (s *Stream) Release() {
 	s.ctx = nil
 	s.cancel = nil
 	s.phase = 0
-	// Drain the channel without blocking.
-	for {
-		select {
-		case <-s.ReceivedWindowUpd:
-		default:
-			goto drained
+	// Drain the channel without blocking. Skip for H1 streams
+	// (channel is never written to) to avoid select dispatch overhead.
+	if len(s.ReceivedWindowUpd) > 0 {
+		for {
+			select {
+			case <-s.ReceivedWindowUpd:
+			default:
+				goto drained
+			}
 		}
+	drained:
 	}
-drained:
 	streamPool.Put(s)
 }
 
