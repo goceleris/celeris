@@ -187,9 +187,8 @@ type optionalTier struct {
 
 func (t *optionalTier) Tier() engine.Tier { return engine.Optional }
 func (t *optionalTier) SetupFlags() uint32 {
-	if t.deferTaskrun {
-		return setupDeferTaskrun | setupSingleIssuer | setupSQPoll
-	}
+	// SQPOLL and DEFER_TASKRUN are incompatible (kernel returns EINVAL).
+	// Always use COOP_TASKRUN with SQPOLL.
 	return setupCoopTaskrun | setupSingleIssuer | setupSQPoll
 }
 func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
