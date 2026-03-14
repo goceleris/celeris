@@ -74,6 +74,11 @@ func NewH1Stream(id uint32) *Stream {
 	s.ID = id
 	s.State = StateIdle
 	s.ctx = context.Background()
+	// Pre-allocate header capacity to avoid allocation in requestToStream.
+	// After the first Release, capacity is preserved from the previous request.
+	if cap(s.Headers) < 16 {
+		s.Headers = make([][2]string, 0, 16)
+	}
 	return s
 }
 

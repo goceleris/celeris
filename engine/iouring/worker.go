@@ -69,6 +69,7 @@ type Worker struct {
 
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
+	h2cfg         conn.H2Config
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -101,6 +102,11 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		acceptPaused: acceptPaused,
 		wake:         make(chan struct{}),
 		ready:        make(chan error, 1),
+		h2cfg: conn.H2Config{
+			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
+			InitialWindowSize:   cfg.InitialWindowSize,
+			MaxFrameSize:        cfg.MaxFrameSize,
+		},
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
@@ -459,11 +465,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			}
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(w.handler, conn.H2Config{
-			MaxConcurrentStreams: w.cfg.MaxConcurrentStreams,
-			InitialWindowSize:    w.cfg.InitialWindowSize,
-			MaxFrameSize:         w.cfg.MaxFrameSize,
-		}, cs.writeFn)
+		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
@@ -539,11 +541,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 	case engine.H2C:
-		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, conn.H2Config{
-			MaxConcurrentStreams: w.cfg.MaxConcurrentStreams,
-			InitialWindowSize:    w.cfg.InitialWindowSize,
-			MaxFrameSize:         w.cfg.MaxFrameSize,
-		})
+		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 	}
 
 	// Batch-return the provided buffer after processing. The data has been

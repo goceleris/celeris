@@ -19,6 +19,10 @@ var ErrHijacked = errors.New("celeris: connection hijacked")
 // maxRequestBodySize is the maximum allowed request body (100 MB), matching H2.
 const maxRequestBodySize = 100 << 20
 
+// errConnectionClose is returned when the client requests Connection: close.
+// Pre-allocated to avoid per-request fmt.Errorf allocation.
+var errConnectionClose = errors.New("connection close requested")
+
 // continue100Response is sent when the client sends "Expect: 100-continue"
 // to signal that the server is willing to accept the request body.
 var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
@@ -82,7 +86,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				return err
 			}
 			if !state.req.KeepAlive {
-				return fmt.Errorf("connection close requested")
+				return errConnectionClose
 			}
 			offset += consumed
 		}
@@ -158,7 +162,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			return err
 		}
 		if !state.req.KeepAlive {
-			return fmt.Errorf("connection close requested")
+			return errConnectionClose
 		}
 	}
 	return nil
@@ -225,6 +229,8 @@ func requestToStream(req *h1.Request, body []byte, remoteAddr string) *stream.St
 		_, _ = s.GetBuf().Write(body)
 	}
 	s.EndStream = true
-	s.SetState(stream.StateHalfClosedRemote)
+	// Direct assignment — no mutex needed. H1 streams are single-threaded
+	// (no manager), and the stream is not yet visible to any handler.
+	s.State = stream.StateHalfClosedRemote
 	return s
 }

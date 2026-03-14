@@ -57,6 +57,7 @@ type Loop struct {
 	tickCounter uint32
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
+	h2cfg     conn.H2Config
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -108,6 +109,11 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		reqCount:    reqCount,
 		activeConns: activeConns,
 		errCount:    errCount,
+		h2cfg: conn.H2Config{
+			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
+			InitialWindowSize:   cfg.InitialWindowSize,
+			MaxFrameSize:        cfg.MaxFrameSize,
+		},
 	}, nil
 }
 
@@ -348,11 +354,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		case engine.HTTP1:
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
 		case engine.H2C:
-			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, conn.H2Config{
-				MaxConcurrentStreams: l.cfg.MaxConcurrentStreams,
-				InitialWindowSize:    l.cfg.InitialWindowSize,
-				MaxFrameSize:         l.cfg.MaxFrameSize,
-			})
+			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
 		}
 
 		l.reqBatch++
@@ -402,11 +404,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			return l.hijackConn(cs.fd)
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(l.handler, conn.H2Config{
-			MaxConcurrentStreams: l.cfg.MaxConcurrentStreams,
-			InitialWindowSize:    l.cfg.InitialWindowSize,
-			MaxFrameSize:         l.cfg.MaxFrameSize,
-		}, cs.writeFn)
+		cs.h2State = conn.NewH2State(l.handler, l.h2cfg, cs.writeFn)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
