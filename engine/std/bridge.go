@@ -23,7 +23,7 @@ type Bridge struct {
 func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.engine.metrics.reqCount.Add(1)
 
-	s := stream.NewStream(1)
+	s := stream.NewH1Stream(1)
 	defer s.Release()
 
 	scheme := "http"
@@ -62,7 +62,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(body) > 0 {
-			_, _ = s.Data.Write(body)
+			_, _ = s.GetBuf().Write(body)
 		}
 	}
 
@@ -95,7 +95,7 @@ type stdResponseWriter struct {
 func (rw *stdResponseWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	h := rw.w.Header()
 	for _, hdr := range headers {
-		h.Add(sanitizeHeaderValue(hdr[0]), sanitizeHeaderValue(hdr[1]))
+		h.Add(hdr[0], hdr[1])
 	}
 
 	if len(body) > 0 && h.Get("Content-Length") == "" {
@@ -140,20 +140,11 @@ func (rw *stdResponseWriter) CloseConn() error {
 func (rw *stdResponseWriter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
 	h := rw.w.Header()
 	for _, hdr := range headers {
-		h.Add(sanitizeHeaderValue(hdr[0]), sanitizeHeaderValue(hdr[1]))
+		h.Add(hdr[0], hdr[1])
 	}
 	rw.w.WriteHeader(status)
 	rw.flushed = true
 	return nil
-}
-
-// sanitizeHeaderValue strips \r and \n to prevent HTTP response splitting.
-// Defense-in-depth: the public API (Context.SetHeader) also strips CRLF.
-func sanitizeHeaderValue(s string) string {
-	if strings.ContainsAny(s, "\r\n") {
-		return strings.NewReplacer("\r", "", "\n", "").Replace(s)
-	}
-	return s
 }
 
 func (rw *stdResponseWriter) Write(_ *stream.Stream, data []byte) error {
