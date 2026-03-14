@@ -28,6 +28,7 @@ type H1State struct {
 	parser     *h1.Parser
 	buffer     bytes.Buffer
 	req        h1.Request
+	rw         h1ResponseAdapter // embedded — reused per request, avoids heap alloc
 	RemoteAddr string
 	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
 }
@@ -77,7 +78,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				break
 			}
 
-			if err := handleH1Request(ctx, &state.req, nil, state.RemoteAddr, handler, write, state.HijackFn); err != nil {
+			if err := handleH1Request(ctx, state, nil, handler, write); err != nil {
 				return err
 			}
 			if !state.req.KeepAlive {
@@ -153,7 +154,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			state.buffer.Next(consumed)
 		}
 
-		if err := handleH1Request(ctx, &state.req, bodyData, state.RemoteAddr, handler, write, state.HijackFn); err != nil {
+		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
 		if !state.req.KeepAlive {
@@ -163,15 +164,21 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	return nil
 }
 
-func handleH1Request(ctx context.Context, req *h1.Request, body []byte, remoteAddr string,
-	handler stream.Handler, write func([]byte), hijackFn func() (net.Conn, error)) error {
+func handleH1Request(ctx context.Context, state *H1State, body []byte,
+	handler stream.Handler, write func([]byte)) error {
 
-	s := requestToStream(req, body, remoteAddr)
+	req := &state.req
+	s := requestToStream(req, body, state.RemoteAddr)
 	defer s.Release()
-	rw := &h1ResponseAdapter{
-		write: write, keepAlive: req.KeepAlive,
-		isHEAD: req.Method == "HEAD", hijackFn: hijackFn,
-	}
+
+	// Reuse the connection-scoped response adapter — avoids a heap allocation
+	// per request. Reset per-request fields; hijackFn/write are stable.
+	rw := &state.rw
+	rw.write = write
+	rw.keepAlive = req.KeepAlive
+	rw.isHEAD = req.Method == "HEAD"
+	rw.hijackFn = state.HijackFn
+	rw.hijacked = false
 	s.ResponseWriter = rw
 
 	if err := handler.HandleStream(ctx, s); err != nil {
