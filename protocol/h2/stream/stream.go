@@ -74,6 +74,11 @@ func NewH1Stream(id uint32) *Stream {
 	s.ID = id
 	s.State = StateIdle
 	s.ctx = context.Background()
+	// Pre-allocate header capacity to avoid allocation in requestToStream.
+	// After the first Release, capacity is preserved from the previous request.
+	if cap(s.Headers) < 16 {
+		s.Headers = make([][2]string, 0, 16)
+	}
 	return s
 }
 
@@ -136,15 +141,18 @@ func (s *Stream) Release() {
 	s.ctx = nil
 	s.cancel = nil
 	s.phase = 0
-	// Drain the channel without blocking.
-	for {
-		select {
-		case <-s.ReceivedWindowUpd:
-		default:
-			goto drained
+	// Drain the channel without blocking. Skip for H1 streams
+	// (channel is never written to) to avoid select dispatch overhead.
+	if len(s.ReceivedWindowUpd) > 0 {
+		for {
+			select {
+			case <-s.ReceivedWindowUpd:
+			default:
+				goto drained
+			}
 		}
+	drained:
 	}
-drained:
 	streamPool.Put(s)
 }
 

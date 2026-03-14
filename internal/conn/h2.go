@@ -62,6 +62,7 @@ type H2State struct {
 	inBuf       *frameBuffer
 	mu          sync.Mutex
 	adapter     *h2ResponseAdapter
+	cfg         H2Config // cached with defaults applied
 }
 
 // SetRemoteAddr sets the remote address on the H2 stream manager so that
@@ -99,15 +100,14 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte)) *H2Sta
 		outBuf:    &outBuf,
 		inBuf:     &inBuf,
 		adapter:   rw,
+		cfg:       cfg,
 	}
 }
 
 // ProcessH2 processes incoming H2 data.
 // On first call, validates the client preface and sends server settings.
 func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handler,
-	write func([]byte), cfg H2Config) error {
-
-	cfg = cfg.withDefaults()
+	write func([]byte), _ H2Config) error {
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -123,9 +123,9 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 		state.initialized = true
 
 		settings := []http2.Setting{
-			{ID: http2.SettingMaxConcurrentStreams, Val: cfg.MaxConcurrentStreams},
-			{ID: http2.SettingInitialWindowSize, Val: cfg.InitialWindowSize},
-			{ID: http2.SettingMaxFrameSize, Val: cfg.MaxFrameSize},
+			{ID: http2.SettingMaxConcurrentStreams, Val: state.cfg.MaxConcurrentStreams},
+			{ID: http2.SettingInitialWindowSize, Val: state.cfg.InitialWindowSize},
+			{ID: http2.SettingMaxFrameSize, Val: state.cfg.MaxFrameSize},
 		}
 		if err := state.writer.WriteSettings(settings...); err != nil {
 			return fmt.Errorf("failed to write server settings: %w", err)

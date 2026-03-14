@@ -94,6 +94,7 @@ type h1ResponseAdapter struct {
 	isHEAD    bool
 	hijackFn  func() (net.Conn, error)
 	hijacked  bool
+	respBuf   []byte // per-connection reusable response buffer, avoids sync.Pool per request
 }
 
 func (a *h1ResponseAdapter) Hijack(_ *stream.Stream) (net.Conn, error) {
@@ -110,30 +111,29 @@ func (a *h1ResponseAdapter) Hijack(_ *stream.Stream) (net.Conn, error) {
 var _ stream.Hijacker = (*h1ResponseAdapter)(nil)
 
 func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
-	pooled := getResponseBuffer()
-	buf := (*pooled)[:0]
+	// Reuse per-connection buffer. This eliminates sync.Pool Get/Put
+	// per response (~40ns). The buffer grows as needed and persists
+	// across requests on the same keep-alive connection.
+	buf := a.respBuf[:0]
 
 	buf = appendStatusLine(buf, status)
 
 	buf = appendCachedDate(buf)
 
+	// Merged loop: check for content-length while appending headers.
 	hasContentLength := false
 	for _, h := range headers {
 		if h[0] == "content-length" {
 			hasContentLength = true
-			break
 		}
+		buf = appendSanitizedHeaderField(buf, h[0])
+		buf = append(buf, ": "...)
+		buf = appendSanitizedHeaderField(buf, h[1])
+		buf = append(buf, crlf...)
 	}
 	if !hasContentLength && len(body) > 0 {
 		buf = append(buf, "content-length: "...)
 		buf = strconv.AppendInt(buf, int64(len(body)), 10)
-		buf = append(buf, crlf...)
-	}
-
-	for _, h := range headers {
-		buf = appendSanitizedHeaderField(buf, h[0])
-		buf = append(buf, ": "...)
-		buf = appendSanitizedHeaderField(buf, h[1])
 		buf = append(buf, crlf...)
 	}
 
@@ -151,8 +151,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	}
 
 	a.write(buf)
-	*pooled = buf
-	putResponseBuffer(pooled)
+	a.respBuf = buf
 	return nil
 }
 
@@ -379,12 +378,9 @@ func statusText(code int) string {
 // h1 streaming support — h1ResponseAdapter implements stream.Streamer.
 
 func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
-	pooled := getResponseBuffer()
-	buf := (*pooled)[:0]
+	buf := a.respBuf[:0]
 	buf = appendStatusLine(buf, status)
-	buf = append(buf, "date: "...)
-	buf = time.Now().UTC().AppendFormat(buf, time.RFC1123)
-	buf = append(buf, crlf...)
+	buf = appendCachedDate(buf)
 	buf = append(buf, "transfer-encoding: chunked\r\n"...)
 	for _, h := range headers {
 		buf = appendSanitizedHeaderField(buf, h[0])
@@ -397,14 +393,14 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 	}
 	buf = append(buf, crlf...)
 	a.write(buf)
-	*pooled = buf
-	putResponseBuffer(pooled)
+	a.respBuf = buf
 	return nil
 }
 
 func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	// Chunked transfer encoding: hex(len)\r\n data \r\n
-	chunk := strconv.AppendInt(nil, int64(len(data)), 16)
+	var hexBuf [20]byte
+	chunk := strconv.AppendInt(hexBuf[:0], int64(len(data)), 16)
 	chunk = append(chunk, '\r', '\n')
 	chunk = append(chunk, data...)
 	chunk = append(chunk, crlf...)
@@ -485,21 +481,18 @@ func appendSanitizedHeaderField(buf []byte, s string) []byte {
 	return append(buf, s...)
 }
 
-func buildErrorResponse(status int, message string) []byte {
-	body := []byte(message)
+func writeErrorResponse(write func([]byte), status int, message string) {
 	pooled := getResponseBuffer()
 	buf := (*pooled)[:0]
 	buf = appendStatusLine(buf, status)
 	buf = append(buf, "content-type: text/plain; charset=utf-8\r\n"...)
 	buf = append(buf, "content-length: "...)
-	buf = strconv.AppendInt(buf, int64(len(body)), 10)
+	buf = strconv.AppendInt(buf, int64(len(message)), 10)
 	buf = append(buf, crlf...)
 	buf = append(buf, "connection: close\r\n"...)
 	buf = append(buf, crlf...)
-	buf = append(buf, body...)
-	result := make([]byte, len(buf))
-	copy(result, buf)
+	buf = append(buf, message...)
+	write(buf)
 	*pooled = buf
 	putResponseBuffer(pooled)
-	return result
 }

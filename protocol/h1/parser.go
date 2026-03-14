@@ -191,7 +191,9 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 		return nil
 	}
 	if asciiEqualFold(rawName, "Host") {
-		req.Host = string(rawValue)
+		// Zero-copy: Host string shares the parser buffer memory.
+		// Safe because H1 handlers run synchronously before the buffer is reused.
+		req.Host = UnsafeString(rawValue)
 		return nil
 	}
 	if asciiEqualFold(rawName, "Content-Length") {

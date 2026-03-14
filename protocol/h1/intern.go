@@ -1,23 +1,12 @@
 package h1
 
 import (
-	"bytes"
 	"strings"
 	"unsafe"
 )
 
 var (
-	bGET     = []byte("GET")
-	bPOST    = []byte("POST")
-	bPUT     = []byte("PUT")
-	bDELETE  = []byte("DELETE")
-	bPATCH   = []byte("PATCH")
-	bHEAD    = []byte("HEAD")
-	bOPTIONS = []byte("OPTIONS")
-	bHTTP11  = []byte("HTTP/1.1")
-	bHTTP10  = []byte("HTTP/1.0")
-	bRoot    = []byte("/")
-	bCRLF    = []byte("\r\n")
+	bCRLF = []byte("\r\n")
 )
 
 var (
@@ -34,42 +23,56 @@ var (
 )
 
 func internMethod(b []byte) string {
-	switch {
-	case bytes.Equal(b, bGET):
-		return sGET
-	case bytes.Equal(b, bPOST):
-		return sPOST
-	case bytes.Equal(b, bPUT):
-		return sPUT
-	case bytes.Equal(b, bDELETE):
-		return sDELETE
-	case bytes.Equal(b, bPATCH):
-		return sPATCH
-	case bytes.Equal(b, bHEAD):
-		return sHEAD
-	case bytes.Equal(b, bOPTIONS):
-		return sOPTIONS
-	default:
-		return string(b)
+	switch len(b) {
+	case 3:
+		if b[0] == 'G' && b[1] == 'E' && b[2] == 'T' {
+			return sGET
+		}
+		if b[0] == 'P' && b[1] == 'U' && b[2] == 'T' {
+			return sPUT
+		}
+	case 4:
+		if b[0] == 'P' && b[1] == 'O' && b[2] == 'S' && b[3] == 'T' {
+			return sPOST
+		}
+		if b[0] == 'H' && b[1] == 'E' && b[2] == 'A' && b[3] == 'D' {
+			return sHEAD
+		}
+	case 5:
+		if b[0] == 'P' && b[1] == 'A' && b[2] == 'T' && b[3] == 'C' && b[4] == 'H' {
+			return sPATCH
+		}
+	case 6:
+		if b[0] == 'D' && b[1] == 'E' && b[2] == 'L' && b[3] == 'E' && b[4] == 'T' && b[5] == 'E' {
+			return sDELETE
+		}
+	case 7:
+		if b[0] == 'O' && b[1] == 'P' && b[2] == 'T' && b[3] == 'I' && b[4] == 'O' && b[5] == 'N' && b[6] == 'S' {
+			return sOPTIONS
+		}
 	}
+	return UnsafeString(b)
 }
 
 func internVersion(b []byte) string {
-	switch {
-	case bytes.Equal(b, bHTTP11):
-		return sHTTP11
-	case bytes.Equal(b, bHTTP10):
-		return sHTTP10
-	default:
-		return string(b)
+	if len(b) == 8 && b[0] == 'H' && b[5] == '1' && b[6] == '.' {
+		if b[7] == '1' {
+			return sHTTP11
+		}
+		if b[7] == '0' {
+			return sHTTP10
+		}
 	}
+	return UnsafeString(b)
 }
 
 func internPath(b []byte) string {
-	if bytes.Equal(b, bRoot) {
+	if len(b) == 1 && b[0] == '/' {
 		return sRoot
 	}
-	return string(b)
+	// Zero-copy: path string shares the parser buffer memory.
+	// Safe because H1 handlers run synchronously before the buffer is reused.
+	return UnsafeString(b)
 }
 
 // LowerInPlace lowercases ASCII bytes in-place.
