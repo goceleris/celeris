@@ -20,7 +20,6 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
-	"github.com/goceleris/celeris/internal/timer"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -48,7 +47,6 @@ type Loop struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
-	tw          *timer.Wheel
 	tickCounter uint32
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
@@ -112,10 +110,6 @@ func (l *Loop) run(ctx context.Context) {
 
 	_ = platform.PinToCPU(l.cpuID)
 
-	l.tw = timer.New(func(fd int, _ timer.TimeoutKind) {
-		l.closeConn(fd)
-	})
-
 	activeTimeoutMs := int(l.objective.EpollTimeout.Milliseconds())
 	if activeTimeoutMs <= 0 {
 		activeTimeoutMs = 1
@@ -170,19 +164,20 @@ func (l *Loop) run(ctx context.Context) {
 			continue
 		}
 
+		now := time.Now().UnixNano()
 		for i := range n {
 			ev := &l.events[i]
 			fd := int(ev.Fd)
 
 			if fd == l.listenFD && l.listenFD >= 0 {
-				l.acceptAll(ctx)
+				l.acceptAll(ctx, now)
 				continue
 			}
 
 			// Process EPOLLIN before EPOLLHUP: a peer may send data and
 			// immediately close, producing both flags in one event.
 			if ev.Events&unix.EPOLLIN != 0 {
-				l.drainRead(fd)
+				l.drainRead(fd, now)
 			}
 
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
@@ -192,7 +187,6 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
-		now := time.Now().UnixNano()
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			err := flushWrites(cs)
@@ -202,19 +196,15 @@ func (l *Loop) run(ctx context.Context) {
 			} else if len(cs.writeBuf) == 0 {
 				cs.pendingBytes = 0
 				l.removeDirty(cs)
-				if l.cfg.IdleTimeout > 0 {
-					l.tw.ScheduleAt(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout, now)
-				}
 			}
 			// else: partial write, keep on dirty list for next iteration
 			cs = next
 		}
 
-		// Throttle timer wheel tick: 100ms granularity doesn't need per-iteration
-		// calls. Tick every 1024 iterations to amortize time.Now() cost (P1).
+		// Check connection timeouts every 1024 iterations (~100ms).
 		l.tickCounter++
 		if l.tickCounter&0x3FF == 0 {
-			l.tw.Tick()
+			l.checkTimeouts()
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
@@ -239,7 +229,7 @@ func (l *Loop) run(ctx context.Context) {
 	}
 }
 
-func (l *Loop) acceptAll(ctx context.Context) {
+func (l *Loop) acceptAll(ctx context.Context, now int64) {
 	for i := 0; i < 64; i++ {
 		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
@@ -271,9 +261,7 @@ func (l *Loop) acceptAll(ctx context.Context) {
 			l.cfg.OnConnect(cs.remoteAddr)
 		}
 
-		if l.cfg.IdleTimeout > 0 {
-			l.tw.ScheduleAt(newFD, l.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
-		}
+		cs.lastActivity = now
 
 		if l.cfg.Protocol != engine.Auto {
 			cs.protocol = l.cfg.Protocol
@@ -283,7 +271,7 @@ func (l *Loop) acceptAll(ctx context.Context) {
 	}
 }
 
-func (l *Loop) drainRead(fd int) {
+func (l *Loop) drainRead(fd int, now int64) {
 	cs, ok := l.conns[fd]
 	if !ok {
 		return
@@ -307,13 +295,7 @@ func (l *Loop) drainRead(fd int) {
 
 		data := cs.buf[:n]
 
-		// Cancel idle timer; schedule read timeout while processing request.
-		now := time.Now().UnixNano()
-		if l.cfg.ReadTimeout > 0 {
-			l.tw.ScheduleAt(fd, l.cfg.ReadTimeout, timer.ReadTimeout, now)
-		} else {
-			l.tw.Cancel(fd)
-		}
+		cs.lastActivity = now
 
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)
@@ -345,13 +327,7 @@ func (l *Loop) drainRead(fd int) {
 
 		l.reqCount.Add(1)
 
-		// Schedule write timeout if response data is pending.
-		// Reuse the timestamp captured above (P9).
-		if l.cfg.WriteTimeout > 0 && len(cs.writeBuf) > 0 {
-			l.tw.ScheduleAt(fd, l.cfg.WriteTimeout, timer.WriteTimeout, now)
-		} else if l.cfg.IdleTimeout > 0 {
-			l.tw.ScheduleAt(fd, l.cfg.IdleTimeout, timer.IdleTimeout, now)
-		}
+		// lastActivity already set above; timeout checked in checkTimeouts.
 
 		if processErr != nil {
 			if errors.Is(processErr, conn.ErrHijacked) {
@@ -376,7 +352,6 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	if !ok {
 		return nil, errors.New("celeris: connection not found")
 	}
-	l.tw.Cancel(fd)
 	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	delete(l.conns, fd)
@@ -446,13 +421,32 @@ func (l *Loop) removeDirty(cs *connState) {
 	cs.dirtyPrev = nil
 }
 
+// checkTimeouts scans active connections and closes any that have exceeded
+// their configured timeout. Called every 1024 iterations (~100ms).
+func (l *Loop) checkTimeouts() {
+	now := time.Now().UnixNano()
+	for fd, cs := range l.conns {
+		elapsed := time.Duration(now - cs.lastActivity)
+		if cs.dirty {
+			if l.cfg.WriteTimeout > 0 && elapsed > l.cfg.WriteTimeout {
+				l.closeConn(fd)
+			}
+		} else {
+			if l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout {
+				l.closeConn(fd)
+			} else if l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout {
+				l.closeConn(fd)
+			}
+		}
+	}
+}
+
 func (l *Loop) closeConn(fd int) {
 	cs, ok := l.conns[fd]
 	if !ok {
 		return
 	}
 	l.removeDirty(cs)
-	l.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}

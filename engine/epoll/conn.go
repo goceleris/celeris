@@ -30,6 +30,9 @@ type connState struct {
 	dirtyNext    *connState // 8 bytes: intrusive doubly-linked dirty list
 	dirtyPrev    *connState // 8 bytes
 
+	// Warm — timeout tracking:
+	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
+
 	// Cold — third cache line:
 	h1State    *conn.H1State
 	h2State    *conn.H2State
