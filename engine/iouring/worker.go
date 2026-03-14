@@ -222,11 +222,13 @@ func (w *Worker) run(ctx context.Context) {
 			cqHead, cqTail = w.ring.BeginCQ()
 		}
 
-		now := time.Now().UnixNano()
-		for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
-			entry := w.ring.CQEAt(cqHead)
-			w.processCQE(ctx, entry, now)
-			cqHead++
+		if cqHead != cqTail {
+			now := time.Now().UnixNano()
+			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
+				entry := w.ring.CQEAt(cqHead)
+				w.processCQE(ctx, entry, now)
+				cqHead++
+			}
 		}
 		w.ring.EndCQ(cqHead)
 
@@ -306,14 +308,14 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	fd := decodeFD(c.UserData)
 
 	switch op {
-	case udAccept:
-		w.handleAccept(ctx, c, fd, now)
 	case udRecv:
 		w.handleRecv(c, fd, now)
 	case udSend:
 		w.handleSend(c, fd, now)
 	case udClose:
 		w.handleClose(fd)
+	case udAccept:
+		w.handleAccept(ctx, c, fd, now)
 	case udProvide:
 	}
 }

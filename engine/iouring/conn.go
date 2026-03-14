@@ -43,9 +43,11 @@ type connState struct {
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {
 	childCtx, cancel := context.WithCancel(ctx)
 	cs := &connState{
-		fd:     fd,
-		ctx:    childCtx,
-		cancel: cancel,
+		fd:       fd,
+		writeBuf: make([]byte, 0, 4096),
+		sendBuf:  make([]byte, 0, 4096),
+		ctx:      childCtx,
+		cancel:   cancel,
 	}
 	if bufSize > 0 {
 		cs.buf = make([]byte, bufSize)
