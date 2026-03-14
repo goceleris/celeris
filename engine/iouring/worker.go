@@ -44,7 +44,10 @@ type Worker struct {
 	listenFD     int
 	tier         TierStrategy
 	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
-	conns        map[int]*connState
+	sqpoll       bool // true when SQPOLL is active (kernel submits SQEs)
+	conns        []*connState
+	connCount    int // number of active connections (local, for draining check)
+	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
 	handler      stream.Handler
 	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
@@ -61,6 +64,7 @@ type Worker struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
+	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter uint32
 
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
@@ -84,7 +88,8 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		cpuID:        cpuID,
 		listenFD:     listenFD,
 		tier:         tier,
-		conns:        make(map[int]*connState),
+		sqpoll:       tier.SQPollIdle() > 0,
+		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
 		objective:    objective,
 		resolved:     resolved,
@@ -114,7 +119,7 @@ func (w *Worker) run(ctx context.Context) {
 
 	// Create ring after LockOSThread — SINGLE_ISSUER requires all ring
 	// operations from the same OS thread.
-	ring, err := NewRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags())
+	ring, err := NewRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle())
 	if err != nil {
 		w.ready <- fmt.Errorf("worker %d ring setup: %w", w.id, err)
 		return
@@ -225,6 +230,14 @@ func (w *Worker) run(ctx context.Context) {
 		}
 		w.ring.EndCQ(cqHead)
 
+		// Flush batched request count to the shared atomic counter. This
+		// replaces per-request atomic.Add with one atomic per CQE batch,
+		// eliminating cache-line bouncing under multi-worker contention.
+		if w.reqBatch > 0 {
+			w.reqCount.Add(w.reqBatch)
+			w.reqBatch = 0
+		}
+
 		// Single atomic publish for all batched buffer returns (P0).
 		if w.hasBufReturns {
 			w.bufRing.PublishBuffers()
@@ -244,10 +257,13 @@ func (w *Worker) run(ctx context.Context) {
 			cs = next
 		}
 
-		// Submit SEND SQEs immediately — do not defer to next iteration.
-		// Deferred submission adds ~1-5µs per response, which compounds to
-		// ~10% throughput loss under H1 keep-alive workloads.
-		if w.ring.Pending() > 0 {
+		// Submit SEND SQEs. With SQPOLL, the kernel thread polls the SQ ring
+		// automatically — no Submit syscall needed. Without SQPOLL, submit
+		// immediately to avoid deferring SENDs to the next iteration (~10%
+		// throughput loss under H1 keep-alive).
+		if w.sqpoll {
+			w.ring.ClearPending()
+		} else if w.ring.Pending() > 0 {
 			if _, err := w.ring.Submit(); err != nil {
 				w.logger.Error("submit failed", "worker", w.id, "err", err)
 			}
@@ -264,7 +280,7 @@ func (w *Worker) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
-		if w.listenFD < 0 && len(w.conns) == 0 && w.acceptPaused.Load() {
+		if w.listenFD < 0 && w.connCount == 0 && w.acceptPaused.Load() {
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() {
 				w.wakeMu.Unlock()
@@ -329,6 +345,12 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	newFD := int(c.Res)
 	isFixedFile := w.fixedFiles
 
+	// Bounds check: reject FDs outside the flat conn array.
+	if newFD < 0 || newFD >= len(w.conns) {
+		w.errCount.Add(1)
+		return
+	}
+
 	// Don't discard accepted connections even when paused — the TCP handshake
 	// already completed and the client expects a response. The listen socket
 	// will be closed within one event loop iteration to prevent further accepts.
@@ -358,6 +380,10 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	// not a real FD. getpeername is not available without a real FD.
 
 	w.conns[newFD] = cs
+	w.connCount++
+	if newFD > w.maxFD {
+		w.maxFD = newFD
+	}
 	cs.writeFn = w.makeWriteFn(cs)
 	w.activeConns.Add(1)
 
@@ -400,8 +426,8 @@ func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
 }
 
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
-	cs, ok := w.conns[fd]
-	if !ok {
+	cs := w.conns[fd]
+	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
 	if cs.fixedFile {
@@ -411,7 +437,8 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
 	cs.cancel()
-	delete(w.conns, fd)
+	w.conns[fd] = nil
+	w.connCount--
 	w.activeConns.Add(-1)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
@@ -440,8 +467,8 @@ func (w *Worker) initProtocol(cs *connState) {
 }
 
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
-	cs, ok := w.conns[fd]
-	if !ok || cs.closing {
+	cs := w.conns[fd]
+	if cs == nil || cs.closing {
 		// If multishot recv with provided buffers, batch-return the buffer
 		// even for unknown/closing connections to prevent buffer leak (P0).
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
@@ -525,7 +552,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		w.hasBufReturns = true
 	}
 
-	w.reqCount.Add(1)
+	w.reqBatch++
 
 	// lastActivity already set above; timeout checked in checkTimeouts.
 
@@ -555,8 +582,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 }
 
 func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
-	cs, ok := w.conns[fd]
-	if !ok {
+	cs := w.conns[fd]
+	if cs == nil {
 		return
 	}
 
@@ -602,13 +629,15 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 func (w *Worker) handleClose(fd int) {
 	// finishClose already removed from conns and decremented activeConns.
 	// With CQE_SKIP_SUCCESS, this handler may not fire for successful close.
-	// Kept as a safety guard for error CQEs.
-	delete(w.conns, fd)
+	// Clear the slot as a safety guard for error CQEs.
+	if fd >= 0 && fd < len(w.conns) {
+		w.conns[fd] = nil
+	}
 }
 
 func (w *Worker) closeConn(fd int) {
-	cs, ok := w.conns[fd]
-	if !ok {
+	cs := w.conns[fd]
+	if cs == nil {
 		return
 	}
 	w.removeDirty(cs)
@@ -630,7 +659,8 @@ func (w *Worker) closeConn(fd int) {
 
 func (w *Worker) finishClose(fd int) {
 	cs := w.conns[fd]
-	delete(w.conns, fd)
+	w.conns[fd] = nil
+	w.connCount--
 	w.activeConns.Add(-1)
 
 	if w.cfg.OnDisconnect != nil && cs != nil {
@@ -798,8 +828,9 @@ func (w *Worker) flushSend(cs *connState) {
 // connState and scan here.
 func (w *Worker) checkTimeouts() {
 	now := time.Now().UnixNano()
-	for fd, cs := range w.conns {
-		if cs.closing {
+	for fd := 0; fd <= w.maxFD; fd++ {
+		cs := w.conns[fd]
+		if cs == nil || cs.closing {
 			continue
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
@@ -818,7 +849,11 @@ func (w *Worker) checkTimeouts() {
 }
 
 func (w *Worker) shutdown() {
-	for fd, cs := range w.conns {
+	for fd := 0; fd <= w.maxFD; fd++ {
+		cs := w.conns[fd]
+		if cs == nil {
+			continue
+		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
