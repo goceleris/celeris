@@ -54,7 +54,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			state.req.Reset()
 			consumed, err := state.parser.ParseRequest(&state.req)
 			if err != nil {
-				write(buildErrorResponse(400, "Bad Request"))
+				writeErrorResponse(write, 400, "Bad Request")
 				return err
 			}
 			if consumed == 0 {
@@ -96,7 +96,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		state.req.Reset()
 		consumed, err := state.parser.ParseRequest(&state.req)
 		if err != nil {
-			write(buildErrorResponse(400, "Bad Request"))
+			writeErrorResponse(write, 400, "Bad Request")
 			return err
 		}
 		if consumed == 0 {
@@ -133,7 +133,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				state.parser.Reset(state.buffer.Bytes())
 				chunk, chunkConsumed, cerr := state.parser.ParseChunkedBody()
 				if cerr != nil {
-					write(buildErrorResponse(400, "Invalid chunked encoding"))
+					writeErrorResponse(write, 400, "Invalid chunked encoding")
 					return cerr
 				}
 				if chunkConsumed == 0 {
@@ -145,7 +145,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				}
 				chunks.Write(chunk)
 				if chunks.Len() > maxRequestBodySize {
-					write(buildErrorResponse(413, "Request body too large"))
+					writeErrorResponse(write, 413, "Request body too large")
 					return fmt.Errorf("chunked body exceeds %d byte limit", maxRequestBodySize)
 				}
 			}
@@ -185,7 +185,7 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 		if rw.hijacked {
 			return ErrHijacked
 		}
-		write(buildErrorResponse(500, "Internal Server Error"))
+		writeErrorResponse(write, 500, "Internal Server Error")
 		return err
 	}
 	if rw.hijacked {

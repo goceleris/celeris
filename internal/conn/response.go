@@ -404,7 +404,8 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 
 func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
 	// Chunked transfer encoding: hex(len)\r\n data \r\n
-	chunk := strconv.AppendInt(nil, int64(len(data)), 16)
+	var hexBuf [20]byte
+	chunk := strconv.AppendInt(hexBuf[:0], int64(len(data)), 16)
 	chunk = append(chunk, '\r', '\n')
 	chunk = append(chunk, data...)
 	chunk = append(chunk, crlf...)
@@ -485,21 +486,18 @@ func appendSanitizedHeaderField(buf []byte, s string) []byte {
 	return append(buf, s...)
 }
 
-func buildErrorResponse(status int, message string) []byte {
-	body := []byte(message)
+func writeErrorResponse(write func([]byte), status int, message string) {
 	pooled := getResponseBuffer()
 	buf := (*pooled)[:0]
 	buf = appendStatusLine(buf, status)
 	buf = append(buf, "content-type: text/plain; charset=utf-8\r\n"...)
 	buf = append(buf, "content-length: "...)
-	buf = strconv.AppendInt(buf, int64(len(body)), 10)
+	buf = strconv.AppendInt(buf, int64(len(message)), 10)
 	buf = append(buf, crlf...)
 	buf = append(buf, "connection: close\r\n"...)
 	buf = append(buf, crlf...)
-	buf = append(buf, body...)
-	result := make([]byte, len(buf))
-	copy(result, buf)
+	buf = append(buf, message...)
+	write(buf)
 	*pooled = buf
 	putResponseBuffer(pooled)
-	return result
 }
