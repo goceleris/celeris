@@ -82,10 +82,12 @@ type Ring struct {
 	cqesBase     unsafe.Pointer
 }
 
-// NewRing creates a new io_uring instance.
-func NewRing(entries uint32, flags uint32) (*Ring, error) {
+// NewRing creates a new io_uring instance. sqPollIdle sets the kernel
+// SQPOLL thread idle timeout in milliseconds (only used with IORING_SETUP_SQPOLL).
+func NewRing(entries uint32, flags uint32, sqPollIdle uint32) (*Ring, error) {
 	var params ioUringParams
 	params.flags = flags
+	params.sqThreadIdle = sqPollIdle
 
 	fd, _, errno := unix.Syscall(
 		uintptr(sysIOUringSetup),
@@ -265,6 +267,10 @@ func (r *Ring) SubmitAndWaitTimeout(timeout time.Duration) error {
 
 // Pending returns the number of SQEs submitted but not yet sent to the kernel.
 func (r *Ring) Pending() uint32 { return r.pending }
+
+// ClearPending resets the pending counter without issuing a syscall. Used with
+// SQPOLL where the kernel thread submits SQEs automatically.
+func (r *Ring) ClearPending() { r.pending = 0 }
 
 // BeginCQ returns the current CQ head and tail for batch processing.
 // Under SINGLE_ISSUER, cqHead is a plain load (we own it).
