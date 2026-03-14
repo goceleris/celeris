@@ -372,6 +372,23 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 
+		// Inline flush: send response immediately after the handler returns,
+		// before the next unix.Read (which returns EAGAIN on non-pipelined
+		// connections). This sends the response one event-batch earlier than
+		// the dirty list pass, reducing per-request latency by up to N×2µs
+		// (where N is the number of other events in the same epoll_wait batch).
+		if len(cs.writeBuf) > 0 {
+			if fErr := flushWrites(cs); fErr != nil {
+				l.removeDirty(cs)
+				l.closeConn(fd)
+				return
+			}
+			if len(cs.writeBuf) == 0 {
+				cs.pendingBytes = 0
+				l.removeDirty(cs)
+			}
+		}
+
 		if cs.pendingBytes > maxPendingBytes {
 			l.closeConn(fd)
 			return
