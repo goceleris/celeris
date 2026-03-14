@@ -120,8 +120,12 @@ func (t *midTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 }
 
 // highTier: kernel 5.19+, adds SINGLE_ISSUER, multishot accept, provided buffers.
-// With kernel 6.1+: adds DEFER_TASKRUN (replaces COOP_TASKRUN), fixed files,
-// and multishot recv with ring-mapped provided buffers.
+// With kernel 6.1+: adds DEFER_TASKRUN (replaces COOP_TASKRUN), fixed files.
+//
+// Multishot recv with ring-mapped provided buffers is intentionally disabled:
+// provided buffers scatter data across 4096 mmap'd pages, destroying cache
+// locality for keep-alive connections. Per-connection buffers (single-shot recv)
+// reuse the same cache lines per connection, yielding ~10% higher throughput.
 type highTier struct {
 	deferTaskrun bool
 	fixedFiles   bool
@@ -136,7 +140,7 @@ func (t *highTier) SetupFlags() uint32 {
 }
 func (t *highTier) SupportsProvidedBuffers() bool { return true }
 func (t *highTier) SupportsMultishotAccept() bool { return true }
-func (t *highTier) SupportsMultishotRecv() bool   { return true }
+func (t *highTier) SupportsMultishotRecv() bool   { return false }
 func (t *highTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *highTier) SQPollIdle() uint32            { return 0 }
 
@@ -174,8 +178,7 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }
 
-// optionalTier: kernel 6.0+, adds SQPOLL. With 6.1+: DEFER_TASKRUN, fixed files,
-// multishot recv.
+// optionalTier: kernel 6.0+, adds SQPOLL. With 6.1+: DEFER_TASKRUN, fixed files.
 type optionalTier struct {
 	sqPollIdle   uint32
 	deferTaskrun bool
@@ -191,7 +194,7 @@ func (t *optionalTier) SetupFlags() uint32 {
 }
 func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
 func (t *optionalTier) SupportsMultishotAccept() bool { return true }
-func (t *optionalTier) SupportsMultishotRecv() bool   { return true }
+func (t *optionalTier) SupportsMultishotRecv() bool   { return false }
 func (t *optionalTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *optionalTier) SQPollIdle() uint32            { return t.sqPollIdle }
 
