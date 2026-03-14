@@ -25,6 +25,10 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
+// connTableSize is the number of slots in the flat connection array.
+// Must accommodate the maximum number of concurrent connections per worker.
+const connTableSize = 65536
+
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id           int
@@ -32,7 +36,9 @@ type Loop struct {
 	epollFD      int
 	listenFD     int
 	events       []unix.EpollEvent
-	conns        map[int]*connState
+	conns        []*connState
+	connCount    int // number of active connections (local, for draining check)
+	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
 	handler      stream.Handler
 	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
@@ -47,6 +53,7 @@ type Loop struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
+	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter uint32
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
@@ -83,7 +90,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		epollFD:      epollFD,
 		listenFD:     listenFD,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
-		conns:        make(map[int]*connState),
+		conns:        make([]*connState, connTableSize),
 		handler:      handler,
 		objective:    objective,
 		resolved:     resolved,
@@ -181,7 +188,7 @@ func (l *Loop) run(ctx context.Context) {
 			}
 
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
-				if _, ok := l.conns[fd]; ok {
+				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
 				}
 			}
@@ -201,6 +208,15 @@ func (l *Loop) run(ctx context.Context) {
 			cs = next
 		}
 
+		// Flush batched request count to the shared atomic counter. This
+		// replaces per-request atomic.Add with one atomic per event loop
+		// iteration, eliminating cache-line bouncing under multi-worker
+		// contention.
+		if l.reqBatch > 0 {
+			l.reqCount.Add(l.reqBatch)
+			l.reqBatch = 0
+		}
+
 		// Check connection timeouts every 1024 iterations (~100ms).
 		l.tickCounter++
 		if l.tickCounter&0x3FF == 0 {
@@ -208,7 +224,7 @@ func (l *Loop) run(ctx context.Context) {
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
-		if l.listenFD < 0 && len(l.conns) == 0 && l.acceptPaused.Load() {
+		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() {
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() {
 				l.wakeMu.Unlock()
@@ -240,6 +256,13 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 			return
 		}
 
+		// Bounds check: reject FDs outside the flat conn array.
+		if newFD < 0 || newFD >= len(l.conns) {
+			_ = unix.Close(newFD)
+			l.errCount.Add(1)
+			continue
+		}
+
 		_ = sockopts.ApplyFD(newFD, l.sockOpts)
 
 		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &unix.EpollEvent{
@@ -254,6 +277,10 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 		cs := newConnState(ctx, newFD, l.resolved.BufferSize)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
+		l.connCount++
+		if newFD > l.maxFD {
+			l.maxFD = newFD
+		}
 		cs.writeFn = l.makeWriteFn(cs)
 		l.activeConns.Add(1)
 
@@ -272,8 +299,11 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 }
 
 func (l *Loop) drainRead(fd int, now int64) {
-	cs, ok := l.conns[fd]
-	if !ok {
+	if fd < 0 || fd >= len(l.conns) {
+		return
+	}
+	cs := l.conns[fd]
+	if cs == nil {
 		return
 	}
 
@@ -325,7 +355,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			})
 		}
 
-		l.reqCount.Add(1)
+		l.reqBatch++
 
 		// lastActivity already set above; timeout checked in checkTimeouts.
 
@@ -348,13 +378,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 }
 
 func (l *Loop) hijackConn(fd int) (net.Conn, error) {
-	cs, ok := l.conns[fd]
-	if !ok {
+	cs := l.conns[fd]
+	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
 	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	delete(l.conns, fd)
+	l.conns[fd] = nil
+	l.connCount--
 	l.activeConns.Add(-1)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
@@ -425,7 +456,11 @@ func (l *Loop) removeDirty(cs *connState) {
 // their configured timeout. Called every 1024 iterations (~100ms).
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
-	for fd, cs := range l.conns {
+	for fd := 0; fd <= l.maxFD; fd++ {
+		cs := l.conns[fd]
+		if cs == nil {
+			continue
+		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty {
 			if l.cfg.WriteTimeout > 0 && elapsed > l.cfg.WriteTimeout {
@@ -442,8 +477,8 @@ func (l *Loop) checkTimeouts() {
 }
 
 func (l *Loop) closeConn(fd int) {
-	cs, ok := l.conns[fd]
-	if !ok {
+	cs := l.conns[fd]
+	if cs == nil {
 		return
 	}
 	l.removeDirty(cs)
@@ -455,7 +490,8 @@ func (l *Loop) closeConn(fd int) {
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
 	_ = unix.Close(fd)
-	delete(l.conns, fd)
+	l.conns[fd] = nil
+	l.connCount--
 	l.activeConns.Add(-1)
 
 	if l.cfg.OnDisconnect != nil {
@@ -464,7 +500,11 @@ func (l *Loop) closeConn(fd int) {
 }
 
 func (l *Loop) shutdown() {
-	for fd, cs := range l.conns {
+	for fd := 0; fd <= l.maxFD; fd++ {
+		cs := l.conns[fd]
+		if cs == nil {
+			continue
+		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
@@ -480,7 +520,7 @@ func (l *Loop) shutdown() {
 // drainRecvBuffer reads and discards any data in the socket receive buffer.
 // This prevents close() from sending RST (which discards unsent data like GOAWAY).
 func drainRecvBuffer(fd int) {
-	var buf [512]byte
+	var buf [4096]byte
 	for {
 		n, _ := unix.Read(fd, buf[:])
 		if n <= 0 {
