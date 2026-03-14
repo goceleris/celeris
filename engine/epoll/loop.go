@@ -111,8 +111,8 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		errCount:    errCount,
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
-			InitialWindowSize:   cfg.InitialWindowSize,
-			MaxFrameSize:        cfg.MaxFrameSize,
+			InitialWindowSize:    cfg.InitialWindowSize,
+			MaxFrameSize:         cfg.MaxFrameSize,
 		},
 	}, nil
 }

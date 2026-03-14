@@ -104,8 +104,8 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		ready:        make(chan error, 1),
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
-			InitialWindowSize:   cfg.InitialWindowSize,
-			MaxFrameSize:        cfg.MaxFrameSize,
+			InitialWindowSize:    cfg.InitialWindowSize,
+			MaxFrameSize:         cfg.MaxFrameSize,
 		},
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
@@ -184,7 +184,7 @@ func (w *Worker) run(ctx context.Context) {
 				cancelNow := time.Now().UnixNano()
 				cqH, cqT := w.ring.BeginCQ()
 				for cqH != cqT {
-					entry := w.ring.CQEAt(cqH)
+					entry := w.ring.cqeAt(cqH)
 					if entry.UserData != 0 {
 						w.processCQE(ctx, entry, cancelNow)
 					}
@@ -231,7 +231,7 @@ func (w *Worker) run(ctx context.Context) {
 		if cqHead != cqTail {
 			now := time.Now().UnixNano()
 			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
-				entry := w.ring.CQEAt(cqHead)
+				entry := w.ring.cqeAt(cqHead)
 				w.processCQE(ctx, entry, now)
 				cqHead++
 			}

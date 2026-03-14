@@ -284,8 +284,8 @@ func (r *Ring) BeginCQ() (head, tail uint32) {
 	return
 }
 
-// CQEAt returns the CQE at the given head position.
-func (r *Ring) CQEAt(head uint32) *completionEntry {
+// cqeAt returns the CQE at the given head position.
+func (r *Ring) cqeAt(head uint32) *completionEntry {
 	idx := head & r.cqMask
 	return (*completionEntry)(unsafe.Add(r.cqesBase, uintptr(idx)*cqeSize))
 }
