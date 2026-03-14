@@ -170,7 +170,11 @@ func (r *Ring) GetSQE() unsafe.Pointer {
 	*arrayPtr = idx
 	sqePtr := unsafe.Add(unsafe.Pointer(&r.sqes[0]), uintptr(idx)*sqeSize)
 	clear(unsafe.Slice((*byte)(sqePtr), sqeSize))
-	atomic.StoreUint32((*uint32)(r.sqTail), tail+1)
+	if r.singleIssuer {
+		*(*uint32)(r.sqTail) = tail + 1
+	} else {
+		atomic.StoreUint32((*uint32)(r.sqTail), tail+1)
+	}
 	r.pending++
 	return sqePtr
 }
@@ -259,22 +263,30 @@ func (r *Ring) SubmitAndWaitTimeout(timeout time.Duration) error {
 	return nil
 }
 
-// peekCQE returns the next completed CQE without blocking, or nil if empty.
-func (r *Ring) peekCQE() *completionEntry {
-	head := atomic.LoadUint32((*uint32)(r.cqHead))
-	tail := atomic.LoadUint32((*uint32)(r.cqTail))
-	if head == tail {
-		return nil
+// Pending returns the number of SQEs submitted but not yet sent to the kernel.
+func (r *Ring) Pending() uint32 { return r.pending }
+
+// BeginCQ returns the current CQ head and tail for batch processing.
+// Under SINGLE_ISSUER, cqHead is a plain load (we own it).
+func (r *Ring) BeginCQ() (head, tail uint32) {
+	if r.singleIssuer {
+		head = *(*uint32)(r.cqHead)
+	} else {
+		head = atomic.LoadUint32((*uint32)(r.cqHead))
 	}
-	idx := head & r.cqMask
-	ptr := unsafe.Add(r.cqesBase, uintptr(idx)*cqeSize)
-	return (*completionEntry)(ptr)
+	tail = atomic.LoadUint32((*uint32)(r.cqTail))
+	return
 }
 
-// AdvanceCQ advances the CQ head by one.
-func (r *Ring) AdvanceCQ() {
-	head := atomic.LoadUint32((*uint32)(r.cqHead))
-	atomic.StoreUint32((*uint32)(r.cqHead), head+1)
+// CQEAt returns the CQE at the given head position.
+func (r *Ring) CQEAt(head uint32) *completionEntry {
+	idx := head & r.cqMask
+	return (*completionEntry)(unsafe.Add(r.cqesBase, uintptr(idx)*cqeSize))
+}
+
+// EndCQ advances the CQ head to newHead with a single atomic store.
+func (r *Ring) EndCQ(newHead uint32) {
+	atomic.StoreUint32((*uint32)(r.cqHead), newHead)
 }
 
 // WakeupSQPoll wakes up the SQPOLL thread if it went to sleep.

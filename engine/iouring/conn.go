@@ -30,6 +30,8 @@ type connState struct {
 	dirtyNext *connState // 8
 	dirtyPrev *connState // 8
 
+	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
+
 	h1State    *conn.H1State
 	h2State    *conn.H2State
 	ctx        context.Context
@@ -40,10 +42,13 @@ type connState struct {
 
 func newConnState(ctx context.Context, fd int, bufSize int) *connState {
 	childCtx, cancel := context.WithCancel(ctx)
-	return &connState{
+	cs := &connState{
 		fd:     fd,
-		buf:    make([]byte, bufSize),
 		ctx:    childCtx,
 		cancel: cancel,
 	}
+	if bufSize > 0 {
+		cs.buf = make([]byte, bufSize)
+	}
+	return cs
 }

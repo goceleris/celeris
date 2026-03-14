@@ -13,13 +13,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
-	"github.com/goceleris/celeris/internal/timer"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -37,11 +35,6 @@ const bufRingGroupID = 0
 // bufRingCount is the number of buffers in the provided buffer ring.
 // Must be a power of 2.
 const bufRingCount = 4096
-
-// sendPrepFn prepares a SEND SQE. Two variants exist: one for plain FDs and
-// one for fixed files. The worker selects the variant once at startup based on
-// tier capabilities, eliminating a per-send branch.
-type sendPrepFn func(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool)
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
@@ -68,11 +61,10 @@ type Worker struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
-	tw          *timer.Wheel
 	tickCounter uint32
 
-	dirtyHead *connState // head of intrusive doubly-linked dirty list
-	prepSend  sendPrepFn // selected at startup: plain or fixed-file variant
+	dirtyHead     *connState // head of intrusive doubly-linked dirty list
+	hasBufReturns bool       // set when provided buffers need publishing
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -139,13 +131,6 @@ func (w *Worker) run(ctx context.Context) {
 		}
 	}
 
-	// Select send-prep function once based on fixed file support (P3).
-	if w.fixedFiles {
-		w.prepSend = prepSendFixed
-	} else {
-		w.prepSend = prepSendPlain
-	}
-
 	// Register ring-mapped provided buffers for multishot recv.
 	if w.tier.SupportsMultishotRecv() {
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
@@ -156,10 +141,6 @@ func (w *Worker) run(ctx context.Context) {
 			w.bufRing = br
 		}
 	}
-
-	w.tw = timer.New(func(fd int, _ timer.TimeoutKind) {
-		w.closeConn(fd)
-	})
 
 	w.prepareAccept()
 	if _, err := w.ring.Submit(); err != nil {
@@ -190,16 +171,15 @@ func (w *Worker) run(ctx context.Context) {
 				// handle everything else normally to avoid breaking
 				// active connections.
 				cancelNow := time.Now().UnixNano()
-				for {
-					entry := w.ring.peekCQE()
-					if entry == nil {
-						break
-					}
+				cqH, cqT := w.ring.BeginCQ()
+				for cqH != cqT {
+					entry := w.ring.CQEAt(cqH)
 					if entry.UserData != 0 {
 						w.processCQE(ctx, entry, cancelNow)
 					}
-					w.ring.AdvanceCQ()
+					cqH++
 				}
+				w.ring.EndCQ(cqH)
 			}
 			_ = unix.Close(w.listenFD)
 			w.listenFD = -1
@@ -220,8 +200,12 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Non-blocking peek for CQEs, fall back to timed wait.
-		if w.ring.peekCQE() == nil {
+		// Submit pending SENDs from previous iteration + wait for CQEs in
+		// a single io_uring_enter syscall. Skip when CQEs are already ready
+		// and nothing is pending (pure userspace fast path).
+		hasPending := w.ring.Pending() > 0
+		cqHead, cqTail := w.ring.BeginCQ()
+		if hasPending || cqHead == cqTail {
 			waitTimeout := 100 * time.Millisecond
 			if w.listenFD < 0 {
 				waitTimeout = 1 * time.Second
@@ -230,34 +214,28 @@ func (w *Worker) run(ctx context.Context) {
 				w.shutdown()
 				return
 			}
+			cqHead, cqTail = w.ring.BeginCQ()
 		}
 
 		now := time.Now().UnixNano()
-		processed := 0
-		hasBufReturns := false
-		for processed < w.objective.CQBatch {
-			entry := w.ring.peekCQE()
-			if entry == nil {
-				break
-			}
+		for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
+			entry := w.ring.CQEAt(cqHead)
 			w.processCQE(ctx, entry, now)
-			if decodeOp(entry.UserData) == udRecv && cqeHasBuffer(entry.Flags) && w.bufRing != nil {
-				hasBufReturns = true
-			}
-			w.ring.AdvanceCQ()
-			processed++
+			cqHead++
 		}
+		w.ring.EndCQ(cqHead)
 
 		// Single atomic publish for all batched buffer returns (P0).
-		if hasBufReturns {
+		if w.hasBufReturns {
 			w.bufRing.PublishBuffers()
+			w.hasBufReturns = false
 		}
 
 		// Retry pending sends on dirty connections (SQ ring was full earlier).
 		for cs := w.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			if !cs.sending {
-				w.flushSend(cs.fd)
+				w.flushSend(cs)
 			}
 			// Remove from dirty list if fully flushed (no pending data).
 			if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
@@ -266,15 +244,21 @@ func (w *Worker) run(ctx context.Context) {
 			cs = next
 		}
 
-		// Throttle timer wheel tick: 100ms granularity doesn't need per-iteration
-		// calls. Tick every 1024 iterations to amortize time.Now() cost (P1).
-		w.tickCounter++
-		if w.tickCounter&0x3FF == 0 {
-			w.tw.Tick()
+		// Submit SEND SQEs immediately — do not defer to next iteration.
+		// Deferred submission adds ~1-5µs per response, which compounds to
+		// ~10% throughput loss under H1 keep-alive workloads.
+		if w.ring.Pending() > 0 {
+			if _, err := w.ring.Submit(); err != nil {
+				w.logger.Error("submit failed", "worker", w.id, "err", err)
+			}
 		}
 
-		if _, err := w.ring.Submit(); err != nil {
-			w.logger.Error("submit failed", "worker", w.id, "err", err)
+		// Check connection timeouts every 1024 iterations to amortize
+		// time.Now() cost. Scans active connections directly — no timer
+		// wheel entries, no allocations, no map writes on the hot path.
+		w.tickCounter++
+		if w.tickCounter&0x3FF == 0 {
+			w.checkTimeouts()
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
@@ -326,7 +310,6 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			w.logger.Warn("ACCEPT_DIRECT failed (EINVAL), disabling fixed files",
 				"worker", w.id)
 			w.fixedFiles = false
-			w.prepSend = prepSendPlain
 			if w.listenFD >= 0 {
 				sqe := w.ring.GetSQE()
 				if sqe != nil {
@@ -359,14 +342,12 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	// is actually a fixed file index and we can't call setsockopt on it directly.
 	// Socket options that require per-connection setsockopt are skipped for fixed files.
 
-	cs := newConnState(ctx, newFD, w.resolved.BufferSize)
-	cs.fixedFile = isFixedFile
-
-	// When using multishot recv with ring-mapped buffers, we don't need a
-	// per-connection recv buffer.
+	bufSize := w.resolved.BufferSize
 	if w.bufRing != nil {
-		cs.buf = nil
+		bufSize = 0
 	}
+	cs := newConnState(ctx, newFD, bufSize)
+	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {
 		if sa, err := unix.Getpeername(newFD); err == nil {
@@ -377,16 +358,14 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	// not a real FD. getpeername is not available without a real FD.
 
 	w.conns[newFD] = cs
-	cs.writeFn = w.makeWriteFn(newFD)
+	cs.writeFn = w.makeWriteFn(cs)
 	w.activeConns.Add(1)
 
 	if w.cfg.OnConnect != nil {
 		w.cfg.OnConnect(cs.remoteAddr)
 	}
 
-	if w.cfg.IdleTimeout > 0 {
-		w.tw.ScheduleAt(newFD, w.cfg.IdleTimeout, timer.IdleTimeout, now)
-	}
+	cs.lastActivity = now
 
 	if w.cfg.Protocol != engine.Auto {
 		cs.protocol = w.cfg.Protocol
@@ -431,7 +410,6 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
-	w.tw.Cancel(fd)
 	cs.cancel()
 	delete(w.conns, fd)
 	w.activeConns.Add(-1)
@@ -468,6 +446,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// even for unknown/closing connections to prevent buffer leak (P0).
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+			w.hasBufReturns = true
 		}
 		return
 	}
@@ -475,6 +454,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	if c.Res <= 0 {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+			w.hasBufReturns = true
 		}
 		// ENOBUFS (-105): provided buffer ring exhausted. The multishot recv
 		// is terminated by the kernel but the connection is healthy. Re-arm
@@ -507,11 +487,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		data = cs.buf[:c.Res]
 	}
 
-	if w.cfg.ReadTimeout > 0 {
-		w.tw.ScheduleAt(fd, w.cfg.ReadTimeout, timer.ReadTimeout, now)
-	} else {
-		w.tw.Cancel(fd)
-	}
+	cs.lastActivity = now
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
@@ -546,27 +522,19 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// drain loop completes (P0).
 	if hasProvidedBuf {
 		w.bufRing.PushBuffer(providedBufID)
+		w.hasBufReturns = true
 	}
 
 	w.reqCount.Add(1)
 
-	// Schedule write timeout if response data is pending; otherwise idle timeout.
-	// Reuse the timestamp captured above (P9).
-	if w.cfg.WriteTimeout > 0 && len(cs.writeBuf) > 0 {
-		w.tw.ScheduleAt(fd, w.cfg.WriteTimeout, timer.WriteTimeout, now)
-	} else if w.cfg.IdleTimeout > 0 {
-		w.tw.ScheduleAt(fd, w.cfg.IdleTimeout, timer.IdleTimeout, now)
-	}
+	// lastActivity already set above; timeout checked in checkTimeouts.
 
 	if processErr != nil {
 		if errors.Is(processErr, conn.ErrHijacked) {
 			return // FD already detached
 		}
 		// Flush pending writes (e.g. error responses) before closing.
-		w.flushSend(fd)
-		if _, err := w.ring.Submit(); err != nil {
-			w.logger.Error("submit failed", "worker", w.id, "err", err)
-		}
+		w.flushSend(cs)
 		w.closeConn(fd)
 		return
 	}
@@ -577,7 +545,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	w.flushSend(fd)
+	w.flushSend(cs)
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
 	// without needing a new SQE. Only re-arm if multishot ended.
@@ -621,16 +589,14 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	// All data sent — remove from dirty list, cancel write timeout, restore idle timeout.
+	// All data sent — remove from dirty list, update activity timestamp.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.removeDirty(cs)
-		if w.cfg.IdleTimeout > 0 {
-			w.tw.ScheduleAt(fd, w.cfg.IdleTimeout, timer.IdleTimeout, now)
-		}
+		cs.lastActivity = now
 	}
 
 	// Re-send remainder or flush new data.
-	w.flushSend(fd)
+	w.flushSend(cs)
 }
 
 func (w *Worker) handleClose(fd int) {
@@ -646,7 +612,6 @@ func (w *Worker) closeConn(fd int) {
 		return
 	}
 	w.removeDirty(cs)
-	w.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -656,7 +621,7 @@ func (w *Worker) closeConn(fd int) {
 	// so GOAWAY / RST_STREAM data reaches the client.
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
-		w.flushSend(fd)
+		w.flushSend(cs)
 		return
 	}
 
@@ -697,10 +662,9 @@ func (w *Worker) finishClose(fd int) {
 	}
 }
 
-func (w *Worker) makeWriteFn(fd int) func([]byte) {
+func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		cs, ok := w.conns[fd]
-		if !ok {
+		if cs.closing {
 			return
 		}
 		// Back-pressure: drop writes when total pending data exceeds limit.
@@ -784,9 +748,8 @@ func (w *Worker) removeDirty(cs *connState) {
 // Double-buffer strategy: writeBuf accumulates handler writes; sendBuf holds
 // data the kernel is currently processing. On flush, writeBuf is swapped into
 // sendBuf, and the old sendBuf's capacity is reused for the next writeBuf.
-func (w *Worker) flushSend(fd int) {
-	cs, ok := w.conns[fd]
-	if !ok || cs.sending {
+func (w *Worker) flushSend(cs *connState) {
+	if cs.sending {
 		return
 	}
 
@@ -796,8 +759,12 @@ func (w *Worker) flushSend(fd int) {
 		if sqe == nil {
 			return // SQ ring full — will retry next iteration
 		}
-		w.prepSend(sqe, fd, cs.sendBuf, false)
-		setSQEUserData(sqe, encodeUserData(udSend, fd))
+		if cs.fixedFile {
+			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
+		} else {
+			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
+		}
+		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 		cs.sending = true
 		return
 	}
@@ -815,9 +782,39 @@ func (w *Worker) flushSend(fd int) {
 		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
 		return
 	}
-	w.prepSend(sqe, fd, cs.sendBuf, false)
-	setSQEUserData(sqe, encodeUserData(udSend, fd))
+	if cs.fixedFile {
+		prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
+	} else {
+		prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
+	}
+	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	cs.sending = true
+}
+
+// checkTimeouts scans active connections and closes any that have exceeded
+// their configured timeout. Called every 1024 iterations (~100ms). This
+// replaces the timer wheel: instead of allocating entries and updating maps
+// on every recv/send, we store a single lastActivity timestamp on the
+// connState and scan here.
+func (w *Worker) checkTimeouts() {
+	now := time.Now().UnixNano()
+	for fd, cs := range w.conns {
+		if cs.closing {
+			continue
+		}
+		elapsed := time.Duration(now - cs.lastActivity)
+		if cs.dirty || cs.sending {
+			if w.cfg.WriteTimeout > 0 && elapsed > w.cfg.WriteTimeout {
+				w.closeConn(fd)
+			}
+		} else {
+			if w.cfg.IdleTimeout > 0 && elapsed > w.cfg.IdleTimeout {
+				w.closeConn(fd)
+			} else if w.cfg.ReadTimeout > 0 && elapsed > w.cfg.ReadTimeout {
+				w.closeConn(fd)
+			}
+		}
+	}
 }
 
 func (w *Worker) shutdown() {
