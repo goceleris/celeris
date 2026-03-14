@@ -82,10 +82,12 @@ type Ring struct {
 	cqesBase     unsafe.Pointer
 }
 
-// NewRing creates a new io_uring instance.
-func NewRing(entries uint32, flags uint32) (*Ring, error) {
+// NewRing creates a new io_uring instance. sqPollIdle sets the kernel
+// SQPOLL thread idle timeout in milliseconds (only used with IORING_SETUP_SQPOLL).
+func NewRing(entries uint32, flags uint32, sqPollIdle uint32) (*Ring, error) {
 	var params ioUringParams
 	params.flags = flags
+	params.sqThreadIdle = sqPollIdle
 
 	fd, _, errno := unix.Syscall(
 		uintptr(sysIOUringSetup),
@@ -169,8 +171,12 @@ func (r *Ring) GetSQE() unsafe.Pointer {
 	arrayPtr := (*uint32)(unsafe.Add(r.sqArray, uintptr(idx)*4))
 	*arrayPtr = idx
 	sqePtr := unsafe.Add(unsafe.Pointer(&r.sqes[0]), uintptr(idx)*sqeSize)
-	clear(unsafe.Slice((*byte)(sqePtr), sqeSize))
-	atomic.StoreUint32((*uint32)(r.sqTail), tail+1)
+	*(*[64]byte)(sqePtr) = [64]byte{}
+	if r.singleIssuer {
+		*(*uint32)(r.sqTail) = tail + 1
+	} else {
+		atomic.StoreUint32((*uint32)(r.sqTail), tail+1)
+	}
 	r.pending++
 	return sqePtr
 }
@@ -259,22 +265,34 @@ func (r *Ring) SubmitAndWaitTimeout(timeout time.Duration) error {
 	return nil
 }
 
-// peekCQE returns the next completed CQE without blocking, or nil if empty.
-func (r *Ring) peekCQE() *completionEntry {
-	head := atomic.LoadUint32((*uint32)(r.cqHead))
-	tail := atomic.LoadUint32((*uint32)(r.cqTail))
-	if head == tail {
-		return nil
+// Pending returns the number of SQEs submitted but not yet sent to the kernel.
+func (r *Ring) Pending() uint32 { return r.pending }
+
+// ClearPending resets the pending counter without issuing a syscall. Used with
+// SQPOLL where the kernel thread submits SQEs automatically.
+func (r *Ring) ClearPending() { r.pending = 0 }
+
+// BeginCQ returns the current CQ head and tail for batch processing.
+// Under SINGLE_ISSUER, cqHead is a plain load (we own it).
+func (r *Ring) BeginCQ() (head, tail uint32) {
+	if r.singleIssuer {
+		head = *(*uint32)(r.cqHead)
+	} else {
+		head = atomic.LoadUint32((*uint32)(r.cqHead))
 	}
-	idx := head & r.cqMask
-	ptr := unsafe.Add(r.cqesBase, uintptr(idx)*cqeSize)
-	return (*completionEntry)(ptr)
+	tail = atomic.LoadUint32((*uint32)(r.cqTail))
+	return
 }
 
-// AdvanceCQ advances the CQ head by one.
-func (r *Ring) AdvanceCQ() {
-	head := atomic.LoadUint32((*uint32)(r.cqHead))
-	atomic.StoreUint32((*uint32)(r.cqHead), head+1)
+// cqeAt returns the CQE at the given head position.
+func (r *Ring) cqeAt(head uint32) *completionEntry {
+	idx := head & r.cqMask
+	return (*completionEntry)(unsafe.Add(r.cqesBase, uintptr(idx)*cqeSize))
+}
+
+// EndCQ advances the CQ head to newHead with a single atomic store.
+func (r *Ring) EndCQ(newHead uint32) {
+	atomic.StoreUint32((*uint32)(r.cqHead), newHead)
 }
 
 // WakeupSQPoll wakes up the SQPOLL thread if it went to sleep.

@@ -20,11 +20,14 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
-	"github.com/goceleris/celeris/internal/timer"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
+
+// connTableSize is the number of slots in the flat connection array.
+// Must accommodate the maximum number of concurrent connections per worker.
+const connTableSize = 65536
 
 // Loop is an epoll-based event loop worker.
 type Loop struct {
@@ -33,7 +36,9 @@ type Loop struct {
 	epollFD      int
 	listenFD     int
 	events       []unix.EpollEvent
-	conns        map[int]*connState
+	conns        []*connState
+	connCount    int // number of active connections (local, for draining check)
+	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
 	handler      stream.Handler
 	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
@@ -48,10 +53,11 @@ type Loop struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
-	tw          *timer.Wheel
+	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter uint32
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
+	h2cfg     conn.H2Config
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -85,7 +91,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		epollFD:      epollFD,
 		listenFD:     listenFD,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
-		conns:        make(map[int]*connState),
+		conns:        make([]*connState, connTableSize),
 		handler:      handler,
 		objective:    objective,
 		resolved:     resolved,
@@ -103,6 +109,11 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		reqCount:    reqCount,
 		activeConns: activeConns,
 		errCount:    errCount,
+		h2cfg: conn.H2Config{
+			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
+			InitialWindowSize:    cfg.InitialWindowSize,
+			MaxFrameSize:         cfg.MaxFrameSize,
+		},
 	}, nil
 }
 
@@ -111,10 +122,6 @@ func (l *Loop) run(ctx context.Context) {
 	defer runtime.UnlockOSThread()
 
 	_ = platform.PinToCPU(l.cpuID)
-
-	l.tw = timer.New(func(fd int, _ timer.TimeoutKind) {
-		l.closeConn(fd)
-	})
 
 	activeTimeoutMs := int(l.objective.EpollTimeout.Milliseconds())
 	if activeTimeoutMs <= 0 {
@@ -170,29 +177,29 @@ func (l *Loop) run(ctx context.Context) {
 			continue
 		}
 
+		now := time.Now().UnixNano()
 		for i := range n {
 			ev := &l.events[i]
 			fd := int(ev.Fd)
 
 			if fd == l.listenFD && l.listenFD >= 0 {
-				l.acceptAll(ctx)
+				l.acceptAll(ctx, now)
 				continue
 			}
 
 			// Process EPOLLIN before EPOLLHUP: a peer may send data and
 			// immediately close, producing both flags in one event.
 			if ev.Events&unix.EPOLLIN != 0 {
-				l.drainRead(fd)
+				l.drainRead(fd, now)
 			}
 
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
-				if _, ok := l.conns[fd]; ok {
+				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
 				}
 			}
 		}
 
-		now := time.Now().UnixNano()
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			err := flushWrites(cs)
@@ -202,23 +209,28 @@ func (l *Loop) run(ctx context.Context) {
 			} else if len(cs.writeBuf) == 0 {
 				cs.pendingBytes = 0
 				l.removeDirty(cs)
-				if l.cfg.IdleTimeout > 0 {
-					l.tw.ScheduleAt(cs.fd, l.cfg.IdleTimeout, timer.IdleTimeout, now)
-				}
 			}
 			// else: partial write, keep on dirty list for next iteration
 			cs = next
 		}
 
-		// Throttle timer wheel tick: 100ms granularity doesn't need per-iteration
-		// calls. Tick every 1024 iterations to amortize time.Now() cost (P1).
+		// Flush batched request count to the shared atomic counter. This
+		// replaces per-request atomic.Add with one atomic per event loop
+		// iteration, eliminating cache-line bouncing under multi-worker
+		// contention.
+		if l.reqBatch > 0 {
+			l.reqCount.Add(l.reqBatch)
+			l.reqBatch = 0
+		}
+
+		// Check connection timeouts every 1024 iterations (~100ms).
 		l.tickCounter++
 		if l.tickCounter&0x3FF == 0 {
-			l.tw.Tick()
+			l.checkTimeouts()
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
-		if l.listenFD < 0 && len(l.conns) == 0 && l.acceptPaused.Load() {
+		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() {
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() {
 				l.wakeMu.Unlock()
@@ -239,7 +251,7 @@ func (l *Loop) run(ctx context.Context) {
 	}
 }
 
-func (l *Loop) acceptAll(ctx context.Context) {
+func (l *Loop) acceptAll(ctx context.Context, now int64) {
 	for i := 0; i < 64; i++ {
 		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
@@ -248,6 +260,13 @@ func (l *Loop) acceptAll(ctx context.Context) {
 			}
 			l.errCount.Add(1)
 			return
+		}
+
+		// Bounds check: reject FDs outside the flat conn array.
+		if newFD < 0 || newFD >= len(l.conns) {
+			_ = unix.Close(newFD)
+			l.errCount.Add(1)
+			continue
 		}
 
 		_ = sockopts.ApplyFD(newFD, l.sockOpts)
@@ -264,6 +283,10 @@ func (l *Loop) acceptAll(ctx context.Context) {
 		cs := newConnState(ctx, newFD, l.resolved.BufferSize)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
+		l.connCount++
+		if newFD > l.maxFD {
+			l.maxFD = newFD
+		}
 		cs.writeFn = l.makeWriteFn(cs)
 		l.activeConns.Add(1)
 
@@ -271,9 +294,7 @@ func (l *Loop) acceptAll(ctx context.Context) {
 			l.cfg.OnConnect(cs.remoteAddr)
 		}
 
-		if l.cfg.IdleTimeout > 0 {
-			l.tw.ScheduleAt(newFD, l.cfg.IdleTimeout, timer.IdleTimeout, time.Now().UnixNano())
-		}
+		cs.lastActivity = now
 
 		if l.cfg.Protocol != engine.Auto {
 			cs.protocol = l.cfg.Protocol
@@ -283,9 +304,12 @@ func (l *Loop) acceptAll(ctx context.Context) {
 	}
 }
 
-func (l *Loop) drainRead(fd int) {
-	cs, ok := l.conns[fd]
-	if !ok {
+func (l *Loop) drainRead(fd int, now int64) {
+	if fd < 0 || fd >= len(l.conns) {
+		return
+	}
+	cs := l.conns[fd]
+	if cs == nil {
 		return
 	}
 
@@ -307,13 +331,7 @@ func (l *Loop) drainRead(fd int) {
 
 		data := cs.buf[:n]
 
-		// Cancel idle timer; schedule read timeout while processing request.
-		now := time.Now().UnixNano()
-		if l.cfg.ReadTimeout > 0 {
-			l.tw.ScheduleAt(fd, l.cfg.ReadTimeout, timer.ReadTimeout, now)
-		} else {
-			l.tw.Cancel(fd)
-		}
+		cs.lastActivity = now
 
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)
@@ -336,22 +354,12 @@ func (l *Loop) drainRead(fd int) {
 		case engine.HTTP1:
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
 		case engine.H2C:
-			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, conn.H2Config{
-				MaxConcurrentStreams: l.cfg.MaxConcurrentStreams,
-				InitialWindowSize:    l.cfg.InitialWindowSize,
-				MaxFrameSize:         l.cfg.MaxFrameSize,
-			})
+			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
 		}
 
-		l.reqCount.Add(1)
+		l.reqBatch++
 
-		// Schedule write timeout if response data is pending.
-		// Reuse the timestamp captured above (P9).
-		if l.cfg.WriteTimeout > 0 && len(cs.writeBuf) > 0 {
-			l.tw.ScheduleAt(fd, l.cfg.WriteTimeout, timer.WriteTimeout, now)
-		} else if l.cfg.IdleTimeout > 0 {
-			l.tw.ScheduleAt(fd, l.cfg.IdleTimeout, timer.IdleTimeout, now)
-		}
+		// lastActivity already set above; timeout checked in checkTimeouts.
 
 		if processErr != nil {
 			if errors.Is(processErr, conn.ErrHijacked) {
@@ -364,6 +372,23 @@ func (l *Loop) drainRead(fd int) {
 			return
 		}
 
+		// Inline flush: send response immediately after the handler returns,
+		// before the next unix.Read (which returns EAGAIN on non-pipelined
+		// connections). This sends the response one event-batch earlier than
+		// the dirty list pass, reducing per-request latency by up to N×2µs
+		// (where N is the number of other events in the same epoll_wait batch).
+		if len(cs.writeBuf) > 0 {
+			if fErr := flushWrites(cs); fErr != nil {
+				l.removeDirty(cs)
+				l.closeConn(fd)
+				return
+			}
+			if len(cs.writeBuf) == 0 {
+				cs.pendingBytes = 0
+				l.removeDirty(cs)
+			}
+		}
+
 		if cs.pendingBytes > maxPendingBytes {
 			l.closeConn(fd)
 			return
@@ -372,14 +397,14 @@ func (l *Loop) drainRead(fd int) {
 }
 
 func (l *Loop) hijackConn(fd int) (net.Conn, error) {
-	cs, ok := l.conns[fd]
-	if !ok {
+	cs := l.conns[fd]
+	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
-	l.tw.Cancel(fd)
 	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	delete(l.conns, fd)
+	l.conns[fd] = nil
+	l.connCount--
 	l.activeConns.Add(-1)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
@@ -396,11 +421,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			return l.hijackConn(cs.fd)
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(l.handler, conn.H2Config{
-			MaxConcurrentStreams: l.cfg.MaxConcurrentStreams,
-			InitialWindowSize:    l.cfg.InitialWindowSize,
-			MaxFrameSize:         l.cfg.MaxFrameSize,
-		}, cs.writeFn)
+		cs.h2State = conn.NewH2State(l.handler, l.h2cfg, cs.writeFn)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	}
 }
@@ -446,13 +467,36 @@ func (l *Loop) removeDirty(cs *connState) {
 	cs.dirtyPrev = nil
 }
 
+// checkTimeouts scans active connections and closes any that have exceeded
+// their configured timeout. Called every 1024 iterations (~100ms).
+func (l *Loop) checkTimeouts() {
+	now := time.Now().UnixNano()
+	for fd := 0; fd <= l.maxFD; fd++ {
+		cs := l.conns[fd]
+		if cs == nil {
+			continue
+		}
+		elapsed := time.Duration(now - cs.lastActivity)
+		if cs.dirty {
+			if l.cfg.WriteTimeout > 0 && elapsed > l.cfg.WriteTimeout {
+				l.closeConn(fd)
+			}
+		} else {
+			if l.cfg.IdleTimeout > 0 && elapsed > l.cfg.IdleTimeout {
+				l.closeConn(fd)
+			} else if l.cfg.ReadTimeout > 0 && elapsed > l.cfg.ReadTimeout {
+				l.closeConn(fd)
+			}
+		}
+	}
+}
+
 func (l *Loop) closeConn(fd int) {
-	cs, ok := l.conns[fd]
-	if !ok {
+	cs := l.conns[fd]
+	if cs == nil {
 		return
 	}
 	l.removeDirty(cs)
-	l.tw.Cancel(fd)
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -461,7 +505,8 @@ func (l *Loop) closeConn(fd int) {
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
 	_ = unix.Close(fd)
-	delete(l.conns, fd)
+	l.conns[fd] = nil
+	l.connCount--
 	l.activeConns.Add(-1)
 
 	if l.cfg.OnDisconnect != nil {
@@ -470,7 +515,11 @@ func (l *Loop) closeConn(fd int) {
 }
 
 func (l *Loop) shutdown() {
-	for fd, cs := range l.conns {
+	for fd := 0; fd <= l.maxFD; fd++ {
+		cs := l.conns[fd]
+		if cs == nil {
+			continue
+		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
@@ -486,7 +535,7 @@ func (l *Loop) shutdown() {
 // drainRecvBuffer reads and discards any data in the socket receive buffer.
 // This prevents close() from sending RST (which discards unsent data like GOAWAY).
 func drainRecvBuffer(fd int) {
-	var buf [512]byte
+	var buf [4096]byte
 	for {
 		n, _ := unix.Read(fd, buf[:])
 		if n <= 0 {

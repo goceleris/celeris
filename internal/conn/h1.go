@@ -19,6 +19,10 @@ var ErrHijacked = errors.New("celeris: connection hijacked")
 // maxRequestBodySize is the maximum allowed request body (100 MB), matching H2.
 const maxRequestBodySize = 100 << 20
 
+// errConnectionClose is returned when the client requests Connection: close.
+// Pre-allocated to avoid per-request fmt.Errorf allocation.
+var errConnectionClose = errors.New("connection close requested")
+
 // continue100Response is sent when the client sends "Expect: 100-continue"
 // to signal that the server is willing to accept the request body.
 var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
@@ -28,6 +32,7 @@ type H1State struct {
 	parser     *h1.Parser
 	buffer     bytes.Buffer
 	req        h1.Request
+	rw         h1ResponseAdapter // embedded — reused per request, avoids heap alloc
 	RemoteAddr string
 	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
 }
@@ -53,7 +58,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			state.req.Reset()
 			consumed, err := state.parser.ParseRequest(&state.req)
 			if err != nil {
-				write(buildErrorResponse(400, "Bad Request"))
+				writeErrorResponse(write, 400, "Bad Request")
 				return err
 			}
 			if consumed == 0 {
@@ -77,11 +82,11 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				break
 			}
 
-			if err := handleH1Request(ctx, &state.req, nil, state.RemoteAddr, handler, write, state.HijackFn); err != nil {
+			if err := handleH1Request(ctx, state, nil, handler, write); err != nil {
 				return err
 			}
 			if !state.req.KeepAlive {
-				return fmt.Errorf("connection close requested")
+				return errConnectionClose
 			}
 			offset += consumed
 		}
@@ -95,7 +100,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		state.req.Reset()
 		consumed, err := state.parser.ParseRequest(&state.req)
 		if err != nil {
-			write(buildErrorResponse(400, "Bad Request"))
+			writeErrorResponse(write, 400, "Bad Request")
 			return err
 		}
 		if consumed == 0 {
@@ -132,7 +137,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				state.parser.Reset(state.buffer.Bytes())
 				chunk, chunkConsumed, cerr := state.parser.ParseChunkedBody()
 				if cerr != nil {
-					write(buildErrorResponse(400, "Invalid chunked encoding"))
+					writeErrorResponse(write, 400, "Invalid chunked encoding")
 					return cerr
 				}
 				if chunkConsumed == 0 {
@@ -144,7 +149,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				}
 				chunks.Write(chunk)
 				if chunks.Len() > maxRequestBodySize {
-					write(buildErrorResponse(413, "Request body too large"))
+					writeErrorResponse(write, 413, "Request body too large")
 					return fmt.Errorf("chunked body exceeds %d byte limit", maxRequestBodySize)
 				}
 			}
@@ -153,32 +158,38 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			state.buffer.Next(consumed)
 		}
 
-		if err := handleH1Request(ctx, &state.req, bodyData, state.RemoteAddr, handler, write, state.HijackFn); err != nil {
+		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
 		if !state.req.KeepAlive {
-			return fmt.Errorf("connection close requested")
+			return errConnectionClose
 		}
 	}
 	return nil
 }
 
-func handleH1Request(ctx context.Context, req *h1.Request, body []byte, remoteAddr string,
-	handler stream.Handler, write func([]byte), hijackFn func() (net.Conn, error)) error {
+func handleH1Request(ctx context.Context, state *H1State, body []byte,
+	handler stream.Handler, write func([]byte)) error {
 
-	s := requestToStream(req, body, remoteAddr)
+	req := &state.req
+	s := requestToStream(req, body, state.RemoteAddr)
 	defer s.Release()
-	rw := &h1ResponseAdapter{
-		write: write, keepAlive: req.KeepAlive,
-		isHEAD: req.Method == "HEAD", hijackFn: hijackFn,
-	}
+
+	// Reuse the connection-scoped response adapter — avoids a heap allocation
+	// per request. Reset per-request fields; hijackFn/write are stable.
+	rw := &state.rw
+	rw.write = write
+	rw.keepAlive = req.KeepAlive
+	rw.isHEAD = req.Method == "HEAD"
+	rw.hijackFn = state.HijackFn
+	rw.hijacked = false
 	s.ResponseWriter = rw
 
 	if err := handler.HandleStream(ctx, s); err != nil {
 		if rw.hijacked {
 			return ErrHijacked
 		}
-		write(buildErrorResponse(500, "Internal Server Error"))
+		writeErrorResponse(write, 500, "Internal Server Error")
 		return err
 	}
 	if rw.hijacked {
@@ -218,6 +229,8 @@ func requestToStream(req *h1.Request, body []byte, remoteAddr string) *stream.St
 		_, _ = s.GetBuf().Write(body)
 	}
 	s.EndStream = true
-	s.SetState(stream.StateHalfClosedRemote)
+	// Direct assignment — no mutex needed. H1 streams are single-threaded
+	// (no manager), and the stream is not yet visible to any handler.
+	s.State = stream.StateHalfClosedRemote
 	return s
 }

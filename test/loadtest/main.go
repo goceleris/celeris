@@ -59,12 +59,17 @@ type testResult struct {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
+	filter := os.Getenv("CELERIS_FILTER") // e.g., "iouring-latency-h1" or "epoll" or ""
+
 	results := make([]testResult, 0, len(engines)*len(objectives)*len(protocols))
 
 	for _, eng := range engines {
 		for oi, obj := range objectives {
 			for pi, proto := range protocols {
 				name := fmt.Sprintf("celeris-%s-%s-%s", eng, objectiveNames[oi], protocolNames[pi])
+				if filter != "" && !strings.Contains(name, filter) {
+					continue
+				}
 				log.Printf("========== %s ==========", name)
 
 				r := runTest(name, eng, obj, proto)
