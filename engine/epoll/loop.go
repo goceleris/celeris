@@ -388,13 +388,21 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// (where N is the number of other events in the same epoll_wait batch).
 		if cs.writePos < len(cs.writeBuf) {
 			if fErr := flushWrites(cs); fErr != nil {
-				l.removeDirty(cs)
+				if cs.dirty {
+					l.removeDirty(cs)
+				}
 				l.closeConn(fd)
 				return
 			}
 			if cs.writePos >= len(cs.writeBuf) {
+				// Fully flushed — no dirty list needed.
 				cs.pendingBytes = 0
-				l.removeDirty(cs)
+				if cs.dirty {
+					l.removeDirty(cs)
+				}
+			} else {
+				// Partial write — add to dirty list for retry.
+				l.markDirty(cs)
 			}
 		}
 
@@ -450,7 +458,9 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)
 		cs.pendingBytes += len(data)
-		l.markDirty(cs)
+		// Don't markDirty here — drainRead's inline flush handles the
+		// happy path. Only markDirty if the inline flush partially
+		// completes, avoiding linked-list overhead per request.
 	}
 }
 

@@ -232,7 +232,20 @@ func (w *Worker) run(ctx context.Context) {
 			now := time.Now().UnixNano()
 			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
 				entry := w.ring.cqeAt(cqHead)
-				w.processCQE(ctx, entry, now)
+				// Inlined CQE dispatch — eliminates processCQE method call
+				// and avoids passing context.Context on every CQE (only
+				// udAccept needs it). Hot ops (recv/send) are checked first.
+				switch decodeOp(entry.UserData) {
+				case udRecv:
+					w.handleRecv(entry, decodeFD(entry.UserData), now)
+				case udSend:
+					w.handleSend(entry, decodeFD(entry.UserData), now)
+				case udAccept:
+					w.handleAccept(ctx, entry, decodeFD(entry.UserData), now)
+				case udClose:
+					w.handleClose(decodeFD(entry.UserData))
+				case udProvide:
+				}
 				cqHead++
 			}
 		}
@@ -253,14 +266,15 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		// Retry pending sends on dirty connections (SQ ring was full earlier).
+		// The dirty list is only populated when flushSend fails, so this
+		// is typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
-			if !cs.sending {
-				w.flushSend(cs)
-			}
-			// Remove from dirty list if fully flushed (no pending data).
-			if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-				w.removeDirty(cs)
+			if !cs.sending && !w.flushSend(cs) {
+				// Successfully flushed or send is in-flight; remove from dirty list.
+				if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+					w.removeDirty(cs)
+				}
 			}
 			cs = next
 		}
@@ -561,7 +575,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return // FD already detached
 		}
 		// Flush pending writes (e.g. error responses) before closing.
-		w.flushSend(cs)
+		_ = w.flushSend(cs)
 		w.closeConn(fd)
 		return
 	}
@@ -572,7 +586,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	w.flushSend(cs)
+	// Flush response. Only markDirty if the SQ ring was full (retry needed).
+	if w.flushSend(cs) {
+		w.markDirty(cs)
+	}
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
 	// without needing a new SQE. Only re-arm if multishot ended.
@@ -620,10 +637,13 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.removeDirty(cs)
 		cs.lastActivity = now
+		return
 	}
 
-	// Re-send remainder or flush new data.
-	w.flushSend(cs)
+	// Re-send remainder or flush new data. Only markDirty on SQ ring full.
+	if w.flushSend(cs) {
+		w.markDirty(cs)
+	}
 }
 
 func (w *Worker) handleClose(fd int) {
@@ -652,7 +672,9 @@ func (w *Worker) closeConn(fd int) {
 	// so GOAWAY / RST_STREAM data reaches the client.
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
-		w.flushSend(cs)
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
 		return
 	}
 
@@ -711,8 +733,10 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds
 		// sendBuf (not writeBuf), so appending here is safe.
+		// Don't markDirty here — handleRecv calls flushSend after the
+		// handler returns. Only markDirty if flushSend fails (SQ ring
+		// full), avoiding linked-list overhead on the happy path.
 		cs.writeBuf = append(cs.writeBuf, data...)
-		w.markDirty(cs)
 	}
 }
 
@@ -785,16 +809,19 @@ func (w *Worker) removeDirty(cs *connState) {
 // Double-buffer strategy: writeBuf accumulates handler writes; sendBuf holds
 // data the kernel is currently processing. On flush, writeBuf is swapped into
 // sendBuf, and the old sendBuf's capacity is reused for the next writeBuf.
-func (w *Worker) flushSend(cs *connState) {
+//
+// Returns true if data is still pending and needs retry (SQ ring was full).
+// The caller should markDirty only when this returns true.
+func (w *Worker) flushSend(cs *connState) bool {
 	if cs.sending {
-		return
+		return false // send in-flight; handleSend will pick up writeBuf
 	}
 
 	// If sendBuf still has data (partial send remainder), re-send it.
 	if len(cs.sendBuf) > 0 {
 		sqe := w.ring.GetSQE()
 		if sqe == nil {
-			return // SQ ring full — will retry next iteration
+			return true // SQ ring full — caller should markDirty
 		}
 		if cs.fixedFile {
 			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
@@ -803,21 +830,21 @@ func (w *Worker) flushSend(cs *connState) {
 		}
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 		cs.sending = true
-		return
+		return false
 	}
 
 	// No in-flight data; swap writeBuf → sendBuf if there's new data.
 	if len(cs.writeBuf) == 0 {
-		return
+		return false
 	}
 
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
-		// SQ ring full — swap back; will retry next iteration.
+		// SQ ring full — swap back; caller should markDirty.
 		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
-		return
+		return true
 	}
 	if cs.fixedFile {
 		prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
@@ -826,6 +853,7 @@ func (w *Worker) flushSend(cs *connState) {
 	}
 	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	cs.sending = true
+	return false
 }
 
 // checkTimeouts scans active connections and closes any that have exceeded
