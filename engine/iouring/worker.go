@@ -66,6 +66,7 @@ type Worker struct {
 	errCount    *atomic.Uint64
 	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter uint32
+	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
@@ -160,6 +161,7 @@ func (w *Worker) run(ctx context.Context) {
 	}
 
 	w.ready <- nil
+	w.cachedNow = time.Now().UnixNano()
 
 	for {
 		if ctx.Err() != nil {
@@ -229,7 +231,13 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		if cqHead != cqTail {
-			now := time.Now().UnixNano()
+			// Refresh cached timestamp every 64 iterations to amortize
+			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
+			// uses multi-second windows so ~1ms resolution is sufficient.
+			if w.tickCounter&0x3F == 0 {
+				w.cachedNow = time.Now().UnixNano()
+			}
+			now := w.cachedNow
 			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
 				entry := w.ring.cqeAt(cqHead)
 				// Inlined CQE dispatch — eliminates processCQE method call
@@ -281,8 +289,7 @@ func (w *Worker) run(ctx context.Context) {
 
 		// Submit SEND SQEs. With SQPOLL, the kernel thread polls the SQ ring
 		// automatically — no Submit syscall needed. Without SQPOLL, submit
-		// immediately to avoid deferring SENDs to the next iteration (~10%
-		// throughput loss under H1 keep-alive).
+		// immediately to avoid deferring SENDs to the next iteration.
 		if w.sqpoll {
 			w.ring.ClearPending()
 		} else if w.ring.Pending() > 0 {
@@ -586,14 +593,24 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	// Flush response. Only markDirty if the SQ ring was full (retry needed).
-	if w.flushSend(cs) {
-		w.markDirty(cs)
+	// Flush response with linked RECV when using single-shot per-connection
+	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
+	// after SEND completes, eliminating one loop iteration per request.
+	cs.recvLinked = false
+	if w.bufRing == nil {
+		if w.flushSendLink(cs) {
+			w.markDirty(cs)
+		}
+	} else {
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
 	}
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
 	// without needing a new SQE. Only re-arm if multishot ended.
-	if !cqeHasMore(c.Flags) {
+	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
+	if !cqeHasMore(c.Flags) && !cs.recvLinked {
 		w.prepareRecv(fd, cs.buf)
 	}
 }
@@ -852,6 +869,61 @@ func (w *Worker) flushSend(cs *connState) bool {
 		prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
 	}
 	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+	cs.sending = true
+	return false
+}
+
+// flushSendLink is like flushSend but links a RECV SQE after the SEND using
+// IOSQE_IO_LINK. The kernel chains the operations: when SEND completes, RECV
+// starts automatically without another io_uring_enter. This eliminates one
+// loop iteration between request/response cycles.
+//
+// Only used for single-shot recv (bufRing == nil) on the normal request path.
+// Falls back to plain (unlinked) SEND if only one SQE slot is available.
+func (w *Worker) flushSendLink(cs *connState) bool {
+	if cs.sending {
+		return false
+	}
+
+	// Partial send remainder — no linking (RECV may already be in flight).
+	if len(cs.sendBuf) > 0 {
+		return w.flushSend(cs)
+	}
+
+	if len(cs.writeBuf) == 0 {
+		return false
+	}
+
+	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
+
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
+		return true
+	}
+
+	// Try to get a second SQE for the linked RECV.
+	recvSQE := w.ring.GetSQE()
+	if recvSQE != nil {
+		// Link SEND → RECV.
+		if cs.fixedFile {
+			prepSendFixed(sqe, cs.fd, cs.sendBuf, true)
+		} else {
+			prepSendPlain(sqe, cs.fd, cs.sendBuf, true)
+		}
+		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		prepRecv(recvSQE, cs.fd, cs.buf)
+		setSQEUserData(recvSQE, encodeUserData(udRecv, cs.fd))
+		cs.recvLinked = true
+	} else {
+		// Only one SQE slot — plain SEND, no linking.
+		if cs.fixedFile {
+			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
+		} else {
+			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
+		}
+		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+	}
 	cs.sending = true
 	return false
 }

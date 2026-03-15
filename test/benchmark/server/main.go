@@ -1,0 +1,143 @@
+//go:build linux
+
+// Package main runs a standalone celeris server for external benchmarking
+// with wrk, hey, or other load generators. Uses stream.Handler directly
+// (bypasses celeris Server/Router) for raw engine performance testing.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/goceleris/celeris/adaptive"
+	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/epoll"
+	"github.com/goceleris/celeris/engine/iouring"
+	"github.com/goceleris/celeris/engine/std"
+	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/resource"
+)
+
+func main() {
+	engName := envOr("ENGINE", "iouring")
+	objName := envOr("OBJECTIVE", "latency")
+	protoName := envOr("PROTOCOL", "h1")
+	port := envOr("PORT", "18080")
+
+	var obj resource.ObjectiveProfile
+	switch objName {
+	case "latency":
+		obj = resource.LatencyOptimized
+	case "throughput":
+		obj = resource.ThroughputOptimized
+	case "balanced":
+		obj = resource.BalancedObjective
+	default:
+		log.Fatalf("unknown objective: %s", objName)
+	}
+
+	var proto engine.Protocol
+	switch protoName {
+	case "h1":
+		proto = engine.HTTP1
+	case "h2":
+		proto = engine.H2C
+	case "hybrid", "auto":
+		proto = engine.Auto
+	default:
+		log.Fatalf("unknown protocol: %s", protoName)
+	}
+
+	cfg := resource.Config{
+		Addr:      ":" + port,
+		Protocol:  proto,
+		Objective: obj,
+		Resources: resource.Resources{Preset: resource.Greedy},
+	}.WithDefaults()
+
+	handler := newHandler()
+	eng, err := createEngine(engName, cfg, handler)
+	if err != nil {
+		log.Fatalf("engine create: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		cancel()
+	}()
+
+	log.Printf("Starting %s-%s-%s on :%s", engName, objName, protoName, port)
+	if err := eng.Listen(ctx); err != nil && ctx.Err() == nil {
+		log.Fatalf("listen: %v", err)
+	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func createEngine(name string, cfg resource.Config, handler stream.Handler) (engine.Engine, error) {
+	switch name {
+	case "iouring":
+		return iouring.New(cfg, handler)
+	case "epoll":
+		return epoll.New(cfg, handler)
+	case "adaptive":
+		return adaptive.New(cfg, handler)
+	case "std":
+		return std.New(cfg, handler)
+	default:
+		return nil, fmt.Errorf("unknown engine: %s", name)
+	}
+}
+
+// Pre-allocated response components to minimize benchmark handler overhead.
+var (
+	textPlainHeaders = [][2]string{{"content-type", "text/plain"}}
+	jsonHeaders      = [][2]string{{"content-type", "application/json"}}
+	helloBody        = []byte("Hello, World!")
+	jsonBody         = []byte(`{"message":"Hello, World!"}`)
+	notFoundBody     = []byte("Not Found")
+)
+
+func newHandler() stream.HandlerFunc {
+	return func(_ context.Context, s *stream.Stream) error {
+		defer s.Cancel()
+
+		// H1 pseudo-headers are always at fixed positions:
+		// [0] = :method, [1] = :path, [2] = :scheme, [3] = :authority
+		// For H2, the same convention is maintained by HPACK decoding.
+		// Direct index access eliminates the header iteration loop.
+		headers := s.GetHeaders()
+		if len(headers) < 2 {
+			return s.ResponseWriter.WriteResponse(s, 400, textPlainHeaders, notFoundBody)
+		}
+		method := headers[0][1]
+		path := headers[1][1]
+
+		switch {
+		case method == "GET" && path == "/":
+			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, helloBody)
+		case method == "GET" && path == "/json":
+			return s.ResponseWriter.WriteResponse(s, 200, jsonHeaders, jsonBody)
+		case method == "GET" && strings.HasPrefix(path, "/users/"):
+			id := strings.TrimPrefix(path, "/users/")
+			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, []byte("User ID: "+id))
+		default:
+			return s.ResponseWriter.WriteResponse(s, 404, textPlainHeaders, notFoundBody)
+		}
+	}
+}

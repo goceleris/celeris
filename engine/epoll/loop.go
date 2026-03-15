@@ -56,6 +56,7 @@ type Loop struct {
 	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter      uint32
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
+	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
 	h2cfg     conn.H2Config
@@ -128,6 +129,7 @@ func (l *Loop) run(ctx context.Context) {
 	if activeTimeoutMs <= 0 {
 		activeTimeoutMs = 1
 	}
+	l.cachedNow = time.Now().UnixNano()
 
 	for {
 		if ctx.Err() != nil {
@@ -178,7 +180,13 @@ func (l *Loop) run(ctx context.Context) {
 
 		var now int64
 		if n > 0 {
-			now = time.Now().UnixNano()
+			// Refresh cached timestamp every 64 iterations to amortize
+			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
+			// uses multi-second windows so ~1ms resolution is sufficient.
+			if l.tickCounter&0x3F == 0 {
+				l.cachedNow = time.Now().UnixNano()
+			}
+			now = l.cachedNow
 		}
 		for i := range n {
 			ev := &l.events[i]

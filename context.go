@@ -109,42 +109,30 @@ func releaseContext(c *Context) {
 func (c *Context) extractRequestInfo() {
 	headers := c.stream.Headers
 
-	// Fast path: per HTTP/2 spec (RFC 9113 §8.3), pseudo-headers appear before
-	// regular headers. Our H1 parser also places them at indices 0-3. Check the
-	// first few positions directly to avoid a loop for 99.99% of requests (P7).
-	if len(headers) >= 2 {
-		found := 0
-		for i := range min(len(headers), 4) {
-			switch headers[i][0] {
-			case ":method":
-				c.method = headers[i][1]
-				found++
-			case ":path":
-				p := headers[i][1]
-				if i := strings.IndexByte(p, '?'); i >= 0 {
-					c.path = p[:i]
-					c.rawQuery = p[i+1:]
-				} else {
-					c.path = p
-				}
-				found++
-			}
-			if found == 2 {
-				return
-			}
+	// Direct index access: H1 (populateCachedStream) always places
+	// :method at [0] and :path at [1]. H2 (HPACK) usually follows the
+	// same convention. Check the first 2 bytes of each name to verify
+	// (":m" for :method, ":p" for :path) — this is faster than full
+	// string comparison and covers all production pseudo-header names.
+	if len(headers) >= 2 &&
+		len(headers[0][0]) > 1 && headers[0][0][1] == 'm' &&
+		len(headers[1][0]) > 1 && headers[1][0][1] == 'p' {
+		c.method = headers[0][1]
+		p := headers[1][1]
+		if i := strings.IndexByte(p, '?'); i >= 0 {
+			c.path = p[:i]
+			c.rawQuery = p[i+1:]
+		} else {
+			c.path = p
 		}
-		if found == 2 {
-			return
-		}
+		return
 	}
 
-	// Slow fallback: scan all headers.
-	found := 0
+	// Fallback: scan all headers (non-standard ordering or malformed).
 	for _, h := range headers {
 		switch h[0] {
 		case ":method":
 			c.method = h[1]
-			found++
 		case ":path":
 			p := h[1]
 			if i := strings.IndexByte(p, '?'); i >= 0 {
@@ -153,10 +141,6 @@ func (c *Context) extractRequestInfo() {
 			} else {
 				c.path = p
 			}
-			found++
-		}
-		if found == 2 {
-			return
 		}
 	}
 }

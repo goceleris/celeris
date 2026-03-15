@@ -16,15 +16,16 @@ import (
 const maxSendQueueBytes = 4 << 20 // 4 MiB
 
 type connState struct {
-	fd        int             // 8: real FD, or fixed file index
-	protocol  engine.Protocol // 1
-	detected  bool            // 1
-	sending   bool            // 1: true when a SEND SQE is in-flight
-	closing   bool            // 1: defers close until sends complete
-	dirty     bool            // 1: true when data needs flushing
-	fixedFile bool            // 1: true when fd is fixed file index
-	_         [2]byte
-	sendBuf   []byte // 24: in-flight buffer (accessed with sending flag)
+	fd         int             // 8: real FD, or fixed file index
+	protocol   engine.Protocol // 1
+	detected   bool            // 1
+	sending    bool            // 1: true when a SEND SQE is in-flight
+	closing    bool            // 1: defers close until sends complete
+	dirty      bool            // 1: true when data needs flushing
+	fixedFile  bool            // 1: true when fd is fixed file index
+	recvLinked bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
+	_          [1]byte
+	sendBuf    []byte // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
 	buf       []byte     // 24: per-connection recv buffer
@@ -79,6 +80,7 @@ func releaseConnState(cs *connState) {
 	cs.closing = false
 	cs.dirty = false
 	cs.fixedFile = false
+	cs.recvLinked = false
 	cs.lastActivity = 0
 	cs.fd = 0
 	connStatePool.Put(cs)
