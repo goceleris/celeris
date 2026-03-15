@@ -48,6 +48,7 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
+	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	phase                  Phase
@@ -77,6 +78,7 @@ func NewH1Stream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
 	s.State = StateIdle
+	s.h1Mode = true
 	s.ctx = bgCtx
 	// Pre-allocate header capacity to avoid allocation in requestToStream.
 	// After the first Release, capacity is preserved from the previous request.
@@ -151,6 +153,7 @@ func (s *Stream) Release() {
 	s.ReceivedInitialHeaders = false
 	s.ClosedByReset = false
 	s.IsHEAD = false
+	s.h1Mode = false
 	s.ctx = nil
 	s.cancel = nil
 	s.phase = 0
@@ -234,8 +237,13 @@ func (s *Stream) GetData() []byte {
 	return s.Data.Bytes()
 }
 
-// GetHeaders returns a copy of the headers.
+// GetHeaders returns the headers. For single-threaded H1 streams, returns
+// the slice directly (no lock, no copy). For H2 streams, returns a safe copy
+// under lock.
 func (s *Stream) GetHeaders() [][2]string {
+	if s.h1Mode {
+		return s.Headers
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	headers := make([][2]string, len(s.Headers))

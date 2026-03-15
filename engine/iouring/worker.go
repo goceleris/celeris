@@ -211,10 +211,23 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Process ready CQEs without a syscall. When CQEs are already in the
-		// completion ring (from the previous iteration's wait), we consume them
-		// immediately — pure userspace, no io_uring_enter needed.
+		// Submit pending SENDs from previous iteration + wait for CQEs in
+		// a single io_uring_enter syscall. Skip when CQEs are already ready
+		// and nothing is pending (pure userspace fast path).
+		hasPending := w.ring.Pending() > 0
 		cqHead, cqTail := w.ring.BeginCQ()
+		if hasPending || cqHead == cqTail {
+			waitTimeout := 100 * time.Millisecond
+			if w.listenFD < 0 {
+				waitTimeout = 1 * time.Second
+			}
+			if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
+				w.shutdown()
+				return
+			}
+			cqHead, cqTail = w.ring.BeginCQ()
+		}
+
 		if cqHead != cqTail {
 			now := time.Now().UnixNano()
 			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
@@ -252,27 +265,15 @@ func (w *Worker) run(ctx context.Context) {
 			cs = next
 		}
 
-		// Submit pending SENDs + wait for new CQEs in a single io_uring_enter
-		// syscall. By processing CQEs first (above), then flushing response
-		// SENDs into the SQ ring, we merge what was previously two separate
-		// syscalls (SubmitAndWaitTimeout + Submit) into one per iteration.
-		// The kernel starts sending data immediately upon entry while
-		// simultaneously waiting for new completions — no pipeline stall.
-		// SQPOLL: kernel polls SQ ring automatically; clear pending counter.
-		// Fast path: skip syscall when CQEs are already ready and nothing pending.
+		// Submit SEND SQEs. With SQPOLL, the kernel thread polls the SQ ring
+		// automatically — no Submit syscall needed. Without SQPOLL, submit
+		// immediately to avoid deferring SENDs to the next iteration (~10%
+		// throughput loss under H1 keep-alive).
 		if w.sqpoll {
 			w.ring.ClearPending()
-		}
-		hasPending := w.ring.Pending() > 0
-		cqHead, cqTail = w.ring.BeginCQ()
-		if hasPending || cqHead == cqTail {
-			waitTimeout := 100 * time.Millisecond
-			if w.listenFD < 0 {
-				waitTimeout = 1 * time.Second
-			}
-			if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
-				w.shutdown()
-				return
+		} else if w.ring.Pending() > 0 {
+			if _, err := w.ring.Submit(); err != nil {
+				w.logger.Error("submit failed", "worker", w.id, "err", err)
 			}
 		}
 
