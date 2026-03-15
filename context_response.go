@@ -30,7 +30,7 @@ func init() {
 }
 
 func itoa(n int) string {
-	if n >= 0 && n < len(smallInts) {
+	if uint(n) < uint(len(smallInts)) {
 		return smallInts[n]
 	}
 	return strconv.Itoa(n)

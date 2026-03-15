@@ -130,11 +130,9 @@ func (l *Loop) run(ctx context.Context) {
 	}
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			l.shutdown()
 			return
-		default:
 		}
 
 		// ACTIVE → DRAINING: close listen socket to leave SO_REUSEPORT group.
@@ -178,7 +176,10 @@ func (l *Loop) run(ctx context.Context) {
 			continue
 		}
 
-		now := time.Now().UnixNano()
+		var now int64
+		if n > 0 {
+			now = time.Now().UnixNano()
+		}
 		for i := range n {
 			ev := &l.events[i]
 			fd := int(ev.Fd)

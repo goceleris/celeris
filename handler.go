@@ -42,7 +42,9 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 	c.handlers = handlers
 	c.fullPath = fullPath
 
-	a.handleError(c, s, c.Next())
+	if err := c.Next(); err != nil {
+		a.handleError(c, s, err)
+	}
 	if c.buffered && !c.written {
 		c.bufferDepth = 1
 		_ = c.FlushResponse()
