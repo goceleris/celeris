@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -86,7 +87,7 @@ func (c *Context) XML(code int, v any) error {
 // HTML writes an HTML response with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) HTML(code int, html string) error {
-	return c.Blob(code, "text/html; charset=utf-8", []byte(html))
+	return c.Blob(code, "text/html; charset=utf-8", unsafe.Slice(unsafe.StringData(html), len(html)))
 }
 
 // String writes a formatted string response.
@@ -98,7 +99,7 @@ func (c *Context) String(code int, format string, args ...any) error {
 	} else {
 		body = format
 	}
-	return c.Blob(code, "text/plain", []byte(body))
+	return c.Blob(code, "text/plain", unsafe.Slice(unsafe.StringData(body), len(body)))
 }
 
 // Blob writes a response with the given content type and data.
@@ -124,8 +125,7 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		c.capturedStatus = code
 		c.capturedType = contentType
 	}
-	var hdrBuf [8][2]string
-	headers := hdrBuf[:0:8]
+	headers := c.respHdrBuf[:0:8]
 	if len(c.respHeaders)+2 > 8 {
 		headers = make([][2]string, 0, len(c.respHeaders)+2)
 	}

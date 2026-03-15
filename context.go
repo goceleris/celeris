@@ -67,6 +67,8 @@ type Context struct {
 
 	detached   bool
 	detachDone chan struct{}
+
+	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
 }
 
 var contextPool = sync.Pool{New: func() any { return &Context{} }}

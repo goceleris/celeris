@@ -8,6 +8,9 @@ import (
 
 var bufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
+// bgCtx is a cached context.Background() to avoid per-call interface boxing.
+var bgCtx = context.Background()
+
 func getBuf() *bytes.Buffer {
 	b := bufferPool.Get().(*bytes.Buffer)
 	b.Reset()
@@ -60,7 +63,7 @@ func NewStream(id uint32) *Stream {
 	s.Data = getBuf()
 	s.OutboundBuffer = getBuf()
 	s.WindowSize = 65535
-	s.ctx = context.Background()
+	s.ctx = bgCtx
 	s.phase = PhaseInit
 	return s
 }
@@ -73,7 +76,7 @@ func NewH1Stream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
 	s.State = StateIdle
-	s.ctx = context.Background()
+	s.ctx = bgCtx
 	// Pre-allocate header capacity to avoid allocation in requestToStream.
 	// After the first Release, capacity is preserved from the previous request.
 	if cap(s.Headers) < 16 {
