@@ -50,9 +50,9 @@ type Loop struct {
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
 
-	reqCount    *atomic.Uint64
-	activeConns *atomic.Int64
-	errCount    *atomic.Uint64
+	reqCount         *atomic.Uint64
+	activeConns      *atomic.Int64
+	errCount         *atomic.Uint64
 	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter      uint32
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
@@ -409,7 +409,6 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
-	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	releaseConnState(cs)
 	l.conns[fd] = nil
@@ -534,7 +533,6 @@ func (l *Loop) closeConn(fd int) {
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
-	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
@@ -559,7 +557,6 @@ func (l *Loop) shutdown() {
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
-		cs.cancel()
 		_ = unix.Close(fd)
 		releaseConnState(cs)
 		l.conns[fd] = nil

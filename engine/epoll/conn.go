@@ -39,7 +39,6 @@ type connState struct {
 	h1State    *conn.H1State
 	h2State    *conn.H2State
 	ctx        context.Context
-	cancel     context.CancelFunc
 	remoteAddr string
 	writeFn    func([]byte) // cached write function
 }
@@ -54,10 +53,8 @@ var connStatePool = sync.Pool{
 
 func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
 	cs := connStatePool.Get().(*connState)
-	childCtx, cancel := context.WithCancel(ctx)
 	cs.fd = fd
-	cs.ctx = childCtx
-	cs.cancel = cancel
+	cs.ctx = ctx
 	cs.writeBuf = cs.writeBuf[:0]
 	cs.writePos = 0
 	if cap(cs.buf) >= bufSize {
@@ -72,7 +69,6 @@ func releaseConnState(cs *connState) {
 	cs.h1State = nil
 	cs.h2State = nil
 	cs.ctx = nil
-	cs.cancel = nil
 	cs.writeFn = nil
 	cs.remoteAddr = ""
 	cs.dirtyNext = nil

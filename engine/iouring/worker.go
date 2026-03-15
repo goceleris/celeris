@@ -61,9 +61,9 @@ type Worker struct {
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
 
-	reqCount    *atomic.Uint64
-	activeConns *atomic.Int64
-	errCount    *atomic.Uint64
+	reqCount         *atomic.Uint64
+	activeConns      *atomic.Int64
+	errCount         *atomic.Uint64
 	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter      uint32
 	consecutiveEmpty uint32 // consecutive iterations with no CQEs (for adaptive timeout)
@@ -466,7 +466,6 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
-	cs.cancel()
 	releaseConnState(cs)
 	w.conns[fd] = nil
 	w.connCount--
@@ -667,7 +666,6 @@ func (w *Worker) closeConn(fd int) {
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
-	cs.cancel()
 
 	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
@@ -886,7 +884,6 @@ func (w *Worker) shutdown() {
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
-		cs.cancel()
 		isFixedFile := cs.fixedFile
 		releaseConnState(cs)
 		w.conns[fd] = nil
