@@ -168,6 +168,35 @@ func (s *Stream) Release() {
 	streamPool.Put(s)
 }
 
+// ResetH1Stream performs a lightweight per-request reset for H1 stream reuse.
+// Unlike Release(), it does NOT return the stream to the pool. It clears only
+// the fields that change between requests, retaining header slice capacity
+// and the context reference. Called between requests on keep-alive connections
+// to avoid sync.Pool Get/Put overhead.
+func ResetH1Stream(s *Stream) {
+	if s.Data != nil {
+		s.Data.Reset()
+		bufferPool.Put(s.Data)
+		s.Data = nil
+	}
+	s.Headers = s.Headers[:0]
+	s.Trailers = s.Trailers[:0]
+	s.OutboundEndStream = false
+	s.HeadersSent = false
+	s.EndStream = false
+	s.IsStreaming = false
+	s.HandlerStarted = false
+	s.DeferResponse = false
+	s.ResponseWriter = nil
+	s.RemoteAddr = ""
+	s.ReceivedDataLen = 0
+	s.ReceivedInitialHeaders = false
+	s.ClosedByReset = false
+	s.IsHEAD = false
+	s.State = StateIdle
+	s.ctx = bgCtx
+}
+
 // AddHeader adds a header to the stream.
 func (s *Stream) AddHeader(name, value string) {
 	s.mu.Lock()

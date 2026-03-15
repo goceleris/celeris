@@ -641,6 +641,9 @@ func (w *Worker) closeConn(fd int) {
 		return
 	}
 	w.removeDirty(cs)
+	if cs.h1State != nil {
+		conn.CloseH1(cs.h1State)
+	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -853,6 +856,9 @@ func (w *Worker) shutdown() {
 		cs := w.conns[fd]
 		if cs == nil {
 			continue
+		}
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)

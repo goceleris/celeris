@@ -530,6 +530,9 @@ func (l *Loop) closeConn(fd int) {
 		return
 	}
 	l.removeDirty(cs)
+	if cs.h1State != nil {
+		conn.CloseH1(cs.h1State)
+	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
@@ -553,6 +556,9 @@ func (l *Loop) shutdown() {
 		cs := l.conns[fd]
 		if cs == nil {
 			continue
+		}
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
