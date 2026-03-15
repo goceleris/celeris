@@ -6,11 +6,19 @@ import (
 	"sync"
 )
 
+// staticEntry holds the pre-composed handler chain and full path for a fully
+// static route, enabling O(1) map lookup instead of a trie walk.
+type staticEntry struct {
+	handlers []HandlerFunc
+	fullPath string
+}
+
 // router is a compressed radix trie router with a separate tree per HTTP method.
 type router struct {
-	trees       map[string]*node
-	namedRoutes map[string]*Route
-	namedMu     sync.RWMutex
+	trees        map[string]*node
+	staticRoutes map[string]map[string]staticEntry // method -> path -> entry
+	namedRoutes  map[string]*Route
+	namedMu      sync.RWMutex
 }
 
 // Route is an opaque handle to a registered route. Use the Name method to
@@ -69,13 +77,23 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 	chain = append(chain, middleware...)
 	chain = append(chain, final)
 	r.node.handlers = chain
+
+	// Keep the static fast-path map in sync with the updated chain.
+	if r.router != nil {
+		if m := r.router.staticRoutes[r.method]; m != nil {
+			if _, ok := m[r.path]; ok {
+				m[r.path] = staticEntry{handlers: chain, fullPath: r.path}
+			}
+		}
+	}
 	return r
 }
 
 func newRouter() *router {
 	return &router{
-		trees:       make(map[string]*node),
-		namedRoutes: make(map[string]*Route),
+		trees:        make(map[string]*node),
+		staticRoutes: make(map[string]map[string]staticEntry),
+		namedRoutes:  make(map[string]*Route),
 	}
 }
 
@@ -97,6 +115,12 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 		root.handlers = handlers
 		root.fullPath = "/"
 		route.node = root
+		m := r.staticRoutes[method]
+		if m == nil {
+			m = make(map[string]staticEntry)
+			r.staticRoutes[method] = m
+		}
+		m["/"] = staticEntry{handlers: handlers, fullPath: "/"}
 		return route
 	}
 
@@ -109,10 +133,39 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 	current.handlers = handlers
 	current.fullPath = path
 	route.node = current
+
+	// Register in static map for O(1) lookup on fully static paths.
+	if isStaticPath(path) {
+		m := r.staticRoutes[method]
+		if m == nil {
+			m = make(map[string]staticEntry)
+			r.staticRoutes[method] = m
+		}
+		m[path] = staticEntry{handlers: handlers, fullPath: path}
+	}
+
 	return route
 }
 
+// isStaticPath reports whether path contains no parameter (`:`) or catchAll
+// (`*`) segments, making it eligible for the O(1) static fast path.
+func isStaticPath(path string) bool {
+	for i := range len(path) {
+		if path[i] == ':' || path[i] == '*' {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string) {
+	// Static fast path: O(1) map lookup for fully static routes.
+	if m := r.staticRoutes[method]; m != nil {
+		if e, ok := m[path]; ok {
+			return e.handlers, e.fullPath
+		}
+	}
+
 	root := r.trees[method]
 	if root == nil {
 		return nil, ""

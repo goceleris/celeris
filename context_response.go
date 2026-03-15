@@ -20,12 +20,32 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
-var jsonBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 4096)
-		return &b
-	},
+var smallInts [1000]string
+
+func init() {
+	for i := range smallInts {
+		smallInts[i] = strconv.Itoa(i)
+	}
 }
+
+func itoa(n int) string {
+	if n >= 0 && n < len(smallInts) {
+		return smallInts[n]
+	}
+	return strconv.Itoa(n)
+}
+
+type jsonState struct {
+	buf bytes.Buffer
+	enc *json.Encoder
+}
+
+var jsonEncPool = sync.Pool{New: func() any {
+	s := &jsonState{}
+	s.enc = json.NewEncoder(&s.buf)
+	s.enc.SetEscapeHTML(false)
+	return s
+}}
 
 // Status sets the response status code and returns the Context for chaining.
 // Note: response methods (JSON, Blob, etc.) take their own status code
@@ -38,33 +58,19 @@ func (c *Context) Status(code int) *Context {
 // JSON serializes v as JSON and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) JSON(code int, v any) error {
-	bp := jsonBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	var err error
-	buf, err = appendJSON(buf, v)
-	if err != nil {
-		*bp = buf
-		jsonBufPool.Put(bp)
+	js := jsonEncPool.Get().(*jsonState)
+	js.buf.Reset()
+	if err := js.enc.Encode(v); err != nil {
+		jsonEncPool.Put(js)
 		return err
 	}
-	err = c.Blob(code, "application/json", buf)
-	*bp = buf
-	jsonBufPool.Put(bp)
-	return err
-}
-
-func appendJSON(buf []byte, v any) ([]byte, error) {
-	w := bytes.NewBuffer(buf)
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return buf, err
-	}
-	b := w.Bytes()
+	b := js.buf.Bytes()
 	if len(b) > 0 && b[len(b)-1] == '\n' {
 		b = b[:len(b)-1]
 	}
-	return b, nil
+	err := c.Blob(code, "application/json", b)
+	jsonEncPool.Put(js)
+	return err
 }
 
 // XML serializes v as XML and writes it with the given status code.
@@ -124,7 +130,7 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		headers = make([][2]string, 0, len(c.respHeaders)+2)
 	}
 	headers = append(headers, [2]string{"content-type", contentType})
-	headers = append(headers, [2]string{"content-length", strconv.Itoa(len(data))})
+	headers = append(headers, [2]string{"content-length", itoa(len(data))})
 	headers = append(headers, c.respHeaders...)
 	if c.stream.ResponseWriter != nil {
 		return c.stream.ResponseWriter.WriteResponse(c.stream, code, headers, data)

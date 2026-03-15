@@ -66,6 +66,14 @@ var (
 	statusLine503 = []byte("HTTP/1.1 503 Service Unavailable\r\n")
 
 	crlf = []byte("\r\n")
+
+	// Pre-built content-type header lines for common MIME types.
+	// Avoids per-byte append and sanitization on the hot path.
+	ctJSON  = []byte("content-type: application/json\r\n")
+	ctPlain = []byte("content-type: text/plain\r\n")
+	ctHTML  = []byte("content-type: text/html; charset=utf-8\r\n")
+	ctXML   = []byte("content-type: application/xml\r\n")
+	ctOctet = []byte("content-type: application/octet-stream\r\n")
 )
 
 var responseBufferPool = sync.Pool{
@@ -122,14 +130,45 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 
 	// Merged loop: check for content-length while appending headers.
 	hasContentLength := false
-	for _, h := range headers {
+	for i, h := range headers {
 		if h[0] == "content-length" {
 			hasContentLength = true
 		}
-		buf = appendSanitizedHeaderField(buf, h[0])
-		buf = append(buf, ": "...)
-		buf = appendSanitizedHeaderField(buf, h[1])
-		buf = append(buf, crlf...)
+		// Fast path: pre-built header lines for common framework-generated
+		// content-type values, avoiding per-byte append and sanitization.
+		if h[0] == "content-type" {
+			switch h[1] {
+			case "application/json":
+				buf = append(buf, ctJSON...)
+				continue
+			case "text/plain":
+				buf = append(buf, ctPlain...)
+				continue
+			case "text/html; charset=utf-8":
+				buf = append(buf, ctHTML...)
+				continue
+			case "application/xml":
+				buf = append(buf, ctXML...)
+				continue
+			case "application/octet-stream":
+				buf = append(buf, ctOctet...)
+				continue
+			}
+		}
+		// The first 2 headers are framework-generated (content-type,
+		// content-length) and guaranteed clean. Skip sanitization
+		// for them; only sanitize user-supplied headers (index >= 2).
+		if i < 2 {
+			buf = append(buf, h[0]...)
+			buf = append(buf, ": "...)
+			buf = append(buf, h[1]...)
+			buf = append(buf, crlf...)
+		} else {
+			buf = appendSanitizedHeaderField(buf, h[0])
+			buf = append(buf, ": "...)
+			buf = appendSanitizedHeaderField(buf, h[1])
+			buf = append(buf, crlf...)
+		}
 	}
 	if !hasContentLength && len(body) > 0 {
 		buf = append(buf, "content-length: "...)
@@ -424,7 +463,7 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 	defer a.mu.Unlock()
 
 	responseHeaders := make([][2]string, 0, len(headers)+1)
-	responseHeaders = append(responseHeaders, [2]string{":status", strconv.Itoa(status)})
+	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
 	responseHeaders = append(responseHeaders, headers...)
 
 	headerBlock, err := a.encoder.Encode(responseHeaders)

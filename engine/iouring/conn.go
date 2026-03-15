@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"context"
+	"sync"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
@@ -40,17 +41,49 @@ type connState struct {
 	writeFn    func([]byte) // cached write function (avoids closure allocation per recv)
 }
 
-func newConnState(ctx context.Context, fd int, bufSize int) *connState {
+var connStatePool = sync.Pool{
+	New: func() any {
+		return &connState{
+			writeBuf: make([]byte, 0, 4096),
+			sendBuf:  make([]byte, 0, 4096),
+		}
+	},
+}
+
+func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
+	cs := connStatePool.Get().(*connState)
 	childCtx, cancel := context.WithCancel(ctx)
-	cs := &connState{
-		fd:       fd,
-		writeBuf: make([]byte, 0, 4096),
-		sendBuf:  make([]byte, 0, 4096),
-		ctx:      childCtx,
-		cancel:   cancel,
-	}
+	cs.fd = fd
+	cs.ctx = childCtx
+	cs.cancel = cancel
+	cs.writeBuf = cs.writeBuf[:0]
+	cs.sendBuf = cs.sendBuf[:0]
 	if bufSize > 0 {
-		cs.buf = make([]byte, bufSize)
+		if cap(cs.buf) >= bufSize {
+			cs.buf = cs.buf[:bufSize]
+		} else {
+			cs.buf = make([]byte, bufSize)
+		}
 	}
 	return cs
+}
+
+func releaseConnState(cs *connState) {
+	cs.h1State = nil
+	cs.h2State = nil
+	cs.ctx = nil
+	cs.cancel = nil
+	cs.writeFn = nil
+	cs.remoteAddr = ""
+	cs.dirtyNext = nil
+	cs.dirtyPrev = nil
+	cs.protocol = 0
+	cs.detected = false
+	cs.sending = false
+	cs.closing = false
+	cs.dirty = false
+	cs.fixedFile = false
+	cs.lastActivity = 0
+	cs.fd = 0
+	connStatePool.Put(cs)
 }

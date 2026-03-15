@@ -64,8 +64,9 @@ type Worker struct {
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
-	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
-	tickCounter uint32
+	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
+	tickCounter      uint32
+	consecutiveEmpty uint32 // consecutive iterations with no CQEs (for adaptive timeout)
 
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
@@ -217,7 +218,7 @@ func (w *Worker) run(ctx context.Context) {
 		hasPending := w.ring.Pending() > 0
 		cqHead, cqTail := w.ring.BeginCQ()
 		if hasPending || cqHead == cqTail {
-			waitTimeout := 100 * time.Millisecond
+			waitTimeout := w.adaptiveTimeout()
 			if w.listenFD < 0 {
 				waitTimeout = 1 * time.Second
 			}
@@ -228,7 +229,8 @@ func (w *Worker) run(ctx context.Context) {
 			cqHead, cqTail = w.ring.BeginCQ()
 		}
 
-		if cqHead != cqTail {
+		hadCQEs := cqHead != cqTail
+		if hadCQEs {
 			now := time.Now().UnixNano()
 			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
 				entry := w.ring.cqeAt(cqHead)
@@ -237,6 +239,13 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 		w.ring.EndCQ(cqHead)
+
+		// Adaptive timeout tracking: reset on activity, increment on empty.
+		if hadCQEs {
+			w.consecutiveEmpty = 0
+		} else {
+			w.consecutiveEmpty++
+		}
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per CQE batch,
@@ -309,6 +318,19 @@ func (w *Worker) run(ctx context.Context) {
 	}
 }
 
+func (w *Worker) adaptiveTimeout() time.Duration {
+	switch {
+	case w.consecutiveEmpty == 0:
+		return 1 * time.Millisecond
+	case w.consecutiveEmpty <= 10:
+		return 10 * time.Millisecond
+	case w.consecutiveEmpty <= 100:
+		return 50 * time.Millisecond
+	default:
+		return 100 * time.Millisecond
+	}
+}
+
 func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) {
 	op := decodeOp(c.UserData)
 	fd := decodeFD(c.UserData)
@@ -376,7 +398,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	cs := newConnState(ctx, newFD, bufSize)
+	cs := acquireConnState(ctx, newFD, bufSize)
 	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {
@@ -445,6 +467,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
 	cs.cancel()
+	releaseConnState(cs)
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
@@ -667,7 +690,13 @@ func (w *Worker) finishClose(fd int) {
 		w.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	if cs != nil && cs.fixedFile {
+	isFixedFile := cs != nil && cs.fixedFile
+
+	if cs != nil {
+		releaseConnState(cs)
+	}
+
+	if isFixedFile {
 		// Fixed file: close via io_uring direct close (no real FD to shutdown).
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
@@ -858,7 +887,10 @@ func (w *Worker) shutdown() {
 			conn.CloseH2(cs.h2State)
 		}
 		cs.cancel()
-		if !cs.fixedFile {
+		isFixedFile := cs.fixedFile
+		releaseConnState(cs)
+		w.conns[fd] = nil
+		if !isFixedFile {
 			_ = unix.Close(fd)
 		}
 	}

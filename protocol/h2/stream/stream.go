@@ -51,16 +51,16 @@ type Stream struct {
 }
 
 // NewStream creates a new stream with full H2 initialization (context, buffers).
+// Uses context.Background() directly (no WithCancel) to avoid allocation;
+// cancel semantics are lazily created via EnsureCancel only when needed.
 func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
-	ctx, cancel := context.WithCancel(context.Background())
 	s.ID = id
 	s.State = StateIdle
 	s.Data = getBuf()
 	s.OutboundBuffer = getBuf()
 	s.WindowSize = 65535
-	s.ctx = ctx
-	s.cancel = cancel
+	s.ctx = context.Background()
 	s.phase = PhaseInit
 	return s
 }
@@ -93,6 +93,15 @@ func (s *Stream) GetBuf() *bytes.Buffer {
 // Context returns the stream's context.
 func (s *Stream) Context() context.Context {
 	return s.ctx
+}
+
+// EnsureCancel lazily creates a cancellable context for this stream.
+// Called when the stream needs cancel semantics (e.g., RST_STREAM).
+func (s *Stream) EnsureCancel() {
+	if s.cancel != nil {
+		return
+	}
+	s.ctx, s.cancel = context.WithCancel(s.ctx)
 }
 
 // Cancel cancels the stream's context.
@@ -161,6 +170,13 @@ func (s *Stream) AddHeader(name, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Headers = append(s.Headers, [2]string{name, value})
+}
+
+// AddHeadersBatch adds multiple headers under a single lock acquisition.
+func (s *Stream) AddHeadersBatch(headers [][2]string) {
+	s.mu.Lock()
+	s.Headers = append(s.Headers, headers...)
+	s.mu.Unlock()
 }
 
 // AddData adds data to the stream buffer.

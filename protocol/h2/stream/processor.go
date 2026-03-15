@@ -455,9 +455,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
 				return fmt.Errorf("invalid trailers: %w", err)
 			}
-			for _, h := range trailers {
-				existingStream.AddHeader(h[0], h[1])
-			}
+			existingStream.AddHeadersBatch(trailers)
 
 			if f.StreamEnded() {
 				existingStream.EndStream = true
@@ -538,9 +536,10 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 	for _, h := range headers {
 		if h[0] == ":method" && h[1] == "HEAD" {
 			stream.IsHEAD = true
+			break
 		}
-		stream.AddHeader(h[0], h[1])
 	}
+	stream.AddHeadersBatch(headers)
 	stream.ReceivedInitialHeaders = true
 
 	if f.StreamEnded() {
@@ -840,9 +839,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
 				return fmt.Errorf("invalid trailers: %w", err)
 			}
-			for _, h := range headers {
-				stream.AddHeader(h[0], h[1])
-			}
+			stream.AddHeadersBatch(headers)
 		} else {
 			if err := validateRequestHeaders(headers); err != nil {
 				p.continuationState = nil
@@ -852,9 +849,10 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 			for _, h := range headers {
 				if h[0] == ":method" && h[1] == "HEAD" {
 					stream.IsHEAD = true
+					break
 				}
-				stream.AddHeader(h[0], h[1])
 			}
+			stream.AddHeadersBatch(headers)
 			stream.ReceivedInitialHeaders = true
 			if stream.ResponseWriter == nil {
 				stream.ResponseWriter = p.connWriter
