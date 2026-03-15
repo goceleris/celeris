@@ -68,9 +68,10 @@ type Worker struct {
 	tickCounter uint32
 	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead     *connState // head of intrusive doubly-linked dirty list
-	hasBufReturns bool       // set when provided buffers need publishing
-	h2cfg         conn.H2Config
+	dirtyHead      *connState // head of intrusive doubly-linked dirty list
+	hasBufReturns  bool       // set when provided buffers need publishing
+	sendsPending   bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2cfg          conn.H2Config
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -213,15 +214,19 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Submit pending SENDs + wait for CQEs. Three modes:
+		// Submit pending SENDs + wait for CQEs. Four modes:
 		// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
 		// 2. CQEs already ready, nothing pending → skip syscall entirely
-		// 3. No CQEs → SubmitAndWaitTimeout() (submit pending + wait with timeout)
+		// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
+		// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
 		//
-		// Mode 1 avoids the ext_arg overhead of SubmitAndWaitTimeout (kernel
-		// skips timer setup + sigset parsing), saving ~100-200ns per call.
-		// Combined with the single-submit design (no mid-loop Submit), the
-		// total syscall count is halved vs the original two-submit loop.
+		// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
+		// setup/teardown and sigset parsing, saving ~200-500ns per call.
+		// Mode 3a is safe because SEND SQEs always produce CQEs (no
+		// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
+		// Mode 3b uses a timeout because the only pending SQEs may have
+		// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
+		// need a timeout for graceful shutdown via ctx.Err() checks.
 		hasPending := w.ring.Pending() > 0
 		cqHead, cqTail := w.ring.BeginCQ()
 		if cqHead != cqTail && hasPending {
@@ -230,10 +235,17 @@ func (w *Worker) run(ctx context.Context) {
 				w.shutdown()
 				return
 			}
+		} else if hasPending && w.sendsPending {
+			// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
+			// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
+			if err := w.ring.SubmitAndWait(); err != nil {
+				w.shutdown()
+				return
+			}
+			cqHead, cqTail = w.ring.BeginCQ()
 		} else if hasPending || cqHead == cqTail {
-			// Mode 3: submit pending (if any) + wait for CQE with timeout.
-			// Timeout ensures periodic ctx.Err() checks for graceful shutdown
-			// and handles CQE_SKIP_SUCCESS SQEs that may not produce CQEs.
+			// Mode 3b: no guaranteed CQEs — wait with timeout for
+			// shutdown checks and CQE_SKIP_SUCCESS operations.
 			waitTimeout := 100 * time.Millisecond
 			if w.listenFD < 0 {
 				waitTimeout = 1 * time.Second
@@ -244,6 +256,7 @@ func (w *Worker) run(ctx context.Context) {
 			}
 			cqHead, cqTail = w.ring.BeginCQ()
 		}
+		w.sendsPending = false
 
 		if cqHead != cqTail {
 			// Refresh cached timestamp every 64 iterations to amortize
@@ -862,6 +875,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		}
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 		cs.sending = true
+		w.sendsPending = true
 		return false
 	}
 
@@ -885,6 +899,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 	}
 	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	cs.sending = true
+	w.sendsPending = true
 	return false
 }
 
@@ -940,6 +955,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	}
 	cs.sending = true
+	w.sendsPending = true
 	return false
 }
 
