@@ -402,6 +402,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 			l.closeConn(fd)
 			return
 		}
+
+		// Short read: socket is provably drained (read returned fewer bytes
+		// than the buffer can hold). Skip the EAGAIN-producing read that would
+		// otherwise cost one wasted syscall per request. Edge-triggered epoll
+		// will notify when new data arrives on this fd.
+		if n < len(cs.buf) {
+			return
+		}
 	}
 }
 
