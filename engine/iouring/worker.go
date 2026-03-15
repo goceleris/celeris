@@ -376,7 +376,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	cs := newConnState(ctx, newFD, bufSize)
+	cs := acquireConnState(ctx, newFD, bufSize)
 	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {
@@ -444,10 +444,10 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
-	cs.cancel()
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	releaseConnState(cs)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
@@ -647,7 +647,6 @@ func (w *Worker) closeConn(fd int) {
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
-	cs.cancel()
 
 	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
@@ -670,7 +669,12 @@ func (w *Worker) finishClose(fd int) {
 		w.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	if cs != nil && cs.fixedFile {
+	fixedFile := cs != nil && cs.fixedFile
+	if cs != nil {
+		releaseConnState(cs)
+	}
+
+	if fixedFile {
 		// Fixed file: close via io_uring direct close (no real FD to shutdown).
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
@@ -863,10 +867,10 @@ func (w *Worker) shutdown() {
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
-		cs.cancel()
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
+		releaseConnState(cs)
 	}
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
