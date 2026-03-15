@@ -253,7 +253,7 @@ func (w *Worker) run(ctx context.Context) {
 				w.cachedNow = time.Now().UnixNano()
 			}
 			now := w.cachedNow
-			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
+			for cqHead != cqTail {
 				entry := w.ring.cqeAt(cqHead)
 				// Inlined CQE dispatch — eliminates processCQE method call
 				// and avoids passing context.Context on every CQE (only
