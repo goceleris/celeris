@@ -76,7 +76,17 @@ var contextPool = sync.Pool{New: func() any { return &Context{} }}
 const abortIndex int16 = math.MaxInt16 / 2
 
 func acquireContext(s *stream.Stream) *Context {
-	c := contextPool.Get().(*Context)
+	var c *Context
+	if s.CachedCtx != nil {
+		c = s.CachedCtx.(*Context)
+	} else {
+		c = contextPool.Get().(*Context)
+		// Cache on the stream for per-connection reuse (H1 keep-alive).
+		// H2 streams are not cached, so CachedCtx stays nil.
+		if s.CachedCtx == nil {
+			s.CachedCtx = c
+		}
+	}
 	c.stream = s
 	c.index = -1
 	c.statusCode = 200
@@ -87,8 +97,13 @@ func acquireContext(s *stream.Stream) *Context {
 }
 
 func releaseContext(c *Context) {
+	// If the context is cached on the stream for reuse, reset but
+	// do not return to the pool. The stream owns its lifecycle.
+	cached := c.stream != nil && c.stream.CachedCtx == c
 	c.reset()
-	contextPool.Put(c)
+	if !cached {
+		contextPool.Put(c)
+	}
 }
 
 func (c *Context) extractRequestInfo() {

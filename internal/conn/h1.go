@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/goceleris/celeris/internal/ctxkit"
 	h1 "github.com/goceleris/celeris/protocol/h1"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
@@ -47,9 +48,14 @@ func NewH1State() *H1State {
 	}
 }
 
-// CloseH1 releases the cached stream (if any) back to the pool.
+// CloseH1 releases the cached stream and context (if any) back to their pools.
 func CloseH1(state *H1State) {
 	if state.stream != nil {
+		// Release the cached context back to its pool before releasing the stream.
+		if state.stream.CachedCtx != nil {
+			ctxkit.ReleaseContext(state.stream.CachedCtx)
+			state.stream.CachedCtx = nil
+		}
 		state.stream.Release()
 		state.stream = nil
 	}

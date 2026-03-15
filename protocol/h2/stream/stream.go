@@ -51,6 +51,7 @@ type Stream struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	phase                  Phase
+	CachedCtx              any // per-connection cached context (avoids pool Get/Put per request)
 }
 
 // NewStream creates a new stream with full H2 initialization (context, buffers).
@@ -153,6 +154,7 @@ func (s *Stream) Release() {
 	s.ctx = nil
 	s.cancel = nil
 	s.phase = 0
+	s.CachedCtx = nil
 	// Drain the channel without blocking. Skip for H1 streams
 	// (channel is never written to) to avoid select dispatch overhead.
 	if len(s.ReceivedWindowUpd) > 0 {
