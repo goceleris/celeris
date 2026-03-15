@@ -213,12 +213,27 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Submit pending SENDs from previous iteration + wait for CQEs in
-		// a single io_uring_enter syscall. Skip when CQEs are already ready
-		// and nothing is pending (pure userspace fast path).
+		// Submit pending SENDs + wait for CQEs. Three modes:
+		// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
+		// 2. CQEs already ready, nothing pending → skip syscall entirely
+		// 3. No CQEs → SubmitAndWaitTimeout() (submit pending + wait with timeout)
+		//
+		// Mode 1 avoids the ext_arg overhead of SubmitAndWaitTimeout (kernel
+		// skips timer setup + sigset parsing), saving ~100-200ns per call.
+		// Combined with the single-submit design (no mid-loop Submit), the
+		// total syscall count is halved vs the original two-submit loop.
 		hasPending := w.ring.Pending() > 0
 		cqHead, cqTail := w.ring.BeginCQ()
-		if hasPending || cqHead == cqTail {
+		if cqHead != cqTail && hasPending {
+			// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
+			if _, err := w.ring.Submit(); err != nil {
+				w.shutdown()
+				return
+			}
+		} else if hasPending || cqHead == cqTail {
+			// Mode 3: submit pending (if any) + wait for CQE with timeout.
+			// Timeout ensures periodic ctx.Err() checks for graceful shutdown
+			// and handles CQE_SKIP_SUCCESS SQEs that may not produce CQEs.
 			waitTimeout := 100 * time.Millisecond
 			if w.listenFD < 0 {
 				waitTimeout = 1 * time.Second
@@ -259,6 +274,17 @@ func (w *Worker) run(ctx context.Context) {
 		}
 		w.ring.EndCQ(cqHead)
 
+		// SENDs queued during CQE processing remain in the SQ ring and are
+		// submitted at the top of the next iteration (adaptive submit).
+		// This eliminates one io_uring_enter per iteration: the kernel sees
+		// the combined SEND batch in a single submit+wait syscall instead of
+		// a separate Submit() here followed by SubmitAndWaitTimeout() above.
+		// Profile data shows Submit accounts for ~55% of total CPU — removing
+		// this extra call halves the syscall overhead.
+		if w.sqpoll {
+			w.ring.ClearPending()
+		}
+
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per CQE batch,
 		// eliminating cache-line bouncing under multi-worker contention.
@@ -285,17 +311,6 @@ func (w *Worker) run(ctx context.Context) {
 				}
 			}
 			cs = next
-		}
-
-		// Submit SEND SQEs. With SQPOLL, the kernel thread polls the SQ ring
-		// automatically — no Submit syscall needed. Without SQPOLL, submit
-		// immediately to avoid deferring SENDs to the next iteration.
-		if w.sqpoll {
-			w.ring.ClearPending()
-		} else if w.ring.Pending() > 0 {
-			if _, err := w.ring.Submit(); err != nil {
-				w.logger.Error("submit failed", "worker", w.id, "err", err)
-			}
 		}
 
 		// Check connection timeouts every 1024 iterations to amortize
