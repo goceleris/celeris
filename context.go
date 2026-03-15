@@ -68,6 +68,8 @@ type Context struct {
 	detached   bool
 	detachDone chan struct{}
 
+	extended bool // true when keys/query/cookie/form/capture/buffer/detach were used
+
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
 }
 
@@ -194,6 +196,7 @@ func (c *Context) SetContext(ctx context.Context) {
 
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
+	c.extended = true
 	if c.keys == nil {
 		c.keys = make(map[string]any)
 	}
@@ -231,7 +234,6 @@ func (c *Context) reset() {
 		c.handlers = c.handlers[:0]
 	}
 	c.params = c.params[:0]
-	c.keys = nil
 	c.ctx = nil
 	c.method = ""
 	c.path = ""
@@ -241,24 +243,28 @@ func (c *Context) reset() {
 	c.respHeaders = c.respHeaders[:0]
 	c.written = false
 	c.aborted = false
-	c.queryCache = nil
-	c.queryCached = false
-	c.cookieCache = c.cookieCache[:0]
-	c.cookieCached = false
-	if c.multipartForm != nil {
-		_ = c.multipartForm.RemoveAll()
-		c.multipartForm = nil
-	}
-	c.formParsed = false
-	c.formValues = nil
-	c.maxFormSize = 0
-	c.captureBody = false
-	c.capturedBody = nil
-	c.capturedStatus = 0
-	c.capturedType = ""
-	c.bufferDepth = 0
-	c.buffered = false
 	c.bytesWritten = 0
-	c.detached = false
-	c.detachDone = nil
+	c.maxFormSize = 0
+	if c.extended {
+		c.keys = nil
+		c.queryCache = nil
+		c.queryCached = false
+		c.cookieCache = c.cookieCache[:0]
+		c.cookieCached = false
+		if c.multipartForm != nil {
+			_ = c.multipartForm.RemoveAll()
+			c.multipartForm = nil
+		}
+		c.formParsed = false
+		c.formValues = nil
+		c.captureBody = false
+		c.capturedBody = nil
+		c.capturedStatus = 0
+		c.capturedType = ""
+		c.bufferDepth = 0
+		c.buffered = false
+		c.detached = false
+		c.detachDone = nil
+		c.extended = false
+	}
 }

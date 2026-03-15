@@ -428,6 +428,7 @@ func (c *Context) Respond(code int, v any) error {
 // The response is written to the wire AND a copy is captured for inspection
 // (ideal for loggers). Use BufferResponse to defer the wire write entirely.
 func (c *Context) CaptureResponse() {
+	c.extended = true
 	c.captureBody = true
 }
 
@@ -444,6 +445,7 @@ func (c *Context) ResponseContentType() string { return c.capturedType }
 // layers can call BufferResponse — responses are depth-tracked and only sent
 // when the outermost layer calls FlushResponse.
 func (c *Context) BufferResponse() {
+	c.extended = true
 	c.bufferDepth++
 }
 
@@ -531,6 +533,7 @@ func (c *Context) Detach() (done func()) {
 	c.path = strings.Clone(c.path)
 	c.rawQuery = strings.Clone(c.rawQuery)
 
+	c.extended = true
 	c.detached = true
 	ch := make(chan struct{})
 	c.detachDone = ch

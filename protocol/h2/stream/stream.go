@@ -185,18 +185,9 @@ func ResetH1Stream(s *Stream) {
 		s.Data = nil
 	}
 	s.Headers = s.Headers[:0]
-	s.Trailers = s.Trailers[:0]
-	s.OutboundEndStream = false
 	s.HeadersSent = false
 	s.EndStream = false
-	s.IsStreaming = false
-	s.HandlerStarted = false
-	s.DeferResponse = false
 	s.ResponseWriter = nil
-	s.RemoteAddr = ""
-	s.ReceivedDataLen = 0
-	s.ReceivedInitialHeaders = false
-	s.ClosedByReset = false
 	s.IsHEAD = false
 	s.State = StateIdle
 	s.ctx = bgCtx

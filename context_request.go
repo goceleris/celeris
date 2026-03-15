@@ -79,6 +79,7 @@ func (c *Context) Query(key string) string {
 		return ""
 	}
 	if !c.queryCached {
+		c.extended = true
 		c.queryCache, _ = url.ParseQuery(c.rawQuery)
 		c.queryCached = true
 	}
@@ -116,6 +117,7 @@ func (c *Context) QueryValues(key string) []string {
 		return nil
 	}
 	if !c.queryCached {
+		c.extended = true
 		c.queryCache, _ = url.ParseQuery(c.rawQuery)
 		c.queryCached = true
 	}
@@ -128,6 +130,7 @@ func (c *Context) QueryParams() url.Values {
 		return nil
 	}
 	if !c.queryCached {
+		c.extended = true
 		c.queryCache, _ = url.ParseQuery(c.rawQuery)
 		c.queryCached = true
 	}
@@ -212,6 +215,7 @@ func (c *Context) Cookie(name string) (string, error) {
 }
 
 func (c *Context) parseCookies() {
+	c.extended = true
 	c.cookieCached = true
 	raw := c.Header("cookie")
 	if raw == "" {
@@ -366,6 +370,7 @@ func (c *Context) parseForm() error {
 	if c.formParsed {
 		return nil
 	}
+	c.extended = true
 	c.formParsed = true
 	c.formValues = make(url.Values) // always init before error paths
 	ct := c.Header("content-type")
