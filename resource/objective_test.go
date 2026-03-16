@@ -19,27 +19,8 @@ func TestObjectiveProfileString(t *testing.T) {
 	}
 }
 
-func TestWriteStrategyString(t *testing.T) {
-	tests := []struct {
-		strategy WriteStrategy
-		want     string
-	}{
-		{WriteImmediate, "immediate"},
-		{WriteBatched, "batched"},
-		{WriteStrategy(255), "unknown"},
-	}
-	for _, tt := range tests {
-		if got := tt.strategy.String(); got != tt.want {
-			t.Errorf("WriteStrategy(%d).String() = %q, want %q", tt.strategy, got, tt.want)
-		}
-	}
-}
-
 func TestResolveObjectiveLatency(t *testing.T) {
 	p := ResolveObjective(LatencyOptimized)
-	if p.CQBatch != 32 {
-		t.Errorf("CQBatch = %d, want 32", p.CQBatch)
-	}
 	if p.EpollTimeout != 0 {
 		t.Errorf("EpollTimeout = %v, want 0 (intentional for latency)", p.EpollTimeout)
 	}
@@ -51,9 +32,6 @@ func TestResolveObjectiveLatency(t *testing.T) {
 	}
 	if p.SQERingScale != 1 {
 		t.Errorf("SQERingScale = %d, want 1", p.SQERingScale)
-	}
-	if p.Write != WriteImmediate {
-		t.Errorf("Write = %v, want WriteImmediate", p.Write)
 	}
 	if p.SQPollIdle == 0 {
 		t.Error("SQPollIdle should be non-zero")
@@ -68,9 +46,6 @@ func TestResolveObjectiveLatency(t *testing.T) {
 
 func TestResolveObjectiveThroughput(t *testing.T) {
 	p := ResolveObjective(ThroughputOptimized)
-	if p.CQBatch != 256 {
-		t.Errorf("CQBatch = %d, want 256", p.CQBatch)
-	}
 	if p.EpollTimeout == 0 {
 		t.Error("EpollTimeout should be non-zero for throughput")
 	}
@@ -82,9 +57,6 @@ func TestResolveObjectiveThroughput(t *testing.T) {
 	}
 	if p.SQERingScale != 2 {
 		t.Errorf("SQERingScale = %d, want 2", p.SQERingScale)
-	}
-	if p.Write != WriteBatched {
-		t.Errorf("Write = %v, want WriteBatched", p.Write)
 	}
 	if p.SQPollIdle == 0 {
 		t.Error("SQPollIdle should be non-zero")
@@ -99,9 +71,6 @@ func TestResolveObjectiveThroughput(t *testing.T) {
 
 func TestResolveObjectiveBalanced(t *testing.T) {
 	p := ResolveObjective(BalancedObjective)
-	if p.CQBatch != 128 {
-		t.Errorf("CQBatch = %d, want 128", p.CQBatch)
-	}
 	if p.EpollTimeout == 0 {
 		t.Error("EpollTimeout should be non-zero for balanced")
 	}
@@ -113,9 +82,6 @@ func TestResolveObjectiveBalanced(t *testing.T) {
 	}
 	if p.SQERingScale != 1 {
 		t.Errorf("SQERingScale = %d, want 1", p.SQERingScale)
-	}
-	if p.Write != WriteBatched {
-		t.Errorf("Write = %v, want WriteBatched", p.Write)
 	}
 	if p.SQPollIdle == 0 {
 		t.Error("SQPollIdle should be non-zero")
