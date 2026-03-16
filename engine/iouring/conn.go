@@ -24,8 +24,8 @@ type connState struct {
 	dirty      bool            // 1: true when data needs flushing
 	fixedFile  bool            // 1: true when fd is fixed file index
 	recvLinked bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
-	_          [1]byte
-	sendBuf    []byte // 24: in-flight buffer (accessed with sending flag)
+	needsRecv  bool            // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	sendBuf    []byte          // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
 	buf       []byte     // 24: per-connection recv buffer
@@ -81,6 +81,7 @@ func releaseConnState(cs *connState) {
 	cs.dirty = false
 	cs.fixedFile = false
 	cs.recvLinked = false
+	cs.needsRecv = false
 	cs.lastActivity = 0
 	cs.fd = 0
 	connStatePool.Put(cs)
