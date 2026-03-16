@@ -67,6 +67,10 @@ type Context struct {
 
 	detached   bool
 	detachDone chan struct{}
+
+	extended bool // true when keys/query/cookie/form/capture/buffer/detach were used
+
+	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
 }
 
 var contextPool = sync.Pool{New: func() any { return &Context{} }}
@@ -74,7 +78,17 @@ var contextPool = sync.Pool{New: func() any { return &Context{} }}
 const abortIndex int16 = math.MaxInt16 / 2
 
 func acquireContext(s *stream.Stream) *Context {
-	c := contextPool.Get().(*Context)
+	var c *Context
+	if s.CachedCtx != nil {
+		c = s.CachedCtx.(*Context)
+	} else {
+		c = contextPool.Get().(*Context)
+		// Cache on the stream for per-connection reuse (H1 keep-alive).
+		// H2 streams are not cached, so CachedCtx stays nil.
+		if s.CachedCtx == nil {
+			s.CachedCtx = c
+		}
+	}
 	c.stream = s
 	c.index = -1
 	c.statusCode = 200
@@ -85,49 +99,42 @@ func acquireContext(s *stream.Stream) *Context {
 }
 
 func releaseContext(c *Context) {
+	// If the context is cached on the stream for reuse, reset but
+	// do not return to the pool. The stream owns its lifecycle.
+	cached := c.stream != nil && c.stream.CachedCtx == c
 	c.reset()
-	contextPool.Put(c)
+	if !cached {
+		contextPool.Put(c)
+	}
 }
 
 func (c *Context) extractRequestInfo() {
 	headers := c.stream.Headers
 
-	// Fast path: per HTTP/2 spec (RFC 9113 §8.3), pseudo-headers appear before
-	// regular headers. Our H1 parser also places them at indices 0-3. Check the
-	// first few positions directly to avoid a loop for 99.99% of requests (P7).
-	if len(headers) >= 2 {
-		found := 0
-		for i := range min(len(headers), 4) {
-			switch headers[i][0] {
-			case ":method":
-				c.method = headers[i][1]
-				found++
-			case ":path":
-				p := headers[i][1]
-				if i := strings.IndexByte(p, '?'); i >= 0 {
-					c.path = p[:i]
-					c.rawQuery = p[i+1:]
-				} else {
-					c.path = p
-				}
-				found++
-			}
-			if found == 2 {
-				return
-			}
+	// Direct index access: H1 (populateCachedStream) always places
+	// :method at [0] and :path at [1]. H2 (HPACK) usually follows the
+	// same convention. Check the first 2 bytes of each name to verify
+	// (":m" for :method, ":p" for :path) — this is faster than full
+	// string comparison and covers all production pseudo-header names.
+	if len(headers) >= 2 &&
+		len(headers[0][0]) > 1 && headers[0][0][1] == 'm' &&
+		len(headers[1][0]) > 1 && headers[1][0][1] == 'p' {
+		c.method = headers[0][1]
+		p := headers[1][1]
+		if i := strings.IndexByte(p, '?'); i >= 0 {
+			c.path = p[:i]
+			c.rawQuery = p[i+1:]
+		} else {
+			c.path = p
 		}
-		if found == 2 {
-			return
-		}
+		return
 	}
 
-	// Slow fallback: scan all headers.
-	found := 0
+	// Fallback: scan all headers (non-standard ordering or malformed).
 	for _, h := range headers {
 		switch h[0] {
 		case ":method":
 			c.method = h[1]
-			found++
 		case ":path":
 			p := h[1]
 			if i := strings.IndexByte(p, '?'); i >= 0 {
@@ -136,10 +143,6 @@ func (c *Context) extractRequestInfo() {
 			} else {
 				c.path = p
 			}
-			found++
-		}
-		if found == 2 {
-			return
 		}
 	}
 }
@@ -193,6 +196,7 @@ func (c *Context) SetContext(ctx context.Context) {
 
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
+	c.extended = true
 	if c.keys == nil {
 		c.keys = make(map[string]any)
 	}
@@ -230,7 +234,6 @@ func (c *Context) reset() {
 		c.handlers = c.handlers[:0]
 	}
 	c.params = c.params[:0]
-	c.keys = nil
 	c.ctx = nil
 	c.method = ""
 	c.path = ""
@@ -240,24 +243,28 @@ func (c *Context) reset() {
 	c.respHeaders = c.respHeaders[:0]
 	c.written = false
 	c.aborted = false
-	c.queryCache = nil
-	c.queryCached = false
-	c.cookieCache = c.cookieCache[:0]
-	c.cookieCached = false
-	if c.multipartForm != nil {
-		_ = c.multipartForm.RemoveAll()
-		c.multipartForm = nil
-	}
-	c.formParsed = false
-	c.formValues = nil
-	c.maxFormSize = 0
-	c.captureBody = false
-	c.capturedBody = nil
-	c.capturedStatus = 0
-	c.capturedType = ""
-	c.bufferDepth = 0
-	c.buffered = false
 	c.bytesWritten = 0
-	c.detached = false
-	c.detachDone = nil
+	c.maxFormSize = 0
+	if c.extended {
+		c.keys = nil
+		c.queryCache = nil
+		c.queryCached = false
+		c.cookieCache = c.cookieCache[:0]
+		c.cookieCached = false
+		if c.multipartForm != nil {
+			_ = c.multipartForm.RemoveAll()
+			c.multipartForm = nil
+		}
+		c.formParsed = false
+		c.formValues = nil
+		c.captureBody = false
+		c.capturedBody = nil
+		c.capturedStatus = 0
+		c.capturedType = ""
+		c.bufferDepth = 0
+		c.buffered = false
+		c.detached = false
+		c.detachDone = nil
+		c.extended = false
+	}
 }

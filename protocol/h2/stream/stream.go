@@ -8,6 +8,9 @@ import (
 
 var bufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
+// bgCtx is a cached context.Background() to avoid per-call interface boxing.
+var bgCtx = context.Background()
+
 func getBuf() *bytes.Buffer {
 	b := bufferPool.Get().(*bytes.Buffer)
 	b.Reset()
@@ -45,22 +48,24 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
+	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	phase                  Phase
+	CachedCtx              any // per-connection cached context (avoids pool Get/Put per request)
 }
 
 // NewStream creates a new stream with full H2 initialization (context, buffers).
+// Uses context.Background() directly (no WithCancel) to avoid allocation;
+// cancel semantics are lazily created via EnsureCancel only when needed.
 func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
-	ctx, cancel := context.WithCancel(context.Background())
 	s.ID = id
 	s.State = StateIdle
 	s.Data = getBuf()
 	s.OutboundBuffer = getBuf()
 	s.WindowSize = 65535
-	s.ctx = ctx
-	s.cancel = cancel
+	s.ctx = bgCtx
 	s.phase = PhaseInit
 	return s
 }
@@ -73,7 +78,8 @@ func NewH1Stream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
 	s.State = StateIdle
-	s.ctx = context.Background()
+	s.h1Mode = true
+	s.ctx = bgCtx
 	// Pre-allocate header capacity to avoid allocation in requestToStream.
 	// After the first Release, capacity is preserved from the previous request.
 	if cap(s.Headers) < 16 {
@@ -93,6 +99,15 @@ func (s *Stream) GetBuf() *bytes.Buffer {
 // Context returns the stream's context.
 func (s *Stream) Context() context.Context {
 	return s.ctx
+}
+
+// EnsureCancel lazily creates a cancellable context for this stream.
+// Called when the stream needs cancel semantics (e.g., RST_STREAM).
+func (s *Stream) EnsureCancel() {
+	if s.cancel != nil {
+		return
+	}
+	s.ctx, s.cancel = context.WithCancel(s.ctx)
 }
 
 // Cancel cancels the stream's context.
@@ -138,9 +153,11 @@ func (s *Stream) Release() {
 	s.ReceivedInitialHeaders = false
 	s.ClosedByReset = false
 	s.IsHEAD = false
+	s.h1Mode = false
 	s.ctx = nil
 	s.cancel = nil
 	s.phase = 0
+	s.CachedCtx = nil
 	// Drain the channel without blocking. Skip for H1 streams
 	// (channel is never written to) to avoid select dispatch overhead.
 	if len(s.ReceivedWindowUpd) > 0 {
@@ -156,11 +173,38 @@ func (s *Stream) Release() {
 	streamPool.Put(s)
 }
 
+// ResetH1Stream performs a lightweight per-request reset for H1 stream reuse.
+// Unlike Release(), it does NOT return the stream to the pool. It clears only
+// the fields that change between requests, retaining header slice capacity
+// and the context reference. Called between requests on keep-alive connections
+// to avoid sync.Pool Get/Put overhead.
+func ResetH1Stream(s *Stream) {
+	if s.Data != nil {
+		s.Data.Reset()
+		bufferPool.Put(s.Data)
+		s.Data = nil
+	}
+	s.Headers = s.Headers[:0]
+	s.HeadersSent = false
+	s.EndStream = false
+	s.ResponseWriter = nil
+	s.IsHEAD = false
+	s.State = StateIdle
+	s.ctx = bgCtx
+}
+
 // AddHeader adds a header to the stream.
 func (s *Stream) AddHeader(name, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Headers = append(s.Headers, [2]string{name, value})
+}
+
+// AddHeadersBatch adds multiple headers under a single lock acquisition.
+func (s *Stream) AddHeadersBatch(headers [][2]string) {
+	s.mu.Lock()
+	s.Headers = append(s.Headers, headers...)
+	s.mu.Unlock()
 }
 
 // AddData adds data to the stream buffer.
@@ -184,8 +228,13 @@ func (s *Stream) GetData() []byte {
 	return s.Data.Bytes()
 }
 
-// GetHeaders returns a copy of the headers.
+// GetHeaders returns the headers. For single-threaded H1 streams, returns
+// the slice directly (no lock, no copy). For H2 streams, returns a safe copy
+// under lock.
 func (s *Stream) GetHeaders() [][2]string {
+	if s.h1Mode {
+		return s.Headers
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	headers := make([][2]string, len(s.Headers))

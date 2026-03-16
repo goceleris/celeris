@@ -66,9 +66,11 @@ type Worker struct {
 	errCount    *atomic.Uint64
 	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
 	tickCounter uint32
+	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
+	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
 	h2cfg         conn.H2Config
 }
 
@@ -160,6 +162,7 @@ func (w *Worker) run(ctx context.Context) {
 	}
 
 	w.ready <- nil
+	w.cachedNow = time.Now().UnixNano()
 
 	for {
 		if ctx.Err() != nil {
@@ -211,12 +214,38 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Submit pending SENDs from previous iteration + wait for CQEs in
-		// a single io_uring_enter syscall. Skip when CQEs are already ready
-		// and nothing is pending (pure userspace fast path).
+		// Submit pending SENDs + wait for CQEs. Four modes:
+		// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
+		// 2. CQEs already ready, nothing pending → skip syscall entirely
+		// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
+		// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
+		//
+		// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
+		// setup/teardown and sigset parsing, saving ~200-500ns per call.
+		// Mode 3a is safe because SEND SQEs always produce CQEs (no
+		// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
+		// Mode 3b uses a timeout because the only pending SQEs may have
+		// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
+		// need a timeout for graceful shutdown via ctx.Err() checks.
 		hasPending := w.ring.Pending() > 0
 		cqHead, cqTail := w.ring.BeginCQ()
-		if hasPending || cqHead == cqTail {
+		if cqHead != cqTail && hasPending {
+			// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
+			if _, err := w.ring.Submit(); err != nil {
+				w.shutdown()
+				return
+			}
+		} else if hasPending && w.sendsPending {
+			// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
+			// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
+			if err := w.ring.SubmitAndWait(); err != nil {
+				w.shutdown()
+				return
+			}
+			cqHead, cqTail = w.ring.BeginCQ()
+		} else if hasPending || cqHead == cqTail {
+			// Mode 3b: no guaranteed CQEs — wait with timeout for
+			// shutdown checks and CQE_SKIP_SUCCESS operations.
 			waitTimeout := 100 * time.Millisecond
 			if w.listenFD < 0 {
 				waitTimeout = 1 * time.Second
@@ -227,16 +256,47 @@ func (w *Worker) run(ctx context.Context) {
 			}
 			cqHead, cqTail = w.ring.BeginCQ()
 		}
+		w.sendsPending = false
 
 		if cqHead != cqTail {
-			now := time.Now().UnixNano()
-			for processed := 0; processed < w.objective.CQBatch && cqHead != cqTail; processed++ {
+			// Refresh cached timestamp every 64 iterations to amortize
+			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
+			// uses multi-second windows so ~1ms resolution is sufficient.
+			if w.tickCounter&0x3F == 0 {
+				w.cachedNow = time.Now().UnixNano()
+			}
+			now := w.cachedNow
+			for cqHead != cqTail {
 				entry := w.ring.cqeAt(cqHead)
-				w.processCQE(ctx, entry, now)
+				// Inlined CQE dispatch — eliminates processCQE method call
+				// and avoids passing context.Context on every CQE (only
+				// udAccept needs it). Hot ops (recv/send) are checked first.
+				switch decodeOp(entry.UserData) {
+				case udRecv:
+					w.handleRecv(entry, decodeFD(entry.UserData), now)
+				case udSend:
+					w.handleSend(entry, decodeFD(entry.UserData), now)
+				case udAccept:
+					w.handleAccept(ctx, entry, decodeFD(entry.UserData), now)
+				case udClose:
+					w.handleClose(decodeFD(entry.UserData))
+				case udProvide:
+				}
 				cqHead++
 			}
 		}
 		w.ring.EndCQ(cqHead)
+
+		// SENDs queued during CQE processing remain in the SQ ring and are
+		// submitted at the top of the next iteration (adaptive submit).
+		// This eliminates one io_uring_enter per iteration: the kernel sees
+		// the combined SEND batch in a single submit+wait syscall instead of
+		// a separate Submit() here followed by SubmitAndWaitTimeout() above.
+		// Profile data shows Submit accounts for ~55% of total CPU — removing
+		// this extra call halves the syscall overhead.
+		if w.sqpoll {
+			w.ring.ClearPending()
+		}
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per CQE batch,
@@ -253,28 +313,17 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		// Retry pending sends on dirty connections (SQ ring was full earlier).
+		// The dirty list is only populated when flushSend fails, so this
+		// is typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
-			if !cs.sending {
-				w.flushSend(cs)
-			}
-			// Remove from dirty list if fully flushed (no pending data).
-			if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-				w.removeDirty(cs)
+			if !cs.sending && !w.flushSend(cs) {
+				// Successfully flushed or send is in-flight; remove from dirty list.
+				if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+					w.removeDirty(cs)
+				}
 			}
 			cs = next
-		}
-
-		// Submit SEND SQEs. With SQPOLL, the kernel thread polls the SQ ring
-		// automatically — no Submit syscall needed. Without SQPOLL, submit
-		// immediately to avoid deferring SENDs to the next iteration (~10%
-		// throughput loss under H1 keep-alive).
-		if w.sqpoll {
-			w.ring.ClearPending()
-		} else if w.ring.Pending() > 0 {
-			if _, err := w.ring.Submit(); err != nil {
-				w.logger.Error("submit failed", "worker", w.id, "err", err)
-			}
 		}
 
 		// Check connection timeouts every 1024 iterations to amortize
@@ -376,7 +425,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	cs := newConnState(ctx, newFD, bufSize)
+	cs := acquireConnState(ctx, newFD, bufSize)
 	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {
@@ -444,10 +493,10 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
-	cs.cancel()
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	releaseConnState(cs)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
@@ -561,7 +610,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return // FD already detached
 		}
 		// Flush pending writes (e.g. error responses) before closing.
-		w.flushSend(cs)
+		_ = w.flushSend(cs)
 		w.closeConn(fd)
 		return
 	}
@@ -572,11 +621,24 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	w.flushSend(cs)
+	// Flush response with linked RECV when using single-shot per-connection
+	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
+	// after SEND completes, eliminating one loop iteration per request.
+	cs.recvLinked = false
+	if w.bufRing == nil {
+		if w.flushSendLink(cs) {
+			w.markDirty(cs)
+		}
+	} else {
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+	}
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
 	// without needing a new SQE. Only re-arm if multishot ended.
-	if !cqeHasMore(c.Flags) {
+	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
+	if !cqeHasMore(c.Flags) && !cs.recvLinked {
 		w.prepareRecv(fd, cs.buf)
 	}
 }
@@ -620,10 +682,13 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.removeDirty(cs)
 		cs.lastActivity = now
+		return
 	}
 
-	// Re-send remainder or flush new data.
-	w.flushSend(cs)
+	// Re-send remainder or flush new data. Only markDirty on SQ ring full.
+	if w.flushSend(cs) {
+		w.markDirty(cs)
+	}
 }
 
 func (w *Worker) handleClose(fd int) {
@@ -641,16 +706,20 @@ func (w *Worker) closeConn(fd int) {
 		return
 	}
 	w.removeDirty(cs)
+	if cs.h1State != nil {
+		conn.CloseH1(cs.h1State)
+	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
-	cs.cancel()
 
 	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
-		w.flushSend(cs)
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
 		return
 	}
 
@@ -667,7 +736,12 @@ func (w *Worker) finishClose(fd int) {
 		w.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	if cs != nil && cs.fixedFile {
+	fixedFile := cs != nil && cs.fixedFile
+	if cs != nil {
+		releaseConnState(cs)
+	}
+
+	if fixedFile {
 		// Fixed file: close via io_uring direct close (no real FD to shutdown).
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
@@ -704,8 +778,10 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds
 		// sendBuf (not writeBuf), so appending here is safe.
+		// Don't markDirty here — handleRecv calls flushSend after the
+		// handler returns. Only markDirty if flushSend fails (SQ ring
+		// full), avoiding linked-list overhead on the happy path.
 		cs.writeBuf = append(cs.writeBuf, data...)
-		w.markDirty(cs)
 	}
 }
 
@@ -778,16 +854,19 @@ func (w *Worker) removeDirty(cs *connState) {
 // Double-buffer strategy: writeBuf accumulates handler writes; sendBuf holds
 // data the kernel is currently processing. On flush, writeBuf is swapped into
 // sendBuf, and the old sendBuf's capacity is reused for the next writeBuf.
-func (w *Worker) flushSend(cs *connState) {
+//
+// Returns true if data is still pending and needs retry (SQ ring was full).
+// The caller should markDirty only when this returns true.
+func (w *Worker) flushSend(cs *connState) bool {
 	if cs.sending {
-		return
+		return false // send in-flight; handleSend will pick up writeBuf
 	}
 
 	// If sendBuf still has data (partial send remainder), re-send it.
 	if len(cs.sendBuf) > 0 {
 		sqe := w.ring.GetSQE()
 		if sqe == nil {
-			return // SQ ring full — will retry next iteration
+			return true // SQ ring full — caller should markDirty
 		}
 		if cs.fixedFile {
 			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
@@ -796,21 +875,22 @@ func (w *Worker) flushSend(cs *connState) {
 		}
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 		cs.sending = true
-		return
+		w.sendsPending = true
+		return false
 	}
 
 	// No in-flight data; swap writeBuf → sendBuf if there's new data.
 	if len(cs.writeBuf) == 0 {
-		return
+		return false
 	}
 
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
 
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
-		// SQ ring full — swap back; will retry next iteration.
+		// SQ ring full — swap back; caller should markDirty.
 		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
-		return
+		return true
 	}
 	if cs.fixedFile {
 		prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
@@ -819,6 +899,64 @@ func (w *Worker) flushSend(cs *connState) {
 	}
 	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	cs.sending = true
+	w.sendsPending = true
+	return false
+}
+
+// flushSendLink is like flushSend but links a RECV SQE after the SEND using
+// IOSQE_IO_LINK. The kernel chains the operations: when SEND completes, RECV
+// starts automatically without another io_uring_enter. This eliminates one
+// loop iteration between request/response cycles.
+//
+// Only used for single-shot recv (bufRing == nil) on the normal request path.
+// Falls back to plain (unlinked) SEND if only one SQE slot is available.
+func (w *Worker) flushSendLink(cs *connState) bool {
+	if cs.sending {
+		return false
+	}
+
+	// Partial send remainder — no linking (RECV may already be in flight).
+	if len(cs.sendBuf) > 0 {
+		return w.flushSend(cs)
+	}
+
+	if len(cs.writeBuf) == 0 {
+		return false
+	}
+
+	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
+
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
+		return true
+	}
+
+	// Try to get a second SQE for the linked RECV.
+	recvSQE := w.ring.GetSQE()
+	if recvSQE != nil {
+		// Link SEND → RECV.
+		if cs.fixedFile {
+			prepSendFixed(sqe, cs.fd, cs.sendBuf, true)
+		} else {
+			prepSendPlain(sqe, cs.fd, cs.sendBuf, true)
+		}
+		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		prepRecv(recvSQE, cs.fd, cs.buf)
+		setSQEUserData(recvSQE, encodeUserData(udRecv, cs.fd))
+		cs.recvLinked = true
+	} else {
+		// Only one SQE slot — plain SEND, no linking.
+		if cs.fixedFile {
+			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
+		} else {
+			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
+		}
+		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+	}
+	cs.sending = true
+	w.sendsPending = true
+	return false
 }
 
 // checkTimeouts scans active connections and closes any that have exceeded
@@ -854,13 +992,16 @@ func (w *Worker) shutdown() {
 		if cs == nil {
 			continue
 		}
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
+		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
-		cs.cancel()
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
+		releaseConnState(cs)
 	}
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)

@@ -27,8 +27,9 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 		c.maxFormSize = a.server.config.MaxFormSize
 	}
 
-	// WriteTimeout is enforced at the engine level via timer wheel (epoll/iouring)
-	// or http.Server.WriteTimeout (std), avoiding a goroutine+timer alloc per request.
+	// WriteTimeout is enforced at the engine level via periodic timeout checks
+	// (epoll/iouring) or http.Server.WriteTimeout (std), avoiding per-request
+	// timer allocations.
 
 	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
 
@@ -42,7 +43,9 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 	c.handlers = handlers
 	c.fullPath = fullPath
 
-	a.handleError(c, s, c.Next())
+	if err := c.Next(); err != nil {
+		a.handleError(c, s, err)
+	}
 	if c.buffered && !c.written {
 		c.bufferDepth = 1
 		_ = c.FlushResponse()

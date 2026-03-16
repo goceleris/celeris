@@ -15,17 +15,38 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
-var jsonBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 4096)
-		return &b
-	},
+var smallInts [1000]string
+
+func init() {
+	for i := range smallInts {
+		smallInts[i] = strconv.Itoa(i)
+	}
 }
+
+func itoa(n int) string {
+	if uint(n) < uint(len(smallInts)) {
+		return smallInts[n]
+	}
+	return strconv.Itoa(n)
+}
+
+type jsonState struct {
+	buf bytes.Buffer
+	enc *json.Encoder
+}
+
+var jsonEncPool = sync.Pool{New: func() any {
+	s := &jsonState{}
+	s.enc = json.NewEncoder(&s.buf)
+	s.enc.SetEscapeHTML(false)
+	return s
+}}
 
 // Status sets the response status code and returns the Context for chaining.
 // Note: response methods (JSON, Blob, etc.) take their own status code
@@ -38,33 +59,19 @@ func (c *Context) Status(code int) *Context {
 // JSON serializes v as JSON and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) JSON(code int, v any) error {
-	bp := jsonBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	var err error
-	buf, err = appendJSON(buf, v)
-	if err != nil {
-		*bp = buf
-		jsonBufPool.Put(bp)
+	js := jsonEncPool.Get().(*jsonState)
+	js.buf.Reset()
+	if err := js.enc.Encode(v); err != nil {
+		jsonEncPool.Put(js)
 		return err
 	}
-	err = c.Blob(code, "application/json", buf)
-	*bp = buf
-	jsonBufPool.Put(bp)
-	return err
-}
-
-func appendJSON(buf []byte, v any) ([]byte, error) {
-	w := bytes.NewBuffer(buf)
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return buf, err
-	}
-	b := w.Bytes()
+	b := js.buf.Bytes()
 	if len(b) > 0 && b[len(b)-1] == '\n' {
 		b = b[:len(b)-1]
 	}
-	return b, nil
+	err := c.Blob(code, "application/json", b)
+	jsonEncPool.Put(js)
+	return err
 }
 
 // XML serializes v as XML and writes it with the given status code.
@@ -80,7 +87,7 @@ func (c *Context) XML(code int, v any) error {
 // HTML writes an HTML response with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) HTML(code int, html string) error {
-	return c.Blob(code, "text/html; charset=utf-8", []byte(html))
+	return c.Blob(code, "text/html; charset=utf-8", unsafe.Slice(unsafe.StringData(html), len(html)))
 }
 
 // String writes a formatted string response.
@@ -92,7 +99,7 @@ func (c *Context) String(code int, format string, args ...any) error {
 	} else {
 		body = format
 	}
-	return c.Blob(code, "text/plain", []byte(body))
+	return c.Blob(code, "text/plain", unsafe.Slice(unsafe.StringData(body), len(body)))
 }
 
 // Blob writes a response with the given content type and data.
@@ -118,13 +125,12 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		c.capturedStatus = code
 		c.capturedType = contentType
 	}
-	var hdrBuf [8][2]string
-	headers := hdrBuf[:0:8]
+	headers := c.respHdrBuf[:0:8]
 	if len(c.respHeaders)+2 > 8 {
 		headers = make([][2]string, 0, len(c.respHeaders)+2)
 	}
 	headers = append(headers, [2]string{"content-type", contentType})
-	headers = append(headers, [2]string{"content-length", strconv.Itoa(len(data))})
+	headers = append(headers, [2]string{"content-length", itoa(len(data))})
 	headers = append(headers, c.respHeaders...)
 	if c.stream.ResponseWriter != nil {
 		return c.stream.ResponseWriter.WriteResponse(c.stream, code, headers, data)
@@ -422,6 +428,7 @@ func (c *Context) Respond(code int, v any) error {
 // The response is written to the wire AND a copy is captured for inspection
 // (ideal for loggers). Use BufferResponse to defer the wire write entirely.
 func (c *Context) CaptureResponse() {
+	c.extended = true
 	c.captureBody = true
 }
 
@@ -438,6 +445,7 @@ func (c *Context) ResponseContentType() string { return c.capturedType }
 // layers can call BufferResponse — responses are depth-tracked and only sent
 // when the outermost layer calls FlushResponse.
 func (c *Context) BufferResponse() {
+	c.extended = true
 	c.bufferDepth++
 }
 
@@ -525,6 +533,7 @@ func (c *Context) Detach() (done func()) {
 	c.path = strings.Clone(c.path)
 	c.rawQuery = strings.Clone(c.rawQuery)
 
+	c.extended = true
 	c.detached = true
 	ch := make(chan struct{})
 	c.detachDone = ch

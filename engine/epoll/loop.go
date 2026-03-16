@@ -50,11 +50,13 @@ type Loop struct {
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
 
-	reqCount    *atomic.Uint64
-	activeConns *atomic.Int64
-	errCount    *atomic.Uint64
-	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
-	tickCounter uint32
+	reqCount         *atomic.Uint64
+	activeConns      *atomic.Int64
+	errCount         *atomic.Uint64
+	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
+	tickCounter      uint32
+	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
+	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
 	h2cfg     conn.H2Config
@@ -127,13 +129,12 @@ func (l *Loop) run(ctx context.Context) {
 	if activeTimeoutMs <= 0 {
 		activeTimeoutMs = 1
 	}
+	l.cachedNow = time.Now().UnixNano()
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			l.shutdown()
 			return
-		default:
 		}
 
 		// ACTIVE → DRAINING: close listen socket to leave SO_REUSEPORT group.
@@ -163,7 +164,7 @@ func (l *Loop) run(ctx context.Context) {
 			l.listenFD = fd
 		}
 
-		timeoutMs := activeTimeoutMs
+		timeoutMs := l.adaptiveTimeoutMs(activeTimeoutMs)
 		if l.listenFD < 0 {
 			timeoutMs = 500
 		}
@@ -177,7 +178,16 @@ func (l *Loop) run(ctx context.Context) {
 			continue
 		}
 
-		now := time.Now().UnixNano()
+		var now int64
+		if n > 0 {
+			// Refresh cached timestamp every 64 iterations to amortize
+			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
+			// uses multi-second windows so ~1ms resolution is sufficient.
+			if l.tickCounter&0x3F == 0 {
+				l.cachedNow = time.Now().UnixNano()
+			}
+			now = l.cachedNow
+		}
 		for i := range n {
 			ev := &l.events[i]
 			fd := int(ev.Fd)
@@ -200,13 +210,20 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
+		// Adaptive timeout tracking.
+		if n > 0 {
+			l.consecutiveEmpty = 0
+		} else {
+			l.consecutiveEmpty++
+		}
+
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			err := flushWrites(cs)
 			if err != nil {
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
-			} else if len(cs.writeBuf) == 0 {
+			} else if cs.writePos >= len(cs.writeBuf) {
 				cs.pendingBytes = 0
 				l.removeDirty(cs)
 			}
@@ -280,7 +297,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 			continue
 		}
 
-		cs := newConnState(ctx, newFD, l.resolved.BufferSize)
+		cs := acquireConnState(ctx, newFD, l.resolved.BufferSize)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
 		l.connCount++
@@ -377,20 +394,36 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// connections). This sends the response one event-batch earlier than
 		// the dirty list pass, reducing per-request latency by up to N×2µs
 		// (where N is the number of other events in the same epoll_wait batch).
-		if len(cs.writeBuf) > 0 {
+		if cs.writePos < len(cs.writeBuf) {
 			if fErr := flushWrites(cs); fErr != nil {
-				l.removeDirty(cs)
+				if cs.dirty {
+					l.removeDirty(cs)
+				}
 				l.closeConn(fd)
 				return
 			}
-			if len(cs.writeBuf) == 0 {
+			if cs.writePos >= len(cs.writeBuf) {
+				// Fully flushed — no dirty list needed.
 				cs.pendingBytes = 0
-				l.removeDirty(cs)
+				if cs.dirty {
+					l.removeDirty(cs)
+				}
+			} else {
+				// Partial write — add to dirty list for retry.
+				l.markDirty(cs)
 			}
 		}
 
 		if cs.pendingBytes > maxPendingBytes {
 			l.closeConn(fd)
+			return
+		}
+
+		// Short read: socket is provably drained (read returned fewer bytes
+		// than the buffer can hold). Skip the EAGAIN-producing read that would
+		// otherwise cost one wasted syscall per request. Edge-triggered epoll
+		// will notify when new data arrives on this fd.
+		if n < len(cs.buf) {
 			return
 		}
 	}
@@ -401,8 +434,8 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
-	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
+	releaseConnState(cs)
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
@@ -433,7 +466,9 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)
 		cs.pendingBytes += len(data)
-		l.markDirty(cs)
+		// Don't markDirty here — drainRead's inline flush handles the
+		// happy path. Only markDirty if the inline flush partially
+		// completes, avoiding linked-list overhead per request.
 	}
 }
 
@@ -467,6 +502,31 @@ func (l *Loop) removeDirty(cs *connState) {
 	cs.dirtyPrev = nil
 }
 
+func (l *Loop) adaptiveTimeoutMs(base int) int {
+	// When dirty list has unflushed data, poll immediately.
+	if l.dirtyHead != nil {
+		return 0
+	}
+	switch {
+	case l.consecutiveEmpty == 0:
+		return base
+	case l.consecutiveEmpty <= 10:
+		return base
+	case l.consecutiveEmpty <= 100:
+		d := base * 2
+		if d > 100 {
+			d = 100
+		}
+		return d
+	default:
+		d := base * 4
+		if d > 500 {
+			d = 500
+		}
+		return d
+	}
+}
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms).
 func (l *Loop) checkTimeouts() {
@@ -497,10 +557,12 @@ func (l *Loop) closeConn(fd int) {
 		return
 	}
 	l.removeDirty(cs)
+	if cs.h1State != nil {
+		conn.CloseH1(cs.h1State)
+	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 	}
-	cs.cancel()
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
@@ -512,6 +574,8 @@ func (l *Loop) closeConn(fd int) {
 	if l.cfg.OnDisconnect != nil {
 		l.cfg.OnDisconnect(cs.remoteAddr)
 	}
+
+	releaseConnState(cs)
 }
 
 func (l *Loop) shutdown() {
@@ -520,11 +584,15 @@ func (l *Loop) shutdown() {
 		if cs == nil {
 			continue
 		}
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
+		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
-		cs.cancel()
 		_ = unix.Close(fd)
+		releaseConnState(cs)
+		l.conns[fd] = nil
 	}
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)

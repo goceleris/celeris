@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/goceleris/celeris/internal/ctxkit"
 	h1 "github.com/goceleris/celeris/protocol/h1"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
@@ -33,6 +34,7 @@ type H1State struct {
 	buffer     bytes.Buffer
 	req        h1.Request
 	rw         h1ResponseAdapter // embedded — reused per request, avoids heap alloc
+	stream     *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
 	RemoteAddr string
 	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
 }
@@ -43,6 +45,19 @@ func NewH1State() *H1State {
 	p.SetZeroCopy(true)
 	return &H1State{
 		parser: p,
+	}
+}
+
+// CloseH1 releases the cached stream and context (if any) back to their pools.
+func CloseH1(state *H1State) {
+	if state.stream != nil {
+		// Release the cached context back to its pool before releasing the stream.
+		if state.stream.CachedCtx != nil {
+			ctxkit.ReleaseContext(state.stream.CachedCtx)
+			state.stream.CachedCtx = nil
+		}
+		state.stream.Release()
+		state.stream = nil
 	}
 }
 
@@ -172,8 +187,7 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	handler stream.Handler, write func([]byte)) error {
 
 	req := &state.req
-	s := requestToStream(req, body, state.RemoteAddr)
-	defer s.Release()
+	s := populateCachedStream(state, req, body)
 
 	// Reuse the connection-scoped response adapter — avoids a heap allocation
 	// per request. Reset per-request fields; hijackFn/write are stable.
@@ -187,21 +201,38 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 
 	if err := handler.HandleStream(ctx, s); err != nil {
 		if rw.hijacked {
+			// On hijack, release the cached stream since the connection
+			// is being taken over and won't be reused normally.
+			state.stream.Release()
+			state.stream = nil
 			return ErrHijacked
 		}
 		writeErrorResponse(write, 500, "Internal Server Error")
 		return err
 	}
 	if rw.hijacked {
+		state.stream.Release()
+		state.stream = nil
 		return ErrHijacked
 	}
 	return nil
 }
 
-func requestToStream(req *h1.Request, body []byte, remoteAddr string) *stream.Stream {
-	s := stream.NewH1Stream(1)
-	s.RemoteAddr = remoteAddr
-	// Reuse the stream's existing header slice capacity from the pool.
+// populateCachedStream reuses the per-connection cached stream, avoiding
+// sync.Pool Get/Put per request. The stream is acquired from the pool on the
+// first request and retained for the connection's lifetime.
+func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.Stream {
+	s := state.stream
+	if s == nil {
+		s = stream.NewH1Stream(1)
+		state.stream = s
+	} else {
+		// Reset per-request fields. The stream is reused, so clear state
+		// from the previous request without returning to the pool.
+		stream.ResetH1Stream(s)
+	}
+	s.RemoteAddr = state.RemoteAddr
+	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4
 	if cap(hdrs) < needed {

@@ -4,6 +4,7 @@ package iouring
 
 import (
 	"context"
+	"sync"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
@@ -15,15 +16,16 @@ import (
 const maxSendQueueBytes = 4 << 20 // 4 MiB
 
 type connState struct {
-	fd        int             // 8: real FD, or fixed file index
-	protocol  engine.Protocol // 1
-	detected  bool            // 1
-	sending   bool            // 1: true when a SEND SQE is in-flight
-	closing   bool            // 1: defers close until sends complete
-	dirty     bool            // 1: true when data needs flushing
-	fixedFile bool            // 1: true when fd is fixed file index
-	_         [2]byte
-	sendBuf   []byte // 24: in-flight buffer (accessed with sending flag)
+	fd         int             // 8: real FD, or fixed file index
+	protocol   engine.Protocol // 1
+	detected   bool            // 1
+	sending    bool            // 1: true when a SEND SQE is in-flight
+	closing    bool            // 1: defers close until sends complete
+	dirty      bool            // 1: true when data needs flushing
+	fixedFile  bool            // 1: true when fd is fixed file index
+	recvLinked bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
+	_          [1]byte
+	sendBuf    []byte // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
 	buf       []byte     // 24: per-connection recv buffer
@@ -35,22 +37,51 @@ type connState struct {
 	h1State    *conn.H1State
 	h2State    *conn.H2State
 	ctx        context.Context
-	cancel     context.CancelFunc
 	remoteAddr string
 	writeFn    func([]byte) // cached write function (avoids closure allocation per recv)
 }
 
-func newConnState(ctx context.Context, fd int, bufSize int) *connState {
-	childCtx, cancel := context.WithCancel(ctx)
-	cs := &connState{
-		fd:       fd,
-		writeBuf: make([]byte, 0, 4096),
-		sendBuf:  make([]byte, 0, 4096),
-		ctx:      childCtx,
-		cancel:   cancel,
-	}
+var connStatePool = sync.Pool{
+	New: func() any {
+		return &connState{
+			writeBuf: make([]byte, 0, 4096),
+			sendBuf:  make([]byte, 0, 4096),
+		}
+	},
+}
+
+func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
+	cs := connStatePool.Get().(*connState)
+	cs.fd = fd
+	cs.ctx = ctx
+	cs.writeBuf = cs.writeBuf[:0]
+	cs.sendBuf = cs.sendBuf[:0]
 	if bufSize > 0 {
-		cs.buf = make([]byte, bufSize)
+		if cap(cs.buf) >= bufSize {
+			cs.buf = cs.buf[:bufSize]
+		} else {
+			cs.buf = make([]byte, bufSize)
+		}
 	}
 	return cs
+}
+
+func releaseConnState(cs *connState) {
+	cs.h1State = nil
+	cs.h2State = nil
+	cs.ctx = nil
+	cs.writeFn = nil
+	cs.remoteAddr = ""
+	cs.dirtyNext = nil
+	cs.dirtyPrev = nil
+	cs.protocol = 0
+	cs.detected = false
+	cs.sending = false
+	cs.closing = false
+	cs.dirty = false
+	cs.fixedFile = false
+	cs.recvLinked = false
+	cs.lastActivity = 0
+	cs.fd = 0
+	connStatePool.Put(cs)
 }

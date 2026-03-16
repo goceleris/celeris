@@ -190,44 +190,52 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 		}
 		return nil
 	}
-	if asciiEqualFold(rawName, "Host") {
-		// Zero-copy: Host string shares the parser buffer memory.
-		// Safe because H1 handlers run synchronously before the buffer is reused.
-		req.Host = UnsafeString(rawValue)
+	// First-byte dispatch: skip asciiEqualFold for unrecognized headers.
+	// Reduces average header matching from ~5 comparisons to ~1 per header.
+	if len(rawName) == 0 {
 		return nil
 	}
-	if asciiEqualFold(rawName, "Content-Length") {
-		if req.ChunkedEncoding {
-			// RFC 7230 §3.3.3: if Transfer-Encoding is present, Content-Length is ignored
+	switch rawName[0] | 0x20 { // lowercase first byte
+	case 'h':
+		if asciiEqualFold(rawName, "Host") {
+			req.Host = UnsafeString(rawValue)
 			return nil
 		}
-		if cl, ok := parseInt64Bytes(rawValue); ok {
-			req.ContentLength = cl
-		} else {
-			return ErrInvalidContentLength
+	case 'c':
+		if asciiEqualFold(rawName, "Content-Length") {
+			if req.ChunkedEncoding {
+				return nil
+			}
+			if cl, ok := parseInt64Bytes(rawValue); ok {
+				req.ContentLength = cl
+			} else {
+				return ErrInvalidContentLength
+			}
+			return nil
 		}
-		return nil
-	}
-	if asciiEqualFold(rawName, "Transfer-Encoding") {
-		if asciiContainsFoldBytes(rawValue, "chunked") {
-			req.ChunkedEncoding = true
-			req.ContentLength = -1
+		if asciiEqualFold(rawName, "Connection") {
+			if asciiContainsFoldBytes(rawValue, "close") {
+				req.KeepAlive = false
+			} else if asciiContainsFoldBytes(rawValue, "keep-alive") {
+				req.KeepAlive = true
+			}
+			return nil
 		}
-		return nil
-	}
-	if asciiEqualFold(rawName, "Connection") {
-		if asciiContainsFoldBytes(rawValue, "close") {
-			req.KeepAlive = false
-		} else if asciiContainsFoldBytes(rawValue, "keep-alive") {
-			req.KeepAlive = true
+	case 't':
+		if asciiEqualFold(rawName, "Transfer-Encoding") {
+			if asciiContainsFoldBytes(rawValue, "chunked") {
+				req.ChunkedEncoding = true
+				req.ContentLength = -1
+			}
+			return nil
 		}
-		return nil
-	}
-	if asciiEqualFold(rawName, "Expect") {
-		if asciiContainsFoldBytes(rawValue, "100-continue") {
-			req.ExpectContinue = true
+	case 'e':
+		if asciiEqualFold(rawName, "Expect") {
+			if asciiContainsFoldBytes(rawValue, "100-continue") {
+				req.ExpectContinue = true
+			}
+			return nil
 		}
-		return nil
 	}
 	return nil
 }

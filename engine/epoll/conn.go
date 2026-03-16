@@ -5,6 +5,7 @@ package epoll
 
 import (
 	"context"
+	"sync"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
@@ -27,6 +28,7 @@ type connState struct {
 
 	// Warm — second cache line:
 	pendingBytes int        // 8 bytes
+	writePos     int        // 8 bytes: offset into writeBuf for next write(2) call
 	dirtyNext    *connState // 8 bytes: intrusive doubly-linked dirty list
 	dirtyPrev    *connState // 8 bytes
 
@@ -37,18 +39,46 @@ type connState struct {
 	h1State    *conn.H1State
 	h2State    *conn.H2State
 	ctx        context.Context
-	cancel     context.CancelFunc
 	remoteAddr string
 	writeFn    func([]byte) // cached write function
 }
 
-func newConnState(ctx context.Context, fd int, bufSize int) *connState {
-	childCtx, cancel := context.WithCancel(ctx)
-	return &connState{
-		fd:       fd,
-		buf:      make([]byte, bufSize),
-		writeBuf: make([]byte, 0, 4096),
-		ctx:      childCtx,
-		cancel:   cancel,
+var connStatePool = sync.Pool{
+	New: func() any {
+		return &connState{
+			writeBuf: make([]byte, 0, 4096),
+		}
+	},
+}
+
+func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
+	cs := connStatePool.Get().(*connState)
+	cs.fd = fd
+	cs.ctx = ctx
+	cs.writeBuf = cs.writeBuf[:0]
+	cs.writePos = 0
+	if cap(cs.buf) >= bufSize {
+		cs.buf = cs.buf[:bufSize]
+	} else {
+		cs.buf = make([]byte, bufSize)
 	}
+	return cs
+}
+
+func releaseConnState(cs *connState) {
+	cs.h1State = nil
+	cs.h2State = nil
+	cs.ctx = nil
+	cs.writeFn = nil
+	cs.remoteAddr = ""
+	cs.dirtyNext = nil
+	cs.dirtyPrev = nil
+	cs.protocol = 0
+	cs.detected = false
+	cs.dirty = false
+	cs.pendingBytes = 0
+	cs.writePos = 0
+	cs.lastActivity = 0
+	cs.fd = 0
+	connStatePool.Put(cs)
 }
