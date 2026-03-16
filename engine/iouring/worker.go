@@ -68,10 +68,10 @@ type Worker struct {
 	tickCounter uint32
 	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead      *connState // head of intrusive doubly-linked dirty list
-	hasBufReturns  bool       // set when provided buffers need publishing
-	sendsPending   bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
-	h2cfg          conn.H2Config
+	dirtyHead     *connState // head of intrusive doubly-linked dirty list
+	hasBufReturns bool       // set when provided buffers need publishing
+	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2cfg         conn.H2Config
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
