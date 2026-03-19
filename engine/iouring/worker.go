@@ -125,6 +125,15 @@ func (w *Worker) run(ctx context.Context) {
 
 	_ = platform.PinToCPU(w.cpuID)
 
+	// Bind memory allocations to this CPU's NUMA node before creating
+	// the ring and buffers. This ensures mmap'd SQ/CQ rings, SQE arrays,
+	// and provided buffer regions are NUMA-local to the worker thread,
+	// eliminating cross-socket QPI/UPI traffic on multi-socket systems.
+	numaNode := platform.CPUForNode(w.cpuID)
+	if err := platform.BindNumaNode(numaNode); err == nil {
+		defer platform.ResetNumaPolicy()
+	}
+
 	// Create ring after LockOSThread — SINGLE_ISSUER requires all ring
 	// operations from the same OS thread.
 	ring, err := NewRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle())
