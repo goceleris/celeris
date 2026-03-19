@@ -104,3 +104,18 @@ func BenchmarkFindHeaderEnd(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkFindHeaderEnd_8K(b *testing.B) {
+	size := 8192
+	buf := make([]byte, size)
+	for i := range buf {
+		buf[i] = 'A'
+	}
+	copy(buf[size-4:], "\r\n\r\n")
+	b.SetBytes(int64(size))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		findHeaderEnd(buf)
+	}
+}
