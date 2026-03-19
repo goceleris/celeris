@@ -138,8 +138,9 @@ func (w *Worker) run(ctx context.Context) {
 	}
 
 	// Create ring after LockOSThread — SINGLE_ISSUER requires all ring
-	// operations from the same OS thread.
-	ring, err := NewRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle())
+	// operations from the same OS thread. NewRingCPU pins the kernel's SQPOLL
+	// thread to the same CPU as this worker, ensuring NUMA-local SQ ring polling.
+	ring, err := NewRingCPU(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle(), w.cpuID)
 	if err != nil {
 		w.ready <- fmt.Errorf("worker %d ring setup: %w", w.id, err)
 		return

@@ -133,7 +133,16 @@ func (e *Engine) Listen(ctx context.Context) error {
 		e.addr.Store(&addr)
 	}
 
-	e.cfg.Logger.Info("io_uring engine listening", "addr", e.cfg.Addr, "tier", tier.Tier().String(), "workers", resolved.Workers)
+	e.cfg.Logger.Info("io_uring engine listening",
+		"addr", e.cfg.Addr,
+		"tier", tier.Tier().String(),
+		"workers", resolved.Workers,
+		"sqpoll", tier.SQPollIdle() > 0,
+		"send_zc", tier.SupportsSendZC(),
+		"fixed_files", tier.SupportsFixedFiles(),
+		"numa_nodes", e.profile.NUMANodes,
+		"kernel", e.profile.KernelVersion,
+	)
 
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,

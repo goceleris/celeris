@@ -12,6 +12,7 @@ const (
 // io_uring setup flags.
 const (
 	setupSQPoll       = 1 << 1
+	setupSQAff        = 1 << 2 // pin SQPOLL thread to sq_thread_cpu
 	setupCoopTaskrun  = 1 << 8
 	setupSingleIssuer = 1 << 12
 	setupDeferTaskrun = 1 << 13

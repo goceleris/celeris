@@ -85,9 +85,21 @@ type Ring struct {
 // NewRing creates a new io_uring instance. sqPollIdle sets the kernel
 // SQPOLL thread idle timeout in milliseconds (only used with IORING_SETUP_SQPOLL).
 func NewRing(entries uint32, flags uint32, sqPollIdle uint32) (*Ring, error) {
+	return NewRingCPU(entries, flags, sqPollIdle, -1)
+}
+
+// NewRingCPU creates a new io_uring instance with optional SQPOLL CPU affinity.
+// If cpuID >= 0 and SQPOLL is enabled, IORING_SETUP_SQ_AFF is set to pin the
+// kernel's SQPOLL thread to the specified CPU, ensuring NUMA-local processing.
+func NewRingCPU(entries uint32, flags uint32, sqPollIdle uint32, cpuID int) (*Ring, error) {
 	var params ioUringParams
 	params.flags = flags
 	params.sqThreadIdle = sqPollIdle
+
+	if cpuID >= 0 && flags&setupSQPoll != 0 {
+		params.flags |= setupSQAff
+		params.sqThreadCPU = uint32(cpuID)
+	}
 
 	fd, _, errno := unix.Syscall(
 		uintptr(sysIOUringSetup),
