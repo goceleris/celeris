@@ -81,17 +81,15 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
 	acceptPaused *atomic.Bool) (*Worker, error) {
 
-	// Only create the listen socket here. Ring creation is deferred to run()
-	// because SINGLE_ISSUER requires all ring operations from the creating thread.
-	listenFD, err := createListenSocket(cfg.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("worker %d: listen socket: %w", id, err)
-	}
+	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
+	// binding) so that the kernel allocates socket internal buffers on the
+	// worker's NUMA node. This eliminates cross-socket access for accept
+	// queue operations on multi-socket systems.
 
 	return &Worker{
 		id:           id,
 		cpuID:        cpuID,
-		listenFD:     listenFD,
+		listenFD:     -1,
 		tier:         tier,
 		sqpoll:       tier.SQPollIdle() > 0,
 		sendZC:       tier.SupportsSendZC(),
@@ -129,13 +127,24 @@ func (w *Worker) run(ctx context.Context) {
 	_ = platform.PinToCPU(w.cpuID)
 
 	// Bind memory allocations to this CPU's NUMA node before creating
-	// the ring and buffers. This ensures mmap'd SQ/CQ rings, SQE arrays,
-	// and provided buffer regions are NUMA-local to the worker thread,
-	// eliminating cross-socket QPI/UPI traffic on multi-socket systems.
+	// the listen socket, ring, and buffers. This ensures the socket's
+	// accept queue, mmap'd SQ/CQ rings, SQE arrays, and provided buffer
+	// regions are all NUMA-local to the worker thread, eliminating
+	// cross-socket QPI/UPI traffic on multi-socket systems.
 	numaNode := platform.CPUForNode(w.cpuID)
 	if err := platform.BindNumaNode(numaNode); err == nil {
 		defer platform.ResetNumaPolicy()
 	}
+
+	// Create the listen socket on the worker's NUMA node. Each worker has its
+	// own listen socket via SO_REUSEPORT; kernel allocates socket internals
+	// (accept queue, buffers) on the current thread's NUMA node.
+	listenFD, err := createListenSocket(w.cfg.Addr)
+	if err != nil {
+		w.ready <- fmt.Errorf("worker %d: listen socket: %w", w.id, err)
+		return
+	}
+	w.listenFD = listenFD
 
 	// Create ring after LockOSThread — SINGLE_ISSUER requires all ring
 	// operations from the same OS thread. NewRingCPU pins the kernel's SQPOLL
