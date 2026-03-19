@@ -142,6 +142,45 @@ func TestSelectTierOptional(t *testing.T) {
 	}
 }
 
+func TestSelectTierOptionalWithSendZC(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.Optional,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		SQPoll:          true,
+		SendZC:          true,
+	}
+	tier := SelectTier(profile)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	if !tier.SupportsSendZC() {
+		t.Error("expected send ZC support with SendZC profile")
+	}
+}
+
+func TestSelectTierOptionalWithoutSendZC(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.Optional,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		SQPoll:          true,
+	}
+	tier := SelectTier(profile)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	if tier.SupportsSendZC() {
+		t.Error("should not support send ZC without SendZC profile")
+	}
+}
+
 func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
 	// SQPOLL + DEFER_TASKRUN is incompatible (kernel returns EINVAL).
 	// Optional tier must always use COOP_TASKRUN regardless of DeferTaskrun profile.

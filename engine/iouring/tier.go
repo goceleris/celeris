@@ -17,6 +17,7 @@ type TierStrategy interface {
 	SupportsMultishotAccept() bool
 	SupportsMultishotRecv() bool
 	SupportsFixedFiles() bool
+	SupportsSendZC() bool
 	SQPollIdle() uint32
 }
 
@@ -28,6 +29,7 @@ func SelectTier(profile engine.CapabilityProfile) TierStrategy {
 			sqPollIdle:   2000,
 			deferTaskrun: profile.DeferTaskrun,
 			fixedFiles:   profile.FixedFiles,
+			sendZC:       profile.SendZC,
 		}
 	case profile.IOUringTier >= engine.High && profile.ProvidedBuffers:
 		return &highTier{
@@ -52,6 +54,7 @@ func (t *baseTier) SupportsProvidedBuffers() bool { return false }
 func (t *baseTier) SupportsMultishotAccept() bool { return false }
 func (t *baseTier) SupportsMultishotRecv() bool   { return false }
 func (t *baseTier) SupportsFixedFiles() bool      { return false }
+func (t *baseTier) SupportsSendZC() bool          { return false }
 func (t *baseTier) SQPollIdle() uint32            { return 0 }
 
 func (t *baseTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -90,6 +93,7 @@ func (t *midTier) SupportsProvidedBuffers() bool { return false }
 func (t *midTier) SupportsMultishotAccept() bool { return false }
 func (t *midTier) SupportsMultishotRecv() bool   { return false }
 func (t *midTier) SupportsFixedFiles() bool      { return false }
+func (t *midTier) SupportsSendZC() bool          { return false }
 func (t *midTier) SQPollIdle() uint32            { return 0 }
 
 func (t *midTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -142,6 +146,7 @@ func (t *highTier) SupportsProvidedBuffers() bool { return true }
 func (t *highTier) SupportsMultishotAccept() bool { return true }
 func (t *highTier) SupportsMultishotRecv() bool   { return false }
 func (t *highTier) SupportsFixedFiles() bool      { return t.fixedFiles }
+func (t *highTier) SupportsSendZC() bool          { return false }
 func (t *highTier) SQPollIdle() uint32            { return 0 }
 
 func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -178,11 +183,12 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }
 
-// optionalTier: kernel 6.0+, adds SQPOLL. With 6.1+: DEFER_TASKRUN, fixed files.
+// optionalTier: kernel 6.0+, adds SQPOLL, SEND_ZC. With 6.1+: DEFER_TASKRUN, fixed files.
 type optionalTier struct {
 	sqPollIdle   uint32
 	deferTaskrun bool
 	fixedFiles   bool
+	sendZC       bool
 }
 
 func (t *optionalTier) Tier() engine.Tier { return engine.Optional }
@@ -195,6 +201,7 @@ func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
 func (t *optionalTier) SupportsMultishotAccept() bool { return true }
 func (t *optionalTier) SupportsMultishotRecv() bool   { return false }
 func (t *optionalTier) SupportsFixedFiles() bool      { return t.fixedFiles }
+func (t *optionalTier) SupportsSendZC() bool          { return t.sendZC }
 func (t *optionalTier) SQPollIdle() uint32            { return t.sqPollIdle }
 
 func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -224,9 +231,19 @@ func (t *optionalTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) 
 	if sqe == nil {
 		return
 	}
-	prepSend(sqe, fd, buf, linked)
-	if t.fixedFiles {
-		setSQEFixedFile(sqe)
+	if t.sendZC && !linked {
+		// SEND_ZC cannot be linked (the notification CQE would break
+		// the link chain), so fall back to regular SEND for linked ops.
+		if t.fixedFiles {
+			prepSendZCFixed(sqe, fd, buf, false)
+		} else {
+			prepSendZC(sqe, fd, buf, false)
+		}
+	} else {
+		prepSend(sqe, fd, buf, linked)
+		if t.fixedFiles {
+			setSQEFixedFile(sqe)
+		}
 	}
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }

@@ -58,6 +58,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		"multishot_recv", tier.SupportsMultishotRecv(),
 		"provided_buffers", tier.SupportsProvidedBuffers(),
 		"fixed_files", tier.SupportsFixedFiles(),
+		"send_zc", tier.SupportsSendZC(),
 	)
 
 	return &Engine{

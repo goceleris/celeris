@@ -60,6 +60,9 @@ func TestProbeWithOptionalTier(t *testing.T) {
 	if !profile.SQPoll {
 		t.Fatal("expected SQPoll with CAP_SYS_NICE")
 	}
+	if !profile.SendZC {
+		t.Fatal("expected SendZC on kernel 6.0+")
+	}
 	if !profile.EpollAvailable {
 		t.Fatal("expected EpollAvailable")
 	}
@@ -101,6 +104,9 @@ func TestProbeWithHighTier(t *testing.T) {
 	}
 	if profile.SQPoll {
 		t.Fatal("expected no SQPoll")
+	}
+	if profile.SendZC {
+		t.Fatal("expected no SendZC on kernel 5.19")
 	}
 }
 

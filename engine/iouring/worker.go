@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
@@ -45,6 +46,7 @@ type Worker struct {
 	tier         TierStrategy
 	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
 	sqpoll       bool // true when SQPOLL is active (kernel submits SQEs)
+	sendZC       bool // true when SEND_ZC is available (kernel 6.0+)
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
@@ -92,6 +94,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		listenFD:     listenFD,
 		tier:         tier,
 		sqpoll:       tier.SQPollIdle() > 0,
+		sendZC:       tier.SupportsSendZC(),
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
 		objective:    objective,
@@ -658,7 +661,43 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
+	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
+	// Now safe to modify/reuse sendBuf. Process the deferred result.
+	if cqeIsNotif(c.Flags) {
+		cs.zcNotifPending = false
+		w.completeSend(cs, fd, int(cs.zcSentBytes), now)
+		return
+	}
+
+	// SEND_ZC first CQE: result is ready but buffer is still in DMA.
+	// Store the result and wait for the notification before touching sendBuf.
+	if w.sendZC && cqeHasMore(c.Flags) {
+		if c.Res < 0 {
+			cs.sending = false
+			cs.zcNotifPending = true
+			cs.zcSentBytes = c.Res // store negative for error path on NOTIF
+			return
+		}
+		cs.zcNotifPending = true
+		cs.zcSentBytes = c.Res
+		// sending stays true until NOTIF completes the cycle.
+		return
+	}
+
+	// Regular SEND completion (non-ZC path).
 	cs.sending = false
+
+	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
+	// Disable ZC for this worker and retry the send with regular SEND.
+	if c.Res == -22 && w.sendZC {
+		w.sendZC = false
+		w.logger.Warn("SEND_ZC not supported (EINVAL), falling back to regular SEND",
+			"worker", w.id)
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+		return
+	}
 
 	if c.Res < 0 {
 		w.errCount.Add(1)
@@ -672,8 +711,27 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
+	w.completeSend(cs, fd, int(c.Res), now)
+}
+
+// completeSend processes a send result after the buffer is safe to modify.
+// Called directly for regular SEND, or from the NOTIF handler for SEND_ZC.
+func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
+	cs.sending = false
+
+	if sent < 0 {
+		w.errCount.Add(1)
+		cs.sendBuf = cs.sendBuf[:0]
+		cs.writeBuf = cs.writeBuf[:0]
+		if cs.closing {
+			w.finishClose(fd)
+		} else {
+			w.closeConn(fd)
+		}
+		return
+	}
+
 	// Handle partial sends by shifting remaining data to the front.
-	sent := int(c.Res)
 	if sent < len(cs.sendBuf) {
 		remaining := len(cs.sendBuf) - sent
 		copy(cs.sendBuf, cs.sendBuf[sent:])
@@ -724,7 +782,7 @@ func (w *Worker) closeConn(fd int) {
 
 	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
-	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
+	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
 		if w.flushSend(cs) {
 			w.markDirty(cs)
@@ -867,8 +925,8 @@ func (w *Worker) removeDirty(cs *connState) {
 // Returns true if data is still pending and needs retry (SQ ring was full).
 // The caller should markDirty only when this returns true.
 func (w *Worker) flushSend(cs *connState) bool {
-	if cs.sending {
-		return false // send in-flight; handleSend will pick up writeBuf
+	if cs.sending || cs.zcNotifPending {
+		return false // send in-flight; handleSend/NOTIF will pick up writeBuf
 	}
 
 	// If sendBuf still has data (partial send remainder), re-send it.
@@ -877,11 +935,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		if sqe == nil {
 			return true // SQ ring full — caller should markDirty
 		}
-		if cs.fixedFile {
-			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
-		} else {
-			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
-		}
+		w.prepSendSQE(sqe, cs, false)
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 		cs.sending = true
 		w.sendsPending = true
@@ -901,15 +955,28 @@ func (w *Worker) flushSend(cs *connState) bool {
 		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
 		return true
 	}
-	if cs.fixedFile {
-		prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
-	} else {
-		prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
-	}
+	w.prepSendSQE(sqe, cs, false)
 	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	cs.sending = true
 	w.sendsPending = true
 	return false
+}
+
+// prepSendSQE prepares a SEND or SEND_ZC SQE based on worker capabilities.
+// SEND_ZC is only used for unlinked sends (the notification CQE would break
+// the link chain). Linked sends always use regular SEND.
+func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
+	if w.sendZC && !linked {
+		if cs.fixedFile {
+			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
+		} else {
+			prepSendZC(sqe, cs.fd, cs.sendBuf, false)
+		}
+	} else if cs.fixedFile {
+		prepSendFixed(sqe, cs.fd, cs.sendBuf, linked)
+	} else {
+		prepSendPlain(sqe, cs.fd, cs.sendBuf, linked)
+	}
 }
 
 // flushSendLink is like flushSend but links a RECV SQE after the SEND using
@@ -920,7 +987,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 // Only used for single-shot recv (bufRing == nil) on the normal request path.
 // Falls back to plain (unlinked) SEND if only one SQE slot is available.
 func (w *Worker) flushSendLink(cs *connState) bool {
-	if cs.sending {
+	if cs.sending || cs.zcNotifPending {
 		return false
 	}
 
@@ -941,10 +1008,12 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		return true
 	}
 
+	// SEND_ZC cannot be linked (notification CQE breaks the link chain).
+	// For linked SEND→RECV, always use regular SEND.
 	// Try to get a second SQE for the linked RECV.
 	recvSQE := w.ring.GetSQE()
 	if recvSQE != nil {
-		// Link SEND → RECV.
+		// Link SEND → RECV (always regular SEND, never ZC).
 		if cs.fixedFile {
 			prepSendFixed(sqe, cs.fd, cs.sendBuf, true)
 		} else {
@@ -955,12 +1024,8 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		setSQEUserData(recvSQE, encodeUserData(udRecv, cs.fd))
 		cs.recvLinked = true
 	} else {
-		// Only one SQE slot — plain SEND, no linking.
-		if cs.fixedFile {
-			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
-		} else {
-			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
-		}
+		// Only one SQE slot — unlinked send, can use ZC if available.
+		w.prepSendSQE(sqe, cs, false)
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	}
 	cs.sending = true

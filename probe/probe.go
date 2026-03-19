@@ -42,7 +42,7 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 	if kv.AtLeast(5, 10) && sp.ProbeIOUring != nil {
 		features, ops, err := sp.ProbeIOUring()
 		if err == nil {
-			tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs, deferTaskrun, fixedFiles := determineTier(kv, features, ops)
+			tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs, deferTaskrun, fixedFiles, sendZC := determineTier(kv, features, ops)
 			profile.IOUringTier = tier
 			profile.MultishotAccept = multishotAccept
 			profile.MultishotRecv = multishotRecv
@@ -52,6 +52,7 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 			profile.LinkedSQEs = linkedSQEs
 			profile.DeferTaskrun = deferTaskrun
 			profile.FixedFiles = fixedFiles
+			profile.SendZC = sendZC
 
 			if tier >= engine.Optional && sp.CheckCapSysNice != nil {
 				profile.SQPoll = sqpoll || sp.CheckCapSysNice()

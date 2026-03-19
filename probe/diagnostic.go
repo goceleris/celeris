@@ -30,6 +30,7 @@ func DiagnosticReport(profile engine.CapabilityProfile, logger *slog.Logger) {
 			"linked_sqes", profile.LinkedSQEs,
 			"defer_taskrun", profile.DeferTaskrun,
 			"fixed_files", profile.FixedFiles,
+			"send_zc", profile.SendZC,
 		)
 	}
 }
@@ -54,6 +55,7 @@ func FormatDiagnostic(profile engine.CapabilityProfile) string {
 		fmt.Fprintf(&b, "LinkedSQEs: %t\n", profile.LinkedSQEs)
 		fmt.Fprintf(&b, "DeferTaskrun: %t\n", profile.DeferTaskrun)
 		fmt.Fprintf(&b, "FixedFiles: %t\n", profile.FixedFiles)
+		fmt.Fprintf(&b, "SendZC: %t\n", profile.SendZC)
 	}
 
 	return b.String()

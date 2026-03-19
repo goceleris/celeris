@@ -2,9 +2,9 @@ package probe
 
 import "github.com/goceleris/celeris/engine"
 
-func determineTier(kv KernelVersion, _ uint32, _ []uint8) (tier engine.Tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs, deferTaskrun, fixedFiles bool) {
+func determineTier(kv KernelVersion, _ uint32, _ []uint8) (tier engine.Tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs, deferTaskrun, fixedFiles, sendZC bool) {
 	if !kv.AtLeast(5, 10) {
-		return engine.None, false, false, false, false, false, false, false, false, false
+		return engine.None, false, false, false, false, false, false, false, false, false, false
 	}
 
 	tier = engine.Base
@@ -27,6 +27,7 @@ func determineTier(kv KernelVersion, _ uint32, _ []uint8) (tier engine.Tier, mul
 		tier = engine.Optional
 		singleIssuer = true
 		sqpoll = true
+		sendZC = true
 	}
 
 	if kv.AtLeast(6, 1) {

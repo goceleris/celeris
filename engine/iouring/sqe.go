@@ -127,6 +127,29 @@ func prepSendFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	setSQEFixedFile(sqePtr)
 }
 
+// prepSendZC prepares a SEND_ZC (zero-copy send) SQE. The kernel avoids
+// copying the buffer and instead maps it for DMA. Two CQEs are produced:
+// the first with the send result, and a notification CQE (CQE_F_NOTIF)
+// when the buffer can be safely reused.
+func prepSendZC(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opSENDZC
+	if linked {
+		sqe[1] = sqeIOLink
+	}
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	if len(buf) > 0 {
+		*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(unsafe.Pointer(&buf[0])))
+		*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(len(buf))
+	}
+}
+
+// prepSendZCFixed prepares a SEND_ZC SQE for a fixed file descriptor.
+func prepSendZCFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSendZC(sqePtr, fd, buf, linked)
+	setSQEFixedFile(sqePtr)
+}
+
 // prepCancelFDSkipSuccess prepares an ASYNC_CANCEL SQE with CQE_SKIP_SUCCESS
 // to suppress the success CQE (P11).
 func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {

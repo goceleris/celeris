@@ -43,3 +43,7 @@ func cqeHasMore(flags uint32) bool {
 func cqeHasBuffer(flags uint32) bool {
 	return flags&cqeFBuffer != 0
 }
+
+func cqeIsNotif(flags uint32) bool {
+	return flags&cqeFNotif != 0
+}

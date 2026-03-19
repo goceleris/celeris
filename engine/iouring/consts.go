@@ -35,6 +35,7 @@ const (
 	opSEND           = 26
 	opRECV           = 27
 	opPROVIDEBUFFERS = 31
+	opSENDZC         = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
 )
 
 // SQE flags.
@@ -49,6 +50,7 @@ const (
 const (
 	cqeFBuffer = 1 << 0
 	cqeFMore   = 1 << 1
+	cqeFNotif  = 1 << 2 // IORING_CQE_F_NOTIF: zero-copy send notification
 )
 
 // Accept flags.
