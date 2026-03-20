@@ -156,11 +156,6 @@ jobs:
         with:
           go-version: "1.26"
 
-      - name: Raise RLIMIT_MEMLOCK for io_uring ring mmap
-        run: |
-          echo "* - memlock unlimited" | sudo tee /etc/security/limits.d/io_uring.conf
-          echo "* - nofile 1048576"   | sudo tee -a /etc/security/limits.d/io_uring.conf
-
       - name: System info
         run: |
           echo "## System" >> "$GITHUB_STEP_SUMMARY"
@@ -178,8 +173,7 @@ jobs:
 
       - name: "Smoke: engine loadtest"
         run: |
-          ulimit -l unlimited
-          /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
+          sudo prlimit --memlock=unlimited /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/loadtest.txt || echo "0/0 passed, 0 failed, 0 skipped")
           echo "Engine loadtest: $SUMMARY"
 
@@ -203,8 +197,7 @@ jobs:
 
       - name: "Smoke: fullstack loadtest"
         run: |
-          ulimit -l unlimited
-          /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
+          sudo prlimit --memlock=unlimited /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/fullstack.txt || echo "0/0 passed, 0 failed, 0 skipped")
           echo "Fullstack loadtest: $SUMMARY"
 
