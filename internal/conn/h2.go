@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goceleris/celeris/protocol/h2/frame"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+	"golang.org/x/sys/unix"
 )
 
 // frameBuffer wraps bytes.Buffer for incremental H2 frame parsing.
@@ -52,6 +55,183 @@ func (cfg H2Config) withDefaults() H2Config {
 	return cfg
 }
 
+// h2FrameBufPool pools pre-encoded frame byte buffers to eliminate per-response allocations.
+var h2FrameBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 256); return &b },
+}
+
+func getH2FrameBuf() *[]byte { return h2FrameBufPool.Get().(*[]byte) }
+func putH2FrameBuf(p *[]byte) {
+	if cap(*p) > 65536 {
+		return // don't pool oversized buffers
+	}
+	*p = (*p)[:0]
+	h2FrameBufPool.Put(p)
+}
+
+// h2QueueShards is the number of shards in the write queue.
+// 4 shards reduces contention by ~4x while preserving per-stream ordering.
+const h2QueueShards = 4
+
+// h2ShardedQueue is a sharded write queue for pre-encoded H2 frame bytes.
+// Handler goroutines enqueue response frame data; the event loop drains it.
+// Sharding by stream ID eliminates cross-stream lock contention.
+type h2ShardedQueue struct {
+	shards   [h2QueueShards]h2QueueShard
+	pending  atomic.Bool
+	wakeupFD int // eventfd for signaling event loop (-1 if unavailable)
+}
+
+type h2QueueShard struct {
+	mu    sync.Mutex
+	bufs  []*[]byte
+	spare []*[]byte
+}
+
+// Enqueue appends pre-encoded frame bytes to the write queue.
+// Called from handler goroutines. Shards by stream ID.
+func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
+	shard := &q.shards[streamID%h2QueueShards]
+	shard.mu.Lock()
+	shard.bufs = append(shard.bufs, data)
+	shard.mu.Unlock()
+	q.pending.Store(true)
+	// Signal the event loop via eventfd so epoll_wait returns immediately
+	// instead of waiting for the 1ms polling timeout.
+	if q.wakeupFD >= 0 {
+		var val [8]byte
+		val[0] = 1
+		_, _ = unix.Write(q.wakeupFD, val[:])
+	}
+}
+
+// DrainTo drains all enqueued data by calling write for each buffer,
+// then returns buffers to the pool.
+// Called from the event loop thread. The write function must not block.
+func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
+	for i := range q.shards {
+		s := &q.shards[i]
+		s.mu.Lock()
+		s.spare, s.bufs = s.bufs, s.spare[:0]
+		s.mu.Unlock()
+		for _, buf := range s.spare {
+			write(*buf)
+			putH2FrameBuf(buf)
+		}
+		s.spare = s.spare[:0]
+	}
+	q.pending.Store(false)
+}
+
+// h2StreamEncoder provides goroutine-local HPACK encoding with dynamic table
+// size = 0, eliminating serialization requirements. Each goroutine gets its
+// own encoder from the pool, encodes independently, and returns it.
+type h2StreamEncoder struct {
+	hpackBuf bytes.Buffer
+	hpackEnc *hpack.Encoder
+}
+
+var h2StreamEncoderPool = sync.Pool{
+	New: func() any {
+		enc := &h2StreamEncoder{}
+		enc.hpackEnc = hpack.NewEncoder(&enc.hpackBuf)
+		enc.hpackEnc.SetMaxDynamicTableSize(0)
+		return enc
+	},
+}
+
+func getH2StreamEncoder() *h2StreamEncoder {
+	return h2StreamEncoderPool.Get().(*h2StreamEncoder)
+}
+
+func putH2StreamEncoder(enc *h2StreamEncoder) {
+	enc.hpackBuf.Reset()
+	h2StreamEncoderPool.Put(enc)
+}
+
+// encodeHeaders HPACK-encodes response headers using dynamic table size = 0.
+// Returns a slice backed by the encoder's internal buffer (valid until Reset).
+func (e *h2StreamEncoder) encodeHeaders(headers [][2]string) ([]byte, error) {
+	e.hpackBuf.Reset()
+	for _, h := range headers {
+		if err := e.hpackEnc.WriteField(hpack.HeaderField{Name: h[0], Value: h[1]}); err != nil {
+			return nil, err
+		}
+	}
+	return e.hpackBuf.Bytes(), nil
+}
+
+// H2 frame building helpers — produce raw frame bytes without shared state.
+// These replace the shared frame.Writer for the response hot path.
+
+const (
+	h2FrameData         byte = 0x00
+	h2FrameHeaders      byte = 0x01
+	h2FrameRSTStream    byte = 0x03
+	h2FrameContinuation byte = 0x09
+
+	h2FlagEndStream  byte = 0x01
+	h2FlagEndHeaders byte = 0x04
+)
+
+// appendH2Frame appends a raw H2 frame (9-byte header + payload) to buf.
+func appendH2Frame(buf []byte, frameType byte, flags byte, streamID uint32, payload []byte) []byte {
+	length := len(payload)
+	buf = append(buf,
+		byte(length>>16), byte(length>>8), byte(length),
+		frameType,
+		flags,
+		byte(streamID>>24), byte(streamID>>16), byte(streamID>>8), byte(streamID),
+	)
+	return append(buf, payload...)
+}
+
+// appendH2Headers appends HEADERS (+ CONTINUATION if needed) frames to buf.
+func appendH2Headers(buf []byte, streamID uint32, endStream bool, headerBlock []byte, maxFrameSize uint32) []byte {
+	if maxFrameSize == 0 {
+		maxFrameSize = 16384
+	}
+
+	remaining := headerBlock
+	first := true
+	for len(remaining) > 0 {
+		chunkLen := int(maxFrameSize)
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		frag := remaining[:chunkLen]
+		remaining = remaining[chunkLen:]
+
+		if first {
+			var flags byte
+			if endStream {
+				flags |= h2FlagEndStream
+			}
+			if len(remaining) == 0 {
+				flags |= h2FlagEndHeaders
+			}
+			buf = appendH2Frame(buf, h2FrameHeaders, flags, streamID, frag)
+			first = false
+		} else {
+			var flags byte
+			if len(remaining) == 0 {
+				flags |= h2FlagEndHeaders
+			}
+			buf = appendH2Frame(buf, h2FrameContinuation, flags, streamID, frag)
+		}
+	}
+	return buf
+}
+
+// appendH2Data appends a DATA frame to buf.
+func appendH2Data(buf []byte, streamID uint32, endStream bool, data []byte) []byte {
+	var flags byte
+	if endStream {
+		flags |= h2FlagEndStream
+	}
+	return appendH2Frame(buf, h2FrameData, flags, streamID, data)
+}
+
 // H2State holds per-connection H2 state.
 type H2State struct {
 	initialized bool
@@ -62,6 +242,7 @@ type H2State struct {
 	inBuf       *frameBuffer
 	mu          sync.Mutex
 	adapter     *h2ResponseAdapter
+	writeQueue  *h2ShardedQueue
 	cfg         H2Config // cached with defaults applied
 }
 
@@ -71,19 +252,38 @@ func (s *H2State) SetRemoteAddr(addr string) {
 	s.processor.GetManager().RemoteAddr = addr
 }
 
-// NewH2State creates a new H2 connection state.
-func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte)) *H2State {
+// WriteQueuePending returns true if the write queue has pending data.
+func (s *H2State) WriteQueuePending() bool {
+	return s.writeQueue.pending.Load()
+}
+
+// DrainWriteQueue drains async handler responses to the write function.
+// Called from the event loop thread (outside H2State.mu).
+func (s *H2State) DrainWriteQueue(write func([]byte)) {
+	if s.writeQueue.pending.Load() {
+		s.writeQueue.DrainTo(write)
+	}
+}
+
+// NewH2State creates a new H2 connection state. wakeupFD is an eventfd used
+// to signal the event loop when handler goroutines enqueue responses (-1 to
+// disable, falling back to polling).
+func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeupFD int) *H2State {
 	cfg = cfg.withDefaults()
 
 	var outBuf bytes.Buffer
 	var inBuf frameBuffer
 	fw := frame.NewWriter(&outBuf)
 
+	wq := &h2ShardedQueue{wakeupFD: wakeupFD}
+
 	rw := &h2ResponseAdapter{
-		write:   write,
-		outBuf:  &outBuf,
-		writer:  fw,
-		encoder: frame.NewHeaderEncoder(),
+		write:        write,
+		outBuf:       &outBuf,
+		writer:       fw,
+		encoder:      frame.NewHeaderEncoder(),
+		writeQueue:   wq,
+		maxFrameSize: cfg.MaxFrameSize,
 	}
 
 	proc := stream.NewProcessor(handler, fw, rw)
@@ -94,29 +294,33 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte)) *H2Sta
 	proc.GetManager().SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
 
 	return &H2State{
-		processor: proc,
-		parser:    p,
-		writer:    fw,
-		outBuf:    &outBuf,
-		inBuf:     &inBuf,
-		adapter:   rw,
-		cfg:       cfg,
+		processor:  proc,
+		parser:     p,
+		writer:     fw,
+		outBuf:     &outBuf,
+		inBuf:      &inBuf,
+		adapter:    rw,
+		writeQueue: wq,
+		cfg:        cfg,
 	}
 }
 
 // ProcessH2 processes incoming H2 data.
 // On first call, validates the client preface and sends server settings.
+// After frame processing, drains the async write queue for handler goroutine
+// responses that completed during parsing.
 func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handler,
 	write func([]byte), _ H2Config) error {
 
 	state.mu.Lock()
-	defer state.mu.Unlock()
 
 	if !state.initialized {
 		if len(data) < len(frame.ClientPreface) {
+			state.mu.Unlock()
 			return fmt.Errorf("incomplete H2 client preface")
 		}
 		if !frame.ValidateClientPreface(data) {
+			state.mu.Unlock()
 			return fmt.Errorf("invalid H2 client preface")
 		}
 		data = data[len(frame.ClientPreface):]
@@ -128,15 +332,19 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 			{ID: http2.SettingMaxFrameSize, Val: state.cfg.MaxFrameSize},
 		}
 		if err := state.writer.WriteSettings(settings...); err != nil {
+			state.mu.Unlock()
 			return fmt.Errorf("failed to write server settings: %w", err)
 		}
 		if err := state.writer.Flush(); err != nil {
+			state.mu.Unlock()
 			return err
 		}
 		flushOutBuf(state.outBuf, write)
 	}
 
 	if len(data) == 0 {
+		state.mu.Unlock()
+		state.DrainWriteQueue(write)
 		return nil
 	}
 
@@ -159,14 +367,26 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 					http2.ErrCode(ce), []byte(ce.Error()))
 				flushOutBuf(state.outBuf, write)
 			}
+			state.mu.Unlock()
+			state.DrainWriteQueue(write)
 			return fmt.Errorf("frame read error: %w", err)
 		}
 		if err := state.processor.ProcessFrame(ctx, f); err != nil {
 			flushOutBuf(state.outBuf, write)
+			state.mu.Unlock()
+			state.DrainWriteQueue(write)
 			return err
 		}
 		flushOutBuf(state.outBuf, write)
 	}
+
+	state.mu.Unlock()
+
+	// Drain async handler responses that completed during frame parsing.
+	// Most goroutines finish within the ~100-300μs parsing window, so this
+	// drain captures the bulk of responses in the same event loop iteration.
+	state.DrainWriteQueue(write)
+
 	return nil
 }
 
@@ -175,6 +395,7 @@ func CloseH2(state *H2State) {
 	if state.adapter != nil && state.adapter.encoder != nil {
 		state.adapter.encoder.Close()
 	}
+	// Worker pool is global (process-lifetime), no per-connection cleanup needed.
 }
 
 func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {

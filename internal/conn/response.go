@@ -239,46 +239,62 @@ func (a *h1ResponseAdapter) CloseConn() error {
 }
 
 type h2ResponseAdapter struct {
-	write   func([]byte)
-	outBuf  *bytes.Buffer
-	writer  *frame.Writer
-	encoder *frame.HeaderEncoder
-	mu      sync.Mutex
+	write        func([]byte)
+	outBuf       *bytes.Buffer
+	writer       *frame.Writer
+	encoder      *frame.HeaderEncoder // shared encoder for control frames only
+	writeQueue   *h2ShardedQueue      // async response queue (sharded)
+	maxFrameSize uint32
 }
 
+// WriteResponse builds complete response frame bytes using a goroutine-local
+// HPACK encoder (dynamic table = 0) and enqueues them to the write queue.
+// No shared locks are held during encoding — concurrent streams encode independently.
 func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers [][2]string, body []byte) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
 	if len(body) > 0 && s.IsHEAD {
 		body = nil
 	}
 
+	enc := getH2StreamEncoder()
+
 	// Stack-allocated header buffer for common case (≤7 response headers).
-	var buf [16][2]string
-	responseHeaders := buf[:0:16]
+	var hdrBuf [16][2]string
+	responseHeaders := hdrBuf[:0:16]
 	if len(headers)+1 > 16 {
 		responseHeaders = make([][2]string, 0, len(headers)+1)
 	}
 	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
 	responseHeaders = append(responseHeaders, headers...)
 
-	headerBlock, err := a.encoder.EncodeBorrow(responseHeaders)
+	headerBlock, err := enc.encodeHeaders(responseHeaders)
 	if err != nil {
+		putH2StreamEncoder(enc)
 		return fmt.Errorf("HPACK encode error: %w", err)
 	}
 
 	endStream := len(body) == 0
-	if err := a.writer.WriteHeaders(s.ID, endStream, headerBlock, 16384); err != nil {
-		return err
+	maxFrame := a.maxFrameSize
+	if maxFrame == 0 {
+		maxFrame = 16384
 	}
+
+	// Use pooled frame buffer to eliminate per-response allocation.
+	pooled := getH2FrameBuf()
+	frameBuf := (*pooled)[:0]
+
+	// Ensure capacity for headers + body.
+	estimatedSize := 9 + len(headerBlock) + 9 + len(body)
+	if cap(frameBuf) < estimatedSize {
+		frameBuf = make([]byte, 0, estimatedSize)
+	}
+
+	frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
 
 	if len(body) > 0 {
 		window := s.GetWindowSize()
 
 		if window <= 0 {
-			// No window available — buffer everything.
 			s.BufferOutbound(body, true)
 		} else {
 			sendLen := len(body)
@@ -286,29 +302,27 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 				sendLen = int(window)
 			}
 			isEnd := sendLen == len(body)
-			if err := a.writer.WriteData(s.ID, isEnd, body[:sendLen]); err != nil {
-				return err
-			}
+			frameBuf = appendH2Data(frameBuf, s.ID, isEnd, body[:sendLen])
 			s.DeductWindow(int32(sendLen))
 
 			if !isEnd {
-				// Buffer remaining data.
 				s.BufferOutbound(body[sendLen:], true)
 			}
 		}
 	}
 
-	if err := a.writer.Flush(); err != nil {
-		return err
-	}
+	putH2StreamEncoder(enc)
 
-	s.HeadersSent = true
+	*pooled = frameBuf
+	a.writeQueue.Enqueue(s.ID, pooled)
+
+	s.SetHeadersSent()
 	return nil
 }
 
+// SendGoAway writes a GOAWAY frame via the shared writer.
+// Called from the event loop under H2State.mu — no adapter mutex needed.
 func (a *h2ResponseAdapter) SendGoAway(lastStreamID uint32, code http2.ErrCode, debug []byte) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if err := a.writer.WriteGoAway(lastStreamID, code, debug); err != nil {
 		return err
 	}
@@ -321,9 +335,9 @@ func (a *h2ResponseAdapter) IsStreamClosed(_ uint32) bool {
 	return false
 }
 
+// WriteRSTStreamPriority writes a RST_STREAM frame via the shared writer.
+// Called from the event loop under H2State.mu.
 func (a *h2ResponseAdapter) WriteRSTStreamPriority(streamID uint32, code http2.ErrCode) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if err := a.writer.WriteRSTStream(streamID, code); err != nil {
 		return err
 	}
@@ -483,47 +497,74 @@ func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
 }
 
 // h2 streaming support — h2ResponseAdapter implements stream.Streamer.
+// Streaming methods use goroutine-local encoders and the write queue,
+// matching the WriteResponse path for async handler safety.
 
 func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers [][2]string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	enc := getH2StreamEncoder()
 
-	responseHeaders := make([][2]string, 0, len(headers)+1)
+	var hdrBuf [16][2]string
+	responseHeaders := hdrBuf[:0:16]
+	if len(headers)+1 > 16 {
+		responseHeaders = make([][2]string, 0, len(headers)+1)
+	}
 	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
 	responseHeaders = append(responseHeaders, headers...)
 
-	headerBlock, err := a.encoder.Encode(responseHeaders)
+	headerBlock, err := enc.encodeHeaders(responseHeaders)
 	if err != nil {
+		putH2StreamEncoder(enc)
 		return fmt.Errorf("HPACK encode error: %w", err)
 	}
 
-	// endStream=false — body follows
-	if err := a.writer.WriteHeaders(s.ID, false, headerBlock, 16384); err != nil {
-		return err
+	maxFrame := a.maxFrameSize
+	if maxFrame == 0 {
+		maxFrame = 16384
 	}
-	s.HeadersSent = true
-	return a.writer.Flush()
+
+	pooled := getH2FrameBuf()
+	frameBuf := (*pooled)[:0]
+	needed := 9 + len(headerBlock)
+	if cap(frameBuf) < needed {
+		frameBuf = make([]byte, 0, needed)
+	}
+	frameBuf = appendH2Headers(frameBuf, s.ID, false, headerBlock, maxFrame)
+
+	putH2StreamEncoder(enc)
+
+	*pooled = frameBuf
+	a.writeQueue.Enqueue(s.ID, pooled)
+	s.SetHeadersSent()
+	return nil
 }
 
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.writer.WriteData(s.ID, false, data)
+	pooled := getH2FrameBuf()
+	frameBuf := (*pooled)[:0]
+	needed := 9 + len(data)
+	if cap(frameBuf) < needed {
+		frameBuf = make([]byte, 0, needed)
+	}
+	frameBuf = appendH2Data(frameBuf, s.ID, false, data)
+	*pooled = frameBuf
+	a.writeQueue.Enqueue(s.ID, pooled)
+	return nil
 }
 
 func (a *h2ResponseAdapter) Flush(_ *stream.Stream) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.writer.Flush()
+	return nil // write queue data is drained by event loop
 }
 
 func (a *h2ResponseAdapter) Close(s *stream.Stream) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.writer.WriteData(s.ID, true, nil); err != nil {
-		return err
+	pooled := getH2FrameBuf()
+	frameBuf := (*pooled)[:0]
+	if cap(frameBuf) < 9 {
+		frameBuf = make([]byte, 0, 9)
 	}
-	return a.writer.Flush()
+	frameBuf = appendH2Data(frameBuf, s.ID, true, nil)
+	*pooled = frameBuf
+	a.writeQueue.Enqueue(s.ID, pooled)
+	return nil
 }
 
 var _ stream.Streamer = (*h1ResponseAdapter)(nil)
