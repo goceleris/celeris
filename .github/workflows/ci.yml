@@ -215,11 +215,13 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
-          # Fullstack doesn't have iouring/adaptive — only epoll and std.
-          # Any failure is unexpected.
+          # On "none" tier, iouring configs are expected to fail (io_uring disabled).
           UNEXPECTED=$(grep -c 'FAIL.*reqs,' /tmp/fullstack.txt || echo 0)
+          if [ "${{ matrix.tier }}" = "none" ]; then
+            UNEXPECTED=$(grep 'FAIL.*reqs,' /tmp/fullstack.txt | grep -cv 'iouring' || echo 0)
+          fi
           if [ "$UNEXPECTED" -gt 0 ]; then
             echo "::error::$UNEXPECTED unexpected failures in fullstack loadtest"
-            grep 'FAIL.*reqs,' /tmp/fullstack.txt || true
+            grep 'FAIL.*reqs,' /tmp/fullstack.txt | grep -v 'iouring' || true
             exit 1
           fi
