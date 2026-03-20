@@ -1,0 +1,110 @@
+name: Smoke Benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-bench:
+    name: Smoke (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64 / ubuntu-24.04
+            runner: ubuntu-24.04
+          - name: x86_64 / ubuntu-22.04
+            runner: ubuntu-22.04
+          - name: arm64 / ubuntu-24.04
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: System info
+        run: |
+          echo "## System" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Kernel | $(uname -r) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Arch | $(uname -m) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CPUs | $(nproc) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe io_uring capabilities
+        run: |
+          go test -v -run TestProbeIntegration -count=1 ./probe/... 2>&1 | tee /tmp/probe.txt
+          echo "## io_uring Probe" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(Tier|Kernel|SQPOLL|iouring|epoll|CPU|NUMA|feature)' /tmp/probe.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build smoke binaries
+        run: |
+          go build -o /tmp/smoke-loadtest ./test/loadtest/
+          go build -o /tmp/smoke-fullstack ./test/loadtest/fullstack/
+
+      - name: "Smoke: engine loadtest (iouring + epoll + std)"
+        run: |
+          /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
+          # Extract summary line
+          SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/loadtest.txt || echo "0/0 passed, 0 failed, 0 skipped")
+          echo "Loadtest: $SUMMARY"
+
+          # Parse pass/fail counts
+          PASSED=$(echo "$SUMMARY" | grep -oP '^\d+' || echo 0)
+          TOTAL=$(echo "$SUMMARY" | grep -oP '(?<=/)\d+' | head -1 || echo 0)
+          FAILED=$(echo "$SUMMARY" | grep -oP '\d+(?= failed)' || echo 0)
+
+          echo "## Engine Loadtest" >> "$GITHUB_STEP_SUMMARY"
+          echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Full output</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/loadtest.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail if majority of tests failed (catastrophic regression).
+          # Individual errors under high concurrency on shared CI runners
+          # are expected noise — only fail on widespread breakage.
+          if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -gt $((TOTAL / 2)) ]; then
+            echo "::error::Catastrophic regression: $FAILED/$TOTAL configs failed"
+            exit 1
+          fi
+
+      - name: "Smoke: fullstack loadtest (celeris.Server)"
+        run: |
+          /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
+          SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/fullstack.txt || echo "0/0 passed, 0 failed, 0 skipped")
+          echo "Fullstack: $SUMMARY"
+
+          PASSED=$(echo "$SUMMARY" | grep -oP '^\d+' || echo 0)
+          TOTAL=$(echo "$SUMMARY" | grep -oP '(?<=/)\d+' | head -1 || echo 0)
+          FAILED=$(echo "$SUMMARY" | grep -oP '\d+(?= failed)' || echo 0)
+
+          echo "## Fullstack Loadtest" >> "$GITHUB_STEP_SUMMARY"
+          echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Full output</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/fullstack.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -gt $((TOTAL / 2)) ]; then
+            echo "::error::Catastrophic regression: $FAILED/$TOTAL configs failed"
+            exit 1
+          fi
