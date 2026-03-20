@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
@@ -45,6 +46,7 @@ type Worker struct {
 	tier         TierStrategy
 	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
 	sqpoll       bool // true when SQPOLL is active (kernel submits SQEs)
+	sendZC       bool // true when SEND_ZC is available (kernel 6.0+)
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
@@ -71,27 +73,27 @@ type Worker struct {
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
 	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2Conns       []int      // FDs of H2 connections (for write queue polling)
 	h2cfg         conn.H2Config
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) (*Worker, error) {
+	acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
-	// Only create the listen socket here. Ring creation is deferred to run()
-	// because SINGLE_ISSUER requires all ring operations from the creating thread.
-	listenFD, err := createListenSocket(cfg.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("worker %d: listen socket: %w", id, err)
-	}
+	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
+	// binding) so that the kernel allocates socket internal buffers on the
+	// worker's NUMA node. This eliminates cross-socket access for accept
+	// queue operations on multi-socket systems.
 
 	return &Worker{
 		id:           id,
 		cpuID:        cpuID,
-		listenFD:     listenFD,
+		listenFD:     -1,
 		tier:         tier,
 		sqpoll:       tier.SQPollIdle() > 0,
+		sendZC:       tier.SupportsSendZC(),
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
 		objective:    objective,
@@ -125,9 +127,30 @@ func (w *Worker) run(ctx context.Context) {
 
 	_ = platform.PinToCPU(w.cpuID)
 
+	// Bind memory allocations to this CPU's NUMA node before creating
+	// the listen socket, ring, and buffers. This ensures the socket's
+	// accept queue, mmap'd SQ/CQ rings, SQE arrays, and provided buffer
+	// regions are all NUMA-local to the worker thread, eliminating
+	// cross-socket QPI/UPI traffic on multi-socket systems.
+	numaNode := platform.CPUForNode(w.cpuID)
+	if err := platform.BindNumaNode(numaNode); err == nil {
+		defer func() { _ = platform.ResetNumaPolicy() }()
+	}
+
+	// Create the listen socket on the worker's NUMA node. Each worker has its
+	// own listen socket via SO_REUSEPORT; kernel allocates socket internals
+	// (accept queue, buffers) on the current thread's NUMA node.
+	listenFD, err := createListenSocket(w.cfg.Addr)
+	if err != nil {
+		w.ready <- fmt.Errorf("worker %d: listen socket: %w", w.id, err)
+		return
+	}
+	w.listenFD = listenFD
+
 	// Create ring after LockOSThread — SINGLE_ISSUER requires all ring
-	// operations from the same OS thread.
-	ring, err := NewRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle())
+	// operations from the same OS thread. NewRingCPU pins the kernel's SQPOLL
+	// thread to the same CPU as this worker, ensuring NUMA-local SQ ring polling.
+	ring, err := NewRingCPU(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle(), w.cpuID)
 	if err != nil {
 		w.ready <- fmt.Errorf("worker %d ring setup: %w", w.id, err)
 		return
@@ -214,47 +237,80 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Submit pending SENDs + wait for CQEs. Four modes:
-		// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
-		// 2. CQEs already ready, nothing pending → skip syscall entirely
-		// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
-		// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
-		//
-		// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
-		// setup/teardown and sigset parsing, saving ~200-500ns per call.
-		// Mode 3a is safe because SEND SQEs always produce CQEs (no
-		// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
-		// Mode 3b uses a timeout because the only pending SQEs may have
-		// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
-		// need a timeout for graceful shutdown via ctx.Err() checks.
-		hasPending := w.ring.Pending() > 0
-		cqHead, cqTail := w.ring.BeginCQ()
-		if cqHead != cqTail && hasPending {
-			// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
-			if _, err := w.ring.Submit(); err != nil {
-				w.shutdown()
-				return
+		var cqHead, cqTail uint32
+		if w.sqpoll {
+			// SQPOLL path: kernel thread submits SQEs from the shared ring.
+			// We never call Submit() — just clear the pending counter.
+			w.ring.ClearPending()
+
+			// Wake SQPOLL thread if it went idle after sqThreadIdle ms.
+			if w.ring.SQNeedWakeup() {
+				_ = w.ring.WakeupSQPoll()
 			}
-		} else if hasPending && w.sendsPending {
-			// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
-			// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
-			if err := w.ring.SubmitAndWait(); err != nil {
-				w.shutdown()
-				return
-			}
+
+			// Check CQ ring — if CQEs ready, process without syscall.
 			cqHead, cqTail = w.ring.BeginCQ()
-		} else if hasPending || cqHead == cqTail {
-			// Mode 3b: no guaranteed CQEs — wait with timeout for
-			// shutdown checks and CQE_SKIP_SUCCESS operations.
-			waitTimeout := 100 * time.Millisecond
-			if w.listenFD < 0 {
-				waitTimeout = 1 * time.Second
+			if cqHead == cqTail {
+				// No CQEs — wait with timeout (only remaining syscall).
+				waitTimeout := 100 * time.Millisecond
+				if w.listenFD < 0 {
+					waitTimeout = 1 * time.Second
+				}
+				if len(w.h2Conns) > 0 {
+					waitTimeout = 100 * time.Microsecond
+				}
+				if err := w.ring.WaitCQETimeout(waitTimeout); err != nil {
+					w.shutdown()
+					return
+				}
+				cqHead, cqTail = w.ring.BeginCQ()
 			}
-			if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
-				w.shutdown()
-				return
-			}
+		} else {
+			// Non-SQPOLL path: 4-mode adaptive submit.
+			// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
+			// 2. CQEs already ready, nothing pending → skip syscall entirely
+			// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
+			// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
+			//
+			// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
+			// setup/teardown and sigset parsing, saving ~200-500ns per call.
+			// Mode 3a is safe because SEND SQEs always produce CQEs (no
+			// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
+			// Mode 3b uses a timeout because the only pending SQEs may have
+			// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
+			// need a timeout for graceful shutdown via ctx.Err() checks.
+			hasPending := w.ring.Pending() > 0
 			cqHead, cqTail = w.ring.BeginCQ()
+			if cqHead != cqTail && hasPending {
+				// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
+				if _, err := w.ring.Submit(); err != nil {
+					w.shutdown()
+					return
+				}
+			} else if hasPending && w.sendsPending {
+				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
+				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
+				if err := w.ring.SubmitAndWait(); err != nil {
+					w.shutdown()
+					return
+				}
+				cqHead, cqTail = w.ring.BeginCQ()
+			} else if hasPending || cqHead == cqTail {
+				// Mode 3b: no guaranteed CQEs — wait with timeout for
+				// shutdown checks and CQE_SKIP_SUCCESS operations.
+				waitTimeout := 100 * time.Millisecond
+				if w.listenFD < 0 {
+					waitTimeout = 1 * time.Second
+				}
+				if len(w.h2Conns) > 0 {
+					waitTimeout = 100 * time.Microsecond
+				}
+				if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
+					w.shutdown()
+					return
+				}
+				cqHead, cqTail = w.ring.BeginCQ()
+			}
 		}
 		w.sendsPending = false
 
@@ -288,15 +344,10 @@ func (w *Worker) run(ctx context.Context) {
 		w.ring.EndCQ(cqHead)
 
 		// SENDs queued during CQE processing remain in the SQ ring and are
-		// submitted at the top of the next iteration (adaptive submit).
-		// This eliminates one io_uring_enter per iteration: the kernel sees
-		// the combined SEND batch in a single submit+wait syscall instead of
-		// a separate Submit() here followed by SubmitAndWaitTimeout() above.
-		// Profile data shows Submit accounts for ~55% of total CPU — removing
-		// this extra call halves the syscall overhead.
-		if w.sqpoll {
-			w.ring.ClearPending()
-		}
+		// submitted at the top of the next iteration. For non-SQPOLL, the
+		// adaptive submit combines them into a single submit+wait syscall.
+		// For SQPOLL, the kernel thread picks them up from the shared ring
+		// and ClearPending is called at the top of the SQPOLL path.
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per CQE batch,
@@ -328,6 +379,18 @@ func (w *Worker) run(ctx context.Context) {
 				}
 			}
 			cs = next
+		}
+
+		// Drain H2 async write queues. Handler goroutines enqueue response
+		// frame bytes; we drain them into writeBuf and flush to the wire.
+		for _, fd := range w.h2Conns {
+			cs := w.conns[fd]
+			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if w.flushSend(cs) {
+					w.markDirty(cs)
+				}
+			}
 		}
 
 		// Check connection timeouts every 1024 iterations to amortize
@@ -521,8 +584,9 @@ func (w *Worker) initProtocol(cs *connState) {
 			}
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn)
+		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, -1)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
+		w.h2Conns = append(w.h2Conns, cs.fd)
 	}
 }
 
@@ -661,7 +725,43 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
+	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
+	// Now safe to modify/reuse sendBuf. Process the deferred result.
+	if cqeIsNotif(c.Flags) {
+		cs.zcNotifPending = false
+		w.completeSend(cs, fd, int(cs.zcSentBytes), now)
+		return
+	}
+
+	// SEND_ZC first CQE: result is ready but buffer is still in DMA.
+	// Store the result and wait for the notification before touching sendBuf.
+	if w.sendZC && cqeHasMore(c.Flags) {
+		if c.Res < 0 {
+			cs.sending = false
+			cs.zcNotifPending = true
+			cs.zcSentBytes = c.Res // store negative for error path on NOTIF
+			return
+		}
+		cs.zcNotifPending = true
+		cs.zcSentBytes = c.Res
+		// sending stays true until NOTIF completes the cycle.
+		return
+	}
+
+	// Regular SEND completion (non-ZC path).
 	cs.sending = false
+
+	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
+	// Disable ZC for this worker and retry the send with regular SEND.
+	if c.Res == -22 && w.sendZC {
+		w.sendZC = false
+		w.logger.Warn("SEND_ZC not supported (EINVAL), falling back to regular SEND",
+			"worker", w.id)
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+		return
+	}
 
 	if c.Res < 0 {
 		w.errCount.Add(1)
@@ -675,8 +775,27 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
+	w.completeSend(cs, fd, int(c.Res), now)
+}
+
+// completeSend processes a send result after the buffer is safe to modify.
+// Called directly for regular SEND, or from the NOTIF handler for SEND_ZC.
+func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
+	cs.sending = false
+
+	if sent < 0 {
+		w.errCount.Add(1)
+		cs.sendBuf = cs.sendBuf[:0]
+		cs.writeBuf = cs.writeBuf[:0]
+		if cs.closing {
+			w.finishClose(fd)
+		} else {
+			w.closeConn(fd)
+		}
+		return
+	}
+
 	// Handle partial sends by shifting remaining data to the front.
-	sent := int(c.Res)
 	if sent < len(cs.sendBuf) {
 		remaining := len(cs.sendBuf) - sent
 		copy(cs.sendBuf, cs.sendBuf[sent:])
@@ -731,11 +850,12 @@ func (w *Worker) closeConn(fd int) {
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
+		w.removeH2Conn(fd)
 	}
 
 	// Defer actual close until all in-flight and pending SENDs complete,
 	// so GOAWAY / RST_STREAM data reaches the client.
-	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
+	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
 		if w.flushSend(cs) {
 			w.markDirty(cs)
@@ -851,6 +971,16 @@ func (w *Worker) markDirty(cs *connState) {
 	w.dirtyHead = cs
 }
 
+func (w *Worker) removeH2Conn(fd int) {
+	for i, f := range w.h2Conns {
+		if f == fd {
+			w.h2Conns[i] = w.h2Conns[len(w.h2Conns)-1]
+			w.h2Conns = w.h2Conns[:len(w.h2Conns)-1]
+			return
+		}
+	}
+}
+
 func (w *Worker) removeDirty(cs *connState) {
 	if !cs.dirty {
 		return
@@ -880,8 +1010,8 @@ func (w *Worker) removeDirty(cs *connState) {
 // Returns true if data is still pending and needs retry (SQ ring was full).
 // The caller should markDirty only when this returns true.
 func (w *Worker) flushSend(cs *connState) bool {
-	if cs.sending {
-		return false // send in-flight; handleSend will pick up writeBuf
+	if cs.sending || cs.zcNotifPending {
+		return false // send in-flight; handleSend/NOTIF will pick up writeBuf
 	}
 
 	// If sendBuf still has data (partial send remainder), re-send it.
@@ -890,11 +1020,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		if sqe == nil {
 			return true // SQ ring full — caller should markDirty
 		}
-		if cs.fixedFile {
-			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
-		} else {
-			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
-		}
+		w.prepSendSQE(sqe, cs, false)
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 		cs.sending = true
 		w.sendsPending = true
@@ -914,15 +1040,28 @@ func (w *Worker) flushSend(cs *connState) bool {
 		cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
 		return true
 	}
-	if cs.fixedFile {
-		prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
-	} else {
-		prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
-	}
+	w.prepSendSQE(sqe, cs, false)
 	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	cs.sending = true
 	w.sendsPending = true
 	return false
+}
+
+// prepSendSQE prepares a SEND or SEND_ZC SQE based on worker capabilities.
+// SEND_ZC is only used for unlinked sends (the notification CQE would break
+// the link chain). Linked sends always use regular SEND.
+func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
+	if w.sendZC && !linked {
+		if cs.fixedFile {
+			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
+		} else {
+			prepSendZC(sqe, cs.fd, cs.sendBuf, false)
+		}
+	} else if cs.fixedFile {
+		prepSendFixed(sqe, cs.fd, cs.sendBuf, linked)
+	} else {
+		prepSendPlain(sqe, cs.fd, cs.sendBuf, linked)
+	}
 }
 
 // flushSendLink is like flushSend but links a RECV SQE after the SEND using
@@ -933,7 +1072,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 // Only used for single-shot recv (bufRing == nil) on the normal request path.
 // Falls back to plain (unlinked) SEND if only one SQE slot is available.
 func (w *Worker) flushSendLink(cs *connState) bool {
-	if cs.sending {
+	if cs.sending || cs.zcNotifPending {
 		return false
 	}
 
@@ -954,10 +1093,12 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		return true
 	}
 
+	// SEND_ZC cannot be linked (notification CQE breaks the link chain).
+	// For linked SEND→RECV, always use regular SEND.
 	// Try to get a second SQE for the linked RECV.
 	recvSQE := w.ring.GetSQE()
 	if recvSQE != nil {
-		// Link SEND → RECV.
+		// Link SEND → RECV (always regular SEND, never ZC).
 		if cs.fixedFile {
 			prepSendFixed(sqe, cs.fd, cs.sendBuf, true)
 		} else {
@@ -968,12 +1109,8 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		setSQEUserData(recvSQE, encodeUserData(udRecv, cs.fd))
 		cs.recvLinked = true
 	} else {
-		// Only one SQE slot — plain SEND, no linking.
-		if cs.fixedFile {
-			prepSendFixed(sqe, cs.fd, cs.sendBuf, false)
-		} else {
-			prepSendPlain(sqe, cs.fd, cs.sendBuf, false)
-		}
+		// Only one SQE slot — unlinked send, can use ZC if available.
+		w.prepSendSQE(sqe, cs, false)
 		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
 	}
 	cs.sending = true

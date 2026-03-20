@@ -47,7 +47,8 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("io_uring not available on this system")
 	}
 
-	tier := SelectTier(profile)
+	objective := resource.ResolveObjective(cfg.Objective)
+	tier := SelectTier(profile, objective.SQPollIdle)
 	if tier == nil {
 		return nil, fmt.Errorf("no suitable io_uring tier available")
 	}
@@ -58,6 +59,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		"multishot_recv", tier.SupportsMultishotRecv(),
 		"provided_buffers", tier.SupportsProvidedBuffers(),
 		"fixed_files", tier.SupportsFixedFiles(),
+		"send_zc", tier.SupportsSendZC(),
 	)
 
 	return &Engine{
@@ -132,7 +134,16 @@ func (e *Engine) Listen(ctx context.Context) error {
 		e.addr.Store(&addr)
 	}
 
-	e.cfg.Logger.Info("io_uring engine listening", "addr", e.cfg.Addr, "tier", tier.Tier().String(), "workers", resolved.Workers)
+	e.cfg.Logger.Info("io_uring engine listening",
+		"addr", e.cfg.Addr,
+		"tier", tier.Tier().String(),
+		"workers", resolved.Workers,
+		"sqpoll", tier.SQPollIdle() > 0,
+		"send_zc", tier.SupportsSendZC(),
+		"fixed_files", tier.SupportsFixedFiles(),
+		"numa_nodes", e.profile.NUMANodes,
+		"kernel", e.profile.KernelVersion,
+	)
 
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,

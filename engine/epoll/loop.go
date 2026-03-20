@@ -35,6 +35,7 @@ type Loop struct {
 	cpuID        int
 	epollFD      int
 	listenFD     int
+	eventFD      int // eventfd for H2 write queue wakeup (-1 if unavailable)
 	events       []unix.EpollEvent
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
@@ -59,6 +60,7 @@ type Loop struct {
 	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
 
 	dirtyHead *connState // head of intrusive doubly-linked dirty list
+	h2Conns   []int      // FDs of H2 connections (for write queue polling)
 	h2cfg     conn.H2Config
 }
 
@@ -87,11 +89,30 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		return nil, fmt.Errorf("epoll_ctl listen: %w", err)
 	}
 
+	// Create eventfd for H2 write queue wakeup. When available, H2 handler
+	// goroutines signal the eventfd after enqueuing response frames, letting
+	// epoll_wait return immediately instead of 1ms polling. Graceful fallback
+	// to polling if eventfd creation fails.
+	efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if err != nil {
+		efd = -1
+	}
+	if efd >= 0 {
+		if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+			Events: unix.EPOLLIN | unix.EPOLLET,
+			Fd:     int32(efd),
+		}); err != nil {
+			_ = unix.Close(efd)
+			efd = -1
+		}
+	}
+
 	return &Loop{
 		id:           id,
 		cpuID:        cpuID,
 		epollFD:      epollFD,
 		listenFD:     listenFD,
+		eventFD:      efd,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
 		conns:        make([]*connState, connTableSize),
 		handler:      handler,
@@ -192,6 +213,14 @@ func (l *Loop) run(ctx context.Context) {
 			ev := &l.events[i]
 			fd := int(ev.Fd)
 
+			// Eventfd wakeup: drain counter and let the H2 write queue
+			// drain pass below handle the actual data.
+			if fd == l.eventFD && l.eventFD >= 0 {
+				var buf [8]byte
+				_, _ = unix.Read(l.eventFD, buf[:])
+				continue
+			}
+
 			if fd == l.listenFD && l.listenFD >= 0 {
 				l.acceptAll(ctx, now)
 				continue
@@ -229,6 +258,23 @@ func (l *Loop) run(ctx context.Context) {
 			}
 			// else: partial write, keep on dirty list for next iteration
 			cs = next
+		}
+
+		// Drain H2 async write queues. Handler goroutines enqueue response
+		// frame bytes; we drain them into writeBuf and flush to the wire.
+		for _, fd := range l.h2Conns {
+			cs := l.conns[fd]
+			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if cs.writePos < len(cs.writeBuf) {
+					if fErr := flushWrites(cs); fErr != nil {
+						l.removeDirty(cs)
+						l.closeConn(fd)
+					} else if cs.writePos < len(cs.writeBuf) {
+						l.markDirty(cs)
+					}
+				}
+			}
 		}
 
 		// Flush batched request count to the shared atomic counter. This
@@ -454,8 +500,9 @@ func (l *Loop) initProtocol(cs *connState) {
 			return l.hijackConn(cs.fd)
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(l.handler, l.h2cfg, cs.writeFn)
+		cs.h2State = conn.NewH2State(l.handler, l.h2cfg, cs.writeFn, l.eventFD)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
+		l.h2Conns = append(l.h2Conns, cs.fd)
 	}
 }
 
@@ -485,6 +532,16 @@ func (l *Loop) markDirty(cs *connState) {
 	l.dirtyHead = cs
 }
 
+func (l *Loop) removeH2Conn(fd int) {
+	for i, f := range l.h2Conns {
+		if f == fd {
+			l.h2Conns[i] = l.h2Conns[len(l.h2Conns)-1]
+			l.h2Conns = l.h2Conns[:len(l.h2Conns)-1]
+			return
+		}
+	}
+}
+
 func (l *Loop) removeDirty(cs *connState) {
 	if !cs.dirty {
 		return
@@ -506,6 +563,12 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	// When dirty list has unflushed data, poll immediately.
 	if l.dirtyHead != nil {
 		return 0
+	}
+	// When H2 connections exist and no eventfd is available, fall back to
+	// 1ms polling for write queue draining. With eventfd, handler goroutines
+	// signal directly and epoll_wait returns event-driven — no polling needed.
+	if len(l.h2Conns) > 0 && l.eventFD < 0 {
+		return 1
 	}
 	switch {
 	case l.consecutiveEmpty == 0:
@@ -562,6 +625,7 @@ func (l *Loop) closeConn(fd int) {
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
+		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
@@ -596,6 +660,9 @@ func (l *Loop) shutdown() {
 	}
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)
+	}
+	if l.eventFD >= 0 {
+		_ = unix.Close(l.eventFD)
 	}
 	_ = unix.Close(l.epollFD)
 }

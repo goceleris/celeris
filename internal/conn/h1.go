@@ -262,6 +262,8 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	s.EndStream = true
 	// Direct assignment — no mutex needed. H1 streams are single-threaded
 	// (no manager), and the stream is not yet visible to any handler.
-	s.State = stream.StateHalfClosedRemote
+	// Direct atomic store — H1 streams are single-threaded with no manager,
+	// so we skip SetState's atomic.Swap + manager.updateActiveCount overhead.
+	s.StoreState(stream.StateHalfClosedRemote)
 	return s
 }

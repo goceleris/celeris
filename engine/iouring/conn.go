@@ -16,16 +16,18 @@ import (
 const maxSendQueueBytes = 4 << 20 // 4 MiB
 
 type connState struct {
-	fd         int             // 8: real FD, or fixed file index
-	protocol   engine.Protocol // 1
-	detected   bool            // 1
-	sending    bool            // 1: true when a SEND SQE is in-flight
-	closing    bool            // 1: defers close until sends complete
-	dirty      bool            // 1: true when data needs flushing
-	fixedFile  bool            // 1: true when fd is fixed file index
-	recvLinked bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
-	needsRecv  bool            // 1: recv arm was dropped (SQ ring full); retry on next opportunity
-	sendBuf    []byte          // 24: in-flight buffer (accessed with sending flag)
+	fd             int             // 8: real FD, or fixed file index
+	protocol       engine.Protocol // 1
+	detected       bool            // 1
+	sending        bool            // 1: true when a SEND SQE is in-flight
+	closing        bool            // 1: defers close until sends complete
+	dirty          bool            // 1: true when data needs flushing
+	fixedFile      bool            // 1: true when fd is fixed file index
+	recvLinked     bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
+	needsRecv      bool            // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	zcNotifPending bool            // 1: waiting for SEND_ZC notification CQE
+	zcSentBytes    int32           // bytes sent from first SEND_ZC CQE (processed on NOTIF)
+	sendBuf        []byte          // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
 	buf       []byte     // 24: per-connection recv buffer
@@ -82,6 +84,8 @@ func releaseConnState(cs *connState) {
 	cs.fixedFile = false
 	cs.recvLinked = false
 	cs.needsRecv = false
+	cs.zcNotifPending = false
+	cs.zcSentBytes = 0
 	cs.lastActivity = 0
 	cs.fd = 0
 	connStatePool.Put(cs)

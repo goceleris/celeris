@@ -12,6 +12,7 @@ const (
 // io_uring setup flags.
 const (
 	setupSQPoll       = 1 << 1
+	setupSQAff        = 1 << 2 // pin SQPOLL thread to sq_thread_cpu
 	setupCoopTaskrun  = 1 << 8
 	setupSingleIssuer = 1 << 12
 	setupDeferTaskrun = 1 << 13
@@ -35,6 +36,7 @@ const (
 	opSEND           = 26
 	opRECV           = 27
 	opPROVIDEBUFFERS = 31
+	opSENDZC         = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
 )
 
 // SQE flags.
@@ -49,6 +51,7 @@ const (
 const (
 	cqeFBuffer = 1 << 0
 	cqeFMore   = 1 << 1
+	cqeFNotif  = 1 << 2 // IORING_CQE_F_NOTIF: zero-copy send notification
 )
 
 // Accept flags.
@@ -71,6 +74,11 @@ const (
 
 // Fixed file index sentinel for auto-allocation (IORING_FILE_INDEX_ALLOC).
 const fileIndexAlloc = ^uint32(0)
+
+// SQ ring flags (read from shared memory).
+const (
+	sqNeedWakeup = 1 << 0 // IORING_SQ_NEED_WAKEUP
+)
 
 // Async cancel flags.
 const (

@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -26,6 +27,47 @@ const maxRequestBodySize = 100 << 20
 var headerBlockPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
 
 var headersSlicePoolIn = sync.Pool{New: func() any { s := make([][2]string, 0, 16); return &s }}
+
+// h2WorkerPool is a global goroutine pool for executing H2 stream handlers.
+// A single pool is shared across all connections to avoid per-connection
+// goroutine overhead (8 goroutines × N connections was catastrophic).
+type h2WorkerPool struct {
+	work chan h2Task
+}
+
+type h2Task struct {
+	proc   *Processor
+	stream *Stream
+}
+
+// globalH2Pool is the shared worker pool for all H2 connections.
+// Initialized lazily on first use, never closed (process-lifetime).
+var globalH2Pool = newH2WorkerPool(runtime.GOMAXPROCS(0) * 4)
+
+func newH2WorkerPool(size int) *h2WorkerPool {
+	p := &h2WorkerPool{work: make(chan h2Task, size*16)}
+	for range size {
+		go p.run()
+	}
+	return p
+}
+
+func (p *h2WorkerPool) run() {
+	for task := range p.work {
+		task.proc.executeHandler(task.stream)
+	}
+}
+
+// Submit tries to dispatch to a pooled worker. If all workers are busy
+// and the channel is full, falls back to a one-shot goroutine to avoid
+// blocking the event loop (which would stall frame processing).
+func (p *h2WorkerPool) Submit(proc *Processor, s *Stream) {
+	select {
+	case p.work <- h2Task{proc, s}:
+	default:
+		go proc.executeHandler(s)
+	}
+}
 
 // Processor processes incoming HTTP/2 frames and manages streams.
 type Processor struct {
@@ -218,44 +260,47 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			p.manager.initialWindowSize = s.Val
 
 			for sid, stream := range p.manager.streams {
-				stream.mu.Lock()
-				if delta > 0 && stream.WindowSize > 2147483647-delta {
-					stream.mu.Unlock()
+				oldWin := stream.windowSize.Load()
+				if delta > 0 && oldWin > 2147483647-delta {
 					p.manager.mu.Unlock()
 					validationErr = fmt.Errorf("stream %d window overflow", sid)
 					_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeFlowControl, []byte(validationErr.Error()))
 					return validationErr
 				}
-				stream.WindowSize += delta
+				newWin := stream.windowSize.Add(delta)
 
 				// If window became positive and there's buffered data, prepare to flush.
-				if stream.WindowSize > 0 && stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-					buffered := stream.OutboundBuffer.Bytes()
-					sendLen := len(buffered)
-					if int32(sendLen) > stream.WindowSize {
-						sendLen = int(stream.WindowSize)
-					}
-					isEnd := sendLen == len(buffered) && stream.OutboundEndStream
-					data := make([]byte, sendLen)
-					copy(data, buffered[:sendLen])
-					stream.WindowSize -= int32(sendLen)
+				if newWin > 0 {
+					stream.mu.Lock()
+					if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
+						buffered := stream.OutboundBuffer.Bytes()
+						sendLen := len(buffered)
+						curWin := stream.windowSize.Load()
+						if int32(sendLen) > curWin {
+							sendLen = int(curWin)
+						}
+						isEnd := sendLen == len(buffered) && stream.OutboundEndStream
+						data := make([]byte, sendLen)
+						copy(data, buffered[:sendLen])
+						stream.windowSize.Add(-int32(sendLen))
 
-					if sendLen == len(buffered) {
-						stream.OutboundBuffer.Reset()
-					} else {
-						remaining := make([]byte, len(buffered)-sendLen)
-						copy(remaining, buffered[sendLen:])
-						stream.OutboundBuffer.Reset()
-						stream.OutboundBuffer.Write(remaining)
-					}
+						if sendLen == len(buffered) {
+							stream.OutboundBuffer.Reset()
+						} else {
+							remaining := make([]byte, len(buffered)-sendLen)
+							copy(remaining, buffered[sendLen:])
+							stream.OutboundBuffer.Reset()
+							stream.OutboundBuffer.Write(remaining)
+						}
 
-					pendingFlushes = append(pendingFlushes, bufferedFlush{
-						streamID:  sid,
-						data:      data,
-						endStream: isEnd,
-					})
+						pendingFlushes = append(pendingFlushes, bufferedFlush{
+							streamID:  sid,
+							data:      data,
+							endStream: isEnd,
+						})
+					}
+					stream.mu.Unlock()
 				}
-				stream.mu.Unlock()
 			}
 			p.manager.mu.Unlock()
 		case http2.SettingMaxFrameSize:
@@ -292,70 +337,91 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	for _, pf := range pendingFlushes {
 		_ = p.writer.WriteData(pf.streamID, pf.endStream, pf.data)
 		p.flush()
+		// If all buffered data was flushed with END_STREAM, clean up.
+		if pf.endStream {
+			if s, ok := p.manager.GetStream(pf.streamID); ok {
+				switch s.GetState() {
+				case StateHalfClosedRemote:
+					s.SetState(StateClosed)
+				case StateOpen:
+					s.SetState(StateHalfClosedLocal)
+				}
+				p.manager.DeleteStream(pf.streamID)
+			}
+		}
 	}
 
 	return nil
 }
 
-// runHandler runs the stream handler synchronously.
-// Running synchronously ensures response data is written to the output buffer
-// before ProcessFrame returns, so the caller can flush it to the wire.
+// runHandler dispatches the stream handler via the worker pool for concurrent
+// execution. Frame parsing (HPACK decode) remains serial under H2State.mu;
+// handler execution + response encoding run concurrently per stream.
 func (p *Processor) runHandler(stream *Stream) {
 	if p.handler == nil {
 		return
 	}
 
-	select {
-	case <-stream.ctx.Done():
+	if stream.IsCancelled() {
 		return
-	default:
 	}
 
-	stream.mu.Lock()
-	stream.HandlerStarted = true
-	stream.mu.Unlock()
+	stream.asyncRunning.Store(true)
+	globalH2Pool.Submit(p, stream)
+}
 
-	if err := p.handler.HandleStream(stream.ctx, stream); err != nil {
-		select {
-		case <-stream.ctx.Done():
-		default:
-			_ = p.writer.WriteRSTStream(stream.ID, http2.ErrCodeInternal)
-			p.flush()
+// executeHandler executes the handler on a worker pool goroutine. It owns the
+// stream lifecycle: on completion it removes the stream from the manager and
+// releases it back to the pool. If outbound data is buffered (flow control),
+// the stream stays in the map for the event loop to flush via WINDOW_UPDATE.
+func (p *Processor) executeHandler(stream *Stream) {
+	defer func() {
+		if r := recover(); r != nil {
+			_ = r // last-resort panic recovery
 		}
-		p.manager.DeleteStream(stream.ID)
+
+		// If there's buffered outbound data waiting for WINDOW_UPDATE,
+		// keep the stream in the map so the event loop can flush it.
+		// Clear asyncRunning so DeleteStream (on connection close) will
+		// release it. handleWindowUpdate will clean up after full flush.
+		stream.mu.RLock()
+		hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
+		stream.mu.RUnlock()
+		if hasPending {
+			stream.asyncRunning.Store(false)
+			return
+		}
+
+		p.manager.RemoveStreamFromMap(stream.ID)
+		stream.Release()
+	}()
+
+	stream.SetHandlerStarted()
+
+	if err := p.handler.HandleStream(stream.Context(), stream); err != nil {
 		return
 	}
 
-	stream.mu.RLock()
-	headersSent := stream.HeadersSent
-	state := stream.State
-	stream.mu.RUnlock()
+	headersSent := stream.GetHeadersSent()
+	state := stream.GetState()
 
 	if !headersSent {
 		if stream.ResponseWriter != nil {
 			_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
 		}
-		p.manager.DeleteStream(stream.ID)
 		return
 	}
 
 	if state == StateOpen || state == StateHalfClosedRemote {
 		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-			// Data still buffered (flow control); will be flushed on WINDOW_UPDATE.
 			return
 		}
 
-		// WriteResponse already sent DATA with END_STREAM, so just
-		// transition the stream state without sending a duplicate frame.
 		if state == StateHalfClosedRemote {
 			stream.SetState(StateClosed)
 		} else {
 			stream.SetState(StateHalfClosedLocal)
 		}
-	}
-
-	if stream.GetState() == StateClosed {
-		p.manager.DeleteStream(stream.ID)
 	}
 }
 
@@ -654,43 +720,65 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			return nil
 		}
 
-		stream.mu.Lock()
-		newWindow := int64(stream.WindowSize) + int64(f.Increment)
-		if newWindow > 0x7fffffff {
-			stream.mu.Unlock()
-			_ = p.writer.WriteRSTStream(f.StreamID, http2.ErrCodeFlowControl)
-			p.flush()
-			return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, stream.WindowSize, f.Increment)
+		// CAS loop for atomic window update with overflow check.
+		for {
+			old := stream.LoadWindowSize()
+			newWindow := int64(old) + int64(f.Increment)
+			if newWindow > 0x7fffffff {
+				_ = p.writer.WriteRSTStream(f.StreamID, http2.ErrCodeFlowControl)
+				p.flush()
+				return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, old, f.Increment)
+			}
+			//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
+			if stream.CompareAndSwapWindowSize(old, int32(newWindow)) {
+				break
+			}
 		}
-		//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
-		stream.WindowSize = int32(newWindow)
 
 		// Flush buffered outbound data now that window space is available.
-		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 && stream.WindowSize > 0 {
-			buffered := stream.OutboundBuffer.Bytes()
-			sendLen := len(buffered)
-			if int32(sendLen) > stream.WindowSize {
-				sendLen = int(stream.WindowSize)
-			}
-			isEnd := sendLen == len(buffered) && stream.OutboundEndStream
-			stream.WindowSize -= int32(sendLen)
-			stream.mu.Unlock()
+		var flushedAll bool
+		stream.mu.Lock()
+		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
+			curWin := stream.LoadWindowSize()
+			if curWin > 0 {
+				buffered := stream.OutboundBuffer.Bytes()
+				sendLen := len(buffered)
+				if int32(sendLen) > curWin {
+					sendLen = int(curWin)
+				}
+				isEnd := sendLen == len(buffered) && stream.OutboundEndStream
+				stream.windowSize.Add(-int32(sendLen))
+				stream.mu.Unlock()
 
-			_ = p.writer.WriteData(f.StreamID, isEnd, buffered[:sendLen])
-			p.flush()
+				_ = p.writer.WriteData(f.StreamID, isEnd, buffered[:sendLen])
+				p.flush()
 
-			stream.mu.Lock()
-			if sendLen == len(buffered) {
-				stream.OutboundBuffer.Reset()
-			} else {
-				remaining := make([]byte, len(buffered)-sendLen)
-				copy(remaining, buffered[sendLen:])
-				stream.OutboundBuffer.Reset()
-				stream.OutboundBuffer.Write(remaining)
+				stream.mu.Lock()
+				if sendLen == len(buffered) {
+					stream.OutboundBuffer.Reset()
+					if isEnd {
+						flushedAll = true
+					}
+				} else {
+					remaining := make([]byte, len(buffered)-sendLen)
+					copy(remaining, buffered[sendLen:])
+					stream.OutboundBuffer.Reset()
+					stream.OutboundBuffer.Write(remaining)
+				}
 			}
-			stream.mu.Unlock()
-		} else {
-			stream.mu.Unlock()
+		}
+		stream.mu.Unlock()
+
+		// If all buffered data has been flushed with END_STREAM, the handler
+		// goroutine already completed. Transition to closed and clean up.
+		if flushedAll {
+			switch stream.GetState() {
+			case StateHalfClosedRemote:
+				stream.SetState(StateClosed)
+			case StateOpen:
+				stream.SetState(StateHalfClosedLocal)
+			}
+			p.manager.DeleteStream(f.StreamID)
 		}
 
 		select {
@@ -706,9 +794,6 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
-		// RFC 7540 §6.4: RST_STREAM on an idle stream is a connection error,
-		// but RST_STREAM on a recently closed stream (already deleted from the
-		// manager after handler completion) must be silently ignored.
 		if f.StreamID <= p.manager.GetLastClientStreamID() {
 			return nil
 		}
@@ -718,10 +803,13 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 	}
 
 	stream.SetState(StateClosed)
-	stream.mu.Lock()
 	stream.ClosedByReset = true
-	stream.mu.Unlock()
 
+	// Cancel the context to signal any async handler goroutine.
+	stream.Cancel()
+
+	// DeleteStream skips Release if asyncRunning=true; the goroutine
+	// will release the stream when it completes.
 	p.manager.DeleteStream(f.StreamID)
 	return nil
 }
@@ -757,12 +845,13 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 
 	for streamID, stream := range p.manager.streams {
 		if streamID > lastStreamID {
-			stream.mu.Lock()
-			prev := stream.State
-			stream.State = StateClosed
-			stream.mu.Unlock()
-			p.manager.markActiveTransition(prev, StateClosed)
-			stream.Release()
+			prev := stream.GetState()
+			stream.state.Store(int32(StateClosed))
+			p.manager.updateActiveCount(prev, StateClosed)
+			stream.Cancel()
+			if !stream.asyncRunning.Load() {
+				stream.Release()
+			}
 			delete(p.manager.streams, streamID)
 			p.manager.priorityTree.RemoveStream(streamID)
 		}
@@ -905,9 +994,8 @@ func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugDat
 // sendRSTStreamAndMarkClosed sends RST_STREAM and marks the stream as closed.
 func (p *Processor) sendRSTStreamAndMarkClosed(streamID uint32, code http2.ErrCode) error {
 	stream, ok := p.manager.GetStream(streamID)
-
-	if ok && stream.cancel != nil {
-		stream.cancel()
+	if ok {
+		stream.Cancel()
 	}
 
 	if p.connWriter != nil {

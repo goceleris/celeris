@@ -12,7 +12,7 @@ func TestSelectTierBase(t *testing.T) {
 	profile := engine.CapabilityProfile{
 		IOUringTier: engine.Base,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -35,7 +35,7 @@ func TestSelectTierMid(t *testing.T) {
 		IOUringTier: engine.Mid,
 		CoopTaskrun: true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -56,7 +56,7 @@ func TestSelectTierHigh(t *testing.T) {
 		MultishotRecv:   true,
 		SingleIssuer:    true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -88,7 +88,7 @@ func TestSelectTierHighWithFixedFiles(t *testing.T) {
 		SingleIssuer:    true,
 		FixedFiles:      true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -107,7 +107,7 @@ func TestSelectTierHighWithDeferTaskrun(t *testing.T) {
 		SingleIssuer:    true,
 		DeferTaskrun:    true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -133,12 +133,51 @@ func TestSelectTierOptional(t *testing.T) {
 		SingleIssuer:    true,
 		SQPoll:          true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
 	if tier.Tier() != engine.Optional {
 		t.Errorf("expected Optional tier, got %v", tier.Tier())
+	}
+}
+
+func TestSelectTierOptionalWithSendZC(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.Optional,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		SQPoll:          true,
+		SendZC:          true,
+	}
+	tier := SelectTier(profile, 0)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	if !tier.SupportsSendZC() {
+		t.Error("expected send ZC support with SendZC profile")
+	}
+}
+
+func TestSelectTierOptionalWithoutSendZC(t *testing.T) {
+	profile := engine.CapabilityProfile{
+		IOUringTier:     engine.Optional,
+		CoopTaskrun:     true,
+		ProvidedBuffers: true,
+		MultishotAccept: true,
+		MultishotRecv:   true,
+		SingleIssuer:    true,
+		SQPoll:          true,
+	}
+	tier := SelectTier(profile, 0)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	if tier.SupportsSendZC() {
+		t.Error("should not support send ZC without SendZC profile")
 	}
 }
 
@@ -156,7 +195,7 @@ func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
 		DeferTaskrun:    true,
 		FixedFiles:      true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -179,7 +218,7 @@ func TestSelectTierNone(t *testing.T) {
 	profile := engine.CapabilityProfile{
 		IOUringTier: engine.None,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier != nil {
 		t.Errorf("expected nil tier for None")
 	}

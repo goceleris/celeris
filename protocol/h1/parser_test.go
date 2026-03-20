@@ -438,3 +438,116 @@ func TestParseRequest_DefaultContentLengthMinusOne(t *testing.T) {
 		t.Fatalf("default content-length = %d, want -1", req.ContentLength)
 	}
 }
+
+// TestFindHeaderEnd_AllPositions places \r\n\r\n at every possible offset in
+// buffers of varying sizes. This exercises AVX2 (32-byte), SSE2 (16-byte),
+// and scalar code paths, including transition boundaries.
+func TestFindHeaderEnd_AllPositions(t *testing.T) {
+	// Sizes chosen to stress boundaries:
+	//  4       — minimum, scalar only
+	//  15      — just under one SSE2 block
+	//  16      — exactly one SSE2 block (no room for \r\n\r\n verification)
+	//  19      — first size that enters the SSE2 loop
+	//  31      — just under one AVX2 block
+	//  32      — exactly one AVX2 block
+	//  35      — first size that enters the AVX2 loop
+	//  48      — AVX2 + SSE2 tail
+	//  64      — two full AVX2 iterations
+	//  100     — AVX2 + SSE2 + scalar tail
+	//  256     — multiple AVX2 iterations
+	//  1024    — large buffer
+	sizes := []int{4, 5, 15, 16, 17, 19, 20, 31, 32, 33, 35, 36, 48, 63, 64, 65, 100, 256, 1024}
+
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+			for pos := 0; pos <= size-4; pos++ {
+				buf := make([]byte, size)
+				for i := range buf {
+					buf[i] = 'A'
+				}
+				buf[pos] = '\r'
+				buf[pos+1] = '\n'
+				buf[pos+2] = '\r'
+				buf[pos+3] = '\n'
+
+				got := findHeaderEnd(buf)
+				want := pos + 4
+				if got != want {
+					t.Fatalf("size=%d pos=%d: got %d, want %d", size, pos, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestFindHeaderEnd_NotFound verifies -1 is returned when no \r\n\r\n exists.
+func TestFindHeaderEnd_NotFound(t *testing.T) {
+	sizes := []int{0, 1, 2, 3, 4, 16, 32, 64, 128, 256}
+	for _, size := range sizes {
+		buf := make([]byte, size)
+		for i := range buf {
+			buf[i] = 'A'
+		}
+		got := findHeaderEnd(buf)
+		if got != -1 {
+			t.Fatalf("size=%d: got %d, want -1 (no \\r\\n\\r\\n present)", size, got)
+		}
+	}
+}
+
+// TestFindHeaderEnd_FalsePositiveCR verifies that lone \r bytes do not
+// cause false positives. The buffer is filled with \r but no \r\n\r\n exists.
+func TestFindHeaderEnd_FalsePositiveCR(t *testing.T) {
+	sizes := []int{16, 32, 64, 128}
+	for _, size := range sizes {
+		buf := make([]byte, size)
+		for i := range buf {
+			buf[i] = '\r'
+		}
+		// No \n follows any \r, so no valid \r\n\r\n sequence.
+		got := findHeaderEnd(buf)
+		if got != -1 {
+			t.Fatalf("size=%d (all \\r): got %d, want -1", size, got)
+		}
+	}
+}
+
+// TestFindHeaderEnd_MultipleCR verifies correct behavior when multiple \r
+// bytes exist before the actual \r\n\r\n sequence.
+func TestFindHeaderEnd_MultipleCR(t *testing.T) {
+	buf := make([]byte, 128)
+	for i := range buf {
+		buf[i] = '\r'
+	}
+	// Place the real terminator at offset 100.
+	buf[100] = '\r'
+	buf[101] = '\n'
+	buf[102] = '\r'
+	buf[103] = '\n'
+	got := findHeaderEnd(buf)
+	if got != 104 {
+		t.Fatalf("got %d, want 104", got)
+	}
+}
+
+// TestFindHeaderEnd_PartialSequence ensures partial \r\n sequences
+// (without the full \r\n\r\n) are not mistakenly matched.
+func TestFindHeaderEnd_PartialSequence(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{"cr_only", "AAAA\rAAAA"},
+		{"crlf_only", "AAAA\r\nAAAA"},
+		{"crlf_cr", "AAAA\r\n\rAAAA"},
+		{"lf_crlf", "AAAA\n\r\nAAAA"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findHeaderEnd([]byte(tc.data))
+			if got != -1 {
+				t.Fatalf("got %d, want -1 for partial sequence", got)
+			}
+		})
+	}
+}

@@ -26,7 +26,6 @@ import (
 const (
 	concurrency = 64
 	duration    = 5 * time.Second
-	port        = "18080"
 )
 
 var engines = []celeris.EngineType{celeris.IOUring, celeris.Epoll, celeris.Std}
@@ -97,7 +96,7 @@ func main() {
 
 func runTest(name string, eng celeris.EngineType, obj celeris.Objective, proto celeris.Protocol) testResult {
 	s := celeris.New(celeris.Config{
-		Addr:           ":" + port,
+		Addr:           ":0", // kernel-assigned port avoids conflicts between sequential tests
 		Protocol:       proto,
 		Engine:         eng,
 		Objective:      obj,
@@ -127,22 +126,39 @@ func runTest(name string, eng celeris.EngineType, obj celeris.Objective, proto c
 		listenErr <- s.StartWithContext(ctx)
 	}()
 
-	addr := "127.0.0.1:" + port
-	if !waitForReady(addr, 5*time.Second) {
+	// Wait for server to bind and report its address.
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Addr() == nil && time.Now().Before(deadline) {
+		select {
+		case err := <-listenErr:
+			cancel()
+			if err != nil {
+				return testResult{name: name, status: "FAIL", detail: fmt.Sprintf("server start: %v", err)}
+			}
+			return testResult{name: name, status: "FAIL", detail: "server exited without binding"}
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.Addr() == nil {
 		cancel()
 		<-listenErr
 		return testResult{name: name, status: "FAIL", detail: "server failed to start within 5s"}
 	}
+	addr := s.Addr().String()
 	time.Sleep(100 * time.Millisecond)
 
 	endpoints := []string{"/", "/json", "/users/42"}
 	if proto == celeris.HTTP1 || proto == celeris.Auto {
 		reqs, errs, dur := loadTest(addr, endpoints, false)
-		if errs > 0 {
+		if errs > 0 || reqs == 0 {
 			cancel()
 			<-listenErr
-			return testResult{name: name, requests: reqs, errors: errs, duration: dur, status: "FAIL",
-				detail: fmt.Sprintf("H1 load: %d/%d errors", errs, reqs)}
+			detail := fmt.Sprintf("H1 load: %d/%d errors", errs, reqs)
+			if reqs == 0 {
+				detail = "H1 load: 0 requests completed (server not responding)"
+			}
+			return testResult{name: name, requests: reqs, errors: errs, duration: dur, status: "FAIL", detail: detail}
 		}
 		if proto == celeris.HTTP1 {
 			cancel()
@@ -156,9 +172,12 @@ func runTest(name string, eng celeris.EngineType, obj celeris.Objective, proto c
 		reqs, errs, dur := loadTest(addr, endpoints, true)
 		cancel()
 		<-listenErr
-		if errs > 0 {
-			return testResult{name: name, requests: reqs, errors: errs, duration: dur, status: "FAIL",
-				detail: fmt.Sprintf("H2C load: %d/%d errors", errs, reqs)}
+		if errs > 0 || reqs == 0 {
+			detail := fmt.Sprintf("H2C load: %d/%d errors", errs, reqs)
+			if reqs == 0 {
+				detail = "H2C load: 0 requests completed (server not responding)"
+			}
+			return testResult{name: name, requests: reqs, errors: errs, duration: dur, status: "FAIL", detail: detail}
 		}
 		return testResult{name: name, requests: reqs, errors: errs, duration: dur, status: "PASS",
 			detail: fmt.Sprintf("H2C: %d reqs, %.0f rps", reqs, float64(reqs)/dur.Seconds())}
@@ -167,19 +186,6 @@ func runTest(name string, eng celeris.EngineType, obj celeris.Objective, proto c
 	cancel()
 	<-listenErr
 	return testResult{name: name, status: "PASS", detail: "completed"}
-}
-
-func waitForReady(addr string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return true
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return false
 }
 
 func loadTest(addr string, endpoints []string, h2c bool) (totalReqs, totalErrs int64, dur time.Duration) {

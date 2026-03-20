@@ -8,6 +8,21 @@ func PinToCPU(_ int) error {
 	return nil
 }
 
+// BindNumaNode is a no-op on non-Linux platforms.
+func BindNumaNode(_ int) error {
+	return nil
+}
+
+// ResetNumaPolicy is a no-op on non-Linux platforms.
+func ResetNumaPolicy() error {
+	return nil
+}
+
+// CPUForNode returns 0 on non-Linux platforms (no NUMA info).
+func CPUForNode(_ int) int {
+	return 0
+}
+
 // DistributeWorkers returns CPU IDs for numWorkers using round-robin.
 func DistributeWorkers(numWorkers, numCPU, _ int) []int {
 	if numCPU <= 0 {

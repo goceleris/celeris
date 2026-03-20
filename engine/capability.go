@@ -17,6 +17,7 @@ type CapabilityProfile struct {
 	LinkedSQEs      bool
 	DeferTaskrun    bool
 	FixedFiles      bool
+	SendZC          bool
 	NumCPU          int
 	NUMANodes       int
 }

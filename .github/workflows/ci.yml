@@ -124,3 +124,104 @@ jobs:
       - name: Install mage
         run: go install github.com/magefile/mage@latest
       - run: mage bench
+
+  smoke-bench:
+    name: Smoke (${{ matrix.arch }} / ${{ matrix.tier }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      CELERIS_MAX_IOURING_TIER: ${{ matrix.tier }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full tier × arch matrix. GHA runners all have 6.x kernels, so we
+        # use CELERIS_MAX_IOURING_TIER to force each tier's code path:
+        #
+        #   optional  — kernel 6.0+ (SQPOLL, SEND_ZC, SINGLE_ISSUER)
+        #   high      — kernel 5.19+ (multishot accept, provided buffers)
+        #   mid       — kernel 5.13+ (COOP_TASKRUN)
+        #   base      — kernel 5.10+ (single-shot accept/recv)
+        #   none      — io_uring disabled (epoll + std only)
+        arch: [x86_64, arm64]
+        tier: [optional, high, mid, base, none]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: System info
+        run: |
+          echo "## System" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Kernel | $(uname -r) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Arch | $(uname -m) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CPUs | $(nproc) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Max io_uring tier | $CELERIS_MAX_IOURING_TIER |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build smoke binaries
+        run: |
+          go build -o /tmp/smoke-loadtest ./test/loadtest/
+          go build -o /tmp/smoke-fullstack ./test/loadtest/fullstack/
+
+      - name: "Smoke: engine loadtest"
+        run: |
+          sudo -E prlimit --memlock=unlimited /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
+          SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/loadtest.txt || echo "0/0 passed, 0 failed, 0 skipped")
+          echo "Engine loadtest: $SUMMARY"
+
+          echo "## Engine Loadtest (${{ matrix.tier }} tier)" >> "$GITHUB_STEP_SUMMARY"
+          echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Full output</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/loadtest.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+          # Count unexpected failures. On "none" tier, iouring and adaptive
+          # are expected to fail (io_uring disabled). Any other failure is real.
+          UNEXPECTED=$(grep -c 'FAIL.*reqs,' /tmp/loadtest.txt || echo 0)
+          if [ "${{ matrix.tier }}" = "none" ]; then
+            UNEXPECTED=$(grep 'FAIL.*reqs,' /tmp/loadtest.txt | grep -cv -E '(iouring|adaptive)' || echo 0)
+          fi
+          if [ "$UNEXPECTED" -gt 0 ]; then
+            echo "::error::$UNEXPECTED unexpected failures in engine loadtest"
+            grep 'FAIL.*reqs,' /tmp/loadtest.txt | grep -v -E '(iouring|adaptive)' || true
+            exit 1
+          fi
+
+      - name: "Smoke: fullstack loadtest"
+        run: |
+          sudo -E prlimit --memlock=unlimited /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
+          SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/fullstack.txt || echo "0/0 passed, 0 failed, 0 skipped")
+          echo "Fullstack loadtest: $SUMMARY"
+
+          echo "## Fullstack Loadtest (${{ matrix.tier }} tier)" >> "$GITHUB_STEP_SUMMARY"
+          echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Full output</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/fullstack.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+          # On "none" tier, iouring configs are expected to fail (io_uring disabled).
+          UNEXPECTED=$(grep -c 'FAIL.*reqs,' /tmp/fullstack.txt || echo 0)
+          if [ "${{ matrix.tier }}" = "none" ]; then
+            UNEXPECTED=$(grep 'FAIL.*reqs,' /tmp/fullstack.txt | grep -cv 'iouring' || echo 0)
+          fi
+          if [ "$UNEXPECTED" -gt 0 ]; then
+            echo "::error::$UNEXPECTED unexpected failures in fullstack loadtest"
+            grep 'FAIL.*reqs,' /tmp/fullstack.txt | grep -v 'iouring' || true
+            exit 1
+          fi
