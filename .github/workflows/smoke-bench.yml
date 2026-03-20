@@ -12,18 +12,29 @@ permissions:
 
 jobs:
   smoke-bench:
-    name: Smoke (${{ matrix.name }})
+    name: Smoke (${{ matrix.arch }} / ${{ matrix.tier }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    env:
+      CELERIS_MAX_IOURING_TIER: ${{ matrix.tier }}
     strategy:
       fail-fast: false
       matrix:
+        # Full tier × arch matrix. GHA runners all have 6.x kernels, so we
+        # use CELERIS_MAX_IOURING_TIER to force each tier's code path:
+        #
+        #   optional  — kernel 6.0+ (SQPOLL, SEND_ZC, SINGLE_ISSUER)
+        #   high      — kernel 5.19+ (multishot accept, provided buffers, fixed files)
+        #   mid       — kernel 5.13+ (COOP_TASKRUN)
+        #   base      — kernel 5.10+ (single-shot accept/recv)
+        #   none      — io_uring disabled (epoll + std only)
+        arch: [x86_64, arm64]
+        tier: [optional, high, mid, base, none]
         include:
-          - name: x86_64 / ubuntu-24.04
+          # Map arch to GitHub Actions runner labels
+          - arch: x86_64
             runner: ubuntu-24.04
-          - name: x86_64 / ubuntu-22.04
-            runner: ubuntu-22.04
-          - name: arm64 / ubuntu-24.04
+          - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
@@ -40,33 +51,23 @@ jobs:
           echo "| Kernel | $(uname -r) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Arch | $(uname -m) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| CPUs | $(nproc) |" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Probe io_uring capabilities
-        run: |
-          go test -v -run TestProbeIntegration -count=1 ./probe/... 2>&1 | tee /tmp/probe.txt
-          echo "## io_uring Probe" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E '(Tier|Kernel|SQPOLL|iouring|epoll|CPU|NUMA|feature)' /tmp/probe.txt >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "| Max io_uring tier | $CELERIS_MAX_IOURING_TIER |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build smoke binaries
         run: |
           go build -o /tmp/smoke-loadtest ./test/loadtest/
           go build -o /tmp/smoke-fullstack ./test/loadtest/fullstack/
 
-      - name: "Smoke: engine loadtest (iouring + epoll + std)"
+      - name: "Smoke: engine loadtest"
         run: |
           /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
-          # Extract summary line
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/loadtest.txt || echo "0/0 passed, 0 failed, 0 skipped")
-          echo "Loadtest: $SUMMARY"
+          echo "Engine loadtest: $SUMMARY"
 
-          # Parse pass/fail counts
-          PASSED=$(echo "$SUMMARY" | grep -oP '^\d+' || echo 0)
           TOTAL=$(echo "$SUMMARY" | grep -oP '(?<=/)\d+' | head -1 || echo 0)
           FAILED=$(echo "$SUMMARY" | grep -oP '\d+(?= failed)' || echo 0)
 
-          echo "## Engine Loadtest" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Engine Loadtest (${{ matrix.tier }} tier)" >> "$GITHUB_STEP_SUMMARY"
           echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "<details><summary>Full output</summary>" >> "$GITHUB_STEP_SUMMARY"
@@ -77,24 +78,21 @@ jobs:
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
           # Fail if majority of tests failed (catastrophic regression).
-          # Individual errors under high concurrency on shared CI runners
-          # are expected noise — only fail on widespread breakage.
           if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -gt $((TOTAL / 2)) ]; then
             echo "::error::Catastrophic regression: $FAILED/$TOTAL configs failed"
             exit 1
           fi
 
-      - name: "Smoke: fullstack loadtest (celeris.Server)"
+      - name: "Smoke: fullstack loadtest"
         run: |
           /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/fullstack.txt || echo "0/0 passed, 0 failed, 0 skipped")
-          echo "Fullstack: $SUMMARY"
+          echo "Fullstack loadtest: $SUMMARY"
 
-          PASSED=$(echo "$SUMMARY" | grep -oP '^\d+' || echo 0)
           TOTAL=$(echo "$SUMMARY" | grep -oP '(?<=/)\d+' | head -1 || echo 0)
           FAILED=$(echo "$SUMMARY" | grep -oP '\d+(?= failed)' || echo 0)
 
-          echo "## Fullstack Loadtest" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Fullstack Loadtest (${{ matrix.tier }} tier)" >> "$GITHUB_STEP_SUMMARY"
           echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "<details><summary>Full output</summary>" >> "$GITHUB_STEP_SUMMARY"

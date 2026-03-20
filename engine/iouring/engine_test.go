@@ -153,7 +153,7 @@ func TestSelectTierOptionalWithSendZC(t *testing.T) {
 		SQPoll:          true,
 		SendZC:          true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
@@ -172,7 +172,7 @@ func TestSelectTierOptionalWithoutSendZC(t *testing.T) {
 		SingleIssuer:    true,
 		SQPoll:          true,
 	}
-	tier := SelectTier(profile)
+	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
