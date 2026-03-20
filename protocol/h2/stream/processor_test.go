@@ -497,8 +497,10 @@ func TestProcessHeadersNewStream(t *testing.T) {
 	fw := newTestFrameWriter()
 	rw := newTestResponseWriter()
 	var handlerState State
+	done := make(chan struct{})
 	handler := HandlerFunc(func(_ context.Context, s *Stream) error {
 		handlerState = s.GetState()
+		close(done)
 		return nil
 	})
 	p := NewProcessor(handler, fw, rw)
@@ -516,6 +518,8 @@ func TestProcessHeadersNewStream(t *testing.T) {
 		t.Fatalf("ProcessFrame HEADERS: %v", err)
 	}
 
+	<-done // wait for async handler goroutine
+
 	// Stream is cleaned up after handler completes; verify state was correct during handling.
 	if handlerState != StateHalfClosedRemote {
 		t.Errorf("Stream state during handler: got %v, want HalfClosedRemote", handlerState)
@@ -527,9 +531,11 @@ func TestProcessData(t *testing.T) {
 	rw := newTestResponseWriter()
 	var handlerData string
 	var handlerState State
+	done := make(chan struct{})
 	handler := HandlerFunc(func(_ context.Context, s *Stream) error {
 		handlerData = string(s.GetData())
 		handlerState = s.GetState()
+		close(done)
 		return nil
 	})
 	p := NewProcessor(handler, fw, rw)
@@ -552,6 +558,8 @@ func TestProcessData(t *testing.T) {
 	if err := p.ProcessFrame(ctx, df); err != nil {
 		t.Fatalf("ProcessFrame DATA: %v", err)
 	}
+
+	<-done // wait for async handler goroutine
 
 	// Stream is cleaned up after handler completes; verify state was correct during handling.
 	if handlerData != "hello" {
@@ -673,8 +681,10 @@ func TestProcessHeadersContinuation(t *testing.T) {
 	fw := newTestFrameWriter()
 	rw := newTestResponseWriter()
 	var handlerHeaderCount int
+	done := make(chan struct{})
 	handler := HandlerFunc(func(_ context.Context, s *Stream) error {
 		handlerHeaderCount = s.HeadersLen()
+		close(done)
 		return nil
 	})
 	p := NewProcessor(handler, fw, rw)
@@ -736,6 +746,8 @@ func TestProcessHeadersContinuation(t *testing.T) {
 	if p.IsExpectingContinuation() {
 		t.Error("Should not be expecting CONTINUATION after END_HEADERS")
 	}
+
+	<-done // wait for async handler goroutine
 
 	// Stream is cleaned up after handler completes; verify headers were present during handling.
 	if handlerHeaderCount == 0 {

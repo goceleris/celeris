@@ -19,7 +19,7 @@ type Manager struct {
 	nextPushID              uint32
 	maxFrameSize            uint32
 	initialWindowSize       uint32
-	activeStreams           uint32
+	activeStreams           atomic.Uint32
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]*uint32
 	windowUpdateMu          sync.Mutex
@@ -39,7 +39,6 @@ func NewManager() *Manager {
 		nextPushID:              2,
 		maxFrameSize:            16384,
 		initialWindowSize:       65535,
-		activeStreams:           0,
 		pendingConnWindowUpdate: 0,
 		pendingStreamUpdates:    make(map[uint32]*uint32),
 		streamsWithData:         make(map[uint32]struct{}),
@@ -55,7 +54,7 @@ func (m *Manager) CreateStream(id uint32) *Stream {
 	stream.manager = m
 	stream.RemoteAddr = m.RemoteAddr
 	//nolint:gosec // G115: safe conversion, initialWindowSize validated by protocol
-	stream.WindowSize = int32(m.initialWindowSize)
+	stream.SetWindowSize(int32(m.initialWindowSize))
 	m.streams[id] = stream
 	if id > m.maxStreamID {
 		m.maxStreamID = id
@@ -79,12 +78,13 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	defer m.mu.Unlock()
 
 	if s, exists := m.streams[id]; exists {
-		if s.State == StateOpen || s.State == StateHalfClosedLocal || s.State == StateHalfClosedRemote {
+		st := s.GetState()
+		if st == StateOpen || st == StateHalfClosedLocal || st == StateHalfClosedRemote {
 			return s, true
 		}
 	}
 
-	if m.activeStreams >= m.maxStreams {
+	if m.activeStreams.Load() >= m.maxStreams {
 		return nil, false
 	}
 
@@ -92,26 +92,49 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	s.manager = m
 	s.RemoteAddr = m.RemoteAddr
 	//nolint:gosec // G115: safe conversion, initialWindowSize validated by protocol
-	s.WindowSize = int32(m.initialWindowSize)
-	s.State = StateOpen
+	s.SetWindowSize(int32(m.initialWindowSize))
+	s.state.Store(int32(StateOpen))
 	m.streams[id] = s
 	if id > m.maxStreamID {
 		m.maxStreamID = id
 	}
-	m.activeStreams++
+	m.activeStreams.Add(1)
 	return s, true
 }
 
 // DeleteStream removes a stream and releases its pooled buffers.
+// If the stream has an async handler goroutine running (asyncRunning=true),
+// the stream is removed from the map but NOT released — the goroutine
+// will release it upon completion via ReleaseAsyncStream.
 func (m *Manager) DeleteStream(id uint32) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	s, ok := m.streams[id]
+	if ok {
+		delete(m.streams, id)
+		m.priorityTree.RemoveStream(id)
+	}
+	m.mu.Unlock()
 
-	if s, ok := m.streams[id]; ok {
+	if !ok {
+		return
+	}
+
+	m.windowUpdateMu.Lock()
+	delete(m.pendingStreamUpdates, id)
+	m.windowUpdateMu.Unlock()
+
+	if !s.asyncRunning.Load() {
 		s.Release()
 	}
+}
+
+// RemoveStreamFromMap removes a stream from the manager's map without releasing it.
+// Used by async handler goroutines that manage their own stream lifecycle.
+func (m *Manager) RemoveStreamFromMap(id uint32) {
+	m.mu.Lock()
 	delete(m.streams, id)
 	m.priorityTree.RemoveStream(id)
+	m.mu.Unlock()
 
 	m.windowUpdateMu.Lock()
 	delete(m.pendingStreamUpdates, id)
@@ -152,23 +175,30 @@ func (m *Manager) GetConnectionWindow() int32 {
 
 // CountActiveStreams returns number of streams considered active for concurrency limits.
 func (m *Manager) CountActiveStreams() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return int(m.activeStreams)
+	return int(m.activeStreams.Load())
 }
 
-// markActiveTransition adjusts activeStreams when a stream transitions between active and inactive states.
-// Caller must hold m.mu.
-func (m *Manager) markActiveTransition(prev State, next State) {
+// updateActiveCount adjusts activeStreams atomically when a stream transitions
+// between active and inactive states. No locks required.
+func (m *Manager) updateActiveCount(prev State, next State) {
 	wasActive := prev == StateOpen || prev == StateHalfClosedLocal || prev == StateHalfClosedRemote
 	isActive := next == StateOpen || next == StateHalfClosedLocal || next == StateHalfClosedRemote
 	if wasActive == isActive {
 		return
 	}
 	if isActive {
-		m.activeStreams++
-	} else if m.activeStreams > 0 {
-		m.activeStreams--
+		m.activeStreams.Add(1)
+	} else {
+		// Guard against underflow from duplicate transitions.
+		for {
+			old := m.activeStreams.Load()
+			if old == 0 {
+				return
+			}
+			if m.activeStreams.CompareAndSwap(old, old-1) {
+				return
+			}
+		}
 	}
 }
 

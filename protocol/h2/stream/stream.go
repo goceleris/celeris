@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var bufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
@@ -26,19 +28,19 @@ var streamPool = sync.Pool{New: func() any {
 // Stream represents an HTTP/2 stream with its associated state and data.
 type Stream struct {
 	ID                     uint32
-	State                  State
+	state                  atomic.Int32
 	manager                *Manager
 	Headers                [][2]string
 	Trailers               [][2]string
 	Data                   *bytes.Buffer
 	OutboundBuffer         *bytes.Buffer
 	OutboundEndStream      bool
-	HeadersSent            bool
+	headersSent            atomic.Bool
 	EndStream              bool
-	IsStreaming            bool
-	HandlerStarted         bool
+	IsStreaming             bool
+	handlerStarted         atomic.Bool
 	DeferResponse          bool
-	WindowSize             int32
+	windowSize             atomic.Int32
 	ReceivedWindowUpd      chan int32 // buffered; consumed by engine layer during DATA writes
 	mu                     sync.RWMutex
 	writeMu                sync.Mutex
@@ -48,40 +50,66 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
-	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
-	ctx                    context.Context
-	cancel                 context.CancelFunc
+	h1Mode                 bool        // single-threaded H1 stream; skip mutex in GetHeaders
+	asyncRunning           atomic.Bool // true while async handler goroutine is running (H2 only)
+	cancelled              atomic.Bool
+	doneCh                 atomic.Pointer[chan struct{}]
+	doneClose              sync.Once
 	phase                  Phase
 	CachedCtx              any // per-connection cached context (avoids pool Get/Put per request)
 }
 
-// NewStream creates a new stream with full H2 initialization (context, buffers).
-// Uses context.Background() directly (no WithCancel) to avoid allocation;
-// cancel semantics are lazily created via EnsureCancel only when needed.
+// streamContext is a zero-alloc context.Context for streams.
+// It avoids the context.WithCancel allocation on the fast path.
+type streamContext struct{ s *Stream }
+
+func (c streamContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c streamContext) Value(_ any) any             { return nil }
+
+func (c streamContext) Done() <-chan struct{} {
+	if p := c.s.doneCh.Load(); p != nil {
+		return *p
+	}
+	if c.s.cancelled.Load() {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	ch := make(chan struct{})
+	if c.s.doneCh.CompareAndSwap(nil, &ch) {
+		if c.s.cancelled.Load() {
+			c.s.doneClose.Do(func() { close(ch) })
+		}
+		return ch
+	}
+	return *c.s.doneCh.Load()
+}
+
+func (c streamContext) Err() error {
+	if c.s.cancelled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// NewStream creates a new stream with full H2 initialization.
 func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
-	s.State = StateIdle
+	s.state.Store(int32(StateIdle))
 	s.Data = getBuf()
 	s.OutboundBuffer = getBuf()
-	s.WindowSize = 65535
-	s.ctx = bgCtx
+	s.windowSize.Store(65535)
 	s.phase = PhaseInit
 	return s
 }
 
 // NewH1Stream creates a lightweight stream optimized for H1 requests.
-// It uses context.Background() directly (no WithCancel), leaves Data and
-// OutboundBuffer nil (lazy-allocated only when body data arrives), and skips
-// H2-specific window initialization. This eliminates 2+ allocs per H1 request.
 func NewH1Stream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
-	s.State = StateIdle
+	s.state.Store(int32(StateIdle))
 	s.h1Mode = true
-	s.ctx = bgCtx
-	// Pre-allocate header capacity to avoid allocation in requestToStream.
-	// After the first Release, capacity is preserved from the previous request.
 	if cap(s.Headers) < 16 {
 		s.Headers = make([][2]string, 0, 16)
 	}
@@ -98,32 +126,35 @@ func (s *Stream) GetBuf() *bytes.Buffer {
 
 // Context returns the stream's context.
 func (s *Stream) Context() context.Context {
-	return s.ctx
-}
-
-// EnsureCancel lazily creates a cancellable context for this stream.
-// Called when the stream needs cancel semantics (e.g., RST_STREAM).
-func (s *Stream) EnsureCancel() {
-	if s.cancel != nil {
-		return
+	if s.h1Mode {
+		return bgCtx
 	}
-	s.ctx, s.cancel = context.WithCancel(s.ctx)
+	return streamContext{s}
 }
 
 // Cancel cancels the stream's context.
 func (s *Stream) Cancel() {
-	if s.cancel != nil {
-		s.cancel()
+	if s.cancelled.Swap(true) {
+		return // already cancelled
 	}
+	if p := s.doneCh.Load(); p != nil {
+		s.doneClose.Do(func() { close(*p) })
+	}
+}
+
+// IsCancelled reports whether the stream has been cancelled.
+func (s *Stream) IsCancelled() bool {
+	return s.cancelled.Load()
 }
 
 // Release returns pooled buffers, cancels the context, and returns the stream
 // to its pool. Safe to call multiple times; subsequent calls are no-ops.
 func (s *Stream) Release() {
-	if s.ctx == nil {
-		return // already released
+	if s.h1Mode {
+		// H1 streams use a simpler check — no cancel fields to reset.
+	} else {
+		s.Cancel()
 	}
-	s.Cancel()
 	if s.Data != nil {
 		s.Data.Reset()
 		bufferPool.Put(s.Data)
@@ -134,19 +165,18 @@ func (s *Stream) Release() {
 		bufferPool.Put(s.OutboundBuffer)
 		s.OutboundBuffer = nil
 	}
-	// Clear all fields to avoid retaining references.
 	s.ID = 0
-	s.State = 0
+	s.state.Store(0)
 	s.manager = nil
 	s.Headers = s.Headers[:0]
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
-	s.HeadersSent = false
+	s.headersSent.Store(false)
 	s.EndStream = false
 	s.IsStreaming = false
-	s.HandlerStarted = false
+	s.handlerStarted.Store(false)
 	s.DeferResponse = false
-	s.WindowSize = 0
+	s.windowSize.Store(0)
 	s.ResponseWriter = nil
 	s.RemoteAddr = ""
 	s.ReceivedDataLen = 0
@@ -154,12 +184,12 @@ func (s *Stream) Release() {
 	s.ClosedByReset = false
 	s.IsHEAD = false
 	s.h1Mode = false
-	s.ctx = nil
-	s.cancel = nil
+	s.asyncRunning.Store(false)
+	s.cancelled.Store(false)
+	s.doneCh.Store(nil)
+	s.doneClose = sync.Once{}
 	s.phase = 0
 	s.CachedCtx = nil
-	// Drain the channel without blocking. Skip for H1 streams
-	// (channel is never written to) to avoid select dispatch overhead.
 	if len(s.ReceivedWindowUpd) > 0 {
 		for {
 			select {
@@ -174,10 +204,6 @@ func (s *Stream) Release() {
 }
 
 // ResetH1Stream performs a lightweight per-request reset for H1 stream reuse.
-// Unlike Release(), it does NOT return the stream to the pool. It clears only
-// the fields that change between requests, retaining header slice capacity
-// and the context reference. Called between requests on keep-alive connections
-// to avoid sync.Pool Get/Put overhead.
 func ResetH1Stream(s *Stream) {
 	if s.Data != nil {
 		s.Data.Reset()
@@ -185,12 +211,11 @@ func ResetH1Stream(s *Stream) {
 		s.Data = nil
 	}
 	s.Headers = s.Headers[:0]
-	s.HeadersSent = false
+	s.headersSent.Store(false)
 	s.EndStream = false
 	s.ResponseWriter = nil
 	s.IsHEAD = false
-	s.State = StateIdle
-	s.ctx = bgCtx
+	s.state.Store(int32(StateIdle))
 }
 
 // AddHeader adds a header to the stream.
@@ -258,38 +283,73 @@ func (s *Stream) ForEachHeader(fn func(name, value string)) {
 	s.mu.RUnlock()
 }
 
-// SetState sets the stream state.
+// SetState sets the stream state and atomically updates the manager's active count.
 func (s *Stream) SetState(state State) {
-	s.mu.Lock()
-	prev := s.State
-	s.State = state
-	s.mu.Unlock()
+	prev := State(s.state.Swap(int32(state)))
 	if s.manager != nil {
-		s.manager.mu.Lock()
-		s.manager.markActiveTransition(prev, state)
-		s.manager.mu.Unlock()
+		s.manager.updateActiveCount(prev, state)
 	}
+}
+
+// StoreState is a lightweight SetState for H1 streams (no manager, no Swap).
+// Avoids the atomic.Swap + updateActiveCount overhead on the H1 hot path.
+func (s *Stream) StoreState(state State) {
+	s.state.Store(int32(state))
 }
 
 // GetState returns the current stream state.
 func (s *Stream) GetState() State {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.State
+	return State(s.state.Load())
 }
 
 // GetWindowSize returns the current flow control window size.
 func (s *Stream) GetWindowSize() int32 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.WindowSize
+	return s.windowSize.Load()
 }
 
 // DeductWindow subtracts n from the flow control window.
 func (s *Stream) DeductWindow(n int32) {
-	s.mu.Lock()
-	s.WindowSize -= n
-	s.mu.Unlock()
+	s.windowSize.Add(-n)
+}
+
+// SetWindowSize stores a new window size value. Used during initialization.
+func (s *Stream) SetWindowSize(v int32) {
+	s.windowSize.Store(v)
+}
+
+// AddWindowSize atomically adds delta to the window size and returns the new value.
+func (s *Stream) AddWindowSize(delta int32) int32 {
+	return s.windowSize.Add(delta)
+}
+
+// LoadWindowSize is an alias for GetWindowSize, used for clarity in CAS loops.
+func (s *Stream) LoadWindowSize() int32 {
+	return s.windowSize.Load()
+}
+
+// CompareAndSwapWindowSize atomically compares and swaps the window size.
+func (s *Stream) CompareAndSwapWindowSize(old, new int32) bool {
+	return s.windowSize.CompareAndSwap(old, new)
+}
+
+// GetHeadersSent reports whether headers have been sent.
+func (s *Stream) GetHeadersSent() bool {
+	return s.headersSent.Load()
+}
+
+// SetHeadersSent marks headers as sent.
+func (s *Stream) SetHeadersSent() {
+	s.headersSent.Store(true)
+}
+
+// GetHandlerStarted reports whether the handler has started.
+func (s *Stream) GetHandlerStarted() bool {
+	return s.handlerStarted.Load()
+}
+
+// SetHandlerStarted marks the handler as started.
+func (s *Stream) SetHandlerStarted() {
+	s.handlerStarted.Store(true)
 }
 
 // BufferOutbound stores data that couldn't be sent due to flow control.

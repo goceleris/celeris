@@ -13,9 +13,7 @@ func (m *Manager) ConsumeSendWindow(streamID uint32, n int32) {
 	}
 	atomic.AddInt32(&m.connectionWindow, -n)
 	if s, ok := m.GetStream(streamID); ok {
-		s.mu.Lock()
-		s.WindowSize -= n
-		s.mu.Unlock()
+		s.windowSize.Add(-n)
 	}
 }
 
@@ -26,9 +24,7 @@ func (m *Manager) ConsumeSendWindowFast(s *Stream, n int32) {
 		return
 	}
 	atomic.AddInt32(&m.connectionWindow, -n)
-	s.mu.Lock()
-	s.WindowSize -= n
-	s.mu.Unlock()
+	s.windowSize.Add(-n)
 }
 
 // AccumulateWindowUpdate accumulates window credits without sending immediately.
