@@ -157,7 +157,9 @@ jobs:
           go-version: "1.26"
 
       - name: Raise RLIMIT_MEMLOCK for io_uring ring mmap
-        run: sudo prlimit --memlock=unlimited:unlimited --pid $$
+        run: |
+          echo "* - memlock unlimited" | sudo tee /etc/security/limits.d/io_uring.conf
+          echo "* - nofile 1048576"   | sudo tee -a /etc/security/limits.d/io_uring.conf
 
       - name: System info
         run: |
@@ -167,7 +169,6 @@ jobs:
           echo "| Kernel | $(uname -r) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Arch | $(uname -m) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| CPUs | $(nproc) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| MEMLOCK | $(ulimit -l) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Max io_uring tier | $CELERIS_MAX_IOURING_TIER |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build smoke binaries
@@ -177,6 +178,7 @@ jobs:
 
       - name: "Smoke: engine loadtest"
         run: |
+          ulimit -l unlimited
           /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/loadtest.txt || echo "0/0 passed, 0 failed, 0 skipped")
           echo "Engine loadtest: $SUMMARY"
@@ -201,6 +203,7 @@ jobs:
 
       - name: "Smoke: fullstack loadtest"
         run: |
+          ulimit -l unlimited
           /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/fullstack.txt || echo "0/0 passed, 0 failed, 0 skipped")
           echo "Fullstack loadtest: $SUMMARY"
