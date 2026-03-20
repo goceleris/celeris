@@ -166,4 +166,3 @@ func readNodeCPUs(numaNodes int) [][]int {
 	}
 	return result
 }
-

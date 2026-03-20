@@ -340,10 +340,10 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 		// If all buffered data was flushed with END_STREAM, clean up.
 		if pf.endStream {
 			if s, ok := p.manager.GetStream(pf.streamID); ok {
-				state := s.GetState()
-				if state == StateHalfClosedRemote {
+				switch s.GetState() {
+				case StateHalfClosedRemote:
 					s.SetState(StateClosed)
-				} else if state == StateOpen {
+				case StateOpen:
 					s.SetState(StateHalfClosedLocal)
 				}
 				p.manager.DeleteStream(pf.streamID)
@@ -772,10 +772,10 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		// If all buffered data has been flushed with END_STREAM, the handler
 		// goroutine already completed. Transition to closed and clean up.
 		if flushedAll {
-			state := stream.GetState()
-			if state == StateHalfClosedRemote {
+			switch stream.GetState() {
+			case StateHalfClosedRemote:
 				stream.SetState(StateClosed)
-			} else if state == StateOpen {
+			case StateOpen:
 				stream.SetState(StateHalfClosedLocal)
 			}
 			p.manager.DeleteStream(f.StreamID)

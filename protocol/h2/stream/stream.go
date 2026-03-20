@@ -37,7 +37,7 @@ type Stream struct {
 	OutboundEndStream      bool
 	headersSent            atomic.Bool
 	EndStream              bool
-	IsStreaming             bool
+	IsStreaming            bool
 	handlerStarted         atomic.Bool
 	DeferResponse          bool
 	windowSize             atomic.Int32
@@ -150,9 +150,7 @@ func (s *Stream) IsCancelled() bool {
 // Release returns pooled buffers, cancels the context, and returns the stream
 // to its pool. Safe to call multiple times; subsequent calls are no-ops.
 func (s *Stream) Release() {
-	if s.h1Mode {
-		// H1 streams use a simpler check — no cancel fields to reset.
-	} else {
+	if !s.h1Mode {
 		s.Cancel()
 	}
 	if s.Data != nil {
@@ -328,8 +326,8 @@ func (s *Stream) LoadWindowSize() int32 {
 }
 
 // CompareAndSwapWindowSize atomically compares and swaps the window size.
-func (s *Stream) CompareAndSwapWindowSize(old, new int32) bool {
-	return s.windowSize.CompareAndSwap(old, new)
+func (s *Stream) CompareAndSwapWindowSize(old, val int32) bool {
+	return s.windowSize.CompareAndSwap(old, val)
 }
 
 // GetHeadersSent reports whether headers have been sent.

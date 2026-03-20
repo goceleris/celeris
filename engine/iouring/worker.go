@@ -80,7 +80,7 @@ type Worker struct {
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) (*Worker, error) {
+	acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
 	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
 	// binding) so that the kernel allocates socket internal buffers on the
@@ -134,7 +134,7 @@ func (w *Worker) run(ctx context.Context) {
 	// cross-socket QPI/UPI traffic on multi-socket systems.
 	numaNode := platform.CPUForNode(w.cpuID)
 	if err := platform.BindNumaNode(numaNode); err == nil {
-		defer platform.ResetNumaPolicy()
+		defer func() { _ = platform.ResetNumaPolicy() }()
 	}
 
 	// Create the listen socket on the worker's NUMA node. Each worker has its
