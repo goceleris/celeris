@@ -52,6 +52,16 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
+	// Both sub-engines must share the same port (SO_REUSEPORT) so the
+	// adaptive switch works transparently. If the user specified :0,
+	// resolve it to a concrete port before creating sub-engines.
+	if cfg.Addr != "" {
+		resolved, err := resolvePort(cfg.Addr)
+		if err == nil {
+			cfg.Addr = resolved
+		}
+	}
+
 	primary, err := iouring.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
@@ -325,4 +335,16 @@ func (e *Engine) ActiveEngine() engine.Engine {
 // ForceSwitch triggers an immediate engine switch (for testing).
 func (e *Engine) ForceSwitch() {
 	e.performSwitch()
+}
+
+// resolvePort resolves ":0" to a concrete ":PORT" by briefly binding a
+// listener. Both sub-engines need the same port for SO_REUSEPORT switching.
+func resolvePort(addr string) (string, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return addr, err
+	}
+	resolved := ln.Addr().String()
+	_ = ln.Close()
+	return resolved, nil
 }
