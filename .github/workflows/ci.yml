@@ -173,12 +173,9 @@ jobs:
 
       - name: "Smoke: engine loadtest"
         run: |
-          sudo prlimit --memlock=unlimited /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
+          sudo -E prlimit --memlock=unlimited /tmp/smoke-loadtest 2>&1 | tee /tmp/loadtest.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/loadtest.txt || echo "0/0 passed, 0 failed, 0 skipped")
           echo "Engine loadtest: $SUMMARY"
-
-          TOTAL=$(echo "$SUMMARY" | grep -oP '(?<=/)\d+' | head -1 || echo 0)
-          FAILED=$(echo "$SUMMARY" | grep -oP '\d+(?= failed)' || echo 0)
 
           echo "## Engine Loadtest (${{ matrix.tier }} tier)" >> "$GITHUB_STEP_SUMMARY"
           echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
@@ -190,19 +187,23 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -gt $((TOTAL / 2)) ]; then
-            echo "::error::Catastrophic regression: $FAILED/$TOTAL configs failed"
+          # Count unexpected failures. On "none" tier, iouring and adaptive
+          # are expected to fail (io_uring disabled). Any other failure is real.
+          UNEXPECTED=$(grep -c 'FAIL.*reqs,' /tmp/loadtest.txt || echo 0)
+          if [ "${{ matrix.tier }}" = "none" ]; then
+            UNEXPECTED=$(grep 'FAIL.*reqs,' /tmp/loadtest.txt | grep -cv -E '(iouring|adaptive)' || echo 0)
+          fi
+          if [ "$UNEXPECTED" -gt 0 ]; then
+            echo "::error::$UNEXPECTED unexpected failures in engine loadtest"
+            grep 'FAIL.*reqs,' /tmp/loadtest.txt | grep -v -E '(iouring|adaptive)' || true
             exit 1
           fi
 
       - name: "Smoke: fullstack loadtest"
         run: |
-          sudo prlimit --memlock=unlimited /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
+          sudo -E prlimit --memlock=unlimited /tmp/smoke-fullstack 2>&1 | tee /tmp/fullstack.txt || true
           SUMMARY=$(grep -E '^[0-9]+/[0-9]+ passed' /tmp/fullstack.txt || echo "0/0 passed, 0 failed, 0 skipped")
           echo "Fullstack loadtest: $SUMMARY"
-
-          TOTAL=$(echo "$SUMMARY" | grep -oP '(?<=/)\d+' | head -1 || echo 0)
-          FAILED=$(echo "$SUMMARY" | grep -oP '\d+(?= failed)' || echo 0)
 
           echo "## Fullstack Loadtest (${{ matrix.tier }} tier)" >> "$GITHUB_STEP_SUMMARY"
           echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
@@ -214,7 +215,11 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -gt $((TOTAL / 2)) ]; then
-            echo "::error::Catastrophic regression: $FAILED/$TOTAL configs failed"
+          # Fullstack doesn't have iouring/adaptive — only epoll and std.
+          # Any failure is unexpected.
+          UNEXPECTED=$(grep -c 'FAIL.*reqs,' /tmp/fullstack.txt || echo 0)
+          if [ "$UNEXPECTED" -gt 0 ]; then
+            echo "::error::$UNEXPECTED unexpected failures in fullstack loadtest"
+            grep 'FAIL.*reqs,' /tmp/fullstack.txt || true
             exit 1
           fi
