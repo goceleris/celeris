@@ -75,6 +75,11 @@ const (
 // Fixed file index sentinel for auto-allocation (IORING_FILE_INDEX_ALLOC).
 const fileIndexAlloc = ^uint32(0)
 
+// SQ ring flags (read from shared memory).
+const (
+	sqNeedWakeup = 1 << 0 // IORING_SQ_NEED_WAKEUP
+)
+
 // Async cancel flags.
 const (
 	cancelFD  = 1 << 1 // IORING_ASYNC_CANCEL_FD

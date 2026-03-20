@@ -47,7 +47,8 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("io_uring not available on this system")
 	}
 
-	tier := SelectTier(profile)
+	objective := resource.ResolveObjective(cfg.Objective)
+	tier := SelectTier(profile, objective.SQPollIdle)
 	if tier == nil {
 		return nil, fmt.Errorf("no suitable io_uring tier available")
 	}

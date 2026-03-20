@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"time"
+
 	"github.com/goceleris/celeris/engine"
 )
 
@@ -22,11 +24,17 @@ type TierStrategy interface {
 }
 
 // SelectTier returns the highest available tier strategy for the given profile.
-func SelectTier(profile engine.CapabilityProfile) TierStrategy {
+// sqPollIdle is the objective-specific SQPOLL thread idle timeout; if zero,
+// defaults to 2000ms.
+func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) TierStrategy {
 	switch {
 	case profile.IOUringTier >= engine.Optional && profile.SQPoll:
+		idle := uint32(sqPollIdle.Milliseconds())
+		if idle == 0 {
+			idle = 2000
+		}
 		return &optionalTier{
-			sqPollIdle:   2000,
+			sqPollIdle:   idle,
 			deferTaskrun: profile.DeferTaskrun,
 			fixedFiles:   profile.FixedFiles,
 			sendZC:       profile.SendZC,

@@ -73,6 +73,7 @@ type Worker struct {
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
 	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2Conns       []int      // FDs of H2 connections (for write queue polling)
 	h2cfg         conn.H2Config
 }
 
@@ -236,47 +237,80 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// Submit pending SENDs + wait for CQEs. Four modes:
-		// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
-		// 2. CQEs already ready, nothing pending → skip syscall entirely
-		// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
-		// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
-		//
-		// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
-		// setup/teardown and sigset parsing, saving ~200-500ns per call.
-		// Mode 3a is safe because SEND SQEs always produce CQEs (no
-		// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
-		// Mode 3b uses a timeout because the only pending SQEs may have
-		// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
-		// need a timeout for graceful shutdown via ctx.Err() checks.
-		hasPending := w.ring.Pending() > 0
-		cqHead, cqTail := w.ring.BeginCQ()
-		if cqHead != cqTail && hasPending {
-			// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
-			if _, err := w.ring.Submit(); err != nil {
-				w.shutdown()
-				return
+		var cqHead, cqTail uint32
+		if w.sqpoll {
+			// SQPOLL path: kernel thread submits SQEs from the shared ring.
+			// We never call Submit() — just clear the pending counter.
+			w.ring.ClearPending()
+
+			// Wake SQPOLL thread if it went idle after sqThreadIdle ms.
+			if w.ring.SQNeedWakeup() {
+				_ = w.ring.WakeupSQPoll()
 			}
-		} else if hasPending && w.sendsPending {
-			// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
-			// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
-			if err := w.ring.SubmitAndWait(); err != nil {
-				w.shutdown()
-				return
-			}
+
+			// Check CQ ring — if CQEs ready, process without syscall.
 			cqHead, cqTail = w.ring.BeginCQ()
-		} else if hasPending || cqHead == cqTail {
-			// Mode 3b: no guaranteed CQEs — wait with timeout for
-			// shutdown checks and CQE_SKIP_SUCCESS operations.
-			waitTimeout := 100 * time.Millisecond
-			if w.listenFD < 0 {
-				waitTimeout = 1 * time.Second
+			if cqHead == cqTail {
+				// No CQEs — wait with timeout (only remaining syscall).
+				waitTimeout := 100 * time.Millisecond
+				if w.listenFD < 0 {
+					waitTimeout = 1 * time.Second
+				}
+				if len(w.h2Conns) > 0 {
+					waitTimeout = 100 * time.Microsecond
+				}
+				if err := w.ring.WaitCQETimeout(waitTimeout); err != nil {
+					w.shutdown()
+					return
+				}
+				cqHead, cqTail = w.ring.BeginCQ()
 			}
-			if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
-				w.shutdown()
-				return
-			}
+		} else {
+			// Non-SQPOLL path: 4-mode adaptive submit.
+			// 1. CQEs already ready + pending SQEs → Submit() (lightweight, no wait)
+			// 2. CQEs already ready, nothing pending → skip syscall entirely
+			// 3a. No CQEs + SENDs pending → SubmitAndWait() (no ext_arg)
+			// 3b. No CQEs + no SENDs → SubmitAndWaitTimeout() (ext_arg + timeout)
+			//
+			// Modes 1 and 3a avoid ext_arg overhead: the kernel skips hrtimer
+			// setup/teardown and sigset parsing, saving ~200-500ns per call.
+			// Mode 3a is safe because SEND SQEs always produce CQEs (no
+			// CQE_SKIP_SUCCESS), guaranteeing SubmitAndWait returns promptly.
+			// Mode 3b uses a timeout because the only pending SQEs may have
+			// CQE_SKIP_SUCCESS (e.g., CLOSE), and external events (recv, accept)
+			// need a timeout for graceful shutdown via ctx.Err() checks.
+			hasPending := w.ring.Pending() > 0
 			cqHead, cqTail = w.ring.BeginCQ()
+			if cqHead != cqTail && hasPending {
+				// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
+				if _, err := w.ring.Submit(); err != nil {
+					w.shutdown()
+					return
+				}
+			} else if hasPending && w.sendsPending {
+				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
+				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
+				if err := w.ring.SubmitAndWait(); err != nil {
+					w.shutdown()
+					return
+				}
+				cqHead, cqTail = w.ring.BeginCQ()
+			} else if hasPending || cqHead == cqTail {
+				// Mode 3b: no guaranteed CQEs — wait with timeout for
+				// shutdown checks and CQE_SKIP_SUCCESS operations.
+				waitTimeout := 100 * time.Millisecond
+				if w.listenFD < 0 {
+					waitTimeout = 1 * time.Second
+				}
+				if len(w.h2Conns) > 0 {
+					waitTimeout = 100 * time.Microsecond
+				}
+				if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
+					w.shutdown()
+					return
+				}
+				cqHead, cqTail = w.ring.BeginCQ()
+			}
 		}
 		w.sendsPending = false
 
@@ -310,15 +344,10 @@ func (w *Worker) run(ctx context.Context) {
 		w.ring.EndCQ(cqHead)
 
 		// SENDs queued during CQE processing remain in the SQ ring and are
-		// submitted at the top of the next iteration (adaptive submit).
-		// This eliminates one io_uring_enter per iteration: the kernel sees
-		// the combined SEND batch in a single submit+wait syscall instead of
-		// a separate Submit() here followed by SubmitAndWaitTimeout() above.
-		// Profile data shows Submit accounts for ~55% of total CPU — removing
-		// this extra call halves the syscall overhead.
-		if w.sqpoll {
-			w.ring.ClearPending()
-		}
+		// submitted at the top of the next iteration. For non-SQPOLL, the
+		// adaptive submit combines them into a single submit+wait syscall.
+		// For SQPOLL, the kernel thread picks them up from the shared ring
+		// and ClearPending is called at the top of the SQPOLL path.
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per CQE batch,
@@ -346,6 +375,18 @@ func (w *Worker) run(ctx context.Context) {
 				}
 			}
 			cs = next
+		}
+
+		// Drain H2 async write queues. Handler goroutines enqueue response
+		// frame bytes; we drain them into writeBuf and flush to the wire.
+		for _, fd := range w.h2Conns {
+			cs := w.conns[fd]
+			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if w.flushSend(cs) {
+					w.markDirty(cs)
+				}
+			}
 		}
 
 		// Check connection timeouts every 1024 iterations to amortize
@@ -536,8 +577,9 @@ func (w *Worker) initProtocol(cs *connState) {
 			}
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn)
+		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, -1)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
+		w.h2Conns = append(w.h2Conns, cs.fd)
 	}
 }
 
@@ -788,6 +830,7 @@ func (w *Worker) closeConn(fd int) {
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
+		w.removeH2Conn(fd)
 	}
 
 	// Defer actual close until all in-flight and pending SENDs complete,
@@ -904,6 +947,16 @@ func (w *Worker) markDirty(cs *connState) {
 		w.dirtyHead.dirtyPrev = cs
 	}
 	w.dirtyHead = cs
+}
+
+func (w *Worker) removeH2Conn(fd int) {
+	for i, f := range w.h2Conns {
+		if f == fd {
+			w.h2Conns[i] = w.h2Conns[len(w.h2Conns)-1]
+			w.h2Conns = w.h2Conns[:len(w.h2Conns)-1]
+			return
+		}
+	}
 }
 
 func (w *Worker) removeDirty(cs *connState) {
