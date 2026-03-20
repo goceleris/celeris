@@ -228,8 +228,6 @@ func createEngine(name string, cfg resource.Config, handler stream.Handler) (eng
 	}
 }
 
-
-
 func loadTest(addr string, endpoints []string, h2c bool) (totalReqs, totalErrs int64, dur time.Duration) {
 	var client *http.Client
 

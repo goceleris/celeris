@@ -188,7 +188,6 @@ func runTest(name string, eng celeris.EngineType, obj celeris.Objective, proto c
 	return testResult{name: name, status: "PASS", detail: "completed"}
 }
 
-
 func loadTest(addr string, endpoints []string, h2c bool) (totalReqs, totalErrs int64, dur time.Duration) {
 	var client *http.Client
 	if h2c {
