@@ -363,14 +363,18 @@ func (w *Worker) run(ctx context.Context) {
 			w.hasBufReturns = false
 		}
 
-		// Retry pending sends on dirty connections (SQ ring was full earlier).
-		// The dirty list is only populated when flushSend fails, so this
-		// is typically empty under normal load.
+		// Retry pending sends and dropped recv arms on dirty connections
+		// (SQ ring was full earlier). Typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
-			if !cs.sending && !w.flushSend(cs) {
-				// Successfully flushed or send is in-flight; remove from dirty list.
-				if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+			if !cs.sending {
+				sqFull := w.flushSend(cs)
+				if cs.needsRecv {
+					if w.prepareRecv(cs.fd, cs.buf) {
+						cs.needsRecv = false
+					}
+				}
+				if !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && !cs.needsRecv {
 					w.removeDirty(cs)
 				}
 			}
@@ -520,7 +524,10 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	}
 	// For Auto mode, cs.detected is false; the first handleRecv will
 	// detect the protocol from the received data before processing it.
-	w.prepareRecv(newFD, cs.buf)
+	if !w.prepareRecv(newFD, cs.buf) {
+		cs.needsRecv = true
+		w.markDirty(cs)
+	}
 
 	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() && w.listenFD >= 0 {
 		w.prepareAccept()
@@ -606,10 +613,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// returned via PublishBuffers().
 		if c.Res == -105 && w.bufRing != nil {
 			w.bufRing.PublishBuffers()
-			sqe := w.ring.GetSQE()
-			if sqe != nil {
-				prepMultishotRecv(sqe, fd, bufRingGroupID, cs.fixedFile)
-				setSQEUserData(sqe, encodeUserData(udRecv, fd))
+			if !w.prepareRecv(fd, cs.buf) {
+				cs.needsRecv = true
+				w.markDirty(cs)
 			}
 			return
 		}
@@ -643,7 +649,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 				w.bufRing.ReturnBuffer(providedBufID)
 			}
 			if !cqeHasMore(c.Flags) {
-				w.prepareRecv(fd, cs.buf)
+				if !w.prepareRecv(fd, cs.buf) {
+					cs.needsRecv = true
+					w.markDirty(cs)
+				}
 			}
 			return
 		}
@@ -703,7 +712,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// without needing a new SQE. Only re-arm if multishot ended.
 	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
 	if !cqeHasMore(c.Flags) && !cs.recvLinked {
-		w.prepareRecv(fd, cs.buf)
+		if !w.prepareRecv(fd, cs.buf) {
+			cs.needsRecv = true
+			w.markDirty(cs)
+		}
 	}
 }
 
@@ -797,8 +809,16 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 		return
 	}
 
-	// All data sent — remove from dirty list, update activity timestamp.
+	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+		if cs.needsRecv {
+			if w.prepareRecv(fd, cs.buf) {
+				cs.needsRecv = false
+			} else {
+				w.markDirty(cs)
+				return
+			}
+		}
 		w.removeDirty(cs)
 		cs.lastActivity = now
 		return
@@ -923,10 +943,11 @@ func (w *Worker) prepareAccept() {
 
 // prepareRecv submits a recv SQE. Uses multishot recv with ring-mapped provided
 // buffers when available; falls back to single-shot per-connection buffer recv.
-func (w *Worker) prepareRecv(fd int, buf []byte) {
+// Returns true if the SQE was submitted, false if the SQ ring was full.
+func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
-		return
+		return false
 	}
 	if w.bufRing != nil {
 		prepMultishotRecv(sqe, fd, bufRingGroupID, w.fixedFiles)
@@ -934,6 +955,7 @@ func (w *Worker) prepareRecv(fd int, buf []byte) {
 		prepRecv(sqe, fd, buf)
 	}
 	setSQEUserData(sqe, encodeUserData(udRecv, fd))
+	return true
 }
 
 func (w *Worker) markDirty(cs *connState) {
