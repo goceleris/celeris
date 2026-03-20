@@ -23,6 +23,7 @@ type jsonMsg struct {
 func main() {
 	engName := envOr("ENGINE", "iouring")
 	objName := envOr("OBJECTIVE", "latency")
+	protoName := envOr("PROTOCOL", "h1")
 	port := envOr("PORT", "18080")
 
 	// pprof server on separate port
@@ -55,9 +56,21 @@ func main() {
 		log.Fatalf("unknown objective: %s", objName)
 	}
 
+	var proto celeris.Protocol
+	switch protoName {
+	case "h1":
+		proto = celeris.HTTP1
+	case "h2":
+		proto = celeris.H2C
+	case "hybrid", "auto":
+		proto = celeris.Auto
+	default:
+		log.Fatalf("unknown protocol: %s", protoName)
+	}
+
 	s := celeris.New(celeris.Config{
 		Addr:           ":" + port,
-		Protocol:       celeris.HTTP1,
+		Protocol:       proto,
 		Engine:         eng,
 		Objective:      obj,
 		DisableMetrics: true,
@@ -83,7 +96,7 @@ func main() {
 		cancel()
 	}()
 
-	log.Printf("Starting profiled %s-%s on :%s", engName, objName, port)
+	log.Printf("Starting profiled %s-%s-%s on :%s", engName, objName, protoName, port)
 	if err := s.StartWithContext(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("listen: %v", err)
 	}
