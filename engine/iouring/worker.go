@@ -74,6 +74,8 @@ type Worker struct {
 	hasBufReturns bool       // set when provided buffers need publishing
 	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
 	h2Conns       []int      // FDs of H2 connections (for write queue polling)
+	h2EventFD     int        // eventfd for H2 write queue wakeup (-1 if unavailable)
+	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
 	h2cfg         conn.H2Config
 }
 
@@ -91,6 +93,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		id:           id,
 		cpuID:        cpuID,
 		listenFD:     -1,
+		h2EventFD:    -1,
 		tier:         tier,
 		sqpoll:       tier.SQPollIdle() > 0,
 		sendZC:       tier.SupportsSendZC(),
@@ -178,6 +181,15 @@ func (w *Worker) run(ctx context.Context) {
 		}
 	}
 
+	// Create eventfd for H2 write queue wakeup. Handler goroutines signal
+	// the eventfd after enqueuing response frames; io_uring POLL_ADD on the
+	// eventfd wakes the ring event-driven, replacing the 100μs polling timeout.
+	efd, efdErr := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if efdErr != nil {
+		efd = -1
+	}
+	w.h2EventFD = efd
+
 	w.prepareAccept()
 	if _, err := w.ring.Submit(); err != nil {
 		w.ready <- fmt.Errorf("worker %d initial submit: %w", w.id, err)
@@ -256,7 +268,7 @@ func (w *Worker) run(ctx context.Context) {
 				if w.listenFD < 0 {
 					waitTimeout = 1 * time.Second
 				}
-				if len(w.h2Conns) > 0 {
+				if len(w.h2Conns) > 0 && w.h2EventFD < 0 {
 					waitTimeout = 100 * time.Microsecond
 				}
 				if err := w.ring.WaitCQETimeout(waitTimeout); err != nil {
@@ -302,7 +314,7 @@ func (w *Worker) run(ctx context.Context) {
 				if w.listenFD < 0 {
 					waitTimeout = 1 * time.Second
 				}
-				if len(w.h2Conns) > 0 {
+				if len(w.h2Conns) > 0 && w.h2EventFD < 0 {
 					waitTimeout = 100 * time.Microsecond
 				}
 				if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
@@ -336,6 +348,8 @@ func (w *Worker) run(ctx context.Context) {
 					w.handleAccept(ctx, entry, decodeFD(entry.UserData), now)
 				case udClose:
 					w.handleClose(decodeFD(entry.UserData))
+				case udH2Wakeup:
+					w.handleH2Wakeup()
 				case udProvide:
 				}
 				cqHead++
@@ -438,6 +452,8 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 		w.handleClose(fd)
 	case udAccept:
 		w.handleAccept(ctx, c, fd, now)
+	case udH2Wakeup:
+		w.handleH2Wakeup()
 	case udProvide:
 	}
 }
@@ -584,8 +600,14 @@ func (w *Worker) initProtocol(cs *connState) {
 			}
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, -1)
+		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
+		// Arm eventfd POLL_ADD on first H2 connection so the ring wakes
+		// event-driven when handler goroutines enqueue responses.
+		if !w.h2PollArmed && w.h2EventFD >= 0 {
+			w.prepareH2Poll()
+			w.h2PollArmed = true
+		}
 		w.h2Conns = append(w.h2Conns, cs.fd)
 	}
 }
@@ -925,6 +947,26 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 	}
 }
 
+// prepareH2Poll submits a single-shot POLL_ADD SQE on the H2 eventfd.
+// When handler goroutines write the eventfd, the CQE wakes the ring
+// event-driven, replacing the 100μs polling timeout.
+func (w *Worker) prepareH2Poll() {
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		return
+	}
+	prepPollAdd(sqe, w.h2EventFD, unix.POLLIN)
+	setSQEUserData(sqe, encodeUserData(udH2Wakeup, w.h2EventFD))
+}
+
+// handleH2Wakeup drains the eventfd counter and re-arms the poll.
+// The actual H2 write queue drain happens in the existing bottom-of-loop pass.
+func (w *Worker) handleH2Wakeup() {
+	var buf [8]byte
+	_, _ = unix.Read(w.h2EventFD, buf[:])
+	w.prepareH2Poll()
+}
+
 // prepareAccept submits an accept SQE using the best available mode.
 func (w *Worker) prepareAccept() {
 	sqe := w.ring.GetSQE()
@@ -1165,6 +1207,9 @@ func (w *Worker) shutdown() {
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 	}
+	if w.h2EventFD >= 0 {
+		_ = unix.Close(w.h2EventFD)
+	}
 	if w.bufRing != nil && w.ring != nil {
 		w.bufRing.Close(w.ring)
 	}
@@ -1209,6 +1254,12 @@ func createListenSocket(addr string) (int, error) {
 		_ = unix.Close(fd)
 		return -1, fmt.Errorf("SO_REUSEPORT: %w", err)
 	}
+
+	// TCP_DEFER_ACCEPT: kernel holds connections until data arrives,
+	// eliminating wasted accept+wait cycles for idle connections.
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 
 	if err := unix.Bind(fd, sa); err != nil {
 		_ = unix.Close(fd)

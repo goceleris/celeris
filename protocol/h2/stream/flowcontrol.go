@@ -35,11 +35,7 @@ func (m *Manager) AccumulateWindowUpdate(streamID uint32, increment uint32) {
 	if streamID == 0 {
 		m.pendingConnWindowUpdate += increment
 	} else {
-		if m.pendingStreamUpdates[streamID] == nil {
-			val := uint32(0)
-			m.pendingStreamUpdates[streamID] = &val
-		}
-		*m.pendingStreamUpdates[streamID] += increment
+		m.pendingStreamUpdates[streamID] += increment
 	}
 }
 
@@ -59,10 +55,9 @@ func (m *Manager) FlushWindowUpdates(writer FrameWriter, force bool) bool {
 	}
 
 	for sid, pending := range m.pendingStreamUpdates {
-		if pending != nil && *pending > 0 && (force || *pending >= windowUpdateThreshold) {
-			val := *pending
-			*pending = 0
-			_ = writer.WriteWindowUpdate(sid, val)
+		if pending > 0 && (force || pending >= windowUpdateThreshold) {
+			delete(m.pendingStreamUpdates, sid)
+			_ = writer.WriteWindowUpdate(sid, pending)
 			flushed = true
 		}
 	}

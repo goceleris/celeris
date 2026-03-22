@@ -30,6 +30,7 @@ const (
 	opNOP            = 0
 	opREADV          = 1
 	opWRITEV         = 2
+	opPOLLADD        = 6 // IORING_OP_POLL_ADD
 	opACCEPT         = 13
 	opASYNCCANCEL    = 14
 	opCLOSE          = 19

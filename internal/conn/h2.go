@@ -62,7 +62,7 @@ var h2FrameBufPool = sync.Pool{
 
 func getH2FrameBuf() *[]byte { return h2FrameBufPool.Get().(*[]byte) }
 func putH2FrameBuf(p *[]byte) {
-	if cap(*p) > 65536 {
+	if cap(*p) > 8192 {
 		return // don't pool oversized buffers
 	}
 	*p = (*p)[:0]
@@ -95,10 +95,10 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 	shard.mu.Lock()
 	shard.bufs = append(shard.bufs, data)
 	shard.mu.Unlock()
-	q.pending.Store(true)
-	// Signal the event loop via eventfd so epoll_wait returns immediately
-	// instead of waiting for the 1ms polling timeout.
-	if q.wakeupFD >= 0 {
+	// CAS coalescing: only signal the event loop if no prior enqueue already
+	// set pending. If CAS fails, pending is already true and a prior enqueue
+	// already wrote the eventfd — the event loop will drain all shards.
+	if q.pending.CompareAndSwap(false, true) && q.wakeupFD >= 0 {
 		var val [8]byte
 		val[0] = 1
 		_, _ = unix.Write(q.wakeupFD, val[:])
@@ -118,7 +118,12 @@ func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
 			write(*buf)
 			putH2FrameBuf(buf)
 		}
-		s.spare = s.spare[:0]
+		// Reclaim capacity if it grew beyond steady-state.
+		if cap(s.spare) > 64 {
+			s.spare = make([]*[]byte, 0, 16)
+		} else {
+			s.spare = s.spare[:0]
+		}
 	}
 	q.pending.Store(false)
 }
@@ -145,6 +150,10 @@ func getH2StreamEncoder() *h2StreamEncoder {
 }
 
 func putH2StreamEncoder(enc *h2StreamEncoder) {
+	// Discard encoders with bloated buffers instead of returning to pool.
+	if enc.hpackBuf.Cap() > 4096 {
+		return
+	}
 	enc.hpackBuf.Reset()
 	h2StreamEncoderPool.Put(enc)
 }

@@ -59,6 +59,23 @@ func Clean() error {
 	return run("go", "clean", "./...")
 }
 
+// CleanBenchmarks removes stale benchmark JSON files from the project root.
+func CleanBenchmarks() error {
+	matches, _ := filepath.Glob("*-benchmarks.json")
+	if len(matches) == 0 {
+		fmt.Println("No benchmark JSON files to clean.")
+		return nil
+	}
+	for _, m := range matches {
+		fmt.Printf("Removing %s\n", m)
+		if err := os.Remove(m); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("Removed %d benchmark file(s).\n", len(matches))
+	return nil
+}
+
 // Tools installs external test tools (h2spec).
 func Tools() error {
 	if _, err := exec.LookPath("h2spec"); err == nil {

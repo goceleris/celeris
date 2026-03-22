@@ -148,6 +148,15 @@ func prepSendZCFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	setSQEFixedFile(sqePtr)
 }
 
+// prepPollAdd prepares a POLL_ADD SQE. The poll event mask goes in the
+// poll32_events field (offset 28). Used for eventfd wakeup monitoring.
+func prepPollAdd(sqePtr unsafe.Pointer, fd int, pollMask uint32) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opPOLLADD
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = pollMask // poll32_events at offset 28
+}
+
 // prepCancelFDSkipSuccess prepares an ASYNC_CANCEL SQE with CQE_SKIP_SUCCESS
 // to suppress the success CQE (P11).
 func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {

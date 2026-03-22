@@ -21,7 +21,7 @@ type Manager struct {
 	initialWindowSize       uint32
 	activeStreams           atomic.Uint32
 	pendingConnWindowUpdate uint32
-	pendingStreamUpdates    map[uint32]*uint32
+	pendingStreamUpdates    map[uint32]uint32
 	windowUpdateMu          sync.Mutex
 	streamsWithData         map[uint32]struct{}
 	RemoteAddr              string
@@ -40,7 +40,7 @@ func NewManager() *Manager {
 		maxFrameSize:            16384,
 		initialWindowSize:       65535,
 		pendingConnWindowUpdate: 0,
-		pendingStreamUpdates:    make(map[uint32]*uint32),
+		pendingStreamUpdates:    make(map[uint32]uint32),
 		streamsWithData:         make(map[uint32]struct{}),
 	}
 }
@@ -123,7 +123,7 @@ func (m *Manager) DeleteStream(id uint32) {
 	delete(m.pendingStreamUpdates, id)
 	m.windowUpdateMu.Unlock()
 
-	if !s.asyncRunning.Load() {
+	if s.flags.Load()&flagAsyncRunning == 0 {
 		s.Release()
 	}
 }

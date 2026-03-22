@@ -255,8 +255,10 @@ func (l *Loop) run(ctx context.Context) {
 			} else if cs.writePos >= len(cs.writeBuf) {
 				cs.pendingBytes = 0
 				l.removeDirty(cs)
+			} else {
+				// Sync pendingBytes with actual buffer state after partial write.
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
 			}
-			// else: partial write, keep on dirty list for next iteration
 			cs = next
 		}
 
@@ -455,7 +457,8 @@ func (l *Loop) drainRead(fd int, now int64) {
 					l.removeDirty(cs)
 				}
 			} else {
-				// Partial write — add to dirty list for retry.
+				// Partial write — sync pendingBytes with actual buffer state.
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
 				l.markDirty(cs)
 			}
 		}
@@ -703,6 +706,12 @@ func createListenSocket(addr string) (int, error) {
 		_ = unix.Close(fd)
 		return -1, err
 	}
+
+	// TCP_DEFER_ACCEPT: kernel holds connections until data arrives,
+	// eliminating wasted accept+wait cycles for idle connections.
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 
 	if err := unix.Bind(fd, sa); err != nil {
 		_ = unix.Close(fd)

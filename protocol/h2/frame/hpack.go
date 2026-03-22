@@ -75,8 +75,10 @@ func (e *HeaderEncoder) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.buf != nil {
-		e.buf.Reset()
-		headerBufPool.Put(e.buf)
+		if e.buf.Cap() <= 8192 {
+			e.buf.Reset()
+			headerBufPool.Put(e.buf)
+		}
 		e.buf = nil
 		e.encoder = nil
 	}
