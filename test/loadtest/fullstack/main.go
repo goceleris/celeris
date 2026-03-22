@@ -23,10 +23,16 @@ import (
 	"golang.org/x/net/http2"
 )
 
-const (
-	concurrency = 64
-	duration    = 5 * time.Second
-)
+const concurrency = 64
+
+var duration = func() time.Duration {
+	if d := os.Getenv("DURATION"); d != "" {
+		if dur, err := time.ParseDuration(d); err == nil {
+			return dur
+		}
+	}
+	return 5 * time.Second
+}()
 
 var engines = []celeris.EngineType{celeris.IOUring, celeris.Epoll, celeris.Std}
 var engineNames = []string{"iouring", "epoll", "std"}

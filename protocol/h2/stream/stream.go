@@ -20,10 +20,15 @@ func getBuf() *bytes.Buffer {
 }
 
 var streamPool = sync.Pool{New: func() any {
-	return &Stream{
-		ReceivedWindowUpd: make(chan int32, 16),
-	}
+	return &Stream{}
 }}
+
+// Stream flag bits packed into flags atomic.Uint32.
+const (
+	flagCancelled    uint32 = 1 << 0
+	flagAsyncRunning uint32 = 1 << 1
+	flagDoneClosed   uint32 = 1 << 2
+)
 
 // Stream represents an HTTP/2 stream with its associated state and data.
 type Stream struct {
@@ -50,11 +55,9 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
-	h1Mode                 bool        // single-threaded H1 stream; skip mutex in GetHeaders
-	asyncRunning           atomic.Bool // true while async handler goroutine is running (H2 only)
-	cancelled              atomic.Bool
+	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
+	flags                  atomic.Uint32
 	doneCh                 atomic.Pointer[chan struct{}]
-	doneClose              sync.Once
 	phase                  Phase
 	CachedCtx              any // per-connection cached context (avoids pool Get/Put per request)
 }
@@ -70,15 +73,17 @@ func (c streamContext) Done() <-chan struct{} {
 	if p := c.s.doneCh.Load(); p != nil {
 		return *p
 	}
-	if c.s.cancelled.Load() {
+	if c.s.flags.Load()&flagCancelled != 0 {
 		ch := make(chan struct{})
 		close(ch)
 		return ch
 	}
 	ch := make(chan struct{})
 	if c.s.doneCh.CompareAndSwap(nil, &ch) {
-		if c.s.cancelled.Load() {
-			c.s.doneClose.Do(func() { close(ch) })
+		if c.s.flags.Load()&flagCancelled != 0 {
+			if old := c.s.flags.Or(flagDoneClosed); old&flagDoneClosed == 0 {
+				close(ch)
+			}
 		}
 		return ch
 	}
@@ -86,7 +91,7 @@ func (c streamContext) Done() <-chan struct{} {
 }
 
 func (c streamContext) Err() error {
-	if c.s.cancelled.Load() {
+	if c.s.flags.Load()&flagCancelled != 0 {
 		return context.Canceled
 	}
 	return nil
@@ -134,17 +139,20 @@ func (s *Stream) Context() context.Context {
 
 // Cancel cancels the stream's context.
 func (s *Stream) Cancel() {
-	if s.cancelled.Swap(true) {
+	old := s.flags.Or(flagCancelled)
+	if old&flagCancelled != 0 {
 		return // already cancelled
 	}
 	if p := s.doneCh.Load(); p != nil {
-		s.doneClose.Do(func() { close(*p) })
+		if old2 := s.flags.Or(flagDoneClosed); old2&flagDoneClosed == 0 {
+			close(*p)
+		}
 	}
 }
 
 // IsCancelled reports whether the stream has been cancelled.
 func (s *Stream) IsCancelled() bool {
-	return s.cancelled.Load()
+	return s.flags.Load()&flagCancelled != 0
 }
 
 // Release returns pooled buffers, cancels the context, and returns the stream
@@ -182,21 +190,15 @@ func (s *Stream) Release() {
 	s.ClosedByReset = false
 	s.IsHEAD = false
 	s.h1Mode = false
-	s.asyncRunning.Store(false)
-	s.cancelled.Store(false)
+	s.flags.Store(0)
 	s.doneCh.Store(nil)
-	s.doneClose = sync.Once{}
 	s.phase = 0
 	s.CachedCtx = nil
-	if len(s.ReceivedWindowUpd) > 0 {
-		for {
-			select {
-			case <-s.ReceivedWindowUpd:
-			default:
-				goto drained
-			}
+	if s.ReceivedWindowUpd != nil {
+		for len(s.ReceivedWindowUpd) > 0 {
+			<-s.ReceivedWindowUpd
 		}
-	drained:
+		s.ReceivedWindowUpd = nil
 	}
 	streamPool.Put(s)
 }
@@ -373,6 +375,15 @@ func (s *Stream) GetPhase() Phase {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.phase
+}
+
+// GetOrCreateWindowUpdateChan lazily allocates the ReceivedWindowUpd channel.
+// Used by streaming handlers that need to wait for flow control updates.
+func (s *Stream) GetOrCreateWindowUpdateChan() chan int32 {
+	if s.ReceivedWindowUpd == nil {
+		s.ReceivedWindowUpd = make(chan int32, 16)
+	}
+	return s.ReceivedWindowUpd
 }
 
 // WriteLock acquires the per-stream write lock.

@@ -366,7 +366,7 @@ func (p *Processor) runHandler(stream *Stream) {
 		return
 	}
 
-	stream.asyncRunning.Store(true)
+	stream.flags.Or(flagAsyncRunning)
 	globalH2Pool.Submit(p, stream)
 }
 
@@ -380,6 +380,14 @@ func (p *Processor) executeHandler(stream *Stream) {
 			_ = r // last-resort panic recovery
 		}
 
+		// Eagerly release the input buffer now that the handler is done.
+		// This reduces peak concurrent buffer memory under high stream concurrency.
+		if stream.Data != nil {
+			stream.Data.Reset()
+			bufferPool.Put(stream.Data)
+			stream.Data = nil
+		}
+
 		// If there's buffered outbound data waiting for WINDOW_UPDATE,
 		// keep the stream in the map so the event loop can flush it.
 		// Clear asyncRunning so DeleteStream (on connection close) will
@@ -388,7 +396,7 @@ func (p *Processor) executeHandler(stream *Stream) {
 		hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
 		stream.mu.RUnlock()
 		if hasPending {
-			stream.asyncRunning.Store(false)
+			stream.flags.And(^flagAsyncRunning)
 			return
 		}
 
@@ -507,7 +515,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
-				trailers = append(trailers, [2]string{hf.Name, hf.Value})
+				trailers = append(trailers, [2]string{internH2HeaderName(hf.Name), hf.Value})
 			})
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -570,7 +578,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 			isTrailers:    false,
 		}
 		p.continuationStateMu.Unlock()
-		stream.SetState(StateOpen)
+		// TryOpenStream already set state to StateOpen; skip redundant Swap.
 		if stream.ResponseWriter == nil {
 			stream.ResponseWriter = p.connWriter
 		}
@@ -584,7 +592,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
-		headers = append(headers, [2]string{hf.Name, hf.Value})
+		headers = append(headers, [2]string{internH2HeaderName(hf.Name), hf.Value})
 	})
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.goAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
@@ -716,11 +724,13 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 				fmt.Errorf("WINDOW_UPDATE on idle stream %d", f.StreamID))
 		}
 
-		if stream.GetState() == StateClosed {
+		streamState := stream.GetState()
+		if streamState == StateClosed {
 			return nil
 		}
 
 		// CAS loop for atomic window update with overflow check.
+		var newWin int32
 		for {
 			old := stream.LoadWindowSize()
 			newWindow := int64(old) + int64(f.Increment)
@@ -730,7 +740,8 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 				return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, old, f.Increment)
 			}
 			//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
-			if stream.CompareAndSwapWindowSize(old, int32(newWindow)) {
+			newWin = int32(newWindow)
+			if stream.CompareAndSwapWindowSize(old, newWin) {
 				break
 			}
 		}
@@ -739,12 +750,11 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		var flushedAll bool
 		stream.mu.Lock()
 		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-			curWin := stream.LoadWindowSize()
-			if curWin > 0 {
+			if newWin > 0 {
 				buffered := stream.OutboundBuffer.Bytes()
 				sendLen := len(buffered)
-				if int32(sendLen) > curWin {
-					sendLen = int(curWin)
+				if int32(sendLen) > newWin {
+					sendLen = int(newWin)
 				}
 				isEnd := sendLen == len(buffered) && stream.OutboundEndStream
 				stream.windowSize.Add(-int32(sendLen))
@@ -772,7 +782,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		// If all buffered data has been flushed with END_STREAM, the handler
 		// goroutine already completed. Transition to closed and clean up.
 		if flushedAll {
-			switch stream.GetState() {
+			switch streamState {
 			case StateHalfClosedRemote:
 				stream.SetState(StateClosed)
 			case StateOpen:
@@ -781,10 +791,12 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			p.manager.DeleteStream(f.StreamID)
 		}
 
-		select {
-		//nolint:gosec // G115: safe conversion
-		case stream.ReceivedWindowUpd <- int32(f.Increment):
-		default:
+		if stream.ReceivedWindowUpd != nil {
+			select {
+			//nolint:gosec // G115: safe conversion
+			case stream.ReceivedWindowUpd <- int32(f.Increment):
+			default:
+			}
 		}
 	}
 	return nil
@@ -849,7 +861,7 @@ func (p *Processor) handleGoAway(f *http2.GoAwayFrame) error {
 			stream.state.Store(int32(StateClosed))
 			p.manager.updateActiveCount(prev, StateClosed)
 			stream.Cancel()
-			if !stream.asyncRunning.Load() {
+			if stream.flags.Load()&flagAsyncRunning == 0 {
 				stream.Release()
 			}
 			delete(p.manager.streams, streamID)
@@ -908,7 +920,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 			headersSlicePoolIn.Put(pooledHeadersIn)
 		}()
 		p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
-			headers = append(headers, [2]string{hf.Name, hf.Value})
+			headers = append(headers, [2]string{internH2HeaderName(hf.Name), hf.Value})
 		})
 
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
