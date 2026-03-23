@@ -68,6 +68,38 @@ func setMempolicy(mode int, nodemask *uint64, maxnode uintptr) error {
 	return nil
 }
 
+// NUMATopology holds detected NUMA topology information.
+type NUMATopology struct {
+	NumNodes int
+	NodeCPUs [][]int
+}
+
+// DetectNUMA probes the system's NUMA topology via sysfs.
+// Returns NumNodes=1 if NUMA info is unavailable.
+func DetectNUMA() NUMATopology {
+	entries, err := os.ReadDir("/sys/devices/system/node")
+	if err != nil {
+		return NUMATopology{NumNodes: 1}
+	}
+	numNodes := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() && len(name) > 4 && name[:4] == "node" {
+			if _, err := strconv.Atoi(name[4:]); err == nil {
+				numNodes++
+			}
+		}
+	}
+	if numNodes == 0 {
+		return NUMATopology{NumNodes: 1}
+	}
+	nodeCPUs := readNodeCPUs(numNodes)
+	return NUMATopology{
+		NumNodes: numNodes,
+		NodeCPUs: nodeCPUs,
+	}
+}
+
 // CPUForNode returns the NUMA node that the given CPU belongs to.
 // Returns 0 if the node cannot be determined (safe default).
 func CPUForNode(cpu int) int {

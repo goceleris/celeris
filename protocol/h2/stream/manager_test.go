@@ -144,9 +144,7 @@ func TestGetLastClientStreamID(t *testing.T) {
 		t.Errorf("Initial GetLastClientStreamID: got %d, want 0", m.GetLastClientStreamID())
 	}
 
-	m.mu.Lock()
-	m.lastClientStream = 5
-	m.mu.Unlock()
+	m.lastClientStream.Store(5)
 
 	if m.GetLastClientStreamID() != 5 {
 		t.Errorf("GetLastClientStreamID: got %d, want 5", m.GetLastClientStreamID())

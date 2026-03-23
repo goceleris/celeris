@@ -9,7 +9,7 @@ import (
 type Manager struct {
 	streams                 map[uint32]*Stream
 	nextStreamID            uint32
-	lastClientStream        uint32
+	lastClientStream        atomic.Uint32
 	maxStreamID             uint32
 	mu                      sync.RWMutex
 	connectionWindow        int32
@@ -23,6 +23,7 @@ type Manager struct {
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]uint32
 	windowUpdateMu          sync.Mutex
+	hasPendingUpdates       atomic.Bool
 	streamsWithData         map[uint32]struct{}
 	RemoteAddr              string
 }
@@ -158,9 +159,7 @@ func (m *Manager) GetLastStreamID() uint32 {
 
 // GetLastClientStreamID returns the highest client-initiated stream ID observed.
 func (m *Manager) GetLastClientStreamID() uint32 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.lastClientStream
+	return m.lastClientStream.Load()
 }
 
 // UpdateConnectionWindow atomically updates the connection-level flow control window.

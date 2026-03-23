@@ -218,6 +218,44 @@ func ResetH1Stream(s *Stream) {
 	s.state.Store(int32(StateIdle))
 }
 
+// ResetH2StreamInline performs a lightweight reset for inline H2 stream reuse.
+// Similar to ResetH1Stream but for H2 inline handler path. Resets per-request
+// fields while preserving the stream's pool buffers.
+func ResetH2StreamInline(s *Stream, id uint32) {
+	if s.Data != nil {
+		s.Data.Reset()
+	} else {
+		s.Data = getBuf()
+	}
+	if s.OutboundBuffer != nil {
+		s.OutboundBuffer.Reset()
+	} else {
+		s.OutboundBuffer = getBuf()
+	}
+	s.ID = id
+	s.Headers = s.Headers[:0]
+	s.Trailers = s.Trailers[:0]
+	s.OutboundEndStream = false
+	s.headersSent.Store(false)
+	s.EndStream = false
+	s.IsStreaming = false
+	s.handlerStarted.Store(false)
+	s.DeferResponse = false
+	s.windowSize.Store(65535)
+	s.ResponseWriter = nil
+	s.RemoteAddr = ""
+	s.ReceivedDataLen = 0
+	s.ReceivedInitialHeaders = false
+	s.ClosedByReset = false
+	s.IsHEAD = false
+	s.h1Mode = false
+	s.flags.Store(0)
+	s.doneCh.Store(nil)
+	s.phase = PhaseInit
+	s.CachedCtx = nil
+	s.state.Store(int32(StateIdle))
+}
+
 // AddHeader adds a header to the stream.
 func (s *Stream) AddHeader(name, value string) {
 	s.mu.Lock()

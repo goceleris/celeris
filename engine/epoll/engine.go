@@ -49,32 +49,48 @@ func (e *Engine) Listen(ctx context.Context) error {
 	objective := resource.ResolveObjective(e.cfg.Objective)
 	resolved := e.cfg.Resources.Resolve(runtime.NumCPU())
 
-	cpus := platform.DistributeWorkers(resolved.Workers, runtime.NumCPU(), 1)
+	topo := platform.DetectNUMA()
+	cpus := platform.DistributeWorkers(resolved.Workers, runtime.NumCPU(), topo.NumNodes)
+
+	if topo.NumNodes > 1 {
+		resolved.MaxEvents = resolved.MaxEvents / topo.NumNodes
+		if resolved.MaxEvents < 64 {
+			resolved.MaxEvents = 64
+		}
+	}
 
 	e.mu.Lock()
 	e.loops = make([]*Loop, resolved.Workers)
 	for i := range resolved.Workers {
-		l, err := newLoop(i, cpus[i], e.handler,
+		l := newLoop(i, cpus[i], e.handler,
 			objective, resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
 			&e.acceptPaused)
-		if err != nil {
-			e.mu.Unlock()
-			return fmt.Errorf("loop %d init: %w", i, err)
-		}
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
-	if len(e.loops) > 0 {
-		addr := boundAddr(e.loops[0].listenFD)
-		e.addr.Store(&addr)
-	}
+
+	innerCtx, innerCancel := context.WithCancel(ctx)
+	defer innerCancel()
 
 	var wg sync.WaitGroup
 	for _, l := range e.loops {
 		wg.Go(func() {
-			l.run(ctx)
+			l.run(innerCtx)
 		})
+	}
+
+	for _, l := range e.loops {
+		if initErr := <-l.ready; initErr != nil {
+			innerCancel()
+			wg.Wait()
+			return initErr
+		}
+	}
+
+	if len(e.loops) > 0 {
+		addr := boundAddr(e.loops[0].listenFD)
+		e.addr.Store(&addr)
 	}
 
 	e.cfg.Logger.Info("epoll engine listening", "addr", e.cfg.Addr, "loops", resolved.Workers)

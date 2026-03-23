@@ -10,11 +10,11 @@ import (
 // validateRequestHeaders validates HTTP/2 request headers according to RFC 7540.
 func validateRequestHeaders(headers [][2]string) error {
 	var (
-		hasMethod   bool
-		hasScheme   bool
-		hasPath     bool
-		seenRegular bool
-		seenPseudo  = make(map[string]bool)
+		hasMethod     bool
+		hasScheme     bool
+		hasPath       bool
+		hasAuthority  bool
+		seenRegular   bool
 	)
 
 	for _, h := range headers {
@@ -30,22 +30,30 @@ func validateRequestHeaders(headers [][2]string) error {
 				return fmt.Errorf("pseudo-header %s appears after regular header", name)
 			}
 
-			if seenPseudo[name] {
-				return fmt.Errorf("duplicate pseudo-header: %s", name)
-			}
-			seenPseudo[name] = true
-
 			switch name {
 			case ":method":
+				if hasMethod {
+					return fmt.Errorf("duplicate pseudo-header: %s", name)
+				}
 				hasMethod = true
 			case ":scheme":
+				if hasScheme {
+					return fmt.Errorf("duplicate pseudo-header: %s", name)
+				}
 				hasScheme = true
 			case ":path":
+				if hasPath {
+					return fmt.Errorf("duplicate pseudo-header: %s", name)
+				}
 				hasPath = true
 				if value == "" {
 					return fmt.Errorf("empty :path pseudo-header")
 				}
 			case ":authority":
+				if hasAuthority {
+					return fmt.Errorf("duplicate pseudo-header: %s", name)
+				}
+				hasAuthority = true
 			default:
 				return fmt.Errorf("unknown pseudo-header: %s", name)
 			}

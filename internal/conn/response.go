@@ -13,6 +13,7 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // cachedDatePtr holds the pre-formatted HTTP Date header line, updated every second.
@@ -238,6 +239,98 @@ func (a *h1ResponseAdapter) CloseConn() error {
 	return nil
 }
 
+// h2InlineResponseAdapter writes H2 response frames directly to outBuf.
+// Used by inline handlers that execute on the event loop thread. Bypasses
+// the sharded write queue entirely (no mutex, no eventfd, no goroutine).
+// Safe only when called from the event loop under H2State.mu.
+type h2InlineResponseAdapter struct {
+	outBuf       *bytes.Buffer
+	maxFrameSize uint32
+	enc          h2StreamEncoder // per-connection encoder (no sync.Pool needed for inline path)
+}
+
+func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, headers [][2]string, body []byte) error {
+	if len(body) > 0 && s.IsHEAD {
+		body = nil
+	}
+
+	enc := &a.enc
+
+	var hdrBuf [16][2]string
+	responseHeaders := hdrBuf[:0:16]
+	if len(headers)+1 > 16 {
+		responseHeaders = make([][2]string, 0, len(headers)+1)
+	}
+	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
+	responseHeaders = append(responseHeaders, headers...)
+
+	// Fast path for common responses: status 200 + known content-type +
+	// content-length. Uses pre-encoded HPACK bytes for status and
+	// content-type, and manual HPACK encoding for content-length (avoids
+	// the full encoder's static table lookup + Huffman decision overhead).
+	var headerBlock []byte
+	if status == 200 && len(headers) == 2 && headers[0][0] == "content-type" && headers[1][0] == "content-length" {
+		var ctBlock []byte
+		switch headers[0][1] {
+		case "text/plain":
+			ctBlock = hpackCTTextPlain
+		case "application/json":
+			ctBlock = hpackCTAppJSON
+		}
+		if ctBlock != nil {
+			enc.hpackBuf.Reset()
+			enc.hpackBuf.Write(hpackStatus200)
+			enc.hpackBuf.Write(ctBlock)
+			appendHPACKContentLength(&enc.hpackBuf, headers[1][1])
+			headerBlock = enc.hpackBuf.Bytes()
+		}
+	}
+	if headerBlock == nil {
+		var err error
+		headerBlock, err = enc.encodeHeaders(responseHeaders)
+		if err != nil {
+			return fmt.Errorf("HPACK encode error: %w", err)
+		}
+	}
+
+	endStream := len(body) == 0
+	maxFrame := a.maxFrameSize
+	if maxFrame == 0 {
+		maxFrame = 16384
+	}
+
+	// Write frames directly to outBuf — no intermediate allocation.
+	// Fast path: single HEADERS frame (fits in one frame, the common case).
+	if uint32(len(headerBlock)) <= maxFrame {
+		writeH2FrameHeader(a.outBuf, h2FrameHeaders, endStream, s.ID, len(headerBlock))
+		a.outBuf.Write(headerBlock)
+	} else {
+		a.outBuf.Write(appendH2Headers(nil, s.ID, endStream, headerBlock, maxFrame))
+	}
+
+	if len(body) > 0 {
+		writeH2FrameHeader(a.outBuf, h2FrameData, true, s.ID, len(body))
+		a.outBuf.Write(body)
+	}
+
+	s.SetHeadersSent()
+	return nil
+}
+
+func (a *h2InlineResponseAdapter) SendGoAway(lastStreamID uint32, code http2.ErrCode, debug []byte) error {
+	return nil // handled by connWriter
+}
+
+func (a *h2InlineResponseAdapter) MarkStreamClosed(_ uint32) {}
+
+func (a *h2InlineResponseAdapter) IsStreamClosed(_ uint32) bool { return false }
+
+func (a *h2InlineResponseAdapter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) error {
+	return nil
+}
+
+func (a *h2InlineResponseAdapter) CloseConn() error { return nil }
+
 type h2ResponseAdapter struct {
 	write        func([]byte)
 	outBuf       *bytes.Buffer
@@ -254,6 +347,65 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
 	if len(body) > 0 && s.IsHEAD {
 		body = nil
+	}
+
+	// Fast path: status 200 + common content-type + content-length.
+	// Uses pre-encoded HPACK bytes (dynamic table = 0, deterministic).
+	if status == 200 && len(headers) == 2 && headers[0][0] == "content-type" && headers[1][0] == "content-length" {
+		var ctBlock []byte
+		switch headers[0][1] {
+		case "text/plain":
+			ctBlock = hpackCTTextPlain
+		case "application/json":
+			ctBlock = hpackCTAppJSON
+		}
+		if ctBlock != nil {
+			enc := getH2StreamEncoder()
+			enc.hpackBuf.Reset()
+			enc.hpackBuf.Write(hpackStatus200)
+			enc.hpackBuf.Write(ctBlock)
+			_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-length", Value: headers[1][1]})
+			headerBlock := enc.hpackBuf.Bytes()
+
+			endStream := len(body) == 0 || s.IsHEAD
+			if s.IsHEAD {
+				body = nil
+			}
+			maxFrame := a.maxFrameSize
+			if maxFrame == 0 {
+				maxFrame = 16384
+			}
+
+			pooled := getH2FrameBuf()
+			frameBuf := (*pooled)[:0]
+			estimatedSize := 9 + len(headerBlock) + 9 + len(body)
+			if cap(frameBuf) < estimatedSize {
+				frameBuf = make([]byte, 0, estimatedSize)
+			}
+			frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
+			if len(body) > 0 {
+				window := s.GetWindowSize()
+				if window <= 0 {
+					s.BufferOutbound(body, true)
+				} else {
+					sendLen := len(body)
+					if int32(sendLen) > window {
+						sendLen = int(window)
+					}
+					isEnd := sendLen == len(body)
+					frameBuf = appendH2Data(frameBuf, s.ID, isEnd, body[:sendLen])
+					s.DeductWindow(int32(sendLen))
+					if !isEnd {
+						s.BufferOutbound(body[sendLen:], true)
+					}
+				}
+			}
+			putH2StreamEncoder(enc)
+			*pooled = frameBuf
+			a.writeQueue.Enqueue(s.ID, pooled)
+			s.SetHeadersSent()
+			return nil
+		}
 	}
 
 	enc := getH2StreamEncoder()

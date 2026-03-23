@@ -15,8 +15,8 @@ import (
 
 const (
 	awsRegion      = "us-east-1"
-	awsX86Instance = "c6i.xlarge"  // 4 vCPU, 8GB, Intel
-	awsArmInstance = "c7g.xlarge"  // 4 vCPU, 8GB, Graviton3
+	awsX86Instance = "c7i.2xlarge" // 8 vCPU, 16GB, Intel (matches benchmarks repo)
+	awsArmInstance = "c7g.2xlarge" // 8 vCPU, 16GB, Graviton3
 	awsKeyPrefix   = "celeris-mage"
 	awsSGName      = "celeris-mage-sg"
 )
@@ -197,6 +197,7 @@ func awsSSH(ip, keyPath, cmd string) (string, error) {
 	c := exec.Command("ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=30",
 		"-o", "BatchMode=yes",
 		"-i", keyPath,
 		fmt.Sprintf("ubuntu@%s", ip),
@@ -210,6 +211,7 @@ func awsSSHStream(ip, keyPath, cmd string) error {
 	c := exec.Command("ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=30",
 		"-o", "BatchMode=yes",
 		"-i", keyPath,
 		fmt.Sprintf("ubuntu@%s", ip),

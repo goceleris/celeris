@@ -46,6 +46,7 @@ type Loop struct {
 	sockOpts     sockopts.Options
 	cfg          resource.Config
 	logger       *slog.Logger
+	ready        chan error
 	acceptPaused *atomic.Bool
 	wake         chan struct{}
 	wakeMu       sync.Mutex
@@ -67,52 +68,14 @@ type Loop struct {
 func newLoop(id, cpuID int, handler stream.Handler,
 	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) (*Loop, error) {
-
-	epollFD, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
-	if err != nil {
-		return nil, fmt.Errorf("epoll_create1: %w", err)
-	}
-
-	listenFD, err := createListenSocket(cfg.Addr)
-	if err != nil {
-		_ = unix.Close(epollFD)
-		return nil, fmt.Errorf("listen socket: %w", err)
-	}
-
-	if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, listenFD, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET,
-		Fd:     int32(listenFD),
-	}); err != nil {
-		_ = unix.Close(epollFD)
-		_ = unix.Close(listenFD)
-		return nil, fmt.Errorf("epoll_ctl listen: %w", err)
-	}
-
-	// Create eventfd for H2 write queue wakeup. When available, H2 handler
-	// goroutines signal the eventfd after enqueuing response frames, letting
-	// epoll_wait return immediately instead of 1ms polling. Graceful fallback
-	// to polling if eventfd creation fails.
-	efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
-	if err != nil {
-		efd = -1
-	}
-	if efd >= 0 {
-		if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET,
-			Fd:     int32(efd),
-		}); err != nil {
-			_ = unix.Close(efd)
-			efd = -1
-		}
-	}
+	acceptPaused *atomic.Bool) *Loop {
 
 	return &Loop{
 		id:           id,
 		cpuID:        cpuID,
-		epollFD:      epollFD,
-		listenFD:     listenFD,
-		eventFD:      efd,
+		epollFD:      -1,
+		listenFD:     -1,
+		eventFD:      -1,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
 		conns:        make([]*connState, connTableSize),
 		handler:      handler,
@@ -122,6 +85,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		logger:       cfg.Logger,
 		acceptPaused: acceptPaused,
 		wake:         make(chan struct{}),
+		ready:        make(chan error, 1),
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  objective.TCPNoDelay,
 			TCPQuickAck: objective.TCPQuickAck,
@@ -137,7 +101,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			InitialWindowSize:    cfg.InitialWindowSize,
 			MaxFrameSize:         cfg.MaxFrameSize,
 		},
-	}, nil
+	}
 }
 
 func (l *Loop) run(ctx context.Context) {
@@ -145,6 +109,53 @@ func (l *Loop) run(ctx context.Context) {
 	defer runtime.UnlockOSThread()
 
 	_ = platform.PinToCPU(l.cpuID)
+
+	numaNode := platform.CPUForNode(l.cpuID)
+	if err := platform.BindNumaNode(numaNode); err == nil {
+		defer func() { _ = platform.ResetNumaPolicy() }()
+	}
+
+	epollFD, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+	if err != nil {
+		l.ready <- fmt.Errorf("loop %d: epoll_create1: %w", l.id, err)
+		return
+	}
+	l.epollFD = epollFD
+
+	listenFD, err := createListenSocket(l.cfg.Addr)
+	if err != nil {
+		_ = unix.Close(epollFD)
+		l.ready <- fmt.Errorf("loop %d: listen socket: %w", l.id, err)
+		return
+	}
+	l.listenFD = listenFD
+
+	if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, listenFD, &unix.EpollEvent{
+		Events: unix.EPOLLIN | unix.EPOLLET,
+		Fd:     int32(listenFD),
+	}); err != nil {
+		_ = unix.Close(listenFD)
+		_ = unix.Close(epollFD)
+		l.ready <- fmt.Errorf("loop %d: epoll_ctl listen: %w", l.id, err)
+		return
+	}
+
+	efd, efdErr := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if efdErr != nil {
+		efd = -1
+	}
+	if efd >= 0 {
+		if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+			Events: unix.EPOLLIN | unix.EPOLLET,
+			Fd:     int32(efd),
+		}); err != nil {
+			_ = unix.Close(efd)
+			efd = -1
+		}
+	}
+	l.eventFD = efd
+
+	l.ready <- nil
 
 	activeTimeoutMs := int(l.objective.EpollTimeout.Milliseconds())
 	if activeTimeoutMs <= 0 {
