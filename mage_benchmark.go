@@ -539,6 +539,132 @@ func generateWrkH2loadReport(branchName string, mainRuns, branchRuns []map[strin
 	return sb.String()
 }
 
+// generateThreeWayReport generates a three-way comparison table: main vs savepoint vs current.
+// This enables tracking both total improvement (vs main) and incremental improvement (vs savepoint).
+func generateThreeWayReport(branchName string, mainRuns, savepointRuns, currentRuns []map[string]float64) string {
+	allConfigs := make(map[string]bool)
+	mainVals := make(map[string][]float64)
+	saveVals := make(map[string][]float64)
+	curVals := make(map[string][]float64)
+	for _, run := range mainRuns {
+		for k, v := range run {
+			allConfigs[k] = true
+			mainVals[k] = append(mainVals[k], v)
+		}
+	}
+	for _, run := range savepointRuns {
+		for k, v := range run {
+			allConfigs[k] = true
+			saveVals[k] = append(saveVals[k], v)
+		}
+	}
+	for _, run := range currentRuns {
+		for k, v := range run {
+			allConfigs[k] = true
+			curVals[k] = append(curVals[k], v)
+		}
+	}
+
+	var configs []string
+	for _, cfg := range splitBenchConfigs {
+		name := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		if allConfigs[name] {
+			configs = append(configs, name)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Celeris Three-Way Benchmark Report (wrk + h2load)\n")
+	sb.WriteString(fmt.Sprintf("Branch: %s — current vs savepoint (HEAD) vs main\n", branchName))
+	sb.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("Rounds: %d per binary (interleaved)\n", len(mainRuns)))
+	sb.WriteString(fmt.Sprintf("H1 load: wrk -t4 -c16384 -d%ds\n", loadDuration))
+	sb.WriteString(fmt.Sprintf("H2 load: h2load -c128 -m128 -t4 -D%d (16384 concurrent streams)\n", loadDuration))
+	sb.WriteString("Server: all 8 CPUs (no taskset), separate client machine\n\n")
+
+	sb.WriteString(fmt.Sprintf("%-28s | %11s | %11s | %11s | %9s | %9s\n",
+		"Config", "main (med)", "save (med)", "cur (med)", "vs main", "vs save"))
+	sb.WriteString(strings.Repeat("-", 100) + "\n")
+
+	improved, neutral, regressed := 0, 0, 0
+	var totalDeltaMain, totalDeltaSave float64
+
+	for _, name := range configs {
+		mRPS := medianFloat64(mainVals[name])
+		sRPS := medianFloat64(saveVals[name])
+		cRPS := medianFloat64(curVals[name])
+
+		deltaMain, deltaSave := 0.0, 0.0
+		deltaMainStr, deltaSaveStr := "N/A", "N/A"
+		if mRPS > 0 {
+			deltaMain = (cRPS - mRPS) / mRPS * 100
+			deltaMainStr = fmt.Sprintf("%+.1f%%", deltaMain)
+		}
+		if sRPS > 0 {
+			deltaSave = (cRPS - sRPS) / sRPS * 100
+			deltaSaveStr = fmt.Sprintf("%+.1f%%", deltaSave)
+		}
+
+		sb.WriteString(fmt.Sprintf("%-28s | %11.0f | %11.0f | %11.0f | %9s | %9s\n",
+			name, mRPS, sRPS, cRPS, deltaMainStr, deltaSaveStr))
+
+		if math.Abs(deltaMain) < 2.0 {
+			neutral++
+		} else if deltaMain > 0 {
+			improved++
+		} else {
+			regressed++
+		}
+		totalDeltaMain += deltaMain
+		totalDeltaSave += deltaSave
+	}
+
+	sb.WriteString(strings.Repeat("-", 100) + "\n")
+	n := len(configs)
+	avgMain, avgSave := 0.0, 0.0
+	if n > 0 {
+		avgMain = totalDeltaMain / float64(n)
+		avgSave = totalDeltaSave / float64(n)
+	}
+	sb.WriteString(fmt.Sprintf("\nSummary vs main: %d improved, %d neutral, %d regressed (avg: %+.1f%%)\n",
+		improved, neutral, regressed, avgMain))
+	sb.WriteString(fmt.Sprintf("Summary vs savepoint: avg delta %+.1f%%\n", avgSave))
+
+	// io_uring vs epoll comparison (current).
+	sb.WriteString("\n--- io_uring vs epoll (current) ---\n")
+	for _, obj := range []string{"latency", "throughput", "balanced"} {
+		for _, proto := range []string{"h1", "h2"} {
+			iouName := fmt.Sprintf("iouring-%s-%s", obj, proto)
+			epoName := fmt.Sprintf("epoll-%s-%s", obj, proto)
+			iouRPS := medianFloat64(curVals[iouName])
+			epoRPS := medianFloat64(curVals[epoName])
+			if epoRPS > 0 {
+				adv := (iouRPS - epoRPS) / epoRPS * 100
+				sb.WriteString(fmt.Sprintf("  %-25s: io_uring %8.0f  epoll %8.0f  %+.1f%%\n",
+					obj+"-"+proto, iouRPS, epoRPS, adv))
+			}
+		}
+	}
+
+	// H2 vs H1 comparison (current).
+	sb.WriteString("\n--- H2 vs H1 (current) ---\n")
+	for _, eng := range []string{"iouring", "epoll", "std"} {
+		for _, obj := range []string{"latency", "throughput", "balanced"} {
+			h1Name := fmt.Sprintf("%s-%s-h1", eng, obj)
+			h2Name := fmt.Sprintf("%s-%s-h2", eng, obj)
+			h1RPS := medianFloat64(curVals[h1Name])
+			h2RPS := medianFloat64(curVals[h2Name])
+			if h1RPS > 0 && h2RPS > 0 {
+				ratio := h2RPS / h1RPS * 100
+				sb.WriteString(fmt.Sprintf("  %-25s: H2 %8.0f  H1 %8.0f  H2/H1 = %.0f%%\n",
+					eng+"-"+obj, h2RPS, h1RPS, ratio))
+			}
+		}
+	}
+
+	return sb.String()
+}
+
 // highConnCounts defines the connection counts for the high-connection benchmark.
 var highConnCounts = []int{256, 512, 1024, 2048}
 
@@ -862,10 +988,15 @@ func buildSplitPassScript(serverBin, serverIP, serverKeyPath string) string {
 	return strings.Join(parts, "\n")
 }
 
-// CloudBenchmarkSplit runs A/B benchmarks with SEPARATE server and client instances.
+// CloudBenchmarkSplit runs A/B/C benchmarks with SEPARATE server and client instances.
 // The server gets ALL 8 CPUs (no taskset). The client runs wrk/h2load on a separate
 // machine over VPC network. This tests the real-world scenario where io_uring's
 // syscall batching advantage manifests over real network (not loopback).
+//
+// Three-way comparison: main vs HEAD (savepoint) vs working tree (current).
+// The savepoint is the last committed state on the branch — useful for tracking
+// incremental progress during optimization loops. If HEAD equals main, the
+// savepoint column is omitted.
 //
 // Set CLOUD_ARCH=amd64|arm64 (default: amd64).
 func CloudBenchmarkSplit() error {
@@ -888,7 +1019,16 @@ func CloudBenchmarkSplit() error {
 	}
 	arch := arches[0]
 
-	fmt.Printf("Cloud Split Benchmark: %s vs main (%s)\n", branch, arch)
+	// Determine if savepoint differs from main (i.e., we have commits on the branch).
+	headSHA, _ := output("git", "rev-parse", "HEAD")
+	mainSHA, _ := output("git", "rev-parse", "main")
+	hasSavepoint := strings.TrimSpace(headSHA) != strings.TrimSpace(mainSHA)
+
+	if hasSavepoint {
+		fmt.Printf("Cloud Split Benchmark: %s vs HEAD (savepoint) vs main (%s)\n", branch, arch)
+	} else {
+		fmt.Printf("Cloud Split Benchmark: %s vs main (%s)\n", branch, arch)
+	}
 	fmt.Printf("Separate server + client machines (server gets all 8 CPUs)\n")
 	fmt.Printf("Instance type: %s\n\n", awsInstanceType(arch))
 
@@ -922,6 +1062,14 @@ func CloudBenchmarkSplit() error {
 	}
 	if err := crossCompileFromRef("main", "test/benchmark/profiled", mainBin, arch); err != nil {
 		return err
+	}
+
+	var savepointBin string
+	if hasSavepoint {
+		savepointBin = filepath.Join(dir, fmt.Sprintf("profiled-savepoint-%s", arch))
+		if err := crossCompileFromRef("HEAD", "test/benchmark/profiled", savepointBin, arch); err != nil {
+			return fmt.Errorf("build profiled (savepoint/HEAD, %s): %w", arch, err)
+		}
 	}
 
 	ami, err := awsLatestAMI(arch)
@@ -962,6 +1110,11 @@ func CloudBenchmarkSplit() error {
 	if err := awsSCP(currentBin, "/tmp/bench/profiled-current", serverPublicIP, keyPath); err != nil {
 		return err
 	}
+	if hasSavepoint {
+		if err := awsSCP(savepointBin, "/tmp/bench/profiled-savepoint", serverPublicIP, keyPath); err != nil {
+			return err
+		}
+	}
 	if _, err := awsSSH(serverPublicIP, keyPath, "chmod +x /tmp/bench/profiled-*"); err != nil {
 		return err
 	}
@@ -991,24 +1144,42 @@ func CloudBenchmarkSplit() error {
 		return err
 	}
 
-	// Interleaved: M1→C1→C2→M2→M3→C3
 	type pass struct {
 		label     string
 		serverBin string
 		target    *[]map[string]float64
 	}
-	var mainRuns, currentRuns []map[string]float64
-	schedule := []pass{
-		{"main R1", "/tmp/bench/profiled-main", &mainRuns},
-		{"branch R1", "/tmp/bench/profiled-current", &currentRuns},
-		{"branch R2", "/tmp/bench/profiled-current", &currentRuns},
-		{"main R2", "/tmp/bench/profiled-main", &mainRuns},
-		{"main R3", "/tmp/bench/profiled-main", &mainRuns},
-		{"branch R3", "/tmp/bench/profiled-current", &currentRuns},
+	var mainRuns, savepointRuns, currentRuns []map[string]float64
+
+	var schedule []pass
+	if hasSavepoint {
+		// 9-pass interleaved: M1→S1→C1→C2→S2→M2→M3→S3→C3
+		schedule = []pass{
+			{"main R1", "/tmp/bench/profiled-main", &mainRuns},
+			{"savepoint R1", "/tmp/bench/profiled-savepoint", &savepointRuns},
+			{"branch R1", "/tmp/bench/profiled-current", &currentRuns},
+			{"branch R2", "/tmp/bench/profiled-current", &currentRuns},
+			{"savepoint R2", "/tmp/bench/profiled-savepoint", &savepointRuns},
+			{"main R2", "/tmp/bench/profiled-main", &mainRuns},
+			{"main R3", "/tmp/bench/profiled-main", &mainRuns},
+			{"savepoint R3", "/tmp/bench/profiled-savepoint", &savepointRuns},
+			{"branch R3", "/tmp/bench/profiled-current", &currentRuns},
+		}
+	} else {
+		// 6-pass interleaved: M1→C1→C2→M2→M3→C3
+		schedule = []pass{
+			{"main R1", "/tmp/bench/profiled-main", &mainRuns},
+			{"branch R1", "/tmp/bench/profiled-current", &currentRuns},
+			{"branch R2", "/tmp/bench/profiled-current", &currentRuns},
+			{"main R2", "/tmp/bench/profiled-main", &mainRuns},
+			{"main R3", "/tmp/bench/profiled-main", &mainRuns},
+			{"branch R3", "/tmp/bench/profiled-current", &currentRuns},
+		}
 	}
 
+	totalPasses := len(schedule)
 	for i, p := range schedule {
-		fmt.Printf("\n--- Pass %d/6: %s ---\n", i+1, p.label)
+		fmt.Printf("\n--- Pass %d/%d: %s ---\n", i+1, totalPasses, p.label)
 		script := buildSplitPassScript(p.serverBin, serverPrivateIP, "/tmp/server-key.pem")
 
 		scriptPath := filepath.Join(dir, fmt.Sprintf("split-pass-%d.sh", i))
@@ -1026,7 +1197,12 @@ func CloudBenchmarkSplit() error {
 		*p.target = append(*p.target, results)
 	}
 
-	report := generateWrkH2loadReport(branch+" ("+arch+", split)", mainRuns, currentRuns)
+	var report string
+	if hasSavepoint {
+		report = generateThreeWayReport(branch+" ("+arch+", split)", mainRuns, savepointRuns, currentRuns)
+	} else {
+		report = generateWrkH2loadReport(branch+" ("+arch+", split)", mainRuns, currentRuns)
+	}
 	fmt.Println("\n" + report)
 
 	reportPath := filepath.Join(dir, fmt.Sprintf("report-%s.txt", arch))

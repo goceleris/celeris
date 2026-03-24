@@ -55,7 +55,7 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
-	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
+	h1Mode                 bool   // single-threaded H1 stream; skip mutex in GetHeaders
 	flags                  atomic.Uint32
 	doneCh                 atomic.Pointer[chan struct{}]
 	phase                  Phase
@@ -106,6 +106,9 @@ func NewStream(id uint32) *Stream {
 	s.OutboundBuffer = getBuf()
 	s.windowSize.Store(65535)
 	s.phase = PhaseInit
+	if cap(s.Headers) < 8 {
+		s.Headers = make([][2]string, 0, 8)
+	}
 	return s
 }
 
@@ -128,6 +131,9 @@ func (s *Stream) GetBuf() *bytes.Buffer {
 	}
 	return s.Data
 }
+
+// IsH1 returns true if this is an H1 stream (single-threaded, persistent per connection).
+func (s *Stream) IsH1() bool { return s.h1Mode }
 
 // Context returns the stream's context.
 func (s *Stream) Context() context.Context {

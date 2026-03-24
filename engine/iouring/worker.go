@@ -377,6 +377,20 @@ func (w *Worker) run(ctx context.Context) {
 			w.hasBufReturns = false
 		}
 
+		// Drain H2 async write queues FIRST. Handler goroutines enqueue
+		// response frame bytes; draining them before the dirty list ensures
+		// SEND SQEs are queued as early as possible after CQE processing,
+		// reducing pipeline stalls for H2 multiplexed streams.
+		for _, fd := range w.h2Conns {
+			cs := w.conns[fd]
+			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
+				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if w.flushSend(cs) {
+					w.markDirty(cs)
+				}
+			}
+		}
+
 		// Retry pending sends and dropped recv arms on dirty connections
 		// (SQ ring was full earlier). Typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
@@ -395,30 +409,17 @@ func (w *Worker) run(ctx context.Context) {
 			cs = next
 		}
 
-		// Drain H2 async write queues. Handler goroutines enqueue response
-		// frame bytes; we drain them into writeBuf and flush to the wire.
-		for _, fd := range w.h2Conns {
-			cs := w.conns[fd]
-			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
-				cs.h2State.DrainWriteQueue(cs.writeFn)
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
-			}
-		}
-
-		// Immediate submit (non-SQPOLL): flush all SENDs from CQE
-		// processing, dirty list retries, and H2 async drain to the
-		// kernel NOW instead of deferring to the next iteration's
-		// adaptive submit. Without this, responses sit in the SQ ring
-		// for an entire iteration (~50-200μs), creating pipeline stalls
-		// for H2 multiplexed streams where clients wait for responses
-		// before sending more requests. The extra Submit() syscall
-		// (~300ns) is far cheaper than the stall it prevents.
+		// Immediate submit (non-SQPOLL): flush SENDs to the kernel NOW
+		// instead of deferring to the next iteration's adaptive submit.
+		// Skip when CQEs are already visible — the next iteration wakes
+		// immediately (mode 1) and does Submit() there, saving ~300ns.
 		if !w.sqpoll && w.ring.Pending() > 0 {
-			if _, err := w.ring.Submit(); err != nil {
-				w.shutdown()
-				return
+			cqH, cqT := w.ring.BeginCQ()
+			if cqH == cqT {
+				if _, err := w.ring.Submit(); err != nil {
+					w.shutdown()
+					return
+				}
 			}
 		}
 

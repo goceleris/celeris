@@ -13,12 +13,16 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
 )
 
 // cachedDatePtr holds the pre-formatted HTTP Date header line, updated every second.
 // Using atomic.Pointer avoids the type assertion cost of atomic.Value (P6).
 var cachedDatePtr atomic.Pointer[[]byte]
+
+// cachedStatus200DatePtr holds "HTTP/1.1 200 OK\r\ndate: <RFC1123>\r\n" fused into
+// a single cached block, updated every second alongside cachedDatePtr. For 200 OK
+// responses (95%+ of API traffic), this replaces two separate appends with one.
+var cachedStatus200DatePtr atomic.Pointer[[]byte]
 
 func init() {
 	updateCachedDate()
@@ -40,6 +44,15 @@ func updateCachedDate() {
 	cp := make([]byte, len(b))
 	copy(cp, b)
 	cachedDatePtr.Store(&cp)
+
+	// Fused "HTTP/1.1 200 OK\r\ndate: ...\r\n" block.
+	var buf2 [96]byte
+	b2 := buf2[:0]
+	b2 = append(b2, statusLine200...)
+	b2 = append(b2, cp...)
+	cp2 := make([]byte, len(b2))
+	copy(cp2, b2)
+	cachedStatus200DatePtr.Store(&cp2)
 }
 
 func appendCachedDate(buf []byte) []byte {
@@ -49,6 +62,16 @@ func appendCachedDate(buf []byte) []byte {
 	buf = append(buf, "date: "...)
 	buf = time.Now().UTC().AppendFormat(buf, time.RFC1123)
 	return append(buf, crlf...)
+}
+
+// appendCachedStatus200Date appends the fused "HTTP/1.1 200 OK\r\ndate: ...\r\n"
+// block. Falls back to two separate appends if the cache isn't ready.
+func appendCachedStatus200Date(buf []byte) []byte {
+	if p := cachedStatus200DatePtr.Load(); p != nil {
+		return append(buf, (*p)...)
+	}
+	buf = appendStatusLine(buf, 200)
+	return appendCachedDate(buf)
 }
 
 var (
@@ -128,9 +151,13 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// across requests on the same keep-alive connection.
 	buf := a.respBuf[:0]
 
-	buf = appendStatusLine(buf, status)
-
-	buf = appendCachedDate(buf)
+	// Fast path: status 200 uses fused status+date block (one append).
+	if status == 200 {
+		buf = appendCachedStatus200Date(buf)
+	} else {
+		buf = appendStatusLine(buf, status)
+		buf = appendCachedDate(buf)
+	}
 
 	// Fast path: exactly 2 headers from Blob() (content-type, content-length).
 	// This is the dominant case for API responses. Skip per-header string
@@ -380,7 +407,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			enc.hpackBuf.Reset()
 			enc.hpackBuf.Write(hpackStatus200)
 			enc.hpackBuf.Write(ctBlock)
-			_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-length", Value: headers[1][1]})
+			appendHPACKContentLength(&enc.hpackBuf, headers[1][1])
 			headerBlock := enc.hpackBuf.Bytes()
 
 			endStream := len(body) == 0 || s.IsHEAD
