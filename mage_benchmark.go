@@ -774,21 +774,32 @@ func CloudBenchmarkHighConn() error {
 }
 
 // splitBenchConfigs defines configs for the split-machine benchmark.
+// All engine×objective×protocol combinations for comprehensive comparison.
+// H1 uses high-concurrency wrk (16384 connections) to match H2's total
+// concurrent streams (128 connections × 128 streams = 16384).
 var splitBenchConfigs = []struct {
 	engine    string
 	objective string
 	protocol  string
 	loadTool  string
 }{
+	// io_uring — all objectives, H1 + H2
 	{"iouring", "latency", "h1", "wrk"},
-	{"iouring", "throughput", "h1", "wrk"},
-	{"iouring", "balanced", "h1", "wrk"},
 	{"iouring", "latency", "h2", "h2load"},
+	{"iouring", "throughput", "h1", "wrk"},
+	{"iouring", "throughput", "h2", "h2load"},
+	{"iouring", "balanced", "h1", "wrk"},
+	{"iouring", "balanced", "h2", "h2load"},
+	// epoll — all objectives, H1 + H2
 	{"epoll", "latency", "h1", "wrk"},
-	{"epoll", "throughput", "h1", "wrk"},
-	{"epoll", "balanced", "h1", "wrk"},
 	{"epoll", "latency", "h2", "h2load"},
+	{"epoll", "throughput", "h1", "wrk"},
+	{"epoll", "throughput", "h2", "h2load"},
+	{"epoll", "balanced", "h1", "wrk"},
+	{"epoll", "balanced", "h2", "h2load"},
+	// std — latency only (control group)
 	{"std", "latency", "h1", "wrk"},
+	{"std", "latency", "h2", "h2load"},
 }
 
 // buildSplitServerScript starts the server (no taskset — all CPUs).
@@ -817,9 +828,12 @@ func buildSplitPassScript(serverBin, serverIP, serverKeyPath string) string {
 	for i, cfg := range splitBenchConfigs {
 		var loadCmd string
 		if cfg.loadTool == "h2load" {
+			// 128 connections × 128 multiplexed streams = 16384 concurrent requests
 			loadCmd = fmt.Sprintf("h2load -c128 -m128 -t4 -D %d http://%s:18080/", loadDuration, serverIP)
 		} else {
-			loadCmd = fmt.Sprintf("wrk -t4 -c256 -d%ds --latency http://%s:18080/", loadDuration, serverIP)
+			// 16384 connections to match H2's total concurrent request count
+			// (128 conns × 128 streams). Apples-to-apples comparison.
+			loadCmd = fmt.Sprintf("wrk -t4 -c16384 -d%ds --latency http://%s:18080/", loadDuration, serverIP)
 		}
 
 		// Write server start script to a local temp file, scp it, then execute.
