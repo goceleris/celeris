@@ -454,32 +454,64 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 
 	state.inBuf.Write(data)
 
+	maxFrameSize := state.processor.GetManager().GetMaxFrameSize()
 	for state.inBuf.hasCompleteFrame() {
 		// Tell the processor if more frames follow in this recv buffer.
 		// When true, canRunInline returns false to avoid sending the
 		// response before subsequent frames (WINDOW_UPDATE, PRIORITY)
 		// are processed — required for h2spec compliance.
 		state.processor.SetHasMoreFrames(state.inBuf.hasMoreThanOneFrame())
-		f, err := state.parser.ReadNextFrame()
-		if err != nil {
-			if err == io.EOF {
-				break
+
+		// Fast path: peek at frame header to detect simple HEADERS frames
+		// (END_HEADERS set, no PADDED, no PRIORITY, not in CONTINUATION).
+		// Bypasses x/net framer's ReadFrame which allocates *HeadersFrame.
+		var processErr error
+		raw := state.inBuf.Bytes()
+		frameType := raw[3]
+		frameFlags := raw[4]
+		frameLen := uint32(raw[0])<<16 | uint32(raw[1])<<8 | uint32(raw[2])
+		const (
+			flagEndStream  = 0x01
+			flagEndHeaders = 0x04
+			flagPadded     = 0x08
+			flagPriority   = 0x20
+			typeHeaders    = 0x01
+		)
+		if frameType == typeHeaders &&
+			frameFlags&flagEndHeaders != 0 &&
+			frameFlags&flagPadded == 0 &&
+			frameFlags&flagPriority == 0 &&
+			frameLen <= maxFrameSize &&
+			!state.processor.IsExpectingContinuation() {
+			// Zero-alloc HEADERS fast path.
+			rf, consumed, _ := frame.ReadRawFrame(raw)
+			state.inBuf.Next(consumed) // advance past frame
+			processErr = state.processor.ProcessRawHeaders(
+				rf.StreamID, rf.HasEndStream(), rf.Payload)
+		} else {
+			// Standard path: delegate to x/net framer for complex frames.
+			f, err := state.parser.ReadNextFrame()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				if ce, ok := err.(http2.ConnectionError); ok {
+					_ = state.processor.SendGoAway(
+						state.processor.GetManager().GetLastStreamID(),
+						http2.ErrCode(ce), []byte(ce.Error()))
+					flushOutBuf(state.outBuf, write)
+				}
+				state.mu.Unlock()
+				state.DrainWriteQueue(write)
+				return fmt.Errorf("frame read error: %w", err)
 			}
-			if ce, ok := err.(http2.ConnectionError); ok {
-				_ = state.processor.SendGoAway(
-					state.processor.GetManager().GetLastStreamID(),
-					http2.ErrCode(ce), []byte(ce.Error()))
-				flushOutBuf(state.outBuf, write)
-			}
-			state.mu.Unlock()
-			state.DrainWriteQueue(write)
-			return fmt.Errorf("frame read error: %w", err)
+			processErr = state.processor.ProcessFrame(ctx, f)
 		}
-		if err := state.processor.ProcessFrame(ctx, f); err != nil {
+		if processErr != nil {
 			flushOutBuf(state.outBuf, write)
 			state.mu.Unlock()
 			state.DrainWriteQueue(write)
-			return err
+			return processErr
 		}
 		flushOutBuf(state.outBuf, write)
 		// Drain inline handler responses immediately so they're sent in the

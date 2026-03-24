@@ -253,6 +253,9 @@ func (m *Manager) GetSendWindowsAndMaxFrame(streamID uint32) (connWindow int32, 
 	return
 }
 
+// GetMaxFrameSize returns the current max frame size (atomic).
+func (m *Manager) GetMaxFrameSize() uint32 { return atomic.LoadUint32(&m.maxFrameSize) }
+
 // GetSendWindowsAndMaxFrameFast returns current connection window, stream window, and max frame size.
 // It avoids Manager lock by using atomics and direct stream access.
 func (m *Manager) GetSendWindowsAndMaxFrameFast(s *Stream) (connWindow int32, streamWindow int32, maxFrame uint32) {
