@@ -2,7 +2,6 @@ package stream
 
 import (
 	"fmt"
-	"strings"
 
 	"golang.org/x/net/http2"
 )
@@ -25,7 +24,7 @@ func validateRequestHeaders(headers [][2]string) error {
 			return fmt.Errorf("header field name must be lowercase: %s", name)
 		}
 
-		if strings.HasPrefix(name, ":") {
+		if len(name) > 0 && name[0] == ':' {
 			if seenRegular {
 				return fmt.Errorf("pseudo-header %s appears after regular header", name)
 			}
@@ -95,7 +94,7 @@ func validateTrailerHeaders(headers [][2]string) error {
 			return fmt.Errorf("header field name must be lowercase: %s", name)
 		}
 
-		if strings.HasPrefix(name, ":") {
+		if len(name) > 0 && name[0] == ':' {
 			return fmt.Errorf("pseudo-header not allowed in trailers: %s", name)
 		}
 
@@ -116,8 +115,8 @@ func validateTrailerHeaders(headers [][2]string) error {
 func validateContentLength(headers [][2]string, bodyLength int) error {
 	for _, h := range headers {
 		if h[0] == "content-length" {
-			var expectedLength int
-			if _, err := fmt.Sscanf(h[1], "%d", &expectedLength); err != nil {
+			expectedLength, ok := parseUint(h[1])
+			if !ok {
 				return fmt.Errorf("invalid content-length value: %s", h[1])
 			}
 			if expectedLength != bodyLength {
@@ -127,6 +126,22 @@ func validateContentLength(headers [][2]string, bodyLength int) error {
 		}
 	}
 	return nil
+}
+
+// parseUint parses a non-negative integer from a string without allocations.
+func parseUint(s string) (int, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	n := 0
+	for i := range len(s) {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
 }
 
 // sendStreamError sends an RST_STREAM frame with the specified error code.

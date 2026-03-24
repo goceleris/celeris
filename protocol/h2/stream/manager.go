@@ -99,6 +99,9 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 	if id > m.maxStreamID {
 		m.maxStreamID = id
 	}
+	if id%2 == 1 {
+		m.lastClientStream.Store(id)
+	}
 	m.activeStreams.Add(1)
 	return s, true
 }

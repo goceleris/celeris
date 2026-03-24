@@ -34,6 +34,18 @@ func (fb *frameBuffer) hasCompleteFrame() bool {
 	return uint32(len(b)) >= 9+length
 }
 
+// hasMoreThanOneFrame checks if the buffer contains more than one complete frame.
+// Used to suppress inline handler execution when subsequent frames need processing.
+func (fb *frameBuffer) hasMoreThanOneFrame() bool {
+	b := fb.Bytes()
+	if len(b) < 9 {
+		return false
+	}
+	firstLen := uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+	consumed := 9 + firstLen
+	return uint32(len(b)) > consumed+8 // room for at least another 9-byte header
+}
+
 // H2Config holds H2 connection configuration.
 type H2Config struct {
 	MaxConcurrentStreams uint32
@@ -450,80 +462,14 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 		return nil
 	}
 
-	// Dual-path frame processing:
-	// 1. Raw path: parse 9-byte header + handle WINDOW_UPDATE, PING, SETTINGS(ACK)
-	//    directly from the byte buffer. Zero alloc, no x/net Framer overhead.
-	// 2. Framer path: HEADERS, DATA, CONTINUATION, etc. go through x/net for
-	//    full HPACK/priority support.
 	state.inBuf.Write(data)
 
 	for state.inBuf.hasCompleteFrame() {
-		buf := state.inBuf.Bytes()
-		if len(buf) < 9 {
-			break
-		}
-
-		frameType := buf[3]
-		flags := buf[4]
-
-		// Raw fast-path for simple frame types.
-		switch frameType {
-		case rawFrameWindowUpdate:
-			rf, consumed, err := frame.ReadRawFrame(buf)
-			if err != nil {
-				break // incomplete, wait for more data
-			}
-			if rf.StreamID == 0 && flags&0x01 != 0 {
-				// Stream 0 should not have flags on WINDOW_UPDATE
-			}
-			state.inBuf.Next(consumed)
-			if err := state.processor.HandleRawWindowUpdate(rf.StreamID, rf.Payload); err != nil {
-				flushOutBuf(state.outBuf, write)
-				state.mu.Unlock()
-				state.DrainWriteQueue(write)
-				return err
-			}
-			flushOutBuf(state.outBuf, write)
-			continue
-
-		case rawFramePing:
-			rf, consumed, err := frame.ReadRawFrame(buf)
-			if err != nil {
-				break
-			}
-			if rf.StreamID != 0 {
-				state.inBuf.Next(consumed)
-				err := state.processor.GoAwayErr(0, http2.ErrCodeProtocol, []byte("PING on non-zero stream"),
-					fmt.Errorf("PING frame with non-zero stream id: %d", rf.StreamID))
-				flushOutBuf(state.outBuf, write)
-				state.mu.Unlock()
-				state.DrainWriteQueue(write)
-				return err
-			}
-			state.inBuf.Next(consumed)
-			if err := state.processor.HandleRawPing(rf.Flags, rf.Payload); err != nil {
-				flushOutBuf(state.outBuf, write)
-				state.mu.Unlock()
-				state.DrainWriteQueue(write)
-				return err
-			}
-			flushOutBuf(state.outBuf, write)
-			continue
-
-		case rawFrameSettings:
-			// Only handle SETTINGS ACK (flags=0x01, length=0) via raw path.
-			// Full SETTINGS frames need the x/net path for setting enumeration.
-			if flags == 0x01 {
-				length := uint32(buf[0])<<16 | uint32(buf[1])<<8 | uint32(buf[2])
-				if length == 0 {
-					state.inBuf.Next(9)
-					// SETTINGS ACK is a no-op
-					continue
-				}
-			}
-		}
-
-		// Framer path: complex frames.
+		// Tell the processor if more frames follow in this recv buffer.
+		// When true, canRunInline returns false to avoid sending the
+		// response before subsequent frames (WINDOW_UPDATE, PRIORITY)
+		// are processed — required for h2spec compliance.
+		state.processor.SetHasMoreFrames(state.inBuf.hasMoreThanOneFrame())
 		f, err := state.parser.ReadNextFrame()
 		if err != nil {
 			if err == io.EOF {
@@ -553,6 +499,10 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 			state.writeQueue.DrainTo(write)
 		}
 	}
+
+	// Clean up inline-completed streams that were deferred during the
+	// frame loop (pending outbound data or more frames to process).
+	state.processor.FlushInlineCleanup()
 
 	state.mu.Unlock()
 

@@ -80,9 +80,40 @@ type Processor struct {
 	continuationState   *ContinuationState
 	continuationStateMu sync.Mutex
 	continuationActive  atomic.Bool
-	cachedStream        *Stream // per-connection cached stream for inline handlers
-	InlineWriter        ResponseWriter // direct-to-outBuf writer for inline handlers (set by conn layer)
+	cachedStream        *Stream         // per-connection cached stream for inline handlers
+	InlineCachedCtx      any            // per-connection cached app context for inline handlers (avoids sync.Pool)
+	hasMoreFrames        bool           // true when more frames follow in current recv (defers inline cleanup)
+	pendingInlineCleanup []*Stream      // inline-completed streams deferred until frame loop exits
+	InlineWriter         ResponseWriter // direct-to-outBuf writer for inline handlers (set by conn layer)
 	InlineCount         uint64  // number of requests handled inline (for metrics)
+}
+
+// SetHasMoreFrames tells the processor whether more frames follow the
+// current one in the recv buffer. Used to suppress inline handler execution
+// when the frame loop has more frames to process.
+func (p *Processor) SetHasMoreFrames(v bool) { p.hasMoreFrames = v }
+
+// FlushInlineCleanup transitions and removes streams that completed inline
+// during the frame loop but had cleanup deferred (pending outbound data or
+// more frames to process). Called after the frame loop, under H2State.mu.
+func (p *Processor) FlushInlineCleanup() {
+	for _, s := range p.pendingInlineCleanup {
+		// Stream may have been cleaned up by handleWindowUpdate/handleSettings.
+		if existing, ok := p.manager.GetStream(s.ID); !ok || existing != s {
+			continue
+		}
+		state := s.GetState()
+		if state == StateOpen || state == StateHalfClosedRemote {
+			if state == StateHalfClosedRemote {
+				s.SetState(StateClosed)
+			} else {
+				s.SetState(StateHalfClosedLocal)
+			}
+		}
+		p.manager.RemoveStreamFromMap(s.ID)
+		s.Release()
+	}
+	p.pendingInlineCleanup = p.pendingInlineCleanup[:0]
 }
 
 // NewProcessor creates a new stream processor.
@@ -367,8 +398,7 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 //
 func (p *Processor) canRunInline(stream *Stream) bool {
 	return stream.EndStream &&
-		!p.continuationActive.Load() &&
-		p.manager.GetConnectionWindow() > 0
+		!p.continuationActive.Load()
 }
 
 // runHandler dispatches the stream handler. For inline-eligible streams
@@ -398,11 +428,13 @@ func (p *Processor) runHandler(stream *Stream) {
 // eventfd syscall, and drain loop overhead.
 func (p *Processor) executeHandlerInline(stream *Stream) {
 	p.InlineCount++
-
-	// Use connWriter (write queue path). The per-frame queue drain in
-	// ProcessH2 flushes responses immediately after each frame, avoiding
-	// the starvation issue under high concurrency.
 	stream.ResponseWriter = p.connWriter
+
+	if p.InlineCachedCtx != nil {
+		stream.CachedCtx = p.InlineCachedCtx
+	}
+
+	var keepAlive bool
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -413,6 +445,16 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 			stream.Data.Reset()
 			bufferPool.Put(stream.Data)
 			stream.Data = nil
+		}
+
+		// Save cached context before Release clears it.
+		if stream.CachedCtx != nil {
+			p.InlineCachedCtx = stream.CachedCtx
+			stream.CachedCtx = nil
+		}
+
+		if keepAlive {
+			return
 		}
 
 		p.manager.RemoveStreamFromMap(stream.ID)
@@ -429,6 +471,30 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 		if stream.ResponseWriter != nil {
 			_ = stream.ResponseWriter.WriteResponse(stream, 200, nil, nil)
 		}
+		return
+	}
+
+	// Keep the stream alive if outbound DATA is buffered (flow control
+	// window=0). handleWindowUpdate/handleSettings will flush the DATA
+	// and clean up the stream when the window opens. Without this, the
+	// stream is removed and buffered DATA is never sent.
+	// Fixes h2spec: WINDOW_UPDATE/PRIORITY on half-closed + negative SETTINGS.
+	stream.mu.RLock()
+	hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
+	stream.mu.RUnlock()
+	if hasPending {
+		keepAlive = true
+		return
+	}
+
+	// When more frames follow in the recv buffer, defer the state
+	// transition and cleanup until FlushInlineCleanup (after the frame
+	// loop). This keeps activeStreams elevated so TryOpenStream correctly
+	// enforces MAX_CONCURRENT_STREAMS for subsequent HEADERS frames.
+	// Fixes h2spec: concurrent stream limit exceeded.
+	if p.hasMoreFrames {
+		p.pendingInlineCleanup = append(p.pendingInlineCleanup, stream)
+		keepAlive = true
 		return
 	}
 

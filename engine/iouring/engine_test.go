@@ -69,8 +69,8 @@ func TestSelectTierHigh(t *testing.T) {
 	if !tier.SupportsMultishotAccept() {
 		t.Error("expected multishot accept support")
 	}
-	if tier.SupportsMultishotRecv() {
-		t.Error("high tier should not support multishot recv (disabled for cache locality)")
+	if !tier.SupportsMultishotRecv() {
+		t.Error("high tier should support multishot recv (6-8% throughput improvement)")
 	}
 	// Without FixedFiles in profile, should not support.
 	if tier.SupportsFixedFiles() {

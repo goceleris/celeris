@@ -308,9 +308,25 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 		a.outBuf.Write(appendH2Headers(nil, s.ID, endStream, headerBlock, maxFrame))
 	}
 
+	// Flow control: respect stream window for DATA frames (matches async
+	// adapter pattern). HEADERS don't consume window, always sent inline.
 	if len(body) > 0 {
-		writeH2FrameHeader(a.outBuf, h2FrameData, true, s.ID, len(body))
-		a.outBuf.Write(body)
+		window := s.GetWindowSize()
+		if window <= 0 {
+			s.BufferOutbound(body, true)
+		} else {
+			sendLen := len(body)
+			if int32(sendLen) > window {
+				sendLen = int(window)
+			}
+			isEnd := sendLen == len(body)
+			writeH2FrameHeader(a.outBuf, h2FrameData, isEnd, s.ID, sendLen)
+			a.outBuf.Write(body[:sendLen])
+			s.DeductWindow(int32(sendLen))
+			if !isEnd {
+				s.BufferOutbound(body[sendLen:], true)
+			}
+		}
 	}
 
 	s.SetHeadersSent()
