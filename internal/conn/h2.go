@@ -329,17 +329,17 @@ func appendH2Data(buf []byte, streamID uint32, endStream bool, data []byte) []by
 
 // H2State holds per-connection H2 state.
 type H2State struct {
-	initialized    bool
-	processor      *stream.Processor
-	parser         *frame.Parser
-	writer         *frame.Writer
-	outBuf         *bytes.Buffer
-	inBuf          *frameBuffer
-	mu             sync.Mutex
-	adapter        *h2ResponseAdapter
-	inlineAdapter  *h2InlineResponseAdapter
-	writeQueue     *h2ShardedQueue
-	cfg            H2Config // cached with defaults applied
+	initialized   bool
+	processor     *stream.Processor
+	parser        *frame.Parser
+	writer        *frame.Writer
+	outBuf        *bytes.Buffer
+	inBuf         *frameBuffer
+	mu            sync.Mutex
+	adapter       *h2ResponseAdapter
+	inlineAdapter *h2InlineResponseAdapter
+	writeQueue    *h2ShardedQueue
+	cfg           H2Config // cached with defaults applied
 }
 
 // SetRemoteAddr sets the remote address on the H2 stream manager so that
@@ -410,18 +410,8 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	}
 }
 
-// H2 frame type constants for raw parsing.
-const (
-	rawFrameData         = 0x00
-	rawFrameHeaders      = 0x01
-	rawFrameSettings     = 0x04
-	rawFramePing         = 0x06
-	rawFrameWindowUpdate = 0x08
-)
-
 // ProcessH2 processes incoming H2 data.
 // On first call, validates the client preface and sends server settings.
-// Uses zero-copy raw frame parsing for common frame types (WINDOW_UPDATE,
 // PING, SETTINGS ACK) and falls back to x/net framer for complex types.
 func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handler,
 	write func([]byte), _ H2Config) error {

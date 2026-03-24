@@ -9,11 +9,11 @@ import (
 // validateRequestHeaders validates HTTP/2 request headers according to RFC 7540.
 func validateRequestHeaders(headers [][2]string) error {
 	var (
-		hasMethod     bool
-		hasScheme     bool
-		hasPath       bool
-		hasAuthority  bool
-		seenRegular   bool
+		hasMethod    bool
+		hasScheme    bool
+		hasPath      bool
+		hasAuthority bool
+		seenRegular  bool
 	)
 
 	for _, h := range headers {

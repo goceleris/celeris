@@ -76,16 +76,6 @@ func prepSend(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	}
 }
 
-// prepShutdown prepares a SHUTDOWN SQE linked to the following SQE.
-// Used as SHUTDOWN→CLOSE linked pair to replace synchronous shutdown+close.
-func prepShutdown(sqePtr unsafe.Pointer, fd int, how int) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opSHUTDOWN
-	sqe[1] = sqeIOLink | sqeCQESkipSuccess // link to CLOSE, suppress success CQE
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
-	*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(how)
-}
-
 func prepClose(sqePtr unsafe.Pointer, fd int) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[0] = opCLOSE

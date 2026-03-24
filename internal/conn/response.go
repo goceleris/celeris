@@ -333,7 +333,7 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 	return nil
 }
 
-func (a *h2InlineResponseAdapter) SendGoAway(lastStreamID uint32, code http2.ErrCode, debug []byte) error {
+func (a *h2InlineResponseAdapter) SendGoAway(_ uint32, _ http2.ErrCode, _ []byte) error {
 	return nil // handled by connWriter
 }
 

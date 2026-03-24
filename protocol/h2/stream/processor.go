@@ -71,21 +71,20 @@ func (p *h2WorkerPool) Submit(proc *Processor, s *Stream) {
 
 // Processor processes incoming HTTP/2 frames and manages streams.
 type Processor struct {
-	manager             *Manager
-	handler             Handler
-	writer              FrameWriter
-	currentConn         ResponseWriter
-	connWriter          ResponseWriter
-	hpackDecoder        *hpack.Decoder
-	continuationState   *ContinuationState
-	continuationStateMu sync.Mutex
-	continuationActive  atomic.Bool
-	cachedStream        *Stream         // per-connection cached stream for inline handlers
+	manager              *Manager
+	handler              Handler
+	writer               FrameWriter
+	currentConn          ResponseWriter
+	connWriter           ResponseWriter
+	hpackDecoder         *hpack.Decoder
+	continuationState    *ContinuationState
+	continuationStateMu  sync.Mutex
+	continuationActive   atomic.Bool
 	InlineCachedCtx      any            // per-connection cached app context for inline handlers (avoids sync.Pool)
 	hasMoreFrames        bool           // true when more frames follow in current recv (defers inline cleanup)
 	pendingInlineCleanup []*Stream      // inline-completed streams deferred until frame loop exits
 	InlineWriter         ResponseWriter // direct-to-outBuf writer for inline handlers (set by conn layer)
-	InlineCount         uint64  // number of requests handled inline (for metrics)
+	InlineCount          uint64         // number of requests handled inline (for metrics)
 }
 
 // SetHasMoreFrames tells the processor whether more frames follow the
@@ -395,7 +394,6 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 // canRunInline returns true if the stream can be executed inline on the event
 // loop. Eligible: END_STREAM set (GET/HEAD), no CONTINUATION pending,
 // connection window > 0 (can send response immediately).
-//
 func (p *Processor) canRunInline(stream *Stream) bool {
 	return stream.EndStream &&
 		!p.continuationActive.Load()
@@ -1325,10 +1323,5 @@ func (p *Processor) HandleRawPing(flags byte, payload []byte) error {
 		return err
 	}
 	p.flush()
-	return nil
-}
-
-// handleRawSettingsAck processes a SETTINGS frame with ACK flag. No-op.
-func (p *Processor) handleRawSettingsAck() error {
 	return nil
 }
