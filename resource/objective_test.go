@@ -49,8 +49,8 @@ func TestResolveObjectiveThroughput(t *testing.T) {
 	if p.EpollTimeout == 0 {
 		t.Error("EpollTimeout should be non-zero for throughput")
 	}
-	if p.SOBusyPoll != 0 {
-		t.Errorf("SOBusyPoll = %v, want 0 (intentional for throughput)", p.SOBusyPoll)
+	if p.SOBusyPoll == 0 {
+		t.Error("SOBusyPoll should be non-zero for throughput")
 	}
 	if p.BufferSize != 65536 {
 		t.Errorf("BufferSize = %d, want 65536", p.BufferSize)

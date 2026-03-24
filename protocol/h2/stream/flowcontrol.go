@@ -37,11 +37,16 @@ func (m *Manager) AccumulateWindowUpdate(streamID uint32, increment uint32) {
 	} else {
 		m.pendingStreamUpdates[streamID] += increment
 	}
+	m.hasPendingUpdates.Store(true)
 }
 
 // FlushWindowUpdates sends accumulated WINDOW_UPDATE frames if threshold is met.
 // Returns true if updates were sent.
 func (m *Manager) FlushWindowUpdates(writer FrameWriter, force bool) bool {
+	if !m.hasPendingUpdates.Load() {
+		return false
+	}
+
 	m.windowUpdateMu.Lock()
 	defer m.windowUpdateMu.Unlock()
 
@@ -60,6 +65,10 @@ func (m *Manager) FlushWindowUpdates(writer FrameWriter, force bool) bool {
 			_ = writer.WriteWindowUpdate(sid, pending)
 			flushed = true
 		}
+	}
+
+	if m.pendingConnWindowUpdate == 0 && len(m.pendingStreamUpdates) == 0 {
+		m.hasPendingUpdates.Store(false)
 	}
 
 	return flushed

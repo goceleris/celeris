@@ -37,6 +37,7 @@ const (
 	opSEND           = 26
 	opRECV           = 27
 	opPROVIDEBUFFERS = 31
+	opSHUTDOWN       = 52 // IORING_OP_SHUTDOWN (kernel 5.11+)
 	opSENDZC         = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
 )
 

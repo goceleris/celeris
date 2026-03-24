@@ -69,8 +69,8 @@ func TestSelectTierHigh(t *testing.T) {
 	if !tier.SupportsMultishotAccept() {
 		t.Error("expected multishot accept support")
 	}
-	if tier.SupportsMultishotRecv() {
-		t.Error("high tier should not support multishot recv (disabled for cache locality)")
+	if !tier.SupportsMultishotRecv() {
+		t.Error("high tier should support multishot recv (6-8% throughput improvement)")
 	}
 	// Without FixedFiles in profile, should not support.
 	if tier.SupportsFixedFiles() {
@@ -79,6 +79,7 @@ func TestSelectTierHigh(t *testing.T) {
 }
 
 func TestSelectTierHighWithFixedFiles(t *testing.T) {
+	// Fixed files are disabled (IU-1: TCP_NODELAY not set with ACCEPT_DIRECT).
 	profile := engine.CapabilityProfile{
 		IOUringTier:     engine.High,
 		CoopTaskrun:     true,
@@ -92,8 +93,8 @@ func TestSelectTierHighWithFixedFiles(t *testing.T) {
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
-	if !tier.SupportsFixedFiles() {
-		t.Error("high tier with FixedFiles should support fixed files")
+	if tier.SupportsFixedFiles() {
+		t.Error("fixed files should be disabled (TCP_NODELAY bug)")
 	}
 }
 
@@ -123,7 +124,9 @@ func TestSelectTierHighWithDeferTaskrun(t *testing.T) {
 	}
 }
 
-func TestSelectTierOptional(t *testing.T) {
+func TestSelectTierDeferTaskrunPriorityOverSQPoll(t *testing.T) {
+	// DEFER_TASKRUN (high tier) is prioritized over SQPOLL (optional tier)
+	// because SQPOLL's kernel thread steals CPU from workers.
 	profile := engine.CapabilityProfile{
 		IOUringTier:     engine.Optional,
 		CoopTaskrun:     true,
@@ -132,6 +135,22 @@ func TestSelectTierOptional(t *testing.T) {
 		MultishotRecv:   true,
 		SingleIssuer:    true,
 		SQPoll:          true,
+	}
+	tier := SelectTier(profile, 0)
+	if tier == nil {
+		t.Fatal("expected non-nil tier")
+	}
+	if tier.Tier() != engine.High {
+		t.Errorf("expected High tier (DEFER_TASKRUN priority), got %v", tier.Tier())
+	}
+}
+
+func TestSelectTierOptional(t *testing.T) {
+	// Optional tier selected when SQPoll available but ProvidedBuffers is not.
+	profile := engine.CapabilityProfile{
+		IOUringTier: engine.Optional,
+		CoopTaskrun: true,
+		SQPoll:      true,
 	}
 	tier := SelectTier(profile, 0)
 	if tier == nil {
@@ -144,14 +163,10 @@ func TestSelectTierOptional(t *testing.T) {
 
 func TestSelectTierOptionalWithSendZC(t *testing.T) {
 	profile := engine.CapabilityProfile{
-		IOUringTier:     engine.Optional,
-		CoopTaskrun:     true,
-		ProvidedBuffers: true,
-		MultishotAccept: true,
-		MultishotRecv:   true,
-		SingleIssuer:    true,
-		SQPoll:          true,
-		SendZC:          true,
+		IOUringTier: engine.Optional,
+		CoopTaskrun: true,
+		SQPoll:      true,
+		SendZC:      true,
 	}
 	tier := SelectTier(profile, 0)
 	if tier == nil {
@@ -164,13 +179,9 @@ func TestSelectTierOptionalWithSendZC(t *testing.T) {
 
 func TestSelectTierOptionalWithoutSendZC(t *testing.T) {
 	profile := engine.CapabilityProfile{
-		IOUringTier:     engine.Optional,
-		CoopTaskrun:     true,
-		ProvidedBuffers: true,
-		MultishotAccept: true,
-		MultishotRecv:   true,
-		SingleIssuer:    true,
-		SQPoll:          true,
+		IOUringTier: engine.Optional,
+		CoopTaskrun: true,
+		SQPoll:      true,
 	}
 	tier := SelectTier(profile, 0)
 	if tier == nil {
@@ -182,18 +193,14 @@ func TestSelectTierOptionalWithoutSendZC(t *testing.T) {
 }
 
 func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
-	// SQPOLL + DEFER_TASKRUN is incompatible (kernel returns EINVAL).
-	// Optional tier must always use COOP_TASKRUN regardless of DeferTaskrun profile.
+	// SQPOLL is incompatible with both DEFER_TASKRUN and COOP_TASKRUN.
+	// SQPOLL path must use neither IPI-related flag.
 	profile := engine.CapabilityProfile{
-		IOUringTier:     engine.Optional,
-		CoopTaskrun:     true,
-		ProvidedBuffers: true,
-		MultishotAccept: true,
-		MultishotRecv:   true,
-		SingleIssuer:    true,
-		SQPoll:          true,
-		DeferTaskrun:    true,
-		FixedFiles:      true,
+		IOUringTier:  engine.Optional,
+		CoopTaskrun:  true,
+		SQPoll:       true,
+		DeferTaskrun: true,
+		FixedFiles:   true,
 	}
 	tier := SelectTier(profile, 0)
 	if tier == nil {
@@ -203,14 +210,14 @@ func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
 	if flags&setupDeferTaskrun != 0 {
 		t.Error("DEFER_TASKRUN must not be set with SQPOLL (incompatible)")
 	}
-	if flags&setupCoopTaskrun == 0 {
-		t.Error("expected COOP_TASKRUN with SQPOLL")
+	if flags&setupCoopTaskrun != 0 {
+		t.Error("COOP_TASKRUN must not be set with SQPOLL (incompatible)")
 	}
 	if flags&setupSQPoll == 0 {
 		t.Error("expected SQPOLL in setup flags")
 	}
-	if !tier.SupportsFixedFiles() {
-		t.Error("expected fixed files support")
+	if tier.SupportsFixedFiles() {
+		t.Error("fixed files should be disabled (TCP_NODELAY bug)")
 	}
 }
 

@@ -407,6 +407,21 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
+		// Immediate submit (non-SQPOLL): flush all SENDs from CQE
+		// processing, dirty list retries, and H2 async drain to the
+		// kernel NOW instead of deferring to the next iteration's
+		// adaptive submit. Without this, responses sit in the SQ ring
+		// for an entire iteration (~50-200μs), creating pipeline stalls
+		// for H2 multiplexed streams where clients wait for responses
+		// before sending more requests. The extra Submit() syscall
+		// (~300ns) is far cheaper than the stall it prevents.
+		if !w.sqpoll && w.ring.Pending() > 0 {
+			if _, err := w.ring.Submit(); err != nil {
+				w.shutdown()
+				return
+			}
+		}
+
 		// Check connection timeouts every 1024 iterations to amortize
 		// time.Now() cost. Scans active connections directly — no timer
 		// wheel entries, no allocations, no map writes on the hot path.

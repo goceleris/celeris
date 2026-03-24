@@ -34,6 +34,18 @@ func (fb *frameBuffer) hasCompleteFrame() bool {
 	return uint32(len(b)) >= 9+length
 }
 
+// hasMoreThanOneFrame checks if the buffer contains more than one complete frame.
+// Used to suppress inline handler execution when subsequent frames need processing.
+func (fb *frameBuffer) hasMoreThanOneFrame() bool {
+	b := fb.Bytes()
+	if len(b) < 9 {
+		return false
+	}
+	firstLen := uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+	consumed := 9 + firstLen
+	return uint32(len(b)) > consumed+8 // room for at least another 9-byte header
+}
+
 // H2Config holds H2 connection configuration.
 type H2Config struct {
 	MaxConcurrentStreams uint32
@@ -145,6 +157,56 @@ var h2StreamEncoderPool = sync.Pool{
 	},
 }
 
+var (
+	hpackStatus200   []byte // :status: 200
+	hpackCTTextPlain []byte // content-type: text/plain
+	hpackCTAppJSON   []byte // content-type: application/json
+)
+
+func init() {
+	enc := &h2StreamEncoder{}
+	enc.hpackEnc = hpack.NewEncoder(&enc.hpackBuf)
+	enc.hpackEnc.SetMaxDynamicTableSize(0)
+
+	enc.hpackBuf.Reset()
+	_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	hpackStatus200 = append([]byte(nil), enc.hpackBuf.Bytes()...)
+
+	enc.hpackBuf.Reset()
+	_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
+	hpackCTTextPlain = append([]byte(nil), enc.hpackBuf.Bytes()...)
+
+	enc.hpackBuf.Reset()
+	_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/json"})
+	hpackCTAppJSON = append([]byte(nil), enc.hpackBuf.Bytes()...)
+}
+
+// appendHPACKContentLength manually encodes "content-length: <value>" in HPACK
+// format (literal without indexing, indexed name). This avoids the full HPACK
+// encoder's static table lookup and Huffman decision overhead (~100-200ns).
+// content-length is static table index 28.
+func appendHPACKContentLength(buf *bytes.Buffer, value string) {
+	// Literal header field without indexing (0000 prefix), indexed name.
+	// Index 28 with 4-bit prefix: 28 > 14, so multi-byte: 0x0f, 28-15=13.
+	buf.Write([]byte{0x0f, 0x0d})
+	// Value: length-prefixed string, no Huffman (short digit strings are
+	// not compressible). Bit 7 = 0 (no Huffman), bits 6-0 = length.
+	n := len(value)
+	if n < 127 {
+		buf.WriteByte(byte(n))
+	} else {
+		// Multi-byte length (7-bit prefix overflow). Rare for content-length.
+		buf.WriteByte(0x7f)
+		rem := n - 127
+		for rem >= 128 {
+			buf.WriteByte(byte(rem&0x7f) | 0x80)
+			rem >>= 7
+		}
+		buf.WriteByte(byte(rem))
+	}
+	buf.WriteString(value)
+}
+
 func getH2StreamEncoder() *h2StreamEncoder {
 	return h2StreamEncoderPool.Get().(*h2StreamEncoder)
 }
@@ -182,6 +244,30 @@ const (
 	h2FlagEndStream  byte = 0x01
 	h2FlagEndHeaders byte = 0x04
 )
+
+// writeH2FrameHeader writes a 9-byte H2 frame header directly to a Buffer.
+// For HEADERS frames, sets END_HEADERS. For DATA/HEADERS with endStream, sets END_STREAM.
+// Used by inline response adapters to avoid intermediate slice allocations.
+func writeH2FrameHeader(buf *bytes.Buffer, frameType byte, endStream bool, streamID uint32, payloadLen int) {
+	var flags byte
+	if endStream {
+		flags |= h2FlagEndStream
+	}
+	if frameType == h2FrameHeaders {
+		flags |= h2FlagEndHeaders
+	}
+	var hdr [9]byte
+	hdr[0] = byte(payloadLen >> 16)
+	hdr[1] = byte(payloadLen >> 8)
+	hdr[2] = byte(payloadLen)
+	hdr[3] = frameType
+	hdr[4] = flags
+	hdr[5] = byte(streamID >> 24)
+	hdr[6] = byte(streamID >> 16)
+	hdr[7] = byte(streamID >> 8)
+	hdr[8] = byte(streamID)
+	buf.Write(hdr[:])
+}
 
 // appendH2Frame appends a raw H2 frame (9-byte header + payload) to buf.
 func appendH2Frame(buf []byte, frameType byte, flags byte, streamID uint32, payload []byte) []byte {
@@ -243,16 +329,17 @@ func appendH2Data(buf []byte, streamID uint32, endStream bool, data []byte) []by
 
 // H2State holds per-connection H2 state.
 type H2State struct {
-	initialized bool
-	processor   *stream.Processor
-	parser      *frame.Parser
-	writer      *frame.Writer
-	outBuf      *bytes.Buffer
-	inBuf       *frameBuffer
-	mu          sync.Mutex
-	adapter     *h2ResponseAdapter
-	writeQueue  *h2ShardedQueue
-	cfg         H2Config // cached with defaults applied
+	initialized   bool
+	processor     *stream.Processor
+	parser        *frame.Parser
+	writer        *frame.Writer
+	outBuf        *bytes.Buffer
+	inBuf         *frameBuffer
+	mu            sync.Mutex
+	adapter       *h2ResponseAdapter
+	inlineAdapter *h2InlineResponseAdapter
+	writeQueue    *h2ShardedQueue
+	cfg           H2Config // cached with defaults applied
 }
 
 // SetRemoteAddr sets the remote address on the H2 stream manager so that
@@ -295,7 +382,15 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 		maxFrameSize: cfg.MaxFrameSize,
 	}
 
+	inlineRW := &h2InlineResponseAdapter{
+		outBuf:       &outBuf,
+		maxFrameSize: cfg.MaxFrameSize,
+	}
+	inlineRW.enc.hpackEnc = hpack.NewEncoder(&inlineRW.enc.hpackBuf)
+	inlineRW.enc.hpackEnc.SetMaxDynamicTableSize(0)
+
 	proc := stream.NewProcessor(handler, fw, rw)
+	proc.InlineWriter = inlineRW
 
 	p := frame.NewParser()
 	p.InitReader(&inBuf)
@@ -303,21 +398,21 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	proc.GetManager().SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
 
 	return &H2State{
-		processor:  proc,
-		parser:     p,
-		writer:     fw,
-		outBuf:     &outBuf,
-		inBuf:      &inBuf,
-		adapter:    rw,
-		writeQueue: wq,
-		cfg:        cfg,
+		processor:     proc,
+		parser:        p,
+		writer:        fw,
+		outBuf:        &outBuf,
+		inBuf:         &inBuf,
+		adapter:       rw,
+		inlineAdapter: inlineRW,
+		writeQueue:    wq,
+		cfg:           cfg,
 	}
 }
 
 // ProcessH2 processes incoming H2 data.
 // On first call, validates the client preface and sends server settings.
-// After frame processing, drains the async write queue for handler goroutine
-// responses that completed during parsing.
+// PING, SETTINGS ACK) and falls back to x/net framer for complex types.
 func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handler,
 	write func([]byte), _ H2Config) error {
 
@@ -357,19 +452,19 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 		return nil
 	}
 
-	// Write data to the input buffer, then drain all complete frames.
-	// We check hasCompleteFrame before ReadNextFrame to avoid the x/net
-	// framer consuming partial frame data on TCP segment boundaries
-	// (which causes io.ErrUnexpectedEOF and kills the connection).
 	state.inBuf.Write(data)
 
 	for state.inBuf.hasCompleteFrame() {
+		// Tell the processor if more frames follow in this recv buffer.
+		// When true, canRunInline returns false to avoid sending the
+		// response before subsequent frames (WINDOW_UPDATE, PRIORITY)
+		// are processed — required for h2spec compliance.
+		state.processor.SetHasMoreFrames(state.inBuf.hasMoreThanOneFrame())
 		f, err := state.parser.ReadNextFrame()
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			// RFC 7540 §5.4.1: send GOAWAY before closing on connection errors.
 			if ce, ok := err.(http2.ConnectionError); ok {
 				_ = state.processor.SendGoAway(
 					state.processor.GetManager().GetLastStreamID(),
@@ -387,13 +482,21 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 			return err
 		}
 		flushOutBuf(state.outBuf, write)
+		// Drain inline handler responses immediately so they're sent in the
+		// same event loop iteration. Without this, responses queue up and
+		// never flush until the frame loop exits (starving h2load clients).
+		if state.writeQueue.pending.Load() {
+			state.writeQueue.DrainTo(write)
+		}
 	}
+
+	// Clean up inline-completed streams that were deferred during the
+	// frame loop (pending outbound data or more frames to process).
+	state.processor.FlushInlineCleanup()
 
 	state.mu.Unlock()
 
 	// Drain async handler responses that completed during frame parsing.
-	// Most goroutines finish within the ~100-300μs parsing window, so this
-	// drain captures the bulk of responses in the same event loop iteration.
 	state.DrainWriteQueue(write)
 
 	return nil

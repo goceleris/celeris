@@ -22,6 +22,8 @@ func applyFD(fd int, opts Options) error {
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, micros); err != nil {
 			return err
 		}
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, 69, 1) // SO_PREFER_BUSY_POLL
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, 70, 8) // SO_BUSY_POLL_BUDGET
 	}
 	if opts.RecvBuf > 0 {
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, opts.RecvBuf); err != nil {

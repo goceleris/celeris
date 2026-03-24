@@ -23,6 +23,17 @@ func CPUForNode(_ int) int {
 	return 0
 }
 
+// NUMATopology holds detected NUMA topology information.
+type NUMATopology struct {
+	NumNodes int
+	NodeCPUs [][]int
+}
+
+// DetectNUMA returns a single-node topology on non-Linux platforms.
+func DetectNUMA() NUMATopology {
+	return NUMATopology{NumNodes: 1}
+}
+
 // DistributeWorkers returns CPU IDs for numWorkers using round-robin.
 func DistributeWorkers(numWorkers, numCPU, _ int) []int {
 	if numCPU <= 0 {

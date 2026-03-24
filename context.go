@@ -84,7 +84,6 @@ func acquireContext(s *stream.Stream) *Context {
 	} else {
 		c = contextPool.Get().(*Context)
 		// Cache on the stream for per-connection reuse (H1 keep-alive).
-		// H2 streams are not cached, so CachedCtx stays nil.
 		if s.CachedCtx == nil {
 			s.CachedCtx = c
 		}

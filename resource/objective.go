@@ -52,7 +52,7 @@ func ResolveObjective(profile ObjectiveProfile) ObjectiveParams {
 	case ThroughputOptimized:
 		return ObjectiveParams{
 			EpollTimeout: 10 * time.Millisecond,
-			SOBusyPoll:   0,
+			SOBusyPoll:   50 * time.Microsecond,
 			BufferSize:   65536,
 			SQERingScale: 2,
 			SQPollIdle:   1000 * time.Millisecond,

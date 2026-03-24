@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/goceleris/celeris"
@@ -25,6 +26,11 @@ func main() {
 	objName := envOr("OBJECTIVE", "latency")
 	protoName := envOr("PROTOCOL", "h1")
 	port := envOr("PORT", "18080")
+
+	// Increase CPU profile sampling rate 10x (1KHz vs default 100Hz).
+	// Custom engines (epoll/io_uring) spend >90% in kernel syscalls;
+	// the default 100Hz rate captures near-zero userspace samples.
+	runtime.SetCPUProfileRate(1000)
 
 	// pprof server on separate port
 	go func() {
