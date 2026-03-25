@@ -12,12 +12,12 @@ import (
 type Protocol engine.Protocol
 
 const (
+	// Auto enables automatic protocol detection between HTTP/1.1 and H2C (default).
+	Auto Protocol = Protocol(engine.Auto)
 	// HTTP1 selects HTTP/1.1 only.
 	HTTP1 Protocol = Protocol(engine.HTTP1)
 	// H2C selects HTTP/2 cleartext (h2c) only.
 	H2C Protocol = Protocol(engine.H2C)
-	// Auto enables automatic protocol detection between HTTP/1.1 and H2C.
-	Auto Protocol = Protocol(engine.Auto)
 )
 
 // String returns the protocol name.
@@ -27,12 +27,12 @@ func (p Protocol) String() string { return engine.Protocol(p).String() }
 type EngineType engine.EngineType
 
 const (
-	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.10+ required).
-	IOUring EngineType = EngineType(engine.IOUring)
+	// Adaptive dynamically switches between Epoll and IOUring based on load (default on Linux).
+	Adaptive EngineType = EngineType(engine.Adaptive)
 	// Epoll uses Linux edge-triggered epoll for I/O (Linux only).
 	Epoll EngineType = EngineType(engine.Epoll)
-	// Adaptive dynamically switches between IOUring and Epoll based on load (Linux only).
-	Adaptive EngineType = EngineType(engine.Adaptive)
+	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.10+ required).
+	IOUring EngineType = EngineType(engine.IOUring)
 	// Std uses Go's net/http standard library server (all platforms).
 	Std EngineType = EngineType(engine.Std)
 )
@@ -40,34 +40,17 @@ const (
 // String returns the engine type name.
 func (t EngineType) String() string { return engine.EngineType(t).String() }
 
-// Objective selects a tuning profile that controls I/O and networking parameters.
-type Objective resource.ObjectiveProfile
-
-const (
-	// Balanced targets a balance between latency and throughput (default).
-	Balanced Objective = Objective(resource.BalancedObjective)
-	// Latency optimizes for minimum response latency.
-	Latency Objective = Objective(resource.LatencyOptimized)
-	// Throughput optimizes for maximum requests per second.
-	Throughput Objective = Objective(resource.ThroughputOptimized)
-)
-
-// String returns the objective name.
-func (o Objective) String() string { return resource.ObjectiveProfile(o).String() }
-
 // Config holds the public server configuration.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
 	Addr string
-	// Protocol is the HTTP protocol version (default HTTP1).
+	// Protocol is the HTTP protocol version (default Auto — auto-detect H1/H2).
 	Protocol Protocol
-	// Engine is the I/O engine (default Std; IOUring, Epoll, Adaptive require Linux).
+	// Engine is the I/O engine (default Adaptive on Linux, Std elsewhere).
 	Engine EngineType
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
 	Workers int
-	// Objective is the tuning profile (default Balanced).
-	Objective Objective
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (300s). Set to -1 for no timeout.
@@ -165,7 +148,6 @@ func (c Config) toResourceConfig() resource.Config {
 		rc.Resources.MaxConns = c.MaxConns
 	}
 
-	rc.Objective = resource.ObjectiveProfile(c.Objective)
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
 

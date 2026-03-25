@@ -34,8 +34,11 @@ const fixedFileTableSize = 65536
 const bufRingGroupID = 0
 
 // bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2.
-const bufRingCount = 4096
+// Must be a power of 2. 512 supports 512 concurrent in-flight multishot
+// recvs per worker (more than enough). Keeps total memory manageable on
+// high-core-count machines (512 * 64KB = 32 MB per worker; 64 workers = 2 GB).
+// Previous value of 4096 caused 16-25 GB RSS on 64-96 vCPU metal instances.
+const bufRingCount = 512
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
@@ -51,7 +54,6 @@ type Worker struct {
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
 	handler      stream.Handler
-	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
 	bufRing      *BufferRing // ring-mapped provided buffers for multishot recv
@@ -80,7 +82,7 @@ type Worker struct {
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
-	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
+	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
 	acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
@@ -99,7 +101,6 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		sendZC:       tier.SupportsSendZC(),
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
-		objective:    objective,
 		resolved:     resolved,
 		cfg:          cfg,
 		logger:       cfg.Logger,
@@ -115,9 +116,9 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 		},
 		sockOpts: sockopts.Options{
-			TCPNoDelay:  objective.TCPNoDelay,
-			TCPQuickAck: objective.TCPQuickAck,
-			SOBusyPoll:  objective.SOBusyPoll,
+			TCPNoDelay:  true,
+			TCPQuickAck: true,
+			SOBusyPoll:  50 * time.Microsecond,
 			RecvBuf:     resolved.SocketRecv,
 			SendBuf:     resolved.SocketSend,
 		},

@@ -45,8 +45,6 @@ func main() {
 
 	engines := []celeris.EngineType{celeris.IOUring, celeris.Epoll}
 	engineNames := []string{"iouring", "epoll"}
-	objectives := []celeris.Objective{celeris.Latency, celeris.Throughput, celeris.Balanced}
-	objectiveNames := []string{"latency", "throughput", "balanced"}
 
 	type result struct {
 		name string
@@ -56,19 +54,17 @@ func main() {
 	var results []result
 
 	for ei, eng := range engines {
-		for oi, obj := range objectives {
-			name := fmt.Sprintf("%s-%s", engineNames[ei], objectiveNames[oi])
-			if filter != "" && !strings.Contains(name, filter) {
-				continue
-			}
-			rps, errs := runTest(name, eng, obj)
-			results = append(results, result{name, rps, errs})
-			status := "PASS"
-			if errs > 0 {
-				status = "FAIL"
-			}
-			log.Printf("[%s] %s: %.0f rps, %d errors", status, name, rps, errs)
+		name := engineNames[ei]
+		if filter != "" && !strings.Contains(name, filter) {
+			continue
 		}
+		rps, errs := runTest(name, eng)
+		results = append(results, result{name, rps, errs})
+		status := "PASS"
+		if errs > 0 {
+			status = "FAIL"
+		}
+		log.Printf("[%s] %s: %.0f rps, %d errors", status, name, rps, errs)
 	}
 
 	fmt.Println("\n===== SUMMARY =====")
@@ -77,12 +73,11 @@ func main() {
 	}
 }
 
-func runTest(name string, eng celeris.EngineType, obj celeris.Objective) (float64, int64) {
+func runTest(name string, eng celeris.EngineType) (float64, int64) {
 	s := celeris.New(celeris.Config{
 		Addr:           ":" + port,
 		Protocol:       celeris.HTTP1,
 		Engine:         eng,
-		Objective:      obj,
 		DisableMetrics: true,
 	})
 

@@ -46,8 +46,6 @@ var duration = func() time.Duration {
 
 var engines = []celeris.EngineType{celeris.IOUring, celeris.Epoll, celeris.Std}
 var engineNames = []string{"iouring", "epoll", "std"}
-var objectives = []celeris.Objective{celeris.Latency, celeris.Throughput, celeris.Balanced}
-var objectiveNames = []string{"latency", "throughput", "balanced"}
 var protocols = []celeris.Protocol{celeris.HTTP1, celeris.H2C, celeris.Auto}
 var protocolNames = []string{"h1", "h2", "hybrid"}
 
@@ -68,28 +66,26 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	filter := os.Getenv("CELERIS_FILTER")
 
-	results := make([]testResult, 0, len(engines)*len(objectives)*len(protocols))
+	results := make([]testResult, 0, len(engines)*len(protocols))
 
 	for ei, eng := range engines {
-		for oi, obj := range objectives {
-			for pi, proto := range protocols {
-				name := fmt.Sprintf("celeris-%s-%s-%s", engineNames[ei], objectiveNames[oi], protocolNames[pi])
-				if filter != "" && !strings.Contains(name, filter) {
-					continue
-				}
-				log.Printf("========== %s ==========", name)
-				r := runTest(name, eng, obj, proto)
-				results = append(results, r)
-				status := r.status
-				switch r.status {
-				case "FAIL":
-					status = "\033[31mFAIL\033[0m"
-				case "PASS":
-					status = "\033[32mPASS\033[0m"
-				}
-				log.Printf("[%s] %s: %d reqs, %d errs, %s — %s",
-					status, r.name, r.requests, r.errors, r.duration.Round(time.Millisecond), r.detail)
+		for pi, proto := range protocols {
+			name := fmt.Sprintf("celeris-%s-%s", engineNames[ei], protocolNames[pi])
+			if filter != "" && !strings.Contains(name, filter) {
+				continue
 			}
+			log.Printf("========== %s ==========", name)
+			r := runTest(name, eng, proto)
+			results = append(results, r)
+			status := r.status
+			switch r.status {
+			case "FAIL":
+				status = "\033[31mFAIL\033[0m"
+			case "PASS":
+				status = "\033[32mPASS\033[0m"
+			}
+			log.Printf("[%s] %s: %d reqs, %d errs, %s — %s",
+				status, r.name, r.requests, r.errors, r.duration.Round(time.Millisecond), r.detail)
 		}
 	}
 
@@ -110,12 +106,11 @@ func main() {
 	}
 }
 
-func runTest(name string, eng celeris.EngineType, obj celeris.Objective, proto celeris.Protocol) testResult {
+func runTest(name string, eng celeris.EngineType, proto celeris.Protocol) testResult {
 	s := celeris.New(celeris.Config{
 		Addr:           ":0",
 		Protocol:       proto,
 		Engine:         eng,
-		Objective:      obj,
 		DisableMetrics: true,
 	})
 

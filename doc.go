@@ -168,12 +168,6 @@
 // # Configuration
 //
 // Config.Workers controls the number of I/O workers (default: GOMAXPROCS).
-// Config.Objective selects a tuning profile:
-//
-//	celeris.Latency     // Optimize for minimum response time
-//	celeris.Throughput  // Optimize for maximum requests per second
-//	celeris.Balanced    // Balance between latency and throughput (default)
-//
 // Config.ShutdownTimeout sets the graceful shutdown deadline for
 // StartWithContext (default: 30s).
 //
@@ -507,9 +501,8 @@
 //	    Protocol: celeris.Auto,        // HTTP1, H2C, or Auto
 //	    Engine:   celeris.Adaptive,    // IOUring, Epoll, Adaptive, Std
 //
-//	    // Workers & Tuning
+//	    // Workers
 //	    Workers:   0,                  // I/O workers (default GOMAXPROCS)
-//	    Objective: celeris.Balanced,   // Latency, Throughput, Balanced
 //
 //	    // Timeouts (0 = default: 300s read/write, 600s idle; -1 = no timeout)
 //	    ReadTimeout:     0,

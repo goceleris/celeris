@@ -23,7 +23,6 @@ type jsonMsg struct {
 
 func main() {
 	engName := envOr("ENGINE", "iouring")
-	objName := envOr("OBJECTIVE", "latency")
 	protoName := envOr("PROTOCOL", "h1")
 	port := envOr("PORT", "18080")
 
@@ -50,18 +49,6 @@ func main() {
 		log.Fatalf("unknown engine: %s", engName)
 	}
 
-	var obj celeris.Objective
-	switch objName {
-	case "latency":
-		obj = celeris.Latency
-	case "throughput":
-		obj = celeris.Throughput
-	case "balanced":
-		obj = celeris.Balanced
-	default:
-		log.Fatalf("unknown objective: %s", objName)
-	}
-
 	var proto celeris.Protocol
 	switch protoName {
 	case "h1":
@@ -78,7 +65,6 @@ func main() {
 		Addr:           ":" + port,
 		Protocol:       proto,
 		Engine:         eng,
-		Objective:      obj,
 		DisableMetrics: true,
 	})
 
@@ -102,7 +88,7 @@ func main() {
 		cancel()
 	}()
 
-	log.Printf("Starting profiled %s-%s-%s on :%s", engName, objName, protoName, port)
+	log.Printf("Starting profiled %s-%s on :%s", engName, protoName, port)
 	if err := s.StartWithContext(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("listen: %v", err)
 	}

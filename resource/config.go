@@ -10,13 +10,20 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
+// defaultEngine returns Adaptive on Linux and Std on other platforms.
+func defaultEngine() engine.EngineType {
+	if runtime.GOOS == "linux" {
+		return engine.Adaptive
+	}
+	return engine.Std
+}
+
 // Config holds server configuration including protocol, engine, address, and resource settings.
 type Config struct {
 	Protocol             engine.Protocol
 	Engine               engine.EngineType
 	Addr                 string
 	Resources            Resources
-	Objective            ObjectiveProfile
 	MaxHeaderBytes       int
 	MaxConcurrentStreams uint32
 	MaxFrameSize         uint32
@@ -97,6 +104,12 @@ func (c Config) Validate() []error {
 func (c Config) WithDefaults() Config {
 	if c.Addr == "" {
 		c.Addr = ":8080"
+	}
+	if c.Engine.IsDefault() {
+		c.Engine = defaultEngine()
+	}
+	if c.Protocol.IsDefault() {
+		c.Protocol = engine.Auto
 	}
 	if c.MaxFrameSize == 0 {
 		c.MaxFrameSize = 16384

@@ -46,8 +46,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 // Listen starts the epoll engine and blocks until context is canceled.
 func (e *Engine) Listen(ctx context.Context) error {
-	objective := resource.ResolveObjective(e.cfg.Objective)
-	resolved := e.cfg.Resources.Resolve(runtime.NumCPU())
+	resolved := e.cfg.Resources.Resolve()
 
 	topo := platform.DetectNUMA()
 	cpus := platform.DistributeWorkers(resolved.Workers, runtime.NumCPU(), topo.NumNodes)
@@ -63,7 +62,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	e.loops = make([]*Loop, resolved.Workers)
 	for i := range resolved.Workers {
 		l := newLoop(i, cpus[i], e.handler,
-			objective, resolved, e.cfg,
+			resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
 			&e.acceptPaused)
 		e.loops[i] = l

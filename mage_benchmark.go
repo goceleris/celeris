@@ -18,31 +18,22 @@ import (
 const benchmarkVM = "celeris-benchmark"
 
 // benchConfigs defines the server configurations to benchmark.
-// Each config specifies the engine, objective, protocol, and the external
+// Each config specifies the engine, protocol, and the external
 // load tool to use (wrk for H1, h2load for H2).
 var benchConfigs = []struct {
 	engine   string
-	objective string
 	protocol string
 	loadTool string // "wrk" or "h2load"
 }{
-	// io_uring — all objectives, H1 + H2
-	{"iouring", "latency", "h1", "wrk"},
-	{"iouring", "latency", "h2", "h2load"},
-	{"iouring", "throughput", "h1", "wrk"},
-	{"iouring", "throughput", "h2", "h2load"},
-	{"iouring", "balanced", "h1", "wrk"},
-	{"iouring", "balanced", "h2", "h2load"},
-	// epoll — all objectives, H1 + H2
-	{"epoll", "latency", "h1", "wrk"},
-	{"epoll", "latency", "h2", "h2load"},
-	{"epoll", "throughput", "h1", "wrk"},
-	{"epoll", "throughput", "h2", "h2load"},
-	{"epoll", "balanced", "h1", "wrk"},
-	{"epoll", "balanced", "h2", "h2load"},
-	// std — latency only (control group)
-	{"std", "latency", "h1", "wrk"},
-	{"std", "latency", "h2", "h2load"},
+	// io_uring — H1 + H2
+	{"iouring", "h1", "wrk"},
+	{"iouring", "h2", "h2load"},
+	// epoll — H1 + H2
+	{"epoll", "h1", "wrk"},
+	{"epoll", "h2", "h2load"},
+	// std — control group
+	{"std", "h1", "wrk"},
+	{"std", "h2", "h2load"},
 }
 
 // loadDuration is the duration of each load run in seconds.
@@ -60,7 +51,7 @@ func h2loadArgs() string {
 
 // buildOneBenchRun generates a bash script for one benchmark run.
 // It starts the server, waits for it, runs the load tool, kills the server.
-func buildOneBenchRun(serverBin, engine, objective, protocol, loadTool string) string {
+func buildOneBenchRun(serverBin, engine, protocol, loadTool string) string {
 	var loadCmd string
 	if loadTool == "h2load" {
 		loadCmd = "taskset -c 4-7 h2load " + h2loadArgs()
@@ -74,10 +65,10 @@ func buildOneBenchRun(serverBin, engine, objective, protocol, loadTool string) s
 		"sleep 0.5",
 		// Ensure io_uring SQPOLL is allowed (Ubuntu 24.04 AppArmor restriction).
 		"echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_io_uring > /dev/null 2>&1 || true",
-		fmt.Sprintf("echo '>>> CONFIG: %s-%s-%s (%s)'", engine, objective, protocol, loadTool),
+		fmt.Sprintf("echo '>>> CONFIG: %s-%s (%s)'", engine, protocol, loadTool),
 		// Start server with output to log file.
-		fmt.Sprintf("sudo taskset -c 0-3 env ENGINE=%s OBJECTIVE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/bench/server.log 2>&1 &",
-			engine, objective, protocol, serverBin),
+		fmt.Sprintf("sudo taskset -c 0-3 env ENGINE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/bench/server.log 2>&1 &",
+			engine, protocol, serverBin),
 		"SERVER_PID=$!",
 		"sleep 3",
 		// Show tier selection for debugging.
@@ -101,7 +92,7 @@ func buildOneBenchRun(serverBin, engine, objective, protocol, loadTool string) s
 func buildBenchPassScript(serverBin string) string {
 	var parts []string
 	for _, cfg := range benchConfigs {
-		parts = append(parts, buildOneBenchRun(serverBin, cfg.engine, cfg.objective, cfg.protocol, cfg.loadTool))
+		parts = append(parts, buildOneBenchRun(serverBin, cfg.engine, cfg.protocol, cfg.loadTool))
 	}
 	return strings.Join(parts, "\n")
 }
@@ -453,7 +444,7 @@ func generateWrkH2loadReport(branchName string, mainRuns, branchRuns []map[strin
 	// Ordered config list.
 	var configs []string
 	for _, cfg := range benchConfigs {
-		name := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		name := fmt.Sprintf("%s-%s", cfg.engine, cfg.protocol)
 		if allConfigs[name] {
 			configs = append(configs, name)
 		}
@@ -506,33 +497,29 @@ func generateWrkH2loadReport(branchName string, mainRuns, branchRuns []map[strin
 
 	// Add io_uring vs epoll comparison.
 	sb.WriteString("\n--- io_uring vs epoll (branch) ---\n")
-	for _, obj := range []string{"latency", "throughput", "balanced"} {
-		for _, proto := range []string{"h1", "h2"} {
-			iouName := fmt.Sprintf("iouring-%s-%s", obj, proto)
-			epoName := fmt.Sprintf("epoll-%s-%s", obj, proto)
-			iouRPS := medianFloat64(branchVals[iouName])
-			epoRPS := medianFloat64(branchVals[epoName])
-			if epoRPS > 0 {
-				adv := (iouRPS - epoRPS) / epoRPS * 100
-				sb.WriteString(fmt.Sprintf("  %-25s: io_uring %8.0f  epoll %8.0f  %+.1f%%\n",
-					obj+"-"+proto, iouRPS, epoRPS, adv))
-			}
+	for _, proto := range []string{"h1", "h2"} {
+		iouName := fmt.Sprintf("iouring-%s", proto)
+		epoName := fmt.Sprintf("epoll-%s", proto)
+		iouRPS := medianFloat64(branchVals[iouName])
+		epoRPS := medianFloat64(branchVals[epoName])
+		if epoRPS > 0 {
+			adv := (iouRPS - epoRPS) / epoRPS * 100
+			sb.WriteString(fmt.Sprintf("  %-25s: io_uring %8.0f  epoll %8.0f  %+.1f%%\n",
+				proto, iouRPS, epoRPS, adv))
 		}
 	}
 
 	// Add H2 vs H1 comparison.
 	sb.WriteString("\n--- H2 vs H1 (branch) ---\n")
 	for _, eng := range []string{"iouring", "epoll", "std"} {
-		for _, obj := range []string{"latency", "throughput", "balanced"} {
-			h1Name := fmt.Sprintf("%s-%s-h1", eng, obj)
-			h2Name := fmt.Sprintf("%s-%s-h2", eng, obj)
-			h1RPS := medianFloat64(branchVals[h1Name])
-			h2RPS := medianFloat64(branchVals[h2Name])
-			if h1RPS > 0 && h2RPS > 0 {
-				ratio := h2RPS / h1RPS * 100
-				sb.WriteString(fmt.Sprintf("  %-25s: H2 %8.0f  H1 %8.0f  H2/H1 = %.0f%%\n",
-					eng+"-"+obj, h2RPS, h1RPS, ratio))
-			}
+		h1Name := fmt.Sprintf("%s-h1", eng)
+		h2Name := fmt.Sprintf("%s-h2", eng)
+		h1RPS := medianFloat64(branchVals[h1Name])
+		h2RPS := medianFloat64(branchVals[h2Name])
+		if h1RPS > 0 && h2RPS > 0 {
+			ratio := h2RPS / h1RPS * 100
+			sb.WriteString(fmt.Sprintf("  %-25s: H2 %8.0f  H1 %8.0f  H2/H1 = %.0f%%\n",
+				eng, h2RPS, h1RPS, ratio))
 		}
 	}
 
@@ -567,7 +554,7 @@ func generateThreeWayReport(branchName string, mainRuns, savepointRuns, currentR
 
 	var configs []string
 	for _, cfg := range splitBenchConfigs {
-		name := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		name := fmt.Sprintf("%s-%s", cfg.engine, cfg.protocol)
 		if allConfigs[name] {
 			configs = append(configs, name)
 		}
@@ -632,33 +619,29 @@ func generateThreeWayReport(branchName string, mainRuns, savepointRuns, currentR
 
 	// io_uring vs epoll comparison (current).
 	sb.WriteString("\n--- io_uring vs epoll (current) ---\n")
-	for _, obj := range []string{"latency", "throughput", "balanced"} {
-		for _, proto := range []string{"h1", "h2"} {
-			iouName := fmt.Sprintf("iouring-%s-%s", obj, proto)
-			epoName := fmt.Sprintf("epoll-%s-%s", obj, proto)
-			iouRPS := medianFloat64(curVals[iouName])
-			epoRPS := medianFloat64(curVals[epoName])
-			if epoRPS > 0 {
-				adv := (iouRPS - epoRPS) / epoRPS * 100
-				sb.WriteString(fmt.Sprintf("  %-25s: io_uring %8.0f  epoll %8.0f  %+.1f%%\n",
-					obj+"-"+proto, iouRPS, epoRPS, adv))
-			}
+	for _, proto := range []string{"h1", "h2"} {
+		iouName := fmt.Sprintf("iouring-%s", proto)
+		epoName := fmt.Sprintf("epoll-%s", proto)
+		iouRPS := medianFloat64(curVals[iouName])
+		epoRPS := medianFloat64(curVals[epoName])
+		if epoRPS > 0 {
+			adv := (iouRPS - epoRPS) / epoRPS * 100
+			sb.WriteString(fmt.Sprintf("  %-25s: io_uring %8.0f  epoll %8.0f  %+.1f%%\n",
+				proto, iouRPS, epoRPS, adv))
 		}
 	}
 
 	// H2 vs H1 comparison (current).
 	sb.WriteString("\n--- H2 vs H1 (current) ---\n")
 	for _, eng := range []string{"iouring", "epoll", "std"} {
-		for _, obj := range []string{"latency", "throughput", "balanced"} {
-			h1Name := fmt.Sprintf("%s-%s-h1", eng, obj)
-			h2Name := fmt.Sprintf("%s-%s-h2", eng, obj)
-			h1RPS := medianFloat64(curVals[h1Name])
-			h2RPS := medianFloat64(curVals[h2Name])
-			if h1RPS > 0 && h2RPS > 0 {
-				ratio := h2RPS / h1RPS * 100
-				sb.WriteString(fmt.Sprintf("  %-25s: H2 %8.0f  H1 %8.0f  H2/H1 = %.0f%%\n",
-					eng+"-"+obj, h2RPS, h1RPS, ratio))
-			}
+		h1Name := fmt.Sprintf("%s-h1", eng)
+		h2Name := fmt.Sprintf("%s-h2", eng)
+		h1RPS := medianFloat64(curVals[h1Name])
+		h2RPS := medianFloat64(curVals[h2Name])
+		if h1RPS > 0 && h2RPS > 0 {
+			ratio := h2RPS / h1RPS * 100
+			sb.WriteString(fmt.Sprintf("  %-25s: H2 %8.0f  H1 %8.0f  H2/H1 = %.0f%%\n",
+				eng, h2RPS, h1RPS, ratio))
 		}
 	}
 
@@ -670,12 +653,11 @@ var highConnCounts = []int{256, 512, 1024, 2048}
 
 // highConnConfigs defines the two configs compared in the high-connection benchmark.
 var highConnConfigs = []struct {
-	engine    string
-	objective string
-	protocol  string
+	engine   string
+	protocol string
 }{
-	{"iouring", "latency", "h1"},
-	{"epoll", "latency", "h1"},
+	{"iouring", "h1"},
+	{"epoll", "h1"},
 }
 
 // buildHighConnBenchScript generates a bash script that benchmarks io_uring vs
@@ -687,10 +669,10 @@ func buildHighConnBenchScript(serverBin string, conns int) string {
 		parts = append(parts, strings.Join([]string{
 			"sudo pkill -9 -f 'profiled-(main|current)' 2>/dev/null || true",
 			"sleep 0.5",
-			fmt.Sprintf("echo '>>> CONFIG: %s-%s-%s (wrk) CONNS=%d'",
-				cfg.engine, cfg.objective, cfg.protocol, conns),
-			fmt.Sprintf("sudo taskset -c 0-3 env ENGINE=%s OBJECTIVE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/bench/server.log 2>&1 &",
-				cfg.engine, cfg.objective, cfg.protocol, serverBin),
+			fmt.Sprintf("echo '>>> CONFIG: %s-%s (wrk) CONNS=%d'",
+				cfg.engine, cfg.protocol, conns),
+			fmt.Sprintf("sudo taskset -c 0-3 env ENGINE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/bench/server.log 2>&1 &",
+				cfg.engine, cfg.protocol, serverBin),
 			"SERVER_PID=$!",
 			"sleep 3",
 			"if ! timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/18080' 2>/dev/null; then",
@@ -759,8 +741,8 @@ func generateHighConnReport(branchName string, runs []map[string]float64) string
 	sb.WriteString(strings.Repeat("-", 72) + "\n")
 
 	for _, conns := range highConnCounts {
-		iouKey := fmt.Sprintf("iouring-latency-h1@%d", conns)
-		epoKey := fmt.Sprintf("epoll-latency-h1@%d", conns)
+		iouKey := fmt.Sprintf("iouring-h1@%d", conns)
+		epoKey := fmt.Sprintf("epoll-h1@%d", conns)
 		iouRPS := medianFloat64(allVals[iouKey])
 		epoRPS := medianFloat64(allVals[epoKey])
 		advStr := "N/A"
@@ -900,43 +882,34 @@ func CloudBenchmarkHighConn() error {
 }
 
 // splitBenchConfigs defines configs for the split-machine benchmark.
-// All engine×objective×protocol combinations for comprehensive comparison.
+// All engine×protocol combinations for comprehensive comparison.
 // H1 uses high-concurrency wrk (16384 connections) to match H2's total
 // concurrent streams (128 connections × 128 streams = 16384).
 var splitBenchConfigs = []struct {
-	engine    string
-	objective string
-	protocol  string
-	loadTool  string
+	engine   string
+	protocol string
+	loadTool string
 }{
-	// io_uring — all objectives, H1 + H2
-	{"iouring", "latency", "h1", "wrk"},
-	{"iouring", "latency", "h2", "h2load"},
-	{"iouring", "throughput", "h1", "wrk"},
-	{"iouring", "throughput", "h2", "h2load"},
-	{"iouring", "balanced", "h1", "wrk"},
-	{"iouring", "balanced", "h2", "h2load"},
-	// epoll — all objectives, H1 + H2
-	{"epoll", "latency", "h1", "wrk"},
-	{"epoll", "latency", "h2", "h2load"},
-	{"epoll", "throughput", "h1", "wrk"},
-	{"epoll", "throughput", "h2", "h2load"},
-	{"epoll", "balanced", "h1", "wrk"},
-	{"epoll", "balanced", "h2", "h2load"},
-	// std — latency only (control group)
-	{"std", "latency", "h1", "wrk"},
-	{"std", "latency", "h2", "h2load"},
+	// io_uring — H1 + H2
+	{"iouring", "h1", "wrk"},
+	{"iouring", "h2", "h2load"},
+	// epoll — H1 + H2
+	{"epoll", "h1", "wrk"},
+	{"epoll", "h2", "h2load"},
+	// std — control group
+	{"std", "h1", "wrk"},
+	{"std", "h2", "h2load"},
 }
 
 // buildSplitServerScript starts the server (no taskset — all CPUs).
 // Uses double-quotes for patterns to avoid single-quote nesting issues with SSH.
-func buildSplitServerScript(serverBin, engine, objective, protocol string) string {
+func buildSplitServerScript(serverBin, engine, protocol string) string {
 	return strings.Join([]string{
 		"sudo pkill -9 -f profiled 2>/dev/null || true",
 		"sleep 0.5",
 		"echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_io_uring > /dev/null 2>&1 || true",
-		fmt.Sprintf("sudo env ENGINE=%s OBJECTIVE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/bench/server.log 2>&1 &",
-			engine, objective, protocol, serverBin),
+		fmt.Sprintf("sudo env ENGINE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/bench/server.log 2>&1 &",
+			engine, protocol, serverBin),
 		"sleep 3",
 		"head -5 /tmp/bench/server.log 2>/dev/null || true",
 		"echo SERVER_READY",
@@ -963,11 +936,11 @@ func buildSplitPassScript(serverBin, serverIP, serverKeyPath string) string {
 		}
 
 		// Write server start script to a local temp file, scp it, then execute.
-		serverScript := buildSplitServerScript(serverBin, cfg.engine, cfg.objective, cfg.protocol)
+		serverScript := buildSplitServerScript(serverBin, cfg.engine, cfg.protocol)
 		scriptFile := fmt.Sprintf("/tmp/server-start-%d.sh", i)
 
 		parts = append(parts, strings.Join([]string{
-			fmt.Sprintf("echo '>>> CONFIG: %s-%s-%s (%s)'", cfg.engine, cfg.objective, cfg.protocol, cfg.loadTool),
+			fmt.Sprintf("echo '>>> CONFIG: %s-%s (%s)'", cfg.engine, cfg.protocol, cfg.loadTool),
 			// Write server script locally on client.
 			fmt.Sprintf("cat > %s << 'SERVEREOF'\n%s\nSERVEREOF", scriptFile, serverScript),
 			// Upload and execute on server.
