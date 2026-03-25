@@ -88,16 +88,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	e.ctrl = newController(primary, secondary, sampler, logger)
 
-	// Set initial active engine per SDD 7.5.
-	var initialActive engine.Engine
-	switch cfg.Protocol {
-	case engine.H2C:
-		initialActive = secondary
-		e.ctrl.state.activeIsPrimary = false
-	default: // HTTP1, Auto → io_uring
-		initialActive = primary
-		e.ctrl.state.activeIsPrimary = true
-	}
+	// Start with primary (epoll) for all protocols. Epoll has better H2
+	// throughput on current kernels and matches H1 performance.
+	var initialActive engine.Engine = primary
+	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
 	return e, nil
@@ -119,15 +113,8 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 
 	e.ctrl = newController(primary, secondary, sampler, logger)
 
-	var initialActive engine.Engine
-	switch cfg.Protocol {
-	case engine.H2C:
-		initialActive = secondary
-		e.ctrl.state.activeIsPrimary = false
-	default:
-		initialActive = primary
-		e.ctrl.state.activeIsPrimary = true
-	}
+	var initialActive engine.Engine = primary
+	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
 	return e
@@ -144,13 +131,13 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	wg.Go(func() {
 		if err := e.primary.Listen(innerCtx); err != nil {
-			errCh <- fmt.Errorf("primary (io_uring): %w", err)
+			errCh <- fmt.Errorf("primary (epoll): %w", err)
 		}
 	})
 
 	wg.Go(func() {
 		if err := e.secondary.Listen(innerCtx); err != nil {
-			errCh <- fmt.Errorf("secondary (epoll): %w", err)
+			errCh <- fmt.Errorf("secondary (io_uring): %w", err)
 		}
 	})
 
