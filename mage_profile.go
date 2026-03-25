@@ -14,15 +14,20 @@ import (
 const profileVM = "celeris-profile"
 
 // profileConfigs defines the configs to profile.
-// Both engines and both protocols for fast iteration cycles.
+// All 9 engine×protocol combinations for comprehensive coverage.
 var profileConfigs = []struct {
 	engine   string
 	protocol string
 }{
 	{"epoll", "h1"},
-	{"iouring", "h1"},
 	{"epoll", "h2"},
+	{"epoll", "hybrid"},
+	{"iouring", "h1"},
 	{"iouring", "h2"},
+	{"iouring", "hybrid"},
+	{"adaptive", "h1"},
+	{"adaptive", "h2"},
+	{"adaptive", "hybrid"},
 }
 
 // profileArtifacts lists the files captured per profile run.
