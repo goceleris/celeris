@@ -43,7 +43,10 @@ type Engine struct {
 	freezeCooldown time.Duration
 }
 
-// New creates a new adaptive engine with io_uring as primary and epoll as secondary.
+// New creates a new adaptive engine with epoll as primary and io_uring as secondary.
+// Epoll starts first because it has lower H2 latency on current kernels (single-pass
+// read→process→write vs io_uring's two-iteration CQE model). The controller may
+// switch to io_uring if telemetry indicates it would perform better for the workload.
 // Both sub-engines get the full resource config. This is safe because standby
 // workers are fully suspended (zero CPU, zero connections, listen sockets closed).
 func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
@@ -62,14 +65,14 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 
-	primary, err := iouring.New(cfg, handler)
-	if err != nil {
-		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
-	}
-
-	secondary, err := epoll.New(cfg, handler)
+	primary, err := epoll.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("epoll sub-engine: %w", err)
+	}
+
+	secondary, err := iouring.New(cfg, handler)
+	if err != nil {
+		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
 
 	sampler := newLiveSampler()

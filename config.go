@@ -12,12 +12,12 @@ import (
 type Protocol engine.Protocol
 
 const (
+	// Auto enables automatic protocol detection between HTTP/1.1 and H2C (default).
+	Auto Protocol = Protocol(engine.Auto)
 	// HTTP1 selects HTTP/1.1 only.
 	HTTP1 Protocol = Protocol(engine.HTTP1)
 	// H2C selects HTTP/2 cleartext (h2c) only.
 	H2C Protocol = Protocol(engine.H2C)
-	// Auto enables automatic protocol detection between HTTP/1.1 and H2C.
-	Auto Protocol = Protocol(engine.Auto)
 )
 
 // String returns the protocol name.
@@ -27,12 +27,12 @@ func (p Protocol) String() string { return engine.Protocol(p).String() }
 type EngineType engine.EngineType
 
 const (
-	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.10+ required).
-	IOUring EngineType = EngineType(engine.IOUring)
+	// Adaptive dynamically switches between Epoll and IOUring based on load (default on Linux).
+	Adaptive EngineType = EngineType(engine.Adaptive)
 	// Epoll uses Linux edge-triggered epoll for I/O (Linux only).
 	Epoll EngineType = EngineType(engine.Epoll)
-	// Adaptive dynamically switches between IOUring and Epoll based on load (Linux only).
-	Adaptive EngineType = EngineType(engine.Adaptive)
+	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.10+ required).
+	IOUring EngineType = EngineType(engine.IOUring)
 	// Std uses Go's net/http standard library server (all platforms).
 	Std EngineType = EngineType(engine.Std)
 )
@@ -44,9 +44,9 @@ func (t EngineType) String() string { return engine.EngineType(t).String() }
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
 	Addr string
-	// Protocol is the HTTP protocol version (default HTTP1).
+	// Protocol is the HTTP protocol version (default Auto — auto-detect H1/H2).
 	Protocol Protocol
-	// Engine is the I/O engine (default Std; IOUring, Epoll, Adaptive require Linux).
+	// Engine is the I/O engine (default Adaptive on Linux, Std elsewhere).
 	Engine EngineType
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
