@@ -55,7 +55,7 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
-	h1Mode                 bool   // single-threaded H1 stream; skip mutex in GetHeaders
+	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
 	flags                  atomic.Uint32
 	doneCh                 atomic.Pointer[chan struct{}]
 	phase                  Phase

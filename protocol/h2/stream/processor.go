@@ -77,7 +77,7 @@ type Processor struct {
 	currentConn          ResponseWriter
 	connWriter           ResponseWriter
 	hpackDecoder         *hpack.Decoder
-	hpackTarget          *[][2]string   // current HPACK decode target slice (avoids closure alloc per request)
+	hpackTarget          *[][2]string // current HPACK decode target slice (avoids closure alloc per request)
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
