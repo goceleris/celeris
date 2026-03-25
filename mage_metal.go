@@ -4,34 +4,18 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // benchRepoRelPath is the relative path to the benchmarks repo (sibling of celeris).
 const benchRepoRelPath = "../benchmarks"
-
-// metalServerConfigs defines all celeris server configurations to test.
-// Format: engine-objective-protocol-preset
-// This tests all engine×objective×protocol combos with both Greedy and Minimal presets.
-var metalServerConfigs = func() []metalConfig {
-	var configs []metalConfig
-	for _, eng := range []string{"iouring", "epoll", "adaptive"} {
-		for _, obj := range []string{"latency", "throughput", "balanced"} {
-			for _, proto := range []string{"h1", "h2", "hybrid"} {
-				for _, preset := range []string{"greedy", "minimal"} {
-					configs = append(configs, metalConfig{
-						engine: eng, objective: obj, protocol: proto, preset: preset,
-					})
-				}
-			}
-		}
-	}
-	return configs
-}()
 
 type metalConfig struct {
 	engine, objective, protocol, preset string
@@ -46,20 +30,35 @@ func (c metalConfig) envVars(port string) string {
 		c.engine, c.objective, c.protocol, port, c.preset)
 }
 
-// CloudMetalBenchmark runs the full celeris benchmark matrix using the benchmarks
-// repo's custom H1/H2 clients on separate EC2 instances. Tests all 54 configs
-// (3 engines × 3 objectives × 3 protocols × 2 presets) across up to 3 celeris
-// versions (v1.0.0, HEAD, current working tree).
+// buildMetalConfigs generates all engine×objective×protocol×preset combinations.
+func buildMetalConfigs() []metalConfig {
+	var configs []metalConfig
+	for _, eng := range []string{"iouring", "epoll", "adaptive"} {
+		for _, obj := range []string{"latency", "throughput", "balanced"} {
+			for _, proto := range []string{"h1", "h2", "hybrid"} {
+				for _, preset := range []string{"greedy", "minimal"} {
+					configs = append(configs, metalConfig{
+						engine: eng, objective: obj, protocol: proto, preset: preset,
+					})
+				}
+			}
+		}
+	}
+	return configs
+}
+
+// CloudMetalBenchmark runs the full celeris benchmark matrix using wrk (H1) and
+// h2load (H2) on separate EC2 instances. Tests 54 configurations (3 engines ×
+// 3 objectives × 3 protocols × 2 presets) across up to 3 celeris versions.
 //
-// Server binaries are built from test/benchmark/server/ which uses resource.Config
-// directly (not the public celeris.Config API) for full preset control.
+// Results are collected inline (like CloudBenchmarkSplit), aggregated into a
+// comparison report, and saved to results/<timestamp>-cloud-metal-benchmark/.
 //
-// Published versions (v1.0.0, tags) are fetched via the Go module proxy — no
-// worktree or local builds needed. Only "current" (uncommitted changes) uses
-// the local working tree.
+// Server binaries are built from test/benchmark/server/ which accepts PRESET
+// and WORKERS env vars for full resource control.
 //
 // Set CLOUD_ARCH=amd64|arm64 (default: arm64).
-// Set METAL_INSTANCE=c7g.4xlarge (default: same as awsInstanceType).
+// Set METAL_INSTANCE=<type> (default: same as cloud benchmark instance).
 // Set METAL_DURATION=15s (default) per benchmark.
 // Set METAL_REFS=v1.0.0,HEAD,current (default) — refs to compare.
 func CloudMetalBenchmark() error {
@@ -88,12 +87,14 @@ func CloudMetalBenchmark() error {
 	refsStr := metalEnvOr("METAL_REFS", "v1.0.0,HEAD,current")
 	refs := strings.Split(refsStr, ",")
 
+	configs := buildMetalConfigs()
+
 	fmt.Printf("Cloud Metal Benchmark: %s (%s on %s)\n", branch, arch, instanceType)
 	fmt.Printf("Refs: %v\n", refs)
-	fmt.Printf("Configs: %d (3 engines × 3 objectives × 3 protocols × 2 presets)\n", len(metalServerConfigs))
-	fmt.Printf("Duration: %s per benchmark\n\n", duration)
+	fmt.Printf("Configs: %d (3 engines × 3 objectives × 3 protocols × 2 presets)\n", len(configs))
+	fmt.Printf("Duration: %s per benchmark, %d total runs\n\n", duration, len(configs)*len(refs))
 
-	// Step 1: Build server binaries for each ref.
+	// Build server binaries for each ref.
 	serverBins := make(map[string]string)
 	for _, ref := range refs {
 		label := sanitizeRef(ref)
@@ -105,22 +106,7 @@ func CloudMetalBenchmark() error {
 		serverBins[ref] = binPath
 	}
 
-	// Step 2: Build client binary from benchmarks repo.
-	benchRepoAbs, err := filepath.Abs(benchRepoRelPath)
-	if err != nil {
-		return fmt.Errorf("resolve benchmarks repo: %w", err)
-	}
-	if _, err := os.Stat(filepath.Join(benchRepoAbs, "go.mod")); err != nil {
-		return fmt.Errorf("benchmarks repo not found at %s — clone it as a sibling: %w", benchRepoAbs, err)
-	}
-
-	clientBin := filepath.Join(dir, fmt.Sprintf("bench-%s", arch))
-	fmt.Println("Building benchmark client...")
-	if err := metalCrossCompile(benchRepoAbs, "cmd/bench", clientBin, arch); err != nil {
-		return fmt.Errorf("build bench client: %w", err)
-	}
-
-	// Step 3: Launch EC2 instances.
+	// AWS setup.
 	keyName, keyPath, err := awsCreateKeyPair(dir)
 	if err != nil {
 		return err
@@ -130,12 +116,9 @@ func CloudMetalBenchmark() error {
 		awsDeleteKeyPair(keyName)
 		return err
 	}
-	// Allow server + control ports.
-	for _, port := range []string{"8080", "9999", "18080"} {
-		_, _ = awsCLI("ec2", "authorize-security-group-ingress",
-			"--region", awsRegion, "--group-id", sgID,
-			"--protocol", "tcp", "--port", port, "--source-group", sgID)
-	}
+	_, _ = awsCLI("ec2", "authorize-security-group-ingress",
+		"--region", awsRegion, "--group-id", sgID,
+		"--protocol", "tcp", "--port", "18080", "--source-group", sgID)
 
 	var allInstanceIDs []string
 	defer func() {
@@ -147,7 +130,7 @@ func CloudMetalBenchmark() error {
 		return err
 	}
 
-	// Launch server instance.
+	// Launch server.
 	serverID, serverPublicIP, err := awsLaunchInstance(ami, instanceType, keyName, sgID, arch)
 	if err != nil {
 		return err
@@ -166,21 +149,18 @@ func CloudMetalBenchmark() error {
 	serverPrivateIP = strings.TrimSpace(serverPrivateIP)
 	fmt.Printf("  Server: %s (private: %s)\n", serverPublicIP, serverPrivateIP)
 
-	// Configure server.
 	_, _ = awsSSH(serverPublicIP, keyPath, "echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_io_uring > /dev/null 2>&1")
 	_, _ = awsSSH(serverPublicIP, keyPath, "mkdir -p /tmp/metal")
 
-	// Upload server binaries.
 	for ref, bin := range serverBins {
 		label := sanitizeRef(ref)
-		remote := fmt.Sprintf("/tmp/metal/server-%s", label)
-		if err := awsSCP(bin, remote, serverPublicIP, keyPath); err != nil {
+		if err := awsSCP(bin, fmt.Sprintf("/tmp/metal/server-%s", label), serverPublicIP, keyPath); err != nil {
 			return fmt.Errorf("upload server %s: %w", ref, err)
 		}
 	}
 	_, _ = awsSSH(serverPublicIP, keyPath, "chmod +x /tmp/metal/server-*")
 
-	// Launch client instance.
+	// Launch client.
 	clientID, clientPublicIP, err := awsLaunchInstance(ami, instanceType, keyName, sgID, arch)
 	if err != nil {
 		return err
@@ -191,82 +171,81 @@ func CloudMetalBenchmark() error {
 	}
 	fmt.Printf("  Client: %s\n", clientPublicIP)
 
-	// Upload client binary + SSH key.
-	_, _ = awsSSH(clientPublicIP, keyPath, "mkdir -p /tmp/metal/results")
-	if err := awsSCP(clientBin, "/tmp/metal/bench", clientPublicIP, keyPath); err != nil {
-		return err
-	}
-	_, _ = awsSSH(clientPublicIP, keyPath, "chmod +x /tmp/metal/bench")
+	fmt.Println("Installing load tools on client...")
+	_, _ = awsSSH(clientPublicIP, keyPath, "sudo apt-get update -qq && sudo apt-get install -y -qq wrk nghttp2-client 2>/dev/null")
 	if err := awsSCP(keyPath, "/tmp/server-key.pem", clientPublicIP, keyPath); err != nil {
 		return err
 	}
 	_, _ = awsSSH(clientPublicIP, keyPath, "chmod 600 /tmp/server-key.pem")
 
-	// Install wrk + h2load on client for fallback.
-	_, _ = awsSSH(clientPublicIP, keyPath, "sudo apt-get update -qq && sudo apt-get install -y -qq wrk nghttp2-client 2>/dev/null")
-
 	sshToServer := fmt.Sprintf("ssh -o StrictHostKeyChecking=no -o BatchMode=yes -i /tmp/server-key.pem ubuntu@%s", serverPrivateIP)
 
-	// Step 4: Run benchmarks for each ref — interleaved per config for fairness.
-	for i, cfg := range metalServerConfigs {
-		fmt.Printf("\n--- Config %d/%d: %s ---\n", i+1, len(metalServerConfigs), cfg.name())
+	// Collect results: map[ref]map[configName]rps
+	results := make(map[string]map[string]float64)
+	for _, ref := range refs {
+		results[ref] = make(map[string]float64)
+	}
+	var failures []string
+
+	// Run benchmarks — interleaved per config for fairness.
+	run := 0
+	for i, cfg := range configs {
+		fmt.Printf("\n--- Config %d/%d: %s ---\n", i+1, len(configs), cfg.name())
 
 		for _, ref := range refs {
+			run++
 			label := sanitizeRef(ref)
 			serverBinRemote := fmt.Sprintf("/tmp/metal/server-%s", label)
 
-			// Start server with this config.
-			startScript := fmt.Sprintf(`#!/bin/bash
-%s 'sudo pkill -9 -f server- 2>/dev/null || true'
-sleep 1
-%s 'sudo prlimit --memlock=unlimited env %s %s > /tmp/metal/server.log 2>&1 &'
-sleep 3
-# Check server is listening
-if ! %s 'timeout 2 bash -c "echo > /dev/tcp/localhost/18080" 2>/dev/null'; then
-  echo "ERROR: server not listening"
-  %s 'cat /tmp/metal/server.log' || true
-fi
-`, sshToServer, sshToServer, cfg.envVars("18080"), serverBinRemote, sshToServer, sshToServer)
+			// Start server.
+			startScript := strings.Join([]string{
+				fmt.Sprintf("%s 'sudo pkill -9 -f server- 2>/dev/null || true'", sshToServer),
+				"sleep 1",
+				fmt.Sprintf("%s 'sudo prlimit --memlock=unlimited env %s %s > /tmp/metal/server.log 2>&1 &'",
+					sshToServer, cfg.envVars("18080"), serverBinRemote),
+				"sleep 3",
+				fmt.Sprintf("if ! %s 'timeout 2 bash -c \"echo > /dev/tcp/localhost/18080\" 2>/dev/null'; then", sshToServer),
+				"  echo 'ERROR: server not listening'",
+				fmt.Sprintf("  %s 'cat /tmp/metal/server.log' || true", sshToServer),
+				"fi",
+			}, "\n")
 
-			scriptPath := filepath.Join(dir, fmt.Sprintf("start-%s-%s.sh", cfg.name(), label))
+			scriptPath := filepath.Join(dir, fmt.Sprintf("start-%d.sh", run))
 			_ = os.WriteFile(scriptPath, []byte(startScript), 0o755)
 			if err := awsSCP(scriptPath, "/tmp/metal/start.sh", clientPublicIP, keyPath); err != nil {
 				continue
 			}
 			startOut, err := awsSSH(clientPublicIP, keyPath, "bash /tmp/metal/start.sh")
-			if err != nil {
-				fmt.Printf("  %s: server start failed: %v\n", label, err)
-				continue
-			}
-			if strings.Contains(startOut, "ERROR") {
-				fmt.Printf("  %s: %s\n", label, startOut)
+			if err != nil || strings.Contains(startOut, "ERROR") {
+				fmt.Printf("  %s: FAILED (server start)\n", label)
+				failures = append(failures, fmt.Sprintf("%s/%s: server start failed", cfg.name(), ref))
 				continue
 			}
 
-			// Determine load tool based on protocol.
+			// Run load.
 			var loadCmd string
-			switch cfg.protocol {
-			case "h2":
+			if cfg.protocol == "h2" {
 				loadCmd = fmt.Sprintf("h2load -c128 -m128 -t4 -D %s http://%s:18080/", duration, serverPrivateIP)
-			default:
+			} else {
 				loadCmd = fmt.Sprintf("wrk -t4 -c256 -d%s --latency http://%s:18080/", duration, serverPrivateIP)
 			}
 
-			fmt.Printf("  %s: ", label)
 			loadOut, _ := awsSSH(clientPublicIP, keyPath, loadCmd)
 
-			// Extract RPS from output.
-			rps := "?"
+			// Parse RPS.
+			var rps float64
 			if cfg.protocol == "h2" {
 				if m := h2loadRPSRegex.FindStringSubmatch(loadOut); m != nil {
-					rps = m[1]
+					rps, _ = strconv.ParseFloat(m[1], 64)
 				}
 			} else {
 				if m := wrkRPSRegex.FindStringSubmatch(loadOut); m != nil {
-					rps = m[1]
+					rps, _ = strconv.ParseFloat(m[1], 64)
 				}
 			}
-			fmt.Printf("%s rps\n", rps)
+
+			results[ref][cfg.name()] = rps
+			fmt.Printf("  %s: %.0f rps\n", label, rps)
 
 			// Stop server.
 			_, _ = awsSSH(clientPublicIP, keyPath, fmt.Sprintf("%s 'sudo pkill -9 -f server- 2>/dev/null || true'", sshToServer))
@@ -274,20 +253,178 @@ fi
 		}
 	}
 
-	fmt.Printf("\nResults saved to: %s\n", dir)
+	// Generate report.
+	report := generateMetalReport(branch, arch, instanceType, refs, configs, results, failures)
+	fmt.Println("\n" + report)
+
+	reportPath := filepath.Join(dir, fmt.Sprintf("report-%s.txt", arch))
+	_ = os.WriteFile(reportPath, []byte(report), 0o644)
+	fmt.Printf("Report saved to: %s\n", reportPath)
+
 	return nil
 }
 
-// buildMetalServer builds the test/benchmark/server binary for a specific
-// celeris ref. For published versions, uses the Go module proxy. For "current",
-// uses the local working tree.
-func buildMetalServer(ref, outputPath, arch string) error {
-	if ref == "current" {
-		// Build from current working tree.
-		return crossCompile("test/benchmark/server", outputPath, arch)
+// generateMetalReport builds the comparison report from collected results.
+func generateMetalReport(branch, arch, instance string, refs []string, configs []metalConfig, results map[string]map[string]float64, failures []string) string {
+	var sb strings.Builder
+
+	sb.WriteString("Celeris Metal Benchmark Report\n")
+	sb.WriteString(fmt.Sprintf("Branch: %s (%s on %s)\n", branch, arch, instance))
+	sb.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("Refs: %s\n", strings.Join(refs, ", ")))
+	sb.WriteString(fmt.Sprintf("Configs: %d\n\n", len(configs)))
+
+	// Header row.
+	header := fmt.Sprintf("%-40s", "Config")
+	for _, ref := range refs {
+		header += fmt.Sprintf(" | %14s", ref)
+	}
+	if len(refs) >= 2 {
+		header += fmt.Sprintf(" | %8s", "delta")
+	}
+	sb.WriteString(header + "\n")
+	sb.WriteString(strings.Repeat("-", len(header)+5) + "\n")
+
+	// Sort configs by name for consistent output.
+	sorted := make([]metalConfig, len(configs))
+	copy(sorted, configs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].name() < sorted[j].name() })
+
+	improved, neutral, regressed := 0, 0, 0
+	var totalDelta float64
+	counted := 0
+
+	for _, cfg := range sorted {
+		row := fmt.Sprintf("%-40s", cfg.name())
+		rpsList := make([]float64, len(refs))
+		for i, ref := range refs {
+			rps := results[ref][cfg.name()]
+			rpsList[i] = rps
+			if rps > 0 {
+				row += fmt.Sprintf(" | %14.0f", rps)
+			} else {
+				row += fmt.Sprintf(" | %14s", "FAIL")
+			}
+		}
+
+		if len(refs) >= 2 {
+			first := rpsList[0]
+			last := rpsList[len(rpsList)-1]
+			if first > 0 && last > 0 {
+				delta := (last - first) / first * 100
+				row += fmt.Sprintf(" | %+7.1f%%", delta)
+				totalDelta += delta
+				counted++
+				if math.Abs(delta) < 2.0 {
+					neutral++
+				} else if delta > 0 {
+					improved++
+				} else {
+					regressed++
+				}
+			} else {
+				row += fmt.Sprintf(" | %8s", "N/A")
+			}
+		}
+		sb.WriteString(row + "\n")
 	}
 
-	// Build from a specific ref using git worktree.
+	sb.WriteString(strings.Repeat("-", 100) + "\n")
+	avgDelta := 0.0
+	if counted > 0 {
+		avgDelta = totalDelta / float64(counted)
+	}
+	sb.WriteString(fmt.Sprintf("\nSummary (%s vs %s): %d improved, %d neutral, %d regressed (avg: %+.1f%%)\n",
+		refs[0], refs[len(refs)-1], improved, neutral, regressed, avgDelta))
+
+	// Per-engine summary.
+	sb.WriteString("\n--- Per-engine averages ---\n")
+	for _, eng := range []string{"iouring", "epoll", "adaptive"} {
+		var sum float64
+		var n int
+		for _, cfg := range sorted {
+			if cfg.engine != eng {
+				continue
+			}
+			if len(refs) < 2 {
+				continue
+			}
+			first := results[refs[0]][cfg.name()]
+			last := results[refs[len(refs)-1]][cfg.name()]
+			if first > 0 && last > 0 {
+				sum += (last - first) / first * 100
+				n++
+			}
+		}
+		if n > 0 {
+			sb.WriteString(fmt.Sprintf("  %-12s: %+.1f%% (%d configs)\n", eng, sum/float64(n), n))
+		}
+	}
+
+	// Per-protocol summary.
+	sb.WriteString("\n--- Per-protocol averages ---\n")
+	for _, proto := range []string{"h1", "h2", "hybrid"} {
+		var sum float64
+		var n int
+		for _, cfg := range sorted {
+			if cfg.protocol != proto {
+				continue
+			}
+			if len(refs) < 2 {
+				continue
+			}
+			first := results[refs[0]][cfg.name()]
+			last := results[refs[len(refs)-1]][cfg.name()]
+			if first > 0 && last > 0 {
+				sum += (last - first) / first * 100
+				n++
+			}
+		}
+		if n > 0 {
+			sb.WriteString(fmt.Sprintf("  %-12s: %+.1f%% (%d configs)\n", proto, sum/float64(n), n))
+		}
+	}
+
+	// Per-preset summary.
+	sb.WriteString("\n--- Per-preset averages ---\n")
+	for _, preset := range []string{"greedy", "minimal"} {
+		var sum float64
+		var n int
+		for _, cfg := range sorted {
+			if cfg.preset != preset {
+				continue
+			}
+			if len(refs) < 2 {
+				continue
+			}
+			first := results[refs[0]][cfg.name()]
+			last := results[refs[len(refs)-1]][cfg.name()]
+			if first > 0 && last > 0 {
+				sum += (last - first) / first * 100
+				n++
+			}
+		}
+		if n > 0 {
+			sb.WriteString(fmt.Sprintf("  %-12s: %+.1f%% (%d configs)\n", preset, sum/float64(n), n))
+		}
+	}
+
+	// Failures.
+	if len(failures) > 0 {
+		sb.WriteString(fmt.Sprintf("\n--- Failures (%d) ---\n", len(failures)))
+		for _, f := range failures {
+			sb.WriteString(fmt.Sprintf("  %s\n", f))
+		}
+	}
+
+	return sb.String()
+}
+
+// buildMetalServer builds test/benchmark/server for a celeris ref.
+func buildMetalServer(ref, outputPath, arch string) error {
+	if ref == "current" {
+		return crossCompile("test/benchmark/server", outputPath, arch)
+	}
 	return crossCompileFromRef(ref, "test/benchmark/server", outputPath, arch)
 }
 
@@ -299,9 +436,7 @@ func metalCrossCompile(repoDir, pkg, outputPath, arch string) error {
 	}
 	cmd := exec.Command("go", "build", "-o", absOutput, "./"+pkg)
 	cmd.Dir = repoDir
-	cmd.Env = append(os.Environ(),
-		"GOOS=linux", "GOARCH="+arch, "CGO_ENABLED=0",
-	)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+arch, "CGO_ENABLED=0")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
