@@ -53,12 +53,30 @@ func main() {
 		log.Fatalf("unknown protocol: %s", protoName)
 	}
 
+	var preset resource.ResourcePreset
+	switch envOr("PRESET", "greedy") {
+	case "greedy":
+		preset = resource.Greedy
+	case "minimal":
+		preset = resource.Minimal
+	default:
+		log.Fatalf("unknown preset: %s (use greedy or minimal)", envOr("PRESET", ""))
+	}
+
 	cfg := resource.Config{
 		Addr:      ":" + port,
 		Protocol:  proto,
 		Objective: obj,
-		Resources: resource.Resources{Preset: resource.Greedy},
+		Resources: resource.Resources{Preset: preset},
 	}.WithDefaults()
+
+	// Override workers if explicitly set.
+	if w := envOr("WORKERS", ""); w != "" {
+		var n int
+		if _, err := fmt.Sscanf(w, "%d", &n); err == nil && n > 0 {
+			cfg.Resources.Workers = n
+		}
+	}
 
 	handler := newHandler()
 	eng, err := createEngine(engName, cfg, handler)
@@ -136,6 +154,9 @@ func newHandler() stream.HandlerFunc {
 		case method == "GET" && strings.HasPrefix(path, "/users/"):
 			id := strings.TrimPrefix(path, "/users/")
 			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, []byte("User ID: "+id))
+		case method == "POST" && path == "/upload":
+			// Body benchmark: read and discard request body, return OK.
+			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, helloBody)
 		default:
 			return s.ResponseWriter.WriteResponse(s, 404, textPlainHeaders, notFoundBody)
 		}
