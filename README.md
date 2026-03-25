@@ -7,44 +7,26 @@
 
 Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uring & epoll) designed for high-throughput infrastructure and zero-allocation microservices. It provides a familiar route-group and middleware API similar to Gin and Echo, so teams can adopt it without learning a new programming model.
 
+## Highlights
+
+- **3.3M+ HTTP/2 requests/sec** on a single 8-vCPU machine (arm64 Graviton3)
+- **590K+ HTTP/1.1 requests/sec** — 81% syscall-bound, zero allocations on the hot path
+- **io_uring and epoll at parity** — both engines hit the same throughput
+- **H2 is 5.7x faster than H1** thanks to stream multiplexing and inline handler execution
+- **Zero hot-path allocations** for both H1 and H2
+
 ## Features
 
-- **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept, provided buffers, SQ poll) for your kernel
+- **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept/recv, provided buffers, SQ poll, fixed files) for your kernel
 - **Edge-triggered epoll** — per-core event loops with CPU pinning
 - **Adaptive meta-engine** — dynamically switches between io_uring and epoll based on runtime telemetry
 - **SIMD HTTP parser** — SSE2 (amd64) and NEON (arm64) with generic SWAR fallback
-- **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK
+- **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK, inline handler execution, zero-alloc HEADERS fast path
 - **Auto-detect** — protocol negotiation from the first bytes on the wire
 - **Error-returning handlers** — `HandlerFunc` returns `error`; structured `HTTPError` for status codes
 - **Serialization** — JSON and XML response methods (`JSON`, `XML`); Protocol Buffers available via [`github.com/goceleris/middlewares`](https://github.com/goceleris/middlewares); `Bind` auto-detects request format from Content-Type
 - **net/http compatibility** — wrap existing `http.Handler` via `celeris.Adapt()`
 - **Built-in metrics collector** — atomic counters, always-on `Server.Collector().Snapshot()`
-
-## API Overview
-
-| Type | Package | Description |
-|------|---------|-------------|
-| `Server` | `celeris` | Top-level entry point; owns config, router, engine |
-| `Config` | `celeris` | Server configuration (addr, engine, protocol, timeouts) |
-| `Context` | `celeris` | Per-request context with params, headers, body, response methods |
-| `HandlerFunc` | `celeris` | `func(*Context) error` — handler/middleware signature |
-| `HTTPError` | `celeris` | Structured error carrying HTTP status code and message |
-| `RouteGroup` | `celeris` | Group of routes sharing a prefix and middleware |
-| `Route` | `celeris` | Opaque handle to a registered route |
-| `Collector` | `observe` | Lock-free request metrics aggregator |
-| `Snapshot` | `observe` | Point-in-time copy of all collected metrics |
-
-## Architecture
-
-```mermaid
-block-beta
-  columns 3
-  A["celeris (public API)"]:3
-  B["adaptive"]:1 C["observe"]:2
-  E["engine/iouring"]:1 F["engine/epoll"]:1 G["engine/std"]:1
-  H["protocol/h1"]:1 I["protocol/h2"]:1 J["protocol/detect"]:1
-  K["probe"]:1 L["resource"]:1 M["internal"]:1
-```
 
 ## Quick Start
 
@@ -267,18 +249,53 @@ For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](h
 | CPU pinning | yes | yes | no |
 | Provided buffers | yes (5.19+) | no | no |
 | Multishot accept | yes (5.19+) | no | no |
+| Multishot recv | yes (6.0+) | no | no |
+| Zero-alloc HEADERS | yes | yes | no |
+| Inline H2 handlers | yes | yes | no |
 
 ## Benchmarks
 
-Framework overhead on 8 vCPU (arm64 c6g.2xlarge, x86 c5a.2xlarge):
+Cloud benchmarks on arm64 c7g.2xlarge (8 vCPU Graviton3), separate server and client machines:
 
-- **<1.5%** overhead vs raw engine (balanced mode)
-- All 3 engines within **0.3%** of each other (adaptive fully matches dedicated)
-- Beats Fiber by **+1.4-2.1%** (arm64), **+0.7-1.3%** (x86)
-- Beats echo/chi/gin/iris by **5-6%**
-- H2 overhead: **1.5%** vs Go frameworks' **16.6%** (11x smaller)
+| Protocol | Engine | Throughput |
+|----------|--------|-----------|
+| HTTP/2 | epoll | **3.33M rps** |
+| HTTP/2 | io_uring | **3.30M rps** |
+| HTTP/1.1 | epoll | **590K rps** |
+| HTTP/1.1 | io_uring | **590K rps** |
 
-Methodology: 27 server configurations (3 engines x 3 objectives x 3 protocols) tested with `wrk2` at fixed request rates. Full results and reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/benchmarks).
+- io_uring and epoll within **1%** of each other on both protocols
+- H2 is **5.7x faster** than H1 (stream multiplexing + inline handlers)
+- Zero allocations on the hot path for both H1 and H2
+- All 3 engines within **0.3%** of each other in adaptive mode
+
+Methodology: 14 server configurations (io_uring/epoll/std x latency/throughput/balanced x H1/H2) tested with `wrk` (H1, 16384 connections) and `h2load` (H2, 128 connections x 128 streams) in 9-pass interleaved runs. Full results and reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/benchmarks).
+
+## API Overview
+
+| Type | Package | Description |
+|------|---------|-------------|
+| `Server` | `celeris` | Top-level entry point; owns config, router, engine |
+| `Config` | `celeris` | Server configuration (addr, engine, protocol, timeouts) |
+| `Context` | `celeris` | Per-request context with params, headers, body, response methods |
+| `HandlerFunc` | `celeris` | `func(*Context) error` — handler/middleware signature |
+| `HTTPError` | `celeris` | Structured error carrying HTTP status code and message |
+| `RouteGroup` | `celeris` | Group of routes sharing a prefix and middleware |
+| `Route` | `celeris` | Opaque handle to a registered route |
+| `Collector` | `observe` | Lock-free request metrics aggregator |
+| `Snapshot` | `observe` | Point-in-time copy of all collected metrics |
+
+## Architecture
+
+```mermaid
+block-beta
+  columns 3
+  A["celeris (public API)"]:3
+  B["adaptive"]:1 C["observe"]:2
+  E["engine/iouring"]:1 F["engine/epoll"]:1 G["engine/std"]:1
+  H["protocol/h1"]:1 I["protocol/h2"]:1 J["protocol/detect"]:1
+  K["probe"]:1 L["resource"]:1 M["internal"]:1
+```
 
 ## Requirements
 
@@ -305,9 +322,9 @@ test/           Conformance, spec compliance, integration, benchmarks
 ```bash
 go install github.com/magefile/mage@latest  # one-time setup
 mage build   # build all targets
-mage test    # run tests
+mage test    # run tests with race detector
 mage lint    # run linters
-mage bench   # run benchmarks
+mage check   # full verification: lint + test + spec + build
 ```
 
 Pull requests should target `main`.

@@ -19,6 +19,11 @@ const (
 	awsArmInstance = "c7g.2xlarge" // 8 vCPU, 16GB, Graviton3
 	awsKeyPrefix   = "celeris-mage"
 	awsSGName      = "celeris-mage-sg"
+
+	// awsTagValue is a unique identifier for resources created by this mage
+	// session. Used to tag instances so they can be distinguished from other
+	// workloads (benchmarks repo, other branches) sharing the same AWS account.
+	awsTagProject = "celeris-mage"
 )
 
 // cloudArch returns the target architectures from CLOUD_ARCH env (default: "both").
@@ -131,7 +136,7 @@ func awsLaunchInstance(ami, instanceType, keyName, sgID, arch string) (instanceI
 		"--key-name", keyName,
 		"--security-group-ids", sgID,
 		"--block-device-mappings", `[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]`,
-		"--tag-specifications", fmt.Sprintf(`ResourceType=instance,Tags=[{Key=Name,Value=celeris-mage-%s}]`, arch),
+		"--tag-specifications", fmt.Sprintf(`ResourceType=instance,Tags=[{Key=Name,Value=celeris-mage-%s-%s},{Key=Project,Value=%s},{Key=KeyPair,Value=%s}]`, arch, keyName, awsTagProject, keyName),
 		"--query", "Instances[0].InstanceId",
 		"--output", "text")
 	if err != nil {
@@ -253,9 +258,12 @@ func awsDeleteSecurityGroup(sgID string, instanceIDs ...string) {
 		"--group-id", sgID)
 }
 
-// awsCleanup performs best-effort cleanup of all AWS resources.
+// awsCleanup performs best-effort cleanup of AWS resources created by THIS run.
+// Only terminates instances from the provided list (tracked during launch).
+// Never discovers or modifies instances from other runs, branches, or projects.
 func awsCleanup(instanceIDs []string, keyName, sgID, keyPath string) {
 	fmt.Println("\nCleaning up AWS resources...")
+	fmt.Printf("  Scope: %d instances, key=%s, sg=%s\n", len(instanceIDs), keyName, sgID)
 	for _, id := range instanceIDs {
 		awsTerminate(id)
 	}

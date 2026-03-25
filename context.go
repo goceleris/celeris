@@ -83,8 +83,12 @@ func acquireContext(s *stream.Stream) *Context {
 		c = s.CachedCtx.(*Context)
 	} else {
 		c = contextPool.Get().(*Context)
-		// Cache on the stream for per-connection reuse (H1 keep-alive).
-		if s.CachedCtx == nil {
+		// Cache on H1 streams for per-connection reuse (keep-alive).
+		// H2 streams are ephemeral (released after one request), so caching
+		// would leak the context — releaseContext skips pool.Put for cached
+		// contexts, but stream.Release() nils CachedCtx, leaving the context
+		// unreachable. H2 inline handlers use InlineCachedCtx instead.
+		if s.IsH1() {
 			s.CachedCtx = c
 		}
 	}

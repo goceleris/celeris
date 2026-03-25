@@ -77,6 +77,7 @@ type Processor struct {
 	currentConn          ResponseWriter
 	connWriter           ResponseWriter
 	hpackDecoder         *hpack.Decoder
+	hpackTarget          *[][2]string // current HPACK decode target slice (avoids closure alloc per request)
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
@@ -117,13 +118,23 @@ func (p *Processor) FlushInlineCleanup() {
 
 // NewProcessor creates a new stream processor.
 func NewProcessor(handler Handler, writer FrameWriter, conn ResponseWriter) *Processor {
-	return &Processor{
-		manager:      NewManager(),
-		handler:      handler,
-		writer:       writer,
-		connWriter:   conn,
-		hpackDecoder: hpack.NewDecoder(4096, nil),
+	p := &Processor{
+		manager:    NewManager(),
+		handler:    handler,
+		writer:     writer,
+		connWriter: conn,
 	}
+	// Set emit function ONCE per connection. The hpackTarget field is updated
+	// before each decode to point at the current pooled slice, eliminating
+	// a closure allocation per HEADERS/CONTINUATION frame.
+	p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
+	return p
+}
+
+// hpackEmit is the persistent HPACK emit callback. It appends decoded headers
+// to the slice pointed to by p.hpackTarget (set before each decode call).
+func (p *Processor) hpackEmit(hf hpack.HeaderField) {
+	*p.hpackTarget = append(*p.hpackTarget, [2]string{internH2HeaderName(hf.Name), hf.Value})
 }
 
 // GetManager returns the stream manager.
@@ -407,12 +418,13 @@ func (p *Processor) runHandler(stream *Stream) {
 		return
 	}
 
-	if stream.IsCancelled() {
+	if p.canRunInline(stream) {
+		p.executeHandlerInline(stream)
 		return
 	}
 
-	if p.canRunInline(stream) {
-		p.executeHandlerInline(stream)
+	// Check cancellation after inline (rare path, avoids atomic load on hot inline path).
+	if stream.IsCancelled() {
 		return
 	}
 
@@ -644,14 +656,12 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 			}
 
 			pooledTrailers := headersSlicePoolIn.Get().(*[][2]string)
-			trailers := (*pooledTrailers)[:0]
+			*pooledTrailers = (*pooledTrailers)[:0]
 			defer func() {
-				*pooledTrailers = trailers[:0]
+				*pooledTrailers = (*pooledTrailers)[:0]
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
-			p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
-				trailers = append(trailers, [2]string{internH2HeaderName(hf.Name), hf.Value})
-			})
+			p.hpackTarget = pooledTrailers
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -660,6 +670,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to finalize trailers: %w", err))
 			}
+			trailers := *pooledTrailers
 			if err := validateTrailerHeaders(trailers); err != nil {
 				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeProtocol)
 				return fmt.Errorf("invalid trailers: %w", err)
@@ -722,14 +733,12 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 	}
 
 	pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
-	headers := (*pooledHeadersIn)[:0]
+	*pooledHeadersIn = (*pooledHeadersIn)[:0]
 	defer func() {
-		*pooledHeadersIn = headers[:0]
+		*pooledHeadersIn = (*pooledHeadersIn)[:0]
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
-	p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
-		headers = append(headers, [2]string{internH2HeaderName(hf.Name), hf.Value})
-	})
+	p.hpackTarget = pooledHeadersIn
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -739,6 +748,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 			fmt.Errorf("failed to finalize headers: %w", err))
 	}
 
+	headers := *pooledHeadersIn
 	if err := validateRequestHeaders(headers); err != nil {
 		sendStreamError(p.writer, f.StreamID, http2.ErrCodeProtocol)
 		return fmt.Errorf("invalid headers: %w", err)
@@ -758,6 +768,135 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 
 		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
 			sendStreamError(p.writer, f.StreamID, http2.ErrCodeProtocol)
+			return fmt.Errorf("content-length mismatch: %w", err)
+		}
+
+		p.runHandler(stream)
+	}
+
+	return nil
+}
+
+// ProcessRawHeaders handles a HEADERS frame from raw bytes, bypassing the
+// x/net framer's *HeadersFrame allocation. Only valid for simple HEADERS
+// (END_HEADERS set, no PADDED, no PRIORITY, not during CONTINUATION).
+// All RFC 7540 validations are preserved.
+func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlock []byte) error {
+	existingStream, exists := p.manager.GetStream(streamID)
+
+	if !exists {
+		lastClientStream := p.manager.lastClientStream.Load()
+
+		if streamID <= lastClientStream {
+			_ = p.SendGoAway(lastClientStream, http2.ErrCodeProtocol, []byte("HEADERS on closed stream (reused id)"))
+			return fmt.Errorf("HEADERS frame on closed stream %d (last stream: %d)", streamID, lastClientStream)
+		}
+
+		if err := validateStreamID(streamID, lastClientStream, false); err != nil {
+			return p.GoAwayErr(lastClientStream, http2.ErrCodeProtocol, []byte(err.Error()), err)
+		}
+
+		if streamID > lastClientStream {
+			p.manager.lastClientStream.Store(streamID)
+		}
+	}
+
+	if exists {
+		state := existingStream.GetState()
+		switch state {
+		case StateClosed:
+			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on closed stream (state closed)"))
+			return fmt.Errorf("HEADERS frame on closed stream %d", streamID)
+		case StateHalfClosedRemote:
+			_ = p.SendGoAway(p.manager.GetLastStreamID(), http2.ErrCodeStreamClosed, []byte("HEADERS on half-closed stream"))
+			return fmt.Errorf("HEADERS frame on half-closed (remote) stream %d", streamID)
+		}
+
+		if existingStream.ReceivedInitialHeaders {
+			if !endStream {
+				return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("second HEADERS without END_STREAM"),
+					fmt.Errorf("second HEADERS without END_STREAM on stream %d", streamID))
+			}
+			// Trailers on existing stream.
+			pooledTrailers := headersSlicePoolIn.Get().(*[][2]string)
+			*pooledTrailers = (*pooledTrailers)[:0]
+			defer func() {
+				*pooledTrailers = (*pooledTrailers)[:0]
+				headersSlicePoolIn.Put(pooledTrailers)
+			}()
+			p.hpackTarget = pooledTrailers
+			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
+				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+					fmt.Errorf("failed to decode trailers: %w", err))
+			}
+			if err := p.hpackDecoder.Close(); err != nil {
+				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+					fmt.Errorf("failed to finalize trailers: %w", err))
+			}
+			trailers := *pooledTrailers
+			if err := validateTrailerHeaders(trailers); err != nil {
+				_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeProtocol)
+				return fmt.Errorf("invalid trailers: %w", err)
+			}
+			existingStream.AddHeadersBatch(trailers)
+
+			if endStream {
+				existingStream.EndStream = true
+				existingStream.SetState(StateHalfClosedRemote)
+				p.runHandler(existingStream)
+			}
+			return nil
+		}
+	}
+
+	// New stream — open it.
+	stream, ok := p.manager.TryOpenStream(streamID)
+	if !ok {
+		sendStreamError(p.writer, streamID, http2.ErrCodeRefusedStream)
+		return nil
+	}
+	if stream.ResponseWriter == nil {
+		stream.ResponseWriter = p.connWriter
+	}
+
+	// No PRIORITY handling needed (flag checked by caller).
+
+	pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
+	*pooledHeadersIn = (*pooledHeadersIn)[:0]
+	defer func() {
+		*pooledHeadersIn = (*pooledHeadersIn)[:0]
+		headersSlicePoolIn.Put(pooledHeadersIn)
+	}()
+	p.hpackTarget = pooledHeadersIn
+	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
+		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to decode headers: %w", err))
+	}
+	if err := p.hpackDecoder.Close(); err != nil {
+		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
+			fmt.Errorf("failed to finalize headers: %w", err))
+	}
+
+	headers := *pooledHeadersIn
+	if err := validateRequestHeaders(headers); err != nil {
+		sendStreamError(p.writer, streamID, http2.ErrCodeProtocol)
+		return fmt.Errorf("invalid headers: %w", err)
+	}
+	for _, h := range headers {
+		if h[0] == ":method" && h[1] == "HEAD" {
+			stream.IsHEAD = true
+			break
+		}
+	}
+	stream.AddHeadersBatch(headers)
+	stream.ReceivedInitialHeaders = true
+
+	if endStream {
+		stream.EndStream = true
+		stream.SetState(StateHalfClosedRemote)
+
+		if err := validateContentLength(stream.Headers, stream.ReceivedDataLen); err != nil {
+			sendStreamError(p.writer, streamID, http2.ErrCodeProtocol)
 			return fmt.Errorf("content-length mismatch: %w", err)
 		}
 
@@ -1050,14 +1189,12 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		stream.SetState(StateOpen)
 
 		pooledHeadersIn := headersSlicePoolIn.Get().(*[][2]string)
-		headers := (*pooledHeadersIn)[:0]
+		*pooledHeadersIn = (*pooledHeadersIn)[:0]
 		defer func() {
-			*pooledHeadersIn = headers[:0]
+			*pooledHeadersIn = (*pooledHeadersIn)[:0]
 			headersSlicePoolIn.Put(pooledHeadersIn)
 		}()
-		p.hpackDecoder.SetEmitFunc(func(hf hpack.HeaderField) {
-			headers = append(headers, [2]string{internH2HeaderName(hf.Name), hf.Value})
-		})
+		p.hpackTarget = pooledHeadersIn
 
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
 			p.continuationState = nil
@@ -1072,6 +1209,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 				fmt.Errorf("failed to finalize headers: %w", err))
 		}
 
+		headers := *pooledHeadersIn
 		if p.continuationState.isTrailers {
 			if err := validateTrailerHeaders(headers); err != nil {
 				p.continuationState = nil
