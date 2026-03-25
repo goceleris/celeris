@@ -2,11 +2,12 @@
 
 ## Supported Versions
 
-| Version        | Supported |
-|----------------|-----------|
-| 1.x            | Yes       |
-| < 1.0          | No        |
-| Beta / RC      | No        |
+| Version        | Supported          |
+|----------------|--------------------|
+| >= 1.1.0       | Yes                |
+| < 1.1.0        | No                 |
+
+Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
 
 ## Reporting a Vulnerability
 
