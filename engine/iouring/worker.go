@@ -34,8 +34,11 @@ const fixedFileTableSize = 65536
 const bufRingGroupID = 0
 
 // bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2.
-const bufRingCount = 4096
+// Must be a power of 2. 512 supports 512 concurrent in-flight multishot
+// recvs per worker (more than enough). Keeps total memory manageable on
+// high-core-count machines (512 * 64KB = 32 MB per worker; 64 workers = 2 GB).
+// Previous value of 4096 caused 16-25 GB RSS on 64-96 vCPU metal instances.
+const bufRingCount = 512
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {

@@ -534,12 +534,13 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 	return nil
 }
 
-// CloseH2 cleans up H2 state.
+// CloseH2 cleans up H2 state. Releases all streams still held by the
+// manager to prevent memory leaks on connection close.
 func CloseH2(state *H2State) {
 	if state.adapter != nil && state.adapter.encoder != nil {
 		state.adapter.encoder.Close()
 	}
-	// Worker pool is global (process-lifetime), no per-connection cleanup needed.
+	state.processor.GetManager().Close()
 }
 
 func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
