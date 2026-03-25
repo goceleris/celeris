@@ -18,44 +18,40 @@ import (
 const benchRepoRelPath = "../benchmarks"
 
 type metalConfig struct {
-	engine, objective, protocol, preset string
+	engine, protocol string
 }
 
 func (c metalConfig) name() string {
-	return fmt.Sprintf("%s-%s-%s-%s", c.engine, c.objective, c.protocol, c.preset)
+	return fmt.Sprintf("%s-%s", c.engine, c.protocol)
 }
 
 func (c metalConfig) envVars(port string) string {
-	return fmt.Sprintf("ENGINE=%s OBJECTIVE=%s PROTOCOL=%s PORT=%s PRESET=%s",
-		c.engine, c.objective, c.protocol, port, c.preset)
+	return fmt.Sprintf("ENGINE=%s PROTOCOL=%s PORT=%s",
+		c.engine, c.protocol, port)
 }
 
-// buildMetalConfigs generates all engine×objective×protocol×preset combinations.
+// buildMetalConfigs generates all engine×protocol combinations.
 func buildMetalConfigs() []metalConfig {
 	var configs []metalConfig
 	for _, eng := range []string{"iouring", "epoll", "adaptive"} {
-		for _, obj := range []string{"latency", "throughput", "balanced"} {
-			for _, proto := range []string{"h1", "h2", "hybrid"} {
-				for _, preset := range []string{"greedy", "minimal"} {
-					configs = append(configs, metalConfig{
-						engine: eng, objective: obj, protocol: proto, preset: preset,
-					})
-				}
-			}
+		for _, proto := range []string{"h1", "h2", "hybrid"} {
+			configs = append(configs, metalConfig{
+				engine: eng, protocol: proto,
+			})
 		}
 	}
 	return configs
 }
 
 // CloudMetalBenchmark runs the full celeris benchmark matrix using wrk (H1) and
-// h2load (H2) on separate EC2 instances. Tests 54 configurations (3 engines ×
-// 3 objectives × 3 protocols × 2 presets) across up to 3 celeris versions.
+// h2load (H2) on separate EC2 instances. Tests 9 configurations (3 engines ×
+// 3 protocols) across up to 3 celeris versions.
 //
 // Results are collected inline (like CloudBenchmarkSplit), aggregated into a
 // comparison report, and saved to results/<timestamp>-cloud-metal-benchmark/.
 //
-// Server binaries are built from test/benchmark/server/ which accepts PRESET
-// and WORKERS env vars for full resource control.
+// Server binaries are built from test/benchmark/server/ which accepts
+// WORKERS env var for worker count control.
 //
 // Set CLOUD_ARCH=amd64|arm64 (default: arm64).
 // Set METAL_INSTANCE=<type> (default: same as cloud benchmark instance).
@@ -91,7 +87,7 @@ func CloudMetalBenchmark() error {
 
 	fmt.Printf("Cloud Metal Benchmark: %s (%s on %s)\n", branch, arch, instanceType)
 	fmt.Printf("Refs: %v\n", refs)
-	fmt.Printf("Configs: %d (3 engines × 3 objectives × 3 protocols × 2 presets)\n", len(configs))
+	fmt.Printf("Configs: %d (3 engines × 3 protocols)\n", len(configs))
 	fmt.Printf("Duration: %s per benchmark, %d total runs\n\n", duration, len(configs)*len(refs))
 
 	// Build server binaries for each ref.
@@ -390,30 +386,6 @@ func generateMetalReport(branch, arch, instance string, refs []string, configs [
 		}
 		if n > 0 {
 			sb.WriteString(fmt.Sprintf("  %-12s: %+.1f%% (%d configs)\n", proto, sum/float64(n), n))
-		}
-	}
-
-	// Per-preset summary.
-	sb.WriteString("\n--- Per-preset averages ---\n")
-	for _, preset := range []string{"greedy", "minimal"} {
-		var sum float64
-		var n int
-		for _, cfg := range sorted {
-			if cfg.preset != preset {
-				continue
-			}
-			if len(refs) < 2 {
-				continue
-			}
-			first := results[refs[0]][cfg.name()]
-			last := results[refs[len(refs)-1]][cfg.name()]
-			if first > 0 && last > 0 {
-				sum += (last - first) / first * 100
-				n++
-			}
-		}
-		if n > 0 {
-			sb.WriteString(fmt.Sprintf("  %-12s: %+.1f%% (%d configs)\n", preset, sum/float64(n), n))
 		}
 	}
 

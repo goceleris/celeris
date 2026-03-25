@@ -25,21 +25,8 @@ import (
 
 func main() {
 	engName := envOr("ENGINE", "iouring")
-	objName := envOr("OBJECTIVE", "latency")
 	protoName := envOr("PROTOCOL", "h1")
 	port := envOr("PORT", "18080")
-
-	var obj resource.ObjectiveProfile
-	switch objName {
-	case "latency":
-		obj = resource.LatencyOptimized
-	case "throughput":
-		obj = resource.ThroughputOptimized
-	case "balanced":
-		obj = resource.BalancedObjective
-	default:
-		log.Fatalf("unknown objective: %s", objName)
-	}
 
 	var proto engine.Protocol
 	switch protoName {
@@ -53,21 +40,9 @@ func main() {
 		log.Fatalf("unknown protocol: %s", protoName)
 	}
 
-	var preset resource.ResourcePreset
-	switch envOr("PRESET", "greedy") {
-	case "greedy":
-		preset = resource.Greedy
-	case "minimal":
-		preset = resource.Minimal
-	default:
-		log.Fatalf("unknown preset: %s (use greedy or minimal)", envOr("PRESET", ""))
-	}
-
 	cfg := resource.Config{
-		Addr:      ":" + port,
-		Protocol:  proto,
-		Objective: obj,
-		Resources: resource.Resources{Preset: preset},
+		Addr:     ":" + port,
+		Protocol: proto,
 	}.WithDefaults()
 
 	// Override workers if explicitly set.
@@ -94,7 +69,7 @@ func main() {
 		cancel()
 	}()
 
-	log.Printf("Starting %s-%s-%s on :%s", engName, objName, protoName, port)
+	log.Printf("Starting %s-%s on :%s", engName, protoName, port)
 	if err := eng.Listen(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("listen: %v", err)
 	}

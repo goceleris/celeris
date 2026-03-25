@@ -1,6 +1,6 @@
 //go:build linux
 
-// Package main runs load tests against all 36 celeris engine configurations.
+// Package main runs load tests against all celeris engine configurations.
 // Must be run on Linux with io_uring support (kernel 5.10+).
 package main
 
@@ -37,12 +37,6 @@ const (
 )
 
 var engines = []string{"iouring", "epoll", "adaptive", "std"}
-var objectives = []resource.ObjectiveProfile{
-	resource.LatencyOptimized,
-	resource.ThroughputOptimized,
-	resource.BalancedObjective,
-}
-var objectiveNames = []string{"latency", "throughput", "balanced"}
 var protocols = []engine.Protocol{engine.HTTP1, engine.H2C, engine.Auto}
 var protocolNames = []string{"h1", "h2", "hybrid"}
 
@@ -58,32 +52,30 @@ type testResult struct {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	filter := os.Getenv("CELERIS_FILTER") // e.g., "iouring-latency-h1" or "epoll" or ""
+	filter := os.Getenv("CELERIS_FILTER") // e.g., "iouring-h1" or "epoll" or ""
 
-	results := make([]testResult, 0, len(engines)*len(objectives)*len(protocols))
+	results := make([]testResult, 0, len(engines)*len(protocols))
 
 	for _, eng := range engines {
-		for oi, obj := range objectives {
-			for pi, proto := range protocols {
-				name := fmt.Sprintf("celeris-%s-%s-%s", eng, objectiveNames[oi], protocolNames[pi])
-				if filter != "" && !strings.Contains(name, filter) {
-					continue
-				}
-				log.Printf("========== %s ==========", name)
-
-				r := runTest(name, eng, obj, proto)
-				results = append(results, r)
-
-				status := r.status
-				switch r.status {
-				case "FAIL":
-					status = "\033[31mFAIL\033[0m"
-				case "PASS":
-					status = "\033[32mPASS\033[0m"
-				}
-				log.Printf("[%s] %s: %d reqs, %d errs, %s — %s",
-					status, r.name, r.requests, r.errors, r.duration.Round(time.Millisecond), r.detail)
+		for pi, proto := range protocols {
+			name := fmt.Sprintf("celeris-%s-%s", eng, protocolNames[pi])
+			if filter != "" && !strings.Contains(name, filter) {
+				continue
 			}
+			log.Printf("========== %s ==========", name)
+
+			r := runTest(name, eng, proto)
+			results = append(results, r)
+
+			status := r.status
+			switch r.status {
+			case "FAIL":
+				status = "\033[31mFAIL\033[0m"
+			case "PASS":
+				status = "\033[32mPASS\033[0m"
+			}
+			log.Printf("[%s] %s: %d reqs, %d errs, %s — %s",
+				status, r.name, r.requests, r.errors, r.duration.Round(time.Millisecond), r.detail)
 		}
 	}
 
@@ -112,14 +104,10 @@ type addrGetter interface {
 	Addr() net.Addr
 }
 
-func runTest(name, engName string, obj resource.ObjectiveProfile, proto engine.Protocol) testResult {
+func runTest(name, engName string, proto engine.Protocol) testResult {
 	cfg := resource.Config{
-		Addr:      ":0", // kernel-assigned port avoids conflicts between sequential tests
-		Protocol:  proto,
-		Objective: obj,
-		Resources: resource.Resources{
-			Preset: resource.Greedy,
-		},
+		Addr:     ":0", // kernel-assigned port avoids conflicts between sequential tests
+		Protocol: proto,
 	}.WithDefaults()
 
 	handler := newTestHandler()

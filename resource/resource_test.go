@@ -4,10 +4,9 @@ import "testing"
 
 func TestResolveUserOverrides(t *testing.T) {
 	r := Resources{
-		Preset:  Balanced,
 		Workers: 8,
 	}
-	res := r.Resolve(4)
+	res := r.Resolve()
 	if res.Workers != 8 {
 		t.Errorf("Workers override: got %d, want 8", res.Workers)
 	}
@@ -15,31 +14,18 @@ func TestResolveUserOverrides(t *testing.T) {
 
 func TestResolveAllOverrides(t *testing.T) {
 	r := Resources{
-		Preset:      Minimal,
-		Workers:     16,
-		SQERingSize: 4096,
-		BufferPool:  2048,
-		BufferSize:  32768,
-		MaxEvents:   4096,
-		MaxConns:    8192,
-		SocketRecv:  131072,
-		SocketSend:  131072,
+		Workers:    16,
+		BufferSize: 32768,
+		MaxConns:   8192,
+		SocketRecv: 131072,
+		SocketSend: 131072,
 	}
-	res := r.Resolve(4)
+	res := r.Resolve()
 	if res.Workers != 16 {
 		t.Errorf("Workers = %d, want 16", res.Workers)
 	}
-	if res.SQERingSize != 4096 {
-		t.Errorf("SQERingSize = %d, want 4096", res.SQERingSize)
-	}
-	if res.BufferPool != 2048 {
-		t.Errorf("BufferPool = %d, want 2048", res.BufferPool)
-	}
 	if res.BufferSize != 32768 {
 		t.Errorf("BufferSize = %d, want 32768", res.BufferSize)
-	}
-	if res.MaxEvents != 4096 {
-		t.Errorf("MaxEvents = %d, want 4096", res.MaxEvents)
 	}
 	if res.MaxConns != 8192 {
 		t.Errorf("MaxConns = %d, want 8192", res.MaxConns)
@@ -52,44 +38,35 @@ func TestResolveAllOverrides(t *testing.T) {
 	}
 }
 
-func TestResolveSQERingPowerOf2(t *testing.T) {
-	r := Resources{
-		Preset:      Balanced,
-		SQERingSize: 1000,
+func TestResolveDefaultValues(t *testing.T) {
+	r := Resources{}
+	res := r.Resolve()
+	if res.SQERingSize != 32768 {
+		t.Errorf("SQERingSize = %d, want 32768", res.SQERingSize)
 	}
-	res := r.Resolve(4)
-	if res.SQERingSize != 1024 {
-		t.Errorf("SQERingSize = %d, want 1024 (rounded from 1000)", res.SQERingSize)
+	if res.BufferPool != 65536 {
+		t.Errorf("BufferPool = %d, want 65536", res.BufferPool)
 	}
-}
-
-func TestResolveSQERingAlreadyPowerOf2(t *testing.T) {
-	r := Resources{
-		Preset:      Balanced,
-		SQERingSize: 2048,
+	if res.BufferSize != 65536 {
+		t.Errorf("BufferSize = %d, want 65536", res.BufferSize)
 	}
-	res := r.Resolve(4)
-	if res.SQERingSize != 2048 {
-		t.Errorf("SQERingSize = %d, want 2048", res.SQERingSize)
+	if res.MaxEvents != 8192 {
+		t.Errorf("MaxEvents = %d, want 8192", res.MaxEvents)
 	}
-}
-
-func TestResolveSQERingHardCap(t *testing.T) {
-	r := Resources{
-		Preset:      Balanced,
-		SQERingSize: 100000,
+	if res.MaxConns != 65536 {
+		t.Errorf("MaxConns = %d, want 65536", res.MaxConns)
 	}
-	res := r.Resolve(4)
-	if res.SQERingSize != MaxSQERing {
-		t.Errorf("SQERingSize = %d, want %d (capped)", res.SQERingSize, MaxSQERing)
+	if res.SocketRecv != 262144 {
+		t.Errorf("SocketRecv = %d, want 262144", res.SocketRecv)
+	}
+	if res.SocketSend != 262144 {
+		t.Errorf("SocketSend = %d, want 262144", res.SocketSend)
 	}
 }
 
 func TestResolveWorkersMinCap(t *testing.T) {
-	r := Resources{
-		Preset: Balanced,
-	}
-	res := r.Resolve(1)
+	r := Resources{}
+	res := r.Resolve()
 	if res.Workers < MinWorkers {
 		t.Errorf("Workers = %d, want >= %d", res.Workers, MinWorkers)
 	}
@@ -97,10 +74,9 @@ func TestResolveWorkersMinCap(t *testing.T) {
 
 func TestResolveBufferSizeMinCap(t *testing.T) {
 	r := Resources{
-		Preset:     Balanced,
 		BufferSize: 1024,
 	}
-	res := r.Resolve(4)
+	res := r.Resolve()
 	if res.BufferSize != MinBufferSize {
 		t.Errorf("BufferSize = %d, want %d (clamped to min)", res.BufferSize, MinBufferSize)
 	}
@@ -108,33 +84,55 @@ func TestResolveBufferSizeMinCap(t *testing.T) {
 
 func TestResolveBufferSizeMaxCap(t *testing.T) {
 	r := Resources{
-		Preset:     Balanced,
 		BufferSize: 1 << 20,
 	}
-	res := r.Resolve(4)
+	res := r.Resolve()
 	if res.BufferSize != MaxBufferSize {
 		t.Errorf("BufferSize = %d, want %d (clamped to max)", res.BufferSize, MaxBufferSize)
 	}
 }
 
-func TestResolveZeroOverridesUsePreset(t *testing.T) {
-	r := Resources{Preset: Greedy}
-	res := r.Resolve(8)
-	preset := resolvePreset(Greedy, 8)
+func TestClamp(t *testing.T) {
+	tests := []struct {
+		v, minVal, maxVal, want int
+	}{
+		{5, 2, 10, 5},
+		{1, 2, 10, 2},
+		{15, 2, 10, 10},
+		{5, 0, 0, 5},
+		{5, 2, 0, 5},
+		{1, 2, 0, 2},
+		{5, 0, 3, 3},
+	}
+	for _, tt := range tests {
+		got := clamp(tt.v, tt.minVal, tt.maxVal)
+		if got != tt.want {
+			t.Errorf("clamp(%d, %d, %d) = %d, want %d", tt.v, tt.minVal, tt.maxVal, got, tt.want)
+		}
+	}
+}
 
-	if res.BufferPool != preset.BufferPool {
-		t.Errorf("BufferPool = %d, want preset %d", res.BufferPool, preset.BufferPool)
+func TestNextPowerOf2(t *testing.T) {
+	tests := []struct {
+		input, want int
+	}{
+		{1000, 1024},
+		{2048, 2048},
+		{3, 4},
+		{1, 1},
+		{0, 0},
+		{-1, -1},
+		{5, 8},
+		{16, 16},
+		{17, 32},
+		{4096, 4096},
+		{4097, 8192},
+		{32768, 32768},
 	}
-	if res.MaxEvents != preset.MaxEvents {
-		t.Errorf("MaxEvents = %d, want preset %d", res.MaxEvents, preset.MaxEvents)
-	}
-	if res.MaxConns != preset.MaxConns {
-		t.Errorf("MaxConns = %d, want preset %d", res.MaxConns, preset.MaxConns)
-	}
-	if res.SocketRecv != preset.SocketRecv {
-		t.Errorf("SocketRecv = %d, want preset %d", res.SocketRecv, preset.SocketRecv)
-	}
-	if res.SocketSend != preset.SocketSend {
-		t.Errorf("SocketSend = %d, want preset %d", res.SocketSend, preset.SocketSend)
+	for _, tt := range tests {
+		got := nextPowerOf2(tt.input)
+		if got != tt.want {
+			t.Errorf("nextPowerOf2(%d) = %d, want %d", tt.input, got, tt.want)
+		}
 	}
 }

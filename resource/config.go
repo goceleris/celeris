@@ -16,7 +16,6 @@ type Config struct {
 	Engine               engine.EngineType
 	Addr                 string
 	Resources            Resources
-	Objective            ObjectiveProfile
 	MaxHeaderBytes       int
 	MaxConcurrentStreams uint32
 	MaxFrameSize         uint32

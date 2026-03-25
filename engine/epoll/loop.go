@@ -41,7 +41,6 @@ type Loop struct {
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
 	handler      stream.Handler
-	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
 	cfg          resource.Config
@@ -66,7 +65,7 @@ type Loop struct {
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
-	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
+	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
 	acceptPaused *atomic.Bool) *Loop {
 
@@ -79,7 +78,6 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
 		conns:        make([]*connState, connTableSize),
 		handler:      handler,
-		objective:    objective,
 		resolved:     resolved,
 		cfg:          cfg,
 		logger:       cfg.Logger,
@@ -87,9 +85,9 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		wake:         make(chan struct{}),
 		ready:        make(chan error, 1),
 		sockOpts: sockopts.Options{
-			TCPNoDelay:  objective.TCPNoDelay,
-			TCPQuickAck: objective.TCPQuickAck,
-			SOBusyPoll:  objective.SOBusyPoll,
+			TCPNoDelay:  true,
+			TCPQuickAck: true,
+			SOBusyPoll:  50 * time.Microsecond,
 			RecvBuf:     resolved.SocketRecv,
 			SendBuf:     resolved.SocketSend,
 		},
@@ -157,10 +155,7 @@ func (l *Loop) run(ctx context.Context) {
 
 	l.ready <- nil
 
-	activeTimeoutMs := int(l.objective.EpollTimeout.Milliseconds())
-	if activeTimeoutMs <= 0 {
-		activeTimeoutMs = 1
-	}
+	activeTimeoutMs := 1 // 1ms default epoll timeout
 	l.cachedNow = time.Now().UnixNano()
 
 	for {

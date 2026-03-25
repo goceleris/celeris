@@ -1,43 +1,16 @@
 package resource
 
-// ResourcePreset selects a predefined resource allocation profile.
-type ResourcePreset uint8 //nolint:revive // ResourcePreset is clearer than Preset for cross-package use
-
-// Resource preset constants.
-const (
-	Greedy ResourcePreset = iota
-	Balanced
-	Minimal
-)
-
-func (p ResourcePreset) String() string {
-	switch p {
-	case Greedy:
-		return "greedy"
-	case Balanced:
-		return "balanced"
-	case Minimal:
-		return "minimal"
-	default:
-		return "unknown"
-	}
-}
-
-// Resources allows user overrides of preset values.
-// Zero values mean "use preset default".
+// Resources allows user overrides of default values.
+// Zero values mean "use default".
 type Resources struct {
-	Preset      ResourcePreset
 	Workers     int
-	SQERingSize int
-	BufferPool  int
 	BufferSize  int
-	MaxEvents   int
-	MaxConns    int
 	SocketRecv  int
 	SocketSend  int
+	MaxConns    int
 }
 
-// ResolvedResources contains the final computed values after applying presets and overrides.
+// ResolvedResources contains the final computed values after applying defaults and overrides.
 type ResolvedResources struct {
 	Workers     int
 	SQERingSize int
@@ -49,24 +22,15 @@ type ResolvedResources struct {
 	SocketSend  int
 }
 
-// Resolve applies preset defaults, user overrides, and hard caps.
-func (r Resources) Resolve(numCPU int) ResolvedResources {
-	res := resolvePreset(r.Preset, numCPU)
+// Resolve applies hardcoded defaults, user overrides, and hard caps.
+func (r Resources) Resolve() ResolvedResources {
+	res := resolveDefaults()
 
 	if r.Workers > 0 {
 		res.Workers = r.Workers
 	}
-	if r.SQERingSize > 0 {
-		res.SQERingSize = r.SQERingSize
-	}
-	if r.BufferPool > 0 {
-		res.BufferPool = r.BufferPool
-	}
 	if r.BufferSize > 0 {
 		res.BufferSize = r.BufferSize
-	}
-	if r.MaxEvents > 0 {
-		res.MaxEvents = r.MaxEvents
 	}
 	if r.MaxConns > 0 {
 		res.MaxConns = r.MaxConns

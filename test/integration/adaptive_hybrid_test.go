@@ -99,7 +99,6 @@ func TestAdaptiveAutoSingleWorker(t *testing.T) {
 	cfg := defaultTestConfig(port, engine.Auto)
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 0 // will default based on NumCPU
-	cfg.Resources.SQERingSize = 1024
 
 	e, err := adaptive.New(cfg, &echoHandler{})
 	if err != nil {
@@ -292,7 +291,6 @@ func TestAdaptiveConstrainedRing(t *testing.T) {
 	cfg := defaultTestConfig(port, engine.HTTP1)
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 2
-	cfg.Resources.SQERingSize = 1024
 
 	e, err := adaptive.New(cfg, &echoHandler{})
 	if err != nil {

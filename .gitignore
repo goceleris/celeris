@@ -45,3 +45,5 @@ multipass-cloud-init.yml
 results/
 .claude/worktrees/
 fullstack
+*.json
+benchmark_analysis.py

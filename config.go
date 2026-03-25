@@ -40,21 +40,6 @@ const (
 // String returns the engine type name.
 func (t EngineType) String() string { return engine.EngineType(t).String() }
 
-// Objective selects a tuning profile that controls I/O and networking parameters.
-type Objective resource.ObjectiveProfile
-
-const (
-	// Balanced targets a balance between latency and throughput (default).
-	Balanced Objective = Objective(resource.BalancedObjective)
-	// Latency optimizes for minimum response latency.
-	Latency Objective = Objective(resource.LatencyOptimized)
-	// Throughput optimizes for maximum requests per second.
-	Throughput Objective = Objective(resource.ThroughputOptimized)
-)
-
-// String returns the objective name.
-func (o Objective) String() string { return resource.ObjectiveProfile(o).String() }
-
 // Config holds the public server configuration.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
@@ -66,8 +51,6 @@ type Config struct {
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
 	Workers int
-	// Objective is the tuning profile (default Balanced).
-	Objective Objective
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (300s). Set to -1 for no timeout.
@@ -165,7 +148,6 @@ func (c Config) toResourceConfig() resource.Config {
 		rc.Resources.MaxConns = c.MaxConns
 	}
 
-	rc.Objective = resource.ObjectiveProfile(c.Objective)
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
 
