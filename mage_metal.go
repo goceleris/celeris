@@ -172,11 +172,19 @@ func CloudMetalBenchmark() error {
 	fmt.Printf("  Client: %s\n", clientPublicIP)
 
 	fmt.Println("Installing load tools on client...")
-	_, _ = awsSSH(clientPublicIP, keyPath, "sudo apt-get update -qq && sudo apt-get install -y -qq wrk nghttp2-client 2>/dev/null")
+	if _, err := awsSSH(clientPublicIP, keyPath, "sudo apt-get update -qq && sudo apt-get install -y -qq wrk nghttp2-client"); err != nil {
+		return fmt.Errorf("install tools: %w", err)
+	}
+	// Ensure /tmp/metal exists on client before any file transfers.
+	if _, err := awsSSH(clientPublicIP, keyPath, "mkdir -p /tmp/metal"); err != nil {
+		return fmt.Errorf("mkdir on client: %w", err)
+	}
 	if err := awsSCP(keyPath, "/tmp/server-key.pem", clientPublicIP, keyPath); err != nil {
+		return fmt.Errorf("upload SSH key to client: %w", err)
+	}
+	if _, err := awsSSH(clientPublicIP, keyPath, "chmod 600 /tmp/server-key.pem"); err != nil {
 		return err
 	}
-	_, _ = awsSSH(clientPublicIP, keyPath, "chmod 600 /tmp/server-key.pem")
 
 	sshToServer := fmt.Sprintf("ssh -o StrictHostKeyChecking=no -o BatchMode=yes -i /tmp/server-key.pem ubuntu@%s", serverPrivateIP)
 
@@ -420,12 +428,86 @@ func generateMetalReport(branch, arch, instance string, refs []string, configs [
 	return sb.String()
 }
 
-// buildMetalServer builds test/benchmark/server for a celeris ref.
+// buildMetalServer builds test/benchmark/server linked against a specific
+// celeris version. For "current", builds from the working tree. For published
+// tags (v1.0.0 etc.), creates a temp module that imports the server code from
+// HEAD but replaces the celeris dependency with the tagged version from the
+// Go module proxy. This works even for old tags that don't have the server binary.
 func buildMetalServer(ref, outputPath, arch string) error {
 	if ref == "current" {
 		return crossCompile("test/benchmark/server", outputPath, arch)
 	}
-	return crossCompileFromRef(ref, "test/benchmark/server", outputPath, arch)
+	if ref == "HEAD" {
+		return crossCompileFromRef("HEAD", "test/benchmark/server", outputPath, arch)
+	}
+
+	// For tagged versions: build from HEAD's server code but replace celeris
+	// module with the published version. This ensures the server binary always
+	// uses the latest routes/control logic but links against the specified
+	// celeris engine code.
+	absOutput, err := filepath.Abs(outputPath)
+	if err != nil {
+		return err
+	}
+	absCelerisDir, err := filepath.Abs(".")
+	if err != nil {
+		return err
+	}
+
+	// Create a worktree from HEAD (which has test/benchmark/server/).
+	worktreeDir := filepath.Join(os.TempDir(), fmt.Sprintf("celeris-metal-%s-%d", ref, time.Now().UnixNano()))
+	fmt.Printf("  Creating worktree from HEAD for server build with celeris@%s\n", ref)
+	if err := run("git", "worktree", "add", worktreeDir, "HEAD"); err != nil {
+		return fmt.Errorf("git worktree add: %w", err)
+	}
+	defer func() {
+		_ = exec.Command("git", "worktree", "remove", "--force", worktreeDir).Run()
+	}()
+
+	// Replace celeris module with the published tag version.
+	// First drop the local replace (if any), then require the tag.
+	goModEdit := exec.Command("go", "mod", "edit",
+		fmt.Sprintf("-require=github.com/goceleris/celeris@%s", ref),
+		"-dropreplace=github.com/goceleris/celeris")
+	goModEdit.Dir = worktreeDir
+	goModEdit.Stdout = os.Stdout
+	goModEdit.Stderr = os.Stderr
+	if err := goModEdit.Run(); err != nil {
+		// If require fails (self-referencing module), use replace instead.
+		// For a module that references itself, we need a different approach:
+		// point at the tag via a local checkout.
+		tagWorktree := filepath.Join(os.TempDir(), fmt.Sprintf("celeris-tag-%s-%d", ref, time.Now().UnixNano()))
+		if err := run("git", "worktree", "add", tagWorktree, ref); err != nil {
+			return fmt.Errorf("git worktree add %s: %w", ref, err)
+		}
+		defer func() {
+			_ = exec.Command("git", "worktree", "remove", "--force", tagWorktree).Run()
+		}()
+
+		replaceCmd := exec.Command("go", "mod", "edit",
+			fmt.Sprintf("-replace=github.com/goceleris/celeris=%s", tagWorktree))
+		replaceCmd.Dir = worktreeDir
+		replaceCmd.Stdout = os.Stdout
+		replaceCmd.Stderr = os.Stderr
+		if err := replaceCmd.Run(); err != nil {
+			return fmt.Errorf("go mod edit -replace: %w", err)
+		}
+	}
+
+	_ = absCelerisDir // suppress unused warning
+
+	tidyCmd := exec.Command("go", "mod", "tidy")
+	tidyCmd.Dir = worktreeDir
+	tidyCmd.Stdout = os.Stdout
+	tidyCmd.Stderr = os.Stderr
+	_ = tidyCmd.Run() // best effort
+
+	buildCmd := exec.Command("go", "build", "-o", absOutput, "./test/benchmark/server")
+	buildCmd.Dir = worktreeDir
+	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+arch, "CGO_ENABLED=0")
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	return buildCmd.Run()
 }
 
 // metalCrossCompile builds a package from an external directory.
