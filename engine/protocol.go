@@ -15,6 +15,7 @@ const (
 // IsDefault reports whether the protocol is the unset zero value.
 func (p Protocol) IsDefault() bool { return p == protocolDefault }
 
+// String returns the protocol name (e.g. "http1", "h2c", "auto").
 func (p Protocol) String() string {
 	switch p {
 	case HTTP1:

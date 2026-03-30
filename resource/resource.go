@@ -1,25 +1,39 @@
 package resource
 
-// Resources allows user overrides of default values.
-// Zero values mean "use default".
+// Resources allows user overrides of default resource values.
+// Zero values mean "use engine default".
 type Resources struct {
-	Workers     int
-	BufferSize  int
-	SocketRecv  int
-	SocketSend  int
-	MaxConns    int
+	// Workers is the number of I/O worker goroutines (0 = GOMAXPROCS).
+	Workers int
+	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
+	BufferSize int
+	// SocketRecv is the SO_RCVBUF size for accepted connections (0 = OS default).
+	SocketRecv int
+	// SocketSend is the SO_SNDBUF size for accepted connections (0 = OS default).
+	SocketSend int
+	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
+	MaxConns int
 }
 
-// ResolvedResources contains the final computed values after applying defaults and overrides.
+// ResolvedResources contains the final computed values after applying defaults,
+// user overrides, and hard caps. Used by engine implementations at startup.
 type ResolvedResources struct {
-	Workers     int
+	// Workers is the resolved number of I/O worker goroutines.
+	Workers int
+	// SQERingSize is the io_uring submission queue size (power of 2).
 	SQERingSize int
-	BufferPool  int
-	BufferSize  int
-	MaxEvents   int
-	MaxConns    int
-	SocketRecv  int
-	SocketSend  int
+	// BufferPool is the number of pre-allocated I/O buffers.
+	BufferPool int
+	// BufferSize is the resolved per-connection I/O buffer size in bytes.
+	BufferSize int
+	// MaxEvents is the max events returned per epoll_wait call.
+	MaxEvents int
+	// MaxConns is the resolved max connections per worker.
+	MaxConns int
+	// SocketRecv is the resolved SO_RCVBUF size.
+	SocketRecv int
+	// SocketSend is the resolved SO_SNDBUF size.
+	SocketSend int
 }
 
 // Resolve applies hardcoded defaults, user overrides, and hard caps.

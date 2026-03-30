@@ -4,9 +4,13 @@ import "runtime"
 
 // Resource limit constants for validation and clamping.
 const (
-	MinWorkers    = 2
-	MaxSQERing    = 65536
+	// MinWorkers is the minimum allowed number of I/O workers.
+	MinWorkers = 2
+	// MaxSQERing is the maximum io_uring submission queue ring size.
+	MaxSQERing = 65536
+	// MinBufferSize is the minimum per-connection I/O buffer size in bytes.
 	MinBufferSize = 4096
+	// MaxBufferSize is the maximum per-connection I/O buffer size in bytes.
 	MaxBufferSize = 262144
 )
 
@@ -17,9 +21,9 @@ func resolveDefaults() ResolvedResources {
 	}
 	return ResolvedResources{
 		Workers:     numCPU,
-		SQERingSize: 32768,
+		SQERingSize: 8192,
 		BufferPool:  65536,
-		BufferSize:  65536,
+		BufferSize:  8192,
 		MaxEvents:   8192,
 		MaxConns:    65536,
 		SocketRecv:  262144,

@@ -529,6 +529,10 @@
 //	    // Observability
 //	    DisableMetrics: false,         // skip per-request metric recording
 //	    Logger: nil,                   // *slog.Logger for engine diagnostics
+//
+//	    // Connection callbacks (must be fast — blocks the event loop)
+//	    OnConnect:    func(addr string) { ... },
+//	    OnDisconnect: func(addr string) { ... },
 //	}
 //
 // # Listener Address

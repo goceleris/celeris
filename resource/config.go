@@ -18,24 +18,41 @@ func defaultEngine() engine.EngineType {
 	return engine.Std
 }
 
-// Config holds server configuration including protocol, engine, address, and resource settings.
+// Config holds the internal server configuration used by engine implementations.
+// Users typically interact with the top-level celeris.Config instead.
 type Config struct {
-	Protocol             engine.Protocol
-	Engine               engine.EngineType
-	Addr                 string
-	Resources            Resources
-	MaxHeaderBytes       int
+	// Protocol is the HTTP protocol version (HTTP1, H2C, or Auto).
+	Protocol engine.Protocol
+	// Engine is the I/O engine type (IOUring, Epoll, Adaptive, or Std).
+	Engine engine.EngineType
+	// Addr is the TCP address to listen on (e.g. ":8080").
+	Addr string
+	// Resources holds worker, buffer, and connection limit overrides.
+	Resources Resources
+	// MaxHeaderBytes is the max header block size in bytes (min 4096 if set).
+	MaxHeaderBytes int
+	// MaxConcurrentStreams limits simultaneous H2 streams per connection.
 	MaxConcurrentStreams uint32
-	MaxFrameSize         uint32
-	InitialWindowSize    uint32
-	ReadTimeout          time.Duration
-	WriteTimeout         time.Duration
-	IdleTimeout          time.Duration
-	DisableKeepAlive     bool
-	Listener             net.Listener
-	OnConnect            func(addr string)
-	OnDisconnect         func(addr string)
-	Logger               *slog.Logger
+	// MaxFrameSize is the max H2 frame payload size (range 16384-16777215).
+	MaxFrameSize uint32
+	// InitialWindowSize is the H2 initial stream flow-control window size.
+	InitialWindowSize uint32
+	// ReadTimeout is the max duration for reading the entire request.
+	ReadTimeout time.Duration
+	// WriteTimeout is the max duration for writing the response.
+	WriteTimeout time.Duration
+	// IdleTimeout is the max duration a keep-alive connection may be idle.
+	IdleTimeout time.Duration
+	// DisableKeepAlive disables HTTP keep-alive.
+	DisableKeepAlive bool
+	// Listener is an optional pre-existing listener for socket inheritance.
+	Listener net.Listener
+	// OnConnect is called when a new connection is accepted.
+	OnConnect func(addr string)
+	// OnDisconnect is called when a connection is closed.
+	OnDisconnect func(addr string)
+	// Logger is the structured logger for engine diagnostics (default slog.Default()).
+	Logger *slog.Logger
 }
 
 // Validate checks all config fields and returns any validation errors.

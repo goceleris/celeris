@@ -35,6 +35,7 @@ func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) Tier
 		return &highTier{
 			deferTaskrun: profile.DeferTaskrun,
 			fixedFiles:   profile.FixedFiles,
+			sendZC:       profile.SendZC,
 		}
 	case profile.IOUringTier >= engine.Optional && profile.SQPoll:
 		idle := uint32(sqPollIdle.Milliseconds())
@@ -143,6 +144,7 @@ func (t *midTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 type highTier struct {
 	deferTaskrun bool
 	fixedFiles   bool
+	sendZC       bool
 }
 
 func (t *highTier) Tier() engine.Tier { return engine.High }
@@ -155,8 +157,8 @@ func (t *highTier) SetupFlags() uint32 {
 func (t *highTier) SupportsProvidedBuffers() bool { return true }
 func (t *highTier) SupportsMultishotAccept() bool { return true }
 func (t *highTier) SupportsMultishotRecv() bool   { return true }
-func (t *highTier) SupportsFixedFiles() bool      { return false }
-func (t *highTier) SupportsSendZC() bool          { return false }
+func (t *highTier) SupportsFixedFiles() bool      { return t.fixedFiles }
+func (t *highTier) SupportsSendZC() bool          { return t.sendZC }
 func (t *highTier) SQPollIdle() uint32            { return 0 }
 
 func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
@@ -186,9 +188,17 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	if sqe == nil {
 		return
 	}
-	prepSend(sqe, fd, buf, linked)
-	if t.fixedFiles {
-		setSQEFixedFile(sqe)
+	if t.sendZC && !linked {
+		if t.fixedFiles {
+			prepSendZCFixed(sqe, fd, buf, false)
+		} else {
+			prepSendZC(sqe, fd, buf, false)
+		}
+	} else {
+		prepSend(sqe, fd, buf, linked)
+		if t.fixedFiles {
+			setSQEFixedFile(sqe)
+		}
 	}
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }
@@ -210,7 +220,7 @@ func (t *optionalTier) SetupFlags() uint32 {
 func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
 func (t *optionalTier) SupportsMultishotAccept() bool { return true }
 func (t *optionalTier) SupportsMultishotRecv() bool   { return true }
-func (t *optionalTier) SupportsFixedFiles() bool      { return false }
+func (t *optionalTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *optionalTier) SupportsSendZC() bool          { return t.sendZC }
 func (t *optionalTier) SQPollIdle() uint32            { return t.sqPollIdle }
 

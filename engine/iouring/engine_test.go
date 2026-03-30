@@ -79,7 +79,6 @@ func TestSelectTierHigh(t *testing.T) {
 }
 
 func TestSelectTierHighWithFixedFiles(t *testing.T) {
-	// Fixed files are disabled (IU-1: TCP_NODELAY not set with ACCEPT_DIRECT).
 	profile := engine.CapabilityProfile{
 		IOUringTier:     engine.High,
 		CoopTaskrun:     true,
@@ -93,8 +92,8 @@ func TestSelectTierHighWithFixedFiles(t *testing.T) {
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
-	if tier.SupportsFixedFiles() {
-		t.Error("fixed files should be disabled (TCP_NODELAY bug)")
+	if !tier.SupportsFixedFiles() {
+		t.Error("fixed files should be enabled when profile.FixedFiles is true")
 	}
 }
 
@@ -216,8 +215,8 @@ func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
 	if flags&setupSQPoll == 0 {
 		t.Error("expected SQPOLL in setup flags")
 	}
-	if tier.SupportsFixedFiles() {
-		t.Error("fixed files should be disabled (TCP_NODELAY bug)")
+	if !tier.SupportsFixedFiles() {
+		t.Error("fixed files should be enabled when profile.FixedFiles is true")
 	}
 }
 

@@ -16,6 +16,7 @@ const (
 // IsDefault reports whether the engine type is the unset zero value.
 func (t EngineType) IsDefault() bool { return t == engineDefault }
 
+// String returns the human-readable engine type name (e.g. "io_uring", "epoll").
 func (t EngineType) String() string {
 	switch t {
 	case IOUring:

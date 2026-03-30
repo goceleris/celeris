@@ -22,7 +22,8 @@ func init() {
 	}
 }
 
-// EngineMetrics is a point-in-time snapshot of engine-level performance counters.
+// EngineMetrics is a type alias for [engine.EngineMetrics], re-exported here so
+// users of the observe package do not need to import engine directly.
 type EngineMetrics = engine.EngineMetrics
 
 // Snapshot is a point-in-time copy of all collected metrics. All fields are
@@ -55,7 +56,8 @@ type Collector struct {
 	engineMetricsFn func() EngineMetrics
 }
 
-// NewCollector creates a new Collector.
+// NewCollector creates a new Collector with zeroed counters. The server creates
+// one automatically unless Config.DisableMetrics is true.
 func NewCollector() *Collector {
 	return &Collector{}
 }

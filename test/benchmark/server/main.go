@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -101,9 +102,11 @@ func createEngine(name string, cfg resource.Config, handler stream.Handler) (eng
 var (
 	textPlainHeaders = [][2]string{{"content-type", "text/plain"}}
 	jsonHeaders      = [][2]string{{"content-type", "application/json"}}
+	octetHeaders     = [][2]string{{"content-type", "application/octet-stream"}}
 	helloBody        = []byte("Hello, World!")
 	jsonBody         = []byte(`{"message":"Hello, World!"}`)
 	notFoundBody     = []byte("Not Found")
+	downloadBody     = bytes.Repeat([]byte("X"), 65536) // 64KB for large-download benchmarks
 )
 
 func newHandler() stream.HandlerFunc {
@@ -126,6 +129,8 @@ func newHandler() stream.HandlerFunc {
 			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, helloBody)
 		case method == "GET" && path == "/json":
 			return s.ResponseWriter.WriteResponse(s, 200, jsonHeaders, jsonBody)
+		case method == "GET" && path == "/download":
+			return s.ResponseWriter.WriteResponse(s, 200, octetHeaders, downloadBody)
 		case method == "GET" && strings.HasPrefix(path, "/users/"):
 			id := strings.TrimPrefix(path, "/users/")
 			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, []byte("User ID: "+id))

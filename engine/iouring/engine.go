@@ -47,6 +47,31 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("io_uring not available on this system")
 	}
 
+	// Runtime feature probes: verify features actually work on this kernel,
+	// overriding version-based detection which is unreliable (e.g., AWS
+	// kernels may have features disabled or partially broken).
+	// SEND_ZC runtime probe with IORING_SEND_ZC_REPORT_USAGE.
+	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
+	if profile.SendZC {
+		zcResult := probeSendZC()
+		cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
+		switch zcResult {
+		case SendZCTrueZeroCopy:
+			// True zero-copy on this NIC — keep enabled.
+		case SendZCCopyFallback:
+			// Works but copies data (loopback, or NIC without scatter-gather DMA).
+			// No performance benefit over regular SEND — disable.
+			profile.SendZC = false
+		default:
+			// Unsupported or broken — disable.
+			profile.SendZC = false
+		}
+	}
+	if profile.FixedFiles && !probeFixedFiles() {
+		cfg.Logger.Info("fixed files runtime probe failed, disabling")
+		profile.FixedFiles = false
+	}
+
 	tier := SelectTier(profile, 2*time.Second)
 	if tier == nil {
 		return nil, fmt.Errorf("no suitable io_uring tier available")

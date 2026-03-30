@@ -41,14 +41,14 @@ func TestResolveAllOverrides(t *testing.T) {
 func TestResolveDefaultValues(t *testing.T) {
 	r := Resources{}
 	res := r.Resolve()
-	if res.SQERingSize != 32768 {
-		t.Errorf("SQERingSize = %d, want 32768", res.SQERingSize)
+	if res.SQERingSize != 8192 {
+		t.Errorf("SQERingSize = %d, want 8192", res.SQERingSize)
 	}
 	if res.BufferPool != 65536 {
 		t.Errorf("BufferPool = %d, want 65536", res.BufferPool)
 	}
-	if res.BufferSize != 65536 {
-		t.Errorf("BufferSize = %d, want 65536", res.BufferSize)
+	if res.BufferSize != 8192 {
+		t.Errorf("BufferSize = %d, want 8192", res.BufferSize)
 	}
 	if res.MaxEvents != 8192 {
 		t.Errorf("MaxEvents = %d, want 8192", res.MaxEvents)

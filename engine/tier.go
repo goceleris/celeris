@@ -13,6 +13,7 @@ const (
 	Optional             // kernel 6.0+ (SINGLE_ISSUER, SQPOLL)
 )
 
+// String returns the tier name (e.g. "none", "base", "high").
 func (t Tier) String() string {
 	switch t {
 	case None:
