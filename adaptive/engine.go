@@ -90,7 +90,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	// Start with primary (epoll) for all protocols. Epoll has better H2
 	// throughput on current kernels and matches H1 performance.
-	var initialActive engine.Engine = primary //nolint:staticcheck // explicit interface type required for atomic.Pointer[engine.Engine]
+	var initialActive engine.Engine = primary
 	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
