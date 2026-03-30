@@ -43,7 +43,10 @@ type Engine struct {
 	freezeCooldown time.Duration
 }
 
-// New creates a new adaptive engine with io_uring as primary and epoll as secondary.
+// New creates a new adaptive engine with epoll as primary and io_uring as secondary.
+// Epoll starts first because it has lower H2 latency on current kernels (single-pass
+// read→process→write vs io_uring's two-iteration CQE model). The controller may
+// switch to io_uring if telemetry indicates it would perform better for the workload.
 // Both sub-engines get the full resource config. This is safe because standby
 // workers are fully suspended (zero CPU, zero connections, listen sockets closed).
 func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
@@ -62,14 +65,14 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 
-	primary, err := iouring.New(cfg, handler)
-	if err != nil {
-		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
-	}
-
-	secondary, err := epoll.New(cfg, handler)
+	primary, err := epoll.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("epoll sub-engine: %w", err)
+	}
+
+	secondary, err := iouring.New(cfg, handler)
+	if err != nil {
+		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
 
 	sampler := newLiveSampler()
@@ -85,16 +88,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	e.ctrl = newController(primary, secondary, sampler, logger)
 
-	// Set initial active engine per SDD 7.5.
-	var initialActive engine.Engine
-	switch cfg.Protocol {
-	case engine.H2C:
-		initialActive = secondary
-		e.ctrl.state.activeIsPrimary = false
-	default: // HTTP1, Auto → io_uring
-		initialActive = primary
-		e.ctrl.state.activeIsPrimary = true
-	}
+	// Start with primary (epoll) for all protocols. Epoll has better H2
+	// throughput on current kernels and matches H1 performance.
+	var initialActive engine.Engine = primary
+	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
 	return e, nil
@@ -116,15 +113,8 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 
 	e.ctrl = newController(primary, secondary, sampler, logger)
 
-	var initialActive engine.Engine
-	switch cfg.Protocol {
-	case engine.H2C:
-		initialActive = secondary
-		e.ctrl.state.activeIsPrimary = false
-	default:
-		initialActive = primary
-		e.ctrl.state.activeIsPrimary = true
-	}
+	initialActive := primary
+	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
 	return e
@@ -141,13 +131,13 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	wg.Go(func() {
 		if err := e.primary.Listen(innerCtx); err != nil {
-			errCh <- fmt.Errorf("primary (io_uring): %w", err)
+			errCh <- fmt.Errorf("primary (epoll): %w", err)
 		}
 	})
 
 	wg.Go(func() {
 		if err := e.secondary.Listen(innerCtx); err != nil {
-			errCh <- fmt.Errorf("secondary (epoll): %w", err)
+			errCh <- fmt.Errorf("secondary (io_uring): %w", err)
 		}
 	})
 

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -25,21 +26,8 @@ import (
 
 func main() {
 	engName := envOr("ENGINE", "iouring")
-	objName := envOr("OBJECTIVE", "latency")
 	protoName := envOr("PROTOCOL", "h1")
 	port := envOr("PORT", "18080")
-
-	var obj resource.ObjectiveProfile
-	switch objName {
-	case "latency":
-		obj = resource.LatencyOptimized
-	case "throughput":
-		obj = resource.ThroughputOptimized
-	case "balanced":
-		obj = resource.BalancedObjective
-	default:
-		log.Fatalf("unknown objective: %s", objName)
-	}
 
 	var proto engine.Protocol
 	switch protoName {
@@ -54,11 +42,17 @@ func main() {
 	}
 
 	cfg := resource.Config{
-		Addr:      ":" + port,
-		Protocol:  proto,
-		Objective: obj,
-		Resources: resource.Resources{Preset: resource.Greedy},
+		Addr:     ":" + port,
+		Protocol: proto,
 	}.WithDefaults()
+
+	// Override workers if explicitly set.
+	if w := envOr("WORKERS", ""); w != "" {
+		var n int
+		if _, err := fmt.Sscanf(w, "%d", &n); err == nil && n > 0 {
+			cfg.Resources.Workers = n
+		}
+	}
 
 	handler := newHandler()
 	eng, err := createEngine(engName, cfg, handler)
@@ -76,7 +70,7 @@ func main() {
 		cancel()
 	}()
 
-	log.Printf("Starting %s-%s-%s on :%s", engName, objName, protoName, port)
+	log.Printf("Starting %s-%s on :%s", engName, protoName, port)
 	if err := eng.Listen(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("listen: %v", err)
 	}
@@ -108,9 +102,11 @@ func createEngine(name string, cfg resource.Config, handler stream.Handler) (eng
 var (
 	textPlainHeaders = [][2]string{{"content-type", "text/plain"}}
 	jsonHeaders      = [][2]string{{"content-type", "application/json"}}
+	octetHeaders     = [][2]string{{"content-type", "application/octet-stream"}}
 	helloBody        = []byte("Hello, World!")
 	jsonBody         = []byte(`{"message":"Hello, World!"}`)
 	notFoundBody     = []byte("Not Found")
+	downloadBody     = bytes.Repeat([]byte("X"), 65536) // 64KB for large-download benchmarks
 )
 
 func newHandler() stream.HandlerFunc {
@@ -133,9 +129,14 @@ func newHandler() stream.HandlerFunc {
 			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, helloBody)
 		case method == "GET" && path == "/json":
 			return s.ResponseWriter.WriteResponse(s, 200, jsonHeaders, jsonBody)
+		case method == "GET" && path == "/download":
+			return s.ResponseWriter.WriteResponse(s, 200, octetHeaders, downloadBody)
 		case method == "GET" && strings.HasPrefix(path, "/users/"):
 			id := strings.TrimPrefix(path, "/users/")
 			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, []byte("User ID: "+id))
+		case method == "POST" && path == "/upload":
+			// Body benchmark: read and discard request body, return OK.
+			return s.ResponseWriter.WriteResponse(s, 200, textPlainHeaders, helloBody)
 		default:
 			return s.ResponseWriter.WriteResponse(s, 404, textPlainHeaders, notFoundBody)
 		}

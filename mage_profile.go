@@ -14,17 +14,20 @@ import (
 const profileVM = "celeris-profile"
 
 // profileConfigs defines the configs to profile.
-// Focused on latency objective with both engines and both protocols
-// for fast iteration cycles.
+// All 9 engine×protocol combinations for comprehensive coverage.
 var profileConfigs = []struct {
-	engine    string
-	objective string
-	protocol  string
+	engine   string
+	protocol string
 }{
-	{"epoll", "latency", "h1"},
-	{"iouring", "latency", "h1"},
-	{"epoll", "latency", "h2"},
-	{"iouring", "latency", "h2"},
+	{"epoll", "h1"},
+	{"epoll", "h2"},
+	{"epoll", "hybrid"},
+	{"iouring", "h1"},
+	{"iouring", "h2"},
+	{"iouring", "hybrid"},
+	{"adaptive", "h1"},
+	{"adaptive", "h2"},
+	{"adaptive", "hybrid"},
 }
 
 // profileArtifacts lists the files captured per profile run.
@@ -74,12 +77,12 @@ func LocalProfile() error {
 
 func runProfileDirect(dir string, bins map[string]string, branch string) error {
 	fmt.Println("Running profiling directly on Linux...")
-	return runProfileOnTarget(dir, branch, func(version, engine, objective, protocol string) error {
+	return runProfileOnTarget(dir, branch, func(version, engine, protocol string) error {
 		profiledBin := bins["profiled-main"]
 		if version == "current" {
 			profiledBin = bins["profiled-current"]
 		}
-		return profileOneConfig(dir, version, engine, objective, protocol,
+		return profileOneConfig(dir, version, engine, protocol,
 			profiledBin, bins["fullstack-current"])
 	})
 }
@@ -108,18 +111,18 @@ func runProfileInVM(dir string, bins map[string]string, arch, branch string) err
 	}
 	_, _ = vmExec(profileVM, "chmod +x /tmp/profile/*")
 
-	return runProfileOnTarget(dir, branch, func(version, engine, objective, protocol string) error {
+	return runProfileOnTarget(dir, branch, func(version, engine, protocol string) error {
 		profiledBin := remoteBins["profiled-main"]
 		if version == "current" {
 			profiledBin = remoteBins["profiled-current"]
 		}
 		loadBin := remoteBins["fullstack-current"]
-		tag := fmt.Sprintf("%s-%s-%s", engine, objective, protocol)
+		tag := fmt.Sprintf("%s-%s", engine, protocol)
 
 		remoteDir := fmt.Sprintf("/tmp/profile/results/%s/%s", tag, version)
 		_, _ = vmExec(profileVM, "mkdir -p "+remoteDir)
 
-		script := buildProfileScript(profiledBin, loadBin, engine, objective, protocol, remoteDir)
+		script := buildProfileScript(profiledBin, loadBin, engine, protocol, remoteDir)
 		fmt.Printf("  Running profile script in VM...\n")
 		if _, err := vmExec(profileVM, script); err != nil {
 			fmt.Printf("  WARNING: profile capture failed: %v\n", err)
@@ -138,16 +141,16 @@ func runProfileInVM(dir string, bins map[string]string, arch, branch string) err
 
 // runProfileOnTarget iterates through configs and branches, calling profileFn
 // for each. After all captures, it runs automated profile analysis.
-func runProfileOnTarget(dir, branch string, profileFn func(version, engine, objective, protocol string) error) error {
+func runProfileOnTarget(dir, branch string, profileFn func(version, engine, protocol string) error) error {
 	for _, cfg := range profileConfigs {
-		tag := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		tag := fmt.Sprintf("%s-%s", cfg.engine, cfg.protocol)
 		for _, version := range []string{"main", "current"} {
 			label := "main"
 			if version == "current" {
 				label = branch
 			}
 			fmt.Printf("\n--- Profiling: %s %s ---\n", label, tag)
-			if err := profileFn(version, cfg.engine, cfg.objective, cfg.protocol); err != nil {
+			if err := profileFn(version, cfg.engine, cfg.protocol); err != nil {
 				fmt.Printf("  WARNING: %s %s failed: %v\n", version, tag, err)
 			}
 		}
@@ -163,12 +166,12 @@ func runProfileOnTarget(dir, branch string, profileFn func(version, engine, obje
 }
 
 // profileOneConfig runs one profile capture (Linux direct mode).
-func profileOneConfig(dir, version, engine, objective, protocol, profiledBin, loadBin string) error {
-	tag := fmt.Sprintf("%s-%s-%s", engine, objective, protocol)
+func profileOneConfig(dir, version, engine, protocol, profiledBin, loadBin string) error {
+	tag := fmt.Sprintf("%s-%s", engine, protocol)
 	localDir := filepath.Join(dir, tag, version)
 	_ = os.MkdirAll(localDir, 0o755)
 
-	script := buildProfileScript(profiledBin, loadBin, engine, objective, protocol, localDir)
+	script := buildProfileScript(profiledBin, loadBin, engine, protocol, localDir)
 	cmd := exec.Command("bash", "-c", script)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -178,7 +181,7 @@ func profileOneConfig(dir, version, engine, objective, protocol, profiledBin, lo
 // buildProfileScript generates a bash script that starts the profiled server,
 // applies sustained load via h2load/wrk, captures pprof profiles and perf stat
 // counters, and cleans up. Includes diagnostics for empty profile detection.
-func buildProfileScript(profiledBin, _ /* loadBin unused */, engine, objective, protocol, outputDir string) string {
+func buildProfileScript(profiledBin, _ /* loadBin unused */, engine, protocol, outputDir string) string {
 	var loadCmd string
 	if protocol == "h2" {
 		loadCmd = "taskset -c 4-7 h2load -c 128 -m 128 -t 4 -D 25 http://127.0.0.1:18080/ > /dev/null 2>&1 &"
@@ -191,8 +194,8 @@ func buildProfileScript(profiledBin, _ /* loadBin unused */, engine, objective, 
 		"# Kill any leftover server.",
 		"sudo pkill -9 -f profiled 2>/dev/null || true",
 		"sleep 1",
-		fmt.Sprintf("sudo taskset -c 0-3 env ENGINE=%s OBJECTIVE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/profiled.log 2>&1 &",
-			engine, objective, protocol, profiledBin),
+		fmt.Sprintf("sudo taskset -c 0-3 env ENGINE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/profiled.log 2>&1 &",
+			engine, protocol, profiledBin),
 		"SERVER_PID=$!",
 		"sleep 2",
 		"",
@@ -357,18 +360,18 @@ func CloudProfile() error {
 	_, _ = awsSSH(ip, keyPath, "sudo apt-get install -y -qq linux-tools-$(uname -r) linux-tools-common 2>/dev/null || true")
 	_, _ = awsSSH(ip, keyPath, "sudo sysctl -w kernel.io_uring_disabled=0 2>/dev/null; sudo sysctl -w kernel.io_uring_group=-1 2>/dev/null; echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_io_uring 2>/dev/null")
 
-	return runProfileOnTarget(dir, branch, func(version, engine, objective, protocol string) error {
+	return runProfileOnTarget(dir, branch, func(version, engine, protocol string) error {
 		profiledBin := "/tmp/profile/profiled-main"
 		if version == "current" {
 			profiledBin = "/tmp/profile/profiled-current"
 		}
 		loadBin := "/tmp/profile/fullstack-current"
-		tag := fmt.Sprintf("%s-%s-%s", engine, objective, protocol)
+		tag := fmt.Sprintf("%s-%s", engine, protocol)
 
 		remoteDir := fmt.Sprintf("/tmp/profile/results/%s/%s", tag, version)
 		_, _ = awsSSH(ip, keyPath, fmt.Sprintf("mkdir -p %s", remoteDir))
 
-		script := buildProfileScript(profiledBin, loadBin, engine, objective, protocol, remoteDir)
+		script := buildProfileScript(profiledBin, loadBin, engine, protocol, remoteDir)
 		fmt.Printf("  Running profile capture on %s...\n", ip)
 		if _, err := awsSSH(ip, keyPath, script); err != nil {
 			fmt.Printf("  WARNING: profile capture failed: %v\n", err)
@@ -519,7 +522,7 @@ func CloudProfileSplit() error {
 
 	// Profile each config and version.
 	for _, cfg := range profileConfigs {
-		tag := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		tag := fmt.Sprintf("%s-%s", cfg.engine, cfg.protocol)
 		for _, version := range []string{"main", "current"} {
 			label := "main"
 			if version == "current" {
@@ -535,7 +538,7 @@ func CloudProfileSplit() error {
 			remoteDir := fmt.Sprintf("/tmp/profile/results/%s/%s", tag, version)
 			_, _ = awsSSH(serverPublicIP, keyPath, "mkdir -p "+remoteDir)
 
-			script := buildSplitProfilePassScript(profiledBin, cfg.engine, cfg.objective, cfg.protocol,
+			script := buildSplitProfilePassScript(profiledBin, cfg.engine, cfg.protocol,
 				serverPrivateIP, "/tmp/server-key.pem", remoteDir)
 
 			scriptPath := filepath.Join(dir, fmt.Sprintf("profile-%s-%s.sh", tag, version))
@@ -574,7 +577,7 @@ func CloudProfileSplit() error {
 // buildSplitProfilePassScript generates a bash script that runs on the CLIENT
 // machine for one profile capture. It starts the server via SSH, runs load
 // locally, and triggers profile + perf stat capture on the server.
-func buildSplitProfilePassScript(serverBin, engine, objective, protocol, serverIP, serverKeyPath, remoteOutputDir string) string {
+func buildSplitProfilePassScript(serverBin, engine, protocol, serverIP, serverKeyPath, remoteOutputDir string) string {
 	sshBase := fmt.Sprintf("ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ServerAliveInterval=30 -o ConnectTimeout=10 -i %s ubuntu@%s",
 		serverKeyPath, serverIP)
 
@@ -590,8 +593,8 @@ func buildSplitProfilePassScript(serverBin, engine, objective, protocol, serverI
 		"sudo pkill -9 -f profiled 2>/dev/null || true",
 		"sleep 0.5",
 		"echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_io_uring > /dev/null 2>&1 || true",
-		fmt.Sprintf("sudo env ENGINE=%s OBJECTIVE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/profiled.log 2>&1 &",
-			engine, objective, protocol, serverBin),
+		fmt.Sprintf("sudo env ENGINE=%s PROTOCOL=%s PORT=18080 prlimit --memlock=unlimited %s > /tmp/profiled.log 2>&1 &",
+			engine, protocol, serverBin),
 		"sleep 3",
 		"if timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/18080' 2>/dev/null; then echo SERVER_READY; else echo SERVER_FAILED; cat /tmp/profiled.log 2>/dev/null; fi",
 		"if timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/6060' 2>/dev/null; then echo PPROF_READY; else echo PPROF_FAILED; fi",
@@ -694,7 +697,7 @@ func analyzeProfiles(dir string) error {
 	report.WriteString(strings.Repeat("=", 60) + "\n\n")
 
 	for _, cfg := range profileConfigs {
-		tag := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		tag := fmt.Sprintf("%s-%s", cfg.engine, cfg.protocol)
 		report.WriteString(fmt.Sprintf("Config: %s\n", tag))
 		report.WriteString(strings.Repeat("-", 40) + "\n")
 
@@ -757,7 +760,7 @@ func analyzeProfiles(dir string) error {
 	// Try flamegraph SVGs (requires graphviz).
 	svgGenerated := false
 	for _, cfg := range profileConfigs {
-		tag := fmt.Sprintf("%s-%s-%s", cfg.engine, cfg.objective, cfg.protocol)
+		tag := fmt.Sprintf("%s-%s", cfg.engine, cfg.protocol)
 		currentCPU := filepath.Join(dir, tag, "current", "cpu.prof")
 		svgPath := filepath.Join(dir, tag, "current", "flamegraph.svg")
 		if isValidProfile(currentCPU) {

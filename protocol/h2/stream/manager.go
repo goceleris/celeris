@@ -264,3 +264,21 @@ func (m *Manager) GetSendWindowsAndMaxFrameFast(s *Stream) (connWindow int32, st
 	maxFrame = atomic.LoadUint32(&m.maxFrameSize)
 	return
 }
+
+// Close releases all streams still held by the manager. Called when the
+// H2 connection is closed to prevent stream objects from leaking in the map.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	for id, s := range m.streams {
+		delete(m.streams, id)
+		// Only release streams that aren't running async handlers.
+		if s.flags.Load()&flagAsyncRunning == 0 {
+			s.Release()
+		}
+	}
+	m.mu.Unlock()
+
+	m.windowUpdateMu.Lock()
+	clear(m.pendingStreamUpdates)
+	m.windowUpdateMu.Unlock()
+}

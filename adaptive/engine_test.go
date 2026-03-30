@@ -71,19 +71,21 @@ func (m *mockEngine) ResumeAccept() error {
 }
 
 func TestInitialBias(t *testing.T) {
+	// newFromEngines always starts with primary. In production, New()
+	// creates epoll as primary, so all protocols start with epoll.
 	tests := []struct {
 		protocol engine.Protocol
 		wantType engine.EngineType
 	}{
-		{engine.HTTP1, engine.IOUring},
+		{engine.HTTP1, engine.Epoll},
 		{engine.H2C, engine.Epoll},
-		{engine.Auto, engine.IOUring},
+		{engine.Auto, engine.Epoll},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.protocol.String(), func(t *testing.T) {
-			primary := newMockEngine(engine.IOUring)
-			secondary := newMockEngine(engine.Epoll)
+			primary := newMockEngine(engine.Epoll)
+			secondary := newMockEngine(engine.IOUring)
 			sampler := newSyntheticSampler()
 
 			cfg := resource.Config{Protocol: tt.protocol}

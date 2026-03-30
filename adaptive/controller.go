@@ -88,6 +88,16 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	activeSnap := c.sampler.Sample(active)
 	activeScore := computeScore(activeSnap, c.weights)
 
+	// Apply io_uring bias: when conditions favor io_uring (256-4096 connections,
+	// high CPU), add a bonus to io_uring's score or penalty to epoll's score.
+	// This enables proactive switching even when throughput is equivalent.
+	bias := ioUringBias(activeSnap)
+	if active.Type() == engine.IOUring {
+		activeScore *= (1.0 + bias) // Bonus: io_uring already active, reinforce
+	} else if bias > 0 {
+		activeScore *= (1.0 - bias*0.5) // Penalty: epoll active but conditions favor io_uring
+	}
+
 	// Store active's score for historical reference.
 	c.state.lastActiveScore[active.Type()] = activeScore
 	c.state.lastActiveTime[active.Type()] = now

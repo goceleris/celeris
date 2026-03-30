@@ -34,8 +34,11 @@ const fixedFileTableSize = 65536
 const bufRingGroupID = 0
 
 // bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2.
-const bufRingCount = 4096
+// Must be a power of 2. 128 supports 128 concurrent in-flight multishot
+// recvs per worker. Typical web workloads have ~15-30 concurrent recvs
+// per worker, so 128 is a 4-8x safety margin. With 8KB buffers:
+// 128 * 8KB = 1 MB per worker; 64 workers = 64 MB total.
+const bufRingCount = 128
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
@@ -51,7 +54,6 @@ type Worker struct {
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
 	handler      stream.Handler
-	objective    resource.ObjectiveParams
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
 	bufRing      *BufferRing // ring-mapped provided buffers for multishot recv
@@ -77,10 +79,11 @@ type Worker struct {
 	h2EventFD     int        // eventfd for H2 write queue wakeup (-1 if unavailable)
 	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
 	h2cfg         conn.H2Config
+	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
-	objective resource.ObjectiveParams, resolved resource.ResolvedResources,
+	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
 	acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
@@ -99,7 +102,6 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		sendZC:       tier.SupportsSendZC(),
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
-		objective:    objective,
 		resolved:     resolved,
 		cfg:          cfg,
 		logger:       cfg.Logger,
@@ -115,9 +117,9 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 		},
 		sockOpts: sockopts.Options{
-			TCPNoDelay:  objective.TCPNoDelay,
-			TCPQuickAck: objective.TCPQuickAck,
-			SOBusyPoll:  objective.SOBusyPoll,
+			TCPNoDelay:  true,
+			TCPQuickAck: true,
+			SOBusyPoll:  50 * time.Microsecond,
 			RecvBuf:     resolved.SocketRecv,
 			SendBuf:     resolved.SocketSend,
 		},
@@ -263,15 +265,8 @@ func (w *Worker) run(ctx context.Context) {
 			// Check CQ ring — if CQEs ready, process without syscall.
 			cqHead, cqTail = w.ring.BeginCQ()
 			if cqHead == cqTail {
-				// No CQEs — wait with timeout (only remaining syscall).
-				waitTimeout := 100 * time.Millisecond
-				if w.listenFD < 0 {
-					waitTimeout = 1 * time.Second
-				}
-				if len(w.h2Conns) > 0 && w.h2EventFD < 0 {
-					waitTimeout = 100 * time.Microsecond
-				}
-				if err := w.ring.WaitCQETimeout(waitTimeout); err != nil {
+				// No CQEs — wait with adaptive timeout.
+				if err := w.ring.WaitCQETimeout(w.adaptiveTimeout()); err != nil {
 					w.shutdown()
 					return
 				}
@@ -294,11 +289,15 @@ func (w *Worker) run(ctx context.Context) {
 			hasPending := w.ring.Pending() > 0
 			cqHead, cqTail = w.ring.BeginCQ()
 			if cqHead != cqTail && hasPending {
-				// Mode 1: CQEs ready — just push pending SQEs, process CQEs below.
-				if _, err := w.ring.Submit(); err != nil {
+				// Mode 1: CQEs ready + SQEs pending. SubmitAndWait combines
+				// submission + CQE retrieval into one syscall (saves ~300ns vs
+				// separate Submit + next-iteration wait).
+				if err := w.ring.SubmitAndWait(); err != nil {
 					w.shutdown()
 					return
 				}
+				cqHead, cqTail = w.ring.BeginCQ()
+			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
 			} else if hasPending && w.sendsPending {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
@@ -308,16 +307,9 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
 			} else if hasPending || cqHead == cqTail {
-				// Mode 3b: no guaranteed CQEs — wait with timeout for
+				// Mode 3b: no guaranteed CQEs — wait with adaptive timeout for
 				// shutdown checks and CQE_SKIP_SUCCESS operations.
-				waitTimeout := 100 * time.Millisecond
-				if w.listenFD < 0 {
-					waitTimeout = 1 * time.Second
-				}
-				if len(w.h2Conns) > 0 && w.h2EventFD < 0 {
-					waitTimeout = 100 * time.Microsecond
-				}
-				if err := w.ring.SubmitAndWaitTimeout(waitTimeout); err != nil {
+				if err := w.ring.SubmitAndWaitTimeout(w.adaptiveTimeout()); err != nil {
 					w.shutdown()
 					return
 				}
@@ -327,6 +319,7 @@ func (w *Worker) run(ctx context.Context) {
 		w.sendsPending = false
 
 		if cqHead != cqTail {
+			w.emptyIters = 0 // Reset adaptive timeout on activity.
 			// Refresh cached timestamp every 64 iterations to amortize
 			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
 			// uses multi-second windows so ~1ms resolution is sufficient.
@@ -409,18 +402,14 @@ func (w *Worker) run(ctx context.Context) {
 			cs = next
 		}
 
-		// Immediate submit (non-SQPOLL): flush SENDs to the kernel NOW
-		// instead of deferring to the next iteration's adaptive submit.
-		// Skip when CQEs are already visible — the next iteration wakes
-		// immediately (mode 1) and does Submit() there, saving ~300ns.
-		if !w.sqpoll && w.ring.Pending() > 0 {
-			cqH, cqT := w.ring.BeginCQ()
-			if cqH == cqT {
-				if _, err := w.ring.Submit(); err != nil {
-					w.shutdown()
-					return
-				}
-			}
+		// SENDs queued during CQE processing are submitted at the top of
+		// the next iteration: Mode 1 SubmitAndWait combines submit + CQE
+		// retrieval in one syscall. No separate submit needed here.
+
+		// Increment empty iterations counter when no CQEs were found.
+		// (Reset to 0 above when CQEs are present.)
+		if w.emptyIters < 200 {
+			w.emptyIters++
 		}
 
 		// Check connection timeouts every 1024 iterations to amortize
@@ -471,6 +460,31 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udH2Wakeup:
 		w.handleH2Wakeup()
 	case udProvide:
+	}
+}
+
+// adaptiveTimeout returns a wait timeout that scales with idle duration.
+// Under load (CQEs arriving), returns 1ms for minimal latency. During idle
+// periods, backs off to reduce syscall overhead (up to 100ms). When the
+// listen socket is closed (draining), uses 1s. When H2 connections exist
+// without eventfd, uses 100us for write queue polling.
+func (w *Worker) adaptiveTimeout() time.Duration {
+	if w.listenFD < 0 {
+		return 1 * time.Second
+	}
+	if len(w.h2Conns) > 0 && w.h2EventFD < 0 {
+		return 100 * time.Microsecond
+	}
+	if w.dirtyHead != nil {
+		return 0
+	}
+	switch {
+	case w.emptyIters <= 10:
+		return 1 * time.Millisecond
+	case w.emptyIters <= 100:
+		return 5 * time.Millisecond
+	default:
+		return 100 * time.Millisecond
 	}
 }
 
@@ -926,6 +940,11 @@ func (w *Worker) finishClose(fd int) {
 			prepCloseDirect(sqe, fd)
 			setSQEUserData(sqe, encodeUserData(udClose, fd))
 		}
+		// Explicitly reset the fixed file slot to -1 so the kernel's
+		// IORING_FILE_INDEX_ALLOC allocator can reuse it. Without this,
+		// some kernels (e.g., AWS 6.17) fail to recycle CLOSE_DIRECT'd
+		// slots, exhausting the 65536-entry table under sustained churn.
+		_ = w.ring.UpdateFixedFile(fd, -1)
 		return
 	}
 

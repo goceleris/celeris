@@ -1,72 +1,50 @@
 package resource
 
-// ResourcePreset selects a predefined resource allocation profile.
-type ResourcePreset uint8 //nolint:revive // ResourcePreset is clearer than Preset for cross-package use
-
-// Resource preset constants.
-const (
-	Greedy ResourcePreset = iota
-	Balanced
-	Minimal
-)
-
-func (p ResourcePreset) String() string {
-	switch p {
-	case Greedy:
-		return "greedy"
-	case Balanced:
-		return "balanced"
-	case Minimal:
-		return "minimal"
-	default:
-		return "unknown"
-	}
-}
-
-// Resources allows user overrides of preset values.
-// Zero values mean "use preset default".
+// Resources allows user overrides of default resource values.
+// Zero values mean "use engine default".
 type Resources struct {
-	Preset      ResourcePreset
-	Workers     int
-	SQERingSize int
-	BufferPool  int
-	BufferSize  int
-	MaxEvents   int
-	MaxConns    int
-	SocketRecv  int
-	SocketSend  int
+	// Workers is the number of I/O worker goroutines (0 = GOMAXPROCS).
+	Workers int
+	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
+	BufferSize int
+	// SocketRecv is the SO_RCVBUF size for accepted connections (0 = OS default).
+	SocketRecv int
+	// SocketSend is the SO_SNDBUF size for accepted connections (0 = OS default).
+	SocketSend int
+	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
+	MaxConns int
 }
 
-// ResolvedResources contains the final computed values after applying presets and overrides.
+// ResolvedResources contains the final computed values after applying defaults,
+// user overrides, and hard caps. Used by engine implementations at startup.
 type ResolvedResources struct {
-	Workers     int
+	// Workers is the resolved number of I/O worker goroutines.
+	Workers int
+	// SQERingSize is the io_uring submission queue size (power of 2).
 	SQERingSize int
-	BufferPool  int
-	BufferSize  int
-	MaxEvents   int
-	MaxConns    int
-	SocketRecv  int
-	SocketSend  int
+	// BufferPool is the number of pre-allocated I/O buffers.
+	BufferPool int
+	// BufferSize is the resolved per-connection I/O buffer size in bytes.
+	BufferSize int
+	// MaxEvents is the max events returned per epoll_wait call.
+	MaxEvents int
+	// MaxConns is the resolved max connections per worker.
+	MaxConns int
+	// SocketRecv is the resolved SO_RCVBUF size.
+	SocketRecv int
+	// SocketSend is the resolved SO_SNDBUF size.
+	SocketSend int
 }
 
-// Resolve applies preset defaults, user overrides, and hard caps.
-func (r Resources) Resolve(numCPU int) ResolvedResources {
-	res := resolvePreset(r.Preset, numCPU)
+// Resolve applies hardcoded defaults, user overrides, and hard caps.
+func (r Resources) Resolve() ResolvedResources {
+	res := resolveDefaults()
 
 	if r.Workers > 0 {
 		res.Workers = r.Workers
 	}
-	if r.SQERingSize > 0 {
-		res.SQERingSize = r.SQERingSize
-	}
-	if r.BufferPool > 0 {
-		res.BufferPool = r.BufferPool
-	}
 	if r.BufferSize > 0 {
 		res.BufferSize = r.BufferSize
-	}
-	if r.MaxEvents > 0 {
-		res.MaxEvents = r.MaxEvents
 	}
 	if r.MaxConns > 0 {
 		res.MaxConns = r.MaxConns

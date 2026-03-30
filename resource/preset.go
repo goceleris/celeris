@@ -1,55 +1,33 @@
 package resource
 
+import "runtime"
+
 // Resource limit constants for validation and clamping.
 const (
-	MinWorkers    = 2
-	MaxSQERing    = 65536
+	// MinWorkers is the minimum allowed number of I/O workers.
+	MinWorkers = 2
+	// MaxSQERing is the maximum io_uring submission queue ring size.
+	MaxSQERing = 65536
+	// MinBufferSize is the minimum per-connection I/O buffer size in bytes.
 	MinBufferSize = 4096
+	// MaxBufferSize is the maximum per-connection I/O buffer size in bytes.
 	MaxBufferSize = 262144
 )
 
-func resolvePreset(preset ResourcePreset, numCPU int) ResolvedResources {
+func resolveDefaults() ResolvedResources {
+	numCPU := runtime.GOMAXPROCS(0)
 	if numCPU < 1 {
 		numCPU = 1
 	}
-	switch preset {
-	case Greedy:
-		return ResolvedResources{
-			Workers:     numCPU,
-			SQERingSize: 32768,
-			BufferPool:  65536,
-			BufferSize:  65536,
-			MaxEvents:   8192,
-			MaxConns:    65536,
-			SocketRecv:  262144,
-			SocketSend:  262144,
-		}
-	case Minimal:
-		workers := numCPU / 2
-		if workers < MinWorkers {
-			workers = MinWorkers
-		}
-		return ResolvedResources{
-			Workers:     workers,
-			SQERingSize: 2048,
-			BufferPool:  1024,
-			BufferSize:  16384,
-			MaxEvents:   1024,
-			MaxConns:    1024,
-			SocketRecv:  65536,
-			SocketSend:  65536,
-		}
-	default:
-		return ResolvedResources{
-			Workers:     numCPU,
-			SQERingSize: min(2048*numCPU, 32768),
-			BufferPool:  min(512*numCPU, 65536),
-			BufferSize:  65536,
-			MaxEvents:   min(1024*numCPU, 8192),
-			MaxConns:    min(512*numCPU, 65536),
-			SocketRecv:  262144,
-			SocketSend:  262144,
-		}
+	return ResolvedResources{
+		Workers:     numCPU,
+		SQERingSize: 8192,
+		BufferPool:  65536,
+		BufferSize:  8192,
+		MaxEvents:   8192,
+		MaxConns:    65536,
+		SocketRecv:  262144,
+		SocketSend:  262144,
 	}
 }
 

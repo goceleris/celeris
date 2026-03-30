@@ -164,12 +164,14 @@ func awsLaunchInstance(ami, instanceType, keyName, sgID, arch string) (instanceI
 	return instanceID, publicIP, nil
 }
 
-// awsWaitSSH polls until SSH authentication works on the instance.
-// TCP connectivity alone is insufficient — cloud-init may still be setting
-// up authorized_keys or restarting sshd.
+// awsWaitSSH polls until SSH authentication works on the instance (ubuntu user).
 func awsWaitSSH(ip, keyPath string) error {
+	return awsWaitSSHAs("ubuntu", ip, keyPath)
+}
+
+// awsWaitSSHAs polls until SSH authentication works on the instance.
+func awsWaitSSHAs(user, ip, keyPath string) error {
 	fmt.Printf("  Waiting for SSH on %s...\n", ip)
-	// First wait for TCP port to be open.
 	for range 60 {
 		conn, err := net.DialTimeout("tcp", ip+":22", 2*time.Second)
 		if err == nil {
@@ -178,9 +180,8 @@ func awsWaitSSH(ip, keyPath string) error {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	// Then verify actual SSH auth works (cloud-init may still be running).
 	for attempt := range 30 {
-		out, err := awsSSH(ip, keyPath, "echo ready")
+		out, err := awsSSHAs(user, ip, keyPath, "echo ready")
 		if err == nil && strings.Contains(out, "ready") {
 			fmt.Printf("  SSH ready on %s (attempt %d)\n", ip, attempt+1)
 			return nil
@@ -192,20 +193,29 @@ func awsWaitSSH(ip, keyPath string) error {
 
 // awsSCP uploads a local file to the instance.
 func awsSCP(src, dst, ip, keyPath string) error {
-	return run("scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-		"-i", keyPath, src, fmt.Sprintf("ubuntu@%s:%s", ip, dst))
+	return awsSCPAs("ubuntu", src, dst, ip, keyPath)
 }
 
-// awsSSH runs a command on the instance. The command is passed as the SSH
-// remote command, which is interpreted by the remote shell.
+// awsSCPAs uploads a local file to the instance as the specified user.
+func awsSCPAs(user, src, dst, ip, keyPath string) error {
+	return run("scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+		"-i", keyPath, src, fmt.Sprintf("%s@%s:%s", user, ip, dst))
+}
+
+// awsSSH runs a command on the instance as the ubuntu user.
 func awsSSH(ip, keyPath, cmd string) (string, error) {
+	return awsSSHAs("ubuntu", ip, keyPath, cmd)
+}
+
+// awsSSHAs runs a command on the instance as the specified user.
+func awsSSHAs(user, ip, keyPath, cmd string) (string, error) {
 	c := exec.Command("ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ConnectTimeout=10",
 		"-o", "ServerAliveInterval=30",
 		"-o", "BatchMode=yes",
 		"-i", keyPath,
-		fmt.Sprintf("ubuntu@%s", ip),
+		fmt.Sprintf("%s@%s", user, ip),
 		cmd)
 	out, err := c.CombinedOutput()
 	return string(out), err

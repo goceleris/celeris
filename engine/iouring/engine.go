@@ -7,9 +7,9 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/platform"
@@ -47,8 +47,32 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("io_uring not available on this system")
 	}
 
-	objective := resource.ResolveObjective(cfg.Objective)
-	tier := SelectTier(profile, objective.SQPollIdle)
+	// Runtime feature probes: verify features actually work on this kernel,
+	// overriding version-based detection which is unreliable (e.g., AWS
+	// kernels may have features disabled or partially broken).
+	// SEND_ZC runtime probe with IORING_SEND_ZC_REPORT_USAGE.
+	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
+	if profile.SendZC {
+		zcResult := probeSendZC()
+		cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
+		switch zcResult {
+		case SendZCTrueZeroCopy:
+			// True zero-copy on this NIC — keep enabled.
+		case SendZCCopyFallback:
+			// Works but copies data (loopback, or NIC without scatter-gather DMA).
+			// No performance benefit over regular SEND — disable.
+			profile.SendZC = false
+		default:
+			// Unsupported or broken — disable.
+			profile.SendZC = false
+		}
+	}
+	if profile.FixedFiles && !probeFixedFiles() {
+		cfg.Logger.Info("fixed files runtime probe failed, disabling")
+		profile.FixedFiles = false
+	}
+
+	tier := SelectTier(profile, 2*time.Second)
 	if tier == nil {
 		return nil, fmt.Errorf("no suitable io_uring tier available")
 	}
@@ -72,8 +96,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 // Listen starts the io_uring engine and blocks until context is canceled.
 func (e *Engine) Listen(ctx context.Context) error {
-	objective := resource.ResolveObjective(e.cfg.Objective)
-	resolved := e.cfg.Resources.Resolve(runtime.NumCPU())
+	resolved := e.cfg.Resources.Resolve()
 
 	cpus := platform.DistributeWorkers(resolved.Workers, e.profile.NumCPU, e.profile.NUMANodes)
 
@@ -96,7 +119,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		)
 		tier = lower
 	}
-	workers, err := e.createWorkers(tier, cpus, objective, resolved)
+	workers, err := e.createWorkers(tier, cpus, resolved)
 	if err != nil {
 		return fmt.Errorf("worker init: %w", err)
 	}
@@ -153,11 +176,11 @@ func (e *Engine) Listen(ctx context.Context) error {
 }
 
 func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
-	objective resource.ObjectiveParams, resolved resource.ResolvedResources) ([]*Worker, error) {
+	resolved resource.ResolvedResources) ([]*Worker, error) {
 	workers := make([]*Worker, len(cpus))
 	for i := range workers {
 		w, err := newWorker(i, cpus[i], tier, e.handler,
-			objective, resolved, e.cfg,
+			resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
 			&e.acceptPaused)
 		if err != nil {
