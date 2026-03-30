@@ -10,8 +10,8 @@ import (
 
 // SEND_ZC ioprio flags and notification result values.
 const (
-	sendZCReportUsage = 1 << 3 // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
-	notifUsageZCCopied = 2     // IORING_NOTIF_USAGE_ZC_COPIED: data was copied, not zero-copied
+	sendZCReportUsage  = 1 << 3 // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
+	notifUsageZCCopied = 2      // IORING_NOTIF_USAGE_ZC_COPIED: data was copied, not zero-copied
 )
 
 // SendZCProbeResult describes the outcome of the SEND_ZC runtime probe.
@@ -61,19 +61,19 @@ func probeSendZC() SendZCProbeResult {
 	if err != nil {
 		return SendZCUnsupported
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		return SendZCUnsupported
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	accepted, err := ln.Accept()
 	if err != nil {
 		return SendZCUnsupported
 	}
-	defer accepted.Close()
+	defer func() { _ = accepted.Close() }()
 
 	rawConn, err := conn.(*net.TCPConn).SyscallConn()
 	if err != nil {
@@ -81,13 +81,13 @@ func probeSendZC() SendZCProbeResult {
 	}
 
 	var fd int
-	rawConn.Control(func(f uintptr) { fd = int(f) })
+	_ = rawConn.Control(func(f uintptr) { fd = int(f) })
 
 	ring, err := NewRing(4, 0, 0)
 	if err != nil {
 		return SendZCUnsupported
 	}
-	defer ring.Close()
+	defer func() { _ = ring.Close() }()
 
 	// Prepare SEND_ZC with REPORT_USAGE flag so the notification CQE tells
 	// us whether true zero-copy or copy fallback was used.
@@ -169,7 +169,7 @@ func probeFixedFiles() bool {
 	if err != nil {
 		return false
 	}
-	defer ring.Close()
+	defer func() { _ = ring.Close() }()
 
 	if err := ring.RegisterFiles(16); err != nil {
 		return false

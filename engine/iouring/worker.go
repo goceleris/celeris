@@ -79,7 +79,7 @@ type Worker struct {
 	h2EventFD     int        // eventfd for H2 write queue wakeup (-1 if unavailable)
 	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
 	h2cfg         conn.H2Config
-	emptyIters    uint32     // consecutive iterations with zero CQEs (for adaptive timeout)
+	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -297,8 +297,7 @@ func (w *Worker) run(ctx context.Context) {
 					return
 				}
 				cqHead, cqTail = w.ring.BeginCQ()
-			} else if cqHead != cqTail {
-				// Mode 1b: CQEs ready, no pending SQEs. No syscall needed.
+			} else if cqHead != cqTail { //nolint:revive // intentional no-op: CQEs ready, no pending SQEs, no syscall needed
 			} else if hasPending && w.sendsPending {
 				// Mode 3a: SEND SQEs pending — guaranteed CQE on completion.
 				// SubmitAndWait avoids ext_arg overhead (no hrtimer, no sigset).
