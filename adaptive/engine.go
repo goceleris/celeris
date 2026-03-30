@@ -90,7 +90,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	// Start with primary (epoll) for all protocols. Epoll has better H2
 	// throughput on current kernels and matches H1 performance.
-	initialActive := primary
+	var initialActive engine.Engine = primary //nolint:unconvert // explicit interface type required for atomic.Pointer[engine.Engine]
 	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
@@ -113,7 +113,7 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 
 	e.ctrl = newController(primary, secondary, sampler, logger)
 
-	initialActive := primary
+	var initialActive engine.Engine = primary //nolint:unconvert // explicit interface type required for atomic.Pointer[engine.Engine]
 	e.ctrl.state.activeIsPrimary = true
 	e.active.Store(&initialActive)
 
