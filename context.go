@@ -23,6 +23,15 @@ func init() {
 		ctx := c.(*Context)
 		ctx.params = append(ctx.params, Param{Key: key, Value: value})
 	}
+	ctxkit.SetHandlers = func(c any, handlers []any) {
+		ctx := c.(*Context)
+		chain := make([]HandlerFunc, len(handlers))
+		for i, h := range handlers {
+			chain[i] = h.(HandlerFunc)
+		}
+		ctx.handlers = chain
+		ctx.index = -1
+	}
 }
 
 // Context is the request context passed to handlers. It is pooled via sync.Pool.

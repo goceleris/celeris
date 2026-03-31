@@ -10,4 +10,5 @@ var (
 	NewContext     func(s *stream.Stream) any
 	ReleaseContext func(c any)
 	AddParam       func(c any, key, value string)
+	SetHandlers    func(c any, handlers []any)
 )
