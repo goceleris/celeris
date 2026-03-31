@@ -104,7 +104,6 @@ func NewStream(id uint32) *Stream {
 	s.ID = id
 	s.state.Store(int32(StateIdle))
 	s.Data = getBuf()
-	s.OutboundBuffer = getBuf()
 	s.windowSize.Store(65535)
 	s.phase = PhaseInit
 	if cap(s.Headers) < 8 {
@@ -402,7 +401,7 @@ func (s *Stream) SetHandlerStarted() {
 func (s *Stream) BufferOutbound(data []byte, endStream bool) {
 	s.mu.Lock()
 	if s.OutboundBuffer == nil {
-		s.OutboundBuffer = new(bytes.Buffer)
+		s.OutboundBuffer = getBuf()
 	}
 	s.OutboundBuffer.Write(data)
 	s.OutboundEndStream = endStream
