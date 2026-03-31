@@ -35,8 +35,12 @@ func TestAdaptiveAutoProtocol(t *testing.T) {
 
 	addr := e.Addr().String()
 
-	// H1 requests.
-	h1Client := &http.Client{Timeout: 3 * time.Second}
+	// H1 requests. Use a dedicated transport to avoid reusing the readiness
+	// probe's pooled connection, which can be RST'd on slow CI machines.
+	h1Client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{},
+	}
 	for range 5 {
 		resp, err := h1Client.Get("http://" + addr + "/h1test")
 		if err != nil {
