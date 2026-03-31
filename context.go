@@ -86,7 +86,11 @@ type Context struct {
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
 }
 
-var contextPool = sync.Pool{New: func() any { return &Context{} }}
+var contextPool = sync.Pool{New: func() any {
+	c := &Context{}
+	c.respHeaders = c.respHdrBuf[:0]
+	return c
+}}
 
 const abortIndex int16 = math.MaxInt16 / 2
 
@@ -256,7 +260,7 @@ func (c *Context) reset() {
 	c.rawQuery = ""
 	c.fullPath = ""
 	c.statusCode = 200
-	c.respHeaders = c.respHeaders[:0]
+	c.respHeaders = c.respHdrBuf[:0]
 	c.written = false
 	c.aborted = false
 	c.bytesWritten = 0

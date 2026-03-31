@@ -125,13 +125,24 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		c.capturedStatus = code
 		c.capturedType = contentType
 	}
-	headers := c.respHdrBuf[:0:8]
-	if len(c.respHeaders)+2 > 8 {
-		headers = make([][2]string, 0, len(c.respHeaders)+2)
+	nUser := len(c.respHeaders)
+	total := nUser + 2
+	var headers [][2]string
+	if total <= 8 {
+		// respHeaders shares backing array with respHdrBuf — copy user
+		// headers to a stack temporary before overwriting the buffer.
+		var tmp [6][2]string
+		copy(tmp[:nUser], c.respHeaders)
+		headers = c.respHdrBuf[:0:8]
+		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
+		headers = append(headers, [2]string{"content-length", itoa(len(data))})
+		headers = append(headers, tmp[:nUser]...)
+	} else {
+		headers = make([][2]string, 0, total)
+		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
+		headers = append(headers, [2]string{"content-length", itoa(len(data))})
+		headers = append(headers, c.respHeaders...)
 	}
-	headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
-	headers = append(headers, [2]string{"content-length", itoa(len(data))})
-	headers = append(headers, c.respHeaders...)
 	if c.stream.ResponseWriter != nil {
 		return c.stream.ResponseWriter.WriteResponse(c.stream, code, headers, data)
 	}
