@@ -134,12 +134,23 @@ func (e *Engine) connStateHook(conn net.Conn, state http.ConnState) {
 	case http.StateNew:
 		e.metrics.activeConns.Add(1)
 		if e.cfg.OnConnect != nil {
-			e.cfg.OnConnect(conn.RemoteAddr().String())
+			e.safeCallback(e.cfg.OnConnect, conn.RemoteAddr().String())
 		}
 	case http.StateClosed, http.StateHijacked:
 		e.metrics.activeConns.Add(-1)
 		if e.cfg.OnDisconnect != nil {
-			e.cfg.OnDisconnect(conn.RemoteAddr().String())
+			e.safeCallback(e.cfg.OnDisconnect, conn.RemoteAddr().String())
 		}
 	}
+}
+
+// safeCallback invokes a user-provided callback with panic recovery to prevent
+// a panicking callback from crashing the connection state handler.
+func (e *Engine) safeCallback(fn func(string), arg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.logger.Error("callback panic", "error", r)
+		}
+	}()
+	fn(arg)
 }

@@ -170,7 +170,7 @@ func (c *Context) SetHeader(key, value string) {
 	k := key
 	for i := range len(key) {
 		b := key[i]
-		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' {
+		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' || b == 0 {
 			k = sanitizeHeaderKey(key)
 			break
 		}
@@ -195,22 +195,23 @@ func (c *Context) AddHeader(key, value string) {
 	})
 }
 
-// sanitizeHeaderKey lowercases and strips CRLF. Fast path avoids allocation
-// when the key is already lowercase and clean (common case).
+// sanitizeHeaderKey lowercases and strips CRLF/null bytes. Fast path avoids
+// allocation when the key is already lowercase and clean (common case).
 func sanitizeHeaderKey(s string) string {
 	for i := range len(s) {
 		c := s[i]
-		if c >= 'A' && c <= 'Z' || c == '\r' || c == '\n' {
+		if c >= 'A' && c <= 'Z' || c == '\r' || c == '\n' || c == 0 {
 			return stripCRLF(strings.ToLower(s))
 		}
 	}
 	return s
 }
 
-// stripCRLF removes \r and \n to prevent HTTP response splitting (CWE-113).
+// stripCRLF removes \r, \n, and \x00 to prevent HTTP response splitting
+// (CWE-113) and null-byte header smuggling.
 func stripCRLF(s string) string {
-	if strings.ContainsAny(s, "\r\n") {
-		return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+	if strings.ContainsAny(s, "\r\n\x00") {
+		return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
 	}
 	return s
 }
@@ -244,21 +245,32 @@ func (c *Context) Redirect(code int, url string) error {
 	return c.NoContent(code)
 }
 
+// stripCookieUnsafe strips characters that could inject cookie attributes
+// (semicolons) or cause header injection (CRLF) from cookie field values.
+func stripCookieUnsafe(s string) string {
+	if strings.ContainsAny(s, ";\r\n") {
+		return strings.NewReplacer(";", "", "\r", "", "\n", "").Replace(s)
+	}
+	return s
+}
+
 // SetCookie appends a Set-Cookie header to the response.
 // Cookie values are sent as-is without encoding (per RFC 6265).
 // Callers are responsible for encoding values if needed.
+// Semicolons in Name, Value, Path, and Domain are stripped to prevent
+// cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
 	var b strings.Builder
-	b.WriteString(cookie.Name)
+	b.WriteString(stripCookieUnsafe(cookie.Name))
 	b.WriteByte('=')
-	b.WriteString(cookie.Value)
+	b.WriteString(stripCookieUnsafe(cookie.Value))
 	if cookie.Path != "" {
 		b.WriteString("; Path=")
-		b.WriteString(cookie.Path)
+		b.WriteString(stripCookieUnsafe(cookie.Path))
 	}
 	if cookie.Domain != "" {
 		b.WriteString("; Domain=")
-		b.WriteString(cookie.Domain)
+		b.WriteString(stripCookieUnsafe(cookie.Domain))
 	}
 	if !cookie.Expires.IsZero() {
 		b.WriteString("; Expires=")

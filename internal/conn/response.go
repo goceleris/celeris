@@ -162,7 +162,9 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// Fast path: exactly 2 headers from Blob() (content-type, content-length).
 	// This is the dominant case for API responses. Skip per-header string
 	// comparisons and the hasContentLength flag entirely.
-	if len(headers) == 2 {
+	// Guard: verify the second header is actually content-length to avoid
+	// misframing responses from callers that pass non-CL 2-header slices.
+	if len(headers) == 2 && headers[1][0] == "content-length" {
 		// First header: content-type (from Blob).
 		switch headers[0][1] {
 		case "application/json":

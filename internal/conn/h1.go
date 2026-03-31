@@ -110,7 +110,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					}
 				}
 				if state.req.ExpectContinue {
-					if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
+					if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 						write(expectation417Response)
 						// Close connection after rejection to prevent request
 						// smuggling: body bytes already in the buffer would
@@ -165,7 +165,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
-			if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
+			if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 				write(expectation417Response)
 				// Close connection after rejection to prevent request
 				// smuggling: body bytes already in the buffer would
@@ -233,6 +233,18 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 	}
 	return nil
+}
+
+// safeExpectContinue calls the OnExpectContinue callback with panic recovery.
+// A panicking callback is treated as rejection (returns false) to avoid
+// crashing the event loop worker goroutine.
+func safeExpectContinue(fn func(string, string, [][2]string) bool, method, path string, headers [][2]string) (accepted bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			accepted = false
+		}
+	}()
+	return fn(method, path, headers)
 }
 
 // expectHeaders converts raw H1 headers to [][2]string for the OnExpectContinue

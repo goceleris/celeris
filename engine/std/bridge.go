@@ -3,6 +3,7 @@ package std
 import (
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -52,7 +53,12 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var body []byte
 		var err error
 		if maxBodySize > 0 {
-			body, err = io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
+			// Prevent int64 overflow: maxBodySize+1 wraps for MaxInt64.
+			limit := maxBodySize
+			if limit < math.MaxInt64 {
+				limit++
+			}
+			body, err = io.ReadAll(io.LimitReader(r.Body, limit))
 		} else {
 			body, err = io.ReadAll(r.Body)
 		}
