@@ -308,6 +308,34 @@ func (s *Server) EngineInfo() *EngineInfo {
 	}
 }
 
+// PauseAccept stops accepting new connections. Existing connections continue
+// to be served. Returns [ErrAcceptControlNotSupported] if the engine does not
+// support accept control (e.g. std engine).
+func (s *Server) PauseAccept() error {
+	if s.engine == nil {
+		return ErrAcceptControlNotSupported
+	}
+	ac, ok := s.engine.(engine.AcceptController)
+	if !ok {
+		return ErrAcceptControlNotSupported
+	}
+	return ac.PauseAccept()
+}
+
+// ResumeAccept resumes accepting new connections after PauseAccept.
+// Returns [ErrAcceptControlNotSupported] if the engine does not support
+// accept control.
+func (s *Server) ResumeAccept() error {
+	if s.engine == nil {
+		return ErrAcceptControlNotSupported
+	}
+	ac, ok := s.engine.(engine.AcceptController)
+	if !ok {
+		return ErrAcceptControlNotSupported
+	}
+	return ac.ResumeAccept()
+}
+
 // Collector returns the metrics collector, or nil if the server has not been
 // started or if Config.DisableMetrics is true.
 func (s *Server) Collector() *observe.Collector {

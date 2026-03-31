@@ -17,9 +17,6 @@ import (
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
 
-// maxRequestBodySize is the maximum allowed request body (100 MB), matching H2.
-const maxRequestBodySize = 100 << 20
-
 // errConnectionClose is returned when the client requests Connection: close.
 // Pre-allocated to avoid per-request fmt.Errorf allocation.
 var errConnectionClose = errors.New("connection close requested")
@@ -28,15 +25,32 @@ var errConnectionClose = errors.New("connection close requested")
 // to signal that the server is willing to accept the request body.
 var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 
+// expectation417Response is sent when OnExpectContinue rejects the request.
+var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n")
+
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
-	parser     *h1.Parser
-	buffer     bytes.Buffer
-	req        h1.Request
-	rw         h1ResponseAdapter // embedded — reused per request, avoids heap alloc
-	stream     *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
-	RemoteAddr string
-	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
+	parser             *h1.Parser
+	buffer             bytes.Buffer
+	req                h1.Request
+	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
+	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
+	RemoteAddr         string
+	HijackFn           func() (net.Conn, error)                            // set by engine; nil if unsupported
+	MaxRequestBodySize int64                                               // 0 = use default (100 MB)
+	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
+	OnDetach           func()                                              // set by engine; called on Context.Detach
+	Detached           bool                                                // set by OnDetach; breaks pipelining loop
+}
+
+// UpdateWriteFn replaces the response adapter's write function. Called by
+// OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
+func (s *H1State) UpdateWriteFn(fn func([]byte)) {
+	s.rw.write = fn
+}
+
+func (s *H1State) maxBodySize() int64 {
+	return s.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
 }
 
 // NewH1State creates a new H1 connection state with zero-copy header parsing.
@@ -89,7 +103,20 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			}
 
 			if bodyNeeded > 0 || bodyNeeded == -1 {
+				if bodyNeeded > 0 {
+					if limit := state.maxBodySize(); limit > 0 && bodyNeeded > limit {
+						writeErrorResponse(write, 413, "Request body too large")
+						return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
+					}
+				}
 				if state.req.ExpectContinue {
+					if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
+						write(expectation417Response)
+						// Close connection after rejection to prevent request
+						// smuggling: body bytes already in the buffer would
+						// otherwise be parsed as a new request.
+						return errConnectionClose
+					}
 					write(continue100Response)
 					state.req.ExpectContinue = false
 				}
@@ -99,6 +126,14 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 
 			if err := handleH1Request(ctx, state, nil, handler, write); err != nil {
 				return err
+			}
+			if state.Detached {
+				// Handler called Detach — a goroutine now writes through
+				// the mutex-guarded writeFn. We must NOT continue parsing
+				// pipelined requests with the stale `write` parameter
+				// (captured before Detach replaced cs.writeFn), as that
+				// would race with the goroutine on writeBuf.
+				return nil
 			}
 			if !state.req.KeepAlive {
 				return errConnectionClose
@@ -130,8 +165,22 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
+			if state.OnExpectContinue != nil && !safeExpectContinue(state.OnExpectContinue, state.req.Method, state.req.Path, expectHeaders(&state.req)) {
+				write(expectation417Response)
+				// Close connection after rejection to prevent request
+				// smuggling: body bytes already in the buffer would
+				// otherwise be parsed as a new request.
+				return errConnectionClose
+			}
 			write(continue100Response)
 			state.req.ExpectContinue = false
+		}
+
+		if bodyNeeded > 0 {
+			if limit := state.maxBodySize(); limit > 0 && bodyNeeded > limit {
+				writeErrorResponse(write, 413, "Request body too large")
+				return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
+			}
 		}
 
 		var bodyData []byte
@@ -163,9 +212,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					break
 				}
 				chunks.Write(chunk)
-				if chunks.Len() > maxRequestBodySize {
+				if limit := state.maxBodySize(); limit > 0 && int64(chunks.Len()) > limit {
 					writeErrorResponse(write, 413, "Request body too large")
-					return fmt.Errorf("chunked body exceeds %d byte limit", maxRequestBodySize)
+					return fmt.Errorf("chunked body exceeds %d byte limit", limit)
 				}
 			}
 			bodyData = chunks.Bytes()
@@ -176,11 +225,40 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
+		if state.Detached {
+			return nil // see fast-path comment above
+		}
 		if !state.req.KeepAlive {
 			return errConnectionClose
 		}
 	}
 	return nil
+}
+
+// safeExpectContinue calls the OnExpectContinue callback with panic recovery.
+// A panicking callback is treated as rejection (returns false) to avoid
+// crashing the event loop worker goroutine.
+func safeExpectContinue(fn func(string, string, [][2]string) bool, method, path string, headers [][2]string) (accepted bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			accepted = false
+		}
+	}()
+	return fn(method, path, headers)
+}
+
+// expectHeaders converts raw H1 headers to [][2]string for the OnExpectContinue
+// callback. Zero-copy strings are safe because the callback runs synchronously
+// on the event loop thread before the read buffer is reused.
+func expectHeaders(req *h1.Request) [][2]string {
+	if len(req.RawHeaders) == 0 {
+		return nil
+	}
+	hdrs := make([][2]string, len(req.RawHeaders))
+	for i, rh := range req.RawHeaders {
+		hdrs[i] = [2]string{h1.UnsafeLowerHeader(rh[0]), h1.UnsafeString(rh[1])}
+	}
+	return hdrs
 }
 
 func handleH1Request(ctx context.Context, state *H1State, body []byte,
@@ -232,6 +310,7 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 		stream.ResetH1Stream(s)
 	}
 	s.RemoteAddr = state.RemoteAddr
+	s.OnDetach = state.OnDetach
 	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4

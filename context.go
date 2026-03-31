@@ -68,7 +68,11 @@ type Context struct {
 	detached   bool
 	detachDone chan struct{}
 
-	extended bool // true when keys/query/cookie/form/capture/buffer/detach were used
+	extended bool // true when keys/query/cookie/form/capture/buffer/detach/overrides were used
+
+	clientIPOverride string
+	schemeOverride   string
+	hostOverride     string
 
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
 }
@@ -268,6 +272,9 @@ func (c *Context) reset() {
 		c.buffered = false
 		c.detached = false
 		c.detachDone = nil
+		c.clientIPOverride = ""
+		c.schemeOverride = ""
+		c.hostOverride = ""
 		c.extended = false
 	}
 }

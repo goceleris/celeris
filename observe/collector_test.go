@@ -1,6 +1,7 @@
 package observe
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -139,5 +140,55 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	if snap.EngineSwitches != 100 {
 		t.Fatalf("expected 100 switches, got %d", snap.EngineSwitches)
+	}
+}
+
+func TestSnapshotCPUUtilizationDefault(t *testing.T) {
+	c := NewCollector()
+	snap := c.Snapshot()
+	if snap.CPUUtilization != -1 {
+		t.Fatalf("expected -1 without CPU monitor, got %f", snap.CPUUtilization)
+	}
+}
+
+type mockCPUMonitor struct {
+	util float64
+	err  error
+}
+
+func (m *mockCPUMonitor) Close() error { return nil }
+func (m *mockCPUMonitor) Sample() (float64, error) {
+	return m.util, m.err
+}
+
+func TestSnapshotWithCPUMonitor(t *testing.T) {
+	c := NewCollector()
+	c.SetCPUMonitor(&mockCPUMonitor{util: 0.75})
+	snap := c.Snapshot()
+	if snap.CPUUtilization != 0.75 {
+		t.Fatalf("expected 0.75, got %f", snap.CPUUtilization)
+	}
+}
+
+func TestSnapshotCPUMonitorError(t *testing.T) {
+	c := NewCollector()
+	c.SetCPUMonitor(&mockCPUMonitor{util: -1, err: errors.New("sample failed")})
+	snap := c.Snapshot()
+	if snap.CPUUtilization != -1 {
+		t.Fatalf("expected -1 on error, got %f", snap.CPUUtilization)
+	}
+}
+
+func TestNewCPUMonitor(t *testing.T) {
+	m, err := NewCPUMonitor()
+	if err != nil {
+		t.Fatalf("NewCPUMonitor: %v", err)
+	}
+	util, err := m.Sample()
+	if err != nil {
+		t.Fatalf("Sample: %v", err)
+	}
+	if util < 0 || util > 1 {
+		t.Fatalf("expected utilization in [0,1], got %f", util)
 	}
 }

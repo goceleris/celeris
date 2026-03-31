@@ -3,6 +3,7 @@ package std
 import (
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -48,15 +49,26 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Headers = hdrs
 
 	if r.Body != nil && r.Body != http.NoBody {
-		const maxBridgeBodySize = 100 << 20 // 100 MB — matches H2 processor limit
-		body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBridgeBodySize)+1))
+		maxBodySize := b.engine.cfg.MaxRequestBodySize // 0 = unlimited (after WithDefaults)
+		var body []byte
+		var err error
+		if maxBodySize > 0 {
+			// Prevent int64 overflow: maxBodySize+1 wraps for MaxInt64.
+			limit := maxBodySize
+			if limit < math.MaxInt64 {
+				limit++
+			}
+			body, err = io.ReadAll(io.LimitReader(r.Body, limit))
+		} else {
+			body, err = io.ReadAll(r.Body)
+		}
 		_ = r.Body.Close()
 		if err != nil {
 			b.engine.metrics.errCount.Add(1)
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
 		}
-		if len(body) > maxBridgeBodySize {
+		if maxBodySize > 0 && int64(len(body)) > maxBodySize {
 			b.engine.metrics.errCount.Add(1)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return

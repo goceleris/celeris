@@ -162,7 +162,9 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// Fast path: exactly 2 headers from Blob() (content-type, content-length).
 	// This is the dominant case for API responses. Skip per-header string
 	// comparisons and the hasContentLength flag entirely.
-	if len(headers) == 2 {
+	// Guard: verify the second header is actually content-length to avoid
+	// misframing responses from callers that pass non-CL 2-header slices.
+	if len(headers) == 2 && headers[1][0] == "content-length" {
 		// First header: content-type (from Blob).
 		switch headers[0][1] {
 		case "application/json":
@@ -188,7 +190,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	} else {
 		// General path: merged loop checks for content-length while appending.
 		hasContentLength := false
-		for i, h := range headers {
+		for _, h := range headers {
 			if h[0] == "content-length" {
 				hasContentLength = true
 			}
@@ -211,17 +213,10 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 					continue
 				}
 			}
-			if i < 2 {
-				buf = append(buf, h[0]...)
-				buf = append(buf, ": "...)
-				buf = append(buf, h[1]...)
-				buf = append(buf, crlf...)
-			} else {
-				buf = appendSanitizedHeaderField(buf, h[0])
-				buf = append(buf, ": "...)
-				buf = appendSanitizedHeaderField(buf, h[1])
-				buf = append(buf, crlf...)
-			}
+			buf = appendSanitizedHeaderField(buf, h[0])
+			buf = append(buf, ": "...)
+			buf = appendSanitizedHeaderField(buf, h[1])
+			buf = append(buf, crlf...)
 		}
 		if !hasContentLength && len(body) > 0 {
 			buf = append(buf, clPrefix...)

@@ -136,3 +136,23 @@ func TestNextPowerOf2(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigMaxRequestBodySizeDefaults(t *testing.T) {
+	// 0 → default 100 MB
+	c := Config{}.WithDefaults()
+	if c.MaxRequestBodySize != 100<<20 {
+		t.Fatalf("expected 100MB default, got %d", c.MaxRequestBodySize)
+	}
+
+	// Positive value preserved
+	c = Config{MaxRequestBodySize: 50 << 20}.WithDefaults()
+	if c.MaxRequestBodySize != 50<<20 {
+		t.Fatalf("expected 50MB, got %d", c.MaxRequestBodySize)
+	}
+
+	// -1 → unlimited (0)
+	c = Config{MaxRequestBodySize: -1}.WithDefaults()
+	if c.MaxRequestBodySize != 0 {
+		t.Fatalf("expected 0 (unlimited), got %d", c.MaxRequestBodySize)
+	}
+}

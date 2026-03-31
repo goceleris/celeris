@@ -59,9 +59,12 @@ type Loop struct {
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead *connState // head of intrusive doubly-linked dirty list
-	h2Conns   []int      // FDs of H2 connections (for write queue polling)
-	h2cfg     conn.H2Config
+	dirtyHead    *connState // head of intrusive doubly-linked dirty list
+	h2Conns      []int      // FDs of H2 connections (for write queue polling)
+	h2cfg        conn.H2Config
+	detachQueue  []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
+	detachQMu    sync.Mutex
+	detachQSpare []*connState // reuse slice to avoid alloc in drainDetachQueue
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -98,6 +101,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
 			MaxFrameSize:         cfg.MaxFrameSize,
+			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		},
 	}
 }
@@ -254,16 +258,28 @@ func (l *Loop) run(ctx context.Context) {
 
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			err := flushWrites(cs)
 			if err != nil {
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
 			} else if cs.writePos >= len(cs.writeBuf) {
 				cs.pendingBytes = 0
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 				l.removeDirty(cs)
 			} else {
 				// Sync pendingBytes with actual buffer state after partial write.
 				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 			}
 			cs = next
 		}
@@ -284,6 +300,10 @@ func (l *Loop) run(ctx context.Context) {
 				}
 			}
 		}
+
+		// Drain detached goroutine writes. Goroutines append to the queue
+		// instead of calling markDirty directly (dirtyHead is loop-local).
+		l.drainDetachQueue()
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per event loop
@@ -390,12 +410,24 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
 			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			_ = flushWrites(cs)
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
 			l.closeConn(fd)
 			return
 		}
 		if n == 0 {
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			_ = flushWrites(cs)
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
 			l.closeConn(fd)
 			return
 		}
@@ -437,8 +469,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 				return // FD already detached — do not close or flush
 			}
 			// Flush any pending writes (e.g. error responses) before closing.
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			_ = flushWrites(cs)
 			cs.pendingBytes = 0
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
 			l.closeConn(fd)
 			return
 		}
@@ -448,8 +486,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// connections). This sends the response one event-batch earlier than
 		// the dirty list pass, reducing per-request latency by up to N×2µs
 		// (where N is the number of other events in the same epoll_wait batch).
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
 		if cs.writePos < len(cs.writeBuf) {
 			if fErr := flushWrites(cs); fErr != nil {
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 				if cs.dirty {
 					l.removeDirty(cs)
 				}
@@ -467,6 +511,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
 				l.markDirty(cs)
 			}
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
 		}
 
 		if cs.pendingBytes > maxPendingBytes {
@@ -505,6 +552,48 @@ func (l *Loop) initProtocol(cs *connState) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
 		cs.h1State.RemoteAddr = cs.remoteAddr
+		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
+		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
+		cs.h1State.OnDetach = func() {
+			cs.h1State.Detached = true
+			mu := &sync.Mutex{}
+			cs.detachMu = mu
+			orig := cs.writeFn
+			guarded := func(data []byte) {
+				mu.Lock()
+				if cs.detachClosed {
+					mu.Unlock()
+					return
+				}
+				orig(data)
+				mu.Unlock()
+				// Signal the event loop to flush. Do NOT call markDirty
+				// from this goroutine — dirtyHead is event-loop-local.
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
+			}
+			cs.writeFn = guarded
+			// Also update the response adapter so StreamWriter writes
+			// go through the guarded path (not the stale pre-Detach writeFn).
+			cs.h1State.UpdateWriteFn(guarded)
+			// Ensure eventfd is available for wakeup.
+			if l.eventFD < 0 {
+				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+				if err == nil {
+					l.eventFD = efd
+					_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+						Events: unix.EPOLLIN | unix.EPOLLET,
+						Fd:     int32(efd),
+					})
+				}
+			}
+		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
 			return l.hijackConn(cs.fd)
 		}
@@ -526,6 +615,19 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 		// happy path. Only markDirty if the inline flush partially
 		// completes, avoiding linked-list overhead per request.
 	}
+}
+
+func (l *Loop) drainDetachQueue() {
+	l.detachQMu.Lock()
+	l.detachQSpare, l.detachQueue = l.detachQueue, l.detachQSpare[:0]
+	l.detachQMu.Unlock()
+	for _, cs := range l.detachQSpare {
+		if cs.detachClosed {
+			continue
+		}
+		l.markDirty(cs)
+	}
+	l.detachQSpare = l.detachQSpare[:0]
 }
 
 func (l *Loop) markDirty(cs *connState) {
@@ -628,9 +730,22 @@ func (l *Loop) closeConn(fd int) {
 	if cs == nil {
 		return
 	}
+	detached := cs.detachMu != nil
+	if detached {
+		// Signal the detached goroutine's writeFn to stop writing.
+		// The mutex serializes with any in-progress write — if the
+		// goroutine is mid-write, we block until it finishes.
+		cs.detachMu.Lock()
+		cs.detachClosed = true
+		cs.detachMu.Unlock()
+	}
 	l.removeDirty(cs)
-	if cs.h1State != nil {
-		conn.CloseH1(cs.h1State)
+	if !detached {
+		// Only release the H1 stream when NOT detached — the goroutine
+		// still holds a reference through its Context/StreamWriter.
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
+		}
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
@@ -648,7 +763,12 @@ func (l *Loop) closeConn(fd int) {
 		l.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	releaseConnState(cs)
+	if !detached {
+		releaseConnState(cs)
+	}
+	// Detached: connState is NOT returned to the pool. The goroutine's
+	// closures still reference it. GC collects it after the goroutine
+	// finishes and all closure references are dropped.
 }
 
 func (l *Loop) shutdown() {
@@ -657,14 +777,22 @@ func (l *Loop) shutdown() {
 		if cs == nil {
 			continue
 		}
-		if cs.h1State != nil {
+		detached := cs.detachMu != nil
+		if detached {
+			cs.detachMu.Lock()
+			cs.detachClosed = true
+			cs.detachMu.Unlock()
+		}
+		if !detached && cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
 		_ = unix.Close(fd)
-		releaseConnState(cs)
+		if !detached {
+			releaseConnState(cs)
+		}
 		l.conns[fd] = nil
 	}
 	if l.listenFD >= 0 {

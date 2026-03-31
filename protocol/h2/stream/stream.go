@@ -59,7 +59,8 @@ type Stream struct {
 	flags                  atomic.Uint32
 	doneCh                 atomic.Pointer[chan struct{}]
 	phase                  Phase
-	CachedCtx              any // per-connection cached context (avoids pool Get/Put per request)
+	CachedCtx              any    // per-connection cached context (avoids pool Get/Put per request)
+	OnDetach               func() // called by Context.Detach to install write-thread safety
 }
 
 // streamContext is a zero-alloc context.Context for streams.
@@ -200,6 +201,7 @@ func (s *Stream) Release() {
 	s.doneCh.Store(nil)
 	s.phase = 0
 	s.CachedCtx = nil
+	s.OnDetach = nil
 	if s.ReceivedWindowUpd != nil {
 		for len(s.ReceivedWindowUpd) > 0 {
 			<-s.ReceivedWindowUpd

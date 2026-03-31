@@ -129,7 +129,7 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if len(c.respHeaders)+2 > 8 {
 		headers = make([][2]string, 0, len(c.respHeaders)+2)
 	}
-	headers = append(headers, [2]string{"content-type", contentType})
+	headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
 	headers = append(headers, [2]string{"content-length", itoa(len(data))})
 	headers = append(headers, c.respHeaders...)
 	if c.stream.ResponseWriter != nil {
@@ -170,7 +170,7 @@ func (c *Context) SetHeader(key, value string) {
 	k := key
 	for i := range len(key) {
 		b := key[i]
-		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' {
+		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' || b == 0 {
 			k = sanitizeHeaderKey(key)
 			break
 		}
@@ -195,29 +195,43 @@ func (c *Context) AddHeader(key, value string) {
 	})
 }
 
-// sanitizeHeaderKey lowercases and strips CRLF. Fast path avoids allocation
-// when the key is already lowercase and clean (common case).
+// sanitizeHeaderKey lowercases and strips CRLF/null bytes. Fast path avoids
+// allocation when the key is already lowercase and clean (common case).
 func sanitizeHeaderKey(s string) string {
 	for i := range len(s) {
 		c := s[i]
-		if c >= 'A' && c <= 'Z' || c == '\r' || c == '\n' {
+		if c >= 'A' && c <= 'Z' || c == '\r' || c == '\n' || c == 0 {
 			return stripCRLF(strings.ToLower(s))
 		}
 	}
 	return s
 }
 
-// stripCRLF removes \r and \n to prevent HTTP response splitting (CWE-113).
+// stripCRLF removes \r, \n, and \x00 to prevent HTTP response splitting
+// (CWE-113) and null-byte header smuggling.
 func stripCRLF(s string) string {
-	if strings.ContainsAny(s, "\r\n") {
-		return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+	if strings.ContainsAny(s, "\r\n\x00") {
+		return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
 	}
 	return s
+}
+
+// ResponseHeaders returns the response headers that have been set so far.
+// The returned slice must not be modified. Use SetHeader or AddHeader to
+// change response headers.
+func (c *Context) ResponseHeaders() [][2]string {
+	return c.respHeaders
 }
 
 // StatusCode returns the response status code set by the handler.
 func (c *Context) StatusCode() int {
 	return c.statusCode
+}
+
+// DeleteCookie appends a Set-Cookie header that instructs the client to delete
+// the named cookie. The path must match the original cookie's path.
+func (c *Context) DeleteCookie(name, path string) {
+	c.SetCookie(&Cookie{Name: name, Path: path, MaxAge: -1})
 }
 
 // Redirect sends an HTTP redirect to the given URL with the specified status code.
@@ -231,21 +245,32 @@ func (c *Context) Redirect(code int, url string) error {
 	return c.NoContent(code)
 }
 
+// stripCookieUnsafe strips characters that could inject cookie attributes
+// (semicolons) or cause header injection (CRLF) from cookie field values.
+func stripCookieUnsafe(s string) string {
+	if strings.ContainsAny(s, ";\r\n") {
+		return strings.NewReplacer(";", "", "\r", "", "\n", "").Replace(s)
+	}
+	return s
+}
+
 // SetCookie appends a Set-Cookie header to the response.
 // Cookie values are sent as-is without encoding (per RFC 6265).
 // Callers are responsible for encoding values if needed.
+// Semicolons in Name, Value, Path, and Domain are stripped to prevent
+// cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
 	var b strings.Builder
-	b.WriteString(cookie.Name)
+	b.WriteString(stripCookieUnsafe(cookie.Name))
 	b.WriteByte('=')
-	b.WriteString(cookie.Value)
+	b.WriteString(stripCookieUnsafe(cookie.Value))
 	if cookie.Path != "" {
 		b.WriteString("; Path=")
-		b.WriteString(cookie.Path)
+		b.WriteString(stripCookieUnsafe(cookie.Path))
 	}
 	if cookie.Domain != "" {
 		b.WriteString("; Domain=")
-		b.WriteString(cookie.Domain)
+		b.WriteString(stripCookieUnsafe(cookie.Domain))
 	}
 	if !cookie.Expires.IsZero() {
 		b.WriteString("; Expires=")
@@ -517,12 +542,17 @@ func (c *Context) Hijack() (net.Conn, error) {
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
 func (c *Context) Detach() (done func()) {
+	if c.detached {
+		return func() {} // already detached — return no-op done
+	}
 	// Materialize any unsafe string headers (zero-copy H1 headers backed by
 	// the connection's read buffer) before the handler returns and the buffer
-	// is reused for the next recv. Pseudo-headers (:method, :path, etc.) are
-	// literal strings and don't need copying.
+	// is reused for the next recv. Pseudo-header keys are string literals
+	// (safe), but their values (:authority, :path for non-"/" paths, :method
+	// for non-standard methods) may be UnsafeString backed by the buffer.
 	for i, h := range c.stream.Headers {
 		if len(h[0]) > 0 && h[0][0] == ':' {
+			c.stream.Headers[i][1] = strings.Clone(h[1])
 			continue
 		}
 		c.stream.Headers[i][0] = strings.Clone(h[0])
@@ -535,6 +565,9 @@ func (c *Context) Detach() (done func()) {
 
 	c.extended = true
 	c.detached = true
+	if c.stream.OnDetach != nil {
+		c.stream.OnDetach()
+	}
 	ch := make(chan struct{})
 	c.detachDone = ch
 	return func() { close(ch) }

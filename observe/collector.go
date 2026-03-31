@@ -43,6 +43,23 @@ type Snapshot struct {
 	BucketBounds []float64
 	// EngineMetrics contains the underlying engine's own performance counters.
 	EngineMetrics EngineMetrics
+	// CPUUtilization is the system CPU utilization as a fraction [0.0, 1.0].
+	// Returns -1 if no CPU monitor is configured or sampling failed.
+	CPUUtilization float64
+}
+
+// CPUMonitor provides CPU utilization sampling. Implementations are
+// platform-specific: Linux uses /proc/stat, other platforms use
+// runtime/metrics. Use [NewCPUMonitor] to create the appropriate
+// implementation for the current platform.
+//
+// Call Close when the monitor is no longer needed to release resources
+// (e.g., the /proc/stat file descriptor on Linux).
+type CPUMonitor interface {
+	// Sample returns the current CPU utilization as a fraction in [0.0, 1.0].
+	Sample() (float64, error)
+	// Close releases any resources held by the monitor.
+	Close() error
 }
 
 // Collector aggregates request metrics using lock-free counters.
@@ -54,6 +71,7 @@ type Collector struct {
 	latencyBuckets  [bucketCount]atomic.Uint64
 	mu              sync.Mutex
 	engineMetricsFn func() EngineMetrics
+	cpuMon          CPUMonitor
 }
 
 // NewCollector creates a new Collector with zeroed counters. The server creates
@@ -66,6 +84,14 @@ func NewCollector() *Collector {
 func (c *Collector) SetEngineMetricsFn(fn func() EngineMetrics) {
 	c.mu.Lock()
 	c.engineMetricsFn = fn
+	c.mu.Unlock()
+}
+
+// SetCPUMonitor registers a CPU utilization monitor. When set, Snapshot()
+// includes a CPUUtilization field sampled on each call (~every 15s is typical).
+func (c *Collector) SetCPUMonitor(m CPUMonitor) {
+	c.mu.Lock()
+	c.cpuMon = m
 	c.mu.Unlock()
 }
 
@@ -118,13 +144,20 @@ func (c *Collector) Snapshot() Snapshot {
 		EngineSwitches: c.engineSwitches.Load(),
 		LatencyBuckets: buckets,
 		BucketBounds:   bounds,
+		CPUUtilization: -1,
 	}
 	c.mu.Lock()
 	fn := c.engineMetricsFn
+	mon := c.cpuMon
 	c.mu.Unlock()
 	if fn != nil {
 		snap.EngineMetrics = fn()
 		snap.ActiveConns = snap.EngineMetrics.ActiveConnections
+	}
+	if mon != nil {
+		if util, err := mon.Sample(); err == nil {
+			snap.CPUUtilization = util
+		}
 	}
 	return snap
 }

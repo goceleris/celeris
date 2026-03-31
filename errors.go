@@ -26,6 +26,10 @@ var ErrInvalidRedirectCode = errors.New("celeris: redirect status code must be 3
 // support takeover (e.g. HTTP/2 multiplexed streams).
 var ErrHijackNotSupported = stream.ErrHijackNotSupported
 
+// ErrAcceptControlNotSupported is returned by PauseAccept/ResumeAccept when
+// the active engine does not implement accept control (e.g. std engine).
+var ErrAcceptControlNotSupported = errors.New("celeris: engine does not support accept control")
+
 // HTTPError is a structured error that carries an HTTP status code.
 // Handlers return HTTPError to signal a specific status code to the
 // routerAdapter safety net. Use NewHTTPError to create one.

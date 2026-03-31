@@ -1304,3 +1304,13 @@ func TestStartRaceGuard(t *testing.T) {
 		}
 	}
 }
+
+func TestPauseAcceptNotStarted(t *testing.T) {
+	s := New(Config{Addr: ":0"})
+	if err := s.PauseAccept(); !errors.Is(err, ErrAcceptControlNotSupported) {
+		t.Fatalf("expected ErrAcceptControlNotSupported, got %v", err)
+	}
+	if err := s.ResumeAccept(); !errors.Is(err, ErrAcceptControlNotSupported) {
+		t.Fatalf("expected ErrAcceptControlNotSupported, got %v", err)
+	}
+}

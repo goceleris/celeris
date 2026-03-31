@@ -80,6 +80,9 @@ type Worker struct {
 	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
 	h2cfg         conn.H2Config
 	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
+	detachQueue   []*connState
+	detachQMu     sync.Mutex
+	detachQSpare  []*connState
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -115,6 +118,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
 			MaxFrameSize:         cfg.MaxFrameSize,
+			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		},
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  true,
@@ -384,18 +388,29 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
+		// Drain detached goroutine writes. Goroutines append to the queue
+		// instead of calling markDirty directly (dirtyHead is worker-local).
+		w.drainDetachQueue()
+
 		// Retry pending sends and dropped recv arms on dirty connections
 		// (SQ ring was full earlier). Typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			if !cs.sending {
+				if mu := cs.detachMu; mu != nil {
+					mu.Lock()
+				}
 				sqFull := w.flushSend(cs)
 				if cs.needsRecv {
 					if w.prepareRecv(cs.fd, cs.buf) {
 						cs.needsRecv = false
 					}
 				}
-				if !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && !cs.needsRecv {
+				canRemove := !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && !cs.needsRecv
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				if canRemove {
 					w.removeDirty(cs)
 				}
 			}
@@ -624,6 +639,43 @@ func (w *Worker) initProtocol(cs *connState) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
 		cs.h1State.RemoteAddr = cs.remoteAddr
+		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
+		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
+		cs.h1State.OnDetach = func() {
+			cs.h1State.Detached = true
+			mu := &sync.Mutex{}
+			cs.detachMu = mu
+			orig := cs.writeFn
+			wakeupFD := w.h2EventFD
+			guarded := func(data []byte) {
+				mu.Lock()
+				if cs.detachClosed {
+					mu.Unlock()
+					return
+				}
+				orig(data)
+				mu.Unlock()
+				// Signal the event loop to flush. Do NOT call markDirty
+				// from this goroutine — dirtyHead is worker-local.
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQMu.Unlock()
+				if wakeupFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(wakeupFD, val[:])
+				}
+			}
+			cs.writeFn = guarded
+			// Also update the response adapter so StreamWriter writes
+			// go through the guarded path (not the stale pre-Detach writeFn).
+			cs.h1State.UpdateWriteFn(guarded)
+			// Ensure eventfd poll is armed so the worker wakes up.
+			if !w.h2PollArmed && w.h2EventFD >= 0 {
+				w.prepareH2Poll()
+				w.h2PollArmed = true
+			}
+		}
 		if !cs.fixedFile {
 			cs.h1State.HijackFn = func() (net.Conn, error) {
 				return w.hijackConn(cs.fd)
@@ -750,6 +802,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
 	// after SEND completes, eliminating one loop iteration per request.
 	cs.recvLinked = false
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+	}
 	if w.bufRing == nil {
 		if w.flushSendLink(cs) {
 			w.markDirty(cs)
@@ -758,6 +813,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
+	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Unlock()
 	}
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
@@ -818,7 +876,13 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	if c.Res < 0 {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
 		cs.writeBuf = cs.writeBuf[:0]
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
 		if cs.closing {
 			w.finishClose(fd)
 		} else {
@@ -838,7 +902,13 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	if sent < 0 {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
 		cs.writeBuf = cs.writeBuf[:0]
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
 		if cs.closing {
 			w.finishClose(fd)
 		} else {
@@ -856,13 +926,22 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 		cs.sendBuf = cs.sendBuf[:0]
 	}
 
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+	}
 	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
 		w.finishClose(fd)
 		return
 	}
 
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
 		if cs.needsRecv {
 			if w.prepareRecv(fd, cs.buf) {
 				cs.needsRecv = false
@@ -880,6 +959,9 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	if w.flushSend(cs) {
 		w.markDirty(cs)
 	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Unlock()
+	}
 }
 
 func (w *Worker) handleClose(fd int) {
@@ -896,13 +978,30 @@ func (w *Worker) closeConn(fd int) {
 	if cs == nil {
 		return
 	}
+	detached := cs.detachMu != nil
+	if detached {
+		// Signal the detached goroutine's writeFn to stop writing.
+		cs.detachMu.Lock()
+		cs.detachClosed = true
+		cs.detachMu.Unlock()
+	}
 	w.removeDirty(cs)
-	if cs.h1State != nil {
-		conn.CloseH1(cs.h1State)
+	if !detached {
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
+		}
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 		w.removeH2Conn(fd)
+	}
+
+	if detached {
+		// Skip deferred-close and pool return for detached connections.
+		// The goroutine's closures still reference cs; GC collects it
+		// after the goroutine finishes.
+		w.finishCloseDetached(fd, cs)
+		return
 	}
 
 	// Defer actual close until all in-flight and pending SENDs complete,
@@ -954,6 +1053,41 @@ func (w *Worker) finishClose(fd int) {
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	// Drain receive buffer to prevent RST from discarding unsent data
 	// (close() with unread data in recv buffer causes RST instead of FIN).
+	drainRecvBuffer(fd)
+
+	sqe := w.ring.GetSQE()
+	if sqe != nil {
+		prepClose(sqe, fd)
+		setSQEUserData(sqe, encodeUserData(udClose, fd))
+	}
+}
+
+// finishCloseDetached closes the FD and removes the connection from bookkeeping
+// WITHOUT returning the connState to the pool. Used when a detached goroutine
+// still holds closure references to the connState.
+func (w *Worker) finishCloseDetached(fd int, cs *connState) {
+	w.conns[fd] = nil
+	w.connCount--
+	w.activeConns.Add(-1)
+
+	if w.cfg.OnDisconnect != nil {
+		w.cfg.OnDisconnect(cs.remoteAddr)
+	}
+
+	fixedFile := cs.fixedFile
+	// Do NOT call releaseConnState — goroutine closures still reference cs.
+
+	if fixedFile {
+		sqe := w.ring.GetSQE()
+		if sqe != nil {
+			prepCloseDirect(sqe, fd)
+			setSQEUserData(sqe, encodeUserData(udClose, fd))
+		}
+		_ = w.ring.UpdateFixedFile(fd, -1)
+		return
+	}
+
+	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
 
 	sqe := w.ring.GetSQE()
@@ -1033,6 +1167,19 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 	}
 	setSQEUserData(sqe, encodeUserData(udRecv, fd))
 	return true
+}
+
+func (w *Worker) drainDetachQueue() {
+	w.detachQMu.Lock()
+	w.detachQSpare, w.detachQueue = w.detachQueue, w.detachQSpare[:0]
+	w.detachQMu.Unlock()
+	for _, cs := range w.detachQSpare {
+		if cs.detachClosed {
+			continue
+		}
+		w.markDirty(cs)
+	}
+	w.detachQSpare = w.detachQSpare[:0]
 }
 
 func (w *Worker) markDirty(cs *connState) {
@@ -1228,7 +1375,13 @@ func (w *Worker) shutdown() {
 		if cs == nil {
 			continue
 		}
-		if cs.h1State != nil {
+		detached := cs.detachMu != nil
+		if detached {
+			cs.detachMu.Lock()
+			cs.detachClosed = true
+			cs.detachMu.Unlock()
+		}
+		if !detached && cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
@@ -1237,7 +1390,9 @@ func (w *Worker) shutdown() {
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
-		releaseConnState(cs)
+		if !detached {
+			releaseConnState(cs)
+		}
 	}
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)

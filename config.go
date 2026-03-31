@@ -69,6 +69,11 @@ type Config struct {
 	// (default 32 MB). Set to -1 to disable the limit.
 	MaxFormSize int64
 
+	// MaxRequestBodySize is the maximum allowed request body size in bytes
+	// across all protocols (H1, H2, bridge). 0 uses the default (100 MB).
+	// Set to -1 to disable the limit (unlimited).
+	MaxRequestBodySize int64
+
 	// MaxConcurrentStreams limits simultaneous H2 streams per connection (default 100).
 	MaxConcurrentStreams uint32
 	// MaxFrameSize is the max H2 frame payload size (default 16384, range 16384-16777215).
@@ -93,6 +98,11 @@ type Config struct {
 	// [Server.Collector] returns nil and per-request metric recording is skipped.
 	// Default false (metrics enabled).
 	DisableMetrics bool
+
+	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
+	// If the callback returns false, the server responds with 417 Expectation Failed
+	// and skips reading the body. If nil, the server always sends 100 Continue.
+	OnExpectContinue func(method, path string, headers [][2]string) bool
 
 	// OnConnect is called when a new connection is accepted. The addr is the
 	// remote peer address. Must be fast — blocks the event loop.
@@ -148,6 +158,8 @@ func (c Config) toResourceConfig() resource.Config {
 		rc.Resources.MaxConns = c.MaxConns
 	}
 
+	rc.MaxRequestBodySize = c.MaxRequestBodySize
+	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
 

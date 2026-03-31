@@ -35,6 +35,31 @@ func (c *Context) FullPath() string { return c.fullPath }
 // Returns empty string if the URL has no query component.
 func (c *Context) RawQuery() string { return c.rawQuery }
 
+// SetRawQuery overrides the raw query string. Any cached query parameters
+// from a previous call to Query/QueryValues/QueryParams are invalidated.
+func (c *Context) SetRawQuery(q string) {
+	c.rawQuery = q
+	if c.queryCached {
+		c.extended = true
+		c.queryCache = nil
+		c.queryCached = false
+	}
+}
+
+// ContentLength returns the value of the Content-Length request header
+// parsed as int64. Returns -1 if the header is absent or invalid.
+func (c *Context) ContentLength() int64 {
+	cl := c.Header("content-length")
+	if cl == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(cl, 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
 // Header returns the value of the named request header. Keys must be lowercase
 // (HTTP/2 mandates lowercase; the H1 parser normalizes to lowercase).
 func (c *Context) Header(key string) string {
@@ -247,11 +272,15 @@ func (c *Context) parseCookies() {
 	}
 }
 
-// Scheme returns the request scheme ("http" or "https"). It checks the
+// Scheme returns the request scheme ("http" or "https"). If SetScheme has been
+// called, the override value is returned. Otherwise it checks the
 // X-Forwarded-Proto header first (set by reverse proxies), then falls back
 // to the :scheme pseudo-header from the original request.
 // Returns "http" if neither source provides a value.
 func (c *Context) Scheme() string {
+	if c.schemeOverride != "" {
+		return c.schemeOverride
+	}
 	if proto := c.Header("x-forwarded-proto"); proto != "" {
 		return strings.ToLower(strings.TrimSpace(proto))
 	}
@@ -261,11 +290,24 @@ func (c *Context) Scheme() string {
 	return "http"
 }
 
-// ClientIP extracts the client IP from X-Forwarded-For or X-Real-Ip headers.
-// Returns empty string if neither header is present.
+// SetScheme overrides the value returned by Scheme. This is useful in
+// middleware that determines the actual scheme from trusted proxy headers
+// (e.g., X-Forwarded-Proto) and wants downstream handlers to see the
+// canonical value without re-parsing headers.
+func (c *Context) SetScheme(scheme string) {
+	c.extended = true
+	c.schemeOverride = strings.ToLower(strings.TrimSpace(scheme))
+}
+
+// ClientIP extracts the client IP. If SetClientIP has been called, the
+// override value is returned. Otherwise it reads X-Forwarded-For or
+// X-Real-Ip headers. Returns empty string if neither header is present.
 // These headers can be spoofed by clients. In production behind a reverse proxy,
 // ensure only trusted proxies set these headers.
 func (c *Context) ClientIP() string {
+	if c.clientIPOverride != "" {
+		return c.clientIPOverride
+	}
 	if xff := c.Header("x-forwarded-for"); xff != "" {
 		if i := strings.IndexByte(xff, ','); i > 0 {
 			return strings.TrimSpace(xff[:i])
@@ -276,6 +318,14 @@ func (c *Context) ClientIP() string {
 		return strings.TrimSpace(xri)
 	}
 	return ""
+}
+
+// SetClientIP overrides the value returned by ClientIP. This is useful in
+// middleware that validates and extracts the real client IP from trusted proxy
+// headers, so downstream handlers see the canonical IP.
+func (c *Context) SetClientIP(ip string) {
+	c.extended = true
+	c.clientIPOverride = ip
 }
 
 // BasicAuth extracts HTTP Basic Authentication credentials from the
@@ -416,12 +466,23 @@ func (c *Context) RequestHeaders() [][2]string {
 func (c *Context) RemoteAddr() string { return c.stream.RemoteAddr }
 
 // Host returns the request host from the :authority pseudo-header (HTTP/2)
-// or the Host header (HTTP/1.1).
+// or the Host header (HTTP/1.1). If SetHost has been called, the override
+// value is returned instead.
 func (c *Context) Host() string {
+	if c.hostOverride != "" {
+		return c.hostOverride
+	}
 	if h := c.Header(":authority"); h != "" {
 		return h
 	}
 	return c.Header("host")
+}
+
+// SetHost overrides the value returned by Host. This is useful in middleware
+// that normalizes the host (e.g., stripping port, applying X-Forwarded-Host).
+func (c *Context) SetHost(host string) {
+	c.extended = true
+	c.hostOverride = host
 }
 
 // IsWebSocket returns true if the request is a WebSocket upgrade.
