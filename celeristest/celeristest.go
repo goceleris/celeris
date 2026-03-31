@@ -83,6 +83,7 @@ type config struct {
 	params     [][2]string
 	cookies    [][2]string
 	remoteAddr string
+	handlers   []any
 }
 
 // WithBody sets the request body.
@@ -126,6 +127,18 @@ func WithCookie(name, value string) Option {
 // WithRemoteAddr sets the remote address on the test stream.
 func WithRemoteAddr(addr string) Option {
 	return func(c *config) { c.remoteAddr = addr }
+}
+
+// WithHandlers sets the handler chain on the test context. This enables
+// middleware chain testing where mw1 calls c.Next() → mw2 runs → ... → final handler.
+// Pass celeris.HandlerFunc values; they are stored as []any to avoid import cycles.
+func WithHandlers(handlers ...celeris.HandlerFunc) Option {
+	return func(c *config) {
+		c.handlers = make([]any, len(handlers))
+		for i, h := range handlers {
+			c.handlers[i] = h
+		}
+	}
 }
 
 // ReleaseContext returns a [celeris.Context] to the pool. The context must not
@@ -190,6 +203,9 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 	ctx := ctxkit.NewContext(s).(*celeris.Context)
 	for _, p := range cfg.params {
 		ctxkit.AddParam(ctx, p[0], p[1])
+	}
+	if len(cfg.handlers) > 0 {
+		ctxkit.SetHandlers(ctx, cfg.handlers)
 	}
 	return ctx, rec
 }
