@@ -9,11 +9,9 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 
 ## Highlights
 
-- **3.3M+ HTTP/2 requests/sec** on a single 8-vCPU machine (arm64 Graviton3)
-- **590K+ HTTP/1.1 requests/sec** — 81% syscall-bound, zero allocations on the hot path
-- **io_uring and epoll at parity** — both engines hit the same throughput
-- **H2 is 5.7x faster than H1** thanks to stream multiplexing and inline handler execution
+- **io_uring and epoll at parity** — both engines deliver equivalent throughput
 - **Zero hot-path allocations** for both H1 and H2
+- **Designed for throughput** — see [benchmarks](https://goceleris.dev/benchmarks) for current numbers
 
 ## Features
 
@@ -26,7 +24,15 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 - **Error-returning handlers** — `HandlerFunc` returns `error`; structured `HTTPError` for status codes
 - **Serialization** — JSON and XML response methods (`JSON`, `XML`); Protocol Buffers available via [`github.com/goceleris/middlewares`](https://github.com/goceleris/middlewares); `Bind` auto-detects request format from Content-Type
 - **net/http compatibility** — wrap existing `http.Handler` via `celeris.Adapt()`
-- **Built-in metrics collector** — atomic counters, always-on `Server.Collector().Snapshot()`
+- **Streaming responses** — `Detach()` + `StreamWriter` for SSE and chunked responses on native engines
+- **Connection hijacking** — `Hijack()` for WebSocket and custom protocol upgrades (H1 only)
+- **Configurable body limits** — `MaxRequestBodySize` enforced across H1, H2, and the bridge
+- **100-continue control** — `OnExpectContinue` callback for upload validation before body transfer
+- **Accept control** — `PauseAccept()`/`ResumeAccept()` for graceful load shedding
+- **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`
+- **Response buffering** — `BufferResponse`/`FlushResponse` for transform middleware (compress, ETag)
+- **Zero-downtime restart** — `InheritListener` + `StartWithListener` for socket inheritance
+- **Built-in metrics** — atomic counters, CPU utilization sampling, always-on `Server.Collector().Snapshot()`
 
 ## Quick Start
 
@@ -85,48 +91,7 @@ v2.GET("/items", listItemsV2)
 
 ## Middleware
 
-Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module — one subpackage per middleware, individually importable.
-
-```go
-import (
-	"github.com/goceleris/middlewares/logger"
-	"github.com/goceleris/middlewares/recovery"
-	"github.com/goceleris/middlewares/cors"
-	"github.com/goceleris/middlewares/ratelimit"
-)
-
-s := celeris.New(celeris.Config{Addr: ":8080"})
-s.Use(recovery.New())
-s.Use(logger.New(slog.Default()))
-
-api := s.Group("/api")
-api.Use(ratelimit.New(1000))
-api.Use(cors.New(cors.Config{
-	AllowOrigins: []string{"https://example.com"},
-}))
-```
-
-See the [middlewares repo](https://github.com/goceleris/middlewares) for the full list: Logger, Recovery, CORS, RateLimit, RequestID, Timeout, BodyLimit, BasicAuth, JWT, CSRF, Session, Metrics, Debug, Compress, and more.
-
-### Writing Custom Middleware
-
-Middleware is just a `HandlerFunc` that calls `c.Next()`:
-
-```go
-func Timing() celeris.HandlerFunc {
-	return func(c *celeris.Context) error {
-		start := time.Now()
-		err := c.Next()
-		dur := time.Since(start)
-		slog.Info("request", "path", c.Path(), "duration", dur, "error", err)
-		return err
-	}
-}
-
-s.Use(Timing())
-```
-
-The `error` returned by `c.Next()` is the first non-nil error from any downstream handler. Middleware can inspect, wrap, or swallow the error before returning.
+Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module. See that repo for usage, examples, and the full list of available middleware.
 
 ## Error Handling
 
@@ -161,16 +126,16 @@ func ErrorLogger() celeris.HandlerFunc {
 
 ```go
 s := celeris.New(celeris.Config{
-	Addr:            ":8080",
-	Protocol:        celeris.Auto,       // HTTP1, H2C, or Auto
-	Engine:          celeris.Adaptive,    // IOUring, Epoll, Adaptive, or Std
-	Workers:         8,
-	Objective:       celeris.Latency,    // Latency, Throughput, or Balanced
-	ReadTimeout:     30 * time.Second,
-	WriteTimeout:    30 * time.Second,
-	IdleTimeout:     120 * time.Second,
-	ShutdownTimeout: 10 * time.Second,   // max wait for in-flight requests (default 30s)
-	Logger:          slog.Default(),
+	Addr:               ":8080",
+	Protocol:           celeris.Auto,       // HTTP1, H2C, or Auto
+	Engine:             celeris.Adaptive,    // IOUring, Epoll, Adaptive, or Std
+	Workers:            8,
+	ReadTimeout:        30 * time.Second,
+	WriteTimeout:       30 * time.Second,
+	IdleTimeout:        120 * time.Second,
+	ShutdownTimeout:    10 * time.Second,    // max wait for in-flight requests (default 30s)
+	MaxRequestBodySize: 50 << 20,            // 50 MB (default 100 MB, -1 for unlimited)
+	Logger:             slog.Default(),
 })
 ```
 
@@ -188,7 +153,7 @@ s.GET("/func", celeris.AdaptFunc(func(w http.ResponseWriter, r *http.Request) {
 }))
 ```
 
-The bridge buffers the adapted handler's response in memory, capped at **100 MB**. Responses exceeding this limit return an error.
+The bridge buffers the adapted handler's response in memory, capped at `MaxRequestBodySize` (default 100 MB). Responses exceeding this limit return an error.
 
 ## Engine Selection
 
@@ -200,14 +165,6 @@ The bridge buffers the adapted handler's response in memory, capped at **100 MB*
 | `Std` | Any OS | Development, compatibility, non-Linux deploys |
 
 Use Adaptive (the default on Linux) unless you have a specific reason to pin an engine. On non-Linux platforms, only Std is available.
-
-## Performance Profiles
-
-| Profile | Optimizes For | Key Tuning |
-|---------|---------------|------------|
-| `celeris.Latency` | P99 tail latency | TCP_NODELAY, small batches, SO_BUSY_POLL |
-| `celeris.Throughput` | Max RPS | Large CQ batches, write batching |
-| `celeris.Balanced` | Mixed workloads | Default settings |
 
 ## Graceful Shutdown
 
@@ -234,7 +191,15 @@ The core provides a lightweight metrics collector accessible via `Server.Collect
 
 ```go
 snap := server.Collector().Snapshot()
-fmt.Println(snap.RequestsTotal, snap.ErrorsTotal, snap.ActiveConns)
+fmt.Println(snap.RequestsTotal, snap.ErrorsTotal, snap.ActiveConns, snap.CPUUtilization)
+```
+
+For CPU utilization tracking, register a monitor:
+
+```go
+mon, _ := observe.NewCPUMonitor()
+server.Collector().SetCPUMonitor(mon)
+defer mon.Close()
 ```
 
 For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](https://github.com/goceleris/middlewares) and [`middlewares/debug`](https://github.com/goceleris/middlewares) packages.
@@ -252,50 +217,33 @@ For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](h
 | Multishot recv | yes (6.0+) | no | no |
 | Zero-alloc HEADERS | yes | yes | no |
 | Inline H2 handlers | yes | yes | no |
+| Detach / StreamWriter | yes | yes | yes |
+| Connection hijack | yes | yes | yes |
 
 ## Benchmarks
 
-Cloud benchmarks on arm64 c7g.2xlarge (8 vCPU Graviton3), separate server and client machines:
+For current benchmark results and methodology, see [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks).
 
-| Protocol | Engine | Throughput |
-|----------|--------|-----------|
-| HTTP/2 | epoll | **3.33M rps** |
-| HTTP/2 | io_uring | **3.30M rps** |
-| HTTP/1.1 | epoll | **590K rps** |
-| HTTP/1.1 | io_uring | **590K rps** |
-
-- io_uring and epoll within **1%** of each other on both protocols
-- H2 is **5.7x faster** than H1 (stream multiplexing + inline handlers)
-- Zero allocations on the hot path for both H1 and H2
-- All 3 engines within **0.3%** of each other in adaptive mode
-
-Methodology: 14 server configurations (io_uring/epoll/std x latency/throughput/balanced x H1/H2) tested with `wrk` (H1, 16384 connections) and `h2load` (H2, 128 connections x 128 streams) in 9-pass interleaved runs. Full results and reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/benchmarks).
+Reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/benchmarks).
 
 ## API Overview
 
 | Type | Package | Description |
 |------|---------|-------------|
 | `Server` | `celeris` | Top-level entry point; owns config, router, engine |
-| `Config` | `celeris` | Server configuration (addr, engine, protocol, timeouts) |
+| `Config` | `celeris` | Server configuration (addr, engine, protocol, timeouts, body limits) |
 | `Context` | `celeris` | Per-request context with params, headers, body, response methods |
 | `HandlerFunc` | `celeris` | `func(*Context) error` — handler/middleware signature |
 | `HTTPError` | `celeris` | Structured error carrying HTTP status code and message |
 | `RouteGroup` | `celeris` | Group of routes sharing a prefix and middleware |
 | `Route` | `celeris` | Opaque handle to a registered route |
+| `RouteInfo` | `celeris` | Describes a registered route (method, path, handler count) |
+| `Cookie` | `celeris` | HTTP cookie for `SetCookie`/`DeleteCookie` |
+| `StreamWriter` | `celeris` | Incremental response writer for streaming/SSE |
+| `EngineInfo` | `celeris` | Read-only info about the running engine (type + metrics) |
 | `Collector` | `observe` | Lock-free request metrics aggregator |
 | `Snapshot` | `observe` | Point-in-time copy of all collected metrics |
-
-## Architecture
-
-```mermaid
-block-beta
-  columns 3
-  A["celeris (public API)"]:3
-  B["adaptive"]:1 C["observe"]:2
-  E["engine/iouring"]:1 F["engine/epoll"]:1 G["engine/std"]:1
-  H["protocol/h1"]:1 I["protocol/h2"]:1 J["protocol/detect"]:1
-  K["probe"]:1 L["resource"]:1 M["internal"]:1
-```
+| `CPUMonitor` | `observe` | CPU utilization sampler (Linux `/proc/stat`, other `runtime/metrics`) |
 
 ## Requirements
 
@@ -308,12 +256,13 @@ block-beta
 
 ```
 adaptive/       Adaptive meta-engine (Linux)
+celeristest/    Test helpers (NewContext, ResponseRecorder)
 engine/         Engine interface + implementations (iouring, epoll, std)
-internal/       Shared internals (conn, cpumon, platform, sockopts)
-observe/        Lightweight metrics collector (atomic counters, Snapshot)
+internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts, timer)
+observe/        Metrics collector, CPUMonitor, Snapshot
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)
-resource/       Configuration, presets, objectives
+resource/       Configuration, presets, defaults
 test/           Conformance, spec compliance, integration, benchmarks
 ```
 

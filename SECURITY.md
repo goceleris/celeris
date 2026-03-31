@@ -4,10 +4,12 @@
 
 | Version        | Supported          |
 |----------------|--------------------|
-| >= 1.1.0       | Yes                |
-| < 1.1.0        | No                 |
+| >= 1.2.0       | Yes                |
+| < 1.2.0        | No                 |
 
 Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
+
+Versions prior to 1.2.0 contain known vulnerabilities in the HTTP response writer, cookie handling, header sanitization, and the `Detach()` streaming mechanism that were identified and fixed during the v1.2.0 security review process. We strongly recommend upgrading immediately.
 
 ## Reporting a Vulnerability
 
@@ -32,3 +34,9 @@ This policy covers the core `github.com/goceleris/celeris` module, including:
 - I/O engines (io_uring, epoll, std)
 - Request routing and context handling
 - The net/http bridge adapter
+- Response header sanitization (CRLF, null bytes, cookie attributes)
+- Connection lifecycle management (Detach, StreamWriter, pool safety)
+- Body size enforcement (MaxRequestBodySize across H1, H2, bridge)
+- Callback safety (OnExpectContinue, OnConnect, OnDisconnect)
+
+The middleware ecosystem (`github.com/goceleris/middlewares`) has its own security policy.

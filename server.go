@@ -19,7 +19,7 @@ import (
 )
 
 // Version is the semantic version of the celeris module.
-const Version = "1.0.0"
+const Version = "1.2.0"
 
 // ErrAlreadyStarted is returned when Start or StartWithContext is called on a
 // server that is already running.
