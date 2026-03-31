@@ -535,6 +535,10 @@ func (l *Loop) initProtocol(cs *connState) {
 			orig := cs.writeFn
 			cs.writeFn = func(data []byte) {
 				mu.Lock()
+				if cs.detachClosed {
+					mu.Unlock()
+					return
+				}
 				orig(data)
 				l.markDirty(cs)
 				mu.Unlock()
@@ -663,9 +667,22 @@ func (l *Loop) closeConn(fd int) {
 	if cs == nil {
 		return
 	}
+	detached := cs.detachMu != nil
+	if detached {
+		// Signal the detached goroutine's writeFn to stop writing.
+		// The mutex serializes with any in-progress write — if the
+		// goroutine is mid-write, we block until it finishes.
+		cs.detachMu.Lock()
+		cs.detachClosed = true
+		cs.detachMu.Unlock()
+	}
 	l.removeDirty(cs)
-	if cs.h1State != nil {
-		conn.CloseH1(cs.h1State)
+	if !detached {
+		// Only release the H1 stream when NOT detached — the goroutine
+		// still holds a reference through its Context/StreamWriter.
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
+		}
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
@@ -683,7 +700,12 @@ func (l *Loop) closeConn(fd int) {
 		l.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	releaseConnState(cs)
+	if !detached {
+		releaseConnState(cs)
+	}
+	// Detached: connState is NOT returned to the pool. The goroutine's
+	// closures still reference it. GC collects it after the goroutine
+	// finishes and all closure references are dropped.
 }
 
 func (l *Loop) shutdown() {

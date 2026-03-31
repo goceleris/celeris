@@ -641,6 +641,10 @@ func (w *Worker) initProtocol(cs *connState) {
 			wakeupFD := w.h2EventFD
 			cs.writeFn = func(data []byte) {
 				mu.Lock()
+				if cs.detachClosed {
+					mu.Unlock()
+					return
+				}
 				orig(data)
 				w.markDirty(cs)
 				mu.Unlock()
@@ -953,13 +957,30 @@ func (w *Worker) closeConn(fd int) {
 	if cs == nil {
 		return
 	}
+	detached := cs.detachMu != nil
+	if detached {
+		// Signal the detached goroutine's writeFn to stop writing.
+		cs.detachMu.Lock()
+		cs.detachClosed = true
+		cs.detachMu.Unlock()
+	}
 	w.removeDirty(cs)
-	if cs.h1State != nil {
-		conn.CloseH1(cs.h1State)
+	if !detached {
+		if cs.h1State != nil {
+			conn.CloseH1(cs.h1State)
+		}
 	}
 	if cs.h2State != nil {
 		conn.CloseH2(cs.h2State)
 		w.removeH2Conn(fd)
+	}
+
+	if detached {
+		// Skip deferred-close and pool return for detached connections.
+		// The goroutine's closures still reference cs; GC collects it
+		// after the goroutine finishes.
+		w.finishCloseDetached(fd, cs)
+		return
 	}
 
 	// Defer actual close until all in-flight and pending SENDs complete,
@@ -1011,6 +1032,41 @@ func (w *Worker) finishClose(fd int) {
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	// Drain receive buffer to prevent RST from discarding unsent data
 	// (close() with unread data in recv buffer causes RST instead of FIN).
+	drainRecvBuffer(fd)
+
+	sqe := w.ring.GetSQE()
+	if sqe != nil {
+		prepClose(sqe, fd)
+		setSQEUserData(sqe, encodeUserData(udClose, fd))
+	}
+}
+
+// finishCloseDetached closes the FD and removes the connection from bookkeeping
+// WITHOUT returning the connState to the pool. Used when a detached goroutine
+// still holds closure references to the connState.
+func (w *Worker) finishCloseDetached(fd int, cs *connState) {
+	w.conns[fd] = nil
+	w.connCount--
+	w.activeConns.Add(-1)
+
+	if w.cfg.OnDisconnect != nil {
+		w.cfg.OnDisconnect(cs.remoteAddr)
+	}
+
+	fixedFile := cs.fixedFile
+	// Do NOT call releaseConnState — goroutine closures still reference cs.
+
+	if fixedFile {
+		sqe := w.ring.GetSQE()
+		if sqe != nil {
+			prepCloseDirect(sqe, fd)
+			setSQEUserData(sqe, encodeUserData(udClose, fd))
+		}
+		_ = w.ring.UpdateFixedFile(fd, -1)
+		return
+	}
+
+	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
 
 	sqe := w.ring.GetSQE()

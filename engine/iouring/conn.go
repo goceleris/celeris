@@ -36,12 +36,13 @@ type connState struct {
 
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
-	h1State    *conn.H1State
-	h2State    *conn.H2State
-	ctx        context.Context
-	remoteAddr string
-	writeFn    func([]byte) // cached write function (avoids closure allocation per recv)
-	detachMu   *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
+	h1State      *conn.H1State
+	h2State      *conn.H2State
+	ctx          context.Context
+	remoteAddr   string
+	writeFn      func([]byte) // cached write function (avoids closure allocation per recv)
+	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
+	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
 }
 
 var connStatePool = sync.Pool{
@@ -89,6 +90,7 @@ func releaseConnState(cs *connState) {
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
 	cs.detachMu = nil
+	cs.detachClosed = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }
