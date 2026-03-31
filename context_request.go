@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
 )
@@ -340,16 +341,18 @@ func (c *Context) BasicAuth() (username, password string, ok bool) {
 	if len(auth) < len(prefix) || auth[:len(prefix)] != prefix {
 		return
 	}
-	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	payload := auth[len(prefix):]
+	var buf [128]byte
+	n, err := base64.StdEncoding.Decode(buf[:],
+		unsafe.Slice(unsafe.StringData(payload), len(payload)))
 	if err != nil {
 		return
 	}
-	s := string(decoded)
-	colon := strings.IndexByte(s, ':')
-	if colon < 0 {
+	i := bytes.IndexByte(buf[:n], ':')
+	if i < 0 {
 		return
 	}
-	return s[:colon], s[colon+1:], true
+	return string(buf[:i]), string(buf[i+1 : n]), true
 }
 
 // FormValue returns the first value for the named form field.
