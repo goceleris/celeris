@@ -61,6 +61,7 @@ type Stream struct {
 	phase                  Phase
 	CachedCtx              any    // per-connection cached context (avoids pool Get/Put per request)
 	OnDetach               func() // called by Context.Detach to install write-thread safety
+	hdrBuf                 [16][2]string
 }
 
 // streamContext is a zero-alloc context.Context for streams.
@@ -106,9 +107,7 @@ func NewStream(id uint32) *Stream {
 	s.Data = getBuf()
 	s.windowSize.Store(65535)
 	s.phase = PhaseInit
-	if cap(s.Headers) < 8 {
-		s.Headers = make([][2]string, 0, 8)
-	}
+	s.Headers = s.hdrBuf[:0]
 	return s
 }
 
@@ -118,9 +117,7 @@ func NewH1Stream(id uint32) *Stream {
 	s.ID = id
 	s.state.Store(int32(StateIdle))
 	s.h1Mode = true
-	if cap(s.Headers) < 16 {
-		s.Headers = make([][2]string, 0, 16)
-	}
+	s.Headers = s.hdrBuf[:0]
 	return s
 }
 
@@ -180,7 +177,7 @@ func (s *Stream) Release() {
 	s.ID = 0
 	s.state.Store(0)
 	s.manager = nil
-	s.Headers = s.Headers[:0]
+	s.Headers = s.hdrBuf[:0]
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.headersSent.Store(false)
@@ -217,7 +214,7 @@ func ResetH1Stream(s *Stream) {
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
-	s.Headers = s.Headers[:0]
+	s.Headers = s.hdrBuf[:0]
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.ResponseWriter = nil
@@ -240,7 +237,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 		s.OutboundBuffer = getBuf()
 	}
 	s.ID = id
-	s.Headers = s.Headers[:0]
+	s.Headers = s.hdrBuf[:0]
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.headersSent.Store(false)
