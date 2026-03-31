@@ -92,8 +92,12 @@ func startEngine(t *testing.T, e engine.Engine) {
 		}
 
 		// Readiness probe: verify the engine can serve a request.
+		// Use a non-pooling transport so the probe connection is closed
+		// immediately, preventing reuse by test clients (which would see
+		// RST on slow CI machines if the server recycles the connection).
 		addr := ag.Addr().String()
-		client := &http.Client{Timeout: 2 * time.Second}
+		probeTransport := &http.Transport{DisableKeepAlives: true}
+		client := &http.Client{Timeout: 2 * time.Second, Transport: probeTransport}
 		resp, probeErr := client.Get("http://" + addr + "/healthz")
 		if probeErr != nil {
 			cancel()
