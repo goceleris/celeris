@@ -105,9 +105,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				if state.req.ExpectContinue {
 					if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, nil) {
 						write(expectation417Response)
-						state.req.ExpectContinue = false
-						offset += consumed
-						continue
+						// Close connection after rejection to prevent request
+						// smuggling: body bytes already in the buffer would
+						// otherwise be parsed as a new request.
+						return errConnectionClose
 					}
 					write(continue100Response)
 					state.req.ExpectContinue = false
@@ -151,9 +152,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
 			if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, nil) {
 				write(expectation417Response)
-				state.req.ExpectContinue = false
-				state.buffer.Next(consumed)
-				continue
+				// Close connection after rejection to prevent request
+				// smuggling: body bytes already in the buffer would
+				// otherwise be parsed as a new request.
+				return errConnectionClose
 			}
 			write(continue100Response)
 			state.req.ExpectContinue = false
