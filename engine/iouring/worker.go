@@ -647,7 +647,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			cs.detachMu = mu
 			orig := cs.writeFn
 			wakeupFD := w.h2EventFD
-			cs.writeFn = func(data []byte) {
+			guarded := func(data []byte) {
 				mu.Lock()
 				if cs.detachClosed {
 					mu.Unlock()
@@ -666,6 +666,10 @@ func (w *Worker) initProtocol(cs *connState) {
 					_, _ = unix.Write(wakeupFD, val[:])
 				}
 			}
+			cs.writeFn = guarded
+			// Also update the response adapter so StreamWriter writes
+			// go through the guarded path (not the stale pre-Detach writeFn).
+			cs.h1State.UpdateWriteFn(guarded)
 			// Ensure eventfd poll is armed so the worker wakes up.
 			if !w.h2PollArmed && w.h2EventFD >= 0 {
 				w.prepareH2Poll()

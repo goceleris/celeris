@@ -43,6 +43,12 @@ type H1State struct {
 	Detached           bool                                                // set by OnDetach; breaks pipelining loop
 }
 
+// UpdateWriteFn replaces the response adapter's write function. Called by
+// OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
+func (s *H1State) UpdateWriteFn(fn func([]byte)) {
+	s.rw.write = fn
+}
+
 func (s *H1State) maxBodySize() int64 {
 	return s.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
 }

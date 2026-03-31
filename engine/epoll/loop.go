@@ -559,7 +559,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			mu := &sync.Mutex{}
 			cs.detachMu = mu
 			orig := cs.writeFn
-			cs.writeFn = func(data []byte) {
+			guarded := func(data []byte) {
 				mu.Lock()
 				if cs.detachClosed {
 					mu.Unlock()
@@ -578,6 +578,10 @@ func (l *Loop) initProtocol(cs *connState) {
 					_, _ = unix.Write(l.eventFD, val[:])
 				}
 			}
+			cs.writeFn = guarded
+			// Also update the response adapter so StreamWriter writes
+			// go through the guarded path (not the stale pre-Detach writeFn).
+			cs.h1State.UpdateWriteFn(guarded)
 			// Ensure eventfd is available for wakeup.
 			if l.eventFD < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
