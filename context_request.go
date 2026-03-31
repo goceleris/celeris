@@ -296,7 +296,7 @@ func (c *Context) Scheme() string {
 // canonical value without re-parsing headers.
 func (c *Context) SetScheme(scheme string) {
 	c.extended = true
-	c.schemeOverride = scheme
+	c.schemeOverride = strings.ToLower(strings.TrimSpace(scheme))
 }
 
 // ClientIP extracts the client IP. If SetClientIP has been called, the

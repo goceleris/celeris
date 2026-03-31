@@ -871,7 +871,13 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	if c.Res < 0 {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
 		cs.writeBuf = cs.writeBuf[:0]
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
 		if cs.closing {
 			w.finishClose(fd)
 		} else {

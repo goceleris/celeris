@@ -410,12 +410,24 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
 			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			_ = flushWrites(cs)
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
 			l.closeConn(fd)
 			return
 		}
 		if n == 0 {
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			_ = flushWrites(cs)
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
 			l.closeConn(fd)
 			return
 		}

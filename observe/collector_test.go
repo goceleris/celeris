@@ -156,6 +156,7 @@ type mockCPUMonitor struct {
 	err  error
 }
 
+func (m *mockCPUMonitor) Close() error { return nil }
 func (m *mockCPUMonitor) Sample() (float64, error) {
 	return m.util, m.err
 }

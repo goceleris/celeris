@@ -52,8 +52,14 @@ type Snapshot struct {
 // platform-specific: Linux uses /proc/stat, other platforms use
 // runtime/metrics. Use [NewCPUMonitor] to create the appropriate
 // implementation for the current platform.
+//
+// Call Close when the monitor is no longer needed to release resources
+// (e.g., the /proc/stat file descriptor on Linux).
 type CPUMonitor interface {
+	// Sample returns the current CPU utilization as a fraction in [0.0, 1.0].
 	Sample() (float64, error)
+	// Close releases any resources held by the monitor.
+	Close() error
 }
 
 // Collector aggregates request metrics using lock-free counters.

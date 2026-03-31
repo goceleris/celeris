@@ -96,6 +96,12 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			}
 
 			if bodyNeeded > 0 || bodyNeeded == -1 {
+				if bodyNeeded > 0 {
+					if limit := state.maxBodySize(); limit > 0 && bodyNeeded > limit {
+						writeErrorResponse(write, 413, "Request body too large")
+						return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
+					}
+				}
 				if state.req.ExpectContinue {
 					if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 						write(expectation417Response)
@@ -153,6 +159,13 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			}
 			write(continue100Response)
 			state.req.ExpectContinue = false
+		}
+
+		if bodyNeeded > 0 {
+			if limit := state.maxBodySize(); limit > 0 && bodyNeeded > limit {
+				writeErrorResponse(write, 413, "Request body too large")
+				return fmt.Errorf("content-length %d exceeds %d byte limit", bodyNeeded, limit)
+			}
 		}
 
 		var bodyData []byte
