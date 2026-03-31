@@ -129,7 +129,7 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if len(c.respHeaders)+2 > 8 {
 		headers = make([][2]string, 0, len(c.respHeaders)+2)
 	}
-	headers = append(headers, [2]string{"content-type", contentType})
+	headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
 	headers = append(headers, [2]string{"content-length", itoa(len(data))})
 	headers = append(headers, c.respHeaders...)
 	if c.stream.ResponseWriter != nil {

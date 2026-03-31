@@ -190,7 +190,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	} else {
 		// General path: merged loop checks for content-length while appending.
 		hasContentLength := false
-		for i, h := range headers {
+		for _, h := range headers {
 			if h[0] == "content-length" {
 				hasContentLength = true
 			}
@@ -213,17 +213,10 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 					continue
 				}
 			}
-			if i < 2 {
-				buf = append(buf, h[0]...)
-				buf = append(buf, ": "...)
-				buf = append(buf, h[1]...)
-				buf = append(buf, crlf...)
-			} else {
-				buf = appendSanitizedHeaderField(buf, h[0])
-				buf = append(buf, ": "...)
-				buf = appendSanitizedHeaderField(buf, h[1])
-				buf = append(buf, crlf...)
-			}
+			buf = appendSanitizedHeaderField(buf, h[0])
+			buf = append(buf, ": "...)
+			buf = appendSanitizedHeaderField(buf, h[1])
+			buf = append(buf, crlf...)
 		}
 		if !hasContentLength && len(body) > 0 {
 			buf = append(buf, clPrefix...)
