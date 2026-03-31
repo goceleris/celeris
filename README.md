@@ -91,48 +91,7 @@ v2.GET("/items", listItemsV2)
 
 ## Middleware
 
-Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module — one subpackage per middleware, individually importable.
-
-```go
-import (
-	"github.com/goceleris/middlewares/logger"
-	"github.com/goceleris/middlewares/recovery"
-	"github.com/goceleris/middlewares/cors"
-	"github.com/goceleris/middlewares/ratelimit"
-)
-
-s := celeris.New(celeris.Config{Addr: ":8080"})
-s.Use(recovery.New())
-s.Use(logger.New(slog.Default()))
-
-api := s.Group("/api")
-api.Use(ratelimit.New(1000))
-api.Use(cors.New(cors.Config{
-	AllowOrigins: []string{"https://example.com"},
-}))
-```
-
-See the [middlewares repo](https://github.com/goceleris/middlewares) for the full list: Logger, Recovery, CORS, RateLimit, RequestID, Timeout, BodyLimit, BasicAuth, JWT, CSRF, Session, KeyAuth, Compress, ETag, Cache, Metrics, Debug, and more.
-
-### Writing Custom Middleware
-
-Middleware is just a `HandlerFunc` that calls `c.Next()`:
-
-```go
-func Timing() celeris.HandlerFunc {
-	return func(c *celeris.Context) error {
-		start := time.Now()
-		err := c.Next()
-		dur := time.Since(start)
-		slog.Info("request", "path", c.Path(), "duration", dur, "error", err)
-		return err
-	}
-}
-
-s.Use(Timing())
-```
-
-The `error` returned by `c.Next()` is the first non-nil error from any downstream handler. Middleware can inspect, wrap, or swallow the error before returning.
+Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module. See that repo for usage, examples, and the full list of available middleware.
 
 ## Error Handling
 
@@ -285,18 +244,6 @@ Reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/b
 | `Collector` | `observe` | Lock-free request metrics aggregator |
 | `Snapshot` | `observe` | Point-in-time copy of all collected metrics |
 | `CPUMonitor` | `observe` | CPU utilization sampler (Linux `/proc/stat`, other `runtime/metrics`) |
-
-## Architecture
-
-```mermaid
-block-beta
-  columns 3
-  A["celeris (public API)"]:3
-  B["adaptive"]:1 C["observe"]:2
-  E["engine/iouring"]:1 F["engine/epoll"]:1 G["engine/std"]:1
-  H["protocol/h1"]:1 I["protocol/h2"]:1 J["protocol/detect"]:1
-  K["probe"]:1 L["resource"]:1 M["internal"]:1
-```
 
 ## Requirements
 
