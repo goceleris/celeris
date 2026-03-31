@@ -48,18 +48,21 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Headers = hdrs
 
 	if r.Body != nil && r.Body != http.NoBody {
-		maxBodySize := b.engine.cfg.MaxRequestBodySize
-		if maxBodySize <= 0 {
-			maxBodySize = 100 << 20 // 100 MB default
+		maxBodySize := b.engine.cfg.MaxRequestBodySize // 0 = unlimited (after WithDefaults)
+		var body []byte
+		var err error
+		if maxBodySize > 0 {
+			body, err = io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
+		} else {
+			body, err = io.ReadAll(r.Body)
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
 		_ = r.Body.Close()
 		if err != nil {
 			b.engine.metrics.errCount.Add(1)
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
 		}
-		if int64(len(body)) > maxBodySize {
+		if maxBodySize > 0 && int64(len(body)) > maxBodySize {
 			b.engine.metrics.errCount.Add(1)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return

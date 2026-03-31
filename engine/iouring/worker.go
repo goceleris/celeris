@@ -80,6 +80,9 @@ type Worker struct {
 	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
 	h2cfg         conn.H2Config
 	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
+	detachQueue   []*connState
+	detachQMu     sync.Mutex
+	detachQSpare  []*connState
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -385,6 +388,10 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
+		// Drain detached goroutine writes. Goroutines append to the queue
+		// instead of calling markDirty directly (dirtyHead is worker-local).
+		w.drainDetachQueue()
+
 		// Retry pending sends and dropped recv arms on dirty connections
 		// (SQ ring was full earlier). Typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
@@ -646,9 +653,12 @@ func (w *Worker) initProtocol(cs *connState) {
 					return
 				}
 				orig(data)
-				w.markDirty(cs)
 				mu.Unlock()
-				// Wake the event loop so it drains the dirty list.
+				// Signal the event loop to flush. Do NOT call markDirty
+				// from this goroutine — dirtyHead is worker-local.
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQMu.Unlock()
 				if wakeupFD >= 0 {
 					var val [8]byte
 					val[0] = 1
@@ -1148,6 +1158,19 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 	return true
 }
 
+func (w *Worker) drainDetachQueue() {
+	w.detachQMu.Lock()
+	w.detachQSpare, w.detachQueue = w.detachQueue, w.detachQSpare[:0]
+	w.detachQMu.Unlock()
+	for _, cs := range w.detachQSpare {
+		if cs.detachClosed {
+			continue
+		}
+		w.markDirty(cs)
+	}
+	w.detachQSpare = w.detachQSpare[:0]
+}
+
 func (w *Worker) markDirty(cs *connState) {
 	if cs.dirty {
 		return
@@ -1341,7 +1364,13 @@ func (w *Worker) shutdown() {
 		if cs == nil {
 			continue
 		}
-		if cs.h1State != nil {
+		detached := cs.detachMu != nil
+		if detached {
+			cs.detachMu.Lock()
+			cs.detachClosed = true
+			cs.detachMu.Unlock()
+		}
+		if !detached && cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
@@ -1350,7 +1379,9 @@ func (w *Worker) shutdown() {
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
-		releaseConnState(cs)
+		if !detached {
+			releaseConnState(cs)
+		}
 	}
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)

@@ -17,9 +17,6 @@ import (
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
 
-// defaultMaxRequestBodySize is the default maximum allowed request body (100 MB).
-const defaultMaxRequestBodySize = 100 << 20
-
 // errConnectionClose is returned when the client requests Connection: close.
 // Pre-allocated to avoid per-request fmt.Errorf allocation.
 var errConnectionClose = errors.New("connection close requested")
@@ -46,10 +43,7 @@ type H1State struct {
 }
 
 func (s *H1State) maxBodySize() int64 {
-	if s.MaxRequestBodySize > 0 {
-		return s.MaxRequestBodySize
-	}
-	return defaultMaxRequestBodySize
+	return s.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
 }
 
 // NewH1State creates a new H1 connection state with zero-copy header parsing.
@@ -103,7 +97,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 
 			if bodyNeeded > 0 || bodyNeeded == -1 {
 				if state.req.ExpectContinue {
-					if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, nil) {
+					if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 						write(expectation417Response)
 						// Close connection after rejection to prevent request
 						// smuggling: body bytes already in the buffer would
@@ -150,7 +144,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
-			if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, nil) {
+			if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, expectHeaders(&state.req)) {
 				write(expectation417Response)
 				// Close connection after rejection to prevent request
 				// smuggling: body bytes already in the buffer would
@@ -208,6 +202,20 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 	}
 	return nil
+}
+
+// expectHeaders converts raw H1 headers to [][2]string for the OnExpectContinue
+// callback. Zero-copy strings are safe because the callback runs synchronously
+// on the event loop thread before the read buffer is reused.
+func expectHeaders(req *h1.Request) [][2]string {
+	if len(req.RawHeaders) == 0 {
+		return nil
+	}
+	hdrs := make([][2]string, len(req.RawHeaders))
+	for i, rh := range req.RawHeaders {
+		hdrs[i] = [2]string{h1.UnsafeLowerHeader(rh[0]), h1.UnsafeString(rh[1])}
+	}
+	return hdrs
 }
 
 func handleH1Request(ctx context.Context, state *H1State, body []byte,

@@ -530,6 +530,9 @@ func (c *Context) Hijack() (net.Conn, error) {
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
 func (c *Context) Detach() (done func()) {
+	if c.detached {
+		return func() {} // already detached — return no-op done
+	}
 	// Materialize any unsafe string headers (zero-copy H1 headers backed by
 	// the connection's read buffer) before the handler returns and the buffer
 	// is reused for the next recv. Pseudo-headers (:method, :path, etc.) are

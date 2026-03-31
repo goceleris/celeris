@@ -20,10 +20,6 @@ type ContinuationState struct {
 	isTrailers    bool
 }
 
-// defaultMaxRequestBodySize is the default maximum allowed request body (100 MB).
-// Streams exceeding this limit are rejected with RST_STREAM.
-const defaultMaxRequestBodySize = 100 << 20
-
 var headerBlockPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
 
 var headersSlicePoolIn = sync.Pool{New: func() any { s := make([][2]string, 0, 16); return &s }}
@@ -90,10 +86,7 @@ type Processor struct {
 }
 
 func (p *Processor) maxBodySize() int64 {
-	if p.MaxRequestBodySize > 0 {
-		return p.MaxRequestBodySize
-	}
-	return defaultMaxRequestBodySize
+	return p.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
 }
 
 // SetHasMoreFrames tells the processor whether more frames follow the

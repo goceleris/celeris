@@ -5,9 +5,9 @@ import "testing"
 func TestH1StateMaxBodySize(t *testing.T) {
 	s := NewH1State()
 
-	// Default: 100 MB
-	if got := s.maxBodySize(); got != defaultMaxRequestBodySize {
-		t.Fatalf("expected default %d, got %d", defaultMaxRequestBodySize, got)
+	// Zero value = unlimited (0 passes through, limit > 0 guard disables enforcement)
+	if got := s.maxBodySize(); got != 0 {
+		t.Fatalf("expected 0 (unlimited), got %d", got)
 	}
 
 	// Custom value
