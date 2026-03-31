@@ -87,7 +87,7 @@ type Context struct {
 }
 
 var contextPool = sync.Pool{New: func() any {
-	c := &Context{}
+	c := &Context{keys: make(map[string]any, 4)}
 	c.respHeaders = c.respHdrBuf[:0]
 	return c
 }}
@@ -217,17 +217,11 @@ func (c *Context) SetContext(ctx context.Context) {
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
 	c.extended = true
-	if c.keys == nil {
-		c.keys = make(map[string]any)
-	}
 	c.keys[key] = value
 }
 
 // Get returns the value for a key.
 func (c *Context) Get(key string) (any, bool) {
-	if c.keys == nil {
-		return nil, false
-	}
 	v, ok := c.keys[key]
 	return v, ok
 }
@@ -235,7 +229,7 @@ func (c *Context) Get(key string) (any, bool) {
 // Keys returns a copy of all key-value pairs stored on this context.
 // Returns nil if no values have been set.
 func (c *Context) Keys() map[string]any {
-	if c.keys == nil {
+	if len(c.keys) == 0 {
 		return nil
 	}
 	cp := make(map[string]any, len(c.keys))
@@ -266,7 +260,7 @@ func (c *Context) reset() {
 	c.bytesWritten = 0
 	c.maxFormSize = 0
 	if c.extended {
-		c.keys = nil
+		clear(c.keys)
 		c.queryCache = nil
 		c.queryCached = false
 		c.cookieCache = c.cookieCache[:0]
