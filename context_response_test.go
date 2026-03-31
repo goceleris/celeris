@@ -1395,3 +1395,62 @@ func TestInlineNoFilename(t *testing.T) {
 		t.Fatalf("expected 'inline', got %q", cd)
 	}
 }
+
+func TestContextResponseHeaders(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if len(c.ResponseHeaders()) != 0 {
+		t.Fatal("expected empty response headers")
+	}
+
+	c.SetHeader("x-custom", "value1")
+	c.SetHeader("x-other", "value2")
+
+	hdrs := c.ResponseHeaders()
+	if len(hdrs) != 2 {
+		t.Fatalf("expected 2 headers, got %d", len(hdrs))
+	}
+	if hdrs[0][0] != "x-custom" || hdrs[0][1] != "value1" {
+		t.Fatalf("unexpected header[0]: %v", hdrs[0])
+	}
+	if hdrs[1][0] != "x-other" || hdrs[1][1] != "value2" {
+		t.Fatalf("unexpected header[1]: %v", hdrs[1])
+	}
+}
+
+func TestContextDeleteCookie(t *testing.T) {
+	s, rw := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	c.DeleteCookie("session", "/")
+	if err := c.NoContent(200); err != nil {
+		t.Fatal(err)
+	}
+
+	var setCookie string
+	for _, h := range rw.headers {
+		if h[0] == "set-cookie" {
+			setCookie = h[1]
+			break
+		}
+	}
+	if setCookie == "" {
+		t.Fatal("expected set-cookie header")
+	}
+	if !strings.Contains(setCookie, "session=") {
+		t.Fatalf("expected cookie name 'session', got %q", setCookie)
+	}
+	if !strings.Contains(setCookie, "Max-Age=0") {
+		t.Fatalf("expected Max-Age=0 (delete), got %q", setCookie)
+	}
+	if !strings.Contains(setCookie, "Path=/") {
+		t.Fatalf("expected Path=/, got %q", setCookie)
+	}
+}

@@ -215,9 +215,22 @@ func stripCRLF(s string) string {
 	return s
 }
 
+// ResponseHeaders returns the response headers that have been set so far.
+// The returned slice must not be modified. Use SetHeader or AddHeader to
+// change response headers.
+func (c *Context) ResponseHeaders() [][2]string {
+	return c.respHeaders
+}
+
 // StatusCode returns the response status code set by the handler.
 func (c *Context) StatusCode() int {
 	return c.statusCode
+}
+
+// DeleteCookie appends a Set-Cookie header that instructs the client to delete
+// the named cookie. The path must match the original cookie's path.
+func (c *Context) DeleteCookie(name, path string) {
+	c.SetCookie(&Cookie{Name: name, Path: path, MaxAge: -1})
 }
 
 // Redirect sends an HTTP redirect to the given URL with the specified status code.
@@ -535,6 +548,9 @@ func (c *Context) Detach() (done func()) {
 
 	c.extended = true
 	c.detached = true
+	if c.stream.OnDetach != nil {
+		c.stream.OnDetach()
+	}
 	ch := make(chan struct{})
 	c.detachDone = ch
 	return func() { close(ch) }

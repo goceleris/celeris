@@ -20,9 +20,9 @@ type ContinuationState struct {
 	isTrailers    bool
 }
 
-// maxRequestBodySize is the maximum allowed request body (100 MB).
+// defaultMaxRequestBodySize is the default maximum allowed request body (100 MB).
 // Streams exceeding this limit are rejected with RST_STREAM.
-const maxRequestBodySize = 100 << 20
+const defaultMaxRequestBodySize = 100 << 20
 
 var headerBlockPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
 
@@ -86,6 +86,14 @@ type Processor struct {
 	pendingInlineCleanup []*Stream      // inline-completed streams deferred until frame loop exits
 	InlineWriter         ResponseWriter // direct-to-outBuf writer for inline handlers (set by conn layer)
 	InlineCount          uint64         // number of requests handled inline (for metrics)
+	MaxRequestBodySize   int64          // 0 = use default (100 MB)
+}
+
+func (p *Processor) maxBodySize() int64 {
+	if p.MaxRequestBodySize > 0 {
+		return p.MaxRequestBodySize
+	}
+	return defaultMaxRequestBodySize
 }
 
 // SetHasMoreFrames tells the processor whether more frames follow the
@@ -930,9 +938,9 @@ func (p *Processor) handleData(_ context.Context, f *http2.DataFrame) error {
 	stream.ReceivedDataLen += dataLen
 
 	// Reject streams that exceed the maximum request body size (100 MB).
-	if stream.ReceivedDataLen > maxRequestBodySize {
+	if limit := p.maxBodySize(); limit > 0 && int64(stream.ReceivedDataLen) > limit {
 		_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeCancel)
-		return fmt.Errorf("request body exceeds %d bytes on stream %d", maxRequestBodySize, f.StreamID)
+		return fmt.Errorf("request body exceeds %d bytes on stream %d", limit, f.StreamID)
 	}
 
 	if err := stream.AddData(f.Data()); err != nil {

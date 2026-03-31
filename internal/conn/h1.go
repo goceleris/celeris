@@ -17,8 +17,8 @@ import (
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
 
-// maxRequestBodySize is the maximum allowed request body (100 MB), matching H2.
-const maxRequestBodySize = 100 << 20
+// defaultMaxRequestBodySize is the default maximum allowed request body (100 MB).
+const defaultMaxRequestBodySize = 100 << 20
 
 // errConnectionClose is returned when the client requests Connection: close.
 // Pre-allocated to avoid per-request fmt.Errorf allocation.
@@ -28,15 +28,28 @@ var errConnectionClose = errors.New("connection close requested")
 // to signal that the server is willing to accept the request body.
 var continue100Response = []byte("HTTP/1.1 100 Continue\r\n\r\n")
 
+// expectation417Response is sent when OnExpectContinue rejects the request.
+var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n")
+
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
-	parser     *h1.Parser
-	buffer     bytes.Buffer
-	req        h1.Request
-	rw         h1ResponseAdapter // embedded — reused per request, avoids heap alloc
-	stream     *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
-	RemoteAddr string
-	HijackFn   func() (net.Conn, error) // set by engine; nil if unsupported
+	parser             *h1.Parser
+	buffer             bytes.Buffer
+	req                h1.Request
+	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
+	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
+	RemoteAddr         string
+	HijackFn           func() (net.Conn, error)                            // set by engine; nil if unsupported
+	MaxRequestBodySize int64                                               // 0 = use default (100 MB)
+	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
+	OnDetach           func()                                              // set by engine; called on Context.Detach
+}
+
+func (s *H1State) maxBodySize() int64 {
+	if s.MaxRequestBodySize > 0 {
+		return s.MaxRequestBodySize
+	}
+	return defaultMaxRequestBodySize
 }
 
 // NewH1State creates a new H1 connection state with zero-copy header parsing.
@@ -90,6 +103,12 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 
 			if bodyNeeded > 0 || bodyNeeded == -1 {
 				if state.req.ExpectContinue {
+					if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, nil) {
+						write(expectation417Response)
+						state.req.ExpectContinue = false
+						offset += consumed
+						continue
+					}
 					write(continue100Response)
 					state.req.ExpectContinue = false
 				}
@@ -130,6 +149,12 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 
 		if state.req.ExpectContinue && (bodyNeeded > 0 || bodyNeeded == -1) {
+			if state.OnExpectContinue != nil && !state.OnExpectContinue(state.req.Method, state.req.Path, nil) {
+				write(expectation417Response)
+				state.req.ExpectContinue = false
+				state.buffer.Next(consumed)
+				continue
+			}
 			write(continue100Response)
 			state.req.ExpectContinue = false
 		}
@@ -163,9 +188,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					break
 				}
 				chunks.Write(chunk)
-				if chunks.Len() > maxRequestBodySize {
+				if limit := state.maxBodySize(); limit > 0 && int64(chunks.Len()) > limit {
 					writeErrorResponse(write, 413, "Request body too large")
-					return fmt.Errorf("chunked body exceeds %d byte limit", maxRequestBodySize)
+					return fmt.Errorf("chunked body exceeds %d byte limit", limit)
 				}
 			}
 			bodyData = chunks.Bytes()
@@ -232,6 +257,7 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 		stream.ResetH1Stream(s)
 	}
 	s.RemoteAddr = state.RemoteAddr
+	s.OnDetach = state.OnDetach
 	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4

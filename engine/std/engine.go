@@ -129,11 +129,17 @@ func (e *Engine) Addr() net.Addr {
 
 var _ engine.Engine = (*Engine)(nil)
 
-func (e *Engine) connStateHook(_ net.Conn, state http.ConnState) {
+func (e *Engine) connStateHook(conn net.Conn, state http.ConnState) {
 	switch state {
 	case http.StateNew:
 		e.metrics.activeConns.Add(1)
+		if e.cfg.OnConnect != nil {
+			e.cfg.OnConnect(conn.RemoteAddr().String())
+		}
 	case http.StateClosed, http.StateHijacked:
 		e.metrics.activeConns.Add(-1)
+		if e.cfg.OnDisconnect != nil {
+			e.cfg.OnDisconnect(conn.RemoteAddr().String())
+		}
 	}
 }

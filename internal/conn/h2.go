@@ -51,6 +51,7 @@ type H2Config struct {
 	MaxConcurrentStreams uint32
 	InitialWindowSize    uint32
 	MaxFrameSize         uint32
+	MaxRequestBodySize   int64 // 0 = use default (100 MB)
 }
 
 // withDefaults returns a copy of cfg with zero fields set to RFC 7540 defaults.
@@ -391,6 +392,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 
 	proc := stream.NewProcessor(handler, fw, rw)
 	proc.InlineWriter = inlineRW
+	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
 
 	p := frame.NewParser()
 	p.InitReader(&inBuf)

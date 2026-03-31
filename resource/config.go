@@ -47,6 +47,13 @@ type Config struct {
 	DisableKeepAlive bool
 	// Listener is an optional pre-existing listener for socket inheritance.
 	Listener net.Listener
+	// MaxRequestBodySize is the maximum allowed request body size in bytes.
+	// 0 uses the default (100 MB). -1 disables the limit (unlimited).
+	MaxRequestBodySize int64
+	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
+	// If the callback returns false, the server responds with 417 Expectation Failed
+	// and skips reading the request body. If nil, the server always sends 100 Continue.
+	OnExpectContinue func(method, path string, headers [][2]string) bool
 	// OnConnect is called when a new connection is accepted.
 	OnConnect func(addr string)
 	// OnDisconnect is called when a connection is closed.
@@ -139,6 +146,12 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.MaxHeaderBytes == 0 {
 		c.MaxHeaderBytes = 16 << 20
+	}
+	switch {
+	case c.MaxRequestBodySize == 0:
+		c.MaxRequestBodySize = 100 << 20 // 100 MB
+	case c.MaxRequestBodySize < 0:
+		c.MaxRequestBodySize = 0 // 0 internally means unlimited
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()

@@ -41,6 +41,7 @@ type connState struct {
 	ctx        context.Context
 	remoteAddr string
 	writeFn    func([]byte) // cached write function
+	detachMu   *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 }
 
 var connStatePool = sync.Pool{
@@ -79,6 +80,7 @@ func releaseConnState(cs *connState) {
 	cs.pendingBytes = 0
 	cs.writePos = 0
 	cs.lastActivity = 0
+	cs.detachMu = nil
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

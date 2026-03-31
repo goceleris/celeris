@@ -98,6 +98,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
 			MaxFrameSize:         cfg.MaxFrameSize,
+			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		},
 	}
 }
@@ -254,16 +255,28 @@ func (l *Loop) run(ctx context.Context) {
 
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
 			err := flushWrites(cs)
 			if err != nil {
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
 			} else if cs.writePos >= len(cs.writeBuf) {
 				cs.pendingBytes = 0
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 				l.removeDirty(cs)
 			} else {
 				// Sync pendingBytes with actual buffer state after partial write.
 				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 			}
 			cs = next
 		}
@@ -448,8 +461,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// connections). This sends the response one event-batch earlier than
 		// the dirty list pass, reducing per-request latency by up to N×2µs
 		// (where N is the number of other events in the same epoll_wait batch).
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
 		if cs.writePos < len(cs.writeBuf) {
 			if fErr := flushWrites(cs); fErr != nil {
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
 				if cs.dirty {
 					l.removeDirty(cs)
 				}
@@ -467,6 +486,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
 				l.markDirty(cs)
 			}
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
 		}
 
 		if cs.pendingBytes > maxPendingBytes {
@@ -505,6 +527,19 @@ func (l *Loop) initProtocol(cs *connState) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
 		cs.h1State.RemoteAddr = cs.remoteAddr
+		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
+		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
+		cs.h1State.OnDetach = func() {
+			mu := &sync.Mutex{}
+			cs.detachMu = mu
+			orig := cs.writeFn
+			cs.writeFn = func(data []byte) {
+				mu.Lock()
+				orig(data)
+				l.markDirty(cs)
+				mu.Unlock()
+			}
+		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
 			return l.hijackConn(cs.fd)
 		}

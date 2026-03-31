@@ -1222,3 +1222,154 @@ func TestContextHTML(t *testing.T) {
 		t.Fatalf("expected text/html; charset=utf-8, got %s", ct)
 	}
 }
+
+func TestContextContentLength(t *testing.T) {
+	s, _ := newTestStream("POST", "/body")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	// No content-length header
+	if cl := c.ContentLength(); cl != -1 {
+		t.Fatalf("expected -1 for missing content-length, got %d", cl)
+	}
+
+	// Valid content-length
+	s.Headers = append(s.Headers, [2]string{"content-length", "42"})
+	if cl := c.ContentLength(); cl != 42 {
+		t.Fatalf("expected 42, got %d", cl)
+	}
+}
+
+func TestContextContentLengthInvalid(t *testing.T) {
+	s, _ := newTestStream("POST", "/body")
+	s.Headers = append(s.Headers, [2]string{"content-length", "notanumber"})
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if cl := c.ContentLength(); cl != -1 {
+		t.Fatalf("expected -1 for invalid content-length, got %d", cl)
+	}
+}
+
+func TestContextContentLengthNegative(t *testing.T) {
+	s, _ := newTestStream("POST", "/body")
+	s.Headers = append(s.Headers, [2]string{"content-length", "-1"})
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if cl := c.ContentLength(); cl != -1 {
+		t.Fatalf("expected -1 for negative content-length, got %d", cl)
+	}
+}
+
+func TestContextSetRawQuery(t *testing.T) {
+	s, _ := newTestStream("GET", "/test?foo=bar")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if c.RawQuery() != "foo=bar" {
+		t.Fatalf("expected foo=bar, got %s", c.RawQuery())
+	}
+
+	// Cache query params
+	if v := c.Query("foo"); v != "bar" {
+		t.Fatalf("expected bar, got %s", v)
+	}
+
+	// Override query string — should invalidate cache
+	c.SetRawQuery("baz=qux")
+	if c.RawQuery() != "baz=qux" {
+		t.Fatalf("expected baz=qux, got %s", c.RawQuery())
+	}
+	if v := c.Query("foo"); v != "" {
+		t.Fatalf("expected empty after override, got %s", v)
+	}
+	if v := c.Query("baz"); v != "qux" {
+		t.Fatalf("expected qux, got %s", v)
+	}
+}
+
+func TestContextSetClientIP(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	s.Headers = append(s.Headers, [2]string{"x-forwarded-for", "1.2.3.4"})
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if ip := c.ClientIP(); ip != "1.2.3.4" {
+		t.Fatalf("expected 1.2.3.4, got %s", ip)
+	}
+
+	c.SetClientIP("10.0.0.1")
+	if ip := c.ClientIP(); ip != "10.0.0.1" {
+		t.Fatalf("expected override 10.0.0.1, got %s", ip)
+	}
+}
+
+func TestContextSetScheme(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if scheme := c.Scheme(); scheme != "http" {
+		t.Fatalf("expected http, got %s", scheme)
+	}
+
+	c.SetScheme("https")
+	if scheme := c.Scheme(); scheme != "https" {
+		t.Fatalf("expected override https, got %s", scheme)
+	}
+}
+
+func TestContextSetHost(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if host := c.Host(); host != "localhost" {
+		t.Fatalf("expected localhost, got %s", host)
+	}
+
+	c.SetHost("example.com")
+	if host := c.Host(); host != "example.com" {
+		t.Fatalf("expected override example.com, got %s", host)
+	}
+}
+
+func TestContextOverridesResetOnReuse(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	c.SetClientIP("10.0.0.1")
+	c.SetScheme("https")
+	c.SetHost("example.com")
+	releaseContext(c)
+
+	// Reacquire and verify overrides are cleared
+	c2 := acquireContext(s)
+	defer releaseContext(c2)
+
+	if c2.clientIPOverride != "" {
+		t.Fatal("expected clientIPOverride to be cleared")
+	}
+	if c2.schemeOverride != "" {
+		t.Fatal("expected schemeOverride to be cleared")
+	}
+	if c2.hostOverride != "" {
+		t.Fatal("expected hostOverride to be cleared")
+	}
+}
