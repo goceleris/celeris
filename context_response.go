@@ -535,10 +535,12 @@ func (c *Context) Detach() (done func()) {
 	}
 	// Materialize any unsafe string headers (zero-copy H1 headers backed by
 	// the connection's read buffer) before the handler returns and the buffer
-	// is reused for the next recv. Pseudo-headers (:method, :path, etc.) are
-	// literal strings and don't need copying.
+	// is reused for the next recv. Pseudo-header keys are string literals
+	// (safe), but their values (:authority, :path for non-"/" paths, :method
+	// for non-standard methods) may be UnsafeString backed by the buffer.
 	for i, h := range c.stream.Headers {
 		if len(h[0]) > 0 && h[0][0] == ':' {
+			c.stream.Headers[i][1] = strings.Clone(h[1])
 			continue
 		}
 		c.stream.Headers[i][0] = strings.Clone(h[0])

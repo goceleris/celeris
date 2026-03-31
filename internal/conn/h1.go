@@ -40,6 +40,7 @@ type H1State struct {
 	MaxRequestBodySize int64                                               // 0 = use default (100 MB)
 	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
 	OnDetach           func()                                              // set by engine; called on Context.Detach
+	Detached           bool                                                // set by OnDetach; breaks pipelining loop
 }
 
 func (s *H1State) maxBodySize() int64 {
@@ -119,6 +120,14 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 
 			if err := handleH1Request(ctx, state, nil, handler, write); err != nil {
 				return err
+			}
+			if state.Detached {
+				// Handler called Detach — a goroutine now writes through
+				// the mutex-guarded writeFn. We must NOT continue parsing
+				// pipelined requests with the stale `write` parameter
+				// (captured before Detach replaced cs.writeFn), as that
+				// would race with the goroutine on writeBuf.
+				return nil
 			}
 			if !state.req.KeepAlive {
 				return errConnectionClose
@@ -209,6 +218,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
+		}
+		if state.Detached {
+			return nil // see fast-path comment above
 		}
 		if !state.req.KeepAlive {
 			return errConnectionClose

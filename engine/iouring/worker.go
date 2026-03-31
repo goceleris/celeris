@@ -642,6 +642,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
 		cs.h1State.OnDetach = func() {
+			cs.h1State.Detached = true
 			mu := &sync.Mutex{}
 			cs.detachMu = mu
 			orig := cs.writeFn
