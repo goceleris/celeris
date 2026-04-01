@@ -57,7 +57,7 @@ func ToHandler(h HandlerFunc) http.Handler {
 				return
 			}
 			if len(body) > 0 {
-				_, _ = s.Data.Write(body)
+				_, _ = s.GetBuf().Write(body)
 			}
 		}
 

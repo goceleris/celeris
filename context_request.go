@@ -352,7 +352,8 @@ func (c *Context) BasicAuth() (username, password string, ok bool) {
 	if i < 0 {
 		return
 	}
-	return string(buf[:i]), string(buf[i+1 : n]), true
+	decoded := string(buf[:n])
+	return decoded[:i], decoded[i+1:], true
 }
 
 // FormValue returns the first value for the named form field.

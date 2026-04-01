@@ -25,9 +25,18 @@ func init() {
 	}
 	ctxkit.SetHandlers = func(c any, handlers []any) {
 		ctx := c.(*Context)
-		chain := make([]HandlerFunc, len(handlers))
-		for i, h := range handlers {
-			chain[i] = h.(HandlerFunc)
+		n := len(handlers)
+		var chain []HandlerFunc
+		if n <= len(ctx.handlerBuf) {
+			for i, h := range handlers {
+				ctx.handlerBuf[i] = h.(HandlerFunc)
+			}
+			chain = ctx.handlerBuf[:n]
+		} else {
+			chain = make([]HandlerFunc, n)
+			for i, h := range handlers {
+				chain[i] = h.(HandlerFunc)
+			}
 		}
 		ctx.handlers = chain
 		ctx.index = -1
@@ -39,15 +48,23 @@ func init() {
 		}
 		return nil
 	}
+	ctxkit.GetStream = func(c any) any {
+		ctx := c.(*Context)
+		if ctx.stream != nil {
+			return ctx.stream
+		}
+		return nil
+	}
 }
 
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
 // A Context is obtained from the pool and must not be retained after the handler returns.
 type Context struct {
 	stream   *stream.Stream
-	index    int16
-	handlers []HandlerFunc
-	params   Params
+	index      int16
+	handlers   []HandlerFunc
+	handlerBuf [8]HandlerFunc
+	params     Params
 	keys     map[string]any
 	ctx      context.Context
 
@@ -249,6 +266,16 @@ func (c *Context) Keys() map[string]any {
 func (c *Context) reset() {
 	c.stream = nil
 	c.index = -1
+	// Clear handler references so closures can be GCed, but only when
+	// the slice is owned by this context (backed by handlerBuf or a
+	// SetHandlers allocation). The production path assigns the router's
+	// pre-composed chain directly; nilling those would corrupt shared state.
+	if len(c.handlers) > 0 && cap(c.handlers) <= len(c.handlerBuf) &&
+		&c.handlers[:cap(c.handlers)][0] == &c.handlerBuf[0] {
+		for i := range c.handlers {
+			c.handlers[i] = nil
+		}
+	}
 	if cap(c.handlers) > 64 {
 		c.handlers = nil
 	} else {

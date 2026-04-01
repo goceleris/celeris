@@ -12,4 +12,5 @@ var (
 	AddParam           func(c any, key, value string)
 	SetHandlers        func(c any, handlers []any)
 	GetResponseWriter  func(c any) any
+	GetStream          func(c any) any
 )

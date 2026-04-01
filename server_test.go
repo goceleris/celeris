@@ -65,7 +65,7 @@ func TestServerRouting(t *testing.T) {
 
 	// Test POST /echo.
 	st2, rw2 := newTestStream("POST", "/echo")
-	st2.Data.Write([]byte("payload"))
+	st2.GetBuf().Write([]byte("payload"))
 	if err := adapter.HandleStream(context.Background(), st2); err != nil {
 		t.Fatal(err)
 	}

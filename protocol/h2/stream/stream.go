@@ -104,7 +104,6 @@ func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
 	s.state.Store(int32(StateIdle))
-	s.Data = getBuf()
 	s.windowSize.Store(65535)
 	s.phase = PhaseInit
 	s.Headers = s.hdrBuf[:0]
@@ -158,12 +157,30 @@ func (s *Stream) IsCancelled() bool {
 	return s.flags.Load()&flagCancelled != 0
 }
 
+// HasDoneCh reports whether a Done channel was created, indicating
+// a derived context (e.g. context.WithTimeout) is watching this stream.
+func (s *Stream) HasDoneCh() bool {
+	return s.doneCh.Load() != nil
+}
+
 // Release returns pooled buffers, cancels the context, and returns the stream
 // to its pool. Safe to call multiple times; subsequent calls are no-ops.
 func (s *Stream) Release() {
 	if !s.h1Mode {
 		s.Cancel()
 	}
+	s.resetAndPool()
+}
+
+// ResetForPool returns pooled buffers and returns the stream to its pool
+// WITHOUT cancelling the context. Use this in test harnesses where derived
+// contexts (e.g. from context.WithTimeout) may have propagation goroutines
+// that race with cancellation flag clearing.
+func ResetForPool(s *Stream) {
+	s.resetAndPool()
+}
+
+func (s *Stream) resetAndPool() {
 	if s.Data != nil {
 		s.Data.Reset()
 		bufferPool.Put(s.Data)

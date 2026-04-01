@@ -15,7 +15,7 @@ import (
 
 func TestContextBind(t *testing.T) {
 	s, _ := newTestStream("POST", "/bind")
-	s.Data.Write([]byte(`{"name":"test"}`))
+	s.GetBuf().Write([]byte(`{"name":"test"}`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -221,7 +221,7 @@ func TestContextQueryInt(t *testing.T) {
 
 func TestBindJSON(t *testing.T) {
 	s, _ := newTestStream("POST", "/bind-json")
-	s.Data.Write([]byte(`{"name":"test"}`))
+	s.GetBuf().Write([]byte(`{"name":"test"}`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -238,7 +238,7 @@ func TestBindJSON(t *testing.T) {
 
 func TestBindXML(t *testing.T) {
 	s, _ := newTestStream("POST", "/bind-xml")
-	s.Data.Write([]byte(`<Item><Name>test</Name></Item>`))
+	s.GetBuf().Write([]byte(`<Item><Name>test</Name></Item>`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -259,7 +259,7 @@ func TestBindXML(t *testing.T) {
 func TestBindContentTypeDetection(t *testing.T) {
 	// JSON (default, no Content-Type).
 	s, _ := newTestStream("POST", "/bind-auto")
-	s.Data.Write([]byte(`{"name":"json"}`))
+	s.GetBuf().Write([]byte(`{"name":"json"}`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -276,7 +276,7 @@ func TestBindContentTypeDetection(t *testing.T) {
 	// XML with Content-Type header.
 	s2, _ := newTestStream("POST", "/bind-auto-xml")
 	s2.Headers = append(s2.Headers, [2]string{"content-type", "application/xml"})
-	s2.Data.Write([]byte(`<Item><Name>xml</Name></Item>`))
+	s2.GetBuf().Write([]byte(`<Item><Name>xml</Name></Item>`))
 	defer s2.Release()
 
 	c2 := acquireContext(s2)
@@ -440,7 +440,7 @@ func TestContextBasicAuthPasswordWithColons(t *testing.T) {
 func TestContextFormValueURLEncoded(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("name=alice&age=30"))
+	s.GetBuf().Write([]byte("name=alice&age=30"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -460,7 +460,7 @@ func TestContextFormValueURLEncoded(t *testing.T) {
 func TestContextFormValuesMultiple(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("color=red&color=blue&color=green"))
+	s.GetBuf().Write([]byte("color=red&color=blue&color=green"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -484,7 +484,7 @@ func TestContextMultipartFormValue(t *testing.T) {
 
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
-	s.Data.Write(buf.Bytes())
+	s.GetBuf().Write(buf.Bytes())
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -513,7 +513,7 @@ func TestContextFormFile(t *testing.T) {
 
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
-	s.Data.Write(buf.Bytes())
+	s.GetBuf().Write(buf.Bytes())
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -538,7 +538,7 @@ func TestContextFormFile(t *testing.T) {
 func TestContextFormFileNonMultipart(t *testing.T) {
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -565,7 +565,7 @@ func TestContextFormEmptyBody(t *testing.T) {
 func TestContextFormCaching(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("a=1&b=2"))
+	s.GetBuf().Write([]byte("a=1&b=2"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -584,7 +584,7 @@ func TestContextFormCaching(t *testing.T) {
 func TestContextFormResetClearsForm(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -607,7 +607,7 @@ func TestContextMaxFormSizeUnlimited(t *testing.T) {
 
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
-	s.Data.Write(buf.Bytes())
+	s.GetBuf().Write(buf.Bytes())
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -624,7 +624,7 @@ func TestContextMaxFormSizeUnlimited(t *testing.T) {
 
 func TestContextBodyCopy(t *testing.T) {
 	s, _ := newTestStream("POST", "/data")
-	s.Data.Write([]byte("original"))
+	s.GetBuf().Write([]byte("original"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -655,7 +655,7 @@ func TestContextBodyCopyEmpty(t *testing.T) {
 
 func TestContextBodyReader(t *testing.T) {
 	s, _ := newTestStream("POST", "/data")
-	s.Data.Write([]byte("read me"))
+	s.GetBuf().Write([]byte("read me"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -1070,7 +1070,7 @@ func TestAcceptsLanguagesNoMatch(t *testing.T) {
 func TestFormFileNotMultipart(t *testing.T) {
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -1092,7 +1092,7 @@ func TestFormFileNotMultipart(t *testing.T) {
 func TestMultipartFormNotMultipart(t *testing.T) {
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -1170,7 +1170,7 @@ func TestContextFormValueOk(t *testing.T) {
 	body := "name=alice&empty="
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte(body))
+	s.GetBuf().Write([]byte(body))
 	defer s.Release()
 
 	c := acquireContext(s)
