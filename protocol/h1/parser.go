@@ -7,14 +7,14 @@ import (
 
 // H1 parser sentinel errors.
 var (
-	ErrBufferExhausted      = errors.New("buffer exhausted")
-	ErrInvalidRequestLine   = errors.New("invalid request line")
-	ErrInvalidHeader        = errors.New("invalid header line")
-	ErrMissingHost          = errors.New("missing Host header")
-	ErrUnsupportedVersion   = errors.New("unsupported HTTP version")
-	ErrHeadersTooLarge      = errors.New("headers too large")
-	ErrInvalidContentLength    = errors.New("invalid content-length")
-	ErrDuplicateContentLength  = errors.New("duplicate content-length with conflicting values")
+	ErrBufferExhausted        = errors.New("buffer exhausted")
+	ErrInvalidRequestLine     = errors.New("invalid request line")
+	ErrInvalidHeader          = errors.New("invalid header line")
+	ErrMissingHost            = errors.New("missing Host header")
+	ErrUnsupportedVersion     = errors.New("unsupported HTTP version")
+	ErrHeadersTooLarge        = errors.New("headers too large")
+	ErrInvalidContentLength   = errors.New("invalid content-length")
+	ErrDuplicateContentLength = errors.New("duplicate content-length with conflicting values")
 )
 
 // Parser is a zero-allocation HTTP/1.x request parser.
