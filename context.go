@@ -32,6 +32,13 @@ func init() {
 		ctx.handlers = chain
 		ctx.index = -1
 	}
+	ctxkit.GetResponseWriter = func(c any) any {
+		ctx := c.(*Context)
+		if ctx.stream != nil {
+			return ctx.stream.ResponseWriter
+		}
+		return nil
+	}
 }
 
 // Context is the request context passed to handlers. It is pooled via sync.Pool.

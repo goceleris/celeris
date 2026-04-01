@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/goceleris/celeris"
@@ -48,18 +49,32 @@ func (r *ResponseRecorder) BodyString() string {
 	return string(r.Body)
 }
 
+// recorderCombo bundles a ResponseRecorder and its recorderWriter in a
+// single allocation so they can be pooled together.
+type recorderCombo struct {
+	rec ResponseRecorder
+	rw  recorderWriter
+}
+
+var recorderPool = sync.Pool{New: func() any {
+	combo := &recorderCombo{}
+	combo.rw.rec = &combo.rec
+	combo.rw.combo = combo
+	return combo
+}}
+
 // recorderWriter adapts a ResponseRecorder to the internal
 // stream.ResponseWriter interface without leaking internal types
 // in the public API.
 type recorderWriter struct {
-	rec *ResponseRecorder
+	rec   *ResponseRecorder
+	combo *recorderCombo
 }
 
 func (w *recorderWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	w.rec.StatusCode = status
 	w.rec.Headers = headers
-	w.rec.Body = make([]byte, len(body))
-	copy(w.rec.Body, body)
+	w.rec.Body = append(w.rec.Body[:0], body...)
 	return nil
 }
 
@@ -144,6 +159,18 @@ func WithHandlers(handlers ...celeris.HandlerFunc) Option {
 // ReleaseContext returns a [celeris.Context] to the pool. The context must not
 // be used after this call.
 func ReleaseContext(ctx *celeris.Context) {
+	// Extract recorder combo before releasing the context (which nils the stream).
+	if rw := ctxkit.GetResponseWriter(ctx); rw != nil {
+		if w, ok := rw.(*recorderWriter); ok && w.combo != nil {
+			combo := w.combo
+			ctxkit.ReleaseContext(ctx)
+			combo.rec.StatusCode = 0
+			combo.rec.Headers = nil
+			combo.rec.Body = combo.rec.Body[:0]
+			recorderPool.Put(combo)
+			return
+		}
+	}
 	ctxkit.ReleaseContext(ctx)
 }
 
@@ -193,8 +220,12 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		s.Data.Write(cfg.body)
 	}
 
-	rec := &ResponseRecorder{}
-	s.ResponseWriter = &recorderWriter{rec: rec}
+	combo := recorderPool.Get().(*recorderCombo)
+	combo.rec.StatusCode = 0
+	combo.rec.Headers = nil
+	combo.rec.Body = combo.rec.Body[:0]
+	rec := &combo.rec
+	s.ResponseWriter = &combo.rw
 
 	if cfg.remoteAddr != "" {
 		s.RemoteAddr = cfg.remoteAddr
