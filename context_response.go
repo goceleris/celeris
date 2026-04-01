@@ -128,12 +128,13 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 	nUser := len(c.respHeaders)
 	total := nUser + 2
 	var headers [][2]string
-	if total <= 8 {
+	if total <= len(c.respHdrBuf) {
 		// respHeaders shares backing array with respHdrBuf — copy user
 		// headers to a stack temporary before overwriting the buffer.
+		// Max user headers in fast path: len(respHdrBuf) - 2 = 6.
 		var tmp [6][2]string
 		copy(tmp[:nUser], c.respHeaders)
-		headers = c.respHdrBuf[:0:8]
+		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
 		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, tmp[:nUser]...)
@@ -186,7 +187,14 @@ func (c *Context) SetHeader(key, value string) {
 			break
 		}
 	}
-	v := stripCRLF(value)
+	v := value
+	for i := range len(value) {
+		b := value[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			v = stripCRLF(value)
+			break
+		}
+	}
 	for i, h := range c.respHeaders {
 		if h[0] == k {
 			c.respHeaders[i][1] = v
@@ -200,10 +208,23 @@ func (c *Context) SetHeader(key, value string) {
 // replace existing values — use this for headers that allow multiple values
 // (e.g. set-cookie).
 func (c *Context) AddHeader(key, value string) {
-	c.respHeaders = append(c.respHeaders, [2]string{
-		sanitizeHeaderKey(key),
-		stripCRLF(value),
-	})
+	k := key
+	for i := range len(key) {
+		b := key[i]
+		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' || b == 0 {
+			k = sanitizeHeaderKey(key)
+			break
+		}
+	}
+	v := value
+	for i := range len(value) {
+		b := value[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			v = stripCRLF(value)
+			break
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{k, v})
 }
 
 // sanitizeHeaderKey lowercases and strips CRLF/null bytes. Fast path avoids
@@ -218,11 +239,13 @@ func sanitizeHeaderKey(s string) string {
 	return s
 }
 
+var crlfReplacer = strings.NewReplacer("\r", "", "\n", "", "\x00", "")
+
 // stripCRLF removes \r, \n, and \x00 to prevent HTTP response splitting
 // (CWE-113) and null-byte header smuggling.
 func stripCRLF(s string) string {
 	if strings.ContainsAny(s, "\r\n\x00") {
-		return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
+		return crlfReplacer.Replace(s)
 	}
 	return s
 }
@@ -256,11 +279,13 @@ func (c *Context) Redirect(code int, url string) error {
 	return c.NoContent(code)
 }
 
+var cookieUnsafeReplacer = strings.NewReplacer(";", "", "\r", "", "\n", "")
+
 // stripCookieUnsafe strips characters that could inject cookie attributes
 // (semicolons) or cause header injection (CRLF) from cookie field values.
 func stripCookieUnsafe(s string) string {
 	if strings.ContainsAny(s, ";\r\n") {
-		return strings.NewReplacer(";", "", "\r", "", "\n", "").Replace(s)
+		return cookieUnsafeReplacer.Replace(s)
 	}
 	return s
 }
@@ -272,6 +297,7 @@ func stripCookieUnsafe(s string) string {
 // cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
 	var b strings.Builder
+	b.Grow(128)
 	b.WriteString(stripCookieUnsafe(cookie.Name))
 	b.WriteByte('=')
 	b.WriteString(stripCookieUnsafe(cookie.Value))
@@ -368,15 +394,34 @@ func (c *Context) File(filePath string) error {
 
 // FileFromDir safely serves a file from within baseDir. The userPath is
 // cleaned and joined with baseDir; if the result escapes baseDir, a 400
-// error is returned. This prevents directory traversal when serving
-// user-supplied paths.
+// error is returned. Symlinks are resolved and rechecked to prevent a
+// symlink under baseDir from escaping the directory boundary.
 func (c *Context) FileFromDir(baseDir, userPath string) error {
 	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
 	base := filepath.Clean(baseDir)
 	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
 		return NewHTTPError(400, "invalid file path")
 	}
-	return c.File(abs)
+	// Resolve symlinks and recheck prefix to prevent symlink escape.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return err
+	}
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return err
+	}
+	if resolved != resolvedBase && !strings.HasPrefix(resolved, resolvedBase+string(filepath.Separator)) {
+		return NewHTTPError(400, "invalid file path")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return NewHTTPError(400, "invalid file path")
+	}
+	return c.File(resolved)
 }
 
 func parseRange(header string, size int64) (start, end int64, ok bool) {

@@ -194,7 +194,10 @@ func (s *Stream) resetAndPool() {
 	s.ID = 0
 	s.state.Store(0)
 	s.manager = nil
+	clear(s.hdrBuf[:])
 	s.Headers = s.hdrBuf[:0]
+	s.Trailers = s.Trailers[:cap(s.Trailers)]
+	clear(s.Trailers)
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.headersSent.Store(false)

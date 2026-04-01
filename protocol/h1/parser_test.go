@@ -530,6 +530,81 @@ func TestFindHeaderEnd_MultipleCR(t *testing.T) {
 	}
 }
 
+func TestParseRequest_DuplicateContentLength_Conflicting(t *testing.T) {
+	for _, zeroCopy := range []bool{false, true} {
+		name := "standard"
+		if zeroCopy {
+			name = "zerocopy"
+		}
+		t.Run(name, func(t *testing.T) {
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n"
+			p := NewParser()
+			if zeroCopy {
+				p.noStringHeaders = true
+			}
+			p.Reset([]byte(raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if !errors.Is(err, ErrDuplicateContentLength) {
+				t.Fatalf("got error %v, want %v", err, ErrDuplicateContentLength)
+			}
+		})
+	}
+}
+
+func TestParseRequest_DuplicateContentLength_Identical(t *testing.T) {
+	for _, zeroCopy := range []bool{false, true} {
+		name := "standard"
+		if zeroCopy {
+			name = "zerocopy"
+		}
+		t.Run(name, func(t *testing.T) {
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n"
+			p := NewParser()
+			if zeroCopy {
+				p.noStringHeaders = true
+			}
+			p.Reset([]byte(raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if err != nil {
+				t.Fatalf("identical CL should be accepted, got: %v", err)
+			}
+			if req.ContentLength != 42 {
+				t.Fatalf("content-length = %d, want 42", req.ContentLength)
+			}
+		})
+	}
+}
+
+func TestParseRequest_DuplicateContentLength_ChunkedIgnored(t *testing.T) {
+	for _, zeroCopy := range []bool{false, true} {
+		name := "standard"
+		if zeroCopy {
+			name = "zerocopy"
+		}
+		t.Run(name, func(t *testing.T) {
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n"
+			p := NewParser()
+			if zeroCopy {
+				p.noStringHeaders = true
+			}
+			p.Reset([]byte(raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if err != nil {
+				t.Fatalf("conflicting CL with chunked TE should be ignored, got: %v", err)
+			}
+			if !req.ChunkedEncoding {
+				t.Fatal("chunked encoding not detected")
+			}
+			if req.ContentLength != -1 {
+				t.Fatalf("content-length = %d, want -1 for chunked", req.ContentLength)
+			}
+		})
+	}
+}
+
 // TestFindHeaderEnd_PartialSequence ensures partial \r\n sequences
 // (without the full \r\n\r\n) are not mistakenly matched.
 func TestFindHeaderEnd_PartialSequence(t *testing.T) {

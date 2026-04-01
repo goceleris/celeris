@@ -65,6 +65,7 @@ type Context struct {
 	handlers   []HandlerFunc
 	handlerBuf [8]HandlerFunc
 	params     Params
+	paramBuf   [4]Param
 	keys     map[string]any
 	ctx      context.Context
 
@@ -112,6 +113,7 @@ type Context struct {
 
 var contextPool = sync.Pool{New: func() any {
 	c := &Context{keys: make(map[string]any, 4)}
+	c.params = c.paramBuf[:0]
 	c.respHeaders = c.respHdrBuf[:0]
 	return c
 }}
@@ -281,13 +283,15 @@ func (c *Context) reset() {
 	} else {
 		c.handlers = c.handlers[:0]
 	}
-	c.params = c.params[:0]
+	clear(c.paramBuf[:])
+	c.params = c.paramBuf[:0]
 	c.ctx = nil
 	c.method = ""
 	c.path = ""
 	c.rawQuery = ""
 	c.fullPath = ""
 	c.statusCode = 200
+	clear(c.respHdrBuf[:])
 	c.respHeaders = c.respHdrBuf[:0]
 	c.written = false
 	c.aborted = false

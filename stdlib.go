@@ -11,7 +11,7 @@ import (
 	"golang.org/x/net/http2"
 )
 
-const maxToHandlerBodySize = 100 << 20 // 100 MB
+const maxToHandlerBodySize = maxBodySize
 
 // ToHandler wraps a celeris HandlerFunc as an http.Handler for use with
 // net/http routers, middleware, or test infrastructure. The returned handler

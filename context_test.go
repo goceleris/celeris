@@ -19,7 +19,8 @@ type mockResponseWriter struct {
 
 func (m *mockResponseWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	m.status = status
-	m.headers = headers
+	m.headers = make([][2]string, len(headers))
+	copy(m.headers, headers)
 	m.body = make([]byte, len(body))
 	copy(m.body, body)
 	return nil

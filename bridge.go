@@ -89,7 +89,7 @@ func buildHTTPRequest(c *Context) (*http.Request, error) {
 	return req, nil
 }
 
-const maxBridgeResponseBytes = 100 << 20 // 100 MB
+const maxBridgeResponseBytes = maxBodySize
 
 var errBridgeResponseTooLarge = errors.New("bridge: response body exceeds 100MB limit")
 

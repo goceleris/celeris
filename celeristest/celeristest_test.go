@@ -205,3 +205,111 @@ func TestWithRemoteAddr(t *testing.T) {
 		t.Fatalf("expected 192.168.1.1:54321, got %s", ctx.RemoteAddr())
 	}
 }
+
+func TestWithHandlers(t *testing.T) {
+	var order []string
+	mw := func(c *celeris.Context) error {
+		order = append(order, "mw")
+		return c.Next()
+	}
+	handler := func(c *celeris.Context) error {
+		order = append(order, "handler")
+		return c.String(200, "ok")
+	}
+	ctx, rec := NewContext("GET", "/test", WithHandlers(mw, handler))
+	defer ReleaseContext(ctx)
+
+	err := ctx.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", rec.StatusCode)
+	}
+	if rec.BodyString() != "ok" {
+		t.Fatalf("expected body 'ok', got %q", rec.BodyString())
+	}
+	if len(order) != 2 || order[0] != "mw" || order[1] != "handler" {
+		t.Fatalf("unexpected execution order: %v", order)
+	}
+}
+
+func TestWithHandlersErrorPropagation(t *testing.T) {
+	mw := func(c *celeris.Context) error {
+		return c.Next()
+	}
+	handler := func(c *celeris.Context) error {
+		return celeris.NewHTTPError(403, "forbidden")
+	}
+	ctx, _ := NewContext("GET", "/test", WithHandlers(mw, handler))
+	defer ReleaseContext(ctx)
+
+	err := ctx.Next()
+	if err == nil {
+		t.Fatal("expected error from handler chain")
+	}
+	he, ok := err.(*celeris.HTTPError)
+	if !ok {
+		t.Fatalf("expected *HTTPError, got %T", err)
+	}
+	if he.Code != 403 {
+		t.Fatalf("expected 403, got %d", he.Code)
+	}
+}
+
+func TestWithHandlersManyHandlers(t *testing.T) {
+	var order []string
+	makeMW := func(name string) celeris.HandlerFunc {
+		return func(c *celeris.Context) error {
+			order = append(order, name)
+			return c.Next()
+		}
+	}
+	handler := func(c *celeris.Context) error {
+		order = append(order, "handler")
+		return c.String(200, "ok")
+	}
+	// 5 middleware + 1 handler = 6 total, exceeds the 4-element handlersBuf.
+	ctx, rec := NewContext("GET", "/test", WithHandlers(
+		makeMW("mw1"), makeMW("mw2"), makeMW("mw3"), makeMW("mw4"), makeMW("mw5"), handler,
+	))
+	defer ReleaseContext(ctx)
+
+	err := ctx.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", rec.StatusCode)
+	}
+	expected := []string{"mw1", "mw2", "mw3", "mw4", "mw5", "handler"}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d entries, got %d: %v", len(expected), len(order), order)
+	}
+	for i, e := range expected {
+		if order[i] != e {
+			t.Fatalf("order[%d] = %q, want %q", i, order[i], e)
+		}
+	}
+}
+
+func TestWithHandlersAbort(t *testing.T) {
+	var reached bool
+	mw := func(c *celeris.Context) error {
+		return c.AbortWithStatus(401)
+	}
+	handler := func(c *celeris.Context) error {
+		reached = true
+		return c.String(200, "ok")
+	}
+	ctx, rec := NewContext("GET", "/test", WithHandlers(mw, handler))
+	defer ReleaseContext(ctx)
+
+	_ = ctx.Next()
+	if reached {
+		t.Fatal("handler should not have been reached after abort")
+	}
+	if rec.StatusCode != 401 {
+		t.Fatalf("expected 401, got %d", rec.StatusCode)
+	}
+}

@@ -12,7 +12,9 @@ import (
 )
 
 type routerAdapter struct {
-	server *Server
+	server                 *Server
+	notFoundChain          []HandlerFunc
+	methodNotAllowedChain  []HandlerFunc
 }
 
 func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
@@ -111,9 +113,13 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 	if len(allowed) > 0 {
 		c.statusCode = 405
 		allowVal := strings.Join(allowed, ", ")
-		if a.server.methodNotAllowedHandler != nil {
+		chain := a.methodNotAllowedChain
+		if chain == nil && a.server.methodNotAllowedHandler != nil {
+			chain = []HandlerFunc{a.server.methodNotAllowedHandler}
+		}
+		if chain != nil {
 			c.SetHeader("allow", allowVal)
-			c.handlers = []HandlerFunc{a.server.methodNotAllowedHandler}
+			c.handlers = chain
 			a.handleError(c, s, c.Next())
 		}
 		if !c.written && s.ResponseWriter != nil {
@@ -125,8 +131,12 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 		}
 	} else {
 		c.statusCode = 404
-		if a.server.notFoundHandler != nil {
-			c.handlers = []HandlerFunc{a.server.notFoundHandler}
+		chain := a.notFoundChain
+		if chain == nil && a.server.notFoundHandler != nil {
+			chain = []HandlerFunc{a.server.notFoundHandler}
+		}
+		if chain != nil {
+			c.handlers = chain
 			a.handleError(c, s, c.Next())
 		}
 		if !c.written && s.ResponseWriter != nil {

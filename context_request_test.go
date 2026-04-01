@@ -1166,7 +1166,7 @@ func TestRequestHeaders(t *testing.T) {
 	}
 }
 
-func TestContextFormValueOk(t *testing.T) {
+func TestContextFormValueOK(t *testing.T) {
 	body := "name=alice&empty="
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
@@ -1176,12 +1176,12 @@ func TestContextFormValueOk(t *testing.T) {
 	c := acquireContext(s)
 	defer releaseContext(c)
 
-	v, ok := c.FormValueOk("name")
+	v, ok := c.FormValueOK("name")
 	if !ok || v != "alice" {
 		t.Fatalf("expected (alice, true), got (%s, %v)", v, ok)
 	}
 
-	v, ok = c.FormValueOk("empty")
+	v, ok = c.FormValueOK("empty")
 	if !ok {
 		t.Fatal("expected field 'empty' to be present")
 	}
@@ -1189,7 +1189,7 @@ func TestContextFormValueOk(t *testing.T) {
 		t.Fatalf("expected empty string, got %q", v)
 	}
 
-	_, ok = c.FormValueOk("missing")
+	_, ok = c.FormValueOK("missing")
 	if ok {
 		t.Fatal("expected missing field to return false")
 	}
@@ -1371,5 +1371,151 @@ func TestContextOverridesResetOnReuse(t *testing.T) {
 	}
 	if c2.hostOverride != "" {
 		t.Fatal("expected hostOverride to be cleared")
+	}
+}
+
+func TestQueryBool(t *testing.T) {
+	tests := []struct {
+		query    string
+		key      string
+		def      bool
+		expected bool
+	}{
+		{"debug=true", "debug", false, true},
+		{"debug=1", "debug", false, true},
+		{"debug=yes", "debug", false, true},
+		{"debug=false", "debug", true, false},
+		{"debug=0", "debug", true, false},
+		{"debug=no", "debug", true, false},
+		{"debug=TRUE", "debug", false, true},
+		{"debug=FALSE", "debug", true, false},
+		{"debug=Yes", "debug", false, true},
+		{"debug=No", "debug", true, false},
+		{"debug=invalid", "debug", true, true},
+		{"debug=invalid", "debug", false, false},
+		{"", "debug", true, true},
+		{"", "debug", false, false},
+		{"other=1", "debug", false, false},
+		{"other=1", "debug", true, true},
+	}
+	for _, tt := range tests {
+		name := tt.query + "_" + tt.key
+		if tt.def {
+			name += "_def=true"
+		} else {
+			name += "_def=false"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := "/test"
+			if tt.query != "" {
+				path += "?" + tt.query
+			}
+			s, _ := newTestStream("GET", path)
+			defer s.Release()
+
+			c := acquireContext(s)
+			defer releaseContext(c)
+
+			got := c.QueryBool(tt.key, tt.def)
+			if got != tt.expected {
+				t.Fatalf("QueryBool(%q, %v) = %v, want %v", tt.key, tt.def, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestQueryInt64(t *testing.T) {
+	tests := []struct {
+		query    string
+		key      string
+		def      int64
+		expected int64
+	}{
+		{"page=42", "page", 0, 42},
+		{"page=9999999999", "page", 0, 9999999999},
+		{"page=-100", "page", 0, -100},
+		{"page=0", "page", 99, 0},
+		{"page=abc", "page", 10, 10},
+		{"", "page", 5, 5},
+		{"other=1", "page", 7, 7},
+		{"page=9223372036854775807", "page", 0, 9223372036854775807},
+	}
+	for _, tt := range tests {
+		name := tt.query + "_" + tt.key
+		t.Run(name, func(t *testing.T) {
+			path := "/test"
+			if tt.query != "" {
+				path += "?" + tt.query
+			}
+			s, _ := newTestStream("GET", path)
+			defer s.Release()
+
+			c := acquireContext(s)
+			defer releaseContext(c)
+
+			got := c.QueryInt64(tt.key, tt.def)
+			if got != tt.expected {
+				t.Fatalf("QueryInt64(%q, %d) = %d, want %d", tt.key, tt.def, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParamDefault(t *testing.T) {
+	s, _ := newTestStream("GET", "/users/alice")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	c.params = Params{
+		{Key: "name", Value: "alice"},
+		{Key: "empty", Value: ""},
+	}
+
+	if got := c.ParamDefault("name", "fallback"); got != "alice" {
+		t.Fatalf("expected alice, got %s", got)
+	}
+	if got := c.ParamDefault("empty", "fallback"); got != "fallback" {
+		t.Fatalf("expected fallback for empty param, got %s", got)
+	}
+	if got := c.ParamDefault("missing", "fallback"); got != "fallback" {
+		t.Fatalf("expected fallback for missing param, got %s", got)
+	}
+}
+
+func TestFormValueOkDeprecated(t *testing.T) {
+	body := "name=alice&empty="
+	s, _ := newTestStream("POST", "/form")
+	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
+	s.GetBuf().Write([]byte(body))
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	// FormValueOk (deprecated) should return the same results as FormValueOK.
+	v1, ok1 := c.FormValueOK("name")
+	v2, ok2 := c.FormValueOk("name")
+	if v1 != v2 || ok1 != ok2 {
+		t.Fatalf("FormValueOk != FormValueOK: (%q,%v) vs (%q,%v)", v1, ok1, v2, ok2)
+	}
+	if !ok1 || v1 != "alice" {
+		t.Fatalf("expected (alice, true), got (%s, %v)", v1, ok1)
+	}
+
+	v1, ok1 = c.FormValueOK("empty")
+	v2, ok2 = c.FormValueOk("empty")
+	if v1 != v2 || ok1 != ok2 {
+		t.Fatalf("FormValueOk != FormValueOK for empty: (%q,%v) vs (%q,%v)", v1, ok1, v2, ok2)
+	}
+
+	_, ok1 = c.FormValueOK("missing")
+	_, ok2 = c.FormValueOk("missing")
+	if ok1 != ok2 {
+		t.Fatalf("FormValueOk != FormValueOK for missing: %v vs %v", ok1, ok2)
+	}
+	if ok1 {
+		t.Fatal("expected missing field to return false")
 	}
 }
