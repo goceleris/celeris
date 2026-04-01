@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/goceleris/celeris"
@@ -48,18 +49,32 @@ func (r *ResponseRecorder) BodyString() string {
 	return string(r.Body)
 }
 
+// recorderCombo bundles a ResponseRecorder and its recorderWriter in a
+// single allocation so they can be pooled together.
+type recorderCombo struct {
+	rec ResponseRecorder
+	rw  recorderWriter
+}
+
+var recorderPool = sync.Pool{New: func() any {
+	combo := &recorderCombo{}
+	combo.rw.rec = &combo.rec
+	combo.rw.combo = combo
+	return combo
+}}
+
 // recorderWriter adapts a ResponseRecorder to the internal
 // stream.ResponseWriter interface without leaking internal types
 // in the public API.
 type recorderWriter struct {
-	rec *ResponseRecorder
+	rec   *ResponseRecorder
+	combo *recorderCombo
 }
 
 func (w *recorderWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	w.rec.StatusCode = status
 	w.rec.Headers = headers
-	w.rec.Body = make([]byte, len(body))
-	copy(w.rec.Body, body)
+	w.rec.Body = append(w.rec.Body[:0], body...)
 	return nil
 }
 
@@ -77,13 +92,38 @@ var _ stream.ResponseWriter = (*recorderWriter)(nil)
 type Option func(*config)
 
 type config struct {
-	body       []byte
-	headers    [][2]string
-	queries    [][2]string
-	params     [][2]string
-	cookies    [][2]string
-	remoteAddr string
-	handlers   []any
+	body        []byte
+	headers     [][2]string
+	queries     [][2]string
+	params      [][2]string
+	cookies     [][2]string
+	remoteAddr  string
+	handlers    []any
+	headersBuf  [4][2]string
+	handlersBuf [4]any
+}
+
+var configPool = sync.Pool{New: func() any {
+	c := &config{}
+	c.headers = c.headersBuf[:0]
+	c.handlers = c.handlersBuf[:0]
+	return c
+}}
+
+func (c *config) reset() {
+	c.body = nil
+	for i := range c.headers {
+		c.headers[i] = [2]string{}
+	}
+	c.headers = c.headersBuf[:0]
+	c.queries = nil
+	c.params = nil
+	c.cookies = nil
+	c.remoteAddr = ""
+	for i := range c.handlers {
+		c.handlers[i] = nil
+	}
+	c.handlers = c.handlersBuf[:0]
 }
 
 // WithBody sets the request body.
@@ -134,9 +174,17 @@ func WithRemoteAddr(addr string) Option {
 // Pass celeris.HandlerFunc values; they are stored as []any to avoid import cycles.
 func WithHandlers(handlers ...celeris.HandlerFunc) Option {
 	return func(c *config) {
-		c.handlers = make([]any, len(handlers))
-		for i, h := range handlers {
-			c.handlers[i] = h
+		n := len(handlers)
+		if n <= len(c.handlersBuf) {
+			for i, h := range handlers {
+				c.handlersBuf[i] = h
+			}
+			c.handlers = c.handlersBuf[:n]
+		} else {
+			c.handlers = make([]any, n)
+			for i, h := range handlers {
+				c.handlers[i] = h
+			}
 		}
 	}
 }
@@ -144,7 +192,38 @@ func WithHandlers(handlers ...celeris.HandlerFunc) Option {
 // ReleaseContext returns a [celeris.Context] to the pool. The context must not
 // be used after this call.
 func ReleaseContext(ctx *celeris.Context) {
+	// Extract stream and recorder before releasing context (reset nils them).
+	var s *stream.Stream
+	if raw := ctxkit.GetStream(ctx); raw != nil {
+		s = raw.(*stream.Stream)
+	}
+	var combo *recorderCombo
+	if rw := ctxkit.GetResponseWriter(ctx); rw != nil {
+		if w, ok := rw.(*recorderWriter); ok && w.combo != nil {
+			combo = w.combo
+		}
+	}
+
 	ctxkit.ReleaseContext(ctx)
+
+	// Return stream to pool so NewStream reuses it on the next call.
+	if s != nil {
+		if s.HasDoneCh() {
+			// A derived context (e.g. context.WithTimeout) spawned a
+			// goroutine that holds a reference to this stream. Cancel to
+			// terminate it, but don't pool the stream — the goroutine may
+			// still read Err()/Done() after the pool recycles the struct.
+			s.Cancel()
+		} else {
+			stream.ResetForPool(s)
+		}
+	}
+	if combo != nil {
+		combo.rec.StatusCode = 0
+		combo.rec.Headers = nil
+		combo.rec.Body = combo.rec.Body[:0]
+		recorderPool.Put(combo)
+	}
 }
 
 // NewContextT is like [NewContext] but registers an automatic cleanup with
@@ -160,7 +239,7 @@ func NewContextT(t *testing.T, method, path string, opts ...Option) (*celeris.Co
 // The returned context has the given method and path, plus any options applied.
 // Call [ReleaseContext] when done to clean up pooled resources.
 func NewContext(method, path string, opts ...Option) (*celeris.Context, *ResponseRecorder) {
-	cfg := &config{}
+	cfg := configPool.Get().(*config)
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -175,12 +254,12 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 	}
 
 	s := stream.NewStream(1)
-	s.Headers = [][2]string{
-		{":method", method},
-		{":path", fullPath},
-		{":scheme", "http"},
-		{":authority", "localhost"},
-	}
+	s.Headers = append(s.Headers,
+		[2]string{":method", method},
+		[2]string{":path", fullPath},
+		[2]string{":scheme", "http"},
+		[2]string{":authority", "localhost"},
+	)
 	s.Headers = append(s.Headers, cfg.headers...)
 	if len(cfg.cookies) > 0 {
 		parts := make([]string, 0, len(cfg.cookies))
@@ -190,11 +269,15 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		s.Headers = append(s.Headers, [2]string{"cookie", strings.Join(parts, "; ")})
 	}
 	if len(cfg.body) > 0 {
-		s.Data.Write(cfg.body)
+		s.GetBuf().Write(cfg.body)
 	}
 
-	rec := &ResponseRecorder{}
-	s.ResponseWriter = &recorderWriter{rec: rec}
+	combo := recorderPool.Get().(*recorderCombo)
+	combo.rec.StatusCode = 0
+	combo.rec.Headers = nil
+	combo.rec.Body = combo.rec.Body[:0]
+	rec := &combo.rec
+	s.ResponseWriter = &combo.rw
 
 	if cfg.remoteAddr != "" {
 		s.RemoteAddr = cfg.remoteAddr
@@ -207,5 +290,9 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 	if len(cfg.handlers) > 0 {
 		ctxkit.SetHandlers(ctx, cfg.handlers)
 	}
+
+	cfg.reset()
+	configPool.Put(cfg)
+
 	return ctx, rec
 }

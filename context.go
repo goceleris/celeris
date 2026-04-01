@@ -25,24 +25,49 @@ func init() {
 	}
 	ctxkit.SetHandlers = func(c any, handlers []any) {
 		ctx := c.(*Context)
-		chain := make([]HandlerFunc, len(handlers))
-		for i, h := range handlers {
-			chain[i] = h.(HandlerFunc)
+		n := len(handlers)
+		var chain []HandlerFunc
+		if n <= len(ctx.handlerBuf) {
+			for i, h := range handlers {
+				ctx.handlerBuf[i] = h.(HandlerFunc)
+			}
+			chain = ctx.handlerBuf[:n]
+		} else {
+			chain = make([]HandlerFunc, n)
+			for i, h := range handlers {
+				chain[i] = h.(HandlerFunc)
+			}
 		}
 		ctx.handlers = chain
 		ctx.index = -1
+	}
+	ctxkit.GetResponseWriter = func(c any) any {
+		ctx := c.(*Context)
+		if ctx.stream != nil {
+			return ctx.stream.ResponseWriter
+		}
+		return nil
+	}
+	ctxkit.GetStream = func(c any) any {
+		ctx := c.(*Context)
+		if ctx.stream != nil {
+			return ctx.stream
+		}
+		return nil
 	}
 }
 
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
 // A Context is obtained from the pool and must not be retained after the handler returns.
 type Context struct {
-	stream   *stream.Stream
-	index    int16
-	handlers []HandlerFunc
-	params   Params
-	keys     map[string]any
-	ctx      context.Context
+	stream     *stream.Stream
+	index      int16
+	handlers   []HandlerFunc
+	handlerBuf [8]HandlerFunc
+	params     Params
+	paramBuf   [4]Param
+	keys       map[string]any
+	ctx        context.Context
 
 	method   string
 	path     string
@@ -86,7 +111,12 @@ type Context struct {
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
 }
 
-var contextPool = sync.Pool{New: func() any { return &Context{} }}
+var contextPool = sync.Pool{New: func() any {
+	c := &Context{keys: make(map[string]any, 4)}
+	c.params = c.paramBuf[:0]
+	c.respHeaders = c.respHdrBuf[:0]
+	return c
+}}
 
 const abortIndex int16 = math.MaxInt16 / 2
 
@@ -213,17 +243,11 @@ func (c *Context) SetContext(ctx context.Context) {
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
 	c.extended = true
-	if c.keys == nil {
-		c.keys = make(map[string]any)
-	}
 	c.keys[key] = value
 }
 
 // Get returns the value for a key.
 func (c *Context) Get(key string) (any, bool) {
-	if c.keys == nil {
-		return nil, false
-	}
 	v, ok := c.keys[key]
 	return v, ok
 }
@@ -231,7 +255,7 @@ func (c *Context) Get(key string) (any, bool) {
 // Keys returns a copy of all key-value pairs stored on this context.
 // Returns nil if no values have been set.
 func (c *Context) Keys() map[string]any {
-	if c.keys == nil {
+	if len(c.keys) == 0 {
 		return nil
 	}
 	cp := make(map[string]any, len(c.keys))
@@ -244,25 +268,37 @@ func (c *Context) Keys() map[string]any {
 func (c *Context) reset() {
 	c.stream = nil
 	c.index = -1
+	// Clear handler references so closures can be GCed, but only when
+	// the slice is owned by this context (backed by handlerBuf or a
+	// SetHandlers allocation). The production path assigns the router's
+	// pre-composed chain directly; nilling those would corrupt shared state.
+	if len(c.handlers) > 0 && cap(c.handlers) <= len(c.handlerBuf) &&
+		&c.handlers[:cap(c.handlers)][0] == &c.handlerBuf[0] {
+		for i := range c.handlers {
+			c.handlers[i] = nil
+		}
+	}
 	if cap(c.handlers) > 64 {
 		c.handlers = nil
 	} else {
 		c.handlers = c.handlers[:0]
 	}
-	c.params = c.params[:0]
+	clear(c.paramBuf[:])
+	c.params = c.paramBuf[:0]
 	c.ctx = nil
 	c.method = ""
 	c.path = ""
 	c.rawQuery = ""
 	c.fullPath = ""
 	c.statusCode = 200
-	c.respHeaders = c.respHeaders[:0]
+	clear(c.respHdrBuf[:])
+	c.respHeaders = c.respHdrBuf[:0]
 	c.written = false
 	c.aborted = false
 	c.bytesWritten = 0
 	c.maxFormSize = 0
 	if c.extended {
-		c.keys = nil
+		clear(c.keys)
 		c.queryCache = nil
 		c.queryCached = false
 		c.cookieCache = c.cookieCache[:0]

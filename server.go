@@ -375,7 +375,14 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			s.collector = observe.NewCollector()
 		}
 
-		var handler stream.Handler = &routerAdapter{server: s}
+		ra := &routerAdapter{server: s}
+		if s.notFoundHandler != nil {
+			ra.notFoundChain = []HandlerFunc{s.notFoundHandler}
+		}
+		if s.methodNotAllowedHandler != nil {
+			ra.methodNotAllowedChain = []HandlerFunc{s.methodNotAllowedHandler}
+		}
+		var handler stream.Handler = ra
 		var err error
 		eng, err = createEngine(cfg, handler)
 		if err != nil {

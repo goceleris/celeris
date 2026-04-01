@@ -431,9 +431,9 @@
 //
 // # Form Presence
 //
-// FormValueOk distinguishes a missing field from an empty value:
+// FormValueOK distinguishes a missing field from an empty value:
 //
-//	val, ok := c.FormValueOk("name")
+//	val, ok := c.FormValueOK("name")
 //	if !ok {
 //	    // field was not submitted
 //	}

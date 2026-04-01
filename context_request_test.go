@@ -15,7 +15,7 @@ import (
 
 func TestContextBind(t *testing.T) {
 	s, _ := newTestStream("POST", "/bind")
-	s.Data.Write([]byte(`{"name":"test"}`))
+	s.GetBuf().Write([]byte(`{"name":"test"}`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -221,7 +221,7 @@ func TestContextQueryInt(t *testing.T) {
 
 func TestBindJSON(t *testing.T) {
 	s, _ := newTestStream("POST", "/bind-json")
-	s.Data.Write([]byte(`{"name":"test"}`))
+	s.GetBuf().Write([]byte(`{"name":"test"}`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -238,7 +238,7 @@ func TestBindJSON(t *testing.T) {
 
 func TestBindXML(t *testing.T) {
 	s, _ := newTestStream("POST", "/bind-xml")
-	s.Data.Write([]byte(`<Item><Name>test</Name></Item>`))
+	s.GetBuf().Write([]byte(`<Item><Name>test</Name></Item>`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -259,7 +259,7 @@ func TestBindXML(t *testing.T) {
 func TestBindContentTypeDetection(t *testing.T) {
 	// JSON (default, no Content-Type).
 	s, _ := newTestStream("POST", "/bind-auto")
-	s.Data.Write([]byte(`{"name":"json"}`))
+	s.GetBuf().Write([]byte(`{"name":"json"}`))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -276,7 +276,7 @@ func TestBindContentTypeDetection(t *testing.T) {
 	// XML with Content-Type header.
 	s2, _ := newTestStream("POST", "/bind-auto-xml")
 	s2.Headers = append(s2.Headers, [2]string{"content-type", "application/xml"})
-	s2.Data.Write([]byte(`<Item><Name>xml</Name></Item>`))
+	s2.GetBuf().Write([]byte(`<Item><Name>xml</Name></Item>`))
 	defer s2.Release()
 
 	c2 := acquireContext(s2)
@@ -440,7 +440,7 @@ func TestContextBasicAuthPasswordWithColons(t *testing.T) {
 func TestContextFormValueURLEncoded(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("name=alice&age=30"))
+	s.GetBuf().Write([]byte("name=alice&age=30"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -460,7 +460,7 @@ func TestContextFormValueURLEncoded(t *testing.T) {
 func TestContextFormValuesMultiple(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("color=red&color=blue&color=green"))
+	s.GetBuf().Write([]byte("color=red&color=blue&color=green"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -484,7 +484,7 @@ func TestContextMultipartFormValue(t *testing.T) {
 
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
-	s.Data.Write(buf.Bytes())
+	s.GetBuf().Write(buf.Bytes())
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -513,7 +513,7 @@ func TestContextFormFile(t *testing.T) {
 
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
-	s.Data.Write(buf.Bytes())
+	s.GetBuf().Write(buf.Bytes())
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -538,7 +538,7 @@ func TestContextFormFile(t *testing.T) {
 func TestContextFormFileNonMultipart(t *testing.T) {
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -565,7 +565,7 @@ func TestContextFormEmptyBody(t *testing.T) {
 func TestContextFormCaching(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("a=1&b=2"))
+	s.GetBuf().Write([]byte("a=1&b=2"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -584,7 +584,7 @@ func TestContextFormCaching(t *testing.T) {
 func TestContextFormResetClearsForm(t *testing.T) {
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -607,7 +607,7 @@ func TestContextMaxFormSizeUnlimited(t *testing.T) {
 
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", w.FormDataContentType()})
-	s.Data.Write(buf.Bytes())
+	s.GetBuf().Write(buf.Bytes())
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -624,7 +624,7 @@ func TestContextMaxFormSizeUnlimited(t *testing.T) {
 
 func TestContextBodyCopy(t *testing.T) {
 	s, _ := newTestStream("POST", "/data")
-	s.Data.Write([]byte("original"))
+	s.GetBuf().Write([]byte("original"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -655,7 +655,7 @@ func TestContextBodyCopyEmpty(t *testing.T) {
 
 func TestContextBodyReader(t *testing.T) {
 	s, _ := newTestStream("POST", "/data")
-	s.Data.Write([]byte("read me"))
+	s.GetBuf().Write([]byte("read me"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -1070,7 +1070,7 @@ func TestAcceptsLanguagesNoMatch(t *testing.T) {
 func TestFormFileNotMultipart(t *testing.T) {
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -1092,7 +1092,7 @@ func TestFormFileNotMultipart(t *testing.T) {
 func TestMultipartFormNotMultipart(t *testing.T) {
 	s, _ := newTestStream("POST", "/upload")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte("key=value"))
+	s.GetBuf().Write([]byte("key=value"))
 	defer s.Release()
 
 	c := acquireContext(s)
@@ -1166,22 +1166,22 @@ func TestRequestHeaders(t *testing.T) {
 	}
 }
 
-func TestContextFormValueOk(t *testing.T) {
+func TestContextFormValueOK(t *testing.T) {
 	body := "name=alice&empty="
 	s, _ := newTestStream("POST", "/form")
 	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.Data.Write([]byte(body))
+	s.GetBuf().Write([]byte(body))
 	defer s.Release()
 
 	c := acquireContext(s)
 	defer releaseContext(c)
 
-	v, ok := c.FormValueOk("name")
+	v, ok := c.FormValueOK("name")
 	if !ok || v != "alice" {
 		t.Fatalf("expected (alice, true), got (%s, %v)", v, ok)
 	}
 
-	v, ok = c.FormValueOk("empty")
+	v, ok = c.FormValueOK("empty")
 	if !ok {
 		t.Fatal("expected field 'empty' to be present")
 	}
@@ -1189,7 +1189,7 @@ func TestContextFormValueOk(t *testing.T) {
 		t.Fatalf("expected empty string, got %q", v)
 	}
 
-	_, ok = c.FormValueOk("missing")
+	_, ok = c.FormValueOK("missing")
 	if ok {
 		t.Fatal("expected missing field to return false")
 	}
@@ -1371,5 +1371,151 @@ func TestContextOverridesResetOnReuse(t *testing.T) {
 	}
 	if c2.hostOverride != "" {
 		t.Fatal("expected hostOverride to be cleared")
+	}
+}
+
+func TestQueryBool(t *testing.T) {
+	tests := []struct {
+		query    string
+		key      string
+		def      bool
+		expected bool
+	}{
+		{"debug=true", "debug", false, true},
+		{"debug=1", "debug", false, true},
+		{"debug=yes", "debug", false, true},
+		{"debug=false", "debug", true, false},
+		{"debug=0", "debug", true, false},
+		{"debug=no", "debug", true, false},
+		{"debug=TRUE", "debug", false, true},
+		{"debug=FALSE", "debug", true, false},
+		{"debug=Yes", "debug", false, true},
+		{"debug=No", "debug", true, false},
+		{"debug=invalid", "debug", true, true},
+		{"debug=invalid", "debug", false, false},
+		{"", "debug", true, true},
+		{"", "debug", false, false},
+		{"other=1", "debug", false, false},
+		{"other=1", "debug", true, true},
+	}
+	for _, tt := range tests {
+		name := tt.query + "_" + tt.key
+		if tt.def {
+			name += "_def=true"
+		} else {
+			name += "_def=false"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := "/test"
+			if tt.query != "" {
+				path += "?" + tt.query
+			}
+			s, _ := newTestStream("GET", path)
+			defer s.Release()
+
+			c := acquireContext(s)
+			defer releaseContext(c)
+
+			got := c.QueryBool(tt.key, tt.def)
+			if got != tt.expected {
+				t.Fatalf("QueryBool(%q, %v) = %v, want %v", tt.key, tt.def, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestQueryInt64(t *testing.T) {
+	tests := []struct {
+		query    string
+		key      string
+		def      int64
+		expected int64
+	}{
+		{"page=42", "page", 0, 42},
+		{"page=9999999999", "page", 0, 9999999999},
+		{"page=-100", "page", 0, -100},
+		{"page=0", "page", 99, 0},
+		{"page=abc", "page", 10, 10},
+		{"", "page", 5, 5},
+		{"other=1", "page", 7, 7},
+		{"page=9223372036854775807", "page", 0, 9223372036854775807},
+	}
+	for _, tt := range tests {
+		name := tt.query + "_" + tt.key
+		t.Run(name, func(t *testing.T) {
+			path := "/test"
+			if tt.query != "" {
+				path += "?" + tt.query
+			}
+			s, _ := newTestStream("GET", path)
+			defer s.Release()
+
+			c := acquireContext(s)
+			defer releaseContext(c)
+
+			got := c.QueryInt64(tt.key, tt.def)
+			if got != tt.expected {
+				t.Fatalf("QueryInt64(%q, %d) = %d, want %d", tt.key, tt.def, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParamDefault(t *testing.T) {
+	s, _ := newTestStream("GET", "/users/alice")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	c.params = Params{
+		{Key: "name", Value: "alice"},
+		{Key: "empty", Value: ""},
+	}
+
+	if got := c.ParamDefault("name", "fallback"); got != "alice" {
+		t.Fatalf("expected alice, got %s", got)
+	}
+	if got := c.ParamDefault("empty", "fallback"); got != "fallback" {
+		t.Fatalf("expected fallback for empty param, got %s", got)
+	}
+	if got := c.ParamDefault("missing", "fallback"); got != "fallback" {
+		t.Fatalf("expected fallback for missing param, got %s", got)
+	}
+}
+
+func TestFormValueOkDeprecated(t *testing.T) {
+	body := "name=alice&empty="
+	s, _ := newTestStream("POST", "/form")
+	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
+	s.GetBuf().Write([]byte(body))
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	// FormValueOk (deprecated) should return the same results as FormValueOK.
+	v1, ok1 := c.FormValueOK("name")
+	v2, ok2 := c.FormValueOk("name")
+	if v1 != v2 || ok1 != ok2 {
+		t.Fatalf("FormValueOk != FormValueOK: (%q,%v) vs (%q,%v)", v1, ok1, v2, ok2)
+	}
+	if !ok1 || v1 != "alice" {
+		t.Fatalf("expected (alice, true), got (%s, %v)", v1, ok1)
+	}
+
+	v1, ok1 = c.FormValueOK("empty")
+	v2, ok2 = c.FormValueOk("empty")
+	if v1 != v2 || ok1 != ok2 {
+		t.Fatalf("FormValueOk != FormValueOK for empty: (%q,%v) vs (%q,%v)", v1, ok1, v2, ok2)
+	}
+
+	_, ok1 = c.FormValueOK("missing")
+	_, ok2 = c.FormValueOk("missing")
+	if ok1 != ok2 {
+		t.Fatalf("FormValueOk != FormValueOK for missing: %v vs %v", ok1, ok2)
+	}
+	if ok1 {
+		t.Fatal("expected missing field to return false")
 	}
 }

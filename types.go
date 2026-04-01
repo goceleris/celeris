@@ -11,7 +11,11 @@ type HandlerFunc func(*Context) error
 // parsing (32 MB), matching net/http.
 const DefaultMaxFormSize int64 = 32 << 20
 
-const maxStreamBodySize = 100 << 20 // 100MB
+// maxBodySize is the maximum request/response body size (100 MB), shared by
+// stream responses (File, Stream), bridge adapter output, and ToHandler input.
+const maxBodySize = 100 << 20
+
+const maxStreamBodySize = maxBodySize
 
 // SameSite controls the SameSite attribute of a cookie.
 type SameSite int

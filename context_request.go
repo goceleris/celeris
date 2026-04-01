@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
 )
@@ -60,9 +61,21 @@ func (c *Context) ContentLength() int64 {
 	return n
 }
 
-// Header returns the value of the named request header. Keys must be lowercase
-// (HTTP/2 mandates lowercase; the H1 parser normalizes to lowercase).
+// Header returns the value of the named request header. Keys are normalized
+// to lowercase automatically (HTTP/2 mandates lowercase; the H1 parser
+// normalizes to lowercase).
 func (c *Context) Header(key string) string {
+	// Fast path: most programmatic keys are already lowercase.
+	needsLower := false
+	for i := range len(key) {
+		if key[i] >= 'A' && key[i] <= 'Z' {
+			needsLower = true
+			break
+		}
+	}
+	if needsLower {
+		key = strings.ToLower(key)
+	}
 	for _, h := range c.stream.Headers {
 		if h[0] == key {
 			return h[1]
@@ -95,6 +108,15 @@ func (c *Context) ParamInt64(key string) (int64, error) {
 		return 0, fmt.Errorf("celeris: param %q not found", key)
 	}
 	return strconv.ParseInt(v, 10, 64)
+}
+
+// ParamDefault returns the value of a URL parameter, or the default if absent or empty.
+func (c *Context) ParamDefault(key, defaultValue string) string {
+	v := c.Param(key)
+	if v == "" {
+		return defaultValue
+	}
+	return v
 }
 
 // Query returns the value of a query parameter by name. Results are cached
@@ -133,6 +155,38 @@ func (c *Context) QueryInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return n
+}
+
+// QueryInt64 returns a query parameter parsed as an int64.
+// Returns the provided default value if the key is absent or not a valid integer.
+func (c *Context) QueryInt64(key string, defaultValue int64) int64 {
+	v := c.Query(key)
+	if v == "" {
+		return defaultValue
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return n
+}
+
+// QueryBool returns a query parameter parsed as a bool.
+// Returns the provided default value if the key is absent or not a valid bool.
+// Recognizes "true", "1", "yes" as true and "false", "0", "no" as false.
+func (c *Context) QueryBool(key string, defaultValue bool) bool {
+	v := c.Query(key)
+	if v == "" {
+		return defaultValue
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true
+	case "false", "0", "no":
+		return false
+	default:
+		return defaultValue
+	}
 }
 
 // QueryValues returns all values for the given query parameter key.
@@ -282,6 +336,9 @@ func (c *Context) Scheme() string {
 		return c.schemeOverride
 	}
 	if proto := c.Header("x-forwarded-proto"); proto != "" {
+		if proto == "https" || proto == "http" {
+			return proto
+		}
 		return strings.ToLower(strings.TrimSpace(proto))
 	}
 	if scheme := c.Header(":scheme"); scheme != "" {
@@ -340,16 +397,22 @@ func (c *Context) BasicAuth() (username, password string, ok bool) {
 	if len(auth) < len(prefix) || auth[:len(prefix)] != prefix {
 		return
 	}
-	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	payload := auth[len(prefix):]
+	var buf [128]byte
+	if base64.StdEncoding.DecodedLen(len(payload)) > len(buf) {
+		return
+	}
+	n, err := base64.StdEncoding.Decode(buf[:],
+		unsafe.Slice(unsafe.StringData(payload), len(payload)))
 	if err != nil {
 		return
 	}
-	s := string(decoded)
-	colon := strings.IndexByte(s, ':')
-	if colon < 0 {
+	i := bytes.IndexByte(buf[:n], ':')
+	if i < 0 {
 		return
 	}
-	return s[:colon], s[colon+1:], true
+	decoded := string(buf[:n])
+	return decoded[:i], decoded[i+1:], true
 }
 
 // FormValue returns the first value for the named form field.
@@ -361,10 +424,10 @@ func (c *Context) FormValue(name string) string {
 	return c.formValues.Get(name)
 }
 
-// FormValueOk returns the first value for the named form field plus a boolean
+// FormValueOK returns the first value for the named form field plus a boolean
 // indicating whether the field was present. Unlike FormValue, callers can
 // distinguish a missing field from an empty value.
-func (c *Context) FormValueOk(name string) (string, bool) {
+func (c *Context) FormValueOK(name string) (string, bool) {
 	if err := c.parseForm(); err != nil {
 		return "", false
 	}
@@ -373,6 +436,13 @@ func (c *Context) FormValueOk(name string) (string, bool) {
 		return "", false
 	}
 	return vs[0], true
+}
+
+// FormValueOk is a deprecated alias for [Context.FormValueOK].
+//
+// Deprecated: Use [Context.FormValueOK] instead.
+func (c *Context) FormValueOk(name string) (string, bool) {
+	return c.FormValueOK(name)
 }
 
 // FormValues returns all values for the named form field.

@@ -61,6 +61,7 @@ type Stream struct {
 	phase                  Phase
 	CachedCtx              any    // per-connection cached context (avoids pool Get/Put per request)
 	OnDetach               func() // called by Context.Detach to install write-thread safety
+	hdrBuf                 [16][2]string
 }
 
 // streamContext is a zero-alloc context.Context for streams.
@@ -103,13 +104,9 @@ func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
 	s.ID = id
 	s.state.Store(int32(StateIdle))
-	s.Data = getBuf()
-	s.OutboundBuffer = getBuf()
 	s.windowSize.Store(65535)
 	s.phase = PhaseInit
-	if cap(s.Headers) < 8 {
-		s.Headers = make([][2]string, 0, 8)
-	}
+	s.Headers = s.hdrBuf[:0]
 	return s
 }
 
@@ -119,9 +116,7 @@ func NewH1Stream(id uint32) *Stream {
 	s.ID = id
 	s.state.Store(int32(StateIdle))
 	s.h1Mode = true
-	if cap(s.Headers) < 16 {
-		s.Headers = make([][2]string, 0, 16)
-	}
+	s.Headers = s.hdrBuf[:0]
 	return s
 }
 
@@ -162,12 +157,30 @@ func (s *Stream) IsCancelled() bool {
 	return s.flags.Load()&flagCancelled != 0
 }
 
+// HasDoneCh reports whether a Done channel was created, indicating
+// a derived context (e.g. context.WithTimeout) is watching this stream.
+func (s *Stream) HasDoneCh() bool {
+	return s.doneCh.Load() != nil
+}
+
 // Release returns pooled buffers, cancels the context, and returns the stream
 // to its pool. Safe to call multiple times; subsequent calls are no-ops.
 func (s *Stream) Release() {
 	if !s.h1Mode {
 		s.Cancel()
 	}
+	s.resetAndPool()
+}
+
+// ResetForPool returns pooled buffers and returns the stream to its pool
+// WITHOUT cancelling the context. Use this in test harnesses where derived
+// contexts (e.g. from context.WithTimeout) may have propagation goroutines
+// that race with cancellation flag clearing.
+func ResetForPool(s *Stream) {
+	s.resetAndPool()
+}
+
+func (s *Stream) resetAndPool() {
 	if s.Data != nil {
 		s.Data.Reset()
 		bufferPool.Put(s.Data)
@@ -181,7 +194,10 @@ func (s *Stream) Release() {
 	s.ID = 0
 	s.state.Store(0)
 	s.manager = nil
-	s.Headers = s.Headers[:0]
+	clear(s.hdrBuf[:])
+	s.Headers = s.hdrBuf[:0]
+	s.Trailers = s.Trailers[:cap(s.Trailers)]
+	clear(s.Trailers)
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.headersSent.Store(false)
@@ -218,7 +234,7 @@ func ResetH1Stream(s *Stream) {
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
-	s.Headers = s.Headers[:0]
+	s.Headers = s.hdrBuf[:0]
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.ResponseWriter = nil
@@ -241,7 +257,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 		s.OutboundBuffer = getBuf()
 	}
 	s.ID = id
-	s.Headers = s.Headers[:0]
+	s.Headers = s.hdrBuf[:0]
 	s.Trailers = s.Trailers[:0]
 	s.OutboundEndStream = false
 	s.headersSent.Store(false)
@@ -402,7 +418,7 @@ func (s *Stream) SetHandlerStarted() {
 func (s *Stream) BufferOutbound(data []byte, endStream bool) {
 	s.mu.Lock()
 	if s.OutboundBuffer == nil {
-		s.OutboundBuffer = new(bytes.Buffer)
+		s.OutboundBuffer = getBuf()
 	}
 	s.OutboundBuffer.Write(data)
 	s.OutboundEndStream = endStream

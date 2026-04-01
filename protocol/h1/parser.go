@@ -7,13 +7,14 @@ import (
 
 // H1 parser sentinel errors.
 var (
-	ErrBufferExhausted      = errors.New("buffer exhausted")
-	ErrInvalidRequestLine   = errors.New("invalid request line")
-	ErrInvalidHeader        = errors.New("invalid header line")
-	ErrMissingHost          = errors.New("missing Host header")
-	ErrUnsupportedVersion   = errors.New("unsupported HTTP version")
-	ErrHeadersTooLarge      = errors.New("headers too large")
-	ErrInvalidContentLength = errors.New("invalid content-length")
+	ErrBufferExhausted        = errors.New("buffer exhausted")
+	ErrInvalidRequestLine     = errors.New("invalid request line")
+	ErrInvalidHeader          = errors.New("invalid header line")
+	ErrMissingHost            = errors.New("missing Host header")
+	ErrUnsupportedVersion     = errors.New("unsupported HTTP version")
+	ErrHeadersTooLarge        = errors.New("headers too large")
+	ErrInvalidContentLength   = errors.New("invalid content-length")
+	ErrDuplicateContentLength = errors.New("duplicate content-length with conflicting values")
 )
 
 // Parser is a zero-allocation HTTP/1.x request parser.
@@ -171,6 +172,9 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 			if !ok {
 				return ErrInvalidContentLength
 			}
+			if req.ContentLength >= 0 && req.ContentLength != cl {
+				return ErrDuplicateContentLength
+			}
 			req.ContentLength = cl
 		case "transfer-encoding":
 			if asciiContainsFoldString(value, "chunked") {
@@ -206,11 +210,14 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 			if req.ChunkedEncoding {
 				return nil
 			}
-			if cl, ok := parseInt64Bytes(rawValue); ok {
-				req.ContentLength = cl
-			} else {
+			cl, ok := parseInt64Bytes(rawValue)
+			if !ok {
 				return ErrInvalidContentLength
 			}
+			if req.ContentLength >= 0 && req.ContentLength != cl {
+				return ErrDuplicateContentLength
+			}
+			req.ContentLength = cl
 			return nil
 		}
 		if asciiEqualFold(rawName, "Connection") {
