@@ -399,6 +399,9 @@ func (c *Context) BasicAuth() (username, password string, ok bool) {
 	}
 	payload := auth[len(prefix):]
 	var buf [128]byte
+	if base64.StdEncoding.DecodedLen(len(payload)) > len(buf) {
+		return
+	}
 	n, err := base64.StdEncoding.Decode(buf[:],
 		unsafe.Slice(unsafe.StringData(payload), len(payload)))
 	if err != nil {
