@@ -100,7 +100,7 @@ type config struct {
 	remoteAddr  string
 	handlers    []any
 	headersBuf  [4][2]string
-	handlersBuf [4]any
+	handlersBuf [8]any
 }
 
 var configPool = sync.Pool{New: func() any {
