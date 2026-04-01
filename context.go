@@ -60,14 +60,14 @@ func init() {
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
 // A Context is obtained from the pool and must not be retained after the handler returns.
 type Context struct {
-	stream   *stream.Stream
+	stream     *stream.Stream
 	index      int16
 	handlers   []HandlerFunc
 	handlerBuf [8]HandlerFunc
 	params     Params
 	paramBuf   [4]Param
-	keys     map[string]any
-	ctx      context.Context
+	keys       map[string]any
+	ctx        context.Context
 
 	method   string
 	path     string

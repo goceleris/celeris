@@ -238,7 +238,7 @@ func TestWithHandlersErrorPropagation(t *testing.T) {
 	mw := func(c *celeris.Context) error {
 		return c.Next()
 	}
-	handler := func(c *celeris.Context) error {
+	handler := func(_ *celeris.Context) error {
 		return celeris.NewHTTPError(403, "forbidden")
 	}
 	ctx, _ := NewContext("GET", "/test", WithHandlers(mw, handler))

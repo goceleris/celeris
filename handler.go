@@ -12,9 +12,9 @@ import (
 )
 
 type routerAdapter struct {
-	server                 *Server
-	notFoundChain          []HandlerFunc
-	methodNotAllowedChain  []HandlerFunc
+	server                *Server
+	notFoundChain         []HandlerFunc
+	methodNotAllowedChain []HandlerFunc
 }
 
 func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
