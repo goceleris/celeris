@@ -689,7 +689,7 @@ func (c *Context) StreamWriter() *StreamWriter {
 func (c *Context) Attachment(filename string) {
 	if filename != "" {
 		c.SetHeader("content-disposition",
-			fmt.Sprintf(`attachment; filename="%s"`, escapeQuotedString(filename)))
+			fmt.Sprintf(`attachment; filename="%s"`, EscapeQuotedString(filename)))
 	} else {
 		c.SetHeader("content-disposition", "attachment")
 	}
@@ -700,15 +700,15 @@ func (c *Context) Attachment(filename string) {
 func (c *Context) Inline(filename string) {
 	if filename != "" {
 		c.SetHeader("content-disposition",
-			fmt.Sprintf(`inline; filename="%s"`, escapeQuotedString(filename)))
+			fmt.Sprintf(`inline; filename="%s"`, EscapeQuotedString(filename)))
 	} else {
 		c.SetHeader("content-disposition", "inline")
 	}
 }
 
-// escapeQuotedString escapes backslash and double-quote for use in
-// HTTP quoted-string values (RFC 2616 §2.2).
-func escapeQuotedString(s string) string {
+// EscapeQuotedString escapes backslash and double-quote characters for use
+// in RFC 7230 quoted-string header values.
+func EscapeQuotedString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return s

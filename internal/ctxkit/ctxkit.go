@@ -3,7 +3,11 @@
 // implementation types in the public API.
 package ctxkit
 
-import "github.com/goceleris/celeris/protocol/h2/stream"
+import (
+	"time"
+
+	"github.com/goceleris/celeris/protocol/h2/stream"
+)
 
 // Hooks registered by the celeris package at init time.
 var (
@@ -13,4 +17,5 @@ var (
 	SetHandlers       func(c any, handlers []any)
 	GetResponseWriter func(c any) any
 	GetStream         func(c any) any
+	SetStartTime      func(c any, t time.Time)
 )

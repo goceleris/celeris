@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"mime/multipart"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -55,6 +56,9 @@ func init() {
 			return ctx.stream
 		}
 		return nil
+	}
+	ctxkit.SetStartTime = func(c any, t time.Time) {
+		c.(*Context).startTime = t
 	}
 }
 
@@ -111,6 +115,8 @@ type Context struct {
 	hostOverride     string
 
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
+
+	trustedNets []*net.IPNet
 
 	onRelease    []func()
 	onReleaseBuf [4]func()

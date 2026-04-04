@@ -10,6 +10,7 @@ import (
 	"math"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -357,15 +358,19 @@ func (c *Context) SetScheme(scheme string) {
 }
 
 // ClientIP extracts the client IP. If SetClientIP has been called, the
-// override value is returned. Otherwise it reads X-Forwarded-For or
-// X-Real-Ip headers. Returns empty string if neither header is present.
-// These headers can be spoofed by clients. In production behind a reverse proxy,
-// ensure only trusted proxies set these headers.
+// override value is returned. When [Config.TrustedProxies] is configured,
+// the X-Forwarded-For chain is walked right-to-left and entries from
+// trusted networks are skipped; the first untrusted IP is returned. When
+// TrustedProxies is empty (default), the leftmost XFF entry is returned
+// (legacy behavior). Falls back to X-Real-Ip, then empty string.
 func (c *Context) ClientIP() string {
 	if c.clientIPOverride != "" {
 		return c.clientIPOverride
 	}
 	if xff := c.Header("x-forwarded-for"); xff != "" {
+		if c.trustedNets != nil {
+			return c.clientIPFromTrustedXFF(xff)
+		}
 		if i := strings.IndexByte(xff, ','); i > 0 {
 			return strings.TrimSpace(xff[:i])
 		}
@@ -375,6 +380,39 @@ func (c *Context) ClientIP() string {
 		return strings.TrimSpace(xri)
 	}
 	return ""
+}
+
+// clientIPFromTrustedXFF walks the XFF chain right-to-left, skipping IPs that
+// fall within the configured trusted proxy networks. Returns the first
+// untrusted IP, or falls back to RemoteAddr if all are trusted.
+func (c *Context) clientIPFromTrustedXFF(xff string) string {
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		raw := strings.TrimSpace(parts[i])
+		if raw == "" {
+			continue
+		}
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			continue
+		}
+		trusted := false
+		for _, n := range c.trustedNets {
+			if n.Contains(ip) {
+				trusted = true
+				break
+			}
+		}
+		if !trusted {
+			return raw
+		}
+	}
+	// All XFF entries are trusted proxies; fall back to remote peer.
+	addr := c.RemoteAddr()
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 // SetClientIP overrides the value returned by ClientIP. This is useful in

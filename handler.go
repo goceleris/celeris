@@ -21,6 +21,7 @@ type routerAdapter struct {
 func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
 	c := acquireContext(s)
 	c.startTime = time.Now()
+	c.trustedNets = a.server.trustedNets
 
 	if a.server.config.MaxFormSize != 0 {
 		c.maxFormSize = a.server.config.MaxFormSize
@@ -109,6 +110,7 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 	allowed := a.server.router.allowedMethods(c.path, c.method)
 	if len(allowed) > 0 {
 		c.statusCode = 405
+		c.fullPath = "<method-not-allowed>"
 		allowVal := strings.Join(allowed, ", ")
 		chain := a.methodNotAllowedChain
 		if chain == nil && a.server.methodNotAllowedHandler != nil {
@@ -128,6 +130,7 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 		}
 	} else {
 		c.statusCode = 404
+		c.fullPath = "<unmatched>"
 		chain := a.notFoundChain
 		if chain == nil && a.server.notFoundHandler != nil {
 			chain = []HandlerFunc{a.server.notFoundHandler}
@@ -161,6 +164,7 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 		if s.ResponseWriter != nil {
 			_ = s.ResponseWriter.WriteResponse(s, he.Code, [][2]string{
 				{"content-type", "text/plain"},
+				{"cache-control", "no-store"},
 			}, []byte(he.Message))
 			c.written = true
 		}
@@ -169,6 +173,7 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 		if s.ResponseWriter != nil {
 			_ = s.ResponseWriter.WriteResponse(s, 500, [][2]string{
 				{"content-type", "text/plain"},
+				{"cache-control", "no-store"},
 			}, []byte("Internal Server Error"))
 			c.written = true
 		}

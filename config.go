@@ -111,6 +111,12 @@ type Config struct {
 	// remote peer address. Must be fast — blocks the event loop.
 	OnDisconnect func(addr string)
 
+	// TrustedProxies is a list of trusted proxy CIDR ranges (e.g., "10.0.0.0/8",
+	// "172.16.0.0/12", "192.168.0.0/16"). When set, ClientIP() only trusts
+	// X-Forwarded-For hops from these networks. When empty, ClientIP() trusts
+	// all proxy headers (legacy behavior).
+	TrustedProxies []string
+
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
 }

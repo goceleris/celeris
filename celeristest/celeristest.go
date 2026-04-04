@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/internal/ctxkit"
@@ -284,6 +285,7 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 	}
 
 	ctx := ctxkit.NewContext(s).(*celeris.Context)
+	ctxkit.SetStartTime(ctx, time.Now())
 	for _, p := range cfg.params {
 		ctxkit.AddParam(ctx, p[0], p[1])
 	}
