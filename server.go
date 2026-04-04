@@ -57,6 +57,9 @@ type Server struct {
 	methodNotAllowedHandler HandlerFunc
 	errorHandler            func(*Context, error)
 
+	trustedNets   []*net.IPNet
+	shutdownHooks []func(ctx context.Context)
+
 	startOnce sync.Once
 	startErr  error
 }
@@ -153,6 +156,14 @@ func (s *Server) MethodNotAllowed(handler HandlerFunc) *Server {
 // fallback applies. Must be called before Start.
 func (s *Server) OnError(handler func(c *Context, err error)) *Server {
 	s.errorHandler = handler
+	return s
+}
+
+// OnShutdown registers a function to be called during Server.Shutdown.
+// Hooks fire in registration order with the shutdown context. Must be
+// called before Start.
+func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
+	s.shutdownHooks = append(s.shutdownHooks, fn)
 	return s
 }
 
@@ -290,12 +301,21 @@ func (s *Server) Start() error {
 }
 
 // Shutdown gracefully shuts down the server. Returns nil if the server has not
-// been started.
+// been started. After the engine stops accepting new connections and drains
+// in-flight requests, any hooks registered via [Server.OnShutdown] fire in
+// registration order with the provided context.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.engine == nil {
 		return nil
 	}
-	return s.engine.Shutdown(ctx)
+	err := s.engine.Shutdown(ctx)
+	for _, fn := range s.shutdownHooks {
+		func() {
+			defer func() { _ = recover() }()
+			fn(ctx)
+		}()
+	}
+	return err
 }
 
 // Addr returns the listener's bound address, or nil if the server has not been
@@ -381,16 +401,37 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			return
 		}
 
+		for _, cidr := range s.config.TrustedProxies {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				ip := net.ParseIP(cidr)
+				if ip == nil {
+					s.startErr = fmt.Errorf("celeris: invalid TrustedProxies entry: %s", cidr)
+					return
+				}
+				if ip4 := ip.To4(); ip4 != nil {
+					_, ipNet, _ = net.ParseCIDR(ip4.String() + "/32")
+				} else {
+					_, ipNet, _ = net.ParseCIDR(ip.String() + "/128")
+				}
+			}
+			s.trustedNets = append(s.trustedNets, ipNet)
+		}
+
 		if !s.config.DisableMetrics {
 			s.collector = observe.NewCollector()
 		}
 
 		ra := &routerAdapter{server: s}
 		if s.notFoundHandler != nil {
-			ra.notFoundChain = []HandlerFunc{s.notFoundHandler}
+			ra.notFoundChain = make([]HandlerFunc, 0, len(s.middleware)+1)
+			ra.notFoundChain = append(ra.notFoundChain, s.middleware...)
+			ra.notFoundChain = append(ra.notFoundChain, s.notFoundHandler)
 		}
 		if s.methodNotAllowedHandler != nil {
-			ra.methodNotAllowedChain = []HandlerFunc{s.methodNotAllowedHandler}
+			ra.methodNotAllowedChain = make([]HandlerFunc, 0, len(s.middleware)+1)
+			ra.methodNotAllowedChain = append(ra.methodNotAllowedChain, s.middleware...)
+			ra.methodNotAllowedChain = append(ra.methodNotAllowedChain, s.methodNotAllowedHandler)
 		}
 		ra.errorHandler = s.errorHandler
 		var handler stream.Handler = ra
@@ -463,7 +504,7 @@ func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listene
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = eng.Shutdown(shutCtx)
+		_ = s.Shutdown(shutCtx)
 	}()
 
 	return eng.Listen(ctx)
@@ -509,7 +550,7 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = eng.Shutdown(shutCtx)
+		_ = s.Shutdown(shutCtx)
 	}()
 
 	return eng.Listen(ctx)

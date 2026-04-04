@@ -11,10 +11,12 @@ package celeristest
 
 import (
 	"encoding/base64"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/internal/ctxkit"
@@ -92,15 +94,18 @@ var _ stream.ResponseWriter = (*recorderWriter)(nil)
 type Option func(*config)
 
 type config struct {
-	body        []byte
-	headers     [][2]string
-	queries     [][2]string
-	params      [][2]string
-	cookies     [][2]string
-	remoteAddr  string
-	handlers    []any
-	headersBuf  [4][2]string
-	handlersBuf [4]any
+	body           []byte
+	headers        [][2]string
+	queries        [][2]string
+	params         [][2]string
+	cookies        [][2]string
+	remoteAddr     string
+	handlers       []any
+	fullPath       string
+	protocol       string
+	trustedProxies []string
+	headersBuf     [4][2]string
+	handlersBuf    [4]any
 }
 
 var configPool = sync.Pool{New: func() any {
@@ -120,6 +125,9 @@ func (c *config) reset() {
 	c.params = nil
 	c.cookies = nil
 	c.remoteAddr = ""
+	c.fullPath = ""
+	c.protocol = ""
+	c.trustedProxies = nil
 	for i := range c.handlers {
 		c.handlers[i] = nil
 	}
@@ -167,6 +175,21 @@ func WithCookie(name, value string) Option {
 // WithRemoteAddr sets the remote address on the test stream.
 func WithRemoteAddr(addr string) Option {
 	return func(c *config) { c.remoteAddr = addr }
+}
+
+// WithFullPath sets the route pattern (e.g., "/users/:id") on the test context.
+func WithFullPath(path string) Option {
+	return func(c *config) { c.fullPath = path }
+}
+
+// WithProtocol sets the HTTP protocol version. Use "1.1" for HTTP/1.1 or "2" for HTTP/2.
+func WithProtocol(version string) Option {
+	return func(c *config) { c.protocol = version }
+}
+
+// WithTrustedProxies sets CIDR ranges for trusted proxy ClientIP resolution.
+func WithTrustedProxies(cidrs ...string) Option {
+	return func(c *config) { c.trustedProxies = cidrs }
 }
 
 // WithHandlers sets the handler chain on the test context. This enables
@@ -284,11 +307,42 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 	}
 
 	ctx := ctxkit.NewContext(s).(*celeris.Context)
+	ctxkit.SetStartTime(ctx, time.Now())
 	for _, p := range cfg.params {
 		ctxkit.AddParam(ctx, p[0], p[1])
 	}
 	if len(cfg.handlers) > 0 {
 		ctxkit.SetHandlers(ctx, cfg.handlers)
+	}
+	if cfg.fullPath != "" {
+		ctxkit.SetFullPath(ctx, cfg.fullPath)
+	}
+	if cfg.protocol != "" {
+		switch cfg.protocol {
+		case "1.1":
+			ctxkit.SetProtoMajor(ctx, 1)
+		case "2":
+			ctxkit.SetProtoMajor(ctx, 2)
+		}
+	}
+	if len(cfg.trustedProxies) > 0 {
+		nets := make([]*net.IPNet, 0, len(cfg.trustedProxies))
+		for _, cidr := range cfg.trustedProxies {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				ip := net.ParseIP(cidr)
+				if ip == nil {
+					panic("celeristest: invalid trusted proxy: " + cidr)
+				}
+				if ip4 := ip.To4(); ip4 != nil {
+					_, ipNet, _ = net.ParseCIDR(ip4.String() + "/32")
+				} else {
+					_, ipNet, _ = net.ParseCIDR(ip.String() + "/128")
+				}
+			}
+			nets = append(nets, ipNet)
+		}
+		ctxkit.SetTrustedNets(ctx, nets)
 	}
 
 	cfg.reset()

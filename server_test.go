@@ -1398,3 +1398,65 @@ func TestServerOnErrorChaining(t *testing.T) {
 		t.Fatal("expected OnError to return *Server for chaining")
 	}
 }
+
+func TestServerOnShutdown(t *testing.T) {
+	s := New(Config{})
+	var hookFired bool
+	s.OnShutdown(func(_ context.Context) {
+		hookFired = true
+	})
+
+	// Simulate engine set by firing the startOnce.
+	s.startOnce.Do(func() {
+		s.engine = &fakeEngine{}
+	})
+
+	ctx := context.Background()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !hookFired {
+		t.Fatal("expected OnShutdown hook to fire")
+	}
+}
+
+func TestServerOnShutdownOrder(t *testing.T) {
+	s := New(Config{})
+	var order []int
+	s.OnShutdown(func(_ context.Context) { order = append(order, 1) })
+	s.OnShutdown(func(_ context.Context) { order = append(order, 2) })
+	s.OnShutdown(func(_ context.Context) { order = append(order, 3) })
+
+	s.startOnce.Do(func() {
+		s.engine = &fakeEngine{}
+	})
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 3 || order[0] != 1 || order[1] != 2 || order[2] != 3 {
+		t.Fatalf("expected [1 2 3], got %v", order)
+	}
+}
+
+func TestServerOnShutdownChaining(t *testing.T) {
+	s := New(Config{})
+	result := s.OnShutdown(func(_ context.Context) {})
+	if result != s {
+		t.Fatal("expected OnShutdown to return *Server for chaining")
+	}
+}
+
+func TestServerOnShutdownNotStarted(t *testing.T) {
+	s := New(Config{})
+	var hookFired bool
+	s.OnShutdown(func(_ context.Context) { hookFired = true })
+
+	// Shutdown without starting — should return nil and NOT fire hooks.
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if hookFired {
+		t.Fatal("hook should not fire when server was not started")
+	}
+}

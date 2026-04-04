@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
@@ -581,8 +582,15 @@ func (c *Context) ResponseStatus() int { return c.capturedStatus }
 func (c *Context) IsWritten() bool { return c.written }
 
 // BytesWritten returns the response body size in bytes, or 0 if no response
-// was written. For NoContent responses, returns 0.
-func (c *Context) BytesWritten() int { return c.bytesWritten }
+// was written. For NoContent responses, returns 0. For streamed responses
+// (via [StreamWriter]), returns the total bytes written so far (may increase
+// while streaming is in progress).
+func (c *Context) BytesWritten() int {
+	if c.streamWriter != nil {
+		return int(c.streamWriter.bytesWritten.Load())
+	}
+	return c.bytesWritten
+}
 
 // Hijack takes over the underlying TCP connection. After Hijack, the caller
 // owns the connection and is responsible for closing it. Supported on all
@@ -643,9 +651,13 @@ func (c *Context) Detach() (done func()) {
 }
 
 // StreamWriter provides incremental response writing. Obtained via [Context.StreamWriter].
+// Bytes written through the StreamWriter are tracked and reflected in
+// [Context.BytesWritten]. The counter uses atomic operations and is safe
+// for use from a detached goroutine.
 type StreamWriter struct {
-	streamer stream.Streamer
-	stream   *stream.Stream
+	streamer     stream.Streamer
+	stream       *stream.Stream
+	bytesWritten atomic.Int64
 }
 
 // WriteHeader sends the status line and headers. Must be called once before Write.
@@ -659,7 +671,14 @@ func (sw *StreamWriter) Write(data []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	sw.bytesWritten.Add(int64(len(data)))
 	return len(data), nil
+}
+
+// BytesWritten returns the total bytes written through this StreamWriter.
+// Safe for concurrent use.
+func (sw *StreamWriter) BytesWritten() int64 {
+	return sw.bytesWritten.Load()
 }
 
 // Flush ensures buffered data is sent to the network.
@@ -667,21 +686,40 @@ func (sw *StreamWriter) Flush() error {
 	return sw.streamer.Flush(sw.stream)
 }
 
-// Close signals end of the response body.
+// Close signals end of the response body and syncs the byte count back to
+// the owning Context so that [Context.BytesWritten] reflects the total.
 func (sw *StreamWriter) Close() error {
 	return sw.streamer.Close(sw.stream)
 }
 
 // StreamWriter returns a [StreamWriter] for incremental response writing.
-// Returns nil if the engine does not support streaming.
+// Returns nil if the engine does not support streaming or if buffering is
+// active (see below).
+//
+// StreamWriter is incompatible with [Context.BufferResponse] -- if buffering
+// is active, StreamWriter returns nil. Streaming writes data incrementally
+// to the wire, which cannot be deferred or replayed by a buffer layer.
+// [Context.CaptureResponse] does not capture streamed bytes.
+// [Context.IsWritten] returns true and [Context.BytesWritten] tracks bytes
+// after StreamWriter is used.
+//
 // On native engines (epoll, io_uring), the caller must call [Context.Detach]
 // before spawning a goroutine that uses the StreamWriter. Call Close() when done.
 func (c *Context) StreamWriter() *StreamWriter {
+	// Streaming is fundamentally incompatible with response buffering:
+	// buffered responses are held in memory for possible mutation/discard,
+	// but streamed bytes go directly to the wire and cannot be recalled.
+	if c.bufferDepth > 0 {
+		return nil
+	}
 	s, ok := c.stream.ResponseWriter.(stream.Streamer)
 	if !ok {
 		return nil
 	}
-	return &StreamWriter{streamer: s, stream: c.stream}
+	c.written = true
+	sw := &StreamWriter{streamer: s, stream: c.stream}
+	c.streamWriter = sw
+	return sw
 }
 
 // Attachment sets the Content-Disposition header to "attachment" with the
@@ -689,7 +727,7 @@ func (c *Context) StreamWriter() *StreamWriter {
 func (c *Context) Attachment(filename string) {
 	if filename != "" {
 		c.SetHeader("content-disposition",
-			fmt.Sprintf(`attachment; filename="%s"`, escapeQuotedString(filename)))
+			fmt.Sprintf(`attachment; filename="%s"`, EscapeQuotedString(filename)))
 	} else {
 		c.SetHeader("content-disposition", "attachment")
 	}
@@ -700,15 +738,15 @@ func (c *Context) Attachment(filename string) {
 func (c *Context) Inline(filename string) {
 	if filename != "" {
 		c.SetHeader("content-disposition",
-			fmt.Sprintf(`inline; filename="%s"`, escapeQuotedString(filename)))
+			fmt.Sprintf(`inline; filename="%s"`, EscapeQuotedString(filename)))
 	} else {
 		c.SetHeader("content-disposition", "inline")
 	}
 }
 
-// escapeQuotedString escapes backslash and double-quote for use in
-// HTTP quoted-string values (RFC 2616 §2.2).
-func escapeQuotedString(s string) string {
+// EscapeQuotedString escapes backslash and double-quote characters for use
+// in RFC 7230 quoted-string header values.
+func EscapeQuotedString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return s

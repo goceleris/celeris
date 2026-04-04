@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"mime/multipart"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -56,6 +57,18 @@ func init() {
 		}
 		return nil
 	}
+	ctxkit.SetStartTime = func(c any, t time.Time) {
+		c.(*Context).startTime = t
+	}
+	ctxkit.SetFullPath = func(c any, path string) {
+		c.(*Context).fullPath = path
+	}
+	ctxkit.SetTrustedNets = func(c any, nets []*net.IPNet) {
+		c.(*Context).trustedNets = nets
+	}
+	ctxkit.SetProtoMajor = func(c any, v uint8) {
+		c.(*Context).stream.SetProtoMajor(v)
+	}
 }
 
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
@@ -100,6 +113,7 @@ type Context struct {
 	bufferDepth  int
 	buffered     bool
 	bytesWritten int
+	streamWriter *StreamWriter
 
 	detached   bool
 	detachDone chan struct{}
@@ -111,6 +125,8 @@ type Context struct {
 	hostOverride     string
 
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
+
+	trustedNets []*net.IPNet
 
 	onRelease    []func()
 	onReleaseBuf [4]func()
@@ -125,6 +141,11 @@ var contextPool = sync.Pool{New: func() any {
 }}
 
 const abortIndex int16 = math.MaxInt16 / 2
+
+// RequestIDKey is the canonical context store key for the request ID.
+// Middleware that generates or reads request IDs should use this key
+// with [Context.Set] and [Context.Get] for interoperability.
+const RequestIDKey = "request_id"
 
 func acquireContext(s *stream.Stream) *Context {
 	var c *Context
@@ -293,6 +314,7 @@ func (c *Context) reset() {
 		}()
 	}
 	c.stream = nil
+	c.trustedNets = nil
 	c.index = -1
 	// Clear handler references so closures can be GCed, but only when
 	// the slice is owned by this context (backed by handlerBuf or a
@@ -341,6 +363,7 @@ func (c *Context) reset() {
 		c.capturedType = ""
 		c.bufferDepth = 0
 		c.buffered = false
+		c.streamWriter = nil
 		c.detached = false
 		c.detachDone = nil
 		c.clientIPOverride = ""

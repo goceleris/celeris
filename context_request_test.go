@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/textproto"
 	"strings"
 	"testing"
@@ -1549,5 +1550,76 @@ func TestContextProtocolH1(t *testing.T) {
 
 	if p := c.Protocol(); p != "1.1" {
 		t.Fatalf("expected \"1.1\" for H1 stream, got %q", p)
+	}
+}
+
+func TestClientIPTrustedProxies(t *testing.T) {
+	_, trusted, _ := net.ParseCIDR("10.0.0.0/8")
+	_, trusted2, _ := net.ParseCIDR("192.168.0.0/16")
+	nets := []*net.IPNet{trusted, trusted2}
+
+	st := stream.NewStream(1)
+	st.Headers = [][2]string{
+		{":method", "GET"},
+		{":path", "/ip"},
+		{"x-forwarded-for", "203.0.113.50, 10.0.0.1, 192.168.1.5"},
+	}
+	st.RemoteAddr = "10.0.0.2:12345"
+	rw := &mockResponseWriter{}
+	st.ResponseWriter = rw
+	defer st.Release()
+
+	c := acquireContext(st)
+	defer releaseContext(c)
+	c.trustedNets = nets
+
+	got := c.ClientIP()
+	if got != "203.0.113.50" {
+		t.Fatalf("expected 203.0.113.50, got %q", got)
+	}
+}
+
+func TestClientIPTrustedProxiesAllTrusted(t *testing.T) {
+	_, trusted, _ := net.ParseCIDR("10.0.0.0/8")
+	nets := []*net.IPNet{trusted}
+
+	st := stream.NewStream(1)
+	st.Headers = [][2]string{
+		{":method", "GET"},
+		{":path", "/ip"},
+		{"x-forwarded-for", "10.0.0.1, 10.0.0.2"},
+	}
+	st.RemoteAddr = "10.0.0.3:12345"
+	rw := &mockResponseWriter{}
+	st.ResponseWriter = rw
+	defer st.Release()
+
+	c := acquireContext(st)
+	defer releaseContext(c)
+	c.trustedNets = nets
+
+	got := c.ClientIP()
+	if got != "10.0.0.3" {
+		t.Fatalf("expected fallback to RemoteAddr 10.0.0.3, got %q", got)
+	}
+}
+
+func TestClientIPNoTrustedProxies(t *testing.T) {
+	st := stream.NewStream(1)
+	st.Headers = [][2]string{
+		{":method", "GET"},
+		{":path", "/ip"},
+		{"x-forwarded-for", "203.0.113.50, 10.0.0.1"},
+	}
+	rw := &mockResponseWriter{}
+	st.ResponseWriter = rw
+	defer st.Release()
+
+	c := acquireContext(st)
+	defer releaseContext(c)
+	// trustedNets is nil — legacy behavior: return leftmost entry.
+	got := c.ClientIP()
+	if got != "203.0.113.50" {
+		t.Fatalf("expected 203.0.113.50 (leftmost), got %q", got)
 	}
 }
