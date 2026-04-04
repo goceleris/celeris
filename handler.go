@@ -15,15 +15,12 @@ type routerAdapter struct {
 	server                *Server
 	notFoundChain         []HandlerFunc
 	methodNotAllowedChain []HandlerFunc
+	errorHandler          func(*Context, error)
 }
 
 func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
-	var start time.Time
-	if a.server.collector != nil {
-		start = time.Now()
-	}
-
 	c := acquireContext(s)
+	c.startTime = time.Now()
 
 	if a.server.config.MaxFormSize != 0 {
 		c.maxFormSize = a.server.config.MaxFormSize
@@ -35,7 +32,7 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 
 	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
 
-	defer a.recoverAndRelease(c, s, start)
+	defer a.recoverAndRelease(c, s)
 
 	if handlers == nil {
 		a.handleUnmatched(c, s)
@@ -60,7 +57,7 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 // by the deferred closure and debug.Stack() call (P5).
 //
 //go:noinline
-func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream, start time.Time) {
+func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 	if r := recover(); r != nil {
 		a.handlePanic(c, s, r)
 	}
@@ -72,7 +69,7 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream, start ti
 				if status == 0 {
 					status = 200
 				}
-				a.server.collector.RecordRequest(time.Since(start), status)
+				a.server.collector.RecordRequest(time.Since(c.startTime), status)
 			}
 			releaseContext(c)
 		}()
@@ -83,7 +80,7 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream, start ti
 		if status == 0 {
 			status = 200
 		}
-		a.server.collector.RecordRequest(time.Since(start), status)
+		a.server.collector.RecordRequest(time.Since(c.startTime), status)
 	}
 	releaseContext(c)
 }
@@ -151,6 +148,12 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 	if err == nil || c.written {
 		return
+	}
+	if a.errorHandler != nil {
+		a.errorHandler(c, err)
+		if c.written {
+			return
+		}
 	}
 	var he *HTTPError
 	if errors.As(err, &he) {

@@ -1519,3 +1519,35 @@ func TestFormValueOkDeprecated(t *testing.T) {
 		t.Fatal("expected missing field to return false")
 	}
 }
+
+func TestContextProtocolH2(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if p := c.Protocol(); p != "2" {
+		t.Fatalf("expected \"2\" for default H2 stream, got %q", p)
+	}
+}
+
+func TestContextProtocolH1(t *testing.T) {
+	s := stream.NewH1Stream(1)
+	s.Headers = [][2]string{
+		{":method", "GET"},
+		{":path", "/test"},
+		{":scheme", "http"},
+		{":authority", "localhost"},
+	}
+	rw := &mockResponseWriter{}
+	s.ResponseWriter = rw
+	defer s.Release()
+
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	if p := c.Protocol(); p != "1.1" {
+		t.Fatalf("expected \"1.1\" for H1 stream, got %q", p)
+	}
+}

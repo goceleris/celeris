@@ -1314,3 +1314,87 @@ func TestPauseAcceptNotStarted(t *testing.T) {
 		t.Fatalf("expected ErrAcceptControlNotSupported, got %v", err)
 	}
 }
+
+func TestServerOnErrorHTTPError(t *testing.T) {
+	s := New(Config{})
+	s.OnError(func(c *Context, err error) {
+		var he *HTTPError
+		code := 500
+		msg := "internal"
+		if errors.As(err, &he) {
+			code = he.Code
+			msg = he.Message
+		}
+		_ = c.JSON(code, map[string]string{"error": msg})
+	})
+	s.GET("/fail", func(_ *Context) error {
+		return NewHTTPError(422, "validation failed")
+	})
+
+	adapter := &routerAdapter{server: s, errorHandler: s.errorHandler}
+
+	st, rw := newTestStream("GET", "/fail")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 422 {
+		t.Fatalf("expected 422, got %d", rw.status)
+	}
+	if !contains(rw.body, "validation failed") {
+		t.Fatalf("expected JSON with 'validation failed', got %s", string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerOnErrorNilHandler(t *testing.T) {
+	s := New(Config{})
+	s.GET("/fail", func(_ *Context) error {
+		return NewHTTPError(400, "bad request")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/fail")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 400 {
+		t.Fatalf("expected 400, got %d", rw.status)
+	}
+	if string(rw.body) != "bad request" {
+		t.Fatalf("expected text/plain 'bad request', got %q", string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerOnErrorNoWrite(t *testing.T) {
+	s := New(Config{})
+	s.OnError(func(_ *Context, _ error) {
+		// Deliberately do nothing — default fallback should apply.
+	})
+	s.GET("/fail", func(_ *Context) error {
+		return fmt.Errorf("something broke")
+	})
+
+	adapter := &routerAdapter{server: s, errorHandler: s.errorHandler}
+
+	st, rw := newTestStream("GET", "/fail")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 500 {
+		t.Fatalf("expected 500 fallback, got %d", rw.status)
+	}
+	if string(rw.body) != "Internal Server Error" {
+		t.Fatalf("expected 'Internal Server Error' fallback, got %q", string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerOnErrorChaining(t *testing.T) {
+	s := New(Config{})
+	result := s.OnError(func(_ *Context, _ error) {})
+	if result != s {
+		t.Fatal("expected OnError to return *Server for chaining")
+	}
+}

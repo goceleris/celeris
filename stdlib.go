@@ -62,6 +62,7 @@ func ToHandler(h HandlerFunc) http.Handler {
 		}
 
 		s.RemoteAddr = r.RemoteAddr
+		s.SetProtoMajor(uint8(r.ProtoMajor))
 		s.EndStream = true
 		s.SetState(stream.StateHalfClosedRemote)
 
