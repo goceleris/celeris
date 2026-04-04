@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
@@ -70,7 +71,17 @@ func ToHandler(h HandlerFunc) http.Handler {
 		s.ResponseWriter = rw
 
 		c := acquireContext(s)
-		defer releaseContext(c)
+		c.startTime = time.Now()
+		defer func() {
+			if rv := recover(); rv != nil {
+				if !rw.flushed {
+					c.statusCode = 500
+					w.WriteHeader(500)
+					_, _ = w.Write([]byte("Internal Server Error"))
+				}
+			}
+			releaseContext(c)
+		}()
 
 		c.handlers = []HandlerFunc{h}
 		if err := c.Next(); err != nil {

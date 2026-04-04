@@ -402,9 +402,11 @@ func (c *Context) clientIPFromTrustedXFF(xff string) string {
 			}
 			return addr
 		}
-		// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to IPv4 so that
-		// trusted nets in either form match correctly. net.IPNet.Contains
-		// does not cross-match 4-byte and 16-byte representations.
+		// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) and IPv4-compatible
+		// IPv6 (::x.x.x.x, deprecated RFC 4291) to IPv4 so that trusted
+		// nets in either form match correctly. Go's IP.To4() handles both
+		// forms. net.IPNet.Contains does not cross-match 4-byte and 16-byte
+		// representations, so we check both.
 		ip4 := ip.To4()
 		trusted := false
 		for _, n := range c.trustedNets {

@@ -304,6 +304,7 @@ func (c *Context) reset() {
 		}()
 	}
 	c.stream = nil
+	c.trustedNets = nil
 	c.index = -1
 	// Clear handler references so closures can be GCed, but only when
 	// the slice is owned by this context (backed by handlerBuf or a
