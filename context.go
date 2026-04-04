@@ -132,6 +132,11 @@ var contextPool = sync.Pool{New: func() any {
 
 const abortIndex int16 = math.MaxInt16 / 2
 
+// RequestIDKey is the canonical context store key for the request ID.
+// Middleware that generates or reads request IDs should use this key
+// with [Context.Set] and [Context.Get] for interoperability.
+const RequestIDKey = "request_id"
+
 func acquireContext(s *stream.Stream) *Context {
 	var c *Context
 	if s.CachedCtx != nil {

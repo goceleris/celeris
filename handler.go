@@ -101,6 +101,7 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 	if !c.written && s.ResponseWriter != nil {
 		_ = s.ResponseWriter.WriteResponse(s, 500, [][2]string{
 			{"content-type", "text/plain"},
+			{"cache-control", "no-store"},
 		}, []byte("Internal Server Error"))
 		c.written = true
 	}
