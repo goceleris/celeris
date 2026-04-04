@@ -309,6 +309,74 @@ func TestContextKeys(t *testing.T) {
 	}
 }
 
+func TestOnReleaseFiresOnRelease(t *testing.T) {
+	s, _ := newTestStream("GET", "/release")
+	defer s.Release()
+
+	c := acquireContext(s)
+	var fired bool
+	c.OnRelease(func() { fired = true })
+	releaseContext(c)
+
+	if !fired {
+		t.Fatal("expected OnRelease callback to fire during releaseContext")
+	}
+}
+
+func TestOnReleaseLIFOOrder(t *testing.T) {
+	s, _ := newTestStream("GET", "/lifo")
+	defer s.Release()
+
+	c := acquireContext(s)
+	var order []int
+	c.OnRelease(func() { order = append(order, 1) })
+	c.OnRelease(func() { order = append(order, 2) })
+	c.OnRelease(func() { order = append(order, 3) })
+	releaseContext(c)
+
+	if len(order) != 3 || order[0] != 3 || order[1] != 2 || order[2] != 1 {
+		t.Fatalf("expected LIFO order [3 2 1], got %v", order)
+	}
+}
+
+func TestOnReleasePanicRecovery(t *testing.T) {
+	s, _ := newTestStream("GET", "/panic-release")
+	defer s.Release()
+
+	c := acquireContext(s)
+	var normalFired bool
+	c.OnRelease(func() { normalFired = true })
+	c.OnRelease(func() { panic("boom") })
+	releaseContext(c)
+
+	if !normalFired {
+		t.Fatal("expected normal callback to fire even after panic in another")
+	}
+}
+
+func TestOnReleaseResetClearsCallbacks(t *testing.T) {
+	s, _ := newTestStream("GET", "/clear")
+	defer s.Release()
+
+	c := acquireContext(s)
+	callCount := 0
+	c.OnRelease(func() { callCount++ })
+	releaseContext(c)
+
+	if callCount != 1 {
+		t.Fatalf("expected 1 call, got %d", callCount)
+	}
+
+	// Re-acquire and release again without registering new callbacks.
+	// The callback must NOT fire a second time.
+	c2 := acquireContext(s)
+	releaseContext(c2)
+
+	if callCount != 1 {
+		t.Fatalf("expected callback count to remain 1 after reuse, got %d", callCount)
+	}
+}
+
 func TestHandleUnmatchedFallback(t *testing.T) {
 	// Custom 404 handler that returns nil without writing should fall back
 	// to default response.
@@ -327,5 +395,24 @@ func TestHandleUnmatchedFallback(t *testing.T) {
 
 	if rw.status != 404 {
 		t.Fatalf("expected 404 fallback response, got %d", rw.status)
+	}
+}
+
+func TestContextStartTime(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	before := time.Now()
+	c := acquireContext(s)
+	c.startTime = time.Now()
+	after := time.Now()
+	defer releaseContext(c)
+
+	st := c.StartTime()
+	if st.IsZero() {
+		t.Fatal("expected non-zero StartTime")
+	}
+	if st.Before(before) || st.After(after) {
+		t.Fatalf("StartTime %v not within bracket [%v, %v]", st, before, after)
 	}
 }

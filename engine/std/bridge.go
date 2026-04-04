@@ -79,6 +79,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.RemoteAddr = r.RemoteAddr
+	s.SetProtoMajor(uint8(r.ProtoMajor))
 	s.EndStream = true
 	s.SetState(stream.StateHalfClosedRemote)
 

@@ -565,6 +565,15 @@ func (c *Context) IsTLS() bool {
 	return c.Scheme() == "https"
 }
 
+// Protocol returns the HTTP protocol version: "1.1" for HTTP/1.1 or "2"
+// for HTTP/2. Values match the OTel network.protocol.version convention.
+func (c *Context) Protocol() string {
+	if c.stream.ProtoMajor() == 1 {
+		return "1.1"
+	}
+	return "2"
+}
+
 // AcceptsEncodings returns the best matching encoding from the Accept-Encoding
 // header, or empty string if none match.
 func (c *Context) AcceptsEncodings(offers ...string) string {

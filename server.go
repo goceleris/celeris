@@ -55,6 +55,7 @@ type Server struct {
 
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
+	errorHandler            func(*Context, error)
 
 	startOnce sync.Once
 	startErr  error
@@ -143,6 +144,15 @@ func (s *Server) NotFound(handler HandlerFunc) *Server {
 // but the HTTP method does not. The Allow header is set automatically.
 func (s *Server) MethodNotAllowed(handler HandlerFunc) *Server {
 	s.methodNotAllowedHandler = handler
+	return s
+}
+
+// OnError registers a global error handler called when an unhandled error
+// reaches the safety net after all middleware has had its chance. The handler
+// should write a response. If it does not write, the default text/plain
+// fallback applies. Must be called before Start.
+func (s *Server) OnError(handler func(c *Context, err error)) *Server {
+	s.errorHandler = handler
 	return s
 }
 
@@ -382,6 +392,7 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		if s.methodNotAllowedHandler != nil {
 			ra.methodNotAllowedChain = []HandlerFunc{s.methodNotAllowedHandler}
 		}
+		ra.errorHandler = s.errorHandler
 		var handler stream.Handler = ra
 		var err error
 		eng, err = createEngine(cfg, handler)
