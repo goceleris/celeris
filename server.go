@@ -310,7 +310,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	err := s.engine.Shutdown(ctx)
 	for _, fn := range s.shutdownHooks {
-		fn(ctx)
+		func() {
+			defer func() { _ = recover() }()
+			fn(ctx)
+		}()
 	}
 	return err
 }
@@ -501,7 +504,7 @@ func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listene
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = eng.Shutdown(shutCtx)
+		_ = s.Shutdown(shutCtx)
 	}()
 
 	return eng.Listen(ctx)
@@ -547,7 +550,7 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = eng.Shutdown(shutCtx)
+		_ = s.Shutdown(shutCtx)
 	}()
 
 	return eng.Listen(ctx)

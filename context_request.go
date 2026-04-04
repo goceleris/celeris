@@ -394,7 +394,13 @@ func (c *Context) clientIPFromTrustedXFF(xff string) string {
 		}
 		ip := net.ParseIP(raw)
 		if ip == nil {
-			continue
+			// Malformed entry — do not skip into attacker-controlled
+			// entries further left. Fall back to RemoteAddr.
+			addr := c.RemoteAddr()
+			if host, _, err := net.SplitHostPort(addr); err == nil {
+				return host
+			}
+			return addr
 		}
 		trusted := false
 		for _, n := range c.trustedNets {
