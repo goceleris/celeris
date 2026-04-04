@@ -555,6 +555,19 @@ func (c *Context) FlushResponse() error {
 	return c.Blob(c.capturedStatus, c.capturedType, c.capturedBody)
 }
 
+// DiscardBufferedResponse decrements the buffer depth and clears any captured
+// response data without writing to the wire. Used by timeout middleware to
+// discard a stale buffered response before writing an error response.
+func (c *Context) DiscardBufferedResponse() {
+	if c.bufferDepth > 0 {
+		c.bufferDepth--
+	}
+	c.buffered = false
+	c.capturedBody = c.capturedBody[:0]
+	c.capturedStatus = 0
+	c.capturedType = ""
+}
+
 // SetResponseBody replaces the buffered response body. Only valid after
 // BufferResponse + c.Next(). Used by transform middleware (compress, etc.).
 func (c *Context) SetResponseBody(body []byte) {

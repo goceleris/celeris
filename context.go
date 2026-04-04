@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -68,6 +69,7 @@ type Context struct {
 	paramBuf   [4]Param
 	keys       map[string]any
 	ctx        context.Context
+	startTime  time.Time
 
 	method   string
 	path     string
@@ -109,12 +111,16 @@ type Context struct {
 	hostOverride     string
 
 	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
+
+	onRelease    []func()
+	onReleaseBuf [4]func()
 }
 
 var contextPool = sync.Pool{New: func() any {
 	c := &Context{keys: make(map[string]any, 4)}
 	c.params = c.paramBuf[:0]
 	c.respHeaders = c.respHdrBuf[:0]
+	c.onRelease = c.onReleaseBuf[:0]
 	return c
 }}
 
@@ -240,6 +246,11 @@ func (c *Context) SetContext(ctx context.Context) {
 	c.ctx = ctx
 }
 
+// StartTime returns the time at which request processing began. Set once by
+// the framework before the handler chain runs, so all middleware share the
+// same timestamp without calling time.Now() independently.
+func (c *Context) StartTime() time.Time { return c.startTime }
+
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
 	c.extended = true
@@ -265,7 +276,22 @@ func (c *Context) Keys() map[string]any {
 	return cp
 }
 
+// OnRelease registers a function to be called when this Context is released
+// back to the pool. Callbacks fire in LIFO order (like defer), before fields
+// are cleared, so context state is still accessible. Panics in callbacks are
+// recovered and silently discarded.
+func (c *Context) OnRelease(fn func()) {
+	c.extended = true
+	c.onRelease = append(c.onRelease, fn)
+}
+
 func (c *Context) reset() {
+	for i := len(c.onRelease) - 1; i >= 0; i-- {
+		func() {
+			defer func() { _ = recover() }()
+			c.onRelease[i]()
+		}()
+	}
 	c.stream = nil
 	c.index = -1
 	// Clear handler references so closures can be GCed, but only when
@@ -320,6 +346,10 @@ func (c *Context) reset() {
 		c.clientIPOverride = ""
 		c.schemeOverride = ""
 		c.hostOverride = ""
+		for i := range c.onRelease {
+			c.onRelease[i] = nil
+		}
+		c.onRelease = c.onReleaseBuf[:0]
 		c.extended = false
 	}
 }

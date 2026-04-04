@@ -55,7 +55,8 @@ type Stream struct {
 	ReceivedInitialHeaders bool
 	ClosedByReset          bool
 	IsHEAD                 bool
-	h1Mode                 bool // single-threaded H1 stream; skip mutex in GetHeaders
+	h1Mode                 bool  // single-threaded H1 stream; skip mutex in GetHeaders
+	protoMajor             uint8 // 0=infer from h1Mode, 1=HTTP/1.1, 2=HTTP/2
 	flags                  atomic.Uint32
 	doneCh                 atomic.Pointer[chan struct{}]
 	phase                  Phase
@@ -130,6 +131,20 @@ func (s *Stream) GetBuf() *bytes.Buffer {
 
 // IsH1 returns true if this is an H1 stream (single-threaded, persistent per connection).
 func (s *Stream) IsH1() bool { return s.h1Mode }
+
+// ProtoMajor returns the HTTP major version (1 or 2).
+func (s *Stream) ProtoMajor() uint8 {
+	if s.protoMajor != 0 {
+		return s.protoMajor
+	}
+	if s.h1Mode {
+		return 1
+	}
+	return 2
+}
+
+// SetProtoMajor sets the HTTP major version explicitly.
+func (s *Stream) SetProtoMajor(v uint8) { s.protoMajor = v }
 
 // Context returns the stream's context.
 func (s *Stream) Context() context.Context {
@@ -213,6 +228,7 @@ func (s *Stream) resetAndPool() {
 	s.ClosedByReset = false
 	s.IsHEAD = false
 	s.h1Mode = false
+	s.protoMajor = 0
 	s.flags.Store(0)
 	s.doneCh.Store(nil)
 	s.phase = 0
@@ -273,6 +289,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	s.ClosedByReset = false
 	s.IsHEAD = false
 	s.h1Mode = false
+	s.protoMajor = 0
 	s.flags.Store(0)
 	s.doneCh.Store(nil)
 	s.phase = PhaseInit

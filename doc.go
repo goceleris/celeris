@@ -52,9 +52,8 @@
 //
 //	func timing() celeris.HandlerFunc {
 //	    return func(c *celeris.Context) error {
-//	        start := time.Now()
 //	        err := c.Next()
-//	        elapsed := time.Since(start)
+//	        elapsed := time.Since(c.StartTime())
 //	        c.SetHeader("x-response-time", elapsed.String())
 //	        return err
 //	    }
@@ -83,6 +82,27 @@
 //	    }
 //	    return nil
 //	})
+//
+// # Global Error Handler
+//
+// Register a global error handler with Server.OnError. This is called when
+// an unhandled error reaches the safety net after all middleware has had its
+// chance. Use it to render structured error responses (e.g. JSON) instead of
+// the default text/plain fallback:
+//
+//	s.OnError(func(c *celeris.Context, err error) {
+//	    var he *celeris.HTTPError
+//	    code := 500
+//	    msg := "internal server error"
+//	    if errors.As(err, &he) {
+//	        code = he.Code
+//	        msg = he.Message
+//	    }
+//	    c.JSON(code, map[string]string{"error": msg})
+//	})
+//
+// If the handler does not write a response, the default text/plain fallback
+// applies. OnError must be called before Start.
 //
 // # Custom 404 / 405 Handlers
 //
