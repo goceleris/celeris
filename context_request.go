@@ -402,9 +402,13 @@ func (c *Context) clientIPFromTrustedXFF(xff string) string {
 			}
 			return addr
 		}
+		// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to IPv4 so that
+		// trusted nets in either form match correctly. net.IPNet.Contains
+		// does not cross-match 4-byte and 16-byte representations.
+		ip4 := ip.To4()
 		trusted := false
 		for _, n := range c.trustedNets {
-			if n.Contains(ip) {
+			if n.Contains(ip) || (ip4 != nil && n.Contains(ip4)) {
 				trusted = true
 				break
 			}
