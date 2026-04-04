@@ -132,8 +132,8 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if total <= len(c.respHdrBuf) {
 		// respHeaders shares backing array with respHdrBuf — copy user
 		// headers to a stack temporary before overwriting the buffer.
-		// Max user headers in fast path: len(respHdrBuf) - 2 = 6.
-		var tmp [6][2]string
+		// Max user headers in fast path: len(respHdrBuf) - 2 = 14.
+		var tmp [14][2]string
 		copy(tmp[:nUser], c.respHeaders)
 		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
 		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})

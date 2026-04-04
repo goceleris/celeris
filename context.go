@@ -15,60 +15,50 @@ import (
 )
 
 func init() {
-	ctxkit.NewContext = func(s *stream.Stream) any {
-		return acquireContext(s)
-	}
+	// internal/conn/h1.go needs to release cached contexts on connection close
+	// but cannot import the root package (circular dependency). This single
+	// hook is the only remaining ctxkit indirection.
 	ctxkit.ReleaseContext = func(c any) {
 		releaseContext(c.(*Context))
 	}
-	ctxkit.AddParam = func(c any, key, value string) {
-		ctx := c.(*Context)
-		ctx.params = append(ctx.params, Param{Key: key, Value: value})
+}
+
+// AcquireTestContext returns a Context from the pool, bound to the given Stream.
+// This is intended for test helpers only; production code uses HandleStream.
+func AcquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
+
+// ReleaseTestContext returns a Context to the pool, firing OnRelease callbacks.
+func ReleaseTestContext(c *Context) { releaseContext(c) }
+
+// TestStream returns the underlying stream, or nil. Test helpers only.
+func TestStream(c *Context) *stream.Stream { return c.stream }
+
+// SetTestStartTime sets the start time on a test context.
+func SetTestStartTime(c *Context, t time.Time) { c.startTime = t }
+
+// SetTestFullPath sets the full path on a test context.
+func SetTestFullPath(c *Context, path string) { c.fullPath = path }
+
+// SetTestTrustedNets sets the trusted proxy networks on a test context.
+func SetTestTrustedNets(c *Context, nets []*net.IPNet) { c.trustedNets = nets }
+
+// AddTestParam appends a route parameter to a test context.
+func AddTestParam(c *Context, key, value string) {
+	c.params = append(c.params, Param{Key: key, Value: value})
+}
+
+// SetTestHandlers installs a handler chain on a test context, using the
+// inline handlerBuf when the chain is small enough.
+func SetTestHandlers(c *Context, handlers []HandlerFunc) {
+	n := len(handlers)
+	if n <= len(c.handlerBuf) {
+		copy(c.handlerBuf[:n], handlers)
+		c.handlers = c.handlerBuf[:n]
+	} else {
+		c.handlers = make([]HandlerFunc, n)
+		copy(c.handlers, handlers)
 	}
-	ctxkit.SetHandlers = func(c any, handlers []any) {
-		ctx := c.(*Context)
-		n := len(handlers)
-		var chain []HandlerFunc
-		if n <= len(ctx.handlerBuf) {
-			for i, h := range handlers {
-				ctx.handlerBuf[i] = h.(HandlerFunc)
-			}
-			chain = ctx.handlerBuf[:n]
-		} else {
-			chain = make([]HandlerFunc, n)
-			for i, h := range handlers {
-				chain[i] = h.(HandlerFunc)
-			}
-		}
-		ctx.handlers = chain
-		ctx.index = -1
-	}
-	ctxkit.GetResponseWriter = func(c any) any {
-		ctx := c.(*Context)
-		if ctx.stream != nil {
-			return ctx.stream.ResponseWriter
-		}
-		return nil
-	}
-	ctxkit.GetStream = func(c any) any {
-		ctx := c.(*Context)
-		if ctx.stream != nil {
-			return ctx.stream
-		}
-		return nil
-	}
-	ctxkit.SetStartTime = func(c any, t time.Time) {
-		c.(*Context).startTime = t
-	}
-	ctxkit.SetFullPath = func(c any, path string) {
-		c.(*Context).fullPath = path
-	}
-	ctxkit.SetTrustedNets = func(c any, nets []*net.IPNet) {
-		c.(*Context).trustedNets = nets
-	}
-	ctxkit.SetProtoMajor = func(c any, v uint8) {
-		c.(*Context).stream.SetProtoMajor(v)
-	}
+	c.index = -1
 }
 
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
@@ -124,7 +114,7 @@ type Context struct {
 	schemeOverride   string
 	hostOverride     string
 
-	respHdrBuf [8][2]string // reusable buffer for response headers (avoids heap escape)
+	respHdrBuf [16][2]string // reusable buffer for response headers (avoids heap escape)
 
 	trustedNets []*net.IPNet
 

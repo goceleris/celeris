@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
@@ -216,18 +215,15 @@ func WithHandlers(handlers ...celeris.HandlerFunc) Option {
 // be used after this call.
 func ReleaseContext(ctx *celeris.Context) {
 	// Extract stream and recorder before releasing context (reset nils them).
-	var s *stream.Stream
-	if raw := ctxkit.GetStream(ctx); raw != nil {
-		s = raw.(*stream.Stream)
-	}
+	s := celeris.TestStream(ctx)
 	var combo *recorderCombo
-	if rw := ctxkit.GetResponseWriter(ctx); rw != nil {
-		if w, ok := rw.(*recorderWriter); ok && w.combo != nil {
+	if s != nil {
+		if w, ok := s.ResponseWriter.(*recorderWriter); ok && w.combo != nil {
 			combo = w.combo
 		}
 	}
 
-	ctxkit.ReleaseContext(ctx)
+	celeris.ReleaseTestContext(ctx)
 
 	// Return stream to pool so NewStream reuses it on the next call.
 	if s != nil {
@@ -306,24 +302,29 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		s.RemoteAddr = cfg.remoteAddr
 	}
 
-	ctx := ctxkit.NewContext(s).(*celeris.Context)
-	ctxkit.SetStartTime(ctx, time.Now())
-	for _, p := range cfg.params {
-		ctxkit.AddParam(ctx, p[0], p[1])
-	}
-	if len(cfg.handlers) > 0 {
-		ctxkit.SetHandlers(ctx, cfg.handlers)
-	}
-	if cfg.fullPath != "" {
-		ctxkit.SetFullPath(ctx, cfg.fullPath)
-	}
 	if cfg.protocol != "" {
 		switch cfg.protocol {
 		case "1.1":
-			ctxkit.SetProtoMajor(ctx, 1)
+			s.SetProtoMajor(1)
 		case "2":
-			ctxkit.SetProtoMajor(ctx, 2)
+			s.SetProtoMajor(2)
 		}
+	}
+
+	ctx := celeris.AcquireTestContext(s)
+	celeris.SetTestStartTime(ctx, time.Now())
+	for _, p := range cfg.params {
+		celeris.AddTestParam(ctx, p[0], p[1])
+	}
+	if len(cfg.handlers) > 0 {
+		chain := make([]celeris.HandlerFunc, len(cfg.handlers))
+		for i, h := range cfg.handlers {
+			chain[i] = h.(celeris.HandlerFunc)
+		}
+		celeris.SetTestHandlers(ctx, chain)
+	}
+	if cfg.fullPath != "" {
+		celeris.SetTestFullPath(ctx, cfg.fullPath)
 	}
 	if len(cfg.trustedProxies) > 0 {
 		nets := make([]*net.IPNet, 0, len(cfg.trustedProxies))
@@ -342,7 +343,7 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 			}
 			nets = append(nets, ipNet)
 		}
-		ctxkit.SetTrustedNets(ctx, nets)
+		celeris.SetTestTrustedNets(ctx, nets)
 	}
 
 	cfg.reset()
