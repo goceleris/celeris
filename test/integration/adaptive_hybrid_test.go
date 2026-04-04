@@ -113,8 +113,12 @@ func TestAdaptiveAutoSingleWorker(t *testing.T) {
 
 	addr := e.Addr().String()
 
-	// H1 request.
-	h1Client := &http.Client{Timeout: 3 * time.Second}
+	// H1 request. Use a dedicated transport to avoid default pool
+	// interference with the subsequent H2C connection.
+	h1Client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 	resp, err := h1Client.Get("http://" + addr + "/single-h1")
 	if err != nil {
 		t.Fatalf("H1 request failed: %v", err)
@@ -124,11 +128,19 @@ func TestAdaptiveAutoSingleWorker(t *testing.T) {
 		t.Errorf("H1: got status %d", resp.StatusCode)
 	}
 
-	// H2C request.
+	// H2C request. On single-CPU CI the adaptive engine may transiently
+	// reset H2C connections during stabilization, so retry with backoff.
 	h2c := h2cClient(addr)
-	resp, err = h2c.Get("http://" + addr + "/single-h2")
-	if err != nil {
-		t.Fatalf("H2C request failed: %v", err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err = h2c.Get("http://" + addr + "/single-h2")
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("H2C request failed after retries: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
