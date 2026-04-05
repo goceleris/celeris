@@ -361,7 +361,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		sess.ctx = reqCtx
 		sess.expiry = idleTimeout
 		sess.keyGen = keyGen
-		sess.data = make(map[string]any)
+		sess.data = nil // set from store.Get or make below
 		sess.id = ""
 		sess.modified = false
 		sess.destroyed = false
@@ -425,6 +425,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		if !loaded {
 			sess.id = keyGen()
 			sess.fresh = true
+			sess.data = make(map[string]any)
 			if !absDisabled {
 				sess.data[absExpKey] = time.Now().UnixNano()
 			}

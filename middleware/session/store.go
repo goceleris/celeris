@@ -126,13 +126,10 @@ func (m *memoryStore) Get(_ context.Context, id string) (map[string]any, error) 
 		s.mu.Unlock()
 		return nil, nil
 	}
-	// Return a shallow copy so callers cannot mutate the store's map.
-	cp := make(map[string]any, len(item.data))
-	for k, v := range item.data {
-		cp[k] = v
-	}
+	// Return directly; caller owns the map until Save copies it back.
+	data := item.data
 	s.mu.Unlock()
-	return cp, nil
+	return data, nil
 }
 
 func (m *memoryStore) Save(_ context.Context, id string, data map[string]any, expiry time.Duration) error {

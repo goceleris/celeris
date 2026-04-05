@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +28,51 @@ type Header struct {
 	Alg string `json:"alg"`
 	Kid string `json:"kid,omitempty"`
 	Typ string `json:"typ,omitempty"`
+}
+
+var tokenPool = sync.Pool{New: func() any { return &Token{} }}
+
+func acquireToken() *Token {
+	t := tokenPool.Get().(*Token)
+	t.Raw = ""
+	t.Header = Header{}
+	t.Claims = nil
+	t.Method = nil
+	t.Signature = nil
+	t.Valid = false
+	return t
+}
+
+// ReleaseToken returns a Token to the pool for reuse.
+func ReleaseToken(t *Token) {
+	if t == nil {
+		return
+	}
+	t.Raw = ""
+	t.Header = Header{}
+	t.Claims = nil
+	t.Method = nil
+	t.Signature = nil
+	t.Valid = false
+	tokenPool.Put(t)
+}
+
+var mapClaimsPool = sync.Pool{New: func() any { return make(MapClaims, 8) }}
+
+// AcquireMapClaims returns a cleared MapClaims from the pool.
+func AcquireMapClaims() MapClaims {
+	m := mapClaimsPool.Get().(MapClaims)
+	clear(m)
+	return m
+}
+
+// ReleaseMapClaims returns a MapClaims to the pool for reuse.
+func ReleaseMapClaims(m MapClaims) {
+	if m == nil {
+		return
+	}
+	clear(m)
+	mapClaimsPool.Put(m)
 }
 
 // Keyfunc is called during parsing to supply the key for signature verification.
@@ -215,12 +261,11 @@ func (p *Parser) ParseWithClaims(tokenString string, claims Claims, keyFunc Keyf
 	sig := sigBytes
 
 	// 7. Build token, call keyfunc.
-	token := &Token{
-		Raw:    tokenString,
-		Header: header,
-		Claims: claims,
-		Method: method,
-	}
+	token := acquireToken()
+	token.Raw = tokenString
+	token.Header = header
+	token.Claims = claims
+	token.Method = method
 
 	key, err := keyFunc(token)
 	if err != nil {

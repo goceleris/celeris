@@ -105,6 +105,17 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.Set(tokenCtxKey, token)
 		c.Set(claimsCtxKey, token.Claims)
 
+		c.OnRelease(func() {
+			if v, ok := c.Get(tokenCtxKey); ok {
+				if t, ok := v.(*jwtparse.Token); ok {
+					if m, ok := t.Claims.(jwtparse.MapClaims); ok {
+						jwtparse.ReleaseMapClaims(m)
+					}
+					jwtparse.ReleaseToken(t)
+				}
+			}
+		})
+
 		if successHandler != nil {
 			successHandler(c)
 		}
@@ -174,7 +185,7 @@ func newClaims(factory func() jwtparse.Claims, template jwtparse.Claims) jwtpars
 func cloneClaims(template jwtparse.Claims) jwtparse.Claims {
 	switch template.(type) {
 	case jwtparse.MapClaims:
-		return make(jwtparse.MapClaims, 8)
+		return jwtparse.AcquireMapClaims()
 	case *jwtparse.RegisteredClaims:
 		return &jwtparse.RegisteredClaims{}
 	default:

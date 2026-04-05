@@ -24,21 +24,29 @@ func fill() {
 }
 
 // HexToken returns a cryptographically random hex string of n*2 characters
-// (n random bytes, hex-encoded).
+// (n random bytes, hex-encoded). Uses a stack buffer for n<=32 (the common
+// case) to avoid the intermediate byte slice allocation.
 func HexToken(n int) string {
-	out := make([]byte, n)
 	if n > bufSize {
+		out := make([]byte, n)
 		if _, err := rand.Read(out); err != nil {
 			panic("randutil: crypto/rand failed: " + err.Error())
 		}
 		return hex.EncodeToString(out)
 	}
+	var hexBuf [64]byte // stack buffer for tokens <= 32 bytes
+	var dst []byte
+	if n*2 <= len(hexBuf) {
+		dst = hexBuf[:n*2]
+	} else {
+		dst = make([]byte, n*2)
+	}
 	mu.Lock()
 	if pos+n > bufSize {
 		fill()
 	}
-	copy(out, buf[pos:pos+n])
+	hex.Encode(dst, buf[pos:pos+n])
 	pos += n
 	mu.Unlock()
-	return hex.EncodeToString(out)
+	return string(dst)
 }

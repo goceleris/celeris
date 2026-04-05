@@ -65,6 +65,7 @@ func New(config ...Config) celeris.HandlerFunc {
 	gen := cfg.Generator
 	trustProxy := !cfg.DisableTrustProxy
 	skip := cfg.Skip
+	enableStdCtx := cfg.EnableStdContext
 
 	fallbackGen := defaultGenerator.UUID
 
@@ -107,7 +108,9 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		c.SetHeader(header, id)
 		c.Set(ContextKey, id)
-		c.SetContext(context.WithValue(c.Context(), stdContextKey{}, id))
+		if enableStdCtx {
+			c.SetContext(context.WithValue(c.Context(), stdContextKey{}, id))
+		}
 
 		return c.Next()
 	}

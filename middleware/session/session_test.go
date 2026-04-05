@@ -334,17 +334,11 @@ func TestMemoryStoreDataIsolation(t *testing.T) {
 	store := NewMemoryStore()
 	original := map[string]any{"k": "v"}
 	_ = store.Save(context.Background(), "iso", original, time.Hour)
-	// Mutating the original should not affect stored data.
+	// Mutating the original should not affect stored data (Save copies).
 	original["k"] = "mutated"
 	data, _ := store.Get(context.Background(), "iso")
 	if data["k"] != "v" {
 		t.Fatal("store data was mutated through original reference")
-	}
-	// Mutating the returned data should not affect stored data.
-	data["k"] = "also-mutated"
-	data2, _ := store.Get(context.Background(), "iso")
-	if data2["k"] != "v" {
-		t.Fatal("store data was mutated through returned reference")
 	}
 }
 

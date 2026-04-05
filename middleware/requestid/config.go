@@ -20,6 +20,14 @@ type Config struct {
 	// and always generates a fresh ID. This prevents request ID spoofing
 	// from untrusted clients. Default: false (inbound headers are trusted).
 	DisableTrustProxy bool
+
+	// EnableStdContext, when true, stores the request ID in the stdlib
+	// context.Context via context.WithValue, making it available to
+	// downstream code that only has access to context.Context (e.g.,
+	// database drivers, gRPC interceptors). This adds one allocation
+	// per request. Default: false (request ID stored only in celeris
+	// Context store).
+	EnableStdContext bool
 }
 
 // defaultConfig is the default request ID configuration.

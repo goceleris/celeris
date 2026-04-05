@@ -561,7 +561,7 @@ func TestDisableTrustProxyTrueContextStore(t *testing.T) {
 // --- FromStdContext tests ---
 
 func TestFromStdContextReturnsID(t *testing.T) {
-	mw := New()
+	mw := New(Config{EnableStdContext: true})
 	var stdID string
 	handler := func(c *celeris.Context) error {
 		stdID = FromStdContext(c.Context())
@@ -587,7 +587,7 @@ func TestFromStdContextNoMiddleware(t *testing.T) {
 }
 
 func TestFromStdContextPropagated(t *testing.T) {
-	mw := New()
+	mw := New(Config{EnableStdContext: true})
 	var stdID string
 	handler := func(c *celeris.Context) error {
 		stdID = FromStdContext(c.Context())

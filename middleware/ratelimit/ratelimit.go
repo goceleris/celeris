@@ -40,10 +40,8 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 	cfg = applyDefaults(cfg)
 
-	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
-	for _, p := range cfg.SkipPaths {
-		skipMap[p] = struct{}{}
-	}
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	keyFunc := cfg.KeyFunc
 	disableHeaders := cfg.DisableHeaders
@@ -53,7 +51,7 @@ func New(config ...Config) celeris.HandlerFunc {
 	rateFunc := cfg.RateFunc
 
 	if cfg.Store != nil {
-		return newStoreMiddleware(cfg.Store, cfg.Burst, cfg.Skip, keyFunc, skipMap, disableHeaders, limitReached, skipFailed, skipSuccess)
+		return newStoreMiddleware(cfg.Store, cfg.Burst, &skip, keyFunc, disableHeaders, limitReached, skipFailed, skipSuccess)
 	}
 
 	var lim limiter
@@ -159,11 +157,7 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 
 	return func(c *celeris.Context) error {
-		if cfg.Skip != nil && cfg.Skip(c) {
-			return c.Next()
-		}
-
-		if _, ok := skipMap[c.Path()]; ok {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 
@@ -226,9 +220,8 @@ func New(config ...Config) celeris.HandlerFunc {
 func newStoreMiddleware(
 	store Store,
 	burst int,
-	skipFunc func(c *celeris.Context) bool,
+	skip *celeris.SkipHelper,
 	keyFunc func(c *celeris.Context) string,
-	skipMap map[string]struct{},
 	disableHeaders bool,
 	limitReached func(c *celeris.Context) error,
 	skipFailed, skipSuccess bool,
@@ -237,11 +230,7 @@ func newStoreMiddleware(
 	limitStr := formatInt(burst)
 
 	return func(c *celeris.Context) error {
-		if skipFunc != nil && skipFunc(c) {
-			return c.Next()
-		}
-
-		if _, ok := skipMap[c.Path()]; ok {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 

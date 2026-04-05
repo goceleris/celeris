@@ -280,61 +280,63 @@ func (c *Context) Redirect(code int, url string) error {
 	return c.NoContent(code)
 }
 
-var cookieUnsafeReplacer = strings.NewReplacer(";", "", "\r", "", "\n", "")
-
-// stripCookieUnsafe strips characters that could inject cookie attributes
-// (semicolons) or cause header injection (CRLF) from cookie field values.
-func stripCookieUnsafe(s string) string {
-	if strings.ContainsAny(s, ";\r\n") {
-		return cookieUnsafeReplacer.Replace(s)
-	}
-	return s
-}
-
 // SetCookie appends a Set-Cookie header to the response.
 // Cookie values are sent as-is without encoding (per RFC 6265).
 // Callers are responsible for encoding values if needed.
 // Semicolons in Name, Value, Path, and Domain are stripped to prevent
 // cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
-	var b strings.Builder
-	b.Grow(128)
-	b.WriteString(stripCookieUnsafe(cookie.Name))
-	b.WriteByte('=')
-	b.WriteString(stripCookieUnsafe(cookie.Value))
+	var buf [256]byte
+	b := buf[:0]
+	b = appendCookieSafe(b, cookie.Name)
+	b = append(b, '=')
+	b = appendCookieSafe(b, cookie.Value)
 	if cookie.Path != "" {
-		b.WriteString("; Path=")
-		b.WriteString(stripCookieUnsafe(cookie.Path))
+		b = append(b, "; Path="...)
+		b = appendCookieSafe(b, cookie.Path)
 	}
 	if cookie.Domain != "" {
-		b.WriteString("; Domain=")
-		b.WriteString(stripCookieUnsafe(cookie.Domain))
+		b = append(b, "; Domain="...)
+		b = appendCookieSafe(b, cookie.Domain)
 	}
 	if !cookie.Expires.IsZero() {
-		b.WriteString("; Expires=")
-		b.WriteString(cookie.Expires.UTC().Format(http.TimeFormat))
+		b = append(b, "; Expires="...)
+		b = cookie.Expires.UTC().AppendFormat(b, http.TimeFormat)
 	}
 	if cookie.MaxAge > 0 {
-		b.WriteString("; Max-Age=")
-		b.WriteString(strconv.Itoa(cookie.MaxAge))
+		b = append(b, "; Max-Age="...)
+		b = strconv.AppendInt(b, int64(cookie.MaxAge), 10)
 	} else if cookie.MaxAge < 0 {
-		b.WriteString("; Max-Age=0")
+		b = append(b, "; Max-Age=0"...)
 	}
 	if cookie.HTTPOnly {
-		b.WriteString("; HttpOnly")
+		b = append(b, "; HttpOnly"...)
 	}
 	if cookie.Secure {
-		b.WriteString("; Secure")
+		b = append(b, "; Secure"...)
 	}
 	switch cookie.SameSite {
 	case SameSiteLaxMode:
-		b.WriteString("; SameSite=Lax")
+		b = append(b, "; SameSite=Lax"...)
 	case SameSiteStrictMode:
-		b.WriteString("; SameSite=Strict")
+		b = append(b, "; SameSite=Strict"...)
 	case SameSiteNoneMode:
-		b.WriteString("; SameSite=None")
+		b = append(b, "; SameSite=None"...)
 	}
-	c.AddHeader("set-cookie", b.String())
+	c.AddHeader("set-cookie", string(b))
+}
+
+// appendCookieSafe appends s to dst, stripping semicolons and CRLF
+// to prevent cookie attribute injection and header splitting.
+func appendCookieSafe(dst []byte, s string) []byte {
+	for i := range len(s) {
+		c := s[i]
+		if c == ';' || c == '\r' || c == '\n' {
+			continue
+		}
+		dst = append(dst, c)
+	}
+	return dst
 }
 
 // File serves the named file. The content type is detected from the file
