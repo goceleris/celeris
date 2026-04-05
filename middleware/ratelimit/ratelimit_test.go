@@ -706,7 +706,7 @@ func TestStoreDenyRetryAfter(t *testing.T) {
 	store := newMockStore(1)
 	mw := New(Config{
 		Store:   store,
-		KeyFunc: func(c *celeris.Context) string { return "test" },
+		KeyFunc: func(_ *celeris.Context) string { return "test" },
 	})
 
 	// Exhaust token.
@@ -732,7 +732,7 @@ func TestStoreLimitReached(t *testing.T) {
 			called = true
 			return c.String(429, "custom")
 		},
-		KeyFunc: func(c *celeris.Context) string { return "test" },
+		KeyFunc: func(_ *celeris.Context) string { return "test" },
 	})
 
 	_, _ = testutil.RunMiddleware(t, mw)
@@ -748,7 +748,7 @@ func TestStoreSkipPaths(t *testing.T) {
 	mw := New(Config{
 		Store:     store,
 		SkipPaths: []string{"/health"},
-		KeyFunc:   func(c *celeris.Context) string { return "test" },
+		KeyFunc:   func(_ *celeris.Context) string { return "test" },
 	})
 
 	// Exhaust token.
