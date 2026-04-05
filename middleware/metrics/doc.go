@@ -65,4 +65,12 @@
 // By default, the middleware creates a dedicated [prometheus.Registry] with
 // Go runtime and process collectors. Pass a custom [Config].Registry to use
 // a shared or pre-configured registry.
+//
+// # Response Size and Compression
+//
+// The response_size_bytes metric records c.BytesWritten() at the point
+// metrics middleware runs in the chain. With the recommended ordering
+// (metrics before compress), this records the uncompressed application-level
+// size. If metrics runs after compress, it records the compressed network-level
+// size. Be aware of this when interpreting response size dashboards.
 package metrics
