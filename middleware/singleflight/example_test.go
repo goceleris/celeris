@@ -13,6 +13,16 @@ func ExampleNew() {
 	_ = singleflight.New()
 }
 
+func ExampleNew_skipNonGET() {
+	// Only deduplicate GET and HEAD requests (recommended).
+	_ = singleflight.New(singleflight.Config{
+		Skip: func(c *celeris.Context) bool {
+			m := c.Method()
+			return m != "GET" && m != "HEAD"
+		},
+	})
+}
+
 func ExampleNew_customKey() {
 	// Use only the path as the deduplication key, ignoring query parameters.
 	_ = singleflight.New(singleflight.Config{

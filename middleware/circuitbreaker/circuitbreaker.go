@@ -32,6 +32,11 @@ func (b *Breaker) State() State {
 	return State(b.state.Load())
 }
 
+// Counts returns the current sliding window totals.
+func (b *Breaker) Counts() (total, failures int64) {
+	return b.window.counts()
+}
+
 // Reset forces the breaker back to Closed and clears the observation window.
 func (b *Breaker) Reset() {
 	b.mu.Lock()

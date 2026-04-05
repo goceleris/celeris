@@ -90,16 +90,16 @@ func applyDefaults(cfg Config) Config {
 	if cfg.Threshold == 0 {
 		cfg.Threshold = defaultConfig.Threshold
 	}
-	if cfg.MinRequests == 0 {
+	if cfg.MinRequests <= 0 {
 		cfg.MinRequests = defaultConfig.MinRequests
 	}
-	if cfg.WindowSize == 0 {
+	if cfg.WindowSize <= 0 {
 		cfg.WindowSize = defaultConfig.WindowSize
 	}
-	if cfg.CooldownPeriod == 0 {
+	if cfg.CooldownPeriod <= 0 {
 		cfg.CooldownPeriod = defaultConfig.CooldownPeriod
 	}
-	if cfg.HalfOpenMax == 0 {
+	if cfg.HalfOpenMax <= 0 {
 		cfg.HalfOpenMax = defaultConfig.HalfOpenMax
 	}
 	if cfg.IsError == nil {
@@ -118,5 +118,17 @@ func applyDefaults(cfg Config) Config {
 func validate(cfg Config) {
 	if cfg.Threshold <= 0 || cfg.Threshold > 1 {
 		panic("circuitbreaker: Threshold must be in (0, 1]")
+	}
+	if cfg.WindowSize < 10*time.Millisecond {
+		panic("circuitbreaker: WindowSize must be >= 10ms")
+	}
+	if cfg.CooldownPeriod <= 0 {
+		panic("circuitbreaker: CooldownPeriod must be > 0")
+	}
+	if cfg.HalfOpenMax < 1 {
+		panic("circuitbreaker: HalfOpenMax must be >= 1")
+	}
+	if cfg.MinRequests < 1 {
+		panic("circuitbreaker: MinRequests must be >= 1")
 	}
 }

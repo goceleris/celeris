@@ -103,8 +103,8 @@ All middleware is in-tree under [`middleware/`](middleware/):
 |---------|-------------|
 | [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
 | [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
-| [`compress`](middleware/compress) | Response compression (zstd, brotli, gzip; separate go.mod) |
 | [`circuitbreaker`](middleware/circuitbreaker) | Circuit breaker (3-state, sliding window error rate, 503 + Retry-After) |
+| [`compress`](middleware/compress) | Response compression (zstd, brotli, gzip; separate go.mod) |
 | [`cors`](middleware/cors) | Cross-Origin Resource Sharing (zero-alloc) |
 | [`csrf`](middleware/csrf) | CSRF protection (double-submit cookie + origin validation) |
 | [`debug`](middleware/debug) | Debug/introspection endpoints (loopback-only by default) |
