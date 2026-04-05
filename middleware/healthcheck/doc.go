@@ -25,8 +25,8 @@
 // Setting a probe path to "" disables that probe. [Config].Skip bypasses
 // the middleware before path matching.
 //
-// [Config].validate() panics on invalid paths (missing leading '/') or
-// overlapping enabled paths. These are programming errors caught at init.
+// Invalid paths (missing leading '/') or overlapping enabled paths cause
+// a panic at initialization. These are programming errors caught early.
 //
 // Response format: 200 {"status":"ok"} / 503 {"status":"unavailable"}.
 // HEAD requests return the status code with no body.

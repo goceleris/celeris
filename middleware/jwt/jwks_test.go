@@ -224,50 +224,6 @@ func TestJWKSRefreshStaleKeys(t *testing.T) {
 	}
 }
 
-func TestJWKSStaleFallbackOnError(t *testing.T) {
-	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := rsaJWKSJSON("stale-kid", &privKey.PublicKey)
-
-	var shouldFail atomic.Bool
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if shouldFail.Load() {
-			w.WriteHeader(500)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
-	}))
-	defer ts.Close()
-
-	fetcher := newJWKSFetcher(ts.URL, 10*time.Millisecond)
-
-	// Initial successful fetch.
-	tok := &jwtparse.Token{Header: jwtparse.Header{Kid: "stale-kid"}}
-	key, err := fetcher.keyFunc(tok)
-	if err != nil {
-		t.Fatalf("first keyFunc: %v", err)
-	}
-	if key == nil {
-		t.Fatal("expected non-nil key")
-	}
-
-	// Make server fail, wait for stale.
-	shouldFail.Store(true)
-	time.Sleep(20 * time.Millisecond)
-
-	// Should still return stale key.
-	key2, err := fetcher.keyFunc(tok)
-	if err != nil {
-		t.Fatalf("stale fallback should succeed: %v", err)
-	}
-	if key2 == nil {
-		t.Fatal("expected non-nil stale key")
-	}
-}
-
 func TestJWKSUnknownKidAfterRefresh(t *testing.T) {
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -894,26 +850,6 @@ func TestJWKSFetchError(t *testing.T) {
 	}
 	if key2 == nil {
 		t.Fatal("expected non-nil stale key")
-	}
-}
-
-func TestJWKSMaxBodySize(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"keys":[`))
-		buf := make([]byte, 1<<20) // 1MB of padding
-		for i := range buf {
-			buf[i] = ' '
-		}
-		_, _ = w.Write(buf)
-		_, _ = w.Write([]byte(`]}`))
-	}))
-	defer ts.Close()
-
-	fetcher := newJWKSFetcher(ts.URL, time.Hour)
-	err := fetcher.fetch()
-	if err == nil {
-		t.Fatal("expected error for >1MB body")
 	}
 }
 

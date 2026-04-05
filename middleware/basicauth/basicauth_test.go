@@ -157,12 +157,6 @@ func TestEmptyUsernamePassword(t *testing.T) {
 	testutil.AssertStatus(t, rec, 200)
 }
 
-func TestDefaultConfigRealm(t *testing.T) {
-	if defaultConfig.Realm != "Restricted" {
-		t.Fatalf("default Realm: got %q, want %q", defaultConfig.Realm, "Restricted")
-	}
-}
-
 func TestApplyDefaultsFixesEmptyRealm(t *testing.T) {
 	cfg := applyDefaults(Config{Realm: ""})
 	if cfg.Realm != "Restricted" {
@@ -271,12 +265,6 @@ func TestUsernameFromContext(t *testing.T) {
 				t.Fatalf("UsernameFromContext: got %q, want %q", username, tt.wantUser)
 			}
 		})
-	}
-}
-
-func TestUsernameKeyConstant(t *testing.T) {
-	if UsernameKey != "basicauth_username" {
-		t.Fatalf("UsernameKey: got %q, want %q", UsernameKey, "basicauth_username")
 	}
 }
 

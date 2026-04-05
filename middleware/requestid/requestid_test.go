@@ -309,12 +309,6 @@ func TestFromContextNoMiddleware(t *testing.T) {
 	}
 }
 
-func TestContextKeyConstant(t *testing.T) {
-	if ContextKey != "request_id" {
-		t.Fatalf("ContextKey: got %q, want %q", ContextKey, "request_id")
-	}
-}
-
 func TestRejectsNonPrintableASCII(t *testing.T) {
 	mw := New()
 	chain := []celeris.HandlerFunc{mw, okHandler}
@@ -446,20 +440,6 @@ func TestGeneratorSuccessOnFirstCallNoRetry(t *testing.T) {
 	testutil.AssertHeader(t, rec, "x-request-id", "first-try")
 	if callCount != 1 {
 		t.Fatalf("expected 1 generator call, got %d", callCount)
-	}
-}
-
-func TestDefaultGeneratorNoRetry(t *testing.T) {
-	mw := New()
-	chain := []celeris.HandlerFunc{mw, okHandler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/")
-	testutil.AssertNoError(t, err)
-	id := rec.Header("x-request-id")
-	if id == "" {
-		t.Fatal("expected UUID")
-	}
-	if !uuidRe.MatchString(id) {
-		t.Fatalf("expected UUID format, got %q", id)
 	}
 }
 

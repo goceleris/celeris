@@ -41,6 +41,14 @@
 // entries (default: [slog.LevelError]). Broken pipe panics are always
 // logged at [slog.LevelWarn] regardless of this setting.
 //
+// # Sentinel Errors
+//
+// The package exports sentinel errors for use with errors.Is:
+//   - [ErrPanic]: generic panic recovery
+//   - [ErrBrokenPipe]: broken pipe or ECONNRESET
+//   - [ErrPanicContextCancelled]: panic after the request context was cancelled
+//   - [ErrPanicResponseCommitted]: panic after the response has been committed
+//
 // # Middleware Order
 //
 // Register after logger/metrics so they see the 500 status from recovered panics.

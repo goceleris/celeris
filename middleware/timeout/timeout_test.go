@@ -720,22 +720,6 @@ func TestTimeoutErrorsPreemptiveWrapped(t *testing.T) {
 	testutil.AssertHTTPError(t, err, 503)
 }
 
-func TestValidatePanicsOnZeroTimeoutWithoutTimeoutFunc(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for zero Timeout without TimeoutFunc")
-		}
-		msg, ok := r.(string)
-		if !ok || msg != "timeout: Timeout must be positive or TimeoutFunc must be set" {
-			t.Fatalf("unexpected panic message: %v", r)
-		}
-	}()
-	// applyDefaults now contains the validation check, so calling it with
-	// zero Timeout and no TimeoutFunc panics immediately.
-	applyDefaults(Config{Timeout: 0})
-}
-
 func TestValidateNewPanicsOnZeroTimeoutWithoutTimeoutFunc(t *testing.T) {
 	defer func() {
 		r := recover()

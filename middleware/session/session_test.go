@@ -626,12 +626,6 @@ func TestDefaultConfigValues(t *testing.T) {
 	}
 }
 
-func TestContextKeyConstant(t *testing.T) {
-	if ContextKey != "session" {
-		t.Fatalf("ContextKey: got %q, want %q", ContextKey, "session")
-	}
-}
-
 func TestDefaultKeyGeneratorLength(t *testing.T) {
 	gen := newBufferedKeyGenerator()
 	id := gen.generate()

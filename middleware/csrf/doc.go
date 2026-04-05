@@ -67,4 +67,8 @@
 // CookieSecure defaults to false for development convenience. Production
 // deployments MUST set CookieSecure: true to prevent cookie transmission
 // over unencrypted connections.
+//
+// CookieHTTPOnly is always enforced as true regardless of the user-supplied
+// Config value. This prevents client-side JavaScript from reading the CSRF
+// cookie, which is a defense-in-depth measure against XSS token theft.
 package csrf

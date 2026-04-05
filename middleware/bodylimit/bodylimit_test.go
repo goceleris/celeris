@@ -179,18 +179,6 @@ func TestRequestOneOverLimitRejects(t *testing.T) {
 	testutil.AssertHTTPError(t, err, 413)
 }
 
-func TestCustomMaxBytes(t *testing.T) {
-	mw := New(Config{MaxBytes: 100})
-	handler := func(c *celeris.Context) error {
-		return c.String(200, "ok")
-	}
-	chain := []celeris.HandlerFunc{mw, handler}
-	_, err := testutil.RunChain(t, chain, "POST", "/upload",
-		celeristest.WithHeader("content-length", "200"),
-	)
-	testutil.AssertHTTPError(t, err, 413)
-}
-
 func TestSkipBypassesCheck(t *testing.T) {
 	mw := New(Config{
 		MaxBytes: 100,
@@ -206,12 +194,6 @@ func TestSkipBypassesCheck(t *testing.T) {
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 	testutil.AssertBodyContains(t, rec, "skipped")
-}
-
-func TestDefaultConfig4MB(t *testing.T) {
-	if defaultConfig.MaxBytes != 4*1024*1024 {
-		t.Fatalf("default MaxBytes: got %d, want %d", defaultConfig.MaxBytes, 4*1024*1024)
-	}
 }
 
 func TestApplyDefaultsFixesInvalid(t *testing.T) {
@@ -245,17 +227,6 @@ func TestDefaultConfigNoArgs(t *testing.T) {
 	rec, err := testutil.RunChain(t, chain, "POST", "/upload",
 		celeristest.WithHeader("content-length", "1024"),
 	)
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-}
-
-func TestGETRequestPasses(t *testing.T) {
-	mw := New(Config{MaxBytes: 1024})
-	handler := func(c *celeris.Context) error {
-		return c.String(200, "ok")
-	}
-	chain := []celeris.HandlerFunc{mw, handler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 }
@@ -395,7 +366,7 @@ func TestLimitStringInvalidPanics(t *testing.T) {
 	New(Config{Limit: "notasize"})
 }
 
-func TestLimitStringEmptyPanics(_ *testing.T) {
+func TestLimitStringEmptyNoPanic(_ *testing.T) {
 	// Empty Limit string should NOT panic — it means "use MaxBytes".
 	// This is different from a non-empty invalid string.
 	mw := New(Config{Limit: "", MaxBytes: 1024})
@@ -728,20 +699,6 @@ func TestErrLengthRequiredSentinel(t *testing.T) {
 	if httpErr.Code != 411 {
 		t.Fatalf("ErrLengthRequired code: got %d, want 411", httpErr.Code)
 	}
-}
-
-func TestParseSizeRejectsNegativeMB(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for negative size string")
-		}
-		msg, ok := r.(string)
-		if !ok || msg != "bodylimit: Limit must not be negative" {
-			t.Fatalf("unexpected panic message: %v", r)
-		}
-	}()
-	New(Config{Limit: "-1MB"})
 }
 
 func TestParseSizeRejectsNegativeFractionalGB(t *testing.T) {

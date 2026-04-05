@@ -383,22 +383,10 @@ func TestUnsupportedKeyLookupSourcePanics(t *testing.T) {
 	})
 }
 
-func TestDefaultConfigKeyLookup(t *testing.T) {
-	if defaultConfig.KeyLookup != "header:X-API-Key" {
-		t.Fatalf("default KeyLookup: got %q, want %q", defaultConfig.KeyLookup, "header:X-API-Key")
-	}
-}
-
 func TestApplyDefaultsFixesEmptyKeyLookup(t *testing.T) {
 	cfg := applyDefaults(Config{KeyLookup: ""})
 	if cfg.KeyLookup != "header:X-API-Key" {
 		t.Fatalf("expected header:X-API-Key, got %q", cfg.KeyLookup)
-	}
-}
-
-func TestContextKeyConstant(t *testing.T) {
-	if ContextKey != "keyauth_key" {
-		t.Fatalf("ContextKey: got %q, want %q", ContextKey, "keyauth_key")
 	}
 }
 
@@ -1264,12 +1252,6 @@ func TestRealmWithControlCharPanics(t *testing.T) {
 		Validator: validatorFor("x"),
 		Realm:     "My\x00Realm",
 	})
-}
-
-func TestDefaultConfigImmutable(t *testing.T) {
-	if defaultConfig.KeyLookup != "header:X-API-Key" {
-		t.Fatalf("defaultConfig.KeyLookup: got %q, want %q", defaultConfig.KeyLookup, "header:X-API-Key")
-	}
 }
 
 // --- ChallengeParams scope NQCHAR validation tests ---

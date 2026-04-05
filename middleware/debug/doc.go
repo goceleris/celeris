@@ -26,6 +26,13 @@
 // [Config].MemStatsTTL controls /memory caching (default 1s, floor
 // 100ms) to avoid repeated stop-the-world pauses from ReadMemStats.
 //
+// [Config].Skip defines a function to bypass the debug middleware for
+// specific requests matching the debug prefix. It is only consulted for
+// requests under the prefix; non-debug paths always pass through.
+//
+// The /config endpoint returns Go runtime information (go_version, go_os,
+// go_arch, num_cpu, goroutines), not application-level configuration.
+//
 // Server and Collector are optional; when nil, /routes returns [] and
 // /metrics returns 501.
 package debug

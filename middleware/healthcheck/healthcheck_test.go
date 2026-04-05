@@ -108,43 +108,6 @@ func TestCustomPaths(t *testing.T) {
 	testutil.AssertBodyContains(t, rec, "ok")
 }
 
-func TestDefaultConfigPaths(t *testing.T) {
-	t.Parallel()
-	cfg := defaultConfigCopy()
-	if cfg.LivePath != "/livez" {
-		t.Fatalf("defaultConfigCopy().LivePath: got %q, want %q", cfg.LivePath, "/livez")
-	}
-	if cfg.ReadyPath != "/readyz" {
-		t.Fatalf("defaultConfigCopy().ReadyPath: got %q, want %q", cfg.ReadyPath, "/readyz")
-	}
-	if cfg.StartPath != "/startupz" {
-		t.Fatalf("defaultConfigCopy().StartPath: got %q, want %q", cfg.StartPath, "/startupz")
-	}
-}
-
-func TestDefaultConfigCheckers(t *testing.T) {
-	t.Parallel()
-	cfg := defaultConfigCopy()
-	if cfg.LiveChecker == nil {
-		t.Fatal("defaultConfigCopy().LiveChecker should not be nil")
-	}
-	if cfg.ReadyChecker == nil {
-		t.Fatal("defaultConfigCopy().ReadyChecker should not be nil")
-	}
-	if cfg.StartChecker == nil {
-		t.Fatal("defaultConfigCopy().StartChecker should not be nil")
-	}
-	if !cfg.LiveChecker(nil) {
-		t.Fatal("defaultConfigCopy().LiveChecker should return true")
-	}
-	if !cfg.ReadyChecker(nil) {
-		t.Fatal("defaultConfigCopy().ReadyChecker should return true")
-	}
-	if !cfg.StartChecker(nil) {
-		t.Fatal("defaultConfigCopy().StartChecker should return true")
-	}
-}
-
 func TestApplyDefaultsLeavesEmptyPaths(t *testing.T) {
 	t.Parallel()
 	cfg := applyDefaults(Config{})
@@ -221,13 +184,6 @@ func TestExportedPathConstants(t *testing.T) {
 	}
 	if DefaultStartPath != "/startupz" {
 		t.Fatalf("DefaultStartPath: got %q, want %q", DefaultStartPath, "/startupz")
-	}
-}
-
-func TestFastPathTimeoutConstant(t *testing.T) {
-	t.Parallel()
-	if FastPathTimeout != -1*time.Second {
-		t.Fatalf("FastPathTimeout: got %v, want -1s", FastPathTimeout)
 	}
 }
 

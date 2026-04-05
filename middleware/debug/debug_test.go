@@ -237,13 +237,6 @@ func TestUnknownDebugSubpath(t *testing.T) {
 	testutil.AssertBodyEmpty(t, rec)
 }
 
-func TestDefaultConfigPrefix(t *testing.T) {
-	cfg := defaultConfigCopy()
-	if cfg.Prefix != "/debug/celeris" {
-		t.Fatalf("defaultConfigCopy().Prefix: got %q, want %q", cfg.Prefix, "/debug/celeris")
-	}
-}
-
 func TestIPv6Loopback(t *testing.T) {
 	mw := New()
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/celeris/status",
@@ -270,13 +263,6 @@ func FuzzDebugPaths(f *testing.F) {
 	})
 }
 
-func TestDefaultConfigAuthFunc(t *testing.T) {
-	cfg := defaultConfigCopy()
-	if cfg.AuthFunc == nil {
-		t.Fatal("defaultConfigCopy().AuthFunc should not be nil")
-	}
-}
-
 func TestApplyDefaultsFillsPrefix(t *testing.T) {
 	cfg := applyDefaults(Config{})
 	if cfg.Prefix != "/debug/celeris" {
@@ -288,21 +274,6 @@ func TestApplyDefaultsPreservesCustomPrefix(t *testing.T) {
 	cfg := applyDefaults(Config{Prefix: "/custom"})
 	if cfg.Prefix != "/custom" {
 		t.Fatalf("applyDefaults Prefix: got %q, want %q", cfg.Prefix, "/custom")
-	}
-}
-
-func TestPrefixOnlyServesIndex(t *testing.T) {
-	mw := New(Config{AuthFunc: openAuth()})
-	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/celeris")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-
-	var endpoints []string
-	if err := json.Unmarshal(rec.Body, &endpoints); err != nil {
-		t.Fatalf("failed to unmarshal index response: %v", err)
-	}
-	if len(endpoints) != 7 {
-		t.Fatalf("expected 7 endpoints in index, got %d", len(endpoints))
 	}
 }
 

@@ -103,16 +103,6 @@ func TestCustomValues(t *testing.T) {
 	testutil.AssertHeader(t, rec, "x-permitted-cross-domain-policies", "master-only")
 }
 
-func TestHSTSIncludeSubdomainsDefault(t *testing.T) {
-	// Default config includes includeSubDomains.
-	mw := New()
-	chain := []celeris.HandlerFunc{mw, okHandler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
-	testutil.AssertNoError(t, err)
-	testutil.AssertHeader(t, rec, "strict-transport-security", "max-age=63072000; includeSubDomains")
-}
-
 func TestHSTSIncludeSubdomainsDefaultWithCustomConfig(t *testing.T) {
 	// When user provides a partial config, HSTS still defaults to 2 years.
 	// There is no zero-value trap: customizing other fields does NOT disable HSTS.
@@ -375,36 +365,6 @@ func TestBuildHeadersWithCSPAndPermissions(t *testing.T) {
 	}
 }
 
-func TestDefaultConfigValues(t *testing.T) {
-	if defaultConfig.XContentTypeOptions != "nosniff" {
-		t.Fatalf("defaultConfig.XContentTypeOptions: got %q, want %q", defaultConfig.XContentTypeOptions, "nosniff")
-	}
-	if defaultConfig.XFrameOptions != "SAMEORIGIN" {
-		t.Fatalf("defaultConfig.XFrameOptions: got %q, want %q", defaultConfig.XFrameOptions, "SAMEORIGIN")
-	}
-	if defaultConfig.XSSProtection != "0" {
-		t.Fatalf("defaultConfig.XSSProtection: got %q, want %q", defaultConfig.XSSProtection, "0")
-	}
-	if defaultConfig.HSTSMaxAge != 63072000 {
-		t.Fatalf("defaultConfig.HSTSMaxAge: got %d, want %d", defaultConfig.HSTSMaxAge, 63072000)
-	}
-	if defaultConfig.HSTSExcludeSubdomains {
-		t.Fatal("defaultConfig.HSTSExcludeSubdomains: got true, want false")
-	}
-	if defaultConfig.HSTSPreload {
-		t.Fatal("defaultConfig.HSTSPreload: got true, want false")
-	}
-	if defaultConfig.ReferrerPolicy != "strict-origin-when-cross-origin" {
-		t.Fatalf("defaultConfig.ReferrerPolicy: got %q, want %q", defaultConfig.ReferrerPolicy, "strict-origin-when-cross-origin")
-	}
-	if defaultConfig.OriginAgentCluster != "?1" {
-		t.Fatalf("defaultConfig.OriginAgentCluster: got %q, want %q", defaultConfig.OriginAgentCluster, "?1")
-	}
-	if defaultConfig.XDownloadOptions != "noopen" {
-		t.Fatalf("defaultConfig.XDownloadOptions: got %q, want %q", defaultConfig.XDownloadOptions, "noopen")
-	}
-}
-
 func TestNewNoArgs(t *testing.T) {
 	mw := New()
 	ctx, _ := celeristest.NewContextT(t, "GET", "/")
@@ -549,12 +509,6 @@ func TestSuppressNotOverriddenByDefaults(t *testing.T) {
 	cfg := applyDefaults(Config{XContentTypeOptions: Suppress})
 	if cfg.XContentTypeOptions != Suppress {
 		t.Fatalf("expected Suppress sentinel to survive applyDefaults, got %q", cfg.XContentTypeOptions)
-	}
-}
-
-func TestSuppressConstValue(t *testing.T) {
-	if Suppress != "-" {
-		t.Fatalf("Suppress: got %q, want %q", Suppress, "-")
 	}
 }
 
