@@ -10,8 +10,6 @@ import (
 	"strings"
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
-
-
 )
 
 // Bridge implements http.Handler, bridging net/http requests to stream.Handler.

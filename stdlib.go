@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
-
-
 )
 
 const maxToHandlerBodySize = maxBodySize
