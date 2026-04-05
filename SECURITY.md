@@ -9,6 +9,18 @@
 
 Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
 
+### v1.3.1 Security Improvements
+
+v1.3.1 includes security hardening in the new HTTP transport middleware and core:
+
+- **Scheme() trust model**: `Context.Scheme()` no longer reads `X-Forwarded-Proto` from untrusted clients. Only the proxy middleware (which validates against `TrustedProxies`) can set the scheme override. This prevents `HTTPSRedirect` bypass by direct-connect attackers.
+- **Proxy host validation**: `X-Forwarded-Host` is validated against CRLF injection, null bytes, path traversal (`/`, `\`), query injection (`?`, `#`), userinfo injection (`@`), and a 253-byte DNS length cap.
+- **Proxy IP validation**: `X-Real-IP` and custom headers (e.g., `CF-Connecting-IP`) are parsed with `netip.ParseAddr` — non-IP values are rejected.
+- **Method override target restriction**: `TargetMethods` whitelist (default: PUT, DELETE, PATCH) prevents overriding POST to arbitrary methods like CONNECT or TRACE.
+- **Negotiate q=0 exclusion**: `Accept-Encoding` entries with `q=0` are now correctly treated as "not acceptable" per RFC 9110, including wildcard exclusions (e.g., `*, br;q=0` excludes brotli).
+- **Redirect code validation**: Only valid redirect codes (301, 302, 303, 307, 308) are accepted. Non-redirect codes like 304 are rejected at init time.
+- **Compress BREACH warning**: Documentation warns about BREACH attacks when compressing HTTPS responses containing both user-controlled input and secrets.
+
 ### v1.3.0 Security Improvements
 
 v1.3.0 includes hardening identified during a comprehensive 24-agent automated security review:
@@ -51,7 +63,7 @@ This policy covers the core `github.com/goceleris/celeris` module and all in-tre
 - Body size enforcement (MaxRequestBodySize across H1, H2, bridge)
 - Callback safety (OnExpectContinue, OnConnect, OnDisconnect)
 - All in-tree middleware packages (`middleware/`)
-- Sub-module middleware (`middleware/metrics`, `middleware/otel`)
+- Sub-module middleware (`middleware/compress`, `middleware/metrics`, `middleware/otel`)
 
 ### Out of Scope
 
