@@ -10,9 +10,11 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/middleware/circuitbreaker"
 	"github.com/goceleris/celeris/middleware/cors"
 	"github.com/goceleris/celeris/middleware/etag"
 	"github.com/goceleris/celeris/middleware/methodoverride"
+	"github.com/goceleris/celeris/middleware/singleflight"
 	"github.com/goceleris/celeris/middleware/proxy"
 	"github.com/goceleris/celeris/middleware/ratelimit"
 	"github.com/goceleris/celeris/middleware/recovery"
@@ -487,6 +489,44 @@ func BenchmarkChainETagHit(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainWithCircuitBreaker benchmarks: requestid -> recovery -> circuitbreaker -> timeout -> handler.
+func BenchmarkChainWithCircuitBreaker(b *testing.B) {
+	chain := []celeris.HandlerFunc{
+		requestid.New(),
+		recovery.New(recovery.Config{DisableLogStack: true}),
+		circuitbreaker.New(),
+		timeout.New(timeout.Config{Timeout: 30 * time.Second}),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainWithSingleflight benchmarks: requestid -> recovery -> singleflight -> etag -> handler.
+func BenchmarkChainWithSingleflight(b *testing.B) {
+	chain := []celeris.HandlerFunc{
+		requestid.New(),
+		recovery.New(recovery.Config{DisableLogStack: true}),
+		singleflight.New(),
+		etag.New(),
+		textHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/data", opts...)
 		_ = ctx.Next()
 		celeristest.ReleaseContext(ctx)
 	}
