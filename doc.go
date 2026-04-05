@@ -41,10 +41,15 @@
 //
 // # Middleware
 //
-// Middleware is provided by the github.com/goceleris/middlewares module.
-// Use Server.Use to register middleware globally or per route group.
+// Middleware is provided by the in-tree middleware/ packages (e.g.
+// middleware/logger, middleware/recovery). Use Server.Use to register
+// middleware globally or per route group.
 //
-//	s.Use(middlewares.Logger(), middlewares.Recovery())
+//	import (
+//	    "github.com/goceleris/celeris/middleware/logger"
+//	    "github.com/goceleris/celeris/middleware/recovery"
+//	)
+//	s.Use(logger.New(), recovery.New())
 //
 // To write custom middleware, use the HandlerFunc signature and call
 // Context.Next to invoke downstream handlers. Next returns the first
@@ -183,7 +188,7 @@
 //	fmt.Println(snap.RequestsTotal, snap.ErrorsTotal)
 //
 // For Prometheus or debug endpoint integration, see the
-// github.com/goceleris/middlewares module.
+// middleware/metrics and middleware/debug packages.
 //
 // # Configuration
 //

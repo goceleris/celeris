@@ -1,7 +1,8 @@
 package celeris
 
 // SkipHelper encapsulates the common middleware skip logic (path map + callback).
-// Initialize with Init, then call ShouldSkip at the top of each request.
+// Middleware authors embed SkipHelper to gain standard Skip/SkipPaths support
+// without reimplementing the pattern.
 type SkipHelper struct {
 	skipMap map[string]struct{}
 	skipFn  func(*Context) bool

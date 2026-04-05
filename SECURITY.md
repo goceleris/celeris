@@ -39,4 +39,4 @@ This policy covers the core `github.com/goceleris/celeris` module, including:
 - Body size enforcement (MaxRequestBodySize across H1, H2, bridge)
 - Callback safety (OnExpectContinue, OnConnect, OnDisconnect)
 
-The middleware ecosystem (`github.com/goceleris/middlewares`) has its own security policy.
+The in-tree middleware packages (`middleware/`) are covered by this same policy.

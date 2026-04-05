@@ -22,7 +22,7 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 - **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK, inline handler execution, zero-alloc HEADERS fast path
 - **Auto-detect** — protocol negotiation from the first bytes on the wire
 - **Error-returning handlers** — `HandlerFunc` returns `error`; structured `HTTPError` for status codes
-- **Serialization** — JSON and XML response methods (`JSON`, `XML`); Protocol Buffers available via [`github.com/goceleris/middlewares`](https://github.com/goceleris/middlewares); `Bind` auto-detects request format from Content-Type
+- **Serialization** — JSON and XML response methods (`JSON`, `XML`); Protocol Buffers available via [`middleware/protobuf`](middleware/protobuf); `Bind` auto-detects request format from Content-Type
 - **net/http compatibility** — wrap existing `http.Handler` via `celeris.Adapt()`
 - **Streaming responses** — `Detach()` + `StreamWriter` for SSE and chunked responses on native engines
 - **Connection hijacking** — `Hijack()` for WebSocket and custom protocol upgrades (H1 only)
@@ -91,7 +91,7 @@ v2.GET("/items", listItemsV2)
 
 ## Middleware
 
-Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module. See that repo for usage, examples, and the full list of available middleware.
+Middleware is provided by the in-tree [`middleware/`](middleware/) packages (e.g. `middleware/logger`, `middleware/recovery`). See the [middleware package docs](middleware/) for usage, examples, and the full list of available middleware.
 
 ## Error Handling
 
@@ -202,7 +202,7 @@ server.Collector().SetCPUMonitor(mon)
 defer mon.Close()
 ```
 
-For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](https://github.com/goceleris/middlewares) and [`middlewares/debug`](https://github.com/goceleris/middlewares) packages.
+For Prometheus exposition and debug endpoints, use the [`middleware/metrics`](middleware/metrics) and [`middleware/debug`](middleware/debug) packages.
 
 ## Feature Matrix
 

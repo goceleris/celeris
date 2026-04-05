@@ -98,6 +98,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		claims := newClaims(claimsFactory, claimsTemplate)
 		token, err := parser.ParseWithClaims(tokenStr, claims, keyFunc)
 		if err != nil || !token.Valid {
+			// Release pooled token and claims on the error path to
+			// avoid leaking them back to GC instead of the pool.
+			if token != nil {
+				if m, ok := token.Claims.(jwtparse.MapClaims); ok {
+					jwtparse.ReleaseMapClaims(m)
+				}
+				jwtparse.ReleaseToken(token)
+			}
 			wrappedErr := fmt.Errorf("%w: %w", ErrTokenInvalid, err)
 			return handleError(c, wrappedErr)
 		}

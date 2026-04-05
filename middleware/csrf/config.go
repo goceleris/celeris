@@ -43,9 +43,10 @@ type Config struct {
 	// CookieSecure flags the cookie for HTTPS-only transmission.
 	CookieSecure bool
 
-	// CookieHTTPOnly prevents client-side scripts from accessing the cookie.
-	// Default: true. Set to false for SPA usage where JavaScript must
-	// read the cookie.
+	// CookieHTTPOnly controls the HttpOnly flag on the CSRF cookie.
+	// This is always enforced as true for security — CSRF cookies must not
+	// be readable by JavaScript. The field exists for documentation purposes
+	// but is overridden by applyDefaults.
 	CookieHTTPOnly bool
 
 	// CookieSameSite controls the SameSite attribute of the CSRF cookie.

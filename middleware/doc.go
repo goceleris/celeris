@@ -4,7 +4,9 @@
 //
 // Install middleware in this order so each layer sees the right context:
 //
+//	healthcheck — health probes bypass all middleware; respond immediately
 //	requestid   — assign request ID first; all downstream logs include it
+//	metrics/otel — Prometheus / OpenTelemetry: can also go after logger
 //	logger      — log every request with the ID from requestid
 //	recovery    — catch panics from everything below; logger records the 500
 //	secure      — set OWASP security headers before any response can escape
@@ -14,6 +16,7 @@
 //	[auth]      — jwt / keyauth / basicauth (see Auth Stacking below)
 //	csrf        — validate CSRF token after authentication is established
 //	session     — load session (may depend on authenticated user)
+//	debug       — intercepts by path prefix (e.g. /debug/); can go anywhere
 //	timeout     — bound handler execution; innermost wrapper before the route
 //	[handler]   — route handler
 //
@@ -43,7 +46,7 @@
 // Chain them for JWT-preferred authentication with API key fallback:
 //
 //	jwtAuth := jwt.New(jwt.Config{
-//	    SigningKey:             jwt.SigningKey{Key: hmacSecret},
+//	    SigningKey:             hmacSecret,
 //	    ContinueOnIgnoredError: true,
 //	    ErrorHandler: func(c *celeris.Context, err error) error {
 //	        return nil // ignore JWT failure, let keyauth try

@@ -331,7 +331,7 @@ func (c *Context) SetCookie(cookie *Cookie) {
 func appendCookieSafe(dst []byte, s string) []byte {
 	for i := range len(s) {
 		c := s[i]
-		if c == ';' || c == '\r' || c == '\n' {
+		if c == ';' || c == '\r' || c == '\n' || c == 0 {
 			continue
 		}
 		dst = append(dst, c)

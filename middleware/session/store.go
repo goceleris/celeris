@@ -126,10 +126,14 @@ func (m *memoryStore) Get(_ context.Context, id string) (map[string]any, error) 
 		s.mu.Unlock()
 		return nil, nil
 	}
-	// Return directly; caller owns the map until Save copies it back.
-	data := item.data
+	// Copy the map so concurrent requests with the same session ID
+	// each get an independent snapshot (Go maps are not concurrency-safe).
+	cp := make(map[string]any, len(item.data))
+	for k, v := range item.data {
+		cp[k] = v
+	}
 	s.mu.Unlock()
-	return data, nil
+	return cp, nil
 }
 
 func (m *memoryStore) Save(_ context.Context, id string, data map[string]any, expiry time.Duration) error {

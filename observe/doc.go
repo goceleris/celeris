@@ -6,5 +6,5 @@
 // engine-level metrics. All recording methods are safe for concurrent use.
 //
 // For Prometheus and debug endpoint integration, see the
-// github.com/goceleris/middlewares module.
+// middleware/metrics package.
 package observe

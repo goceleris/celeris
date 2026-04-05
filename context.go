@@ -28,6 +28,7 @@ func init() {
 func AcquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
 
 // ReleaseTestContext returns a Context to the pool, firing OnRelease callbacks.
+// This is intended for test helpers only; production code uses releaseContext.
 func ReleaseTestContext(c *Context) { releaseContext(c) }
 
 // TestStream returns the underlying stream, or nil. Test helpers only.
