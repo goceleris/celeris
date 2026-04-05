@@ -2,6 +2,7 @@ package compress
 
 import (
 	"bytes"
+	"compress/flate"
 	"fmt"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ func New(config ...Config) celeris.HandlerFunc {
 	// Build pools at init.
 	var gzipPool *sync.Pool
 	var brotliPool *sync.Pool
+	var deflatePool *sync.Pool
 	var zstdEncoder *zstd.Encoder
 	var bufPool sync.Pool
 
@@ -55,6 +57,14 @@ func New(config ...Config) celeris.HandlerFunc {
 			zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
 			if err != nil {
 				panic("compress: zstd init: " + err.Error())
+			}
+		case "deflate":
+			level := resolveDeflateLevel(cfg.DeflateLevel)
+			deflatePool = &sync.Pool{
+				New: func() any {
+					w, _ := flate.NewWriter(nil, level)
+					return w
+				},
 			}
 		}
 	}
@@ -104,7 +114,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
 
-		if status < 200 || status >= 300 || len(body) == 0 || len(body) < minLen {
+		if status < 200 || status >= 300 || len(body) < minLen {
 			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
@@ -129,7 +139,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			return err
 		}
 
-		compressed, compErr := compressBody(encoding, body, gzipPool, brotliPool, zstdEncoder, &bufPool)
+		compressed, compErr := compressBody(encoding, body, gzipPool, brotliPool, deflatePool, zstdEncoder, &bufPool)
 		if compErr != nil {
 			// Graceful degradation: if compression fails, flush the original
 			// uncompressed body. The compression error is propagated to the caller
@@ -215,6 +225,7 @@ func compressBody(
 	body []byte,
 	gzipPool *sync.Pool,
 	brotliPool *sync.Pool,
+	deflatePool *sync.Pool,
 	zstdEncoder *zstd.Encoder,
 	bufPool *sync.Pool,
 ) ([]byte, error) {
@@ -225,6 +236,8 @@ func compressBody(
 		return compressBrotli(body, brotliPool, bufPool)
 	case "zstd":
 		return compressZstd(body, zstdEncoder)
+	case "deflate":
+		return compressDeflate(body, deflatePool, bufPool)
 	default:
 		return nil, fmt.Errorf("compress: unsupported encoding: %s", encoding)
 	}
@@ -273,6 +286,34 @@ func compressBrotli(body []byte, pool *sync.Pool, bufPool *sync.Pool) ([]byte, e
 	}()
 
 	w := pool.Get().(*brotli.Writer)
+	w.Reset(buf)
+
+	if _, err := w.Write(body); err != nil {
+		_ = w.Close()
+		pool.Put(w)
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		pool.Put(w)
+		return nil, err
+	}
+	pool.Put(w)
+
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
+}
+
+func compressDeflate(body []byte, pool *sync.Pool, bufPool *sync.Pool) ([]byte, error) {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= maxPooledBufSize {
+			bufPool.Put(buf)
+		}
+	}()
+
+	w := pool.Get().(*flate.Writer)
 	w.Reset(buf)
 
 	if _, err := w.Write(body); err != nil {

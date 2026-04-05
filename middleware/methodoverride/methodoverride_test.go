@@ -288,6 +288,72 @@ func TestFormThenHeaderGetter(t *testing.T) {
 	})
 }
 
+// --- QueryGetter factory ---
+
+func TestQueryGetter(t *testing.T) {
+	mw := New(Config{
+		Getter: QueryGetter("_method"),
+	})
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	// POST /api?_method=PUT → method becomes PUT
+	rec, err := testutil.RunChain(t, chain, "POST", "/api",
+		celeristest.WithQuery("_method", "PUT"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "PUT" {
+		t.Fatalf("method: got %q, want PUT", method)
+	}
+}
+
+func TestQueryGetterNoParam(t *testing.T) {
+	mw := New(Config{
+		Getter: QueryGetter("_method"),
+	})
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	// POST /api without query param → method stays POST
+	rec, err := testutil.RunChain(t, chain, "POST", "/api")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "POST" {
+		t.Fatalf("method: got %q, want POST (no query param)", method)
+	}
+}
+
+func TestQueryGetterCaseInsensitive(t *testing.T) {
+	mw := New(Config{
+		Getter: QueryGetter("_method"),
+	})
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	// POST /api?_method=delete → method becomes DELETE (uppercased)
+	rec, err := testutil.RunChain(t, chain, "POST", "/api",
+		celeristest.WithQuery("_method", "delete"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "DELETE" {
+		t.Fatalf("method: got %q, want DELETE", method)
+	}
+}
+
 // --- Skip ---
 
 func TestSkipBypassesOverride(t *testing.T) {

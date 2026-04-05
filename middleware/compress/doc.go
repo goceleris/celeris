@@ -1,9 +1,11 @@
 // Package compress provides transparent response compression middleware
 // for celeris.
 //
-// Supported encodings are zstd, brotli, and gzip, negotiated via the
-// Accept-Encoding request header. The server-side priority order is
-// configurable; the default prefers zstd > brotli > gzip.
+// Supported encodings are zstd, brotli, gzip, and deflate, negotiated via
+// the Accept-Encoding request header. The server-side priority order is
+// configurable; the default prefers zstd > brotli > gzip. Deflate is
+// supported but opt-in only (not in the default Encodings list) because
+// it is a legacy encoding superseded by gzip.
 //
 // Basic usage with defaults (zstd > br > gzip, MinLength 256):
 //
@@ -45,14 +47,34 @@
 // Only 2xx responses are compressed. Error responses (4xx, 5xx), redirects
 // (3xx), and informational responses (1xx) pass through uncompressed.
 //
+// # Deflate (opt-in)
+//
+// The "deflate" encoding (raw DEFLATE, RFC 1951) is supported but not
+// included in the default Encodings list. Add it explicitly:
+//
+//	server.Use(compress.New(compress.Config{
+//	    Encodings: []string{"zstd", "br", "gzip", "deflate"},
+//	}))
+//
+// Deflate is a legacy encoding. Prefer gzip, brotli, or zstd for new
+// deployments.
+//
+// # Streaming Compression
+//
+// For endpoints that produce large or streaming responses, use
+// [NewCompressedStream] to wrap a [celeris.StreamWriter] with on-the-fly
+// gzip or brotli compression. This avoids buffering the entire response
+// body but does not support the expansion guard or MinLength threshold.
+//
 // # Pool Strategy
 //
 // Writer pools eliminate per-request allocations on the hot path:
 //
 //   - gzip: [sync.Pool] of *gzip.Writer — Get, Reset, Write, Close, Put.
 //   - brotli: [sync.Pool] of *brotli.Writer — same pattern.
+//   - deflate: [sync.Pool] of *flate.Writer — same pattern.
 //   - zstd: single thread-safe [zstd.Encoder] — EncodeAll, no pool needed.
-//   - buffers: [sync.Pool] of *bytes.Buffer for gzip/brotli output.
+//   - buffers: [sync.Pool] of *bytes.Buffer for gzip/brotli/deflate output.
 //
 // # StreamWriter Incompatibility
 //

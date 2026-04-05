@@ -2,6 +2,7 @@ package compress
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"errors"
 	"io"
@@ -61,6 +62,17 @@ func decompressZstd(t *testing.T, data []byte) []byte {
 	out, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatalf("zstd read: %v", err)
+	}
+	return out
+}
+
+func decompressDeflate(t *testing.T, data []byte) []byte {
+	t.Helper()
+	r := flate.NewReader(bytes.NewReader(data))
+	defer func() { _ = r.Close() }()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("deflate read: %v", err)
 	}
 	return out
 }
@@ -812,7 +824,7 @@ func TestValidatePanics(t *testing.T) {
 		},
 		{
 			name:   "unsupported encoding",
-			config: Config{Encodings: []string{"deflate"}},
+			config: Config{Encodings: []string{"lz4"}},
 		},
 		{
 			name:   "gzip level too low",
@@ -1234,4 +1246,162 @@ func TestValidateZstdLevel11Panics(t *testing.T) {
 		}
 	}()
 	New(Config{Encodings: []string{"zstd"}, ZstdLevel: 11})
+}
+
+// --- Deflate encoding tests ---
+
+func TestDeflateCompression(t *testing.T) {
+	body := testBody()
+	mw := New(Config{Encodings: []string{"deflate"}})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "deflate"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if rec.Header("content-encoding") != "deflate" {
+		t.Fatalf("expected content-encoding deflate, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressDeflate(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch")
+	}
+}
+
+func TestDeflateNegotiation(t *testing.T) {
+	body := testBody()
+	mw := New(Config{Encodings: []string{"gzip", "deflate"}})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "deflate"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "deflate" {
+		t.Fatalf("expected deflate, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressDeflate(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch")
+	}
+}
+
+func TestDeflateNotInDefaultEncodings(t *testing.T) {
+	body := testBody()
+	// Default config does not include deflate.
+	mw := New()
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "deflate"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Deflate is not in the default encodings list, so should not compress.
+	if rec.Header("content-encoding") != "" {
+		t.Fatalf("expected no compression with default config for deflate-only client, got %q", rec.Header("content-encoding"))
+	}
+}
+
+func TestDeflateLevelBest(t *testing.T) {
+	body := testBody()
+	mw := New(Config{
+		Encodings:    []string{"deflate"},
+		DeflateLevel: LevelBest,
+	})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "deflate"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "deflate" {
+		t.Fatalf("expected deflate, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressDeflate(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch with LevelBest")
+	}
+}
+
+func TestDeflateValidatePanics(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{
+			"deflate level too low",
+			Config{Encodings: []string{"deflate"}, DeflateLevel: -3},
+		},
+		{
+			"deflate level too high",
+			Config{Encodings: []string{"deflate"}, DeflateLevel: 10},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			cfg := applyDefaults(tt.config)
+			cfg.validate()
+		})
+	}
+}
+
+func TestDeflateValidateAcceptsValid(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{
+			"deflate with LevelDefault",
+			Config{Encodings: []string{"deflate"}, DeflateLevel: LevelDefault, ExcludedContentTypes: []string{"image/"}},
+		},
+		{
+			"deflate with LevelNone",
+			Config{Encodings: []string{"deflate"}, DeflateLevel: LevelNone, ExcludedContentTypes: []string{"image/"}},
+		},
+		{
+			"deflate with LevelBest",
+			Config{Encodings: []string{"deflate"}, DeflateLevel: LevelBest, ExcludedContentTypes: []string{"image/"}},
+		},
+		{
+			"deflate with raw level 5",
+			Config{Encodings: []string{"deflate"}, DeflateLevel: 5, ExcludedContentTypes: []string{"image/"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("unexpected panic: %v", r)
+				}
+			}()
+			cfg := applyDefaults(tt.config)
+			cfg.validate()
+		})
+	}
 }

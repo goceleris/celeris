@@ -1,11 +1,15 @@
 package compress_test
 
 import (
+	"strings"
+
+	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/middleware/compress"
 )
 
 func ExampleNew() {
 	// Default: zstd > brotli > gzip, MinLength 256.
+	//   server.Use(compress.New())
 	_ = compress.New()
 }
 
@@ -44,5 +48,35 @@ func ExampleNew_noCompression() {
 	_ = compress.New(compress.Config{
 		Encodings: []string{"gzip"},
 		GzipLevel: compress.LevelNone,
+	})
+}
+
+func ExampleNew_skip() {
+	// Dynamic skip: bypass compression for WebSocket upgrades and
+	// streaming download endpoints.
+	_ = compress.New(compress.Config{
+		Skip: func(c *celeris.Context) bool {
+			if c.Header("upgrade") == "websocket" {
+				return true
+			}
+			return strings.HasPrefix(c.Path(), "/download/")
+		},
+	})
+}
+
+func ExampleNew_zstdLevel() {
+	// Use SpeedBestCompression (level 4) for zstd.
+	_ = compress.New(compress.Config{
+		Encodings: []string{"zstd"},
+		ZstdLevel: compress.LevelBest,
+	})
+}
+
+func ExampleNew_deflate() {
+	// Opt-in to deflate for legacy client support. Deflate is not
+	// included in the default Encodings list.
+	_ = compress.New(compress.Config{
+		Encodings:    []string{"zstd", "br", "gzip", "deflate"},
+		DeflateLevel: compress.LevelDefault,
 	})
 }

@@ -109,3 +109,13 @@ func FormThenHeaderGetter(field, header string) func(*celeris.Context) string {
 		return c.Header(h)
 	}
 }
+
+// QueryGetter returns a getter that reads the override method from the
+// given query parameter. Use with caution: query-based overrides are
+// vulnerable to cross-site attacks via embeddable URLs (e.g.,
+// <img src="...?_method=DELETE">). Prefer HeaderGetter for API clients.
+func QueryGetter(param string) func(*celeris.Context) string {
+	return func(c *celeris.Context) string {
+		return c.Query(param)
+	}
+}

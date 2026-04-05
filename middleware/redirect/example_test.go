@@ -53,3 +53,10 @@ func ExampleRemoveTrailingSlashRewrite() {
 	// Strip trailing slash in-place without sending a redirect.
 	_ = redirect.RemoveTrailingSlashRewrite()
 }
+
+func ExampleHTTPSRedirect_skipPaths() {
+	// Skip HTTPS redirect for health check and readiness probe endpoints.
+	_ = redirect.HTTPSRedirect(redirect.Config{
+		SkipPaths: []string{"/health", "/healthz", "/ready"},
+	})
+}

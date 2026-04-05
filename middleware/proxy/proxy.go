@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"net/netip"
 	"strings"
 
@@ -157,13 +158,9 @@ func splitHostPort(addr string) (string, string, error) {
 }
 
 var (
-	errMissingPort    = &splitError{"missing port"}
-	errMissingBracket = &splitError{"missing ]"}
+	errMissingPort    = errors.New("missing port")
+	errMissingBracket = errors.New("missing ]")
 )
-
-type splitError struct{ s string }
-
-func (e *splitError) Error() string { return e.s }
 
 // isTrusted checks if addr falls within any of the trusted prefixes.
 func isTrusted(addr netip.Addr, nets []netip.Prefix) bool {

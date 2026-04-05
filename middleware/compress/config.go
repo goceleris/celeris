@@ -1,6 +1,7 @@
 package compress
 
 import (
+	"compress/flate"
 	"slices"
 	"strings"
 
@@ -44,8 +45,8 @@ type Config struct {
 	MinLength int
 
 	// Encodings lists the supported encodings in server-side priority order.
-	// Supported values: "zstd", "br", "gzip".
-	// Default: ["zstd", "br", "gzip"].
+	// Supported values: "zstd", "br", "gzip", "deflate".
+	// Default: ["zstd", "br", "gzip"] (deflate is opt-in only).
 	Encodings []string
 
 	// GzipLevel sets the gzip compression level.
@@ -62,6 +63,12 @@ type Config struct {
 	// Default: LevelDefault (0 = library default).
 	// Use LevelNone (-1) for no compression.
 	ZstdLevel Level
+
+	// DeflateLevel sets the deflate (raw DEFLATE, RFC 1951) compression level.
+	// Deflate is a legacy encoding; prefer gzip, brotli, or zstd for new
+	// deployments. Add "deflate" to Encodings to enable it (not included by
+	// default). Default: LevelDefault (0 = library default, flate.DefaultCompression).
+	DeflateLevel Level
 
 	// ExcludedContentTypes lists content-type prefixes that should not be
 	// compressed. Set to an empty slice to disable all content-type exclusions.
@@ -82,9 +89,10 @@ var defaultConfig = Config{
 }
 
 var supportedEncodings = map[string]struct{}{
-	"gzip": {},
-	"br":   {},
-	"zstd": {},
+	"gzip":    {},
+	"br":      {},
+	"zstd":    {},
+	"deflate": {},
 }
 
 func applyDefaults(cfg Config) Config {
@@ -128,6 +136,11 @@ func (cfg Config) validate() {
 			panic("compress: ZstdLevel must be between -1 (LevelNone) and 4 (SpeedBestCompression), or LevelBest")
 		}
 	}
+	if slices.Contains(cfg.Encodings, "deflate") {
+		if cfg.DeflateLevel != LevelBest && (cfg.DeflateLevel < -1 || cfg.DeflateLevel > 9) {
+			panic("compress: DeflateLevel must be between -1 (LevelNone) and 9")
+		}
+	}
 	if cfg.MinLength < 0 {
 		panic("compress: MinLength must be non-negative")
 	}
@@ -135,6 +148,20 @@ func (cfg Config) validate() {
 		if ct == "" {
 			panic("compress: ExcludedContentTypes must not contain empty strings")
 		}
+	}
+}
+
+// resolveDeflateLevel maps sentinel levels to compress/flate library values.
+func resolveDeflateLevel(l Level) int {
+	switch l {
+	case LevelDefault:
+		return flate.DefaultCompression // -1 in stdlib
+	case LevelNone:
+		return flate.NoCompression // 0
+	case LevelBest:
+		return flate.BestCompression // 9
+	default:
+		return int(l)
 	}
 }
 

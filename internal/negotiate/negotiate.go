@@ -123,6 +123,8 @@ func MatchMedia(pattern, offer string) bool {
 	if pattern == "*" || pattern == "*/*" {
 		return true
 	}
+	// Defensive: internal callers (Accept, isExcluded) pass pre-lowered
+	// values, but MatchMedia is exported and may receive mixed-case input.
 	pattern = strings.ToLower(pattern)
 	offer = strings.ToLower(offer)
 	pSlash := strings.IndexByte(pattern, '/')

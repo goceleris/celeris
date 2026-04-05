@@ -31,3 +31,17 @@ func ExampleNew_formThenHeader() {
 		Getter: methodoverride.FormThenHeaderGetter("_method", "X-HTTP-Method"),
 	})
 }
+
+func ExampleNew_queryGetter() {
+	// Read override from ?_method query parameter.
+	// Security: query params are embeddable in links; use with caution.
+	_ = methodoverride.New(methodoverride.Config{
+		Getter: methodoverride.QueryGetter("_method"),
+	})
+}
+
+func ExampleNew_customTargets() {
+	_ = methodoverride.New(methodoverride.Config{
+		TargetMethods: []string{"PUT", "DELETE", "PATCH", "GET"},
+	})
+}

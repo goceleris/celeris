@@ -3,19 +3,32 @@ package etag_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 
+	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/middleware/etag"
 )
 
 func ExampleNew() {
 	// Weak ETags (default) -- suitable for responses that may be
 	// content-negotiated or transfer-encoded.
+	// s := celeris.New()
+	// s.Use(etag.New())
 	_ = etag.New()
 }
 
 func ExampleNew_strong() {
 	// Strong ETags -- byte-for-byte identical guarantee.
 	_ = etag.New(etag.Config{Strong: true})
+}
+
+func ExampleNew_skip() {
+	// Dynamically skip ETag for server-sent event streams.
+	_ = etag.New(etag.Config{
+		Skip: func(c *celeris.Context) bool {
+			return strings.HasPrefix(c.Path(), "/events")
+		},
+	})
 }
 
 func ExampleNew_skipPaths() {

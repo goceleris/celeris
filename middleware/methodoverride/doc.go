@@ -46,6 +46,11 @@
 //	    Getter: methodoverride.FormThenHeaderGetter("_method", "X-HTTP-Method"),
 //	}))
 //
+// [QueryGetter] reads from a URL query parameter. This is provided for
+// parity with Echo but carries security risks: query parameters are
+// embeddable in links and images, potentially enabling cross-site method
+// override attacks. Use only when the security implications are understood.
+//
 // # Target Methods
 //
 // By default, only PUT, DELETE, and PATCH are valid override targets
