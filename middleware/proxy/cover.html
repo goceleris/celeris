@@ -1,0 +1,423 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>proxy: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/goceleris/celeris/middleware/proxy/config.go (100.0%)</option>
+				
+				<option value="file1">github.com/goceleris/celeris/middleware/proxy/proxy.go (92.8%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package proxy
+
+import (
+        "net/netip"
+
+        "github.com/goceleris/celeris"
+)
+
+// Config controls proxy header extraction behavior.
+type Config struct {
+        // Skip is a function that returns true to bypass the middleware for a request.
+        Skip func(c *celeris.Context) bool
+
+        // SkipPaths lists paths to skip (exact match).
+        SkipPaths []string
+
+        // TrustedProxies lists CIDRs or bare IPs whose forwarded headers are trusted.
+        // Bare IPs are expanded to /32 (IPv4) or /128 (IPv6).
+        // An empty list means no headers are trusted (safe default -- middleware is a no-op).
+        // Invalid entries cause a panic at init time.
+        TrustedProxies []string
+
+        // TrustedHeaders lists which forwarded headers to inspect.
+        // "x-forwarded-for" and "x-real-ip" have built-in chain-walk and validation
+        // logic. Any other header name (e.g. "cf-connecting-ip") is treated as a
+        // single-value IP header: the value is parsed with net.ParseIP and used
+        // only if valid.
+        // Values are lowercased at init time.
+        // Default: ["x-forwarded-for", "x-real-ip"].
+        TrustedHeaders []string
+
+        // ForwardedProto enables processing of X-Forwarded-Proto to override Scheme.
+        // When providing a Config struct, set this explicitly; the zero value (false)
+        // means disabled. Use [DefaultConfig] for a pre-populated Config with
+        // ForwardedProto enabled.
+        ForwardedProto bool
+
+        // ForwardedHost enables processing of X-Forwarded-Host to override Host.
+        // When providing a Config struct, set this explicitly; the zero value (false)
+        // means disabled. Use [DefaultConfig] for a pre-populated Config with
+        // ForwardedHost enabled.
+        ForwardedHost bool
+}
+
+var defaultConfig = Config{
+        TrustedHeaders: []string{"x-forwarded-for", "x-real-ip"},
+        ForwardedProto: true,
+        ForwardedHost:  true,
+}
+
+// DefaultConfig returns the default proxy configuration with ForwardedProto
+// and ForwardedHost enabled. Users can modify fields before passing to [New]:
+//
+//        cfg := proxy.DefaultConfig()
+//        cfg.TrustedProxies = []string{"10.0.0.0/8"}
+//        server.Pre(proxy.New(cfg))
+func DefaultConfig() Config <span class="cov8" title="1">{
+        return Config{
+                TrustedHeaders: []string{"x-forwarded-for", "x-real-ip"},
+                ForwardedProto: true,
+                ForwardedHost:  true,
+        }
+}</span>
+
+func applyDefaults(cfg Config) Config <span class="cov8" title="1">{
+        if len(cfg.TrustedHeaders) == 0 </span><span class="cov8" title="1">{
+                cfg.TrustedHeaders = defaultConfig.TrustedHeaders
+        }</span>
+        <span class="cov8" title="1">return cfg</span>
+}
+
+// validate checks Config invariants. parseTrustedProxies already panics on
+// invalid CIDR/IP entries, so this is a placeholder for future constraints.
+func (cfg Config) validate() {<span class="cov8" title="1">}</span>
+
+// parseTrustedProxies parses CIDRs and bare IPs into []netip.Prefix.
+// Panics on invalid entries.
+func parseTrustedProxies(proxies []string) []netip.Prefix <span class="cov8" title="1">{
+        nets := make([]netip.Prefix, 0, len(proxies))
+        for _, entry := range proxies </span><span class="cov8" title="1">{
+                if prefix, err := netip.ParsePrefix(entry); err == nil </span><span class="cov8" title="1">{
+                        nets = append(nets, prefix)
+                        continue</span>
+                }
+                <span class="cov8" title="1">addr, err := netip.ParseAddr(entry)
+                if err != nil </span><span class="cov8" title="1">{
+                        panic("proxy: invalid trusted proxy entry: " + entry)</span>
+                }
+                <span class="cov8" title="1">bits := 128
+                if addr.Is4() </span><span class="cov8" title="1">{
+                        bits = 32
+                }</span>
+                <span class="cov8" title="1">nets = append(nets, netip.PrefixFrom(addr, bits))</span>
+        }
+        <span class="cov8" title="1">return nets</span>
+}
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package proxy
+
+import (
+        "net/netip"
+        "strings"
+
+        "github.com/goceleris/celeris"
+)
+
+// New creates a proxy middleware that extracts real client IP, scheme, and host
+// from trusted reverse proxy headers. Pass zero or one Config; zero-value
+// fields are filled with safe defaults.
+func New(config ...Config) celeris.HandlerFunc <span class="cov8" title="1">{
+        cfg := defaultConfig
+        if len(config) &gt; 0 </span><span class="cov8" title="1">{
+                cfg = config[0]
+        }</span>
+        <span class="cov8" title="1">cfg = applyDefaults(cfg)
+        cfg.validate()
+
+        trustedNets := parseTrustedProxies(cfg.TrustedProxies)
+
+        headers := make([]string, len(cfg.TrustedHeaders))
+        for i, h := range cfg.TrustedHeaders </span><span class="cov8" title="1">{
+                headers[i] = strings.ToLower(h)
+        }</span>
+
+        <span class="cov8" title="1">hasXFF := false
+        hasXRI := false
+        var otherHeaders []string
+        for _, h := range headers </span><span class="cov8" title="1">{
+                switch h </span>{
+                case "x-forwarded-for":<span class="cov8" title="1">
+                        hasXFF = true</span>
+                case "x-real-ip":<span class="cov8" title="1">
+                        hasXRI = true</span>
+                default:<span class="cov8" title="1">
+                        otherHeaders = append(otherHeaders, h)</span>
+                }
+        }
+
+        <span class="cov8" title="1">forwardedProto := cfg.ForwardedProto
+        forwardedHost := cfg.ForwardedHost
+
+        var skip celeris.SkipHelper
+        skip.Init(cfg.SkipPaths, cfg.Skip)
+
+        return func(c *celeris.Context) error </span><span class="cov8" title="1">{
+                if skip.ShouldSkip(c) </span><span class="cov8" title="1">{
+                        return c.Next()
+                }</span>
+
+                <span class="cov8" title="1">if len(trustedNets) == 0 </span><span class="cov8" title="1">{
+                        return c.Next()
+                }</span>
+
+                <span class="cov8" title="1">peer, ok := extractPeerIP(c.RemoteAddr())
+                if !ok </span><span class="cov8" title="1">{
+                        return c.Next()
+                }</span>
+
+                <span class="cov8" title="1">if !isTrusted(peer, trustedNets) </span><span class="cov8" title="1">{
+                        return c.Next()
+                }</span>
+
+                <span class="cov8" title="1">var clientIP string
+                if hasXFF </span><span class="cov8" title="1">{
+                        if xff := c.Header("x-forwarded-for"); xff != "" </span><span class="cov8" title="1">{
+                                clientIP = walkXFF(xff, trustedNets)
+                        }</span>
+                }
+                <span class="cov8" title="1">if clientIP == "" &amp;&amp; hasXRI </span><span class="cov8" title="1">{
+                        if xri := c.Header("x-real-ip"); xri != "" </span><span class="cov8" title="1">{
+                                raw := strings.TrimSpace(xri)
+                                if addr, err := netip.ParseAddr(raw); err == nil </span><span class="cov8" title="1">{
+                                        clientIP = addr.Unmap().String()
+                                }</span>
+                        }
+                }
+                <span class="cov8" title="1">if clientIP == "" </span><span class="cov8" title="1">{
+                        for _, h := range otherHeaders </span><span class="cov8" title="1">{
+                                if val := c.Header(h); val != "" </span><span class="cov8" title="1">{
+                                        raw := strings.TrimSpace(val)
+                                        if addr, err := netip.ParseAddr(raw); err == nil </span><span class="cov8" title="1">{
+                                                clientIP = addr.Unmap().String()
+                                                break</span>
+                                        }
+                                }
+                        }
+                }
+
+                <span class="cov8" title="1">if clientIP != "" </span><span class="cov8" title="1">{
+                        c.SetClientIP(clientIP)
+                }</span>
+
+                <span class="cov8" title="1">if forwardedProto </span><span class="cov8" title="1">{
+                        if proto := c.Header("x-forwarded-proto"); proto != "" </span><span class="cov8" title="1">{
+                                p := strings.ToLower(strings.TrimSpace(proto))
+                                if p == "http" || p == "https" </span><span class="cov8" title="1">{
+                                        c.SetScheme(p)
+                                }</span>
+                        }
+                }
+
+                <span class="cov8" title="1">if forwardedHost </span><span class="cov8" title="1">{
+                        if host := c.Header("x-forwarded-host"); host != "" </span><span class="cov8" title="1">{
+                                h := strings.TrimSpace(host)
+                                if isValidHost(h) </span><span class="cov8" title="1">{
+                                        c.SetHost(h)
+                                }</span>
+                        }
+                }
+
+                <span class="cov8" title="1">return c.Next()</span>
+        }
+}
+
+// extractPeerIP extracts the IP from a "host:port" address.
+// Handles IPv6 bracket notation. Normalizes IPv4-mapped IPv6 via Unmap.
+func extractPeerIP(addr string) (netip.Addr, bool) <span class="cov8" title="1">{
+        if addr == "" </span><span class="cov8" title="1">{
+                return netip.Addr{}, false
+        }</span>
+        <span class="cov8" title="1">host, _, err := splitHostPort(addr)
+        if err != nil </span><span class="cov0" title="0">{
+                host = addr
+        }</span>
+        <span class="cov8" title="1">a, err := netip.ParseAddr(host)
+        if err != nil </span><span class="cov0" title="0">{
+                return netip.Addr{}, false
+        }</span>
+        <span class="cov8" title="1">return a.Unmap(), true</span>
+}
+
+// splitHostPort is a lightweight host:port splitter that avoids net.SplitHostPort's
+// allocation. It handles bracketed IPv6 ([::1]:port).
+func splitHostPort(addr string) (string, string, error) <span class="cov8" title="1">{
+        if len(addr) == 0 </span><span class="cov0" title="0">{
+                return "", "", errMissingPort
+        }</span>
+        <span class="cov8" title="1">if addr[0] == '[' </span><span class="cov8" title="1">{
+                end := strings.IndexByte(addr, ']')
+                if end &lt; 0 </span><span class="cov0" title="0">{
+                        return "", "", errMissingBracket
+                }</span>
+                <span class="cov8" title="1">host := addr[1:end]
+                if end+1 &lt; len(addr) &amp;&amp; addr[end+1] == ':' </span><span class="cov8" title="1">{
+                        return host, addr[end+2:], nil
+                }</span>
+                <span class="cov0" title="0">return host, "", nil</span>
+        }
+        <span class="cov8" title="1">colon := strings.LastIndexByte(addr, ':')
+        if colon &lt; 0 </span><span class="cov0" title="0">{
+                return addr, "", errMissingPort
+        }</span>
+        <span class="cov8" title="1">return addr[:colon], addr[colon+1:], nil</span>
+}
+
+var (
+        errMissingPort    = &amp;splitError{"missing port"}
+        errMissingBracket = &amp;splitError{"missing ]"}
+)
+
+type splitError struct{ s string }
+
+func (e *splitError) Error() string <span class="cov0" title="0">{ return e.s }</span>
+
+// isTrusted checks if addr falls within any of the trusted prefixes.
+func isTrusted(addr netip.Addr, nets []netip.Prefix) bool <span class="cov8" title="1">{
+        for _, n := range nets </span><span class="cov8" title="1">{
+                if n.Contains(addr) </span><span class="cov8" title="1">{
+                        return true
+                }</span>
+        }
+        <span class="cov8" title="1">return false</span>
+}
+
+// walkXFF walks X-Forwarded-For right-to-left, skipping trusted IPs.
+// Returns the first untrusted IP (normalized), or empty string if all are
+// trusted or a malformed entry is encountered.
+func walkXFF(xff string, nets []netip.Prefix) string <span class="cov8" title="1">{
+        parts := strings.Split(xff, ",")
+        for i := len(parts) - 1; i &gt;= 0; i-- </span><span class="cov8" title="1">{
+                raw := strings.TrimSpace(parts[i])
+                if raw == "" </span><span class="cov0" title="0">{
+                        continue</span>
+                }
+                <span class="cov8" title="1">addr, err := netip.ParseAddr(raw)
+                if err != nil </span><span class="cov8" title="1">{
+                        return ""
+                }</span>
+                <span class="cov8" title="1">addr = addr.Unmap()
+                trusted := false
+                for _, n := range nets </span><span class="cov8" title="1">{
+                        if n.Contains(addr) </span><span class="cov8" title="1">{
+                                trusted = true
+                                break</span>
+                        }
+                }
+                <span class="cov8" title="1">if !trusted </span><span class="cov8" title="1">{
+                        return addr.String()
+                }</span>
+        }
+        <span class="cov8" title="1">return ""</span>
+}
+
+// isValidHost returns true if the host string does not contain
+// characters that could enable header injection or path traversal.
+func isValidHost(host string) bool <span class="cov8" title="1">{
+        if host == "" </span><span class="cov8" title="1">{
+                return false
+        }</span>
+        <span class="cov8" title="1">for i := 0; i &lt; len(host); i++ </span><span class="cov8" title="1">{
+                switch host[i] </span>{
+                case '\r', '\n', '\x00', '/', '?', '#', '@':<span class="cov8" title="1">
+                        return false</span>
+                }
+        }
+        <span class="cov8" title="1">return true</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

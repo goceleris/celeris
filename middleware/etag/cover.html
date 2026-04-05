@@ -1,0 +1,332 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>etag: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/goceleris/celeris/middleware/etag/config.go (100.0%)</option>
+				
+				<option value="file1">github.com/goceleris/celeris/middleware/etag/etag.go (97.2%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package etag
+
+import "github.com/goceleris/celeris"
+
+// Config defines the ETag middleware configuration.
+type Config struct {
+        // Skip defines a function to skip this middleware for certain requests.
+        Skip func(c *celeris.Context) bool
+
+        // SkipPaths lists paths to skip (exact match).
+        SkipPaths []string
+
+        // Weak controls whether ETags use the weak format W/"xxxxxxxx".
+        // Default: true.
+        Weak bool
+
+        // HashFunc computes a custom ETag from the response body.
+        // When set, the returned string is used as the opaque-tag (without quotes
+        // or W/ prefix -- those are added automatically based on the Weak setting).
+        // Default: CRC-32 IEEE hex.
+        HashFunc func(body []byte) string
+}
+
+// defaultConfig is the default ETag configuration.
+// It is unexported to prevent mutation; use New() with no arguments
+// for the default behavior.
+var defaultConfig = Config{
+        Weak: true,
+}
+
+// applyDefaults is intentionally empty -- Weak defaults to true via
+// defaultConfig, and there are no zero-value fields to backfill.
+// Kept for consistency with the middleware pattern.
+func applyDefaults(cfg Config) Config <span class="cov8" title="1">{
+        return cfg
+}</span>
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package etag
+
+import (
+        "encoding/hex"
+        "hash/crc32"
+
+        "github.com/goceleris/celeris"
+)
+
+// New creates an ETag middleware with the given config.
+func New(config ...Config) celeris.HandlerFunc <span class="cov8" title="1">{
+        cfg := defaultConfig
+        if len(config) &gt; 0 </span><span class="cov8" title="1">{
+                cfg = config[0]
+        }</span>
+        <span class="cov8" title="1">cfg = applyDefaults(cfg)
+
+        var skip celeris.SkipHelper
+        skip.Init(cfg.SkipPaths, cfg.Skip)
+
+        weak := cfg.Weak
+        hashFunc := cfg.HashFunc
+
+        return func(c *celeris.Context) error </span><span class="cov8" title="1">{
+                if skip.ShouldSkip(c) </span><span class="cov8" title="1">{
+                        return c.Next()
+                }</span>
+
+                <span class="cov8" title="1">m := c.Method()
+                if m != "GET" &amp;&amp; m != "HEAD" </span><span class="cov8" title="1">{
+                        return c.Next()
+                }</span>
+
+                <span class="cov8" title="1">c.BufferResponse()
+                err := c.Next()
+
+                status := c.ResponseStatus()
+                body := c.ResponseBody()
+
+                if status &lt; 200 || status &gt;= 300 || len(body) == 0 </span><span class="cov8" title="1">{
+                        if ferr := c.FlushResponse(); ferr != nil &amp;&amp; err == nil </span><span class="cov0" title="0">{
+                                err = ferr
+                        }</span>
+                        <span class="cov8" title="1">return err</span>
+                }
+
+                // Check if handler already set an etag header.
+                <span class="cov8" title="1">existingTag := ""
+                for _, h := range c.ResponseHeaders() </span><span class="cov8" title="1">{
+                        if h[0] == "etag" </span><span class="cov8" title="1">{
+                                existingTag = h[1]
+                                break</span>
+                        }
+                }
+
+                <span class="cov8" title="1">var tag string
+                if existingTag != "" </span><span class="cov8" title="1">{
+                        tag = existingTag
+                }</span> else<span class="cov8" title="1"> if hashFunc != nil </span><span class="cov8" title="1">{
+                        opaque := hashFunc(body)
+                        if weak </span><span class="cov8" title="1">{
+                                tag = `W/"` + opaque + `"`
+                        }</span> else<span class="cov8" title="1"> {
+                                tag = `"` + opaque + `"`
+                        }</span>
+                } else<span class="cov8" title="1"> {
+                        checksum := crc32.ChecksumIEEE(body)
+                        tag = formatETag(checksum, weak)
+                }</span>
+
+                <span class="cov8" title="1">inm := c.Header("if-none-match")
+                if inm != "" &amp;&amp; etagMatch(inm, tag) </span><span class="cov8" title="1">{
+                        if existingTag == "" </span><span class="cov8" title="1">{
+                                c.SetHeader("etag", tag)
+                        }</span>
+                        <span class="cov8" title="1">c.DiscardBufferedResponse()
+                        if nerr := c.NoContent(304); nerr != nil &amp;&amp; err == nil </span><span class="cov0" title="0">{
+                                err = nerr
+                        }</span>
+                        <span class="cov8" title="1">return err</span>
+                }
+
+                <span class="cov8" title="1">if existingTag == "" </span><span class="cov8" title="1">{
+                        c.SetHeader("etag", tag)
+                }</span>
+                <span class="cov8" title="1">if ferr := c.FlushResponse(); ferr != nil &amp;&amp; err == nil </span><span class="cov0" title="0">{
+                        err = ferr
+                }</span>
+                <span class="cov8" title="1">return err</span>
+        }
+}
+
+// formatETag formats a CRC-32 checksum as an ETag value using a stack buffer.
+func formatETag(checksum uint32, weak bool) string <span class="cov8" title="1">{
+        var buf [14]byte
+        if weak </span><span class="cov8" title="1">{
+                buf[0] = 'W'
+                buf[1] = '/'
+                buf[2] = '"'
+                hex.Encode(buf[3:11], []byte{byte(checksum &gt;&gt; 24), byte(checksum &gt;&gt; 16), byte(checksum &gt;&gt; 8), byte(checksum)})
+                buf[11] = '"'
+                return string(buf[:12])
+        }</span>
+        <span class="cov8" title="1">buf[0] = '"'
+        hex.Encode(buf[1:9], []byte{byte(checksum &gt;&gt; 24), byte(checksum &gt;&gt; 16), byte(checksum &gt;&gt; 8), byte(checksum)})
+        buf[9] = '"'
+        return string(buf[:10])</span>
+}
+
+// opaqueTag strips the W/ prefix and quotes from an ETag value.
+// Returns the opaque-tag for weak comparison per RFC 7232 Section 2.3.2.
+func opaqueTag(etag string) string <span class="cov8" title="1">{
+        if len(etag) &gt;= 4 &amp;&amp; etag[0] == 'W' &amp;&amp; etag[1] == '/' </span><span class="cov8" title="1">{
+                etag = etag[2:]
+        }</span>
+        <span class="cov8" title="1">if len(etag) &gt;= 2 &amp;&amp; etag[0] == '"' &amp;&amp; etag[len(etag)-1] == '"' </span><span class="cov8" title="1">{
+                return etag[1 : len(etag)-1]
+        }</span>
+        <span class="cov8" title="1">return etag</span>
+}
+
+// etagMatch checks if the If-None-Match header matches the given tag.
+// Implements weak comparison per RFC 7232 Section 2.3.2.
+func etagMatch(inm, tag string) bool <span class="cov8" title="1">{
+        tagOpaque := opaqueTag(tag)
+
+        if inm == "*" </span><span class="cov8" title="1">{
+                return true
+        }</span>
+
+        <span class="cov8" title="1">for len(inm) &gt; 0 </span><span class="cov8" title="1">{
+                // Skip whitespace.
+                for len(inm) &gt; 0 &amp;&amp; inm[0] == ' ' </span><span class="cov8" title="1">{
+                        inm = inm[1:]
+                }</span>
+                <span class="cov8" title="1">if len(inm) == 0 </span><span class="cov8" title="1">{
+                        break</span>
+                }
+
+                <span class="cov8" title="1">var candidate string
+                if inm[0] == '"' </span><span class="cov8" title="1">{
+                        end := 1
+                        for end &lt; len(inm) &amp;&amp; inm[end] != '"' </span><span class="cov8" title="1">{
+                                end++
+                        }</span>
+                        <span class="cov8" title="1">if end &lt; len(inm) </span><span class="cov8" title="1">{
+                                candidate = inm[:end+1]
+                                inm = inm[end+1:]
+                        }</span> else<span class="cov8" title="1"> {
+                                candidate = inm
+                                inm = ""
+                        }</span>
+                } else<span class="cov8" title="1"> if len(inm) &gt;= 2 &amp;&amp; inm[0] == 'W' &amp;&amp; inm[1] == '/' </span><span class="cov8" title="1">{
+                        if len(inm) &gt;= 3 &amp;&amp; inm[2] == '"' </span><span class="cov8" title="1">{
+                                end := 3
+                                for end &lt; len(inm) &amp;&amp; inm[end] != '"' </span><span class="cov8" title="1">{
+                                        end++
+                                }</span>
+                                <span class="cov8" title="1">if end &lt; len(inm) </span><span class="cov8" title="1">{
+                                        candidate = inm[:end+1]
+                                        inm = inm[end+1:]
+                                }</span> else<span class="cov8" title="1"> {
+                                        candidate = inm
+                                        inm = ""
+                                }</span>
+                        } else<span class="cov8" title="1"> {
+                                break</span>
+                        }
+                } else<span class="cov8" title="1"> {
+                        end := 0
+                        for end &lt; len(inm) &amp;&amp; inm[end] != ',' </span><span class="cov8" title="1">{
+                                end++
+                        }</span>
+                        <span class="cov8" title="1">candidate = inm[:end]
+                        inm = inm[end:]</span>
+                }
+
+                <span class="cov8" title="1">if opaqueTag(candidate) == tagOpaque </span><span class="cov8" title="1">{
+                        return true
+                }</span>
+
+                // Skip comma and whitespace.
+                <span class="cov8" title="1">for len(inm) &gt; 0 &amp;&amp; (inm[0] == ',' || inm[0] == ' ') </span><span class="cov8" title="1">{
+                        inm = inm[1:]
+                }</span>
+        }
+
+        <span class="cov8" title="1">return false</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>
