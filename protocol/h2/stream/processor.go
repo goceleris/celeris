@@ -84,12 +84,12 @@ type Processor struct {
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
-	InlineCachedCtx      any            // per-connection cached app context for inline handlers (avoids sync.Pool)
-	hasMoreFrames        bool           // true when more frames follow in current recv (defers inline cleanup)
-	pendingInlineCleanup []*Stream      // inline-completed streams deferred until frame loop exits
-	InlineWriter         h2Conn         // direct-to-outBuf writer for inline handlers (set by conn layer)
-	InlineCount          uint64         // number of requests handled inline (for metrics)
-	MaxRequestBodySize   int64          // 0 = use default (100 MB)
+	InlineCachedCtx      any       // per-connection cached app context for inline handlers (avoids sync.Pool)
+	hasMoreFrames        bool      // true when more frames follow in current recv (defers inline cleanup)
+	pendingInlineCleanup []*Stream // inline-completed streams deferred until frame loop exits
+	InlineWriter         h2Conn    // direct-to-outBuf writer for inline handlers (set by conn layer)
+	InlineCount          uint64    // number of requests handled inline (for metrics)
+	MaxRequestBodySize   int64     // 0 = use default (100 MB)
 }
 
 func (p *Processor) maxBodySize() int64 {

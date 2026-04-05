@@ -115,4 +115,3 @@ func (rw *toStdlibResponseWriter) WriteResponse(_ *stream.Stream, status int, he
 	}
 	return nil
 }
-
