@@ -30,6 +30,32 @@ mage fuzz      # Run fuzz tests (30s default, set FUZZ_TIME to override)
 mage check     # Run all checks: lint + test + spec + build
 ```
 
+### Sub-Module Testing
+
+The `middleware/metrics` and `middleware/otel` packages have their own `go.mod` files (to isolate heavy Prometheus and OpenTelemetry dependencies from the core module). These are tested automatically in CI but require separate commands locally:
+
+```bash
+# Root module (includes all middleware except metrics + otel)
+go test -race ./...
+
+# Sub-modules (separate go.mod)
+cd middleware/metrics && go test -race ./...
+cd middleware/otel && go test -race ./...
+```
+
+### Middleware Development
+
+All middleware lives under `middleware/`. Each package follows a consistent pattern:
+
+- `config.go` — Config struct with defaults, validation (panics on invalid config at init)
+- `<name>.go` — Middleware implementation using `New(config ...Config) celeris.HandlerFunc`
+- `doc.go` — Package-level godoc with usage examples and security notes
+- `<name>_test.go` — Comprehensive tests with race detection
+- `bench_test.go` — Benchmarks with `b.ReportAllocs()`
+- `example_test.go` — Runnable examples for godoc
+
+When adding middleware, use `celeris.SkipHelper` for skip logic (not manual `skipMap`). See `middleware/recovery` or `middleware/cors` for reference implementations.
+
 ### Linux Testing from macOS
 
 The io_uring and epoll engines only compile and run on Linux. Use the Multipass VM targets to test from macOS:
@@ -46,9 +72,11 @@ The VM is created automatically on first use (Ubuntu Noble, 4 CPUs, 4 GB RAM). U
 ### Benchmarking
 
 ```bash
-mage localBenchmark   # A/B benchmark: main vs current branch (Multipass VM)
-mage localProfile     # Capture pprof profiles for main vs current branch
-mage bench            # Run Go benchmarks (local, any OS)
+mage localBenchmark       # A/B benchmark: main vs current branch (Multipass VM)
+mage localProfile         # Capture pprof profiles for main vs current branch
+mage bench                # Run Go benchmarks (local, any OS)
+mage middlewareBenchmark  # Compare middleware against Fiber/Echo/Chi/stdlib
+mage middlewareProfile    # CPU profile each middleware individually
 ```
 
 ### Available Mage Targets
@@ -63,7 +91,7 @@ mage -l    # List all available targets
 - Include tests for new functionality
 - Run `mage check` before submitting (or `mage checkLinux` if touching engine code)
 - Follow existing code style (enforced by golangci-lint)
-- Write clear commit messages following the `type: description` format (e.g., `feat:`, `fix:`, `perf:`, `docs:`, `test:`, `chore:`)
+- Write clear commit messages following the `type: description` format (e.g., `feat:`, `fix:`, `perf:`, `security:`, `test:`, `chore:`)
 - Security-sensitive changes should note the CWE number in the commit message
 
 ## Code Style
@@ -73,12 +101,14 @@ mage -l    # List all available targets
 - Only add comments where the logic is not self-evident
 - Use `mage lint` to verify (runs golangci-lint across darwin + linux)
 - Hot-path code: avoid allocations, avoid `defer` for Lock/Unlock, prefer inline fast-paths with fallback to function calls
+- Do not add redundant tests that only check constant values or duplicate existing test coverage
 
 ## Testing
 
 - Unit tests go in `*_test.go` files alongside the code
 - Integration tests (multi-engine, adaptive, etc.) go in `test/integration/`
 - Conformance tests (HTTP/1.1 RFC 9112, HTTP/2 h2spec) go in `test/spec/`
+- Middleware benchmarks comparing against other frameworks go in `test/benchcmp/`
 - Use the `celeristest` package for Context/ResponseRecorder test helpers
 - Run with `-race` flag (all CI runs use race detection)
 
