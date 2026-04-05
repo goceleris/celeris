@@ -2,7 +2,6 @@ package compress
 
 import (
 	"io"
-	"sync"
 
 	"github.com/andybalholm/brotli"
 	kgzip "github.com/klauspost/compress/gzip"
@@ -24,7 +23,6 @@ type CompressedStream struct {
 	sw       *celeris.StreamWriter
 	writer   io.WriteCloser
 	encoding string
-	pool     *sync.Pool
 	closed   bool
 }
 
