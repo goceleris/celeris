@@ -21,6 +21,9 @@ func Accept(header string, offers []string) string {
 	bestIdx := len(entries) // higher = worse; prefer earlier Accept entries on tie
 	for _, offer := range offers {
 		for idx, e := range entries {
+			if e.Quality <= 0 {
+				continue
+			}
 			if !MatchMedia(e.MediaType, offer) {
 				continue
 			}
@@ -40,7 +43,15 @@ func Accept(header string, offers []string) string {
 // Parse parses an Accept header value into a slice of AcceptItems.
 func Parse(header string) []AcceptItem {
 	var entries []AcceptItem
-	for _, part := range strings.Split(header, ",") {
+	for len(header) > 0 {
+		var part string
+		if i := strings.IndexByte(header, ','); i >= 0 {
+			part = header[:i]
+			header = header[i+1:]
+		} else {
+			part = header
+			header = ""
+		}
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -49,7 +60,15 @@ func Parse(header string) []AcceptItem {
 		if i := strings.IndexByte(part, ';'); i >= 0 {
 			params := part[i+1:]
 			e.MediaType = strings.TrimSpace(part[:i])
-			for _, p := range strings.Split(params, ";") {
+			for len(params) > 0 {
+				var p string
+				if j := strings.IndexByte(params, ';'); j >= 0 {
+					p = params[:j]
+					params = params[j+1:]
+				} else {
+					p = params
+					params = ""
+				}
 				p = strings.TrimSpace(p)
 				if strings.HasPrefix(p, "q=") {
 					if q, err := strconv.ParseFloat(p[2:], 64); err == nil {
@@ -69,9 +88,9 @@ func Parse(header string) []AcceptItem {
 }
 
 // MatchMedia returns true if the Accept pattern matches the offered media type.
-// Supports wildcards: "*/*" matches everything, "text/*" matches any text subtype.
+// Supports wildcards: "*" or "*/*" matches everything, "text/*" matches any text subtype.
 func MatchMedia(pattern, offer string) bool {
-	if pattern == "*/*" {
+	if pattern == "*" || pattern == "*/*" {
 		return true
 	}
 	pSlash := strings.IndexByte(pattern, '/')
