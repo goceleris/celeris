@@ -37,14 +37,14 @@ func weakCRC32ETag(body []byte) string {
 
 // Pre-computed bodies and ETags used across benchmarks.
 var (
-	textBody       = []byte(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 20))
+	textBody        = []byte(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 20))
 	textHandlerETag = weakCRC32ETag(textBody)
 
-	html4KB       = []byte("<html><head><title>Example</title></head><body>" + strings.Repeat("<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>", 60) + "</body></html>")
-	html4KBETag   = weakCRC32ETag(html4KB)
+	html4KB     = []byte("<html><head><title>Example</title></head><body>" + strings.Repeat("<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>", 60) + "</body></html>")
+	html4KBETag = weakCRC32ETag(html4KB)
 
-	json1KB       = []byte(`{"users":[` + strings.Repeat(`{"id":1,"name":"Alice","email":"alice@example.com","role":"admin"},`, 12) + `{"id":13,"name":"Bob","email":"bob@example.com","role":"user"}]}`)
-	json1KBETag   = weakCRC32ETag(json1KB)
+	json1KB     = []byte(`{"users":[` + strings.Repeat(`{"id":1,"name":"Alice","email":"alice@example.com","role":"admin"},`, 12) + `{"id":13,"name":"Bob","email":"bob@example.com","role":"user"}]}`)
+	json1KBETag = weakCRC32ETag(json1KB)
 )
 
 // jsonHandler simulates a typical JSON API response.
