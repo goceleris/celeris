@@ -181,7 +181,7 @@ func TestMissingTokenReturnsErrTokenMissing(t *testing.T) {
 	}
 }
 
-func TestInvalidTokenReturnsErrTokenInvalid(t *testing.T) {
+func TestInvalidTokenReturnsErrJWTMalformed(t *testing.T) {
 	mw := New(Config{SigningKey: testSecret})
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
@@ -191,8 +191,8 @@ func TestInvalidTokenReturnsErrTokenInvalid(t *testing.T) {
 		celeristest.WithHeader("authorization", "Bearer invalid.token.here"),
 	)
 	assertHTTPError(t, err, 401)
-	if !errors.Is(err, ErrTokenInvalid) {
-		t.Fatalf("expected ErrTokenInvalid, got %v", err)
+	if !errors.Is(err, ErrJWTMalformed) {
+		t.Fatalf("expected ErrJWTMalformed, got %v", err)
 	}
 }
 
@@ -210,8 +210,8 @@ func TestExpiredTokenRejected(t *testing.T) {
 		celeristest.WithHeader("authorization", "Bearer "+tokenStr),
 	)
 	assertHTTPError(t, err, 401)
-	if !errors.Is(err, ErrTokenInvalid) {
-		t.Fatalf("expected ErrTokenInvalid, got %v", err)
+	if !errors.Is(err, ErrJWTExpired) {
+		t.Fatalf("expected ErrJWTExpired, got %v", err)
 	}
 }
 
@@ -670,9 +670,9 @@ func TestErrorWrapping(t *testing.T) {
 	_, err := runChain(t, chain, "GET", "/",
 		celeristest.WithHeader("authorization", "Bearer invalid.token.here"),
 	)
-	// The error should wrap ErrTokenInvalid.
-	if !errors.Is(err, ErrTokenInvalid) {
-		t.Fatalf("expected errors.Is(ErrTokenInvalid), got %v", err)
+	// Malformed tokens should wrap ErrJWTMalformed.
+	if !errors.Is(err, ErrJWTMalformed) {
+		t.Fatalf("expected errors.Is(ErrJWTMalformed), got %v", err)
 	}
 	// The multi-wrapped error should contain the jwtparse malformed error.
 	if !errors.Is(err, jwtparse.ErrTokenMalformed) {
@@ -691,8 +691,9 @@ func TestErrorWrappingExpired(t *testing.T) {
 	_, err := runChain(t, chain, "GET", "/",
 		celeristest.WithHeader("authorization", "Bearer "+tokenStr),
 	)
-	if !errors.Is(err, ErrTokenInvalid) {
-		t.Fatalf("expected errors.Is(ErrTokenInvalid), got %v", err)
+	// Expired tokens should wrap ErrJWTExpired.
+	if !errors.Is(err, ErrJWTExpired) {
+		t.Fatalf("expected errors.Is(ErrJWTExpired), got %v", err)
 	}
 	// Should also wrap the jwtparse expiration error.
 	if !errors.Is(err, jwtparse.ErrTokenExpired) {

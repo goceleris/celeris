@@ -3,6 +3,7 @@ package jwt
 import (
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 
 	"github.com/goceleris/celeris"
@@ -16,8 +17,16 @@ var ErrUnauthorized = celeris.NewHTTPError(401, "Unauthorized")
 // ErrTokenMissing is returned when no token is found in the request.
 var ErrTokenMissing = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: missing or malformed token")}
 
-// ErrTokenInvalid is returned when the token is invalid or expired.
+// ErrTokenInvalid is returned when the token fails validation for reasons
+// other than expiration or malformation (e.g., bad signature, unknown kid).
 var ErrTokenInvalid = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: invalid or expired token")}
+
+// ErrJWTExpired is returned when the token's exp claim is in the past.
+var ErrJWTExpired = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: token has expired")}
+
+// ErrJWTMalformed is returned when the token cannot be parsed (bad
+// encoding, wrong number of segments, etc.).
+var ErrJWTMalformed = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: token is malformed")}
 
 // New creates a JWT authentication middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
@@ -43,7 +52,11 @@ func New(config ...Config) celeris.HandlerFunc {
 		validMethods = []string{cfg.SigningMethod.Alg()}
 	}
 
-	keyFunc := resolveKeyFunc(cfg, customValidMethods)
+	keyFunc, jwksFetchers := resolveKeyFunc(cfg, customValidMethods)
+
+	if len(jwksFetchers) > 0 && (cfg.JWKSPreload == nil || *cfg.JWKSPreload) {
+		preloadJWKS(jwksFetchers)
+	}
 
 	tokenCtxKey := cfg.TokenContextKey
 	claimsCtxKey := cfg.ClaimsContextKey
@@ -106,7 +119,7 @@ func New(config ...Config) celeris.HandlerFunc {
 				}
 				jwtparse.ReleaseToken(token)
 			}
-			wrappedErr := fmt.Errorf("%w: %w", ErrTokenInvalid, err)
+			wrappedErr := classifyTokenError(err)
 			return handleError(c, wrappedErr)
 		}
 
@@ -208,5 +221,30 @@ func cloneClaims(template jwtparse.Claims) jwtparse.Claims {
 			panic(fmt.Sprintf("jwt: unsupported custom claims type %T; use ClaimsFactory for non-struct types", template))
 		}
 		return reflect.New(t).Interface().(jwtparse.Claims)
+	}
+}
+
+// classifyTokenError inspects the parser error and wraps it with the
+// appropriate HTTPError sentinel so callers can distinguish expired
+// tokens from malformed ones without inspecting internal parse errors.
+func classifyTokenError(err error) error {
+	if err == nil {
+		return fmt.Errorf("%w: token not valid", ErrTokenInvalid)
+	}
+	if errors.Is(err, jwtparse.ErrTokenExpired) || errors.Is(err, jwtparse.ErrTokenNotValidYet) || errors.Is(err, jwtparse.ErrTokenUsedBeforeIssued) {
+		return fmt.Errorf("%w: %w", ErrJWTExpired, err)
+	}
+	if errors.Is(err, jwtparse.ErrTokenMalformed) || errors.Is(err, jwtparse.ErrTokenUnverifiable) {
+		return fmt.Errorf("%w: %w", ErrJWTMalformed, err)
+	}
+	return fmt.Errorf("%w: %w", ErrTokenInvalid, err)
+}
+
+// preloadJWKS eagerly fetches JWKS keys at startup when enabled.
+func preloadJWKS(fetchers []*jwksFetcher) {
+	for _, f := range fetchers {
+		if err := f.Preload(); err != nil {
+			log.Printf("jwt: JWKS preload from %s failed (will lazy-fetch on first request): %v", f.url, err)
+		}
 	}
 }

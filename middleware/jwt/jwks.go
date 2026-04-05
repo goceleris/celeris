@@ -39,6 +39,13 @@ func newJWKSFetcher(url string, refresh time.Duration) *jwksFetcher {
 	}
 }
 
+// Preload synchronously fetches the JWKS keyset so the first request
+// does not block on a network call. Returns an error if the fetch fails,
+// but the fetcher remains usable (lazy fallback on first request).
+func (f *jwksFetcher) Preload() error {
+	return f.fetch()
+}
+
 func (f *jwksFetcher) keyFunc(t *jwtparse.Token) (any, error) {
 	kid := t.Header.Kid
 

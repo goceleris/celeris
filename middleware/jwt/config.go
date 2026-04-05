@@ -79,6 +79,14 @@ type Config struct {
 	// Default: 1h.
 	JWKSRefresh time.Duration
 
+	// JWKSPreload controls whether JWKS keys are fetched eagerly at
+	// middleware creation time. When nil (default) or pointing to true,
+	// Preload is enabled and the first request avoids a blocking network
+	// call. Set to a pointer to false to disable preloading (lazy fetch
+	// on first request). If preload fails, a warning is logged and the
+	// middleware falls back to lazy fetching.
+	JWKSPreload *bool
+
 	// TokenProcessorFunc is called on the raw token string after extraction
 	// but before parsing. Use it for decryption, decompression, or other
 	// transformations. If it returns an error, the middleware returns
@@ -214,12 +222,13 @@ func parseTokenLookup(lookup string) extract.Func {
 	return extract.Parse(lookup)
 }
 
-// resolveKeyFunc builds the key function. When customValidMethods is true,
+// resolveKeyFunc builds the key function and returns any JWKS fetchers
+// created so the caller can preload them. When customValidMethods is true,
 // the caller has set ValidMethods explicitly, so the parser already enforces
 // algorithm restrictions and the key function should not duplicate that check.
-func resolveKeyFunc(cfg Config, customValidMethods bool) jwtparse.Keyfunc {
+func resolveKeyFunc(cfg Config, customValidMethods bool) (jwtparse.Keyfunc, []*jwksFetcher) {
 	if cfg.KeyFunc != nil {
-		return cfg.KeyFunc
+		return cfg.KeyFunc, nil
 	}
 	jwksURLs := buildJWKSURLs(cfg)
 	if len(jwksURLs) > 0 {
@@ -228,9 +237,9 @@ func resolveKeyFunc(cfg Config, customValidMethods bool) jwtparse.Keyfunc {
 			fetchers[i] = newJWKSFetcher(u, cfg.JWKSRefresh)
 		}
 		if len(fetchers) == 1 {
-			return fetchers[0].keyFunc
+			return fetchers[0].keyFunc, fetchers
 		}
-		return multiJWKSKeyFunc(fetchers)
+		return multiJWKSKeyFunc(fetchers), fetchers
 	}
 	if len(cfg.SigningKeys) > 0 {
 		return func(t *jwtparse.Token) (any, error) {
@@ -240,19 +249,19 @@ func resolveKeyFunc(cfg Config, customValidMethods bool) jwtparse.Keyfunc {
 				return nil, ErrTokenInvalid
 			}
 			return key, nil
-		}
+		}, nil
 	}
 	if customValidMethods {
 		return func(_ *jwtparse.Token) (any, error) {
 			return cfg.SigningKey, nil
-		}
+		}, nil
 	}
 	return func(t *jwtparse.Token) (any, error) {
 		if t.Method.Alg() != cfg.SigningMethod.Alg() {
 			return nil, fmt.Errorf("jwt: unexpected signing method: %v", t.Header.Alg)
 		}
 		return cfg.SigningKey, nil
-	}
+	}, nil
 }
 
 // buildJWKSURLs merges JWKSURL and JWKSURLs into a single deduplicated list.
