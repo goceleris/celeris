@@ -13,6 +13,23 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+var (
+	// ErrPanic is the base sentinel for all recovery-caught panics.
+	ErrPanic = errors.New("recovery: panic")
+
+	// ErrPanicContextCancelled is returned when a panic occurs after
+	// the request context has been cancelled.
+	ErrPanicContextCancelled = errors.New("recovery: panic (context cancelled)")
+
+	// ErrPanicResponseCommitted is returned when a panic occurs after
+	// the response has already been partially written.
+	ErrPanicResponseCommitted = errors.New("recovery: panic (response committed)")
+
+	// ErrBrokenPipe is returned when a panic is caused by a broken pipe
+	// or connection reset (client disconnected).
+	ErrBrokenPipe = errors.New("recovery: broken pipe")
+)
+
 var stackPool = sync.Pool{New: func() any {
 	buf := make([]byte, 4096)
 	return &buf
@@ -68,7 +85,7 @@ func New(config ...Config) celeris.HandlerFunc {
 						slog.String("path", c.Path()),
 						slog.String("error", panicVal),
 					)
-					retErr = fmt.Errorf("recovery: panic: %v", r)
+					retErr = fmt.Errorf("%w: %v", ErrPanicContextCancelled, r)
 					return
 				}
 
@@ -79,7 +96,7 @@ func New(config ...Config) celeris.HandlerFunc {
 						slog.String("path", c.Path()),
 						slog.String("error", panicVal),
 					)
-					retErr = fmt.Errorf("recovery: panic after response committed: %v", r)
+					retErr = fmt.Errorf("%w: %v", ErrPanicResponseCommitted, r)
 					return
 				}
 
@@ -118,7 +135,7 @@ func handleBrokenPipe(c *celeris.Context, r any, panicVal string, log *slog.Logg
 	if brokenPipeHandler != nil {
 		return brokenPipeHandler(c, r)
 	}
-	return fmt.Errorf("recovery: broken pipe (client disconnected): %v", r)
+	return fmt.Errorf("%w: %v", ErrBrokenPipe, r)
 }
 
 // logPanic logs the panic with an optional stack trace.

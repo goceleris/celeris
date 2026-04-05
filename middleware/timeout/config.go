@@ -39,6 +39,11 @@ type Config struct {
 	// goroutine to finish, discards the buffered response, and returns
 	// the error handler result. Handlers MUST respect context cancellation
 	// (select on c.Context().Done()) to avoid blocking the response.
+	//
+	// Preemptive mode is incompatible with StreamWriter: buffered mode
+	// captures the full response in memory, defeating streaming and
+	// potentially causing OOM on large payloads. Use non-preemptive
+	// mode (the default) for streaming endpoints.
 	Preemptive bool
 
 	// TimeoutErrors lists errors that should be treated as timeouts even

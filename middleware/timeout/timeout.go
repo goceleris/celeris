@@ -20,10 +20,8 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 	cfg = applyDefaults(cfg)
 
-	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
-	for _, p := range cfg.SkipPaths {
-		skipMap[p] = struct{}{}
-	}
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	dur := cfg.Timeout
 	timeoutFunc := cfg.TimeoutFunc
@@ -32,15 +30,11 @@ func New(config ...Config) celeris.HandlerFunc {
 	timeoutErrors := cfg.TimeoutErrors
 
 	if preemptive {
-		return preemptiveHandler(skipMap, dur, timeoutFunc, errHandler, cfg.Skip, timeoutErrors)
+		return preemptiveHandler(&skip, dur, timeoutFunc, errHandler, timeoutErrors)
 	}
 
 	return func(c *celeris.Context) error {
-		if cfg.Skip != nil && cfg.Skip(c) {
-			return c.Next()
-		}
-
-		if _, ok := skipMap[c.Path()]; ok {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 
@@ -127,19 +121,14 @@ func flushOrReturn(c *celeris.Context, err error) error {
 // concurrently with the handler goroutine, ensuring no concurrent Context
 // access post-return.
 func preemptiveHandler(
-	skipMap map[string]struct{},
+	skip *celeris.SkipHelper,
 	dur time.Duration,
 	timeoutFunc func(*celeris.Context) time.Duration,
 	errHandler func(*celeris.Context, error) error,
-	skip func(*celeris.Context) bool,
 	timeoutErrors []error,
 ) celeris.HandlerFunc {
 	return func(c *celeris.Context) error {
-		if skip != nil && skip(c) {
-			return c.Next()
-		}
-
-		if _, ok := skipMap[c.Path()]; ok {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 

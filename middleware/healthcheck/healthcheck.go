@@ -33,17 +33,11 @@ func New(config ...Config) celeris.HandlerFunc {
 	startChecker := cfg.StartChecker
 	checkerTimeout := cfg.CheckerTimeout
 
-	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
-	for _, p := range cfg.SkipPaths {
-		skipMap[p] = struct{}{}
-	}
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	return func(c *celeris.Context) error {
-		if cfg.Skip != nil && cfg.Skip(c) {
-			return c.Next()
-		}
-
-		if _, ok := skipMap[c.Path()]; ok {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 

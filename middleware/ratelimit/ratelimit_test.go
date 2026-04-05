@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1727,5 +1728,101 @@ func TestClientIPWithTrustedProxies(t *testing.T) {
 
 	if capturedKey != "203.0.113.50" {
 		t.Fatalf("expected rate limit key to be real client IP 203.0.113.50, got %q", capturedKey)
+	}
+}
+
+// --- ValidateConfig tests ---
+
+func TestValidateConfigValid(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{"zero value", Config{}},
+		{"explicit RPS/Burst", Config{RPS: 10, Burst: 20}},
+		{"Rate string", Config{Rate: "100-M"}},
+		{"Rate with explicit Burst", Config{Rate: "100-M", Burst: 50}},
+		{"all fields", Config{RPS: 5, Burst: 10, Shards: 4, CleanupInterval: time.Second, MaxDynamicLimiters: 100}},
+		{"zero RPS uses default", Config{RPS: 0}},
+		{"zero Burst uses default", Config{Burst: 0}},
+		{"zero Shards uses default", Config{Shards: 0}},
+		{"zero CleanupInterval uses default", Config{CleanupInterval: 0}},
+		{"zero MaxDynamicLimiters uses default", Config{MaxDynamicLimiters: 0}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateConfig(tc.cfg); err != nil {
+				t.Fatalf("ValidateConfig returned unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateConfigInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantSub string
+	}{
+		{"bad Rate format", Config{Rate: "not-valid"}, "Rate:"},
+		{"bad Rate unit", Config{Rate: "100-X"}, "Rate:"},
+		{"bad Rate count", Config{Rate: "abc-M"}, "Rate:"},
+		{"empty Rate count", Config{Rate: "-S"}, "Rate:"},
+		{"negative RPS", Config{RPS: -1}, "RPS must be non-negative"},
+		{"negative Burst", Config{Burst: -1}, "Burst must be non-negative"},
+		{"negative Shards", Config{Shards: -1}, "Shards must be non-negative"},
+		{"negative CleanupInterval", Config{CleanupInterval: -time.Second}, "CleanupInterval must be non-negative"},
+		{"negative MaxDynamicLimiters", Config{MaxDynamicLimiters: -1}, "MaxDynamicLimiters must be non-negative"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateConfig(tc.cfg)
+			if err == nil {
+				t.Fatal("ValidateConfig returned nil, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestValidateConfigMultipleErrors(t *testing.T) {
+	cfg := Config{
+		Rate:               "bad",
+		Burst:              -1,
+		Shards:             -2,
+		CleanupInterval:    -time.Minute,
+		MaxDynamicLimiters: -5,
+	}
+	err := ValidateConfig(cfg)
+	if err == nil {
+		t.Fatal("ValidateConfig returned nil, want error")
+	}
+	msg := err.Error()
+	for _, sub := range []string{"Rate:", "Burst", "Shards", "CleanupInterval", "MaxDynamicLimiters"} {
+		if !strings.Contains(msg, sub) {
+			t.Errorf("error %q missing expected substring %q", msg, sub)
+		}
+	}
+}
+
+func TestValidateConfigRateOverridesRPS(t *testing.T) {
+	// When Rate is set, RPS is derived from Rate; a negative RPS should not
+	// cause an error because Rate takes precedence.
+	cfg := Config{Rate: "100-M", RPS: -5}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("ValidateConfig returned unexpected error: %v", err)
+	}
+}
+
+func TestValidateConfigNaNRPS(t *testing.T) {
+	cfg := Config{RPS: math.NaN()}
+	err := ValidateConfig(cfg)
+	if err == nil {
+		t.Fatal("ValidateConfig returned nil for NaN RPS, want error")
+	}
+	if !strings.Contains(err.Error(), "NaN") {
+		t.Fatalf("error %q does not mention NaN", err)
 	}
 }

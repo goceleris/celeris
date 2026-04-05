@@ -291,6 +291,9 @@ func TestBrokenPipeNilHandlerReturnsError(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected error from broken pipe")
 			}
+			if !errors.Is(err, ErrBrokenPipe) {
+				t.Fatalf("expected ErrBrokenPipe sentinel, got: %v", err)
+			}
 			if !strings.Contains(err.Error(), "broken pipe") {
 				t.Fatalf("expected 'broken pipe' in error message, got: %v", err)
 			}
@@ -426,6 +429,9 @@ func TestPanicAfterResponseWritten(t *testing.T) {
 	testutil.AssertStatus(t, rec, 200)
 	testutil.AssertBodyContains(t, rec, "ok")
 	testutil.AssertError(t, err)
+	if !errors.Is(err, ErrPanicResponseCommitted) {
+		t.Fatalf("expected ErrPanicResponseCommitted in error, got: %v", err)
+	}
 	if !strings.Contains(err.Error(), "response committed") {
 		t.Fatalf("expected 'response committed' in error, got: %v", err)
 	}
@@ -444,8 +450,11 @@ func TestPanicAfterContextCancelled(t *testing.T) {
 	chain := []celeris.HandlerFunc{mw, handler}
 	_, err := testutil.RunChain(t, chain, "GET", "/cancelled-panic")
 	testutil.AssertError(t, err)
-	if !strings.Contains(err.Error(), "recovery: panic:") {
-		t.Fatalf("expected 'recovery: panic:' in error, got: %v", err)
+	if !errors.Is(err, ErrPanicContextCancelled) {
+		t.Fatalf("expected ErrPanicContextCancelled in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "recovery: panic (context cancelled)") {
+		t.Fatalf("expected 'recovery: panic (context cancelled)' in error, got: %v", err)
 	}
 	output := buf.String()
 	if !strings.Contains(output, "panic after context cancelled") {

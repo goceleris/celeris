@@ -2,7 +2,9 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -148,6 +150,39 @@ func applyDefaults(cfg Config) Config {
 		cfg.MaxDynamicLimiters = 1024
 	}
 	return cfg
+}
+
+// ValidateConfig checks the configuration for errors without panicking.
+// Returns nil if the configuration is valid. Users loading config from
+// files or untrusted sources can call this before New() to check their
+// config safely.
+func ValidateConfig(cfg Config) error {
+	var errs []error
+
+	if cfg.Rate != "" {
+		if _, _, err := ParseRate(cfg.Rate); err != nil {
+			errs = append(errs, fmt.Errorf("Rate: %w", err))
+		}
+	}
+	if cfg.Rate == "" && cfg.RPS < 0 {
+		errs = append(errs, fmt.Errorf("RPS must be non-negative, got %g", cfg.RPS))
+	}
+	if cfg.Rate == "" && !math.IsInf(cfg.RPS, 0) && math.IsNaN(cfg.RPS) {
+		errs = append(errs, errors.New("RPS must not be NaN"))
+	}
+	if cfg.Burst < 0 {
+		errs = append(errs, fmt.Errorf("Burst must be non-negative, got %d", cfg.Burst))
+	}
+	if cfg.Shards < 0 {
+		errs = append(errs, fmt.Errorf("Shards must be non-negative, got %d", cfg.Shards))
+	}
+	if cfg.CleanupInterval < 0 {
+		errs = append(errs, fmt.Errorf("CleanupInterval must be non-negative, got %v", cfg.CleanupInterval))
+	}
+	if cfg.MaxDynamicLimiters < 0 {
+		errs = append(errs, fmt.Errorf("MaxDynamicLimiters must be non-negative, got %d", cfg.MaxDynamicLimiters))
+	}
+	return errors.Join(errs...)
 }
 
 // ParseRate parses a human-readable rate string into RPS and burst values.

@@ -29,10 +29,8 @@ func New(config ...Config) celeris.HandlerFunc {
 	cfg = applyDefaults(cfg)
 	cfg.validate()
 
-	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
-	for _, p := range cfg.SkipPaths {
-		skipMap[p] = struct{}{}
-	}
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	// Resolve sensitive headers: nil → defaults, empty slice → disabled.
 	headers := cfg.SensitiveHeaders
@@ -82,14 +80,11 @@ func New(config ...Config) celeris.HandlerFunc {
 	tz := cfg.TimeZone
 
 	return func(c *celeris.Context) error {
-		if cfg.Skip != nil && cfg.Skip(c) {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 
 		path := c.Path()
-		if _, ok := skipMap[path]; ok {
-			return c.Next()
-		}
 
 		if captureRespBody {
 			c.CaptureResponse()

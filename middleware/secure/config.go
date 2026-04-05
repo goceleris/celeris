@@ -68,6 +68,11 @@ type Config struct {
 
 	// CrossOriginEmbedderPolicy sets the Cross-Origin-Embedder-Policy header.
 	// Default: "require-corp".
+	//
+	// WARNING: "require-corp" blocks cross-origin resources (images, scripts,
+	// etc.) that do not carry a Cross-Origin-Resource-Policy header or valid
+	// CORS headers. If your application loads third-party assets, use
+	// "credentialless" or [Suppress] to avoid breakage.
 	CrossOriginEmbedderPolicy string `yaml:"cross_origin_embedder_policy"`
 
 	// XDNSPrefetchControl sets the X-DNS-Prefetch-Control header.
