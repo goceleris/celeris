@@ -86,7 +86,7 @@ func TestHTTPSRedirectHTTPSNoRedirect(t *testing.T) {
 	mw := HTTPSRedirect()
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/hello",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 	testutil.AssertNoHeader(t, rec, "location")
@@ -428,7 +428,7 @@ func TestValidatePanicsOnInvalidCode(t *testing.T) {
 			t.Fatal("expected panic for invalid code")
 		}
 		msg, ok := r.(string)
-		if !ok || msg != "redirect: Code must be 300-308, got 200" {
+		if !ok || msg != "redirect: Code must be a redirect status (301, 302, 303, 307, 308), got 200" {
 			t.Fatalf("unexpected panic: %v", r)
 		}
 	}()
@@ -444,6 +444,24 @@ func TestValidatePanicsOnCode299(t *testing.T) {
 	HTTPSRedirect(Config{Code: 299})
 }
 
+func TestValidatePanicsOnCode300(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for code 300")
+		}
+	}()
+	HTTPSRedirect(Config{Code: 300})
+}
+
+func TestValidatePanicsOnCode304(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for code 304")
+		}
+	}()
+	HTTPSRedirect(Config{Code: 304})
+}
+
 func TestValidatePanicsOnCode309(t *testing.T) {
 	defer func() {
 		if recover() == nil {
@@ -453,11 +471,11 @@ func TestValidatePanicsOnCode309(t *testing.T) {
 	HTTPSRedirect(Config{Code: 309})
 }
 
-func TestValidateAcceptsBoundary300(t *testing.T) {
-	mw := HTTPSRedirect(Config{Code: 300})
+func TestValidateAcceptsBoundary301(t *testing.T) {
+	mw := HTTPSRedirect(Config{Code: 301})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/page")
 	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 300)
+	testutil.AssertStatus(t, rec, 301)
 }
 
 func TestValidateAcceptsBoundary308(t *testing.T) {
@@ -492,7 +510,7 @@ func TestHTTPSWWWRedirectHTTPWithWWW(t *testing.T) {
 func TestHTTPSWWWRedirectHTTPSNonWWW(t *testing.T) {
 	mw := HTTPSWWWRedirect()
 	ctx, rec := celeristest.NewContextT(t, "GET", "/page",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	ctx.SetHost("example.com")
 	err := mw(ctx)
 	testutil.AssertNoError(t, err)
@@ -504,7 +522,7 @@ func TestHTTPSWWWRedirectPassThrough(t *testing.T) {
 	mw := HTTPSWWWRedirect()
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	ctx, rec := celeristest.NewContextT(t, "GET", "/page",
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHandlers(chain...))
 	ctx.SetHost("www.example.com")
 	err := ctx.Next()
@@ -573,7 +591,7 @@ func TestHTTPSNonWWWRedirectHTTPNonWWW(t *testing.T) {
 func TestHTTPSNonWWWRedirectHTTPSWithWWW(t *testing.T) {
 	mw := HTTPSNonWWWRedirect()
 	ctx, rec := celeristest.NewContextT(t, "GET", "/page",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	ctx.SetHost("www.example.com")
 	err := mw(ctx)
 	testutil.AssertNoError(t, err)
@@ -585,7 +603,7 @@ func TestHTTPSNonWWWRedirectPassThrough(t *testing.T) {
 	mw := HTTPSNonWWWRedirect()
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	ctx, rec := celeristest.NewContextT(t, "GET", "/page",
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHandlers(chain...))
 	ctx.SetHost("example.com")
 	err := ctx.Next()
@@ -792,4 +810,28 @@ func TestHTTPSNonWWWRedirectCustomCode(t *testing.T) {
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 308)
 	testutil.AssertHeader(t, rec, "location", "https://example.com/submit")
+}
+
+// --- Case-insensitive www detection ---
+
+func TestWWWRedirectCaseInsensitive(t *testing.T) {
+	mw := WWWRedirect()
+	chain := []celeris.HandlerFunc{mw, okHandler}
+	ctx, rec := celeristest.NewContextT(t, "GET", "/page",
+		celeristest.WithHandlers(chain...))
+	ctx.SetHost("WWW.example.com")
+	err := ctx.Next()
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertNoHeader(t, rec, "location")
+}
+
+func TestNonWWWRedirectCaseInsensitive(t *testing.T) {
+	mw := NonWWWRedirect()
+	ctx, rec := celeristest.NewContextT(t, "GET", "/page")
+	ctx.SetHost("WWW.example.com")
+	err := mw(ctx)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 301)
+	testutil.AssertHeader(t, rec, "location", "http://example.com/page")
 }

@@ -34,7 +34,7 @@
 // Example production stack:
 //
 //	// Pre-routing
-//	s.Pre(proxy.New(proxy.DefaultConfig()))
+//	s.Pre(proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}))
 //	s.Pre(redirect.HTTPSRedirect())
 //	s.Pre(methodoverride.New())
 //

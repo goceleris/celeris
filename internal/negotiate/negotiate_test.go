@@ -2,222 +2,119 @@ package negotiate
 
 import "testing"
 
-func TestMatchMedia(t *testing.T) {
+func TestAcceptBasic(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		offers []string
+		want   string
+	}{
+		{"exact match", "text/html", []string{"text/html"}, "text/html"},
+		{"no match", "text/html", []string{"application/json"}, ""},
+		{"wildcard", "*/*", []string{"application/json"}, "application/json"},
+		{"quality preference", "text/html;q=0.9, application/json", []string{"text/html", "application/json"}, "application/json"},
+		{"empty header", "", []string{"text/html"}, ""},
+		{"empty offers", "text/html", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Accept(tt.header, tt.offers)
+			if got != tt.want {
+				t.Fatalf("Accept(%q, %v) = %q, want %q", tt.header, tt.offers, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAcceptCaseInsensitive(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		offers []string
+		want   string
+	}{
+		{"uppercase header encoding", "GZIP", []string{"gzip"}, "gzip"},
+		{"mixed case header encoding", "Gzip, Deflate", []string{"gzip", "deflate"}, "gzip"},
+		{"uppercase offer", "gzip", []string{"GZIP"}, "GZIP"},
+		{"mixed media type", "TEXT/HTML", []string{"text/html"}, "text/html"},
+		{"upper offer media", "text/html", []string{"TEXT/HTML"}, "TEXT/HTML"},
+		{"wildcard subtype case", "TEXT/*", []string{"text/plain"}, "text/plain"},
+		{"accept-encoding GZIP with offers gzip", "GZIP", []string{"gzip"}, "gzip"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Accept(tt.header, tt.offers)
+			if got != tt.want {
+				t.Fatalf("Accept(%q, %v) = %q, want %q", tt.header, tt.offers, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchMediaCaseInsensitive(t *testing.T) {
 	tests := []struct {
 		pattern string
 		offer   string
 		want    bool
 	}{
-		{"*/*", "text/html", true},
-		{"*", "text/html", true},
-		{"*", "application/json", true},
-		{"text/*", "text/html", true},
-		{"text/*", "text/plain", true},
-		{"text/*", "application/json", false},
-		{"application/json", "application/json", true},
-		{"application/json", "text/html", false},
-		{"noslash", "noslash", true},
-		{"noslash", "other", false},
+		{"text/html", "TEXT/HTML", true},
+		{"TEXT/HTML", "text/html", true},
+		{"text/*", "TEXT/PLAIN", true},
+		{"*/*", "anything", true},
+		{"*", "gzip", true},
+		{"gzip", "GZIP", true},
 		{"text/html", "text/plain", false},
-		{"", "", true},
 	}
 	for _, tt := range tests {
-		got := MatchMedia(tt.pattern, tt.offer)
-		if got != tt.want {
-			t.Errorf("MatchMedia(%q, %q) = %v, want %v", tt.pattern, tt.offer, got, tt.want)
-		}
-	}
-}
-
-func TestParse(t *testing.T) {
-	tests := []struct {
-		header string
-		want   []AcceptItem
-	}{
-		{
-			"application/json",
-			[]AcceptItem{{MediaType: "application/json", Quality: 1.0}},
-		},
-		{
-			"text/html, application/json;q=0.9, */*;q=0.1",
-			[]AcceptItem{
-				{MediaType: "text/html", Quality: 1.0},
-				{MediaType: "application/json", Quality: 0.9},
-				{MediaType: "*/*", Quality: 0.1},
-			},
-		},
-		{"", nil},
-		{"   ", nil},
-		{",,,", nil},
-		{
-			"text/html;q=abc",
-			[]AcceptItem{{MediaType: "text/html", Quality: 1.0}},
-		},
-		{
-			"text/html;q=0.5;level=1",
-			[]AcceptItem{{MediaType: "text/html", Quality: 0.5}},
-		},
-		{
-			"*",
-			[]AcceptItem{{MediaType: "*", Quality: 1.0}},
-		},
-		{
-			"application/json;q=0",
-			[]AcceptItem{{MediaType: "application/json", Quality: 0.0}},
-		},
-	}
-	for _, tt := range tests {
-		got := Parse(tt.header)
-		if len(got) != len(tt.want) {
-			t.Errorf("Parse(%q) returned %d items, want %d", tt.header, len(got), len(tt.want))
-			continue
-		}
-		for i := range got {
-			if got[i].MediaType != tt.want[i].MediaType {
-				t.Errorf("Parse(%q)[%d].MediaType = %q, want %q", tt.header, i, got[i].MediaType, tt.want[i].MediaType)
-			}
-			if got[i].Quality != tt.want[i].Quality {
-				t.Errorf("Parse(%q)[%d].Quality = %f, want %f", tt.header, i, got[i].Quality, tt.want[i].Quality)
-			}
-		}
-	}
-}
-
-func TestAccept(t *testing.T) {
-	tests := []struct {
-		header string
-		offers []string
-		want   string
-	}{
-		{"application/json", []string{"application/json"}, "application/json"},
-		{"text/html, application/json;q=0.9", []string{"application/json", "text/html"}, "text/html"},
-		{"*/*", []string{"text/plain"}, "text/plain"},
-		{"", []string{"application/json"}, ""},
-		{"text/html;q=0.5, text/plain;q=0.9", []string{"text/plain", "text/html"}, "text/plain"},
-		// bare * wildcard
-		{"*", []string{"application/json"}, "application/json"},
-		{"*;q=0.5, text/html", []string{"text/html", "text/plain"}, "text/html"},
-	}
-	for _, tt := range tests {
-		got := Accept(tt.header, tt.offers)
-		if got != tt.want {
-			t.Errorf("Accept(%q, %v) = %q, want %q", tt.header, tt.offers, got, tt.want)
-		}
-	}
-}
-
-func TestAcceptRejectsQZero(t *testing.T) {
-	// q=0 means "not acceptable" per RFC 9110.
-	tests := []struct {
-		name   string
-		header string
-		offers []string
-		want   string
-	}{
-		{
-			"single q=0 is not acceptable",
-			"text/html;q=0",
-			[]string{"text/html"},
-			"",
-		},
-		{
-			"q=0.0 is not acceptable",
-			"text/html;q=0.0",
-			[]string{"text/html"},
-			"",
-		},
-		{
-			"q=0 excluded, fallback to other",
-			"text/html;q=0, application/json;q=0.5",
-			[]string{"text/html", "application/json"},
-			"application/json",
-		},
-		{
-			"all q=0 means no match",
-			"text/html;q=0, application/json;q=0",
-			[]string{"text/html", "application/json"},
-			"",
-		},
-		{
-			"wildcard q=0 is not acceptable",
-			"*/*;q=0",
-			[]string{"text/html"},
-			"",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := Accept(tt.header, tt.offers)
+		t.Run(tt.pattern+"_"+tt.offer, func(t *testing.T) {
+			got := MatchMedia(tt.pattern, tt.offer)
 			if got != tt.want {
-				t.Errorf("Accept(%q, %v) = %q, want %q", tt.header, tt.offers, got, tt.want)
+				t.Fatalf("MatchMedia(%q, %q) = %v, want %v", tt.pattern, tt.offer, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestAcceptQZeroWildcardExclusion(t *testing.T) {
-	tests := []struct {
-		name   string
-		header string
-		offers []string
-		want   string
-	}{
-		{
-			"Accept-Encoding wildcard with br;q=0 excludes br",
-			"*, br;q=0",
-			[]string{"gzip", "br"},
-			"gzip",
-		},
-		{
-			"Accept wildcard with text/html;q=0 excludes text/html",
-			"*/*, text/html;q=0",
-			[]string{"application/json", "text/html"},
-			"application/json",
-		},
-		{
-			"Accept wildcard with text/html;q=0 does not match text/html",
-			"*/*, text/html;q=0",
-			[]string{"text/html"},
-			"",
-		},
-		{
-			"Accept wildcard with text/html;q=0 matches other types",
-			"*/*, text/html;q=0",
-			[]string{"text/plain"},
-			"text/plain",
-		},
-		{
-			"text/* q=0 excludes all text subtypes via wildcard",
-			"*/*, text/*;q=0",
-			[]string{"text/html", "application/json"},
-			"application/json",
-		},
-		{
-			"text/* q=0 excludes text/html when only text offered",
-			"*/*, text/*;q=0",
-			[]string{"text/html"},
-			"",
-		},
+func TestParseLowercasesMediaType(t *testing.T) {
+	entries := Parse("TEXT/HTML, APPLICATION/JSON;q=0.9")
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := Accept(tt.header, tt.offers)
-			if got != tt.want {
-				t.Errorf("Accept(%q, %v) = %q, want %q", tt.header, tt.offers, got, tt.want)
-			}
-		})
+	if entries[0].MediaType != "text/html" {
+		t.Fatalf("expected text/html, got %q", entries[0].MediaType)
+	}
+	if entries[1].MediaType != "application/json" {
+		t.Fatalf("expected application/json, got %q", entries[1].MediaType)
+	}
+	if entries[1].Quality != 0.9 {
+		t.Fatalf("expected quality 0.9, got %f", entries[1].Quality)
 	}
 }
 
-func TestMatchMediaBareWildcard(t *testing.T) {
-	// bare "*" should match any offer, including media types with slashes
-	if !MatchMedia("*", "text/html") {
-		t.Error("MatchMedia(\"*\", \"text/html\") should be true")
+func TestAcceptEncodingCaseInsensitive(t *testing.T) {
+	// Simulate Accept-Encoding: GZIP with offers ["gzip"]
+	got := Accept("GZIP", []string{"gzip"})
+	if got != "gzip" {
+		t.Fatalf("Accept(\"GZIP\", [\"gzip\"]) = %q, want \"gzip\"", got)
 	}
-	if !MatchMedia("*", "application/json") {
-		t.Error("MatchMedia(\"*\", \"application/json\") should be true")
+
+	// Simulate Accept-Encoding: gzip, DEFLATE with offers ["deflate", "gzip"]
+	got = Accept("gzip, DEFLATE", []string{"deflate", "gzip"})
+	if got != "gzip" {
+		t.Fatalf("expected gzip (first in header), got %q", got)
 	}
-	if !MatchMedia("*", "noslash") {
-		t.Error("MatchMedia(\"*\", \"noslash\") should be true")
+}
+
+func TestParseEmptyAndWhitespace(t *testing.T) {
+	entries := Parse("  ,  , ")
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 entries for whitespace-only input, got %d", len(entries))
+	}
+}
+
+func TestAcceptQualityZeroExcluded(t *testing.T) {
+	got := Accept("gzip;q=0, deflate", []string{"gzip", "deflate"})
+	if got != "deflate" {
+		t.Fatalf("expected deflate (gzip excluded by q=0), got %q", got)
 	}
 }

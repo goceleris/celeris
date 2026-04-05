@@ -5,6 +5,13 @@
 // clients to tunnel PUT, PATCH, DELETE, and other methods through a POST
 // request by specifying the intended method in a header or form field.
 //
+// # IMPORTANT: Use Server.Pre(), Not Server.Use()
+//
+// This middleware MUST be registered via [celeris.Server.Pre], not
+// [celeris.Server.Use]. With Server.Use, the router has already matched
+// the request based on the original method, making the override ineffective.
+// Using Server.Use will silently produce wrong routing behavior.
+//
 // Register the middleware with [celeris.Server.Pre] so the method is
 // rewritten before routing:
 //

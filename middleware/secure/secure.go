@@ -5,7 +5,7 @@ import "github.com/goceleris/celeris"
 // New creates a security headers middleware with the given config.
 // All non-HSTS header values are pre-computed at initialization for
 // zero-allocation responses on the hot path. HSTS is only sent over
-// HTTPS connections (Scheme() checks X-Forwarded-Proto internally).
+// HTTPS connections (determined by Context.Scheme).
 //
 // validate() panics at initialization for invalid configurations
 // (e.g., HSTSPreload with insufficient MaxAge). This is intentional:

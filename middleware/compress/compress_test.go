@@ -420,6 +420,34 @@ func TestExcludedContentTypeVideo(t *testing.T) {
 	}
 }
 
+func TestNoExcludedContentTypes(t *testing.T) {
+	body := testBody()
+	mw := New(Config{
+		Encodings:            []string{"gzip"},
+		ExcludedContentTypes: []string{}, // explicitly empty: no exclusions
+	})
+	handler := func(c *celeris.Context) error {
+		return c.Blob(200, "image/png", body)
+	}
+
+	ctx, rec := celeristest.NewContext("GET", "/img",
+		celeristest.WithHeader("accept-encoding", "gzip"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "gzip" {
+		t.Fatalf("expected image/png to be compressed when ExcludedContentTypes is empty, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressGzip(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch")
+	}
+}
+
 func TestVaryHeaderAdded(t *testing.T) {
 	body := testBody()
 	mw := New(Config{Encodings: []string{"gzip"}})
@@ -808,7 +836,7 @@ func TestValidatePanics(t *testing.T) {
 		},
 		{
 			name:   "zstd level too high",
-			config: Config{Encodings: []string{"zstd"}, ZstdLevel: 12},
+			config: Config{Encodings: []string{"zstd"}, ZstdLevel: 5},
 		},
 		{
 			name:   "negative min length",
@@ -1175,10 +1203,10 @@ func TestResolveZstdLevelRawInt(t *testing.T) {
 	}
 }
 
-func TestResolveZstdLevelClamping(t *testing.T) {
-	// Level 10 exceeds SpeedBestCompression (4) and should be clamped.
+func TestResolveZstdLevelMax(t *testing.T) {
+	// Level 4 is SpeedBestCompression, the maximum valid zstd level.
 	body := testBody()
-	mw := New(Config{Encodings: []string{"zstd"}, ZstdLevel: 10})
+	mw := New(Config{Encodings: []string{"zstd"}, ZstdLevel: 4})
 	handler := jsonHandler(body)
 
 	ctx, rec := celeristest.NewContext("GET", "/data",
@@ -1191,10 +1219,19 @@ func TestResolveZstdLevelClamping(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if rec.Header("content-encoding") != "zstd" {
-		t.Fatalf("expected zstd with clamped level, got %q", rec.Header("content-encoding"))
+		t.Fatalf("expected zstd with max level, got %q", rec.Header("content-encoding"))
 	}
 	decompressed := decompressZstd(t, rec.Body)
 	if !bytes.Equal(decompressed, body) {
-		t.Fatalf("decompressed body mismatch with clamped zstd level")
+		t.Fatalf("decompressed body mismatch with zstd level 4")
 	}
+}
+
+func TestValidateZstdLevel11Panics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic for ZstdLevel 11")
+		}
+	}()
+	New(Config{Encodings: []string{"zstd"}, ZstdLevel: 11})
 }

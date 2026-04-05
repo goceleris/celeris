@@ -749,16 +749,46 @@ func TestContextScheme(t *testing.T) {
 		t.Fatalf("expected http, got %s", c.Scheme())
 	}
 
-	// X-Forwarded-Proto takes precedence.
+	// SetScheme override takes precedence.
 	s2, _ := newTestStream("GET", "/test")
-	s2.Headers = append(s2.Headers, [2]string{"x-forwarded-proto", "https"})
 	defer s2.Release()
 
 	c2 := acquireContext(s2)
 	defer releaseContext(c2)
 
+	c2.SetScheme("https")
 	if c2.Scheme() != "https" {
 		t.Fatalf("expected https, got %s", c2.Scheme())
+	}
+
+	// :scheme pseudo-header is respected when no override set.
+	s3, _ := newTestStream("GET", "/test")
+	// Replace the default :scheme "http" with "https".
+	for i := range s3.Headers {
+		if s3.Headers[i][0] == ":scheme" {
+			s3.Headers[i][1] = "https"
+			break
+		}
+	}
+	defer s3.Release()
+
+	c3 := acquireContext(s3)
+	defer releaseContext(c3)
+
+	if c3.Scheme() != "https" {
+		t.Fatalf("expected https from :scheme header, got %s", c3.Scheme())
+	}
+
+	// Raw X-Forwarded-Proto is NOT trusted without proxy middleware.
+	s4, _ := newTestStream("GET", "/test")
+	s4.Headers = append(s4.Headers, [2]string{"x-forwarded-proto", "https"})
+	defer s4.Release()
+
+	c4 := acquireContext(s4)
+	defer releaseContext(c4)
+
+	if c4.Scheme() != "http" {
+		t.Fatalf("expected http (XFF should be ignored), got %s", c4.Scheme())
 	}
 }
 
@@ -987,11 +1017,11 @@ func TestIsWebSocketCaseInsensitive(t *testing.T) {
 
 func TestIsTLS(t *testing.T) {
 	s, _ := newTestStream("GET", "/test")
-	s.Headers = append(s.Headers, [2]string{"x-forwarded-proto", "https"})
 	defer s.Release()
 
 	c := acquireContext(s)
 	defer releaseContext(c)
+	c.SetScheme("https")
 
 	if !c.IsTLS() {
 		t.Fatal("expected IsTLS to return true for https")

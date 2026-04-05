@@ -1,6 +1,10 @@
 package redirect
 
-import "github.com/goceleris/celeris"
+import (
+	"strings"
+
+	"github.com/goceleris/celeris"
+)
 
 // initRedirect parses config, applies defaults, validates, and returns
 // the redirect code and initialized SkipHelper.
@@ -79,7 +83,7 @@ func WWWRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		if len(host) > 4 && host[:4] == "www." {
+		if len(host) > 4 && strings.EqualFold(host[:4], "www.") {
 			return c.Next()
 		}
 
@@ -107,7 +111,7 @@ func NonWWWRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		if len(host) <= 4 || host[:4] != "www." {
+		if len(host) <= 4 || !strings.EqualFold(host[:4], "www.") {
 			return c.Next()
 		}
 
@@ -194,7 +198,7 @@ func HTTPSWWWRedirect(config ...Config) celeris.HandlerFunc {
 		}
 
 		isHTTPS := c.Scheme() == "https"
-		isWWW := len(host) > 4 && host[:4] == "www."
+		isWWW := len(host) > 4 && strings.EqualFold(host[:4], "www.")
 
 		if isHTTPS && isWWW {
 			return c.Next()
@@ -229,7 +233,7 @@ func HTTPSNonWWWRedirect(config ...Config) celeris.HandlerFunc {
 		}
 
 		isHTTPS := c.Scheme() == "https"
-		isWWW := len(host) > 4 && host[:4] == "www."
+		isWWW := len(host) > 4 && strings.EqualFold(host[:4], "www.")
 
 		if isHTTPS && !isWWW {
 			return c.Next()

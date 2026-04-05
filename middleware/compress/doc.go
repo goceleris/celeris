@@ -54,6 +54,14 @@
 //   - zstd: single thread-safe [zstd.Encoder] — EncodeAll, no pool needed.
 //   - buffers: [sync.Pool] of *bytes.Buffer for gzip/brotli output.
 //
+// # StreamWriter Incompatibility
+//
+// This middleware uses [celeris.Context.BufferResponse] which is incompatible
+// with [celeris.Context.StreamWriter]. If the downstream handler uses
+// StreamWriter, BufferResponse returns nil and the streamed response
+// bypasses this middleware entirely. Use [Config].Skip to explicitly
+// exclude streaming endpoints.
+//
 // # Response Buffering (No Streaming Compression)
 //
 // This middleware buffers the entire response body in memory before

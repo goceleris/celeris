@@ -27,7 +27,7 @@ func BenchmarkHTTPSNoRedirect(b *testing.B) {
 	noop := func(_ *celeris.Context) error { return nil }
 	opts := []celeristest.Option{
 		celeristest.WithHandlers(mw, noop),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 	}
 	b.ReportAllocs()
 	b.ResetTimer()

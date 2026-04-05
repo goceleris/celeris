@@ -206,7 +206,7 @@ func BenchmarkChainPreRouting(b *testing.B) {
 		celeristest.WithHandlers(chain...),
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
 		celeristest.WithHeader("x-forwarded-for", "203.0.113.50"),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -339,7 +339,7 @@ func BenchmarkChainProductionAPI(b *testing.B) {
 		celeristest.WithHandlers(chain...),
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
 		celeristest.WithHeader("x-forwarded-for", "203.0.113.50"),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("origin", "https://app.example.com"),
 	}
 	b.ReportAllocs()
@@ -414,7 +414,7 @@ func BenchmarkChainWebhookReceiver(b *testing.B) {
 		celeristest.WithHandlers(chain...),
 		celeristest.WithRemoteAddr("10.0.0.1:4321"),
 		celeristest.WithHeader("x-forwarded-for", "198.51.100.10"),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("content-type", "application/json"),
 	}
 	b.ReportAllocs()
@@ -444,7 +444,7 @@ func BenchmarkChainPreRoutingOnly(b *testing.B) {
 		celeristest.WithHandlers(chain...),
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
 		celeristest.WithHeader("x-forwarded-for", "203.0.113.50"),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 	}
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -72,13 +72,21 @@
 // and other methods bypass the middleware entirely (no buffering, no
 // ETag computation) with zero allocations.
 //
-// # Content-Length on 304
+// # 304 Not Modified Response
 //
-// When returning 304 Not Modified, any Content-Length header set by the
-// downstream handler is preserved. Per RFC 9110 Section 15.4.5, a 304
-// response MUST generate headers that would have been sent in a 200
-// response, including Content-Length when it matches the selected
-// representation.
+// When returning 304, the middleware sends only the ETag header and any
+// other response headers set by the handler. Content-Length is not included
+// because the buffered response body (from which Content-Length would be
+// derived) is discarded before the 304 is sent. This is RFC-compliant --
+// Content-Length is optional on 304 responses (RFC 9110 Section 8.6).
+//
+// # StreamWriter Incompatibility
+//
+// This middleware uses [celeris.Context.BufferResponse] which is incompatible
+// with [celeris.Context.StreamWriter]. If the downstream handler uses
+// StreamWriter, BufferResponse returns nil and the streamed response
+// bypasses this middleware entirely. Use [Config].Skip to explicitly
+// exclude streaming endpoints.
 //
 // # Full-Body Buffering
 //

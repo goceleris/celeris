@@ -18,7 +18,7 @@ func TestDefaultConfigSetsAllHeaders(t *testing.T) {
 	mw := New()
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 	testutil.AssertHeader(t, rec, "x-content-type-options", "nosniff")
@@ -90,7 +90,7 @@ func TestCustomValues(t *testing.T) {
 	})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "x-content-type-options", "custom-cto")
 	testutil.AssertHeader(t, rec, "x-frame-options", "DENY")
@@ -111,7 +111,7 @@ func TestHSTSIncludeSubdomainsDefaultWithCustomConfig(t *testing.T) {
 	})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "strict-transport-security", "max-age=63072000; includeSubDomains")
 }
@@ -123,7 +123,7 @@ func TestHSTSExcludeSubdomains(t *testing.T) {
 	})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "strict-transport-security", "max-age=3600")
 }
@@ -135,7 +135,7 @@ func TestHSTSPreload(t *testing.T) {
 	})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "strict-transport-security", "max-age=63072000; includeSubDomains; preload")
 }
@@ -157,7 +157,7 @@ func TestHSTSDisabled(t *testing.T) {
 	mw := New(Config{HSTSMaxAge: -1})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertNoHeader(t, rec, "strict-transport-security")
 }
@@ -171,9 +171,9 @@ func TestHSTSOnlyOnHTTPS(t *testing.T) {
 	testutil.AssertNoError(t, err)
 	testutil.AssertNoHeader(t, rec, "strict-transport-security")
 
-	// HTTPS via x-forwarded-proto should get HSTS.
+	// HTTPS via scheme override should get HSTS.
 	rec, err = testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "strict-transport-security", "max-age=63072000; includeSubDomains")
 }
@@ -471,7 +471,7 @@ func TestValidateHSTSPreloadValidConfig(t *testing.T) {
 	})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("x-forwarded-proto", "https"))
+		celeristest.WithScheme("https"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "strict-transport-security", "max-age=31536000; includeSubDomains; preload")
 }

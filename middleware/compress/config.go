@@ -64,7 +64,7 @@ type Config struct {
 	ZstdLevel Level
 
 	// ExcludedContentTypes lists content-type prefixes that should not be
-	// compressed. The check is case-insensitive and uses prefix matching.
+	// compressed. Set to an empty slice to disable all content-type exclusions.
 	// Default: ["image/", "video/", "audio/"].
 	ExcludedContentTypes []string
 }
@@ -98,7 +98,7 @@ func applyDefaults(cfg Config) Config {
 	}
 	// Levels: LevelDefault (0, the zero value) maps to library defaults in
 	// pool initialization. No override needed — the zero value IS the default.
-	if len(cfg.ExcludedContentTypes) == 0 {
+	if cfg.ExcludedContentTypes == nil {
 		cfg.ExcludedContentTypes = defaultConfig.ExcludedContentTypes
 	}
 	return cfg
@@ -124,8 +124,8 @@ func (cfg Config) validate() {
 		}
 	}
 	if slices.Contains(cfg.Encodings, "zstd") {
-		if cfg.ZstdLevel != LevelBest && (cfg.ZstdLevel < -1 || cfg.ZstdLevel > 11) {
-			panic("compress: ZstdLevel must be between -1 (LevelNone) and 11")
+		if cfg.ZstdLevel != LevelBest && (cfg.ZstdLevel < -1 || cfg.ZstdLevel > 4) {
+			panic("compress: ZstdLevel must be between -1 (LevelNone) and 4 (SpeedBestCompression), or LevelBest")
 		}
 	}
 	if cfg.MinLength < 0 {

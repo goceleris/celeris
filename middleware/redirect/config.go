@@ -14,7 +14,7 @@ type Config struct {
 	// SkipPaths lists paths to skip (exact match).
 	SkipPaths []string
 
-	// Code is the HTTP redirect status code. Must be 300-308.
+	// Code is the HTTP redirect status code. Must be 301, 302, 303, 307, or 308.
 	// Default: 301 (Moved Permanently).
 	Code int
 }
@@ -31,7 +31,10 @@ func applyDefaults(cfg Config) Config {
 }
 
 func (cfg Config) validate() {
-	if cfg.Code < 300 || cfg.Code > 308 {
-		panic(fmt.Sprintf("redirect: Code must be 300-308, got %d", cfg.Code))
+	switch cfg.Code {
+	case 301, 302, 303, 307, 308:
+		// valid redirect codes
+	default:
+		panic(fmt.Sprintf("redirect: Code must be a redirect status (301, 302, 303, 307, 308), got %d", cfg.Code))
 	}
 }
