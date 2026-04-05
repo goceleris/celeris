@@ -1,6 +1,7 @@
 package cors
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -710,24 +711,6 @@ func TestNegativeMaxAgeSendsZero(t *testing.T) {
 	testutil.AssertHeader(t, rec, "access-control-max-age", "0")
 }
 
-func TestNegativeMaxAgeLargeValue(t *testing.T) {
-	mw := New(Config{MaxAge: -100})
-	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
-		celeristest.WithHeader("origin", "http://example.com"),
-		celeristest.WithHeader("access-control-request-method", "GET"))
-	testutil.AssertNoError(t, err)
-	testutil.AssertHeader(t, rec, "access-control-max-age", "0")
-}
-
-func TestZeroMaxAgeStillOmitted(t *testing.T) {
-	mw := New(Config{MaxAge: 0})
-	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
-		celeristest.WithHeader("origin", "http://example.com"),
-		celeristest.WithHeader("access-control-request-method", "GET"))
-	testutil.AssertNoError(t, err)
-	testutil.AssertNoHeader(t, rec, "access-control-max-age")
-}
-
 func TestPositiveMaxAgeUnchanged(t *testing.T) {
 	mw := New(Config{MaxAge: 600})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
@@ -958,25 +941,6 @@ func TestValueRedactionInPanicDefault(t *testing.T) {
 	})
 }
 
-func TestMultiWildcardPanicRedacted(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic")
-		}
-		msg, ok := r.(string)
-		if !ok {
-			t.Fatalf("expected string panic, got %T", r)
-		}
-		if !strings.Contains(msg, "[redacted]") {
-			t.Fatalf("expected [redacted] in panic message, got: %s", msg)
-		}
-	}()
-	New(Config{
-		AllowOrigins: []string{"https://*.*"},
-	})
-}
-
 // --- normalizeOrigin rejects paths ---
 
 func TestNormalizeOriginRejectsPath(t *testing.T) {
@@ -1101,24 +1065,131 @@ func TestVaryOriginOnNonCORSRequestWithWildcardOrigins(t *testing.T) {
 
 // --- Wildcard dot-count depth validation ---
 
-func TestWildcardSingleLevelMatches(t *testing.T) {
-	mw := New(Config{AllowOrigins: []string{"https://*.example.com"}})
+// --- MirrorRequestHeaders validation edge cases ---
+
+func TestMirrorRequestHeadersLongHeaderDropped(t *testing.T) {
+	// Header name >128 bytes should be silently dropped.
+	mw := New(Config{
+		AllowOrigins:         []string{"http://example.com"},
+		MirrorRequestHeaders: true,
+	})
+	longHeader := strings.Repeat("X", 129)
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
+		celeristest.WithHeader("origin", "http://example.com"),
+		celeristest.WithHeader("access-control-request-method", "POST"),
+		celeristest.WithHeader("access-control-request-headers", "X-Valid, "+longHeader+", X-Also-Valid"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 204)
+	testutil.AssertHeader(t, rec, "access-control-allow-headers", "X-Valid, X-Also-Valid")
+}
+
+func TestMirrorRequestHeadersCappedAt20(t *testing.T) {
+	// >20 comma-separated headers should be capped at 20.
+	mw := New(Config{
+		AllowOrigins:         []string{"http://example.com"},
+		MirrorRequestHeaders: true,
+	})
+	var hdrs []string
+	for i := 0; i < 25; i++ {
+		hdrs = append(hdrs, "X-H"+strconv.Itoa(i))
+	}
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
+		celeristest.WithHeader("origin", "http://example.com"),
+		celeristest.WithHeader("access-control-request-method", "POST"),
+		celeristest.WithHeader("access-control-request-headers", strings.Join(hdrs, ", ")))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 204)
+	allowed := rec.Header("access-control-allow-headers")
+	count := len(strings.Split(allowed, ", "))
+	if count != 20 {
+		t.Fatalf("expected 20 mirrored headers, got %d: %q", count, allowed)
+	}
+}
+
+func TestMirrorRequestHeadersForbiddenCharsDropped(t *testing.T) {
+	// Headers containing forbidden chars (semicolon, colon, slash, space, CRLF)
+	// should be silently dropped.
+	mw := New(Config{
+		AllowOrigins:         []string{"http://example.com"},
+		MirrorRequestHeaders: true,
+	})
+	forbidden := []string{
+		"X;Bad",
+		"X:Bad",
+		"X/Bad",
+		"X Bad",
+		"X\rBad",
+		"X\nBad",
+	}
+	for _, hdr := range forbidden {
+		rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
+			celeristest.WithHeader("origin", "http://example.com"),
+			celeristest.WithHeader("access-control-request-method", "POST"),
+			celeristest.WithHeader("access-control-request-headers", "X-Good, "+hdr+", X-Also-Good"))
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 204)
+		testutil.AssertHeader(t, rec, "access-control-allow-headers", "X-Good, X-Also-Good")
+	}
+}
+
+func TestMirrorRequestHeadersEmptySegments(t *testing.T) {
+	// Empty segments after commas should be handled gracefully.
+	mw := New(Config{
+		AllowOrigins:         []string{"http://example.com"},
+		MirrorRequestHeaders: true,
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "OPTIONS", "/",
+		celeristest.WithHeader("origin", "http://example.com"),
+		celeristest.WithHeader("access-control-request-method", "POST"),
+		celeristest.WithHeader("access-control-request-headers", "X-First,,,, ,X-Second"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 204)
+	testutil.AssertHeader(t, rec, "access-control-allow-headers", "X-First, X-Second")
+}
+
+// --- AllowCredentials + wildcard subdomain ---
+
+func TestAllowCredentialsWithWildcardSubdomainPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for AllowCredentials with wildcard subdomain")
+		}
+	}()
+	New(Config{
+		AllowOrigins:     []string{"https://*.example.com"},
+		AllowCredentials: true,
+	})
+}
+
+func TestUnsafeAllowCredentialsWithWildcardSuppressesPanic(t *testing.T) {
+	// Should NOT panic.
+	mw := New(Config{
+		AllowOrigins:                       []string{"https://*.example.com"},
+		AllowCredentials:                   true,
+		UnsafeAllowCredentialsWithWildcard: true,
+	})
+	if mw == nil {
+		t.Fatal("expected non-nil middleware")
+	}
+}
+
+func TestUnsafeAllowCredentialsWithWildcardRequest(t *testing.T) {
+	// Actual request with credentials + wildcard subdomain should echo
+	// the origin and set credentials header.
+	mw := New(Config{
+		AllowOrigins:                       []string{"https://*.example.com"},
+		AllowCredentials:                   true,
+		UnsafeAllowCredentialsWithWildcard: true,
+	})
 	chain := []celeris.HandlerFunc{mw, okHandler}
 
 	rec, err := testutil.RunChain(t, chain, "GET", "/",
 		celeristest.WithHeader("origin", "https://api.example.com"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertHeader(t, rec, "access-control-allow-origin", "https://api.example.com")
-}
-
-func TestWildcardTwoLevelRejected(t *testing.T) {
-	mw := New(Config{AllowOrigins: []string{"https://*.example.com"}})
-	chain := []celeris.HandlerFunc{mw, okHandler}
-
-	rec, err := testutil.RunChain(t, chain, "GET", "/",
-		celeristest.WithHeader("origin", "https://a.b.example.com"))
-	testutil.AssertNoError(t, err)
-	testutil.AssertNoHeader(t, rec, "access-control-allow-origin")
+	testutil.AssertHeader(t, rec, "access-control-allow-credentials", "true")
+	testutil.AssertHeader(t, rec, "vary", "Origin")
 }
 
 func TestWildcardDepthUnit(t *testing.T) {

@@ -53,8 +53,9 @@
 //
 // When [Config].MirrorRequestHeaders is true, the middleware mirrors the
 // value of the Access-Control-Request-Headers header from the preflight
-// request back in Access-Control-Allow-Headers. This means any header
-// the client requests will be reflected as allowed without validation.
+// request back in Access-Control-Allow-Headers. Each header name is
+// validated against the RFC 7230 token charset, names longer than 128
+// bytes are silently dropped, and at most 20 header names are accepted.
 // When MirrorRequestHeaders is false (the default), the AllowHeaders
 // list is used (defaults to Origin, Content-Type, Accept, Authorization).
 //
@@ -62,6 +63,15 @@
 //
 // Set [Config].AllowPrivateNetwork to true to enable the Private Network
 // Access spec (Access-Control-Allow-Private-Network header on preflight).
+//
+// # Unsafe Credentials with Wildcard Subdomains
+//
+// Using AllowCredentials with a subdomain wildcard origin
+// (e.g., "https://*.example.com") panics by default because the browser
+// receives the echoed origin (not "*") with credentials, widening the
+// credential scope to every matching subdomain. Set
+// [Config].UnsafeAllowCredentialsWithWildcard to true to suppress the
+// panic if you fully understand the security implications.
 //
 // # Null Origin Warning
 //
