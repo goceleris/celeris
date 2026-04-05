@@ -104,6 +104,7 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
 | [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
 | [`compress`](middleware/compress) | Response compression (zstd, brotli, gzip; separate go.mod) |
+| [`circuitbreaker`](middleware/circuitbreaker) | Circuit breaker (3-state, sliding window error rate, 503 + Retry-After) |
 | [`cors`](middleware/cors) | Cross-Origin Resource Sharing (zero-alloc) |
 | [`csrf`](middleware/csrf) | CSRF protection (double-submit cookie + origin validation) |
 | [`debug`](middleware/debug) | Debug/introspection endpoints (loopback-only by default) |
@@ -122,6 +123,7 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`requestid`](middleware/requestid) | Request ID generation (buffered UUID v4) |
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions with pluggable store |
+| [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
 
 ```go
@@ -277,7 +279,7 @@ adaptive/       Adaptive meta-engine (Linux)
 celeristest/    Test helpers (NewContext, ResponseRecorder)
 engine/         Engine interface + implementations (iouring, epoll, std)
 internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts)
-middleware/     In-tree middleware ecosystem (22 packages)
+middleware/     In-tree middleware ecosystem (24 packages)
 observe/        Metrics collector, CPUMonitor, Snapshot
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)

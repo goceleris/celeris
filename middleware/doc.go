@@ -22,11 +22,13 @@
 //	cors        — handle preflight; must run before auth rejects OPTIONS
 //	bodylimit   — reject oversized bodies before parsing begins
 //	ratelimit   — shed load before expensive auth/business logic
+//	circuitbreaker — trip open on error rate spike; after ratelimit, before timeout
 //	[auth]      — jwt / keyauth / basicauth (see Auth Stacking below)
 //	csrf        — validate CSRF token after authentication is established
 //	session     — load session (may depend on authenticated user)
 //	debug       — intercepts by path prefix (e.g. /debug/); can go anywhere
 //	timeout     — bound handler execution; innermost wrapper before the route
+//	singleflight — collapse identical in-flight requests; after timeout
 //	compress    — response compression; wraps etag (computes on uncompressed body)
 //	etag        — conditional responses (304 Not Modified); innermost transform
 //	[handler]   — route handler
@@ -44,6 +46,9 @@
 //	s.Use(recovery.New())
 //	s.Use(cors.New())
 //	s.Use(secure.New())
+//	s.Use(circuitbreaker.New())
+//	s.Use(timeout.New(timeout.Config{Timeout: 30 * time.Second}))
+//	s.Use(singleflight.New())
 //	s.Use(compress.New())
 //	s.Use(etag.New())
 //
