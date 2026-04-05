@@ -1,8 +1,9 @@
 package otel
 
 import (
-	"github.com/goceleris/celeris"
 	"go.opentelemetry.io/otel/propagation"
+
+	"github.com/goceleris/celeris"
 )
 
 // Compile-time interface check.

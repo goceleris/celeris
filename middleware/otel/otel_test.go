@@ -833,15 +833,15 @@ func TestSemconvAttributeKeys(t *testing.T) {
 	// Verify attribute keys match semconv constants exactly.
 	// http.route is omitted because FullPath() is empty in test contexts (no router).
 	wantKeys := map[attribute.Key]bool{
-		semconv.HTTPRequestMethodKey:        true,
-		semconv.URLSchemeKey:                true,
-		semconv.URLPathKey:                  true,
-		semconv.NetworkProtocolVersionKey:   true,
-		semconv.ClientAddressKey:            true,
-		semconv.ServerAddressKey:            true,
-		semconv.UserAgentOriginalKey:        true,
-		semconv.HTTPResponseStatusCodeKey:   true,
-		semconv.HTTPResponseBodySizeKey:     true,
+		semconv.HTTPRequestMethodKey:      true,
+		semconv.URLSchemeKey:              true,
+		semconv.URLPathKey:                true,
+		semconv.NetworkProtocolVersionKey: true,
+		semconv.ClientAddressKey:          true,
+		semconv.ServerAddressKey:          true,
+		semconv.UserAgentOriginalKey:      true,
+		semconv.HTTPResponseStatusCodeKey: true,
+		semconv.HTTPResponseBodySizeKey:   true,
 	}
 	for _, a := range spans[0].Attributes {
 		delete(wantKeys, a.Key)

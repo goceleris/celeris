@@ -1,9 +1,10 @@
 package otel_test
 
 import (
-	"github.com/goceleris/celeris"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"github.com/goceleris/celeris"
 
 	"github.com/goceleris/celeris/middleware/otel"
 )
