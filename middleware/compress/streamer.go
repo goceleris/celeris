@@ -72,7 +72,10 @@ func NewCompressedStream(sw *celeris.StreamWriter, encoding string, opts ...Stre
 	cs := &CompressedStream{sw: sw, encoding: encoding}
 	switch encoding {
 	case "gzip":
-		w, _ := kgzip.NewWriterLevel(writerFunc(cs.writeRaw), cfg.gzipLevel)
+		w, err := kgzip.NewWriterLevel(writerFunc(cs.writeRaw), cfg.gzipLevel)
+		if err != nil {
+			return nil
+		}
 		cs.writer = w
 	case "br":
 		w := brotli.NewWriterLevel(writerFunc(cs.writeRaw), cfg.brotliLevel)
