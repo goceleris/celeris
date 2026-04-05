@@ -1,6 +1,10 @@
 package cors
 
-import "github.com/goceleris/celeris"
+import (
+	"strings"
+
+	"github.com/goceleris/celeris"
+)
 
 // New creates a CORS middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
@@ -80,7 +84,9 @@ func New(config ...Config) celeris.HandlerFunc {
 			c.SetHeader("access-control-allow-methods", p.allowMethods)
 			if p.mirrorRequestHeaders {
 				if reqHeaders := c.Header("access-control-request-headers"); reqHeaders != "" {
-					c.SetHeader("access-control-allow-headers", reqHeaders)
+					if validated := validateMirroredHeaders(reqHeaders); validated != "" {
+						c.SetHeader("access-control-allow-headers", validated)
+					}
 				}
 			} else {
 				c.SetHeader("access-control-allow-headers", p.allowHeaders)
@@ -97,4 +103,43 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		return c.Next()
 	}
+}
+
+// validateMirroredHeaders splits a comma-separated header list, validates
+// each token against the HTTP token charset (RFC 7230 §3.2.6), enforces a
+// maximum of maxMirroredHeaders names with each at most maxHeaderNameLen
+// bytes, and returns the cleaned comma-separated result. Returns "" if no
+// valid headers remain.
+func validateMirroredHeaders(raw string) string {
+	var b strings.Builder
+	count := 0
+	for raw != "" {
+		var name string
+		if idx := strings.IndexByte(raw, ','); idx >= 0 {
+			name = raw[:idx]
+			raw = raw[idx+1:]
+		} else {
+			name = raw
+			raw = ""
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if len(name) > maxHeaderNameLen {
+			continue
+		}
+		if !isValidHTTPToken(name) {
+			continue
+		}
+		count++
+		if count > maxMirroredHeaders {
+			break
+		}
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(name)
+	}
+	return b.String()
 }

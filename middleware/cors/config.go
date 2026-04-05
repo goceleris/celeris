@@ -61,6 +61,14 @@ type Config struct {
 	// AllowCredentials indicates whether credentials are allowed.
 	AllowCredentials bool
 
+	// UnsafeAllowCredentialsWithWildcard suppresses the panic that fires when
+	// AllowCredentials is true and an AllowOrigins entry contains a wildcard
+	// (e.g. "https://*.example.com"). This combination is spec-compliant
+	// (the browser receives the echoed origin, not "*"), but it widens the
+	// credential scope to any matching subdomain. Set this only if you fully
+	// understand the security implications.
+	UnsafeAllowCredentialsWithWildcard bool
+
 	// AllowPrivateNetwork enables the Private Network Access spec.
 	// When true, preflight responses include Access-Control-Allow-Private-Network.
 	AllowPrivateNetwork bool
@@ -94,6 +102,9 @@ func (cfg Config) validate() {
 		for _, o := range cfg.AllowOrigins {
 			if o == "*" {
 				panic("cors: AllowCredentials cannot be used with wildcard AllowOrigins")
+			}
+			if !cfg.UnsafeAllowCredentialsWithWildcard && strings.Contains(o, "*") {
+				panic("cors: AllowCredentials cannot be used with wildcard subdomain AllowOrigins (set UnsafeAllowCredentialsWithWildcard to override)")
 			}
 		}
 	}
@@ -266,6 +277,37 @@ func precompute(cfg Config) precomputed {
 	}
 
 	return p
+}
+
+// maxMirroredHeaders is the maximum number of header names accepted from
+// Access-Control-Request-Headers when MirrorRequestHeaders is true.
+const maxMirroredHeaders = 20
+
+// maxHeaderNameLen is the maximum length of a single header name accepted
+// when mirroring request headers.
+const maxHeaderNameLen = 128
+
+// isValidHTTPToken reports whether s is a valid HTTP token per RFC 7230 §3.2.6.
+// token = 1*tchar
+// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+//
+//	"^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+func isValidHTTPToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // isSerializedOrigin checks whether an origin string looks like a valid

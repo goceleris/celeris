@@ -12,7 +12,7 @@ func ExampleNew() {
 func ExampleNew_restricted() {
 	// Restrict to specific origins with credentials.
 	_ = cors.New(cors.Config{
-		AllowOrigins:     []string{"https://example.com", "https://*.example.com"},
+		AllowOrigins:     []string{"https://example.com"},
 		AllowCredentials: true,
 		MaxAge:           3600,
 	})
