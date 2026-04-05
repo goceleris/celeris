@@ -33,7 +33,7 @@ func Accept(header string, offers []string) string {
 			}
 		}
 	}
-	if bestQ < 0 {
+	if bestQ <= 0 {
 		return ""
 	}
 	return bestOffer
