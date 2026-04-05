@@ -115,7 +115,7 @@ func applyDefaults(cfg Config) Config {
 	return cfg
 }
 
-func validate(cfg Config) {
+func (cfg Config) validate() {
 	if cfg.Threshold <= 0 || cfg.Threshold > 1 {
 		panic("circuitbreaker: Threshold must be in (0, 1]")
 	}

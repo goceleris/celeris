@@ -516,13 +516,13 @@ func TestValidateNegativeCooldown(t *testing.T) {
 			t.Fatal("expected panic for negative CooldownPeriod")
 		}
 	}()
-	validate(Config{
+	(Config{
 		Threshold:      0.5,
 		MinRequests:    10,
 		WindowSize:     10 * time.Second,
 		CooldownPeriod: -1 * time.Second,
 		HalfOpenMax:    1,
-	})
+	}).validate()
 }
 
 func TestValidateNegativeHalfOpenMax(t *testing.T) {
@@ -532,13 +532,13 @@ func TestValidateNegativeHalfOpenMax(t *testing.T) {
 			t.Fatal("expected panic for negative HalfOpenMax")
 		}
 	}()
-	validate(Config{
+	(Config{
 		Threshold:      0.5,
 		MinRequests:    10,
 		WindowSize:     10 * time.Second,
 		CooldownPeriod: 30 * time.Second,
 		HalfOpenMax:    -1,
-	})
+	}).validate()
 }
 
 func TestValidateTinyWindowSize(t *testing.T) {
@@ -548,13 +548,13 @@ func TestValidateTinyWindowSize(t *testing.T) {
 			t.Fatal("expected panic for tiny WindowSize")
 		}
 	}()
-	validate(Config{
+	(Config{
 		Threshold:      0.5,
 		MinRequests:    10,
 		WindowSize:     1 * time.Nanosecond,
 		CooldownPeriod: 30 * time.Second,
 		HalfOpenMax:    1,
-	})
+	}).validate()
 }
 
 func TestValidateNegativeMinRequests(t *testing.T) {
@@ -564,13 +564,13 @@ func TestValidateNegativeMinRequests(t *testing.T) {
 			t.Fatal("expected panic for negative MinRequests")
 		}
 	}()
-	validate(Config{
+	(Config{
 		Threshold:      0.5,
 		MinRequests:    -5,
 		WindowSize:     10 * time.Second,
 		CooldownPeriod: 30 * time.Second,
 		HalfOpenMax:    1,
-	})
+	}).validate()
 }
 
 func TestCounts(t *testing.T) {

@@ -45,9 +45,10 @@
 // # Programmatic Access
 //
 // Use [NewWithBreaker] to obtain a reference to the underlying [Breaker]
-// struct. This allows programmatic state inspection ([Breaker.State]) and
-// forced reset ([Breaker.Reset]) for health checks, admin endpoints, or
-// integration tests.
+// struct. This allows programmatic state inspection ([Breaker.State]),
+// window counter export ([Breaker.Counts]) for dashboards and Prometheus,
+// and forced reset ([Breaker.Reset]) for health checks, admin endpoints,
+// or integration tests.
 //
 // # Middleware Ordering
 //

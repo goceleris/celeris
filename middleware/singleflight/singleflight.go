@@ -28,7 +28,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		cfg = config[0]
 	}
 	cfg = applyDefaults(cfg)
-	validate(cfg)
+	cfg.validate()
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)

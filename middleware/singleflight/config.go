@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"net/url"
 	"slices"
 
 	"github.com/goceleris/celeris"
@@ -39,7 +40,8 @@ func applyDefaults(cfg Config) Config {
 	return cfg
 }
 
-func validate(Config) {}
+// No validation needed: all Config fields have safe zero values.
+func (cfg Config) validate() {}
 
 func defaultKeyFunc(c *celeris.Context) string {
 	m := c.Method()
@@ -52,9 +54,15 @@ func defaultKeyFunc(c *celeris.Context) string {
 	if rq == "" {
 		key = m + "\x00" + p
 	} else {
-		sorted := c.QueryParams()
-		for _, vals := range sorted {
-			slices.Sort(vals)
+		// Clone query params before sorting to avoid mutating the
+		// context's cached queryCache.
+		params := c.QueryParams()
+		sorted := make(url.Values, len(params))
+		for k, v := range params {
+			cp := make([]string, len(v))
+			copy(cp, v)
+			slices.Sort(cp)
+			sorted[k] = cp
 		}
 		key = m + "\x00" + p + "\x00" + sorted.Encode()
 	}
