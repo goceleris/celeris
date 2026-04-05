@@ -9,7 +9,7 @@ import (
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
-	"golang.org/x/net/http2"
+
 )
 
 const maxToHandlerBodySize = maxBodySize
@@ -118,10 +118,3 @@ func (rw *toStdlibResponseWriter) WriteResponse(_ *stream.Stream, status int, he
 	return nil
 }
 
-func (rw *toStdlibResponseWriter) SendGoAway(_ uint32, _ http2.ErrCode, _ []byte) error { return nil }
-func (rw *toStdlibResponseWriter) MarkStreamClosed(_ uint32)                            {}
-func (rw *toStdlibResponseWriter) IsStreamClosed(_ uint32) bool                         { return false }
-func (rw *toStdlibResponseWriter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) error {
-	return nil
-}
-func (rw *toStdlibResponseWriter) CloseConn() error { return nil }

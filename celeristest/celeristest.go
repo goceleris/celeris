@@ -21,7 +21,7 @@ import (
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
-	"golang.org/x/net/http2"
+
 )
 
 // ResponseRecorder captures the response written by a handler.
@@ -78,14 +78,6 @@ func (w *recorderWriter) WriteResponse(_ *stream.Stream, status int, headers [][
 	w.rec.Body = append(w.rec.Body[:0], body...)
 	return nil
 }
-
-func (w *recorderWriter) SendGoAway(_ uint32, _ http2.ErrCode, _ []byte) error { return nil }
-func (w *recorderWriter) MarkStreamClosed(_ uint32)                            {}
-func (w *recorderWriter) IsStreamClosed(_ uint32) bool                         { return false }
-func (w *recorderWriter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) error {
-	return nil
-}
-func (w *recorderWriter) CloseConn() error { return nil }
 
 var _ stream.ResponseWriter = (*recorderWriter)(nil)
 

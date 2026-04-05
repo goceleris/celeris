@@ -243,24 +243,6 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	return nil
 }
 
-func (a *h1ResponseAdapter) SendGoAway(_ uint32, _ http2.ErrCode, _ []byte) error {
-	return nil
-}
-
-func (a *h1ResponseAdapter) MarkStreamClosed(_ uint32) {}
-
-func (a *h1ResponseAdapter) IsStreamClosed(_ uint32) bool {
-	return false
-}
-
-func (a *h1ResponseAdapter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) error {
-	return nil
-}
-
-func (a *h1ResponseAdapter) CloseConn() error {
-	return nil
-}
-
 // h2InlineResponseAdapter writes H2 response frames directly to outBuf.
 // Used by inline handlers that execute on the event loop thread. Bypasses
 // the sharded write queue entirely (no mutex, no eventfd, no goroutine).

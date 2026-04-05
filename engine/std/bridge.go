@@ -11,7 +11,7 @@ import (
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
-	"golang.org/x/net/http2"
+
 )
 
 // Bridge implements http.Handler, bridging net/http requests to stream.Handler.
@@ -127,24 +127,6 @@ func (rw *stdResponseWriter) WriteResponse(_ *stream.Stream, status int, headers
 	if f, ok := rw.w.(http.Flusher); ok {
 		f.Flush()
 	}
-	return nil
-}
-
-func (rw *stdResponseWriter) SendGoAway(_ uint32, _ http2.ErrCode, _ []byte) error {
-	return nil
-}
-
-func (rw *stdResponseWriter) MarkStreamClosed(_ uint32) {}
-
-func (rw *stdResponseWriter) IsStreamClosed(_ uint32) bool {
-	return false
-}
-
-func (rw *stdResponseWriter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) error {
-	return nil
-}
-
-func (rw *stdResponseWriter) CloseConn() error {
 	return nil
 }
 

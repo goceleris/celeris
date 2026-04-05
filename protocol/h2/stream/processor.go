@@ -65,13 +65,20 @@ func (p *h2WorkerPool) Submit(proc *Processor, s *Stream) {
 	}
 }
 
+// h2Conn combines ResponseWriter and H2Controller for processor-internal use.
+// The H2 connection adapter implements both interfaces on a single type.
+type h2Conn interface {
+	ResponseWriter
+	H2Controller
+}
+
 // Processor processes incoming HTTP/2 frames and manages streams.
 type Processor struct {
 	manager              *Manager
 	handler              Handler
 	writer               FrameWriter
 	currentConn          ResponseWriter
-	connWriter           ResponseWriter
+	connWriter           h2Conn
 	hpackDecoder         *hpack.Decoder
 	hpackTarget          *[][2]string // current HPACK decode target slice (avoids closure alloc per request)
 	continuationState    *ContinuationState
@@ -80,7 +87,7 @@ type Processor struct {
 	InlineCachedCtx      any            // per-connection cached app context for inline handlers (avoids sync.Pool)
 	hasMoreFrames        bool           // true when more frames follow in current recv (defers inline cleanup)
 	pendingInlineCleanup []*Stream      // inline-completed streams deferred until frame loop exits
-	InlineWriter         ResponseWriter // direct-to-outBuf writer for inline handlers (set by conn layer)
+	InlineWriter         h2Conn         // direct-to-outBuf writer for inline handlers (set by conn layer)
 	InlineCount          uint64         // number of requests handled inline (for metrics)
 	MaxRequestBodySize   int64          // 0 = use default (100 MB)
 }
@@ -117,8 +124,9 @@ func (p *Processor) FlushInlineCleanup() {
 	p.pendingInlineCleanup = p.pendingInlineCleanup[:0]
 }
 
-// NewProcessor creates a new stream processor.
-func NewProcessor(handler Handler, writer FrameWriter, conn ResponseWriter) *Processor {
+// NewProcessor creates a new stream processor. The conn parameter must
+// implement both ResponseWriter and H2Controller (all H2 engine adapters do).
+func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
 	p := &Processor{
 		manager:    NewManager(),
 		handler:    handler,
