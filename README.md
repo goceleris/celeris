@@ -103,17 +103,22 @@ All middleware is in-tree under [`middleware/`](middleware/):
 |---------|-------------|
 | [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
 | [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
+| [`compress`](middleware/compress) | Response compression (zstd, brotli, gzip; separate go.mod) |
 | [`cors`](middleware/cors) | Cross-Origin Resource Sharing (zero-alloc) |
 | [`csrf`](middleware/csrf) | CSRF protection (double-submit cookie + origin validation) |
 | [`debug`](middleware/debug) | Debug/introspection endpoints (loopback-only by default) |
+| [`etag`](middleware/etag) | Automatic ETag generation and conditional 304 responses |
 | [`healthcheck`](middleware/healthcheck) | Kubernetes-style liveness/readiness/startup probes |
 | [`jwt`](middleware/jwt) | JWT authentication (HMAC/RSA/ECDSA/EdDSA, JWKS auto-refresh) |
 | [`keyauth`](middleware/keyauth) | API key authentication with constant-time comparison |
 | [`logger`](middleware/logger) | Structured request logging (slog, zero-alloc FastHandler) |
+| [`methodoverride`](middleware/methodoverride) | HTTP method override via header or form field |
 | [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
 | [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
+| [`proxy`](middleware/proxy) | Trusted proxy header extraction (X-Forwarded-For, X-Real-IP) |
 | [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter |
 | [`recovery`](middleware/recovery) | Panic recovery with broken pipe detection |
+| [`redirect`](middleware/redirect) | URL redirect/rewrite (HTTPS, www, trailing slash) |
 | [`requestid`](middleware/requestid) | Request ID generation (buffered UUID v4) |
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions with pluggable store |
@@ -263,6 +268,8 @@ For current benchmark results and methodology, see [goceleris.dev/benchmarks](ht
 
 Middleware comparison benchmarks are in [`test/benchcmp/`](test/benchcmp/) (Celeris vs Fiber v3 vs Echo v4 vs Chi v5 vs stdlib). Run with `mage middlewareBenchmark`.
 
+> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use `test/benchcmp/` for fair cross-framework comparisons.
+
 ## Project Structure
 
 ```
@@ -270,7 +277,7 @@ adaptive/       Adaptive meta-engine (Linux)
 celeristest/    Test helpers (NewContext, ResponseRecorder)
 engine/         Engine interface + implementations (iouring, epoll, std)
 internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts)
-middleware/     In-tree middleware ecosystem (17 packages)
+middleware/     In-tree middleware ecosystem (22 packages)
 observe/        Metrics collector, CPUMonitor, Snapshot
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)

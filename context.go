@@ -62,6 +62,12 @@ func SetTestHandlers(c *Context, handlers []HandlerFunc) {
 	c.index = -1
 }
 
+// SetTestScheme sets the scheme override on a test context.
+func SetTestScheme(c *Context, scheme string) {
+	c.extended = true
+	c.schemeOverride = scheme
+}
+
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
 // A Context is obtained from the pool and must not be retained after the handler returns.
 type Context struct {

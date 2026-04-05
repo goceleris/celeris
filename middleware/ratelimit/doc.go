@@ -61,4 +61,18 @@
 // Note: [New] spawns one or more background goroutines for bucket eviction.
 // Set CleanupContext to a cancellable context to ensure they are stopped
 // when the middleware is no longer needed.
+//
+// # Reverse Proxy Integration
+//
+// The default KeyFunc uses c.ClientIP(). When behind a reverse proxy,
+// install the proxy middleware via Server.Pre() so rate limits apply to
+// real client IPs, not the proxy's IP:
+//
+//	server.Pre(proxy.New(proxy.Config{
+//	    TrustedProxies: []string{"10.0.0.0/8"},
+//	}))
+//	server.Use(ratelimit.New()) // rate-limits by real client IP
+//
+// Without proxy middleware, all clients behind the same proxy share a
+// single rate-limit bucket.
 package ratelimit

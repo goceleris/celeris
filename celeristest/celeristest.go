@@ -92,6 +92,7 @@ type config struct {
 	handlers       []any
 	fullPath       string
 	protocol       string
+	scheme         string
 	trustedProxies []string
 	headersBuf     [4][2]string
 	handlersBuf    [4]any
@@ -116,6 +117,7 @@ func (c *config) reset() {
 	c.remoteAddr = ""
 	c.fullPath = ""
 	c.protocol = ""
+	c.scheme = ""
 	c.trustedProxies = nil
 	for i := range c.handlers {
 		c.handlers[i] = nil
@@ -174,6 +176,13 @@ func WithFullPath(path string) Option {
 // WithProtocol sets the HTTP protocol version. Use "1.1" for HTTP/1.1 or "2" for HTTP/2.
 func WithProtocol(version string) Option {
 	return func(c *config) { c.protocol = version }
+}
+
+// WithScheme sets the request scheme override (e.g. "https"). This simulates
+// what the proxy middleware does via SetScheme, without requiring the raw
+// X-Forwarded-Proto header (which Scheme() no longer trusts directly).
+func WithScheme(scheme string) Option {
+	return func(c *config) { c.scheme = scheme }
 }
 
 // WithTrustedProxies sets CIDR ranges for trusted proxy ClientIP resolution.
@@ -315,6 +324,9 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 	}
 	if cfg.fullPath != "" {
 		celeris.SetTestFullPath(ctx, cfg.fullPath)
+	}
+	if cfg.scheme != "" {
+		celeris.SetTestScheme(ctx, cfg.scheme)
 	}
 	if len(cfg.trustedProxies) > 0 {
 		nets := make([]*net.IPNet, 0, len(cfg.trustedProxies))

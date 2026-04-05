@@ -71,4 +71,18 @@
 // CookieHTTPOnly is always enforced as true regardless of the user-supplied
 // Config value. This prevents client-side JavaScript from reading the CSRF
 // cookie, which is a defense-in-depth measure against XSS token theft.
+//
+// # Method Override Interaction
+//
+// When using the methodoverride middleware (registered via Server.Pre()),
+// the HTTP method is rewritten before CSRF validation. A POST request with
+// X-HTTP-Method-Override: PUT becomes a PUT by the time CSRF runs.
+//
+// IMPORTANT: Do not add PUT, DELETE, or PATCH to SafeMethods if you use
+// method override. Doing so would allow form submissions to bypass CSRF
+// token validation by tunneling through POST → PUT/DELETE/PATCH.
+//
+// The default SafeMethods (GET, HEAD, OPTIONS, TRACE) are safe because
+// methodoverride only overrides POST requests, and the typical override
+// targets (PUT, DELETE, PATCH) are not in the CSRF safe set.
 package csrf

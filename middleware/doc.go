@@ -1,10 +1,19 @@
 // Package middleware provides production-ready middleware for celeris.
 //
-// # Recommended Middleware Ordering
+// # Pre-Routing Middleware (Server.Pre)
+//
+// These run before the router matches the request and can mutate the
+// request method, path, scheme, host, or client IP:
+//
+//	proxy          — extract real client IP/scheme/host from trusted proxy headers
+//	redirect       — HTTPS, www, trailing-slash URL normalization
+//	methodoverride — override POST method via _method form field or header
+//
+// # Recommended Middleware Ordering (Server.Use)
 //
 // Install middleware in this order so each layer sees the right context:
 //
-//	healthcheck — health probes bypass all middleware; respond immediately
+//	healthcheck — health probes respond early; place first to skip downstream middleware
 //	requestid   — assign request ID first; all downstream logs include it
 //	metrics/otel — Prometheus / OpenTelemetry: can also go after logger
 //	logger      — log every request with the ID from requestid
@@ -18,7 +27,25 @@
 //	session     — load session (may depend on authenticated user)
 //	debug       — intercepts by path prefix (e.g. /debug/); can go anywhere
 //	timeout     — bound handler execution; innermost wrapper before the route
+//	compress    — response compression; wraps etag (computes on uncompressed body)
+//	etag        — conditional responses (304 Not Modified); innermost transform
 //	[handler]   — route handler
+//
+// Example production stack:
+//
+//	// Pre-routing
+//	s.Pre(proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}))
+//	s.Pre(redirect.HTTPSRedirect())
+//	s.Pre(methodoverride.New())
+//
+//	// Route middleware
+//	s.Use(healthcheck.New())
+//	s.Use(requestid.New())
+//	s.Use(recovery.New())
+//	s.Use(cors.New())
+//	s.Use(secure.New())
+//	s.Use(compress.New())
+//	s.Use(etag.New())
 //
 // # Measurement System Roles
 //
@@ -62,4 +89,18 @@
 // Requests with a valid JWT proceed after jwtAuth. Requests without a JWT
 // (or with an invalid one) fall through to keyAuth. If neither succeeds,
 // keyAuth returns 401.
+//
+// # Vary Header Convention
+//
+// Several middleware set the Vary response header:
+//
+//   - cors: Vary: Origin
+//   - compress: Vary: Accept-Encoding
+//
+// All middleware use AddHeader (not SetHeader) for Vary to preserve values
+// set by other middleware. Handlers that need to set Vary MUST also use
+// AddHeader to avoid clobbering middleware-set values:
+//
+//	c.AddHeader("vary", "Accept-Language")  // correct
+//	c.SetHeader("vary", "Accept-Language")  // WRONG: clobbers cors/compress Vary
 package middleware

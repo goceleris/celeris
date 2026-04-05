@@ -331,20 +331,17 @@ func (c *Context) parseCookies() {
 	}
 }
 
-// Scheme returns the request scheme ("http" or "https"). If SetScheme has been
-// called, the override value is returned. Otherwise it checks the
-// X-Forwarded-Proto header first (set by reverse proxies), then falls back
-// to the :scheme pseudo-header from the original request.
-// Returns "http" if neither source provides a value.
+// Scheme returns the request scheme ("http" or "https"). If [Context.SetScheme]
+// has been called (typically by the proxy middleware), the override value is
+// returned. Otherwise it checks the :scheme pseudo-header from the original
+// request. Returns "http" if neither source provides a value.
+//
+// To trust X-Forwarded-Proto from reverse proxies, use the proxy middleware
+// which validates the header against trusted proxy networks before calling
+// SetScheme.
 func (c *Context) Scheme() string {
 	if c.schemeOverride != "" {
 		return c.schemeOverride
-	}
-	if proto := c.Header("x-forwarded-proto"); proto != "" {
-		if proto == "https" || proto == "http" {
-			return proto
-		}
-		return strings.ToLower(strings.TrimSpace(proto))
 	}
 	if scheme := c.Header(":scheme"); scheme != "" {
 		return scheme

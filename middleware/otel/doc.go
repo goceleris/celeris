@@ -34,4 +34,12 @@
 // http.server.response.body.size (By). Set [Config].DisableMetrics for
 // tracing-only mode. Use [Config].CustomAttributes and
 // [Config].CustomMetricAttributes for per-request attribute injection.
+//
+// # Response Size and Compression
+//
+// The http.response.body.size metric records c.BytesWritten() at the point
+// the OTel middleware runs. With the recommended ordering (otel before
+// compress), this reflects uncompressed application-level sizes. Changing
+// the middleware order to place otel after compress would record compressed
+// sizes instead.
 package otel

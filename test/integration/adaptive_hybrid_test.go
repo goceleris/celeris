@@ -114,14 +114,24 @@ func TestAdaptiveAutoSingleWorker(t *testing.T) {
 	addr := e.Addr().String()
 
 	// H1 request. Use a dedicated transport to avoid default pool
-	// interference with the subsequent H2C connection.
+	// interference with the subsequent H2C connection. On CI the adaptive
+	// engine may transiently reset connections during io_uring stabilization
+	// (ACCEPT_DIRECT EINVAL), so retry with backoff.
 	h1Client := &http.Client{
 		Timeout:   3 * time.Second,
 		Transport: &http.Transport{DisableKeepAlives: true},
 	}
-	resp, err := h1Client.Get("http://" + addr + "/single-h1")
-	if err != nil {
-		t.Fatalf("H1 request failed: %v", err)
+	var resp *http.Response
+	h1Deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err = h1Client.Get("http://" + addr + "/single-h1")
+		if err == nil {
+			break
+		}
+		if time.Now().After(h1Deadline) {
+			t.Fatalf("H1 request failed after retries: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {

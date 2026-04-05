@@ -898,12 +898,12 @@ func TestGranularErrorSentinels(t *testing.T) {
 		{"ErrRefererMissing on HTTPS no referer", []celeristest.Option{
 			celeristest.WithHeader("x-csrf-token", validToken),
 			celeristest.WithCookie("_csrf", validToken),
-			celeristest.WithHeader("x-forwarded-proto", "https"),
+			celeristest.WithScheme("https"),
 		}, ErrRefererMissing},
 		{"ErrRefererMismatch on HTTPS bad referer", []celeristest.Option{
 			celeristest.WithHeader("x-csrf-token", validToken),
 			celeristest.WithCookie("_csrf", validToken),
-			celeristest.WithHeader("x-forwarded-proto", "https"),
+			celeristest.WithScheme("https"),
 			celeristest.WithHeader("referer", "https://evil.com/page"),
 		}, ErrRefererMismatch},
 	}
@@ -983,7 +983,7 @@ func TestRefererFallbackHTTPS(t *testing.T) {
 	_, err := testutil.RunChain(t, chain, "POST", "/submit",
 		celeristest.WithHeader("x-csrf-token", validToken),
 		celeristest.WithCookie("_csrf", validToken),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("referer", "https://evil.com/page"),
 	)
 	testutil.AssertHTTPError(t, err, 403)
@@ -999,7 +999,7 @@ func TestRefererFallbackHTTPSMatchingHost(t *testing.T) {
 	rec, err := testutil.RunChain(t, chain, "POST", "/submit",
 		celeristest.WithHeader("x-csrf-token", validToken),
 		celeristest.WithCookie("_csrf", validToken),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("referer", "https://localhost/page"),
 	)
 	testutil.AssertNoError(t, err)
@@ -1034,7 +1034,7 @@ func TestRefererFullURLExtractsOriginForComparison(t *testing.T) {
 	rec, err := testutil.RunChain(t, chain, "POST", "/submit",
 		celeristest.WithHeader("x-csrf-token", validToken),
 		celeristest.WithCookie("_csrf", validToken),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("referer", "https://trusted.example.com/some/path?q=1"),
 	)
 	testutil.AssertNoError(t, err)
@@ -1051,7 +1051,7 @@ func TestRefererWithPathMatchesHost(t *testing.T) {
 	rec, err := testutil.RunChain(t, chain, "POST", "/submit",
 		celeristest.WithHeader("x-csrf-token", validToken),
 		celeristest.WithCookie("_csrf", validToken),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("referer", "https://localhost/deep/path?key=value"),
 	)
 	testutil.AssertNoError(t, err)
@@ -1070,7 +1070,7 @@ func TestRefererWildcardMatchesOriginOnly(t *testing.T) {
 	rec, err := testutil.RunChain(t, chain, "POST", "/submit",
 		celeristest.WithHeader("x-csrf-token", validToken),
 		celeristest.WithCookie("_csrf", validToken),
-		celeristest.WithHeader("x-forwarded-proto", "https"),
+		celeristest.WithScheme("https"),
 		celeristest.WithHeader("referer", "https://app.example.com/api/v1/action"),
 	)
 	testutil.AssertNoError(t, err)

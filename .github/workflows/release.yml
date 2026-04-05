@@ -37,7 +37,7 @@ jobs:
       - name: Create sub-module tags
         run: |
           VERSION="${{ github.event.release.tag_name }}"
-          SUBMODULES="middleware/metrics middleware/otel"
+          SUBMODULES="middleware/compress middleware/metrics middleware/otel"
           for sub in $SUBMODULES; do
             TAG="${sub}/${VERSION}"
             if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
@@ -51,7 +51,7 @@ jobs:
       - name: Update sub-module go.mod versions
         run: |
           VERSION="${{ github.event.release.tag_name }}"
-          SUBMODULES="middleware/metrics middleware/otel"
+          SUBMODULES="middleware/compress middleware/metrics middleware/otel"
           for sub in $SUBMODULES; do
             GOMOD="${sub}/go.mod"
             if [ -f "$GOMOD" ]; then
@@ -91,7 +91,7 @@ jobs:
       - name: Request sub-module versions from proxy
         run: |
           VERSION="${{ github.event.release.tag_name }}"
-          SUBMODULES="middleware/metrics middleware/otel"
+          SUBMODULES="middleware/compress middleware/metrics middleware/otel"
           for sub in $SUBMODULES; do
             MODULE="github.com/goceleris/celeris/${sub}"
             echo "Notifying proxy for ${MODULE}@${VERSION}..."
@@ -109,5 +109,6 @@ jobs:
         run: |
           VERSION="${{ github.event.release.tag_name }}"
           go list -m "github.com/goceleris/celeris@${VERSION}" || echo "Root module not yet indexed"
+          go list -m "github.com/goceleris/celeris/middleware/compress@${VERSION}" || echo "compress sub-module not yet indexed"
           go list -m "github.com/goceleris/celeris/middleware/metrics@${VERSION}" || echo "metrics sub-module not yet indexed"
           go list -m "github.com/goceleris/celeris/middleware/otel@${VERSION}" || echo "otel sub-module not yet indexed"

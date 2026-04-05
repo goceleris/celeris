@@ -66,4 +66,17 @@
 // # Middleware Order
 //
 // Register after requestid for request ID inclusion in logs.
+//
+// # Reverse Proxy Integration
+//
+// When running behind a reverse proxy, install the proxy middleware via
+// Server.Pre() so that Logger sees the real client IP:
+//
+//	server.Pre(proxy.New(proxy.Config{
+//	    TrustedProxies: []string{"10.0.0.0/8"},
+//	}))
+//	server.Use(logger.New()) // now logs the real client IP
+//
+// Without proxy middleware, Logger records the reverse proxy's IP address,
+// not the end user's.
 package logger
