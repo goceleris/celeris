@@ -14,9 +14,9 @@ import (
 // a reference for programmatic state inspection and reset.
 type Breaker struct {
 	state        atomic.Int32
-	openedAt     atomic.Int64  // UnixNano when breaker opened
-	halfOpenUsed atomic.Int32  // probe requests admitted in half-open
-	mu           sync.Mutex    // protects state transitions
+	openedAt     atomic.Int64 // UnixNano when breaker opened
+	halfOpenUsed atomic.Int32 // probe requests admitted in half-open
+	mu           sync.Mutex   // protects state transitions
 	window       *slidingWindow
 
 	threshold      float64

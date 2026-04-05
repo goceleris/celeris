@@ -14,13 +14,13 @@ import (
 	"github.com/goceleris/celeris/middleware/cors"
 	"github.com/goceleris/celeris/middleware/etag"
 	"github.com/goceleris/celeris/middleware/methodoverride"
-	"github.com/goceleris/celeris/middleware/singleflight"
 	"github.com/goceleris/celeris/middleware/proxy"
 	"github.com/goceleris/celeris/middleware/ratelimit"
 	"github.com/goceleris/celeris/middleware/recovery"
 	"github.com/goceleris/celeris/middleware/redirect"
 	"github.com/goceleris/celeris/middleware/requestid"
 	"github.com/goceleris/celeris/middleware/secure"
+	"github.com/goceleris/celeris/middleware/singleflight"
 	"github.com/goceleris/celeris/middleware/timeout"
 )
 

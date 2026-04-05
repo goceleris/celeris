@@ -66,7 +66,7 @@
 // use atomic operations (lock-free hot path). State transitions acquire a
 // mutex with double-check locking to prevent duplicate transitions.
 //
-// Basic usage with defaults (50% threshold, 10 min requests, 10s window):
+// Basic usage with defaults (50% threshold, minimum 10 requests, 10s window):
 //
 //	server.Use(circuitbreaker.New())
 //
