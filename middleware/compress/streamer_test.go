@@ -151,4 +151,3 @@ func TestWriteHeaderAddsEncodingAndVary(t *testing.T) {
 		})
 	}
 }
-
