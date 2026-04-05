@@ -33,7 +33,7 @@ func decompressGzip(t *testing.T, data []byte) []byte {
 	if err != nil {
 		t.Fatalf("gzip.NewReader: %v", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	out, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("gzip read: %v", err)
