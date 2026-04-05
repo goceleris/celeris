@@ -16,6 +16,8 @@
 *.out
 coverage.*
 *.coverprofile
+*.prof
+cover.html
 profile.cov
 
 # Dependency directories
