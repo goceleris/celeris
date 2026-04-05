@@ -22,15 +22,17 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 - **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK, inline handler execution, zero-alloc HEADERS fast path
 - **Auto-detect** — protocol negotiation from the first bytes on the wire
 - **Error-returning handlers** — `HandlerFunc` returns `error`; structured `HTTPError` for status codes
-- **Serialization** — JSON and XML response methods (`JSON`, `XML`); Protocol Buffers available via [`github.com/goceleris/middlewares`](https://github.com/goceleris/middlewares); `Bind` auto-detects request format from Content-Type
+- **Pre-routing middleware** — `Server.Pre()` runs middleware before route matching (method override, URL rewrite)
+- **Serialization** — JSON and XML response methods; `Bind` auto-detects request format from Content-Type
 - **net/http compatibility** — wrap existing `http.Handler` via `celeris.Adapt()`
 - **Streaming responses** — `Detach()` + `StreamWriter` for SSE and chunked responses on native engines
 - **Connection hijacking** — `Hijack()` for WebSocket and custom protocol upgrades (H1 only)
+- **Response buffering** — `BufferResponse`/`FlushResponse` for transform middleware (compress, ETag, cache)
+- **File serving** — `File()` from OS, `FileFromFS()` from `embed.FS` / `fs.FS`
+- **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`
 - **Configurable body limits** — `MaxRequestBodySize` enforced across H1, H2, and the bridge
 - **100-continue control** — `OnExpectContinue` callback for upload validation before body transfer
 - **Accept control** — `PauseAccept()`/`ResumeAccept()` for graceful load shedding
-- **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`
-- **Response buffering** — `BufferResponse`/`FlushResponse` for transform middleware (compress, ETag)
 - **Zero-downtime restart** — `InheritListener` + `StartWithListener` for socket inheritance
 - **Built-in metrics** — atomic counters, CPU utilization sampling, always-on `Server.Collector().Snapshot()`
 
@@ -79,19 +81,63 @@ s.GET("/users/:id", func(c *celeris.Context) error {
 // Catch-all wildcards
 s.GET("/files/*path", staticFileHandler)
 
-// Route groups
+// Route groups with middleware
 api := s.Group("/api")
+api.Use(authMiddleware)
 api.GET("/items", listItems)
 api.POST("/items", createItem)
 
-// Nested groups
-v2 := api.Group("/v2")
-v2.GET("/items", listItemsV2)
+// Named routes + reverse URL generation
+s.GET("/users/:id", showUser).Name("user")
+url, _ := s.URL("user", "42") // "/users/42"
+
+// Pre-routing middleware (runs before route matching)
+s.Pre(methodOverride, urlRewrite)
 ```
 
 ## Middleware
 
-Middleware is provided by the [`goceleris/middlewares`](https://github.com/goceleris/middlewares) module. See that repo for usage, examples, and the full list of available middleware.
+All middleware is in-tree under [`middleware/`](middleware/):
+
+| Package | Description |
+|---------|-------------|
+| [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
+| [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
+| [`cors`](middleware/cors) | Cross-Origin Resource Sharing (zero-alloc) |
+| [`csrf`](middleware/csrf) | CSRF protection (double-submit cookie + origin validation) |
+| [`debug`](middleware/debug) | Debug/introspection endpoints (loopback-only by default) |
+| [`healthcheck`](middleware/healthcheck) | Kubernetes-style liveness/readiness/startup probes |
+| [`jwt`](middleware/jwt) | JWT authentication (HMAC/RSA/ECDSA/EdDSA, JWKS auto-refresh) |
+| [`keyauth`](middleware/keyauth) | API key authentication with constant-time comparison |
+| [`logger`](middleware/logger) | Structured request logging (slog, zero-alloc FastHandler) |
+| [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
+| [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
+| [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter |
+| [`recovery`](middleware/recovery) | Panic recovery with broken pipe detection |
+| [`requestid`](middleware/requestid) | Request ID generation (buffered UUID v4) |
+| [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
+| [`session`](middleware/session) | Cookie-based sessions with pluggable store |
+| [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
+
+```go
+import (
+	"github.com/goceleris/celeris/middleware/cors"
+	"github.com/goceleris/celeris/middleware/logger"
+	"github.com/goceleris/celeris/middleware/recovery"
+)
+
+s := celeris.New(celeris.Config{Addr: ":8080"})
+s.Use(recovery.New())
+s.Use(logger.New())
+s.Use(cors.New())
+```
+
+For middleware with external dependencies, use separate imports:
+
+```go
+import "github.com/goceleris/celeris/middleware/metrics" // requires prometheus
+import "github.com/goceleris/celeris/middleware/otel"    // requires opentelemetry
+```
 
 ## Error Handling
 
@@ -110,16 +156,15 @@ s.GET("/item/:id", func(c *celeris.Context) error {
 	return c.JSON(200, item)
 })
 
-// Middleware can intercept errors from downstream handlers
-func ErrorLogger() celeris.HandlerFunc {
-	return func(c *celeris.Context) error {
-		err := c.Next()
-		if err != nil {
-			slog.Error("handler error", "path", c.Path(), "error", err)
-		}
-		return err
+// Use Status() + StatusJSON() for fluent responses
+s.POST("/items", func(c *celeris.Context) error {
+	var item Item
+	if err := c.Bind(&item); err != nil {
+		return celeris.NewHTTPError(400, "invalid body").WithError(err)
 	}
-}
+	created := store.Create(item)
+	return c.Status(201).StatusJSON(created)
+})
 ```
 
 ## Configuration
@@ -194,15 +239,7 @@ snap := server.Collector().Snapshot()
 fmt.Println(snap.RequestsTotal, snap.ErrorsTotal, snap.ActiveConns, snap.CPUUtilization)
 ```
 
-For CPU utilization tracking, register a monitor:
-
-```go
-mon, _ := observe.NewCPUMonitor()
-server.Collector().SetCPUMonitor(mon)
-defer mon.Close()
-```
-
-For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](https://github.com/goceleris/middlewares) and [`middlewares/debug`](https://github.com/goceleris/middlewares) packages.
+For Prometheus exposition and debug endpoints, use the [`middleware/metrics`](middleware/metrics) and [`middleware/debug`](middleware/debug) packages. For OpenTelemetry, use [`middleware/otel`](middleware/otel).
 
 ## Feature Matrix
 
@@ -224,26 +261,22 @@ For Prometheus exposition and debug endpoints, use the [`middlewares/metrics`](h
 
 For current benchmark results and methodology, see [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks).
 
-Reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/benchmarks).
+Middleware comparison benchmarks are in [`test/benchcmp/`](test/benchcmp/) (Celeris vs Fiber v3 vs Echo v4 vs Chi v5 vs stdlib). Run with `mage middlewareBenchmark`.
 
-## API Overview
+## Project Structure
 
-| Type | Package | Description |
-|------|---------|-------------|
-| `Server` | `celeris` | Top-level entry point; owns config, router, engine |
-| `Config` | `celeris` | Server configuration (addr, engine, protocol, timeouts, body limits) |
-| `Context` | `celeris` | Per-request context with params, headers, body, response methods |
-| `HandlerFunc` | `celeris` | `func(*Context) error` — handler/middleware signature |
-| `HTTPError` | `celeris` | Structured error carrying HTTP status code and message |
-| `RouteGroup` | `celeris` | Group of routes sharing a prefix and middleware |
-| `Route` | `celeris` | Opaque handle to a registered route |
-| `RouteInfo` | `celeris` | Describes a registered route (method, path, handler count) |
-| `Cookie` | `celeris` | HTTP cookie for `SetCookie`/`DeleteCookie` |
-| `StreamWriter` | `celeris` | Incremental response writer for streaming/SSE |
-| `EngineInfo` | `celeris` | Read-only info about the running engine (type + metrics) |
-| `Collector` | `observe` | Lock-free request metrics aggregator |
-| `Snapshot` | `observe` | Point-in-time copy of all collected metrics |
-| `CPUMonitor` | `observe` | CPU utilization sampler (Linux `/proc/stat`, other `runtime/metrics`) |
+```
+adaptive/       Adaptive meta-engine (Linux)
+celeristest/    Test helpers (NewContext, ResponseRecorder)
+engine/         Engine interface + implementations (iouring, epoll, std)
+internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts)
+middleware/     In-tree middleware ecosystem (17 packages)
+observe/        Metrics collector, CPUMonitor, Snapshot
+probe/          System capability detection
+protocol/       Protocol parsers (h1, h2, detect)
+resource/       Configuration, presets, defaults
+test/           Conformance, spec compliance, integration, benchmarks
+```
 
 ## Requirements
 
@@ -252,31 +285,9 @@ Reproduction scripts are in the [benchmarks repo](https://github.com/goceleris/b
 - **Any OS** for the std engine
 - Dependencies: `golang.org/x/sys`, `golang.org/x/net`
 
-## Project Structure
-
-```
-adaptive/       Adaptive meta-engine (Linux)
-celeristest/    Test helpers (NewContext, ResponseRecorder)
-engine/         Engine interface + implementations (iouring, epoll, std)
-internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts, timer)
-observe/        Metrics collector, CPUMonitor, Snapshot
-probe/          System capability detection
-protocol/       Protocol parsers (h1, h2, detect)
-resource/       Configuration, presets, defaults
-test/           Conformance, spec compliance, integration, benchmarks
-```
-
 ## Contributing
 
-```bash
-go install github.com/magefile/mage@latest  # one-time setup
-mage build   # build all targets
-mage test    # run tests with race detector
-mage lint    # run linters
-mage check   # full verification: lint + test + spec + build
-```
-
-Pull requests should target `main`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and pull request guidelines.
 
 ## License
 

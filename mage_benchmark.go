@@ -140,7 +140,6 @@ func parseBenchOutput(out string) map[string]float64 {
 	return results
 }
 
-
 // LocalBenchmark runs A/B benchmarks on a local Multipass VM using wrk/h2load.
 func LocalBenchmark() error {
 	branch, err := currentBranch()

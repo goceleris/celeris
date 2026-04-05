@@ -64,12 +64,14 @@ func (g *RouteGroup) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return g.handle("OPTIONS", path, handlers...)
 }
 
-// Any registers a handler for all HTTP methods.
-func (g *RouteGroup) Any(path string, handlers ...HandlerFunc) *RouteGroup {
-	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} {
-		g.handle(method, path, handlers...)
+// Any registers a handler for all HTTP methods, returning the [Route] for each.
+func (g *RouteGroup) Any(path string, handlers ...HandlerFunc) []*Route {
+	methods := []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+	routes := make([]*Route, len(methods))
+	for i, method := range methods {
+		routes[i] = g.handle(method, path, handlers...)
 	}
-	return g
+	return routes
 }
 
 // Handle registers a handler for the given HTTP method and path pattern.

@@ -44,9 +44,16 @@ type FrameWriter interface {
 	WritePushPromise(streamID uint32, promiseID uint32, endHeaders bool, headerBlock []byte) error
 }
 
-// ResponseWriter is an interface for writing responses.
+// ResponseWriter is the minimal interface for writing HTTP responses.
+// All engine adapters, test recorders, and stdlib bridges implement this.
 type ResponseWriter interface {
 	WriteResponse(stream *Stream, status int, headers [][2]string, body []byte) error
+}
+
+// H2Controller provides HTTP/2 connection-level control operations.
+// Only H2-capable engines implement this; H1 adapters, test recorders,
+// and stdlib bridges do not.
+type H2Controller interface {
 	SendGoAway(lastStreamID uint32, code http2.ErrCode, debug []byte) error
 	MarkStreamClosed(streamID uint32)
 	IsStreamClosed(streamID uint32) bool

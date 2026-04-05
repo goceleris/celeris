@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net"
 	"net/http"
@@ -55,6 +56,26 @@ var jsonEncPool = sync.Pool{New: func() any {
 func (c *Context) Status(code int) *Context {
 	c.statusCode = code
 	return c
+}
+
+// StatusJSON serializes v as JSON using the status code set by [Status].
+// Equivalent to c.JSON(c.statusCode, v).
+func (c *Context) StatusJSON(v any) error { return c.JSON(c.statusCode, v) }
+
+// StatusXML serializes v as XML using the status code set by [Status].
+// Equivalent to c.XML(c.statusCode, v).
+func (c *Context) StatusXML(v any) error { return c.XML(c.statusCode, v) }
+
+// StatusString writes a plain-text response using the status code set by [Status].
+// Equivalent to c.Blob(c.statusCode, "text/plain", []byte(s)).
+func (c *Context) StatusString(s string) error {
+	return c.Blob(c.statusCode, "text/plain", unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// StatusBlob writes a response using the status code set by [Status].
+// Equivalent to c.Blob(c.statusCode, contentType, data).
+func (c *Context) StatusBlob(contentType string, data []byte) error {
+	return c.Blob(c.statusCode, contentType, data)
 }
 
 // JSON serializes v as JSON and writes it with the given status code.
@@ -132,8 +153,8 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if total <= len(c.respHdrBuf) {
 		// respHeaders shares backing array with respHdrBuf — copy user
 		// headers to a stack temporary before overwriting the buffer.
-		// Max user headers in fast path: len(respHdrBuf) - 2 = 6.
-		var tmp [6][2]string
+		// Max user headers in fast path: len(respHdrBuf) - 2 = 14.
+		var tmp [14][2]string
 		copy(tmp[:nUser], c.respHeaders)
 		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
 		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
@@ -256,6 +277,19 @@ func stripCRLF(s string) string {
 // change response headers.
 func (c *Context) ResponseHeaders() [][2]string {
 	return c.respHeaders
+}
+
+// SetResponseHeaders replaces all response headers. Used by caching middleware
+// to replay stored responses. The provided headers are copied; the caller
+// retains ownership of the slice.
+func (c *Context) SetResponseHeaders(headers [][2]string) {
+	if len(headers) <= len(c.respHdrBuf) {
+		copy(c.respHdrBuf[:len(headers)], headers)
+		c.respHeaders = c.respHdrBuf[:len(headers)]
+	} else {
+		c.respHeaders = make([][2]string, len(headers))
+		copy(c.respHeaders, headers)
+	}
 }
 
 // StatusCode returns the response status code set by the handler.
@@ -423,6 +457,45 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 		return NewHTTPError(400, "invalid file path")
 	}
 	return c.File(resolved)
+}
+
+// FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
+// type is detected from the file extension. The entire file is loaded into
+// memory (capped at 100 MB). Returns [HTTPError] with status 413 if the file
+// exceeds this limit.
+//
+// Security: name is passed directly to fsys.Open — callers MUST sanitize
+// user-supplied paths to prevent directory traversal. For untrusted input,
+// use [Context.FileFromDir] instead.
+func (c *Context) FileFromFS(name string, fsys fs.FS) error {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if stat.IsDir() {
+		return NewHTTPError(400, "path is a directory")
+	}
+	size := stat.Size()
+	if size > int64(maxStreamBodySize) {
+		return NewHTTPError(413, "file exceeds 100MB limit")
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+
+	contentType := mime.TypeByExtension(filepath.Ext(name))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	return c.Blob(200, contentType, data)
 }
 
 func parseRange(header string, size int64) (start, end int64, ok bool) {

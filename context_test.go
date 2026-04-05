@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
-
-	"golang.org/x/net/http2"
 )
 
 type mockResponseWriter struct {
@@ -25,13 +23,6 @@ func (m *mockResponseWriter) WriteResponse(_ *stream.Stream, status int, headers
 	copy(m.body, body)
 	return nil
 }
-func (m *mockResponseWriter) SendGoAway(_ uint32, _ http2.ErrCode, _ []byte) error { return nil }
-func (m *mockResponseWriter) MarkStreamClosed(_ uint32)                            {}
-func (m *mockResponseWriter) IsStreamClosed(_ uint32) bool                         { return false }
-func (m *mockResponseWriter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCode) error {
-	return nil
-}
-func (m *mockResponseWriter) CloseConn() error { return nil }
 
 func newTestStream(method, path string) (*stream.Stream, *mockResponseWriter) {
 	s := stream.NewStream(1)

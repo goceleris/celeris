@@ -31,9 +31,35 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 	// (epoll/iouring) or http.Server.WriteTimeout (std), avoiding per-request
 	// timer allocations.
 
-	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
-
 	defer a.recoverAndRelease(c, s)
+
+	// Run pre-routing middleware before route lookup. Pre-middleware may modify
+	// c.method or c.path (e.g. URL rewriting, method override). If any
+	// pre-middleware aborts, skip routing entirely.
+	if len(a.server.preMiddleware) > 0 {
+		c.handlers = a.server.preMiddleware
+		c.index = -1
+		if err := c.Next(); err != nil {
+			a.handleError(c, s, err)
+			if c.buffered && !c.written {
+				c.bufferDepth = 1
+				_ = c.FlushResponse()
+			}
+			return nil
+		}
+		if c.IsAborted() {
+			if c.buffered && !c.written {
+				c.bufferDepth = 1
+				_ = c.FlushResponse()
+			}
+			return nil
+		}
+		// Reset for the actual handler chain.
+		c.handlers = nil
+		c.index = -1
+	}
+
+	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
 
 	if handlers == nil {
 		a.handleUnmatched(c, s)

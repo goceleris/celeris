@@ -47,11 +47,12 @@ type RouteInfo struct {
 // A Server is safe for concurrent use after Start is called. Route registration
 // methods (GET, POST, Use, Group, etc.) must be called before Start.
 type Server struct {
-	config     Config
-	router     *router
-	middleware []HandlerFunc
-	engine     engine.Engine
-	collector  *observe.Collector
+	config        Config
+	router        *router
+	middleware    []HandlerFunc
+	preMiddleware []HandlerFunc
+	engine        engine.Engine
+	collector     *observe.Collector
 
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
@@ -65,11 +66,17 @@ type Server struct {
 }
 
 // New creates a Server with the given configuration.
+// The metrics [observe.Collector] is created eagerly so that [Server.Collector]
+// returns non-nil before Start is called (unless Config.DisableMetrics is set).
 func New(cfg Config) *Server {
-	return &Server{
+	s := &Server{
 		config: cfg,
 		router: newRouter(),
 	}
+	if !cfg.DisableMetrics {
+		s.collector = observe.NewCollector()
+	}
+	return s
 }
 
 func (s *Server) handle(method, path string, handlers ...HandlerFunc) *Route {
@@ -84,6 +91,16 @@ func (s *Server) handle(method, path string, handlers ...HandlerFunc) *Route {
 // at route registration time, so Use must be called before registering routes.
 func (s *Server) Use(middleware ...HandlerFunc) *Server {
 	s.middleware = append(s.middleware, middleware...)
+	return s
+}
+
+// Pre registers pre-routing middleware that executes before route lookup.
+// Pre-middleware may modify the request method or path (e.g. for rewriting or
+// stripping a prefix) before the router resolves the handler chain.
+// If a pre-middleware handler aborts, no routing occurs and the request is
+// considered handled. Must be called before Start.
+func (s *Server) Pre(middleware ...HandlerFunc) *Server {
+	s.preMiddleware = append(s.preMiddleware, middleware...)
 	return s
 }
 
@@ -129,12 +146,14 @@ func (s *Server) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("OPTIONS", path, handlers...)
 }
 
-// Any registers a handler for all HTTP methods.
-func (s *Server) Any(path string, handlers ...HandlerFunc) *Server {
-	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} {
-		s.handle(method, path, handlers...)
+// Any registers a handler for all HTTP methods, returning the [Route] for each.
+func (s *Server) Any(path string, handlers ...HandlerFunc) []*Route {
+	methods := []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+	routes := make([]*Route, len(methods))
+	for i, method := range methods {
+		routes[i] = s.handle(method, path, handlers...)
 	}
-	return s
+	return routes
 }
 
 // NotFound registers a custom handler for requests that do not match any route.
@@ -416,10 +435,6 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 				}
 			}
 			s.trustedNets = append(s.trustedNets, ipNet)
-		}
-
-		if !s.config.DisableMetrics {
-			s.collector = observe.NewCollector()
 		}
 
 		ra := &routerAdapter{server: s}

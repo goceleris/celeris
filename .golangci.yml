@@ -39,3 +39,15 @@ linters:
         linters:
           - revive
         text: "dot-imports"
+      - path: _test\.go
+        linters:
+          - revive
+        text: "unused-parameter"
+      - path: middleware/debug/
+        linters:
+          - revive
+        text: "var-naming"
+      - path: middleware/metrics/
+        linters:
+          - revive
+        text: "var-naming"
