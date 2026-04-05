@@ -457,9 +457,19 @@ func (e *fakeEngine) Addr() net.Addr                   { return nil }
 
 func TestServerAny(t *testing.T) {
 	s := New(Config{})
-	s.Any("/any", func(c *Context) error {
+	routes := s.Any("/any", func(c *Context) error {
 		return c.String(200, "%s", c.Method())
 	})
+
+	// Any must return one Route per method.
+	if len(routes) != 7 {
+		t.Fatalf("expected 7 routes, got %d", len(routes))
+	}
+	for i, r := range routes {
+		if r == nil {
+			t.Fatalf("route[%d] is nil", i)
+		}
+	}
 
 	adapter := &routerAdapter{server: s}
 
@@ -1111,17 +1121,17 @@ func TestStartWithListenerDoubleStart(t *testing.T) {
 
 func TestServerDisableMetrics(t *testing.T) {
 	s := New(Config{DisableMetrics: true})
-	s.GET("/ping", func(c *Context) error {
-		return c.String(200, "pong")
-	})
-
-	// Simulate prepare without actually starting.
-	s.startOnce.Do(func() {
-		s.engine = &fakeEngine{}
-	})
-	// When DisableMetrics is true, collector should remain nil.
+	// When DisableMetrics is true, collector should be nil immediately.
 	if s.Collector() != nil {
 		t.Fatal("expected nil Collector when DisableMetrics is true")
+	}
+}
+
+func TestServerEagerCollector(t *testing.T) {
+	s := New(Config{})
+	// Collector should be non-nil before Start is called.
+	if s.Collector() == nil {
+		t.Fatal("expected non-nil Collector before Start")
 	}
 }
 
@@ -1458,5 +1468,153 @@ func TestServerOnShutdownNotStarted(t *testing.T) {
 	}
 	if hookFired {
 		t.Fatal("hook should not fire when server was not started")
+	}
+}
+
+func TestServerPreMiddleware(t *testing.T) {
+	s := New(Config{})
+	var preRan bool
+	s.Pre(func(c *Context) error {
+		preRan = true
+		return c.Next()
+	})
+	s.GET("/test", func(c *Context) error {
+		return c.String(200, "ok")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/test")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if !preRan {
+		t.Fatal("expected pre-middleware to run")
+	}
+	if rw.status != 200 || string(rw.body) != "ok" {
+		t.Fatalf("expected 200 ok, got %d %s", rw.status, string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerPreMiddlewarePathRewrite(t *testing.T) {
+	s := New(Config{})
+	s.Pre(func(c *Context) error {
+		if c.Path() == "/old" {
+			c.SetPath("/new")
+		}
+		return c.Next()
+	})
+	s.GET("/new", func(c *Context) error {
+		return c.String(200, "rewritten")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/old")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 200 || string(rw.body) != "rewritten" {
+		t.Fatalf("expected 200 rewritten, got %d %s", rw.status, string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerPreMiddlewareMethodOverride(t *testing.T) {
+	s := New(Config{})
+	s.Pre(func(c *Context) error {
+		if c.Method() == "POST" {
+			c.SetMethod("PUT")
+		}
+		return c.Next()
+	})
+	s.PUT("/resource", func(c *Context) error {
+		return c.String(200, "put-ok")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("POST", "/resource")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 200 || string(rw.body) != "put-ok" {
+		t.Fatalf("expected 200 put-ok, got %d %s", rw.status, string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerPreMiddlewareAbort(t *testing.T) {
+	s := New(Config{})
+	s.Pre(func(c *Context) error {
+		return c.AbortWithStatus(403)
+	})
+	var handlerRan bool
+	s.GET("/secret", func(c *Context) error {
+		handlerRan = true
+		return c.String(200, "ok")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/secret")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if handlerRan {
+		t.Fatal("handler should not run when pre-middleware aborts")
+	}
+	if rw.status != 403 {
+		t.Fatalf("expected 403, got %d", rw.status)
+	}
+	st.Release()
+}
+
+func TestServerPreMiddlewareError(t *testing.T) {
+	s := New(Config{})
+	s.Pre(func(_ *Context) error {
+		return NewHTTPError(429, "rate limited")
+	})
+	s.GET("/api", func(c *Context) error {
+		return c.String(200, "ok")
+	})
+
+	adapter := &routerAdapter{server: s}
+
+	st, rw := newTestStream("GET", "/api")
+	if err := adapter.HandleStream(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if rw.status != 429 {
+		t.Fatalf("expected 429, got %d", rw.status)
+	}
+	if string(rw.body) != "rate limited" {
+		t.Fatalf("expected 'rate limited', got %q", string(rw.body))
+	}
+	st.Release()
+}
+
+func TestServerPreChaining(t *testing.T) {
+	s := New(Config{})
+	result := s.Pre(func(c *Context) error { return c.Next() })
+	if result != s {
+		t.Fatal("expected Pre to return *Server for chaining")
+	}
+}
+
+func TestGroupAnyReturnsRoutes(t *testing.T) {
+	s := New(Config{})
+	api := s.Group("/api")
+	routes := api.Any("/all", func(c *Context) error {
+		return c.String(200, "ok")
+	})
+	if len(routes) != 7 {
+		t.Fatalf("expected 7 routes from group Any, got %d", len(routes))
+	}
+	for i, r := range routes {
+		if r == nil {
+			t.Fatalf("group route[%d] is nil", i)
+		}
 	}
 }
