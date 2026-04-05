@@ -84,6 +84,27 @@
 // Scheme() returns "http" (the backend transport), causing an infinite
 // redirect loop with HTTPSRedirect.
 //
+// # Choosing a Constructor
+//
+// The package provides 9 constructors organized into three categories:
+//
+// Redirect (sends 3xx response):
+//
+//	HTTPSRedirect, WWWRedirect, NonWWWRedirect,
+//	TrailingSlashRedirect, RemoveTrailingSlashRedirect
+//
+// Combined redirect (avoids double-redirect):
+//
+//	HTTPSWWWRedirect, HTTPSNonWWWRedirect
+//
+// Rewrite (modifies path in-place, no redirect):
+//
+//	TrailingSlashRewrite, RemoveTrailingSlashRewrite
+//
+// Use redirect when clients should update their URLs (SEO, bookmarks).
+// Use rewrite when normalization is internal (the client URL stays the same).
+// Use combined constructors when both scheme and host need changing.
+//
 // # Skipping
 //
 // Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for

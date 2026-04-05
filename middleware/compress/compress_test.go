@@ -1103,3 +1103,98 @@ func TestAllEncodingsLevelBest(t *testing.T) {
 		ZstdLevel:   LevelBest,
 	})
 }
+
+// --- Resolve-level raw integer tests ---
+
+func TestResolveGzipLevelRawInt(t *testing.T) {
+	body := testBody()
+	mw := New(Config{Encodings: []string{"gzip"}, GzipLevel: 4})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "gzip"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "gzip" {
+		t.Fatalf("expected gzip with raw level 4, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressGzip(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch with gzip level 4")
+	}
+}
+
+func TestResolveBrotliLevelRawInt(t *testing.T) {
+	body := testBody()
+	mw := New(Config{Encodings: []string{"br"}, BrotliLevel: 8})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "br"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "br" {
+		t.Fatalf("expected br with raw level 8, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressBrotli(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch with brotli level 8")
+	}
+}
+
+func TestResolveZstdLevelRawInt(t *testing.T) {
+	body := testBody()
+	mw := New(Config{Encodings: []string{"zstd"}, ZstdLevel: 2})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "zstd"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "zstd" {
+		t.Fatalf("expected zstd with raw level 2, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressZstd(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch with zstd level 2")
+	}
+}
+
+func TestResolveZstdLevelClamping(t *testing.T) {
+	// Level 10 exceeds SpeedBestCompression (4) and should be clamped.
+	body := testBody()
+	mw := New(Config{Encodings: []string{"zstd"}, ZstdLevel: 10})
+	handler := jsonHandler(body)
+
+	ctx, rec := celeristest.NewContext("GET", "/data",
+		celeristest.WithHeader("accept-encoding", "zstd"),
+		celeristest.WithHandlers(mw, handler),
+	)
+	defer celeristest.ReleaseContext(ctx)
+
+	if err := ctx.Next(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Header("content-encoding") != "zstd" {
+		t.Fatalf("expected zstd with clamped level, got %q", rec.Header("content-encoding"))
+	}
+	decompressed := decompressZstd(t, rec.Body)
+	if !bytes.Equal(decompressed, body) {
+		t.Fatalf("decompressed body mismatch with clamped zstd level")
+	}
+}

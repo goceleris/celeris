@@ -26,6 +26,11 @@ type Config struct {
 	// Default: ["POST"]. Must not contain empty or whitespace-only strings.
 	AllowedMethods []string
 
+	// TargetMethods lists the HTTP methods that can be used as override targets.
+	// Override values not in this list are silently ignored.
+	// Default: ["PUT", "DELETE", "PATCH"].
+	TargetMethods []string
+
 	// Getter extracts the override method from the request. The returned
 	// string should be an HTTP method name (e.g. "PUT", "DELETE"). An
 	// empty return value means no override.
@@ -37,11 +42,15 @@ type Config struct {
 // defaultConfig is the default method override configuration.
 var defaultConfig = Config{
 	AllowedMethods: []string{"POST"},
+	TargetMethods:  []string{"PUT", "DELETE", "PATCH"},
 }
 
 func applyDefaults(cfg Config) Config {
 	if len(cfg.AllowedMethods) == 0 {
 		cfg.AllowedMethods = defaultConfig.AllowedMethods
+	}
+	if len(cfg.TargetMethods) == 0 {
+		cfg.TargetMethods = defaultConfig.TargetMethods
 	}
 	if cfg.Getter == nil {
 		cfg.Getter = defaultGetter
@@ -53,6 +62,11 @@ func (cfg Config) validate() {
 	for _, m := range cfg.AllowedMethods {
 		if strings.TrimSpace(m) == "" {
 			panic("methodoverride: AllowedMethods must not contain empty or whitespace-only strings")
+		}
+	}
+	for _, m := range cfg.TargetMethods {
+		if strings.TrimSpace(m) == "" {
+			panic("methodoverride: TargetMethods must not contain empty or whitespace-only strings")
 		}
 	}
 }

@@ -19,12 +19,12 @@ func ExampleNew_realIPOnly() {
 	})
 }
 
-func ExampleDefaultConfig() {
-	// Use DefaultConfig for a pre-populated config with ForwardedProto
-	// and ForwardedHost enabled.
-	cfg := proxy.DefaultConfig()
-	cfg.TrustedProxies = []string{"10.0.0.0/8"}
-	_ = proxy.New(cfg)
+func ExampleNew_disableForwardedProto() {
+	// Disable X-Forwarded-Proto processing (X-Forwarded-Host remains enabled).
+	_ = proxy.New(proxy.Config{
+		TrustedProxies:        []string{"10.0.0.0/8"},
+		DisableForwardedProto: true,
+	})
 }
 
 func ExampleNew_customHeader() {

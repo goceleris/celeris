@@ -36,8 +36,11 @@ type Config struct {
 
 	// MinLength is the minimum response body size (in bytes) required for
 	// compression. Responses smaller than this are sent uncompressed.
-	// Default: 256. Set to 1 to compress all non-empty responses.
-	// A value of 0 means "use default" (256).
+	// Default: 256.
+	//
+	// Note: MinLength cannot be set to 0 to mean "compress all" — a value
+	// of 0 is treated as "use default" (256). Set MinLength to 1 to compress
+	// all non-empty responses regardless of size.
 	MinLength int
 
 	// Encodings lists the supported encodings in server-side priority order.

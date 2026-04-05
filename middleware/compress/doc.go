@@ -54,13 +54,18 @@
 //   - zstd: single thread-safe [zstd.Encoder] — EncodeAll, no pool needed.
 //   - buffers: [sync.Pool] of *bytes.Buffer for gzip/brotli output.
 //
-// # Response Buffering
+// # Response Buffering (No Streaming Compression)
 //
-// The middleware fully buffers the downstream response body before deciding
-// whether to compress. This means the entire response is held in memory.
-// For large responses (e.g., file downloads, streaming SSE, export
-// endpoints), use [Config].Skip or [Config].SkipPaths to bypass
-// compression and avoid excessive memory usage:
+// This middleware buffers the entire response body in memory before
+// deciding whether and how to compress. This design enables the expansion
+// guard (flush original if compressed >= original) and correct
+// Content-Length headers, but means the full uncompressed body must fit
+// in memory.
+//
+// For endpoints that produce large responses (file downloads, CSV exports,
+// streaming JSON), use [Config].Skip or [Config].SkipPaths to bypass
+// compression entirely. Consider using the framework's StreamWriter for
+// such endpoints instead.
 //
 //	compress.New(compress.Config{
 //	    SkipPaths: []string{"/api/export", "/files"},
@@ -68,6 +73,10 @@
 //	        return strings.HasPrefix(c.Path(), "/download/")
 //	    },
 //	})
+//
+// Competing frameworks (Echo, Fiber) offer streaming compression by
+// wrapping the response writer, but this prevents expansion detection
+// and accurate Content-Length.
 //
 // # MinLength Threshold
 //
@@ -102,6 +111,18 @@
 //
 //	server.Use(compress.New())  // outermost
 //	server.Use(etag.New())      // inner — ETag computed on uncompressed body
+//
+// # BREACH Attack Warning
+//
+// Compressing HTTPS responses that reflect user input (search queries,
+// form values, URL parameters) alongside secrets (CSRF tokens, session
+// IDs) can leak those secrets via the BREACH attack. Mitigation options:
+//   - Exclude sensitive endpoints with [Config].SkipPaths or [Config].Skip
+//   - Randomize padding on pages that mix user input and secrets
+//   - Separate secret-bearing responses from user-controlled content
+//
+// See http://breachattack.com for details. This applies to any HTTP
+// compression layer, not just this middleware.
 //
 // # Response Size Measurement
 //

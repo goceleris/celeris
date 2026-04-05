@@ -18,18 +18,22 @@
 // IP spoofing. If you need to trust all proxies in a controlled
 // environment, specify the CIDR explicitly (e.g. "0.0.0.0/0").
 //
-// # DefaultConfig
+// # Disable* Convention
 //
-// Use [DefaultConfig] to get a pre-populated [Config] with ForwardedProto
-// and ForwardedHost enabled, then override specific fields:
+// [Config] uses the Disable* pattern for ForwardedProto and ForwardedHost.
+// The Go zero value (false) means enabled, so a minimal Config literal
+// automatically processes both headers:
 //
-//	cfg := proxy.DefaultConfig()
-//	cfg.TrustedProxies = []string{"10.0.0.0/8"}
-//	server.Pre(proxy.New(cfg))
+//	server.Pre(proxy.New(proxy.Config{
+//	    TrustedProxies: []string{"10.0.0.0/8"},
+//	}))
 //
-// When passing a [Config] literal directly, ForwardedProto and
-// ForwardedHost default to false (Go zero value). Set them explicitly
-// if you need them.
+// To opt out of one or both, set the corresponding Disable* field:
+//
+//	server.Pre(proxy.New(proxy.Config{
+//	    TrustedProxies:        []string{"10.0.0.0/8"},
+//	    DisableForwardedProto: true,
+//	}))
 //
 // # TrustedProxies
 //
@@ -67,7 +71,7 @@
 //
 // # X-Forwarded-Host Validation
 //
-// When ForwardedHost is enabled, the X-Forwarded-Host value is validated
+// When X-Forwarded-Host processing is enabled (the default), the value is validated
 // before being applied. Values containing \r, \n, \x00, /, \, ?, #, or @
 // are rejected to prevent header injection and path traversal. Hosts
 // exceeding 253 bytes (the DNS maximum per RFC 1035) are also rejected.
@@ -80,9 +84,10 @@
 //
 // # ForwardedProto and ForwardedHost
 //
-// When enabled, X-Forwarded-Proto overrides [celeris.Context.Scheme]
-// and X-Forwarded-Host overrides [celeris.Context.Host]. Only "http" and
-// "https" are accepted for proto; other values are silently ignored.
+// By default (Disable* fields false), X-Forwarded-Proto overrides
+// [celeris.Context.Scheme] and X-Forwarded-Host overrides
+// [celeris.Context.Host]. Only "http" and "https" are accepted for proto;
+// other values are silently ignored.
 //
 // # RFC 7239 (Forwarded)
 //

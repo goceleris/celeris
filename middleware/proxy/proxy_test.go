@@ -159,7 +159,6 @@ func TestIPv4MappedIPv6InXFF(t *testing.T) {
 func TestForwardedProtoHTTPS(t *testing.T) {
 	mw := New(Config{
 		TrustedProxies: []string{"10.0.0.0/8"},
-		ForwardedProto: true,
 	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
@@ -176,7 +175,6 @@ func TestForwardedProtoHTTPS(t *testing.T) {
 func TestForwardedProtoInvalidIgnored(t *testing.T) {
 	mw := New(Config{
 		TrustedProxies: []string{"10.0.0.0/8"},
-		ForwardedProto: true,
 	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
@@ -193,7 +191,6 @@ func TestForwardedProtoInvalidIgnored(t *testing.T) {
 func TestForwardedHost(t *testing.T) {
 	mw := New(Config{
 		TrustedProxies: []string{"10.0.0.0/8"},
-		ForwardedHost:  true,
 	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
@@ -291,8 +288,8 @@ func TestXRealIPOnlyConfig(t *testing.T) {
 
 func TestForwardedProtoDisabled(t *testing.T) {
 	mw := New(Config{
-		TrustedProxies: []string{"10.0.0.0/8"},
-		ForwardedProto: false,
+		TrustedProxies:        []string{"10.0.0.0/8"},
+		DisableForwardedProto: true,
 	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
@@ -301,13 +298,13 @@ func TestForwardedProtoDisabled(t *testing.T) {
 	if err := mw(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// ForwardedProto=false -> middleware does NOT call SetScheme.
+	// DisableForwardedProto=true -> middleware does NOT call SetScheme.
 }
 
 func TestForwardedHostDisabled(t *testing.T) {
 	mw := New(Config{
-		TrustedProxies: []string{"10.0.0.0/8"},
-		ForwardedHost:  false,
+		TrustedProxies:       []string{"10.0.0.0/8"},
+		DisableForwardedHost: true,
 	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
@@ -317,7 +314,7 @@ func TestForwardedHostDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	if h := ctx.Host(); h != "localhost" {
-		t.Fatalf("expected native host=localhost (ForwardedHost disabled), got %q", h)
+		t.Fatalf("expected native host=localhost (DisableForwardedHost=true), got %q", h)
 	}
 }
 
@@ -407,7 +404,6 @@ func TestXForwardedHostDangerousCharsRejected(t *testing.T) {
 	for _, host := range dangerous {
 		mw := New(Config{
 			TrustedProxies: []string{"10.0.0.0/8"},
-			ForwardedHost:  true,
 		})
 		ctx, _ := celeristest.NewContextT(t, "GET", "/",
 			celeristest.WithRemoteAddr("10.0.0.1:1234"),
@@ -479,10 +475,10 @@ func TestCustomHeaderXFFPrecedence(t *testing.T) {
 	}
 }
 
-func TestDefaultConfigUsage(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.TrustedProxies = []string{"10.0.0.0/8"}
-	mw := New(cfg)
+func TestZeroConfigEnabledByDefault(t *testing.T) {
+	mw := New(Config{
+		TrustedProxies: []string{"10.0.0.0/8"},
+	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),
 		celeristest.WithHeader("x-forwarded-for", "5.6.7.8"),
@@ -503,24 +499,25 @@ func TestDefaultConfigUsage(t *testing.T) {
 	}
 }
 
-func TestDefaultConfigForwardedProtoHost(t *testing.T) {
-	cfg := DefaultConfig()
-	if !cfg.ForwardedProto {
-		t.Fatal("DefaultConfig().ForwardedProto should be true")
+func TestZeroConfigDisableFieldsAreFalse(t *testing.T) {
+	cfg := Config{}
+	if cfg.DisableForwardedProto {
+		t.Fatal("zero-value Config should have DisableForwardedProto=false (enabled)")
 	}
-	if !cfg.ForwardedHost {
-		t.Fatal("DefaultConfig().ForwardedHost should be true")
+	if cfg.DisableForwardedHost {
+		t.Fatal("zero-value Config should have DisableForwardedHost=false (enabled)")
 	}
 }
 
-func TestZeroConfigForwardedProtoHostFalse(t *testing.T) {
+func TestZeroConfigForwardedProtoHostEnabled(t *testing.T) {
 	cfg := Config{TrustedProxies: []string{"10.0.0.0/8"}}
-	// Go zero value: ForwardedProto and ForwardedHost are false.
-	if cfg.ForwardedProto {
-		t.Fatal("zero-value Config should have ForwardedProto=false")
+	// Go zero value: DisableForwardedProto and DisableForwardedHost are false,
+	// meaning both features are enabled by default (safe zero value).
+	if cfg.DisableForwardedProto {
+		t.Fatal("zero-value Config should have DisableForwardedProto=false (enabled)")
 	}
-	if cfg.ForwardedHost {
-		t.Fatal("zero-value Config should have ForwardedHost=false")
+	if cfg.DisableForwardedHost {
+		t.Fatal("zero-value Config should have DisableForwardedHost=false (enabled)")
 	}
 }
 
@@ -643,7 +640,6 @@ func TestWalkXFFAllEmptySegments(t *testing.T) {
 func TestXForwardedHostBackslashRejected(t *testing.T) {
 	mw := New(Config{
 		TrustedProxies: []string{"10.0.0.0/8"},
-		ForwardedHost:  true,
 	})
 	ctx, _ := celeristest.NewContextT(t, "GET", "/",
 		celeristest.WithRemoteAddr("10.0.0.1:1234"),

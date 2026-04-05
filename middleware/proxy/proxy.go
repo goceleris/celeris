@@ -39,8 +39,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 	}
 
-	forwardedProto := cfg.ForwardedProto
-	forwardedHost := cfg.ForwardedHost
+	forwardedProto := !cfg.DisableForwardedProto
+	forwardedHost := !cfg.DisableForwardedHost
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)

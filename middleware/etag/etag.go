@@ -8,12 +8,10 @@ import (
 
 // New creates an ETag middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
+	var cfg Config
 	if len(config) > 0 {
 		cfg = config[0]
 	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)

@@ -30,37 +30,17 @@ type Config struct {
 	// Default: ["x-forwarded-for", "x-real-ip"].
 	TrustedHeaders []string
 
-	// ForwardedProto enables processing of X-Forwarded-Proto to override Scheme.
-	// When providing a Config struct, set this explicitly; the zero value (false)
-	// means disabled. Use [DefaultConfig] for a pre-populated Config with
-	// ForwardedProto enabled.
-	ForwardedProto bool
+	// DisableForwardedProto disables processing of X-Forwarded-Proto.
+	// When false (default), X-Forwarded-Proto is used to override Scheme.
+	DisableForwardedProto bool
 
-	// ForwardedHost enables processing of X-Forwarded-Host to override Host.
-	// When providing a Config struct, set this explicitly; the zero value (false)
-	// means disabled. Use [DefaultConfig] for a pre-populated Config with
-	// ForwardedHost enabled.
-	ForwardedHost bool
+	// DisableForwardedHost disables processing of X-Forwarded-Host.
+	// When false (default), X-Forwarded-Host is used to override Host.
+	DisableForwardedHost bool
 }
 
 var defaultConfig = Config{
 	TrustedHeaders: []string{"x-forwarded-for", "x-real-ip"},
-	ForwardedProto: true,
-	ForwardedHost:  true,
-}
-
-// DefaultConfig returns the default proxy configuration with ForwardedProto
-// and ForwardedHost enabled. Users can modify fields before passing to [New]:
-//
-//	cfg := proxy.DefaultConfig()
-//	cfg.TrustedProxies = []string{"10.0.0.0/8"}
-//	server.Pre(proxy.New(cfg))
-func DefaultConfig() Config {
-	return Config{
-		TrustedHeaders: []string{"x-forwarded-for", "x-real-ip"},
-		ForwardedProto: true,
-		ForwardedHost:  true,
-	}
 }
 
 func applyDefaults(cfg Config) Config {

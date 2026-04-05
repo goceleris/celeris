@@ -29,7 +29,15 @@ func Accept(header string, offers []string) string {
 	bestQ := -1.0
 	bestIdx := len(entries) // higher = worse; prefer earlier Accept entries on tie
 	for _, offer := range offers {
-		if excluded[offer] {
+		// Check if offer is explicitly excluded by a q=0 entry.
+		isExcluded := false
+		for ex := range excluded {
+			if MatchMedia(ex, offer) {
+				isExcluded = true
+				break
+			}
+		}
+		if isExcluded {
 			continue
 		}
 		for idx, e := range entries {

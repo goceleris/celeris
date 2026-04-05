@@ -39,10 +39,18 @@
 //	    Getter: methodoverride.FormThenHeaderGetter("_method", "X-HTTP-Method"),
 //	}))
 //
+// # Target Methods
+//
+// By default, only PUT, DELETE, and PATCH are valid override targets
+// (configurable via [Config].TargetMethods). Override values not in this
+// list are silently ignored, preventing clients from overriding to
+// arbitrary methods such as CONNECT or TRACE.
+//
 // # Validation
 //
-// [Config].AllowedMethods must not contain empty or whitespace-only strings.
-// The middleware panics at initialization if this constraint is violated.
+// [Config].AllowedMethods and [Config].TargetMethods must not contain empty
+// or whitespace-only strings. The middleware panics at initialization if
+// this constraint is violated.
 //
 // # Skipping
 //

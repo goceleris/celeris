@@ -22,6 +22,10 @@ func New(config ...Config) celeris.HandlerFunc {
 	for _, m := range cfg.AllowedMethods {
 		allowed[strings.ToUpper(m)] = struct{}{}
 	}
+	targets := make(map[string]struct{}, len(cfg.TargetMethods))
+	for _, m := range cfg.TargetMethods {
+		targets[strings.ToUpper(m)] = struct{}{}
+	}
 	getter := cfg.Getter
 
 	var skip celeris.SkipHelper
@@ -43,6 +47,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		upper := strings.ToUpper(override)
+		if _, ok := targets[upper]; !ok {
+			return c.Next()
+		}
 		if upper != original {
 			c.SetMethod(upper)
 		}

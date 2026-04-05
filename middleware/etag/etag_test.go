@@ -62,7 +62,7 @@ func TestETag(t *testing.T) {
 	}{
 		{
 			name:       "GET 200 with body adds weak ETag",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			handler:    bodyHandler("hello world"),
@@ -82,7 +82,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "GET 200 matching If-None-Match returns 304",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", expectedWeakTag("hello")}},
@@ -93,7 +93,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "GET 200 non-matching If-None-Match returns 200",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", `W/"00000000"`}},
@@ -104,7 +104,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "HEAD request with matching If-None-Match returns 304",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "HEAD",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", expectedWeakTag("hello")}},
@@ -115,7 +115,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "POST request skips middleware",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "POST",
 			path:       "/",
 			handler:    bodyHandler("created"),
@@ -125,7 +125,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "PUT request skips middleware",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "PUT",
 			path:       "/",
 			handler:    bodyHandler("updated"),
@@ -135,7 +135,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "DELETE request skips middleware",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "DELETE",
 			path:       "/",
 			handler:    bodyHandler("deleted"),
@@ -145,7 +145,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "OPTIONS request skips middleware",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "OPTIONS",
 			path:       "/",
 			handler:    bodyHandler("options"),
@@ -155,7 +155,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "non-2xx response flushes without ETag",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			handler:    notFoundHandler,
@@ -165,7 +165,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "empty body response flushes without ETag",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			handler:    emptyHandler,
@@ -175,7 +175,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "handler-set ETag is preserved",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			handler:    etagHandler(`"custom-tag"`),
@@ -185,7 +185,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "If-None-Match wildcard returns 304",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", "*"}},
@@ -196,7 +196,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "weak comparison W/abc matches abc",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", `"` + opaqueTag(expectedWeakTag("data")) + `"`}},
@@ -207,7 +207,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "comma-separated If-None-Match list",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", `"aaa", ` + expectedWeakTag("hello") + `, "bbb"`}},
@@ -242,7 +242,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:    "handler error propagated alongside 304",
-			config:  defaultConfig,
+			config:  Config{},
 			method:  "GET",
 			path:    "/",
 			headers: [][2]string{{"if-none-match", expectedWeakTag("hello")}},
@@ -257,7 +257,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "multiple ETags in If-None-Match one matches",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", `W/"00000001", W/"00000002", ` + expectedWeakTag("test")}},
@@ -268,7 +268,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "If-None-Match with extra whitespace",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", `  ` + expectedWeakTag("hello") + `  `}},
@@ -290,7 +290,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "handler-set weak ETag with matching If-None-Match",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			headers:    [][2]string{{"if-none-match", `W/"custom"`}},
@@ -311,7 +311,7 @@ func TestETag(t *testing.T) {
 		},
 		{
 			name:       "large body 1KB+",
-			config:     defaultConfig,
+			config:     Config{},
 			method:     "GET",
 			path:       "/",
 			handler:    bodyHandler(strings.Repeat("x", 2048)),

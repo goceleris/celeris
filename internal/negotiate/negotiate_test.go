@@ -186,6 +186,18 @@ func TestAcceptQZeroWildcardExclusion(t *testing.T) {
 			[]string{"text/plain"},
 			"text/plain",
 		},
+		{
+			"text/* q=0 excludes all text subtypes via wildcard",
+			"*/*, text/*;q=0",
+			[]string{"text/html", "application/json"},
+			"application/json",
+		},
+		{
+			"text/* q=0 excludes text/html when only text offered",
+			"*/*, text/*;q=0",
+			[]string{"text/html"},
+			"",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

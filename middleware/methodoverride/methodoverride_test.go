@@ -404,6 +404,142 @@ func TestDefaultConstants(t *testing.T) {
 	}
 }
 
+// --- TargetMethods ---
+
+func TestTargetMethodsBlocksCONNECT(t *testing.T) {
+	mw := New() // default TargetMethods: PUT, DELETE, PATCH
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	rec, err := testutil.RunChain(t, chain, "POST", "/",
+		celeristest.WithHeader(strings.ToLower(DefaultHeader), "CONNECT"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "POST" {
+		t.Fatalf("method: got %q, want POST (CONNECT should be blocked by default TargetMethods)", method)
+	}
+}
+
+func TestTargetMethodsBlocksGETByDefault(t *testing.T) {
+	mw := New() // default TargetMethods: PUT, DELETE, PATCH
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	rec, err := testutil.RunChain(t, chain, "POST", "/",
+		celeristest.WithHeader(strings.ToLower(DefaultHeader), "GET"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "POST" {
+		t.Fatalf("method: got %q, want POST (GET should be blocked by default TargetMethods)", method)
+	}
+}
+
+func TestTargetMethodsBlocksTRACE(t *testing.T) {
+	mw := New()
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	rec, err := testutil.RunChain(t, chain, "POST", "/",
+		celeristest.WithHeader(strings.ToLower(DefaultHeader), "TRACE"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "POST" {
+		t.Fatalf("method: got %q, want POST (TRACE should be blocked by default TargetMethods)", method)
+	}
+}
+
+func TestCustomTargetMethods(t *testing.T) {
+	mw := New(Config{
+		TargetMethods: []string{"GET", "HEAD"},
+	})
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	// GET is in custom TargetMethods, should work.
+	rec, err := testutil.RunChain(t, chain, "POST", "/",
+		celeristest.WithHeader(strings.ToLower(DefaultHeader), "GET"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "GET" {
+		t.Fatalf("method: got %q, want GET (custom TargetMethods)", method)
+	}
+
+	// PUT is NOT in custom TargetMethods, should be blocked.
+	rec, err = testutil.RunChain(t, chain, "POST", "/",
+		celeristest.WithHeader(strings.ToLower(DefaultHeader), "PUT"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "POST" {
+		t.Fatalf("method: got %q, want POST (PUT not in custom TargetMethods)", method)
+	}
+}
+
+func TestTargetMethodsCaseInsensitive(t *testing.T) {
+	mw := New(Config{
+		TargetMethods: []string{"put"},
+	})
+	var method string
+	handler := func(c *celeris.Context) error {
+		method = c.Method()
+		return c.String(200, "ok")
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	rec, err := testutil.RunChain(t, chain, "POST", "/",
+		celeristest.WithHeader(strings.ToLower(DefaultHeader), "PUT"),
+	)
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if method != "PUT" {
+		t.Fatalf("method: got %q, want PUT (case insensitive TargetMethods)", method)
+	}
+}
+
+func TestValidateTargetMethodsEmptyPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for empty string in TargetMethods")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "TargetMethods must not contain empty") {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+	New(Config{TargetMethods: []string{"PUT", ""}})
+}
+
+func TestValidateTargetMethodsWhitespacePanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for whitespace-only string in TargetMethods")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "TargetMethods must not contain empty") {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+	New(Config{TargetMethods: []string{"  \t  "}})
+}
+
 // --- Same method → no SetMethod call ---
 
 func TestSameMethodNoRewrite(t *testing.T) {
