@@ -16,12 +16,23 @@
 //	    GzipLevel: compress.LevelFastest,
 //	}))
 //
+// Per-encoding compression levels are configurable via [Config].GzipLevel,
+// [Config].BrotliLevel, and [Config].ZstdLevel. Each accepts [Level]
+// constants (LevelDefault, LevelFastest, LevelBest, LevelNone) or an
+// integer within the encoding's valid range.
+//
 // Exclude specific content types and paths:
 //
 //	server.Use(compress.New(compress.Config{
 //	    ExcludedContentTypes: []string{"image/", "video/", "audio/", "application/octet-stream"},
 //	    SkipPaths:            []string{"/health", "/metrics"},
 //	}))
+//
+// # Method Filtering
+//
+// HEAD and OPTIONS requests bypass compression entirely (only Vary is added).
+// This avoids unnecessary buffering for requests that do not produce
+// response bodies.
 //
 // # Content-Negotiation
 //
@@ -47,12 +58,9 @@
 //
 // The middleware fully buffers the downstream response body before deciding
 // whether to compress. This means the entire response is held in memory.
-// For large responses (e.g., file downloads, streaming SSE), use
-// [Config].Skip or [Config].SkipPaths to bypass compression and avoid
-// excessive memory usage.
-//
-// For file-serving or export endpoints that produce large responses,
-// use Skip or SkipPaths to bypass compression and avoid excessive memory use:
+// For large responses (e.g., file downloads, streaming SSE, export
+// endpoints), use [Config].Skip or [Config].SkipPaths to bypass
+// compression and avoid excessive memory usage:
 //
 //	compress.New(compress.Config{
 //	    SkipPaths: []string{"/api/export", "/files"},
@@ -94,6 +102,12 @@
 //
 //	server.Use(compress.New())  // outermost
 //	server.Use(etag.New())      // inner — ETag computed on uncompressed body
+//
+// # Response Size Measurement
+//
+// When metrics or OTel middleware runs before compress (the recommended
+// ordering), response size metrics reflect uncompressed application-level
+// sizes. See middleware/metrics and middleware/otel documentation.
 //
 // # Separate Sub-Module
 //

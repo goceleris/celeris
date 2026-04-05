@@ -16,10 +16,22 @@ type AcceptItem struct {
 // Returns "" if no offer matches.
 func Accept(header string, offers []string) string {
 	entries := Parse(header)
+
+	// Build exclusion set: types with q=0 are explicitly rejected (RFC 9110).
+	excluded := make(map[string]bool)
+	for _, e := range entries {
+		if e.Quality <= 0 {
+			excluded[e.MediaType] = true
+		}
+	}
+
 	bestOffer := ""
 	bestQ := -1.0
 	bestIdx := len(entries) // higher = worse; prefer earlier Accept entries on tie
 	for _, offer := range offers {
+		if excluded[offer] {
+			continue
+		}
 		for idx, e := range entries {
 			if e.Quality <= 0 {
 				continue

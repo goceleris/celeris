@@ -83,6 +83,6 @@
 // token validation by tunneling through POST → PUT/DELETE/PATCH.
 //
 // The default SafeMethods (GET, HEAD, OPTIONS, TRACE) are safe because
-// methodoverride only overrides POST requests and its default AllowedMethods
-// (PUT, DELETE, PATCH) are not in the safe set.
+// methodoverride only overrides POST requests, and the typical override
+// targets (PUT, DELETE, PATCH) are not in the CSRF safe set.
 package csrf

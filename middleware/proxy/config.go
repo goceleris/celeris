@@ -9,7 +9,7 @@ import (
 
 // Config controls proxy header extraction behavior.
 type Config struct {
-	// Skip is a function that returns true to bypass the middleware for a request.
+	// Skip defines a function to skip this middleware for certain requests.
 	Skip func(c *celeris.Context) bool
 
 	// SkipPaths lists paths to skip (exact match).

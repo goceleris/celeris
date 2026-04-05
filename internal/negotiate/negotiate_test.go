@@ -155,6 +155,48 @@ func TestAcceptRejectsQZero(t *testing.T) {
 	}
 }
 
+func TestAcceptQZeroWildcardExclusion(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		offers []string
+		want   string
+	}{
+		{
+			"Accept-Encoding wildcard with br;q=0 excludes br",
+			"*, br;q=0",
+			[]string{"gzip", "br"},
+			"gzip",
+		},
+		{
+			"Accept wildcard with text/html;q=0 excludes text/html",
+			"*/*, text/html;q=0",
+			[]string{"application/json", "text/html"},
+			"application/json",
+		},
+		{
+			"Accept wildcard with text/html;q=0 does not match text/html",
+			"*/*, text/html;q=0",
+			[]string{"text/html"},
+			"",
+		},
+		{
+			"Accept wildcard with text/html;q=0 matches other types",
+			"*/*, text/html;q=0",
+			[]string{"text/plain"},
+			"text/plain",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Accept(tt.header, tt.offers)
+			if got != tt.want {
+				t.Errorf("Accept(%q, %v) = %q, want %q", tt.header, tt.offers, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMatchMediaBareWildcard(t *testing.T) {
 	// bare "*" should match any offer, including media types with slashes
 	if !MatchMedia("*", "text/html") {

@@ -16,7 +16,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		cfg = config[0]
 	}
 	cfg = applyDefaults(cfg)
-	validate(cfg)
+	cfg.validate()
 
 	allowed := make(map[string]struct{}, len(cfg.AllowedMethods))
 	for _, m := range cfg.AllowedMethods {

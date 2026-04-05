@@ -1,7 +1,6 @@
 package etag
 
 import (
-	"encoding/hex"
 	"hash/crc32"
 
 	"github.com/goceleris/celeris"
@@ -14,6 +13,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		cfg = config[0]
 	}
 	cfg = applyDefaults(cfg)
+	cfg.validate()
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
@@ -61,9 +61,8 @@ func New(config ...Config) celeris.HandlerFunc {
 			tag = formatETag(opaque, !strong)
 		} else {
 			// Inline CRC-32 ETag formatting: the [14]byte buffer lives on
-			// the closure's stack frame, avoiding the heap escape that
-			// occurs when formatCRC32ETag returns string(buf[:n]) across
-			// a non-inlinable function boundary.
+			// the closure's stack frame, avoiding the heap escape that a
+			// returned-string helper would cause.
 			checksum := crc32.ChecksumIEEE(body)
 			var tagBuf [14]byte
 			n := writeCRC32ETag(&tagBuf, checksum, !strong)
@@ -102,9 +101,8 @@ func hexDigit(b byte) byte {
 }
 
 // writeCRC32ETag writes a CRC-32 ETag into dst and returns the number of
-// bytes written. The caller owns the buffer, so it stays on the caller's
-// stack. This avoids the heap escape that occurs when formatCRC32ETag
-// returns string(buf[:n]) across a non-inlinable function boundary.
+// bytes written. The caller owns the buffer so it stays on the caller's
+// stack, avoiding the heap escape that a returned-string helper would cause.
 func writeCRC32ETag(dst *[14]byte, checksum uint32, weak bool) int {
 	off := 0
 	if weak {
@@ -134,25 +132,6 @@ func formatETag(opaque string, weak bool) string {
 		return `W/"` + opaque + `"`
 	}
 	return `"` + opaque + `"`
-}
-
-// formatCRC32ETag formats a CRC-32 checksum as an ETag value using a stack buffer.
-// Retained for external callers and tests; the hot path in New() uses
-// writeCRC32ETag with a caller-owned buffer to avoid the heap escape.
-func formatCRC32ETag(checksum uint32, weak bool) string {
-	var buf [14]byte
-	if weak {
-		buf[0] = 'W'
-		buf[1] = '/'
-		buf[2] = '"'
-		hex.Encode(buf[3:11], []byte{byte(checksum >> 24), byte(checksum >> 16), byte(checksum >> 8), byte(checksum)})
-		buf[11] = '"'
-		return string(buf[:12])
-	}
-	buf[0] = '"'
-	hex.Encode(buf[1:9], []byte{byte(checksum >> 24), byte(checksum >> 16), byte(checksum >> 8), byte(checksum)})
-	buf[9] = '"'
-	return string(buf[:10])
 }
 
 // opaqueTag strips the W/ prefix and quotes from an ETag value.

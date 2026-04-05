@@ -2,6 +2,35 @@ package redirect
 
 import "github.com/goceleris/celeris"
 
+// initRedirect parses config, applies defaults, validates, and returns
+// the redirect code and initialized SkipHelper.
+func initRedirect(config []Config) (int, celeris.SkipHelper) {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
+	return cfg.Code, skip
+}
+
+// initSkip parses config, applies defaults, validates, and returns an
+// initialized SkipHelper. Used by rewrite functions that ignore Code.
+func initSkip(config []Config) celeris.SkipHelper {
+	_, skip := initRedirect(config)
+	return skip
+}
+
+// buildRedirectURL constructs a redirect URL preserving the query string.
+func buildRedirectURL(scheme, host, path, rawQuery string) string {
+	if rawQuery != "" {
+		return scheme + "://" + host + path + "?" + rawQuery
+	}
+	return scheme + "://" + host + path
+}
+
 // HTTPSRedirect redirects HTTP requests to HTTPS. HTTPS requests pass
 // through to the next handler. The redirect URL preserves the original
 // host, path, and query string.
@@ -10,17 +39,7 @@ import "github.com/goceleris/celeris"
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func HTTPSRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -36,14 +55,7 @@ func HTTPSRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		path := c.Path()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = "https://" + host + path + "?" + q
-		} else {
-			url = "https://" + host + path
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL("https", host, c.Path(), c.RawQuery()))
 	}
 }
 
@@ -55,17 +67,7 @@ func HTTPSRedirect(config ...Config) celeris.HandlerFunc {
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func WWWRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -81,15 +83,7 @@ func WWWRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		scheme := c.Scheme()
-		path := c.Path()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = scheme + "://www." + host + path + "?" + q
-		} else {
-			url = scheme + "://www." + host + path
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL(c.Scheme(), "www."+host, c.Path(), c.RawQuery()))
 	}
 }
 
@@ -101,17 +95,7 @@ func WWWRedirect(config ...Config) celeris.HandlerFunc {
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func NonWWWRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -127,15 +111,7 @@ func NonWWWRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		scheme := c.Scheme()
-		path := c.Path()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = scheme + "://" + host[4:] + path + "?" + q
-		} else {
-			url = scheme + "://" + host[4:] + path
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL(c.Scheme(), host[4:], c.Path(), c.RawQuery()))
 	}
 }
 
@@ -147,17 +123,7 @@ func NonWWWRedirect(config ...Config) celeris.HandlerFunc {
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func TrailingSlashRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -174,14 +140,7 @@ func TrailingSlashRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		scheme := c.Scheme()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = scheme + "://" + host + path + "/?" + q
-		} else {
-			url = scheme + "://" + host + path + "/"
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL(c.Scheme(), host, path+"/", c.RawQuery()))
 	}
 }
 
@@ -193,17 +152,7 @@ func TrailingSlashRedirect(config ...Config) celeris.HandlerFunc {
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func RemoveTrailingSlashRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -220,14 +169,7 @@ func RemoveTrailingSlashRedirect(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		scheme := c.Scheme()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = scheme + "://" + host + path[:len(path)-1] + "?" + q
-		} else {
-			url = scheme + "://" + host + path[:len(path)-1]
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL(c.Scheme(), host, path[:len(path)-1], c.RawQuery()))
 	}
 }
 
@@ -239,17 +181,7 @@ func RemoveTrailingSlashRedirect(config ...Config) celeris.HandlerFunc {
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func HTTPSWWWRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -272,14 +204,7 @@ func HTTPSWWWRedirect(config ...Config) celeris.HandlerFunc {
 			host = "www." + host
 		}
 
-		path := c.Path()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = "https://" + host + path + "?" + q
-		} else {
-			url = "https://" + host + path
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL("https", host, c.Path(), c.RawQuery()))
 	}
 }
 
@@ -291,17 +216,7 @@ func HTTPSWWWRedirect(config ...Config) celeris.HandlerFunc {
 // allows browsers to change the request method (e.g., POST becomes GET).
 // Use Config{Code: 308} to preserve the original method.
 func HTTPSNonWWWRedirect(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
-
-	code := cfg.Code
+	code, skip := initRedirect(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -324,14 +239,7 @@ func HTTPSNonWWWRedirect(config ...Config) celeris.HandlerFunc {
 			host = host[4:]
 		}
 
-		path := c.Path()
-		var url string
-		if q := c.RawQuery(); q != "" {
-			url = "https://" + host + path + "?" + q
-		} else {
-			url = "https://" + host + path
-		}
-		return c.Redirect(code, url)
+		return c.Redirect(code, buildRedirectURL("https", host, c.Path(), c.RawQuery()))
 	}
 }
 
@@ -339,15 +247,7 @@ func HTTPSNonWWWRedirect(config ...Config) celeris.HandlerFunc {
 // Unlike TrailingSlashRedirect, this does not send a redirect response --
 // the request is processed with the modified path.
 func TrailingSlashRewrite(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
+	skip := initSkip(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -368,15 +268,7 @@ func TrailingSlashRewrite(config ...Config) celeris.HandlerFunc {
 // path in-place. Unlike RemoveTrailingSlashRedirect, this does not send
 // a redirect response -- the request is processed with the modified path.
 func RemoveTrailingSlashRewrite(config ...Config) celeris.HandlerFunc {
-	cfg := defaultConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
-	cfg = applyDefaults(cfg)
-	cfg.validate()
-
-	var skip celeris.SkipHelper
-	skip.Init(cfg.SkipPaths, cfg.Skip)
+	skip := initSkip(config)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {

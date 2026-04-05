@@ -93,14 +93,19 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.BufferResponse()
 		err := c.Next()
 
-		// All buffered paths below add Vary before flushing.
+		// flushWithVary adds the Vary header and flushes the (possibly
+		// uncompressed) buffered response. Used by every early-return and
+		// the final success path below.
+		flushWithVary := func() error {
+			c.AddHeader("vary", "Accept-Encoding")
+			return c.FlushResponse()
+		}
 
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
 
 		if status < 200 || status >= 300 || len(body) == 0 || len(body) < minLen {
-			c.AddHeader("vary", "Accept-Encoding")
-			if ferr := c.FlushResponse(); ferr != nil && err == nil {
+			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
 			return err
@@ -109,8 +114,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// Skip if response already has content-encoding.
 		for _, h := range c.ResponseHeaders() {
 			if h[0] == "content-encoding" {
-				c.AddHeader("vary", "Accept-Encoding")
-				if ferr := c.FlushResponse(); ferr != nil && err == nil {
+				if ferr := flushWithVary(); ferr != nil && err == nil {
 					err = ferr
 				}
 				return err
@@ -119,8 +123,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		ct := c.ResponseContentType()
 		if isExcluded(ct, excluded) {
-			c.AddHeader("vary", "Accept-Encoding")
-			if ferr := c.FlushResponse(); ferr != nil && err == nil {
+			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
 			return err
@@ -128,8 +131,10 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		compressed, compErr := compressBody(encoding, body, gzipPool, brotliPool, zstdEncoder, &bufPool)
 		if compErr != nil {
-			c.AddHeader("vary", "Accept-Encoding")
-			if ferr := c.FlushResponse(); ferr != nil && err == nil {
+			// Graceful degradation: if compression fails, flush the original
+			// uncompressed body. The compression error is propagated to the caller
+			// but the response is already sent to avoid a blank page.
+			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
 			if err == nil {
@@ -140,8 +145,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		// Compression expansion guard.
 		if len(compressed) >= len(body) {
-			c.AddHeader("vary", "Accept-Encoding")
-			if ferr := c.FlushResponse(); ferr != nil && err == nil {
+			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}
 			return err
@@ -149,8 +153,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		c.SetResponseBody(compressed)
 		c.SetHeader("content-encoding", encoding)
-		c.AddHeader("vary", "Accept-Encoding")
-		if ferr := c.FlushResponse(); ferr != nil && err == nil {
+		if ferr := flushWithVary(); ferr != nil && err == nil {
 			err = ferr
 		}
 		return err

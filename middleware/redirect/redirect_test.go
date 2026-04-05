@@ -428,7 +428,7 @@ func TestValidatePanicsOnInvalidCode(t *testing.T) {
 			t.Fatal("expected panic for invalid code")
 		}
 		msg, ok := r.(string)
-		if !ok || msg != "redirect: Code must be 300-308" {
+		if !ok || msg != "redirect: Code must be 300-308, got 200" {
 			t.Fatalf("unexpected panic: %v", r)
 		}
 	}()

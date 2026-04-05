@@ -92,7 +92,9 @@ s.GET("/users/:id", showUser).Name("user")
 url, _ := s.URL("user", "42") // "/users/42"
 
 // Pre-routing middleware (runs before route matching)
-s.Pre(methodOverride, urlRewrite)
+s.Pre(proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}))
+s.Pre(redirect.HTTPSRedirect())
+s.Pre(methodoverride.New())
 ```
 
 ## Middleware
@@ -103,17 +105,22 @@ All middleware is in-tree under [`middleware/`](middleware/):
 |---------|-------------|
 | [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
 | [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
+| [`compress`](middleware/compress) | Transparent response compression (zstd, brotli, gzip) |
 | [`cors`](middleware/cors) | Cross-Origin Resource Sharing (zero-alloc) |
 | [`csrf`](middleware/csrf) | CSRF protection (double-submit cookie + origin validation) |
 | [`debug`](middleware/debug) | Debug/introspection endpoints (loopback-only by default) |
+| [`etag`](middleware/etag) | Automatic ETag generation and conditional 304 Not Modified |
 | [`healthcheck`](middleware/healthcheck) | Kubernetes-style liveness/readiness/startup probes |
 | [`jwt`](middleware/jwt) | JWT authentication (HMAC/RSA/ECDSA/EdDSA, JWKS auto-refresh) |
 | [`keyauth`](middleware/keyauth) | API key authentication with constant-time comparison |
 | [`logger`](middleware/logger) | Structured request logging (slog, zero-alloc FastHandler) |
+| [`methodoverride`](middleware/methodoverride) | HTTP method override for HTML forms |
 | [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
 | [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
+| [`proxy`](middleware/proxy) | Trusted reverse proxy header extraction (client IP, scheme, host) |
 | [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter |
 | [`recovery`](middleware/recovery) | Panic recovery with broken pipe detection |
+| [`redirect`](middleware/redirect) | HTTP redirect and URL normalization (HTTPS, www, trailing slash) |
 | [`requestid`](middleware/requestid) | Request ID generation (buffered UUID v4) |
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions with pluggable store |
@@ -135,8 +142,9 @@ s.Use(cors.New())
 For middleware with external dependencies, use separate imports:
 
 ```go
-import "github.com/goceleris/celeris/middleware/metrics" // requires prometheus
-import "github.com/goceleris/celeris/middleware/otel"    // requires opentelemetry
+import "github.com/goceleris/celeris/middleware/compress" // requires brotli, zstd
+import "github.com/goceleris/celeris/middleware/metrics"  // requires prometheus
+import "github.com/goceleris/celeris/middleware/otel"     // requires opentelemetry
 ```
 
 ## Error Handling
@@ -270,7 +278,7 @@ adaptive/       Adaptive meta-engine (Linux)
 celeristest/    Test helpers (NewContext, ResponseRecorder)
 engine/         Engine interface + implementations (iouring, epoll, std)
 internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts)
-middleware/     In-tree middleware ecosystem (17 packages)
+middleware/     In-tree middleware ecosystem (22 packages)
 observe/        Metrics collector, CPUMonitor, Snapshot
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)

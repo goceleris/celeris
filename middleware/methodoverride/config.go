@@ -49,7 +49,7 @@ func applyDefaults(cfg Config) Config {
 	return cfg
 }
 
-func validate(cfg Config) {
+func (cfg Config) validate() {
 	for _, m := range cfg.AllowedMethods {
 		if strings.TrimSpace(m) == "" {
 			panic("methodoverride: AllowedMethods must not contain empty or whitespace-only strings")

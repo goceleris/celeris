@@ -23,6 +23,11 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.9
+      - name: Lint middleware/compress
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.9
+          working-directory: middleware/compress
       - name: Lint middleware/metrics
         uses: golangci/golangci-lint-action@v9
         with:
@@ -49,6 +54,9 @@ jobs:
         run: >-
           go test -race -count=1 -timeout=120s
           $(go list ./... | grep -v /test/)
+      - name: Sub-module tests (middleware/compress)
+        run: go test -race -count=1 -timeout=60s ./...
+        working-directory: middleware/compress
       - name: Sub-module tests (middleware/metrics)
         run: go test -race -count=1 -timeout=60s ./...
         working-directory: middleware/metrics
@@ -117,6 +125,9 @@ jobs:
           go-version: "1.26"
       - name: Build root module
         run: go build ./...
+      - name: Build middleware/compress
+        run: go build ./...
+        working-directory: middleware/compress
       - name: Build middleware/metrics
         run: go build ./...
         working-directory: middleware/metrics
@@ -136,6 +147,9 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Root module
         run: govulncheck ./...
+      - name: middleware/compress
+        run: govulncheck ./...
+        working-directory: middleware/compress
       - name: middleware/metrics
         run: govulncheck ./...
         working-directory: middleware/metrics

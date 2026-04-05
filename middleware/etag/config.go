@@ -28,9 +28,13 @@ type Config struct {
 // for the default behavior. Zero value: Strong=false produces weak ETags.
 var defaultConfig = Config{}
 
-// applyDefaults is intentionally empty -- Strong defaults to false (weak ETags)
-// via zero value, and there are no zero-value fields to backfill.
-// Kept for consistency with the middleware pattern.
+// applyDefaults is intentionally a no-op -- Config fields have safe zero values.
+// Strong defaults to false (weak ETags) via zero value, and there are no
+// zero-value fields to backfill. Kept for consistency with the middleware pattern.
 func applyDefaults(cfg Config) Config {
 	return cfg
 }
+
+// validate is a no-op but kept for pattern consistency with other middleware.
+// Config is simple with safe zero values.
+func (cfg Config) validate() {}

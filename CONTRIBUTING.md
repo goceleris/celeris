@@ -32,13 +32,14 @@ mage check     # Run all checks: lint + test + spec + build
 
 ### Sub-Module Testing
 
-The `middleware/metrics` and `middleware/otel` packages have their own `go.mod` files (to isolate heavy Prometheus and OpenTelemetry dependencies from the core module). These are tested automatically in CI but require separate commands locally:
+The `middleware/compress`, `middleware/metrics`, and `middleware/otel` packages have their own `go.mod` files (to isolate heavy external dependencies from the core module). These are tested automatically in CI but require separate commands locally:
 
 ```bash
-# Root module (includes all middleware except metrics + otel)
+# Root module (includes all middleware except compress, metrics + otel)
 go test -race ./...
 
 # Sub-modules (separate go.mod)
+cd middleware/compress && go test -race ./...
 cd middleware/metrics && go test -race ./...
 cd middleware/otel && go test -race ./...
 ```

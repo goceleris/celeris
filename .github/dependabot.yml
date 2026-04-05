@@ -11,6 +11,17 @@ updates:
     commit-message:
       prefix: "deps"
 
+  - package-ecosystem: gomod
+    directory: /middleware/compress
+    schedule:
+      interval: daily
+    groups:
+      all-go-deps:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

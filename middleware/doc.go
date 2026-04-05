@@ -13,7 +13,7 @@
 //
 // Install middleware in this order so each layer sees the right context:
 //
-//	healthcheck — health probes bypass all middleware; respond immediately
+//	healthcheck — health probes respond early; place first to skip downstream middleware
 //	requestid   — assign request ID first; all downstream logs include it
 //	metrics/otel — Prometheus / OpenTelemetry: can also go after logger
 //	logger      — log every request with the ID from requestid
@@ -30,6 +30,22 @@
 //	compress    — response compression; wraps etag (computes on uncompressed body)
 //	etag        — conditional responses (304 Not Modified); innermost transform
 //	[handler]   — route handler
+//
+// Example production stack:
+//
+//	// Pre-routing
+//	s.Pre(proxy.New(proxy.DefaultConfig()))
+//	s.Pre(redirect.HTTPSRedirect())
+//	s.Pre(methodoverride.New())
+//
+//	// Route middleware
+//	s.Use(healthcheck.New())
+//	s.Use(requestid.New())
+//	s.Use(recovery.New())
+//	s.Use(cors.New())
+//	s.Use(secure.New())
+//	s.Use(compress.New())
+//	s.Use(etag.New())
 //
 // # Measurement System Roles
 //

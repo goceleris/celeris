@@ -77,6 +77,13 @@
 // that would occur from chaining [HTTPSRedirect] with [WWWRedirect] or
 // [NonWWWRedirect].
 //
+// # Reverse Proxy Interaction
+//
+// When running behind a TLS-terminating reverse proxy, install the proxy
+// middleware via Server.Pre() BEFORE redirect middleware. Without it,
+// Scheme() returns "http" (the backend transport), causing an infinite
+// redirect loop with HTTPSRedirect.
+//
 // # Skipping
 //
 // Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for

@@ -102,6 +102,13 @@
 //	    TrustedProxies: []string{"10.0.0.0/8", "172.16.0.0/12"},
 //	}))
 //
+// # Downstream Middleware
+//
+// Several middleware depend on proxy for correct values:
+//   - logger: logs c.ClientIP() — without proxy, logs the proxy's IP
+//   - ratelimit: keys rate limits by c.ClientIP() — without proxy, all
+//     clients behind the same proxy share one rate-limit bucket
+//
 // # Skip
 //
 // Use [Config].SkipPaths for exact path matches or [Config].Skip for
