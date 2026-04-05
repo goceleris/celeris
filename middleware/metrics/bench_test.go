@@ -3,9 +3,10 @@ package metrics
 import (
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 func BenchmarkMetricsPassthrough(b *testing.B) {

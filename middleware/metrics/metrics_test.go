@@ -6,10 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/celeristest"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
 )
 
 func newIsolatedRegistry() *prometheus.Registry {

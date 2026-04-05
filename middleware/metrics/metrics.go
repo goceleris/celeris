@@ -7,10 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goceleris/celeris"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/common/expfmt"
+
+	"github.com/goceleris/celeris"
 )
 
 // New creates a Prometheus metrics middleware with the given config.

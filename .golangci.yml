@@ -47,3 +47,7 @@ linters:
         linters:
           - revive
         text: "var-naming"
+      - path: middleware/metrics/
+        linters:
+          - revive
+        text: "var-naming"

@@ -3,8 +3,9 @@ package metrics
 import (
 	"fmt"
 
-	"github.com/goceleris/celeris"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/goceleris/celeris"
 )
 
 // DefaultBuckets returns the default histogram bucket boundaries for
