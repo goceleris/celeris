@@ -5,7 +5,7 @@ on:
     types: [published]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate-tag:
@@ -26,29 +26,88 @@ jobs:
     needs: validate-tag
     uses: ./.github/workflows/ci.yml
 
+  tag-submodules:
+    name: Tag Sub-Modules
+    needs: [validate-tag, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Create sub-module tags
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          SUBMODULES="middleware/metrics middleware/otel"
+          for sub in $SUBMODULES; do
+            TAG="${sub}/${VERSION}"
+            if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag ${TAG} already exists, skipping"
+            else
+              echo "Creating tag ${TAG}"
+              git tag "${TAG}"
+            fi
+          done
+          git push origin --tags
+      - name: Update sub-module go.mod versions
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          SUBMODULES="middleware/metrics middleware/otel"
+          for sub in $SUBMODULES; do
+            GOMOD="${sub}/go.mod"
+            if [ -f "$GOMOD" ]; then
+              echo "Checking ${GOMOD} for stale celeris version..."
+              CURRENT=$(grep 'github.com/goceleris/celeris ' "$GOMOD" | awk '{print $2}')
+              if [ "$CURRENT" != "$VERSION" ]; then
+                echo "::warning::${GOMOD} pins celeris ${CURRENT}, not ${VERSION}. Update before next sub-module release."
+              else
+                echo "${GOMOD} already at ${VERSION}"
+              fi
+            fi
+          done
+
   notify-proxy:
     name: Notify Go Proxy
-    needs: [validate-tag, ci]
+    needs: [validate-tag, ci, tag-submodules]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
-      - name: Request module version from proxy
+      - name: Request root module from proxy
         run: |
           VERSION="${{ github.event.release.tag_name }}"
           MODULE="github.com/goceleris/celeris"
+          echo "Notifying proxy for ${MODULE}@${VERSION}..."
           for attempt in 1 2 3; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info")
             if [ "$STATUS" = "200" ]; then
-              echo "Proxy responded with 200 for ${VERSION}"
+              echo "Proxy responded with 200 for ${MODULE}@${VERSION}"
               break
             fi
             echo "Attempt $attempt: proxy returned $STATUS, retrying in 10s..."
             sleep 10
           done
+      - name: Request sub-module versions from proxy
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          SUBMODULES="middleware/metrics middleware/otel"
+          for sub in $SUBMODULES; do
+            MODULE="github.com/goceleris/celeris/${sub}"
+            echo "Notifying proxy for ${MODULE}@${VERSION}..."
+            for attempt in 1 2 3; do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info")
+              if [ "$STATUS" = "200" ]; then
+                echo "Proxy responded with 200 for ${MODULE}@${VERSION}"
+                break
+              fi
+              echo "Attempt $attempt: proxy returned $STATUS, retrying in 10s..."
+              sleep 10
+            done
+          done
       - name: Verify module availability
         run: |
           VERSION="${{ github.event.release.tag_name }}"
-          go list -m "github.com/goceleris/celeris@${VERSION}" || echo "Module not yet indexed (may take a few minutes)"
+          go list -m "github.com/goceleris/celeris@${VERSION}" || echo "Root module not yet indexed"
+          go list -m "github.com/goceleris/celeris/middleware/metrics@${VERSION}" || echo "metrics sub-module not yet indexed"
+          go list -m "github.com/goceleris/celeris/middleware/otel@${VERSION}" || echo "otel sub-module not yet indexed"
