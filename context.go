@@ -322,7 +322,9 @@ func (c *Context) reset() {
 	} else {
 		c.handlers = c.handlers[:0]
 	}
-	clear(c.paramBuf[:])
+	if n := len(c.params); n > 0 {
+		clear(c.paramBuf[:n])
+	}
 	c.params = c.paramBuf[:0]
 	c.ctx = nil
 	c.method = ""
@@ -330,7 +332,9 @@ func (c *Context) reset() {
 	c.rawQuery = ""
 	c.fullPath = ""
 	c.statusCode = 200
-	clear(c.respHdrBuf[:])
+	if n := len(c.respHeaders); n > 0 {
+		clear(c.respHdrBuf[:n])
+	}
 	c.respHeaders = c.respHdrBuf[:0]
 	c.written = false
 	c.aborted = false

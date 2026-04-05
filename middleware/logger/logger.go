@@ -243,9 +243,16 @@ func New(config ...Config) celeris.HandlerFunc {
 			ts = ts.In(tz)
 		}
 
-		r := slog.NewRecord(ts, level, "request", 0)
-		r.AddAttrs(attrs...)
-		_ = handler.Handle(ctx, r)
+		// Fast path: when using FastHandler, bypass slog.Record entirely.
+		// This avoids the closure escape in Record.Attrs and the
+		// copy-before-write, eliminating 4 allocations per request.
+		if fh, ok := handler.(*FastHandler); ok {
+			fh.HandleDirect(ts, level, "request", attrs)
+		} else {
+			r := slog.NewRecord(ts, level, "request", 0)
+			r.AddAttrs(attrs...)
+			_ = handler.Handle(ctx, r)
+		}
 
 		// Cap the pooled slice to prevent unbounded growth from requests
 		// with many custom fields. If it grew past 64, replace with a

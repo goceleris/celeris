@@ -168,9 +168,9 @@ func (h *FastHandler) Handle(_ context.Context, r slog.Record) error {
 
 	buf = append(buf, '\n')
 
-	// Copy buf before returning to pool: Write may retain the slice
-	// (e.g., bufio.Writer), and the pool would reclaim the backing array.
-	_, err := h.w.Write(append([]byte(nil), buf...))
+	// Write pooled buffer directly — io.Writer.Write must not retain data
+	// per the io.Writer contract.
+	_, err := h.w.Write(buf)
 
 	// Cap pooled buffer to prevent unbounded growth.
 	if cap(buf) > 4096 {
@@ -182,6 +182,61 @@ func (h *FastHandler) Handle(_ context.Context, r slog.Record) error {
 	fastBufPool.Put(bp)
 
 	return err
+}
+
+// HandleDirect formats a log record directly from a pre-built attrs slice,
+// bypassing slog.Record entirely. This avoids the closure escape in
+// Record.Attrs and the copy-before-write, eliminating 4 allocations
+// compared to the standard Handle path.
+func (h *FastHandler) HandleDirect(ts time.Time, level slog.Level, msg string, attrs []slog.Attr) {
+	bp := fastBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+
+	buf = append(buf, "time="...)
+	if h.timeFormat != "" {
+		buf = append(buf, ts.Format(h.timeFormat)...)
+	} else {
+		buf = appendTime(buf, ts)
+	}
+
+	buf = append(buf, " level="...)
+	idx := levelIndex(level)
+	if h.color {
+		buf = append(buf, levelColors[idx]...)
+	}
+	buf = append(buf, levelStrings[idx]...)
+	if h.color {
+		buf = append(buf, colorReset...)
+	}
+
+	buf = append(buf, " msg="...)
+	buf = appendTextValue(buf, msg)
+
+	if len(h.prefix) > 0 {
+		buf = append(buf, h.prefix...)
+	}
+
+	appendFn := appendAttr
+	if h.color {
+		appendFn = colorAppendAttr
+	}
+	for _, a := range attrs {
+		buf = append(buf, ' ')
+		buf = appendFn(buf, a)
+	}
+
+	buf = append(buf, '\n')
+
+	// Write pooled buffer directly — io.Writer.Write must not retain data.
+	_, _ = h.w.Write(buf)
+
+	if cap(buf) > 4096 {
+		fresh := make([]byte, 0, 512)
+		*bp = fresh
+	} else {
+		*bp = buf
+	}
+	fastBufPool.Put(bp)
 }
 
 // WithAttrs returns a new handler with the given attributes pre-formatted.
@@ -269,7 +324,7 @@ func (g *groupHandler) Handle(_ context.Context, r slog.Record) error {
 	})
 
 	buf = append(buf, '\n')
-	_, err := g.parent.w.Write(append([]byte(nil), buf...))
+	_, err := g.parent.w.Write(buf)
 
 	if cap(buf) > 4096 {
 		fresh := make([]byte, 0, 512)
