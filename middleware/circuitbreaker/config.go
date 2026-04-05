@@ -41,7 +41,7 @@ type Config struct {
 	SkipPaths []string
 
 	// Threshold is the failure ratio (failures/total) that trips the breaker.
-	// Must be between 0 and 1 (exclusive). Default: 0.5.
+	// Must be in (0, 1] — greater than 0 and at most 1. Default: 0.5.
 	Threshold float64
 
 	// MinRequests is the minimum number of requests in the current window

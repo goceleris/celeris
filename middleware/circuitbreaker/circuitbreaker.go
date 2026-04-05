@@ -129,7 +129,16 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 			// Let through.
 		}
 
-		err := c.Next()
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					brk.window.recordFailure()
+					panic(r) // re-panic after recording the failure
+				}
+			}()
+			err = c.Next()
+		}()
 
 		status := responseStatus(c, err)
 		isFailure := brk.isError(err, status)

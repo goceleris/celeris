@@ -110,6 +110,18 @@
 // will cause one user's response (including Set-Cookie headers and
 // personalized content) to be replayed to other concurrent users.
 //
+// # Waiter Timeout
+//
+// Waiters block unconditionally until the leader completes. There is no
+// independent timeout per waiter — a waiter whose context deadline expires
+// will still wait for the leader to finish. To bound waiter wait time,
+// place timeout middleware OUTSIDE singleflight (the recommended ordering):
+//
+//	server.Use(timeout.New(...))      // bounds total request time
+//	server.Use(singleflight.New())    // waiter wait is bounded by timeout
+//
+// This is the same limitation as [golang.org/x/sync/singleflight].
+//
 // # Memory
 //
 // The leader's response body is deep-copied for each waiter. For large
