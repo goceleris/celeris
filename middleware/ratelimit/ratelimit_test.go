@@ -1764,15 +1764,15 @@ func TestValidateConfigInvalid(t *testing.T) {
 		cfg     Config
 		wantSub string
 	}{
-		{"bad Rate format", Config{Rate: "not-valid"}, "Rate:"},
-		{"bad Rate unit", Config{Rate: "100-X"}, "Rate:"},
-		{"bad Rate count", Config{Rate: "abc-M"}, "Rate:"},
-		{"empty Rate count", Config{Rate: "-S"}, "Rate:"},
-		{"negative RPS", Config{RPS: -1}, "RPS must be non-negative"},
-		{"negative Burst", Config{Burst: -1}, "Burst must be non-negative"},
-		{"negative Shards", Config{Shards: -1}, "Shards must be non-negative"},
-		{"negative CleanupInterval", Config{CleanupInterval: -time.Second}, "CleanupInterval must be non-negative"},
-		{"negative MaxDynamicLimiters", Config{MaxDynamicLimiters: -1}, "MaxDynamicLimiters must be non-negative"},
+		{"bad Rate format", Config{Rate: "not-valid"}, "rate:"},
+		{"bad Rate unit", Config{Rate: "100-X"}, "rate:"},
+		{"bad Rate count", Config{Rate: "abc-M"}, "rate:"},
+		{"empty Rate count", Config{Rate: "-S"}, "rate:"},
+		{"negative RPS", Config{RPS: -1}, "rps must be non-negative"},
+		{"negative Burst", Config{Burst: -1}, "burst must be non-negative"},
+		{"negative Shards", Config{Shards: -1}, "shards must be non-negative"},
+		{"negative CleanupInterval", Config{CleanupInterval: -time.Second}, "cleanupInterval must be non-negative"},
+		{"negative MaxDynamicLimiters", Config{MaxDynamicLimiters: -1}, "maxDynamicLimiters must be non-negative"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1800,7 +1800,7 @@ func TestValidateConfigMultipleErrors(t *testing.T) {
 		t.Fatal("ValidateConfig returned nil, want error")
 	}
 	msg := err.Error()
-	for _, sub := range []string{"Rate:", "Burst", "Shards", "CleanupInterval", "MaxDynamicLimiters"} {
+	for _, sub := range []string{"rate:", "burst", "shards", "cleanupInterval", "maxDynamicLimiters"} {
 		if !strings.Contains(msg, sub) {
 			t.Errorf("error %q missing expected substring %q", msg, sub)
 		}

@@ -161,26 +161,26 @@ func ValidateConfig(cfg Config) error {
 
 	if cfg.Rate != "" {
 		if _, _, err := ParseRate(cfg.Rate); err != nil {
-			errs = append(errs, fmt.Errorf("Rate: %w", err))
+			errs = append(errs, fmt.Errorf("rate: %w", err))
 		}
 	}
 	if cfg.Rate == "" && cfg.RPS < 0 {
-		errs = append(errs, fmt.Errorf("RPS must be non-negative, got %g", cfg.RPS))
+		errs = append(errs, fmt.Errorf("rps must be non-negative, got %g", cfg.RPS))
 	}
 	if cfg.Rate == "" && !math.IsInf(cfg.RPS, 0) && math.IsNaN(cfg.RPS) {
-		errs = append(errs, errors.New("RPS must not be NaN"))
+		errs = append(errs, errors.New("rps must not be NaN"))
 	}
 	if cfg.Burst < 0 {
-		errs = append(errs, fmt.Errorf("Burst must be non-negative, got %d", cfg.Burst))
+		errs = append(errs, fmt.Errorf("burst must be non-negative, got %d", cfg.Burst))
 	}
 	if cfg.Shards < 0 {
-		errs = append(errs, fmt.Errorf("Shards must be non-negative, got %d", cfg.Shards))
+		errs = append(errs, fmt.Errorf("shards must be non-negative, got %d", cfg.Shards))
 	}
 	if cfg.CleanupInterval < 0 {
-		errs = append(errs, fmt.Errorf("CleanupInterval must be non-negative, got %v", cfg.CleanupInterval))
+		errs = append(errs, fmt.Errorf("cleanupInterval must be non-negative, got %v", cfg.CleanupInterval))
 	}
 	if cfg.MaxDynamicLimiters < 0 {
-		errs = append(errs, fmt.Errorf("MaxDynamicLimiters must be non-negative, got %d", cfg.MaxDynamicLimiters))
+		errs = append(errs, fmt.Errorf("maxDynamicLimiters must be non-negative, got %d", cfg.MaxDynamicLimiters))
 	}
 	return errors.Join(errs...)
 }
