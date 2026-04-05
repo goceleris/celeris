@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net"
 	"net/http"
@@ -55,6 +56,26 @@ var jsonEncPool = sync.Pool{New: func() any {
 func (c *Context) Status(code int) *Context {
 	c.statusCode = code
 	return c
+}
+
+// StatusJSON serializes v as JSON using the status code set by [Status].
+// Equivalent to c.JSON(c.statusCode, v).
+func (c *Context) StatusJSON(v any) error { return c.JSON(c.statusCode, v) }
+
+// StatusXML serializes v as XML using the status code set by [Status].
+// Equivalent to c.XML(c.statusCode, v).
+func (c *Context) StatusXML(v any) error { return c.XML(c.statusCode, v) }
+
+// StatusString writes a plain-text response using the status code set by [Status].
+// Equivalent to c.Blob(c.statusCode, "text/plain", []byte(s)).
+func (c *Context) StatusString(s string) error {
+	return c.Blob(c.statusCode, "text/plain", unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// StatusBlob writes a response using the status code set by [Status].
+// Equivalent to c.Blob(c.statusCode, contentType, data).
+func (c *Context) StatusBlob(contentType string, data []byte) error {
+	return c.Blob(c.statusCode, contentType, data)
 }
 
 // JSON serializes v as JSON and writes it with the given status code.
@@ -258,6 +279,19 @@ func (c *Context) ResponseHeaders() [][2]string {
 	return c.respHeaders
 }
 
+// SetResponseHeaders replaces all response headers. Used by caching middleware
+// to replay stored responses. The provided headers are copied; the caller
+// retains ownership of the slice.
+func (c *Context) SetResponseHeaders(headers [][2]string) {
+	if len(headers) <= len(c.respHdrBuf) {
+		copy(c.respHdrBuf[:len(headers)], headers)
+		c.respHeaders = c.respHdrBuf[:len(headers)]
+	} else {
+		c.respHeaders = make([][2]string, len(headers))
+		copy(c.respHeaders, headers)
+	}
+}
+
 // StatusCode returns the response status code set by the handler.
 func (c *Context) StatusCode() int {
 	return c.statusCode
@@ -280,63 +314,61 @@ func (c *Context) Redirect(code int, url string) error {
 	return c.NoContent(code)
 }
 
+var cookieUnsafeReplacer = strings.NewReplacer(";", "", "\r", "", "\n", "")
+
+// stripCookieUnsafe strips characters that could inject cookie attributes
+// (semicolons) or cause header injection (CRLF) from cookie field values.
+func stripCookieUnsafe(s string) string {
+	if strings.ContainsAny(s, ";\r\n") {
+		return cookieUnsafeReplacer.Replace(s)
+	}
+	return s
+}
+
 // SetCookie appends a Set-Cookie header to the response.
 // Cookie values are sent as-is without encoding (per RFC 6265).
 // Callers are responsible for encoding values if needed.
 // Semicolons in Name, Value, Path, and Domain are stripped to prevent
 // cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
-	var buf [256]byte
-	b := buf[:0]
-	b = appendCookieSafe(b, cookie.Name)
-	b = append(b, '=')
-	b = appendCookieSafe(b, cookie.Value)
+	var b strings.Builder
+	b.Grow(128)
+	b.WriteString(stripCookieUnsafe(cookie.Name))
+	b.WriteByte('=')
+	b.WriteString(stripCookieUnsafe(cookie.Value))
 	if cookie.Path != "" {
-		b = append(b, "; Path="...)
-		b = appendCookieSafe(b, cookie.Path)
+		b.WriteString("; Path=")
+		b.WriteString(stripCookieUnsafe(cookie.Path))
 	}
 	if cookie.Domain != "" {
-		b = append(b, "; Domain="...)
-		b = appendCookieSafe(b, cookie.Domain)
+		b.WriteString("; Domain=")
+		b.WriteString(stripCookieUnsafe(cookie.Domain))
 	}
 	if !cookie.Expires.IsZero() {
-		b = append(b, "; Expires="...)
-		b = cookie.Expires.UTC().AppendFormat(b, http.TimeFormat)
+		b.WriteString("; Expires=")
+		b.WriteString(cookie.Expires.UTC().Format(http.TimeFormat))
 	}
 	if cookie.MaxAge > 0 {
-		b = append(b, "; Max-Age="...)
-		b = strconv.AppendInt(b, int64(cookie.MaxAge), 10)
+		b.WriteString("; Max-Age=")
+		b.WriteString(strconv.Itoa(cookie.MaxAge))
 	} else if cookie.MaxAge < 0 {
-		b = append(b, "; Max-Age=0"...)
+		b.WriteString("; Max-Age=0")
 	}
 	if cookie.HTTPOnly {
-		b = append(b, "; HttpOnly"...)
+		b.WriteString("; HttpOnly")
 	}
 	if cookie.Secure {
-		b = append(b, "; Secure"...)
+		b.WriteString("; Secure")
 	}
 	switch cookie.SameSite {
 	case SameSiteLaxMode:
-		b = append(b, "; SameSite=Lax"...)
+		b.WriteString("; SameSite=Lax")
 	case SameSiteStrictMode:
-		b = append(b, "; SameSite=Strict"...)
+		b.WriteString("; SameSite=Strict")
 	case SameSiteNoneMode:
-		b = append(b, "; SameSite=None"...)
+		b.WriteString("; SameSite=None")
 	}
-	c.AddHeader("set-cookie", string(b))
-}
-
-// appendCookieSafe appends s to dst, stripping semicolons and CRLF
-// to prevent cookie attribute injection and header splitting.
-func appendCookieSafe(dst []byte, s string) []byte {
-	for i := range len(s) {
-		c := s[i]
-		if c == ';' || c == '\r' || c == '\n' || c == 0 {
-			continue
-		}
-		dst = append(dst, c)
-	}
-	return dst
+	c.AddHeader("set-cookie", b.String())
 }
 
 // File serves the named file. The content type is detected from the file
@@ -425,6 +457,45 @@ func (c *Context) FileFromDir(baseDir, userPath string) error {
 		return NewHTTPError(400, "invalid file path")
 	}
 	return c.File(resolved)
+}
+
+// FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
+// type is detected from the file extension. The entire file is loaded into
+// memory (capped at 100 MB). Returns [HTTPError] with status 413 if the file
+// exceeds this limit.
+//
+// Security: name is passed directly to fsys.Open — callers MUST sanitize
+// user-supplied paths to prevent directory traversal. For untrusted input,
+// use [Context.FileFromDir] instead.
+func (c *Context) FileFromFS(name string, fsys fs.FS) error {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if stat.IsDir() {
+		return NewHTTPError(400, "path is a directory")
+	}
+	size := stat.Size()
+	if size > int64(maxStreamBodySize) {
+		return NewHTTPError(413, "file exceeds 100MB limit")
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+
+	contentType := mime.TypeByExtension(filepath.Ext(name))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	return c.Blob(200, contentType, data)
 }
 
 func parseRange(header string, size int64) (start, end int64, ok bool) {

@@ -22,6 +22,10 @@ import (
 // Method returns the HTTP method.
 func (c *Context) Method() string { return c.method }
 
+// SetMethod overrides the HTTP method. Used by method-override middleware
+// running in Server.Pre().
+func (c *Context) SetMethod(m string) { c.method = m }
+
 // Path returns the request path without query string.
 func (c *Context) Path() string { return c.path }
 
@@ -443,11 +447,18 @@ func (c *Context) BasicAuth() (username, password string, ok bool) {
 	if auth == "" {
 		return
 	}
-	const prefix = "Basic "
-	if len(auth) < len(prefix) || auth[:len(prefix)] != prefix {
+	// RFC 7617: scheme comparison is case-insensitive.
+	// Inline ASCII fold avoids allocation from strings.EqualFold.
+	if len(auth) < 6 ||
+		auth[0]|0x20 != 'b' ||
+		auth[1]|0x20 != 'a' ||
+		auth[2]|0x20 != 's' ||
+		auth[3]|0x20 != 'i' ||
+		auth[4]|0x20 != 'c' ||
+		auth[5] != ' ' {
 		return
 	}
-	payload := auth[len(prefix):]
+	payload := auth[6:]
 	var buf [128]byte
 	if base64.StdEncoding.DecodedLen(len(payload)) > len(buf) {
 		return
