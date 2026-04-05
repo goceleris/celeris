@@ -114,7 +114,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
 
-		if status < 200 || status >= 300 || len(body) < minLen {
+		if status < 200 || status >= 300 || len(body) == 0 || (minLen > 0 && len(body) < minLen) {
 			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}

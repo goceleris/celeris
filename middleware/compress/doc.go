@@ -111,8 +111,8 @@
 // # MinLength Threshold
 //
 // Responses smaller than [Config].MinLength bytes (default 256) are not
-// compressed. This avoids wasting CPU on responses too small to benefit
-// from compression.
+// compressed. Set MinLength to 0 to compress all non-empty responses.
+// This avoids wasting CPU on responses too small to benefit from compression.
 //
 // # Excluded Content Types
 //

@@ -37,11 +37,8 @@ type Config struct {
 
 	// MinLength is the minimum response body size (in bytes) required for
 	// compression. Responses smaller than this are sent uncompressed.
-	// Default: 256.
-	//
-	// Note: MinLength cannot be set to 0 to mean "compress all" — a value
-	// of 0 is treated as "use default" (256). Set MinLength to 1 to compress
-	// all non-empty responses regardless of size.
+	// Default: 256 (when no Config is passed to New).
+	// Set to 0 to compress all non-empty responses regardless of size.
 	MinLength int
 
 	// Encodings lists the supported encodings in server-side priority order.
@@ -96,11 +93,8 @@ var supportedEncodings = map[string]struct{}{
 }
 
 func applyDefaults(cfg Config) Config {
-	// MinLength: 0 means "use default" (256). To compress all sizes, set
-	// MinLength to 1. This is documented in the Config struct.
-	if cfg.MinLength == 0 {
-		cfg.MinLength = defaultConfig.MinLength
-	}
+	// MinLength: 0 means "compress all non-empty responses" (no threshold).
+	// The default 256 comes from defaultConfig (used when no Config is passed).
 	if len(cfg.Encodings) == 0 {
 		cfg.Encodings = defaultConfig.Encodings
 	}
