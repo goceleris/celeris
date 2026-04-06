@@ -424,7 +424,7 @@ func TestReverseProxyBehavioral(t *testing.T) {
 		mu.Unlock()
 		w.Header().Set("X-Backend", "ok")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "backend-response")
+		_, _ = fmt.Fprint(w, "backend-response")
 	}))
 	defer backend.Close()
 
@@ -493,7 +493,7 @@ func TestReverseProxyErrorHandler(t *testing.T) {
 			errorHandlerCalled = true
 			mu.Unlock()
 			w.WriteHeader(http.StatusBadGateway)
-			fmt.Fprint(w, "proxy error")
+			_, _ = fmt.Fprint(w, "proxy error")
 		}),
 	)
 

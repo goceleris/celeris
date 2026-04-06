@@ -7,20 +7,17 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
-	"testing/fstest"
-
 	"github.com/goceleris/celeris/middleware/adapters"
 	"github.com/goceleris/celeris/middleware/circuitbreaker"
-	"github.com/goceleris/celeris/middleware/pprof"
-	"github.com/goceleris/celeris/middleware/static"
-	"github.com/goceleris/celeris/middleware/swagger"
 	"github.com/goceleris/celeris/middleware/cors"
 	"github.com/goceleris/celeris/middleware/etag"
 	"github.com/goceleris/celeris/middleware/methodoverride"
+	"github.com/goceleris/celeris/middleware/pprof"
 	"github.com/goceleris/celeris/middleware/proxy"
 	"github.com/goceleris/celeris/middleware/ratelimit"
 	"github.com/goceleris/celeris/middleware/recovery"
@@ -29,6 +26,8 @@ import (
 	"github.com/goceleris/celeris/middleware/rewrite"
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/singleflight"
+	"github.com/goceleris/celeris/middleware/static"
+	"github.com/goceleris/celeris/middleware/swagger"
 	"github.com/goceleris/celeris/middleware/timeout"
 )
 
