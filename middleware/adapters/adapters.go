@@ -124,8 +124,13 @@ func buildRequest(c *celeris.Context) *http.Request {
 	return req
 }
 
+// maxCaptureBytes is the maximum response body size the capture buffer
+// will accept. Matches the core bridge's 100MB cap.
+const maxCaptureBytes = 100 << 20
+
 // responseCapture is a minimal http.ResponseWriter that buffers the
-// response for inspection.
+// response for inspection. Body is capped at 100MB to prevent OOM from
+// misbehaving stdlib middleware.
 type responseCapture struct {
 	header http.Header
 	code   int
@@ -135,6 +140,9 @@ type responseCapture struct {
 func (r *responseCapture) Header() http.Header  { return r.header }
 func (r *responseCapture) WriteHeader(code int) { r.code = code }
 func (r *responseCapture) Write(b []byte) (int, error) {
+	if len(r.body)+len(b) > maxCaptureBytes {
+		return 0, http.ErrContentLength
+	}
 	r.body = append(r.body, b...)
 	return len(b), nil
 }

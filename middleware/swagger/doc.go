@@ -42,6 +42,18 @@
 //	    },
 //	})
 //
+// # Content Security Policy (CSP)
+//
+// The UI pages load JavaScript and CSS from cdn.jsdelivr.net. If the
+// secure middleware (or any upstream proxy) sets a Content-Security-Policy
+// header, the swagger UI will be blocked unless the CSP includes:
+//
+//	script-src cdn.jsdelivr.net; style-src cdn.jsdelivr.net;
+//
+// The CDN URLs use @latest version tags. For production deployments that
+// require deterministic builds, provide a custom HTML page via a separate
+// static middleware instead of relying on CDN @latest.
+//
 // # Middleware Ordering
 //
 // Place swagger after debug middleware and before application-level

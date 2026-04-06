@@ -5,11 +5,11 @@
 // and either rewrites the path in-place (silent rewrite) or sends an
 // HTTP redirect response.
 //
-// Basic usage (silent rewrite):
+// Basic usage (silent rewrite — use anchored patterns):
 //
 //	server.Pre(rewrite.New(rewrite.Config{
 //	    Rules: map[string]string{
-//	        "/old": "/new",
+//	        "^/old$": "/new",
 //	    },
 //	}))
 //
@@ -17,7 +17,7 @@
 //
 //	server.Pre(rewrite.New(rewrite.Config{
 //	    Rules: map[string]string{
-//	        "/old": "/new",
+//	        "^/old$": "/new",
 //	    },
 //	    RedirectCode: 301,
 //	}))
@@ -76,6 +76,20 @@
 // [New] panics if Rules is empty, if RedirectCode is non-zero and not a
 // valid redirect status, or if any rule key is an invalid regex (via
 // [regexp.MustCompile]).
+//
+// # Security
+//
+// Regex patterns are compiled once at init time via [regexp.MustCompile],
+// not per-request. Avoid catastrophic backtracking patterns (e.g.,
+// `(a+)+$`) which can cause high CPU during compilation.
+//
+// In redirect mode, the redirect URL is constructed from [celeris.Context.Host]
+// and [celeris.Context.Scheme], which are derived from request headers.
+// Without a reverse proxy that validates the Host header, an attacker
+// can send a crafted Host to produce an open redirect. Ensure your
+// deployment validates the Host header upstream (e.g., via the proxy
+// middleware) or use silent rewrite mode (RedirectCode: 0) which only
+// modifies the internal path.
 //
 // # Skipping
 //
