@@ -51,3 +51,7 @@ linters:
         linters:
           - revive
         text: "var-naming"
+      - path: middleware/pprof/
+        linters:
+          - revive
+        text: "var-naming"

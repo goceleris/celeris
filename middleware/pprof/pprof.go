@@ -32,10 +32,8 @@ func New(config ...Config) celeris.HandlerFunc {
 	cfg = applyDefaults(cfg)
 	cfg.validate()
 
-	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
-	for _, p := range cfg.SkipPaths {
-		skipMap[p] = struct{}{}
-	}
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	prefix := strings.TrimRight(cfg.Prefix, "/")
 	prefixSlash := prefix + "/"
@@ -53,21 +51,16 @@ func New(config ...Config) celeris.HandlerFunc {
 	threadcreatePath := prefix + "/threadcreate"
 
 	authFunc := cfg.AuthFunc
-	skipFn := cfg.Skip
 
 	return func(c *celeris.Context) error {
 		path := c.Path()
-
-		if _, ok := skipMap[path]; ok {
-			return c.Next()
-		}
 
 		// Fast path: requests outside the prefix pass through immediately.
 		if path != prefix && !strings.HasPrefix(path, prefixSlash) {
 			return c.Next()
 		}
 
-		if skipFn != nil && skipFn(c) {
+		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 

@@ -2,6 +2,7 @@ package swagger
 
 import (
 	"fmt"
+	"html"
 	"io"
 	"strings"
 
@@ -54,12 +55,16 @@ func New(config ...Config) celeris.HandlerFunc {
 
 	specBytes := loadSpec(cfg)
 
+	// Escape SpecURL for safe embedding in HTML/JavaScript contexts.
+	// Prevents XSS if SpecURL contains quotes or script tags.
+	safeURL := html.EscapeString(cfg.SpecURL)
+
 	var uiHTML string
 	switch cfg.UIEngine {
 	case "scalar":
-		uiHTML = fmt.Sprintf(scalarTemplate, cfg.SpecURL)
+		uiHTML = fmt.Sprintf(scalarTemplate, safeURL)
 	default:
-		uiHTML = fmt.Sprintf(swaggerUITemplate, cfg.SpecURL)
+		uiHTML = fmt.Sprintf(swaggerUITemplate, safeURL)
 	}
 
 	uiPath := strings.TrimRight(cfg.UIPath, "/")

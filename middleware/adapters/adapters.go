@@ -132,6 +132,9 @@ type responseCapture struct {
 	body   []byte
 }
 
-func (r *responseCapture) Header() http.Header         { return r.header }
-func (r *responseCapture) WriteHeader(code int)         { r.code = code }
-func (r *responseCapture) Write(b []byte) (int, error)  { r.body = append(r.body, b...); return len(b), nil }
+func (r *responseCapture) Header() http.Header  { return r.header }
+func (r *responseCapture) WriteHeader(code int) { r.code = code }
+func (r *responseCapture) Write(b []byte) (int, error) {
+	r.body = append(r.body, b...)
+	return len(b), nil
+}
