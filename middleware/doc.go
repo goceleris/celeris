@@ -7,7 +7,13 @@
 //
 //	proxy          — extract real client IP/scheme/host from trusted proxy headers
 //	redirect       — HTTPS, www, trailing-slash URL normalization
+//	rewrite        — regex-based URL rewriting (pattern → replacement)
 //	methodoverride — override POST method via _method form field or header
+//
+// Order matters: install proxy first (sets real client IP/scheme for all
+// downstream middleware), then redirect (uses scheme from proxy), then
+// rewrite (modifies path after redirect normalizes the URL), then
+// methodoverride (after path is finalized).
 //
 // # Recommended Middleware Ordering (Server.Use)
 //
@@ -27,6 +33,10 @@
 //	csrf        — validate CSRF token after authentication is established
 //	session     — load session (may depend on authenticated user)
 //	debug       — intercepts by path prefix (e.g. /debug/); can go anywhere
+//	pprof       — Go profiling endpoints (loopback-only by default)
+//	swagger     — OpenAPI spec + UI (CDN-loaded Swagger UI or Scalar)
+//	static      — static file server with directory browse (after security/auth if protecting)
+//	adapters    — (utility) stdlib ↔ celeris middleware conversion; not a chain member
 //	timeout     — bound handler execution; innermost wrapper before the route
 //	singleflight — collapse identical in-flight requests; after timeout
 //	compress    — response compression; wraps etag (computes on uncompressed body)
@@ -38,6 +48,7 @@
 //	// Pre-routing
 //	s.Pre(proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}))
 //	s.Pre(redirect.HTTPSRedirect())
+//	s.Pre(rewrite.New(rewrite.Config{Rules: []rewrite.Rule{{Pattern: `^/old/(.*)$`, Replacement: "/new/$1"}}}))
 //	s.Pre(methodoverride.New())
 //
 //	// Route middleware

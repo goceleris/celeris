@@ -1,0 +1,435 @@
+package rewrite
+
+import (
+	"testing"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/middleware/internal/testutil"
+)
+
+func pathRecorder(c *celeris.Context) error {
+	return c.Blob(200, "text/plain", []byte(c.Path()))
+}
+
+func TestRewriteSimple(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+	})
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err := testutil.RunChain(t, chain, "GET", "/old")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/new" {
+		t.Fatalf("path: got %q, want %q", rec.BodyString(), "/new")
+	}
+}
+
+func TestRewriteCaptureGroups(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: `^/users/(\d+)/posts$`, Replacement: "/api/v2/users/$1/posts"},
+		},
+	})
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err := testutil.RunChain(t, chain, "GET", "/users/42/posts")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/api/v2/users/42/posts" {
+		t.Fatalf("path: got %q, want %q", rec.BodyString(), "/api/v2/users/42/posts")
+	}
+}
+
+func TestRewriteFirstMatchWins(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/a/.*", Replacement: "/alpha"},
+			{Pattern: "^/b/.*", Replacement: "/beta"},
+		},
+	})
+
+	t.Run("matches first rule", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/a/something")
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 200)
+		if rec.BodyString() != "/alpha" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/alpha")
+		}
+	})
+
+	t.Run("matches second rule", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/b/something")
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 200)
+		if rec.BodyString() != "/beta" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/beta")
+		}
+	})
+}
+
+func TestRewriteInsertionOrder(t *testing.T) {
+	// Verify that rules are evaluated in insertion order, not alphabetical.
+	// With alphabetical sort, "^/z/.*" would come after "^/a/.*",
+	// but here we put "/z" first so it should match first for an
+	// overlapping path.
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/z/.*", Replacement: "/zulu"},
+			{Pattern: "^/.*", Replacement: "/catchall"},
+		},
+	})
+
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err := testutil.RunChain(t, chain, "GET", "/z/foo")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/zulu" {
+		t.Fatalf("path: got %q, want %q (insertion order should win)", rec.BodyString(), "/zulu")
+	}
+}
+
+func TestRewriteRedirectMode(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+		RedirectCode: 301,
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/old",
+		celeristest.WithScheme("https"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 301)
+	testutil.AssertHeader(t, rec, "location", "https://localhost/new")
+}
+
+func TestRewriteNoMatch(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+	})
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err := testutil.RunChain(t, chain, "GET", "/other")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/other" {
+		t.Fatalf("path: got %q, want %q", rec.BodyString(), "/other")
+	}
+}
+
+func TestRewritePreserveQuery(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+		RedirectCode: 302,
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/old",
+		celeristest.WithScheme("https"),
+		celeristest.WithQuery("key", "value"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 302)
+	testutil.AssertHeader(t, rec, "location", "https://localhost/new?key=value")
+}
+
+func TestRewriteSkipPaths(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+		SkipPaths: []string{"/old"},
+	})
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err := testutil.RunChain(t, chain, "GET", "/old")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/old" {
+		t.Fatalf("path: got %q, want %q (should be unchanged due to skip)", rec.BodyString(), "/old")
+	}
+}
+
+func TestRewriteSkipFunc(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+		Skip: func(c *celeris.Context) bool {
+			return c.Method() == "POST"
+		},
+	})
+
+	t.Run("GET is rewritten", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/old")
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "/new" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/new")
+		}
+	})
+
+	t.Run("POST is skipped", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "POST", "/old")
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "/old" {
+			t.Fatalf("path: got %q, want %q (should be unchanged due to skip)", rec.BodyString(), "/old")
+		}
+	})
+}
+
+func TestRewriteMethodRestriction(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new", Methods: []string{"POST"}},
+		},
+	})
+
+	t.Run("GET does not match", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/old")
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 200)
+		if rec.BodyString() != "/old" {
+			t.Fatalf("path: got %q, want %q (GET should not match POST-only rule)", rec.BodyString(), "/old")
+		}
+	})
+
+	t.Run("POST matches", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "POST", "/old")
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 200)
+		if rec.BodyString() != "/new" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/new")
+		}
+	})
+}
+
+func TestRewriteHostRestriction(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new", Host: "api.example.com"},
+		},
+	})
+
+	setHost := func(host string) celeris.HandlerFunc {
+		return func(c *celeris.Context) error {
+			c.SetHost(host)
+			return c.Next()
+		}
+	}
+
+	t.Run("different host does not match", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/old")
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 200)
+		if rec.BodyString() != "/old" {
+			t.Fatalf("path: got %q, want %q (default host should not match)", rec.BodyString(), "/old")
+		}
+	})
+
+	t.Run("matching host rewrites", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{setHost("api.example.com"), mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/old")
+		testutil.AssertNoError(t, err)
+		testutil.AssertStatus(t, rec, 200)
+		if rec.BodyString() != "/new" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/new")
+		}
+	})
+}
+
+func TestRewriteMethodAndHostCombined(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{
+				Pattern:     "^/old$",
+				Replacement: "/new",
+				Methods:     []string{"POST"},
+				Host:        "api.example.com",
+			},
+		},
+	})
+
+	setHost := func(host string) celeris.HandlerFunc {
+		return func(c *celeris.Context) error {
+			c.SetHost(host)
+			return c.Next()
+		}
+	}
+
+	t.Run("wrong method and wrong host", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/old")
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "/old" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/old")
+		}
+	})
+
+	t.Run("correct method wrong host", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "POST", "/old")
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "/old" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/old")
+		}
+	})
+
+	t.Run("wrong method correct host", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{setHost("api.example.com"), mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "GET", "/old")
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "/old" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/old")
+		}
+	})
+
+	t.Run("correct method and host rewrites", func(t *testing.T) {
+		chain := []celeris.HandlerFunc{setHost("api.example.com"), mw, pathRecorder}
+		rec, err := testutil.RunChain(t, chain, "POST", "/old")
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "/new" {
+			t.Fatalf("path: got %q, want %q", rec.BodyString(), "/new")
+		}
+	})
+}
+
+func TestRewriteNoMethodRestriction(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
+		},
+	})
+
+	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH"} {
+		t.Run(method, func(t *testing.T) {
+			chain := []celeris.HandlerFunc{mw, pathRecorder}
+			rec, err := testutil.RunChain(t, chain, method, "/old")
+			testutil.AssertNoError(t, err)
+			testutil.AssertStatus(t, rec, 200)
+			if rec.BodyString() != "/new" {
+				t.Fatalf("path: got %q, want %q (rule without Methods should match all)", rec.BodyString(), "/new")
+			}
+		})
+	}
+}
+
+func TestValidatePanics(t *testing.T) {
+	t.Run("empty rules", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for empty Rules")
+			}
+			msg, ok := r.(string)
+			if !ok || msg != "rewrite: Rules must not be empty" {
+				t.Fatalf("unexpected panic: %v", r)
+			}
+		}()
+		New(Config{Rules: []Rule{}})
+	})
+
+	t.Run("nil rules", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for nil Rules")
+			}
+		}()
+		New(Config{})
+	})
+
+	t.Run("invalid redirect code", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for invalid RedirectCode")
+			}
+			msg, ok := r.(string)
+			if !ok {
+				t.Fatalf("unexpected panic type: %T", r)
+			}
+			if msg == "" {
+				t.Fatal("expected non-empty panic message")
+			}
+		}()
+		New(Config{
+			Rules:        []Rule{{Pattern: "^/old$", Replacement: "/new"}},
+			RedirectCode: 200,
+		})
+	})
+
+	t.Run("invalid regex panics", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for invalid regex")
+			}
+		}()
+		New(Config{
+			Rules: []Rule{{Pattern: "[invalid", Replacement: "/new"}},
+		})
+	})
+
+	t.Run("empty pattern", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for empty Pattern")
+			}
+		}()
+		New(Config{
+			Rules: []Rule{{Pattern: "", Replacement: "/new"}},
+		})
+	})
+
+	t.Run("invalid per-rule redirect code", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for invalid per-rule RedirectCode")
+			}
+		}()
+		New(Config{
+			Rules: []Rule{{Pattern: "^/old$", Replacement: "/new", RedirectCode: 200}},
+		})
+	})
+}
+
+func TestRewritePerRuleRedirect(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new", RedirectCode: 301},
+			{Pattern: "^/temp$", Replacement: "/dest", RedirectCode: 307},
+			{Pattern: "^/silent$", Replacement: "/rewritten"},
+		},
+	})
+
+	// First rule: 301 redirect
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/old",
+		celeristest.WithScheme("https"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 301)
+	testutil.AssertHeader(t, rec, "location", "https://localhost/new")
+
+	// Second rule: 307 redirect
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/temp",
+		celeristest.WithScheme("https"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 307)
+	testutil.AssertHeader(t, rec, "location", "https://localhost/dest")
+
+	// Third rule: silent rewrite (no per-rule code, no config-level code)
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err = testutil.RunChain(t, chain, "GET", "/silent")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/rewritten" {
+		t.Fatalf("path: got %q, want %q", rec.BodyString(), "/rewritten")
+	}
+}

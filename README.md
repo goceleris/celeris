@@ -101,6 +101,7 @@ All middleware is in-tree under [`middleware/`](middleware/):
 
 | Package | Description |
 |---------|-------------|
+| [`adapters`](middleware/adapters) | Bidirectional stdlib ↔ celeris middleware/handler conversion |
 | [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
 | [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
 | [`circuitbreaker`](middleware/circuitbreaker) | Circuit breaker (3-state, sliding window error rate, 503 + Retry-After) |
@@ -116,14 +117,18 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`methodoverride`](middleware/methodoverride) | HTTP method override via header or form field |
 | [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
 | [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
+| [`pprof`](middleware/pprof) | Go profiling endpoints (loopback-only by default) |
 | [`proxy`](middleware/proxy) | Trusted proxy header extraction (X-Forwarded-For, X-Real-IP) |
 | [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter |
 | [`recovery`](middleware/recovery) | Panic recovery with broken pipe detection |
 | [`redirect`](middleware/redirect) | URL redirect/rewrite (HTTPS, www, trailing slash) |
 | [`requestid`](middleware/requestid) | Request ID generation (buffered UUID v4) |
+| [`rewrite`](middleware/rewrite) | Regex-based URL rewriting with capture group support |
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions with pluggable store |
 | [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
+| [`static`](middleware/static) | Static file serving with directory browse, ETag/Last-Modified caching |
+| [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI/Scalar (CDN-loaded) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
 
 ```go
@@ -279,7 +284,7 @@ adaptive/       Adaptive meta-engine (Linux)
 celeristest/    Test helpers (NewContext, ResponseRecorder)
 engine/         Engine interface + implementations (iouring, epoll, std)
 internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts)
-middleware/     In-tree middleware ecosystem (24 packages)
+middleware/     In-tree middleware ecosystem (29 packages)
 observe/        Metrics collector, CPUMonitor, Snapshot
 probe/          System capability detection
 protocol/       Protocol parsers (h1, h2, detect)

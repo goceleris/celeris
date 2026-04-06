@@ -61,6 +61,9 @@ When adding middleware, use `celeris.SkipHelper` for skip logic (not manual `ski
 - **Stateful**: `middleware/ratelimit`, `middleware/circuitbreaker` — shared state with atomic counters, background cleanup, sliding windows
 - **Response-transform**: `middleware/etag`, `middleware/compress` — BufferResponse/FlushResponse pattern
 - **Request-coalescing**: `middleware/singleflight` — embedded singleflight group with response fan-out
+- **Path-prefix interception**: `middleware/debug`, `middleware/pprof`, `middleware/swagger`
+- **Pre-routing URL manipulation**: `middleware/redirect`, `middleware/rewrite`
+- **Utility package**: `middleware/adapters` — conversion functions, not middleware constructor
 
 ### Linux Testing from macOS
 
