@@ -100,15 +100,17 @@ func ExampleNew_redocCustom() {
 	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
 		Renderer:    swagger.RendererReDoc,
-		ReDoc: swagger.ReDocConfig{
-			Theme:              "dark",
-			ExpandResponses:    "200",
-			HideDownloadButton: true,
+		Options: map[string]any{
+			"theme": map[string]any{
+				"colors": map[string]any{"primary": map[string]any{"main": "#32329f"}},
+			},
+			"expandResponses":    "200",
+			"hideDownloadButton": true,
 		},
 	}))
 }
 
-func ExampleIntPtr() {
+func ExampleNew_modelsExpandDepth() {
 	server := celeris.New(celeris.Config{})
 
 	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
@@ -116,7 +118,7 @@ func ExampleIntPtr() {
 	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
 		UI: swagger.UIConfig{
-			DefaultModelsExpandDepth: swagger.IntPtr(0),
+			DefaultModelsExpandDepth: 1,
 		},
 	}))
 }

@@ -504,40 +504,12 @@ func TestReverseProxyWithModifyResponse(t *testing.T) {
 	testutil.AssertBodyContains(t, rec, "from-backend")
 }
 
-func TestResponseCaptureFlusher(t *testing.T) {
+func TestResponseCaptureNoFlusher(t *testing.T) {
 	rec := &responseCapture{header: make(http.Header)}
-
-	// Verify responseCapture implements http.Flusher.
-	flusher, ok := http.ResponseWriter(rec).(http.Flusher)
-	if !ok {
-		t.Fatal("responseCapture does not implement http.Flusher")
+	_, ok := http.ResponseWriter(rec).(http.Flusher)
+	if ok {
+		t.Fatal("responseCapture should NOT implement http.Flusher")
 	}
-
-	// Flush should not panic.
-	flusher.Flush()
-}
-
-func TestWrapMiddlewareWithFlusher(t *testing.T) {
-	// Stdlib middleware that type-asserts Flusher and calls Flush.
-	flushMW := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-
-	handler := func(c *celeris.Context) error {
-		return c.String(200, "flushed")
-	}
-
-	mw := WrapMiddleware(flushMW)
-	chain := []celeris.HandlerFunc{mw, handler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "flushed")
 }
 
 func TestReverseProxyErrorHandler(t *testing.T) {

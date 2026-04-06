@@ -1,6 +1,7 @@
 package swagger
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
 	"strings"
@@ -8,35 +9,17 @@ import (
 	"github.com/goceleris/celeris"
 )
 
-// buildReDocOptions returns a JavaScript object literal string from the
-// ReDocConfig. Empty/zero fields are omitted so ReDoc uses its own defaults.
-func buildReDocOptions(rd ReDocConfig) string {
-	var parts []string
-	if rd.Theme != "" {
-		parts = append(parts, fmt.Sprintf("theme:{colors:{primary:{main:%q}}}", rd.Theme))
-		// "dark" needs special handling: ReDoc doesn't have a single "dark"
-		// toggle, so we translate to the known rightPanel/text colours.
-		if rd.Theme == "dark" {
-			parts = parts[:len(parts)-1]
-			parts = append(parts, `theme:{colors:{primary:{main:"#32329f"}},typography:{color:"#fff"},rightPanel:{backgroundColor:"#263238"},schema:{nestedBackground:"#1a1a2e"}}`)
-		}
-	}
-	if rd.ExpandResponses != "" {
-		parts = append(parts, fmt.Sprintf("expandResponses: %q", rd.ExpandResponses))
-	}
-	if rd.HideDownloadButton {
-		parts = append(parts, "hideDownloadButton: true")
-	}
-	if rd.ScrollYOffset != 0 {
-		parts = append(parts, fmt.Sprintf("scrollYOffset: %d", rd.ScrollYOffset))
-	}
-	if rd.NoAutoAuth {
-		parts = append(parts, "noAutoAuth: true")
-	}
-	if len(parts) == 0 {
+// marshalOptions serializes the Options map to a JSON string for embedding
+// in HTML templates. Returns "{}" when opts is nil or empty.
+func marshalOptions(opts map[string]any) string {
+	if len(opts) == 0 {
 		return "{}"
 	}
-	return "{" + strings.Join(parts, ", ") + "}"
+	b, err := json.Marshal(opts)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // New creates a swagger middleware that serves an OpenAPI spec viewer.
@@ -114,11 +97,6 @@ func buildPage(cfg Config, specURL string) string {
 func buildSwaggerUIPage(cfg Config, specURL string) string {
 	ui := cfg.UI
 
-	depth := 1
-	if ui.DefaultModelsExpandDepth != nil {
-		depth = *ui.DefaultModelsExpandDepth
-	}
-
 	var cssURL, bundleURL, presetURL string
 	if cfg.AssetsPath != "" {
 		base := strings.TrimRight(cfg.AssetsPath, "/")
@@ -185,21 +163,27 @@ const ui = SwaggerUIBundle({
 </script>
 </body>
 </html>`, html.EscapeString(ui.Title), cssURL, bundleURL, presetURL,
-		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization, depth,
-		oauth2Redirect, oauth2Init)
+		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization,
+		ui.DefaultModelsExpandDepth, oauth2Redirect, oauth2Init)
 }
 
 func buildScalarPage(cfg Config, specURL string) string {
 	ui := cfg.UI
 
+	scalarOpts := cfg.Options
+	if scalarOpts == nil {
+		scalarOpts = map[string]any{"theme": "default"}
+	}
+	dataCfg := html.EscapeString(marshalOptions(scalarOpts))
+
 	var scriptTag string
 	if cfg.AssetsPath != "" {
 		base := strings.TrimRight(cfg.AssetsPath, "/")
-		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='{"theme":"default"}'></script>
-<script src="%s/standalone.min.js"></script>`, specURL, html.EscapeString(base))
+		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='%s'></script>
+<script src="%s/standalone.min.js"></script>`, specURL, dataCfg, html.EscapeString(base))
 	} else {
-		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='{"theme":"default"}'></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>`, specURL)
+		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='%s'></script>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>`, specURL, dataCfg)
 	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
@@ -217,7 +201,7 @@ func buildScalarPage(cfg Config, specURL string) string {
 
 func buildReDocPage(cfg Config, specURL string) string {
 	ui := cfg.UI
-	opts := buildReDocOptions(cfg.ReDoc)
+	opts := marshalOptions(cfg.Options)
 
 	var jsURL string
 	if cfg.AssetsPath != "" {

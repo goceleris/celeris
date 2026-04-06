@@ -37,9 +37,11 @@
 //
 // # Limitations
 //
-// The responseCapture implements http.Flusher (as a no-op for compatibility)
-// but does not implement http.Hijacker. Stdlib middleware that requires
-// WebSocket upgrade (via Hijack) will not work through WrapMiddleware.
+// The responseCapture used by WrapMiddleware does not implement
+// http.Hijacker or http.Flusher. Stdlib middleware that requires
+// WebSocket upgrade (via Hijack) or streaming flush (via Flush)
+// will not work through WrapMiddleware. For these use cases,
+// implement the middleware natively in celeris.
 //
 // # Reverse Proxy
 //

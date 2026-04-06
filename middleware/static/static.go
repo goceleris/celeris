@@ -79,7 +79,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		filePath = strings.TrimSuffix(filePath, "/")
 
 		if fsys != nil {
-			return serveFS(c, fsys, filePath, index, browse, spa, maxAge)
+			return serveFS(c, fsys, filePath, index, browse, spa, compress, maxAge)
 		}
 		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge, compress)
 	}
@@ -179,8 +179,8 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
-func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa bool, maxAge time.Duration) error {
-	// fs.FS uses "." for the root directory.
+func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, maxAge time.Duration) error {
+	// 1. Open + stat + directory handling.
 	openPath := filePath
 	if openPath == "" {
 		openPath = "."
@@ -189,7 +189,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	f, err := fsys.Open(openPath)
 	if err != nil {
 		if spa {
-			return serveFS(c, fsys, index, index, browse, false, maxAge)
+			return serveFS(c, fsys, index, index, browse, false, compress, maxAge)
 		}
 		return c.Next()
 	}
@@ -213,7 +213,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			indexStat, statErr := indexFile.Stat()
 			_ = indexFile.Close()
 			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse, spa, maxAge)
+				return serveFS(c, fsys, indexPath, index, browse, spa, compress, maxAge)
 			}
 		}
 		if browse {
@@ -222,12 +222,13 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		return c.Next()
 	}
 
+	// 2. Size cap check.
 	size := stat.Size()
 	if size > maxFSFileSize {
 		return celeris.NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	// Compute caching headers before any file reads.
+	// 3. Cache headers + 304 check.
 	modTime := stat.ModTime()
 	if !modTime.IsZero() {
 		etag := setCacheHeaders(c, modTime, size, maxAge)
@@ -236,24 +237,81 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		}
 	}
 
-	// ReadSeeker fast-path: range requests read only the requested range
-	// instead of the entire file.
+	// 4. Pre-compressed check (if enabled).
+	if compress {
+		if served, err := servePreCompressedFS(c, fsys, filePath); served {
+			return err
+		}
+	}
+
+	// 5. ReadSeeker fast path OR full read + response.
+	c.SetHeader("accept-ranges", "bytes")
+
 	if rs, ok := f.(io.ReadSeeker); ok {
 		return serveFSReadSeeker(c, rs, filePath, size)
 	}
+	return serveFSFullRead(c, f, filePath, size)
+}
 
-	// Non-ReadSeeker fallback: read entire file into memory.
+// servePreCompressedFS attempts to serve a pre-compressed variant (.br or .gz)
+// of the requested file from an fs.FS. Returns (true, err) if a compressed
+// variant was served, (false, nil) to fall through to normal serving.
+func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool, error) {
+	ae := c.Header("accept-encoding")
+	if ae == "" {
+		return false, nil
+	}
+
+	type variant struct {
+		suffix   string
+		encoding string
+	}
+	variants := [2]variant{
+		{".br", "br"},
+		{".gz", "gzip"},
+	}
+
+	for _, v := range variants {
+		if !strings.Contains(ae, v.encoding) {
+			continue
+		}
+		compPath := filePath + v.suffix
+		f, err := fsys.Open(compPath)
+		if err != nil {
+			continue
+		}
+		stat, statErr := f.Stat()
+		if statErr != nil || stat.IsDir() || stat.Size() > maxFSFileSize {
+			_ = f.Close()
+			continue
+		}
+		data := make([]byte, stat.Size())
+		_, readErr := io.ReadFull(f, data)
+		_ = f.Close()
+		if readErr != nil {
+			continue
+		}
+		ct := mime.TypeByExtension(filepath.Ext(filePath))
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		c.SetHeader("content-encoding", v.encoding)
+		c.AddHeader("vary", "Accept-Encoding")
+		return true, c.Blob(200, ct, data)
+	}
+
+	return false, nil
+}
+
+// serveFSFullRead serves an fs.FS file by reading the entire contents into
+// memory, detecting the content type, and handling range requests.
+func serveFSFullRead(c *celeris.Context, f fs.File, filePath string, size int64) error {
 	data := make([]byte, size)
 	if _, err := io.ReadFull(f, data); err != nil {
 		return err
 	}
 
-	contentType := mime.TypeByExtension(filepath.Ext(filePath))
-	if contentType == "" {
-		contentType = http.DetectContentType(data[:min(512, len(data))])
-	}
-
-	c.SetHeader("accept-ranges", "bytes")
+	contentType := detectContentType(filePath, data)
 
 	if rng := c.Header("range"); rng != "" {
 		if start, end, ok := parseByteRange(rng, int64(len(data))); ok {
@@ -265,34 +323,27 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	return c.Blob(200, contentType, data)
 }
 
+// detectContentType returns the MIME type for a file. It checks the file
+// extension first, then falls back to http.DetectContentType on the data.
+func detectContentType(filePath string, data []byte) string {
+	ct := mime.TypeByExtension(filepath.Ext(filePath))
+	if ct != "" {
+		return ct
+	}
+	if len(data) > 0 {
+		return http.DetectContentType(data[:min(512, len(data))])
+	}
+	return "application/octet-stream"
+}
+
 // serveFSReadSeeker serves a file from an fs.FS file that implements
 // io.ReadSeeker. Range requests seek to the requested offset and read
 // only the required bytes instead of loading the entire file.
 func serveFSReadSeeker(c *celeris.Context, rs io.ReadSeeker, filePath string, size int64) error {
-	contentType := mime.TypeByExtension(filepath.Ext(filePath))
-	if contentType == "" {
-		buf := make([]byte, 512)
-		n, _ := io.ReadAtLeast(rs, buf, 1)
-		contentType = http.DetectContentType(buf[:n])
-		if _, err := rs.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-	}
+	contentType := sniffContentType(rs, filePath)
 
-	c.SetHeader("accept-ranges", "bytes")
-
-	if rng := c.Header("range"); rng != "" {
-		if start, end, ok := parseByteRange(rng, size); ok {
-			if _, err := rs.Seek(start, io.SeekStart); err != nil {
-				return err
-			}
-			data := make([]byte, end-start+1)
-			if _, err := io.ReadFull(rs, data); err != nil {
-				return err
-			}
-			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
-			return c.Blob(206, contentType, data)
-		}
+	if served, err := serveRangeFromReader(c, rs, contentType, size); served {
+		return err
 	}
 
 	data := make([]byte, size)
@@ -300,6 +351,49 @@ func serveFSReadSeeker(c *celeris.Context, rs io.ReadSeeker, filePath string, si
 		return err
 	}
 	return c.Blob(200, contentType, data)
+}
+
+// sniffContentType determines the MIME type for a file opened as an
+// io.ReadSeeker. It checks the file extension first, then reads up to
+// 512 bytes for content sniffing, and resets the reader position.
+func sniffContentType(rs io.ReadSeeker, filePath string) string {
+	ct := mime.TypeByExtension(filepath.Ext(filePath))
+	if ct != "" {
+		return ct
+	}
+	buf := make([]byte, 512)
+	n, _ := io.ReadAtLeast(rs, buf, 1)
+	if n > 0 {
+		ct = http.DetectContentType(buf[:n])
+	}
+	rs.Seek(0, io.SeekStart)
+	if ct == "" {
+		return "application/octet-stream"
+	}
+	return ct
+}
+
+// serveRangeFromReader handles range requests using an io.ReadSeeker.
+// Returns (true, err) if a range was served, (false, nil) if no valid
+// range was requested.
+func serveRangeFromReader(c *celeris.Context, rs io.ReadSeeker, contentType string, size int64) (bool, error) {
+	rng := c.Header("range")
+	if rng == "" {
+		return false, nil
+	}
+	start, end, ok := parseByteRange(rng, size)
+	if !ok {
+		return false, nil
+	}
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		return false, err
+	}
+	data := make([]byte, end-start+1)
+	if _, err := io.ReadFull(rs, data); err != nil {
+		return false, err
+	}
+	c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	return true, c.Blob(206, contentType, data)
 }
 
 // setCacheHeaders sets Last-Modified, ETag, and Cache-Control headers from

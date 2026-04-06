@@ -159,7 +159,7 @@ func TestUIConfigSwaggerUI(t *testing.T) {
 			DocExpansion:             "full",
 			DeepLinking:              true,
 			PersistAuthorization:     true,
-			DefaultModelsExpandDepth: intPtrHelper(-1),
+			DefaultModelsExpandDepth: -1,
 			Title:                    "My API",
 		},
 	})
@@ -183,7 +183,7 @@ func TestUIConfigDefaults(t *testing.T) {
 	assertContains(t, body, `docExpansion: "list"`)
 	assertContains(t, body, `deepLinking: false`)
 	assertContains(t, body, `persistAuthorization: false`)
-	assertContains(t, body, `defaultModelsExpandDepth: 1`)
+	assertContains(t, body, `defaultModelsExpandDepth: 0`)
 	assertContains(t, body, `<title>API Documentation</title>`)
 }
 
@@ -398,8 +398,8 @@ func TestApplyDefaultsFillsEmpty(t *testing.T) {
 	if cfg.UI.DocExpansion != "list" {
 		t.Fatalf("DocExpansion: got %q, want list", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth == nil || *cfg.UI.DefaultModelsExpandDepth != 1 {
-		t.Fatalf("DefaultModelsExpandDepth: got %v, want 1", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth != 0 {
+		t.Fatalf("DefaultModelsExpandDepth: got %d, want 0", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "API Documentation" {
 		t.Fatalf("Title: got %q, want API Documentation", cfg.UI.Title)
@@ -413,7 +413,7 @@ func TestApplyDefaultsPreservesCustom(t *testing.T) {
 		Renderer: RendererScalar,
 		UI: UIConfig{
 			DocExpansion:             "full",
-			DefaultModelsExpandDepth: intPtrHelper(-1),
+			DefaultModelsExpandDepth: -1,
 			Title:                    "Custom",
 		},
 	})
@@ -426,8 +426,8 @@ func TestApplyDefaultsPreservesCustom(t *testing.T) {
 	if cfg.UI.DocExpansion != "full" {
 		t.Fatalf("DocExpansion: got %q, want full", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth == nil || *cfg.UI.DefaultModelsExpandDepth != -1 {
-		t.Fatalf("DefaultModelsExpandDepth: got %v, want -1", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth != -1 {
+		t.Fatalf("DefaultModelsExpandDepth: got %d, want -1", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "Custom" {
 		t.Fatalf("Title: got %q, want Custom", cfg.UI.Title)
@@ -522,47 +522,31 @@ func TestAssetsPathReDoc(t *testing.T) {
 
 // --- DefaultModelsExpandDepth zero ---
 
-func TestDefaultModelsExpandDepthZero(t *testing.T) {
+func TestDefaultModelsExpandDepthExplicit(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		UI: UIConfig{
-			DefaultModelsExpandDepth: intPtrHelper(0),
+			DefaultModelsExpandDepth: 2,
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `defaultModelsExpandDepth: 0`)
+	assertContains(t, body, `defaultModelsExpandDepth: 2`)
 }
 
-// --- IntPtr helper ---
+// --- ReDoc customization via Options ---
 
-func TestIntPtr(t *testing.T) {
-	t.Parallel()
-	p := IntPtr(42)
-	if p == nil || *p != 42 {
-		t.Fatalf("IntPtr(42): got %v, want *42", p)
-	}
-	z := IntPtr(0)
-	if z == nil || *z != 0 {
-		t.Fatalf("IntPtr(0): got %v, want *0", z)
-	}
-	n := IntPtr(-1)
-	if n == nil || *n != -1 {
-		t.Fatalf("IntPtr(-1): got %v, want *-1", n)
-	}
-}
-
-// --- ReDoc customization ---
-
-func TestReDocTheme(t *testing.T) {
+func TestReDocOptionsTheme(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
-		ReDoc: ReDocConfig{
-			Theme: "dark",
+		Options: map[string]any{
+			"theme": map[string]any{
+				"colors": map[string]any{"primary": map[string]any{"main": "#32329f"}},
+			},
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
@@ -570,68 +554,68 @@ func TestReDocTheme(t *testing.T) {
 	testutil.AssertStatus(t, rec, 200)
 	body := rec.BodyString()
 	assertContains(t, body, `Redoc.init`)
-	assertContains(t, body, `theme:`)
-	assertContains(t, body, `"#263238"`)
+	assertContains(t, body, `"theme"`)
+	assertContains(t, body, `#32329f`)
 }
 
-func TestReDocExpandResponses(t *testing.T) {
+func TestReDocOptionsExpandResponses(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
-		ReDoc: ReDocConfig{
-			ExpandResponses: "200,201",
+		Options: map[string]any{
+			"expandResponses": "200,201",
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `expandResponses: "200,201"`)
+	assertContains(t, body, `"expandResponses":"200,201"`)
 }
 
-func TestReDocHideDownloadButton(t *testing.T) {
+func TestReDocOptionsHideDownloadButton(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
-		ReDoc: ReDocConfig{
-			HideDownloadButton: true,
+		Options: map[string]any{
+			"hideDownloadButton": true,
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `hideDownloadButton: true`)
+	assertContains(t, body, `"hideDownloadButton":true`)
 }
 
-func TestReDocScrollYOffset(t *testing.T) {
+func TestReDocOptionsScrollYOffset(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
-		ReDoc: ReDocConfig{
-			ScrollYOffset: 100,
+		Options: map[string]any{
+			"scrollYOffset": 100,
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `scrollYOffset: 100`)
+	assertContains(t, body, `"scrollYOffset":100`)
 }
 
-func TestReDocNoAutoAuth(t *testing.T) {
+func TestReDocOptionsNoAutoAuth(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
-		ReDoc: ReDocConfig{
-			NoAutoAuth: true,
+		Options: map[string]any{
+			"noAutoAuth": true,
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `noAutoAuth: true`)
+	assertContains(t, body, `"noAutoAuth":true`)
 }
 
 func TestReDocDefaultOptions(t *testing.T) {
@@ -717,8 +701,6 @@ func TestOAuth2RedirectURL(t *testing.T) {
 }
 
 // --- helpers ---
-
-func intPtrHelper(v int) *int { return IntPtr(v) }
 
 func assertContains(t *testing.T, s, substr string) {
 	t.Helper()

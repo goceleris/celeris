@@ -8,17 +8,6 @@ import (
 	"github.com/goceleris/celeris"
 )
 
-// IntPtr returns a pointer to v. Use this helper to set
-// [UIConfig].DefaultModelsExpandDepth to zero or other values that
-// would otherwise be indistinguishable from an unset field:
-//
-//	swagger.Config{
-//	    UI: swagger.UIConfig{
-//	        DefaultModelsExpandDepth: swagger.IntPtr(0),
-//	    },
-//	}
-func IntPtr(v int) *int { return &v }
-
 // UIRenderer selects the frontend used to render the API specification.
 type UIRenderer string
 
@@ -49,19 +38,20 @@ type UIConfig struct {
 	PersistAuthorization bool
 
 	// DefaultModelsExpandDepth controls how deep models are expanded.
-	// Default 1 (nil pointer means use default). Set to -1 to completely
-	// hide models. Use [IntPtr] to set to zero (show model name only):
-	//
-	//	DefaultModelsExpandDepth: swagger.IntPtr(0)
-	//
+	// Default: 0 (show model names). Set to 1 to expand one level,
+	// -1 to hide the models section entirely.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
-	DefaultModelsExpandDepth *int
+	DefaultModelsExpandDepth int
 
 	// OAuth2RedirectURL sets the OAuth2 redirect URL for Swagger UI.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	OAuth2RedirectURL string
 
 	// OAuth2 pre-fills the OAuth2 authorization dialog in Swagger UI.
+	// WARNING: all values including ClientSecret are embedded in the HTML
+	// page source and visible to anyone who can access the page. Only use
+	// ClientSecret for development or test environments. In production,
+	// use PKCE (public clients) which do not require a secret.
 	// When nil, no OAuth2 initialization is emitted.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	OAuth2 *OAuth2Config
@@ -82,25 +72,6 @@ type OAuth2Config struct {
 	AppName string
 	// Scopes lists the default OAuth2 scopes to request.
 	Scopes []string
-}
-
-// ReDocConfig configures ReDoc-specific options. These fields are ignored
-// when [Config].Renderer is not [RendererReDoc].
-type ReDocConfig struct {
-	// Theme sets the ReDoc theme. Valid values: "light", "dark".
-	// Default: "" (ReDoc default, which is light).
-	Theme string
-	// ExpandResponses controls which response codes are expanded.
-	// Comma-separated list of codes (e.g. "200,201") or "all".
-	// Default: "" (none expanded).
-	ExpandResponses string
-	// HideDownloadButton hides the "Download" button for the spec.
-	HideDownloadButton bool
-	// ScrollYOffset sets the vertical scroll offset in pixels.
-	// Default: 0.
-	ScrollYOffset int
-	// NoAutoAuth disables automatic authentication.
-	NoAutoAuth bool
 }
 
 // Config defines the swagger middleware configuration.
@@ -137,9 +108,25 @@ type Config struct {
 	// UI controls the appearance and behavior of the UI renderer.
 	UI UIConfig
 
-	// ReDoc configures ReDoc-specific options. Ignored when Renderer is
-	// not [RendererReDoc].
-	ReDoc ReDocConfig
+	// Options provides renderer-specific configuration as a JSON-serializable
+	// map. For Swagger UI, these are passed to SwaggerUIBundle(). For ReDoc,
+	// these are passed to Redoc.init(). For Scalar, these are passed as
+	// data-configuration. When nil, renderer defaults are used.
+	//
+	// Example (ReDoc dark theme):
+	//
+	//	swagger.Config{
+	//	    SpecContent: spec,
+	//	    Renderer:    swagger.RendererReDoc,
+	//	    Options: map[string]any{
+	//	        "theme": map[string]any{
+	//	            "colors": map[string]any{"primary": map[string]any{"main": "#32329f"}},
+	//	        },
+	//	        "expandResponses": "200,201",
+	//	        "hideDownloadButton": true,
+	//	    },
+	//	}
+	Options map[string]any
 
 	// AssetsPath, when set, serves Swagger UI assets from a local path
 	// instead of the default CDN. The HTML template references scripts and
@@ -174,9 +161,6 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.UI.DocExpansion == "" {
 		cfg.UI.DocExpansion = defaultConfig.UI.DocExpansion
-	}
-	if cfg.UI.DefaultModelsExpandDepth == nil {
-		cfg.UI.DefaultModelsExpandDepth = IntPtr(1)
 	}
 	if cfg.UI.Title == "" {
 		cfg.UI.Title = defaultConfig.UI.Title

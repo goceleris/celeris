@@ -1,9 +1,9 @@
 // Package swagger provides OpenAPI specification viewer middleware for
 // celeris.
 //
-// The middleware serves a Swagger UI (or Scalar) page and the raw OpenAPI
-// spec at configurable URL paths. It supports both JSON and YAML specs
-// with automatic content-type detection.
+// The middleware serves a Swagger UI (or Scalar / ReDoc) page and the raw
+// OpenAPI spec at configurable URL paths. It supports both JSON and YAML
+// specs with automatic content-type detection.
 //
 // Basic usage with an embedded spec:
 //
@@ -22,10 +22,11 @@
 //	    SpecContent: spec,
 //	    BasePath:    "/docs",
 //	    UI: swagger.UIConfig{
-//	        DocExpansion:         "full",
-//	        DeepLinking:          true,
-//	        PersistAuthorization: true,
-//	        Title:                "My API",
+//	        DocExpansion:             "full",
+//	        DeepLinking:              true,
+//	        PersistAuthorization:     true,
+//	        DefaultModelsExpandDepth: 1,
+//	        Title:                    "My API",
 //	    },
 //	}))
 //
@@ -47,29 +48,28 @@
 // DefaultModelsExpandDepth) apply only to Swagger UI and are ignored when
 // Renderer is Scalar or ReDoc.
 //
-// Use [IntPtr] when setting [UIConfig].DefaultModelsExpandDepth to zero
-// (show model name only) to distinguish it from the unset nil pointer:
+// # Renderer-Specific Options
 //
-//	UI: swagger.UIConfig{
-//	    DefaultModelsExpandDepth: swagger.IntPtr(0),
-//	}
+// Use [Config].Options to pass renderer-specific configuration as a
+// JSON-serializable map. For ReDoc these are passed to Redoc.init(),
+// for Scalar they become the data-configuration attribute, and for
+// Swagger UI they are passed to SwaggerUIBundle().
 //
-// # ReDoc Customization
-//
-// When using ReDoc, configure theme, expanded responses, and other options
-// via [Config].ReDoc:
+// ReDoc dark theme example:
 //
 //	server.Use(swagger.New(swagger.Config{
 //	    SpecContent: spec,
 //	    Renderer:    swagger.RendererReDoc,
-//	    ReDoc: swagger.ReDocConfig{
-//	        Theme:              "dark",
-//	        ExpandResponses:    "200,201",
-//	        HideDownloadButton: true,
+//	    Options: map[string]any{
+//	        "theme": map[string]any{
+//	            "colors": map[string]any{"primary": map[string]any{"main": "#32329f"}},
+//	        },
+//	        "expandResponses":    "200,201",
+//	        "hideDownloadButton": true,
 //	    },
 //	}))
 //
-// [ReDocConfig] fields are ignored when Renderer is not [RendererReDoc].
+// When Options is nil, each renderer uses its own defaults.
 //
 // # OAuth2 Pre-Configuration
 //
@@ -87,6 +87,11 @@
 //	        },
 //	    },
 //	}))
+//
+// WARNING: all [OAuth2Config] values including ClientSecret are embedded in
+// the HTML page source and visible to anyone who can access the page. Only
+// use ClientSecret for development or test environments. In production, use
+// PKCE (public clients) which do not require a secret.
 //
 // OAuth2 fields are ignored when Renderer is not [RendererSwaggerUI].
 //

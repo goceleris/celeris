@@ -55,8 +55,8 @@ type Config struct {
 	// Compress enables serving pre-compressed files. When true, the middleware
 	// checks for .br (Brotli) and .gz (gzip) variants of the requested file
 	// and serves them if the client accepts the encoding via Accept-Encoding.
-	// Brotli is preferred over gzip when both are accepted. Only applies to
-	// OS filesystem (Root), not fs.FS.
+	// Brotli is preferred over gzip when both are accepted. Works with both
+	// OS filesystem (Root) and fs.FS.
 	Compress bool
 }
 
