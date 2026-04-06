@@ -2,6 +2,7 @@ package static_test
 
 import (
 	"embed"
+	"time"
 
 	"github.com/goceleris/celeris/middleware/static"
 )
@@ -29,5 +30,23 @@ func ExampleNew_embedFS() {
 	_ = static.New(static.Config{
 		FS:     embeddedFS,
 		Prefix: "/assets",
+	})
+}
+
+func ExampleNew_spa() {
+	// Serve a single-page application: non-existent paths fall back to
+	// index.html so the client-side router can handle them.
+	_ = static.New(static.Config{
+		Root: "./dist",
+		SPA:  true,
+	})
+}
+
+func ExampleNew_maxAge() {
+	// Set a 24-hour Cache-Control max-age alongside the automatic ETag
+	// and Last-Modified headers.
+	_ = static.New(static.Config{
+		Root:   "./public",
+		MaxAge: 24 * time.Hour,
 	})
 }

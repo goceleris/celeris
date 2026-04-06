@@ -7,6 +7,11 @@
 //	corsHandler := cors.Handler(cors.Options{AllowedOrigins: []string{"*"}})
 //	server.Use(adapters.WrapMiddleware(corsHandler))
 //
+// Warning: Do not use both adapters.WrapMiddleware with a stdlib CORS
+// library (e.g., rs/cors) AND the native celeris/middleware/cors in the
+// same chain. This produces duplicate Access-Control-* headers and
+// conflicting preflight handling. Use one or the other.
+//
 // For converting celeris handlers to stdlib, use [celeris.ToHandler] directly.
 //
 // # How It Works
@@ -46,4 +51,8 @@
 // The proxy automatically sets X-Forwarded-For, X-Forwarded-Host, and
 // X-Forwarded-Proto via [net/http/httputil.ProxyRequest.SetXForwarded].
 // Panics if target is nil.
+//
+// ReverseProxy delegates to [celeris.Adapt], which buffers the response.
+// Streaming responses (SSE, WebSocket upgrade) are not supported through
+// the proxy.
 package adapters

@@ -16,6 +16,8 @@ const (
 	RendererSwaggerUI UIRenderer = "swagger-ui"
 	// RendererScalar uses Scalar API reference.
 	RendererScalar UIRenderer = "scalar"
+	// RendererReDoc uses ReDoc API reference.
+	RendererReDoc UIRenderer = "redoc"
 )
 
 // UIConfig controls the appearance and behavior of the Swagger UI or
@@ -24,17 +26,23 @@ type UIConfig struct {
 	// DocExpansion controls how operations are displayed on first load.
 	// Valid values: "list" (default, expand tags), "full" (expand everything),
 	// "none" (collapse all).
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	DocExpansion string
 
 	// DeepLinking enables deep linking for tags and operations.
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	DeepLinking bool
 
 	// PersistAuthorization persists authorization data across browser sessions.
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	PersistAuthorization bool
 
 	// DefaultModelsExpandDepth controls how deep models are expanded.
-	// Default 1. Set to -1 to completely hide models.
-	DefaultModelsExpandDepth int
+	// Default 1 (nil). Set to -1 to completely hide models.
+	// Use a pointer to distinguish zero (valid: "expand 0 levels") from
+	// unset (nil: use default 1).
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
+	DefaultModelsExpandDepth *int
 
 	// Title is the HTML page title. Default: "API Documentation".
 	Title string
@@ -93,11 +101,12 @@ var defaultConfig = Config{
 	BasePath: "/swagger",
 	Renderer: RendererSwaggerUI,
 	UI: UIConfig{
-		DocExpansion:             "list",
-		DefaultModelsExpandDepth: 1,
-		Title:                    "API Documentation",
+		DocExpansion: "list",
+		Title:        "API Documentation",
 	},
 }
+
+func intPtr(v int) *int { return &v }
 
 func applyDefaults(cfg Config) Config {
 	if cfg.BasePath == "" {
@@ -109,8 +118,8 @@ func applyDefaults(cfg Config) Config {
 	if cfg.UI.DocExpansion == "" {
 		cfg.UI.DocExpansion = defaultConfig.UI.DocExpansion
 	}
-	if cfg.UI.DefaultModelsExpandDepth == 0 {
-		cfg.UI.DefaultModelsExpandDepth = defaultConfig.UI.DefaultModelsExpandDepth
+	if cfg.UI.DefaultModelsExpandDepth == nil {
+		cfg.UI.DefaultModelsExpandDepth = intPtr(1)
 	}
 	if cfg.UI.Title == "" {
 		cfg.UI.Title = defaultConfig.UI.Title
@@ -126,7 +135,7 @@ func (cfg Config) validate() {
 		panic("swagger: either SpecContent or SpecURL must be set")
 	}
 	switch cfg.Renderer {
-	case RendererSwaggerUI, RendererScalar:
+	case RendererSwaggerUI, RendererScalar, RendererReDoc:
 		// valid
 	default:
 		panic(fmt.Sprintf("swagger: unknown Renderer %q", cfg.Renderer))

@@ -36,6 +36,17 @@
 //	    Renderer:    swagger.RendererScalar,
 //	}))
 //
+// Using ReDoc instead of Swagger UI:
+//
+//	server.Use(swagger.New(swagger.Config{
+//	    SpecContent: spec,
+//	    Renderer:    swagger.RendererReDoc,
+//	}))
+//
+// Note that [UIConfig] options (DocExpansion, DeepLinking, PersistAuthorization,
+// DefaultModelsExpandDepth) apply only to Swagger UI and are ignored when
+// Renderer is Scalar or ReDoc.
+//
 // External spec URL (no /spec endpoint registered):
 //
 //	server.Use(swagger.New(swagger.Config{

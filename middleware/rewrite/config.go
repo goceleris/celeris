@@ -9,9 +9,14 @@ import (
 // Rule defines a single rewrite rule.
 type Rule struct {
 	// Pattern is a Go regular expression matched against the request path.
+	// Use ^ and $ anchors for exact path matching.
 	Pattern string
 	// Replacement is the replacement string with capture group support ($1, $2).
 	Replacement string
+	// RedirectCode overrides [Config].RedirectCode for this rule.
+	// When non-zero, this rule sends an HTTP redirect instead of a silent rewrite.
+	// When zero (default), the config-level RedirectCode is used.
+	RedirectCode int
 }
 
 // Config defines the rewrite middleware configuration.
@@ -45,11 +50,23 @@ func (cfg Config) validate() {
 		panic("rewrite: Rules must not be empty")
 	}
 	if cfg.RedirectCode != 0 {
-		switch cfg.RedirectCode {
-		case 301, 302, 303, 307, 308:
-			// valid redirect codes
-		default:
-			panic(fmt.Sprintf("rewrite: RedirectCode must be 0 (silent) or a redirect status (301, 302, 303, 307, 308), got %d", cfg.RedirectCode))
+		validateRedirectCode("RedirectCode", cfg.RedirectCode)
+	}
+	for i, r := range cfg.Rules {
+		if r.Pattern == "" {
+			panic(fmt.Sprintf("rewrite: Rules[%d].Pattern must not be empty", i))
 		}
+		if r.RedirectCode != 0 {
+			validateRedirectCode(fmt.Sprintf("Rules[%d].RedirectCode", i), r.RedirectCode)
+		}
+	}
+}
+
+func validateRedirectCode(field string, code int) {
+	switch code {
+	case 301, 302, 303, 307, 308:
+		// valid
+	default:
+		panic(fmt.Sprintf("rewrite: %s must be 0 (silent) or a redirect status (301, 302, 303, 307, 308), got %d", field, code))
 	}
 }

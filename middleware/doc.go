@@ -10,6 +10,11 @@
 //	rewrite        — regex-based URL rewriting (pattern → replacement)
 //	methodoverride — override POST method via _method form field or header
 //
+// Order matters: install proxy first (sets real client IP/scheme for all
+// downstream middleware), then redirect (uses scheme from proxy), then
+// rewrite (modifies path after redirect normalizes the URL), then
+// methodoverride (after path is finalized).
+//
 // # Recommended Middleware Ordering (Server.Use)
 //
 // Install middleware in this order so each layer sees the right context:

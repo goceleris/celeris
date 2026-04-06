@@ -66,9 +66,8 @@ func TestNonSwaggerPathPassesThrough(t *testing.T) {
 func TestPOSTReturns405(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{SpecContent: jsonSpec})
-	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "POST", "/swagger/")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 405)
+	_, err := testutil.RunMiddlewareWithMethod(t, mw, "POST", "/swagger/")
+	testutil.AssertHTTPError(t, err, 405)
 }
 
 func TestHEADMethodAllowed(t *testing.T) {
@@ -160,7 +159,7 @@ func TestUIConfigSwaggerUI(t *testing.T) {
 			DocExpansion:             "full",
 			DeepLinking:              true,
 			PersistAuthorization:     true,
-			DefaultModelsExpandDepth: -1,
+			DefaultModelsExpandDepth: intPtrHelper(-1),
 			Title:                    "My API",
 		},
 	})
@@ -199,7 +198,7 @@ func TestScalarRenderer(t *testing.T) {
 	testutil.AssertStatus(t, rec, 200)
 	body := rec.BodyString()
 	assertContains(t, body, "api-reference")
-	assertContains(t, body, "@scalar/api-reference")
+	assertContains(t, body, "@scalar/api-reference@1")
 	assertContains(t, body, `<title>API Documentation</title>`)
 }
 
@@ -309,9 +308,8 @@ func TestSpecURL(t *testing.T) {
 	testutil.AssertBodyContains(t, rec, "petstore.swagger.io")
 
 	// Spec endpoint returns 404 since content is external.
-	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/spec")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 404)
+	_, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/spec")
+	testutil.AssertHTTPError(t, err, 404)
 }
 
 func TestSkipBypassesSwagger(t *testing.T) {
@@ -373,7 +371,7 @@ func TestValidatePanicsUnknownRenderer(t *testing.T) {
 			t.Fatal("expected panic for unknown renderer")
 		}
 	}()
-	New(Config{SpecContent: jsonSpec, Renderer: "redoc"})
+	New(Config{SpecContent: jsonSpec, Renderer: "unknown-renderer"})
 }
 
 func TestValidatePanicsUnknownDocExpansion(t *testing.T) {
@@ -400,8 +398,8 @@ func TestApplyDefaultsFillsEmpty(t *testing.T) {
 	if cfg.UI.DocExpansion != "list" {
 		t.Fatalf("DocExpansion: got %q, want list", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth != 1 {
-		t.Fatalf("DefaultModelsExpandDepth: got %d, want 1", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth == nil || *cfg.UI.DefaultModelsExpandDepth != 1 {
+		t.Fatalf("DefaultModelsExpandDepth: got %v, want 1", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "API Documentation" {
 		t.Fatalf("Title: got %q, want API Documentation", cfg.UI.Title)
@@ -415,7 +413,7 @@ func TestApplyDefaultsPreservesCustom(t *testing.T) {
 		Renderer: RendererScalar,
 		UI: UIConfig{
 			DocExpansion:             "full",
-			DefaultModelsExpandDepth: -1,
+			DefaultModelsExpandDepth: intPtrHelper(-1),
 			Title:                    "Custom",
 		},
 	})
@@ -428,8 +426,8 @@ func TestApplyDefaultsPreservesCustom(t *testing.T) {
 	if cfg.UI.DocExpansion != "full" {
 		t.Fatalf("DocExpansion: got %q, want full", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth != -1 {
-		t.Fatalf("DefaultModelsExpandDepth: got %d, want -1", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth == nil || *cfg.UI.DefaultModelsExpandDepth != -1 {
+		t.Fatalf("DefaultModelsExpandDepth: got %v, want -1", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "Custom" {
 		t.Fatalf("Title: got %q, want Custom", cfg.UI.Title)
@@ -452,7 +450,95 @@ func FuzzSwaggerPaths(f *testing.F) {
 	})
 }
 
+// --- HEAD on spec ---
+
+func TestHEADOnSpec(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{SpecContent: jsonSpec})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "HEAD", "/swagger/spec")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertHeaderContains(t, rec, "content-type", "application/json")
+}
+
+// --- DocExpansion none ---
+
+func TestDocExpansionNone(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		UI:          UIConfig{DocExpansion: "none"},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `docExpansion: "none"`)
+}
+
+// --- ReDoc ---
+
+func TestReDocRenderer(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	body := rec.BodyString()
+	assertContains(t, body, `redoc-container`)
+	assertContains(t, body, `Redoc.init`)
+	assertContains(t, body, `redoc.standalone.js`)
+	assertContains(t, body, `<title>API Documentation</title>`)
+}
+
+func TestReDocRendererWithTitle(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		UI:          UIConfig{Title: "ReDoc API"},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `<title>ReDoc API</title>`)
+}
+
+func TestAssetsPathReDoc(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		AssetsPath:  "/local-redoc",
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `/local-redoc/redoc.standalone.js`)
+	assertNotContains(t, body, "cdn.jsdelivr.net")
+}
+
+// --- DefaultModelsExpandDepth zero ---
+
+func TestDefaultModelsExpandDepthZero(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		UI: UIConfig{
+			DefaultModelsExpandDepth: intPtrHelper(0),
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `defaultModelsExpandDepth: 0`)
+}
+
 // --- helpers ---
+
+func intPtrHelper(v int) *int { return &v }
 
 func assertContains(t *testing.T, s, substr string) {
 	t.Helper()

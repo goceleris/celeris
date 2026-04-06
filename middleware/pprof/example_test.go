@@ -23,12 +23,22 @@ func ExampleNew_customPrefix() {
 	}))
 }
 
-func ExampleNew_publicAccess() {
+func ExampleNew_tokenAuth() {
 	server := celeris.New(celeris.Config{})
 
+	// Token-based authentication via environment variable.
 	server.Use(pprof.New(pprof.Config{
 		AuthFunc: func(c *celeris.Context) bool {
 			return c.Header("x-pprof-token") == os.Getenv("PPROF_TOKEN")
 		},
+	}))
+}
+
+func ExampleNew_publicAccess() {
+	server := celeris.New(celeris.Config{})
+
+	// Allow all clients (disable loopback-only restriction).
+	server.Use(pprof.New(pprof.Config{
+		AuthFunc: func(_ *celeris.Context) bool { return true },
 	}))
 }

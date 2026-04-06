@@ -3,6 +3,7 @@ package adapters
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -12,6 +13,10 @@ import (
 
 	"github.com/goceleris/celeris"
 )
+
+const maxCaptureBytes = 100 << 20 // 100MB, matching core bridge
+
+var errCaptureResponseTooLarge = errors.New("adapters: response body exceeds 100MB limit")
 
 // WrapMiddleware adapts a standard net/http middleware (func(http.Handler) http.Handler)
 // into a celeris HandlerFunc. The adapted middleware receives a reconstructed
@@ -25,6 +30,9 @@ import (
 // When the stdlib middleware does NOT call the inner handler (e.g., it returns
 // an early 403), the captured response is written back via c.Blob.
 func WrapMiddleware(mw func(http.Handler) http.Handler) celeris.HandlerFunc {
+	if mw == nil {
+		panic("adapters: WrapMiddleware argument must not be nil")
+	}
 	return func(c *celeris.Context) error {
 		rec := acquireCapture()
 		defer releaseCapture(rec)
@@ -147,6 +155,9 @@ func (w *responseCapture) Header() http.Header {
 func (w *responseCapture) Write(b []byte) (int, error) {
 	if w.code == 0 {
 		w.code = http.StatusOK
+	}
+	if w.body.Len()+len(b) > maxCaptureBytes {
+		return 0, errCaptureResponseTooLarge
 	}
 	return w.body.Write(b)
 }

@@ -11,8 +11,13 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"testing/fstest"
+
 	"github.com/goceleris/celeris/middleware/adapters"
 	"github.com/goceleris/celeris/middleware/circuitbreaker"
+	"github.com/goceleris/celeris/middleware/pprof"
+	"github.com/goceleris/celeris/middleware/static"
+	"github.com/goceleris/celeris/middleware/swagger"
 	"github.com/goceleris/celeris/middleware/cors"
 	"github.com/goceleris/celeris/middleware/etag"
 	"github.com/goceleris/celeris/middleware/methodoverride"
@@ -602,6 +607,79 @@ func BenchmarkChainWithWrapMiddleware(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainPprofPassthrough benchmarks pprof on a non-matching path (zero overhead).
+func BenchmarkChainPprofPassthrough(b *testing.B) {
+	chain := []celeris.HandlerFunc{
+		requestid.New(),
+		recovery.New(recovery.Config{DisableLogStack: true}),
+		pprof.New(pprof.Config{AuthFunc: func(_ *celeris.Context) bool { return true }}),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainSwaggerPassthrough benchmarks swagger on a non-matching path.
+func BenchmarkChainSwaggerPassthrough(b *testing.B) {
+	chain := []celeris.HandlerFunc{
+		requestid.New(),
+		recovery.New(recovery.Config{DisableLogStack: true}),
+		swagger.New(swagger.Config{SpecContent: []byte(`{"openapi":"3.0.0"}`)}),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainStaticPassthrough benchmarks static on a non-matching method (POST).
+func BenchmarkChainStaticPassthrough(b *testing.B) {
+	fsys := fstest.MapFS{"index.html": {Data: []byte("<html>index</html>")}}
+	chain := []celeris.HandlerFunc{
+		requestid.New(),
+		recovery.New(recovery.Config{DisableLogStack: true}),
+		static.New(static.Config{FS: fsys}),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("POST", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainStaticServe benchmarks static serving a file from fs.FS + etag.
+func BenchmarkChainStaticServe(b *testing.B) {
+	fsys := fstest.MapFS{"style.css": {Data: []byte("body{}")}}
+	chain := []celeris.HandlerFunc{
+		recovery.New(recovery.Config{DisableLogStack: true}),
+		etag.New(),
+		static.New(static.Config{FS: fsys}),
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/style.css", opts...)
 		_ = ctx.Next()
 		celeristest.ReleaseContext(ctx)
 	}

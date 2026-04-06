@@ -236,4 +236,61 @@ func TestValidatePanics(t *testing.T) {
 			Rules: []Rule{{Pattern: "[invalid", Replacement: "/new"}},
 		})
 	})
+
+	t.Run("empty pattern", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for empty Pattern")
+			}
+		}()
+		New(Config{
+			Rules: []Rule{{Pattern: "", Replacement: "/new"}},
+		})
+	})
+
+	t.Run("invalid per-rule redirect code", func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic for invalid per-rule RedirectCode")
+			}
+		}()
+		New(Config{
+			Rules: []Rule{{Pattern: "^/old$", Replacement: "/new", RedirectCode: 200}},
+		})
+	})
+}
+
+func TestRewritePerRuleRedirect(t *testing.T) {
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new", RedirectCode: 301},
+			{Pattern: "^/temp$", Replacement: "/dest", RedirectCode: 307},
+			{Pattern: "^/silent$", Replacement: "/rewritten"},
+		},
+	})
+
+	// First rule: 301 redirect
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/old",
+		celeristest.WithScheme("https"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 301)
+	testutil.AssertHeader(t, rec, "location", "https://localhost/new")
+
+	// Second rule: 307 redirect
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/temp",
+		celeristest.WithScheme("https"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 307)
+	testutil.AssertHeader(t, rec, "location", "https://localhost/dest")
+
+	// Third rule: silent rewrite (no per-rule code, no config-level code)
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err = testutil.RunChain(t, chain, "GET", "/silent")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/rewritten" {
+		t.Fatalf("path: got %q, want %q", rec.BodyString(), "/rewritten")
+	}
 }

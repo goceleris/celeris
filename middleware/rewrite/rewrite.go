@@ -7,8 +7,9 @@ import (
 )
 
 type compiledRule struct {
-	pattern     *regexp.Regexp
-	replacement string
+	pattern      *regexp.Regexp
+	replacement  string
+	redirectCode int // 0 means use config-level default
 }
 
 // New creates a rewrite middleware with the given config. Rules are compiled
@@ -28,8 +29,9 @@ func New(config ...Config) celeris.HandlerFunc {
 	rules := make([]compiledRule, len(cfg.Rules))
 	for i, r := range cfg.Rules {
 		rules[i] = compiledRule{
-			pattern:     regexp.MustCompile(r.Pattern),
-			replacement: r.Replacement,
+			pattern:      regexp.MustCompile(r.Pattern),
+			replacement:  r.Replacement,
+			redirectCode: r.RedirectCode,
 		}
 	}
 
@@ -48,12 +50,18 @@ func New(config ...Config) celeris.HandlerFunc {
 			if r.pattern.MatchString(path) {
 				newPath := r.pattern.ReplaceAllString(path, r.replacement)
 
-				if redirectCode != 0 {
+				// Per-rule RedirectCode overrides config-level default.
+				code := r.redirectCode
+				if code == 0 {
+					code = redirectCode
+				}
+
+				if code != 0 {
 					url := c.Scheme() + "://" + c.Host() + newPath
 					if q := c.RawQuery(); q != "" {
 						url += "?" + q
 					}
-					return c.Redirect(redirectCode, url)
+					return c.Redirect(code, url)
 				}
 
 				c.SetPath(newPath)

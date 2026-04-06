@@ -12,8 +12,8 @@ type Config struct {
 	Skip func(c *celeris.Context) bool
 
 	// SkipPaths lists full paths to bypass entirely (exact match).
-	// Unlike Skip (which is only consulted for requests matching the prefix),
-	// SkipPaths is checked before any other logic.
+	// Only consulted for requests that match the prefix. Checked before
+	// authentication and handler dispatch.
 	SkipPaths []string
 
 	// Prefix is the URL path prefix for pprof endpoints.
@@ -56,5 +56,8 @@ func applyDefaults(cfg Config) Config {
 func (cfg Config) validate() {
 	if cfg.Prefix != "" && cfg.Prefix[0] != '/' {
 		panic("pprof: Prefix must start with /")
+	}
+	if cfg.Prefix == "/" {
+		panic("pprof: Prefix must not be / (would intercept all requests)")
 	}
 }

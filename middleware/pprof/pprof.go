@@ -7,6 +7,11 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+var (
+	errForbidden = celeris.NewHTTPError(403, "Forbidden")
+	errNotFound  = celeris.NewHTTPError(404, "Not Found")
+)
+
 // Pre-wrap all standard net/http/pprof handlers via celeris.Adapt at init
 // time so no allocation happens per-request.
 var (
@@ -65,7 +70,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		if authFunc != nil && !authFunc(c) {
-			return c.NoContent(403)
+			return errForbidden
 		}
 
 		switch path {
@@ -94,7 +99,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		case threadcreatePath:
 			return adaptedThreadcreate(c)
 		default:
-			return c.NoContent(404)
+			return errNotFound
 		}
 	}
 }

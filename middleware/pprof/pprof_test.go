@@ -39,11 +39,24 @@ func TestPprofHeap(t *testing.T) {
 
 func TestPprofDeniedRemote(t *testing.T) {
 	mw := New()
-	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/heap",
+	_, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/heap",
 		celeristest.WithRemoteAddr("1.2.3.4:9999"))
+	testutil.AssertHTTPError(t, err, 403)
+}
+
+func TestPprofDeniedIPv6Remote(t *testing.T) {
+	mw := New()
+	_, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/heap",
+		celeristest.WithRemoteAddr("2001:db8::1:9999"))
+	testutil.AssertHTTPError(t, err, 403)
+}
+
+func TestPprofAllowIPv6Loopback(t *testing.T) {
+	mw := New()
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/heap",
+		celeristest.WithRemoteAddr("[::1]:12345"))
 	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 403)
-	testutil.AssertBodyEmpty(t, rec)
+	testutil.AssertStatus(t, rec, 200)
 }
 
 func TestPprofCustomAuth(t *testing.T) {
@@ -81,10 +94,26 @@ func TestPprofPassthrough(t *testing.T) {
 
 func TestPprofNotFoundSubpath(t *testing.T) {
 	mw := New(Config{AuthFunc: openAuth()})
-	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/nonexistent")
+	_, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/nonexistent")
+	testutil.AssertHTTPError(t, err, 404)
+}
+
+func TestPprofBarePrefix(t *testing.T) {
+	mw := New(Config{AuthFunc: openAuth()})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof")
 	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 404)
-	testutil.AssertBodyEmpty(t, rec)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertBodyContains(t, rec, "profile")
+}
+
+func TestValidatePanicRootPrefix(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for Prefix=/")
+		}
+	}()
+	New(Config{Prefix: "/"})
 }
 
 func TestPprofSkipPaths(t *testing.T) {

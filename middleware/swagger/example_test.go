@@ -52,6 +52,17 @@ func ExampleNew_externalSpec() {
 	}))
 }
 
+func ExampleNew_redoc() {
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
+		SpecContent: spec,
+		Renderer:    swagger.RendererReDoc,
+	}))
+}
+
 func ExampleNew_localAssets() {
 	server := celeris.New(celeris.Config{})
 

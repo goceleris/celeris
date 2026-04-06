@@ -35,8 +35,16 @@ func New(config ...Config) celeris.HandlerFunc {
 	prefix := cfg.Prefix
 	index := cfg.Index
 	browse := cfg.Browse
+	spa := cfg.SPA
+	maxAge := cfg.MaxAge
 	root := cfg.Root
 	fsys := cfg.FS
+
+	// Precompute cleanRoot once instead of per request.
+	var cleanRoot string
+	if root != "" {
+		cleanRoot = filepath.Clean(root)
+	}
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -70,20 +78,20 @@ func New(config ...Config) celeris.HandlerFunc {
 		filePath = strings.TrimSuffix(filePath, "/")
 
 		if fsys != nil {
-			return serveFS(c, fsys, filePath, index, browse)
+			return serveFS(c, fsys, filePath, index, browse, spa, maxAge)
 		}
-		return serveOS(c, root, filePath, index, browse)
+		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge)
 	}
 }
 
 // serveOS serves a file from the OS filesystem using c.FileFromDir (which
 // handles directory traversal, symlink escape, and range requests).
-func serveOS(c *celeris.Context, root, filePath, index string, browse bool) error {
-	fullPath := filepath.Join(root, filepath.FromSlash(filePath))
+// cleanRoot must be filepath.Clean(root) — precomputed by New.
+func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, maxAge time.Duration) error {
+	fullPath := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
 
 	// Prevent directory traversal: filepath.Join resolves ".." segments,
 	// so verify the result stays within the root directory.
-	cleanRoot := filepath.Clean(root)
 	if fullPath != cleanRoot && !strings.HasPrefix(fullPath, cleanRoot+string(filepath.Separator)) {
 		return c.Next()
 	}
@@ -91,6 +99,9 @@ func serveOS(c *celeris.Context, root, filePath, index string, browse bool) erro
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if spa {
+				return c.FileFromDir(cleanRoot, index)
+			}
 			return c.Next()
 		}
 		return err
@@ -123,16 +134,16 @@ func serveOS(c *celeris.Context, root, filePath, index string, browse bool) erro
 		}
 	}
 
-	setCacheHeaders(c, info.ModTime(), info.Size())
-	if notModified(c, info.ModTime(), info.Size()) {
+	etag := setCacheHeaders(c, info.ModTime(), info.Size(), maxAge)
+	if notModified(c, etag, info.ModTime()) {
 		return c.NoContent(304)
 	}
 
-	return c.FileFromDir(root, filePath)
+	return c.FileFromDir(cleanRoot, filePath)
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
-func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse bool) error {
+func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa bool, maxAge time.Duration) error {
 	// fs.FS uses "." for the root directory.
 	openPath := filePath
 	if openPath == "" {
@@ -141,6 +152,9 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse bool
 
 	f, err := fsys.Open(openPath)
 	if err != nil {
+		if spa {
+			return serveFS(c, fsys, index, index, browse, false, maxAge)
+		}
 		return c.Next()
 	}
 	defer func() { _ = f.Close() }()
@@ -163,7 +177,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse bool
 			indexStat, statErr := indexFile.Stat()
 			_ = indexFile.Close()
 			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse)
+				return serveFS(c, fsys, indexPath, index, browse, spa, maxAge)
 			}
 		}
 		if browse {
@@ -179,8 +193,8 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse bool
 
 	modTime := stat.ModTime()
 	if !modTime.IsZero() {
-		setCacheHeaders(c, modTime, size)
-		if notModified(c, modTime, size) {
+		etag := setCacheHeaders(c, modTime, size, maxAge)
+		if notModified(c, etag, modTime) {
 			return c.NoContent(304)
 		}
 	}
@@ -190,8 +204,8 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse bool
 		contentType = "application/octet-stream"
 	}
 
-	data, err := io.ReadAll(f)
-	if err != nil {
+	data := make([]byte, size)
+	if _, err := io.ReadFull(f, data); err != nil {
 		return err
 	}
 
@@ -207,22 +221,28 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse bool
 	return c.Blob(200, contentType, data)
 }
 
-// setCacheHeaders sets Last-Modified and ETag headers from file metadata.
-func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64) {
+// setCacheHeaders sets Last-Modified, ETag, and Cache-Control headers from
+// file metadata. Returns the computed ETag string for reuse by notModified.
+func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, maxAge time.Duration) string {
 	if modTime.IsZero() {
-		return
+		return ""
 	}
 	c.SetHeader("last-modified", modTime.UTC().Format(http.TimeFormat))
-	c.SetHeader("etag", fmt.Sprintf(`W/"%x-%x"`, modTime.Unix(), size))
+	etag := fmt.Sprintf(`W/"%x-%x"`, modTime.Unix(), size)
+	c.SetHeader("etag", etag)
+	if maxAge > 0 {
+		c.SetHeader("cache-control", fmt.Sprintf("public, max-age=%d", int(maxAge.Seconds())))
+	}
+	return etag
 }
 
-// notModified checks If-None-Match and If-Modified-Since headers.
-// Returns true if the client already has a fresh copy.
-func notModified(c *celeris.Context, modTime time.Time, size int64) bool {
-	etag := fmt.Sprintf(`W/"%x-%x"`, modTime.Unix(), size)
-
-	if inm := c.Header("if-none-match"); inm == etag {
-		return true
+// notModified checks If-None-Match and If-Modified-Since headers per
+// RFC 7232 §6. Returns true if the client already has a fresh copy.
+func notModified(c *celeris.Context, etag string, modTime time.Time) bool {
+	if inm := c.Header("if-none-match"); inm != "" {
+		// If-None-Match is present: check it and skip If-Modified-Since
+		// regardless of whether it matches (RFC 7232 §6).
+		return etagMatch(inm, etag)
 	}
 
 	if ims := c.Header("if-modified-since"); ims != "" {
@@ -233,6 +253,28 @@ func notModified(c *celeris.Context, modTime time.Time, size int64) bool {
 		}
 	}
 
+	return false
+}
+
+// etagMatch reports whether the If-None-Match header value matches etag.
+// It handles comma-separated lists and weak comparison (strips W/ prefix).
+func etagMatch(inm, etag string) bool {
+	if inm == "*" {
+		return true
+	}
+	weak := func(s string) string {
+		s = strings.TrimSpace(s)
+		if strings.HasPrefix(s, "W/") {
+			return s[2:]
+		}
+		return s
+	}
+	target := weak(etag)
+	for _, part := range strings.Split(inm, ",") {
+		if weak(part) == target {
+			return true
+		}
+	}
 	return false
 }
 

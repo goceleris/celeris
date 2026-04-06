@@ -648,6 +648,159 @@ func TestHeadRequest(t *testing.T) {
 	}
 }
 
+func TestSPAMode(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, SPA: true})
+
+	// Non-existent file should serve index.html in SPA mode.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/app/dashboard")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "<html>index</html>" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "<html>index</html>")
+	}
+}
+
+func TestSPAModeFS(t *testing.T) {
+	fsys := fstest.MapFS{
+		"index.html": {Data: []byte("<html>spa</html>")},
+	}
+	mw := New(Config{FS: fsys, SPA: true})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/app/dashboard")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "<html>spa</html>" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "<html>spa</html>")
+	}
+}
+
+func TestSPAModeDisabled(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	rec, err := testutil.RunChain(t, chain, "GET", "/app/dashboard")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("expected fallthrough with SPA disabled, got %q", rec.BodyString())
+	}
+}
+
+func TestMaxAge(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, MaxAge: 24 * time.Hour})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	cc := rec.Header("cache-control")
+	if cc != "public, max-age=86400" {
+		t.Fatalf("cache-control: got %q, want %q", cc, "public, max-age=86400")
+	}
+}
+
+func TestMaxAgeZero(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	cc := rec.Header("cache-control")
+	if cc != "" {
+		t.Fatalf("expected no cache-control header, got %q", cc)
+	}
+}
+
+func TestHeadRequestFS(t *testing.T) {
+	modTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	fsys := fstest.MapFS{
+		"hello.txt": {
+			Data:    []byte("hello fs"),
+			ModTime: modTime,
+		},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "HEAD", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	etag := rec.Header("etag")
+	if etag == "" {
+		t.Fatal("expected etag header on HEAD request")
+	}
+	lm := rec.Header("last-modified")
+	if lm == "" {
+		t.Fatal("expected last-modified header on HEAD request")
+	}
+}
+
+func TestFS304WithIfModifiedSince(t *testing.T) {
+	modTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	fsys := fstest.MapFS{
+		"hello.txt": {
+			Data:    []byte("hello"),
+			ModTime: modTime,
+		},
+	}
+	mw := New(Config{FS: fsys})
+
+	// First request to get Last-Modified.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	lm := rec.Header("last-modified")
+
+	// Conditional request returns 304.
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt",
+		celeristest.WithHeader("if-modified-since", lm))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 304)
+}
+
+func TestIfNoneMatchMultipleETags(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	// First request to get ETag.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	etag := rec.Header("etag")
+
+	// Send comma-separated list of ETags including the matching one.
+	multiETags := fmt.Sprintf(`"nonexistent", %s, "other"`, etag)
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt",
+		celeristest.WithHeader("if-none-match", multiETags))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 304)
+
+	// Non-matching multi-ETags should return 200.
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt",
+		celeristest.WithHeader("if-none-match", `"aaa", "bbb"`))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+}
+
+func TestPrefixValidation(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for prefix without leading /")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "Prefix must start with /") {
+			t.Fatalf("unexpected panic: %v", r)
+		}
+	}()
+	New(Config{Root: "/tmp", Prefix: "bad"})
+}
+
 // fakeDirEntry implements fs.DirEntry for testing.
 type fakeDirEntry struct {
 	name  string

@@ -2,6 +2,7 @@ package static
 
 import (
 	"io/fs"
+	"time"
 
 	"github.com/goceleris/celeris"
 )
@@ -40,6 +41,16 @@ type Config struct {
 	// a directory without an index file.
 	// Default: false.
 	Browse bool
+
+	// SPA enables single-page application mode. When true, requests for
+	// non-existent files serve the index file instead of falling through
+	// to the next handler. Useful for single-page applications.
+	// Default: false.
+	SPA bool
+
+	// MaxAge sets the Cache-Control max-age directive. Zero means no
+	// Cache-Control header.
+	MaxAge time.Duration
 }
 
 var defaultConfig = Config{
@@ -60,5 +71,8 @@ func applyDefaults(cfg Config) Config {
 func (cfg Config) validate() {
 	if cfg.Root == "" && cfg.FS == nil {
 		panic("static: Root or FS must be set")
+	}
+	if cfg.Prefix != "" && cfg.Prefix[0] != '/' {
+		panic("static: Prefix must start with /")
 	}
 }

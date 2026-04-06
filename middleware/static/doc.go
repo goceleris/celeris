@@ -30,6 +30,14 @@
 // listing are URL-encoded in href attributes and HTML-escaped in display
 // text to prevent XSS via crafted filenames.
 //
+// # SPA Mode
+//
+// When [Config].SPA is true the middleware operates in single-page
+// application mode: requests for non-existent files serve the index file
+// (default index.html) instead of falling through to the next handler.
+// This allows client-side routers to handle arbitrary URL paths. Existing
+// files and directories are still served normally.
+//
 // # Caching
 //
 // The middleware sets Last-Modified and ETag headers based on file metadata.
@@ -39,6 +47,16 @@
 // The ETag is a weak validator computed from the file's modification time
 // and size: W/"<mtime_hex>-<size_hex>". For embed.FS files where ModTime
 // is zero, caching headers are omitted.
+//
+// # Cache-Control
+//
+// [Config].MaxAge sets the Cache-Control max-age directive. When MaxAge is
+// greater than zero the response includes a "public, max-age=N" header
+// (where N is seconds). When MaxAge is zero (the default) no Cache-Control
+// header is added. MaxAge works alongside ETag and Last-Modified: browsers
+// that have a cached copy within the max-age window skip the network
+// entirely, and once the window expires they can still use conditional
+// requests to validate freshness.
 //
 // # Range Requests
 //

@@ -2,6 +2,7 @@ package swagger
 
 import (
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/goceleris/celeris"
@@ -48,7 +49,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		method := c.Method()
 		if method != "GET" && method != "HEAD" {
-			return c.NoContent(405)
+			return celeris.NewHTTPError(405, "Method Not Allowed")
 		}
 
 		switch path {
@@ -58,7 +59,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.HTML(200, page)
 		case specPath:
 			if cfg.SpecContent == nil {
-				return c.NoContent(404)
+				return celeris.NewHTTPError(404, "Not Found")
 			}
 			return c.Blob(200, specContentType, cfg.SpecContent)
 		}
@@ -72,6 +73,8 @@ func buildPage(cfg Config, specURL string) string {
 	switch cfg.Renderer {
 	case RendererScalar:
 		return buildScalarPage(cfg, specURL)
+	case RendererReDoc:
+		return buildReDocPage(cfg, specURL)
 	default:
 		return buildSwaggerUIPage(cfg, specURL)
 	}
@@ -80,12 +83,17 @@ func buildPage(cfg Config, specURL string) string {
 func buildSwaggerUIPage(cfg Config, specURL string) string {
 	ui := cfg.UI
 
+	depth := 1
+	if ui.DefaultModelsExpandDepth != nil {
+		depth = *ui.DefaultModelsExpandDepth
+	}
+
 	var cssURL, bundleURL, presetURL string
 	if cfg.AssetsPath != "" {
 		base := strings.TrimRight(cfg.AssetsPath, "/")
-		cssURL = base + "/swagger-ui.css"
-		bundleURL = base + "/swagger-ui-bundle.js"
-		presetURL = base + "/swagger-ui-standalone-preset.js"
+		cssURL = html.EscapeString(base + "/swagger-ui.css")
+		bundleURL = html.EscapeString(base + "/swagger-ui-bundle.js")
+		presetURL = html.EscapeString(base + "/swagger-ui-standalone-preset.js")
 	} else {
 		const cdn = "https://unpkg.com/swagger-ui-dist@5"
 		cssURL = cdn + "/swagger-ui.css"
@@ -118,8 +126,8 @@ SwaggerUIBundle({
 });
 </script>
 </body>
-</html>`, ui.Title, cssURL, bundleURL, presetURL,
-		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization, ui.DefaultModelsExpandDepth)
+</html>`, html.EscapeString(ui.Title), cssURL, bundleURL, presetURL,
+		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization, depth)
 }
 
 func buildScalarPage(cfg Config, specURL string) string {
@@ -129,10 +137,10 @@ func buildScalarPage(cfg Config, specURL string) string {
 	if cfg.AssetsPath != "" {
 		base := strings.TrimRight(cfg.AssetsPath, "/")
 		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='{"theme":"default"}'></script>
-<script src="%s/standalone.min.js"></script>`, specURL, base)
+<script src="%s/standalone.min.js"></script>`, specURL, html.EscapeString(base))
 	} else {
 		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='{"theme":"default"}'></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>`, specURL)
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>`, specURL)
 	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
@@ -145,5 +153,33 @@ func buildScalarPage(cfg Config, specURL string) string {
 <body>
 %s
 </body>
-</html>`, ui.Title, scriptTag)
+</html>`, html.EscapeString(ui.Title), scriptTag)
+}
+
+func buildReDocPage(cfg Config, specURL string) string {
+	ui := cfg.UI
+
+	var jsURL string
+	if cfg.AssetsPath != "" {
+		base := strings.TrimRight(cfg.AssetsPath, "/")
+		jsURL = html.EscapeString(base + "/redoc.standalone.js")
+	} else {
+		jsURL = "https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"
+	}
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+</head>
+<body>
+<div id="redoc-container"></div>
+<script src="%s"></script>
+<script>
+Redoc.init(%q, {}, document.getElementById("redoc-container"));
+</script>
+</body>
+</html>`, html.EscapeString(ui.Title), jsURL, specURL)
 }
