@@ -881,12 +881,12 @@ type seekerFileInfo struct {
 	modTime time.Time
 }
 
-func (fi *seekerFileInfo) Name() string      { return fi.name }
-func (fi *seekerFileInfo) Size() int64       { return fi.size }
-func (fi *seekerFileInfo) Mode() fs.FileMode { return 0o444 }
+func (fi *seekerFileInfo) Name() string       { return fi.name }
+func (fi *seekerFileInfo) Size() int64        { return fi.size }
+func (fi *seekerFileInfo) Mode() fs.FileMode  { return 0o444 }
 func (fi *seekerFileInfo) ModTime() time.Time { return fi.modTime }
-func (fi *seekerFileInfo) IsDir() bool       { return false }
-func (fi *seekerFileInfo) Sys() any          { return nil }
+func (fi *seekerFileInfo) IsDir() bool        { return false }
+func (fi *seekerFileInfo) Sys() any           { return nil }
 
 func TestServeFSReadSeeker(t *testing.T) {
 	data := []byte("0123456789abcdef")
