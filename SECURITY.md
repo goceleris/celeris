@@ -9,6 +9,15 @@
 
 Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
 
+### v1.3.2 Security Improvements
+
+v1.3.2 includes a security fix and hardening in the new resilience middleware:
+
+- **Singleflight cross-user data leakage (fixed)**: The default deduplication key now includes `Authorization` and `Cookie` request headers. Without this, concurrent authenticated requests to the same endpoint would be coalesced, leaking one user's response (including PII, session cookies) to another user. Custom `KeyFunc` implementations must incorporate user identity for authenticated endpoints.
+- **Singleflight multi-value header replay (fixed)**: Waiter response replay now uses `SetResponseHeaders` (bulk replace) instead of a `SetHeader` loop, preserving multi-value headers like `Set-Cookie`. The previous implementation dropped all but the last value for duplicate header keys.
+- **Circuit breaker panic recording**: Handler panics are now recorded as failures in the sliding window via `defer/recover` before re-panicking. Previously, panics bypassed the circuit breaker entirely, making it blind to panic-heavy failure modes.
+- **Circuit breaker validation hardened**: `validate()` now rejects negative `CooldownPeriod`, `HalfOpenMax < 1`, `WindowSize < 10ms`, and `MinRequests < 1`. Previously only `Threshold` was validated, allowing configurations that caused division-by-zero panics or permanently stuck breakers.
+
 ### v1.3.1 Security Improvements
 
 v1.3.1 includes security hardening in the new HTTP transport middleware and core:

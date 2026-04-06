@@ -55,7 +55,12 @@ All middleware lives under `middleware/`. Each package follows a consistent patt
 - `bench_test.go` — Benchmarks with `b.ReportAllocs()`
 - `example_test.go` — Runnable examples for godoc
 
-When adding middleware, use `celeris.SkipHelper` for skip logic (not manual `skipMap`). See `middleware/recovery` or `middleware/cors` for reference implementations.
+When adding middleware, use `celeris.SkipHelper` for skip logic (not manual `skipMap`). Reference implementations by complexity:
+
+- **Simple**: `middleware/recovery`, `middleware/cors` — basic middleware with no shared state
+- **Stateful**: `middleware/ratelimit`, `middleware/circuitbreaker` — shared state with atomic counters, background cleanup, sliding windows
+- **Response-transform**: `middleware/etag`, `middleware/compress` — BufferResponse/FlushResponse pattern
+- **Request-coalescing**: `middleware/singleflight` — embedded singleflight group with response fan-out
 
 ### Linux Testing from macOS
 
