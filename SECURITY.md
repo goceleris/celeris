@@ -9,6 +9,14 @@
 
 Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
 
+### v1.3.3 Security Improvements
+
+v1.3.3 includes security-hardened defaults in three new middleware packages:
+
+- **Pprof loopback-only default**: The pprof middleware restricts access to loopback IPs (127.0.0.1, ::1) by default. Exposing Go profiling data to untrusted networks reveals goroutine stacks, heap contents, and source code paths.
+- **Static path traversal protection**: The static middleware uses celeris's FileFromDir (with symlink resolution and prefix verification) for OS filesystem access. For fs.FS, paths are cleaned and .. components are rejected.
+- **Swagger AuthFunc**: The swagger middleware optionally accepts an AuthFunc for protecting spec and UI endpoints. OpenAPI specs may reveal internal API structure.
+
 ### v1.3.2 Security Improvements
 
 v1.3.2 includes a security fix and hardening in the new resilience middleware:
