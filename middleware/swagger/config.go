@@ -1,6 +1,7 @@
 package swagger
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -38,10 +39,11 @@ type UIConfig struct {
 	PersistAuthorization bool
 
 	// DefaultModelsExpandDepth controls how deep models are expanded.
-	// Default: 1 (expand one level). Set to -1 to hide the models section
-	// entirely. Note: 0 is treated as unset and defaults to 1.
+	// Default: nil (Swagger UI default, which is 1). Use [IntPtr] to set
+	// an explicit value: IntPtr(0) for model names only, IntPtr(-1) to
+	// hide the models section entirely.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
-	DefaultModelsExpandDepth int
+	DefaultModelsExpandDepth *int
 
 	// OAuth2RedirectURL sets the OAuth2 redirect URL for Swagger UI.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
@@ -143,6 +145,13 @@ type Config struct {
 	AssetsPath string
 }
 
+// IntPtr returns a pointer to v. Use with [UIConfig].DefaultModelsExpandDepth
+// to distinguish explicit zero from unset:
+//
+//	swagger.IntPtr(0)  // show model names only
+//	swagger.IntPtr(-1) // hide models section
+func IntPtr(v int) *int { return &v }
+
 var defaultConfig = Config{
 	BasePath: "/swagger",
 	Renderer: RendererSwaggerUI,
@@ -165,9 +174,6 @@ func applyDefaults(cfg Config) Config {
 	if cfg.UI.Title == "" {
 		cfg.UI.Title = defaultConfig.UI.Title
 	}
-	if cfg.UI.DefaultModelsExpandDepth == 0 {
-		cfg.UI.DefaultModelsExpandDepth = 1
-	}
 	return cfg
 }
 
@@ -189,6 +195,11 @@ func (cfg Config) validate() {
 		// valid
 	default:
 		panic(fmt.Sprintf("swagger: unknown DocExpansion %q", cfg.UI.DocExpansion))
+	}
+	if cfg.Options != nil {
+		if _, err := json.Marshal(cfg.Options); err != nil {
+			panic(fmt.Sprintf("swagger: Options is not JSON-serializable: %v", err))
+		}
 	}
 }
 

@@ -97,6 +97,11 @@ func buildPage(cfg Config, specURL string) string {
 func buildSwaggerUIPage(cfg Config, specURL string) string {
 	ui := cfg.UI
 
+	depth := 1 // Swagger UI default
+	if ui.DefaultModelsExpandDepth != nil {
+		depth = *ui.DefaultModelsExpandDepth
+	}
+
 	var cssURL, bundleURL, presetURL string
 	if cfg.AssetsPath != "" {
 		base := strings.TrimRight(cfg.AssetsPath, "/")
@@ -164,7 +169,7 @@ const ui = SwaggerUIBundle({
 </body>
 </html>`, html.EscapeString(ui.Title), cssURL, bundleURL, presetURL,
 		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization,
-		ui.DefaultModelsExpandDepth, oauth2Redirect, oauth2Init)
+		depth, oauth2Redirect, oauth2Init)
 }
 
 func buildScalarPage(cfg Config, specURL string) string {

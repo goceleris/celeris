@@ -115,10 +115,11 @@ func ExampleNew_modelsExpandDepth() {
 
 	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
 
+	// Use IntPtr to set DefaultModelsExpandDepth to 0 (show model names only).
 	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
 		UI: swagger.UIConfig{
-			DefaultModelsExpandDepth: 1,
+			DefaultModelsExpandDepth: swagger.IntPtr(0),
 		},
 	}))
 }

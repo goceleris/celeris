@@ -159,7 +159,7 @@ func TestUIConfigSwaggerUI(t *testing.T) {
 			DocExpansion:             "full",
 			DeepLinking:              true,
 			PersistAuthorization:     true,
-			DefaultModelsExpandDepth: -1,
+			DefaultModelsExpandDepth: IntPtr(-1),
 			Title:                    "My API",
 		},
 	})
@@ -398,8 +398,8 @@ func TestApplyDefaultsFillsEmpty(t *testing.T) {
 	if cfg.UI.DocExpansion != "list" {
 		t.Fatalf("DocExpansion: got %q, want list", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth != 1 {
-		t.Fatalf("DefaultModelsExpandDepth: got %d, want 1", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth != nil {
+		t.Fatalf("DefaultModelsExpandDepth: got %v, want nil (uses Swagger UI default 1)", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "API Documentation" {
 		t.Fatalf("Title: got %q, want API Documentation", cfg.UI.Title)
@@ -413,7 +413,7 @@ func TestApplyDefaultsPreservesCustom(t *testing.T) {
 		Renderer: RendererScalar,
 		UI: UIConfig{
 			DocExpansion:             "full",
-			DefaultModelsExpandDepth: -1,
+			DefaultModelsExpandDepth: IntPtr(-1),
 			Title:                    "Custom",
 		},
 	})
@@ -426,8 +426,8 @@ func TestApplyDefaultsPreservesCustom(t *testing.T) {
 	if cfg.UI.DocExpansion != "full" {
 		t.Fatalf("DocExpansion: got %q, want full", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth != -1 {
-		t.Fatalf("DefaultModelsExpandDepth: got %d, want -1", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth == nil || *cfg.UI.DefaultModelsExpandDepth != -1 {
+		t.Fatalf("DefaultModelsExpandDepth: got %v, want -1", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "Custom" {
 		t.Fatalf("Title: got %q, want Custom", cfg.UI.Title)
@@ -520,20 +520,55 @@ func TestAssetsPathReDoc(t *testing.T) {
 	assertNotContains(t, body, "cdn.jsdelivr.net")
 }
 
-// --- DefaultModelsExpandDepth zero ---
+// --- DefaultModelsExpandDepth ---
 
 func TestDefaultModelsExpandDepthExplicit(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		UI: UIConfig{
-			DefaultModelsExpandDepth: 2,
+			DefaultModelsExpandDepth: IntPtr(2),
 		},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
-	body := rec.BodyString()
-	assertContains(t, body, `defaultModelsExpandDepth: 2`)
+	assertContains(t, rec.BodyString(), `defaultModelsExpandDepth: 2`)
+}
+
+func TestDefaultModelsExpandDepthZero(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		UI: UIConfig{
+			DefaultModelsExpandDepth: IntPtr(0),
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	assertContains(t, rec.BodyString(), `defaultModelsExpandDepth: 0`)
+}
+
+func TestDefaultModelsExpandDepthNilDefault(t *testing.T) {
+	t.Parallel()
+	// nil (unset) should render Swagger UI's default of 1
+	mw := New(Config{SpecContent: jsonSpec})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	assertContains(t, rec.BodyString(), `defaultModelsExpandDepth: 1`)
+}
+
+func TestOptionsValidationPanic(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for non-serializable Options")
+		}
+	}()
+	New(Config{
+		SpecContent: jsonSpec,
+		Options:     map[string]any{"bad": func() {}},
+	})
 }
 
 // --- ReDoc customization via Options ---
