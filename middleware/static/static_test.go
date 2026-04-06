@@ -1,293 +1,619 @@
 package static
 
 import (
+	"fmt"
+	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
 	"github.com/goceleris/celeris/middleware/internal/testutil"
 )
 
-func tmpDir(t *testing.T, files map[string]string) string {
+func noopHandler(c *celeris.Context) error {
+	return c.String(200, "fallthrough")
+}
+
+func setupTempDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for name, content := range files {
-		full := filepath.Join(dir, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+
+	_ = os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello world"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>index</html>"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "style.css"), []byte("body{}"), 0o644)
+
+	sub := filepath.Join(dir, "sub")
+	_ = os.Mkdir(sub, 0o755)
+	_ = os.WriteFile(filepath.Join(sub, "page.html"), []byte("<html>page</html>"), 0o644)
+	_ = os.WriteFile(filepath.Join(sub, "index.html"), []byte("<html>sub index</html>"), 0o644)
+
 	return dir
 }
 
-func noop(_ *celeris.Context) error { return nil }
-
-func TestStaticServeFile(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"hello.txt": "hello world",
-	})
+func TestServeOSFile(t *testing.T) {
+	dir := setupTempDir(t)
 	mw := New(Config{Root: dir})
-	chain := []celeris.HandlerFunc{mw, noop}
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "hello world" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "hello world")
+	}
+}
+
+func TestServeOSIndex(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "<html>index</html>" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "<html>index</html>")
+	}
+}
+
+func TestServeOSSubdirIndex(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/sub/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "<html>sub index</html>" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "<html>sub index</html>")
+	}
+}
+
+func TestNotFoundFallsThrough(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	rec, err := testutil.RunChain(t, chain, "GET", "/nonexistent.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "fallthrough")
+	}
+}
+
+func TestPostMethodFallsThrough(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	rec, err := testutil.RunChain(t, chain, "POST", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "fallthrough")
+	}
+}
+
+func TestPrefix(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, Prefix: "/static"})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/static/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "hello world" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "hello world")
+	}
+}
+
+func TestPrefixSegmentBoundary(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, Prefix: "/api"})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	// /api-docs should NOT match prefix /api
+	rec, err := testutil.RunChain(t, chain, "GET", "/api-docs/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("expected fallthrough for /api-docs, got %q", rec.BodyString())
+	}
+
+	// /api/hello.txt SHOULD match prefix /api
+	rec2, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/api/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec2, 200)
+	if rec2.BodyString() != "hello world" {
+		t.Fatalf("body: got %q, want %q", rec2.BodyString(), "hello world")
+	}
+}
+
+func TestPrefixExactMatch(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, Prefix: "/static"})
+
+	// /static with no trailing path should serve index
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/static")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "<html>index</html>" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "<html>index</html>")
+	}
+}
+
+func TestBrowseXSS(t *testing.T) {
+	dir := t.TempDir()
+	// Create a file with a javascript: filename
+	_ = os.WriteFile(filepath.Join(dir, "javascript:alert(1)"), []byte("xss"), 0o644)
+
+	mw := New(Config{Root: dir, Browse: true})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	body := rec.BodyString()
+	// The href MUST NOT start with a bare "javascript:" protocol.
+	// The ./ prefix forces the browser to treat it as a relative path,
+	// preventing protocol-scheme injection even though url.PathEscape
+	// does not encode the colon.
+	if strings.Contains(body, `href="javascript:`) {
+		t.Fatal("XSS: href starts with javascript: protocol (missing ./ prefix)")
+	}
+	// The href should use ./ prefix + URL-encoded name.
+	if !strings.Contains(body, `href="./javascript:alert%281%29"`) {
+		t.Fatalf("expected ./ prefixed URL-encoded href, got body:\n%s", body)
+	}
+	// The display text should show the original filename.
+	if !strings.Contains(body, "javascript:alert(1)") {
+		t.Fatal("display text should contain the original filename")
+	}
+}
+
+func TestBrowseDirectoryListing(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644)
+	_ = os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
+
+	mw := New(Config{Root: dir, Browse: true})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	body := rec.BodyString()
+	if !strings.Contains(body, "a.txt") {
+		t.Fatal("listing should contain a.txt")
+	}
+	if !strings.Contains(body, "subdir/") {
+		t.Fatal("listing should contain subdir/")
+	}
+}
+
+func TestBrowseDisabledFallsThrough(t *testing.T) {
+	dir := t.TempDir()
+	// No index file, browse disabled
+	mw := New(Config{Root: dir})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	rec, err := testutil.RunChain(t, chain, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("expected fallthrough, got %q", rec.BodyString())
+	}
+}
+
+func TestETagLastModified(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	lm := rec.Header("last-modified")
+	if lm == "" {
+		t.Fatal("expected last-modified header")
+	}
+	_, parseErr := http.ParseTime(lm)
+	if parseErr != nil {
+		t.Fatalf("invalid last-modified: %q: %v", lm, parseErr)
+	}
+
+	etag := rec.Header("etag")
+	if etag == "" {
+		t.Fatal("expected etag header")
+	}
+	if !strings.HasPrefix(etag, `W/"`) {
+		t.Fatalf("expected weak etag, got %q", etag)
+	}
+}
+
+func TestIfModifiedSince304(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	// First request to get Last-Modified.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	lm := rec.Header("last-modified")
+
+	// Conditional request with the same Last-Modified.
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt",
+		celeristest.WithHeader("if-modified-since", lm))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 304)
+}
+
+func TestIfNoneMatch304(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+
+	// First request to get ETag.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	etag := rec.Header("etag")
+
+	// Conditional request with the same ETag.
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt",
+		celeristest.WithHeader("if-none-match", etag))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 304)
+}
+
+func TestServeFSFile(t *testing.T) {
+	fsys := fstest.MapFS{
+		"hello.txt": {Data: []byte("hello fs")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "hello fs" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "hello fs")
+	}
+}
+
+func TestServeFSIndex(t *testing.T) {
+	fsys := fstest.MapFS{
+		"index.html": {Data: []byte("<html>fs index</html>")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "<html>fs index</html>" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "<html>fs index</html>")
+	}
+}
+
+func TestRangeRequestFS(t *testing.T) {
+	fsys := fstest.MapFS{
+		"data.txt": {Data: []byte("0123456789abcdef")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/data.txt",
+		celeristest.WithHeader("range", "bytes=0-4"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 206)
+	if rec.BodyString() != "01234" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "01234")
+	}
+	cr := rec.Header("content-range")
+	if cr != "bytes 0-4/16" {
+		t.Fatalf("content-range: got %q, want %q", cr, "bytes 0-4/16")
+	}
+}
+
+func TestRangeRequestFSSuffix(t *testing.T) {
+	fsys := fstest.MapFS{
+		"data.txt": {Data: []byte("0123456789abcdef")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/data.txt",
+		celeristest.WithHeader("range", "bytes=-4"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 206)
+	if rec.BodyString() != "cdef" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "cdef")
+	}
+}
+
+func TestRangeRequestFSOpenEnd(t *testing.T) {
+	fsys := fstest.MapFS{
+		"data.txt": {Data: []byte("0123456789abcdef")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/data.txt",
+		celeristest.WithHeader("range", "bytes=12-"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 206)
+	if rec.BodyString() != "cdef" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "cdef")
+	}
+}
+
+func TestRangeRequestFSInvalid(t *testing.T) {
+	fsys := fstest.MapFS{
+		"data.txt": {Data: []byte("0123456789")},
+	}
+	mw := New(Config{FS: fsys})
+
+	// Invalid range should return full content.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/data.txt",
+		celeristest.WithHeader("range", "bytes=50-100"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "0123456789" {
+		t.Fatalf("body: got %q, want %q", rec.BodyString(), "0123456789")
+	}
+}
+
+func TestFSCacheHeadersNonZeroModTime(t *testing.T) {
+	modTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	fsys := fstest.MapFS{
+		"hello.txt": {
+			Data:    []byte("hello"),
+			ModTime: modTime,
+		},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	lm := rec.Header("last-modified")
+	if lm == "" {
+		t.Fatal("expected last-modified header for non-zero ModTime")
+	}
+	etag := rec.Header("etag")
+	if etag == "" {
+		t.Fatal("expected etag header for non-zero ModTime")
+	}
+}
+
+func TestFSCacheHeadersZeroModTime(t *testing.T) {
+	fsys := fstest.MapFS{
+		"hello.txt": {Data: []byte("hello")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	lm := rec.Header("last-modified")
+	if lm != "" {
+		t.Fatalf("expected no last-modified for zero ModTime, got %q", lm)
+	}
+	etag := rec.Header("etag")
+	if etag != "" {
+		t.Fatalf("expected no etag for zero ModTime, got %q", etag)
+	}
+}
+
+func TestFS304WithIfNoneMatch(t *testing.T) {
+	modTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	fsys := fstest.MapFS{
+		"hello.txt": {
+			Data:    []byte("hello"),
+			ModTime: modTime,
+		},
+	}
+	mw := New(Config{FS: fsys})
+
+	// Get ETag from first request.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt")
+	testutil.AssertNoError(t, err)
+	etag := rec.Header("etag")
+
+	// Conditional request returns 304.
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/hello.txt",
+		celeristest.WithHeader("if-none-match", etag))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 304)
+}
+
+func TestSkipPaths(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, SkipPaths: []string{"/hello.txt"}})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
 	rec, err := testutil.RunChain(t, chain, "GET", "/hello.txt")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "hello world")
-}
-
-func TestStaticServeIndex(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"sub/index.html": "<h1>index</h1>",
-	})
-	mw := New(Config{Root: dir})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/sub/")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "<h1>index</h1>")
-}
-
-func TestStaticSPAFallback(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"index.html": "<h1>spa</h1>",
-	})
-	mw := New(Config{Root: dir, SPA: true})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/nonexistent/page")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "<h1>spa</h1>")
-}
-
-func TestStaticSPAExistingFile(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"index.html": "<h1>spa</h1>",
-		"app.js":     "console.log('ok')",
-	})
-	mw := New(Config{Root: dir, SPA: true})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/app.js")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "console.log")
-}
-
-func TestStaticFromFS(t *testing.T) {
-	mapFS := fstest.MapFS{
-		"style.css":  {Data: []byte("body{}")},
-		"index.html": {Data: []byte("<html></html>")},
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("expected fallthrough on skipped path, got %q", rec.BodyString())
 	}
-	mw := New(Config{Filesystem: mapFS})
-	chain := []celeris.HandlerFunc{mw, noop}
+}
 
-	rec, err := testutil.RunChain(t, chain, "GET", "/style.css")
+func TestSkipFunc(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{
+		Root: dir,
+		Skip: func(c *celeris.Context) bool {
+			return c.Path() == "/hello.txt"
+		},
+	})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	rec, err := testutil.RunChain(t, chain, "GET", "/hello.txt")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "body{}")
-}
-
-func TestStaticCacheControl(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"file.txt": "cached",
-	})
-	mw := New(Config{Root: dir, MaxAge: 3600})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/file.txt")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertHeader(t, rec, "cache-control", "public, max-age=3600")
-}
-
-func TestStaticPathTraversal(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"safe.txt": "safe",
-	})
-	mw := New(Config{Root: dir})
-	chain := []celeris.HandlerFunc{mw, noop}
-
-	// The sanitize function rejects ".." so this falls through to noop.
-	rec, err := testutil.RunChain(t, chain, "GET", "/../etc/passwd")
-	testutil.AssertNoError(t, err)
-	// Falls through to next handler which writes nothing (noop).
-	testutil.AssertBodyEmpty(t, rec)
-}
-
-func TestStaticPassthroughPOST(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"file.txt": "content",
-	})
-	mw := New(Config{Root: dir})
-	handler := func(c *celeris.Context) error {
-		return c.String(200, "post-handler")
+	if rec.BodyString() != "fallthrough" {
+		t.Fatalf("expected fallthrough on skipped path, got %q", rec.BodyString())
 	}
-	chain := []celeris.HandlerFunc{mw, handler}
-	rec, err := testutil.RunChain(t, chain, "POST", "/file.txt")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "post-handler")
 }
 
-func TestStaticNotFound(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"exists.txt": "yes",
-	})
-	mw := New(Config{Root: dir})
-	handler := func(c *celeris.Context) error {
-		return c.String(404, "not found")
+func TestBrowseFSListing(t *testing.T) {
+	fsys := fstest.MapFS{
+		"dir/a.txt": {Data: []byte("a")},
+		"dir/b.txt": {Data: []byte("b")},
 	}
-	chain := []celeris.HandlerFunc{mw, handler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/missing.txt")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 404)
-	testutil.AssertBodyContains(t, rec, "not found")
-}
+	mw := New(Config{FS: fsys, Browse: true})
 
-func TestStaticPrefix(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"app.js": "var x=1",
-	})
-	mw := New(Config{Root: dir, Prefix: "/static"})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/static/app.js")
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dir/")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "var x=1")
-}
 
-func TestStaticBrowse(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"docs/a.txt": "aaa",
-		"docs/b.txt": "bbb",
-	})
-	mw := New(Config{Root: dir, Browse: true})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/docs/")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
 	body := rec.BodyString()
-	if !strings.Contains(body, "a.txt") || !strings.Contains(body, "b.txt") {
-		t.Fatalf("expected directory listing with a.txt and b.txt, got: %s", body)
+	if !strings.Contains(body, "a.txt") {
+		t.Fatal("listing should contain a.txt")
+	}
+	if !strings.Contains(body, "b.txt") {
+		t.Fatal("listing should contain b.txt")
 	}
 }
 
-func TestStaticSkipPaths(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"health": "ok",
-	})
-	mw := New(Config{Root: dir, SkipPaths: []string{"/health"}})
-	handler := func(c *celeris.Context) error {
-		return c.String(200, "dynamic-health")
+func TestBrowseXSSFS(t *testing.T) {
+	fsys := fstest.MapFS{
+		"dir/javascript:alert(1)": {Data: []byte("xss")},
 	}
-	chain := []celeris.HandlerFunc{mw, handler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/health")
+	mw := New(Config{FS: fsys, Browse: true})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/dir/")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "dynamic-health")
+
+	body := rec.BodyString()
+	if strings.Contains(body, `href="javascript:`) {
+		t.Fatal("XSS: href starts with javascript: protocol (missing ./ prefix)")
+	}
+	if !strings.Contains(body, `href="./javascript:alert%281%29"`) {
+		t.Fatalf("expected ./ prefixed URL-encoded href in FS listing, got body:\n%s", body)
+	}
 }
 
-func TestValidatePanicNoRoot(t *testing.T) {
+func TestConfigPanicNoRootNoFS(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("expected panic when neither Root nor Filesystem is set")
+			t.Fatal("expected panic for empty config")
 		}
 		msg, ok := r.(string)
-		if !ok || !strings.Contains(msg, "Root") {
+		if !ok || !strings.Contains(msg, "Root or FS must be set") {
 			t.Fatalf("unexpected panic: %v", r)
 		}
 	}()
 	New(Config{})
 }
 
-func TestStaticPrefixMismatch(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"file.txt": "content",
-	})
-	mw := New(Config{Root: dir, Prefix: "/assets"})
-	handler := func(c *celeris.Context) error {
-		return c.String(200, "fallback")
+func TestRenderListingParentLink(t *testing.T) {
+	listing := renderListing("/sub/dir/", nil)
+	if !strings.Contains(listing, `href="../"`) {
+		t.Fatal("expected parent directory link")
 	}
-	chain := []celeris.HandlerFunc{mw, handler}
-	rec, err := testutil.RunChain(t, chain, "GET", "/other/file.txt")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "fallback")
-}
 
-func TestStaticFSIndex(t *testing.T) {
-	mapFS := fstest.MapFS{
-		"sub/index.html": {Data: []byte("<h1>fs-index</h1>")},
-	}
-	mw := New(Config{Filesystem: mapFS})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/sub/")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "<h1>fs-index</h1>")
-}
-
-func TestStaticFSSPAFallback(t *testing.T) {
-	mapFS := fstest.MapFS{
-		"index.html": {Data: []byte("<h1>spa-fs</h1>")},
-	}
-	mw := New(Config{Filesystem: mapFS, SPA: true})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/does/not/exist")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "<h1>spa-fs</h1>")
-}
-
-func TestStaticFSBrowse(t *testing.T) {
-	mapFS := fstest.MapFS{
-		"dir/one.txt": {Data: []byte("1")},
-		"dir/two.txt": {Data: []byte("2")},
-	}
-	mw := New(Config{Filesystem: mapFS, Browse: true})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/dir/")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-	body := rec.BodyString()
-	if !strings.Contains(body, "one.txt") || !strings.Contains(body, "two.txt") {
-		t.Fatalf("expected directory listing, got: %s", body)
+	listing = renderListing("/", nil)
+	if strings.Contains(listing, `href="../"`) {
+		t.Fatal("root path should not have parent link")
 	}
 }
 
-func TestStaticRootIndex(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"index.html": "<h1>root</h1>",
-	})
+func TestRenderListingHTMLEscape(t *testing.T) {
+	entries := []fs.DirEntry{
+		&fakeDirEntry{name: `<script>alert("xss")</script>.txt`},
+	}
+	listing := renderListing("/", entries)
+	if strings.Contains(listing, `<script>`) {
+		t.Fatal("display name must be HTML-escaped")
+	}
+	if !strings.Contains(listing, "&lt;script&gt;") {
+		t.Fatal("expected HTML-escaped display name")
+	}
+}
+
+func TestParseByteRange(t *testing.T) {
+	tests := []struct {
+		header string
+		size   int64
+		start  int64
+		end    int64
+		ok     bool
+	}{
+		{"bytes=0-4", 10, 0, 4, true},
+		{"bytes=5-9", 10, 5, 9, true},
+		{"bytes=-3", 10, 7, 9, true},
+		{"bytes=7-", 10, 7, 9, true},
+		{"bytes=0-0", 10, 0, 0, true},
+		// Invalid ranges
+		{"bytes=10-15", 10, 0, 0, false},
+		{"bytes=-0", 10, 0, 0, false},
+		{"bytes=5-3", 10, 0, 0, false},
+		{"chars=0-4", 10, 0, 0, false},
+		{"", 10, 0, 0, false},
+		{"bytes=abc-def", 10, 0, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s/%d", tt.header, tt.size), func(t *testing.T) {
+			start, end, ok := parseByteRange(tt.header, tt.size)
+			if ok != tt.ok {
+				t.Fatalf("ok: got %v, want %v", ok, tt.ok)
+			}
+			if ok {
+				if start != tt.start || end != tt.end {
+					t.Fatalf("range: got %d-%d, want %d-%d", start, end, tt.start, tt.end)
+				}
+			}
+		})
+	}
+}
+
+func TestAcceptRangesHeaderFS(t *testing.T) {
+	fsys := fstest.MapFS{
+		"file.txt": {Data: []byte("content")},
+	}
+	mw := New(Config{FS: fsys})
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/file.txt")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+
+	ar := rec.Header("accept-ranges")
+	if ar != "bytes" {
+		t.Fatalf("accept-ranges: got %q, want %q", ar, "bytes")
+	}
+}
+
+func TestHeadRequest(t *testing.T) {
+	dir := setupTempDir(t)
 	mw := New(Config{Root: dir})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "GET", "/")
+
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "HEAD", "/hello.txt")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
-	testutil.AssertBodyContains(t, rec, "<h1>root</h1>")
+
+	etag := rec.Header("etag")
+	if etag == "" {
+		t.Fatal("expected etag header on HEAD request")
+	}
+	lm := rec.Header("last-modified")
+	if lm == "" {
+		t.Fatal("expected last-modified header on HEAD request")
+	}
 }
 
-func TestValidatePanicBadPrefix(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for prefix not starting with /")
-		}
-	}()
-	New(Config{Root: "/tmp", Prefix: "bad"})
+// fakeDirEntry implements fs.DirEntry for testing.
+type fakeDirEntry struct {
+	name  string
+	isDir bool
 }
 
-func TestStaticHeadRequest(t *testing.T) {
-	dir := tmpDir(t, map[string]string{
-		"file.txt": "head-content",
-	})
-	mw := New(Config{Root: dir})
-	chain := []celeris.HandlerFunc{mw, noop}
-	rec, err := testutil.RunChain(t, chain, "HEAD", "/file.txt")
-	testutil.AssertNoError(t, err)
-	testutil.AssertStatus(t, rec, 200)
-}
+func (f *fakeDirEntry) Name() string              { return f.name }
+func (f *fakeDirEntry) IsDir() bool                { return f.isDir }
+func (f *fakeDirEntry) Type() fs.FileMode          { return 0 }
+func (f *fakeDirEntry) Info() (fs.FileInfo, error) { return nil, nil }

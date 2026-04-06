@@ -9,8 +9,8 @@ func ExampleNew() {
 	// s := celeris.New()
 	// s.Pre(rewrite.New(rewrite.Config{...}))
 	_ = rewrite.New(rewrite.Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []rewrite.Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 	})
 }
@@ -18,8 +18,8 @@ func ExampleNew() {
 func ExampleNew_captureGroups() {
 	// Capture groups: extract user ID and rewrite to an API path.
 	_ = rewrite.New(rewrite.Config{
-		Rules: map[string]string{
-			`^/users/(\d+)/posts$`: "/api/v2/users/$1/posts",
+		Rules: []rewrite.Rule{
+			{Pattern: `^/users/(\d+)/posts$`, Replacement: "/api/v2/users/$1/posts"},
 		},
 	})
 }
@@ -27,8 +27,8 @@ func ExampleNew_captureGroups() {
 func ExampleNew_redirect() {
 	// Redirect mode: send a 301 redirect instead of a silent rewrite.
 	_ = rewrite.New(rewrite.Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []rewrite.Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 		RedirectCode: 301,
 	})

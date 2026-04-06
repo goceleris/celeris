@@ -5,44 +5,43 @@
 // and either rewrites the path in-place (silent rewrite) or sends an
 // HTTP redirect response.
 //
-// Basic usage (silent rewrite — use anchored patterns):
+// Basic usage (silent rewrite -- use anchored patterns):
 //
 //	server.Pre(rewrite.New(rewrite.Config{
-//	    Rules: map[string]string{
-//	        "^/old$": "/new",
+//	    Rules: []rewrite.Rule{
+//	        {Pattern: "^/old$", Replacement: "/new"},
 //	    },
 //	}))
 //
 // Redirect mode:
 //
 //	server.Pre(rewrite.New(rewrite.Config{
-//	    Rules: map[string]string{
-//	        "^/old$": "/new",
+//	    Rules: []rewrite.Rule{
+//	        {Pattern: "^/old$", Replacement: "/new"},
 //	    },
 //	    RedirectCode: 301,
 //	}))
 //
 // # Regex and Capture Groups
 //
-// Rule keys are Go regular expressions compiled with [regexp.MustCompile].
+// Rule patterns are Go regular expressions compiled with [regexp.MustCompile].
 // The replacement string supports capture group substitution ($1, $2, ...)
 // using [regexp.Regexp.ReplaceAllString] semantics:
 //
 //	server.Pre(rewrite.New(rewrite.Config{
-//	    Rules: map[string]string{
-//	        `/users/(\d+)/posts`: "/api/v2/users/$1/posts",
+//	    Rules: []rewrite.Rule{
+//	        {Pattern: `/users/(\d+)/posts`, Replacement: "/api/v2/users/$1/posts"},
 //	    },
 //	}))
 //
-// # First-Match-Wins (Alphabetical Key Order)
+// # First-Match-Wins
 //
-// When multiple rules are defined, keys are sorted alphabetically at init
-// time. The first matching regex wins and subsequent rules are not checked.
-// This provides deterministic behavior regardless of Go map iteration order:
+// Rules are evaluated in the order provided. The first matching regex wins
+// and subsequent rules are not checked:
 //
-//	Rules: map[string]string{
-//	    "/a/.*": "/alpha",  // checked first (alphabetical)
-//	    "/b/.*": "/beta",   // checked second
+//	Rules: []rewrite.Rule{
+//	    {Pattern: "/a/.*", Replacement: "/alpha"},  // checked first
+//	    {Pattern: "/b/.*", Replacement: "/beta"},   // checked second
 //	}
 //
 // # Silent Rewrite vs Redirect
@@ -62,7 +61,9 @@
 // rewriting occurs before route lookup:
 //
 //	server.Pre(rewrite.New(rewrite.Config{
-//	    Rules: map[string]string{"/old": "/new"},
+//	    Rules: []rewrite.Rule{
+//	        {Pattern: "/old", Replacement: "/new"},
+//	    },
 //	}))
 //
 // # Query String Preservation
@@ -74,7 +75,7 @@
 // # Init-Time Validation
 //
 // [New] panics if Rules is empty, if RedirectCode is non-zero and not a
-// valid redirect status, or if any rule key is an invalid regex (via
+// valid redirect status, or if any rule pattern is an invalid regex (via
 // [regexp.MustCompile]).
 //
 // # Security

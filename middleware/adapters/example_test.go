@@ -27,16 +27,6 @@ func ExampleWrapMiddleware() {
 	// Output: middleware registered
 }
 
-func ExampleToStdlib() {
-	h := func(c *celeris.Context) error {
-		return c.String(200, "hello from celeris")
-	}
-
-	// Use a celeris handler in a net/http server.
-	_ = adapters.ToStdlib(h)
-	fmt.Println("handler converted")
-	// Output: handler converted
-}
 
 func ExampleReverseProxy() {
 	target, _ := url.Parse("http://backend:8080")

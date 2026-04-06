@@ -1,39 +1,64 @@
 package swagger_test
 
 import (
-	"fmt"
-
 	"github.com/goceleris/celeris"
+
 	"github.com/goceleris/celeris/middleware/swagger"
 )
 
 func ExampleNew() {
-	spec := []byte(`{"openapi":"3.0.0","info":{"title":"My API","version":"1.0"}}`)
-	mw := swagger.New(swagger.Config{
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
-	})
-	fmt.Printf("middleware type: %T\n", mw)
-	// Output: middleware type: celeris.HandlerFunc
+	}))
+}
+
+func ExampleNew_customUI() {
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
+		SpecContent: spec,
+		BasePath:    "/docs",
+		UI: swagger.UIConfig{
+			DocExpansion:         "full",
+			DeepLinking:          true,
+			PersistAuthorization: true,
+			Title:                "My API",
+		},
+	}))
 }
 
 func ExampleNew_scalar() {
-	spec := []byte(`{"openapi":"3.0.0","info":{"title":"My API","version":"1.0"}}`)
-	mw := swagger.New(swagger.Config{
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
-		UIEngine:    "scalar",
-	})
-	fmt.Printf("middleware type: %T\n", mw)
-	// Output: middleware type: celeris.HandlerFunc
+		Renderer:    swagger.RendererScalar,
+	}))
 }
 
-func ExampleNew_withAuth() {
-	spec := []byte(`{"openapi":"3.0.0","info":{"title":"My API","version":"1.0"}}`)
-	mw := swagger.New(swagger.Config{
+func ExampleNew_externalSpec() {
+	server := celeris.New(celeris.Config{})
+
+	server.Use(swagger.New(swagger.Config{
+		SpecURL: "https://petstore.swagger.io/v2/swagger.json",
+	}))
+}
+
+func ExampleNew_localAssets() {
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
-		AuthFunc: func(c *celeris.Context) bool {
-			return c.Header("x-api-key") == "secret"
-		},
-	})
-	fmt.Printf("middleware type: %T\n", mw)
-	// Output: middleware type: celeris.HandlerFunc
+		AssetsPath:  "/swagger-assets",
+	}))
 }

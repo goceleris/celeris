@@ -12,7 +12,7 @@ func BenchmarkStaticPassthrough(b *testing.B) {
 	mapFS := fstest.MapFS{
 		"index.html": {Data: []byte("<html></html>")},
 	}
-	mw := New(Config{Filesystem: mapFS})
+	mw := New(Config{FS: mapFS})
 	noop := func(_ *celeris.Context) error { return nil }
 	opts := []celeristest.Option{
 		celeristest.WithHandlers(mw, noop),
@@ -30,7 +30,7 @@ func BenchmarkStaticServeFromFS(b *testing.B) {
 	mapFS := fstest.MapFS{
 		"style.css": {Data: []byte("body{margin:0}")},
 	}
-	mw := New(Config{Filesystem: mapFS})
+	mw := New(Config{FS: mapFS})
 	noop := func(_ *celeris.Context) error { return nil }
 	opts := []celeristest.Option{
 		celeristest.WithHandlers(mw, noop),

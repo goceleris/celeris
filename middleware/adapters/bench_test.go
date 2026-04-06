@@ -30,9 +30,9 @@ func BenchmarkWrapMiddleware(b *testing.B) {
 	}
 }
 
-func BenchmarkToStdlib(b *testing.B) {
+func BenchmarkToHandler(b *testing.B) {
 	h := func(c *celeris.Context) error { return c.NoContent(200) }
-	stdHandler := ToStdlib(h)
+	stdHandler := celeris.ToHandler(h)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	b.ReportAllocs()

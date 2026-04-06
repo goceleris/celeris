@@ -1,54 +1,31 @@
-// Package adapters provides conversion functions between celeris handlers
-// and net/http handlers, plus a reverse proxy helper.
+// Package adapters bridges stdlib net/http middleware into celeris handler chains.
 //
-// Unlike standard celeris middleware, this package does not follow the
-// New(config ...Config) pattern. It exposes standalone functions for bridging
-// the two ecosystems.
+// Use [WrapMiddleware] to adapt any func(http.Handler) http.Handler into a
+// [celeris.HandlerFunc]. This enables reuse of existing stdlib middleware
+// such as rs/cors, gorilla/csrf, and similar libraries.
 //
-// # WrapMiddleware: stdlib to celeris
+//	corsHandler := cors.Handler(cors.Options{AllowedOrigins: []string{"*"}})
+//	server.Use(adapters.WrapMiddleware(corsHandler))
 //
-// [WrapMiddleware] converts a standard func(http.Handler) http.Handler
-// middleware (such as rs/cors, gorilla/csrf, or chi/middleware) into a
-// [celeris.HandlerFunc]:
+// For converting celeris handlers to stdlib, use [celeris.ToHandler] directly.
 //
-//	server.Use(adapters.WrapMiddleware(stdlibCORS))
+// # How It Works
 //
-// The wrapped middleware can either call through to the next handler in the
-// celeris chain (by invoking its inner http.Handler argument) or
-// short-circuit the request (e.g., returning 403 Forbidden for CSRF
-// failures). When the middleware short-circuits, its captured status code,
-// headers, and body are written to the celeris context automatically.
+// WrapMiddleware creates a temporary http.ResponseWriter (responseCapture)
+// and reconstructs an *http.Request from the celeris Context. The stdlib
+// middleware runs against these. If the middleware calls the inner handler,
+// control returns to the celeris chain via c.Next(). Any response headers
+// the stdlib middleware set before calling next are copied to the celeris
+// response.
 //
-// # ToStdlib: celeris to http.Handler
+// If the stdlib middleware short-circuits (does not call the inner handler),
+// the captured status code, headers, and body are written through celeris.
 //
-// [ToStdlib] converts a [celeris.HandlerFunc] to an [http.Handler] for use
-// with net/http routers, test infrastructure, or stdlib middleware chains.
-// It delegates to [celeris.ToHandler].
+// # Limitations
 //
-//	http.Handle("/legacy", adapters.ToStdlib(myHandler))
-//
-// # ReverseProxy
-//
-// [ReverseProxy] creates a celeris handler that proxies requests to a
-// target URL using [net/http/httputil.ReverseProxy]. It supports
-// configurable transport, request modification, and error handling via
-// functional options:
-//
-//	target, _ := url.Parse("http://backend:8080")
-//	server.Any("/api/*path", adapters.ReverseProxy(target,
-//	    adapters.WithTransport(customTransport),
-//	    adapters.WithModifyRequest(func(r *http.Request) {
-//	        r.Header.Set("X-Custom", "value")
-//	    }),
-//	))
-//
-// # Header Propagation
-//
-// When WrapMiddleware calls through to the celeris chain, response headers
-// are written by the downstream celeris handlers directly. Headers set by
-// the stdlib middleware before calling its inner handler are not visible to
-// the celeris chain (they are written to the capture buffer, not the
-// celeris context). This is a fundamental limitation of bridging two
-// response-writing models. If the stdlib middleware short-circuits, all of
-// its headers are propagated to the celeris response.
+// The responseCapture used by WrapMiddleware does not implement
+// http.Hijacker or http.Flusher. Stdlib middleware that requires
+// WebSocket upgrade (via Hijack) or streaming flush (via Flush)
+// will not work through WrapMiddleware. For these use cases,
+// implement the middleware natively in celeris.
 package adapters

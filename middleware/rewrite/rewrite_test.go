@@ -14,8 +14,8 @@ func pathRecorder(c *celeris.Context) error {
 
 func TestRewriteSimple(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 	})
 	chain := []celeris.HandlerFunc{mw, pathRecorder}
@@ -29,8 +29,8 @@ func TestRewriteSimple(t *testing.T) {
 
 func TestRewriteCaptureGroups(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			`^/users/(\d+)/posts$`: "/api/v2/users/$1/posts",
+		Rules: []Rule{
+			{Pattern: `^/users/(\d+)/posts$`, Replacement: "/api/v2/users/$1/posts"},
 		},
 	})
 	chain := []celeris.HandlerFunc{mw, pathRecorder}
@@ -44,9 +44,9 @@ func TestRewriteCaptureGroups(t *testing.T) {
 
 func TestRewriteFirstMatchWins(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/a/.*": "/alpha",
-			"^/b/.*": "/beta",
+		Rules: []Rule{
+			{Pattern: "^/a/.*", Replacement: "/alpha"},
+			{Pattern: "^/b/.*", Replacement: "/beta"},
 		},
 	})
 
@@ -71,10 +71,31 @@ func TestRewriteFirstMatchWins(t *testing.T) {
 	})
 }
 
+func TestRewriteInsertionOrder(t *testing.T) {
+	// Verify that rules are evaluated in insertion order, not alphabetical.
+	// With alphabetical sort, "^/z/.*" would come after "^/a/.*",
+	// but here we put "/z" first so it should match first for an
+	// overlapping path.
+	mw := New(Config{
+		Rules: []Rule{
+			{Pattern: "^/z/.*", Replacement: "/zulu"},
+			{Pattern: "^/.*", Replacement: "/catchall"},
+		},
+	})
+
+	chain := []celeris.HandlerFunc{mw, pathRecorder}
+	rec, err := testutil.RunChain(t, chain, "GET", "/z/foo")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if rec.BodyString() != "/zulu" {
+		t.Fatalf("path: got %q, want %q (insertion order should win)", rec.BodyString(), "/zulu")
+	}
+}
+
 func TestRewriteRedirectMode(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 		RedirectCode: 301,
 	})
@@ -87,8 +108,8 @@ func TestRewriteRedirectMode(t *testing.T) {
 
 func TestRewriteNoMatch(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 	})
 	chain := []celeris.HandlerFunc{mw, pathRecorder}
@@ -102,8 +123,8 @@ func TestRewriteNoMatch(t *testing.T) {
 
 func TestRewritePreserveQuery(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 		RedirectCode: 302,
 	})
@@ -117,8 +138,8 @@ func TestRewritePreserveQuery(t *testing.T) {
 
 func TestRewriteSkipPaths(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 		SkipPaths: []string{"/old"},
 	})
@@ -133,8 +154,8 @@ func TestRewriteSkipPaths(t *testing.T) {
 
 func TestRewriteSkipFunc(t *testing.T) {
 	mw := New(Config{
-		Rules: map[string]string{
-			"^/old$": "/new",
+		Rules: []Rule{
+			{Pattern: "^/old$", Replacement: "/new"},
 		},
 		Skip: func(c *celeris.Context) bool {
 			return c.Method() == "POST"
@@ -172,7 +193,7 @@ func TestValidatePanics(t *testing.T) {
 				t.Fatalf("unexpected panic: %v", r)
 			}
 		}()
-		New(Config{Rules: map[string]string{}})
+		New(Config{Rules: []Rule{}})
 	})
 
 	t.Run("nil rules", func(t *testing.T) {
@@ -200,7 +221,7 @@ func TestValidatePanics(t *testing.T) {
 			}
 		}()
 		New(Config{
-			Rules:        map[string]string{"^/old$": "/new"},
+			Rules:        []Rule{{Pattern: "^/old$", Replacement: "/new"}},
 			RedirectCode: 200,
 		})
 	})
@@ -212,7 +233,7 @@ func TestValidatePanics(t *testing.T) {
 			}
 		}()
 		New(Config{
-			Rules: map[string]string{"[invalid": "/new"},
+			Rules: []Rule{{Pattern: "[invalid", Replacement: "/new"}},
 		})
 	})
 }

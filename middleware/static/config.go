@@ -14,51 +14,51 @@ type Config struct {
 	// SkipPaths lists paths to skip (exact match).
 	SkipPaths []string
 
-	// Root is the OS filesystem directory from which to serve files.
-	// Either Root or Filesystem must be set.
+	// Root is the directory path on the OS filesystem from which to serve
+	// files. Mutually exclusive with FS. If neither Root nor FS is set,
+	// the middleware panics.
 	Root string
 
-	// Filesystem is an alternative file source (e.g. embed.FS or
-	// fstest.MapFS). Either Root or Filesystem must be set.
-	Filesystem fs.FS
+	// FS is an [fs.FS] from which to serve files (e.g. embed.FS).
+	// Mutually exclusive with Root. If both Root and FS are set, FS takes
+	// precedence.
+	FS fs.FS
 
-	// Index is the file to serve for directory requests.
+	// Prefix is the URL path prefix to strip before looking up the file.
+	// For example, Prefix: "/static" serves /static/style.css from style.css
+	// in Root/FS. The prefix is matched at segment boundaries: /static does
+	// not match /static-docs.
+	// Default: "/" (serve from the URL root).
+	Prefix string
+
+	// Index is the default file to serve when the request path resolves to
+	// a directory.
 	// Default: "index.html".
 	Index string
 
-	// SPA enables single-page application mode. When a requested file
-	// does not exist, the Index file is served instead of passing to the
-	// next handler.
-	SPA bool
-
-	// Browse enables directory listing. When true, requests to directories
-	// that lack an index file receive a simple HTML listing of entries.
+	// Browse enables directory listing when the request path resolves to
+	// a directory without an index file.
+	// Default: false.
 	Browse bool
+}
 
-	// MaxAge sets the Cache-Control max-age directive in seconds.
-	// Zero (default) means no Cache-Control header is added.
-	MaxAge int
-
-	// Prefix is the URL prefix to strip before file lookup.
-	// Must start with "/". Default: "/".
-	Prefix string
+var defaultConfig = Config{
+	Prefix: "/",
+	Index:  "index.html",
 }
 
 func applyDefaults(cfg Config) Config {
-	if cfg.Index == "" {
-		cfg.Index = "index.html"
-	}
 	if cfg.Prefix == "" {
-		cfg.Prefix = "/"
+		cfg.Prefix = defaultConfig.Prefix
+	}
+	if cfg.Index == "" {
+		cfg.Index = defaultConfig.Index
 	}
 	return cfg
 }
 
 func (cfg Config) validate() {
-	if cfg.Root == "" && cfg.Filesystem == nil {
-		panic("static: either Root or Filesystem must be set")
-	}
-	if cfg.Prefix != "" && cfg.Prefix[0] != '/' {
-		panic("static: Prefix must start with /")
+	if cfg.Root == "" && cfg.FS == nil {
+		panic("static: Root or FS must be set")
 	}
 }

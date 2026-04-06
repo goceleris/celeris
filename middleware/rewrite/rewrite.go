@@ -2,36 +2,29 @@ package rewrite
 
 import (
 	"regexp"
-	"slices"
 
 	"github.com/goceleris/celeris"
 )
 
-type rule struct {
+type compiledRule struct {
 	pattern     *regexp.Regexp
 	replacement string
 }
 
 // New creates a rewrite middleware with the given config. Rules are compiled
-// into regular expressions at init time and sorted alphabetically by pattern
-// string for deterministic first-match-wins ordering.
+// into regular expressions at init time and evaluated in the order provided.
+// The first matching regex wins and subsequent rules are not checked.
 //
 // Panics if Rules is empty or contains an invalid regex pattern
 // (via regexp.MustCompile).
 func New(config Config) celeris.HandlerFunc {
 	config.validate()
 
-	keys := make([]string, 0, len(config.Rules))
-	for k := range config.Rules {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-
-	rules := make([]rule, len(keys))
-	for i, k := range keys {
-		rules[i] = rule{
-			pattern:     regexp.MustCompile(k),
-			replacement: config.Rules[k],
+	rules := make([]compiledRule, len(config.Rules))
+	for i, r := range config.Rules {
+		rules[i] = compiledRule{
+			pattern:     regexp.MustCompile(r.Pattern),
+			replacement: r.Replacement,
 		}
 	}
 

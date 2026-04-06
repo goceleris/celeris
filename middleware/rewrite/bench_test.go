@@ -9,8 +9,8 @@ import (
 
 func BenchmarkRewriteNoMatch(b *testing.B) {
 	mw := New(Config{
-		Rules: map[string]string{
-			`^/users/(\d+)/posts$`: "/api/v2/users/$1/posts",
+		Rules: []Rule{
+			{Pattern: `^/users/(d+)/posts$`, Replacement: "/api/v2/users/$1/posts"},
 		},
 	})
 	handler := func(c *celeris.Context) error {
@@ -28,8 +28,8 @@ func BenchmarkRewriteNoMatch(b *testing.B) {
 
 func BenchmarkRewriteMatch(b *testing.B) {
 	mw := New(Config{
-		Rules: map[string]string{
-			`^/users/(\d+)/posts$`: "/api/v2/users/$1/posts",
+		Rules: []Rule{
+			{Pattern: `^/users/(d+)/posts$`, Replacement: "/api/v2/users/$1/posts"},
 		},
 	})
 	handler := func(c *celeris.Context) error {

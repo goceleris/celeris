@@ -16,19 +16,18 @@ func ExampleNew() {
 	})
 }
 
-func ExampleNew_spa() {
-	// Single-page application: non-existent paths serve index.html.
+func ExampleNew_browse() {
+	// Enable directory listing.
 	_ = static.New(static.Config{
-		Root:  "./dist",
-		SPA:   true,
-		Index: "index.html",
+		Root:   "./public",
+		Browse: true,
 	})
 }
 
 func ExampleNew_embedFS() {
 	// Serve files from an embedded filesystem.
 	_ = static.New(static.Config{
-		Filesystem: embeddedFS,
-		Prefix:     "/assets",
+		FS:     embeddedFS,
+		Prefix: "/assets",
 	})
 }

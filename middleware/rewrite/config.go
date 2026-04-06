@@ -6,6 +6,14 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// Rule defines a single rewrite rule.
+type Rule struct {
+	// Pattern is a Go regular expression matched against the request path.
+	Pattern string
+	// Replacement is the replacement string with capture group support ($1, $2).
+	Replacement string
+}
+
 // Config defines the rewrite middleware configuration.
 type Config struct {
 	// Skip defines a function to skip this middleware for certain requests.
@@ -14,14 +22,9 @@ type Config struct {
 	// SkipPaths lists paths to skip (exact match).
 	SkipPaths []string
 
-	// Rules maps regex patterns to replacement strings. Each key is a
-	// regular expression matched against the request path, and the value
-	// is the replacement string. Capture groups ($1, $2, ...) in the
-	// replacement are expanded using regexp.ReplaceAllString semantics.
-	//
-	// Keys are sorted alphabetically at init time to provide deterministic
-	// first-match-wins ordering.
-	Rules map[string]string
+	// Rules defines the rewrite rules. First match wins.
+	// Rules are evaluated in the order provided (not sorted).
+	Rules []Rule
 
 	// RedirectCode controls the rewrite behavior:
 	//   - 0 (default): silent rewrite via SetPath (path is modified in-place)

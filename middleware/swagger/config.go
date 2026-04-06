@@ -1,80 +1,166 @@
 package swagger
 
 import (
-	"io/fs"
+	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/goceleris/celeris"
 )
+
+// UIRenderer selects the frontend used to render the API specification.
+type UIRenderer string
+
+const (
+	// RendererSwaggerUI uses Swagger UI (default).
+	RendererSwaggerUI UIRenderer = "swagger-ui"
+	// RendererScalar uses Scalar API reference.
+	RendererScalar UIRenderer = "scalar"
+)
+
+// UIConfig controls the appearance and behavior of the Swagger UI or
+// Scalar renderer.
+type UIConfig struct {
+	// DocExpansion controls how operations are displayed on first load.
+	// Valid values: "list" (default, expand tags), "full" (expand everything),
+	// "none" (collapse all).
+	DocExpansion string
+
+	// DeepLinking enables deep linking for tags and operations.
+	DeepLinking bool
+
+	// PersistAuthorization persists authorization data across browser sessions.
+	PersistAuthorization bool
+
+	// DefaultModelsExpandDepth controls how deep models are expanded.
+	// Default 1. Set to -1 to completely hide models.
+	DefaultModelsExpandDepth int
+
+	// Title is the HTML page title. Default: "API Documentation".
+	Title string
+}
 
 // Config defines the swagger middleware configuration.
 type Config struct {
 	// Skip defines a function to skip this middleware for certain requests.
 	Skip func(c *celeris.Context) bool
 
-	// SkipPaths lists paths to skip (exact match).
+	// SkipPaths lists paths to skip (exact match on c.Path()).
 	SkipPaths []string
 
-	// SpecURL is the URL path that serves the raw OpenAPI spec.
-	// Default: "/swagger/doc.json".
-	SpecURL string
-
-	// UIPath is the URL path prefix for the Swagger UI page.
+	// BasePath is the URL prefix for the swagger endpoints.
 	// Default: "/swagger".
-	UIPath string
+	// The middleware registers:
+	//   {BasePath}/         — UI page
+	//   {BasePath}/spec     — raw spec file
+	BasePath string
 
-	// SpecContent is the raw OpenAPI specification bytes (JSON or YAML).
-	// Either SpecContent or Filesystem must be set.
+	// SpecContent is the raw OpenAPI specification content (JSON or YAML).
+	// Either SpecContent or SpecURL must be set.
 	SpecContent []byte
 
-	// Filesystem provides an alternative source for the OpenAPI spec.
-	// When set, the spec is read from Filesystem at SpecFile path.
-	Filesystem fs.FS
+	// SpecURL is a URL to an externally hosted spec file. When set,
+	// SpecContent is ignored and no /spec endpoint is registered.
+	SpecURL string
 
-	// SpecFile is the path within Filesystem to read the spec from.
-	// Default: "openapi.json".
+	// SpecFile is the original filename of the spec (e.g. "openapi.yaml").
+	// Used as a hint for content-type detection when SpecContent is provided.
+	// When omitted, content-type is detected from the spec bytes.
 	SpecFile string
 
-	// UIEngine selects the documentation UI.
-	// Supported values: "swagger-ui" (default) or "scalar".
-	UIEngine string
+	// Renderer selects the UI renderer. Default: RendererSwaggerUI.
+	Renderer UIRenderer
 
-	// AuthFunc is an optional authentication check executed before
-	// serving the UI or spec. If it returns false, the middleware
-	// responds with 403 Forbidden.
-	AuthFunc func(c *celeris.Context) bool
+	// UI controls the appearance and behavior of the UI renderer.
+	UI UIConfig
+
+	// AssetsPath, when set, serves Swagger UI assets from a local path
+	// instead of the default CDN. The HTML template references scripts and
+	// stylesheets from this prefix (e.g. {AssetsPath}/swagger-ui-bundle.js).
+	//
+	// Users must serve the assets themselves, for example with a static
+	// file middleware:
+	//
+	//   server.Use(static.New(static.Config{Root: "./swagger-ui-dist", Prefix: "/swagger-assets"}))
+	//   server.Use(swagger.New(swagger.Config{
+	//       SpecContent: spec,
+	//       AssetsPath:  "/swagger-assets",
+	//   }))
+	AssetsPath string
 }
 
 var defaultConfig = Config{
-	SpecURL:  "/swagger/doc.json",
-	UIPath:   "/swagger",
-	SpecFile: "openapi.json",
-	UIEngine: "swagger-ui",
+	BasePath: "/swagger",
+	Renderer: RendererSwaggerUI,
+	UI: UIConfig{
+		DocExpansion:             "list",
+		DefaultModelsExpandDepth: 1,
+		Title:                    "API Documentation",
+	},
 }
 
 func applyDefaults(cfg Config) Config {
-	if cfg.SpecURL == "" {
-		cfg.SpecURL = defaultConfig.SpecURL
+	if cfg.BasePath == "" {
+		cfg.BasePath = defaultConfig.BasePath
 	}
-	if cfg.UIPath == "" {
-		cfg.UIPath = defaultConfig.UIPath
+	if cfg.Renderer == "" {
+		cfg.Renderer = defaultConfig.Renderer
 	}
-	if cfg.SpecFile == "" {
-		cfg.SpecFile = defaultConfig.SpecFile
+	if cfg.UI.DocExpansion == "" {
+		cfg.UI.DocExpansion = defaultConfig.UI.DocExpansion
 	}
-	if cfg.UIEngine == "" {
-		cfg.UIEngine = defaultConfig.UIEngine
+	if cfg.UI.DefaultModelsExpandDepth == 0 {
+		cfg.UI.DefaultModelsExpandDepth = defaultConfig.UI.DefaultModelsExpandDepth
+	}
+	if cfg.UI.Title == "" {
+		cfg.UI.Title = defaultConfig.UI.Title
 	}
 	return cfg
 }
 
 func (cfg Config) validate() {
-	if cfg.SpecContent == nil && cfg.Filesystem == nil {
-		panic("swagger: either SpecContent or Filesystem must be set")
+	if cfg.BasePath == "" || cfg.BasePath[0] != '/' {
+		panic("swagger: BasePath must start with '/'")
 	}
-	if cfg.UIPath != "" && cfg.UIPath[0] != '/' {
-		panic("swagger: UIPath must start with /")
+	if cfg.SpecContent == nil && cfg.SpecURL == "" {
+		panic("swagger: either SpecContent or SpecURL must be set")
 	}
-	if cfg.SpecURL != "" && cfg.SpecURL[0] != '/' {
-		panic("swagger: SpecURL must start with /")
+	switch cfg.Renderer {
+	case RendererSwaggerUI, RendererScalar:
+		// valid
+	default:
+		panic(fmt.Sprintf("swagger: unknown Renderer %q", cfg.Renderer))
 	}
+	switch cfg.UI.DocExpansion {
+	case "list", "full", "none":
+		// valid
+	default:
+		panic(fmt.Sprintf("swagger: unknown DocExpansion %q", cfg.UI.DocExpansion))
+	}
+}
+
+// detectSpecContentType determines the MIME type for the spec content.
+// It checks the file extension first, then falls back to inspecting the
+// first non-whitespace byte of the content.
+func detectSpecContentType(content []byte, filename string) string {
+	if filename != "" {
+		ext := strings.ToLower(filepath.Ext(filename))
+		switch ext {
+		case ".json":
+			return "application/json"
+		case ".yaml", ".yml":
+			return "application/x-yaml"
+		}
+	}
+	for _, b := range content {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{', '[':
+			return "application/json"
+		default:
+			return "application/x-yaml"
+		}
+	}
+	return "application/json"
 }

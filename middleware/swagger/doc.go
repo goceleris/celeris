@@ -1,85 +1,79 @@
-// Package swagger provides API documentation middleware for celeris.
+// Package swagger provides OpenAPI specification viewer middleware for
+// celeris.
 //
-// The middleware serves an interactive API documentation UI (Swagger UI
-// or Scalar) and the raw OpenAPI specification at configurable URL paths.
-// No assets are bundled; both UIs are loaded from CDN (jsdelivr.net) at
-// page load time. The HTML pages and spec bytes are rendered once at
-// init time and served from memory on each request.
+// The middleware serves a Swagger UI (or Scalar) page and the raw OpenAPI
+// spec at configurable URL paths. It supports both JSON and YAML specs
+// with automatic content-type detection.
 //
-// Basic usage with inline spec:
+// Basic usage with an embedded spec:
 //
-//	spec, _ := os.ReadFile("openapi.json")
-//	server.Use(swagger.New(swagger.Config{
-//	    SpecContent: spec,
-//	}))
-//
-// Usage with embed.FS:
+//	import "embed"
 //
 //	//go:embed openapi.json
-//	var specFS embed.FS
+//	var spec []byte
 //
 //	server.Use(swagger.New(swagger.Config{
-//	    Filesystem: specFS,
-//	    SpecFile:   "openapi.json",
+//	    SpecContent: spec,
 //	}))
 //
-// # UI Engines
+// Custom base path and UI options:
 //
-// Set [Config].UIEngine to select the documentation frontend:
-//
-//   - "swagger-ui" (default): classic Swagger UI from swagger-ui-dist
-//   - "scalar": modern Scalar API Reference
-//
-// # Authentication
-//
-// Use [Config].AuthFunc to restrict access to documentation endpoints.
-// When AuthFunc returns false, the middleware responds with 403 Forbidden:
-//
-//	swagger.New(swagger.Config{
+//	server.Use(swagger.New(swagger.Config{
 //	    SpecContent: spec,
-//	    AuthFunc: func(c *celeris.Context) bool {
-//	        return c.Header("x-api-key") == "secret"
+//	    BasePath:    "/docs",
+//	    UI: swagger.UIConfig{
+//	        DocExpansion:         "full",
+//	        DeepLinking:          true,
+//	        PersistAuthorization: true,
+//	        Title:                "My API",
 //	    },
-//	})
+//	}))
 //
-// # Content Security Policy (CSP)
+// Using Scalar instead of Swagger UI:
 //
-// The UI pages load JavaScript and CSS from cdn.jsdelivr.net. If the
-// secure middleware (or any upstream proxy) sets a Content-Security-Policy
-// header, the swagger UI will be blocked unless the CSP includes:
+//	server.Use(swagger.New(swagger.Config{
+//	    SpecContent: spec,
+//	    Renderer:    swagger.RendererScalar,
+//	}))
 //
-//	script-src cdn.jsdelivr.net; style-src cdn.jsdelivr.net;
+// External spec URL (no /spec endpoint registered):
 //
-// The CDN URLs use @latest version tags. For production deployments that
-// require deterministic builds, provide a custom HTML page via a separate
-// static middleware instead of relying on CDN @latest.
+//	server.Use(swagger.New(swagger.Config{
+//	    SpecURL: "https://petstore.swagger.io/v2/swagger.json",
+//	}))
 //
-// # Middleware Ordering
+// # Air-Gapped / Self-Hosted Assets
 //
-// Place swagger after debug middleware and before application-level
-// middleware (cors, secure, etc.) so that documentation endpoints are
-// served without unnecessary processing:
+// By default, CSS and JavaScript are loaded from public CDNs. For
+// environments without internet access, set [Config].AssetsPath to a
+// local URL prefix and serve the bundled assets with a static file
+// middleware:
 //
-//	server.Use(debug.New(...))
-//	server.Use(swagger.New(...))
-//	server.Use(cors.New(...))
+//	server.Use(static.New(static.Config{
+//	    Root:   "./swagger-ui-dist",
+//	    Prefix: "/swagger-assets",
+//	}))
+//	server.Use(swagger.New(swagger.Config{
+//	    SpecContent: spec,
+//	    AssetsPath:  "/swagger-assets",
+//	}))
 //
-// # fs.FS Support
+// # Content-Type Detection
 //
-// When [Config].Filesystem is set, the spec is read once during
-// middleware initialization and cached. The filesystem is not accessed
-// at request time. [Config].SpecFile controls the path within the
-// filesystem (default "openapi.json").
+// When serving the spec via the /spec endpoint, the middleware
+// auto-detects whether the content is JSON or YAML. Detection checks
+// the [Config].SpecFile extension first (.json, .yaml, .yml), then
+// inspects the first non-whitespace byte of the content ('{' or '['
+// indicates JSON; anything else is assumed YAML).
 //
-// # Paths
+// # Endpoints
 //
-// Default paths: UI at "/swagger", spec at "/swagger/doc.json".
-// Both are configurable via [Config].UIPath and [Config].SpecURL.
-// Non-matching requests pass through to the next handler with zero
-// overhead.
+// The middleware registers:
 //
-// # Skipping
+//   - {BasePath}/     — renders the UI page (HTML)
+//   - {BasePath}/spec — serves the raw spec (JSON or YAML)
+//   - {BasePath}      — redirects to {BasePath}/
 //
-// Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for
-// path exclusions. SkipPaths uses exact path matching.
+// Requests to other paths pass through. Only GET and HEAD are handled;
+// other methods return 405.
 package swagger

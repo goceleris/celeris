@@ -2,116 +2,149 @@ package swagger
 
 import (
 	"fmt"
-	"html"
-	"io"
 	"strings"
 
 	"github.com/goceleris/celeris"
 )
 
-const swaggerUITemplate = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Swagger UI</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@latest/swagger-ui.css">
-</head>
-<body>
-<div id="swagger-ui"></div>
-<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@latest/swagger-ui-bundle.js"></script>
-<script>
-SwaggerUIBundle({
-  url: "%s",
-  dom_id: "#swagger-ui",
-  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
-  layout: "BaseLayout"
-});
-</script>
-</body>
-</html>`
-
-const scalarTemplate = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>API Reference</title>
-</head>
-<body>
-<script id="api-reference" data-url="%s"></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@latest"></script>
-</body>
-</html>`
-
-// New creates a swagger documentation middleware with the given config.
+// New creates a swagger middleware that serves an OpenAPI spec viewer.
 func New(config ...Config) celeris.HandlerFunc {
-	var cfg Config
+	cfg := defaultConfig
 	if len(config) > 0 {
 		cfg = config[0]
 	}
 	cfg = applyDefaults(cfg)
 	cfg.validate()
 
-	specBytes := loadSpec(cfg)
+	basePath := strings.TrimRight(cfg.BasePath, "/")
+	uiPath := basePath + "/"
+	specPath := basePath + "/spec"
 
-	// Escape SpecURL for safe embedding in HTML/JavaScript contexts.
-	// Prevents XSS if SpecURL contains quotes or script tags.
-	safeURL := html.EscapeString(cfg.SpecURL)
-
-	var uiHTML string
-	switch cfg.UIEngine {
-	case "scalar":
-		uiHTML = fmt.Sprintf(scalarTemplate, safeURL)
-	default:
-		uiHTML = fmt.Sprintf(swaggerUITemplate, safeURL)
+	var specContentType string
+	if cfg.SpecContent != nil {
+		specContentType = detectSpecContentType(cfg.SpecContent, cfg.SpecFile)
 	}
 
-	uiPath := strings.TrimRight(cfg.UIPath, "/")
-	uiPathSlash := uiPath + "/"
 	specURL := cfg.SpecURL
-	authFunc := cfg.AuthFunc
+	if specURL == "" {
+		specURL = specPath
+	}
+
+	page := buildPage(cfg, specURL)
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	return func(c *celeris.Context) error {
-		path := c.Path()
-
 		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 
-		if path != uiPath && path != uiPathSlash && path != specURL {
+		path := c.Path()
+
+		if path != basePath && path != uiPath && path != specPath {
 			return c.Next()
 		}
 
-		if authFunc != nil && !authFunc(c) {
-			return c.NoContent(403)
+		method := c.Method()
+		if method != "GET" && method != "HEAD" {
+			return c.NoContent(405)
 		}
 
-		if path == specURL {
-			return c.Blob(200, "application/json", specBytes)
+		switch path {
+		case basePath:
+			c.SetHeader("location", uiPath)
+			return c.NoContent(301)
+		case uiPath:
+			return c.HTML(200, page)
+		case specPath:
+			if cfg.SpecContent == nil {
+				return c.NoContent(404)
+			}
+			return c.Blob(200, specContentType, cfg.SpecContent)
 		}
 
-		return c.HTML(200, uiHTML)
+		return c.Next()
 	}
 }
 
-func loadSpec(cfg Config) []byte {
-	if cfg.SpecContent != nil {
-		cp := make([]byte, len(cfg.SpecContent))
-		copy(cp, cfg.SpecContent)
-		return cp
+// buildPage generates the HTML page for the configured renderer.
+func buildPage(cfg Config, specURL string) string {
+	switch cfg.Renderer {
+	case RendererScalar:
+		return buildScalarPage(cfg, specURL)
+	default:
+		return buildSwaggerUIPage(cfg, specURL)
 	}
-	f, err := cfg.Filesystem.Open(cfg.SpecFile)
-	if err != nil {
-		panic("swagger: failed to open spec from Filesystem: " + err.Error())
+}
+
+func buildSwaggerUIPage(cfg Config, specURL string) string {
+	ui := cfg.UI
+
+	var cssURL, bundleURL, presetURL string
+	if cfg.AssetsPath != "" {
+		base := strings.TrimRight(cfg.AssetsPath, "/")
+		cssURL = base + "/swagger-ui.css"
+		bundleURL = base + "/swagger-ui-bundle.js"
+		presetURL = base + "/swagger-ui-standalone-preset.js"
+	} else {
+		const cdn = "https://unpkg.com/swagger-ui-dist@5"
+		cssURL = cdn + "/swagger-ui.css"
+		bundleURL = cdn + "/swagger-ui-bundle.js"
+		presetURL = cdn + "/swagger-ui-standalone-preset.js"
 	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(f)
-	if err != nil {
-		panic("swagger: failed to read spec from Filesystem: " + err.Error())
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+<link rel="stylesheet" href="%s">
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="%s"></script>
+<script src="%s"></script>
+<script>
+SwaggerUIBundle({
+  url: %q,
+  dom_id: "#swagger-ui",
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+  layout: "StandaloneLayout",
+  docExpansion: %q,
+  deepLinking: %v,
+  persistAuthorization: %v,
+  defaultModelsExpandDepth: %d
+});
+</script>
+</body>
+</html>`, ui.Title, cssURL, bundleURL, presetURL,
+		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization, ui.DefaultModelsExpandDepth)
+}
+
+func buildScalarPage(cfg Config, specURL string) string {
+	ui := cfg.UI
+
+	var scriptTag string
+	if cfg.AssetsPath != "" {
+		base := strings.TrimRight(cfg.AssetsPath, "/")
+		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='{"theme":"default"}'></script>
+<script src="%s/standalone.min.js"></script>`, specURL, base)
+	} else {
+		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='{"theme":"default"}'></script>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>`, specURL)
 	}
-	return data
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+</head>
+<body>
+%s
+</body>
+</html>`, ui.Title, scriptTag)
 }
