@@ -33,3 +33,16 @@ func ExampleNew_redirect() {
 		RedirectCode: 301,
 	})
 }
+
+func ExampleNew_conditional() {
+	// Method-restricted rewriting: only rewrite GET and HEAD requests.
+	_ = rewrite.New(rewrite.Config{
+		Rules: []rewrite.Rule{
+			{
+				Pattern:     "^/api/v1/(.*)$",
+				Replacement: "/api/v2/$1",
+				Methods:     []string{"GET", "HEAD"},
+			},
+		},
+	})
+}

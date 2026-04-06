@@ -476,6 +476,70 @@ func TestReverseProxyBehavioral(t *testing.T) {
 	testutil.AssertBodyContains(t, rec, "backend-response")
 }
 
+func TestReverseProxyWithModifyResponse(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend-Version", "1.0")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "from-backend")
+	}))
+	defer backend.Close()
+
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("parse backend URL: %v", err)
+	}
+
+	h := ReverseProxy(target,
+		WithModifyResponse(func(resp *http.Response) error {
+			resp.Header.Set("X-Modified", "true")
+			return nil
+		}),
+	)
+
+	chain := []celeris.HandlerFunc{h}
+	rec, err := testutil.RunChain(t, chain, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertHeader(t, rec, "x-modified", "true")
+	testutil.AssertBodyContains(t, rec, "from-backend")
+}
+
+func TestResponseCaptureFlusher(t *testing.T) {
+	rec := &responseCapture{header: make(http.Header)}
+
+	// Verify responseCapture implements http.Flusher.
+	flusher, ok := http.ResponseWriter(rec).(http.Flusher)
+	if !ok {
+		t.Fatal("responseCapture does not implement http.Flusher")
+	}
+
+	// Flush should not panic.
+	flusher.Flush()
+}
+
+func TestWrapMiddlewareWithFlusher(t *testing.T) {
+	// Stdlib middleware that type-asserts Flusher and calls Flush.
+	flushMW := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	handler := func(c *celeris.Context) error {
+		return c.String(200, "flushed")
+	}
+
+	mw := WrapMiddleware(flushMW)
+	chain := []celeris.HandlerFunc{mw, handler}
+	rec, err := testutil.RunChain(t, chain, "GET", "/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertBodyContains(t, rec, "flushed")
+}
+
 func TestReverseProxyErrorHandler(t *testing.T) {
 	// Create a test server and close it immediately to get a dead port.
 	deadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))

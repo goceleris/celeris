@@ -51,6 +51,13 @@ type Config struct {
 	// MaxAge sets the Cache-Control max-age directive. Zero means no
 	// Cache-Control header.
 	MaxAge time.Duration
+
+	// Compress enables serving pre-compressed files. When true, the middleware
+	// checks for .br (Brotli) and .gz (gzip) variants of the requested file
+	// and serves them if the client accepts the encoding via Accept-Encoding.
+	// Brotli is preferred over gzip when both are accepted. Only applies to
+	// OS filesystem (Root), not fs.FS.
+	Compress bool
 }
 
 var defaultConfig = Config{

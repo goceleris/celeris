@@ -73,3 +73,50 @@ func ExampleNew_localAssets() {
 		AssetsPath:  "/swagger-assets",
 	}))
 }
+
+func ExampleNew_oauth2() {
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
+		SpecContent: spec,
+		UI: swagger.UIConfig{
+			OAuth2RedirectURL: "https://example.com/oauth2-redirect",
+			OAuth2: &swagger.OAuth2Config{
+				ClientID: "my-client-id",
+				AppName:  "My Application",
+				Scopes:   []string{"read:api", "write:api"},
+			},
+		},
+	}))
+}
+
+func ExampleNew_redocCustom() {
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
+		SpecContent: spec,
+		Renderer:    swagger.RendererReDoc,
+		ReDoc: swagger.ReDocConfig{
+			Theme:              "dark",
+			ExpandResponses:    "200",
+			HideDownloadButton: true,
+		},
+	}))
+}
+
+func ExampleIntPtr() {
+	server := celeris.New(celeris.Config{})
+
+	spec := []byte(`{"openapi":"3.0.0","info":{"title":"Test","version":"1.0"}}`)
+
+	server.Use(swagger.New(swagger.Config{
+		SpecContent: spec,
+		UI: swagger.UIConfig{
+			DefaultModelsExpandDepth: swagger.IntPtr(0),
+		},
+	}))
+}

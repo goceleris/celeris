@@ -8,6 +8,17 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// IntPtr returns a pointer to v. Use this helper to set
+// [UIConfig].DefaultModelsExpandDepth to zero or other values that
+// would otherwise be indistinguishable from an unset field:
+//
+//	swagger.Config{
+//	    UI: swagger.UIConfig{
+//	        DefaultModelsExpandDepth: swagger.IntPtr(0),
+//	    },
+//	}
+func IntPtr(v int) *int { return &v }
+
 // UIRenderer selects the frontend used to render the API specification.
 type UIRenderer string
 
@@ -38,14 +49,58 @@ type UIConfig struct {
 	PersistAuthorization bool
 
 	// DefaultModelsExpandDepth controls how deep models are expanded.
-	// Default 1 (nil). Set to -1 to completely hide models.
-	// Use a pointer to distinguish zero (valid: "expand 0 levels") from
-	// unset (nil: use default 1).
+	// Default 1 (nil pointer means use default). Set to -1 to completely
+	// hide models. Use [IntPtr] to set to zero (show model name only):
+	//
+	//	DefaultModelsExpandDepth: swagger.IntPtr(0)
+	//
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	DefaultModelsExpandDepth *int
 
+	// OAuth2RedirectURL sets the OAuth2 redirect URL for Swagger UI.
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
+	OAuth2RedirectURL string
+
+	// OAuth2 pre-fills the OAuth2 authorization dialog in Swagger UI.
+	// When nil, no OAuth2 initialization is emitted.
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
+	OAuth2 *OAuth2Config
+
 	// Title is the HTML page title. Default: "API Documentation".
 	Title string
+}
+
+// OAuth2Config pre-fills the OAuth2 authorization dialog in Swagger UI.
+type OAuth2Config struct {
+	// ClientID is the OAuth2 client identifier.
+	ClientID string
+	// ClientSecret is the OAuth2 client secret. Only for confidential clients.
+	ClientSecret string
+	// Realm is the OAuth2 realm.
+	Realm string
+	// AppName is the application name shown in the authorization dialog.
+	AppName string
+	// Scopes lists the default OAuth2 scopes to request.
+	Scopes []string
+}
+
+// ReDocConfig configures ReDoc-specific options. These fields are ignored
+// when [Config].Renderer is not [RendererReDoc].
+type ReDocConfig struct {
+	// Theme sets the ReDoc theme. Valid values: "light", "dark".
+	// Default: "" (ReDoc default, which is light).
+	Theme string
+	// ExpandResponses controls which response codes are expanded.
+	// Comma-separated list of codes (e.g. "200,201") or "all".
+	// Default: "" (none expanded).
+	ExpandResponses string
+	// HideDownloadButton hides the "Download" button for the spec.
+	HideDownloadButton bool
+	// ScrollYOffset sets the vertical scroll offset in pixels.
+	// Default: 0.
+	ScrollYOffset int
+	// NoAutoAuth disables automatic authentication.
+	NoAutoAuth bool
 }
 
 // Config defines the swagger middleware configuration.
@@ -82,6 +137,10 @@ type Config struct {
 	// UI controls the appearance and behavior of the UI renderer.
 	UI UIConfig
 
+	// ReDoc configures ReDoc-specific options. Ignored when Renderer is
+	// not [RendererReDoc].
+	ReDoc ReDocConfig
+
 	// AssetsPath, when set, serves Swagger UI assets from a local path
 	// instead of the default CDN. The HTML template references scripts and
 	// stylesheets from this prefix (e.g. {AssetsPath}/swagger-ui-bundle.js).
@@ -106,8 +165,6 @@ var defaultConfig = Config{
 	},
 }
 
-func intPtr(v int) *int { return &v }
-
 func applyDefaults(cfg Config) Config {
 	if cfg.BasePath == "" {
 		cfg.BasePath = defaultConfig.BasePath
@@ -119,7 +176,7 @@ func applyDefaults(cfg Config) Config {
 		cfg.UI.DocExpansion = defaultConfig.UI.DocExpansion
 	}
 	if cfg.UI.DefaultModelsExpandDepth == nil {
-		cfg.UI.DefaultModelsExpandDepth = intPtr(1)
+		cfg.UI.DefaultModelsExpandDepth = IntPtr(1)
 	}
 	if cfg.UI.Title == "" {
 		cfg.UI.Title = defaultConfig.UI.Title

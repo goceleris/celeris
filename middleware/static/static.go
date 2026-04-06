@@ -39,6 +39,7 @@ func New(config ...Config) celeris.HandlerFunc {
 	maxAge := cfg.MaxAge
 	root := cfg.Root
 	fsys := cfg.FS
+	compress := cfg.Compress
 
 	// Precompute cleanRoot once instead of per request.
 	var cleanRoot string
@@ -80,14 +81,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		if fsys != nil {
 			return serveFS(c, fsys, filePath, index, browse, spa, maxAge)
 		}
-		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge)
+		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge, compress)
 	}
 }
 
 // serveOS serves a file from the OS filesystem using c.FileFromDir (which
 // handles directory traversal, symlink escape, and range requests).
 // cleanRoot must be filepath.Clean(root) — precomputed by New.
-func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, maxAge time.Duration) error {
+func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, maxAge time.Duration, compress bool) error {
 	fullPath := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
 
 	// Prevent directory traversal: filepath.Join resolves ".." segments,
@@ -139,7 +140,42 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		return c.NoContent(304)
 	}
 
+	if compress {
+		if served, err := servePreCompressed(c, cleanRoot, filePath, fullPath); served {
+			return err
+		}
+	}
+
 	return c.FileFromDir(cleanRoot, filePath)
+}
+
+// servePreCompressed checks for .br or .gz pre-compressed variants of the
+// requested file and serves them if the client accepts the encoding.
+// Returns (true, err) if a pre-compressed file was served, (false, nil) to
+// fall through to normal serving.
+func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string) (bool, error) {
+	ae := c.Header("accept-encoding")
+	if ae == "" {
+		return false, nil
+	}
+
+	// Prefer Brotli over gzip.
+	if strings.Contains(ae, "br") {
+		if _, err := os.Stat(fullPath + ".br"); err == nil {
+			c.SetHeader("content-encoding", "br")
+			c.AddHeader("vary", "Accept-Encoding")
+			return true, c.FileFromDir(cleanRoot, filePath+".br")
+		}
+	}
+	if strings.Contains(ae, "gzip") {
+		if _, err := os.Stat(fullPath + ".gz"); err == nil {
+			c.SetHeader("content-encoding", "gzip")
+			c.AddHeader("vary", "Accept-Encoding")
+			return true, c.FileFromDir(cleanRoot, filePath+".gz")
+		}
+	}
+
+	return false, nil
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
@@ -191,6 +227,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		return celeris.NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
+	// Compute caching headers before any file reads.
 	modTime := stat.ModTime()
 	if !modTime.IsZero() {
 		etag := setCacheHeaders(c, modTime, size, maxAge)
@@ -199,14 +236,21 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		}
 	}
 
-	contentType := mime.TypeByExtension(filepath.Ext(filePath))
-	if contentType == "" {
-		contentType = "application/octet-stream"
+	// ReadSeeker fast-path: range requests read only the requested range
+	// instead of the entire file.
+	if rs, ok := f.(io.ReadSeeker); ok {
+		return serveFSReadSeeker(c, rs, filePath, size)
 	}
 
+	// Non-ReadSeeker fallback: read entire file into memory.
 	data := make([]byte, size)
 	if _, err := io.ReadFull(f, data); err != nil {
 		return err
+	}
+
+	contentType := mime.TypeByExtension(filepath.Ext(filePath))
+	if contentType == "" {
+		contentType = http.DetectContentType(data[:min(512, len(data))])
 	}
 
 	c.SetHeader("accept-ranges", "bytes")
@@ -218,6 +262,43 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		}
 	}
 
+	return c.Blob(200, contentType, data)
+}
+
+// serveFSReadSeeker serves a file from an fs.FS file that implements
+// io.ReadSeeker. Range requests seek to the requested offset and read
+// only the required bytes instead of loading the entire file.
+func serveFSReadSeeker(c *celeris.Context, rs io.ReadSeeker, filePath string, size int64) error {
+	contentType := mime.TypeByExtension(filepath.Ext(filePath))
+	if contentType == "" {
+		buf := make([]byte, 512)
+		n, _ := io.ReadAtLeast(rs, buf, 1)
+		contentType = http.DetectContentType(buf[:n])
+		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+	}
+
+	c.SetHeader("accept-ranges", "bytes")
+
+	if rng := c.Header("range"); rng != "" {
+		if start, end, ok := parseByteRange(rng, size); ok {
+			if _, err := rs.Seek(start, io.SeekStart); err != nil {
+				return err
+			}
+			data := make([]byte, end-start+1)
+			if _, err := io.ReadFull(rs, data); err != nil {
+				return err
+			}
+			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			return c.Blob(206, contentType, data)
+		}
+	}
+
+	data := make([]byte, size)
+	if _, err := io.ReadFull(rs, data); err != nil {
+		return err
+	}
 	return c.Blob(200, contentType, data)
 }
 

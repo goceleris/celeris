@@ -8,6 +8,37 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// buildReDocOptions returns a JavaScript object literal string from the
+// ReDocConfig. Empty/zero fields are omitted so ReDoc uses its own defaults.
+func buildReDocOptions(rd ReDocConfig) string {
+	var parts []string
+	if rd.Theme != "" {
+		parts = append(parts, fmt.Sprintf("theme:{colors:{primary:{main:%q}}}", rd.Theme))
+		// "dark" needs special handling: ReDoc doesn't have a single "dark"
+		// toggle, so we translate to the known rightPanel/text colours.
+		if rd.Theme == "dark" {
+			parts = parts[:len(parts)-1]
+			parts = append(parts, `theme:{colors:{primary:{main:"#32329f"}},typography:{color:"#fff"},rightPanel:{backgroundColor:"#263238"},schema:{nestedBackground:"#1a1a2e"}}`)
+		}
+	}
+	if rd.ExpandResponses != "" {
+		parts = append(parts, fmt.Sprintf("expandResponses: %q", rd.ExpandResponses))
+	}
+	if rd.HideDownloadButton {
+		parts = append(parts, "hideDownloadButton: true")
+	}
+	if rd.ScrollYOffset != 0 {
+		parts = append(parts, fmt.Sprintf("scrollYOffset: %d", rd.ScrollYOffset))
+	}
+	if rd.NoAutoAuth {
+		parts = append(parts, "noAutoAuth: true")
+	}
+	if len(parts) == 0 {
+		return "{}"
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
 // New creates a swagger middleware that serves an OpenAPI spec viewer.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
@@ -101,6 +132,33 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		presetURL = cdn + "/swagger-ui-standalone-preset.js"
 	}
 
+	var oauth2Redirect string
+	if ui.OAuth2RedirectURL != "" {
+		oauth2Redirect = fmt.Sprintf(",\n  oauth2RedirectUrl: %q", ui.OAuth2RedirectURL)
+	}
+
+	var oauth2Init string
+	if ui.OAuth2 != nil {
+		oa := ui.OAuth2
+		var oaParts []string
+		if oa.ClientID != "" {
+			oaParts = append(oaParts, fmt.Sprintf("clientId: %q", oa.ClientID))
+		}
+		if oa.ClientSecret != "" {
+			oaParts = append(oaParts, fmt.Sprintf("clientSecret: %q", oa.ClientSecret))
+		}
+		if oa.Realm != "" {
+			oaParts = append(oaParts, fmt.Sprintf("realm: %q", oa.Realm))
+		}
+		if oa.AppName != "" {
+			oaParts = append(oaParts, fmt.Sprintf("appName: %q", oa.AppName))
+		}
+		if len(oa.Scopes) > 0 {
+			oaParts = append(oaParts, fmt.Sprintf("scopes: %q", strings.Join(oa.Scopes, " ")))
+		}
+		oauth2Init = fmt.Sprintf("\nui.initOAuth({%s});", strings.Join(oaParts, ", "))
+	}
+
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -114,7 +172,7 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 <script src="%s"></script>
 <script src="%s"></script>
 <script>
-SwaggerUIBundle({
+const ui = SwaggerUIBundle({
   url: %q,
   dom_id: "#swagger-ui",
   presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
@@ -122,12 +180,13 @@ SwaggerUIBundle({
   docExpansion: %q,
   deepLinking: %v,
   persistAuthorization: %v,
-  defaultModelsExpandDepth: %d
-});
+  defaultModelsExpandDepth: %d%s
+});%s
 </script>
 </body>
 </html>`, html.EscapeString(ui.Title), cssURL, bundleURL, presetURL,
-		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization, depth)
+		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization, depth,
+		oauth2Redirect, oauth2Init)
 }
 
 func buildScalarPage(cfg Config, specURL string) string {
@@ -158,6 +217,7 @@ func buildScalarPage(cfg Config, specURL string) string {
 
 func buildReDocPage(cfg Config, specURL string) string {
 	ui := cfg.UI
+	opts := buildReDocOptions(cfg.ReDoc)
 
 	var jsURL string
 	if cfg.AssetsPath != "" {
@@ -178,8 +238,8 @@ func buildReDocPage(cfg Config, specURL string) string {
 <div id="redoc-container"></div>
 <script src="%s"></script>
 <script>
-Redoc.init(%q, {}, document.getElementById("redoc-container"));
+Redoc.init(%q, %s, document.getElementById("redoc-container"));
 </script>
 </body>
-</html>`, html.EscapeString(ui.Title), jsURL, specURL)
+</html>`, html.EscapeString(ui.Title), jsURL, specURL, opts)
 }

@@ -168,6 +168,14 @@ func (w *responseCapture) WriteHeader(code int) {
 	}
 }
 
+// Flush is a no-op. responseCapture is fully buffered, so there is
+// nothing to flush. Implementing http.Flusher prevents panics in
+// stdlib middleware that type-asserts the ResponseWriter.
+func (w *responseCapture) Flush() {}
+
+// Unwrap returns nil since responseCapture does not wrap a real ResponseWriter.
+func (w *responseCapture) Unwrap() http.ResponseWriter { return nil }
+
 var capturePool = sync.Pool{New: func() any {
 	return &responseCapture{header: make(http.Header)}
 }}
@@ -212,6 +220,9 @@ func ReverseProxy(target *url.URL, opts ...Option) celeris.HandlerFunc {
 	}
 	if cfg.transport != nil {
 		proxy.Transport = cfg.transport
+	}
+	if cfg.modifyResponse != nil {
+		proxy.ModifyResponse = cfg.modifyResponse
 	}
 	if cfg.errorHandler != nil {
 		proxy.ErrorHandler = cfg.errorHandler

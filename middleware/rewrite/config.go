@@ -17,6 +17,13 @@ type Rule struct {
 	// When non-zero, this rule sends an HTTP redirect instead of a silent rewrite.
 	// When zero (default), the config-level RedirectCode is used.
 	RedirectCode int
+	// Methods restricts this rule to specific HTTP methods.
+	// When empty, the rule matches all methods.
+	// Example: []string{"GET", "HEAD"} — only rewrite GET and HEAD requests.
+	Methods []string
+	// Host restricts this rule to a specific Host header value.
+	// When empty, the rule matches all hosts. Supports exact match only.
+	Host string
 }
 
 // Config defines the rewrite middleware configuration.

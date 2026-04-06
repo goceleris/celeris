@@ -47,6 +47,49 @@
 // DefaultModelsExpandDepth) apply only to Swagger UI and are ignored when
 // Renderer is Scalar or ReDoc.
 //
+// Use [IntPtr] when setting [UIConfig].DefaultModelsExpandDepth to zero
+// (show model name only) to distinguish it from the unset nil pointer:
+//
+//	UI: swagger.UIConfig{
+//	    DefaultModelsExpandDepth: swagger.IntPtr(0),
+//	}
+//
+// # ReDoc Customization
+//
+// When using ReDoc, configure theme, expanded responses, and other options
+// via [Config].ReDoc:
+//
+//	server.Use(swagger.New(swagger.Config{
+//	    SpecContent: spec,
+//	    Renderer:    swagger.RendererReDoc,
+//	    ReDoc: swagger.ReDocConfig{
+//	        Theme:              "dark",
+//	        ExpandResponses:    "200,201",
+//	        HideDownloadButton: true,
+//	    },
+//	}))
+//
+// [ReDocConfig] fields are ignored when Renderer is not [RendererReDoc].
+//
+// # OAuth2 Pre-Configuration
+//
+// Swagger UI supports pre-filling the OAuth2 authorization dialog. Set
+// [UIConfig].OAuth2 to configure client credentials:
+//
+//	server.Use(swagger.New(swagger.Config{
+//	    SpecContent: spec,
+//	    UI: swagger.UIConfig{
+//	        OAuth2RedirectURL: "https://example.com/oauth2-redirect",
+//	        OAuth2: &swagger.OAuth2Config{
+//	            ClientID: "my-client-id",
+//	            AppName:  "My Application",
+//	            Scopes:   []string{"read:api", "write:api"},
+//	        },
+//	    },
+//	}))
+//
+// OAuth2 fields are ignored when Renderer is not [RendererSwaggerUI].
+//
 // External spec URL (no /spec endpoint registered):
 //
 //	server.Use(swagger.New(swagger.Config{

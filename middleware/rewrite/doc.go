@@ -72,6 +72,28 @@
 // URL. In silent rewrite mode, the query string is unmodified since only
 // the path is rewritten.
 //
+// # Conditional Rewriting
+//
+// Rules can be restricted to specific HTTP methods or hosts:
+//
+//	server.Pre(rewrite.New(rewrite.Config{
+//	    Rules: []rewrite.Rule{
+//	        {
+//	            Pattern:     "^/api/v1/(.*)$",
+//	            Replacement: "/api/v2/$1",
+//	            Methods:     []string{"GET", "HEAD"},
+//	        },
+//	        {
+//	            Pattern:     "^/admin/(.*)$",
+//	            Replacement: "/internal/$1",
+//	            Host:        "admin.example.com",
+//	        },
+//	    },
+//	}))
+//
+// When Methods is empty, the rule matches all methods. When Host is
+// empty, the rule matches all hosts.
+//
 // # Init-Time Validation
 //
 // [New] panics if Rules is empty, if RedirectCode is non-zero and not a

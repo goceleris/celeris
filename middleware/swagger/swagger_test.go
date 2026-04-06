@@ -536,9 +536,189 @@ func TestDefaultModelsExpandDepthZero(t *testing.T) {
 	assertContains(t, body, `defaultModelsExpandDepth: 0`)
 }
 
+// --- IntPtr helper ---
+
+func TestIntPtr(t *testing.T) {
+	t.Parallel()
+	p := IntPtr(42)
+	if p == nil || *p != 42 {
+		t.Fatalf("IntPtr(42): got %v, want *42", p)
+	}
+	z := IntPtr(0)
+	if z == nil || *z != 0 {
+		t.Fatalf("IntPtr(0): got %v, want *0", z)
+	}
+	n := IntPtr(-1)
+	if n == nil || *n != -1 {
+		t.Fatalf("IntPtr(-1): got %v, want *-1", n)
+	}
+}
+
+// --- ReDoc customization ---
+
+func TestReDocTheme(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		ReDoc: ReDocConfig{
+			Theme: "dark",
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	body := rec.BodyString()
+	assertContains(t, body, `Redoc.init`)
+	assertContains(t, body, `theme:`)
+	assertContains(t, body, `"#263238"`)
+}
+
+func TestReDocExpandResponses(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		ReDoc: ReDocConfig{
+			ExpandResponses: "200,201",
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `expandResponses: "200,201"`)
+}
+
+func TestReDocHideDownloadButton(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		ReDoc: ReDocConfig{
+			HideDownloadButton: true,
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `hideDownloadButton: true`)
+}
+
+func TestReDocScrollYOffset(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		ReDoc: ReDocConfig{
+			ScrollYOffset: 100,
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `scrollYOffset: 100`)
+}
+
+func TestReDocNoAutoAuth(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+		ReDoc: ReDocConfig{
+			NoAutoAuth: true,
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `noAutoAuth: true`)
+}
+
+func TestReDocDefaultOptions(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		Renderer:    RendererReDoc,
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `Redoc.init`)
+	assertContains(t, body, `, {}, document.getElementById`)
+}
+
+// --- OAuth2 ---
+
+func TestOAuth2Config(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		UI: UIConfig{
+			OAuth2: &OAuth2Config{
+				ClientID:     "my-client",
+				ClientSecret: "my-secret",
+				Realm:        "my-realm",
+				AppName:      "My App",
+				Scopes:       []string{"read", "write"},
+			},
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `ui.initOAuth(`)
+	assertContains(t, body, `clientId: "my-client"`)
+	assertContains(t, body, `clientSecret: "my-secret"`)
+	assertContains(t, body, `realm: "my-realm"`)
+	assertContains(t, body, `appName: "My App"`)
+	assertContains(t, body, `scopes: "read write"`)
+}
+
+func TestOAuth2ConfigNil(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{SpecContent: jsonSpec})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertNotContains(t, body, `initOAuth`)
+}
+
+func TestOAuth2ConfigPartial(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		UI: UIConfig{
+			OAuth2: &OAuth2Config{
+				ClientID: "only-id",
+			},
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `ui.initOAuth(`)
+	assertContains(t, body, `clientId: "only-id"`)
+	assertNotContains(t, body, `clientSecret`)
+	assertNotContains(t, body, `realm:`)
+}
+
+func TestOAuth2RedirectURL(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{
+		SpecContent: jsonSpec,
+		UI: UIConfig{
+			OAuth2RedirectURL: "https://example.com/oauth2-redirect",
+		},
+	})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `oauth2RedirectUrl: "https://example.com/oauth2-redirect"`)
+}
+
 // --- helpers ---
 
-func intPtrHelper(v int) *int { return &v }
+func intPtrHelper(v int) *int { return IntPtr(v) }
 
 func assertContains(t *testing.T, s, substr string) {
 	t.Helper()

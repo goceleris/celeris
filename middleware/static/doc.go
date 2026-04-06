@@ -62,7 +62,29 @@
 //
 // OS files support range requests via the core [celeris.Context.FileFromDir]
 // method. For fs.FS files, the middleware implements range request handling
-// inline, supporting single byte ranges (bytes=start-end).
+// inline, supporting single byte ranges (bytes=start-end). When the underlying
+// fs.File implements [io.ReadSeeker], range requests seek to the requested
+// offset and read only the required bytes instead of loading the entire file
+// into memory.
+//
+// # Content-Type Detection
+//
+// Content types are determined by file extension via [mime.TypeByExtension].
+// When the extension is unknown or absent, the middleware sniffs the first 512
+// bytes using [http.DetectContentType] (for fs.FS files) or delegates to the
+// core file-serving method (for OS files).
+//
+// # Pre-Compressed Files
+//
+// When [Config].Compress is true, the middleware checks for pre-compressed
+// variants of the requested file before serving the original. It inspects
+// the Accept-Encoding request header and looks for a .br (Brotli) or .gz
+// (gzip) file alongside the original. Brotli is preferred when both are
+// accepted. The response includes Content-Encoding and Vary headers.
+//
+// Pre-compressed file serving only applies to OS filesystem (Root), not
+// fs.FS. This pairs well with build tools that generate .br and .gz files
+// at deploy time (e.g. Vite, esbuild, or a post-build compression step).
 //
 // # Security
 //

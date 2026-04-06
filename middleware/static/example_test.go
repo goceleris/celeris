@@ -50,3 +50,15 @@ func ExampleNew_maxAge() {
 		MaxAge: 24 * time.Hour,
 	})
 }
+
+func ExampleNew_compress() {
+	// Serve pre-compressed files when available. If the client sends
+	// Accept-Encoding: br, the middleware serves app.js.br instead of
+	// app.js (and sets Content-Encoding: br). Falls back to the original
+	// file when no pre-compressed variant exists.
+	_ = static.New(static.Config{
+		Root:     "./dist",
+		Compress: true,
+		MaxAge:   7 * 24 * time.Hour,
+	})
+}

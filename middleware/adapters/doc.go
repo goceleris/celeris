@@ -26,13 +26,20 @@
 // If the stdlib middleware short-circuits (does not call the inner handler),
 // the captured status code, headers, and body are written through celeris.
 //
+// # Performance
+//
+// WrapMiddleware reconstructs an *http.Request per call, which costs
+// 8-15 heap allocations depending on header count and body presence.
+// For hot-path middleware (e.g., CORS on every request), prefer the native
+// celeris/middleware/cors over adapters.WrapMiddleware(rs/cors) for
+// zero-alloc performance. Use WrapMiddleware for middleware that runs
+// infrequently or where the stdlib library has no native celeris equivalent.
+//
 // # Limitations
 //
-// The responseCapture used by WrapMiddleware does not implement
-// http.Hijacker or http.Flusher. Stdlib middleware that requires
-// WebSocket upgrade (via Hijack) or streaming flush (via Flush)
-// will not work through WrapMiddleware. For these use cases,
-// implement the middleware natively in celeris.
+// The responseCapture implements http.Flusher (as a no-op for compatibility)
+// but does not implement http.Hijacker. Stdlib middleware that requires
+// WebSocket upgrade (via Hijack) will not work through WrapMiddleware.
 //
 // # Reverse Proxy
 //
@@ -46,6 +53,7 @@
 //
 //   - [WithTransport]: set a custom [http.RoundTripper]
 //   - [WithModifyRequest]: mutate outbound requests (e.g. add headers)
+//   - [WithModifyResponse]: inspect or modify backend responses before forwarding
 //   - [WithErrorHandler]: custom error handling for proxy failures
 //
 // The proxy automatically sets X-Forwarded-For, X-Forwarded-Host, and
