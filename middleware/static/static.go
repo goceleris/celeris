@@ -366,7 +366,7 @@ func sniffContentType(rs io.ReadSeeker, filePath string) string {
 	if n > 0 {
 		ct = http.DetectContentType(buf[:n])
 	}
-	rs.Seek(0, io.SeekStart)
+	_, _ = rs.Seek(0, io.SeekStart)
 	if ct == "" {
 		return "application/octet-stream"
 	}
