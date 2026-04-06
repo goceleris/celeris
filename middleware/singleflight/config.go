@@ -1,6 +1,11 @@
 package singleflight
 
-import "github.com/goceleris/celeris"
+import (
+	"net/url"
+	"slices"
+
+	"github.com/goceleris/celeris"
+)
 
 // Config defines the singleflight middleware configuration.
 type Config struct {
@@ -14,7 +19,15 @@ type Config struct {
 	// with the same key that arrive while a leader request is in-flight
 	// are coalesced — waiters receive a copy of the leader's response.
 	//
-	// Default: method + "\x00" + path + "\x00" + sorted-query-string.
+	// Default: method + "\x00" + path + "\x00" + sorted-query-string
+	// + "\x00" + Authorization header + "\x00" + Cookie header. The
+	// Authorization and Cookie components ensure that requests from
+	// different authenticated users produce different keys, preventing
+	// cross-user data leakage. Unauthenticated requests (no auth/cookie
+	// headers) still coalesce normally.
+	//
+	// If you provide a custom KeyFunc, ensure it incorporates user
+	// identity for any endpoint that returns user-specific data.
 	KeyFunc func(c *celeris.Context) string
 }
 
@@ -27,15 +40,37 @@ func applyDefaults(cfg Config) Config {
 	return cfg
 }
 
-func validate(Config) {}
+// No validation needed: all Config fields have safe zero values.
+func (cfg Config) validate() {}
 
 func defaultKeyFunc(c *celeris.Context) string {
 	m := c.Method()
 	p := c.Path()
 	rq := c.RawQuery()
+	auth := c.Header("authorization")
+	cookie := c.Header("cookie")
+
+	var key string
 	if rq == "" {
-		return m + "\x00" + p
+		key = m + "\x00" + p
+	} else {
+		// Clone query params before sorting to avoid mutating the
+		// context's cached queryCache.
+		params := c.QueryParams()
+		sorted := make(url.Values, len(params))
+		for k, v := range params {
+			cp := make([]string, len(v))
+			copy(cp, v)
+			slices.Sort(cp)
+			sorted[k] = cp
+		}
+		key = m + "\x00" + p + "\x00" + sorted.Encode()
 	}
-	sorted := c.QueryParams().Encode()
-	return m + "\x00" + p + "\x00" + sorted
+	if auth != "" {
+		key += "\x00" + auth
+	}
+	if cookie != "" {
+		key += "\x00" + cookie
+	}
+	return key
 }

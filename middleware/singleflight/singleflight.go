@@ -28,7 +28,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		cfg = config[0]
 	}
 	cfg = applyDefaults(cfg)
-	validate(cfg)
+	cfg.validate()
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
@@ -55,10 +55,8 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 
 			c.Abort()
-			c.SetHeader("x-singleflight", "HIT")
-			for _, h := range entry.headers {
-				c.SetHeader(h[0], h[1])
-			}
+			c.SetResponseHeaders(entry.headers)
+			c.AddHeader("x-singleflight", "HIT")
 			if entry.ct == "" {
 				_ = c.NoContent(entry.status)
 			} else {
@@ -109,6 +107,10 @@ func New(config ...Config) celeris.HandlerFunc {
 			panic(panicVal)
 		}
 
-		return c.FlushResponse()
+		handlerErr := entry.err
+		if ferr := c.FlushResponse(); ferr != nil && handlerErr == nil {
+			handlerErr = ferr
+		}
+		return handlerErr
 	}
 }

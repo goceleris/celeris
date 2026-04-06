@@ -21,6 +21,16 @@ func ExampleNew_custom() {
 	})
 }
 
+func ExampleNew_perGroup() {
+	// Separate circuit breakers for different upstream services.
+	// s := celeris.New()
+	// payments := s.Group("/api/payments")
+	// payments.Use(circuitbreaker.New(circuitbreaker.Config{Threshold: 0.3}))
+	// internal := s.Group("/internal")
+	// internal.Use(circuitbreaker.New(circuitbreaker.Config{Threshold: 0.7}))
+	_ = circuitbreaker.New(circuitbreaker.Config{Threshold: 0.3})
+}
+
 func ExampleNewWithBreaker() {
 	// Obtain a Breaker reference for programmatic state inspection.
 	mw, breaker := circuitbreaker.NewWithBreaker(circuitbreaker.Config{

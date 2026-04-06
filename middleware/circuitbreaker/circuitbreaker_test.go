@@ -508,3 +508,94 @@ func TestValidatePanics(t *testing.T) {
 	}()
 	New(Config{Threshold: 1.5})
 }
+
+func TestValidateNegativeCooldown(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for negative CooldownPeriod")
+		}
+	}()
+	(Config{
+		Threshold:      0.5,
+		MinRequests:    10,
+		WindowSize:     10 * time.Second,
+		CooldownPeriod: -1 * time.Second,
+		HalfOpenMax:    1,
+	}).validate()
+}
+
+func TestValidateNegativeHalfOpenMax(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for negative HalfOpenMax")
+		}
+	}()
+	(Config{
+		Threshold:      0.5,
+		MinRequests:    10,
+		WindowSize:     10 * time.Second,
+		CooldownPeriod: 30 * time.Second,
+		HalfOpenMax:    -1,
+	}).validate()
+}
+
+func TestValidateTinyWindowSize(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for tiny WindowSize")
+		}
+	}()
+	(Config{
+		Threshold:      0.5,
+		MinRequests:    10,
+		WindowSize:     1 * time.Nanosecond,
+		CooldownPeriod: 30 * time.Second,
+		HalfOpenMax:    1,
+	}).validate()
+}
+
+func TestValidateNegativeMinRequests(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for negative MinRequests")
+		}
+	}()
+	(Config{
+		Threshold:      0.5,
+		MinRequests:    -5,
+		WindowSize:     10 * time.Second,
+		CooldownPeriod: 30 * time.Second,
+		HalfOpenMax:    1,
+	}).validate()
+}
+
+func TestCounts(t *testing.T) {
+	mw, brk := NewWithBreaker(Config{
+		Threshold:      0.9,
+		MinRequests:    100,
+		WindowSize:     1 * time.Second,
+		CooldownPeriod: 10 * time.Second,
+	})
+
+	successChain := []celeris.HandlerFunc{mw, okHandler}
+	failChain := []celeris.HandlerFunc{mw, errHandler500}
+
+	for range 5 {
+		_, _ = testutil.RunChain(t, successChain, "GET", "/")
+	}
+	for range 3 {
+		_, _ = testutil.RunChain(t, failChain, "GET", "/")
+	}
+
+	total, failures := brk.Counts()
+	if total != 8 {
+		t.Fatalf("expected total=8, got %d", total)
+	}
+	if failures != 3 {
+		t.Fatalf("expected failures=3, got %d", failures)
+	}
+}

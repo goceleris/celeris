@@ -474,6 +474,133 @@ func TestSingleflightHITHeaderOnWaiters(t *testing.T) {
 	}
 }
 
+func TestDifferentAuthNotCoalesced(t *testing.T) {
+	fn := defaultKeyFunc
+
+	ctx1, _ := celeristest.NewContext("GET", "/api/profile",
+		celeristest.WithHeader("authorization", "Bearer token-user-a"))
+	defer celeristest.ReleaseContext(ctx1)
+	ctx2, _ := celeristest.NewContext("GET", "/api/profile",
+		celeristest.WithHeader("authorization", "Bearer token-user-b"))
+	defer celeristest.ReleaseContext(ctx2)
+
+	k1 := fn(ctx1)
+	k2 := fn(ctx2)
+	if k1 == k2 {
+		t.Fatalf("different Authorization: keys should differ: %q vs %q", k1, k2)
+	}
+}
+
+func TestDifferentCookieNotCoalesced(t *testing.T) {
+	fn := defaultKeyFunc
+
+	ctx1, _ := celeristest.NewContext("GET", "/api/profile",
+		celeristest.WithCookie("session", "aaa"))
+	defer celeristest.ReleaseContext(ctx1)
+	ctx2, _ := celeristest.NewContext("GET", "/api/profile",
+		celeristest.WithCookie("session", "bbb"))
+	defer celeristest.ReleaseContext(ctx2)
+
+	k1 := fn(ctx1)
+	k2 := fn(ctx2)
+	if k1 == k2 {
+		t.Fatalf("different Cookie: keys should differ: %q vs %q", k1, k2)
+	}
+}
+
+func TestSameAuthCoalesced(t *testing.T) {
+	fn := defaultKeyFunc
+
+	ctx1, _ := celeristest.NewContext("GET", "/api/data",
+		celeristest.WithHeader("authorization", "Bearer same-token"))
+	defer celeristest.ReleaseContext(ctx1)
+	ctx2, _ := celeristest.NewContext("GET", "/api/data",
+		celeristest.WithHeader("authorization", "Bearer same-token"))
+	defer celeristest.ReleaseContext(ctx2)
+
+	k1 := fn(ctx1)
+	k2 := fn(ctx2)
+	if k1 != k2 {
+		t.Fatalf("same Authorization: keys should match: %q vs %q", k1, k2)
+	}
+}
+
+func TestNoAuthPublicCoalesced(t *testing.T) {
+	fn := defaultKeyFunc
+
+	ctx1, _ := celeristest.NewContext("GET", "/public")
+	defer celeristest.ReleaseContext(ctx1)
+	ctx2, _ := celeristest.NewContext("GET", "/public")
+	defer celeristest.ReleaseContext(ctx2)
+
+	k1 := fn(ctx1)
+	k2 := fn(ctx2)
+	if k1 != k2 {
+		t.Fatalf("no auth (public): keys should match: %q vs %q", k1, k2)
+	}
+}
+
+func TestDefaultKeyMultiValueQueryOrder(t *testing.T) {
+	fn := defaultKeyFunc
+
+	ctx1, _ := celeristest.NewContext("GET", "/path?a=2&a=1")
+	defer celeristest.ReleaseContext(ctx1)
+	ctx2, _ := celeristest.NewContext("GET", "/path?a=1&a=2")
+	defer celeristest.ReleaseContext(ctx2)
+
+	k1 := fn(ctx1)
+	k2 := fn(ctx2)
+	if k1 != k2 {
+		t.Fatalf("same multi-value params different order: keys differ: %q vs %q", k1, k2)
+	}
+}
+
+func TestMultiValueHeadersPreservedForWaiters(t *testing.T) {
+	ct := &concurrentTest{
+		n:       2,
+		method:  "GET",
+		path:    "/cookies",
+		entered: make(chan struct{}),
+		gate:    make(chan struct{}),
+	}
+	ct.handler = func(c *celeris.Context) error {
+		c.AddHeader("set-cookie", "a=1; Path=/")
+		c.AddHeader("set-cookie", "b=2; Path=/")
+		ct.enterOnce.Do(func() { close(ct.entered) })
+		<-ct.gate
+		return c.Blob(200, "text/plain", []byte("cookies"))
+	}
+	ct.run(t)
+
+	// Verify waiter got both set-cookie headers.
+	waiterRec := ct.recs[1]
+	var setCookieValues []string
+	for _, h := range waiterRec.Headers {
+		if h[0] == "set-cookie" {
+			setCookieValues = append(setCookieValues, h[1])
+		}
+	}
+	if len(setCookieValues) != 2 {
+		t.Fatalf("waiter set-cookie count = %d, want 2 (values: %v)", len(setCookieValues), setCookieValues)
+	}
+	if setCookieValues[0] != "a=1; Path=/" || setCookieValues[1] != "b=2; Path=/" {
+		t.Fatalf("waiter set-cookie values = %v, want [a=1; Path=/ b=2; Path=/]", setCookieValues)
+	}
+}
+
+func TestLeaderErrorPropagated(t *testing.T) {
+	testErr := errors.New("handler error")
+	handler := func(c *celeris.Context) error {
+		_ = c.Blob(200, "text/plain", []byte("ok"))
+		return testErr
+	}
+	mw := New()
+	_, err := testutil.RunChain(t, []celeris.HandlerFunc{mw, handler}, "GET", "/err-leader")
+	if !errors.Is(err, testErr) {
+		t.Fatalf("leader err = %v, want %v", err, testErr)
+	}
+}
+
 func TestConcurrentSafety(t *testing.T) {
 	handler := func(c *celeris.Context) error {
 		return c.Blob(200, "text/plain", []byte("ok"))

@@ -31,13 +31,17 @@ func (w *slidingWindow) currentBucket(now int64) *bucket {
 	idx := (now / w.bucketSize) % numBuckets
 	b := &w.buckets[idx]
 	epoch := (now / w.bucketSize) * w.bucketSize
-	if old := b.epoch.Load(); old != epoch {
+	for {
+		old := b.epoch.Load()
+		if old == epoch {
+			return b
+		}
 		if b.epoch.CompareAndSwap(old, epoch) {
 			b.successes.Store(0)
 			b.failures.Store(0)
+			return b
 		}
 	}
-	return b
 }
 
 func (w *slidingWindow) recordSuccess() {

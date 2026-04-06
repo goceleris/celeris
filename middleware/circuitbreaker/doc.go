@@ -45,9 +45,10 @@
 // # Programmatic Access
 //
 // Use [NewWithBreaker] to obtain a reference to the underlying [Breaker]
-// struct. This allows programmatic state inspection ([Breaker.State]) and
-// forced reset ([Breaker.Reset]) for health checks, admin endpoints, or
-// integration tests.
+// struct. This allows programmatic state inspection ([Breaker.State]),
+// window counter export ([Breaker.Counts]) for dashboards and Prometheus,
+// and forced reset ([Breaker.Reset]) for health checks, admin endpoints,
+// or integration tests.
 //
 // # Middleware Ordering
 //
@@ -59,6 +60,21 @@
 //
 // This ensures rate-limited requests are rejected before reaching the breaker,
 // and timed-out requests are properly classified by the breaker.
+//
+// # In-Flight Requests During Transition
+//
+// Requests that are already executing when the breaker transitions to Open
+// continue to completion — only NEW requests are rejected. This is by design:
+// interrupting in-flight requests could cause data corruption or incomplete
+// operations.
+//
+// # Per-Endpoint Breakers
+//
+// To use separate breakers for different services or route groups, create
+// multiple instances and apply them to the appropriate groups:
+//
+//	payments := s.Group("/api/payments")
+//	payments.Use(circuitbreaker.New(circuitbreaker.Config{Threshold: 0.3}))
 //
 // # Thread Safety
 //

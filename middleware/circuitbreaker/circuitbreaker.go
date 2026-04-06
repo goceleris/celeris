@@ -32,6 +32,11 @@ func (b *Breaker) State() State {
 	return State(b.state.Load())
 }
 
+// Counts returns the current sliding window totals.
+func (b *Breaker) Counts() (total, failures int64) {
+	return b.window.counts()
+}
+
 // Reset forces the breaker back to Closed and clears the observation window.
 func (b *Breaker) Reset() {
 	b.mu.Lock()
@@ -59,7 +64,7 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 		cfg = config[0]
 	}
 	cfg = applyDefaults(cfg)
-	validate(cfg)
+	cfg.validate()
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
@@ -124,7 +129,16 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 			// Let through.
 		}
 
-		err := c.Next()
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					brk.window.recordFailure()
+					panic(r) // re-panic after recording the failure
+				}
+			}()
+			err = c.Next()
+		}()
 
 		status := responseStatus(c, err)
 		isFailure := brk.isError(err, status)
