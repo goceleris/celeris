@@ -613,7 +613,7 @@ type fakeDirEntry struct {
 	isDir bool
 }
 
-func (f *fakeDirEntry) Name() string              { return f.name }
+func (f *fakeDirEntry) Name() string               { return f.name }
 func (f *fakeDirEntry) IsDir() bool                { return f.isDir }
 func (f *fakeDirEntry) Type() fs.FileMode          { return 0 }
 func (f *fakeDirEntry) Info() (fs.FileInfo, error) { return nil, nil }

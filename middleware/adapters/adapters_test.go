@@ -146,11 +146,11 @@ func TestBuildRequestTLSState(t *testing.T) {
 
 func TestBuildRequestProtocol(t *testing.T) {
 	tests := []struct {
-		name       string
-		protocol   string
-		wantProto  string
-		wantMajor  int
-		wantMinor  int
+		name      string
+		protocol  string
+		wantProto string
+		wantMajor int
+		wantMinor int
 	}{
 		{"HTTP/1.1", "1.1", "HTTP/1.1", 1, 1},
 		{"HTTP/2", "2", "HTTP/2.0", 2, 0},

@@ -27,7 +27,6 @@ func ExampleWrapMiddleware() {
 	// Output: middleware registered
 }
 
-
 func ExampleReverseProxy() {
 	target, _ := url.Parse("http://backend:8080")
 
