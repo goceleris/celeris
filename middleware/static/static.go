@@ -12,10 +12,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goceleris/celeris"
 )
+
+// cachedFile stores the immutable content and content-type of an fs.FS file.
+type cachedFile struct {
+	data        []byte
+	contentType string
+}
 
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
 const maxFSFileSize = 100 << 20
@@ -46,6 +53,10 @@ func New(config ...Config) celeris.HandlerFunc {
 	if root != "" {
 		cleanRoot = filepath.Clean(root)
 	}
+
+	// Per-file cache for fs.FS content. Since fs.FS is immutable (especially
+	// embed.FS), caching avoids repeated heap allocations for the same file.
+	var fsCache sync.Map // map[string]*cachedFile
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -79,7 +90,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		filePath = strings.TrimSuffix(filePath, "/")
 
 		if fsys != nil {
-			return serveFS(c, fsys, filePath, index, browse, spa, compress, maxAge)
+			return serveFS(c, fsys, filePath, index, browse, spa, compress, maxAge, &fsCache)
 		}
 		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge, compress)
 	}
@@ -179,7 +190,7 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
-func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, maxAge time.Duration) error {
+func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, maxAge time.Duration, cache *sync.Map) error {
 	// 1. Open + stat + directory handling.
 	openPath := filePath
 	if openPath == "" {
@@ -189,7 +200,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	f, err := fsys.Open(openPath)
 	if err != nil {
 		if spa {
-			return serveFS(c, fsys, index, index, browse, false, compress, maxAge)
+			return serveFS(c, fsys, index, index, browse, false, compress, maxAge, cache)
 		}
 		return c.Next()
 	}
@@ -213,7 +224,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			indexStat, statErr := indexFile.Stat()
 			_ = indexFile.Close()
 			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse, spa, compress, maxAge)
+				return serveFS(c, fsys, indexPath, index, browse, spa, compress, maxAge, cache)
 			}
 		}
 		if browse {
@@ -244,13 +255,34 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		}
 	}
 
-	// 5. ReadSeeker fast path OR full read + response.
+	// 5. Check fs.FS content cache.
 	c.SetHeader("accept-ranges", "bytes")
 
-	if rs, ok := f.(io.ReadSeeker); ok {
-		return serveFSReadSeeker(c, rs, filePath, size)
+	if cf, ok := cache.Load(filePath); ok {
+		cached := cf.(*cachedFile)
+		return serveFSCached(c, cached.data, cached.contentType)
 	}
-	return serveFSFullRead(c, f, filePath, size)
+
+	// 6. Read, cache, and serve.
+	var data []byte
+	var contentType string
+
+	if rs, ok := f.(io.ReadSeeker); ok {
+		contentType = sniffContentType(rs, filePath)
+		data = make([]byte, size)
+		if _, err := io.ReadFull(rs, data); err != nil {
+			return err
+		}
+	} else {
+		data = make([]byte, size)
+		if _, err := io.ReadFull(f, data); err != nil {
+			return err
+		}
+		contentType = detectContentType(filePath, data)
+	}
+
+	cache.Store(filePath, &cachedFile{data: data, contentType: contentType})
+	return serveFSCached(c, data, contentType)
 }
 
 // servePreCompressedFS attempts to serve a pre-compressed variant (.br or .gz)
@@ -293,7 +325,18 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 		}
 		ct := mime.TypeByExtension(filepath.Ext(filePath))
 		if ct == "" {
-			ct = "application/octet-stream"
+			// Sniff from the original (uncompressed) file if possible.
+			if orig, err := fsys.Open(filePath); err == nil {
+				buf := make([]byte, 512)
+				n, _ := io.ReadAtLeast(orig, buf, 1)
+				_ = orig.Close()
+				if n > 0 {
+					ct = http.DetectContentType(buf[:n])
+				}
+			}
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
 		}
 		c.SetHeader("content-encoding", v.encoding)
 		c.AddHeader("vary", "Accept-Encoding")
@@ -303,23 +346,15 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 	return false, nil
 }
 
-// serveFSFullRead serves an fs.FS file by reading the entire contents into
-// memory, detecting the content type, and handling range requests.
-func serveFSFullRead(c *celeris.Context, f fs.File, filePath string, size int64) error {
-	data := make([]byte, size)
-	if _, err := io.ReadFull(f, data); err != nil {
-		return err
-	}
-
-	contentType := detectContentType(filePath, data)
-
+// serveFSCached serves file data from the cache (or freshly read bytes),
+// handling range requests via byte slicing.
+func serveFSCached(c *celeris.Context, data []byte, contentType string) error {
 	if rng := c.Header("range"); rng != "" {
 		if start, end, ok := parseByteRange(rng, int64(len(data))); ok {
 			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, int64(len(data))))
 			return c.Blob(206, contentType, data[start:end+1])
 		}
 	}
-
 	return c.Blob(200, contentType, data)
 }
 
@@ -334,23 +369,6 @@ func detectContentType(filePath string, data []byte) string {
 		return http.DetectContentType(data[:min(512, len(data))])
 	}
 	return "application/octet-stream"
-}
-
-// serveFSReadSeeker serves a file from an fs.FS file that implements
-// io.ReadSeeker. Range requests seek to the requested offset and read
-// only the required bytes instead of loading the entire file.
-func serveFSReadSeeker(c *celeris.Context, rs io.ReadSeeker, filePath string, size int64) error {
-	contentType := sniffContentType(rs, filePath)
-
-	if served, err := serveRangeFromReader(c, rs, contentType, size); served {
-		return err
-	}
-
-	data := make([]byte, size)
-	if _, err := io.ReadFull(rs, data); err != nil {
-		return err
-	}
-	return c.Blob(200, contentType, data)
 }
 
 // sniffContentType determines the MIME type for a file opened as an
@@ -371,29 +389,6 @@ func sniffContentType(rs io.ReadSeeker, filePath string) string {
 		return "application/octet-stream"
 	}
 	return ct
-}
-
-// serveRangeFromReader handles range requests using an io.ReadSeeker.
-// Returns (true, err) if a range was served, (false, nil) if no valid
-// range was requested.
-func serveRangeFromReader(c *celeris.Context, rs io.ReadSeeker, contentType string, size int64) (bool, error) {
-	rng := c.Header("range")
-	if rng == "" {
-		return false, nil
-	}
-	start, end, ok := parseByteRange(rng, size)
-	if !ok {
-		return false, nil
-	}
-	if _, err := rs.Seek(start, io.SeekStart); err != nil {
-		return false, err
-	}
-	data := make([]byte, end-start+1)
-	if _, err := io.ReadFull(rs, data); err != nil {
-		return false, err
-	}
-	c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
-	return true, c.Blob(206, contentType, data)
 }
 
 // setCacheHeaders sets Last-Modified, ETag, and Cache-Control headers from

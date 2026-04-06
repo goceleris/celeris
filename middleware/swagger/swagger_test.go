@@ -183,7 +183,7 @@ func TestUIConfigDefaults(t *testing.T) {
 	assertContains(t, body, `docExpansion: "list"`)
 	assertContains(t, body, `deepLinking: false`)
 	assertContains(t, body, `persistAuthorization: false`)
-	assertContains(t, body, `defaultModelsExpandDepth: 0`)
+	assertContains(t, body, `defaultModelsExpandDepth: 1`)
 	assertContains(t, body, `<title>API Documentation</title>`)
 }
 
@@ -398,8 +398,8 @@ func TestApplyDefaultsFillsEmpty(t *testing.T) {
 	if cfg.UI.DocExpansion != "list" {
 		t.Fatalf("DocExpansion: got %q, want list", cfg.UI.DocExpansion)
 	}
-	if cfg.UI.DefaultModelsExpandDepth != 0 {
-		t.Fatalf("DefaultModelsExpandDepth: got %d, want 0", cfg.UI.DefaultModelsExpandDepth)
+	if cfg.UI.DefaultModelsExpandDepth != 1 {
+		t.Fatalf("DefaultModelsExpandDepth: got %d, want 1", cfg.UI.DefaultModelsExpandDepth)
 	}
 	if cfg.UI.Title != "API Documentation" {
 		t.Fatalf("Title: got %q, want API Documentation", cfg.UI.Title)

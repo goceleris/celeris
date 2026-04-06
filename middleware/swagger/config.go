@@ -38,8 +38,8 @@ type UIConfig struct {
 	PersistAuthorization bool
 
 	// DefaultModelsExpandDepth controls how deep models are expanded.
-	// Default: 0 (show model names). Set to 1 to expand one level,
-	// -1 to hide the models section entirely.
+	// Default: 1 (expand one level). Set to -1 to hide the models section
+	// entirely. Note: 0 is treated as unset and defaults to 1.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	DefaultModelsExpandDepth int
 
@@ -164,6 +164,9 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.UI.Title == "" {
 		cfg.UI.Title = defaultConfig.UI.Title
+	}
+	if cfg.UI.DefaultModelsExpandDepth == 0 {
+		cfg.UI.DefaultModelsExpandDepth = 1
 	}
 	return cfg
 }
