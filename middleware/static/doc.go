@@ -56,4 +56,18 @@
 //
 // Only GET and HEAD requests are processed. All other methods pass through
 // to the next handler.
+//
+// # Ordering
+//
+// Place the static middleware after security and authentication middleware
+// if you need to protect static files. Place it before compress and etag
+// if you want framework-level caching/compression (though the static
+// middleware sets its own ETag from file metadata, which the etag middleware
+// will preserve).
+//
+// # Skipping
+//
+// Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for
+// exact-match path exclusions. Skipped requests call c.Next() without
+// serving any files.
 package static

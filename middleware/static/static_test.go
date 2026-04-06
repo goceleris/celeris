@@ -497,6 +497,47 @@ func TestBrowseXSSFS(t *testing.T) {
 	}
 }
 
+func TestPathTraversalBrowse(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir, Browse: true})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	// Attempt directory traversal via ".." — must fall through, not list parent dirs.
+	paths := []string{
+		"/../",
+		"/../../",
+		"/sub/../../",
+		"/sub/../../../etc/",
+	}
+	for _, p := range paths {
+		t.Run(p, func(t *testing.T) {
+			rec, err := testutil.RunChain(t, chain, "GET", p)
+			testutil.AssertNoError(t, err)
+			testutil.AssertStatus(t, rec, 200)
+			if rec.BodyString() != "fallthrough" {
+				t.Fatalf("path %q should fall through, got body: %s", p, rec.BodyString())
+			}
+		})
+	}
+}
+
+func TestPathTraversalFile(t *testing.T) {
+	dir := setupTempDir(t)
+	mw := New(Config{Root: dir})
+	chain := []celeris.HandlerFunc{mw, noopHandler}
+
+	// Attempt file traversal via ".." — must fall through.
+	rec, err := testutil.RunChain(t, chain, "GET", "/../../../etc/passwd")
+	testutil.AssertNoError(t, err)
+	// Should either fall through or return an error, never serve the file.
+	if rec.BodyString() != "fallthrough" {
+		body := rec.BodyString()
+		if strings.Contains(body, "root:") {
+			t.Fatal("path traversal: served /etc/passwd!")
+		}
+	}
+}
+
 func TestConfigPanicNoRootNoFS(t *testing.T) {
 	defer func() {
 		r := recover()

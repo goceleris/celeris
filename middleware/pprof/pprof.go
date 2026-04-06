@@ -25,7 +25,7 @@ var (
 
 // New creates a pprof middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
-	var cfg Config
+	cfg := defaultConfig
 	if len(config) > 0 {
 		cfg = config[0]
 	}

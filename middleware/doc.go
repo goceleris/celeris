@@ -29,8 +29,9 @@
 //	session     — load session (may depend on authenticated user)
 //	debug       — intercepts by path prefix (e.g. /debug/); can go anywhere
 //	pprof       — Go profiling endpoints (loopback-only by default)
-//	swagger     — OpenAPI spec + UI (CDN-loaded, optional AuthFunc)
-//	static      — static file server / SPA (after security/auth if protecting)
+//	swagger     — OpenAPI spec + UI (CDN-loaded Swagger UI or Scalar)
+//	static      — static file server with directory browse (after security/auth if protecting)
+//	adapters    — (utility) stdlib ↔ celeris middleware conversion; not a chain member
 //	timeout     — bound handler execution; innermost wrapper before the route
 //	singleflight — collapse identical in-flight requests; after timeout
 //	compress    — response compression; wraps etag (computes on uncompressed body)
@@ -42,7 +43,7 @@
 //	// Pre-routing
 //	s.Pre(proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}))
 //	s.Pre(redirect.HTTPSRedirect())
-//	s.Pre(rewrite.New(rewrite.Config{Rules: map[string]string{"/old/*": "/new/$1"}}))
+//	s.Pre(rewrite.New(rewrite.Config{Rules: []rewrite.Rule{{Pattern: `^/old/(.*)$`, Replacement: "/new/$1"}}}))
 //	s.Pre(methodoverride.New())
 //
 //	// Route middleware

@@ -17,21 +17,26 @@ type compiledRule struct {
 //
 // Panics if Rules is empty or contains an invalid regex pattern
 // (via regexp.MustCompile).
-func New(config Config) celeris.HandlerFunc {
-	config.validate()
+func New(config ...Config) celeris.HandlerFunc {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
 
-	rules := make([]compiledRule, len(config.Rules))
-	for i, r := range config.Rules {
+	rules := make([]compiledRule, len(cfg.Rules))
+	for i, r := range cfg.Rules {
 		rules[i] = compiledRule{
 			pattern:     regexp.MustCompile(r.Pattern),
 			replacement: r.Replacement,
 		}
 	}
 
-	redirectCode := config.RedirectCode
+	redirectCode := cfg.RedirectCode
 
 	var skip celeris.SkipHelper
-	skip.Init(config.SkipPaths, config.Skip)
+	skip.Init(cfg.SkipPaths, cfg.Skip)
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {

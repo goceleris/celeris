@@ -28,4 +28,22 @@
 // WebSocket upgrade (via Hijack) or streaming flush (via Flush)
 // will not work through WrapMiddleware. For these use cases,
 // implement the middleware natively in celeris.
+//
+// # Reverse Proxy
+//
+// [ReverseProxy] creates a handler that forwards requests to a target URL
+// using [net/http/httputil.ReverseProxy] under the hood:
+//
+//	target, _ := url.Parse("http://backend:8080")
+//	server.Any("/api/*path", adapters.ReverseProxy(target))
+//
+// Options:
+//
+//   - [WithTransport]: set a custom [http.RoundTripper]
+//   - [WithModifyRequest]: mutate outbound requests (e.g. add headers)
+//   - [WithErrorHandler]: custom error handling for proxy failures
+//
+// The proxy automatically sets X-Forwarded-For, X-Forwarded-Host, and
+// X-Forwarded-Proto via [net/http/httputil.ProxyRequest.SetXForwarded].
+// Panics if target is nil.
 package adapters

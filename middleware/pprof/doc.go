@@ -49,4 +49,10 @@
 //	        return c.Header("x-pprof-token") == os.Getenv("PPROF_TOKEN")
 //	    },
 //	}))
+//
+// # Skipping
+//
+// Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for
+// exact-match path exclusions. Skipped requests call c.Next() without
+// invoking the auth check or serving profiles.
 package pprof

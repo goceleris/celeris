@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/hex"
 	"hash/crc32"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/middleware/adapters"
 	"github.com/goceleris/celeris/middleware/circuitbreaker"
 	"github.com/goceleris/celeris/middleware/cors"
 	"github.com/goceleris/celeris/middleware/etag"
@@ -19,6 +21,7 @@ import (
 	"github.com/goceleris/celeris/middleware/recovery"
 	"github.com/goceleris/celeris/middleware/redirect"
 	"github.com/goceleris/celeris/middleware/requestid"
+	"github.com/goceleris/celeris/middleware/rewrite"
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/singleflight"
 	"github.com/goceleris/celeris/middleware/timeout"
@@ -527,6 +530,78 @@ func BenchmarkChainWithSingleflight(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		ctx, _ := celeristest.NewContext("GET", "/api/data", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// --- v1.3.3 chain benchmarks ---
+
+// BenchmarkChainPreRoutingWithRewrite benchmarks: proxy -> rewrite -> redirect.HTTPS -> handler.
+func BenchmarkChainPreRoutingWithRewrite(b *testing.B) {
+	chain := []celeris.HandlerFunc{
+		proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}),
+		rewrite.New(rewrite.Config{
+			Rules: []rewrite.Rule{
+				{Pattern: `^/v1/(.*)$`, Replacement: "/v2/$1"},
+			},
+		}),
+		redirect.HTTPSRedirect(),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{
+		celeristest.WithHandlers(chain...),
+		celeristest.WithRemoteAddr("10.0.0.1:1234"),
+		celeristest.WithHeader("x-forwarded-for", "203.0.113.50"),
+		celeristest.WithScheme("https"),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/v1/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainRewritePassthrough benchmarks rewrite on a non-matching path.
+func BenchmarkChainRewritePassthrough(b *testing.B) {
+	chain := []celeris.HandlerFunc{
+		rewrite.New(rewrite.Config{
+			Rules: []rewrite.Rule{
+				{Pattern: `^/old/(.*)$`, Replacement: "/new/$1"},
+			},
+		}),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkChainWithWrapMiddleware benchmarks a stdlib middleware wrapped via adapters.
+func BenchmarkChainWithWrapMiddleware(b *testing.B) {
+	stdMW := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Via", "stdlib")
+			next.ServeHTTP(w, r)
+		})
+	}
+	chain := []celeris.HandlerFunc{
+		requestid.New(),
+		adapters.WrapMiddleware(stdMW),
+		jsonHandler,
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
 		_ = ctx.Next()
 		celeristest.ReleaseContext(ctx)
 	}

@@ -15,7 +15,7 @@ v1.3.3 includes security-hardened defaults in three new middleware packages:
 
 - **Pprof loopback-only default**: The pprof middleware restricts access to loopback IPs (127.0.0.1, ::1) by default. Exposing Go profiling data to untrusted networks reveals goroutine stacks, heap contents, and source code paths.
 - **Static path traversal protection**: The static middleware uses celeris's FileFromDir (with symlink resolution and prefix verification) for OS filesystem access. For fs.FS, paths are cleaned and .. components are rejected.
-- **Swagger AuthFunc**: The swagger middleware optionally accepts an AuthFunc for protecting spec and UI endpoints. OpenAPI specs may reveal internal API structure.
+- **Swagger path-only interception**: The swagger middleware only responds to exact path matches under its BasePath ({BasePath}/, {BasePath}/spec) and ignores all other requests. OpenAPI specs may reveal internal API structure — restrict access with upstream auth middleware or network-level controls.
 
 ### v1.3.2 Security Improvements
 

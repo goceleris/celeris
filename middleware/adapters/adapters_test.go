@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/goceleris/celeris"
@@ -142,6 +143,41 @@ func TestBuildRequestTLSState(t *testing.T) {
 		celeristest.WithScheme("https"),
 	)
 	testutil.AssertNoError(t, err)
+}
+
+func TestReverseProxyPanicNilTarget(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for nil target")
+		}
+		msg, ok := r.(string)
+		if !ok || msg != "adapters: ReverseProxy target must not be nil" {
+			t.Fatalf("unexpected panic: %v", r)
+		}
+	}()
+	ReverseProxy(nil)
+}
+
+func TestReverseProxyOptions(t *testing.T) {
+	// Verify options are applied without panic.
+	var modifyCalled bool
+	target, _ := url.Parse("http://localhost:9999")
+
+	// Just verify construction succeeds with all options.
+	h := ReverseProxy(target,
+		WithTransport(http.DefaultTransport),
+		WithModifyRequest(func(r *http.Request) {
+			modifyCalled = true
+			_ = modifyCalled
+		}),
+		WithErrorHandler(func(w http.ResponseWriter, r *http.Request, err error) {
+			w.WriteHeader(502)
+		}),
+	)
+	if h == nil {
+		t.Fatal("expected non-nil handler")
+	}
 }
 
 func TestBuildRequestProtocol(t *testing.T) {

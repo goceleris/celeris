@@ -53,8 +53,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		switch path {
 		case basePath:
-			c.SetHeader("location", uiPath)
-			return c.NoContent(301)
+			return c.Redirect(301, uiPath)
 		case uiPath:
 			return c.HTML(200, page)
 		case specPath:

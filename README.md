@@ -127,7 +127,7 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions with pluggable store |
 | [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
-| [`static`](middleware/static) | Static file serving with SPA mode and Cache-Control |
+| [`static`](middleware/static) | Static file serving with directory browse, ETag/Last-Modified caching |
 | [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI/Scalar (CDN-loaded) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
 

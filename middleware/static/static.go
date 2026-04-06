@@ -81,6 +81,13 @@ func New(config ...Config) celeris.HandlerFunc {
 func serveOS(c *celeris.Context, root, filePath, index string, browse bool) error {
 	fullPath := filepath.Join(root, filepath.FromSlash(filePath))
 
+	// Prevent directory traversal: filepath.Join resolves ".." segments,
+	// so verify the result stays within the root directory.
+	cleanRoot := filepath.Clean(root)
+	if fullPath != cleanRoot && !strings.HasPrefix(fullPath, cleanRoot+string(filepath.Separator)) {
+		return c.Next()
+	}
+
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -97,7 +104,20 @@ func serveOS(c *celeris.Context, root, filePath, index string, browse bool) erro
 			filePath = filepath.Join(filePath, index)
 			info = indexInfo
 		} else if browse {
-			return serveDirListingOS(c, fullPath)
+			// Resolve symlinks and recheck to prevent symlink escape,
+			// mirroring the protection in Context.FileFromDir.
+			resolved, err := filepath.EvalSymlinks(fullPath)
+			if err != nil {
+				return c.Next()
+			}
+			resolvedRoot, err := filepath.EvalSymlinks(cleanRoot)
+			if err != nil {
+				return c.Next()
+			}
+			if resolved != resolvedRoot && !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+				return c.Next()
+			}
+			return serveDirListingOS(c, resolved)
 		} else {
 			return c.Next()
 		}

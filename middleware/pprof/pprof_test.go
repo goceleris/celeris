@@ -99,6 +99,31 @@ func TestPprofSkipPaths(t *testing.T) {
 	testutil.AssertBodyContains(t, rec, "ok")
 }
 
+func TestPprofSkipFunc(t *testing.T) {
+	mw := New(Config{
+		AuthFunc: openAuth(),
+		Skip: func(c *celeris.Context) bool {
+			return c.Header("x-skip") == "true"
+		},
+	})
+
+	// Without skip header: pprof serves the profile.
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/debug/pprof/heap")
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	if len(rec.Body) == 0 {
+		t.Fatal("expected non-empty heap profile body")
+	}
+
+	// With skip header: falls through to next handler.
+	chain := []celeris.HandlerFunc{mw, okHandler}
+	rec, err = testutil.RunChain(t, chain, "GET", "/debug/pprof/heap",
+		celeristest.WithHeader("x-skip", "true"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertBodyContains(t, rec, "ok")
+}
+
 func TestDefaultConfig(t *testing.T) {
 	mw := New()
 	// Loopback should work with default config.

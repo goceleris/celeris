@@ -29,7 +29,7 @@ func BenchmarkSwaggerSpec(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		ctx, _ := celeristest.NewContext("GET", "/swagger/doc.json", opts...)
+		ctx, _ := celeristest.NewContext("GET", "/swagger/spec", opts...)
 		_ = mw(ctx)
 		celeristest.ReleaseContext(ctx)
 	}

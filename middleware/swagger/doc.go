@@ -76,4 +76,24 @@
 //
 // Requests to other paths pass through. Only GET and HEAD are handled;
 // other methods return 405.
+//
+// # Ordering
+//
+// The swagger middleware intercepts by path prefix and can be placed at any
+// position in the [celeris.Server.Use] chain. Place it after authentication
+// middleware if you want to protect the spec and UI endpoints.
+//
+// # Skipping
+//
+// Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for
+// exact-match path exclusions. Skipped requests call c.Next() without
+// serving the UI or spec.
+//
+// # Security
+//
+// The middleware has no built-in authentication. OpenAPI specs may reveal
+// internal API structure. Protect the endpoints with upstream auth middleware
+// or network-level controls. When using CDN-loaded assets, ensure your CSP
+// policy allows cdn.jsdelivr.net (Scalar) or unpkg.com (Swagger UI) in
+// script-src and style-src.
 package swagger

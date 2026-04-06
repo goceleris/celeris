@@ -32,6 +32,14 @@ type Config struct {
 	RedirectCode int
 }
 
+// defaultConfig holds zero-value defaults. Rewrite has no meaningful defaults
+// (Rules is required), but the variable is present for pattern consistency.
+var defaultConfig Config
+
+func applyDefaults(cfg Config) Config {
+	return cfg
+}
+
 func (cfg Config) validate() {
 	if len(cfg.Rules) == 0 {
 		panic("rewrite: Rules must not be empty")
