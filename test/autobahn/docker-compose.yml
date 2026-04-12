@@ -1,0 +1,13 @@
+services:
+  fuzzingclient:
+    image: crossbario/autobahn-testsuite:latest
+    container_name: celeris-autobahn-client
+    volumes:
+      - ./fuzzingclient.json:/config/fuzzingclient.json:ro
+      - ./reports:/reports
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      wstest
+      -m fuzzingclient
+      -s /config/fuzzingclient.json
