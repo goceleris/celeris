@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris/engine"
@@ -19,7 +20,7 @@ import (
 )
 
 // Version is the semantic version of the celeris module.
-const Version = "1.2.0"
+const Version = "1.3.4"
 
 // ErrAlreadyStarted is returned when Start or StartWithContext is called on a
 // server that is already running.
@@ -51,8 +52,12 @@ type Server struct {
 	router        *router
 	middleware    []HandlerFunc
 	preMiddleware []HandlerFunc
-	engine        engine.Engine
-	collector     *observe.Collector
+	// engineRef holds the active engine. Stored as an atomic.Pointer so that
+	// concurrent observers (e.g. Server.Addr() called from a polling test
+	// helper while doPrepare is still running on a goroutine) see a
+	// consistent value without taking a mutex.
+	engineRef atomic.Pointer[engine.Engine]
+	collector *observe.Collector
 
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
@@ -84,6 +89,16 @@ func (s *Server) handle(method, path string, handlers ...HandlerFunc) *Route {
 	chain = append(chain, s.middleware...)
 	chain = append(chain, handlers...)
 	return s.router.addRoute(method, path, chain)
+}
+
+// loadEngine returns the active engine, or nil if Start has not yet
+// installed one. Safe for concurrent use.
+func (s *Server) loadEngine() engine.Engine {
+	p := s.engineRef.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // Use registers global middleware that runs before every route handler.
@@ -324,10 +339,11 @@ func (s *Server) Start() error {
 // in-flight requests, any hooks registered via [Server.OnShutdown] fire in
 // registration order with the provided context.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.engine == nil {
+	eng := s.loadEngine()
+	if eng == nil {
 		return nil
 	}
-	err := s.engine.Shutdown(ctx)
+	err := eng.Shutdown(ctx)
 	for _, fn := range s.shutdownHooks {
 		func() {
 			defer func() { _ = recover() }()
@@ -340,20 +356,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // Addr returns the listener's bound address, or nil if the server has not been
 // started. Useful when listening on ":0" to discover the OS-assigned port.
 func (s *Server) Addr() net.Addr {
-	if s.engine == nil {
+	eng := s.loadEngine()
+	if eng == nil {
 		return nil
 	}
-	return s.engine.Addr()
+	return eng.Addr()
 }
 
 // EngineInfo returns information about the running engine, or nil if not started.
 func (s *Server) EngineInfo() *EngineInfo {
-	if s.engine == nil {
+	eng := s.loadEngine()
+	if eng == nil {
 		return nil
 	}
 	return &EngineInfo{
-		Type:    EngineType(s.engine.Type()),
-		Metrics: s.engine.Metrics(),
+		Type:    EngineType(eng.Type()),
+		Metrics: eng.Metrics(),
 	}
 }
 
@@ -361,10 +379,11 @@ func (s *Server) EngineInfo() *EngineInfo {
 // to be served. Returns [ErrAcceptControlNotSupported] if the engine does not
 // support accept control (e.g. std engine).
 func (s *Server) PauseAccept() error {
-	if s.engine == nil {
+	eng := s.loadEngine()
+	if eng == nil {
 		return ErrAcceptControlNotSupported
 	}
-	ac, ok := s.engine.(engine.AcceptController)
+	ac, ok := eng.(engine.AcceptController)
 	if !ok {
 		return ErrAcceptControlNotSupported
 	}
@@ -375,10 +394,11 @@ func (s *Server) PauseAccept() error {
 // Returns [ErrAcceptControlNotSupported] if the engine does not support
 // accept control.
 func (s *Server) ResumeAccept() error {
-	if s.engine == nil {
+	eng := s.loadEngine()
+	if eng == nil {
 		return ErrAcceptControlNotSupported
 	}
-	ac, ok := s.engine.(engine.AcceptController)
+	ac, ok := eng.(engine.AcceptController)
 	if !ok {
 		return ErrAcceptControlNotSupported
 	}
@@ -456,7 +476,7 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			s.startErr = fmt.Errorf("create engine: %w", err)
 			return
 		}
-		s.engine = eng
+		s.engineRef.Store(&eng)
 
 		if s.collector != nil {
 			s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {
@@ -492,6 +512,13 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 // StartWithListener starts the server using an existing [net.Listener].
 // This enables zero-downtime restarts via socket inheritance (e.g., passing
 // the listener FD to a child process via environment variable).
+//
+// Listener ownership: on the std engine, the supplied listener is used
+// directly. On the native engines (epoll, io_uring), the address is
+// extracted from ln and the listener is closed so the engine workers can
+// rebind their own SO_REUSEPORT sockets bound to the same (host, port).
+// In both cases, the caller must not Accept on or close the supplied
+// listener after calling this function.
 //
 // Returns [ErrAlreadyStarted] if called more than once.
 func (s *Server) StartWithListener(ln net.Listener) error {

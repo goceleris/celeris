@@ -685,6 +685,75 @@ func (c *Context) Hijack() (net.Conn, error) {
 	return conn, nil
 }
 
+// UpgradeWebSocket installs a data delivery callback for engine-integrated
+// WebSocket support. After the HTTP 101 upgrade is sent and Detach is called,
+// subsequent data arriving on the connection is delivered to the callback
+// instead of being parsed as HTTP. Returns false if the engine does not
+// support integrated WebSocket (e.g. std engine), in which case the caller
+// should fall back to [Context.Hijack].
+//
+// The callback is invoked on the engine's event loop thread and must not
+// block. Typically it writes to an [io.PipeWriter].
+func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
+	if c.stream.OnWSUpgrade == nil {
+		return false
+	}
+	c.stream.OnWSUpgrade(delivery)
+	return true
+}
+
+// SetWSDetachClose installs a callback that the engine invokes when it
+// closes a detached connection (timeout, error, shutdown). This allows
+// the WebSocket middleware to unblock its handler goroutine.
+func (c *Context) SetWSDetachClose(fn func()) {
+	if c.stream.OnWSDetachClose != nil {
+		c.stream.OnWSDetachClose(fn)
+	}
+}
+
+// WSRawWriteFn returns the raw write function for WebSocket frames,
+// bypassing chunked encoding. Returns nil if not available (e.g., before
+// Detach or on the std engine). Must be called AFTER [Context.Detach].
+func (c *Context) WSRawWriteFn() func([]byte) {
+	if c.stream.OnWSRawWrite == nil {
+		return nil
+	}
+	return c.stream.OnWSRawWrite()
+}
+
+// SetWSErrorHandler installs a handler called by the engine when an I/O
+// failure occurs on this detached connection. The WebSocket middleware uses
+// this to surface engine-side errors from the next user-level Read or Write
+// call. Must be called AFTER [Context.Detach]. No-op on engines that do not
+// support engine-integrated WebSocket (e.g. std).
+func (c *Context) SetWSErrorHandler(fn func(error)) {
+	if c.stream.OnWSSetError != nil {
+		c.stream.OnWSSetError(fn)
+	}
+}
+
+// WSReadPauser returns the engine's pause/resume callbacks for inbound
+// WebSocket data, or (nil, nil) if the engine does not support TCP-level
+// backpressure (e.g. std). Must be called AFTER [Context.Detach]. The
+// returned callbacks are safe to call from any goroutine.
+func (c *Context) WSReadPauser() (pause, resume func()) {
+	if c.stream.OnWSReadPauser == nil {
+		return nil, nil
+	}
+	return c.stream.OnWSReadPauser()
+}
+
+// SetWSIdleDeadline sets the absolute deadline (Unix nanoseconds) at which
+// the engine should close this detached connection. Used by the WebSocket
+// middleware to enforce IdleTimeout on the engine path. Pass 0 to clear.
+// May be called repeatedly to extend the deadline. No-op on engines that
+// do not support engine-integrated WebSocket.
+func (c *Context) SetWSIdleDeadline(ns int64) {
+	if c.stream.OnWSSetIdleDeadline != nil {
+		c.stream.OnWSSetIdleDeadline(ns)
+	}
+}
+
 // Detach removes the Context from the handler chain's lifecycle.
 // After Detach, the Context will not be released when the handler returns.
 // The caller MUST call the returned done function when finished with the Context —

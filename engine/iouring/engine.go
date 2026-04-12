@@ -96,6 +96,19 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 // Listen starts the io_uring engine and blocks until context is canceled.
 func (e *Engine) Listen(ctx context.Context) error {
+	// If a listener was provided (StartWithListener), use its bound address
+	// and close the Go-managed listener so our raw sockets can bind with
+	// SO_REUSEPORT. Log the ownership transfer so users see it.
+	if e.cfg.Listener != nil {
+		e.cfg.Addr = e.cfg.Listener.Addr().String()
+		if e.cfg.Logger != nil {
+			e.cfg.Logger.Info("iouring: closing supplied listener to rebind via SO_REUSEPORT",
+				"addr", e.cfg.Addr)
+		}
+		e.cfg.Listener.Close()
+		e.cfg.Listener = nil
+	}
+
 	resolved := e.cfg.Resources.Resolve()
 
 	cpus := platform.DistributeWorkers(resolved.Workers, e.profile.NumCPU, e.profile.NUMANodes)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	h1 "github.com/goceleris/celeris/protocol/h1"
@@ -41,6 +42,50 @@ type H1State struct {
 	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
 	OnDetach           func()                                              // set by engine; called on Context.Detach
 	Detached           bool                                                // set by OnDetach; breaks pipelining loop
+
+	// WSDataDelivery is set by the WebSocket middleware after upgrade (101 sent).
+	// When non-nil and Detached, subsequent reads are delivered as raw bytes
+	// to this callback instead of being parsed as H1 requests. The callback
+	// is called on the event loop thread — it must not block.
+	WSDataDelivery func(data []byte)
+
+	// RawWriteFn is set after Detach. It writes raw bytes to the engine's
+	// write buffer, bypassing H1 chunked encoding. Used by WebSocket for
+	// frame writes.
+	RawWriteFn func([]byte)
+
+	// OnDetachClose is called by the engine when it closes a detached
+	// connection (timeout, error, shutdown). The WebSocket middleware sets
+	// this to close the io.Pipe and data channel, unblocking the handler
+	// goroutine. Called under cs.detachMu — must not block.
+	//
+	// Detached-connection API surface — stable. The fields below
+	// (OnDetachClose, OnError, PauseRecv, ResumeRecv, IdleDeadlineNs) form
+	// the contract between the engine layer and any long-lived-connection
+	// middleware (WebSocket, SSE, gRPC streaming, etc). They are part of
+	// the celeris public API: changes require a major version bump.
+	OnDetachClose func()
+
+	// OnError is called by the engine when an I/O failure occurs on a
+	// detached connection (read error, write error, EPIPE, ECONNRESET, etc).
+	// The WebSocket middleware uses this to surface engine-side errors
+	// from the next user-level Read or Write call. Called under cs.detachMu
+	// — must not block.
+	OnError func(err error)
+
+	// PauseRecv and ResumeRecv are set by the engine in OnDetach. The
+	// middleware calls them to apply TCP-level backpressure on the inbound
+	// data path. They may be called from any goroutine and are no-ops if
+	// the engine cannot pause reads (e.g. std hijacked path).
+	PauseRecv  func()
+	ResumeRecv func()
+
+	// IdleDeadlineNs holds the absolute deadline (Unix nanoseconds) at
+	// which a detached connection should be closed by the engine. The
+	// WebSocket middleware updates this after each successful frame read;
+	// the engine's idle sweep checks it on detached connections. 0 = no
+	// deadline.
+	IdleDeadlineNs atomic.Int64
 }
 
 // UpdateWriteFn replaces the response adapter's write function. Called by
@@ -79,6 +124,14 @@ func CloseH1(state *H1State) {
 // The write callback is used to send response bytes back to the connection.
 func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.Handler,
 	write func([]byte)) error {
+
+	// WebSocket upgrade: deliver raw bytes to the middleware goroutine
+	// instead of parsing as H1. The delivery callback writes to an io.Pipe
+	// that the goroutine reads from.
+	if state.Detached && state.WSDataDelivery != nil {
+		state.WSDataDelivery(data)
+		return nil
+	}
 
 	if state.buffer.Len() == 0 {
 		offset := 0
@@ -311,6 +364,24 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	}
 	s.RemoteAddr = state.RemoteAddr
 	s.OnDetach = state.OnDetach
+	s.OnWSUpgrade = func(delivery func([]byte)) {
+		state.WSDataDelivery = delivery
+	}
+	s.OnWSRawWrite = func() func([]byte) {
+		return state.RawWriteFn
+	}
+	s.OnWSDetachClose = func(closeFn func()) {
+		state.OnDetachClose = closeFn
+	}
+	s.OnWSSetError = func(errFn func(error)) {
+		state.OnError = errFn
+	}
+	s.OnWSReadPauser = func() (func(), func()) {
+		return state.PauseRecv, state.ResumeRecv
+	}
+	s.OnWSSetIdleDeadline = func(ns int64) {
+		state.IdleDeadlineNs.Store(ns)
+	}
 	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4

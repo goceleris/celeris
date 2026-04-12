@@ -60,8 +60,14 @@ type Stream struct {
 	flags                  atomic.Uint32
 	doneCh                 atomic.Pointer[chan struct{}]
 	phase                  Phase
-	CachedCtx              any    // per-connection cached context (avoids pool Get/Put per request)
-	OnDetach               func() // called by Context.Detach to install write-thread safety
+	CachedCtx              any                     // per-connection cached context (avoids pool Get/Put per request)
+	OnDetach               func()                  // called by Context.Detach to install write-thread safety
+	OnWSUpgrade            func(func([]byte))      // called by Context to install WS data delivery callback
+	OnWSRawWrite           func() func([]byte)     // returns raw write fn (bypasses chunked encoding)
+	OnWSDetachClose        func(func())            // installs callback for engine-side connection close
+	OnWSSetError           func(func(error))       // installs error handler for engine-side I/O failures
+	OnWSReadPauser         func() (func(), func()) // returns (pause, resume) callbacks for inbound backpressure
+	OnWSSetIdleDeadline    func(int64)             // sets the absolute idle deadline (Unix nanoseconds)
 	hdrBuf                 [16][2]string
 }
 
@@ -234,6 +240,12 @@ func (s *Stream) resetAndPool() {
 	s.phase = 0
 	s.CachedCtx = nil
 	s.OnDetach = nil
+	s.OnWSUpgrade = nil
+	s.OnWSRawWrite = nil
+	s.OnWSDetachClose = nil
+	s.OnWSSetError = nil
+	s.OnWSReadPauser = nil
+	s.OnWSSetIdleDeadline = nil
 	if s.ReceivedWindowUpd != nil {
 		for len(s.ReceivedWindowUpd) > 0 {
 			<-s.ReceivedWindowUpd

@@ -4,11 +4,15 @@ go 1.26.0
 
 require (
 	github.com/go-chi/chi/v5 v5.2.1
-	github.com/goceleris/celeris v0.0.0
+	github.com/goceleris/celeris v1.3.3
+	github.com/goceleris/celeris/middleware/protobuf v0.0.0
+	github.com/goceleris/celeris/middleware/websocket v0.0.0
 	github.com/gofiber/fiber/v3 v3.0.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/rs/cors v1.11.1
 	github.com/valyala/fasthttp v1.69.0
+	google.golang.org/protobuf v1.36.6
 )
 
 require (
@@ -31,4 +35,8 @@ require (
 	golang.org/x/time v0.8.0 // indirect
 )
 
-replace github.com/goceleris/celeris => ../../
+replace (
+	github.com/goceleris/celeris => ../../
+	github.com/goceleris/celeris/middleware/protobuf => ../../middleware/protobuf
+	github.com/goceleris/celeris/middleware/websocket => ../../middleware/websocket
+)

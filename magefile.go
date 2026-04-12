@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const vmName = "celeris-bench"
@@ -122,6 +123,37 @@ func H1Spec() error {
 // Spec runs all protocol compliance tests (h2spec + h1spec) across all engines.
 func Spec() error {
 	return run("go", "test", "-v", "-count=1", "-timeout=120s", "./test/spec/...")
+}
+
+// TestAutobahn runs the Autobahn|Testsuite fuzzingclient against the
+// celeris WebSocket middleware on each available engine. Requires Docker
+// (for the autobahn-testsuite container) and Go to build the local
+// echo-server binary. On macOS only the std engine is exercised.
+//
+// Reports land in test/autobahn/reports/clients/index.html.
+func TestAutobahn() error {
+	return runEnv(nil, "make", "-C", "test/autobahn", "autobahn")
+}
+
+// TestSoak runs the 5-minute WebSocket slow-consumer soak test. Validates
+// that the engine-integrated backpressure pipeline keeps goroutine count
+// and heap allocation bounded under sustained load. Override the
+// duration via SOAK_DURATION (e.g. SOAK_DURATION=30m for the pre-release
+// soak).
+func TestSoak() error {
+	duration := os.Getenv("SOAK_DURATION")
+	if duration == "" {
+		duration = "5m"
+	}
+	// Give the Go test framework a little slack on top of SOAK_DURATION.
+	timeout := duration + "+5m"
+	if d, err := time.ParseDuration(duration); err == nil {
+		timeout = (d + 5*time.Minute).String()
+	}
+	return runEnv(map[string]string{"SOAK_DURATION": duration},
+		"go", "test", "-tags=soak", "-timeout", timeout,
+		"-run", "TestSoakSlowConsumer",
+		"-v", "./middleware/websocket/...")
 }
 
 // LintLinux runs golangci-lint for Linux cross-compilation.

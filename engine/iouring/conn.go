@@ -5,6 +5,7 @@ package iouring
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
@@ -43,6 +44,10 @@ type connState struct {
 	writeFn      func([]byte) // cached write function (avoids closure allocation per recv)
 	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
+
+	// WebSocket recv backpressure (detached conns only):
+	recvPaused       bool        // engine-side current state (worker-thread only)
+	recvPauseDesired atomic.Bool // requested state from middleware goroutine
 }
 
 var connStatePool = sync.Pool{
@@ -91,6 +96,8 @@ func releaseConnState(cs *connState) {
 	cs.lastActivity = 0
 	cs.detachMu = nil
 	cs.detachClosed = false
+	cs.recvPaused = false
+	cs.recvPauseDesired.Store(false)
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

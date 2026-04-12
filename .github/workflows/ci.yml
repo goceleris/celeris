@@ -38,6 +38,11 @@ jobs:
         with:
           version: v2.9
           working-directory: middleware/otel
+      - name: Lint middleware/protobuf
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.9
+          working-directory: middleware/protobuf
 
   test:
     name: Test (${{ matrix.os }})
@@ -63,6 +68,9 @@ jobs:
       - name: Sub-module tests (middleware/otel)
         run: go test -race -count=1 -timeout=60s ./...
         working-directory: middleware/otel
+      - name: Sub-module tests (middleware/protobuf)
+        run: go test -race -count=1 -timeout=60s ./...
+        working-directory: middleware/protobuf
 
   conformance:
     name: Conformance
@@ -134,6 +142,9 @@ jobs:
       - name: Build middleware/otel
         run: go build ./...
         working-directory: middleware/otel
+      - name: Build middleware/protobuf
+        run: go build ./...
+        working-directory: middleware/protobuf
 
   vulncheck:
     name: Vulnerability Check
@@ -156,6 +167,9 @@ jobs:
       - name: middleware/otel
         run: govulncheck ./...
         working-directory: middleware/otel
+      - name: middleware/protobuf
+        run: govulncheck ./...
+        working-directory: middleware/protobuf
 
   bench:
     name: Bench

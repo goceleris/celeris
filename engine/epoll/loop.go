@@ -29,6 +29,10 @@ import (
 // Must accommodate the maximum number of concurrent connections per worker.
 const connTableSize = 65536
 
+// errPeerClosed is returned via H1State.OnError when the peer closes the
+// connection cleanly (read returns 0 bytes / EOF).
+var errPeerClosed = errors.New("celeris: peer closed connection")
+
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id           int
@@ -59,12 +63,13 @@ type Loop struct {
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead    *connState // head of intrusive doubly-linked dirty list
-	h2Conns      []int      // FDs of H2 connections (for write queue polling)
-	h2cfg        conn.H2Config
-	detachQueue  []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
-	detachQMu    sync.Mutex
-	detachQSpare []*connState // reuse slice to avoid alloc in drainDetachQueue
+	dirtyHead     *connState // head of intrusive doubly-linked dirty list
+	h2Conns       []int      // FDs of H2 connections (for write queue polling)
+	h2cfg         conn.H2Config
+	detachQueue   []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
+	detachQMu     sync.Mutex
+	detachQSpare  []*connState // reuse slice to avoid alloc in drainDetachQueue
+	detachedCount int          // number of currently-detached conns; gates idle-deadline sweep
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -256,6 +261,11 @@ func (l *Loop) run(ctx context.Context) {
 			l.consecutiveEmpty++
 		}
 
+		// Drain detached goroutine writes BEFORE the dirty flush so that
+		// data written by goroutines (e.g. WebSocket responses) is flushed
+		// in the same event loop iteration.
+		l.drainDetachQueue()
+
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			if mu := cs.detachMu; mu != nil {
@@ -263,6 +273,10 @@ func (l *Loop) run(ctx context.Context) {
 			}
 			err := flushWrites(cs)
 			if err != nil {
+				// Surface I/O failure to detached middleware before closing.
+				if cs.h1State != nil && cs.h1State.OnError != nil {
+					cs.h1State.OnError(err)
+				}
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -301,9 +315,6 @@ func (l *Loop) run(ctx context.Context) {
 			}
 		}
 
-		// Drain detached goroutine writes. Goroutines append to the queue
-		// instead of calling markDirty directly (dirtyHead is loop-local).
-		l.drainDetachQueue()
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per event loop
@@ -314,9 +325,16 @@ func (l *Loop) run(ctx context.Context) {
 			l.reqBatch = 0
 		}
 
-		// Check connection timeouts every 1024 iterations (~100ms).
+		// Check connection timeouts. Default cadence is every 1024 iterations
+		// (~100ms under load); when detached conns exist with idle deadlines
+		// the gate tightens to every 32 iterations (~50ms idle wall time)
+		// so the WS idle-close fires within its configured budget.
 		l.tickCounter++
-		if l.tickCounter&0x3FF == 0 {
+		gate := uint32(0x3FF)
+		if l.detachedCount > 0 {
+			gate = 0x1F
+		}
+		if l.tickCounter&gate == 0 {
 			l.checkTimeouts()
 		}
 
@@ -414,6 +432,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 				mu.Lock()
 			}
 			_ = flushWrites(cs)
+			// Surface read failure to detached middleware (e.g. WS).
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(err)
+			}
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
 			}
@@ -425,6 +447,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 				mu.Lock()
 			}
 			_ = flushWrites(cs)
+			// Surface peer-close (EOF) to detached middleware.
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(errPeerClosed)
+			}
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
 			}
@@ -474,6 +500,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 			}
 			_ = flushWrites(cs)
 			cs.pendingBytes = 0
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(processErr)
+			}
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
 			}
@@ -491,6 +520,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 		}
 		if cs.writePos < len(cs.writeBuf) {
 			if fErr := flushWrites(cs); fErr != nil {
+				if cs.h1State != nil && cs.h1State.OnError != nil {
+					cs.h1State.OnError(fErr)
+				}
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -512,11 +544,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.markDirty(cs)
 			}
 		}
+		// Capture pendingBytes inside the lock so the check below is safe
+		// against concurrent goroutine writes via the guarded writeFn.
+		pending := cs.pendingBytes
 		if mu := cs.detachMu; mu != nil {
 			mu.Unlock()
 		}
 
-		if cs.pendingBytes > maxPendingBytes {
+		if pending > maxPendingBytes {
 			l.closeConn(fd)
 			return
 		}
@@ -558,6 +593,7 @@ func (l *Loop) initProtocol(cs *connState) {
 			cs.h1State.Detached = true
 			mu := &sync.Mutex{}
 			cs.detachMu = mu
+			l.detachedCount++
 			orig := cs.writeFn
 			guarded := func(data []byte) {
 				mu.Lock()
@@ -582,6 +618,37 @@ func (l *Loop) initProtocol(cs *connState) {
 			// Also update the response adapter so StreamWriter writes
 			// go through the guarded path (not the stale pre-Detach writeFn).
 			cs.h1State.UpdateWriteFn(guarded)
+			// Expose raw write for WebSocket (bypasses chunked encoding).
+			cs.h1State.RawWriteFn = guarded
+			// Install pause/resume callbacks for WebSocket backpressure.
+			// These set a desired state and wake the loop; the actual
+			// EPOLL_CTL_MOD is applied in drainDetachQueue (event-loop thread).
+			cs.h1State.PauseRecv = func() {
+				if cs.recvPauseDesired.Swap(true) {
+					return // already requested
+				}
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
+			}
+			cs.h1State.ResumeRecv = func() {
+				if !cs.recvPauseDesired.Swap(false) {
+					return // already not paused
+				}
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
+			}
 			// Ensure eventfd is available for wakeup.
 			if l.eventFD < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
@@ -624,6 +691,21 @@ func (l *Loop) drainDetachQueue() {
 	for _, cs := range l.detachQSpare {
 		if cs.detachClosed {
 			continue
+		}
+		// Apply any pending pause/resume request from the WS middleware.
+		// EPOLL_CTL_MOD with Events=0 stops EPOLLIN delivery; restoring
+		// EPOLLIN|EPOLLET re-enables it. The kernel applies TCP-level
+		// backpressure (zero-window) when its recv buffer fills.
+		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
+			var events uint32 = unix.EPOLLIN | unix.EPOLLET
+			if desired {
+				events = 0
+			}
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
+				Events: events,
+				Fd:     int32(cs.fd),
+			})
+			cs.recvPaused = desired
 		}
 		l.markDirty(cs)
 	}
@@ -681,6 +763,12 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	if len(l.h2Conns) > 0 && l.eventFD < 0 {
 		return 1
 	}
+	// Cap the timeout when detached conns exist so checkTimeouts can fire
+	// the WS-supplied IdleDeadline before its expiry.
+	cap := 500
+	if l.detachedCount > 0 {
+		cap = 50
+	}
 	switch {
 	case l.consecutiveEmpty == 0:
 		return base
@@ -691,11 +779,14 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 		if d > 100 {
 			d = 100
 		}
+		if d > cap {
+			d = cap
+		}
 		return d
 	default:
 		d := base * 4
-		if d > 500 {
-			d = 500
+		if d > cap {
+			d = cap
 		}
 		return d
 	}
@@ -708,6 +799,18 @@ func (l *Loop) checkTimeouts() {
 	for fd := 0; fd <= l.maxFD; fd++ {
 		cs := l.conns[fd]
 		if cs == nil {
+			continue
+		}
+		// Detached connections (e.g. WebSocket): honor an explicit deadline
+		// supplied by the middleware via SetWSIdleDeadline. Skip the
+		// engine-config-driven idle/read/write timeouts since the middleware
+		// owns the I/O lifecycle.
+		if cs.detachMu != nil {
+			if cs.h1State != nil {
+				if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
+					l.closeConn(fd)
+				}
+			}
 			continue
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
@@ -737,7 +840,20 @@ func (l *Loop) closeConn(fd int) {
 		// goroutine is mid-write, we block until it finishes.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
+		if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+			cs.h1State.OnDetachClose()
+			cs.h1State.OnDetachClose = nil
+		}
 		cs.detachMu.Unlock()
+		// Drop callbacks once the engine relinquishes the conn so any
+		// late goroutine references resolve to no-ops without crashing.
+		if cs.h1State != nil {
+			cs.h1State.PauseRecv = nil
+			cs.h1State.ResumeRecv = nil
+		}
+		if l.detachedCount > 0 {
+			l.detachedCount--
+		}
 	}
 	l.removeDirty(cs)
 	if !detached {
@@ -781,6 +897,10 @@ func (l *Loop) shutdown() {
 		if detached {
 			cs.detachMu.Lock()
 			cs.detachClosed = true
+			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+				cs.h1State.OnDetachClose()
+				cs.h1State.OnDetachClose = nil
+			}
 			cs.detachMu.Unlock()
 		}
 		if !detached && cs.h1State != nil {
