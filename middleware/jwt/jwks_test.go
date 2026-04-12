@@ -39,16 +39,14 @@ func rsaJWKSJSON(kid string, pub *rsa.PublicKey) []byte {
 }
 
 func ecJWKSJSON(kid string, pub *ecdsa.PublicKey, crv string) []byte {
-	byteLen := (pub.Curve.Params().BitSize + 7) / 8
-	xBytes := pub.X.Bytes()
-	yBytes := pub.Y.Bytes()
-	// Pad to correct length.
-	xPadded := make([]byte, byteLen)
-	yPadded := make([]byte, byteLen)
-	copy(xPadded[byteLen-len(xBytes):], xBytes)
-	copy(yPadded[byteLen-len(yBytes):], yBytes)
-	x := base64.RawURLEncoding.EncodeToString(xPadded)
-	y := base64.RawURLEncoding.EncodeToString(yPadded)
+	ecdhKey, err := pub.ECDH()
+	if err != nil {
+		panic(err)
+	}
+	raw := ecdhKey.Bytes() // 0x04 || X || Y
+	byteLen := (len(raw) - 1) / 2
+	x := base64.RawURLEncoding.EncodeToString(raw[1 : 1+byteLen])
+	y := base64.RawURLEncoding.EncodeToString(raw[1+byteLen:])
 	jwks := map[string]any{
 		"keys": []map[string]any{
 			{
@@ -125,7 +123,7 @@ func TestJWKSFetchEC(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *ecdsa.PublicKey, got %T", key)
 	}
-	if pub.X.Cmp(privKey.X) != 0 || pub.Y.Cmp(privKey.Y) != 0 {
+	if !pub.Equal(&privKey.PublicKey) {
 		t.Fatal("EC key mismatch")
 	}
 }
@@ -304,11 +302,24 @@ func TestJWKSResponseSizeLimit(t *testing.T) {
 }
 
 func TestJWKSHTTPTimeout(t *testing.T) {
+	// The test asserts that the client times out after 50ms while the
+	// server handler takes 15s. Using an unblocking signal lets ts.Close
+	// finish immediately instead of waiting out the 15s sleep — which
+	// previously caused httptest to emit its "Server blocked in Close"
+	// debug dump and flake the suite under -count=2+ when running
+	// alongside other tests.
+	stop := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(15 * time.Second)
+		select {
+		case <-stop:
+		case <-time.After(15 * time.Second):
+		}
 		_, _ = w.Write([]byte(`{"keys":[]}`))
 	}))
-	defer ts.Close()
+	defer func() {
+		close(stop)
+		ts.Close()
+	}()
 
 	fetcher := newJWKSFetcher(ts.URL, time.Hour)
 	// Override client timeout to 50ms for fast test.
@@ -759,27 +770,26 @@ func TestJWKSParseECKey(t *testing.T) {
 	}
 	pub := &privKey.PublicKey
 
-	byteLen := (pub.Curve.Params().BitSize + 7) / 8
-	xBytes := pub.X.Bytes()
-	yBytes := pub.Y.Bytes()
-	xPadded := make([]byte, byteLen)
-	yPadded := make([]byte, byteLen)
-	copy(xPadded[byteLen-len(xBytes):], xBytes)
-	copy(yPadded[byteLen-len(yBytes):], yBytes)
+	ecdhKey, err := pub.ECDH()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := ecdhKey.Bytes() // 0x04 || X || Y
+	byteLen := (len(raw) - 1) / 2
 
 	jwk := map[string]any{
 		"kty": "EC",
 		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(xPadded),
-		"y":   base64.RawURLEncoding.EncodeToString(yPadded),
+		"x":   base64.RawURLEncoding.EncodeToString(raw[1 : 1+byteLen]),
+		"y":   base64.RawURLEncoding.EncodeToString(raw[1+byteLen:]),
 	}
 
 	parsed, err := parseECKey(jwk)
 	if err != nil {
 		t.Fatalf("parseECKey: %v", err)
 	}
-	if parsed.X.Cmp(pub.X) != 0 || parsed.Y.Cmp(pub.Y) != 0 {
-		t.Fatal("EC key coordinate mismatch")
+	if !parsed.Equal(pub) {
+		t.Fatal("EC key mismatch")
 	}
 	if parsed.Curve != elliptic.P256() {
 		t.Fatal("EC curve mismatch")

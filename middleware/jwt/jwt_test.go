@@ -1437,10 +1437,12 @@ func TestHMACKeyLengthWarning(t *testing.T) {
 				key[i] = byte(i + 1)
 			}
 			var logBuf strings.Builder
+			prevOut := log.Writer()
+			prevFlags := log.Flags()
 			log.SetOutput(&logBuf)
 			log.SetFlags(0)
-			defer log.SetOutput(nil)
-			defer log.SetFlags(log.LstdFlags)
+			defer log.SetOutput(prevOut)
+			defer log.SetFlags(prevFlags)
 
 			tokenStr := signTokenWithMethod(tc.method, jwtparse.MapClaims{"sub": "1"}, key)
 			mw := New(Config{
@@ -1466,10 +1468,12 @@ func TestHMACKeyLengthNoWarningWhenSufficient(t *testing.T) {
 		goodKey[i] = byte(i + 1)
 	}
 	var logBuf strings.Builder
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
 	log.SetOutput(&logBuf)
 	log.SetFlags(0)
-	defer log.SetOutput(nil)
-	defer log.SetFlags(log.LstdFlags)
+	defer log.SetOutput(prevOut)
+	defer log.SetFlags(prevFlags)
 
 	tokenStr := signTokenWithMethod(jwtparse.SigningMethodHS256, jwtparse.MapClaims{"sub": "1"}, goodKey)
 	mw := New(Config{SigningKey: goodKey})
