@@ -34,7 +34,7 @@ func BenchmarkParseRequest_ManyHeaders(b *testing.B) {
 	sb.WriteString("X-Request-ID: abc-def-ghi\r\n")
 	sb.WriteString("X-Forwarded-For: 10.0.0.1\r\n")
 	for i := 0; i < 20; i++ {
-		sb.WriteString(fmt.Sprintf("X-Custom-%02d: value-%02d\r\n", i, i))
+		fmt.Fprintf(&sb, "X-Custom-%02d: value-%02d\r\n", i, i)
 	}
 	sb.WriteString("\r\n")
 	sb.WriteString("Hello, World!")

@@ -19,7 +19,7 @@ func TestHeadersTooLarge(t *testing.T) {
 	headerCount := (MaxHeaderSize / (8192 + 20)) + 10 // enough to exceed 16MB
 
 	for i := 0; i < headerCount; i++ {
-		b.WriteString(fmt.Sprintf("X-Pad-%04d: %s\r\n", i, value))
+		fmt.Fprintf(&b, "X-Pad-%04d: %s\r\n", i, value)
 	}
 	b.WriteString("\r\n")
 
@@ -45,7 +45,7 @@ func TestHeadersJustUnderLimit(t *testing.T) {
 	// Target: total header bytes just under MaxHeaderSize
 	remaining := MaxHeaderSize - hostLineLen - 100 // leave margin
 	value := strings.Repeat("B", remaining-6)      // "X: " + value + "\r\n"
-	b.WriteString(fmt.Sprintf("X: %s\r\n", value))
+	fmt.Fprintf(&b, "X: %s\r\n", value)
 	b.WriteString("\r\n")
 
 	raw := b.String()
