@@ -37,10 +37,7 @@ func TestH2Spec(t *testing.T) {
 						section,
 					)
 					output, err := cmd.CombinedOutput()
-					t.Logf("h2spec %s:\n%s", section, output)
-					if err != nil {
-						t.Errorf("h2spec %s: %v", section, err)
-					}
+					checkH2SpecResult(t, se.name, section, output, err)
 				})
 			}
 		})

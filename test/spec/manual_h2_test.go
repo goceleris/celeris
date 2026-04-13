@@ -28,10 +28,7 @@ func TestH2SpecFull(t *testing.T) {
 				"--strict",
 			)
 			output, err := cmd.CombinedOutput()
-			t.Logf("h2spec:\n%s", output)
-			if err != nil {
-				t.Errorf("h2spec: %v", err)
-			}
+			checkH2SpecResult(t, se.name, "full-strict", output, err)
 		})
 	}
 }
