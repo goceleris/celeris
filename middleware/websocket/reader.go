@@ -118,10 +118,14 @@ func (c *Conn) NextReader() (MessageType, io.Reader, error) {
 				}
 				return mt, bytes.NewReader(data), nil
 			}
-			// Single compressed frame — decompress.
-			data, derr := decompressMessage(payload)
+			// Single compressed frame — decompress, bounded by readLimit.
+			data, derr := decompressMessage(payload, c.readLimit)
 			if derr != nil {
-				c.writeCloseProtocol(CloseProtocolError, "decompression error")
+				if derr == ErrReadLimit {
+					c.writeCloseProtocol(CloseMessageTooBig, "decompressed message too large")
+				} else {
+					c.writeCloseProtocol(CloseProtocolError, "decompression error")
+				}
 				return 0, nil, derr
 			}
 			if h.Opcode == OpText && !utf8.Valid(data) {

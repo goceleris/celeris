@@ -439,7 +439,28 @@ func FuzzBasicAuthHeader(f *testing.F) {
 	})
 }
 
-// --- HashedUsers (SHA-256) tests ---
+// --- HashedUsers tests ---
+//
+// HashedUsers requires HashedUsersFunc since v1.3.4 (no built-in default;
+// SHA-2/SHA-3/BLAKE2 are too fast for credential storage). Tests below
+// supply a SHA-256 verifier so the assertions still exercise the auth
+// flow end-to-end. Production callers should use bcrypt/argon2.
+
+// sha256Verifier is a HashedUsersFunc using SHA-256, matching what
+// HashPassword produces. Constant-time per the contract.
+func sha256Verifier(stored, pass string) bool {
+	want, err := hex.DecodeString(stored)
+	if err != nil || len(want) != sha256.Size {
+		// Constant-time false: still hash and compare to a fixed array
+		// so callers can't time the format-error branch.
+		got := sha256.Sum256([]byte(pass))
+		var dummy [sha256.Size]byte
+		_ = subtle.ConstantTimeCompare(got[:], dummy[:])
+		return false
+	}
+	got := sha256.Sum256([]byte(pass))
+	return subtle.ConstantTimeCompare(got[:], want) == 1
+}
 
 func TestHashPasswordDeterministic(t *testing.T) {
 	h1 := HashPassword("secret")
@@ -483,6 +504,7 @@ func TestHashedUsers(t *testing.T) {
 			"admin": HashPassword("secret"),
 			"user2": HashPassword("pass2"),
 		},
+		HashedUsersFunc: sha256Verifier,
 	})
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -507,27 +529,18 @@ func TestHashedUsers(t *testing.T) {
 	}
 }
 
-func TestHashedUsersInvalidHexPanics(t *testing.T) {
+func TestHashedUsersRequiresFuncPanics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Fatal("expected panic for invalid hex hash")
+			t.Fatal("expected panic when HashedUsers is set without HashedUsersFunc")
 		}
 	}()
-	New(Config{HashedUsers: map[string]string{"admin": "not-hex"}})
-}
-
-func TestHashedUsersWrongLengthPanics(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic for wrong-length hash")
-		}
-	}()
-	New(Config{HashedUsers: map[string]string{"admin": "abcd"}})
+	New(Config{HashedUsers: map[string]string{"admin": HashPassword("secret")}})
 }
 
 func TestHashedUsersDeepCopy(t *testing.T) {
 	hashed := map[string]string{"admin": HashPassword("secret")}
-	mw := New(Config{HashedUsers: hashed})
+	mw := New(Config{HashedUsers: hashed, HashedUsersFunc: sha256Verifier})
 
 	hashed["admin"] = HashPassword("changed")
 	hashed["hacker"] = HashPassword("injected")

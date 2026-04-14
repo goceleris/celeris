@@ -127,8 +127,8 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		if oa.ClientID != "" {
 			oaParts = append(oaParts, fmt.Sprintf("clientId: %q", oa.ClientID))
 		}
-		if oa.ClientSecret != "" {
-			oaParts = append(oaParts, fmt.Sprintf("clientSecret: %q", oa.ClientSecret))
+		if oa.UsePKCE {
+			oaParts = append(oaParts, "usePkceWithAuthorizationCodeGrant: true")
 		}
 		if oa.Realm != "" {
 			oaParts = append(oaParts, fmt.Sprintf("realm: %q", oa.Realm))

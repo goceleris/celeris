@@ -102,11 +102,20 @@ func appendData(buf []byte, s string) []byte {
 	}
 }
 
-// formatComment writes a comment line ": <text>\n\n" into buf.
+// formatComment writes a comment line ": <text>\n\n" into buf. Newlines
+// inside text are stripped to prevent SSE-event injection: a `\n` would
+// terminate the comment line and let attacker-controlled trailing bytes
+// be interpreted as `data:` / `event:` / `id:` fields.
 func formatComment(buf []byte, text string) []byte {
 	buf = buf[:0]
 	buf = append(buf, ": "...)
-	buf = append(buf, text...)
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c == '\r' || c == '\n' {
+			continue
+		}
+		buf = append(buf, c)
+	}
 	buf = append(buf, '\n', '\n')
 	return buf
 }

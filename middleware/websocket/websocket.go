@@ -82,9 +82,20 @@ func New(config ...Config) celeris.HandlerFunc {
 				return celeris.NewHTTPError(403, "websocket: origin not allowed")
 			}
 		} else {
-			// Default same-origin check: Origin must match Host.
+			// Default same-origin check: Origin must match Host. Browser
+			// clients always send Origin on cross-origin upgrade attempts;
+			// missing Origin on https:// is treated as a CSRF-class
+			// signal and rejected. Non-browser clients that legitimately
+			// omit Origin should set an explicit [Config.CheckOrigin].
 			origin := c.Header("origin")
-			if origin != "" {
+			if origin == "" {
+				if c.Scheme() == "https" {
+					return celeris.NewHTTPError(403, "websocket: missing Origin on https — set Config.CheckOrigin to allow")
+				}
+				// Plain http: keep the legacy permissive behavior; loopback
+				// dev tools and CLI clients commonly omit Origin and would
+				// break otherwise.
+			} else {
 				host := c.Host()
 				if !checkSameOrigin(origin, host) {
 					return celeris.NewHTTPError(403, "websocket: origin not allowed")

@@ -59,7 +59,15 @@ type Config struct {
 	// Parsed via ParseRate.
 	RateFunc func(c *celeris.Context) (rate string, err error)
 
-	// KeyFunc extracts the rate limit key from the request. Default: c.ClientIP().
+	// KeyFunc extracts the rate limit key from the request. Default:
+	// c.ClientIP() — which means the proxy middleware MUST be installed
+	// (Server.Pre(proxy.New(...))) when running behind a reverse proxy.
+	// Without proxy, ClientIP() returns the immediate peer (the load
+	// balancer's address), so all real clients share one bucket and a
+	// single noisy client triggers a global DoS for everyone behind the
+	// same hop. With a misconfigured TrustedProxies range, attackers can
+	// spoof X-Forwarded-For and escape their bucket. Verify the chain
+	// before relying on the default.
 	KeyFunc func(c *celeris.Context) string
 
 	// SkipPaths lists paths to skip (exact match).

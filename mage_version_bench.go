@@ -63,6 +63,7 @@ func sanitizeRef(ref string) string {
 
 func parseVersionRefs(spec string) []string {
 	if spec == "" {
+		// Bump to include v1.3.4 once that tag is published.
 		return []string{"v1.1.0", "v1.2.0", "v1.3.0", "v1.3.3", "HEAD"}
 	}
 	parts := strings.Split(spec, ",")

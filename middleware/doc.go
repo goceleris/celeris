@@ -59,13 +59,23 @@
 //	s.Pre(rewrite.New(rewrite.Config{Rules: []rewrite.Rule{{Pattern: `^/old/(.*)$`, Replacement: "/new/$1"}}}))
 //	s.Pre(methodoverride.New())
 //
-//	// Route middleware
+//	// Route middleware (install per the ordering list above; entries
+//	// commented out below are optional but, when used, must keep their
+//	// position in the chain).
 //	s.Use(healthcheck.New())
 //	s.Use(requestid.New())
+//	// s.Use(metrics.New(...))     // optional: Prometheus
+//	// s.Use(otel.New(...))        // optional: OpenTelemetry
+//	// s.Use(logger.New())         // optional: structured request logs
 //	s.Use(recovery.New())
-//	s.Use(cors.New())
 //	s.Use(secure.New())
+//	s.Use(cors.New())
+//	// s.Use(bodylimit.New(...))   // optional: cap request body
+//	// s.Use(ratelimit.New(...))   // optional: shed load
 //	s.Use(circuitbreaker.New())
+//	// s.Use(jwt.New(...))         // optional: auth (see Auth Stacking)
+//	// s.Use(csrf.New())           // optional: after auth
+//	// s.Use(session.New(...))     // optional: after auth
 //	s.Use(timeout.New(timeout.Config{Timeout: 30 * time.Second}))
 //	s.Use(singleflight.New())
 //	s.Use(compress.New())

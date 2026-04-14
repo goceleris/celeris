@@ -271,9 +271,11 @@
 //	    return nil
 //	})
 //
-// StreamWriter returns nil if the engine does not support streaming.
-// The std engine supports streaming; native engines (io_uring, epoll)
-// will support it in a future release.
+// StreamWriter returns nil if the response is currently being buffered by
+// an upstream middleware (e.g. compress, etag); call StreamWriter before
+// any middleware buffers, or use [Context.BufferDepth] to detect the
+// state. All shipped engines (std, epoll, io_uring) support streaming via
+// the H1/H2 response adapter.
 //
 // # Cookies
 //

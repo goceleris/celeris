@@ -1470,7 +1470,7 @@ func TestCompressDecompressRoundTrip(t *testing.T) {
 	if len(buf.data) >= len(original) {
 		t.Error("compressed data should be smaller than original")
 	}
-	decompressed, err := decompressMessage(buf.data)
+	decompressed, err := decompressMessage(buf.data, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}

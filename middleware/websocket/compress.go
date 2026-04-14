@@ -189,9 +189,11 @@ func compressMessage(dst io.Writer, data []byte, level int) error {
 // decompressMessage decompresses a permessage-deflate payload. Builds a
 // single contiguous source slice (data || deflateTrailer || finalBlock)
 // in a pooled scratch buffer, then drains the flate reader into a second
-// pooled scratch buffer. The returned slice is owned by the caller (a
-// fresh copy) so the pool buffers can be reused immediately.
-func decompressMessage(data []byte) ([]byte, error) {
+// pooled scratch buffer. Output is bounded by maxOutput so a tiny
+// compressed frame cannot expand into an OOM-class payload (decompression
+// bomb defense). The returned slice is owned by the caller (a fresh copy)
+// so the pool buffers can be reused immediately.
+func decompressMessage(data []byte, maxOutput int64) ([]byte, error) {
 	// Build the contiguous source.
 	in := acquireCompressBuf()
 	defer releaseCompressBuf(in)
@@ -204,11 +206,17 @@ func decompressMessage(data []byte) ([]byte, error) {
 
 	out := acquireCompressBuf()
 	defer releaseCompressBuf(out)
-	if _, err := io.Copy(out, fr); err != nil {
-		putFlateReader(fr)
+	// LimitReader+1 lets us detect "exactly maxOutput" vs "more than
+	// maxOutput" — if Copy reads the +1 byte, the payload exceeds the cap.
+	limited := io.LimitReader(fr, maxOutput+1)
+	n, err := io.Copy(out, limited)
+	putFlateReader(fr)
+	if err != nil {
 		return nil, err
 	}
-	putFlateReader(fr)
+	if n > maxOutput {
+		return nil, ErrReadLimit
+	}
 
 	// Hand back an owned copy of the decompressed bytes.
 	result := make([]byte, len(out.data))

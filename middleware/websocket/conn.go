@@ -389,9 +389,13 @@ func (c *Conn) ReadMessageReuse() (MessageType, []byte, error) {
 				// Single unfragmented message — decompress if needed.
 				if c.readCompressed {
 					var err error
-					payload, err = decompressMessage(payload)
+					payload, err = decompressMessage(payload, c.readLimit)
 					if err != nil {
-						c.writeCloseProtocol(CloseProtocolError, "decompression error")
+						if err == ErrReadLimit {
+							c.writeCloseProtocol(CloseMessageTooBig, "decompressed message too large")
+						} else {
+							c.writeCloseProtocol(CloseProtocolError, "decompression error")
+						}
 						return 0, nil, err
 					}
 				}
@@ -432,9 +436,13 @@ func (c *Conn) ReadMessageReuse() (MessageType, []byte, error) {
 		// Decompress fragmented message if RSV1 was set on first frame.
 		if c.readCompressed {
 			var derr error
-			msg, derr = decompressMessage(msg)
+			msg, derr = decompressMessage(msg, c.readLimit)
 			if derr != nil {
-				c.writeCloseProtocol(CloseProtocolError, "decompression error")
+				if derr == ErrReadLimit {
+					c.writeCloseProtocol(CloseMessageTooBig, "decompressed message too large")
+				} else {
+					c.writeCloseProtocol(CloseProtocolError, "decompression error")
+				}
 				return 0, nil, derr
 			}
 		}

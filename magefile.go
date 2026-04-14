@@ -14,6 +14,8 @@ import (
 
 const vmName = "celeris-bench"
 
+// Default is the target invoked when `mage` runs with no arguments.
+// It runs lint, tests, and a full build via [All].
 var Default = All
 
 // All runs lint, test, and build.
