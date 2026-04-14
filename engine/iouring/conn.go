@@ -11,10 +11,29 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 )
 
-// maxSendQueueBytes is the per-connection back-pressure limit.
-// When pending send data exceeds this, the connection is closed to prevent
-// unbounded memory growth when the SQ ring is full under sustained load.
-const maxSendQueueBytes = 4 << 20 // 4 MiB
+// maxSendQueueBytes is the per-connection back-pressure limit for
+// H1/H2 connections. When pending send data exceeds this, the
+// connection is closed to prevent unbounded memory growth while a
+// slow peer stalls with un-ACKed responses.
+//
+// maxSendQueueBytesDetached is the corresponding limit once a
+// connection is detached (WebSocket / SSE). Detached middleware owns
+// its own flow control — ReadLimit + backpressure — and may legitimately
+// echo payloads larger than 4 MiB (Autobahn 9.1.6 sends 16 MiB).
+// 64 MiB matches the WS default ReadLimit.
+const (
+	maxSendQueueBytes         = 4 << 20  // 4 MiB (H1/H2)
+	maxSendQueueBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+)
+
+// sendCap returns the effective back-pressure limit for cs, accounting
+// for whether the connection is detached.
+func (cs *connState) sendCap() int {
+	if cs.detachMu != nil {
+		return maxSendQueueBytesDetached
+	}
+	return maxSendQueueBytes
+}
 
 type connState struct {
 	fd             int             // 8: real FD, or fixed file index

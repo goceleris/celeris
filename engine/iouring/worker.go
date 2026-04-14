@@ -893,7 +893,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// Back-pressure: capture pending size inside the lock so concurrent
 	// goroutine writes via the guarded writeFn don't race the read.
 	pending := len(cs.writeBuf) + len(cs.sendBuf)
-	if pending > maxSendQueueBytes {
+	if pending > cs.sendCap() {
 		if mu := cs.detachMu; mu != nil {
 			mu.Unlock()
 		}
@@ -1217,7 +1217,7 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		}
 		// Back-pressure: drop writes when total pending data exceeds limit.
 		// The connection will be closed after processing completes.
-		if len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes {
+		if len(cs.writeBuf)+len(cs.sendBuf) > cs.sendCap() {
 			return
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds

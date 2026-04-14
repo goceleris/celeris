@@ -554,8 +554,24 @@ func (l *Loop) drainRead(fd int, now int64) {
 			mu.Unlock()
 		}
 
-		if pending > maxPendingBytes {
+		if pending > cs.writeCap() {
 			l.closeConn(fd)
+			return
+		}
+
+		// Detached WS/SSE backpressure: if the middleware signaled pause
+		// during this iteration (recvPauseDesired toggled by chanReader
+		// crossing high-water during Append), apply EPOLL_CTL_MOD inline
+		// and stop reading. Without this, a large single message can
+		// over-fill the channel within one drainRead pass — pause would
+		// only land on the NEXT iteration via drainDetachQueue, too late
+		// to prevent overflow → chanReader drop → ErrReadLimit.
+		if cs.detachMu != nil && cs.recvPauseDesired.Load() && !cs.recvPaused {
+			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
+				Events: 0,
+				Fd:     int32(cs.fd),
+			})
+			cs.recvPaused = true
 			return
 		}
 
@@ -679,7 +695,7 @@ func (l *Loop) initProtocol(cs *connState) {
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		if cs.pendingBytes > maxPendingBytes {
+		if cs.pendingBytes > cs.writeCap() {
 			return
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)

@@ -12,8 +12,28 @@ import (
 	"github.com/goceleris/celeris/internal/conn"
 )
 
-// maxPendingBytes is the per-connection back-pressure limit for pending writes.
-const maxPendingBytes = 4 << 20 // 4 MiB
+// maxPendingBytes is the per-connection back-pressure limit for pending
+// writes on H1/H2 connections. Intentionally small (4 MiB) so a stalled
+// peer cannot fill server memory with un-ACKed responses.
+//
+// maxPendingBytesDetached is the per-connection limit once the
+// connection is detached (WebSocket / SSE). Detached middleware owns
+// its own flow control — ReadLimit + backpressure — and may legitimately
+// echo payloads larger than 4 MiB (RFC 6455 allows frames up to 2^63,
+// Autobahn 9.1.6 sends 16 MiB). 64 MiB matches the WS default ReadLimit.
+const (
+	maxPendingBytes         = 4 << 20  // 4 MiB (H1/H2)
+	maxPendingBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+)
+
+// writeCap returns the effective back-pressure limit for cs, accounting
+// for whether the connection is detached.
+func (cs *connState) writeCap() int {
+	if cs.detachMu != nil {
+		return maxPendingBytesDetached
+	}
+	return maxPendingBytes
+}
 
 // connState holds per-connection state for the epoll engine.
 // Fields are ordered for cache line optimization (P4): hot fields first.
