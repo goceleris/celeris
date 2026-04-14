@@ -1,40 +1,19 @@
 version: 2
 updates:
+  # Single gomod entry covering every Go module in the repo. The
+  # `directories:` (plural) form runs the updater across all listed
+  # paths and groups updates with the same group name into ONE pull
+  # request — so a daily x/net bump produces a single PR touching root
+  # + every middleware + test module instead of seven racing PRs.
   - package-ecosystem: gomod
-    directory: /
-    schedule:
-      interval: daily
-    groups:
-      all-go-deps:
-        patterns:
-          - "*"
-    commit-message:
-      prefix: "deps"
-
-  - package-ecosystem: gomod
-    directory: /middleware/compress
-    schedule:
-      interval: daily
-    groups:
-      all-go-deps:
-        patterns:
-          - "*"
-    commit-message:
-      prefix: "deps"
-
-  - package-ecosystem: gomod
-    directory: /middleware/metrics
-    schedule:
-      interval: daily
-    groups:
-      all-go-deps:
-        patterns:
-          - "*"
-    commit-message:
-      prefix: "deps"
-
-  - package-ecosystem: gomod
-    directory: /middleware/otel
+    directories:
+      - /
+      - /middleware/compress
+      - /middleware/metrics
+      - /middleware/otel
+      - /middleware/protobuf
+      - /test/benchcmp
+      - /test/benchcmp_ws
     schedule:
       interval: daily
     groups:
