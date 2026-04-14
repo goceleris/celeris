@@ -357,6 +357,27 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	if s == nil {
 		s = stream.NewH1Stream(1)
 		state.stream = s
+		// WS callbacks capture `state`, which is per-connection and
+		// stable across requests. Install once on stream creation so
+		// the hot path reuses the same closures.
+		s.OnWSUpgrade = func(delivery func([]byte)) {
+			state.WSDataDelivery = delivery
+		}
+		s.OnWSRawWrite = func() func([]byte) {
+			return state.RawWriteFn
+		}
+		s.OnWSDetachClose = func(closeFn func()) {
+			state.OnDetachClose = closeFn
+		}
+		s.OnWSSetError = func(errFn func(error)) {
+			state.OnError = errFn
+		}
+		s.OnWSReadPauser = func() (func(), func()) {
+			return state.PauseRecv, state.ResumeRecv
+		}
+		s.OnWSSetIdleDeadline = func(ns int64) {
+			state.IdleDeadlineNs.Store(ns)
+		}
 	} else {
 		// Reset per-request fields. The stream is reused, so clear state
 		// from the previous request without returning to the pool.
@@ -364,24 +385,6 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	}
 	s.RemoteAddr = state.RemoteAddr
 	s.OnDetach = state.OnDetach
-	s.OnWSUpgrade = func(delivery func([]byte)) {
-		state.WSDataDelivery = delivery
-	}
-	s.OnWSRawWrite = func() func([]byte) {
-		return state.RawWriteFn
-	}
-	s.OnWSDetachClose = func(closeFn func()) {
-		state.OnDetachClose = closeFn
-	}
-	s.OnWSSetError = func(errFn func(error)) {
-		state.OnError = errFn
-	}
-	s.OnWSReadPauser = func() (func(), func()) {
-		return state.PauseRecv, state.ResumeRecv
-	}
-	s.OnWSSetIdleDeadline = func(ns int64) {
-		state.IdleDeadlineNs.Store(ns)
-	}
 	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4

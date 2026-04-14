@@ -91,10 +91,11 @@ type Worker struct {
 	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
 	h2cfg         conn.H2Config
 	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
-	detachQueue   []*connState
-	detachQMu     sync.Mutex
-	detachQSpare  []*connState
-	detachedCount int // number of currently-detached conns; gates idle-deadline sweep
+	detachQueue    []*connState
+	detachQMu      sync.Mutex
+	detachQSpare   []*connState
+	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
+	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -688,6 +689,7 @@ func (w *Worker) initProtocol(cs *connState) {
 				// from this goroutine — dirtyHead is worker-local.
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
 				w.detachQMu.Unlock()
 				if wakeupFD >= 0 {
 					var val [8]byte
@@ -711,6 +713,7 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
 				w.detachQMu.Unlock()
 				if wakeupFD >= 0 {
 					var val [8]byte
@@ -724,6 +727,7 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
 				w.detachQMu.Unlock()
 				if wakeupFD >= 0 {
 					var val [8]byte
@@ -1277,8 +1281,12 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 }
 
 func (w *Worker) drainDetachQueue() {
+	if w.detachQPending.Load() == 0 {
+		return
+	}
 	w.detachQMu.Lock()
 	w.detachQSpare, w.detachQueue = w.detachQueue, w.detachQSpare[:0]
+	w.detachQPending.Store(0)
 	w.detachQMu.Unlock()
 	for _, cs := range w.detachQSpare {
 		if cs.detachClosed {

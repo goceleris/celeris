@@ -66,10 +66,11 @@ type Loop struct {
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	h2Conns       []int      // FDs of H2 connections (for write queue polling)
 	h2cfg         conn.H2Config
-	detachQueue   []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
-	detachQMu     sync.Mutex
-	detachQSpare  []*connState // reuse slice to avoid alloc in drainDetachQueue
-	detachedCount int          // number of currently-detached conns; gates idle-deadline sweep
+	detachQueue    []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
+	detachQMu      sync.Mutex
+	detachQSpare   []*connState // reuse slice to avoid alloc in drainDetachQueue
+	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
+	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -607,6 +608,7 @@ func (l *Loop) initProtocol(cs *connState) {
 				// from this goroutine — dirtyHead is event-loop-local.
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
 				l.detachQMu.Unlock()
 				if l.eventFD >= 0 {
 					var val [8]byte
@@ -629,6 +631,7 @@ func (l *Loop) initProtocol(cs *connState) {
 				}
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
 				l.detachQMu.Unlock()
 				if l.eventFD >= 0 {
 					var val [8]byte
@@ -642,6 +645,7 @@ func (l *Loop) initProtocol(cs *connState) {
 				}
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
 				l.detachQMu.Unlock()
 				if l.eventFD >= 0 {
 					var val [8]byte
@@ -685,8 +689,12 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 }
 
 func (l *Loop) drainDetachQueue() {
+	if l.detachQPending.Load() == 0 {
+		return
+	}
 	l.detachQMu.Lock()
 	l.detachQSpare, l.detachQueue = l.detachQueue, l.detachQSpare[:0]
+	l.detachQPending.Store(0)
 	l.detachQMu.Unlock()
 	for _, cs := range l.detachQSpare {
 		if cs.detachClosed {
