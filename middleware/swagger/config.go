@@ -50,12 +50,11 @@ type UIConfig struct {
 	OAuth2RedirectURL string
 
 	// OAuth2 pre-fills the OAuth2 authorization dialog in Swagger UI.
-	// WARNING: all values including ClientSecret are embedded in the HTML
-	// page source and visible to anyone who can access the page. Only use
-	// ClientSecret for development or test environments. In production,
-	// use PKCE (public clients) which do not require a secret.
-	// When nil, no OAuth2 initialization is emitted.
-	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
+	// All values are embedded in the served HTML page source and visible
+	// to anyone who can access the page; only public-client material is
+	// supported (no ClientSecret — use PKCE via [OAuth2Config.UsePKCE]).
+	// When nil, no OAuth2 initialization is emitted. Swagger UI only;
+	// ignored when Renderer is Scalar or ReDoc.
 	OAuth2 *OAuth2Config
 
 	// Title is the HTML page title. Default: "API Documentation".
@@ -63,17 +62,25 @@ type UIConfig struct {
 }
 
 // OAuth2Config pre-fills the OAuth2 authorization dialog in Swagger UI.
+//
+// Browser flows MUST use PKCE — the public ClientID is the only secret
+// material safe to embed in HTML. Confidential-client secrets cannot be
+// kept secret in a browser; the previous ClientSecret field was removed
+// in v1.3.4 because it shipped credentials in plaintext to every page
+// load. If you have a server-side OAuth flow, perform the token exchange
+// on your backend, not in Swagger UI.
 type OAuth2Config struct {
-	// ClientID is the OAuth2 client identifier.
+	// ClientID is the OAuth2 client identifier (public; safe to embed).
 	ClientID string
-	// ClientSecret is the OAuth2 client secret. Only for confidential clients.
-	ClientSecret string
 	// Realm is the OAuth2 realm.
 	Realm string
 	// AppName is the application name shown in the authorization dialog.
 	AppName string
 	// Scopes lists the default OAuth2 scopes to request.
 	Scopes []string
+	// UsePKCE enables Proof Key for Code Exchange (RFC 7636), the
+	// recommended public-client flow. Default: true.
+	UsePKCE bool
 }
 
 // Config defines the swagger middleware configuration.

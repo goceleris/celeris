@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
@@ -126,9 +127,14 @@ func (c *Context) String(code int, format string, args ...any) error {
 
 // Blob writes a response with the given content type and data.
 // Returns ErrResponseWritten if a response has already been sent.
+// Returns ErrDetached if the Context has been detached (e.g. by a
+// WebSocket or SSE middleware) — use the middleware's own write API.
 func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if c.written {
 		return ErrResponseWritten
+	}
+	if c.detached {
+		return ErrDetached
 	}
 	if c.bufferDepth > 0 {
 		c.capturedBody = append(c.capturedBody[:0], data...)
@@ -539,6 +545,12 @@ func parseRange(header string, size int64) (start, end int64, ok bool) {
 // Stream reads all data from r (capped at 100 MB) and writes it as the
 // response with the given status code and content type. Returns [HTTPError]
 // with status 413 if the data exceeds 100 MB.
+//
+// Despite the name, Stream BUFFERS the entire reader before writing —
+// it is not incremental. Use [Context.StreamWriter] for true streaming
+// responses. The [Context.StreamReader] alias is the preferred name
+// going forward and makes the buffering behavior obvious at the call
+// site; Stream is retained for backwards compatibility.
 func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 	data, err := io.ReadAll(io.LimitReader(r, int64(maxStreamBodySize)+1))
 	if err != nil {
@@ -548,6 +560,14 @@ func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 		return NewHTTPError(413, "stream body exceeds 100MB limit")
 	}
 	return c.Blob(code, contentType, data)
+}
+
+// StreamReader is the preferred name for [Context.Stream] — it makes
+// clear that the entire reader is buffered before writing, vs the
+// truly-incremental [Context.StreamWriter]. Behavior is identical to
+// [Context.Stream].
+func (c *Context) StreamReader(code int, contentType string, r io.Reader) error {
+	return c.Stream(code, contentType, r)
 }
 
 // Negotiate inspects the Accept header and returns the best matching content type
@@ -685,6 +705,91 @@ func (c *Context) Hijack() (net.Conn, error) {
 	return conn, nil
 }
 
+// UpgradeWebSocket installs a data delivery callback for engine-integrated
+// WebSocket support. After the HTTP 101 upgrade is sent and Detach is called,
+// subsequent data arriving on the connection is delivered to the callback
+// instead of being parsed as HTTP. Returns false if the engine does not
+// support integrated WebSocket (e.g. std engine), in which case the caller
+// should fall back to [Context.Hijack].
+//
+// The callback is invoked on the engine's event loop thread and must not
+// block. Typically it writes to an [io.PipeWriter].
+//
+// Call ordering for engine-integrated WebSocket setup:
+//  1. UpgradeWebSocket(deliveryFn) — installs the data callback
+//  2. SetWSErrorHandler / SetWSIdleDeadline / SetWSDetachClose
+//     (optional, but install BEFORE Detach to avoid losing pre-existing
+//     engine errors that fire as soon as Detach completes)
+//  3. Detach() — engine takes ownership of the connection
+//  4. WSRawWriteFn() — returns the raw write fn (Hijack-like; nil before Detach)
+//  5. WSReadPauser() — returns engine pause/resume callbacks (after Detach)
+func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
+	if c.stream.OnWSUpgrade == nil {
+		return false
+	}
+	c.stream.OnWSUpgrade(delivery)
+	return true
+}
+
+// SetWSDetachClose installs a callback that the engine invokes when it
+// closes a detached connection (timeout, error, shutdown). This allows
+// the WebSocket middleware to unblock its handler goroutine.
+//
+// May be called either before or after [Context.Detach] — the underlying
+// H1State.OnDetachClose field is just stored; the engine reads it when
+// firing the close. Installing it BEFORE Detach is preferred so a peer
+// RST landing in the Detach race window is not lost.
+func (c *Context) SetWSDetachClose(fn func()) {
+	if c.stream.OnWSDetachClose != nil {
+		c.stream.OnWSDetachClose(fn)
+	}
+}
+
+// WSRawWriteFn returns the raw write function for WebSocket frames,
+// bypassing chunked encoding. Returns nil if not available (e.g., before
+// Detach or on the std engine). Must be called AFTER [Context.Detach].
+func (c *Context) WSRawWriteFn() func([]byte) {
+	if c.stream.OnWSRawWrite == nil {
+		return nil
+	}
+	return c.stream.OnWSRawWrite()
+}
+
+// SetWSErrorHandler installs a handler called by the engine when an I/O
+// failure occurs on this detached connection. The WebSocket middleware uses
+// this to surface engine-side errors from the next user-level Read or Write
+// call. May be called either before or after [Context.Detach] — installing
+// BEFORE Detach is preferred so a pre-existing peer RST landing in the
+// Detach race window is not lost. No-op on engines that do not support
+// engine-integrated WebSocket (e.g. std).
+func (c *Context) SetWSErrorHandler(fn func(error)) {
+	if c.stream.OnWSSetError != nil {
+		c.stream.OnWSSetError(fn)
+	}
+}
+
+// WSReadPauser returns the engine's pause/resume callbacks for inbound
+// WebSocket data, or (nil, nil) if the engine does not support TCP-level
+// backpressure (e.g. std). Must be called AFTER [Context.Detach]. The
+// returned callbacks are safe to call from any goroutine.
+func (c *Context) WSReadPauser() (pause, resume func()) {
+	if c.stream.OnWSReadPauser == nil {
+		return nil, nil
+	}
+	return c.stream.OnWSReadPauser()
+}
+
+// SetWSIdleDeadline sets the absolute deadline (Unix nanoseconds) at which
+// the engine should close this detached connection. Used by the WebSocket
+// middleware to enforce IdleTimeout on the engine path. Pass 0 to clear.
+// May be called repeatedly to extend the deadline. No-op on engines that
+// do not support engine-integrated WebSocket.
+func (c *Context) SetWSIdleDeadline(ns int64) {
+	if c.stream.OnWSSetIdleDeadline != nil {
+		c.stream.OnWSSetIdleDeadline(ns)
+	}
+}
+
 // Detach removes the Context from the handler chain's lifecycle.
 // After Detach, the Context will not be released when the handler returns.
 // The caller MUST call the returned done function when finished with the Context —
@@ -720,7 +825,19 @@ func (c *Context) Detach() (done func()) {
 	}
 	ch := make(chan struct{})
 	c.detachDone = ch
-	return func() { close(ch) }
+	return func() {
+		// Snapshot status + elapsed BEFORE close so the metrics goroutine
+		// can read these without racing late writes from a handler that
+		// touches Context fields after calling done() (contract violation
+		// but observed in practice with deferred logger blocks). Heap-
+		// allocated only on the Detach slow path so non-detached requests
+		// don't pay the field cost in every pooled Context.
+		c.detachSnap = &detachSnapshot{
+			status:  c.statusCode,
+			elapsed: time.Since(c.startTime),
+		}
+		close(ch)
+	}
 }
 
 // StreamWriter provides incremental response writing. Obtained via [Context.StreamWriter].

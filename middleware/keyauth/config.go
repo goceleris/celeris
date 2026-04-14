@@ -197,15 +197,8 @@ func StaticKeys(keys ...string) func(*celeris.Context, string) (bool, error) {
 		if len(key) > math.MaxInt32 {
 			return false, nil
 		}
-		var kb []byte
-		if maxLen <= 256 {
-			var buf [256]byte
-			kb = buf[:maxLen]
-			clear(kb)
-			copy(kb, key)
-		} else {
-			kb = padTo([]byte(key), maxLen) //nolint:staticcheck // kb is used in the loop below
-		}
+		kb := make([]byte, maxLen)
+		copy(kb, key)
 		match := 0
 		for i, p := range padded {
 			lenMatch := subtle.ConstantTimeEq(int32(len(keys[i])), int32(len(key)))

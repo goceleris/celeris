@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/go-chi/chi/v5 v5.2.1
-	github.com/goceleris/celeris v0.0.0
+	github.com/goceleris/celeris v1.3.3
 	github.com/gofiber/fiber/v3 v3.0.0
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/rs/cors v1.11.1
@@ -24,11 +24,14 @@ require (
 	github.com/tinylib/msgp v1.6.3 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/crypto v0.50.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
 )
 
-replace github.com/goceleris/celeris => ../../
+replace (
+	github.com/goceleris/celeris => ../../
+	github.com/goceleris/celeris/middleware/protobuf => ../../middleware/protobuf
+)

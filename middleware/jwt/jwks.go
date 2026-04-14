@@ -1,6 +1,7 @@
 package jwt
 
 import (
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -198,24 +199,35 @@ func parseECKey(key map[string]any) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("jwt: invalid EC y coordinate: %w", err)
 	}
 
+	var ecdhCurve ecdh.Curve
 	var curve elliptic.Curve
 	switch crv {
 	case "P-256":
+		ecdhCurve = ecdh.P256()
 		curve = elliptic.P256()
 	case "P-384":
+		ecdhCurve = ecdh.P384()
 		curve = elliptic.P384()
 	case "P-521":
+		ecdhCurve = ecdh.P521()
 		curve = elliptic.P521()
 	default:
 		return nil, fmt.Errorf("jwt: unsupported EC curve: %s", crv)
 	}
 
-	x := new(big.Int).SetBytes(xBytes)
-	y := new(big.Int).SetBytes(yBytes)
+	// Build the uncompressed point (0x04 || X || Y) and validate via ecdh.
+	byteLen := (curve.Params().BitSize + 7) / 8
+	uncompressed := make([]byte, 1+2*byteLen)
+	uncompressed[0] = 0x04
+	copy(uncompressed[1+byteLen-len(xBytes):1+byteLen], xBytes)
+	copy(uncompressed[1+2*byteLen-len(yBytes):], yBytes)
 
-	if !curve.IsOnCurve(x, y) {
+	if _, err := ecdhCurve.NewPublicKey(uncompressed); err != nil {
 		return nil, fmt.Errorf("jwt: EC point is not on curve %s", crv)
 	}
+
+	x := new(big.Int).SetBytes(xBytes)
+	y := new(big.Int).SetBytes(yBytes)
 
 	return &ecdsa.PublicKey{
 		Curve: curve,

@@ -22,7 +22,8 @@ func TestServerEngineInfo(t *testing.T) {
 	}
 
 	// Simulate engine set.
-	s.engine = &fakeEngine{}
+	var fe engine.Engine = &fakeEngine{}
+	s.engineRef.Store(&fe)
 	info := s.EngineInfo()
 	if info == nil {
 		t.Fatal("expected non-nil EngineInfo")
@@ -274,7 +275,8 @@ func TestServerDoubleStart(t *testing.T) {
 
 	// Simulate engine already set by firing the startOnce.
 	s.startOnce.Do(func() {
-		s.engine = &fakeEngine{}
+		var fe engine.Engine = &fakeEngine{}
+		s.engineRef.Store(&fe)
 	})
 
 	err := s.Start()
@@ -1104,7 +1106,8 @@ func TestStartWithListenerDoubleStart(t *testing.T) {
 	s := New(Config{})
 	// Simulate engine already set by firing the startOnce.
 	s.startOnce.Do(func() {
-		s.engine = &fakeEngine{}
+		var fe engine.Engine = &fakeEngine{}
+		s.engineRef.Store(&fe)
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1296,7 +1299,8 @@ func TestStartRaceGuard(t *testing.T) {
 
 	// Fire the once to prevent actual engine creation.
 	s.startOnce.Do(func() {
-		s.engine = &fakeEngine{}
+		var fe engine.Engine = &fakeEngine{}
+		s.engineRef.Store(&fe)
 	})
 
 	// Multiple concurrent calls should all get ErrAlreadyStarted, no race.
@@ -1418,7 +1422,8 @@ func TestServerOnShutdown(t *testing.T) {
 
 	// Simulate engine set by firing the startOnce.
 	s.startOnce.Do(func() {
-		s.engine = &fakeEngine{}
+		var fe engine.Engine = &fakeEngine{}
+		s.engineRef.Store(&fe)
 	})
 
 	ctx := context.Background()
@@ -1438,7 +1443,8 @@ func TestServerOnShutdownOrder(t *testing.T) {
 	s.OnShutdown(func(_ context.Context) { order = append(order, 3) })
 
 	s.startOnce.Do(func() {
-		s.engine = &fakeEngine{}
+		var fe engine.Engine = &fakeEngine{}
+		s.engineRef.Store(&fe)
 	})
 
 	if err := s.Shutdown(context.Background()); err != nil {

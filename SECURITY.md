@@ -9,6 +9,40 @@
 
 Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
 
+### v1.3.4 Security Improvements
+
+v1.3.4 introduces engine-integrated WebSocket/SSE plus a follow-up
+middleware audit. Security-relevant changes:
+
+- **WebSocket permessage-deflate decompression cap**: `truncWriter` was
+  rewritten to correctly reassemble the tail-4 sync-marker window when a
+  flate writer emits sub-4-byte trailing chunks (Autobahn 12.1.4-12.1.10
+  regression on v1.3.3). The decompression path now bounds output via
+  `io.LimitReader` capped by the per-connection `ReadLimit`, preventing
+  decompression-bomb DoS.
+- **WebSocket missing-Origin policy**: when `Config.CheckOrigin` is nil,
+  connections without an `Origin` header on `https://` are rejected by
+  default (CSRF mitigation for browser-origin assumptions). Non-browser
+  clients should set an explicit `CheckOrigin` to allow Origin-less
+  upgrades.
+- **SSE comment field sanitization**: `Client.SendComment` now strips
+  `\r` and `\n` from comment text, matching the treatment of `id` and
+  `event` fields. Prevents synthetic-event injection if a handler
+  forwards user-supplied text as a comment.
+- **Swagger ClientSecret removed**: `OAuth2Config.ClientSecret` was
+  rendered into served HTML in plaintext; the field is removed and the
+  documentation now requires PKCE for browser flows.
+- **basicauth HashedUsers default removed**: SHA-256 is no longer the
+  default password hash. Callers must supply `HashedUsersFunc`
+  (bcrypt/scrypt/argon2 example in package docs); the existing
+  `HashPassword` helper is retained but flagged as fast-hash for
+  deterministic identifiers, not credentials.
+- **Engine-integrated WebSocket auditability**: the `H1State` pause/
+  resume API surface (`OnError`, `PauseRecv`, `ResumeRecv`,
+  `IdleDeadlineNs`, `OnDetachClose`) is documented as the stable
+  middleware↔engine contract for long-lived connections; changes
+  require a major version bump.
+
 ### v1.3.3 Security Improvements
 
 v1.3.3 includes security-hardened defaults in three new middleware packages:

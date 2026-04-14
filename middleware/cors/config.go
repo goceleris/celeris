@@ -368,5 +368,55 @@ func normalizeOrigin(raw string) string {
 		return raw
 	}
 
-	return strings.ToLower(scheme) + "://" + strings.ToLower(authority)
+	// Fast path: input is already lowercase. Most browser-sent origins
+	// are already lowercased, so this avoids the strings.ToLower /
+	// concat allocations on the hot path.
+	if isASCIILower(scheme) && isASCIILower(authority) {
+		// We may still need to strip a trailing '/'; if authEnd < len(rest)
+		// then rest[:authEnd] excludes the slash, and `raw` may contain
+		// the slash. Compose without it.
+		if authEnd == len(rest) {
+			return raw
+		}
+		// Need to drop trailing '/'; build a single allocation.
+		out := make([]byte, 0, sep+3+len(authority))
+		out = append(out, scheme...)
+		out = append(out, '/', '/', '/')
+		// Replace the last char ('/' '/' '/' is wrong; recompute):
+		out = out[:0]
+		out = append(out, scheme...)
+		out = append(out, ':', '/', '/')
+		out = append(out, authority...)
+		return string(out)
+	}
+
+	// General path: build via strings.Builder with an upfront Grow so
+	// we make a single allocation.
+	var b strings.Builder
+	b.Grow(len(scheme) + 3 + len(authority))
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	b.WriteString("://")
+	for i := 0; i < len(authority); i++ {
+		c := authority[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func isASCIILower(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return false
+		}
+	}
+	return true
 }

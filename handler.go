@@ -39,6 +39,8 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 	if len(a.server.preMiddleware) > 0 {
 		c.handlers = a.server.preMiddleware
 		c.index = -1
+		// Error AND abort: error wins — handleError still runs, then we
+		// flush any buffered body.
 		if err := c.Next(); err != nil {
 			a.handleError(c, s, err)
 			if c.buffered && !c.written {
@@ -47,6 +49,8 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 			}
 			return nil
 		}
+		// Pure abort (handler wrote a response and called Abort with no
+		// error): skip routing and flush.
 		if c.IsAborted() {
 			if c.buffered && !c.written {
 				c.bufferDepth = 1
@@ -83,6 +87,16 @@ func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error 
 // separate noinline function so that HandleStream's stack frame is not inflated
 // by the deferred closure and debug.Stack() call (P5).
 //
+// Layering with middleware/recovery: this is the last-resort safety net.
+// Panics from user handlers normally hit middleware/recovery (when
+// installed) inside the chain, which converts them to errors before
+// they reach this function. recover() here is for catastrophic cases
+// where recovery middleware itself panics, isn't installed, or where
+// pre-routing middleware panics outside the route chain. Custom panic
+// handling (Sentry, structured 500 responses, etc.) belongs in
+// middleware/recovery — this function's a.handlePanic is intentionally
+// minimal.
+//
 //go:noinline
 func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 	if r := recover(); r != nil {
@@ -92,11 +106,18 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		go func() {
 			<-c.detachDone
 			if a.server.collector != nil {
-				status := c.statusCode
-				if status == 0 {
-					status = 200
+				// Read the snapshot captured by Detach's done() callback
+				// to avoid racing late writes from a handler that touched
+				// the Context after calling done().
+				status := 200
+				var elapsed time.Duration
+				if snap := c.detachSnap; snap != nil {
+					if snap.status != 0 {
+						status = snap.status
+					}
+					elapsed = snap.elapsed
 				}
-				a.server.collector.RecordRequest(time.Since(c.startTime), status)
+				a.server.collector.RecordRequest(elapsed, status)
 			}
 			releaseContext(c)
 		}()

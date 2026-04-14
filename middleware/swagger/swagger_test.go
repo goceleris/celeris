@@ -674,11 +674,11 @@ func TestOAuth2Config(t *testing.T) {
 		SpecContent: jsonSpec,
 		UI: UIConfig{
 			OAuth2: &OAuth2Config{
-				ClientID:     "my-client",
-				ClientSecret: "my-secret",
-				Realm:        "my-realm",
-				AppName:      "My App",
-				Scopes:       []string{"read", "write"},
+				ClientID: "my-client",
+				Realm:    "my-realm",
+				AppName:  "My App",
+				Scopes:   []string{"read", "write"},
+				UsePKCE:  true,
 			},
 		},
 	})
@@ -687,10 +687,13 @@ func TestOAuth2Config(t *testing.T) {
 	body := rec.BodyString()
 	assertContains(t, body, `ui.initOAuth(`)
 	assertContains(t, body, `clientId: "my-client"`)
-	assertContains(t, body, `clientSecret: "my-secret"`)
+	assertContains(t, body, `usePkceWithAuthorizationCodeGrant: true`)
 	assertContains(t, body, `realm: "my-realm"`)
 	assertContains(t, body, `appName: "My App"`)
 	assertContains(t, body, `scopes: "read write"`)
+	if strings.Contains(body, "clientSecret") {
+		t.Errorf("OAuth2 HTML must not include clientSecret (removed in v1.3.4); body=%s", body)
+	}
 }
 
 func TestOAuth2ConfigNil(t *testing.T) {

@@ -12,7 +12,9 @@ import (
 )
 
 // ErrUnauthorized is returned when authentication fails.
-var ErrUnauthorized = celeris.NewHTTPError(401, "Unauthorized")
+// ErrUnauthorized aliases [celeris.ErrUnauthorized] so cross-package
+// errors.Is checks work (e.g. mixed jwt+keyauth stacks).
+var ErrUnauthorized = celeris.ErrUnauthorized
 
 // ErrTokenMissing is returned when no token is found in the request.
 var ErrTokenMissing = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: missing or malformed token")}
@@ -92,6 +94,15 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		if _, ok := skipMap[c.Path()]; ok {
+			return c.Next()
+		}
+
+		// Defensive OPTIONS skip: CORS preflight must not be auth-blocked
+		// regardless of middleware-installation order. If cors runs before
+		// jwt (the recommended order), preflights short-circuit before
+		// reaching here. If a misconfiguration puts auth ahead of cors,
+		// this lets the preflight through to cors.
+		if c.Method() == "OPTIONS" {
 			return c.Next()
 		}
 

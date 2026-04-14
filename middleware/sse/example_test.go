@@ -1,0 +1,65 @@
+package sse_test
+
+import (
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/sse"
+)
+
+// Stream a counter to the client every second; client disconnects close
+// the context, which ends the loop cleanly.
+func ExampleNew() {
+	s := celeris.New(celeris.Config{})
+
+	s.GET("/events", sse.New(sse.Config{
+		HeartbeatInterval: 30 * time.Second,
+		Handler: func(c *sse.Client) {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			i := 0
+			for {
+				select {
+				case <-c.Context().Done():
+					return
+				case <-ticker.C:
+					if err := c.Send(sse.Event{
+						Event: "tick",
+						ID:    strconv.Itoa(i),
+						Data:  "tick " + strconv.Itoa(i),
+					}); err != nil {
+						return
+					}
+					i++
+				}
+			}
+		},
+	}))
+
+	fmt.Println("SSE handler installed at /events")
+	// Output: SSE handler installed at /events
+}
+
+// Resume from a Last-Event-ID supplied by the browser's reconnect logic.
+func ExampleClient_LastEventID() {
+	handler := sse.New(sse.Config{
+		Handler: func(c *sse.Client) {
+			start := 0
+			if id := c.LastEventID(); id != "" {
+				if n, err := strconv.Atoi(id); err == nil {
+					start = n + 1
+				}
+			}
+			_ = c.Send(sse.Event{
+				ID:   strconv.Itoa(start),
+				Data: "resumed at " + strconv.Itoa(start),
+			})
+		},
+	})
+
+	_ = handler
+	fmt.Println("ok")
+	// Output: ok
+}

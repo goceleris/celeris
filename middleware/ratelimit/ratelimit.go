@@ -45,7 +45,14 @@ func New(config ...Config) celeris.HandlerFunc {
 
 	keyFunc := cfg.KeyFunc
 	disableHeaders := cfg.DisableHeaders
+	// ErrorHandler (new) takes precedence over LimitReached
+	// (deprecated). Adapt the new shape into the legacy one for the
+	// inner code paths.
 	limitReached := cfg.LimitReached
+	if cfg.ErrorHandler != nil {
+		eh := cfg.ErrorHandler
+		limitReached = func(c *celeris.Context) error { return eh(c, ErrTooManyRequests) }
+	}
 	skipFailed := cfg.SkipFailedRequests
 	skipSuccess := cfg.SkipSuccessfulRequests
 	rateFunc := cfg.RateFunc

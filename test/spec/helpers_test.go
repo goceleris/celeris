@@ -160,6 +160,61 @@ func probeEngine(addr string, proto engine.Protocol) error {
 	return nil
 }
 
+// h2specMaxFail defines per-engine maximum tolerated h2spec failures.
+// The std engine delegates to Go's net/http + x/net/http2 which has 4
+// known non-conformances (connection-specific headers, invalid preface
+// EOF, SETTINGS_INITIAL_WINDOW_SIZE ordering). Native engines handle
+// these correctly and must pass everything.
+var h2specMaxFail = map[string]int{
+	"std":     4, // 4 known stdlib failures
+	"epoll":   0, // must be fully conformant
+	"iouring": 0, // must be fully conformant
+}
+
+// parseH2SpecSummary extracts the "N tests, M passed, S skipped, F failed"
+// line from h2spec output and returns (total, passed, failed).
+func parseH2SpecSummary(output string) (total, passed, failed int, ok bool) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		var skipped int
+		n, _ := fmt.Sscanf(line, "%d tests, %d passed, %d skipped, %d failed",
+			&total, &passed, &skipped, &failed)
+		if n == 4 {
+			return total, passed, failed, true
+		}
+	}
+	return 0, 0, 0, false
+}
+
+// checkH2SpecResult validates h2spec output against the per-engine tolerance.
+// It logs the output, then fails only if the number of failures exceeds the
+// engine's known-acceptable maximum.
+func checkH2SpecResult(t *testing.T, engineName, label string, output []byte, exitErr error) {
+	t.Helper()
+	t.Logf("h2spec %s:\n%s", label, output)
+
+	total, passed, failed, ok := parseH2SpecSummary(string(output))
+	if !ok {
+		if exitErr != nil {
+			t.Errorf("h2spec %s: %v (could not parse summary)", label, exitErr)
+		}
+		return
+	}
+
+	maxFail, known := h2specMaxFail[engineName]
+	if !known {
+		maxFail = 0 // unknown engine: require full pass
+	}
+
+	if failed > maxFail {
+		t.Errorf("h2spec %s [%s]: %d/%d passed, %d failed (max tolerated: %d)",
+			label, engineName, passed, total, failed, maxFail)
+	} else if failed > 0 {
+		t.Logf("h2spec %s [%s]: %d/%d passed (%d known acceptable failures)",
+			label, engineName, passed, total, failed)
+	}
+}
+
 // rawConnect opens a raw TCP connection with deadlines.
 func rawConnect(t *testing.T, addr string) net.Conn {
 	t.Helper()

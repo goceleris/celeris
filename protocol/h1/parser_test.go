@@ -295,7 +295,7 @@ func TestParseRequest_ManyHeaders(t *testing.T) {
 	b.WriteString("GET / HTTP/1.1\r\n")
 	b.WriteString("Host: example.com\r\n")
 	for i := 0; i < 100; i++ {
-		b.WriteString(fmt.Sprintf("X-Header-%d: value-%d\r\n", i, i))
+		fmt.Fprintf(&b, "X-Header-%d: value-%d\r\n", i, i)
 	}
 	b.WriteString("\r\n")
 	raw := b.String()

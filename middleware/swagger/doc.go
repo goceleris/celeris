@@ -84,14 +84,15 @@
 //	            ClientID: "my-client-id",
 //	            AppName:  "My Application",
 //	            Scopes:   []string{"read:api", "write:api"},
+//	            UsePKCE:  true,
 //	        },
 //	    },
 //	}))
 //
-// WARNING: all [OAuth2Config] values including ClientSecret are embedded in
-// the HTML page source and visible to anyone who can access the page. Only
-// use ClientSecret for development or test environments. In production, use
-// PKCE (public clients) which do not require a secret.
+// All [OAuth2Config] values are embedded in the HTML page source. Only
+// public-client material (ClientID, scopes, app name) is supported;
+// confidential client secrets cannot be kept secret in a browser. Use
+// PKCE (UsePKCE: true) for the recommended public-client flow.
 //
 // OAuth2 fields are ignored when Renderer is not [RendererSwaggerUI].
 //

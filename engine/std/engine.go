@@ -73,9 +73,15 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 // Listen starts the server and blocks until the context is canceled or an error occurs.
 func (e *Engine) Listen(ctx context.Context) error {
-	ln, err := net.Listen("tcp", e.cfg.Addr)
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+	var ln net.Listener
+	var err error
+	if e.cfg.Listener != nil {
+		ln = e.cfg.Listener
+	} else {
+		ln, err = net.Listen("tcp", e.cfg.Addr)
+		if err != nil {
+			return fmt.Errorf("listen: %w", err)
+		}
 	}
 	e.listener.Store(&ln)
 	e.logger.Info("std engine listening", "addr", ln.Addr().String())

@@ -30,6 +30,17 @@ import (
 // Must accommodate the maximum number of concurrent connections per worker.
 const fixedFileTableSize = 65536
 
+// errIORingRecv wraps a negative io_uring recv result as a syscall.Errno.
+// Used to surface concrete errors to detached middleware via H1State.OnError.
+func errIORingRecv(res int32) error {
+	return unix.Errno(uint32(-res))
+}
+
+// errIORingSend wraps a negative io_uring send result as a syscall.Errno.
+func errIORingSend(res int32) error {
+	return unix.Errno(uint32(-res))
+}
+
 // bufRingGroupID is the provided buffer ring group ID.
 const bufRingGroupID = 0
 
@@ -72,17 +83,19 @@ type Worker struct {
 	tickCounter uint32
 	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead     *connState // head of intrusive doubly-linked dirty list
-	hasBufReturns bool       // set when provided buffers need publishing
-	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
-	h2Conns       []int      // FDs of H2 connections (for write queue polling)
-	h2EventFD     int        // eventfd for H2 write queue wakeup (-1 if unavailable)
-	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
-	h2cfg         conn.H2Config
-	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
-	detachQueue   []*connState
-	detachQMu     sync.Mutex
-	detachQSpare  []*connState
+	dirtyHead      *connState // head of intrusive doubly-linked dirty list
+	hasBufReturns  bool       // set when provided buffers need publishing
+	sendsPending   bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2Conns        []int      // FDs of H2 connections (for write queue polling)
+	h2EventFD      int        // eventfd for H2 write queue wakeup (-1 if unavailable)
+	h2PollArmed    bool       // true when POLL_ADD is active on h2EventFD
+	h2cfg          conn.H2Config
+	emptyIters     uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
+	detachQueue    []*connState
+	detachQMu      sync.Mutex
+	detachQSpare   []*connState
+	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
+	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -216,7 +229,11 @@ func (w *Worker) run(ctx context.Context) {
 		// reference to the underlying file, allowing the socket to leave the
 		// SO_REUSEPORT group immediately. Without this, unix.Close alone
 		// leaves a phantom socket that intercepts connections.
-		if w.listenFD >= 0 && w.acceptPaused.Load() {
+		// Cache the atomic load: same value used by the two branches
+		// below and (further down) the SUSPENDED check. Saves 2 atomic
+		// loads per event-loop iteration on the steady-state hot path.
+		paused := w.acceptPaused.Load()
+		if w.listenFD >= 0 && paused {
 			if sqe := w.ring.GetSQE(); sqe != nil {
 				prepCancelFDSkipSuccess(sqe, w.listenFD)
 				setSQEUserData(sqe, 0)
@@ -241,7 +258,7 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
-		if w.listenFD < 0 && !w.acceptPaused.Load() {
+		if w.listenFD < 0 && !paused {
 			fd, err := createListenSocket(w.cfg.Addr)
 			if err != nil {
 				w.logger.Error("re-create listen socket", "worker", w.id, "err", err)
@@ -401,12 +418,12 @@ func (w *Worker) run(ctx context.Context) {
 					mu.Lock()
 				}
 				sqFull := w.flushSend(cs)
-				if cs.needsRecv {
+				if cs.needsRecv && !cs.recvPaused {
 					if w.prepareRecv(cs.fd, cs.buf) {
 						cs.needsRecv = false
 					}
 				}
-				canRemove := !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && !cs.needsRecv
+				canRemove := !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && (!cs.needsRecv || cs.recvPaused)
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -427,11 +444,17 @@ func (w *Worker) run(ctx context.Context) {
 			w.emptyIters++
 		}
 
-		// Check connection timeouts every 1024 iterations to amortize
-		// time.Now() cost. Scans active connections directly — no timer
-		// wheel entries, no allocations, no map writes on the hot path.
+		// Check connection timeouts. Default cadence is every 1024
+		// iterations (~100ms under load); when detached conns exist with
+		// idle deadlines the gate tightens to every 32 iterations
+		// (~50ms idle wall time) so the WS idle-close fires within its
+		// configured budget.
 		w.tickCounter++
-		if w.tickCounter&0x3FF == 0 {
+		gate := uint32(0x3FF)
+		if w.detachedCount > 0 {
+			gate = 0x1F
+		}
+		if w.tickCounter&gate == 0 {
 			w.checkTimeouts()
 		}
 
@@ -482,7 +505,9 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 // Under load (CQEs arriving), returns 1ms for minimal latency. During idle
 // periods, backs off to reduce syscall overhead (up to 100ms). When the
 // listen socket is closed (draining), uses 1s. When H2 connections exist
-// without eventfd, uses 100us for write queue polling.
+// without eventfd, uses 100us for write queue polling. When detached
+// conns exist with idle deadlines, the cap drops to 50ms so checkTimeouts
+// can fire the WS-supplied IdleDeadline before its expiry.
 func (w *Worker) adaptiveTimeout() time.Duration {
 	if w.listenFD < 0 {
 		return 1 * time.Second
@@ -493,13 +518,21 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	if w.dirtyHead != nil {
 		return 0
 	}
+	maxWait := 100 * time.Millisecond
+	if w.detachedCount > 0 {
+		maxWait = 50 * time.Millisecond
+	}
 	switch {
 	case w.emptyIters <= 10:
 		return 1 * time.Millisecond
 	case w.emptyIters <= 100:
-		return 5 * time.Millisecond
+		d := 5 * time.Millisecond
+		if d > maxWait {
+			d = maxWait
+		}
+		return d
 	default:
-		return 100 * time.Millisecond
+		return maxWait
 	}
 }
 
@@ -645,6 +678,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			cs.h1State.Detached = true
 			mu := &sync.Mutex{}
 			cs.detachMu = mu
+			w.detachedCount++
 			orig := cs.writeFn
 			wakeupFD := w.h2EventFD
 			guarded := func(data []byte) {
@@ -659,6 +693,7 @@ func (w *Worker) initProtocol(cs *connState) {
 				// from this goroutine — dirtyHead is worker-local.
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
 				w.detachQMu.Unlock()
 				if wakeupFD >= 0 {
 					var val [8]byte
@@ -670,6 +705,40 @@ func (w *Worker) initProtocol(cs *connState) {
 			// Also update the response adapter so StreamWriter writes
 			// go through the guarded path (not the stale pre-Detach writeFn).
 			cs.h1State.UpdateWriteFn(guarded)
+			// Expose raw write for WebSocket (bypasses chunked encoding).
+			cs.h1State.RawWriteFn = guarded
+			// Install pause/resume callbacks for WebSocket backpressure.
+			// They set a desired state and wake the worker; the actual
+			// recv cancel / re-arm is performed in drainDetachQueue
+			// (worker thread).
+			cs.h1State.PauseRecv = func() {
+				if cs.recvPauseDesired.Swap(true) {
+					return
+				}
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
+				w.detachQMu.Unlock()
+				if wakeupFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(wakeupFD, val[:])
+				}
+			}
+			cs.h1State.ResumeRecv = func() {
+				if !cs.recvPauseDesired.Swap(false) {
+					return
+				}
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
+				w.detachQMu.Unlock()
+				if wakeupFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(wakeupFD, val[:])
+				}
+			}
 			// Ensure eventfd poll is armed so the worker wakes up.
 			if !w.h2PollArmed && w.h2EventFD >= 0 {
 				w.prepareH2Poll()
@@ -711,17 +780,32 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
 		}
+		// Recv was cancelled by drainDetachQueue (WS backpressure pause).
+		// Don't close — the connection stays open until ResumeRecv re-arms.
+		if c.Res == -int32(unix.ECANCELED) && cs.recvPaused {
+			return
+		}
 		// ENOBUFS (-105): provided buffer ring exhausted. The multishot recv
 		// is terminated by the kernel but the connection is healthy. Re-arm
 		// multishot recv — buffers will be available after current batch is
 		// returned via PublishBuffers().
 		if c.Res == -105 && w.bufRing != nil {
 			w.bufRing.PublishBuffers()
-			if !w.prepareRecv(fd, cs.buf) {
-				cs.needsRecv = true
-				w.markDirty(cs)
+			if !cs.recvPaused {
+				if !w.prepareRecv(fd, cs.buf) {
+					cs.needsRecv = true
+					w.markDirty(cs)
+				}
 			}
 			return
+		}
+		// Surface read failure to detached middleware before closing.
+		if cs.detachMu != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+			cs.detachMu.Lock()
+			if cs.h1State.OnError != nil {
+				cs.h1State.OnError(errIORingRecv(c.Res))
+			}
+			cs.detachMu.Unlock()
 		}
 		w.closeConn(fd)
 		return
@@ -788,12 +872,13 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		}
 		// Flush pending writes (e.g. error responses) before closing.
 		_ = w.flushSend(cs)
-		w.closeConn(fd)
-		return
-	}
-
-	// Back-pressure: close connection if pending data grew too large.
-	if len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes {
+		if cs.detachMu != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+			cs.detachMu.Lock()
+			if cs.h1State.OnError != nil {
+				cs.h1State.OnError(processErr)
+			}
+			cs.detachMu.Unlock()
+		}
 		w.closeConn(fd)
 		return
 	}
@@ -804,6 +889,16 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	cs.recvLinked = false
 	if mu := cs.detachMu; mu != nil {
 		mu.Lock()
+	}
+	// Back-pressure: capture pending size inside the lock so concurrent
+	// goroutine writes via the guarded writeFn don't race the read.
+	pending := len(cs.writeBuf) + len(cs.sendBuf)
+	if pending > cs.sendCap() {
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
+		w.closeConn(fd)
+		return
 	}
 	if w.bufRing == nil {
 		if w.flushSendLink(cs) {
@@ -821,7 +916,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
 	// without needing a new SQE. Only re-arm if multishot ended.
 	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
-	if !cqeHasMore(c.Flags) && !cs.recvLinked {
+	// Don't re-arm if recv is paused (WebSocket backpressure).
+	if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
 		if !w.prepareRecv(fd, cs.buf) {
 			cs.needsRecv = true
 			w.markDirty(cs)
@@ -880,6 +976,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 			mu.Lock()
 		}
 		cs.writeBuf = cs.writeBuf[:0]
+		if cs.h1State != nil && cs.h1State.OnError != nil {
+			cs.h1State.OnError(errIORingSend(c.Res))
+		}
 		if mu := cs.detachMu; mu != nil {
 			mu.Unlock()
 		}
@@ -896,18 +995,29 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 
 // completeSend processes a send result after the buffer is safe to modify.
 // Called directly for regular SEND, or from the NOTIF handler for SEND_ZC.
+//
+// For detached connections, cs.sendBuf is read by the makeWriteFn closure
+// running on the user's goroutine (back-pressure check at line 1222).
+// All cs.sendBuf mutations below MUST be guarded by detachMu when one
+// exists, otherwise the goroutine read races the event-loop write —
+// observed via -race in TestNativeEngineLargePayload/io_uring.
 func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	cs.sending = false
+
+	// Take the lock up-front for detached connections so the entire
+	// state mutation (sendBuf truncate / writeBuf reset / OnError fire)
+	// is serialized against the goroutine writeFn path.
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
 
 	if sent < 0 {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
 		cs.writeBuf = cs.writeBuf[:0]
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
+		if cs.h1State != nil && cs.h1State.OnError != nil {
+			cs.h1State.OnError(errIORingSend(int32(sent)))
 		}
 		if cs.closing {
 			w.finishClose(fd)
@@ -925,24 +1035,16 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	} else {
 		cs.sendBuf = cs.sendBuf[:0]
 	}
-
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-	}
+	// detachMu (if any) is held by the deferred unlock at the top of
+	// the function — no per-branch Unlock needed below.
 	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
 		w.finishClose(fd)
 		return
 	}
 
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
-		if cs.needsRecv {
+		if cs.needsRecv && !cs.recvPaused {
 			if w.prepareRecv(fd, cs.buf) {
 				cs.needsRecv = false
 			} else {
@@ -956,11 +1058,9 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	}
 
 	// Re-send remainder or flush new data. Only markDirty on SQ ring full.
+	// detachMu (if any) is held by the deferred unlock at the top.
 	if w.flushSend(cs) {
 		w.markDirty(cs)
-	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Unlock()
 	}
 }
 
@@ -983,7 +1083,20 @@ func (w *Worker) closeConn(fd int) {
 		// Signal the detached goroutine's writeFn to stop writing.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
+		if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+			cs.h1State.OnDetachClose()
+			cs.h1State.OnDetachClose = nil
+		}
 		cs.detachMu.Unlock()
+		// Drop callbacks once the engine relinquishes the conn so any
+		// late goroutine references resolve to no-ops without crashing.
+		if cs.h1State != nil {
+			cs.h1State.PauseRecv = nil
+			cs.h1State.ResumeRecv = nil
+		}
+		if w.detachedCount > 0 {
+			w.detachedCount--
+		}
 	}
 	w.removeDirty(cs)
 	if !detached {
@@ -1104,7 +1217,7 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		}
 		// Back-pressure: drop writes when total pending data exceeds limit.
 		// The connection will be closed after processing completes.
-		if len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes {
+		if len(cs.writeBuf)+len(cs.sendBuf) > cs.sendCap() {
 			return
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds
@@ -1170,12 +1283,39 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 }
 
 func (w *Worker) drainDetachQueue() {
+	if w.detachQPending.Load() == 0 {
+		return
+	}
 	w.detachQMu.Lock()
 	w.detachQSpare, w.detachQueue = w.detachQueue, w.detachQSpare[:0]
+	w.detachQPending.Store(0)
 	w.detachQMu.Unlock()
 	for _, cs := range w.detachQSpare {
 		if cs.detachClosed {
 			continue
+		}
+		// Apply pending pause/resume request from the WS middleware.
+		// Pause: cancel any in-flight RECV (multishot or single-shot)
+		// targeting this fd. Once cancelled, no recv is re-armed until
+		// resume is called. Resume: re-arm recv via prepareRecv.
+		//
+		// The cancel CQE (if any — sqeCQESkipSuccess suppresses success
+		// CQEs) is tagged with udProvide so the main dispatcher silently
+		// ignores it instead of routing through handleRecv.
+		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
+			if desired {
+				if sqe := w.ring.GetSQE(); sqe != nil {
+					prepCancelFDSkipSuccess(sqe, cs.fd)
+					setSQEUserData(sqe, encodeUserData(udProvide, cs.fd))
+				}
+			} else {
+				if w.prepareRecv(cs.fd, cs.buf) {
+					cs.needsRecv = false
+				} else {
+					cs.needsRecv = true
+				}
+			}
+			cs.recvPaused = desired
 		}
 		w.markDirty(cs)
 	}
@@ -1354,6 +1494,18 @@ func (w *Worker) checkTimeouts() {
 		if cs == nil || cs.closing {
 			continue
 		}
+		// Detached connections (e.g. WebSocket): honor an explicit deadline
+		// supplied by the middleware via SetWSIdleDeadline. Skip the
+		// engine-config-driven timeouts since the middleware owns the
+		// I/O lifecycle.
+		if cs.detachMu != nil {
+			if cs.h1State != nil {
+				if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
+					w.closeConn(fd)
+				}
+			}
+			continue
+		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty || cs.sending {
 			if w.cfg.WriteTimeout > 0 && elapsed > w.cfg.WriteTimeout {
@@ -1379,6 +1531,10 @@ func (w *Worker) shutdown() {
 		if detached {
 			cs.detachMu.Lock()
 			cs.detachClosed = true
+			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+				cs.h1State.OnDetachClose()
+				cs.h1State.OnDetachClose = nil
+			}
 			cs.detachMu.Unlock()
 		}
 		if !detached && cs.h1State != nil {

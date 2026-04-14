@@ -7,7 +7,9 @@ import (
 )
 
 // ErrUnauthorized is returned when authentication fails.
-var ErrUnauthorized = celeris.NewHTTPError(401, "Unauthorized")
+// ErrUnauthorized aliases [celeris.ErrUnauthorized] so cross-package
+// errors.Is checks work.
+var ErrUnauthorized = celeris.ErrUnauthorized
 
 // New creates a basic auth middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
@@ -34,7 +36,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		errorHandler = func(c *celeris.Context, _ error) error {
 			c.SetHeader("www-authenticate", realmHeader)
 			c.SetHeader("cache-control", "no-store")
-			c.SetHeader("vary", "authorization")
+			// AddHeader (not SetHeader) to preserve Vary values set by
+			// other middleware — see middleware/doc.go "Vary Header Convention".
+			c.AddHeader("vary", "authorization")
 			return ErrUnauthorized
 		}
 	}
@@ -45,6 +49,12 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		if _, ok := skipMap[c.Path()]; ok {
+			return c.Next()
+		}
+
+		// Defensive OPTIONS skip: CORS preflight must not be auth-blocked
+		// regardless of middleware-installation order.
+		if c.Method() == "OPTIONS" {
 			return c.Next()
 		}
 
@@ -64,6 +74,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		c.Set(UsernameKey, user)
+		if cfg.SuccessHandler != nil {
+			cfg.SuccessHandler(c)
+		}
 		return c.Next()
 	}
 }

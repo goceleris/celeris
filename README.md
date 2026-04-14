@@ -118,6 +118,7 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
 | [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
 | [`pprof`](middleware/pprof) | Go profiling endpoints (loopback-only by default) |
+| [`protobuf`](middleware/protobuf) | Protobuf serialization with content negotiation (separate go.mod) |
 | [`proxy`](middleware/proxy) | Trusted proxy header extraction (X-Forwarded-For, X-Real-IP) |
 | [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter |
 | [`recovery`](middleware/recovery) | Panic recovery with broken pipe detection |
@@ -127,9 +128,11 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions with pluggable store |
 | [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
+| [`sse`](middleware/sse) | Server-Sent Events with heartbeat + Last-Event-ID resumption |
 | [`static`](middleware/static) | Static file serving with directory browse, ETag/Last-Modified caching |
 | [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI/Scalar (CDN-loaded) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
+| [`websocket`](middleware/websocket) | RFC 6455 WebSocket with permessage-deflate + engine-integrated backpressure |
 
 ```go
 import (

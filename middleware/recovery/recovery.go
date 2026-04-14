@@ -44,6 +44,19 @@ func New(config ...Config) celeris.HandlerFunc {
 	cfg = applyDefaults(cfg)
 
 	handler := cfg.ErrorHandler
+	// ErrorHandlerErr takes precedence — wrap the panic value as an
+	// error and route through the typed handler. Non-error panic values
+	// (string / struct / etc.) are wrapped via fmt.Errorf so callers
+	// can use errors.Is / errors.As.
+	if cfg.ErrorHandlerErr != nil {
+		typedFn := cfg.ErrorHandlerErr
+		handler = func(c *celeris.Context, r any) error {
+			if e, ok := r.(error); ok {
+				return typedFn(c, e)
+			}
+			return typedFn(c, fmt.Errorf("recovery: panic: %v", r))
+		}
+	}
 	brokenPipeHandler := cfg.BrokenPipeHandler
 	stackSize := cfg.StackSize
 	logStack := !cfg.DisableLogStack

@@ -59,7 +59,15 @@ type Config struct {
 	// Parsed via ParseRate.
 	RateFunc func(c *celeris.Context) (rate string, err error)
 
-	// KeyFunc extracts the rate limit key from the request. Default: c.ClientIP().
+	// KeyFunc extracts the rate limit key from the request. Default:
+	// c.ClientIP() — which means the proxy middleware MUST be installed
+	// (Server.Pre(proxy.New(...))) when running behind a reverse proxy.
+	// Without proxy, ClientIP() returns the immediate peer (the load
+	// balancer's address), so all real clients share one bucket and a
+	// single noisy client triggers a global DoS for everyone behind the
+	// same hop. With a misconfigured TrustedProxies range, attackers can
+	// spoof X-Forwarded-For and escape their bucket. Verify the chain
+	// before relying on the default.
 	KeyFunc func(c *celeris.Context) string
 
 	// SkipPaths lists paths to skip (exact match).
@@ -99,7 +107,19 @@ type Config struct {
 
 	// LimitReached is called when a request is rate-limited.
 	// If nil, returns 429 Too Many Requests.
+	//
+	// Deprecated: use [ErrorHandler] for naming consistency with the
+	// rest of the middleware family (jwt, keyauth, basicauth, csrf,
+	// recovery). LimitReached is kept working for backwards
+	// compatibility; if both fields are set, ErrorHandler wins.
 	LimitReached func(c *celeris.Context) error
+
+	// ErrorHandler is called when a request is rate-limited. The err
+	// argument is the sentinel [ErrTooManyRequests] so callers can
+	// distinguish the cause from other middleware errors via
+	// errors.Is. If nil, falls back to LimitReached, then to a
+	// 429 Too Many Requests default.
+	ErrorHandler func(c *celeris.Context, err error) error
 
 	// MaxDynamicLimiters caps the number of distinct rate strings cached
 	// when RateFunc is used. When exceeded, new rate strings are rejected

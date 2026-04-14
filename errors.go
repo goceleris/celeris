@@ -30,6 +30,25 @@ var ErrHijackNotSupported = stream.ErrHijackNotSupported
 // the active engine does not implement accept control (e.g. std engine).
 var ErrAcceptControlNotSupported = errors.New("celeris: engine does not support accept control")
 
+// ErrDetached is returned by response methods (JSON, Blob, XML, HTML, String,
+// File, Stream) when the Context has been detached. After Detach(), the
+// connection is owned by streaming middleware (WebSocket frames, SSE event
+// stream, etc.) and the standard response writers would corrupt the stream.
+// Use [Context.StreamWriter] or the relevant middleware's write API instead.
+var ErrDetached = errors.New("celeris: cannot write standard response on detached context")
+
+// ErrUnauthorized is the canonical 401 [HTTPError] used by all auth-style
+// middleware (jwt, keyauth, basicauth). Each package re-exports it under
+// the same name so callers can `errors.Is(err, celeris.ErrUnauthorized)`
+// across mixed auth stacks.
+var ErrUnauthorized = NewHTTPError(401, "Unauthorized")
+
+// ErrServiceUnavailable is the canonical 503 [HTTPError] used by
+// infrastructure middleware that sheds load (timeout, circuitbreaker,
+// ratelimit). Re-exported by each package so callers can match across
+// stacks with errors.Is.
+var ErrServiceUnavailable = NewHTTPError(503, "Service Unavailable")
+
 // HTTPError is a structured error that carries an HTTP status code.
 // Handlers return HTTPError to signal a specific status code to the
 // routerAdapter safety net. Use NewHTTPError to create one.

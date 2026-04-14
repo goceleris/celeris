@@ -45,8 +45,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		customLabelFuncs[i] = cfg.LabelFuncs[name]
 	}
 
-	baseLabels := []string{"method", "path", "status"}
-	allLabels := append(baseLabels, customLabelNames...)
+	allLabels := make([]string, 0, 3+len(customLabelNames))
+	allLabels = append(allLabels, "method", "path", "status")
+	allLabels = append(allLabels, customLabelNames...)
 
 	requestsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   cfg.Namespace,
@@ -140,11 +141,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		activeRequests.Inc()
+		// Defer ensures the gauge is always decremented, even when a
+		// panic escapes this middleware (e.g. recovery ordered outside
+		// metrics).
+		defer activeRequests.Dec()
 
 		err := c.Next()
 
 		duration := time.Since(c.StartTime()).Seconds()
-		activeRequests.Dec()
 
 		status := c.StatusCode()
 		if _, ignored := ignoreStatus[status]; ignored {
