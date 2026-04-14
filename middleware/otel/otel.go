@@ -259,6 +259,9 @@ func New(config ...Config) celeris.HandlerFunc {
 			activeAttrSet := metric.WithAttributeSet(attribute.NewSet(metricBaseAttrs...))
 			if activeRequests != nil {
 				activeRequests.Add(spanCtx, 1, activeAttrSet)
+				// Defer ensures we decrement even if a panic escapes
+				// this middleware (recovery ordered outside otel).
+				defer activeRequests.Add(spanCtx, -1, activeAttrSet)
 			}
 			err := c.Next()
 
@@ -286,9 +289,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			if requestDuration != nil {
 				requestDuration.Record(spanCtx, duration, fullAttrSet)
 			}
-			if activeRequests != nil {
-				activeRequests.Add(spanCtx, -1, activeAttrSet)
-			}
+			// activeRequests decrement happens in the defer above.
 
 			if reqSize := c.ContentLength(); reqSize > 0 && requestBodySize != nil {
 				requestBodySize.Record(spanCtx, reqSize, fullAttrSet)

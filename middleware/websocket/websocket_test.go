@@ -2292,7 +2292,7 @@ func TestEngineWriteErrorPropagation(t *testing.T) {
 		written = append(written, p...)
 		mu.Unlock()
 	}
-	r := newChanReader(8)
+	r := newChanReader(8, 0, 0)
 	ws := newEngineConn(context.Background(), func() {},
 		r, writeFn, defaultReadBufSize)
 
@@ -2344,7 +2344,7 @@ func TestWriteBufferPoolHijackOnly(t *testing.T) {
 			getCalls: &get,
 			putCalls: &put,
 		}
-		r := newChanReader(8)
+		r := newChanReader(8, 0, 0)
 		ws := newEngineConn(context.Background(), func() {},
 			r, func([]byte) {}, defaultReadBufSize)
 		ws.writePool = pool

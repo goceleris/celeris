@@ -126,9 +126,14 @@ func (c *Context) String(code int, format string, args ...any) error {
 
 // Blob writes a response with the given content type and data.
 // Returns ErrResponseWritten if a response has already been sent.
+// Returns ErrDetached if the Context has been detached (e.g. by a
+// WebSocket or SSE middleware) — use the middleware's own write API.
 func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if c.written {
 		return ErrResponseWritten
+	}
+	if c.detached {
+		return ErrDetached
 	}
 	if c.bufferDepth > 0 {
 		c.capturedBody = append(c.capturedBody[:0], data...)

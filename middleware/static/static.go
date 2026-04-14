@@ -393,6 +393,12 @@ func sniffContentType(rs io.ReadSeeker, filePath string) string {
 
 // setCacheHeaders sets Last-Modified, ETag, and Cache-Control headers from
 // file metadata. Returns the computed ETag string for reuse by notModified.
+//
+// When chained with the etag middleware (etag → static), etag detects the
+// ETag set here and reuses it as the existing tag — no double-Etag header
+// is emitted. The mtime/size form static uses is preferable for static
+// files (no body hash required); etag's CRC-32 fallback only runs when no
+// ETag header is set.
 func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, maxAge time.Duration) string {
 	if modTime.IsZero() {
 		return ""

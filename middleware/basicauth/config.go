@@ -59,6 +59,12 @@ type Config struct {
 	// [ErrUnauthorized] for all auth failures.
 	// Default: 401 with WWW-Authenticate + Cache-Control + Vary headers.
 	ErrorHandler func(c *celeris.Context, err error) error
+
+	// SuccessHandler is called after successful credential validation,
+	// before c.Next(). Use for logging, metrics, or enriching the context.
+	// Matches the hook exposed by middleware/jwt and middleware/keyauth so
+	// mixed auth stacks can enrich uniformly.
+	SuccessHandler func(c *celeris.Context)
 }
 
 // defaultConfig is the default basic auth configuration.

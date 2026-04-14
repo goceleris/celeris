@@ -113,7 +113,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		// On native engines, the handler runs on the event loop thread.
 		// We must spawn a goroutine for the blocking handler and return
 		// immediately to free the event loop.
-		ws, done := tryEngineUpgrade(c, acceptKey, subproto, readBufSize, readLimit, compress, cfg.MaxBackpressureBuffer)
+		ws, done := tryEngineUpgrade(c, acceptKey, subproto, readBufSize, readLimit, compress,
+			cfg.MaxBackpressureBuffer, cfg.BackpressureHighPct, cfg.BackpressureLowPct)
 
 		if ws != nil {
 			// Engine path: populate conn and run handler in goroutine.
@@ -189,9 +190,10 @@ func New(config ...Config) celeris.HandlerFunc {
 //  5. Returns the new Conn plus a `done` callback the caller invokes when
 //     the handler goroutine finishes.
 func tryEngineUpgrade(c *celeris.Context, acceptKey, subproto string,
-	readBufSize int, readLimit int64, compress bool, backpressure int) (*Conn, func()) {
+	readBufSize int, readLimit int64, compress bool,
+	backpressure, highPct, lowPct int) (*Conn, func()) {
 
-	reader := newChanReader(backpressure)
+	reader := newChanReader(backpressure, highPct, lowPct)
 
 	if !c.UpgradeWebSocket(func(data []byte) {
 		// Called on the event loop thread — must NOT block.

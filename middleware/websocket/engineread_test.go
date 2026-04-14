@@ -10,7 +10,7 @@ import (
 // TestChanReaderBasicReadWrite verifies the chanReader yields appended
 // chunks via io.Reader semantics with partial-chunk tracking.
 func TestChanReaderBasicReadWrite(t *testing.T) {
-	r := newChanReader(8)
+	r := newChanReader(8, 0, 0)
 	r.Append([]byte("hello "))
 	r.Append([]byte("world"))
 
@@ -32,7 +32,7 @@ func TestChanReaderBasicReadWrite(t *testing.T) {
 // TestChanReaderCloseEOF verifies that closing without an error returns
 // io.EOF on subsequent reads.
 func TestChanReaderCloseEOF(t *testing.T) {
-	r := newChanReader(4)
+	r := newChanReader(4, 0, 0)
 	r.closeWith(nil)
 
 	_, err := r.Read(make([]byte, 4))
@@ -44,7 +44,7 @@ func TestChanReaderCloseEOF(t *testing.T) {
 // TestChanReaderCloseWithError verifies that closeWith preserves a custom
 // error and returns it on the next read.
 func TestChanReaderCloseWithError(t *testing.T) {
-	r := newChanReader(4)
+	r := newChanReader(4, 0, 0)
 	want := errors.New("synthetic write error")
 	r.closeWith(want)
 
@@ -60,7 +60,7 @@ func TestChanReaderCloseWithError(t *testing.T) {
 func TestChanReaderPauseResumeWatermarks(t *testing.T) {
 	const chanCap = 8 // high=6, low=2
 	var pauses, resumes atomic.Uint32
-	r := newChanReader(chanCap)
+	r := newChanReader(chanCap, 0, 0)
 	r.SetPauser(func() { pauses.Add(1) }, func() { resumes.Add(1) })
 
 	// Fill below high-water — no pause yet.
@@ -104,7 +104,7 @@ func TestChanReaderPauseResumeWatermarks(t *testing.T) {
 // capacity poisons the reader with ErrReadLimit and increments the
 // dropped counter.
 func TestChanReaderDropsOnOverflow(t *testing.T) {
-	r := newChanReader(2) // tiny channel — no pause callback wired
+	r := newChanReader(2, 0, 0) // tiny channel — no pause callback wired
 	r.Append([]byte("a"))
 	r.Append([]byte("b"))
 
@@ -131,7 +131,7 @@ func TestChanReaderDropsOnOverflow(t *testing.T) {
 // (e.g., 2) does not cause pause/resume to thrash (highWater == lowWater).
 func TestChanReaderSmallCapacityNoThrash(t *testing.T) {
 	var pauses, resumes atomic.Uint32
-	r := newChanReader(2) // highWater=1, lowWater=0 (after floor fix)
+	r := newChanReader(2, 0, 0) // highWater=1, lowWater=0 (after floor fix)
 	r.SetPauser(func() { pauses.Add(1) }, func() { resumes.Add(1) })
 
 	// Fill to highWater — should pause exactly once.
@@ -161,7 +161,7 @@ func TestChanReaderSmallCapacityNoThrash(t *testing.T) {
 // TestChanReaderConcurrentCloseRace verifies closeWith is idempotent
 // under concurrent callers.
 func TestChanReaderConcurrentCloseRace(t *testing.T) {
-	r := newChanReader(8)
+	r := newChanReader(8, 0, 0)
 	done := make(chan struct{})
 	for range 4 {
 		go func() {

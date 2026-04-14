@@ -15,11 +15,19 @@
 // rewrite (modifies path after redirect normalizes the URL), then
 // methodoverride (after path is finalized).
 //
+// Short-circuit contract: writing a response in pre-routing middleware does
+// NOT auto-abort the chain. Custom pre-routing middleware that responds
+// (e.g. a redirect or 4xx error) MUST return WITHOUT calling c.Next() — the
+// shipped redirect middleware does this. If a pre-middleware writes a body
+// AND calls c.Next(), the router will run and may write a second response.
+//
 // # Recommended Middleware Ordering (Server.Use)
 //
 // Install middleware in this order so each layer sees the right context:
 //
 //	healthcheck — health probes respond early; place first to skip downstream middleware
+//	              (install with Server.Use, NEVER with Server.Pre — pre-routing
+//	              rewrite rules could otherwise retarget the probe paths)
 //	requestid   — assign request ID first; all downstream logs include it
 //	metrics/otel — Prometheus / OpenTelemetry: can also go after logger
 //	logger      — log every request with the ID from requestid
@@ -81,6 +89,13 @@
 // tracing and metrics. Creates spans per request with W3C trace context
 // propagation. Exports to any OTLP-compatible backend (Jaeger, Tempo, etc.).
 // Use for cross-service request correlation and latency breakdown.
+//
+// Counter overlap: each system records the same request independently —
+// observe.Collector.TotalRequests, prometheus celeris_requests_total, and
+// otel http.server.request.duration count are NOT shared. Enabling all
+// three gives three independent views of the same traffic; do NOT add
+// numbers across systems. Pick one as the source of truth for a given
+// chart, alert, or SLO.
 //
 // # Auth Stacking Pattern
 //

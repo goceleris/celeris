@@ -34,7 +34,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		errorHandler = func(c *celeris.Context, _ error) error {
 			c.SetHeader("www-authenticate", realmHeader)
 			c.SetHeader("cache-control", "no-store")
-			c.SetHeader("vary", "authorization")
+			// AddHeader (not SetHeader) to preserve Vary values set by
+			// other middleware — see middleware/doc.go "Vary Header Convention".
+			c.AddHeader("vary", "authorization")
 			return ErrUnauthorized
 		}
 	}
@@ -64,6 +66,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		c.Set(UsernameKey, user)
+		if cfg.SuccessHandler != nil {
+			cfg.SuccessHandler(c)
+		}
 		return c.Next()
 	}
 }

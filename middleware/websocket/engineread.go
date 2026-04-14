@@ -50,17 +50,23 @@ type chanReader struct {
 	dropped atomic.Uint64 // chunks dropped because the channel was full
 }
 
-// newChanReader creates a chanReader with the given backpressure capacity.
-// highWater and lowWater are derived as 75% and 25% of capacity by default.
+// newChanReader creates a chanReader with the given backpressure capacity
+// and watermark percents (0-100). highPct/lowPct ≤ 0 fall back to 75/25.
 // If capacity ≤ 0, the default of 256 is used.
-func newChanReader(capacity int) *chanReader {
+func newChanReader(capacity, highPct, lowPct int) *chanReader {
 	if capacity <= 0 {
 		capacity = 256
 	}
+	if highPct <= 0 || highPct > 100 {
+		highPct = 75
+	}
+	if lowPct <= 0 || lowPct >= highPct {
+		lowPct = 25
+	}
 	r := &chanReader{
 		ch:        make(chan []byte, capacity),
-		highWater: capacity * 3 / 4,
-		lowWater:  capacity / 4,
+		highWater: capacity * highPct / 100,
+		lowWater:  capacity * lowPct / 100,
 	}
 	if r.highWater < 1 {
 		r.highWater = 1

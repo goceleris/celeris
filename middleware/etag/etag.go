@@ -7,6 +7,13 @@ import (
 )
 
 // New creates an ETag middleware with the given config.
+//
+// Composition: when a downstream handler or middleware (e.g.
+// middleware/static) already sets an "etag" response header, this
+// middleware reuses that tag instead of computing its own. The body hash
+// is only computed when no ETag is present. This means etag(static(...))
+// emits exactly one ETag header — the mtime/size form static computed —
+// and no double tagging occurs.
 func New(config ...Config) celeris.HandlerFunc {
 	var cfg Config
 	if len(config) > 0 {

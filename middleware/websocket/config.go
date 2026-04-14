@@ -111,11 +111,22 @@ type Config struct {
 
 	// MaxBackpressureBuffer is the maximum number of inbound chunks
 	// buffered between the engine event loop and the WebSocket handler
-	// goroutine on the engine-integrated path. When this fills past 75%,
-	// the engine pauses inbound delivery for this connection (TCP-level
-	// backpressure); when it drains below 25%, delivery is resumed.
+	// goroutine on the engine-integrated path. When the buffer fills past
+	// BackpressureHighPct, the engine pauses inbound delivery for this
+	// connection (TCP-level backpressure); when it drains below
+	// BackpressureLowPct, delivery is resumed.
 	// Default: 256. Ignored on the std (hijack) engine path.
 	MaxBackpressureBuffer int
+
+	// BackpressureHighPct is the buffer fill percentage (0-100) at which
+	// the engine is asked to pause inbound delivery. Default: 75.
+	BackpressureHighPct int
+
+	// BackpressureLowPct is the buffer fill percentage (0-100) at which
+	// the engine is asked to resume inbound delivery after a pause. Must
+	// be lower than BackpressureHighPct or it falls back to the default
+	// (25). Default: 25.
+	BackpressureLowPct int
 
 	// OnConnect is called after upgrade succeeds, before Handler.
 	// If it returns a non-nil error, the connection is closed.
@@ -145,6 +156,12 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.MaxBackpressureBuffer <= 0 {
 		cfg.MaxBackpressureBuffer = 256
+	}
+	if cfg.BackpressureHighPct <= 0 || cfg.BackpressureHighPct > 100 {
+		cfg.BackpressureHighPct = 75
+	}
+	if cfg.BackpressureLowPct <= 0 || cfg.BackpressureLowPct >= cfg.BackpressureHighPct {
+		cfg.BackpressureLowPct = 25
 	}
 	return cfg
 }

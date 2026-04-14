@@ -131,7 +131,7 @@ func TestEngineConnReadWrite(t *testing.T) {
 		writeMu.Unlock()
 	}
 
-	reader := newChanReader(64)
+	reader := newChanReader(64, 0, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	ws := newEngineConn(ctx, cancel, reader, writeFn, defaultReadBufSize)
 
