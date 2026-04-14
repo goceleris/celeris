@@ -197,9 +197,8 @@ func StaticKeys(keys ...string) func(*celeris.Context, string) (bool, error) {
 		if len(key) > math.MaxInt32 {
 			return false, nil
 		}
-		// staticcheck v2.9 (CI) has a false positive on this pattern;
-		// kb is read below via subtle.ConstantTimeCompare.
-		kb := padTo([]byte(key), maxLen) //nolint:staticcheck // SA4006 false positive: kb is read in the loop below
+		kb := make([]byte, maxLen)
+		copy(kb, key)
 		match := 0
 		for i, p := range padded {
 			lenMatch := subtle.ConstantTimeEq(int32(len(keys[i])), int32(len(key)))
