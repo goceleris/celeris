@@ -341,10 +341,25 @@ func TestAdaptiveConstrainedRing(t *testing.T) {
 	startEngine(t, e)
 
 	addr := e.Addr().String()
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://" + addr + "/constrained")
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	// On Azure CI VMs the adaptive engine may transiently reset
+	// connections during io_uring stabilization (ACCEPT_DIRECT EINVAL),
+	// so retry with backoff — same pattern as TestAdaptiveAutoSingleWorker
+	// (commits 88c92b2 / f912fd4).
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	var resp *http.Response
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err = client.Get("http://" + addr + "/constrained")
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("request failed after retries: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
