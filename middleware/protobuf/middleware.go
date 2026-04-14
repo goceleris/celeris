@@ -1,8 +1,9 @@
 package protobuf
 
 import (
-	"github.com/goceleris/celeris"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/goceleris/celeris"
 )
 
 const configKey = "protobuf.config"

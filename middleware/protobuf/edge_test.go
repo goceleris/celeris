@@ -2,8 +2,10 @@ package protobuf
 
 import (
 	"testing"
-	"github.com/goceleris/celeris/celeristest"
+
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/goceleris/celeris/celeristest"
 )
 
 // Test edge cases in content-type detection
@@ -18,21 +20,21 @@ func TestContentTypeEdgeCases(t *testing.T) {
 		{"trailing space", "application/x-protobuf ", true},
 		{"both spaces", " application/x-protobuf ", true},
 		{"internal space", "application / x-protobuf", false}, // Should fail
-		
+
 		// Case variations with parameters
 		{"mixed case with param", "APPLICATION/X-PROTOBUF; CHARSET=UTF-8", true},
-		
+
 		// Multiple semicolons
 		{"double semicolon", "application/x-protobuf;; charset=utf-8", true},
-		
+
 		// Empty after semicolon
 		{"empty after semi", "application/x-protobuf;", true},
-		
+
 		// Whitespace around semicolon
 		{"space before semi", "application/x-protobuf ; charset=utf-8", true},
 		{"space after semi", "application/x-protobuf; charset=utf-8", true},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := isProtoBufContentType(tt.ct)
@@ -49,11 +51,12 @@ func TestRespondEdgeCases(t *testing.T) {
 	msg := wrapperspb.String("test")
 	ctx, rec := celeristest.NewContextT(t, "GET", "/test")
 	// No Accept header set
-	Respond(ctx, 200, msg, nil)
-	
+	if err := Respond(ctx, 200, msg, nil); err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+
 	// Should default to protobuf (first offer)
 	if rec.Header("content-type") != ContentType {
 		t.Errorf("expected protobuf without Accept header, got %q", rec.Header("content-type"))
 	}
 }
-

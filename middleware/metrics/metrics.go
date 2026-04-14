@@ -45,8 +45,9 @@ func New(config ...Config) celeris.HandlerFunc {
 		customLabelFuncs[i] = cfg.LabelFuncs[name]
 	}
 
-	baseLabels := []string{"method", "path", "status"}
-	allLabels := append(baseLabels, customLabelNames...)
+	allLabels := make([]string, 0, 3+len(customLabelNames))
+	allLabels = append(allLabels, "method", "path", "status")
+	allLabels = append(allLabels, customLabelNames...)
 
 	requestsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   cfg.Namespace,

@@ -4,11 +4,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/celeristest"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
 )
 
 // --- ProtoBuf response tests ---
@@ -284,7 +285,9 @@ func TestFromContextWithoutMiddleware(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out wrapperspb.StringValue
-	proto.Unmarshal(rec.Body, &out)
+	if err := proto.Unmarshal(rec.Body, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
 	if out.GetValue() != "no-mw" {
 		t.Errorf("value = %q", out.GetValue())
 	}

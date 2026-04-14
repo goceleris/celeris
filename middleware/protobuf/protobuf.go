@@ -6,8 +6,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/goceleris/celeris"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/goceleris/celeris"
 )
 
 // maxPooledBufSize is the maximum buffer capacity returned to the pool.
