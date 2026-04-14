@@ -2321,10 +2321,15 @@ func TestWriteBufferPoolHijackOnly(t *testing.T) {
 			getCalls: &get,
 			putCalls: &put,
 		}
+		// handlerDone signals the test that WriteMessage's defers have
+		// completed (including putWriter), so the pool count check
+		// doesn't race the handler's defer chain on slow CI VMs.
+		handlerDone := make(chan struct{})
 		addr, shutdown := startServer(t, Config{
 			WriteBufferPool: pool,
 			Handler: func(c *Conn) {
 				_ = c.WriteMessage(TextMessage, []byte("hello"))
+				close(handlerDone)
 			},
 		})
 		defer shutdown()
@@ -2332,6 +2337,11 @@ func TestWriteBufferPoolHijackOnly(t *testing.T) {
 		defer client.close()
 		client.upgrade(t, "/ws")
 		client.readServerFrame(t)
+		select {
+		case <-handlerDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handler did not complete within 2s")
+		}
 		if get.Load() == 0 || put.Load() == 0 {
 			t.Errorf("hijack path should consult pool: get=%d put=%d", get.Load(), put.Load())
 		}
