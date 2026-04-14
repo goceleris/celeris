@@ -89,12 +89,40 @@ func Bind(c *celeris.Context, v proto.Message) error {
 // Respond performs content negotiation between protobuf and JSON. If the
 // client accepts protobuf (via Accept header), v is serialized as protobuf.
 // Otherwise, jsonFallback is serialized as JSON.
+//
+// The Content-Type written is the exact variant the client prefers
+// (application/x-protobuf vs application/protobuf), honoring q=0 to
+// exclude either form per RFC 7231 §5.3.1.
 func Respond(c *celeris.Context, code int, v proto.Message, jsonFallback any) error {
 	best := c.Negotiate(ContentType, ContentTypeAlt, "application/json")
 	if best == ContentType || best == ContentTypeAlt {
-		return Write(c, code, v)
+		return writeAs(c, code, v, best)
 	}
 	return c.JSON(code, jsonFallback)
+}
+
+// writeAs serializes v as protobuf and writes it with the negotiated
+// content-type (either application/x-protobuf or application/protobuf).
+func writeAs(c *celeris.Context, code int, v proto.Message, ct string) error {
+	if v == nil {
+		return ErrNilMessage
+	}
+	bp := bufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	data, err := proto.MarshalOptions{}.MarshalAppend(buf, v)
+	if err != nil {
+		*bp = buf
+		bufPool.Put(bp)
+		return err
+	}
+	writeErr := c.Blob(code, ct, data)
+	if cap(data) <= maxPooledBufSize {
+		*bp = data
+		bufPool.Put(bp)
+	} else {
+		PoolEvictions.Add(1)
+	}
+	return writeErr
 }
 
 func isProtoBufContentType(ct string) bool {

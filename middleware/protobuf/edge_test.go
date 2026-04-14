@@ -60,3 +60,44 @@ func TestRespondEdgeCases(t *testing.T) {
 		t.Errorf("expected protobuf without Accept header, got %q", rec.Header("content-type"))
 	}
 }
+
+// TestRespondQZeroExclusion table-tests Accept-header q=0 exclusion of
+// each protobuf content-type. RFC 7231 §5.3.1: q=0 means "not
+// acceptable" and the server must NOT pick that media type.
+func TestRespondQZeroExclusion(t *testing.T) {
+	msg := wrapperspb.String("hello")
+	cases := []struct {
+		name   string
+		accept string
+		wantCT string
+	}{
+		{
+			name:   "exclude application/x-protobuf forces alt",
+			accept: "application/x-protobuf;q=0, application/protobuf, application/json",
+			wantCT: ContentTypeAlt,
+		},
+		{
+			name:   "exclude both protobuf variants forces JSON",
+			accept: "application/x-protobuf;q=0, application/protobuf;q=0, application/json",
+			wantCT: "application/json",
+		},
+		{
+			name:   "wildcard q=0 + explicit json forces JSON",
+			accept: "*/*;q=0, application/json",
+			wantCT: "application/json",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, rec := celeristest.NewContextT(t, "GET", "/api",
+				celeristest.WithHeader("accept", tc.accept))
+			if err := Respond(ctx, 200, msg, map[string]string{"v": "hello"}); err != nil {
+				t.Fatalf("Respond: %v", err)
+			}
+			got := rec.Header("content-type")
+			if got != tc.wantCT {
+				t.Errorf("Accept=%q → Content-Type=%q, want %q", tc.accept, got, tc.wantCT)
+			}
+		})
+	}
+}
