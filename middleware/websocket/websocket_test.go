@@ -1721,9 +1721,15 @@ func TestWriteBufferPool(t *testing.T) {
 		getCalls: &getCalls,
 		putCalls: &putCalls,
 	}
+	// handlerDone signals the test that WriteMessage's defer chain
+	// (including putWriter) has fully completed, so the pool counter
+	// check doesn't race the handler's post-Flush defers on slow CI
+	// VMs. Same shape as TestWriteBufferPoolHijackOnly (efebbba).
+	handlerDone := make(chan struct{})
 	addr, shutdown := startServer(t, Config{
 		WriteBufferPool: pool,
 		Handler: func(c *Conn) {
+			defer close(handlerDone)
 			mt, msg, err := c.ReadMessage()
 			if err != nil {
 				return
@@ -1739,6 +1745,11 @@ func TestWriteBufferPool(t *testing.T) {
 	_, _, data := client.readServerFrame(t)
 	if string(data) != "pool test" {
 		t.Errorf("got %q", data)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not complete within 2s")
 	}
 	if getCalls.Load() == 0 {
 		t.Error("pool.Get was never called")

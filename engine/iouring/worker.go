@@ -983,7 +983,7 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 			mu.Unlock()
 		}
 		if cs.closing {
-			w.finishClose(fd)
+			w.finishCloseAny(fd, cs)
 		} else {
 			w.closeConn(fd)
 		}
@@ -1020,7 +1020,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 			cs.h1State.OnError(errIORingSend(int32(sent)))
 		}
 		if cs.closing {
-			w.finishClose(fd)
+			w.finishCloseAny(fd, cs)
 		} else {
 			w.closeConn(fd)
 		}
@@ -1038,7 +1038,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	// detachMu (if any) is held by the deferred unlock at the top of
 	// the function — no per-branch Unlock needed below.
 	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-		w.finishClose(fd)
+		w.finishCloseAny(fd, cs)
 		return
 	}
 
@@ -1109,21 +1109,28 @@ func (w *Worker) closeConn(fd int) {
 		w.removeH2Conn(fd)
 	}
 
-	if detached {
-		// Skip deferred-close and pool return for detached connections.
-		// The goroutine's closures still reference cs; GC collects it
-		// after the goroutine finishes.
-		w.finishCloseDetached(fd, cs)
-		return
-	}
-
 	// Defer actual close until all in-flight and pending SENDs complete,
-	// so GOAWAY / RST_STREAM data reaches the client.
+	// so the last bytes (GOAWAY / RST_STREAM / WS close-echo) reach the
+	// client before SHUT_WR. For detached connections this specifically
+	// guards the WS close handshake: the WS middleware queues a close-
+	// echo frame and then asks the engine to drop the FD via
+	// SetWSIdleDeadline(1); without this guard the subsequent
+	// checkTimeouts → closeConn pair would fire before the SEND SQE
+	// submitted by the dirty-list flush has completed, and the echo
+	// would never leave the kernel.
 	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
+		return
+	}
+
+	if detached {
+		// Skip deferred-close and pool return for detached connections.
+		// The goroutine's closures still reference cs; GC collects it
+		// after the goroutine finishes.
+		w.finishCloseDetached(fd, cs)
 		return
 	}
 
@@ -1173,6 +1180,18 @@ func (w *Worker) finishClose(fd int) {
 		prepClose(sqe, fd)
 		setSQEUserData(sqe, encodeUserData(udClose, fd))
 	}
+}
+
+// finishCloseAny dispatches to finishCloseDetached for detached connections
+// and finishClose otherwise. Used by the deferred-close paths in
+// handleSend / completeSend, where the connection may be either a plain
+// H1/H2 conn or a detached WS/SSE conn (distinguished by detachMu).
+func (w *Worker) finishCloseAny(fd int, cs *connState) {
+	if cs.detachMu != nil {
+		w.finishCloseDetached(fd, cs)
+		return
+	}
+	w.finishClose(fd)
 }
 
 // finishCloseDetached closes the FD and removes the connection from bookkeeping
