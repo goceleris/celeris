@@ -46,8 +46,8 @@ type connState struct {
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
 
 	// WebSocket recv backpressure (detached conns only):
-	recvPaused        bool        // engine-side current state (single-threaded write)
-	recvPauseDesired  atomic.Bool // requested state from middleware goroutine
+	recvPaused       bool        // engine-side current state (single-threaded write)
+	recvPauseDesired atomic.Bool // requested state from middleware goroutine
 }
 
 var connStatePool = sync.Pool{

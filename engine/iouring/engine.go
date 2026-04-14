@@ -105,7 +105,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 			e.cfg.Logger.Info("iouring: closing supplied listener to rebind via SO_REUSEPORT",
 				"addr", e.cfg.Addr)
 		}
-		e.cfg.Listener.Close()
+		_ = e.cfg.Listener.Close()
 		e.cfg.Listener = nil
 	}
 

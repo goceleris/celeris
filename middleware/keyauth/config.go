@@ -197,14 +197,13 @@ func StaticKeys(keys ...string) func(*celeris.Context, string) (bool, error) {
 		if len(key) > math.MaxInt32 {
 			return false, nil
 		}
-		var kb []byte
+		kb := padTo([]byte(key), maxLen)
 		if maxLen <= 256 {
+			// Stack-allocated fast path to avoid the heap allocation in padTo.
 			var buf [256]byte
 			kb = buf[:maxLen]
 			clear(kb)
 			copy(kb, key)
-		} else {
-			kb = padTo([]byte(key), maxLen)
 		}
 		match := 0
 		for i, p := range padded {

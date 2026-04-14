@@ -63,9 +63,9 @@ type Loop struct {
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead     *connState // head of intrusive doubly-linked dirty list
-	h2Conns       []int      // FDs of H2 connections (for write queue polling)
-	h2cfg         conn.H2Config
+	dirtyHead      *connState // head of intrusive doubly-linked dirty list
+	h2Conns        []int      // FDs of H2 connections (for write queue polling)
+	h2cfg          conn.H2Config
 	detachQueue    []*connState // detached conns with pending writes (goroutine-safe via detachQMu)
 	detachQMu      sync.Mutex
 	detachQSpare   []*connState // reuse slice to avoid alloc in drainDetachQueue
@@ -315,7 +315,6 @@ func (l *Loop) run(ctx context.Context) {
 				}
 			}
 		}
-
 
 		// Flush batched request count to the shared atomic counter. This
 		// replaces per-request atomic.Add with one atomic per event loop
@@ -773,9 +772,9 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	}
 	// Cap the timeout when detached conns exist so checkTimeouts can fire
 	// the WS-supplied IdleDeadline before its expiry.
-	cap := 500
+	maxMs := 500
 	if l.detachedCount > 0 {
-		cap = 50
+		maxMs = 50
 	}
 	switch {
 	case l.consecutiveEmpty == 0:
@@ -787,14 +786,14 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 		if d > 100 {
 			d = 100
 		}
-		if d > cap {
-			d = cap
+		if d > maxMs {
+			d = maxMs
 		}
 		return d
 	default:
 		d := base * 4
-		if d > cap {
-			d = cap
+		if d > maxMs {
+			d = maxMs
 		}
 		return d
 	}

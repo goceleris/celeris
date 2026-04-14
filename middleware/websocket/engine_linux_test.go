@@ -101,7 +101,9 @@ func TestNativeEngineEcho(t *testing.T) {
 			// 100 sequential round-trips.
 			for i := 0; i < 100; i++ {
 				msg := []byte("native-" + strconv.Itoa(i))
-				client.writeClientFrame(true, OpText, msg)
+				if err := client.writeClientFrame(true, OpText, msg); err != nil {
+					t.Fatalf("iter %d: write: %v", i, err)
+				}
 				_, op, resp := client.readServerFrame(t)
 				if op != OpText || string(resp) != string(msg) {
 					t.Fatalf("iter %d: op=%d resp=%q want %q", i, op, resp, msg)
@@ -109,7 +111,9 @@ func TestNativeEngineEcho(t *testing.T) {
 			}
 
 			// Ping/pong.
-			client.writeClientFrame(true, OpPing, []byte("hi"))
+			if err := client.writeClientFrame(true, OpPing, []byte("hi")); err != nil {
+				t.Fatalf("ping write: %v", err)
+			}
 			_, op, data := client.readServerFrame(t)
 			if op != OpPong || string(data) != "hi" {
 				t.Fatalf("ping reply: op=%d data=%q", op, data)
@@ -117,7 +121,9 @@ func TestNativeEngineEcho(t *testing.T) {
 
 			// Binary echo.
 			bin := []byte{0, 1, 2, 3, 0xff}
-			client.writeClientFrame(true, OpBinary, bin)
+			if err := client.writeClientFrame(true, OpBinary, bin); err != nil {
+				t.Fatalf("binary write: %v", err)
+			}
 			_, op, data = client.readServerFrame(t)
 			if op != OpBinary || len(data) != len(bin) {
 				t.Fatalf("binary: op=%d len=%d", op, len(data))
@@ -152,7 +158,9 @@ func TestNativeEngineLargePayload(t *testing.T) {
 			for i := range payload {
 				payload[i] = byte(i)
 			}
-			client.writeClientFrame(true, OpBinary, payload)
+			if err := client.writeClientFrame(true, OpBinary, payload); err != nil {
+				t.Fatalf("write: %v", err)
+			}
 			_, _, resp := client.readServerFrame(t)
 			if len(resp) != len(payload) {
 				t.Fatalf("got %d bytes, want %d", len(resp), len(payload))
@@ -189,7 +197,9 @@ func TestNativeEngineCompression(t *testing.T) {
 			client.upgradeWithCompression(t, "/ws")
 
 			text := strings.Repeat("compress me native! ", 50)
-			client.writeClientFrame(true, OpText, []byte(text))
+			if err := client.writeClientFrame(true, OpText, []byte(text)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
 			_, op, _ := client.readServerFrame(t)
 			if op != OpText {
 				t.Errorf("op = %d", op)
@@ -258,7 +268,7 @@ func TestNativeEngineWriteErrorPropagation(t *testing.T) {
 			if tc, ok := client.conn.(*net.TCPConn); ok {
 				_ = tc.SetLinger(0)
 			}
-			client.conn.Close()
+			_ = client.conn.Close()
 
 			select {
 			case err := <-readErr:
@@ -311,9 +321,11 @@ func TestNativeEngineBackpressure(t *testing.T) {
 			// Flood with 200 small messages — far above the 32-slot buffer.
 			const total = 200
 			for i := 0; i < total; i++ {
-				client.writeClientFrame(true, OpText, []byte("flood"))
+				if err := client.writeClientFrame(true, OpText, []byte("flood")); err != nil {
+					t.Fatalf("flood write %d: %v", i, err)
+				}
 			}
-			client.bw.Flush()
+			_ = client.bw.Flush()
 
 			// Give the slow handler time to process them all.
 			deadline := time.Now().Add(5 * time.Second)
@@ -323,7 +335,7 @@ func TestNativeEngineBackpressure(t *testing.T) {
 
 			// Close the client cleanly so the handler returns and we can
 			// inspect the dropped counter.
-			client.conn.Close()
+			_ = client.conn.Close()
 			wg.Wait()
 
 			if processed.Load() != total {
@@ -335,4 +347,3 @@ func TestNativeEngineBackpressure(t *testing.T) {
 		})
 	}
 }
-

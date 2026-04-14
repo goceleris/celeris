@@ -83,14 +83,14 @@ type Worker struct {
 	tickCounter uint32
 	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
-	dirtyHead     *connState // head of intrusive doubly-linked dirty list
-	hasBufReturns bool       // set when provided buffers need publishing
-	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
-	h2Conns       []int      // FDs of H2 connections (for write queue polling)
-	h2EventFD     int        // eventfd for H2 write queue wakeup (-1 if unavailable)
-	h2PollArmed   bool       // true when POLL_ADD is active on h2EventFD
-	h2cfg         conn.H2Config
-	emptyIters    uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
+	dirtyHead      *connState // head of intrusive doubly-linked dirty list
+	hasBufReturns  bool       // set when provided buffers need publishing
+	sendsPending   bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2Conns        []int      // FDs of H2 connections (for write queue polling)
+	h2EventFD      int        // eventfd for H2 write queue wakeup (-1 if unavailable)
+	h2PollArmed    bool       // true when POLL_ADD is active on h2EventFD
+	h2cfg          conn.H2Config
+	emptyIters     uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
 	detachQueue    []*connState
 	detachQMu      sync.Mutex
 	detachQSpare   []*connState
@@ -514,21 +514,21 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	if w.dirtyHead != nil {
 		return 0
 	}
-	cap := 100 * time.Millisecond
+	maxWait := 100 * time.Millisecond
 	if w.detachedCount > 0 {
-		cap = 50 * time.Millisecond
+		maxWait = 50 * time.Millisecond
 	}
 	switch {
 	case w.emptyIters <= 10:
 		return 1 * time.Millisecond
 	case w.emptyIters <= 100:
 		d := 5 * time.Millisecond
-		if d > cap {
-			d = cap
+		if d > maxWait {
+			d = maxWait
 		}
 		return d
 	default:
-		return cap
+		return maxWait
 	}
 }
 
