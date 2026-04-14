@@ -96,6 +96,11 @@ type Conn struct {
 	headers [][2]string
 
 	subprotocol string
+
+	// cachedIP holds the parsed peer IP (host part of RemoteAddr).
+	// Computed lazily on first IP() call so per-message logging loops
+	// don't re-parse RemoteAddr.String() on every iteration.
+	cachedIP string
 }
 
 // newConn creates a Conn from a raw net.Conn (hijack path — used by std engine).
@@ -813,8 +818,13 @@ func (c *Conn) BackpressureDropped() uint64 {
 	return c.engineReader.Dropped()
 }
 
-// IP returns the remote IP address (without port).
+// IP returns the remote IP address (without port). The result is cached
+// after the first call so per-message log loops don't re-parse
+// RemoteAddr().String() on every iteration.
 func (c *Conn) IP() string {
+	if c.cachedIP != "" {
+		return c.cachedIP
+	}
 	if c.conn == nil {
 		return ""
 	}
@@ -824,9 +834,11 @@ func (c *Conn) IP() string {
 	}
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return addr.String()
+		c.cachedIP = addr.String()
+	} else {
+		c.cachedIP = host
 	}
-	return host
+	return c.cachedIP
 }
 
 // Locals returns a per-connection value. Safe for concurrent use.

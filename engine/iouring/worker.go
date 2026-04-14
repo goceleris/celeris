@@ -229,7 +229,11 @@ func (w *Worker) run(ctx context.Context) {
 		// reference to the underlying file, allowing the socket to leave the
 		// SO_REUSEPORT group immediately. Without this, unix.Close alone
 		// leaves a phantom socket that intercepts connections.
-		if w.listenFD >= 0 && w.acceptPaused.Load() {
+		// Cache the atomic load: same value used by the two branches
+		// below and (further down) the SUSPENDED check. Saves 2 atomic
+		// loads per event-loop iteration on the steady-state hot path.
+		paused := w.acceptPaused.Load()
+		if w.listenFD >= 0 && paused {
 			if sqe := w.ring.GetSQE(); sqe != nil {
 				prepCancelFDSkipSuccess(sqe, w.listenFD)
 				setSQEUserData(sqe, 0)
@@ -254,7 +258,7 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
-		if w.listenFD < 0 && !w.acceptPaused.Load() {
+		if w.listenFD < 0 && !paused {
 			fd, err := createListenSocket(w.cfg.Addr)
 			if err != nil {
 				w.logger.Error("re-create listen socket", "worker", w.id, "err", err)

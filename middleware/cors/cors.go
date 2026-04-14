@@ -112,6 +112,10 @@ func New(config ...Config) celeris.HandlerFunc {
 // valid headers remain.
 func validateMirroredHeaders(raw string) string {
 	var b strings.Builder
+	// Grow upfront — output is at most as long as input. Avoids the
+	// initial 0→64→128 byte reallocations during append on common
+	// preflights (e.g. "authorization, content-type, x-trace-id").
+	b.Grow(len(raw))
 	count := 0
 	for raw != "" {
 		var name string
