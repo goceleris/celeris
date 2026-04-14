@@ -109,11 +109,15 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 				// Read the snapshot captured by Detach's done() callback
 				// to avoid racing late writes from a handler that touched
 				// the Context after calling done().
-				status := c.detachStatus
-				if status == 0 {
-					status = 200
+				status := 200
+				var elapsed time.Duration
+				if snap := c.detachSnap; snap != nil {
+					if snap.status != 0 {
+						status = snap.status
+					}
+					elapsed = snap.elapsed
 				}
-				a.server.collector.RecordRequest(c.detachElapsed, status)
+				a.server.collector.RecordRequest(elapsed, status)
 			}
 			releaseContext(c)
 		}()

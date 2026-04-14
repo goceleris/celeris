@@ -129,13 +129,16 @@ type Context struct {
 
 	detached   bool
 	detachDone chan struct{}
-	// detachStatus + detachElapsed are snapshotted by the done() callback
-	// returned from Detach so the recoverAndRelease goroutine can read
-	// final status/latency without racing late writes from a handler that
-	// touches the Context after calling done() (which is a contract bug
-	// but happens in practice with deferred logging).
-	detachStatus  int
-	detachElapsed time.Duration
+	// detachSnap is allocated only when Detach() runs and stores the
+	// status + elapsed snapshot captured by done() so the metrics
+	// goroutine can read final values without racing late writes from
+	// a handler that touches the Context after calling done()
+	// (contract violation but seen in practice with deferred logger
+	// blocks). Heap allocation is acceptable here because Detach is
+	// the slow path; the alternative — embedding the fields directly —
+	// grows every pooled Context by 24 bytes and pessimizes the H1/H2
+	// hot path through cache pressure.
+	detachSnap *detachSnapshot
 
 	extended bool // true when keys/query/cookie/form/capture/buffer/detach/overrides were used
 
@@ -389,8 +392,7 @@ func (c *Context) reset() {
 		c.streamWriter = nil
 		c.detached = false
 		c.detachDone = nil
-		c.detachStatus = 0
-		c.detachElapsed = 0
+		c.detachSnap = nil
 		c.clientIPOverride = ""
 		c.schemeOverride = ""
 		c.hostOverride = ""
@@ -400,4 +402,12 @@ func (c *Context) reset() {
 		c.onRelease = c.onReleaseBuf[:0]
 		c.extended = false
 	}
+}
+
+// detachSnapshot captures the response status and request elapsed time
+// at the moment a detached handler signals completion via Detach's
+// returned done(). Allocated lazily so non-detached requests pay no cost.
+type detachSnapshot struct {
+	status  int
+	elapsed time.Duration
 }

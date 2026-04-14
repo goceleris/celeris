@@ -995,21 +995,29 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 
 // completeSend processes a send result after the buffer is safe to modify.
 // Called directly for regular SEND, or from the NOTIF handler for SEND_ZC.
+//
+// For detached connections, cs.sendBuf is read by the makeWriteFn closure
+// running on the user's goroutine (back-pressure check at line 1222).
+// All cs.sendBuf mutations below MUST be guarded by detachMu when one
+// exists, otherwise the goroutine read races the event-loop write —
+// observed via -race in TestNativeEngineLargePayload/io_uring.
 func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	cs.sending = false
+
+	// Take the lock up-front for detached connections so the entire
+	// state mutation (sendBuf truncate / writeBuf reset / OnError fire)
+	// is serialized against the goroutine writeFn path.
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
 
 	if sent < 0 {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
 		cs.writeBuf = cs.writeBuf[:0]
 		if cs.h1State != nil && cs.h1State.OnError != nil {
 			cs.h1State.OnError(errIORingSend(int32(sent)))
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
 		}
 		if cs.closing {
 			w.finishClose(fd)
@@ -1027,23 +1035,15 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	} else {
 		cs.sendBuf = cs.sendBuf[:0]
 	}
-
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-	}
+	// detachMu (if any) is held by the deferred unlock at the top of
+	// the function — no per-branch Unlock needed below.
 	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
 		w.finishClose(fd)
 		return
 	}
 
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
 		if cs.needsRecv && !cs.recvPaused {
 			if w.prepareRecv(fd, cs.buf) {
 				cs.needsRecv = false
@@ -1058,11 +1058,9 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	}
 
 	// Re-send remainder or flush new data. Only markDirty on SQ ring full.
+	// detachMu (if any) is held by the deferred unlock at the top.
 	if w.flushSend(cs) {
 		w.markDirty(cs)
-	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Unlock()
 	}
 }
 

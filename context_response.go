@@ -735,9 +735,10 @@ func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
 // closes a detached connection (timeout, error, shutdown). This allows
 // the WebSocket middleware to unblock its handler goroutine.
 //
-// Must be called AFTER [Context.Detach] — before Detach the engine has
-// not installed the underlying H1State.OnDetachClose plumbing and this
-// call is a silent no-op.
+// May be called either before or after [Context.Detach] — the underlying
+// H1State.OnDetachClose field is just stored; the engine reads it when
+// firing the close. Installing it BEFORE Detach is preferred so a peer
+// RST landing in the Detach race window is not lost.
 func (c *Context) SetWSDetachClose(fn func()) {
 	if c.stream.OnWSDetachClose != nil {
 		c.stream.OnWSDetachClose(fn)
@@ -757,8 +758,10 @@ func (c *Context) WSRawWriteFn() func([]byte) {
 // SetWSErrorHandler installs a handler called by the engine when an I/O
 // failure occurs on this detached connection. The WebSocket middleware uses
 // this to surface engine-side errors from the next user-level Read or Write
-// call. Must be called AFTER [Context.Detach]. No-op on engines that do not
-// support engine-integrated WebSocket (e.g. std).
+// call. May be called either before or after [Context.Detach] — installing
+// BEFORE Detach is preferred so a pre-existing peer RST landing in the
+// Detach race window is not lost. No-op on engines that do not support
+// engine-integrated WebSocket (e.g. std).
 func (c *Context) SetWSErrorHandler(fn func(error)) {
 	if c.stream.OnWSSetError != nil {
 		c.stream.OnWSSetError(fn)
@@ -826,9 +829,13 @@ func (c *Context) Detach() (done func()) {
 		// Snapshot status + elapsed BEFORE close so the metrics goroutine
 		// can read these without racing late writes from a handler that
 		// touches Context fields after calling done() (contract violation
-		// but observed in practice with deferred logger blocks).
-		c.detachStatus = c.statusCode
-		c.detachElapsed = time.Since(c.startTime)
+		// but observed in practice with deferred logger blocks). Heap-
+		// allocated only on the Detach slow path so non-detached requests
+		// don't pay the field cost in every pooled Context.
+		c.detachSnap = &detachSnapshot{
+			status:  c.statusCode,
+			elapsed: time.Since(c.startTime),
+		}
 		close(ch)
 	}
 }
