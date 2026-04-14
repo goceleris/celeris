@@ -48,7 +48,22 @@ func New(config ...Config) celeris.HandlerFunc {
 		if entry, ok := g.m[key]; ok {
 			// Waiter path: another request is already in-flight for this key.
 			g.mu.Unlock()
-			entry.wg.Wait()
+			// Race the leader's WaitGroup against the request context so a
+			// timeout middleware (or upstream client cancel) can preempt the
+			// wait instead of blocking until the leader returns. Without
+			// this, timeout(preemptive) → singleflight(waiter) deadlocks
+			// when the leader exceeds the deadline because the timeout
+			// goroutine sits inside wg.Wait() with no way out.
+			waitDone := make(chan struct{})
+			go func() {
+				entry.wg.Wait()
+				close(waitDone)
+			}()
+			select {
+			case <-waitDone:
+			case <-c.Context().Done():
+				return c.Context().Err()
+			}
 
 			if entry.panicVal != nil {
 				panic(entry.panicVal)

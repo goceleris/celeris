@@ -50,6 +50,12 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
+		// Defensive OPTIONS skip: CORS preflight must not be auth-blocked
+		// regardless of middleware-installation order.
+		if c.Method() == "OPTIONS" {
+			return c.Next()
+		}
+
 		user, pass, ok := c.BasicAuth()
 		if !ok {
 			return errorHandler(c, ErrUnauthorized)

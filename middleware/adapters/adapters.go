@@ -39,6 +39,7 @@ func WrapMiddleware(mw func(http.Handler) http.Handler) celeris.HandlerFunc {
 
 		var nextCalled bool
 		var nextErr error
+		var nextPanic any
 
 		inner := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			nextCalled = true
@@ -49,6 +50,15 @@ func WrapMiddleware(mw func(http.Handler) http.Handler) celeris.HandlerFunc {
 					c.AddHeader(lk, v)
 				}
 			}
+			// Catch panics from the celeris chain so the stdlib middleware's
+			// own recover() (if any) can't swallow them. Re-panic AFTER
+			// wrapped.ServeHTTP returns so celeris recovery middleware sees
+			// the original value.
+			defer func() {
+				if r := recover(); r != nil {
+					nextPanic = r
+				}
+			}()
 			nextErr = c.Next()
 		})
 
@@ -56,6 +66,10 @@ func WrapMiddleware(mw func(http.Handler) http.Handler) celeris.HandlerFunc {
 
 		req := buildRequest(c)
 		wrapped.ServeHTTP(rec, req)
+
+		if nextPanic != nil {
+			panic(nextPanic)
+		}
 
 		if nextCalled {
 			return nextErr

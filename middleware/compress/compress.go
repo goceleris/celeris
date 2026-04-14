@@ -163,6 +163,20 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		c.SetResponseBody(compressed)
 		c.SetHeader("content-encoding", encoding)
+		// If a downstream handler or middleware (etag/static) set a strong
+		// ETag, weakify it: that tag was computed over the uncompressed
+		// body but the wire now carries the compressed form. RFC 7232 §2.3
+		// says strong validators must match byte-for-byte, including
+		// Content-Encoding — replaying the original tag against the
+		// compressed payload would corrupt cache validation. The weak
+		// "W/" prefix tells the client the tag describes payload semantics,
+		// not octet identity.
+		for _, h := range c.ResponseHeaders() {
+			if h[0] == "etag" && len(h[1]) > 0 && h[1][0] != 'W' {
+				c.SetHeader("etag", "W/"+h[1])
+				break
+			}
+		}
 		if ferr := flushWithVary(); ferr != nil && err == nil {
 			err = ferr
 		}

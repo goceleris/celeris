@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
@@ -699,6 +700,15 @@ func (c *Context) Hijack() (net.Conn, error) {
 //
 // The callback is invoked on the engine's event loop thread and must not
 // block. Typically it writes to an [io.PipeWriter].
+//
+// Call ordering for engine-integrated WebSocket setup:
+//  1. UpgradeWebSocket(deliveryFn) — installs the data callback
+//  2. SetWSErrorHandler / SetWSIdleDeadline / SetWSDetachClose
+//     (optional, but install BEFORE Detach to avoid losing pre-existing
+//     engine errors that fire as soon as Detach completes)
+//  3. Detach() — engine takes ownership of the connection
+//  4. WSRawWriteFn() — returns the raw write fn (Hijack-like; nil before Detach)
+//  5. WSReadPauser() — returns engine pause/resume callbacks (after Detach)
 func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
 	if c.stream.OnWSUpgrade == nil {
 		return false
@@ -710,6 +720,10 @@ func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
 // SetWSDetachClose installs a callback that the engine invokes when it
 // closes a detached connection (timeout, error, shutdown). This allows
 // the WebSocket middleware to unblock its handler goroutine.
+//
+// Must be called AFTER [Context.Detach] — before Detach the engine has
+// not installed the underlying H1State.OnDetachClose plumbing and this
+// call is a silent no-op.
 func (c *Context) SetWSDetachClose(fn func()) {
 	if c.stream.OnWSDetachClose != nil {
 		c.stream.OnWSDetachClose(fn)
@@ -794,7 +808,15 @@ func (c *Context) Detach() (done func()) {
 	}
 	ch := make(chan struct{})
 	c.detachDone = ch
-	return func() { close(ch) }
+	return func() {
+		// Snapshot status + elapsed BEFORE close so the metrics goroutine
+		// can read these without racing late writes from a handler that
+		// touches Context fields after calling done() (contract violation
+		// but observed in practice with deferred logger blocks).
+		c.detachStatus = c.statusCode
+		c.detachElapsed = time.Since(c.startTime)
+		close(ch)
+	}
 }
 
 // StreamWriter provides incremental response writing. Obtained via [Context.StreamWriter].

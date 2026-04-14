@@ -165,8 +165,21 @@ func (w *engineWriter) Write(p []byte) (int, error) {
 	if w.conn.closed.Load() {
 		return 0, ErrWriteClosed
 	}
+	if w.conn.engineWriteFn == nil {
+		// Conn was constructed pre-Detach (race-window safety in
+		// tryEngineUpgrade); the WS handler must not write before
+		// setRawWrite has been called.
+		return 0, ErrWriteClosed
+	}
 	w.conn.engineWriteFn(p)
 	return len(p), nil
+}
+
+// setRawWrite finishes wiring the engine raw-write function into the
+// Conn. Used by tryEngineUpgrade to install the engine-provided rawWrite
+// AFTER OnError is registered, so a pre-Detach race cannot lose errors.
+func (c *Conn) setRawWrite(fn func([]byte)) {
+	c.engineWriteFn = fn
 }
 
 func (c *Conn) lockWrite()   { <-c.writeSem }

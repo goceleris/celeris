@@ -67,6 +67,12 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
+		// Defensive OPTIONS skip: CORS preflight must not be auth-blocked
+		// regardless of middleware-installation order.
+		if c.Method() == "OPTIONS" {
+			return c.Next()
+		}
+
 		key := extract(c)
 		if key == "" {
 			return handleError(c, ErrMissingKey)

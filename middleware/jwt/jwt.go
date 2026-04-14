@@ -95,6 +95,15 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
+		// Defensive OPTIONS skip: CORS preflight must not be auth-blocked
+		// regardless of middleware-installation order. If cors runs before
+		// jwt (the recommended order), preflights short-circuit before
+		// reaching here. If a misconfiguration puts auth ahead of cors,
+		// this lets the preflight through to cors.
+		if c.Method() == "OPTIONS" {
+			return c.Next()
+		}
+
 		tokenStr := extractor(c)
 		if tokenStr == "" {
 			return handleError(c, ErrTokenMissing)

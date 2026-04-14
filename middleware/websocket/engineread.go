@@ -68,17 +68,22 @@ func newChanReader(capacity, highPct, lowPct int) *chanReader {
 		highWater: capacity * highPct / 100,
 		lowWater:  capacity * lowPct / 100,
 	}
+	// Single-pass clamp: highWater must be ≥ 1, lowWater must satisfy
+	// 0 < lowWater < highWater so resume always has somewhere to fire.
+	// Two pathological edges to handle:
+	//   capacity=1 → highWater=1, lowWater=0 → lowWater forced to 0 then
+	//                clamped to highWater-1 = 0. OK, resume on empty.
+	//   highPct≈lowPct → both round to the same value; lowWater needs to
+	//                be strictly less than highWater for the read-side
+	//                "drained" signal to fire.
 	if r.highWater < 1 {
 		r.highWater = 1
 	}
-	if r.lowWater < 1 {
-		r.lowWater = 1
-	}
-	// Ensure lowWater < highWater to prevent pause/resume thrashing on
-	// very small capacities (e.g., capacity=2 gives highWater=1, lowWater=1
-	// without this guard).
 	if r.lowWater >= r.highWater {
 		r.lowWater = r.highWater - 1
+	}
+	if r.lowWater < 0 {
+		r.lowWater = 0
 	}
 	return r
 }

@@ -114,6 +114,13 @@ type Context struct {
 
 	detached   bool
 	detachDone chan struct{}
+	// detachStatus + detachElapsed are snapshotted by the done() callback
+	// returned from Detach so the recoverAndRelease goroutine can read
+	// final status/latency without racing late writes from a handler that
+	// touches the Context after calling done() (which is a contract bug
+	// but happens in practice with deferred logging).
+	detachStatus  int
+	detachElapsed time.Duration
 
 	extended bool // true when keys/query/cookie/form/capture/buffer/detach/overrides were used
 
@@ -367,6 +374,8 @@ func (c *Context) reset() {
 		c.streamWriter = nil
 		c.detached = false
 		c.detachDone = nil
+		c.detachStatus = 0
+		c.detachElapsed = 0
 		c.clientIPOverride = ""
 		c.schemeOverride = ""
 		c.hostOverride = ""

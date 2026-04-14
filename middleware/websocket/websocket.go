@@ -217,26 +217,38 @@ func tryEngineUpgrade(c *celeris.Context, acceptKey, subproto string,
 		return nil, nil
 	}
 
-	// Detach FIRST to install the guarded writeFn and engine pause/resume.
+	// Pre-construct the Conn shell so the error handler installed
+	// BEFORE Detach has a stable place to record write errors. After
+	// Detach, the engine may immediately call OnError (e.g. a pre-
+	// existing peer RST race window between UpgradeWebSocket and the
+	// caller-visible Conn); installing the handler ahead of Detach
+	// avoids losing that error.
+	ctx, cancel := context.WithCancel(c.Context())
+	ws := newEngineConn(ctx, cancel, reader, nil, readBufSize) // rawWrite filled after Detach
+	ws.readLimit = readLimit
+	ws.subprotocol = subproto
+
+	c.SetWSErrorHandler(func(err error) {
+		ws.writeErr.Store(err)
+		reader.closeWith(err)
+	})
+
+	// Detach installs the guarded writeFn and engine pause/resume hooks.
 	done := c.Detach()
 
-	// Get the raw write function (bypasses chunked encoding).
+	// Get the raw write function (bypasses chunked encoding) and finish
+	// wiring it into the Conn.
 	rawWrite := c.WSRawWriteFn()
 	if rawWrite == nil {
 		reader.closeWith(io.EOF)
 		done()
 		return nil, nil
 	}
+	ws.setRawWrite(rawWrite)
 
 	// Write the 101 response using raw write (no chunked encoding).
 	resp := buildUpgradeResponse(acceptKey, subproto, compress)
 	rawWrite(resp)
-
-	// Create engine-integrated Conn.
-	ctx, cancel := context.WithCancel(c.Context())
-	ws := newEngineConn(ctx, cancel, reader, rawWrite, readBufSize)
-	ws.readLimit = readLimit
-	ws.subprotocol = subproto
 
 	// Wire engine pause/resume into the chanReader for TCP-level
 	// backpressure. The engine applies pause/resume asynchronously via
@@ -244,13 +256,6 @@ func tryEngineUpgrade(c *celeris.Context, acceptKey, subproto string,
 	if pause, resume := c.WSReadPauser(); pause != nil && resume != nil {
 		reader.SetPauser(pause, resume)
 	}
-
-	// Surface engine-side I/O failures (read/write/EPIPE/ECONNRESET) into
-	// the WS conn so the next user-level Read or Write returns the cause.
-	c.SetWSErrorHandler(func(err error) {
-		ws.writeErr.Store(err)
-		reader.closeWith(err)
-	})
 
 	// Idle timeout on the engine path: store a closure the WS conn calls
 	// after each successful frame read to extend the deadline.

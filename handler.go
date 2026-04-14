@@ -92,11 +92,14 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		go func() {
 			<-c.detachDone
 			if a.server.collector != nil {
-				status := c.statusCode
+				// Read the snapshot captured by Detach's done() callback
+				// to avoid racing late writes from a handler that touched
+				// the Context after calling done().
+				status := c.detachStatus
 				if status == 0 {
 					status = 200
 				}
-				a.server.collector.RecordRequest(time.Since(c.startTime), status)
+				a.server.collector.RecordRequest(c.detachElapsed, status)
 			}
 			releaseContext(c)
 		}()
