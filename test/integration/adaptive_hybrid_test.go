@@ -286,8 +286,23 @@ func TestAdaptiveResourceCleanup(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	// Send some traffic.
-	for range 5 {
+	// Send some traffic. First request retries on io_uring stabilization
+	// resets (ACCEPT_DIRECT EINVAL surfaces as connection reset); mirrors
+	// the pattern in TestAdaptiveAutoSingleWorker.
+	var firstResp *http.Response
+	deadline2 := time.Now().Add(5 * time.Second)
+	for {
+		firstResp, err = client.Get("http://" + addr + "/cleanup-test")
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline2) {
+			t.Fatalf("first request failed after retries: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = firstResp.Body.Close()
+	for range 4 {
 		resp, err := client.Get("http://" + addr + "/cleanup-test")
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
