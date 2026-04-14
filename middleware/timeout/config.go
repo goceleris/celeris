@@ -44,6 +44,13 @@ type Config struct {
 	// captures the full response in memory, defeating streaming and
 	// potentially causing OOM on large payloads. Use non-preemptive
 	// mode (the default) for streaming endpoints.
+	//
+	// Cost: preemptive mode allocates a goroutine and a context.WithTimeout
+	// per request — measurable at very high RPS (~1-3% throughput on
+	// the reference benchmark suite). Reach for it only when you
+	// genuinely need to interrupt CPU-bound or blocking handlers; the
+	// non-preemptive default uses a single context.WithTimeout and lets
+	// handlers cooperatively check c.Context().Done().
 	Preemptive bool
 
 	// TimeoutErrors lists errors that should be treated as timeouts even

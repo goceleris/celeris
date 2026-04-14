@@ -92,6 +92,16 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
+		// Streaming protocols are incompatible with response buffering.
+		// SSE produces incremental events; WebSocket upgrades the
+		// connection. Detect both before BufferResponse otherwise the
+		// downstream handler's StreamWriter() returns nil (because
+		// bufferDepth > 0) and the request fails with 500.
+		if isStreamingRequest(c) {
+			c.AddHeader("vary", "Accept-Encoding")
+			return c.Next()
+		}
+
 		encoding := c.AcceptsEncodings(encodings...)
 		if encoding == "" {
 			// No matching encoding. Still add Vary so caches know the
@@ -348,4 +358,25 @@ func compressDeflate(body []byte, pool *sync.Pool, bufPool *sync.Pool) ([]byte, 
 
 func compressZstd(body []byte, enc *zstd.Encoder) ([]byte, error) {
 	return enc.EncodeAll(body, nil), nil
+}
+
+// isStreamingRequest detects requests whose responses must not be buffered
+// by this middleware: SSE (Accept: text/event-stream) and WebSocket
+// upgrades (Upgrade: websocket). Both rely on c.StreamWriter() / Hijack
+// flows that fail when bufferDepth > 0.
+func isStreamingRequest(c *celeris.Context) bool {
+	if accept := c.Header("accept"); accept != "" {
+		// Plain comparison rather than full media-type parsing — SSE
+		// uses exactly "text/event-stream"; clients may add q-values
+		// or list other types alongside it.
+		if strings.Contains(accept, "text/event-stream") {
+			return true
+		}
+	}
+	if upg := c.Header("upgrade"); upg != "" {
+		if strings.EqualFold(upg, "websocket") {
+			return true
+		}
+	}
+	return false
 }

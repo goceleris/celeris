@@ -68,6 +68,10 @@ type Server struct {
 
 	startOnce sync.Once
 	startErr  error
+
+	// routesRegistered is set the first time handle() runs. Use() panics if
+	// it sees this true (see Use godoc for rationale).
+	routesRegistered bool
 }
 
 // New creates a Server with the given configuration.
@@ -85,6 +89,7 @@ func New(cfg Config) *Server {
 }
 
 func (s *Server) handle(method, path string, handlers ...HandlerFunc) *Route {
+	s.routesRegistered = true
 	chain := make([]HandlerFunc, 0, len(s.middleware)+len(handlers))
 	chain = append(chain, s.middleware...)
 	chain = append(chain, handlers...)
@@ -103,8 +108,13 @@ func (s *Server) loadEngine() engine.Engine {
 
 // Use registers global middleware that runs before every route handler.
 // Middleware executes in registration order. Middleware chains are composed
-// at route registration time, so Use must be called before registering routes.
+// at route registration time, so Use must be called before registering routes;
+// calling it after panics to surface the silent-divergence bug
+// (some routes would have the middleware, others would not).
 func (s *Server) Use(middleware ...HandlerFunc) *Server {
+	if s.routesRegistered {
+		panic("celeris: Server.Use called after routes were registered — chains were already baked at handle() time, so this Use call would only apply to routes registered hereafter and produce silently inconsistent middleware coverage. Move Use calls before any GET/POST/etc.")
+	}
 	s.middleware = append(s.middleware, middleware...)
 	return s
 }

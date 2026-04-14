@@ -721,14 +721,30 @@ func (c *Conn) writeCloseProtocol(code int, text string) {
 }
 
 // GracefulClose sends a close frame and waits for the peer's response.
+//
+// On the hijack path the deadline is enforced via net.Conn.SetReadDeadline.
+// On the engine path (chanReader-backed reads) net.Conn is nil, so a
+// time.AfterFunc closes the engineReader to unblock ReadMessageReuse if
+// the peer never sends its close frame.
 func (c *Conn) GracefulClose(code int, text string) error {
 	err := c.writeCloseFrame(code, text)
 	if err != nil {
 		return c.Close()
 	}
-	// Set a deadline for the close response.
+	deadline := time.Now().Add(closeTimeout)
 	if c.conn != nil {
-		_ = c.conn.SetReadDeadline(time.Now().Add(closeTimeout))
+		_ = c.conn.SetReadDeadline(deadline)
+	}
+	var watchdog *time.Timer
+	if c.engineReader != nil {
+		watchdog = time.AfterFunc(closeTimeout, func() {
+			c.engineReader.closeWith(io.EOF)
+		})
+		// Engine path also asks the engine's idle sweep to close the
+		// connection on schedule; redundant with the watchdog but cheap.
+		if c.idleDeadlineFn != nil {
+			c.idleDeadlineFn(deadline.UnixNano())
+		}
 	}
 	// Read until we get the close response or deadline.
 	for {
@@ -736,6 +752,9 @@ func (c *Conn) GracefulClose(code int, text string) error {
 		if rerr != nil {
 			break
 		}
+	}
+	if watchdog != nil {
+		watchdog.Stop()
 	}
 	return c.Close()
 }
