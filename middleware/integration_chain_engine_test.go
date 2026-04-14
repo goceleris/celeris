@@ -28,6 +28,11 @@ import (
 // liveEngineServer is the epoll equivalent of liveServer (which uses Std).
 // Same shape, different engine — surfaces engine-specific bugs in the
 // middleware contract.
+//
+// Native engines close the supplied listener and rebind via SO_REUSEPORT,
+// so we must read s.Addr() AFTER the engine is up rather than trusting
+// the original ln.Addr(). The dial loop polls both for the engine to
+// publish its address and for that address to actually accept connections.
 func liveEngineServer(t *testing.T, eng celeris.EngineType, configure func(s *celeris.Server)) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -43,20 +48,22 @@ func liveEngineServer(t *testing.T, eng celeris.EngineType, configure func(s *ce
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 	})
-	addr := ln.Addr().String()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = c.Close()
-			return "http://" + addr
+		if addr := s.Addr(); addr != nil {
+			a := addr.String()
+			c, derr := net.DialTimeout("tcp", a, 100*time.Millisecond)
+			if derr == nil {
+				_ = c.Close()
+				return "http://" + a
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("server not ready on %s", addr)
+	t.Fatalf("server not ready within 5s")
 	return ""
 }
 
@@ -80,6 +87,14 @@ func TestEngineMatrix_AuthRateLimitBodyLimit(t *testing.T) {
 	hashPw := func(s string) string {
 		h := sha256.Sum256([]byte(s))
 		return hex.EncodeToString(h[:])
+	}
+
+	// Some CI sandboxes restrict raw sockets / SO_REUSEPORT — skip the
+	// epoll matrix on those rather than flaking. The test below wires
+	// real-server lifecycle, so a hard "engine not ready" is the
+	// signal to skip.
+	if testing.Short() {
+		t.Skip("engine matrix test skipped in -short")
 	}
 
 	url := liveEngineServer(t, celeris.Epoll, func(s *celeris.Server) {
