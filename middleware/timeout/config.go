@@ -67,7 +67,10 @@ var defaultConfig = Config{
 }
 
 // ErrServiceUnavailable is returned when the request timeout is exceeded.
-var ErrServiceUnavailable = celeris.NewHTTPError(503, "Service Unavailable")
+// ErrServiceUnavailable aliases [celeris.ErrServiceUnavailable] so
+// callers can match across timeout/circuitbreaker/ratelimit with
+// errors.Is.
+var ErrServiceUnavailable = celeris.ErrServiceUnavailable
 
 func defaultErrorHandler(_ *celeris.Context, _ error) error {
 	return ErrServiceUnavailable

@@ -7,7 +7,9 @@ import (
 )
 
 // ErrUnauthorized is returned when authentication fails.
-var ErrUnauthorized = celeris.NewHTTPError(401, "Unauthorized")
+// ErrUnauthorized aliases [celeris.ErrUnauthorized] so cross-package
+// errors.Is checks work.
+var ErrUnauthorized = celeris.ErrUnauthorized
 
 // New creates a basic auth middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {

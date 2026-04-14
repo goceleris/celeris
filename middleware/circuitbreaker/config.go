@@ -75,8 +75,10 @@ type Config struct {
 	ErrorHandler func(c *celeris.Context, err error) error
 }
 
-// ErrServiceUnavailable is returned when the circuit breaker is open.
-var ErrServiceUnavailable = celeris.NewHTTPError(503, "Service Unavailable")
+// ErrServiceUnavailable aliases [celeris.ErrServiceUnavailable] so
+// callers can match across timeout/circuitbreaker/ratelimit with
+// errors.Is.
+var ErrServiceUnavailable = celeris.ErrServiceUnavailable
 
 var defaultConfig = Config{
 	Threshold:      0.5,

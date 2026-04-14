@@ -545,6 +545,12 @@ func parseRange(header string, size int64) (start, end int64, ok bool) {
 // Stream reads all data from r (capped at 100 MB) and writes it as the
 // response with the given status code and content type. Returns [HTTPError]
 // with status 413 if the data exceeds 100 MB.
+//
+// Despite the name, Stream BUFFERS the entire reader before writing —
+// it is not incremental. Use [Context.StreamWriter] for true streaming
+// responses. The [Context.StreamReader] alias is the preferred name
+// going forward and makes the buffering behavior obvious at the call
+// site; Stream is retained for backwards compatibility.
 func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 	data, err := io.ReadAll(io.LimitReader(r, int64(maxStreamBodySize)+1))
 	if err != nil {
@@ -554,6 +560,14 @@ func (c *Context) Stream(code int, contentType string, r io.Reader) error {
 		return NewHTTPError(413, "stream body exceeds 100MB limit")
 	}
 	return c.Blob(code, contentType, data)
+}
+
+// StreamReader is the preferred name for [Context.Stream] — it makes
+// clear that the entire reader is buffered before writing, vs the
+// truly-incremental [Context.StreamWriter]. Behavior is identical to
+// [Context.Stream].
+func (c *Context) StreamReader(code int, contentType string, r io.Reader) error {
+	return c.Stream(code, contentType, r)
 }
 
 // Negotiate inspects the Accept header and returns the best matching content type

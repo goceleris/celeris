@@ -12,7 +12,9 @@ import (
 )
 
 // ErrUnauthorized is returned when authentication fails.
-var ErrUnauthorized = celeris.NewHTTPError(401, "Unauthorized")
+// ErrUnauthorized aliases [celeris.ErrUnauthorized] so cross-package
+// errors.Is checks work (e.g. mixed jwt+keyauth stacks).
+var ErrUnauthorized = celeris.ErrUnauthorized
 
 // ErrTokenMissing is returned when no token is found in the request.
 var ErrTokenMissing = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: missing or malformed token")}

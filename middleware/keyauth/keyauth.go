@@ -9,7 +9,9 @@ import (
 
 // ErrUnauthorized is returned when the API key is invalid.
 // Do not mutate: this is a shared sentinel value used with errors.Is.
-var ErrUnauthorized = celeris.NewHTTPError(401, "Unauthorized")
+// ErrUnauthorized aliases [celeris.ErrUnauthorized] so cross-package
+// errors.Is checks work.
+var ErrUnauthorized = celeris.ErrUnauthorized
 
 // ErrMissingKey is returned when no API key is found in the request.
 // Do not mutate: this is a shared sentinel value used with errors.Is.

@@ -107,7 +107,19 @@ type Config struct {
 
 	// LimitReached is called when a request is rate-limited.
 	// If nil, returns 429 Too Many Requests.
+	//
+	// Deprecated: use [ErrorHandler] for naming consistency with the
+	// rest of the middleware family (jwt, keyauth, basicauth, csrf,
+	// recovery). LimitReached is kept working for backwards
+	// compatibility; if both fields are set, ErrorHandler wins.
 	LimitReached func(c *celeris.Context) error
+
+	// ErrorHandler is called when a request is rate-limited. The err
+	// argument is the sentinel [ErrTooManyRequests] so callers can
+	// distinguish the cause from other middleware errors via
+	// errors.Is. If nil, falls back to LimitReached, then to a
+	// 429 Too Many Requests default.
+	ErrorHandler func(c *celeris.Context, err error) error
 
 	// MaxDynamicLimiters caps the number of distinct rate strings cached
 	// when RateFunc is used. When exceeded, new rate strings are rejected

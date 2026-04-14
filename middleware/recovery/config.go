@@ -16,7 +16,19 @@ type Config struct {
 	SkipPaths []string
 
 	// ErrorHandler handles the recovered panic value. Default: JSON 500 response.
+	//
+	// Prefer [ErrorHandlerErr] for new code: it receives a concrete
+	// error value (panic-value-as-error wrapped if necessary), which
+	// matches the pattern used by jwt/keyauth/basicauth/csrf and
+	// supports errors.Is / errors.As. ErrorHandler is retained for
+	// backwards compatibility; if both are set, ErrorHandlerErr wins.
 	ErrorHandler func(c *celeris.Context, err any) error
+
+	// ErrorHandlerErr is the error-typed counterpart of [ErrorHandler]
+	// added in v1.3.4 to align with the rest of the auth middleware
+	// family. The middleware wraps non-error panic values with
+	// fmt.Errorf("recovery: panic: %v", r) before invocation.
+	ErrorHandlerErr func(c *celeris.Context, err error) error
 
 	// BrokenPipeHandler handles broken pipe / connection reset panics.
 	// When nil, broken pipe panics are logged at WARN level without a stack

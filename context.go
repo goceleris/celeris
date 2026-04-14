@@ -23,33 +23,47 @@ func init() {
 	}
 }
 
+// The AcquireTestContext / ReleaseTestContext / TestStream / SetTest*
+// / AddTestParam helpers below are low-level building blocks for the
+// celeristest package and other in-tree test infrastructure. End-user
+// tests should reach for [celeristest.NewContext] /
+// [celeristest.NewContextT] and the With* options instead — they
+// build the Context+Stream pair, set up the recorder, and wire
+// t.Cleanup automatically. These primitives are NOT marked Deprecated
+// because celeristest itself depends on them; they are simply not
+// the recommended API for new test code.
+
 // AcquireTestContext returns a Context from the pool, bound to the given Stream.
-// This is intended for test helpers only; production code uses HandleStream.
+// Prefer [celeristest.NewContext] for new code.
 func AcquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
 
 // ReleaseTestContext returns a Context to the pool, firing OnRelease callbacks.
-// This is intended for test helpers only; production code uses releaseContext.
+// Prefer [celeristest.ReleaseContext] for new code.
 func ReleaseTestContext(c *Context) { releaseContext(c) }
 
-// TestStream returns the underlying stream, or nil. Test helpers only.
+// TestStream returns the underlying stream, or nil. Test infrastructure only.
 func TestStream(c *Context) *stream.Stream { return c.stream }
 
 // SetTestStartTime sets the start time on a test context.
 func SetTestStartTime(c *Context, t time.Time) { c.startTime = t }
 
 // SetTestFullPath sets the full path on a test context.
+// Prefer [celeristest.WithFullPath].
 func SetTestFullPath(c *Context, path string) { c.fullPath = path }
 
 // SetTestTrustedNets sets the trusted proxy networks on a test context.
+// Prefer [celeristest.WithTrustedProxies].
 func SetTestTrustedNets(c *Context, nets []*net.IPNet) { c.trustedNets = nets }
 
 // AddTestParam appends a route parameter to a test context.
+// Prefer [celeristest.WithParam].
 func AddTestParam(c *Context, key, value string) {
 	c.params = append(c.params, Param{Key: key, Value: value})
 }
 
 // SetTestHandlers installs a handler chain on a test context, using the
 // inline handlerBuf when the chain is small enough.
+// Prefer [celeristest.WithHandlers].
 func SetTestHandlers(c *Context, handlers []HandlerFunc) {
 	n := len(handlers)
 	if n <= len(c.handlerBuf) {
@@ -63,6 +77,7 @@ func SetTestHandlers(c *Context, handlers []HandlerFunc) {
 }
 
 // SetTestScheme sets the scheme override on a test context.
+// Prefer [celeristest.WithScheme].
 func SetTestScheme(c *Context, scheme string) {
 	c.extended = true
 	c.schemeOverride = scheme
