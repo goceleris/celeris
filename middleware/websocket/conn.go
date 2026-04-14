@@ -53,6 +53,7 @@ type Conn struct {
 	readFrag       Opcode        // opcode of first frame in fragmented message
 	readFragBuf    []byte        // accumulated fragmented payload
 	readCompressed bool          // true if current message had RSV1 (compressed)
+	readUTF8       utf8Stream    // incremental UTF-8 validator (fragmented text messages)
 	idleTimeout    time.Duration // auto read deadline; 0 = disabled
 
 	// Compression state.
@@ -261,6 +262,17 @@ func (c *Conn) readFrameFast() (payload []byte, err error) {
 	}
 
 	// For small frames: try to peek header + payload in one call.
+	//
+	// Uncompressed text (first frame or continuation of a text fragment)
+	// bypasses the all-at-once peek path so readFrameSlow can validate
+	// UTF-8 incrementally as bufio returns each TCP chunk. Without this,
+	// a frame split across multiple TCP writes would only be validated
+	// after the final chunk arrived (Autobahn 6.4.3/4 NON-STRICT).
+	opcodeText := h.Opcode == OpText || (h.Opcode == OpContinuation && c.readFrag == OpText)
+	if opcodeText && !h.RSV1 && !c.readCompressed {
+		return c.readFrameSlow()
+	}
+
 	totalSize := headerSize + int(payLen)
 	if payLen < 126 && totalSize <= 4096 {
 		// Try to get the entire frame in one peek.
@@ -311,6 +323,13 @@ func (c *Conn) readFrameFast() (payload []byte, err error) {
 
 // readFrameSlow reads a frame using multiple io.ReadFull calls (for large
 // frames or when the fast peek path fails).
+//
+// For uncompressed text data — first text frame or a continuation of a
+// text fragmented message — the payload is consumed in bufio-sized
+// chunks and validated incrementally via readUTF8. This lets us fail
+// fast on a TCP-chopped frame (Autobahn 6.4.3/6.4.4 strict behavior):
+// the invalid byte sequence is rejected the moment it arrives rather
+// than after the entire frame has been buffered.
 func (c *Conn) readFrameSlow() ([]byte, error) {
 	h := &c.readHdr
 	if err := readFrameHeader(c.br, c.readBuf, h); err != nil {
@@ -333,6 +352,33 @@ func (c *Conn) readFrameSlow() ([]byte, error) {
 		c.readPayload = make([]byte, n)
 	}
 	payload := c.readPayload[:n]
+
+	streamValidate := !h.RSV1 && !c.readCompressed &&
+		(h.Opcode == OpText || (h.Opcode == OpContinuation && c.readFrag == OpText))
+	if streamValidate {
+		if h.Opcode == OpText {
+			c.readUTF8.reset()
+		}
+		pos := 0
+		for pos < n {
+			got, err := c.br.Read(payload[pos:n])
+			if err != nil {
+				return nil, err
+			}
+			if got == 0 {
+				continue
+			}
+			maskBytesOffset(h.Mask, payload[pos:pos+got], pos)
+			final := (pos+got == n) && h.Fin
+			if !c.readUTF8.feed(payload[pos:pos+got], final) {
+				c.writeCloseProtocol(CloseInvalidPayload, "invalid UTF-8")
+				return nil, ErrInvalidUTF8
+			}
+			pos += got
+		}
+		return payload, nil
+	}
+
 	if _, err := io.ReadFull(c.br, payload); err != nil {
 		return nil, err
 	}
@@ -404,7 +450,7 @@ func (c *Conn) ReadMessageReuse() (MessageType, []byte, error) {
 			c.readCompressed = h.RSV1
 
 			if h.Fin {
-				// Single unfragmented message — decompress if needed.
+				// Single unfragmented message.
 				if c.readCompressed {
 					var err error
 					payload, err = decompressMessage(payload, c.readLimit)
@@ -416,14 +462,23 @@ func (c *Conn) ReadMessageReuse() (MessageType, []byte, error) {
 						}
 						return 0, nil, err
 					}
+					// Compressed text is validated post-decompression; the
+					// streaming UTF-8 pass in readFrameSlow only sees
+					// raw DEFLATE bytes and is therefore skipped for
+					// RSV1 frames.
+					if h.Opcode == OpText && !utf8.Valid(payload) {
+						c.writeCloseProtocol(CloseInvalidPayload, "invalid UTF-8")
+						return 0, nil, ErrInvalidUTF8
+					}
 				}
-				if h.Opcode == OpText && !utf8.Valid(payload) {
-					c.writeCloseProtocol(CloseInvalidPayload, "invalid UTF-8")
-					return 0, nil, ErrInvalidUTF8
-				}
+				// Uncompressed text was already streaming-validated in
+				// readFrameSlow; no redundant scan here.
 				return h.Opcode, payload, nil
 			}
-			// Start of fragmented message.
+			// Start of fragmented message. Uncompressed text is validated
+			// incrementally by readFrameSlow as each TCP chunk arrives
+			// (strict fail-fast behavior for Autobahn 6.4.x); compressed
+			// text defers validation to post-decompression.
 			c.readFrag = h.Opcode
 			c.readFragBuf = append(c.readFragBuf[:0], payload...)
 			continue // read next frame
@@ -465,7 +520,10 @@ func (c *Conn) ReadMessageReuse() (MessageType, []byte, error) {
 			}
 		}
 
-		if op == OpText && !utf8.Valid(msg) {
+		// Uncompressed text was validated incrementally via readUTF8 above;
+		// the final feed(...,Fin=true) already enforced no trailing
+		// truncation. Compressed text needs a post-decompression pass.
+		if op == OpText && c.readCompressed && !utf8.Valid(msg) {
 			c.writeCloseProtocol(CloseInvalidPayload, "invalid UTF-8")
 			return 0, nil, ErrInvalidUTF8
 		}
@@ -507,9 +565,16 @@ func (c *Conn) handleCloseFrame(payload []byte) error {
 		return c.closeHandler(code, text)
 	}
 
-	// Default: echo close frame back.
+	// Default: echo close frame back. RFC 6455 §7.4.1 reserves 1005/1006
+	// as status-code sentinels that MUST NOT appear on the wire, so when
+	// the peer sent an empty-payload close we echo an empty-payload close
+	// (writeCloseFrame treats code==0 as "no payload").
 	if !c.closeSent.Load() {
-		_ = c.writeCloseFrame(code, text)
+		if len(payload) == 0 {
+			_ = c.writeCloseFrame(0, "")
+		} else {
+			_ = c.writeCloseFrame(code, text)
+		}
 	}
 	return &CloseError{Code: code, Text: text}
 }
@@ -765,6 +830,15 @@ func (c *Conn) GracefulClose(code int, text string) error {
 }
 
 // Close closes the underlying connection.
+//
+// On the engine path (net.Conn unavailable), Close asks the engine to
+// drop the FD on its next idle sweep by setting the WS idle deadline to
+// the past. This is the server-side TCP close that RFC 6455 §7.1.1 and
+// Autobahn 7.7.x (requireClean=True) require after the close handshake —
+// without it the peer waits indefinitely for the server FIN. The
+// underlying drain order (drainDetachQueue → flush writes → checkTimeouts
+// → closeConn) guarantees any buffered close-frame echo reaches the wire
+// before the FD is shut down.
 func (c *Conn) Close() error {
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
@@ -778,6 +852,9 @@ func (c *Conn) Close() error {
 	}
 	if c.conn != nil {
 		return c.conn.Close()
+	}
+	if c.idleDeadlineFn != nil {
+		c.idleDeadlineFn(1)
 	}
 	return nil
 }

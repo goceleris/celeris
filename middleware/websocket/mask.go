@@ -48,3 +48,19 @@ func maskBytes(mask [4]byte, b []byte) {
 		b[i] ^= mask[i&3]
 	}
 }
+
+// maskBytesOffset applies the WebSocket XOR mask starting at position
+// `offset` within the mask cycle. Used by streaming frame readers that
+// consume a payload in multiple chunks — each chunk is masked as if its
+// first byte were at index `offset` of the full-frame mask sequence.
+func maskBytesOffset(mask [4]byte, b []byte, offset int) {
+	if len(b) == 0 {
+		return
+	}
+	var rotated [4]byte
+	rotated[0] = mask[offset&3]
+	rotated[1] = mask[(offset+1)&3]
+	rotated[2] = mask[(offset+2)&3]
+	rotated[3] = mask[(offset+3)&3]
+	maskBytes(rotated, b)
+}
