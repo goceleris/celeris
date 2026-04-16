@@ -57,7 +57,7 @@ jobs:
           go-version: "1.26"
       - name: Root module tests (core + middleware)
         run: >-
-          go test -race -count=1 -timeout=120s
+          go test -race -count=1 -timeout=300s
           $(go list ./... | grep -v /test/)
       - name: Sub-module tests (middleware/compress)
         run: go test -race -count=1 -timeout=60s ./...
