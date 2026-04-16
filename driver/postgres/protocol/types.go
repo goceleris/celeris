@@ -467,36 +467,45 @@ func encodeByteaText(dst []byte, v any) ([]byte, error) {
 
 // -------------------- uuid --------------------
 
-func decodeUUIDBinary(src []byte) (driver.Value, error) {
-	if len(src) != 16 {
-		return nil, fmt.Errorf("postgres/protocol: uuid length = %d", len(src))
+// formatUUID formats 16 raw bytes as the canonical RFC 4122 hyphenated hex
+// form, e.g. "550e8400-e29b-41d4-a716-446655440000".
+func formatUUID(src []byte) string {
+	const hex = "0123456789abcdef"
+	var buf [36]byte
+	j := 0
+	for i := 0; i < 16; i++ {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			buf[j] = '-'
+			j++
+		}
+		buf[j] = hex[src[i]>>4]
+		buf[j+1] = hex[src[i]&0x0f]
+		j += 2
 	}
-	out := make([]byte, 16)
-	copy(out, src)
-	return out, nil
+	return string(buf[:])
 }
 
-func decodeUUIDText(src []byte) (driver.Value, error) {
-	// 8-4-4-4-12 form.
+// parseUUID parses the canonical 36-char RFC 4122 form into 16 raw bytes.
+func parseUUID(src []byte) ([16]byte, error) {
+	var out [16]byte
 	if len(src) != 36 {
-		return nil, fmt.Errorf("postgres/protocol: uuid text length = %d", len(src))
+		return out, fmt.Errorf("postgres/protocol: uuid text length = %d", len(src))
 	}
-	out := make([]byte, 16)
 	j := 0
 	for i := 0; i < 36; i++ {
 		if i == 8 || i == 13 || i == 18 || i == 23 {
 			if src[i] != '-' {
-				return nil, fmt.Errorf("postgres/protocol: uuid separator at %d = %q", i, src[i])
+				return out, fmt.Errorf("postgres/protocol: uuid separator at %d = %q", i, src[i])
 			}
 			continue
 		}
 		hi, err := fromHexNibble(src[i])
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		lo, err := fromHexNibble(src[i+1])
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		out[j] = hi<<4 | lo
 		j++
@@ -505,17 +514,47 @@ func decodeUUIDText(src []byte) (driver.Value, error) {
 	return out, nil
 }
 
+func decodeUUIDBinary(src []byte) (driver.Value, error) {
+	if len(src) != 16 {
+		return nil, fmt.Errorf("postgres/protocol: uuid length = %d", len(src))
+	}
+	return formatUUID(src), nil
+}
+
+func decodeUUIDText(src []byte) (driver.Value, error) {
+	// 8-4-4-4-12 form. We validate the structure but return the canonical
+	// lower-case string form for a symmetric roundtrip with the binary path.
+	u, err := parseUUID(src)
+	if err != nil {
+		return nil, err
+	}
+	return formatUUID(u[:]), nil
+}
+
 func encodeUUIDBinary(dst []byte, v any) ([]byte, error) {
 	v, err := resolveValuer(v)
 	if err != nil {
 		return nil, err
 	}
 	switch u := v.(type) {
-	case []byte:
-		if len(u) != 16 {
-			return nil, fmt.Errorf("postgres/protocol: uuid encode len=%d", len(u))
+	case string:
+		parsed, err := parseUUID([]byte(u))
+		if err != nil {
+			return nil, err
 		}
-		return append(dst, u...), nil
+		return append(dst, parsed[:]...), nil
+	case []byte:
+		if len(u) == 16 {
+			return append(dst, u...), nil
+		}
+		if len(u) == 36 {
+			parsed, err := parseUUID(u)
+			if err != nil {
+				return nil, err
+			}
+			return append(dst, parsed[:]...), nil
+		}
+		return nil, fmt.Errorf("postgres/protocol: uuid encode len=%d", len(u))
 	case [16]byte:
 		return append(dst, u[:]...), nil
 	}
@@ -660,7 +699,7 @@ func init() {
 		DecodeText:   decodeUUIDText,
 		EncodeBinary: encodeUUIDBinary,
 		EncodeText:   nil, // uuids go over binary in our driver
-		ScanType:     reflect.TypeOf([]byte(nil)),
+		ScanType:     reflect.TypeOf(""),
 	})
 	RegisterType(&TypeCodec{
 		OID:          OIDJSON,

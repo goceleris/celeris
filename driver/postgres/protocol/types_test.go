@@ -135,11 +135,19 @@ func TestByteaRoundTrip(t *testing.T) {
 }
 
 func TestUUIDRoundTrip(t *testing.T) {
+	// Binary roundtrip: encode 16 raw bytes, decode yields the canonical
+	// RFC 4122 hyphenated string form.
 	u := []byte{0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
 		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
-	got := roundTripBinary(t, OIDUUID, u).([]byte)
-	if !bytes.Equal(got, u) {
-		t.Fatalf("uuid %x -> %x", u, got)
+	const want = "12345678-9abc-def0-1122-334455667788"
+	got := roundTripBinary(t, OIDUUID, u).(string)
+	if got != want {
+		t.Fatalf("uuid bytes -> %q want %q", got, want)
+	}
+	// String roundtrip: encode the canonical form, decode yields the same.
+	gotStr := roundTripBinary(t, OIDUUID, want).(string)
+	if gotStr != want {
+		t.Fatalf("uuid string -> %q want %q", gotStr, want)
 	}
 }
 
