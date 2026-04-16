@@ -17,8 +17,14 @@ const (
 	udClose    uint64 = 0x04 << 56
 	udProvide  uint64 = 0x06 << 56
 	udH2Wakeup uint64 = 0x07 << 56
-	udMask     uint64 = 0xFF << 56
-	fdMask     uint64 = (1 << 56) - 1
+	// Driver tags for EventLoopProvider — kept non-overlapping with HTTP tags
+	// so the main CQE dispatch can route them to the driver path without
+	// consulting the driverConns map.
+	udDriverRecv  uint64 = 0x10 << 56
+	udDriverSend  uint64 = 0x11 << 56
+	udDriverClose uint64 = 0x12 << 56
+	udMask        uint64 = 0xFF << 56
+	fdMask        uint64 = (1 << 56) - 1
 )
 
 func encodeUserData(op uint64, fd int) uint64 {

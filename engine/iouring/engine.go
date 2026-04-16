@@ -269,9 +269,25 @@ func (e *Engine) ResumeAccept() error {
 }
 
 var (
-	_ engine.Engine           = (*Engine)(nil)
-	_ engine.AcceptController = (*Engine)(nil)
+	_ engine.Engine            = (*Engine)(nil)
+	_ engine.AcceptController  = (*Engine)(nil)
+	_ engine.EventLoopProvider = (*Engine)(nil)
 )
+
+// NumWorkers returns the number of worker event loops available for
+// driver FD registration.
+func (e *Engine) NumWorkers() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.workers)
+}
+
+// WorkerLoop returns the WorkerLoop for worker n.
+func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.workers[n]
+}
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {
