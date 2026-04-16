@@ -428,6 +428,70 @@ func TestPgCancelWaitTimeout(t *testing.T) {
 
 // ---------- Blocker 5: TLS error messages are clear ---------------------
 
+// TestPgExecReturningLargeResult guards against a panic that bit any Exec
+// path whose query returned >= streamThreshold (64) DataRows — e.g.
+// INSERT ... RETURNING id over many rows. The dispatch handler used to
+// call promoteToStreaming unconditionally once len(head.rows) crossed
+// the threshold, but Exec paths do not allocate req.colsCh, so
+// promoteToStreaming's close(req.colsCh) panicked on a nil channel and
+// killed the event-loop worker goroutine.
+func TestPgExecReturningLargeResult(t *testing.T) {
+	const nRows = 128
+	addr := startFakePG(t, func(c net.Conn) {
+		fakePGTrustStartup(t, c, 1, 2, func(c net.Conn) {
+			// First Query: simpleExec-style — emit RowDescription + lots
+			// of DataRows + CommandComplete + ReadyForQuery.
+			typ, _, err := readMsg(c)
+			if err != nil || typ != protocol.MsgQuery {
+				return
+			}
+			rd := buildRowDescription([]colSpec{{
+				name: "id", typeOID: protocol.OIDInt8, typeSize: 8,
+				format: protocol.FormatText,
+			}})
+			_ = writeMsg(c, protocol.BackendRowDescription, rd)
+			for i := 0; i < nRows; i++ {
+				idBytes := []byte{byte('0' + (i % 10))}
+				_ = writeMsg(c, protocol.BackendDataRow, buildDataRow([][]byte{idBytes}))
+			}
+			_ = writeCommandComplete(c, "INSERT 0 128")
+			_ = writeReadyForQuery(c, 'I')
+			// Keep the conn alive for graceful close.
+			_, _, _ = readMsg(c)
+		})
+	})
+
+	prov, err := eventloop.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eventloop.Release(prov)
+
+	host, port, _ := net.SplitHostPort(addr)
+	dsn := DSN{Host: host, Port: port, User: "u", Options: Options{SSLMode: "disable", StatementCacheSize: 4}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := dialConn(ctx, prov, nil, dsn, 0)
+	if err != nil {
+		t.Fatalf("dialConn: %v", err)
+	}
+	defer c.Close()
+
+	// Trigger the simple-protocol Exec path: no args → simpleExec.
+	res, err := c.ExecContext(ctx,
+		"INSERT INTO t SELECT generate_series(1, 128) RETURNING id", nil)
+	if err != nil {
+		t.Fatalf("ExecContext: %v", err)
+	}
+	got, err := res.RowsAffected()
+	if err != nil {
+		t.Fatalf("RowsAffected: %v", err)
+	}
+	if got != nRows {
+		t.Fatalf("RowsAffected=%d, want %d", got, nRows)
+	}
+}
+
 func TestPgTLSErrorMessage(t *testing.T) {
 	_, err := Open("postgres://u@localhost/?sslmode=require")
 	if err == nil {

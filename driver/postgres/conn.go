@@ -887,7 +887,12 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 				return
 			}
 			head.appendRowFromAlias(fields)
-			if !head.syncMode.Load() && len(head.rows) >= streamThreshold {
+			// Only promote on request paths that actually have a caller
+			// waiting on streamed rows (colsCh != nil). Exec paths
+			// (simpleExec / doExtendedExec) don't allocate colsCh — they
+			// only care about CommandComplete's tag — and promoting would
+			// panic on close(nil colsCh) inside promoteToStreaming.
+			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
 				promoteToStreaming(head)
 			}
 		}
@@ -922,7 +927,9 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 				return
 			}
 			head.appendRowFromAlias(fields)
-			if !head.syncMode.Load() && len(head.rows) >= streamThreshold {
+			// See reqSimple branch: skip promotion when colsCh is nil
+			// (Exec paths don't allocate one; promoting would panic).
+			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
 				promoteToStreaming(head)
 			}
 		}
@@ -1093,8 +1100,13 @@ func promoteToStreaming(req *pgRequest) {
 	}
 	req.rows = req.rows[:0]
 	// Signal colsCh so the caller (waitForQueryRows) can return a streamRows.
-	// colsCh was pre-allocated by simpleQuery/doExtendedQuery.
-	close(req.colsCh)
+	// colsCh was pre-allocated by simpleQuery/doExtendedQuery; Exec paths
+	// don't allocate one and the dispatch sites above guard on colsCh != nil
+	// before calling promoteToStreaming. Double-check here as a defense in
+	// depth — close(nil) panics.
+	if req.colsCh != nil {
+		close(req.colsCh)
+	}
 }
 
 // onClose is the event-loop callback for an fd-level shutdown. It closes the
