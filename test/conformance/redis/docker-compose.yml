@@ -1,0 +1,37 @@
+# docker-compose.yml — disposable Redis server for the celeris conformance
+# suite. Start with:
+#
+#   docker compose -f test/conformance/redis/docker-compose.yml up -d
+#   export CELERIS_REDIS_ADDR=127.0.0.1:6379
+#   # Optional: export CELERIS_REDIS_PASSWORD=celeris   (if the auth profile is enabled)
+#   go test -tags redis ./test/conformance/redis/...
+#
+# Tear down with: docker compose -f ... down -v
+#
+# Redis 7.2 is RESP3-capable (HELLO 3). The default profile has NO password so
+# the suite works out-of-the-box on a vanilla checkout. To exercise AUTH, pass
+# --requirepass celeris on the command line below and set CELERIS_REDIS_PASSWORD
+# to the same value when running the tests.
+
+services:
+  redis:
+    image: redis:7.2
+    container_name: celeris-redis-conformance
+    ports:
+      - "6379:6379"
+    # Default: no password. RESP3 is always available (HELLO 3). To require
+    # auth, uncomment the line below and export CELERIS_REDIS_PASSWORD=celeris
+    # before running `go test`.
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      # - --requirepass
+      # - celeris
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
