@@ -14,6 +14,22 @@ import (
 // has already been closed.
 var ErrLoopClosed = errors.New("celeris/eventloop: loop is closed")
 
+// maxPendingBytes is the per-FD outbound buffer cap on the Linux worker.
+// Writes beyond this return engine.ErrQueueFull. Chosen to match the H1/H2
+// backpressure limit used by the HTTP epoll engine.
+const maxPendingBytes = 4 << 20 // 4 MiB
+
+// shutdownPartial closes any workers created before a failure in newLoop.
+func (l *Loop) shutdownPartial() error {
+	var first error
+	for _, w := range l.workers {
+		if err := w.shutdown(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
 // ErrAlreadyRegistered is returned when RegisterConn is called for a fd that
 // is already registered on this worker.
 var ErrAlreadyRegistered = errors.New("celeris/eventloop: fd already registered")
