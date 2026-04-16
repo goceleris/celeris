@@ -329,12 +329,18 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		req.expect = expectNone
 	}
 	if syncPipe {
-		// Only the last request's finished flag is checked by isDone.
-		// Skip the atomic store for intermediate requests — they are
-		// dispatched sequentially by index and the caller reads results
-		// directly, never checking finished.
+		// Intermediate requests never need a signal — the caller reads their
+		// results by index after the last req completes, and nobody waits on
+		// their doneCh. For the LAST request we MUST use finish() (not just
+		// finished.Store), because execManyCore falls through to spin-wait on
+		// reqs[n-1].doneCh whenever WriteAndPollMulti returns ok=false. That
+		// can legitimately happen if data arrives in the tiny window between
+		// the final drain's EAGAIN and the EPOLLIN re-arm — the last response
+		// then lands via bridge dispatch, but only if reqs[n-1] was still in
+		// syncPipeReqs at dispatch time. If it was dispatched via sync pipe,
+		// bridge never sees it and only the doneCh signal wakes the caller.
 		if s.syncPipeIdx >= len(s.syncPipeReqs) {
-			req.finished.Store(true)
+			req.finish()
 		}
 	} else {
 		req.finish()

@@ -1101,9 +1101,17 @@ func promoteToStreaming(req *pgRequest) {
 	if req.columns == nil && req.kind == reqExtended {
 		req.columns = req.extended.Columns
 	}
-	req.rowCh = make(chan [][]byte, streamRowsChanSize)
-	// Flush buffered rows into the channel. Since len(req.rows) ==
-	// streamThreshold == streamRowsChanSize, all rows fit without blocking.
+	// Channel capacity must fit every buffered row without blocking — we hold
+	// the dispatch goroutine here, and the caller is still selecting on colsCh
+	// (which we close after this flush). Normally len(req.rows) == streamThreshold,
+	// but the sync fast path (WriteAndPoll) suppresses promotion via
+	// syncMode=true and may leave a large buffer behind when it falls through
+	// to the async path. Sizing to len(req.rows) guarantees forward progress.
+	chanCap := streamRowsChanSize
+	if n := len(req.rows); n > chanCap {
+		chanCap = n
+	}
+	req.rowCh = make(chan [][]byte, chanCap)
 	for _, row := range req.rows {
 		req.rowCh <- row
 	}
