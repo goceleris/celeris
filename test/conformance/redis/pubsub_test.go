@@ -79,8 +79,11 @@ func TestPubSub_Basic(t *testing.T) {
 
 func TestPubSub_Pattern(t *testing.T) {
 	c := connectClient(t)
-	pattern := uniqueKey(t, "pat") + ".*"
-	target := uniqueKey(t, "pat") + ".one"
+	// The target must match the pattern — share the same prefix so one
+	// PSUBSCRIBE subscription matches every published channel we send.
+	prefix := uniqueKey(t, "pat")
+	pattern := prefix + ".*"
+	target := prefix + ".one"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -91,21 +94,32 @@ func TestPubSub_Pattern(t *testing.T) {
 	}
 	defer func() { _ = ps.Close() }()
 
-	time.Sleep(100 * time.Millisecond)
+	// The driver consumes subscribe acks internally, so there is no
+	// synchronous signal that the server has registered the pattern. Publish
+	// in a loop until either a pmessage is delivered or the deadline fires.
+	// This tolerates the brief window between PSUBSCRIBE send and server
+	// registration without the historical flake from a fixed 100 ms sleep.
+	deadline := time.After(3 * time.Second)
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
 
 	publish(t, target, "hey")
-
-	select {
-	case m := <-ps.Channel():
-		if m == nil {
-			t.Fatalf("nil message")
+	for {
+		select {
+		case m := <-ps.Channel():
+			if m == nil {
+				t.Fatalf("nil message")
+			}
+			// Pattern messages carry both Channel (actual) and Pattern (match).
+			if m.Channel != target || m.Payload != "hey" {
+				t.Fatalf("got Channel=%q Payload=%q, want Channel=%q Payload=hey", m.Channel, m.Payload, target)
+			}
+			return
+		case <-tick.C:
+			publish(t, target, "hey")
+		case <-deadline:
+			t.Fatalf("timeout waiting for pmessage")
 		}
-		// Pattern messages carry both Channel (actual) and Pattern (match).
-		if m.Channel != target || m.Payload != "hey" {
-			t.Fatalf("got Channel=%q Payload=%q, want Channel=%q Payload=hey", m.Channel, m.Payload, target)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timeout waiting for pmessage")
 	}
 }
 
