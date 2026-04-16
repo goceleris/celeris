@@ -27,7 +27,7 @@ import (
 func TestPgConnCloseNoDoubleClose(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
 		fakePGTrustStartup(t, c, 1, 2, func(c net.Conn) {
-			io.Copy(io.Discard, c)
+			_, _ = io.Copy(io.Discard, c)
 		})
 	})
 	prov, err := eventloop.Resolve(nil)
@@ -104,7 +104,7 @@ func TestPgBridgeOnWriteError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Manually drive failReq for a fake request we enqueue, simulating a
 	// Write-returned-error path. This is the exact sequence that produced
@@ -160,7 +160,7 @@ func TestPgDoneChNoRaceClose(t *testing.T) {
 // with the event loop writing via ParameterStatus dispatch. Run under -race. (PG-4)
 func TestPgServerParamsRace(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		readStartup(t, c)
 		_ = writeAuthOK(c)
 		_ = writeBackendKeyData(c, 1, 2)
@@ -171,7 +171,7 @@ func TestPgServerParamsRace(t *testing.T) {
 			_ = writeMsg(c, protocol.BackendParameterStatus, ps)
 			time.Sleep(time.Millisecond)
 		}
-		io.Copy(io.Discard, c)
+		_, _ = io.Copy(io.Discard, c)
 	})
 	prov, err := eventloop.Resolve(nil)
 	if err != nil {
@@ -187,7 +187,7 @@ func TestPgServerParamsRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	var stop atomic.Bool
 	var wg sync.WaitGroup
@@ -209,7 +209,7 @@ func TestPgServerParamsRace(t *testing.T) {
 // no Acquire must panic with a nil-deref on p.provider. (PG-5/PG-6)
 func TestPgPoolCloseRacesAcquire(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		readStartup(t, c)
 		_ = writeAuthOK(c)
 		_ = writeBackendKeyData(c, 1, 2)
@@ -298,7 +298,7 @@ func TestPgResetSessionDiscardAll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Sub-test 1: only stmts cached, no sessionDirty → ResetSession is a
 	// no-op (no server round-trip, cache preserved).
@@ -380,7 +380,7 @@ func TestPgCancelWaitTimeout(t *testing.T) {
 	// (never sends a response). The cancel side-channel conn will also be
 	// accepted but ignored.
 	addr := startFakePG(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		if !readStartup(t, c) {
 			return
 		}
@@ -409,7 +409,7 @@ func TestPgCancelWaitTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Issue a query with a short ctx; cancel triggers the CancelRequest
 	// side-channel, then wait() should hit its 30s timer. We override
@@ -477,7 +477,7 @@ func TestPgExecReturningLargeResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialConn: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Trigger the simple-protocol Exec path: no args → simpleExec.
 	res, err := c.ExecContext(ctx,
@@ -517,7 +517,7 @@ func TestPgDialConnNoPhantomCloseOnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			c, err := ln.Accept()

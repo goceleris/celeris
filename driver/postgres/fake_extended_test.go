@@ -94,7 +94,7 @@ func TestExtendedFakeHarness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	stmt, err := c.PrepareContext(ctx, "INSERT INTO t(id, name) VALUES($1, $2)")
 	if err != nil {
@@ -136,7 +136,7 @@ func benchPreparedExec(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	stmt, err := c.PrepareContext(ctx, "INSERT INTO t(id, name) VALUES($1, $2)")
 	if err != nil {
@@ -283,7 +283,7 @@ func TestReprepareOnMiss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Prepare the statement — this succeeds and caches "celst_1".
 	stmt, err := c.PrepareContext(ctx, "INSERT INTO t(id, name) VALUES($1, $2)")

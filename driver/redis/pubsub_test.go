@@ -118,7 +118,7 @@ func (b *pubsubBroker) spublish(ch, payload string) {
 		writeBulk(w, "smessage")
 		writeBulk(w, ch)
 		writeBulk(w, payload)
-		w.Flush()
+		_ = w.Flush()
 		wm.Unlock()
 	}
 }
@@ -141,7 +141,7 @@ func (b *pubsubBroker) publish(ch, payload string) {
 		writeBulk(w, "message")
 		writeBulk(w, ch)
 		writeBulk(w, payload)
-		w.Flush()
+		_ = w.Flush()
 		wm.Unlock()
 	}
 }
@@ -154,13 +154,13 @@ func TestPubSubBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.Subscribe(context.Background(), "chan1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ps.Close() })
+	t.Cleanup(func() { _ = ps.Close() })
 
 	// Give the server time to process the SUBSCRIBE.
 	time.Sleep(50 * time.Millisecond)
@@ -184,13 +184,13 @@ func TestPubSubUnsubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.Subscribe(context.Background(), "a", "b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ps.Close()
+	defer func() { _ = ps.Close() }()
 	time.Sleep(50 * time.Millisecond)
 	if err := ps.Unsubscribe(context.Background(), "a"); err != nil {
 		t.Fatal(err)
@@ -212,7 +212,7 @@ func TestPubSubDeliverAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.Subscribe(context.Background(), "ch")
 	if err != nil {
@@ -220,7 +220,7 @@ func TestPubSubDeliverAfterClose(t *testing.T) {
 	}
 	// Close first, then deliver. Before the fix, deliver would send on a
 	// closed channel and panic.
-	ps.Close()
+	_ = ps.Close()
 	// Must not panic.
 	ok := ps.deliver(&Message{Channel: "ch", Payload: "late"})
 	if ok {
@@ -236,13 +236,13 @@ func TestSSubscribeBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.newPubSub(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ps.Close() })
+	t.Cleanup(func() { _ = ps.Close() })
 
 	if err := ps.SSubscribe(context.Background(), "shard1"); err != nil {
 		t.Fatal(err)
@@ -272,13 +272,13 @@ func TestSSubscribeReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.newPubSub(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ps.Close() })
+	t.Cleanup(func() { _ = ps.Close() })
 
 	if err := ps.SSubscribe(context.Background(), "rshard"); err != nil {
 		t.Fatal(err)
@@ -298,7 +298,7 @@ func TestSSubscribeReconnect(t *testing.T) {
 	conn := ps.conn
 	ps.mu.Unlock()
 	if conn != nil {
-		conn.Close()
+		_ = conn.Close()
 	}
 
 	// Wait for reconnect to re-establish.
@@ -325,13 +325,13 @@ func TestSMessageRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.newPubSub(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ps.Close() })
+	t.Cleanup(func() { _ = ps.Close() })
 
 	// Subscribe to both regular and shard channels.
 	if err := ps.Subscribe(context.Background(), "regular"); err != nil {

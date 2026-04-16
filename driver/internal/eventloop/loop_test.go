@@ -20,7 +20,7 @@ func tcpPair(t *testing.T) (left, right net.Conn, leftFD, rightFD int) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	type pair struct {
 		c   net.Conn

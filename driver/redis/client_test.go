@@ -686,7 +686,7 @@ func newTestClient(t *testing.T, mem *memStore, opts ...Option) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	return c
 }
 
@@ -834,7 +834,7 @@ func TestClientContextCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -862,7 +862,7 @@ func TestClientHELLOFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}

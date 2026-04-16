@@ -80,7 +80,7 @@ func (t *ClusterTx) Exec(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Discard()
+	defer func() { _ = tx.Discard() }()
 	// Queue commands on the real Tx, keeping references to the Tx's pipeCmds
 	// so we can copy results back.
 	txPCs := make([]*pipeCmd, len(t.cmds))

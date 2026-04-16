@@ -79,7 +79,7 @@ func TestPipelineChunkedReplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	for trial := 0; trial < 20; trial++ {
 		p := c.Pipeline()

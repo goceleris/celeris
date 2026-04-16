@@ -41,7 +41,7 @@ func TestPublishCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	n, err := c.Publish(context.Background(), "chan", "hi")
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestTxWatchAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	ctx := context.Background()
 	tx, err := c.TxPipeline(ctx)
 	if err != nil {
@@ -181,7 +181,7 @@ func TestScanIterator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	ctx := context.Background()
 	it := c.Scan(ctx, "*", 10)
 	got := []string{}
@@ -223,7 +223,7 @@ func TestScanIteratorMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	ctx := context.Background()
 	it := c.Scan(ctx, "user:*", 0)
 	got := []string{}
@@ -372,7 +372,7 @@ func TestPushCallbackOnCmdConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
@@ -412,7 +412,7 @@ func TestPushCallbackNilDropsSilently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
@@ -438,7 +438,7 @@ func TestOnPushPostConstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	// Register OnPush after construction.
 	c.OnPush(func(channel string, data []protocol.Value) {

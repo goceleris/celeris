@@ -564,7 +564,7 @@ func (r *Row) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	defer r.rows.Close()
+	defer func() { _ = r.rows.Close() }()
 	if !r.rows.Next() {
 		if r.rows.Err() != nil {
 			return r.rows.Err()

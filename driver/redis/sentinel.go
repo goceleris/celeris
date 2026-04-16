@@ -159,7 +159,7 @@ func (s *SentinelClient) queryMaster(sentinelAddr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	v, err := c.Do(context.Background(), "SENTINEL", "get-master-addr-by-name", s.cfg.MasterName)
 	if err != nil {

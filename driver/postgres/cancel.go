@@ -40,7 +40,7 @@ func sendCancelRequest(_ context.Context, addr *net.TCPAddr, pid, secret int32) 
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if deadline, ok := cancelCtx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {

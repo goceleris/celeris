@@ -12,7 +12,7 @@ func BenchmarkGetSet(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -33,7 +33,7 @@ func BenchmarkPipeline100(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -56,7 +56,7 @@ func BenchmarkPipeline1000(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -79,7 +79,7 @@ func BenchmarkPipeline100_Parallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ResetTimer()
 	b.ReportAllocs()

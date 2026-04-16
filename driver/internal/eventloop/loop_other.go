@@ -11,8 +11,9 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/goceleris/celeris/engine"
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/engine"
 )
 
 // worker is a goroutine-per-connection fallback used on non-Linux hosts

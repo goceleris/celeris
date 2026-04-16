@@ -21,7 +21,7 @@ func ExampleOpen() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	var greeting string
@@ -50,7 +50,7 @@ func ExampleOpen_withEngine() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 
 	ctx := context.Background()
 	rows, err := pool.QueryContext(ctx,
@@ -58,7 +58,7 @@ func ExampleOpen_withEngine() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var id int
@@ -80,7 +80,7 @@ func ExamplePool_BeginTx() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -111,14 +111,14 @@ func ExampleTx_Savepoint() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 
 	ctx := context.Background()
 	tx, err := pool.BeginTx(ctx, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, "INSERT INTO jobs(name) VALUES ('always')"); err != nil {
 		log.Fatal(err)
@@ -152,7 +152,7 @@ func ExamplePool_CopyFrom() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 
 	ctx := context.Background()
 	rows := [][]any{

@@ -27,7 +27,7 @@ func TestSQLOpen(t *testing.T) {
 	if db == nil {
 		t.Fatal("sql.Open returned nil *DB")
 	}
-	db.Close()
+	_ = db.Close()
 }
 
 func TestSQLOpen_BadSSL(t *testing.T) {
@@ -35,7 +35,7 @@ func TestSQLOpen_BadSSL(t *testing.T) {
 	// ssl rejection happens at DSN parse in newConnector, which is called
 	// from OpenConnector; sql.Open propagates that error.
 	if err == nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatal("expected ErrSSLNotSupported from sql.Open")
 	}
 }

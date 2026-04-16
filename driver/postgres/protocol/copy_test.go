@@ -93,10 +93,10 @@ func TestCopyInStateHappyPath(t *testing.T) {
 
 func TestCopyInStateError(t *testing.T) {
 	s := &CopyInState{}
-	s.Handle(BackendCopyInResponse, buildCopyResponse(0, nil))
+	_, _ = s.Handle(BackendCopyInResponse, buildCopyResponse(0, nil))
 	// Server rejects input (e.g. constraint violation).
 	payload := []byte("SERROR\x00C23505\x00Mduplicate\x00\x00")
-	s.Handle(BackendErrorResponse, payload)
+	_, _ = s.Handle(BackendErrorResponse, payload)
 	done, err := s.Handle(BackendReadyForQuery, []byte{'I'})
 	if !done || err == nil {
 		t.Fatalf("expected done with surfaced error: done=%v err=%v", done, err)
@@ -111,12 +111,12 @@ func TestCopyOutStateHappyPath(t *testing.T) {
 	if _, err := s.Handle(BackendCopyOutResponse, buildCopyResponse(0, []int16{0}), onRow); err != nil {
 		t.Fatal(err)
 	}
-	s.Handle(BackendCopyData, []byte("row-1\n"), onRow)
-	s.Handle(BackendCopyData, []byte("row-2\n"), onRow)
+	_, _ = s.Handle(BackendCopyData, []byte("row-1\n"), onRow)
+	_, _ = s.Handle(BackendCopyData, []byte("row-2\n"), onRow)
 	if _, err := s.Handle(BackendCopyDone, nil, onRow); err != nil {
 		t.Fatal(err)
 	}
-	s.Handle(BackendCommandComplete, buildCommandComplete("COPY 2"), onRow)
+	_, _ = s.Handle(BackendCommandComplete, buildCommandComplete("COPY 2"), onRow)
 	done, err := s.Handle(BackendReadyForQuery, []byte{'I'}, onRow)
 	if err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)

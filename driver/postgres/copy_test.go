@@ -84,7 +84,7 @@ func TestCopyFromBasic(t *testing.T) {
 			}
 			_ = writeCommandComplete(c, fmt.Sprintf("COPY %d", wantRows))
 			_ = writeReadyForQuery(c, 'I')
-			io.Copy(io.Discard, c)
+			_, _ = io.Copy(io.Discard, c)
 		})
 	})
 
@@ -102,7 +102,7 @@ func TestCopyFromBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	rows := make([][]any, wantRows)
 	for i := range rows {
@@ -149,7 +149,7 @@ func TestCopyToBasic(t *testing.T) {
 			_ = writeMsg(c, protocol.BackendCopyDone, nil)
 			_ = writeCommandComplete(c, fmt.Sprintf("COPY %d", wantRows))
 			_ = writeReadyForQuery(c, 'I')
-			io.Copy(io.Discard, c)
+			_, _ = io.Copy(io.Discard, c)
 		})
 	})
 
@@ -167,7 +167,7 @@ func TestCopyToBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	var got [][]byte
 	err = conn.copyTo(ctx, "COPY t TO STDOUT", func(row []byte) error {
@@ -199,7 +199,7 @@ func TestCopyToAbortMidStream(t *testing.T) {
 			_ = writeMsg(c, protocol.BackendCopyDone, nil)
 			_ = writeCommandComplete(c, "COPY 10")
 			_ = writeReadyForQuery(c, 'I')
-			io.Copy(io.Discard, c)
+			_, _ = io.Copy(io.Discard, c)
 		})
 	})
 	prov, err := eventloop.Resolve(nil)
@@ -215,7 +215,7 @@ func TestCopyToAbortMidStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	stop := errors.New("stop")
 	err = conn.copyTo(ctx, "COPY t TO STDOUT", func(row []byte) error {
@@ -290,7 +290,7 @@ func TestSavepointTxWireBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := conn.Savepoint(ctx, "sp1"); err != nil {
 		t.Fatalf("Savepoint: %v", err)

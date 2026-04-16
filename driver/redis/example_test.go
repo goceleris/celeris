@@ -19,7 +19,7 @@ func ExampleNewClient() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -41,7 +41,7 @@ func ExampleClient_Pipeline() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	p := client.Pipeline()
@@ -66,7 +66,7 @@ func ExampleClient_Subscribe() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -75,7 +75,7 @@ func ExampleClient_Subscribe() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer ps.Close()
+	defer func() { _ = ps.Close() }()
 
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -98,7 +98,7 @@ func ExampleClient_Do() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	// XADD stream * field value — returns the new entry ID as a bulk string.
@@ -116,14 +116,14 @@ func ExampleClient_TxPipeline() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 	tx, err := client.TxPipeline(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer tx.Discard() // no-op after a successful Exec.
+	defer func() { _ = tx.Discard() }() // no-op after a successful Exec.
 
 	visits := tx.Incr("visits")
 	uniques := tx.Incr("uniques")

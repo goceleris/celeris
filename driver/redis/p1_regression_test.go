@@ -32,7 +32,7 @@ func TestRedisDialConnNoPhantomCloseOnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -85,7 +85,7 @@ func TestHELLOFallbackReleasesRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Verify the client fell back to RESP2 and works.
 	if err := c.Ping(context.Background()); err != nil {
@@ -210,7 +210,7 @@ func TestSentinelHandleSwitchMasterDialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sc.Close()
+	defer func() { _ = sc.Close() }()
 
 	// Verify initial connection works.
 	_, err = sc.getClient()
@@ -249,7 +249,7 @@ func TestPoolExhaustedErrorMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Acquire the only slot by starting a command that never returns.
 	go func() {

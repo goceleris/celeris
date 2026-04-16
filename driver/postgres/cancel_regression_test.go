@@ -18,7 +18,7 @@ func TestSendCancelRequestIgnoresExpiredCtx(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	accepted := make(chan []byte, 1)
 	go func() {
@@ -26,7 +26,7 @@ func TestSendCancelRequestIgnoresExpiredCtx(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		buf := make([]byte, 16)
 		n, _ := c.Read(buf)
 		accepted <- buf[:n]

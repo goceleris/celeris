@@ -109,7 +109,7 @@ func benchGETSmall(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -127,7 +127,7 @@ func benchSETSmall(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -166,7 +166,7 @@ func benchMGET10(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"}
 	b.ReportAllocs()
@@ -185,7 +185,7 @@ func benchPipeline100(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()

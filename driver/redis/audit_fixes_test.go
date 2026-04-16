@@ -62,13 +62,13 @@ func TestPubSubReconnectOnDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.Subscribe(context.Background(), "chan1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ps.Close() })
+	t.Cleanup(func() { _ = ps.Close() })
 
 	// Wait for initial SUBSCRIBE to be accepted.
 	select {
@@ -105,7 +105,7 @@ func TestPubSubReconnectOnDisconnect(t *testing.T) {
 		writeBulk(w, "message")
 		writeBulk(w, "chan1")
 		writeBulk(w, "after-reconnect")
-		w.Flush()
+		_ = w.Flush()
 		wm.Unlock()
 	}
 
@@ -145,7 +145,7 @@ func TestPubSubCloseAfterDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ps, err := c.Subscribe(context.Background(), "drop-me")
 	if err != nil {
@@ -195,7 +195,7 @@ func TestExecWriteErrorDiscards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	ctx := context.Background()
 
 	// Warm up a conn and drop its server side. The next Get should
@@ -240,7 +240,7 @@ func TestPipelineContextCancelPopulatesErrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	p := c.Pipeline()
 	s := p.Set("k", "v", 0)
@@ -340,7 +340,7 @@ func TestClientDo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	v, err := c.Do(context.Background(), "OBJECT", "ENCODING", "foo")
 	if err != nil {
@@ -374,14 +374,14 @@ func TestVerbatimStringsStripPrefix(t *testing.T) {
 		case "HELLO":
 			handleHELLO(w, 3)
 		case "GET":
-			w.WriteString("=15\r\ntxt:hello world\r\n")
+			_, _ = w.WriteString("=15\r\ntxt:hello world\r\n")
 		}
 	})
 	c, err := NewClient(fake.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	got, err := c.Get(context.Background(), "k")
 	if err != nil {
 		t.Fatal(err)
@@ -418,7 +418,7 @@ func TestForceRESP2WithPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestResetSessionClearsMulti(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	ctx := context.Background()
 	if _, err := c.Do(ctx, "MULTI"); err != nil {
@@ -514,14 +514,14 @@ func TestReaderMaxBulkDoSPropagates(t *testing.T) {
 		case "HELLO":
 			handleHELLO(w, 3)
 		case "GET":
-			w.WriteString("$99999999999999999\r\n")
+			_, _ = w.WriteString("$99999999999999999\r\n")
 		}
 	})
 	c, err := NewClient(fake.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, gerr := c.Get(ctx, "k")
@@ -569,7 +569,7 @@ func TestContextCancelDoesNotDesync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	// Issue a GET with a ctx that we cancel quickly.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -620,7 +620,7 @@ func TestHealthCheckIntervalDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	// Warm a conn so it enters the idle pool.
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
@@ -645,7 +645,7 @@ func TestHealthCheckIntervalDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 	if err := c.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestEvalResultNotAliased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
 	v, err := c.Eval(context.Background(), "return {'alpha','bravo'}", nil)
 	if err != nil {

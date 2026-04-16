@@ -22,7 +22,7 @@ func startFakePG(t *testing.T, handler func(net.Conn)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -125,7 +125,7 @@ func readMsg(c net.Conn) (byte, []byte, error) {
 // authentication and then calls post for the query phase.
 func fakePGTrustStartup(t *testing.T, c net.Conn, pid, secret int32, post func(net.Conn)) {
 	t.Helper()
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	readStartup(t, c)
 	if err := writeAuthOK(c); err != nil {
 		return
@@ -175,7 +175,7 @@ func TestConn_StartupAndPing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialConn: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if c.pid != 42 {
 		t.Errorf("pid = %d", c.pid)
 	}
@@ -218,13 +218,13 @@ func TestConn_SimpleQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	rows, err := c.QueryContext(ctx, "SELECT 7", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	cols := rows.Columns()
 	if len(cols) != 1 || cols[0] != "n" {
 		t.Errorf("cols=%v", cols)
@@ -283,14 +283,14 @@ func TestConn_CloseWithPending(t *testing.T) {
 	wg.Add(1)
 	addr := startFakePG(t, func(c net.Conn) {
 		defer wg.Done()
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		readStartup(t, c)
 		_ = writeAuthOK(c)
 		_ = writeBackendKeyData(c, 1, 2)
 		_ = writeReadyForQuery(c, 'I')
 		// Don't respond to the query; the test closes the conn and expects
 		// Ping to unblock.
-		io.Copy(io.Discard, c)
+		_, _ = io.Copy(io.Discard, c)
 	})
 	prov, err := eventloop.Resolve(nil)
 	if err != nil {
@@ -312,7 +312,7 @@ func TestConn_CloseWithPending(t *testing.T) {
 		done <- c.Ping(context.Background())
 	}()
 	time.Sleep(50 * time.Millisecond)
-	c.Close()
+	_ = c.Close()
 	select {
 	case err := <-done:
 		if err == nil {

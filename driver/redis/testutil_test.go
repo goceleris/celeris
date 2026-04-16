@@ -59,13 +59,13 @@ func startFakeRedisTB(tb testing.TB, handler func(cmd []string, w *bufio.Writer)
 	}
 	f := &fakeRedis{ln: ln, handler: handler}
 	tb.Cleanup(func() {
-		ln.Close()
+		_ = ln.Close()
 		f.mu.Lock()
 		conns := f.conns
 		f.conns = nil
 		f.mu.Unlock()
 		for _, c := range conns {
-			c.Close()
+			_ = c.Close()
 		}
 	})
 	go f.accept()
@@ -89,7 +89,7 @@ func (f *fakeRedis) accept() {
 }
 
 func (f *fakeRedis) serve(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	r := bufio.NewReader(c)
 	w := bufio.NewWriter(c)
 	wm := f.WriterMutex(w)
@@ -279,15 +279,15 @@ func atoiBytes(b []byte) (int, error) {
 // ---- helper response writers ----
 
 func writeSimple(w *bufio.Writer, s string) {
-	w.WriteByte('+')
-	w.WriteString(s)
-	w.WriteString("\r\n")
+	_ = w.WriteByte('+')
+	_, _ = w.WriteString(s)
+	_, _ = w.WriteString("\r\n")
 }
 
 func writeError(w *bufio.Writer, s string) {
-	w.WriteByte('-')
-	w.WriteString(s)
-	w.WriteString("\r\n")
+	_ = w.WriteByte('-')
+	_, _ = w.WriteString(s)
+	_, _ = w.WriteString("\r\n")
 }
 
 func writeInt(w *bufio.Writer, n int64) {
@@ -300,31 +300,31 @@ func writeInt(w *bufio.Writer, n int64) {
 	b = append(b, ':')
 	b = strconv.AppendInt(b, n, 10)
 	b = append(b, '\r', '\n')
-	w.Write(b)
+	_, _ = w.Write(b)
 }
 
 func writeBulk(w *bufio.Writer, s string) {
-	w.WriteByte('$')
-	w.WriteString(strconv.Itoa(len(s)))
-	w.WriteString("\r\n")
-	w.WriteString(s)
-	w.WriteString("\r\n")
+	_ = w.WriteByte('$')
+	_, _ = w.WriteString(strconv.Itoa(len(s)))
+	_, _ = w.WriteString("\r\n")
+	_, _ = w.WriteString(s)
+	_, _ = w.WriteString("\r\n")
 }
 
 func writeNullBulk(w *bufio.Writer) {
-	w.WriteString("$-1\r\n")
+	_, _ = w.WriteString("$-1\r\n")
 }
 
 func writeArrayHeader(w *bufio.Writer, n int) {
-	w.WriteByte('*')
-	w.WriteString(strconv.Itoa(n))
-	w.WriteString("\r\n")
+	_ = w.WriteByte('*')
+	_, _ = w.WriteString(strconv.Itoa(n))
+	_, _ = w.WriteString("\r\n")
 }
 
 func writePush(w *bufio.Writer, items ...string) {
-	w.WriteByte('>')
-	w.WriteString(strconv.Itoa(len(items)))
-	w.WriteString("\r\n")
+	_ = w.WriteByte('>')
+	_, _ = w.WriteString(strconv.Itoa(len(items)))
+	_, _ = w.WriteString("\r\n")
 	for _, i := range items {
 		writeBulk(w, i)
 	}

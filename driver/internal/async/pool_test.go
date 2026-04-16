@@ -52,7 +52,7 @@ func TestPoolAcquireRelease(t *testing.T) {
 		atomic.AddInt32(&dials, 1)
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c, err := p.Acquire(context.Background(), 0)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestPoolMaxOpen(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c1, err := p.Acquire(context.Background(), 0)
 	if err != nil {
@@ -118,7 +118,7 @@ func TestPoolCrossWorkerFallback(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c, err := p.Acquire(context.Background(), 0)
 	if err != nil {
@@ -146,7 +146,7 @@ func TestPoolReleaseEvictsExpired(t *testing.T) {
 		time.Sleep(time.Millisecond)
 		return c, nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c, err := p.Acquire(context.Background(), 0)
 	if err != nil {
@@ -188,7 +188,7 @@ func TestPoolIdleCap(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c1, _ := p.Acquire(context.Background(), 0)
 	c2, _ := p.Acquire(context.Background(), 0)
@@ -209,7 +209,7 @@ func TestPoolStatsShape(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	s := p.Stats()
 	if len(s.PerWorker) != 3 {
 		t.Fatalf("per-worker len=%d, want 3", len(s.PerWorker))
@@ -228,7 +228,7 @@ func TestPoolHealthCheckEvicts(t *testing.T) {
 		c.pingErr = errors.New("bad")
 		return c, nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	c, _ := p.Acquire(context.Background(), 0)
 	p.Release(c)
 	// Wait for ~3 health ticks.
@@ -246,7 +246,7 @@ func TestPoolWaitQueue(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c1, err := p.Acquire(context.Background(), 0)
 	if err != nil {
@@ -293,7 +293,7 @@ func TestPoolWaitQueueTimeout(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	c, err := p.Acquire(context.Background(), 0)
 	if err != nil {
@@ -314,7 +314,7 @@ func TestPoolWaitQueueUnlimited(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	const N = 100
 	conns := make([]*fakeConn, N)

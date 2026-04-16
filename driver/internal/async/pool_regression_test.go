@@ -17,7 +17,7 @@ func TestPoolExhaustedErrorIncludesMaxOpen(t *testing.T) {
 	p := NewPool(cfg, func(ctx context.Context, w int) (*fakeConn, error) {
 		return newFake(w), nil
 	})
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Exhaust both slots.
 	c1, err := p.Acquire(context.Background(), 0)

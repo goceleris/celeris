@@ -1149,13 +1149,13 @@ func (c *pgConn) failAll(err error) {
 			// Close rowCh exactly once: use a recover guard since another
 			// goroutine (dispatch) might have already closed it.
 			func() {
-				defer func() { recover() }()
+				defer func() { _ = recover() }()
 				close(r.rowCh)
 			}()
 		}
 		if r.colsCh != nil {
 			func() {
-				defer func() { recover() }()
+				defer func() { _ = recover() }()
 				close(r.colsCh)
 			}()
 		}

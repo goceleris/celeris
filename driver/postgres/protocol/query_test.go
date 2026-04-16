@@ -157,15 +157,15 @@ func TestSimpleQueryMultiStatement(t *testing.T) {
 	captureRow := func(f [][]byte) {}
 
 	// First result.
-	q.Handle(BackendRowDescription, buildRowDescription(cols1), capture, captureRow)
-	q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), capture, captureRow)
-	q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), capture, captureRow)
+	_, _ = q.Handle(BackendRowDescription, buildRowDescription(cols1), capture, captureRow)
+	_, _ = q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), capture, captureRow)
+	_, _ = q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), capture, captureRow)
 	tags = append(tags, string(q.TagBytes()))
 
 	// Second result in the same Q.
-	q.Handle(BackendRowDescription, buildRowDescription(cols2), capture, captureRow)
-	q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("x")}), capture, captureRow)
-	q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), capture, captureRow)
+	_, _ = q.Handle(BackendRowDescription, buildRowDescription(cols2), capture, captureRow)
+	_, _ = q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("x")}), capture, captureRow)
+	_, _ = q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), capture, captureRow)
 	tags = append(tags, string(q.TagBytes()))
 
 	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, capture, captureRow)

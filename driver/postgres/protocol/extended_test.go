@@ -30,7 +30,7 @@ func TestWriteParse(t *testing.T) {
 
 func TestWriteBindAllFormats(t *testing.T) {
 	w := NewWriter()
-	out := WriteBind(w, "portal", "stmt", []int16{FormatBinary}, [][]byte{[]byte{0, 0, 0, 5}}, []int16{FormatBinary})
+	out := WriteBind(w, "portal", "stmt", []int16{FormatBinary}, [][]byte{{0, 0, 0, 5}}, []int16{FormatBinary})
 	if out[0] != MsgBind {
 		t.Fatalf("type=%q", out[0])
 	}
@@ -137,8 +137,8 @@ func TestExtendedQueryFullCycle(t *testing.T) {
 
 func TestExtendedQueryNoDescribe(t *testing.T) {
 	e := &ExtendedQueryState{HasDescribe: false}
-	e.Handle(BackendParseComplete, nil, nil)
-	e.Handle(BackendBindComplete, nil, nil)
+	_, _ = e.Handle(BackendParseComplete, nil, nil)
+	_, _ = e.Handle(BackendBindComplete, nil, nil)
 	// With no Describe we expect to jump straight to execute results:
 	// server sends no RowDescription. For an INSERT there would just be
 	// CommandComplete.
@@ -156,11 +156,11 @@ func TestExtendedQueryNoDescribe(t *testing.T) {
 
 func TestExtendedQueryNoData(t *testing.T) {
 	e := &ExtendedQueryState{HasDescribe: true}
-	e.Handle(BackendParseComplete, nil, nil)
-	e.Handle(BackendBindComplete, nil, nil)
+	_, _ = e.Handle(BackendParseComplete, nil, nil)
+	_, _ = e.Handle(BackendBindComplete, nil, nil)
 	// Describe statement with no params: server sends ParameterDescription
 	// (empty) then NoData for DDL / statements with no result set.
-	e.Handle(BackendParameterDesc, buildParameterDescription(nil), nil)
+	_, _ = e.Handle(BackendParameterDesc, buildParameterDescription(nil), nil)
 	if _, err := e.Handle(BackendNoData, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestExtendedQueryNoData(t *testing.T) {
 
 func TestExtendedQueryErrorResponse(t *testing.T) {
 	e := &ExtendedQueryState{HasDescribe: true}
-	e.Handle(BackendParseComplete, nil, nil)
+	_, _ = e.Handle(BackendParseComplete, nil, nil)
 	// Server sends Error after BindComplete fails.
 	payload := []byte("SERROR\x00C42703\x00Mcolumn not found\x00\x00")
 	if _, err := e.Handle(BackendErrorResponse, payload, nil); err != nil {
@@ -199,12 +199,12 @@ func TestExtendedQueryErrorResponse(t *testing.T) {
 
 func TestExtendedQueryPortalSuspended(t *testing.T) {
 	e := &ExtendedQueryState{HasDescribe: true}
-	e.Handle(BackendParseComplete, nil, nil)
-	e.Handle(BackendBindComplete, nil, nil)
-	e.Handle(BackendParameterDesc, buildParameterDescription(nil), nil)
+	_, _ = e.Handle(BackendParseComplete, nil, nil)
+	_, _ = e.Handle(BackendBindComplete, nil, nil)
+	_, _ = e.Handle(BackendParameterDesc, buildParameterDescription(nil), nil)
 	cols := []ColumnDesc{{Name: "a", TypeOID: OIDInt4}}
-	e.Handle(BackendRowDescription, buildRowDescription(cols), nil)
-	e.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), nil)
+	_, _ = e.Handle(BackendRowDescription, buildRowDescription(cols), nil)
+	_, _ = e.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), nil)
 	if _, err := e.Handle(BackendPortalSuspended, nil, nil); err != nil {
 		t.Fatal(err)
 	}

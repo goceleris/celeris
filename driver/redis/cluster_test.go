@@ -346,7 +346,7 @@ func TestClusterGetSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	// Write a key that maps to some slot and verify it routes correctly.
@@ -371,7 +371,7 @@ func TestClusterMOVED(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 
@@ -465,7 +465,7 @@ func TestClusterASK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	if err := cc.Set(ctx, "ask-key", "ask-value", 0); err != nil {
@@ -482,7 +482,7 @@ func TestClusterTopologyRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	// Force a topology refresh.
 	ctx := context.Background()
@@ -512,7 +512,7 @@ func TestClusterMultiKeyDel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	// Set some keys that likely map to different slots.
@@ -540,7 +540,7 @@ func TestClusterPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	// Use hash tags to colocate keys on the same slot.
@@ -634,7 +634,7 @@ func TestClusterMaxRedirects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	_, err = cc.Get(ctx, "loop-key")
@@ -652,7 +652,7 @@ func TestClusterForEachNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	var count int
 	ctx := context.Background()
@@ -677,7 +677,7 @@ func TestClusterIncr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	n, err := cc.Incr(ctx, "counter")
@@ -716,7 +716,7 @@ func TestClusterTxBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	// Use hash tags to colocate keys on the same slot.
@@ -751,7 +751,7 @@ func TestClusterTxCrossSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	// Find two keys that hash to different slots.
 	key1 := "aaa"
@@ -787,7 +787,7 @@ func TestClusterWatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	// Pre-set the key.
@@ -823,7 +823,7 @@ func TestClusterWatchCrossSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	// Find two keys in different slots.
 	key1 := "{slotA}.key"
@@ -858,7 +858,7 @@ func TestClusterTxDiscard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	tx := cc.TxPipeline()
 	tx.Set("{discard}.k", "v", 0)
@@ -880,7 +880,7 @@ func TestClusterTxEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	tx := cc.TxPipeline()
 	ctx := context.Background()
@@ -919,7 +919,7 @@ func TestClusterReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 
@@ -974,7 +974,7 @@ func TestClusterReadOnlyFallback(t *testing.T) {
 	// Create a dead replica: start and immediately close.
 	deadReplica := startFakeClusterReplica(t, primary.mem, 0, 16383, primary.Addr())
 	deadAddr := deadReplica.Addr()
-	deadReplica.fake.ln.Close() // kill the listener
+	_ = deadReplica.fake.ln.Close() // kill the listener
 
 	topo := []fakeClusterSlotRange{
 		{start: 0, end: 16383, addr: primary.Addr(), replicas: []string{liveReplica.Addr(), deadAddr}},
@@ -990,7 +990,7 @@ func TestClusterReadOnlyFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 
@@ -1060,7 +1060,7 @@ func TestClusterRouteByLatency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 
@@ -1244,7 +1244,7 @@ func TestClusterPipelineASKPinsConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	// Seed the value on node2's in-memory store so the ASK retry can fetch it.
 	mem.mu.Lock()
@@ -1361,7 +1361,7 @@ func TestClusterPipelineReturnsValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClusterClient: %v", err)
 	}
-	defer cc.Close()
+	defer func() { _ = cc.Close() }()
 
 	ctx := context.Background()
 	// Colocate with hash tags so a single sub-pipeline runs.

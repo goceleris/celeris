@@ -183,7 +183,7 @@ func TestSentinelDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSentinelClient: %v", err)
 	}
-	defer sc.Close()
+	defer func() { _ = sc.Close() }()
 
 	ctx := context.Background()
 	if err := sc.Set(ctx, "k", "v", 0); err != nil {
@@ -211,7 +211,7 @@ func TestSentinelFailover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSentinelClient: %v", err)
 	}
-	defer sc.Close()
+	defer func() { _ = sc.Close() }()
 
 	ctx := context.Background()
 	if err := sc.Set(ctx, "before", "1", 0); err != nil {
@@ -293,7 +293,7 @@ func TestSentinelPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSentinelClient: %v", err)
 	}
-	defer sc.Close()
+	defer func() { _ = sc.Close() }()
 
 	p := sc.Pipeline()
 	if p == nil {

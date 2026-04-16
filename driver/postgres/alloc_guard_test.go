@@ -103,7 +103,7 @@ func benchQuery1col1row(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -112,7 +112,7 @@ func benchQuery1col1row(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		rows.Close()
+		_ = rows.Close()
 	}
 }
 
@@ -141,7 +141,7 @@ func benchPoolAcquireRelease(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Warm the pool with a single acquire/release so the first hot-loop
 	// iteration doesn't pay for the dial.
@@ -172,7 +172,7 @@ func startFakePGBench(tb testing.TB, handler func(net.Conn)) string {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	tb.Cleanup(func() { ln.Close() })
+	tb.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -187,7 +187,7 @@ func startFakePGBench(tb testing.TB, handler func(net.Conn)) string {
 
 func fakePGTrustStartupB(tb testing.TB, c net.Conn, pid, secret int32, post func(net.Conn)) {
 	tb.Helper()
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	// Read startup message.
 	lenBuf := make([]byte, 4)
 	if _, err := readFull(c, lenBuf); err != nil {

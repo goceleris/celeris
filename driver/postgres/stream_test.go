@@ -62,13 +62,13 @@ func TestStreamingBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	rows, err := conn.QueryContext(ctx, "SELECT id, name FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols := rows.Columns()
 	if len(cols) != 2 || cols[0] != "id" || cols[1] != "name" {
@@ -158,7 +158,7 @@ func TestStreamingLarge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Force a GC before measuring baseline.
 	runtime.GC()
@@ -182,7 +182,7 @@ func TestStreamingLarge(t *testing.T) {
 		}
 		count++
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if count != numRows {
 		t.Fatalf("got %d rows, want %d", count, numRows)
@@ -253,7 +253,7 @@ func TestStreamingCloseEarly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// First query: read only 10 rows, then close.
 	rows, err := conn.QueryContext(ctx, "SELECT n FROM t", nil)
@@ -286,7 +286,7 @@ func TestStreamingCloseEarly(t *testing.T) {
 		}
 		count++
 	}
-	rows2.Close()
+	_ = rows2.Close()
 	if count != numRows {
 		t.Fatalf("second query: got %d rows, want %d", count, numRows)
 	}
@@ -340,13 +340,13 @@ func TestStreamingError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	rows, err := conn.QueryContext(ctx, "SELECT n FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	dest := make([]driver.Value, 1)
 	count := 0
@@ -372,7 +372,7 @@ func TestStreamingError(t *testing.T) {
 func TestStreamingPoolLevel(t *testing.T) {
 	const numRows = 5
 	addr := startFakePG(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		readStartup(t, c)
 		_ = writeAuthOK(c)
 		_ = writeBackendKeyData(c, 1, 2)
@@ -407,7 +407,7 @@ func TestStreamingPoolLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -431,7 +431,7 @@ func TestStreamingPoolLevel(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if count != numRows {
 		t.Fatalf("got %d rows, want %d", count, numRows)
 	}
@@ -449,7 +449,7 @@ func TestStreamingPoolLevel(t *testing.T) {
 		}
 		count++
 	}
-	rows2.Close()
+	_ = rows2.Close()
 	if count != numRows {
 		t.Fatalf("second query: got %d rows, want %d", count, numRows)
 	}

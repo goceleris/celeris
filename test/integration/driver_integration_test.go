@@ -138,7 +138,7 @@ func pgBuildDataRow(field []byte) []byte {
 // Query message replies with a single-row RowDescription+DataRow for value=1.
 // Handles arbitrarily many queries on the same connection (pool may reuse).
 func pgSelect1Handler(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if err := pgReadStartup(c); err != nil {
 		return
 	}
@@ -233,7 +233,7 @@ func (f *fakeRedis) accept() {
 }
 
 func (f *fakeRedis) serve(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	r := bufio.NewReader(c)
 	w := bufio.NewWriter(c)
 	for {
@@ -424,7 +424,7 @@ func TestEndToEndPostgresViaServer(t *testing.T) {
 			if err != nil {
 				return c.String(http.StatusInternalServerError, "query error: %v", err)
 			}
-			defer rows.Close()
+			defer func() { _ = rows.Close() }()
 			if cols := rows.Columns(); len(cols) != 1 {
 				return c.String(http.StatusInternalServerError, "unexpected cols: %v", cols)
 			}
@@ -444,7 +444,7 @@ func TestEndToEndPostgresViaServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /db: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -486,7 +486,7 @@ func TestEndToEndRedisViaServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /cache: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -528,10 +528,10 @@ func TestEndToEndBothDrivers(t *testing.T) {
 				return c.String(http.StatusInternalServerError, "pg: %v", err)
 			}
 			if !rows.Next() {
-				rows.Close()
+				_ = rows.Close()
 				return c.String(http.StatusInternalServerError, "pg: no row")
 			}
-			rows.Close()
+			_ = rows.Close()
 
 			v, err := client.DoString(ctx, "GET", "k")
 			if err != nil {
@@ -549,7 +549,7 @@ func TestEndToEndBothDrivers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /combo: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}

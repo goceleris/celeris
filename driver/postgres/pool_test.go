@@ -14,7 +14,7 @@ import (
 
 func TestPool_OpenAndPing(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		readStartup(t, c)
 		_ = writeAuthOK(c)
 		_ = writeBackendKeyData(c, 1, 2)
@@ -38,7 +38,7 @@ func TestPool_OpenAndPing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := p.Ping(ctx); err != nil {
@@ -63,7 +63,7 @@ func TestPool_WithWorker(t *testing.T) {
 
 func TestPool_PingWithAffinity(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		readStartup(t, c)
 		_ = writeAuthOK(c)
 		_ = writeBackendKeyData(c, 1, 2)
@@ -88,7 +88,7 @@ func TestPool_PingWithAffinity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	ctx := WithWorker(context.Background(), 0)
 	if err := p.Ping(ctx); err != nil {
 		t.Fatalf("ping: %v", err)
