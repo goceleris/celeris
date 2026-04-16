@@ -13,9 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/resource"
-	"golang.org/x/net/http2/hpack"
 )
 
 // ---------- H2C test helpers ----------
@@ -144,8 +145,7 @@ func findH2DataOnStream(buf []byte, streamID uint32) ([]byte, bool) {
 
 // ---------- h2c config matrix ----------
 
-func h2cTrue() *bool  { b := true; return &b }
-func h2cFalse() *bool { b := false; return &b }
+func h2cTrue() *bool { b := true; return &b }
 
 // ---------- TESTS ----------
 
@@ -165,7 +165,7 @@ func TestH2CUpgradeBasicGET(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 
 			req := buildH1UpgradeRequest("GET", "/hello", "example.com", nil)
 			// Send request + client preface + SETTINGS together.
@@ -216,7 +216,7 @@ func TestH2CUpgradeWithBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			body := []byte("payload-body")
 			req := buildH1UpgradeRequest("POST", "/echo", "example.com", body)
 			msg := []byte(req)
@@ -265,7 +265,7 @@ func TestH2CUpgradeInvalidSettings(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			// Bad base64 in HTTP2-Settings.
 			req := "GET /x HTTP/1.1\r\n" +
 				"Host: example.com\r\n" +
@@ -298,7 +298,7 @@ func TestH2CUpgradeMissingConnectionToken(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			// Connection header lacks "HTTP2-Settings" token.
 			req := "GET /x HTTP/1.1\r\n" +
 				"Host: example.com\r\n" +
@@ -330,7 +330,7 @@ func TestH2CUpgradeAmbiguousUpgrade(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			// Multi-token Upgrade: security invariant — h2c must not be
 			// selected when other tokens coexist.
 			req := "GET /x HTTP/1.1\r\n" +
@@ -391,7 +391,7 @@ func TestH2CUpgradeConfigMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatalf("dial: %v", err)
 				}
-				defer cc.Close()
+				defer func() { _ = cc.Close() }()
 				req := buildH1UpgradeRequest("GET", "/probe", "example.com", nil)
 				if _, err := cc.Write([]byte(req)); err != nil {
 					t.Fatalf("write: %v", err)
@@ -423,7 +423,7 @@ func TestH2CUpgradePrefaceInSameSegment(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			req := buildH1UpgradeRequest("GET", "/s1", "example.com", nil)
 			msg := append([]byte(req), []byte(h2cClientPreface)...)
 			msg = append(msg, encodeH2Frame(0x04, 0, 0, nil)...)
@@ -452,7 +452,7 @@ func TestH2CUpgradePrefaceSplit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			req := buildH1UpgradeRequest("GET", "/split", "example.com", nil)
 			if _, err := c.Write([]byte(req)); err != nil {
 				t.Fatalf("write: %v", err)
@@ -496,7 +496,7 @@ func TestH2CUpgradeLargeBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			body := bytes.Repeat([]byte{'A'}, 1<<20) // 1 MB
 			req := buildH1UpgradeRequest("POST", "/big", "example.com", body)
 			msg := append([]byte(req), []byte(h2cClientPreface)...)
@@ -560,7 +560,7 @@ func TestH2CUpgradeSubsequentStreams(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			req := buildH1UpgradeRequest("GET", "/init", "example.com", nil)
 			msg := append([]byte(req), []byte(h2cClientPreface)...)
 			msg = append(msg, encodeH2Frame(0x04, 0, 0, nil)...)

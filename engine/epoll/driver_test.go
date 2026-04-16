@@ -124,8 +124,8 @@ func TestDriverRegisterUnregister(t *testing.T) {
 
 	wl := eng.WorkerLoop(0)
 	local, peer := socketpairNonblocking(t)
-	defer unix.Close(local)
-	defer unix.Close(peer)
+	defer func() { _ = unix.Close(local) }()
+	defer func() { _ = unix.Close(peer) }()
 
 	var (
 		recvMu   sync.Mutex
@@ -206,8 +206,8 @@ func TestDriverHTTPZeroOverhead(t *testing.T) {
 	}
 
 	local, peer := socketpairNonblocking(t)
-	defer unix.Close(local)
-	defer unix.Close(peer)
+	defer func() { _ = unix.Close(local) }()
+	defer func() { _ = unix.Close(peer) }()
 
 	if err := eng.WorkerLoop(0).RegisterConn(local, func([]byte) {}, func(error) {}); err != nil {
 		t.Fatalf("RegisterConn: %v", err)
@@ -228,8 +228,8 @@ func TestDriverWriteSerialization(t *testing.T) {
 	defer stop()
 
 	local, peer := socketpairNonblocking(t)
-	defer unix.Close(local)
-	defer unix.Close(peer)
+	defer func() { _ = unix.Close(local) }()
+	defer func() { _ = unix.Close(peer) }()
 
 	// Enlarge peer's recv buffer so the test doesn't block on SO_SNDBUF
 	// back-pressure (we want to exercise serialization, not flow control).
@@ -322,8 +322,8 @@ func TestDriverFDCollisionRejected(t *testing.T) {
 	// (our own socketpair half). This still exercises RegisterConn's
 	// HTTP-collision guard without racing with acceptAll/closeConn.
 	local, peer := socketpairNonblocking(t)
-	defer unix.Close(local)
-	defer unix.Close(peer)
+	defer func() { _ = unix.Close(local) }()
+	defer func() { _ = unix.Close(peer) }()
 
 	l := eng.loops[0]
 	if local >= connTableSize {
@@ -348,8 +348,8 @@ func TestDriverCallbackOnWorkerGoroutine(t *testing.T) {
 	// verify subsequent deliveries observe the same ID. The worker runs
 	// one iteration per epoll_wait so all callbacks fire from it.
 	local, peer := socketpairNonblocking(t)
-	defer unix.Close(local)
-	defer unix.Close(peer)
+	defer func() { _ = unix.Close(local) }()
+	defer func() { _ = unix.Close(peer) }()
 
 	var (
 		firstGID atomic.Int64

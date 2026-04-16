@@ -57,9 +57,9 @@ func TestSoakSlowConsumer(t *testing.T) {
 		}
 	}
 	const (
-		messagesPerClient  = 10_000 // plenty to keep the pipeline busy
-		handlerSleep       = 5 * time.Millisecond
-		bufCap             = 32 // small on purpose — exercises pause/resume
+		messagesPerClient = 10_000 // plenty to keep the pipeline busy
+		handlerSleep      = 5 * time.Millisecond
+		bufCap            = 32 // small on purpose — exercises pause/resume
 	)
 
 	duration := soakDuration()
@@ -135,20 +135,20 @@ func TestSoakSlowConsumer(t *testing.T) {
 				}
 				defer client.close()
 				client.upgrade(t, "/ws")
-			sent := 0
-			for sent < messagesPerClient && time.Now().Before(deadline) {
-				if err := client.writeClientFrame(true, OpText, []byte("flood")); err != nil {
-					return
+				sent := 0
+				for sent < messagesPerClient && time.Now().Before(deadline) {
+					if err := client.writeClientFrame(true, OpText, []byte("flood")); err != nil {
+						return
+					}
+					if err := client.bw.Flush(); err != nil {
+						return
+					}
+					sent++
 				}
-				if err := client.bw.Flush(); err != nil {
-					return
-				}
-				sent++
-			}
-			// Close cleanly so the handler returns.
-			client.writeClientFrame(true, OpClose,
-				FormatCloseMessage(CloseNormalClosure, ""))
-			_ = client.bw.Flush()
+				// Close cleanly so the handler returns.
+				client.writeClientFrame(true, OpClose,
+					FormatCloseMessage(CloseNormalClosure, ""))
+				_ = client.bw.Flush()
 			}(i)
 		}
 		// Brief pause between batches to let the accept queue drain.

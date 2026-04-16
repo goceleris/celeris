@@ -15,10 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
-	"golang.org/x/sys/unix"
 )
 
 // testHandler is a minimal stream.Handler for engine bring-up.
@@ -106,7 +107,7 @@ func TestDriverRegisterUnregister(t *testing.T) {
 	wl := e.WorkerLoop(0)
 
 	a, b := nonblockSocketPair(t)
-	defer unix.Close(b)
+	defer func() { _ = unix.Close(b) }()
 
 	var closed atomic.Bool
 	// closeErr uses atomic.Pointer[error] so a "no error" state is a nil
@@ -192,7 +193,7 @@ func TestDriverHTTPZeroOverhead(t *testing.T) {
 
 	wl := e.WorkerLoop(0)
 	a, b := nonblockSocketPair(t)
-	defer unix.Close(b)
+	defer func() { _ = unix.Close(b) }()
 
 	if err := wl.RegisterConn(a, func([]byte) {}, func(error) {}); err != nil {
 		t.Fatalf("RegisterConn: %v", err)
@@ -226,7 +227,7 @@ func TestDriverWriteSerialization(t *testing.T) {
 
 	wl := e.WorkerLoop(0)
 	a, b := nonblockSocketPair(t)
-	defer unix.Close(b)
+	defer func() { _ = unix.Close(b) }()
 
 	if err := wl.RegisterConn(a, func([]byte) {}, func(error) {}); err != nil {
 		t.Fatalf("RegisterConn: %v", err)
@@ -288,8 +289,8 @@ func TestDriverCancelOnUnregister(t *testing.T) {
 
 	wl := e.WorkerLoop(0)
 	a, b := nonblockSocketPair(t)
-	defer unix.Close(b)
-	defer unix.Close(a)
+	defer func() { _ = unix.Close(b) }()
+	defer func() { _ = unix.Close(a) }()
 
 	var closed atomic.Bool
 	if err := wl.RegisterConn(a, func([]byte) {}, func(error) {
@@ -355,8 +356,8 @@ func TestIouringShutdownFiresDriverOnClose(t *testing.T) {
 
 	wl := e.WorkerLoop(0)
 	a, b := nonblockSocketPair(t)
-	defer unix.Close(a)
-	defer unix.Close(b)
+	defer func() { _ = unix.Close(a) }()
+	defer func() { _ = unix.Close(b) }()
 
 	closeErrCh := make(chan error, 1)
 	if err := wl.RegisterConn(a, func([]byte) {}, func(err error) {

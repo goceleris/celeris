@@ -21,7 +21,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
-	"github.com/goceleris/celeris/celeristest"
 	"github.com/gofiber/fiber/v3"
 	fiberextractors "github.com/gofiber/fiber/v3/extractors"
 	fiberbasicauth "github.com/gofiber/fiber/v3/middleware/basicauth"
@@ -37,6 +36,8 @@ import (
 	"github.com/labstack/echo/v4"
 	echomw "github.com/labstack/echo/v4/middleware"
 	rscors "github.com/rs/cors"
+
+	"github.com/goceleris/celeris/celeristest"
 
 	"github.com/goceleris/celeris/middleware/basicauth"
 	"github.com/goceleris/celeris/middleware/cors"

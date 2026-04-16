@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
+	gorillaws "github.com/gorilla/websocket"
+
 	"github.com/goceleris/celeris"
 	celerisws "github.com/goceleris/celeris/middleware/websocket"
-	gorillaws "github.com/gorilla/websocket"
 )
 
 func startCelerisWS(b *testing.B, handler celerisws.Handler) (string, func()) {

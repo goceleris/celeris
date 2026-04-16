@@ -11,9 +11,10 @@ import (
 	"testing"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	celeris "github.com/goceleris/celeris"
 	celredis "github.com/goceleris/celeris/driver/redis"
-	goredis "github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------

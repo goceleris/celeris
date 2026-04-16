@@ -8,8 +8,9 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/goceleris/celeris/engine"
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/engine"
 )
 
 // prepCancelFDDriver prepares an ASYNC_CANCEL SQE without CQE_SKIP_SUCCESS,
@@ -37,16 +38,16 @@ const driverSendCap = 64 << 20
 // Separate from connState because the HTTP path has invariants (protocol
 // detection, fixed files, detached WS paths) that don't apply to drivers.
 type driverConn struct {
-	fd       int
-	w        *Worker
-	onRecv   func([]byte)
-	onClose  func(error)
-	buf      []byte
-	writeBuf []byte
-	sendBuf  []byte
-	sending  bool
-	mu       sync.Mutex
-	closing  bool
+	fd        int
+	w         *Worker
+	onRecv    func([]byte)
+	onClose   func(error)
+	buf       []byte
+	writeBuf  []byte
+	sendBuf   []byte
+	sending   bool
+	mu        sync.Mutex
+	closing   bool
 	recvArmed bool
 
 	// inflightOps counts submitted RECV/SEND SQEs that have not yet

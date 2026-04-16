@@ -12,10 +12,11 @@ import (
 	"testing"
 	"time"
 
-	celeris "github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/driver/postgres"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
+
+	celeris "github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/driver/postgres"
 )
 
 // ---------------------------------------------------------------------------
