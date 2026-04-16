@@ -4,11 +4,61 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"net"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/engine"
 )
+
+// zeroWorkerProvider is a test Provider exposing NumWorkers==0 so dialRedisConn
+// takes the early-error branch under test.
+type zeroWorkerProvider struct{}
+
+func (zeroWorkerProvider) NumWorkers() int                  { return 0 }
+func (zeroWorkerProvider) WorkerLoop(n int) engine.WorkerLoop { panic("no workers") }
+
+// TestRedisDialConnNoPhantomCloseOnError guards against a double-close of
+// an fd when dialRedisConn bails out before adopting it into c.file. The
+// previous error branches called syscall.Close(fd) but left the *os.File
+// returned from tcp.File() alive with its runtime finalizer armed — a
+// later GC cycle could then call syscall.Close(fd) AGAIN on an fd the
+// kernel had reassigned to another socket (classic phantom-close bug).
+func TestRedisDialConnNoPhantomCloseOnError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, derr := dialRedisConn(ctx, zeroWorkerProvider{}, Config{Addr: ln.Addr().String()}, 0)
+	if derr == nil {
+		t.Fatal("dialRedisConn should have returned an error")
+	}
+	if !strings.Contains(derr.Error(), "0 workers") {
+		t.Fatalf("unexpected error: %v", derr)
+	}
+	// Force GC; a stray finalizer armed on the freed *os.File would
+	// close the fd here — potentially hitting a recycled fd owned by
+	// something else.
+	runtime.GC()
+	runtime.GC()
+	runtime.Gosched()
+	runtime.GC()
+}
 
 // ---------- Bug 4: HELLO fallback leaks request ----------
 

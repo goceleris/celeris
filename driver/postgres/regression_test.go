@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/engine"
 )
 
 // TestPgConnCloseNoDoubleClose asserts Close's fd-close path is idempotent:
@@ -490,6 +492,67 @@ func TestPgExecReturningLargeResult(t *testing.T) {
 	if got != nRows {
 		t.Fatalf("RowsAffected=%d, want %d", got, nRows)
 	}
+}
+
+// zeroWorkerProvider exposes a Provider with 0 workers so dialConn takes
+// the early-return branch that previously called syscall.Close(fd) while
+// the *os.File wrapper was still live (with finalizer armed).
+type zeroWorkerProvider struct{}
+
+func (zeroWorkerProvider) NumWorkers() int                  { return 0 }
+func (zeroWorkerProvider) WorkerLoop(n int) engine.WorkerLoop { panic("no workers") }
+
+// TestPgDialConnNoPhantomCloseOnError guards against a double-close of
+// an fd when dialConn bails out before adopting it into fdFile. The
+// previous error branches called syscall.Close(fd) but left the
+// *os.File returned from tcp.File() alive with its runtime finalizer
+// armed, so a later GC cycle would call syscall.Close(fd) AGAIN,
+// potentially on an unrelated fd the kernel had since reassigned.
+//
+// This test forces the NumWorkers<=0 branch, runs GC, and verifies the
+// process doesn't crash or leak an extra fd.
+func TestPgDialConnNoPhantomCloseOnError(t *testing.T) {
+	// Accept-and-hold server so dialConn reaches the NumWorkers check.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c // hold it open; dialConn will bail before the handshake
+		}
+	}()
+
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	dsn := DSN{Host: host, Port: port, User: "u", Options: Options{SSLMode: "disable", StatementCacheSize: 4}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Invoke with a zero-worker provider. dialConn should return the
+	// "0 workers" error and close the fd via file.Close() (disarming the
+	// finalizer). Previously it used syscall.Close(fd), leaving the
+	// finalizer armed for a later GC-driven double close.
+	_, derr := dialConn(ctx, zeroWorkerProvider{}, nil, dsn, 0)
+	if derr == nil {
+		t.Fatal("dialConn should have returned an error")
+	}
+	if !strings.Contains(derr.Error(), "0 workers") {
+		t.Fatalf("unexpected error: %v", derr)
+	}
+
+	// Force GC twice — if the fd was closed via syscall.Close and the
+	// *os.File finalizer still armed, the finalizer would close the fd
+	// again here. Under the race detector or with an fd recycled to an
+	// unrelated socket this typically surfaces as an EBADF / panic.
+	runtime.GC()
+	runtime.GC()
+	runtime.Gosched()
+	runtime.GC()
 }
 
 func TestPgTLSErrorMessage(t *testing.T) {

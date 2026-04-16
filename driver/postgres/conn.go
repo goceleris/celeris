@@ -565,7 +565,11 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 
 	nw := prov.NumWorkers()
 	if nw <= 0 {
-		_ = syscall.Close(fd)
+		// Use file.Close() (not syscall.Close(fd)) so the *os.File's
+		// runtime finalizer is disarmed. Otherwise a later GC cycle would
+		// call syscall.Close(fd) a second time, potentially on an
+		// unrelated fd the kernel has since reassigned to another socket.
+		_ = file.Close()
 		return nil, errors.New("celeris-postgres: event loop has 0 workers")
 	}
 	if workerHint < 0 || workerHint >= nw {
@@ -607,7 +611,11 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
 	if err := loop.RegisterConn(fd, c.onRecv, c.onClose); err != nil {
-		_ = syscall.Close(fd)
+		// Close via file.Close() to disarm the *os.File finalizer. A stray
+		// syscall.Close(fd) here would leave the finalizer armed; when GC
+		// later fires it would close the same fd a SECOND time, possibly
+		// hitting an unrelated fd the kernel reassigned in the meantime.
+		_ = file.Close()
 		return nil, err
 	}
 

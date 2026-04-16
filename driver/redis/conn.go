@@ -153,7 +153,11 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 
 	nw := prov.NumWorkers()
 	if nw <= 0 {
-		_ = syscall.Close(fd)
+		// Close via file.Close() so the *os.File's runtime finalizer is
+		// disarmed. syscall.Close(fd) alone would leave the finalizer
+		// armed; GC could then call syscall.Close(fd) a second time on an
+		// fd the kernel has since reassigned to another socket.
+		_ = file.Close()
 		return nil, errors.New("celeris/redis: event loop has 0 workers")
 	}
 	if workerHint < 0 || workerHint >= nw {
@@ -183,7 +187,10 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
 	if err := loop.RegisterConn(fd, c.onRecv, c.onClose); err != nil {
-		_ = syscall.Close(fd)
+		// Close via file.Close() to disarm the *os.File finalizer; a plain
+		// syscall.Close(fd) would leak the finalizer and risk a double
+		// close on a reassigned fd when GC later runs it.
+		_ = file.Close()
 		return nil, err
 	}
 
