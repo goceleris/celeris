@@ -33,7 +33,17 @@ func startFakeSentinel(t *testing.T, masterAddr string) *fakeSentinel {
 		masterAddr: masterAddr,
 		switchCh:   make(chan string, 4),
 	}
-	fs.fake = startFakeRedis(t, fs.handler)
+	// startFakeRedis spawns its accept goroutine before returning, so any
+	// handler invocation that reads fs.fake would race with the assignment
+	// below. Gate the handler on a ready channel: the close establishes a
+	// happens-before edge after fs.fake is set.
+	ready := make(chan struct{})
+	handler := func(cmd []string, w *bufio.Writer) {
+		<-ready
+		fs.handler(cmd, w)
+	}
+	fs.fake = startFakeRedis(t, handler)
+	close(ready)
 	go fs.pushLoop()
 	return fs
 }
