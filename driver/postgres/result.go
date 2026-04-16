@@ -35,12 +35,17 @@ func newPGResultFromCount(n int64) driver.Result {
 	return &pgResult{n: n}
 }
 
-// ErrNoLastInsertId is returned from pgResult.LastInsertId. PG exposes
+// ErrNoLastInsertID is returned from pgResult.LastInsertId. PG exposes
 // sequence values via RETURNING rather than a generic last-insert-id.
-var ErrNoLastInsertId = errors.New("celeris-postgres: LastInsertId is not supported; use RETURNING")
+var ErrNoLastInsertID = errors.New("celeris-postgres: LastInsertId is not supported; use RETURNING")
+
+// ErrNoLastInsertId is a deprecated alias retained for API compatibility.
+//
+// Deprecated: use [ErrNoLastInsertID] instead.
+var ErrNoLastInsertId = ErrNoLastInsertID //nolint:revive // backward-compat alias
 
 func (r *pgResult) LastInsertId() (int64, error) {
-	return 0, ErrNoLastInsertId
+	return 0, ErrNoLastInsertID
 }
 
 func (r *pgResult) RowsAffected() (int64, error) {

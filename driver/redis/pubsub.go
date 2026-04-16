@@ -122,8 +122,9 @@ func (ps *PubSub) Channel() <-chan *Message {
 // full.
 func (ps *PubSub) Drops() uint64 { return ps.drops.Load() }
 
-// Subscribe adds channels to the subscription set.
-func (ps *PubSub) Subscribe(ctx context.Context, channels ...string) error {
+// Subscribe adds channels to the subscription set. The ctx argument is kept
+// for API symmetry with [Client.Subscribe]; cancellation is not honored.
+func (ps *PubSub) Subscribe(_ context.Context, channels ...string) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}
@@ -137,8 +138,9 @@ func (ps *PubSub) Subscribe(ctx context.Context, channels ...string) error {
 	return sendPubSubControl(conn, args)
 }
 
-// Unsubscribe removes channels. Empty list unsubscribes all.
-func (ps *PubSub) Unsubscribe(ctx context.Context, channels ...string) error {
+// Unsubscribe removes channels. Empty list unsubscribes all. The ctx argument
+// is kept for API symmetry; cancellation is not honored.
+func (ps *PubSub) Unsubscribe(_ context.Context, channels ...string) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}
@@ -156,8 +158,9 @@ func (ps *PubSub) Unsubscribe(ctx context.Context, channels ...string) error {
 	return sendPubSubControl(conn, args)
 }
 
-// PSubscribe adds patterns to the subscription set.
-func (ps *PubSub) PSubscribe(ctx context.Context, patterns ...string) error {
+// PSubscribe adds patterns to the subscription set. The ctx argument is kept
+// for API symmetry; cancellation is not honored.
+func (ps *PubSub) PSubscribe(_ context.Context, patterns ...string) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}
@@ -171,8 +174,9 @@ func (ps *PubSub) PSubscribe(ctx context.Context, patterns ...string) error {
 	return sendPubSubControl(conn, args)
 }
 
-// PUnsubscribe removes patterns. Empty list unsubscribes all patterns.
-func (ps *PubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
+// PUnsubscribe removes patterns. Empty list unsubscribes all patterns. The
+// ctx argument is kept for API symmetry; cancellation is not honored.
+func (ps *PubSub) PUnsubscribe(_ context.Context, patterns ...string) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}
@@ -191,8 +195,9 @@ func (ps *PubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
 }
 
 // SSubscribe adds shard channels (Redis 7+ SSUBSCRIBE) to the subscription
-// set. Shard channels are scoped to the cluster slot of the channel name.
-func (ps *PubSub) SSubscribe(ctx context.Context, channels ...string) error {
+// set. Shard channels are scoped to the cluster slot of the channel name. The
+// ctx argument is kept for API symmetry; cancellation is not honored.
+func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}
@@ -207,8 +212,9 @@ func (ps *PubSub) SSubscribe(ctx context.Context, channels ...string) error {
 }
 
 // SUnsubscribe removes shard channels. Empty list unsubscribes all shard
-// channels.
-func (ps *PubSub) SUnsubscribe(ctx context.Context, channels ...string) error {
+// channels. The ctx argument is kept for API symmetry; cancellation is not
+// honored.
+func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
 	if ps.closed.Load() {
 		return ErrClosed
 	}

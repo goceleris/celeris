@@ -147,6 +147,7 @@ func (r *pubsubRouter) clear() {
 	r.mu.Unlock()
 }
 
+//nolint:unparam // bool return kept for test introspection and backpressure
 func (r *pubsubRouter) deliver(m *Message) bool {
 	r.mu.Lock()
 	t := r.target

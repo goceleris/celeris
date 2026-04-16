@@ -110,14 +110,6 @@ func (f *fakeRedis) serve(c net.Conn) {
 	}
 }
 
-// readCommand parses a RESP2 array of bulk strings from r. Uses ReadSlice
-// (not ReadString) so the per-line buffer is not heap-allocated by bufio's
-// strings.Builder path — this keeps the fake server's steady-state loop
-// from polluting the driver's allocation measurements in TestAllocBudgets.
-func readCommand(r *bufio.Reader) ([]string, error) {
-	return readCommandInto(r, nil)
-}
-
 // internCmd short-circuits the string allocation for common command bytes.
 // TestAllocBudgets measures server-side allocs too (same goroutine path);
 // pipelines that hammer the same command (e.g. INCR ctr, GET k) otherwise

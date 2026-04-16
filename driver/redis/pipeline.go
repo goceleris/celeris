@@ -437,13 +437,6 @@ func (p *Pipeline) addCmd3(kind cmdKind, a0, a1, a2 string) int {
 	return len(p.cmds) - 1
 }
 
-// addCmd4 is the 4-arg fast path.
-func (p *Pipeline) addCmd4(kind cmdKind, a0, a1, a2, a3 string) int {
-	p.w.AppendCommand4(a0, a1, a2, a3)
-	p.cmds = append(p.cmds, pipeCmd{kind: kind})
-	return len(p.cmds) - 1
-}
-
 // ---------- Deferred result handles ----------
 //
 // Each typed Cmd stores a back-pointer to the owning Pipeline and the index

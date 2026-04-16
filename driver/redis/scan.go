@@ -37,8 +37,9 @@ type ScanIterator struct {
 }
 
 // Scan returns a new iterator. match is the pattern passed as MATCH (empty
-// means no MATCH arg). count is the COUNT hint (0 means no COUNT arg).
-func (c *Client) Scan(ctx context.Context, match string, count int64) *ScanIterator {
+// means no MATCH arg). count is the COUNT hint (0 means no COUNT arg). The
+// ctx argument is passed through on each Next call.
+func (c *Client) Scan(_ context.Context, match string, count int64) *ScanIterator {
 	return &ScanIterator{
 		client: c,
 		cursor: "0",

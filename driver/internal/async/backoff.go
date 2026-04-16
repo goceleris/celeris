@@ -27,9 +27,9 @@ type Backoff struct {
 }
 
 // NewBackoff returns a Backoff with a 0.2 jitter factor and the provided
-// base/cap (or the package defaults if either is <= 0).
-func NewBackoff(base, cap time.Duration) *Backoff {
-	return &Backoff{Base: base, Cap: cap, Jitter: 0.2}
+// base/max (or the package defaults if either is <= 0).
+func NewBackoff(base, maxDelay time.Duration) *Backoff {
+	return &Backoff{Base: base, Cap: maxDelay, Jitter: 0.2}
 }
 
 // Next returns the delay for attempt n (0-indexed) and advances the internal
@@ -40,9 +40,9 @@ func (b *Backoff) Next(attempt int) time.Duration {
 	if base <= 0 {
 		base = 50 * time.Millisecond
 	}
-	cap := b.Cap
-	if cap <= 0 {
-		cap = 5 * time.Second
+	maxDelay := b.Cap
+	if maxDelay <= 0 {
+		maxDelay = 5 * time.Second
 	}
 	jitter := b.Jitter
 	if jitter < 0 {
@@ -59,11 +59,11 @@ func (b *Backoff) Next(attempt int) time.Duration {
 	// Cap at 62 shifts so int64 doesn't overflow; well beyond any realistic
 	// Cap.
 	if attempt >= 62 {
-		d = cap
+		d = maxDelay
 	} else {
 		shifted := base << uint(attempt)
-		if shifted <= 0 || shifted > cap {
-			d = cap
+		if shifted <= 0 || shifted > maxDelay {
+			d = maxDelay
 		} else {
 			d = shifted
 		}

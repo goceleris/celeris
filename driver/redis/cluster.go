@@ -942,8 +942,9 @@ func (c *ClusterClient) Do(ctx context.Context, args ...any) (*protocol.Value, e
 }
 
 // ForEachNode calls fn on every node's Client. Used for cluster-wide
-// operations like FLUSHDB or DBSIZE.
-func (c *ClusterClient) ForEachNode(ctx context.Context, fn func(*Client) error) error {
+// operations like FLUSHDB or DBSIZE. The ctx argument is kept for API
+// symmetry; cancellation is not honored.
+func (c *ClusterClient) ForEachNode(_ context.Context, fn func(*Client) error) error {
 	c.mu.RLock()
 	nodes := make([]*clusterNode, 0, len(c.nodes))
 	for _, n := range c.nodes {

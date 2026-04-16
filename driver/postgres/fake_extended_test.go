@@ -173,22 +173,6 @@ func TestAllocBudgetsPreparedExec(t *testing.T) {
 	}
 }
 
-// writeErrorResponse builds and writes a PG ErrorResponse ('E') with the
-// given SQLSTATE code and message.
-func writeErrorResponse(c net.Conn, code, msg string) error {
-	var payload []byte
-	payload = append(payload, 'S')
-	payload = append(payload, "ERROR\x00"...)
-	payload = append(payload, 'C')
-	payload = append(payload, code...)
-	payload = append(payload, 0)
-	payload = append(payload, 'M')
-	payload = append(payload, msg...)
-	payload = append(payload, 0)
-	payload = append(payload, 0) // terminator
-	return writeMsg(c, protocol.BackendErrorResponse, payload)
-}
-
 // extendedFakeServerWithStaleStmt scripts a fake PG that:
 //   - handles the initial Prepare (Parse+Describe+Sync) normally
 //   - on the first Bind for the named stmt, returns ErrorResponse 26000

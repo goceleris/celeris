@@ -228,6 +228,8 @@ func (c *redisConn) onClose(err error) {
 // into their own send buffer) or write synchronously (std eventloop), so the
 // slice is safe to reuse once Write returns. writerMu serializes access so
 // two concurrent writes on the same conn can't clobber each other's buffer.
+//
+//nolint:unparam // returned buffer retained for async callers that reuse it
 func (c *redisConn) writeCommand(args ...string) ([]byte, error) {
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()

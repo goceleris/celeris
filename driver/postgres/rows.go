@@ -57,12 +57,6 @@ func acquirePGRows(cols []protocol.ColumnDesc, rows [][][]byte, textFormat bool,
 	return r
 }
 
-// newPGRows is retained for callers (tests) that synthesize rows without a
-// pgRequest backing — it takes the slow path of a freshly-allocated struct.
-func newPGRows(cols []protocol.ColumnDesc, rows [][][]byte, textFormat bool) *pgRows {
-	return &pgRows{columns: cols, rows: rows, textFormat: textFormat}
-}
-
 func (r *pgRows) Columns() []string {
 	out := make([]string, len(r.columns))
 	for i, c := range r.columns {
@@ -313,7 +307,7 @@ func (r *streamRows) Close() error {
 		return nil
 	}
 	// Drain remaining rows so dispatch doesn't block forever.
-	for range r.rowCh {
+	for range r.rowCh { //revive:disable-line:empty-block drain until closed
 	}
 	// Wait for the full request completion (ReadyForQuery).
 	<-r.doneCh

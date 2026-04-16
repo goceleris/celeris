@@ -12,13 +12,12 @@ import (
 
 // defaultHandler implements a minimal key/value/hash store for tests.
 type memStore struct {
-	mu     sync.Mutex
-	kv     map[string]string
-	hash   map[string]map[string]string
-	list   map[string][]string
-	set    map[string]map[string]struct{}
-	zset   map[string]map[string]float64
-	killed bool
+	mu   sync.Mutex
+	kv   map[string]string
+	hash map[string]map[string]string
+	list map[string][]string
+	set  map[string]map[string]struct{}
+	zset map[string]map[string]float64
 	// per-conn transaction buffers keyed by the *bufio.Writer receiving the
 	// conn's output — used by MULTI/EXEC path so the fake can stage queued
 	// commands per connection.

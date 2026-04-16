@@ -520,6 +520,10 @@ func (c *pgConn) buildMessage(fn func(*protocol.Writer) []byte) []byte {
 // dialConn dials a TCP connection to the DSN's host:port, sets it non-blocking,
 // and registers it with the given event loop. The returned pgConn is fully
 // initialized (including startup) and ready for queries.
+// dialConn accepts closeLoop for symmetry with Pool.dialConn; callers that
+// own the loop themselves (e.g. [Connector.Connect]) pass nil.
+//
+//nolint:unparam // closeLoop is always nil today but retained for pool reuse
 func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func(), dsn DSN, workerHint int) (*pgConn, error) {
 	if err := dsn.CheckSSL(); err != nil {
 		return nil, err
@@ -683,6 +687,8 @@ func (c *pgConn) enqueue(req *pgRequest) {
 // enqueue+pop lifecycle typical of serialized query use, we shift
 // remaining entries down instead of re-slicing with [1:] (which sheds
 // capacity one element at a time and forces the next Enqueue to realloc).
+//
+//nolint:unparam // callers sometimes ignore the return; kept symmetric
 func (c *pgConn) popHead() *pgRequest {
 	c.pendingMu.Lock()
 	n := len(c.pending)
@@ -1239,27 +1245,6 @@ func (c *pgConn) prepareStatement(ctx context.Context, name, query string) (*pro
 	}, nil
 }
 
-// closePreparedServer issues a Close 'S' + Sync for the named statement and
-// drains the response.
-func (c *pgConn) closePreparedServer(ctx context.Context, name string) error {
-	if c.closed.Load() || name == "" {
-		return nil
-	}
-	ps := &prepareState{name: name, phase: 3}
-	req := &pgRequest{ctx: ctx, kind: reqPrepare, prep: ps, doneCh: make(chan struct{})}
-	c.enqueue(req)
-	payload := c.buildMessage(func(w *protocol.Writer) []byte {
-		closeB := protocol.WriteClose(w, 'S', name)
-		syncB := protocol.WriteSync(w)
-		return joinBytes(closeB, syncB)
-	})
-	if err := c.loop.Write(c.fd, payload); err != nil {
-		c.failReq(req, err)
-		return err
-	}
-	return c.wait(ctx, req)
-}
-
 // closePreparedServerAsync is the fire-and-forget variant used for cache
 // eviction. It enqueues the Close 'S' + Sync but does NOT block on the
 // doneCh — if the server's reply never arrives, the pending request is
@@ -1459,6 +1444,10 @@ func drainStreamToPGRows(req *pgRequest, textFormat bool) *pgRows {
 	return acquirePGRows(req.columns, rows, textFormat, req, nil)
 }
 
+// simpleExec returns the command tag and rows-affected count. Callers may
+// ignore the int64, which remains here for future rows-affected consumers.
+//
+//nolint:unparam // rows-affected return retained for future callers
 func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, error) {
 	if c.closed.Load() {
 		return "", 0, ErrClosed
@@ -2069,7 +2058,7 @@ func (c *pgConn) ServerParam(name string) string {
 }
 
 // CheckNamedValue lets us accept any Go type and let encodeOne deal with it.
-func (c *pgConn) CheckNamedValue(v *driver.NamedValue) error {
+func (c *pgConn) CheckNamedValue(_ *driver.NamedValue) error {
 	return nil
 }
 

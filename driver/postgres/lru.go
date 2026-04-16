@@ -21,9 +21,9 @@ type lruEntry struct {
 	val *protocol.PreparedStmt
 }
 
-func newLRU(cap int) *lru {
+func newLRU(capacity int) *lru {
 	return &lru{
-		cap:   cap,
+		cap:   capacity,
 		ll:    list.New(),
 		items: map[string]*list.Element{},
 	}
@@ -74,6 +74,8 @@ func (l *lru) put(k string, v *protocol.PreparedStmt) []*protocol.PreparedStmt {
 
 // remove deletes the entry for k from the cache. Returns true if k was
 // present.
+//
+//nolint:unparam // return kept for future eviction callers
 func (l *lru) remove(k string) bool {
 	if l == nil || l.cap <= 0 {
 		return false
@@ -87,16 +89,6 @@ func (l *lru) remove(k string) bool {
 	delete(l.items, k)
 	l.ll.Remove(e)
 	return true
-}
-
-// empty reports whether the cache holds zero entries.
-func (l *lru) empty() bool {
-	if l == nil || l.cap <= 0 {
-		return true
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.ll.Len() == 0
 }
 
 // reset clears the cache. Called on reconnect — named statements do not

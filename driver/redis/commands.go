@@ -234,7 +234,7 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 func (c *Client) Set(ctx context.Context, key string, value any, expiration time.Duration) error {
 	args := []string{"SET", key, argify(value)}
 	args = appendExpire(args, expiration)
-	return c.do(ctx, func(v protocol.Value) error { return nil }, args...)
+	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
 }
 
 // SetNX sets key only if it does not exist.
@@ -716,7 +716,7 @@ func (c *Client) Type(ctx context.Context, key string) (string, error) {
 
 // Rename renames a key.
 func (c *Client) Rename(ctx context.Context, key, newKey string) error {
-	return c.do(ctx, func(v protocol.Value) error { return nil }, "RENAME", key, newKey)
+	return c.do(ctx, func(protocol.Value) error { return nil }, "RENAME", key, newKey)
 }
 
 // RandomKey returns a random key.
@@ -914,7 +914,7 @@ func (c *Client) MSet(ctx context.Context, pairs ...any) error {
 	for _, p := range pairs {
 		args = append(args, argify(p))
 	}
-	return c.do(ctx, func(v protocol.Value) error { return nil }, args...)
+	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
 }
 
 // IncrBy increments key by val and returns the new value.
@@ -968,7 +968,7 @@ func (c *Client) SetEX(ctx context.Context, key string, value any, ttl time.Dura
 	if secs <= 0 {
 		secs = 1
 	}
-	return c.do(ctx, func(v protocol.Value) error { return nil },
+	return c.do(ctx, func(protocol.Value) error { return nil },
 		"SETEX", key, strconv.FormatInt(secs, 10), argify(value))
 }
 
@@ -1069,15 +1069,15 @@ func (c *Client) ZRevRange(ctx context.Context, key string, start, stop int64) (
 	return out, err
 }
 
-// ZCount returns the count of members with scores between min and max
+// ZCount returns the count of members with scores between minScore and maxScore
 // (inclusive string boundaries, e.g. "-inf", "+inf", "1", "(5").
-func (c *Client) ZCount(ctx context.Context, key, min, max string) (int64, error) {
+func (c *Client) ZCount(ctx context.Context, key, minScore, maxScore string) (int64, error) {
 	var out int64
 	err := c.do(ctx, func(v protocol.Value) error {
 		n, e := asInt(v)
 		out = n
 		return e
-	}, "ZCOUNT", key, min, max)
+	}, "ZCOUNT", key, minScore, maxScore)
 	return out, err
 }
 
@@ -1174,7 +1174,7 @@ func (c *Client) PTTL(ctx context.Context, key string) (time.Duration, error) {
 
 // FlushDB removes all keys from the current database.
 func (c *Client) FlushDB(ctx context.Context) error {
-	return c.do(ctx, func(v protocol.Value) error { return nil }, "FLUSHDB")
+	return c.do(ctx, func(protocol.Value) error { return nil }, "FLUSHDB")
 }
 
 // DBSize returns the number of keys in the current database.

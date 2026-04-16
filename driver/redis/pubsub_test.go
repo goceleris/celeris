@@ -15,15 +15,9 @@ import (
 // serialize their writes.
 type pubsubBroker struct {
 	mu        sync.Mutex
-	pending   []pubmsg
 	subs      map[*bufio.Writer]map[string]struct{}
 	shardSubs map[*bufio.Writer]map[string]struct{}
 	fake      *fakeRedis // set after fake is started
-}
-
-type pubmsg struct {
-	channel string
-	payload string
 }
 
 func newBroker() *pubsubBroker {
