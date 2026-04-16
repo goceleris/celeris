@@ -317,8 +317,8 @@ func TestClusterSlot(t *testing.T) {
 		{"{user}.following", crc16("user") % 16384},
 		{"{user}.followers", crc16("user") % 16384},
 		{"abc{}{def}", crc16("abc{}{def}") % 16384}, // empty tag: hash whole key
-		{"{abc", crc16("{abc") % 16384},              // no closing brace
-		{"abc}", crc16("abc}") % 16384},              // no opening brace
+		{"{abc", crc16("{abc") % 16384},             // no closing brace
+		{"abc}", crc16("abc}") % 16384},             // no opening brace
 	}
 	for _, tt := range tests {
 		got := Slot(tt.key)

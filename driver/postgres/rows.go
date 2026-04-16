@@ -221,11 +221,11 @@ type streamRows struct {
 
 	rowCh  chan [][]byte          // bounded channel; closed by dispatch on completion
 	doneCh chan struct{}          // signaled after ReadyForQuery (request fully done)
-	req    *pgRequest            // owns slab memory; released on Close
+	req    *pgRequest             // owns slab memory; released on Close
 	errVal *atomic.Pointer[error] // points to req.streamErr; set before close(rowCh)
 
-	current [][]byte   // last row received from rowCh
-	err     error      // cached error from errVal
+	current [][]byte // last row received from rowCh
+	err     error    // cached error from errVal
 	closed  atomic.Bool
 }
 

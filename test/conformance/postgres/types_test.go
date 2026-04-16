@@ -37,8 +37,8 @@ func TestIntRoundTrip(t *testing.T) {
 	defer cancel()
 
 	cases := []struct {
-		typ  string
-		val  int64
+		typ string
+		val int64
 	}{
 		{"int2", -32768},
 		{"int2", 32767},

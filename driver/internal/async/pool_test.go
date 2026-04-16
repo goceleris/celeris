@@ -10,13 +10,13 @@ import (
 )
 
 type fakeConn struct {
-	worker     int
-	closed     atomic.Bool
-	created    time.Time
-	lastUsed   time.Time
-	maxLife    time.Duration
-	maxIdle    time.Duration
-	pingErr    error
+	worker   int
+	closed   atomic.Bool
+	created  time.Time
+	lastUsed time.Time
+	maxLife  time.Duration
+	maxIdle  time.Duration
+	pingErr  error
 }
 
 func (c *fakeConn) Ping(ctx context.Context) error {

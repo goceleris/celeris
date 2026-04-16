@@ -71,7 +71,7 @@ func TestWriteCopyMessages(t *testing.T) {
 
 func TestCopyInStateHappyPath(t *testing.T) {
 	s := &CopyInState{}
-	if _, err := s.Handle(BackendCopyInResponse, buildCopyResponse(0, []int16{0, 0}), ); err != nil {
+	if _, err := s.Handle(BackendCopyInResponse, buildCopyResponse(0, []int16{0, 0})); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Ready() {
@@ -79,7 +79,7 @@ func TestCopyInStateHappyPath(t *testing.T) {
 	}
 	// Driver streams CopyData (no state change) then sends CopyDone; server
 	// responds with CommandComplete + RFQ.
-	if _, err := s.Handle(BackendCommandComplete, buildCommandComplete("COPY 3"), ); err != nil {
+	if _, err := s.Handle(BackendCommandComplete, buildCommandComplete("COPY 3")); err != nil {
 		t.Fatal(err)
 	}
 	if s.Tag != "COPY 3" {

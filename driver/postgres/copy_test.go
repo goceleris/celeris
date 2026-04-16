@@ -319,4 +319,3 @@ func TestSavepointTxWireBytes(t *testing.T) {
 		}
 	}
 }
-

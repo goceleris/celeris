@@ -37,8 +37,8 @@ func FuzzRESPParse(f *testing.F) {
 		[]byte("|1\r\n+k\r\n+v\r\n"),
 		[]byte(">2\r\n+push\r\n+data\r\n"),
 		[]byte("?\r\n"),                   // invalid tag
-		[]byte("$999999999999999999\r\n"),  // oversized bulk
-		[]byte("*999999999999999999\r\n"),  // oversized array
+		[]byte("$999999999999999999\r\n"), // oversized bulk
+		[]byte("*999999999999999999\r\n"), // oversized array
 		[]byte("$5\r\nhel"),               // incomplete
 	}
 	for _, s := range seeds {

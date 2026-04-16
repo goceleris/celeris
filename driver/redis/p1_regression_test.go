@@ -18,7 +18,7 @@ import (
 // takes the early-error branch under test.
 type zeroWorkerProvider struct{}
 
-func (zeroWorkerProvider) NumWorkers() int                  { return 0 }
+func (zeroWorkerProvider) NumWorkers() int                    { return 0 }
 func (zeroWorkerProvider) WorkerLoop(n int) engine.WorkerLoop { panic("no workers") }
 
 // TestRedisDialConnNoPhantomCloseOnError guards against a double-close of

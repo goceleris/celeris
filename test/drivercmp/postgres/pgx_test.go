@@ -198,9 +198,9 @@ type copySource struct {
 	rows int
 }
 
-func (c *copySource) Next() bool                { c.i++; return c.i <= c.rows }
-func (c *copySource) Values() ([]any, error)    { return []any{c.i, fmt.Sprintf("row_%d", c.i)}, nil }
-func (c *copySource) Err() error                { return nil }
+func (c *copySource) Next() bool             { c.i++; return c.i <= c.rows }
+func (c *copySource) Values() ([]any, error) { return []any{c.i, fmt.Sprintf("row_%d", c.i)}, nil }
+func (c *copySource) Err() error             { return nil }
 
 func drainPgx(b *testing.B, p *pgxpool.Pool, ctx context.Context, q string) {
 	b.Helper()

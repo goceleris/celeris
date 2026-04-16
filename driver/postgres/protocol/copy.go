@@ -23,7 +23,7 @@ var CopyBinaryTrailer = []byte{0xff, 0xff}
 // CopyResponse holds CopyInResponse / CopyOutResponse / CopyBothResponse
 // metadata.
 type CopyResponse struct {
-	Format        int8    // 0=text, 1=binary
+	Format        int8 // 0=text, 1=binary
 	NumColumns    int16
 	ColumnFormats []int16 // length == NumColumns
 }
@@ -147,7 +147,7 @@ func (s *CopyInState) Handle(msgType byte, payload []byte) (bool, error) {
 type copyOutPhase int
 
 const (
-	copyOutWaiting   copyOutPhase = iota
+	copyOutWaiting copyOutPhase = iota
 	copyOutStreaming
 	copyOutFinished
 )

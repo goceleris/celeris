@@ -460,4 +460,3 @@ func TestOnPushPostConstruction(t *testing.T) {
 	_ = called
 	mu.Unlock()
 }
-

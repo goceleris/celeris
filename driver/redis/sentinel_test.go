@@ -52,8 +52,6 @@ func (fs *fakeSentinel) SetMaster(addr string) {
 	fs.switchCh <- payload
 }
 
-
-
 func (fs *fakeSentinel) handler(cmd []string, w *bufio.Writer) {
 	if len(cmd) == 0 {
 		return

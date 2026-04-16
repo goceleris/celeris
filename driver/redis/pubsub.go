@@ -40,9 +40,9 @@ type PubSub struct {
 	subs      map[string]struct{}
 	psubs     map[string]struct{}
 	shardSubs map[string]struct{}
-	msgCh   chan *Message
-	closeCh chan struct{}
-	closed  atomic.Bool
+	msgCh     chan *Message
+	closeCh   chan struct{}
+	closed    atomic.Bool
 
 	// reconnecting is set while a reconnect goroutine is active. Guards
 	// against double-fires from both onRecv-error and onClose in the same

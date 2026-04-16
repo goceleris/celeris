@@ -486,7 +486,7 @@ func TestDecodeNumericSmallFraction(t *testing.T) {
 	// Old code panicked because the loop started at i = weight+1 = -1,
 	// causing an out-of-bounds access on the digits slice.
 	src := make([]byte, 10)
-	binary.BigEndian.PutUint16(src[0:2], 1)     // ndigits
+	binary.BigEndian.PutUint16(src[0:2], 1)      // ndigits
 	binary.BigEndian.PutUint16(src[2:4], 0xFFFE) // weight = -2 (int16)
 	binary.BigEndian.PutUint16(src[4:6], 0)      // sign positive
 	binary.BigEndian.PutUint16(src[6:8], 8)      // dscale
@@ -506,10 +506,10 @@ func TestDecodeNumericVerySmallFraction(t *testing.T) {
 	// 0.000000001234: weight=-3, ndigits=1, dscale=12, digits=[1234]
 	src := make([]byte, 10)
 	binary.BigEndian.PutUint16(src[0:2], 1)      // ndigits
-	binary.BigEndian.PutUint16(src[2:4], 0xFFFD)  // weight = -3 (int16)
-	binary.BigEndian.PutUint16(src[4:6], 0)       // sign positive
-	binary.BigEndian.PutUint16(src[6:8], 12)      // dscale
-	binary.BigEndian.PutUint16(src[8:10], 1234)   // digits[0]
+	binary.BigEndian.PutUint16(src[2:4], 0xFFFD) // weight = -3 (int16)
+	binary.BigEndian.PutUint16(src[4:6], 0)      // sign positive
+	binary.BigEndian.PutUint16(src[6:8], 12)     // dscale
+	binary.BigEndian.PutUint16(src[8:10], 1234)  // digits[0]
 
 	v, err := decodeNumericBinary(src)
 	if err != nil {

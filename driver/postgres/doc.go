@@ -78,13 +78,14 @@
 //
 //  1. (*postgres.Tx).Savepoint / ReleaseSavepoint / RollbackToSavepoint on
 //     the direct Pool transaction.
+//
 //  2. database/sql via sql.Conn.Raw + the exported [Conn] alias:
 //
 //     conn, _ := db.Conn(ctx)
 //     defer conn.Close()
 //     _ = conn.Raw(func(raw any) error {
-//         pc := raw.(*postgres.Conn)
-//         return pc.Savepoint(ctx, "sp1")
+//     pc := raw.(*postgres.Conn)
+//     return pc.Savepoint(ctx, "sp1")
 //     })
 //
 //  3. Raw simple queries ("SAVEPOINT sp1") issued through Exec on a

@@ -285,7 +285,7 @@ func readRESP(r *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
-func respSimple(w *bufio.Writer, s string)   { _, _ = w.WriteString("+" + s + "\r\n") }
+func respSimple(w *bufio.Writer, s string) { _, _ = w.WriteString("+" + s + "\r\n") }
 func respBulk(w *bufio.Writer, s string) {
 	_, _ = w.WriteString("$" + strconv.Itoa(len(s)) + "\r\n" + s + "\r\n")
 }

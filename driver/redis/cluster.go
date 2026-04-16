@@ -76,9 +76,9 @@ type ClusterClient struct {
 	cfg ClusterConfig
 
 	mu       sync.RWMutex
-	nodes    map[string]*clusterNode   // addr -> node
-	slots    [16384]*clusterNode       // slot -> primary node
-	replicas [16384][]*clusterNode     // slot -> replica nodes
+	nodes    map[string]*clusterNode // addr -> node
+	slots    [16384]*clusterNode     // slot -> primary node
+	replicas [16384][]*clusterNode   // slot -> replica nodes
 
 	replicaIdx atomic.Uint64 // round-robin counter for replica selection
 

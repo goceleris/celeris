@@ -196,8 +196,8 @@ func TestResolveStandalone(t *testing.T) {
 
 type mockProvider struct{}
 
-func (m *mockProvider) NumWorkers() int                      { return 1 }
-func (m *mockProvider) WorkerLoop(n int) engine.WorkerLoop   { return nil }
+func (m *mockProvider) NumWorkers() int                    { return 1 }
+func (m *mockProvider) WorkerLoop(n int) engine.WorkerLoop { return nil }
 
 type fakeServer struct {
 	p engine.EventLoopProvider

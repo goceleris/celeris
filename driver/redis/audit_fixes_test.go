@@ -542,7 +542,7 @@ func TestContextCancelDoesNotDesync(t *testing.T) {
 	var (
 		mu    sync.Mutex
 		slow  = make(chan struct{}) // closed when fake should reply to GET
-		phase atomic.Int32         // 0 = stall, 1 = reply normally
+		phase atomic.Int32          // 0 = stall, 1 = reply normally
 	)
 	fake := startFakeRedis(t, func(cmd []string, w *bufio.Writer) {
 		switch strings.ToUpper(cmd[0]) {

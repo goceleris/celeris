@@ -91,13 +91,13 @@ func TestRowsAffected(t *testing.T) {
 		n  int64
 		ok bool
 	}{
-		"SELECT 5":    {5, true},
-		"INSERT 0 3":  {3, true},
-		"UPDATE 12":   {12, true},
-		"DELETE 0":    {0, true},
+		"SELECT 5":     {5, true},
+		"INSERT 0 3":   {3, true},
+		"UPDATE 12":    {12, true},
+		"DELETE 0":     {0, true},
 		"CREATE TABLE": {0, false},
-		"":            {0, false},
-		"INSERT 0":    {0, false},
+		"":             {0, false},
+		"INSERT 0":     {0, false},
 	}
 	for tag, want := range cases {
 		got, ok := RowsAffected(tag)

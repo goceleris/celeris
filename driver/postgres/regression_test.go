@@ -499,7 +499,7 @@ func TestPgExecReturningLargeResult(t *testing.T) {
 // the *os.File wrapper was still live (with finalizer armed).
 type zeroWorkerProvider struct{}
 
-func (zeroWorkerProvider) NumWorkers() int                  { return 0 }
+func (zeroWorkerProvider) NumWorkers() int                    { return 0 }
 func (zeroWorkerProvider) WorkerLoop(n int) engine.WorkerLoop { panic("no workers") }
 
 // TestPgDialConnNoPhantomCloseOnError guards against a double-close of

@@ -13,16 +13,16 @@ const ProtocolVersion int32 = 3 << 16
 
 // Authentication subtypes carried in the 'R' message's int32 body prefix.
 const (
-	AuthOK                 int32 = 0
-	AuthKerberosV5         int32 = 2
-	AuthCleartextPassword  int32 = 3
-	AuthMD5Password        int32 = 5
-	AuthGSS                int32 = 7
-	AuthGSSContinue        int32 = 8
-	AuthSSPI               int32 = 9
-	AuthSASL               int32 = 10
-	AuthSASLContinue       int32 = 11
-	AuthSASLFinal          int32 = 12
+	AuthOK                int32 = 0
+	AuthKerberosV5        int32 = 2
+	AuthCleartextPassword int32 = 3
+	AuthMD5Password       int32 = 5
+	AuthGSS               int32 = 7
+	AuthGSSContinue       int32 = 8
+	AuthSSPI              int32 = 9
+	AuthSASL              int32 = 10
+	AuthSASLContinue      int32 = 11
+	AuthSASLFinal         int32 = 12
 )
 
 // SCRAM mechanism names advertised in AuthenticationSASL.
@@ -51,10 +51,10 @@ const (
 // A StartupState is single-use: once done is true, it must not receive more
 // messages. Use a fresh instance per connection.
 type StartupState struct {
-	User         string
-	Password     string
-	Database     string
-	Params       map[string]string
+	User     string
+	Password string
+	Database string
+	Params   map[string]string
 
 	// Populated as the exchange proceeds.
 	PID          int32
@@ -272,7 +272,8 @@ func writeSASLResponse(w *Writer, msg []byte) []byte {
 }
 
 // md5Hash computes the MD5-password response:
-//   "md5" + hex(md5(hex(md5(password + user)) + salt))
+//
+//	"md5" + hex(md5(hex(md5(password + user)) + salt))
 func md5Hash(password, user string, salt []byte) string {
 	inner := md5.Sum([]byte(password + user))
 	innerHex := hex.EncodeToString(inner[:])

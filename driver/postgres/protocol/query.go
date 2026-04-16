@@ -311,9 +311,9 @@ func RowsAffected(tag string) (int64, bool) {
 type simpleQueryPhase int
 
 const (
-	sqPhaseAwaitResult simpleQueryPhase = iota // expect T, I, C, E
-	sqPhaseAwaitRowsOrDone                     // after RowDescription: expect D, C
-	sqPhaseDone                                // ReadyForQuery seen
+	sqPhaseAwaitResult     simpleQueryPhase = iota // expect T, I, C, E
+	sqPhaseAwaitRowsOrDone                         // after RowDescription: expect D, C
+	sqPhaseDone                                    // ReadyForQuery seen
 )
 
 // SimpleQueryState drives the client side of a Query ('Q') round trip.

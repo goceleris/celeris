@@ -838,8 +838,8 @@ func TestCopy(t *testing.T) {
 		// Row: 1 field, int4, value=42.
 		var row bytes.Buffer
 		binary.Write(&row, binary.BigEndian, int16(1))  // field count
-		binary.Write(&row, binary.BigEndian, int32(4))   // field length
-		binary.Write(&row, binary.BigEndian, int32(42))  // value
+		binary.Write(&row, binary.BigEndian, int32(4))  // field length
+		binary.Write(&row, binary.BigEndian, int32(42)) // value
 		stream = append(stream, row.Bytes()...)
 		// Trailer.
 		stream = append(stream, protocol.CopyBinaryTrailer...)
@@ -1176,14 +1176,14 @@ func TestTypes(t *testing.T) {
 		}
 
 		expected := map[int]string{
-			0:  "t",                                      // bool
-			1:  "32767",                                  // int2
-			2:  "2147483647",                             // int4
-			3:  "9223372036854775807",                    // int8
-			6:  "hello pgspec",                           // text
-			7:  "\\xdeadbeef",                            // bytea
-			8:  "2024-06-15",                             // date
-			13: "12345.6789",                             // numeric
+			0:  "t",                   // bool
+			1:  "32767",               // int2
+			2:  "2147483647",          // int4
+			3:  "9223372036854775807", // int8
+			6:  "hello pgspec",        // text
+			7:  "\\xdeadbeef",         // bytea
+			8:  "2024-06-15",          // date
+			13: "12345.6789",          // numeric
 		}
 		for idx, want := range expected {
 			got := string(fields[idx])

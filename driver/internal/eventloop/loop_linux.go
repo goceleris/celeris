@@ -129,7 +129,6 @@ func newWorker(id int) (*worker, error) {
 	}, nil
 }
 
-
 func (w *worker) shutdown() error {
 	if !w.closed.CompareAndSwap(false, true) {
 		return nil
