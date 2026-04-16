@@ -71,6 +71,14 @@ type Loop struct {
 	detachQSpare   []*connState // reuse slice to avoid alloc in drainDetachQueue
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
 	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
+
+	// Driver integration (EventLoopProvider). The hasDriverConns gate is the
+	// ONLY check the HTTP hot path pays when no drivers are registered; it
+	// must stay an atomic.Bool load, not a map read.
+	driverConns    map[int]*driverConn
+	driverMu       sync.RWMutex
+	hasDriverConns atomic.Bool
+	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -243,6 +251,16 @@ func (l *Loop) run(ctx context.Context) {
 			if fd == l.listenFD && l.listenFD >= 0 {
 				l.acceptAll(ctx, now)
 				continue
+			}
+
+			// Driver fast-path: single atomic load when no drivers are
+			// registered (zero-cost for pure-HTTP workloads). The map
+			// lookup happens only when the gate is true.
+			if l.hasDriverConns.Load() {
+				if dc := l.lookupDriver(fd); dc != nil {
+					l.handleDriverEvent(dc, ev.Events)
+					continue
+				}
 			}
 
 			// Process EPOLLIN before EPOLLHUP: a peer may send data and
@@ -485,6 +503,37 @@ func (l *Loop) drainRead(fd int, now int64) {
 		switch cs.protocol {
 		case engine.HTTP1:
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
+			if errors.Is(processErr, conn.ErrUpgradeH2C) {
+				// H1→H2 promotion. switchToH2 consumes the upgrade info,
+				// installs H2 state, and feeds any preface bytes synchronously.
+				if err := l.switchToH2(cs, writeFn); err != nil {
+					l.closeConn(fd)
+					return
+				}
+				// Flush the buffered 101 Switching Protocols response and any
+				// H2 server preface + stream 1 response bytes that switchToH2
+				// may have queued. The normal inline-flush block below is
+				// skipped by the `continue` so we must flush explicitly here,
+				// otherwise the client blocks forever waiting for the 101.
+				if cs.writePos < len(cs.writeBuf) {
+					if fErr := flushWrites(cs); fErr != nil {
+						l.closeConn(fd)
+						return
+					}
+					if cs.writePos >= len(cs.writeBuf) {
+						cs.pendingBytes = 0
+						if cs.dirty {
+							l.removeDirty(cs)
+						}
+					} else {
+						cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+						l.markDirty(cs)
+					}
+				}
+				// Fall through to continue the loop; subsequent reads go
+				// through the H2 path via cs.protocol switch above.
+				continue
+			}
 		case engine.H2C:
 			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
 		}
@@ -608,6 +657,7 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
+		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
 			mu := &sync.Mutex{}
@@ -691,6 +741,38 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 		l.h2Conns = append(l.h2Conns, cs.fd)
 	}
+}
+
+// switchToH2 promotes an H1 connection to H2 mid-stream (RFC 7540 §3.2).
+// Called immediately after ProcessH1 returns ErrUpgradeH2C. The H1 state
+// is released; a new H2 state is built with the upgrade info already
+// applied (server preface written, client settings absorbed, stream 1
+// injected). Any residual bytes from the recv buffer (which may include
+// the H2 client preface and initial SETTINGS frame) are fed through
+// ProcessH2 synchronously so no data is dropped at the protocol boundary.
+func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
+	info := cs.h1State.UpgradeInfo
+	// Build H2 state FIRST. If it fails, cs.h1State remains intact so the
+	// caller's cleanup path can release it properly.
+	h2State, err := conn.NewH2StateFromUpgrade(l.handler, l.h2cfg, writeFn, l.eventFD, info)
+	if err != nil {
+		cs.h1State.UpgradeInfo = nil
+		return err
+	}
+	cs.h1State.UpgradeInfo = nil
+	conn.CloseH1(cs.h1State)
+	cs.h1State = nil
+	cs.h2State = h2State
+	cs.h2State.SetRemoteAddr(cs.remoteAddr)
+	cs.protocol = engine.H2C
+	l.h2Conns = append(l.h2Conns, cs.fd)
+
+	if len(info.Remaining) > 0 {
+		if err := conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, l.handler, writeFn, l.h2cfg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
@@ -914,6 +996,7 @@ func (l *Loop) closeConn(fd int) {
 }
 
 func (l *Loop) shutdown() {
+	l.shutdownDrivers()
 	for fd := 0; fd <= l.maxFD; fd++ {
 		cs := l.conns[fd]
 		if cs == nil {
