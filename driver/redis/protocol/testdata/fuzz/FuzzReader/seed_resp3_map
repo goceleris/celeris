@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("%2\r\n$3\r\nkey\r\n$3\r\nval\r\n$4\r\nkey2\r\n$4\r\nval2\r\n")
