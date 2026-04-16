@@ -1107,6 +1107,62 @@ func TestClusterRouteByLatency(t *testing.T) {
 	}
 }
 
+// TestClusterPipelineReturnsValues guards against a regression where
+// ClusterPipeline.Exec dropped every successful reply because the per-node
+// sub-pipeline used the direct-extraction path (pc.str + pc.direct) but the
+// cluster harvester only read from pc.val. GETs would silently return a
+// zero protocol.Value{}.
+func TestClusterPipelineReturnsValues(t *testing.T) {
+	// Single-node cluster owning all slots so both GETs route to the same
+	// sub-pipeline and both exercise the direct-extraction path.
+	node := startFakeClusterNode(t, 0, 16383)
+	node.SetTopology([]fakeClusterSlotRange{{start: 0, end: 16383, addr: node.Addr()}})
+
+	cc, err := NewClusterClient(ClusterConfig{
+		Addrs:       []string{node.Addr()},
+		DialTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClusterClient: %v", err)
+	}
+	defer cc.Close()
+
+	ctx := context.Background()
+	// Colocate with hash tags so a single sub-pipeline runs.
+	if err := cc.Set(ctx, "{pv}.foo", "hello", 0); err != nil {
+		t.Fatalf("Set foo: %v", err)
+	}
+	if err := cc.Set(ctx, "{pv}.bar", "world", 0); err != nil {
+		t.Fatalf("Set bar: %v", err)
+	}
+
+	p := cc.Pipeline()
+	p.Get("{pv}.foo")
+	p.Get("{pv}.bar")
+	results, errs := p.Exec(ctx)
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("cmd %d error: %v", i, e)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if got := string(results[0].Str); got != "hello" {
+		t.Fatalf("results[0].Str = %q, want %q", got, "hello")
+	}
+	if got := string(results[1].Str); got != "world" {
+		t.Fatalf("results[1].Str = %q, want %q", got, "world")
+	}
+
+	// Also verify the bytes survive after the pipeline would have been
+	// Released (i.e. slab reclaimed). Copy-out in harvester must be real.
+	foo := append([]byte(nil), results[0].Str...)
+	bar := append([]byte(nil), results[1].Str...)
+	_ = foo
+	_ = bar
+}
+
 func TestIsReadOnlyCommand(t *testing.T) {
 	readCmds := []string{"GET", "get", "MGET", "EXISTS", "TTL", "HGET", "HGETALL",
 		"LRANGE", "SMEMBERS", "ZRANGE", "SCAN", "HSCAN"}

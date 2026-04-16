@@ -1034,6 +1034,28 @@ func stringsToAnys(ss []string) []any {
 	return out
 }
 
+// directToValue synthesizes a protocol.Value from a pipeCmd that used the
+// direct-extraction path. String bytes are copied out of the pipeline's
+// slab (pc.str aliases p.strSlab which is reclaimed on Release). Scalars
+// are decoded from pc.scalar according to the command kind.
+func directToValue(pc *pipeCmd) protocol.Value {
+	switch pc.kind {
+	case kindString:
+		return protocol.Value{Type: protocol.TyBulk, Str: []byte(pc.str)}
+	case kindStatus:
+		return protocol.Value{Type: protocol.TySimple, Str: []byte(pc.str)}
+	case kindInt:
+		return protocol.Value{Type: protocol.TyInt, Int: pc.scalar}
+	case kindFloat:
+		return protocol.Value{Type: protocol.TyDouble, Float: math.Float64frombits(uint64(pc.scalar))}
+	case kindBool:
+		return protocol.Value{Type: protocol.TyBool, Bool: pc.scalar != 0}
+	default:
+		// Unknown/array: direct path should not have been taken, but be safe.
+		return protocol.Value{Type: protocol.TyBulk, Str: []byte(pc.str)}
+	}
+}
+
 // execRound groups cmds by slot, runs sub-pipelines, and scans results for
 // MOVED/ASK errors. On the first round (isRetry=false), redirect errors
 // trigger a single retry round; on a retry round, redirect errors are
@@ -1072,7 +1094,7 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 			defer p.Release()
 			cmdIdxes := make([]int, len(icmds))
 			for i, ic := range icmds {
-				p.addCmd(kindString, ic.cmd.args...)
+				p.addCmd(ic.cmd.kind, ic.cmd.args...)
 				cmdIdxes[i] = ic.origIdx
 			}
 			execErr := p.Exec(ctx)
@@ -1086,6 +1108,13 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 						errs[origIdx] = pc.err
 					} else if pc.val != nil {
 						results[origIdx] = *pc.val
+					} else if pc.direct {
+						// Direct path: typed result lives in pc.str / pc.scalar
+						// and pc.str is backed by p.strSlab which will be
+						// reclaimed by the deferred p.Release(). Synthesize a
+						// protocol.Value and copy any string data out of the
+						// slab so the caller sees stable bytes.
+						results[origIdx] = directToValue(pc)
 					}
 				}
 			}
