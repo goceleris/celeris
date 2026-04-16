@@ -1163,11 +1163,30 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 				errs[i] = nerr
 				continue
 			}
-			if _, askErr := n.client.Do(ctx, "ASKING"); askErr != nil {
+			// Redis requires ASKING and the following command to arrive on
+			// the same TCP connection. Pin a conn across both calls (mirrors
+			// the single-command doASK pattern above).
+			conn, aerr := n.client.pool.acquireCmd(ctx, -1)
+			if aerr != nil {
+				errs[i] = aerr
+				continue
+			}
+			req, askErr := conn.exec(ctx, "ASKING")
+			if askErr != nil {
+				n.client.pool.releaseCmd(conn)
 				errs[i] = askErr
 				continue
 			}
-			v, doErr := n.client.Do(ctx, stringsToAnys(cp.cmds[i].args)...)
+			if req.resultErr != nil {
+				conn.releaseResult(req)
+				n.client.pool.releaseCmd(conn)
+				errs[i] = req.resultErr
+				continue
+			}
+			conn.releaseResult(req)
+			pinCtx := context.WithValue(ctx, pinnedConnKey{}, conn)
+			v, doErr := n.client.Do(pinCtx, stringsToAnys(cp.cmds[i].args)...)
+			n.client.pool.releaseCmd(conn)
 			if doErr != nil {
 				errs[i] = doErr
 			} else if v != nil {

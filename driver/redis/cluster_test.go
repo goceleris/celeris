@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1105,6 +1106,241 @@ func TestClusterRouteByLatency(t *testing.T) {
 	if slowGets > fastGets {
 		t.Errorf("slow replica got %d GETs, fast replica got %d GETs; expected fast >= slow", slowGets, fastGets)
 	}
+}
+
+// TestClusterPipelineASKPinsConn guards against a regression where the
+// cluster pipeline's ASK retry issued ASKING and the command on two
+// different conns (separate acquireCmd calls). Redis requires both to land
+// on the same TCP connection.
+func TestClusterPipelineASKPinsConn(t *testing.T) {
+	// node2 tracks per-conn sequences so we can assert ASKING preceded the
+	// command on the SAME connection.
+	type conEvent struct {
+		writerID uintptr
+		cmd      string
+	}
+	var node2Events []conEvent
+	var node2Mu sync.Mutex
+	// Real Redis only accepts the next command after ASKING on the SAME
+	// TCP conn — any other conn responds with MOVED. We mirror that here
+	// via per-conn ASKING state keyed by the writer pointer.
+	askedPerConn := map[uintptr]bool{}
+	var askMu sync.Mutex
+
+	// raceHook fires immediately AFTER node2 replies to ASKING. A test
+	// goroutine uses this window to grab the just-released conn out of
+	// the pool before the cluster pipeline's follow-up GET can
+	// re-acquire it. Without the ASK-pins-conn fix, this reliably forces
+	// the GET onto a DIFFERENT conn than the ASKING — and the strict
+	// MOVED rule above then surfaces the bug as a failing GET reply.
+	askingReplied := make(chan struct{}, 1)
+
+	mem := newMem()
+	node2Fake := startFakeRedis(t, func(cmd []string, w *bufio.Writer) {
+		if len(cmd) == 0 {
+			return
+		}
+		upper := strings.ToUpper(cmd[0])
+		wID := uintptrOfWriter(w)
+		// Record every non-handshake command with its writer identity.
+		switch upper {
+		case "HELLO", "CLUSTER":
+			// handshake / topology: do not record
+		default:
+			node2Mu.Lock()
+			node2Events = append(node2Events, conEvent{
+				writerID: wID,
+				cmd:      upper,
+			})
+			node2Mu.Unlock()
+		}
+		switch upper {
+		case "HELLO":
+			proto := 2
+			if len(cmd) > 1 && cmd[1] == "3" {
+				proto = 3
+			}
+			handleHELLO(w, proto)
+			return
+		case "ASKING":
+			askMu.Lock()
+			askedPerConn[wID] = true
+			askMu.Unlock()
+			writeSimple(w, "OK")
+			// Signal the race goroutine that ASKING's reply is on the
+			// wire. It will try to grab the same conn out of node2's
+			// pool before the pipeline code re-acquires it for GET.
+			select {
+			case askingReplied <- struct{}{}:
+			default:
+			}
+			return
+		case "CLUSTER":
+			writeError(w, "ERR unsupported here")
+			return
+		case "GET":
+			// Strict ASK semantics: the migrating slot's owner requires
+			// ASKING to have been sent on THIS same conn before the GET.
+			if len(cmd) >= 2 && strings.HasPrefix(cmd[1], "ask-") {
+				askMu.Lock()
+				ok := askedPerConn[wID]
+				delete(askedPerConn, wID) // consume the flag, per-cmd
+				askMu.Unlock()
+				if !ok {
+					writeError(w, "MOVED 0 127.0.0.1:0") // mimic: ASKING missing
+					return
+				}
+			}
+		}
+		mem.handler(cmd, w)
+	})
+
+	// node1 owns all slots per its own topology, but responds to our target
+	// key with ASK pointing to node2.
+	var node1Addr atomic.Value
+	node1Fake := startFakeRedis(t, func(cmd []string, w *bufio.Writer) {
+		if len(cmd) == 0 {
+			return
+		}
+		upper := strings.ToUpper(cmd[0])
+		switch upper {
+		case "HELLO":
+			proto := 2
+			if len(cmd) > 1 && cmd[1] == "3" {
+				proto = 3
+			}
+			handleHELLO(w, proto)
+			return
+		case "CLUSTER":
+			if len(cmd) >= 2 && strings.ToUpper(cmd[1]) == "SLOTS" {
+				addr, _ := node1Addr.Load().(string)
+				writeArrayHeader(w, 1)
+				writeArrayHeader(w, 3)
+				writeInt(w, 0)
+				writeInt(w, 16383)
+				host, port, _ := splitHostPort(addr)
+				writeArrayHeader(w, 3)
+				writeBulk(w, host)
+				writeInt(w, parseInt(port))
+				writeBulk(w, "node-1")
+				return
+			}
+			writeError(w, "ERR unknown")
+			return
+		case "GET":
+			if len(cmd) >= 2 && strings.HasPrefix(cmd[1], "ask-") {
+				writeError(w, fmt.Sprintf("ASK %d %s", Slot(cmd[1]), node2Fake.Addr()))
+				return
+			}
+		}
+		writeNullBulk(w)
+	})
+	node1Addr.Store(node1Fake.Addr())
+
+	cc, err := NewClusterClient(ClusterConfig{
+		Addrs:       []string{node1Fake.Addr()},
+		DialTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClusterClient: %v", err)
+	}
+	defer cc.Close()
+
+	// Seed the value on node2's in-memory store so the ASK retry can fetch it.
+	mem.mu.Lock()
+	mem.kv["ask-key"] = "pinned-value"
+	mem.mu.Unlock()
+
+	ctx := context.Background()
+	// Warm node2's pool with multiple conns via concurrent PINGs so the
+	// pool has several idle candidates, making it possible for a buggy
+	// (unpinned) ASK+GET retry to land on different conns.
+	n2, err := cc.getOrCreateNode(node2Fake.Addr())
+	if err != nil {
+		t.Fatalf("getOrCreateNode node2: %v", err)
+	}
+	var warm sync.WaitGroup
+	const nConns = 8
+	startBarrier := make(chan struct{})
+	for i := 0; i < nConns; i++ {
+		warm.Add(1)
+		go func() {
+			defer warm.Done()
+			<-startBarrier
+			_, _ = n2.client.Do(ctx, "PING")
+		}()
+	}
+	close(startBarrier)
+	warm.Wait()
+
+	// Race goroutine: as soon as ASKING's reply hits the wire, hammer
+	// node2 with concurrent PINGs. Without the fix, ASKING's conn
+	// returns to the idle pool and one of these PINGs can steal it
+	// before the pipeline re-acquires for GET — forcing GET onto a
+	// different conn whose ASKING flag is unset, so node2 responds
+	// with MOVED and the pipeline GET fails.
+	raceDone := make(chan struct{})
+	go func() {
+		defer close(raceDone)
+		<-askingReplied
+		var rg sync.WaitGroup
+		for i := 0; i < 64; i++ {
+			rg.Add(1)
+			go func() {
+				defer rg.Done()
+				_, _ = n2.client.Do(ctx, "PING")
+			}()
+		}
+		rg.Wait()
+	}()
+
+	p := cc.Pipeline()
+	p.Get("ask-key")
+	results, errs := p.Exec(ctx)
+	<-raceDone
+	if len(errs) != 1 || errs[0] != nil {
+		t.Fatalf("unexpected errs: %v", errs)
+	}
+	if got := string(results[0].Str); got != "pinned-value" {
+		t.Fatalf("results[0].Str = %q, want %q (ASK retry likely landed on a different conn than ASKING)", got, "pinned-value")
+	}
+
+	// Verify the GET for "ask-key" landed on the SAME conn that received
+	// the ASKING. Iterate to find the ASKING and the first following GET
+	// (there may be concurrent PINGs mixed in due to the race goroutine).
+	node2Mu.Lock()
+	defer node2Mu.Unlock()
+	var askingEv *conEvent
+	var getEv *conEvent
+	for i := range node2Events {
+		ev := &node2Events[i]
+		if askingEv == nil && ev.cmd == "ASKING" {
+			askingEv = ev
+			continue
+		}
+		if askingEv != nil && ev.cmd == "GET" {
+			getEv = ev
+			break
+		}
+	}
+	if askingEv == nil {
+		t.Fatalf("node2 never received ASKING; events=%+v", node2Events)
+	}
+	if getEv == nil {
+		t.Fatalf("no GET followed ASKING; events=%+v", node2Events)
+	}
+	if askingEv.writerID != getEv.writerID {
+		t.Fatalf("ASKING (writer %x) and GET (writer %x) landed on different conns",
+			askingEv.writerID, getEv.writerID)
+	}
+}
+
+// uintptrOfWriter returns a stable identity for a *bufio.Writer so tests
+// can correlate commands that arrived over the same TCP connection.
+func uintptrOfWriter(w *bufio.Writer) uintptr {
+	// The writer is created once per conn in fakeRedis.serve, so its
+	// address is a valid per-conn identifier for the lifetime of that conn.
+	return reflect.ValueOf(w).Pointer()
 }
 
 // TestClusterPipelineReturnsValues guards against a regression where
