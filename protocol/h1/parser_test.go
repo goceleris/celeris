@@ -626,3 +626,171 @@ func TestFindHeaderEnd_PartialSequence(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRequest_H2CUpgrade(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string
+		wantUpgrade bool
+		wantSet     string // expected HTTP2Settings value (may be empty)
+	}{
+		{
+			name: "happy path",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n",
+			wantUpgrade: true,
+			wantSet:     "AAMAAABkAARAAAAAAAIAAAAA",
+		},
+		{
+			name: "case variations",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"CONNECTION: UPGRADE, http2-Settings\r\n" +
+				"UPGRADE: H2C\r\n" +
+				"Http2-SETTINGS: abc\r\n\r\n",
+			wantUpgrade: true,
+			wantSet:     "abc",
+		},
+		{
+			name: "reversed connection tokens",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: http2-settings, upgrade\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: true,
+			wantSet:     "abc",
+		},
+		{
+			name: "missing HTTP2-Settings",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "missing Upgrade token in Connection",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "missing HTTP2-Settings token in Connection",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "wrong Upgrade value (websocket)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: websocket\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "multiple upgrade tokens (ambiguous, reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: websocket, h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "h2c with trailing token (ambiguous, reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c, foo\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "empty HTTP2-Settings value",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: \r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "no upgrade headers",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			// Regression: two separate Upgrade headers. The first is non-h2c
+			// (disqualifying); the second sets h2c. The one-way disqualifier
+			// latch must prevent the second header from re-enabling the flag
+			// (otherwise an attacker could smuggle an h2c upgrade past a
+			// reverse proxy that inspects only the first Upgrade line).
+			name: "multiple Upgrade headers: websocket then h2c (reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			// Symmetric case: h2c first, then a non-h2c header. The latch
+			// must disqualify because the presence of a second non-h2c
+			// Upgrade token means this is a multi-protocol upgrade, not a
+			// pure h2c upgrade.
+			name: "multiple Upgrade headers: h2c then websocket (reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"Upgrade: websocket\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewParser()
+			p.Reset([]byte(tc.raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if req.UpgradeH2C != tc.wantUpgrade {
+				t.Fatalf("UpgradeH2C = %v, want %v", req.UpgradeH2C, tc.wantUpgrade)
+			}
+			if tc.wantSet != "" && req.HTTP2Settings != tc.wantSet {
+				t.Fatalf("HTTP2Settings = %q, want %q", req.HTTP2Settings, tc.wantSet)
+			}
+		})
+	}
+}
+
+func TestRequest_Reset_ClearsUpgrade(t *testing.T) {
+	var req Request
+	req.UpgradeH2C = true
+	req.HTTP2Settings = "abc"
+	req.Reset()
+	if req.UpgradeH2C {
+		t.Fatal("UpgradeH2C not cleared by Reset")
+	}
+	if req.HTTP2Settings != "" {
+		t.Fatalf("HTTP2Settings = %q, want empty", req.HTTP2Settings)
+	}
+}

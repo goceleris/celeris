@@ -60,6 +60,10 @@ type Config struct {
 	OnDisconnect func(addr string)
 	// Logger is the structured logger for engine diagnostics (default slog.Default()).
 	Logger *slog.Logger
+	// EnableH2Upgrade enables RFC 7540 §3.2 HTTP/1.1→H2C upgrades. Resolved
+	// from celeris.Config.EnableH2Upgrade (pointer, may be nil) and Protocol.
+	// Always a concrete value after WithDefaults.
+	EnableH2Upgrade bool
 }
 
 // Validate checks all config fields and returns any validation errors.
@@ -132,8 +136,17 @@ func (c Config) WithDefaults() Config {
 	if c.Engine.IsDefault() {
 		c.Engine = defaultEngine()
 	}
+	// Resolve h2c-upgrade default. Auto protocol (including the implicit
+	// default) enables h2c upgrade; HTTP1/H2C don't unless the caller
+	// explicitly set EnableH2Upgrade=true before calling WithDefaults.
+	// Callers who want upgrade disabled on Auto must go through the root
+	// celeris.Config path where EnableH2Upgrade is a *bool.
+	wasAutoOrDefault := c.Protocol.IsDefault() || c.Protocol == engine.Auto
 	if c.Protocol.IsDefault() {
 		c.Protocol = engine.Auto
+	}
+	if wasAutoOrDefault && !c.EnableH2Upgrade {
+		c.EnableH2Upgrade = true
 	}
 	if c.MaxFrameSize == 0 {
 		c.MaxFrameSize = 16384

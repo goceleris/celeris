@@ -86,6 +86,15 @@ type H1State struct {
 	// the engine's idle sweep checks it on detached connections. 0 = no
 	// deadline.
 	IdleDeadlineNs atomic.Int64
+
+	// EnableH2Upgrade, when true, permits this connection to honor a
+	// valid RFC 7540 §3.2 h2c upgrade request. Set by the engine at
+	// initProtocol time from resource.Config.EnableH2Upgrade.
+	EnableH2Upgrade bool
+	// UpgradeInfo is populated by ProcessH1 just before returning
+	// ErrUpgradeH2C. The engine consumes it via switchToH2 and then clears
+	// it. Always nil on a clean (non-upgrade) connection.
+	UpgradeInfo *UpgradeInfo
 }
 
 // UpdateWriteFn replaces the response adapter's write function. Called by
@@ -175,6 +184,13 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				}
 				state.buffer.Write(data[offset:])
 				break
+			}
+
+			if err := tryUpgradeH2C(state, nil, data[offset+consumed:], write); err != nil {
+				return err
+			}
+			if state.UpgradeInfo != nil {
+				return ErrUpgradeH2C
 			}
 
 			if err := handleH1Request(ctx, state, nil, handler, write); err != nil {
@@ -275,6 +291,13 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			state.buffer.Next(consumed)
 		}
 
+		if err := tryUpgradeH2C(state, bodyData, state.buffer.Bytes(), write); err != nil {
+			return err
+		}
+		if state.UpgradeInfo != nil {
+			return ErrUpgradeH2C
+		}
+
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
@@ -286,6 +309,71 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 	}
 	return nil
+}
+
+// tryUpgradeH2C inspects the just-parsed request for an h2c upgrade. On a
+// valid request it writes the 101 Switching Protocols response, captures
+// the upgrade state into state.UpgradeInfo (which triggers the caller to
+// return ErrUpgradeH2C), and returns nil. On any failure (settings decode,
+// feature disabled, not-a-upgrade) it returns nil and leaves UpgradeInfo
+// nil so the caller falls through to the normal handler path.
+//
+// remaining holds bytes in the recv buffer AFTER the just-consumed H1
+// request (and its body). These are preserved for H2 — they may already
+// contain the H2 client preface and initial SETTINGS.
+func tryUpgradeH2C(state *H1State, body, remaining []byte, write func([]byte)) error {
+	if !state.EnableH2Upgrade || !state.req.UpgradeH2C {
+		return nil
+	}
+	settings, err := DecodeHTTP2Settings(state.req.HTTP2Settings)
+	if err != nil {
+		// Malformed settings: silently fall through to normal H1 handling.
+		// This matches the spec's tolerance requirement and avoids a 400
+		// on a merely-noisy client.
+		return nil
+	}
+
+	// Write 101 response. Connection/Upgrade headers per RFC 7540 §3.2.
+	write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n"))
+
+	info := &UpgradeInfo{
+		Settings: settings,
+		Method:   state.req.Method,
+		URI:      state.req.Path,
+		Headers:  copyH2CHeaders(&state.req),
+		Body:     append([]byte(nil), body...),
+	}
+	if len(remaining) > 0 {
+		info.Remaining = append([]byte(nil), remaining...)
+	}
+	state.UpgradeInfo = info
+	return nil
+}
+
+// copyH2CHeaders returns a defensive copy of the request's headers with
+// hop-by-hop + upgrade-mechanism headers stripped. These must NOT appear
+// on H2 stream 1 (RFC 7540 §8.1.2.2 forbids connection-specific headers).
+//
+// The returned strings MUST be heap-owned copies: the H1 recv buffer
+// (which backs rh[0] and rh[1]) is reused after switchToH2 releases the
+// H1 state. Using h1.UnsafeLowerHeader here would alias that buffer on
+// uncommon names, so we force an allocating ToLower for the header name
+// and a string copy for the value.
+func copyH2CHeaders(req *h1.Request) [][2]string {
+	out := make([][2]string, 0, len(req.RawHeaders))
+	for _, rh := range req.RawHeaders {
+		// Use the interned-or-allocating variant: returns a pre-allocated
+		// literal for common names, and strings.ToLower(string(raw)) for
+		// everything else. Neither aliases the recv buffer.
+		name := h1.LowerHeaderCopy(rh[0])
+		switch name {
+		case "upgrade", "connection", "http2-settings":
+			continue
+		}
+		// Copy value — the raw byte buffer is reused after this call returns.
+		out = append(out, [2]string{name, string(rh[1])})
+	}
+	return out
 }
 
 // safeExpectContinue calls the OnExpectContinue callback with panic recovery.

@@ -20,6 +20,7 @@ type Manager struct {
 	maxFrameSize            uint32
 	initialWindowSize       uint32
 	activeStreams           atomic.Uint32
+	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
 	pendingConnWindowUpdate uint32
 	pendingStreamUpdates    map[uint32]uint32
 	windowUpdateMu          sync.Mutex
@@ -40,6 +41,7 @@ func NewManager() *Manager {
 		nextPushID:              2,
 		maxFrameSize:            16384,
 		initialWindowSize:       65535,
+		headerTableSize:         4096, // RFC 7540 §6.5.2 default
 		pendingConnWindowUpdate: 0,
 		pendingStreamUpdates:    make(map[uint32]uint32),
 		streamsWithData:         make(map[uint32]struct{}),
@@ -209,6 +211,60 @@ func (m *Manager) SetMaxConcurrentStreams(n uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.maxStreams = n
+}
+
+// ApplySetting applies a single H2 SETTINGS entry. Used by the h2c upgrade
+// path to seed the connection with the client's settings from the
+// HTTP2-Settings header (RFC 7540 §3.2.1). This is a minimal, conservative
+// application; complex side-effects (stream window resync on
+// INITIAL_WINDOW_SIZE change) are not needed because no streams exist yet
+// when this is called.
+//
+// The setting identifiers are from RFC 7540 §6.5.2:
+//
+//	0x1 HEADER_TABLE_SIZE        0x4 INITIAL_WINDOW_SIZE
+//	0x2 ENABLE_PUSH              0x5 MAX_FRAME_SIZE
+//	0x3 MAX_CONCURRENT_STREAMS   0x6 MAX_HEADER_LIST_SIZE
+func (m *Manager) ApplySetting(id uint16, val uint32) {
+	switch id {
+	case 0x1: // HEADER_TABLE_SIZE
+		// Peer's upper bound on our HPACK encoder dynamic table. Stash
+		// it so we respect the limit when emitting headers. The inline
+		// and stream encoders currently run with MaxDynamicTableSize=0,
+		// which trivially satisfies any non-zero limit; if the encoder
+		// ever enables the dynamic table, this value MUST bound it.
+		m.mu.Lock()
+		m.headerTableSize = val
+		m.mu.Unlock()
+	case 0x2: // ENABLE_PUSH
+		m.mu.Lock()
+		m.pushEnabled = val == 1
+		m.mu.Unlock()
+	case 0x3: // MAX_CONCURRENT_STREAMS (client's limit on server push)
+		// Client-side setting; no server state to update.
+	case 0x4: // INITIAL_WINDOW_SIZE
+		if val > 0x7fffffff {
+			return
+		}
+		m.mu.Lock()
+		m.initialWindowSize = val
+		m.mu.Unlock()
+	case 0x5: // MAX_FRAME_SIZE
+		if val < 16384 || val > 16777215 {
+			return
+		}
+		atomic.StoreUint32(&m.maxFrameSize, val)
+	}
+}
+
+// GetHeaderTableSize returns the peer's SETTINGS_HEADER_TABLE_SIZE (the
+// maximum HPACK dynamic table size the peer will accept from the server).
+// Defaults to 4096 (RFC 7540 §6.5.2) until the peer advertises otherwise.
+func (m *Manager) GetHeaderTableSize() uint32 {
+	m.mu.RLock()
+	v := m.headerTableSize
+	m.mu.RUnlock()
+	return v
 }
 
 // GetMaxConcurrentStreams returns the currently configured max concurrent streams value.

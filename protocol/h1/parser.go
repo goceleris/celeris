@@ -22,6 +22,13 @@ type Parser struct {
 	buf             []byte
 	pos             int
 	noStringHeaders bool
+
+	// h2c upgrade detection (RFC 7540 §3.2). Reset per request in ParseRequest.
+	upgradeH2CSeen             bool
+	upgradeH2CDisqualified     bool // latches true when any Upgrade header is non-h2c or multi-token
+	http2SettingsSeen          bool
+	connectionHasUpgradeToken  bool
+	connectionHasSettingsToken bool
 }
 
 // NewParser returns a new Parser ready for use.
@@ -77,6 +84,13 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 	req.ContentLength = -1
 	req.KeepAlive = req.Version == sHTTP11
 
+	// Reset h2c detection state per request.
+	p.upgradeH2CSeen = false
+	p.upgradeH2CDisqualified = false
+	p.http2SettingsSeen = false
+	p.connectionHasUpgradeToken = false
+	p.connectionHasSettingsToken = false
+
 	complete, err = p.parseHeaders(req)
 	if err != nil {
 		return 0, err
@@ -87,6 +101,13 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 
 	if req.Host == "" {
 		return 0, ErrMissingHost
+	}
+
+	// RFC 7540 §3.2: valid h2c upgrade requires all three signals.
+	// Single-token Upgrade disambiguates from WebSocket path.
+	if p.upgradeH2CSeen && p.http2SettingsSeen &&
+		p.connectionHasUpgradeToken && p.connectionHasSettingsToken {
+		req.UpgradeH2C = true
 	}
 	return p.pos, nil
 }
@@ -156,6 +177,9 @@ func (p *Parser) parseHeaders(req *Request) (bool, error) {
 
 func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 	req.RawHeaders = append(req.RawHeaders, [2][]byte{rawName, rawValue})
+	// h2c upgrade detection (RFC 7540 §3.2). Run on raw bytes regardless of
+	// noStringHeaders mode so the detection is uniform across paths.
+	p.detectH2CHeader(req, rawName, rawValue)
 	if !p.noStringHeaders {
 		name := internOrLowerHeader(rawName)
 		value := string(rawValue)
@@ -269,4 +293,75 @@ func (p *Parser) GetBody(contentLength int64) []byte {
 // ConsumeBody advances the parser position by n bytes.
 func (p *Parser) ConsumeBody(n int) {
 	p.pos += n
+}
+
+// detectH2CHeader inspects a parsed header (raw bytes) and updates the
+// parser's h2c upgrade detection state. Separate from appendHeader's main
+// dispatch to keep the hot path unchanged.
+//
+// Invariants (RFC 7540 §3.2):
+//   - Upgrade must be exactly the single token "h2c". Any other token
+//     coexisting (e.g. "websocket, h2c" or "h2c, foo") disables h2c upgrade.
+//     This is a security invariant: it prevents ambiguity with other
+//     upgrade protocols (notably WebSocket).
+//   - HTTP2-Settings value is non-empty (further validation deferred to decode).
+//   - Connection must list BOTH "upgrade" and "http2-settings" as comma-
+//     separated tokens (case-insensitive).
+func (p *Parser) detectH2CHeader(req *Request, rawName, rawValue []byte) {
+	if len(rawName) == 0 {
+		return
+	}
+	switch rawName[0] | 0x20 {
+	case 'u':
+		if asciiEqualFold(rawName, "Upgrade") {
+			trimmed := trimSpace(rawValue)
+			// Reject multi-token Upgrade: any comma disqualifies.
+			if bytes.IndexByte(trimmed, ',') >= 0 {
+				p.upgradeH2CSeen = false
+				p.upgradeH2CDisqualified = true
+				return
+			}
+			if asciiEqualFold(trimmed, "h2c") {
+				// One-way latch: a prior non-h2c Upgrade header (e.g.
+				// "Upgrade: websocket\r\nUpgrade: h2c") must not be
+				// overridden by a later h2c header.
+				if !p.upgradeH2CDisqualified {
+					p.upgradeH2CSeen = true
+				}
+			} else {
+				p.upgradeH2CSeen = false
+				p.upgradeH2CDisqualified = true
+			}
+		}
+	case 'h':
+		if asciiEqualFold(rawName, "HTTP2-Settings") {
+			trimmed := trimSpace(rawValue)
+			if len(trimmed) > 0 {
+				p.http2SettingsSeen = true
+				req.HTTP2Settings = string(trimmed)
+			}
+		}
+	case 'c':
+		if asciiEqualFold(rawName, "Connection") {
+			// Scan comma-separated tokens for "upgrade" and "http2-settings".
+			b := rawValue
+			for len(b) > 0 {
+				// Find next comma.
+				idx := bytes.IndexByte(b, ',')
+				var tok []byte
+				if idx < 0 {
+					tok = trimSpace(b)
+					b = nil
+				} else {
+					tok = trimSpace(b[:idx])
+					b = b[idx+1:]
+				}
+				if asciiEqualFold(tok, "upgrade") {
+					p.connectionHasUpgradeToken = true
+				} else if asciiEqualFold(tok, "http2-settings") {
+					p.connectionHasSettingsToken = true
+				}
+			}
+		}
+	}
 }

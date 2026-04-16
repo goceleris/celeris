@@ -291,7 +291,11 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	_ = f.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
 		case http2.SettingHeaderTableSize:
-			// No validation needed
+			// Peer's upper bound on our HPACK encoder dynamic table.
+			// Stash the value so encoders can honor it.
+			p.manager.mu.Lock()
+			p.manager.headerTableSize = s.Val
+			p.manager.mu.Unlock()
 		case http2.SettingEnablePush:
 			if s.Val != 0 && s.Val != 1 {
 				validationErr = fmt.Errorf("SETTINGS_ENABLE_PUSH must be 0 or 1, got %d", s.Val)
@@ -1470,5 +1474,55 @@ func (p *Processor) HandleRawPing(flags byte, payload []byte) error {
 		return err
 	}
 	p.flush()
+	return nil
+}
+
+// InjectStreamHeaders opens a new stream with the given ID, populates it
+// with the provided headers + body (no HPACK round-trip — headers are
+// already decoded), and dispatches the handler. Used by the h2c upgrade
+// path (RFC 7540 §3.2) to replay the original H1 request as stream 1 on
+// the newly-promoted H2 connection.
+//
+// Invariants:
+//   - streamID must not already exist in the manager.
+//   - headers must include all H2 pseudo-headers (:method, :path, :scheme,
+//     :authority); the caller synthesizes these from the H1 request line.
+//   - If endStream=true, body must be the complete request body and the
+//     stream transitions to HalfClosedRemote immediately.
+func (p *Processor) InjectStreamHeaders(streamID uint32, endStream bool, headers [][2]string, body []byte) error {
+	s, ok := p.manager.TryOpenStream(streamID)
+	if !ok {
+		return fmt.Errorf("injectStreamHeaders: could not open stream %d", streamID)
+	}
+	if s.ResponseWriter == nil {
+		s.ResponseWriter = p.connWriter
+	}
+
+	// Detect HEAD (mirrors ProcessRawHeaders behavior).
+	for _, h := range headers {
+		if h[0] == ":method" && h[1] == "HEAD" {
+			s.IsHEAD = true
+			break
+		}
+	}
+	s.AddHeadersBatch(headers)
+	s.ReceivedInitialHeaders = true
+
+	if len(body) > 0 {
+		_, _ = s.GetBuf().Write(body) // bytes.Buffer.Write never returns error
+		s.ReceivedDataLen = len(body)
+	}
+	if endStream {
+		s.EndStream = true
+		s.SetState(StateHalfClosedRemote)
+	}
+
+	// lastClientStream must reflect the injected stream so subsequent
+	// HEADERS validate correctly (odd, strictly increasing).
+	if streamID%2 == 1 && streamID > p.manager.lastClientStream.Load() {
+		p.manager.lastClientStream.Store(streamID)
+	}
+
+	p.runHandler(s)
 	return nil
 }
