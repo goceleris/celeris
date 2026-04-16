@@ -1,8 +1,13 @@
+//go:build !race
+
+// testing.Benchmark + race detector scales b.N too aggressively on slow
+// CI runners (see sibling file in driver/redis). Allocation budgets are
+// only meaningful on the non-race hot path.
+
 package postgres
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"os"
 	"testing"
@@ -166,63 +171,3 @@ func benchPoolAcquireRelease(b *testing.B) {
 // --- benchmark-grade fake server helpers (mirrors conn_test.go but takes
 // testing.TB so *testing.B can drive them).
 
-func startFakePGBench(tb testing.TB, handler func(net.Conn)) string {
-	tb.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatal(err)
-	}
-	tb.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go handler(c)
-		}
-	}()
-	return ln.Addr().String()
-}
-
-func fakePGTrustStartupB(tb testing.TB, c net.Conn, pid, secret int32, post func(net.Conn)) {
-	tb.Helper()
-	defer func() { _ = c.Close() }()
-	// Read startup message.
-	lenBuf := make([]byte, 4)
-	if _, err := readFull(c, lenBuf); err != nil {
-		return
-	}
-	n := int(binary.BigEndian.Uint32(lenBuf))
-	if n < 4 {
-		return
-	}
-	body := make([]byte, n-4)
-	if _, err := readFull(c, body); err != nil {
-		return
-	}
-	if err := writeAuthOK(c); err != nil {
-		return
-	}
-	if err := writeBackendKeyData(c, pid, secret); err != nil {
-		return
-	}
-	if err := writeReadyForQuery(c, 'I'); err != nil {
-		return
-	}
-	if post != nil {
-		post(c)
-	}
-}
-
-func readFull(c net.Conn, buf []byte) (int, error) {
-	n := 0
-	for n < len(buf) {
-		k, err := c.Read(buf[n:])
-		if err != nil {
-			return n, err
-		}
-		n += k
-	}
-	return n, nil
-}

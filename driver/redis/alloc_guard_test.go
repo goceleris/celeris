@@ -1,3 +1,11 @@
+//go:build !race
+
+// The race detector inflates allocation counts (shadow memory + instrumentation)
+// and dramatically slows down each iteration. Under -race on slow CI runners
+// (2-core GHA) testing.Benchmark's b.N auto-scaling overshoots and the test
+// runs for many minutes. Since the budgets only meaningfully apply to the
+// non-race hot path, excluding this file from -race builds is correct.
+
 package redis
 
 import (
