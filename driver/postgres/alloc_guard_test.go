@@ -170,4 +170,3 @@ func benchPoolAcquireRelease(b *testing.B) {
 
 // --- benchmark-grade fake server helpers (mirrors conn_test.go but takes
 // testing.TB so *testing.B can drive them).
-
