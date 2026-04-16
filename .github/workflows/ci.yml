@@ -83,6 +83,49 @@ jobs:
       - name: Conformance matrix (engines × protocols)
         run: go test -v -race -count=1 -timeout=120s ./test/conformance/...
 
+  driver-conformance:
+    name: Driver Conformance (Postgres + Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: celeris
+          POSTGRES_USER: celeris
+          POSTGRES_DB: celeristest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U celeris -d celeristest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_PG_DSN: postgres://celeris:celeris@127.0.0.1:5432/celeristest?sslmode=disable
+      CELERIS_REDIS_ADDR: 127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Postgres conformance
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      - name: Redis conformance
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+
   spec:
     name: Spec Compliance
     runs-on: ubuntu-latest
