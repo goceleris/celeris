@@ -9,10 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
-	"golang.org/x/sys/unix"
 )
 
 // noopHandler satisfies stream.Handler for tests that don't exercise HTTP.
