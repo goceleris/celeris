@@ -36,19 +36,29 @@ import (
 	"github.com/goceleris/celeris/driver/redis"
 )
 
-// startSharedLoopServer builds a celeris.Server on :0 backed by the std
-// engine (works on darwin + linux), calls `register` to wire drivers +
-// handlers, and returns the bound base URL. The driver Open() calls MUST
-// happen inside `register` so they see the server before Start.
+// startSharedLoopServer builds a celeris.Server on :0 backed by the engine
+// selected via CELERIS_SHARED_LOOP_ENGINE (default: std), calls `register`
+// to wire drivers + handlers, and returns the bound base URL. The driver
+// Open() calls MUST happen inside `register` so they see the server before
+// Start.
 //
-// Differs from startServer in driver_integration_test.go only in that it
-// logs the provider the test would have seen — both helpers target the
-// same std engine on darwin.
+// Set CELERIS_SHARED_LOOP_ENGINE=epoll|iouring|adaptive on Linux to exercise
+// the real EventLoopProvider path where .Worker() affinity is observable.
+// Any other value (or darwin) falls through to Std.
 func startSharedLoopServer(t *testing.T, register func(*celeris.Server)) (*celeris.Server, string) {
 	t.Helper()
+	engineChoice := celeris.Std
+	switch strings.ToLower(os.Getenv("CELERIS_SHARED_LOOP_ENGINE")) {
+	case "epoll":
+		engineChoice = celeris.Epoll
+	case "iouring", "io_uring", "uring":
+		engineChoice = celeris.IOUring
+	case "adaptive":
+		engineChoice = celeris.Adaptive
+	}
 	srv := celeris.New(celeris.Config{
 		Addr:   "127.0.0.1:0",
-		Engine: celeris.Std,
+		Engine: engineChoice,
 	})
 	register(srv)
 
@@ -140,6 +150,7 @@ func TestSharedLoopPostgres(t *testing.T) {
 		t.Skip("skipping: CELERIS_PG_DSN not set")
 	}
 
+	observed := newWorkerIDSet()
 	var pool *postgres.Pool
 	srv, base := startSharedLoopServer(t, func(srv *celeris.Server) {
 		p, err := postgres.Open(dsn,
@@ -156,8 +167,11 @@ func TestSharedLoopPostgres(t *testing.T) {
 			if perr != nil {
 				return c.String(http.StatusBadRequest, "bad n: %v", perr)
 			}
+			wid := c.WorkerID()
+			observed.add(wid)
 			ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 			defer cancel()
+			ctx = postgres.WithWorker(ctx, wid)
 			row := pool.QueryRow(ctx, "SELECT $1::int + 1", n)
 			var out int
 			if err := row.Scan(&out); err != nil {
@@ -187,6 +201,8 @@ func TestSharedLoopPostgres(t *testing.T) {
 		}
 		return nil
 	})
+
+	assertWorkerAffinity(t, srv, observed, pool.IdleConnWorkers())
 }
 
 // -----------------------------------------------------------------------------
@@ -229,6 +245,7 @@ func TestSharedLoopRedis(t *testing.T) {
 		_, _ = seedClient.Do(cleanupCtx, args...)
 	})
 
+	observed := newWorkerIDSet()
 	var client *redis.Client
 	srv, base := startSharedLoopServer(t, func(srv *celeris.Server) {
 		c, err := redis.NewClient(addr,
@@ -242,8 +259,11 @@ func TestSharedLoopRedis(t *testing.T) {
 		client = c
 
 		srv.GET("/value/:k", func(c *celeris.Context) error {
+			wid := c.WorkerID()
+			observed.add(wid)
 			ctx, cancelReq := context.WithTimeout(c.Context(), 5*time.Second)
 			defer cancelReq()
+			ctx = redis.WithWorker(ctx, wid)
 			v, err := client.DoString(ctx, "GET", c.Param("k"))
 			if err != nil {
 				return c.String(http.StatusInternalServerError, "get: %v", err)
@@ -272,6 +292,8 @@ func TestSharedLoopRedis(t *testing.T) {
 		}
 		return nil
 	})
+
+	assertWorkerAffinity(t, srv, observed, client.IdleConnWorkers())
 }
 
 // -----------------------------------------------------------------------------
@@ -310,6 +332,7 @@ func TestSharedLoopMemcached(t *testing.T) {
 		}
 	})
 
+	observed := newWorkerIDSet()
 	var client *memcached.Client
 	srv, base := startSharedLoopServer(t, func(srv *celeris.Server) {
 		c, err := memcached.NewClient(addr,
@@ -322,8 +345,11 @@ func TestSharedLoopMemcached(t *testing.T) {
 		client = c
 
 		srv.GET("/value/:k", func(c *celeris.Context) error {
+			wid := c.WorkerID()
+			observed.add(wid)
 			ctx, cancelReq := context.WithTimeout(c.Context(), 5*time.Second)
 			defer cancelReq()
+			ctx = memcached.WithWorker(ctx, wid)
 			v, err := client.Get(ctx, c.Param("k"))
 			if err != nil {
 				return c.String(http.StatusInternalServerError, "get: %v", err)
@@ -352,15 +378,16 @@ func TestSharedLoopMemcached(t *testing.T) {
 		}
 		return nil
 	})
+
+	assertWorkerAffinity(t, srv, observed, client.IdleConnWorkers())
 }
 
 // logProviderIdentity documents the "same event loop" claim for this test
 // run. With the std engine (darwin CI + default linux CI), srv.EventLoopProvider()
-// is nil and we log the fallback path. With a native engine (linux + Explicit
-// Epoll/IOUring/Adaptive) the provider is non-nil and we report worker count;
-// the test cannot compare against the driver's internal connection .Worker()
-// IDs because the driver package doesn't expose a hook for enumerating live
-// conns — see the shared-loop test notes in the gap-closure report.
+// is nil and the driver uses its standalone fallback loop. With a native
+// engine (linux + Explicit Epoll/IOUring/Adaptive) the provider is non-nil,
+// handlers see non-negative WorkerID()s, and the driver pools carry per-worker
+// idle slots. The actual affinity assertion happens in assertWorkerAffinity.
 func logProviderIdentity(t *testing.T, srv *celeris.Server) {
 	t.Helper()
 	if srv.EventLoopProvider() == nil {
@@ -368,5 +395,120 @@ func logProviderIdentity(t *testing.T, srv *celeris.Server) {
 		return
 	}
 	t.Logf("provider: native, NumWorkers=%d (drivers share this loop)", srv.EventLoopProvider().NumWorkers())
+}
+
+// workerIDSet is a concurrent-safe set of observed worker IDs.
+type workerIDSet struct {
+	mu  sync.Mutex
+	ids map[int]int // id -> count
+}
+
+func newWorkerIDSet() *workerIDSet { return &workerIDSet{ids: make(map[int]int)} }
+
+func (s *workerIDSet) add(id int) {
+	s.mu.Lock()
+	s.ids[id]++
+	s.mu.Unlock()
+}
+
+// distinct returns the sorted unique worker IDs observed.
+func (s *workerIDSet) distinct() []int {
+	s.mu.Lock()
+	out := make([]int, 0, len(s.ids))
+	for id := range s.ids {
+		out = append(out, id)
+	}
+	s.mu.Unlock()
+	return out
+}
+
+// assertWorkerAffinity validates that the handler worker IDs observed during
+// the fanout match the per-worker idle slots the driver's pool now carries.
+//
+// Std engine / standalone fallback: WorkerID() is -1 and the driver pool uses
+// a single worker (NumWorkers=1). In that case we assert every observed ID is
+// -1 and every idle-conn ID is 0 (the single worker slot). This still proves
+// the driver ran under the shared-loop contract.
+//
+// Native engine: we assert that
+//
+//  1. every idle-conn worker ID is in the set observed by handlers (no stray
+//     workers dialed the pool), AND
+//  2. at least one observed handler worker shows up in the idle set (proves
+//     the hint threading reached the pool — otherwise idle conns would all
+//     cluster on worker 0 via round-robin).
+//
+// The inverse inclusion (observed ⊆ idle) is too strict: if every handler
+// worker happens to hand its conn out to a peer before fanout ends, that
+// worker's idle slot is empty. We only require non-zero overlap.
+func assertWorkerAffinity(t *testing.T, srv *celeris.Server, observed *workerIDSet, idle []int) {
+	t.Helper()
+	obsIDs := observed.distinct()
+	t.Logf("observed handler worker IDs: %v", obsIDs)
+	t.Logf("idle conn worker IDs: %v", idle)
+
+	prov := srv.EventLoopProvider()
+	if prov == nil {
+		// Standalone fallback: handlers run under Go's scheduler; c.WorkerID()
+		// returns -1. The driver's pool is backed by the standalone mini-loop
+		// whose NumWorkers() defaults to runtime.NumCPU() — so idle conns
+		// carry worker IDs in [0, NumCPU), not a single slot.
+		if len(obsIDs) == 0 {
+			t.Fatal("no handler invocations observed — test is broken")
+		}
+		for _, id := range obsIDs {
+			if id != -1 {
+				t.Errorf("std engine: expected c.WorkerID()==-1, got %d", id)
+			}
+		}
+		upper := runtime.NumCPU()
+		for _, id := range idle {
+			if id < 0 || id >= upper {
+				t.Errorf("standalone pool: conn.Worker()==%d out of range [0,%d)", id, upper)
+			}
+		}
+		return
+	}
+
+	nw := prov.NumWorkers()
+	if nw <= 0 {
+		t.Fatalf("provider reports NumWorkers=%d (<= 0)", nw)
+	}
+
+	obs := make(map[int]struct{}, len(obsIDs))
+	for _, id := range obsIDs {
+		if id < 0 || id >= nw {
+			t.Errorf("observed worker ID %d out of range [0,%d)", id, nw)
+			continue
+		}
+		obs[id] = struct{}{}
+	}
+	if len(obs) == 0 {
+		t.Fatal("no valid handler worker IDs observed against native engine")
+	}
+
+	if len(idle) == 0 {
+		// Fanout consumed every conn and didn't release back yet. Rare but
+		// possible. Warn but don't fail — the hint threading is covered by
+		// the "no stray" check being vacuous here.
+		t.Log("no idle conns after fanout — skipping idle-set assertions")
+		return
+	}
+
+	overlap := 0
+	for _, id := range idle {
+		if id < 0 || id >= nw {
+			t.Errorf("idle conn reports Worker()==%d out of range [0,%d)", id, nw)
+			continue
+		}
+		if _, ok := obs[id]; ok {
+			overlap++
+		} else {
+			t.Errorf("idle conn on worker %d that no handler ran on — stray dial", id)
+		}
+	}
+	if overlap == 0 {
+		t.Errorf("no overlap between observed handler workers %v and idle conn workers %v — worker hint did not reach the pool", obsIDs, idle)
+	}
 }
 

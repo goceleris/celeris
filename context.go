@@ -289,6 +289,29 @@ func (c *Context) SetContext(ctx context.Context) {
 	c.ctx = ctx
 }
 
+// WorkerID returns the numeric ID of the event-loop worker handling this
+// request, or -1 if no worker identity is available (std engine, tests
+// constructing a Context without a Server, etc.). Handlers forwarding a
+// DB or cache call through a celeris driver pool can pass this to the
+// driver's WithWorker option to pin the pool conn to the same CPU,
+// preserving per-request locality end-to-end:
+//
+//	import "github.com/goceleris/celeris/driver/postgres"
+//
+//	func handler(c *celeris.Context) error {
+//	    ctx := postgres.WithWorker(c.Context(), c.WorkerID())
+//	    row, err := pool.QueryContext(ctx, "SELECT ...")
+//	    ...
+//	}
+//
+// Epoll and io_uring engines populate this at accept time; the std
+// engine (all platforms) returns -1 because Go's runtime scheduler
+// picks the goroutine and there is no meaningful worker identity.
+func (c *Context) WorkerID() int {
+	id, _ := ctxkit.WorkerIDFrom(c.Context())
+	return id
+}
+
 // StartTime returns the time at which request processing began. Set once by
 // the framework before the handler chain runs, so all middleware share the
 // same timestamp without calling time.Now() independently.

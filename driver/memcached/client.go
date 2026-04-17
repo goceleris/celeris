@@ -56,6 +56,13 @@ func (c *Client) PoolStats() async.PoolStats {
 	return c.pool.Stats()
 }
 
+// IdleConnWorkers returns the Worker() IDs of every currently-idle
+// connection. Intended for tests and introspection asserting that per-CPU
+// affinity is actually honored by the dial path.
+func (c *Client) IdleConnWorkers() []int {
+	return c.pool.pool.IdleConnWorkers()
+}
+
 // Protocol returns the wire dialect negotiated at dial time.
 func (c *Client) Protocol() Protocol { return c.cfg.Protocol }
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/protocol/detect"
@@ -411,7 +412,13 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 			continue
 		}
 
-		cs := acquireConnState(ctx, newFD, l.resolved.BufferSize)
+		// Tag the per-conn context with this worker's numeric ID so handlers
+		// can call celeris.Context.WorkerID() and forward it to driver
+		// pools (postgres.WithWorker / redis.WithWorker / memcached.WithWorker)
+		// for per-CPU affinity between the HTTP request and any DB/cache
+		// calls it makes.
+		connCtx := ctxkit.WithWorkerID(ctx, l.id)
+		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
 		l.connCount++

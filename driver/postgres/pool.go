@@ -208,6 +208,15 @@ func (p *Pool) Close() error {
 // Stats returns a snapshot of pool occupancy.
 func (p *Pool) Stats() async.PoolStats { return p.inner.Stats() }
 
+// IdleConnWorkers returns the Worker() IDs of every currently-idle connection
+// across all worker slots. Same worker ID may appear multiple times when the
+// slot holds more than one idle conn. In-use conns do not appear.
+//
+// Intended for tests and introspection asserting that per-CPU affinity is
+// actually honored by the dial path — callers should not use it for load
+// balancing decisions.
+func (p *Pool) IdleConnWorkers() []int { return p.inner.IdleConnWorkers() }
+
 // workerCtxKey is the unexported key for the worker hint in Context.
 type workerCtxKey struct{}
 

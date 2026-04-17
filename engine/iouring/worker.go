@@ -17,6 +17,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/protocol/detect"
@@ -615,7 +616,11 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	cs := acquireConnState(ctx, newFD, bufSize)
+	// Tag the per-conn context with this worker's numeric ID — same
+	// plumbing as engine/epoll/loop.go so handlers can pass the affinity
+	// hint to driver pools.
+	connCtx := ctxkit.WithWorkerID(ctx, w.id)
+	cs := acquireConnState(connCtx, newFD, bufSize)
 	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {

@@ -327,3 +327,22 @@ func (p *Pool[C]) Stats() PoolStats {
 		PerWorker: per,
 	}
 }
+
+// IdleConnWorkers returns the Worker() IDs of every currently-idle
+// connection across all worker slots. The same worker ID may appear
+// multiple times if the slot holds more than one idle conn. In-use
+// conns do not appear — they are held by active callers and their
+// Worker() is observable on the caller side. Useful for integration
+// tests asserting that per-CPU affinity is actually being honored by
+// the dial path.
+func (p *Pool[C]) IdleConnWorkers() []int {
+	var out []int
+	for _, slot := range p.perWorker {
+		slot.mu.Lock()
+		for _, c := range slot.idle {
+			out = append(out, c.Worker())
+		}
+		slot.mu.Unlock()
+	}
+	return out
+}

@@ -87,6 +87,13 @@ func (c *Client) Stats() async.PoolStats {
 	return c.pool.Stats()
 }
 
+// IdleConnWorkers returns the Worker() IDs of every currently-idle command
+// connection. Intended for tests and introspection asserting that per-CPU
+// affinity is actually honored by the dial path.
+func (c *Client) IdleConnWorkers() []int {
+	return c.pool.cmd.IdleConnWorkers()
+}
+
 // Do is an escape hatch for commands the typed API does not cover
 // (OBJECT ENCODING, CLUSTER INFO, SCRIPT LOAD, XADD, FUNCTION, ...). Args
 // are converted to strings via [argify]; the returned [protocol.Value] is

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
@@ -18,10 +19,21 @@ type routerAdapter struct {
 	errorHandler          func(*Context, error)
 }
 
-func (a *routerAdapter) HandleStream(_ context.Context, s *stream.Stream) error {
+func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) error {
 	c := acquireContext(s)
 	c.startTime = time.Now()
 	c.trustedNets = a.server.trustedNets
+
+	// Propagate engine-layer values (worker ID, etc.) from the handler-
+	// received ctx into c.ctx. s.Context() is preserved as the base so h2
+	// stream-cancellation semantics (Done/Err) remain intact; we only layer
+	// the worker-ID value on top so handlers can call c.WorkerID() and
+	// forward to driver pools.
+	if ctx != nil {
+		if wid, ok := ctxkit.WorkerIDFrom(ctx); ok {
+			c.ctx = ctxkit.WithWorkerID(c.ctx, wid)
+		}
+	}
 
 	if a.server.config.MaxFormSize != 0 {
 		c.maxFormSize = a.server.config.MaxFormSize
