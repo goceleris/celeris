@@ -1,0 +1,130 @@
+# docker-compose.sentinel.yml — disposable Redis Sentinel deployment:
+# one master, one replica, three sentinels (quorum 2). Mirrors the
+# canonical HA topology for conformance tests.
+#
+# Start:
+#   docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
+#
+# Point the conformance tests at it:
+#   export CELERIS_REDIS_SENTINEL_ADDRS=127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+#   export CELERIS_REDIS_SENTINEL_MASTER=mymaster
+#   go test -tags redis_sentinel -race ./test/conformance/redis/...
+#
+# Tear down:
+#   docker compose -f test/conformance/redis/docker-compose.sentinel.yml down -v
+
+services:
+  # All containers use host networking so Sentinel sees the master at
+  # 127.0.0.1:6379 — the same address a test binary running on the host
+  # (or on the CI runner) reaches. Without host networking, Sentinel
+  # records the master's docker-network IP and hands that address to
+  # clients via `SENTINEL get-master-addr-by-name`, but that IP isn't
+  # routable from outside the docker bridge. `network_mode: host` is
+  # Linux-only; both our local Multipass VM and ubuntu-latest CI
+  # runners are Linux, so this is fine for the conformance suite.
+  redis-master:
+    image: ${REDIS_IMAGE:-redis:7.2}
+    container_name: celeris-sentinel-master
+    network_mode: host
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  redis-replica:
+    image: ${REDIS_IMAGE:-redis:7.2}
+    container_name: celeris-sentinel-replica
+    network_mode: host
+    depends_on:
+      redis-master: {condition: service_healthy}
+    command:
+      - redis-server
+      - --port
+      - "6380"
+      - --replicaof
+      - 127.0.0.1
+      - "6379"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  # Three sentinels configured with quorum=2. Each writes a minimal
+  # config at startup pointing at 127.0.0.1:6379 as master.
+  sentinel-1:
+    image: ${REDIS_IMAGE:-redis:7.2}
+    container_name: celeris-sentinel-1
+    network_mode: host
+    depends_on:
+      redis-master: {condition: service_healthy}
+      redis-replica: {condition: service_healthy}
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        cat > /etc/sentinel.conf <<EOF
+        port 26379
+        sentinel monitor mymaster 127.0.0.1 6379 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        EOF
+        exec redis-sentinel /etc/sentinel.conf
+
+  sentinel-2:
+    image: ${REDIS_IMAGE:-redis:7.2}
+    container_name: celeris-sentinel-2
+    network_mode: host
+    depends_on:
+      redis-master: {condition: service_healthy}
+      redis-replica: {condition: service_healthy}
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        cat > /etc/sentinel.conf <<EOF
+        port 26380
+        sentinel monitor mymaster 127.0.0.1 6379 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        EOF
+        exec redis-sentinel /etc/sentinel.conf
+
+  sentinel-3:
+    image: ${REDIS_IMAGE:-redis:7.2}
+    container_name: celeris-sentinel-3
+    network_mode: host
+    depends_on:
+      redis-master: {condition: service_healthy}
+      redis-replica: {condition: service_healthy}
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        cat > /etc/sentinel.conf <<EOF
+        port 26381
+        sentinel monitor mymaster 127.0.0.1 6379 2
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        sentinel parallel-syncs mymaster 1
+        EOF
+        exec redis-sentinel /etc/sentinel.conf

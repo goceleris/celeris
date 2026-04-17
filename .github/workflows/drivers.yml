@@ -1,0 +1,239 @@
+# Drivers workflow — deep CI for the PostgreSQL and Redis drivers.
+#
+# Scope: full matrix of supported server versions, plus cluster + sentinel
+# conformance against real containerized topologies. These jobs take longer
+# than the default Conformance job on ci.yml and run a wider surface, so
+# they only fire when the diff touches driver code, driver tests, or the
+# workflow itself. A PR can also opt in by attaching the
+# `run-full-driver-ci` label.
+#
+# Triggers:
+#   - push to main: every commit (main must be solid).
+#   - pull_request: only when paths match OR the label is present.
+#   - workflow_dispatch: manual run from the Actions tab (useful for
+#     debugging a failing matrix cell against a specific PG/Redis version).
+
+name: Drivers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'driver/**'
+      - 'test/conformance/postgres/**'
+      - 'test/conformance/redis/**'
+      - 'test/drivercmp/**'
+      - 'test/pgspec/**'
+      - 'test/redisspec/**'
+      - '.github/workflows/drivers.yml'
+  pull_request:
+    branches: [main]
+    # `labeled` fires when a label is added to an already-open PR, letting
+    # a reviewer force this workflow to run on a PR whose diff wouldn't
+    # otherwise trigger the paths filter.
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'driver/**'
+      - 'test/conformance/postgres/**'
+      - 'test/conformance/redis/**'
+      - 'test/drivercmp/**'
+      - 'test/pgspec/**'
+      - 'test/redisspec/**'
+      - '.github/workflows/drivers.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Guard label-triggered invocations: when `types: [labeled]` fires, the
+# workflow runs even if the new label is something unrelated. This
+# top-level `if` ensures only the opt-in label triggers a full run on a
+# label event; normal push/synchronize/open events pass through.
+jobs:
+  # Gate: on a `labeled` event, require the label to be `run-full-driver-ci`.
+  # On any other event, let it through.
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'run-full-driver-ci'
+    steps:
+      - run: echo "Driver CI gated through"
+
+  # Matrix conformance: exercise the standalone single-node mode of each
+  # driver against every supported major version of its server. Each cell
+  # stands up a fresh container for its version.
+  postgres-matrix:
+    name: Postgres ${{ matrix.pg }} Conformance
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["13", "14", "15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_USER: celeris
+          POSTGRES_PASSWORD: celeris
+          POSTGRES_DB: celeristest
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=trust"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U celeris -d celeristest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_PG_DSN: postgres://celeris:celeris@127.0.0.1:5432/celeristest?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Conformance
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/conformance/postgres/...
+      - name: pgspec
+        run: >-
+          go test -tags postgres -race -count=1 -timeout=300s
+          ./test/pgspec/...
+
+  redis-matrix:
+    name: Redis ${{ matrix.redis }} Conformance
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["6.2", "7.0", "7.2", "7.4"]
+    services:
+      redis:
+        image: redis:${{ matrix.redis }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_REDIS_ADDR: 127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Conformance
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      - name: redisspec
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/redisspec/...
+
+  # Cluster: real 6-node cluster via docker compose. network_mode: host is
+  # required so CLUSTER SLOTS advertises routable addresses — GitHub
+  # Actions ubuntu-latest runners are Linux, which supports host
+  # networking.
+  redis-cluster:
+    name: Redis ${{ matrix.redis }} Cluster
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["7.0", "7.2", "7.4"]
+    env:
+      REDIS_IMAGE: redis:${{ matrix.redis }}
+      CELERIS_REDIS_CLUSTER_ADDRS: "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Start cluster
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.cluster.yml up -d
+          # Wait for cluster-init to finish with exit code 0.
+          for i in $(seq 1 60); do
+            status=$(docker inspect celeris-cluster-init --format '{{.State.Status}}' 2>/dev/null || echo "")
+            if [ "$status" = "exited" ]; then
+              code=$(docker inspect celeris-cluster-init --format '{{.State.ExitCode}}')
+              if [ "$code" != "0" ]; then
+                echo "cluster-init exited with $code"
+                docker logs celeris-cluster-init
+                exit 1
+              fi
+              echo "cluster ready"
+              break
+            fi
+            sleep 2
+          done
+      - name: Cluster conformance
+        run: >-
+          go test -tags redis_cluster -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.cluster.yml ps
+          for c in celeris-cluster-0 celeris-cluster-1 celeris-cluster-2; do
+            echo "=== $c ==="
+            docker logs "$c" 2>&1 | tail -40
+          done
+      - name: Tear down
+        if: always()
+        run: docker compose -f test/conformance/redis/docker-compose.cluster.yml down -v
+
+  # Sentinel: master + replica + 3 sentinels with quorum=2.
+  redis-sentinel:
+    name: Redis ${{ matrix.redis }} Sentinel
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["6.2", "7.0", "7.2", "7.4"]
+    env:
+      REDIS_IMAGE: redis:${{ matrix.redis }}
+      CELERIS_REDIS_SENTINEL_ADDRS: "127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381"
+      CELERIS_REDIS_SENTINEL_MASTER: mymaster
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Start sentinel stack
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
+          # Wait until all three sentinels agree on the master.
+          for i in $(seq 1 60); do
+            if docker exec celeris-sentinel-1 redis-cli -p 26379 \
+                sentinel master mymaster 2>/dev/null | grep -q "^127.0.0.1$"; then
+              echo "sentinels ready"
+              break
+            fi
+            sleep 2
+          done
+      - name: Sentinel conformance
+        run: >-
+          go test -tags redis_sentinel -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      - name: Dump sentinel state on failure
+        if: failure()
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.sentinel.yml ps
+          for c in celeris-sentinel-master celeris-sentinel-replica celeris-sentinel-1; do
+            echo "=== $c ==="
+            docker logs "$c" 2>&1 | tail -40
+          done
+      - name: Tear down
+        if: always()
+        run: docker compose -f test/conformance/redis/docker-compose.sentinel.yml down -v
