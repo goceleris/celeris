@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2/hpack"
+
+	"github.com/goceleris/celeris"
 )
 
 const (
@@ -189,7 +191,7 @@ func doUpgradeRoundTrip(addr string) error {
 }
 
 // BenchmarkH2CUpgradeHandshake_Celeris measures the full upgrade dance on a
-// fresh TCP conn against celeris.
+// fresh TCP conn against celeris (platform default engine).
 func BenchmarkH2CUpgradeHandshake_Celeris(b *testing.B) {
 	addr, stop := startCelerisH2C(b)
 	defer stop()
@@ -198,6 +200,39 @@ func BenchmarkH2CUpgradeHandshake_Celeris(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if err := doUpgradeRoundTrip(addr); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkH2CUpgradeHandshake_CelerisEpoll pins the epoll engine so on
+// Linux we can compare each engine independently.
+func BenchmarkH2CUpgradeHandshake_CelerisEpoll(b *testing.B) {
+	benchCelerisEngine(b, celeris.Epoll, doUpgradeRoundTrip)
+}
+
+// BenchmarkH2CUpgradeHandshake_CelerisIOUring pins the io_uring engine.
+func BenchmarkH2CUpgradeHandshake_CelerisIOUring(b *testing.B) {
+	benchCelerisEngine(b, celeris.IOUring, doUpgradeRoundTrip)
+}
+
+// BenchmarkH2CUpgradeHandshake_CelerisStd pins the std engine (available on
+// all platforms — this is the control group that shares the exact same
+// upgrade code path as the net/http+h2c baseline, modulo the celeris
+// router/context wrapper).
+func BenchmarkH2CUpgradeHandshake_CelerisStd(b *testing.B) {
+	benchCelerisEngine(b, celeris.Std, doUpgradeRoundTrip)
+}
+
+// benchCelerisEngine is the shared driver for per-engine upgrade bench.
+func benchCelerisEngine(b *testing.B, eng celeris.EngineType, op func(string) error) {
+	addr, stop := startCelerisH2CEngine(b, eng)
+	defer stop()
+	warmup(b, addr)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := op(addr); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -219,9 +254,26 @@ func BenchmarkH2CUpgradeHandshake_StdHTTP(b *testing.B) {
 }
 
 // BenchmarkH2CUpgradeHandshake_Celeris_Parallel saturates the server with
-// concurrent fresh-conn handshakes.
+// concurrent fresh-conn handshakes (platform default engine).
 func BenchmarkH2CUpgradeHandshake_Celeris_Parallel(b *testing.B) {
-	addr, stop := startCelerisH2C(b)
+	parallelCelerisUpgrade(b, celeris.EngineType(0))
+}
+
+func BenchmarkH2CUpgradeHandshake_CelerisEpoll_Parallel(b *testing.B) {
+	parallelCelerisUpgrade(b, celeris.Epoll)
+}
+
+func BenchmarkH2CUpgradeHandshake_CelerisIOUring_Parallel(b *testing.B) {
+	parallelCelerisUpgrade(b, celeris.IOUring)
+}
+
+func BenchmarkH2CUpgradeHandshake_CelerisStd_Parallel(b *testing.B) {
+	parallelCelerisUpgrade(b, celeris.Std)
+}
+
+// BenchmarkH2CUpgradeHandshake_StdHTTP_Parallel is the std counterpart.
+func BenchmarkH2CUpgradeHandshake_StdHTTP_Parallel(b *testing.B) {
+	addr, stop := startStdH2C(b)
 	defer stop()
 	warmup(b, addr)
 	var errs int64
@@ -239,9 +291,8 @@ func BenchmarkH2CUpgradeHandshake_Celeris_Parallel(b *testing.B) {
 	}
 }
 
-// BenchmarkH2CUpgradeHandshake_StdHTTP_Parallel is the std counterpart.
-func BenchmarkH2CUpgradeHandshake_StdHTTP_Parallel(b *testing.B) {
-	addr, stop := startStdH2C(b)
+func parallelCelerisUpgrade(b *testing.B, eng celeris.EngineType) {
+	addr, stop := startCelerisH2CEngine(b, eng)
 	defer stop()
 	warmup(b, addr)
 	var errs int64
@@ -333,6 +384,24 @@ func benchSteadyState(b *testing.B, addr string) {
 
 func BenchmarkH2CSteadyState_Celeris(b *testing.B) {
 	addr, stop := startCelerisH2C(b)
+	defer stop()
+	benchSteadyState(b, addr)
+}
+
+func BenchmarkH2CSteadyState_CelerisEpoll(b *testing.B) {
+	addr, stop := startCelerisH2CEngine(b, celeris.Epoll)
+	defer stop()
+	benchSteadyState(b, addr)
+}
+
+func BenchmarkH2CSteadyState_CelerisIOUring(b *testing.B) {
+	addr, stop := startCelerisH2CEngine(b, celeris.IOUring)
+	defer stop()
+	benchSteadyState(b, addr)
+}
+
+func BenchmarkH2CSteadyState_CelerisStd(b *testing.B) {
+	addr, stop := startCelerisH2CEngine(b, celeris.Std)
 	defer stop()
 	benchSteadyState(b, addr)
 }

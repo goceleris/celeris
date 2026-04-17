@@ -19,6 +19,8 @@ package h2ccmp
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -31,15 +33,32 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// silentLogger returns a slog.Logger that swallows output. Celeris logs the
+// engine startup banner + warnings; for benchmark runs we don't want those
+// to interleave with benchstat-parseable output.
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
 // startCelerisH2C spins up a celeris server with EnableH2Upgrade=true and
 // returns its loopback address. Caller must call stop() to shut it down.
+// Defaults to the platform default engine (Adaptive on Linux, Std elsewhere).
 func startCelerisH2C(tb testing.TB) (addr string, stop func()) {
+	tb.Helper()
+	return startCelerisH2CEngine(tb, celeris.EngineType(0))
+}
+
+// startCelerisH2CEngine is the engine-parameterized variant. Pass 0 for the
+// platform default.
+func startCelerisH2CEngine(tb testing.TB, eng celeris.EngineType) (addr string, stop func()) {
 	tb.Helper()
 	yes := true
 	cfg := celeris.Config{
 		Addr:            "127.0.0.1:0",
+		Engine:          eng,
 		ShutdownTimeout: 1 * time.Second,
 		EnableH2Upgrade: &yes,
+		Logger:          silentLogger(),
 	}
 	srv := celeris.New(cfg)
 	srv.GET("/pong", func(c *celeris.Context) error {
@@ -59,8 +78,27 @@ func startCelerisH2C(tb testing.TB) (addr string, stop func()) {
 		tb.Fatal("celeris server did not bind")
 	}
 	return srv.Addr().String(), func() {
-		_ = srv.Shutdown(context.Background())
-		<-done
+		// Bound shutdown tightly — the celeris custom engines track open
+		// connections and will drain before returning. For benches that
+		// opened thousands of upgrade conns, a clean drain would dominate
+		// the test runtime. 500 ms is enough for the orderly path, and a
+		// goroutine-race fallback ensures we don't deadlock if Shutdown
+		// itself is unresponsive (server-side teardown bug).
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		shutdownDone := make(chan struct{})
+		go func() {
+			_ = srv.Shutdown(ctx)
+			close(shutdownDone)
+		}()
+		select {
+		case <-shutdownDone:
+		case <-time.After(1 * time.Second):
+		}
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
