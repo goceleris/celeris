@@ -42,6 +42,14 @@ var ErrMalformedKey = errors.New("celeris/memcached: malformed key")
 // dials failed).
 var ErrNoNodes = errors.New("celeris/memcached: cluster has no nodes")
 
+// ErrInvalidCAS is returned by [Client.CAS] when casID=0 is passed.
+// Memcached treats a CAS value of 0 as "don't check", which would
+// silently turn the CAS call into an unconditional Set. A legitimate
+// CAS token returned by Gets is never 0, so casID=0 always indicates
+// a caller bug (forgot to call Gets first, copied the token wrong,
+// etc.). Fail loudly rather than silently degrade.
+var ErrInvalidCAS = errors.New("celeris/memcached: CAS token must be non-zero (did you call Gets first?)")
+
 // MemcachedError wraps a server-side error reply.
 //
 // For text protocol it carries the Kind tag ("ERROR", "CLIENT_ERROR",

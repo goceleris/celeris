@@ -208,6 +208,30 @@ func TestCASSuccess(t *testing.T) {
 	}
 }
 
+// TestCASZeroTokenRejected guards the fix for a subtle correctness bug:
+// memcached's cas command / binary OpSet-with-CAS both treat casID=0 as
+// "no check", silently degrading CAS into Set. A real CAS token from Gets
+// is never 0, so casID=0 always signals a caller bug (forgot Gets,
+// copy/paste error, etc.). The driver must fail loudly instead.
+func TestCASZeroTokenRejected(t *testing.T) {
+	client, _ := newTestClient(t)
+	ctx := context.Background()
+	_ = client.Set(ctx, "k", "v", 0)
+	ok, err := client.CAS(ctx, "k", "attack", 0, 0)
+	if ok {
+		t.Fatal("CAS with casID=0 should not report success")
+	}
+	if !errors.Is(err, ErrInvalidCAS) {
+		t.Fatalf("expected ErrInvalidCAS, got %v", err)
+	}
+	// Value must be unchanged — the degrade-to-Set bug would have
+	// overwritten "v" with "attack".
+	got, _ := client.Get(ctx, "k")
+	if got != "v" {
+		t.Fatalf("CAS with casID=0 silently overwrote the value: got %q, want v", got)
+	}
+}
+
 func TestCASConflict(t *testing.T) {
 	client, _ := newTestClient(t)
 	ctx := context.Background()

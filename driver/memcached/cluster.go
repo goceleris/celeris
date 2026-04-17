@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
@@ -96,9 +96,11 @@ type ringPoint struct {
 //
 // The ring uses the ketama algorithm: each node owns
 // virtualNodesPerWeight × weight ring points, placed at MD5("addr-vnode")
-// boundaries (4 points per 16-byte digest). Lookup hashes the user key with
-// CRC32-IEEE — industry-standard, stdlib-only, and fast enough that the
-// pick-node cost is dominated by the binary search.
+// boundaries (4 points per 16-byte digest). Lookup hashes the user key
+// with the same MD5-first-four-little-endian form so celeris is
+// drop-in compatible with libmemcached and any ketama-adjacent client
+// (dalli, gomemcache/ketama, mcrouter, twemproxy): a mixed-client fleet
+// all agree on which node owns which key.
 type ClusterClient struct {
 	cfg    ClusterConfig
 	nodes  []*clusterNode // index order matches cfg.Addrs
@@ -122,6 +124,13 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 		return nil, fmt.Errorf("celeris/memcached: ClusterConfig.Weights length %d != Addrs length %d",
 			len(cfg.Weights), len(cfg.Addrs))
 	}
+	// Cap total ring points at a safe value: 16 384 virtual nodes × 4 points
+	// per digest = 65 536 points is already beyond any realistic deployment.
+	// Without this, a malicious or buggy weight of math.MaxUint32 would
+	// panic `make` with an OOM. Reject weights that, summed across the
+	// cluster, would exceed this.
+	const maxRingPoints = 1 << 16
+	var totalPoints uint64
 	nodeOpts := cfg.options()
 	nodes := make([]*clusterNode, 0, len(cfg.Addrs))
 	for i, addr := range cfg.Addrs {
@@ -137,6 +146,18 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 				return nil, fmt.Errorf("celeris/memcached: ClusterConfig.Weights[%d] is zero", i)
 			}
 		}
+		// Guard against uint32×160 overflow into the int `total` used by
+		// buildRing — on 32-bit targets this would overflow silently and
+		// allocate a pathologically short slice.
+		perNode := uint64(weight) * virtualNodesPerWeight
+		if perNode > math.MaxInt32 || totalPoints+perNode > maxRingPoints {
+			for _, n := range nodes {
+				_ = n.client.Close()
+			}
+			return nil, fmt.Errorf("celeris/memcached: ClusterConfig.Weights[%d]=%d exceeds ring-point budget (max total %d points)",
+				i, weight, maxRingPoints)
+		}
+		totalPoints += perNode
 		client, err := NewClient(addr, nodeOpts...)
 		if err != nil {
 			for _, n := range nodes {
@@ -179,22 +200,25 @@ func buildRing(nodes []*clusterNode) []ringPoint {
 	return ring
 }
 
-// hashKeyCRC32 is the lookup hash. CRC32-IEEE is in the stdlib, fast, and
-// uniformly distributed for the 1-250 ASCII-range keys memcached accepts. It
-// is deliberately a different algorithm from the ring-build MD5: the lookup
-// hash is on the hot path and favors speed, the ring-build hash is one-shot
-// at construction and favors distribution quality over many short inputs.
-func hashKeyCRC32(key string) uint32 {
-	return crc32.ChecksumIEEE([]byte(key))
+// hashKey is the lookup hash used by pickNode. It MUST match the first
+// four-byte slice of MD5(key) interpreted little-endian — the exact form
+// libmemcached (and every ketama port that derives from it) uses. Using
+// any other hash silently re-partitions keys differently from every
+// other client on the same cluster; see the subagent review dated
+// 2026-04-17 that flagged an earlier CRC32 implementation for exactly
+// this incompatibility.
+func hashKey(key string) uint32 {
+	sum := md5.Sum([]byte(key))
+	return binary.LittleEndian.Uint32(sum[0:4])
 }
 
 // pickNode returns the ring owner of key. The first ring point with
-// hash >= CRC32(key) wins, wrapping to ring[0] when no such point exists.
+// hash >= hashKey(key) wins, wrapping to ring[0] when no such point exists.
 func (c *ClusterClient) pickNode(key string) *clusterNode {
 	if len(c.ring) == 0 {
 		return nil
 	}
-	h := hashKeyCRC32(key)
+	h := hashKey(key)
 	i := sort.Search(len(c.ring), func(i int) bool {
 		return c.ring[i].hash >= h
 	})
@@ -426,6 +450,11 @@ func (c *ClusterClient) GetMulti(ctx context.Context, keys ...string) (map[strin
 		}
 		buckets[n] = append(buckets[n], k)
 	}
+	// Wrap ctx so the first sub-call that errors can cancel the rest. Without
+	// this, a hung node keeps the whole GetMulti blocked until the caller's
+	// own ctx deadline, even after a peer node already returned an error.
+	fanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	out := make(map[string]string, len(keys))
 	var (
 		wg       sync.WaitGroup
@@ -436,12 +465,13 @@ func (c *ClusterClient) GetMulti(ctx context.Context, keys ...string) (map[strin
 		wg.Add(1)
 		go func(n *clusterNode, ks []string) {
 			defer wg.Done()
-			sub, err := n.client.GetMulti(ctx, ks...)
+			sub, err := n.client.GetMulti(fanCtx, ks...)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				if firstErr == nil {
 					firstErr = err
+					cancel() // abort the siblings
 				}
 				return
 			}
@@ -473,6 +503,8 @@ func (c *ClusterClient) GetMultiBytes(ctx context.Context, keys ...string) (map[
 		}
 		buckets[n] = append(buckets[n], k)
 	}
+	fanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	out := make(map[string][]byte, len(keys))
 	var (
 		wg       sync.WaitGroup
@@ -483,12 +515,13 @@ func (c *ClusterClient) GetMultiBytes(ctx context.Context, keys ...string) (map[
 		wg.Add(1)
 		go func(n *clusterNode, ks []string) {
 			defer wg.Done()
-			sub, err := n.client.GetMultiBytes(ctx, ks...)
+			sub, err := n.client.GetMultiBytes(fanCtx, ks...)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				if firstErr == nil {
 					firstErr = err
+					cancel()
 				}
 				return
 			}

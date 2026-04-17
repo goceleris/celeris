@@ -354,6 +354,84 @@ jobs:
         run: docker compose -f test/conformance/redis/docker-compose.cluster.yml down -v
 
   # ------------------------------------------------------------------
+  # Redis Cluster failover drill — destructive. Kills a master container
+  # mid-run and asserts the driver's topology refresh + MOVED retry path
+  # recovers reads. Same docker-compose stack as `redis-cluster`; runs
+  # under the `redis_cluster_failover` tag.
+  #
+  # timeout-minutes is bumped from the default 10 to 15 because each test
+  # retries Get for up to 30s while waiting for the replica promotion to
+  # propagate, and the suite also restores the container in t.Cleanup.
+  # ------------------------------------------------------------------
+  redis-cluster-failover:
+    name: Redis ${{ matrix.redis }} Cluster Failover
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["7.4.8", "8.0.6", "8.6.2"]
+    env:
+      REDIS_IMAGE: redis:${{ matrix.redis }}
+      CELERIS_REDIS_CLUSTER_ADDRS: "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Start cluster
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.cluster.yml up -d
+          for i in $(seq 1 60); do
+            status=$(docker inspect celeris-cluster-init --format '{{.State.Status}}' 2>/dev/null || echo "")
+            if [ "$status" = "exited" ]; then
+              code=$(docker inspect celeris-cluster-init --format '{{.State.ExitCode}}')
+              if [ "$code" != "0" ]; then
+                echo "cluster-init exited with $code"
+                docker logs celeris-cluster-init
+                exit 1
+              fi
+              break
+            fi
+            sleep 2
+          done
+          for i in $(seq 1 60); do
+            ok=1
+            for port in 7000 7001 7002 7003 7004 7005; do
+              state=$(docker exec "celeris-cluster-$((port-7000))" \
+                redis-cli -p "$port" cluster info 2>/dev/null \
+                | awk -F: '/cluster_state:/ {print $2}' | tr -d '\r\n ')
+              if [ "$state" != "ok" ]; then
+                ok=0
+                break
+              fi
+            done
+            if [ "$ok" = "1" ]; then
+              echo "cluster ready (state=ok, took ${i} polls)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "cluster never reached state=ok"
+          exit 1
+      - name: Cluster failover drills
+        run: >-
+          go test -tags redis_cluster_failover -race -count=1 -timeout=240s -v
+          ./test/conformance/redis/...
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.cluster.yml ps
+          for c in celeris-cluster-0 celeris-cluster-1 celeris-cluster-2 celeris-cluster-3 celeris-cluster-4 celeris-cluster-5; do
+            echo "=== $c ==="
+            docker logs "$c" 2>&1 | tail -50 || true
+          done
+      - name: Tear down
+        if: always()
+        run: docker compose -f test/conformance/redis/docker-compose.cluster.yml down -v
+
+  # ------------------------------------------------------------------
   # Redis Sentinel — master + replica + 3 sentinels quorum=2.
   # ------------------------------------------------------------------
   redis-sentinel:
@@ -395,6 +473,58 @@ jobs:
           for c in celeris-sentinel-master celeris-sentinel-replica celeris-sentinel-1; do
             echo "=== $c ==="
             docker logs "$c" 2>&1 | tail -40
+          done
+      - name: Tear down
+        if: always()
+        run: docker compose -f test/conformance/redis/docker-compose.sentinel.yml down -v
+
+  # ------------------------------------------------------------------
+  # Redis Sentinel failover drill — destructive. Stops the master
+  # container and asserts the SentinelClient's Get eventually succeeds
+  # (the promoted replica is reachable and reads follow the new master).
+  # timeout-minutes is bumped to 15 to cover the 60s in-test polling
+  # window plus cluster teardown.
+  # ------------------------------------------------------------------
+  redis-sentinel-failover:
+    name: Redis ${{ matrix.redis }} Sentinel Failover
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["7.4.8", "8.0.6", "8.6.2"]
+    env:
+      REDIS_IMAGE: redis:${{ matrix.redis }}
+      CELERIS_REDIS_SENTINEL_ADDRS: "127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381"
+      CELERIS_REDIS_SENTINEL_MASTER: mymaster
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Start sentinel stack
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
+          for i in $(seq 1 60); do
+            if docker exec celeris-sentinel-1 redis-cli -p 26379 \
+                sentinel master mymaster 2>/dev/null | grep -q "^127.0.0.1$"; then
+              echo "sentinels ready"
+              break
+            fi
+            sleep 2
+          done
+      - name: Sentinel failover drill
+        run: >-
+          go test -tags redis_sentinel_failover -race -count=1 -timeout=240s -v
+          ./test/conformance/redis/...
+      - name: Dump sentinel state on failure
+        if: failure()
+        run: |
+          docker compose -f test/conformance/redis/docker-compose.sentinel.yml ps
+          for c in celeris-sentinel-master celeris-sentinel-replica celeris-sentinel-1 celeris-sentinel-2 celeris-sentinel-3; do
+            echo "=== $c ==="
+            docker logs "$c" 2>&1 | tail -60 || true
           done
       - name: Tear down
         if: always()

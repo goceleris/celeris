@@ -3,6 +3,7 @@ package memcached
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -374,6 +375,19 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 	req := head.(*mcRequest)
 	if req.kind == kindBinaryMulti {
 		return s.dispatchBinaryMulti(req, p)
+	}
+	// Memcached's binary protocol guarantees per-connection response
+	// ordering: the server MUST send replies in the same order the client
+	// sent requests. We rely on that for FIFO bridge-pop matching. As
+	// defense-in-depth, validate that the opaque the server echoed back
+	// matches the one we assigned to the head request — a mismatch means
+	// either a buggy server or on-the-wire corruption, and continuing
+	// would silently return the wrong reply to whichever caller is next
+	// in line. Fail the connection loudly so the caller sees a transport
+	// error instead of a wrong-key value.
+	if p.Header.Opaque != req.opaque {
+		return fmt.Errorf("celeris/memcached: binary opaque mismatch: got %#x, expected %#x (protocol violation)",
+			p.Header.Opaque, req.opaque)
 	}
 	s.bridge.Pop()
 	req.binStatus = p.Status()

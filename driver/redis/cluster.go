@@ -476,6 +476,7 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 		return errors.New("celeris/redis: no cluster nodes available")
 	}
 	triedReplicaFallback := false
+	triedPrimaryRefresh := false
 	for attempt := range c.cfg.MaxRedirects {
 		err := fn(ctx, node.client)
 		if err == nil {
@@ -491,6 +492,28 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 				if primary := c.route(slot); primary != nil {
 					node = primary
 					continue
+				}
+			}
+			// Non-Redis error on a primary means the master just died
+			// (crash, network partition, container stop). Without an
+			// immediate topology refresh the caller would spin on the
+			// dead node until the background refreshLoop fires (60s
+			// ticker, first tick after the crash may also pick the dead
+			// node as the "any" probe and fail its own refresh). Mark
+			// the node failing, force a synchronous refresh, and retry
+			// on whichever primary now owns the slot. One retry only —
+			// if the refresh also fails we bubble the original error up.
+			if node.primary && !triedPrimaryRefresh {
+				node.failing.Store(true)
+				triedPrimaryRefresh = true
+				rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				refreshErr := c.refreshTopology(rctx)
+				cancel()
+				if refreshErr == nil {
+					if newPrim := c.route(slot); newPrim != nil && newPrim != node {
+						node = newPrim
+						continue
+					}
 				}
 			}
 			return err

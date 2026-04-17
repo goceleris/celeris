@@ -153,6 +153,46 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
+    services:
+      # pg/redis/memcached are here to let the TestSharedLoop* integration
+      # tests in ./test/integration run against real backing stores. The
+      # tests skip cleanly when the env vars are absent, so existing
+      # env-less tests on this job are unaffected.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: celeris
+          POSTGRES_PASSWORD: celeris
+          POSTGRES_DB: celeristest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U celeris -d celeristest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      memcached:
+        image: memcached:1.6-alpine
+        ports:
+          - 11211:11211
+        options: >-
+          --health-cmd "echo version | nc -w 1 localhost 11211 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_PG_DSN: postgres://celeris:celeris@127.0.0.1:5432/celeristest?sslmode=disable
+      CELERIS_REDIS_ADDR: 127.0.0.1:6379
+      CELERIS_MEMCACHED_ADDR: 127.0.0.1:11211
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6

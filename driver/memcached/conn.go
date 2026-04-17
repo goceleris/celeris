@@ -242,7 +242,13 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)
-			return nil, err
+			// Return the req so callers can putRequest it back to the pool
+			// via `defer putRequest(req)` placed BEFORE the err check. The
+			// request has already been finished by closeWithErr's
+			// drainWithError; there is nothing more to do on it, but
+			// dropping it on the floor would slowly drain reqPool under
+			// sustained failures.
+			return req, err
 		}
 		if ok {
 			select {
@@ -261,7 +267,7 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 	c.writerMu.Unlock()
 	if werr != nil {
 		_ = c.closeWithErr(werr)
-		return nil, werr
+		return req, werr
 	}
 	return req, c.wait(ctx, req)
 }
