@@ -511,4 +511,3 @@ func assertWorkerAffinity(t *testing.T, srv *celeris.Server, observed *workerIDS
 		t.Errorf("no overlap between observed handler workers %v and idle conn workers %v — worker hint did not reach the pool", obsIDs, idle)
 	}
 }
-
