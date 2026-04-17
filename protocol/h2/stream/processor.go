@@ -126,18 +126,30 @@ func (p *Processor) FlushInlineCleanup() {
 
 // NewProcessor creates a new stream processor. The conn parameter must
 // implement both ResponseWriter and H2Controller (all H2 engine adapters do).
+// The HPACK decoder is lazily initialized on the first header-block write —
+// on RFC 7540 §3.2 h2c upgrades where stream 1 is injected locally (so no
+// HEADERS frame is ever decoded from the wire) and the connection closes
+// before any subsequent request, this avoids a ~4 KB dynamic-table
+// allocation the decoder would otherwise hold for the connection's life.
 func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
-	p := &Processor{
+	return &Processor{
 		manager:    NewManager(),
 		handler:    handler,
 		writer:     writer,
 		connWriter: conn,
 	}
-	// Set emit function ONCE per connection. The hpackTarget field is updated
-	// before each decode to point at the current pooled slice, eliminating
-	// a closure allocation per HEADERS/CONTINUATION frame.
-	p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
-	return p
+}
+
+// ensureHPACKDecoder initializes p.hpackDecoder on first use. Called from
+// every site that writes into the decoder (all are serialized under
+// H2State.mu, so no atomic dance is needed).
+func (p *Processor) ensureHPACKDecoder() {
+	if p.hpackDecoder == nil {
+		// Set emit function ONCE per connection. The hpackTarget field is
+		// updated before each decode to point at the current pooled slice,
+		// eliminating a closure allocation per HEADERS/CONTINUATION frame.
+		p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
+	}
 }
 
 // hpackEmit is the persistent HPACK emit callback. It appends decoded headers
@@ -675,6 +687,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackTarget = pooledTrailers
+			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -752,6 +765,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackTarget = pooledHeadersIn
+	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -838,6 +852,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackTarget = pooledTrailers
+			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -881,6 +896,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackTarget = pooledHeadersIn
+	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -1209,6 +1225,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		}()
 		p.hpackTarget = pooledHeadersIn
 
+		p.ensureHPACKDecoder()
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
 			p.continuationState = nil
 			p.continuationActive.Store(false)
