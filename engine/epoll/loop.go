@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1108,7 +1109,20 @@ func boundAddr(fd int) net.Addr {
 func sockaddrString(sa unix.Sockaddr) string {
 	switch v := sa.(type) {
 	case *unix.SockaddrInet4:
-		return fmt.Sprintf("%s:%d", net.IP(v.Addr[:]), v.Port)
+		// "xxx.xxx.xxx.xxx:ppppp" — max 21 bytes. Formatting by hand
+		// eliminates fmt.Sprintf + net.IP.String allocations that would
+		// otherwise hit on every accepted conn.
+		var buf [21]byte
+		b := strconv.AppendUint(buf[:0], uint64(v.Addr[0]), 10)
+		b = append(b, '.')
+		b = strconv.AppendUint(b, uint64(v.Addr[1]), 10)
+		b = append(b, '.')
+		b = strconv.AppendUint(b, uint64(v.Addr[2]), 10)
+		b = append(b, '.')
+		b = strconv.AppendUint(b, uint64(v.Addr[3]), 10)
+		b = append(b, ':')
+		b = strconv.AppendUint(b, uint64(uint16(v.Port)), 10)
+		return string(b)
 	case *unix.SockaddrInet6:
 		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
 	}

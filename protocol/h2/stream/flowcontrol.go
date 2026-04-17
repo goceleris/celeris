@@ -35,6 +35,9 @@ func (m *Manager) AccumulateWindowUpdate(streamID uint32, increment uint32) {
 	if streamID == 0 {
 		m.pendingConnWindowUpdate += increment
 	} else {
+		if m.pendingStreamUpdates == nil {
+			m.pendingStreamUpdates = make(map[uint32]uint32)
+		}
 		m.pendingStreamUpdates[streamID] += increment
 	}
 	m.hasPendingUpdates.Store(true)

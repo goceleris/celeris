@@ -29,22 +29,23 @@ type Manager struct {
 	RemoteAddr              string
 }
 
-// NewManager creates a new stream manager.
+// NewManager creates a new stream manager. Auxiliary maps
+// (pendingStreamUpdates, streamsWithData) and the priority-tree maps are
+// lazily allocated on first write — on connections that only serve a
+// single default-priority stream (e.g. an h2c upgrade that closes right
+// after the response) they stay nil and save three map allocations.
 func NewManager() *Manager {
 	return &Manager{
-		streams:                 make(map[uint32]*Stream),
-		nextStreamID:            1,
-		connectionWindow:        65535,
-		maxStreams:              100,
-		priorityTree:            NewPriorityTree(),
-		pushEnabled:             true,
-		nextPushID:              2,
-		maxFrameSize:            16384,
-		initialWindowSize:       65535,
-		headerTableSize:         4096, // RFC 7540 §6.5.2 default
-		pendingConnWindowUpdate: 0,
-		pendingStreamUpdates:    make(map[uint32]uint32),
-		streamsWithData:         make(map[uint32]struct{}),
+		streams:           make(map[uint32]*Stream),
+		nextStreamID:      1,
+		connectionWindow:  65535,
+		maxStreams:        100,
+		priorityTree:      NewPriorityTree(),
+		pushEnabled:       true,
+		nextPushID:        2,
+		maxFrameSize:      16384,
+		initialWindowSize: 65535,
+		headerTableSize:   4096, // RFC 7540 §6.5.2 default
 	}
 }
 
@@ -285,6 +286,9 @@ func (m *Manager) GetOrCreateStream(id uint32) *Stream {
 // MarkStreamBuffered adds a stream to the set of streams with buffered data.
 func (m *Manager) MarkStreamBuffered(id uint32) {
 	m.mu.Lock()
+	if m.streamsWithData == nil {
+		m.streamsWithData = make(map[uint32]struct{})
+	}
 	m.streamsWithData[id] = struct{}{}
 	m.mu.Unlock()
 }
@@ -335,6 +339,8 @@ func (m *Manager) Close() {
 	m.mu.Unlock()
 
 	m.windowUpdateMu.Lock()
-	clear(m.pendingStreamUpdates)
+	if m.pendingStreamUpdates != nil {
+		clear(m.pendingStreamUpdates)
+	}
 	m.windowUpdateMu.Unlock()
 }
