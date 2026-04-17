@@ -336,16 +336,19 @@ func tryUpgradeH2C(state *H1State, body, remaining []byte, write func([]byte)) e
 	// Write 101 response. Connection/Upgrade headers per RFC 7540 §3.2.
 	write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n"))
 
-	info := &UpgradeInfo{
-		Settings: settings,
-		Method:   state.req.Method,
-		URI:      state.req.Path,
-		Headers:  copyH2CHeaders(&state.req),
-		Body:     append([]byte(nil), body...),
-	}
-	if len(remaining) > 0 {
-		info.Remaining = append([]byte(nil), remaining...)
-	}
+	// Acquire a pooled UpgradeInfo. Body and Remaining alias state.buffer's
+	// internal storage — that buffer is NOT modified between our return
+	// (with ErrUpgradeH2C) and the engine's switchToH2 call that consumes
+	// the info, so aliasing is safe. ReleaseUpgradeInfo nils these fields
+	// before returning the struct to the pool so we don't pin buffers
+	// beyond the upgrade's lifetime.
+	info := acquireUpgradeInfo()
+	info.Settings = settings
+	info.Method = state.req.Method
+	info.URI = state.req.Path
+	info.Headers = appendH2CHeaders(info.Headers[:0], &state.req)
+	info.Body = body
+	info.Remaining = remaining
 	state.UpgradeInfo = info
 	return nil
 }
@@ -360,17 +363,20 @@ func tryUpgradeH2C(state *H1State, body, remaining []byte, write func([]byte)) e
 // uncommon names, so we force an allocating ToLower for the header name
 // and a string copy for the value.
 func copyH2CHeaders(req *h1.Request) [][2]string {
-	out := make([][2]string, 0, len(req.RawHeaders))
+	return appendH2CHeaders(make([][2]string, 0, len(req.RawHeaders)), req)
+}
+
+// appendH2CHeaders appends the non-hop-by-hop H1 request headers (lowercased
+// name + owned-string value) to out. Exposed so the upgrade path can reuse
+// a pooled UpgradeInfo.Headers backing array — on pooled entry the slice
+// arrives with zero length but non-zero capacity.
+func appendH2CHeaders(out [][2]string, req *h1.Request) [][2]string {
 	for _, rh := range req.RawHeaders {
-		// Use the interned-or-allocating variant: returns a pre-allocated
-		// literal for common names, and strings.ToLower(string(raw)) for
-		// everything else. Neither aliases the recv buffer.
 		name := h1.LowerHeaderCopy(rh[0])
 		switch name {
 		case "upgrade", "connection", "http2-settings":
 			continue
 		}
-		// Copy value — the raw byte buffer is reused after this call returns.
 		out = append(out, [2]string{name, string(rh[1])})
 	}
 	return out

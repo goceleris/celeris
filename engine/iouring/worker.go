@@ -810,6 +810,7 @@ func (w *Worker) switchToH2(cs *connState) error {
 		// Clear UpgradeInfo so a second dispatch through ProcessH1 can't
 		// re-enter the upgrade path on the already-doomed conn.
 		cs.h1State.UpgradeInfo = nil
+		conn.ReleaseUpgradeInfo(info)
 		return err
 	}
 	// Success: release H1 state now that H2 has taken over.
@@ -825,12 +826,12 @@ func (w *Worker) switchToH2(cs *connState) error {
 	}
 	w.h2Conns = append(w.h2Conns, cs.fd)
 
+	var processErr error
 	if len(info.Remaining) > 0 {
-		if err := conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, w.handler, cs.writeFn, w.h2cfg); err != nil {
-			return err
-		}
+		processErr = conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 	}
-	return nil
+	conn.ReleaseUpgradeInfo(info)
+	return processErr
 }
 
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {

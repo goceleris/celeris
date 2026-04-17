@@ -757,6 +757,7 @@ func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
 	h2State, err := conn.NewH2StateFromUpgrade(l.handler, l.h2cfg, writeFn, l.eventFD, info)
 	if err != nil {
 		cs.h1State.UpgradeInfo = nil
+		conn.ReleaseUpgradeInfo(info)
 		return err
 	}
 	cs.h1State.UpgradeInfo = nil
@@ -767,12 +768,15 @@ func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
 	cs.protocol = engine.H2C
 	l.h2Conns = append(l.h2Conns, cs.fd)
 
+	var processErr error
 	if len(info.Remaining) > 0 {
-		if err := conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, l.handler, writeFn, l.h2cfg); err != nil {
-			return err
-		}
+		processErr = conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, l.handler, writeFn, l.h2cfg)
 	}
-	return nil
+	// Release after ProcessH2 since Remaining aliases the H1 buffer — the
+	// info fields are still read by ProcessH2 above. ReleaseUpgradeInfo
+	// nils the slices so the backing buffer becomes GC-eligible.
+	conn.ReleaseUpgradeInfo(info)
+	return processErr
 }
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {

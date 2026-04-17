@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // ErrUpgradeH2C is returned by ProcessH1 after it has written the 101
@@ -14,6 +15,40 @@ import (
 // The original handler has NOT been invoked; it will be dispatched on H2
 // stream 1 by NewH2StateFromUpgrade once the H2 stack is up.
 var ErrUpgradeH2C = errors.New("celeris: h2c upgrade requested")
+
+// upgradeInfoPool recycles UpgradeInfo structs so each h2c upgrade doesn't
+// pay the wrapper allocation. Acquire via acquireUpgradeInfo, release via
+// ReleaseUpgradeInfo after switchToH2 has finished consuming it.
+var upgradeInfoPool = sync.Pool{
+	New: func() any { return &UpgradeInfo{} },
+}
+
+func acquireUpgradeInfo() *UpgradeInfo {
+	return upgradeInfoPool.Get().(*UpgradeInfo)
+}
+
+// ReleaseUpgradeInfo resets every field and returns the struct to the pool.
+// Aliased slices (Body, Remaining) keep their source buffers alive via their
+// slice references, so we MUST nil them out before returning to the pool or
+// the next acquirer's value will pin stale memory.
+func ReleaseUpgradeInfo(info *UpgradeInfo) {
+	if info == nil {
+		return
+	}
+	info.Settings = nil
+	info.Method = ""
+	info.URI = ""
+	info.Body = nil
+	info.Remaining = nil
+	// Reuse Headers backing array where possible: a clean-up loop zeroing
+	// each entry is cheaper than realloc on the next upgrade. The slice
+	// itself is truncated to zero-length but capacity is retained.
+	for i := range info.Headers {
+		info.Headers[i] = [2]string{}
+	}
+	info.Headers = info.Headers[:0]
+	upgradeInfoPool.Put(info)
+}
 
 // UpgradeInfo carries the state needed to switch an H1 connection to H2
 // mid-stream. It is populated by ProcessH1 on an h2c upgrade, then
