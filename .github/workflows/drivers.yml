@@ -1,17 +1,15 @@
-# Drivers workflow — deep CI for the PostgreSQL and Redis drivers.
-#
-# Scope: full matrix of supported server versions, plus cluster + sentinel
-# conformance against real containerized topologies. These jobs take longer
-# than the default Conformance job on ci.yml and run a wider surface, so
-# they only fire when the diff touches driver code, driver tests, or the
-# workflow itself. A PR can also opt in by attaching the
-# `run-full-driver-ci` label.
+# Drivers workflow — deep CI for the PostgreSQL, Redis, and Memcached
+# drivers. Exercises each driver against every supported major version of
+# its reference server, plus Redis-protocol-compatible alternatives
+# (Valkey, DragonflyDB) to prove the client isn't accidentally bound to
+# Redis-specific quirks. Cluster + Sentinel conformance run against real
+# multi-container topologies.
 #
 # Triggers:
 #   - push to main: every commit (main must be solid).
-#   - pull_request: only when paths match OR the label is present.
-#   - workflow_dispatch: manual run from the Actions tab (useful for
-#     debugging a failing matrix cell against a specific PG/Redis version).
+#   - pull_request: only when driver code / driver tests change OR when
+#     the `run-full-driver-ci` label is attached.
+#   - workflow_dispatch: manual run from the Actions tab.
 
 name: Drivers
 
@@ -22,36 +20,35 @@ on:
       - 'driver/**'
       - 'test/conformance/postgres/**'
       - 'test/conformance/redis/**'
+      - 'test/conformance/memcached/**'
       - 'test/drivercmp/**'
       - 'test/pgspec/**'
       - 'test/redisspec/**'
+      - 'test/mcspec/**'
       - '.github/workflows/drivers.yml'
   pull_request:
     branches: [main]
-    # `labeled` fires when a label is added to an already-open PR, letting
-    # a reviewer force this workflow to run on a PR whose diff wouldn't
-    # otherwise trigger the paths filter.
+    # `labeled` lets a reviewer force the workflow to run on a PR whose
+    # diff wouldn't otherwise trigger the paths filter.
     types: [opened, synchronize, reopened, labeled]
     paths:
       - 'driver/**'
       - 'test/conformance/postgres/**'
       - 'test/conformance/redis/**'
+      - 'test/conformance/memcached/**'
       - 'test/drivercmp/**'
       - 'test/pgspec/**'
       - 'test/redisspec/**'
+      - 'test/mcspec/**'
       - '.github/workflows/drivers.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Guard label-triggered invocations: when `types: [labeled]` fires, the
-# workflow runs even if the new label is something unrelated. This
-# top-level `if` ensures only the opt-in label triggers a full run on a
-# label event; normal push/synchronize/open events pass through.
 jobs:
   # Gate: on a `labeled` event, require the label to be `run-full-driver-ci`.
-  # On any other event, let it through.
+  # Other events pass through (paths filter already vetted them).
   gate:
     name: Gate
     runs-on: ubuntu-latest
@@ -61,9 +58,13 @@ jobs:
     steps:
       - run: echo "Driver CI gated through"
 
-  # Matrix conformance: exercise the standalone single-node mode of each
-  # driver against every supported major version of its server. Each cell
-  # stands up a fresh container for its version.
+  # ------------------------------------------------------------------
+  # PostgreSQL matrix
+  #
+  # Versions pinned to the latest patch of each supported major line:
+  #   14.22, 15.17, 16.13, 17.9, 18.3.
+  # Older majors are out of upstream support windows; 18.3 is the latest.
+  # ------------------------------------------------------------------
   postgres-matrix:
     name: Postgres ${{ matrix.pg }} Conformance
     needs: gate
@@ -71,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["13", "14", "15", "16", "17"]
+        pg: ["14.22", "15.17", "16.13", "17.9", "18.3"]
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -104,6 +105,13 @@ jobs:
           go test -tags postgres -race -count=1 -timeout=300s
           ./test/pgspec/...
 
+  # ------------------------------------------------------------------
+  # Redis matrix
+  #
+  # 7.4.8 — last stable release under the pre-SSPL BSD license line.
+  # 8.0.6 — first stable release after Redis Labs relicensed to AGPLv3.
+  # 8.2.5, 8.4.2, 8.6.2 — 8.x stable progression; 8.6.2 is current latest.
+  # ------------------------------------------------------------------
   redis-matrix:
     name: Redis ${{ matrix.redis }} Conformance
     needs: gate
@@ -111,7 +119,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        redis: ["6.2", "7.0", "7.2", "7.4"]
+        redis: ["7.4.8", "8.0.6", "8.2.5", "8.4.2", "8.6.2"]
     services:
       redis:
         image: redis:${{ matrix.redis }}
@@ -138,10 +146,126 @@ jobs:
           go test -tags redis -race -count=1 -timeout=300s
           ./test/redisspec/...
 
-  # Cluster: real 6-node cluster via docker compose. network_mode: host is
-  # required so CLUSTER SLOTS advertises routable addresses — GitHub
-  # Actions ubuntu-latest runners are Linux, which supports host
-  # networking.
+  # ------------------------------------------------------------------
+  # Valkey matrix — open-source Redis-compatible continuation.
+  #
+  # Uses the same RESP client code as the Redis matrix. Conformance here
+  # proves celeris's driver isn't accidentally dependent on Redis-specific
+  # quirks. Valkey 9.0.3 is the current stable line.
+  # ------------------------------------------------------------------
+  valkey-matrix:
+    name: Valkey ${{ matrix.valkey }} Conformance
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        valkey: ["9.0.3"]
+    services:
+      valkey:
+        image: valkey/valkey:${{ matrix.valkey }}-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_REDIS_ADDR: 127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Conformance (Redis driver against Valkey)
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+      - name: redisspec
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/redisspec/...
+
+  # ------------------------------------------------------------------
+  # DragonflyDB matrix — Redis-protocol-compatible alternative with a
+  # completely different storage engine (multi-threaded, dashtable).
+  # Same rationale as Valkey: independent implementation of the wire
+  # protocol is the strongest test that celeris's client is portable.
+  # ------------------------------------------------------------------
+  dragonfly-matrix:
+    name: DragonflyDB ${{ matrix.dragonfly }} Conformance
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dragonfly: ["v1.27.1"]
+    services:
+      dragonfly:
+        image: docker.dragonflydb.io/dragonflydb/dragonfly:${{ matrix.dragonfly }}
+        ports:
+          - 6379:6379
+        options: >-
+          --ulimit memlock=-1
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_REDIS_ADDR: 127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Conformance (Redis driver against DragonflyDB)
+        # DragonflyDB implements most but not every RESP command; any
+        # cell failure here is signal that celeris may be relying on a
+        # Redis-specific command. Allow the job to fail without
+        # blocking merges while we characterise coverage (the Redis and
+        # Valkey jobs remain strict).
+        continue-on-error: true
+        run: >-
+          go test -tags redis -race -count=1 -timeout=300s
+          ./test/conformance/redis/...
+
+  # ------------------------------------------------------------------
+  # Memcached matrix (#238) — LTS + latest 1.6.x.
+  # ------------------------------------------------------------------
+  memcached-matrix:
+    name: Memcached ${{ matrix.memcached }} Conformance
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        memcached: ["1.6.29", "1.6.36", "1.6.41"]
+    services:
+      memcached:
+        image: memcached:${{ matrix.memcached }}-alpine
+        ports:
+          - 11211:11211
+        options: >-
+          --health-cmd "echo version | nc -w 1 localhost 11211 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CELERIS_MEMCACHED_ADDR: 127.0.0.1:11211
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Conformance
+        run: >-
+          go test -tags memcached -race -count=1 -timeout=300s
+          ./test/conformance/memcached/...
+
+  # ------------------------------------------------------------------
+  # Redis Cluster — real 6-node topology per Redis major line.
+  # ------------------------------------------------------------------
   redis-cluster:
     name: Redis ${{ matrix.redis }} Cluster
     needs: gate
@@ -149,7 +273,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        redis: ["7.0", "7.2", "7.4"]
+        redis: ["7.4.8", "8.0.6", "8.6.2"]
     env:
       REDIS_IMAGE: redis:${{ matrix.redis }}
       CELERIS_REDIS_CLUSTER_ADDRS: "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
@@ -161,7 +285,7 @@ jobs:
       - name: Start cluster
         run: |
           docker compose -f test/conformance/redis/docker-compose.cluster.yml up -d
-          # Wait for cluster-init to finish with exit code 0.
+          # Step 1: wait for the cluster-init container to exit.
           for i in $(seq 1 60); do
             status=$(docker inspect celeris-cluster-init --format '{{.State.Status}}' 2>/dev/null || echo "")
             if [ "$status" = "exited" ]; then
@@ -171,11 +295,39 @@ jobs:
                 docker logs celeris-cluster-init
                 exit 1
               fi
-              echo "cluster ready"
               break
             fi
             sleep 2
           done
+          # Step 2: wait for every master to report cluster_state:ok.
+          # 7.4+ usually reaches this within 1s of init returning; older
+          # releases can need up to 10-15s for slot gossip to settle.
+          # Without this second wait the first test in the suite hits
+          # "CLUSTERDOWN The cluster is down".
+          for i in $(seq 1 60); do
+            ok=1
+            for port in 7000 7001 7002 7003 7004 7005; do
+              state=$(docker exec "celeris-cluster-$((port-7000))" \
+                redis-cli -p "$port" cluster info 2>/dev/null \
+                | awk -F: '/cluster_state:/ {print $2}' | tr -d '\r\n ')
+              if [ "$state" != "ok" ]; then
+                ok=0
+                break
+              fi
+            done
+            if [ "$ok" = "1" ]; then
+              echo "cluster ready (state=ok on all 6 nodes, took ${i} polls)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "cluster never reached state=ok"
+          for port in 7000 7001 7002 7003 7004 7005; do
+            echo "=== node $port ==="
+            docker exec "celeris-cluster-$((port-7000))" \
+              redis-cli -p "$port" cluster info 2>&1 | head -10
+          done
+          exit 1
       - name: Cluster conformance
         run: >-
           go test -tags redis_cluster -race -count=1 -timeout=300s
@@ -192,7 +344,9 @@ jobs:
         if: always()
         run: docker compose -f test/conformance/redis/docker-compose.cluster.yml down -v
 
-  # Sentinel: master + replica + 3 sentinels with quorum=2.
+  # ------------------------------------------------------------------
+  # Redis Sentinel — master + replica + 3 sentinels quorum=2.
+  # ------------------------------------------------------------------
   redis-sentinel:
     name: Redis ${{ matrix.redis }} Sentinel
     needs: gate
@@ -200,7 +354,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        redis: ["6.2", "7.0", "7.2", "7.4"]
+        redis: ["7.4.8", "8.0.6", "8.6.2"]
     env:
       REDIS_IMAGE: redis:${{ matrix.redis }}
       CELERIS_REDIS_SENTINEL_ADDRS: "127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381"
@@ -213,7 +367,6 @@ jobs:
       - name: Start sentinel stack
         run: |
           docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
-          # Wait until all three sentinels agree on the master.
           for i in $(seq 1 60); do
             if docker exec celeris-sentinel-1 redis-cli -p 26379 \
                 sentinel master mymaster 2>/dev/null | grep -q "^127.0.0.1$"; then

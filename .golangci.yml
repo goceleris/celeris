@@ -70,6 +70,10 @@ linters:
         linters:
           - revive
         text: "stutters"
+      - path: driver/memcached/errors\.go
+        linters:
+          - revive
+        text: "stutters"
       - path: middleware/debug/
         linters:
           - revive

@@ -78,8 +78,17 @@ func TestDriver(driver string) error {
 			"-tags", "redis",
 			"-race", "-count=1", "-timeout=300s",
 			"./test/conformance/redis/...")
+	case "memcached":
+		env := map[string]string{}
+		if os.Getenv("CELERIS_MEMCACHED_ADDR") == "" {
+			env["CELERIS_MEMCACHED_ADDR"] = "127.0.0.1:11211"
+		}
+		return runEnv(env, "go", "test",
+			"-tags", "memcached",
+			"-race", "-count=1", "-timeout=300s",
+			"./test/conformance/memcached/...")
 	default:
-		return fmt.Errorf("unknown driver %q (want postgres|redis)", driver)
+		return fmt.Errorf("unknown driver %q (want postgres|redis|memcached)", driver)
 	}
 }
 
@@ -102,6 +111,27 @@ func RedisSpec() error {
 		"-tags", "redisspec",
 		"-race", "-count=1", "-timeout=300s", "-v",
 		"./test/redisspec/...")
+}
+
+// MCSpec runs the memcached text + binary protocol compliance verification
+// suite against a live memcached server.
+//
+// Usage:
+//
+//	mage mcSpec                                     # uses 127.0.0.1:11211
+//	CELERIS_MEMCACHED_ADDR=host:port mage mcSpec    # explicit address
+//
+// Requires a reachable memcached 1.6+ instance with both text and binary
+// protocols available.
+func MCSpec() error {
+	env := map[string]string{}
+	if os.Getenv("CELERIS_MEMCACHED_ADDR") == "" {
+		env["CELERIS_MEMCACHED_ADDR"] = "127.0.0.1:11211"
+	}
+	return runEnv(env, "go", "test",
+		"-tags", "memcached",
+		"-race", "-count=1", "-timeout=300s", "-v",
+		"./test/mcspec/...")
 }
 
 // PGSpec runs the PostgreSQL v3 wire protocol compliance verification suite.
@@ -203,8 +233,12 @@ func BaselineBench(subsys string) error {
 		benchOut, runErr = outputInDir("test/drivercmp/redis",
 			"go", "test", "-run=^$", "-bench", ".",
 			"-benchmem", "-count=1", "./...")
+	case "memcached":
+		benchOut, runErr = outputInDir("test/drivercmp/memcached",
+			"go", "test", "-run=^$", "-bench", ".",
+			"-benchmem", "-count=1", "./...")
 	default:
-		return fmt.Errorf("unknown subsys %q (want eventloop|h2c|postgres|redis)", subsys)
+		return fmt.Errorf("unknown subsys %q (want eventloop|h2c|postgres|redis|memcached)", subsys)
 	}
 
 	benchPath := filepath.Join(dir, "bench.txt")
@@ -243,8 +277,10 @@ func DriverProfile(driver, benchName, duration string) error {
 		benchDir = "test/drivercmp/postgres"
 	case "redis":
 		benchDir = "test/drivercmp/redis"
+	case "memcached":
+		benchDir = "test/drivercmp/memcached"
 	default:
-		return fmt.Errorf("unknown driver %q (want postgres|redis)", driver)
+		return fmt.Errorf("unknown driver %q (want postgres|redis|memcached)", driver)
 	}
 	if strings.TrimSpace(duration) == "" {
 		duration = "30s"
@@ -327,8 +363,10 @@ func DriverBench(driver string) error {
 		benchDir = "test/drivercmp/postgres"
 	case "redis":
 		benchDir = "test/drivercmp/redis"
+	case "memcached":
+		benchDir = "test/drivercmp/memcached"
 	default:
-		return fmt.Errorf("unknown driver %q (want postgres|redis)", driver)
+		return fmt.Errorf("unknown driver %q (want postgres|redis|memcached)", driver)
 	}
 	dir, err := resultsDir("bench-" + driver)
 	if err != nil {
