@@ -249,11 +249,48 @@ const (
 	h2FrameData         byte = 0x00
 	h2FrameHeaders      byte = 0x01
 	h2FrameRSTStream    byte = 0x03
+	h2FrameSettings     byte = 0x04
 	h2FrameContinuation byte = 0x09
 
 	h2FlagEndStream  byte = 0x01
+	h2FlagAck        byte = 0x01 // overload: ACK on SETTINGS/PING frames
 	h2FlagEndHeaders byte = 0x04
 )
+
+// writeSettingsFrame emits a SETTINGS frame with up to 4 parameters directly
+// to buf without going through the shared frame.Writer (which owns an
+// http2.Framer with its own buffers + hpack machinery). The handshake path
+// only needs server SETTINGS + SETTINGS_ACK, so bypassing the framer cuts
+// one large per-upgrade allocation.
+func writeSettingsFrame(buf *bytes.Buffer, params [][2]uint32) {
+	payloadLen := 6 * len(params)
+	var hdr [9]byte
+	hdr[0] = byte(payloadLen >> 16)
+	hdr[1] = byte(payloadLen >> 8)
+	hdr[2] = byte(payloadLen)
+	hdr[3] = h2FrameSettings
+	hdr[4] = 0 // no flags on server-sent initial SETTINGS
+	// streamID = 0 (already zero)
+	buf.Write(hdr[:])
+	var p [6]byte
+	for _, kv := range params {
+		id, val := kv[0], kv[1]
+		p[0] = byte(id >> 8)
+		p[1] = byte(id)
+		p[2] = byte(val >> 24)
+		p[3] = byte(val >> 16)
+		p[4] = byte(val >> 8)
+		p[5] = byte(val)
+		buf.Write(p[:])
+	}
+}
+
+// writeSettingsAckFrame emits the 9-byte SETTINGS ACK frame (empty payload,
+// flags=ACK) directly to buf. Used by the handshake path and by ProcessH2
+// after receiving client SETTINGS to avoid touching state.writer.
+func writeSettingsAckFrame(buf *bytes.Buffer) {
+	buf.Write([]byte{0, 0, 0, h2FrameSettings, h2FlagAck, 0, 0, 0, 0})
+}
 
 // writeH2FrameHeader writes a 9-byte H2 frame header directly to a Buffer.
 // For HEADERS frames, sets END_HEADERS. For DATA/HEADERS with endStream, sets END_STREAM.
@@ -338,6 +375,17 @@ func appendH2Data(buf []byte, streamID uint32, endStream bool, data []byte) []by
 }
 
 // H2State holds per-connection H2 state.
+//
+// Sub-structures (outBuf, inBuf, wq, rw, inlineRW) are embedded as VALUES
+// rather than pointer fields so the whole struct is allocated in one heap
+// block instead of 8. Pointer callers take &s.outBuf etc; since heap
+// allocations don't move in Go, the inner pointers stay stable for the
+// lifetime of the H2State.
+//
+// `processor`, `parser`, and `writer` remain pointer fields — Processor
+// in particular is already large (sync.Mutex, multiple maps, hpack state)
+// and has its own lifecycle hooks, so collapsing it into the parent would
+// invert the existing layering.
 type H2State struct {
 	initialized       bool
 	serverPrefaceSent bool // true if server SETTINGS already written (h2c upgrade path)
@@ -345,12 +393,12 @@ type H2State struct {
 	processor         *stream.Processor
 	parser            *frame.Parser
 	writer            *frame.Writer
-	outBuf            *bytes.Buffer
-	inBuf             *frameBuffer
+	outBuf            bytes.Buffer
+	inBuf             frameBuffer
 	mu                sync.Mutex
-	adapter           *h2ResponseAdapter
-	inlineAdapter     *h2InlineResponseAdapter
-	writeQueue        *h2ShardedQueue
+	adapter           h2ResponseAdapter
+	inlineAdapter     h2InlineResponseAdapter
+	writeQueue        h2ShardedQueue
 	cfg               H2Config // cached with defaults applied
 }
 
@@ -379,49 +427,38 @@ func (s *H2State) DrainWriteQueue(write func([]byte)) {
 func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeupFD int) *H2State {
 	cfg = cfg.withDefaults()
 
-	var outBuf bytes.Buffer
-	var inBuf frameBuffer
-	fw := frame.NewWriter(&outBuf)
-
-	wq := &h2ShardedQueue{wakeupFD: wakeupFD}
-
-	rw := &h2ResponseAdapter{
+	// Single heap allocation for the whole H2State. Substructures are
+	// embedded as values; we fill them in place and hand out pointers below.
+	s := &H2State{cfg: cfg}
+	s.writeQueue.wakeupFD = wakeupFD
+	s.adapter = h2ResponseAdapter{
 		write:        write,
-		outBuf:       &outBuf,
-		writer:       fw,
-		writeQueue:   wq,
+		outBuf:       &s.outBuf,
+		writeQueue:   &s.writeQueue,
+		maxFrameSize: cfg.MaxFrameSize,
+	}
+	s.inlineAdapter = h2InlineResponseAdapter{
+		outBuf:       &s.outBuf,
 		maxFrameSize: cfg.MaxFrameSize,
 	}
 
-	inlineRW := &h2InlineResponseAdapter{
-		outBuf:       &outBuf,
-		maxFrameSize: cfg.MaxFrameSize,
-	}
-	// enc.hpackEnc is lazily initialized in encodeHeaders on the slow path.
-	// The fast path (status 200 + known content-type + content-length) uses
-	// pre-encoded HPACK bytes and never needs the dynamic encoder — see
-	// h2InlineResponseAdapter.WriteResponse.
+	fw := frame.NewWriter(&s.outBuf)
+	s.writer = fw
+	s.adapter.writer = fw
 
-	proc := stream.NewProcessor(handler, fw, rw)
-	proc.InlineWriter = inlineRW
+	// Processor stays as a pointer — it owns a hpack.Decoder, a mutex, and
+	// two maps; collapsing into the parent would cost more than it saves.
+	proc := stream.NewProcessor(handler, fw, &s.adapter)
+	proc.InlineWriter = &s.inlineAdapter
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
+	proc.GetManager().SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
+	s.processor = proc
 
 	p := frame.NewParser()
-	p.InitReader(&inBuf)
+	p.InitReader(&s.inBuf)
+	s.parser = p
 
-	proc.GetManager().SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
-
-	return &H2State{
-		processor:     proc,
-		parser:        p,
-		writer:        fw,
-		outBuf:        &outBuf,
-		inBuf:         &inBuf,
-		adapter:       rw,
-		inlineAdapter: inlineRW,
-		writeQueue:    wq,
-		cfg:           cfg,
-	}
+	return s
 }
 
 // NewH2StateFromUpgrade constructs an H2State that has already absorbed
@@ -453,21 +490,19 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 	// not strictly specified (RFC 7540 §3.5: "The server connection
 	// preface consists of a potentially empty SETTINGS frame..."), but
 	// sending our SETTINGS first matches common server behavior.
-	settings := []http2.Setting{
-		{ID: http2.SettingMaxConcurrentStreams, Val: state.cfg.MaxConcurrentStreams},
-		{ID: http2.SettingInitialWindowSize, Val: state.cfg.InitialWindowSize},
-		{ID: http2.SettingMaxFrameSize, Val: state.cfg.MaxFrameSize},
-	}
-	if err := state.writer.WriteSettings(settings...); err != nil {
-		return nil, fmt.Errorf("h2c upgrade: write server settings: %w", err)
-	}
-	if err := state.writer.WriteSettingsAck(); err != nil {
-		return nil, fmt.Errorf("h2c upgrade: write settings ack: %w", err)
-	}
-	if err := state.writer.Flush(); err != nil {
-		return nil, fmt.Errorf("h2c upgrade: flush settings: %w", err)
-	}
-	flushOutBuf(state.outBuf, write)
+	//
+	// We bypass state.writer here so the handshake path never lazy-pays
+	// for an http2.Framer allocation. state.writer is still constructed
+	// in NewH2State for code paths that need it (WriteData on async
+	// response, WriteGoAway/WriteRSTStream on errors), but for the
+	// server preface frames we know the exact wire format.
+	writeSettingsFrame(&state.outBuf, [][2]uint32{
+		{uint32(http2.SettingMaxConcurrentStreams), state.cfg.MaxConcurrentStreams},
+		{uint32(http2.SettingInitialWindowSize), state.cfg.InitialWindowSize},
+		{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
+	})
+	writeSettingsAckFrame(&state.outBuf)
+	flushOutBuf(&state.outBuf, write)
 	state.serverPrefaceSent = true
 
 	// Extract authority (Host) from headers (lowercase).
@@ -504,7 +539,7 @@ func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]by
 	}
 	// Drain any inline response that the handler produced (common case for
 	// simple GET handlers that write immediately).
-	flushOutBuf(state.outBuf, write)
+	flushOutBuf(&state.outBuf, write)
 	if state.writeQueue.pending.Load() {
 		state.writeQueue.DrainTo(write)
 	}
@@ -523,20 +558,12 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 		// h2c upgrade path writes the server preface (SETTINGS) synchronously
 		// in NewH2StateFromUpgrade, so skip the write if already done.
 		if !state.serverPrefaceSent {
-			settings := []http2.Setting{
-				{ID: http2.SettingMaxConcurrentStreams, Val: state.cfg.MaxConcurrentStreams},
-				{ID: http2.SettingInitialWindowSize, Val: state.cfg.InitialWindowSize},
-				{ID: http2.SettingMaxFrameSize, Val: state.cfg.MaxFrameSize},
-			}
-			if err := state.writer.WriteSettings(settings...); err != nil {
-				state.mu.Unlock()
-				return fmt.Errorf("failed to write server settings: %w", err)
-			}
-			if err := state.writer.Flush(); err != nil {
-				state.mu.Unlock()
-				return err
-			}
-			flushOutBuf(state.outBuf, write)
+			writeSettingsFrame(&state.outBuf, [][2]uint32{
+				{uint32(http2.SettingMaxConcurrentStreams), state.cfg.MaxConcurrentStreams},
+				{uint32(http2.SettingInitialWindowSize), state.cfg.InitialWindowSize},
+				{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
+			})
+			flushOutBuf(&state.outBuf, write)
 			state.serverPrefaceSent = true
 		}
 
@@ -622,7 +649,7 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 					_ = state.processor.SendGoAway(
 						state.processor.GetManager().GetLastStreamID(),
 						http2.ErrCode(ce), []byte(ce.Error()))
-					flushOutBuf(state.outBuf, write)
+					flushOutBuf(&state.outBuf, write)
 				}
 				state.mu.Unlock()
 				state.DrainWriteQueue(write)
@@ -631,12 +658,12 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 			processErr = state.processor.ProcessFrame(ctx, f)
 		}
 		if processErr != nil {
-			flushOutBuf(state.outBuf, write)
+			flushOutBuf(&state.outBuf, write)
 			state.mu.Unlock()
 			state.DrainWriteQueue(write)
 			return processErr
 		}
-		flushOutBuf(state.outBuf, write)
+		flushOutBuf(&state.outBuf, write)
 		// Drain inline handler responses immediately so they're sent in the
 		// same event loop iteration. Without this, responses queue up and
 		// never flush until the frame loop exits (starving h2load clients).
