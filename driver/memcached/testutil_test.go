@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,6 +21,14 @@ type fakeMemcached struct {
 	mu    sync.Mutex
 	conns []net.Conn
 	store *memStore
+	// cmdCount is the number of commands this fake has received since start.
+	// Atomic so cluster tests can assert request distribution across fakes
+	// without synchronizing with the serve loop.
+	cmdCount atomic.Uint64
+	// getKeys is the total number of key arguments seen across all get/gets
+	// requests. Useful for asserting fan-out proportions in the cluster
+	// driver's GetMulti, where a single request on the wire carries N keys.
+	getKeys atomic.Uint64
 }
 
 // memStore is a goroutine-safe map that services the fake server's default
@@ -144,8 +153,10 @@ func (f *fakeMemcached) serve(c net.Conn) {
 			continue
 		}
 		cmd := fields[0]
+		f.cmdCount.Add(1)
 		switch cmd {
 		case "get", "gets":
+			f.getKeys.Add(uint64(len(fields) - 1))
 			f.handleGet(cmd, fields[1:], w)
 		case "set", "add", "replace", "append", "prepend":
 			if !f.handleStore(cmd, fields[1:], r, w) {

@@ -94,10 +94,10 @@
 // reading a PCAP. The binary protocol is opt-in via [WithProtocol]; it adds
 // an opaque correlation ID, fixed-size framing, and explicit status codes.
 // The binary dialect is useful where malformed user input or embedded NULs
-// in values must round-trip cleanly, but its lack of server-side multi-key
-// pipeline semantics in our current state machine means GetMulti on binary
-// falls back to sequential GETs (one round trip per key). Callers needing
-// true multi-get pipelining should pick the text protocol.
+// in values must round-trip cleanly. Both dialects truly pipeline
+// [Client.GetMulti] in a single round trip — binary uses OpGetKQ + OpNoop,
+// text uses the multi-key `get` command. Multi-packet server replies such
+// as binary Stats are decoded natively on the active conn.
 //
 // # Expiration times
 //
@@ -113,16 +113,59 @@
 // who switch from text to binary do not accidentally ship previously
 // valid-looking keys that the text server would have rejected.
 //
+// # Multi-server sharding (ClusterClient)
+//
+// Production memcached deployments fan keys across N independent nodes; the
+// memcached protocol has no cluster-aware peer discovery, so sharding is a
+// client-side concern. [ClusterClient] owns a static ring of [Client]
+// instances (one per configured address) and routes each key via a
+// libmemcached-compatible ketama consistent-hash ring.
+//
+//	cc, err := memcached.NewClusterClient(memcached.ClusterConfig{
+//	    Addrs: []string{
+//	        "memcache-a:11211",
+//	        "memcache-b:11211",
+//	        "memcache-c:11211",
+//	    },
+//	    // Optional: relative weights (nil = equal).
+//	    // Weights: []uint32{1, 2, 1},
+//	})
+//	defer cc.Close()
+//	cc.Set(ctx, "user:42", "payload", time.Hour)
+//
+// The ring assigns 160 virtual nodes per unit weight, placed at
+// MD5("<addr>-<vnode>") boundaries (4 ring points per digest). Lookup uses
+// CRC32-IEEE on the user key and a binary search with wrap-around. Removing
+// one of N nodes only re-homes the ~1/N share of keys it owned; the rest
+// keep their owner, matching the usual ketama guarantee.
+//
+// The [ClusterClient] API mirrors [Client] command-for-command:
+//
+//   - Single-key ops (Get, Set, Delete, Incr, ...) route to pickNode(key).
+//   - GetMulti / GetMultiBytes partition keys by owner, fan out one
+//     sub-request per node in parallel, and merge the per-node responses.
+//     On error the first error wins; partial results from other nodes are
+//     discarded.
+//   - Stats, Version return a per-node map keyed by address.
+//   - Flush, FlushAfter, Ping fan out to every node; the first error wins.
+//   - NodeFor(key) exposes the ring's routing decision for debugging and
+//     for out-of-band work that needs to track per-node state.
+//
+// Topology is static for the lifetime of the client: memcached nodes do
+// not gossip and [ClusterClient] does not run a background refresh loop.
+// Adding or removing a node requires tearing down the client and building
+// a new one. For a dynamically-changing fleet, deploy a proxy such as
+// mcrouter or twemproxy in front of the nodes and point the single-node
+// [Client] at the proxy.
+//
 // # Known limitations (v1.4.0)
 //
 //   - No TLS — deploy over VPC, loopback, or a sidecar.
 //   - No SASL authentication; memcached servers configured with -Y will
 //     reject the driver's handshake. Deploy with network-level auth.
-//   - Binary GetMulti is implemented as sequential GETs (one round trip per
-//     key). Text GetMulti is truly pipelined in a single round trip.
 //   - No server-side compression. Values are sent as-is; large payloads
 //     should be compressed on the client side.
-//   - No consistent-hash ring across multiple servers — the driver pins to
-//     a single addr. Use a client-side hash ring or a proxy (mcrouter) for
-//     sharding.
+//   - [ClusterClient] topology is static: no background refresh. Memcached
+//     nodes do not gossip. To add/remove nodes at runtime, tear down and
+//     rebuild the client, or front the fleet with mcrouter.
 package memcached

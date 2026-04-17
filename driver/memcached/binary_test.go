@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goceleris/celeris/driver/memcached/protocol"
@@ -15,11 +17,51 @@ import (
 
 // fakeBinaryServer is a minimal in-process server that speaks the binary
 // protocol. Unlike the text fake it only implements the subset the driver
-// needs: get / set / delete / incr / decr / version / touch / flush.
+// needs: get / set / delete / incr / decr / version / touch / flush / stats,
+// plus OpGetKQ + OpNoop pipelined multi-get.
 type fakeBinaryServer struct {
 	ln    net.Listener
 	mu    sync.Mutex
 	store map[string]binItem
+
+	// statsReply, if non-nil, overrides the default set of STAT entries
+	// emitted in response to OpStat.
+	statsReply []statKV
+
+	// writeCount counts the number of discrete c.Write calls the fake has
+	// made back to the client. A pipelined GetMulti batch is written with a
+	// single Write (one trip through bytes.Buffer). Atomic so tests can read
+	// it without grabbing mu.
+	writeCount atomic.Uint64
+	// recvBatchSizes records the length of each client read this conn saw.
+	// Used to verify the driver wrote one pipelined batch rather than N
+	// individual packets.
+	recvBatchSizes []int
+	// lastRecv captures every client read for byte-level framing assertions.
+	lastRecv []byte
+}
+
+// statKV is one scripted STAT reply entry.
+type statKV struct {
+	name  string
+	value string
+}
+
+// statsReplyOrDefault returns the configured stats script, or a default set
+// of three well-known entries if the test did not install an override.
+func (f *fakeBinaryServer) statsReplyOrDefault() []statKV {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statsReply != nil {
+		out := make([]statKV, len(f.statsReply))
+		copy(out, f.statsReply)
+		return out
+	}
+	return []statKV{
+		{"pid", "1234"},
+		{"version", "1.6.celeris-fake-bin"},
+		{"uptime", "42"},
+	}
 }
 
 type binItem struct {
@@ -49,8 +91,33 @@ func (f *fakeBinaryServer) accept() {
 		if err != nil {
 			return
 		}
-		go f.serve(c)
+		go f.serve(&trackedBinConn{Conn: c, f: f})
 	}
+}
+
+// trackedBinConn wraps net.Conn so the fake can observe how many Read calls
+// the driver's write pattern produces on the server side (1 read per client
+// Write is the fast-path invariant for pipelined GetMulti) and how many
+// discrete c.Write calls the fake made back.
+type trackedBinConn struct {
+	net.Conn
+	f *fakeBinaryServer
+}
+
+func (t *trackedBinConn) Read(p []byte) (int, error) {
+	n, err := t.Conn.Read(p)
+	if n > 0 {
+		t.f.mu.Lock()
+		t.f.recvBatchSizes = append(t.f.recvBatchSizes, n)
+		t.f.lastRecv = append(t.f.lastRecv, p[:n]...)
+		t.f.mu.Unlock()
+	}
+	return n, err
+}
+
+func (t *trackedBinConn) Write(p []byte) (int, error) {
+	t.f.writeCount.Add(1)
+	return t.Conn.Write(p)
 }
 
 func (f *fakeBinaryServer) serve(c net.Conn) {
@@ -93,6 +160,29 @@ func (f *fakeBinaryServer) serve(c net.Conn) {
 				binary.BigEndian.PutUint32(ex[0:4], it.flags)
 				writeResp(resp, op, protocol.StatusOK, it.cas, opaque, ex[:], nil, it.value)
 			}
+		case protocol.OpGetKQ:
+			// Quiet get-with-key: reply on hit (opcode echo, extras+key+value),
+			// suppress on miss.
+			f.mu.Lock()
+			it, ok := f.store[key]
+			f.mu.Unlock()
+			if ok {
+				var ex [4]byte
+				binary.BigEndian.PutUint32(ex[0:4], it.flags)
+				writeResp(resp, op, protocol.StatusOK, it.cas, opaque, ex[:], []byte(key), it.value)
+			}
+		case protocol.OpNoop:
+			writeResp(resp, op, protocol.StatusOK, 0, opaque, nil, nil, nil)
+		case protocol.OpStat:
+			// Emit a fixed scripted set of stat packets followed by the
+			// zero-key terminator. The caller can install a custom statsReply
+			// hook (see fakeBinaryServer.statsReply) to override the packet
+			// list per test.
+			entries := f.statsReplyOrDefault()
+			for _, e := range entries {
+				writeResp(resp, op, protocol.StatusOK, 0, opaque, nil, []byte(e.name), []byte(e.value))
+			}
+			writeResp(resp, op, protocol.StatusOK, 0, opaque, nil, nil, nil)
 		case protocol.OpSet, protocol.OpAdd, protocol.OpReplace:
 			var flags, exptime uint32
 			if len(extras) >= 8 {
@@ -347,8 +437,8 @@ func TestBinaryFlush(t *testing.T) {
 }
 
 func TestBinaryGetMulti(t *testing.T) {
-	// Binary GetMulti is sequential GETs; verify it still aggregates hits
-	// and skips misses.
+	// Binary GetMulti is pipelined (OpGetKQ + OpNoop); verify it aggregates
+	// hits and skips misses.
 	c, _ := newBinaryClient(t)
 	ctx := context.Background()
 	_ = c.Set(ctx, "a", "va", 0)
@@ -363,4 +453,245 @@ func TestBinaryGetMulti(t *testing.T) {
 	if _, ok := out["absent"]; ok {
 		t.Fatalf("absent key should be omitted")
 	}
+}
+
+// TestBinary_GetMulti_Pipelined verifies that GetMulti issues one pipelined
+// write containing N OpGetKQ packets followed by a single OpNoop terminator,
+// rather than N individual round trips. We inspect the raw bytes the fake
+// received on the wire for the precise request framing.
+func TestBinary_GetMulti_Pipelined(t *testing.T) {
+	c, fake := newBinaryClient(t)
+	ctx := context.Background()
+	for _, k := range []string{"a", "b", "c"} {
+		if err := c.Set(ctx, k, "v"+k, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reset the on-wire recorder to isolate the GetMulti call.
+	fake.mu.Lock()
+	fake.lastRecv = fake.lastRecv[:0]
+	fake.mu.Unlock()
+
+	out, err := c.GetMulti(ctx, "a", "b", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 || out["a"] != "va" || out["b"] != "vb" || out["c"] != "vc" {
+		t.Fatalf("GetMulti = %#v", out)
+	}
+	fake.mu.Lock()
+	wire := append([]byte(nil), fake.lastRecv...)
+	fake.mu.Unlock()
+	opcodes := extractRequestOpcodes(t, wire)
+	// Expect exactly OpGetKQ x3 then OpNoop x1.
+	want := []byte{protocol.OpGetKQ, protocol.OpGetKQ, protocol.OpGetKQ, protocol.OpNoop}
+	if !bytes.Equal(opcodes, want) {
+		t.Fatalf("wire opcodes = %x, want %x", opcodes, want)
+	}
+}
+
+// TestBinary_GetMulti_AllMisses verifies that a pipelined batch where every
+// key is absent returns an empty map (and no error) — the driver must still
+// recognize the Noop terminator as a normal completion.
+func TestBinary_GetMulti_AllMisses(t *testing.T) {
+	c, _ := newBinaryClient(t)
+	out, err := c.GetMulti(context.Background(), "x", "y", "z")
+	if err != nil {
+		t.Fatalf("GetMulti: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("expected empty map, got %#v", out)
+	}
+}
+
+// TestBinary_GetMulti_PartialHits sets 3 of 5 keys and verifies only the
+// hits come back in the response map.
+func TestBinary_GetMulti_PartialHits(t *testing.T) {
+	c, _ := newBinaryClient(t)
+	ctx := context.Background()
+	keys := []string{"pk0", "pk1", "pk2", "pk3", "pk4"}
+	hits := map[string]string{"pk0": "v0", "pk2": "v2", "pk4": "v4"}
+	for k, v := range hits {
+		if err := c.Set(ctx, k, v, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := c.GetMulti(ctx, keys...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(hits) {
+		t.Fatalf("GetMulti len = %d (%v), want %d (%v)", len(got), got, len(hits), hits)
+	}
+	for k, v := range hits {
+		if got[k] != v {
+			t.Fatalf("GetMulti[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+	for _, k := range []string{"pk1", "pk3"} {
+		if _, ok := got[k]; ok {
+			t.Fatalf("miss key %q should not appear in result", k)
+		}
+	}
+}
+
+// TestBinary_GetMulti_LargeBatch sets and retrieves 100 keys in a single
+// pipelined round trip. Exercises buffer-growth paths in the writer and
+// stream-terminator detection across many server replies.
+func TestBinary_GetMulti_LargeBatch(t *testing.T) {
+	c, _ := newBinaryClient(t)
+	ctx := context.Background()
+	const N = 100
+	keys := make([]string, N)
+	expected := make(map[string]string, N)
+	for i := 0; i < N; i++ {
+		k := "big_" + strconv.Itoa(i)
+		v := "val_" + strconv.Itoa(i)
+		keys[i] = k
+		expected[k] = v
+		if err := c.Set(ctx, k, v, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := c.GetMulti(ctx, keys...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != N {
+		t.Fatalf("GetMulti returned %d entries, want %d", len(got), N)
+	}
+	for k, v := range expected {
+		if got[k] != v {
+			t.Fatalf("GetMulti[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// TestBinary_Stats_MultiPacket verifies that Stats accumulates every STAT
+// packet the server emits until the zero-key terminator arrives.
+func TestBinary_Stats_MultiPacket(t *testing.T) {
+	c, fake := newBinaryClient(t)
+	fake.mu.Lock()
+	fake.statsReply = []statKV{
+		{"pid", "42"},
+		{"version", "1.6.fake"},
+		{"curr_items", "7"},
+		{"cmd_get", "0"},
+		{"cmd_set", "1"},
+	}
+	fake.mu.Unlock()
+	out, err := c.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(out) != 5 {
+		t.Fatalf("Stats returned %d entries (%v), want 5", len(out), out)
+	}
+	if out["pid"] != "42" || out["version"] != "1.6.fake" ||
+		out["curr_items"] != "7" || out["cmd_get"] != "0" || out["cmd_set"] != "1" {
+		t.Fatalf("Stats values mismatch: %v", out)
+	}
+}
+
+// TestBinary_Stats_Empty verifies that an empty stats stream (server replies
+// with only the terminator) returns an empty map, not an error.
+func TestBinary_Stats_Empty(t *testing.T) {
+	c, fake := newBinaryClient(t)
+	fake.mu.Lock()
+	fake.statsReply = []statKV{}
+	fake.mu.Unlock()
+	out, err := c.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("Stats returned %d entries (%v), want 0", len(out), out)
+	}
+}
+
+// extractRequestOpcodes walks wire bytes parsed as a stream of binary
+// request headers and returns the opcode sequence. Helper for framing
+// assertions in the pipelined GetMulti test.
+func extractRequestOpcodes(t *testing.T, wire []byte) []byte {
+	t.Helper()
+	var ops []byte
+	i := 0
+	for i+protocol.BinHeaderLen <= len(wire) {
+		if wire[i] != protocol.MagicRequest {
+			t.Fatalf("non-request magic at offset %d: 0x%02x", i, wire[i])
+		}
+		ops = append(ops, wire[i+1])
+		bodyLen := int(binary.BigEndian.Uint32(wire[i+8 : i+12]))
+		i += protocol.BinHeaderLen + bodyLen
+	}
+	if i != len(wire) {
+		t.Fatalf("trailing bytes at offset %d (wire len %d)", i, len(wire))
+	}
+	return ops
+}
+
+// BenchmarkBinary_GetMulti_10 measures allocations for a 10-key pipelined
+// binary GetMulti against the in-process fake. Reported for the v1.4.0
+// alloc-budget tracker (task #58). A single pipelined round trip should not
+// regress versus the earlier sequential implementation.
+func BenchmarkBinary_GetMulti_10(b *testing.B) {
+	fake := startFakeBinaryB(b)
+	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"}
+	c, err := NewClient(fake.Addr(), WithProtocol(ProtocolBinary))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+	for _, k := range keys {
+		if err := c.Set(ctx, k, "v", 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if _, err := c.GetMulti(ctx, keys...); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.GetMulti(ctx, keys...); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkBinary_Stats measures allocations for a native-binary Stats call
+// against the in-process fake. Useful as a tripwire against regressions in
+// the multi-packet accumulation path.
+func BenchmarkBinary_Stats(b *testing.B) {
+	fake := startFakeBinaryB(b)
+	c, err := NewClient(fake.Addr(), WithProtocol(ProtocolBinary))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+	if _, err := c.Stats(ctx); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Stats(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// startFakeBinaryB is the *testing.B variant of startFakeBinary.
+func startFakeBinaryB(b *testing.B) *fakeBinaryServer {
+	b.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	f := &fakeBinaryServer{ln: ln, store: map[string]binItem{}}
+	b.Cleanup(func() { _ = ln.Close() })
+	go f.accept()
+	return f
 }

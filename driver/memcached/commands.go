@@ -333,23 +333,19 @@ func (c *Client) GetMulti(ctx context.Context, keys ...string) (map[string]strin
 	out := make(map[string]string, len(keys))
 	err := c.run(ctx, func(ctx context.Context, conn *memcachedConn) error {
 		if conn.binary {
-			// Binary pipelining via OpGetKQ + OpNoop gives one response per
-			// hit plus the Noop reply as a sentinel. We emit them in a
-			// single write, enqueue one request per key (GetKQ packets are
-			// "quiet": no response on miss, so we can't easily map replies
-			// to requests without an opaque index). To keep the state machine
-			// simple we fall back to sequential OpGet packets in binary mode.
-			for _, k := range keys {
-				req, err := conn.execBinary(ctx, protocol.OpGet, func(w *protocol.BinaryWriter, opaque uint32) []byte {
-					return w.AppendGet(protocol.OpGet, k, opaque)
-				})
-				if err != nil {
-					return err
-				}
-				if req.binStatus == protocol.StatusOK && len(req.values) > 0 {
-					out[k] = string(req.values[0].Data)
-				}
-				putRequest(req)
+			req, err := conn.execBinaryMulti(ctx,
+				func(w *protocol.BinaryWriter) []byte { return encodeGetMultiBatch(conn, w, keys) },
+				isGetMultiTerminator,
+			)
+			if err != nil {
+				return err
+			}
+			defer putRequest(req)
+			if req.resultErr != nil {
+				return req.resultErr
+			}
+			for _, v := range req.values {
+				out[v.Key] = bytesToString(v.Data)
 			}
 			return nil
 		}
@@ -364,7 +360,7 @@ func (c *Client) GetMulti(ctx context.Context, keys ...string) (map[string]strin
 			return req.resultErr
 		}
 		for _, v := range req.values {
-			out[string(v.Key)] = string(v.Data)
+			out[v.Key] = string(v.Data)
 		}
 		return nil
 	})
@@ -384,17 +380,19 @@ func (c *Client) GetMultiBytes(ctx context.Context, keys ...string) (map[string]
 	out := make(map[string][]byte, len(keys))
 	err := c.run(ctx, func(ctx context.Context, conn *memcachedConn) error {
 		if conn.binary {
-			for _, k := range keys {
-				req, err := conn.execBinary(ctx, protocol.OpGet, func(w *protocol.BinaryWriter, opaque uint32) []byte {
-					return w.AppendGet(protocol.OpGet, k, opaque)
-				})
-				if err != nil {
-					return err
-				}
-				if req.binStatus == protocol.StatusOK && len(req.values) > 0 {
-					out[k] = req.values[0].Data
-				}
-				putRequest(req)
+			req, err := conn.execBinaryMulti(ctx,
+				func(w *protocol.BinaryWriter) []byte { return encodeGetMultiBatch(conn, w, keys) },
+				isGetMultiTerminator,
+			)
+			if err != nil {
+				return err
+			}
+			defer putRequest(req)
+			if req.resultErr != nil {
+				return req.resultErr
+			}
+			for _, v := range req.values {
+				out[v.Key] = v.Data
 			}
 			return nil
 		}
@@ -409,11 +407,42 @@ func (c *Client) GetMultiBytes(ctx context.Context, keys ...string) (map[string]
 			return req.resultErr
 		}
 		for _, v := range req.values {
-			out[string(v.Key)] = v.Data
+			out[v.Key] = v.Data
 		}
 		return nil
 	})
 	return out, err
+}
+
+// encodeGetMultiBatch emits N OpGetKQ packets followed by one OpNoop
+// terminator, all into a single buffer. OpGetKQ is the "quiet get with key"
+// variant: hits stream back as separate response packets carrying the key,
+// while misses suppress any reply entirely. The trailing OpNoop forces a
+// reply even if every key missed, giving dispatch a definite end-of-stream
+// marker. Opaque values are not used for matching (we rely on the key
+// carried in the response), but we assign monotonically increasing values
+// for tracing and to keep the wire identical to what mcrouter / twemproxy
+// emit.
+func encodeGetMultiBatch(conn *memcachedConn, w *protocol.BinaryWriter, keys []string) []byte {
+	for _, k := range keys {
+		op := conn.opaque.Add(1)
+		_ = w.AppendGet(protocol.OpGetKQ, k, op)
+	}
+	return w.AppendSimple(protocol.OpNoop, conn.opaque.Add(1))
+}
+
+// isGetMultiTerminator returns true for the Noop echo that closes a
+// pipelined GetMulti stream.
+func isGetMultiTerminator(p protocol.BinaryPacket) bool {
+	return p.Header.Opcode == protocol.OpNoop
+}
+
+// isStatsTerminator returns true for the zero-body STAT packet that ends a
+// stats stream. Per the binary spec, the terminator carries no key and no
+// value.
+func isStatsTerminator(p protocol.BinaryPacket) bool {
+	return p.Header.Opcode == protocol.OpStat &&
+		p.Header.KeyLen == 0 && p.Header.BodyLen == 0
 }
 
 // CASItem is the key + value + CAS token triple returned by [Client.Gets].
@@ -468,7 +497,7 @@ func (c *Client) Gets(ctx context.Context, key string) (CASItem, error) {
 			return ErrCacheMiss
 		}
 		v := req.values[0]
-		out = CASItem{Key: string(v.Key), Value: v.Data, Flags: v.Flags, CAS: v.CAS}
+		out = CASItem{Key: v.Key, Value: v.Data, Flags: v.Flags, CAS: v.CAS}
 		return nil
 	})
 	return out, err
@@ -690,25 +719,21 @@ func (c *Client) Stats(ctx context.Context) (map[string]string, error) {
 	out := make(map[string]string)
 	err := c.run(ctx, func(ctx context.Context, conn *memcachedConn) error {
 		if conn.binary {
-			// Binary stats is multi-reply terminated by a zero-key packet.
-			// The current state machine resolves one packet per request, so
-			// we decode statistics via repeated Read — simpler to route via
-			// a single initial packet with a loop that keeps Pop'ing until
-			// a zero-length key arrives. That requires deeper state-machine
-			// changes; for v1.4.0 we fall back to text-protocol stats when
-			// the caller is on binary, dialing a one-shot text conn on
-			// demand.
-			textClient, err := NewClient(c.cfg.Addr, WithProtocol(ProtocolText))
+			req, err := conn.execBinaryMulti(ctx,
+				func(w *protocol.BinaryWriter) []byte {
+					return w.AppendStats("", conn.opaque.Add(1))
+				},
+				isStatsTerminator,
+			)
 			if err != nil {
 				return err
 			}
-			defer func() { _ = textClient.Close() }()
-			m, err := textClient.Stats(ctx)
-			if err != nil {
-				return err
+			defer putRequest(req)
+			if req.resultErr != nil {
+				return req.resultErr
 			}
-			for k, v := range m {
-				out[k] = v
+			for _, s := range req.stats {
+				out[s.Name] = s.Value
 			}
 			return nil
 		}

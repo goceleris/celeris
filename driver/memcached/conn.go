@@ -318,6 +318,88 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 	return req, c.waitTransport(ctx, req)
 }
 
+// execBinaryMulti sends a binary-protocol request that elicits multiple
+// response packets terminated by a sentinel (GetMulti via OpGetKQ+OpNoop,
+// Stats via OpStat). encode writes the full request bytes into w (which the
+// caller has reset for them) and returns the serialized buffer to send.
+// isTerm reports whether a response packet is the terminator. The driver
+// holds the request on the bridge until isTerm returns true; intermediate
+// packets accumulate into req.values / req.stats.
+func (c *memcachedConn) execBinaryMulti(
+	ctx context.Context,
+	encode func(w *protocol.BinaryWriter) []byte,
+	isTerm func(p protocol.BinaryPacket) bool,
+) (*mcRequest, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
+	req := getRequest(ctx)
+	req.kind = kindBinaryMulti
+	// A unique starting opaque for the batch — individual sub-requests in the
+	// batch (GetKQ per key, Noop terminator) choose their own opaques via
+	// c.opaque.Add inside encode if needed, but dispatch does not rely on
+	// opaque matching (it uses the terminator predicate instead).
+	req.opaque = c.opaque.Add(1)
+	req.binIsTerm = isTerm
+
+	if c.sync != nil {
+		c.writerMu.Lock()
+		c.state.binW.Reset()
+		buf := encode(c.state.binW)
+		c.state.bridge.Enqueue(req)
+		if c.syncBuf == nil {
+			c.syncBuf = make([]byte, 16<<10)
+		}
+		// Prefer WriteAndPollMulti on platforms that support it: we do not
+		// know up-front how many packets the server will emit, so the poll
+		// must continue until the terminator is seen. The isDone predicate
+		// piggybacks on req.finished, which dispatchBinaryMulti flips once
+		// the terminator packet is parsed.
+		if c.syncMulti != nil {
+			isDone := func() bool { return req.finished.Load() }
+			ok, err := c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecv, isDone, nil)
+			c.writerMu.Unlock()
+			if err != nil {
+				_ = c.closeWithErr(err)
+				return req, err
+			}
+			if ok {
+				select {
+				case <-req.doneCh:
+					return req, nil
+				default:
+				}
+			}
+			return req, c.waitTransport(ctx, req)
+		}
+		ok, err := c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		c.writerMu.Unlock()
+		if err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
+		if ok {
+			select {
+			case <-req.doneCh:
+				return req, nil
+			default:
+			}
+		}
+		return req, c.waitTransport(ctx, req)
+	}
+
+	c.writerMu.Lock()
+	c.state.binW.Reset()
+	buf := encode(c.state.binW)
+	werr := c.writeAndEnqueue(req, func() []byte { return buf })
+	c.writerMu.Unlock()
+	if werr != nil {
+		_ = c.closeWithErr(werr)
+		return req, werr
+	}
+	return req, c.waitTransport(ctx, req)
+}
+
 // waitTransport blocks until the request completes or ctx is canceled,
 // returning only transport-level errors. Application-level errors are
 // encoded in req.resultErr / req.binStatus and must be inspected by the

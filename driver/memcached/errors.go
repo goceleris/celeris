@@ -37,6 +37,11 @@ var ErrPoolExhausted = errors.New("celeris/memcached: pool exhausted")
 // changing their key-hygiene assumptions.
 var ErrMalformedKey = errors.New("celeris/memcached: malformed key")
 
+// ErrNoNodes is returned when a [ClusterClient] has no live nodes configured
+// (typically because every ClusterConfig.Addrs entry was empty or all seed
+// dials failed).
+var ErrNoNodes = errors.New("celeris/memcached: cluster has no nodes")
+
 // MemcachedError wraps a server-side error reply.
 //
 // For text protocol it carries the Kind tag ("ERROR", "CLIENT_ERROR",

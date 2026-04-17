@@ -294,6 +294,148 @@ func TestBinary_UnknownCommand(t *testing.T) {
 	}
 }
 
+// TestBinarySpec_GetMultiPipelinedFraming writes an OpGetKQ pipeline + OpNoop
+// terminator directly on the raw socket and asserts the server emits the
+// expected per-key response packets followed by the Noop echo. Validates the
+// driver's on-wire framing contract at the protocol layer: misses suppress
+// their reply entirely, hits carry the key back in the response body, and
+// the Noop reply closes the stream.
+func TestBinarySpec_GetMultiPipelinedFraming(t *testing.T) {
+	c := dialBinary(t)
+
+	// Seed one present key so the spec covers both hit and miss suppression.
+	presentKey := uniqueKey(t, "sp_gmp_hit")
+	absentA := uniqueKey(t, "sp_gmp_missA")
+	absentB := uniqueKey(t, "sp_gmp_missB")
+
+	c.writer.Reset()
+	c.writer.AppendStorage(protocol.OpSet, presentKey, []byte("VAL"), 0, 0, 0, c.nextOpaque())
+	c.WriteRaw(c.writer.Bytes())
+	c.ExpectStatus(t, protocol.OpSet, protocol.StatusOK)
+
+	// Emit OpGetKQ x3 + OpNoop in a single write buffer.
+	c.writer.Reset()
+	opA := c.nextOpaque()
+	opB := c.nextOpaque()
+	opC := c.nextOpaque()
+	opN := c.nextOpaque()
+	c.writer.AppendGet(protocol.OpGetKQ, absentA, opA)
+	c.writer.AppendGet(protocol.OpGetKQ, presentKey, opB)
+	c.writer.AppendGet(protocol.OpGetKQ, absentB, opC)
+	c.writer.AppendSimple(protocol.OpNoop, opN)
+	// Sanity-check the buffer we're about to send contains the expected
+	// sequence of request opcodes. This is the "driver's on-the-wire byte
+	// output" part of the spec: exactly 3 OpGetKQ + 1 OpNoop in order.
+	wire := c.writer.Bytes()
+	var seenOpcodes []byte
+	i := 0
+	for i+protocol.BinHeaderLen <= len(wire) {
+		if wire[i] != protocol.MagicRequest {
+			t.Fatalf("bad magic in request buffer at offset %d: 0x%02x", i, wire[i])
+		}
+		seenOpcodes = append(seenOpcodes, wire[i+1])
+		bodyLen := int(wire[i+8])<<24 | int(wire[i+9])<<16 | int(wire[i+10])<<8 | int(wire[i+11])
+		i += protocol.BinHeaderLen + bodyLen
+	}
+	want := []byte{protocol.OpGetKQ, protocol.OpGetKQ, protocol.OpGetKQ, protocol.OpNoop}
+	if len(seenOpcodes) != len(want) {
+		t.Fatalf("request buffer opcodes = %x, want %x", seenOpcodes, want)
+	}
+	for j := range want {
+		if seenOpcodes[j] != want[j] {
+			t.Fatalf("request opcode[%d] = 0x%02x, want 0x%02x", j, seenOpcodes[j], want[j])
+		}
+	}
+	c.WriteRaw(wire)
+
+	// Expect exactly one GetKQ hit (the present key) and one Noop, in any
+	// order that misses suppressed the other two replies. Per spec, server
+	// responds to OpGetKQ hits with opcode 0x0d and to OpNoop with 0x0a.
+	first := c.ReadPacket(t)
+	second := c.ReadPacket(t)
+	// Either order is legal (miss suppression means hits and noop order is
+	// server-defined); but memcached always emits replies in request order
+	// so the hit should precede the Noop. We tolerate both for robustness.
+	var hit, noop protocol.BinaryPacket
+	switch {
+	case first.Header.Opcode == protocol.OpGetKQ && second.Header.Opcode == protocol.OpNoop:
+		hit, noop = first, second
+	case first.Header.Opcode == protocol.OpNoop && second.Header.Opcode == protocol.OpGetKQ:
+		hit, noop = second, first
+	default:
+		t.Fatalf("unexpected reply opcodes: 0x%02x + 0x%02x (want 0x0d + 0x0a)",
+			first.Header.Opcode, second.Header.Opcode)
+	}
+	if hit.Status() != protocol.StatusOK {
+		t.Fatalf("hit status = 0x%04x, want OK", hit.Status())
+	}
+	if string(hit.Key) != presentKey {
+		t.Fatalf("hit key = %q, want %q", hit.Key, presentKey)
+	}
+	if string(hit.Value) != "VAL" {
+		t.Fatalf("hit value = %q, want %q", hit.Value, "VAL")
+	}
+	if hit.Header.Opaque != opB {
+		t.Fatalf("hit opaque = 0x%08x, want 0x%08x", hit.Header.Opaque, opB)
+	}
+	if noop.Status() != protocol.StatusOK {
+		t.Fatalf("noop status = 0x%04x, want OK", noop.Status())
+	}
+	if noop.Header.BodyLen != 0 {
+		t.Fatalf("noop BodyLen = %d, want 0", noop.Header.BodyLen)
+	}
+	if noop.Header.Opaque != opN {
+		t.Fatalf("noop opaque = 0x%08x, want 0x%08x", noop.Header.Opaque, opN)
+	}
+
+	// cleanup
+	c.writer.Reset()
+	c.writer.AppendDelete(presentKey, 0, c.nextOpaque())
+	c.WriteRaw(c.writer.Bytes())
+	_ = c.ReadPacket(t)
+}
+
+// TestBinarySpec_StatsTerminatorFraming sends an OpStat request and reads
+// packets until the zero-key + zero-body terminator arrives, then confirms
+// the server responds normally to a follow-up op (no stream-state leak).
+func TestBinarySpec_StatsTerminatorFraming(t *testing.T) {
+	c := dialBinary(t)
+	c.writer.Reset()
+	c.writer.AppendStats("", c.nextOpaque())
+	c.WriteRaw(c.writer.Bytes())
+
+	count := 0
+	for {
+		pkt := c.ReadPacket(t)
+		if pkt.Header.Opcode != protocol.OpStat {
+			t.Fatalf("unexpected opcode in stats stream: 0x%02x", pkt.Header.Opcode)
+		}
+		if pkt.Status() != protocol.StatusOK {
+			t.Fatalf("stats packet status = 0x%04x, want OK", pkt.Status())
+		}
+		if pkt.Header.KeyLen == 0 && pkt.Header.BodyLen == 0 {
+			break
+		}
+		count++
+		if count > 10000 {
+			t.Fatal("stats stream did not terminate after 10000 packets")
+		}
+	}
+	if count == 0 {
+		t.Fatal("stats stream produced no non-terminator packets")
+	}
+
+	// Follow-up version request; confirms the stream really terminated and
+	// did not leak bytes into the next read.
+	c.writer.Reset()
+	c.writer.AppendSimple(protocol.OpVersion, c.nextOpaque())
+	c.WriteRaw(c.writer.Bytes())
+	pkt := c.ExpectStatus(t, protocol.OpVersion, protocol.StatusOK)
+	if len(pkt.Value) == 0 {
+		t.Fatal("version body empty after stats")
+	}
+}
+
 // TestBinary_DeltaBadval verifies that incr on a non-numeric value returns
 // StatusNonNumeric (DELTA_BADVAL-equivalent).
 func TestBinary_DeltaBadval(t *testing.T) {

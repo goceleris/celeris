@@ -100,7 +100,7 @@ func TestProtocol_TextBinary(t *testing.T) {
 				t.Fatalf("Ping: %v", err)
 			}
 
-			// --- Stats round-trip (driver dials a text conn when binary) ---
+			// --- Stats round-trip (native binary multi-reply on binary path) ---
 			stats, err := c.Stats(ctx)
 			if err != nil {
 				t.Fatalf("Stats: %v", err)
@@ -108,6 +108,50 @@ func TestProtocol_TextBinary(t *testing.T) {
 			if len(stats) == 0 {
 				t.Fatal("Stats returned empty map")
 			}
+			// pid / version are the two keys every memcached build emits;
+			// assert at least one of them is present so the binary stats
+			// accumulator is exercised end-to-end.
+			if _, hasPid := stats["pid"]; !hasPid {
+				if _, hasVer := stats["version"]; !hasVer {
+					t.Fatalf("Stats missing well-known keys pid/version: got %d entries", len(stats))
+				}
+			}
+
+			// --- GetMulti with 10 keys across a hit/miss split ---
+			t.Run("GetMulti_Pipelined", func(t *testing.T) {
+				var allKeys [10]string
+				var presentKeys [8]string
+				present := make(map[string]string, 8)
+				for i := 0; i < 10; i++ {
+					allKeys[i] = uniqueKey(t, "gmp")
+				}
+				cleanupKeys(t, c, allKeys[:]...)
+				for i := 0; i < 8; i++ {
+					presentKeys[i] = allKeys[i]
+					v := "gv" + string(rune('0'+i))
+					if err := c.Set(ctx, allKeys[i], v, 0); err != nil {
+						t.Fatalf("Set: %v", err)
+					}
+					present[allKeys[i]] = v
+				}
+				got, err := c.GetMulti(ctx, allKeys[:]...)
+				if err != nil {
+					t.Fatalf("GetMulti: %v", err)
+				}
+				if len(got) != len(present) {
+					t.Fatalf("GetMulti len = %d, want %d", len(got), len(present))
+				}
+				for k, v := range present {
+					if got[k] != v {
+						t.Fatalf("GetMulti[%q] = %q, want %q", k, got[k], v)
+					}
+				}
+				for i := 8; i < 10; i++ {
+					if _, ok := got[allKeys[i]]; ok {
+						t.Fatalf("miss key %q present in result", allKeys[i])
+					}
+				}
+			})
 		})
 	}
 }

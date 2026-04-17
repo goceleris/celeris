@@ -5,10 +5,24 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/memcached/protocol"
 )
+
+// bytesToString returns a string that aliases b — no copy. Safe only when
+// b is owned by the caller and will not be mutated for the string's
+// lifetime. We use it in GetMulti's output path: the []byte came from
+// copyBytes (owned) and is never written again; the returned string is
+// handed to the caller's map and becomes the sole reference to the
+// backing array.
+func bytesToString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
 
 // replyKind tells the parser how to interpret the sequence of wire-level
 // replies that terminate one logical request. Memcached protocols do not
@@ -34,13 +48,27 @@ const (
 	// kindBinary: one binary packet (Opcode matches the request) or a binary
 	// error packet with a non-zero Status. Used by every binary-protocol op.
 	kindBinary
+	// kindBinaryMulti: a binary request that elicits a stream of response
+	// packets terminated by a sentinel — OpGetKQ pipelines terminated by an
+	// OpNoop echo (GetMulti), or an OpStat stream terminated by a zero-length
+	// key packet. The accumulator predicate [mcRequest.binIsTerm] decides when
+	// the stream is done.
+	kindBinaryMulti
 )
 
 // valueItem is one VALUE reply (or binary GET hit) copied into request-owned
 // memory. The protocol.TextReader aliases its backing buffer, so dispatch
-// copies Data/Key before signaling completion.
+// copies Data before signaling completion.
+//
+// Key is stored as a string rather than []byte: GetMulti's output map is
+// keyed by string, so storing Key as string folds the unavoidable []byte →
+// string conversion into dispatch (one alloc) instead of forcing the
+// consuming loop to do it later (which would require a second copy). Data
+// stays []byte because GetMultiBytes wants the raw bytes and Get's one
+// extra string(Data) conversion happens at the caller without a second
+// copy (Go 1.26 recognises the immediate-use pattern).
 type valueItem struct {
-	Key   []byte
+	Key   string
 	Flags uint32
 	CAS   uint64
 	Data  []byte
@@ -66,6 +94,12 @@ type mcRequest struct {
 	status    protocol.Kind // text-protocol reply tag (ignored in binary mode)
 	binStatus uint16        // binary-protocol status code
 	resultErr error
+
+	// binIsTerm reports whether p is the terminator packet for a
+	// kindBinaryMulti request. Non-terminator packets are accumulated into
+	// req.values (GetMulti hits) or req.stats (Stats entries). Set by the
+	// caller before enqueueing; ignored on non-multi kinds.
+	binIsTerm func(p protocol.BinaryPacket) bool
 
 	doneCh   chan struct{}
 	finished atomic.Bool
@@ -115,6 +149,7 @@ func getRequest(ctx context.Context) *mcRequest {
 	r.status = 0
 	r.binStatus = 0
 	r.resultErr = nil
+	r.binIsTerm = nil
 	r.finished.Store(false)
 	return r
 }
@@ -228,7 +263,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			s.pendingGet = req
 		}
 		item := valueItem{
-			Key:   copyBytes(v.Key),
+			Key:   string(v.Key),
 			Flags: v.Flags,
 			CAS:   v.CAS,
 			Data:  copyBytes(v.Data),
@@ -326,22 +361,27 @@ func (s *mcState) processBinary(data []byte) error {
 	return nil
 }
 
-// dispatchBinary routes one binary-protocol packet. The binary dialect is
-// strictly one-request-one-reply for the commands this driver issues (it does
-// not generate pipelined GetQ packets that require a NOOP sentinel); callers
-// that add such flows in the future must extend this state machine.
+// dispatchBinary routes one binary-protocol packet. Single-response ops
+// (get/set/delete/incr/…) consume one packet and finish the head request;
+// multi-response ops (GetMulti via OpGetKQ+OpNoop, Stats via OpStat) leave
+// the head in place, accumulate packets, and only pop+finish on the
+// terminator (as decided by req.binIsTerm).
 func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
-	head := s.bridge.Pop()
+	head := s.bridge.Head()
 	if head == nil {
 		return errors.New("celeris/memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
+	if req.kind == kindBinaryMulti {
+		return s.dispatchBinaryMulti(req, p)
+	}
+	s.bridge.Pop()
 	req.binStatus = p.Status()
 	if p.Status() == protocol.StatusOK {
 		// GET-style replies carry the value in p.Value.
 		if len(p.Value) > 0 {
 			item := valueItem{
-				Key:  copyBytes(p.Key),
+				Key:  string(p.Key),
 				CAS:  p.Header.CAS,
 				Data: copyBytes(p.Value),
 			}
@@ -355,6 +395,58 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 			req.number = p.Header.CAS
 		}
 	} else {
+		req.resultErr = &MemcachedError{Status: p.Status(), Msg: string(p.Value)}
+	}
+	req.finish()
+	return nil
+}
+
+// dispatchBinaryMulti routes one packet belonging to an in-flight
+// kindBinaryMulti request. Non-terminator packets are appended to the
+// request's accumulators (req.values for GetKQ hits, req.stats for STAT
+// entries); the terminator pops the bridge and finishes the request. A
+// non-OK status on an intermediate packet poisons the whole batch — the
+// error propagates once the terminator arrives. A non-OK status on the
+// terminator itself short-circuits and finishes immediately.
+func (s *mcState) dispatchBinaryMulti(req *mcRequest, p protocol.BinaryPacket) error {
+	terminator := req.binIsTerm != nil && req.binIsTerm(p)
+	if !terminator {
+		if p.Status() == protocol.StatusOK {
+			switch p.Header.Opcode {
+			case protocol.OpStat:
+				req.stats = append(req.stats, statItem{
+					Name:  string(p.Key),
+					Value: string(p.Value),
+				})
+			default:
+				// GetKQ / GetK style: key + extras(flags) + value.
+				item := valueItem{
+					Key:  string(p.Key),
+					CAS:  p.Header.CAS,
+					Data: copyBytes(p.Value),
+				}
+				if len(p.Extras) >= 4 {
+					item.Flags = binaryUint32(p.Extras[0:4])
+				}
+				req.values = append(req.values, item)
+			}
+		} else {
+			// First non-OK status wins; remember it but keep consuming until
+			// the terminator arrives so we stay framing-aligned with the
+			// server. A malformed key/server error is rare for these ops.
+			if req.resultErr == nil {
+				req.resultErr = &MemcachedError{Status: p.Status(), Msg: string(p.Value)}
+			}
+		}
+		return nil
+	}
+	// Terminator: pop, record its own status (so callers can detect STAT
+	// errors or Noop failures) and finish.
+	if popped := s.bridge.Pop(); popped != req {
+		return errors.New("celeris/memcached: bridge head mismatch on binary terminator")
+	}
+	req.binStatus = p.Status()
+	if p.Status() != protocol.StatusOK && req.resultErr == nil {
 		req.resultErr = &MemcachedError{Status: p.Status(), Msg: string(p.Value)}
 	}
 	req.finish()
