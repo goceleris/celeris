@@ -413,6 +413,20 @@ type SyncRoundTripper interface {
 	WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
 
+// SyncBusyRoundTripper is the variant of SyncRoundTripper that skips the
+// runtime.Gosched() yield in its poll spin. Intended for callers known to
+// run on a runtime.LockOSThread'd goroutine (the celeris HTTP engine's
+// io_uring / epoll worker), where every Gosched incurs a stoplockedm +
+// startlockedm futex pair and collapses integrated throughput.
+//
+// Unlocked callers (standalone mini-loop + foreign HTTP) should use
+// [SyncRoundTripper]. Locked callers (celeris HTTP engine host)
+// must use WriteAndPollBusy. Drivers select the path at open time based
+// on whether an engine was supplied — see the driver's WithEngine option.
+type SyncBusyRoundTripper interface {
+	WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
+}
+
 // WriteAndPoll implements SyncRoundTripper. It writes data to fd, then polls
 // for the response directly on the calling goroutine. If data arrives within
 // the poll window, it invokes onRecv and returns ok=true. If the socket
@@ -523,9 +537,13 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 			break
 		}
 	}
-	// Phase B: non-blocking poll(0) + Gosched() spin. Each round costs
-	// ~1-3µs (syscall + scheduler yield) vs 1ms for a blocking poll.
-	// 32 rounds ≈ 50-100µs budget — well within localhost RTT.
+	// Phase B: 32-round poll(0) + runtime.Gosched() spin. For an
+	// unlocked caller (foreign-HTTP handler goroutine), Gosched yields
+	// the P so other handlers on the same P make progress — removing
+	// it regressed foreign-HTTP throughput 15–22%. For a locked caller
+	// (celeris HTTP engine worker), Gosched forces stoplockedm +
+	// startlockedm (a futex pair per call) and collapses throughput —
+	// locked callers must use WriteAndPollBusy instead.
 	if !gotData && readErr == nil {
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
@@ -615,6 +633,200 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	}
 	if !gotData {
 		return false, nil // EAGAIN — fall back to event-loop path
+	}
+	return true, nil
+}
+
+// WriteAndPollBusy implements [SyncBusyRoundTripper]. It mirrors WriteAndPoll
+// but omits the runtime.Gosched() yield in its Phase B spin. Callers running
+// on a runtime.LockOSThread'd goroutine (celeris HTTP engine workers) use
+// this variant to avoid the stoplockedm+startlockedm futex storm that
+// Gosched triggers on locked Ms — measured at 40%+ of CPU samples and
+// responsible for a 2–3× throughput collapse on integrated HTTP+DB load.
+//
+// Contract matches WriteAndPoll (see that function's doc). Differs only in
+// Phase B: instead of yielding between poll(0) calls, it does a tight 16-
+// round poll(0) spin (~8µs) to catch responses that arrived just after
+// Phase A finished, then falls through to poll(1ms). No scheduler hand-off
+// during the spin — the locked M stays on-CPU.
+func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (bool, error) {
+	if w.closed.Load() {
+		return false, ErrLoopClosed
+	}
+	w.mu.RLock()
+	c, ok := w.conns[fd]
+	epfd := w.epollFD
+	w.mu.RUnlock()
+	if !ok {
+		return false, engine.ErrUnknownFD
+	}
+
+	// Step 1: Write.
+	c.mu.Lock()
+	if c.closing || c.closed {
+		c.mu.Unlock()
+		return false, engine.ErrUnknownFD
+	}
+	if len(c.writeBuf)-c.writePos+len(data) > maxPendingBytes {
+		c.mu.Unlock()
+		return false, engine.ErrQueueFull
+	}
+	c.writeBuf = append(c.writeBuf, data...)
+	if c.sending {
+		c.mu.Unlock()
+		return false, nil
+	}
+	c.sending = true
+	werr := w.flushLocked(c)
+	c.sending = false
+	pending := c.writePos < len(c.writeBuf)
+	c.mu.Unlock()
+	if werr != nil {
+		w.errorClose(fd, werr)
+		return false, werr
+	}
+	if pending {
+		w.enqueueFlush(fd)
+	}
+
+	// Step 2: Mask EPOLLIN under recvMu.
+	c.recvMu.Lock()
+	evMask := uint32(unix.EPOLLET | unix.EPOLLRDHUP)
+	if c.epollOut {
+		evMask |= unix.EPOLLOUT
+	}
+	_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{
+		Events: evMask,
+		Fd:     int32(fd),
+	})
+
+	// Step 3a — Phase A: 64 tight non-blocking reads (~10µs). Catches
+	// responses already in the kernel buffer.
+	const spinRounds = 64
+	gotData := false
+	var readErr error
+	for range spinRounds {
+		n, err := unix.Read(fd, rbuf)
+		if n > 0 {
+			gotData = true
+			onRecv(rbuf[:n])
+			for {
+				n2, err2 := unix.Read(fd, rbuf)
+				if n2 > 0 {
+					onRecv(rbuf[:n2])
+					continue
+				}
+				if err2 != nil {
+					break
+				}
+				if n2 == 0 {
+					break
+				}
+			}
+			break
+		}
+		if err != nil {
+			if isEAGAIN(err) {
+				continue
+			}
+			readErr = err
+			break
+		}
+		if n == 0 {
+			break
+		}
+	}
+	// Step 3b — Phase B (busy): 16 tight poll(0) without yielding. No
+	// Gosched — on a locked M it would futex-storm; on an unlocked M
+	// the caller is expected to be in the foreign-HTTP path instead.
+	if !gotData && readErr == nil {
+		var pfd [1]unix.PollFd
+		pfd[0].Fd = int32(fd)
+		pfd[0].Events = unix.POLLIN
+		for range 16 {
+			pfd[0].Revents = 0
+			np, perr := unix.Poll(pfd[:], 0)
+			if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
+				for {
+					n, err := unix.Read(fd, rbuf)
+					if n > 0 {
+						gotData = true
+						onRecv(rbuf[:n])
+						continue
+					}
+					if err != nil {
+						if isEAGAIN(err) {
+							break
+						}
+						readErr = err
+					}
+					break
+				}
+				break
+			}
+		}
+	}
+	// Step 3c — Phase C: blocking poll(1ms) as last resort. During this
+	// syscall the Go runtime detaches P so other Gs on the same P run.
+	if !gotData && readErr == nil {
+		var pfd [1]unix.PollFd
+		pfd[0].Fd = int32(fd)
+		pfd[0].Events = unix.POLLIN
+		np, perr := unix.Poll(pfd[:], 1)
+		if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
+			for {
+				n, err := unix.Read(fd, rbuf)
+				if n > 0 {
+					gotData = true
+					onRecv(rbuf[:n])
+					continue
+				}
+				if err != nil {
+					if isEAGAIN(err) {
+						break
+					}
+					readErr = err
+				}
+				break
+			}
+		}
+	}
+
+	// Step 4: Final drain to EAGAIN before re-arming EPOLLIN.
+	if gotData && readErr == nil {
+		for {
+			n, err := unix.Read(fd, rbuf)
+			if n > 0 {
+				onRecv(rbuf[:n])
+				continue
+			}
+			if err != nil {
+				if isEAGAIN(err) {
+					break
+				}
+				readErr = err
+			}
+			break
+		}
+	}
+
+	// Step 5: Re-enable EPOLLIN and release recvMu.
+	evMask = unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP
+	if c.epollOut {
+		evMask |= unix.EPOLLOUT
+	}
+	_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{
+		Events: evMask,
+		Fd:     int32(fd),
+	})
+	c.recvMu.Unlock()
+
+	if readErr != nil {
+		w.errorClose(fd, readErr)
+		return false, readErr
+	}
+	if !gotData {
+		return false, nil
 	}
 	return true, nil
 }

@@ -41,6 +41,13 @@ type options struct {
 	cfg      PoolConfig
 	provider engine.EventLoopProvider
 	ownsLoop bool
+	// hasEngine records whether WithEngine was called with a non-nil
+	// provider — independent of whether provider resolution succeeded
+	// at Open time (the engine is often not started yet when drivers
+	// are wired up). Used to pick the no-yield busy-poll sync path:
+	// the handler that calls us will run on the engine's LockOSThread'd
+	// worker, so runtime.Gosched would futex-storm.
+	hasEngine bool
 }
 
 // Option configures Open.
@@ -53,6 +60,7 @@ func WithEngine(sp eventloop.ServerProvider) Option {
 		if sp == nil {
 			return
 		}
+		o.hasEngine = true
 		if p := sp.EventLoopProvider(); p != nil {
 			o.provider = p
 			o.ownsLoop = false
@@ -92,6 +100,7 @@ type Pool struct {
 	providerMu sync.RWMutex
 	provider   engine.EventLoopProvider
 	ownsLoop   bool
+	hasEngine  bool // WithEngine was supplied; use busy-poll sync path
 
 	closed atomic.Bool
 
@@ -175,10 +184,11 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 		NumWorkers:       nw,
 	}
 	p := &Pool{
-		provider: o.provider,
-		ownsLoop: o.ownsLoop,
-		dsn:      dsn,
-		cfg:      o.cfg,
+		provider:  o.provider,
+		ownsLoop:  o.ownsLoop,
+		hasEngine: o.hasEngine,
+		dsn:       dsn,
+		cfg:       o.cfg,
 	}
 	p.inner = async.NewPool[*pgConn](asyncCfg, p.dial)
 	return p, nil
@@ -197,6 +207,7 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	}
 	c.maxLifetime = p.cfg.MaxLifetime
 	c.maxIdleTime = p.cfg.MaxIdleTime
+	c.useBusySync(p.hasEngine)
 	return c, nil
 }
 

@@ -30,6 +30,12 @@ type syncRoundTripper interface {
 	WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
 
+// syncBusyRoundTripper is the no-yield variant used by drivers opened
+// WithEngine — caller is a LockOSThread'd celeris HTTP engine worker.
+type syncBusyRoundTripper interface {
+	WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
+}
+
 // syncMultiRoundTripper extends syncRoundTripper for workloads that poll until
 // a completion predicate fires. Memcached uses this for GetMulti, which
 // receives N VALUE blocks followed by one END.
@@ -52,6 +58,12 @@ type memcachedConn struct {
 	// sync is non-nil when the worker supports synchronous round-trip
 	// (write+poll on the caller's goroutine). Cached at dial time.
 	sync syncRoundTripper
+	// syncBusy is non-nil when the worker supports the no-yield busy-poll
+	// variant. Drivers opened WithEngine route through this to avoid the
+	// locked-M futex storm.
+	syncBusy syncBusyRoundTripper
+	// useBusy dispatches exec through syncBusy when set (WithEngine).
+	useBusy bool
 	// syncMulti is non-nil when the worker supports multi-response poll.
 	syncMulti syncMultiRoundTripper
 	// syncBuf is the per-conn read buffer used by the sync round-trip path.
@@ -151,6 +163,10 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	if srt, ok := loop.(syncRoundTripper); ok {
 		c.sync = srt
 	}
+	if sbrt, ok := loop.(syncBusyRoundTripper); ok {
+		c.syncBusy = sbrt
+	}
+	c.useBusy = cfg.Engine != nil && c.syncBusy != nil
 	if smrt, ok := loop.(syncMultiRoundTripper); ok {
 		c.syncMulti = smrt
 	}
@@ -238,7 +254,13 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		if c.syncBuf == nil {
 			c.syncBuf = make([]byte, 16<<10)
 		}
-		ok, err := c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		var ok bool
+		var err error
+		if c.useBusy {
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+		} else {
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		}
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)
@@ -296,7 +318,13 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 		if c.syncBuf == nil {
 			c.syncBuf = make([]byte, 16<<10)
 		}
-		ok, err := c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		var ok bool
+		var err error
+		if c.useBusy {
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+		} else {
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		}
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)
@@ -378,7 +406,13 @@ func (c *memcachedConn) execBinaryMulti(
 			}
 			return req, c.waitTransport(ctx, req)
 		}
-		ok, err := c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		var ok bool
+		var err error
+		if c.useBusy {
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+		} else {
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		}
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)

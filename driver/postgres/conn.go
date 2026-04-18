@@ -28,6 +28,41 @@ type syncRoundTripper interface {
 	WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
 
+// syncBusyRoundTripper is the no-yield variant used by drivers opened
+// WithEngine (caller is a LockOSThread'd celeris HTTP engine worker).
+type syncBusyRoundTripper interface {
+	WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
+}
+
+// pgSyncLoop adapts the mini-loop's two sync variants behind a single
+// WriteAndPoll method. Opened-WithEngine conns set busy=<impl> to route
+// through WriteAndPollBusy (skips runtime.Gosched — locked-M-safe);
+// standalone conns set busy=nil and route through the yielding variant.
+type pgSyncLoop struct {
+	sync syncRoundTripper
+	busy syncBusyRoundTripper
+}
+
+func (s *pgSyncLoop) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (bool, error) {
+	if s.busy != nil {
+		return s.busy.WriteAndPollBusy(fd, data, rbuf, onRecv)
+	}
+	return s.sync.WriteAndPoll(fd, data, rbuf, onRecv)
+}
+
+// useBusySync enables the no-yield busy-poll variant when the driver was
+// opened WithEngine. The handler that invokes us will run on the celeris
+// HTTP engine's LockOSThread'd worker, where runtime.Gosched triggers
+// stoplockedm+startlockedm futex storms.
+func (c *pgConn) useBusySync(enable bool) {
+	if !enable || c.syncLoop == nil {
+		return
+	}
+	if sb, ok := c.loop.(syncBusyRoundTripper); ok {
+		c.syncLoop.busy = sb
+	}
+}
+
 // requestKind tags the in-flight pgRequest so the event loop's recv handler
 // can pick the right protocol state machine.
 type requestKind int
@@ -430,7 +465,7 @@ type pgConn struct {
 	// as sporadic EBADF / hangs under GC pressure).
 	fdFile    *os.File
 	loop      engine.WorkerLoop
-	syncLoop  syncRoundTripper // cached type assertion; nil on non-Linux
+	syncLoop  *pgSyncLoop // nil on non-Linux or no sync support
 	workerID  int
 	closeLoop func()
 	syncBuf   []byte // read buffer for syncLoop.WriteAndPoll
@@ -589,7 +624,10 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	loop := prov.WorkerLoop(workerHint)
 
 	// Cache the SyncRoundTripper capability for the fast path.
-	syncL, _ := loop.(syncRoundTripper)
+	var syncL *pgSyncLoop
+	if srt, ok := loop.(syncRoundTripper); ok {
+		syncL = &pgSyncLoop{sync: srt}
+	}
 
 	c := &pgConn{
 		fd:        fd,

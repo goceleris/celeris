@@ -31,6 +31,15 @@ type syncRoundTripper interface {
 	WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
 }
 
+// syncBusyRoundTripper is the no-yield variant of syncRoundTripper. Drivers
+// opened WithEngine(srv) — where the caller is the celeris HTTP engine's
+// LockOSThread'd worker goroutine — use this path. Its Phase B skips
+// runtime.Gosched() to avoid the stoplockedm+startlockedm futex storm
+// that locked Ms incur on every Gosched.
+type syncBusyRoundTripper interface {
+	WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func([]byte)) (ok bool, err error)
+}
+
 // syncMultiRoundTripper extends syncRoundTripper for pipeline workloads.
 // WriteAndPollMulti writes data, then repeatedly polls until isDone returns
 // true. beforeRearm runs under recvMu before EPOLLIN is re-armed, allowing
@@ -54,7 +63,15 @@ type redisConn struct {
 
 	// sync is non-nil when the worker supports synchronous round-trip
 	// (write+poll on the caller's goroutine). Cached at dial time.
+	// When useBusy is true, we prefer syncBusy and fall back to sync.
 	sync syncRoundTripper
+	// syncBusy is non-nil when the worker supports the no-yield busy-poll
+	// variant. Drivers opened WithEngine dispatch through this to skip
+	// the locked-M futex storm. Cached at dial time.
+	syncBusy syncBusyRoundTripper
+	// useBusy routes exec through syncBusy when set — true when the driver
+	// was opened WithEngine (caller is a LockOSThread'd engine worker).
+	useBusy bool
 	// syncMulti is non-nil when the worker supports multi-response poll.
 	// Used by execManyInto for pipeline workloads. Cached at dial time.
 	syncMulti syncMultiRoundTripper
@@ -181,6 +198,13 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 	if srt, ok := loop.(syncRoundTripper); ok {
 		c.sync = srt
 	}
+	if sbrt, ok := loop.(syncBusyRoundTripper); ok {
+		c.syncBusy = sbrt
+	}
+	// When the driver was opened WithEngine, the handler that calls into
+	// us runs on the celeris HTTP engine's LockOSThread'd worker. Route
+	// through the busy variant to avoid Gosched's locked-M futex storm.
+	c.useBusy = cfg.Engine != nil && c.syncBusy != nil
 	if smrt, ok := loop.(syncMultiRoundTripper); ok {
 		c.syncMulti = smrt
 	}
@@ -263,7 +287,13 @@ func (c *redisConn) exec(ctx context.Context, args ...string) (*redisRequest, er
 		if c.syncBuf == nil {
 			c.syncBuf = make([]byte, 16<<10)
 		}
-		ok, err := c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		var ok bool
+		var err error
+		if c.useBusy {
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+		} else {
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+		}
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)
