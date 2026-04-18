@@ -403,16 +403,19 @@ func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 //   - IOUring: async dispatch implemented; returns true when configured.
 //   - Std (net/http fallback): always async natively (goroutine per
 //     conn); returns true when configured.
-//   - Adaptive: may switch between epoll and iouring at runtime; we
-//     return false to avoid handing drivers an async promise that
-//     could evaporate across a switch (both targets support async but
-//     the hot swap would invalidate in-flight direct-mode conns).
+//   - Adaptive: both targets (epoll, iouring) support async dispatch,
+//     and direct-mode drivers use Go netpoll — no engine-registered
+//     FDs, so the adaptive engine's hot-swap machinery is safe
+//     around them. Returns true when configured; a switch while
+//     direct-mode drivers are in-flight is a no-op for the drivers
+//     (their net.TCPConn goroutines keep running regardless of which
+//     sub-engine is active).
 func (s *Server) AsyncHandlers() bool {
 	if !s.config.AsyncHandlers {
 		return false
 	}
 	switch s.config.Engine {
-	case Epoll, IOUring, Std:
+	case Epoll, IOUring, Adaptive, Std:
 		return true
 	default:
 		return false
