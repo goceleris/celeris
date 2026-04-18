@@ -476,9 +476,11 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	// EPOLLIN so the event-loop worker does not wake up for this fd
 	// while we hold the lock. Without the mask epoll_wait still fires
 	// (edge-triggered), the worker blocks on recvMu, and the block/
-	// unblock cycle is much more expensive than the EpollCtl syscall
-	// (measured: removing the MOD tripled Get latency under parallel
-	// load — the mask is pulling its weight).
+	// unblock cycle is more expensive than the EpollCtl syscall. A
+	// TryLock-based alternative deadlocks: edge-triggered epoll
+	// delivers each edge exactly once, and a skip consumes the edge
+	// without draining, leaving the response stranded when the caller
+	// is already parked on doneCh waiting for it.
 	c.recvMu.Lock()
 	evMask := uint32(unix.EPOLLET | unix.EPOLLRDHUP)
 	if c.epollOut {
@@ -531,11 +533,13 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	}
 	// Phase B: 32-round poll(0) + runtime.Gosched() spin. For an
 	// unlocked caller (foreign-HTTP handler goroutine), Gosched yields
-	// the P so other handlers on the same P make progress — removing
-	// it regressed foreign-HTTP throughput 15–22%. For a locked caller
-	// (celeris HTTP engine worker), Gosched forces stoplockedm +
-	// startlockedm (a futex pair per call) and collapses throughput —
-	// locked callers must use WriteAndPollBusy instead.
+	// the P so other handlers on the same P make progress. Removing
+	// this loop (and relying on Phase C's poll(1ms) alone) regressed
+	// foreign-HTTP throughput 20-30% — 256 handlers all parking in
+	// poll(1ms) simultaneously starves the kernel scheduler even though
+	// per-request latency stays low. For a locked caller (celeris HTTP
+	// engine worker) Gosched forces stoplockedm + startlockedm (a
+	// futex pair per call) — those callers must use WriteAndPollBusy.
 	if !gotData && readErr == nil {
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
