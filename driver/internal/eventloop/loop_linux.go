@@ -489,53 +489,45 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		Fd:     int32(fd),
 	})
 
-	// Step 3: Poll for the response. Three phases:
-	//   Phase A: 64 non-blocking reads. Catches ultra-fast responses
-	//            without any kernel involvement.
-	//   Phase B: 32 non-blocking poll(0) + Gosched() rounds (~50-200µs).
-	//            Catches localhost responses without paying the 1ms poll
-	//            ceiling that dominates latency on fast networks.
-	//   Phase C: poll(2) with 1ms timeout as last resort before falling
-	//            back to the full event-loop path.
+	// Step 3: Poll for the response. Two phases now (A + C):
+	//   Phase A: one non-blocking read. Catches responses already in the
+	//            kernel buffer by the time we arrive here — TCP coalescing
+	//            and NAPI tail-drain both occasionally leave pre-written
+	//            data visible immediately.
+	//   Phase B: 32 non-blocking poll(0) + Gosched() rounds. Yields the P
+	//            so other handlers on this P make progress — essential for
+	//            foreign-HTTP throughput under 256-way concurrency.
+	//   Phase C: poll(1ms) as last resort.
 	//
-	// The 64-round Phase A budget is tuned for parallel workloads: under
-	// 12+ concurrent goroutines each busy-spinning 512 times wasted
-	// CPU and crowded out other goroutines that had data ready; 64
-	// rounds still catch >95% of loopback responses without starving.
-	const spinRounds = 64
+	// A prior design did 64 tight unix.Read calls in Phase A as an
+	// "in-kernel-buffer" probe. Line-level profile of nethttp+celerismc
+	// at 62k rps showed that loop burning 20% of total CPU in mostly-
+	// EAGAIN returns — the response never arrives in <1µs on loopback
+	// (kernel-to-kernel RTT is 20–50µs minimum), so rounds 2-64 were
+	// pure waste (~60 failed syscalls per request, ~30µs of CPU
+	// overhead). A single attempt preserves the rare pre-arrived-data
+	// win and then cedes to the yielding poll path.
 	gotData := false
 	var readErr error
-	for range spinRounds {
-		n, err := unix.Read(fd, rbuf)
-		if n > 0 {
-			gotData = true
-			onRecv(rbuf[:n])
-			for {
-				n2, err2 := unix.Read(fd, rbuf)
-				if n2 > 0 {
-					onRecv(rbuf[:n2])
-					continue
-				}
-				if err2 != nil {
-					break
-				}
-				if n2 == 0 {
-					readErr = nil
-					break
-				}
-			}
-			break
-		}
-		if err != nil {
-			if isEAGAIN(err) {
+	if n, err := unix.Read(fd, rbuf); n > 0 {
+		gotData = true
+		onRecv(rbuf[:n])
+		for {
+			n2, err2 := unix.Read(fd, rbuf)
+			if n2 > 0 {
+				onRecv(rbuf[:n2])
 				continue
 			}
-			readErr = err
-			break
+			if err2 != nil {
+				break
+			}
+			if n2 == 0 {
+				readErr = nil
+				break
+			}
 		}
-		if n == 0 {
-			break
-		}
+	} else if err != nil && !isEAGAIN(err) {
+		readErr = err
 	}
 	// Phase B: 32-round poll(0) + runtime.Gosched() spin. For an
 	// unlocked caller (foreign-HTTP handler goroutine), Gosched yields
@@ -700,8 +692,14 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 		Fd:     int32(fd),
 	})
 
-	// Step 3a — Phase A: 64 tight non-blocking reads (~10µs). Catches
-	// responses already in the kernel buffer.
+	// Step 3a — Phase A: 64 tight non-blocking reads. Unlike the
+	// yielding WriteAndPoll variant (which drops Phase A to a single
+	// read to free its P for other handlers), the busy variant runs on
+	// a LockOSThread'd engine worker — its P is dedicated to one
+	// handler at a time, so burning ~15µs of CPU to catch responses
+	// that arrive mid-spin is a net win (avoids the Phase B/C latency
+	// for the fastest responses). Profile shows this recovers ~15-20%
+	// throughput vs a single-read Phase A on the celeris-engine path.
 	const spinRounds = 64
 	gotData := false
 	var readErr error
