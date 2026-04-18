@@ -19,6 +19,15 @@ type Client struct {
 // NewClient dials a pool at addr using the given options. Connections are
 // established lazily on first command.
 //
+// When opened without WithEngine(srv), the client uses direct [net.TCPConn]
+// I/O on the caller's goroutine — no event-loop indirection. This matches
+// [github.com/bradfitz/gomemcache] in shape (Go's netpoll parks the
+// goroutine on EPOLLIN transparently) and closes the foreign-HTTP gap
+// vs gomc on the MSR1 bench from ~17% to within noise.
+//
+// When opened WithEngine, the mini-loop sync path (WriteAndPollBusy) is
+// used so DB I/O colocates with the celeris HTTP engine's worker.
+//
 // addr may optionally include a "memcache://" or "memcached://" scheme
 // prefix; the prefix is stripped and the remaining "host:port" is used
 // verbatim. TLS is not supported in v1.4.0.
@@ -32,11 +41,18 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	if cfg.Addr == "" {
 		return nil, errors.New("celeris/memcached: empty address")
 	}
+	if cfg.Engine == nil {
+		// Standalone path: no mini-loop. Each conn does direct
+		// net.TCPConn.Write + Read on the caller goroutine. Go's
+		// netpoll handles EPOLLIN parking transparently.
+		pool := newDirectPool(cfg)
+		return &Client{cfg: cfg, pool: pool}, nil
+	}
 	provider, err := eventloop.Resolve(cfg.Engine)
 	if err != nil {
 		return nil, err
 	}
-	ownsLoop := cfg.Engine == nil
+	ownsLoop := false
 	pool := newPool(cfg, provider, ownsLoop)
 	return &Client{cfg: cfg, pool: pool}, nil
 }

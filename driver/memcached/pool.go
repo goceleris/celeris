@@ -2,6 +2,7 @@ package memcached
 
 import (
 	"context"
+	"runtime"
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
@@ -16,6 +17,64 @@ type memcachedPool struct {
 	cfg      Config
 	provider engine.EventLoopProvider
 	ownsLoop bool
+}
+
+// newDirectPool creates a pool that dials direct-mode conns (no mini-loop).
+// Used when the client is opened without WithEngine. Shards by GOMAXPROCS
+// to match the async.Pool's worker-affinity API — the shard count is
+// otherwise cosmetic in direct mode since any goroutine can use any conn.
+func newDirectPool(cfg Config) *memcachedPool {
+	nw := runtime.GOMAXPROCS(0)
+	if nw <= 0 {
+		nw = 1
+	}
+	maxOpen := cfg.MaxOpen
+	if maxOpen == 0 {
+		maxOpen = nw * 4
+	}
+	idle := cfg.MaxIdlePerWorker
+	if idle == 0 {
+		idle = (maxOpen + nw - 1) / nw
+		if idle < defaultMaxIdlePerWorker {
+			idle = defaultMaxIdlePerWorker
+		}
+	}
+	life := cfg.MaxLifetime
+	if life == 0 {
+		life = defaultMaxLifetime
+	}
+	idleT := cfg.MaxIdleTime
+	if idleT == 0 {
+		idleT = defaultMaxIdleTime
+	}
+	hc := cfg.HealthCheckInterval
+	if hc == 0 {
+		hc = defaultHealthCheck
+	}
+	if hc < 0 {
+		hc = 0
+	}
+	asyncCfg := async.PoolConfig{
+		MaxOpen:          maxOpen,
+		MaxIdlePerWorker: idle,
+		MaxLifetime:      life,
+		MaxIdleTime:      idleT,
+		HealthCheck:      hc,
+		NumWorkers:       nw,
+	}
+	p := &memcachedPool{cfg: cfg, provider: nil, ownsLoop: false}
+	dial := func(ctx context.Context, workerID int) (*memcachedConn, error) {
+		c, err := dialDirectMemcachedConn(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		c.maxLifetime = life
+		c.maxIdleTime = idleT
+		c.workerID = workerID
+		return c, nil
+	}
+	p.pool = async.NewPool[*memcachedConn](asyncCfg, dial)
+	return p
 }
 
 func newPool(cfg Config, provider engine.EventLoopProvider, ownsLoop bool) *memcachedPool {

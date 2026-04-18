@@ -46,7 +46,25 @@ type syncMultiRoundTripper interface {
 // memcachedConn is a single connection driven by a celeris event loop. It
 // owns an mcState decoder and exposes helper methods for encoding commands
 // and awaiting replies.
+//
+// Two I/O modes coexist in the same struct:
+//
+//   - Engine-integrated mode (cfg.Engine != nil): fd + loop + sync-path
+//     round-trips via WriteAndPoll / WriteAndPollBusy. Driver FDs share
+//     the celeris HTTP engine's worker goroutine.
+//   - Direct mode (cfg.Engine == nil): tcp is the live *net.TCPConn; all
+//     I/O goes through it on the caller's goroutine. Go's netpoll parks
+//     the goroutine on EPOLLIN transparently. Matches gomemcache's
+//     shape; no mini-loop overhead.
+//
+// useDirect discriminates. Fields for the unused mode are zero.
 type memcachedConn struct {
+	useDirect bool
+
+	// Direct-mode fields.
+	tcp *net.TCPConn
+
+	// Engine-integrated fields.
 	fd       int
 	loop     engine.WorkerLoop
 	workerID int
@@ -184,6 +202,44 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	return c, nil
 }
 
+// dialDirectMemcachedConn dials a TCP connection in direct mode — no
+// mini-loop registration, no fd extraction. The conn keeps the live
+// *net.TCPConn and performs Write/Read directly on the caller's goroutine.
+func dialDirectMemcachedConn(ctx context.Context, cfg Config) (*memcachedConn, error) {
+	timeout := cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = defaultDialTimeout
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	raw, err := dialer.DialContext(ctx, "tcp", cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
+	tcp, ok := raw.(*net.TCPConn)
+	if !ok {
+		_ = raw.Close()
+		return nil, fmt.Errorf("celeris/memcached: expected *net.TCPConn, got %T", raw)
+	}
+	_ = tcp.SetNoDelay(true)
+
+	bin := cfg.Protocol == ProtocolBinary
+	c := &memcachedConn{
+		useDirect: true,
+		tcp:       tcp,
+		state:     newMCState(bin),
+		cfg:       cfg,
+		binary:    bin,
+		createdAt: time.Now(),
+	}
+	c.lastUsedAt.Store(time.Now().UnixNano())
+
+	if err := c.handshake(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
 // onRecv runs on the worker goroutine.
 func (c *memcachedConn) onRecv(data []byte) {
 	if err := c.state.processRecv(data); err != nil {
@@ -246,6 +302,10 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 	req := getRequest(ctx)
 	req.kind = kind
 
+	if c.useDirect {
+		return c.execTextDirect(ctx, req, encode)
+	}
+
 	if c.sync != nil {
 		c.writerMu.Lock()
 		c.state.textW.Reset()
@@ -306,6 +366,12 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 		return nil, ErrClosed
 	}
 	_ = opcode // opcode is implicit in the encoder; keep the signature symmetrical for future validation.
+	if c.useDirect {
+		req := getRequest(ctx)
+		req.kind = kindBinary
+		req.opaque = c.opaque.Add(1)
+		return c.execBinaryDirect(ctx, req, encode)
+	}
 	req := getRequest(ctx)
 	req.kind = kindBinary
 	req.opaque = c.opaque.Add(1)
@@ -375,6 +441,10 @@ func (c *memcachedConn) execBinaryMulti(
 	// opaque matching (it uses the terminator predicate instead).
 	req.opaque = c.opaque.Add(1)
 	req.binIsTerm = isTerm
+
+	if c.useDirect {
+		return c.execBinaryMultiDirect(ctx, req, encode)
+	}
 
 	if c.sync != nil {
 		c.writerMu.Lock()
@@ -550,18 +620,25 @@ func (c *memcachedConn) Ping(ctx context.Context) error {
 func (c *memcachedConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		if c.loop != nil {
-			_ = c.loop.UnregisterConn(c.fd)
-		}
-		// Close via the pinned *os.File so the underlying fd is closed
-		// exactly once. Falling back to syscall.Close would race with the
-		// File's finalizer (double-close on an fd that may have been reused
-		// by the runtime).
-		if c.file != nil {
-			_ = c.file.Close()
-			c.file = nil
-		} else if c.fd > 0 {
-			_ = syscall.Close(c.fd)
+		if c.useDirect {
+			if c.tcp != nil {
+				_ = c.tcp.Close()
+				c.tcp = nil
+			}
+		} else {
+			if c.loop != nil {
+				_ = c.loop.UnregisterConn(c.fd)
+			}
+			// Close via the pinned *os.File so the underlying fd is closed
+			// exactly once. Falling back to syscall.Close would race with the
+			// File's finalizer (double-close on an fd that may have been reused
+			// by the runtime).
+			if c.file != nil {
+				_ = c.file.Close()
+				c.file = nil
+			} else if c.fd > 0 {
+				_ = syscall.Close(c.fd)
+			}
 		}
 		drainErr := ErrClosed
 		if box := c.closeErr.Load(); box != nil && box.err != nil {
@@ -570,6 +647,115 @@ func (c *memcachedConn) Close() error {
 		c.state.drainWithError(drainErr)
 	})
 	return nil
+}
+
+// execTextDirect is the direct-mode path for text-protocol commands. Writes
+// the encoded request on the caller's goroutine via net.TCPConn.Write, then
+// drives net.TCPConn.Read until onRecv finishes the request. Go's netpoll
+// parks the goroutine on EPOLLIN transparently — no mini-loop overhead.
+func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, encode func(w *protocol.TextWriter) []byte) (*mcRequest, error) {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+
+	c.state.textW.Reset()
+	buf := encode(c.state.textW)
+	c.state.bridge.Enqueue(req)
+	if c.syncBuf == nil {
+		c.syncBuf = make([]byte, 16<<10)
+	}
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.tcp.SetDeadline(dl)
+		defer c.tcp.SetDeadline(time.Time{})
+	}
+
+	if _, err := c.tcp.Write(buf); err != nil {
+		_ = c.closeWithErr(err)
+		return req, err
+	}
+
+	for !req.finished.Load() {
+		n, err := c.tcp.Read(c.syncBuf)
+		if n > 0 {
+			c.onRecv(c.syncBuf[:n])
+		}
+		if err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
+	}
+	return req, req.resultErr
+}
+
+// execBinaryDirect is the direct-mode path for binary-protocol commands.
+func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, encode func(w *protocol.BinaryWriter, opaque uint32) []byte) (*mcRequest, error) {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+
+	c.state.binW.Reset()
+	buf := encode(c.state.binW, req.opaque)
+	c.state.bridge.Enqueue(req)
+	if c.syncBuf == nil {
+		c.syncBuf = make([]byte, 16<<10)
+	}
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.tcp.SetDeadline(dl)
+		defer c.tcp.SetDeadline(time.Time{})
+	}
+
+	if _, err := c.tcp.Write(buf); err != nil {
+		_ = c.closeWithErr(err)
+		return req, err
+	}
+
+	for !req.finished.Load() {
+		n, err := c.tcp.Read(c.syncBuf)
+		if n > 0 {
+			c.onRecv(c.syncBuf[:n])
+		}
+		if err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
+	}
+	return req, nil
+}
+
+// execBinaryMultiDirect is the direct-mode path for multi-reply binary
+// commands (GetMulti, Stats). Loops reading until req.finished fires.
+func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcRequest, encode func(w *protocol.BinaryWriter) []byte) (*mcRequest, error) {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+
+	c.state.binW.Reset()
+	buf := encode(c.state.binW)
+	c.state.bridge.Enqueue(req)
+	if c.syncBuf == nil {
+		c.syncBuf = make([]byte, 16<<10)
+	}
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.tcp.SetDeadline(dl)
+		defer c.tcp.SetDeadline(time.Time{})
+	}
+
+	if _, err := c.tcp.Write(buf); err != nil {
+		_ = c.closeWithErr(err)
+		return req, err
+	}
+
+	for !req.finished.Load() {
+		n, err := c.tcp.Read(c.syncBuf)
+		if n > 0 {
+			c.onRecv(c.syncBuf[:n])
+		}
+		if err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
+	}
+	return req, nil
 }
 
 // Worker satisfies async.Conn.
