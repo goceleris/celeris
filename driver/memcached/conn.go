@@ -63,6 +63,10 @@ type memcachedConn struct {
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
+	// tcpFd caches the raw fd for MSG_DONTWAIT peeks (W4). Pre-netpoll
+	// peek catches loopback-fast responses without the G-park wakeup;
+	// zero when SyscallConn failed.
+	tcpFd int
 
 	// Engine-integrated fields.
 	fd       int
@@ -222,10 +226,16 @@ func dialDirectMemcachedConn(ctx context.Context, cfg Config) (*memcachedConn, e
 	}
 	_ = tcp.SetNoDelay(true)
 
+	var rawFd int
+	if sc, scErr := tcp.SyscallConn(); scErr == nil {
+		_ = sc.Control(func(fd uintptr) { rawFd = int(fd) })
+	}
+
 	bin := cfg.Protocol == ProtocolBinary
 	c := &memcachedConn{
 		useDirect: true,
 		tcp:       tcp,
+		tcpFd:     rawFd,
 		state:     newMCState(bin),
 		cfg:       cfg,
 		binary:    bin,
@@ -679,6 +689,15 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 	}
 
 	for !req.finished.Load() {
+		if c.tcpFd > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+				c.onRecv(c.syncBuf[:n])
+				continue
+			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				_ = c.closeWithErr(perr)
+				return req, perr
+			}
+		}
 		n, err := c.tcp.Read(c.syncBuf)
 		if n > 0 {
 			c.onRecv(c.syncBuf[:n])
@@ -718,6 +737,15 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 	}
 
 	for !req.finished.Load() {
+		if c.tcpFd > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+				c.onRecv(c.syncBuf[:n])
+				continue
+			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				_ = c.closeWithErr(perr)
+				return req, perr
+			}
+		}
 		n, err := c.tcp.Read(c.syncBuf)
 		if n > 0 {
 			c.onRecv(c.syncBuf[:n])
@@ -758,6 +786,15 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 	}
 
 	for !req.finished.Load() {
+		if c.tcpFd > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+				c.onRecv(c.syncBuf[:n])
+				continue
+			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				_ = c.closeWithErr(perr)
+				return req, perr
+			}
+		}
 		n, err := c.tcp.Read(c.syncBuf)
 		if n > 0 {
 			c.onRecv(c.syncBuf[:n])

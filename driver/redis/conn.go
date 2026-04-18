@@ -70,6 +70,11 @@ type redisConn struct {
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
+	// tcpFd caches the raw fd for MSG_DONTWAIT peeks before falling
+	// through to tcp.Read (which parks the G via Go's netpoll). A
+	// single non-blocking peek catches loopback-fast responses without
+	// paying the netpoll wakeup round-trip. Zero when unavailable.
+	tcpFd int
 
 	// Engine-integrated fields.
 	fd       int
@@ -173,9 +178,14 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 		return nil, fmt.Errorf("celeris/redis: expected *net.TCPConn, got %T", raw)
 	}
 	_ = tcp.SetNoDelay(true)
+	var rawFd int
+	if sc, scErr := tcp.SyscallConn(); scErr == nil {
+		_ = sc.Control(func(fd uintptr) { rawFd = int(fd) })
+	}
 	c := &redisConn{
 		useDirect: true,
 		tcp:       tcp,
+		tcpFd:     rawFd,
 		state:     newRedisState(),
 		cfg:       cfg,
 		createdAt: time.Now(),
@@ -353,6 +363,21 @@ func (c *redisConn) execDirect(ctx context.Context, req *redisRequest, args ...s
 		return req, err
 	}
 	for !req.finished.Load() {
+		// One non-blocking peek before paying netpoll wakeup. For tiny
+		// Redis replies (10-byte GET, +PONG\r\n, etc.) the response is
+		// usually already in the kernel recv buffer by the time the
+		// server has echoed it back on loopback. Peek catches that
+		// common case in a single syscall — tcp.Read's G-park adds
+		// ~1-2µs per read and costs measurable RPS at 90k+.
+		if c.tcpFd > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); n > 0 {
+				c.onRecv(c.syncBuf[:n])
+				continue
+			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				_ = c.closeWithErr(perr)
+				return req, perr
+			}
+		}
 		n, err := c.tcp.Read(c.syncBuf)
 		if n > 0 {
 			c.onRecv(c.syncBuf[:n])
@@ -392,6 +417,15 @@ func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*red
 		return reqs, err
 	}
 	for !last.finished.Load() {
+		if c.tcpFd > 0 {
+			if rn, _, perr := syscall.Recvfrom(c.tcpFd, c.syncBuf, syscall.MSG_DONTWAIT); rn > 0 {
+				c.onRecv(c.syncBuf[:rn])
+				continue
+			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				_ = c.closeWithErr(perr)
+				return reqs, perr
+			}
+		}
 		rn, err := c.tcp.Read(c.syncBuf)
 		if rn > 0 {
 			c.onRecv(c.syncBuf[:rn])
