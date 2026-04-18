@@ -15,6 +15,31 @@ type ServerProvider interface {
 	EventLoopProvider() engine.EventLoopProvider
 }
 
+// AsyncHandlerProvider is optionally implemented by ServerProvider to report
+// whether the server dispatches HTTP handlers to spawned goroutines rather
+// than running them inline on LockOSThread'd worker Gs. Drivers opened
+// WithEngine(srv) consult this via type assertion — when the caller will
+// run on an unlocked handler G, the direct net.Conn path becomes the
+// fastest choice (Go netpoll parks the G on EPOLLIN without blocking an M).
+// When the caller runs on a locked worker, the mini-loop busy-poll path
+// is preferred (direct net.Conn.Read on a locked M triggers
+// stoplockedm+startlockedm futex storms).
+type AsyncHandlerProvider interface {
+	AsyncHandlers() bool
+}
+
+// IsAsyncServer reports whether sp opts into async handler dispatch. Safe
+// to call with a nil sp — returns false.
+func IsAsyncServer(sp ServerProvider) bool {
+	if sp == nil {
+		return false
+	}
+	if a, ok := sp.(AsyncHandlerProvider); ok {
+		return a.AsyncHandlers()
+	}
+	return false
+}
+
 // standaloneState tracks the package-level refcounted standalone Loop shared
 // by drivers when no HTTP server is available.
 var (

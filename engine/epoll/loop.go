@@ -35,13 +35,12 @@ const connTableSize = 65536
 // connection cleanly (read returns 0 bytes / EOF).
 var errPeerClosed = errors.New("celeris: peer closed connection")
 
-// asyncHandlers is an experimental flag that dispatches the HTTP handler to
-// a goroutine per connection instead of running it inline on the (locked)
-// worker goroutine. Enabled via CELERIS_ASYNC_HANDLERS=1. Intended to
-// validate whether off-worker handler execution closes the integration
-// tax observed with blocking DB drivers (handler blocking worker → worker
-// can't service other FDs → throughput limited by NumWorkers).
-var asyncHandlers = os.Getenv("CELERIS_ASYNC_HANDLERS") == "1"
+// asyncHandlers (legacy env-var fallback) dispatches HTTP handlers to a
+// goroutine per connection instead of running them inline on the
+// LockOSThread'd worker. The canonical switch is now Config.AsyncHandlers;
+// the env var remains as a diagnostic override and is OR'd with the config
+// flag inside run().
+var asyncHandlersEnv = os.Getenv("CELERIS_ASYNC_HANDLERS") == "1"
 
 // Loop is an epoll-based event loop worker.
 type Loop struct {
@@ -89,6 +88,12 @@ type Loop struct {
 	driverMu       sync.RWMutex
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
+
+	// async dispatches HTTP1 handlers to spawned goroutines. Set by
+	// Config.AsyncHandlers (OR'd with the CELERIS_ASYNC_HANDLERS env-var
+	// override for diagnostic flips). Checked on every drainRead; keep it
+	// as a plain bool so the no-async path is a single mov+test.
+	async bool
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -127,6 +132,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		},
+		async: cfg.AsyncHandlers || asyncHandlersEnv,
 	}
 }
 
@@ -426,7 +432,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 		// for per-CPU affinity between the HTTP request and any DB/cache
 		// calls it makes.
 		connCtx := ctxkit.WithWorkerID(ctx, l.id)
-		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize)
+		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
 		l.connCount++
@@ -515,12 +521,16 @@ func (l *Loop) drainRead(fd int, now int64) {
 
 		writeFn := cs.writeFn
 
-		// Experimental: dispatch handler to a goroutine. The handler holds
-		// cs.detachMu while running so writeBuf and writeFn access is
-		// serialized. Worker continues to epoll_wait immediately, so other
-		// FDs on this worker aren't starved while this handler blocks on
-		// DB I/O. Enabled via CELERIS_ASYNC_HANDLERS=1.
-		if asyncHandlers && cs.protocol == engine.HTTP1 {
+		// Async handler dispatch: spawn a goroutine for the handler. The
+		// handler goroutine holds cs.detachMu while running so writeBuf
+		// and writeFn access is serialized with worker-initiated flushes.
+		// Worker returns to epoll_wait immediately — other FDs on this
+		// worker aren't starved while this handler blocks on DB I/O.
+		//
+		// Gated by Config.AsyncHandlers (+ CELERIS_ASYNC_HANDLERS env
+		// override for ops diagnostics). The inline path below is
+		// unchanged and zero-cost when async is off.
+		if l.async && cs.protocol == engine.HTTP1 {
 			dataCopy := append([]byte(nil), data...)
 			fdCopy := fd
 			go func(cs *connState) {
@@ -528,14 +538,17 @@ func (l *Loop) drainRead(fd int, now int64) {
 				defer cs.detachMu.Unlock()
 				processErr := conn.ProcessH1(cs.ctx, dataCopy, cs.h1State, l.handler, writeFn)
 				if processErr != nil {
-					// Best-effort close. Skipping l.closeConn (which isn't
-					// thread-safe on the conn table) — the kernel will
-					// surface EOF on next epoll iteration and the worker
-					// will run the full close path then.
+					// Best-effort close: shut down the TCP half so the
+					// kernel surfaces EPOLLRDHUP on next epoll_wait and the
+					// worker runs the full close path thread-safely on its
+					// own goroutine. Skipping l.closeConn here because the
+					// conn table write would race with drainRead.
 					_ = unix.Close(fdCopy)
 					return
 				}
-				// Flush response inline.
+				// Flush response inline. detachMu is held so writes to
+				// cs.writeBuf during ProcessH1 (which just completed) can
+				// be safely observed by flushWrites below.
 				if cs.writePos < len(cs.writeBuf) {
 					_ = flushWrites(cs)
 				}

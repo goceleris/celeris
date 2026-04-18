@@ -32,6 +32,25 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	if cfg.Addr == "" {
 		return nil, errors.New("celeris/redis: empty address")
 	}
+	// Direct-cmd-path ONLY when the engine dispatches handlers async
+	// (caller runs on an unlocked G → net.Conn.Read uses Go's netpoll
+	// to park the G without blocking an M).
+	//
+	// For standalone (no engine), the mini-loop's sync spin is measurably
+	// faster than direct net.Conn.Read for redis's tiny GET responses (-2%
+	// flipped to +2%). For WithEngine without async, direct on a locked
+	// worker M would futex-storm.
+	//
+	// Pub/sub always uses the mini-loop because unsolicited server-push
+	// frames need event-driven delivery.
+	if eventloop.IsAsyncServer(cfg.Engine) {
+		provider, err := eventloop.Resolve(nil)
+		if err != nil {
+			return nil, err
+		}
+		pool := newDirectCmdPool(cfg, provider)
+		return &Client{cfg: cfg, pool: pool}, nil
+	}
 	provider, err := eventloop.Resolve(cfg.Engine)
 	if err != nil {
 		return nil, err

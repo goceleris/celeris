@@ -78,7 +78,7 @@ var connStatePool = sync.Pool{
 	},
 }
 
-func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
+func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *connState {
 	cs := connStatePool.Get().(*connState)
 	cs.fd = fd
 	cs.ctx = ctx
@@ -89,10 +89,9 @@ func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
 	} else {
 		cs.buf = make([]byte, bufSize)
 	}
-	// Async handler dispatch experiment: always allocate detachMu so
-	// handler goroutine and worker can serialize writeBuf access.
-	// Gated by CELERIS_ASYNC_HANDLERS=1 — detachMu is harmless when unused.
-	if asyncHandlers {
+	// Async handler dispatch: allocate detachMu so handler goroutine and
+	// worker serialize writeBuf access. Harmless when unused.
+	if async {
 		cs.detachMu = &sync.Mutex{}
 	}
 	return cs

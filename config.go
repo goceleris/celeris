@@ -99,6 +99,28 @@ type Config struct {
 	// Default false (metrics enabled).
 	DisableMetrics bool
 
+	// AsyncHandlers dispatches HTTP handlers to spawned goroutines instead of
+	// running them inline on the engine's LockOSThread'd worker. Enabling
+	// this is the right choice when handlers do blocking I/O (DB drivers,
+	// external HTTP calls, file reads): the worker returns to epoll_wait /
+	// io_uring_enter while the handler blocks, so the per-worker serialization
+	// ceiling (NumWorkers × 1/RTT) is replaced by goroutine-per-connection
+	// parallelism, matching net/http's concurrency model.
+	//
+	// When AsyncHandlers is set, celeris drivers opened WithEngine(srv) auto-
+	// select their direct net.Conn path (Go netpoll parks handler Gs on
+	// EPOLLIN without blocking an M), validated on MSR1 at celeris-epoll +
+	// celerismc jumping from 64k → 105k rps.
+	//
+	// The cost on pure-CPU handlers is a goroutine spawn per request (~100ns)
+	// plus scheduler overhead — measured regression on a static-response
+	// bench is ~3–5%. Keep AsyncHandlers false for latency-critical CPU-only
+	// workloads; enable it for any workload that touches a DB, cache, or
+	// upstream service.
+	//
+	// Default: false.
+	AsyncHandlers bool
+
 	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
 	// If the callback returns false, the server responds with 417 Expectation Failed
 	// and skips reading the body. If nil, the server always sends 100 Continue.
@@ -178,6 +200,7 @@ func (c Config) toResourceConfig() resource.Config {
 	}
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize
+	rc.AsyncHandlers = c.AsyncHandlers
 	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect

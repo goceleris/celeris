@@ -52,7 +52,26 @@ type syncMultiRoundTripper interface {
 // redisConn is a single connection driven by a celeris event loop. It owns a
 // redisState decoder and exposes helper methods for encoding commands and
 // awaiting replies.
+//
+// Two I/O modes coexist. useDirect discriminates; fields for the unused
+// mode are zero.
+//
+//   - Engine-integrated (cfg.Engine != nil, !AsyncHandlers): fd + loop +
+//     sync round-trips via WriteAndPoll / WriteAndPollBusy. Driver FDs
+//     share the celeris HTTP engine's LockOSThread'd worker. Direct
+//     net.Conn.Read on that locked M would futex-storm.
+//   - Direct (cfg.Engine == nil OR AsyncHandlers=true, cmd pool only):
+//     tcp holds the live *net.TCPConn; exec() writes and reads directly
+//     on the caller's goroutine via Go's netpoll. Pub/sub conns still
+//     use the mini-loop path — unsolicited server-push messages need
+//     event-loop delivery.
 type redisConn struct {
+	useDirect bool
+
+	// Direct-mode fields.
+	tcp *net.TCPConn
+
+	// Engine-integrated fields.
 	fd       int
 	loop     engine.WorkerLoop
 	workerID int
@@ -133,6 +152,40 @@ func (c *redisConn) notifyPubSubClose(err error) {
 	if fn != nil {
 		go fn(err)
 	}
+}
+
+// dialDirectRedisConn dials a TCP connection in direct mode: no mini-loop
+// registration, no fd extraction. The conn keeps the live *net.TCPConn
+// and does Write/Read on the caller's goroutine via Go's netpoll.
+func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
+	timeout := cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = defaultDialTimeout
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	raw, err := dialer.DialContext(ctx, "tcp", cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
+	tcp, ok := raw.(*net.TCPConn)
+	if !ok {
+		_ = raw.Close()
+		return nil, fmt.Errorf("celeris/redis: expected *net.TCPConn, got %T", raw)
+	}
+	_ = tcp.SetNoDelay(true)
+	c := &redisConn{
+		useDirect: true,
+		tcp:       tcp,
+		state:     newRedisState(),
+		cfg:       cfg,
+		createdAt: time.Now(),
+	}
+	c.lastUsedAt.Store(time.Now().UnixNano())
+	if err := c.handshake(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
 }
 
 // dialRedisConn dials a TCP connection, sets it non-blocking, registers it
@@ -266,7 +319,89 @@ func (c *redisConn) writeCommand(args ...string) ([]byte, error) {
 
 // sendRaw writes a pre-serialized byte slice.
 func (c *redisConn) sendRaw(data []byte) error {
+	if c.useDirect {
+		c.writerMu.Lock()
+		_, err := c.tcp.Write(data)
+		c.writerMu.Unlock()
+		return err
+	}
 	return c.loop.Write(c.fd, data)
+}
+
+// execDirect is the direct-mode exec path. Writes the encoded command on
+// the caller's goroutine via net.TCPConn.Write, then drives net.TCPConn.Read
+// until onRecv finishes the request. Go's netpoll parks the goroutine on
+// EPOLLIN transparently.
+func (c *redisConn) execDirect(ctx context.Context, req *redisRequest, args ...string) (*redisRequest, error) {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+	buf := c.state.writer.WriteCommand(args...)
+	if c.syncBuf == nil {
+		c.syncBuf = make([]byte, 16<<10)
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		tcp := c.tcp
+		_ = tcp.SetDeadline(dl)
+		defer func() {
+			if c.tcp != nil {
+				_ = c.tcp.SetDeadline(time.Time{})
+			}
+		}()
+	}
+	if _, err := c.tcp.Write(buf); err != nil {
+		_ = c.closeWithErr(err)
+		return req, err
+	}
+	for !req.finished.Load() {
+		n, err := c.tcp.Read(c.syncBuf)
+		if n > 0 {
+			c.onRecv(c.syncBuf[:n])
+		}
+		if err != nil {
+			_ = c.closeWithErr(err)
+			return req, err
+		}
+	}
+	return req, req.resultErr
+}
+
+// execManyDirect is the direct-mode pipeline path. Writes `data` once,
+// enqueues all reqs into the bridge, reads until the last req fires.
+func (c *redisConn) execManyDirect(ctx context.Context, data []byte, reqs []*redisRequest) ([]*redisRequest, error) {
+	n := len(reqs)
+	last := reqs[n-1]
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+	for i := 0; i < n; i++ {
+		c.state.bridge.Enqueue(reqs[i])
+	}
+	if c.syncBuf == nil {
+		c.syncBuf = make([]byte, 64<<10)
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		tcp := c.tcp
+		_ = tcp.SetDeadline(dl)
+		defer func() {
+			if c.tcp != nil {
+				_ = c.tcp.SetDeadline(time.Time{})
+			}
+		}()
+	}
+	if _, err := c.tcp.Write(data); err != nil {
+		_ = c.closeWithErr(err)
+		return reqs, err
+	}
+	for !last.finished.Load() {
+		rn, err := c.tcp.Read(c.syncBuf)
+		if rn > 0 {
+			c.onRecv(c.syncBuf[:rn])
+		}
+		if err != nil {
+			_ = c.closeWithErr(err)
+			return reqs, err
+		}
+	}
+	return reqs, nil
 }
 
 // exec sends a command and waits for the reply. The caller receives an
@@ -277,6 +412,13 @@ func (c *redisConn) exec(ctx context.Context, args ...string) (*redisRequest, er
 	}
 	req := getRequest(ctx)
 	c.state.bridge.Enqueue(req)
+
+	// Direct-mode path: net.TCPConn.Write + Read on the caller's goroutine.
+	// Go's netpoll handles EPOLLIN parking. Used when no engine was
+	// supplied or when the engine dispatches handlers asynchronously.
+	if c.useDirect {
+		return c.execDirect(ctx, req, args...)
+	}
 
 	// Sync fast path: write the command and poll for the response on the
 	// calling goroutine. Eliminates the event-loop context switch and the
@@ -358,6 +500,11 @@ func (c *redisConn) execManyIntoPrealloc(ctx context.Context, data []byte, reqs 
 func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redisRequest) ([]*redisRequest, error) {
 	n := len(reqs)
 	last := reqs[n-1].doneCh
+
+	// Direct-mode pipeline: one write, loop reads until last req fires.
+	if c.useDirect {
+		return c.execManyDirect(ctx, data, reqs)
+	}
 
 	// Sync multi fast path: write all commands and poll for all N responses
 	// on the calling goroutine. Uses direct-index dispatch (syncPipeReqs) to
@@ -635,6 +782,19 @@ func (c *redisConn) Ping(ctx context.Context) error {
 func (c *redisConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+		if c.useDirect {
+			if c.tcp != nil {
+				_ = c.tcp.Close()
+				c.tcp = nil
+			}
+			drainErr := ErrClosed
+			if box := c.closeErr.Load(); box != nil && box.err != nil {
+				drainErr = box.err
+			}
+			c.state.drainWithError(drainErr)
+			c.notifyPubSubClose(drainErr)
+			return
+		}
 		if c.loop != nil {
 			_ = c.loop.UnregisterConn(c.fd)
 		}

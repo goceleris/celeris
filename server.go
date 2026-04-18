@@ -389,6 +389,38 @@ func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 	return nil
 }
 
+// AsyncHandlers reports whether the server dispatches HTTP handlers to
+// spawned goroutines (Config.AsyncHandlers). Celeris drivers opened via
+// WithEngine(srv) consult this to auto-select their direct net.Conn path
+// — direct I/O matches Go's netpoll model perfectly on the spawned
+// handler G, whereas the mini-loop sync path is preferred when the
+// caller runs on a LockOSThread'd worker.
+//
+// Only engines that actually implement async dispatch report true — even
+// when Config.AsyncHandlers is set. Currently:
+//
+//   - Epoll: async dispatch implemented; returns true when configured.
+//   - Std (net/http fallback): always async natively (goroutine per
+//     conn); returns true when configured.
+//   - IOUring: async dispatch NOT yet implemented — returns false even
+//     when configured, so drivers fall back to the mini-loop sync path
+//     instead of direct-conn (which would futex-storm on a locked
+//     worker's netpoll.G parking).
+//   - Adaptive: may switch between epoll and iouring at runtime; we
+//     return false to avoid handing drivers an async promise that
+//     could evaporate across a switch.
+func (s *Server) AsyncHandlers() bool {
+	if !s.config.AsyncHandlers {
+		return false
+	}
+	switch s.config.Engine {
+	case Epoll, Std:
+		return true
+	default:
+		return false
+	}
+}
+
 // EngineInfo returns information about the running engine, or nil if not started.
 func (s *Server) EngineInfo() *EngineInfo {
 	eng := s.loadEngine()

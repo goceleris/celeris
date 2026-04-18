@@ -3,7 +3,6 @@ package memcached
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 
 	"github.com/goceleris/celeris/driver/internal/async"
@@ -42,12 +41,15 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	if cfg.Addr == "" {
 		return nil, errors.New("celeris/memcached: empty address")
 	}
-	// Experimental: always direct when CELERIS_MC_FORCE_DIRECT=1. Used
-	// to validate async-handler-dispatch + direct-conn combination on
-	// the celeris HTTP engine path. When the handler runs on a spawned
-	// (unlocked) goroutine, direct net.Conn.Read uses Go's netpoll
-	// which parks the G efficiently without blocking the M.
-	if cfg.Engine == nil || os.Getenv("CELERIS_MC_FORCE_DIRECT") == "1" {
+	// Direct net.TCPConn path when:
+	//   - No engine supplied (standalone), OR
+	//   - The engine dispatches handlers async (AsyncHandlers=true) — the
+	//     caller will run on a spawned goroutine, so net.Conn.Read via
+	//     Go's netpoll parks the G on EPOLLIN without blocking an M.
+	// Mini-loop path only when WithEngine is supplied AND handlers run
+	// inline on LockOSThread'd workers — direct net.Conn.Read on a
+	// locked M would futex-storm through stoplockedm+startlockedm.
+	if cfg.Engine == nil || eventloop.IsAsyncServer(cfg.Engine) {
 		pool := newDirectPool(cfg)
 		return &Client{cfg: cfg, pool: pool}, nil
 	}

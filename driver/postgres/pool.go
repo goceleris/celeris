@@ -48,6 +48,12 @@ type options struct {
 	// the handler that calls us will run on the engine's LockOSThread'd
 	// worker, so runtime.Gosched would futex-storm.
 	hasEngine bool
+	// asyncEngine is true when the engine dispatches HTTP handlers async
+	// (Config.AsyncHandlers on a supported engine). The handler runs on
+	// an unlocked spawned G, so runtime.Gosched is cheap; the yielding
+	// sync path is preferred to avoid the busy-spin P-hogging that cuts
+	// other handler Gs on the same P off from running.
+	asyncEngine bool
 }
 
 // Option configures Open.
@@ -61,6 +67,9 @@ func WithEngine(sp eventloop.ServerProvider) Option {
 			return
 		}
 		o.hasEngine = true
+		if eventloop.IsAsyncServer(sp) {
+			o.asyncEngine = true
+		}
 		if p := sp.EventLoopProvider(); p != nil {
 			o.provider = p
 			o.ownsLoop = false
@@ -97,10 +106,11 @@ func WithHealthCheck(d time.Duration) Option { return func(o *options) { o.cfg.H
 type Pool struct {
 	inner *async.Pool[*pgConn]
 
-	providerMu sync.RWMutex
-	provider   engine.EventLoopProvider
-	ownsLoop   bool
-	hasEngine  bool // WithEngine was supplied; use busy-poll sync path
+	providerMu  sync.RWMutex
+	provider    engine.EventLoopProvider
+	ownsLoop    bool
+	hasEngine   bool // WithEngine was supplied; handler runs on engine worker
+	asyncEngine bool // engine dispatches handlers async; handler is unlocked G
 
 	closed atomic.Bool
 
@@ -184,11 +194,12 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 		NumWorkers:       nw,
 	}
 	p := &Pool{
-		provider:  o.provider,
-		ownsLoop:  o.ownsLoop,
-		hasEngine: o.hasEngine,
-		dsn:       dsn,
-		cfg:       o.cfg,
+		provider:    o.provider,
+		ownsLoop:    o.ownsLoop,
+		hasEngine:   o.hasEngine,
+		asyncEngine: o.asyncEngine,
+		dsn:         dsn,
+		cfg:         o.cfg,
 	}
 	p.inner = async.NewPool[*pgConn](asyncCfg, p.dial)
 	return p, nil
@@ -207,7 +218,12 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	}
 	c.maxLifetime = p.cfg.MaxLifetime
 	c.maxIdleTime = p.cfg.MaxIdleTime
-	c.useBusySync(p.hasEngine)
+	// busy-poll only on engines that run handlers inline on a locked
+	// worker M. When the engine dispatches handlers async (caller is
+	// an unlocked G), runtime.Gosched is cheap — the yielding sync
+	// path is preferred since the busy-spin P-hog starves other
+	// handler Gs on the same P.
+	c.useBusySync(p.hasEngine && !p.asyncEngine)
 	return c, nil
 }
 

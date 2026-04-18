@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"runtime"
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
@@ -19,6 +20,89 @@ type redisPool struct {
 	cfg      Config
 	provider engine.EventLoopProvider
 	ownsLoop bool
+}
+
+// newDirectCmdPool creates a pool whose cmd conns dial via direct
+// net.TCPConn (no mini-loop). The pubsub pool still uses the mini-loop —
+// pub/sub needs event-driven delivery of unsolicited push frames. provider
+// is the package-level standalone Loop from eventloop.Resolve(nil) (or the
+// engine's provider when engine is non-nil, for pubsub colocation).
+func newDirectCmdPool(cfg Config, provider engine.EventLoopProvider) *redisPool {
+	nwCmd := runtime.GOMAXPROCS(0)
+	if nwCmd <= 0 {
+		nwCmd = 1
+	}
+	maxOpen := cfg.PoolSize
+	if maxOpen == 0 {
+		maxOpen = nwCmd * 4
+	}
+	idle := cfg.MaxIdlePerWorker
+	if idle == 0 {
+		idle = (maxOpen + nwCmd - 1) / nwCmd
+		if idle < defaultMaxIdlePerWorker {
+			idle = defaultMaxIdlePerWorker
+		}
+	}
+	life := cfg.MaxLifetime
+	if life == 0 {
+		life = defaultMaxLifetime
+	}
+	idleT := cfg.MaxIdleTime
+	if idleT == 0 {
+		idleT = defaultMaxIdleTime
+	}
+	hc := cfg.HealthCheckInterval
+	if hc == 0 {
+		hc = 30 * time.Second
+	}
+	if hc < 0 {
+		hc = 0
+	}
+	asyncCfgCmd := async.PoolConfig{
+		MaxOpen:          maxOpen,
+		MaxIdlePerWorker: idle,
+		MaxLifetime:      life,
+		MaxIdleTime:      idleT,
+		HealthCheck:      hc,
+		NumWorkers:       nwCmd,
+	}
+	p := &redisPool{
+		cfg:      cfg,
+		provider: provider,
+		ownsLoop: true,
+	}
+	dialCmdDirect := func(ctx context.Context, workerID int) (*redisConn, error) {
+		c, err := dialDirectRedisConn(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		c.maxLifetime = life
+		c.maxIdleTime = idleT
+		c.state.onPush = cfg.OnPush
+		c.workerID = workerID
+		return c, nil
+	}
+	p.cmd = async.NewPool[*redisConn](asyncCfgCmd, dialCmdDirect)
+	nwPubsub := provider.NumWorkers()
+	if nwPubsub <= 0 {
+		nwPubsub = 1
+	}
+	asyncCfgPubsub := asyncCfgCmd
+	asyncCfgPubsub.NumWorkers = nwPubsub
+	asyncCfgPubsub.MaxOpen = 0
+	asyncCfgPubsub.MaxIdlePerWorker = 0
+	dialPubsub := func(ctx context.Context, workerID int) (*redisConn, error) {
+		c, err := dialRedisConn(ctx, provider, cfg, workerID)
+		if err != nil {
+			return nil, err
+		}
+		c.maxLifetime = life
+		c.maxIdleTime = idleT
+		c.state.onPush = cfg.OnPush
+		return c, nil
+	}
+	p.pubsub = async.NewPool[*redisConn](asyncCfgPubsub, dialPubsub)
+	return p
 }
 
 func newPool(cfg Config, provider engine.EventLoopProvider, ownsLoop bool) *redisPool {

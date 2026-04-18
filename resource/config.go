@@ -50,6 +50,9 @@ type Config struct {
 	// MaxRequestBodySize is the maximum allowed request body size in bytes.
 	// 0 uses the default (100 MB). -1 disables the limit (unlimited).
 	MaxRequestBodySize int64
+	// AsyncHandlers dispatches HTTP handlers to spawned goroutines instead
+	// of inline execution on LockOSThread'd workers. See celeris.Config.
+	AsyncHandlers bool
 	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
 	// If the callback returns false, the server responds with 417 Expectation Failed
 	// and skips reading the request body. If nil, the server always sends 100 Continue.
