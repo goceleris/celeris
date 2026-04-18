@@ -160,6 +160,59 @@ func encodeBoolText(dst []byte, v any) ([]byte, error) {
 
 // -------------------- int2/int4/int8 --------------------
 
+// DecodeIntBinary returns the integer value of src in binary format.
+// Dispatches on codec.OID to pick int2/int4/int8 width. Callers that
+// already know the width may call the type-specific helpers below for
+// the tight inner loop.
+func DecodeIntBinary(src []byte, codec *TypeCodec) (int64, error) {
+	if codec == nil {
+		return 0, fmt.Errorf("postgres/protocol: DecodeIntBinary: nil codec")
+	}
+	switch codec.OID {
+	case OIDInt2:
+		if len(src) != 2 {
+			return 0, fmt.Errorf("postgres/protocol: int2 length = %d", len(src))
+		}
+		return int64(int16(binary.BigEndian.Uint16(src))), nil
+	case OIDInt4:
+		if len(src) != 4 {
+			return 0, fmt.Errorf("postgres/protocol: int4 length = %d", len(src))
+		}
+		return int64(int32(binary.BigEndian.Uint32(src))), nil
+	case OIDInt8:
+		if len(src) != 8 {
+			return 0, fmt.Errorf("postgres/protocol: int8 length = %d", len(src))
+		}
+		return int64(binary.BigEndian.Uint64(src)), nil
+	}
+	// Not a primitive integer — dispatch through the codec.
+	if codec.DecodeBinary == nil {
+		return 0, fmt.Errorf("postgres/protocol: DecodeIntBinary: no binary decoder for oid %d", codec.OID)
+	}
+	v, err := codec.DecodeBinary(src)
+	if err != nil {
+		return 0, err
+	}
+	if n, ok := v.(int64); ok {
+		return n, nil
+	}
+	return 0, fmt.Errorf("postgres/protocol: DecodeIntBinary: oid %d did not decode to int64", codec.OID)
+}
+
+// ParseIntTextASCII parses a PG text-format integer without allocating
+// the intermediate string that strconv.ParseInt would require.
+func ParseIntTextASCII(src []byte) (int64, error) {
+	v, err := decodeIntText(src)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := v.(int64)
+	if !ok {
+		return 0, fmt.Errorf("postgres/protocol: ParseIntTextASCII: unexpected type %T", v)
+	}
+	return n, nil
+}
+
 func decodeInt2Binary(src []byte) (driver.Value, error) {
 	if len(src) != 2 {
 		return nil, fmt.Errorf("postgres/protocol: int2 length = %d", len(src))
@@ -190,10 +243,11 @@ func decodeIntText(src []byte) (driver.Value, error) {
 	}
 	i := 0
 	neg := false
-	if src[0] == '-' {
+	switch src[0] {
+	case '-':
 		neg = true
 		i = 1
-	} else if src[0] == '+' {
+	case '+':
 		i = 1
 	}
 	if i == len(src) {
@@ -213,7 +267,7 @@ func decodeIntText(src []byte) (driver.Value, error) {
 			return strconv.ParseInt(string(src), 10, 64)
 		}
 		n = n*10 + d
-		if n > maxPos && !(neg && n == maxPos+1) {
+		if n > maxPos && (!neg || n != maxPos+1) {
 			return strconv.ParseInt(string(src), 10, 64)
 		}
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
+	"github.com/goceleris/celeris/driver/postgres/protocol"
 	"github.com/goceleris/celeris/engine"
 )
 
@@ -378,8 +379,21 @@ type Rows struct {
 	pool  *Pool
 	done  bool
 
-	// current holds the driver.Values decoded by the last successful Next call.
+	// current holds the driver.Values decoded by the last successful
+	// Next call. Populated only when the inner is NOT *pgRows (i.e.
+	// in tests or alternate paths); production path uses rawRow.
 	current []driver.Value
+
+	// rawRow / rawCodecs / rawColumns / rawTextFormat short-circuit the
+	// slow driver.Value path when inner is *pgRows. rawRow holds a view
+	// into the underlying pgRequest slab and is valid until the next
+	// Next / Close.
+	rawRow        [][]byte
+	rawCodecs     []*protocol.TypeCodec
+	rawColumns    []protocol.ColumnDesc
+	rawTextFormat bool
+	rawAvailable  bool
+
 	// iterErr records the first non-EOF error encountered during Next.
 	iterErr error
 }
@@ -403,17 +417,36 @@ func (r *Rows) Close() error {
 // Next advances the cursor to the next row. It returns false when no more
 // rows are available or an error occurred. After Next returns false, call
 // [Rows.Err] to distinguish normal end-of-data from an error.
+//
+// Fast path: when inner is *pgRows (the production path), Next captures
+// the raw wire bytes + per-column codecs without boxing into
+// driver.Value. Scan() then decodes directly into user pointers, saving
+// one heap alloc per non-zero-size cell (int64 / time.Time etc. would
+// otherwise escape via interface conversion).
 func (r *Rows) Next() bool {
 	if r.done {
 		return false
 	}
-	// Reuse the current slice across iterations to avoid per-call allocation.
-	// On the first call, current is nil; we size it from the column count.
+	if pgr, ok := r.inner.(*pgRows); ok {
+		row, codecs, cols, textFormat, err := pgr.nextRaw()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				r.iterErr = err
+			}
+			r.rawAvailable = false
+			return false
+		}
+		r.rawRow = row
+		r.rawCodecs = codecs
+		r.rawColumns = cols
+		r.rawTextFormat = textFormat
+		r.rawAvailable = true
+		return true
+	}
+	// Legacy path for non-pgRows inners.
 	if r.current == nil {
 		r.current = make([]driver.Value, len(r.inner.Columns()))
 	}
-	// Clear the values from the previous iteration (prevents stale refs
-	// from pinning old data between rows).
 	for i := range r.current {
 		r.current[i] = nil
 	}
@@ -426,11 +459,30 @@ func (r *Rows) Next() bool {
 	return true
 }
 
-// Scan copies the columns from the current row into dest. The number of
-// dest arguments must match the number of columns. Each dest must be a
-// pointer; Scan assigns the driver.Value to the pointed-to variable with
-// basic type conversion.
+// Scan copies the columns from the current row into dest. Each dest
+// must be a pointer. On the fast path (inner is *pgRows), Scan decodes
+// directly from the wire bytes into dest without ever materialising a
+// driver.Value — zero interface{} boxing per cell.
 func (r *Rows) Scan(dest ...any) error {
+	if r.rawAvailable {
+		if len(dest) != len(r.rawRow) {
+			return fmt.Errorf("celeris-postgres: Scan expected %d dest, got %d", len(r.rawRow), len(dest))
+		}
+		for i, raw := range r.rawRow {
+			var col protocol.ColumnDesc
+			var codec *protocol.TypeCodec
+			if i < len(r.rawColumns) {
+				col = r.rawColumns[i]
+			}
+			if i < len(r.rawCodecs) {
+				codec = r.rawCodecs[i]
+			}
+			if err := scanRaw(dest[i], raw, codec, col, r.rawTextFormat); err != nil {
+				return fmt.Errorf("celeris-postgres: column %d: %w", i, err)
+			}
+		}
+		return nil
+	}
 	if r.current == nil {
 		return errors.New("celeris-postgres: Scan called without a preceding Next")
 	}
@@ -447,6 +499,200 @@ func (r *Rows) Scan(dest ...any) error {
 
 // Err returns the first non-EOF error encountered during iteration.
 func (r *Rows) Err() error { return r.iterErr }
+
+// scanRaw decodes wire bytes directly into the caller's pointer without
+// allocating an intermediate driver.Value. This is the hot path for
+// Rows.Scan when the inner driver is *pgRows; the goal is to eliminate
+// the interface{} boxing that forces int64 / time.Time / float64 cells
+// to escape to heap. For types this path doesn't cover (sql.Scanner,
+// []interface{}, rare PG types), it falls through to the driver.Value
+// path via the codec and scanValue so behaviour stays identical.
+func scanRaw(dest any, raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDesc, textFormat bool) error {
+	// sql.Scanner gets first dibs — users expect Scan(nil) to fire.
+	if scanner, ok := dest.(sql.Scanner); ok {
+		if raw == nil {
+			return scanner.Scan(nil)
+		}
+		v, err := decodeToValue(raw, codec, col, textFormat)
+		if err != nil {
+			return err
+		}
+		return scanner.Scan(v)
+	}
+	if raw == nil {
+		// Nil cell — zero the target if it's a common primitive.
+		return assignNil(dest)
+	}
+	// Binary format for known codecs — direct decode into typed pointer.
+	binaryFmt := !textFormat && col.FormatCode != protocol.FormatText
+	if codec != nil && binaryFmt {
+		if ok, err := decodeBinaryInto(dest, raw, codec); ok {
+			return err
+		}
+	}
+	if codec != nil && !binaryFmt {
+		if ok, err := decodeTextInto(dest, raw, codec); ok {
+			return err
+		}
+	}
+	// Fallback: go through driver.Value.
+	v, err := decodeToValue(raw, codec, col, textFormat)
+	if err != nil {
+		return err
+	}
+	return scanValue(dest, v)
+}
+
+// decodeToValue runs the codec's standard decoder and returns the boxed
+// driver.Value. Used by scanRaw's fallback paths.
+func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDesc, textFormat bool) (driver.Value, error) {
+	if codec == nil {
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		return cp, nil
+	}
+	if textFormat || col.FormatCode == protocol.FormatText {
+		if codec.DecodeText != nil {
+			return codec.DecodeText(raw)
+		}
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		return cp, nil
+	}
+	if codec.DecodeBinary != nil {
+		return codec.DecodeBinary(raw)
+	}
+	if codec.DecodeText != nil {
+		return codec.DecodeText(raw)
+	}
+	cp := make([]byte, len(raw))
+	copy(cp, raw)
+	return cp, nil
+}
+
+// decodeBinaryInto decodes raw binary-format bytes directly into dest
+// for the common primitive types. Returns (true, err) when the type was
+// handled (err may be non-nil for decode failures); (false, nil) when
+// the caller should fall through to the driver.Value path.
+func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, error) {
+	switch d := dest.(type) {
+	case *int:
+		n, err := protocol.DecodeIntBinary(raw, codec)
+		if err != nil {
+			return true, err
+		}
+		*d = int(n)
+		return true, nil
+	case *int64:
+		n, err := protocol.DecodeIntBinary(raw, codec)
+		if err != nil {
+			return true, err
+		}
+		*d = n
+		return true, nil
+	case *int32:
+		n, err := protocol.DecodeIntBinary(raw, codec)
+		if err != nil {
+			return true, err
+		}
+		*d = int32(n)
+		return true, nil
+	case *int16:
+		n, err := protocol.DecodeIntBinary(raw, codec)
+		if err != nil {
+			return true, err
+		}
+		*d = int16(n)
+		return true, nil
+	case *uint32:
+		n, err := protocol.DecodeIntBinary(raw, codec)
+		if err != nil {
+			return true, err
+		}
+		*d = uint32(n)
+		return true, nil
+	case *string:
+		// Fast path for text/varchar/etc.: no interface boxing, single
+		// string allocation out of the raw slab bytes.
+		*d = string(raw)
+		return true, nil
+	case *[]byte:
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		*d = cp
+		return true, nil
+	case *bool:
+		// PG binary bool is a single byte (0/1).
+		if len(raw) != 1 {
+			return false, nil
+		}
+		*d = raw[0] != 0
+		return true, nil
+	}
+	return false, nil
+}
+
+// decodeTextInto is the text-format counterpart to decodeBinaryInto.
+func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
+	switch d := dest.(type) {
+	case *int:
+		n, err := protocol.ParseIntTextASCII(raw)
+		if err != nil {
+			return true, err
+		}
+		*d = int(n)
+		return true, nil
+	case *int64:
+		n, err := protocol.ParseIntTextASCII(raw)
+		if err != nil {
+			return true, err
+		}
+		*d = n
+		return true, nil
+	case *int32:
+		n, err := protocol.ParseIntTextASCII(raw)
+		if err != nil {
+			return true, err
+		}
+		*d = int32(n)
+		return true, nil
+	case *string:
+		*d = string(raw)
+		return true, nil
+	case *[]byte:
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		*d = cp
+		return true, nil
+	}
+	return false, nil
+}
+
+// assignNil zeros the pointed-to primitive when the column is NULL.
+func assignNil(dest any) error {
+	switch d := dest.(type) {
+	case *int:
+		*d = 0
+	case *int64:
+		*d = 0
+	case *int32:
+		*d = 0
+	case *int16:
+		*d = 0
+	case *uint32:
+		*d = 0
+	case *string:
+		*d = ""
+	case *[]byte:
+		*d = nil
+	case *bool:
+		*d = false
+	default:
+		// Unknown target — let scanValue handle it via convertAssign(nil).
+		return scanValue(dest, nil)
+	}
+	return nil
+}
 
 // scanValue assigns driver.Value v to the pointer dest with basic type
 // conversion. It covers the types returned by the Postgres codec layer.

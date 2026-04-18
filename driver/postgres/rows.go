@@ -163,6 +163,24 @@ func (r *pgRows) Next(dest []driver.Value) error {
 	return nil
 }
 
+// nextRaw advances the cursor and returns the raw bytes of the new row
+// plus the per-column codecs and descriptors. Returns (nil, nil, nil,
+// io.EOF) at end. Used by the Pool's Rows.Scan fast path to decode raw
+// bytes directly into user pointers without going through driver.Value
+// interface{} boxing — saves one heap alloc per non-zero-size cell
+// (int64 / time.Time / float64 etc. all escape to heap when boxed).
+func (r *pgRows) nextRaw() ([][]byte, []*protocol.TypeCodec, []protocol.ColumnDesc, bool, error) {
+	if r.idx >= len(r.rows) {
+		if r.err != nil {
+			return nil, nil, nil, r.textFormat, r.err
+		}
+		return nil, nil, nil, r.textFormat, io.EOF
+	}
+	row := r.rows[r.idx]
+	r.idx++
+	return row, r.codecs, r.columns, r.textFormat, nil
+}
+
 // ColumnTypeScanType returns the Go type the i-th column will decode into.
 func (r *pgRows) ColumnTypeScanType(i int) reflect.Type {
 	if i < 0 || i >= len(r.columns) {

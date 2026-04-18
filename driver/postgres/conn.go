@@ -1353,7 +1353,7 @@ func isCacheableQuery(q string) bool {
 		if c == '/' && i+1 < len(q) && q[i+1] == '*' {
 			// Block comment — skip to */.
 			i += 2
-			for i+1 < len(q) && !(q[i] == '*' && q[i+1] == '/') {
+			for i+1 < len(q) && (q[i] != '*' || q[i+1] != '/') {
 				i++
 			}
 			i += 2
