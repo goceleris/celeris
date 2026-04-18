@@ -266,11 +266,15 @@ func TestWriteAndPollSyncPath(t *testing.T) {
 		t.Fatalf("worker %T does not implement SyncRoundTripper", w)
 	}
 
-	// Write a response on the peer side before calling WriteAndPoll.
-	go func() {
-		time.Sleep(50 * time.Microsecond)
-		_, _ = unix.Write(b, []byte("pong"))
-	}()
+	// Write the response on the peer side before calling WriteAndPoll so
+	// the data is already in the kernel buffer by the time Phase A's
+	// single non-blocking read runs. Using a 50µs sleep + goroutine here
+	// is flaky on loaded CI: the goroutine may not be scheduled before
+	// Phase C's poll(1ms) times out, producing "ok=false; sync fast path
+	// not engaged" even though the code is correct.
+	if _, werr := unix.Write(b, []byte("pong")); werr != nil {
+		t.Fatalf("peer write: %v", werr)
+	}
 
 	var got []byte
 	rbuf := make([]byte, 128)
