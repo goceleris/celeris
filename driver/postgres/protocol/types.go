@@ -182,11 +182,45 @@ func decodeInt8Binary(src []byte) (driver.Value, error) {
 }
 
 func decodeIntText(src []byte) (driver.Value, error) {
-	n, err := strconv.ParseInt(string(src), 10, 64)
-	if err != nil {
-		return nil, err
+	// Hot-path byte parser — avoids the string(src) allocation that
+	// strconv.ParseInt forces. Handles optional leading minus, rejects
+	// empty input and non-digit characters the same way ParseInt does.
+	if len(src) == 0 {
+		return nil, strconv.ErrSyntax
 	}
-	return n, nil
+	i := 0
+	neg := false
+	if src[0] == '-' {
+		neg = true
+		i = 1
+	} else if src[0] == '+' {
+		i = 1
+	}
+	if i == len(src) {
+		return nil, strconv.ErrSyntax
+	}
+	var n uint64
+	const maxPos = uint64(1)<<63 - 1
+	for ; i < len(src); i++ {
+		c := src[i]
+		if c < '0' || c > '9' {
+			// Fall back to strconv on anything exotic (whitespace, etc.) —
+			// keeps error semantics identical.
+			return strconv.ParseInt(string(src), 10, 64)
+		}
+		d := uint64(c - '0')
+		if n > maxPos/10 {
+			return strconv.ParseInt(string(src), 10, 64)
+		}
+		n = n*10 + d
+		if n > maxPos && !(neg && n == maxPos+1) {
+			return strconv.ParseInt(string(src), 10, 64)
+		}
+	}
+	if neg {
+		return -int64(n), nil
+	}
+	return int64(n), nil
 }
 
 // asInt64 coerces common numeric Go types (after Valuer resolution) to int64.
