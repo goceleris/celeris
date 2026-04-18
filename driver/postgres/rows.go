@@ -14,8 +14,13 @@ import (
 // by decoding each field with the TypeCodec registered for its OID.
 type pgRows struct {
 	columns []protocol.ColumnDesc
-	rows    [][][]byte
-	idx     int
+	// codecs is populated once in acquirePGRows: codecs[i] is the cached
+	// TypeCodec for column i (may be nil if the OID is unknown). Resolving
+	// once per query instead of once per cell saves an RWMutex RLock per
+	// row×column under tight iteration.
+	codecs []*protocol.TypeCodec
+	rows   [][][]byte
+	idx    int
 	// textFormat is true for simple-query results (always text encoding) and
 	// false for extended-query results that requested binary.
 	textFormat bool
@@ -28,6 +33,9 @@ type pgRows struct {
 	// caller is done iterating (Close), so the slab memory recycles rather
 	// than leaking alloc pressure into every QueryContext call.
 	req *pgRequest
+	// codecsBuf is the inline backing storage for small column counts
+	// (<=16). Larger queries fall back to a heap-allocated slice.
+	codecsBuf [16]*protocol.TypeCodec
 }
 
 var (
@@ -54,6 +62,16 @@ func acquirePGRows(cols []protocol.ColumnDesc, rows [][][]byte, textFormat bool,
 	r.closed = false
 	r.err = deferredErr
 	r.req = req
+	// Resolve one codec per column up front. Hits the RWMutex once per
+	// column instead of once per cell.
+	if len(cols) <= len(r.codecsBuf) {
+		r.codecs = r.codecsBuf[:len(cols)]
+	} else {
+		r.codecs = make([]*protocol.TypeCodec, len(cols))
+	}
+	for i, c := range cols {
+		r.codecs[i] = protocol.LookupOID(c.TypeOID)
+	}
 	return r
 }
 
@@ -106,7 +124,7 @@ func (r *pgRows) Next(dest []driver.Value) error {
 			continue
 		}
 		col := r.columns[i]
-		codec := protocol.LookupOID(col.TypeOID)
+		codec := r.codecs[i]
 		if codec == nil {
 			// Unknown type — return raw bytes.
 			cp := make([]byte, len(raw))
@@ -211,6 +229,7 @@ const streamThreshold = streamRowsChanSize
 // and signals doneCh. Close() drains any remaining rows and waits for doneCh.
 type streamRows struct {
 	columns    []protocol.ColumnDesc
+	codecs     []*protocol.TypeCodec // cached lookup per column
 	textFormat bool
 
 	rowCh  chan [][]byte          // bounded channel; closed by dispatch on completion
@@ -262,7 +281,10 @@ func (r *streamRows) Next(dest []driver.Value) error {
 			continue
 		}
 		col := r.columns[i]
-		codec := protocol.LookupOID(col.TypeOID)
+		var codec *protocol.TypeCodec
+		if i < len(r.codecs) {
+			codec = r.codecs[i]
+		}
 		if codec == nil {
 			cp := make([]byte, len(raw))
 			copy(cp, raw)

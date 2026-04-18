@@ -1392,14 +1392,19 @@ func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textForma
 	case <-req.colsCh:
 		// Streaming activated — promoteToStreaming allocated rowCh and
 		// closed colsCh. Rows will continue streaming through rowCh.
-		return &streamRows{
+		sr := &streamRows{
 			columns:    req.columns,
 			textFormat: textFormat,
 			rowCh:      req.rowCh,
 			doneCh:     req.doneCh,
 			req:        req,
 			errVal:     &req.streamErr,
-		}, nil
+		}
+		sr.codecs = make([]*protocol.TypeCodec, len(req.columns))
+		for i, col := range req.columns {
+			sr.codecs[i] = protocol.LookupOID(col.TypeOID)
+		}
+		return sr, nil
 	case <-req.doneCh:
 		// Request fully completed. Drain the buffered doneCh signal.
 		select {
