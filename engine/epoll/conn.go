@@ -73,15 +73,20 @@ type connState struct {
 
 	// Async handler dispatch (Config.AsyncHandlers=true, HTTP1 only):
 	// Incoming bytes are appended to asyncInBuf under asyncInMu by the
-	// worker goroutine. A single dispatch goroutine per conn (spawned on
-	// first receipt) drains asyncInBuf in a loop, runs ProcessH1 over
-	// the pulled data (which handles pipelined requests in one shot via
-	// its internal offset loop), and exits when asyncInBuf is empty.
-	// asyncRun serializes spawn decisions with drain completion. This
-	// shape matches net/http's goroutine-per-conn model and preserves
-	// HTTP/1.1 pipelining ordering guarantees.
+	// worker. A single dispatch goroutine per conn drains asyncInBuf
+	// via a double-buffer swap with asyncOutBuf (zero-alloc on the hot
+	// path) and runs ProcessH1 over the pulled data. The goroutine
+	// stays alive across requests — after draining, it blocks on
+	// asyncCond.Wait rather than exiting, so a subsequent read from
+	// the same keep-alive conn reuses the goroutine instead of paying
+	// the spawn cost each request. Matches net/http's goroutine-per-
+	// conn model while preserving HTTP/1.1 pipelining order (ProcessH1
+	// handles pipelined requests in one shot via its internal offset
+	// loop).
 	asyncInBuf  []byte
+	asyncOutBuf []byte
 	asyncInMu   sync.Mutex
+	asyncCond   sync.Cond   // L = &asyncInMu; signaled by worker on new data or close
 	asyncRun    bool        // true while the dispatch goroutine is alive
 	asyncClosed atomic.Bool // set by worker's close path; goroutine exits next iter
 }
@@ -109,6 +114,7 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	// worker serialize writeBuf access. Harmless when unused.
 	if async {
 		cs.detachMu = &sync.Mutex{}
+		cs.asyncCond.L = &cs.asyncInMu
 	}
 	return cs
 }
@@ -132,6 +138,7 @@ func releaseConnState(cs *connState) {
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
 	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.fd = 0

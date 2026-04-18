@@ -72,13 +72,17 @@ type connState struct {
 
 	// Async handler dispatch (Worker.async=true, HTTP1 only):
 	// Incoming recv bytes are appended under asyncInMu by the worker.
-	// A single dispatch goroutine per conn drains asyncInBuf, runs
-	// ProcessH1 under detachMu (serializes with worker-initiated
-	// flushes), then enqueues on detachQueue so the worker submits
-	// SEND SQEs on its own goroutine (SINGLE_ISSUER). Shape matches
+	// A single dispatch goroutine per conn drains asyncInBuf via a
+	// double-buffer swap with asyncOutBuf, runs ProcessH1 under
+	// detachMu, then enqueues on detachQueue so the worker submits
+	// SEND SQEs on its own goroutine (SINGLE_ISSUER). The goroutine
+	// parks on asyncCond between requests rather than exiting — saves
+	// the ~1.5µs spawn cost on keep-alive conns. Shape matches
 	// engine/epoll's runAsyncHandler and preserves HTTP/1.1 pipelining.
 	asyncInBuf  []byte
+	asyncOutBuf []byte
 	asyncInMu   sync.Mutex
+	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
 }
@@ -110,6 +114,7 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	// later install step. Harmless (nil-free) when unused.
 	if async {
 		cs.detachMu = &sync.Mutex{}
+		cs.asyncCond.L = &cs.asyncInMu
 	}
 	return cs
 }
@@ -138,6 +143,7 @@ func releaseConnState(cs *connState) {
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
 	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.fd = 0

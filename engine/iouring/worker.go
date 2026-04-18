@@ -937,20 +937,25 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// enqueues on detachQueue so this worker submits SEND SQEs on its
 	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
 	if w.async && cs.protocol == engine.HTTP1 {
-		dataCopy := append([]byte(nil), data...)
-		if hasProvidedBuf {
-			w.bufRing.PushBuffer(providedBufID)
-			w.hasBufReturns = true
-		}
 		cs.asyncInMu.Lock()
-		cs.asyncInBuf = append(cs.asyncInBuf, dataCopy...)
+		// Append directly into asyncInBuf — dispatch goroutine swaps
+		// with asyncOutBuf under the same mutex before running
+		// ProcessH1, so the provided-buffer slice cannot be overwritten
+		// in-flight. Zero allocation on steady state.
+		cs.asyncInBuf = append(cs.asyncInBuf, data...)
 		starting := !cs.asyncRun
 		if starting {
 			cs.asyncRun = true
 		}
 		cs.asyncInMu.Unlock()
+		if hasProvidedBuf {
+			w.bufRing.PushBuffer(providedBufID)
+			w.hasBufReturns = true
+		}
 		if starting {
 			go w.runAsyncHandler(cs)
+		} else {
+			cs.asyncCond.Signal()
 		}
 		w.reqBatch++
 		if !cqeHasMore(c.Flags) && !cs.recvPaused {
@@ -1235,10 +1240,12 @@ func (w *Worker) closeConn(fd int) {
 	}
 	detached := cs.detachMu != nil
 	if detached {
-		// Signal both dispatch goroutine (async handlers) and detached
-		// goroutine (WebSocket/SSE) to stop. asyncClosed is checked at
-		// the top of runAsyncHandler's loop between ProcessH1 runs.
 		cs.asyncClosed.Store(true)
+		if cs.asyncCond.L != nil {
+			cs.asyncInMu.Lock()
+			cs.asyncCond.Broadcast()
+			cs.asyncInMu.Unlock()
+		}
 		// Signal the detached goroutine's writeFn to stop writing.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
@@ -1409,22 +1416,17 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 func (w *Worker) runAsyncHandler(cs *connState) {
 	for {
 		cs.asyncInMu.Lock()
-		if len(cs.asyncInBuf) == 0 {
-			cs.asyncRun = false
-			cs.asyncInMu.Unlock()
-			return
+		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
+			cs.asyncCond.Wait()
 		}
-		data := cs.asyncInBuf
-		cs.asyncInBuf = nil
-		cs.asyncInMu.Unlock()
-
 		if cs.asyncClosed.Load() {
-			cs.asyncInMu.Lock()
-			cs.asyncInBuf = nil
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
 			return
 		}
+		cs.asyncInBuf, cs.asyncOutBuf = cs.asyncOutBuf[:0], cs.asyncInBuf
+		data := cs.asyncOutBuf
+		cs.asyncInMu.Unlock()
 
 		cs.detachMu.Lock()
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
@@ -1432,11 +1434,9 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		cs.detachMu.Unlock()
 
 		if processErr != nil {
-			// Mark closing so the worker tears down the conn. We can't
-			// call closeConn here — conns[] / dirty list are worker-local.
 			cs.asyncClosed.Store(true)
 			cs.asyncInMu.Lock()
-			cs.asyncInBuf = nil
+			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
 			// Wake the worker so it notices asyncClosed and runs closeConn
@@ -1454,7 +1454,6 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		}
 
 		if hasWrite {
-			// Queue for worker-side SEND submission.
 			w.detachQMu.Lock()
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
@@ -1791,6 +1790,11 @@ func (w *Worker) shutdown() {
 		detached := cs.detachMu != nil
 		if detached {
 			cs.asyncClosed.Store(true)
+			if cs.asyncCond.L != nil {
+				cs.asyncInMu.Lock()
+				cs.asyncCond.Broadcast()
+				cs.asyncInMu.Unlock()
+			}
 			cs.detachMu.Lock()
 			cs.detachClosed = true
 			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {

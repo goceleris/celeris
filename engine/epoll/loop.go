@@ -540,9 +540,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// override for ops diagnostics). The inline path below is
 		// unchanged and zero-cost when async is off.
 		if l.async && cs.protocol == engine.HTTP1 {
-			dataCopy := append([]byte(nil), data...)
 			cs.asyncInMu.Lock()
-			cs.asyncInBuf = append(cs.asyncInBuf, dataCopy...)
+			// Append directly into asyncInBuf — the goroutine swaps it
+			// out via double-buffer under the same mutex before invoking
+			// ProcessH1, so the worker's next read into cs.buf can't
+			// overwrite in-flight bytes. Zero allocation on steady state.
+			cs.asyncInBuf = append(cs.asyncInBuf, data...)
 			starting := !cs.asyncRun
 			if starting {
 				cs.asyncRun = true
@@ -550,6 +553,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 			cs.asyncInMu.Unlock()
 			if starting {
 				go l.runAsyncHandler(cs)
+			} else {
+				// Goroutine is parked in asyncCond.Wait — wake it.
+				cs.asyncCond.Signal()
 			}
 			continue
 		}
@@ -863,24 +869,26 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 func (l *Loop) runAsyncHandler(cs *connState) {
 	for {
 		cs.asyncInMu.Lock()
-		if len(cs.asyncInBuf) == 0 {
-			cs.asyncRun = false
-			cs.asyncInMu.Unlock()
-			return
+		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
+			// Park until the worker appends more bytes or the conn is
+			// being torn down. Stays alive across keep-alive requests
+			// so we don't pay the ~1.5µs goroutine spawn cost per
+			// request — profile showed this accounted for ~3% of
+			// epoll+async CPU on high-rps redis workloads.
+			cs.asyncCond.Wait()
 		}
-		data := cs.asyncInBuf
-		cs.asyncInBuf = nil
-		cs.asyncInMu.Unlock()
-
 		if cs.asyncClosed.Load() {
-			// Worker signaled close. Drop any remaining data and exit;
-			// the worker's closeConn already tore down conn table state.
-			cs.asyncInMu.Lock()
-			cs.asyncInBuf = nil
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
 			return
 		}
+		// Double-buffer swap: hand asyncInBuf to the goroutine, reuse
+		// the emptied asyncOutBuf as the worker's new asyncInBuf. No
+		// allocation on steady state — append(out[:0], ...) grows into
+		// the retained backing array.
+		cs.asyncInBuf, cs.asyncOutBuf = cs.asyncOutBuf[:0], cs.asyncInBuf
+		data := cs.asyncOutBuf
+		cs.asyncInMu.Unlock()
 
 		cs.detachMu.Lock()
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
@@ -892,9 +900,6 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		cs.detachMu.Unlock()
 
 		if partial {
-			// EAGAIN on socket buffer: hand the FD to the worker via the
-			// detach queue so its next tick retries the flush. markDirty
-			// is worker-local and cannot be called from this goroutine.
 			l.detachQMu.Lock()
 			l.detachQueue = append(l.detachQueue, cs)
 			l.detachQPending.Store(1)
@@ -914,7 +919,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			// write would race with drainRead on the worker goroutine.
 			_ = unix.Close(cs.fd)
 			cs.asyncInMu.Lock()
-			cs.asyncInBuf = nil
+			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
 			return
@@ -1080,6 +1085,14 @@ func (l *Loop) closeConn(fd int) {
 		// goroutine (WebSocket/SSE) to stop. asyncClosed is checked at
 		// the top of runAsyncHandler's loop between ProcessH1 runs.
 		cs.asyncClosed.Store(true)
+		// Wake the parked dispatch goroutine so it observes asyncClosed
+		// and exits cleanly. Safe when the Cond was never armed (the
+		// L field is lazily set in acquireConnState when async=true).
+		if cs.asyncCond.L != nil {
+			cs.asyncInMu.Lock()
+			cs.asyncCond.Broadcast()
+			cs.asyncInMu.Unlock()
+		}
 		// Signal the detached goroutine's writeFn to stop writing.
 		// The mutex serializes with any in-progress write — if the
 		// goroutine is mid-write, we block until it finishes.
@@ -1147,6 +1160,11 @@ func (l *Loop) shutdown() {
 		detached := cs.detachMu != nil
 		if detached {
 			cs.asyncClosed.Store(true)
+			if cs.asyncCond.L != nil {
+				cs.asyncInMu.Lock()
+				cs.asyncCond.Broadcast()
+				cs.asyncInMu.Unlock()
+			}
 			cs.detachMu.Lock()
 			cs.detachClosed = true
 			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
