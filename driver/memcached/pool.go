@@ -29,7 +29,15 @@ func newPool(cfg Config, provider engine.EventLoopProvider, ownsLoop bool) *memc
 	}
 	idle := cfg.MaxIdlePerWorker
 	if idle == 0 {
-		idle = defaultMaxIdlePerWorker
+		// Size the per-worker idle list so every released conn fits
+		// without eviction. A tight default caused constant
+		// reconnect churn under 256-way HTTP concurrency; keeping
+		// the full working set idle avoids the dial on every
+		// request cycle. Bounded below by defaultMaxIdlePerWorker.
+		idle = (maxOpen + nw - 1) / nw
+		if idle < defaultMaxIdlePerWorker {
+			idle = defaultMaxIdlePerWorker
+		}
 	}
 	life := cfg.MaxLifetime
 	if life == 0 {

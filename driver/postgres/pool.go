@@ -140,7 +140,20 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 		o.cfg.MaxOpen = nw * 4
 	}
 	if o.cfg.MaxIdlePerWorker == 0 {
-		o.cfg.MaxIdlePerWorker = defaultMaxIdlePerWorker
+		// Size the per-worker idle list so the pool can keep every
+		// open conn idle between round-trips. A tight cap like 2
+		// causes constant reconnection under parallel load (each
+		// release past the cap closes the conn, and the next acquire
+		// pays the full dial + SCRAM-SHA-256 handshake + auto-prepare
+		// cycle). Default: ceil(MaxOpen / NumWorkers) so the idle
+		// list can absorb every released conn without churn. Users
+		// with memory-sensitive deployments can still lower via
+		// WithMaxIdlePerWorker.
+		per := (o.cfg.MaxOpen + nw - 1) / nw
+		if per < defaultMaxIdlePerWorker {
+			per = defaultMaxIdlePerWorker
+		}
+		o.cfg.MaxIdlePerWorker = per
 	}
 	if o.cfg.MaxLifetime == 0 {
 		o.cfg.MaxLifetime = defaultMaxLifetime
