@@ -27,9 +27,11 @@ const (
 )
 
 // writeCap returns the effective back-pressure limit for cs, accounting
-// for whether the connection is detached.
+// for whether the connection is detached. Async-mode HTTP1 conns set
+// detachMu up front without being truly detached; they keep the H1/H2
+// limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
 func (cs *connState) writeCap() int {
-	if cs.detachMu != nil {
+	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached {
 		return maxPendingBytesDetached
 	}
 	return maxPendingBytes
@@ -68,6 +70,20 @@ type connState struct {
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (single-threaded write)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
+
+	// Async handler dispatch (Config.AsyncHandlers=true, HTTP1 only):
+	// Incoming bytes are appended to asyncInBuf under asyncInMu by the
+	// worker goroutine. A single dispatch goroutine per conn (spawned on
+	// first receipt) drains asyncInBuf in a loop, runs ProcessH1 over
+	// the pulled data (which handles pipelined requests in one shot via
+	// its internal offset loop), and exits when asyncInBuf is empty.
+	// asyncRun serializes spawn decisions with drain completion. This
+	// shape matches net/http's goroutine-per-conn model and preserves
+	// HTTP/1.1 pipelining ordering guarantees.
+	asyncInBuf  []byte
+	asyncInMu   sync.Mutex
+	asyncRun    bool         // true while the dispatch goroutine is alive
+	asyncClosed atomic.Bool  // set by worker's close path; goroutine exits next iter
 }
 
 var connStatePool = sync.Pool{
@@ -115,6 +131,9 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.asyncRun = false
+	cs.asyncClosed.Store(false)
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

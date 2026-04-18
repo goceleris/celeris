@@ -400,21 +400,19 @@ func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 // when Config.AsyncHandlers is set. Currently:
 //
 //   - Epoll: async dispatch implemented; returns true when configured.
+//   - IOUring: async dispatch implemented; returns true when configured.
 //   - Std (net/http fallback): always async natively (goroutine per
 //     conn); returns true when configured.
-//   - IOUring: async dispatch NOT yet implemented — returns false even
-//     when configured, so drivers fall back to the mini-loop sync path
-//     instead of direct-conn (which would futex-storm on a locked
-//     worker's netpoll.G parking).
 //   - Adaptive: may switch between epoll and iouring at runtime; we
 //     return false to avoid handing drivers an async promise that
-//     could evaporate across a switch.
+//     could evaporate across a switch (both targets support async but
+//     the hot swap would invalidate in-flight direct-mode conns).
 func (s *Server) AsyncHandlers() bool {
 	if !s.config.AsyncHandlers {
 		return false
 	}
 	switch s.config.Engine {
-	case Epoll, Std:
+	case Epoll, IOUring, Std:
 		return true
 	default:
 		return false

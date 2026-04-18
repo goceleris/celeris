@@ -521,38 +521,36 @@ func (l *Loop) drainRead(fd int, now int64) {
 
 		writeFn := cs.writeFn
 
-		// Async handler dispatch: spawn a goroutine for the handler. The
-		// handler goroutine holds cs.detachMu while running so writeBuf
-		// and writeFn access is serialized with worker-initiated flushes.
-		// Worker returns to epoll_wait immediately — other FDs on this
-		// worker aren't starved while this handler blocks on DB I/O.
+		// Async handler dispatch — goroutine-per-conn with an input buffer.
+		//
+		// The worker appends this read's bytes to cs.asyncInBuf. If a
+		// dispatch goroutine is already draining the buffer for this
+		// conn, it will pick up the new bytes on its next iteration. If
+		// not, we spawn one. The goroutine holds cs.detachMu while
+		// inside ProcessH1 so writeBuf/writeFn mutations serialize with
+		// worker-initiated flush paths.
+		//
+		// This shape preserves HTTP/1.1 pipelining order guarantees —
+		// ProcessH1's fast path drains multiple pipelined requests from
+		// a single `data` slice in order, and the per-conn goroutine
+		// processes any buffered batch monotonically. Matches
+		// net/http's goroutine-per-conn model.
 		//
 		// Gated by Config.AsyncHandlers (+ CELERIS_ASYNC_HANDLERS env
 		// override for ops diagnostics). The inline path below is
 		// unchanged and zero-cost when async is off.
 		if l.async && cs.protocol == engine.HTTP1 {
 			dataCopy := append([]byte(nil), data...)
-			fdCopy := fd
-			go func(cs *connState) {
-				cs.detachMu.Lock()
-				defer cs.detachMu.Unlock()
-				processErr := conn.ProcessH1(cs.ctx, dataCopy, cs.h1State, l.handler, writeFn)
-				if processErr != nil {
-					// Best-effort close: shut down the TCP half so the
-					// kernel surfaces EPOLLRDHUP on next epoll_wait and the
-					// worker runs the full close path thread-safely on its
-					// own goroutine. Skipping l.closeConn here because the
-					// conn table write would race with drainRead.
-					_ = unix.Close(fdCopy)
-					return
-				}
-				// Flush response inline. detachMu is held so writes to
-				// cs.writeBuf during ProcessH1 (which just completed) can
-				// be safely observed by flushWrites below.
-				if cs.writePos < len(cs.writeBuf) {
-					_ = flushWrites(cs)
-				}
-			}(cs)
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = append(cs.asyncInBuf, dataCopy...)
+			starting := !cs.asyncRun
+			if starting {
+				cs.asyncRun = true
+			}
+			cs.asyncInMu.Unlock()
+			if starting {
+				go l.runAsyncHandler(cs)
+			}
 			continue
 		}
 
@@ -849,6 +847,81 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	}
 }
 
+// runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
+// Config.AsyncHandlers is enabled. It drains cs.asyncInBuf in a loop:
+// take the currently-buffered bytes, run ProcessH1 under detachMu (so
+// write paths serialize with worker-initiated flushes), flush the
+// response, repeat until the buffer is empty. When empty, clear
+// cs.asyncRun under the same mutex that gates spawn decisions, then
+// exit — the next worker append will spawn a fresh goroutine.
+//
+// This preserves HTTP/1.1 pipelining order guarantees: a pipelined
+// burst arrives in one worker read, ProcessH1's offset loop drains
+// every request from that slice in order, and responses appear in the
+// same order on cs.writeBuf before the flush. The "one goroutine at a
+// time per conn" invariant is enforced by cs.asyncRun.
+func (l *Loop) runAsyncHandler(cs *connState) {
+	for {
+		cs.asyncInMu.Lock()
+		if len(cs.asyncInBuf) == 0 {
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
+		data := cs.asyncInBuf
+		cs.asyncInBuf = nil
+		cs.asyncInMu.Unlock()
+
+		if cs.asyncClosed.Load() {
+			// Worker signaled close. Drop any remaining data and exit;
+			// the worker's closeConn already tore down conn table state.
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = nil
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
+
+		cs.detachMu.Lock()
+		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
+		var flushErr error
+		if processErr == nil && cs.writePos < len(cs.writeBuf) {
+			flushErr = flushWrites(cs)
+		}
+		partial := flushErr == nil && cs.writePos < len(cs.writeBuf)
+		cs.detachMu.Unlock()
+
+		if partial {
+			// EAGAIN on socket buffer: hand the FD to the worker via the
+			// detach queue so its next tick retries the flush. markDirty
+			// is worker-local and cannot be called from this goroutine.
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
+		}
+
+		if processErr != nil || flushErr != nil {
+			// Best-effort close: shut down the TCP half so the kernel
+			// surfaces EPOLLRDHUP on next epoll_wait and the worker
+			// runs the full close path thread-safely on its own
+			// goroutine. Skipping l.closeConn here — the conn table
+			// write would race with drainRead on the worker goroutine.
+			_ = unix.Close(cs.fd)
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = nil
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
+	}
+}
+
 func (l *Loop) drainDetachQueue() {
 	if l.detachQPending.Load() == 0 {
 		return
@@ -973,12 +1046,11 @@ func (l *Loop) checkTimeouts() {
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
 		// engine-config-driven idle/read/write timeouts since the middleware
-		// owns the I/O lifecycle.
-		if cs.detachMu != nil {
-			if cs.h1State != nil {
-				if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
-					l.closeConn(fd)
-				}
+		// owns the I/O lifecycle. Async-mode conns set detachMu up front
+		// without a true detach — fall through to the normal scan for those.
+		if cs.h1State != nil && cs.h1State.Detached {
+			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
+				l.closeConn(fd)
 			}
 			continue
 		}
@@ -1004,6 +1076,10 @@ func (l *Loop) closeConn(fd int) {
 	}
 	detached := cs.detachMu != nil
 	if detached {
+		// Signal both dispatch goroutine (async handlers) and detached
+		// goroutine (WebSocket/SSE) to stop. asyncClosed is checked at
+		// the top of runAsyncHandler's loop between ProcessH1 runs.
+		cs.asyncClosed.Store(true)
 		// Signal the detached goroutine's writeFn to stop writing.
 		// The mutex serializes with any in-progress write — if the
 		// goroutine is mid-write, we block until it finishes.
@@ -1020,14 +1096,19 @@ func (l *Loop) closeConn(fd int) {
 			cs.h1State.PauseRecv = nil
 			cs.h1State.ResumeRecv = nil
 		}
-		if l.detachedCount > 0 {
+		// Only decrement when OnDetach actually fired (WS/SSE detach).
+		// Async-mode HTTP1 conns pre-allocate detachMu without bumping
+		// detachedCount, so decrementing would underflow here.
+		if cs.h1State != nil && cs.h1State.Detached && l.detachedCount > 0 {
 			l.detachedCount--
 		}
 	}
+	// Close H1 state unless a real WS/SSE detach handed ownership to a
+	// middleware goroutine. Async-mode HTTP1 conns have detachMu set
+	// but h1State.Detached is false — we still own H1 state there.
+	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 	l.removeDirty(cs)
-	if !detached {
-		// Only release the H1 stream when NOT detached — the goroutine
-		// still holds a reference through its Context/StreamWriter.
+	if !trulyDetached {
 		if cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
@@ -1048,12 +1129,12 @@ func (l *Loop) closeConn(fd int) {
 		l.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	if !detached {
+	if !trulyDetached {
 		releaseConnState(cs)
 	}
-	// Detached: connState is NOT returned to the pool. The goroutine's
-	// closures still reference it. GC collects it after the goroutine
-	// finishes and all closure references are dropped.
+	// Truly-detached (WS/SSE): connState is NOT returned to the pool.
+	// The goroutine's closures still reference it. GC collects it after
+	// the goroutine finishes and all closure references are dropped.
 }
 
 func (l *Loop) shutdown() {
@@ -1065,6 +1146,7 @@ func (l *Loop) shutdown() {
 		}
 		detached := cs.detachMu != nil
 		if detached {
+			cs.asyncClosed.Store(true)
 			cs.detachMu.Lock()
 			cs.detachClosed = true
 			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
@@ -1073,14 +1155,15 @@ func (l *Loop) shutdown() {
 			}
 			cs.detachMu.Unlock()
 		}
-		if !detached && cs.h1State != nil {
+		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+		if !trulyDetached && cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
 		_ = unix.Close(fd)
-		if !detached {
+		if !trulyDetached {
 			releaseConnState(cs)
 		}
 		l.conns[fd] = nil

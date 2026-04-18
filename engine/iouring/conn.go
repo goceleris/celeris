@@ -27,9 +27,11 @@ const (
 )
 
 // sendCap returns the effective back-pressure limit for cs, accounting
-// for whether the connection is detached.
+// for whether the connection is detached. Async-mode HTTP1 conns set
+// detachMu up front without being truly detached; they keep the H1/H2
+// limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
 func (cs *connState) sendCap() int {
-	if cs.detachMu != nil {
+	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached {
 		return maxSendQueueBytesDetached
 	}
 	return maxSendQueueBytes
@@ -67,6 +69,18 @@ type connState struct {
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (worker-thread only)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
+
+	// Async handler dispatch (Worker.async=true, HTTP1 only):
+	// Incoming recv bytes are appended under asyncInMu by the worker.
+	// A single dispatch goroutine per conn drains asyncInBuf, runs
+	// ProcessH1 under detachMu (serializes with worker-initiated
+	// flushes), then enqueues on detachQueue so the worker submits
+	// SEND SQEs on its own goroutine (SINGLE_ISSUER). Shape matches
+	// engine/epoll's runAsyncHandler and preserves HTTP/1.1 pipelining.
+	asyncInBuf  []byte
+	asyncInMu   sync.Mutex
+	asyncRun    bool
+	asyncClosed atomic.Bool
 }
 
 var connStatePool = sync.Pool{
@@ -78,7 +92,7 @@ var connStatePool = sync.Pool{
 	},
 }
 
-func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
+func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *connState {
 	cs := connStatePool.Get().(*connState)
 	cs.fd = fd
 	cs.ctx = ctx
@@ -90,6 +104,12 @@ func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
 		} else {
 			cs.buf = make([]byte, bufSize)
 		}
+	}
+	// Async handler dispatch: pre-allocate detachMu so the dispatch
+	// goroutine and the worker can serialize writeBuf access without a
+	// later install step. Harmless (nil-free) when unused.
+	if async {
+		cs.detachMu = &sync.Mutex{}
 	}
 	return cs
 }
@@ -117,6 +137,9 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.asyncRun = false
+	cs.asyncClosed.Store(false)
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

@@ -62,6 +62,7 @@ type Worker struct {
 	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
 	sqpoll       bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC       bool // true when SEND_ZC is available (kernel 6.0+)
+	async        bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
@@ -128,6 +129,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		tier:         tier,
 		sqpoll:       tier.SQPollIdle() > 0,
 		sendZC:       tier.SupportsSendZC(),
+		async:        cfg.AsyncHandlers,
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
 		resolved:     resolved,
@@ -620,7 +622,7 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	// plumbing as engine/epoll/loop.go so handlers can pass the affinity
 	// hint to driver pools.
 	connCtx := ctxkit.WithWorkerID(ctx, w.id)
-	cs := acquireConnState(connCtx, newFD, bufSize)
+	cs := acquireConnState(connCtx, newFD, bufSize, w.async)
 	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {
@@ -711,8 +713,15 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
-			mu := &sync.Mutex{}
-			cs.detachMu = mu
+			// Async mode may have already allocated detachMu in
+			// acquireConnState; reuse it so the async goroutine and the
+			// middleware goroutine share one mutex. Otherwise create
+			// a fresh mutex for the WS/SSE detach flow.
+			mu := cs.detachMu
+			if mu == nil {
+				mu = &sync.Mutex{}
+				cs.detachMu = mu
+			}
 			w.detachedCount++
 			orig := cs.writeFn
 			wakeupFD := w.h2EventFD
@@ -920,6 +929,37 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 			return
 		}
+	}
+
+	// Async handler dispatch (Config.AsyncHandlers on HTTP1): hand the
+	// received bytes to a per-conn goroutine and return to the CQE drain
+	// immediately. The goroutine runs ProcessH1 under cs.detachMu and
+	// enqueues on detachQueue so this worker submits SEND SQEs on its
+	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
+	if w.async && cs.protocol == engine.HTTP1 {
+		dataCopy := append([]byte(nil), data...)
+		if hasProvidedBuf {
+			w.bufRing.PushBuffer(providedBufID)
+			w.hasBufReturns = true
+		}
+		cs.asyncInMu.Lock()
+		cs.asyncInBuf = append(cs.asyncInBuf, dataCopy...)
+		starting := !cs.asyncRun
+		if starting {
+			cs.asyncRun = true
+		}
+		cs.asyncInMu.Unlock()
+		if starting {
+			go w.runAsyncHandler(cs)
+		}
+		w.reqBatch++
+		if !cqeHasMore(c.Flags) && !cs.recvPaused {
+			if !w.prepareRecv(fd, cs.buf) {
+				cs.needsRecv = true
+				w.markDirty(cs)
+			}
+		}
+		return
 	}
 
 	var processErr error
@@ -1195,6 +1235,10 @@ func (w *Worker) closeConn(fd int) {
 	}
 	detached := cs.detachMu != nil
 	if detached {
+		// Signal both dispatch goroutine (async handlers) and detached
+		// goroutine (WebSocket/SSE) to stop. asyncClosed is checked at
+		// the top of runAsyncHandler's loop between ProcessH1 runs.
+		cs.asyncClosed.Store(true)
 		// Signal the detached goroutine's writeFn to stop writing.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
@@ -1209,12 +1253,20 @@ func (w *Worker) closeConn(fd int) {
 			cs.h1State.PauseRecv = nil
 			cs.h1State.ResumeRecv = nil
 		}
-		if w.detachedCount > 0 {
+		// Only decrement when OnDetach actually fired (WS/SSE detach).
+		// Async mode pre-allocates detachMu in acquireConnState but does
+		// NOT increment detachedCount, so decrementing here would cause
+		// underflow for plain async-HTTP1 conns.
+		if cs.h1State != nil && cs.h1State.Detached && w.detachedCount > 0 {
 			w.detachedCount--
 		}
 	}
 	w.removeDirty(cs)
-	if !detached {
+	// Close H1 state unless a real WS/SSE detach handed ownership to a
+	// middleware goroutine. Async-mode HTTP1 conns have detachMu set
+	// but h1State.Detached is false — we still own H1 state there.
+	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+	if !trulyDetached {
 		if cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
@@ -1241,10 +1293,13 @@ func (w *Worker) closeConn(fd int) {
 		return
 	}
 
-	if detached {
+	if trulyDetached {
 		// Skip deferred-close and pool return for detached connections.
 		// The goroutine's closures still reference cs; GC collects it
-		// after the goroutine finishes.
+		// after the goroutine finishes. Async-mode conns (detachMu set
+		// but Detached=false) fall through to the normal finishClose —
+		// the dispatch goroutine has already observed asyncClosed and
+		// dropped its cs reference, so the pool return is safe.
 		w.finishCloseDetached(fd, cs)
 		return
 	}
@@ -1341,6 +1396,77 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	if sqe != nil {
 		prepClose(sqe, fd)
 		setSQEUserData(sqe, encodeUserData(udClose, fd))
+	}
+}
+
+// runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
+// Config.AsyncHandlers is enabled. Drains cs.asyncInBuf in a loop: take
+// currently-buffered bytes, run ProcessH1 under cs.detachMu (serializes
+// with worker-initiated writeBuf/sendBuf mutations), enqueue on
+// detachQueue so the worker submits SEND SQEs on its own goroutine
+// (SINGLE_ISSUER — handler Gs cannot call ring.GetSQE directly).
+// Preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
+// request in the slice in order, and responses land on cs.writeBuf in
+// the same order before the flush.
+func (w *Worker) runAsyncHandler(cs *connState) {
+	for {
+		cs.asyncInMu.Lock()
+		if len(cs.asyncInBuf) == 0 {
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
+		data := cs.asyncInBuf
+		cs.asyncInBuf = nil
+		cs.asyncInMu.Unlock()
+
+		if cs.asyncClosed.Load() {
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = nil
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
+
+		cs.detachMu.Lock()
+		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+		hasWrite := len(cs.writeBuf) > 0
+		cs.detachMu.Unlock()
+
+		if processErr != nil {
+			// Mark closing so the worker tears down the conn. We can't
+			// call closeConn here — conns[] / dirty list are worker-local.
+			cs.asyncClosed.Store(true)
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = nil
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			// Wake the worker so it notices asyncClosed and runs closeConn
+			// from its own goroutine via the detachQueue → drain path.
+			w.detachQMu.Lock()
+			w.detachQueue = append(w.detachQueue, cs)
+			w.detachQPending.Store(1)
+			w.detachQMu.Unlock()
+			if w.h2EventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(w.h2EventFD, val[:])
+			}
+			return
+		}
+
+		if hasWrite {
+			// Queue for worker-side SEND submission.
+			w.detachQMu.Lock()
+			w.detachQueue = append(w.detachQueue, cs)
+			w.detachQPending.Store(1)
+			w.detachQMu.Unlock()
+			if w.h2EventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(w.h2EventFD, val[:])
+			}
+		}
 	}
 }
 
@@ -1631,12 +1757,12 @@ func (w *Worker) checkTimeouts() {
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
 		// engine-config-driven timeouts since the middleware owns the
-		// I/O lifecycle.
-		if cs.detachMu != nil {
-			if cs.h1State != nil {
-				if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
-					w.closeConn(fd)
-				}
+		// I/O lifecycle. Async-mode conns set detachMu up front without
+		// a real detach — fall through to the normal timeout scan for
+		// those.
+		if cs.h1State != nil && cs.h1State.Detached {
+			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
+				w.closeConn(fd)
 			}
 			continue
 		}
@@ -1666,6 +1792,7 @@ func (w *Worker) shutdown() {
 		}
 		detached := cs.detachMu != nil
 		if detached {
+			cs.asyncClosed.Store(true)
 			cs.detachMu.Lock()
 			cs.detachClosed = true
 			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
@@ -1674,7 +1801,8 @@ func (w *Worker) shutdown() {
 			}
 			cs.detachMu.Unlock()
 		}
-		if !detached && cs.h1State != nil {
+		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+		if !trulyDetached && cs.h1State != nil {
 			conn.CloseH1(cs.h1State)
 		}
 		if cs.h2State != nil {
@@ -1683,7 +1811,7 @@ func (w *Worker) shutdown() {
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
-		if !detached {
+		if !trulyDetached {
 			releaseConnState(cs)
 		}
 	}
