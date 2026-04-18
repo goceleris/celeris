@@ -82,8 +82,8 @@ type connState struct {
 	// HTTP/1.1 pipelining ordering guarantees.
 	asyncInBuf  []byte
 	asyncInMu   sync.Mutex
-	asyncRun    bool         // true while the dispatch goroutine is alive
-	asyncClosed atomic.Bool  // set by worker's close path; goroutine exits next iter
+	asyncRun    bool        // true while the dispatch goroutine is alive
+	asyncClosed atomic.Bool // set by worker's close path; goroutine exits next iter
 }
 
 var connStatePool = sync.Pool{

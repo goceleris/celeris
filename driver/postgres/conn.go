@@ -481,9 +481,9 @@ type pgConn struct {
 	// on the caller goroutine.
 	useDirect bool
 	tcp       *net.TCPConn
-	tcpFd     int          // cached fd for MSG_DONTWAIT peek (W4); 0 if unavailable
-	directMu  sync.Mutex   // serializes tcp.Write
-	directBuf []byte       // read buffer for driveDirect
+	tcpFd     int        // cached fd for MSG_DONTWAIT peek (W4); 0 if unavailable
+	directMu  sync.Mutex // serializes tcp.Write
+	directBuf []byte     // read buffer for driveDirect
 
 	addr   *net.TCPAddr
 	opts   Options
