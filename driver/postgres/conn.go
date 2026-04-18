@@ -470,6 +470,21 @@ type pgConn struct {
 	closeLoop func()
 	syncBuf   []byte // read buffer for syncLoop.WriteAndPoll
 
+	// Direct mode: used when the caller runs on an unlocked G (standalone
+	// or Config.AsyncHandlers=true). All I/O goes through c.tcp (which is
+	// backed by Go's netpoll) instead of the mini-loop — no LockOSThread'd
+	// worker in the picture, so net.Conn.Read parks the G cleanly without
+	// the futex storm that Gosched would cause on a locked M.
+	//
+	// In direct mode, loop is nil, syncLoop is nil, and every write goes
+	// through writeRaw → tcp.Write; every wait drives tcp.Read → onRecv
+	// on the caller goroutine.
+	useDirect bool
+	tcp       *net.TCPConn
+	tcpFd     int          // cached fd for MSG_DONTWAIT peek (W4); 0 if unavailable
+	directMu  sync.Mutex   // serializes tcp.Write
+	directBuf []byte       // read buffer for driveDirect
+
 	addr   *net.TCPAddr
 	opts   Options
 	dsn    DSN
@@ -554,6 +569,101 @@ func (c *pgConn) buildMessage(fn func(*protocol.Writer) []byte) []byte {
 	c.writerMu.Lock()
 	defer c.writerMu.Unlock()
 	return fn(c.writer)
+}
+
+// writeRaw sends data to the server using whichever transport the conn was
+// opened with. Direct-mode conns bypass the event loop entirely: they dial
+// a *net.TCPConn whose Read/Write go through Go's netpoll. Loop-mode conns
+// hand the bytes to the mini-loop (or the engine's loop for WithEngine,
+// non-async mode).
+func (c *pgConn) writeRaw(data []byte) error {
+	if c.useDirect {
+		c.directMu.Lock()
+		_, err := c.tcp.Write(data)
+		c.directMu.Unlock()
+		return err
+	}
+	return c.loop.Write(c.fd, data)
+}
+
+// driveDirect is the direct-mode equivalent of mini-loop's WriteAndPoll
+// read phase: it spins in a tight tcp.Read → c.onRecv loop on the caller
+// goroutine until the request completes (req.doneAtom != 0) or the ctx
+// is cancelled. The caller must have already issued writeRaw for the
+// request's payload before invoking driveDirect.
+//
+// Concurrency: in direct mode the pool pins a conn to exactly one
+// caller goroutine at a time, so we're the sole reader on c.tcp. That
+// also means c.reader / c.onRecv state mutations are single-threaded
+// (no event-loop goroutine reads here), matching loop mode's invariant
+// that onRecv always runs on exactly one goroutine per conn.
+func (c *pgConn) driveDirect(ctx context.Context, req *pgRequest) error {
+	if c.directBuf == nil {
+		c.directBuf = make([]byte, 16<<10)
+	}
+	for {
+		if req.doneAtom.Load() != 0 {
+			select {
+			case <-req.doneCh:
+			default:
+			}
+			return req.err
+		}
+		if err := ctx.Err(); err != nil {
+			if c.pid != 0 && c.secret != 0 {
+				_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+			}
+			// Bounded wait for the server's Error + RFQ response so we
+			// leave the wire aligned. If the server doesn't drain within
+			// 30s we fail the conn to prevent a stuck reader.
+			deadline := time.Now().Add(30 * time.Second)
+			_ = c.tcp.SetReadDeadline(deadline)
+			for req.doneAtom.Load() == 0 {
+				n, rerr := c.tcp.Read(c.directBuf)
+				if n > 0 {
+					c.onRecv(c.directBuf[:n])
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			_ = c.tcp.SetReadDeadline(time.Time{})
+			return err
+		}
+		if c.tcpFd > 0 {
+			if n, _, perr := syscall.Recvfrom(c.tcpFd, c.directBuf, syscall.MSG_DONTWAIT); n > 0 {
+				c.onRecv(c.directBuf[:n])
+				continue
+			} else if perr != nil && perr != syscall.EAGAIN && perr != syscall.EWOULDBLOCK {
+				if errors.Is(perr, io.EOF) {
+					perr = io.ErrUnexpectedEOF
+				}
+				c.failAll(perr)
+				_ = c.closeDirect()
+				return perr
+			}
+		}
+		n, err := c.tcp.Read(c.directBuf)
+		if n > 0 {
+			c.onRecv(c.directBuf[:n])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			c.failAll(err)
+			_ = c.closeDirect()
+			return err
+		}
+	}
+}
+
+// closeDirect tears down the direct-mode tcp connection exactly once.
+func (c *pgConn) closeDirect() error {
+	if c.tcp == nil {
+		return nil
+	}
+	return c.tcp.Close()
 }
 
 // dialConn dials a TCP connection to the DSN's host:port, sets it non-blocking,
@@ -677,6 +787,64 @@ func resolveAddr(host, port string) (*net.TCPAddr, error) {
 	return net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
 }
 
+// dialDirectConn opens a pgConn that bypasses the event loop entirely.
+// All I/O goes through c.tcp (Go netpoll) on the caller goroutine; there
+// is no worker M holding the conn, no LockOSThread involved, and no
+// syncLoop. Used when the engine is absent (standalone) or when the
+// engine dispatches HTTP handlers asynchronously (handler runs on an
+// unlocked G, so net.Conn.Read parks cleanly without a futex storm).
+func dialDirectConn(ctx context.Context, dsn DSN) (*pgConn, error) {
+	if err := dsn.CheckSSL(); err != nil {
+		return nil, err
+	}
+	addr, err := resolveAddr(dsn.Host, dsn.Port)
+	if err != nil {
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: dsn.Options.ConnectTimeout}
+	raw, err := dialer.DialContext(ctx, "tcp", addr.String())
+	if err != nil {
+		return nil, err
+	}
+	tcp, ok := raw.(*net.TCPConn)
+	if !ok {
+		_ = raw.Close()
+		return nil, fmt.Errorf("celeris-postgres: expected *net.TCPConn, got %T", raw)
+	}
+	_ = tcp.SetNoDelay(true)
+
+	// Cache the raw fd for MSG_DONTWAIT peek (W4). Best-effort: if
+	// SyscallConn fails we just fall through to plain tcp.Read.
+	var rawFd int
+	if sc, scErr := tcp.SyscallConn(); scErr == nil {
+		_ = sc.Control(func(fd uintptr) { rawFd = int(fd) })
+	}
+
+	c := &pgConn{
+		useDirect:    true,
+		tcp:          tcp,
+		tcpFd:        rawFd,
+		addr:         addr,
+		opts:         dsn.Options,
+		dsn:          dsn,
+		reader:       protocol.NewReader(),
+		writer:       protocol.NewWriter(),
+		bridge:       async.NewBridge(),
+		stmtCache:    newLRU(dsn.Options.StatementCacheSize),
+		autoCache:    dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
+		pending:      make([]*pgRequest, 0, 8),
+		createdAt:    time.Now(),
+		serverParams: map[string]string{},
+	}
+	c.lastUsedAt.Store(time.Now().UnixNano())
+
+	if err := c.doStartup(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
 // doStartup performs the full startup handshake synchronously. The event loop
 // delivers bytes to onRecv, which drives the StartupState machine via a
 // dedicated pgRequest of kind reqStartup.
@@ -695,7 +863,7 @@ func (c *pgConn) doStartup(ctx context.Context) error {
 		doneCh:  make(chan struct{}),
 	}
 	c.enqueue(req)
-	if err := c.loop.Write(c.fd, initial); err != nil {
+	if err := c.writeRaw(initial); err != nil {
 		c.failReq(req, err)
 		return err
 	}
@@ -802,6 +970,9 @@ func (c *pgConn) failReq(req *pgRequest, err error) {
 // The atomic check is ~1ns per iteration; 128 iterations is ~0.1µs, which
 // costs nothing but catches the already-done case.
 func (c *pgConn) wait(ctx context.Context, req *pgRequest) error {
+	if c.useDirect {
+		return c.driveDirect(ctx, req)
+	}
 	// Phase 1: tight spin — atomic check only, ~1ns per iteration. Catches
 	// the already-done case (response arrived during the sync poll or write).
 	for range 64 {
@@ -919,7 +1090,7 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			head.doneMu.Unlock()
 		}
 		if resp != nil {
-			if werr := c.loop.Write(c.fd, resp); werr != nil {
+			if werr := c.writeRaw(resp); werr != nil {
 				head.doneMu.Lock()
 				if head.err == nil {
 					head.err = werr
@@ -1281,7 +1452,7 @@ func (c *pgConn) prepareStatement(ctx context.Context, name, query string) (*pro
 		syncB := protocol.WriteSync(w)
 		return joinBytes(parseB, descB, syncB)
 	})
-	if err := c.loop.Write(c.fd, payload); err != nil {
+	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
 		return nil, err
 	}
@@ -1315,7 +1486,7 @@ func (c *pgConn) closePreparedServerAsync(name string) error {
 		syncB := protocol.WriteSync(w)
 		return joinBytes(closeB, syncB)
 	})
-	if err := c.loop.Write(c.fd, payload); err != nil {
+	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
 		return err
 	}
@@ -1459,6 +1630,12 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	// rowCh (~2KB) is NOT allocated — dispatch buffers into req.rows
 	// and only allocates rowCh when the result exceeds streamThreshold.
 	req.colsCh = make(chan struct{})
+	// Direct mode drives onRecv on the caller goroutine; streaming
+	// would deadlock the same way the sync fast path does, so pin
+	// syncMode=true so dispatch never promotes.
+	if c.useDirect {
+		req.syncMode.Store(true)
+	}
 	c.enqueue(req)
 
 	// Sync fast path: write the query and poll for the response on the
@@ -1503,7 +1680,7 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		// Async path: standard event-loop write.
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		err := c.loop.Write(c.fd, payload)
+		err := c.writeRaw(payload)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -1525,6 +1702,22 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 //   - Streaming (colsCh fires first): returns a streamRows reading from rowCh.
 //     colsCh fires when promoteToStreaming allocates rowCh on the Nth DataRow.
 func (c *pgConn) waitForQueryRows(ctx context.Context, req *pgRequest, textFormat bool) (driver.Rows, error) {
+	if c.useDirect {
+		// Direct mode: no event-loop goroutine drives onRecv, so we drive
+		// the read loop here until the request completes. Streaming mode
+		// never activates (req.syncMode prevents promoteToStreaming) —
+		// rows accumulate in req.rows and we return a buffered pgRows.
+		if err := c.driveDirect(ctx, req); err != nil {
+			if len(req.rows) > 0 {
+				c.touch()
+				return acquirePGRows(req.columns, req.rows, textFormat, req, err), nil
+			}
+			releasePgRequest(req)
+			return nil, err
+		}
+		c.touch()
+		return acquirePGRows(req.columns, req.rows, textFormat, req, nil), nil
+	}
 	select {
 	case <-req.colsCh:
 		// Streaming activated — promoteToStreaming allocated rowCh and
@@ -1651,7 +1844,7 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 	// Async path.
 	c.writerMu.Lock()
 	payload := protocol.WriteQueryInto(c.writer, query)
-	err := c.loop.Write(c.fd, payload)
+	err := c.writeRaw(payload)
 	c.writerMu.Unlock()
 	if err != nil {
 		c.failReq(req, err)
@@ -1716,7 +1909,7 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 
 	c.writerMu.Lock()
 	payload := protocol.WriteQueryInto(c.writer, query)
-	err := c.loop.Write(c.fd, payload)
+	err := c.writeRaw(payload)
 	c.writerMu.Unlock()
 	if err != nil {
 		c.failReq(req, err)
@@ -1764,6 +1957,11 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	req.extended.HasDescribe = true
 	// Lazy streaming: allocate only colsCh (cheap). See simpleQuery.
 	req.colsCh = make(chan struct{})
+	// Direct mode drives reads on the caller goroutine; streaming would
+	// deadlock. Pin syncMode=true so dispatch never promotes.
+	if c.useDirect {
+		req.syncMode.Store(true)
+	}
 	c.enqueue(req)
 	resultFormats := []int16{protocol.FormatBinary}
 
@@ -1827,7 +2025,7 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		if skipParse {
 			req.extended.SkipParse = true
 		}
-		if err := c.loop.Write(c.fd, payload); err != nil {
+		if err := c.writeRaw(payload); err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
 			return nil, err
@@ -1919,7 +2117,7 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 			}
 			return joinBytes(bindB, execB, syncB)
 		})
-		if err := c.loop.Write(c.fd, payload); err != nil {
+		if err := c.writeRaw(payload); err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
 			return nil, err
@@ -2016,21 +2214,31 @@ func (c *pgConn) Close() error {
 	var firstErr error
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		if c.loop != nil {
-			termBytes := c.buildMessage(func(w *protocol.Writer) []byte {
-				w.Reset()
-				w.StartMessage(protocol.MsgTerminate)
-				w.FinishMessage()
-				return append([]byte(nil), w.Bytes()...)
-			})
-			if err := c.loop.Write(c.fd, termBytes); err != nil && firstErr == nil {
+		termBytes := c.buildMessage(func(w *protocol.Writer) []byte {
+			w.Reset()
+			w.StartMessage(protocol.MsgTerminate)
+			w.FinishMessage()
+			return append([]byte(nil), w.Bytes()...)
+		})
+		if c.useDirect {
+			if c.tcp != nil {
+				_ = c.tcp.SetWriteDeadline(time.Now().Add(time.Second))
+				if err := c.writeRaw(termBytes); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				if err := c.tcp.Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		} else if c.loop != nil {
+			if err := c.writeRaw(termBytes); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			if err := c.loop.UnregisterConn(c.fd); err != nil && firstErr == nil {
 				firstErr = err
 			}
+			c.closeFDOnce()
 		}
-		c.closeFDOnce()
 		c.failAll(ErrClosed)
 		if c.closeLoop != nil {
 			c.closeLoop()
@@ -2229,6 +2437,9 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	if c.closed.Load() {
 		return 0, ErrClosed
 	}
+	if c.useDirect {
+		return 0, ErrDirectModeUnsupported
+	}
 	if tableName == "" {
 		return 0, errors.New("celeris-postgres: CopyFrom requires a table name")
 	}
@@ -2242,7 +2453,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	}
 	c.enqueue(req)
 	payload := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteQuery(w, query) })
-	if err := c.loop.Write(c.fd, payload); err != nil {
+	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
 		return 0, err
 	}
@@ -2279,7 +2490,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		}
 		rowBuf = encodeTextRow(rowBuf[:0], vals)
 		frame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyData(w, rowBuf) })
-		if werr := c.loop.Write(c.fd, frame); werr != nil {
+		if werr := c.writeRaw(frame); werr != nil {
 			_ = c.sendCopyFail(werr.Error())
 			<-req.doneCh
 			return 0, werr
@@ -2294,7 +2505,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	// End with CopyDone. The server then sends CommandComplete + ReadyForQuery
 	// which closes req.doneCh.
 	doneFrame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyDone(w) })
-	if werr := c.loop.Write(c.fd, doneFrame); werr != nil {
+	if werr := c.writeRaw(doneFrame); werr != nil {
 		<-req.doneCh
 		return 0, werr
 	}
@@ -2310,7 +2521,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 // the caller is already unwinding an error path.
 func (c *pgConn) sendCopyFail(reason string) error {
 	frame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyFail(w, reason) })
-	return c.loop.Write(c.fd, frame)
+	return c.writeRaw(frame)
 }
 
 // copyTo issues COPY (<query>) TO STDOUT and invokes dest for every row.
@@ -2318,6 +2529,9 @@ func (c *pgConn) sendCopyFail(reason string) error {
 func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte) error) error {
 	if c.closed.Load() {
 		return ErrClosed
+	}
+	if c.useDirect {
+		return ErrDirectModeUnsupported
 	}
 	if dest == nil {
 		return errors.New("celeris-postgres: CopyTo requires a non-nil dest")
@@ -2331,7 +2545,7 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 	}
 	c.enqueue(req)
 	payload := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteQuery(w, query) })
-	if err := c.loop.Write(c.fd, payload); err != nil {
+	if err := c.writeRaw(payload); err != nil {
 		c.failReq(req, err)
 		return err
 	}

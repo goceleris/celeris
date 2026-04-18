@@ -121,6 +121,13 @@ type Pool struct {
 // ErrPoolClosed is returned from Pool methods after Close has been called.
 var ErrPoolClosed = errors.New("celeris-postgres: pool is closed")
 
+// ErrDirectModeUnsupported is returned by operations that require the
+// event-loop driven mini-loop (currently: COPY FROM/TO, LISTEN/NOTIFY).
+// Direct-mode conns dial a net.TCPConn and drive reads from the caller
+// goroutine — there is no background reader, so APIs that rely on
+// unsolicited server messages cannot be served.
+var ErrDirectModeUnsupported = errors.New("celeris-postgres: operation unsupported in direct mode (COPY/LISTEN require event-loop driven reads)")
+
 // Open opens a worker-affinity pool. The DSN is parsed once here; connect
 // errors surface on the first Acquire.
 func Open(dsnStr string, opts ...Option) (*Pool, error) {
@@ -206,6 +213,23 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 }
 
 func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
+	// Direct mode when the caller runs on an unlocked G: standalone
+	// (no engine) or WithEngine on an engine that dispatches handlers
+	// async. In both cases net.Conn.Read parks the G through Go's
+	// netpoll — no LockOSThread involvement, so we skip the mini-loop
+	// entirely and keep the dispatch model symmetric with memcached.
+	directMode := !p.hasEngine || p.asyncEngine
+	if directMode {
+		c, err := dialDirectConn(ctx, p.dsn)
+		if err != nil {
+			return nil, err
+		}
+		c.workerID = workerID
+		c.maxLifetime = p.cfg.MaxLifetime
+		c.maxIdleTime = p.cfg.MaxIdleTime
+		return c, nil
+	}
+
 	p.providerMu.RLock()
 	prov := p.provider
 	p.providerMu.RUnlock()
