@@ -59,8 +59,11 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 		close(done)
 	}()
 
-	// Wait until the engine has at least one worker ready.
-	deadline := time.Now().Add(3 * time.Second)
+	// Wait until the engine has at least one worker ready. On shared
+	// CI runners (GitHub Actions Azure VMs) io_uring ring setup can
+	// legitimately take 3-5 seconds when the host is under load;
+	// 15s covers the tail without hiding real failures.
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		e.mu.Lock()
 		n := len(e.workers)
