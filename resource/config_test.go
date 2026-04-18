@@ -315,3 +315,45 @@ func TestValidateNegativePort(t *testing.T) {
 		t.Error("expected port validation error for :-1")
 	}
 }
+
+func TestWithDefaults_EnableH2Upgrade(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       Config
+		wantH2Up bool
+	}{
+		{
+			name:     "default protocol enables upgrade",
+			in:       Config{},
+			wantH2Up: true,
+		},
+		{
+			name:     "explicit Auto enables upgrade",
+			in:       Config{Protocol: engine.Auto},
+			wantH2Up: true,
+		},
+		{
+			name:     "HTTP1 does not get upgrade by default",
+			in:       Config{Protocol: engine.HTTP1},
+			wantH2Up: false,
+		},
+		{
+			name:     "H2C does not get upgrade by default",
+			in:       Config{Protocol: engine.H2C},
+			wantH2Up: false,
+		},
+		{
+			name:     "explicit EnableH2Upgrade true on HTTP1 is preserved",
+			in:       Config{Protocol: engine.HTTP1, EnableH2Upgrade: true},
+			wantH2Up: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.in.WithDefaults()
+			if got.EnableH2Upgrade != tc.wantH2Up {
+				t.Fatalf("EnableH2Upgrade = %v, want %v", got.EnableH2Upgrade, tc.wantH2Up)
+			}
+		})
+	}
+}

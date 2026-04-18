@@ -355,8 +355,7 @@ type h2ResponseAdapter struct {
 	write        func([]byte)
 	outBuf       *bytes.Buffer
 	writer       *frame.Writer
-	encoder      *frame.HeaderEncoder // shared encoder for control frames only
-	writeQueue   *h2ShardedQueue      // async response queue (sharded)
+	writeQueue   *h2ShardedQueue // async response queue (sharded)
 	maxFrameSize uint32
 }
 

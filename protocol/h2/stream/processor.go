@@ -126,18 +126,30 @@ func (p *Processor) FlushInlineCleanup() {
 
 // NewProcessor creates a new stream processor. The conn parameter must
 // implement both ResponseWriter and H2Controller (all H2 engine adapters do).
+// The HPACK decoder is lazily initialized on the first header-block write —
+// on RFC 7540 §3.2 h2c upgrades where stream 1 is injected locally (so no
+// HEADERS frame is ever decoded from the wire) and the connection closes
+// before any subsequent request, this avoids a ~4 KB dynamic-table
+// allocation the decoder would otherwise hold for the connection's life.
 func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
-	p := &Processor{
+	return &Processor{
 		manager:    NewManager(),
 		handler:    handler,
 		writer:     writer,
 		connWriter: conn,
 	}
-	// Set emit function ONCE per connection. The hpackTarget field is updated
-	// before each decode to point at the current pooled slice, eliminating
-	// a closure allocation per HEADERS/CONTINUATION frame.
-	p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
-	return p
+}
+
+// ensureHPACKDecoder initializes p.hpackDecoder on first use. Called from
+// every site that writes into the decoder (all are serialized under
+// H2State.mu, so no atomic dance is needed).
+func (p *Processor) ensureHPACKDecoder() {
+	if p.hpackDecoder == nil {
+		// Set emit function ONCE per connection. The hpackTarget field is
+		// updated before each decode to point at the current pooled slice,
+		// eliminating a closure allocation per HEADERS/CONTINUATION frame.
+		p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
+	}
 }
 
 // hpackEmit is the persistent HPACK emit callback. It appends decoded headers
@@ -291,7 +303,11 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	_ = f.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
 		case http2.SettingHeaderTableSize:
-			// No validation needed
+			// Peer's upper bound on our HPACK encoder dynamic table.
+			// Stash the value so encoders can honor it.
+			p.manager.mu.Lock()
+			p.manager.headerTableSize = s.Val
+			p.manager.mu.Unlock()
 		case http2.SettingEnablePush:
 			if s.Val != 0 && s.Val != 1 {
 				validationErr = fmt.Errorf("SETTINGS_ENABLE_PUSH must be 0 or 1, got %d", s.Val)
@@ -671,6 +687,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackTarget = pooledTrailers
+			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -748,6 +765,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackTarget = pooledHeadersIn
+	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -834,6 +852,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackTarget = pooledTrailers
+			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -877,6 +896,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackTarget = pooledHeadersIn
+	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -1205,6 +1225,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		}()
 		p.hpackTarget = pooledHeadersIn
 
+		p.ensureHPACKDecoder()
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
 			p.continuationState = nil
 			p.continuationActive.Store(false)
@@ -1470,5 +1491,55 @@ func (p *Processor) HandleRawPing(flags byte, payload []byte) error {
 		return err
 	}
 	p.flush()
+	return nil
+}
+
+// InjectStreamHeaders opens a new stream with the given ID, populates it
+// with the provided headers + body (no HPACK round-trip — headers are
+// already decoded), and dispatches the handler. Used by the h2c upgrade
+// path (RFC 7540 §3.2) to replay the original H1 request as stream 1 on
+// the newly-promoted H2 connection.
+//
+// Invariants:
+//   - streamID must not already exist in the manager.
+//   - headers must include all H2 pseudo-headers (:method, :path, :scheme,
+//     :authority); the caller synthesizes these from the H1 request line.
+//   - If endStream=true, body must be the complete request body and the
+//     stream transitions to HalfClosedRemote immediately.
+func (p *Processor) InjectStreamHeaders(streamID uint32, endStream bool, headers [][2]string, body []byte) error {
+	s, ok := p.manager.TryOpenStream(streamID)
+	if !ok {
+		return fmt.Errorf("injectStreamHeaders: could not open stream %d", streamID)
+	}
+	if s.ResponseWriter == nil {
+		s.ResponseWriter = p.connWriter
+	}
+
+	// Detect HEAD (mirrors ProcessRawHeaders behavior).
+	for _, h := range headers {
+		if h[0] == ":method" && h[1] == "HEAD" {
+			s.IsHEAD = true
+			break
+		}
+	}
+	s.AddHeadersBatch(headers)
+	s.ReceivedInitialHeaders = true
+
+	if len(body) > 0 {
+		_, _ = s.GetBuf().Write(body) // bytes.Buffer.Write never returns error
+		s.ReceivedDataLen = len(body)
+	}
+	if endStream {
+		s.EndStream = true
+		s.SetState(StateHalfClosedRemote)
+	}
+
+	// lastClientStream must reflect the injected stream so subsequent
+	// HEADERS validate correctly (odd, strictly increasing).
+	if streamID%2 == 1 && streamID > p.manager.lastClientStream.Load() {
+		p.manager.lastClientStream.Store(streamID)
+	}
+
+	p.runHandler(s)
 	return nil
 }

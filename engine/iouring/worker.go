@@ -17,6 +17,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/protocol/detect"
@@ -96,6 +97,17 @@ type Worker struct {
 	detachQSpare   []*connState
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
 	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
+
+	// EventLoopProvider state. driverConns is keyed by real FD and is
+	// completely disjoint from the HTTP conns array. hasDriverConns is the
+	// zero-cost gate: when false, the HTTP fast path pays no overhead.
+	driverConns         map[int]*driverConn
+	driverMu            sync.RWMutex
+	hasDriverConns      atomic.Bool
+	driverActionQueue   []driverAction
+	driverActionSpare   []driverAction
+	driverActionMu      sync.Mutex
+	driverActionPending atomic.Int32
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -365,6 +377,12 @@ func (w *Worker) run(ctx context.Context) {
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udProvide:
+				case udDriverRecv:
+					w.handleDriverRecv(entry, decodeFD(entry.UserData))
+				case udDriverSend:
+					w.handleDriverSend(entry, decodeFD(entry.UserData))
+				case udDriverClose:
+					w.handleDriverClose(decodeFD(entry.UserData))
 				}
 				cqHead++
 			}
@@ -408,6 +426,12 @@ func (w *Worker) run(ctx context.Context) {
 		// Drain detached goroutine writes. Goroutines append to the queue
 		// instead of calling markDirty directly (dirtyHead is worker-local).
 		w.drainDetachQueue()
+
+		// Apply driver-side actions (RegisterConn / UnregisterConn / Write)
+		// on the worker thread so SQE submission honors single-issuer.
+		if w.hasDriverConns.Load() || w.driverActionPending.Load() != 0 {
+			w.drainDriverActions()
+		}
 
 		// Retry pending sends and dropped recv arms on dirty connections
 		// (SQ ring was full earlier). Typically empty under normal load.
@@ -498,6 +522,12 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udH2Wakeup:
 		w.handleH2Wakeup()
 	case udProvide:
+	case udDriverRecv:
+		w.handleDriverRecv(c, fd)
+	case udDriverSend:
+		w.handleDriverSend(c, fd)
+	case udDriverClose:
+		w.handleDriverClose(fd)
 	}
 }
 
@@ -586,7 +616,11 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	cs := acquireConnState(ctx, newFD, bufSize)
+	// Tag the per-conn context with this worker's numeric ID — same
+	// plumbing as engine/epoll/loop.go so handlers can pass the affinity
+	// hint to driver pools.
+	connCtx := ctxkit.WithWorkerID(ctx, w.id)
+	cs := acquireConnState(connCtx, newFD, bufSize)
 	cs.fixedFile = isFixedFile
 
 	if !isFixedFile {
@@ -674,6 +708,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
+		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
 			mu := &sync.Mutex{}
@@ -763,6 +798,47 @@ func (w *Worker) initProtocol(cs *connState) {
 	}
 }
 
+// switchToH2 promotes an H1 connection to H2 mid-stream (RFC 7540 §3.2).
+// Called after ProcessH1 returns ErrUpgradeH2C. Drops H1 state, builds H2
+// state with the upgrade info pre-applied, and drains any residual bytes
+// (which may contain the H2 client preface + initial SETTINGS) through
+// ProcessH2 synchronously.
+func (w *Worker) switchToH2(cs *connState) error {
+	info := cs.h1State.UpgradeInfo
+	// Build H2 state FIRST. If it fails, cs.h1State remains intact so the
+	// caller's cleanup path (closeConn) can release it properly. Nulling
+	// h1State before the build would leave cs in an inconsistent state
+	// (protocol=HTTP1, h1State=nil, h2State=nil) that panics on any
+	// subsequent op.
+	h2State, err := conn.NewH2StateFromUpgrade(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD, info)
+	if err != nil {
+		// Clear UpgradeInfo so a second dispatch through ProcessH1 can't
+		// re-enter the upgrade path on the already-doomed conn.
+		cs.h1State.UpgradeInfo = nil
+		conn.ReleaseUpgradeInfo(info)
+		return err
+	}
+	// Success: release H1 state now that H2 has taken over.
+	cs.h1State.UpgradeInfo = nil
+	conn.CloseH1(cs.h1State)
+	cs.h1State = nil
+	cs.h2State = h2State
+	cs.h2State.SetRemoteAddr(cs.remoteAddr)
+	cs.protocol = engine.H2C
+	if !w.h2PollArmed && w.h2EventFD >= 0 {
+		w.prepareH2Poll()
+		w.h2PollArmed = true
+	}
+	w.h2Conns = append(w.h2Conns, cs.fd)
+
+	var processErr error
+	if len(info.Remaining) > 0 {
+		processErr = conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+	}
+	conn.ReleaseUpgradeInfo(info)
+	return processErr
+}
+
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	cs := w.conns[fd]
 	if cs == nil || cs.closing {
@@ -850,6 +926,45 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	switch cs.protocol {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+		if errors.Is(processErr, conn.ErrUpgradeH2C) {
+			// H1→H2 upgrade. switchToH2 consumes the upgrade info and
+			// re-arms recv so subsequent data is parsed as H2.
+			if hasProvidedBuf {
+				w.bufRing.PushBuffer(providedBufID)
+				w.hasBufReturns = true
+			}
+			if err := w.switchToH2(cs); err != nil {
+				w.closeConn(fd)
+				return
+			}
+			// Flush the buffered 101 Switching Protocols + H2 server preface
+			// + stream 1 response bytes. Without this explicit flush the
+			// client blocks forever waiting for the 101 (the normal post-
+			// process flush path below is bypassed by this early return).
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
+			if w.bufRing == nil {
+				if w.flushSendLink(cs) {
+					w.markDirty(cs)
+				}
+			} else {
+				if w.flushSend(cs) {
+					w.markDirty(cs)
+				}
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			// Re-arm recv to keep reading H2 frames.
+			if !cqeHasMore(c.Flags) {
+				if !w.prepareRecv(fd, cs.buf) {
+					cs.needsRecv = true
+					w.markDirty(cs)
+				}
+			}
+			return
+		}
 	case engine.H2C:
 		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 	}
@@ -1541,6 +1656,9 @@ func (w *Worker) checkTimeouts() {
 }
 
 func (w *Worker) shutdown() {
+	// Fire onClose for every registered driver conn before tearing down
+	// ring/listen fd. Otherwise driver callbacks are silently dropped.
+	w.shutdownDrivers()
 	for fd := 0; fd <= w.maxFD; fd++ {
 		cs := w.conns[fd]
 		if cs == nil {

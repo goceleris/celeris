@@ -119,6 +119,19 @@ type Config struct {
 
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
+
+	// EnableH2Upgrade controls whether the server honors RFC 7540 §3.2
+	// "HTTP/1.1 Upgrade: h2c" requests, promoting an HTTP/1 connection to
+	// cleartext HTTP/2 on the original request's handler (dispatched on
+	// stream 1). Resolution follows three cases:
+	//   - nil (default): inferred from Protocol — enabled for Auto,
+	//     disabled for H2C (clients already speak H2 directly) and for
+	//     HTTP1 (upgrade is irrelevant, no H2 stack available).
+	//   - non-nil true: force enabled. Useful to opt into upgrade on
+	//     Protocol=H2C for clients that prefer to negotiate.
+	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
+	//     the engine intentionally only serves HTTP/1.
+	EnableH2Upgrade *bool
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
@@ -168,6 +181,15 @@ func (c Config) toResourceConfig() resource.Config {
 	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
+
+	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
+	// HTTP1/H2C → false). Non-nil → user override honored verbatim.
+	if c.EnableH2Upgrade != nil {
+		rc.EnableH2Upgrade = *c.EnableH2Upgrade
+	} else {
+		p := engine.Protocol(c.Protocol)
+		rc.EnableH2Upgrade = p.IsDefault() || p == engine.Auto
+	}
 
 	return rc
 }

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte(">3\r\n$7\r\nmessage\r\n$4\r\nchan\r\n$5\r\nhello\r\n")

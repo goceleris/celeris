@@ -373,6 +373,22 @@ func (s *Server) Addr() net.Addr {
 	return eng.Addr()
 }
 
+// EventLoopProvider returns the engine's event-loop provider, or nil if the
+// engine does not expose one (e.g. the std net/http fallback) or the server
+// has not been started. The returned provider is shared with the HTTP path;
+// drivers register their own file descriptors on it to colocate database or
+// cache I/O on the same worker threads as HTTP requests.
+func (s *Server) EventLoopProvider() engine.EventLoopProvider {
+	eng := s.loadEngine()
+	if eng == nil {
+		return nil
+	}
+	if p, ok := eng.(engine.EventLoopProvider); ok {
+		return p
+	}
+	return nil
+}
+
 // EngineInfo returns information about the running engine, or nil if not started.
 func (s *Server) EngineInfo() *EngineInfo {
 	eng := s.loadEngine()

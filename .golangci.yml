@@ -37,12 +37,43 @@ linters:
           - unparam
       - path: _test\.go
         linters:
+          - prealloc
+      - path: _test\.go
+        linters:
           - revive
         text: "dot-imports"
       - path: _test\.go
         linters:
           - revive
         text: "unused-parameter"
+      - path: _test\.go
+        linters:
+          - revive
+        text: "empty-block"
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: "SA9003"
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: "SA2001"
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: "SA4024"
+      - path: driver/redis/(cluster|sentinel)\.go
+        linters:
+          - revive
+        text: "exported: exported method"
+      - path: driver/redis/errors\.go
+        linters:
+          - revive
+        text: "stutters"
+      - path: driver/memcached/errors\.go
+        linters:
+          - revive
+        text: "stutters"
       - path: middleware/debug/
         linters:
           - revive

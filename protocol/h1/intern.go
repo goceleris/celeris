@@ -176,6 +176,14 @@ func UnsafeLowerHeader(raw []byte) string {
 	return UnsafeString(raw)
 }
 
+// LowerHeaderCopy returns a pre-allocated lowercase string for common HTTP
+// header names, falling back to strings.ToLower(string(raw)) for uncommon
+// names. Unlike UnsafeLowerHeader, the returned string never aliases raw —
+// safe to retain after raw's backing buffer is reused.
+func LowerHeaderCopy(raw []byte) string {
+	return internOrLowerHeader(raw)
+}
+
 // internOrLowerHeader returns a pre-allocated lowercase string for common HTTP
 // header names, avoiding the allocation from strings.ToLower(string(raw)).
 func internOrLowerHeader(raw []byte) string {

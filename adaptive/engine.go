@@ -41,6 +41,16 @@ type Engine struct {
 	// freezeCooldown is the duration to suppress further switches after a switch.
 	// Zero means no cooldown (default).
 	freezeCooldown time.Duration
+
+	// freezeState synchronises the three counters below. The counters are
+	// atomic so read-only checks (performSwitch) stay lock-free, but any
+	// mutation that may flip frozen must hold this mutex to avoid races
+	// where two goroutines observe counters==0 and simultaneously transition
+	// frozen in opposite directions.
+	freezeState    sync.Mutex
+	userFreezes    atomic.Int32  // calls to FreezeSwitching not yet matched by UnfreezeSwitching
+	driverFDs      atomic.Int32  // driver FDs currently registered via the provider
+	switchRejected atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
 }
 
 // New creates a new adaptive engine with epoll as primary and io_uring as secondary.
@@ -160,8 +170,14 @@ func (e *Engine) Listen(ctx context.Context) error {
 	addr := e.primary.Addr()
 	e.addr.Store(&addr)
 
-	// Pause standby engine's accept.
-	if e.ctrl.state.activeIsPrimary {
+	// Pause standby engine's accept. Read c.state.activeIsPrimary under
+	// switchMu to avoid racing with performSwitch → recordSwitch, which
+	// can fire from a concurrent ForceSwitch or controller tick before
+	// Listen finishes its own setup.
+	e.switchMu.Lock()
+	activeIsPrimary := e.ctrl.state.activeIsPrimary
+	e.switchMu.Unlock()
+	if activeIsPrimary {
 		if ac, ok := e.secondary.(engine.AcceptController); ok {
 			_ = ac.PauseAccept()
 		}
@@ -216,6 +232,24 @@ func (e *Engine) runEvalLoop(ctx context.Context) {
 func (e *Engine) performSwitch() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Driver FDs are pinned to whichever sub-engine's worker they were
+	// registered on — they cannot migrate across epoll ↔ io_uring. If any
+	// driver has live FDs we refuse the switch rather than orphan them.
+	// Hold freezeState for the entire swap so a concurrent acquireDriverFD
+	// either (a) observes the old active engine and registers on it before
+	// the swap starts, or (b) waits until after the swap lands and
+	// registers on the new active. There is no interleaving where a driver
+	// registers on the about-to-be-paused engine mid-swap.
+	e.freezeState.Lock()
+	defer e.freezeState.Unlock()
+	if e.driverFDs.Load() > 0 {
+		e.switchRejected.Add(1)
+		e.logger.Warn("refusing engine switch: driver FDs still registered",
+			"driver_fds", e.driverFDs.Load(),
+		)
+		return
+	}
 
 	now := time.Now()
 
@@ -302,13 +336,71 @@ func (e *Engine) Addr() net.Addr {
 }
 
 // FreezeSwitching prevents the controller from switching engines.
+//
+// FreezeSwitching is reference-counted: every call must be matched by a
+// corresponding UnfreezeSwitching. The engine remains frozen until every
+// external freeze has been released AND every driver-registered FD has been
+// unregistered. This makes it safe for benchmarks and drivers to hold
+// independent freezes without clobbering each other.
 func (e *Engine) FreezeSwitching() {
+	e.freezeState.Lock()
+	e.userFreezes.Add(1)
 	e.frozen.Store(true)
+	e.freezeState.Unlock()
 }
 
-// UnfreezeSwitching allows the controller to switch engines again.
+// UnfreezeSwitching releases one external freeze. The engine only becomes
+// thawed when the external freeze count and the driver-FD count both reach
+// zero. Calling UnfreezeSwitching more times than FreezeSwitching is a
+// no-op (and does NOT unfreeze the engine if drivers still hold FDs).
 func (e *Engine) UnfreezeSwitching() {
-	e.frozen.Store(false)
+	e.freezeState.Lock()
+	defer e.freezeState.Unlock()
+	if e.userFreezes.Add(-1) < 0 {
+		e.userFreezes.Store(0)
+		return
+	}
+	if e.userFreezes.Load() == 0 && e.driverFDs.Load() == 0 {
+		e.frozen.Store(false)
+	}
+}
+
+// acquireDriverFD registers that a driver has attached a FD to the adaptive
+// provider. While any driverFDs are live the engine is held frozen — a
+// concurrent FreezeSwitching / UnfreezeSwitching can still run in parallel
+// but the net frozen state only thaws when both counts reach zero.
+func (e *Engine) acquireDriverFD() {
+	e.freezeState.Lock()
+	e.driverFDs.Add(1)
+	e.frozen.Store(true)
+	e.freezeState.Unlock()
+}
+
+// releaseDriverFD decrements the driver FD count. If no external freezes
+// remain either, the engine is thawed.
+func (e *Engine) releaseDriverFD() {
+	e.freezeState.Lock()
+	defer e.freezeState.Unlock()
+	if e.driverFDs.Add(-1) < 0 {
+		e.driverFDs.Store(0)
+		return
+	}
+	if e.userFreezes.Load() == 0 && e.driverFDs.Load() == 0 {
+		e.frozen.Store(false)
+	}
+}
+
+// DriverFDCount reports the number of driver FDs currently registered on
+// either sub-engine. Exposed for tests and observability.
+func (e *Engine) DriverFDCount() int {
+	return int(e.driverFDs.Load())
+}
+
+// SwitchRejectedCount reports how many engine-switch attempts were blocked
+// by outstanding driver FDs since the engine started. Monotonic; useful for
+// tests asserting that a switch actually happened (or did not).
+func (e *Engine) SwitchRejectedCount() uint64 {
+	return e.switchRejected.Load()
 }
 
 // SetFreezeCooldown sets the duration to suppress further switches after a switch.

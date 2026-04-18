@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
+	gorillaws "github.com/gorilla/websocket"
+
 	"github.com/goceleris/celeris"
 	celerisws "github.com/goceleris/celeris/middleware/websocket"
-	gorillaws "github.com/gorilla/websocket"
 )
 
 func startCelerisWS(b *testing.B, handler celerisws.Handler) (string, func()) {
@@ -33,7 +34,9 @@ func startRawWS(b *testing.B, handler func(*gorillaws.Conn)) (string, func()) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		c, err := u.Upgrade(w, r, nil)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		handler(c)
 	})
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
@@ -45,66 +48,120 @@ func startRawWS(b *testing.B, handler func(*gorillaws.Conn)) (string, func()) {
 func dial(b *testing.B, url string) *gorillaws.Conn {
 	b.Helper()
 	c, _, err := gorillaws.DefaultDialer.Dial(url, nil)
-	if err != nil { b.Fatal(err) }
+	if err != nil {
+		b.Fatal(err)
+	}
 	return c
 }
 
 func BenchmarkWSUpgrade_Celeris(b *testing.B) {
 	url, shutdown := startCelerisWS(b, func(c *celerisws.Conn) {})
 	defer shutdown()
-	b.ReportAllocs(); b.ResetTimer()
-	for b.Loop() { c := dial(b, url); c.Close() }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		c := dial(b, url)
+		c.Close()
+	}
 }
 
 func BenchmarkWSUpgrade_RawGorilla(b *testing.B) {
 	url, shutdown := startRawWS(b, func(c *gorillaws.Conn) { c.Close() })
 	defer shutdown()
-	b.ReportAllocs(); b.ResetTimer()
-	for b.Loop() { c := dial(b, url); c.Close() }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		c := dial(b, url)
+		c.Close()
+	}
 }
 
 func BenchmarkWSEcho_Celeris(b *testing.B) {
 	url, shutdown := startCelerisWS(b, func(c *celerisws.Conn) {
-		for { mt, msg, err := c.ReadMessage(); if err != nil { return }; c.WriteMessage(mt, msg) }
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			c.WriteMessage(mt, msg)
+		}
 	})
 	defer shutdown()
-	conn := dial(b, url); defer conn.Close()
+	conn := dial(b, url)
+	defer conn.Close()
 	p := []byte("hello websocket bench!")
-	b.ReportAllocs(); b.ResetTimer()
-	for b.Loop() { conn.WriteMessage(gorillaws.TextMessage, p); conn.ReadMessage() }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		conn.WriteMessage(gorillaws.TextMessage, p)
+		conn.ReadMessage()
+	}
 }
 
 func BenchmarkWSEcho_RawGorilla(b *testing.B) {
 	url, shutdown := startRawWS(b, func(c *gorillaws.Conn) {
 		defer c.Close()
-		for { mt, msg, err := c.ReadMessage(); if err != nil { return }; c.WriteMessage(mt, msg) }
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			c.WriteMessage(mt, msg)
+		}
 	})
 	defer shutdown()
-	conn := dial(b, url); defer conn.Close()
+	conn := dial(b, url)
+	defer conn.Close()
 	p := []byte("hello websocket bench!")
-	b.ReportAllocs(); b.ResetTimer()
-	for b.Loop() { conn.WriteMessage(gorillaws.TextMessage, p); conn.ReadMessage() }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		conn.WriteMessage(gorillaws.TextMessage, p)
+		conn.ReadMessage()
+	}
 }
 
 func BenchmarkWSEchoLarge_Celeris(b *testing.B) {
 	url, shutdown := startCelerisWS(b, func(c *celerisws.Conn) {
-		for { mt, msg, err := c.ReadMessage(); if err != nil { return }; c.WriteMessage(mt, msg) }
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			c.WriteMessage(mt, msg)
+		}
 	})
 	defer shutdown()
-	conn := dial(b, url); defer conn.Close()
+	conn := dial(b, url)
+	defer conn.Close()
 	p := make([]byte, 65536)
-	b.ReportAllocs(); b.ResetTimer()
-	for b.Loop() { conn.WriteMessage(gorillaws.BinaryMessage, p); conn.ReadMessage() }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		conn.WriteMessage(gorillaws.BinaryMessage, p)
+		conn.ReadMessage()
+	}
 }
 
 func BenchmarkWSEchoLarge_RawGorilla(b *testing.B) {
 	url, shutdown := startRawWS(b, func(c *gorillaws.Conn) {
 		defer c.Close()
-		for { mt, msg, err := c.ReadMessage(); if err != nil { return }; c.WriteMessage(mt, msg) }
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			c.WriteMessage(mt, msg)
+		}
 	})
 	defer shutdown()
-	conn := dial(b, url); defer conn.Close()
+	conn := dial(b, url)
+	defer conn.Close()
 	p := make([]byte, 65536)
-	b.ReportAllocs(); b.ResetTimer()
-	for b.Loop() { conn.WriteMessage(gorillaws.BinaryMessage, p); conn.ReadMessage() }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		conn.WriteMessage(gorillaws.BinaryMessage, p)
+		conn.ReadMessage()
+	}
 }
