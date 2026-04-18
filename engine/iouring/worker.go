@@ -1293,13 +1293,11 @@ func (w *Worker) closeConn(fd int) {
 		return
 	}
 
-	if trulyDetached {
-		// Skip deferred-close and pool return for detached connections.
-		// The goroutine's closures still reference cs; GC collects it
-		// after the goroutine finishes. Async-mode conns (detachMu set
-		// but Detached=false) fall through to the normal finishClose —
-		// the dispatch goroutine has already observed asyncClosed and
-		// dropped its cs reference, so the pool return is safe.
+	if detached {
+		// Skip deferred-close and pool return while any goroutine holds
+		// closure references to cs (WS/SSE detach or async dispatch).
+		// GC collects cs once the goroutine finishes and all closure
+		// references are dropped.
 		w.finishCloseDetached(fd, cs)
 		return
 	}
@@ -1811,7 +1809,7 @@ func (w *Worker) shutdown() {
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
-		if !trulyDetached {
+		if !detached {
 			releaseConnState(cs)
 		}
 	}

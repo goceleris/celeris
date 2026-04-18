@@ -1129,12 +1129,12 @@ func (l *Loop) closeConn(fd int) {
 		l.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	if !trulyDetached {
+	// Never release the connState while a goroutine may still hold a
+	// reference (WS/SSE detach OR async dispatch). GC collects cs once
+	// the goroutine finishes and all closure references are dropped.
+	if !detached {
 		releaseConnState(cs)
 	}
-	// Truly-detached (WS/SSE): connState is NOT returned to the pool.
-	// The goroutine's closures still reference it. GC collects it after
-	// the goroutine finishes and all closure references are dropped.
 }
 
 func (l *Loop) shutdown() {
@@ -1163,7 +1163,7 @@ func (l *Loop) shutdown() {
 			conn.CloseH2(cs.h2State)
 		}
 		_ = unix.Close(fd)
-		if !trulyDetached {
+		if !detached {
 			releaseConnState(cs)
 		}
 		l.conns[fd] = nil
