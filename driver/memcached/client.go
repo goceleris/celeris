@@ -3,6 +3,7 @@ package memcached
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 
 	"github.com/goceleris/celeris/driver/internal/async"
@@ -41,20 +42,15 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	if cfg.Addr == "" {
 		return nil, errors.New("celeris/memcached: empty address")
 	}
-	if cfg.Engine == nil {
-		// Standalone: no mini-loop. Each conn does direct net.TCPConn
-		// I/O on the caller goroutine; Go's netpoll parks the handler
-		// G on EPOLLIN transparently. Measured +17–21% vs the
-		// mini-loop path for foreign HTTP hosts (matrix 13).
+	// Experimental: always direct when CELERIS_MC_FORCE_DIRECT=1. Used
+	// to validate async-handler-dispatch + direct-conn combination on
+	// the celeris HTTP engine path. When the handler runs on a spawned
+	// (unlocked) goroutine, direct net.Conn.Read uses Go's netpoll
+	// which parks the G efficiently without blocking the M.
+	if cfg.Engine == nil || os.Getenv("CELERIS_MC_FORCE_DIRECT") == "1" {
 		pool := newDirectPool(cfg)
 		return &Client{cfg: cfg, pool: pool}, nil
 	}
-	// Engine-integrated: use the mini-loop sync path (WriteAndPollBusy)
-	// so DB I/O colocates with the celeris HTTP engine's worker. Direct
-	// net.Conn.Read on a LockOSThread'd engine worker goroutine would
-	// park the locked M via netpoll, triggering a stoplockedm+startlockedm
-	// futex pair per request — the same pathology WriteAndPollBusy was
-	// introduced to avoid.
 	provider, err := eventloop.Resolve(cfg.Engine)
 	if err != nil {
 		return nil, err

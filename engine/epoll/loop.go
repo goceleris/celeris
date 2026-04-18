@@ -35,6 +35,14 @@ const connTableSize = 65536
 // connection cleanly (read returns 0 bytes / EOF).
 var errPeerClosed = errors.New("celeris: peer closed connection")
 
+// asyncHandlers is an experimental flag that dispatches the HTTP handler to
+// a goroutine per connection instead of running it inline on the (locked)
+// worker goroutine. Enabled via CELERIS_ASYNC_HANDLERS=1. Intended to
+// validate whether off-worker handler execution closes the integration
+// tax observed with blocking DB drivers (handler blocking worker → worker
+// can't service other FDs → throughput limited by NumWorkers).
+var asyncHandlers = os.Getenv("CELERIS_ASYNC_HANDLERS") == "1"
+
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id           int
@@ -506,6 +514,34 @@ func (l *Loop) drainRead(fd int, now int64) {
 		}
 
 		writeFn := cs.writeFn
+
+		// Experimental: dispatch handler to a goroutine. The handler holds
+		// cs.detachMu while running so writeBuf and writeFn access is
+		// serialized. Worker continues to epoll_wait immediately, so other
+		// FDs on this worker aren't starved while this handler blocks on
+		// DB I/O. Enabled via CELERIS_ASYNC_HANDLERS=1.
+		if asyncHandlers && cs.protocol == engine.HTTP1 {
+			dataCopy := append([]byte(nil), data...)
+			fdCopy := fd
+			go func(cs *connState) {
+				cs.detachMu.Lock()
+				defer cs.detachMu.Unlock()
+				processErr := conn.ProcessH1(cs.ctx, dataCopy, cs.h1State, l.handler, writeFn)
+				if processErr != nil {
+					// Best-effort close. Skipping l.closeConn (which isn't
+					// thread-safe on the conn table) — the kernel will
+					// surface EOF on next epoll iteration and the worker
+					// will run the full close path then.
+					_ = unix.Close(fdCopy)
+					return
+				}
+				// Flush response inline.
+				if cs.writePos < len(cs.writeBuf) {
+					_ = flushWrites(cs)
+				}
+			}(cs)
+			continue
+		}
 
 		var processErr error
 		switch cs.protocol {
