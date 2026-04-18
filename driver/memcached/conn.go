@@ -666,7 +666,7 @@ func (c *memcachedConn) execTextDirect(ctx context.Context, req *mcRequest, enco
 
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.tcp.SetDeadline(dl)
-		defer c.tcp.SetDeadline(time.Time{})
+		defer func() { _ = c.tcp.SetDeadline(time.Time{}) }()
 	}
 
 	if _, err := c.tcp.Write(buf); err != nil {
@@ -701,7 +701,7 @@ func (c *memcachedConn) execBinaryDirect(ctx context.Context, req *mcRequest, en
 
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.tcp.SetDeadline(dl)
-		defer c.tcp.SetDeadline(time.Time{})
+		defer func() { _ = c.tcp.SetDeadline(time.Time{}) }()
 	}
 
 	if _, err := c.tcp.Write(buf); err != nil {
@@ -737,7 +737,7 @@ func (c *memcachedConn) execBinaryMultiDirect(ctx context.Context, req *mcReques
 
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.tcp.SetDeadline(dl)
-		defer c.tcp.SetDeadline(time.Time{})
+		defer func() { _ = c.tcp.SetDeadline(time.Time{}) }()
 	}
 
 	if _, err := c.tcp.Write(buf); err != nil {

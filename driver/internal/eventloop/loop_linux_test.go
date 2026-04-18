@@ -266,14 +266,26 @@ func TestWriteAndPollSyncPath(t *testing.T) {
 		t.Fatalf("worker %T does not implement SyncRoundTripper", w)
 	}
 
-	// Write the response on the peer side before calling WriteAndPoll so
-	// the data is already in the kernel buffer by the time Phase A's
-	// single non-blocking read runs. Using a 50µs sleep + goroutine here
-	// is flaky on loaded CI: the goroutine may not be scheduled before
-	// Phase C's poll(1ms) times out, producing "ok=false; sync fast path
-	// not engaged" even though the code is correct.
+	// Stage the response on the peer side BEFORE calling WriteAndPoll, and
+	// verify the kernel has delivered it to our end of the socketpair
+	// before issuing the request. The earlier "50µs sleep + goroutine"
+	// shape was flaky on loaded CI runners — the goroutine wouldn't get
+	// scheduled before Phase C's poll(1ms) timed out.
 	if _, werr := unix.Write(b, []byte("pong")); werr != nil {
 		t.Fatalf("peer write: %v", werr)
+	}
+	// Wait for the write to propagate to our end. On -race builds with
+	// high scheduler jitter the write buffer can take a scheduler tick
+	// to flip visible; poll() with a 50ms ceiling is a deterministic
+	// hand-off signal that doesn't depend on timer resolution.
+	var waitPfd [1]unix.PollFd
+	waitPfd[0].Fd = int32(a)
+	waitPfd[0].Events = unix.POLLIN
+	if _, perr := unix.Poll(waitPfd[:], 50); perr != nil {
+		t.Fatalf("poll for peer write: %v", perr)
+	}
+	if waitPfd[0].Revents&unix.POLLIN == 0 {
+		t.Fatal("peer write did not become readable within 50ms")
 	}
 
 	var got []byte
