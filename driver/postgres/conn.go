@@ -1568,7 +1568,9 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if c.autoCache && isCacheableQuery(query) {
 		if stmt, ok := c.stmtCache.get(query); ok {
-			return c.doExtendedQuery(ctx, stmt.Name, query, args)
+			// Cached: skip the server-side Describe round-trip; we
+			// already know the row description from the initial prep.
+			return c.doExtendedQuery(ctx, stmt.Name, query, args, stmt.Columns)
 		}
 		// Cache miss with autoCache on — prepare + cache + execute.
 		name := c.mintStmtName()
@@ -1578,7 +1580,7 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 			for _, ev := range evicted {
 				c.dropPreparedAsync(ev)
 			}
-			return c.doExtendedQuery(ctx, name, query, args)
+			return c.doExtendedQuery(ctx, name, query, args, prep.Columns)
 		}
 		// Prepare failed — fall through to the legacy path.
 	}
@@ -1979,7 +1981,7 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 // a Parse for an already-server-known name is still valid (PG accepts
 // re-Parse of the same query with the same OIDs).
 func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue) (driver.Rows, error) {
-	rows, err := c.doExtendedQuery(ctx, stmtName, query, args)
+	rows, err := c.doExtendedQuery(ctx, stmtName, query, args, nil)
 	if stmtName != "" && isPreparedStatementNotFound(err) {
 		c.stmtCache.remove(query)
 		prep, prepErr := c.prepareStatement(ctx, stmtName, query)
@@ -1987,12 +1989,12 @@ func (c *pgConn) extendedQuery(ctx context.Context, stmtName, query string, args
 			return nil, prepErr
 		}
 		c.stmtCache.put(query, prep)
-		rows, err = c.doExtendedQuery(ctx, stmtName, query, args)
+		rows, err = c.doExtendedQuery(ctx, stmtName, query, args, prep.Columns)
 	}
 	return rows, err
 }
 
-func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, args []driver.NamedValue, cachedCols []protocol.ColumnDesc) (driver.Rows, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -2003,7 +2005,28 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqExtended
-	req.extended.HasDescribe = true
+	// When the caller has cached column descriptions (auto-prepare or
+	// explicit cache), we pre-populate them and drop the server-side
+	// Describe round trip. Saves one message per query (~7 bytes of
+	// wire and one protocol-state transition) — measured +3-5% RPS
+	// on the MSR1 PG cell.
+	hasDescribe := len(cachedCols) == 0
+	req.extended.HasDescribe = hasDescribe
+	if !hasDescribe {
+		// Prepare-time Describe returns FormatCode=0 (text) because
+		// Postgres doesn't decide the output encoding until Execute,
+		// which carries the resultFormats vector. We pass
+		// [FormatBinary] below, so reflect that on the cached column
+		// slice to keep decode on the binary path. Use a shallow copy
+		// so the cached slice in stmtCache isn't mutated.
+		cols := make([]protocol.ColumnDesc, len(cachedCols))
+		copy(cols, cachedCols)
+		for i := range cols {
+			cols[i].FormatCode = protocol.FormatBinary
+		}
+		req.columns = cols
+		req.extended.Columns = cols
+	}
 	// Lazy streaming: allocate only colsCh (cheap). See simpleQuery.
 	req.colsCh = make(chan struct{})
 	// Direct mode drives reads on the caller goroutine; streaming would
@@ -2025,7 +2048,9 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 			req.extended.SkipParse = true
 		}
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
-		protocol.AppendDescribe(c.writer, 'P', "")
+		if hasDescribe {
+			protocol.AppendDescribe(c.writer, 'P', "")
+		}
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
 		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecv)
@@ -2062,14 +2087,23 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 				parseB = protocol.WriteParse(w, "", query, nil)
 			}
 			bindB := protocol.WriteBind(w, "", stmtName, formats, values, resultFormats)
-			descB := protocol.WriteDescribe(w, 'P', "")
+			var descB []byte
+			if hasDescribe {
+				descB = protocol.WriteDescribe(w, 'P', "")
+			}
 			execB := protocol.WriteExecute(w, "", 0)
 			syncB := protocol.WriteSync(w)
 			if parseB != nil {
-				return joinBytes(parseB, bindB, descB, execB, syncB)
+				if descB != nil {
+					return joinBytes(parseB, bindB, descB, execB, syncB)
+				}
+				return joinBytes(parseB, bindB, execB, syncB)
 			}
 			skipParse = true
-			return joinBytes(bindB, descB, execB, syncB)
+			if descB != nil {
+				return joinBytes(bindB, descB, execB, syncB)
+			}
+			return joinBytes(bindB, execB, syncB)
 		})
 		if skipParse {
 			req.extended.SkipParse = true
