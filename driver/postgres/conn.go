@@ -666,6 +666,55 @@ func (c *pgConn) closeDirect() error {
 	return c.tcp.Close()
 }
 
+// startDirectReader spawns a goroutine that pumps tcp.Read → onRecv for
+// operations that need async server message delivery (COPY FROM/TO,
+// potentially LISTEN). Direct-mode conns have no event-loop goroutine
+// driving onRecv, so these flows would otherwise block on copyReady /
+// doneCh forever. The returned stop func halts the reader and restores
+// the connection's read deadline; callers must defer it.
+//
+// The reader uses a short read deadline (50ms) to periodically check
+// the stop signal — this avoids needing a separate wakeup path while
+// keeping worst-case shutdown latency bounded.
+func (c *pgConn) startDirectReader() func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 16<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = c.tcp.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			n, err := c.tcp.Read(buf)
+			if n > 0 {
+				c.onRecv(buf[:n])
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				if errors.Is(err, io.EOF) {
+					err = io.ErrUnexpectedEOF
+				}
+				c.failAll(err)
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		// Unstick any pending tcp.Read by setting the deadline to now,
+		// then wait for the goroutine to observe stop and exit.
+		_ = c.tcp.SetReadDeadline(time.Now())
+		<-done
+		_ = c.tcp.SetReadDeadline(time.Time{})
+	}
+}
+
 // dialConn dials a TCP connection to the DSN's host:port, sets it non-blocking,
 // and registers it with the given event loop. The returned pgConn is fully
 // initialized (including startup) and ready for queries.
@@ -2437,11 +2486,18 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	if c.closed.Load() {
 		return 0, ErrClosed
 	}
-	if c.useDirect {
-		return 0, ErrDirectModeUnsupported
-	}
 	if tableName == "" {
 		return 0, errors.New("celeris-postgres: CopyFrom requires a table name")
+	}
+	if c.useDirect {
+		// Direct mode has no event-loop goroutine driving onRecv for us.
+		// Spawn a short-lived reader that pumps tcp.Read -> onRecv for
+		// the lifetime of this copy. copyReady/doneCh fire from the
+		// reader's onRecv calls; the caller goroutine remains the sole
+		// writer of CopyData frames (tcp.Write is safe alongside
+		// concurrent tcp.Read on a different goroutine).
+		stop := c.startDirectReader()
+		defer stop()
 	}
 	query := buildCopyFromQuery(tableName, columns)
 	req := &pgRequest{
@@ -2509,8 +2565,22 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 		<-req.doneCh
 		return 0, werr
 	}
-	if err := c.wait(ctx, req); err != nil {
-		return 0, err
+	if c.useDirect {
+		// Direct mode: the background reader goroutine drives onRecv
+		// which fires doneCh. c.wait would spawn a second tcp reader —
+		// bad. Just wait on the channel directly.
+		select {
+		case <-req.doneCh:
+			if req.err != nil {
+				return 0, req.err
+			}
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	} else {
+		if err := c.wait(ctx, req); err != nil {
+			return 0, err
+		}
 	}
 	c.touch()
 	n, _ := protocol.RowsAffected(req.tag)
@@ -2530,11 +2600,12 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	if c.useDirect {
-		return ErrDirectModeUnsupported
-	}
 	if dest == nil {
 		return errors.New("celeris-postgres: CopyTo requires a non-nil dest")
+	}
+	if c.useDirect {
+		stop := c.startDirectReader()
+		defer stop()
 	}
 	req := &pgRequest{
 		ctx:       ctx,
@@ -2549,8 +2620,19 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 		c.failReq(req, err)
 		return err
 	}
-	if err := c.wait(ctx, req); err != nil {
-		return err
+	if c.useDirect {
+		select {
+		case <-req.doneCh:
+			if req.err != nil {
+				return req.err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	} else {
+		if err := c.wait(ctx, req); err != nil {
+			return err
+		}
 	}
 	c.touch()
 	return nil
