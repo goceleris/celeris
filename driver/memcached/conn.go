@@ -63,7 +63,7 @@ type memcachedConn struct {
 
 	// Direct-mode fields.
 	tcp *net.TCPConn
-	// tcpFd caches the raw fd for MSG_DONTWAIT peeks (W4). Pre-netpoll
+	// tcpFd caches the raw fd for MSG_DONTWAIT peeks. Pre-netpoll
 	// peek catches loopback-fast responses without the G-park wakeup;
 	// zero when SyscallConn failed.
 	tcpFd int

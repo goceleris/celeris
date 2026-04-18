@@ -854,12 +854,13 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
-// Config.AsyncHandlers is enabled. It drains cs.asyncInBuf in a loop:
-// take the currently-buffered bytes, run ProcessH1 under detachMu (so
-// write paths serialize with worker-initiated flushes), flush the
-// response, repeat until the buffer is empty. When empty, clear
-// cs.asyncRun under the same mutex that gates spawn decisions, then
-// exit — the next worker append will spawn a fresh goroutine.
+// Config.AsyncHandlers is enabled. It takes the currently-buffered
+// bytes via a double-buffer swap, runs ProcessH1 under detachMu (so
+// write paths serialize with worker-initiated flushes), flushes the
+// response, and parks on asyncCond.Wait when the buffer is empty —
+// keeping the goroutine alive across keep-alive requests. The worker
+// calls asyncCond.Signal after each append, and asyncCond.Broadcast
+// in closeConn so the parked goroutine exits cleanly.
 //
 // This preserves HTTP/1.1 pipelining order guarantees: a pipelined
 // burst arrives in one worker read, ProcessH1's offset loop drains
