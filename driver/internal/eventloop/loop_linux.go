@@ -544,7 +544,7 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)
 		pfd[0].Events = unix.POLLIN
-		for range 32 {
+		for range 16 {
 			pfd[0].Revents = 0
 			np, perr := unix.Poll(pfd[:], 0)
 			if np > 0 && perr == nil && pfd[0].Revents&unix.POLLIN != 0 {
