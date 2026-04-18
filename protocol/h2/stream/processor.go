@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -90,7 +91,24 @@ type Processor struct {
 	InlineWriter         h2Conn    // direct-to-outBuf writer for inline handlers (set by conn layer)
 	InlineCount          uint64    // number of requests handled inline (for metrics)
 	MaxRequestBodySize   int64     // 0 = use default (100 MB)
+
+	// CVE-2023-44487 "HTTP/2 Rapid Reset" mitigation. Track RST_STREAM
+	// rate per connection; if a peer exceeds the threshold we emit
+	// GOAWAY(ENHANCE_YOUR_CALM). Window is a sliding per-second bucket:
+	// simple, cheap, and enough to shut down a flood loop.
+	rstCount     uint32 // RST_STREAM count within the current second
+	rstWindowSec int64  // unix-second marker for the current window
 }
+
+// rstRateLimit and rstBurstLimit bound RST_STREAM arrivals. An honest
+// client resets at most a handful of streams per second (client abort
+// of a pipelined request, EARLY_HINTS race, etc.). 100 resets per
+// second is well above any legitimate pattern we've observed and well
+// below the thousands-per-second required to amplify the CVE attack.
+const (
+	rstRateLimitPerSec = 100
+	rstBurstMax        = 200
+)
 
 func (p *Processor) maxBodySize() int64 {
 	return p.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
@@ -1106,8 +1124,25 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	return nil
 }
 
-// handleRSTStream processes RST_STREAM frames.
+// handleRSTStream processes RST_STREAM frames. Enforces a rate limit
+// to mitigate CVE-2023-44487 "Rapid Reset" — a client that opens and
+// RST_STREAMs a stream in a tight loop consumes per-stream resources
+// (HPACK state, priority tree, handler dispatch) without paying the
+// usual connection-level flow-control cost.
 func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
+	// Sliding one-second window counter.
+	nowSec := time.Now().Unix()
+	if nowSec != p.rstWindowSec {
+		p.rstWindowSec = nowSec
+		p.rstCount = 0
+	}
+	p.rstCount++
+	if p.rstCount > rstBurstMax {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm,
+			[]byte("RST_STREAM flood"),
+			fmt.Errorf("RST_STREAM rate exceeded %d/s (burst %d)", rstRateLimitPerSec, rstBurstMax))
+	}
+
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
 		if f.StreamID <= p.manager.GetLastClientStreamID() {

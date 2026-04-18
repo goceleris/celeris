@@ -1,7 +1,22 @@
 package h1
 
 // MaxHeaderSize is the maximum allowed size of HTTP headers in bytes.
-const MaxHeaderSize = 16 << 20 // 16MB
+// 64 KiB matches nginx's large_client_header_buffers ceiling and is
+// two orders of magnitude below the previous 16 MiB which was a
+// slow-loris amplifier. Legitimate request headers are always well
+// under a few KiB; 64 KiB accommodates edge cases like verbose proxy
+// chains without exposing the server to per-connection memory
+// exhaustion.
+const MaxHeaderSize = 64 << 10
+
+// MaxHeaderCount caps the number of header fields in a single
+// request. Prevents an attacker from sending thousands of tiny
+// headers that stay under the MaxHeaderSize byte limit while
+// still triggering O(n) slice growth and scan work. 200 sits
+// above typical nginx/apache defaults (100 for client headers,
+// but verbose proxy chains can add more) and well below the
+// thousands-per-request attack threshold.
+const MaxHeaderCount = 200
 
 // Request holds the parsed components of an HTTP/1.x request.
 type Request struct {

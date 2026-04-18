@@ -64,6 +64,12 @@ type Worker struct {
 	sqpoll       bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC       bool // true when SEND_ZC is available (kernel 6.0+)
 	async        bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+
+	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
+	// can Wait on them before returning. See engine/epoll/loop.go
+	// for rationale — keeps dispatch Gs from touching connState
+	// memory after the engine claims to have stopped.
+	asyncWG sync.WaitGroup
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
@@ -966,6 +972,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.hasBufReturns = true
 		}
 		if starting {
+			w.asyncWG.Add(1)
 			go w.runAsyncHandler(cs)
 		} else {
 			cs.asyncCond.Signal()
@@ -1427,6 +1434,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // request in the slice in order, and responses land on cs.writeBuf in
 // the same order before the flush.
 func (w *Worker) runAsyncHandler(cs *connState) {
+	defer w.asyncWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			if w.logger != nil {
@@ -1589,6 +1597,15 @@ func (w *Worker) drainDetachQueue() {
 	w.detachQMu.Unlock()
 	for _, cs := range w.detachQSpare {
 		if cs.detachClosed {
+			continue
+		}
+		// If the dispatch goroutine enqueued this conn because it
+		// observed an error or recovered from a panic, it also set
+		// asyncClosed. We're on the worker goroutine here — this is
+		// where the conn-table teardown has to happen (dispatch
+		// goroutine can't touch w.conns or the dirty list safely).
+		if cs.asyncClosed.Load() {
+			w.closeConn(cs.fd)
 			continue
 		}
 		// Apply pending pause/resume request from the WS middleware.
@@ -1869,6 +1886,10 @@ func (w *Worker) shutdown() {
 	if w.ring != nil {
 		_ = w.ring.Close()
 	}
+	// Join dispatch goroutines; they've been signaled via
+	// asyncClosed + Broadcast above. Prevents stale-memory races
+	// after the engine claims to have stopped.
+	w.asyncWG.Wait()
 }
 
 // drainRecvBuffer reads and discards any data in the socket receive buffer.

@@ -2092,7 +2092,13 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	// Describe round trip. Saves one message per query (~7 bytes of
 	// wire and one protocol-state transition) — measured +3-5% RPS
 	// on the MSR1 PG cell.
-	hasDescribe := len(cachedCols) == 0
+	//
+	// Intentional check: cachedCols == nil (not len==0). A prepared
+	// statement that genuinely returns zero columns (e.g. VALUES ()
+	// or a no-projection query) has a non-nil but zero-length slice;
+	// treating it as "no cache" would defeat the optimization and
+	// send a redundant Describe for every call.
+	hasDescribe := cachedCols == nil
 	req.extended.HasDescribe = hasDescribe
 	if !hasDescribe {
 		// Prepare-time Describe returns FormatCode=0 (text) because

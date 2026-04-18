@@ -82,6 +82,13 @@ type Loop struct {
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
 	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
 
+	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
+	// can Wait on them before returning. Without this the engine's
+	// top-level wg.Wait joins only the worker/Listen goroutines, and
+	// dispatch Gs can still be in ProcessH1 against released state
+	// when shutdown returns.
+	asyncWG sync.WaitGroup
+
 	// Driver integration (EventLoopProvider). The hasDriverConns gate is the
 	// ONLY check the HTTP hot path pays when no drivers are registered; it
 	// must stay an atomic.Bool load, not a map read.
@@ -561,6 +568,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			}
 			cs.asyncInMu.Unlock()
 			if starting {
+				l.asyncWG.Add(1)
 				go l.runAsyncHandler(cs)
 			} else {
 				// Goroutine is parked in asyncCond.Wait — wake it.
@@ -877,6 +885,7 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 // same order on cs.writeBuf before the flush. The "one goroutine at a
 // time per conn" invariant is enforced by cs.asyncRun.
 func (l *Loop) runAsyncHandler(cs *connState) {
+	defer l.asyncWG.Done()
 	// Last-resort panic safety net. User handlers SHOULD use recovery
 	// middleware, but a goroutine spawned by the engine must not let an
 	// unrecovered panic crash the process. routerAdapter has its own
@@ -897,8 +906,18 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
-			// Force the worker's close path on next epoll_wait.
-			_ = unix.Close(cs.fd)
+			// Signal worker via detachQueue + eventfd (never close the
+			// fd from this goroutine — races with drainRead on the
+			// worker's stale l.conns slot).
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
 		}
 	}()
 	for {
@@ -946,16 +965,28 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		}
 
 		if processErr != nil || flushErr != nil {
-			// Best-effort close: shut down the TCP half so the kernel
-			// surfaces EPOLLRDHUP on next epoll_wait and the worker
-			// runs the full close path thread-safely on its own
-			// goroutine. Skipping l.closeConn here — the conn table
-			// write would race with drainRead on the worker goroutine.
-			_ = unix.Close(cs.fd)
+			// Signal the worker to tear down the conn from its own
+			// goroutine. Never close cs.fd directly here — the worker
+			// goroutine still has l.conns[fd] pointing at cs, and a
+			// concurrent drainRead on the stale slot would race with
+			// fd reuse after close. Instead set asyncClosed, enqueue
+			// on detachQueue, and write eventfd; the worker's
+			// drainDetachQueue pass will observe asyncClosed and run
+			// closeConn thread-safely.
+			cs.asyncClosed.Store(true)
 			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
 			return
 		}
 	}
@@ -971,6 +1002,13 @@ func (l *Loop) drainDetachQueue() {
 	l.detachQMu.Unlock()
 	for _, cs := range l.detachQSpare {
 		if cs.detachClosed {
+			continue
+		}
+		// Dispatch goroutine signaled close via asyncClosed. Only the
+		// worker can safely touch l.conns / dirty list, so we handle
+		// the teardown here.
+		if cs.asyncClosed.Load() {
+			l.closeConn(cs.fd)
 			continue
 		}
 		// Apply any pending pause/resume request from the WS middleware.
@@ -1227,6 +1265,11 @@ func (l *Loop) shutdown() {
 		_ = unix.Close(l.eventFD)
 	}
 	_ = unix.Close(l.epollFD)
+	// Wait for async dispatch goroutines to exit. They've been
+	// signaled via asyncClosed + Broadcast above; this join ensures
+	// the engine has no outstanding Gs touching connState memory
+	// before Listen returns.
+	l.asyncWG.Wait()
 }
 
 // drainRecvBuffer reads and discards any data in the socket receive buffer.

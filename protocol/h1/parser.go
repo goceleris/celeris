@@ -13,6 +13,7 @@ var (
 	ErrMissingHost            = errors.New("missing Host header")
 	ErrUnsupportedVersion     = errors.New("unsupported HTTP version")
 	ErrHeadersTooLarge        = errors.New("headers too large")
+	ErrTooManyHeaders         = errors.New("too many headers")
 	ErrInvalidContentLength   = errors.New("invalid content-length")
 	ErrDuplicateContentLength = errors.New("duplicate content-length with conflicting values")
 )
@@ -162,6 +163,12 @@ func (p *Parser) parseHeaders(req *Request) (bool, error) {
 		if len(line) == 0 {
 			req.HeadersComplete = true
 			return true, nil
+		}
+		// Reject thousands-of-tiny-headers DoS pattern: each line
+		// that survives past the empty-line check is a header, so
+		// the count at this point equals headers observed so far.
+		if len(req.RawHeaders) >= MaxHeaderCount {
+			return false, ErrTooManyHeaders
 		}
 		colonIdx := bytes.IndexByte(line, ':')
 		if colonIdx == -1 {
