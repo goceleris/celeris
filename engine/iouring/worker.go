@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -938,6 +939,18 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
 	if w.async && cs.protocol == engine.HTTP1 {
 		cs.asyncInMu.Lock()
+		// Backpressure: drop the conn if the dispatch goroutine is
+		// falling behind. Prevents a pipelining client from ballooning
+		// asyncInBuf without bound.
+		if len(cs.asyncInBuf)+len(data) > maxPendingInputBytes {
+			cs.asyncInMu.Unlock()
+			if hasProvidedBuf {
+				w.bufRing.PushBuffer(providedBufID)
+				w.hasBufReturns = true
+			}
+			w.closeConn(fd)
+			return
+		}
 		// Append directly into asyncInBuf — dispatch goroutine swaps
 		// with asyncOutBuf under the same mutex before running
 		// ProcessH1, so the provided-buffer slice cannot be overwritten
@@ -1414,6 +1427,33 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // request in the slice in order, and responses land on cs.writeBuf in
 // the same order before the flush.
 func (w *Worker) runAsyncHandler(cs *connState) {
+	defer func() {
+		if r := recover(); r != nil {
+			if w.logger != nil {
+				w.logger.Error("async handler panicked",
+					"panic", r,
+					"stack", string(debug.Stack()),
+					"fd", cs.fd,
+				)
+			}
+			cs.asyncClosed.Store(true)
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = cs.asyncInBuf[:0]
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			// Wake the worker so it observes asyncClosed and tears
+			// down the conn via the detachQueue → drain path.
+			w.detachQMu.Lock()
+			w.detachQueue = append(w.detachQueue, cs)
+			w.detachQPending.Store(1)
+			w.detachQMu.Unlock()
+			if w.h2EventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(w.h2EventFD, val[:])
+			}
+		}
+	}()
 	for {
 		cs.asyncInMu.Lock()
 		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {

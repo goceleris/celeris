@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -541,6 +542,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// unchanged and zero-cost when async is off.
 		if l.async && cs.protocol == engine.HTTP1 {
 			cs.asyncInMu.Lock()
+			// Backpressure: drop the conn if the dispatch goroutine is
+			// falling behind. A client that pipelines faster than we
+			// can process would otherwise grow asyncInBuf without bound.
+			if len(cs.asyncInBuf)+len(data) > maxPendingInputBytes {
+				cs.asyncInMu.Unlock()
+				l.closeConn(fd)
+				return
+			}
 			// Append directly into asyncInBuf — the goroutine swaps it
 			// out via double-buffer under the same mutex before invoking
 			// ProcessH1, so the worker's next read into cs.buf can't
@@ -868,6 +877,30 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 // same order on cs.writeBuf before the flush. The "one goroutine at a
 // time per conn" invariant is enforced by cs.asyncRun.
 func (l *Loop) runAsyncHandler(cs *connState) {
+	// Last-resort panic safety net. User handlers SHOULD use recovery
+	// middleware, but a goroutine spawned by the engine must not let an
+	// unrecovered panic crash the process. routerAdapter has its own
+	// recover for the sync path; async dispatch needs symmetric
+	// protection because the panic would otherwise unwind here,
+	// outside any router code. See #240.
+	defer func() {
+		if r := recover(); r != nil {
+			if l.logger != nil {
+				l.logger.Error("async handler panicked",
+					"panic", r,
+					"stack", string(debug.Stack()),
+					"fd", cs.fd,
+				)
+			}
+			cs.asyncClosed.Store(true)
+			cs.asyncInMu.Lock()
+			cs.asyncInBuf = cs.asyncInBuf[:0]
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			// Force the worker's close path on next epoll_wait.
+			_ = unix.Close(cs.fd)
+		}
+	}()
 	for {
 		cs.asyncInMu.Lock()
 		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {

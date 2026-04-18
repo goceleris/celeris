@@ -21,6 +21,14 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
+// maxDirectResultBytes is the per-query result buffer cap in direct mode.
+// Direct mode pins syncMode=true (lazy streaming cannot activate because
+// the caller goroutine IS the dispatcher — a blocking channel send would
+// deadlock), so without a cap a SELECT against a huge table would buffer
+// every row into req.rowSlab. 64 MiB matches the WebSocket detach-limit
+// on the engine side and gives typical result sets a wide margin.
+const maxDirectResultBytes = 64 << 20
+
 // syncRoundTripper is the optional interface for event-loop workers that
 // support a combined write+read fast path. On Linux, the standalone eventloop
 // worker implements this; on other platforms it's nil.
@@ -1164,6 +1172,20 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 				return
 			}
 			head.appendRowFromAlias(fields)
+			// Direct-mode result buffer cap: in direct mode syncMode is
+			// pinned so lazy streaming never fires, and a huge SELECT
+			// would otherwise buffer every row in memory without
+			// bound. Cap at maxDirectResultBytes (64 MiB) and fail the
+			// request — the caller sees ErrResultTooBig with an
+			// actionable message about paginating or switching modes.
+			if head.syncMode.Load() && len(head.rowSlab) > maxDirectResultBytes {
+				head.doneMu.Lock()
+				if head.err == nil {
+					head.err = ErrResultTooBig
+				}
+				head.doneMu.Unlock()
+				return
+			}
 			// Only promote on request paths that actually have a caller
 			// waiting on streamed rows (colsCh != nil). Exec paths
 			// (simpleExec / doExtendedExec) don't allocate colsCh — they
@@ -1204,6 +1226,15 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 				return
 			}
 			head.appendRowFromAlias(fields)
+			// See reqSimple branch: same direct-mode cap.
+			if head.syncMode.Load() && len(head.rowSlab) > maxDirectResultBytes {
+				head.doneMu.Lock()
+				if head.err == nil {
+					head.err = ErrResultTooBig
+				}
+				head.doneMu.Unlock()
+				return
+			}
 			// See reqSimple branch: skip promotion when colsCh is nil
 			// (Exec paths don't allocate one; promoting would panic).
 			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
@@ -1590,6 +1621,48 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 	return c.extendedQuery(ctx, "", query, args)
 }
 
+// isListenOrUnlisten reports whether q starts with LISTEN or UNLISTEN
+// after skipping leading whitespace + comments. Direct-mode conns
+// cannot support LISTEN because NotificationResponse messages arrive
+// asynchronously between queries, and direct mode has no background
+// reader between queries to consume them. Gating these statements
+// with ErrDirectModeUnsupported prevents silently-dropped
+// notifications (see #241 / #4 follow-up).
+func isListenOrUnlisten(q string) bool {
+	start := skipLeadingWSAndComments(q)
+	rest := q[start:]
+	return hasPrefixFold(rest, "LISTEN") || hasPrefixFold(rest, "UNLISTEN") || hasPrefixFold(rest, "NOTIFY")
+}
+
+// skipLeadingWSAndComments returns the byte offset of the first
+// non-whitespace, non-comment character in q.
+func skipLeadingWSAndComments(q string) int {
+	i := 0
+	for i < len(q) {
+		c := q[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		if c == '-' && i+1 < len(q) && q[i+1] == '-' {
+			for i < len(q) && q[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(q) && q[i+1] == '*' {
+			i += 2
+			for i+1 < len(q) && (q[i] != '*' || q[i+1] != '/') {
+				i++
+			}
+			i += 2
+			continue
+		}
+		break
+	}
+	return i
+}
+
 // isCacheableQuery returns true when the query is a read that can safely
 // be prepared and cached per-conn. The check is intentionally permissive
 // — single-statement SELECT / WITH / VALUES / SHOW / TABLE. Anything
@@ -1673,6 +1746,9 @@ func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
 func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
+	}
+	if c.useDirect && isListenOrUnlisten(query) {
+		return nil, ErrDirectModeUnsupported
 	}
 	req := acquirePgRequest()
 	req.ctx = ctx
@@ -1846,6 +1922,9 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 	if c.closed.Load() {
 		return "", 0, ErrClosed
 	}
+	if c.useDirect && isListenOrUnlisten(query) {
+		return "", 0, ErrDirectModeUnsupported
+	}
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqSimple
@@ -1920,6 +1999,9 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 	if c.closed.Load() {
 		return ErrClosed
+	}
+	if c.useDirect && isListenOrUnlisten(query) {
+		return ErrDirectModeUnsupported
 	}
 	req := acquirePgRequest()
 	req.ctx = ctx
@@ -2602,14 +2684,12 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	if c.useDirect {
 		// Direct mode: the background reader goroutine drives onRecv
 		// which fires doneCh. c.wait would spawn a second tcp reader —
-		// bad. Just wait on the channel directly.
-		select {
-		case <-req.doneCh:
-			if req.err != nil {
-				return 0, req.err
-			}
-		case <-ctx.Done():
-			return 0, ctx.Err()
+		// bad. Handle ctx cancellation explicitly: send CancelRequest
+		// and wait bounded for the server's Error+RFQ to complete
+		// req. Without this, a canceled COPY leaves req in the pending
+		// queue and desynchronizes the wire on the next query (#241).
+		if err := c.awaitDirectWithCancel(ctx, req); err != nil {
+			return 0, err
 		}
 	} else {
 		if err := c.wait(ctx, req); err != nil {
@@ -2619,6 +2699,34 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	c.touch()
 	n, _ := protocol.RowsAffected(req.tag)
 	return n, nil
+}
+
+// awaitDirectWithCancel waits for req.doneCh in direct mode, with
+// proper ctx.Done handling: CancelRequest + bounded wait for the
+// server's Error+RFQ to drain the pipeline. On timeout, fails the
+// whole conn so the pool discards it — avoids leaving an orphaned
+// request in the pending queue.
+func (c *pgConn) awaitDirectWithCancel(ctx context.Context, req *pgRequest) error {
+	select {
+	case <-req.doneCh:
+		return req.err
+	case <-ctx.Done():
+		if c.pid != 0 && c.secret != 0 {
+			_ = sendCancelRequest(ctx, c.addr, c.pid, c.secret)
+		}
+		// Wait for the reader goroutine to observe Error+RFQ and
+		// complete req. Bounded so a wedged server can't pin the
+		// caller forever.
+		drainTimer := time.NewTimer(30 * time.Second)
+		defer drainTimer.Stop()
+		select {
+		case <-req.doneCh:
+			return ctx.Err()
+		case <-drainTimer.C:
+			c.failAll(errors.New("celeris-postgres: cancel timeout draining direct-mode req"))
+			return ctx.Err()
+		}
+	}
 }
 
 // sendCopyFail writes a CopyFail frame; errors from the write are advisory —
@@ -2655,13 +2763,10 @@ func (c *pgConn) copyTo(ctx context.Context, query string, dest func(row []byte)
 		return err
 	}
 	if c.useDirect {
-		select {
-		case <-req.doneCh:
-			if req.err != nil {
-				return req.err
-			}
-		case <-ctx.Done():
-			return ctx.Err()
+		// See awaitDirectWithCancel contract: CancelRequest + bounded
+		// drain so ctx.Done doesn't leave req orphaned (#241).
+		if err := c.awaitDirectWithCancel(ctx, req); err != nil {
+			return err
 		}
 	} else {
 		if err := c.wait(ctx, req); err != nil {

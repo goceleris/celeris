@@ -121,12 +121,20 @@ type Pool struct {
 // ErrPoolClosed is returned from Pool methods after Close has been called.
 var ErrPoolClosed = errors.New("celeris-postgres: pool is closed")
 
-// ErrDirectModeUnsupported is returned by operations that require the
-// event-loop driven mini-loop (currently: COPY FROM/TO, LISTEN/NOTIFY).
-// Direct-mode conns dial a net.TCPConn and drive reads from the caller
-// goroutine — there is no background reader, so APIs that rely on
-// unsolicited server messages cannot be served.
-var ErrDirectModeUnsupported = errors.New("celeris-postgres: operation unsupported in direct mode (COPY/LISTEN require event-loop driven reads)")
+// ErrDirectModeUnsupported is returned by operations that rely on
+// unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY
+// (NotificationResponse) most notably. Direct-mode conns dial a plain
+// net.TCPConn and drive reads from the caller goroutine only during
+// an active query; between queries no reader is active, so any
+// async-delivered message is silently dropped. COPY FROM/TO is
+// supported via a short-lived per-call reader goroutine; only the
+// persistent-listener class of operations returns this error.
+//
+// Workarounds: open the pool against an engine with AsyncHandlers=false
+// (drivers will pick the mini-loop path which has an always-on reader),
+// or use a separate non-pooled listener conn dedicated to
+// LISTEN/NOTIFY in a non-async configuration.
+var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
 
 // Open opens a worker-affinity pool. The DSN is parsed once here; connect
 // errors surface on the first Acquire.

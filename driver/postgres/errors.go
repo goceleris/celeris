@@ -23,6 +23,15 @@ var ErrClosed = errors.New("celeris-postgres: connection closed")
 // it causes database/sql to evict the conn and open a fresh one.
 var ErrBadConn = errors.New("celeris-postgres: bad connection")
 
+// ErrResultTooBig is returned when a query's cumulative DataRow payload
+// exceeds the direct-mode buffering cap (maxDirectResultBytes, 64 MiB).
+// Direct mode pins syncMode=true and cannot lazily promote to streaming,
+// so huge SELECTs would otherwise balloon per-conn memory. To iterate
+// large result sets, use a non-direct pool (set up with a non-async
+// engine via WithEngine) which supports lazy streaming, or paginate the
+// query with LIMIT/OFFSET or cursor-based paging.
+var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate or use streaming mode")
+
 // PGError re-exports the server-side ErrorResponse type so callers can
 // type-assert without importing the protocol package.
 type PGError = protocol.PGError

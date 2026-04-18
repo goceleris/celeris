@@ -24,6 +24,11 @@ import (
 const (
 	maxSendQueueBytes         = 4 << 20  // 4 MiB (H1/H2)
 	maxSendQueueBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+	// maxPendingInputBytes caps the async dispatch input buffer
+	// (cs.asyncInBuf) so a client pipelining requests faster than
+	// the dispatch goroutine drains them cannot balloon per-conn
+	// memory. Matches the send-side cap.
+	maxPendingInputBytes = 4 << 20
 )
 
 // sendCap returns the effective back-pressure limit for cs, accounting
