@@ -601,14 +601,23 @@ func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listene
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 30 * time.Second
 	}
+	listenDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = s.Shutdown(shutCtx)
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			_ = s.Shutdown(shutCtx)
+		case <-listenDone:
+			// Listen returned (likely an error — ctx not cancelled).
+			// Exit without calling Shutdown; nothing to shut down.
+			return
+		}
 	}()
 
-	return eng.Listen(ctx)
+	err = eng.Listen(ctx)
+	close(listenDone)
+	return err
 }
 
 // InheritListener returns a [net.Listener] from the file descriptor in the
@@ -647,12 +656,19 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 30 * time.Second
 	}
+	listenDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = s.Shutdown(shutCtx)
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			_ = s.Shutdown(shutCtx)
+		case <-listenDone:
+			return
+		}
 	}()
 
-	return eng.Listen(ctx)
+	err = eng.Listen(ctx)
+	close(listenDone)
+	return err
 }

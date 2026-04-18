@@ -342,6 +342,19 @@ func (c *ClusterClient) refreshTopology(ctx context.Context) error {
 
 	wantReplicas := c.cfg.ReadOnly || c.cfg.RouteByLatency
 
+	// Fully reset the slot→node and slot→replicas maps at the start of
+	// every refresh. Previously we only reset per-range, which (a)
+	// left stale replicas for slots that dropped out of the topology
+	// and (b) allowed replica accumulation when two range entries
+	// overlapped (resharding). A full reset costs one sweep of 16k
+	// entries per refresh — negligible vs the CLUSTER SLOTS RTT.
+	for s := range c.slots {
+		c.slots[s] = nil
+	}
+	for s := range c.replicas {
+		c.replicas[s] = nil
+	}
+
 	seen := make(map[string]bool)
 	for _, slot := range v.Array {
 		if slot.Type != protocol.TyArray || len(slot.Array) < 3 {
@@ -371,7 +384,6 @@ func (c *ClusterClient) refreshTopology(ctx context.Context) error {
 		n.primary = true
 		for s := startSlot; s <= endSlot && s < 16384; s++ {
 			c.slots[s] = n
-			c.replicas[s] = nil // reset replicas for this slot range
 		}
 
 		// Parse replica entries (slot.Array[3], [4], ...).
@@ -477,7 +489,16 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 	}
 	triedReplicaFallback := false
 	triedPrimaryRefresh := false
-	for attempt := range c.cfg.MaxRedirects {
+	// Loop runs up to MaxRedirects+1 times: one initial attempt
+	// plus up to MaxRedirects redirects. `range N` iterates N
+	// times in Go 1.22+; explicit limit + counter so the
+	// off-by-one documented in the Config.MaxRedirects godoc is
+	// accurate ("maximum number of MOVED/ASK redirects").
+	maxAttempts := c.cfg.MaxRedirects + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for i := 0; i < maxAttempts; i++ {
 		err := fn(ctx, node.client)
 		if err == nil {
 			return nil
@@ -523,11 +544,14 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 			if addr == "" {
 				return err
 			}
-			if attempt == 0 {
-				rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				_ = c.refreshTopology(rctx)
-				cancel()
-			}
+			// Refresh topology on every MOVED — not just attempt==0.
+			// A stale slot map keeps generating redirects; routing
+			// by the embedded MOVED address only helps for this one
+			// call, subsequent commands for the same slot still hit
+			// the old node and loop.
+			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_ = c.refreshTopology(rctx)
+			cancel()
 			n, nerr := c.getOrCreateNode(addr)
 			if nerr != nil {
 				return err

@@ -394,7 +394,6 @@ func (r *Reader) readInt() (int64, error) {
 }
 
 func (r *Reader) readBulk(ty Type) (Value, error) {
-	start := r.r // for rewind via parse() — but we actually rewind in Next
 	n, err := r.readInt()
 	if err != nil {
 		return Value{}, err
@@ -408,10 +407,9 @@ func (r *Reader) readBulk(ty Type) (Value, error) {
 	if n > MaxBulkLen {
 		return Value{}, ErrProtocolOversizedBulk
 	}
-	// Need n bytes + CRLF.
+	// Need n bytes + CRLF. On ErrIncomplete the caller (Next)
+	// rewinds r.r to before the tag byte; no local rewind needed.
 	if r.w-r.r < int(n)+2 {
-		// rewind to the start of this bulk length (just after '$').
-		r.r = start
 		return Value{}, ErrIncomplete
 	}
 	end := r.r + int(n)

@@ -167,6 +167,13 @@ func (p *Processor) ensureHPACKDecoder() {
 		// updated before each decode to point at the current pooled slice,
 		// eliminating a closure allocation per HEADERS/CONTINUATION frame.
 		p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
+		// SETTINGS_MAX_HEADER_LIST_SIZE enforcement: cap the total
+		// uncompressed header list size the decoder is willing to
+		// accept. Without this a single HEADERS frame can grow the
+		// decode target unboundedly (DoS). 64 KiB matches the H1
+		// MaxHeaderSize default and leaves wide margin for real
+		// requests.
+		p.hpackDecoder.SetMaxStringLength(64 << 10)
 	}
 }
 
@@ -1170,6 +1177,19 @@ func (p *Processor) handlePriority(f *http2.PriorityFrame) error {
 	if f.StreamDep == f.StreamID {
 		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"),
 			fmt.Errorf("stream %d depends on itself", f.StreamID))
+	}
+
+	// Reject PRIORITY on stream IDs far beyond the last-opened
+	// client stream — an attacker could otherwise blast PRIORITY
+	// frames on monotonically-increasing IDs and grow the priority
+	// tree unboundedly (maps + GetOrCreateStream inserts). Honest
+	// clients only reference streams they've opened or are about
+	// to open; anything more than 1024 ahead is an anomaly.
+	lastClient := p.manager.GetLastClientStreamID()
+	if f.StreamID > lastClient+2048 {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+			[]byte("PRIORITY stream ID too far ahead"),
+			fmt.Errorf("PRIORITY stream %d > last client %d + window", f.StreamID, lastClient))
 	}
 
 	_, exists := p.manager.GetStream(f.StreamID)

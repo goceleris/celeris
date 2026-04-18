@@ -228,7 +228,11 @@ func fallbackTier(current TierStrategy) TierStrategy {
 	}
 }
 
-// Shutdown gracefully shuts down the engine.
+// Shutdown is a no-op for the io_uring engine — graceful shutdown is
+// driven by context cancellation on Listen's parent context. Workers
+// exit their run loops on ctx.Done and call Worker.shutdown, which
+// joins async dispatch goroutines via asyncWG. See epoll engine
+// Shutdown for the same rationale.
 func (e *Engine) Shutdown(_ context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()

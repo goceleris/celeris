@@ -114,6 +114,13 @@ func ParseRowDescriptionInto(dst []ColumnDesc, payload []byte) ([]ColumnDesc, er
 	if n < 0 {
 		return nil, fmt.Errorf("postgres/protocol: negative column count %d", n)
 	}
+	// PostgreSQL caps tuples at 1600 columns (MaxHeapAttributeNumber).
+	// Rejecting anything above avoids a server-supplied int16 (up to
+	// 32767) forcing a multi-MB allocation per RowDescription, and
+	// matches the server's own limit.
+	if n > 1600 {
+		return nil, fmt.Errorf("postgres/protocol: column count %d exceeds MaxHeapAttributeNumber (1600)", n)
+	}
 	var cols []ColumnDesc
 	if cap(dst) >= int(n) {
 		cols = dst[:n]

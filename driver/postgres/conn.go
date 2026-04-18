@@ -533,6 +533,10 @@ type pgConn struct {
 	closeOnce sync.Once
 	closeErr  atomic.Value // error
 	closed    atomic.Bool
+	// closeWG tracks background goroutines spawned by the conn
+	// (dropPreparedAsync, etc.) so Close can join them and we don't
+	// leak Gs that outlive the conn.
+	closeWG sync.WaitGroup
 
 	// fdCloseOnce guards syscall.Close(fd) so it runs exactly once regardless
 	// of whether the first close path is Close() or onClose() (fired by the
@@ -1721,14 +1725,27 @@ func hasPrefixFold(s, prefix string) bool {
 }
 
 // dropPreparedAsync fires a best-effort Close('S') for an evicted
-// prepared statement. Fire-and-forget to not block the caller.
+// prepared statement. Fire-and-forget to not block the caller, but
+// bound by:
+//   - a 5s timeout (so a stuck TCP write doesn't hold the G forever)
+//   - the conn's closed flag (on Close, the G observes and bails)
+//   - the conn's closeWG (Close waits so the G doesn't outlive
+//     the conn's logical lifetime)
 func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
 	if prep == nil || prep.Name == "" {
 		return
 	}
+	if c.closed.Load() {
+		return
+	}
+	c.closeWG.Add(1)
 	go func() {
+		defer c.closeWG.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if c.closed.Load() {
+			return
+		}
 		_ = c.simpleExecNoTag(ctx, "DEALLOCATE "+prep.Name)
 	}()
 }
@@ -2415,6 +2432,10 @@ func (c *pgConn) Close() error {
 			c.closeLoop()
 		}
 	})
+	// Join any background goroutines (dropPreparedAsync) spawned by
+	// this conn. Safe outside closeOnce because closeWG.Wait() on
+	// a zero WaitGroup returns immediately.
+	c.closeWG.Wait()
 	return firstErr
 }
 

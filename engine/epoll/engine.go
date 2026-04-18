@@ -117,7 +117,17 @@ func (e *Engine) Listen(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown gracefully shuts down the engine.
+// Shutdown is a no-op for the epoll engine — graceful shutdown is
+// driven by context cancellation on Listen's parent context. The
+// Server calls Listen with its managed context and cancels it during
+// Server.Shutdown; the Listen goroutine returns after running
+// Loop.shutdown (which closes connections and joins async dispatch
+// goroutines via asyncWG).
+//
+// The context parameter is accepted for interface parity with engines
+// that do run async drain operations on Shutdown (e.g. std's
+// http.Server.Shutdown), and for future use if epoll Shutdown gains
+// explicit drain semantics.
 func (e *Engine) Shutdown(_ context.Context) error {
 	return nil
 }

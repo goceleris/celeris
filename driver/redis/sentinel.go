@@ -253,8 +253,23 @@ func (s *SentinelClient) subscribeLoop() {
 		}
 		bo.Reset()
 		attempt = 0
+		// Replace any stale entries — on a flappy sentinel the
+		// previous sc's client is already closed (watchFailover
+		// exits on read error and we fall back to reconnect),
+		// and append-without-remove would grow sentinelConns
+		// unboundedly across reconnects.
+		// Cap the history to avoid unbounded growth under flappy
+		// sentinels. Keep only the most recent entry and discard
+		// the rest; watchFailover for the older ones has already
+		// exited on read error (that's what triggered this
+		// reconnect iteration).
 		s.sentinelMu.Lock()
-		s.sentinelConns = append(s.sentinelConns, sc)
+		for _, old := range s.sentinelConns {
+			if old != nil && old.client != nil {
+				_ = old.client.Close()
+			}
+		}
+		s.sentinelConns = append(s.sentinelConns[:0], sc)
 		s.sentinelMu.Unlock()
 		s.watchFailover(sc)
 	}
