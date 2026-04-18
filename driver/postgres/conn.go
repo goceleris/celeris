@@ -461,6 +461,10 @@ type pgConn struct {
 	pending   []*pgRequest
 
 	stmtCache *lru
+	// autoCache, when true, routes cacheable SELECT-style QueryContext
+	// calls through the per-conn stmtCache even when the caller did not
+	// explicitly Prepare. Opt-in via DSN's AutoCacheStatements option.
+	autoCache bool
 
 	createdAt  time.Time
 	lastUsedAt atomic.Int64 // unix nanos
@@ -601,6 +605,7 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 		writer:    protocol.NewWriter(),
 		bridge:    async.NewBridge(),
 		stmtCache: newLRU(dsn.Options.StatementCacheSize),
+		autoCache: dsn.Options.AutoCacheStatements && dsn.Options.StatementCacheSize > 0,
 		// Pre-size pending queue for the common case (pipeline depth 1-2).
 		// Backing cap is retained across enqueue/popHead cycles thanks to
 		// the in-place shift in popHead, so bursty depths only allocate
@@ -1294,11 +1299,105 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 }
 
 // QueryContext satisfies driver.QueryerContext.
+//
+// When the DSN option AutoCacheStatements is enabled (opt-in; the LRU
+// size is bounded by StatementCacheSize), cacheable SELECT-style queries
+// are transparently auto-prepared on first use and reused via
+// Bind+Describe+Execute+Sync on subsequent invocations. This matches
+// pgx's QueryExecModeCacheStatement at steady state. The first call
+// pays Parse + Describe + Bind + Execute in one flight (same as pgx);
+// subsequent calls skip Parse.
 func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.autoCache && isCacheableQuery(query) {
+		if stmt, ok := c.stmtCache.get(query); ok {
+			return c.doExtendedQuery(ctx, stmt.Name, query, args)
+		}
+		// Cache miss with autoCache on — prepare + cache + execute.
+		name := c.mintStmtName()
+		prep, err := c.prepareStatement(ctx, name, query)
+		if err == nil {
+			evicted := c.stmtCache.put(query, prep)
+			for _, ev := range evicted {
+				c.dropPreparedAsync(ev)
+			}
+			return c.doExtendedQuery(ctx, name, query, args)
+		}
+		// Prepare failed — fall through to the legacy path.
+	}
 	if len(args) == 0 {
 		return c.simpleQuery(ctx, query)
 	}
 	return c.extendedQuery(ctx, "", query, args)
+}
+
+// isCacheableQuery returns true when the query is a read that can safely
+// be prepared and cached per-conn. The check is intentionally permissive
+// — single-statement SELECT / WITH / VALUES / SHOW / TABLE. Anything
+// else (DDL, SET, LISTEN, multi-statement, etc.) is routed through the
+// simple protocol to preserve full-fidelity behaviour.
+func isCacheableQuery(q string) bool {
+	// Skip leading whitespace and SQL comments.
+	for i := 0; i < len(q); {
+		c := q[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		if c == '-' && i+1 < len(q) && q[i+1] == '-' {
+			// Line comment — skip to newline.
+			for i < len(q) && q[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(q) && q[i+1] == '*' {
+			// Block comment — skip to */.
+			i += 2
+			for i+1 < len(q) && !(q[i] == '*' && q[i+1] == '/') {
+				i++
+			}
+			i += 2
+			continue
+		}
+		// First non-whitespace, non-comment character: check keyword.
+		return hasPrefixFold(q[i:], "SELECT") ||
+			hasPrefixFold(q[i:], "WITH") ||
+			hasPrefixFold(q[i:], "VALUES") ||
+			hasPrefixFold(q[i:], "SHOW") ||
+			hasPrefixFold(q[i:], "TABLE")
+	}
+	return false
+}
+
+// hasPrefixFold reports whether s starts with prefix, ASCII case-insensitive.
+// prefix must be uppercase.
+func hasPrefixFold(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		ch := s[i]
+		if ch >= 'a' && ch <= 'z' {
+			ch -= 'a' - 'A'
+		}
+		if ch != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// dropPreparedAsync fires a best-effort Close('S') for an evicted
+// prepared statement. Fire-and-forget to not block the caller.
+func (c *pgConn) dropPreparedAsync(prep *protocol.PreparedStmt) {
+	if prep == nil || prep.Name == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.simpleExecNoTag(ctx, "DEALLOCATE "+prep.Name)
+	}()
 }
 
 // simpleQuery runs a no-arg Query via the simple protocol.

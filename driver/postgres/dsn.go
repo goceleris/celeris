@@ -17,6 +17,13 @@ type Options struct {
 	// StatementCacheSize is the per-conn LRU capacity for named prepared
 	// statements. Zero disables the cache.
 	StatementCacheSize int
+	// AutoCacheStatements, when true AND StatementCacheSize > 0, causes
+	// cacheable SELECT-style QueryContext calls to transparently auto-
+	// prepare on first use and reuse via the extended protocol on
+	// subsequent calls. Default false preserves the legacy simple-query
+	// behaviour for queries without an explicit db.Prepare. Equivalent to
+	// pgx's QueryExecModeCacheStatement at steady state.
+	AutoCacheStatements bool
 	// Application is copied into the "application_name" startup parameter.
 	Application string
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are
@@ -195,6 +202,15 @@ func applyDSNKey(d *DSN, k, v string) error {
 			return fmt.Errorf("celeris-postgres: statement_cache_size must be >= 0")
 		}
 		d.Options.StatementCacheSize = n
+	case "auto_cache_statements":
+		switch strings.ToLower(v) {
+		case "1", "true", "on", "yes":
+			d.Options.AutoCacheStatements = true
+		case "0", "false", "off", "no":
+			d.Options.AutoCacheStatements = false
+		default:
+			return fmt.Errorf("celeris-postgres: auto_cache_statements = %q: want bool", v)
+		}
 	case "application_name":
 		d.Options.Application = v
 	default:
