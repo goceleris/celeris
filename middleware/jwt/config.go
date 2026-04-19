@@ -10,6 +10,7 @@ import (
 
 	"github.com/goceleris/celeris/middleware/internal/extract"
 	"github.com/goceleris/celeris/middleware/jwt/internal/jwtparse"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // TokenKey is the context store key for the parsed *jwt.Token.
@@ -86,6 +87,15 @@ type Config struct {
 	// on first request). If preload fails, a warning is logged and the
 	// middleware falls back to lazy fetching.
 	JWKSPreload *bool
+
+	// JWKSCache, when set, caches the raw JWKS JSON response keyed by
+	// the JWKS URL. On refresh, the middleware checks the cache before
+	// issuing an HTTP GET and writes back on successful fetch, reducing
+	// JWKS endpoint load in multi-instance deployments. Cache TTL equals
+	// JWKSRefresh. All cache failures are non-fatal.
+	//
+	// Typical use: pass [middleware/jwt/jwtcache.New](redisClient).
+	JWKSCache store.KV
 
 	// TokenProcessorFunc is called on the raw token string after extraction
 	// but before parsing. Use it for decryption, decompression, or other
@@ -235,6 +245,9 @@ func resolveKeyFunc(cfg Config, customValidMethods bool) (jwtparse.Keyfunc, []*j
 		fetchers := make([]*jwksFetcher, len(jwksURLs))
 		for i, u := range jwksURLs {
 			fetchers[i] = newJWKSFetcher(u, cfg.JWKSRefresh)
+			if cfg.JWKSCache != nil {
+				fetchers[i].cache = cfg.JWKSCache
+			}
 		}
 		if len(fetchers) == 1 {
 			return fetchers[0].keyFunc, fetchers
