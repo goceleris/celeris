@@ -23,7 +23,12 @@ func newTestClient(t *testing.T) *redis.Client {
 
 func TestAllowUnderLimit(t *testing.T) {
 	client := newTestClient(t)
-	s, err := New(context.Background(), client, Options{RPS: 100, Burst: 5})
+	// RPS=1 → refill is ~1ms per thousand; five rapid Allow calls plus
+	// the sixth check complete in far less than that, so the bucket
+	// stays empty and the sixth must be denied. Higher RPS values
+	// have flaked on slower runners when TCP roundtrips accidentally
+	// let the bucket refill mid-test.
+	s, err := New(context.Background(), client, Options{RPS: 1, Burst: 5})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -13,7 +13,6 @@ package postgresstore
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -164,10 +163,16 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Set implements [store.KV]. A ttl <= 0 stores NULL for expires_at
 // (no expiry). Positive ttl converts to NOW() + INTERVAL.
+//
+// Expires is passed as either a time.Time (positive TTL) or nil (no
+// expiry). The celeris-postgres driver accepts those forms natively;
+// passing sql.NullTime would fail with "unsupported argument type".
 func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	var expires sql.NullTime
+	var expires any
 	if ttl > 0 {
-		expires = sql.NullTime{Time: time.Now().Add(ttl), Valid: true}
+		expires = time.Now().Add(ttl)
+	} else {
+		expires = nil
 	}
 	q := fmt.Sprintf(`INSERT INTO %s (id, value, expires_at)
 		VALUES ($1, $2, $3)
