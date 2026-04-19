@@ -158,6 +158,52 @@
 // mcrouter or twemproxy in front of the nodes and point the single-node
 // [Client] at the proxy.
 //
+// # Node failure detection and failover (v1.4.1)
+//
+// [ClusterClient] tracks the health of each node and automatically
+// reroutes around failed ones so a single dead node does not translate
+// into per-key errors for every key in its slice of the ring.
+//
+// Detection is passive + probe:
+//
+//   - Each [Client] operation issued through the cluster updates the
+//     node's consecutive-failure counter. Infrastructure errors (dial
+//     failures, I/O errors, protocol corruption) count; protocol-level
+//     responses ([ErrCacheMiss], [ErrNotStored], [ErrCASConflict],
+//     [*MemcachedError]) do NOT — they are valid server replies.
+//   - Once the counter reaches [ClusterConfig.FailureThreshold] (default
+//     2), the node is marked failing. [ClusterClient.pickNode] then
+//     walks the node list clockwise from the failing node's position
+//     and returns the first healthy neighbor it finds.
+//   - A background goroutine (configurable via
+//     [ClusterConfig.HealthProbeInterval], default 5s) pings any
+//     failing node that has been down for at least 1 second and clears
+//     the failing flag on success.
+//   - Any successful operation passively clears the flag — so a node
+//     that silently recovers while still receiving traffic from
+//     passed-through requests is picked up immediately.
+//
+// Key-redistribution implications:
+//
+//   - The successor is the next node in insertion order (the order
+//     given in [ClusterConfig.Addrs]), NOT the next ring neighbor.
+//     This preserves the consistent-hash invariant that all keys
+//     formerly routed to failing node N now route to the same
+//     successor — rather than being scattered across the ring.
+//   - During the failure transition, keys that were cached on N will
+//     MISS on the successor. During recovery, keys that were cached on
+//     the successor will MISS on N. Applications must tolerate both
+//     transitions — caches are not authoritative.
+//
+// Observability: [ClusterClient.NodeHealth] returns a snapshot of the
+// failing flag per address; [ClusterClient.NodeStatsMap] includes the
+// last-fail timestamp and consecutive-fail counter.
+//
+// Semantics vs. gomemcache/dalli: celeris matches dalli's "mark after
+// N failures, passive heal on success" policy. The background probe
+// is an addition for deployments where a failing node receives no
+// traffic (otherwise the passive path would never clear the flag).
+//
 // # Known limitations (v1.4.0)
 //
 //   - No TLS — deploy over VPC, loopback, or a sidecar.
