@@ -20,7 +20,6 @@ func newTestClient(t *testing.T) *redis.Client {
 	return c
 }
 
-
 func TestAllowUnderLimit(t *testing.T) {
 	client := newTestClient(t)
 	// RPS=1 → refill is ~1ms per thousand; five rapid Allow calls plus

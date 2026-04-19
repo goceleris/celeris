@@ -134,17 +134,12 @@ func readArray(r *bufio.Reader) ([]string, error) {
 }
 
 // Dispatcher writes helpers.
-func writeSimple(w *bufio.Writer, s string) { fmt.Fprintf(w, "+%s\r\n", s) }
-func writeError(w *bufio.Writer, s string)  { fmt.Fprintf(w, "-%s\r\n", s) }
-func writeInt(w *bufio.Writer, n int64)     { fmt.Fprintf(w, ":%d\r\n", n) }
-func writeNil(w *bufio.Writer)              { w.WriteString("$-1\r\n") }
-func writeBulk(w *bufio.Writer, s string)   { fmt.Fprintf(w, "$%d\r\n%s\r\n", len(s), s) }
-func writeBulkBytes(w *bufio.Writer, b []byte) {
-	fmt.Fprintf(w, "$%d\r\n", len(b))
-	w.Write(b)
-	w.WriteString("\r\n")
-}
-func writeArrayHeader(w *bufio.Writer, n int) { fmt.Fprintf(w, "*%d\r\n", n) }
+func writeSimple(w *bufio.Writer, s string)   { _, _ = fmt.Fprintf(w, "+%s\r\n", s) }
+func writeError(w *bufio.Writer, s string)    { _, _ = fmt.Fprintf(w, "-%s\r\n", s) }
+func writeInt(w *bufio.Writer, n int64)       { _, _ = fmt.Fprintf(w, ":%d\r\n", n) }
+func writeNil(w *bufio.Writer)                { _, _ = w.WriteString("$-1\r\n") }
+func writeBulk(w *bufio.Writer, s string)     { _, _ = fmt.Fprintf(w, "$%d\r\n%s\r\n", len(s), s) }
+func writeArrayHeader(w *bufio.Writer, n int) { _, _ = fmt.Fprintf(w, "*%d\r\n", n) }
 
 func (s *Server) get(key string) (string, bool) {
 	s.mu.Lock()
@@ -179,9 +174,7 @@ func (s *Server) del(keys []string) int64 {
 			delete(s.data, k)
 			n++
 		}
-		if _, ok := s.hashes[k]; ok {
-			delete(s.hashes, k)
-		}
+		delete(s.hashes, k)
 	}
 	return n
 }
@@ -504,7 +497,7 @@ func (s *Server) runTokenBucket(keys, args []string, w *bufio.Writer) {
 	}
 	allowed := int64(0)
 	if tokens >= 1 {
-		tokens -= 1
+		tokens--
 		allowed = 1
 	}
 	h["tokens"] = strconv.FormatFloat(tokens, 'f', -1, 64)
@@ -536,7 +529,7 @@ func (s *Server) runUndo(keys, args []string, w *bufio.Writer) {
 		return
 	}
 	tokens, _ := strconv.ParseFloat(h["tokens"], 64)
-	tokens += 1
+	tokens++
 	if tokens > float64(burst) {
 		tokens = float64(burst)
 	}

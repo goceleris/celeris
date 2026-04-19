@@ -106,7 +106,7 @@ func TestSessionSave(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 	data, ok := loadMap(t, store, "save-test")
-	var err error = nil
+	var err error
 	_ = ok
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -242,7 +242,7 @@ func TestMemoryStoreCRUD(t *testing.T) {
 
 	// Get non-existent.
 	data, ok := loadMap(t, store, "nope")
-	var err error = nil
+	var err error
 	_ = ok
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -2031,8 +2031,8 @@ func TestMemoryStoreReset(t *testing.T) {
 	for i := range 20 {
 		sid := hexID(byte(i))
 		data, ok := loadMap(t, store, sid)
-	var err error = nil
-	_ = ok
+		var err error
+		_ = ok
 		if err != nil {
 			t.Fatalf("Get after Reset: %v", err)
 		}
@@ -2087,7 +2087,7 @@ func TestMemoryStoreResetThenSave(t *testing.T) {
 	// Store should accept new sessions after Reset.
 	saveMap(t, store, "after", map[string]any{"k": "v2"}, time.Hour)
 	data, ok := loadMap(t, store, "after")
-	var err error = nil
+	var err error
 	_ = ok
 	if err != nil {
 		t.Fatalf("Get after Reset+Save: %v", err)

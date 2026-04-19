@@ -250,7 +250,7 @@ func (nonPrefix) Get(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
 func (nonPrefix) Set(context.Context, string, []byte, time.Duration) error { return nil }
-func (nonPrefix) Delete(context.Context, string) error                      { return nil }
+func (nonPrefix) Delete(context.Context, string) error                     { return nil }
 
 func TestMemoryStoreLRU(t *testing.T) {
 	m := NewMemoryStore(MemoryStoreConfig{Shards: 1, MaxEntries: 2})

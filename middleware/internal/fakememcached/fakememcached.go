@@ -22,9 +22,9 @@ import (
 // Server is an in-process fake memcached text-protocol server bound
 // to a random loopback port.
 type Server struct {
-	ln     net.Listener
-	mu     sync.Mutex
-	data   map[string]*item
+	ln      net.Listener
+	mu      sync.Mutex
+	data    map[string]*item
 	nextCAS atomic.Uint64
 }
 

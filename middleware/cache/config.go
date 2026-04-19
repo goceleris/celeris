@@ -105,7 +105,7 @@ func applyDefaults(cfg Config) Config {
 	// RespectCacheControl defaults to true; preserve explicit false.
 	// Since the zero value is false, we default it to true only when
 	// the entire Config is zero-valued (nothing else set).
-	if !cfg.RespectCacheControl && cfg.Singleflight == false &&
+	if !cfg.RespectCacheControl && !cfg.Singleflight &&
 		cfg.Store == nil && cfg.TTL == 0 {
 		cfg.RespectCacheControl = true
 	} else if !cfg.RespectCacheControl {

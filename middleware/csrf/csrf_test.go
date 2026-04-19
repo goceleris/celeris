@@ -1696,7 +1696,7 @@ func TestMemoryStorageGetSetDelete(t *testing.T) {
 		t.Fatalf("expected token1, got %q (ok=%v)", val, ok)
 	}
 
-	store.Delete(context.Background(), "key1")
+	_ = store.Delete(context.Background(), "key1")
 	_, ok = storeGet(t, store, "key1")
 	if ok {
 		t.Fatal("expected not found after delete")
@@ -1727,7 +1727,7 @@ func TestMemoryStorageConcurrency(t *testing.T) {
 			key := "key" + string(rune('a'+n%26))
 			storeSet(t, store, key, "tok", time.Hour)
 			_, _ = storeGet(t, store, key)
-			store.Delete(context.Background(), key)
+			_ = store.Delete(context.Background(), key)
 		}(i)
 	}
 	wg.Wait()

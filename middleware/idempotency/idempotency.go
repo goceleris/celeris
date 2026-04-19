@@ -19,7 +19,6 @@ package idempotency
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -232,11 +231,4 @@ func replay(c *celeris.Context, rep store.EncodedResponse) error {
 		c.SetHeader(h[0], h[1])
 	}
 	return c.Blob(rep.Status, ct, rep.Body)
-}
-
-// hexBodyHash is kept here so alloc-guard benchmarks can reuse the
-// helper without pulling in crypto/sha256 in the test file.
-func hexBodyHash(body []byte) string {
-	h := sha256.Sum256(body)
-	return hex.EncodeToString(h[:])
 }

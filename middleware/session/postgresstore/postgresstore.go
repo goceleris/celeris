@@ -230,14 +230,15 @@ func validIdent(s string) bool {
 		return false
 	}
 	for i, c := range s {
-		first := i == 0
-		if first {
-			if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 {
+			if c != '_' && !isAlpha {
 				return false
 			}
 			continue
 		}
-		if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+		if c != '_' && !isAlpha && !isDigit {
 			return false
 		}
 	}

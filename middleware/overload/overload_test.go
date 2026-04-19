@@ -25,7 +25,7 @@ func (m *mockCPU) Sample() (float64, error) {
 	v, _ := m.val.Load().(float64)
 	return v, nil
 }
-func (m *mockCPU) Close() error { return nil }
+func (m *mockCPU) Close() error  { return nil }
 func (m *mockCPU) set(v float64) { m.val.Store(v) }
 
 func runOnce(t *testing.T, mw celeris.HandlerFunc, handler celeris.HandlerFunc, method, path string) *celeristest.ResponseRecorder {

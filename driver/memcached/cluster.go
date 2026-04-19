@@ -465,10 +465,7 @@ func isInfraError(err error) bool {
 		return false
 	}
 	var mcErr *MemcachedError
-	if errors.As(err, &mcErr) {
-		return false
-	}
-	return true
+	return !errors.As(err, &mcErr)
 }
 
 // probeLoop runs the background health probe. For each failing node

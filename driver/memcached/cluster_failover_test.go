@@ -4,7 +4,6 @@ import (
 	"context"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -380,8 +379,3 @@ func timeNowHex(i int) string {
 	}
 	return string(b[:])
 }
-
-// assertNoActiveOp is a placeholder to keep the atomic import in use;
-// no-op in release but useful when adding new lifecycle tests that
-// touch atomic.Int32 directly.
-func assertNoActiveOp() { _ = atomic.Int32{} }

@@ -29,11 +29,11 @@ func TestValidIdent(t *testing.T) {
 
 func TestEscapeLike(t *testing.T) {
 	cases := map[string]string{
-		"abc":       "abc",
-		"100%off":   "100\\%off",
-		"a_b":       "a\\_b",
-		"back\\":    "back\\\\",
-		"a%_\\":     "a\\%\\_\\\\",
+		"abc":     "abc",
+		"100%off": "100\\%off",
+		"a_b":     "a\\_b",
+		"back\\":  "back\\\\",
+		"a%_\\":   "a\\%\\_\\\\",
 	}
 	for in, want := range cases {
 		if got := escapeLike(in); got != want {

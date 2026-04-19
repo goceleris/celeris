@@ -3,6 +3,7 @@
 package idempotency
 
 import (
+	"context"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -69,7 +70,7 @@ func TestAllocBudgets(t *testing.T) {
 				kv := store.NewMemoryKV()
 				defer kv.Close()
 
-				_, _ = kv.SetNX(nil, "locked", []byte{entryLocked}, 0)
+				_, _ = kv.SetNX(context.Background(), "locked", []byte{entryLocked}, 0)
 				handler := func(c *celeris.Context) error {
 					return c.String(200, "impossible")
 				}

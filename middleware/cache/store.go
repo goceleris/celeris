@@ -34,10 +34,10 @@ type MemoryStoreConfig struct {
 // MemoryStore is an in-memory, sharded LRU cache. It implements
 // [store.KV], [store.PrefixDeleter], and [store.Scanner].
 type MemoryStore struct {
-	shards  []memShard
-	mask    uint64
-	perMax  int
-	cancel  context.CancelFunc
+	shards []memShard
+	mask   uint64
+	perMax int
+	cancel context.CancelFunc
 }
 
 type memShard struct {
@@ -49,11 +49,11 @@ type memShard struct {
 }
 
 type lruNode struct {
-	key     string
-	value   []byte
-	expiry  int64 // UnixNano; 0 means no expiry
-	prev    *lruNode
-	next    *lruNode
+	key    string
+	value  []byte
+	expiry int64 // UnixNano; 0 means no expiry
+	prev   *lruNode
+	next   *lruNode
 }
 
 // NewMemoryStore returns a new in-memory cache store.
