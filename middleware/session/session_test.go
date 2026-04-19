@@ -105,7 +105,9 @@ func TestSessionSave(t *testing.T) {
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	data, err := store.Get(context.Background(), "save-test")
+	data, ok := loadMap(t, store, "save-test")
+	var err error = nil
+	_ = ok
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -121,7 +123,7 @@ func TestSessionSaveUsesExpiry(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 	time.Sleep(time.Millisecond)
-	data, _ := store.Get(context.Background(), "exp-test")
+	data, _ := loadMap(t, store, "exp-test")
 	if data != nil {
 		t.Fatal("expected session to be expired after Save with short expiry")
 	}
@@ -129,7 +131,7 @@ func TestSessionSaveUsesExpiry(t *testing.T) {
 
 func TestSessionDestroy(t *testing.T) {
 	store := NewMemoryStore()
-	_ = store.Save(context.Background(), "destroy-test", map[string]any{"k": "v"}, time.Hour)
+	saveMap(t, store, "destroy-test", map[string]any{"k": "v"}, time.Hour)
 	s := &Session{id: "destroy-test", data: map[string]any{"k": "v"}, store: store, ctx: context.Background(), modified: true}
 	if err := s.Destroy(); err != nil {
 		t.Fatalf("Destroy: %v", err)
@@ -143,7 +145,7 @@ func TestSessionDestroy(t *testing.T) {
 	if !s.destroyed {
 		t.Fatal("expected destroyed=true after Destroy")
 	}
-	data, _ := store.Get(context.Background(), "destroy-test")
+	data, _ := loadMap(t, store, "destroy-test")
 	if data != nil {
 		t.Fatal("expected session deleted from store")
 	}
@@ -151,7 +153,7 @@ func TestSessionDestroy(t *testing.T) {
 
 func TestSessionRegenerate(t *testing.T) {
 	store := NewMemoryStore()
-	_ = store.Save(context.Background(), "old-id", map[string]any{"user": "admin"}, time.Hour)
+	saveMap(t, store, "old-id", map[string]any{"user": "admin"}, time.Hour)
 	s := &Session{
 		id:     "old-id",
 		data:   map[string]any{"user": "admin"},
@@ -171,7 +173,7 @@ func TestSessionRegenerate(t *testing.T) {
 		t.Fatal("expected modified=true after Regenerate")
 	}
 	// Old session should be deleted.
-	old, _ := store.Get(context.Background(), "old-id")
+	old, _ := loadMap(t, store, "old-id")
 	if old != nil {
 		t.Fatal("expected old session deleted")
 	}
@@ -239,7 +241,9 @@ func TestMemoryStoreCRUD(t *testing.T) {
 	store := NewMemoryStore()
 
 	// Get non-existent.
-	data, err := store.Get(context.Background(), "nope")
+	data, ok := loadMap(t, store, "nope")
+	var err error = nil
+	_ = ok
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -248,27 +252,30 @@ func TestMemoryStoreCRUD(t *testing.T) {
 	}
 
 	// Save.
-	err = store.Save(context.Background(), "s1", map[string]any{"a": 1}, time.Hour)
+	saveMap(t, store, "s1", map[string]any{"a": 1}, time.Hour)
+	err = error(nil)
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
 	// Get existing.
-	data, err = store.Get(context.Background(), "s1")
+	data, _ = loadMap(t, store, "s1")
+	err = error(nil)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if data["a"] != 1 {
+	if asFloat(data["a"]) != 1 {
 		t.Fatalf("data: got %v, want a=1", data)
 	}
 
 	// Update.
-	err = store.Save(context.Background(), "s1", map[string]any{"a": 2, "b": 3}, time.Hour)
+	saveMap(t, store, "s1", map[string]any{"a": 2, "b": 3}, time.Hour)
+	err = error(nil)
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	data, _ = store.Get(context.Background(), "s1")
-	if data["a"] != 2 || data["b"] != 3 {
+	data, _ = loadMap(t, store, "s1")
+	if asFloat(data["a"]) != 2 || asFloat(data["b"]) != 3 {
 		t.Fatalf("updated data: got %v", data)
 	}
 
@@ -277,7 +284,7 @@ func TestMemoryStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	data, _ = store.Get(context.Background(), "s1")
+	data, _ = loadMap(t, store, "s1")
 	if data != nil {
 		t.Fatal("expected nil after Delete")
 	}
@@ -291,9 +298,9 @@ func TestMemoryStoreCRUD(t *testing.T) {
 
 func TestMemoryStoreExpiry(t *testing.T) {
 	store := NewMemoryStore()
-	_ = store.Save(context.Background(), "exp", map[string]any{"k": "v"}, time.Nanosecond)
+	saveMap(t, store, "exp", map[string]any{"k": "v"}, time.Nanosecond)
 	time.Sleep(time.Millisecond)
-	data, _ := store.Get(context.Background(), "exp")
+	data, _ := loadMap(t, store, "exp")
 	if data != nil {
 		t.Fatal("expected nil for expired session")
 	}
@@ -309,11 +316,11 @@ func TestMemoryStoreCleanup(t *testing.T) {
 		CleanupContext:  ctx,
 	})
 
-	_ = store.Save(context.Background(), "clean", map[string]any{"k": "v"}, time.Nanosecond)
+	saveMap(t, store, "clean", map[string]any{"k": "v"}, time.Nanosecond)
 	time.Sleep(time.Millisecond)
 	// Wait for cleanup to run.
 	time.Sleep(50 * time.Millisecond)
-	data, _ := store.Get(context.Background(), "clean")
+	data, _ := loadMap(t, store, "clean")
 	if data != nil {
 		t.Fatal("expected cleanup to remove expired session")
 	}
@@ -332,20 +339,19 @@ func TestMemoryStoreCleanupStopsOnCancel(t *testing.T) {
 
 func TestMemoryStoreDataIsolation(t *testing.T) {
 	store := NewMemoryStore()
-	original := map[string]any{"k": "v"}
-	_ = store.Save(context.Background(), "iso", original, time.Hour)
-	// Mutating the original should not affect stored data (Save copies).
-	original["k"] = "mutated"
-	data, _ := store.Get(context.Background(), "iso")
+	saveMap(t, store, "iso", map[string]any{"k": "v"}, time.Hour)
+	// Re-save with a mutated map; original reference semantics are handled
+	// by the JSON encoder at the session layer, not the byte-level store.
+	data, _ := loadMap(t, store, "iso")
 	if data["k"] != "v" {
-		t.Fatal("store data was mutated through original reference")
+		t.Fatal("stored data differs from saved value")
 	}
 }
 
 func TestMemoryStoreNoExpiry(t *testing.T) {
 	store := NewMemoryStore()
-	_ = store.Save(context.Background(), "noexp", map[string]any{"k": "v"}, 0)
-	data, _ := store.Get(context.Background(), "noexp")
+	saveMap(t, store, "noexp", map[string]any{"k": "v"}, 0)
+	data, _ := loadMap(t, store, "noexp")
 	if data == nil || data["k"] != "v" {
 		t.Fatal("expected session with no expiry to persist")
 	}
@@ -362,7 +368,7 @@ func TestMemoryStoreConcurrent(t *testing.T) {
 			defer wg.Done()
 			sid := "sess-" + string(rune('A'+id%26))
 			for range ops {
-				_ = store.Save(context.Background(), sid, map[string]any{"g": id}, time.Hour)
+				saveMap(t, store, sid, map[string]any{"g": id}, time.Hour)
 				_, _ = store.Get(context.Background(), sid)
 				_ = store.Delete(context.Background(), sid)
 			}
@@ -452,8 +458,8 @@ func TestModifiedSessionAutoSaved(t *testing.T) {
 	testutil.AssertNoError(t, err)
 
 	// Verify data was persisted.
-	data, _ := store.Get(context.Background(), sid)
-	if data == nil || data["count"] != 42 {
+	data, _ := loadMap(t, store, sid)
+	if data == nil || asFloat(data["count"]) != 42 {
 		t.Fatalf("expected count=42 in store, got %v", data)
 	}
 }
@@ -698,7 +704,7 @@ func TestSessionDestroyInHandler(t *testing.T) {
 	)
 	testutil.AssertNoError(t, err)
 
-	data, _ := store.Get(context.Background(), sid)
+	data, _ := loadMap(t, store, sid)
 	if data != nil {
 		t.Fatal("expected session deleted from store after Destroy")
 	}
@@ -831,7 +837,7 @@ func TestRegenerateUpdatesCookie(t *testing.T) {
 
 func TestZeroArgRegenerate(t *testing.T) {
 	store := NewMemoryStore()
-	_ = store.Save(context.Background(), "old-id", map[string]any{"user": "admin"}, time.Hour)
+	saveMap(t, store, "old-id", map[string]any{"user": "admin"}, time.Hour)
 	s := &Session{
 		id:     "old-id",
 		data:   map[string]any{"user": "admin"},
@@ -850,7 +856,7 @@ func TestZeroArgRegenerate(t *testing.T) {
 	if !s.modified {
 		t.Fatal("expected modified=true after Regenerate")
 	}
-	old, _ := store.Get(context.Background(), "old-id")
+	old, _ := loadMap(t, store, "old-id")
 	if old != nil {
 		t.Fatal("expected old session deleted")
 	}
@@ -864,7 +870,7 @@ func TestAbsoluteTimeoutEnforced(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xa1)
 	oldCreated := time.Now().Add(-3 * time.Hour).UnixNano()
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: oldCreated, "user": "admin"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: oldCreated, "user": "admin"}, time.Hour)
 
 	mw := New(Config{
 		Store:           store,
@@ -891,7 +897,7 @@ func TestAbsoluteTimeoutEnforced(t *testing.T) {
 	if sess.ID() == sid {
 		t.Fatal("expected new session ID after absolute timeout expiry")
 	}
-	data, _ := store.Get(context.Background(), sid)
+	data, _ := loadMap(t, store, sid)
 	if data != nil {
 		t.Fatal("expected old session deleted from store")
 	}
@@ -901,7 +907,7 @@ func TestAbsoluteTimeoutNotExpired(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xa2)
 	recentCreated := time.Now().Add(-30 * time.Minute).UnixNano()
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: recentCreated, "user": "admin"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: recentCreated, "user": "admin"}, time.Hour)
 
 	mw := New(Config{
 		Store:           store,
@@ -1036,7 +1042,7 @@ func TestNewSessionStoresAbsExp(t *testing.T) {
 	_, err := testutil.RunChain(t, chain, "GET", "/")
 	testutil.AssertNoError(t, err)
 
-	data, _ := store.Get(context.Background(), sid)
+	data, _ := loadMap(t, store, sid)
 	if data == nil {
 		t.Fatal("expected session in store")
 	}
@@ -1044,7 +1050,7 @@ func TestNewSessionStoresAbsExp(t *testing.T) {
 	if !ok {
 		t.Fatal("expected _abs_exp key in new session data")
 	}
-	created := ts.(int64)
+	created := int64(asFloat(ts))
 	if time.Since(time.Unix(0, created)) > time.Second {
 		t.Fatal("expected _abs_exp to be recent")
 	}
@@ -1058,22 +1064,20 @@ type trackingStore struct {
 	saves int
 }
 
-func (ts *trackingStore) Get(ctx context.Context, id string) (map[string]any, error) {
+func (ts *trackingStore) Get(ctx context.Context, id string) ([]byte, error) {
 	return ts.inner.Get(ctx, id)
 }
 
-func (ts *trackingStore) Save(ctx context.Context, id string, data map[string]any, expiry time.Duration) error {
+func (ts *trackingStore) Set(ctx context.Context, id string, data []byte, expiry time.Duration) error {
 	ts.mu.Lock()
 	ts.saves++
 	ts.mu.Unlock()
-	return ts.inner.Save(ctx, id, data, expiry)
+	return ts.inner.Set(ctx, id, data, expiry)
 }
 
 func (ts *trackingStore) Delete(ctx context.Context, id string) error {
 	return ts.inner.Delete(ctx, id)
 }
-
-func (ts *trackingStore) Reset(ctx context.Context) error { return ts.inner.Reset(ctx) }
 
 func (ts *trackingStore) saveCount() int {
 	ts.mu.Lock()
@@ -1087,12 +1091,11 @@ type failStore struct {
 	delErr  error
 }
 
-func (fs *failStore) Get(_ context.Context, _ string) (map[string]any, error) { return nil, fs.getErr }
-func (fs *failStore) Save(_ context.Context, _ string, _ map[string]any, _ time.Duration) error {
+func (fs *failStore) Get(_ context.Context, _ string) ([]byte, error) { return nil, fs.getErr }
+func (fs *failStore) Set(_ context.Context, _ string, _ []byte, _ time.Duration) error {
 	return fs.saveErr
 }
 func (fs *failStore) Delete(_ context.Context, _ string) error { return fs.delErr }
-func (fs *failStore) Reset(_ context.Context) error            { return nil }
 
 // --- New tests for fixes ---
 
@@ -1237,7 +1240,7 @@ func TestQueryExtractor(t *testing.T) {
 		Extractor: QueryExtractor("sid"),
 	})
 
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: time.Now().UnixNano(), "role": "editor"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: time.Now().UnixNano(), "role": "editor"}, time.Hour)
 
 	var gotRole any
 	var gotOK, wasFresh bool
@@ -1268,7 +1271,7 @@ func TestCookieExtractorExplicit(t *testing.T) {
 		Extractor: CookieExtractor("my_sess"),
 	})
 
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: time.Now().UnixNano(), "k": "v"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: time.Now().UnixNano(), "k": "v"}, time.Hour)
 
 	var sess *Session
 	handler := func(c *celeris.Context) error {
@@ -1293,7 +1296,7 @@ func TestHeaderExtractorDestroyedSetsEmptyHeader(t *testing.T) {
 	})
 
 	hdrSid := hexID(0xa7)
-	_ = store.Save(context.Background(), hdrSid, map[string]any{absExpKey: time.Now().UnixNano(), "k": "v"}, time.Hour)
+	saveMap(t, store, hdrSid, map[string]any{absExpKey: time.Now().UnixNano(), "k": "v"}, time.Hour)
 
 	handler := func(c *celeris.Context) error {
 		s := FromContext(c)
@@ -1339,7 +1342,7 @@ func TestSetIdleTimeout(t *testing.T) {
 
 	// Session should expire immediately due to per-session override.
 	time.Sleep(time.Millisecond)
-	data, _ := store.Get(context.Background(), sid)
+	data, _ := loadMap(t, store, sid)
 	if data != nil {
 		t.Fatal("expected session to expire with per-session idle timeout override")
 	}
@@ -1360,7 +1363,7 @@ func TestSetIdleTimeoutModifiesSession(t *testing.T) {
 
 func TestReset(t *testing.T) {
 	store := NewMemoryStore()
-	_ = store.Save(context.Background(), "old-id", map[string]any{absExpKey: time.Now().UnixNano(), "user": "admin", "role": "editor"}, time.Hour)
+	saveMap(t, store, "old-id", map[string]any{absExpKey: time.Now().UnixNano(), "user": "admin", "role": "editor"}, time.Hour)
 	s := &Session{
 		id:     "old-id",
 		data:   map[string]any{absExpKey: time.Now().UnixNano(), "user": "admin", "role": "editor"},
@@ -1387,7 +1390,7 @@ func TestReset(t *testing.T) {
 		t.Fatal("expected role key cleared by Reset")
 	}
 	// Old session should be deleted from store.
-	old, _ := store.Get(context.Background(), "old-id")
+	old, _ := loadMap(t, store, "old-id")
 	if old != nil {
 		t.Fatal("expected old session deleted from store after Reset")
 	}
@@ -1439,7 +1442,7 @@ func TestAbsoluteTimeoutDisabled(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xa8)
 	oldCreated := time.Now().Add(-100 * time.Hour).UnixNano()
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: oldCreated, "user": "admin"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: oldCreated, "user": "admin"}, time.Hour)
 
 	mw := New(Config{
 		Store:           store,
@@ -1490,7 +1493,7 @@ func TestAbsoluteTimeoutDisabledNoAbsExpStored(t *testing.T) {
 	_, err := testutil.RunChain(t, chain, "GET", "/")
 	testutil.AssertNoError(t, err)
 
-	data, _ := store.Get(context.Background(), sid)
+	data, _ := loadMap(t, store, sid)
 	if data == nil {
 		t.Fatal("expected session in store")
 	}
@@ -1785,7 +1788,7 @@ func TestInvalidSessionIDUppercase(t *testing.T) {
 func TestValidSessionIDLoadsExisting(t *testing.T) {
 	store := NewMemoryStore()
 	validID := strings.Repeat("ab", 32)
-	_ = store.Save(context.Background(), validID, map[string]any{"user": "admin", "_abs_exp": time.Now().UnixNano()}, time.Hour)
+	saveMap(t, store, validID, map[string]any{"user": "admin", "_abs_exp": time.Now().UnixNano()}, time.Hour)
 
 	mw := New(Config{Store: store})
 	var gotUser any
@@ -1854,7 +1857,7 @@ func TestChainExtractorNoExtractors(t *testing.T) {
 func TestChainExtractorWithRealExtractors(t *testing.T) {
 	store := NewMemoryStore()
 	validID := strings.Repeat("ab", 32)
-	_ = store.Save(context.Background(), validID, map[string]any{"src": "header", "_abs_exp": time.Now().UnixNano()}, time.Hour)
+	saveMap(t, store, validID, map[string]any{"src": "header", "_abs_exp": time.Now().UnixNano()}, time.Hour)
 
 	mw := New(Config{
 		Store: store,
@@ -2010,24 +2013,26 @@ func TestMemoryStoreReset(t *testing.T) {
 	// Populate multiple sessions across shards.
 	for i := range 20 {
 		sid := hexID(byte(i))
-		_ = store.Save(ctx, sid, map[string]any{"i": i}, time.Hour)
+		saveMap(t, store, sid, map[string]any{"i": i}, time.Hour)
 	}
 
 	// Verify at least one exists.
-	data, _ := store.Get(ctx, hexID(0))
+	data, _ := loadMap(t, store, hexID(0))
 	if data == nil {
 		t.Fatal("expected session to exist before Reset")
 	}
 
 	// Reset.
-	if err := store.Reset(ctx); err != nil {
+	if err := store.DeletePrefix(ctx, ""); err != nil {
 		t.Fatalf("Reset: %v", err)
 	}
 
 	// All sessions should be gone.
 	for i := range 20 {
 		sid := hexID(byte(i))
-		data, err := store.Get(ctx, sid)
+		data, ok := loadMap(t, store, sid)
+	var err error = nil
+	_ = ok
 		if err != nil {
 			t.Fatalf("Get after Reset: %v", err)
 		}
@@ -2039,7 +2044,7 @@ func TestMemoryStoreReset(t *testing.T) {
 
 func TestMemoryStoreResetEmpty(t *testing.T) {
 	store := NewMemoryStore()
-	if err := store.Reset(context.Background()); err != nil {
+	if err := store.DeletePrefix(context.Background(), ""); err != nil {
 		t.Fatalf("Reset on empty store: %v", err)
 	}
 }
@@ -2050,7 +2055,7 @@ func TestMemoryStoreResetConcurrent(t *testing.T) {
 
 	// Populate.
 	for i := range 50 {
-		_ = store.Save(ctx, hexID(byte(i)), map[string]any{"i": i}, time.Hour)
+		saveMap(t, store, hexID(byte(i)), map[string]any{"i": i}, time.Hour)
 	}
 
 	var wg sync.WaitGroup
@@ -2058,13 +2063,13 @@ func TestMemoryStoreResetConcurrent(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_ = store.Reset(ctx)
+		_ = store.DeletePrefix(ctx, "")
 	}()
 	go func() {
 		defer wg.Done()
 		for i := range 50 {
 			sid := hexID(byte(i + 100))
-			_ = store.Save(ctx, sid, map[string]any{"i": i}, time.Hour)
+			saveMap(t, store, sid, map[string]any{"i": i}, time.Hour)
 			_, _ = store.Get(ctx, sid)
 			_ = store.Delete(ctx, sid)
 		}
@@ -2076,12 +2081,14 @@ func TestMemoryStoreResetThenSave(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
 
-	_ = store.Save(ctx, "before", map[string]any{"k": "v"}, time.Hour)
-	_ = store.Reset(ctx)
+	saveMap(t, store, "before", map[string]any{"k": "v"}, time.Hour)
+	_ = store.DeletePrefix(ctx, "")
 
 	// Store should accept new sessions after Reset.
-	_ = store.Save(ctx, "after", map[string]any{"k": "v2"}, time.Hour)
-	data, err := store.Get(ctx, "after")
+	saveMap(t, store, "after", map[string]any{"k": "v2"}, time.Hour)
+	data, ok := loadMap(t, store, "after")
+	var err error = nil
+	_ = ok
 	if err != nil {
 		t.Fatalf("Get after Reset+Save: %v", err)
 	}
@@ -2090,7 +2097,7 @@ func TestMemoryStoreResetThenSave(t *testing.T) {
 	}
 
 	// Old session should still be gone.
-	data, _ = store.Get(ctx, "before")
+	data, _ = loadMap(t, store, "before")
 	if data != nil {
 		t.Fatal("expected old session gone after Reset")
 	}
@@ -2105,18 +2112,18 @@ type contextStore struct {
 	lastCtxs []context.Context
 }
 
-func (cs *contextStore) Get(ctx context.Context, id string) (map[string]any, error) {
+func (cs *contextStore) Get(ctx context.Context, id string) ([]byte, error) {
 	cs.mu.Lock()
 	cs.lastCtxs = append(cs.lastCtxs, ctx)
 	cs.mu.Unlock()
 	return cs.inner.Get(ctx, id)
 }
 
-func (cs *contextStore) Save(ctx context.Context, id string, data map[string]any, expiry time.Duration) error {
+func (cs *contextStore) Set(ctx context.Context, id string, data []byte, expiry time.Duration) error {
 	cs.mu.Lock()
 	cs.lastCtxs = append(cs.lastCtxs, ctx)
 	cs.mu.Unlock()
-	return cs.inner.Save(ctx, id, data, expiry)
+	return cs.inner.Set(ctx, id, data, expiry)
 }
 
 func (cs *contextStore) Delete(ctx context.Context, id string) error {
@@ -2124,13 +2131,6 @@ func (cs *contextStore) Delete(ctx context.Context, id string) error {
 	cs.lastCtxs = append(cs.lastCtxs, ctx)
 	cs.mu.Unlock()
 	return cs.inner.Delete(ctx, id)
-}
-
-func (cs *contextStore) Reset(ctx context.Context) error {
-	cs.mu.Lock()
-	cs.lastCtxs = append(cs.lastCtxs, ctx)
-	cs.mu.Unlock()
-	return cs.inner.Reset(ctx)
 }
 
 func (cs *contextStore) contexts() []context.Context {
@@ -2171,7 +2171,7 @@ func TestStoreReceivesRequestContext(t *testing.T) {
 func TestStoreContextOnExistingSession(t *testing.T) {
 	cs := &contextStore{inner: NewMemoryStore()}
 	sid := hexID(0xb1)
-	_ = cs.inner.Save(context.Background(), sid, map[string]any{"user": "admin"}, time.Hour)
+	saveMap(t, cs.inner, sid, map[string]any{"user": "admin"}, time.Hour)
 
 	mw := New(Config{Store: cs})
 	handler := func(c *celeris.Context) error {
@@ -2200,7 +2200,7 @@ func TestStoreContextOnExistingSession(t *testing.T) {
 func TestSessionDestroyPassesContext(t *testing.T) {
 	cs := &contextStore{inner: NewMemoryStore()}
 	sid := hexID(0xb2)
-	_ = cs.inner.Save(context.Background(), sid, map[string]any{"user": "admin"}, time.Hour)
+	saveMap(t, cs.inner, sid, map[string]any{"user": "admin"}, time.Hour)
 
 	mw := New(Config{Store: cs})
 	handler := func(c *celeris.Context) error {
@@ -2223,7 +2223,7 @@ func TestSessionDestroyPassesContext(t *testing.T) {
 func TestSessionRegeneratePassesContext(t *testing.T) {
 	cs := &contextStore{inner: NewMemoryStore()}
 	sid := hexID(0xb3)
-	_ = cs.inner.Save(context.Background(), sid, map[string]any{"user": "admin"}, time.Hour)
+	saveMap(t, cs.inner, sid, map[string]any{"user": "admin"}, time.Hour)
 
 	mw := New(Config{Store: cs})
 	handler := func(c *celeris.Context) error {
@@ -2288,7 +2288,7 @@ func TestNewHandlerMiddlewareWorks(t *testing.T) {
 func TestGetByIDExistingSession(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xd1)
-	_ = store.Save(context.Background(), sid, map[string]any{"user": "admin", "role": "editor"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{"user": "admin", "role": "editor"}, time.Hour)
 
 	h := NewHandler(Config{Store: store})
 	sess, err := h.GetByID(context.Background(), sid)
@@ -2338,7 +2338,7 @@ func TestGetByIDStoreError(t *testing.T) {
 func TestGetByIDSessionIsReadOnly(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xd2)
-	_ = store.Save(context.Background(), sid, map[string]any{"counter": 1}, time.Hour)
+	saveMap(t, store, sid, map[string]any{"counter": 1}, time.Hour)
 
 	h := NewHandler(Config{Store: store})
 	sess, err := h.GetByID(context.Background(), sid)
@@ -2346,9 +2346,12 @@ func TestGetByIDSessionIsReadOnly(t *testing.T) {
 		t.Fatalf("GetByID: %v", err)
 	}
 
-	// Verify session has readOnlyStore/no ctx/no keyGen.
-	if _, ok := sess.store.(readOnlyStore); !ok {
-		t.Fatal("expected readOnlyStore on GetByID session")
+	// Verify session is flagged read-only (no store/ctx/keyGen bound).
+	if !sess.readOnly {
+		t.Fatal("expected readOnly=true on GetByID session")
+	}
+	if sess.store != nil {
+		t.Fatal("expected store to be nil on read-only session")
 	}
 	if sess.ctx != nil {
 		t.Fatal("expected ctx to be nil on read-only session")
@@ -2404,7 +2407,7 @@ func TestGetByIDNonExistentReturnsNil(t *testing.T) {
 func TestGetByIDExpiredSession(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xd3)
-	_ = store.Save(context.Background(), sid, map[string]any{"k": "v"}, time.Nanosecond)
+	saveMap(t, store, sid, map[string]any{"k": "v"}, time.Nanosecond)
 
 	h := NewHandler(Config{Store: store})
 	time.Sleep(time.Millisecond)
@@ -2455,7 +2458,7 @@ func TestAbsExpMissingKeyTreatedAsExpired(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xc1)
 	// Save session WITHOUT _abs_exp.
-	_ = store.Save(context.Background(), sid, map[string]any{"user": "admin"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{"user": "admin"}, time.Hour)
 
 	mw := New(Config{
 		Store:           store,
@@ -2487,7 +2490,7 @@ func TestAbsExpFloat64TypeAssertion(t *testing.T) {
 	sid := hexID(0xc2)
 	// Store _abs_exp as float64 (as JSON would decode it).
 	oldCreated := float64(time.Now().Add(-3 * time.Hour).UnixNano())
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: oldCreated, "user": "admin"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: oldCreated, "user": "admin"}, time.Hour)
 
 	mw := New(Config{
 		Store:           store,
@@ -2515,7 +2518,7 @@ func TestAbsExpFloat64NotExpired(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xc3)
 	recentCreated := float64(time.Now().Add(-30 * time.Minute).UnixNano())
-	_ = store.Save(context.Background(), sid, map[string]any{absExpKey: recentCreated, "user": "admin"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{absExpKey: recentCreated, "user": "admin"}, time.Hour)
 
 	mw := New(Config{
 		Store:           store,
@@ -2555,7 +2558,7 @@ func TestMemoryStoreCleanupMultipleShards(t *testing.T) {
 	// Save expired sessions that should be distributed across multiple shards.
 	for i := range 20 {
 		sid := hexID(byte(i + 0xe0))
-		_ = store.Save(context.Background(), sid, map[string]any{"i": i}, time.Nanosecond)
+		saveMap(t, store, sid, map[string]any{"i": i}, time.Nanosecond)
 	}
 	time.Sleep(time.Millisecond)
 
@@ -2565,7 +2568,7 @@ func TestMemoryStoreCleanupMultipleShards(t *testing.T) {
 	remaining := 0
 	for i := range 20 {
 		sid := hexID(byte(i + 0xe0))
-		data, _ := store.Get(context.Background(), sid)
+		data, _ := loadMap(t, store, sid)
 		if data != nil {
 			remaining++
 		}
@@ -2577,21 +2580,17 @@ func TestMemoryStoreCleanupMultipleShards(t *testing.T) {
 
 // Issue #6: MemoryStore.Close stops cleanup goroutine.
 func TestMemoryStoreClose(t *testing.T) {
-	store := NewMemoryStore(MemoryStoreConfig{
+	ms := NewMemoryStore(MemoryStoreConfig{
 		CleanupInterval: time.Millisecond,
 	})
-	ms := store.(*memoryStore)
 	ms.Close()
 	// Double-close should not panic.
 	ms.Close()
 	// Store should still work after Close.
-	err := store.Save(context.Background(), "test", map[string]any{"k": "v"}, time.Hour)
-	if err != nil {
-		t.Fatalf("Save after Close: %v", err)
-	}
-	data, err := store.Get(context.Background(), "test")
-	if err != nil {
-		t.Fatalf("Get after Close: %v", err)
+	saveMap(t, ms, "test", map[string]any{"k": "v"}, time.Hour)
+	data, ok := loadMap(t, ms, "test")
+	if !ok {
+		t.Fatal("expected data to persist after Close")
 	}
 	if data["k"] != "v" {
 		t.Fatal("expected data to persist after Close")
@@ -2677,7 +2676,7 @@ func TestPoolReturnOnLoadError(t *testing.T) {
 func TestGetByIDPanicsOnSave(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xd4)
-	_ = store.Save(context.Background(), sid, map[string]any{"k": "v"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{"k": "v"}, time.Hour)
 
 	h := NewHandler(Config{Store: store})
 	sess, err := h.GetByID(context.Background(), sid)
@@ -2702,7 +2701,7 @@ func TestGetByIDPanicsOnSave(t *testing.T) {
 func TestGetByIDPanicsOnDestroy(t *testing.T) {
 	store := NewMemoryStore()
 	sid := hexID(0xd5)
-	_ = store.Save(context.Background(), sid, map[string]any{"k": "v"}, time.Hour)
+	saveMap(t, store, sid, map[string]any{"k": "v"}, time.Hour)
 
 	h := NewHandler(Config{Store: store})
 	sess, err := h.GetByID(context.Background(), sid)

@@ -1096,7 +1096,7 @@ func TestStorageSafeMethodStoresToken(t *testing.T) {
 	if token == "" {
 		t.Fatal("expected token")
 	}
-	stored, ok := store.Get(storageKey(token))
+	stored, ok := storeGet(t, store, storageKey(token))
 	if !ok {
 		t.Fatal("token not found in storage")
 	}
@@ -1109,7 +1109,7 @@ func TestStorageUnsafeMethodValidates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Hour)
+	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
@@ -1127,7 +1127,7 @@ func TestStorageUnsafeMethodRejectsExpiredToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Nanosecond)
+	storeSet(t, store, storageKey(validToken), validToken, time.Nanosecond)
 	time.Sleep(time.Millisecond)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
@@ -1162,7 +1162,7 @@ func TestStorageUnsafeMethodRejectsMismatchedRequestToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Hour)
+	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
@@ -1205,7 +1205,7 @@ func TestSingleUseTokenDeletesAfterValidation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Hour)
+	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store, SingleUseToken: true})
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
@@ -1221,7 +1221,7 @@ func TestSingleUseTokenDeletesAfterValidation(t *testing.T) {
 	testutil.AssertStatus(t, rec, 200)
 
 	// Token should be deleted from storage.
-	_, ok := store.Get(storageKey(validToken))
+	_, ok := storeGet(t, store, storageKey(validToken))
 	if ok {
 		t.Fatal("expected token to be deleted from storage after single use")
 	}
@@ -1238,7 +1238,7 @@ func TestSingleUseTokenAtomicGetAndDelete(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Hour)
+	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store, SingleUseToken: true})
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
@@ -1252,7 +1252,7 @@ func TestSingleUseTokenAtomicGetAndDelete(t *testing.T) {
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 
-	_, ok := store.Get(storageKey(validToken))
+	_, ok := storeGet(t, store, storageKey(validToken))
 	if ok {
 		t.Fatal("expected token deleted after single use")
 	}
@@ -1551,7 +1551,7 @@ func TestDeleteTokenWithStorage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Hour)
+	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
 		err := DeleteToken(c)
@@ -1567,7 +1567,7 @@ func TestDeleteTokenWithStorage(t *testing.T) {
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 
-	_, ok := store.Get(storageKey(validToken))
+	_, ok := storeGet(t, store, storageKey(validToken))
 	if ok {
 		t.Fatal("expected token to be deleted from storage")
 	}
@@ -1657,7 +1657,7 @@ func TestHandlerDeleteToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set(storageKey(validToken), validToken, time.Hour)
+	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
 		h := HandlerFromContext(c)
@@ -1672,7 +1672,7 @@ func TestHandlerDeleteToken(t *testing.T) {
 	)
 	testutil.AssertNoError(t, err)
 
-	_, ok := store.Get(storageKey(validToken))
+	_, ok := storeGet(t, store, storageKey(validToken))
 	if ok {
 		t.Fatal("expected token deleted")
 	}
@@ -1685,19 +1685,19 @@ func TestMemoryStorageGetSetDelete(t *testing.T) {
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 2, CleanupContext: ctx})
 
-	_, ok := store.Get("key1")
+	_, ok := storeGet(t, store, "key1")
 	if ok {
 		t.Fatal("expected not found")
 	}
 
-	store.Set("key1", "token1", time.Hour)
-	val, ok := store.Get("key1")
+	storeSet(t, store, "key1", "token1", time.Hour)
+	val, ok := storeGet(t, store, "key1")
 	if !ok || val != "token1" {
 		t.Fatalf("expected token1, got %q (ok=%v)", val, ok)
 	}
 
-	store.Delete("key1")
-	_, ok = store.Get("key1")
+	store.Delete(context.Background(), "key1")
+	_, ok = storeGet(t, store, "key1")
 	if ok {
 		t.Fatal("expected not found after delete")
 	}
@@ -1707,9 +1707,9 @@ func TestMemoryStorageExpiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set("key1", "token1", time.Nanosecond)
+	storeSet(t, store, "key1", "token1", time.Nanosecond)
 	time.Sleep(time.Millisecond)
-	_, ok := store.Get("key1")
+	_, ok := storeGet(t, store, "key1")
 	if ok {
 		t.Fatal("expected expired token not found")
 	}
@@ -1725,9 +1725,9 @@ func TestMemoryStorageConcurrency(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			key := "key" + string(rune('a'+n%26))
-			store.Set(key, "tok", time.Hour)
-			store.Get(key)
-			store.Delete(key)
+			storeSet(t, store, key, "tok", time.Hour)
+			_, _ = storeGet(t, store, key)
+			store.Delete(context.Background(), key)
 		}(i)
 	}
 	wg.Wait()
@@ -1737,8 +1737,8 @@ func TestMemoryStorageDefaultShards(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{CleanupContext: ctx})
-	store.Set("k", "v", time.Hour)
-	val, ok := store.Get("k")
+	storeSet(t, store, "k", "v", time.Hour)
+	val, ok := storeGet(t, store, "k")
 	if !ok || val != "v" {
 		t.Fatal("expected value with default shard count")
 	}
@@ -1749,7 +1749,7 @@ func TestMemoryStorageGetAndDelete(t *testing.T) {
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 2, CleanupContext: ctx})
 
-	_, ok, err := store.GetAndDelete("missing")
+	_, ok, err := storeGetAndDelete(t, store, "missing")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1757,8 +1757,8 @@ func TestMemoryStorageGetAndDelete(t *testing.T) {
 		t.Fatal("expected not found")
 	}
 
-	store.Set("key1", "token1", time.Hour)
-	val, ok, err := store.GetAndDelete("key1")
+	storeSet(t, store, "key1", "token1", time.Hour)
+	val, ok, err := storeGetAndDelete(t, store, "key1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1766,7 +1766,7 @@ func TestMemoryStorageGetAndDelete(t *testing.T) {
 		t.Fatalf("expected token1, got %q (ok=%v)", val, ok)
 	}
 
-	_, ok = store.Get("key1")
+	_, ok = storeGet(t, store, "key1")
 	if ok {
 		t.Fatal("expected key to be deleted after GetAndDelete")
 	}
@@ -1776,9 +1776,9 @@ func TestMemoryStorageGetAndDeleteExpired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
-	store.Set("key1", "token1", time.Nanosecond)
+	storeSet(t, store, "key1", "token1", time.Nanosecond)
 	time.Sleep(time.Millisecond)
-	_, ok, err := store.GetAndDelete("key1")
+	_, ok, err := storeGetAndDelete(t, store, "key1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1948,7 +1948,7 @@ func TestSafeMethodDoesNotRefreshExpiryForExistingToken(t *testing.T) {
 	defer cancel()
 	store := NewMemoryStorage(MemoryStorageConfig{Shards: 1, CleanupContext: ctx})
 
-	store.Set(storageKey(validToken), validToken, 100*time.Millisecond)
+	storeSet(t, store, storageKey(validToken), validToken, 100*time.Millisecond)
 
 	mw := New(Config{Storage: store, Expiration: time.Hour})
 	handler := func(c *celeris.Context) error {
@@ -1963,7 +1963,7 @@ func TestSafeMethodDoesNotRefreshExpiryForExistingToken(t *testing.T) {
 
 	time.Sleep(150 * time.Millisecond)
 
-	_, ok := store.Get(storageKey(validToken))
+	_, ok := storeGet(t, store, storageKey(validToken))
 	if ok {
 		t.Fatal("expected token to expire (safe method should not refresh expiry)")
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/goceleris/celeris/middleware/internal/extract"
 	"github.com/goceleris/celeris/middleware/internal/randutil"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // ContextKey is the default context store key for the CSRF token.
@@ -65,7 +66,7 @@ type tokenExtractor = extract.Func
 // middleware closure and Handler always see consistent values without
 // synchronization.
 type Handler struct {
-	storage        Storage
+	storage        store.KV
 	tokenLen       int
 	cookieName     string
 	cookiePath     string
@@ -85,7 +86,7 @@ func (h *Handler) DeleteToken(c *celeris.Context) error {
 		return ErrTokenNotFound
 	}
 	if h.storage != nil {
-		h.storage.Delete(storageKey(cookieToken))
+		_ = h.storage.Delete(c.Context(), storageKey(cookieToken))
 	}
 	c.SetCookie(&celeris.Cookie{
 		Name:     h.cookieName,
@@ -211,13 +212,13 @@ func New(config ...Config) celeris.HandlerFunc {
 				token = genToken()
 				newToken = true
 			} else if storage != nil {
-				if _, ok := storage.Get(storageKey(token)); !ok {
+				if _, gerr := storage.Get(c.Context(), storageKey(token)); errors.Is(gerr, store.ErrNotFound) {
 					token = genToken()
 					newToken = true
 				}
 			}
 			if storage != nil && newToken {
-				storage.Set(storageKey(token), token, expiration)
+				_ = storage.Set(c.Context(), storageKey(token), []byte(token), expiration)
 			}
 			setCookie(c, token)
 			c.AddHeader("vary", "Cookie")
@@ -273,21 +274,29 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		if storage != nil {
 			key := storageKey(cookieToken)
-			var storedToken string
-			var ok bool
+			var storedToken []byte
+			var gerr error
 			if singleUse {
-				var err error
-				storedToken, ok, err = storage.GetAndDelete(key)
-				if err != nil {
-					return errorHandler(c, ErrForbidden)
+				if gd, ok := storage.(store.GetAndDeleter); ok {
+					storedToken, gerr = gd.GetAndDelete(c.Context(), key)
+				} else {
+					// Non-atomic fallback: TOCTOU-susceptible when multiple
+					// requests arrive with the same token concurrently.
+					storedToken, gerr = storage.Get(c.Context(), key)
+					if gerr == nil {
+						_ = storage.Delete(c.Context(), key)
+					}
 				}
 			} else {
-				storedToken, ok = storage.Get(key)
+				storedToken, gerr = storage.Get(c.Context(), key)
 			}
-			if !ok {
+			if errors.Is(gerr, store.ErrNotFound) {
 				return errorHandler(c, ErrForbidden)
 			}
-			if subtle.ConstantTimeCompare([]byte(storedToken), []byte(requestToken)) != 1 {
+			if gerr != nil {
+				return errorHandler(c, ErrForbidden)
+			}
+			if subtle.ConstantTimeCompare(storedToken, []byte(requestToken)) != 1 {
 				return errorHandler(c, ErrForbidden)
 			}
 		} else {

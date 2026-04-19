@@ -92,10 +92,11 @@ func ExampleNew_customStore() {
 	})
 }
 
-func ExampleStore_Reset() {
-	store := session.NewMemoryStore()
-	// Wipe all sessions (e.g., admin "log out all users").
-	_ = store.Reset(context.Background())
+func ExampleNewMemoryStore_reset() {
+	kv := session.NewMemoryStore()
+	// Wipe all sessions (e.g., admin "log out all users"). MemoryStore
+	// implements store.PrefixDeleter; an empty prefix clears every key.
+	_ = kv.DeletePrefix(context.Background(), "")
 }
 
 func ExampleNew_contextAwareStore() {

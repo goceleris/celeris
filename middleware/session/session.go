@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // ErrSessionDestroyed is returned when Save is called after Destroy.
@@ -26,7 +27,7 @@ var sessionPool = sync.Pool{New: func() any { return &Session{} }}
 type Session struct {
 	id           string
 	data         map[string]any
-	store        Store
+	store        store.KV
 	ctx          context.Context
 	expiry       time.Duration
 	idleOverride time.Duration // per-session idle timeout override; 0 = use config default
@@ -34,6 +35,7 @@ type Session struct {
 	modified     bool
 	fresh        bool // true for newly created sessions
 	destroyed    bool
+	readOnly     bool // true when session was obtained via Handler.GetByID
 }
 
 // Get returns the value for key from the session data.
@@ -144,12 +146,22 @@ func (s *Session) Save() error {
 	if s.destroyed {
 		return ErrSessionDestroyed
 	}
-	return s.store.Save(s.ctx, s.id, s.data, s.expiry)
+	if s.readOnly {
+		panic("session: Save called on a read-only session returned by GetByID; use the middleware pipeline for writes")
+	}
+	buf, err := store.EncodeJSON(s.data)
+	if err != nil {
+		return err
+	}
+	return s.store.Set(s.ctx, s.id, buf, s.expiry)
 }
 
 // Destroy invalidates the session by clearing data and deleting it from
 // the store.
 func (s *Session) Destroy() error {
+	if s.readOnly {
+		panic("session: Destroy called on a read-only session returned by GetByID; use the middleware pipeline for writes")
+	}
 	s.data = make(map[string]any)
 	s.modified = false
 	s.destroyed = true
@@ -166,6 +178,9 @@ func (s *Session) Destroy() error {
 // Applications MUST call Regenerate after authentication state changes
 // (e.g., login, privilege escalation) to prevent session fixation attacks.
 func (s *Session) Regenerate() error {
+	if s.readOnly {
+		panic("session: Regenerate called on a read-only session returned by GetByID; use the middleware pipeline for writes")
+	}
 	oldID := s.id
 	s.id = s.keyGen()
 	if err := s.store.Delete(s.ctx, oldID); err != nil {
@@ -234,7 +249,7 @@ func validSessionID(s string) bool {
 // Handler holds the session middleware and provides methods for out-of-band
 // session access (e.g., admin tools, background jobs).
 type Handler struct {
-	store Store
+	store store.KV
 	mw    celeris.HandlerFunc
 }
 
@@ -251,39 +266,22 @@ func (h *Handler) Middleware() celeris.HandlerFunc { return h.mw }
 // message because no store or context is bound.
 // Returns nil and no error if the session does not exist.
 func (h *Handler) GetByID(ctx context.Context, id string) (*Session, error) {
-	data, err := h.store.Get(ctx, id)
+	raw, err := h.store.Get(ctx, id)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
-	if data == nil {
-		return nil, nil
+	data := make(map[string]any)
+	if derr := store.DecodeJSON(raw, &data); derr != nil {
+		return nil, derr
 	}
 	return &Session{
-		id:    id,
-		data:  data,
-		store: readOnlyStore{},
+		id:       id,
+		data:     data,
+		readOnly: true,
 	}, nil
-}
-
-// readOnlyStore is a sentinel Store that panics on any mutating operation.
-// It is assigned to sessions returned by [Handler.GetByID] to provide
-// clear error messages if callers accidentally attempt writes.
-type readOnlyStore struct{}
-
-func (readOnlyStore) Get(_ context.Context, _ string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (readOnlyStore) Save(_ context.Context, _ string, _ map[string]any, _ time.Duration) error {
-	panic("session: Save called on a read-only session returned by GetByID; use the middleware pipeline for writes")
-}
-
-func (readOnlyStore) Delete(_ context.Context, _ string) error {
-	panic("session: Delete called on a read-only session returned by GetByID; use the middleware pipeline for writes")
-}
-
-func (readOnlyStore) Reset(_ context.Context) error {
-	panic("session: Reset called on a read-only session returned by GetByID; use the middleware pipeline for writes")
 }
 
 // NewHandler creates a session [Handler] that exposes both the middleware
@@ -318,7 +316,6 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		skipMap[p] = struct{}{}
 	}
 
-	store := cfg.Store
 	cookieName := cfg.CookieName
 	keyGen := cfg.KeyGenerator
 	idleTimeout := cfg.IdleTimeout
@@ -345,6 +342,8 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		SameSite: cfg.CookieSameSite,
 	}
 
+	kv := cfg.Store
+
 	return func(c *celeris.Context) error {
 		if cfg.Skip != nil && cfg.Skip(c) {
 			return c.Next()
@@ -357,7 +356,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		reqCtx := c.Context()
 
 		sess := sessionPool.Get().(*Session)
-		sess.store = store
+		sess.store = kv
 		sess.ctx = reqCtx
 		sess.expiry = idleTimeout
 		sess.keyGen = keyGen
@@ -367,6 +366,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		sess.destroyed = false
 		sess.fresh = false
 		sess.idleOverride = 0
+		sess.readOnly = false
 
 		// Register cleanup callback to return session to pool on all exit
 		// paths — including panics (issue #12: pool leak on error paths).
@@ -384,9 +384,16 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 			sid = ""
 		}
 		if sid != "" {
-			data, loadErr := store.Get(reqCtx, sid)
-			if loadErr != nil {
+			raw, loadErr := kv.Get(reqCtx, sid)
+			var data map[string]any
+			if loadErr != nil && !errors.Is(loadErr, store.ErrNotFound) {
 				return errorHandler(c, loadErr)
+			}
+			if loadErr == nil {
+				data = make(map[string]any)
+				if derr := store.DecodeJSON(raw, &data); derr != nil {
+					return errorHandler(c, derr)
+				}
 			}
 			if data != nil && !absDisabled {
 				// Check absolute timeout.
@@ -411,7 +418,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 					expired = true
 				}
 				if expired {
-					_ = store.Delete(reqCtx, sid)
+					_ = kv.Delete(reqCtx, sid)
 					data = nil
 				}
 			}
@@ -452,7 +459,14 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 			if sess.idleOverride > 0 {
 				expiry = sess.idleOverride
 			}
-			saveErr := store.Save(reqCtx, sess.id, sess.data, expiry)
+			buf, encErr := store.EncodeJSON(sess.data)
+			if encErr != nil {
+				if chainErr != nil {
+					return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", encErr, chainErr))
+				}
+				return errorHandler(c, encErr)
+			}
+			saveErr := kv.Set(reqCtx, sess.id, buf, expiry)
 			if saveErr != nil {
 				// Issue #11: wrap chainErr with save error so neither
 				// is swallowed.

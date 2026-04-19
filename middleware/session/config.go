@@ -6,6 +6,7 @@ import (
 	"github.com/goceleris/celeris"
 
 	"github.com/goceleris/celeris/middleware/internal/randutil"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // ContextKey is the context store key for the session object.
@@ -56,8 +57,10 @@ type Config struct {
 	// SkipPaths lists paths to skip (exact match).
 	SkipPaths []string
 
-	// Store is the session backend. Default: NewMemoryStore().
-	Store Store
+	// Store is the session backend. Default: [NewMemoryStore].
+	// Sessions are JSON-encoded before persistence; custom [store.KV]
+	// backends (Redis, Postgres) must preserve byte slice contents.
+	Store store.KV
 
 	// Extractor extracts the session ID from the request. Default:
 	// CookieExtractor(CookieName). When a non-cookie extractor is used,
