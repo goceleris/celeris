@@ -85,7 +85,7 @@ func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	b.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	waitReady(b, addr)
 
-	cli, err := celredis.NewClient(redisAddr, celredis.WithEngine(srv))
+	cli, err := celredis.NewClient(redisAddr)
 	if err != nil {
 		b.Fatalf("celeris redis: %v", err)
 	}

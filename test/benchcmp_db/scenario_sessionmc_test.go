@@ -72,7 +72,7 @@ func startCelerisSessionMCServer(b *testing.B, mcAddr string) string {
 	b.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	waitReady(b, addr)
 
-	cli, err := celmc.NewClient(mcAddr, celmc.WithEngine(srv))
+	cli, err := celmc.NewClient(mcAddr)
 	if err != nil {
 		b.Fatalf("celeris mc: %v", err)
 	}

@@ -105,7 +105,7 @@ func startCelerisPGServer(b *testing.B, dsn string) string {
 	waitReady(b, addr)
 
 	// Now that the server is live, open the pool with WithEngine.
-	pool, err := celpostgres.Open(dsn, celpostgres.WithEngine(srv))
+	pool, err := celpostgres.Open(dsn)
 	if err != nil {
 		b.Fatalf("celeris pg: %v", err)
 	}
