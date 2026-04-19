@@ -55,21 +55,21 @@ const bufRingCount = 128
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
-	id           int
-	cpuID        int
-	ring         *Ring
-	listenFD     int
-	tier         TierStrategy
-	fixedFiles   bool // runtime flag: true if ACCEPT_DIRECT is working
-	sqpoll       bool // true when SQPOLL is active (kernel submits SQEs)
-	sendZC       bool // true when SEND_ZC is available (kernel 6.0+)
-	async        bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	id         int
+	cpuID      int
+	ring       *Ring
+	listenFD   int
+	tier       TierStrategy
+	fixedFiles bool // runtime flag: true if ACCEPT_DIRECT is working
+	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
+	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
+	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
 
 	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
 	// can Wait on them before returning. See engine/epoll/loop.go
 	// for rationale — keeps dispatch Gs from touching connState
 	// memory after the engine claims to have stopped.
-	asyncWG sync.WaitGroup
+	asyncWG      sync.WaitGroup
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
 	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
