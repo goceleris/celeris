@@ -273,6 +273,66 @@ jobs:
           ./test/conformance/memcached/...
 
   # ------------------------------------------------------------------
+  # Memcached Cluster Failover — 3-node ring per memcached version with
+  # mid-test node kills and probe-based recovery. Exercises the v1.4.1
+  # failover paths: pickNode successor walk, recordResult threshold,
+  # probeLoop recovery, NodeHealth/NodeStatsMap surfaces.
+  # ------------------------------------------------------------------
+  memcached-cluster-failover:
+    name: Memcached ${{ matrix.memcached }} Cluster Failover
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        memcached: ["1.6.29", "1.6.36", "1.6.41"]
+    env:
+      CELERIS_MEMCACHED_CLUSTER_ADDRS: "127.0.0.1:11211,127.0.0.1:11212,127.0.0.1:11213"
+    services:
+      memcached-a:
+        image: memcached:${{ matrix.memcached }}-alpine
+        ports:
+          - 11211:11211
+        options: >-
+          --health-cmd "echo version | nc -w 1 localhost 11211 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      memcached-b:
+        image: memcached:${{ matrix.memcached }}-alpine
+        ports:
+          - 11212:11211
+        options: >-
+          --health-cmd "echo version | nc -w 1 localhost 11211 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      memcached-c:
+        image: memcached:${{ matrix.memcached }}-alpine
+        ports:
+          - 11213:11211
+        options: >-
+          --health-cmd "echo version | nc -w 1 localhost 11211 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: In-process failover suite
+        run: >-
+          go test -race -count=1 -timeout=300s -v
+          -run "TestClusterFailover|TestClusterFailureThresholdHysteresis"
+          ./driver/memcached/...
+      - name: Cluster-failover conformance (live services)
+        run: >-
+          go test -tags memcached_cluster_failover -race -count=1 -timeout=240s -v
+          ./test/conformance/memcached/...
+
+  # ------------------------------------------------------------------
   # Redis Cluster — real 6-node topology per Redis major line.
   # ------------------------------------------------------------------
   redis-cluster:
