@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,15 +58,17 @@ func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	addr := freePort(b)
 	srv := celeris.New(celeris.Config{Addr: addr})
 
-	// Same WithEngine wiring as PGQuery scenario — Redis I/O rides
-	// the server's event loop for per-worker locality.
-	cli, err := celredis.NewClient(redisAddr, celredis.WithEngine(srv))
-	if err != nil {
-		b.Fatalf("celeris redis: %v", err)
-	}
-	b.Cleanup(func() { _ = cli.Close() })
+	// Pool is opened AFTER Start so WithEngine resolves to the live
+	// engine's EventLoopProvider; otherwise the driver falls back to
+	// its standalone loop (measured ~6-9x slower on arm64 Linux).
+	var cliPtr atomic.Pointer[celredis.Client]
+
 	srv.GET("/health", func(c *celeris.Context) error { return c.String(200, "ok") })
 	srv.GET("/me", func(c *celeris.Context) error {
+		cli := cliPtr.Load()
+		if cli == nil {
+			return c.String(503, "not ready")
+		}
 		sid := c.Header(strings.ToLower(sessHeader))
 		raw, err := cli.GetBytes(c.Context(), sid)
 		if err != nil {
@@ -81,6 +84,25 @@ func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	go func() { _ = srv.Start() }()
 	b.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	waitReady(b, addr)
+
+	cli, err := celredis.NewClient(redisAddr, celredis.WithEngine(srv))
+	if err != nil {
+		b.Fatalf("celeris redis: %v", err)
+	}
+	b.Cleanup(func() { _ = cli.Close() })
+	cliPtr.Store(cli)
+
+	// Warm up so first bench iteration doesn't pay dial cost.
+	warmClient := httpClient("warm-sess-" + addr)
+	req, _ := http.NewRequest("GET", "http://"+addr+"/me", nil)
+	req.Header.Set(sessHeader, sessKey)
+	for i := 0; i < 8; i++ {
+		resp, err := warmClient.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}
 	return addr
 }
 

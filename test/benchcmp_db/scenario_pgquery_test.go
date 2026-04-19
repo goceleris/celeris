@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,18 +72,20 @@ func startCelerisPGServer(b *testing.B, dsn string) string {
 	addr := freePort(b)
 	srv := celeris.New(celeris.Config{Addr: addr})
 
-	// Open the pool bound to the server's event loop so PG I/O and
-	// HTTP I/O share per-worker locality — this is the v1.4.0 fast
-	// path; without it the driver falls back to its standalone loop
-	// which competes with the HTTP loop for cycles.
-	pool, err := celpostgres.Open(dsn, celpostgres.WithEngine(srv))
-	if err != nil {
-		b.Fatalf("celeris pg: %v", err)
-	}
-	b.Cleanup(func() { _ = pool.Close() })
+	// Pool is opened AFTER the server starts so WithEngine resolves
+	// to the live engine's event loop — if we opened before Start,
+	// the server's EventLoopProvider returns nil and the driver
+	// falls back to its standalone loop (measured ~9x slower).
+	// The handler closure reads the pool through an atomic pointer
+	// so route registration works before the pool exists.
+	var poolPtr atomic.Pointer[celpostgres.Pool]
 
 	srv.GET("/health", func(c *celeris.Context) error { return c.String(200, "ok") })
 	srv.GET("/user", func(c *celeris.Context) error {
+		pool := poolPtr.Load()
+		if pool == nil {
+			return c.String(503, "not ready")
+		}
 		rows, err := pool.QueryContext(c.Context(), "SELECT id, name FROM bench_users WHERE id=$1", 1)
 		if err != nil {
 			return c.String(500, "query")
@@ -100,6 +103,24 @@ func startCelerisPGServer(b *testing.B, dsn string) string {
 	go func() { _ = srv.Start() }()
 	b.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	waitReady(b, addr)
+
+	// Now that the server is live, open the pool with WithEngine.
+	pool, err := celpostgres.Open(dsn, celpostgres.WithEngine(srv))
+	if err != nil {
+		b.Fatalf("celeris pg: %v", err)
+	}
+	b.Cleanup(func() { _ = pool.Close() })
+	poolPtr.Store(pool)
+
+	// Warm up so the first request doesn't eat a dial roundtrip.
+	client := httpClient("warm-pg-" + addr)
+	for i := 0; i < 8; i++ {
+		resp, err := client.Get("http://" + addr + "/user")
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}
 	return addr
 }
 
