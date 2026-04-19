@@ -112,14 +112,28 @@ func startCelerisPGServer(b *testing.B, dsn string) string {
 	b.Cleanup(func() { _ = pool.Close() })
 	poolPtr.Store(pool)
 
-	// Warm up so the first request doesn't eat a dial roundtrip.
-	client := httpClient("warm-pg-" + addr)
-	for i := 0; i < 8; i++ {
-		resp, err := client.Get("http://" + addr + "/user")
-		if err == nil {
+	// Warm up. We aggressively warm so each worker in the io_uring /
+	// epoll engine has an established PG connection in its idle list
+	// — otherwise the first few bench iterations pay a full Parse
+	// roundtrip and dominate the measurement. 200 requests with
+	// parallel clients covers all 12 workers on a 12-core arm64.
+	warmClient := httpClient("warm-pg-" + addr)
+	type res struct{ err error }
+	done := make(chan res, 200)
+	for i := 0; i < 200; i++ {
+		go func() {
+			resp, err := warmClient.Get("http://" + addr + "/user")
+			if err != nil {
+				done <- res{err}
+				return
+			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-		}
+			done <- res{}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		<-done
 	}
 	return addr
 }

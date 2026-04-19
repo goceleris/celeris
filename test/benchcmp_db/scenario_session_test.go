@@ -92,16 +92,28 @@ func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	b.Cleanup(func() { _ = cli.Close() })
 	cliPtr.Store(cli)
 
-	// Warm up so first bench iteration doesn't pay dial cost.
+	// Warm up every engine worker (up to 12 cores on arm64). Parallel
+	// so all workers see a request before the bench starts — otherwise
+	// cold worker dispatches pay the first Redis dial.
 	warmClient := httpClient("warm-sess-" + addr)
-	req, _ := http.NewRequest("GET", "http://"+addr+"/me", nil)
-	req.Header.Set(sessHeader, sessKey)
-	for i := 0; i < 8; i++ {
-		resp, err := warmClient.Do(req)
-		if err == nil {
+	type res struct{ err error }
+	done := make(chan res, 200)
+	for i := 0; i < 200; i++ {
+		go func() {
+			req, _ := http.NewRequest("GET", "http://"+addr+"/me", nil)
+			req.Header.Set(sessHeader, sessKey)
+			resp, err := warmClient.Do(req)
+			if err != nil {
+				done <- res{err}
+				return
+			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-		}
+			done <- res{}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		<-done
 	}
 	return addr
 }
