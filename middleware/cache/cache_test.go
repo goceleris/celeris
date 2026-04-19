@@ -81,6 +81,29 @@ func TestCacheStatusFilter(t *testing.T) {
 	}
 }
 
+func TestCacheControlMaxAgeCapsTTL(t *testing.T) {
+	kv := store.NewMemoryKV()
+	defer kv.Close()
+	handler := func(c *celeris.Context) error {
+		c.SetHeader("cache-control", "public, max-age=1")
+		return c.String(200, "ok")
+	}
+	mw := New(Config{Store: kv, TTL: time.Hour})
+
+	_ = runOnce(t, mw, handler, "GET", "/cc")
+	rec := runOnce(t, mw, handler, "GET", "/cc")
+	if got := rec.Header("x-cache"); got != "HIT" {
+		t.Fatalf("expected HIT while within 1s max-age, got %q", got)
+	}
+	// Wait for the cap to elapse; entry should expire even though
+	// cfg.TTL=1h.
+	time.Sleep(1100 * time.Millisecond)
+	rec2 := runOnce(t, mw, handler, "GET", "/cc")
+	if got := rec2.Header("x-cache"); got != "MISS" {
+		t.Fatalf("expected MISS after max-age cap elapsed, got %q", got)
+	}
+}
+
 func TestCacheControlNoStore(t *testing.T) {
 	kv := store.NewMemoryKV()
 	defer kv.Close()

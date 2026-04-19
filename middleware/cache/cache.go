@@ -93,25 +93,29 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		// Singleflight: only the leader runs the handler. Followers decode
 		// the leader's encoded bytes and replay on their own Context.
-		bytes, leader, err := sf.do(key, func() ([]byte, error) {
-			return executeAndReturn(c, cfg, include, exclude)
+		// sfResult carries the encoded bytes plus the effective TTL the
+		// leader computed so followers don't re-derive it (and so the
+		// leader can apply per-response Cache-Control max-age caps).
+		res, leader, err := sf.do(key, func() (sfResult, error) {
+			buf, ttl, rerr := executeAndReturnWithTTL(c, cfg, include, exclude)
+			return sfResult{bytes: buf, ttl: ttl}, rerr
 		})
 		if err != nil {
 			return err
 		}
 		if leader {
-			if bytes != nil {
-				_ = cfg.Store.Set(ctx, key, bytes, cfg.TTL)
+			if res.bytes != nil {
+				_ = cfg.Store.Set(ctx, key, res.bytes, res.ttl)
 			}
 			return nil
 		}
 		// Follower path.
-		if bytes == nil {
+		if res.bytes == nil {
 			// Leader determined the response is not cacheable. Followers
 			// fall back to running their own handler.
 			return executeAndStore(c, cfg, include, exclude, key)
 		}
-		rep, derr := store.DecodeResponse(bytes)
+		rep, derr := store.DecodeResponse(res.bytes)
 		if derr != nil {
 			return executeAndStore(c, cfg, include, exclude, key)
 		}
@@ -120,39 +124,46 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 }
 
+// sfResult bundles the encoded response bytes and the effective TTL
+// (possibly capped by Cache-Control max-age) so the singleflight
+// leader can pass both to its waiters and the store.
+type sfResult struct {
+	bytes []byte
+	ttl   time.Duration
+}
+
 // executeAndStore runs the handler, flushes its response to the wire
 // with the MISS header, and stores the encoded bytes on cache
 // eligibility. Used on the non-singleflight path and by followers that
 // fall back (leader produced no cacheable bytes).
 func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string) error {
-	bytes, err := executeAndReturn(c, cfg, include, exclude)
+	bytes, ttl, err := executeAndReturnWithTTL(c, cfg, include, exclude)
 	if err != nil {
 		return err
 	}
 	if bytes != nil {
-		_ = cfg.Store.Set(c.Context(), key, bytes, cfg.TTL)
+		_ = cfg.Store.Set(c.Context(), key, bytes, ttl)
 	}
 	return nil
 }
 
-// executeAndReturn buffers + runs the remaining handler chain on c,
-// flushes the wire with the MISS header set, and returns the encoded
-// bytes iff the response is cacheable. Returns (nil, nil) when the
-// response is ineligible (status filter, body size, no-store, etc.).
-func executeAndReturn(c *celeris.Context, cfg Config, include, exclude map[string]struct{}) ([]byte, error) {
+// executeAndReturnWithTTL buffers + runs the remaining handler chain
+// on c, flushes the wire with the MISS header set, and returns the
+// (encoded-bytes, effective-ttl) iff the response is cacheable.
+// Effective TTL is min(cfg.TTL, Cache-Control max-age) when
+// RespectCacheControl is enabled. Returns (nil, 0, nil) for ineligible
+// responses (status filter, size cap, no-store/private, etc.).
+func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude map[string]struct{}) ([]byte, time.Duration, error) {
 	c.BufferResponse()
 	chainErr := c.Next()
-	// The outer ctx.Next() loop will also try to advance beyond the
-	// last handler, which is a no-op; no extra handler runs because
-	// Next returned after executing the final handler.
 	status := c.ResponseStatus()
 	body := c.ResponseBody()
 	respHeaders := c.ResponseHeaders()
 
 	var cacheBytes []byte
+	effectiveTTL := cfg.TTL
 	if chainErr == nil && cfg.StatusFilter(status) && len(body) <= cfg.MaxBodyBytes {
 		cacheable := true
-		ttl := cfg.TTL
 		if cfg.RespectCacheControl {
 			for _, h := range respHeaders {
 				if strings.EqualFold(h[0], "cache-control") {
@@ -162,17 +173,13 @@ func executeAndReturn(c *celeris.Context, cfg Config, include, exclude map[strin
 						break
 					}
 					if secs, ok := parseMaxAge(v); ok {
-						if d := time.Duration(secs) * time.Second; d > 0 && d < ttl {
-							ttl = d
+						if d := time.Duration(secs) * time.Second; d > 0 && d < effectiveTTL {
+							effectiveTTL = d
 						}
 					}
 				}
 			}
 		}
-		_ = ttl // TTL cap from Cache-Control is honored via the Set call below when
-		// we're not in singleflight — the singleflight leader uses cfg.TTL. For
-		// simplicity this first implementation uses cfg.TTL uniformly; a follow-up
-		// may thread the per-response TTL through.
 		if cacheable {
 			filtered := filterHeaders(respHeaders, include, exclude)
 			enc := store.EncodedResponse{Status: status, Headers: filtered, Body: body}
@@ -185,12 +192,12 @@ func executeAndReturn(c *celeris.Context, cfg Config, include, exclude map[strin
 		c.SetHeader(cfg.HeaderName, "MISS")
 	}
 	if ferr := c.FlushResponse(); ferr != nil {
-		return cacheBytes, ferr
+		return cacheBytes, effectiveTTL, ferr
 	}
 	if chainErr != nil {
-		return nil, chainErr
+		return nil, 0, chainErr
 	}
-	return cacheBytes, nil
+	return cacheBytes, effectiveTTL, nil
 }
 
 func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {
@@ -304,7 +311,7 @@ type sfGroup struct {
 
 type sfCall struct {
 	wg     sync.WaitGroup
-	result []byte
+	result sfResult
 	err    error
 }
 
@@ -312,7 +319,7 @@ func newSingleflight() *sfGroup {
 	return &sfGroup{calls: make(map[string]*sfCall)}
 }
 
-func (g *sfGroup) do(key string, fn func() ([]byte, error)) ([]byte, bool, error) {
+func (g *sfGroup) do(key string, fn func() (sfResult, error)) (sfResult, bool, error) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
 		g.mu.Unlock()

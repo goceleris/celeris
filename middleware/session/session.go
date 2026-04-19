@@ -17,6 +17,15 @@ var ErrSessionDestroyed = errors.New("session: cannot save a destroyed session")
 
 var sessionPool = sync.Pool{New: func() any { return &Session{} }}
 
+// sessionDataPool recycles the decoded session map so repeat Get paths
+// avoid allocating a fresh map on every request. The map is cleared
+// before handing out and after the request releases the session, so
+// no data leaks between requests.
+var sessionDataPool = sync.Pool{New: func() any {
+	m := make(map[string]any, 8)
+	return &m
+}}
+
 // Session holds per-request session data backed by a [Store].
 //
 // Session is designed for single-goroutine-per-request access and is NOT
@@ -36,6 +45,7 @@ type Session struct {
 	fresh        bool // true for newly created sessions
 	destroyed    bool
 	readOnly     bool // true when session was obtained via Handler.GetByID
+	pooledMap    bool // data slice was drawn from sessionDataPool and must be returned
 }
 
 // Get returns the value for key from the session data.
@@ -372,7 +382,13 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		// paths — including panics (issue #12: pool leak on error paths).
 		returnToPool := func() {
 			c.Set(ContextKey, nil) // issue #1: clear context key before pool Put
+			if sess.data != nil && sess.pooledMap {
+				clear(sess.data)
+				m := sess.data
+				sessionDataPool.Put(&m)
+			}
 			sess.data = nil
+			sess.pooledMap = false
 			sess.ctx = nil
 			sessionPool.Put(sess)
 		}
@@ -390,10 +406,14 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 				return errorHandler(c, loadErr)
 			}
 			if loadErr == nil {
-				data = make(map[string]any)
+				mp := sessionDataPool.Get().(*map[string]any)
+				data = *mp
 				if derr := store.DecodeJSON(raw, &data); derr != nil {
+					clear(data)
+					sessionDataPool.Put(mp)
 					return errorHandler(c, derr)
 				}
+				sess.pooledMap = true
 			}
 			if data != nil && !absDisabled {
 				// Check absolute timeout.
