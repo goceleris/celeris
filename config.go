@@ -99,6 +99,28 @@ type Config struct {
 	// Default false (metrics enabled).
 	DisableMetrics bool
 
+	// AsyncHandlers dispatches HTTP handlers to spawned goroutines instead of
+	// running them inline on the engine's LockOSThread'd worker. Enabling
+	// this is the right choice when handlers do blocking I/O (DB drivers,
+	// external HTTP calls, file reads): the worker returns to epoll_wait /
+	// io_uring_enter while the handler blocks, so the per-worker serialization
+	// ceiling (NumWorkers × 1/RTT) is replaced by goroutine-per-connection
+	// parallelism, matching net/http's concurrency model.
+	//
+	// When AsyncHandlers is set, celeris drivers opened WithEngine(srv) auto-
+	// select their direct net.Conn path (Go netpoll parks handler Gs on
+	// EPOLLIN without blocking an M), validated on MSR1 at celeris-epoll +
+	// celerismc jumping from 64k → 105k rps.
+	//
+	// The cost on pure-CPU handlers is a goroutine spawn per request (~100ns)
+	// plus scheduler overhead — measured regression on a static-response
+	// bench is ~3–5%. Keep AsyncHandlers false for latency-critical CPU-only
+	// workloads; enable it for any workload that touches a DB, cache, or
+	// upstream service.
+	//
+	// Default: false.
+	AsyncHandlers bool
+
 	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
 	// If the callback returns false, the server responds with 417 Expectation Failed
 	// and skips reading the body. If nil, the server always sends 100 Continue.
@@ -119,6 +141,19 @@ type Config struct {
 
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
+
+	// EnableH2Upgrade controls whether the server honors RFC 7540 §3.2
+	// "HTTP/1.1 Upgrade: h2c" requests, promoting an HTTP/1 connection to
+	// cleartext HTTP/2 on the original request's handler (dispatched on
+	// stream 1). Resolution follows three cases:
+	//   - nil (default): inferred from Protocol — enabled for Auto,
+	//     disabled for H2C (clients already speak H2 directly) and for
+	//     HTTP1 (upgrade is irrelevant, no H2 stack available).
+	//   - non-nil true: force enabled. Useful to opt into upgrade on
+	//     Protocol=H2C for clients that prefer to negotiate.
+	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
+	//     the engine intentionally only serves HTTP/1.
+	EnableH2Upgrade *bool
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
@@ -165,9 +200,19 @@ func (c Config) toResourceConfig() resource.Config {
 	}
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize
+	rc.AsyncHandlers = c.AsyncHandlers
 	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
+
+	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
+	// HTTP1/H2C → false). Non-nil → user override honored verbatim.
+	if c.EnableH2Upgrade != nil {
+		rc.EnableH2Upgrade = *c.EnableH2Upgrade
+	} else {
+		p := engine.Protocol(c.Protocol)
+		rc.EnableH2Upgrade = p.IsDefault() || p == engine.Auto
+	}
 
 	return rc
 }

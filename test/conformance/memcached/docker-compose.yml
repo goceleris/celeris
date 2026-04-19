@@ -1,0 +1,29 @@
+# docker-compose.yml — disposable Memcached server for the celeris conformance
+# suite. Start with:
+#
+#   docker compose -f test/conformance/memcached/docker-compose.yml up -d
+#   export CELERIS_MEMCACHED_ADDR=127.0.0.1:11211
+#   go test -tags memcached ./test/conformance/memcached/...
+#
+# Tear down with: docker compose -f ... down -v
+#
+# memcached 1.6-alpine ships with both the text and binary protocols enabled.
+# The default item size cap (-I) is 1 MiB; mcspec tests that push at that
+# boundary assume the default is in effect.
+
+services:
+  memcached:
+    image: memcached:1.6-alpine
+    container_name: celeris-memcached-conformance
+    ports:
+      - "11211:11211"
+    # -v gives the server a little extra log verbosity in case we need to
+    # inspect command framing. Otherwise defaults are fine.
+    command:
+      - memcached
+      - -v
+    healthcheck:
+      test: ["CMD-SHELL", "echo stats | nc -w 1 127.0.0.1 11211 | grep -q version"]
+      interval: 2s
+      timeout: 2s
+      retries: 20

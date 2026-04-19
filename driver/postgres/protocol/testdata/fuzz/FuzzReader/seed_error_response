@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("E\x00\x00\x00\x2aSERROR\x00C42601\x00Msyntax error at or near \"foo\"\x00\x00")

@@ -20,18 +20,25 @@ type PriorityTree struct {
 	dependencies map[uint32][]uint32
 }
 
-// NewPriorityTree creates a new priority tree.
+// NewPriorityTree creates a new priority tree. Maps are nil until the
+// first SetPriority / GetPriority call — many H2 connections (including
+// every RFC 7540 §3.2 h2c upgrade that serves a single request with
+// default priority) never touch them, and an empty map still costs
+// ~48 bytes and an allocation.
 func NewPriorityTree() *PriorityTree {
-	return &PriorityTree{
-		priorities:   make(map[uint32]*Priority),
-		dependencies: make(map[uint32][]uint32),
-	}
+	return &PriorityTree{}
 }
 
 // SetPriority assigns or updates priority information for a stream.
 func (pt *PriorityTree) SetPriority(streamID uint32, priority Priority) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
+
+	// Lazy-init on first write — reads are safe on nil maps.
+	if pt.priorities == nil {
+		pt.priorities = make(map[uint32]*Priority)
+		pt.dependencies = make(map[uint32][]uint32)
+	}
 
 	if oldPriority, ok := pt.priorities[streamID]; ok {
 		pt.removeDependency(streamID, oldPriority.StreamDependency)

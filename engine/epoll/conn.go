@@ -24,12 +24,20 @@ import (
 const (
 	maxPendingBytes         = 4 << 20  // 4 MiB (H1/H2)
 	maxPendingBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+	// maxPendingInputBytes caps the async dispatch input buffer
+	// (cs.asyncInBuf) so a client pipelining requests faster than
+	// the dispatch goroutine drains them cannot balloon per-conn
+	// memory. Same ceiling as the output side (4 MiB) — a full
+	// saturated buffer pair is 8 MiB per conn.
+	maxPendingInputBytes = 4 << 20
 )
 
 // writeCap returns the effective back-pressure limit for cs, accounting
-// for whether the connection is detached.
+// for whether the connection is detached. Async-mode HTTP1 conns set
+// detachMu up front without being truly detached; they keep the H1/H2
+// limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
 func (cs *connState) writeCap() int {
-	if cs.detachMu != nil {
+	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached {
 		return maxPendingBytesDetached
 	}
 	return maxPendingBytes
@@ -68,6 +76,25 @@ type connState struct {
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (single-threaded write)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
+
+	// Async handler dispatch (Config.AsyncHandlers=true, HTTP1 only):
+	// Incoming bytes are appended to asyncInBuf under asyncInMu by the
+	// worker. A single dispatch goroutine per conn drains asyncInBuf
+	// via a double-buffer swap with asyncOutBuf (zero-alloc on the hot
+	// path) and runs ProcessH1 over the pulled data. The goroutine
+	// stays alive across requests — after draining, it blocks on
+	// asyncCond.Wait rather than exiting, so a subsequent read from
+	// the same keep-alive conn reuses the goroutine instead of paying
+	// the spawn cost each request. Matches net/http's goroutine-per-
+	// conn model while preserving HTTP/1.1 pipelining order (ProcessH1
+	// handles pipelined requests in one shot via its internal offset
+	// loop).
+	asyncInBuf  []byte
+	asyncOutBuf []byte
+	asyncInMu   sync.Mutex
+	asyncCond   sync.Cond   // L = &asyncInMu; signaled by worker on new data or close
+	asyncRun    bool        // true while the dispatch goroutine is alive
+	asyncClosed atomic.Bool // set by worker's close path; goroutine exits next iter
 }
 
 var connStatePool = sync.Pool{
@@ -78,7 +105,7 @@ var connStatePool = sync.Pool{
 	},
 }
 
-func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
+func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *connState {
 	cs := connStatePool.Get().(*connState)
 	cs.fd = fd
 	cs.ctx = ctx
@@ -88,6 +115,12 @@ func acquireConnState(ctx context.Context, fd int, bufSize int) *connState {
 		cs.buf = cs.buf[:bufSize]
 	} else {
 		cs.buf = make([]byte, bufSize)
+	}
+	// Async handler dispatch: allocate detachMu so handler goroutine and
+	// worker serialize writeBuf access. Harmless when unused.
+	if async {
+		cs.detachMu = &sync.Mutex{}
+		cs.asyncCond.L = &cs.asyncInMu
 	}
 	return cs
 }
@@ -110,6 +143,10 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.asyncOutBuf = cs.asyncOutBuf[:0]
+	cs.asyncRun = false
+	cs.asyncClosed.Store(false)
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

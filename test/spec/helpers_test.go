@@ -85,15 +85,27 @@ func freePort(t *testing.T) int {
 
 func startSpecEngine(t *testing.T, se specEngine, proto engine.Protocol) string {
 	t.Helper()
+	return startSpecEngineWithConfig(t, se, func(cfg *resource.Config) {
+		cfg.Protocol = proto
+	})
+}
+
+// startSpecEngineWithConfig starts an engine with a caller-provided config
+// customizer. Used by h2c upgrade tests that need to toggle EnableH2Upgrade.
+// Note: the handler is always the default specHandler (echoes METHOD PATH).
+func startSpecEngineWithConfig(t *testing.T, se specEngine, customize func(*resource.Config)) string {
+	t.Helper()
 	port := freePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := resource.Config{
-		Addr:     addr,
-		Engine:   se.typ,
-		Protocol: proto,
+		Addr:   addr,
+		Engine: se.typ,
 		Resources: resource.Resources{
 			Workers: 2,
 		},
+	}
+	if customize != nil {
+		customize(&cfg)
 	}
 	e, err := se.new(cfg, &specHandler{})
 	if err != nil {
@@ -127,7 +139,7 @@ func startSpecEngine(t *testing.T, se specEngine, proto engine.Protocol) string 
 	// Readiness probe: verify the engine can actually serve a request.
 	// On resource-constrained CI runners io_uring may bind successfully
 	// but fail to process completions, causing every subtest to timeout.
-	if err := probeEngine(addr, proto); err != nil {
+	if err := probeEngine(addr, cfg.Protocol); err != nil {
 		cancel()
 		<-errCh
 		t.Skipf("engine %s not functional (skipping): %v", se.name, err)

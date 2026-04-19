@@ -1,0 +1,53 @@
+# docker-compose.cluster.yml — three disposable Memcached instances for the
+# celeris ClusterClient conformance suite. Memcached has no cluster protocol,
+# so each container is an independent node; the driver shards across them via
+# a client-side ketama ring.
+#
+# Start with:
+#
+#   docker compose -f test/conformance/memcached/docker-compose.cluster.yml up -d
+#   export CELERIS_MEMCACHED_CLUSTER_ADDRS=127.0.0.1:11211,127.0.0.1:11212,127.0.0.1:11213
+#   go test -tags memcached_cluster ./test/conformance/memcached/...
+#
+# Tear down with:
+#
+#   docker compose -f test/conformance/memcached/docker-compose.cluster.yml down -v
+#
+# memcached 1.6-alpine ships with both text and binary protocols enabled.
+
+services:
+  memcached-a:
+    image: memcached:1.6-alpine
+    container_name: celeris-memcached-cluster-a
+    ports:
+      - "11211:11211"
+    command: [memcached, -v]
+    healthcheck:
+      test: ["CMD-SHELL", "echo stats | nc -w 1 127.0.0.1 11211 | grep -q version"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  memcached-b:
+    image: memcached:1.6-alpine
+    container_name: celeris-memcached-cluster-b
+    ports:
+      - "11212:11211"
+    command: [memcached, -v]
+    healthcheck:
+      test: ["CMD-SHELL", "echo stats | nc -w 1 127.0.0.1 11211 | grep -q version"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  memcached-c:
+    image: memcached:1.6-alpine
+    container_name: celeris-memcached-cluster-c
+    ports:
+      - "11213:11211"
+    command: [memcached, -v]
+    healthcheck:
+      test: ["CMD-SHELL", "echo stats | nc -w 1 127.0.0.1 11211 | grep -q version"]
+      interval: 2s
+      timeout: 2s
+      retries: 20

@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -90,7 +91,24 @@ type Processor struct {
 	InlineWriter         h2Conn    // direct-to-outBuf writer for inline handlers (set by conn layer)
 	InlineCount          uint64    // number of requests handled inline (for metrics)
 	MaxRequestBodySize   int64     // 0 = use default (100 MB)
+
+	// CVE-2023-44487 "HTTP/2 Rapid Reset" mitigation. Track RST_STREAM
+	// rate per connection; if a peer exceeds the threshold we emit
+	// GOAWAY(ENHANCE_YOUR_CALM). Window is a sliding per-second bucket:
+	// simple, cheap, and enough to shut down a flood loop.
+	rstCount     uint32 // RST_STREAM count within the current second
+	rstWindowSec int64  // unix-second marker for the current window
 }
+
+// rstRateLimit and rstBurstLimit bound RST_STREAM arrivals. An honest
+// client resets at most a handful of streams per second (client abort
+// of a pipelined request, EARLY_HINTS race, etc.). 100 resets per
+// second is well above any legitimate pattern we've observed and well
+// below the thousands-per-second required to amplify the CVE attack.
+const (
+	rstRateLimitPerSec = 100
+	rstBurstMax        = 200
+)
 
 func (p *Processor) maxBodySize() int64 {
 	return p.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
@@ -126,18 +144,37 @@ func (p *Processor) FlushInlineCleanup() {
 
 // NewProcessor creates a new stream processor. The conn parameter must
 // implement both ResponseWriter and H2Controller (all H2 engine adapters do).
+// The HPACK decoder is lazily initialized on the first header-block write —
+// on RFC 7540 §3.2 h2c upgrades where stream 1 is injected locally (so no
+// HEADERS frame is ever decoded from the wire) and the connection closes
+// before any subsequent request, this avoids a ~4 KB dynamic-table
+// allocation the decoder would otherwise hold for the connection's life.
 func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
-	p := &Processor{
+	return &Processor{
 		manager:    NewManager(),
 		handler:    handler,
 		writer:     writer,
 		connWriter: conn,
 	}
-	// Set emit function ONCE per connection. The hpackTarget field is updated
-	// before each decode to point at the current pooled slice, eliminating
-	// a closure allocation per HEADERS/CONTINUATION frame.
-	p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
-	return p
+}
+
+// ensureHPACKDecoder initializes p.hpackDecoder on first use. Called from
+// every site that writes into the decoder (all are serialized under
+// H2State.mu, so no atomic dance is needed).
+func (p *Processor) ensureHPACKDecoder() {
+	if p.hpackDecoder == nil {
+		// Set emit function ONCE per connection. The hpackTarget field is
+		// updated before each decode to point at the current pooled slice,
+		// eliminating a closure allocation per HEADERS/CONTINUATION frame.
+		p.hpackDecoder = hpack.NewDecoder(4096, p.hpackEmit)
+		// SETTINGS_MAX_HEADER_LIST_SIZE enforcement: cap the total
+		// uncompressed header list size the decoder is willing to
+		// accept. Without this a single HEADERS frame can grow the
+		// decode target unboundedly (DoS). 64 KiB matches the H1
+		// MaxHeaderSize default and leaves wide margin for real
+		// requests.
+		p.hpackDecoder.SetMaxStringLength(64 << 10)
+	}
 }
 
 // hpackEmit is the persistent HPACK emit callback. It appends decoded headers
@@ -291,7 +328,11 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 	_ = f.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
 		case http2.SettingHeaderTableSize:
-			// No validation needed
+			// Peer's upper bound on our HPACK encoder dynamic table.
+			// Stash the value so encoders can honor it.
+			p.manager.mu.Lock()
+			p.manager.headerTableSize = s.Val
+			p.manager.mu.Unlock()
 		case http2.SettingEnablePush:
 			if s.Val != 0 && s.Val != 1 {
 				validationErr = fmt.Errorf("SETTINGS_ENABLE_PUSH must be 0 or 1, got %d", s.Val)
@@ -671,6 +712,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackTarget = pooledTrailers
+			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -748,6 +790,7 @@ func (p *Processor) handleHeaders(_ context.Context, f *http2.HeadersFrame) erro
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackTarget = pooledHeadersIn
+	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -834,6 +877,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 				headersSlicePoolIn.Put(pooledTrailers)
 			}()
 			p.hpackTarget = pooledTrailers
+			p.ensureHPACKDecoder()
 			if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 				return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 					fmt.Errorf("failed to decode trailers: %w", err))
@@ -877,6 +921,7 @@ func (p *Processor) ProcessRawHeaders(streamID uint32, endStream bool, headerBlo
 		headersSlicePoolIn.Put(pooledHeadersIn)
 	}()
 	p.hpackTarget = pooledHeadersIn
+	p.ensureHPACKDecoder()
 	if _, err := p.hpackDecoder.Write(headerBlock); err != nil {
 		return p.GoAwayErr(0, http2.ErrCodeCompression, []byte("HPACK decoding failed"),
 			fmt.Errorf("failed to decode headers: %w", err))
@@ -1086,8 +1131,25 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	return nil
 }
 
-// handleRSTStream processes RST_STREAM frames.
+// handleRSTStream processes RST_STREAM frames. Enforces a rate limit
+// to mitigate CVE-2023-44487 "Rapid Reset" — a client that opens and
+// RST_STREAMs a stream in a tight loop consumes per-stream resources
+// (HPACK state, priority tree, handler dispatch) without paying the
+// usual connection-level flow-control cost.
 func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
+	// Sliding one-second window counter.
+	nowSec := time.Now().Unix()
+	if nowSec != p.rstWindowSec {
+		p.rstWindowSec = nowSec
+		p.rstCount = 0
+	}
+	p.rstCount++
+	if p.rstCount > rstBurstMax {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeEnhanceYourCalm,
+			[]byte("RST_STREAM flood"),
+			fmt.Errorf("RST_STREAM rate exceeded %d/s (burst %d)", rstRateLimitPerSec, rstBurstMax))
+	}
+
 	stream, ok := p.manager.GetStream(f.StreamID)
 	if !ok {
 		if f.StreamID <= p.manager.GetLastClientStreamID() {
@@ -1115,6 +1177,19 @@ func (p *Processor) handlePriority(f *http2.PriorityFrame) error {
 	if f.StreamDep == f.StreamID {
 		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol, []byte("stream depends on itself"),
 			fmt.Errorf("stream %d depends on itself", f.StreamID))
+	}
+
+	// Reject PRIORITY on stream IDs far beyond the last-opened
+	// client stream — an attacker could otherwise blast PRIORITY
+	// frames on monotonically-increasing IDs and grow the priority
+	// tree unboundedly (maps + GetOrCreateStream inserts). Honest
+	// clients only reference streams they've opened or are about
+	// to open; anything more than 1024 ahead is an anomaly.
+	lastClient := p.manager.GetLastClientStreamID()
+	if f.StreamID > lastClient+2048 {
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+			[]byte("PRIORITY stream ID too far ahead"),
+			fmt.Errorf("PRIORITY stream %d > last client %d + window", f.StreamID, lastClient))
 	}
 
 	_, exists := p.manager.GetStream(f.StreamID)
@@ -1205,6 +1280,7 @@ func (p *Processor) handleContinuation(_ context.Context, f *http2.ContinuationF
 		}()
 		p.hpackTarget = pooledHeadersIn
 
+		p.ensureHPACKDecoder()
 		if _, err := p.hpackDecoder.Write(p.continuationState.headerBlock); err != nil {
 			p.continuationState = nil
 			p.continuationActive.Store(false)
@@ -1470,5 +1546,55 @@ func (p *Processor) HandleRawPing(flags byte, payload []byte) error {
 		return err
 	}
 	p.flush()
+	return nil
+}
+
+// InjectStreamHeaders opens a new stream with the given ID, populates it
+// with the provided headers + body (no HPACK round-trip — headers are
+// already decoded), and dispatches the handler. Used by the h2c upgrade
+// path (RFC 7540 §3.2) to replay the original H1 request as stream 1 on
+// the newly-promoted H2 connection.
+//
+// Invariants:
+//   - streamID must not already exist in the manager.
+//   - headers must include all H2 pseudo-headers (:method, :path, :scheme,
+//     :authority); the caller synthesizes these from the H1 request line.
+//   - If endStream=true, body must be the complete request body and the
+//     stream transitions to HalfClosedRemote immediately.
+func (p *Processor) InjectStreamHeaders(streamID uint32, endStream bool, headers [][2]string, body []byte) error {
+	s, ok := p.manager.TryOpenStream(streamID)
+	if !ok {
+		return fmt.Errorf("injectStreamHeaders: could not open stream %d", streamID)
+	}
+	if s.ResponseWriter == nil {
+		s.ResponseWriter = p.connWriter
+	}
+
+	// Detect HEAD (mirrors ProcessRawHeaders behavior).
+	for _, h := range headers {
+		if h[0] == ":method" && h[1] == "HEAD" {
+			s.IsHEAD = true
+			break
+		}
+	}
+	s.AddHeadersBatch(headers)
+	s.ReceivedInitialHeaders = true
+
+	if len(body) > 0 {
+		_, _ = s.GetBuf().Write(body) // bytes.Buffer.Write never returns error
+		s.ReceivedDataLen = len(body)
+	}
+	if endStream {
+		s.EndStream = true
+		s.SetState(StateHalfClosedRemote)
+	}
+
+	// lastClientStream must reflect the injected stream so subsequent
+	// HEADERS validate correctly (odd, strictly increasing).
+	if streamID%2 == 1 && streamID > p.manager.lastClientStream.Load() {
+		p.manager.lastClientStream.Store(streamID)
+	}
+
+	p.runHandler(s)
 	return nil
 }

@@ -180,6 +180,11 @@ func (e *Engine) Listen(ctx context.Context) error {
 		"numa_nodes", e.profile.NUMANodes,
 		"kernel", e.profile.KernelVersion,
 	)
+	if e.cfg.AsyncHandlers && e.cfg.EnableH2Upgrade {
+		e.cfg.Logger.Info(
+			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
+		)
+	}
 
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,
@@ -223,7 +228,11 @@ func fallbackTier(current TierStrategy) TierStrategy {
 	}
 }
 
-// Shutdown gracefully shuts down the engine.
+// Shutdown is a no-op for the io_uring engine — graceful shutdown is
+// driven by context cancellation on Listen's parent context. Workers
+// exit their run loops on ctx.Done and call Worker.shutdown, which
+// joins async dispatch goroutines via asyncWG. See epoll engine
+// Shutdown for the same rationale.
 func (e *Engine) Shutdown(_ context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -269,9 +278,25 @@ func (e *Engine) ResumeAccept() error {
 }
 
 var (
-	_ engine.Engine           = (*Engine)(nil)
-	_ engine.AcceptController = (*Engine)(nil)
+	_ engine.Engine            = (*Engine)(nil)
+	_ engine.AcceptController  = (*Engine)(nil)
+	_ engine.EventLoopProvider = (*Engine)(nil)
 )
+
+// NumWorkers returns the number of worker event loops available for
+// driver FD registration.
+func (e *Engine) NumWorkers() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.workers)
+}
+
+// WorkerLoop returns the WorkerLoop for worker n.
+func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.workers[n]
+}
 
 // Addr returns the bound listener address.
 func (e *Engine) Addr() net.Addr {

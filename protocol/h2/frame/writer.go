@@ -14,12 +14,21 @@ type Writer struct {
 	mu     sync.Mutex
 }
 
-// NewWriter creates a new frame writer.
+// NewWriter creates a new frame writer. The underlying http2.Framer is
+// created lazily on first non-trivial call (WriteFrame, WriteHeaders,
+// WriteData, WriteGoAway, WriteRawFrame, etc). Fixed-shape control frames
+// (WriteSettingsAck) are emitted directly without constructing the Framer
+// at all — useful for h2c handshakes that close before any HPACK-requiring
+// frame is sent.
 func NewWriter(w io.Writer) *Writer {
-	framer := http2.NewFramer(w, nil)
-	return &Writer{
-		framer: framer,
-		writer: w,
+	return &Writer{writer: w}
+}
+
+// ensureFramer lazily constructs the underlying http2.Framer. Callers must
+// hold w.mu.
+func (w *Writer) ensureFramer() {
+	if w.framer == nil {
+		w.framer = http2.NewFramer(w.writer, nil)
 	}
 }
 
@@ -54,6 +63,7 @@ func (w *Writer) CloseImmediate() error {
 func (w *Writer) WriteFrame(f *Frame) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	flags := http2.Flags(f.Flags)
 	return w.framer.WriteRawFrame(http2.FrameType(f.Type), flags, f.StreamID, f.Payload)
 }
@@ -62,20 +72,30 @@ func (w *Writer) WriteFrame(f *Frame) error {
 func (w *Writer) WriteSettings(settings ...http2.Setting) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	return w.framer.WriteSettings(settings...)
 }
+
+// settingsAckFrame is the exact 9-byte wire encoding of an H2 SETTINGS ACK
+// frame (length=0, type=SETTINGS (4), flags=ACK (1), streamID=0). Written
+// directly rather than through http2.Framer — the Framer validates frame
+// sizes and reuses internal buffers, neither of which add any value for
+// this fixed-shape frame.
+var settingsAckFrame = [9]byte{0, 0, 0, 0x04, 0x01, 0, 0, 0, 0}
 
 // WriteSettingsAck writes a SETTINGS acknowledgment frame.
 func (w *Writer) WriteSettingsAck() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.framer.WriteSettingsAck()
+	_, err := w.writer.Write(settingsAckFrame[:])
+	return err
 }
 
 // WriteHeaders writes HEADERS (and CONTINUATION) frames, fragmenting by maxFrameSize.
 func (w *Writer) WriteHeaders(streamID uint32, endStream bool, headerBlock []byte, maxFrameSize uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 
 	if maxFrameSize == 0 {
 		maxFrameSize = 16384
@@ -123,6 +143,7 @@ func (w *Writer) WriteData(streamID uint32, endStream bool, data []byte) error {
 	if len(data) == 0 && !endStream {
 		return nil
 	}
+	w.ensureFramer()
 	return w.framer.WriteData(streamID, endStream, data)
 }
 
@@ -130,6 +151,7 @@ func (w *Writer) WriteData(streamID uint32, endStream bool, data []byte) error {
 func (w *Writer) WriteWindowUpdate(streamID uint32, increment uint32) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	return w.framer.WriteWindowUpdate(streamID, increment)
 }
 
@@ -137,6 +159,7 @@ func (w *Writer) WriteWindowUpdate(streamID uint32, increment uint32) error {
 func (w *Writer) WriteRSTStream(streamID uint32, code http2.ErrCode) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	return w.framer.WriteRSTStream(streamID, code)
 }
 
@@ -144,6 +167,7 @@ func (w *Writer) WriteRSTStream(streamID uint32, code http2.ErrCode) error {
 func (w *Writer) WriteGoAway(lastStreamID uint32, code http2.ErrCode, debugData []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	return w.framer.WriteGoAway(lastStreamID, code, debugData)
 }
 
@@ -151,6 +175,7 @@ func (w *Writer) WriteGoAway(lastStreamID uint32, code http2.ErrCode, debugData 
 func (w *Writer) WritePing(ack bool, data [8]byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	return w.framer.WritePing(ack, data)
 }
 
@@ -158,6 +183,7 @@ func (w *Writer) WritePing(ack bool, data [8]byte) error {
 func (w *Writer) WritePushPromise(streamID uint32, promiseID uint32, endHeaders bool, headerBlock []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ensureFramer()
 	var flags http2.Flags
 	if endHeaders {
 		flags = http2.FlagPushPromiseEndHeaders

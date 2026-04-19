@@ -106,13 +106,28 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	e.cfg.Logger.Info("epoll engine listening", "addr", e.cfg.Addr, "loops", resolved.Workers)
+	if e.cfg.AsyncHandlers && e.cfg.EnableH2Upgrade {
+		e.cfg.Logger.Info(
+			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
+		)
+	}
 
 	<-ctx.Done()
 	wg.Wait()
 	return nil
 }
 
-// Shutdown gracefully shuts down the engine.
+// Shutdown is a no-op for the epoll engine — graceful shutdown is
+// driven by context cancellation on Listen's parent context. The
+// Server calls Listen with its managed context and cancels it during
+// Server.Shutdown; the Listen goroutine returns after running
+// Loop.shutdown (which closes connections and joins async dispatch
+// goroutines via asyncWG).
+//
+// The context parameter is accepted for interface parity with engines
+// that do run async drain operations on Shutdown (e.g. std's
+// http.Server.Shutdown), and for future use if epoll Shutdown gains
+// explicit drain semantics.
 func (e *Engine) Shutdown(_ context.Context) error {
 	return nil
 }

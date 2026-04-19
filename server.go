@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the semantic version of the celeris module.
-const Version = "1.3.4"
+const Version = "1.4.0"
 
 // ErrAlreadyStarted is returned when Start or StartWithContext is called on a
 // server that is already running.
@@ -373,6 +373,55 @@ func (s *Server) Addr() net.Addr {
 	return eng.Addr()
 }
 
+// EventLoopProvider returns the engine's event-loop provider, or nil if the
+// engine does not expose one (e.g. the std net/http fallback) or the server
+// has not been started. The returned provider is shared with the HTTP path;
+// drivers register their own file descriptors on it to colocate database or
+// cache I/O on the same worker threads as HTTP requests.
+func (s *Server) EventLoopProvider() engine.EventLoopProvider {
+	eng := s.loadEngine()
+	if eng == nil {
+		return nil
+	}
+	if p, ok := eng.(engine.EventLoopProvider); ok {
+		return p
+	}
+	return nil
+}
+
+// AsyncHandlers reports whether the server dispatches HTTP handlers to
+// spawned goroutines (Config.AsyncHandlers). Celeris drivers opened via
+// WithEngine(srv) consult this to auto-select their direct net.Conn path
+// — direct I/O matches Go's netpoll model perfectly on the spawned
+// handler G, whereas the mini-loop sync path is preferred when the
+// caller runs on a LockOSThread'd worker.
+//
+// Only engines that actually implement async dispatch report true — even
+// when Config.AsyncHandlers is set. Currently:
+//
+//   - Epoll: async dispatch implemented; returns true when configured.
+//   - IOUring: async dispatch implemented; returns true when configured.
+//   - Std (net/http fallback): always async natively (goroutine per
+//     conn); returns true when configured.
+//   - Adaptive: both targets (epoll, iouring) support async dispatch,
+//     and direct-mode drivers use Go netpoll — no engine-registered
+//     FDs, so the adaptive engine's hot-swap machinery is safe
+//     around them. Returns true when configured; a switch while
+//     direct-mode drivers are in-flight is a no-op for the drivers
+//     (their net.TCPConn goroutines keep running regardless of which
+//     sub-engine is active).
+func (s *Server) AsyncHandlers() bool {
+	if !s.config.AsyncHandlers {
+		return false
+	}
+	switch s.config.Engine {
+	case Epoll, IOUring, Adaptive, Std:
+		return true
+	default:
+		return false
+	}
+}
+
 // EngineInfo returns information about the running engine, or nil if not started.
 func (s *Server) EngineInfo() *EngineInfo {
 	eng := s.loadEngine()
@@ -552,14 +601,23 @@ func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listene
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 30 * time.Second
 	}
+	listenDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = s.Shutdown(shutCtx)
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			_ = s.Shutdown(shutCtx)
+		case <-listenDone:
+			// Listen returned (likely an error — ctx not cancelled).
+			// Exit without calling Shutdown; nothing to shut down.
+			return
+		}
 	}()
 
-	return eng.Listen(ctx)
+	err = eng.Listen(ctx)
+	close(listenDone)
+	return err
 }
 
 // InheritListener returns a [net.Listener] from the file descriptor in the
@@ -598,12 +656,19 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 30 * time.Second
 	}
+	listenDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = s.Shutdown(shutCtx)
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			_ = s.Shutdown(shutCtx)
+		case <-listenDone:
+			return
+		}
 	}()
 
-	return eng.Listen(ctx)
+	err = eng.Listen(ctx)
+	close(listenDone)
+	return err
 }

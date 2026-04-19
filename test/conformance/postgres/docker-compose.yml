@@ -1,0 +1,44 @@
+# docker-compose.yml — disposable PostgreSQL server for the celeris conformance
+# suite. Start with:
+#
+#   docker compose -f test/conformance/postgres/docker-compose.yml up -d
+#   export CELERIS_PG_DSN='postgres://celeris:celeris@localhost:5432/celeristest?sslmode=disable'
+#   go test -tags postgres ./test/conformance/postgres/...
+#
+# Tear down with: docker compose -f ... down -v
+#
+# The default auth method is SCRAM-SHA-256, which exercises the driver's SCRAM
+# path. To test MD5 instead, edit the POSTGRES_HOST_AUTH_METHOD env var and
+# the pg_hba.conf file mounted below. To test trust, set the env var to
+# "trust" and remove the mount.
+#
+# Note: exercising multiple auth methods in a single run would require separate
+# roles each mapped to a different method in pg_hba.conf — the conformance
+# suite intentionally only tests whichever method the server is configured for.
+# See auth_test.go for the rationale.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: celeris-pg-conformance
+    environment:
+      POSTGRES_USER: celeris
+      POSTGRES_PASSWORD: celeris
+      POSTGRES_DB: celeristest
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=trust"
+    ports:
+      - "5432:5432"
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=200
+      - -c
+      - log_statement=none
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U celeris -d celeristest"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
