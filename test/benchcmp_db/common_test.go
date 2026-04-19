@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -31,6 +32,11 @@ import (
 	"testing"
 	"time"
 )
+
+// quietLogger discards everything — benchmark output parsers can't
+// cope with celeris's startup WARN/INFO lines interleaved with Go's
+// bench result lines. Every test server uses this.
+var quietLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // liveRedisAddr returns CELERIS_REDIS_ADDR or the default. The caller
 // is responsible for skipping when the address does not respond.

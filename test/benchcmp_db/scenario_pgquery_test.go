@@ -70,7 +70,7 @@ func skipIfNoPG(b *testing.B) string {
 func startCelerisPGServer(b *testing.B, dsn string) string {
 	b.Helper()
 	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr})
+	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger})
 
 	// Pool is opened AFTER the server starts so WithEngine resolves
 	// to the live engine's event loop — if we opened before Start,
@@ -167,7 +167,7 @@ func startFiberPGServer(b *testing.B, dsn string) string {
 		return c.JSON(u)
 	})
 	addr := freePort(b)
-	go func() { _ = app.Listen(addr) }()
+	go func() { _ = app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true}) }()
 	b.Cleanup(func() { _ = app.Shutdown() })
 	waitReady(b, addr)
 	return addr

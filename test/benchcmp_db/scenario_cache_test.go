@@ -47,7 +47,7 @@ type cachedUser struct {
 func startCelerisCacheServer(b *testing.B, redisAddr string) string {
 	b.Helper()
 	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr})
+	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger})
 
 	var cliPtr atomic.Pointer[celredis.Client]
 	srv.GET("/health", func(c *celeris.Context) error { return c.String(200, "ok") })
@@ -109,7 +109,7 @@ func startFiberCacheServer(b *testing.B, redisAddr string) string {
 		return c.JSON(u)
 	})
 	addr := freePort(b)
-	go func() { _ = app.Listen(addr) }()
+	go func() { _ = app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true}) }()
 	b.Cleanup(func() { _ = app.Shutdown() })
 	waitReady(b, addr)
 	return addr

@@ -56,7 +56,7 @@ func primeSession(addr string) error {
 func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	b.Helper()
 	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr})
+	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger})
 
 	// Pool is opened AFTER Start so WithEngine resolves to the live
 	// engine's EventLoopProvider; otherwise the driver falls back to
@@ -139,7 +139,7 @@ func startFiberSessionServer(b *testing.B, redisAddr string) string {
 		return c.JSON(p)
 	})
 	addr := freePort(b)
-	go func() { _ = app.Listen(addr) }()
+	go func() { _ = app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true}) }()
 	b.Cleanup(func() { _ = app.Shutdown() })
 	waitReady(b, addr)
 	return addr
