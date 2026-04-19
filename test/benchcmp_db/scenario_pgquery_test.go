@@ -68,14 +68,19 @@ func skipIfNoPG(b *testing.B) string {
 
 func startCelerisPGServer(b *testing.B, dsn string) string {
 	b.Helper()
-	pool, err := celpostgres.Open(dsn)
+	addr := freePort(b)
+	srv := celeris.New(celeris.Config{Addr: addr})
+
+	// Open the pool bound to the server's event loop so PG I/O and
+	// HTTP I/O share per-worker locality — this is the v1.4.0 fast
+	// path; without it the driver falls back to its standalone loop
+	// which competes with the HTTP loop for cycles.
+	pool, err := celpostgres.Open(dsn, celpostgres.WithEngine(srv))
 	if err != nil {
 		b.Fatalf("celeris pg: %v", err)
 	}
 	b.Cleanup(func() { _ = pool.Close() })
 
-	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr})
 	srv.GET("/health", func(c *celeris.Context) error { return c.String(200, "ok") })
 	srv.GET("/user", func(c *celeris.Context) error {
 		rows, err := pool.QueryContext(c.Context(), "SELECT id, name FROM bench_users WHERE id=$1", 1)

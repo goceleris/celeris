@@ -54,14 +54,16 @@ func primeSession(addr string) error {
 
 func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	b.Helper()
-	cli, err := celredis.NewClient(redisAddr)
+	addr := freePort(b)
+	srv := celeris.New(celeris.Config{Addr: addr})
+
+	// Same WithEngine wiring as PGQuery scenario — Redis I/O rides
+	// the server's event loop for per-worker locality.
+	cli, err := celredis.NewClient(redisAddr, celredis.WithEngine(srv))
 	if err != nil {
 		b.Fatalf("celeris redis: %v", err)
 	}
 	b.Cleanup(func() { _ = cli.Close() })
-
-	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr})
 	srv.GET("/health", func(c *celeris.Context) error { return c.String(200, "ok") })
 	srv.GET("/me", func(c *celeris.Context) error {
 		sid := c.Header(strings.ToLower(sessHeader))
