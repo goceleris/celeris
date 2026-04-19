@@ -27,9 +27,16 @@ import (
 )
 
 // maxCASRetries caps the CAS-loop length per Allow/Undo call so
-// pathological contention cannot spin indefinitely. Six retries gives
-// ~98% success under moderate (N=64) contention.
-const maxCASRetries = 6
+// pathological contention cannot spin indefinitely.
+//
+// CAS-based rate limiting has an unavoidable contention edge:
+// when N goroutines race for a burst of B tokens, losers retry
+// through every winning CAS before they see an empty bucket, so
+// retries scale with N, not with B. 24 retries absorbs ~20×-burst
+// contention without starvation. Exhausted calls return
+// (false, err) — safe-by-default since a CAS limiter over-throttles
+// under contention but never under-throttles.
+const maxCASRetries = 24
 
 // Options configure the memcached-backed rate limit store.
 type Options struct {
