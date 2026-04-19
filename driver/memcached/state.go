@@ -258,7 +258,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			// real callers always install kindGet before writing the cmd.
 			head := s.bridge.Head()
 			if head == nil {
-				return errors.New("celeris/memcached: unexpected VALUE with empty queue")
+				return errors.New("celeris-memcached: unexpected VALUE with empty queue")
 			}
 			req = head.(*mcRequest)
 			s.pendingGet = req
@@ -278,7 +278,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			s.pendingGet = nil
 			if popped := s.bridge.Pop(); popped != req {
 				// Bridge head drift would indicate a framing bug — fail loud.
-				return errors.New("celeris/memcached: bridge head mismatch on END")
+				return errors.New("celeris-memcached: bridge head mismatch on END")
 			}
 			req.status = protocol.KindEnd
 			req.finish()
@@ -288,7 +288,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 			req := s.pendingStats
 			s.pendingStats = nil
 			if popped := s.bridge.Pop(); popped != req {
-				return errors.New("celeris/memcached: bridge head mismatch on END")
+				return errors.New("celeris-memcached: bridge head mismatch on END")
 			}
 			req.status = protocol.KindEnd
 			req.finish()
@@ -298,7 +298,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 		// the head and resolve it as an empty result.
 		head := s.bridge.Pop()
 		if head == nil {
-			return errors.New("celeris/memcached: unexpected END with empty queue")
+			return errors.New("celeris-memcached: unexpected END with empty queue")
 		}
 		req := head.(*mcRequest)
 		req.status = protocol.KindEnd
@@ -309,7 +309,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 		if req == nil {
 			head := s.bridge.Head()
 			if head == nil {
-				return errors.New("celeris/memcached: unexpected STAT with empty queue")
+				return errors.New("celeris-memcached: unexpected STAT with empty queue")
 			}
 			req = head.(*mcRequest)
 			s.pendingStats = req
@@ -324,7 +324,7 @@ func (s *mcState) dispatchText(v protocol.TextReply) error {
 	// Single-line replies terminate the head-of-queue request.
 	head := s.bridge.Pop()
 	if head == nil {
-		return errors.New("celeris/memcached: unexpected server reply with empty queue")
+		return errors.New("celeris-memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
 	req.status = v.Kind
@@ -370,7 +370,7 @@ func (s *mcState) processBinary(data []byte) error {
 func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 	head := s.bridge.Head()
 	if head == nil {
-		return errors.New("celeris/memcached: unexpected server reply with empty queue")
+		return errors.New("celeris-memcached: unexpected server reply with empty queue")
 	}
 	req := head.(*mcRequest)
 	if req.kind == kindBinaryMulti {
@@ -386,7 +386,7 @@ func (s *mcState) dispatchBinary(p protocol.BinaryPacket) error {
 	// in line. Fail the connection loudly so the caller sees a transport
 	// error instead of a wrong-key value.
 	if p.Header.Opaque != req.opaque {
-		return fmt.Errorf("celeris/memcached: binary opaque mismatch: got %#x, expected %#x (protocol violation)",
+		return fmt.Errorf("celeris-memcached: binary opaque mismatch: got %#x, expected %#x (protocol violation)",
 			p.Header.Opaque, req.opaque)
 	}
 	s.bridge.Pop()
@@ -457,7 +457,7 @@ func (s *mcState) dispatchBinaryMulti(req *mcRequest, p protocol.BinaryPacket) e
 	// Terminator: pop, record its own status (so callers can detect STAT
 	// errors or Noop failures) and finish.
 	if popped := s.bridge.Pop(); popped != req {
-		return errors.New("celeris/memcached: bridge head mismatch on binary terminator")
+		return errors.New("celeris-memcached: bridge head mismatch on binary terminator")
 	}
 	req.binStatus = p.Status()
 	if p.Status() != protocol.StatusOK && req.resultErr == nil {

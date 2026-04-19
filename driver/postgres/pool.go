@@ -121,21 +121,6 @@ type Pool struct {
 // ErrPoolClosed is returned from Pool methods after Close has been called.
 var ErrPoolClosed = errors.New("celeris-postgres: pool is closed")
 
-// ErrDirectModeUnsupported is returned by operations that rely on
-// unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY
-// (NotificationResponse) most notably. Direct-mode conns dial a plain
-// net.TCPConn and drive reads from the caller goroutine only during
-// an active query; between queries no reader is active, so any
-// async-delivered message is silently dropped. COPY FROM/TO is
-// supported via a short-lived per-call reader goroutine; only the
-// persistent-listener class of operations returns this error.
-//
-// Workarounds: open the pool against an engine with AsyncHandlers=false
-// (drivers will pick the mini-loop path which has an always-on reader),
-// or use a separate non-pooled listener conn dedicated to
-// LISTEN/NOTIFY in a non-async configuration.
-var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
-
 // Open opens a worker-affinity pool. The DSN is parsed once here; connect
 // errors surface on the first Acquire.
 func Open(dsnStr string, opts ...Option) (*Pool, error) {
@@ -797,9 +782,9 @@ func convertAssign(dest any, src any) error {
 		case float64:
 			*d = int(s)
 		case string:
-			return fmt.Errorf("cannot convert string %q to int", s)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert string %q to int", s)
 		default:
-			return fmt.Errorf("cannot convert %T to int", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to int", src)
 		}
 	case *int64:
 		switch s := src.(type) {
@@ -808,21 +793,21 @@ func convertAssign(dest any, src any) error {
 		case float64:
 			*d = int64(s)
 		default:
-			return fmt.Errorf("cannot convert %T to int64", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to int64", src)
 		}
 	case *int32:
 		switch s := src.(type) {
 		case int64:
 			*d = int32(s)
 		default:
-			return fmt.Errorf("cannot convert %T to int32", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to int32", src)
 		}
 	case *int16:
 		switch s := src.(type) {
 		case int64:
 			*d = int16(s)
 		default:
-			return fmt.Errorf("cannot convert %T to int16", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to int16", src)
 		}
 	case *float64:
 		switch s := src.(type) {
@@ -831,7 +816,7 @@ func convertAssign(dest any, src any) error {
 		case int64:
 			*d = float64(s)
 		default:
-			return fmt.Errorf("cannot convert %T to float64", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to float64", src)
 		}
 	case *float32:
 		switch s := src.(type) {
@@ -840,7 +825,7 @@ func convertAssign(dest any, src any) error {
 		case int64:
 			*d = float32(s)
 		default:
-			return fmt.Errorf("cannot convert %T to float32", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to float32", src)
 		}
 	case *bool:
 		switch s := src.(type) {
@@ -849,7 +834,7 @@ func convertAssign(dest any, src any) error {
 		case int64:
 			*d = s != 0
 		default:
-			return fmt.Errorf("cannot convert %T to bool", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to bool", src)
 		}
 	case *[]byte:
 		switch s := src.(type) {
@@ -860,7 +845,7 @@ func convertAssign(dest any, src any) error {
 		case string:
 			*d = []byte(s)
 		default:
-			return fmt.Errorf("cannot convert %T to []byte", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to []byte", src)
 		}
 	case *any:
 		*d = src
@@ -869,7 +854,7 @@ func convertAssign(dest any, src any) error {
 		case time.Time:
 			*d = s
 		default:
-			return fmt.Errorf("cannot convert %T to time.Time", src)
+			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to time.Time", src)
 		}
 	default:
 		return fmt.Errorf("unsupported scan dest type %T", dest)

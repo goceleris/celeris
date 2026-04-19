@@ -279,7 +279,7 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		idx := s.syncPipeIdx
 		if idx >= len(s.syncPipeReqs) {
 			s.reader.Release(v)
-			return errors.New("celeris/redis: sync pipeline overflow")
+			return errors.New("celeris-redis: sync pipeline overflow")
 		}
 		req = s.syncPipeReqs[idx]
 		s.syncPipeIdx = idx + 1
@@ -291,7 +291,7 @@ func (s *redisState) dispatch(v protocol.Value) error {
 				return nil
 			}
 			s.reader.Release(v)
-			return errors.New("celeris/redis: unexpected server reply with empty queue")
+			return errors.New("celeris-redis: unexpected server reply with empty queue")
 		}
 		req = head.(*redisRequest)
 	}

@@ -156,7 +156,12 @@ func WithBasicAuth(user, pass string) Option {
 	return WithHeader("authorization", "Basic "+encoded)
 }
 
-// WithCookie adds a cookie to the request.
+// WithCookie adds a cookie to the request. Name and value are joined as
+// "name=value" and concatenated with "; " between cookies, matching the
+// Cookie header wire format. This helper does not escape semicolons or
+// CR/LF inside value — tests should pass well-formed values only. If a
+// test needs to exercise the server's handling of malformed cookie
+// headers, set the raw "cookie" header via [WithHeader] instead.
 func WithCookie(name, value string) Option {
 	return func(c *config) {
 		c.cookies = append(c.cookies, [2]string{name, value})

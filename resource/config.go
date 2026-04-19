@@ -128,6 +128,22 @@ func (c Config) Validate() []error {
 		}
 	}
 
+	// Listener + explicit Addr with a concrete non-zero port is
+	// ambiguous — the runtime silently prefers Listener.Addr().
+	// Warn so the caller notices the discard at config time rather
+	// than observing a mismatched port in logs. Allow "<host>:0"
+	// (pick-any-port) since it's a common pattern when the caller
+	// intentionally delegates port selection to the pre-bound listener.
+	if c.Listener != nil && c.Addr != "" && c.Addr != ":8080" {
+		if _, port, splitErr := net.SplitHostPort(c.Addr); splitErr == nil && port != "0" {
+			if lnAddr := c.Listener.Addr().String(); lnAddr != c.Addr {
+				errs = append(errs, fmt.Errorf(
+					"ambiguous configuration: Addr=%q but Listener is bound to %q; the explicit Addr will be discarded",
+					c.Addr, lnAddr))
+			}
+		}
+	}
+
 	return errs
 }
 
@@ -172,15 +188,21 @@ func (c Config) WithDefaults() Config {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
+	// Read/Write defaults. Previous 300s was too permissive for
+	// a latency-focused engine — a slow-loris client could hold a
+	// worker M / fd for 5 minutes before eviction. 60s matches
+	// nginx's client_header_timeout / client_body_timeout and
+	// covers legitimate slow-network cases. Users who need longer
+	// (streaming uploads, big downloads) should set explicit values.
 	switch {
 	case c.ReadTimeout == 0:
-		c.ReadTimeout = 300 * time.Second
+		c.ReadTimeout = 60 * time.Second
 	case c.ReadTimeout < 0:
 		c.ReadTimeout = 0 // -1 → no timeout
 	}
 	switch {
 	case c.WriteTimeout == 0:
-		c.WriteTimeout = 300 * time.Second
+		c.WriteTimeout = 60 * time.Second
 	case c.WriteTimeout < 0:
 		c.WriteTimeout = 0 // -1 → no timeout
 	}

@@ -118,10 +118,10 @@ type ClusterClient struct {
 // the client down and build a new one.
 func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 	if len(cfg.Addrs) == 0 {
-		return nil, errors.New("celeris/memcached: ClusterConfig.Addrs requires at least one address")
+		return nil, errors.New("celeris-memcached: ClusterConfig.Addrs requires at least one address")
 	}
 	if len(cfg.Weights) != 0 && len(cfg.Weights) != len(cfg.Addrs) {
-		return nil, fmt.Errorf("celeris/memcached: ClusterConfig.Weights length %d != Addrs length %d",
+		return nil, fmt.Errorf("celeris-memcached: ClusterConfig.Weights length %d != Addrs length %d",
 			len(cfg.Weights), len(cfg.Addrs))
 	}
 	// Cap total ring points at a safe value: 16 384 virtual nodes × 4 points
@@ -143,7 +143,7 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 				for _, n := range nodes {
 					_ = n.client.Close()
 				}
-				return nil, fmt.Errorf("celeris/memcached: ClusterConfig.Weights[%d] is zero", i)
+				return nil, fmt.Errorf("celeris-memcached: ClusterConfig.Weights[%d] is zero", i)
 			}
 		}
 		// Guard against uint32×160 overflow into the int `total` used by
@@ -154,7 +154,7 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 			for _, n := range nodes {
 				_ = n.client.Close()
 			}
-			return nil, fmt.Errorf("celeris/memcached: ClusterConfig.Weights[%d]=%d exceeds ring-point budget (max total %d points)",
+			return nil, fmt.Errorf("celeris-memcached: ClusterConfig.Weights[%d]=%d exceeds ring-point budget (max total %d points)",
 				i, weight, maxRingPoints)
 		}
 		totalPoints += perNode
@@ -163,7 +163,7 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 			for _, n := range nodes {
 				_ = n.client.Close()
 			}
-			return nil, fmt.Errorf("celeris/memcached: dial %s: %w", addr, err)
+			return nil, fmt.Errorf("celeris-memcached: dial %s: %w", addr, err)
 		}
 		nodes = append(nodes, &clusterNode{addr: addr, weight: weight, client: client})
 	}

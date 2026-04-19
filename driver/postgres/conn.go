@@ -1635,7 +1635,27 @@ func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.N
 func isListenOrUnlisten(q string) bool {
 	start := skipLeadingWSAndComments(q)
 	rest := q[start:]
-	return hasPrefixFold(rest, "LISTEN") || hasPrefixFold(rest, "UNLISTEN") || hasPrefixFold(rest, "NOTIFY")
+	for _, kw := range [...]string{"LISTEN", "UNLISTEN", "NOTIFY"} {
+		if hasKeywordPrefix(rest, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasKeywordPrefix reports whether s starts with keyword followed
+// by a non-identifier byte (whitespace, punctuation, end-of-string).
+// This prevents false positives like "LISTENABLE" matching "LISTEN"
+// or "SHOW_ME_THE_TABLES" matching "SHOW".
+func hasKeywordPrefix(s, keyword string) bool {
+	if !hasPrefixFold(s, keyword) {
+		return false
+	}
+	if len(s) == len(keyword) {
+		return true
+	}
+	c := s[len(keyword)]
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ';' || c == '(' || c == '-'
 }
 
 // skipLeadingWSAndComments returns the byte offset of the first
@@ -1696,12 +1716,16 @@ func isCacheableQuery(q string) bool {
 			i += 2
 			continue
 		}
-		// First non-whitespace, non-comment character: check keyword.
-		return hasPrefixFold(q[i:], "SELECT") ||
-			hasPrefixFold(q[i:], "WITH") ||
-			hasPrefixFold(q[i:], "VALUES") ||
-			hasPrefixFold(q[i:], "SHOW") ||
-			hasPrefixFold(q[i:], "TABLE")
+		// First non-whitespace, non-comment character: check keyword
+		// with a word-boundary guard so we don't match statements
+		// like "SHOW_TABLES" (procedure call) or "WITHDRAWAL" (a
+		// table name).
+		rest := q[i:]
+		return hasKeywordPrefix(rest, "SELECT") ||
+			hasKeywordPrefix(rest, "WITH") ||
+			hasKeywordPrefix(rest, "VALUES") ||
+			hasKeywordPrefix(rest, "SHOW") ||
+			hasKeywordPrefix(rest, "TABLE")
 	}
 	return false
 }
@@ -2679,25 +2703,37 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	// Stream rows. We reuse a scratch buffer per call to hold each encoded
 	// row so we don't allocate a fresh slice in the hot loop. Each CopyData
 	// wrapper still allocates a small framed-message copy (WriteCopyData).
+	// awaitDoneBounded waits for req.doneCh with a 30s ceiling — a
+	// dead reader goroutine in direct mode would otherwise wedge
+	// the caller forever.
+	awaitDoneBounded := func() {
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-req.doneCh:
+		case <-timer.C:
+			c.failAll(errors.New("celeris-postgres: COPY cleanup wait timeout"))
+		}
+	}
 	var rowBuf []byte
 	for src.Next() {
 		vals, verr := src.Values()
 		if verr != nil {
 			_ = c.sendCopyFail(verr.Error())
-			<-req.doneCh
+			awaitDoneBounded()
 			return 0, verr
 		}
 		rowBuf = encodeTextRow(rowBuf[:0], vals)
 		frame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyData(w, rowBuf) })
 		if werr := c.writeRaw(frame); werr != nil {
 			_ = c.sendCopyFail(werr.Error())
-			<-req.doneCh
+			awaitDoneBounded()
 			return 0, werr
 		}
 	}
 	if serr := src.Err(); serr != nil {
 		_ = c.sendCopyFail(serr.Error())
-		<-req.doneCh
+		awaitDoneBounded()
 		return 0, serr
 	}
 
@@ -2705,7 +2741,7 @@ func (c *pgConn) copyFrom(ctx context.Context, tableName string, columns []strin
 	// which closes req.doneCh.
 	doneFrame := c.buildMessage(func(w *protocol.Writer) []byte { return protocol.WriteCopyDone(w) })
 	if werr := c.writeRaw(doneFrame); werr != nil {
-		<-req.doneCh
+		awaitDoneBounded()
 		return 0, werr
 	}
 	if c.useDirect {

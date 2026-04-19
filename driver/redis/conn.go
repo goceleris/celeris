@@ -175,7 +175,7 @@ func dialDirectRedisConn(ctx context.Context, cfg Config) (*redisConn, error) {
 	tcp, ok := raw.(*net.TCPConn)
 	if !ok {
 		_ = raw.Close()
-		return nil, fmt.Errorf("celeris/redis: expected *net.TCPConn, got %T", raw)
+		return nil, fmt.Errorf("celeris-redis: expected *net.TCPConn, got %T", raw)
 	}
 	_ = tcp.SetNoDelay(true)
 	var rawFd int
@@ -213,7 +213,7 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 	tcp, ok := raw.(*net.TCPConn)
 	if !ok {
 		_ = raw.Close()
-		return nil, fmt.Errorf("celeris/redis: expected *net.TCPConn, got %T", raw)
+		return nil, fmt.Errorf("celeris-redis: expected *net.TCPConn, got %T", raw)
 	}
 	_ = tcp.SetNoDelay(true)
 
@@ -238,7 +238,7 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 		// armed; GC could then call syscall.Close(fd) a second time on an
 		// fd the kernel has since reassigned to another socket.
 		_ = file.Close()
-		return nil, errors.New("celeris/redis: event loop has 0 workers")
+		return nil, errors.New("celeris-redis: event loop has 0 workers")
 	}
 	if workerHint < 0 || workerHint >= nw {
 		workerHint = fd % nw

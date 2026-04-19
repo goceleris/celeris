@@ -31,11 +31,11 @@ import (
 // ErrIncomplete indicates the buffered input does not yet contain a complete
 // reply. The reader's cursor is not advanced and the caller should feed more
 // bytes and retry.
-var ErrIncomplete = errors.New("celeris/memcached/protocol: incomplete frame")
+var ErrIncomplete = errors.New("celeris-memcached-protocol: incomplete frame")
 
 // ErrProtocol is returned when server input cannot be parsed against either
 // dialect (corrupted stream, unknown reply line, bad length header, ...).
-var ErrProtocol = errors.New("celeris/memcached/protocol: protocol error")
+var ErrProtocol = errors.New("celeris-memcached-protocol: protocol error")
 
 // MaxValueLen caps the advertised length of a single VALUE data block. 128 MiB
 // is above memcached's default 1 MiB per-item limit with plenty of headroom
@@ -357,19 +357,23 @@ func parseUint(b []byte) (uint64, error) {
 	if len(b) == 0 {
 		return 0, ErrProtocol
 	}
+	const maxU64 = ^uint64(0)
 	var n uint64
 	for _, d := range b {
 		if d < '0' || d > '9' {
 			return 0, ErrProtocol
 		}
-		n10 := n * 10
-		if n10/10 != n {
+		digit := uint64(d - '0')
+		// Fully-correct overflow detection: the multiplication guard
+		// `n10/10 != n` catches multiplicative overflow but the
+		// subsequent addition `n10 + digit` can still wrap for values
+		// where `n == maxU64/10` with `digit > maxU64%10`. The
+		// low-bit wrap check `n < digit` caught most of these but
+		// not all — pre-check before the add.
+		if n > (maxU64-digit)/10 {
 			return 0, ErrProtocol
 		}
-		n = n10 + uint64(d-'0')
-		if n < uint64(d-'0') {
-			return 0, ErrProtocol
-		}
+		n = n*10 + digit
 	}
 	return n, nil
 }

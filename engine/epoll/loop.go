@@ -738,8 +738,20 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
-			mu := &sync.Mutex{}
-			cs.detachMu = mu
+			// In async mode cs.detachMu was already allocated at
+			// acquireConnState time. Reuse it so the dispatch
+			// goroutine (which closes over cs.detachMu) and the
+			// WebSocket middleware's guarded writeFn share one
+			// mutex — otherwise installing a fresh mu here leaves
+			// the dispatch goroutine holding a lock nobody else
+			// sees.
+			var mu *sync.Mutex
+			if cs.detachMu != nil {
+				mu = cs.detachMu
+			} else {
+				mu = &sync.Mutex{}
+				cs.detachMu = mu
+			}
 			l.detachedCount++
 			orig := cs.writeFn
 			guarded := func(data []byte) {

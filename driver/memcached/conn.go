@@ -136,7 +136,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	tcp, ok := raw.(*net.TCPConn)
 	if !ok {
 		_ = raw.Close()
-		return nil, fmt.Errorf("celeris/memcached: expected *net.TCPConn, got %T", raw)
+		return nil, fmt.Errorf("celeris-memcached: expected *net.TCPConn, got %T", raw)
 	}
 	_ = tcp.SetNoDelay(true)
 
@@ -161,7 +161,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 		// armed; GC could then call syscall.Close(fd) a second time on an
 		// fd the kernel has since reassigned.
 		_ = file.Close()
-		return nil, errors.New("celeris/memcached: event loop has 0 workers")
+		return nil, errors.New("celeris-memcached: event loop has 0 workers")
 	}
 	if workerHint < 0 || workerHint >= nw {
 		workerHint = fd % nw
@@ -222,7 +222,7 @@ func dialDirectMemcachedConn(ctx context.Context, cfg Config) (*memcachedConn, e
 	tcp, ok := raw.(*net.TCPConn)
 	if !ok {
 		_ = raw.Close()
-		return nil, fmt.Errorf("celeris/memcached: expected *net.TCPConn, got %T", raw)
+		return nil, fmt.Errorf("celeris-memcached: expected *net.TCPConn, got %T", raw)
 	}
 	_ = tcp.SetNoDelay(true)
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -245,9 +246,33 @@ func applyDefaults(d *DSN) {
 
 // CheckSSL returns ErrSSLNotSupported if the DSN requests a TLS mode this
 // driver version cannot satisfy.
+//
+// In v1.4.0 the driver has no TLS stack. sslmode semantics:
+//
+//   - "" / "disable"         : plaintext, always allowed.
+//   - "prefer" / "allow"     : the libpq semantics are "try TLS, fall
+//     back to plaintext" (prefer) or "try plaintext,
+//     upgrade if the server demands TLS" (allow). Since
+//     we can only ever do plaintext, these are treated
+//     as equivalent to "disable" but WITH a warning —
+//     the user expected opportunistic encryption and
+//     got none.
+//   - "require" / "verify-ca" / "verify-full" : TLS is mandatory;
+//     rejected with ErrSSLNotSupported. Users with managed
+//     cloud DBs (RDS, CloudSQL, etc.) must wait for v1.4.x
+//     TLS support.
 func (d *DSN) CheckSSL() error {
 	switch strings.ToLower(d.Options.SSLMode) {
-	case "", "disable", "prefer", "allow":
+	case "", "disable":
+		return nil
+	case "prefer", "allow":
+		// Silent downgrade is a real operational footgun. We accept
+		// the connection but emit a single stderr warning so callers
+		// see the mismatch at startup instead of discovering it in
+		// production.
+		fmt.Fprintf(os.Stderr,
+			"celeris-postgres: sslmode=%s silently downgraded to plaintext — v1.4.0 has no TLS stack (use sslmode=disable explicitly, or wait for v1.4.x TLS support)\n",
+			d.Options.SSLMode)
 		return nil
 	case "require", "verify-ca", "verify-full":
 		return fmt.Errorf("%w (sslmode=%s)", ErrSSLNotSupported, d.Options.SSLMode)

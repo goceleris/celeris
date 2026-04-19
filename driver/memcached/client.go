@@ -39,7 +39,7 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 		o(&cfg)
 	}
 	if cfg.Addr == "" {
-		return nil, errors.New("celeris/memcached: empty address")
+		return nil, errors.New("celeris-memcached: empty address")
 	}
 	// Direct net.TCPConn path when:
 	//   - No engine supplied (standalone), OR

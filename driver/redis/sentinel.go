@@ -65,10 +65,10 @@ type sentinelConn struct {
 // connections for automatic failover handling.
 func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 	if cfg.MasterName == "" {
-		return nil, errors.New("celeris/redis: SentinelConfig.MasterName is required")
+		return nil, errors.New("celeris-redis: SentinelConfig.MasterName is required")
 	}
 	if len(cfg.SentinelAddrs) == 0 {
-		return nil, errors.New("celeris/redis: SentinelConfig.SentinelAddrs requires at least one address")
+		return nil, errors.New("celeris-redis: SentinelConfig.SentinelAddrs requires at least one address")
 	}
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = defaultDialTimeout
@@ -79,11 +79,11 @@ func NewSentinelClient(cfg SentinelConfig) (*SentinelClient, error) {
 	}
 	masterAddr, err := s.discoverMaster()
 	if err != nil {
-		return nil, fmt.Errorf("celeris/redis: sentinel master discovery failed: %w", err)
+		return nil, fmt.Errorf("celeris-redis: sentinel master discovery failed: %w", err)
 	}
 	client, err := s.dialMaster(masterAddr)
 	if err != nil {
-		return nil, fmt.Errorf("celeris/redis: dial master %s failed: %w", masterAddr, err)
+		return nil, fmt.Errorf("celeris-redis: dial master %s failed: %w", masterAddr, err)
 	}
 	s.client = client
 	go s.subscribeLoop()
@@ -327,7 +327,7 @@ func (s *SentinelClient) watchFailover(sc *sentinelConn) {
 // ErrSentinelUnhealthy is returned by commands when the sentinel client
 // failed to connect to the new master after a failover and is in an
 // unhealthy state.
-var ErrSentinelUnhealthy = errors.New("celeris/redis: sentinel client unhealthy, failover dial failed")
+var ErrSentinelUnhealthy = errors.New("celeris-redis: sentinel client unhealthy, failover dial failed")
 
 // handleSwitchMaster parses the sentinel notification and swaps the master client.
 // On dial failure, it retries 3 times with exponential backoff. If all retries

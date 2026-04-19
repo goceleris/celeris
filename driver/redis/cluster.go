@@ -67,7 +67,7 @@ type ClusterConfig struct {
 
 // ErrClusterMaxRedirects is returned when the maximum number of MOVED/ASK
 // redirects has been exhausted.
-var ErrClusterMaxRedirects = errors.New("celeris/redis: cluster max redirects exceeded")
+var ErrClusterMaxRedirects = errors.New("celeris-redis: cluster max redirects exceeded")
 
 // ClusterClient is a Redis Cluster client. It maintains a slot-to-node mapping,
 // routes commands by key hash slot, and handles MOVED/ASK redirects
@@ -91,7 +91,7 @@ type ClusterClient struct {
 // slot map. A background goroutine refreshes the topology periodically.
 func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 	if len(cfg.Addrs) == 0 {
-		return nil, errors.New("celeris/redis: ClusterConfig.Addrs requires at least one address")
+		return nil, errors.New("celeris-redis: ClusterConfig.Addrs requires at least one address")
 	}
 	if cfg.MaxRedirects <= 0 {
 		cfg.MaxRedirects = 3
@@ -105,14 +105,14 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 		closeCh: make(chan struct{}),
 	}
 	if err := c.initNodes(); err != nil {
-		return nil, fmt.Errorf("celeris/redis: cluster init failed: %w", err)
+		return nil, fmt.Errorf("celeris-redis: cluster init failed: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.DialTimeout)
 	err := c.refreshTopology(ctx)
 	cancel()
 	if err != nil {
 		c.closeNodes()
-		return nil, fmt.Errorf("celeris/redis: CLUSTER SLOTS failed: %w", err)
+		return nil, fmt.Errorf("celeris-redis: CLUSTER SLOTS failed: %w", err)
 	}
 	go c.refreshLoop()
 	return c, nil
@@ -204,7 +204,7 @@ func (c *ClusterClient) dialReplicaNode(addr string) (*Client, error) {
 	defer cancel()
 	if _, err := client.Do(ctx, "READONLY"); err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("celeris/redis: READONLY handshake on %s: %w", addr, err)
+		return nil, fmt.Errorf("celeris-redis: READONLY handshake on %s: %w", addr, err)
 	}
 	return client, nil
 }
@@ -485,7 +485,7 @@ func (c *ClusterClient) doWithRetryCmd(ctx context.Context, key, cmd string, fn 
 		node = c.anyNode()
 	}
 	if node == nil {
-		return errors.New("celeris/redis: no cluster nodes available")
+		return errors.New("celeris-redis: no cluster nodes available")
 	}
 	triedReplicaFallback := false
 	triedPrimaryRefresh := false
@@ -613,7 +613,7 @@ func parseRedirectAddr(msg string) string {
 func (c *ClusterClient) Ping(ctx context.Context) error {
 	node := c.anyNode()
 	if node == nil {
-		return errors.New("celeris/redis: no cluster nodes available")
+		return errors.New("celeris-redis: no cluster nodes available")
 	}
 	return node.client.Ping(ctx)
 }
@@ -911,7 +911,7 @@ func (c *ClusterClient) Publish(ctx context.Context, channel, message string) (i
 	// PUBLISH in cluster mode: route to any node (pubsub is cluster-wide).
 	node := c.anyNode()
 	if node == nil {
-		return 0, errors.New("celeris/redis: no cluster nodes available")
+		return 0, errors.New("celeris-redis: no cluster nodes available")
 	}
 	return node.client.Publish(ctx, channel, message)
 }
@@ -920,7 +920,7 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 	// Regular SUBSCRIBE is cluster-wide: pick any node.
 	node := c.anyNode()
 	if node == nil {
-		return nil, errors.New("celeris/redis: no cluster nodes available")
+		return nil, errors.New("celeris-redis: no cluster nodes available")
 	}
 	return node.client.Subscribe(ctx, channels...)
 }
@@ -932,7 +932,7 @@ func (c *ClusterClient) Subscribe(ctx context.Context, channels ...string) (*Pub
 // undefined behavior in cluster mode.
 func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*PubSub, error) {
 	if len(channels) == 0 {
-		return nil, errors.New("celeris/redis: SSubscribe requires at least one channel")
+		return nil, errors.New("celeris-redis: SSubscribe requires at least one channel")
 	}
 	slot := Slot(channels[0])
 	node := c.route(slot)
@@ -940,7 +940,7 @@ func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) (*Pu
 		node = c.anyNode()
 	}
 	if node == nil {
-		return nil, errors.New("celeris/redis: no cluster nodes available")
+		return nil, errors.New("celeris-redis: no cluster nodes available")
 	}
 	ps, err := node.client.newPubSub(ctx)
 	if err != nil {
@@ -973,7 +973,7 @@ func (c *ClusterClient) Do(ctx context.Context, args ...any) (*protocol.Value, e
 	if len(args) < 2 {
 		node := c.anyNode()
 		if node == nil {
-			return nil, errors.New("celeris/redis: no cluster nodes available")
+			return nil, errors.New("celeris-redis: no cluster nodes available")
 		}
 		return node.client.Do(ctx, args...)
 	}
@@ -1133,7 +1133,7 @@ func (cp *ClusterPipeline) execRound(ctx context.Context, cmds []clusterPipeCmd,
 			if node == nil {
 				mu.Lock()
 				for _, ic := range icmds {
-					errs[ic.origIdx] = errors.New("celeris/redis: no cluster nodes available")
+					errs[ic.origIdx] = errors.New("celeris-redis: no cluster nodes available")
 				}
 				mu.Unlock()
 				return

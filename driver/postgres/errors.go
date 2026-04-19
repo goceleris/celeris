@@ -32,6 +32,21 @@ var ErrBadConn = errors.New("celeris-postgres: bad connection")
 // query with LIMIT/OFFSET or cursor-based paging.
 var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-mode buffer cap (64 MiB); paginate or use streaming mode")
 
+// ErrDirectModeUnsupported is returned by operations that rely on
+// unsolicited server messages between queries — LISTEN/UNLISTEN/NOTIFY
+// (NotificationResponse) most notably. Direct-mode conns dial a plain
+// net.TCPConn and drive reads from the caller goroutine only during
+// an active query; between queries no reader is active, so any
+// async-delivered message is silently dropped. COPY FROM/TO is
+// supported via a short-lived per-call reader goroutine; only the
+// persistent-listener class of operations returns this error.
+//
+// Workarounds: open the pool against an engine with AsyncHandlers=false
+// (drivers will pick the mini-loop path which has an always-on reader),
+// or use a separate non-pooled listener conn dedicated to
+// LISTEN/NOTIFY in a non-async configuration.
+var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
+
 // PGError re-exports the server-side ErrorResponse type so callers can
 // type-assert without importing the protocol package.
 type PGError = protocol.PGError

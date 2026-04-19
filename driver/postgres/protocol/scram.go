@@ -115,6 +115,14 @@ func (s *scramClient) HandleServerFirst(msg []byte) ([]byte, error) {
 	if err != nil || iter < 1 {
 		return nil, fmt.Errorf("postgres/protocol: bad scram iteration count: %s", string(iAttr))
 	}
+	// RFC 7677 §3 mandates a minimum of 4096 iterations for
+	// SCRAM-SHA-256. A server advertising a lower count (either
+	// misconfigured or a MITM trying to accelerate an offline
+	// dictionary attack) is rejected.
+	const scramMinIterations = 4096
+	if iter < scramMinIterations {
+		return nil, fmt.Errorf("postgres/protocol: SCRAM iteration count %d below RFC 7677 minimum (%d)", iter, scramMinIterations)
+	}
 	s.iterations = iter
 
 	// SaltedPassword := Hi(password, salt, i)
@@ -185,6 +193,18 @@ func (s *scramClient) HandleServerFinal(msg []byte) error {
 	if !hmac.Equal(serverSigSent, serverSig) {
 		return errors.New("postgres/protocol: scram server signature mismatch")
 	}
+	// Auth complete. Zero derived key material so a memory-dump
+	// scenario (core dump, /proc/self/mem) cannot recover it. The
+	// cleartext password is a Go string (immutable, can't be
+	// zeroed); callers who want strict secret hygiene must zero
+	// their own input before handing it to newSCRAM.
+	clear(s.saltedPassword)
+	clear(s.authMessage)
+	clear(s.clientFirst)
+	clear(s.serverFirst)
+	clear(serverKey)
+	clear(serverSig)
+	s.password = "" // drop the reference; string memory is already shared
 	return nil
 }
 

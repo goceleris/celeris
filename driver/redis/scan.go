@@ -85,7 +85,7 @@ func (it *ScanIterator) fetch(ctx context.Context) error {
 	var keys []string
 	err := it.client.do(ctx, func(v protocol.Value) error {
 		if v.Type != protocol.TyArray || len(v.Array) != 2 {
-			return errors.New("celeris/redis: SCAN reply is not a 2-element array")
+			return errors.New("celeris-redis: SCAN reply is not a 2-element array")
 		}
 		cur, e := asString(v.Array[0])
 		if e != nil {

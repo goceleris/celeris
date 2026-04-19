@@ -21,7 +21,7 @@ type Client struct {
 // established lazily on first command.
 func NewClient(addr string, opts ...Option) (*Client, error) {
 	if strings.HasPrefix(addr, "rediss://") {
-		return nil, errors.New("celeris/redis: TLS (rediss://) is not supported in v1.4.0; use redis:// for VPC/loopback deployments or wait for v1.4.x TLS support")
+		return nil, errors.New("celeris-redis: TLS (rediss://) is not supported in v1.4.0; use redis:// for VPC/loopback deployments or wait for v1.4.x TLS support")
 	}
 	// Strip redis:// prefix if present.
 	addr = strings.TrimPrefix(addr, "redis://")
@@ -30,7 +30,7 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 		o(&cfg)
 	}
 	if cfg.Addr == "" {
-		return nil, errors.New("celeris/redis: empty address")
+		return nil, errors.New("celeris-redis: empty address")
 	}
 	// Direct-cmd-path ONLY when the engine dispatches handlers async
 	// (caller runs on an unlocked G → net.Conn.Read uses Go's netpoll
@@ -120,7 +120,7 @@ func (c *Client) IdleConnWorkers() []int {
 // surface as [*RedisError] via the returned error.
 func (c *Client) Do(ctx context.Context, args ...any) (*protocol.Value, error) {
 	if len(args) == 0 {
-		return nil, errors.New("celeris/redis: Do requires at least one argument")
+		return nil, errors.New("celeris-redis: Do requires at least one argument")
 	}
 	strs := make([]string, len(args))
 	for i, a := range args {

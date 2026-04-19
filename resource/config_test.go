@@ -205,11 +205,11 @@ func TestWithDefaults(t *testing.T) {
 	if d.Logger == nil {
 		t.Error("Logger should not be nil after WithDefaults")
 	}
-	if d.ReadTimeout != 300*time.Second {
-		t.Errorf("ReadTimeout = %v, want 5m0s", d.ReadTimeout)
+	if d.ReadTimeout != 60*time.Second {
+		t.Errorf("ReadTimeout = %v, want 1m0s", d.ReadTimeout)
 	}
-	if d.WriteTimeout != 300*time.Second {
-		t.Errorf("WriteTimeout = %v, want 5m0s", d.WriteTimeout)
+	if d.WriteTimeout != 60*time.Second {
+		t.Errorf("WriteTimeout = %v, want 1m0s", d.WriteTimeout)
 	}
 	if d.IdleTimeout != 600*time.Second {
 		t.Errorf("IdleTimeout = %v, want 10m0s", d.IdleTimeout)

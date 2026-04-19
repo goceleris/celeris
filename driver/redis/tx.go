@@ -49,13 +49,13 @@ func (c *Client) TxPipeline(ctx context.Context) (*Tx, error) {
 // not +OK or keys is empty.
 func (tx *Tx) Watch(ctx context.Context, keys ...string) error {
 	if tx.done {
-		return errors.New("celeris/redis: Tx already executed")
+		return errors.New("celeris-redis: Tx already executed")
 	}
 	if len(keys) == 0 {
-		return errors.New("celeris/redis: Watch requires at least one key")
+		return errors.New("celeris-redis: Watch requires at least one key")
 	}
 	if len(tx.cmds) > 0 {
-		return errors.New("celeris/redis: Watch must be called before any queued command")
+		return errors.New("celeris-redis: Watch must be called before any queued command")
 	}
 	args := append([]string{"WATCH"}, keys...)
 	req, err := tx.conn.exec(ctx, args...)
@@ -69,7 +69,7 @@ func (tx *Tx) Watch(ctx context.Context, keys ...string) error {
 // Unwatch drops all watched keys on the pinned conn.
 func (tx *Tx) Unwatch(ctx context.Context) error {
 	if tx.done {
-		return errors.New("celeris/redis: Tx already executed")
+		return errors.New("celeris-redis: Tx already executed")
 	}
 	req, err := tx.conn.exec(ctx, "UNWATCH")
 	if err != nil {
@@ -118,7 +118,7 @@ func (tx *Tx) addCmd3(kind cmdKind, a0, a1, a2 string) *pipeCmd {
 //     error. The conn is returned to the pool.
 func (tx *Tx) Exec(ctx context.Context) error {
 	if tx.done {
-		return errors.New("celeris/redis: Tx already executed")
+		return errors.New("celeris-redis: Tx already executed")
 	}
 	tx.done = true
 	defer func() {
@@ -185,7 +185,7 @@ func (tx *Tx) Exec(ctx context.Context) error {
 		return ErrTxAborted
 	}
 	if execReq.result.Type != protocol.TyArray && execReq.result.Type != protocol.TySet {
-		err := errors.New("celeris/redis: EXEC reply is not an array")
+		err := errors.New("celeris-redis: EXEC reply is not an array")
 		for _, pc := range tx.cmds {
 			if pc.err == nil {
 				pc.err = err
@@ -195,7 +195,7 @@ func (tx *Tx) Exec(ctx context.Context) error {
 	}
 	elems := execReq.result.Array
 	if len(elems) != n {
-		err := errors.New("celeris/redis: EXEC reply count mismatch")
+		err := errors.New("celeris-redis: EXEC reply count mismatch")
 		for _, pc := range tx.cmds {
 			if pc.err == nil {
 				pc.err = err

@@ -35,19 +35,19 @@ import (
 
 // ErrIncomplete indicates the buffered input does not yet contain a full RESP
 // frame. The Reader's cursor is not advanced.
-var ErrIncomplete = errors.New("celeris/redis/protocol: incomplete frame")
+var ErrIncomplete = errors.New("celeris-redis-protocol: incomplete frame")
 
 // ErrProtocol indicates malformed RESP input.
-var ErrProtocol = errors.New("celeris/redis/protocol: protocol error")
+var ErrProtocol = errors.New("celeris-redis-protocol: protocol error")
 
 // ErrProtocolOversizedBulk indicates a bulk string length header exceeds
 // [MaxBulkLen]. Hostile or corrupt servers can otherwise force the Reader
 // buffer to grow without bound while waiting for payload bytes.
-var ErrProtocolOversizedBulk = errors.New("celeris/redis/protocol: bulk length exceeds maximum")
+var ErrProtocolOversizedBulk = errors.New("celeris-redis-protocol: bulk length exceeds maximum")
 
 // ErrProtocolOversizedArray indicates an aggregate header (array / set / push
 // / map / attr) exceeds [MaxArrayLen].
-var ErrProtocolOversizedArray = errors.New("celeris/redis/protocol: aggregate length exceeds maximum")
+var ErrProtocolOversizedArray = errors.New("celeris-redis-protocol: aggregate length exceeds maximum")
 
 const (
 	// MaxBulkLen caps the advertised length of a single bulk/verbatim/blob

@@ -101,7 +101,7 @@ func asBytes(v any) ([]byte, error) {
 	case fmt.Stringer:
 		return []byte(x.String()), nil
 	default:
-		return nil, fmt.Errorf("celeris/memcached: unsupported value type %T", v)
+		return nil, fmt.Errorf("celeris-memcached: unsupported value type %T", v)
 	}
 }
 
@@ -844,7 +844,7 @@ func binaryStorageOp(cmd string) (byte, error) {
 	case "prepend":
 		return protocol.OpPrepend, nil
 	}
-	return 0, fmt.Errorf("celeris/memcached: no binary opcode for %q", cmd)
+	return 0, fmt.Errorf("celeris-memcached: no binary opcode for %q", cmd)
 }
 
 // translateTextStorage converts a text-protocol reply into the appropriate

@@ -270,6 +270,19 @@ func (p *Pool[C]) releaseSem() {
 // Close closes every idle connection, stops the health check, and prevents
 // further Acquire calls. In-flight connections held by drivers will be
 // closed when they are Release'd back to the pool.
+// Close closes all idle connections and marks the pool closed.
+// In-flight connections — those currently held by callers outside
+// the pool's idle lists — are NOT force-closed; when the caller
+// returns them via Release, the pool will see its closed state and
+// Discard the connection (TCP close). Callers that want a strict
+// drain should stop issuing new queries and wait for in-flight
+// work to complete before calling Close.
+//
+// Any active database transactions on in-flight connections are
+// aborted at the server side when the TCP connection is eventually
+// closed (no ROLLBACK is sent). Callers that must guarantee
+// transactional cleanup should issue Commit or Rollback before
+// releasing the conn to the pool.
 func (p *Pool[C]) Close() error {
 	if !p.closed.CompareAndSwap(false, true) {
 		return nil

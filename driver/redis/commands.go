@@ -51,7 +51,7 @@ func asString(v protocol.Value) (string, error) {
 	case protocol.TyInt:
 		return strconv.FormatInt(v.Int, 10), nil
 	default:
-		return "", fmt.Errorf("celeris/redis: expected string reply, got %s", v.Type)
+		return "", fmt.Errorf("celeris-redis: expected string reply, got %s", v.Type)
 	}
 }
 
@@ -79,7 +79,7 @@ func asBytes(v protocol.Value) ([]byte, error) {
 	case protocol.TyNull:
 		return nil, ErrNil
 	default:
-		return nil, fmt.Errorf("celeris/redis: expected string reply, got %s", v.Type)
+		return nil, fmt.Errorf("celeris-redis: expected string reply, got %s", v.Type)
 	}
 }
 
@@ -92,7 +92,7 @@ func asInt(v protocol.Value) (int64, error) {
 	case protocol.TyNull:
 		return 0, ErrNil
 	default:
-		return 0, fmt.Errorf("celeris/redis: expected int reply, got %s", v.Type)
+		return 0, fmt.Errorf("celeris-redis: expected int reply, got %s", v.Type)
 	}
 }
 
@@ -105,7 +105,7 @@ func asFloat(v protocol.Value) (float64, error) {
 	case protocol.TyNull:
 		return 0, ErrNil
 	default:
-		return 0, fmt.Errorf("celeris/redis: expected float reply, got %s", v.Type)
+		return 0, fmt.Errorf("celeris-redis: expected float reply, got %s", v.Type)
 	}
 }
 
@@ -122,11 +122,11 @@ func asBool(v protocol.Value) (bool, error) {
 		case "0", "false", "FALSE", "False":
 			return false, nil
 		}
-		return false, fmt.Errorf("celeris/redis: cannot decode bulk %q as bool", v.Str)
+		return false, fmt.Errorf("celeris-redis: cannot decode bulk %q as bool", v.Str)
 	case protocol.TyNull:
 		return false, ErrNil
 	}
-	return false, fmt.Errorf("celeris/redis: expected bool reply, got %s", v.Type)
+	return false, fmt.Errorf("celeris-redis: expected bool reply, got %s", v.Type)
 }
 
 func asStringSlice(v protocol.Value) ([]string, error) {
@@ -143,12 +143,19 @@ func asStringSlice(v protocol.Value) ([]string, error) {
 		}
 		return out, nil
 	case protocol.TyNull:
-		return nil, nil
+		// Return ErrNil explicitly rather than (nil, nil) — a
+		// caller that checks only `err == nil` should not confuse
+		// a genuine miss with an empty-but-present array. Matches
+		// asInt / asFloat / asString behaviour.
+		return nil, ErrNil
 	}
-	return nil, fmt.Errorf("celeris/redis: expected array reply, got %s", v.Type)
+	return nil, fmt.Errorf("celeris-redis: expected array reply, got %s", v.Type)
 }
 
 func asStringMap(v protocol.Value) (map[string]string, error) {
+	if v.Type == protocol.TyNull {
+		return nil, ErrNil
+	}
 	switch v.Type {
 	case protocol.TyMap:
 		out := make(map[string]string, len(v.Map))
@@ -158,7 +165,7 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 		return out, nil
 	case protocol.TyArray:
 		if len(v.Array)%2 != 0 {
-			return nil, errors.New("celeris/redis: map array has odd length")
+			return nil, errors.New("celeris-redis: map array has odd length")
 		}
 		out := make(map[string]string, len(v.Array)/2)
 		for i := 0; i < len(v.Array); i += 2 {
@@ -166,9 +173,9 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 		}
 		return out, nil
 	case protocol.TyNull:
-		return nil, nil
+		return nil, ErrNil
 	}
-	return nil, fmt.Errorf("celeris/redis: expected map reply, got %s", v.Type)
+	return nil, fmt.Errorf("celeris-redis: expected map reply, got %s", v.Type)
 }
 
 // argify converts a value to a string arg. Used by variadic commands.
@@ -375,7 +382,7 @@ func (c *Client) HGet(ctx context.Context, key, field string) (string, error) {
 // f2, v2, ...].
 func (c *Client) HSet(ctx context.Context, key string, values ...any) (int64, error) {
 	if len(values) == 0 || len(values)%2 != 0 {
-		return 0, errors.New("celeris/redis: HSet requires an even number of values")
+		return 0, errors.New("celeris-redis: HSet requires an even number of values")
 	}
 	args := make([]string, 0, 2+len(values))
 	args = append(args, "HSET", key)
@@ -648,7 +655,7 @@ type ZRangeBy struct {
 // LIMIT.
 func (c *Client) ZRangeByScore(ctx context.Context, key string, opt *ZRangeBy) ([]string, error) {
 	if opt == nil {
-		return nil, errors.New("celeris/redis: ZRangeByScore opt is nil")
+		return nil, errors.New("celeris-redis: ZRangeByScore opt is nil")
 	}
 	args := []string{"ZRANGEBYSCORE", key, opt.Min, opt.Max}
 	if opt.Count != 0 {
@@ -865,7 +872,7 @@ func (c *Client) ScriptLoad(ctx context.Context, script string) (string, error) 
 // If the WATCHed keys change before EXEC, Exec returns [ErrTxAborted].
 func (c *Client) Watch(ctx context.Context, fn func(tx *Tx) error, keys ...string) error {
 	if len(keys) == 0 {
-		return errors.New("celeris/redis: Watch requires at least one key")
+		return errors.New("celeris-redis: Watch requires at least one key")
 	}
 	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
 	if err != nil {
@@ -907,7 +914,7 @@ func (c *Client) Watch(ctx context.Context, fn func(tx *Tx) error, keys ...strin
 // [k1, v1, k2, v2, ...].
 func (c *Client) MSet(ctx context.Context, pairs ...any) error {
 	if len(pairs) == 0 || len(pairs)%2 != 0 {
-		return errors.New("celeris/redis: MSet requires an even number of arguments")
+		return errors.New("celeris-redis: MSet requires an even number of arguments")
 	}
 	args := make([]string, 0, 1+len(pairs))
 	args = append(args, "MSET")
