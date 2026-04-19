@@ -5,6 +5,7 @@ go 1.26.0
 replace github.com/goceleris/celeris => ../../
 
 require (
+	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/goceleris/celeris v0.0.0-00010101000000-000000000000
 	github.com/gofiber/fiber/v3 v3.1.0

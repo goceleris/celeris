@@ -57,6 +57,15 @@ func livePGDSN() string {
 	return dsn
 }
 
+// liveMemcachedAddr returns CELERIS_MEMCACHED_ADDR or the default.
+func liveMemcachedAddr() string {
+	addr := os.Getenv("CELERIS_MEMCACHED_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:11211"
+	}
+	return addr
+}
+
 // tcpReachable returns true if a TCP connection to addr can be
 // established within 500ms.
 func tcpReachable(addr string) bool {
