@@ -229,7 +229,9 @@ func validKey(key string, maxLen int) bool {
 func replay(c *celeris.Context, rep store.EncodedResponse) error {
 	ct := "application/octet-stream"
 	for _, h := range rep.Headers {
-		if strings.EqualFold(h[0], "content-type") {
+		// Keys stored via c.SetHeader were already lowercased at capture
+		// time (see cache.go's same optimization); skip EqualFold.
+		if h[0] == "content-type" {
 			ct = h[1]
 			continue
 		}

@@ -166,7 +166,9 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 		cacheable := true
 		if cfg.RespectCacheControl {
 			for _, h := range respHeaders {
-				if strings.EqualFold(h[0], "cache-control") {
+				// c.SetHeader lowercases keys on storage, so an exact ==
+				// is both correct and ~10x faster than strings.EqualFold.
+				if h[0] == "cache-control" {
 					v := strings.ToLower(h[1])
 					if strings.Contains(v, "no-store") || strings.Contains(v, "private") {
 						cacheable = false
