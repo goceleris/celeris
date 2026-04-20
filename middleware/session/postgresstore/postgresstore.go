@@ -50,6 +50,16 @@ type Store struct {
 	pool  *postgres.Pool
 	table string
 
+	// Pre-formatted SQL templates — table name is immutable after
+	// construction, so fmt.Sprintf'ing once here avoids an alloc per
+	// Get/Set/Delete call.
+	qGet          string
+	qSet          string
+	qDelete       string
+	qTruncate     string
+	qDeletePrefix string
+	qCleanup      string
+
 	cancel context.CancelFunc
 	done   chan struct{}
 
@@ -80,7 +90,21 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 		return nil, errors.New("postgresstore: pool must not be nil")
 	}
 
-	s := &Store{pool: pool, table: o.TableName}
+	s := &Store{
+		pool:  pool,
+		table: o.TableName,
+		qGet: fmt.Sprintf(
+			`SELECT value FROM %s WHERE id=$1 AND (expires_at IS NULL OR expires_at > NOW())`,
+			o.TableName,
+		),
+		qSet: fmt.Sprintf(`INSERT INTO %s (id, value, expires_at)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO UPDATE SET value=EXCLUDED.value, expires_at=EXCLUDED.expires_at`, o.TableName),
+		qDelete:       fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, o.TableName),
+		qTruncate:     fmt.Sprintf(`TRUNCATE TABLE %s`, o.TableName),
+		qDeletePrefix: fmt.Sprintf(`DELETE FROM %s WHERE id LIKE $1 ESCAPE '\'`, o.TableName),
+		qCleanup:      fmt.Sprintf(`DELETE FROM %s WHERE expires_at IS NOT NULL AND expires_at <= NOW()`, o.TableName),
+	}
 
 	if !o.SkipSchemaInit {
 		if err := s.ensureSchema(ctx); err != nil {
@@ -142,8 +166,7 @@ func (s *Store) Close() error {
 
 // Get implements [store.KV].
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	q := fmt.Sprintf(`SELECT value FROM %s WHERE id=$1 AND (expires_at IS NULL OR expires_at > NOW())`, s.table)
-	rows, err := s.pool.QueryContext(ctx, q, key)
+	rows, err := s.pool.QueryContext(ctx, s.qGet, key)
 	if err != nil {
 		return nil, err
 	}
@@ -174,17 +197,13 @@ func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Dura
 	} else {
 		expires = nil
 	}
-	q := fmt.Sprintf(`INSERT INTO %s (id, value, expires_at)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (id) DO UPDATE SET value=EXCLUDED.value, expires_at=EXCLUDED.expires_at`, s.table)
-	_, err := s.pool.ExecContext(ctx, q, key, value, expires)
+	_, err := s.pool.ExecContext(ctx, s.qSet, key, value, expires)
 	return err
 }
 
 // Delete implements [store.KV].
 func (s *Store) Delete(ctx context.Context, key string) error {
-	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, s.table)
-	_, err := s.pool.ExecContext(ctx, q, key)
+	_, err := s.pool.ExecContext(ctx, s.qDelete, key)
 	return err
 }
 
@@ -194,12 +213,10 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // being interpreted.
 func (s *Store) DeletePrefix(ctx context.Context, prefix string) error {
 	if prefix == "" {
-		q := fmt.Sprintf(`TRUNCATE TABLE %s`, s.table)
-		_, err := s.pool.ExecContext(ctx, q)
+		_, err := s.pool.ExecContext(ctx, s.qTruncate)
 		return err
 	}
-	q := fmt.Sprintf(`DELETE FROM %s WHERE id LIKE $1 ESCAPE '\'`, s.table)
-	_, err := s.pool.ExecContext(ctx, q, escapeLike(prefix)+"%")
+	_, err := s.pool.ExecContext(ctx, s.qDeletePrefix, escapeLike(prefix)+"%")
 	return err
 }
 
@@ -207,7 +224,7 @@ func (s *Store) cleanupLoop(ctx context.Context, interval time.Duration) {
 	defer close(s.done)
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	q := fmt.Sprintf(`DELETE FROM %s WHERE expires_at IS NOT NULL AND expires_at <= NOW()`, s.table)
+	q := s.qCleanup // hoisted local to keep the select body tight.
 	for {
 		select {
 		case <-ctx.Done():
