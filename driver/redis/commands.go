@@ -304,7 +304,18 @@ func (c *Client) SetBytes(ctx context.Context, key string, value []byte, expirat
 
 // SetNX sets key only if it does not exist.
 func (c *Client) SetNX(ctx context.Context, key string, value any, expiration time.Duration) (bool, error) {
-	args := []string{"SET", key, argify(value)}
+	return c.setNX(ctx, key, argify(value), expiration)
+}
+
+// SetNXBytes is the allocation-lean variant of [Client.SetNX]. Skips
+// argify's string(x) copy via unsafe.String — same safety rationale as
+// [Client.SetBytes].
+func (c *Client) SetNXBytes(ctx context.Context, key string, value []byte, expiration time.Duration) (bool, error) {
+	return c.setNX(ctx, key, unsafeStringFromBytes(value), expiration)
+}
+
+func (c *Client) setNX(ctx context.Context, key, value string, expiration time.Duration) (bool, error) {
+	args := []string{"SET", key, value}
 	args = appendExpire(args, expiration)
 	args = append(args, "NX")
 	var ok bool
@@ -456,6 +467,20 @@ func (c *Client) HSet(ctx context.Context, key string, values ...any) (int64, er
 	return out, err
 }
 
+// HSetBytes is the allocation-lean variant of [Client.HSet] for a single
+// field/value pair where value is already a []byte. The field name is
+// still a string (hash fields are typed string).
+func (c *Client) HSetBytes(ctx context.Context, key, field string, value []byte) (int64, error) {
+	args := []string{"HSET", key, field, unsafeStringFromBytes(value)}
+	var out int64
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n
+		return e
+	}, args...)
+	return out, err
+}
+
 // HDel removes one or more fields.
 func (c *Client) HDel(ctx context.Context, key string, fields ...string) (int64, error) {
 	args := make([]string, 0, 2+len(fields))
@@ -532,12 +557,47 @@ func (c *Client) LPush(ctx context.Context, key string, values ...any) (int64, e
 	return out, err
 }
 
+// LPushBytes is the allocation-lean variant of [Client.LPush] for
+// callers that already hold the values as [][]byte. Skips argify's
+// string(x) copy per value.
+func (c *Client) LPushBytes(ctx context.Context, key string, values ...[]byte) (int64, error) {
+	args := make([]string, 0, 2+len(values))
+	args = append(args, "LPUSH", key)
+	for _, v := range values {
+		args = append(args, unsafeStringFromBytes(v))
+	}
+	var out int64
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n
+		return e
+	}, args...)
+	return out, err
+}
+
 // RPush appends one or more values.
 func (c *Client) RPush(ctx context.Context, key string, values ...any) (int64, error) {
 	args := make([]string, 0, 2+len(values))
 	args = append(args, "RPUSH", key)
 	for _, v := range values {
 		args = append(args, argify(v))
+	}
+	var out int64
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n
+		return e
+	}, args...)
+	return out, err
+}
+
+// RPushBytes is the allocation-lean variant of [Client.RPush]. Skips
+// argify's per-value string(x) copy.
+func (c *Client) RPushBytes(ctx context.Context, key string, values ...[]byte) (int64, error) {
+	args := make([]string, 0, 2+len(values))
+	args = append(args, "RPUSH", key)
+	for _, v := range values {
+		args = append(args, unsafeStringFromBytes(v))
 	}
 	var out int64
 	err := c.do(ctx, func(v protocol.Value) error {
@@ -1037,6 +1097,16 @@ func (c *Client) SetEX(ctx context.Context, key string, value any, ttl time.Dura
 		"SETEX", key, strconv.FormatInt(secs, 10), argify(value))
 }
 
+// SetEXBytes is the allocation-lean variant of [Client.SetEX].
+func (c *Client) SetEXBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	secs := int64(ttl / time.Second)
+	if secs <= 0 {
+		secs = 1
+	}
+	return c.do(ctx, func(protocol.Value) error { return nil },
+		"SETEX", key, strconv.FormatInt(secs, 10), unsafeStringFromBytes(value))
+}
+
 // Append appends value to key and returns the new string length.
 func (c *Client) Append(ctx context.Context, key string, value string) (int64, error) {
 	var out int64
@@ -1200,6 +1270,17 @@ func (c *Client) HSetNX(ctx context.Context, key, field string, value any) (bool
 		out = n == 1
 		return e
 	}, "HSETNX", key, field, argify(value))
+	return out, err
+}
+
+// HSetNXBytes is the allocation-lean variant of [Client.HSetNX].
+func (c *Client) HSetNXBytes(ctx context.Context, key, field string, value []byte) (bool, error) {
+	var out bool
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n == 1
+		return e
+	}, "HSETNX", key, field, unsafeStringFromBytes(value))
 	return out, err
 }
 
