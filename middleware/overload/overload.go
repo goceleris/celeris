@@ -24,6 +24,7 @@ package overload
 
 import (
 	"context"
+	"math"
 	"runtime"
 	"strconv"
 	"sync/atomic"
@@ -35,14 +36,40 @@ import (
 // Controller exposes runtime introspection and control of a running
 // overload middleware instance.
 type Controller struct {
-	stage   *atomic.Int32
-	stopped chan struct{}
-	cancel  context.CancelFunc
+	stage        *atomic.Int32
+	inFlight     *atomic.Int32
+	latencyEMAns *atomic.Uint64
+	cpuSample    *atomic.Uint64 // float64 bits of last CPU sample (0..1)
+	stopped      chan struct{}
+	cancel       context.CancelFunc
 }
 
 // Stage returns the current stage.
 func (c *Controller) Stage() Stage {
 	return Stage(c.stage.Load())
+}
+
+// InFlight returns the current in-flight request count observed by the
+// middleware. Not affected by SkipPaths / ExemptPaths (they never touch
+// the counter).
+func (c *Controller) InFlight() int32 {
+	return c.inFlight.Load()
+}
+
+// LatencyEMA returns the current smoothed (EMA) tail latency across
+// observed non-exempt requests. Zero if no requests have completed yet.
+func (c *Controller) LatencyEMA() time.Duration {
+	return time.Duration(c.latencyEMAns.Load())
+}
+
+// CPUSample returns the CPU utilization (0..1) from the last completed
+// poll tick. Returns -1 if no sample has been taken yet.
+func (c *Controller) CPUSample() float64 {
+	bits := c.cpuSample.Load()
+	if bits == 0 {
+		return -1
+	}
+	return math.Float64frombits(bits)
 }
 
 // Stop cancels the background sampling goroutine. Safe to call
@@ -87,6 +114,9 @@ func NewWithController(config ...Config) (celeris.HandlerFunc, *Controller) {
 	}
 
 	stage := &atomic.Int32{}
+	inFlight := &atomic.Int32{}
+	latencyEMAns := &atomic.Uint64{}
+	cpuSample := &atomic.Uint64{}
 
 	parent := cfg.StopContext
 	if parent == nil {
@@ -94,9 +124,16 @@ func NewWithController(config ...Config) (celeris.HandlerFunc, *Controller) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	stopped := make(chan struct{})
-	go run(ctx, cfg, stage, stopped)
+	go run(ctx, cfg, stage, inFlight, latencyEMAns, cpuSample, stopped)
 
-	ctrl := &Controller{stage: stage, stopped: stopped, cancel: cancel}
+	ctrl := &Controller{
+		stage:        stage,
+		inFlight:     inFlight,
+		latencyEMAns: latencyEMAns,
+		cpuSample:    cpuSample,
+		stopped:      stopped,
+		cancel:       cancel,
+	}
 
 	priorityFn := cfg.PriorityFunc
 	priorityThreshold := cfg.PriorityThreshold
@@ -104,6 +141,9 @@ func NewWithController(config ...Config) (celeris.HandlerFunc, *Controller) {
 	backpressureDelay := cfg.BackpressureDelay
 	rejectStatus := cfg.RejectStatus
 	retryAfter := strconv.FormatInt(int64(cfg.RetryAfter/time.Second), 10)
+	emaAlpha := cfg.LatencyEMAAlpha
+	// Depth thresholds snapshot (read-only after New).
+	depth := cfg.DepthThresholds
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -115,31 +155,79 @@ func NewWithController(config ...Config) (celeris.HandlerFunc, *Controller) {
 		if cfg.ExemptFunc != nil && cfg.ExemptFunc(c) {
 			return c.Next()
 		}
-		switch Stage(stage.Load()) {
-		case StageNormal, StageExpand, StageReap:
-			return c.Next()
+
+		// Fold depth into the effective stage — the depth signal can
+		// escalate beyond (but not below) the poll-driven CPU stage.
+		// Zero-valued thresholds are skipped so the hot path stays
+		// branch-predictor-friendly when the user leaves depth off.
+		effective := Stage(stage.Load())
+		if depth.Reject > 0 || depth.Backpressure > 0 || depth.Reorder > 0 || depth.Reap > 0 || depth.Expand > 0 {
+			n := inFlight.Load()
+			if depth.Reject > 0 && n >= depth.Reject && effective < StageReject {
+				effective = StageReject
+			} else if depth.Backpressure > 0 && n >= depth.Backpressure && effective < StageBackpressure {
+				effective = StageBackpressure
+			} else if depth.Reorder > 0 && n >= depth.Reorder && effective < StageReorder {
+				effective = StageReorder
+			} else if depth.Reap > 0 && n >= depth.Reap && effective < StageReap {
+				effective = StageReap
+			} else if depth.Expand > 0 && n >= depth.Expand && effective < StageExpand {
+				effective = StageExpand
+			}
+		}
+
+		// Apply the effective stage's action before letting the request
+		// into the critical section (otherwise rejections would count
+		// against in-flight and skew depth readings).
+		switch effective {
 		case StageReorder:
-			if priorityFn == nil || priorityFn(c) >= priorityThreshold {
-				return c.Next()
+			if priorityFn != nil && priorityFn(c) < priorityThreshold {
+				c.SetHeader("retry-after", retryAfter)
+				return c.AbortWithStatus(rejectStatus)
 			}
-			c.SetHeader("retry-after", retryAfter)
-			return c.AbortWithStatus(rejectStatus)
 		case StageBackpressure:
-			if priorityFn == nil || priorityFn(c) >= priorityThreshold {
-				time.Sleep(backpressureDelay)
-				return c.Next()
+			if priorityFn != nil && priorityFn(c) < priorityThreshold {
+				c.SetHeader("retry-after", retryAfter)
+				return c.AbortWithStatus(backpressureStatus)
 			}
-			c.SetHeader("retry-after", retryAfter)
-			return c.AbortWithStatus(backpressureStatus)
 		case StageReject:
 			c.SetHeader("retry-after", retryAfter)
 			return c.AbortWithStatus(rejectStatus)
 		}
-		return c.Next()
+
+		// Passing through: record in-flight + latency around Next().
+		inFlight.Add(1)
+		if effective == StageBackpressure {
+			time.Sleep(backpressureDelay)
+		}
+		start := time.Now()
+		err := c.Next()
+		elapsedNs := uint64(time.Since(start).Nanoseconds())
+		inFlight.Add(-1)
+		// EMA update: ema = ema*(1-α) + sample*α. Atomic CAS loop so
+		// concurrent writers don't lose updates. One contended retry on
+		// burst; noise on steady-state.
+		for {
+			prev := latencyEMAns.Load()
+			var next uint64
+			if prev == 0 {
+				next = elapsedNs
+			} else {
+				next = uint64(float64(prev)*(1-emaAlpha) + float64(elapsedNs)*emaAlpha)
+			}
+			if latencyEMAns.CompareAndSwap(prev, next) {
+				break
+			}
+		}
+		return err
 	}, ctrl
 }
 
-func run(ctx context.Context, cfg Config, stage *atomic.Int32, stopped chan struct{}) {
+func run(ctx context.Context, cfg Config,
+	stage *atomic.Int32, inFlight *atomic.Int32,
+	latencyEMAns *atomic.Uint64, cpuSample *atomic.Uint64,
+	stopped chan struct{},
+) {
 	defer close(stopped)
 	t := time.NewTicker(cfg.PollInterval)
 	defer t.Stop()
@@ -156,15 +244,44 @@ func run(ctx context.Context, cfg Config, stage *atomic.Int32, stopped chan stru
 			if cpu < 0 {
 				continue
 			}
-			newStage := computeStage(Stage(stage.Load()), cpu, cfg.Thresholds)
+			cpuSample.Store(math.Float64bits(cpu))
+			cpuStage := computeStage(Stage(stage.Load()), cpu, cfg.Thresholds)
+			// Fold latency into the stage decision: whichever signal
+			// produces the higher stage wins. Latency-driven escalation
+			// doesn't need hysteresis because the EMA already smooths
+			// the signal; it naturally decays as latencies recover.
+			latencyStage := latencyToStage(time.Duration(latencyEMAns.Load()), cfg.LatencyThresholds)
+			newStage := cpuStage
+			if latencyStage > newStage {
+				newStage = latencyStage
+			}
 			stage.Store(int32(newStage))
 			if newStage == StageReap && cfg.EnableReap {
 				if cfg.ReapAggressiveness >= 1 {
 					runtime.GC()
 				}
 			}
+			_ = inFlight // surfaced through Controller; not needed in poll
 		}
 	}
+}
+
+// latencyToStage maps a smoothed latency to its stage. Returns
+// StageNormal when all thresholds are zero (latency signal disabled).
+func latencyToStage(ema time.Duration, th LatencyThresholds) Stage {
+	switch {
+	case th.Reject > 0 && ema >= th.Reject:
+		return StageReject
+	case th.Backpressure > 0 && ema >= th.Backpressure:
+		return StageBackpressure
+	case th.Reorder > 0 && ema >= th.Reorder:
+		return StageReorder
+	case th.Reap > 0 && ema >= th.Reap:
+		return StageReap
+	case th.Expand > 0 && ema >= th.Expand:
+		return StageExpand
+	}
+	return StageNormal
 }
 
 // computeStage maps CPU utilization to a stage using hysteresis on

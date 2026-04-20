@@ -54,6 +54,42 @@ type Thresholds struct {
 	Hysteresis   float64 // default 0.05
 }
 
+// DepthThresholds defines the per-stage in-flight request count that
+// escalates the driver independent of CPU. Zero-valued fields disable
+// the depth signal for that stage (CPU-only). Each threshold is an
+// absolute count — if the middleware observes N >= threshold in-flight
+// requests, the effective stage is at least that one.
+//
+// Depth is the most reliable overload signal when handlers block on
+// upstream I/O: CPU stays low while requests queue up. Typical choice:
+// Reorder = 2×NumWorkers, Backpressure = 4×NumWorkers,
+// Reject = 8×NumWorkers.
+type DepthThresholds struct {
+	Expand       int32 // default 0 (disabled)
+	Reap         int32 // default 0 (disabled)
+	Reorder      int32 // default 0 (disabled)
+	Backpressure int32 // default 0 (disabled)
+	Reject       int32 // default 0 (disabled)
+	Hysteresis   int32 // default 0 (no hysteresis on depth)
+}
+
+// LatencyThresholds defines the per-stage EMA tail-latency target that
+// escalates the driver independent of CPU or depth. When the smoothed
+// latency EMA exceeds a threshold, the effective stage is at least that
+// one. Zero-valued fields disable the latency signal for that stage.
+//
+// Latency is the right signal for SLO-aware degradation: at fixed CPU
+// and fixed load, a sudden jump in latency usually means an upstream
+// has slowed down — applying backpressure early preserves overall SLO.
+type LatencyThresholds struct {
+	Expand       time.Duration // default 0 (disabled)
+	Reap         time.Duration // default 0 (disabled)
+	Reorder      time.Duration // default 0 (disabled)
+	Backpressure time.Duration // default 0 (disabled)
+	Reject       time.Duration // default 0 (disabled)
+	Hysteresis   time.Duration // default 0 (no hysteresis on latency)
+}
+
 // Config defines the overload middleware configuration.
 type Config struct {
 	// CollectorProvider returns the [observe.Collector] from which
@@ -63,6 +99,20 @@ type Config struct {
 	// Thresholds sets the per-stage CPU fractions. Zero-valued fields
 	// fall back to the defaults documented on [Thresholds].
 	Thresholds Thresholds
+
+	// DepthThresholds sets the per-stage in-flight request count that
+	// escalates the driver. Optional; zero-valued fields are ignored.
+	// See [DepthThresholds] for guidance.
+	DepthThresholds DepthThresholds
+
+	// LatencyThresholds sets the per-stage EMA tail-latency target that
+	// escalates the driver. Optional; zero-valued fields are ignored.
+	LatencyThresholds LatencyThresholds
+
+	// LatencyEMAAlpha is the smoothing factor for the in-flight latency
+	// EMA. 0..1 range; higher weights recent samples more aggressively.
+	// Default: 0.1 (10% weight to current sample, 90% to history).
+	LatencyEMAAlpha float64
 
 	// PollInterval is how often the background goroutine samples CPU
 	// and updates the stage. Default: 1 second.
@@ -172,6 +222,9 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.ReapAggressiveness == 0 {
 		cfg.ReapAggressiveness = 1
+	}
+	if cfg.LatencyEMAAlpha <= 0 || cfg.LatencyEMAAlpha > 1 {
+		cfg.LatencyEMAAlpha = 0.1
 	}
 	return cfg
 }
