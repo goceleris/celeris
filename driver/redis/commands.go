@@ -1086,6 +1086,19 @@ func (c *Client) GetDel(ctx context.Context, key string) (string, error) {
 	return out, err
 }
 
+// GetDelBytes is the []byte-returning variant of [Client.GetDel], skipping
+// the string→[]byte conversion that [Client.GetDel] callers otherwise incur
+// when passing the result through [middleware/store.KV].GetAndDelete.
+func (c *Client) GetDelBytes(ctx context.Context, key string) ([]byte, error) {
+	var out []byte
+	err := c.do(ctx, func(v protocol.Value) error {
+		b, e := asBytes(v)
+		out = b
+		return e
+	}, "GETDEL", key)
+	return out, err
+}
+
 // SetEX sets key to value with the given TTL (second granularity). This is
 // the atomic equivalent of SET + EXPIRE.
 func (c *Client) SetEX(ctx context.Context, key string, value any, ttl time.Duration) error {

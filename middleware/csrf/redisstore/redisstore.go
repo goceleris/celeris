@@ -87,12 +87,12 @@ func (s *Store) GetAndDelete(ctx context.Context, key string) ([]byte, error) {
 		_, _ = s.client.Del(ctx, full)
 		return v, nil
 	}
-	v, err := s.client.GetDel(ctx, full)
+	v, err := s.client.GetDelBytes(ctx, full)
 	if errors.Is(err, redis.ErrNil) {
 		return nil, store.ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	return []byte(v), nil
+	return v, nil
 }
