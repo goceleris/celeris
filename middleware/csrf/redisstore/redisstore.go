@@ -62,7 +62,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Set implements [store.KV].
 func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return s.client.Set(ctx, s.prefix+key, value, ttl)
+	return s.client.SetBytes(ctx, s.prefix+key, value, ttl)
 }
 
 // Delete implements [store.KV].

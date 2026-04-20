@@ -58,7 +58,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 // Set implements [store.KV]. ttl <= 0 means "no expiry" from
 // memcached's perspective (0 is the magic "never expire" value).
 func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return s.client.Set(ctx, s.prefix+key, value, ttl)
+	return s.client.SetBytes(ctx, s.prefix+key, value, ttl)
 }
 
 // Delete implements [store.KV]. Memcached's DELETE returns

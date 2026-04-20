@@ -58,7 +58,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Set implements [store.KV].
 func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return s.client.Set(ctx, s.prefix+key, value, ttl)
+	return s.client.SetBytes(ctx, s.prefix+key, value, ttl)
 }
 
 // Delete implements [store.KV].
@@ -90,7 +90,7 @@ func (s *Store) GetAndDelete(ctx context.Context, key string) ([]byte, error) {
 	// CAS a single-byte sentinel with 1 second TTL — the CAS protects
 	// against a concurrent winner; the short TTL ensures the slot is
 	// eventually freed even if the follow-up Delete is never reached.
-	ok, err := s.client.CAS(ctx, full, []byte{0}, item.CAS, time.Second)
+	ok, err := s.client.CASBytes(ctx, full, []byte{0}, item.CAS, time.Second)
 	if err != nil {
 		return nil, err
 	}
