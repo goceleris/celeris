@@ -38,6 +38,7 @@ type Session struct {
 	data         map[string]any
 	store        store.KV
 	ctx          context.Context
+	releaseCtx   *celeris.Context // set by middleware entry so returnToPool is a closureless method value
 	expiry       time.Duration
 	idleOverride time.Duration // per-session idle timeout override; 0 = use config default
 	keyGen       func() string
@@ -46,6 +47,30 @@ type Session struct {
 	destroyed    bool
 	readOnly     bool // true when session was obtained via Handler.GetByID
 	pooledMap    bool // data slice was drawn from sessionDataPool and must be returned
+}
+
+// returnToPool is the cleanup hook registered with c.OnRelease on the
+// middleware entry. Converting the original closure to a method value
+// avoids capturing the celeris.Context in an anonymous function's
+// backing struct — the receiver (*Session) already carries everything
+// the cleanup needs (via s.releaseCtx). The method value allocation is
+// a single 2-word runtime.funcval; Go does not currently elide it
+// here, but it's smaller and more cache-friendly than the capture-
+// struct the closure generated.
+func (s *Session) returnToPool() {
+	if s.releaseCtx != nil {
+		s.releaseCtx.Set(ContextKey, nil) // issue #1: clear context key before pool Put
+	}
+	if s.data != nil && s.pooledMap {
+		clear(s.data)
+		m := s.data
+		sessionDataPool.Put(&m)
+	}
+	s.data = nil
+	s.pooledMap = false
+	s.ctx = nil
+	s.releaseCtx = nil
+	sessionPool.Put(s)
 }
 
 // Get returns the value for key from the session data.
@@ -380,19 +405,11 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 
 		// Register cleanup callback to return session to pool on all exit
 		// paths — including panics (issue #12: pool leak on error paths).
-		returnToPool := func() {
-			c.Set(ContextKey, nil) // issue #1: clear context key before pool Put
-			if sess.data != nil && sess.pooledMap {
-				clear(sess.data)
-				m := sess.data
-				sessionDataPool.Put(&m)
-			}
-			sess.data = nil
-			sess.pooledMap = false
-			sess.ctx = nil
-			sessionPool.Put(sess)
-		}
-		c.OnRelease(returnToPool)
+		// Uses a method value over *Session (sess.releaseCtx provides the
+		// context back-pointer) instead of an anonymous closure so the
+		// escape cost is one funcval, not a multi-capture struct.
+		sess.releaseCtx = c
+		c.OnRelease(sess.returnToPool)
 
 		loaded := false
 		sid := extract(c)
