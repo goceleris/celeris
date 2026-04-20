@@ -104,8 +104,11 @@ func startCelerisPGServer(b *testing.B, dsn string) string {
 	b.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	waitReady(b, addr)
 
-	// Now that the server is live, open the pool with WithEngine.
-	pool, err := celpostgres.Open(dsn)
+	// Now that the server is live, open the pool with WithEngine so the
+	// driver shares the HTTP engine's lifecycle (the pool's direct-mode
+	// fallback — see driver/postgres/pool.go — kicks in when the engine's
+	// WorkerLoop lacks sync support).
+	pool, err := celpostgres.Open(dsn, celpostgres.WithEngine(srv))
 	if err != nil {
 		b.Fatalf("celeris pg: %v", err)
 	}
