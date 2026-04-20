@@ -17,13 +17,42 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis"
 	"github.com/goceleris/celeris/driver/redis/protocol"
 	"github.com/goceleris/celeris/middleware/ratelimit"
 )
+
+// keyBufSlot carries a reusable []byte slab for prefix+key assembly
+// (same pattern as session/redisstore R55 and csrf/redisstore R56).
+// The slab holds an unsafe.String view that driver/redis.EvalSHA
+// consumes synchronously via copying into its RESP buffer.
+type keyBufSlot struct {
+	buf []byte
+}
+
+var keyBufPool = sync.Pool{
+	New: func() any { return &keyBufSlot{buf: make([]byte, 0, 64)} },
+}
+
+func acquireFullKey(prefix, key string) (string, *keyBufSlot) {
+	slot := keyBufPool.Get().(*keyBufSlot)
+	slot.buf = append(slot.buf[:0], prefix...)
+	slot.buf = append(slot.buf, key...)
+	return unsafe.String(unsafe.SliceData(slot.buf), len(slot.buf)), slot
+}
+
+func releaseFullKey(slot *keyBufSlot) {
+	if slot == nil {
+		return
+	}
+	slot.buf = slot.buf[:0]
+	keyBufPool.Put(slot)
+}
 
 //go:embed redisstore.lua
 var luaTokenBucket string
@@ -139,7 +168,8 @@ func (s *Store) Allow(key string) (bool, int, time.Time, error) {
 }
 
 func (s *Store) allow(ctx context.Context, key string) (bool, int, time.Time, error) {
-	fullKey := s.prefix + key
+	fullKey, slot := acquireFullKey(s.prefix, key)
+	defer releaseFullKey(slot)
 	now := time.Now().UnixNano()
 	// Static RPS/Burst/TTL args are pre-boxed in Store fields, so only
 	// the per-call `now` string is allocated + boxed here.
@@ -174,7 +204,8 @@ func (s *Store) allow(ctx context.Context, key string) (bool, int, time.Time, er
 // ultimately should not count (e.g. SkipFailedRequests semantics).
 func (s *Store) Undo(key string) error {
 	ctx := context.Background()
-	fullKey := s.prefix + key
+	fullKey, slot := acquireFullKey(s.prefix, key)
+	defer releaseFullKey(slot)
 	args := []any{s.argBurst, s.argTTLSec}
 	sha, _ := s.undoSHA.Load().(string)
 	_, err := s.client.EvalSHA(ctx, sha, []string{fullKey}, args...)
