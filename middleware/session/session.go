@@ -42,11 +42,15 @@ type Session struct {
 	expiry       time.Duration
 	idleOverride time.Duration // per-session idle timeout override; 0 = use config default
 	keyGen       func() string
-	modified     bool
-	fresh        bool // true for newly created sessions
-	destroyed    bool
-	readOnly     bool // true when session was obtained via Handler.GetByID
-	pooledMap    bool // data slice was drawn from sessionDataPool and must be returned
+	// onReleaseFn is a pre-bound method value pointing at returnToPool.
+	// Stored at pool.New time so the middleware hot path can register it
+	// with c.OnRelease without re-allocating a fresh funcval per request.
+	onReleaseFn func()
+	modified    bool
+	fresh       bool // true for newly created sessions
+	destroyed   bool
+	readOnly    bool // true when session was obtained via Handler.GetByID
+	pooledMap   bool // data slice was drawn from sessionDataPool and must be returned
 }
 
 // returnToPool is the cleanup hook registered with c.OnRelease on the
@@ -409,7 +413,14 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		// context back-pointer) instead of an anonymous closure so the
 		// escape cost is one funcval, not a multi-capture struct.
 		sess.releaseCtx = c
-		c.OnRelease(sess.returnToPool)
+		// Lazy-bind the method-value on first use of a pooled Session so
+		// subsequent requests reuse the stored funcval without
+		// re-materialising it. Go's init cycle detector prevents binding
+		// inside sessionPool.New since returnToPool references the pool.
+		if sess.onReleaseFn == nil {
+			sess.onReleaseFn = sess.returnToPool
+		}
+		c.OnRelease(sess.onReleaseFn)
 
 		loaded := false
 		sid := extract(c)
