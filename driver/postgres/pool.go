@@ -372,7 +372,7 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 		p.release(c)
 		return nil, err
 	}
-	return &Rows{inner: drows, conn: c, pool: p}, nil
+	return acquireRows(drows, c, p), nil
 }
 
 // ExecContext runs a statement and returns a [Result].
@@ -432,6 +432,26 @@ func anysToNamed(args []any) []driver.NamedValue {
 	return out
 }
 
+// rowsPool recycles *Rows wrappers so QueryContext avoids a heap alloc per
+// query on the hot path. On Close the struct is zeroed and returned to the
+// pool; callers who retain the pointer past Close see a cleared wrapper
+// (same behavior as any other post-Close access — an API contract
+// violation already).
+var rowsPool = sync.Pool{New: func() any { return &Rows{} }}
+
+func acquireRows(inner driver.Rows, conn *pgConn, pool *Pool) *Rows {
+	r := rowsPool.Get().(*Rows)
+	r.inner = inner
+	r.conn = conn
+	r.pool = pool
+	return r
+}
+
+func releaseRows(r *Rows) {
+	*r = Rows{}
+	rowsPool.Put(r)
+}
+
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
 // pool when Close is called. The iteration API matches database/sql.Rows:
 //
@@ -477,6 +497,7 @@ func (r *Rows) Close() error {
 	if r.pool != nil && r.conn != nil {
 		r.pool.release(r.conn)
 	}
+	releaseRows(r)
 	return err
 }
 
@@ -992,7 +1013,7 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows
 	if err != nil {
 		return nil, err
 	}
-	return &Rows{inner: drows, conn: nil, pool: nil}, nil
+	return acquireRows(drows, nil, nil), nil
 }
 
 // QueryRow executes a query expected to return at most one row on the
