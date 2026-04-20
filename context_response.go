@@ -337,44 +337,48 @@ func stripCookieUnsafe(s string) string {
 // Semicolons in Name, Value, Path, and Domain are stripped to prevent
 // cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
-	var b strings.Builder
-	b.Grow(128)
-	b.WriteString(stripCookieUnsafe(cookie.Name))
-	b.WriteByte('=')
-	b.WriteString(stripCookieUnsafe(cookie.Value))
+	// Typical Set-Cookie values are <200B (session/csrf tokens with path,
+	// max-age, flags). The 256-byte stack buffer holds the common case
+	// without heap; oversize cookies grow via append into heap.
+	var buf [256]byte
+	dst := buf[:0]
+	dst = append(dst, stripCookieUnsafe(cookie.Name)...)
+	dst = append(dst, '=')
+	dst = append(dst, stripCookieUnsafe(cookie.Value)...)
 	if cookie.Path != "" {
-		b.WriteString("; Path=")
-		b.WriteString(stripCookieUnsafe(cookie.Path))
+		dst = append(dst, "; Path="...)
+		dst = append(dst, stripCookieUnsafe(cookie.Path)...)
 	}
 	if cookie.Domain != "" {
-		b.WriteString("; Domain=")
-		b.WriteString(stripCookieUnsafe(cookie.Domain))
+		dst = append(dst, "; Domain="...)
+		dst = append(dst, stripCookieUnsafe(cookie.Domain)...)
 	}
 	if !cookie.Expires.IsZero() {
-		b.WriteString("; Expires=")
-		b.WriteString(cookie.Expires.UTC().Format(http.TimeFormat))
+		dst = append(dst, "; Expires="...)
+		dst = cookie.Expires.UTC().AppendFormat(dst, http.TimeFormat)
 	}
 	if cookie.MaxAge > 0 {
-		b.WriteString("; Max-Age=")
-		b.WriteString(strconv.Itoa(cookie.MaxAge))
+		dst = append(dst, "; Max-Age="...)
+		// AppendInt avoids strconv.Itoa's intermediate string alloc.
+		dst = strconv.AppendInt(dst, int64(cookie.MaxAge), 10)
 	} else if cookie.MaxAge < 0 {
-		b.WriteString("; Max-Age=0")
+		dst = append(dst, "; Max-Age=0"...)
 	}
 	if cookie.HTTPOnly {
-		b.WriteString("; HttpOnly")
+		dst = append(dst, "; HttpOnly"...)
 	}
 	if cookie.Secure {
-		b.WriteString("; Secure")
+		dst = append(dst, "; Secure"...)
 	}
 	switch cookie.SameSite {
 	case SameSiteLaxMode:
-		b.WriteString("; SameSite=Lax")
+		dst = append(dst, "; SameSite=Lax"...)
 	case SameSiteStrictMode:
-		b.WriteString("; SameSite=Strict")
+		dst = append(dst, "; SameSite=Strict"...)
 	case SameSiteNoneMode:
-		b.WriteString("; SameSite=None")
+		dst = append(dst, "; SameSite=None"...)
 	}
-	c.AddHeader("set-cookie", b.String())
+	c.AddHeader("set-cookie", string(dst))
 }
 
 // File serves the named file. The content type is detected from the file
