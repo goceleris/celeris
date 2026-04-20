@@ -18,7 +18,13 @@ type AcceptItem struct {
 // "not acceptable" per RFC 9110 §12.5.1 and exclude matching offers even
 // from wildcard entries.
 func Accept(header string, offers []string) string {
-	entries := Parse(header)
+	// Stack-backed entry buffer. Real Accept-Encoding / Accept-Language
+	// headers almost always hold ≤8 items; anything larger falls back to
+	// heap-allocated growth. Saves one alloc on the hot path of every
+	// request that passes through a compression or language-negotiation
+	// middleware.
+	var entryBuf [8]AcceptItem
+	entries := ParseInto(entryBuf[:0], header)
 
 	// Build exclusion set: types with q=0 are explicitly rejected (RFC 9110).
 	// These override wildcard matches — e.g., "*, br;q=0" excludes br.
@@ -71,7 +77,16 @@ func isExcluded(offer string, excluded []string) bool {
 // Parse parses an Accept header value into a slice of AcceptItems.
 // MediaType values are lowercased for case-insensitive matching.
 func Parse(header string) []AcceptItem {
-	var entries []AcceptItem
+	return ParseInto(nil, header)
+}
+
+// ParseInto is the alloc-friendly variant of [Parse]. Callers can pass
+// a pre-sized slice (e.g. a stack-backed `make([]AcceptItem, 0, 8)[:0]`
+// or the zero value of an array via `buf[:0]`) to avoid the fresh
+// allocation when the expected number of entries is small. If the
+// header yields more entries than dst's capacity, it grows naturally.
+func ParseInto(dst []AcceptItem, header string) []AcceptItem {
+	entries := dst
 	for len(header) > 0 {
 		var part string
 		if i := strings.IndexByte(header, ','); i >= 0 {
