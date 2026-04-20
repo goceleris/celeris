@@ -351,7 +351,14 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 func serveFSCached(c *celeris.Context, data []byte, contentType string) error {
 	if rng := c.Header("range"); rng != "" {
 		if start, end, ok := parseByteRange(rng, int64(len(data))); ok {
-			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, int64(len(data))))
+			var rngBuf [48]byte
+			dst := append(rngBuf[:0], "bytes "...)
+			dst = strconv.AppendInt(dst, start, 10)
+			dst = append(dst, '-')
+			dst = strconv.AppendInt(dst, end, 10)
+			dst = append(dst, '/')
+			dst = strconv.AppendInt(dst, int64(len(data)), 10)
+			c.SetHeader("content-range", string(dst))
 			return c.Blob(206, contentType, data[start:end+1])
 		}
 	}
@@ -404,10 +411,19 @@ func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, maxAge t
 		return ""
 	}
 	c.SetHeader("last-modified", modTime.UTC().Format(http.TimeFormat))
-	etag := fmt.Sprintf(`W/"%x-%x"`, modTime.Unix(), size)
+	// ETag is built without fmt to avoid per-request fmt.Sprintf overhead
+	// (formatter-scanner + arg boxing). int64 hex is ≤16 chars per field,
+	// plus W/"…-…" framing = 37 max; 64 is a safe margin.
+	var etagBuf [64]byte
+	dst := append(etagBuf[:0], 'W', '/', '"')
+	dst = strconv.AppendInt(dst, modTime.Unix(), 16)
+	dst = append(dst, '-')
+	dst = strconv.AppendInt(dst, size, 16)
+	dst = append(dst, '"')
+	etag := string(dst)
 	c.SetHeader("etag", etag)
 	if maxAge > 0 {
-		c.SetHeader("cache-control", fmt.Sprintf("public, max-age=%d", int(maxAge.Seconds())))
+		c.SetHeader("cache-control", "public, max-age="+strconv.Itoa(int(maxAge.Seconds())))
 	}
 	return etag
 }
