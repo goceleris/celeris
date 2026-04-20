@@ -196,23 +196,10 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 }
 
-// lockNonce returns a 16-byte nonce combining the process counter
-// with the current nanosecond. Not cryptographically secure — nonces
-// exist only to make lock entries human-distinguishable in debug logs.
-func lockNonce() []byte {
-	n := lockNonceCounter.Add(1)
-	out := make([]byte, 16)
-	nano := uint64(time.Now().UnixNano())
-	for i := 0; i < 8; i++ {
-		out[i] = byte(n >> (i * 8))
-		out[8+i] = byte(nano >> (i * 8))
-	}
-	return out
-}
-
 // makeLockPayload returns [entryLocked | 16-byte nonce] in one 17-byte
-// allocation, avoiding the lockNonce + append double-alloc on the
-// idempotency hot path.
+// allocation. The 16-byte nonce combines the process counter with the
+// current nanosecond — not cryptographically secure; exists only to
+// make lock entries human-distinguishable in debug logs.
 func makeLockPayload() []byte {
 	n := lockNonceCounter.Add(1)
 	out := make([]byte, 17)
