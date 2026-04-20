@@ -2134,10 +2134,11 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	values, formats, err := encodeArgs(args)
+	values, formats, encSlot, err := encodeArgs(args)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseEncodedArgs(encSlot)
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqExtended
@@ -2276,10 +2277,11 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	values, formats, err := encodeArgs(args)
+	values, formats, encSlot, err := encodeArgs(args)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseEncodedArgs(encSlot)
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqExtended
@@ -2360,21 +2362,65 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 }
 
 // encodeArgs converts a NamedValue list into Bind-ready ([][]byte, []int16).
-func encodeArgs(args []driver.NamedValue) ([][]byte, []int16, error) {
-	if len(args) == 0 {
-		return nil, nil, nil
+// encodedArgsSlot holds the paired []byte+int16 slices that encodeArgs
+// returns to protocol.AppendBind. Both are sized to the same length, so
+// a single pooled struct amortises two allocations per query.
+type encodedArgsSlot struct {
+	values  [][]byte
+	formats []int16
+}
+
+var encodedArgsPool = sync.Pool{
+	New: func() any {
+		return &encodedArgsSlot{
+			values:  make([][]byte, 0, 8),
+			formats: make([]int16, 0, 8),
+		}
+	},
+}
+
+// releaseEncodedArgs returns slot to the pool. Callers MUST invoke this
+// once protocol.AppendBind has consumed values+formats (synchronously,
+// inside the write path).
+func releaseEncodedArgs(slot *encodedArgsSlot) {
+	if slot == nil {
+		return
 	}
-	values := make([][]byte, len(args))
-	formats := make([]int16, len(args))
+	// Zero []byte references so encoded payloads aren't pinned in the
+	// pool.
+	for i := range slot.values {
+		slot.values[i] = nil
+	}
+	slot.values = slot.values[:0]
+	slot.formats = slot.formats[:0]
+	encodedArgsPool.Put(slot)
+}
+
+func encodeArgs(args []driver.NamedValue) ([][]byte, []int16, *encodedArgsSlot, error) {
+	if len(args) == 0 {
+		return nil, nil, nil, nil
+	}
+	slot := encodedArgsPool.Get().(*encodedArgsSlot)
+	if cap(slot.values) < len(args) {
+		slot.values = make([][]byte, len(args))
+	} else {
+		slot.values = slot.values[:len(args)]
+	}
+	if cap(slot.formats) < len(args) {
+		slot.formats = make([]int16, len(args))
+	} else {
+		slot.formats = slot.formats[:len(args)]
+	}
 	for i, a := range args {
 		b, fmtCode, err := encodeOne(a.Value)
 		if err != nil {
-			return nil, nil, fmt.Errorf("celeris-postgres: encode arg %d: %w", i+1, err)
+			releaseEncodedArgs(slot)
+			return nil, nil, nil, fmt.Errorf("celeris-postgres: encode arg %d: %w", i+1, err)
 		}
-		values[i] = b
-		formats[i] = fmtCode
+		slot.values[i] = b
+		slot.formats[i] = fmtCode
 	}
-	return values, formats, nil
+	return slot.values, slot.formats, slot, nil
 }
 
 // encodeOne picks a binary encoding for common Go types and falls back to
