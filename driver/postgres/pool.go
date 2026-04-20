@@ -366,8 +366,9 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	if err != nil {
 		return nil, err
 	}
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	drows, err := c.QueryContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		p.release(c)
 		return nil, err
@@ -382,8 +383,9 @@ func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (Resu
 		return Result{}, err
 	}
 	defer p.release(c)
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	r, err := c.ExecContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		return Result{}, err
 	}
@@ -420,16 +422,52 @@ func (p *Pool) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	return &Tx{inner: tx.(*pgTx), conn: c, pool: p}, nil
 }
 
+// namedArgsSlot holds a reusable []driver.NamedValue slab pooled via
+// namedArgsPool. The slab header lives on the heap exactly once (when
+// the pool's New runs); subsequent Get/Put round-trips reuse the same
+// *namedArgsSlot pointer so there is no per-call slice-header alloc.
+type namedArgsSlot struct {
+	buf []driver.NamedValue
+}
+
+var namedArgsPool = sync.Pool{
+	New: func() any {
+		return &namedArgsSlot{buf: make([]driver.NamedValue, 0, 8)}
+	},
+}
+
 // anysToNamed converts a variadic ...any arg list into driver.NamedValues.
-func anysToNamed(args []any) []driver.NamedValue {
+// On success it returns the slot for releaseNamedArgs to return to the
+// pool; for len(args)==0 it returns (nil, nil) so callers can skip the
+// release call entirely.
+func anysToNamed(args []any) ([]driver.NamedValue, *namedArgsSlot) {
 	if len(args) == 0 {
-		return nil
+		return nil, nil
 	}
-	out := make([]driver.NamedValue, len(args))
+	slot := namedArgsPool.Get().(*namedArgsSlot)
+	if cap(slot.buf) < len(args) {
+		slot.buf = make([]driver.NamedValue, len(args))
+	} else {
+		slot.buf = slot.buf[:len(args)]
+	}
 	for i, a := range args {
-		out[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
+		slot.buf[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
 	}
-	return out
+	return slot.buf, slot
+}
+
+// releaseNamedArgs returns the slot to the pool after zeroing the
+// backing slots so captured Values are not pinned. A nil slot is a no-op
+// (matches the zero-arg fast path).
+func releaseNamedArgs(slot *namedArgsSlot) {
+	if slot == nil {
+		return
+	}
+	for i := range slot.buf {
+		slot.buf[i] = driver.NamedValue{}
+	}
+	slot.buf = slot.buf[:0]
+	namedArgsPool.Put(slot)
 }
 
 // rowsPool recycles *Rows wrappers so QueryContext avoids a heap alloc per
@@ -993,8 +1031,9 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 	if t.done {
 		return Result{}, errors.New("celeris-postgres: tx already finished")
 	}
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		return Result{}, err
 	}
@@ -1008,8 +1047,9 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows
 	if t.done {
 		return nil, errors.New("celeris-postgres: tx already finished")
 	}
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		return nil, err
 	}
