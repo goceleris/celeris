@@ -212,6 +212,28 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	// netpoll — no LockOSThread involvement, so we skip the mini-loop
 	// entirely and keep the dispatch model symmetric with memcached.
 	directMode := !p.hasEngine || p.asyncEngine
+
+	// Additional case: WithEngine on an engine whose WorkerLoop does NOT
+	// implement syncRoundTripper (io_uring, epoll today). Without a sync
+	// path the driver's async write + channel-wait deadlocks on inline
+	// handlers: the engine worker is the goroutine executing the handler
+	// (LockOSThread'd), so when wait() parks on doneCh the M sits idle
+	// and never drains the CQE carrying PG's reply. Netpoll is M-safe,
+	// so direct mode sidesteps the deadlock with no correctness impact.
+	if !directMode {
+		p.providerMu.RLock()
+		prov := p.provider
+		p.providerMu.RUnlock()
+		if prov == nil {
+			return nil, ErrPoolClosed
+		}
+		if wl := prov.WorkerLoop(0); wl != nil {
+			if _, ok := wl.(syncRoundTripper); !ok {
+				directMode = true
+			}
+		}
+	}
+
 	if directMode {
 		c, err := dialDirectConn(ctx, p.dsn)
 		if err != nil {
