@@ -66,6 +66,13 @@ type Store struct {
 	burst  int
 	ttlSec int64
 
+	// Pre-boxed static EVALSHA args — RPS/Burst/TTL are immutable after
+	// construction, so their string + interface boxing happens once here
+	// rather than on every Allow/Undo call.
+	argRPS    any
+	argBurst  any
+	argTTLSec any
+
 	allowSHA atomic.Value // string
 	undoSHA  atomic.Value // string
 }
@@ -93,12 +100,16 @@ func New(ctx context.Context, client *redis.Client, opts Options) (*Store, error
 			opts.TTL = time.Minute
 		}
 	}
+	ttlSec := int64(opts.TTL.Seconds())
 	s := &Store{
-		client: client,
-		prefix: opts.KeyPrefix,
-		rps:    opts.RPS,
-		burst:  opts.Burst,
-		ttlSec: int64(opts.TTL.Seconds()),
+		client:    client,
+		prefix:    opts.KeyPrefix,
+		rps:       opts.RPS,
+		burst:     opts.Burst,
+		ttlSec:    ttlSec,
+		argRPS:    strconv.FormatFloat(opts.RPS, 'g', -1, 64),
+		argBurst:  strconv.Itoa(opts.Burst),
+		argTTLSec: strconv.FormatInt(ttlSec, 10),
 	}
 	if err := s.loadScripts(ctx); err != nil {
 		return nil, err
@@ -130,13 +141,13 @@ func (s *Store) Allow(key string) (bool, int, time.Time, error) {
 func (s *Store) allow(ctx context.Context, key string) (bool, int, time.Time, error) {
 	fullKey := s.prefix + key
 	now := time.Now().UnixNano()
-	// strconv.* is 2-3x faster than fmt.Sprintf and allocates exactly
-	// the returned string (no intermediate args slice copy in fmt).
+	// Static RPS/Burst/TTL args are pre-boxed in Store fields, so only
+	// the per-call `now` string is allocated + boxed here.
 	args := []any{
 		strconv.FormatInt(now, 10),
-		strconv.FormatFloat(s.rps, 'g', -1, 64),
-		strconv.Itoa(s.burst),
-		strconv.FormatInt(s.ttlSec, 10),
+		s.argRPS,
+		s.argBurst,
+		s.argTTLSec,
 	}
 
 	sha, _ := s.allowSHA.Load().(string)
@@ -164,10 +175,7 @@ func (s *Store) allow(ctx context.Context, key string) (bool, int, time.Time, er
 func (s *Store) Undo(key string) error {
 	ctx := context.Background()
 	fullKey := s.prefix + key
-	args := []any{
-		strconv.Itoa(s.burst),
-		strconv.FormatInt(s.ttlSec, 10),
-	}
+	args := []any{s.argBurst, s.argTTLSec}
 	sha, _ := s.undoSHA.Load().(string)
 	_, err := s.client.EvalSHA(ctx, sha, []string{fullKey}, args...)
 	if err != nil && isNoScript(err) {
