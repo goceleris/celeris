@@ -2,6 +2,7 @@ package healthcheck
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -14,6 +15,10 @@ var (
 )
 
 const jsonContentType = "application/json"
+
+// doneChanPool reuses the result channel allocated on the goroutine
+// check path — mirrors middleware/timeout's chanPool pattern.
+var doneChanPool = sync.Pool{New: func() any { return make(chan bool, 1) }}
 
 // New creates a healthcheck middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
@@ -79,7 +84,12 @@ func runChecker(checker Checker, c *celeris.Context, timeout time.Duration) bool
 	ctx, cancel := context.WithTimeout(origCtx, timeout)
 	c.SetContext(ctx)
 
-	done := make(chan bool, 1)
+	done := doneChanPool.Get().(chan bool)
+	// Drain any stale value left from a prior pool cycle.
+	select {
+	case <-done:
+	default:
+	}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -100,6 +110,7 @@ func runChecker(checker Checker, c *celeris.Context, timeout time.Duration) bool
 		<-done
 		cancel = func() {} // prevent double-cancel in defer
 	}
+	doneChanPool.Put(done)
 
 	cancel()
 	c.SetContext(origCtx)
