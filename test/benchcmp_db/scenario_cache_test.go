@@ -47,7 +47,7 @@ type cachedUser struct {
 func startCelerisCacheServer(b *testing.B, redisAddr string) string {
 	b.Helper()
 	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger})
+	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger, AsyncHandlers: true})
 
 	var cliPtr atomic.Pointer[celredis.Client]
 	srv.GET("/health", func(c *celeris.Context) error { return c.String(200, "ok") })

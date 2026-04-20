@@ -70,7 +70,7 @@ func skipIfNoPG(b *testing.B) string {
 func startCelerisPGServer(b *testing.B, dsn string) string {
 	b.Helper()
 	addr := freePort(b)
-	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger})
+	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger, AsyncHandlers: true})
 
 	// Pool is opened AFTER the server starts so WithEngine resolves
 	// to the live engine's event loop — if we opened before Start,
