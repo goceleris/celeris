@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,6 +14,17 @@ import (
 
 	"github.com/goceleris/celeris"
 )
+
+// labelValuesPool recycles the label-value slice that every recorded
+// request builds for WithLabelValues. Prometheus consumes the values
+// synchronously (lookup + Observe/Inc return before the slice is
+// reused) so a pool is safe. Capacity 8 covers 3 base labels + up to
+// 5 custom ones without re-grow; larger custom sets fall back to a
+// fresh allocation (rare).
+var labelValuesPool = sync.Pool{New: func() any {
+	s := make([]string, 0, 8)
+	return &s
+}}
 
 // New creates a Prometheus metrics middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
@@ -176,10 +188,12 @@ func New(config ...Config) celeris.HandlerFunc {
 		path = strings.ToValidUTF8(path, "")
 
 		// Build label values: method, path, status + custom labels.
-		lv := make([]string, 3, 3+nCustom)
-		lv[0] = c.Method()
-		lv[1] = path
-		lv[2] = statusStr
+		// Pool-backed slice: Prometheus consumes synchronously (no
+		// retention past WithLabelValues), so we can return the
+		// backing array to the pool.
+		lvPtr := labelValuesPool.Get().(*[]string)
+		lv := (*lvPtr)[:0]
+		lv = append(lv, c.Method(), path, statusStr)
 		for i := range nCustom {
 			lv = append(lv, customLabelFuncs[i](c))
 		}
@@ -193,6 +207,16 @@ func New(config ...Config) celeris.HandlerFunc {
 		if bw := c.BytesWritten(); bw > 0 {
 			responseSize.WithLabelValues(lv...).Observe(float64(bw))
 		}
+
+		// Cap retained capacity so a pathological custom-label
+		// consumer doesn't hold a huge backing array in the pool.
+		if cap(lv) > 32 {
+			fresh := make([]string, 0, 8)
+			*lvPtr = fresh
+		} else {
+			*lvPtr = lv
+		}
+		labelValuesPool.Put(lvPtr)
 
 		return err
 	}
