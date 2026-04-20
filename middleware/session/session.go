@@ -469,7 +469,11 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 		if !loaded {
 			sess.id = keyGen()
 			sess.fresh = true
-			sess.data = make(map[string]any)
+			// Reuse pooled maps on the fresh-session path too so both
+			// cold-start and warm sessions share alloc amortisation.
+			mp := sessionDataPool.Get().(*map[string]any)
+			sess.data = *mp
+			sess.pooledMap = true
 			if !absDisabled {
 				sess.data[absExpKey] = time.Now().UnixNano()
 			}
