@@ -2246,10 +2246,12 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
 		buf := c.writer.Bytes()
-		payload := make([]byte, len(buf))
-		copy(payload, buf)
+		pslot := acquirePayloadBuf(len(buf))
+		pslot.buf = append(pslot.buf, buf...)
 		c.writerMu.Unlock()
-		if err := c.writeRaw(payload); err != nil {
+		err := c.writeRaw(pslot.buf)
+		releasePayloadBuf(pslot)
+		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
 			return nil, err
@@ -2340,10 +2342,12 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
 		buf := c.writer.Bytes()
-		payload := make([]byte, len(buf))
-		copy(payload, buf)
+		pslot := acquirePayloadBuf(len(buf))
+		pslot.buf = append(pslot.buf, buf...)
 		c.writerMu.Unlock()
-		if err := c.writeRaw(payload); err != nil {
+		err := c.writeRaw(pslot.buf)
+		releasePayloadBuf(pslot)
+		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
 			return nil, err
@@ -2394,6 +2398,37 @@ func releaseEncodedArgs(slot *encodedArgsSlot) {
 	slot.values = slot.values[:0]
 	slot.formats = slot.formats[:0]
 	encodedArgsPool.Put(slot)
+}
+
+// payloadBufSlot recycles the []byte snapshot of c.writer.Bytes() taken
+// on the direct-mode write path. The slab header lives on the heap once
+// (in the pool's New); subsequent Get/Put round-trips reuse the same
+// *payloadBufSlot pointer so there is no per-call slice-header alloc.
+type payloadBufSlot struct {
+	buf []byte
+}
+
+var payloadBufPool = sync.Pool{
+	New: func() any {
+		return &payloadBufSlot{buf: make([]byte, 0, 256)}
+	},
+}
+
+func acquirePayloadBuf(size int) *payloadBufSlot {
+	slot := payloadBufPool.Get().(*payloadBufSlot)
+	slot.buf = slot.buf[:0]
+	if cap(slot.buf) < size {
+		slot.buf = make([]byte, 0, size)
+	}
+	return slot
+}
+
+func releasePayloadBuf(slot *payloadBufSlot) {
+	if slot == nil {
+		return
+	}
+	slot.buf = slot.buf[:0]
+	payloadBufPool.Put(slot)
 }
 
 func encodeArgs(args []driver.NamedValue) ([][]byte, []int16, *encodedArgsSlot, error) {
