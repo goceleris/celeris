@@ -546,6 +546,20 @@ func (c *ClusterClient) Set(ctx context.Context, key string, value any, ttl time
 	return err
 }
 
+// SetBytes is the allocation-lean variant of [ClusterClient.Set].
+func (c *ClusterClient) SetBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return ErrNoNodes
+	}
+	err := n.client.SetBytes(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
+}
+
 // Add forwards to the ring owner of key.
 func (c *ClusterClient) Add(ctx context.Context, key string, value any, ttl time.Duration) error {
 	if c.isClosed() {
@@ -560,6 +574,20 @@ func (c *ClusterClient) Add(ctx context.Context, key string, value any, ttl time
 	return err
 }
 
+// AddBytes is the allocation-lean variant of [ClusterClient.Add].
+func (c *ClusterClient) AddBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return ErrNoNodes
+	}
+	err := n.client.AddBytes(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
+}
+
 // Replace forwards to the ring owner of key.
 func (c *ClusterClient) Replace(ctx context.Context, key string, value any, ttl time.Duration) error {
 	if c.isClosed() {
@@ -570,6 +598,20 @@ func (c *ClusterClient) Replace(ctx context.Context, key string, value any, ttl 
 		return ErrNoNodes
 	}
 	err := n.client.Replace(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
+}
+
+// ReplaceBytes is the allocation-lean variant of [ClusterClient.Replace].
+func (c *ClusterClient) ReplaceBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return ErrNoNodes
+	}
+	err := n.client.ReplaceBytes(ctx, key, value, ttl)
 	n.recordResult(err, c.failureThreshold)
 	return err
 }
@@ -612,6 +654,20 @@ func (c *ClusterClient) CAS(ctx context.Context, key string, value any, casID ui
 		return false, ErrNoNodes
 	}
 	ok, err := n.client.CAS(ctx, key, value, casID, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return ok, err
+}
+
+// CASBytes is the allocation-lean variant of [ClusterClient.CAS].
+func (c *ClusterClient) CASBytes(ctx context.Context, key string, value []byte, casID uint64, ttl time.Duration) (bool, error) {
+	if c.isClosed() {
+		return false, ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return false, ErrNoNodes
+	}
+	ok, err := n.client.CASBytes(ctx, key, value, casID, ttl)
 	n.recordResult(err, c.failureThreshold)
 	return ok, err
 }
