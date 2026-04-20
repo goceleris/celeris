@@ -11,11 +11,45 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis"
 	"github.com/goceleris/celeris/middleware/store"
 )
+
+// keyBufSlot carries a reusable []byte slab for `prefix+key` assembly so
+// the per-call s.prefix+key string concat can be avoided. A slot's buf
+// is owned by the *keyBufSlot pointer; Get/Put round-trips the same
+// pointer so no slice-header alloc happens per release. The full key is
+// handed to the Redis client as an unsafe.String view — safe because
+// driver/redis writes the string bytes to its RESP buffer synchronously
+// and does not retain them past the call.
+type keyBufSlot struct {
+	buf []byte
+}
+
+var keyBufPool = sync.Pool{
+	New: func() any { return &keyBufSlot{buf: make([]byte, 0, 64)} },
+}
+
+// acquireFullKey assembles prefix+key into a pooled slab and returns
+// both the view-into-slab string and the slot pointer for release.
+func acquireFullKey(prefix, key string) (string, *keyBufSlot) {
+	slot := keyBufPool.Get().(*keyBufSlot)
+	slot.buf = append(slot.buf[:0], prefix...)
+	slot.buf = append(slot.buf, key...)
+	return unsafe.String(unsafe.SliceData(slot.buf), len(slot.buf)), slot
+}
+
+func releaseFullKey(slot *keyBufSlot) {
+	if slot == nil {
+		return
+	}
+	slot.buf = slot.buf[:0]
+	keyBufPool.Put(slot)
+}
 
 // Options configure the Redis-backed session store.
 type Options struct {
@@ -55,7 +89,9 @@ func New(client *redis.Client, opts ...Options) *Store {
 
 // Get implements [store.KV].
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	v, err := s.client.GetBytes(ctx, s.prefix+key)
+	full, slot := acquireFullKey(s.prefix, key)
+	v, err := s.client.GetBytes(ctx, full)
+	releaseFullKey(slot)
 	if errors.Is(err, redis.ErrNil) {
 		return nil, store.ErrNotFound
 	}
@@ -67,12 +103,17 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Set implements [store.KV].
 func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return s.client.SetBytes(ctx, s.prefix+key, value, ttl)
+	full, slot := acquireFullKey(s.prefix, key)
+	err := s.client.SetBytes(ctx, full, value, ttl)
+	releaseFullKey(slot)
+	return err
 }
 
 // Delete implements [store.KV].
 func (s *Store) Delete(ctx context.Context, key string) error {
-	_, err := s.client.Del(ctx, s.prefix+key)
+	full, slot := acquireFullKey(s.prefix, key)
+	_, err := s.client.Del(ctx, full)
+	releaseFullKey(slot)
 	return err
 }
 
