@@ -44,7 +44,7 @@ type cachedUser struct {
 	Plan string `json:"plan"`
 }
 
-func startCelerisCacheServer(b *testing.B, redisAddr string) string {
+func startCelerisCacheServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	addr := freePort(b)
 	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger, AsyncHandlers: true})
@@ -91,7 +91,7 @@ func startCelerisCacheServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startFiberCacheServer(b *testing.B, redisAddr string) string {
+func startFiberCacheServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })
@@ -115,7 +115,7 @@ func startFiberCacheServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startEchoCacheServer(b *testing.B, redisAddr string) string {
+func startEchoCacheServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })
@@ -141,7 +141,7 @@ func startEchoCacheServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startChiCacheServer(b *testing.B, redisAddr string) string {
+func startChiCacheServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })
@@ -173,7 +173,7 @@ func startChiCacheServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startStdlibCacheServer(b *testing.B, redisAddr string) string {
+func startStdlibCacheServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })

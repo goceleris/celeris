@@ -53,7 +53,7 @@ func primeSession(addr string) error {
 	return nil
 }
 
-func startCelerisSessionServer(b *testing.B, redisAddr string) string {
+func startCelerisSessionServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	addr := freePort(b)
 	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger, AsyncHandlers: true})
@@ -118,7 +118,7 @@ func startCelerisSessionServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startFiberSessionServer(b *testing.B, redisAddr string) string {
+func startFiberSessionServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })
@@ -145,7 +145,7 @@ func startFiberSessionServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startEchoSessionServer(b *testing.B, redisAddr string) string {
+func startEchoSessionServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })
@@ -174,7 +174,7 @@ func startEchoSessionServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startChiSessionServer(b *testing.B, redisAddr string) string {
+func startChiSessionServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })
@@ -209,7 +209,7 @@ func startChiSessionServer(b *testing.B, redisAddr string) string {
 	return addr
 }
 
-func startStdlibSessionServer(b *testing.B, redisAddr string) string {
+func startStdlibSessionServer(b testing.TB, redisAddr string) string {
 	b.Helper()
 	cli := goredis.NewClient(&goredis.Options{Addr: redisAddr})
 	b.Cleanup(func() { _ = cli.Close() })

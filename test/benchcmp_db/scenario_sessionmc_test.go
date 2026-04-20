@@ -47,7 +47,7 @@ func primeSessionMC(addr string) error {
 	})
 }
 
-func startCelerisSessionMCServer(b *testing.B, mcAddr string) string {
+func startCelerisSessionMCServer(b testing.TB, mcAddr string) string {
 	b.Helper()
 	addr := freePort(b)
 	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger, AsyncHandlers: true})
@@ -83,7 +83,7 @@ func startCelerisSessionMCServer(b *testing.B, mcAddr string) string {
 	return addr
 }
 
-func startFiberSessionMCServer(b *testing.B, mcAddr string) string {
+func startFiberSessionMCServer(b testing.TB, mcAddr string) string {
 	b.Helper()
 	cli := memcache.New(mcAddr)
 	cli.Timeout = 2 * time.Second
@@ -110,7 +110,7 @@ func startFiberSessionMCServer(b *testing.B, mcAddr string) string {
 	return addr
 }
 
-func startEchoSessionMCServer(b *testing.B, mcAddr string) string {
+func startEchoSessionMCServer(b testing.TB, mcAddr string) string {
 	b.Helper()
 	cli := memcache.New(mcAddr)
 	cli.Timeout = 2 * time.Second
@@ -138,7 +138,7 @@ func startEchoSessionMCServer(b *testing.B, mcAddr string) string {
 	return addr
 }
 
-func startChiSessionMCServer(b *testing.B, mcAddr string) string {
+func startChiSessionMCServer(b testing.TB, mcAddr string) string {
 	b.Helper()
 	cli := memcache.New(mcAddr)
 	cli.Timeout = 2 * time.Second
@@ -172,7 +172,7 @@ func startChiSessionMCServer(b *testing.B, mcAddr string) string {
 	return addr
 }
 
-func startStdlibSessionMCServer(b *testing.B, mcAddr string) string {
+func startStdlibSessionMCServer(b testing.TB, mcAddr string) string {
 	b.Helper()
 	cli := memcache.New(mcAddr)
 	cli.Timeout = 2 * time.Second

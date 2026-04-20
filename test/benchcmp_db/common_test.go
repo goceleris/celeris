@@ -79,7 +79,7 @@ func tcpReachable(addr string) bool {
 
 // skipIfNoRedis calls b.Skip when Redis is unreachable at the
 // configured address.
-func skipIfNoRedis(b *testing.B) string {
+func skipIfNoRedis(b testing.TB) string {
 	b.Helper()
 	addr := liveRedisAddr()
 	if !tcpReachable(addr) {
@@ -91,7 +91,7 @@ func skipIfNoRedis(b *testing.B) string {
 // freePort asks the kernel for an available loopback port, returns
 // it, and frees the listener — the caller binds the same port via
 // the framework server immediately after.
-func freePort(b *testing.B) string {
+func freePort(b testing.TB) string {
 	b.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -130,7 +130,7 @@ func httpClient(addr string) *http.Client {
 
 // waitReady retries GET / until it returns a non-error response or
 // the deadline elapses.
-func waitReady(b *testing.B, addr string) {
+func waitReady(b testing.TB, addr string) {
 	b.Helper()
 	client := httpClient("ready-" + addr)
 	deadline := time.Now().Add(10 * time.Second)

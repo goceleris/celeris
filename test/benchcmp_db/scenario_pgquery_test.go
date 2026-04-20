@@ -56,7 +56,7 @@ func primePGSchema(dsn string) error {
 	return nil
 }
 
-func skipIfNoPG(b *testing.B) string {
+func skipIfNoPG(b testing.TB) string {
 	b.Helper()
 	dsn := livePGDSN()
 	if err := primePGSchema(dsn); err != nil {
@@ -67,7 +67,7 @@ func skipIfNoPG(b *testing.B) string {
 
 // --- celeris (native driver/postgres) ---
 
-func startCelerisPGServer(b *testing.B, dsn string) string {
+func startCelerisPGServer(b testing.TB, dsn string) string {
 	b.Helper()
 	addr := freePort(b)
 	srv := celeris.New(celeris.Config{Addr: addr, Logger: quietLogger, AsyncHandlers: true})
@@ -141,7 +141,7 @@ func startCelerisPGServer(b *testing.B, dsn string) string {
 	return addr
 }
 
-func newPgxPool(b *testing.B, dsn string) *pgxpool.Pool {
+func newPgxPool(b testing.TB, dsn string) *pgxpool.Pool {
 	b.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -153,7 +153,7 @@ func newPgxPool(b *testing.B, dsn string) *pgxpool.Pool {
 	return p
 }
 
-func startFiberPGServer(b *testing.B, dsn string) string {
+func startFiberPGServer(b testing.TB, dsn string) string {
 	b.Helper()
 	pool := newPgxPool(b, dsn)
 
@@ -176,7 +176,7 @@ func startFiberPGServer(b *testing.B, dsn string) string {
 	return addr
 }
 
-func startEchoPGServer(b *testing.B, dsn string) string {
+func startEchoPGServer(b testing.TB, dsn string) string {
 	b.Helper()
 	pool := newPgxPool(b, dsn)
 	e := echo.New()
@@ -197,7 +197,7 @@ func startEchoPGServer(b *testing.B, dsn string) string {
 	return addr
 }
 
-func startChiPGServer(b *testing.B, dsn string) string {
+func startChiPGServer(b testing.TB, dsn string) string {
 	b.Helper()
 	pool := newPgxPool(b, dsn)
 	r := chi.NewRouter()
@@ -223,7 +223,7 @@ func startChiPGServer(b *testing.B, dsn string) string {
 	return addr
 }
 
-func startStdlibPGServer(b *testing.B, dsn string) string {
+func startStdlibPGServer(b testing.TB, dsn string) string {
 	b.Helper()
 	pool := newPgxPool(b, dsn)
 	mux := http.NewServeMux()
