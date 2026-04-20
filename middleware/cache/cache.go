@@ -17,10 +17,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/internal/sf"
 	"github.com/goceleris/celeris/middleware/store"
 )
 
@@ -58,7 +58,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		keyGen = defaultKeyGenerator(cfg.VaryHeaders)
 	}
 
-	sf := newSingleflight()
+	group := sf.New[sfResult]()
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -96,7 +96,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// sfResult carries the encoded bytes plus the effective TTL the
 		// leader computed so followers don't re-derive it (and so the
 		// leader can apply per-response Cache-Control max-age caps).
-		res, leader, err := sf.do(key, func() (sfResult, error) {
+		res, leader, err := group.Do(key, func() (sfResult, error) {
 			buf, ttl, rerr := executeAndReturnWithTTL(c, cfg, include, exclude)
 			return sfResult{bytes: buf, ttl: ttl}, rerr
 		})
@@ -302,44 +302,3 @@ func InvalidatePrefix(s store.KV, prefix string) error {
 	return pd.DeletePrefix(context.Background(), prefix)
 }
 
-// sfGroup coalesces concurrent in-flight misses for the same key. The
-// leader runs the producer; followers block on the leader's result.
-type sfGroup struct {
-	mu    sync.Mutex
-	calls map[string]*sfCall
-}
-
-type sfCall struct {
-	wg     sync.WaitGroup
-	result sfResult
-	err    error
-}
-
-func newSingleflight() *sfGroup {
-	return &sfGroup{calls: make(map[string]*sfCall)}
-}
-
-func (g *sfGroup) do(key string, fn func() (sfResult, error)) (sfResult, bool, error) {
-	g.mu.Lock()
-	if c, ok := g.calls[key]; ok {
-		g.mu.Unlock()
-		c.wg.Wait()
-		return c.result, false, c.err
-	}
-	c := &sfCall{}
-	c.wg.Add(1)
-	g.calls[key] = c
-	g.mu.Unlock()
-
-	defer func() {
-		g.mu.Lock()
-		delete(g.calls, key)
-		g.mu.Unlock()
-		c.wg.Done()
-	}()
-
-	result, err := fn()
-	c.result = result
-	c.err = err
-	return result, true, err
-}
