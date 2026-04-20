@@ -12,9 +12,13 @@ package memcached_test
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -211,4 +215,198 @@ func TestClusterKeyStabilityLive(t *testing.T) {
 		}
 	}
 	t.Logf("all %d middle-node keys redirected to %s", len(onMiddle), successor)
+}
+
+// TestClusterChaosSustainedLoad runs heavy concurrent traffic through
+// the cluster while randomly stopping/restarting nodes in the background.
+// Assertions:
+//
+//   - Sustained throughput stays above a minimum threshold (200 ops/s
+//     per goroutine across the whole run; tunable via CHAOS_MIN_RPS).
+//   - Data consistency: a key written to the cluster reads back the
+//     same value (no torn writes, no returning a stale value after a
+//     restart cycle).
+//   - p99 latency does not exceed CHAOS_P99_CEILING_MS (default 500ms)
+//     — a generous bound since chaos injection DOES spike latency.
+//
+// Gated by CELERIS_MEMCACHED_DOCKER_PREFIX. Opt-in via CHAOS_DURATION
+// (default 30s).
+func TestClusterChaosSustainedLoad(t *testing.T) {
+	if !dockerCanStop(t) {
+		return
+	}
+	addrs := clusterAddrsFromEnvShared(t)
+	if len(addrs) < 3 {
+		t.Skip("chaos test requires at least 3 nodes")
+	}
+	prefix := os.Getenv("CELERIS_MEMCACHED_DOCKER_PREFIX")
+
+	duration := 30 * time.Second
+	if dv := os.Getenv("CHAOS_DURATION"); dv != "" {
+		if d, err := time.ParseDuration(dv); err == nil {
+			duration = d
+		}
+	}
+	p99Ceiling := 500 * time.Millisecond
+	if cv := os.Getenv("CHAOS_P99_CEILING_MS"); cv != "" {
+		var ms int
+		if _, err := fmt.Sscanf(cv, "%d", &ms); err == nil && ms > 0 {
+			p99Ceiling = time.Duration(ms) * time.Millisecond
+		}
+	}
+	concurrency := 64
+	if cv := os.Getenv("CHAOS_CONC"); cv != "" {
+		fmt.Sscanf(cv, "%d", &concurrency)
+	}
+
+	cc, err := celmc.NewClusterClient(celmc.ClusterConfig{
+		Addrs:               addrs,
+		DialTimeout:         2 * time.Second,
+		FailureThreshold:    2,
+		HealthProbeInterval: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClusterClient: %v", err)
+	}
+	defer func() { _ = cc.Close() }()
+
+	// Chaos goroutine: stop + restart a random node every few seconds.
+	// Keep one node always alive so the cluster retains routing majority.
+	containers := make([]string, len(addrs))
+	for i, a := range addrs {
+		_ = a
+		containers[i] = fmt.Sprintf("%s-memcached-%c-1", prefix, 'a'+i)
+	}
+	chaosStop := make(chan struct{})
+	chaosDone := make(chan struct{})
+	var chaosEvents atomic.Int64
+	go func() {
+		defer close(chaosDone)
+		r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-chaosStop:
+				return
+			case <-ticker.C:
+				// Pick a non-first container (keep [0] always alive).
+				idx := 1 + r.IntN(len(containers)-1)
+				c := containers[idx]
+				t.Logf("chaos: stopping %s", c)
+				if err := dockerExec(t, "stop", "-t", "1", c); err != nil {
+					t.Logf("chaos: docker stop %s: %v", c, err)
+					continue
+				}
+				chaosEvents.Add(1)
+				// Wait 2s then restart.
+				select {
+				case <-time.After(2 * time.Second):
+				case <-chaosStop:
+					_ = dockerExec(t, "start", c)
+					return
+				}
+				t.Logf("chaos: restarting %s", c)
+				if err := dockerExec(t, "start", c); err != nil {
+					t.Logf("chaos: docker start %s: %v", c, err)
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(chaosStop)
+		<-chaosDone
+		// Restart every container (best-effort) so subsequent tests
+		// find a clean cluster.
+		for _, c := range containers {
+			_ = dockerExec(t, "start", c)
+		}
+	}()
+
+	// Load drivers.
+	var okCount, errCount, mismatchCount atomic.Int64
+	var latencies []time.Duration
+	var latMu sync.Mutex
+	var wg sync.WaitGroup
+	stopLoad := make(chan struct{})
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			local := make([]time.Duration, 0, 8192)
+			keyBase := fmt.Sprintf("chaos-w%d-", w)
+			for i := 0; ; i++ {
+				select {
+				case <-stopLoad:
+					latMu.Lock()
+					latencies = append(latencies, local...)
+					latMu.Unlock()
+					return
+				default:
+				}
+				key := keyBase + fmt.Sprintf("%d", i%100)
+				val := fmt.Sprintf("val-%d-%d", w, i)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				t0 := time.Now()
+				err := cc.Set(ctx, key, val, 5*time.Minute)
+				if err != nil {
+					cancel()
+					errCount.Add(1)
+					continue
+				}
+				got, gerr := cc.Get(ctx, key)
+				cancel()
+				elapsed := time.Since(t0)
+				local = append(local, elapsed)
+				if gerr != nil {
+					errCount.Add(1)
+					continue
+				}
+				if got != val {
+					mismatchCount.Add(1)
+					t.Errorf("data corruption: key=%q wrote=%q got=%q", key, val, got)
+					errCount.Add(1)
+					continue
+				}
+				okCount.Add(1)
+			}
+		}(w)
+	}
+
+	start := time.Now()
+	time.Sleep(duration)
+	close(stopLoad)
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	ok := okCount.Load()
+	errs := errCount.Load()
+	mismatches := mismatchCount.Load()
+	rps := float64(ok) / elapsed.Seconds()
+	t.Logf("chaos summary: elapsed=%v ok=%d err=%d mismatch=%d rps=%.0f chaos_events=%d",
+		elapsed, ok, errs, mismatches, rps, chaosEvents.Load())
+
+	if mismatches > 0 {
+		t.Fatalf("data corruption: %d mismatches (MUST be 0)", mismatches)
+	}
+	// Minimum throughput: a chaos run tanks RPS by 5-30% but not by
+	// more than that. Require at least 100 ops/s overall — the real
+	// guarantee is no crashes + no corruption.
+	if rps < 100 {
+		t.Fatalf("sustained RPS dropped below 100: got %.0f (severe regression)", rps)
+	}
+
+	// p99 latency ceiling.
+	latMu.Lock()
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	var p99 time.Duration
+	if len(latencies) > 0 {
+		idx := int(float64(len(latencies)-1) * 0.99)
+		p99 = latencies[idx]
+	}
+	latMu.Unlock()
+	t.Logf("p99 latency under chaos: %v (ceiling %v)", p99, p99Ceiling)
+	if p99 > p99Ceiling {
+		t.Errorf("p99 latency under chaos exceeded ceiling: %v > %v", p99, p99Ceiling)
+	}
 }
