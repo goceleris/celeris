@@ -158,7 +158,7 @@
 // mcrouter or twemproxy in front of the nodes and point the single-node
 // [Client] at the proxy.
 //
-// # Node failure detection and failover (v1.4.1)
+// # Node failure detection and failover (v1.5.0)
 //
 // [ClusterClient] tracks the health of each node and automatically
 // reroutes around failed ones so a single dead node does not translate
