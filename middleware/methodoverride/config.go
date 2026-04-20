@@ -71,6 +71,11 @@ func (cfg Config) validate() {
 	}
 }
 
+// defaultHeaderLower is the pre-lowercased form of DefaultHeader used by
+// defaultGetter to avoid allocating a fresh string per request via
+// strings.ToLower on the const value.
+var defaultHeaderLower = strings.ToLower(DefaultHeader)
+
 // defaultGetter checks the form field DefaultFormField first, then the
 // header DefaultHeader. This order allows HTML forms (which cannot set
 // custom headers) to override the method without client-side JavaScript.
@@ -78,7 +83,7 @@ func defaultGetter(c *celeris.Context) string {
 	if m := c.FormValue(DefaultFormField); m != "" {
 		return m
 	}
-	return c.Header(strings.ToLower(DefaultHeader))
+	return c.Header(defaultHeaderLower)
 }
 
 // HeaderGetter returns a getter that reads the override method from the
