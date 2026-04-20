@@ -10,6 +10,29 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// smallRetryAfter caches the ASCII form of retry-after seconds for
+// all values in [0, 3600]. Covers every realistic cooldownPeriod —
+// typical production values are 5–300s; 3600 comfortably covers
+// "1 hour cooldown" style setups. ~60 KiB of static strings trades
+// for zero strconv.FormatInt allocations on the breaker-open hot
+// path.
+const retryAfterCacheSize = 3601 // inclusive upper bound
+
+var smallRetryAfter = func() [retryAfterCacheSize]string {
+	var cache [retryAfterCacheSize]string
+	for i := range cache {
+		cache[i] = strconv.FormatInt(int64(i), 10)
+	}
+	return cache
+}()
+
+func retryAfterString(n int64) string {
+	if n >= 0 && int(n) < retryAfterCacheSize {
+		return smallRetryAfter[n]
+	}
+	return strconv.FormatInt(n, 10)
+}
+
 // Breaker holds the circuit breaker state. Use [NewWithBreaker] to obtain
 // a reference for programmatic state inspection and reset.
 type Breaker struct {
@@ -111,7 +134,7 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 				if retryAfter < 1 {
 					retryAfter = 1
 				}
-				c.SetHeader("retry-after", strconv.FormatInt(retryAfter, 10))
+				c.SetHeader("retry-after", retryAfterString(retryAfter))
 				return errHandler(c, ErrServiceUnavailable)
 			}
 			// Fell through to HalfOpen.
@@ -120,8 +143,9 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 		case HalfOpen:
 			used := brk.halfOpenUsed.Add(1)
 			if used > brk.halfOpenMax {
-				retryAfter := int64(1)
-				c.SetHeader("retry-after", strconv.FormatInt(retryAfter, 10))
+				// Static "1" — avoids strconv.FormatInt allocation
+				// on every over-cap HalfOpen request.
+				c.SetHeader("retry-after", "1")
 				return errHandler(c, ErrServiceUnavailable)
 			}
 
