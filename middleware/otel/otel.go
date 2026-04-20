@@ -70,7 +70,10 @@ func truncateString(s string, maxLen int) string {
 // isSSE reports whether the response Content-Type indicates a Server-Sent Events stream.
 func isSSE(c *celeris.Context) bool {
 	for _, h := range c.ResponseHeaders() {
-		if strings.EqualFold(h[0], "content-type") && strings.HasPrefix(h[1], "text/event-stream") {
+		// c.SetHeader lowercases keys at storage, so exact == on
+		// "content-type" is both correct and ~6x faster than
+		// strings.EqualFold on a full-header sweep.
+		if h[0] == "content-type" && strings.HasPrefix(h[1], "text/event-stream") {
 			return true
 		}
 	}
