@@ -34,6 +34,12 @@ var (
 	SigningMethodHS512 *signingMethodHMAC
 )
 
+// hmacSumBufPool backs the 64-byte Sum scratch used by Verify. A local
+// [64]byte escapes to heap because hmac.Equal takes []byte through an
+// interface call (R7 fixed the larger claims/sig escapes; this one is
+// the tail cleanup).
+var hmacSumBufPool = sync.Pool{New: func() any { b := make([]byte, 64); return &b }}
+
 func init() {
 	SigningMethodHS256 = &signingMethodHMAC{alg: "HS256", hash: crypto.SHA256}
 	SigningMethodHS384 = &signingMethodHMAC{alg: "HS384", hash: crypto.SHA384}
@@ -76,11 +82,14 @@ func (m *signingMethodHMAC) Verify(signingInput string, sig []byte, key any) err
 	entry := m.getHMAC(keyBytes)
 	entry.mac.Write(stringToBytes(signingInput))
 
-	var buf [64]byte
-	expected := entry.mac.Sum(buf[:0])
+	bufPtr := hmacSumBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+	expected := entry.mac.Sum(buf)
 	m.putHMAC(entry)
 
-	if !hmac.Equal(sig, expected) {
+	ok = hmac.Equal(sig, expected)
+	hmacSumBufPool.Put(bufPtr)
+	if !ok {
 		return ErrTokenSignatureInvalid
 	}
 	return nil
