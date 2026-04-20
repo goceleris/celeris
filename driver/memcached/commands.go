@@ -68,7 +68,9 @@ func validateKey(key string) error {
 }
 
 // asBytes converts a user-supplied value to its wire-level byte form. Used
-// by Set/Add/Replace/CAS/etc.
+// by Set/Add/Replace/CAS/etc. Numeric/float branches use strconv.Append* to
+// write straight into a fresh []byte, eliminating the intermediate string
+// allocation that strconv.Format* would produce.
 func asBytes(v any) ([]byte, error) {
 	switch x := v.(type) {
 	case []byte:
@@ -76,17 +78,17 @@ func asBytes(v any) ([]byte, error) {
 	case string:
 		return []byte(x), nil
 	case int:
-		return []byte(strconv.FormatInt(int64(x), 10)), nil
+		return strconv.AppendInt(nil, int64(x), 10), nil
 	case int64:
-		return []byte(strconv.FormatInt(x, 10)), nil
+		return strconv.AppendInt(nil, x, 10), nil
 	case int32:
-		return []byte(strconv.FormatInt(int64(x), 10)), nil
+		return strconv.AppendInt(nil, int64(x), 10), nil
 	case uint:
-		return []byte(strconv.FormatUint(uint64(x), 10)), nil
+		return strconv.AppendUint(nil, uint64(x), 10), nil
 	case uint64:
-		return []byte(strconv.FormatUint(x, 10)), nil
+		return strconv.AppendUint(nil, x, 10), nil
 	case uint32:
-		return []byte(strconv.FormatUint(uint64(x), 10)), nil
+		return strconv.AppendUint(nil, uint64(x), 10), nil
 	case float32:
 		return []byte(strconv.FormatFloat(float64(x), 'f', -1, 32)), nil
 	case float64:
