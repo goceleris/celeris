@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"unsafe"
 
 	"github.com/goceleris/celeris"
 
@@ -366,9 +367,22 @@ func extractOrigin(rawURL string) string {
 
 // storageKey returns a SHA-256 hex digest of the token for use as a storage key.
 // This prevents leaking raw tokens through the storage backend.
+//
+// The hash path uses sha256.New → Write(string) via unsafe.StringData to
+// avoid the []byte(token) allocation, then hex-encodes into a stack-sized
+// buffer. `string(dst)` is the only unavoidable alloc (the returned key
+// escapes to heap via the storage call). Net: 2 → 1 alloc per call.
 func storageKey(token string) string {
-	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:])
+	// Hash directly from the string's bytes (no []byte copy). Safe:
+	// sha256 reads but does not retain the slice.
+	h := sha256.New()
+	h.Write(unsafe.Slice(unsafe.StringData(token), len(token)))
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	// sha256.Size is 32 → hex-encoded is 64.
+	var hexBuf [64]byte
+	hex.Encode(hexBuf[:], sum[:])
+	return string(hexBuf[:])
 }
 
 // TokenFromContext returns the CSRF token from the context store.
