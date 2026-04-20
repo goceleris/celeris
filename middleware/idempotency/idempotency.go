@@ -121,9 +121,12 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		// Attempt to acquire the lock.
-		nonce := lockNonce()
-		acquired, err := cfg.Store.SetNX(ctx, key, append([]byte{entryLocked}, nonce...), cfg.LockTimeout)
+		// Attempt to acquire the lock. Build the 17-byte payload in a
+		// single allocation (1 status byte + 16-byte nonce) instead of
+		// making a 16-byte nonce and then append-copying it — saves one
+		// alloc per attempt.
+		lockPayload := makeLockPayload()
+		acquired, err := cfg.Store.SetNX(ctx, key, lockPayload, cfg.LockTimeout)
 		if err != nil {
 			return c.Next()
 		}
@@ -203,6 +206,21 @@ func lockNonce() []byte {
 	for i := 0; i < 8; i++ {
 		out[i] = byte(n >> (i * 8))
 		out[8+i] = byte(nano >> (i * 8))
+	}
+	return out
+}
+
+// makeLockPayload returns [entryLocked | 16-byte nonce] in one 17-byte
+// allocation, avoiding the lockNonce + append double-alloc on the
+// idempotency hot path.
+func makeLockPayload() []byte {
+	n := lockNonceCounter.Add(1)
+	out := make([]byte, 17)
+	out[0] = entryLocked
+	nano := uint64(time.Now().UnixNano())
+	for i := 0; i < 8; i++ {
+		out[1+i] = byte(n >> (i * 8))
+		out[9+i] = byte(nano >> (i * 8))
 	}
 	return out
 }
