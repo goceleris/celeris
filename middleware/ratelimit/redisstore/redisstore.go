@@ -16,6 +16,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -129,11 +130,13 @@ func (s *Store) Allow(key string) (bool, int, time.Time, error) {
 func (s *Store) allow(ctx context.Context, key string) (bool, int, time.Time, error) {
 	fullKey := s.prefix + key
 	now := time.Now().UnixNano()
+	// strconv.* is 2-3x faster than fmt.Sprintf and allocates exactly
+	// the returned string (no intermediate args slice copy in fmt).
 	args := []any{
-		fmt.Sprintf("%d", now),
-		fmt.Sprintf("%g", s.rps),
-		fmt.Sprintf("%d", s.burst),
-		fmt.Sprintf("%d", s.ttlSec),
+		strconv.FormatInt(now, 10),
+		strconv.FormatFloat(s.rps, 'g', -1, 64),
+		strconv.Itoa(s.burst),
+		strconv.FormatInt(s.ttlSec, 10),
 	}
 
 	sha, _ := s.allowSHA.Load().(string)
@@ -162,8 +165,8 @@ func (s *Store) Undo(key string) error {
 	ctx := context.Background()
 	fullKey := s.prefix + key
 	args := []any{
-		fmt.Sprintf("%d", s.burst),
-		fmt.Sprintf("%d", s.ttlSec),
+		strconv.Itoa(s.burst),
+		strconv.FormatInt(s.ttlSec, 10),
 	}
 	sha, _ := s.undoSHA.Load().(string)
 	_, err := s.client.EvalSHA(ctx, sha, []string{fullKey}, args...)
