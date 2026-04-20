@@ -38,6 +38,45 @@ func (c *Client) do(ctx context.Context, fn func(v protocol.Value) error, args .
 	return ferr
 }
 
+// doRead is the zero-closure fast path for Get/GetBytes/HGet/HGetAll/etc.
+// — any read that returns a single Value. Avoids the per-call heap-allocated
+// closure that `do` requires (the closure captures the caller's output var,
+// forcing it to escape). Callers must decode req.result themselves and call
+// releaseResult before the conn is released.
+//
+// Returns (result, err). The result aliases the conn's reader buffer and
+// is valid only until releaseResult is called — callers that retain bytes
+// must copy via asBytes / copyValueDetached first.
+func (c *Client) doRead(ctx context.Context, args ...string) (protocol.Value, *redisRequest, *redisConn, error) {
+	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
+	if err != nil {
+		return protocol.Value{}, nil, nil, err
+	}
+	req, err := conn.exec(ctx, args...)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			c.pool.discardCmd(conn)
+		} else {
+			c.pool.releaseCmd(conn)
+		}
+		return protocol.Value{}, nil, nil, err
+	}
+	if req.resultErr != nil {
+		rerr := req.resultErr
+		conn.releaseResult(req)
+		c.pool.releaseCmd(conn)
+		return protocol.Value{}, nil, nil, rerr
+	}
+	return req.result, req, conn, nil
+}
+
+// release finalises a doRead call — must be paired with every successful
+// doRead return.
+func (c *Client) releaseDoRead(req *redisRequest, conn *redisConn) {
+	conn.releaseResult(req)
+	c.pool.releaseCmd(conn)
+}
+
 // ---------- decoding helpers ----------
 
 func asString(v protocol.Value) (string, error) {
@@ -210,30 +249,24 @@ func argify(v any) string {
 // Get retrieves the string value at key. Returns [ErrNil] when the key is
 // missing.
 func (c *Client) Get(ctx context.Context, key string) (string, error) {
-	var out string
-	err := c.do(ctx, func(v protocol.Value) error {
-		s, err := asString(v)
-		if err != nil {
-			return err
-		}
-		out = s
-		return nil
-	}, "GET", key)
-	return out, err
+	v, req, conn, err := c.doRead(ctx, "GET", key)
+	if err != nil {
+		return "", err
+	}
+	s, derr := asString(v)
+	c.releaseDoRead(req, conn)
+	return s, derr
 }
 
 // GetBytes is the []byte variant of Get. The returned slice is a fresh copy.
 func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
-	var out []byte
-	err := c.do(ctx, func(v protocol.Value) error {
-		b, err := asBytes(v)
-		if err != nil {
-			return err
-		}
-		out = b
-		return nil
-	}, "GET", key)
-	return out, err
+	v, req, conn, err := c.doRead(ctx, "GET", key)
+	if err != nil {
+		return nil, err
+	}
+	b, derr := asBytes(v)
+	c.releaseDoRead(req, conn)
+	return b, derr
 }
 
 // Set stores value at key. If expiration > 0, an EX argument is appended with
