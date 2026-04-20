@@ -1,6 +1,7 @@
 package session
 
 import (
+	"strings"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -34,10 +35,12 @@ func CookieExtractor(cookieName string) Extractor {
 
 // HeaderExtractor returns an [Extractor] that reads the session ID from
 // the named request header. Use this for API clients that cannot store
-// cookies.
+// cookies. Header name is pre-lowercased so c.Header's own fast-path
+// fires without allocating per request.
 func HeaderExtractor(headerName string) Extractor {
+	h := strings.ToLower(headerName)
 	return func(c *celeris.Context) string {
-		return c.Header(headerName)
+		return c.Header(h)
 	}
 }
 
