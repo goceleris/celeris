@@ -10,11 +10,41 @@ package redisstore
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis"
 	"github.com/goceleris/celeris/middleware/store"
 )
+
+// keyBufSlot carries a reusable []byte slab for prefix+key assembly so
+// each Get/Set/Delete can skip the per-call heap alloc from the
+// `s.prefix+key` string concat. Hand the Redis client an unsafe.String
+// view — safe because driver/redis writes the key bytes to its RESP
+// buffer synchronously and does not retain them.
+type keyBufSlot struct {
+	buf []byte
+}
+
+var keyBufPool = sync.Pool{
+	New: func() any { return &keyBufSlot{buf: make([]byte, 0, 64)} },
+}
+
+func acquireFullKey(prefix, key string) (string, *keyBufSlot) {
+	slot := keyBufPool.Get().(*keyBufSlot)
+	slot.buf = append(slot.buf[:0], prefix...)
+	slot.buf = append(slot.buf, key...)
+	return unsafe.String(unsafe.SliceData(slot.buf), len(slot.buf)), slot
+}
+
+func releaseFullKey(slot *keyBufSlot) {
+	if slot == nil {
+		return
+	}
+	slot.buf = slot.buf[:0]
+	keyBufPool.Put(slot)
+}
 
 // Options configure the Redis-backed CSRF store.
 type Options struct {
@@ -50,7 +80,9 @@ func New(client *redis.Client, opts ...Options) *Store {
 
 // Get implements [store.KV].
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	v, err := s.client.GetBytes(ctx, s.prefix+key)
+	full, slot := acquireFullKey(s.prefix, key)
+	v, err := s.client.GetBytes(ctx, full)
+	releaseFullKey(slot)
 	if errors.Is(err, redis.ErrNil) {
 		return nil, store.ErrNotFound
 	}
@@ -62,12 +94,17 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Set implements [store.KV].
 func (s *Store) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return s.client.SetBytes(ctx, s.prefix+key, value, ttl)
+	full, slot := acquireFullKey(s.prefix, key)
+	err := s.client.SetBytes(ctx, full, value, ttl)
+	releaseFullKey(slot)
+	return err
 }
 
 // Delete implements [store.KV].
 func (s *Store) Delete(ctx context.Context, key string) error {
-	_, err := s.client.Del(ctx, s.prefix+key)
+	full, slot := acquireFullKey(s.prefix, key)
+	_, err := s.client.Del(ctx, full)
+	releaseFullKey(slot)
 	return err
 }
 
@@ -75,19 +112,23 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // (Redis 6.2+). When [Options.OldRedisCompat] is true, falls back to
 // a non-atomic GET+DEL pair.
 func (s *Store) GetAndDelete(ctx context.Context, key string) ([]byte, error) {
-	full := s.prefix + key
+	full, slot := acquireFullKey(s.prefix, key)
 	if s.oldMode {
 		v, err := s.client.GetBytes(ctx, full)
 		if errors.Is(err, redis.ErrNil) {
+			releaseFullKey(slot)
 			return nil, store.ErrNotFound
 		}
 		if err != nil {
+			releaseFullKey(slot)
 			return nil, err
 		}
 		_, _ = s.client.Del(ctx, full)
+		releaseFullKey(slot)
 		return v, nil
 	}
 	v, err := s.client.GetDelBytes(ctx, full)
+	releaseFullKey(slot)
 	if errors.Is(err, redis.ErrNil) {
 		return nil, store.ErrNotFound
 	}
