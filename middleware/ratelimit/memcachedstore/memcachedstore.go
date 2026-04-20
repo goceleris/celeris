@@ -104,11 +104,16 @@ type bucketState struct {
 	tokens float64
 }
 
-func encodeBucket(s bucketState) []byte {
-	var buf [16]byte
-	binary.BigEndian.PutUint64(buf[0:8], uint64(s.last))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(int64(s.tokens*1e6)))
-	return buf[:]
+// encodeBucketInto serializes s into dst (must be ≥16 bytes) and returns
+// dst[:16]. Accepts a caller-owned buffer so the stack-allocated storage
+// doesn't escape to the heap through the returned slice — at the driver
+// boundary we pass this via client.AddBytes/CASBytes which take []byte
+// directly (no `any` boxing).
+func encodeBucketInto(dst []byte, s bucketState) []byte {
+	_ = dst[15] // bounds check once
+	binary.BigEndian.PutUint64(dst[0:8], uint64(s.last))
+	binary.BigEndian.PutUint64(dst[8:16], uint64(int64(s.tokens*1e6)))
+	return dst[:16]
 }
 
 func decodeBucket(raw []byte) (bucketState, error) {
@@ -154,11 +159,14 @@ func (s *Store) Allow(key string) (bool, int, time.Time, error) {
 		}
 		state.last = now
 
-		blob := encodeBucket(state)
+		var buf [16]byte
+		blob := encodeBucketInto(buf[:], state)
 		if cas == 0 {
-			// No existing entry — use Add so another concurrent
-			// initializer doesn't overwrite us.
-			if addErr := s.client.Add(ctx, full, blob, s.ttl); addErr != nil {
+			// No existing entry — use AddBytes so another concurrent
+			// initializer doesn't overwrite us. AddBytes skips the
+			// `any`-interface boxing that would otherwise force buf
+			// onto the heap.
+			if addErr := s.client.AddBytes(ctx, full, blob, s.ttl); addErr != nil {
 				if errors.Is(addErr, celmc.ErrNotStored) {
 					// Someone else won the init; retry as an update.
 					s.retries.Add(1)
@@ -167,7 +175,7 @@ func (s *Store) Allow(key string) (bool, int, time.Time, error) {
 				return false, 0, time.Time{}, addErr
 			}
 		} else {
-			ok, casErr := s.client.CAS(ctx, full, blob, cas, s.ttl)
+			ok, casErr := s.client.CASBytes(ctx, full, blob, cas, s.ttl)
 			if casErr != nil {
 				return false, 0, time.Time{}, casErr
 			}
@@ -211,8 +219,9 @@ func (s *Store) Undo(key string) error {
 		if state.tokens > float64(s.burst) {
 			state.tokens = float64(s.burst)
 		}
-		blob := encodeBucket(state)
-		ok, casErr := s.client.CAS(ctx, full, blob, item.CAS, s.ttl)
+		var buf [16]byte
+		blob := encodeBucketInto(buf[:], state)
+		ok, casErr := s.client.CASBytes(ctx, full, blob, item.CAS, s.ttl)
 		if casErr != nil {
 			return casErr
 		}
