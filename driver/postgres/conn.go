@@ -1794,10 +1794,23 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqSimple
-	// Lazy streaming: allocate only colsCh (cheap, ~56 bytes) upfront.
-	// rowCh (~2KB) is NOT allocated — dispatch buffers into req.rows
-	// and only allocates rowCh when the result exceeds streamThreshold.
-	req.colsCh = make(chan struct{})
+	// Lazy streaming: colsCh fires when promoteToStreaming activates
+	// rowCh mid-dispatch, letting the caller goroutine switch to
+	// streaming mode instead of waiting for the full result set.
+	//
+	// The alloc (~56 bytes) is unneeded in two hot paths:
+	//   - useDirect: driveDirect owns the caller's read loop, no select
+	//     on colsCh ever happens.
+	//   - syncLoop fast path succeeds: simpleQuery returns directly
+	//     from the buffered-rows branch without entering
+	//     waitForQueryRows' select.
+	// Skipping the allocation in useDirect shaves one alloc per
+	// Query_1col_1row; the syncLoop fast path also benefits via the
+	// fallback branch in waitForQueryRows which re-allocates when it
+	// actually needs to wait.
+	if !c.useDirect {
+		req.colsCh = make(chan struct{})
+	}
 	// Direct mode drives onRecv on the caller goroutine; streaming
 	// would deadlock the same way the sync fast path does, so pin
 	// syncMode=true so dispatch never promotes.
@@ -2156,8 +2169,12 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		req.columns = cols
 		req.extended.Columns = cols
 	}
-	// Lazy streaming: allocate only colsCh (cheap). See simpleQuery.
-	req.colsCh = make(chan struct{})
+	// Lazy streaming: colsCh only needed in the async/streaming path.
+	// useDirect never enters waitForQueryRows' select so the alloc is
+	// unused there. See simpleQuery for the detailed rationale.
+	if !c.useDirect {
+		req.colsCh = make(chan struct{})
+	}
 	// Direct mode drives reads on the caller goroutine; streaming would
 	// deadlock. Pin syncMode=true so dispatch never promotes.
 	if c.useDirect {
