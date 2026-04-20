@@ -203,7 +203,11 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {
 	ct := "application/octet-stream"
 	for _, h := range rep.Headers {
-		if strings.EqualFold(h[0], "content-type") {
+		// Stored headers come from c.ResponseHeaders() which is already
+		// lowercased by celeris.Context.SetHeader (HTTP/2 RFC 7540 §8.1.2),
+		// so a plain string compare is correct and ~10x faster than
+		// strings.EqualFold on every HIT.
+		if h[0] == "content-type" {
 			ct = h[1]
 			continue
 		}
