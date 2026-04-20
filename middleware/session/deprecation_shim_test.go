@@ -46,17 +46,19 @@ func TestDeprecatedStoreAliasRoundTrip(t *testing.T) {
 func TestDeprecatedAliasIsExactlyKV(t *testing.T) {
 	// session.Store must be assignable to and from store.KV without any
 	// conversion — that's the whole point of the type-alias approach.
+	// The explicit type declarations below are intentional (testing the
+	// alias surface), so staticcheck's ST1023 warning is silenced.
 	var kv store.KV = session.NewMemoryStore()
-	var s session.Store = kv
+	var s session.Store = kv //nolint:staticcheck // ST1023: explicit type tests alias
 	_ = s
-	var back store.KV = s
+	var back store.KV = s //nolint:staticcheck // ST1023
 	_ = back
 }
 
 func TestDeprecatedMemoryStoreConfigAlias(t *testing.T) {
 	// MemoryStoreConfig is a type alias for store.MemoryKVConfig — the
 	// fields should be usable under either name.
-	var cfg session.MemoryStoreConfig = store.MemoryKVConfig{Shards: 4}
+	var cfg session.MemoryStoreConfig = store.MemoryKVConfig{Shards: 4} //nolint:staticcheck // ST1023: explicit type tests alias
 	s := session.NewMemoryStore(cfg)
 	defer s.Close()
 }

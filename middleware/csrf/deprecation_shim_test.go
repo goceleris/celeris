@@ -51,9 +51,10 @@ func TestDeprecatedStorageAliasRoundTrip(t *testing.T) {
 }
 
 func TestDeprecatedAliasIsExactlyKV(t *testing.T) {
+	// Explicit type decls are intentional: the test *is* the alias surface.
 	var kv store.KV = csrf.NewMemoryStorage()
-	var s csrf.Storage = kv
+	var s csrf.Storage = kv //nolint:staticcheck // ST1023: explicit type tests alias
 	_ = s
-	var back store.KV = s
+	var back store.KV = s //nolint:staticcheck // ST1023
 	_ = back
 }

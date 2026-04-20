@@ -301,4 +301,3 @@ func InvalidatePrefix(s store.KV, prefix string) error {
 	}
 	return pd.DeletePrefix(context.Background(), prefix)
 }
-
