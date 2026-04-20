@@ -2209,34 +2209,28 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		// Clear syncMode so async dispatch can promote to streaming.
 		req.syncMode.Store(false)
 	} else {
-		var skipParse bool
-		payload := c.buildMessage(func(w *protocol.Writer) []byte {
-			var parseB []byte
-			if stmtName == "" {
-				parseB = protocol.WriteParse(w, "", query, nil)
-			}
-			bindB := protocol.WriteBind(w, "", stmtName, formats, values, resultFormats)
-			var descB []byte
-			if hasDescribe {
-				descB = protocol.WriteDescribe(w, 'P', "")
-			}
-			execB := protocol.WriteExecute(w, "", 0)
-			syncB := protocol.WriteSync(w)
-			if parseB != nil {
-				if descB != nil {
-					return joinBytes(parseB, bindB, descB, execB, syncB)
-				}
-				return joinBytes(parseB, bindB, execB, syncB)
-			}
-			skipParse = true
-			if descB != nil {
-				return joinBytes(bindB, descB, execB, syncB)
-			}
-			return joinBytes(bindB, execB, syncB)
-		})
-		if skipParse {
+		// Direct-mode extended query. Build the Parse+Bind+[Describe]+
+		// Execute+Sync sequence in-place on c.writer to avoid the per-
+		// message snapshot copies the Write* helpers return and the
+		// joinBytes fusion slice. One owned copy at the end so callers
+		// can release writerMu before hitting the wire.
+		c.writerMu.Lock()
+		c.writer.Reset()
+		if stmtName == "" {
+			protocol.AppendParse(c.writer, "", query, nil)
+		} else {
 			req.extended.SkipParse = true
 		}
+		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
+		if hasDescribe {
+			protocol.AppendDescribe(c.writer, 'P', "")
+		}
+		protocol.AppendExecute(c.writer, "", 0)
+		protocol.AppendSync(c.writer)
+		buf := c.writer.Bytes()
+		payload := make([]byte, len(buf))
+		copy(payload, buf)
+		c.writerMu.Unlock()
 		if err := c.writeRaw(payload); err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
@@ -2316,19 +2310,20 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 			return res, nil
 		}
 	} else {
-		payload := c.buildMessage(func(w *protocol.Writer) []byte {
-			var parseB []byte
-			if stmtName == "" {
-				parseB = protocol.WriteParse(w, "", query, nil)
-			}
-			bindB := protocol.WriteBind(w, "", stmtName, formats, values, nil)
-			execB := protocol.WriteExecute(w, "", 0)
-			syncB := protocol.WriteSync(w)
-			if parseB != nil {
-				return joinBytes(parseB, bindB, execB, syncB)
-			}
-			return joinBytes(bindB, execB, syncB)
-		})
+		// Direct-mode extended exec — same in-place Append strategy as
+		// doExtendedQuery to eliminate intermediate snapshot allocs.
+		c.writerMu.Lock()
+		c.writer.Reset()
+		if stmtName == "" {
+			protocol.AppendParse(c.writer, "", query, nil)
+		}
+		protocol.AppendBind(c.writer, "", stmtName, formats, values, nil)
+		protocol.AppendExecute(c.writer, "", 0)
+		protocol.AppendSync(c.writer)
+		buf := c.writer.Bytes()
+		payload := make([]byte, len(buf))
+		copy(payload, buf)
+		c.writerMu.Unlock()
 		if err := c.writeRaw(payload); err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
