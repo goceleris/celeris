@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis/protocol"
 )
@@ -217,6 +218,19 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 	return nil, fmt.Errorf("celeris-redis: expected map reply, got %s", v.Type)
 }
 
+// unsafeStringFromBytes reinterprets a []byte as a string without
+// copying. The caller MUST guarantee that the returned string is only
+// used for read-only operations that complete before the backing slice
+// is mutated or freed. Used on the SetBytes / HSetBytes fast paths
+// where the written bytes are consumed synchronously by the RESP
+// writer + TCP Write and never retained.
+func unsafeStringFromBytes(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
 // argify converts a value to a string arg. Used by variadic commands.
 func argify(v any) string {
 	switch x := v.(type) {
@@ -273,6 +287,17 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 // whole-second granularity (or PX for sub-second).
 func (c *Client) Set(ctx context.Context, key string, value any, expiration time.Duration) error {
 	args := []string{"SET", key, argify(value)}
+	args = appendExpire(args, expiration)
+	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
+}
+
+// SetBytes is the allocation-lean variant of [Client.Set]. It converts the
+// caller-owned []byte into a string without copying via unsafe.String —
+// safe because the RESP writer only reads the bytes to stream to the wire
+// and does not retain the string past the round trip. Skips argify's
+// interface type switch + allocating string(x) for the []byte case.
+func (c *Client) SetBytes(ctx context.Context, key string, value []byte, expiration time.Duration) error {
+	args := []string{"SET", key, unsafeStringFromBytes(value)}
 	args = appendExpire(args, expiration)
 	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
 }
