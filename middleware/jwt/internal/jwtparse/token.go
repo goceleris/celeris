@@ -21,6 +21,38 @@ type Token struct {
 	Method    SigningMethod
 	Signature []byte
 	Valid     bool
+
+	// onReleaseFn is a pre-bound method value to ReleaseFromContext,
+	// stored so jwt middleware can register it with Context.OnRelease
+	// without materialising a fresh closure per request. Lazy-bound on
+	// first Middleware use — sync.Pool's New cannot do it directly
+	// because ReleaseFromContext references tokenPool (init cycle).
+	onReleaseFn func()
+}
+
+// ReleaseFromContext returns t and its MapClaims (if any) to their
+// respective pools. Designed to be registered as-is with
+// Context.OnRelease so the middleware hot path does not materialise a
+// closure capturing the context.
+func (t *Token) ReleaseFromContext() {
+	if t == nil {
+		return
+	}
+	if m, ok := t.Claims.(MapClaims); ok {
+		ReleaseMapClaims(m)
+	}
+	ReleaseToken(t)
+}
+
+// OnReleaseFn returns (and lazily binds) the cached method value for
+// Context.OnRelease registration. The caller is responsible for
+// ensuring the returned value is used only for the token's current
+// life-cycle.
+func (t *Token) OnReleaseFn() func() {
+	if t.onReleaseFn == nil {
+		t.onReleaseFn = t.ReleaseFromContext
+	}
+	return t.onReleaseFn
 }
 
 // Header is the JOSE header of a JWT.

@@ -137,16 +137,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.Set(tokenCtxKey, token)
 		c.Set(claimsCtxKey, token.Claims)
 
-		c.OnRelease(func() {
-			if v, ok := c.Get(tokenCtxKey); ok {
-				if t, ok := v.(*jwtparse.Token); ok {
-					if m, ok := t.Claims.(jwtparse.MapClaims); ok {
-						jwtparse.ReleaseMapClaims(m)
-					}
-					jwtparse.ReleaseToken(t)
-				}
-			}
-		})
+		// Using the pre-bound method value instead of an anonymous
+		// closure saves 1 alloc per request (full closure captures c and
+		// escapes via cross-package OnRelease).
+		c.OnRelease(token.OnReleaseFn())
 
 		if successHandler != nil {
 			successHandler(c)
