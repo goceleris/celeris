@@ -30,6 +30,24 @@ type group struct {
 	m  map[string]*call
 }
 
+// callPool recycles *call entries whose leader finished with zero
+// waiters — the common single-flight miss. Entries with waiters
+// accumulate captured body/headers and are released to GC when the
+// last waiter drops its reference.
+var callPool = sync.Pool{New: func() any { return &call{} }}
+
+func acquireCall() *call {
+	c := callPool.Get().(*call)
+	c.status = 0
+	c.headers = c.headers[:0]
+	c.body = c.body[:0]
+	c.ct = ""
+	c.err = nil
+	c.panicVal = nil
+	c.waiters.Store(0)
+	return c
+}
+
 // New creates a singleflight middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
@@ -94,7 +112,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		// Leader path: first request for this key.
-		entry := &call{}
+		entry := acquireCall()
 		entry.wg.Add(1)
 		g.m[key] = entry
 		g.mu.Unlock()
@@ -139,11 +157,24 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		entry.wg.Done()
 
+		// Snapshot any leader-side state BEFORE returning entry to the
+		// pool — otherwise a concurrent acquireCall could race with the
+		// reads below.
+		handlerErr := entry.err
+
+		// Pool-reuse the entry when no waiter referenced it. Entries seen
+		// by waiters stay live until the last reader drops them (the
+		// waiter path reads entry.body/headers/etc. after wg.Done); GC
+		// reclaims them then. Returning those to the pool would be a
+		// use-after-free.
+		if numWaiters == 0 {
+			callPool.Put(entry)
+		}
+
 		if panicVal != nil {
 			panic(panicVal)
 		}
 
-		handlerErr := entry.err
 		if ferr := c.FlushResponse(); ferr != nil && handlerErr == nil {
 			handlerErr = ferr
 		}
