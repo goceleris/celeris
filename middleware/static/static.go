@@ -18,10 +18,17 @@ import (
 	"github.com/goceleris/celeris"
 )
 
-// cachedFile stores the immutable content and content-type of an fs.FS file.
+// cachedFile stores the immutable content and content-type of an fs.FS file,
+// plus the pre-formatted last-modified and ETag strings. fs.FS is assumed
+// immutable (embed.FS, fstest.MapFS), so the formatted header strings
+// never go stale once populated. Freshness is verified against modTime
+// on every serve — a modTime mismatch invalidates the cached headers.
 type cachedFile struct {
-	data        []byte
-	contentType string
+	data            []byte
+	contentType     string
+	etag            string
+	lastModifiedStr string
+	modTime         time.Time
 }
 
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
@@ -247,10 +254,29 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		return celeris.NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	// 3. Cache headers + 304 check.
+	// 3. Cache headers + 304 check. Reuse pre-formatted strings from the
+	// fs cache when present and the modTime matches.
 	modTime := stat.ModTime()
+	var cached *cachedFile
+	if cf, ok := cache.Load(filePath); ok {
+		if cf2 := cf.(*cachedFile); cf2.modTime.Equal(modTime) {
+			cached = cf2
+		}
+	}
+
+	var etag, lastModifiedStr string
 	if !modTime.IsZero() {
-		etag := setCacheHeaders(c, modTime, size, cacheControl)
+		if cached != nil {
+			etag = cached.etag
+			lastModifiedStr = cached.lastModifiedStr
+		} else {
+			etag, lastModifiedStr = computeFSCacheStrings(modTime, size)
+		}
+		c.SetHeader("last-modified", lastModifiedStr)
+		c.SetHeader("etag", etag)
+		if cacheControl != "" {
+			c.SetHeader("cache-control", cacheControl)
+		}
 		if notModified(c, etag, modTime) {
 			return c.NoContent(304)
 		}
@@ -263,15 +289,13 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		}
 	}
 
-	// 5. Check fs.FS content cache.
+	// 5. Serve cached content if available.
 	c.SetHeader("accept-ranges", "bytes")
-
-	if cf, ok := cache.Load(filePath); ok {
-		cached := cf.(*cachedFile)
+	if cached != nil {
 		return serveFSCached(c, cached.data, cached.contentType)
 	}
 
-	// 6. Read, cache, and serve.
+	// 6. Read, cache (with headers), and serve.
 	var data []byte
 	var contentType string
 
@@ -289,8 +313,31 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		contentType = detectContentType(filePath, data)
 	}
 
-	cache.Store(filePath, &cachedFile{data: data, contentType: contentType})
+	cache.Store(filePath, &cachedFile{
+		data:            data,
+		contentType:     contentType,
+		etag:            etag,
+		lastModifiedStr: lastModifiedStr,
+		modTime:         modTime,
+	})
 	return serveFSCached(c, data, contentType)
+}
+
+// computeFSCacheStrings formats the Last-Modified and ETag strings for a
+// file with the given modTime and size. Shared between the cache-miss
+// path in serveFS (which stores the result on cachedFile) and one-off
+// renderings; setCacheHeaders still handles the serveOS path where no
+// per-file cache exists.
+func computeFSCacheStrings(modTime time.Time, size int64) (etag, lastModifiedStr string) {
+	lastModifiedStr = modTime.UTC().Format(http.TimeFormat)
+	var etagBuf [64]byte
+	dst := append(etagBuf[:0], 'W', '/', '"')
+	dst = strconv.AppendInt(dst, modTime.Unix(), 16)
+	dst = append(dst, '-')
+	dst = strconv.AppendInt(dst, size, 16)
+	dst = append(dst, '"')
+	etag = string(dst)
+	return
 }
 
 // servePreCompressedFS attempts to serve a pre-compressed variant (.br or .gz)
