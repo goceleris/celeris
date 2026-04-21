@@ -96,9 +96,13 @@ func DecodeResponse(buf []byte) (EncodedResponse, error) {
 		r.Headers = append(r.Headers, [2]string{key, val})
 	}
 	if off < len(buf) {
-		body := make([]byte, len(buf)-off)
-		copy(body, buf[off:])
-		r.Body = body
+		// Share the caller-owned buf slice for the body. Callers (cache,
+		// idempotency) pass buf sourced from a Store.Get, which returns
+		// a caller-owned defensive copy — sharing lets us skip the extra
+		// copy without exposing mutable store state. If a consumer
+		// retains r.Body past buf's scope, Go's GC pins the whole
+		// backing array via the slice header.
+		r.Body = buf[off:]
 	}
 	return r, nil
 }
