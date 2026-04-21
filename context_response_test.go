@@ -1454,3 +1454,46 @@ func TestContextDeleteCookie(t *testing.T) {
 		t.Fatalf("expected Path=/, got %q", setCookie)
 	}
 }
+
+// TestJSONFastPathMapString checks byte-identity of the map[string]string
+// fast-path against stdlib encoding/json. Any drift here is a bug —
+// the fast path exists to save allocations, not to produce different
+// output.
+func TestJSONFastPathMapString(t *testing.T) {
+	cases := []map[string]string{
+		{},
+		{"status": "ok"},
+		{"a": "1", "b": "2", "c": "3"},
+		{"message": "hello world"},
+		{"key": "value with spaces"},
+	}
+	for _, m := range cases {
+		s, _ := newTestStream("GET", "/test")
+		c := acquireContext(s)
+		if err := c.JSON(200, m); err != nil {
+			t.Fatalf("JSON(%v): %v", m, err)
+		}
+		got := string(s.ResponseWriter.(*mockResponseWriter).body)
+
+		want, _ := stdlibJSONEncode(m)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", m, got, want)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}
+
+func stdlibJSONEncode(v any) (string, error) {
+	var b bytes.Buffer
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(v); err != nil {
+		return "", err
+	}
+	out := b.Bytes()
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	return string(out), nil
+}
