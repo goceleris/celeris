@@ -73,7 +73,12 @@ func New(config ...Config) celeris.HandlerFunc {
 			return errorHandler(c, ErrUnauthorized)
 		}
 
-		c.Set(UsernameKey, user)
+		// SetString avoids the any-interface boxing c.Set(UsernameKey, user)
+		// would pay — ~16B alloc per authenticated request.
+		// UsernameFromContext reads via GetString, zero-alloc. User code
+		// calling c.Get(UsernameKey) still sees the value (via fallback;
+		// re-boxes on each call).
+		c.SetString(UsernameKey, user)
 		if cfg.SuccessHandler != nil {
 			cfg.SuccessHandler(c)
 		}
@@ -84,10 +89,6 @@ func New(config ...Config) celeris.HandlerFunc {
 // UsernameFromContext returns the authenticated username from the context store.
 // Returns an empty string if no username was stored (e.g., no auth or skipped).
 func UsernameFromContext(c *celeris.Context) string {
-	v, ok := c.Get(UsernameKey)
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
+	s, _ := c.GetString(UsernameKey)
 	return s
 }

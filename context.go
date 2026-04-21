@@ -147,6 +147,13 @@ type Context struct {
 	// skip the any-interface boxing that Set(RequestIDKey, id) would cost.
 	requestID string
 
+	// stringKeys stores string-valued per-request data without the
+	// any-interface boxing that c.Set would pay. Populated lazily on
+	// first [Context.SetString]. Preferred storage for auth principals,
+	// tenant IDs, trace correlators — any stringly-typed scalar that
+	// middleware wants to share downstream without an alloc per request.
+	stringKeys map[string]string
+
 	clientIPOverride string
 	schemeOverride   string
 	hostOverride     string
@@ -335,14 +342,20 @@ func (c *Context) Set(key string, value any) {
 
 // Get returns the value for a key.
 //
-// As of the RequestID refactor (see [Context.SetRequestID]), a value set
-// via SetRequestID is surfaced here for [RequestIDKey] even though the
-// ID is stored in a dedicated field rather than c.keys — but the any-
-// interface boxing is re-done per Get call, so consumers in the
-// celeris ecosystem prefer [Context.RequestID] for zero-alloc reads.
+// Consults c.keys first (values set via [Context.Set]), then the
+// dedicated string storage from [Context.SetString] and
+// [Context.SetRequestID]. The any-interface boxing on fallback paths
+// is re-done per Get call, so celeris-ecosystem code prefers the typed
+// [Context.GetString] and [Context.RequestID] getters for zero-alloc
+// reads.
 func (c *Context) Get(key string) (any, bool) {
 	if v, ok := c.keys[key]; ok {
 		return v, ok
+	}
+	if c.stringKeys != nil {
+		if s, ok := c.stringKeys[key]; ok {
+			return s, true
+		}
 	}
 	if key == RequestIDKey && c.requestID != "" {
 		return c.requestID, true
@@ -353,9 +366,13 @@ func (c *Context) Get(key string) (any, bool) {
 // Keys returns a copy of all key-value pairs stored on this context.
 // Returns nil if no values have been set.
 func (c *Context) Keys() map[string]any {
-	n := len(c.keys)
+	n := len(c.keys) + len(c.stringKeys)
 	if c.requestID != "" {
-		n++
+		if _, inMap := c.stringKeys[RequestIDKey]; !inMap {
+			if _, inKeys := c.keys[RequestIDKey]; !inKeys {
+				n++
+			}
+		}
 	}
 	if n == 0 {
 		return nil
@@ -364,8 +381,15 @@ func (c *Context) Keys() map[string]any {
 	for k, v := range c.keys {
 		cp[k] = v
 	}
+	for k, v := range c.stringKeys {
+		if _, clash := cp[k]; !clash {
+			cp[k] = v
+		}
+	}
 	if c.requestID != "" {
-		cp[RequestIDKey] = c.requestID
+		if _, clash := cp[RequestIDKey]; !clash {
+			cp[RequestIDKey] = c.requestID
+		}
 	}
 	return cp
 }
@@ -385,6 +409,38 @@ func (c *Context) RequestID() string { return c.requestID }
 func (c *Context) SetRequestID(id string) {
 	c.extended = true
 	c.requestID = id
+}
+
+// SetString stores a string value on the context under key. Unlike
+// [Context.Set], the value is kept in typed string storage — no
+// any-interface boxing alloc per call.
+//
+// Reads: pair with [Context.GetString] for zero-alloc access. [Context.Get]
+// falls back to the string storage, but re-boxes the string into an
+// any on each call.
+func (c *Context) SetString(key, value string) {
+	c.extended = true
+	if c.stringKeys == nil {
+		c.stringKeys = make(map[string]string, 2)
+	}
+	c.stringKeys[key] = value
+}
+
+// GetString returns the string value stored under key by
+// [Context.SetString], or ("", false) if absent. Also falls back to
+// any-typed values written via [Context.Set] for back-compat.
+func (c *Context) GetString(key string) (string, bool) {
+	if c.stringKeys != nil {
+		if s, ok := c.stringKeys[key]; ok {
+			return s, true
+		}
+	}
+	if v, ok := c.keys[key]; ok {
+		if s, ok := v.(string); ok {
+			return s, true
+		}
+	}
+	return "", false
 }
 
 // OnRelease registers a function to be called when this Context is released
@@ -442,6 +498,9 @@ func (c *Context) reset() {
 	c.requestID = ""
 	if c.extended {
 		clear(c.keys)
+		if c.stringKeys != nil {
+			clear(c.stringKeys)
+		}
 		c.queryCache = nil
 		c.queryCached = false
 		c.cookieCache = c.cookieCache[:0]

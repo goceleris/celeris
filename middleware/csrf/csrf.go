@@ -223,7 +223,10 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 			setCookie(c, token)
 			c.AddHeader("vary", "Cookie")
-			c.Set(contextKey, token)
+			// SetString avoids c.Set(contextKey, token)'s string-box alloc
+			// on every safe-method request. TokenFromContext reads via
+			// GetString (zero-alloc); user c.Get(ContextKey) still works.
+			c.SetString(contextKey, token)
 			return c.Next()
 		}
 
@@ -307,7 +310,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		c.AddHeader("vary", "Cookie")
-		c.Set(contextKey, cookieToken)
+		c.SetString(contextKey, cookieToken)
 		return c.Next()
 	}
 }
@@ -391,17 +394,11 @@ func storageKey(token string) string {
 // key is tried first, falling back to the default ContextKey constant.
 func TokenFromContext(c *celeris.Context) string {
 	if h := handlerFromContext(c); h != nil {
-		v, ok := c.Get(h.contextKey)
-		if ok {
-			s, _ := v.(string)
+		if s, ok := c.GetString(h.contextKey); ok {
 			return s
 		}
 	}
-	v, ok := c.Get(ContextKey)
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
+	s, _ := c.GetString(ContextKey)
 	return s
 }
 
