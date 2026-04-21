@@ -79,9 +79,32 @@ func (c *Context) StatusBlob(contentType string, data []byte) error {
 	return c.Blob(c.statusCode, contentType, data)
 }
 
+// jsonFastBufPool backs the reflection-free fast path in [Context.JSON]
+// for common API response shapes (map[string]string with ASCII-safe
+// values). c.Blob either copies the payload into capturedBody
+// (buffered mode) or writes it synchronously to the stream, so the
+// buffer is always safe to recycle once Blob returns.
+var jsonFastBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
+
 // JSON serializes v as JSON and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) JSON(code int, v any) error {
+	// Fast path: map[string]string with ASCII-safe keys and values —
+	// the dominant shape of status/error/info API responses. Saves the
+	// ~6 allocations that encoding/json pays for reflection + Encoder
+	// state (mapEncoder.encode, reflect.unsafe_New, etc.).
+	if m, ok := v.(map[string]string); ok {
+		bp := jsonFastBufPool.Get().(*[]byte)
+		buf, ok := appendJSONMapString((*bp)[:0], m)
+		if ok {
+			err := c.Blob(code, "application/json", buf)
+			*bp = buf
+			jsonFastBufPool.Put(bp)
+			return err
+		}
+		*bp = (*bp)[:0]
+		jsonFastBufPool.Put(bp)
+	}
 	js := jsonEncPool.Get().(*jsonState)
 	js.buf.Reset()
 	if err := js.enc.Encode(v); err != nil {
@@ -95,6 +118,53 @@ func (c *Context) JSON(code int, v any) error {
 	err := c.Blob(code, "application/json", b)
 	jsonEncPool.Put(js)
 	return err
+}
+
+// appendJSONMapString appends a JSON object encoding m to dst and
+// returns the extended slice, iff every key and value is ASCII-safe
+// (bytes 0x20..0x7E excluding quote and backslash). Returns (nil,
+// false) to signal the caller should fall back to full encoding/json.
+//
+// Safety rationale: stdlib json.Encoder with SetEscapeHTML(false)
+// emits these bytes verbatim, so the fast path's output is
+// byte-identical to stdlib for safe inputs. Non-ASCII, control
+// chars, quote, backslash all bail — the fast path never produces
+// a JSON string that differs from what encoding/json would.
+func appendJSONMapString(dst []byte, m map[string]string) ([]byte, bool) {
+	for k, v := range m {
+		if !jsonIsSafeASCII(k) || !jsonIsSafeASCII(v) {
+			return nil, false
+		}
+	}
+	dst = append(dst, '{')
+	first := true
+	for k, v := range m {
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		dst = append(dst, '"')
+		dst = append(dst, k...)
+		dst = append(dst, '"', ':', '"')
+		dst = append(dst, v...)
+		dst = append(dst, '"')
+	}
+	dst = append(dst, '}')
+	return dst, true
+}
+
+// jsonIsSafeASCII reports whether every byte of s can be emitted
+// verbatim inside a JSON string without escaping — i.e. printable
+// ASCII except the two characters that MUST be escaped (" and \).
+// Callers fall back to stdlib encoding when this returns false.
+func jsonIsSafeASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // XML serializes v as XML and writes it with the given status code.
