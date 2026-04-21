@@ -88,7 +88,10 @@ func New(config ...Config) celeris.HandlerFunc {
 			return handleError(c, ErrUnauthorized)
 		}
 
-		c.Set(ContextKey, key)
+		// SetString avoids c.Set(ContextKey, key)'s string-box alloc on
+		// every authenticated request. KeyFromContext reads via GetString
+		// (zero-alloc); user c.Get(ContextKey) still works (re-boxes).
+		c.SetString(ContextKey, key)
 		if successHandler != nil {
 			successHandler(c)
 		}
@@ -114,10 +117,6 @@ func headerVaryValue(lookup string) string {
 // KeyFromContext returns the authenticated API key from the context store.
 // Returns an empty string if no key was stored (e.g., no auth or skipped).
 func KeyFromContext(c *celeris.Context) string {
-	v, ok := c.Get(ContextKey)
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
+	s, _ := c.GetString(ContextKey)
 	return s
 }
