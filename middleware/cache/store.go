@@ -126,8 +126,6 @@ func (m *MemoryStore) Get(_ context.Context, key string) ([]byte, error) {
 // Set implements [store.KV]. Evicts the LRU entry when the shard is
 // over capacity.
 func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
-	cp := make([]byte, len(value))
-	copy(cp, value)
 	var exp int64
 	if ttl > 0 {
 		exp = time.Now().Add(ttl).UnixNano()
@@ -136,11 +134,23 @@ func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.items[key]; ok {
-		existing.value = cp
+		// Reuse the existing backing array when it fits — updates to
+		// the same key (ETag refresh, handler recompute) skip the
+		// per-Set heap alloc.
+		if cap(existing.value) >= len(value) {
+			existing.value = existing.value[:len(value)]
+			copy(existing.value, value)
+		} else {
+			cp := make([]byte, len(value))
+			copy(cp, value)
+			existing.value = cp
+		}
 		existing.expiry = exp
 		s.moveToFront(existing)
 		return nil
 	}
+	cp := make([]byte, len(value))
+	copy(cp, value)
 	n := &lruNode{key: key, value: cp, expiry: exp}
 	s.items[key] = n
 	s.pushFront(n)
