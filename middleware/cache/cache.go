@@ -36,6 +36,11 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 	cfg = applyDefaults(cfg)
 
+	// Pre-lowercase the response header name once so c.SetHeader's
+	// fast-path fires on HIT/MISS/ERROR writes — the default "X-Cache"
+	// has uppercase and otherwise allocates per response.
+	cfg.HeaderName = strings.ToLower(cfg.HeaderName)
+
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
 
