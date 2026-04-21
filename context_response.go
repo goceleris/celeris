@@ -614,7 +614,17 @@ func (c *Context) CaptureResponse() {
 // ResponseBody returns the captured response body, or nil if capture was not
 // enabled. Available after [Context.CaptureResponse] + c.Next(), or after
 // [Context.BufferResponse] + a response method (JSON, Blob, etc.).
-func (c *Context) ResponseBody() []byte { return c.capturedBody }
+func (c *Context) ResponseBody() []byte {
+	// The backing array of capturedBody persists across pool cycles for
+	// allocation reuse (see [Context.reset] — the slice header is reset
+	// to len=0 instead of nil when the cap fits the retention policy).
+	// Gate the return on the capture / buffered flags so callers who
+	// never opted into capture still observe nil.
+	if !c.captureBody && !c.buffered {
+		return nil
+	}
+	return c.capturedBody
+}
 
 // ResponseContentType returns the captured Content-Type, or "" if not captured.
 func (c *Context) ResponseContentType() string { return c.capturedType }

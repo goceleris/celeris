@@ -164,6 +164,11 @@ var contextPool = sync.Pool{New: func() any {
 
 const abortIndex int16 = math.MaxInt16 / 2
 
+// capturedBodyMaxRetained caps the backing array size kept across
+// Context pool cycles. Requests that produce larger bodies don't
+// retain their buffer (avoiding pool-wide memory bloat from outliers).
+const capturedBodyMaxRetained = 64 * 1024
+
 // RequestIDKey is the canonical context store key for the request ID.
 // Middleware that generates or reads request IDs should use this key
 // with [Context.Set] and [Context.Get] for interoperability.
@@ -407,7 +412,15 @@ func (c *Context) reset() {
 		c.formParsed = false
 		c.formValues = nil
 		c.captureBody = false
-		c.capturedBody = nil
+		// Retain the capturedBody backing array across pool cycles so the
+		// next Buffer/Capture request's append doesn't start from nil.
+		// Cap retention at 64 KiB so an outlier response doesn't bloat
+		// every pooled Context forever.
+		if cap(c.capturedBody) > capturedBodyMaxRetained {
+			c.capturedBody = nil
+		} else {
+			c.capturedBody = c.capturedBody[:0]
+		}
 		c.capturedStatus = 0
 		c.capturedType = ""
 		c.bufferDepth = 0
