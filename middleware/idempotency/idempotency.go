@@ -63,6 +63,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 	}
 
+	// Pre-lowercased header name — c.Header's fast-path fires without
+	// allocating on every request that hits the idempotency path.
+	keyHeaderLower := strings.ToLower(cfg.KeyHeader)
+
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
 			return c.Next()
@@ -70,7 +74,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		if _, ok := methods[strings.ToUpper(c.Method())]; !ok {
 			return c.Next()
 		}
-		key := c.Header(cfg.KeyHeader)
+		key := c.Header(keyHeaderLower)
 		if key == "" {
 			return c.Next()
 		}

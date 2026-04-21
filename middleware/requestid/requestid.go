@@ -2,6 +2,7 @@ package requestid
 
 import (
 	"context"
+	"strings"
 
 	"github.com/goceleris/celeris"
 )
@@ -61,7 +62,10 @@ func New(config ...Config) celeris.HandlerFunc {
 	isCustomGen := cfg.Generator != nil
 	cfg = applyDefaults(cfg)
 
-	header := cfg.Header
+	// Pre-lowercase the header name so c.Header's fast-path fires
+	// without allocating per request, even if a caller overrides the
+	// default with a mixed-case value like "X-Request-Id".
+	header := strings.ToLower(cfg.Header)
 	gen := cfg.Generator
 	trustProxy := !cfg.DisableTrustProxy
 	enableStdCtx := cfg.EnableStdContext
