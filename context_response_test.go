@@ -1522,6 +1522,37 @@ func TestJSONFastPathSliceString(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathPrimitiveSlices verifies []int, []int64, []uint64,
+// []bool fast paths against stdlib byte output.
+func TestJSONFastPathPrimitiveSlices(t *testing.T) {
+	cases := []any{
+		[]int(nil),
+		[]int{},
+		[]int{1, 2, 3},
+		[]int{-1, 0, 1},
+		[]int64{0, -9223372036854775808, 9223372036854775807}, // extremes
+		[]uint64{0, 1, 18446744073709551615},                  // max uint64
+		[]bool(nil),
+		[]bool{},
+		[]bool{true, false, true},
+		map[string]any{"ids": []int{1, 2, 3}, "flags": []bool{true, false}},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
 // TestJSONFastPathEscapedStrings verifies the in-place escape emitter
 // handles every byte stdlib escapes under SetEscapeHTML(false):
 // ", \, control chars with short forms (\b \t \n \f \r), control

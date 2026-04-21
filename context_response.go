@@ -176,6 +176,10 @@ func jsonSafeValue(v any) bool {
 			}
 		}
 		return true
+	case []int, []int64, []bool, []uint64:
+		// Element types that emit byte-identically via strconv.Append*
+		// / "true"/"false". No per-element safety check needed.
+		return true
 	default:
 		_ = x
 		return false
@@ -277,6 +281,58 @@ func appendJSONValue(dst []byte, v any) []byte {
 				dst = append(dst, ',')
 			}
 			dst = appendJSONValue(dst, e)
+		}
+		return append(dst, ']')
+	case []int:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendInt(dst, int64(n), 10)
+		}
+		return append(dst, ']')
+	case []int64:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendInt(dst, n, 10)
+		}
+		return append(dst, ']')
+	case []uint64:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendUint(dst, n, 10)
+		}
+		return append(dst, ']')
+	case []bool:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, b := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			if b {
+				dst = append(dst, "true"...)
+			} else {
+				dst = append(dst, "false"...)
+			}
 		}
 		return append(dst, ']')
 	}
