@@ -4,6 +4,7 @@
 package extract
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/goceleris/celeris"
@@ -61,7 +62,7 @@ func parseSingle(lookup string) Func {
 		}
 	case "query":
 		return func(c *celeris.Context) string {
-			return c.Query(name)
+			return queryLookup(c.RawQuery(), name)
 		}
 	case "cookie":
 		return func(c *celeris.Context) string {
@@ -79,4 +80,53 @@ func parseSingle(lookup string) Func {
 	default:
 		panic("extract: unsupported source: " + source)
 	}
+}
+
+// queryLookup scans raw for key=value pairs and returns the first value
+// matching key, without building a url.Values map. The common case (ASCII
+// key + unescaped value, e.g. a JWT in a ?token=... query) returns a
+// substring of raw — zero alloc. Encoded keys/values fall back to
+// url.QueryUnescape. Mirrors url.ParseQuery's first-match semantics.
+func queryLookup(raw, key string) string {
+	for len(raw) > 0 {
+		var kv string
+		if i := strings.IndexByte(raw, '&'); i >= 0 {
+			kv = raw[:i]
+			raw = raw[i+1:]
+		} else {
+			kv = raw
+			raw = ""
+		}
+		if kv == "" {
+			continue
+		}
+		var k, v string
+		if eq := strings.IndexByte(kv, '='); eq >= 0 {
+			k, v = kv[:eq], kv[eq+1:]
+		} else {
+			k = kv
+		}
+		if k == key {
+			return unescapeValue(v)
+		}
+		if strings.IndexByte(k, '%') >= 0 || strings.IndexByte(k, '+') >= 0 {
+			if uk, err := url.QueryUnescape(k); err == nil && uk == key {
+				return unescapeValue(v)
+			}
+		}
+	}
+	return ""
+}
+
+func unescapeValue(v string) string {
+	if v == "" {
+		return ""
+	}
+	if strings.IndexByte(v, '%') < 0 && strings.IndexByte(v, '+') < 0 {
+		return v
+	}
+	if u, err := url.QueryUnescape(v); err == nil {
+		return u
+	}
+	return ""
 }
