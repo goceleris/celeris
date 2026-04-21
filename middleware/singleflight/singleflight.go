@@ -2,12 +2,21 @@ package singleflight
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/goceleris/celeris"
 )
 
 type call struct {
-	wg       sync.WaitGroup
+	wg sync.WaitGroup
+	// waiters counts concurrent requests that joined this leader's
+	// in-flight state. Waiter goroutines increment under the group
+	// mutex (before registering on the WaitGroup); the leader reads
+	// it under the same mutex at delete time, so count captures every
+	// waiter that will ever read from this entry. A zero count lets
+	// the leader skip body/header deep-copies — the work only matters
+	// if someone else is going to read it back.
+	waiters  atomic.Int32
 	status   int
 	headers  [][2]string
 	body     []byte
@@ -47,6 +56,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		g.mu.Lock()
 		if entry, ok := g.m[key]; ok {
 			// Waiter path: another request is already in-flight for this key.
+			// Increment the waiter count BEFORE releasing the mutex so the
+			// leader's delete-time check sees it. Any waiter that reaches
+			// this branch pairs with the leader's post-Next capture.
+			entry.waiters.Add(1)
 			g.mu.Unlock()
 			// Race the leader's WaitGroup against the request context so a
 			// timeout middleware (or upstream client cancel) can preempt the
@@ -98,25 +111,33 @@ func New(config ...Config) celeris.HandlerFunc {
 			entry.err = c.Next()
 		}()
 
-		// Capture response state (deep copy).
-		entry.status = c.ResponseStatus()
-		entry.ct = c.ResponseContentType()
-		body := c.ResponseBody()
-		if len(body) > 0 {
-			entry.body = append([]byte(nil), body...)
-		}
-		respHeaders := c.ResponseHeaders()
-		if len(respHeaders) > 0 {
-			entry.headers = make([][2]string, len(respHeaders))
-			copy(entry.headers, respHeaders)
-		}
-		entry.panicVal = panicVal
-
-		// Remove from map BEFORE wg.Done so new requests after Done create fresh entries.
+		// Remove from map BEFORE wg.Done so new requests after Done create
+		// fresh entries. Reading entry.waiters under the same mutex that
+		// gates waiter increments gives a consistent count of everyone who
+		// will read from this entry; capture is a no-op when nobody's
+		// waiting (the common single-flight miss).
 		g.mu.Lock()
 		delete(g.m, key)
-		entry.wg.Done()
+		numWaiters := entry.waiters.Load()
 		g.mu.Unlock()
+
+		if numWaiters > 0 {
+			// Capture response state (deep copy) only when a waiter will
+			// consume it.
+			entry.status = c.ResponseStatus()
+			entry.ct = c.ResponseContentType()
+			body := c.ResponseBody()
+			if len(body) > 0 {
+				entry.body = append([]byte(nil), body...)
+			}
+			respHeaders := c.ResponseHeaders()
+			if len(respHeaders) > 0 {
+				entry.headers = make([][2]string, len(respHeaders))
+				copy(entry.headers, respHeaders)
+			}
+			entry.panicVal = panicVal
+		}
+		entry.wg.Done()
 
 		if panicVal != nil {
 			panic(panicVal)
