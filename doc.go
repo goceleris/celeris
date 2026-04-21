@@ -436,11 +436,29 @@
 //
 // # Key-Value Storage
 //
-// Store request-scoped data for sharing between middleware and handlers:
+// Store request-scoped data for sharing between middleware and handlers.
+// Three storage surfaces are provided; pick the narrowest one that fits
+// the value type:
 //
+//	// Generic any-typed store. Backwards compatible; boxes into interface{}.
 //	c.Set("userID", 42)
-//	id, ok := c.Get("userID")
+//	v, ok := c.Get("userID")
 //	all := c.Keys()              // copy of all stored pairs
+//
+//	// Typed string store — no interface boxing, 1 alloc saved per layer.
+//	c.SetString("tenantID", "acme-prod")
+//	s, ok := c.GetString("tenantID")
+//
+//	// Dedicated zero-alloc request-ID field. Same value surfaces via
+//	// c.Get(celeris.RequestIDKey) for back-compat.
+//	c.SetRequestID("abcd-1234")
+//	id := c.RequestID()
+//
+// GetString falls back to the any-typed c.keys map and to the dedicated
+// request-ID field, so code calling c.Get(key) continues to see values
+// written via c.SetString. The csrf, basicauth, keyauth, and requestid
+// middleware use the typed accessors; custom middleware that carry
+// string-only request-scoped values should prefer them too.
 //
 // # Content-Disposition
 //

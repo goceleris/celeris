@@ -57,6 +57,18 @@ unified `middleware/store.KV` interface; deprecation shims are provided.
 - **Benchmark harness** — `test/benchcmp_db/` module, compares celeris
   vs fiber v3 / echo v4 / chi v5 / net/http stdlib on end-to-end HTTP +
   real DB with same middleware stack + same keep-alive pool.
+- **`Context.RequestID()` / `Context.SetRequestID(string)`** — zero-alloc
+  dedicated accessor for the request ID (skips the `any`-interface
+  boxing that `c.Set(RequestIDKey, id)` used to pay per request).
+  `middleware/requestid` now stores via `SetRequestID`; value still
+  surfaces through `c.Get(RequestIDKey)` for back-compat.
+- **`Context.SetString(key, val)` / `Context.GetString(key)`** — typed
+  string storage that avoids the `any` box on both write and read.
+  `middleware/{csrf,basicauth,keyauth,requestid}` migrated; chains that
+  carry a handful of auth-scoped strings drop one alloc per middleware
+  layer. `GetString` falls back to the generic `c.keys` map and to the
+  dedicated `RequestID` field, so existing `c.Get(key)` callers still
+  observe the same values.
 
 ### Changed
 
@@ -103,6 +115,65 @@ Go 1.26.1), `-benchtime=3s -count=3`, median reported.
   was the benchmark running with default `AsyncHandlers=false`; with
   the correct config (see `celeris.Config.AsyncHandlers` doc) it drops
   from 5.9 ms to 855 µs, near parity with `pgx` + `net/http` stdlib.
+
+#### Context / hot-path micro-optimizations (103-round perf loop)
+
+Byte-identical output, zero behavioural change, hot paths only. All
+gains measured on `mini@msr1`, ≥3 % deltas kept, null rounds excluded.
+
+- **`c.JSON()` reflection-free fast path** — primitive scalars, strings,
+  `[]string`, `[]int/int64/uint64/bool`, `map[string]string`, and
+  `map[string]any` payloads up to 16 keys bypass `encoding/json`
+  entirely. Keys are pre-sorted (stack-allocated `[16]string` +
+  insertion sort) so output is byte-identical to `json.Marshal` with
+  `SetEscapeHTML(false)`. ASCII strings take a pure-copy path; strings
+  with escapes are handled inline; floats use stdlib's exact branching
+  rule (`'f'` in `[1e-6, 1e21)`, `'e'` otherwise with exponent
+  cleanup). Complex or nested shapes fall through to `encoding/json`.
+  Per-request alloc drop on JSON responses ranges from 2 allocs on
+  `{"ok":true}` to 5+ allocs on mid-size structured maps.
+- **`c.Query(key)` zero-alloc scan** — scans `rawQuery` directly with
+  byte arithmetic, skipping the `url.ParseQuery` map allocation for
+  the common case of one-shot lookups. `QueryParams()` still parses
+  into a `url.Values` the first time it's called.
+- **Context retention wins** — `capturedBody` backing array kept
+  across pool reuse (R82); `requestID` / `stringKeys` dedicated fields
+  skip `any`-boxing (R85–R87); `parseForm` short-circuits on non-form
+  requests (R88); stack `[]byte` builder for `SetCookie` instead of
+  `fmt.Fprintf` (R46).
+- **Driver tightening** — `driver/postgres` pools `Rows`,
+  `[]driver.NamedValue` slabs, encoded-args scratch, and direct-mode
+  payload buffers (R47–R50); `driver/memcached` routes `asBytes` ints
+  through `strconv.Append*`, elides cluster wrapper allocs, and fixes a
+  `Pipeline` escape (R16, R19, R39); `driver/redis` prebuilds argument
+  arrays for the EVALSHA path and adopts `GetDelBytes` (R37, R40).
+- **Middleware tightening** — `middleware/jwt` `classifiedError`
+  replaces `fmt.Errorf("%w: %w", ...)` (4 allocs → 1) and releases
+  `MapClaims` on every error path (R71, R72, R76); `middleware/cache`
+  gets a single-param `sortedQuery` fast path, a default key generator
+  fast path, and reuses existing backing arrays in `MemoryStore.Set`
+  (R61, R65, R79); `middleware/session` pools `sessionDataPool` and
+  returns fresh maps to it (R44, R53, R63); `middleware/healthcheck`
+  detects the default always-true checker config and skips the
+  per-request fan-out goroutine allocation (R89); `middleware/static`
+  pre-formats headers and caches per-file ETag/Last-Modified (R41,
+  R67, R70); `middleware/singleflight` pools `*call` entries for the
+  no-waiter path and skips capture when no one is waiting (R73, R74,
+  R78); `middleware/{cache,idempotency,requestid,methodoverride}`
+  pre-lowercase configured header names so `c.Header`'s fast path
+  fires without allocating per request (R42, R52, R59, R60); many
+  store adapters pool the `prefix+key` buffer used on every call
+  (R55–R57).
+- **`HTTPError.Error()`** — stack-buffer concat replaces
+  `fmt.Sprintf` in the hot error-formatting path (R69).
+
+Running total across the 103-round loop:
+- 60+ committed wins (40+ null/investigation rounds excluded).
+- No behavioural changes; existing tests, fuzz suites, and
+  `h1spec`/`h2spec` continue to pass on both x86_64 and arm64.
+- Back-compat preserved: `c.Get(RequestIDKey)` still returns the
+  request ID; `c.Get(key)` still returns values set via
+  `c.SetString(key, ...)`.
 
 ### Deprecated
 

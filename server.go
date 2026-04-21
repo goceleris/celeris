@@ -495,7 +495,7 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			configureFn(&cfg)
 		}
 		if errs := cfg.Validate(); len(errs) > 0 {
-			s.startErr = fmt.Errorf("config validation: %w", errs[0])
+			s.startErr = fmt.Errorf("config validation: %w", errors.Join(errs...))
 			return
 		}
 
