@@ -328,7 +328,7 @@ func (l *Loop) run(ctx context.Context) {
 				}
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
-			} else if cs.writePos >= len(cs.writeBuf) {
+			} else if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
 				cs.pendingBytes = 0
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
@@ -336,7 +336,7 @@ func (l *Loop) run(ctx context.Context) {
 				l.removeDirty(cs)
 			} else {
 				// Sync pendingBytes with actual buffer state after partial write.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -648,7 +648,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		if mu := cs.detachMu; mu != nil {
 			mu.Lock()
 		}
-		if cs.writePos < len(cs.writeBuf) {
+		if cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0 {
 			if fErr := flushWrites(cs); fErr != nil {
 				if cs.h1State != nil && cs.h1State.OnError != nil {
 					cs.h1State.OnError(fErr)
@@ -662,7 +662,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.closeConn(fd)
 				return
 			}
-			if cs.writePos >= len(cs.writeBuf) {
+			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
 				// Fully flushed — no dirty list needed.
 				cs.pendingBytes = 0
 				if cs.dirty {
@@ -670,7 +670,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				}
 			} else {
 				// Partial write — sync pendingBytes with actual buffer state.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
 				l.markDirty(cs)
 			}
 		}
@@ -736,6 +736,14 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
+		// Scatter-gather body writer: handler hands large bodies to the
+		// engine as a zero-copy slice; flushWrites emits writev(2) with
+		// [headers, body] so we save the respBuf → writeBuf memcpy.
+		// Disabled in async mode because cs.bodyBuf access would race
+		// with the dispatch goroutine without a mutex.
+		if !l.async {
+			cs.h1State.SetWriteBodyFn(l.makeWriteBodyFn(cs))
+		}
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
 			// In async mode cs.detachMu was already allocated at
@@ -871,7 +879,7 @@ func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		if cs.pendingBytes > cs.writeCap() {
+		if cs.pendingBytes+len(cs.bodyBuf) > cs.writeCap() {
 			return
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)
@@ -879,6 +887,27 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 		// Don't markDirty here — drainRead's inline flush handles the
 		// happy path. Only markDirty if the inline flush partially
 		// completes, avoiding linked-list overhead per request.
+	}
+}
+
+// makeWriteBodyFn stages a zero-copy body slice for scatter-gather
+// writev at flush time. The body is NOT copied — it must remain valid
+// and unmutated until flushWrites drains it. Used by the H1 response
+// adapter for bodies ≥ 8 KiB to skip the respBuf → writeBuf memcpy.
+func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
+	return func(body []byte) {
+		if cs.pendingBytes+len(cs.bodyBuf)+len(body) > cs.writeCap() {
+			return
+		}
+		if cs.bodyBuf != nil {
+			// A second large-body write in the same request: fall back
+			// to copying (we only carry one writev body slot per flush).
+			cs.writeBuf = append(cs.writeBuf, body...)
+			cs.pendingBytes += len(body)
+			return
+		}
+		cs.bodyBuf = body
+		cs.pendingBytes += len(body)
 	}
 }
 
@@ -1215,9 +1244,19 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	drainRecvBuffer(fd)
-	_ = unix.Close(fd)
+	// Fast-close path for plain H1 connections: close() alone. Saves
+	// shutdown(SHUT_WR) + drainRecvBuffer syscalls (~2 per close) in
+	// the Connection:close churn hot path. Graceful path retained for
+	// H2 (GOAWAY / RST_STREAM flushing) and WS/SSE detach (middleware-
+	// queued close frames).
+	fastClose := !detached && cs.protocol == engine.HTTP1 && cs.h1State != nil && !trulyDetached
+	if fastClose {
+		_ = unix.Close(fd)
+	} else {
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		drainRecvBuffer(fd)
+		_ = unix.Close(fd)
+	}
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)

@@ -125,6 +125,29 @@ func prepSendFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	setSQEFixedFile(sqePtr)
 }
 
+// prepWritev prepares a WRITEV SQE for scatter-gather transmission. The
+// kernel reads from iov entries in order and issues a single writev(2)-
+// equivalent syscall. Used on TCP sockets so that a large response (a
+// small header block + a large body) can be sent in ONE syscall without
+// first memcpying the body into the engine's outbound buffer. Saves one
+// full body-sized memcpy per request on json-64k-style responses.
+//
+// iov must remain valid until the corresponding CQE fires. The iovec
+// Go struct is defined in golang.org/x/sys/unix; we pass a pointer to
+// the first iovec and the count. The kernel copies the iovec array into
+// its own state before returning from io_uring_enter, but the BUFFERS
+// pointed to by the iovecs must stay alive until completion.
+func prepWritev(sqePtr unsafe.Pointer, fd int, iovPtr unsafe.Pointer, iovLen int, linked bool) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opWRITEV
+	if linked {
+		sqe[1] = sqeIOLink
+	}
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(iovPtr))
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(iovLen)
+}
+
 // prepSendZC prepares a SEND_ZC (zero-copy send) SQE. The kernel avoids
 // copying the buffer and instead maps it for DMA. Two CQEs are produced:
 // the first with the send result, and a notification CQE (CQE_F_NOTIF)

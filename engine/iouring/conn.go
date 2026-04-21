@@ -42,6 +42,14 @@ func (cs *connState) sendCap() int {
 	return maxSendQueueBytes
 }
 
+// iovec mirrors Linux struct iovec (16 bytes on 64-bit platforms).
+// Used for IORING_OP_WRITEV scatter-gather sends. Celeris only builds
+// on amd64 and arm64 (both 64-bit), so size is stable at 16.
+type iovec struct {
+	Base uintptr
+	Len  uint64
+}
+
 type connState struct {
 	fd             int             // 8: real FD, or fixed file index
 	protocol       engine.Protocol // 1
@@ -57,7 +65,10 @@ type connState struct {
 	sendBuf        []byte          // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
+	bodyBuf   []byte     // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
+	sendBody  []byte     // 24: in-flight body slice during WRITEV (cleared by completeSend)
 	buf       []byte     // 24: per-connection recv buffer
+	iov       [2]iovec   // 32: iovec storage for WRITEV SQEs (sendBuf + sendBody)
 	dirtyNext *connState // 8
 	dirtyPrev *connState // 8
 
@@ -151,6 +162,8 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.bodyBuf = nil
+	cs.sendBody = nil
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

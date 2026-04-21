@@ -125,6 +125,7 @@ func putResponseBuffer(p *[]byte) {
 
 type h1ResponseAdapter struct {
 	write     func([]byte)
+	writeBody func([]byte) // optional scatter-gather body writer (zero-copy body)
 	keepAlive bool
 	isHEAD    bool
 	hijackFn  func() (net.Conn, error)
@@ -234,7 +235,23 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
 	// Content-Length is still included above to indicate the size that
 	// would be returned for a GET, but no bytes are sent.
+	//
+	// Zero-copy large-body fast path: for bodies ≥ 8 KiB when the engine
+	// supplies a scatter-gather body writer, ship headers and body as
+	// two separate engine-level buffers. The engine emits a single
+	// IORING_OP_WRITEV / writev(2) call with iovec = [headers, body],
+	// which avoids the body-sized memcpy into the accumulator buffer.
+	// Saves ~6–8 GB/s memory bandwidth at 100 k rps on 64 KB responses.
+	// Falls back to the append path when the engine can't express
+	// scatter-gather (std engine, tests with mock writers, or when the
+	// caller passed an expired/closed writer).
 	if len(body) > 0 && !a.isHEAD {
+		if len(body) >= 8192 && a.writeBody != nil {
+			a.write(buf)
+			a.respBuf = buf
+			a.writeBody(body)
+			return nil
+		}
 		buf = append(buf, body...)
 	}
 

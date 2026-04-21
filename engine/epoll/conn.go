@@ -54,6 +54,7 @@ type connState struct {
 	_        [5]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
+	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
 
 	// Warm — second cache line:
 	pendingBytes int        // 8 bytes
@@ -143,6 +144,7 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.bodyBuf = nil
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false

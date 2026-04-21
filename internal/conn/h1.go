@@ -103,6 +103,18 @@ func (s *H1State) UpdateWriteFn(fn func([]byte)) {
 	s.rw.write = fn
 }
 
+// SetWriteBodyFn installs a scatter-gather body writer on the response
+// adapter. When non-nil, WriteResponse for large bodies bypasses the
+// respBuf → cs.writeBuf copy and hands the body slice straight to the
+// engine for a single WRITEV/sendmsg submission. Callers must not mutate
+// the body slice after a writeBody call until the response returns (the
+// engine keeps a reference until the SEND CQE fires). The std engine and
+// adapters that cannot express scatter-gather may leave this unset; the
+// adapter then falls back to the single-buffer path.
+func (s *H1State) SetWriteBodyFn(fn func([]byte)) {
+	s.rw.writeBody = fn
+}
+
 func (s *H1State) maxBodySize() int64 {
 	return s.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
 }
