@@ -270,11 +270,32 @@ func defaultKeyGenerator(vary []string) func(*celeris.Context) string {
 		varyLower[i] = strings.ToLower(h)
 	}
 	return func(c *celeris.Context) string {
+		m := c.Method()
+		p := c.Path()
+		rq := c.RawQuery()
+		// Fast path: plain "METHOD PATH" when there's no query and no
+		// vary headers to mix in. Covers the common REST-API cache key
+		// shape with one concat alloc instead of strings.Builder
+		// grow-then-materialize.
+		if rq == "" && len(varyLower) == 0 {
+			return m + " " + p
+		}
 		var b strings.Builder
-		b.WriteString(c.Method())
+		// Pre-size the builder so WriteString doesn't realloc on the
+		// common mid-size key. Estimate: method + ' ' + path + '?' +
+		// query + (|h=v) for each vary.
+		n := len(m) + 1 + len(p)
+		if rq != "" {
+			n += 1 + len(rq)
+		}
+		for _, h := range varyLower {
+			n += 2 + len(h) + len(c.Header(h))
+		}
+		b.Grow(n)
+		b.WriteString(m)
 		b.WriteString(" ")
-		b.WriteString(c.Path())
-		if rq := c.RawQuery(); rq != "" {
+		b.WriteString(p)
+		if rq != "" {
 			b.WriteString("?")
 			b.WriteString(sortedQuery(rq))
 		}
