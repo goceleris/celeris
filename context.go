@@ -142,6 +142,11 @@ type Context struct {
 
 	extended bool // true when keys/query/cookie/form/capture/buffer/detach/overrides were used
 
+	// requestID is the canonical request ID, set by middleware/requestid
+	// via [Context.SetRequestID]. Dedicated field so per-request writes
+	// skip the any-interface boxing that Set(RequestIDKey, id) would cost.
+	requestID string
+
 	clientIPOverride string
 	schemeOverride   string
 	hostOverride     string
@@ -329,22 +334,57 @@ func (c *Context) Set(key string, value any) {
 }
 
 // Get returns the value for a key.
+//
+// As of the RequestID refactor (see [Context.SetRequestID]), a value set
+// via SetRequestID is surfaced here for [RequestIDKey] even though the
+// ID is stored in a dedicated field rather than c.keys — but the any-
+// interface boxing is re-done per Get call, so consumers in the
+// celeris ecosystem prefer [Context.RequestID] for zero-alloc reads.
 func (c *Context) Get(key string) (any, bool) {
-	v, ok := c.keys[key]
-	return v, ok
+	if v, ok := c.keys[key]; ok {
+		return v, ok
+	}
+	if key == RequestIDKey && c.requestID != "" {
+		return c.requestID, true
+	}
+	return nil, false
 }
 
 // Keys returns a copy of all key-value pairs stored on this context.
 // Returns nil if no values have been set.
 func (c *Context) Keys() map[string]any {
-	if len(c.keys) == 0 {
+	n := len(c.keys)
+	if c.requestID != "" {
+		n++
+	}
+	if n == 0 {
 		return nil
 	}
-	cp := make(map[string]any, len(c.keys))
+	cp := make(map[string]any, n)
 	for k, v := range c.keys {
 		cp[k] = v
 	}
+	if c.requestID != "" {
+		cp[RequestIDKey] = c.requestID
+	}
 	return cp
+}
+
+// RequestID returns the canonical request ID for this context, set by
+// middleware/requestid via [Context.SetRequestID]. Empty when no
+// requestid middleware is installed or it skipped this request.
+//
+// Prefer this over Get(RequestIDKey) in celeris-ecosystem middleware:
+// the underlying storage avoids the any-interface boxing that c.Get
+// has to re-create on every call.
+func (c *Context) RequestID() string { return c.requestID }
+
+// SetRequestID stores the canonical request ID for this context. The
+// value is exposed via both [Context.RequestID] (zero-alloc, preferred)
+// and Get(RequestIDKey) (back-compat; re-boxes per call).
+func (c *Context) SetRequestID(id string) {
+	c.extended = true
+	c.requestID = id
 }
 
 // OnRelease registers a function to be called when this Context is released
@@ -399,6 +439,7 @@ func (c *Context) reset() {
 	c.aborted = false
 	c.bytesWritten = 0
 	c.maxFormSize = 0
+	c.requestID = ""
 	if c.extended {
 		clear(c.keys)
 		c.queryCache = nil

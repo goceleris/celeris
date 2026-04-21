@@ -232,10 +232,8 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		c.SetContext(spanCtx)
 
-		if rid, ok := c.Get(celeris.RequestIDKey); ok {
-			if s, ok := rid.(string); ok && s != "" {
-				span.SetAttributes(attribute.String("request.id", s))
-			}
+		if s := c.RequestID(); s != "" {
+			span.SetAttributes(attribute.String("request.id", s))
 		}
 
 		if metricsEnabled {

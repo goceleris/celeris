@@ -104,7 +104,11 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		c.SetHeader(header, id)
-		c.Set(ContextKey, id)
+		// SetRequestID stores into a dedicated string field, skipping the
+		// any-interface boxing that c.Set(ContextKey, id) would pay on
+		// every request. Value still surfaces via Get(celeris.RequestIDKey)
+		// for backward compatibility (re-boxes per call).
+		c.SetRequestID(id)
 		if enableStdCtx {
 			c.SetContext(context.WithValue(c.Context(), stdContextKey{}, id))
 		}

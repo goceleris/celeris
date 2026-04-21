@@ -88,8 +88,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 				logPanic(c, log, logLevel, panicVal, logStack, stackSize, stackAll)
 
-				rid, _ := c.Get(celeris.RequestIDKey)
-				ridStr, _ := rid.(string)
+				ridStr := c.RequestID()
 
 				if c.Context().Err() != nil {
 					log.LogAttrs(c.Context(), slog.LevelWarn, "panic after context cancelled",
@@ -136,8 +135,7 @@ func formatPanic(r any) string {
 // handleBrokenPipe handles panics caused by broken pipe / connection reset.
 func handleBrokenPipe(c *celeris.Context, r any, panicVal string, log *slog.Logger, brokenPipeHandler func(*celeris.Context, any) error, disableLog bool) error {
 	if !disableLog {
-		rid, _ := c.Get(celeris.RequestIDKey)
-		ridStr, _ := rid.(string)
+		ridStr := c.RequestID()
 		log.LogAttrs(c.Context(), slog.LevelWarn, "broken pipe",
 			slog.String("request_id", ridStr),
 			slog.String("method", c.Method()),
@@ -156,8 +154,7 @@ func logPanic(c *celeris.Context, log *slog.Logger, level slog.Level, panicVal s
 	if !logStack {
 		return
 	}
-	rid, _ := c.Get(celeris.RequestIDKey)
-	ridStr, _ := rid.(string)
+	ridStr := c.RequestID()
 	if stackSize > 0 {
 		bufPtr := stackPool.Get().(*[]byte)
 		buf := *bufPtr
@@ -190,8 +187,7 @@ func logPanic(c *celeris.Context, log *slog.Logger, level slog.Level, panicVal s
 func safeCallHandler(c *celeris.Context, handler func(*celeris.Context, any) error, r any, log *slog.Logger, level slog.Level) (retErr error) {
 	defer func() {
 		if r2 := recover(); r2 != nil {
-			rid, _ := c.Get(celeris.RequestIDKey)
-			ridStr, _ := rid.(string)
+			ridStr := c.RequestID()
 			log.LogAttrs(c.Context(), level, "panic in error handler",
 				slog.String("request_id", ridStr),
 				slog.String("method", c.Method()),

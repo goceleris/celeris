@@ -127,10 +127,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		if ip := c.ClientIP(); ip != "" {
 			attrs = append(attrs, slog.String("client_ip", ip))
 		}
-		if rid, ok := c.Get(celeris.RequestIDKey); ok {
-			if s, ok := rid.(string); ok && s != "" {
-				attrs = append(attrs, slog.String("request_id", s))
-			}
+		if s := c.RequestID(); s != "" {
+			attrs = append(attrs, slog.String("request_id", s))
 		} else if rid := c.Header("x-request-id"); rid != "" {
 			attrs = append(attrs, slog.String("request_id", rid))
 		}
