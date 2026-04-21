@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
@@ -135,7 +136,7 @@ func jsonSafeValue(v any) bool {
 	case bool:
 		return true
 	case string:
-		return jsonIsSafeASCII(x)
+		return jsonClassifyString(x) != jsonStringBail
 	case int, int8, int16, int32, int64,
 		uint8, uint16, uint32, uint, uint64, uintptr:
 		return true
@@ -144,7 +145,9 @@ func jsonSafeValue(v any) bool {
 			return false
 		}
 		for k, v := range x {
-			if !jsonIsSafeASCII(k) || !jsonIsSafeASCII(v) {
+			// Keys must be verbatim-safe (we don't escape keys); values
+			// can use the escape emitter.
+			if !jsonIsSafeASCII(k) || jsonClassifyString(v) == jsonStringBail {
 				return false
 			}
 		}
@@ -161,7 +164,7 @@ func jsonSafeValue(v any) bool {
 		return true
 	case []string:
 		for i := range x {
-			if !jsonIsSafeASCII(x[i]) {
+			if jsonClassifyString(x[i]) == jsonStringBail {
 				return false
 			}
 		}
@@ -193,9 +196,7 @@ func appendJSONValue(dst []byte, v any) []byte {
 		}
 		return append(dst, "false"...)
 	case string:
-		dst = append(dst, '"')
-		dst = append(dst, x...)
-		return append(dst, '"')
+		return appendJSONString(dst, x)
 	case int:
 		return strconv.AppendInt(dst, int64(x), 10)
 	case int8:
@@ -232,9 +233,8 @@ func appendJSONValue(dst []byte, v any) []byte {
 			}
 			dst = append(dst, '"')
 			dst = append(dst, k...)
-			dst = append(dst, '"', ':', '"')
-			dst = append(dst, x[k]...)
-			dst = append(dst, '"')
+			dst = append(dst, '"', ':')
+			dst = appendJSONString(dst, x[k])
 		}
 		return append(dst, '}')
 	case map[string]any:
@@ -264,9 +264,7 @@ func appendJSONValue(dst []byte, v any) []byte {
 			if i > 0 {
 				dst = append(dst, ',')
 			}
-			dst = append(dst, '"')
-			dst = append(dst, s...)
-			dst = append(dst, '"')
+			dst = appendJSONString(dst, s)
 		}
 		return append(dst, ']')
 	case []any:
@@ -297,30 +295,128 @@ func sortJSONKeys(keys []string) {
 	}
 }
 
-// jsonIsSafeASCII reports whether every byte of s can be emitted
-// verbatim inside a JSON string without any escaping.
+// appendJSONString writes s as a JSON-quoted string with stdlib-
+// compatible escaping for ", \, control characters, and the
+// U+2028/U+2029 separators. Callers must have classified s as
+// non-bail via jsonClassifyString — invalid UTF-8 inputs produce
+// divergent output vs stdlib here.
 //
-// Safe bytes are: printable ASCII (0x20..0x7E) excluding " and \,
-// plus any valid-looking continuation/lead bytes of UTF-8 (0x80+) —
-// stdlib json.Encoder with SetEscapeHTML(false) emits those verbatim.
-// The one exception under stdlib's default behavior is U+2028 /
-// U+2029 (the line/paragraph separator code points, encoded in UTF-8
-// as E2 80 A8 / E2 80 A9), which stdlib emits as \u2028 / \u2029; we
-// bail on those so the fast path never produces divergent bytes.
-func jsonIsSafeASCII(s string) bool {
-	for j := 0; j < len(s); j++ {
-		c := s[j]
-		if c < 0x20 || c == '"' || c == '\\' || c == 0x7F {
-			return false
+// Runs of unescaped bytes are appended as a single span, so the
+// common case (no escapes at all) costs a single append plus the
+// two quote bytes.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		b := s[i]
+		// ASCII escape-needing bytes: < 0x20, " (0x22), \ (0x5C).
+		// 0x7F (DEL) is NOT escaped by stdlib under SetEscapeHTML(false),
+		// so we pass it through verbatim.
+		if b < 0x80 {
+			if b < 0x20 || b == '"' || b == '\\' {
+				dst = append(dst, s[start:i]...)
+				dst = appendJSONEscapeByte(dst, b)
+				i++
+				start = i
+				continue
+			}
+			i++
+			continue
 		}
-		// U+2028 and U+2029 are the only non-ASCII runes stdlib
-		// escapes under SetEscapeHTML(false). Both encode to E2 80 A8
-		// or E2 80 A9. Detect the 3-byte sequence and bail.
-		if c == 0xE2 && j+2 < len(s) && s[j+1] == 0x80 && (s[j+2] == 0xA8 || s[j+2] == 0xA9) {
-			return false
+		// U+2028 (E2 80 A8) / U+2029 (E2 80 A9) — stdlib escapes even
+		// with HTML off. Detect without full UTF-8 decode.
+		if b == 0xE2 && i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xA8 || s[i+2] == 0xA9) {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, '\\', 'u', '2', '0', '2')
+			if s[i+2] == 0xA8 {
+				dst = append(dst, '8')
+			} else {
+				dst = append(dst, '9')
+			}
+			i += 3
+			start = i
+			continue
 		}
+		// Any other 0x80+ byte is a valid UTF-8 continuation/lead
+		// (classified non-bail by caller); emit verbatim.
+		i++
 	}
-	return true
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+
+// appendJSONEscapeByte writes the stdlib-compatible escape for a
+// single byte known to require escaping (< 0x20, ", or \).
+func appendJSONEscapeByte(dst []byte, b byte) []byte {
+	switch b {
+	case '"':
+		return append(dst, '\\', '"')
+	case '\\':
+		return append(dst, '\\', '\\')
+	case '\n':
+		return append(dst, '\\', 'n')
+	case '\r':
+		return append(dst, '\\', 'r')
+	case '\t':
+		return append(dst, '\\', 't')
+	case '\b':
+		return append(dst, '\\', 'b')
+	case '\f':
+		return append(dst, '\\', 'f')
+	}
+	const hex = "0123456789abcdef"
+	return append(dst, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xF])
+}
+
+// jsonStringClass classifies how s can participate in the fast path.
+const (
+	jsonStringVerbatim = iota // emit as-is between quotes, no escaping
+	jsonStringEscape          // needs byte-level escaping but still fast
+	jsonStringBail            // invalid UTF-8; fall back to encoding/json
+)
+
+// jsonClassifyString returns jsonStringVerbatim when s is printable
+// ASCII + valid UTF-8 with no escape-triggering bytes, jsonStringEscape
+// when s is valid UTF-8 but contains " / \ / control chars /
+// U+2028 / U+2029 (which appendJSONEscapedString handles), and
+// jsonStringBail when s contains invalid UTF-8 (stdlib emits \ufffd
+// for each invalid byte — cheaper to fall back than to replicate).
+func jsonClassifyString(s string) int {
+	kind := jsonStringVerbatim
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b < 0x20 || b == '"' || b == '\\' {
+			kind = jsonStringEscape
+			i++
+			continue
+		}
+		if b < 0x80 {
+			// Printable ASCII and 0x7F: both pass through without
+			// escaping under SetEscapeHTML(false).
+			i++
+			continue
+		}
+		// Multi-byte UTF-8: validate and check for U+2028 / U+2029
+		// (the only non-ASCII runes stdlib still escapes with HTML
+		// off). Invalid UTF-8 bails — stdlib emits \ufffd for each
+		// invalid byte and that format is awkward to replicate.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return jsonStringBail
+		}
+		if r == 0x2028 || r == 0x2029 {
+			kind = jsonStringEscape
+		}
+		i += size
+	}
+	return kind
+}
+
+// jsonIsSafeASCII (legacy shim) returns true iff s is verbatim-safe.
+// The broader classification is jsonClassifyString; existing callers
+// (map/slice key scans) only care about the boolean answer.
+func jsonIsSafeASCII(s string) bool {
+	return jsonClassifyString(s) == jsonStringVerbatim
 }
 
 // appendJSONMapAny appends a JSON object encoding m to dst iff every

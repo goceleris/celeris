@@ -1522,6 +1522,42 @@ func TestJSONFastPathSliceString(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathEscapedStrings verifies the in-place escape emitter
+// handles every byte stdlib escapes under SetEscapeHTML(false):
+// ", \, control chars with short forms (\b \t \n \f \r), control
+// chars without short forms (\u000b etc.), and U+2028/U+2029.
+func TestJSONFastPathEscapedStrings(t *testing.T) {
+	cases := []any{
+		map[string]string{"msg": "she said \"hi\""},
+		map[string]string{"path": "C:\\Users\\alice"},
+		map[string]string{"tab": "a\tb"},
+		map[string]string{"newline": "line1\nline2"},
+		map[string]string{"cr": "a\rb"},
+		map[string]string{"bell": "a\bb"},
+		map[string]string{"ff": "a\fb"},
+		map[string]string{"vt": "a\x0Bb"}, // no short form → \u000b
+		map[string]string{"null": "a\x00b"},
+		map[string]string{"ls": "\u2028"},
+		map[string]string{"ps": "\u2029"},
+		map[string]string{"mix": "\"\\\n\u2028café😀"},
+		[]string{"plain", "with \"quote\"", "back\\slash"},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
 // TestJSONFastPathUTF8 verifies the fast path emits valid UTF-8
 // strings (non-ASCII bytes) byte-identically to stdlib. After the
 // widened jsonIsSafeASCII check, common international content —
