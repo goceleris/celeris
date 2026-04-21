@@ -201,19 +201,23 @@ func (m *MemoryKV) DeletePrefix(_ context.Context, prefix string) error {
 // already exist (or has expired). Returns (true, nil) on acquisition,
 // (false, nil) on contention.
 func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Check contention under the lock BEFORE copying — a contended
+	// SetNX otherwise pays for a defensive value copy it throws away.
+	// Idempotency middleware's lock-vs-replay contention path hits
+	// this frequently.
+	if it, ok := s.items[key]; ok {
+		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
+			return false, nil
+		}
+	}
 	cp := make([]byte, len(value))
 	copy(cp, value)
 	var exp int64
 	if ttl > 0 {
 		exp = time.Now().Add(ttl).UnixNano()
-	}
-	s := m.shard(key)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if it, ok := s.items[key]; ok {
-		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
-			return false, nil
-		}
 	}
 	s.items[key] = &memItem{value: cp, expiry: exp}
 	return true, nil
