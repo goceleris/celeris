@@ -298,13 +298,25 @@ func sortJSONKeys(keys []string) {
 }
 
 // jsonIsSafeASCII reports whether every byte of s can be emitted
-// verbatim inside a JSON string without escaping — i.e. printable
-// ASCII except the two characters that MUST be escaped (" and \).
-// Callers fall back to stdlib encoding when this returns false.
+// verbatim inside a JSON string without any escaping.
+//
+// Safe bytes are: printable ASCII (0x20..0x7E) excluding " and \,
+// plus any valid-looking continuation/lead bytes of UTF-8 (0x80+) —
+// stdlib json.Encoder with SetEscapeHTML(false) emits those verbatim.
+// The one exception under stdlib's default behavior is U+2028 /
+// U+2029 (the line/paragraph separator code points, encoded in UTF-8
+// as E2 80 A8 / E2 80 A9), which stdlib emits as \u2028 / \u2029; we
+// bail on those so the fast path never produces divergent bytes.
 func jsonIsSafeASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
+	for j := 0; j < len(s); j++ {
+		c := s[j]
+		if c < 0x20 || c == '"' || c == '\\' || c == 0x7F {
+			return false
+		}
+		// U+2028 and U+2029 are the only non-ASCII runes stdlib
+		// escapes under SetEscapeHTML(false). Both encode to E2 80 A8
+		// or E2 80 A9. Detect the 3-byte sequence and bail.
+		if c == 0xE2 && j+2 < len(s) && s[j+1] == 0x80 && (s[j+2] == 0xA8 || s[j+2] == 0xA9) {
 			return false
 		}
 	}

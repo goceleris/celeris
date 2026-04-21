@@ -1522,18 +1522,46 @@ func TestJSONFastPathSliceString(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathUTF8 verifies the fast path emits valid UTF-8
+// strings (non-ASCII bytes) byte-identically to stdlib. After the
+// widened jsonIsSafeASCII check, common international content —
+// accented latin, Japanese, emoji — stays on the fast path.
+func TestJSONFastPathUTF8(t *testing.T) {
+	cases := []any{
+		map[string]string{"name": "café"},
+		map[string]string{"city": "東京"},
+		map[string]string{"mood": "😀✨"},
+		[]string{"α", "β", "γ"},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
 // TestJSONFastPathFallbacks checks that values the fast path cannot
-// emit byte-identically (floats, non-ASCII strings, nested structures)
-// fall through to stdlib encoding/json rather than being emitted
-// incorrectly by the fast path.
+// emit byte-identically fall through to stdlib encoding/json rather
+// than being emitted incorrectly by the fast path.
 func TestJSONFastPathFallbacks(t *testing.T) {
 	cases := []any{
-		map[string]any{"pi": 3.14},                   // float — stdlib's format differs from strconv
-		map[string]any{"big": 1e20},                  // large float
-		map[string]any{"name": "café"},               // non-ASCII
-		map[string]any{"nest": map[string]string{}},  // nested non-primitive
-		map[string]any{"list": []int{1, 2}},          // slice
-		map[string]string{"html": "<b>x</b>"},        // HTML chars (would mismatch under some handlers)
+		map[string]any{"pi": 3.14},                             // float — stdlib's format differs from strconv
+		map[string]any{"big": 1e20},                            // large float
+		map[string]string{"msg": "she said \"hi\""},            // embedded quote → stdlib escapes
+		map[string]string{"path": "C:\\Users"},                 // backslash
+		map[string]string{"ln": "line1\nline2"},                // control char
+		map[string]string{"sep": "\u2028line"},                 // U+2028 separator — stdlib escapes even with HTML off
+		map[string]string{"sep2": "para\u2029break"},           // U+2029 paragraph separator
+		map[string]any{"list": []int{1, 2}},                    // []int slice — not covered yet
 	}
 	for _, v := range cases {
 		s, rw := newTestStream("GET", "/test")
