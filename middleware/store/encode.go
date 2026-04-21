@@ -35,29 +35,42 @@ type EncodedResponse struct {
 // Encode serializes r into a new byte slice using the current wire
 // format version.
 func (r EncodedResponse) Encode() []byte {
+	return r.AppendTo(nil)
+}
+
+// AppendTo serializes r into dst and returns the extended slice. Lets
+// callers reuse a pooled buffer across requests (cache / idempotency
+// MISS paths transfer the encoded bytes into a Store.Set that copies
+// internally, so the buffer is free to recycle immediately after).
+func (r EncodedResponse) AppendTo(dst []byte) []byte {
 	size := 1 + 2 + 2
 	for _, h := range r.Headers {
 		size += 2 + len(h[0]) + 2 + len(h[1])
 	}
 	size += len(r.Body)
 
-	out := make([]byte, 0, size)
-	out = append(out, ResponseWireVersion)
+	// Grow once up-front so the append chain below never reallocates.
+	if cap(dst)-len(dst) < size {
+		grown := make([]byte, len(dst), len(dst)+size)
+		copy(grown, dst)
+		dst = grown
+	}
+	dst = append(dst, ResponseWireVersion)
 	var tmp [2]byte
 	binary.BigEndian.PutUint16(tmp[:], uint16(r.Status))
-	out = append(out, tmp[:]...)
+	dst = append(dst, tmp[:]...)
 	binary.BigEndian.PutUint16(tmp[:], uint16(len(r.Headers)))
-	out = append(out, tmp[:]...)
+	dst = append(dst, tmp[:]...)
 	for _, h := range r.Headers {
 		binary.BigEndian.PutUint16(tmp[:], uint16(len(h[0])))
-		out = append(out, tmp[:]...)
-		out = append(out, h[0]...)
+		dst = append(dst, tmp[:]...)
+		dst = append(dst, h[0]...)
 		binary.BigEndian.PutUint16(tmp[:], uint16(len(h[1])))
-		out = append(out, tmp[:]...)
-		out = append(out, h[1]...)
+		dst = append(dst, tmp[:]...)
+		dst = append(dst, h[1]...)
 	}
-	out = append(out, r.Body...)
-	return out
+	dst = append(dst, r.Body...)
+	return dst
 }
 
 // DecodeResponse parses buf into an [EncodedResponse] following the

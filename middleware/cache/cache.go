@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -102,7 +103,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		// leader computed so followers don't re-derive it (and so the
 		// leader can apply per-response Cache-Control max-age caps).
 		res, leader, err := group.Do(key, func() (sfResult, error) {
-			buf, ttl, rerr := executeAndReturnWithTTL(c, cfg, include, exclude)
+			// nil dst: leader returns the encoded bytes via sf.Do; followers
+			// may still be reading them after this call frame returns, so
+			// we can't share a pooled buffer here.
+			buf, ttl, rerr := executeAndReturnWithTTL(c, cfg, include, exclude, nil)
 			return sfResult{bytes: buf, ttl: ttl}, rerr
 		})
 		if err != nil {
@@ -141,16 +145,37 @@ type sfResult struct {
 // with the MISS header, and stores the encoded bytes on cache
 // eligibility. Used on the non-singleflight path and by followers that
 // fall back (leader produced no cacheable bytes).
+//
+// Borrows the encode buffer from cacheBufPool — Store.Set copies its
+// input internally (MemoryKV.Set reuses the existing backing array per
+// R66; redis/memcached adapters write through the wire), so the pooled
+// buffer is safe to recycle the moment Set returns.
 func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string) error {
-	bytes, ttl, err := executeAndReturnWithTTL(c, cfg, include, exclude)
+	bufPtr := cacheBufPool.Get().(*[]byte)
+	encoded, ttl, err := executeAndReturnWithTTL(c, cfg, include, exclude, (*bufPtr)[:0])
 	if err != nil {
+		*bufPtr = encoded
+		cacheBufPool.Put(bufPtr)
 		return err
 	}
-	if bytes != nil {
-		_ = cfg.Store.Set(c.Context(), key, bytes, ttl)
+	if encoded != nil {
+		_ = cfg.Store.Set(c.Context(), key, encoded, ttl)
 	}
+	if cap(encoded) <= cacheBufMaxPooled {
+		*bufPtr = encoded
+	} else {
+		*bufPtr = (*bufPtr)[:0]
+	}
+	cacheBufPool.Put(bufPtr)
 	return nil
 }
+
+// cacheBufPool recycles encode-buffer backing arrays across
+// non-singleflight MISS requests. cacheBufMaxPooled caps retained
+// capacity so a pathological oversized response doesn't bloat the pool.
+const cacheBufMaxPooled = 64 * 1024
+
+var cacheBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
 
 // executeAndReturnWithTTL buffers + runs the remaining handler chain
 // on c, flushes the wire with the MISS header set, and returns the
@@ -158,14 +183,19 @@ func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string
 // Effective TTL is min(cfg.TTL, Cache-Control max-age) when
 // RespectCacheControl is enabled. Returns (nil, 0, nil) for ineligible
 // responses (status filter, size cap, no-store/private, etc.).
-func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude map[string]struct{}) ([]byte, time.Duration, error) {
+//
+// dst is an optional pre-allocated buffer to encode into. Pass nil for
+// the singleflight leader (followers hold onto the returned bytes past
+// the caller's stack frame), or a pooled buffer on the non-singleflight
+// path where Store.Set's internal copy lets us recycle immediately.
+func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, dst []byte) ([]byte, time.Duration, error) {
 	c.BufferResponse()
 	chainErr := c.Next()
 	status := c.ResponseStatus()
 	body := c.ResponseBody()
 	respHeaders := c.ResponseHeaders()
 
-	var cacheBytes []byte
+	cacheBytes := dst
 	effectiveTTL := cfg.TTL
 	if chainErr == nil && cfg.StatusFilter(status) && len(body) <= cfg.MaxBodyBytes {
 		cacheable := true
@@ -190,8 +220,12 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 		if cacheable {
 			filtered := filterHeaders(respHeaders, include, exclude)
 			enc := store.EncodedResponse{Status: status, Headers: filtered, Body: body}
-			cacheBytes = enc.Encode()
+			cacheBytes = enc.AppendTo(cacheBytes[:0])
+		} else {
+			cacheBytes = nil
 		}
+	} else {
+		cacheBytes = nil
 	}
 
 	// Set MISS header before flushing so it makes it to the wire.
