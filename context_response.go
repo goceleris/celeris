@@ -239,6 +239,12 @@ func appendJSONMapAny(dst []byte, m map[string]any) ([]byte, bool) {
 
 // jsonPrimitiveSafe reports whether v is a primitive value the fast
 // path can emit byte-identically to stdlib encoding/json.
+//
+// Floats are deliberately excluded — stdlib's float encoder uses
+// 'f' format for values in [1e-6, 1e21) and 'e' with an exponent-cleanup
+// pass outside that window, neither of which matches a plain
+// strconv.AppendFloat call. Any map with float values falls back to
+// encoding/json so the output stays byte-identical.
 func jsonPrimitiveSafe(v any) bool {
 	switch x := v.(type) {
 	case nil:
@@ -254,12 +260,10 @@ func jsonPrimitiveSafe(v any) bool {
 	case uint, uint64, uintptr:
 		// stdlib emits these as decimal integers; same path.
 		return true
-	case float32:
-		return !isNaNOrInf32(x)
-	case float64:
-		return !isNaNOrInf64(x)
+	default:
+		_ = x
+		return false
 	}
-	return false
 }
 
 // appendJSONPrimitive writes v's primitive encoding into dst. Caller
@@ -299,20 +303,9 @@ func appendJSONPrimitive(dst []byte, v any) []byte {
 		return strconv.AppendUint(dst, x, 10)
 	case uintptr:
 		return strconv.AppendUint(dst, uint64(x), 10)
-	case float32:
-		return strconv.AppendFloat(dst, float64(x), 'g', -1, 32)
-	case float64:
-		return strconv.AppendFloat(dst, x, 'g', -1, 64)
 	}
 	// Unreachable — jsonPrimitiveSafe gates this switch.
 	return dst
-}
-
-func isNaNOrInf32(f float32) bool {
-	return f != f || f > 3.4e38 || f < -3.4e38
-}
-func isNaNOrInf64(f float64) bool {
-	return f != f || f > 1.7e308 || f < -1.7e308
 }
 
 // XML serializes v as XML and writes it with the given status code.
