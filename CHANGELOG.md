@@ -85,6 +85,46 @@ unified `middleware/store.KV` interface; deprecation shims are provided.
 
 ### Fixed
 
+- **iouring engine: HTTP/1 Connection:close churn collapse (260× fix).**
+  Under sustained HTTP/1 Connection:close traffic against a client that
+  pools connections — the canonical production pattern: load balancers,
+  service mesh sidecars, HTTP/2 upstream pools fronting an H1 backend —
+  the iouring engine throttled to ~90 rps on aarch64 kernel 6.6.10, a
+  100–260× collapse vs the epoll engine's ~25 k rps on the identical
+  workload. CPU profile showed workers spending 97 % of their time
+  asleep in `io_uring_enter`, drowning in spurious recv CQEs (25 k/s
+  per worker against ~50 useful completions — a 500 : 1 waste ratio)
+  from the ring-mapped provided-buffer multishot recv path. Fix:
+  switch the default recv model to single-shot per-connection recv
+  (the same model `engine/epoll` uses); opt back in to multishot via
+  `CELERIS_IOURING_MULTISHOT_RECV=1` for workloads genuinely dominated
+  by long-lived keep-alive connections. Measured delta on
+  `mini@msr1`: `celeris-iouring-*-h1 churn` = 0.1 k → 24 k rps
+  (+21 000 %); median across all 180 other benchmark × engine ×
+  protocol combinations is within ±5 % of the pre-fix matrix.
+- **iouring engine: multishot accept now re-arms on CQE_F_MORE=0.**
+  Previously the re-arm was gated on `!SupportsMultishotAccept`, so a
+  kernel-terminated multishot (backpressure or error path) would
+  silently stop the worker from accepting new connections. Now fires
+  in both paths.
+- **iouring engine: synchronous close replaces the async CLOSE SQE.**
+  The async path left the fd open across `io_uring_enter` boundaries,
+  compounding with the server-initiated FIN_WAIT_2 pileup to wedge the
+  ephemeral port pool under churn. `unix.Close` on a non-blocking
+  socket is a pure descriptor-table op and does not stall the event
+  loop. Detached (WS/SSE) conns keep the graceful half-close + drain
+  + close path because middleware may have queued close-frame bytes
+  that the RST path would cut off.
+- **iouring engine: ACCEPT_DIRECT runtime probe.** The previous probe
+  only verified `IORING_REGISTER_FILES` succeeded, but kernel
+  6.6.10-cix accepts the file-table registration and then fails the
+  actual `ACCEPT_DIRECT` SQE with EINVAL at runtime. Every worker
+  paid the cold-fallback cost on its first accept, and the ring
+  stayed in a mixed "files-registered-but-unused" state. The probe
+  now submits a real multishot-accept-direct against a scratch
+  listen socket and checks the CQE res; an EINVAL response marks
+  fixed-files unsupported at start-up so the engine takes the plain
+  fd path cleanly.
 - **`WithEngine(srv)` deadlock under concurrent warmup on inline
   handlers.** When `AsyncHandlers=false` (celeris default) and the
   engine's `WorkerLoop` didn't implement the driver's

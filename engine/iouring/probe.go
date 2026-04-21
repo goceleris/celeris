@@ -162,10 +162,21 @@ func probeSendZC() SendZCProbeResult {
 	return SendZCTrueZeroCopy
 }
 
-// probeFixedFiles tests whether ACCEPT_DIRECT (fixed files) works by
-// registering a fixed file table on a temporary ring.
+// probeFixedFiles tests whether ACCEPT_DIRECT (fixed files) works end-to-end.
+// Registering the file table is not enough: some kernels (observed on
+// 6.6.10-cix, ARM64) accept IORING_REGISTER_FILES_SPARSE but then fail the
+// multishot-accept-direct SQE with EINVAL at runtime. When that happens
+// every worker pays the cold-fallback cost on its very first accept and,
+// critically, the ring is left in a mixed state with RegisterFiles succeeded
+// but fixed files effectively disabled — which compounds the per-op overhead
+// on subsequent recv/send SQEs that would otherwise have been optimized.
+//
+// To avoid that, submit an actual MULTISHOT ACCEPT_DIRECT against a
+// temporary listen socket. If the kernel returns EINVAL (-22), we know
+// fixed files are non-functional on this host and surface it as a probe
+// miss so the engine takes the plain-fd path from the start.
 func probeFixedFiles() bool {
-	ring, err := NewRing(4, 0, 0)
+	ring, err := NewRing(8, 0, 0)
 	if err != nil {
 		return false
 	}
@@ -174,5 +185,51 @@ func probeFixedFiles() bool {
 	if err := ring.RegisterFiles(16); err != nil {
 		return false
 	}
-	return true
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return false
+	}
+	defer func() { _ = ln.Close() }()
+
+	rc, err := ln.(*net.TCPListener).SyscallConn()
+	if err != nil {
+		return false
+	}
+	var listenFD int
+	_ = rc.Control(func(fd uintptr) { listenFD = int(fd) })
+	if listenFD <= 0 {
+		return false
+	}
+
+	sqe := ring.GetSQE()
+	if sqe == nil {
+		return false
+	}
+	prepMultishotAcceptDirect(sqe, listenFD)
+	setSQEUserData(sqe, 0xF17EDF11E) // distinct tag for this probe
+	if _, err := ring.Submit(); err != nil {
+		return false
+	}
+
+	// Trigger one accept so the kernel produces a CQE for the multishot SQE.
+	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
+	conn, err := dialer.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		return false
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
+		return false
+	}
+	head, tail := ring.BeginCQ()
+	if head == tail {
+		return false
+	}
+	cqe := ring.cqeAt(head)
+	ring.EndCQ(head + 1)
+	// Res = -EINVAL (-22) means the kernel registered files but refuses
+	// ACCEPT_DIRECT (seen on 6.6.10-cix aarch64). Treat as unsupported.
+	return cqe.Res >= 0
 }

@@ -47,11 +47,14 @@ func errIORingSend(res int32) error {
 const bufRingGroupID = 0
 
 // bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2. 128 supports 128 concurrent in-flight multishot
-// recvs per worker. Typical web workloads have ~15-30 concurrent recvs
-// per worker, so 128 is a 4-8x safety margin. With 8KB buffers:
-// 128 * 8KB = 1 MB per worker; 64 workers = 64 MB total.
-const bufRingCount = 128
+// Must be a power of 2. Only used when multishot recv is opted into via
+// CELERIS_IOURING_MULTISHOT_RECV=1; the default single-shot-recv path
+// uses per-connection buffers and ignores this ring entirely. 1024
+// supports 1024 concurrent in-flight multishot recvs per worker
+// (128 was too small for the 1500+ conn churn test patterns —
+// ENOBUFS terminations kept burning the per-conn re-arm path).
+// With 8 KB buffers: 1024 × 8 KB = 8 MB per worker.
+const bufRingCount = 1024
 
 // Worker is a per-core io_uring event loop.
 type Worker struct {
@@ -89,6 +92,7 @@ type Worker struct {
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
 	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
+
 	tickCounter uint32
 	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
 
@@ -210,8 +214,27 @@ func (w *Worker) run(ctx context.Context) {
 		}
 	}
 
-	// Register ring-mapped provided buffers for multishot recv.
-	if w.tier.SupportsMultishotRecv() {
+	// Multishot recv + ring-mapped provided buffers is OFF by default.
+	//
+	// Under sustained HTTP/1 Connection:close churn against a client
+	// that pools connections (Go's http.Client with keep-alive of
+	// course does NOT pool closed conns, but load balancers, service
+	// mesh sidecars, and raw-socket benchmarking tools like goceleris/
+	// loadgen all hold a pool of open conns and expect the server to
+	// close them), multishot recv on aarch64 kernel 6.6.10 throttles
+	// the whole worker to ~30 accepts/s / ~90 req/s — a 100× collapse
+	// vs the epoll engine's ~25 k req/s on the identical workload.
+	// The profile showed workers drowning in spurious recv CQEs (25 k
+	// per worker per second against ~50 useful completions), and
+	// disabling multishot recv in favour of single-shot per-conn
+	// recv (the same model epoll uses) recovered churn to ~35 k rps
+	// while costing ≈2 % on keep-alive simple and being a wash on
+	// json-64k / body / headers.
+	//
+	// Opt back in with CELERIS_IOURING_MULTISHOT_RECV=1 for workloads
+	// that are known to be dominated by long-lived keep-alive conns
+	// and that benefit from the CQE-batching multishot provides.
+	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
 			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
@@ -600,17 +623,32 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	}
 
 	newFD := int(c.Res)
-	isFixedFile := w.fixedFiles
+	w.onAcceptedFD(ctx, newFD, now, w.fixedFiles)
 
+	// Re-arm accept when CQE_F_MORE is clear. In single-shot mode this
+	// fires on every CQE. In multishot mode kernel sets F_MORE=1 to say
+	// "more CQEs coming from this SQE"; if F_MORE is clear the multishot
+	// was terminated (kernel backpressure or error) and without re-arming
+	// the worker permanently stops accepting on its listen socket.
+	// Observed on aarch64 kernel 6.6.10: multishot accept silently
+	// terminated under HTTP/1 Connection:close churn pressure, killing
+	// accept throughput on that worker until the engine restarted.
+	if !cqeHasMore(c.Flags) && w.listenFD >= 0 {
+		w.prepareAccept()
+	}
+}
+
+// onAcceptedFD sets up state for a newly accepted fd — builds connState,
+// registers it with the worker, and arms the first recv.
+func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixedFile bool) {
 	// Bounds check: reject FDs outside the flat conn array.
 	if newFD < 0 || newFD >= len(w.conns) {
+		if !isFixedFile {
+			_ = unix.Close(newFD)
+		}
 		w.errCount.Add(1)
 		return
 	}
-
-	// Don't discard accepted connections even when paused — the TCP handshake
-	// already completed and the client expects a response. The listen socket
-	// will be closed within one event loop iteration to prevent further accepts.
 
 	if !isFixedFile {
 		_ = sockopts.ApplyFD(newFD, w.sockOpts)
@@ -619,15 +657,11 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	// via inherited options. TCP_NODELAY etc. must be set post-accept for
 	// non-inherited options — but with fixed files (ACCEPT_DIRECT), the fd field
 	// is actually a fixed file index and we can't call setsockopt on it directly.
-	// Socket options that require per-connection setsockopt are skipped for fixed files.
 
 	bufSize := w.resolved.BufferSize
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	// Tag the per-conn context with this worker's numeric ID — same
-	// plumbing as engine/epoll/loop.go so handlers can pass the affinity
-	// hint to driver pools.
 	connCtx := ctxkit.WithWorkerID(ctx, w.id)
 	cs := acquireConnState(connCtx, newFD, bufSize, w.async)
 	cs.fixedFile = isFixedFile
@@ -637,8 +671,6 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			cs.remoteAddr = sockaddrString(sa)
 		}
 	}
-	// For fixed files (ACCEPT_DIRECT), the CQE result is a fixed file index,
-	// not a real FD. getpeername is not available without a real FD.
 
 	w.conns[newFD] = cs
 	w.connCount++
@@ -659,15 +691,9 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 		cs.detected = true
 		w.initProtocol(cs)
 	}
-	// For Auto mode, cs.detected is false; the first handleRecv will
-	// detect the protocol from the received data before processing it.
 	if !w.prepareRecv(newFD, cs.buf) {
 		cs.needsRecv = true
 		w.markDirty(cs)
-	}
-
-	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() && w.listenFD >= 0 {
-		w.prepareAccept()
 	}
 }
 
@@ -1362,19 +1388,15 @@ func (w *Worker) finishClose(fd int) {
 		return
 	}
 
-	// Half-close before full close: shutdown(SHUT_WR) sends FIN after all
-	// pending data in the socket buffer, preventing RST from discarding
-	// unsent GOAWAY / RST_STREAM frames.
+	// Half-close + drain + sync close. Sync close avoids the async-SQE
+	// pile-up that leaves the fd open until io_uring_enter flushes the
+	// SQ — under sustained Connection:close churn that compounds with
+	// FIN_WAIT_2 to wedge the ephemeral port pool. The fd is
+	// non-blocking; close is a pure descriptor-table op that does not
+	// stall the event loop.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	// Drain receive buffer to prevent RST from discarding unsent data
-	// (close() with unread data in recv buffer causes RST instead of FIN).
 	drainRecvBuffer(fd)
-
-	sqe := w.ring.GetSQE()
-	if sqe != nil {
-		prepClose(sqe, fd)
-		setSQEUserData(sqe, encodeUserData(udClose, fd))
-	}
+	_ = unix.Close(fd)
 }
 
 // finishCloseAny dispatches to finishCloseDetached for detached connections
@@ -1414,14 +1436,17 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		return
 	}
 
+	// Detached connections still use the graceful half-close path —
+	// middleware (WebSocket / SSE) may have queued a close-frame echo
+	// that we want to let finish cleanly, and the middleware goroutine
+	// already drove the protocol handshake to completion before asking
+	// the engine to drop the FD. RST close (as used by closeNonFixedFD
+	// for plain H1/H2) would cut that echo off. The graceful path is
+	// still SYNC (unix.Close directly) to avoid the async-SQE pile-up
+	// that plagued the pre-patch version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
-
-	sqe := w.ring.GetSQE()
-	if sqe != nil {
-		prepClose(sqe, fd)
-		setSQEUserData(sqe, encodeUserData(udClose, fd))
-	}
+	_ = unix.Close(fd)
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
