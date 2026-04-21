@@ -46,6 +46,10 @@ type Session struct {
 	// Stored at pool.New time so the middleware hot path can register it
 	// with c.OnRelease without re-allocating a fresh funcval per request.
 	onReleaseFn func()
+	// dataPoolPtr is the original *map[string]any drawn from
+	// sessionDataPool; retained so returnToPool can Put the same pointer
+	// back, avoiding the classic Put(&localMap) heap alloc trap.
+	dataPoolPtr *map[string]any
 	modified    bool
 	fresh       bool // true for newly created sessions
 	destroyed   bool
@@ -67,10 +71,18 @@ func (s *Session) returnToPool() {
 	}
 	if s.data != nil && s.pooledMap {
 		clear(s.data)
-		m := s.data
-		sessionDataPool.Put(&m)
+		if s.dataPoolPtr != nil {
+			*s.dataPoolPtr = s.data
+			sessionDataPool.Put(s.dataPoolPtr)
+		} else {
+			// Defensive: pooledMap set but no pool ptr (shouldn't
+			// happen after this refactor; handle gracefully anyway).
+			m := s.data
+			sessionDataPool.Put(&m)
+		}
 	}
 	s.data = nil
+	s.dataPoolPtr = nil
 	s.pooledMap = false
 	s.ctx = nil
 	s.releaseCtx = nil
@@ -442,6 +454,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 					return errorHandler(c, derr)
 				}
 				sess.pooledMap = true
+				sess.dataPoolPtr = mp
 			}
 			if data != nil && !absDisabled {
 				// Check absolute timeout.
@@ -485,6 +498,7 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 			mp := sessionDataPool.Get().(*map[string]any)
 			sess.data = *mp
 			sess.pooledMap = true
+			sess.dataPoolPtr = mp
 			if !absDisabled {
 				sess.data[absExpKey] = time.Now().UnixNano()
 			}
