@@ -2,7 +2,7 @@ package celeris
 
 import (
 	"errors"
-	"fmt"
+	"strconv"
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
@@ -63,10 +63,19 @@ type HTTPError struct {
 
 // Error returns a string representation including the status code and message.
 func (e *HTTPError) Error() string {
+	// Direct concat with a 128-byte stack buffer avoids fmt.Sprintf's
+	// formatter-state alloc on the hot auth-deny path, where every
+	// rejected request flows through HTTPError.Error during logging.
+	var buf [128]byte
+	dst := append(buf[:0], "code="...)
+	dst = strconv.AppendInt(dst, int64(e.Code), 10)
+	dst = append(dst, ", message="...)
+	dst = append(dst, e.Message...)
 	if e.Err != nil {
-		return fmt.Sprintf("code=%d, message=%s, err=%v", e.Code, e.Message, e.Err)
+		dst = append(dst, ", err="...)
+		dst = append(dst, e.Err.Error()...)
 	}
-	return fmt.Sprintf("code=%d, message=%s", e.Code, e.Message)
+	return string(dst)
 }
 
 // Unwrap returns the wrapped error for use with errors.Is and errors.As.
