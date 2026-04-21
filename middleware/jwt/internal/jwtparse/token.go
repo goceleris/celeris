@@ -319,13 +319,13 @@ func (p *Parser) ParseWithClaims(tokenString string, claims Claims, keyFunc Keyf
 
 	key, err := keyFunc(token)
 	if err != nil {
-		return token, fmt.Errorf("%w: %w", ErrTokenUnverifiable, err)
+		return token, &wrapErr{outer: ErrTokenUnverifiable, inner: err}
 	}
 
 	// 8. Verify signature. signingInput is a substring of tokenString (zero alloc).
 	signingInput := tokenString[:dot2]
 	if err := method.Verify(signingInput, sig, key); err != nil {
-		return token, fmt.Errorf("%w: %w", ErrTokenSignatureInvalid, err)
+		return token, &wrapErr{outer: ErrTokenSignatureInvalid, inner: err}
 	}
 	// 9. Validate claims with leeway support.
 	if err := claims.Valid(); err != nil {
