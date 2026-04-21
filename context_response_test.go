@@ -1455,6 +1455,31 @@ func TestContextDeleteCookie(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathMapAny checks byte-identity of the map[string]any
+// primitive fast-path against stdlib encoding/json for safe inputs.
+func TestJSONFastPathMapAny(t *testing.T) {
+	cases := []map[string]any{
+		{},
+		{"status": "ok"},
+		{"ok": true, "count": int64(42), "name": "alice"},
+		{"n": nil, "s": "str", "b": false, "i": int64(-7), "u": uint32(1000)},
+	}
+	for _, m := range cases {
+		s, rw := newTestStream("GET", "/test")
+		c := acquireContext(s)
+		if err := c.JSON(200, m); err != nil {
+			t.Fatalf("JSON(%v): %v", m, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(m)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", m, got, want)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}
+
 // TestJSONFastPathMapString checks byte-identity of the map[string]string
 // fast-path against stdlib encoding/json. Any drift here is a bug —
 // the fast path exists to save allocations, not to produce different

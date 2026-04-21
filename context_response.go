@@ -93,9 +93,21 @@ func (c *Context) JSON(code int, v any) error {
 	// the dominant shape of status/error/info API responses. Saves the
 	// ~6 allocations that encoding/json pays for reflection + Encoder
 	// state (mapEncoder.encode, reflect.unsafe_New, etc.).
-	if m, ok := v.(map[string]string); ok {
+	switch m := v.(type) {
+	case map[string]string:
 		bp := jsonFastBufPool.Get().(*[]byte)
 		buf, ok := appendJSONMapString((*bp)[:0], m)
+		if ok {
+			err := c.Blob(code, "application/json", buf)
+			*bp = buf
+			jsonFastBufPool.Put(bp)
+			return err
+		}
+		*bp = (*bp)[:0]
+		jsonFastBufPool.Put(bp)
+	case map[string]any:
+		bp := jsonFastBufPool.Get().(*[]byte)
+		buf, ok := appendJSONMapAny((*bp)[:0], m)
 		if ok {
 			err := c.Blob(code, "application/json", buf)
 			*bp = buf
@@ -120,37 +132,60 @@ func (c *Context) JSON(code int, v any) error {
 	return err
 }
 
+// jsonFastMaxKeys caps the number of entries the map fast paths
+// handle. Keeps the key-sort stack buffer finite; larger maps fall
+// back to encoding/json. Captures the 99th percentile of status /
+// error / info response shapes.
+const jsonFastMaxKeys = 16
+
 // appendJSONMapString appends a JSON object encoding m to dst and
 // returns the extended slice, iff every key and value is ASCII-safe
-// (bytes 0x20..0x7E excluding quote and backslash). Returns (nil,
-// false) to signal the caller should fall back to full encoding/json.
+// (bytes 0x20..0x7E excluding quote and backslash) and the map has at
+// most jsonFastMaxKeys entries. Returns (nil, false) to signal the
+// caller should fall back to full encoding/json.
 //
-// Safety rationale: stdlib json.Encoder with SetEscapeHTML(false)
-// emits these bytes verbatim, so the fast path's output is
-// byte-identical to stdlib for safe inputs. Non-ASCII, control
-// chars, quote, backslash all bail — the fast path never produces
-// a JSON string that differs from what encoding/json would.
+// Keys are emitted in lexicographic order to match stdlib
+// json.Encoder's map key ordering, so the output is byte-identical to
+// what encoding/json would produce with SetEscapeHTML(false) on safe
+// inputs.
 func appendJSONMapString(dst []byte, m map[string]string) ([]byte, bool) {
+	if len(m) > jsonFastMaxKeys {
+		return nil, false
+	}
+	var keyBuf [jsonFastMaxKeys]string
+	keys := keyBuf[:0]
 	for k, v := range m {
 		if !jsonIsSafeASCII(k) || !jsonIsSafeASCII(v) {
 			return nil, false
 		}
+		keys = append(keys, k)
 	}
+	sortJSONKeys(keys)
 	dst = append(dst, '{')
-	first := true
-	for k, v := range m {
-		if !first {
+	for i, k := range keys {
+		if i > 0 {
 			dst = append(dst, ',')
 		}
-		first = false
 		dst = append(dst, '"')
 		dst = append(dst, k...)
 		dst = append(dst, '"', ':', '"')
-		dst = append(dst, v...)
+		dst = append(dst, m[k]...)
 		dst = append(dst, '"')
 	}
 	dst = append(dst, '}')
 	return dst, true
+}
+
+// sortJSONKeys is an in-place insertion sort for the small key slices
+// the JSON fast paths produce (≤ jsonFastMaxKeys = 16 entries). Avoids
+// the interface-conversion heap alloc that sort.Strings would require
+// and is competitive with quicksort at these sizes.
+func sortJSONKeys(keys []string) {
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
 }
 
 // jsonIsSafeASCII reports whether every byte of s can be emitted
@@ -165,6 +200,119 @@ func jsonIsSafeASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// appendJSONMapAny appends a JSON object encoding m to dst iff every
+// key is ASCII-safe and every value is a primitive type that encodes
+// to the exact same bytes as stdlib encoding/json would emit. Returns
+// (nil, false) to fall back otherwise.
+//
+// Covered primitive types: string (ASCII-safe), bool, int*, uint*
+// (excluding uint64 > math.MaxInt64 which stdlib emits as a string
+// under some modes), float32/float64 (non-NaN/non-Inf), nil.
+func appendJSONMapAny(dst []byte, m map[string]any) ([]byte, bool) {
+	if len(m) > jsonFastMaxKeys {
+		return nil, false
+	}
+	var keyBuf [jsonFastMaxKeys]string
+	keys := keyBuf[:0]
+	for k, v := range m {
+		if !jsonIsSafeASCII(k) || !jsonPrimitiveSafe(v) {
+			return nil, false
+		}
+		keys = append(keys, k)
+	}
+	sortJSONKeys(keys)
+	dst = append(dst, '{')
+	for i, k := range keys {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, '"')
+		dst = append(dst, k...)
+		dst = append(dst, '"', ':')
+		dst = appendJSONPrimitive(dst, m[k])
+	}
+	dst = append(dst, '}')
+	return dst, true
+}
+
+// jsonPrimitiveSafe reports whether v is a primitive value the fast
+// path can emit byte-identically to stdlib encoding/json.
+func jsonPrimitiveSafe(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return true
+	case string:
+		return jsonIsSafeASCII(x)
+	case int, int8, int16, int32, int64:
+		return true
+	case uint8, uint16, uint32:
+		return true
+	case uint, uint64, uintptr:
+		// stdlib emits these as decimal integers; same path.
+		return true
+	case float32:
+		return !isNaNOrInf32(x)
+	case float64:
+		return !isNaNOrInf64(x)
+	}
+	return false
+}
+
+// appendJSONPrimitive writes v's primitive encoding into dst. Caller
+// must have verified v with jsonPrimitiveSafe.
+func appendJSONPrimitive(dst []byte, v any) []byte {
+	switch x := v.(type) {
+	case nil:
+		return append(dst, "null"...)
+	case bool:
+		if x {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	case string:
+		dst = append(dst, '"')
+		dst = append(dst, x...)
+		return append(dst, '"')
+	case int:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int8:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int16:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int32:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int64:
+		return strconv.AppendInt(dst, x, 10)
+	case uint8:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint16:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint32:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint64:
+		return strconv.AppendUint(dst, x, 10)
+	case uintptr:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case float32:
+		return strconv.AppendFloat(dst, float64(x), 'g', -1, 32)
+	case float64:
+		return strconv.AppendFloat(dst, x, 'g', -1, 64)
+	}
+	// Unreachable — jsonPrimitiveSafe gates this switch.
+	return dst
+}
+
+func isNaNOrInf32(f float32) bool {
+	return f != f || f > 3.4e38 || f < -3.4e38
+}
+func isNaNOrInf64(f float64) bool {
+	return f != f || f > 1.7e308 || f < -1.7e308
 }
 
 // XML serializes v as XML and writes it with the given status code.
