@@ -550,7 +550,6 @@ func (c *Context) parseForm() error {
 	}
 	c.extended = true
 	c.formParsed = true
-	c.formValues = make(url.Values) // always init before error paths
 	ct := c.Header("content-type")
 	mediaType, mparams, _ := mime.ParseMediaType(ct)
 	body := c.Body()
@@ -570,6 +569,7 @@ func (c *Context) parseForm() error {
 			return NewHTTPError(400, "celeris: invalid multipart form").WithError(err)
 		}
 		c.multipartForm = form
+		c.formValues = make(url.Values, len(form.Value))
 		for k, vs := range form.Value {
 			c.formValues[k] = vs
 		}
@@ -580,6 +580,11 @@ func (c *Context) parseForm() error {
 		}
 		c.formValues = vals
 	}
+	// Unknown / missing content-type: leave c.formValues nil; url.Values's
+	// methods (Get, len, index) all handle nil safely, so FormValue /
+	// FormValueOK work unchanged — skipping the make() saves one alloc per
+	// FormValue call on requests without a form body (e.g., the
+	// methodoverride header-only path).
 	return nil
 }
 
