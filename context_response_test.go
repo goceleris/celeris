@@ -1455,6 +1455,32 @@ func TestContextDeleteCookie(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathSliceString checks byte-identity of the []string
+// fast path against stdlib encoding/json for safe inputs.
+func TestJSONFastPathSliceString(t *testing.T) {
+	cases := [][]string{
+		nil,
+		{},
+		{"a"},
+		{"one", "two", "three"},
+		{"", "middle", ""},
+	}
+	for _, s := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, s); err != nil {
+			t.Fatalf("JSON(%v): %v", s, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(s)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", s, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
 // TestJSONFastPathFallbacks checks that values the fast path cannot
 // emit byte-identically (floats, non-ASCII strings, nested structures)
 // fall through to stdlib encoding/json rather than being emitted

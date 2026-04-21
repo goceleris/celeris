@@ -116,6 +116,17 @@ func (c *Context) JSON(code int, v any) error {
 		}
 		*bp = (*bp)[:0]
 		jsonFastBufPool.Put(bp)
+	case []string:
+		bp := jsonFastBufPool.Get().(*[]byte)
+		buf, ok := appendJSONSliceString((*bp)[:0], m)
+		if ok {
+			err := c.Blob(code, "application/json", buf)
+			*bp = buf
+			jsonFastBufPool.Put(bp)
+			return err
+		}
+		*bp = (*bp)[:0]
+		jsonFastBufPool.Put(bp)
 	}
 	js := jsonEncPool.Get().(*jsonState)
 	js.buf.Reset()
@@ -210,6 +221,32 @@ func jsonIsSafeASCII(s string) bool {
 // Covered primitive types: string (ASCII-safe), bool, int*, uint*
 // (excluding uint64 > math.MaxInt64 which stdlib emits as a string
 // under some modes), float32/float64 (non-NaN/non-Inf), nil.
+// appendJSONSliceString appends a JSON array encoding of s to dst iff
+// every element is ASCII-safe. Preserves slice order (slices have no
+// randomization). Matches stdlib byte output for safe inputs — nil
+// slices encode as "null", non-nil slices as "[...]" even when empty.
+func appendJSONSliceString(dst []byte, s []string) ([]byte, bool) {
+	if s == nil {
+		return append(dst, "null"...), true
+	}
+	for i := range s {
+		if !jsonIsSafeASCII(s[i]) {
+			return nil, false
+		}
+	}
+	dst = append(dst, '[')
+	for i, v := range s {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, '"')
+		dst = append(dst, v...)
+		dst = append(dst, '"')
+	}
+	dst = append(dst, ']')
+	return dst, true
+}
+
 func appendJSONMapAny(dst []byte, m map[string]any) ([]byte, bool) {
 	if len(m) > jsonFastMaxKeys {
 		return nil, false
