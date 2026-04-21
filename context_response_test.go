@@ -1455,6 +1455,47 @@ func TestContextDeleteCookie(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathNested checks byte-identity for nested shapes: maps
+// containing slices, slices containing maps, etc. These are the
+// realistic list+envelope shapes of production API traffic, where the
+// fast path saves the most allocations vs encoding/json.
+func TestJSONFastPathNested(t *testing.T) {
+	cases := []any{
+		map[string]any{
+			"data": []any{
+				map[string]string{"id": "1", "name": "alice"},
+				map[string]string{"id": "2", "name": "bob"},
+			},
+			"total": int64(2),
+		},
+		map[string]any{
+			"items": []string{"a", "b", "c"},
+			"ok":    true,
+		},
+		[]any{
+			map[string]string{"k": "v"},
+			"bare",
+			int64(42),
+			nil,
+			true,
+		},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
 // TestJSONFastPathSliceString checks byte-identity of the []string
 // fast path against stdlib encoding/json for safe inputs.
 func TestJSONFastPathSliceString(t *testing.T) {

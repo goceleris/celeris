@@ -89,44 +89,18 @@ var jsonFastBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); ret
 // JSON serializes v as JSON and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) JSON(code int, v any) error {
-	// Fast path: map[string]string with ASCII-safe keys and values —
-	// the dominant shape of status/error/info API responses. Saves the
-	// ~6 allocations that encoding/json pays for reflection + Encoder
-	// state (mapEncoder.encode, reflect.unsafe_New, etc.).
-	switch m := v.(type) {
-	case map[string]string:
+	// Fast path: primitive/map/slice shapes the reflection-free
+	// encoder can emit byte-identically to stdlib encoding/json.
+	// Nested maps and slices are supported recursively — covers the
+	// bulk of JSON-over-HTTP traffic (status envelopes, list endpoints,
+	// {"data": [...]} shapes). See jsonSafeValue for the whitelist.
+	if jsonSafeValue(v) {
 		bp := jsonFastBufPool.Get().(*[]byte)
-		buf, ok := appendJSONMapString((*bp)[:0], m)
-		if ok {
-			err := c.Blob(code, "application/json", buf)
-			*bp = buf
-			jsonFastBufPool.Put(bp)
-			return err
-		}
-		*bp = (*bp)[:0]
+		buf := appendJSONValue((*bp)[:0], v)
+		err := c.Blob(code, "application/json", buf)
+		*bp = buf
 		jsonFastBufPool.Put(bp)
-	case map[string]any:
-		bp := jsonFastBufPool.Get().(*[]byte)
-		buf, ok := appendJSONMapAny((*bp)[:0], m)
-		if ok {
-			err := c.Blob(code, "application/json", buf)
-			*bp = buf
-			jsonFastBufPool.Put(bp)
-			return err
-		}
-		*bp = (*bp)[:0]
-		jsonFastBufPool.Put(bp)
-	case []string:
-		bp := jsonFastBufPool.Get().(*[]byte)
-		buf, ok := appendJSONSliceString((*bp)[:0], m)
-		if ok {
-			err := c.Blob(code, "application/json", buf)
-			*bp = buf
-			jsonFastBufPool.Put(bp)
-			return err
-		}
-		*bp = (*bp)[:0]
-		jsonFastBufPool.Put(bp)
+		return err
 	}
 	js := jsonEncPool.Get().(*jsonState)
 	js.buf.Reset()
@@ -149,140 +123,12 @@ func (c *Context) JSON(code int, v any) error {
 // error / info response shapes.
 const jsonFastMaxKeys = 16
 
-// appendJSONMapString appends a JSON object encoding m to dst and
-// returns the extended slice, iff every key and value is ASCII-safe
-// (bytes 0x20..0x7E excluding quote and backslash) and the map has at
-// most jsonFastMaxKeys entries. Returns (nil, false) to signal the
-// caller should fall back to full encoding/json.
-//
-// Keys are emitted in lexicographic order to match stdlib
-// json.Encoder's map key ordering, so the output is byte-identical to
-// what encoding/json would produce with SetEscapeHTML(false) on safe
-// inputs.
-func appendJSONMapString(dst []byte, m map[string]string) ([]byte, bool) {
-	if len(m) > jsonFastMaxKeys {
-		return nil, false
-	}
-	var keyBuf [jsonFastMaxKeys]string
-	keys := keyBuf[:0]
-	for k, v := range m {
-		if !jsonIsSafeASCII(k) || !jsonIsSafeASCII(v) {
-			return nil, false
-		}
-		keys = append(keys, k)
-	}
-	sortJSONKeys(keys)
-	dst = append(dst, '{')
-	for i, k := range keys {
-		if i > 0 {
-			dst = append(dst, ',')
-		}
-		dst = append(dst, '"')
-		dst = append(dst, k...)
-		dst = append(dst, '"', ':', '"')
-		dst = append(dst, m[k]...)
-		dst = append(dst, '"')
-	}
-	dst = append(dst, '}')
-	return dst, true
-}
-
-// sortJSONKeys is an in-place insertion sort for the small key slices
-// the JSON fast paths produce (≤ jsonFastMaxKeys = 16 entries). Avoids
-// the interface-conversion heap alloc that sort.Strings would require
-// and is competitive with quicksort at these sizes.
-func sortJSONKeys(keys []string) {
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
-			keys[j-1], keys[j] = keys[j], keys[j-1]
-		}
-	}
-}
-
-// jsonIsSafeASCII reports whether every byte of s can be emitted
-// verbatim inside a JSON string without escaping — i.e. printable
-// ASCII except the two characters that MUST be escaped (" and \).
-// Callers fall back to stdlib encoding when this returns false.
-func jsonIsSafeASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
-			return false
-		}
-	}
-	return true
-}
-
-// appendJSONMapAny appends a JSON object encoding m to dst iff every
-// key is ASCII-safe and every value is a primitive type that encodes
-// to the exact same bytes as stdlib encoding/json would emit. Returns
-// (nil, false) to fall back otherwise.
-//
-// Covered primitive types: string (ASCII-safe), bool, int*, uint*
-// (excluding uint64 > math.MaxInt64 which stdlib emits as a string
-// under some modes), float32/float64 (non-NaN/non-Inf), nil.
-// appendJSONSliceString appends a JSON array encoding of s to dst iff
-// every element is ASCII-safe. Preserves slice order (slices have no
-// randomization). Matches stdlib byte output for safe inputs — nil
-// slices encode as "null", non-nil slices as "[...]" even when empty.
-func appendJSONSliceString(dst []byte, s []string) ([]byte, bool) {
-	if s == nil {
-		return append(dst, "null"...), true
-	}
-	for i := range s {
-		if !jsonIsSafeASCII(s[i]) {
-			return nil, false
-		}
-	}
-	dst = append(dst, '[')
-	for i, v := range s {
-		if i > 0 {
-			dst = append(dst, ',')
-		}
-		dst = append(dst, '"')
-		dst = append(dst, v...)
-		dst = append(dst, '"')
-	}
-	dst = append(dst, ']')
-	return dst, true
-}
-
-func appendJSONMapAny(dst []byte, m map[string]any) ([]byte, bool) {
-	if len(m) > jsonFastMaxKeys {
-		return nil, false
-	}
-	var keyBuf [jsonFastMaxKeys]string
-	keys := keyBuf[:0]
-	for k, v := range m {
-		if !jsonIsSafeASCII(k) || !jsonPrimitiveSafe(v) {
-			return nil, false
-		}
-		keys = append(keys, k)
-	}
-	sortJSONKeys(keys)
-	dst = append(dst, '{')
-	for i, k := range keys {
-		if i > 0 {
-			dst = append(dst, ',')
-		}
-		dst = append(dst, '"')
-		dst = append(dst, k...)
-		dst = append(dst, '"', ':')
-		dst = appendJSONPrimitive(dst, m[k])
-	}
-	dst = append(dst, '}')
-	return dst, true
-}
-
-// jsonPrimitiveSafe reports whether v is a primitive value the fast
-// path can emit byte-identically to stdlib encoding/json.
-//
-// Floats are deliberately excluded — stdlib's float encoder uses
-// 'f' format for values in [1e-6, 1e21) and 'e' with an exponent-cleanup
-// pass outside that window, neither of which matches a plain
-// strconv.AppendFloat call. Any map with float values falls back to
-// encoding/json so the output stays byte-identical.
-func jsonPrimitiveSafe(v any) bool {
+// jsonSafeValue reports whether v and all nested values are shapes
+// and primitives the reflection-free encoder can emit byte-identically
+// to stdlib encoding/json. Floats, non-ASCII strings, maps with >16
+// keys, and anything outside the explicit whitelist fall through to
+// encoding/json — the fast path never emits a divergent byte.
+func jsonSafeValue(v any) bool {
 	switch x := v.(type) {
 	case nil:
 		return true
@@ -290,12 +136,42 @@ func jsonPrimitiveSafe(v any) bool {
 		return true
 	case string:
 		return jsonIsSafeASCII(x)
-	case int, int8, int16, int32, int64:
+	case int, int8, int16, int32, int64,
+		uint8, uint16, uint32, uint, uint64, uintptr:
 		return true
-	case uint8, uint16, uint32:
+	case map[string]string:
+		if len(x) > jsonFastMaxKeys {
+			return false
+		}
+		for k, v := range x {
+			if !jsonIsSafeASCII(k) || !jsonIsSafeASCII(v) {
+				return false
+			}
+		}
 		return true
-	case uint, uint64, uintptr:
-		// stdlib emits these as decimal integers; same path.
+	case map[string]any:
+		if len(x) > jsonFastMaxKeys {
+			return false
+		}
+		for k, v := range x {
+			if !jsonIsSafeASCII(k) || !jsonSafeValue(v) {
+				return false
+			}
+		}
+		return true
+	case []string:
+		for i := range x {
+			if !jsonIsSafeASCII(x[i]) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for i := range x {
+			if !jsonSafeValue(x[i]) {
+				return false
+			}
+		}
 		return true
 	default:
 		_ = x
@@ -303,9 +179,11 @@ func jsonPrimitiveSafe(v any) bool {
 	}
 }
 
-// appendJSONPrimitive writes v's primitive encoding into dst. Caller
-// must have verified v with jsonPrimitiveSafe.
-func appendJSONPrimitive(dst []byte, v any) []byte {
+// appendJSONValue emits v's JSON encoding into dst. Caller must have
+// verified v via jsonSafeValue — any other input results in undefined
+// output. Output is byte-identical to what encoding/json with
+// SetEscapeHTML(false) would produce.
+func appendJSONValue(dst []byte, v any) []byte {
 	switch x := v.(type) {
 	case nil:
 		return append(dst, "null"...)
@@ -340,11 +218,100 @@ func appendJSONPrimitive(dst []byte, v any) []byte {
 		return strconv.AppendUint(dst, x, 10)
 	case uintptr:
 		return strconv.AppendUint(dst, uint64(x), 10)
+	case map[string]string:
+		var keyBuf [jsonFastMaxKeys]string
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sortJSONKeys(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':', '"')
+			dst = append(dst, x[k]...)
+			dst = append(dst, '"')
+		}
+		return append(dst, '}')
+	case map[string]any:
+		var keyBuf [jsonFastMaxKeys]string
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sortJSONKeys(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':')
+			dst = appendJSONValue(dst, x[k])
+		}
+		return append(dst, '}')
+	case []string:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, s := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, s...)
+			dst = append(dst, '"')
+		}
+		return append(dst, ']')
+	case []any:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, e := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONValue(dst, e)
+		}
+		return append(dst, ']')
 	}
-	// Unreachable — jsonPrimitiveSafe gates this switch.
 	return dst
 }
 
+// sortJSONKeys is an in-place insertion sort for the small key slices
+// the JSON fast paths produce (≤ jsonFastMaxKeys = 16 entries). Avoids
+// the interface-conversion heap alloc that sort.Strings would require
+// and is competitive with quicksort at these sizes.
+func sortJSONKeys(keys []string) {
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+}
+
+// jsonIsSafeASCII reports whether every byte of s can be emitted
+// verbatim inside a JSON string without escaping — i.e. printable
+// ASCII except the two characters that MUST be escaped (" and \).
+// Callers fall back to stdlib encoding when this returns false.
+func jsonIsSafeASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7E || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+// appendJSONMapAny appends a JSON object encoding m to dst iff every
 // XML serializes v as XML and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) XML(code int, v any) error {
