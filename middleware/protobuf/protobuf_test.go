@@ -449,3 +449,21 @@ func BenchmarkVsJSON(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkUnmarshalInvalid exercises the invalid-proto error path.
+// Hit on malformed client requests, content-type mismatches, or
+// mis-configured clients sending JSON over application/x-protobuf.
+func BenchmarkUnmarshalInvalid(b *testing.B) {
+	// Garbage bytes that won't parse as any wrapperspb type.
+	data := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("POST", "/bench",
+			celeristest.WithBody(data),
+			celeristest.WithContentType(ContentType))
+		var out wrapperspb.StringValue
+		_ = BindProtoBuf(ctx, &out)
+		celeristest.ReleaseContext(ctx)
+	}
+}
