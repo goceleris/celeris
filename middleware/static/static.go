@@ -54,6 +54,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		cleanRoot = filepath.Clean(root)
 	}
 
+	// Precompute the cache-control header once — maxAge is closure-constant,
+	// so rebuilding "public, max-age=N" per request wasted an alloc + an
+	// strconv.Itoa on every cache-hit response.
+	var cacheControl string
+	if maxAge > 0 {
+		cacheControl = "public, max-age=" + strconv.Itoa(int(maxAge.Seconds()))
+	}
+
 	// Per-file cache for fs.FS content. Since fs.FS is immutable (especially
 	// embed.FS), caching avoids repeated heap allocations for the same file.
 	var fsCache sync.Map // map[string]*cachedFile
@@ -90,16 +98,16 @@ func New(config ...Config) celeris.HandlerFunc {
 		filePath = strings.TrimSuffix(filePath, "/")
 
 		if fsys != nil {
-			return serveFS(c, fsys, filePath, index, browse, spa, compress, maxAge, &fsCache)
+			return serveFS(c, fsys, filePath, index, browse, spa, compress, cacheControl, &fsCache)
 		}
-		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge, compress)
+		return serveOS(c, cleanRoot, filePath, index, browse, spa, cacheControl, compress)
 	}
 }
 
 // serveOS serves a file from the OS filesystem using c.FileFromDir (which
 // handles directory traversal, symlink escape, and range requests).
 // cleanRoot must be filepath.Clean(root) — precomputed by New.
-func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, maxAge time.Duration, compress bool) error {
+func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, cacheControl string, compress bool) error {
 	fullPath := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
 
 	// Prevent directory traversal: filepath.Join resolves ".." segments,
@@ -146,7 +154,7 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		}
 	}
 
-	etag := setCacheHeaders(c, info.ModTime(), info.Size(), maxAge)
+	etag := setCacheHeaders(c, info.ModTime(), info.Size(), cacheControl)
 	if notModified(c, etag, info.ModTime()) {
 		return c.NoContent(304)
 	}
@@ -190,7 +198,7 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
-func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, maxAge time.Duration, cache *sync.Map) error {
+func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, cacheControl string, cache *sync.Map) error {
 	// 1. Open + stat + directory handling.
 	openPath := filePath
 	if openPath == "" {
@@ -200,7 +208,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	f, err := fsys.Open(openPath)
 	if err != nil {
 		if spa {
-			return serveFS(c, fsys, index, index, browse, false, compress, maxAge, cache)
+			return serveFS(c, fsys, index, index, browse, false, compress, cacheControl, cache)
 		}
 		return c.Next()
 	}
@@ -224,7 +232,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			indexStat, statErr := indexFile.Stat()
 			_ = indexFile.Close()
 			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse, spa, compress, maxAge, cache)
+				return serveFS(c, fsys, indexPath, index, browse, spa, compress, cacheControl, cache)
 			}
 		}
 		if browse {
@@ -242,7 +250,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	// 3. Cache headers + 304 check.
 	modTime := stat.ModTime()
 	if !modTime.IsZero() {
-		etag := setCacheHeaders(c, modTime, size, maxAge)
+		etag := setCacheHeaders(c, modTime, size, cacheControl)
 		if notModified(c, etag, modTime) {
 			return c.NoContent(304)
 		}
@@ -406,7 +414,7 @@ func sniffContentType(rs io.ReadSeeker, filePath string) string {
 // is emitted. The mtime/size form static uses is preferable for static
 // files (no body hash required); etag's CRC-32 fallback only runs when no
 // ETag header is set.
-func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, maxAge time.Duration) string {
+func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, cacheControl string) string {
 	if modTime.IsZero() {
 		return ""
 	}
@@ -422,8 +430,8 @@ func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, maxAge t
 	dst = append(dst, '"')
 	etag := string(dst)
 	c.SetHeader("etag", etag)
-	if maxAge > 0 {
-		c.SetHeader("cache-control", "public, max-age="+strconv.Itoa(int(maxAge.Seconds())))
+	if cacheControl != "" {
+		c.SetHeader("cache-control", cacheControl)
 	}
 	return etag
 }
