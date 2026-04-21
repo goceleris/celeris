@@ -1522,6 +1522,36 @@ func TestJSONFastPathSliceString(t *testing.T) {
 	}
 }
 
+// TestJSONFastPathFloats verifies the float format matches stdlib's
+// 1e-6/1e21 mode switch + exponent cleanup byte-for-byte. NaN/Inf
+// must continue to bail (stdlib returns an error for those).
+func TestJSONFastPathFloats(t *testing.T) {
+	cases := []any{
+		map[string]any{"zero": 0.0},
+		map[string]any{"one": 1.0},
+		map[string]any{"neg": -1.5},
+		map[string]any{"pi": 3.14},
+		map[string]any{"small": 1e-7},
+		map[string]any{"big": 1e20},
+		map[string]any{"mixed": []any{1e-7, 1e20, 0.5, -3.14}},
+		map[string]any{"f32": float32(2.5)},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
 // TestJSONFastPathPrimitiveSlices verifies []int, []int64, []uint64,
 // []bool fast paths against stdlib byte output.
 func TestJSONFastPathPrimitiveSlices(t *testing.T) {
@@ -1620,15 +1650,19 @@ func TestJSONFastPathUTF8(t *testing.T) {
 // emit byte-identically fall through to stdlib encoding/json rather
 // than being emitted incorrectly by the fast path.
 func TestJSONFastPathFallbacks(t *testing.T) {
+	// Every case below still takes the fast path now (float/escaped
+	// strings/nested slices are all supported). The test still serves
+	// as a byte-identity regression guard for the edge-case shapes we
+	// claim to handle.
 	cases := []any{
-		map[string]any{"pi": 3.14},                             // float — stdlib's format differs from strconv
-		map[string]any{"big": 1e20},                            // large float
-		map[string]string{"msg": "she said \"hi\""},            // embedded quote → stdlib escapes
-		map[string]string{"path": "C:\\Users"},                 // backslash
-		map[string]string{"ln": "line1\nline2"},                // control char
-		map[string]string{"sep": "\u2028line"},                 // U+2028 separator — stdlib escapes even with HTML off
-		map[string]string{"sep2": "para\u2029break"},           // U+2029 paragraph separator
-		map[string]any{"list": []int{1, 2}},                    // []int slice — not covered yet
+		map[string]any{"pi": 3.14},
+		map[string]any{"big": 1e20},
+		map[string]string{"msg": "she said \"hi\""},
+		map[string]string{"path": "C:\\Users"},
+		map[string]string{"ln": "line1\nline2"},
+		map[string]string{"sep": "\u2028line"},
+		map[string]string{"sep2": "para\u2029break"},
+		map[string]any{"list": []int{1, 2}},
 	}
 	for _, v := range cases {
 		s, rw := newTestStream("GET", "/test")

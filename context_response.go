@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -140,6 +141,11 @@ func jsonSafeValue(v any) bool {
 	case int, int8, int16, int32, int64,
 		uint8, uint16, uint32, uint, uint64, uintptr:
 		return true
+	case float32:
+		f := float64(x)
+		return !math.IsNaN(f) && !math.IsInf(f, 0)
+	case float64:
+		return !math.IsNaN(x) && !math.IsInf(x, 0)
 	case map[string]string:
 		if len(x) > jsonFastMaxKeys {
 			return false
@@ -223,6 +229,10 @@ func appendJSONValue(dst []byte, v any) []byte {
 		return strconv.AppendUint(dst, x, 10)
 	case uintptr:
 		return strconv.AppendUint(dst, uint64(x), 10)
+	case float32:
+		return appendJSONFloat(dst, float64(x))
+	case float64:
+		return appendJSONFloat(dst, x)
 	case map[string]string:
 		var keyBuf [jsonFastMaxKeys]string
 		keys := keyBuf[:0]
@@ -349,6 +359,28 @@ func sortJSONKeys(keys []string) {
 			keys[j-1], keys[j] = keys[j], keys[j-1]
 		}
 	}
+}
+
+// appendJSONFloat emits f using stdlib encoding/json's format rules:
+// 'f' notation inside [1e-6, 1e21) and 'e' outside. The exponent
+// gets stdlib's "e-09 → e-9" cleanup pass. Caller must have
+// excluded NaN/Inf via jsonSafeValue.
+func appendJSONFloat(dst []byte, f float64) []byte {
+	abs := math.Abs(f)
+	format := byte('f')
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	start := len(dst)
+	dst = strconv.AppendFloat(dst, f, format, -1, 64)
+	if format == 'e' {
+		n := len(dst)
+		if n-start >= 4 && dst[n-4] == 'e' && dst[n-3] == '-' && dst[n-2] == '0' {
+			dst[n-2] = dst[n-1]
+			dst = dst[:n-1]
+		}
+	}
+	return dst
 }
 
 // appendJSONString writes s as a JSON-quoted string with stdlib-
