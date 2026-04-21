@@ -289,6 +289,10 @@ func defaultKeyGenerator(vary []string) func(*celeris.Context) string {
 }
 
 func sortedQuery(rq string) string {
+	// Single-param fast path: no split/sort/join allocations.
+	if strings.IndexByte(rq, '&') < 0 {
+		return rq
+	}
 	parts := strings.Split(rq, "&")
 	sort.Strings(parts)
 	return strings.Join(parts, "&")
