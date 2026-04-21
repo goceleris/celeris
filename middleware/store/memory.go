@@ -117,16 +117,31 @@ func (m *MemoryKV) Get(_ context.Context, key string) ([]byte, error) {
 
 // Set implements [KV]. A ttl <= 0 stores the value with no expiry.
 func (m *MemoryKV) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
-	cp := make([]byte, len(value))
-	copy(cp, value)
 	var exp int64
 	if ttl > 0 {
 		exp = time.Now().Add(ttl).UnixNano()
 	}
 	s := m.shard(key)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Update-in-place: if an entry already exists and its backing
+	// array is large enough, reuse it. Session middleware's per-request
+	// Save hits this path repeatedly on the same session id.
+	if existing, ok := s.items[key]; ok {
+		if cap(existing.value) >= len(value) {
+			existing.value = existing.value[:len(value)]
+			copy(existing.value, value)
+		} else {
+			cp := make([]byte, len(value))
+			copy(cp, value)
+			existing.value = cp
+		}
+		existing.expiry = exp
+		return nil
+	}
+	cp := make([]byte, len(value))
+	copy(cp, value)
 	s.items[key] = &memItem{value: cp, expiry: exp}
-	s.mu.Unlock()
 	return nil
 }
 
