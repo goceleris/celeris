@@ -2,6 +2,7 @@ package healthcheck
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"time"
 
@@ -28,6 +29,16 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 	cfg = applyDefaults(cfg)
 	cfg.validate()
+	// Detect whether each checker is still the built-in always-true
+	// default (either because the caller left it nil or because it was
+	// filled by applyDefaults). Those defaults are trivial, so the
+	// goroutine/channel/context.WithTimeout scaffolding in runChecker is
+	// pure overhead — force FastPathTimeout for them regardless of what
+	// CheckerTimeout says. Non-default checkers keep the user-configured
+	// timeout.
+	liveDefault := isDefaultChecker(cfg.LiveChecker, defaultConfig.LiveChecker)
+	readyDefault := isDefaultChecker(cfg.ReadyChecker, defaultConfig.ReadyChecker)
+	startDefault := isDefaultChecker(cfg.StartChecker, defaultConfig.StartChecker)
 
 	livePath := cfg.LivePath
 	readyPath := cfg.ReadyPath
@@ -36,7 +47,18 @@ func New(config ...Config) celeris.HandlerFunc {
 	liveChecker := cfg.LiveChecker
 	readyChecker := cfg.ReadyChecker
 	startChecker := cfg.StartChecker
-	checkerTimeout := cfg.CheckerTimeout
+	liveTimeout := cfg.CheckerTimeout
+	readyTimeout := cfg.CheckerTimeout
+	startTimeout := cfg.CheckerTimeout
+	if liveDefault {
+		liveTimeout = FastPathTimeout
+	}
+	if readyDefault {
+		readyTimeout = FastPathTimeout
+	}
+	if startDefault {
+		startTimeout = FastPathTimeout
+	}
 
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
@@ -56,16 +78,28 @@ func New(config ...Config) celeris.HandlerFunc {
 		var ok bool
 		switch {
 		case livePath != "" && path == livePath:
-			ok = runChecker(liveChecker, c, checkerTimeout)
+			ok = runChecker(liveChecker, c, liveTimeout)
 		case readyPath != "" && path == readyPath:
-			ok = runChecker(readyChecker, c, checkerTimeout)
+			ok = runChecker(readyChecker, c, readyTimeout)
 		case startPath != "" && path == startPath:
-			ok = runChecker(startChecker, c, checkerTimeout)
+			ok = runChecker(startChecker, c, startTimeout)
 		default:
 			return c.Next()
 		}
 		return respond(c, ok, method == "HEAD")
 	}
+}
+
+// isDefaultChecker reports whether checker is (a literal function
+// value equal to) def. Used to detect whether the caller accepted the
+// built-in always-true default so New can force FastPathTimeout and
+// skip the context.WithTimeout + goroutine + channel scaffolding that
+// only matters for checkers that might actually block.
+func isDefaultChecker(checker, def Checker) bool {
+	if checker == nil || def == nil {
+		return false
+	}
+	return reflect.ValueOf(checker).Pointer() == reflect.ValueOf(def).Pointer()
 }
 
 // runChecker runs the health checker. When timeout is positive, the
