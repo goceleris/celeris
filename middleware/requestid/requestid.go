@@ -28,12 +28,14 @@ const maxIDLen = 128
 
 // FromContext returns the request ID from the context store.
 // Returns an empty string if no request ID was stored.
+//
+// Uses [celeris.Context.GetString] so the lookup covers all three
+// sources: the dedicated requestID field set by
+// [celeris.Context.SetRequestID] (preferred, zero-alloc), the stringKeys
+// map from [celeris.Context.SetString], and the any-typed c.keys map
+// from user code that called c.Set(ContextKey, id) directly.
 func FromContext(c *celeris.Context) string {
-	v, ok := c.Get(ContextKey)
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
+	s, _ := c.GetString(ContextKey)
 	return s
 }
 

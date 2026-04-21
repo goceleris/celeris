@@ -428,7 +428,12 @@ func (c *Context) SetString(key, value string) {
 
 // GetString returns the string value stored under key by
 // [Context.SetString], or ("", false) if absent. Also falls back to
-// any-typed values written via [Context.Set] for back-compat.
+// any-typed values written via [Context.Set] for back-compat, and to
+// [Context.SetRequestID] when key == [RequestIDKey].
+//
+// Unlike Gin's single-return GetString, celeris returns ("", false)
+// on absent keys so callers can distinguish "never set" from "set to
+// empty string".
 func (c *Context) GetString(key string) (string, bool) {
 	if c.stringKeys != nil {
 		if s, ok := c.stringKeys[key]; ok {
@@ -439,6 +444,9 @@ func (c *Context) GetString(key string) (string, bool) {
 		if s, ok := v.(string); ok {
 			return s, true
 		}
+	}
+	if key == RequestIDKey && c.requestID != "" {
+		return c.requestID, true
 	}
 	return "", false
 }
