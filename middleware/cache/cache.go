@@ -293,9 +293,48 @@ func sortedQuery(rq string) string {
 	if strings.IndexByte(rq, '&') < 0 {
 		return rq
 	}
-	parts := strings.Split(rq, "&")
-	sort.Strings(parts)
-	return strings.Join(parts, "&")
+	// Small-query fast path: up to 8 parameters fit in a stack array
+	// and avoid the Split heap allocation. If the parts are already
+	// sorted we return rq unchanged (second-level skip — many clients
+	// send canonical query strings already).
+	var stackBuf [8]string
+	parts := stackBuf[:0]
+	start := 0
+	for i := 0; i < len(rq); i++ {
+		if rq[i] == '&' {
+			if len(parts) == cap(stackBuf) {
+				parts = nil
+				break
+			}
+			parts = append(parts, rq[start:i])
+			start = i + 1
+		}
+	}
+	if parts != nil {
+		if len(parts) == cap(stackBuf) {
+			parts = nil
+		} else {
+			parts = append(parts, rq[start:])
+		}
+	}
+	if parts != nil {
+		sorted := true
+		for i := 1; i < len(parts); i++ {
+			if parts[i-1] > parts[i] {
+				sorted = false
+				break
+			}
+		}
+		if sorted {
+			return rq
+		}
+		sort.Strings(parts)
+		return strings.Join(parts, "&")
+	}
+	// Fallback for >8 params.
+	fparts := strings.Split(rq, "&")
+	sort.Strings(fparts)
+	return strings.Join(fparts, "&")
 }
 
 // Invalidate removes the exact cache entry for the given key.

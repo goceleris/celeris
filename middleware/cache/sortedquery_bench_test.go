@@ -19,3 +19,13 @@ func BenchmarkSortedQueryMulti(b *testing.B) {
 		_ = sortedQuery(q)
 	}
 }
+
+// Multi-param already in order (bar,baz,foo alpha-sorted).
+func BenchmarkSortedQueryAlreadySorted(b *testing.B) {
+	const q = "bar=2&baz=3&foo=1"
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = sortedQuery(q)
+	}
+}
