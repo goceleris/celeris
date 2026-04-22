@@ -194,6 +194,37 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					write(continue100Response)
 					state.req.ExpectContinue = false
 				}
+				// Zero-copy body fast path: if the entire content-length
+				// body is already in `data`, dispatch directly from the
+				// engine's read buffer — skipping a full-body memcpy into
+				// state.buffer. Only applies to fixed-length bodies;
+				// chunked encoding keeps going through the buffered path
+				// so ParseChunkedBody can accumulate across reads.
+				if bodyNeeded > 0 {
+					remaining := len(data) - offset - consumed
+					if int64(remaining) >= bodyNeeded {
+						bodyStart := offset + consumed
+						bodyEnd := bodyStart + int(bodyNeeded)
+						bodyData := data[bodyStart:bodyEnd]
+						if err := tryUpgradeH2C(state, bodyData, data[bodyEnd:], write); err != nil {
+							return err
+						}
+						if state.UpgradeInfo != nil {
+							return ErrUpgradeH2C
+						}
+						if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
+							return err
+						}
+						if state.Detached {
+							return nil
+						}
+						if !state.req.KeepAlive {
+							return errConnectionClose
+						}
+						offset = bodyEnd
+						continue
+					}
+				}
 				state.buffer.Write(data[offset:])
 				break
 			}
