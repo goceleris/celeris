@@ -507,7 +507,6 @@ func jsonIsSafeASCII(s string) bool {
 	return jsonClassifyString(s) == jsonStringVerbatim
 }
 
-// appendJSONMapAny appends a JSON object encoding m to dst iff every
 // XML serializes v as XML and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) XML(code int, v any) error {

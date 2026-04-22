@@ -261,17 +261,17 @@ func (c *classifiedError) Is(target error) bool {
 // Unwrap returns outer so errors.As can reach the HTTPError sentinel.
 func (c *classifiedError) Unwrap() error { return c.outer }
 
-// staticInner is the fixed "token not valid" message used by the
-// err == nil branch of classifyTokenError. Pre-built once so the branch
-// matches the other three (one struct alloc, no string alloc).
-var staticInner = errors.New("token not valid")
+// errStaticTokenInvalid is the fixed "token not valid" inner used by
+// the err == nil branch of classifyTokenError. Pre-built once so the
+// branch matches the other three (one struct alloc, no string alloc).
+var errStaticTokenInvalid = errors.New("token not valid")
 
 // classifyTokenError inspects the parser error and wraps it with the
 // appropriate HTTPError sentinel so callers can distinguish expired
 // tokens from malformed ones without inspecting internal parse errors.
 func classifyTokenError(err error) error {
 	if err == nil {
-		return &classifiedError{outer: ErrTokenInvalid, inner: staticInner}
+		return &classifiedError{outer: ErrTokenInvalid, inner: errStaticTokenInvalid}
 	}
 	if errors.Is(err, jwtparse.ErrTokenExpired) || errors.Is(err, jwtparse.ErrTokenNotValidYet) || errors.Is(err, jwtparse.ErrTokenUsedBeforeIssued) {
 		return &classifiedError{outer: ErrJWTExpired, inner: err}
