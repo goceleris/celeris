@@ -28,6 +28,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/driver/memcached"
+	"github.com/goceleris/celeris/driver/postgres"
+	"github.com/goceleris/celeris/driver/redis"
 	"github.com/goceleris/celeris/test/perfmatrix/servers"
 	"github.com/goceleris/celeris/test/perfmatrix/services"
 )
@@ -109,6 +112,15 @@ type celerisServer struct {
 	// listenDone fires after srv.StartWithListener returns, whether by
 	// Shutdown (nil err) or by a fatal bind/accept failure.
 	listenDone chan error
+
+	// Driver clients instantiated by mountDriverHandlers. Nil when
+	// svcs is nil or the relevant driver was not provisioned. Closed
+	// in Stop via shutdownDriverHandlers so repeat lifecycles don't
+	// leak pool connections.
+	pgPool      *postgres.Pool
+	redisClient *redis.Client
+	mcClient    *memcached.Client
+	sessionMW   celeris.HandlerFunc
 }
 
 // Name implements [servers.Server].
@@ -126,7 +138,7 @@ func (s *celerisServer) Features() servers.FeatureSet { return s.features }
 // engines' SO_REUSEPORT rebind), then blocks until the server's own
 // Addr() is non-nil so the caller can safely dial the returned listener
 // without a race.
-func (s *celerisServer) Start(_ context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Listener, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -143,6 +155,13 @@ func (s *celerisServer) Start(_ context.Context, _ *services.Handles) (net.Liste
 	}
 	srv := celeris.New(cfg)
 	registerStaticHandlers(srv)
+	// Wave-3 additions: driver-backed and middleware-chain scenarios.
+	// Drivers are lazily constructed from svcs; when svcs is nil or a
+	// service is absent, the driver handler returns 503 so the
+	// orchestrator can detect missing prerequisites. Chain handlers are
+	// always registered — they need no external services.
+	mountDriverHandlers(s, srv, svcs)
+	mountChainHandlers(srv)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -203,6 +222,9 @@ func (s *celerisServer) Stop(ctx context.Context) error {
 		case <-ctx.Done():
 		}
 	}
+	// Close any driver clients opened by mountDriverHandlers so repeat
+	// Start/Stop cycles don't leak pool connections.
+	shutdownDriverHandlers(s)
 	return err
 }
 
