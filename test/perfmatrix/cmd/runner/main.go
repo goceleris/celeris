@@ -475,7 +475,9 @@ func requiredServiceKinds(scs []scenarios.Scenario) []string {
 			need[services.KindPostgres] = true
 		case strings.Contains(name, "redis"):
 			need[services.KindRedis] = true
-		case strings.Contains(name, "memcached"):
+		case strings.Contains(name, "memcached") || strings.Contains(name, "-mc-"):
+			// Match both the long form ("driver-memcached-*") and the short
+			// form ("driver-mc-get") so scenario authors can use either.
 			need[services.KindMemcached] = true
 		case strings.Contains(name, "session"):
 			// Session scenarios use Redis by convention.
