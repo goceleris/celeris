@@ -26,8 +26,14 @@ func resolveDefaults() ResolvedResources {
 		BufferSize:  8192,
 		MaxEvents:   8192,
 		MaxConns:    65536,
-		SocketRecv:  262144,
-		SocketSend:  262144,
+		// SocketRecv / SocketSend = 0 leaves SO_RCVBUF / SO_SNDBUF unset so
+		// the kernel's TCP auto-tuning owns the buffer sizing (up to
+		// net.ipv4.tcp_rmem / tcp_wmem maxima — typically 6 MiB / 4 MiB).
+		// Forcing 256 KiB previously capped rwnd at min(256 KiB, rmem_max)
+		// which throttled large body POSTs by ~10 % on hosts where
+		// net.core.rmem_max < 256 KiB (the default on most distros).
+		SocketRecv: 0,
+		SocketSend: 0,
 	}
 }
 
