@@ -60,6 +60,7 @@ type connState struct {
 	fixedFile      bool            // 1: true when fd is fixed file index
 	recvLinked     bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
 	needsRecv      bool            // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	recvIntoBody   bool            // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool            // 1: waiting for SEND_ZC notification CQE
 	zcSentBytes    int32           // bytes sent from first SEND_ZC CQE (processed on NOTIF)
 	sendBuf        []byte          // 24: in-flight buffer (accessed with sending flag)
@@ -151,6 +152,7 @@ func releaseConnState(cs *connState) {
 	cs.fixedFile = false
 	cs.recvLinked = false
 	cs.needsRecv = false
+	cs.recvIntoBody = false
 	cs.zcNotifPending = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0

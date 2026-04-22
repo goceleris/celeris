@@ -956,6 +956,76 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 
 	cs.lastActivity = now
 
+	// Direct-into-bodyBuf path: the previous recv SQE targeted
+	// H1State.bodyBuf (NextRecvBuf). Skip ProcessH1, extend the body, and
+	// dispatch the handler when the body is full. Bypasses the
+	// cs.buf→bodyBuf memcpy that the normal recv path would incur.
+	if cs.recvIntoBody && cs.h1State != nil {
+		cs.recvIntoBody = false
+		complete := cs.h1State.ConsumeBodyRecv(int(c.Res))
+		if !complete {
+			if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
+				if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+					cs.needsRecv = true
+					w.markDirty(cs)
+				}
+			}
+			return
+		}
+		rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, w.handler, cs.writeFn)
+		if errors.Is(derr, conn.ErrUpgradeH2C) {
+			if err := w.switchToH2(cs); err != nil {
+				w.closeConn(fd)
+				return
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
+			cs.recvLinked = false
+			if w.bufRing == nil {
+				if w.flushSendLink(cs) {
+					w.markDirty(cs)
+				}
+			} else {
+				if w.flushSend(cs) {
+					w.markDirty(cs)
+				}
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			return
+		}
+		if derr != nil {
+			w.closeConn(fd)
+			return
+		}
+		if len(rest) > 0 {
+			if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn); perr != nil {
+				if !errors.Is(perr, conn.ErrHijacked) {
+					w.closeConn(fd)
+				}
+				return
+			}
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
+		if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
+			if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+				cs.needsRecv = true
+				w.markDirty(cs)
+			}
+		}
+		return
+	}
+
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
 		if !w.detectProtocol(cs, data) {
@@ -1141,7 +1211,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
 	// Don't re-arm if recv is paused (WebSocket backpressure).
 	if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-		if !w.prepareRecv(fd, cs.buf) {
+		if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
@@ -1727,6 +1797,25 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 	}
 	setSQEUserData(sqe, encodeUserData(udRecv, fd))
 	return true
+}
+
+// pickRecvTarget selects the recv target for the next SQE on cs. When the
+// H1 parser is in a partial-body state and there's bodyBuf tail capacity,
+// it returns that slice and flags the conn so handleRecv routes the next
+// CQE through the direct-body path (bypassing ProcessH1 + cs.buf memcpy).
+// Disabled when a provided-buffer ring is in use (multishot recv path owns
+// its own buffer lifecycle). Always clears cs.recvIntoBody when the normal
+// cs.buf path is picked.
+func (w *Worker) pickRecvTarget(cs *connState) []byte {
+	cs.recvIntoBody = false
+	if w.bufRing != nil || cs.protocol != engine.HTTP1 || cs.h1State == nil {
+		return cs.buf
+	}
+	if b := cs.h1State.NextRecvBuf(); b != nil {
+		cs.recvIntoBody = true
+		return b
+	}
+	return cs.buf
 }
 
 func (w *Worker) drainDetachQueue() {
