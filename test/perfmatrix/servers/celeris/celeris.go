@@ -146,12 +146,21 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 		return nil, fmt.Errorf("celeris perfmatrix: %s already started", s.name)
 	}
 
-	// Don't set cfg.Addr: we use StartWithListener which owns the bind.
-	// Non-adaptive engines warn-and-discard a redundant Addr, but the
-	// Adaptive engine's sub-engines (epoll + iouring) elevate that to a
-	// fatal "ambiguous configuration" validation error — eating every
-	// adaptive-engine cell in the perfmatrix run. Leave Addr empty.
+	// Bind the listener FIRST so we can hand celeris an Addr that matches
+	// it exactly. celeris.Config.WithDefaults unconditionally fills in
+	// ":8080" when Addr is empty; the Adaptive engine's sub-engines
+	// (epoll + iouring) then reject the config as "ambiguous" because
+	// the listener they're handed isn't bound to ":8080". Setting Addr to
+	// the listener's actual address keeps the validator happy across all
+	// four engines (std silently ignores Addr when Listener is set;
+	// native engines tolerate exact match).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("celeris perfmatrix: %s bind: %w", s.name, err)
+	}
+
 	cfg := celeris.Config{
+		Addr:            ln.Addr().String(),
 		Engine:          s.engine,
 		Protocol:        s.protocol,
 		EnableH2Upgrade: s.h2cUpgrade,
@@ -166,11 +175,6 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 	// always registered — they need no external services.
 	mountDriverHandlers(s, srv, svcs)
 	mountChainHandlers(srv)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, fmt.Errorf("celeris perfmatrix: %s bind: %w", s.name, err)
-	}
 
 	done := make(chan error, 1)
 	go func() { done <- srv.StartWithListener(ln) }()
