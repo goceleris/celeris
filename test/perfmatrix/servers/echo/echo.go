@@ -115,7 +115,7 @@ func drainBody(r *http.Request) {
 	if r.Body == nil {
 		return
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	buf := make([]byte, 32*1024)
 	for {
 		if _, err := r.Body.Read(buf); err != nil {

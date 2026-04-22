@@ -105,13 +105,13 @@ func (s *Server) registerStatic() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("Hello, World!"))
 	})))
-	s.mux.Handle("/json", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.mux.Handle("/json", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, s.jsonSmall)
 	})))
-	s.mux.Handle("/json-1k", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.mux.Handle("/json-1k", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, s.json1K)
 	})))
-	s.mux.Handle("/json-64k", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.mux.Handle("/json-64k", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, s.json64K)
 	})))
 	s.mux.Handle("/users/", methodFilter(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -121,10 +121,10 @@ func (s *Server) registerStatic() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "User ID: %s", id)
+		_, _ = fmt.Fprintf(w, "User ID: %s", id)
 	})))
 	s.mux.Handle("/upload", methodFilter(http.MethodPost, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = drainBody(r)
+		drainBody(r)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("OK"))
 	})))
@@ -135,21 +135,15 @@ func writeJSON(w http.ResponseWriter, body []byte) {
 	_, _ = w.Write(body)
 }
 
-func drainBody(r *http.Request) (int64, error) {
+func drainBody(r *http.Request) {
 	if r.Body == nil {
-		return 0, nil
+		return
 	}
-	defer r.Body.Close()
-	var n int64
+	defer func() { _ = r.Body.Close() }()
 	buf := make([]byte, 32*1024)
 	for {
-		m, err := r.Body.Read(buf)
-		n += int64(m)
-		if err != nil {
-			if err.Error() == "EOF" {
-				return n, nil
-			}
-			return n, nil
+		if _, err := r.Body.Read(buf); err != nil {
+			return
 		}
 	}
 }

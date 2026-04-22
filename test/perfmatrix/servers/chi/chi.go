@@ -103,7 +103,7 @@ func (s *Server) registerStatic() {
 	s.router.Get("/users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := chiv5.URLParam(r, "id")
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "User ID: %s", id)
+		_, _ = fmt.Fprintf(w, "User ID: %s", id)
 	})
 	s.router.Post("/upload", func(w http.ResponseWriter, r *http.Request) {
 		drainBody(r)
@@ -121,7 +121,7 @@ func drainBody(r *http.Request) {
 	if r.Body == nil {
 		return
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	buf := make([]byte, 32*1024)
 	for {
 		if _, err := r.Body.Read(buf); err != nil {

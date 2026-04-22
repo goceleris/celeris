@@ -140,7 +140,7 @@ func (s *Server) dispatch(rc *fasthttp.RequestCtx) {
 		}
 		rc.SetContentType("text/plain; charset=utf-8")
 		rc.SetStatusCode(fasthttp.StatusOK)
-		fmt.Fprintf(rc, "User ID: %s", id)
+		_, _ = fmt.Fprintf(rc, "User ID: %s", id)
 		return
 	case method == http.MethodPost && path == "/upload":
 		_ = rc.PostBody()
