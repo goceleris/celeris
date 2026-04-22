@@ -506,15 +506,19 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	proc := stream.NewProcessor(handler, fw, &s.adapter)
 	proc.InlineWriter = &s.inlineAdapter
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
-	proc.GetManager().SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
+	mgr := proc.GetManager()
+	mgr.SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
+	// Tell the manager what we'll advertise in SETTINGS so inbound frame-size
+	// validation matches (peer may legitimately send frames up to cfg.MaxFrameSize).
+	mgr.SetLocalMaxFrameSize(cfg.MaxFrameSize)
 	s.processor = proc
 
 	// Wire the manager into both adapters so outbound DATA/HEADERS fragment
 	// by the peer's SETTINGS_MAX_FRAME_SIZE (RFC 7540 §4.2), not our own
 	// advertised MAX_FRAME_SIZE. The manager's default is 16 KiB until the
 	// peer's SETTINGS lands.
-	s.adapter.manager = proc.GetManager()
-	s.inlineAdapter.manager = proc.GetManager()
+	s.adapter.manager = mgr
+	s.inlineAdapter.manager = mgr
 
 	p := frame.NewParser()
 	p.InitReader(&s.inBuf)

@@ -17,7 +17,8 @@ type Manager struct {
 	priorityTree            *PriorityTree
 	pushEnabled             bool
 	nextPushID              uint32
-	maxFrameSize            uint32
+	maxFrameSize            uint32 // peer's SETTINGS_MAX_FRAME_SIZE (caps what WE send)
+	localMaxFrameSize       uint32 // our advertised SETTINGS_MAX_FRAME_SIZE (caps what PEER sends us)
 	initialWindowSize       uint32
 	activeStreams           atomic.Uint32
 	headerTableSize         uint32 // peer's SETTINGS_HEADER_TABLE_SIZE (bound on our HPACK dynamic table)
@@ -43,10 +44,30 @@ func NewManager() *Manager {
 		priorityTree:      NewPriorityTree(),
 		pushEnabled:       true,
 		nextPushID:        2,
-		maxFrameSize:      16384,
+		maxFrameSize:      16384, // peer's — RFC default until their SETTINGS lands
+		localMaxFrameSize: 16384, // our advertised — overridden by caller via SetLocalMaxFrameSize
 		initialWindowSize: 65535,
 		headerTableSize:   4096, // RFC 7540 §6.5.2 default
 	}
+}
+
+// SetLocalMaxFrameSize records the SETTINGS_MAX_FRAME_SIZE we advertised to
+// the peer. Inbound frames are validated against this value (RFC 7540 §4.2).
+// Safe to call from any goroutine.
+func (m *Manager) SetLocalMaxFrameSize(v uint32) {
+	if v < 16384 {
+		v = 16384
+	}
+	atomic.StoreUint32(&m.localMaxFrameSize, v)
+}
+
+// GetLocalMaxFrameSize returns our advertised SETTINGS_MAX_FRAME_SIZE.
+func (m *Manager) GetLocalMaxFrameSize() uint32 {
+	v := atomic.LoadUint32(&m.localMaxFrameSize)
+	if v == 0 {
+		return 16384
+	}
+	return v
 }
 
 // CreateStream creates a new stream with the given ID.
