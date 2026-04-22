@@ -31,8 +31,8 @@ var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-
 
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
-	parser             *h1.Parser
-	buffer             bytes.Buffer
+	parser *h1.Parser
+	buffer bytes.Buffer
 	// bodyBuf holds an in-progress fixed-length body that spans multiple
 	// ProcessH1 calls. Reused across requests so each connection allocates
 	// once at its peak body size. Using a dedicated slice bypasses the
@@ -148,7 +148,7 @@ func (s *H1State) NextRecvBuf() []byte {
 // ConsumeBodyRecv extends bodyBuf by n bytes and reports whether the body
 // is now complete. Paired with NextRecvBuf on the engine side.
 func (s *H1State) ConsumeBodyRecv(n int) (complete bool) {
-	s.bodyBuf = s.bodyBuf[: len(s.bodyBuf)+n]
+	s.bodyBuf = s.bodyBuf[:len(s.bodyBuf)+n]
 	return len(s.bodyBuf) >= s.bodyNeeded
 }
 
