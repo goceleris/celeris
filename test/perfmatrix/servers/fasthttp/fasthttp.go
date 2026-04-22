@@ -37,8 +37,26 @@ type Server struct {
 
 	mu     sync.RWMutex
 	extras map[string]fasthttp.RequestHandler // "METHOD path" → handler
-	srv    *fasthttp.Server
-	ln     net.Listener
+	// extraPrefixes holds (method, prefix → handler) entries mounted
+	// via MountPrefix for routes with dynamic path params (e.g.
+	// /db/user/:id in a router-less framework). The prefix MUST end
+	// with "/"; dispatch matches any path starting with it after the
+	// exact extras lookup fails.
+	extraPrefixes []fasthttpPrefix
+	srv           *fasthttp.Server
+	ln            net.Listener
+
+	drivers       *driverState
+	mountedChain  bool
+	mountedDriver bool
+}
+
+// fasthttpPrefix pairs a method with a path prefix and a handler. See
+// Server.extraPrefixes for the matching behavior.
+type fasthttpPrefix struct {
+	method  string
+	prefix  string
+	handler fasthttp.RequestHandler
 }
 
 // New returns the fasthttp-h1 Server.
@@ -75,15 +93,27 @@ func (s *Server) Mount(method, path string, h http.Handler) {
 }
 
 // MountNative attaches a native fasthttp handler under (method, path).
+// Paths ending with "/" are treated as prefix matches so dynamic path
+// segments (e.g. "/db/user/42") resolve to the "/db/user/" handler.
 func (s *Server) MountNative(method, path string, h fasthttp.RequestHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.extras[strings.ToUpper(method)+" "+path] = h
+	m := strings.ToUpper(method)
+	if strings.HasSuffix(path, "/") && path != "/" {
+		s.extraPrefixes = append(s.extraPrefixes, fasthttpPrefix{
+			method: m, prefix: path, handler: h,
+		})
+		return
+	}
+	s.extras[m+" "+path] = h
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -106,12 +136,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	done := make(chan error, 1)
 	go func() { done <- s.srv.Shutdown() }()
+	var err error
 	select {
-	case err := <-done:
-		return err
+	case err = <-done:
 	case <-ctx.Done():
-		return ctx.Err()
+		err = ctx.Err()
 	}
+	s.shutdownDriverHandlers()
+	return err
 }
 
 func (s *Server) dispatch(rc *fasthttp.RequestCtx) {
@@ -151,10 +183,20 @@ func (s *Server) dispatch(rc *fasthttp.RequestCtx) {
 	}
 	s.mu.RLock()
 	h, ok := s.extras[method+" "+path]
+	prefixes := s.extraPrefixes
 	s.mu.RUnlock()
 	if ok {
 		h(rc)
 		return
+	}
+	for _, p := range prefixes {
+		if p.method != method {
+			continue
+		}
+		if strings.HasPrefix(path, p.prefix) {
+			p.handler(rc)
+			return
+		}
 	}
 	rc.SetStatusCode(fasthttp.StatusNotFound)
 }
