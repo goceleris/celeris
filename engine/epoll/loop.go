@@ -477,10 +477,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// Zero-copy body recv: when H1 is in a partial-body state we read
 		// directly into the tail of H1State.bodyBuf — skipping the
 		// cs.buf → bodyBuf memcpy that would otherwise happen on every
-		// read for a multi-read POST.
+		// read for a multi-read POST. Disabled in async mode: the
+		// dispatch goroutine owns h1State and the worker cannot safely
+		// observe NextRecvBuf without synchronization.
 		recvBuf := cs.buf
 		intoBody := false
-		if cs.h1State != nil {
+		if !l.async && cs.h1State != nil {
 			if b := cs.h1State.NextRecvBuf(); b != nil {
 				recvBuf = b
 				intoBody = true

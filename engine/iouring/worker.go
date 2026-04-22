@@ -1809,7 +1809,10 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 // cs.buf path is picked.
 func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	cs.recvIntoBody = false
-	if w.bufRing != nil || cs.protocol != engine.HTTP1 || cs.h1State == nil {
+	// Async mode: the dispatch goroutine owns h1State; the worker cannot
+	// safely observe NextRecvBuf without synchronization. Always use
+	// cs.buf so the goroutine handles body accumulation on its side.
+	if w.async || w.bufRing != nil || cs.protocol != engine.HTTP1 || cs.h1State == nil {
 		return cs.buf
 	}
 	if b := cs.h1State.NextRecvBuf(); b != nil {
