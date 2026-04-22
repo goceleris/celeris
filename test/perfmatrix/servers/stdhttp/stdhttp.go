@@ -45,6 +45,16 @@ type Server struct {
 	mux *http.ServeMux
 	srv *http.Server
 	ln  net.Listener
+
+	// drivers holds driver clients opened lazily by mountDriverHandlers.
+	// Closed in Stop so repeat Start/Stop cycles don't leak pools.
+	drivers *driverState
+
+	// mountedChain / mountedDriver guard the /chain and /db,/cache,/mc,
+	// /session routes from being double-registered on repeat Start calls
+	// (Go's http.ServeMux panics on duplicate patterns).
+	mountedChain  bool
+	mountedDriver bool
 }
 
 // newServer constructs a Server for the requested mode.
@@ -149,13 +159,19 @@ func drainBody(r *http.Request) {
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	s.ln = ln
+
+	// Wave-3 additions: driver-backed and middleware-chain scenarios.
+	// Drivers are constructed lazily from svcs; when svcs is nil or a
+	// service is absent, the matching handler responds 503.
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
 
 	var handler http.Handler = s.mux
 	h2s := &http2.Server{
@@ -196,7 +212,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.srv == nil {
 		return nil
 	}
-	return s.srv.Shutdown(ctx)
+	err := s.srv.Shutdown(ctx)
+	s.shutdownDriverHandlers()
+	return err
 }
 
 // payloadSmall mirrors the /json shape across every perfmatrix server.
