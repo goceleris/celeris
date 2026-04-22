@@ -224,6 +224,15 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 						offset = bodyEnd
 						continue
 					}
+					// Partial body: we're going to spread this request
+					// across N reads. Pre-grow state.buffer to the full
+					// expected size so subsequent Writes don't pay the
+					// bytes.Buffer doubling-reallocation memcpy
+					// (amortises to ~2× payload on a cold buffer).
+					remainingNeeded := int(bodyNeeded) - remaining + consumed
+					if growth := remainingNeeded - (state.buffer.Cap() - state.buffer.Len()); growth > 0 {
+						state.buffer.Grow(growth)
+					}
 				}
 				state.buffer.Write(data[offset:])
 				break
@@ -300,6 +309,13 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		case bodyNeeded > 0:
 			available := int64(state.buffer.Len() - consumed)
 			if available < bodyNeeded {
+				// Body is incomplete. Pre-grow state.buffer so that
+				// subsequent partial-body Writes don't trigger
+				// bytes.Buffer doubling reallocations.
+				needed := int(bodyNeeded - available)
+				if growth := needed - (state.buffer.Cap() - state.buffer.Len()); growth > 0 {
+					state.buffer.Grow(growth)
+				}
 				return nil
 			}
 			state.buffer.Next(consumed)
