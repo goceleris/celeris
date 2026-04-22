@@ -136,6 +136,46 @@ unified `middleware/store.KV` interface; deprecation shims are provided.
   is unavailable. Symmetric across `driver/{postgres,redis,memcached}`.
 - 25 golangci-lint errors across `errcheck`, `gofmt`, `revive`,
   `staticcheck`, `unused` (internal fakes + session/csrf/cache tests).
+- **H2 parser enforced stale 16 KiB `MaxReadFrameSize` while advertising
+  up to 1 MiB.** `NewH2State` never raised the parser ceiling after
+  `InitReader`, so any DATA frame > 16 384 bytes hit
+  `FRAME_SIZE_ERROR` and the connection was silently dropped. Visible
+  as 100 % error rate on any H2 POST body > 16 KiB from compliant
+  clients (loadgen, curl, x/net/http2 when the peer chose large frames).
+  Fix: `p.SetMaxReadFrameSize(cfg.MaxFrameSize)` right after InitReader
+  with a 16 KiB-minimum clamp for direct `H2Config` callers.
+- **H2 default `SETTINGS_MAX_FRAME_SIZE` raised 16 KiB → 1 MiB** to match
+  `golang.org/x/net/http2` and fasthttp2. The prior default rejected
+  well-behaved clients that pre-negotiate their send chunk size.
+- **H2 default `SETTINGS_INITIAL_WINDOW_SIZE` raised 65 535 → 1 MiB.**
+  A 64 KiB + 1-byte body POST over H2 deadlocked on the old window: the
+  client blocked waiting for WINDOW_UPDATE while the server waited to
+  read the full body before sending it. 1 MiB matches std http2.
+- **H1 `SO_RCVBUF`/`SO_SNDBUF` default → 0 (kernel auto-tune).** Forcing
+  256 KiB disabled Linux TCP auto-tuning — on hosts where
+  `net.core.rmem_max < 256 KiB` (msr1 default: 208 KiB) the socket was
+  capped at the lower of the two, throttling 1 MiB POST throughput by
+  ~10 % vs fiber/fasthttp. Users who need a hard cap can still set
+  `Resources.SocketRecv/SocketSend` explicitly.
+- **H1 zero-copy request body path.** Previously every POST copied the
+  raw body slice from the engine's read buffer into a `*bytes.Buffer`
+  (`s.Data`) before the handler saw it. New `Stream.SetRawBody` +
+  `Stream.rawBody` install a zero-copy view that `GetData` / `Body` /
+  `BodyCopy` return directly. `BodyCopy` remains safe for retention.
+- **H1 dedicated `bodyBuf` for partial-body multi-read POSTs.** A 1 MiB
+  body accumulated in 128 × 8 KiB Writes used to pay ~2 MiB of
+  userspace memcpy to `state.buffer` (`*bytes.Buffer` doubling grow).
+  New `H1State.bodyBuf` + `bodyNeeded` + the engine-side
+  `NextRecvBuf` / `ConsumeBodyRecv` / `DispatchBufferedBody` hooks land
+  body bytes straight into a correctly-sized slice, skipping the
+  `cs.buf → state.buffer` memcpy. Active only in sync-handler mode
+  (async handler path still goes through `asyncInBuf`).
+- **Combined impact on msr1:**
+  - H1 POST 4 K: **+9.6 %** vs fiber (loss → win).
+  - H1 POST 64 K: gap −23 % → −3 % vs fiber.
+  - H1 POST 1 M: gap −43 % → −4 % vs fiber.
+  - H2 POST 64 K: **+63 %** vs chi (previously "0 rps due to H2 bug").
+  - H2 GET: **+83 % / +91 %** over the next-best competitor.
 
 ### Performance
 
