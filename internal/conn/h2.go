@@ -456,6 +456,11 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 
 	p := frame.NewParser()
 	p.InitReader(&s.inBuf)
+	// Raise the parser's ceiling to match what we advertise via
+	// SETTINGS_MAX_FRAME_SIZE — otherwise we advertise 1 MiB but reject
+	// anything over the RFC-default 16 KiB on receive, silently dropping
+	// compliant clients that send 16 KiB+1-byte frames.
+	p.SetMaxReadFrameSize(cfg.MaxFrameSize)
 	s.parser = p
 
 	return s
