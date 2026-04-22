@@ -51,6 +51,10 @@ type Server struct {
 	h   *server.Hertz
 	ln  net.Listener
 	run chan error
+
+	drivers       *driverState
+	mountedChain  bool
+	mountedDriver bool
 }
 
 func newServer(name string, m mode) *Server {
@@ -97,7 +101,7 @@ func (s *Server) MountNative(method, path string, h app.HandlerFunc) {
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -108,6 +112,12 @@ func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, 
 	s.mu.Lock()
 	s.ensureEngineLocked(ln)
 	s.mu.Unlock()
+
+	// Wave-3: mount chain + driver routes after the engine is built
+	// (hertz's routes can be added any time before Run; both mount
+	// funcs grab their own lock as needed).
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
 
 	s.run = make(chan error, 1)
 	go func() { s.run <- s.h.Run() }()
@@ -136,7 +146,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.h == nil {
 		return nil
 	}
-	return s.h.Shutdown(ctx)
+	err := s.h.Shutdown(ctx)
+	s.shutdownDriverHandlers()
+	return err
 }
 
 // ensureEngineLocked builds the hertz engine once. Called under s.mu.
