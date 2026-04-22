@@ -163,8 +163,11 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	}
 
 	// In-progress fixed-length body spanning multiple reads. Append into
-	// the dedicated bodyBuf (no state.buffer memcpy), and when full,
-	// dispatch the handler.
+	// the dedicated bodyBuf (no state.buffer memcpy), then re-parse the
+	// headers from state.buffer (kept stable across reads since the H1
+	// parser runs in zero-copy mode and state.req slices reference the
+	// per-call `data` buffer that the engine reuses). When the body is
+	// full, dispatch the handler.
 	if state.bodyNeeded > 0 {
 		need := state.bodyNeeded - len(state.bodyBuf)
 		if len(data) < need {
@@ -173,6 +176,15 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 		state.bodyBuf = append(state.bodyBuf, data[:need]...)
 		rest := data[need:]
+		// Re-parse headers from state.buffer so req fields point at
+		// stable memory (the earlier partial-body branch stashed them).
+		state.parser.Reset(state.buffer.Bytes())
+		state.req.Reset()
+		if _, err := state.parser.ParseRequest(&state.req); err != nil {
+			writeErrorResponse(write, 400, "Bad Request")
+			return err
+		}
+		state.buffer.Reset()
 		bodyData := state.bodyBuf
 		if err := tryUpgradeH2C(state, bodyData, rest, write); err != nil {
 			return err
@@ -183,7 +195,6 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
-		// Handler is done — body slice is no longer referenced.
 		state.bodyBuf = state.bodyBuf[:0]
 		state.bodyNeeded = 0
 		if state.Detached {
@@ -268,10 +279,13 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 						offset = bodyEnd
 						continue
 					}
-					// Partial body: accumulate directly into bodyBuf so
-					// subsequent reads skip state.buffer entirely. bodyBuf
-					// is sized once at the peak body length and reused
-					// across requests on this connection.
+					// Partial body: accumulate body bytes into bodyBuf
+					// (reused across requests on this connection), and
+					// stash the header bytes in state.buffer so state.req
+					// can be re-parsed from stable memory when the body
+					// completes across subsequent reads (req slices today
+					// point into the per-call `data`, which the engine
+					// reuses).
 					need := int(bodyNeeded)
 					if cap(state.bodyBuf) < need {
 						state.bodyBuf = make([]byte, 0, need)
@@ -281,6 +295,8 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					if remaining > 0 {
 						state.bodyBuf = append(state.bodyBuf, data[offset+consumed:]...)
 					}
+					state.buffer.Reset()
+					state.buffer.Write(data[offset : offset+consumed])
 					state.bodyNeeded = need
 					return nil
 				}
@@ -359,22 +375,24 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		case bodyNeeded > 0:
 			available := int64(state.buffer.Len() - consumed)
 			if available < bodyNeeded {
-				// Body is incomplete. Drain everything after the headers
-				// out of state.buffer into the dedicated bodyBuf — the
-				// next ProcessH1 call will see state.bodyNeeded > 0 and
-				// skip state.buffer entirely for the remaining body
-				// bytes. This avoids the bytes.Buffer doubling-grow and
-				// the paired cs.buf→state.buffer memcpy on every read.
+				// Body is incomplete. Move any body bytes currently in
+				// state.buffer into bodyBuf, then shrink state.buffer
+				// back to just the header bytes. Subsequent ProcessH1
+				// calls will take the state.bodyNeeded > 0 short-circuit
+				// and append directly to bodyBuf, avoiding the
+				// bytes.Buffer doubling-grow + cs.buf→state.buffer
+				// memcpy on each partial-body read.
 				need := int(bodyNeeded)
 				if cap(state.bodyBuf) < need {
 					state.bodyBuf = make([]byte, 0, need)
 				} else {
 					state.bodyBuf = state.bodyBuf[:0]
 				}
-				state.buffer.Next(consumed)
-				if avail := state.buffer.Len(); avail > 0 {
-					state.bodyBuf = append(state.bodyBuf, state.buffer.Bytes()...)
-					state.buffer.Next(avail)
+				if available > 0 {
+					bufBytes := state.buffer.Bytes()
+					state.bodyBuf = append(state.bodyBuf, bufBytes[consumed:]...)
+					// Trim body bytes off the buffer; headers remain.
+					state.buffer.Truncate(consumed)
 				}
 				state.bodyNeeded = need
 				return nil
