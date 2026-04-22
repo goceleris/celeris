@@ -459,8 +459,15 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	// Raise the parser's ceiling to match what we advertise via
 	// SETTINGS_MAX_FRAME_SIZE — otherwise we advertise 1 MiB but reject
 	// anything over the RFC-default 16 KiB on receive, silently dropping
-	// compliant clients that send 16 KiB+1-byte frames.
-	p.SetMaxReadFrameSize(cfg.MaxFrameSize)
+	// compliant clients that send 16 KiB+1-byte frames. cfg.MaxFrameSize
+	// is already defaulted to 1 MiB by WithDefaults / this file's init
+	// block above; guard against 0 just in case a caller constructs an
+	// H2Config directly without it.
+	maxFrame := cfg.MaxFrameSize
+	if maxFrame < 16384 {
+		maxFrame = 16384
+	}
+	p.SetMaxReadFrameSize(maxFrame)
 	s.parser = p
 
 	return s
