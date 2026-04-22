@@ -182,14 +182,7 @@ func (s *H1State) DispatchBufferedBody(ctx context.Context, handler stream.Handl
 	if err := handleH1Request(ctx, s, bodyData, handler, write); err != nil {
 		return nil, err
 	}
-	// Release outsized bodyBuf back to the heap so an idle keep-alive
-	// conn that saw a one-off huge POST doesn't pin the arena. 64 KiB
-	// is the threshold below which reuse pays off more than GC pressure.
-	if cap(s.bodyBuf) > 64<<10 {
-		s.bodyBuf = nil
-	} else {
-		s.bodyBuf = s.bodyBuf[:0]
-	}
+	s.bodyBuf = s.bodyBuf[:0]
 	s.bodyNeeded = 0
 	if s.Detached {
 		return nil, nil
@@ -220,6 +213,13 @@ func CloseH1(state *H1State) {
 		state.stream.Release()
 		state.stream = nil
 	}
+	// Free the body buffer — for a conn that handled a 1 MiB POST, this
+	// is where we relinquish the arena. Reuse across requests on the
+	// same conn is fine (the 10 k idle-conn × 1 MiB scenario only
+	// triggers if every conn sustained a huge POST, which implies the
+	// memory was already being paid for real traffic).
+	state.bodyBuf = nil
+	state.bodyNeeded = 0
 }
 
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
@@ -268,11 +268,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
-		if cap(state.bodyBuf) > 64<<10 {
-			state.bodyBuf = nil
-		} else {
-			state.bodyBuf = state.bodyBuf[:0]
-		}
+		state.bodyBuf = state.bodyBuf[:0]
 		state.bodyNeeded = 0
 		if state.Detached {
 			return nil
