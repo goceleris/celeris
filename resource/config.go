@@ -168,7 +168,12 @@ func (c Config) WithDefaults() Config {
 		c.EnableH2Upgrade = true
 	}
 	if c.MaxFrameSize == 0 {
-		c.MaxFrameSize = 16384
+		// 1 MiB matches golang.org/x/net/http2's defaultMaxReadFrameSize
+		// and fasthttp2 / hertz. RFC 7540 §4.2 permits up to 16 MiB. The
+		// 16 KiB default previously rejected 32 KiB+ DATA frames from
+		// clients that pre-negotiate their send size (Go std http2
+		// client, loadgen, browser upload flows over H2).
+		c.MaxFrameSize = 1 << 20
 	}
 	if c.InitialWindowSize == 0 {
 		c.InitialWindowSize = 65535

@@ -190,8 +190,8 @@ func TestWithDefaults(t *testing.T) {
 	if d.Addr != ":8080" {
 		t.Errorf("Addr = %q, want :8080", d.Addr)
 	}
-	if d.MaxFrameSize != 16384 {
-		t.Errorf("MaxFrameSize = %d, want 16384", d.MaxFrameSize)
+	if d.MaxFrameSize != 1<<20 {
+		t.Errorf("MaxFrameSize = %d, want %d", d.MaxFrameSize, 1<<20)
 	}
 	if d.InitialWindowSize != 65535 {
 		t.Errorf("InitialWindowSize = %d, want 65535", d.InitialWindowSize)

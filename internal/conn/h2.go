@@ -63,7 +63,7 @@ func (cfg H2Config) withDefaults() H2Config {
 		cfg.InitialWindowSize = 65535
 	}
 	if cfg.MaxFrameSize == 0 {
-		cfg.MaxFrameSize = 16384
+		cfg.MaxFrameSize = 1 << 20 // 1 MiB — see resource/config.go for rationale
 	}
 	return cfg
 }

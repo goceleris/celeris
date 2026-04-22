@@ -173,12 +173,14 @@ func probeEngine(addr string, proto engine.Protocol) error {
 }
 
 // h2specMaxFail defines per-engine maximum tolerated h2spec failures.
-// The std engine delegates to Go's net/http + x/net/http2 which has 4
+// The std engine delegates to Go's net/http + x/net/http2 which has
 // known non-conformances (connection-specific headers, invalid preface
-// EOF, SETTINGS_INITIAL_WINDOW_SIZE ordering). Native engines handle
+// EOF, SETTINGS_INITIAL_WINDOW_SIZE ordering, and §4.3 "large HEADERS
+// frame" — x/net/http2 accepts HEADERS up to MaxReadFrameSize+a safety
+// slack rather than strictly ≤ MAX_FRAME_SIZE). Native engines handle
 // these correctly and must pass everything.
 var h2specMaxFail = map[string]int{
-	"std":     4, // 4 known stdlib failures
+	"std":     5, // 5 known stdlib failures
 	"epoll":   0, // must be fully conformant
 	"iouring": 0, // must be fully conformant
 }
