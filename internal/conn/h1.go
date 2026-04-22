@@ -33,6 +33,14 @@ var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-
 type H1State struct {
 	parser             *h1.Parser
 	buffer             bytes.Buffer
+	// bodyBuf holds an in-progress fixed-length body that spans multiple
+	// ProcessH1 calls. Reused across requests so each connection allocates
+	// once at its peak body size. Using a dedicated slice bypasses the
+	// state.buffer (*bytes.Buffer) doubling-grow and the paired
+	// cs.buf→state.buffer memcpy that previously dominated the 1 MiB POST
+	// hot path.
+	bodyBuf            []byte
+	bodyNeeded         int
 	req                h1.Request
 	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
 	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
@@ -154,6 +162,42 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		return nil
 	}
 
+	// In-progress fixed-length body spanning multiple reads. Append into
+	// the dedicated bodyBuf (no state.buffer memcpy), and when full,
+	// dispatch the handler.
+	if state.bodyNeeded > 0 {
+		need := state.bodyNeeded - len(state.bodyBuf)
+		if len(data) < need {
+			state.bodyBuf = append(state.bodyBuf, data...)
+			return nil
+		}
+		state.bodyBuf = append(state.bodyBuf, data[:need]...)
+		rest := data[need:]
+		bodyData := state.bodyBuf
+		if err := tryUpgradeH2C(state, bodyData, rest, write); err != nil {
+			return err
+		}
+		if state.UpgradeInfo != nil {
+			return ErrUpgradeH2C
+		}
+		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
+			return err
+		}
+		// Handler is done — body slice is no longer referenced.
+		state.bodyBuf = state.bodyBuf[:0]
+		state.bodyNeeded = 0
+		if state.Detached {
+			return nil
+		}
+		if !state.req.KeepAlive {
+			return errConnectionClose
+		}
+		if len(rest) == 0 {
+			return nil
+		}
+		data = rest
+	}
+
 	if state.buffer.Len() == 0 {
 		offset := 0
 		for offset < len(data) {
@@ -224,15 +268,21 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 						offset = bodyEnd
 						continue
 					}
-					// Partial body: we're going to spread this request
-					// across N reads. Pre-grow state.buffer to the full
-					// expected size so subsequent Writes don't pay the
-					// bytes.Buffer doubling-reallocation memcpy
-					// (amortises to ~2× payload on a cold buffer).
-					remainingNeeded := int(bodyNeeded) - remaining + consumed
-					if growth := remainingNeeded - (state.buffer.Cap() - state.buffer.Len()); growth > 0 {
-						state.buffer.Grow(growth)
+					// Partial body: accumulate directly into bodyBuf so
+					// subsequent reads skip state.buffer entirely. bodyBuf
+					// is sized once at the peak body length and reused
+					// across requests on this connection.
+					need := int(bodyNeeded)
+					if cap(state.bodyBuf) < need {
+						state.bodyBuf = make([]byte, 0, need)
+					} else {
+						state.bodyBuf = state.bodyBuf[:0]
 					}
+					if remaining > 0 {
+						state.bodyBuf = append(state.bodyBuf, data[offset+consumed:]...)
+					}
+					state.bodyNeeded = need
+					return nil
 				}
 				state.buffer.Write(data[offset:])
 				break
@@ -309,13 +359,24 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		case bodyNeeded > 0:
 			available := int64(state.buffer.Len() - consumed)
 			if available < bodyNeeded {
-				// Body is incomplete. Pre-grow state.buffer so that
-				// subsequent partial-body Writes don't trigger
-				// bytes.Buffer doubling reallocations.
-				needed := int(bodyNeeded - available)
-				if growth := needed - (state.buffer.Cap() - state.buffer.Len()); growth > 0 {
-					state.buffer.Grow(growth)
+				// Body is incomplete. Drain everything after the headers
+				// out of state.buffer into the dedicated bodyBuf — the
+				// next ProcessH1 call will see state.bodyNeeded > 0 and
+				// skip state.buffer entirely for the remaining body
+				// bytes. This avoids the bytes.Buffer doubling-grow and
+				// the paired cs.buf→state.buffer memcpy on every read.
+				need := int(bodyNeeded)
+				if cap(state.bodyBuf) < need {
+					state.bodyBuf = make([]byte, 0, need)
+				} else {
+					state.bodyBuf = state.bodyBuf[:0]
 				}
+				state.buffer.Next(consumed)
+				if avail := state.buffer.Len(); avail > 0 {
+					state.bodyBuf = append(state.bodyBuf, state.buffer.Bytes()...)
+					state.buffer.Next(avail)
+				}
+				state.bodyNeeded = need
 				return nil
 			}
 			state.buffer.Next(consumed)
