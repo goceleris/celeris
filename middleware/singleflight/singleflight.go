@@ -36,6 +36,13 @@ type group struct {
 // last waiter drops its reference.
 var callPool = sync.Pool{New: func() any { return &call{} }}
 
+// testHookWaiterJoined fires (under g.mu, right after entry.waiters.Add)
+// when a request joins an in-flight leader as a waiter. Nil in production;
+// tests use it to synchronize deterministically on waiter-joined events
+// instead of sleeping. Cost in production: one nil check per coalesced
+// request.
+var testHookWaiterJoined func()
+
 func acquireCall() *call {
 	c := callPool.Get().(*call)
 	c.status = 0
@@ -78,6 +85,9 @@ func New(config ...Config) celeris.HandlerFunc {
 			// leader's delete-time check sees it. Any waiter that reaches
 			// this branch pairs with the leader's post-Next capture.
 			entry.waiters.Add(1)
+			if testHookWaiterJoined != nil {
+				testHookWaiterJoined()
+			}
 			g.mu.Unlock()
 			// Race the leader's WaitGroup against the request context so a
 			// timeout middleware (or upstream client cancel) can preempt the
