@@ -182,7 +182,14 @@ func (s *H1State) DispatchBufferedBody(ctx context.Context, handler stream.Handl
 	if err := handleH1Request(ctx, s, bodyData, handler, write); err != nil {
 		return nil, err
 	}
-	s.bodyBuf = s.bodyBuf[:0]
+	// Release outsized bodyBuf back to the heap so an idle keep-alive
+	// conn that saw a one-off huge POST doesn't pin the arena. 64 KiB
+	// is the threshold below which reuse pays off more than GC pressure.
+	if cap(s.bodyBuf) > 64<<10 {
+		s.bodyBuf = nil
+	} else {
+		s.bodyBuf = s.bodyBuf[:0]
+	}
 	s.bodyNeeded = 0
 	if s.Detached {
 		return nil, nil
@@ -261,7 +268,11 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
-		state.bodyBuf = state.bodyBuf[:0]
+		if cap(state.bodyBuf) > 64<<10 {
+			state.bodyBuf = nil
+		} else {
+			state.bodyBuf = state.bodyBuf[:0]
+		}
 		state.bodyNeeded = 0
 		if state.Detached {
 			return nil
