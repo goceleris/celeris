@@ -176,7 +176,11 @@ func (c Config) WithDefaults() Config {
 		c.MaxFrameSize = 1 << 20
 	}
 	if c.InitialWindowSize == 0 {
-		c.InitialWindowSize = 65535
+		// 1 MiB matches golang.org/x/net/http2 and fasthttp2: a 64 KiB +
+		// one-byte body POST would stall on the default 65 535-byte
+		// window because the server's WINDOW_UPDATE lands only after it
+		// finishes reading the full body. RFC 7540 allows up to 2^31-1.
+		c.InitialWindowSize = 1 << 20
 	}
 	if c.MaxConcurrentStreams == 0 {
 		c.MaxConcurrentStreams = 100

@@ -193,8 +193,8 @@ func TestWithDefaults(t *testing.T) {
 	if d.MaxFrameSize != 1<<20 {
 		t.Errorf("MaxFrameSize = %d, want %d", d.MaxFrameSize, 1<<20)
 	}
-	if d.InitialWindowSize != 65535 {
-		t.Errorf("InitialWindowSize = %d, want 65535", d.InitialWindowSize)
+	if d.InitialWindowSize != 1<<20 {
+		t.Errorf("InitialWindowSize = %d, want %d", d.InitialWindowSize, 1<<20)
 	}
 	if d.MaxConcurrentStreams != 100 {
 		t.Errorf("MaxConcurrentStreams = %d, want 100", d.MaxConcurrentStreams)
