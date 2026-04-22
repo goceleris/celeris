@@ -52,6 +52,10 @@ type Server struct {
 	built bool
 	srv   *http.Server
 	ln    net.Listener
+
+	drivers       *driverState
+	mountedChain  bool
+	mountedDriver bool
 }
 
 func newServer(name string, m mode) *Server {
@@ -137,8 +141,12 @@ func drainBody(r *http.Request) {
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
+	// Mount before Build so iris's route tree includes the new prefixes.
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
+
 	s.mu.Lock()
 	if !s.built {
 		if err := s.app.Build(); err != nil {
@@ -180,7 +188,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return s.srv.Shutdown(shutdownCtx)
+	err := s.srv.Shutdown(shutdownCtx)
+	s.shutdownDriverHandlers()
+	return err
 }
 
 // buildJSONPayload mirrors the celeris builder.
