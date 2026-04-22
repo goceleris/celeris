@@ -96,8 +96,11 @@ func benchmarkSSE(b *testing.B, start func() (url string, stop func())) {
 
 // --- Celeris --------------------------------------------------------
 
-func startSSECeleris() (string, func()) {
-	srv := celeris.New(celeris.Config{Addr: "127.0.0.1:0"})
+// newCelerisSSEServer builds a celeris *Server with the /events handler
+// registered. engType lets the caller pick between Std (apples-to-apples
+// with stdhttp/chi/echo) and native engines.
+func newCelerisSSEServer(engType celeris.EngineType) *celeris.Server {
+	srv := celeris.New(celeris.Config{Addr: "127.0.0.1:0", Engine: engType})
 	srv.GET("/events", sse.New(sse.Config{
 		HeartbeatInterval: 0,
 		Handler: func(c *sse.Client) {
@@ -110,21 +113,44 @@ func startSSECeleris() (string, func()) {
 			}
 		},
 	}))
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(err)
+	return srv
+}
+
+func startSSECelerisWith(engType celeris.EngineType) func() (string, func()) {
+	return func() (string, func()) {
+		srv := newCelerisSSEServer(engType)
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			panic(err)
+		}
+		go func() { _ = srv.StartWithListener(ln) }()
+		// Wait until the server's Addr is wired (StartWithListener
+		// initialises the engine asynchronously).
+		for i := 0; i < 200; i++ {
+			if srv.Addr() != nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return "http://" + ln.Addr().String() + "/events", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+		}
 	}
-	go func() { _ = srv.StartWithListener(ln) }()
-	return "http://" + ln.Addr().String() + "/events", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	}
+}
+
+func startSSECeleris() (string, func()) {
+	return startSSECelerisWith(celeris.Std)()
 }
 
 func BenchmarkSSE_Celeris(b *testing.B) {
 	benchmarkSSE(b, startSSECeleris)
 }
+
+// Native-engine variants (linux-only under the build tag).
+func BenchmarkSSE_CelerisEpoll(b *testing.B)   { benchmarkSSE(b, startSSECelerisWith(celeris.Epoll)) }
+func BenchmarkSSE_CelerisIOUring(b *testing.B) { benchmarkSSE(b, startSSECelerisWith(celeris.IOUring)) }
 
 // --- stdhttp -------------------------------------------------------
 
