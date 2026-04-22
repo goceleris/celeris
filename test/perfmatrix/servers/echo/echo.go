@@ -49,6 +49,10 @@ type Server struct {
 	e   *echov4.Echo
 	srv *http.Server
 	ln  net.Listener
+
+	drivers       *driverState
+	mountedChain  bool
+	mountedDriver bool
 }
 
 func newServer(name string, m mode) *Server {
@@ -125,8 +129,11 @@ func drainBody(r *http.Request) {
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -154,7 +161,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.srv == nil {
 		return nil
 	}
-	return s.srv.Shutdown(ctx)
+	err := s.srv.Shutdown(ctx)
+	s.shutdownDriverHandlers()
+	return err
 }
 
 // buildJSONPayload mirrors the celeris builder.
