@@ -72,7 +72,10 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(body) > 0 {
-			_, _ = s.GetBuf().Write(body)
+			// body is a freshly-allocated slice from io.ReadAll; install
+			// as zero-copy override so GetData avoids the Buffer.Write
+			// memcpy (critical for large-body POSTs).
+			s.SetRawBody(body)
 		}
 	}
 

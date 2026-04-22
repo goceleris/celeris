@@ -516,7 +516,10 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	s.IsHEAD = req.Method == "HEAD"
 
 	if len(body) > 0 {
-		_, _ = s.GetBuf().Write(body)
+		// Zero-copy: body is a slice into the H1 read buffer that stays
+		// stable for the handler's synchronous lifetime (state.buffer is
+		// only advanced past these bytes before handler dispatch).
+		s.SetRawBody(body)
 	}
 	s.EndStream = true
 	// Direct assignment — no mutex needed. H1 streams are single-threaded

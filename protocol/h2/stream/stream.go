@@ -38,6 +38,7 @@ type Stream struct {
 	Headers                [][2]string
 	Trailers               [][2]string
 	Data                   *bytes.Buffer
+	rawBody                []byte // zero-copy body slice (preferred over Data when set)
 	OutboundBuffer         *bytes.Buffer
 	OutboundEndStream      bool
 	headersSent            atomic.Bool
@@ -207,6 +208,7 @@ func (s *Stream) resetAndPool() {
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
+	s.rawBody = nil
 	if s.OutboundBuffer != nil {
 		s.OutboundBuffer.Reset()
 		bufferPool.Put(s.OutboundBuffer)
@@ -262,6 +264,7 @@ func ResetH1Stream(s *Stream) {
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
+	s.rawBody = nil
 	s.Headers = s.hdrBuf[:0]
 	s.headersSent.Store(false)
 	s.EndStream = false
@@ -279,6 +282,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	} else {
 		s.Data = getBuf()
 	}
+	s.rawBody = nil
 	if s.OutboundBuffer != nil {
 		s.OutboundBuffer.Reset()
 	} else {
@@ -335,13 +339,40 @@ func (s *Stream) AddData(data []byte) error {
 }
 
 // GetData returns the buffered data.
+//
+// For H1 streams a raw body slice may be installed via SetRawBody — that
+// slice is returned directly, avoiding the per-request memcpy that
+// Data.Write would incur. H2 and the buffered fallback path still go
+// through s.Data.
 func (s *Stream) GetData() []byte {
+	if s.h1Mode {
+		// Single-threaded H1: no lock, no atomics on the read path.
+		if s.rawBody != nil {
+			return s.rawBody
+		}
+		if s.Data == nil {
+			return nil
+		}
+		return s.Data.Bytes()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.rawBody != nil {
+		return s.rawBody
+	}
 	if s.Data == nil {
 		return nil
 	}
 	return s.Data.Bytes()
+}
+
+// SetRawBody installs a zero-copy body slice on the stream. The caller
+// must guarantee the backing array stays valid for the handler's
+// lifetime. Intended for H1 and std-bridge paths where the body is
+// already materialised as a contiguous slice (into the read buffer or a
+// freshly allocated heap slice). Passing nil clears the override.
+func (s *Stream) SetRawBody(b []byte) {
+	s.rawBody = b
 }
 
 // GetHeaders returns the headers. For single-threaded H1 streams, returns
