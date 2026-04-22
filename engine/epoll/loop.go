@@ -474,7 +474,19 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 
 	for {
-		n, err := unix.Read(fd, cs.buf)
+		// Zero-copy body recv: when H1 is in a partial-body state we read
+		// directly into the tail of H1State.bodyBuf — skipping the
+		// cs.buf → bodyBuf memcpy that would otherwise happen on every
+		// read for a multi-read POST.
+		recvBuf := cs.buf
+		intoBody := false
+		if cs.h1State != nil {
+			if b := cs.h1State.NextRecvBuf(); b != nil {
+				recvBuf = b
+				intoBody = true
+			}
+		}
+		n, err := unix.Read(fd, recvBuf)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
@@ -509,9 +521,75 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 
-		data := cs.buf[:n]
-
 		cs.lastActivity = now
+
+		// Direct-into-bodyBuf completion path: we read straight into
+		// H1State.bodyBuf; dispatch the handler if the body is full,
+		// otherwise continue the recv loop for the next chunk.
+		if intoBody {
+			complete := cs.h1State.ConsumeBodyRecv(n)
+			if !complete {
+				continue
+			}
+			rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, l.handler, cs.writeFn)
+			if errors.Is(derr, conn.ErrUpgradeH2C) {
+				if err := l.switchToH2(cs, cs.writeFn); err != nil {
+					l.closeConn(fd)
+					return
+				}
+			} else if derr != nil {
+				if errors.Is(derr, conn.ErrHijacked) {
+					return
+				}
+				if mu := cs.detachMu; mu != nil {
+					mu.Lock()
+				}
+				_ = flushWrites(cs)
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				l.closeConn(fd)
+				return
+			}
+			if len(rest) > 0 {
+				// Tail bytes after the body — feed them back through
+				// the normal parser for pipelined request(s).
+				if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn); perr != nil {
+					if errors.Is(perr, conn.ErrHijacked) {
+						return
+					}
+					if mu := cs.detachMu; mu != nil {
+						mu.Lock()
+					}
+					_ = flushWrites(cs)
+					if mu := cs.detachMu; mu != nil {
+						mu.Unlock()
+					}
+					l.closeConn(fd)
+					return
+				}
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
+			if err := flushWrites(cs); err != nil {
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				l.closeConn(fd)
+				return
+			}
+			dirty := len(cs.writeBuf)-cs.writePos > 0 || len(cs.bodyBuf) > 0
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			if dirty {
+				l.markDirty(cs)
+			}
+			continue
+		}
+
+		data := cs.buf[:n]
 
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)

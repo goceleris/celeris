@@ -127,6 +127,72 @@ func (s *H1State) maxBodySize() int64 {
 	return s.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
 }
 
+// NextRecvBuf returns the tail of the pending body buffer when H1 is in a
+// partial-body state, so the engine can recv directly into bodyBuf and
+// skip the cs.buf → bodyBuf memcpy. Returns nil when the engine should
+// use its own per-connection read buffer.
+//
+// Callers MUST pair a successful non-nil read with ConsumeBodyRecv(n) so
+// H1State can detect body completion and trigger handler dispatch.
+func (s *H1State) NextRecvBuf() []byte {
+	if s.bodyNeeded <= 0 {
+		return nil
+	}
+	free := cap(s.bodyBuf) - len(s.bodyBuf)
+	if free <= 0 {
+		return nil
+	}
+	return s.bodyBuf[len(s.bodyBuf) : len(s.bodyBuf)+free]
+}
+
+// ConsumeBodyRecv extends bodyBuf by n bytes and reports whether the body
+// is now complete. Paired with NextRecvBuf on the engine side.
+func (s *H1State) ConsumeBodyRecv(n int) (complete bool) {
+	s.bodyBuf = s.bodyBuf[: len(s.bodyBuf)+n]
+	return len(s.bodyBuf) >= s.bodyNeeded
+}
+
+// DispatchBufferedBody runs the handler against the fully-buffered body
+// that NextRecvBuf / ConsumeBodyRecv accumulated. The engine must have
+// observed complete=true from ConsumeBodyRecv. Returns the residual
+// unread bytes if the recv overshot into the next pipelined request, or
+// nil when nothing is left. KeepAlive / Detached state lives on s.req —
+// same semantics as ProcessH1's equivalent exit.
+func (s *H1State) DispatchBufferedBody(ctx context.Context, handler stream.Handler, write func([]byte)) ([]byte, error) {
+	overflow := len(s.bodyBuf) - s.bodyNeeded
+	var rest []byte
+	if overflow > 0 {
+		rest = append([]byte(nil), s.bodyBuf[s.bodyNeeded:]...)
+		s.bodyBuf = s.bodyBuf[:s.bodyNeeded]
+	}
+	s.parser.Reset(s.buffer.Bytes())
+	s.req.Reset()
+	if _, err := s.parser.ParseRequest(&s.req); err != nil {
+		writeErrorResponse(write, 400, "Bad Request")
+		return nil, err
+	}
+	s.buffer.Reset()
+	bodyData := s.bodyBuf
+	if err := tryUpgradeH2C(s, bodyData, rest, write); err != nil {
+		return nil, err
+	}
+	if s.UpgradeInfo != nil {
+		return nil, ErrUpgradeH2C
+	}
+	if err := handleH1Request(ctx, s, bodyData, handler, write); err != nil {
+		return nil, err
+	}
+	s.bodyBuf = s.bodyBuf[:0]
+	s.bodyNeeded = 0
+	if s.Detached {
+		return nil, nil
+	}
+	if !s.req.KeepAlive {
+		return nil, errConnectionClose
+	}
+	return rest, nil
+}
+
 // NewH1State creates a new H1 connection state with zero-copy header parsing.
 func NewH1State() *H1State {
 	p := h1.NewParser()
