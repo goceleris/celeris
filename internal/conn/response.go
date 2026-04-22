@@ -266,8 +266,22 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 // Safe only when called from the event loop under H2State.mu.
 type h2InlineResponseAdapter struct {
 	outBuf       *bytes.Buffer
-	maxFrameSize uint32
+	maxFrameSize uint32          // peer's advertised MAX_FRAME_SIZE (updated via Refresh)
+	manager      *stream.Manager // peer-SETTINGS-aware source of max frame size
 	enc          h2StreamEncoder // per-connection encoder (no sync.Pool needed for inline path)
+}
+
+// peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE.
+// Falls back to the adapter's default (cfg.MaxFrameSize, capped to 16 KiB when
+// the manager is nil, e.g. in unit tests).
+func (a *h2InlineResponseAdapter) peerMaxFrame() uint32 {
+	if a.manager != nil {
+		return a.manager.GetMaxFrameSize()
+	}
+	if a.maxFrameSize == 0 {
+		return 16384
+	}
+	return a.maxFrameSize
 }
 
 func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, headers [][2]string, body []byte) error {
@@ -315,10 +329,7 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 	}
 
 	endStream := len(body) == 0
-	maxFrame := a.maxFrameSize
-	if maxFrame == 0 {
-		maxFrame = 16384
-	}
+	maxFrame := a.peerMaxFrame()
 
 	// Write frames directly to outBuf — no intermediate allocation.
 	// Fast path: single HEADERS frame (fits in one frame, the common case).
@@ -341,8 +352,8 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 				sendLen = int(window)
 			}
 			isEnd := sendLen == len(body)
-			writeH2FrameHeader(a.outBuf, h2FrameData, isEnd, s.ID, sendLen)
-			a.outBuf.Write(body[:sendLen])
+			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE (not our own).
+			writeH2DataFragmented(a.outBuf, s.ID, isEnd, body[:sendLen], maxFrame)
 			s.DeductWindow(int32(sendLen))
 			if !isEnd {
 				s.BufferOutbound(body[sendLen:], true)
@@ -373,7 +384,20 @@ type h2ResponseAdapter struct {
 	outBuf       *bytes.Buffer
 	writer       *frame.Writer
 	writeQueue   *h2ShardedQueue // async response queue (sharded)
-	maxFrameSize uint32
+	maxFrameSize uint32          // our own advertised MAX_FRAME_SIZE (fallback)
+	manager      *stream.Manager // peer-SETTINGS-aware source of max frame size
+}
+
+// peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE,
+// falling back to the adapter's default when the manager hasn't been wired yet.
+func (a *h2ResponseAdapter) peerMaxFrame() uint32 {
+	if a.manager != nil {
+		return a.manager.GetMaxFrameSize()
+	}
+	if a.maxFrameSize == 0 {
+		return 16384
+	}
+	return a.maxFrameSize
 }
 
 // WriteResponse builds complete response frame bytes using a goroutine-local
@@ -407,10 +431,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			if s.IsHEAD {
 				body = nil
 			}
-			maxFrame := a.maxFrameSize
-			if maxFrame == 0 {
-				maxFrame = 16384
-			}
+			maxFrame := a.peerMaxFrame()
 
 			pooled := getH2FrameBuf()
 			frameBuf := (*pooled)[:0]
@@ -429,7 +450,8 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 						sendLen = int(window)
 					}
 					isEnd := sendLen == len(body)
-					frameBuf = appendH2Data(frameBuf, s.ID, isEnd, body[:sendLen])
+					// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
+					frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
 					s.DeductWindow(int32(sendLen))
 					if !isEnd {
 						s.BufferOutbound(body[sendLen:], true)
@@ -462,10 +484,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	}
 
 	endStream := len(body) == 0
-	maxFrame := a.maxFrameSize
-	if maxFrame == 0 {
-		maxFrame = 16384
-	}
+	maxFrame := a.peerMaxFrame()
 
 	// Use pooled frame buffer to eliminate per-response allocation.
 	pooled := getH2FrameBuf()
@@ -490,7 +509,8 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 				sendLen = int(window)
 			}
 			isEnd := sendLen == len(body)
-			frameBuf = appendH2Data(frameBuf, s.ID, isEnd, body[:sendLen])
+			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
+			frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
 			s.DeductWindow(int32(sendLen))
 
 			if !isEnd {
@@ -705,10 +725,7 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 		return fmt.Errorf("HPACK encode error: %w", err)
 	}
 
-	maxFrame := a.maxFrameSize
-	if maxFrame == 0 {
-		maxFrame = 16384
-	}
+	maxFrame := a.peerMaxFrame()
 
 	pooled := getH2FrameBuf()
 	frameBuf := (*pooled)[:0]
@@ -727,13 +744,20 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 }
 
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
+	maxFrame := a.peerMaxFrame()
 	pooled := getH2FrameBuf()
 	frameBuf := (*pooled)[:0]
-	needed := 9 + len(data)
+	// Worst case: one 9-byte header per maxFrame-sized chunk plus the data itself.
+	numChunks := (len(data) + int(maxFrame) - 1) / int(maxFrame)
+	if numChunks == 0 {
+		numChunks = 1
+	}
+	needed := 9*numChunks + len(data)
 	if cap(frameBuf) < needed {
 		frameBuf = make([]byte, 0, needed)
 	}
-	frameBuf = appendH2Data(frameBuf, s.ID, false, data)
+	// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
+	frameBuf = appendH2DataFragmented(frameBuf, s.ID, false, data, maxFrame)
 	*pooled = frameBuf
 	a.writeQueue.Enqueue(s.ID, pooled)
 	return nil

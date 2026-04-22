@@ -9,9 +9,19 @@ import (
 
 // Writer handles HTTP/2 frame writing with mutex protection.
 type Writer struct {
-	framer *http2.Framer
-	writer io.Writer
-	mu     sync.Mutex
+	framer       *http2.Framer
+	writer       io.Writer
+	mu           sync.Mutex
+	maxFrameSize uint32 // peer's SETTINGS_MAX_FRAME_SIZE; 0 = use RFC default 16 KiB
+}
+
+// SetMaxFrameSize updates the peer's advertised SETTINGS_MAX_FRAME_SIZE.
+// Subsequent WriteData calls will split payloads larger than this value into
+// multiple DATA frames. Safe to call from any goroutine.
+func (w *Writer) SetMaxFrameSize(v uint32) {
+	w.mu.Lock()
+	w.maxFrameSize = v
+	w.mu.Unlock()
 }
 
 // NewWriter creates a new frame writer. The underlying http2.Framer is
@@ -136,7 +146,10 @@ func (w *Writer) WriteHeaders(streamID uint32, endStream bool, headerBlock []byt
 	return nil
 }
 
-// WriteData writes a DATA frame.
+// WriteData writes one or more DATA frames, fragmenting by the peer's
+// advertised SETTINGS_MAX_FRAME_SIZE (RFC 7540 §4.2). When
+// SetMaxFrameSize has not been called the writer defaults to 16 KiB.
+// endStream is applied to the final fragment only.
 func (w *Writer) WriteData(streamID uint32, endStream bool, data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -144,7 +157,30 @@ func (w *Writer) WriteData(streamID uint32, endStream bool, data []byte) error {
 		return nil
 	}
 	w.ensureFramer()
-	return w.framer.WriteData(streamID, endStream, data)
+
+	maxFrame := int(w.maxFrameSize)
+	if maxFrame <= 0 {
+		maxFrame = 16384
+	}
+
+	// Fast path: fits in a single frame.
+	if len(data) <= maxFrame {
+		return w.framer.WriteData(streamID, endStream, data)
+	}
+
+	remaining := data
+	for len(remaining) > 0 {
+		chunkLen := maxFrame
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		isLast := chunkLen == len(remaining)
+		if err := w.framer.WriteData(streamID, isLast && endStream, remaining[:chunkLen]); err != nil {
+			return err
+		}
+		remaining = remaining[chunkLen:]
+	}
+	return nil
 }
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.

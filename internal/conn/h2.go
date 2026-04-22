@@ -374,6 +374,58 @@ func appendH2Data(buf []byte, streamID uint32, endStream bool, data []byte) []by
 	return appendH2Frame(buf, h2FrameData, flags, streamID, data)
 }
 
+// appendH2DataFragmented appends one or more DATA frames, splitting data by
+// maxFrameSize. RFC 7540 §4.2 requires senders to respect the peer's
+// advertised SETTINGS_MAX_FRAME_SIZE, which defaults to 16 KiB. endStream is
+// applied only to the final fragment.
+func appendH2DataFragmented(buf []byte, streamID uint32, endStream bool, data []byte, maxFrameSize uint32) []byte {
+	if maxFrameSize == 0 {
+		maxFrameSize = 16384
+	}
+	if len(data) == 0 {
+		return appendH2Data(buf, streamID, endStream, data)
+	}
+	remaining := data
+	for len(remaining) > 0 {
+		chunkLen := int(maxFrameSize)
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		isLast := chunkLen == len(remaining)
+		var flags byte
+		if isLast && endStream {
+			flags |= h2FlagEndStream
+		}
+		buf = appendH2Frame(buf, h2FrameData, flags, streamID, remaining[:chunkLen])
+		remaining = remaining[chunkLen:]
+	}
+	return buf
+}
+
+// writeH2DataFragmented writes one or more DATA frames directly to buf,
+// splitting data by maxFrameSize. Used by the inline adapter which appends
+// straight to the connection's outBuf without going through a pooled []byte.
+func writeH2DataFragmented(buf *bytes.Buffer, streamID uint32, endStream bool, data []byte, maxFrameSize uint32) {
+	if maxFrameSize == 0 {
+		maxFrameSize = 16384
+	}
+	if len(data) == 0 {
+		writeH2FrameHeader(buf, h2FrameData, endStream, streamID, 0)
+		return
+	}
+	remaining := data
+	for len(remaining) > 0 {
+		chunkLen := int(maxFrameSize)
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		isLast := chunkLen == len(remaining)
+		writeH2FrameHeader(buf, h2FrameData, isLast && endStream, streamID, chunkLen)
+		buf.Write(remaining[:chunkLen])
+		remaining = remaining[chunkLen:]
+	}
+}
+
 // H2State holds per-connection H2 state.
 //
 // Sub-structures (outBuf, inBuf, wq, rw, inlineRW) are embedded as VALUES
@@ -443,6 +495,9 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	}
 
 	fw := frame.NewWriter(&s.outBuf)
+	// Start the writer at the RFC-default 16 KiB. Peer SETTINGS updates are
+	// propagated by the processor's SettingsMaxFrameSize handler.
+	fw.SetMaxFrameSize(16384)
 	s.writer = fw
 	s.adapter.writer = fw
 
@@ -453,6 +508,13 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
 	proc.GetManager().SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
 	s.processor = proc
+
+	// Wire the manager into both adapters so outbound DATA/HEADERS fragment
+	// by the peer's SETTINGS_MAX_FRAME_SIZE (RFC 7540 §4.2), not our own
+	// advertised MAX_FRAME_SIZE. The manager's default is 16 KiB until the
+	// peer's SETTINGS lands.
+	s.adapter.manager = proc.GetManager()
+	s.inlineAdapter.manager = proc.GetManager()
 
 	p := frame.NewParser()
 	p.InitReader(&s.inBuf)

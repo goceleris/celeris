@@ -76,13 +76,6 @@ func prepSend(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	}
 }
 
-func prepClose(sqePtr unsafe.Pointer, fd int) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opCLOSE
-	sqe[1] = sqeCQESkipSuccess // suppress CQE for successful close
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
-}
-
 // prepCloseDirect closes a fixed file entry by index. The fd field is unused
 // (set to 0); file_index identifies the slot.
 func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {

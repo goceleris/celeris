@@ -413,6 +413,13 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			p.manager.mu.Lock()
 			atomic.StoreUint32(&p.manager.maxFrameSize, s.Val)
 			p.manager.mu.Unlock()
+			// Propagate to the frame writer so WriteData fragments by the
+			// peer's SETTINGS_MAX_FRAME_SIZE (RFC 7540 §4.2). The interface
+			// doesn't require SetMaxFrameSize — native engines implement it
+			// on *frame.Writer, stdlib/test mocks may not.
+			if setter, ok := p.writer.(interface{ SetMaxFrameSize(uint32) }); ok {
+				setter.SetMaxFrameSize(s.Val)
+			}
 		case http2.SettingMaxHeaderListSize:
 			// No specific validation
 		}
