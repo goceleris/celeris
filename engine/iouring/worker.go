@@ -1558,7 +1558,37 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 
 		cs.detachMu.Lock()
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
-		hasWrite := len(cs.writeBuf) > 0
+		// Direct-write fast path: on the async-handler goroutine, call
+		// unix.Write(fd, writeBuf) inline instead of bouncing through
+		// the detachQueue → eventfd → worker → SEND-SQE round-trip.
+		// The iouring multishot recv on this fd is unaffected — TCP is
+		// bidirectional and the kernel happily admits a concurrent write
+		// from any goroutine even while a recv SQE is pending. Mirrors
+		// the engine/epoll runAsyncHandler shape (engine/epoll/loop.go:990)
+		// and closes the 3× integrated-Redis regression observed on
+		// iouring (95 µs/op → target ~30 µs/op, matching epoll and
+		// go-redis + stdlib).
+		var partial bool
+		if processErr == nil && len(cs.writeBuf) > 0 {
+			n, werr := unix.Write(cs.fd, cs.writeBuf)
+			if werr != nil {
+				if werr == unix.EAGAIN || werr == unix.EWOULDBLOCK {
+					// Socket send buffer full — defer to the worker so
+					// flushSend can retry under dirty-list management.
+					partial = true
+				} else {
+					processErr = werr
+				}
+			} else if n < len(cs.writeBuf) {
+				// Partial write — shift remainder and defer to worker.
+				remaining := len(cs.writeBuf) - n
+				copy(cs.writeBuf, cs.writeBuf[n:])
+				cs.writeBuf = cs.writeBuf[:remaining]
+				partial = true
+			} else {
+				cs.writeBuf = cs.writeBuf[:0]
+			}
+		}
 		cs.detachMu.Unlock()
 
 		if processErr != nil {
@@ -1581,7 +1611,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			return
 		}
 
-		if hasWrite {
+		if partial {
 			w.detachQMu.Lock()
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
