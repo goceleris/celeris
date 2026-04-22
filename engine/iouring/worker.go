@@ -940,26 +940,13 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	var data []byte
-	var providedBufID uint16
-	hasProvidedBuf := false
-
-	if cqeHasBuffer(c.Flags) && w.bufRing != nil {
-		// Multishot recv with ring-mapped provided buffers.
-		providedBufID = cqeBufferID(c.Flags)
-		data = w.bufRing.GetBuffer(providedBufID, int(c.Res))
-		hasProvidedBuf = true
-	} else {
-		// Per-connection buffer (single-shot recv).
-		data = cs.buf[:c.Res]
-	}
-
 	cs.lastActivity = now
 
 	// Direct-into-bodyBuf path: the previous recv SQE targeted
-	// H1State.bodyBuf (NextRecvBuf). Skip ProcessH1, extend the body, and
-	// dispatch the handler when the body is full. Bypasses the
-	// cs.buf→bodyBuf memcpy that the normal recv path would incur.
+	// H1State.bodyBuf (NextRecvBuf). The CQE's Res applies to bodyBuf,
+	// NOT cs.buf, so check this FIRST — indexing cs.buf[:c.Res] when
+	// c.Res > cap(cs.buf) would panic. Skip ProcessH1, extend the body,
+	// and dispatch the handler when the body is full.
 	if cs.recvIntoBody && cs.h1State != nil {
 		cs.recvIntoBody = false
 		complete := cs.h1State.ConsumeBodyRecv(int(c.Res))
@@ -1024,6 +1011,20 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			}
 		}
 		return
+	}
+
+	var data []byte
+	var providedBufID uint16
+	hasProvidedBuf := false
+
+	if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+		// Multishot recv with ring-mapped provided buffers.
+		providedBufID = cqeBufferID(c.Flags)
+		data = w.bufRing.GetBuffer(providedBufID, int(c.Res))
+		hasProvidedBuf = true
+	} else {
+		// Per-connection buffer (single-shot recv).
+		data = cs.buf[:c.Res]
 	}
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
