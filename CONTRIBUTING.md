@@ -117,7 +117,7 @@ mage -l    # List all available targets
 - Unit tests go in `*_test.go` files alongside the code
 - Integration tests (multi-engine, adaptive, etc.) go in `test/integration/`
 - Conformance tests (HTTP/1.1 RFC 9112, HTTP/2 h2spec) go in `test/spec/`
-- Middleware benchmarks comparing against other frameworks go in `test/benchcmp/`
+- Cross-framework performance benchmarks go in `test/perfmatrix/` (scenario × server × protocol matrix driven by `loadgen`); driver-isolation benchmarks in `test/drivercmp/`; WebSocket comparisons in `test/benchcmp_ws/`.
 - Use the `celeristest` package for Context/ResponseRecorder test helpers
 - Run with `-race` flag (all CI runs use race detection)
 

@@ -53,7 +53,7 @@ func runComplianceDirect() error {
 	}
 	var testPkgs []string
 	for _, p := range strings.Split(pkgs, "\n") {
-		if !strings.Contains(p, "/test/spec") && !strings.Contains(p, "/test/loadtest") {
+		if !strings.Contains(p, "/test/spec") {
 			testPkgs = append(testPkgs, p)
 		}
 	}
@@ -130,8 +130,8 @@ func runComplianceInVM() error {
 		"FAILURES=0",
 		"",
 		"echo '=== Phase 1: Unit Tests (race detector) ==='",
-		"# Exclude test/spec (run separately in Phase 3) and test/loadtest (Linux binaries, not tests).",
-		"if ! go test -race -count=1 -timeout=600s $(go list ./... | grep -v '/test/spec' | grep -v '/test/loadtest'); then",
+		"# Exclude test/spec (run separately in Phase 3).",
+		"if ! go test -race -count=1 -timeout=600s $(go list ./... | grep -v '/test/spec'); then",
 		"  echo 'PHASE 1 FAILED'",
 		"  FAILURES=$((FAILURES+1))",
 		"fi",

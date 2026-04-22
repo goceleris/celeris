@@ -276,9 +276,9 @@ For Prometheus exposition and debug endpoints, use the [`middleware/metrics`](mi
 
 For current benchmark results and methodology, see [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks).
 
-Middleware comparison benchmarks are in [`test/benchcmp/`](test/benchcmp/) (Celeris vs Fiber v3 vs Echo v4 vs Chi v5 vs stdlib). Run with `mage middlewareBenchmark`.
+Cross-framework performance benchmarks live in [`test/perfmatrix/`](test/perfmatrix/) — a (scenario × server × protocol) matrix driven by `loadgen`. Run the full sweep with `mage matrixBench` or the dev-loop subset with `mage matrixBenchQuick`. Driver-isolation benchmarks remain in [`test/drivercmp/`](test/drivercmp/) and WebSocket comparisons in [`test/benchcmp_ws/`](test/benchcmp_ws/).
 
-> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use `test/benchcmp/` for fair cross-framework comparisons.
+> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use `test/perfmatrix/` for fair cross-framework comparisons.
 
 ## Project Structure
 
