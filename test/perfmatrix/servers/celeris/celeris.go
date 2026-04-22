@@ -146,8 +146,12 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 		return nil, fmt.Errorf("celeris perfmatrix: %s already started", s.name)
 	}
 
+	// Don't set cfg.Addr: we use StartWithListener which owns the bind.
+	// Non-adaptive engines warn-and-discard a redundant Addr, but the
+	// Adaptive engine's sub-engines (epoll + iouring) elevate that to a
+	// fatal "ambiguous configuration" validation error — eating every
+	// adaptive-engine cell in the perfmatrix run. Leave Addr empty.
 	cfg := celeris.Config{
-		Addr:            "127.0.0.1:0",
 		Engine:          s.engine,
 		Protocol:        s.protocol,
 		EnableH2Upgrade: s.h2cUpgrade,
