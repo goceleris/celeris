@@ -49,6 +49,15 @@ type Server struct {
 	router chiv5.Router
 	srv    *http.Server
 	ln     net.Listener
+
+	// drivers holds driver clients (built by mountDriverHandlers) so
+	// Stop can close them on teardown.
+	drivers *driverState
+
+	// mountedChain / mountedDriver guard against double-registration of
+	// /chain/* and driver routes on repeated Start calls.
+	mountedChain  bool
+	mountedDriver bool
 }
 
 func newServer(name string, m mode) *Server {
@@ -131,8 +140,15 @@ func drainBody(r *http.Request) {
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
+	// Wave-3 additions: driver-backed and middleware-chain scenarios.
+	// Routes are registered exactly once per Server via mount guards;
+	// repeat Start calls rebuild driver clients but do not re-register
+	// routes (chi's router panics on duplicate patterns).
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -159,7 +175,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.srv == nil {
 		return nil
 	}
-	return s.srv.Shutdown(ctx)
+	err := s.srv.Shutdown(ctx)
+	s.shutdownDriverHandlers()
+	return err
 }
 
 // buildJSONPayload mirrors the celeris builder.
