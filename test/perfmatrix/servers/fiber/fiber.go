@@ -40,6 +40,10 @@ type Server struct {
 	ln     net.Listener
 	errCh  chan error
 	closed chan struct{}
+
+	drivers       *driverState
+	mountedChain  bool
+	mountedDriver bool
 }
 
 // New returns the fiber-h1 Server.
@@ -130,9 +134,13 @@ func (s *Server) registerStatic() {
 }
 
 // Start implements servers.Server.
-func (s *Server) Start(ctx context.Context, _ *services.Handles) (net.Listener, error) {
+func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
 	s.ensureApp()
+	// Wave-3: mount middleware chain routes before driver routes so
+	// fiber's per-prefix Use() attaches before the terminal handlers.
+	mountChainHandlers(s)
+	mountDriverHandlers(s, svcs)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -154,12 +162,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	done := make(chan error, 1)
 	go func() { done <- s.app.ShutdownWithContext(ctx) }()
+	var err error
 	select {
-	case err := <-done:
-		return err
+	case err = <-done:
 	case <-ctx.Done():
-		return ctx.Err()
+		err = ctx.Err()
 	}
+	s.shutdownDriverHandlers()
+	return err
 }
 
 // buildJSONPayload mirrors the celeris package's builder: ~targetBytes
