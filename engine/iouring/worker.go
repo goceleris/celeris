@@ -1657,6 +1657,19 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		cs.asyncInMu.Unlock()
 
 		cs.detachMu.Lock()
+		// Re-check asyncClosed under detachMu. closeConn sets
+		// asyncClosed BEFORE taking detachMu to run CloseH1; if we
+		// raced past the top-of-loop check but closeConn acquired
+		// detachMu first, by the time we hold detachMu our cs.h1State
+		// may already be torn down. Bail out here so we don't call
+		// ProcessH1 on a closed state.
+		if cs.asyncClosed.Load() {
+			cs.detachMu.Unlock()
+			cs.asyncInMu.Lock()
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 		// H1→H2 upgrade on the async dispatch path. ProcessH1 has
 		// written the 101 Switching Protocols response to cs.writeBuf

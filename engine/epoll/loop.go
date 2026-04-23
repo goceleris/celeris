@@ -1079,6 +1079,16 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		cs.asyncInMu.Unlock()
 
 		cs.detachMu.Lock()
+		// Re-check asyncClosed under detachMu; closeConn sets it
+		// BEFORE tearing down cs.h1State. Mirrors the iouring fix
+		// (see engine/iouring/worker.go:runAsyncHandler).
+		if cs.asyncClosed.Load() {
+			cs.detachMu.Unlock()
+			cs.asyncInMu.Lock()
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
 		// H1→H2 upgrade on the async path. ProcessH1 has written the
 		// 101 Switching Protocols response into cs.writeBuf and stashed
