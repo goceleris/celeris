@@ -52,7 +52,13 @@ func TestAllowUnderLimit(t *testing.T) {
 
 func TestAllowRefill(t *testing.T) {
 	client := newTestClient(t)
-	s, err := New(context.Background(), client, Options{RPS: 1000, Burst: 1})
+	// RPS=10 → refill interval 100 ms. High enough that the "immediate
+	// second Allow" step cannot be pre-empted by a natural refill even
+	// on loaded CI runners (macos-latest observed ~7 ms latency between
+	// calls — at RPS=1000 that was enough for a refill to land, so the
+	// test flaked). 100 ms gives an order-of-magnitude margin; the
+	// waited "Allow after refill" step just waits 150 ms instead.
+	s, err := New(context.Background(), client, Options{RPS: 10, Burst: 1})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -64,8 +70,8 @@ func TestAllowRefill(t *testing.T) {
 	if allowed {
 		t.Fatal("immediate second Allow: expected false")
 	}
-	// After 5ms at 1000 RPS we should have ~5 tokens available.
-	time.Sleep(5 * time.Millisecond)
+	// 150 ms ≥ 1 refill interval (100 ms); the next Allow must succeed.
+	time.Sleep(150 * time.Millisecond)
 	allowed, _, _, _ = s.Allow("u")
 	if !allowed {
 		t.Fatal("Allow after refill: expected true")
