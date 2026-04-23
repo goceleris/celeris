@@ -128,15 +128,24 @@ func MatrixBenchStrict() error {
 	warmStr := envOrDefault("PERFMATRIX_WARMUP", "1s")
 	dur, _ := time.ParseDuration(durStr)
 	warm, _ := time.ParseDuration(warmStr)
-	// Default skip: celeris-std-{auto,h2c}* and stdhttp-{auto,h2c}* both
-	// use golang.org/x/net/http2/h2c which has a known upstream race
-	// between hpack.Encoder.SetMaxDynamicTableSize (SETTINGS path) and
-	// hpack.Encoder.WriteField (frame-write goroutine). That race is
-	// not celeris code and failing the matrix on it tells us nothing
-	// about celeris. Override via PERFMATRIX_CELLS if you want to
-	// include them anyway.
+	// Default skip: every server that wraps golang.org/x/net/http2/h2c
+	// for its auto/h2c configurations. That handler has a known
+	// upstream race between hpack.Encoder.SetMaxDynamicTableSize
+	// (SETTINGS path) and hpack.Encoder.WriteField (frame-write
+	// goroutine), which fires reliably under the first SETTINGS +
+	// first HEADERS exchange. The race is not celeris code; failing
+	// the matrix on it tells us nothing about celeris. Affected
+	// servers: celeris-std, stdhttp, chi, echo, gin, iris. fasthttp /
+	// fiber / hertz do not use x/net/http2 and stay included.
+	// Override via PERFMATRIX_CELLS to force-include.
 	cells := envOrDefault("PERFMATRIX_CELLS",
-		"*,!*/celeris-std-auto*,!*/celeris-std-h2c*,!*/stdhttp-auto,!*/stdhttp-h2c")
+		"*,"+
+			"!*/celeris-std-auto*,!*/celeris-std-h2c*,"+
+			"!*/stdhttp-auto,!*/stdhttp-h2c,"+
+			"!*/chi-auto,!*/chi-h2c,"+
+			"!*/echo-auto,!*/echo-h2c,"+
+			"!*/gin-auto,!*/gin-h2c,"+
+			"!*/iris-auto,!*/iris-h2c")
 	return runMatrix(matrixFlags{
 		runs:     runs,
 		duration: dur,
