@@ -212,18 +212,20 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 		return nil, fmt.Errorf("celeris perfmatrix: %s did not bind within deadline", s.name)
 	}
 
-	// Note: an h2c-upgrade readiness probe was attempted here but
-	// reliably produced more cell errors than it prevented. The
-	// underlying issue is that celeris' iouring/epoll engines
-	// occasionally drop the `HTTP/1.1 101 Switching Protocols` response
-	// on a direct upgrade, emitting the server's H2 SETTINGS frame
-	// instead. That is a real celeris-side bug tracked separately; the
-	// matrix tolerates the handful of auto-mix-111 failures rather than
-	// blocking every h2c+upg cell on a probe that can't distinguish a
-	// startup race from the latent bug. See probeH2CUpgrade below — it
-	// is retained so the helper can be reused once the underlying
-	// engine bug is fixed.
-	_ = wantH2CUpgrade
+	// h2c-upgrade readiness probe. For cells with EnableH2Upgrade true,
+	// Addr()≠nil is necessary but not sufficient — the handler chain and
+	// engine protocol dispatch can lag the listener bind. Send a real
+	// upgrade handshake and wait for any server response so the cell
+	// only runs load after the server is demonstrably ready.
+	if wantH2CUpgrade(s) {
+		if err := probeH2CUpgrade(srv.Addr().String(), 2*time.Second); err != nil {
+			engineCancel()
+			_ = ln.Close()
+			<-done
+			return nil, fmt.Errorf("celeris perfmatrix: %s h2c upgrade not ready: %w",
+				s.name, err)
+		}
+	}
 
 	s.srv = srv
 	// On the native engines StartWithListenerAndContext closes ln after
