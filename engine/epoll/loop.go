@@ -936,9 +936,20 @@ func (l *Loop) initProtocol(cs *connState) {
 // the H2 client preface and initial SETTINGS frame) are fed through
 // ProcessH2 synchronously so no data is dropped at the protocol boundary.
 func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
+	if err := l.switchToH2Local(cs, writeFn); err != nil {
+		return err
+	}
+	l.h2Conns = append(l.h2Conns, cs.fd)
+	return nil
+}
+
+// switchToH2Local does every part of switchToH2 except the l.h2Conns
+// append, which must happen on the worker goroutine (the slice is
+// worker-local and iterated without locks on the hot path). The async
+// dispatch goroutine uses this under cs.detachMu and then asks the
+// worker to finish via asyncH2Promoted + detachQueue.
+func (l *Loop) switchToH2Local(cs *connState, writeFn func([]byte)) error {
 	info := cs.h1State.UpgradeInfo
-	// Build H2 state FIRST. If it fails, cs.h1State remains intact so the
-	// caller's cleanup path can release it properly.
 	h2State, err := conn.NewH2StateFromUpgrade(l.handler, l.h2cfg, writeFn, l.eventFD, info)
 	if err != nil {
 		cs.h1State.UpgradeInfo = nil
@@ -951,15 +962,11 @@ func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
 	cs.h2State = h2State
 	cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	cs.protocol = engine.H2C
-	l.h2Conns = append(l.h2Conns, cs.fd)
 
 	var processErr error
 	if len(info.Remaining) > 0 {
 		processErr = conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, l.handler, writeFn, l.h2cfg)
 	}
-	// Release after ProcessH2 since Remaining aliases the H1 buffer — the
-	// info fields are still read by ProcessH2 above. ReleaseUpgradeInfo
-	// nils the slices so the backing buffer becomes GC-eligible.
 	conn.ReleaseUpgradeInfo(info)
 	return processErr
 }
@@ -1073,6 +1080,48 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 
 		cs.detachMu.Lock()
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
+		// H1→H2 upgrade on the async path. ProcessH1 has written the
+		// 101 Switching Protocols response into cs.writeBuf and stashed
+		// the upgrade info on cs.h1State. Promote cs-local state here
+		// (safe — holding detachMu), flush the 101 + server preface,
+		// then hand the conn back to the worker to (a) finish the
+		// promotion via l.h2Conns append and (b) resume recv in H2
+		// mode. The goroutine exits because from now on this conn uses
+		// the inline H2 path.
+		if errors.Is(processErr, conn.ErrUpgradeH2C) {
+			if err := l.switchToH2Local(cs, cs.writeFn); err != nil {
+				cs.detachMu.Unlock()
+				processErr = err
+			} else {
+				flushErr := error(nil)
+				if cs.writePos < len(cs.writeBuf) {
+					flushErr = flushWrites(cs)
+				}
+				partial := flushErr == nil && cs.writePos < len(cs.writeBuf)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				cs.asyncH2Promoted.Store(true)
+				cs.detachMu.Unlock()
+				if flushErr != nil || partial {
+					// Partial flush or flush error — worker will observe
+					// via detachQueue and either retry or teardown. Either
+					// way, signal now.
+					_ = partial
+				}
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
+				return
+			}
+		}
 		var flushErr error
 		if processErr == nil && cs.writePos < len(cs.writeBuf) {
 			flushErr = flushWrites(cs)
@@ -1137,6 +1186,17 @@ func (l *Loop) drainDetachQueue() {
 		// the teardown here.
 		if cs.asyncClosed.Load() {
 			l.closeConn(cs.fd)
+			continue
+		}
+		// Dispatch goroutine promoted the conn to H2 via switchToH2Local.
+		// Finish the worker-owned bits of the swap: register the fd on
+		// the H2 write-queue poll list. The conn stays alive and
+		// subsequent recvs dispatch via the inline H2 path (cs.protocol
+		// is already H2C).
+		if cs.asyncH2Promoted.Load() {
+			cs.asyncH2Promoted.Store(false)
+			l.h2Conns = append(l.h2Conns, cs.fd)
+			l.markDirty(cs)
 			continue
 		}
 		// Apply any pending pause/resume request from the WS middleware.

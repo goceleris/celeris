@@ -96,6 +96,12 @@ type connState struct {
 	asyncCond   sync.Cond   // L = &asyncInMu; signaled by worker on new data or close
 	asyncRun    bool        // true while the dispatch goroutine is alive
 	asyncClosed atomic.Bool // set by worker's close path; goroutine exits next iter
+	// asyncH2Promoted signals that runAsyncHandler observed ErrUpgradeH2C
+	// and completed the cs-local H1→H2 swap under detachMu. The worker
+	// must finish the promotion in drainDetachQueue (append fd to
+	// l.h2Conns — the only worker-thread-owned piece) and keep the conn
+	// alive instead of closing it.
+	asyncH2Promoted atomic.Bool
 }
 
 var connStatePool = sync.Pool{

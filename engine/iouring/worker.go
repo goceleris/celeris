@@ -865,32 +865,36 @@ func (w *Worker) initProtocol(cs *connState) {
 // (which may contain the H2 client preface + initial SETTINGS) through
 // ProcessH2 synchronously.
 func (w *Worker) switchToH2(cs *connState) error {
+	if err := w.switchToH2Local(cs); err != nil {
+		return err
+	}
+	if !w.h2PollArmed && w.h2EventFD >= 0 {
+		w.prepareH2Poll()
+		w.h2PollArmed = true
+	}
+	w.h2Conns = append(w.h2Conns, cs.fd)
+	return nil
+}
+
+// switchToH2Local does every part of switchToH2 except the worker-owned
+// steps (w.h2Conns append, prepareH2Poll) which must run on the worker
+// goroutine — that slice and SQE submission are SINGLE_ISSUER. The
+// async dispatch goroutine uses this under cs.detachMu and then asks
+// the worker to finish via asyncH2Promoted + detachQueue.
+func (w *Worker) switchToH2Local(cs *connState) error {
 	info := cs.h1State.UpgradeInfo
-	// Build H2 state FIRST. If it fails, cs.h1State remains intact so the
-	// caller's cleanup path (closeConn) can release it properly. Nulling
-	// h1State before the build would leave cs in an inconsistent state
-	// (protocol=HTTP1, h1State=nil, h2State=nil) that panics on any
-	// subsequent op.
 	h2State, err := conn.NewH2StateFromUpgrade(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD, info)
 	if err != nil {
-		// Clear UpgradeInfo so a second dispatch through ProcessH1 can't
-		// re-enter the upgrade path on the already-doomed conn.
 		cs.h1State.UpgradeInfo = nil
 		conn.ReleaseUpgradeInfo(info)
 		return err
 	}
-	// Success: release H1 state now that H2 has taken over.
 	cs.h1State.UpgradeInfo = nil
 	conn.CloseH1(cs.h1State)
 	cs.h1State = nil
 	cs.h2State = h2State
 	cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	cs.protocol = engine.H2C
-	if !w.h2PollArmed && w.h2EventFD >= 0 {
-		w.prepareH2Poll()
-		w.h2PollArmed = true
-	}
-	w.h2Conns = append(w.h2Conns, cs.fd)
 
 	var processErr error
 	if len(info.Remaining) > 0 {
@@ -1637,6 +1641,55 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 
 		cs.detachMu.Lock()
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+		// H1→H2 upgrade on the async dispatch path. ProcessH1 has
+		// written the 101 Switching Protocols response to cs.writeBuf
+		// and stashed the upgrade info. Promote cs-local state now
+		// (safe under detachMu), flush writeBuf synchronously, then
+		// hand off to the worker to register the fd on the H2 write-
+		// queue poll list. The goroutine exits — all subsequent recvs
+		// dispatch via the inline H2 path (cs.protocol is now H2C).
+		if errors.Is(processErr, conn.ErrUpgradeH2C) {
+			if err := w.switchToH2Local(cs); err != nil {
+				cs.detachMu.Unlock()
+				processErr = err
+			} else {
+				if len(cs.writeBuf) > 0 {
+					n, werr := unix.Write(cs.fd, cs.writeBuf)
+					if werr != nil && werr != unix.EAGAIN && werr != unix.EWOULDBLOCK {
+						cs.detachMu.Unlock()
+						processErr = werr
+					} else if werr != nil || n < len(cs.writeBuf) {
+						if werr == nil {
+							remaining := len(cs.writeBuf) - n
+							copy(cs.writeBuf, cs.writeBuf[n:])
+							cs.writeBuf = cs.writeBuf[:remaining]
+						}
+						// Partial or EAGAIN — worker retries via markDirty.
+					} else {
+						cs.writeBuf = cs.writeBuf[:0]
+					}
+				}
+				if processErr == nil || !errors.Is(processErr, conn.ErrUpgradeH2C) {
+					// success path
+				}
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				cs.asyncH2Promoted.Store(true)
+				cs.detachMu.Unlock()
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
+				w.detachQMu.Unlock()
+				if w.h2EventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(w.h2EventFD, val[:])
+				}
+				return
+			}
+		}
 		// Direct-write fast path: on the async-handler goroutine, call
 		// unix.Write(fd, writeBuf) inline instead of bouncing through
 		// the detachQueue → eventfd → worker → SEND-SQE round-trip.
@@ -1849,6 +1902,21 @@ func (w *Worker) drainDetachQueue() {
 		// goroutine can't touch w.conns or the dirty list safely).
 		if cs.asyncClosed.Load() {
 			w.closeConn(cs.fd)
+			continue
+		}
+		// Dispatch goroutine promoted the conn to H2 via switchToH2Local
+		// on the h2c-upgrade path. Finish the worker-owned bits of the
+		// swap: arm the H2 eventfd poll (once per worker) and register
+		// the fd on the write-queue poll list. The conn stays alive;
+		// subsequent recvs dispatch via the inline H2 path.
+		if cs.asyncH2Promoted.Load() {
+			cs.asyncH2Promoted.Store(false)
+			if !w.h2PollArmed && w.h2EventFD >= 0 {
+				w.prepareH2Poll()
+				w.h2PollArmed = true
+			}
+			w.h2Conns = append(w.h2Conns, cs.fd)
+			w.markDirty(cs)
 			continue
 		}
 		// Apply pending pause/resume request from the WS middleware.

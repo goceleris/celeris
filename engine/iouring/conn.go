@@ -102,6 +102,13 @@ type connState struct {
 	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
+	// asyncH2Promoted signals the worker that runAsyncHandler observed
+	// ErrUpgradeH2C and completed the cs-local H1→H2 state swap under
+	// detachMu. drainDetachQueue finishes the promotion by appending
+	// cs.fd to w.h2Conns (the worker-owned write-queue poll list) and
+	// keeps the conn alive, rather than routing it through the
+	// asyncClosed teardown.
+	asyncH2Promoted atomic.Bool
 }
 
 var connStatePool = sync.Pool{
