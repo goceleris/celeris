@@ -253,26 +253,36 @@ func wantH2CUpgrade(s *celerisServer) bool {
 }
 
 // probeH2CUpgrade drives a real HTTP/1.1 Upgrade: h2c handshake against
-// addr, retrying on any failure, until a 101 Switching Protocols lands
-// or deadline expires. Returns nil on success.
+// addr, retrying on any failure, until a `HTTP/1.1 101 Switching
+// Protocols` status line is observed or deadline expires.
 //
-// The alternative — wait N milliseconds then hope — was used pre-fix
-// and produced nine scattered "h2c upgrade: read status line: EOF"
-// cell errors in the first matrix run.
+// The payload matches loadgen's mix client (upgrade request + H2 client
+// preface + empty SETTINGS frame, sent in one write). Celeris' iouring
+// and epoll paths expect the client preface to follow immediately; a
+// probe that sends only the H1 request without the preface triggers a
+// silent 101-drop in the engine's writeBuf accumulation path — that
+// one-arg probe was incorrectly causing perfmatrix cells to error out
+// every run through auto-mix-111 on celeris native-engine h2c+upg
+// configs.
 func probeH2CUpgrade(addr string, deadline time.Duration) error {
 	stop := time.Now().Add(deadline)
-	// Valid RFC 7540 §3.2.1 HTTP2-Settings payload. Celeris rejects
-	// empty settings (internal/conn/upgrade.go), so encode one real
-	// setting: SETTINGS_MAX_CONCURRENT_STREAMS (0x0003) = 100 → 6
-	// bytes, base64url with no padding.
+	// HTTP2-Settings: one real setting (SETTINGS_MAX_CONCURRENT_STREAMS
+	// = 100), base64url no-pad. 6 bytes is the minimum valid payload.
 	settingsPayload := []byte{0x00, 0x03, 0x00, 0x00, 0x00, 0x64}
 	settings := base64.RawURLEncoding.EncodeToString(settingsPayload)
-	req := "GET / HTTP/1.1\r\n" +
+	h1 := "GET / HTTP/1.1\r\n" +
 		"Host: " + addr + "\r\n" +
 		"Connection: Upgrade, HTTP2-Settings\r\n" +
 		"Upgrade: h2c\r\n" +
 		"HTTP2-Settings: " + settings + "\r\n" +
 		"\r\n"
+	// H2 client preface + empty SETTINGS frame (type=0x04, flags=0,
+	// stream=0, length=0 → 9 header bytes, no payload).
+	preface := "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+	emptySettings := []byte{0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}
+	msg := append([]byte(h1), preface...)
+	msg = append(msg, emptySettings...)
+
 	var lastErr error
 	for time.Now().Before(stop) {
 		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
@@ -281,14 +291,13 @@ func probeH2CUpgrade(addr string, deadline time.Duration) error {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		_ = c.SetDeadline(time.Now().Add(300 * time.Millisecond))
-		if _, err := c.Write([]byte(req)); err != nil {
+		_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := c.Write(msg); err != nil {
 			_ = c.Close()
 			lastErr = err
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		// Read just the status line.
 		br := bufio.NewReader(c)
 		status, err := br.ReadString('\n')
 		_ = c.Close()
@@ -297,16 +306,11 @@ func probeH2CUpgrade(addr string, deadline time.Duration) error {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		// Any 2xx (handler completed before upgrade swap) or 101 means
-		// the handler chain is wired. The only failure we care about
-		// is an abortive close before the server sends any response.
-		if strings.Contains(status, " 101 ") ||
-			strings.Contains(status, " 200 ") ||
-			strings.Contains(status, " 204 ") {
-			return nil
-		}
-		// 4xx/5xx on first probe are still valid evidence the chain is
-		// wired; return success.
+		// Accept any `HTTP/1.` status line — 101 is the expected path,
+		// but 200/204 (handler ran H1 path without upgrading) and 4xx/5xx
+		// (server wired but rejecting this request) all prove the
+		// handler chain is installed. The only failure mode we block on
+		// is an abortive close before any status line emerges.
 		if strings.HasPrefix(status, "HTTP/1.") {
 			return nil
 		}
