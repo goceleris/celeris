@@ -700,7 +700,21 @@ func (l *Loop) drainRead(fd int, now int64) {
 				continue
 			}
 		case engine.H2C:
-			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+			// Async-mode conns: serialize inline ProcessH2 against the
+			// runAsyncHandler goroutine that owns cs.writeBuf until its
+			// H1→H2 upgrade-flush (flushWrites) completes. Without the
+			// lock, a new recv arriving while the goroutine is mid-
+			// flush runs ProcessH2 → writeFn → cs.writeBuf manipulation
+			// concurrent with the goroutine's flushWrites — a data
+			// race caught by matrixBenchStrict (mirrors the iouring
+			// fix in engine/iouring/worker.go).
+			if cs.detachMu != nil {
+				cs.detachMu.Lock()
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+				cs.detachMu.Unlock()
+			} else {
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+			}
 		}
 
 		l.reqBatch++
