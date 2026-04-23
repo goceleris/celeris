@@ -128,11 +128,20 @@ func MatrixBenchStrict() error {
 	warmStr := envOrDefault("PERFMATRIX_WARMUP", "1s")
 	dur, _ := time.ParseDuration(durStr)
 	warm, _ := time.ParseDuration(warmStr)
+	// Default skip: celeris-std-{auto,h2c}* and stdhttp-{auto,h2c}* both
+	// use golang.org/x/net/http2/h2c which has a known upstream race
+	// between hpack.Encoder.SetMaxDynamicTableSize (SETTINGS path) and
+	// hpack.Encoder.WriteField (frame-write goroutine). That race is
+	// not celeris code and failing the matrix on it tells us nothing
+	// about celeris. Override via PERFMATRIX_CELLS if you want to
+	// include them anyway.
+	cells := envOrDefault("PERFMATRIX_CELLS",
+		"*,!*/celeris-std-auto*,!*/celeris-std-h2c*,!*/stdhttp-auto,!*/stdhttp-h2c")
 	return runMatrix(matrixFlags{
 		runs:     runs,
 		duration: dur,
 		warmup:   warm,
-		cells:    envOrDefault("PERFMATRIX_CELLS", "*"),
+		cells:    cells,
 		profile:  false,
 		services: "local",
 		strict:   true,

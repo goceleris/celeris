@@ -437,15 +437,57 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 // the glob. The glob is matched against the cell id "<scenario>/<server>".
 // When the glob is empty, every registered scenario and server is
 // returned unchanged.
+//
+// The filter accepts a comma-separated list of patterns. Each pattern
+// is either a positive glob (include) or a negative glob prefixed with
+// "!" (exclude). A cell is kept if it matches at least one positive
+// pattern AND no negative pattern. When every pattern is a negation,
+// the positive set defaults to "*". Example:
+//
+//	"*"                                  — every cell
+//	"driver-*/*"                         — only driver scenarios
+//	"*,!*/celeris-std-h2c*"              — every cell, skip std+h2c
+//	"!*/celeris-std-h2c*,!*/stdhttp-h2c" — everything except x/net h2c
+//
+// The final two forms are what matrixBenchStrict uses to skip cells
+// that trigger a known upstream race in x/net/http2/hpack (which is
+// not a celeris bug and would otherwise trip fail-fast every run).
 func filterCells(scs []scenarios.Scenario, svs []servers.Server, glob string) ([]scenarios.Scenario, []servers.Server, error) {
 	if glob == "" || glob == "*" {
 		return scs, svs, nil
 	}
-	// Match "<scenario>/<server>" against the glob using path.Match.
-	// Validate glob once so malformed patterns error rather than
-	// silently match nothing.
-	if _, err := path.Match(glob, "probe/probe"); err != nil {
-		return nil, nil, fmt.Errorf("invalid glob %q: %w", glob, err)
+
+	var include, exclude []string
+	for _, part := range strings.Split(glob, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "!") {
+			exclude = append(exclude, p[1:])
+		} else {
+			include = append(include, p)
+		}
+	}
+	if len(include) == 0 {
+		include = []string{"*"} // pure-exclusion filter
+	}
+
+	// Validate globs up-front so malformed patterns error rather
+	// than silently match nothing.
+	for _, g := range append(include, exclude...) {
+		if _, err := path.Match(g, "probe/probe"); err != nil {
+			return nil, nil, fmt.Errorf("invalid glob %q: %w", g, err)
+		}
+	}
+
+	matchAny := func(patterns []string, id string) bool {
+		for _, g := range patterns {
+			if ok, _ := path.Match(g, id); ok {
+				return true
+			}
+		}
+		return false
 	}
 
 	scSet := map[string]bool{}
@@ -453,11 +495,14 @@ func filterCells(scs []scenarios.Scenario, svs []servers.Server, glob string) ([
 	for _, s := range scs {
 		for _, srv := range svs {
 			id := s.Name() + "/" + srv.Name()
-			ok, _ := path.Match(glob, id)
-			if ok {
-				scSet[s.Name()] = true
-				svSet[srv.Name()] = true
+			if !matchAny(include, id) {
+				continue
 			}
+			if matchAny(exclude, id) {
+				continue
+			}
+			scSet[s.Name()] = true
+			svSet[srv.Name()] = true
 		}
 	}
 	var outS []scenarios.Scenario
