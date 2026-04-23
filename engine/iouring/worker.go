@@ -1161,7 +1161,21 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return
 		}
 	case engine.H2C:
-		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+		// Async-mode conns: serialize inline ProcessH2 against the
+		// runAsyncHandler goroutine that owns cs.writeBuf until its
+		// H1→H2 upgrade-flush completes. Without the lock, a new
+		// recv arriving while the goroutine is mid-flush runs
+		// ProcessH2 → writeFn → cs.writeBuf manipulation concurrent
+		// with the goroutine's `cs.writeBuf = cs.writeBuf[:0]`
+		// clear — a data race matrixBenchStrict caught on the third
+		// run (see issue #256 investigation thread).
+		if cs.detachMu != nil {
+			cs.detachMu.Lock()
+			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+			cs.detachMu.Unlock()
+		} else {
+			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+		}
 	}
 
 	// Batch-return the provided buffer after processing. The data has been
