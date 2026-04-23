@@ -26,6 +26,14 @@ type matrixFlags struct {
 	extraArgs []string
 	// outDir, if set, overrides the default results/<ts>-<ref>/ path.
 	outDir string
+	// strict builds the runner (and every in-process engine / server it
+	// spawns) with the Go race detector and pointer-sanity checks, runs
+	// the runner with GORACE=halt_on_error=1 + GOTRACEBACK=crash, and
+	// passes -fail-fast to the runner. Any data race, use-after-free,
+	// or invalid pointer write aborts the matrix immediately with a
+	// full crash report — the same kind of bug that otherwise sits
+	// buried for hours of churn load before the consequence fires.
+	strict bool
 }
 
 // MatrixBench runs the full release-gate performance matrix: all celeris
@@ -94,6 +102,40 @@ func MatrixBenchProfile() error {
 		cells:    envOrDefault("PERFMATRIX_CELLS", "*"),
 		profile:  true,
 		services: "local",
+	})
+}
+
+// MatrixBenchStrict runs the matrix with the Go race detector,
+// pointer-sanity checks, and fail-fast enabled. Every bug that
+// would otherwise take 16h of churn-load to surface (data races,
+// use-after-free on pooled connState, stale iovec pointers,
+// invalid unsafe.Pointer conversions, …) aborts the matrix the
+// moment the detector fires, with a full stack trace.
+//
+// Overhead: -race slows each cell ~3-5× and costs ~5-8× memory,
+// so the default is tuned down (3 runs × 5s × 1s warmup) to keep
+// the strict sweep in the 4-8h range on msr1. Override via
+// PERFMATRIX_RUNS / PERFMATRIX_DURATION / PERFMATRIX_WARMUP when
+// a full-weight strict run is wanted.
+//
+// Recommended as the release-gate confidence check: once a strict
+// run completes without aborting, the subsequent performance
+// matrix can be trusted to measure real numbers, not to be
+// hunting bugs in the background.
+func MatrixBenchStrict() error {
+	runs, _ := strconv.Atoi(envOrDefault("PERFMATRIX_RUNS", "3"))
+	durStr := envOrDefault("PERFMATRIX_DURATION", "5s")
+	warmStr := envOrDefault("PERFMATRIX_WARMUP", "1s")
+	dur, _ := time.ParseDuration(durStr)
+	warm, _ := time.ParseDuration(warmStr)
+	return runMatrix(matrixFlags{
+		runs:     runs,
+		duration: dur,
+		warmup:   warm,
+		cells:    envOrDefault("PERFMATRIX_CELLS", "*"),
+		profile:  false,
+		services: "local",
+		strict:   true,
 	})
 }
 
@@ -191,13 +233,22 @@ func runMatrix(fl matrixFlags) error {
 		return fmt.Errorf("mkdir %s: %w", out, err)
 	}
 
-	args := []string{
-		"run", "./cmd/runner",
+	args := []string{"run"}
+	if fl.strict {
+		// -race links the race detector into the runner AND every
+		// in-process server it spawns (celeris engines, competitors),
+		// so a data race anywhere in the stack aborts the process on
+		// detection. checkptr=2 catches invalid uintptr↔unsafe.Pointer
+		// round-trips — the bug class that silently writes into
+		// reclaimed memory and crashes minutes-to-hours later.
+		args = append(args, "-race", "-gcflags=all=-d=checkptr=2")
+	}
+	args = append(args, "./cmd/runner",
 		"-runs", strconv.Itoa(fl.runs),
 		"-duration", fl.duration.String(),
 		"-warmup", fl.warmup.String(),
 		"-services", fl.services,
-	}
+	)
 	if fl.cells != "" {
 		args = append(args, "-cells", fl.cells)
 	}
@@ -209,6 +260,9 @@ func runMatrix(fl matrixFlags) error {
 	if fl.profile {
 		args = append(args, "-profile")
 	}
+	if fl.strict {
+		args = append(args, "-fail-fast")
+	}
 	args = append(args, fl.extraArgs...)
 
 	fmt.Printf("perfmatrix: go %s\n", strings.Join(args, " "))
@@ -217,6 +271,17 @@ func runMatrix(fl matrixFlags) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
+	if fl.strict {
+		// halt_on_error=1 makes a data race terminate the process with
+		// exit code 66 on detection (Go default is log-and-continue).
+		// GOTRACEBACK=crash dumps every goroutine's stack on any
+		// signal — the post-mortem we wished we had for #256 before
+		// we could reproduce it.
+		cmd.Env = append(cmd.Env,
+			"GORACE=halt_on_error=1 log_path=stderr",
+			"GOTRACEBACK=crash",
+		)
+	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("perfmatrix runner: %w", err)
 	}

@@ -46,6 +46,12 @@ type Config struct {
 	MagePhase string
 	Cooldown  time.Duration
 	Seed      int64
+	// FailFast aborts the run the first time a cell returns an error.
+	// Use with `mage matrixBenchStrict` to catch concurrency / memory
+	// safety bugs the moment they surface (otherwise a single -race
+	// report or a SIGSEGV signal could sit buried for hours while the
+	// rest of the matrix keeps running).
+	FailFast bool
 }
 
 // DefaultConfig is the set of defaults applied to a fresh flag.FlagSet.
@@ -87,6 +93,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 		"idle gap between cells to let TCP TIME_WAIT drain")
 	fs.Int64Var(&c.Seed, "seed", c.Seed,
 		"rng seed for any randomised orchestrator behaviour; 0 = time.Now().UnixNano()")
+	fs.BoolVar(&c.FailFast, "fail-fast", c.FailFast,
+		"abort the run at the first cell error (pair with -race / GORACE=halt_on_error for strict mode)")
 }
 
 // ParseArgs parses argv (without the program name). out is used for flag
@@ -250,6 +258,7 @@ func run(cfg Config) error {
 	fmt.Fprintf(os.Stderr, "perfmatrix: %d cells across %d scenarios × %d servers × %d runs\n",
 		len(schedule), len(effScs), len(effSvs), cfg.Runs)
 
+	var firstCellErr error
 	for i, cell := range schedule {
 		if rootCtx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "perfmatrix: cancelled")
@@ -259,6 +268,11 @@ func run(cfg Config) error {
 			i+1, len(schedule), cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
 		if err := executeCell(rootCtx, cfg, handles, cell); err != nil {
 			fmt.Fprintf(os.Stderr, "  cell error: %v\n", err)
+			if cfg.FailFast {
+				firstCellErr = fmt.Errorf("fail-fast: %s/%s: %w",
+					cell.Scenario.Name(), cell.Server.Name(), err)
+				break
+			}
 		}
 
 		if i+1 < len(schedule) && cfg.Cooldown > 0 {
@@ -276,7 +290,7 @@ func run(cfg Config) error {
 
 	fmt.Fprintf(os.Stderr, "perfmatrix: done; started=%s duration=%s out=%s\n",
 		manifestStart.Format(time.RFC3339), time.Since(manifestStart).Round(time.Millisecond), cfg.Out)
-	return nil
+	return firstCellErr
 }
 
 // executeCell runs one (scenario, server, run) tuple end-to-end. Errors

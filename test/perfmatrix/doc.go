@@ -21,10 +21,22 @@
 //
 //	mage matrixBench          # full release-gate (10 × 10s), ~2.5 days
 //	mage matrixBenchDeep      # maximum-rigor (10 × 15s, 3s warmup), ~3.5 days
+//	mage matrixBenchStrict    # -race + checkptr + fail-fast (3 × 5s), ~4-8h
 //	mage matrixBenchQuick     # dev-loop (3 × 5s, static only), ~1 hour
 //	mage matrixBenchDrivers   # driver cells only (10 × 10s)
 //	mage matrixBenchProfile   # full matrix with pprof capture per cell
 //	mage matrixBenchSince     # HEAD vs PERFMATRIX_REF, fails on >2% regression
+//
+// matrixBenchStrict is the release-gate confidence check. It builds
+// the runner and every in-process engine / server with -race and
+// -gcflags=-d=checkptr=2, exports GORACE=halt_on_error=1 and
+// GOTRACEBACK=crash, and passes -fail-fast to the runner. Any data
+// race, use-after-free, or invalid unsafe.Pointer conversion aborts
+// the matrix the moment it surfaces — the bug class that otherwise
+// takes 16+ hours of churn load before the consequence fires (the
+// SIGSEGV crashed at cell 2089 of the 2026-04-23 run, issue #256).
+// Once a strict sweep completes without aborting, the subsequent
+// perf matrix measures real numbers rather than chasing bugs.
 //
 // The scaffold at v1.4.1 wires the targets to print a placeholder
 // message and exit 0. Wave-2 fills in servers, scenarios, and the
