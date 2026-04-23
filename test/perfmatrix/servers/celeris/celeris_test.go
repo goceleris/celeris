@@ -59,6 +59,76 @@ func TestRegistryCardinality(t *testing.T) {
 	}
 }
 
+// TestStartStopGoroutineStable is the regression guard for the
+// thread-exhaustion crash at cell 1021 in the 2026-04-23 matrix run.
+// The root cause was celeris.Server.StartWithListener using a
+// context.Background() the perfmatrix Stop could never cancel; the
+// native engines' worker goroutines (12 per cell) therefore never
+// exited, and Go hit its 10000-thread limit.
+//
+// On Linux we cycle an iouring-h1 cell 30 times and assert the
+// goroutine delta is tiny; on other platforms we cycle a std-h1 cell
+// (still enough to catch any general Start/Stop leak).
+func TestStartStopGoroutineStable(t *testing.T) {
+	name := "celeris-iouring-h1-sync"
+	cycles := 30
+	if runtime.GOOS != "linux" {
+		name = "celeris-std-h1"
+		cycles = 10
+	}
+
+	var target servers.Server
+	for _, s := range servers.Registry() {
+		if s.Name() == name {
+			target = s
+			break
+		}
+	}
+	if target == nil {
+		t.Skipf("%s not in registry on %s", name, runtime.GOOS)
+	}
+
+	// Warm up once so any one-off singletons (pools, caches) land
+	// before the baseline snapshot.
+	ln, err := target.Start(context.Background(), nil)
+	if err != nil {
+		t.Skipf("warm-up Start failed (engine probably unsupported): %v", err)
+	}
+	_ = ln
+	if err := target.Stop(context.Background()); err != nil {
+		t.Fatalf("warm-up Stop: %v", err)
+	}
+
+	// Let any trailing goroutines from warm-up exit before snapshotting.
+	time.Sleep(100 * time.Millisecond)
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	for i := 0; i < cycles; i++ {
+		ln, err := target.Start(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("cycle %d: Start: %v", i, err)
+		}
+		_ = ln
+		if err := target.Stop(context.Background()); err != nil {
+			t.Fatalf("cycle %d: Stop: %v", i, err)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+	after := runtime.NumGoroutine()
+
+	// If every cycle leaked even a single goroutine, after-baseline
+	// would be ≥ cycles. Allow a small constant slack for GC workers
+	// and other stdlib background goroutines that may idle-start.
+	const slack = 10
+	if after-baseline > slack {
+		t.Fatalf("goroutine leak: baseline=%d after %d cycles=%d (leak=%d, slack=%d)",
+			baseline, cycles, after, after-baseline, slack)
+	}
+}
+
 // TestAllNamesLowercase enforces the "lowercase throughout" rule from the
 // naming convention docstring.
 func TestAllNamesLowercase(t *testing.T) {

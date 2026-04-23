@@ -1,6 +1,7 @@
 package celeris
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"time"
@@ -35,7 +36,7 @@ func newDiscardSlog() *slog.Logger { return discardSlog }
 // /logger, /recovery, /cors, /basicauth, /csrf, /secure, /ratelimit,
 // /timeout, /bodylimit) so benchmark numbers reflect the celeris hot path
 // end-to-end.
-func mountChainHandlers(srv *celeris.Server) {
+func mountChainHandlers(srv *celeris.Server, lifetime context.Context) {
 	// Shared terminal handlers: every chain mounts these under its own
 	// prefix. They are cheap on purpose — the bench exists to measure
 	// middleware overhead, not handler work.
@@ -117,6 +118,10 @@ func mountChainHandlers(srv *celeris.Server) {
 		ratelimit.New(ratelimit.Config{
 			RPS:   1_000_000,
 			Burst: 1_000_000,
+			// Tie the eviction goroutine's lifetime to the server's;
+			// otherwise each cell leaks one goroutine here and the
+			// matrix reliably trips Go's 10000-thread limit.
+			CleanupContext: lifetime,
 		}),
 		timeout.New(timeout.Config{
 			Timeout: 30 * time.Second,

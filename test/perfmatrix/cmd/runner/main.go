@@ -314,7 +314,11 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 		return err
 	}
 	defer func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		// 15 s: native celeris engines (epoll / iouring / adaptive) need
+		// their ctx cancelled + worker-goroutine drain before they
+		// release OS threads. 1 s was not enough — the matrix hit Go's
+		// 10000-thread ceiling around cell 1021 in the last run.
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = cell.Server.Stop(stopCtx)
 	}()

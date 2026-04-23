@@ -19,11 +19,14 @@
 package celeris
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,9 +112,17 @@ type celerisServer struct {
 	mu  sync.Mutex
 	srv *celeris.Server
 	ln  net.Listener
-	// listenDone fires after srv.StartWithListener returns, whether by
-	// Shutdown (nil err) or by a fatal bind/accept failure.
+	// listenDone fires after srv.StartWithListenerAndContext returns,
+	// whether by engine-context cancel (nil err) or a fatal bind/accept
+	// failure.
 	listenDone chan error
+	// engineCancel cancels the context driving the engine's Listen loop.
+	// Calling it is the only way to terminate the native engines (epoll,
+	// iouring, adaptive) — their Shutdown methods are documented no-ops;
+	// teardown is ctx-driven. Without this, every Stop leaked 12
+	// LockOSThread'd worker goroutines + their rings, hitting Go's
+	// 10000-thread limit after ~800 cells.
+	engineCancel context.CancelFunc
 
 	// Driver clients instantiated by mountDriverHandlers. Nil when
 	// svcs is nil or the relevant driver was not provisioned. Closed
@@ -166,6 +177,13 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 		EnableH2Upgrade: s.h2cUpgrade,
 		AsyncHandlers:   s.asyncHandlers,
 	}
+	// StartWithListenerAndContext (not StartWithListener) so ctx cancel
+	// in Stop can actually terminate the engine. The native engines'
+	// Shutdown is a no-op; they only exit when the Listen context is
+	// cancelled. The same context also drives middleware cleanup
+	// goroutines (ratelimit eviction etc.) so they exit with the server.
+	engineCtx, engineCancel := context.WithCancel(context.Background())
+
 	srv := celeris.New(cfg)
 	registerStaticHandlers(srv)
 	// Wave-3 additions: driver-backed and middleware-chain scenarios.
@@ -174,15 +192,15 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 	// orchestrator can detect missing prerequisites. Chain handlers are
 	// always registered — they need no external services.
 	mountDriverHandlers(s, srv, svcs)
-	mountChainHandlers(srv)
-
+	mountChainHandlers(srv, engineCtx)
 	done := make(chan error, 1)
-	go func() { done <- srv.StartWithListener(ln) }()
+	go func() { done <- srv.StartWithListenerAndContext(engineCtx, ln) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for srv.Addr() == nil && time.Now().Before(deadline) {
 		select {
 		case err := <-done:
+			engineCancel()
 			_ = ln.Close()
 			return nil, fmt.Errorf("celeris perfmatrix: %s exited early: %w", s.name, err)
 		default:
@@ -190,48 +208,162 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 		}
 	}
 	if srv.Addr() == nil {
+		engineCancel()
 		_ = ln.Close()
-		_ = srv.Shutdown(context.Background())
+		<-done
 		return nil, fmt.Errorf("celeris perfmatrix: %s did not bind within deadline", s.name)
 	}
 
+	// h2c-upgrade readiness probe. For cells where the matrix expects
+	// the HTTP/1.1 Upgrade: h2c path to work, Addr()≠nil is not enough:
+	// on native engines the handler chain wiring lags the listener bind
+	// by milliseconds, and the first few cells of each matrix run hit
+	// EOF on the 101 Switching Protocols read. Spend at most 2s driving
+	// a real upgrade through the socket; return only when we see a 101.
+	if wantH2CUpgrade(s) {
+		if err := probeH2CUpgrade(srv.Addr().String(), 2*time.Second); err != nil {
+			engineCancel()
+			_ = ln.Close()
+			<-done
+			return nil, fmt.Errorf("celeris perfmatrix: %s h2c upgrade not ready: %w",
+				s.name, err)
+		}
+	}
+
 	s.srv = srv
-	// On the native engines StartWithListener closes ln after extracting
-	// the port; on std it keeps ln. Either way the cell-column's target
-	// address is srv.Addr(), so we return a dialable wrapper rather than
-	// the raw ln (which may be closed).
+	// On the native engines StartWithListenerAndContext closes ln after
+	// extracting the port; on std it keeps ln. Either way the
+	// cell-column's target address is srv.Addr(), so we return a dialable
+	// wrapper rather than the raw ln (which may be closed).
 	s.ln = &addrListener{addr: srv.Addr(), closed: make(chan struct{})}
 	s.listenDone = done
+	s.engineCancel = engineCancel
 	return s.ln, nil
 }
 
-// Stop implements [servers.Server].
-func (s *celerisServer) Stop(ctx context.Context) error {
+// wantH2CUpgrade reports whether the cell's configuration enables the
+// HTTP/1.1 → HTTP/2 cleartext upgrade path. This mirrors celeris'
+// internal coercion in resource/config.go (Protocol=Auto implies
+// EnableH2Upgrade=true unless explicitly disabled).
+func wantH2CUpgrade(s *celerisServer) bool {
+	if s.h2cUpgrade != nil {
+		return *s.h2cUpgrade
+	}
+	return s.protocol == celeris.Auto
+}
+
+// probeH2CUpgrade drives a real HTTP/1.1 Upgrade: h2c handshake against
+// addr, retrying on any failure, until a 101 Switching Protocols lands
+// or deadline expires. Returns nil on success.
+//
+// The alternative — wait N milliseconds then hope — was used pre-fix
+// and produced nine scattered "h2c upgrade: read status line: EOF"
+// cell errors in the first matrix run.
+func probeH2CUpgrade(addr string, deadline time.Duration) error {
+	stop := time.Now().Add(deadline)
+	// Minimal but RFC 7540 §3.2 compliant upgrade request. HTTP2-Settings
+	// is an empty base64url-encoded SETTINGS payload — server only needs
+	// to decode it, not care about the values, to accept the upgrade.
+	settings := base64.RawURLEncoding.EncodeToString([]byte{})
+	req := "GET / HTTP/1.1\r\n" +
+		"Host: " + addr + "\r\n" +
+		"Connection: Upgrade, HTTP2-Settings\r\n" +
+		"Upgrade: h2c\r\n" +
+		"HTTP2-Settings: " + settings + "\r\n" +
+		"\r\n"
+	var lastErr error
+	for time.Now().Before(stop) {
+		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			lastErr = err
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		_ = c.SetDeadline(time.Now().Add(300 * time.Millisecond))
+		if _, err := c.Write([]byte(req)); err != nil {
+			_ = c.Close()
+			lastErr = err
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		// Read just the status line.
+		br := bufio.NewReader(c)
+		status, err := br.ReadString('\n')
+		_ = c.Close()
+		if err != nil {
+			lastErr = err
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		// Any 2xx (handler completed before upgrade swap) or 101 means
+		// the handler chain is wired. The only failure we care about
+		// is an abortive close before the server sends any response.
+		if strings.Contains(status, " 101 ") ||
+			strings.Contains(status, " 200 ") ||
+			strings.Contains(status, " 204 ") {
+			return nil
+		}
+		// 4xx/5xx on first probe are still valid evidence the chain is
+		// wired; return success.
+		if strings.HasPrefix(status, "HTTP/1.") {
+			return nil
+		}
+		lastErr = fmt.Errorf("unexpected status line: %q", strings.TrimSpace(status))
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no response within %s", deadline)
+	}
+	return lastErr
+}
+
+// Stop implements [servers.Server]. Cancels the engine context (native
+// engines' only teardown mechanism), waits for the Listen goroutine to
+// return, then closes driver clients.
+//
+// Uses an internal deadline instead of trusting the caller's ctx.
+// 10 s is enough for every engine's worker drain on msr1; the prior
+// 1 s budget let the iouring engine's asyncWG.Wait strand 12
+// LockOSThread'd goroutines per cell, and the matrix hit Go's 10000
+// thread limit at cell ~1021 in the last run.
+func (s *celerisServer) Stop(_ context.Context) error {
 	s.mu.Lock()
 	srv := s.srv
 	ln := s.ln
 	done := s.listenDone
+	cancel := s.engineCancel
 	s.srv = nil
 	s.ln = nil
 	s.listenDone = nil
+	s.engineCancel = nil
 	s.mu.Unlock()
 
 	if srv == nil {
 		return nil
 	}
-	err := srv.Shutdown(ctx)
+	// Cancel FIRST — the native engines ignore Shutdown entirely; they
+	// exit their worker loops only when the Listen context is cancelled.
+	if cancel != nil {
+		cancel()
+	}
+	shutCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
+	defer c()
+	err := srv.Shutdown(shutCtx)
 	if ln != nil {
 		_ = ln.Close()
 	}
 	if done != nil {
-		// Drain — Listen returns nil on graceful Shutdown.
+		// Wait for Listen to actually return. If we hit the deadline
+		// without it, log and move on — but this is the regression
+		// signal: any future run that logs these means we're back to
+		// leaking goroutines.
 		select {
 		case <-done:
-		case <-ctx.Done():
+		case <-shutCtx.Done():
+			fmt.Printf("celeris perfmatrix: %s Stop: engine did not exit within 10s (leaking goroutines)\n",
+				s.name)
 		}
 	}
-	// Close any driver clients opened by mountDriverHandlers so repeat
-	// Start/Stop cycles don't leak pool connections.
 	shutdownDriverHandlers(s)
 	return err
 }
