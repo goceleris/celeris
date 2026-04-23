@@ -483,6 +483,13 @@ func filterCells(scs []scenarios.Scenario, svs []servers.Server, glob string) ([
 
 	matchAny := func(patterns []string, id string) bool {
 		for _, g := range patterns {
+			// "*" as a top-level pattern means "every cell"; path.Match
+			// treats "*" as non-separator-only so it would reject
+			// "scenario/server" on the slash. Short-circuit here so
+			// the universal include works as users expect.
+			if g == "*" {
+				return true
+			}
 			if ok, _ := path.Match(g, id); ok {
 				return true
 			}
