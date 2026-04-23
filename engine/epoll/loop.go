@@ -1380,10 +1380,23 @@ func (l *Loop) closeConn(fd int) {
 	// Close H1 state unless a real WS/SSE detach handed ownership to a
 	// middleware goroutine. Async-mode HTTP1 conns have detachMu set
 	// but h1State.Detached is false — we still own H1 state there.
+	//
+	// For detached / async-dispatched conns, hold detachMu while
+	// tearing down h1State. runAsyncHandler runs ProcessH1 under the
+	// same lock, and CloseH1 writes state.stream / state.bodyBuf /
+	// state.bodyNeeded that ProcessH1 reads; without the lock a peer
+	// close mid-request corrupts H1State (tracked as celeris#256 on
+	// the iouring side). cs.asyncClosed is set earlier; the goroutine
+	// checks it on loop re-entry, so acquiring detachMu here only
+	// blocks for the current ProcessH1 call.
 	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 	l.removeDirty(cs)
-	if !trulyDetached {
-		if cs.h1State != nil {
+	if !trulyDetached && cs.h1State != nil {
+		if detached {
+			cs.detachMu.Lock()
+			conn.CloseH1(cs.h1State)
+			cs.detachMu.Unlock()
+		} else {
 			conn.CloseH1(cs.h1State)
 		}
 	}
@@ -1446,7 +1459,16 @@ func (l *Loop) shutdown() {
 		}
 		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 		if !trulyDetached && cs.h1State != nil {
-			conn.CloseH1(cs.h1State)
+			// Mirror the closeConn fix: hold detachMu while tearing
+			// down h1State so ProcessH1 in runAsyncHandler isn't still
+			// reading the fields CloseH1 writes.
+			if detached {
+				cs.detachMu.Lock()
+				conn.CloseH1(cs.h1State)
+				cs.detachMu.Unlock()
+			} else {
+				conn.CloseH1(cs.h1State)
+			}
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
