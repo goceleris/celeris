@@ -686,7 +686,15 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 
 	cs.lastActivity = now
 
-	if w.cfg.Protocol != engine.Auto {
+	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
+	// upgrades too", so route it through detectProtocol (like Auto) on the
+	// first recv rather than locking cs.protocol=H2C on accept. Without
+	// this, the first HTTP/1.1 upgrade request was fed to ProcessH2 and
+	// the PRI-preface check silently failed, leaving the client with 27
+	// bytes of server SETTINGS frame and no 101 Switching Protocols
+	// response.
+	if w.cfg.Protocol != engine.Auto &&
+		!(w.cfg.Protocol == engine.H2C && w.cfg.EnableH2Upgrade) {
 		cs.protocol = w.cfg.Protocol
 		cs.detected = true
 		w.initProtocol(cs)

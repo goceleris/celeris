@@ -456,7 +456,14 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 
 		cs.lastActivity = now
 
-		if l.cfg.Protocol != engine.Auto {
+		// H2C + EnableH2Upgrade: defer protocol commit to detectProtocol
+		// on first recv. Locking cs.protocol = H2C on accept routed
+		// HTTP/1.1 upgrade requests into ProcessH2 instead of the H1
+		// parser, so the server emitted its SETTINGS frame without the
+		// mandatory 101 Switching Protocols response first. Mirrors the
+		// iouring engine fix.
+		if l.cfg.Protocol != engine.Auto &&
+			!(l.cfg.Protocol == engine.H2C && l.cfg.EnableH2Upgrade) {
 			cs.protocol = l.cfg.Protocol
 			cs.detected = true
 			l.initProtocol(cs)
