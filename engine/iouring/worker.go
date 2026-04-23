@@ -694,7 +694,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	// bytes of server SETTINGS frame and no 101 Switching Protocols
 	// response.
 	if w.cfg.Protocol != engine.Auto &&
-		!(w.cfg.Protocol == engine.H2C && w.cfg.EnableH2Upgrade) {
+		(w.cfg.Protocol != engine.H2C || !w.cfg.EnableH2Upgrade) {
 		cs.protocol = w.cfg.Protocol
 		cs.detected = true
 		w.initProtocol(cs)
@@ -1649,46 +1649,51 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		// queue poll list. The goroutine exits — all subsequent recvs
 		// dispatch via the inline H2 path (cs.protocol is now H2C).
 		if errors.Is(processErr, conn.ErrUpgradeH2C) {
-			if err := w.switchToH2Local(cs); err != nil {
-				cs.detachMu.Unlock()
-				processErr = err
+			promoteErr := w.switchToH2Local(cs)
+			if promoteErr == nil && len(cs.writeBuf) > 0 {
+				n, werr := unix.Write(cs.fd, cs.writeBuf)
+				switch {
+				case werr == nil && n == len(cs.writeBuf):
+					cs.writeBuf = cs.writeBuf[:0]
+				case werr == nil:
+					// Partial write — shift remainder; worker retries
+					// via markDirty after we enqueue on detachQueue.
+					remaining := len(cs.writeBuf) - n
+					copy(cs.writeBuf, cs.writeBuf[n:])
+					cs.writeBuf = cs.writeBuf[:remaining]
+				case werr == unix.EAGAIN || werr == unix.EWOULDBLOCK:
+					// Socket send buffer full — same disposition as a
+					// partial write; bytes stay in cs.writeBuf.
+				default:
+					promoteErr = werr
+				}
+			}
+			cs.detachMu.Unlock()
+			if promoteErr != nil {
+				// Fatal — route through the asyncClosed teardown so the
+				// worker runs closeConn from its own goroutine.
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
 			} else {
-				if len(cs.writeBuf) > 0 {
-					n, werr := unix.Write(cs.fd, cs.writeBuf)
-					if werr != nil && werr != unix.EAGAIN && werr != unix.EWOULDBLOCK {
-						cs.detachMu.Unlock()
-						processErr = werr
-					} else if werr != nil || n < len(cs.writeBuf) {
-						if werr == nil {
-							remaining := len(cs.writeBuf) - n
-							copy(cs.writeBuf, cs.writeBuf[n:])
-							cs.writeBuf = cs.writeBuf[:remaining]
-						}
-						// Partial or EAGAIN — worker retries via markDirty.
-					} else {
-						cs.writeBuf = cs.writeBuf[:0]
-					}
-				}
-				if processErr == nil || !errors.Is(processErr, conn.ErrUpgradeH2C) {
-					// success path
-				}
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
 				cs.asyncRun = false
 				cs.asyncInMu.Unlock()
 				cs.asyncH2Promoted.Store(true)
-				cs.detachMu.Unlock()
-				w.detachQMu.Lock()
-				w.detachQueue = append(w.detachQueue, cs)
-				w.detachQPending.Store(1)
-				w.detachQMu.Unlock()
-				if w.h2EventFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(w.h2EventFD, val[:])
-				}
-				return
 			}
+			w.detachQMu.Lock()
+			w.detachQueue = append(w.detachQueue, cs)
+			w.detachQPending.Store(1)
+			w.detachQMu.Unlock()
+			if w.h2EventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(w.h2EventFD, val[:])
+			}
+			return
 		}
 		// Direct-write fast path: on the async-handler goroutine, call
 		// unix.Write(fd, writeBuf) inline instead of bouncing through

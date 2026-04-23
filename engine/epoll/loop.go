@@ -463,7 +463,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 		// mandatory 101 Switching Protocols response first. Mirrors the
 		// iouring engine fix.
 		if l.cfg.Protocol != engine.Auto &&
-			!(l.cfg.Protocol == engine.H2C && l.cfg.EnableH2Upgrade) {
+			(l.cfg.Protocol != engine.H2C || !l.cfg.EnableH2Upgrade) {
 			cs.protocol = l.cfg.Protocol
 			cs.detected = true
 			l.initProtocol(cs)
@@ -1089,38 +1089,39 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		// mode. The goroutine exits because from now on this conn uses
 		// the inline H2 path.
 		if errors.Is(processErr, conn.ErrUpgradeH2C) {
-			if err := l.switchToH2Local(cs, cs.writeFn); err != nil {
-				cs.detachMu.Unlock()
-				processErr = err
-			} else {
-				flushErr := error(nil)
-				if cs.writePos < len(cs.writeBuf) {
-					flushErr = flushWrites(cs)
+			promoteErr := l.switchToH2Local(cs, cs.writeFn)
+			if promoteErr == nil && cs.writePos < len(cs.writeBuf) {
+				// flushWrites may partially complete; residual bytes
+				// stay in cs.writeBuf and the worker retries via
+				// markDirty once drainDetachQueue picks us up.
+				if err := flushWrites(cs); err != nil {
+					promoteErr = err
 				}
-				partial := flushErr == nil && cs.writePos < len(cs.writeBuf)
+			}
+			cs.detachMu.Unlock()
+			if promoteErr != nil {
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+			} else {
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
 				cs.asyncRun = false
 				cs.asyncInMu.Unlock()
 				cs.asyncH2Promoted.Store(true)
-				cs.detachMu.Unlock()
-				if flushErr != nil || partial {
-					// Partial flush or flush error — worker will observe
-					// via detachQueue and either retry or teardown. Either
-					// way, signal now.
-					_ = partial
-				}
-				l.detachQMu.Lock()
-				l.detachQueue = append(l.detachQueue, cs)
-				l.detachQPending.Store(1)
-				l.detachQMu.Unlock()
-				if l.eventFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(l.eventFD, val[:])
-				}
-				return
 			}
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
+			return
 		}
 		var flushErr error
 		if processErr == nil && cs.writePos < len(cs.writeBuf) {
