@@ -695,7 +695,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	// response.
 	if w.cfg.Protocol != engine.Auto &&
 		(w.cfg.Protocol != engine.H2C || !w.cfg.EnableH2Upgrade) {
-		cs.protocol = w.cfg.Protocol
+		cs.protocol.Store(int32(w.cfg.Protocol))
 		cs.detected = true
 		w.initProtocol(cs)
 	}
@@ -717,7 +717,7 @@ func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
 		}
 		return false
 	}
-	cs.protocol = proto
+	cs.protocol.Store(int32(proto))
 	cs.detected = true
 	w.initProtocol(cs)
 	return true
@@ -745,7 +745,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 }
 
 func (w *Worker) initProtocol(cs *connState) {
-	switch cs.protocol {
+	switch engine.Protocol(cs.protocol.Load()) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
 		cs.h1State.RemoteAddr = cs.remoteAddr
@@ -894,7 +894,7 @@ func (w *Worker) switchToH2Local(cs *connState) error {
 	cs.h1State = nil
 	cs.h2State = h2State
 	cs.h2State.SetRemoteAddr(cs.remoteAddr)
-	cs.protocol = engine.H2C
+	cs.protocol.Store(int32(engine.H2C))
 
 	var processErr error
 	if len(info.Remaining) > 0 {
@@ -1067,7 +1067,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// immediately. The goroutine runs ProcessH1 under cs.detachMu and
 	// enqueues on detachQueue so this worker submits SEND SQEs on its
 	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
-	if w.async && cs.protocol == engine.HTTP1 {
+	if w.async && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 {
 		cs.asyncInMu.Lock()
 		// Backpressure: drop the conn if the dispatch goroutine is
 		// falling behind. Prevents a pipelining client from ballooning
@@ -1112,7 +1112,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	var processErr error
-	switch cs.protocol {
+	switch engine.Protocol(cs.protocol.Load()) {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 		if errors.Is(processErr, conn.ErrUpgradeH2C) {
@@ -1518,7 +1518,7 @@ func (w *Worker) finishClose(fd int) {
 
 	// Capture close-path decisions before releaseConnState wipes cs.
 	fixedFile := cs != nil && cs.fixedFile
-	fastClose := cs != nil && cs.protocol == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached
+	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached
 	if cs != nil {
 		releaseConnState(cs)
 	}
@@ -1914,7 +1914,7 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	// Async mode: the dispatch goroutine owns h1State; the worker cannot
 	// safely observe NextRecvBuf without synchronization. Always use
 	// cs.buf so the goroutine handles body accumulation on its side.
-	if w.async || w.bufRing != nil || cs.protocol != engine.HTTP1 || cs.h1State == nil {
+	if w.async || w.bufRing != nil || engine.Protocol(cs.protocol.Load()) != engine.HTTP1 || cs.h1State == nil {
 		return cs.buf
 	}
 	if b := cs.h1State.NextRecvBuf(); b != nil {

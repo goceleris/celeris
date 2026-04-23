@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
 )
 
@@ -51,19 +50,24 @@ type iovec struct {
 }
 
 type connState struct {
-	fd             int             // 8: real FD, or fixed file index
-	protocol       engine.Protocol // 1
-	detected       bool            // 1
-	sending        bool            // 1: true when a SEND SQE is in-flight
-	closing        bool            // 1: defers close until sends complete
-	dirty          bool            // 1: true when data needs flushing
-	fixedFile      bool            // 1: true when fd is fixed file index
-	recvLinked     bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
-	needsRecv      bool            // 1: recv arm was dropped (SQ ring full); retry on next opportunity
-	recvIntoBody   bool            // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
-	zcNotifPending bool            // 1: waiting for SEND_ZC notification CQE
-	zcSentBytes    int32           // bytes sent from first SEND_ZC CQE (processed on NOTIF)
-	sendBuf        []byte          // 24: in-flight buffer (accessed with sending flag)
+	fd int // 8: real FD, or fixed file index
+	// protocol is accessed concurrently: the worker reads it on every
+	// recv completion, and the async dispatch goroutine writes it once
+	// via switchToH2Local during an H1→H2 upgrade. atomic.Int32 keeps
+	// the common-case Load a single mov instruction while making the
+	// write race-free. Use cs.getProtocol / cs.setProtocol helpers.
+	protocol       atomic.Int32 // engine.Protocol values cast to int32
+	detected       bool         // 1
+	sending        bool         // 1: true when a SEND SQE is in-flight
+	closing        bool         // 1: defers close until sends complete
+	dirty          bool         // 1: true when data needs flushing
+	fixedFile      bool         // 1: true when fd is fixed file index
+	recvLinked     bool         // 1: RECV was linked to SEND (skip standalone prepareRecv)
+	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
+	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
+	zcSentBytes    int32        // bytes sent from first SEND_ZC CQE (processed on NOTIF)
+	sendBuf        []byte       // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
 	bodyBuf   []byte     // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
@@ -151,7 +155,7 @@ func releaseConnState(cs *connState) {
 	cs.remoteAddr = ""
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil
-	cs.protocol = 0
+	cs.protocol.Store(0)
 	cs.detected = false
 	cs.sending = false
 	cs.closing = false
