@@ -261,10 +261,12 @@ func wantH2CUpgrade(s *celerisServer) bool {
 // cell errors in the first matrix run.
 func probeH2CUpgrade(addr string, deadline time.Duration) error {
 	stop := time.Now().Add(deadline)
-	// Minimal but RFC 7540 §3.2 compliant upgrade request. HTTP2-Settings
-	// is an empty base64url-encoded SETTINGS payload — server only needs
-	// to decode it, not care about the values, to accept the upgrade.
-	settings := base64.RawURLEncoding.EncodeToString([]byte{})
+	// Valid RFC 7540 §3.2.1 HTTP2-Settings payload. Celeris rejects
+	// empty settings (internal/conn/upgrade.go), so encode one real
+	// setting: SETTINGS_MAX_CONCURRENT_STREAMS (0x0003) = 100 → 6
+	// bytes, base64url with no padding.
+	settingsPayload := []byte{0x00, 0x03, 0x00, 0x00, 0x00, 0x64}
+	settings := base64.RawURLEncoding.EncodeToString(settingsPayload)
 	req := "GET / HTTP/1.1\r\n" +
 		"Host: " + addr + "\r\n" +
 		"Connection: Upgrade, HTTP2-Settings\r\n" +
