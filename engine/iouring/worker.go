@@ -941,9 +941,13 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return
 		}
 		// Surface read failure to detached middleware before closing.
-		if cs.detachMu != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+		// Check cs.h1State under detachMu — the async dispatch
+		// goroutine's switchToH2Local nulls cs.h1State under the same
+		// lock, so reading it before acquiring detachMu is a TOCTOU
+		// that the race detector flags (#256 regression class).
+		if cs.detachMu != nil {
 			cs.detachMu.Lock()
-			if cs.h1State.OnError != nil {
+			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(errIORingRecv(c.Res))
 			}
 			cs.detachMu.Unlock()
@@ -1178,9 +1182,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		}
 		// Flush pending writes (e.g. error responses) before closing.
 		_ = w.flushSend(cs)
-		if cs.detachMu != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+		// Check cs.h1State under detachMu (same TOCTOU class fixed at
+		// line 944 — see handleRecv recv-failure path).
+		if cs.detachMu != nil {
 			cs.detachMu.Lock()
-			if cs.h1State.OnError != nil {
+			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(processErr)
 			}
 			cs.detachMu.Unlock()
