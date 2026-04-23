@@ -19,14 +19,12 @@
 package celeris
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -298,23 +296,23 @@ func probeH2CUpgrade(addr string, deadline time.Duration) error {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		br := bufio.NewReader(c)
-		status, err := br.ReadString('\n')
+		// Read any response bytes. We don't require the RFC-7540-mandated
+		// 101 status line — celeris' iouring engine currently drops the
+		// 101 on the direct-upgrade path and emits raw H2 SETTINGS
+		// frames straight away (tracked as a separate celeris audit
+		// item). Any bytes before EOF prove the handler chain is wired,
+		// which is all the perfmatrix cares about for readiness.
+		var buf [32]byte
+		n, err := c.Read(buf[:])
 		_ = c.Close()
-		if err != nil {
-			lastErr = err
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		// Accept any `HTTP/1.` status line — 101 is the expected path,
-		// but 200/204 (handler ran H1 path without upgrading) and 4xx/5xx
-		// (server wired but rejecting this request) all prove the
-		// handler chain is installed. The only failure mode we block on
-		// is an abortive close before any status line emerges.
-		if strings.HasPrefix(status, "HTTP/1.") {
+		if n > 0 {
 			return nil
 		}
-		lastErr = fmt.Errorf("unexpected status line: %q", strings.TrimSpace(status))
+		if err == nil {
+			lastErr = fmt.Errorf("zero-byte read")
+		} else {
+			lastErr = err
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if lastErr == nil {
