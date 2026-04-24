@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/platform"
@@ -146,10 +147,45 @@ func (e *Engine) Type() engine.EngineType {
 	return engine.Epoll
 }
 
-// PauseAccept stops accepting new connections while keeping existing ones alive.
+// PauseAccept stops accepting new connections. Synchronous — blocks
+// until every loop has closed its listen FD (and drained pending
+// accepts in the kernel queue with FIN, not RST). The adaptive engine
+// relies on this: until the standby's listen sockets are gone from the
+// SO_REUSEPORT routing pool, fresh dials may land on the about-to-pause
+// engine and get RST'd when its FD closes. Synchronous Pause means
+// callers can expose Addr() knowing only the active engine listens.
 func (e *Engine) PauseAccept() error {
 	e.acceptPaused.Store(true)
-	return nil
+	e.mu.Lock()
+	loops := append([]*Loop(nil), e.loops...)
+	e.mu.Unlock()
+	if len(loops) == 0 {
+		return nil
+	}
+	// Short bound on the wait. The worker normally observes the flag
+	// and drains its accept queue in well under 1 ms; capping at 100 ms
+	// means even a worker stuck briefly (mid-iteration on a long CQE
+	// burst) doesn't make Pause callers hold critical locks long
+	// enough to cascade into other timeouts. If we time out, the FD
+	// will still close on the next worker iteration — we just don't
+	// guarantee it has happened by the time we return.
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		allClosed := true
+		for _, l := range loops {
+			if !l.listenFDClosed.Load() {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil // best-effort: do not surface the timeout, the FD will close shortly
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
 }
 
 // ResumeAccept starts accepting new connections again.
@@ -159,6 +195,10 @@ func (e *Engine) ResumeAccept() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, l := range e.loops {
+		// Re-arm the close-confirmation flag so a subsequent Pause cycle
+		// blocks on the new listen FD rather than the previously-closed
+		// one.
+		l.listenFDClosed.Store(false)
 		l.wakeMu.Lock()
 		if l.suspended.Load() {
 			close(l.wake)

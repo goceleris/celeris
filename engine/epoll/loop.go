@@ -64,6 +64,16 @@ type Loop struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
+	// listenFDClosed signals that the loop has closed its listen FD in
+	// response to acceptPaused=true. PauseAccept polls this so it only
+	// returns once the SO_REUSEPORT group has actually shed this listener
+	// — important for the adaptive engine, where the standby's listen
+	// sockets must be out of the kernel routing pool before the bound
+	// address is exposed to the caller (otherwise the first burst of
+	// dials can land on the standby and get RST when it pauses).
+	// Reset to false in ResumeAccept so a Pause→Resume→Pause cycle
+	// re-arms the signal.
+	listenFDClosed atomic.Bool
 
 	reqCount         *atomic.Uint64
 	activeConns      *atomic.Int64
@@ -211,9 +221,36 @@ func (l *Loop) run(ctx context.Context) {
 		// iteration on the steady-state hot path.
 		paused := l.acceptPaused.Load()
 		if l.listenFD >= 0 && paused {
+			// Drain any pending accepts from the kernel's listen queue so
+			// they get a clean shutdown (FIN) rather than the RST that
+			// close() of the listen FD would send. Loadgen's H2 dial
+			// retries handle FIN gracefully; an RST aborts the whole
+			// benchmark.
+			for {
+				connFD, _, accErr := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+				if accErr != nil {
+					break
+				}
+				_ = unix.Shutdown(connFD, unix.SHUT_RDWR)
+				_ = unix.Close(connFD)
+			}
 			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
 			_ = unix.Close(l.listenFD)
 			l.listenFD = -1
+		}
+		// Maintain the listenFDClosed signal that PauseAccept polls on.
+		// Set it whenever paused==true regardless of whether we just
+		// closed the FD or it was already -1 from a prior Pause-Resume
+		// cycle that hadn't re-created the socket yet (race window:
+		// ResumeAccept clears the flag and toggles paused=false; the
+		// worker may be mid-iteration when paused flips back to true,
+		// so listenFD can transiently be -1 while paused is true). Also
+		// clear the flag when paused goes false so a subsequent Pause
+		// observes a fresh signal once the new listenFD is created.
+		if paused {
+			l.listenFDClosed.Store(true)
+		} else {
+			l.listenFDClosed.Store(false)
 		}
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.

@@ -107,6 +107,15 @@ type Worker struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
+	// listenFDClosed signals that the worker has cancelled in-flight
+	// accept SQEs and closed its listen FD in response to acceptPaused
+	// being set. PauseAccept polls this so it only returns once the
+	// SO_REUSEPORT group has actually shed this listener — important
+	// for the adaptive engine where the standby's listen sockets must
+	// be out of the kernel routing pool before the bound address is
+	// exposed (otherwise a fresh dial can land on the standby and get
+	// RST as it pauses).
+	listenFDClosed atomic.Bool
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -337,6 +346,19 @@ func (w *Worker) run(ctx context.Context) {
 			}
 			_ = unix.Close(w.listenFD)
 			w.listenFD = -1
+		}
+		// Maintain the listenFDClosed signal that PauseAccept polls on.
+		// Set it whenever paused==true regardless of whether we just
+		// closed the FD or it was already -1 from a prior Pause-Resume
+		// cycle that hadn't re-created the socket yet (the worker may
+		// be mid-iteration when paused flips back to true, so listenFD
+		// can transiently be -1 while paused is true). Clear when
+		// paused goes false so a subsequent Pause observes a fresh
+		// signal once the new listenFD is created.
+		if paused {
+			w.listenFDClosed.Store(true)
+		} else {
+			w.listenFDClosed.Store(false)
 		}
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.

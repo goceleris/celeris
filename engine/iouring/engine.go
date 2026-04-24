@@ -253,10 +253,44 @@ func (e *Engine) Type() engine.EngineType {
 	return engine.IOUring
 }
 
-// PauseAccept stops accepting new connections while keeping existing ones alive.
+// PauseAccept stops accepting new connections. Synchronous — blocks
+// until every worker has cancelled its in-flight accept SQE and closed
+// its listen FD. The adaptive engine relies on this: until the
+// standby's listen sockets are gone from the SO_REUSEPORT routing
+// pool, fresh dials may land on the about-to-pause engine and get
+// RST'd as it tears down. Synchronous Pause means callers can expose
+// Addr() knowing only the active engine listens.
 func (e *Engine) PauseAccept() error {
 	e.acceptPaused.Store(true)
-	return nil
+	e.mu.Lock()
+	workers := append([]*Worker(nil), e.workers...)
+	e.mu.Unlock()
+	if len(workers) == 0 {
+		return nil
+	}
+	// Short bound on the wait. The worker normally observes the flag
+	// and finishes the SQE-cancel + close in <50 ms; capping at 200 ms
+	// keeps Pause callers from holding critical locks long enough to
+	// cascade into other timeouts during rapid-switch storms. If we
+	// time out, the FD will still close on the next worker iteration
+	// — we just don't guarantee it has happened by the time we return.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		allClosed := true
+		for _, w := range workers {
+			if !w.listenFDClosed.Load() {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil // best-effort: do not surface the timeout, the FD will close shortly
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
 }
 
 // ResumeAccept starts accepting new connections again.
@@ -266,6 +300,10 @@ func (e *Engine) ResumeAccept() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, w := range e.workers {
+		// Re-arm the close-confirmation flag so a subsequent Pause cycle
+		// blocks on the new listen FD rather than the previously-closed
+		// one.
+		w.listenFDClosed.Store(false)
 		w.wakeMu.Lock()
 		if w.suspended.Load() {
 			close(w.wake)

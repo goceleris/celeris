@@ -167,25 +167,40 @@ func (e *Engine) Listen(ctx context.Context) error {
 		return fmt.Errorf("sub-engines failed to initialize")
 	}
 
-	addr := e.primary.Addr()
-	e.addr.Store(&addr)
-
-	// Pause standby engine's accept. Read c.state.activeIsPrimary under
-	// switchMu to avoid racing with performSwitch → recordSwitch, which
-	// can fire from a concurrent ForceSwitch or controller tick before
-	// Listen finishes its own setup.
+	// Pause standby engine's accept BEFORE publishing Addr so the
+	// SO_REUSEPORT group only contains the active engine by the time
+	// callers start dialing. Without this gate, a burst of incoming
+	// connections in the window between secondary.Listen() succeeding
+	// and PauseAccept taking effect lands some dials on the standby's
+	// accept queue; closing that queue then RSTs them. H1 clients
+	// reconnect transparently but H2 prior-knowledge clients see the
+	// dial fail mid-handshake. Read c.state.activeIsPrimary under
+	// switchMu to avoid racing with performSwitch → recordSwitch (a
+	// concurrent ForceSwitch or controller tick can fire before Listen
+	// finishes its own setup).
 	e.switchMu.Lock()
 	activeIsPrimary := e.ctrl.state.activeIsPrimary
 	e.switchMu.Unlock()
 	if activeIsPrimary {
 		if ac, ok := e.secondary.(engine.AcceptController); ok {
-			_ = ac.PauseAccept()
+			if err := ac.PauseAccept(); err != nil {
+				innerCancel()
+				wg.Wait()
+				return fmt.Errorf("pause secondary: %w", err)
+			}
 		}
 	} else {
 		if ac, ok := e.primary.(engine.AcceptController); ok {
-			_ = ac.PauseAccept()
+			if err := ac.PauseAccept(); err != nil {
+				innerCancel()
+				wg.Wait()
+				return fmt.Errorf("pause primary: %w", err)
+			}
 		}
 	}
+
+	addr := e.primary.Addr()
+	e.addr.Store(&addr)
 
 	e.logger.Info("adaptive engine listening",
 		"addr", e.cfg.Addr,
@@ -236,18 +251,26 @@ func (e *Engine) performSwitch() {
 	// Driver FDs are pinned to whichever sub-engine's worker they were
 	// registered on — they cannot migrate across epoll ↔ io_uring. If any
 	// driver has live FDs we refuse the switch rather than orphan them.
-	// Hold freezeState for the entire swap so a concurrent acquireDriverFD
-	// either (a) observes the old active engine and registers on it before
-	// the swap starts, or (b) waits until after the swap lands and
-	// registers on the new active. There is no interleaving where a driver
-	// registers on the about-to-be-paused engine mid-swap.
+	// Hold freezeState while we (a) check the driver-FD count and
+	// (b) commit the active.Store swap, so a concurrent acquireDriverFD
+	// either observes the old active and registers on it before the
+	// swap, or waits until after active.Store lands and registers on
+	// the new active. We deliberately release freezeState BEFORE the
+	// final PauseAccept on the old active — synchronous PauseAccept can
+	// take O(ms) waiting for the loop to drain its listen queue, and
+	// holding freezeState across that wait blocks driver
+	// register/unregister flows long enough to trip their onClose
+	// timeouts (regression seen in TestAdaptiveConcurrentDriverChurnVsSwitch).
+	// Once active.Store has committed, no new driver registrations will
+	// land on the about-to-be-paused engine, so it's safe to drop the
+	// lock.
 	e.freezeState.Lock()
-	defer e.freezeState.Unlock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
 		e.logger.Warn("refusing engine switch: driver FDs still registered",
 			"driver_fds", e.driverFDs.Load(),
 		)
+		e.freezeState.Unlock()
 		return
 	}
 
@@ -274,15 +297,25 @@ func (e *Engine) performSwitch() {
 	if ac, ok := newActive.(engine.AcceptController); ok {
 		_ = ac.ResumeAccept()
 	}
-	if ac, ok := newStandby.(engine.AcceptController); ok {
-		_ = ac.PauseAccept()
-	}
 
 	eng := newActive
 	e.active.Store(&eng)
 	e.switchMu.Lock()
 	e.ctrl.recordSwitch(now)
 	e.switchMu.Unlock()
+
+	// Active has been committed — release freezeState so concurrent
+	// driver acquireDriverFD calls observe the new active and proceed.
+	e.freezeState.Unlock()
+
+	// Pause the old active. Inline (not in a goroutine) so unit tests
+	// observing pauseCalls right after performSwitch returns see the
+	// effect; PauseAccept itself caps its wait to 2s, but the
+	// freezeState release above means concurrent driver
+	// register/unregister flows are no longer blocked while we wait.
+	if ac, ok := newStandby.(engine.AcceptController); ok {
+		_ = ac.PauseAccept()
+	}
 
 	e.logger.Info("engine switch completed",
 		"now_active", newActive.Type().String(),
