@@ -87,14 +87,14 @@ func (s *ConcurrencyScenario) Workload(target string) loadgen.Config {
 
 // Applicable gates the auto-mix profile to servers that expose every
 // wire-format the mixer draws from (H1, H2C prior-knowledge, and H2C
-// upgrade). Every other profile is protocol-agnostic and applies
-// universally — concurrency profiles exist to sweep connection count,
-// not protocol coverage, and every registered server speaks at least H1.
+// upgrade). Every other profile drives plain H1 on the wire and is
+// inapplicable to H2C-prior-knowledge-only servers (h2c-noupg) — those
+// would silently record 0 RPS.
 func (s *ConcurrencyScenario) Applicable(fs servers.FeatureSet) bool {
 	if s.profile == ProfileAutoMix {
 		return fs.HTTP1 && fs.HTTP2C && fs.H2CUpgrade
 	}
-	return true
+	return fs.HTTP1
 }
 
 // Compile-time assertion that ConcurrencyScenario satisfies Scenario.

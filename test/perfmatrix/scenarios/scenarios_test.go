@@ -12,7 +12,7 @@ import (
 // other files and are deliberately excluded here — this test guards the
 // slice we own, not the ones we don't.
 var expectedRegistry = []string{
-	// static (8)
+	// static H1 (8)
 	"churn-close",
 	"get-json",
 	"get-json-1k",
@@ -21,6 +21,13 @@ var expectedRegistry = []string{
 	"post-1m",
 	"post-4k",
 	"post-64k",
+
+	// static H2-prior-knowledge (4) — exercise h2c-noupg and other
+	// HTTP2C-capable cells that the H1 variants skip.
+	"get-json-64k-h2",
+	"get-json-h2",
+	"post-4k-h2",
+	"post-64k-h2",
 
 	// concurrency (4)
 	"auto-mix-111",
@@ -200,13 +207,38 @@ func TestAutoMixApplicableGating(t *testing.T) {
 	}
 }
 
-func TestConcurrencyNonAutoMixAlwaysApplicable(t *testing.T) {
+func TestConcurrencyNonAutoMixRequireHTTP1(t *testing.T) {
 	t.Parallel()
-	empty := servers.FeatureSet{}
+	h1Only := servers.FeatureSet{HTTP1: true}
+	h2cOnly := servers.FeatureSet{HTTP2C: true}
 	for _, name := range []string{"get-json-1c", "get-simple-128c", "get-simple-1024c"} {
 		s := findScenario(t, name)
-		if !s.Applicable(empty) {
-			t.Errorf("%q: unexpectedly skipped for empty FeatureSet", name)
+		// Non-auto-mix concurrency profiles drive plain H1 on the wire —
+		// h2c-noupg servers (H2-preface only) must be skipped or the
+		// cell silently records 0 RPS.
+		if !s.Applicable(h1Only) {
+			t.Errorf("%q: unexpectedly skipped for HTTP1-only server", name)
+		}
+		if s.Applicable(h2cOnly) {
+			t.Errorf("%q: applicable to H2C-only server (would record 0 RPS)", name)
+		}
+	}
+}
+
+func TestStaticH2ScenariosRequireHTTP2C(t *testing.T) {
+	t.Parallel()
+	h1Only := servers.FeatureSet{HTTP1: true}
+	h2cOnly := servers.FeatureSet{HTTP2C: true}
+	for _, name := range []string{"get-json-h2", "get-json-64k-h2", "post-4k-h2", "post-64k-h2"} {
+		s := findScenario(t, name)
+		// H2 prior-knowledge variants speak H2 frames on the wire — H1-only
+		// servers must be skipped, but any H2C-capable server (including
+		// h2c-noupg) is a valid target.
+		if s.Applicable(h1Only) {
+			t.Errorf("%q: applicable to HTTP1-only server (H2 scenario needs HTTP2C)", name)
+		}
+		if !s.Applicable(h2cOnly) {
+			t.Errorf("%q: unexpectedly skipped for H2C-capable server", name)
 		}
 	}
 }
@@ -216,6 +248,7 @@ func TestCategories(t *testing.T) {
 	for _, name := range []string{
 		"churn-close", "get-json", "get-json-1k", "get-json-64k",
 		"get-simple", "post-1m", "post-4k", "post-64k",
+		"get-json-h2", "get-json-64k-h2", "post-4k-h2", "post-64k-h2",
 	} {
 		s := findScenario(t, name)
 		if got := s.Category(); got != CategoryStatic {

@@ -33,6 +33,12 @@ type StaticScenario struct {
 	// DisableKeepAlive, when true, drives loadgen into Connection: close
 	// mode (one request per conn). Used by the churn scenario.
 	DisableKeepAlive bool
+
+	// HTTP2, when true, drives loadgen in HTTP/2-cleartext prior-knowledge
+	// mode — each worker opens an H2 connection and sends the client preface
+	// directly (no HTTP/1.1 Upgrade handshake). Used to exercise H2C-capable
+	// server cells, including h2c-noupg which refuses plain H1 by design.
+	HTTP2 bool
 }
 
 // NewStaticScenario constructs a [StaticScenario] with the given
@@ -62,7 +68,7 @@ func (s *StaticScenario) Workload(target string) loadgen.Config {
 	if method == "" {
 		method = "GET"
 	}
-	return loadgen.Config{
+	cfg := loadgen.Config{
 		URL:              target + s.Path,
 		Method:           method,
 		Body:             s.Body,
@@ -71,16 +77,30 @@ func (s *StaticScenario) Workload(target string) loadgen.Config {
 		// Duration + Warmup intentionally left zero — filled by the
 		// orchestrator from -duration / -warmup CLI flags (wave 2E).
 	}
+	if s.HTTP2 {
+		cfg.HTTP2 = true
+		// loadgen's HTTP/2 side has its own connection count knob —
+		// reuse s.Connections so an H2 variant of an H1 scenario stays
+		// comparable (same number of TCP connections, each carrying
+		// multiplexed streams). Defaults for MaxStreams apply.
+		cfg.HTTP2Options.Connections = conns
+	}
+	return cfg
 }
 
-// Applicable returns true for any server that speaks HTTP/1.1 on the
-// wire. Static scenarios drive the server with plain H1 requests (no
-// prior-knowledge H2, no upgrade handshake) so a server that only
-// accepts H2C prior-knowledge (e.g. celeris Protocol=H2C with
-// EnableH2Upgrade=false) is inapplicable and must be filtered here —
-// otherwise the cell runs, every request is rejected at the parser,
-// and the benchmark silently records 0 RPS.
-func (s *StaticScenario) Applicable(fs servers.FeatureSet) bool { return fs.HTTP1 }
+// Applicable gates on the wire protocol the scenario actually drives.
+// H1 variants (HTTP2=false) apply to any server that accepts plain
+// HTTP/1.1; H2 variants (HTTP2=true) apply to any HTTP/2-cleartext-
+// capable server, including h2c-noupg (refuses H1 but accepts the H2
+// preface directly). Without this split, h2c-noupg cells silently
+// record 0 RPS on H1 scenarios and H1-only servers would pair with H2
+// scenarios they can't serve.
+func (s *StaticScenario) Applicable(fs servers.FeatureSet) bool {
+	if s.HTTP2 {
+		return fs.HTTP2C
+	}
+	return fs.HTTP1
+}
 
 // Compile-time assertion that StaticScenario satisfies Scenario.
 var _ Scenario = (*StaticScenario)(nil)
@@ -98,6 +118,12 @@ var StaticScenarioNames = []string{
 	"post-64k",
 	"post-1m",
 	"churn-close",
+	// HTTP/2 prior-knowledge variants — exercise every HTTP2C-capable
+	// server, including h2c-noupg (which refuses H1 entirely).
+	"get-json-h2",
+	"get-json-64k-h2",
+	"post-4k-h2",
+	"post-64k-h2",
 }
 
 // Pre-generated POST payloads. They are built once at package init() so
@@ -202,5 +228,42 @@ func init() {
 		Path:             "/",
 		Connections:      32,
 		DisableKeepAlive: true,
+	})
+
+	// HTTP/2 prior-knowledge variants. Paired with the H1 versions on the
+	// same endpoints so an H2 regression shows up as a delta against its
+	// H1 twin rather than an isolated number. Connection count is kept
+	// lower than H1 because H2 multiplexes streams — 32 TCP conns ×
+	// default 100 concurrent streams gives the same or higher effective
+	// concurrency as H1's 128 conns.
+	Register(&StaticScenario{
+		name:        "get-json-h2",
+		Method:      "GET",
+		Path:        "/json",
+		Connections: 32,
+		HTTP2:       true,
+	})
+	Register(&StaticScenario{
+		name:        "get-json-64k-h2",
+		Method:      "GET",
+		Path:        "/json-64k",
+		Connections: 32,
+		HTTP2:       true,
+	})
+	Register(&StaticScenario{
+		name:        "post-4k-h2",
+		Method:      "POST",
+		Path:        "/upload",
+		Body:        post4KBody,
+		Connections: 32,
+		HTTP2:       true,
+	})
+	Register(&StaticScenario{
+		name:        "post-64k-h2",
+		Method:      "POST",
+		Path:        "/upload",
+		Body:        post64KBody,
+		Connections: 32,
+		HTTP2:       true,
 	})
 }
