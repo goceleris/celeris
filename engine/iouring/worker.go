@@ -67,11 +67,14 @@ type pendingReleaseEntry struct {
 }
 
 // pendingReleaseIters is the number of event-loop iterations to
-// hold a closed connState before returning to the pool. The loop
-// runs at O(100k+ iters/sec) under load, so 50 000 iters is a
-// ~500 ms safety window — orders of magnitude longer than io_uring
-// cancellation latency on Linux (typically <1 ms).
-const pendingReleaseIters uint64 = 50_000
+// hold a closed connState before returning to the pool. io_uring's
+// unix.Close(fd) → cancel-pending-ops → ECANCELED CQE path
+// completes within ~1 ms on Linux 6.x even under load, so ~5 000
+// iterations (≈50 ms on a worker looping at 100 k+ iter/s) is an
+// order-of-magnitude safety margin. Pushing this higher only
+// inflates the queue depth × per-cs memory footprint under
+// churn-close load without adding real safety.
+const pendingReleaseIters uint64 = 5_000
 
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
