@@ -57,6 +57,23 @@ const bufRingGroupID = 0
 const bufRingCount = 1024
 
 // Worker is a per-core io_uring event loop.
+// pendingReleaseEntry queues a connState for deferred release — its
+// fd has been closed but the kernel may still have SQEs referencing
+// its buffers; we hold it past the cancellation window before
+// returning to the pool. See Worker.pendingRelease docstring.
+type pendingReleaseEntry struct {
+	cs            *connState
+	releaseAtIter uint64
+}
+
+// pendingReleaseIters is the number of event-loop iterations to
+// hold a closed connState before returning to the pool. The loop
+// runs at O(100k+ iters/sec) under load, so 50 000 iters is a
+// ~500 ms safety window — orders of magnitude longer than io_uring
+// cancellation latency on Linux (typically <1 ms).
+const pendingReleaseIters uint64 = 50_000
+
+// Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
 	id         int
 	cpuID      int
@@ -94,7 +111,25 @@ type Worker struct {
 	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
 
 	tickCounter uint32
-	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
+	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
+	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
+
+	// pendingRelease defers returning connState structs to the pool
+	// until the kernel has drained any in-flight I/O SQEs that may
+	// still hold pointers into cs.buf / cs.sendBuf. On close the fd
+	// is unix.Close'd, which triggers io_uring to cancel pending ops
+	// — but the cancellation is asynchronous and the cancelled CQEs
+	// arrive on subsequent event-loop iterations. If we release cs
+	// immediately, Go's GC can reclaim cs.buf's backing array; the
+	// kernel then writes incoming bytes (that landed in flight just
+	// before close) into memory the Go runtime has since repurposed
+	// for its stack pool, yielding a SIGSEGV in runtime.stackalloc
+	// dereferencing HTTP request bytes as a pointer (#256 SEGV
+	// class — not race-detectable because the writer is the kernel,
+	// not Go code). Holding cs for pendingReleaseIters iterations
+	// after close keeps cs.buf's backing array alive through the
+	// cancellation window.
+	pendingRelease []pendingReleaseEntry
 
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns  bool       // set when provided buffers need publishing
@@ -453,6 +488,14 @@ func (w *Worker) run(ctx context.Context) {
 					w.markDirty(cs)
 				}
 			}
+		}
+
+		// Advance the monotonic iteration counter and release any
+		// connStates whose deferred-release window has elapsed (see
+		// queuePendingRelease docstring).
+		w.iterCount++
+		if len(w.pendingRelease) > 0 {
+			w.drainPendingRelease()
 		}
 
 		// Drain detached goroutine writes. Goroutines append to the queue
@@ -1520,6 +1563,31 @@ func (w *Worker) closeConn(fd int) {
 	w.finishClose(fd)
 }
 
+// queuePendingRelease enqueues cs for release at a future iteration.
+// See Worker.pendingRelease docstring for the kernel-buffer-lifetime
+// invariant this enforces.
+func (w *Worker) queuePendingRelease(cs *connState) {
+	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
+		cs:            cs,
+		releaseAtIter: w.iterCount + pendingReleaseIters,
+	})
+}
+
+// drainPendingRelease returns any connStates whose deferred-release
+// window has elapsed to the sync.Pool. FIFO because queue entries are
+// always appended with monotonically increasing releaseAtIter.
+func (w *Worker) drainPendingRelease() {
+	n := 0
+	for n < len(w.pendingRelease) && w.pendingRelease[n].releaseAtIter <= w.iterCount {
+		releaseConnState(w.pendingRelease[n].cs)
+		w.pendingRelease[n].cs = nil // drop strong ref from the slice's backing array
+		n++
+	}
+	if n > 0 {
+		w.pendingRelease = w.pendingRelease[n:]
+	}
+}
+
 func (w *Worker) finishClose(fd int) {
 	cs := w.conns[fd]
 	w.conns[fd] = nil
@@ -1530,11 +1598,19 @@ func (w *Worker) finishClose(fd int) {
 		w.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
-	// Capture close-path decisions before releaseConnState wipes cs.
+	// Capture close-path decisions before queueing cs for deferred release.
 	fixedFile := cs != nil && cs.fixedFile
 	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached
+	// Defer pool release. Returning cs to sync.Pool now would let Go's
+	// GC reclaim cs.buf's backing array; the kernel's still-pending
+	// recv SQE would then write inbound bytes into memory Go has
+	// repurposed (typically the runtime stack pool), yielding a SEGV
+	// when stackalloc later dereferences HTTP bytes as a pointer
+	// (#256 class). Hold cs in pendingRelease for a window longer
+	// than io_uring's cancellation latency before returning to the
+	// pool.
 	if cs != nil {
-		releaseConnState(cs)
+		w.queuePendingRelease(cs)
 	}
 
 	if fixedFile {
