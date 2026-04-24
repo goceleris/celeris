@@ -262,8 +262,13 @@ func TestFeatureFlagsSanity(t *testing.T) {
 		f := s.Features()
 		name := s.Name()
 
-		if !f.HTTP1 {
-			t.Errorf("%s: HTTP1=false, want true for all celeris configs", name)
+		// HTTP1 is expected for every config except h2c-noupg: pure
+		// H2C rejects plain HTTP/1.1 at the parser, so claiming HTTP1
+		// would make every H1-speaking scenario (static, chain,
+		// driver) pair with the cell and silently record 0 req.
+		wantHTTP1 := !strings.Contains(name, "h2c-noupg")
+		if f.HTTP1 != wantHTTP1 {
+			t.Errorf("%s: HTTP1=%v, want %v", name, f.HTTP1, wantHTTP1)
 		}
 		if !f.Drivers {
 			t.Errorf("%s: Drivers=false, want true", name)

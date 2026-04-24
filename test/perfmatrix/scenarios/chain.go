@@ -117,9 +117,13 @@ func (s *ChainScenario) Workload(target string) loadgen.Config {
 	return cfg
 }
 
-// Applicable requires the server to declare Middleware=true.
+// Applicable requires the server to declare Middleware=true and speak
+// HTTP/1.1 on the wire. Chain scenarios drive the server with plain H1
+// so a server that only accepts H2C prior-knowledge is skipped —
+// otherwise every request is rejected at the parser and the cell
+// silently records 0 RPS.
 func (s *ChainScenario) Applicable(fs servers.FeatureSet) bool {
-	return fs.Middleware && (fs.HTTP1 || fs.HTTP2C || fs.Auto)
+	return fs.Middleware && fs.HTTP1
 }
 
 // Compile-time assertion that ChainScenario satisfies Scenario.

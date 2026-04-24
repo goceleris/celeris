@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -430,6 +431,18 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 	}
 	result.Result = res
 	result.Profile = profileArt
+	// Strict 0-request guard. A cell that measured zero requests almost
+	// always means the server silently refused to serve the client's
+	// wire protocol (scenario × server mismatch) or wedged mid-warmup
+	// — both are test-validity bugs we want to surface, not data
+	// points to average into a report. Raising this as a cell error
+	// lets -fail-fast stop the run so it can be investigated before
+	// polluting hours of downstream measurements.
+	if res != nil && res.Requests == 0 {
+		result.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s (server likely refused the client's protocol or hung mid-warmup)",
+			res.Errors, res.Duration)
+		return errors.New(result.Error)
+	}
 	return nil
 }
 

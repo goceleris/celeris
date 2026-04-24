@@ -73,12 +73,14 @@ func (s *StaticScenario) Workload(target string) loadgen.Config {
 	}
 }
 
-// Applicable returns true for every server. Static scenarios are
-// protocol-agnostic: any server that speaks HTTP at all can serve GET /
-// and POST /upload regardless of H1/H2/auto-upgrade posture. Protocol
-// gating lives on ConcurrencyScenario.auto-mix-111 and on chain/driver
-// scenarios, not here.
-func (s *StaticScenario) Applicable(servers.FeatureSet) bool { return true }
+// Applicable returns true for any server that speaks HTTP/1.1 on the
+// wire. Static scenarios drive the server with plain H1 requests (no
+// prior-knowledge H2, no upgrade handshake) so a server that only
+// accepts H2C prior-knowledge (e.g. celeris Protocol=H2C with
+// EnableH2Upgrade=false) is inapplicable and must be filtered here —
+// otherwise the cell runs, every request is rejected at the parser,
+// and the benchmark silently records 0 RPS.
+func (s *StaticScenario) Applicable(fs servers.FeatureSet) bool { return fs.HTTP1 }
 
 // Compile-time assertion that StaticScenario satisfies Scenario.
 var _ Scenario = (*StaticScenario)(nil)

@@ -98,10 +98,13 @@ func (s *DriverScenario) Workload(target string) loadgen.Config {
 	return cfg
 }
 
-// Applicable requires the server to declare Drivers=true and to speak at
-// least HTTP/1.
+// Applicable requires the server to declare Drivers=true and speak
+// HTTP/1.1 on the wire. Driver scenarios drive the server with plain H1
+// so a server that only accepts H2C prior-knowledge is skipped —
+// otherwise every request is rejected at the parser and the cell
+// silently records 0 RPS.
 func (s *DriverScenario) Applicable(fs servers.FeatureSet) bool {
-	return fs.Drivers && (fs.HTTP1 || fs.HTTP2C || fs.Auto)
+	return fs.Drivers && fs.HTTP1
 }
 
 // Compile-time assertion that DriverScenario satisfies Scenario.

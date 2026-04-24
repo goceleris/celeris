@@ -125,16 +125,23 @@ func TestStaticPOSTBodiesExactSize(t *testing.T) {
 	}
 }
 
-func TestStaticScenariosAlwaysApplicable(t *testing.T) {
+func TestStaticScenariosRequireHTTP1(t *testing.T) {
 	t.Parallel()
-	empty := servers.FeatureSet{}
+	h1Only := servers.FeatureSet{HTTP1: true}
+	h2cOnly := servers.FeatureSet{HTTP2C: true}
 	for _, name := range []string{
 		"churn-close", "get-json", "get-json-1k", "get-json-64k",
 		"get-simple", "post-1m", "post-4k", "post-64k",
 	} {
 		s := findScenario(t, name)
-		if !s.Applicable(empty) {
-			t.Errorf("static scenario %q unexpectedly skipped for empty FeatureSet", name)
+		// Static scenarios drive plain H1 on the wire — a server that
+		// only accepts H2C prior-knowledge (h2c-noupg) must be skipped
+		// or the cell silently records 0 RPS.
+		if !s.Applicable(h1Only) {
+			t.Errorf("static scenario %q unexpectedly skipped for HTTP1-only server", name)
+		}
+		if s.Applicable(h2cOnly) {
+			t.Errorf("static scenario %q applicable to H2C-only server (would record 0 RPS)", name)
 		}
 	}
 }

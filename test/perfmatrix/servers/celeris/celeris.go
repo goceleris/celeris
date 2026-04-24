@@ -505,6 +505,15 @@ func newCelerisServer(engine, protocol, upgrade, async string) *celerisServer {
 	switch protocol {
 	case "h2c":
 		feat.HTTP2C = true
+		// Pure H2C with no upgrade path rejects plain HTTP/1.1 requests;
+		// the feature set must not claim HTTP1 or every H1-speaking
+		// scenario (static, chain, driver) will pair with this cell and
+		// log 0 req / all errors. auto-mix-111 is the only scenario that
+		// speaks prior-knowledge H2C and therefore the only one that
+		// exercises these cells meaningfully.
+		if upgradePtr != nil && !*upgradePtr {
+			feat.HTTP1 = false
+		}
 	case "auto":
 		feat.Auto = true
 		feat.HTTP2C = true

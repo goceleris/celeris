@@ -1148,10 +1148,24 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			return
 		}
 		var flushErr error
-		if processErr == nil && cs.writePos < len(cs.writeBuf) {
+		if processErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {
 			flushErr = flushWrites(cs)
 		}
-		partial := flushErr == nil && cs.writePos < len(cs.writeBuf)
+		// Resync pendingBytes with actual buffer state. makeWriteFn uses
+		// pendingBytes to enforce writeCap backpressure; without this
+		// reset, it grows by len(response) on every request and after
+		// ~writeCap bytes of cumulative responses every subsequent
+		// makeWriteFn call silently drops its payload — the client then
+		// blocks forever on the missing response. Mirror the inline-flush
+		// path (drainRead) and dirty-loop accounting.
+		if flushErr == nil {
+			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
+				cs.pendingBytes = 0
+			} else {
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
+			}
+		}
+		partial := flushErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0)
 		cs.detachMu.Unlock()
 
 		if partial {
