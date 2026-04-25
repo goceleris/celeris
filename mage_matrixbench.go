@@ -40,12 +40,17 @@ type matrixFlags struct {
 // configs × all competitors × all scenarios × 5 interleaved runs at 15s
 // each. Captures reliable p99.99 tails on a sane wall-clock budget.
 // Expected runtime ~1.8 days on msr1. See test/perfmatrix/README.md.
+//
+// PERFMATRIX_CELLS, when set, narrows the run to a comma-separated cell
+// glob (same syntax as the runner's -cells flag). Useful for a partial
+// regression check or to repro a single matrix cell without re-running
+// the entire sweep.
 func MatrixBench() error {
 	return runMatrix(matrixFlags{
 		runs:     5,
 		duration: 15 * time.Second,
 		warmup:   2 * time.Second,
-		cells:    "*",
+		cells:    envOrDefault("PERFMATRIX_CELLS", "*"),
 		profile:  false,
 		services: "local",
 	})
