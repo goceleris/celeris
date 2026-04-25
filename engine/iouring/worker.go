@@ -61,9 +61,18 @@ const bufRingCount = 1024
 // fd has been closed but the kernel may still have SQEs referencing
 // its buffers; we hold it past the cancellation window before
 // returning to the pool. See Worker.pendingRelease docstring.
+//
+// detached entries (async-dispatch / WS / SSE conns) skip the pool
+// recycle: their cs has live state (h1State, asyncCond, asyncInBuf
+// slices) that goroutine closures may still reference even after the
+// worker observes asyncClosed and runs finishCloseDetached. Holding
+// the strong ref alive past the kernel's recv-SQE drain window is
+// what we need; the recycle path resetting fields would race with the
+// goroutine's defer that reads cs.fd / cs.asyncInBuf.
 type pendingReleaseEntry struct {
 	cs            *connState
 	releaseAtIter uint64
+	detached      bool
 }
 
 // pendingReleaseIters is the number of event-loop iterations to
@@ -1598,14 +1607,44 @@ func (w *Worker) queuePendingRelease(cs *connState) {
 	})
 }
 
+// queuePendingReleaseDetached holds cs alive past the kernel's recv-SQE
+// drain window without recycling it through sync.Pool. Used by the
+// detached close path (async-dispatch HTTP/1.1, WebSocket, SSE), where
+// goroutine closures still reference cs.h1State / cs.asyncCond /
+// cs.asyncInBuf — the worker observed asyncClosed and tore the conn
+// down, but the dispatch goroutine can still be inside its deferred
+// recover() block, reading cs.fd and re-clearing cs.asyncInBuf, when
+// finishCloseDetached returns. Recycling cs through releaseConnState
+// at this point races those reads. We just keep the strong ref alive
+// for pendingReleaseIters and let GC collect — the goroutine has long
+// since finished by then, the kernel has long since drained any
+// pending recv targeting cs.buf, and Go's GC reclaims cs and cs.buf
+// without any chance of the kernel writing inbound HTTP bytes into
+// memory the runtime has repurposed (#256 SIGSEGV class).
+func (w *Worker) queuePendingReleaseDetached(cs *connState) {
+	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
+		cs:            cs,
+		releaseAtIter: w.iterCount + pendingReleaseIters,
+		detached:      true,
+	})
+}
+
 // drainPendingRelease returns any connStates whose deferred-release
 // window has elapsed to the sync.Pool. FIFO because queue entries are
 // always appended with monotonically increasing releaseAtIter.
+//
+// Detached entries skip the pool recycle (releaseConnState would
+// reset fields that goroutine closures may still observe via the
+// runAsyncHandler defer block) and just drop the strong ref so GC
+// can reclaim the cs.
 func (w *Worker) drainPendingRelease() {
 	n := 0
 	for n < len(w.pendingRelease) && w.pendingRelease[n].releaseAtIter <= w.iterCount {
-		releaseConnState(w.pendingRelease[n].cs)
-		w.pendingRelease[n].cs = nil // drop strong ref from the slice's backing array
+		entry := &w.pendingRelease[n]
+		if !entry.detached {
+			releaseConnState(entry.cs)
+		}
+		entry.cs = nil // drop strong ref from the slice's backing array
 		n++
 	}
 	if n > 0 {
@@ -1701,6 +1740,23 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 
 	fixedFile := cs.fixedFile
 	// Do NOT call releaseConnState — goroutine closures still reference cs.
+	//
+	// Hold cs alive in pendingRelease past the kernel's recv-SQE drain
+	// window. After the goroutine exits (which happens promptly once
+	// closeConn sets asyncClosed and broadcasts asyncCond), cs has no
+	// remaining references and becomes GC-eligible. Without this hold,
+	// GC would reclaim cs.buf while the kernel still has a pending recv
+	// SQE targeting &cs.buf[0]; on the next inbound byte the kernel
+	// writes HTTP request bytes into memory Go has repurposed for
+	// runtime stack pages — the next stackalloc walks an mspan list
+	// where a pointer slot now reads "GET / HTTP/1.1" and SIGSEGVs at
+	// addr 0x48202f20544547 (#256 class, fingerprint matches the
+	// strict-matrix run2 trip on churn-close × iouring-async).
+	//
+	// pendingReleaseIters (5 000 ≈ 50 ms under load) is comfortably
+	// longer than io_uring's close-cancels-pending-ops latency on
+	// Linux 6.x and longer than any reasonable runAsyncHandler tail.
+	w.queuePendingReleaseDetached(cs)
 
 	if fixedFile {
 		sqe := w.ring.GetSQE()
