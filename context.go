@@ -154,6 +154,17 @@ type Context struct {
 	// middleware wants to share downstream without an alloc per request.
 	stringKeys map[string]string
 
+	// workerID is the engine-supplied event-loop worker affinity for
+	// this request, propagated by routerAdapter.HandleStream from the
+	// engine's connection-scoped context. Stored as a direct field so
+	// c.WorkerID() avoids the per-request context.Value walk and so
+	// the routerAdapter can skip the context.WithValue allocation that
+	// previously dominated the iouring-h1-sync alloc profile (~99% of
+	// total allocations on get-simple). Zero-value is fine: WorkerID()
+	// reports -1 when the engine never set one.
+	workerID    int32
+	workerIDSet bool
+
 	clientIPOverride string
 	schemeOverride   string
 	hostOverride     string
@@ -325,6 +336,13 @@ func (c *Context) SetContext(ctx context.Context) {
 // engine (all platforms) returns -1 because Go's runtime scheduler
 // picks the goroutine and there is no meaningful worker identity.
 func (c *Context) WorkerID() int {
+	if c.workerIDSet {
+		return int(c.workerID)
+	}
+	// Fallback for synthetic contexts (tests etc.) that came in
+	// pre-populated via context.WithValue without going through
+	// routerAdapter.HandleStream. Production hot path uses the field
+	// above and never reaches this Value() walk.
 	id, _ := ctxkit.WorkerIDFrom(c.Context())
 	return id
 }
@@ -504,6 +522,8 @@ func (c *Context) reset() {
 	c.bytesWritten = 0
 	c.maxFormSize = 0
 	c.requestID = ""
+	c.workerID = 0
+	c.workerIDSet = false
 	if c.extended {
 		clear(c.keys)
 		if c.stringKeys != nil {

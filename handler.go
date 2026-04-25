@@ -24,14 +24,17 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	c.startTime = time.Now()
 	c.trustedNets = a.server.trustedNets
 
-	// Propagate engine-layer values (worker ID, etc.) from the handler-
-	// received ctx into c.ctx. s.Context() is preserved as the base so h2
-	// stream-cancellation semantics (Done/Err) remain intact; we only layer
-	// the worker-ID value on top so handlers can call c.WorkerID() and
-	// forward to driver pools.
+	// Propagate engine-supplied worker affinity into the celeris.Context
+	// without paying a per-request context.WithValue allocation. The
+	// engine sets it once at accept time (engine/iouring/worker.go and
+	// engine/epoll/loop.go); we read once here and store as a direct
+	// field so c.WorkerID() returns it without a context.Value walk.
+	// Eliminates ~99% of allocations on iouring-h1-sync get-simple
+	// (5.2M allocs/run → ~0).
 	if ctx != nil {
 		if wid, ok := ctxkit.WorkerIDFrom(ctx); ok {
-			c.ctx = ctxkit.WithWorkerID(c.ctx, wid)
+			c.workerID = int32(wid)
+			c.workerIDSet = true
 		}
 	}
 
