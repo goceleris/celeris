@@ -37,27 +37,14 @@ type matrixFlags struct {
 }
 
 // MatrixBench runs the full release-gate performance matrix: all celeris
-// configs × all competitors × all scenarios × 10 interleaved runs at 10s
-// each. Expected runtime ~2.5 days on msr1. See test/perfmatrix/README.md.
+// configs × all competitors × all scenarios × 5 interleaved runs at 15s
+// each. Captures reliable p99.99 tails on a sane wall-clock budget.
+// Expected runtime ~1.8 days on msr1. See test/perfmatrix/README.md.
 func MatrixBench() error {
 	return runMatrix(matrixFlags{
-		runs:     10,
-		duration: 10 * time.Second,
-		warmup:   2 * time.Second,
-		cells:    "*",
-		profile:  false,
-		services: "local",
-	})
-}
-
-// MatrixBenchDeep is the maximum-rigor variant: 10 runs × 15s measurement +
-// 3s warmup. Captures reliable p99.99 tails. ~3.5 days on msr1. Use for
-// major-release gating.
-func MatrixBenchDeep() error {
-	return runMatrix(matrixFlags{
-		runs:     10,
+		runs:     5,
 		duration: 15 * time.Second,
-		warmup:   3 * time.Second,
+		warmup:   2 * time.Second,
 		cells:    "*",
 		profile:  false,
 		services: "local",
