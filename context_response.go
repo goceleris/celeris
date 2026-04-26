@@ -1241,6 +1241,7 @@ func (c *Context) Detach() (done func()) {
 	// is reused for the next recv. Pseudo-header keys are string literals
 	// (safe), but their values (:authority, :path for non-"/" paths, :method
 	// for non-standard methods) may be UnsafeString backed by the buffer.
+	c.stream.MaterializeHeaders()
 	for i, h := range c.stream.Headers {
 		if len(h[0]) > 0 && h[0][0] == ':' {
 			c.stream.Headers[i][1] = strings.Clone(h[1])

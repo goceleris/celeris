@@ -81,6 +81,7 @@ func (c *Context) Header(key string) string {
 	if needsLower {
 		key = strings.ToLower(key)
 	}
+	c.stream.MaterializeHeaders()
 	for _, h := range c.stream.Headers {
 		if h[0] == key {
 			return h[1]

@@ -14,6 +14,13 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
+func init() {
+	// Wire the H1-package helpers so protocol/h2/stream can lazily
+	// materialize request headers from raw bytes without taking a
+	// build-time dependency on protocol/h1.
+	stream.SetLazyHeaderHelpers(h1.UnsafeLowerHeader, h1.UnsafeString)
+}
+
 // ErrHijacked is returned by ProcessH1 when the connection was hijacked.
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
@@ -721,11 +728,15 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	s.WorkerID = state.WorkerID
 	s.WorkerIDSet = state.WorkerIDSet
 	s.StartTimeNs = state.NowNs
-	// Reuse the stream's existing header slice capacity.
+	// Eagerly populate the 4 pseudo-headers (extractRequestInfo always
+	// reads them); defer the raw-header lowercase + append loop to
+	// Stream.MaterializeHeaders, called by the Context only when a handler
+	// actually reads request headers (Header / RequestHeaders / Cookies /
+	// the request-id middleware etc.). Saves ~5ns per raw header per
+	// request on bench-style workloads where handlers don't read headers.
 	hdrs := s.Headers[:0]
-	needed := len(req.RawHeaders) + 4
-	if cap(hdrs) < needed {
-		hdrs = make([][2]string, 0, needed)
+	if cap(hdrs) < 4 {
+		hdrs = make([][2]string, 0, 4+len(req.RawHeaders))
 	}
 	hdrs = append(hdrs,
 		[2]string{":method", req.Method},
@@ -733,16 +744,8 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 		[2]string{":scheme", "http"},
 		[2]string{":authority", req.Host},
 	)
-	// Zero-copy header conversion: lowercase names in-place, then create
-	// strings backed by the read buffer. Safe because H1 handlers run
-	// synchronously — the buffer isn't reused until after the stream is released.
-	for _, rh := range req.RawHeaders {
-		hdrs = append(hdrs, [2]string{
-			h1.UnsafeLowerHeader(rh[0]),
-			h1.UnsafeString(rh[1]),
-		})
-	}
 	s.Headers = hdrs
+	s.LazyRawHeaders = req.RawHeaders
 	s.IsHEAD = req.Method == "HEAD"
 
 	if len(body) > 0 {

@@ -41,6 +41,14 @@ type Stream struct {
 	// can read affinity without a per-request ctx.Value() walk.
 	WorkerID    int32
 	WorkerIDSet bool
+	// LazyRawHeaders, when non-nil on an H1 stream, holds raw request
+	// header bytes that have NOT been appended to Headers yet — the H1
+	// dispatch sets only the 4 pseudo-headers eagerly and defers the raw
+	// header lowercase + slice append until a handler actually reads them
+	// via Context.Header / Context.RequestHeaders. Materialized once per
+	// request via MaterializeHeaders. Cleared on stream reset.
+	LazyRawHeaders [][2][]byte
+	lazyHeadersBuilt bool
 	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
@@ -279,11 +287,53 @@ func ResetH1Stream(s *Stream) {
 	}
 	s.rawBody = nil
 	s.Headers = s.hdrBuf[:0]
+	s.LazyRawHeaders = nil
+	s.lazyHeadersBuilt = false
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.ResponseWriter = nil
 	s.IsHEAD = false
 	s.state.Store(int32(StateIdle))
+}
+
+// MaterializeHeaders ensures that every header carried by this H1 stream
+// has been appended to s.Headers. The H1 dispatch primes Headers with the
+// 4 pseudo-headers eagerly (extractRequestInfo always reads them) and
+// defers the raw-header loop here so handlers that never call
+// Context.Header / Context.RequestHeaders skip the per-request work
+// entirely. Idempotent.
+func (s *Stream) MaterializeHeaders() {
+	if s.lazyHeadersBuilt || len(s.LazyRawHeaders) == 0 {
+		return
+	}
+	s.lazyHeadersBuilt = true
+	if cap(s.Headers) < len(s.Headers)+len(s.LazyRawHeaders) {
+		grown := make([][2]string, len(s.Headers), len(s.Headers)+len(s.LazyRawHeaders))
+		copy(grown, s.Headers)
+		s.Headers = grown
+	}
+	for _, rh := range s.LazyRawHeaders {
+		s.Headers = append(s.Headers, [2]string{
+			lazyLowerHeaderName(rh[0]),
+			unsafeStringFromBytes(rh[1]),
+		})
+	}
+}
+
+// lazyLowerHeaderName mirrors h1.UnsafeLowerHeader (interned + lowercased)
+// without importing the protocol package here (would create a cycle).
+// Implemented as a function-pointer set by the H1 layer at init.
+var lazyLowerHeaderName func(b []byte) string
+
+// unsafeStringFromBytes is wired by the H1 layer at init for the same
+// reason — the stream package does not import protocol/h1.
+var unsafeStringFromBytes func(b []byte) string
+
+// SetLazyHeaderHelpers wires the H1-package helpers used by
+// MaterializeHeaders. Called from internal/conn package init.
+func SetLazyHeaderHelpers(lower func([]byte) string, str func([]byte) string) {
+	lazyLowerHeaderName = lower
+	unsafeStringFromBytes = str
 }
 
 // ResetH2StreamInline performs a lightweight reset for inline H2 stream reuse.
@@ -390,9 +440,10 @@ func (s *Stream) SetRawBody(b []byte) {
 
 // GetHeaders returns the headers. For single-threaded H1 streams, returns
 // the slice directly (no lock, no copy). For H2 streams, returns a safe copy
-// under lock.
+// under lock. Materializes any deferred raw H1 headers first.
 func (s *Stream) GetHeaders() [][2]string {
 	if s.h1Mode {
+		s.MaterializeHeaders()
 		return s.Headers
 	}
 	s.mu.RLock()
@@ -404,6 +455,10 @@ func (s *Stream) GetHeaders() [][2]string {
 
 // HeadersLen returns the number of headers on the stream.
 func (s *Stream) HeadersLen() int {
+	if s.h1Mode {
+		s.MaterializeHeaders()
+		return len(s.Headers)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.Headers)
@@ -411,6 +466,13 @@ func (s *Stream) HeadersLen() int {
 
 // ForEachHeader calls fn for each header under a read lock.
 func (s *Stream) ForEachHeader(fn func(name, value string)) {
+	if s.h1Mode {
+		s.MaterializeHeaders()
+		for _, h := range s.Headers {
+			fn(h[0], h[1])
+		}
+		return
+	}
 	s.mu.RLock()
 	for _, h := range s.Headers {
 		fn(h[0], h[1])
