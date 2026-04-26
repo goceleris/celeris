@@ -135,17 +135,19 @@ func (c *Collector) RecordRequestSharded(workerID uint32, duration time.Duration
 	if status >= 500 {
 		s.errors.Add(1)
 	}
+	// Linear scan beats binary search at this bucket count (10) when the
+	// distribution is skewed toward the low end — production HTTP request
+	// latencies overwhelmingly land in the first 1-2 buckets, so a linear
+	// walk hits the answer in 1-2 comparisons vs binary's 3-4 (log2(10)).
 	ns := duration.Nanoseconds()
-	lo, hi := 0, bucketCount-1
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if ns <= defaultBucketBoundsNS[mid] {
-			hi = mid
-		} else {
-			lo = mid + 1
+	idx := bucketCount - 1
+	for i := 0; i < bucketCount-1; i++ {
+		if ns <= defaultBucketBoundsNS[i] {
+			idx = i
+			break
 		}
 	}
-	s.buckets[lo].Add(1)
+	s.buckets[idx].Add(1)
 }
 
 // RecordError increments the error counter.
