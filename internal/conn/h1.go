@@ -648,12 +648,18 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	s := populateCachedStream(state, req, body)
 
 	// Reuse the connection-scoped response adapter — avoids a heap allocation
-	// per request. Reset per-request fields; hijackFn/write are stable.
+	// per request. Reset per-request fields. write and hijackFn are stable
+	// across requests on the same connection (write is the engine's
+	// per-conn writeFn closure, hijackFn is set once at initProtocol), so
+	// wire them on the first request and skip the re-assignment after.
+	// UpdateWriteFn handles the rare detach swap if it happens.
 	rw := &state.rw
-	rw.write = write
+	if rw.write == nil {
+		rw.write = write
+		rw.hijackFn = state.HijackFn
+	}
 	rw.keepAlive = req.KeepAlive
 	rw.isHEAD = req.Method == "HEAD"
-	rw.hijackFn = state.HijackFn
 	rw.hijacked = false
 	s.ResponseWriter = rw
 
