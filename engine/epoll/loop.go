@@ -874,6 +874,9 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
+		if !l.cfg.EnableH2Upgrade {
+			cs.h1State.DisableH2CDetect()
+		}
 		// Scatter-gather body writer: handler hands large bodies to the
 		// engine as a zero-copy slice; flushWrites emits writev(2) with
 		// [headers, body] so we save the respBuf → writeBuf memcpy.

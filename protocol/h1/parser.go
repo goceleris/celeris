@@ -23,6 +23,11 @@ type Parser struct {
 	buf             []byte
 	pos             int
 	noStringHeaders bool
+	// disableH2CDetect skips per-header h2c-upgrade detection work
+	// (asciiEqualFold against Upgrade / HTTP2-Settings / Connection on every
+	// header on every request). Set by callers that have already gated the
+	// upgrade path off (e.g. engine config with EnableH2Upgrade=false).
+	disableH2CDetect bool
 
 	// h2c upgrade detection (RFC 7540 §3.2). Reset per request in ParseRequest.
 	upgradeH2CSeen             bool
@@ -42,6 +47,13 @@ func NewParser() *Parser {
 // RawHeaders to strings — typically via unsafe.String for zero allocation.
 func (p *Parser) SetZeroCopy(enabled bool) {
 	p.noStringHeaders = enabled
+}
+
+// SetDisableH2CDetect skips per-header h2c-upgrade detection. Callers that
+// have ruled out h2c upgrade upstream (engine config) save asciiEqualFold
+// scans against Upgrade / HTTP2-Settings / Connection on every header.
+func (p *Parser) SetDisableH2CDetect(disabled bool) {
+	p.disableH2CDetect = disabled
 }
 
 // Reset reinitializes the parser with a new input buffer.
@@ -185,8 +197,11 @@ func (p *Parser) parseHeaders(req *Request) (bool, error) {
 func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 	req.RawHeaders = append(req.RawHeaders, [2][]byte{rawName, rawValue})
 	// h2c upgrade detection (RFC 7540 §3.2). Run on raw bytes regardless of
-	// noStringHeaders mode so the detection is uniform across paths.
-	p.detectH2CHeader(req, rawName, rawValue)
+	// noStringHeaders mode so the detection is uniform across paths. Skipped
+	// when the engine has already ruled out h2c upgrade.
+	if !p.disableH2CDetect {
+		p.detectH2CHeader(req, rawName, rawValue)
+	}
 	if !p.noStringHeaders {
 		name := internOrLowerHeader(rawName)
 		value := string(rawValue)

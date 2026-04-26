@@ -835,6 +835,9 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
+		if !w.cfg.EnableH2Upgrade {
+			cs.h1State.DisableH2CDetect()
+		}
 		// Wire the scatter-gather body writer so the H1 response adapter
 		// can hand large bodies straight to the WRITEV path without the
 		// intermediate respBuf → cs.writeBuf memcpy. writeBodyFn stores

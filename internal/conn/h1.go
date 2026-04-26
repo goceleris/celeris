@@ -202,6 +202,15 @@ func NewH1State() *H1State {
 	}
 }
 
+// DisableH2CDetect tells the H1 parser it can skip per-header h2c-upgrade
+// detection. The engine calls this on connections whose config has
+// EnableH2Upgrade=false; the upgrade path is impossible in that mode and
+// parsing every header against Upgrade / HTTP2-Settings / Connection is
+// wasted work on the recv hot path.
+func (s *H1State) DisableH2CDetect() {
+	s.parser.SetDisableH2CDetect(true)
+}
+
 // CloseH1 releases the cached stream and context (if any) back to their pools.
 func CloseH1(state *H1State) {
 	if state.stream != nil {
