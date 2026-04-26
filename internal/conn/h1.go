@@ -103,6 +103,13 @@ type H1State struct {
 	// ErrUpgradeH2C. The engine consumes it via switchToH2 and then clears
 	// it. Always nil on a clean (non-upgrade) connection.
 	UpgradeInfo *UpgradeInfo
+
+	// WorkerID is the engine worker ID owning the connection (-1 for
+	// unset / std engine). Set by the engine at initProtocol; copied to
+	// the stream by populateCachedStream so HandleStream can read it
+	// without a per-request ctx.Value() walk.
+	WorkerID    int32
+	WorkerIDSet bool
 }
 
 // UpdateWriteFn replaces the response adapter's write function. Called by
@@ -699,6 +706,8 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	}
 	s.RemoteAddr = state.RemoteAddr
 	s.OnDetach = state.OnDetach
+	s.WorkerID = state.WorkerID
+	s.WorkerIDSet = state.WorkerIDSet
 	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4

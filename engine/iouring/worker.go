@@ -835,6 +835,8 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
+		cs.h1State.WorkerID = int32(w.id)
+		cs.h1State.WorkerIDSet = true
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}

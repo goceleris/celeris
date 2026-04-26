@@ -34,6 +34,13 @@ const (
 type Stream struct {
 	ID                     uint32
 	state                  atomic.Int32
+	// WorkerID is the engine worker ID (0..NumWorkers-1) that owns this
+	// stream's connection, or -1 when there is no meaningful worker identity
+	// (e.g. the std engine where Go's runtime scheduler picks the goroutine).
+	// Engines populate this once per connection at accept-time so handlers
+	// can read affinity without a per-request ctx.Value() walk.
+	WorkerID    int32
+	WorkerIDSet bool
 	manager                *Manager
 	Headers                [][2]string
 	Trailers               [][2]string

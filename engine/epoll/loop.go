@@ -874,6 +874,8 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
+		cs.h1State.WorkerID = int32(l.id)
+		cs.h1State.WorkerIDSet = true
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
