@@ -1212,7 +1212,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	switch proto {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
-		if errors.Is(processErr, conn.ErrUpgradeH2C) {
+		// In h1Only mode tryUpgradeH2C is gated off in the parser, so
+		// ProcessH1 cannot return ErrUpgradeH2C — skip the errors.Is call.
+		if !w.h1Only && errors.Is(processErr, conn.ErrUpgradeH2C) {
 			// H1→H2 upgrade. switchToH2 consumes the upgrade info and
 			// re-arms recv so subsequent data is parsed as H2.
 			if hasProvidedBuf {
