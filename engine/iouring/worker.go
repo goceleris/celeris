@@ -471,25 +471,29 @@ func (w *Worker) run(ctx context.Context) {
 				entry := w.ring.cqeAt(cqHead)
 				// Inlined CQE dispatch — eliminates processCQE method call
 				// and avoids passing context.Context on every CQE (only
-				// udAccept needs it). Hot ops (recv/send) are checked first.
-				switch decodeOp(entry.UserData) {
+				// udAccept needs it). Decode op+fd once per CQE; the
+				// previous form re-decoded fd from entry.UserData inside
+				// each case. Hot ops (recv/send) are checked first.
+				ud := entry.UserData
+				fd := int(ud & fdMask)
+				switch ud & udMask {
 				case udRecv:
-					w.handleRecv(entry, decodeFD(entry.UserData), now)
+					w.handleRecv(entry, fd, now)
 				case udSend:
-					w.handleSend(entry, decodeFD(entry.UserData), now)
+					w.handleSend(entry, fd, now)
 				case udAccept:
-					w.handleAccept(ctx, entry, decodeFD(entry.UserData), now)
+					w.handleAccept(ctx, entry, fd, now)
 				case udClose:
-					w.handleClose(decodeFD(entry.UserData))
+					w.handleClose(fd)
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udProvide:
 				case udDriverRecv:
-					w.handleDriverRecv(entry, decodeFD(entry.UserData))
+					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
-					w.handleDriverSend(entry, decodeFD(entry.UserData))
+					w.handleDriverSend(entry, fd)
 				case udDriverClose:
-					w.handleDriverClose(decodeFD(entry.UserData))
+					w.handleDriverClose(fd)
 				}
 				cqHead++
 			}
