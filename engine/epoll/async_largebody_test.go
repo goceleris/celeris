@@ -183,7 +183,7 @@ func TestAsyncHandlerLargeBodyConcurrent(t *testing.T) {
 					return
 				}
 				n, err := io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if err != nil {
 					ch <- res{id, fmt.Errorf("conn %d req %d copy: %w", id, j, err), ok}
 					return

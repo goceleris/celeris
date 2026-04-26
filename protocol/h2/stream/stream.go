@@ -286,6 +286,9 @@ func (s *Stream) resetAndPool() {
 	s.CachedRoutePath = ""
 	s.CachedRouteHandlers = nil
 	s.CachedRouteFullPath = ""
+	s.WorkerID = 0
+	s.WorkerIDSet = false
+	s.StartTimeNs = 0
 	if s.ReceivedWindowUpd != nil {
 		for len(s.ReceivedWindowUpd) > 0 {
 			<-s.ReceivedWindowUpd

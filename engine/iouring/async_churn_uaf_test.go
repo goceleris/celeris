@@ -87,8 +87,17 @@ func TestAsyncChurnNoUseAfterFree(t *testing.T) {
 		}
 	}()
 
-	dl := time.Now().Add(5 * time.Second)
+	// CI runners (and especially -race builds on hosted Azure agents) can
+	// take well over the 5 s our msr1 dev box uses. Bump the deadline so
+	// the test waits until the engine is actually up — the churn-load it
+	// runs after this is the part the test cares about, not the bind.
+	dl := time.Now().Add(30 * time.Second)
 	for time.Now().Before(dl) && e.Addr() == nil {
+		select {
+		case err := <-errCh:
+			t.Fatalf("engine.Listen returned early: %v", err)
+		default:
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if e.Addr() == nil {
