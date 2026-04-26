@@ -92,9 +92,10 @@ type Context struct {
 	handlerBuf [8]HandlerFunc
 	params     Params
 	paramBuf   [4]Param
-	keys       map[string]any
-	ctx        context.Context
-	startTime  time.Time
+	keys        map[string]any
+	ctx         context.Context
+	startTime   time.Time
+	startTimeNs int64 // primary representation; startTime is materialized lazily by StartTime()
 
 	method   string
 	path     string
@@ -350,7 +351,15 @@ func (c *Context) WorkerID() int {
 // StartTime returns the time at which request processing began. Set once by
 // the framework before the handler chain runs, so all middleware share the
 // same timestamp without calling time.Now() independently.
-func (c *Context) StartTime() time.Time { return c.startTime }
+func (c *Context) StartTime() time.Time {
+	// Materialize lazily from the raw ns set by routerAdapter.HandleStream.
+	// Most requests never call StartTime(), so the time.Unix division is
+	// deferred off the hot path.
+	if c.startTime.IsZero() && c.startTimeNs != 0 {
+		c.startTime = time.Unix(0, c.startTimeNs)
+	}
+	return c.startTime
+}
 
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
@@ -524,6 +533,8 @@ func (c *Context) reset() {
 	c.requestID = ""
 	c.workerID = 0
 	c.workerIDSet = false
+	c.startTimeNs = 0
+	c.startTime = time.Time{}
 	if c.extended {
 		clear(c.keys)
 		if c.stringKeys != nil {

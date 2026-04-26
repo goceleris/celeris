@@ -26,9 +26,15 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	// time.Now() vDSO. Falls back to time.Now() for synthetic / std-engine
 	// streams that didn't go through populateCachedStream.
 	if s.StartTimeNs != 0 {
-		c.startTime = time.Unix(0, s.StartTimeNs)
+		// Defer the time.Unix conversion: store the raw ns and only
+		// materialize a time.Time when c.StartTime() is actually called
+		// (rare — the per-request hot path only needs ns for the duration
+		// computation in recoverAndRelease).
+		c.startTimeNs = s.StartTimeNs
 	} else {
-		c.startTime = time.Now()
+		t := time.Now()
+		c.startTime = t
+		c.startTimeNs = t.UnixNano()
 	}
 	c.trustedNets = a.server.trustedNets
 
@@ -153,7 +159,11 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		if status == 0 {
 			status = 200
 		}
-		a.server.collector.RecordRequestSharded(uint32(c.workerID), time.Since(c.startTime), status)
+		// Use the raw int64 ns. time.Since on a time.Unix-constructed
+		// time.Time falls back to wall-clock subtraction; this saves the
+		// detour through time.Time.Sub.
+		duration := time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		a.server.collector.RecordRequestSharded(uint32(c.workerID), duration, status)
 	}
 	releaseContext(c)
 }
