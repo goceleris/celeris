@@ -96,6 +96,11 @@ type Worker struct {
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
 	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	// h1Only is true when engine config locks every conn to HTTP/1.1
+	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
+	// once at registerConn and never written, so the recv hot path can
+	// skip the atomic Load.
+	h1Only bool
 
 	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
 	// can Wait on them before returning. See engine/epoll/loop.go
@@ -197,6 +202,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		sqpoll:       tier.SQPollIdle() > 0,
 		sendZC:       tier.SupportsSendZC(),
 		async:        cfg.AsyncHandlers,
+		h1Only:       cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
 		resolved:     resolved,
@@ -1144,7 +1150,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// immediately. The goroutine runs ProcessH1 under cs.detachMu and
 	// enqueues on detachQueue so this worker submits SEND SQEs on its
 	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
-	if w.async && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 {
+	if w.async && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
 		cs.asyncInMu.Lock()
 		// Backpressure: drop the conn if the dispatch goroutine is
 		// falling behind. Prevents a pipelining client from ballooning
@@ -1189,7 +1195,18 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	var processErr error
-	switch engine.Protocol(cs.protocol.Load()) {
+	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): cs.protocol is
+	// set once at registerConn and never changes, so skip the atomic Load.
+	// The compiler folds the constant into the switch and prunes the H2C
+	// case + the ErrUpgradeH2C handling block at runtime (errors.Is on a
+	// nil-error path returns false in one comparison).
+	var proto engine.Protocol
+	if w.h1Only {
+		proto = engine.HTTP1
+	} else {
+		proto = engine.Protocol(cs.protocol.Load())
+	}
+	switch proto {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 		if errors.Is(processErr, conn.ErrUpgradeH2C) {
@@ -2085,7 +2102,10 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	// Async mode: the dispatch goroutine owns h1State; the worker cannot
 	// safely observe NextRecvBuf without synchronization. Always use
 	// cs.buf so the goroutine handles body accumulation on its side.
-	if w.async || w.bufRing != nil || engine.Protocol(cs.protocol.Load()) != engine.HTTP1 || cs.h1State == nil {
+	if w.async || w.bufRing != nil || cs.h1State == nil {
+		return cs.buf
+	}
+	if !w.h1Only && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
 		return cs.buf
 	}
 	if b := cs.h1State.NextRecvBuf(); b != nil {
