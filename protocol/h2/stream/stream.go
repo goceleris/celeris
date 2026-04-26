@@ -41,6 +41,12 @@ type Stream struct {
 	// can read affinity without a per-request ctx.Value() walk.
 	WorkerID    int32
 	WorkerIDSet bool
+	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
+	// recv that produced this request. populated by populateCachedStream
+	// from the engine's worker-local clock cache so HandleStream avoids a
+	// per-request time.Now() vDSO call. Zero means "unset, fall back to
+	// time.Now()" (synthetic / std-engine path).
+	StartTimeNs int64
 	manager                *Manager
 	Headers                [][2]string
 	Trailers               [][2]string

@@ -702,6 +702,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 		}
 
 		var processErr error
+		// Stash worker-local "now" on H1State so populateCachedStream can
+		// copy it to the stream — HandleStream skips a per-request
+		// time.Now() vDSO call.
+		if cs.h1State != nil {
+			cs.h1State.NowNs = now
+		}
 		switch cs.protocol {
 		case engine.HTTP1:
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)

@@ -110,6 +110,12 @@ type H1State struct {
 	// without a per-request ctx.Value() walk.
 	WorkerID    int32
 	WorkerIDSet bool
+
+	// NowNs is the engine's worker-local cached time.Now().UnixNano()
+	// for the most recent recv. The engine writes it just before calling
+	// ProcessH1; populateCachedStream copies it to the stream so the
+	// handler can record start time without a per-request time.Now() vDSO.
+	NowNs int64
 }
 
 // UpdateWriteFn replaces the response adapter's write function. Called by
@@ -708,6 +714,7 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	s.OnDetach = state.OnDetach
 	s.WorkerID = state.WorkerID
 	s.WorkerIDSet = state.WorkerIDSet
+	s.StartTimeNs = state.NowNs
 	// Reuse the stream's existing header slice capacity.
 	hdrs := s.Headers[:0]
 	needed := len(req.RawHeaders) + 4

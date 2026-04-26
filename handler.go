@@ -21,7 +21,15 @@ type routerAdapter struct {
 
 func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) error {
 	c := acquireContext(s)
-	c.startTime = time.Now()
+	// Prefer the engine's worker-local cached "now" (set on the stream
+	// by populateCachedStream from H1State.NowNs) over a per-request
+	// time.Now() vDSO. Falls back to time.Now() for synthetic / std-engine
+	// streams that didn't go through populateCachedStream.
+	if s.StartTimeNs != 0 {
+		c.startTime = time.Unix(0, s.StartTimeNs)
+	} else {
+		c.startTime = time.Now()
+	}
 	c.trustedNets = a.server.trustedNets
 
 	// Propagate engine-supplied worker affinity into the celeris.Context.

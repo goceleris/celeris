@@ -1211,6 +1211,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	} else {
 		proto = engine.Protocol(cs.protocol.Load())
 	}
+	// Stash the worker's cached "now" on H1State so populateCachedStream
+	// can copy it to the stream — HandleStream then skips a per-request
+	// time.Now() vDSO call.
+	if cs.h1State != nil {
+		cs.h1State.NowNs = now
+	}
 	switch proto {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
