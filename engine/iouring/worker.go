@@ -1392,12 +1392,15 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	// Regular SEND completion (non-ZC path).
-	cs.sending = false
+	// Regular SEND completion (non-ZC path). cs.sending is reset on
+	// every exit branch — by completeSend on success, inline on error
+	// paths — so the previously unconditional reset on entry is dropped
+	// (saves one write per request on the hot success path).
 
 	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
 	// Disable ZC for this worker and retry the send with regular SEND.
 	if c.Res == -22 && w.sendZC {
+		cs.sending = false
 		w.sendZC = false
 		w.logger.Warn("SEND_ZC not supported (EINVAL), falling back to regular SEND",
 			"worker", w.id)
@@ -1408,16 +1411,18 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	}
 
 	if c.Res < 0 {
+		cs.sending = false
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
-		if mu := cs.detachMu; mu != nil {
+		mu := cs.detachMu
+		if mu != nil {
 			mu.Lock()
 		}
 		cs.writeBuf = cs.writeBuf[:0]
 		if cs.h1State != nil && cs.h1State.OnError != nil {
 			cs.h1State.OnError(errIORingSend(c.Res))
 		}
-		if mu := cs.detachMu; mu != nil {
+		if mu != nil {
 			mu.Unlock()
 		}
 		if cs.closing {
