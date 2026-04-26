@@ -563,6 +563,18 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		c.capturedStatus = code
 		c.capturedType = contentType
 	}
+	// Skip the stripCRLF function call when the contentType is already
+	// clean (the dominant case — handlers pass string literals like
+	// "application/json"). Inline the ContainsAny check so the common
+	// path is one branch + zero allocations.
+	ct := contentType
+	for i := 0; i < len(contentType); i++ {
+		b := contentType[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			ct = stripCRLF(contentType)
+			break
+		}
+	}
 	nUser := len(c.respHeaders)
 	total := nUser + 2
 	var headers [][2]string
@@ -573,12 +585,12 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		var tmp [14][2]string
 		copy(tmp[:nUser], c.respHeaders)
 		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
-		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
+		headers = append(headers, [2]string{"content-type", ct})
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, tmp[:nUser]...)
 	} else {
 		headers = make([][2]string, 0, total)
-		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
+		headers = append(headers, [2]string{"content-type", ct})
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, c.respHeaders...)
 	}
