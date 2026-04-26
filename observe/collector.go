@@ -62,13 +62,34 @@ type CPUMonitor interface {
 	Close() error
 }
 
+// shardCount is the number of stripes for per-worker request/latency
+// counters. Power of two so RecordRequestSharded can mask the worker ID
+// instead of dividing. 64 is enough for current msr1 (12 cores) with
+// headroom and matches typical NUMA / socket counts on bigger boxes.
+const shardCount = 64
+const shardMask = shardCount - 1
+
+// shard is a cache-line-padded counter set incremented on a single
+// (worker → shard) goroutine. Padding prevents MESI ping-pong between
+// shards on adjacent cache lines under heavy concurrent updates.
+type shard struct {
+	requests atomic.Uint64
+	errors   atomic.Uint64
+	buckets  [bucketCount]atomic.Uint64
+	// Pad to >=128 bytes so two shards never share an L1 cache line on
+	// any current ARM64 / AMD64 CPU (line size 64 today, 128 on Apple
+	// Silicon performance cores).
+	_pad [64]byte
+}
+
 // Collector aggregates request metrics using lock-free counters.
-// A Collector is safe for concurrent use by multiple goroutines.
+// A Collector is safe for concurrent use by multiple goroutines. Hot
+// counters are striped across shardCount shards keyed by worker ID
+// (set on the Context by the engine) so concurrent RecordRequest calls
+// from different workers don't contend on a single cache line.
 type Collector struct {
-	requestsTotal   atomic.Uint64
-	errorsTotal     atomic.Uint64
+	shards          [shardCount]shard
 	engineSwitches  atomic.Uint64
-	latencyBuckets  [bucketCount]atomic.Uint64
 	mu              sync.Mutex
 	engineMetricsFn func() EngineMetrics
 	cpuMon          CPUMonitor
@@ -97,10 +118,22 @@ func (c *Collector) SetCPUMonitor(m CPUMonitor) {
 
 // RecordRequest increments the request counter and records the latency in the
 // appropriate histogram bucket. Status codes >= 500 also increment the error counter.
+//
+// Routes to shard 0 — callers who can supply a worker ID (engine handlers
+// via Context.WorkerID) should prefer RecordRequestSharded to avoid the
+// cross-worker cache-line contention on shard 0.
 func (c *Collector) RecordRequest(duration time.Duration, status int) {
-	c.requestsTotal.Add(1)
+	c.RecordRequestSharded(0, duration, status)
+}
+
+// RecordRequestSharded is the worker-aware variant: caller passes a worker
+// ID (or any goroutine-stable value) so the increment lands on a per-worker
+// shard. Eliminates the cross-core MESI ping-pong on a single counter.
+func (c *Collector) RecordRequestSharded(workerID uint32, duration time.Duration, status int) {
+	s := &c.shards[workerID&shardMask]
+	s.requests.Add(1)
 	if status >= 500 {
-		c.errorsTotal.Add(1)
+		s.errors.Add(1)
 	}
 	ns := duration.Nanoseconds()
 	lo, hi := 0, bucketCount-1
@@ -112,16 +145,16 @@ func (c *Collector) RecordRequest(duration time.Duration, status int) {
 			lo = mid + 1
 		}
 	}
-	c.latencyBuckets[lo].Add(1)
+	s.buckets[lo].Add(1)
 }
 
 // RecordError increments the error counter.
 //
 // Note: RecordRequest automatically counts responses with status >= 500 as errors.
 // Use RecordError only for errors that do not result in an HTTP response
-// (e.g., connection-level failures).
+// (e.g., connection-level failures). Lands on shard 0.
 func (c *Collector) RecordError() {
-	c.errorsTotal.Add(1)
+	c.shards[0].errors.Add(1)
 }
 
 // RecordSwitch increments the engine switch counter.
@@ -132,15 +165,21 @@ func (c *Collector) RecordSwitch() {
 // Snapshot returns a point-in-time copy of all collected metrics.
 func (c *Collector) Snapshot() Snapshot {
 	buckets := make([]uint64, bucketCount)
-	for i := range c.latencyBuckets {
-		buckets[i] = c.latencyBuckets[i].Load()
+	var requestsTotal, errorsTotal uint64
+	for i := range c.shards {
+		s := &c.shards[i]
+		requestsTotal += s.requests.Load()
+		errorsTotal += s.errors.Load()
+		for j := range s.buckets {
+			buckets[j] += s.buckets[j].Load()
+		}
 	}
 	bounds := make([]float64, len(defaultBucketBounds))
 	copy(bounds, defaultBucketBounds)
 
 	snap := Snapshot{
-		RequestsTotal:  c.requestsTotal.Load(),
-		ErrorsTotal:    c.errorsTotal.Load(),
+		RequestsTotal:  requestsTotal,
+		ErrorsTotal:    errorsTotal,
 		EngineSwitches: c.engineSwitches.Load(),
 		LatencyBuckets: buckets,
 		BucketBounds:   bounds,

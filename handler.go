@@ -132,7 +132,7 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 					}
 					elapsed = snap.elapsed
 				}
-				a.server.collector.RecordRequest(elapsed, status)
+				a.server.collector.RecordRequestSharded(uint32(c.workerID), elapsed, status)
 			}
 			releaseContext(c)
 		}()
@@ -143,7 +143,7 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 		if status == 0 {
 			status = 200
 		}
-		a.server.collector.RecordRequest(time.Since(c.startTime), status)
+		a.server.collector.RecordRequestSharded(uint32(c.workerID), time.Since(c.startTime), status)
 	}
 	releaseContext(c)
 }
