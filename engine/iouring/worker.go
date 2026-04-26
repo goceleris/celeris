@@ -1204,29 +1204,25 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	var processErr error
-	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): cs.protocol is
-	// set once at registerConn and never changes, so skip the atomic Load.
-	// The compiler folds the constant into the switch and prunes the H2C
-	// case + the ErrUpgradeH2C handling block at runtime (errors.Is on a
-	// nil-error path returns false in one comparison).
-	var proto engine.Protocol
-	if w.h1Only {
-		proto = engine.HTTP1
-	} else {
-		proto = engine.Protocol(cs.protocol.Load())
-	}
 	// Stash the worker's cached "now" on H1State so populateCachedStream
-	// can copy it to the stream — HandleStream then skips a per-request
+	// can copy it to the stream — HandleStream skips a per-request
 	// time.Now() vDSO call.
 	if cs.h1State != nil {
 		cs.h1State.NowNs = now
 	}
-	switch proto {
+	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic
+	// Load, no switch dispatch, no upgrade-handling block — ProcessH1
+	// cannot return ErrUpgradeH2C because tryUpgradeH2C is gated off
+	// in the parser. The compiler can specialize the call site without
+	// hitting any of the H2 / upgrade machinery in the binary's hot
+	// section.
+	if w.h1Only {
+		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+	} else {
+		switch engine.Protocol(cs.protocol.Load()) {
 	case engine.HTTP1:
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
-		// In h1Only mode tryUpgradeH2C is gated off in the parser, so
-		// ProcessH1 cannot return ErrUpgradeH2C — skip the errors.Is call.
-		if !w.h1Only && errors.Is(processErr, conn.ErrUpgradeH2C) {
+		if errors.Is(processErr, conn.ErrUpgradeH2C) {
 			// H1→H2 upgrade. switchToH2 consumes the upgrade info and
 			// re-arms recv so subsequent data is parsed as H2.
 			if hasProvidedBuf {
@@ -1286,6 +1282,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			cs.detachMu.Unlock()
 		} else {
 			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+		}
 		}
 	}
 
