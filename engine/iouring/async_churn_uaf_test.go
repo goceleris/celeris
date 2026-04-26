@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -91,10 +92,19 @@ func TestAsyncChurnNoUseAfterFree(t *testing.T) {
 	// take well over the 5 s our msr1 dev box uses. Bump the deadline so
 	// the test waits until the engine is actually up — the churn-load it
 	// runs after this is the part the test cares about, not the bind.
+	// Skip on resource-constrained runners that can't allocate the io_uring
+	// rings: the test exercises a regression that requires a live engine,
+	// and there's no point reporting it as a celeris failure when the
+	// kernel said "cannot allocate memory" before our code even ran.
 	dl := time.Now().Add(30 * time.Second)
 	for time.Now().Before(dl) && e.Addr() == nil {
 		select {
 		case err := <-errCh:
+			if err != nil && (strings.Contains(err.Error(), "cannot allocate memory") ||
+				strings.Contains(err.Error(), "io_uring_setup") ||
+				strings.Contains(err.Error(), "tier")) {
+				t.Skipf("io_uring unavailable on this runner: %v", err)
+			}
 			t.Fatalf("engine.Listen returned early: %v", err)
 		default:
 		}
