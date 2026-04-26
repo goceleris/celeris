@@ -49,6 +49,17 @@ type Stream struct {
 	// request via MaterializeHeaders. Cleared on stream reset.
 	LazyRawHeaders [][2][]byte
 	lazyHeadersBuilt bool
+	// CachedRoute holds a (method, path) → (handlers, fullPath) cache
+	// scoped to the connection. The router adapter populates it on the
+	// first request and reuses it on subsequent requests on the same
+	// keep-alive connection that match the same method+path AND produced
+	// no path params (i.e. a fully-static route). Skips a static-route
+	// map lookup on every request after the first. Per-conn lifetime;
+	// reset on stream pool Release.
+	CachedRouteMethod    string
+	CachedRoutePath      string
+	CachedRouteHandlers  any // []celeris.HandlerFunc — typed any to avoid cycle
+	CachedRouteFullPath  string
 	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
@@ -269,6 +280,12 @@ func (s *Stream) resetAndPool() {
 	s.OnWSSetError = nil
 	s.OnWSReadPauser = nil
 	s.OnWSSetIdleDeadline = nil
+	s.LazyRawHeaders = nil
+	s.lazyHeadersBuilt = false
+	s.CachedRouteMethod = ""
+	s.CachedRoutePath = ""
+	s.CachedRouteHandlers = nil
+	s.CachedRouteFullPath = ""
 	if s.ReceivedWindowUpd != nil {
 		for len(s.ReceivedWindowUpd) > 0 {
 			<-s.ReceivedWindowUpd

@@ -94,7 +94,31 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 		c.index = -1
 	}
 
-	handlers, fullPath := a.server.router.find(c.method, c.path, &c.params)
+	// Per-connection route cache: keep-alive connections that hit the
+	// same static method+path on every request can skip the static-route
+	// map lookup. Only valid when the lookup produced no params (a fully
+	// static route — dynamic routes need fresh params each time).
+	//
+	// strings.Clone on cache fill: c.method and c.path may alias the H1
+	// recv buffer, which is reused on the next request. Cloning gives
+	// the cache a stable backing array so the byte-wise compare on the
+	// next request reads the right bytes. Allocates once per conn (per
+	// route fill); amortized across the entire keep-alive session.
+	var handlers []HandlerFunc
+	var fullPath string
+	if cached, ok := s.CachedRouteHandlers.([]HandlerFunc); ok &&
+		s.CachedRouteMethod == c.method && s.CachedRoutePath == c.path {
+		handlers = cached
+		fullPath = s.CachedRouteFullPath
+	} else {
+		handlers, fullPath = a.server.router.find(c.method, c.path, &c.params)
+		if handlers != nil && len(c.params) == 0 {
+			s.CachedRouteMethod = strings.Clone(c.method)
+			s.CachedRoutePath = strings.Clone(c.path)
+			s.CachedRouteHandlers = handlers
+			s.CachedRouteFullPath = fullPath
+		}
+	}
 
 	if handlers == nil {
 		a.handleUnmatched(c, s)
