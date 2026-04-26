@@ -79,7 +79,7 @@ type shard struct {
 	// Pad to >=128 bytes so two shards never share an L1 cache line on
 	// any current ARM64 / AMD64 CPU (line size 64 today, 128 on Apple
 	// Silicon performance cores).
-	_pad [64]byte
+	_ [64]byte // cache-line padding; never read, kept for layout
 }
 
 // Collector aggregates request metrics using lock-free counters.

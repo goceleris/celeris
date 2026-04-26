@@ -32,8 +32,8 @@ const (
 
 // Stream represents an HTTP/2 stream with its associated state and data.
 type Stream struct {
-	ID                     uint32
-	state                  atomic.Int32
+	ID    uint32
+	state atomic.Int32
 	// WorkerID is the engine worker ID (0..NumWorkers-1) that owns this
 	// stream's connection, or -1 when there is no meaningful worker identity
 	// (e.g. the std engine where Go's runtime scheduler picks the goroutine).
@@ -47,8 +47,16 @@ type Stream struct {
 	// header lowercase + slice append until a handler actually reads them
 	// via Context.Header / Context.RequestHeaders. Materialized once per
 	// request via MaterializeHeaders. Cleared on stream reset.
-	LazyRawHeaders [][2][]byte
-	lazyHeadersBuilt bool
+	LazyRawHeaders     [][2][]byte
+	lazyHeadersBuilt   bool
+	pseudoMaterialized bool
+	// H1 dispatch sets these directly so extractRequestInfo / Host()
+	// don't need to walk Headers[0..3]. Empty for H2 streams (where
+	// pseudo-headers come from HPACK and live in s.Headers as before).
+	Method    string
+	Path      string
+	Scheme    string
+	Authority string
 	// CachedRoute holds a (method, path) → (handlers, fullPath) cache
 	// scoped to the connection. The router adapter populates it on the
 	// first request and reuses it on subsequent requests on the same
@@ -56,16 +64,16 @@ type Stream struct {
 	// no path params (i.e. a fully-static route). Skips a static-route
 	// map lookup on every request after the first. Per-conn lifetime;
 	// reset on stream pool Release.
-	CachedRouteMethod    string
-	CachedRoutePath      string
-	CachedRouteHandlers  any // []celeris.HandlerFunc — typed any to avoid cycle
-	CachedRouteFullPath  string
+	CachedRouteMethod   string
+	CachedRoutePath     string
+	CachedRouteHandlers any // []celeris.HandlerFunc — typed any to avoid cycle
+	CachedRouteFullPath string
 	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
 	// per-request time.Now() vDSO call. Zero means "unset, fall back to
 	// time.Now()" (synthetic / std-engine path).
-	StartTimeNs int64
+	StartTimeNs            int64
 	manager                *Manager
 	Headers                [][2]string
 	Trailers               [][2]string
@@ -282,6 +290,11 @@ func (s *Stream) resetAndPool() {
 	s.OnWSSetIdleDeadline = nil
 	s.LazyRawHeaders = nil
 	s.lazyHeadersBuilt = false
+	s.pseudoMaterialized = false
+	s.Method = ""
+	s.Path = ""
+	s.Scheme = ""
+	s.Authority = ""
 	s.CachedRouteMethod = ""
 	s.CachedRoutePath = ""
 	s.CachedRouteHandlers = nil
@@ -309,6 +322,11 @@ func ResetH1Stream(s *Stream) {
 	s.Headers = s.hdrBuf[:0]
 	s.LazyRawHeaders = nil
 	s.lazyHeadersBuilt = false
+	s.pseudoMaterialized = false
+	s.Method = ""
+	s.Path = ""
+	s.Scheme = ""
+	s.Authority = ""
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.ResponseWriter = nil
@@ -317,20 +335,34 @@ func ResetH1Stream(s *Stream) {
 }
 
 // MaterializeHeaders ensures that every header carried by this H1 stream
-// has been appended to s.Headers. The H1 dispatch primes Headers with the
-// 4 pseudo-headers eagerly (extractRequestInfo always reads them) and
-// defers the raw-header loop here so handlers that never call
-// Context.Header / Context.RequestHeaders skip the per-request work
-// entirely. Idempotent.
+// has been appended to s.Headers. The H1 dispatch keeps the 4 pseudo-
+// headers (:method/:path/:scheme/:authority) on direct Stream fields
+// (Method/Path/Scheme/Authority) and defers BOTH the pseudo-header
+// pretty-print and the raw-header lowercase+append until a handler
+// actually reads them via Context.Header / Context.RequestHeaders.
+// Idempotent.
 func (s *Stream) MaterializeHeaders() {
-	if s.lazyHeadersBuilt || len(s.LazyRawHeaders) == 0 {
+	if s.lazyHeadersBuilt {
 		return
 	}
 	s.lazyHeadersBuilt = true
-	if cap(s.Headers) < len(s.Headers)+len(s.LazyRawHeaders) {
-		grown := make([][2]string, len(s.Headers), len(s.Headers)+len(s.LazyRawHeaders))
+	needed := len(s.LazyRawHeaders)
+	if !s.pseudoMaterialized && s.Method != "" {
+		needed += 4
+	}
+	if cap(s.Headers) < len(s.Headers)+needed {
+		grown := make([][2]string, len(s.Headers), len(s.Headers)+needed)
 		copy(grown, s.Headers)
 		s.Headers = grown
+	}
+	if !s.pseudoMaterialized && s.Method != "" {
+		s.Headers = append(s.Headers,
+			[2]string{":method", s.Method},
+			[2]string{":path", s.Path},
+			[2]string{":scheme", s.Scheme},
+			[2]string{":authority", s.Authority},
+		)
+		s.pseudoMaterialized = true
 	}
 	for _, rh := range s.LazyRawHeaders {
 		s.Headers = append(s.Headers, [2]string{

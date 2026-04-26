@@ -660,6 +660,11 @@ func (c *Context) Host() string {
 	if c.hostOverride != "" {
 		return c.hostOverride
 	}
+	// H1 dispatch primes Stream.Authority directly; skip the
+	// MaterializeHeaders + linear scan for the common case.
+	if c.stream.Authority != "" {
+		return c.stream.Authority
+	}
 	if h := c.Header(":authority"); h != "" {
 		return h
 	}

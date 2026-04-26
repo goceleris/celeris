@@ -1220,69 +1220,69 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
 	} else {
 		switch engine.Protocol(cs.protocol.Load()) {
-	case engine.HTTP1:
-		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
-		if errors.Is(processErr, conn.ErrUpgradeH2C) {
-			// H1→H2 upgrade. switchToH2 consumes the upgrade info and
-			// re-arms recv so subsequent data is parsed as H2.
-			if hasProvidedBuf {
-				w.bufRing.PushBuffer(providedBufID)
-				w.hasBufReturns = true
-			}
-			if err := w.switchToH2(cs); err != nil {
-				w.closeConn(fd)
+		case engine.HTTP1:
+			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+			if errors.Is(processErr, conn.ErrUpgradeH2C) {
+				// H1→H2 upgrade. switchToH2 consumes the upgrade info and
+				// re-arms recv so subsequent data is parsed as H2.
+				if hasProvidedBuf {
+					w.bufRing.PushBuffer(providedBufID)
+					w.hasBufReturns = true
+				}
+				if err := w.switchToH2(cs); err != nil {
+					w.closeConn(fd)
+					return
+				}
+				// Flush the buffered 101 Switching Protocols + H2 server preface
+				// + stream 1 response bytes. Without this explicit flush the
+				// client blocks forever waiting for the 101 (the normal post-
+				// process flush path below is bypassed by this early return).
+				if mu := cs.detachMu; mu != nil {
+					mu.Lock()
+				}
+				cs.recvLinked = false
+				if w.bufRing == nil {
+					if w.flushSendLink(cs) {
+						w.markDirty(cs)
+					}
+				} else {
+					if w.flushSend(cs) {
+						w.markDirty(cs)
+					}
+				}
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				// Re-arm recv to keep reading H2 frames. flushSendLink may have
+				// already chained a recv via IOSQE_IO_LINK — skip our standalone
+				// re-arm in that case to avoid submitting two recv SQEs on the
+				// same fd, which would split incoming H2 frames across CQEs and
+				// occasionally lose END_STREAM delivery for later streams
+				// (observed as flaky TestH2CUpgradeSubsequentStreams/iouring).
+				if !cqeHasMore(c.Flags) && !cs.recvLinked {
+					if !w.prepareRecv(fd, cs.buf) {
+						cs.needsRecv = true
+						w.markDirty(cs)
+					}
+				}
 				return
 			}
-			// Flush the buffered 101 Switching Protocols + H2 server preface
-			// + stream 1 response bytes. Without this explicit flush the
-			// client blocks forever waiting for the 101 (the normal post-
-			// process flush path below is bypassed by this early return).
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			cs.recvLinked = false
-			if w.bufRing == nil {
-				if w.flushSendLink(cs) {
-					w.markDirty(cs)
-				}
+		case engine.H2C:
+			// Async-mode conns: serialize inline ProcessH2 against the
+			// runAsyncHandler goroutine that owns cs.writeBuf until its
+			// H1→H2 upgrade-flush completes. Without the lock, a new
+			// recv arriving while the goroutine is mid-flush runs
+			// ProcessH2 → writeFn → cs.writeBuf manipulation concurrent
+			// with the goroutine's `cs.writeBuf = cs.writeBuf[:0]`
+			// clear — a data race matrixBenchStrict caught on the third
+			// run (see issue #256 investigation thread).
+			if cs.detachMu != nil {
+				cs.detachMu.Lock()
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+				cs.detachMu.Unlock()
 			} else {
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			// Re-arm recv to keep reading H2 frames. flushSendLink may have
-			// already chained a recv via IOSQE_IO_LINK — skip our standalone
-			// re-arm in that case to avoid submitting two recv SQEs on the
-			// same fd, which would split incoming H2 frames across CQEs and
-			// occasionally lose END_STREAM delivery for later streams
-			// (observed as flaky TestH2CUpgradeSubsequentStreams/iouring).
-			if !cqeHasMore(c.Flags) && !cs.recvLinked {
-				if !w.prepareRecv(fd, cs.buf) {
-					cs.needsRecv = true
-					w.markDirty(cs)
-				}
-			}
-			return
-		}
-	case engine.H2C:
-		// Async-mode conns: serialize inline ProcessH2 against the
-		// runAsyncHandler goroutine that owns cs.writeBuf until its
-		// H1→H2 upgrade-flush completes. Without the lock, a new
-		// recv arriving while the goroutine is mid-flush runs
-		// ProcessH2 → writeFn → cs.writeBuf manipulation concurrent
-		// with the goroutine's `cs.writeBuf = cs.writeBuf[:0]`
-		// clear — a data race matrixBenchStrict caught on the third
-		// run (see issue #256 investigation thread).
-		if cs.detachMu != nil {
-			cs.detachMu.Lock()
-			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
-			cs.detachMu.Unlock()
-		} else {
-			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
-		}
 		}
 	}
 

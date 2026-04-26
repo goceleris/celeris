@@ -24,6 +24,19 @@ var cachedDatePtr atomic.Pointer[[]byte]
 // responses (95%+ of API traffic), this replaces two separate appends with one.
 var cachedStatus200DatePtr atomic.Pointer[[]byte]
 
+// cachedStatus200DateCT* hold the further-fused
+// "HTTP/1.1 200 OK\r\ndate: ...\r\ncontent-type: <ct>\r\n" block for the
+// most common content types served by API benchmarks. Lets WriteResponse's
+// fast path collapse three appends (status+date, content-type, then
+// content-length+body) into two — the cached fused block + content-length.
+var (
+	cachedStatus200DateCTJSONPtr  atomic.Pointer[[]byte]
+	cachedStatus200DateCTPlainPtr atomic.Pointer[[]byte]
+	cachedStatus200DateCTHTMLPtr  atomic.Pointer[[]byte]
+	cachedStatus200DateCTXMLPtr   atomic.Pointer[[]byte]
+	cachedStatus200DateCTOctetPtr atomic.Pointer[[]byte]
+)
+
 func init() {
 	updateCachedDate()
 	go func() {
@@ -53,6 +66,23 @@ func updateCachedDate() {
 	cp2 := make([]byte, len(b2))
 	copy(cp2, b2)
 	cachedStatus200DatePtr.Store(&cp2)
+
+	// Further-fused 200+date+content-type blocks for the common 5
+	// content types. One allocation each, swapped atomically every second.
+	storeFusedCT := func(target *atomic.Pointer[[]byte], ctLine []byte) {
+		var bb [192]byte
+		b := bb[:0]
+		b = append(b, cp2...)
+		b = append(b, ctLine...)
+		out := make([]byte, len(b))
+		copy(out, b)
+		target.Store(&out)
+	}
+	storeFusedCT(&cachedStatus200DateCTJSONPtr, ctJSON)
+	storeFusedCT(&cachedStatus200DateCTPlainPtr, ctPlain)
+	storeFusedCT(&cachedStatus200DateCTHTMLPtr, ctHTML)
+	storeFusedCT(&cachedStatus200DateCTXMLPtr, ctXML)
+	storeFusedCT(&cachedStatus200DateCTOctetPtr, ctOctet)
 }
 
 func appendCachedDate(buf []byte) []byte {
@@ -152,6 +182,52 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// across requests on the same keep-alive connection.
 	buf := a.respBuf[:0]
 
+	// Ultra-fast path: 200 + 2 standard headers (content-type, content-length)
+	// where the content-type is one of the cached common types — collapse
+	// status line + date + content-type into a single fused append. Falls
+	// through to the per-step path on cache miss or non-200 / unusual
+	// shapes.
+	if status == 200 && len(headers) == 2 && headers[1][0] == "content-length" {
+		var fused *[]byte
+		switch headers[0][1] {
+		case "application/json":
+			fused = cachedStatus200DateCTJSONPtr.Load()
+		case "text/plain":
+			fused = cachedStatus200DateCTPlainPtr.Load()
+		case "text/html; charset=utf-8":
+			fused = cachedStatus200DateCTHTMLPtr.Load()
+		case "application/xml":
+			fused = cachedStatus200DateCTXMLPtr.Load()
+		case "application/octet-stream":
+			fused = cachedStatus200DateCTOctetPtr.Load()
+		}
+		if fused != nil {
+			buf = append(buf, (*fused)...)
+			buf = append(buf, clPrefix...)
+			buf = append(buf, headers[1][1]...)
+			buf = append(buf, crlf...)
+			if !a.keepAlive {
+				buf = append(buf, "connection: close\r\n"...)
+			}
+			buf = append(buf, crlf...)
+			if len(body) > 0 && !a.isHEAD {
+				if len(body) >= 8192 && a.writeBody != nil {
+					a.write(buf)
+					a.respBuf = buf
+					a.writeBody(body)
+					return nil
+				}
+				a.write(buf)
+				a.respBuf = buf
+				a.write(body)
+				return nil
+			}
+			a.write(buf)
+			a.respBuf = buf
+			return nil
+		}
+	}
+
 	// Fast path: status 200 uses fused status+date block (one append).
 	if status == 200 {
 		buf = appendCachedStatus200Date(buf)
@@ -235,24 +311,25 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body.
 	// Content-Length is still included above to indicate the size that
 	// would be returned for a GET, but no bytes are sent.
-	//
-	// Zero-copy large-body fast path: for bodies ≥ 8 KiB when the engine
-	// supplies a scatter-gather body writer, ship headers and body as
-	// two separate engine-level buffers. The engine emits a single
-	// IORING_OP_WRITEV / writev(2) call with iovec = [headers, body],
-	// which avoids the body-sized memcpy into the accumulator buffer.
-	// Saves ~6–8 GB/s memory bandwidth at 100 k rps on 64 KB responses.
-	// Falls back to the append path when the engine can't express
-	// scatter-gather (std engine, tests with mock writers, or when the
-	// caller passed an expired/closed writer).
 	if len(body) > 0 && !a.isHEAD {
+		// Zero-copy scatter-gather for large bodies: writev/IORING_OP_WRITEV
+		// ships headers + body in one syscall without copying body bytes.
 		if len(body) >= 8192 && a.writeBody != nil {
 			a.write(buf)
 			a.respBuf = buf
 			a.writeBody(body)
 			return nil
 		}
-		buf = append(buf, body...)
+		// Two-write path for small bodies. Cuts one memcpy of body bytes:
+		// previously body was append'd into respBuf then the entire respBuf
+		// was append'd into the engine's writeBuf — copying body twice.
+		// The engine's writeFn just appends to cs.writeBuf, so two calls
+		// land headers and body back-to-back in cs.writeBuf with no
+		// intermediate copy.
+		a.write(buf)
+		a.respBuf = buf
+		a.write(body)
+		return nil
 	}
 
 	a.write(buf)

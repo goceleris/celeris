@@ -86,12 +86,12 @@ func SetTestScheme(c *Context, scheme string) {
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
 // A Context is obtained from the pool and must not be retained after the handler returns.
 type Context struct {
-	stream     *stream.Stream
-	index      int16
-	handlers   []HandlerFunc
-	handlerBuf [8]HandlerFunc
-	params     Params
-	paramBuf   [4]Param
+	stream      *stream.Stream
+	index       int16
+	handlers    []HandlerFunc
+	handlerBuf  [8]HandlerFunc
+	params      Params
+	paramBuf    [4]Param
 	keys        map[string]any
 	ctx         context.Context
 	startTime   time.Time
@@ -233,13 +233,26 @@ func releaseContext(c *Context) {
 }
 
 func (c *Context) extractRequestInfo() {
+	// H1 dispatch primes Stream.Method / Stream.Path directly so we skip
+	// the s.Headers walk entirely. For H2 streams the pseudo-headers
+	// still arrive via HPACK in s.Headers — fall back to the headers
+	// walk in that case.
+	if c.stream.Method != "" {
+		c.method = c.stream.Method
+		p := c.stream.Path
+		if i := strings.IndexByte(p, '?'); i >= 0 {
+			c.path = p[:i]
+			c.rawQuery = p[i+1:]
+		} else {
+			c.path = p
+		}
+		return
+	}
+
 	headers := c.stream.Headers
 
-	// Direct index access: H1 (populateCachedStream) always places
-	// :method at [0] and :path at [1]. H2 (HPACK) usually follows the
-	// same convention. Check the first 2 bytes of each name to verify
-	// (":m" for :method, ":p" for :path) — this is faster than full
-	// string comparison and covers all production pseudo-header names.
+	// Direct index access: H2 HPACK usually places :method first and
+	// :path second.
 	if len(headers) >= 2 &&
 		len(headers[0][0]) > 1 && headers[0][0][1] == 'm' &&
 		len(headers[1][0]) > 1 && headers[1][0][1] == 'p' {

@@ -728,23 +728,19 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	s.WorkerID = state.WorkerID
 	s.WorkerIDSet = state.WorkerIDSet
 	s.StartTimeNs = state.NowNs
-	// Eagerly populate the 4 pseudo-headers (extractRequestInfo always
-	// reads them); defer the raw-header lowercase + append loop to
-	// Stream.MaterializeHeaders, called by the Context only when a handler
-	// actually reads request headers (Header / RequestHeaders / Cookies /
-	// the request-id middleware etc.). Saves ~5ns per raw header per
-	// request on bench-style workloads where handlers don't read headers.
-	hdrs := s.Headers[:0]
-	if cap(hdrs) < 4 {
-		hdrs = make([][2]string, 0, 4+len(req.RawHeaders))
-	}
-	hdrs = append(hdrs,
-		[2]string{":method", req.Method},
-		[2]string{":path", req.Path},
-		[2]string{":scheme", "http"},
-		[2]string{":authority", req.Host},
-	)
-	s.Headers = hdrs
+	// Pseudo-headers (:method/:path/:scheme/:authority) live on dedicated
+	// Stream fields so Context.extractRequestInfo / Context.Host read them
+	// without walking s.Headers. The slice append + 4 pseudo-header
+	// allocations are deferred to Stream.MaterializeHeaders, which the
+	// Context only triggers when a handler actually reads request headers
+	// via Header / RequestHeaders / ForEachHeader. The same goes for the
+	// raw-header lowercase loop (LazyRawHeaders). Bench-style handlers
+	// that read only c.method / c.path skip both passes entirely.
+	s.Headers = s.Headers[:0]
+	s.Method = req.Method
+	s.Path = req.Path
+	s.Scheme = "http"
+	s.Authority = req.Host
 	s.LazyRawHeaders = req.RawHeaders
 	s.IsHEAD = req.Method == "HEAD"
 
