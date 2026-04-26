@@ -1321,14 +1321,18 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
 	// after SEND completes, eliminating one loop iteration per request.
 	cs.recvLinked = false
-	if mu := cs.detachMu; mu != nil {
+	// Hoist the detachMu load: the same mu is checked Lock and Unlock on
+	// the success path, plus once on the early-return overflow path. One
+	// pointer load instead of three.
+	mu := cs.detachMu
+	if mu != nil {
 		mu.Lock()
 	}
 	// Back-pressure: capture pending size inside the lock so concurrent
 	// goroutine writes via the guarded writeFn don't race the read.
 	pending := len(cs.writeBuf) + len(cs.sendBuf)
 	if pending > cs.sendCap() {
-		if mu := cs.detachMu; mu != nil {
+		if mu != nil {
 			mu.Unlock()
 		}
 		w.closeConn(fd)
@@ -1343,7 +1347,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.markDirty(cs)
 		}
 	}
-	if mu := cs.detachMu; mu != nil {
+	if mu != nil {
 		mu.Unlock()
 	}
 
