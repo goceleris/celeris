@@ -19,10 +19,13 @@ import (
 	"github.com/goceleris/celeris/middleware/timeout"
 )
 
-// discardSlog is a slog.Logger whose handler drops every record. The
-// logger middleware still performs the formatting work, so the bench
-// observes realistic overhead without writing to stderr/disk.
-var discardSlog = slog.New(slog.NewTextHandler(io.Discard, nil))
+// discardSlog is a slog.Logger whose handler drops every record. Uses
+// celeris's zero-allocation [logger.FastHandler] (the documented
+// high-perf option) so the bench reflects what a perf-aware celeris
+// user would deploy in production. The handler still formats the
+// record into a pooled buffer, then drops it at the io.Writer — no
+// disk/stderr IO.
+var discardSlog = slog.New(logger.NewFastHandler(io.Discard, nil))
 
 func newDiscardSlog() *slog.Logger { return discardSlog }
 
