@@ -29,6 +29,24 @@ func BenchmarkBasicAuthAllow(b *testing.B) {
 	}
 }
 
+func BenchmarkBasicAuthStaticUsers(b *testing.B) {
+	mw := New(Config{
+		Users: map[string]string{"admin": "secret"},
+	})
+	noop := func(_ *celeris.Context) error { return nil }
+	opts := []celeristest.Option{
+		celeristest.WithBasicAuth("admin", "secret"),
+		celeristest.WithHandlers(mw, noop),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
 func BenchmarkBasicAuthDeny(b *testing.B) {
 	mw := New(Config{
 		Validator: func(_, _ string) bool { return false },
