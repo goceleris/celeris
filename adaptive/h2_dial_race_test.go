@@ -86,9 +86,14 @@ func runOnce(t *testing.T, iter int) {
 	go func() { errCh <- e.Listen(ctx) }()
 	defer func() {
 		cancel()
+		// 30s upper bound — slow CI runners can take several seconds to
+		// drain io_uring CQEs / close SO_REUSEPORT FDs, and the next
+		// iteration's engine fails to bind if the previous one hasn't
+		// fully shut down. 2s was tight enough to cause a flake at
+		// iter 1 on Azure kernel 6.17 runners.
 		select {
 		case <-errCh:
-		case <-time.After(2 * time.Second):
+		case <-time.After(30 * time.Second):
 		}
 	}()
 
