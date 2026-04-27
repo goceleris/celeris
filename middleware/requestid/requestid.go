@@ -90,18 +90,26 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 		}
 		if id == "" {
-			for range maxGeneratorRetries {
+			if isCustomGen {
+				// Custom generators may misbehave; validate output and
+				// retry. After maxGeneratorRetries the fallback UUID
+				// guarantees the request still gets an ID.
+				for range maxGeneratorRetries {
+					id = gen()
+					if validID(id) {
+						break
+					}
+					id = ""
+				}
+				if id == "" {
+					id = fallbackGen()
+				}
+			} else {
+				// Built-in UUID generator: output is always a 36-byte
+				// hex+hyphen string in [0x20, 0x7E]. validID is a no-op
+				// here and retries can never succeed differently — skip
+				// both on the common path.
 				id = gen()
-				if validID(id) {
-					break
-				}
-				id = ""
-				if !isCustomGen {
-					break
-				}
-			}
-			if id == "" {
-				id = fallbackGen()
 			}
 		}
 
