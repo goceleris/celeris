@@ -92,7 +92,9 @@ func runOnce(t *testing.T, iter int) {
 		}
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	// 30s deadline (5s was tight on slow GitHub Actions runners; mirrors
+	// the bind-deadline bump on the iouring async-churn test in 1655eb0).
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) && e.Addr() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}
