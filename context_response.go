@@ -654,6 +654,26 @@ func (c *Context) SetHeader(key, value string) {
 	c.respHeaders = append(c.respHeaders, [2]string{k, v})
 }
 
+// AppendRespHeader appends a response header without sanitization or
+// dedup walk. The caller MUST guarantee:
+//
+//   - key is lowercase ASCII (no characters in [A-Z]) and contains no
+//     CR, LF, or NUL bytes
+//   - value contains no CR, LF, or NUL bytes
+//   - no header with the same key already exists on the response
+//
+// Intended for middleware that pre-validates static header pairs at
+// initialization (e.g. the secure-headers middleware emitting fixed
+// X-Frame-Options / X-Content-Type-Options / etc.) so the per-request
+// hot path skips the byte-by-byte sanitization scan and the linear
+// dedup walk that [Context.SetHeader] performs.
+//
+// Use [Context.SetHeader] when any of these invariants might not hold
+// — it is the safe default.
+func (c *Context) AppendRespHeader(key, value string) {
+	c.respHeaders = append(c.respHeaders, [2]string{key, value})
+}
+
 // AddHeader appends a response header value. Unlike SetHeader, it does not
 // replace existing values — use this for headers that allow multiple values
 // (e.g. set-cookie).
