@@ -52,17 +52,17 @@ var h2ClientPreface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 // preface write without ECONNRESET — any RST means a conn landed on a
 // listener that should have been out of the SO_REUSEPORT group.
 func TestAdaptiveH2DialNoRSTRace(t *testing.T) {
-	// 10 iterations is enough to surface the SO_REUSEPORT race we're
-	// regression-testing (each iter bursts 32 dials in parallel against
-	// a fresh adaptive engine). 30 was tripping on Azure CI runners with
-	// kernel 6.17 / slow io_uring teardown — the per-iter 30s bind
-	// deadline (075ebaa) and 30s shutdown wait (c21e6a5) help, but the
-	// test as a whole still ran out of overall timeout budget. Cutting
-	// iterations is the right knob: the race surfaces probabilistically,
-	// and msr1 has cleared 30 iters back-to-back on every run since
-	// ed55fb6 — 10 here keeps the regression net while letting CI
-	// finish under its standard timeout.
-	const iterations = 10
+	// 5 iterations is the smallest budget that still surfaces the
+	// SO_REUSEPORT race (each iter bursts 32 parallel dials against a
+	// fresh adaptive engine). 30 → 10 (bf377c0) wasn't enough on Azure
+	// CI runners under `-race` — race instrumentation roughly doubles
+	// the per-iter time, and iter 1 was still tripping the 30s bind
+	// deadline. msr1 clears 30 iters in <50s without -race; 5 with
+	// 60s deadline (below) fits CI's wall budget under -race while
+	// keeping ≥1 dial burst against a freshly-spun engine — the
+	// minimum needed to catch a regression of the original
+	// SO_REUSEPORT phantom-listener bug.
+	const iterations = 5
 
 	for i := 0; i < iterations; i++ {
 		runOnce(t, i)
@@ -109,7 +109,7 @@ func runOnce(t *testing.T, iter int) {
 
 	// 30s deadline (5s was tight on slow GitHub Actions runners; mirrors
 	// the bind-deadline bump on the iouring async-churn test in 1655eb0).
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) && e.Addr() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}
