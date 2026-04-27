@@ -253,6 +253,17 @@ func runMatrix(fl matrixFlags) error {
 	}
 
 	args := []string{"run"}
+	// Profile-guided compilation. test/perfmatrix/cmd/runner/default.pgo
+	// is captured from a representative get-simple/iouring run; -pgo=auto
+	// folds it into the build so the benchmarked binary inlines and
+	// tunes branches around the actual hot path. -race is incompatible
+	// with PGO (the race instrumentation perturbs profiles), so only
+	// non-strict matrix runs benefit.
+	if !fl.strict {
+		if _, err := os.Stat(filepath.Join("test", "perfmatrix", "cmd", "runner", "default.pgo")); err == nil {
+			args = append(args, "-pgo=auto")
+		}
+	}
 	if fl.strict {
 		// -race links the race detector into the runner AND every
 		// in-process server it spawns (celeris engines, competitors),
