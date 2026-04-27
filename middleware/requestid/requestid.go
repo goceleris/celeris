@@ -2,6 +2,7 @@ package requestid
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/goceleris/celeris"
@@ -68,6 +69,16 @@ func New(config ...Config) celeris.HandlerFunc {
 	// without allocating per request, even if a caller overrides the
 	// default with a mixed-case value like "X-Request-Id".
 	header := strings.ToLower(cfg.Header)
+
+	// Validate the header name once at construction time so the per-
+	// request hot path can call [celeris.Context.SetHeaderTrust] (no
+	// sanitization scan). Lowercase ASCII without CR/LF/NUL is the
+	// SetHeaderTrust contract.
+	for i := 0; i < len(header); i++ {
+		if b := header[i]; b == '\r' || b == '\n' || b == 0 {
+			panic(fmt.Sprintf("requestid: Header config %q contains CR/LF/NUL at byte %d (header injection); fix the config", cfg.Header, i))
+		}
+	}
 	gen := cfg.Generator
 	trustProxy := !cfg.DisableTrustProxy
 	enableStdCtx := cfg.EnableStdContext
@@ -113,7 +124,11 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 		}
 
-		c.SetHeader(header, id)
+		// SetHeaderTrust is safe here: header was validated lowercase /
+		// no CR-LF-NUL at construction time, and id is either a
+		// validID-checked incoming header value or a built-in UUID
+		// (both already restricted to printable ASCII).
+		c.SetHeaderTrust(header, id)
 		// SetRequestID stores into a dedicated string field, skipping the
 		// any-interface boxing that c.Set(ContextKey, id) would pay on
 		// every request. Value still surfaces via Get(celeris.RequestIDKey)

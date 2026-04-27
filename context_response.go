@@ -654,6 +654,33 @@ func (c *Context) SetHeader(key, value string) {
 	c.respHeaders = append(c.respHeaders, [2]string{k, v})
 }
 
+// SetHeaderTrust replaces an existing header with the same key (or
+// appends a new one if absent) without sanitizing key or value. The
+// caller MUST guarantee:
+//
+//   - key is lowercase ASCII (no characters in [A-Z]) and contains no
+//     CR, LF, or NUL bytes
+//   - value contains no CR, LF, or NUL bytes
+//
+// Compared to [Context.SetHeader] this skips the byte-by-byte
+// sanitization scan; compared to [Context.AppendRespHeader] it keeps
+// the linear dedup walk so callers do not need to assert that a
+// matching key cannot already be present.
+//
+// Use [Context.SetHeader] when any of these invariants might not hold.
+// Suitable for middleware that emits a single header per request from
+// validated input (e.g. request-id middleware writing a generated UUID
+// under a config-validated header name).
+func (c *Context) SetHeaderTrust(key, value string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			c.respHeaders[i][1] = value
+			return
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{key, value})
+}
+
 // AppendRespHeader appends a response header without sanitization or
 // dedup walk. The caller MUST guarantee:
 //
