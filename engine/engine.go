@@ -43,6 +43,24 @@ type SwitchFreezer interface {
 	UnfreezeSwitching()
 }
 
+// WorkerScaler is implemented by engines that support per-worker pause/resume
+// for dynamic capacity adjustment based on load. Used by the higher-level
+// scaler in the adaptive engine to delegate worker activation to whichever
+// sub-engine is currently active. Per-worker pause is asynchronous — the
+// worker drains in-flight connections before going SUSPENDED. Resume wakes a
+// suspended worker so it re-creates its listen socket and rejoins the
+// SO_REUSEPORT group.
+type WorkerScaler interface {
+	// NumWorkers returns the total worker pool size (max active count).
+	NumWorkers() int
+	// PauseWorker deactivates worker i. Asynchronous; returns immediately.
+	// Idempotent — pausing an already-paused worker is a no-op.
+	PauseWorker(i int)
+	// ResumeWorker reactivates worker i. Wakes the worker if SUSPENDED.
+	// Idempotent — resuming an active worker is a no-op.
+	ResumeWorker(i int)
+}
+
 // EngineMetrics is a point-in-time snapshot of engine-level performance
 // counters. Each engine maintains internal atomic counters and populates a
 // fresh snapshot on each [Engine.Metrics] call.

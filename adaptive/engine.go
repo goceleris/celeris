@@ -75,12 +75,20 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 
-	primary, err := epoll.New(cfg, handler)
+	// Suppress the per-engine built-in scaler in both sub-engines —
+	// adaptive runs ONE higher-level scaler that delegates to whichever
+	// sub-engine is currently active. Two scalers fighting over the same
+	// worker pool produced -54 % to +118 % variance on pinning tests
+	// during the spike-B exploration; gating this way eliminates that.
+	subCfg := cfg
+	subCfg.SkipBuiltinScaler = true
+
+	primary, err := epoll.New(subCfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("epoll sub-engine: %w", err)
 	}
 
-	secondary, err := iouring.New(cfg, handler)
+	secondary, err := iouring.New(subCfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
@@ -211,6 +219,17 @@ func (e *Engine) Listen(ctx context.Context) error {
 	wg.Go(func() {
 		e.runEvalLoop(innerCtx)
 	})
+
+	// Start the higher-level dynamic worker scaler. This is the only
+	// worker scaler that runs in an adaptive setup — sub-engines have
+	// their built-in scalers suppressed via Config.SkipBuiltinScaler.
+	// Typed cfg.WorkerScaling takes precedence over env vars. See
+	// adaptive/scaler.go.
+	if scalerCfg := resolveScalerConfig(e.cfg, e.cfg.Resources.Resolve().Workers); scalerCfg.Enabled {
+		wg.Go(func() {
+			e.runScaler(innerCtx, scalerCfg)
+		})
+	}
 
 	select {
 	case <-ctx.Done():

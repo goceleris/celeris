@@ -121,6 +121,11 @@ type Worker struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
+	// inactive is the per-worker pause flag used by the dynamic worker
+	// scaler. ORed with acceptPaused (which is engine-wide) when computing
+	// effective paused state. The scaler flips this to deactivate idle
+	// workers under low load and reactivate them under burst load.
+	inactive atomic.Bool
 	// listenFDClosed signals that the worker has cancelled in-flight
 	// accept SQEs and closed its listen FD in response to acceptPaused
 	// being set. PauseAccept polls this so it only returns once the
@@ -338,7 +343,8 @@ func (w *Worker) run(ctx context.Context) {
 		// Cache the atomic load: same value used by the two branches
 		// below and (further down) the SUSPENDED check. Saves 2 atomic
 		// loads per event-loop iteration on the steady-state hot path.
-		paused := w.acceptPaused.Load()
+		// OR with the per-worker inactive flag (dynamic scaler).
+		paused := w.acceptPaused.Load() || w.inactive.Load()
 		if w.listenFD >= 0 && paused {
 			if sqe := w.ring.GetSQE(); sqe != nil {
 				prepCancelFDSkipSuccess(sqe, w.listenFD)
@@ -604,9 +610,10 @@ func (w *Worker) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
-		if w.listenFD < 0 && w.connCount == 0 && w.acceptPaused.Load() {
+		// Combined paused: engine-wide OR per-worker (dynamic scaler).
+		if w.listenFD < 0 && w.connCount == 0 && (w.acceptPaused.Load() || w.inactive.Load()) {
 			w.wakeMu.Lock()
-			if !w.acceptPaused.Load() {
+			if !w.acceptPaused.Load() && !w.inactive.Load() {
 				w.wakeMu.Unlock()
 				continue
 			}

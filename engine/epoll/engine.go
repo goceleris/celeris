@@ -113,6 +113,15 @@ func (e *Engine) Listen(ctx context.Context) error {
 		)
 	}
 
+	// Dynamic loop scaler. Typed cfg.WorkerScaling takes precedence over
+	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
+	// higher-level scaler that delegates to the active sub-engine.
+	if !e.cfg.SkipBuiltinScaler {
+		if scalerCfg := resolveScalerConfig(e.cfg, len(e.loops)); scalerCfg.Enabled {
+			go e.runScaler(innerCtx, scalerCfg, len(e.loops), &e.metrics.activeConns)
+		}
+	}
+
 	<-ctx.Done()
 	wg.Wait()
 	return nil
@@ -213,6 +222,7 @@ func (e *Engine) ResumeAccept() error {
 var (
 	_ engine.Engine           = (*Engine)(nil)
 	_ engine.AcceptController = (*Engine)(nil)
+	_ engine.WorkerScaler     = (*Engine)(nil)
 )
 
 // Addr returns the bound listener address.

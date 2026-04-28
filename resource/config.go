@@ -67,6 +67,97 @@ type Config struct {
 	// from celeris.Config.EnableH2Upgrade (pointer, may be nil) and Protocol.
 	// Always a concrete value after WithDefaults.
 	EnableH2Upgrade bool
+	// SkipBuiltinScaler suppresses the per-engine dynamic worker scaler
+	// loop. Set by the adaptive engine when it constructs its sub-engines —
+	// adaptive runs ONE higher-level scaler that delegates to the active
+	// sub-engine, so the iouring + epoll built-in scalers must stay quiet
+	// to avoid two scalers fighting over the same worker pool.
+	SkipBuiltinScaler bool
+	// WorkerScaling configures the dynamic worker scaler. Nil disables the
+	// scaler (default — workers stays at Resources.Workers and never adapts).
+	// When set, the scaler activates and deactivates workers based on
+	// observed load to keep CQE/event batching density in the sweet spot.
+	// See WorkerScalingConfig for tuning details.
+	WorkerScaling *WorkerScalingConfig
+}
+
+// WorkerScalingStrategy selects the seed strategy for the dynamic
+// worker scaler. The zero value (ScalingStrategyStartHigh) is the
+// recommended default: start at NumWorkers active, scale down once
+// load is observably low. This preserves SO_REUSEPORT distribution at
+// startup, which the spike-B sweep showed is dramatically better on
+// ramp / oscil traffic patterns (+34-78 % across all three engines).
+type WorkerScalingStrategy int
+
+const (
+	// ScalingStrategyStartHigh seeds the scaler at NumWorkers active.
+	// Best for production where traffic ramps from idle and bursts.
+	// Zero value — selected when the field is unset.
+	ScalingStrategyStartHigh WorkerScalingStrategy = 0
+	// ScalingStrategyStartLow seeds the scaler at MinActive. Best when
+	// the application has a long idle warmup before any conns arrive
+	// and saving CPU during that idle period matters more than peak
+	// throughput on the first burst.
+	ScalingStrategyStartLow WorkerScalingStrategy = 1
+)
+
+// WorkerScalingConfig controls the dynamic worker scaler used by the
+// iouring, epoll, and adaptive engines. Zero values mean "use the
+// scaler's default" — see field comments for what those are. Pass via
+// celeris.Config.WorkerScaling to enable; nil disables the scaler
+// entirely (the engine runs all configured workers all the time, like
+// versions before the scaler was introduced).
+//
+// The scaler tracks the engine's activeConns counter and adjusts the
+// number of "active" workers (workers participating in the SO_REUSEPORT
+// group) so that conns / active is roughly TargetConnsPerWorker. Scale-up
+// is reactive (next tick after a load increase). Scale-down is hysteretic
+// — must observe ScaleDownIdleTicks consecutive ticks below the
+// hysteresis threshold before reducing one worker.
+type WorkerScalingConfig struct {
+	// Strategy picks the seed-state strategy. Zero value is
+	// ScalingStrategyStartHigh, which is the data-validated default for
+	// most production workloads. See WorkerScalingStrategy for tuning.
+	Strategy WorkerScalingStrategy
+	// MinActive is the floor on the active worker count. The scaler will
+	// never reduce active workers below this. Defaults to max(2, NumCPU/2).
+	// Set to NumCPU to force the scaler to always run at full capacity
+	// (effectively a static-w=NumCPU configuration).
+	MinActive int
+	// TargetConnsPerWorker is the active-worker scaling target. The scaler
+	// computes desired = ceil(activeConns / TargetConnsPerWorker), clamps
+	// to [MinActive, NumWorkers], and steers active toward that. Default 20.
+	// Higher values keep more conns per worker (better batching, less
+	// parallelism). Lower values prefer parallelism over batching.
+	TargetConnsPerWorker int
+	// Interval controls how often the scaler reevaluates active count.
+	// Default 250ms. Lower values respond to load changes faster but burn
+	// more CPU on the controller goroutine.
+	Interval time.Duration
+	// ScaleUpStep is the maximum number of workers the scaler will
+	// resume per tick. Default 2 — wider bursts disrupt SO_REUSEPORT
+	// load balancing more than they help. Bigger values are tempting on
+	// SPIKE workloads but produce worse throughput per the v1.4.1
+	// SPIKE-test sweep (upStep=4 and upStep=8 both lost to upStep=2).
+	ScaleUpStep int
+	// ScaleDownStep is the maximum number of workers the scaler will
+	// pause per tick when load drops. Default 1 — scale-down too quickly
+	// and you can't recover throughput when load comes back.
+	ScaleDownStep int
+	// ScaleDownHysteresis adds a buffer between desired and active
+	// before scale-down fires: scale-down only if desired ≤ active -
+	// ScaleDownHysteresis - 1. Default 1 (so a desired-of-N triggers
+	// scale-down only when active is N+2 or higher).
+	ScaleDownHysteresis int
+	// ScaleDownIdleTicks is how many consecutive sub-threshold ticks
+	// must pass before a single scale-down step fires. Default 4
+	// (= 1 second at the default 250ms interval). Tunes how patient
+	// the scaler is about temporary lulls: a request-rate dip of one
+	// tick will not trigger scale-down.
+	ScaleDownIdleTicks int
+	// Trace logs every scaler decision (active, desired, idle_ticks).
+	// Default false. Use when diagnosing scaling behaviour.
+	Trace bool
 }
 
 // Validate checks all config fields and returns any validation errors.

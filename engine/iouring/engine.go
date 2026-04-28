@@ -186,6 +186,15 @@ func (e *Engine) Listen(ctx context.Context) error {
 		)
 	}
 
+	// Dynamic worker scaler. Typed cfg.WorkerScaling takes precedence over
+	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
+	// higher-level scaler that delegates to the active sub-engine.
+	if !e.cfg.SkipBuiltinScaler {
+		if scalerCfg := resolveScalerConfig(e.cfg, len(workers)); scalerCfg.Enabled {
+			go e.runScaler(innerCtx, scalerCfg, len(workers), &e.metrics.activeConns)
+		}
+	}
+
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,
 	// so they will exit within ~100ms of context cancellation.
@@ -319,6 +328,7 @@ var (
 	_ engine.Engine            = (*Engine)(nil)
 	_ engine.AcceptController  = (*Engine)(nil)
 	_ engine.EventLoopProvider = (*Engine)(nil)
+	_ engine.WorkerScaler      = (*Engine)(nil)
 )
 
 // NumWorkers returns the number of worker event loops available for
