@@ -29,10 +29,8 @@ func NewParser() *Parser {
 // more data arrives.
 func (p *Parser) InitReader(r io.Reader) {
 	p.framer = http2.NewFramer(p.buf, r)
-	// Start with the RFC 9113 default (16 KiB). The processor will
-	// raise this via SetMaxReadFrameSize when it observes a
-	// SETTINGS_MAX_FRAME_SIZE update from its own SETTINGS frame.
-	// The previous hard-coded 1 MiB bypassed the negotiated limit.
+	// Start at the RFC 9113 default (16 KiB); the processor raises
+	// this via SetMaxReadFrameSize once SETTINGS_MAX_FRAME_SIZE lands.
 	p.framer.SetMaxReadFrameSize(16384)
 }
 

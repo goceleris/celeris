@@ -167,7 +167,6 @@ func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listene
 	}
 	s.ln = ln
 
-	// Wave-3 additions: driver-backed and middleware-chain scenarios.
 	// Drivers are constructed lazily from svcs; when svcs is nil or a
 	// service is absent, the matching handler responds 503.
 	mountChainHandlers(s)

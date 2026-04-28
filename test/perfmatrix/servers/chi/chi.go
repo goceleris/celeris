@@ -142,7 +142,6 @@ func drainBody(r *http.Request) {
 // Start implements servers.Server.
 func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
-	// Wave-3 additions: driver-backed and middleware-chain scenarios.
 	// Routes are registered exactly once per Server via mount guards;
 	// repeat Start calls rebuild driver clients but do not re-register
 	// routes (chi's router panics on duplicate patterns).

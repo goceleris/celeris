@@ -290,14 +290,10 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 					continue
 				}
 			}
-			// All headers reaching this path are pre-validated CRLF-free:
-			// celeris.Context.SetHeader / AddHeader sanitize at set time,
-			// SetHeaderTrust / AppendRespHeader require the caller to
-			// guarantee the invariant, and content-type / content-length
-			// added in Context.Blob are either an inline-stripped string
-			// or a pure-digit length. Skipping the per-header CRLF scan
-			// saves ~2.24 % CPU on the realistic-API hot path (validated
-			// 2026-04-28).
+			// Headers here are pre-validated CRLF-free: SetHeader/AddHeader
+			// sanitize at set time; SetHeaderTrust/AppendRespHeader push
+			// that invariant onto the caller. Skipping the per-header
+			// scan is worth ~2.24% CPU on the realistic-API hot path.
 			buf = append(buf, h[0]...)
 			buf = append(buf, ": "...)
 			buf = append(buf, h[1]...)
@@ -328,12 +324,9 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 			a.writeBody(body)
 			return nil
 		}
-		// Two-write path for small bodies. Cuts one memcpy of body bytes:
-		// previously body was append'd into respBuf then the entire respBuf
-		// was append'd into the engine's writeBuf — copying body twice.
-		// The engine's writeFn just appends to cs.writeBuf, so two calls
-		// land headers and body back-to-back in cs.writeBuf with no
-		// intermediate copy.
+		// Two-write path for small bodies: writeFn just appends to
+		// cs.writeBuf, so two calls land headers and body back-to-back
+		// without the second body memcpy a single-write would force.
 		a.write(buf)
 		a.respBuf = buf
 		a.write(body)

@@ -17,27 +17,14 @@ import (
 )
 
 // TestAdaptiveScaler_H2DialNoRSTRace mirrors TestAdaptiveH2DialNoRSTRace
-// but with the dynamic worker scaler ENABLED. The strict-matrix run
-// at b7bwnfrbo (2026-04-28) tripped fail-fast on
-// get-json-64k-h2/celeris-adaptive-h2c-noupg-async because the env-path
-// scaler defaulted to start-low — pausing workers before the engine
-// settled its listen FDs in the SO_REUSEPORT group, which RST'd
-// in-flight H2 prior-knowledge handshakes mid-flush.
+// with the dynamic worker scaler enabled. Locks in that the scaler's
+// start-high default does not pause workers before the listen FDs
+// settle in the SO_REUSEPORT group — which would RST in-flight H2
+// prior-knowledge handshakes mid-flush.
 //
-// The fix (in engine/scaler) was to make the env-path StartHigh
-// default true (matching the typed-config default and the data-validated
-// recommendation). This test locks that in by:
-//
-//   - constructing an adaptive engine with a non-nil WorkerScaling
-//     config (zero values → ScalingStrategyStartHigh)
-//   - bursting 32 parallel H2 prior-knowledge dials immediately after
-//     Addr() is non-nil
-//   - asserting every dial completes its preface write + reads ≥1 byte
-//     of SETTINGS without ECONNRESET
-//
-// Iterations bound at 3 — the race only fires once per engine spin-up
-// so we don't need the larger budget the no-scaler test uses; what we
-// care about is "scaler + H2 dial burst doesn't introduce a regression".
+// Iterations bound at 3: the race only fires on engine spin-up, so we
+// just need "scaler + H2 dial burst" coverage in addition to the
+// no-scaler test's larger budget.
 func TestAdaptiveScaler_H2DialNoRSTRace(t *testing.T) {
 	const iterations = 3
 	for i := 0; i < iterations; i++ {

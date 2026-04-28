@@ -2166,17 +2166,13 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqExtended
-	// When the caller has cached column descriptions (auto-prepare or
-	// explicit cache), we pre-populate them and drop the server-side
-	// Describe round trip. Saves one message per query (~7 bytes of
-	// wire and one protocol-state transition) — measured +3-5% RPS
-	// on the MSR1 PG cell.
+	// With cached column descriptions we drop the server-side Describe
+	// round trip (~+3-5% RPS on the MSR1 PG cell).
 	//
-	// Intentional check: cachedCols == nil (not len==0). A prepared
-	// statement that genuinely returns zero columns (e.g. VALUES ()
-	// or a no-projection query) has a non-nil but zero-length slice;
-	// treating it as "no cache" would defeat the optimization and
-	// send a redundant Describe for every call.
+	// Check is == nil, NOT len == 0: a prepared statement returning
+	// zero columns (VALUES (), no-projection) caches as a non-nil
+	// zero-length slice; treating that as "no cache" would re-issue
+	// Describe every call.
 	hasDescribe := cachedCols == nil
 	req.extended.HasDescribe = hasDescribe
 	if !hasDescribe {
@@ -2517,11 +2513,10 @@ func encodeOne(v any) ([]byte, int16, error) {
 		// without requiring knowledge of the server-side parameter OID.
 		return []byte(x.Format(time.RFC3339Nano)), protocol.FormatText, nil
 	default:
-		// Previously: fmt.Sprint(v) was wired through as text. That silently
-		// produces garbage (e.g. "{1 2}") for struct types and anything else
-		// whose default fmt form is not a valid PG literal. Callers must
-		// convert to a supported type (bool, int64, float64, string,
-		// []byte, time.Time) or register a codec in the protocol package.
+		// Reject explicitly. A generic fmt.Sprint fallback silently
+		// produces non-PG-literal text for unsupported types (e.g.
+		// "{1 2}" for struct values), which the server rejects far
+		// from the call site.
 		return nil, 0, fmt.Errorf("celeris-postgres: unsupported argument type %T; convert to bool/int64/float64/string/[]byte/time.Time or register a codec", v)
 	}
 }

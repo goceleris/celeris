@@ -1,8 +1,6 @@
-// Blank-imports to pin every competitor framework + driver dep in
-// go.mod/go.sum. Wave-2 replaces each entry here with a real import
-// inside the corresponding servers/<framework>/ package. Keeping the
-// imports centralized during the scaffold phase means one place to bump
-// versions and one place for `go mod tidy` to reach.
+// Blank-imports under the perfmatrix_deps build tag to pin every
+// competitor framework + driver in go.mod/go.sum so `go mod tidy`
+// keeps them, even when no scenario is currently importing them.
 
 //go:build perfmatrix_deps
 

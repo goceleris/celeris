@@ -27,7 +27,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Fixture IDs exposed to wave-3 driver handlers so they can generate
+// Fixture IDs exposed to driver handlers so they can generate
 // realistic request traffic against the seeded data set.
 const (
 	FixtureUserMinID    = 1

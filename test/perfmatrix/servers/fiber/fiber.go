@@ -73,9 +73,8 @@ func (s *Server) Kind() string { return kind }
 // Features implements servers.Server.
 func (s *Server) Features() servers.FeatureSet { return s.features }
 
-// Mount attaches a net/http.Handler under (method, path). Wave-3 agents
-// call this before Start. Prefer MountNative on hot paths to avoid the
-// fasthttpadaptor hop.
+// Mount attaches a net/http.Handler under (method, path). Prefer
+// MountNative on hot paths to avoid the fasthttpadaptor hop.
 func (s *Server) Mount(method, path string, h http.Handler) {
 	s.ensureApp()
 	native := func(c fiberv3.Ctx) error {
@@ -137,8 +136,8 @@ func (s *Server) registerStatic() {
 func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listener, error) {
 	_ = ctx
 	s.ensureApp()
-	// Wave-3: mount middleware chain routes before driver routes so
-	// fiber's per-prefix Use() attaches before the terminal handlers.
+	// Mount chain routes before driver routes so fiber's per-prefix
+	// Use() attaches before the terminal handlers.
 	mountChainHandlers(s)
 	mountDriverHandlers(s, svcs)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

@@ -1400,8 +1400,8 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 
 	// Regular SEND completion (non-ZC path). cs.sending is reset on
 	// every exit branch — by completeSend on success, inline on error
-	// paths — so the previously unconditional reset on entry is dropped
-	// (saves one write per request on the hot success path).
+	// paths — so we skip the entry-reset to save one write per request
+	// on the hot success path.
 
 	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
 	// Disable ZC for this worker and retry the send with regular SEND.

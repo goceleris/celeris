@@ -184,11 +184,10 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 
 	srv := celeris.New(cfg)
 	registerStaticHandlers(srv)
-	// Wave-3 additions: driver-backed and middleware-chain scenarios.
 	// Drivers are lazily constructed from svcs; when svcs is nil or a
 	// service is absent, the driver handler returns 503 so the
-	// orchestrator can detect missing prerequisites. Chain handlers are
-	// always registered — they need no external services.
+	// orchestrator can detect missing prerequisites. Chain handlers
+	// need no external services and are always registered.
 	mountDriverHandlers(s, srv, svcs)
 	mountChainHandlers(srv, engineCtx)
 	done := make(chan error, 1)

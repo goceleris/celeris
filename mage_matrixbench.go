@@ -38,22 +38,15 @@ type matrixFlags struct {
 
 // MatrixBench runs the full release-gate performance matrix: all celeris
 // configs × all competitors × all scenarios × 5 interleaved runs at 15s
-// each. Captures reliable p99.99 tails on a sane wall-clock budget.
-// Expected runtime ~1.9 days on msr1. See test/perfmatrix/README.md.
+// each. Expected runtime ~1.9 days on msr1. See test/perfmatrix/README.md.
 //
 // PERFMATRIX_CELLS, when set, narrows the run to a comma-separated cell
-// glob (same syntax as the runner's -cells flag). Useful for a partial
-// regression check or to repro a single matrix cell without re-running
-// the entire sweep.
+// glob (same syntax as the runner's -cells flag).
 //
-// 5s warmup (was 2s): the io_uring engine pays a per-cell ring-setup
-// + SO_REUSEPORT-rebind + 128-conn handshake cost on cold start, and a
-// 2s warmup did not amortize it — comparing matrix-runner output to
-// long-duration single-process perfprofile showed iouring engines
-// reporting ~50% of their steady-state RPS purely from this. fasthttp
-// + std-net engines hit steady-state in well under 2s, so they were
-// previously over-flattering vs celeris. 5s closes the gap without
-// inflating total wall time meaningfully (+15 m on a full matrix).
+// Warmup is 5s: the io_uring engine's per-cell ring-setup +
+// SO_REUSEPORT-rebind + 128-conn handshake takes longer than 2s to
+// amortize, so a shorter warmup over-flattered the cold-start-fast
+// engines (fasthttp / std-net) at celeris's expense.
 func MatrixBench() error {
 	return runMatrix(matrixFlags{
 		runs:     5,

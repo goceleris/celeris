@@ -156,13 +156,10 @@ type Context struct {
 	stringKeys map[string]string
 
 	// workerID is the engine-supplied event-loop worker affinity for
-	// this request, propagated by routerAdapter.HandleStream from the
-	// engine's connection-scoped context. Stored as a direct field so
-	// c.WorkerID() avoids the per-request context.Value walk and so
-	// the routerAdapter can skip the context.WithValue allocation that
-	// previously dominated the iouring-h1-sync alloc profile (~99% of
-	// total allocations on get-simple). Zero-value is fine: WorkerID()
-	// reports -1 when the engine never set one.
+	// this request. Stored as a direct field (not via context.Value) so
+	// the routerAdapter avoids a context.WithValue allocation per
+	// request — that single alloc dominated the iouring-h1-sync profile.
+	// Zero-value safe: WorkerID() reports -1 when unset.
 	workerID    int32
 	workerIDSet bool
 

@@ -64,8 +64,8 @@ func newServer(name string, m mode) *Server {
 		s.features = servers.FeatureSet{HTTP1: true, Drivers: true, Middleware: true}
 	case modeH2C:
 		// hertz-contrib/http2 speaks prior-knowledge H2C; it does not
-		// advertise the Upgrade: h2c header. Keep H2CUpgrade=false so
-		// wave-3 loadgen runs use prior-knowledge mode.
+		// advertise Upgrade: h2c. H2CUpgrade stays false so loadgen
+		// dials in prior-knowledge mode.
 		s.features = servers.FeatureSet{HTTP2C: true, Drivers: true, Middleware: true}
 	case modeAuto:
 		s.features = servers.FeatureSet{HTTP1: true, HTTP2C: true, Auto: true, Drivers: true, Middleware: true}
@@ -113,9 +113,9 @@ func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listene
 	s.ensureEngineLocked(ln)
 	s.mu.Unlock()
 
-	// Wave-3: mount chain + driver routes after the engine is built
-	// (hertz's routes can be added any time before Run; both mount
-	// funcs grab their own lock as needed).
+	// Mount chain + driver routes after the engine is built (hertz
+	// accepts route additions any time before Run; both mount funcs
+	// take their own locks).
 	mountChainHandlers(s)
 	mountDriverHandlers(s, svcs)
 

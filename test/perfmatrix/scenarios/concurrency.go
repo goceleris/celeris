@@ -18,10 +18,7 @@ const (
 )
 
 // ConcurrencyScenario parameterises a static workload with one of the
-// four concurrency profiles listed above. Wave-2F registers four canonical
-// cells ("get-json-1c", "get-simple-128c", "get-simple-1024c",
-// "auto-mix-111"); richer cross-products can be layered on top by future
-// waves without reshaping the type.
+// four concurrency profiles listed above.
 type ConcurrencyScenario struct {
 	name    string
 	profile string
