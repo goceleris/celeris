@@ -15,6 +15,7 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/epoll"
 	"github.com/goceleris/celeris/engine/iouring"
+	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -223,9 +224,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 	// Start the higher-level dynamic worker scaler. This is the only
 	// worker scaler that runs in an adaptive setup — sub-engines have
 	// their built-in scalers suppressed via Config.SkipBuiltinScaler.
-	// Typed cfg.WorkerScaling takes precedence over env vars. See
-	// adaptive/scaler.go.
-	if scalerCfg := resolveScalerConfig(e.cfg, e.cfg.Resources.Resolve().Workers); scalerCfg.Enabled {
+	// Typed cfg.WorkerScaling takes precedence over env vars. The
+	// algorithm lives in engine/scaler; adaptive provides a switch-aware
+	// Source via adaptive/scaler.go.
+	if scalerCfg := scaler.Resolve(e.cfg, e.cfg.Resources.Resolve().Workers); scalerCfg.Enabled {
 		wg.Go(func() {
 			e.runScaler(innerCtx, scalerCfg)
 		})

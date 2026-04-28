@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -188,10 +189,11 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	// Dynamic worker scaler. Typed cfg.WorkerScaling takes precedence over
 	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
-	// higher-level scaler that delegates to the active sub-engine.
+	// higher-level scaler that delegates to the active sub-engine. The
+	// algorithm itself lives in engine/scaler; this is just the call site.
 	if !e.cfg.SkipBuiltinScaler {
-		if scalerCfg := resolveScalerConfig(e.cfg, len(workers)); scalerCfg.Enabled {
-			go e.runScaler(innerCtx, scalerCfg, len(workers), &e.metrics.activeConns)
+		if scalerCfg := scaler.Resolve(e.cfg, len(workers)); scalerCfg.Enabled {
+			go e.runScaler(innerCtx, scalerCfg, &e.metrics.activeConns)
 		}
 	}
 
