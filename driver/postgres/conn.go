@@ -523,6 +523,13 @@ type pgConn struct {
 	closeLoop func()
 	syncBuf   []byte // read buffer for syncLoop.WriteAndPoll
 
+	// onRecvFn / onCloseFn cache the method-value closures bound to this
+	// pgConn. The hot sync path (WriteAndPoll on every Query/Exec) would
+	// otherwise re-create `c.onRecv` per call — Go's compiler heap-allocates
+	// the closure when it escapes into a func argument.
+	onRecvFn  func([]byte)
+	onCloseFn func(error)
+
 	// Direct mode: used when the caller runs on an unlocked G (standalone
 	// or Config.AsyncHandlers=true). All I/O goes through c.tcp (which is
 	// backed by Go's netpoll) instead of the mini-loop — no LockOSThread'd
@@ -871,9 +878,11 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	if syncL != nil {
 		c.syncBuf = make([]byte, 16<<10) // 16 KiB read buffer for sync path
 	}
+	c.onRecvFn = c.onRecv
+	c.onCloseFn = c.onClose
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecv, c.onClose); err != nil {
+	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
 		// Close via file.Close() to disarm the *os.File finalizer. A stray
 		// syscall.Close(fd) here would leave the finalizer armed; when GC
 		// later fires it would close the same fd a SECOND time, possibly
@@ -1794,17 +1803,20 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	// rowCh mid-dispatch, letting the caller goroutine switch to
 	// streaming mode instead of waiting for the full result set.
 	//
-	// The alloc (~56 bytes) is unneeded in two hot paths:
+	// The alloc (~96 bytes for the chan header) is unneeded on three
+	// paths:
 	//   - useDirect: driveDirect owns the caller's read loop, no select
 	//     on colsCh ever happens.
 	//   - syncLoop fast path succeeds: simpleQuery returns directly
 	//     from the buffered-rows branch without entering
 	//     waitForQueryRows' select.
-	// Skipping the allocation in useDirect shaves one alloc per
-	// Query_1col_1row; the syncLoop fast path also benefits via the
-	// fallback branch in waitForQueryRows which re-allocates when it
-	// actually needs to wait.
-	if !c.useDirect {
+	//   - syncLoop fast path falls through to async wait: we allocate
+	//     colsCh just before clearing syncMode (the fall-through site
+	//     below) so dispatch can promote to streaming if needed.
+	// Async path (no syncLoop) still pre-allocates upfront because
+	// dispatch on the event-loop goroutine may run before
+	// waitForQueryRows reaches the select and needs colsCh to be set.
+	if !c.useDirect && c.syncLoop == nil {
 		req.colsCh = make(chan struct{})
 	}
 	// Direct mode drives onRecv on the caller goroutine; streaming
@@ -1825,7 +1837,7 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		req.syncMode.Store(true)
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecv)
+		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -1850,8 +1862,12 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 			c.touch()
 			return acquirePGRows(req.columns, req.rows, true, req, nil), nil
 		}
-		// Partial or EAGAIN: clear syncMode so async dispatch can promote
-		// to streaming if the result grows past the threshold.
+		// Partial or EAGAIN: allocate colsCh now (dispatch hasn't taken
+		// over yet — WriteAndPoll has returned and the event-loop worker
+		// is still parked on epoll for this fd) and clear syncMode so
+		// async dispatch can promote to streaming if the result grows
+		// past the threshold.
+		req.colsCh = make(chan struct{})
 		req.syncMode.Store(false)
 	} else {
 		// Async path: standard event-loop write.
@@ -1984,7 +2000,7 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 	if c.syncLoop != nil {
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecv)
+		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -2061,7 +2077,7 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 	if c.syncLoop != nil {
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecv)
+		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -2166,10 +2182,12 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		req.columns = cols
 		req.extended.Columns = cols
 	}
-	// Lazy streaming: colsCh only needed in the async/streaming path.
-	// useDirect never enters waitForQueryRows' select so the alloc is
-	// unused there. See simpleQuery for the detailed rationale.
-	if !c.useDirect {
+	// Lazy streaming: colsCh only needed when waitForQueryRows enters
+	// the select. Skip the alloc on the sync fast path success branch
+	// (re-allocated below before falling through to async wait) and on
+	// useDirect (driveDirect never selects on colsCh). See simpleQuery
+	// for the detailed rationale.
+	if !c.useDirect && c.syncLoop == nil {
 		req.colsCh = make(chan struct{})
 	}
 	// Direct mode drives reads on the caller goroutine; streaming would
@@ -2196,7 +2214,7 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		}
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
-		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecv)
+		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if werr != nil {
 			c.failReq(req, werr)
@@ -2220,7 +2238,9 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 			c.touch()
 			return acquirePGRows(req.columns, req.rows, false, req, nil), nil
 		}
-		// Clear syncMode so async dispatch can promote to streaming.
+		// Allocate colsCh now so async dispatch can signal streaming
+		// promotion, then clear syncMode.
+		req.colsCh = make(chan struct{})
 		req.syncMode.Store(false)
 	} else {
 		// Direct-mode extended query. Build the Parse+Bind+[Describe]+
@@ -2302,7 +2322,7 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, nil)
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
-		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecv)
+		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if werr != nil {
 			c.failReq(req, werr)
