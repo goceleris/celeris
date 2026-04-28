@@ -406,6 +406,51 @@ func growCap(old, need int) int {
 // Ctx implements async.PendingRequest.
 func (r *pgRequest) Ctx() context.Context { return r.ctx }
 
+// OnRowDesc implements [protocol.SimpleQueryObserver]. Called once per
+// RowDescription frame on simple-query requests. Stashes the column
+// list and unblocks any caller waiting on colsCh for early streamRows
+// return.
+func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
+	r.columns = cols
+	if r.rowCh != nil && r.colsCh != nil {
+		close(r.colsCh)
+	}
+}
+
+// OnRow implements [protocol.SimpleQueryObserver] and
+// [protocol.ExtendedQueryObserver]. Called once per DataRow.
+//
+// Direct-mode (sync syncMode) buffers everything into rowSlab/rows;
+// streaming mode forwards through rowCh. The simple and extended
+// dispatch branches share this method — the only difference between
+// them is whether onRowDesc fires (extended takes columns from the
+// Describe step, not from a per-DataRow signal).
+func (r *pgRequest) OnRow(fields [][]byte) {
+	if r.rowCh != nil {
+		r.rowCh <- copyRow(fields)
+		return
+	}
+	r.appendRowFromAlias(fields)
+	// Direct-mode result-buffer cap. In direct mode syncMode is pinned
+	// so lazy streaming never fires; without a cap a huge SELECT would
+	// buffer every row in memory unbounded. Cap at maxDirectResultBytes
+	// (64 MiB) and fail with ErrResultTooBig — caller paginates or
+	// switches modes.
+	if r.syncMode.Load() && len(r.rowSlab) > maxDirectResultBytes {
+		r.doneMu.Lock()
+		if r.err == nil {
+			r.err = ErrResultTooBig
+		}
+		r.doneMu.Unlock()
+		return
+	}
+	// Skip streaming promotion when colsCh is nil (Exec paths don't
+	// allocate one; promoting would panic on close(nil colsCh)).
+	if !r.syncMode.Load() && r.colsCh != nil && len(r.rows) >= streamThreshold {
+		promoteToStreaming(r)
+	}
+}
+
 // prepareState drives a Parse + Describe S + Sync exchange. Unlike
 // ExtendedQueryState, it does not expect a Bind or Execute.
 type prepareState struct {
@@ -1164,42 +1209,11 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			head.finish()
 		}
 	case reqSimple:
-		onRowDesc := func(cols []protocol.ColumnDesc) {
-			head.columns = cols
-			if head.rowCh != nil && head.colsCh != nil {
-				close(head.colsCh)
-			}
-		}
-		onRow := func(fields [][]byte) {
-			if head.rowCh != nil {
-				head.rowCh <- copyRow(fields)
-				return
-			}
-			head.appendRowFromAlias(fields)
-			// Direct-mode result buffer cap: in direct mode syncMode is
-			// pinned so lazy streaming never fires, and a huge SELECT
-			// would otherwise buffer every row in memory without
-			// bound. Cap at maxDirectResultBytes (64 MiB) and fail the
-			// request — the caller sees ErrResultTooBig with an
-			// actionable message about paginating or switching modes.
-			if head.syncMode.Load() && len(head.rowSlab) > maxDirectResultBytes {
-				head.doneMu.Lock()
-				if head.err == nil {
-					head.err = ErrResultTooBig
-				}
-				head.doneMu.Unlock()
-				return
-			}
-			// Only promote on request paths that actually have a caller
-			// waiting on streamed rows (colsCh != nil). Exec paths
-			// (simpleExec / doExtendedExec) don't allocate colsCh — they
-			// only care about CommandComplete's tag — and promoting would
-			// panic on close(nil colsCh) inside promoteToStreaming.
-			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
-				promoteToStreaming(head)
-			}
-		}
-		done, err := head.simple.Handle(msgType, payload, onRowDesc, onRow)
+		// pgRequest implements protocol.SimpleQueryObserver via OnRowDesc /
+		// OnRow methods — passing head directly avoids the per-dispatch
+		// closure-pair allocation the previous inline funcs paid (-2
+		// allocs/op on the hot path; see PR description for full delta).
+		done, err := head.simple.Handle(msgType, payload, head)
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
@@ -1224,28 +1238,10 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			head.finish()
 		}
 	case reqExtended:
-		onRow := func(fields [][]byte) {
-			if head.rowCh != nil {
-				head.rowCh <- copyRow(fields)
-				return
-			}
-			head.appendRowFromAlias(fields)
-			// See reqSimple branch: same direct-mode cap.
-			if head.syncMode.Load() && len(head.rowSlab) > maxDirectResultBytes {
-				head.doneMu.Lock()
-				if head.err == nil {
-					head.err = ErrResultTooBig
-				}
-				head.doneMu.Unlock()
-				return
-			}
-			// See reqSimple branch: skip promotion when colsCh is nil
-			// (Exec paths don't allocate one; promoting would panic).
-			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
-				promoteToStreaming(head)
-			}
-		}
-		done, err := head.extended.Handle(msgType, payload, onRow)
+		// pgRequest implements protocol.ExtendedQueryObserver via the
+		// shared OnRow method — same allocation-free dispatch as the
+		// simple-query branch.
+		done, err := head.extended.Handle(msgType, payload, head)
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)

@@ -113,30 +113,32 @@ func TestSimpleQueryStateFullCycle(t *testing.T) {
 
 	var seenRows [][][]byte
 	var seenCols []ColumnDesc
-	onRowDesc := func(c []ColumnDesc) { seenCols = c }
-	onRow := func(f [][]byte) {
-		c := make([][]byte, len(f))
-		for i, b := range f {
-			if b != nil {
-				c[i] = append([]byte(nil), b...)
+	obs := HandleCallbacks{
+		OnRowDescFn: func(c []ColumnDesc) { seenCols = c },
+		OnRowFn: func(f [][]byte) {
+			c := make([][]byte, len(f))
+			for i, b := range f {
+				if b != nil {
+					c[i] = append([]byte(nil), b...)
+				}
 			}
-		}
-		seenRows = append(seenRows, c)
+			seenRows = append(seenRows, c)
+		},
 	}
 
-	if _, err := q.Handle(BackendRowDescription, buildRowDescription(cols), onRowDesc, onRow); err != nil {
+	if _, err := q.Handle(BackendRowDescription, buildRowDescription(cols), obs); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), onRowDesc, onRow); err != nil {
+	if _, err := q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), obs); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("2")}), onRowDesc, onRow); err != nil {
+	if _, err := q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("2")}), obs); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 2"), onRowDesc, onRow); err != nil {
+	if _, err := q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 2"), obs); err != nil {
 		t.Fatal(err)
 	}
-	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, onRowDesc, onRow)
+	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, obs)
 	if err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -153,22 +155,24 @@ func TestSimpleQueryMultiStatement(t *testing.T) {
 	cols1 := []ColumnDesc{{Name: "a", TypeOID: OIDInt4}}
 	cols2 := []ColumnDesc{{Name: "b", TypeOID: OIDText}}
 	var tags []string
-	capture := func(c []ColumnDesc) {}
-	captureRow := func(f [][]byte) {}
+	obs := HandleCallbacks{
+		OnRowDescFn: func(c []ColumnDesc) {},
+		OnRowFn:     func(f [][]byte) {},
+	}
 
 	// First result.
-	_, _ = q.Handle(BackendRowDescription, buildRowDescription(cols1), capture, captureRow)
-	_, _ = q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), capture, captureRow)
-	_, _ = q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), capture, captureRow)
+	_, _ = q.Handle(BackendRowDescription, buildRowDescription(cols1), obs)
+	_, _ = q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("1")}), obs)
+	_, _ = q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), obs)
 	tags = append(tags, string(q.TagBytes()))
 
 	// Second result in the same Q.
-	_, _ = q.Handle(BackendRowDescription, buildRowDescription(cols2), capture, captureRow)
-	_, _ = q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("x")}), capture, captureRow)
-	_, _ = q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), capture, captureRow)
+	_, _ = q.Handle(BackendRowDescription, buildRowDescription(cols2), obs)
+	_, _ = q.Handle(BackendDataRow, buildDataRow([][]byte{[]byte("x")}), obs)
+	_, _ = q.Handle(BackendCommandComplete, buildCommandComplete("SELECT 1"), obs)
 	tags = append(tags, string(q.TagBytes()))
 
-	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, capture, captureRow)
+	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, obs)
 	if err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -181,13 +185,13 @@ func TestSimpleQueryErrorResponse(t *testing.T) {
 	q := &SimpleQueryState{}
 	// Error payload: S=ERROR, C=42601, M=syntax error.
 	payload := []byte("SERROR\x00C42601\x00Msyntax error\x00\x00")
-	if _, err := q.Handle(BackendErrorResponse, payload, nil, nil); err != nil {
+	if _, err := q.Handle(BackendErrorResponse, payload, nil); err != nil {
 		t.Fatalf("Handle(E): %v", err)
 	}
 	if q.Err == nil || q.Err.Code != "42601" {
 		t.Fatalf("bad PGError: %+v", q.Err)
 	}
-	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, nil, nil)
+	done, err := q.Handle(BackendReadyForQuery, []byte{'I'}, nil)
 	if !done {
 		t.Fatalf("expected done after RFQ")
 	}

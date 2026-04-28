@@ -93,7 +93,7 @@ func TestExtendedQueryFullCycle(t *testing.T) {
 	cols := []ColumnDesc{{Name: "n", TypeOID: OIDInt4}}
 
 	var rows int
-	onRow := func(f [][]byte) { rows++ }
+	onRow := ExtendedHandleCallback(func(f [][]byte) { rows++ })
 
 	// ParseComplete
 	if _, err := e.Handle(BackendParseComplete, nil, onRow); err != nil {
