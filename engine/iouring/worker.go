@@ -56,7 +56,6 @@ const bufRingGroupID = 0
 // With 8 KB buffers: 1024 × 8 KB = 8 MB per worker.
 const bufRingCount = 1024
 
-// Worker is a per-core io_uring event loop.
 // pendingReleaseEntry queues a connState for deferred release — its
 // fd has been closed but the kernel may still have SQEs referencing
 // its buffers; we hold it past the cancellation window before

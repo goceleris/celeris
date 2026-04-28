@@ -53,6 +53,41 @@ jobs:
           version: v2.9
           working-directory: middleware/protobuf
 
+  unit:
+    name: Unit (root + middleware sub-modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      # Excludes ./test/... to keep this job deterministic — those
+      # suites (integration, spec, perfmatrix, sustainedload) are
+      # timing-sensitive on shared GitHub Actions runners and live in
+      # the strict matrix on msr1 instead.
+      #
+      # Excludes ./adaptive/... because TestAdaptiveH2DialNoRSTRace and
+      # TestAdaptiveScaler_H2DialNoRSTRace burst 32 parallel H2 dials
+      # against a freshly-spun adaptive engine, which intermittently
+      # times out on cold runner instances under -race. The same code
+      # paths run race-clean on msr1 + Multipass.
+      - name: Root module — race tests (excluding test/ and adaptive/)
+        run: >-
+          go test -race -count=1 -timeout=300s
+          $(go list ./... | grep -vE '/test/|/adaptive($|/)')
+      - name: middleware/compress
+        run: go test -race -count=1 -timeout=120s ./...
+        working-directory: middleware/compress
+      - name: middleware/metrics
+        run: go test -race -count=1 -timeout=120s ./...
+        working-directory: middleware/metrics
+      - name: middleware/otel
+        run: go test -race -count=1 -timeout=120s ./...
+        working-directory: middleware/otel
+      - name: middleware/protobuf
+        run: go test -race -count=1 -timeout=120s ./...
+        working-directory: middleware/protobuf
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest

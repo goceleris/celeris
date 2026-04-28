@@ -573,7 +573,11 @@ type pgConn struct {
 	stmtCache *lru
 	// autoCache, when true, routes cacheable SELECT-style QueryContext
 	// calls through the per-conn stmtCache even when the caller did not
-	// explicitly Prepare. Opt-in via DSN's AutoCacheStatements option.
+	// explicitly Prepare. Default-on at the [Pool.Open] / [NewConnector]
+	// layer; opt out with the DSN parameter `auto_cache_statements=false`.
+	// Lower-level entry points (raw [dialConn]) keep the field at its
+	// zero-value for backwards compatibility with simple-query test
+	// fixtures.
 	autoCache bool
 
 	createdAt  time.Time
@@ -1598,13 +1602,15 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 
 // QueryContext satisfies driver.QueryerContext.
 //
-// When the DSN option AutoCacheStatements is enabled (opt-in; the LRU
-// size is bounded by StatementCacheSize), cacheable SELECT-style queries
-// are transparently auto-prepared on first use and reused via
+// When AutoCacheStatements is enabled — the default at the [Pool.Open]
+// and [NewConnector] entry points; opt out per-DSN with
+// `auto_cache_statements=false` — cacheable SELECT-style queries with
+// arguments are transparently auto-prepared on first use and reused via
 // Bind+Describe+Execute+Sync on subsequent invocations. This matches
 // pgx's QueryExecModeCacheStatement at steady state. The first call
 // pays Parse + Describe + Bind + Execute in one flight (same as pgx);
-// subsequent calls skip Parse.
+// subsequent calls skip Parse. Arg-less queries (no $N placeholders)
+// take the simple-query path regardless.
 func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	// autoCache only helps arg-bearing queries: extended-protocol caching
 	// turns Parse+Bind+Describe+Execute+Sync (5 frames) into Bind+Execute

@@ -1,14 +1,5 @@
-// Package cache provides an HTTP response cache middleware for celeris.
-//
-// The middleware buffers the handler-produced response (status, headers,
-// body), encodes it via the versioned wire format in [middleware/store],
-// and persists it under a user-derived key. Subsequent matching requests
-// replay the stored response without re-running the handler chain.
-//
-// Concurrent misses for the same key are coalesced via singleflight when
-// enabled (default), so only one handler invocation runs per miss.
-// Cache-Control directives on the response (no-store, private, max-age)
-// are honored by default — opt out via [Config.RespectCacheControl].
+// Package-level documentation lives in doc.go.
+
 package cache
 
 import (

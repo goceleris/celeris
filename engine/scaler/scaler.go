@@ -1,16 +1,11 @@
 //go:build linux
 
-// Package scaler implements the dynamic worker scaler shared by the
-// iouring, epoll, and adaptive engines. The scaler tracks the active
-// connection count and adjusts how many workers participate in the
-// SO_REUSEPORT group so connections-per-active-worker stays near the
-// configured target — this keeps CQE/event batching density in the
-// sweet spot. See PR #257 for the full rationale and benchmark data.
-//
-// Engines plug in via the [Source] interface. Per-engine sources
-// (iouring, epoll) report Generation()=0 always; the adaptive engine's
+// Package-level documentation lives in doc.go (build-unconstrained so
+// pkg.go.dev can render it on non-Linux). Per-engine [Source] sources:
+// iouring + epoll report Generation()=0 always; the adaptive engine's
 // source increments it on each engine switch so the scaler can
 // re-baseline the new active engine's worker pause state.
+
 package scaler
 
 import (

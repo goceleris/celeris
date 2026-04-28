@@ -2,12 +2,14 @@ package session_test
 
 // deprecation_shim_test.go validates that user code written against the
 // deprecated session.Store / session.NewMemoryStore / session.MemoryStoreConfig
-// names continues to compile and run under v1.5.0 without any source change
-// beyond the signature migration documented in CHANGELOG.md § Migration.
+// names continues to compile and run without any source change beyond the
+// new map[string]any-keyed signatures.
 //
 // This is a smoke test for the deprecation alias strategy — it does not
 // cover the old v1.4.x method signatures (Get(sid string)...), which are a
-// breaking change called out in the CHANGELOG.
+// breaking change. Migration: assign a [store.KV] (e.g. [store.NewMemoryKV],
+// or one of the redisstore / postgresstore / memcachedstore adapters) to
+// [session.Config.Store].
 
 import (
 	"context"

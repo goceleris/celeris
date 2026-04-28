@@ -2,7 +2,7 @@ package csrf_test
 
 // deprecation_shim_test.go validates that user code written against the
 // deprecated csrf.Storage / csrf.NewMemoryStorage / csrf.MemoryStorageConfig
-// names continues to compile and run under v1.5.0.
+// names continues to compile and run after the unified-store migration.
 
 import (
 	"context"

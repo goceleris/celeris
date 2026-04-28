@@ -13,7 +13,7 @@ import (
 // atomic GET+DEL fall back to a non-atomic Get+Delete pair.
 //
 // Deprecated: use [store.KV] directly. This alias is retained for
-// source compatibility with v1.3.x and will be removed in v2.0.0.
+// source compatibility with the pre-unified-store API.
 type Storage = store.KV
 
 // MemoryStorageConfig is a type alias for [store.MemoryKVConfig].

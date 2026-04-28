@@ -3,7 +3,7 @@
 //
 // Implemented commands: get, gets, set, add, delete, cas, version,
 // quit. Missing: replace, append/prepend, incr/decr, flush_all — not
-// used by any v1.5.0 adapter.
+// used by any of the bundled middleware-store adapters.
 package fakememcached
 
 import (

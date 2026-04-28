@@ -9,7 +9,7 @@ import (
 // (map[string]any) is JSON-encoded when persisted through Store.
 //
 // Deprecated: use [store.KV] directly. This alias is retained for
-// source compatibility with v1.3.x and will be removed in v2.0.0.
+// source compatibility with the pre-unified-store API.
 type Store = store.KV
 
 // MemoryStoreConfig is a type alias for [store.MemoryKVConfig].
