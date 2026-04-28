@@ -403,7 +403,11 @@ func TestStreamingPoolLevel(t *testing.T) {
 	})
 
 	host, port, _ := net.SplitHostPort(addr)
-	pool, err := Open("postgres://u@"+host+":"+port+"/d?sslmode=disable&statement_cache_size=4", WithMaxOpen(1))
+	// auto_cache_statements=false preserves the simple-query path under
+	// test here; the fakePG harness only handles the Q frame, not the
+	// Parse/Bind/Execute/Sync sequence. Pool.Open's default flipped to
+	// auto-cache=true in v1.4.1 to match pgx.
+	pool, err := Open("postgres://u@"+host+":"+port+"/d?sslmode=disable&statement_cache_size=4&auto_cache_statements=false", WithMaxOpen(1))
 	if err != nil {
 		t.Fatal(err)
 	}

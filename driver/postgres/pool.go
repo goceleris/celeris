@@ -144,6 +144,15 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	if o.cfg.StatementCacheSize != 0 {
 		dsn.Options.StatementCacheSize = o.cfg.StatementCacheSize
 	}
+	// Pool.Open is the production entry point for application code; default
+	// to auto-prepared+cached statements unless the DSN explicitly opted
+	// out (auto_cache_statements=false). Mirrors pgx's default behaviour.
+	// Lower-level entry points (dialConn, the database/sql DSN-only path
+	// via OpenConnector) keep the field unset to preserve raw DSN parse
+	// semantics — this opt-in covers the realistic per-conn-pool path.
+	if !dsn.Options.autoCacheStatementsExplicit {
+		dsn.Options.AutoCacheStatements = true
+	}
 	if o.provider == nil {
 		prov, err := eventloop.Resolve(nil)
 		if err != nil {

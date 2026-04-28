@@ -21,10 +21,16 @@ type Options struct {
 	// AutoCacheStatements, when true AND StatementCacheSize > 0, causes
 	// cacheable SELECT-style QueryContext calls to transparently auto-
 	// prepare on first use and reuse via the extended protocol on
-	// subsequent calls. Default false preserves the legacy simple-query
-	// behaviour for queries without an explicit db.Prepare. Equivalent to
-	// pgx's QueryExecModeCacheStatement at steady state.
+	// subsequent calls. Equivalent to pgx's QueryExecModeCacheStatement
+	// at steady state. Default true; opt out per DSN with
+	// auto_cache_statements=false (preserves the simple-query behaviour
+	// for callers that do not want per-conn statement caching).
 	AutoCacheStatements bool
+	// autoCacheStatementsExplicit tracks whether the DSN parser observed
+	// an explicit auto_cache_statements=… parameter so applyDefaults can
+	// distinguish "user opted out" from "field was never set" before
+	// flipping the default to true.
+	autoCacheStatementsExplicit bool
 	// Application is copied into the "application_name" startup parameter.
 	Application string
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are
@@ -212,6 +218,7 @@ func applyDSNKey(d *DSN, k, v string) error {
 		default:
 			return fmt.Errorf("celeris-postgres: auto_cache_statements = %q: want bool", v)
 		}
+		d.Options.autoCacheStatementsExplicit = true
 	case "application_name":
 		d.Options.Application = v
 	default:
