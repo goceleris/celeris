@@ -379,18 +379,12 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 
 	enc := &a.enc
 
-	var hdrBuf [16][2]string
-	responseHeaders := hdrBuf[:0:16]
-	if len(headers)+1 > 16 {
-		responseHeaders = make([][2]string, 0, len(headers)+1)
-	}
-	responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
-	responseHeaders = append(responseHeaders, headers...)
-
 	// Fast path for common responses: status 200 + known content-type +
 	// content-length. Uses pre-encoded HPACK bytes for status and
 	// content-type, and manual HPACK encoding for content-length (avoids
 	// the full encoder's static table lookup + Huffman decision overhead).
+	// Skips the responseHeaders construction below entirely — the fast
+	// path never feeds the standard encoder.
 	var headerBlock []byte
 	if status == 200 && len(headers) == 2 && headers[0][0] == "content-type" && headers[1][0] == "content-length" {
 		var ctBlock []byte
@@ -409,6 +403,16 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 		}
 	}
 	if headerBlock == nil {
+		// Slow path: construct the response-header slice (status pseudo-
+		// header prepended) only when the standard encoder is actually
+		// needed.
+		var hdrBuf [16][2]string
+		responseHeaders := hdrBuf[:0:16]
+		if len(headers)+1 > 16 {
+			responseHeaders = make([][2]string, 0, len(headers)+1)
+		}
+		responseHeaders = append(responseHeaders, [2]string{":status", statusCodeString(status)})
+		responseHeaders = append(responseHeaders, headers...)
 		var err error
 		headerBlock, err = enc.encodeHeaders(responseHeaders)
 		if err != nil {
