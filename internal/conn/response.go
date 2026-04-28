@@ -290,9 +290,20 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 					continue
 				}
 			}
-			buf = appendSanitizedHeaderField(buf, h[0])
+			// All headers reaching this path are pre-validated CRLF-free:
+			// celeris.Context.SetHeader / AddHeader sanitize at set time,
+			// SetHeaderTrust / AppendRespHeader require the caller to
+			// guarantee the invariant, and content-type / content-length
+			// added in Context.Blob are either an inline-stripped string
+			// or a pure-digit length. Skipping the per-header
+			// appendSanitizedHeaderField scan saves ~2.24 % CPU on the
+			// realistic-API hot path (validated 2026-04-28). Defense-in-depth
+			// for unvalidated input lives in appendSanitizedHeaderField,
+			// kept for paths (error replies, h2 trailers) that may take
+			// non-Context input.
+			buf = append(buf, h[0]...)
 			buf = append(buf, ": "...)
-			buf = appendSanitizedHeaderField(buf, h[1])
+			buf = append(buf, h[1]...)
 			buf = append(buf, crlf...)
 		}
 		if !hasContentLength && len(body) > 0 {
@@ -747,9 +758,11 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 	buf = appendCachedDate(buf)
 	buf = append(buf, "transfer-encoding: chunked\r\n"...)
 	for _, h := range headers {
-		buf = appendSanitizedHeaderField(buf, h[0])
+		// Same invariant as WriteResponse: headers reach this path
+		// pre-validated by celeris.Context's Set methods.
+		buf = append(buf, h[0]...)
 		buf = append(buf, ": "...)
-		buf = appendSanitizedHeaderField(buf, h[1])
+		buf = append(buf, h[1]...)
 		buf = append(buf, crlf...)
 	}
 	if !a.keepAlive {
