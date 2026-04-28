@@ -154,7 +154,15 @@ func fromEnv(numWorkers int) Config {
 	}
 	return Config{
 		Enabled:              enabled,
-		StartHigh:            os.Getenv("CELERIS_DYN_START_HIGH") == "1",
+		// Defaults to true (data-validated; matches the typed-config
+		// Strategy=ScalingStrategyStartHigh default). start-low pauses
+		// workers BEFORE the engine has finished settling its listen
+		// FDs in the SO_REUSEPORT group, which races against incoming
+		// H2 prior-knowledge dials and produces RST mid-handshake (seen
+		// in the v1.4.1 strict-matrix run on get-json-64k-h2/adaptive
+		// before this change). Users who explicitly want start-low can
+		// set CELERIS_DYN_START_HIGH=0.
+		StartHigh: os.Getenv("CELERIS_DYN_START_HIGH") != "0",
 		MinActive:            min,
 		TargetConnsPerWorker: getInt("CELERIS_DYN_TARGET", 20),
 		Interval:             time.Duration(getInt("CELERIS_DYN_INTERVAL", 250)) * time.Millisecond,

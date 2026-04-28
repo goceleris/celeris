@@ -189,11 +189,39 @@ func (s *fakeSource) numActive() int {
 }
 
 // TestRun_StartHighScalesDownOnIdle verifies the start-high default
-// behaviour: starts at NumWorkers active, scales down to MinActive when
-// load is low. Uses a tight Interval to keep the test fast.
+// behaviour: starts at NumWorkers active, scales down to a floor of
+// MinActive when load is low. Uses a tight Interval to keep the test fast.
+//
+// Floor: with ScaleDownHysteresis=0 the floor IS MinActive. With
+// hysteresis>0 the floor is MinActive+hysteresis to prevent flapping
+// near the boundary; that's tested in
+// TestRun_HysteresisFloorPreservedAboveMinActive.
 func TestRun_StartHighScalesDownOnIdle(t *testing.T) {
 	src := newFake(8)
 	src.setConns(0) // idle from the start
+	cfg := Config{
+		Enabled: true, StartHigh: true,
+		MinActive: 2, TargetConnsPerWorker: 20,
+		Interval: 5 * time.Millisecond,
+		ScaleUpStep: 2, ScaleDownStep: 1,
+		ScaleDownHysteresis: 0, ScaleDownIdleTicks: 2,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	Run(ctx, src, cfg)
+
+	if got := src.numActive(); got != 2 {
+		t.Errorf("expected scale-down to MinActive=2 with hyst=0, got %d active", got)
+	}
+}
+
+// TestRun_HysteresisFloorPreservedAboveMinActive verifies that with the
+// default hysteresis=1 the algorithm stops scaling at MinActive+1, not
+// at MinActive. This prevents flapping near the boundary when conn
+// count oscillates ±1 around the threshold.
+func TestRun_HysteresisFloorPreservedAboveMinActive(t *testing.T) {
+	src := newFake(8)
+	src.setConns(0)
 	cfg := Config{
 		Enabled: true, StartHigh: true,
 		MinActive: 2, TargetConnsPerWorker: 20,
@@ -205,9 +233,9 @@ func TestRun_StartHighScalesDownOnIdle(t *testing.T) {
 	defer cancel()
 	Run(ctx, src, cfg)
 
-	// After scale-down with idle=0 conns, active should reach MinActive=2.
-	if got := src.numActive(); got != 2 {
-		t.Errorf("expected scale-down to MinActive=2, got %d active", got)
+	// Floor is MinActive + hyst = 3.
+	if got := src.numActive(); got != 3 {
+		t.Errorf("expected scale-down floor at MinActive+hyst=3, got %d active", got)
 	}
 }
 
