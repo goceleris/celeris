@@ -126,13 +126,13 @@ func TestResolve_DisabledByDefault(t *testing.T) {
 // spinning up an engine. PauseWorker / ResumeWorker calls are tracked
 // per worker.
 type fakeSource struct {
-	mu          sync.Mutex
-	numWorkers  int
-	conns       int64
-	gen         uint64
-	pauseLog    []int
-	resumeLog   []int
-	paused      []bool
+	mu         sync.Mutex
+	numWorkers int
+	conns      int64
+	gen        uint64
+	pauseLog   []int
+	resumeLog  []int
+	paused     []bool
 }
 
 func newFake(n int) *fakeSource { return &fakeSource{numWorkers: n, paused: make([]bool, n)} }
@@ -202,7 +202,7 @@ func TestRun_StartHighScalesDownOnIdle(t *testing.T) {
 	cfg := Config{
 		Enabled: true, StartHigh: true,
 		MinActive: 2, TargetConnsPerWorker: 20,
-		Interval: 5 * time.Millisecond,
+		Interval:    5 * time.Millisecond,
 		ScaleUpStep: 2, ScaleDownStep: 1,
 		ScaleDownHysteresis: 0, ScaleDownIdleTicks: 2,
 	}
@@ -225,7 +225,7 @@ func TestRun_HysteresisFloorPreservedAboveMinActive(t *testing.T) {
 	cfg := Config{
 		Enabled: true, StartHigh: true,
 		MinActive: 2, TargetConnsPerWorker: 20,
-		Interval: 5 * time.Millisecond,
+		Interval:    5 * time.Millisecond,
 		ScaleUpStep: 2, ScaleDownStep: 1,
 		ScaleDownHysteresis: 1, ScaleDownIdleTicks: 2,
 	}
@@ -246,7 +246,7 @@ func TestRun_StartLowScalesUpOnLoad(t *testing.T) {
 	cfg := Config{
 		Enabled: true, StartHigh: false,
 		MinActive: 2, TargetConnsPerWorker: 20,
-		Interval: 5 * time.Millisecond,
+		Interval:    5 * time.Millisecond,
 		ScaleUpStep: 4, ScaleDownStep: 1,
 		ScaleDownHysteresis: 1, ScaleDownIdleTicks: 100,
 	}
@@ -270,7 +270,7 @@ func TestRun_GenerationChangeRebaselines(t *testing.T) {
 	cfg := Config{
 		Enabled: true, StartHigh: true,
 		MinActive: 2, TargetConnsPerWorker: 20,
-		Interval: 5 * time.Millisecond,
+		Interval:    5 * time.Millisecond,
 		ScaleUpStep: 2, ScaleDownStep: 1,
 		ScaleDownHysteresis: 1, ScaleDownIdleTicks: 100,
 	}

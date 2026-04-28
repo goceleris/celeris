@@ -1,7 +1,8 @@
 // leak probe: run celeris N times in same process, capture goroutine count + heap stats between runs.
 //
 // Usage:
-//   ENG=iouring N=5 DUR=15 go run ./cmd/leakprobe
+//
+//	ENG=iouring N=5 DUR=15 go run ./cmd/leakprobe
 package main
 
 import (

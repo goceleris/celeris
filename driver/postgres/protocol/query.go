@@ -408,11 +408,14 @@ type HandleCallbacks struct {
 	OnRowFn     func([][]byte)
 }
 
+// OnRowDesc forwards to the configured OnRowDescFn (no-op when nil).
 func (c HandleCallbacks) OnRowDesc(cols []ColumnDesc) {
 	if c.OnRowDescFn != nil {
 		c.OnRowDescFn(cols)
 	}
 }
+
+// OnRow forwards to the configured OnRowFn (no-op when nil).
 func (c HandleCallbacks) OnRow(fields [][]byte) {
 	if c.OnRowFn != nil {
 		c.OnRowFn(fields)

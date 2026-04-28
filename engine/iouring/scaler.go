@@ -19,12 +19,12 @@ type iouringScalerSource struct {
 	activeConns *atomic.Int64
 }
 
-func (s *iouringScalerSource) NumWorkers() int       { return s.e.NumWorkers() }
-func (s *iouringScalerSource) ActiveConns() int64    { return s.activeConns.Load() }
-func (s *iouringScalerSource) PauseWorker(i int)     { s.e.PauseWorker(i) }
-func (s *iouringScalerSource) ResumeWorker(i int)    { s.e.ResumeWorker(i) }
-func (s *iouringScalerSource) Generation() uint64    { return 0 }
-func (s *iouringScalerSource) Logger() *slog.Logger  { return s.e.cfg.Logger }
+func (s *iouringScalerSource) NumWorkers() int      { return s.e.NumWorkers() }
+func (s *iouringScalerSource) ActiveConns() int64   { return s.activeConns.Load() }
+func (s *iouringScalerSource) PauseWorker(i int)    { s.e.PauseWorker(i) }
+func (s *iouringScalerSource) ResumeWorker(i int)   { s.e.ResumeWorker(i) }
+func (s *iouringScalerSource) Generation() uint64   { return 0 }
+func (s *iouringScalerSource) Logger() *slog.Logger { return s.e.cfg.Logger }
 
 // runScaler is started by Engine.Listen when scaler config is enabled.
 // All algorithm logic lives in engine/scaler; this is a thin source

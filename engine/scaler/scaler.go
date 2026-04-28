@@ -87,15 +87,15 @@ func Resolve(cfg resource.Config, numWorkers int) Config {
 }
 
 func fromTyped(c *resource.WorkerScalingConfig, numWorkers int) Config {
-	min := c.MinActive
-	if min == 0 {
-		min = numWorkers / 2
-		if min < 2 {
-			min = 2
+	minActive := c.MinActive
+	if minActive == 0 {
+		minActive = numWorkers / 2
+		if minActive < 2 {
+			minActive = 2
 		}
 	}
-	if min > numWorkers {
-		min = numWorkers
+	if minActive > numWorkers {
+		minActive = numWorkers
 	}
 	target := c.TargetConnsPerWorker
 	if target == 0 {
@@ -124,7 +124,7 @@ func fromTyped(c *resource.WorkerScalingConfig, numWorkers int) Config {
 	return Config{
 		Enabled:              true,
 		StartHigh:            c.Strategy != resource.ScalingStrategyStartLow,
-		MinActive:            min,
+		MinActive:            minActive,
 		TargetConnsPerWorker: target,
 		Interval:             interval,
 		ScaleUpStep:          upStep,
@@ -145,15 +145,15 @@ func fromEnv(numWorkers int) Config {
 		return def
 	}
 	enabled := getInt("CELERIS_DYN_WORKERS", 0) != 0
-	min := getInt("CELERIS_DYN_MIN", numWorkers/2)
-	if min < 1 {
-		min = 1
+	minActive := getInt("CELERIS_DYN_MIN", numWorkers/2)
+	if minActive < 1 {
+		minActive = 1
 	}
-	if min > numWorkers {
-		min = numWorkers
+	if minActive > numWorkers {
+		minActive = numWorkers
 	}
 	return Config{
-		Enabled:              enabled,
+		Enabled: enabled,
 		// Defaults to true (data-validated; matches the typed-config
 		// Strategy=ScalingStrategyStartHigh default). start-low pauses
 		// workers BEFORE the engine has finished settling its listen
@@ -162,8 +162,8 @@ func fromEnv(numWorkers int) Config {
 		// in the v1.4.1 strict-matrix run on get-json-64k-h2/adaptive
 		// before this change). Users who explicitly want start-low can
 		// set CELERIS_DYN_START_HIGH=0.
-		StartHigh: os.Getenv("CELERIS_DYN_START_HIGH") != "0",
-		MinActive:            min,
+		StartHigh:            os.Getenv("CELERIS_DYN_START_HIGH") != "0",
+		MinActive:            minActive,
 		TargetConnsPerWorker: getInt("CELERIS_DYN_TARGET", 20),
 		Interval:             time.Duration(getInt("CELERIS_DYN_INTERVAL", 250)) * time.Millisecond,
 		ScaleUpStep:          getInt("CELERIS_DYN_UPSTEP", 2),

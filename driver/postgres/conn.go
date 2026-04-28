@@ -1606,7 +1606,13 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 // pays Parse + Describe + Bind + Execute in one flight (same as pgx);
 // subsequent calls skip Parse.
 func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if c.autoCache && isCacheableQuery(query) {
+	// autoCache only helps arg-bearing queries: extended-protocol caching
+	// turns Parse+Bind+Describe+Execute+Sync (5 frames) into Bind+Execute
+	// +Sync (3 frames). For arg-less literal SQL (e.g. SELECT 1), the
+	// simple Q frame is already a single round-trip — caching adds the
+	// prepared-statement overhead without saving anything, and routes
+	// past simple-query test fixtures that only handle the Q frame.
+	if c.autoCache && len(args) > 0 && isCacheableQuery(query) {
 		if stmt, ok := c.stmtCache.get(query); ok {
 			// Cached: skip the server-side Describe round-trip; we
 			// already know the row description from the initial prep.

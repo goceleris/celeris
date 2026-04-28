@@ -295,12 +295,9 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 			// SetHeaderTrust / AppendRespHeader require the caller to
 			// guarantee the invariant, and content-type / content-length
 			// added in Context.Blob are either an inline-stripped string
-			// or a pure-digit length. Skipping the per-header
-			// appendSanitizedHeaderField scan saves ~2.24 % CPU on the
-			// realistic-API hot path (validated 2026-04-28). Defense-in-depth
-			// for unvalidated input lives in appendSanitizedHeaderField,
-			// kept for paths (error replies, h2 trailers) that may take
-			// non-Context input.
+			// or a pure-digit length. Skipping the per-header CRLF scan
+			// saves ~2.24 % CPU on the realistic-API hot path (validated
+			// 2026-04-28).
 			buf = append(buf, h[0]...)
 			buf = append(buf, ": "...)
 			buf = append(buf, h[1]...)
@@ -751,9 +748,6 @@ func statusText(code int) string {
 	}
 }
 
-// appendSanitizedHeaderField appends s to buf, stripping any \r or \n bytes
-// to prevent HTTP response splitting (CWE-113). This is a defense-in-depth
-// measure; the public API (Context.SetHeader) also strips CRLF.
 // h1 streaming support — h1ResponseAdapter implements stream.Streamer.
 
 func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers [][2]string) error {
@@ -875,23 +869,6 @@ func (a *h2ResponseAdapter) Close(s *stream.Stream) error {
 
 var _ stream.Streamer = (*h1ResponseAdapter)(nil)
 var _ stream.Streamer = (*h2ResponseAdapter)(nil)
-
-func appendSanitizedHeaderField(buf []byte, s string) []byte {
-	// Fast path: most header fields have no CRLF.
-	for i := range len(s) {
-		if s[i] == '\r' || s[i] == '\n' {
-			// Slow path: copy bytes, skipping CR/LF.
-			for j := range len(s) {
-				b := s[j]
-				if b != '\r' && b != '\n' {
-					buf = append(buf, b)
-				}
-			}
-			return buf
-		}
-	}
-	return append(buf, s...)
-}
 
 func writeErrorResponse(write func([]byte), status int, message string) {
 	pooled := getResponseBuffer()
