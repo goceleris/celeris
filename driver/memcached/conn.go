@@ -99,6 +99,13 @@ type memcachedConn struct {
 	onRecvFn  func([]byte)
 	onCloseFn func(error)
 
+	// pollIsDoneFn is the cached method value used by execBinaryMulti's
+	// WriteAndPollMulti call. It reads c.state.multiPollLastReq instead
+	// of capturing the local req variable, so it can be created once at
+	// dial time and reused — saving one closure allocation per binary-
+	// multi-packet op (GETM, STATS, BIN-MGET).
+	pollIsDoneFn func() bool
+
 	state *mcState
 	cfg   Config
 
@@ -202,6 +209,7 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	}
 	c.onRecvFn = c.onRecv
 	c.onCloseFn = c.onClose
+	c.pollIsDoneFn = c.pollIsDone
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
 	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
@@ -277,6 +285,14 @@ func (c *memcachedConn) onClose(err error) {
 	c.closeErr.Store(&errBox{err: err})
 	c.closed.Store(true)
 	c.state.drainWithError(err)
+}
+
+// pollIsDone is the eventloop.WriteAndPollMulti predicate. Bound as a
+// cached method value (pollIsDoneFn) at dial time so binary multi-packet
+// ops can reuse it without allocating a fresh closure on every call.
+func (c *memcachedConn) pollIsDone() bool {
+	last := c.state.multiPollLastReq
+	return last != nil && last.finished.Load()
 }
 
 // handshake runs per-protocol validation. Text protocol has no handshake;
@@ -480,8 +496,9 @@ func (c *memcachedConn) execBinaryMulti(
 		// piggybacks on req.finished, which dispatchBinaryMulti flips once
 		// the terminator packet is parsed.
 		if c.syncMulti != nil {
-			isDone := func() bool { return req.finished.Load() }
-			ok, err := c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecvFn, isDone, nil)
+			c.state.multiPollLastReq = req
+			ok, err := c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, nil)
+			c.state.multiPollLastReq = nil
 			c.writerMu.Unlock()
 			if err != nil {
 				_ = c.closeWithErr(err)
