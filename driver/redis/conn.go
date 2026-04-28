@@ -103,6 +103,14 @@ type redisConn struct {
 	// Allocated lazily on first use.
 	syncBuf []byte
 
+	// onRecvFn / onCloseFn cache the method-value closures bound to this
+	// redisConn. Hot sync paths (WriteAndPoll on every command, every
+	// pipeline) would otherwise re-create `c.onRecv` per call, which Go's
+	// compiler heap-allocates whenever the receiver escapes into a func
+	// argument.
+	onRecvFn  func([]byte)
+	onCloseFn func(error)
+
 	state *redisState
 	cfg   Config
 
@@ -271,9 +279,11 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 	if smrt, ok := loop.(syncMultiRoundTripper); ok {
 		c.syncMulti = smrt
 	}
+	c.onRecvFn = c.onRecv
+	c.onCloseFn = c.onClose
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecv, c.onClose); err != nil {
+	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
 		// Close via file.Close() to disarm the *os.File finalizer; a plain
 		// syscall.Close(fd) would leak the finalizer and risk a double
 		// close on a reassigned fd when GC later runs it.
@@ -466,9 +476,9 @@ func (c *redisConn) exec(ctx context.Context, args ...string) (*redisRequest, er
 		var ok bool
 		var err error
 		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
 		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
 		}
 		c.writerMu.Unlock()
 		if err != nil {
@@ -571,7 +581,7 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 				c.state.bridge.Enqueue(reqs[i])
 			}
 		}
-		ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecv, isDone, beforeRearm)
+		ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, isDone, beforeRearm)
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)
