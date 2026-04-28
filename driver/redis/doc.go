@@ -243,11 +243,11 @@
 //	    return tx.Exec(ctx)
 //	}, "{user:123}:visits")
 //
-// # Known limitations (v1.4.0)
+// # Known limitations
 //
-//   - TLS (rediss://) is not supported in v1.4.0; the scheme is rejected
-//     in [NewClient] with a clear error. Deploy over VPC, loopback, or a
-//     sidecar TLS terminator. TLS support is planned for v1.4.x.
+//   - TLS (rediss://) is not yet supported; the scheme is rejected in
+//     [NewClient] with a clear error. Deploy over VPC, loopback, or a
+//     sidecar TLS terminator.
 //   - Cluster ([ClusterClient]) and Sentinel ([SentinelClient]) are supported.
 //     MOVED/ASK redirects are handled transparently by ClusterClient; Sentinel
 //     auto-discovers the master and handles failovers via +switch-master.

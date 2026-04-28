@@ -21,7 +21,7 @@ type Client struct {
 // established lazily on first command.
 func NewClient(addr string, opts ...Option) (*Client, error) {
 	if strings.HasPrefix(addr, "rediss://") {
-		return nil, errors.New("celeris-redis: TLS (rediss://) is not supported in v1.4.0; use redis:// for VPC/loopback deployments or wait for v1.4.x TLS support")
+		return nil, errors.New("celeris-redis: TLS (rediss://) is not yet supported; use redis:// for VPC/loopback deployments")
 	}
 	// Strip redis:// prefix if present.
 	addr = strings.TrimPrefix(addr, "redis://")

@@ -7,7 +7,7 @@
 // [Store.Close] to stop the goroutine in tests or graceful shutdown
 // paths.
 //
-// TLS: driver/postgres v1.4.0 does not support sslmode=require; use
+// TLS: driver/postgres does not yet support sslmode=require; use
 // sslmode=disable on loopback / VPC deployments.
 package postgresstore
 
