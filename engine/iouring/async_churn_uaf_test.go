@@ -34,7 +34,7 @@ func (h *asyncChurnHandler) HandleStream(_ context.Context, s *stream.Stream) er
 }
 
 // TestAsyncChurnNoUseAfterFree is a smoke test for the close path that
-// was hardened to fix the SIGSEGV observed in the v1.5.0 strict matrix
+// was hardened to fix the SIGSEGV observed in the v1.4.1 strict matrix
 // on churn-close × celeris-iouring-auto+upg-async (~5 h to reproduce).
 //
 // Root cause: finishCloseDetached did not queue cs in pendingRelease

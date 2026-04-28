@@ -1,6 +1,6 @@
 //go:build memcached_cluster_failover
 
-// Cluster failover conformance: exercises the v1.5.0 node-failure
+// Cluster failover conformance: exercises the v1.4.1 node-failure
 // detection, passive-heal, and background-probe paths against a real
 // 3-node memcached deployment. Gated by the `memcached_cluster_failover`
 // build tag and the CELERIS_MEMCACHED_CLUSTER_ADDRS environment variable

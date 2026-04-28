@@ -63,7 +63,7 @@ func TestAllocBudgets(t *testing.T) {
 		// string(Key) × 10 (10 allocs) + output map + bridge overhead +
 		// fake response construction. Improving further requires a
 		// per-request slab allocation that replaces the per-value copies
-		// — tracked for v1.5.0.
+		// — tracked for v1.4.1.
 		{name: "GetMulti_10", budget: 26, bench: benchGetMulti10},
 		{name: "PoolAcquireRelease", budget: 0, bench: benchPoolAcquireRelease},
 	}
