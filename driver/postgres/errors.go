@@ -8,8 +8,8 @@ import (
 
 // ErrSSLNotSupported is returned from Connect / Open when the DSN requests
 // sslmode=require, verify-ca, or verify-full. Plaintext (sslmode=disable or
-// prefer) is the only supported mode in v1.4.0.
-var ErrSSLNotSupported = errors.New("celeris-postgres: TLS/SSL not supported in v1.4.0; use sslmode=disable for VPC/loopback deployments or wait for v1.4.x TLS support")
+// prefer) is the only mode the driver currently supports.
+var ErrSSLNotSupported = errors.New("celeris-postgres: TLS/SSL is not yet supported; use sslmode=disable for VPC/loopback deployments, or terminate TLS at a sidecar / VPC boundary")
 
 // ErrUnsupportedAuth is returned when the server demands an authentication
 // method this driver cannot fulfill (for example GSS, SSPI, or a SASL

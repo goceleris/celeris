@@ -266,8 +266,8 @@ func applyDefaults(d *DSN) {
 //     got none.
 //   - "require" / "verify-ca" / "verify-full" : TLS is mandatory;
 //     rejected with ErrSSLNotSupported. Users with managed
-//     cloud DBs (RDS, CloudSQL, etc.) must wait for v1.4.x
-//     TLS support.
+//     cloud DBs (RDS, CloudSQL, etc.) need to terminate TLS at a
+//     sidecar / VPC boundary until first-class TLS support lands.
 func (d *DSN) CheckSSL() error {
 	switch strings.ToLower(d.Options.SSLMode) {
 	case "", "disable":
@@ -278,7 +278,7 @@ func (d *DSN) CheckSSL() error {
 		// see the mismatch at startup instead of discovering it in
 		// production.
 		fmt.Fprintf(os.Stderr,
-			"celeris-postgres: sslmode=%s silently downgraded to plaintext — v1.4.0 has no TLS stack (use sslmode=disable explicitly, or wait for v1.4.x TLS support)\n",
+			"celeris-postgres: sslmode=%s silently downgraded to plaintext — driver has no TLS stack yet (set sslmode=disable explicitly to silence this warning, or terminate TLS at a sidecar / VPC boundary)\n",
 			d.Options.SSLMode)
 		return nil
 	case "require", "verify-ca", "verify-full":

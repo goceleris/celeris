@@ -204,12 +204,11 @@
 // underlying query that were deferred until iteration completed (e.g.
 // cancellation, network errors, or server-side errors on large result sets).
 //
-// # Known limitations (v1.4.0)
+// # Known limitations
 //
-//   - TLS is not supported in v1.4.0. sslmode=require, verify-ca, and
-//     verify-full are rejected at [Open] time with [ErrSSLNotSupported].
-//     Deploy over VPC, loopback, or a sidecar TLS terminator. TLS support
-//     is planned for v1.4.x.
+//   - TLS is not yet supported. sslmode=require, verify-ca, and verify-full
+//     are rejected at [Open] time with [ErrSSLNotSupported]. Deploy over
+//     VPC, loopback, or a sidecar TLS terminator.
 //   - Result sets are fully buffered before Rows.Next returns — there is no
 //     true row-by-row streaming. Callers with large result sets should page
 //     via LIMIT/OFFSET or a server-side DECLARE CURSOR inside a transaction.

@@ -4,10 +4,92 @@
 
 | Version        | Supported          |
 |----------------|--------------------|
-| >= 1.3.0       | Yes                |
+| >= 1.4.0       | Yes                |
+| 1.3.0 – 1.3.4  | Critical fixes only |
 | < 1.3.0        | No                 |
 
-Only the latest minor release receives security patches. Upgrade to the latest version to ensure you have all fixes.
+Only the latest minor release receives feature-level security patches.
+The 1.3.x line continues to receive critical fixes for vulnerabilities
+that cannot be mitigated by upgrading. Upgrade to the latest 1.4.x for
+all fixes.
+
+### v1.4.1 Security Improvements
+
+v1.4.1 ships the middleware × driver integration milestone, the dynamic
+worker scaler, memcached cluster failover, and a sweep of driver/middleware
+hot-path optimizations. Security-relevant changes:
+
+- **`middleware/overload` shedding ladder**: 5-stage controller with CPU
+  + queue-depth + tail-latency-EMA signals returns 503 + Retry-After at
+  saturation. Designed to keep an overloaded process from cascading into
+  total unavailability under DoS-shaped traffic. Defaults are
+  conservative; the alloc-budget guard test pins the Normal-stage path
+  at zero allocations so the middleware itself cannot become a bottleneck.
+- **`middleware/idempotency` lock state machine**: client-supplied
+  `Idempotency-Key` header is matched against a `store.SetNXer`-backed
+  lock entry; concurrent duplicates while the original is in-flight
+  return 409 (no double-execute), and replays serve the cached response
+  for the configured TTL. Lock entries are released on handler
+  completion or expire after `LockTimeout` so a crashed handler does not
+  permanently block the key. Constant-time key comparison via
+  `subtle.ConstantTimeCompare`.
+- **`middleware/cache` Cache-Control honoring**: by default, response
+  `Cache-Control` directives (`no-store`, `private`, `max-age`) cap the
+  effective TTL. `Set-Cookie` is excluded from stored headers by default
+  to prevent session-cookie leakage between users. `Vary` header
+  components are folded into the cache key to prevent cross-user replay
+  on shared keys.
+- **`middleware/store` unified `KV` interface**: session, csrf, ratelimit,
+  cache, idempotency, and JWKS cache all share the same byte-level
+  contract. `Prefixed` namespace helper prevents key collisions when a
+  single Redis / Postgres instance backs multiple middlewares; without
+  it a CSRF token store and a session store could overwrite each other.
+  Backed adapters: in-memory LRU (sharded), Redis (`GETDEL` for atomic
+  single-use, falls back to `GET+DEL` on Redis < 6.2 via `OldRedisCompat`),
+  Postgres (`ON CONFLICT` upsert + background expiry sweep), memcached.
+- **`Context.SetHeaderTrust` / `Context.AppendRespHeader`**: new
+  fast-path response-header verbs that skip the CRLF / NUL sanitize
+  scan. Documented as caller-asserted invariants — used internally by
+  `requestid`, `secure`, and `ratelimit` after one-time validation at
+  middleware construction. Not for user-supplied input. The full
+  `SetHeader` / `AddHeader` verbs continue to sanitize.
+- **`auto_cache_statements` default flip**: `Pool.Open` and
+  `NewConnector` now default `auto_cache_statements=true` (matching pgx).
+  Cached prepared statements are scoped per connection and discarded on
+  conn close; no cross-conn leakage. Opt out per DSN with
+  `auto_cache_statements=false` for environments that need the
+  simple-query semantics (e.g. server-side trigger-driven caches).
+- **memcached cluster failover**: `pickNode` successor walk is
+  deterministic so a node-down event does not silently route writes to
+  a different shard's read-replica. `recordResult` uses a hysteresis
+  threshold to prevent thrashing. Stale reads during failover are
+  surfaced as transient errors rather than silently served from a
+  potentially-stale node.
+
+### v1.4.0 Security Improvements
+
+v1.4.0 introduces the native PostgreSQL, Redis, and memcached drivers
+plus H2C upgrade support and the EventLoopProvider plumbing. Security
+posture is conservative:
+
+- **TLS not implemented**: `driver/postgres` rejects `sslmode=require /
+  verify-ca / verify-full` with `ErrSSLNotSupported` rather than
+  silently downgrading. `sslmode=prefer / allow` emit a stderr warning
+  before downgrading to plaintext. `driver/redis` rejects `rediss://`
+  URLs at `NewClient` time. Until first-class TLS lands, deploy over
+  VPC, loopback, or terminate at a sidecar TLS proxy.
+- **PG SCRAM-SHA-256 only**: cleartext / MD5 / trust + SCRAM-SHA-256
+  (without channel binding) are supported. GSS, SSPI, Kerberos,
+  SCRAM-SHA-256-PLUS, and other SASL mechanisms are rejected — no
+  silent fallback to a weaker auth path.
+- **Driver `WithEngine` deadlock fix**: when an engine's `WorkerLoop`
+  does not implement `syncRoundTripper`, drivers fall back to direct
+  mode (Go netpoll) instead of deadlocking. Prevents a pool-exhaustion
+  DoS on a misconfigured server.
+- **H2C upgrade single-token Upgrade enforcement**: RFC 7540 §3.2
+  requires `Upgrade: h2c` to be the sole token. Multi-token Upgrade
+  headers (e.g. `Upgrade: websocket, h2c`) are disqualified to prevent
+  ambiguity attacks against simultaneous WebSocket / H2 negotiation.
 
 ### v1.3.4 Security Improvements
 
@@ -114,7 +196,12 @@ This policy covers the core `github.com/goceleris/celeris` module and all in-tre
 - Body size enforcement (MaxRequestBodySize across H1, H2, bridge)
 - Callback safety (OnExpectContinue, OnConnect, OnDisconnect)
 - All in-tree middleware packages (`middleware/`)
-- Sub-module middleware (`middleware/compress`, `middleware/metrics`, `middleware/otel`)
+- The `middleware/store` unified `KV` substrate plus the bundled adapters
+  (in-memory LRU, Redis, Postgres, memcached)
+- Native drivers: `driver/postgres`, `driver/redis`, `driver/memcached`
+  (wire-protocol parsers, auth handshakes, cluster failover state)
+- Sub-module middleware (`middleware/compress`, `middleware/metrics`,
+  `middleware/otel`, `middleware/protobuf`)
 
 ### Out of Scope
 
