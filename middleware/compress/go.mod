@@ -16,6 +16,5 @@ require (
 
 // In the monorepo, build against the in-tree celeris core so submodule
 // tests catch core breakage immediately. External consumers ignore this
-// directive — they get the published v1.3.3 (or whatever the require above
-// names).
+// directive — they pull whatever the `require` block above names.
 replace github.com/goceleris/celeris => ../../

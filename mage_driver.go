@@ -1,6 +1,7 @@
 //go:build mage
 
-// Package main — mage targets for the v1.4.0 profile-driven optimization loop.
+// Package main — mage targets for the driver profile-driven
+// optimization loop (PG / Redis / memcached).
 //
 // These targets gate correctness before benchmarking (PreBench), capture
 // per-subsystem baselines (BaselineBench), deep-dive individual driver
