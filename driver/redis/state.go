@@ -185,6 +185,14 @@ type redisState struct {
 	syncPipeReqs []*redisRequest
 	syncPipeIdx  int
 
+	// multiPollLastReq is the last request in the current sync pipeline
+	// batch — read by the cached pollIsDone method value to break out of
+	// the WriteAndPollMulti spin once the terminal response is parsed.
+	// Set by execManyCore immediately before WriteAndPollMulti and cleared
+	// in pollBeforeRearm. A field (rather than a per-call closure capture)
+	// keeps the func() bool / func() callbacks alloc-free.
+	multiPollLastReq *redisRequest
+
 	// copySlab is a single contiguous buffer used by copyValueSlab to batch
 	// all string copies during a sync pipeline dispatch. Instead of one
 	// allocation per response, all Str bytes are appended to this slab and

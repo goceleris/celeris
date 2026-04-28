@@ -111,6 +111,15 @@ type redisConn struct {
 	onRecvFn  func([]byte)
 	onCloseFn func(error)
 
+	// pollIsDoneFn / pollBeforeRearmFn are cached method values used by
+	// execManyCore's WriteAndPollMulti call. They read per-call state
+	// from c.state (multiPollLastReq, syncPipeReqs, syncPipeIdx) instead
+	// of capturing local variables, so they can be created once at dial
+	// time and re-used per pipeline batch — saving two closure allocations
+	// per Exec call.
+	pollIsDoneFn      func() bool
+	pollBeforeRearmFn func()
+
 	state *redisState
 	cfg   Config
 
@@ -281,6 +290,8 @@ func dialRedisConn(ctx context.Context, prov engine.EventLoopProvider, cfg Confi
 	}
 	c.onRecvFn = c.onRecv
 	c.onCloseFn = c.onClose
+	c.pollIsDoneFn = c.pollIsDone
+	c.pollBeforeRearmFn = c.pollBeforeRearm
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
 	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
@@ -317,6 +328,30 @@ func (c *redisConn) onClose(err error) {
 	c.closed.Store(true)
 	c.state.drainWithError(err)
 	c.notifyPubSubClose(err)
+}
+
+// pollIsDone is the eventloop.WriteAndPollMulti predicate. Bound as a
+// cached method value (pollIsDoneFn) at dial time so repeated Pipeline
+// calls can reuse it without allocating a closure each invocation.
+func (c *redisConn) pollIsDone() bool {
+	last := c.state.multiPollLastReq
+	return last != nil && last.finished.Load()
+}
+
+// pollBeforeRearm is the eventloop.WriteAndPollMulti pre-rearm callback.
+// It runs under recvMu, with EPOLLIN still masked, and transitions any
+// un-dispatched requests from sync-pipeline (direct-index) dispatch to
+// bridge (queue) dispatch so the event loop can deliver any remaining
+// responses cleanly. Bound once at dial time.
+func (c *redisConn) pollBeforeRearm() {
+	dispatched := c.state.syncPipeIdx
+	reqs := c.state.syncPipeReqs
+	c.state.syncPipeReqs = nil
+	c.state.syncPipeIdx = 0
+	c.state.multiPollLastReq = nil
+	for i := dispatched; i < len(reqs); i++ {
+		c.state.bridge.Enqueue(reqs[i])
+	}
 }
 
 // writeCommand encodes and sends one command. The writer's internal buffer
@@ -565,23 +600,13 @@ func (c *redisConn) execManyCore(ctx context.Context, data []byte, reqs []*redis
 		c.state.copySlab = c.state.copySlab[:0]
 		c.state.syncPipeReqs = reqs
 		c.state.syncPipeIdx = 0
-		lastReq := reqs[n-1]
-		isDone := func() bool {
-			return lastReq.finished.Load()
-		}
-		// beforeRearm runs under recvMu before EPOLLIN is re-armed. It
-		// transitions from direct-index dispatch to bridge dispatch so the
-		// event loop can deliver any remaining responses.
-		beforeRearm := func() {
-			dispatched := c.state.syncPipeIdx
-			c.state.syncPipeReqs = nil
-			c.state.syncPipeIdx = 0
-			// Enqueue remaining (un-dispatched) requests into the bridge.
-			for i := dispatched; i < n; i++ {
-				c.state.bridge.Enqueue(reqs[i])
-			}
-		}
-		ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, isDone, beforeRearm)
+		c.state.multiPollLastReq = reqs[n-1]
+		// pollIsDoneFn / pollBeforeRearmFn are bound once at dial time and
+		// read per-call state (multiPollLastReq, syncPipeReqs, syncPipeIdx)
+		// from c.state. Passing them here avoids the two closure allocations
+		// that capturing lastReq/n/reqs/dispatched inline used to incur on
+		// every Pipeline.Exec.
+		ok, err := c.syncMulti.WriteAndPollMulti(c.fd, data, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, c.pollBeforeRearmFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			_ = c.closeWithErr(err)
