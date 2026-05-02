@@ -73,8 +73,6 @@ func ClusterDeploy() error {
 		"--extra-vars", "runner_binary_arm64=" + bins.runnerArm64,
 		"--extra-vars", "loadgen_binary_amd64=" + bins.loadgenAmd64,
 		"--extra-vars", "results_local_dir=" + bins.resultsLocal,
-		// Skip the actual bench step on a deploy-only run.
-		"--start-at-task", "Stage binaries on bench targets",
 	}
 	cmd := exec.Command("ansible-playbook", args...)
 	cmd.Dir = clusterAnsibleDir
@@ -105,7 +103,7 @@ func ClusterBench() error {
 	runs := envOrDefault("CLUSTER_RUNS", "3")
 	duration := envOrDefault("CLUSTER_DURATION", "5s")
 	warmup := envOrDefault("CLUSTER_WARMUP", "1s")
-	cells := envOrDefault("CLUSTER_CELLS", "*/get-simple-1024c")
+	cells := envOrDefault("CLUSTER_CELLS", "get-simple-1024c/*")
 	if os.Getenv("CLUSTER_FULL_MATRIX") == "1" {
 		cells = "*"
 	}
@@ -224,9 +222,12 @@ func stageBinaries() (*clusterBins, error) {
 
 // buildLoadgenAmd64 cross-compiles the goceleris/loadgen CLI for
 // linux/amd64. Tries (in order):
-//  1. Sibling clone at ../loadgen (typical dev-machine layout)
-//  2. `go install` from a temp module — pulls the pinned version from
-//     the celeris go.mod
+//  1. Sibling clone — walks up from cwd looking for any ancestor with
+//     a "loadgen/cmd/loadgen" subtree. Typical dev layout has celeris
+//     and loadgen as siblings under a single goceleris/ root.
+//  2. Temp go.mod that requires github.com/goceleris/loadgen, then
+//     `go build -o <out>` the cmd path. This sidesteps the "go install
+//     cannot cross-compile when GOBIN is set" restriction.
 //
 // Path 1 is preferred because it builds whatever the developer has
 // locally; path 2 is the fallback for clean machines / CI.
@@ -235,15 +236,11 @@ func buildLoadgenAmd64(outputPath string) error {
 	if err != nil {
 		return err
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	sibling := filepath.Join(filepath.Dir(cwd), "loadgen")
-	if st, err := os.Stat(sibling); err == nil && st.IsDir() {
-		fmt.Printf("  building from sibling clone at %s\n", sibling)
+
+	if siblingPath, ok := findLoadgenSibling(); ok {
+		fmt.Printf("  building from sibling clone at %s\n", siblingPath)
 		cmd := exec.Command("go", "build", "-o", absOut, "./cmd/loadgen")
-		cmd.Dir = sibling
+		cmd.Dir = siblingPath
 		cmd.Env = append(os.Environ(),
 			"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
 		)
@@ -251,31 +248,56 @@ func buildLoadgenAmd64(outputPath string) error {
 		cmd.Stderr = os.Stderr
 		return cmd.Run()
 	}
-	fmt.Println("  no sibling loadgen clone — falling back to `go install`")
-	tmpHome, err := os.MkdirTemp("", "celeris-loadgen-build-")
+
+	fmt.Println("  no sibling loadgen clone — fetching via temp module")
+	tmpDir, err := os.MkdirTemp("", "celeris-loadgen-build-")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpHome)
-	cmd := exec.Command("go", "install", "github.com/goceleris/loadgen/cmd/loadgen@latest")
-	cmd.Env = append(os.Environ(),
-		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
-		"GOPATH="+tmpHome,
-		"GOBIN="+filepath.Dir(absOut),
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	defer os.RemoveAll(tmpDir)
+
+	// Bootstrap a one-shot module that depends on loadgen.
+	gomod := "module loadgen-builder\n\ngo 1.26\n\nrequire github.com/goceleris/loadgen latest\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(gomod), 0o644); err != nil {
 		return err
 	}
-	// `go install` puts it at GOBIN/loadgen — rename to absOut.
-	produced := filepath.Join(filepath.Dir(absOut), "loadgen")
-	if produced != absOut {
-		if err := os.Rename(produced, absOut); err != nil {
-			return err
-		}
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Dir = tmpDir
+	tidy.Stdout = os.Stdout
+	tidy.Stderr = os.Stderr
+	if err := tidy.Run(); err != nil {
+		return fmt.Errorf("loadgen go mod tidy: %w", err)
 	}
-	return nil
+	build := exec.Command("go", "build", "-o", absOut, "github.com/goceleris/loadgen/cmd/loadgen")
+	build.Dir = tmpDir
+	build.Env = append(os.Environ(),
+		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+	)
+	build.Stdout = os.Stdout
+	build.Stderr = os.Stderr
+	return build.Run()
+}
+
+// findLoadgenSibling walks up from cwd looking for a directory at any
+// ancestor level that contains a "loadgen/cmd/loadgen" subtree.
+// Returns the absolute path to the loadgen repo root if found.
+func findLoadgenSibling() (string, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	dir := cwd
+	for {
+		candidate := filepath.Join(dir, "loadgen", "cmd", "loadgen", "main.go")
+		if _, err := os.Stat(candidate); err == nil {
+			return filepath.Join(dir, "loadgen"), true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
 }
 
 func cleanupStaging(b *clusterBins) {

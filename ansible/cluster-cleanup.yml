@@ -10,9 +10,12 @@
   tasks:
     - name: Stop any lingering bench processes
       become: true
+      # Match by exact process name to avoid pkill self-killing
+      # (pkill -f matches argv, including its own command line).
       ansible.builtin.shell: |
-        pkill -f '{{ bench_root }}/runner' 2>/dev/null || true
-        pkill -f '{{ bench_root }}/loadgen' 2>/dev/null || true
+        pkill -x runner 2>/dev/null
+        pkill -x loadgen 2>/dev/null
+        true
       changed_when: false
 
     - name: Read dep manifest if present

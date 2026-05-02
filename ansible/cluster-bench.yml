@@ -25,6 +25,7 @@
 - name: Stage binaries on bench targets
   hosts: bench_targets
   gather_facts: true
+  tags: stage
   tasks:
     - name: Filter to selected bench_targets only
       ansible.builtin.meta: end_host
@@ -99,6 +100,7 @@
 - name: Stage loadgen on the loadgen host (msa2-client)
   hosts: loadgen
   gather_facts: true
+  tags: stage
   tasks:
     - name: Ensure transient dirs exist
       ansible.builtin.file:
@@ -119,6 +121,7 @@
   hosts: bench_targets
   gather_facts: false
   serial: 0    # parallelize across all selected hosts
+  tags: run
   tasks:
     - name: Filter to selected bench_targets only
       ansible.builtin.meta: end_host
@@ -157,9 +160,12 @@
       always:
         - name: Stop any leftover bench processes
           become: true
+          # Match by exact process name to avoid pkill self-killing
+          # (pkill -f matches argv, including its own command line).
           ansible.builtin.shell: |
-            pkill -f '{{ bench_root }}/runner' 2>/dev/null || true
-            pkill -f '{{ bench_root }}/loadgen' 2>/dev/null || true
+            pkill -x runner 2>/dev/null
+            pkill -x loadgen 2>/dev/null
+            true
           changed_when: false
 
         - name: Fetch results back to dev machine
@@ -176,6 +182,7 @@
 - name: Cluster cleanup (always — uninstall packages WE installed, drop staging dir)
   hosts: cluster
   gather_facts: false
+  tags: cleanup
   tasks:
     - name: Read manifest for cleanup
       ansible.builtin.slurp:

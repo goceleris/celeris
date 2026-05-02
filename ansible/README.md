@@ -40,7 +40,7 @@ The cluster nodes need only an SSH key and passwordless sudo for the
 | `CLUSTER_RUNS`       | `3`                                              | passes to runner `-runs`                               |
 | `CLUSTER_DURATION`   | `5s`                                             | passes to runner `-duration`                           |
 | `CLUSTER_WARMUP`     | `1s`                                             | passes to runner `-warmup`                             |
-| `CLUSTER_CELLS`      | `*/get-simple-1024c`                             | passes to runner `-cells` (smoke default)              |
+| `CLUSTER_CELLS`      | `get-simple-1024c/*`                             | passes to runner `-cells` (smoke default; format `<scenario>/<server>`)              |
 | `CLUSTER_FULL_MATRIX`| `0`                                              | `1` opts into the full sweep (overrides `CELLS`)       |
 
 ## Pristine semantics
