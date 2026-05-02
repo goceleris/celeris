@@ -188,6 +188,12 @@
         true
       changed_when: false
       when: inventory_hostname == bench_target
+      # Retry — SSH ControlMaster can briefly drop right after the bench
+      # finishes while the host's network buffers are still draining.
+      register: stop_result
+      until: stop_result is succeeded
+      retries: 3
+      delay: 5
 
     - name: Wait for mpstat samplers to finish writing
       ansible.builtin.shell: |
@@ -219,6 +225,10 @@
         - "{{ run_out_dir | default('') }}/server.pid"
         - "{{ run_out_dir | default('') }}/cpu.log"
       when: inventory_hostname == bench_target
+      register: fetch_target_result
+      until: fetch_target_result is succeeded
+      retries: 3
+      delay: 5
 
     - name: Fetch loadgen JSON + stderr + cpu sample (msa2-client)
       ansible.builtin.fetch:
@@ -231,6 +241,10 @@
         - "{{ loadgen_run_dir | default('') }}/loadgen.stderr"
         - "{{ loadgen_run_dir | default('') }}/cpu.log"
       when: inventory_hostname == "msa2-client"
+      register: fetch_loadgen_result
+      until: fetch_loadgen_result is succeeded
+      retries: 3
+      delay: 5
 
     - name: Drop bench staging dir
       ansible.builtin.file:

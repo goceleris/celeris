@@ -21,7 +21,24 @@
 all:
   vars:
     ansible_user: mini
-    ansible_ssh_common_args: '-o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=accept-new'
+    # SSH-over-Tailscale survives bench load if we tune the keepalive
+    # aggressively. Default ConnectTimeout (10s) and ServerAlive (off)
+    # were dropping ControlMaster mid-bench when the host's CPU/network
+    # buffers were saturated. New settings:
+    #   ConnectTimeout=60         — slow handshake under load is OK
+    #   ServerAliveInterval=10    — heartbeat every 10s
+    #   ServerAliveCountMax=18    — survive ~3 minutes of dropped heartbeats
+    #   ControlPersist=600s       — long-lived ControlMaster across cells
+    #   TCPKeepAlive=yes          — kernel-level keepalive too
+    ansible_ssh_common_args: >-
+      -o ControlMaster=auto
+      -o ControlPersist=600s
+      -o ConnectTimeout=60
+      -o ServerAliveInterval=10
+      -o ServerAliveCountMax=18
+      -o TCPKeepAlive=yes
+      -o StrictHostKeyChecking=accept-new
+    ansible_command_timeout: 120
     # All transient bench state lives under /tmp so a reboot wipes it.
     bench_root: /tmp/celeris-bench
     results_root: /tmp/celeris-results
