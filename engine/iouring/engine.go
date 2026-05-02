@@ -54,8 +54,12 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// SEND_ZC runtime probe with IORING_SEND_ZC_REPORT_USAGE.
 	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
 	if profile.SendZC {
-		zcResult := probeSendZC()
-		cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
+		zcResult, zcReason := probeSendZC()
+		if zcReason != "" {
+			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String(), "reason", zcReason)
+		} else {
+			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
+		}
 		switch zcResult {
 		case SendZCTrueZeroCopy:
 			// True zero-copy on this NIC — keep enabled.
@@ -68,9 +72,11 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 			profile.SendZC = false
 		}
 	}
-	if profile.FixedFiles && !probeFixedFiles() {
-		cfg.Logger.Info("fixed files runtime probe failed, disabling")
-		profile.FixedFiles = false
+	if profile.FixedFiles {
+		if ok, ffReason := probeFixedFiles(); !ok {
+			cfg.Logger.Info("fixed files runtime probe failed, disabling", "reason", ffReason)
+			profile.FixedFiles = false
+		}
 	}
 
 	tier := SelectTier(profile, 2*time.Second)

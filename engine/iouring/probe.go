@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"fmt"
 	"net"
 	"time"
 	"unsafe"
@@ -56,28 +57,28 @@ func (r SendZCProbeResult) String() string {
 // no DMA). On a real NIC with working zero-copy support, the result is
 // SendZCTrueZeroCopy. On ENA (AWS), the result is SendZCBroken because
 // the notification CQE never arrives.
-func probeSendZC() SendZCProbeResult {
+func probeSendZC() (SendZCProbeResult, string) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "net.Listen failed: " + err.Error()
 	}
 	defer func() { _ = ln.Close() }()
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "net.Dial failed: " + err.Error()
 	}
 	defer func() { _ = conn.Close() }()
 
 	accepted, err := ln.Accept()
 	if err != nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "ln.Accept failed: " + err.Error()
 	}
 	defer func() { _ = accepted.Close() }()
 
 	rawConn, err := conn.(*net.TCPConn).SyscallConn()
 	if err != nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "SyscallConn failed: " + err.Error()
 	}
 
 	var fd int
@@ -85,7 +86,7 @@ func probeSendZC() SendZCProbeResult {
 
 	ring, err := NewRing(4, 0, 0)
 	if err != nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "NewRing failed: " + err.Error()
 	}
 	defer func() { _ = ring.Close() }()
 
@@ -94,7 +95,7 @@ func probeSendZC() SendZCProbeResult {
 	payload := []byte("probe-send-zc-test-payload")
 	sqe := ring.GetSQE()
 	if sqe == nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "GetSQE returned nil"
 	}
 	prepSendZC(sqe, fd, payload, false)
 	// Set IORING_SEND_ZC_REPORT_USAGE in ioprio field (offset 2).
@@ -104,17 +105,18 @@ func probeSendZC() SendZCProbeResult {
 
 	// Submit and wait for the first CQE.
 	if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
-		return SendZCUnsupported
+		return SendZCUnsupported, "SubmitAndWaitTimeout (initial) failed: " + err.Error()
 	}
 
 	cqHead, cqTail := ring.BeginCQ()
 	if cqHead == cqTail {
-		return SendZCUnsupported
+		return SendZCUnsupported, "no initial CQE produced after submit"
 	}
 	entry := ring.cqeAt(cqHead)
 	if entry.Res < 0 {
+		res := entry.Res
 		ring.EndCQ(cqHead + 1)
-		return SendZCUnsupported
+		return SendZCUnsupported, fmt.Sprintf("kernel rejected SEND_ZC opcode: cqe.res=%d (likely -ENOSYS=-38 or -EINVAL=-22)", res)
 	}
 
 	flags := *(*uint32)(unsafe.Add(unsafe.Pointer(entry), 8))
@@ -127,31 +129,32 @@ func probeSendZC() SendZCProbeResult {
 		// safe to reuse immediately. On mainline kernels this shouldn't happen
 		// (CQE_F_MORE is always set), but some patched kernels skip it.
 		// Treat as copy fallback — SEND_ZC works but has no ZC benefit.
-		return SendZCCopyFallback
+		return SendZCCopyFallback, "first CQE missing CQE_F_MORE flag (no notification will follow)"
 	}
 
 	// Wait for the notification CQE.
 	if err := ring.SubmitAndWaitTimeout(2 * time.Second); err != nil {
-		return SendZCBroken
+		return SendZCBroken, "notification CQE wait timed out: " + err.Error()
 	}
 
 	cqHead, cqTail = ring.BeginCQ()
 	if cqHead == cqTail {
-		return SendZCBroken
+		return SendZCBroken, "no notification CQE produced (waited 2s)"
 	}
 
 	entry = ring.cqeAt(cqHead)
 	notifFlags := *(*uint32)(unsafe.Add(unsafe.Pointer(entry), 8))
 	isNotif := notifFlags&0x04 != 0 // CQE_F_NOTIF
+	notifRes := entry.Res
 	ring.EndCQ(cqHead + 1)
 
 	if !isNotif {
-		return SendZCBroken
+		return SendZCBroken, fmt.Sprintf("second CQE missing CQE_F_NOTIF flag (flags=%#x)", notifFlags)
 	}
 
 	// Check the notification's res field for REPORT_USAGE result.
-	if entry.Res&notifUsageZCCopied != 0 {
-		return SendZCCopyFallback
+	if notifRes&notifUsageZCCopied != 0 {
+		return SendZCCopyFallback, "REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
 	}
 
 	// Clean up: read the sent data on the receiver side.
@@ -159,7 +162,7 @@ func probeSendZC() SendZCProbeResult {
 	_ = accepted.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	_, _ = accepted.Read(buf)
 
-	return SendZCTrueZeroCopy
+	return SendZCTrueZeroCopy, ""
 }
 
 // probeFixedFiles tests whether ACCEPT_DIRECT (fixed files) works end-to-end.
@@ -175,61 +178,65 @@ func probeSendZC() SendZCProbeResult {
 // temporary listen socket. If the kernel returns EINVAL (-22), we know
 // fixed files are non-functional on this host and surface it as a probe
 // miss so the engine takes the plain-fd path from the start.
-func probeFixedFiles() bool {
+func probeFixedFiles() (bool, string) {
 	ring, err := NewRing(8, 0, 0)
 	if err != nil {
-		return false
+		return false, "NewRing failed: " + err.Error()
 	}
 	defer func() { _ = ring.Close() }()
 
 	if err := ring.RegisterFiles(16); err != nil {
-		return false
+		return false, "RegisterFiles failed: " + err.Error()
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return false
+		return false, "net.Listen failed: " + err.Error()
 	}
 	defer func() { _ = ln.Close() }()
 
 	rc, err := ln.(*net.TCPListener).SyscallConn()
 	if err != nil {
-		return false
+		return false, "SyscallConn failed: " + err.Error()
 	}
 	var listenFD int
 	_ = rc.Control(func(fd uintptr) { listenFD = int(fd) })
 	if listenFD <= 0 {
-		return false
+		return false, fmt.Sprintf("listen FD=%d <= 0", listenFD)
 	}
 
 	sqe := ring.GetSQE()
 	if sqe == nil {
-		return false
+		return false, "GetSQE returned nil"
 	}
 	prepMultishotAcceptDirect(sqe, listenFD)
 	setSQEUserData(sqe, 0xF17EDF11E) // distinct tag for this probe
 	if _, err := ring.Submit(); err != nil {
-		return false
+		return false, "Submit failed: " + err.Error()
 	}
 
 	// Trigger one accept so the kernel produces a CQE for the multishot SQE.
 	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
 	conn, err := dialer.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		return false
+		return false, "probe dial failed: " + err.Error()
 	}
 	defer func() { _ = conn.Close() }()
 
 	if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
-		return false
+		return false, "SubmitAndWaitTimeout failed: " + err.Error()
 	}
 	head, tail := ring.BeginCQ()
 	if head == tail {
-		return false
+		return false, "no CQE produced after multishot accept-direct + dial"
 	}
 	cqe := ring.cqeAt(head)
+	res := cqe.Res
 	ring.EndCQ(head + 1)
 	// Res = -EINVAL (-22) means the kernel registered files but refuses
 	// ACCEPT_DIRECT (seen on 6.6.10-cix aarch64). Treat as unsupported.
-	return cqe.Res >= 0
+	if res < 0 {
+		return false, fmt.Sprintf("ACCEPT_DIRECT rejected by kernel: cqe.res=%d (likely -EINVAL=-22)", res)
+	}
+	return true, ""
 }
