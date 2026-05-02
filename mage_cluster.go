@@ -160,7 +160,8 @@ func ClusterBench() error {
 //	CLUSTER_DIST_WARMUP    warmup                 (default: 2s)
 //	CLUSTER_DIST_CONNS     loadgen connections    (default: 256)
 //	CLUSTER_DIST_WORKERS   loadgen workers        (default: 0 = library default)
-//	CLUSTER_DIST_H2        loadgen -h2 flag       (default: false)
+//	CLUSTER_DIST_H2        loadgen -h2 flag           (default: false)
+//	CLUSTER_DIST_H2C_UPGRADE loadgen -h2c-upgrade flag (default: false)
 func ClusterDistributedBench() error {
 	if err := requireAnsible(); err != nil {
 		return err
@@ -175,6 +176,7 @@ func ClusterDistributedBench() error {
 	conns := envOrDefault("CLUSTER_DIST_CONNS", "256")
 	workers := envOrDefault("CLUSTER_DIST_WORKERS", "0")
 	h2 := envOrDefault("CLUSTER_DIST_H2", "false")
+	h2cUpgrade := envOrDefault("CLUSTER_DIST_H2C_UPGRADE", "false")
 
 	if target != "msa2-server" && target != "msr1" {
 		return fmt.Errorf("CLUSTER_DIST_TARGET must be msa2-server or msr1 (got %q)", target)
@@ -206,6 +208,7 @@ func ClusterDistributedBench() error {
 		"--extra-vars", "bench_connections=" + conns,
 		"--extra-vars", "bench_workers=" + workers,
 		"--extra-vars", "bench_h2=" + h2,
+		"--extra-vars", "bench_h2c_upgrade=" + h2cUpgrade,
 		"--extra-vars", "server_binary_amd64=" + bins.serverAmd64,
 		"--extra-vars", "server_binary_arm64=" + bins.serverArm64,
 		"--extra-vars", "loadgen_binary_amd64=" + bins.loadgenAmd64,

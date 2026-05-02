@@ -108,6 +108,20 @@
       register: wait_ready
       changed_when: false
 
+    - name: Start mpstat sampler on bench target
+      ansible.builtin.shell: |
+        # Sample 1Hz for warmup+duration+slack seconds; mpstat exits on its own.
+        nohup mpstat -P ALL 1 \
+          {{ ((bench_warmup | default('2s')) | regex_replace('[^0-9]','') | int)
+             + ((bench_duration | default('10s')) | regex_replace('[^0-9]','') | int)
+             + 5 }} \
+          > {{ run_out_dir }}/cpu.log 2>&1 &
+        disown
+        echo $! > {{ run_out_dir }}/mpstat.pid
+      args:
+        executable: /bin/bash
+      changed_when: false
+
 - name: Run loadgen on msa2-client against bench target
   hosts: msa2-client
   gather_facts: false
@@ -130,6 +144,20 @@
       ansible.builtin.set_fact:
         target_ip: "{{ hostvars[bench_target].lan_ip }}"
 
+    - name: Start mpstat sampler on loadgen host (matches bench duration)
+      ansible.builtin.shell: |
+        # Sample 1Hz for warmup+duration+slack seconds; mpstat exits on its own.
+        nohup mpstat -P ALL 1 \
+          {{ ((bench_warmup | default('2s')) | regex_replace('[^0-9]','') | int)
+             + ((bench_duration | default('10s')) | regex_replace('[^0-9]','') | int)
+             + 5 }} \
+          > {{ loadgen_run_dir }}/cpu.log 2>&1 &
+        disown
+        echo $! > {{ loadgen_run_dir }}/mpstat.pid
+      args:
+        executable: /bin/bash
+      changed_when: false
+
     - name: Run loadgen against http(s)://<bench_target>:<port>{{ bench_url_path | default('/') }}
       ansible.builtin.shell: |
         cd {{ bench_root }}
@@ -140,6 +168,7 @@
           -connections {{ bench_connections | default(256) }} \
           {% if bench_workers | default(0) | int > 0 %}-workers {{ bench_workers }}{% endif %} \
           {% if bench_h2 | default(false) | bool %}-h2{% endif %} \
+          {% if bench_h2c_upgrade | default(false) | bool %}-h2c-upgrade{% endif %} \
           > {{ loadgen_run_dir }}/loadgen.json \
           2> {{ loadgen_run_dir }}/loadgen.stderr
       args:
@@ -160,7 +189,26 @@
       changed_when: false
       when: inventory_hostname == bench_target
 
-    - name: Fetch server log + outputs (bench target)
+    - name: Wait for mpstat samplers to finish writing
+      ansible.builtin.shell: |
+        for pidfile in {{ run_out_dir | default('') }}/mpstat.pid {{ loadgen_run_dir | default('') }}/mpstat.pid; do
+          if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile")
+            for i in $(seq 1 10); do
+              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              sleep 0.5
+            done
+          fi
+        done
+        true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: >
+        (inventory_hostname == bench_target) or
+        (inventory_hostname == "msa2-client")
+
+    - name: Fetch server log + cpu sample (bench target)
       ansible.builtin.fetch:
         src: "{{ item }}"
         dest: "{{ results_local_dir }}/{{ bench_target }}/"
@@ -169,9 +217,10 @@
       loop:
         - "{{ run_out_dir | default('') }}/server.log"
         - "{{ run_out_dir | default('') }}/server.pid"
+        - "{{ run_out_dir | default('') }}/cpu.log"
       when: inventory_hostname == bench_target
 
-    - name: Fetch loadgen JSON + stderr (msa2-client)
+    - name: Fetch loadgen JSON + stderr + cpu sample (msa2-client)
       ansible.builtin.fetch:
         src: "{{ item }}"
         dest: "{{ results_local_dir }}/loadgen/"
@@ -180,6 +229,7 @@
       loop:
         - "{{ loadgen_run_dir | default('') }}/loadgen.json"
         - "{{ loadgen_run_dir | default('') }}/loadgen.stderr"
+        - "{{ loadgen_run_dir | default('') }}/cpu.log"
       when: inventory_hostname == "msa2-client"
 
     - name: Drop bench staging dir
