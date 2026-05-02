@@ -20,17 +20,16 @@ import (
 // the next reboot wipes it. See ansible/README.md.
 
 const (
-	clusterAnsibleDir = "ansible"
-	clusterBenchPlaybook   = "cluster-bench.yml"
-	clusterCleanupPlaybook = "cluster-cleanup.yml"
+	clusterAnsibleDir            = "ansible"
+	clusterBenchPlaybook         = "cluster-bench.yml"
+	clusterCleanupPlaybook       = "cluster-cleanup.yml"
+	clusterDistributedPlaybook   = "cluster-distributed-bench.yml"
 
-	// runnerModuleDir — the perfmatrix orchestrator lives in its own
-	// Go module (test/perfmatrix/go.mod). We cd in there before building.
-	runnerModuleDir = "test/perfmatrix"
-	runnerPkgRel    = "./cmd/runner"
-	// loadgen path — staged on msa2-client, planned for distributed
-	// scenarios. For now we ship the same runner binary; loadgen
-	// integration lives in the goceleris/loadgen repo.
+	// perfmatrix lives in its own Go module (test/perfmatrix/go.mod).
+	// We cd in there before building runner/server.
+	perfmatrixModuleDir = "test/perfmatrix"
+	runnerPkgRel        = "./cmd/runner"
+	serverPkgRel        = "./cmd/server"
 )
 
 // ClusterStatus prints quick health for each cluster node: reachability,
@@ -146,6 +145,84 @@ func ClusterBench() error {
 	return nil
 }
 
+// ClusterDistributedBench runs a network-bound bench: celeris server
+// on one bench target (msa2-server or msr1), loadgen on msa2-client,
+// driving load over the 20G LACP fabric. Pairwise — to bench both
+// targets, run the target twice with different CLUSTER_DIST_TARGET.
+//
+// Knobs (env):
+//
+//	CLUSTER_DIST_TARGET    msa2-server | msr1     (default: msa2-server)
+//	CLUSTER_DIST_SERVER    perfmatrix server name (default: celeris-epoll-h1-async)
+//	CLUSTER_DIST_PORT      bind port              (default: 8080)
+//	CLUSTER_DIST_PATH      loadgen URL path       (default: /)
+//	CLUSTER_DIST_DURATION  duration               (default: 10s)
+//	CLUSTER_DIST_WARMUP    warmup                 (default: 2s)
+//	CLUSTER_DIST_CONNS     loadgen connections    (default: 256)
+//	CLUSTER_DIST_WORKERS   loadgen workers        (default: 0 = library default)
+//	CLUSTER_DIST_H2        loadgen -h2 flag       (default: false)
+func ClusterDistributedBench() error {
+	if err := requireAnsible(); err != nil {
+		return err
+	}
+
+	target := envOrDefault("CLUSTER_DIST_TARGET", "msa2-server")
+	serverName := envOrDefault("CLUSTER_DIST_SERVER", "celeris-epoll-h1-async")
+	port := envOrDefault("CLUSTER_DIST_PORT", "8080")
+	urlPath := envOrDefault("CLUSTER_DIST_PATH", "/")
+	duration := envOrDefault("CLUSTER_DIST_DURATION", "10s")
+	warmup := envOrDefault("CLUSTER_DIST_WARMUP", "2s")
+	conns := envOrDefault("CLUSTER_DIST_CONNS", "256")
+	workers := envOrDefault("CLUSTER_DIST_WORKERS", "0")
+	h2 := envOrDefault("CLUSTER_DIST_H2", "false")
+
+	if target != "msa2-server" && target != "msr1" {
+		return fmt.Errorf("CLUSTER_DIST_TARGET must be msa2-server or msr1 (got %q)", target)
+	}
+
+	bins, err := stageBinaries()
+	if err != nil {
+		return err
+	}
+	defer cleanupStaging(bins)
+
+	fmt.Printf("\n=== Cluster distributed bench ===\n")
+	fmt.Printf("  bench target: %s (server runs here)\n", target)
+	fmt.Printf("  loadgen host: msa2-client\n")
+	fmt.Printf("  server:       %s\n", serverName)
+	fmt.Printf("  url:          http://<%s>:%s%s\n", target, port, urlPath)
+	fmt.Printf("  duration:     %s (warmup %s)\n", duration, warmup)
+	fmt.Printf("  connections:  %s, workers=%s, h2=%s\n", conns, workers, h2)
+	fmt.Printf("  results:      %s\n\n", bins.resultsLocal)
+
+	args := []string{
+		"-i", "inventory.yml", clusterDistributedPlaybook,
+		"--extra-vars", "bench_target=" + target,
+		"--extra-vars", "bench_server_name=" + serverName,
+		"--extra-vars", "bench_port=" + port,
+		"--extra-vars", "bench_url_path=" + urlPath,
+		"--extra-vars", "bench_duration=" + duration,
+		"--extra-vars", "bench_warmup=" + warmup,
+		"--extra-vars", "bench_connections=" + conns,
+		"--extra-vars", "bench_workers=" + workers,
+		"--extra-vars", "bench_h2=" + h2,
+		"--extra-vars", "server_binary_amd64=" + bins.serverAmd64,
+		"--extra-vars", "server_binary_arm64=" + bins.serverArm64,
+		"--extra-vars", "loadgen_binary_amd64=" + bins.loadgenAmd64,
+		"--extra-vars", "results_local_dir=" + bins.resultsLocal,
+	}
+	cmd := exec.Command("ansible-playbook", args...)
+	cmd.Dir = clusterAnsibleDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cluster distributed bench failed: %w", err)
+	}
+
+	fmt.Printf("\n=== Distributed bench complete. Results in %s ===\n", bins.resultsLocal)
+	return nil
+}
+
 // ClusterCleanup forces the cleanup phase across all nodes. Use after a
 // failed/interrupted bench to ensure no apt packages or staging dirs
 // are left behind.
@@ -174,13 +251,16 @@ type clusterBins struct {
 	stagingDir   string // temp dir on dev machine holding cross-compiled binaries
 	runnerAmd64  string
 	runnerArm64  string
+	serverAmd64  string
+	serverArm64  string
 	loadgenAmd64 string
 	resultsLocal string
 }
 
-// stageBinaries cross-compiles the perfmatrix runner for both archs
-// and prepares the results landing dir on the dev machine. The temp
-// dir is removed by cleanupStaging after the playbook completes.
+// stageBinaries cross-compiles the perfmatrix runner + server for
+// both archs (linux/amd64 + linux/arm64) and the loadgen CLI for
+// linux/amd64 (msa2-client only). Prepares the local results landing
+// directory. Temp dir is removed by cleanupStaging.
 func stageBinaries() (*clusterBins, error) {
 	stagingDir, err := os.MkdirTemp("", "celeris-cluster-stage-")
 	if err != nil {
@@ -190,6 +270,8 @@ func stageBinaries() (*clusterBins, error) {
 		stagingDir:   stagingDir,
 		runnerAmd64:  filepath.Join(stagingDir, "runner-amd64"),
 		runnerArm64:  filepath.Join(stagingDir, "runner-arm64"),
+		serverAmd64:  filepath.Join(stagingDir, "server-amd64"),
+		serverArm64:  filepath.Join(stagingDir, "server-arm64"),
 		loadgenAmd64: filepath.Join(stagingDir, "loadgen-amd64"),
 	}
 
@@ -203,13 +285,23 @@ func stageBinaries() (*clusterBins, error) {
 		return nil, err
 	}
 
-	fmt.Println("Cross-compiling runner for linux/amd64...")
-	if err := crossCompileInDir(runnerModuleDir, runnerPkgRel, bins.runnerAmd64, "amd64"); err != nil {
-		return nil, fmt.Errorf("cross-compile amd64: %w", err)
+	type buildJob struct {
+		label string
+		pkg   string
+		out   string
+		arch  string
 	}
-	fmt.Println("Cross-compiling runner for linux/arm64...")
-	if err := crossCompileInDir(runnerModuleDir, runnerPkgRel, bins.runnerArm64, "arm64"); err != nil {
-		return nil, fmt.Errorf("cross-compile arm64: %w", err)
+	jobs := []buildJob{
+		{"runner linux/amd64", runnerPkgRel, bins.runnerAmd64, "amd64"},
+		{"runner linux/arm64", runnerPkgRel, bins.runnerArm64, "arm64"},
+		{"server linux/amd64", serverPkgRel, bins.serverAmd64, "amd64"},
+		{"server linux/arm64", serverPkgRel, bins.serverArm64, "arm64"},
+	}
+	for _, j := range jobs {
+		fmt.Printf("Cross-compiling %s...\n", j.label)
+		if err := crossCompileInDir(perfmatrixModuleDir, j.pkg, j.out, j.arch); err != nil {
+			return nil, fmt.Errorf("cross-compile %s: %w", j.label, err)
+		}
 	}
 
 	fmt.Println("Cross-compiling loadgen for linux/amd64...")

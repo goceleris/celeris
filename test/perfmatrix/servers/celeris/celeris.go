@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -163,7 +164,16 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 	// the listener's actual address keeps the validator happy across all
 	// four engines (std silently ignores Addr when Listener is set;
 	// native engines tolerate exact match).
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	//
+	// CELERIS_PERFMATRIX_BIND overrides the default 127.0.0.1:0 — needed
+	// for the distributed cluster bench where the server runs on one
+	// node and loadgen on another, so the listener must be reachable
+	// over the cluster fabric. Format is "host:port" or ":port".
+	bindAddr := "127.0.0.1:0"
+	if env := os.Getenv("CELERIS_PERFMATRIX_BIND"); env != "" {
+		bindAddr = env
+	}
+	ln, err := net.Listen("tcp", bindAddr)
 	if err != nil {
 		return nil, fmt.Errorf("celeris perfmatrix: %s bind: %w", s.name, err)
 	}

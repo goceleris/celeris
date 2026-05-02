@@ -1,0 +1,188 @@
+---
+# Distributed cluster bench: celeris server runs on a bench target,
+# loadgen runs on the dedicated loadgen host (msa2-client) targeting
+# the bench target's network address. Saturates the 20G LACP fabric
+# end-to-end without the loadgen and server competing for CPU on the
+# same box.
+#
+# Required extra-vars:
+#   bench_target          single host name from [bench_targets]
+#                         (msa2-server | msr1) — distributed bench is
+#                         pairwise; for both, run the playbook twice.
+#   server_binary_amd64   path on dev Mac to the cross-compiled
+#                         perfmatrix server for amd64
+#   server_binary_arm64   ditto for arm64
+#   loadgen_binary_amd64  path on dev Mac to loadgen (linux/amd64)
+#   bench_server_name     -name flag for the perfmatrix server
+#                         (default: celeris-epoll-h1-async)
+#   bench_url_path        path component of loadgen -url (default: /)
+#   bench_port            port the server binds (default: 8080)
+#   bench_duration        loadgen -duration (default: 10s)
+#   bench_warmup          loadgen -warmup (default: 2s)
+#   bench_connections     loadgen -connections (default: 256)
+#   bench_workers         loadgen -workers (0 → loadgen default)
+#   bench_h2              loadgen -h2 flag value (default: false)
+#   results_local_dir     where to fetch outputs back to on the Mac
+
+- name: Stage server + loadgen binaries
+  hosts: cluster
+  gather_facts: true
+  tags: stage
+  tasks:
+    - name: Filter to selected hosts
+      ansible.builtin.meta: end_host
+      when: >
+        (inventory_hostname != bench_target) and
+        (inventory_hostname != "msa2-client")
+
+    - name: Ensure transient dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+
+    - name: Push server binary to bench target
+      ansible.builtin.copy:
+        src: "{{ server_binary_amd64 if arch == 'amd64' else server_binary_arm64 }}"
+        dest: "{{ bench_root }}/server"
+        mode: '0755'
+      when: inventory_hostname == bench_target
+
+    - name: Push loadgen binary to msa2-client
+      ansible.builtin.copy:
+        src: "{{ loadgen_binary_amd64 }}"
+        dest: "{{ bench_root }}/loadgen"
+        mode: '0755'
+      when: inventory_hostname == "msa2-client"
+
+- name: Start celeris server on bench target
+  hosts: "{{ bench_target }}"
+  gather_facts: false
+  tags: run
+  tasks:
+    - name: Run-specific output dir
+      ansible.builtin.set_fact:
+        run_out_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-distributed-{{ inventory_hostname }}"
+
+    - name: Create per-run output dir
+      ansible.builtin.file:
+        path: "{{ run_out_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Stop any prior server
+      become: true
+      ansible.builtin.shell: |
+        pkill -x server 2>/dev/null
+        true
+      changed_when: false
+
+    - name: Start celeris server in background
+      become: true
+      ansible.builtin.shell: |
+        cd {{ bench_root }}
+        ulimit -l unlimited
+        nohup ./server \
+          -name '{{ bench_server_name | default("celeris-epoll-h1-async") }}' \
+          -bind 0.0.0.0:{{ bench_port | default(8080) }} \
+          > {{ run_out_dir }}/server.log 2>&1 &
+        echo $! > {{ run_out_dir }}/server.pid
+        disown
+      args:
+        executable: /bin/bash
+
+    - name: Wait for server to bind (look for 'ready addr=')
+      ansible.builtin.shell: |
+        for i in $(seq 1 20); do
+          grep -q 'perfmatrix-server: ready addr=' {{ run_out_dir }}/server.log && exit 0
+          sleep 0.3
+        done
+        echo "server did not become ready in 6s" >&2
+        tail -50 {{ run_out_dir }}/server.log >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: wait_ready
+      changed_when: false
+
+- name: Run loadgen on msa2-client against bench target
+  hosts: msa2-client
+  gather_facts: false
+  tags: run
+  tasks:
+    - name: Loadgen output paths
+      ansible.builtin.set_fact:
+        loadgen_run_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-distributed-loadgen-{{ bench_target }}"
+
+    - name: Create loadgen output dir
+      ansible.builtin.file:
+        path: "{{ loadgen_run_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Resolve bench target IP from inventory
+      ansible.builtin.set_fact:
+        target_ip: "{{ hostvars[bench_target].ansible_host }}"
+
+    - name: Run loadgen against http(s)://<bench_target>:<port>{{ bench_url_path | default('/') }}
+      ansible.builtin.shell: |
+        cd {{ bench_root }}
+        ./loadgen \
+          -url http://{{ target_ip }}:{{ bench_port | default(8080) }}{{ bench_url_path | default('/') }} \
+          -duration {{ bench_duration | default('10s') }} \
+          -warmup {{ bench_warmup | default('2s') }} \
+          -connections {{ bench_connections | default(256) }} \
+          {% if bench_workers | default(0) | int > 0 %}-workers {{ bench_workers }}{% endif %} \
+          {% if bench_h2 | default(false) | bool %}-h2{% endif %} \
+          > {{ loadgen_run_dir }}/loadgen.json \
+          2> {{ loadgen_run_dir }}/loadgen.stderr
+      args:
+        executable: /bin/bash
+
+- name: Stop server + collect everything
+  hosts: cluster
+  gather_facts: false
+  tags: cleanup
+  tasks:
+    - name: Stop celeris server (bench target only)
+      become: true
+      ansible.builtin.shell: |
+        pkill -TERM -x server 2>/dev/null
+        sleep 1
+        pkill -KILL -x server 2>/dev/null
+        true
+      changed_when: false
+      when: inventory_hostname == bench_target
+
+    - name: Fetch server log + outputs (bench target)
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ results_local_dir }}/{{ bench_target }}/"
+        flat: true
+        fail_on_missing: false
+      loop:
+        - "{{ run_out_dir | default('') }}/server.log"
+        - "{{ run_out_dir | default('') }}/server.pid"
+      when: inventory_hostname == bench_target
+
+    - name: Fetch loadgen JSON + stderr (msa2-client)
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ results_local_dir }}/loadgen/"
+        flat: true
+        fail_on_missing: false
+      loop:
+        - "{{ loadgen_run_dir | default('') }}/loadgen.json"
+        - "{{ loadgen_run_dir | default('') }}/loadgen.stderr"
+      when: inventory_hostname == "msa2-client"
+
+    - name: Drop bench staging dir
+      ansible.builtin.file:
+        path: "{{ bench_root }}"
+        state: absent
+      when: >
+        (inventory_hostname == bench_target) or
+        (inventory_hostname == "msa2-client")

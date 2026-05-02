@@ -143,7 +143,15 @@
             mode: '0755'
 
         - name: Execute runner (logs to {{ run_out_dir }}/run.log)
+          # Run as root so we can ulimit -l unlimited — io_uring rings need
+          # locked memory beyond Ubuntu's 8 MB default RLIMIT_MEMLOCK
+          # (~10 MB per worker × 12-16 workers for the high tier).
+          # Equivalent setcap CAP_IPC_LOCK on the runner binary would
+          # avoid root, but adds a persistent capability we'd need to
+          # track in the manifest — root is simpler for transient runs.
+          become: true
           ansible.builtin.shell: |
+            ulimit -l unlimited
             cd {{ bench_root }}
             ./runner \
               -services local \
