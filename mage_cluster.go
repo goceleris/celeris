@@ -214,15 +214,68 @@ func stageBinaries() (*clusterBins, error) {
 		return nil, fmt.Errorf("cross-compile arm64: %w", err)
 	}
 
-	// Loadgen for now reuses the runner binary (it's fine — loadgen is
-	// invoked as a subprocess during runner execution). When the
-	// distributed loadgen mode lands in the goceleris/loadgen repo
-	// we'll cross-compile that separately and push to msa2-client.
-	if err := copyFile(bins.runnerAmd64, bins.loadgenAmd64); err != nil {
-		return nil, fmt.Errorf("stage loadgen: %w", err)
+	fmt.Println("Cross-compiling loadgen for linux/amd64...")
+	if err := buildLoadgenAmd64(bins.loadgenAmd64); err != nil {
+		return nil, fmt.Errorf("cross-compile loadgen: %w", err)
 	}
 
 	return bins, nil
+}
+
+// buildLoadgenAmd64 cross-compiles the goceleris/loadgen CLI for
+// linux/amd64. Tries (in order):
+//  1. Sibling clone at ../loadgen (typical dev-machine layout)
+//  2. `go install` from a temp module — pulls the pinned version from
+//     the celeris go.mod
+//
+// Path 1 is preferred because it builds whatever the developer has
+// locally; path 2 is the fallback for clean machines / CI.
+func buildLoadgenAmd64(outputPath string) error {
+	absOut, err := filepath.Abs(outputPath)
+	if err != nil {
+		return err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	sibling := filepath.Join(filepath.Dir(cwd), "loadgen")
+	if st, err := os.Stat(sibling); err == nil && st.IsDir() {
+		fmt.Printf("  building from sibling clone at %s\n", sibling)
+		cmd := exec.Command("go", "build", "-o", absOut, "./cmd/loadgen")
+		cmd.Dir = sibling
+		cmd.Env = append(os.Environ(),
+			"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	fmt.Println("  no sibling loadgen clone — falling back to `go install`")
+	tmpHome, err := os.MkdirTemp("", "celeris-loadgen-build-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpHome)
+	cmd := exec.Command("go", "install", "github.com/goceleris/loadgen/cmd/loadgen@latest")
+	cmd.Env = append(os.Environ(),
+		"GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+		"GOPATH="+tmpHome,
+		"GOBIN="+filepath.Dir(absOut),
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	// `go install` puts it at GOBIN/loadgen — rename to absOut.
+	produced := filepath.Join(filepath.Dir(absOut), "loadgen")
+	if produced != absOut {
+		if err := os.Rename(produced, absOut); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cleanupStaging(b *clusterBins) {
