@@ -123,9 +123,12 @@
         state: directory
         mode: '0755'
 
-    - name: Resolve bench target IP from inventory
+    - name: Resolve bench target LAN IP from inventory
+      # lan_ip is the DHCP-pinned 20G fabric address. Using a hostname
+      # here would resolve via Tailscale MagicDNS to the tailnet IP and
+      # route over WireGuard, defeating the cluster fabric.
       ansible.builtin.set_fact:
-        target_ip: "{{ hostvars[bench_target].ansible_host }}"
+        target_ip: "{{ hostvars[bench_target].lan_ip }}"
 
     - name: Run loadgen against http(s)://<bench_target>:<port>{{ bench_url_path | default('/') }}
       ansible.builtin.shell: |

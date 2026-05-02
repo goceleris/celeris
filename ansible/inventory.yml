@@ -1,11 +1,23 @@
 ---
 # Cluster inventory for celeris benchmarking.
 #
-# Each host's `ansible_host` is the LAN IP pinned via DHCP reservation on
-# the BD4 router. Tailscale fallback is automatic — when a host is offline
-# from the LAN side, ansible can also reach it via its tailnet name.
+# Two address layers are tracked per host:
+#
+#   - inventory_hostname (the YAML key, e.g. "msa2-server"): used for
+#     ansible's SSH connection. Resolves via the Mac's resolver, which
+#     goes through Tailscale MagicDNS → tailnet IP. Reliable for
+#     orchestration even if the LAN reservation changes.
+#
+#   - lan_ip: LAN address pinned via DHCP reservation on the BD4 router.
+#     Used as the loadgen target so bench traffic flows over the 20G
+#     LACP fabric (NOT through Tailscale's WireGuard overlay). MagicDNS
+#     would otherwise rewrite all hostname forms — even `.lan` /
+#     `.local` — to the tailnet IP.
 #
 # `arch` is the GOARCH for cross-compiling binaries on the developer Mac.
+#
+# Update lan_ip here when you change a DHCP reservation. That's the only
+# place an IP appears in the cluster orchestration.
 all:
   vars:
     ansible_user: mini
@@ -18,15 +30,15 @@ all:
     bench_targets:
       hosts:
         msa2-server:
-          ansible_host: 192.168.50.65
+          lan_ip: 192.168.50.65
           arch: amd64
         msr1:
-          ansible_host: 192.168.50.199
+          lan_ip: 192.168.50.199
           arch: arm64
     loadgen:
       hosts:
         msa2-client:
-          ansible_host: 192.168.50.195
+          lan_ip: 192.168.50.195
           arch: amd64
     cluster:
       children:
