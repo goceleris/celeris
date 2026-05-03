@@ -172,10 +172,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	defer bindWait.Stop()
 	var startErr error
 bindLoop:
-	for {
-		if e.primary.Addr() != nil && e.secondary.Addr() != nil {
-			break
-		}
+	for e.primary.Addr() == nil || e.secondary.Addr() == nil {
 		select {
 		case startErr = <-errCh:
 			break bindLoop
