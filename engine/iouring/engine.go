@@ -78,6 +78,25 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 			profile.FixedFiles = false
 		}
 	}
+	// ProvidedBuffers: tested via IORING_REGISTER_PBUF_RING. Without it,
+	// multishot recv has no backing store, so MultishotRecv is also forced
+	// off when this probe fails.
+	if profile.ProvidedBuffers {
+		if ok, pbReason := probeProvidedBuffers(); !ok {
+			cfg.Logger.Info("provided buffers runtime probe failed, disabling (downgrades to mid tier and disables multishot recv)", "reason", pbReason)
+			profile.ProvidedBuffers = false
+			profile.MultishotRecv = false
+		}
+	}
+	// MultishotAccept: kernel may advertise it but never set CQE_F_MORE,
+	// leaving accept stuck after the first completion. Probe submits a
+	// real multishot accept + dial and verifies the F_MORE flag.
+	if profile.MultishotAccept {
+		if ok, maReason := probeMultishotAccept(); !ok {
+			cfg.Logger.Info("multishot accept runtime probe failed, disabling (worker will use single-shot accept)", "reason", maReason)
+			profile.MultishotAccept = false
+		}
+	}
 
 	tier := SelectTier(profile, 2*time.Second)
 	if tier == nil {
@@ -235,7 +254,13 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 func fallbackTier(current TierStrategy) TierStrategy {
 	switch t := current.(type) {
 	case *optionalTier:
-		return &highTier{deferTaskrun: t.deferTaskrun, fixedFiles: t.fixedFiles}
+		return &highTier{
+			deferTaskrun:    t.deferTaskrun,
+			fixedFiles:      t.fixedFiles,
+			sendZC:          t.sendZC,
+			multishotAccept: t.multishotAccept,
+			multishotRecv:   t.multishotRecv,
+		}
 	case *highTier:
 		return &midTier{}
 	case *midTier:

@@ -7,6 +7,8 @@ import (
 	"net"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // SEND_ZC ioprio flags and notification result values.
@@ -237,6 +239,114 @@ func probeFixedFiles() (bool, string) {
 	// ACCEPT_DIRECT (seen on 6.6.10-cix aarch64). Treat as unsupported.
 	if res < 0 {
 		return false, fmt.Sprintf("ACCEPT_DIRECT rejected by kernel: cqe.res=%d (likely -EINVAL=-22)", res)
+	}
+	return true, ""
+}
+
+// probeProvidedBuffers tests whether IORING_REGISTER_PBUF_RING works on this
+// kernel. Some patched/embedded kernels report 5.19+ but reject the register
+// call (e.g. ENOSYS or EINVAL). Without a working pbuf ring, multishot recv
+// cannot be used — the engine must fall back to single-shot per-connection
+// recv buffers regardless of the kernel-version-based tier.
+func probeProvidedBuffers() (bool, string) {
+	ring, err := NewRing(8, 0, 0)
+	if err != nil {
+		return false, "NewRing failed: " + err.Error()
+	}
+	defer func() { _ = ring.Close() }()
+
+	// Allocate a tiny pbuf ring (8 entries × 16 bytes = 128 bytes via mmap).
+	// We don't actually use the buffers — just verify the kernel accepts
+	// the registration syscall and the matching unregister.
+	const probeCount = 8
+	region, err := unix.Mmap(-1, 0, probeCount*bufRingEntrySize,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+	if err != nil {
+		return false, "mmap probe ring: " + err.Error()
+	}
+	defer func() { _ = unix.Munmap(region) }()
+
+	if regErr := ring.RegisterPbufRing(0xFFFF, probeCount, unsafe.Pointer(&region[0])); regErr != nil {
+		return false, "RegisterPbufRing rejected: " + regErr.Error()
+	}
+	if unregErr := ring.UnregisterPbufRing(0xFFFF); unregErr != nil {
+		return false, "UnregisterPbufRing failed (ring left dirty): " + unregErr.Error()
+	}
+	return true, ""
+}
+
+// probeMultishotAccept tests whether IORING_OP_ACCEPT with the multishot flag
+// actually re-arms after the first completion on this kernel. Vendor kernels
+// have been seen to advertise the feature (kernel ≥5.19) but silently degrade:
+// the first accept lands fine, but CQE_F_MORE is never set, leaving workers
+// in a non-rearming state that looks like "accept stalled" under churn.
+//
+// We submit a non-direct multishot accept against a temp listen socket, dial
+// once, and check that (a) Res ≥ 0 and (b) CQE_F_MORE is set. If F_MORE is
+// missing on the first CQE the multishot path is broken — fall back to
+// single-shot accept which the worker re-arms explicitly on every CQE.
+func probeMultishotAccept() (bool, string) {
+	ring, err := NewRing(8, 0, 0)
+	if err != nil {
+		return false, "NewRing failed: " + err.Error()
+	}
+	defer func() { _ = ring.Close() }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return false, "net.Listen failed: " + err.Error()
+	}
+	defer func() { _ = ln.Close() }()
+
+	rc, err := ln.(*net.TCPListener).SyscallConn()
+	if err != nil {
+		return false, "SyscallConn failed: " + err.Error()
+	}
+	var listenFD int
+	_ = rc.Control(func(fd uintptr) { listenFD = int(fd) })
+	if listenFD <= 0 {
+		return false, fmt.Sprintf("listen FD=%d <= 0", listenFD)
+	}
+
+	sqe := ring.GetSQE()
+	if sqe == nil {
+		return false, "GetSQE returned nil"
+	}
+	prepMultishotAccept(sqe, listenFD)
+	setSQEUserData(sqe, 0xACCE9701B0)
+	if _, subErr := ring.Submit(); subErr != nil {
+		return false, "Submit failed: " + subErr.Error()
+	}
+
+	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
+	conn, err := dialer.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		return false, "probe dial failed: " + err.Error()
+	}
+	defer func() { _ = conn.Close() }()
+
+	if waitErr := ring.SubmitAndWaitTimeout(500 * time.Millisecond); waitErr != nil {
+		return false, "SubmitAndWaitTimeout failed: " + waitErr.Error()
+	}
+	head, tail := ring.BeginCQ()
+	if head == tail {
+		return false, "no CQE produced after multishot accept + dial"
+	}
+	cqe := ring.cqeAt(head)
+	res := cqe.Res
+	flags := *(*uint32)(unsafe.Add(unsafe.Pointer(cqe), 8))
+	ring.EndCQ(head + 1)
+
+	if res < 0 {
+		return false, fmt.Sprintf("multishot accept rejected by kernel: cqe.res=%d", res)
+	}
+	// Close the accepted FD so it doesn't leak — we have its fd in res.
+	if res > 0 {
+		_ = unix.Close(int(res))
+	}
+	if flags&cqeFMore == 0 {
+		return false, "first multishot accept CQE missing CQE_F_MORE (kernel won't re-arm)"
 	}
 	return true, ""
 }

@@ -33,9 +33,11 @@ func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) Tier
 	// Benchmarks show DEFER_TASKRUN is 4% faster than SQPOLL on CPU-pinned workloads.
 	case profile.IOUringTier >= engine.High && profile.ProvidedBuffers:
 		return &highTier{
-			deferTaskrun: profile.DeferTaskrun,
-			fixedFiles:   profile.FixedFiles,
-			sendZC:       profile.SendZC,
+			deferTaskrun:    profile.DeferTaskrun,
+			fixedFiles:      profile.FixedFiles,
+			sendZC:          profile.SendZC,
+			multishotAccept: profile.MultishotAccept,
+			multishotRecv:   profile.MultishotRecv,
 		}
 	case profile.IOUringTier >= engine.Optional && profile.SQPoll:
 		idle := uint32(sqPollIdle.Milliseconds())
@@ -43,10 +45,12 @@ func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) Tier
 			idle = 2000
 		}
 		return &optionalTier{
-			sqPollIdle:   idle,
-			deferTaskrun: profile.DeferTaskrun,
-			fixedFiles:   profile.FixedFiles,
-			sendZC:       profile.SendZC,
+			sqPollIdle:      idle,
+			deferTaskrun:    profile.DeferTaskrun,
+			fixedFiles:      profile.FixedFiles,
+			sendZC:          profile.SendZC,
+			multishotAccept: profile.MultishotAccept,
+			multishotRecv:   profile.MultishotRecv,
 		}
 	case profile.IOUringTier >= engine.Mid && profile.CoopTaskrun:
 		return &midTier{}
@@ -142,9 +146,11 @@ func (t *midTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 // returns data in pre-registered pages, eliminating per-recv syscall overhead.
 // Benchmarks show 6-8% throughput improvement over single-shot recv.
 type highTier struct {
-	deferTaskrun bool
-	fixedFiles   bool
-	sendZC       bool
+	deferTaskrun    bool
+	fixedFiles      bool
+	sendZC          bool
+	multishotAccept bool
+	multishotRecv   bool
 }
 
 func (t *highTier) Tier() engine.Tier { return engine.High }
@@ -155,8 +161,8 @@ func (t *highTier) SetupFlags() uint32 {
 	return setupCoopTaskrun | setupSingleIssuer
 }
 func (t *highTier) SupportsProvidedBuffers() bool { return true }
-func (t *highTier) SupportsMultishotAccept() bool { return true }
-func (t *highTier) SupportsMultishotRecv() bool   { return true }
+func (t *highTier) SupportsMultishotAccept() bool { return t.multishotAccept }
+func (t *highTier) SupportsMultishotRecv() bool   { return t.multishotRecv }
 func (t *highTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *highTier) SupportsSendZC() bool          { return t.sendZC }
 func (t *highTier) SQPollIdle() uint32            { return 0 }
@@ -166,10 +172,13 @@ func (t *highTier) PrepareAccept(ring *Ring, listenFD int) {
 	if sqe == nil {
 		return
 	}
-	if t.fixedFiles {
+	switch {
+	case t.fixedFiles:
 		prepMultishotAcceptDirect(sqe, listenFD)
-	} else {
+	case t.multishotAccept:
 		prepMultishotAccept(sqe, listenFD)
+	default:
+		prepAccept(sqe, listenFD, 0)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
@@ -205,10 +214,12 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 
 // optionalTier: kernel 6.0+, adds SQPOLL, SEND_ZC. With 6.1+: DEFER_TASKRUN, fixed files.
 type optionalTier struct {
-	sqPollIdle   uint32
-	deferTaskrun bool
-	fixedFiles   bool
-	sendZC       bool
+	sqPollIdle      uint32
+	deferTaskrun    bool
+	fixedFiles      bool
+	sendZC          bool
+	multishotAccept bool
+	multishotRecv   bool
 }
 
 func (t *optionalTier) Tier() engine.Tier { return engine.Optional }
@@ -218,8 +229,8 @@ func (t *optionalTier) SetupFlags() uint32 {
 	return setupSQPoll | setupSingleIssuer
 }
 func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
-func (t *optionalTier) SupportsMultishotAccept() bool { return true }
-func (t *optionalTier) SupportsMultishotRecv() bool   { return true }
+func (t *optionalTier) SupportsMultishotAccept() bool { return t.multishotAccept }
+func (t *optionalTier) SupportsMultishotRecv() bool   { return t.multishotRecv }
 func (t *optionalTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *optionalTier) SupportsSendZC() bool          { return t.sendZC }
 func (t *optionalTier) SQPollIdle() uint32            { return t.sqPollIdle }
@@ -229,10 +240,13 @@ func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
 	if sqe == nil {
 		return
 	}
-	if t.fixedFiles {
+	switch {
+	case t.fixedFiles:
 		prepMultishotAcceptDirect(sqe, listenFD)
-	} else {
+	case t.multishotAccept:
 		prepMultishotAccept(sqe, listenFD)
+	default:
+		prepAccept(sqe, listenFD, 0)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
 }
