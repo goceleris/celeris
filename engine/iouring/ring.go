@@ -109,6 +109,23 @@ func NewRingCPU(entries uint32, flags uint32, sqPollIdle uint32, cpuID int) (*Ri
 		0,
 	)
 	if errno != 0 {
+		// ENOMEM during io_uring_setup is almost always RLIMIT_MEMLOCK,
+		// not actual OOM: each ring locks ~4-12MB of pages, and the
+		// default per-process limit is 8MB, so any worker count > 1
+		// trips it. Surface the diagnosis so users don't waste time
+		// chasing a system-memory red herring.
+		if errno == unix.ENOMEM {
+			var rlim unix.Rlimit
+			limit := "unknown"
+			if e := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); e == nil {
+				limit = fmt.Sprintf("%d bytes (soft) / %d bytes (hard)", rlim.Cur, rlim.Max)
+			}
+			return nil, fmt.Errorf("io_uring_setup: %w "+
+				"(likely RLIMIT_MEMLOCK; current=%s; "+
+				"raise via `ulimit -l unlimited`, "+
+				"systemd LimitMEMLOCK=infinity, or run as root)",
+				errno, limit)
+		}
 		return nil, fmt.Errorf("io_uring_setup: %w", errno)
 	}
 
