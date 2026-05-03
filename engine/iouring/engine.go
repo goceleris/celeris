@@ -54,7 +54,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// SEND_ZC runtime probe with IORING_SEND_ZC_REPORT_USAGE.
 	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
 	if profile.SendZC {
-		zcResult, zcReason := probeSendZC()
+		zcResult, zcReason := probeSendZCCached()
 		if zcReason != "" {
 			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String(), "reason", zcReason)
 		} else {
@@ -73,7 +73,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 	if profile.FixedFiles {
-		if ok, ffReason := probeFixedFiles(); !ok {
+		if ok, ffReason := probeFixedFilesCached(); !ok {
 			cfg.Logger.Info("fixed files runtime probe failed, disabling", "reason", ffReason)
 			profile.FixedFiles = false
 		}
@@ -82,7 +82,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// multishot recv has no backing store, so MultishotRecv is also forced
 	// off when this probe fails.
 	if profile.ProvidedBuffers {
-		if ok, pbReason := probeProvidedBuffers(); !ok {
+		if ok, pbReason := probeProvidedBuffersCached(); !ok {
 			cfg.Logger.Info("provided buffers runtime probe failed, disabling (downgrades to mid tier and disables multishot recv)", "reason", pbReason)
 			profile.ProvidedBuffers = false
 			profile.MultishotRecv = false
@@ -92,7 +92,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// leaving accept stuck after the first completion. Probe submits a
 	// real multishot accept + dial and verifies the F_MORE flag.
 	if profile.MultishotAccept {
-		if ok, maReason := probeMultishotAccept(); !ok {
+		if ok, maReason := probeMultishotAcceptCached(); !ok {
 			cfg.Logger.Info("multishot accept runtime probe failed, disabling (worker will use single-shot accept)", "reason", maReason)
 			profile.MultishotAccept = false
 		}

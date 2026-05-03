@@ -5,11 +5,66 @@ package iouring
 import (
 	"fmt"
 	"net"
+	"sync"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// Probe results are cached process-wide via sync.Once: kernel capabilities
+// don't change inside a running process, but iouring.New() can be called
+// hundreds-to-thousands of times in benchmark harnesses (perfmatrix runs
+// 1980 cells in one process with -race), and re-running every probe
+// (each opens a temp ring + a TCP listener + a dial) on every New() is
+// pure overhead.
+var (
+	cachedSendZC          sync.Once
+	cachedSendZCResult    SendZCProbeResult
+	cachedSendZCReason    string
+	cachedFixedFiles      sync.Once
+	cachedFixedFilesOK    bool
+	cachedFixedFilesReas  string
+	cachedPbufRing        sync.Once
+	cachedPbufRingOK      bool
+	cachedPbufRingReason  string
+	cachedMultiAccept     sync.Once
+	cachedMultiAcceptOK   bool
+	cachedMultiAcceptReas string
+)
+
+// probeSendZCCached returns the cached SendZC probe result, running the
+// probe at most once per process.
+func probeSendZCCached() (SendZCProbeResult, string) {
+	cachedSendZC.Do(func() {
+		cachedSendZCResult, cachedSendZCReason = probeSendZC()
+	})
+	return cachedSendZCResult, cachedSendZCReason
+}
+
+// probeFixedFilesCached returns the cached FixedFiles probe result.
+func probeFixedFilesCached() (bool, string) {
+	cachedFixedFiles.Do(func() {
+		cachedFixedFilesOK, cachedFixedFilesReas = probeFixedFiles()
+	})
+	return cachedFixedFilesOK, cachedFixedFilesReas
+}
+
+// probeProvidedBuffersCached returns the cached ProvidedBuffers probe result.
+func probeProvidedBuffersCached() (bool, string) {
+	cachedPbufRing.Do(func() {
+		cachedPbufRingOK, cachedPbufRingReason = probeProvidedBuffers()
+	})
+	return cachedPbufRingOK, cachedPbufRingReason
+}
+
+// probeMultishotAcceptCached returns the cached MultishotAccept probe result.
+func probeMultishotAcceptCached() (bool, string) {
+	cachedMultiAccept.Do(func() {
+		cachedMultiAcceptOK, cachedMultiAcceptReas = probeMultishotAccept()
+	})
+	return cachedMultiAcceptOK, cachedMultiAcceptReas
+}
 
 // SEND_ZC ioprio flags and notification result values.
 const (
