@@ -4,12 +4,57 @@ package iouring
 
 import (
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// minMemlockPerWorker is the conservative lower bound on the locked-page
+// budget io_uring spends on each worker's ring + provided-buffer mmaps.
+// Profiling shows 6-10 MB on common configs; 12 MB gives headroom so the
+// pre-flight cap doesn't underestimate and let createWorkers ENOMEM after
+// we already promised it'd fit.
+const minMemlockPerWorker = 12 * 1024 * 1024
+
+// capWorkersToMemlock returns min(want, RLIMIT_MEMLOCK / minMemlockPerWorker).
+// When the soft limit is unlimited (RLIM_INFINITY), the request is honoured
+// as-is. When the cap forces a reduction, the chosen logger is informed so
+// the operator can spot the workaround and decide whether to raise the limit.
+// A bottom of 1 worker is enforced — the caller's createWorkers / NewRing
+// will surface a precise ENOMEM via ring.go's diagnostic if even that
+// doesn't fit, which is a stronger signal than silently dying.
+func capWorkersToMemlock(want int, logger *slog.Logger) int {
+	if want <= 1 {
+		return want
+	}
+	var rlim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
+		return want
+	}
+	if rlim.Cur == ^uint64(0) {
+		return want
+	}
+	maxByMemlock := int(rlim.Cur / minMemlockPerWorker)
+	if maxByMemlock < 1 {
+		maxByMemlock = 1
+	}
+	if maxByMemlock >= want {
+		return want
+	}
+	if logger != nil {
+		logger.Warn("io_uring workers capped by RLIMIT_MEMLOCK",
+			"requested", want,
+			"capped_to", maxByMemlock,
+			"memlock_cur_bytes", rlim.Cur,
+			"min_per_worker_bytes", minMemlockPerWorker,
+			"hint", "raise via `ulimit -l unlimited`, systemd LimitMEMLOCK=infinity, or run as root",
+		)
+	}
+	return maxByMemlock
+}
 
 // kernelTimespec mirrors struct __kernel_timespec.
 type kernelTimespec struct {

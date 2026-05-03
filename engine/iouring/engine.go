@@ -137,6 +137,16 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	resolved := e.cfg.Resources.Resolve()
 
+	// Cap workers to fit RLIMIT_MEMLOCK. Each worker locks ~12 MB for its
+	// ring + buffers; the systemd / kernel default of 8 MB only fits one.
+	// Without this, the engine would error out on the first worker past
+	// the limit with ENOMEM; capping silently lets a default-ulimit cloud
+	// VM keep running on fewer workers (and logs the cap so the operator
+	// can fix the limit if they want full parallelism).
+	if capped := capWorkersToMemlock(resolved.Workers, e.cfg.Logger); capped < resolved.Workers {
+		resolved.Workers = capped
+	}
+
 	cpus := platform.DistributeWorkers(resolved.Workers, e.profile.NumCPU, e.profile.NUMANodes)
 
 	// Probe for the highest working tier by test-creating a ring.
