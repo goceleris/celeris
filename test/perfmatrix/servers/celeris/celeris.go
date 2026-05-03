@@ -203,7 +203,7 @@ func (s *celerisServer) Start(_ context.Context, svcs *services.Handles) (net.Li
 	done := make(chan error, 1)
 	go func() { done <- srv.StartWithListenerAndContext(engineCtx, ln) }()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(bindDeadline)
 	for srv.Addr() == nil && time.Now().Before(deadline) {
 		select {
 		case err := <-done:
