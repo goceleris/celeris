@@ -161,19 +161,39 @@ func (e *Engine) Listen(ctx context.Context) error {
 	})
 
 	// Wait for both engines to bind their addresses.
-	// io_uring may need multiple tier fallback attempts, so allow ample time.
+	// io_uring may need multiple tier fallback attempts, so allow ample time —
+	// but if either sub-engine has already returned an error to errCh
+	// (e.g. ENOMEM at io_uring_setup under low RLIMIT_MEMLOCK), surface it
+	// immediately instead of waiting out the deadline.
 	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	bindWait := time.NewTimer(time.Until(deadline))
+	defer bindWait.Stop()
+	var startErr error
+bindLoop:
+	for {
 		if e.primary.Addr() != nil && e.secondary.Addr() != nil {
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		select {
+		case startErr = <-errCh:
+			break bindLoop
+		case <-bindWait.C:
+			break bindLoop
+		case <-tick.C:
+		}
 	}
 
+	if startErr != nil {
+		innerCancel()
+		wg.Wait()
+		return fmt.Errorf("sub-engine startup failed: %w", startErr)
+	}
 	if e.primary.Addr() == nil || e.secondary.Addr() == nil {
 		innerCancel()
 		wg.Wait()
-		return fmt.Errorf("sub-engines failed to initialize")
+		return fmt.Errorf("sub-engines failed to initialize within 20s deadline")
 	}
 
 	// Pause standby engine's accept BEFORE publishing Addr so the
