@@ -5,7 +5,6 @@ package websocket
 import (
 	"context"
 	"net"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,43 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/goceleris/celeris"
 	celerisengine "github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/probe"
 )
-
-// minMemlockPerWorker estimates the locked-page budget io_uring spends on
-// each worker's ring + buffers. The actual number scales with ring size
-// and pbuf-ring entries; 12 MB is comfortable headroom over the typical
-// 6-10 MB observed in profiling.
-const minMemlockPerWorker = 12 * 1024 * 1024
-
-// memlockSufficientForIOUring returns true when RLIMIT_MEMLOCK is high enough
-// (or unlimited) to start a multi-worker io_uring engine on this host. Under
-// the systemd / kernel default of 8 MB, anything past worker 0 fails ENOMEM
-// and the engine never finishes binding — bench harnesses use ulimit -l
-// unlimited but go-test does not, so the test must self-skip rather than
-// time out at the engine-start deadline.
-func memlockSufficientForIOUring() (bool, string) {
-	var rlim unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
-		return true, ""
-	}
-	if rlim.Cur == ^uint64(0) {
-		return true, ""
-	}
-	needed := uint64(runtime.NumCPU()) * minMemlockPerWorker
-	if rlim.Cur < needed {
-		return false, "RLIMIT_MEMLOCK soft=" + strconv.FormatUint(rlim.Cur, 10) +
-			" insufficient for " + strconv.Itoa(runtime.NumCPU()) +
-			" workers (need ~" + strconv.FormatUint(needed, 10) +
-			"); raise via `ulimit -l unlimited`, " +
-			"systemd LimitMEMLOCK=infinity, or run as root"
-	}
-	return true, ""
-}
 
 // engineKinds enumerates the native engines under test on Linux. The std
 // engine is exercised by the cross-platform tests in websocket_test.go.
@@ -72,14 +38,9 @@ func engineKinds(t *testing.T) []celeris.EngineType {
 	kinds := []celeris.EngineType{celeris.Epoll}
 	p := probe.Probe()
 	if p.IOUringTier >= celerisengine.High && p.ProvidedBuffers {
-		if ok, why := memlockSufficientForIOUring(); !ok {
-			t.Logf("io_uring tier=%s kernel=%s — skipping IOUring sub-tests: %s",
-				p.IOUringTier.String(), p.KernelVersion, why)
-		} else {
-			kinds = append(kinds, celeris.IOUring)
-			t.Logf("io_uring tier=%s kernel=%s — including in test matrix",
-				p.IOUringTier.String(), p.KernelVersion)
-		}
+		kinds = append(kinds, celeris.IOUring)
+		t.Logf("io_uring tier=%s kernel=%s — including in test matrix",
+			p.IOUringTier.String(), p.KernelVersion)
 	} else {
 		t.Logf("io_uring tier=%s kernel=%s — skipping IOUring sub-tests (need High+ for v1.3.4 validation)",
 			p.IOUringTier.String(), p.KernelVersion)
