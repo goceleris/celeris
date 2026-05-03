@@ -382,11 +382,24 @@ func (e *Engine) NumWorkers() int {
 	return len(e.workers)
 }
 
-// WorkerLoop returns the WorkerLoop for worker n.
+// WorkerLoop returns the WorkerLoop for worker n. Out-of-range n is
+// reduced modulo NumWorkers so callers can hash a connection / FD across
+// the available pool without first reading NumWorkers — important now
+// that workers can be capped below NumCPU by RLIMIT_MEMLOCK.
+// Negative n is mirrored to the positive side first. Panics only when
+// the engine has no workers (i.e. Listen has not yet started).
 func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.workers[n]
+	count := len(e.workers)
+	if count == 0 {
+		panic("celeris/iouring: WorkerLoop called before Listen")
+	}
+	idx := n % count
+	if idx < 0 {
+		idx += count
+	}
+	return e.workers[idx]
 }
 
 // Addr returns the bound listener address.
