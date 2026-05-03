@@ -145,6 +145,14 @@ func (t *ClusterTx) Set(key string, value any, expiration time.Duration) *Status
 	return &StatusCmd{pc: t.addCmd(kindStatus, key, args...)}
 }
 
+// SetBytes is the allocation-lean variant of [ClusterTx.Set] — uses
+// unsafe.String to avoid the argify string(x) copy.
+func (t *ClusterTx) SetBytes(key string, value []byte, expiration time.Duration) *StatusCmd {
+	args := []string{"SET", key, unsafeStringFromBytes(value)}
+	args = appendExpire(args, expiration)
+	return &StatusCmd{pc: t.addCmd(kindStatus, key, args...)}
+}
+
 // Del enqueues DEL.
 func (t *ClusterTx) Del(keys ...string) *IntCmd {
 	for _, k := range keys {
@@ -196,6 +204,12 @@ func (t *ClusterTx) HSet(key string, values ...any) *IntCmd {
 	return &IntCmd{pc: t.addCmd(kindInt, key, args...)}
 }
 
+// HSetBytes enqueues single-field HSET using a zero-copy []byte value.
+func (t *ClusterTx) HSetBytes(key, field string, value []byte) *IntCmd {
+	args := []string{"HSET", key, field, unsafeStringFromBytes(value)}
+	return &IntCmd{pc: t.addCmd(kindInt, key, args...)}
+}
+
 // LPush enqueues LPUSH.
 func (t *ClusterTx) LPush(key string, values ...any) *IntCmd {
 	args := make([]string, 0, 2+len(values))
@@ -206,12 +220,32 @@ func (t *ClusterTx) LPush(key string, values ...any) *IntCmd {
 	return &IntCmd{pc: t.addCmd(kindInt, key, args...)}
 }
 
+// LPushBytes enqueues LPUSH with zero-copy []byte values.
+func (t *ClusterTx) LPushBytes(key string, values ...[]byte) *IntCmd {
+	args := make([]string, 0, 2+len(values))
+	args = append(args, "LPUSH", key)
+	for _, v := range values {
+		args = append(args, unsafeStringFromBytes(v))
+	}
+	return &IntCmd{pc: t.addCmd(kindInt, key, args...)}
+}
+
 // RPush enqueues RPUSH.
 func (t *ClusterTx) RPush(key string, values ...any) *IntCmd {
 	args := make([]string, 0, 2+len(values))
 	args = append(args, "RPUSH", key)
 	for _, v := range values {
 		args = append(args, argify(v))
+	}
+	return &IntCmd{pc: t.addCmd(kindInt, key, args...)}
+}
+
+// RPushBytes enqueues RPUSH with zero-copy []byte values.
+func (t *ClusterTx) RPushBytes(key string, values ...[]byte) *IntCmd {
+	args := make([]string, 0, 2+len(values))
+	args = append(args, "RPUSH", key)
+	for _, v := range values {
+		args = append(args, unsafeStringFromBytes(v))
 	}
 	return &IntCmd{pc: t.addCmd(kindInt, key, args...)}
 }

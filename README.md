@@ -104,6 +104,7 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`adapters`](middleware/adapters) | Bidirectional stdlib ↔ celeris middleware/handler conversion |
 | [`basicauth`](middleware/basicauth) | HTTP Basic authentication with hashed password support |
 | [`bodylimit`](middleware/bodylimit) | Request body size enforcement |
+| [`cache`](middleware/cache) | HTTP response cache with singleflight + Cache-Control honoring |
 | [`circuitbreaker`](middleware/circuitbreaker) | Circuit breaker (3-state, sliding window error rate, 503 + Retry-After) |
 | [`compress`](middleware/compress) | Response compression (zstd, brotli, gzip; separate go.mod) |
 | [`cors`](middleware/cors) | Cross-Origin Resource Sharing (zero-alloc) |
@@ -111,25 +112,28 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`debug`](middleware/debug) | Debug/introspection endpoints (loopback-only by default) |
 | [`etag`](middleware/etag) | Automatic ETag generation and conditional 304 responses |
 | [`healthcheck`](middleware/healthcheck) | Kubernetes-style liveness/readiness/startup probes |
+| [`idempotency`](middleware/idempotency) | Idempotency-Key replay protection (state machine: in-flight 409 + cached replay) |
 | [`jwt`](middleware/jwt) | JWT authentication (HMAC/RSA/ECDSA/EdDSA, JWKS auto-refresh) |
 | [`keyauth`](middleware/keyauth) | API key authentication with constant-time comparison |
 | [`logger`](middleware/logger) | Structured request logging (slog, zero-alloc FastHandler) |
 | [`methodoverride`](middleware/methodoverride) | HTTP method override via header or form field |
 | [`metrics`](middleware/metrics) | Prometheus metrics (separate go.mod) |
 | [`otel`](middleware/otel) | OpenTelemetry tracing + metrics (separate go.mod) |
+| [`overload`](middleware/overload) | 5-stage CPU + queue-depth + tail-latency-EMA overload control (503 + Retry-After) |
 | [`pprof`](middleware/pprof) | Go profiling endpoints (loopback-only by default) |
 | [`protobuf`](middleware/protobuf) | Protobuf serialization with content negotiation (separate go.mod) |
 | [`proxy`](middleware/proxy) | Trusted proxy header extraction (X-Forwarded-For, X-Real-IP) |
-| [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter |
+| [`ratelimit`](middleware/ratelimit) | Sharded token bucket / sliding window rate limiter (Redis store adapter) |
 | [`recovery`](middleware/recovery) | Panic recovery with broken pipe detection |
 | [`redirect`](middleware/redirect) | URL redirect/rewrite (HTTPS, www, trailing slash) |
 | [`requestid`](middleware/requestid) | Request ID generation (buffered UUID v4) |
 | [`rewrite`](middleware/rewrite) | Regex-based URL rewriting with capture group support |
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
-| [`session`](middleware/session) | Cookie-based sessions with pluggable store |
+| [`session`](middleware/session) | Cookie-based sessions on the unified [`store.KV`](middleware/store) (memory / Redis / Postgres / memcached adapters) |
 | [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
 | [`sse`](middleware/sse) | Server-Sent Events with heartbeat + Last-Event-ID resumption |
 | [`static`](middleware/static) | Static file serving with directory browse, ETag/Last-Modified caching |
+| [`store`](middleware/store) | Unified `KV` interface + adapters (memory LRU, Redis, Postgres, memcached) shared by session / csrf / ratelimit / cache / idempotency / jwt JWKS |
 | [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI/Scalar (CDN-loaded) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
 | [`websocket`](middleware/websocket) | RFC 6455 WebSocket with permessage-deflate + engine-integrated backpressure |
@@ -276,9 +280,9 @@ For Prometheus exposition and debug endpoints, use the [`middleware/metrics`](mi
 
 For current benchmark results and methodology, see [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks).
 
-Middleware comparison benchmarks are in [`test/benchcmp/`](test/benchcmp/) (Celeris vs Fiber v3 vs Echo v4 vs Chi v5 vs stdlib). Run with `mage middlewareBenchmark`.
+Cross-framework performance benchmarks live in [`test/perfmatrix/`](test/perfmatrix/) — a (scenario × server × protocol) matrix driven by `loadgen`. Run the full sweep with `mage matrixBench` or the dev-loop subset with `mage matrixBenchQuick`. Driver-isolation benchmarks remain in [`test/drivercmp/`](test/drivercmp/) and WebSocket comparisons in [`test/benchcmp_ws/`](test/benchcmp_ws/).
 
-> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use `test/benchcmp/` for fair cross-framework comparisons.
+> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use `test/perfmatrix/` for fair cross-framework comparisons.
 
 ## Project Structure
 

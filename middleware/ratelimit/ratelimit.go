@@ -196,14 +196,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		if !disableHeaders {
-			c.SetHeader("x-ratelimit-limit", activeLimitStr)
-			c.SetHeader("x-ratelimit-remaining", formatInt(remaining))
-			c.SetHeader("x-ratelimit-reset", formatResetSeconds(resetNano, now))
+			c.SetHeaderTrust("x-ratelimit-limit", activeLimitStr)
+			c.SetHeaderTrust("x-ratelimit-remaining", formatInt(remaining))
+			c.SetHeaderTrust("x-ratelimit-reset", formatResetSeconds(resetNano, now))
 		}
 
 		if !allowed {
 			if !disableHeaders {
-				c.SetHeader("retry-after", formatResetSeconds(resetNano, now))
+				c.SetHeaderTrust("retry-after", formatResetSeconds(resetNano, now))
 			}
 			if limitReached != nil {
 				return limitReached(c)
@@ -248,13 +248,13 @@ func newStoreMiddleware(
 		}
 
 		if !disableHeaders {
-			c.SetHeader("x-ratelimit-limit", limitStr)
-			c.SetHeader("x-ratelimit-remaining", formatInt(remaining))
+			c.SetHeaderTrust("x-ratelimit-limit", limitStr)
+			c.SetHeaderTrust("x-ratelimit-remaining", formatInt(remaining))
 			resetSec := int(time.Until(resetAt).Seconds() + 0.999)
 			if resetSec < 0 {
 				resetSec = 0
 			}
-			c.SetHeader("x-ratelimit-reset", formatInt(resetSec))
+			c.SetHeaderTrust("x-ratelimit-reset", formatInt(resetSec))
 		}
 
 		if !allowed {
@@ -263,7 +263,7 @@ func newStoreMiddleware(
 				if retryAfter < 0 {
 					retryAfter = 0
 				}
-				c.SetHeader("retry-after", formatInt(retryAfter))
+				c.SetHeaderTrust("retry-after", formatInt(retryAfter))
 			}
 			if limitReached != nil {
 				return limitReached(c)

@@ -41,6 +41,13 @@ func newConnector(dsn string) (*Connector, error) {
 	if err := parsed.CheckSSL(); err != nil {
 		return nil, err
 	}
+	// database/sql production entry point — default to auto-prepared+
+	// cached statements unless the DSN explicitly opted out. Mirrors
+	// pgx's QueryExecModeCacheStatement default. Lower-level dialConn
+	// users (internal tests, raw DSN flows) keep the field unset.
+	if !parsed.Options.autoCacheStatementsExplicit {
+		parsed.Options.AutoCacheStatements = true
+	}
 	return &Connector{dsn: parsed}, nil
 }
 

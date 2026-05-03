@@ -14,6 +14,13 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
+func init() {
+	// Wire the H1-package helpers so protocol/h2/stream can lazily
+	// materialize request headers from raw bytes without taking a
+	// build-time dependency on protocol/h1.
+	stream.SetLazyHeaderHelpers(h1.UnsafeLowerHeader, h1.UnsafeString)
+}
+
 // ErrHijacked is returned by ProcessH1 when the connection was hijacked.
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
@@ -31,8 +38,16 @@ var expectation417Response = []byte("HTTP/1.1 417 Expectation Failed\r\nContent-
 
 // H1State holds per-connection H1 parsing state.
 type H1State struct {
-	parser             *h1.Parser
-	buffer             bytes.Buffer
+	parser *h1.Parser
+	buffer bytes.Buffer
+	// bodyBuf holds an in-progress fixed-length body that spans multiple
+	// ProcessH1 calls. Reused across requests so each connection allocates
+	// once at its peak body size. Using a dedicated slice bypasses the
+	// state.buffer (*bytes.Buffer) doubling-grow and the paired
+	// cs.buf→state.buffer memcpy that previously dominated the 1 MiB POST
+	// hot path.
+	bodyBuf            []byte
+	bodyNeeded         int
 	req                h1.Request
 	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
 	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
@@ -95,6 +110,19 @@ type H1State struct {
 	// ErrUpgradeH2C. The engine consumes it via switchToH2 and then clears
 	// it. Always nil on a clean (non-upgrade) connection.
 	UpgradeInfo *UpgradeInfo
+
+	// WorkerID is the engine worker ID owning the connection (-1 for
+	// unset / std engine). Set by the engine at initProtocol; copied to
+	// the stream by populateCachedStream so HandleStream can read it
+	// without a per-request ctx.Value() walk.
+	WorkerID    int32
+	WorkerIDSet bool
+
+	// NowNs is the engine's worker-local cached time.Now().UnixNano()
+	// for the most recent recv. The engine writes it just before calling
+	// ProcessH1; populateCachedStream copies it to the stream so the
+	// handler can record start time without a per-request time.Now() vDSO.
+	NowNs int64
 }
 
 // UpdateWriteFn replaces the response adapter's write function. Called by
@@ -103,8 +131,86 @@ func (s *H1State) UpdateWriteFn(fn func([]byte)) {
 	s.rw.write = fn
 }
 
+// SetWriteBodyFn installs a scatter-gather body writer on the response
+// adapter. When non-nil, WriteResponse for large bodies bypasses the
+// respBuf → cs.writeBuf copy and hands the body slice straight to the
+// engine for a single WRITEV/sendmsg submission. Callers must not mutate
+// the body slice after a writeBody call until the response returns (the
+// engine keeps a reference until the SEND CQE fires). The std engine and
+// adapters that cannot express scatter-gather may leave this unset; the
+// adapter then falls back to the single-buffer path.
+func (s *H1State) SetWriteBodyFn(fn func([]byte)) {
+	s.rw.writeBody = fn
+}
+
 func (s *H1State) maxBodySize() int64 {
 	return s.MaxRequestBodySize // 0 = unlimited (limit > 0 guard at call sites)
+}
+
+// NextRecvBuf returns the tail of the pending body buffer when H1 is in a
+// partial-body state, so the engine can recv directly into bodyBuf and
+// skip the cs.buf → bodyBuf memcpy. Returns nil when the engine should
+// use its own per-connection read buffer.
+//
+// Callers MUST pair a successful non-nil read with ConsumeBodyRecv(n) so
+// H1State can detect body completion and trigger handler dispatch.
+func (s *H1State) NextRecvBuf() []byte {
+	if s.bodyNeeded <= 0 {
+		return nil
+	}
+	free := cap(s.bodyBuf) - len(s.bodyBuf)
+	if free <= 0 {
+		return nil
+	}
+	return s.bodyBuf[len(s.bodyBuf) : len(s.bodyBuf)+free]
+}
+
+// ConsumeBodyRecv extends bodyBuf by n bytes and reports whether the body
+// is now complete. Paired with NextRecvBuf on the engine side.
+func (s *H1State) ConsumeBodyRecv(n int) (complete bool) {
+	s.bodyBuf = s.bodyBuf[:len(s.bodyBuf)+n]
+	return len(s.bodyBuf) >= s.bodyNeeded
+}
+
+// DispatchBufferedBody runs the handler against the fully-buffered body
+// that NextRecvBuf / ConsumeBodyRecv accumulated. The engine must have
+// observed complete=true from ConsumeBodyRecv. Returns the residual
+// unread bytes if the recv overshot into the next pipelined request, or
+// nil when nothing is left. KeepAlive / Detached state lives on s.req —
+// same semantics as ProcessH1's equivalent exit.
+func (s *H1State) DispatchBufferedBody(ctx context.Context, handler stream.Handler, write func([]byte)) ([]byte, error) {
+	overflow := len(s.bodyBuf) - s.bodyNeeded
+	var rest []byte
+	if overflow > 0 {
+		rest = append([]byte(nil), s.bodyBuf[s.bodyNeeded:]...)
+		s.bodyBuf = s.bodyBuf[:s.bodyNeeded]
+	}
+	s.parser.Reset(s.buffer.Bytes())
+	s.req.Reset()
+	if _, err := s.parser.ParseRequest(&s.req); err != nil {
+		writeErrorResponse(write, 400, "Bad Request")
+		return nil, err
+	}
+	s.buffer.Reset()
+	bodyData := s.bodyBuf
+	if err := tryUpgradeH2C(s, bodyData, rest, write); err != nil {
+		return nil, err
+	}
+	if s.UpgradeInfo != nil {
+		return nil, ErrUpgradeH2C
+	}
+	if err := handleH1Request(ctx, s, bodyData, handler, write); err != nil {
+		return nil, err
+	}
+	s.bodyBuf = s.bodyBuf[:0]
+	s.bodyNeeded = 0
+	if s.Detached {
+		return nil, nil
+	}
+	if !s.req.KeepAlive {
+		return nil, errConnectionClose
+	}
+	return rest, nil
 }
 
 // NewH1State creates a new H1 connection state with zero-copy header parsing.
@@ -114,6 +220,15 @@ func NewH1State() *H1State {
 	return &H1State{
 		parser: p,
 	}
+}
+
+// DisableH2CDetect tells the H1 parser it can skip per-header h2c-upgrade
+// detection. The engine calls this on connections whose config has
+// EnableH2Upgrade=false; the upgrade path is impossible in that mode and
+// parsing every header against Upgrade / HTTP2-Settings / Connection is
+// wasted work on the recv hot path.
+func (s *H1State) DisableH2CDetect() {
+	s.parser.SetDisableH2CDetect(true)
 }
 
 // CloseH1 releases the cached stream and context (if any) back to their pools.
@@ -127,6 +242,13 @@ func CloseH1(state *H1State) {
 		state.stream.Release()
 		state.stream = nil
 	}
+	// Free the body buffer — for a conn that handled a 1 MiB POST, this
+	// is where we relinquish the arena. Reuse across requests on the
+	// same conn is fine (the 10 k idle-conn × 1 MiB scenario only
+	// triggers if every conn sustained a huge POST, which implies the
+	// memory was already being paid for real traffic).
+	state.bodyBuf = nil
+	state.bodyNeeded = 0
 }
 
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
@@ -140,6 +262,53 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	if state.Detached && state.WSDataDelivery != nil {
 		state.WSDataDelivery(data)
 		return nil
+	}
+
+	// In-progress fixed-length body spanning multiple reads. Append into
+	// the dedicated bodyBuf (no state.buffer memcpy), then re-parse the
+	// headers from state.buffer (kept stable across reads since the H1
+	// parser runs in zero-copy mode and state.req slices reference the
+	// per-call `data` buffer that the engine reuses). When the body is
+	// full, dispatch the handler.
+	if state.bodyNeeded > 0 {
+		need := state.bodyNeeded - len(state.bodyBuf)
+		if len(data) < need {
+			state.bodyBuf = append(state.bodyBuf, data...)
+			return nil
+		}
+		state.bodyBuf = append(state.bodyBuf, data[:need]...)
+		rest := data[need:]
+		// Re-parse headers from state.buffer so req fields point at
+		// stable memory (the earlier partial-body branch stashed them).
+		state.parser.Reset(state.buffer.Bytes())
+		state.req.Reset()
+		if _, err := state.parser.ParseRequest(&state.req); err != nil {
+			writeErrorResponse(write, 400, "Bad Request")
+			return err
+		}
+		state.buffer.Reset()
+		bodyData := state.bodyBuf
+		if err := tryUpgradeH2C(state, bodyData, rest, write); err != nil {
+			return err
+		}
+		if state.UpgradeInfo != nil {
+			return ErrUpgradeH2C
+		}
+		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
+			return err
+		}
+		state.bodyBuf = state.bodyBuf[:0]
+		state.bodyNeeded = 0
+		if state.Detached {
+			return nil
+		}
+		if !state.req.KeepAlive {
+			return errConnectionClose
+		}
+		if len(rest) == 0 {
+			return nil
+		}
+		data = rest
 	}
 
 	if state.buffer.Len() == 0 {
@@ -181,6 +350,57 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					}
 					write(continue100Response)
 					state.req.ExpectContinue = false
+				}
+				// Zero-copy body fast path: if the entire content-length
+				// body is already in `data`, dispatch directly from the
+				// engine's read buffer — skipping a full-body memcpy into
+				// state.buffer. Only applies to fixed-length bodies;
+				// chunked encoding keeps going through the buffered path
+				// so ParseChunkedBody can accumulate across reads.
+				if bodyNeeded > 0 {
+					remaining := len(data) - offset - consumed
+					if int64(remaining) >= bodyNeeded {
+						bodyStart := offset + consumed
+						bodyEnd := bodyStart + int(bodyNeeded)
+						bodyData := data[bodyStart:bodyEnd]
+						if err := tryUpgradeH2C(state, bodyData, data[bodyEnd:], write); err != nil {
+							return err
+						}
+						if state.UpgradeInfo != nil {
+							return ErrUpgradeH2C
+						}
+						if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
+							return err
+						}
+						if state.Detached {
+							return nil
+						}
+						if !state.req.KeepAlive {
+							return errConnectionClose
+						}
+						offset = bodyEnd
+						continue
+					}
+					// Partial body: accumulate body bytes into bodyBuf
+					// (reused across requests on this connection), and
+					// stash the header bytes in state.buffer so state.req
+					// can be re-parsed from stable memory when the body
+					// completes across subsequent reads (req slices today
+					// point into the per-call `data`, which the engine
+					// reuses).
+					need := int(bodyNeeded)
+					if cap(state.bodyBuf) < need {
+						state.bodyBuf = make([]byte, 0, need)
+					} else {
+						state.bodyBuf = state.bodyBuf[:0]
+					}
+					if remaining > 0 {
+						state.bodyBuf = append(state.bodyBuf, data[offset+consumed:]...)
+					}
+					state.buffer.Reset()
+					state.buffer.Write(data[offset : offset+consumed])
+					state.bodyNeeded = need
+					return nil
 				}
 				state.buffer.Write(data[offset:])
 				break
@@ -257,6 +477,26 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		case bodyNeeded > 0:
 			available := int64(state.buffer.Len() - consumed)
 			if available < bodyNeeded {
+				// Body is incomplete. Move any body bytes currently in
+				// state.buffer into bodyBuf, then shrink state.buffer
+				// back to just the header bytes. Subsequent ProcessH1
+				// calls will take the state.bodyNeeded > 0 short-circuit
+				// and append directly to bodyBuf, avoiding the
+				// bytes.Buffer doubling-grow + cs.buf→state.buffer
+				// memcpy on each partial-body read.
+				need := int(bodyNeeded)
+				if cap(state.bodyBuf) < need {
+					state.bodyBuf = make([]byte, 0, need)
+				} else {
+					state.bodyBuf = state.bodyBuf[:0]
+				}
+				if available > 0 {
+					bufBytes := state.buffer.Bytes()
+					state.bodyBuf = append(state.bodyBuf, bufBytes[consumed:]...)
+					// Trim body bytes off the buffer; headers remain.
+					state.buffer.Truncate(consumed)
+				}
+				state.bodyNeeded = need
 				return nil
 			}
 			state.buffer.Next(consumed)
@@ -415,12 +655,18 @@ func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	s := populateCachedStream(state, req, body)
 
 	// Reuse the connection-scoped response adapter — avoids a heap allocation
-	// per request. Reset per-request fields; hijackFn/write are stable.
+	// per request. Reset per-request fields. write and hijackFn are stable
+	// across requests on the same connection (write is the engine's
+	// per-conn writeFn closure, hijackFn is set once at initProtocol), so
+	// wire them on the first request and skip the re-assignment after.
+	// UpdateWriteFn handles the rare detach swap if it happens.
 	rw := &state.rw
-	rw.write = write
+	if rw.write == nil {
+		rw.write = write
+		rw.hijackFn = state.HijackFn
+	}
 	rw.keepAlive = req.KeepAlive
 	rw.isHEAD = req.Method == "HEAD"
-	rw.hijackFn = state.HijackFn
 	rw.hijacked = false
 	s.ResponseWriter = rw
 
@@ -479,32 +725,30 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 	}
 	s.RemoteAddr = state.RemoteAddr
 	s.OnDetach = state.OnDetach
-	// Reuse the stream's existing header slice capacity.
-	hdrs := s.Headers[:0]
-	needed := len(req.RawHeaders) + 4
-	if cap(hdrs) < needed {
-		hdrs = make([][2]string, 0, needed)
-	}
-	hdrs = append(hdrs,
-		[2]string{":method", req.Method},
-		[2]string{":path", req.Path},
-		[2]string{":scheme", "http"},
-		[2]string{":authority", req.Host},
-	)
-	// Zero-copy header conversion: lowercase names in-place, then create
-	// strings backed by the read buffer. Safe because H1 handlers run
-	// synchronously — the buffer isn't reused until after the stream is released.
-	for _, rh := range req.RawHeaders {
-		hdrs = append(hdrs, [2]string{
-			h1.UnsafeLowerHeader(rh[0]),
-			h1.UnsafeString(rh[1]),
-		})
-	}
-	s.Headers = hdrs
+	s.WorkerID = state.WorkerID
+	s.WorkerIDSet = state.WorkerIDSet
+	s.StartTimeNs = state.NowNs
+	// Pseudo-headers (:method/:path/:scheme/:authority) live on dedicated
+	// Stream fields so Context.extractRequestInfo / Context.Host read them
+	// without walking s.Headers. The slice append + 4 pseudo-header
+	// allocations are deferred to Stream.MaterializeHeaders, which the
+	// Context only triggers when a handler actually reads request headers
+	// via Header / RequestHeaders / ForEachHeader. The same goes for the
+	// raw-header lowercase loop (LazyRawHeaders). Bench-style handlers
+	// that read only c.method / c.path skip both passes entirely.
+	s.Headers = s.Headers[:0]
+	s.Method = req.Method
+	s.Path = req.Path
+	s.Scheme = "http"
+	s.Authority = req.Host
+	s.LazyRawHeaders = req.RawHeaders
 	s.IsHEAD = req.Method == "HEAD"
 
 	if len(body) > 0 {
-		_, _ = s.GetBuf().Write(body)
+		// Zero-copy: body is a slice into the H1 read buffer that stays
+		// stable for the handler's synchronous lifetime (state.buffer is
+		// only advanced past these bytes before handler dispatch).
+		s.SetRawBody(body)
 	}
 	s.EndStream = true
 	// Direct assignment — no mutex needed. H1 streams are single-threaded

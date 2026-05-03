@@ -21,10 +21,16 @@ type Options struct {
 	// AutoCacheStatements, when true AND StatementCacheSize > 0, causes
 	// cacheable SELECT-style QueryContext calls to transparently auto-
 	// prepare on first use and reuse via the extended protocol on
-	// subsequent calls. Default false preserves the legacy simple-query
-	// behaviour for queries without an explicit db.Prepare. Equivalent to
-	// pgx's QueryExecModeCacheStatement at steady state.
+	// subsequent calls. Equivalent to pgx's QueryExecModeCacheStatement
+	// at steady state. Default true; opt out per DSN with
+	// auto_cache_statements=false (preserves the simple-query behaviour
+	// for callers that do not want per-conn statement caching).
 	AutoCacheStatements bool
+	// autoCacheStatementsExplicit tracks whether the DSN parser observed
+	// an explicit auto_cache_statements=… parameter so applyDefaults can
+	// distinguish "user opted out" from "field was never set" before
+	// flipping the default to true.
+	autoCacheStatementsExplicit bool
 	// Application is copied into the "application_name" startup parameter.
 	Application string
 	// SSLMode is the parsed sslmode value. "disable" and "prefer" are
@@ -212,6 +218,7 @@ func applyDSNKey(d *DSN, k, v string) error {
 		default:
 			return fmt.Errorf("celeris-postgres: auto_cache_statements = %q: want bool", v)
 		}
+		d.Options.autoCacheStatementsExplicit = true
 	case "application_name":
 		d.Options.Application = v
 	default:
@@ -259,8 +266,8 @@ func applyDefaults(d *DSN) {
 //     got none.
 //   - "require" / "verify-ca" / "verify-full" : TLS is mandatory;
 //     rejected with ErrSSLNotSupported. Users with managed
-//     cloud DBs (RDS, CloudSQL, etc.) must wait for v1.4.x
-//     TLS support.
+//     cloud DBs (RDS, CloudSQL, etc.) need to terminate TLS at a
+//     sidecar / VPC boundary until first-class TLS support lands.
 func (d *DSN) CheckSSL() error {
 	switch strings.ToLower(d.Options.SSLMode) {
 	case "", "disable":
@@ -271,7 +278,7 @@ func (d *DSN) CheckSSL() error {
 		// see the mismatch at startup instead of discovering it in
 		// production.
 		fmt.Fprintf(os.Stderr,
-			"celeris-postgres: sslmode=%s silently downgraded to plaintext — v1.4.0 has no TLS stack (use sslmode=disable explicitly, or wait for v1.4.x TLS support)\n",
+			"celeris-postgres: sslmode=%s silently downgraded to plaintext — driver has no TLS stack yet (set sslmode=disable explicitly to silence this warning, or terminate TLS at a sidecar / VPC boundary)\n",
 			d.Options.SSLMode)
 		return nil
 	case "require", "verify-ca", "verify-full":

@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/conn"
 )
 
@@ -42,22 +41,39 @@ func (cs *connState) sendCap() int {
 	return maxSendQueueBytes
 }
 
+// iovec mirrors Linux struct iovec (16 bytes on 64-bit platforms).
+// Used for IORING_OP_WRITEV scatter-gather sends. Celeris only builds
+// on amd64 and arm64 (both 64-bit), so size is stable at 16.
+type iovec struct {
+	Base uintptr
+	Len  uint64
+}
+
 type connState struct {
-	fd             int             // 8: real FD, or fixed file index
-	protocol       engine.Protocol // 1
-	detected       bool            // 1
-	sending        bool            // 1: true when a SEND SQE is in-flight
-	closing        bool            // 1: defers close until sends complete
-	dirty          bool            // 1: true when data needs flushing
-	fixedFile      bool            // 1: true when fd is fixed file index
-	recvLinked     bool            // 1: RECV was linked to SEND (skip standalone prepareRecv)
-	needsRecv      bool            // 1: recv arm was dropped (SQ ring full); retry on next opportunity
-	zcNotifPending bool            // 1: waiting for SEND_ZC notification CQE
-	zcSentBytes    int32           // bytes sent from first SEND_ZC CQE (processed on NOTIF)
-	sendBuf        []byte          // 24: in-flight buffer (accessed with sending flag)
+	fd int // 8: real FD, or fixed file index
+	// protocol is accessed concurrently: the worker reads it on every
+	// recv completion, and the async dispatch goroutine writes it once
+	// via switchToH2Local during an H1→H2 upgrade. atomic.Int32 keeps
+	// the common-case Load a single mov instruction while making the
+	// write race-free. Use cs.getProtocol / cs.setProtocol helpers.
+	protocol       atomic.Int32 // engine.Protocol values cast to int32
+	detected       bool         // 1
+	sending        bool         // 1: true when a SEND SQE is in-flight
+	closing        bool         // 1: defers close until sends complete
+	dirty          bool         // 1: true when data needs flushing
+	fixedFile      bool         // 1: true when fd is fixed file index
+	recvLinked     bool         // 1: RECV was linked to SEND (skip standalone prepareRecv)
+	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
+	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
+	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
+	zcSentBytes    int32        // bytes sent from first SEND_ZC CQE (processed on NOTIF)
+	sendBuf        []byte       // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf  []byte     // 24: append buffer for handler writes
+	bodyBuf   []byte     // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
+	sendBody  []byte     // 24: in-flight body slice during WRITEV (cleared by completeSend)
 	buf       []byte     // 24: per-connection recv buffer
+	iov       [2]iovec   // 32: iovec storage for WRITEV SQEs (sendBuf + sendBody)
 	dirtyNext *connState // 8
 	dirtyPrev *connState // 8
 
@@ -90,6 +106,13 @@ type connState struct {
 	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
+	// asyncH2Promoted signals the worker that runAsyncHandler observed
+	// ErrUpgradeH2C and completed the cs-local H1→H2 state swap under
+	// detachMu. drainDetachQueue finishes the promotion by appending
+	// cs.fd to w.h2Conns (the worker-owned write-queue poll list) and
+	// keeps the conn alive, rather than routing it through the
+	// asyncClosed teardown.
+	asyncH2Promoted atomic.Bool
 }
 
 var connStatePool = sync.Pool{
@@ -132,7 +155,7 @@ func releaseConnState(cs *connState) {
 	cs.remoteAddr = ""
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil
-	cs.protocol = 0
+	cs.protocol.Store(0)
 	cs.detected = false
 	cs.sending = false
 	cs.closing = false
@@ -140,6 +163,7 @@ func releaseConnState(cs *connState) {
 	cs.fixedFile = false
 	cs.recvLinked = false
 	cs.needsRecv = false
+	cs.recvIntoBody = false
 	cs.zcNotifPending = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
@@ -151,6 +175,8 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.bodyBuf = nil
+	cs.sendBody = nil
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

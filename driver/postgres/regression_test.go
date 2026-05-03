@@ -560,8 +560,8 @@ func TestPgTLSErrorMessage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected SSL rejection")
 	}
-	if !strings.Contains(err.Error(), "v1.4.0") {
-		t.Fatalf("TLS error missing version info: %v", err)
+	if !strings.Contains(err.Error(), "not yet supported") {
+		t.Fatalf("TLS error missing 'not yet supported': %v", err)
 	}
 	if !strings.Contains(err.Error(), "VPC/loopback") {
 		t.Fatalf("TLS error missing workaround: %v", err)

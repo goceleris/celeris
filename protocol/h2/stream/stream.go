@@ -32,12 +32,53 @@ const (
 
 // Stream represents an HTTP/2 stream with its associated state and data.
 type Stream struct {
-	ID                     uint32
-	state                  atomic.Int32
+	ID    uint32
+	state atomic.Int32
+	// WorkerID is the engine worker ID (0..NumWorkers-1) that owns this
+	// stream's connection, or -1 when there is no meaningful worker identity
+	// (e.g. the std engine where Go's runtime scheduler picks the goroutine).
+	// Engines populate this once per connection at accept-time so handlers
+	// can read affinity without a per-request ctx.Value() walk.
+	WorkerID    int32
+	WorkerIDSet bool
+	// LazyRawHeaders, when non-nil on an H1 stream, holds raw request
+	// header bytes that have NOT been appended to Headers yet — the H1
+	// dispatch sets only the 4 pseudo-headers eagerly and defers the raw
+	// header lowercase + slice append until a handler actually reads them
+	// via Context.Header / Context.RequestHeaders. Materialized once per
+	// request via MaterializeHeaders. Cleared on stream reset.
+	LazyRawHeaders     [][2][]byte
+	lazyHeadersBuilt   bool
+	pseudoMaterialized bool
+	// H1 dispatch sets these directly so extractRequestInfo / Host()
+	// don't need to walk Headers[0..3]. Empty for H2 streams (where
+	// pseudo-headers come from HPACK and live in s.Headers as before).
+	Method    string
+	Path      string
+	Scheme    string
+	Authority string
+	// CachedRoute holds a (method, path) → (handlers, fullPath) cache
+	// scoped to the connection. The router adapter populates it on the
+	// first request and reuses it on subsequent requests on the same
+	// keep-alive connection that match the same method+path AND produced
+	// no path params (i.e. a fully-static route). Skips a static-route
+	// map lookup on every request after the first. Per-conn lifetime;
+	// reset on stream pool Release.
+	CachedRouteMethod   string
+	CachedRoutePath     string
+	CachedRouteHandlers any // []celeris.HandlerFunc — typed any to avoid cycle
+	CachedRouteFullPath string
+	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
+	// recv that produced this request. populated by populateCachedStream
+	// from the engine's worker-local clock cache so HandleStream avoids a
+	// per-request time.Now() vDSO call. Zero means "unset, fall back to
+	// time.Now()" (synthetic / std-engine path).
+	StartTimeNs            int64
 	manager                *Manager
 	Headers                [][2]string
 	Trailers               [][2]string
 	Data                   *bytes.Buffer
+	rawBody                []byte // zero-copy body slice (preferred over Data when set)
 	OutboundBuffer         *bytes.Buffer
 	OutboundEndStream      bool
 	headersSent            atomic.Bool
@@ -207,6 +248,7 @@ func (s *Stream) resetAndPool() {
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
+	s.rawBody = nil
 	if s.OutboundBuffer != nil {
 		s.OutboundBuffer.Reset()
 		bufferPool.Put(s.OutboundBuffer)
@@ -246,6 +288,20 @@ func (s *Stream) resetAndPool() {
 	s.OnWSSetError = nil
 	s.OnWSReadPauser = nil
 	s.OnWSSetIdleDeadline = nil
+	s.LazyRawHeaders = nil
+	s.lazyHeadersBuilt = false
+	s.pseudoMaterialized = false
+	s.Method = ""
+	s.Path = ""
+	s.Scheme = ""
+	s.Authority = ""
+	s.CachedRouteMethod = ""
+	s.CachedRoutePath = ""
+	s.CachedRouteHandlers = nil
+	s.CachedRouteFullPath = ""
+	s.WorkerID = 0
+	s.WorkerIDSet = false
+	s.StartTimeNs = 0
 	if s.ReceivedWindowUpd != nil {
 		for len(s.ReceivedWindowUpd) > 0 {
 			<-s.ReceivedWindowUpd
@@ -262,12 +318,74 @@ func ResetH1Stream(s *Stream) {
 		bufferPool.Put(s.Data)
 		s.Data = nil
 	}
+	s.rawBody = nil
 	s.Headers = s.hdrBuf[:0]
+	s.LazyRawHeaders = nil
+	s.lazyHeadersBuilt = false
+	s.pseudoMaterialized = false
+	s.Method = ""
+	s.Path = ""
+	s.Scheme = ""
+	s.Authority = ""
 	s.headersSent.Store(false)
 	s.EndStream = false
 	s.ResponseWriter = nil
 	s.IsHEAD = false
 	s.state.Store(int32(StateIdle))
+}
+
+// MaterializeHeaders ensures that every header carried by this H1 stream
+// has been appended to s.Headers. The H1 dispatch keeps the 4 pseudo-
+// headers (:method/:path/:scheme/:authority) on direct Stream fields
+// (Method/Path/Scheme/Authority) and defers BOTH the pseudo-header
+// pretty-print and the raw-header lowercase+append until a handler
+// actually reads them via Context.Header / Context.RequestHeaders.
+// Idempotent.
+func (s *Stream) MaterializeHeaders() {
+	if s.lazyHeadersBuilt {
+		return
+	}
+	s.lazyHeadersBuilt = true
+	needed := len(s.LazyRawHeaders)
+	if !s.pseudoMaterialized && s.Method != "" {
+		needed += 4
+	}
+	if cap(s.Headers) < len(s.Headers)+needed {
+		grown := make([][2]string, len(s.Headers), len(s.Headers)+needed)
+		copy(grown, s.Headers)
+		s.Headers = grown
+	}
+	if !s.pseudoMaterialized && s.Method != "" {
+		s.Headers = append(s.Headers,
+			[2]string{":method", s.Method},
+			[2]string{":path", s.Path},
+			[2]string{":scheme", s.Scheme},
+			[2]string{":authority", s.Authority},
+		)
+		s.pseudoMaterialized = true
+	}
+	for _, rh := range s.LazyRawHeaders {
+		s.Headers = append(s.Headers, [2]string{
+			lazyLowerHeaderName(rh[0]),
+			unsafeStringFromBytes(rh[1]),
+		})
+	}
+}
+
+// lazyLowerHeaderName mirrors h1.UnsafeLowerHeader (interned + lowercased)
+// without importing the protocol package here (would create a cycle).
+// Implemented as a function-pointer set by the H1 layer at init.
+var lazyLowerHeaderName func(b []byte) string
+
+// unsafeStringFromBytes is wired by the H1 layer at init for the same
+// reason — the stream package does not import protocol/h1.
+var unsafeStringFromBytes func(b []byte) string
+
+// SetLazyHeaderHelpers wires the H1-package helpers used by
+// MaterializeHeaders. Called from internal/conn package init.
+func SetLazyHeaderHelpers(lower func([]byte) string, str func([]byte) string) {
+	lazyLowerHeaderName = lower
+	unsafeStringFromBytes = str
 }
 
 // ResetH2StreamInline performs a lightweight reset for inline H2 stream reuse.
@@ -279,6 +397,7 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	} else {
 		s.Data = getBuf()
 	}
+	s.rawBody = nil
 	if s.OutboundBuffer != nil {
 		s.OutboundBuffer.Reset()
 	} else {
@@ -335,20 +454,48 @@ func (s *Stream) AddData(data []byte) error {
 }
 
 // GetData returns the buffered data.
+//
+// For H1 streams a raw body slice may be installed via SetRawBody — that
+// slice is returned directly, avoiding the per-request memcpy that
+// Data.Write would incur. H2 and the buffered fallback path still go
+// through s.Data.
 func (s *Stream) GetData() []byte {
+	if s.h1Mode {
+		// Single-threaded H1: no lock, no atomics on the read path.
+		if s.rawBody != nil {
+			return s.rawBody
+		}
+		if s.Data == nil {
+			return nil
+		}
+		return s.Data.Bytes()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.rawBody != nil {
+		return s.rawBody
+	}
 	if s.Data == nil {
 		return nil
 	}
 	return s.Data.Bytes()
 }
 
+// SetRawBody installs a zero-copy body slice on the stream. The caller
+// must guarantee the backing array stays valid for the handler's
+// lifetime. Intended for H1 and std-bridge paths where the body is
+// already materialised as a contiguous slice (into the read buffer or a
+// freshly allocated heap slice). Passing nil clears the override.
+func (s *Stream) SetRawBody(b []byte) {
+	s.rawBody = b
+}
+
 // GetHeaders returns the headers. For single-threaded H1 streams, returns
 // the slice directly (no lock, no copy). For H2 streams, returns a safe copy
-// under lock.
+// under lock. Materializes any deferred raw H1 headers first.
 func (s *Stream) GetHeaders() [][2]string {
 	if s.h1Mode {
+		s.MaterializeHeaders()
 		return s.Headers
 	}
 	s.mu.RLock()
@@ -360,6 +507,10 @@ func (s *Stream) GetHeaders() [][2]string {
 
 // HeadersLen returns the number of headers on the stream.
 func (s *Stream) HeadersLen() int {
+	if s.h1Mode {
+		s.MaterializeHeaders()
+		return len(s.Headers)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.Headers)
@@ -367,6 +518,13 @@ func (s *Stream) HeadersLen() int {
 
 // ForEachHeader calls fn for each header under a read lock.
 func (s *Stream) ForEachHeader(fn func(name, value string)) {
+	if s.h1Mode {
+		s.MaterializeHeaders()
+		for _, h := range s.Headers {
+			fn(h[0], h[1])
+		}
+		return
+	}
 	s.mu.RLock()
 	for _, h := range s.Headers {
 		fn(h[0], h[1])

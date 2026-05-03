@@ -54,16 +54,23 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	listenErr := make(chan error, 1)
 	go func() {
-		_ = e.Listen(ctx)
+		listenErr <- e.Listen(ctx)
 		close(done)
 	}()
 
 	// Wait until the engine has at least one worker ready. On shared
 	// CI runners (GitHub Actions Azure VMs) io_uring ring setup can
 	// legitimately take 3-5 seconds when the host is under load;
-	// 15s covers the tail without hiding real failures.
-	deadline := time.Now().Add(15 * time.Second)
+	// 30s covers the tail without hiding real failures.
+	//
+	// If Listen() returns early with an error (e.g. the runner lacks
+	// the kernel feature a tier needs and every fallback has been
+	// exhausted), surface it as a skip rather than the opaque
+	// "engine did not start in time" timeout.
+	start := time.Now()
+	deadline := start.Add(30 * time.Second)
 	for {
 		e.mu.Lock()
 		n := len(e.workers)
@@ -71,10 +78,19 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 		if n > 0 {
 			break
 		}
+		select {
+		case err := <-listenErr:
+			// Listen returned before workers populated — it failed.
+			if err != nil {
+				t.Skipf("iouring engine Listen failed on this host: %v", err)
+			}
+			t.Fatal("engine.Listen returned nil without populating workers")
+		default:
+		}
 		if time.Now().After(deadline) {
 			cancel()
 			<-done
-			t.Fatal("engine did not start in time")
+			t.Fatalf("engine did not start within 30s (workers still empty)")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -83,8 +99,8 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Log("engine shutdown timeout")
+		case <-time.After(10 * time.Second):
+			t.Log("engine shutdown timeout after 10s; workers may still be running")
 		}
 	}
 }

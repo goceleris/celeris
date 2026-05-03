@@ -81,6 +81,7 @@ func (c *Context) Header(key string) string {
 	if needsLower {
 		key = strings.ToLower(key)
 	}
+	c.stream.MaterializeHeaders()
 	for _, h := range c.stream.Headers {
 		if h[0] == key {
 			return h[1]
@@ -124,18 +125,72 @@ func (c *Context) ParamDefault(key, defaultValue string) string {
 	return v
 }
 
-// Query returns the value of a query parameter by name. Results are cached
-// so repeated calls for different keys do not re-parse the query string.
+// Query returns the value of a query parameter by name.
+//
+// The first call scans the raw query string for the requested key
+// directly — unescaped safe values (the common case) are returned as
+// a substring of rawQuery with zero allocations. url.ParseQuery is
+// only invoked lazily when [Context.QueryValues] / [Context.QueryParams]
+// asks for the full map, after which subsequent Query calls hit the
+// cached values.Get.
 func (c *Context) Query(key string) string {
 	if c.rawQuery == "" {
 		return ""
 	}
-	if !c.queryCached {
-		c.extended = true
-		c.queryCache, _ = url.ParseQuery(c.rawQuery)
-		c.queryCached = true
+	if c.queryCached {
+		return c.queryCache.Get(key)
 	}
-	return c.queryCache.Get(key)
+	return queryLookupSingle(c.rawQuery, key)
+}
+
+// queryLookupSingle scans raw for a key=value pair whose key matches
+// name and returns the decoded value. Zero-alloc when the match has
+// no %-escapes or + signs (the dominant shape for REST query
+// strings); otherwise falls back to url.QueryUnescape on just the
+// matched slot. Behaviour matches url.Values.Get — first match wins,
+// absent key returns "".
+func queryLookupSingle(raw, name string) string {
+	for len(raw) > 0 {
+		var kv string
+		if i := strings.IndexByte(raw, '&'); i >= 0 {
+			kv = raw[:i]
+			raw = raw[i+1:]
+		} else {
+			kv = raw
+			raw = ""
+		}
+		if kv == "" {
+			continue
+		}
+		var k, v string
+		if eq := strings.IndexByte(kv, '='); eq >= 0 {
+			k, v = kv[:eq], kv[eq+1:]
+		} else {
+			k = kv
+		}
+		if k == name {
+			return queryUnescapeValue(v)
+		}
+		if strings.IndexByte(k, '%') >= 0 || strings.IndexByte(k, '+') >= 0 {
+			if uk, err := url.QueryUnescape(k); err == nil && uk == name {
+				return queryUnescapeValue(v)
+			}
+		}
+	}
+	return ""
+}
+
+func queryUnescapeValue(v string) string {
+	if v == "" {
+		return ""
+	}
+	if strings.IndexByte(v, '%') < 0 && strings.IndexByte(v, '+') < 0 {
+		return v
+	}
+	if u, err := url.QueryUnescape(v); err == nil {
+		return u
+	}
+	return ""
 }
 
 // QueryDefault returns the value of a query parameter, or the default if absent
@@ -550,7 +605,6 @@ func (c *Context) parseForm() error {
 	}
 	c.extended = true
 	c.formParsed = true
-	c.formValues = make(url.Values) // always init before error paths
 	ct := c.Header("content-type")
 	mediaType, mparams, _ := mime.ParseMediaType(ct)
 	body := c.Body()
@@ -570,6 +624,7 @@ func (c *Context) parseForm() error {
 			return NewHTTPError(400, "celeris: invalid multipart form").WithError(err)
 		}
 		c.multipartForm = form
+		c.formValues = make(url.Values, len(form.Value))
 		for k, vs := range form.Value {
 			c.formValues[k] = vs
 		}
@@ -580,6 +635,11 @@ func (c *Context) parseForm() error {
 		}
 		c.formValues = vals
 	}
+	// Unknown / missing content-type: leave c.formValues nil; url.Values's
+	// methods (Get, len, index) all handle nil safely, so FormValue /
+	// FormValueOK work unchanged — skipping the make() saves one alloc per
+	// FormValue call on requests without a form body (e.g., the
+	// methodoverride header-only path).
 	return nil
 }
 
@@ -599,6 +659,11 @@ func (c *Context) RemoteAddr() string { return c.stream.RemoteAddr }
 func (c *Context) Host() string {
 	if c.hostOverride != "" {
 		return c.hostOverride
+	}
+	// H1 dispatch primes Stream.Authority directly; skip the
+	// MaterializeHeaders + linear scan for the common case.
+	if c.stream.Authority != "" {
+		return c.stream.Authority
 	}
 	if h := c.Header(":authority"); h != "" {
 		return h

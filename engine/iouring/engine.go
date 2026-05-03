@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -53,8 +54,12 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// SEND_ZC runtime probe with IORING_SEND_ZC_REPORT_USAGE.
 	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
 	if profile.SendZC {
-		zcResult := probeSendZC()
-		cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
+		zcResult, zcReason := probeSendZCCached()
+		if zcReason != "" {
+			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String(), "reason", zcReason)
+		} else {
+			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
+		}
 		switch zcResult {
 		case SendZCTrueZeroCopy:
 			// True zero-copy on this NIC — keep enabled.
@@ -67,9 +72,30 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 			profile.SendZC = false
 		}
 	}
-	if profile.FixedFiles && !probeFixedFiles() {
-		cfg.Logger.Info("fixed files runtime probe failed, disabling")
-		profile.FixedFiles = false
+	if profile.FixedFiles {
+		if ok, ffReason := probeFixedFilesCached(); !ok {
+			cfg.Logger.Info("fixed files runtime probe failed, disabling", "reason", ffReason)
+			profile.FixedFiles = false
+		}
+	}
+	// ProvidedBuffers: tested via IORING_REGISTER_PBUF_RING. Without it,
+	// multishot recv has no backing store, so MultishotRecv is also forced
+	// off when this probe fails.
+	if profile.ProvidedBuffers {
+		if ok, pbReason := probeProvidedBuffersCached(); !ok {
+			cfg.Logger.Info("provided buffers runtime probe failed, disabling (downgrades to mid tier and disables multishot recv)", "reason", pbReason)
+			profile.ProvidedBuffers = false
+			profile.MultishotRecv = false
+		}
+	}
+	// MultishotAccept: kernel may advertise it but never set CQE_F_MORE,
+	// leaving accept stuck after the first completion. Probe submits a
+	// real multishot accept + dial and verifies the F_MORE flag.
+	if profile.MultishotAccept {
+		if ok, maReason := probeMultishotAcceptCached(); !ok {
+			cfg.Logger.Info("multishot accept runtime probe failed, disabling (worker will use single-shot accept)", "reason", maReason)
+			profile.MultishotAccept = false
+		}
 	}
 
 	tier := SelectTier(profile, 2*time.Second)
@@ -110,6 +136,16 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	resolved := e.cfg.Resources.Resolve()
+
+	// Cap workers to fit RLIMIT_MEMLOCK. Each worker locks ~12 MB for its
+	// ring + buffers; the systemd / kernel default of 8 MB only fits one.
+	// Without this, the engine would error out on the first worker past
+	// the limit with ENOMEM; capping silently lets a default-ulimit cloud
+	// VM keep running on fewer workers (and logs the cap so the operator
+	// can fix the limit if they want full parallelism).
+	if capped := capWorkersToMemlock(resolved.Workers, e.cfg.Logger); capped < resolved.Workers {
+		resolved.Workers = capped
+	}
 
 	cpus := platform.DistributeWorkers(resolved.Workers, e.profile.NumCPU, e.profile.NUMANodes)
 
@@ -186,6 +222,16 @@ func (e *Engine) Listen(ctx context.Context) error {
 		)
 	}
 
+	// Dynamic worker scaler. Typed cfg.WorkerScaling takes precedence over
+	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
+	// higher-level scaler that delegates to the active sub-engine. The
+	// algorithm itself lives in engine/scaler; this is just the call site.
+	if !e.cfg.SkipBuiltinScaler {
+		if scalerCfg := scaler.Resolve(e.cfg, len(workers)); scalerCfg.Enabled {
+			go e.runScaler(innerCtx, scalerCfg, &e.metrics.activeConns)
+		}
+	}
+
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,
 	// so they will exit within ~100ms of context cancellation.
@@ -218,7 +264,13 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 func fallbackTier(current TierStrategy) TierStrategy {
 	switch t := current.(type) {
 	case *optionalTier:
-		return &highTier{deferTaskrun: t.deferTaskrun, fixedFiles: t.fixedFiles}
+		return &highTier{
+			deferTaskrun:    t.deferTaskrun,
+			fixedFiles:      t.fixedFiles,
+			sendZC:          t.sendZC,
+			multishotAccept: t.multishotAccept,
+			multishotRecv:   t.multishotRecv,
+		}
 	case *highTier:
 		return &midTier{}
 	case *midTier:
@@ -253,10 +305,44 @@ func (e *Engine) Type() engine.EngineType {
 	return engine.IOUring
 }
 
-// PauseAccept stops accepting new connections while keeping existing ones alive.
+// PauseAccept stops accepting new connections. Synchronous — blocks
+// until every worker has cancelled its in-flight accept SQE and closed
+// its listen FD. The adaptive engine relies on this: until the
+// standby's listen sockets are gone from the SO_REUSEPORT routing
+// pool, fresh dials may land on the about-to-pause engine and get
+// RST'd as it tears down. Synchronous Pause means callers can expose
+// Addr() knowing only the active engine listens.
 func (e *Engine) PauseAccept() error {
 	e.acceptPaused.Store(true)
-	return nil
+	e.mu.Lock()
+	workers := append([]*Worker(nil), e.workers...)
+	e.mu.Unlock()
+	if len(workers) == 0 {
+		return nil
+	}
+	// Short bound on the wait. The worker normally observes the flag
+	// and finishes the SQE-cancel + close in <50 ms; capping at 200 ms
+	// keeps Pause callers from holding critical locks long enough to
+	// cascade into other timeouts during rapid-switch storms. If we
+	// time out, the FD will still close on the next worker iteration
+	// — we just don't guarantee it has happened by the time we return.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		allClosed := true
+		for _, w := range workers {
+			if !w.listenFDClosed.Load() {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil // best-effort: do not surface the timeout, the FD will close shortly
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
 }
 
 // ResumeAccept starts accepting new connections again.
@@ -266,6 +352,10 @@ func (e *Engine) ResumeAccept() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, w := range e.workers {
+		// Re-arm the close-confirmation flag so a subsequent Pause cycle
+		// blocks on the new listen FD rather than the previously-closed
+		// one.
+		w.listenFDClosed.Store(false)
 		w.wakeMu.Lock()
 		if w.suspended.Load() {
 			close(w.wake)
@@ -281,6 +371,7 @@ var (
 	_ engine.Engine            = (*Engine)(nil)
 	_ engine.AcceptController  = (*Engine)(nil)
 	_ engine.EventLoopProvider = (*Engine)(nil)
+	_ engine.WorkerScaler      = (*Engine)(nil)
 )
 
 // NumWorkers returns the number of worker event loops available for
@@ -291,11 +382,24 @@ func (e *Engine) NumWorkers() int {
 	return len(e.workers)
 }
 
-// WorkerLoop returns the WorkerLoop for worker n.
+// WorkerLoop returns the WorkerLoop for worker n. Out-of-range n is
+// reduced modulo NumWorkers so callers can hash a connection / FD across
+// the available pool without first reading NumWorkers — important now
+// that workers can be capped below NumCPU by RLIMIT_MEMLOCK.
+// Negative n is mirrored to the positive side first. Panics only when
+// the engine has no workers (i.e. Listen has not yet started).
 func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.workers[n]
+	count := len(e.workers)
+	if count == 0 {
+		panic("celeris/iouring: WorkerLoop called before Listen")
+	}
+	idx := n % count
+	if idx < 0 {
+		idx += count
+	}
+	return e.workers[idx]
 }
 
 // Addr returns the bound listener address.

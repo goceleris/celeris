@@ -1,0 +1,227 @@
+---
+# Cluster bench orchestrator.
+#
+# Runs the perfmatrix bench against one or more cluster nodes. Each
+# node's full lifecycle is wrapped in block/rescue/always so the
+# cleanup tasks run even if the bench itself fails.
+#
+# Required extra-vars (typically passed by `mage clusterBench`):
+#   bench_targets_filter: comma-separated host names from the
+#     [bench_targets] group, or "both"/"all" (default: both)
+#   runner_binary_amd64: absolute path on the dev Mac
+#   runner_binary_arm64: absolute path on the dev Mac
+#   loadgen_binary_amd64: absolute path on the dev Mac (loadgen for msa2-client)
+#   bench_cells: -cells argument for the runner
+#   bench_runs: -runs argument for the runner
+#   bench_duration: -duration argument for the runner
+#   bench_warmup: -warmup argument for the runner
+#   results_local_dir: where to fetch results back to on the Mac
+#
+# Required system packages on each cluster node (auto-installed if
+# missing; auto-uninstalled in the always-block if WE installed them):
+#   - numactl    (CPU-pinning during the bench)
+#   - perf-tools-unstable (only on bench targets, optional)
+
+- name: Stage binaries on bench targets
+  hosts: bench_targets
+  gather_facts: true
+  tags: stage
+  tasks:
+    - name: Filter to selected bench_targets only
+      ansible.builtin.meta: end_host
+      when: >
+        (bench_targets_filter is defined) and
+        (bench_targets_filter != "both") and
+        (bench_targets_filter != "all") and
+        (inventory_hostname not in bench_targets_filter.split(','))
+
+    - name: Ensure transient dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+
+    - name: Read existing dep manifest if present
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: manifest_slurp
+      failed_when: false
+
+    - name: Initialize empty manifest fact
+      ansible.builtin.set_fact:
+        installed_packages: []
+
+    - name: Restore installed_packages from existing manifest
+      ansible.builtin.set_fact:
+        installed_packages: "{{ (manifest_slurp.content | b64decode | from_json).installed_packages | default([]) }}"
+      when: manifest_slurp is defined and manifest_slurp.content is defined
+
+    - name: Detect missing packages we need
+      ansible.builtin.shell: |
+        for pkg in numactl; do
+          dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+        done
+      register: missing_pkgs
+      changed_when: false
+
+    - name: Install missing packages and record them
+      become: true
+      ansible.builtin.apt:
+        name: "{{ missing_pkgs.stdout_lines }}"
+        state: present
+        update_cache: true
+      when: missing_pkgs.stdout_lines | length > 0
+
+    - name: Append newly installed packages to in-memory manifest
+      ansible.builtin.set_fact:
+        installed_packages: "{{ installed_packages + missing_pkgs.stdout_lines }}"
+      when: missing_pkgs.stdout_lines | length > 0
+
+    - name: Write dep manifest to /tmp
+      ansible.builtin.copy:
+        content: "{{ {'installed_packages': installed_packages} | to_nice_json }}\n"
+        dest: "{{ manifest_path }}"
+        mode: '0644'
+
+    - name: Pick runner binary path by arch
+      ansible.builtin.set_fact:
+        runner_local_path: >-
+          {{ runner_binary_amd64 if arch == 'amd64' else runner_binary_arm64 }}
+
+    - name: Push runner binary to /tmp/celeris-bench/
+      ansible.builtin.copy:
+        src: "{{ runner_local_path }}"
+        dest: "{{ bench_root }}/runner"
+        mode: '0755'
+
+- name: Stage loadgen on the loadgen host (msa2-client)
+  hosts: loadgen
+  gather_facts: true
+  tags: stage
+  tasks:
+    - name: Ensure transient dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+
+    - name: Push loadgen binary to /tmp/celeris-bench/
+      ansible.builtin.copy:
+        src: "{{ loadgen_binary_amd64 }}"
+        dest: "{{ bench_root }}/loadgen"
+        mode: '0755'
+
+- name: Run bench on bench_targets in parallel
+  hosts: bench_targets
+  gather_facts: false
+  serial: 0    # parallelize across all selected hosts
+  tags: run
+  tasks:
+    - name: Filter to selected bench_targets only
+      ansible.builtin.meta: end_host
+      when: >
+        (bench_targets_filter is defined) and
+        (bench_targets_filter != "both") and
+        (bench_targets_filter != "all") and
+        (inventory_hostname not in bench_targets_filter.split(','))
+
+    - block:
+        - name: Generate run-specific output dir
+          ansible.builtin.set_fact:
+            run_out_dir: "{{ results_root }}/{{ ansible_date_time.iso8601_basic_short | default(lookup('pipe', 'date +%Y%m%dT%H%M%S')) }}-{{ inventory_hostname }}"
+
+        - name: Create per-run output dir
+          ansible.builtin.file:
+            path: "{{ run_out_dir }}"
+            state: directory
+            mode: '0755'
+
+        - name: Execute runner (logs to {{ run_out_dir }}/run.log)
+          # Run as root so we can ulimit -l unlimited — io_uring rings need
+          # locked memory beyond Ubuntu's 8 MB default RLIMIT_MEMLOCK
+          # (~10 MB per worker × 12-16 workers for the high tier).
+          # Equivalent setcap CAP_IPC_LOCK on the runner binary would
+          # avoid root, but adds a persistent capability we'd need to
+          # track in the manifest — root is simpler for transient runs.
+          become: true
+          ansible.builtin.shell: |
+            ulimit -l unlimited
+            cd {{ bench_root }}
+            ./runner \
+              -services local \
+              -cells '{{ bench_cells | default("*") }}' \
+              -runs {{ bench_runs | default(3) }} \
+              -duration {{ bench_duration | default("5s") }} \
+              -warmup {{ bench_warmup | default("1s") }} \
+              -out {{ run_out_dir }} \
+              2>&1 | tee {{ run_out_dir }}/run.log
+          args:
+            executable: /bin/bash
+          register: runner_result
+
+      always:
+        - name: Stop any leftover bench processes
+          become: true
+          # Match by exact process name to avoid pkill self-killing
+          # (pkill -f matches argv, including its own command line).
+          ansible.builtin.shell: |
+            pkill -x runner 2>/dev/null
+            pkill -x loadgen 2>/dev/null
+            true
+          changed_when: false
+
+        - name: Fetch results back to dev machine
+          ansible.builtin.fetch:
+            src: "{{ run_out_dir }}/{{ item }}"
+            dest: "{{ results_local_dir }}/{{ inventory_hostname }}/"
+            flat: true
+            fail_on_missing: false
+          loop:
+            - run.log
+            - report.md
+            - aggregated.csv
+
+- name: Cluster cleanup (always — uninstall packages WE installed, drop staging dir)
+  hosts: cluster
+  gather_facts: false
+  tags: cleanup
+  tasks:
+    - name: Read manifest for cleanup
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: cleanup_manifest
+      failed_when: false
+
+    - name: Decode manifest
+      ansible.builtin.set_fact:
+        to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
+      when: cleanup_manifest.content is defined
+
+    - name: Uninstall packages we added (only those, only if we added them)
+      become: true
+      ansible.builtin.apt:
+        name: "{{ to_remove }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when: to_remove is defined and to_remove | length > 0
+
+    - name: Remove dep manifest
+      ansible.builtin.file:
+        path: "{{ manifest_path }}"
+        state: absent
+
+    - name: Remove bench staging dir
+      ansible.builtin.file:
+        path: "{{ bench_root }}"
+        state: absent
+
+    # Note: results_root ({{ results_root }}) intentionally LEFT in /tmp.
+    # tmpfs clears it on reboot; keeping it here lets the user re-fetch
+    # if the local copy is lost.

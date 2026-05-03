@@ -4,8 +4,8 @@ go 1.26.0
 
 require (
 	github.com/andybalholm/brotli v1.2.1
-	github.com/goceleris/celeris v1.3.3
-	github.com/klauspost/compress v1.18.5
+	github.com/goceleris/celeris v1.4.1
+	github.com/klauspost/compress v1.18.6
 )
 
 require (
@@ -16,6 +16,5 @@ require (
 
 // In the monorepo, build against the in-tree celeris core so submodule
 // tests catch core breakage immediately. External consumers ignore this
-// directive — they get the published v1.3.3 (or whatever the require above
-// names).
+// directive — they pull whatever the `require` block above names.
 replace github.com/goceleris/celeris => ../../

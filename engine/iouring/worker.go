@@ -47,13 +47,44 @@ func errIORingSend(res int32) error {
 const bufRingGroupID = 0
 
 // bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2. 128 supports 128 concurrent in-flight multishot
-// recvs per worker. Typical web workloads have ~15-30 concurrent recvs
-// per worker, so 128 is a 4-8x safety margin. With 8KB buffers:
-// 128 * 8KB = 1 MB per worker; 64 workers = 64 MB total.
-const bufRingCount = 128
+// Must be a power of 2. Only used when multishot recv is opted into via
+// CELERIS_IOURING_MULTISHOT_RECV=1; the default single-shot-recv path
+// uses per-connection buffers and ignores this ring entirely. 1024
+// supports 1024 concurrent in-flight multishot recvs per worker
+// (128 was too small for the 1500+ conn churn test patterns —
+// ENOBUFS terminations kept burning the per-conn re-arm path).
+// With 8 KB buffers: 1024 × 8 KB = 8 MB per worker.
+const bufRingCount = 1024
 
-// Worker is a per-core io_uring event loop.
+// pendingReleaseEntry queues a connState for deferred release — its
+// fd has been closed but the kernel may still have SQEs referencing
+// its buffers; we hold it past the cancellation window before
+// returning to the pool. See Worker.pendingRelease docstring.
+//
+// detached entries (async-dispatch / WS / SSE conns) skip the pool
+// recycle: their cs has live state (h1State, asyncCond, asyncInBuf
+// slices) that goroutine closures may still reference even after the
+// worker observes asyncClosed and runs finishCloseDetached. Holding
+// the strong ref alive past the kernel's recv-SQE drain window is
+// what we need; the recycle path resetting fields would race with the
+// goroutine's defer that reads cs.fd / cs.asyncInBuf.
+type pendingReleaseEntry struct {
+	cs            *connState
+	releaseAtIter uint64
+	detached      bool
+}
+
+// pendingReleaseIters is the number of event-loop iterations to
+// hold a closed connState before returning to the pool. io_uring's
+// unix.Close(fd) → cancel-pending-ops → ECANCELED CQE path
+// completes within ~1 ms on Linux 6.x even under load, so ~5 000
+// iterations (≈50 ms on a worker looping at 100 k+ iter/s) is an
+// order-of-magnitude safety margin. Pushing this higher only
+// inflates the queue depth × per-cs memory footprint under
+// churn-close load without adding real safety.
+const pendingReleaseIters uint64 = 5_000
+
+// Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
 	id         int
 	cpuID      int
@@ -64,6 +95,11 @@ type Worker struct {
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
 	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	// h1Only is true when engine config locks every conn to HTTP/1.1
+	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
+	// once at registerConn and never written, so the recv hot path can
+	// skip the atomic Load.
+	h1Only bool
 
 	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
 	// can Wait on them before returning. See engine/epoll/loop.go
@@ -84,13 +120,46 @@ type Worker struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
+	// inactive is the per-worker pause flag used by the dynamic worker
+	// scaler. ORed with acceptPaused (which is engine-wide) when computing
+	// effective paused state. The scaler flips this to deactivate idle
+	// workers under low load and reactivate them under burst load.
+	inactive atomic.Bool
+	// listenFDClosed signals that the worker has cancelled in-flight
+	// accept SQEs and closed its listen FD in response to acceptPaused
+	// being set. PauseAccept polls this so it only returns once the
+	// SO_REUSEPORT group has actually shed this listener — important
+	// for the adaptive engine where the standby's listen sockets must
+	// be out of the kernel routing pool before the bound address is
+	// exposed (otherwise a fresh dial can land on the standby and get
+	// RST as it pauses).
+	listenFDClosed atomic.Bool
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
 	errCount    *atomic.Uint64
 	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
+
 	tickCounter uint32
-	cachedNow   int64 // cached time.Now().UnixNano(), refreshed every 64 iterations
+	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
+	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
+
+	// pendingRelease defers returning connState structs to the pool
+	// until the kernel has drained any in-flight I/O SQEs that may
+	// still hold pointers into cs.buf / cs.sendBuf. On close the fd
+	// is unix.Close'd, which triggers io_uring to cancel pending ops
+	// — but the cancellation is asynchronous and the cancelled CQEs
+	// arrive on subsequent event-loop iterations. If we release cs
+	// immediately, Go's GC can reclaim cs.buf's backing array; the
+	// kernel then writes incoming bytes (that landed in flight just
+	// before close) into memory the Go runtime has since repurposed
+	// for its stack pool, yielding a SIGSEGV in runtime.stackalloc
+	// dereferencing HTTP request bytes as a pointer (#256 SEGV
+	// class — not race-detectable because the writer is the kernel,
+	// not Go code). Holding cs for pendingReleaseIters iterations
+	// after close keeps cs.buf's backing array alive through the
+	// cancellation window.
+	pendingRelease []pendingReleaseEntry
 
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns  bool       // set when provided buffers need publishing
@@ -137,6 +206,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		sqpoll:       tier.SQPollIdle() > 0,
 		sendZC:       tier.SupportsSendZC(),
 		async:        cfg.AsyncHandlers,
+		h1Only:       cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
 		conns:        make([]*connState, fixedFileTableSize),
 		handler:      handler,
 		resolved:     resolved,
@@ -210,8 +280,27 @@ func (w *Worker) run(ctx context.Context) {
 		}
 	}
 
-	// Register ring-mapped provided buffers for multishot recv.
-	if w.tier.SupportsMultishotRecv() {
+	// Multishot recv + ring-mapped provided buffers is OFF by default.
+	//
+	// Under sustained HTTP/1 Connection:close churn against a client
+	// that pools connections (Go's http.Client with keep-alive of
+	// course does NOT pool closed conns, but load balancers, service
+	// mesh sidecars, and raw-socket benchmarking tools like goceleris/
+	// loadgen all hold a pool of open conns and expect the server to
+	// close them), multishot recv on aarch64 kernel 6.6.10 throttles
+	// the whole worker to ~30 accepts/s / ~90 req/s — a 100× collapse
+	// vs the epoll engine's ~25 k req/s on the identical workload.
+	// The profile showed workers drowning in spurious recv CQEs (25 k
+	// per worker per second against ~50 useful completions), and
+	// disabling multishot recv in favour of single-shot per-conn
+	// recv (the same model epoll uses) recovered churn to ~35 k rps
+	// while costing ≈2 % on keep-alive simple and being a wash on
+	// json-64k / body / headers.
+	//
+	// Opt back in with CELERIS_IOURING_MULTISHOT_RECV=1 for workloads
+	// that are known to be dominated by long-lived keep-alive conns
+	// and that benefit from the CQE-batching multishot provides.
+	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
 			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
@@ -253,7 +342,8 @@ func (w *Worker) run(ctx context.Context) {
 		// Cache the atomic load: same value used by the two branches
 		// below and (further down) the SUSPENDED check. Saves 2 atomic
 		// loads per event-loop iteration on the steady-state hot path.
-		paused := w.acceptPaused.Load()
+		// OR with the per-worker inactive flag (dynamic scaler).
+		paused := w.acceptPaused.Load() || w.inactive.Load()
 		if w.listenFD >= 0 && paused {
 			if sqe := w.ring.GetSQE(); sqe != nil {
 				prepCancelFDSkipSuccess(sqe, w.listenFD)
@@ -276,6 +366,19 @@ func (w *Worker) run(ctx context.Context) {
 			}
 			_ = unix.Close(w.listenFD)
 			w.listenFD = -1
+		}
+		// Maintain the listenFDClosed signal that PauseAccept polls on.
+		// Set it whenever paused==true regardless of whether we just
+		// closed the FD or it was already -1 from a prior Pause-Resume
+		// cycle that hadn't re-created the socket yet (the worker may
+		// be mid-iteration when paused flips back to true, so listenFD
+		// can transiently be -1 while paused is true). Clear when
+		// paused goes false so a subsequent Pause observes a fresh
+		// signal once the new listenFD is created.
+		if paused {
+			w.listenFDClosed.Store(true)
+		} else {
+			w.listenFDClosed.Store(false)
 		}
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
@@ -373,25 +476,29 @@ func (w *Worker) run(ctx context.Context) {
 				entry := w.ring.cqeAt(cqHead)
 				// Inlined CQE dispatch — eliminates processCQE method call
 				// and avoids passing context.Context on every CQE (only
-				// udAccept needs it). Hot ops (recv/send) are checked first.
-				switch decodeOp(entry.UserData) {
+				// udAccept needs it). Decode op+fd once per CQE; the
+				// previous form re-decoded fd from entry.UserData inside
+				// each case. Hot ops (recv/send) are checked first.
+				ud := entry.UserData
+				fd := int(ud & fdMask)
+				switch ud & udMask {
 				case udRecv:
-					w.handleRecv(entry, decodeFD(entry.UserData), now)
+					w.handleRecv(entry, fd, now)
 				case udSend:
-					w.handleSend(entry, decodeFD(entry.UserData), now)
+					w.handleSend(entry, fd, now)
 				case udAccept:
-					w.handleAccept(ctx, entry, decodeFD(entry.UserData), now)
+					w.handleAccept(ctx, entry, fd, now)
 				case udClose:
-					w.handleClose(decodeFD(entry.UserData))
+					w.handleClose(fd)
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udProvide:
 				case udDriverRecv:
-					w.handleDriverRecv(entry, decodeFD(entry.UserData))
+					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
-					w.handleDriverSend(entry, decodeFD(entry.UserData))
+					w.handleDriverSend(entry, fd)
 				case udDriverClose:
-					w.handleDriverClose(decodeFD(entry.UserData))
+					w.handleDriverClose(fd)
 				}
 				cqHead++
 			}
@@ -430,6 +537,14 @@ func (w *Worker) run(ctx context.Context) {
 					w.markDirty(cs)
 				}
 			}
+		}
+
+		// Advance the monotonic iteration counter and release any
+		// connStates whose deferred-release window has elapsed (see
+		// queuePendingRelease docstring).
+		w.iterCount++
+		if len(w.pendingRelease) > 0 {
+			w.drainPendingRelease()
 		}
 
 		// Drain detached goroutine writes. Goroutines append to the queue
@@ -494,9 +609,10 @@ func (w *Worker) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
-		if w.listenFD < 0 && w.connCount == 0 && w.acceptPaused.Load() {
+		// Combined paused: engine-wide OR per-worker (dynamic scaler).
+		if w.listenFD < 0 && w.connCount == 0 && (w.acceptPaused.Load() || w.inactive.Load()) {
 			w.wakeMu.Lock()
-			if !w.acceptPaused.Load() {
+			if !w.acceptPaused.Load() && !w.inactive.Load() {
 				w.wakeMu.Unlock()
 				continue
 			}
@@ -600,17 +716,32 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	}
 
 	newFD := int(c.Res)
-	isFixedFile := w.fixedFiles
+	w.onAcceptedFD(ctx, newFD, now, w.fixedFiles)
 
+	// Re-arm accept when CQE_F_MORE is clear. In single-shot mode this
+	// fires on every CQE. In multishot mode kernel sets F_MORE=1 to say
+	// "more CQEs coming from this SQE"; if F_MORE is clear the multishot
+	// was terminated (kernel backpressure or error) and without re-arming
+	// the worker permanently stops accepting on its listen socket.
+	// Observed on aarch64 kernel 6.6.10: multishot accept silently
+	// terminated under HTTP/1 Connection:close churn pressure, killing
+	// accept throughput on that worker until the engine restarted.
+	if !cqeHasMore(c.Flags) && w.listenFD >= 0 {
+		w.prepareAccept()
+	}
+}
+
+// onAcceptedFD sets up state for a newly accepted fd — builds connState,
+// registers it with the worker, and arms the first recv.
+func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixedFile bool) {
 	// Bounds check: reject FDs outside the flat conn array.
 	if newFD < 0 || newFD >= len(w.conns) {
+		if !isFixedFile {
+			_ = unix.Close(newFD)
+		}
 		w.errCount.Add(1)
 		return
 	}
-
-	// Don't discard accepted connections even when paused — the TCP handshake
-	// already completed and the client expects a response. The listen socket
-	// will be closed within one event loop iteration to prevent further accepts.
 
 	if !isFixedFile {
 		_ = sockopts.ApplyFD(newFD, w.sockOpts)
@@ -619,15 +750,11 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 	// via inherited options. TCP_NODELAY etc. must be set post-accept for
 	// non-inherited options — but with fixed files (ACCEPT_DIRECT), the fd field
 	// is actually a fixed file index and we can't call setsockopt on it directly.
-	// Socket options that require per-connection setsockopt are skipped for fixed files.
 
 	bufSize := w.resolved.BufferSize
 	if w.bufRing != nil {
 		bufSize = 0
 	}
-	// Tag the per-conn context with this worker's numeric ID — same
-	// plumbing as engine/epoll/loop.go so handlers can pass the affinity
-	// hint to driver pools.
 	connCtx := ctxkit.WithWorkerID(ctx, w.id)
 	cs := acquireConnState(connCtx, newFD, bufSize, w.async)
 	cs.fixedFile = isFixedFile
@@ -637,8 +764,6 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			cs.remoteAddr = sockaddrString(sa)
 		}
 	}
-	// For fixed files (ACCEPT_DIRECT), the CQE result is a fixed file index,
-	// not a real FD. getpeername is not available without a real FD.
 
 	w.conns[newFD] = cs
 	w.connCount++
@@ -654,20 +779,22 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 
 	cs.lastActivity = now
 
-	if w.cfg.Protocol != engine.Auto {
-		cs.protocol = w.cfg.Protocol
+	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
+	// upgrades too", so route it through detectProtocol (like Auto) on the
+	// first recv rather than locking cs.protocol=H2C on accept. Without
+	// this, the first HTTP/1.1 upgrade request was fed to ProcessH2 and
+	// the PRI-preface check silently failed, leaving the client with 27
+	// bytes of server SETTINGS frame and no 101 Switching Protocols
+	// response.
+	if w.cfg.Protocol != engine.Auto &&
+		(w.cfg.Protocol != engine.H2C || !w.cfg.EnableH2Upgrade) {
+		cs.protocol.Store(int32(w.cfg.Protocol))
 		cs.detected = true
 		w.initProtocol(cs)
 	}
-	// For Auto mode, cs.detected is false; the first handleRecv will
-	// detect the protocol from the received data before processing it.
 	if !w.prepareRecv(newFD, cs.buf) {
 		cs.needsRecv = true
 		w.markDirty(cs)
-	}
-
-	if !cqeHasMore(c.Flags) && !w.tier.SupportsMultishotAccept() && w.listenFD >= 0 {
-		w.prepareAccept()
 	}
 }
 
@@ -683,7 +810,7 @@ func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
 		}
 		return false
 	}
-	cs.protocol = proto
+	cs.protocol.Store(int32(proto))
 	cs.detected = true
 	w.initProtocol(cs)
 	return true
@@ -711,13 +838,29 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 }
 
 func (w *Worker) initProtocol(cs *connState) {
-	switch cs.protocol {
+	switch engine.Protocol(cs.protocol.Load()) {
 	case engine.HTTP1:
 		cs.h1State = conn.NewH1State()
 		cs.h1State.RemoteAddr = cs.remoteAddr
 		cs.h1State.MaxRequestBodySize = w.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = w.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
+		cs.h1State.WorkerID = int32(w.id)
+		cs.h1State.WorkerIDSet = true
+		if !w.cfg.EnableH2Upgrade {
+			cs.h1State.DisableH2CDetect()
+		}
+		// Wire the scatter-gather body writer so the H1 response adapter
+		// can hand large bodies straight to the WRITEV path without the
+		// intermediate respBuf → cs.writeBuf memcpy. writeBodyFn stores
+		// the body slice on the connState; flushSend emits an iovec SQE.
+		// Only enabled on the synchronous inline-handler path: async
+		// mode handlers run on goroutines and need detachMu-guarded
+		// access to cs.bodyBuf, which the current writer does not
+		// provide. Async mode falls back to the copy path.
+		if !w.async {
+			cs.h1State.SetWriteBodyFn(w.makeWriteBodyFn(cs))
+		}
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
 			// Async mode may have already allocated detachMu in
@@ -820,32 +963,36 @@ func (w *Worker) initProtocol(cs *connState) {
 // (which may contain the H2 client preface + initial SETTINGS) through
 // ProcessH2 synchronously.
 func (w *Worker) switchToH2(cs *connState) error {
-	info := cs.h1State.UpgradeInfo
-	// Build H2 state FIRST. If it fails, cs.h1State remains intact so the
-	// caller's cleanup path (closeConn) can release it properly. Nulling
-	// h1State before the build would leave cs in an inconsistent state
-	// (protocol=HTTP1, h1State=nil, h2State=nil) that panics on any
-	// subsequent op.
-	h2State, err := conn.NewH2StateFromUpgrade(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD, info)
-	if err != nil {
-		// Clear UpgradeInfo so a second dispatch through ProcessH1 can't
-		// re-enter the upgrade path on the already-doomed conn.
-		cs.h1State.UpgradeInfo = nil
-		conn.ReleaseUpgradeInfo(info)
+	if err := w.switchToH2Local(cs); err != nil {
 		return err
 	}
-	// Success: release H1 state now that H2 has taken over.
-	cs.h1State.UpgradeInfo = nil
-	conn.CloseH1(cs.h1State)
-	cs.h1State = nil
-	cs.h2State = h2State
-	cs.h2State.SetRemoteAddr(cs.remoteAddr)
-	cs.protocol = engine.H2C
 	if !w.h2PollArmed && w.h2EventFD >= 0 {
 		w.prepareH2Poll()
 		w.h2PollArmed = true
 	}
 	w.h2Conns = append(w.h2Conns, cs.fd)
+	return nil
+}
+
+// switchToH2Local does every part of switchToH2 except the worker-owned
+// steps (w.h2Conns append, prepareH2Poll) which must run on the worker
+// goroutine — that slice and SQE submission are SINGLE_ISSUER. The
+// async dispatch goroutine uses this under cs.detachMu and then asks
+// the worker to finish via asyncH2Promoted + detachQueue.
+func (w *Worker) switchToH2Local(cs *connState) error {
+	info := cs.h1State.UpgradeInfo
+	h2State, err := conn.NewH2StateFromUpgrade(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD, info)
+	if err != nil {
+		cs.h1State.UpgradeInfo = nil
+		conn.ReleaseUpgradeInfo(info)
+		return err
+	}
+	cs.h1State.UpgradeInfo = nil
+	conn.CloseH1(cs.h1State)
+	cs.h1State = nil
+	cs.h2State = h2State
+	cs.h2State.SetRemoteAddr(cs.remoteAddr)
+	cs.protocol.Store(int32(engine.H2C))
 
 	var processErr error
 	if len(info.Remaining) > 0 {
@@ -892,14 +1039,91 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return
 		}
 		// Surface read failure to detached middleware before closing.
-		if cs.detachMu != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+		// Check cs.h1State under detachMu — the async dispatch
+		// goroutine's switchToH2Local nulls cs.h1State under the same
+		// lock, so reading it before acquiring detachMu is a TOCTOU
+		// that the race detector flags (#256 regression class).
+		if cs.detachMu != nil {
 			cs.detachMu.Lock()
-			if cs.h1State.OnError != nil {
+			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(errIORingRecv(c.Res))
 			}
 			cs.detachMu.Unlock()
 		}
 		w.closeConn(fd)
+		return
+	}
+
+	cs.lastActivity = now
+
+	// Direct-into-bodyBuf path: the previous recv SQE targeted
+	// H1State.bodyBuf (NextRecvBuf). The CQE's Res applies to bodyBuf,
+	// NOT cs.buf, so check this FIRST — indexing cs.buf[:c.Res] when
+	// c.Res > cap(cs.buf) would panic. Skip ProcessH1, extend the body,
+	// and dispatch the handler when the body is full.
+	if cs.recvIntoBody && cs.h1State != nil {
+		cs.recvIntoBody = false
+		complete := cs.h1State.ConsumeBodyRecv(int(c.Res))
+		if !complete {
+			if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
+				if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+					cs.needsRecv = true
+					w.markDirty(cs)
+				}
+			}
+			return
+		}
+		rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, w.handler, cs.writeFn)
+		if errors.Is(derr, conn.ErrUpgradeH2C) {
+			if err := w.switchToH2(cs); err != nil {
+				w.closeConn(fd)
+				return
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
+			cs.recvLinked = false
+			if w.bufRing == nil {
+				if w.flushSendLink(cs) {
+					w.markDirty(cs)
+				}
+			} else {
+				if w.flushSend(cs) {
+					w.markDirty(cs)
+				}
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			return
+		}
+		if derr != nil {
+			w.closeConn(fd)
+			return
+		}
+		if len(rest) > 0 {
+			if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, w.handler, cs.writeFn); perr != nil {
+				if !errors.Is(perr, conn.ErrHijacked) {
+					w.closeConn(fd)
+				}
+				return
+			}
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
+		if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
+			if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+				cs.needsRecv = true
+				w.markDirty(cs)
+			}
+		}
 		return
 	}
 
@@ -916,8 +1140,6 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// Per-connection buffer (single-shot recv).
 		data = cs.buf[:c.Res]
 	}
-
-	cs.lastActivity = now
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
@@ -943,7 +1165,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// immediately. The goroutine runs ProcessH1 under cs.detachMu and
 	// enqueues on detachQueue so this worker submits SEND SQEs on its
 	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
-	if w.async && cs.protocol == engine.HTTP1 {
+	if w.async && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
 		cs.asyncInMu.Lock()
 		// Backpressure: drop the conn if the dispatch goroutine is
 		// falling behind. Prevents a pipelining client from ballooning
@@ -988,50 +1210,86 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	var processErr error
-	switch cs.protocol {
-	case engine.HTTP1:
+	// Stash the worker's cached "now" on H1State so populateCachedStream
+	// can copy it to the stream — HandleStream skips a per-request
+	// time.Now() vDSO call.
+	if cs.h1State != nil {
+		cs.h1State.NowNs = now
+	}
+	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic
+	// Load, no switch dispatch, no upgrade-handling block — ProcessH1
+	// cannot return ErrUpgradeH2C because tryUpgradeH2C is gated off
+	// in the parser. The compiler can specialize the call site without
+	// hitting any of the H2 / upgrade machinery in the binary's hot
+	// section.
+	if w.h1Only {
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
-		if errors.Is(processErr, conn.ErrUpgradeH2C) {
-			// H1→H2 upgrade. switchToH2 consumes the upgrade info and
-			// re-arms recv so subsequent data is parsed as H2.
-			if hasProvidedBuf {
-				w.bufRing.PushBuffer(providedBufID)
-				w.hasBufReturns = true
-			}
-			if err := w.switchToH2(cs); err != nil {
-				w.closeConn(fd)
+	} else {
+		switch engine.Protocol(cs.protocol.Load()) {
+		case engine.HTTP1:
+			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+			if errors.Is(processErr, conn.ErrUpgradeH2C) {
+				// H1→H2 upgrade. switchToH2 consumes the upgrade info and
+				// re-arms recv so subsequent data is parsed as H2.
+				if hasProvidedBuf {
+					w.bufRing.PushBuffer(providedBufID)
+					w.hasBufReturns = true
+				}
+				if err := w.switchToH2(cs); err != nil {
+					w.closeConn(fd)
+					return
+				}
+				// Flush the buffered 101 Switching Protocols + H2 server preface
+				// + stream 1 response bytes. Without this explicit flush the
+				// client blocks forever waiting for the 101 (the normal post-
+				// process flush path below is bypassed by this early return).
+				if mu := cs.detachMu; mu != nil {
+					mu.Lock()
+				}
+				cs.recvLinked = false
+				if w.bufRing == nil {
+					if w.flushSendLink(cs) {
+						w.markDirty(cs)
+					}
+				} else {
+					if w.flushSend(cs) {
+						w.markDirty(cs)
+					}
+				}
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				// Re-arm recv to keep reading H2 frames. flushSendLink may have
+				// already chained a recv via IOSQE_IO_LINK — skip our standalone
+				// re-arm in that case to avoid submitting two recv SQEs on the
+				// same fd, which would split incoming H2 frames across CQEs and
+				// occasionally lose END_STREAM delivery for later streams
+				// (observed as flaky TestH2CUpgradeSubsequentStreams/iouring).
+				if !cqeHasMore(c.Flags) && !cs.recvLinked {
+					if !w.prepareRecv(fd, cs.buf) {
+						cs.needsRecv = true
+						w.markDirty(cs)
+					}
+				}
 				return
 			}
-			// Flush the buffered 101 Switching Protocols + H2 server preface
-			// + stream 1 response bytes. Without this explicit flush the
-			// client blocks forever waiting for the 101 (the normal post-
-			// process flush path below is bypassed by this early return).
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			if w.bufRing == nil {
-				if w.flushSendLink(cs) {
-					w.markDirty(cs)
-				}
+		case engine.H2C:
+			// Async-mode conns: serialize inline ProcessH2 against the
+			// runAsyncHandler goroutine that owns cs.writeBuf until its
+			// H1→H2 upgrade-flush completes. Without the lock, a new
+			// recv arriving while the goroutine is mid-flush runs
+			// ProcessH2 → writeFn → cs.writeBuf manipulation concurrent
+			// with the goroutine's `cs.writeBuf = cs.writeBuf[:0]`
+			// clear — a data race matrixBenchStrict caught on the third
+			// run (see issue #256 investigation thread).
+			if cs.detachMu != nil {
+				cs.detachMu.Lock()
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
+				cs.detachMu.Unlock()
 			} else {
-				if w.flushSend(cs) {
-					w.markDirty(cs)
-				}
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			// Re-arm recv to keep reading H2 frames.
-			if !cqeHasMore(c.Flags) {
-				if !w.prepareRecv(fd, cs.buf) {
-					cs.needsRecv = true
-					w.markDirty(cs)
-				}
-			}
-			return
 		}
-	case engine.H2C:
-		processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 	}
 
 	// Batch-return the provided buffer after processing. The data has been
@@ -1052,9 +1310,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		}
 		// Flush pending writes (e.g. error responses) before closing.
 		_ = w.flushSend(cs)
-		if cs.detachMu != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+		// Check cs.h1State under detachMu (same TOCTOU class fixed at
+		// line 944 — see handleRecv recv-failure path).
+		if cs.detachMu != nil {
 			cs.detachMu.Lock()
-			if cs.h1State.OnError != nil {
+			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(processErr)
 			}
 			cs.detachMu.Unlock()
@@ -1067,14 +1327,18 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
 	// after SEND completes, eliminating one loop iteration per request.
 	cs.recvLinked = false
-	if mu := cs.detachMu; mu != nil {
+	// Hoist the detachMu load: the same mu is checked Lock and Unlock on
+	// the success path, plus once on the early-return overflow path. One
+	// pointer load instead of three.
+	mu := cs.detachMu
+	if mu != nil {
 		mu.Lock()
 	}
 	// Back-pressure: capture pending size inside the lock so concurrent
 	// goroutine writes via the guarded writeFn don't race the read.
 	pending := len(cs.writeBuf) + len(cs.sendBuf)
 	if pending > cs.sendCap() {
-		if mu := cs.detachMu; mu != nil {
+		if mu != nil {
 			mu.Unlock()
 		}
 		w.closeConn(fd)
@@ -1089,7 +1353,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.markDirty(cs)
 		}
 	}
-	if mu := cs.detachMu; mu != nil {
+	if mu != nil {
 		mu.Unlock()
 	}
 
@@ -1098,7 +1362,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
 	// Don't re-arm if recv is paused (WebSocket backpressure).
 	if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-		if !w.prepareRecv(fd, cs.buf) {
+		if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
@@ -1134,12 +1398,15 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	// Regular SEND completion (non-ZC path).
-	cs.sending = false
+	// Regular SEND completion (non-ZC path). cs.sending is reset on
+	// every exit branch — by completeSend on success, inline on error
+	// paths — so we skip the entry-reset to save one write per request
+	// on the hot success path.
 
 	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
 	// Disable ZC for this worker and retry the send with regular SEND.
 	if c.Res == -22 && w.sendZC {
+		cs.sending = false
 		w.sendZC = false
 		w.logger.Warn("SEND_ZC not supported (EINVAL), falling back to regular SEND",
 			"worker", w.id)
@@ -1150,16 +1417,18 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	}
 
 	if c.Res < 0 {
+		cs.sending = false
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
-		if mu := cs.detachMu; mu != nil {
+		mu := cs.detachMu
+		if mu != nil {
 			mu.Lock()
 		}
 		cs.writeBuf = cs.writeBuf[:0]
 		if cs.h1State != nil && cs.h1State.OnError != nil {
 			cs.h1State.OnError(errIORingSend(c.Res))
 		}
-		if mu := cs.detachMu; mu != nil {
+		if mu != nil {
 			mu.Unlock()
 		}
 		if cs.closing {
@@ -1196,6 +1465,8 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
 		cs.writeBuf = cs.writeBuf[:0]
+		cs.sendBody = nil
+		cs.bodyBuf = nil
 		if cs.h1State != nil && cs.h1State.OnError != nil {
 			cs.h1State.OnError(errIORingSend(int32(sent)))
 		}
@@ -1207,8 +1478,31 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 		return
 	}
 
-	// Handle partial sends by shifting remaining data to the front.
-	if sent < len(cs.sendBuf) {
+	// Partial-send handling, split by whether we issued a plain SEND
+	// (sendBuf only) or a WRITEV (sendBuf + sendBody). Partial WRITEV
+	// responses collapse the remainder into sendBuf so the retry path
+	// uses the plain SEND fast-path; this pays a one-time body-sized
+	// memcpy only when the kernel returned a short send (rare on
+	// localhost TCP, occasional on congested networks).
+	if len(cs.sendBody) > 0 {
+		headerLen := len(cs.sendBuf)
+		total := headerLen + len(cs.sendBody)
+		switch {
+		case sent >= total:
+			cs.sendBuf = cs.sendBuf[:0]
+			cs.sendBody = nil
+		case sent >= headerLen:
+			cs.sendBuf = cs.sendBuf[:0]
+			cs.sendBuf = append(cs.sendBuf, cs.sendBody[sent-headerLen:]...)
+			cs.sendBody = nil
+		default:
+			remaining := headerLen - sent
+			copy(cs.sendBuf, cs.sendBuf[sent:])
+			cs.sendBuf = cs.sendBuf[:remaining]
+			cs.sendBuf = append(cs.sendBuf, cs.sendBody...)
+			cs.sendBody = nil
+		}
+	} else if sent < len(cs.sendBuf) {
 		remaining := len(cs.sendBuf) - sent
 		copy(cs.sendBuf, cs.sendBuf[sent:])
 		cs.sendBuf = cs.sendBuf[:remaining]
@@ -1292,9 +1586,26 @@ func (w *Worker) closeConn(fd int) {
 	// Close H1 state unless a real WS/SSE detach handed ownership to a
 	// middleware goroutine. Async-mode HTTP1 conns have detachMu set
 	// but h1State.Detached is false — we still own H1 state there.
+	//
+	// For detached / async-dispatched conns, we MUST hold detachMu
+	// while tearing down h1State. runAsyncHandler runs ProcessH1 under
+	// the same lock, and CloseH1 writes state fields (state.stream,
+	// state.bodyBuf, state.bodyNeeded) that ProcessH1 reads. Without
+	// the lock, a peer close arriving while the goroutine is mid-
+	// ProcessH1 races the h1State teardown; under churn-close+
+	// async+auto+upg the resulting memory corruption manifested as a
+	// SIGSEGV in runtime.stackpoolalloc after ~16 h of load
+	// (#256). cs.asyncClosed was already set earlier in this function
+	// and the goroutine checks it on loop re-entry, so acquiring
+	// detachMu here only blocks for the duration of the current
+	// ProcessH1 call.
 	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
-	if !trulyDetached {
-		if cs.h1State != nil {
+	if !trulyDetached && cs.h1State != nil {
+		if detached {
+			cs.detachMu.Lock()
+			conn.CloseH1(cs.h1State)
+			cs.detachMu.Unlock()
+		} else {
 			conn.CloseH1(cs.h1State)
 		}
 	}
@@ -1332,6 +1643,61 @@ func (w *Worker) closeConn(fd int) {
 	w.finishClose(fd)
 }
 
+// queuePendingRelease enqueues cs for release at a future iteration.
+// See Worker.pendingRelease docstring for the kernel-buffer-lifetime
+// invariant this enforces.
+func (w *Worker) queuePendingRelease(cs *connState) {
+	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
+		cs:            cs,
+		releaseAtIter: w.iterCount + pendingReleaseIters,
+	})
+}
+
+// queuePendingReleaseDetached holds cs alive past the kernel's recv-SQE
+// drain window without recycling it through sync.Pool. Used by the
+// detached close path (async-dispatch HTTP/1.1, WebSocket, SSE), where
+// goroutine closures still reference cs.h1State / cs.asyncCond /
+// cs.asyncInBuf — the worker observed asyncClosed and tore the conn
+// down, but the dispatch goroutine can still be inside its deferred
+// recover() block, reading cs.fd and re-clearing cs.asyncInBuf, when
+// finishCloseDetached returns. Recycling cs through releaseConnState
+// at this point races those reads. We just keep the strong ref alive
+// for pendingReleaseIters and let GC collect — the goroutine has long
+// since finished by then, the kernel has long since drained any
+// pending recv targeting cs.buf, and Go's GC reclaims cs and cs.buf
+// without any chance of the kernel writing inbound HTTP bytes into
+// memory the runtime has repurposed (#256 SIGSEGV class).
+func (w *Worker) queuePendingReleaseDetached(cs *connState) {
+	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
+		cs:            cs,
+		releaseAtIter: w.iterCount + pendingReleaseIters,
+		detached:      true,
+	})
+}
+
+// drainPendingRelease returns any connStates whose deferred-release
+// window has elapsed to the sync.Pool. FIFO because queue entries are
+// always appended with monotonically increasing releaseAtIter.
+//
+// Detached entries skip the pool recycle (releaseConnState would
+// reset fields that goroutine closures may still observe via the
+// runAsyncHandler defer block) and just drop the strong ref so GC
+// can reclaim the cs.
+func (w *Worker) drainPendingRelease() {
+	n := 0
+	for n < len(w.pendingRelease) && w.pendingRelease[n].releaseAtIter <= w.iterCount {
+		entry := &w.pendingRelease[n]
+		if !entry.detached {
+			releaseConnState(entry.cs)
+		}
+		entry.cs = nil // drop strong ref from the slice's backing array
+		n++
+	}
+	if n > 0 {
+		w.pendingRelease = w.pendingRelease[n:]
+	}
+}
+
 func (w *Worker) finishClose(fd int) {
 	cs := w.conns[fd]
 	w.conns[fd] = nil
@@ -1342,9 +1708,19 @@ func (w *Worker) finishClose(fd int) {
 		w.cfg.OnDisconnect(cs.remoteAddr)
 	}
 
+	// Capture close-path decisions before queueing cs for deferred release.
 	fixedFile := cs != nil && cs.fixedFile
+	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached
+	// Defer pool release. Returning cs to sync.Pool now would let Go's
+	// GC reclaim cs.buf's backing array; the kernel's still-pending
+	// recv SQE would then write inbound bytes into memory Go has
+	// repurposed (typically the runtime stack pool), yielding a SEGV
+	// when stackalloc later dereferences HTTP bytes as a pointer
+	// (#256 class). Hold cs in pendingRelease for a window longer
+	// than io_uring's cancellation latency before returning to the
+	// pool.
 	if cs != nil {
-		releaseConnState(cs)
+		w.queuePendingRelease(cs)
 	}
 
 	if fixedFile {
@@ -1362,19 +1738,26 @@ func (w *Worker) finishClose(fd int) {
 		return
 	}
 
-	// Half-close before full close: shutdown(SHUT_WR) sends FIN after all
-	// pending data in the socket buffer, preventing RST from discarding
-	// unsent GOAWAY / RST_STREAM frames.
-	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	// Drain receive buffer to prevent RST from discarding unsent data
-	// (close() with unread data in recv buffer causes RST instead of FIN).
-	drainRecvBuffer(fd)
-
-	sqe := w.ring.GetSQE()
-	if sqe != nil {
-		prepClose(sqe, fd)
-		setSQEUserData(sqe, encodeUserData(udClose, fd))
+	// Fast-close path for H1 non-detached connections: close() alone.
+	// The response bytes we wrote are already in the kernel send buffer
+	// and will go out before the socket tears down; localhost ACKs
+	// within microseconds. Skipping shutdown(SHUT_WR) + drainRecvBuffer
+	// saves two syscalls per close and is the difference between hertz
+	// territory (~30 k rps) and ~24 k rps under bench-harness churn.
+	//
+	// The graceful path (shutdown + drain + close) is retained for H2
+	// because GOAWAY / RST_STREAM frames can be staged in the send
+	// buffer at close time; shutdown is what pushes FIN after those
+	// frames so the peer sees them. For H1 without a body in-flight,
+	// close() without shutdown is equivalent on localhost and within
+	// noise on real networks.
+	if fastClose {
+		_ = unix.Close(fd)
+		return
 	}
+	_ = unix.Shutdown(fd, unix.SHUT_WR)
+	drainRecvBuffer(fd)
+	_ = unix.Close(fd)
 }
 
 // finishCloseAny dispatches to finishCloseDetached for detached connections
@@ -1403,6 +1786,23 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 
 	fixedFile := cs.fixedFile
 	// Do NOT call releaseConnState — goroutine closures still reference cs.
+	//
+	// Hold cs alive in pendingRelease past the kernel's recv-SQE drain
+	// window. After the goroutine exits (which happens promptly once
+	// closeConn sets asyncClosed and broadcasts asyncCond), cs has no
+	// remaining references and becomes GC-eligible. Without this hold,
+	// GC would reclaim cs.buf while the kernel still has a pending recv
+	// SQE targeting &cs.buf[0]; on the next inbound byte the kernel
+	// writes HTTP request bytes into memory Go has repurposed for
+	// runtime stack pages — the next stackalloc walks an mspan list
+	// where a pointer slot now reads "GET / HTTP/1.1" and SIGSEGVs at
+	// addr 0x48202f20544547 (#256 class, fingerprint matches the
+	// strict-matrix run2 trip on churn-close × iouring-async).
+	//
+	// pendingReleaseIters (5 000 ≈ 50 ms under load) is comfortably
+	// longer than io_uring's close-cancels-pending-ops latency on
+	// Linux 6.x and longer than any reasonable runAsyncHandler tail.
+	w.queuePendingReleaseDetached(cs)
 
 	if fixedFile {
 		sqe := w.ring.GetSQE()
@@ -1414,14 +1814,17 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		return
 	}
 
+	// Detached connections still use the graceful half-close path —
+	// middleware (WebSocket / SSE) may have queued a close-frame echo
+	// that we want to let finish cleanly, and the middleware goroutine
+	// already drove the protocol handshake to completion before asking
+	// the engine to drop the FD. RST close (as used by closeNonFixedFD
+	// for plain H1/H2) would cut that echo off. The graceful path is
+	// still SYNC (unix.Close directly) to avoid the async-SQE pile-up
+	// that plagued the pre-patch version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
-
-	sqe := w.ring.GetSQE()
-	if sqe != nil {
-		prepClose(sqe, fd)
-		setSQEUserData(sqe, encodeUserData(udClose, fd))
-	}
+	_ = unix.Close(fd)
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
@@ -1477,8 +1880,105 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		cs.asyncInMu.Unlock()
 
 		cs.detachMu.Lock()
+		// Re-check asyncClosed under detachMu. closeConn sets
+		// asyncClosed BEFORE taking detachMu to run CloseH1; if we
+		// raced past the top-of-loop check but closeConn acquired
+		// detachMu first, by the time we hold detachMu our cs.h1State
+		// may already be torn down. Bail out here so we don't call
+		// ProcessH1 on a closed state.
+		if cs.asyncClosed.Load() {
+			cs.detachMu.Unlock()
+			cs.asyncInMu.Lock()
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
-		hasWrite := len(cs.writeBuf) > 0
+		// H1→H2 upgrade on the async dispatch path. ProcessH1 has
+		// written the 101 Switching Protocols response to cs.writeBuf
+		// and stashed the upgrade info. Promote cs-local state now
+		// (safe under detachMu), flush writeBuf synchronously, then
+		// hand off to the worker to register the fd on the H2 write-
+		// queue poll list. The goroutine exits — all subsequent recvs
+		// dispatch via the inline H2 path (cs.protocol is now H2C).
+		if errors.Is(processErr, conn.ErrUpgradeH2C) {
+			promoteErr := w.switchToH2Local(cs)
+			if promoteErr == nil && len(cs.writeBuf) > 0 {
+				n, werr := unix.Write(cs.fd, cs.writeBuf)
+				switch {
+				case werr == nil && n == len(cs.writeBuf):
+					cs.writeBuf = cs.writeBuf[:0]
+				case werr == nil:
+					// Partial write — shift remainder; worker retries
+					// via markDirty after we enqueue on detachQueue.
+					remaining := len(cs.writeBuf) - n
+					copy(cs.writeBuf, cs.writeBuf[n:])
+					cs.writeBuf = cs.writeBuf[:remaining]
+				case werr == unix.EAGAIN || werr == unix.EWOULDBLOCK:
+					// Socket send buffer full — same disposition as a
+					// partial write; bytes stay in cs.writeBuf.
+				default:
+					promoteErr = werr
+				}
+			}
+			cs.detachMu.Unlock()
+			if promoteErr != nil {
+				// Fatal — route through the asyncClosed teardown so the
+				// worker runs closeConn from its own goroutine.
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+			} else {
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				cs.asyncH2Promoted.Store(true)
+			}
+			w.detachQMu.Lock()
+			w.detachQueue = append(w.detachQueue, cs)
+			w.detachQPending.Store(1)
+			w.detachQMu.Unlock()
+			if w.h2EventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(w.h2EventFD, val[:])
+			}
+			return
+		}
+		// Direct-write fast path: on the async-handler goroutine, call
+		// unix.Write(fd, writeBuf) inline instead of bouncing through
+		// the detachQueue → eventfd → worker → SEND-SQE round-trip.
+		// The iouring multishot recv on this fd is unaffected — TCP is
+		// bidirectional and the kernel happily admits a concurrent write
+		// from any goroutine even while a recv SQE is pending. Mirrors
+		// the engine/epoll runAsyncHandler shape (engine/epoll/loop.go:990)
+		// and closes the 3× integrated-Redis regression observed on
+		// iouring (95 µs/op → target ~30 µs/op, matching epoll and
+		// go-redis + stdlib).
+		var partial bool
+		if processErr == nil && len(cs.writeBuf) > 0 {
+			n, werr := unix.Write(cs.fd, cs.writeBuf)
+			if werr != nil {
+				if werr == unix.EAGAIN || werr == unix.EWOULDBLOCK {
+					// Socket send buffer full — defer to the worker so
+					// flushSend can retry under dirty-list management.
+					partial = true
+				} else {
+					processErr = werr
+				}
+			} else if n < len(cs.writeBuf) {
+				// Partial write — shift remainder and defer to worker.
+				remaining := len(cs.writeBuf) - n
+				copy(cs.writeBuf, cs.writeBuf[n:])
+				cs.writeBuf = cs.writeBuf[:remaining]
+				partial = true
+			} else {
+				cs.writeBuf = cs.writeBuf[:0]
+			}
+		}
 		cs.detachMu.Unlock()
 
 		if processErr != nil {
@@ -1501,7 +2001,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			return
 		}
 
-		if hasWrite {
+		if partial {
 			w.detachQMu.Lock()
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
@@ -1522,7 +2022,7 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		}
 		// Back-pressure: drop writes when total pending data exceeds limit.
 		// The connection will be closed after processing completes.
-		if len(cs.writeBuf)+len(cs.sendBuf) > cs.sendCap() {
+		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > cs.sendCap() {
 			return
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds
@@ -1531,6 +2031,38 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		// handler returns. Only markDirty if flushSend fails (SQ ring
 		// full), avoiding linked-list overhead on the happy path.
 		cs.writeBuf = append(cs.writeBuf, data...)
+	}
+}
+
+// makeWriteBodyFn returns a closure that stores a zero-copy body reference
+// for scatter-gather send via IORING_OP_WRITEV. The body slice is NOT
+// copied — it must remain valid and unmutated until completeSend clears
+// cs.sendBody. For HTTP/1 response writers calling
+// writeBody(pre-computed-response) this is always safe; handlers that
+// generate bodies per-request should only call writeBody once with a
+// slice they do not mutate further.
+//
+// Saves one full body-sized memcpy per request: the traditional path
+// appends body into a.respBuf, then writeFn appends respBuf into
+// cs.writeBuf (two userspace copies of body bytes). With writeBody, the
+// body stays in the handler's memory; the engine issues a single WRITEV
+// SQE with iovec = [sendBuf (headers), body (alias)] and the kernel
+// does one copy directly to the socket buffer.
+func (w *Worker) makeWriteBodyFn(cs *connState) func([]byte) {
+	return func(body []byte) {
+		if cs.closing {
+			return
+		}
+		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf)+len(body) > cs.sendCap() {
+			return
+		}
+		if cs.bodyBuf != nil {
+			// A second large-body write in the same request: fall back
+			// to copying (we only carry one iovec entry for the body).
+			cs.writeBuf = append(cs.writeBuf, body...)
+			return
+		}
+		cs.bodyBuf = body
 	}
 }
 
@@ -1587,6 +2119,31 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 	return true
 }
 
+// pickRecvTarget selects the recv target for the next SQE on cs. When the
+// H1 parser is in a partial-body state and there's bodyBuf tail capacity,
+// it returns that slice and flags the conn so handleRecv routes the next
+// CQE through the direct-body path (bypassing ProcessH1 + cs.buf memcpy).
+// Disabled when a provided-buffer ring is in use (multishot recv path owns
+// its own buffer lifecycle). Always clears cs.recvIntoBody when the normal
+// cs.buf path is picked.
+func (w *Worker) pickRecvTarget(cs *connState) []byte {
+	cs.recvIntoBody = false
+	// Async mode: the dispatch goroutine owns h1State; the worker cannot
+	// safely observe NextRecvBuf without synchronization. Always use
+	// cs.buf so the goroutine handles body accumulation on its side.
+	if w.async || w.bufRing != nil || cs.h1State == nil {
+		return cs.buf
+	}
+	if !w.h1Only && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
+		return cs.buf
+	}
+	if b := cs.h1State.NextRecvBuf(); b != nil {
+		cs.recvIntoBody = true
+		return b
+	}
+	return cs.buf
+}
+
 func (w *Worker) drainDetachQueue() {
 	if w.detachQPending.Load() == 0 {
 		return
@@ -1606,6 +2163,21 @@ func (w *Worker) drainDetachQueue() {
 		// goroutine can't touch w.conns or the dirty list safely).
 		if cs.asyncClosed.Load() {
 			w.closeConn(cs.fd)
+			continue
+		}
+		// Dispatch goroutine promoted the conn to H2 via switchToH2Local
+		// on the h2c-upgrade path. Finish the worker-owned bits of the
+		// swap: arm the H2 eventfd poll (once per worker) and register
+		// the fd on the write-queue poll list. The conn stays alive;
+		// subsequent recvs dispatch via the inline H2 path.
+		if cs.asyncH2Promoted.Load() {
+			cs.asyncH2Promoted.Store(false)
+			if !w.h2PollArmed && w.h2EventFD >= 0 {
+				w.prepareH2Poll()
+				w.h2PollArmed = true
+			}
+			w.h2Conns = append(w.h2Conns, cs.fd)
+			w.markDirty(cs)
 			continue
 		}
 		// Apply pending pause/resume request from the WS middleware.
@@ -1706,11 +2278,41 @@ func (w *Worker) flushSend(cs *connState) bool {
 	}
 
 	// No in-flight data; swap writeBuf → sendBuf if there's new data.
-	if len(cs.writeBuf) == 0 {
+	if len(cs.writeBuf) == 0 && len(cs.bodyBuf) == 0 {
 		return false
 	}
 
 	cs.sendBuf, cs.writeBuf = cs.writeBuf, cs.sendBuf[:0]
+
+	// Scatter-gather path: a large body was staged via writeBody without
+	// being copied into writeBuf. Emit one WRITEV SQE that reads [headers,
+	// body] straight to the socket, saving one body-sized memcpy.
+	if len(cs.bodyBuf) > 0 {
+		sqe := w.ring.GetSQE()
+		if sqe == nil {
+			cs.writeBuf, cs.sendBuf = cs.sendBuf, cs.writeBuf
+			return true
+		}
+		cs.sendBody = cs.bodyBuf
+		cs.bodyBuf = nil
+		n := 0
+		if len(cs.sendBuf) > 0 {
+			cs.iov[n].Base = uintptr(unsafe.Pointer(&cs.sendBuf[0]))
+			cs.iov[n].Len = uint64(len(cs.sendBuf))
+			n++
+		}
+		cs.iov[n].Base = uintptr(unsafe.Pointer(&cs.sendBody[0]))
+		cs.iov[n].Len = uint64(len(cs.sendBody))
+		n++
+		prepWritev(sqe, cs.fd, unsafe.Pointer(&cs.iov[0]), n, false)
+		if cs.fixedFile {
+			setSQEFixedFile(sqe)
+		}
+		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		cs.sending = true
+		w.sendsPending = true
+		return false
+	}
 
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
@@ -1756,6 +2358,15 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 
 	// Partial send remainder — no linking (RECV may already be in flight).
 	if len(cs.sendBuf) > 0 {
+		return w.flushSend(cs)
+	}
+
+	// Scatter-gather body is staged — bypass the SEND→RECV link chain
+	// because IORING_OP_WRITEV carries two iovec entries and the normal
+	// link machinery in this function only wires up a single SEND SQE.
+	// flushSend handles WRITEV correctly; the re-arm of multishot recv
+	// is handled by the handleRecv tail on the next CQE.
+	if len(cs.bodyBuf) > 0 {
 		return w.flushSend(cs)
 	}
 
@@ -1862,7 +2473,16 @@ func (w *Worker) shutdown() {
 		}
 		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 		if !trulyDetached && cs.h1State != nil {
-			conn.CloseH1(cs.h1State)
+			// Mirror the closeConn fix: hold detachMu while tearing
+			// down h1State so ProcessH1 in runAsyncHandler isn't still
+			// reading the fields CloseH1 writes.
+			if detached {
+				cs.detachMu.Lock()
+				conn.CloseH1(cs.h1State)
+				cs.detachMu.Unlock()
+			} else {
+				conn.CloseH1(cs.h1State)
+			}
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)

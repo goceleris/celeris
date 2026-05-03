@@ -56,11 +56,11 @@ func TestResolveDefaultValues(t *testing.T) {
 	if res.MaxConns != 65536 {
 		t.Errorf("MaxConns = %d, want 65536", res.MaxConns)
 	}
-	if res.SocketRecv != 262144 {
-		t.Errorf("SocketRecv = %d, want 262144", res.SocketRecv)
+	if res.SocketRecv != 0 {
+		t.Errorf("SocketRecv = %d, want 0 (kernel auto-tune)", res.SocketRecv)
 	}
-	if res.SocketSend != 262144 {
-		t.Errorf("SocketSend = %d, want 262144", res.SocketSend)
+	if res.SocketSend != 0 {
+		t.Errorf("SocketSend = %d, want 0 (kernel auto-tune)", res.SocketSend)
 	}
 }
 

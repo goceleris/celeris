@@ -24,6 +24,34 @@ var (
 	ErrNotProtoBuf = errors.New("protobuf: content type is not protobuf")
 )
 
+// wrapErr pairs ErrInvalidProtoBuf with the underlying proto unmarshal
+// error. Replaces fmt.Errorf("%w: %w", ...) — same alloc-profile
+// reason as middleware/jwt/classifiedError (R71) and
+// middleware/jwt/internal/jwtparse/wrapErr (R72): fmt.Errorf with
+// double-%w costs four allocations (printer state, message string,
+// wrapErrors struct, unwrap slice); this is one struct alloc with
+// a lazy Error() concat.
+type wrapErr struct {
+	outer error
+	inner error
+}
+
+func (w *wrapErr) Error() string {
+	return w.outer.Error() + ": " + w.inner.Error()
+}
+
+// Is matches target against either side, avoiding a per-call slice
+// alloc that Unwrap() []error would require.
+func (w *wrapErr) Is(target error) bool {
+	if errors.Is(w.outer, target) {
+		return true
+	}
+	return errors.Is(w.inner, target)
+}
+
+// Unwrap returns the outer sentinel for errors.As.
+func (w *wrapErr) Unwrap() error { return w.outer }
+
 // Config controls protobuf marshaling and unmarshaling options.
 type Config struct {
 	// MarshalOptions controls proto marshaling behavior.

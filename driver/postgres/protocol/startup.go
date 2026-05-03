@@ -182,7 +182,7 @@ func (s *StartupState) handleAuth(payload []byte, w *Writer) ([]byte, bool, erro
 		// SASLFinal is followed by AuthenticationOk from the server.
 		return nil, false, nil
 	case AuthKerberosV5, AuthGSS, AuthGSSContinue, AuthSSPI:
-		return nil, false, errors.New("postgres/protocol: unsupported auth method (GSS/SSPI/Kerberos); see v1.4.x roadmap")
+		return nil, false, errors.New("postgres/protocol: unsupported auth method (GSS/SSPI/Kerberos)")
 	default:
 		return nil, false, fmt.Errorf("postgres/protocol: unknown Authentication subtype %d", subtype)
 	}

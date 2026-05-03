@@ -86,15 +86,16 @@ func SetTestScheme(c *Context, scheme string) {
 // Context is the request context passed to handlers. It is pooled via sync.Pool.
 // A Context is obtained from the pool and must not be retained after the handler returns.
 type Context struct {
-	stream     *stream.Stream
-	index      int16
-	handlers   []HandlerFunc
-	handlerBuf [8]HandlerFunc
-	params     Params
-	paramBuf   [4]Param
-	keys       map[string]any
-	ctx        context.Context
-	startTime  time.Time
+	stream      *stream.Stream
+	index       int16
+	handlers    []HandlerFunc
+	handlerBuf  [8]HandlerFunc
+	params      Params
+	paramBuf    [4]Param
+	keys        map[string]any
+	ctx         context.Context
+	startTime   time.Time
+	startTimeNs int64 // primary representation; startTime is materialized lazily by StartTime()
 
 	method   string
 	path     string
@@ -142,6 +143,26 @@ type Context struct {
 
 	extended bool // true when keys/query/cookie/form/capture/buffer/detach/overrides were used
 
+	// requestID is the canonical request ID, set by middleware/requestid
+	// via [Context.SetRequestID]. Dedicated field so per-request writes
+	// skip the any-interface boxing that Set(RequestIDKey, id) would cost.
+	requestID string
+
+	// stringKeys stores string-valued per-request data without the
+	// any-interface boxing that c.Set would pay. Populated lazily on
+	// first [Context.SetString]. Preferred storage for auth principals,
+	// tenant IDs, trace correlators — any stringly-typed scalar that
+	// middleware wants to share downstream without an alloc per request.
+	stringKeys map[string]string
+
+	// workerID is the engine-supplied event-loop worker affinity for
+	// this request. Stored as a direct field (not via context.Value) so
+	// the routerAdapter avoids a context.WithValue allocation per
+	// request — that single alloc dominated the iouring-h1-sync profile.
+	// Zero-value safe: WorkerID() reports -1 when unset.
+	workerID    int32
+	workerIDSet bool
+
 	clientIPOverride string
 	schemeOverride   string
 	hostOverride     string
@@ -163,6 +184,11 @@ var contextPool = sync.Pool{New: func() any {
 }}
 
 const abortIndex int16 = math.MaxInt16 / 2
+
+// capturedBodyMaxRetained caps the backing array size kept across
+// Context pool cycles. Requests that produce larger bodies don't
+// retain their buffer (avoiding pool-wide memory bloat from outliers).
+const capturedBodyMaxRetained = 64 * 1024
 
 // RequestIDKey is the canonical context store key for the request ID.
 // Middleware that generates or reads request IDs should use this key
@@ -204,13 +230,26 @@ func releaseContext(c *Context) {
 }
 
 func (c *Context) extractRequestInfo() {
+	// H1 dispatch primes Stream.Method / Stream.Path directly so we skip
+	// the s.Headers walk entirely. For H2 streams the pseudo-headers
+	// still arrive via HPACK in s.Headers — fall back to the headers
+	// walk in that case.
+	if c.stream.Method != "" {
+		c.method = c.stream.Method
+		p := c.stream.Path
+		if i := strings.IndexByte(p, '?'); i >= 0 {
+			c.path = p[:i]
+			c.rawQuery = p[i+1:]
+		} else {
+			c.path = p
+		}
+		return
+	}
+
 	headers := c.stream.Headers
 
-	// Direct index access: H1 (populateCachedStream) always places
-	// :method at [0] and :path at [1]. H2 (HPACK) usually follows the
-	// same convention. Check the first 2 bytes of each name to verify
-	// (":m" for :method, ":p" for :path) — this is faster than full
-	// string comparison and covers all production pseudo-header names.
+	// Direct index access: H2 HPACK usually places :method first and
+	// :path second.
 	if len(headers) >= 2 &&
 		len(headers[0][0]) > 1 && headers[0][0][1] == 'm' &&
 		len(headers[1][0]) > 1 && headers[1][0][1] == 'p' {
@@ -308,6 +347,13 @@ func (c *Context) SetContext(ctx context.Context) {
 // engine (all platforms) returns -1 because Go's runtime scheduler
 // picks the goroutine and there is no meaningful worker identity.
 func (c *Context) WorkerID() int {
+	if c.workerIDSet {
+		return int(c.workerID)
+	}
+	// Fallback for synthetic contexts (tests etc.) that came in
+	// pre-populated via context.WithValue without going through
+	// routerAdapter.HandleStream. Production hot path uses the field
+	// above and never reaches this Value() walk.
 	id, _ := ctxkit.WorkerIDFrom(c.Context())
 	return id
 }
@@ -315,7 +361,15 @@ func (c *Context) WorkerID() int {
 // StartTime returns the time at which request processing began. Set once by
 // the framework before the handler chain runs, so all middleware share the
 // same timestamp without calling time.Now() independently.
-func (c *Context) StartTime() time.Time { return c.startTime }
+func (c *Context) StartTime() time.Time {
+	// Materialize lazily from the raw ns set by routerAdapter.HandleStream.
+	// Most requests never call StartTime(), so the time.Unix division is
+	// deferred off the hot path.
+	if c.startTime.IsZero() && c.startTimeNs != 0 {
+		c.startTime = time.Unix(0, c.startTimeNs)
+	}
+	return c.startTime
+}
 
 // Set stores a key-value pair for this request.
 func (c *Context) Set(key string, value any) {
@@ -324,22 +378,114 @@ func (c *Context) Set(key string, value any) {
 }
 
 // Get returns the value for a key.
+//
+// Consults c.keys first (values set via [Context.Set]), then the
+// dedicated string storage from [Context.SetString] and
+// [Context.SetRequestID]. The any-interface boxing on fallback paths
+// is re-done per Get call, so celeris-ecosystem code prefers the typed
+// [Context.GetString] and [Context.RequestID] getters for zero-alloc
+// reads.
 func (c *Context) Get(key string) (any, bool) {
-	v, ok := c.keys[key]
-	return v, ok
+	if v, ok := c.keys[key]; ok {
+		return v, ok
+	}
+	if c.stringKeys != nil {
+		if s, ok := c.stringKeys[key]; ok {
+			return s, true
+		}
+	}
+	if key == RequestIDKey && c.requestID != "" {
+		return c.requestID, true
+	}
+	return nil, false
 }
 
 // Keys returns a copy of all key-value pairs stored on this context.
 // Returns nil if no values have been set.
 func (c *Context) Keys() map[string]any {
-	if len(c.keys) == 0 {
+	n := len(c.keys) + len(c.stringKeys)
+	if c.requestID != "" {
+		if _, inMap := c.stringKeys[RequestIDKey]; !inMap {
+			if _, inKeys := c.keys[RequestIDKey]; !inKeys {
+				n++
+			}
+		}
+	}
+	if n == 0 {
 		return nil
 	}
-	cp := make(map[string]any, len(c.keys))
+	cp := make(map[string]any, n)
 	for k, v := range c.keys {
 		cp[k] = v
 	}
+	for k, v := range c.stringKeys {
+		if _, clash := cp[k]; !clash {
+			cp[k] = v
+		}
+	}
+	if c.requestID != "" {
+		if _, clash := cp[RequestIDKey]; !clash {
+			cp[RequestIDKey] = c.requestID
+		}
+	}
 	return cp
+}
+
+// RequestID returns the canonical request ID for this context, set by
+// middleware/requestid via [Context.SetRequestID]. Empty when no
+// requestid middleware is installed or it skipped this request.
+//
+// Prefer this over Get(RequestIDKey) in celeris-ecosystem middleware:
+// the underlying storage avoids the any-interface boxing that c.Get
+// has to re-create on every call.
+func (c *Context) RequestID() string { return c.requestID }
+
+// SetRequestID stores the canonical request ID for this context. The
+// value is exposed via both [Context.RequestID] (zero-alloc, preferred)
+// and Get(RequestIDKey) (back-compat; re-boxes per call).
+func (c *Context) SetRequestID(id string) {
+	c.extended = true
+	c.requestID = id
+}
+
+// SetString stores a string value on the context under key. Unlike
+// [Context.Set], the value is kept in typed string storage — no
+// any-interface boxing alloc per call.
+//
+// Reads: pair with [Context.GetString] for zero-alloc access. [Context.Get]
+// falls back to the string storage, but re-boxes the string into an
+// any on each call.
+func (c *Context) SetString(key, value string) {
+	c.extended = true
+	if c.stringKeys == nil {
+		c.stringKeys = make(map[string]string, 2)
+	}
+	c.stringKeys[key] = value
+}
+
+// GetString returns the string value stored under key by
+// [Context.SetString], or ("", false) if absent. Also falls back to
+// any-typed values written via [Context.Set] for back-compat, and to
+// [Context.SetRequestID] when key == [RequestIDKey].
+//
+// Unlike Gin's single-return GetString, celeris returns ("", false)
+// on absent keys so callers can distinguish "never set" from "set to
+// empty string".
+func (c *Context) GetString(key string) (string, bool) {
+	if c.stringKeys != nil {
+		if s, ok := c.stringKeys[key]; ok {
+			return s, true
+		}
+	}
+	if v, ok := c.keys[key]; ok {
+		if s, ok := v.(string); ok {
+			return s, true
+		}
+	}
+	if key == RequestIDKey && c.requestID != "" {
+		return c.requestID, true
+	}
+	return "", false
 }
 
 // OnRelease registers a function to be called when this Context is released
@@ -394,8 +540,16 @@ func (c *Context) reset() {
 	c.aborted = false
 	c.bytesWritten = 0
 	c.maxFormSize = 0
+	c.requestID = ""
+	c.workerID = 0
+	c.workerIDSet = false
+	c.startTimeNs = 0
+	c.startTime = time.Time{}
 	if c.extended {
 		clear(c.keys)
+		if c.stringKeys != nil {
+			clear(c.stringKeys)
+		}
 		c.queryCache = nil
 		c.queryCached = false
 		c.cookieCache = c.cookieCache[:0]
@@ -407,7 +561,15 @@ func (c *Context) reset() {
 		c.formParsed = false
 		c.formValues = nil
 		c.captureBody = false
-		c.capturedBody = nil
+		// Retain the capturedBody backing array across pool cycles so the
+		// next Buffer/Capture request's append doesn't start from nil.
+		// Cap retention at 64 KiB so an outlier response doesn't bloat
+		// every pooled Context forever.
+		if cap(c.capturedBody) > capturedBodyMaxRetained {
+			c.capturedBody = nil
+		} else {
+			c.capturedBody = c.capturedBody[:0]
+		}
 		c.capturedStatus = 0
 		c.capturedType = ""
 		c.bufferDepth = 0

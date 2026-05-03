@@ -302,12 +302,10 @@ func TestJWKSResponseSizeLimit(t *testing.T) {
 }
 
 func TestJWKSHTTPTimeout(t *testing.T) {
-	// The test asserts that the client times out after 50ms while the
-	// server handler takes 15s. Using an unblocking signal lets ts.Close
-	// finish immediately instead of waiting out the 15s sleep — which
-	// previously caused httptest to emit its "Server blocked in Close"
-	// debug dump and flake the suite under -count=2+ when running
-	// alongside other tests.
+	// Asserts the client times out after 50ms while the server takes
+	// 15s. The unblocking `stop` signal lets ts.Close return promptly,
+	// avoiding httptest's "Server blocked in Close" warning that
+	// otherwise flakes -count=2+ runs.
 	stop := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		select {

@@ -491,24 +491,15 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		Fd:     int32(fd),
 	})
 
-	// Step 3: Poll for the response. Two phases now (A + C):
-	//   Phase A: one non-blocking read. Catches responses already in the
-	//            kernel buffer by the time we arrive here — TCP coalescing
-	//            and NAPI tail-drain both occasionally leave pre-written
-	//            data visible immediately.
-	//   Phase B: 32 non-blocking poll(0) + Gosched() rounds. Yields the P
-	//            so other handlers on this P make progress — essential for
-	//            foreign-HTTP throughput under 256-way concurrency.
-	//   Phase C: poll(1ms) as last resort.
-	//
-	// A prior design did 64 tight unix.Read calls in Phase A as an
-	// "in-kernel-buffer" probe. Line-level profile of nethttp+celerismc
-	// at 62k rps showed that loop burning 20% of total CPU in mostly-
-	// EAGAIN returns — the response never arrives in <1µs on loopback
-	// (kernel-to-kernel RTT is 20–50µs minimum), so rounds 2-64 were
-	// pure waste (~60 failed syscalls per request, ~30µs of CPU
-	// overhead). A single attempt preserves the rare pre-arrived-data
-	// win and then cedes to the yielding poll path.
+	// Step 3: Poll for the response in three phases:
+	//   A: one non-blocking read (catches pre-arrived data from TCP
+	//      coalescing / NAPI tail-drain). A tight 64-read probe was tried
+	//      and dropped — kernel-to-kernel loopback RTT is 20–50µs, so
+	//      rounds 2+ were pure EAGAIN waste at ~20% CPU.
+	//   B: 16 poll(0) + Gosched rounds — yields the P so other handlers
+	//      on it make progress. Required for foreign-HTTP throughput
+	//      under 256-way concurrency.
+	//   C: poll(1ms) as last resort.
 	gotData := false
 	var readErr error
 	if n, err := unix.Read(fd, rbuf); n > 0 {
@@ -531,15 +522,10 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	} else if err != nil && !isEAGAIN(err) {
 		readErr = err
 	}
-	// Phase B: 32-round poll(0) + runtime.Gosched() spin. For an
-	// unlocked caller (foreign-HTTP handler goroutine), Gosched yields
-	// the P so other handlers on the same P make progress. Removing
-	// this loop (and relying on Phase C's poll(1ms) alone) regressed
-	// foreign-HTTP throughput 20-30% — 256 handlers all parking in
-	// poll(1ms) simultaneously starves the kernel scheduler even though
-	// per-request latency stays low. For a locked caller (celeris HTTP
-	// engine worker) Gosched forces stoplockedm + startlockedm (a
-	// futex pair per call) — those callers must use WriteAndPollBusy.
+	// Phase B: poll(0) + Gosched spin. Locked callers (celeris HTTP
+	// engine workers) must NOT take this path — Gosched forces
+	// stoplockedm + startlockedm (a futex pair per call); those callers
+	// route through WriteAndPollBusy instead.
 	if !gotData && readErr == nil {
 		var pfd [1]unix.PollFd
 		pfd[0].Fd = int32(fd)

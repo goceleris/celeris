@@ -406,6 +406,51 @@ func growCap(old, need int) int {
 // Ctx implements async.PendingRequest.
 func (r *pgRequest) Ctx() context.Context { return r.ctx }
 
+// OnRowDesc implements [protocol.SimpleQueryObserver]. Called once per
+// RowDescription frame on simple-query requests. Stashes the column
+// list and unblocks any caller waiting on colsCh for early streamRows
+// return.
+func (r *pgRequest) OnRowDesc(cols []protocol.ColumnDesc) {
+	r.columns = cols
+	if r.rowCh != nil && r.colsCh != nil {
+		close(r.colsCh)
+	}
+}
+
+// OnRow implements [protocol.SimpleQueryObserver] and
+// [protocol.ExtendedQueryObserver]. Called once per DataRow.
+//
+// Direct-mode (sync syncMode) buffers everything into rowSlab/rows;
+// streaming mode forwards through rowCh. The simple and extended
+// dispatch branches share this method — the only difference between
+// them is whether onRowDesc fires (extended takes columns from the
+// Describe step, not from a per-DataRow signal).
+func (r *pgRequest) OnRow(fields [][]byte) {
+	if r.rowCh != nil {
+		r.rowCh <- copyRow(fields)
+		return
+	}
+	r.appendRowFromAlias(fields)
+	// Direct-mode result-buffer cap. In direct mode syncMode is pinned
+	// so lazy streaming never fires; without a cap a huge SELECT would
+	// buffer every row in memory unbounded. Cap at maxDirectResultBytes
+	// (64 MiB) and fail with ErrResultTooBig — caller paginates or
+	// switches modes.
+	if r.syncMode.Load() && len(r.rowSlab) > maxDirectResultBytes {
+		r.doneMu.Lock()
+		if r.err == nil {
+			r.err = ErrResultTooBig
+		}
+		r.doneMu.Unlock()
+		return
+	}
+	// Skip streaming promotion when colsCh is nil (Exec paths don't
+	// allocate one; promoting would panic on close(nil colsCh)).
+	if !r.syncMode.Load() && r.colsCh != nil && len(r.rows) >= streamThreshold {
+		promoteToStreaming(r)
+	}
+}
+
 // prepareState drives a Parse + Describe S + Sync exchange. Unlike
 // ExtendedQueryState, it does not expect a Bind or Execute.
 type prepareState struct {
@@ -478,6 +523,13 @@ type pgConn struct {
 	closeLoop func()
 	syncBuf   []byte // read buffer for syncLoop.WriteAndPoll
 
+	// onRecvFn / onCloseFn cache the method-value closures bound to this
+	// pgConn. The hot sync path (WriteAndPoll on every Query/Exec) would
+	// otherwise re-create `c.onRecv` per call — Go's compiler heap-allocates
+	// the closure when it escapes into a func argument.
+	onRecvFn  func([]byte)
+	onCloseFn func(error)
+
 	// Direct mode: used when the caller runs on an unlocked G (standalone
 	// or Config.AsyncHandlers=true). All I/O goes through c.tcp (which is
 	// backed by Go's netpoll) instead of the mini-loop — no LockOSThread'd
@@ -521,7 +573,11 @@ type pgConn struct {
 	stmtCache *lru
 	// autoCache, when true, routes cacheable SELECT-style QueryContext
 	// calls through the per-conn stmtCache even when the caller did not
-	// explicitly Prepare. Opt-in via DSN's AutoCacheStatements option.
+	// explicitly Prepare. Default-on at the [Pool.Open] / [NewConnector]
+	// layer; opt out with the DSN parameter `auto_cache_statements=false`.
+	// Lower-level entry points (raw [dialConn]) keep the field at its
+	// zero-value for backwards compatibility with simple-query test
+	// fixtures.
 	autoCache bool
 
 	createdAt  time.Time
@@ -826,9 +882,11 @@ func dialConn(ctx context.Context, prov engine.EventLoopProvider, closeLoop func
 	if syncL != nil {
 		c.syncBuf = make([]byte, 16<<10) // 16 KiB read buffer for sync path
 	}
+	c.onRecvFn = c.onRecv
+	c.onCloseFn = c.onClose
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecv, c.onClose); err != nil {
+	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
 		// Close via file.Close() to disarm the *os.File finalizer. A stray
 		// syscall.Close(fd) here would leave the finalizer armed; when GC
 		// later fires it would close the same fd a SECOND time, possibly
@@ -1164,42 +1222,11 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			head.finish()
 		}
 	case reqSimple:
-		onRowDesc := func(cols []protocol.ColumnDesc) {
-			head.columns = cols
-			if head.rowCh != nil && head.colsCh != nil {
-				close(head.colsCh)
-			}
-		}
-		onRow := func(fields [][]byte) {
-			if head.rowCh != nil {
-				head.rowCh <- copyRow(fields)
-				return
-			}
-			head.appendRowFromAlias(fields)
-			// Direct-mode result buffer cap: in direct mode syncMode is
-			// pinned so lazy streaming never fires, and a huge SELECT
-			// would otherwise buffer every row in memory without
-			// bound. Cap at maxDirectResultBytes (64 MiB) and fail the
-			// request — the caller sees ErrResultTooBig with an
-			// actionable message about paginating or switching modes.
-			if head.syncMode.Load() && len(head.rowSlab) > maxDirectResultBytes {
-				head.doneMu.Lock()
-				if head.err == nil {
-					head.err = ErrResultTooBig
-				}
-				head.doneMu.Unlock()
-				return
-			}
-			// Only promote on request paths that actually have a caller
-			// waiting on streamed rows (colsCh != nil). Exec paths
-			// (simpleExec / doExtendedExec) don't allocate colsCh — they
-			// only care about CommandComplete's tag — and promoting would
-			// panic on close(nil colsCh) inside promoteToStreaming.
-			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
-				promoteToStreaming(head)
-			}
-		}
-		done, err := head.simple.Handle(msgType, payload, onRowDesc, onRow)
+		// pgRequest implements protocol.SimpleQueryObserver via OnRowDesc /
+		// OnRow methods — passing head directly avoids the per-dispatch
+		// closure-pair allocation the previous inline funcs paid (-2
+		// allocs/op on the hot path; see PR description for full delta).
+		done, err := head.simple.Handle(msgType, payload, head)
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
@@ -1224,28 +1251,10 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			head.finish()
 		}
 	case reqExtended:
-		onRow := func(fields [][]byte) {
-			if head.rowCh != nil {
-				head.rowCh <- copyRow(fields)
-				return
-			}
-			head.appendRowFromAlias(fields)
-			// See reqSimple branch: same direct-mode cap.
-			if head.syncMode.Load() && len(head.rowSlab) > maxDirectResultBytes {
-				head.doneMu.Lock()
-				if head.err == nil {
-					head.err = ErrResultTooBig
-				}
-				head.doneMu.Unlock()
-				return
-			}
-			// See reqSimple branch: skip promotion when colsCh is nil
-			// (Exec paths don't allocate one; promoting would panic).
-			if !head.syncMode.Load() && head.colsCh != nil && len(head.rows) >= streamThreshold {
-				promoteToStreaming(head)
-			}
-		}
-		done, err := head.extended.Handle(msgType, payload, onRow)
+		// pgRequest implements protocol.ExtendedQueryObserver via the
+		// shared OnRow method — same allocation-free dispatch as the
+		// simple-query branch.
+		done, err := head.extended.Handle(msgType, payload, head)
 		if err != nil {
 			if head.rowCh != nil {
 				head.streamErr.Store(&err)
@@ -1593,15 +1602,23 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 
 // QueryContext satisfies driver.QueryerContext.
 //
-// When the DSN option AutoCacheStatements is enabled (opt-in; the LRU
-// size is bounded by StatementCacheSize), cacheable SELECT-style queries
-// are transparently auto-prepared on first use and reused via
+// When AutoCacheStatements is enabled — the default at the [Pool.Open]
+// and [NewConnector] entry points; opt out per-DSN with
+// `auto_cache_statements=false` — cacheable SELECT-style queries with
+// arguments are transparently auto-prepared on first use and reused via
 // Bind+Describe+Execute+Sync on subsequent invocations. This matches
 // pgx's QueryExecModeCacheStatement at steady state. The first call
 // pays Parse + Describe + Bind + Execute in one flight (same as pgx);
-// subsequent calls skip Parse.
+// subsequent calls skip Parse. Arg-less queries (no $N placeholders)
+// take the simple-query path regardless.
 func (c *pgConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if c.autoCache && isCacheableQuery(query) {
+	// autoCache only helps arg-bearing queries: extended-protocol caching
+	// turns Parse+Bind+Describe+Execute+Sync (5 frames) into Bind+Execute
+	// +Sync (3 frames). For arg-less literal SQL (e.g. SELECT 1), the
+	// simple Q frame is already a single round-trip — caching adds the
+	// prepared-statement overhead without saving anything, and routes
+	// past simple-query test fixtures that only handle the Q frame.
+	if c.autoCache && len(args) > 0 && isCacheableQuery(query) {
 		if stmt, ok := c.stmtCache.get(query); ok {
 			// Cached: skip the server-side Describe round-trip; we
 			// already know the row description from the initial prep.
@@ -1794,10 +1811,26 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqSimple
-	// Lazy streaming: allocate only colsCh (cheap, ~56 bytes) upfront.
-	// rowCh (~2KB) is NOT allocated — dispatch buffers into req.rows
-	// and only allocates rowCh when the result exceeds streamThreshold.
-	req.colsCh = make(chan struct{})
+	// Lazy streaming: colsCh fires when promoteToStreaming activates
+	// rowCh mid-dispatch, letting the caller goroutine switch to
+	// streaming mode instead of waiting for the full result set.
+	//
+	// The alloc (~96 bytes for the chan header) is unneeded on three
+	// paths:
+	//   - useDirect: driveDirect owns the caller's read loop, no select
+	//     on colsCh ever happens.
+	//   - syncLoop fast path succeeds: simpleQuery returns directly
+	//     from the buffered-rows branch without entering
+	//     waitForQueryRows' select.
+	//   - syncLoop fast path falls through to async wait: we allocate
+	//     colsCh just before clearing syncMode (the fall-through site
+	//     below) so dispatch can promote to streaming if needed.
+	// Async path (no syncLoop) still pre-allocates upfront because
+	// dispatch on the event-loop goroutine may run before
+	// waitForQueryRows reaches the select and needs colsCh to be set.
+	if !c.useDirect && c.syncLoop == nil {
+		req.colsCh = make(chan struct{})
+	}
 	// Direct mode drives onRecv on the caller goroutine; streaming
 	// would deadlock the same way the sync fast path does, so pin
 	// syncMode=true so dispatch never promotes.
@@ -1816,7 +1849,7 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 		req.syncMode.Store(true)
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecv)
+		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -1841,8 +1874,12 @@ func (c *pgConn) simpleQuery(ctx context.Context, query string) (driver.Rows, er
 			c.touch()
 			return acquirePGRows(req.columns, req.rows, true, req, nil), nil
 		}
-		// Partial or EAGAIN: clear syncMode so async dispatch can promote
-		// to streaming if the result grows past the threshold.
+		// Partial or EAGAIN: allocate colsCh now (dispatch hasn't taken
+		// over yet — WriteAndPoll has returned and the event-loop worker
+		// is still parked on epoll for this fd) and clear syncMode so
+		// async dispatch can promote to streaming if the result grows
+		// past the threshold.
+		req.colsCh = make(chan struct{})
 		req.syncMode.Store(false)
 	} else {
 		// Async path: standard event-loop write.
@@ -1975,7 +2012,7 @@ func (c *pgConn) simpleExec(ctx context.Context, query string) (string, int64, e
 	if c.syncLoop != nil {
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecv)
+		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -2052,7 +2089,7 @@ func (c *pgConn) simpleExecNoTag(ctx context.Context, query string) error {
 	if c.syncLoop != nil {
 		c.writerMu.Lock()
 		payload := protocol.WriteQueryInto(c.writer, query)
-		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecv)
+		ok, err := c.syncLoop.WriteAndPoll(c.fd, payload, c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if err != nil {
 			c.failReq(req, err)
@@ -2121,24 +2158,21 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	values, formats, err := encodeArgs(args)
+	values, formats, encSlot, err := encodeArgs(args)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseEncodedArgs(encSlot)
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqExtended
-	// When the caller has cached column descriptions (auto-prepare or
-	// explicit cache), we pre-populate them and drop the server-side
-	// Describe round trip. Saves one message per query (~7 bytes of
-	// wire and one protocol-state transition) — measured +3-5% RPS
-	// on the MSR1 PG cell.
+	// With cached column descriptions we drop the server-side Describe
+	// round trip (~+3-5% RPS on the MSR1 PG cell).
 	//
-	// Intentional check: cachedCols == nil (not len==0). A prepared
-	// statement that genuinely returns zero columns (e.g. VALUES ()
-	// or a no-projection query) has a non-nil but zero-length slice;
-	// treating it as "no cache" would defeat the optimization and
-	// send a redundant Describe for every call.
+	// Check is == nil, NOT len == 0: a prepared statement returning
+	// zero columns (VALUES (), no-projection) caches as a non-nil
+	// zero-length slice; treating that as "no cache" would re-issue
+	// Describe every call.
 	hasDescribe := cachedCols == nil
 	req.extended.HasDescribe = hasDescribe
 	if !hasDescribe {
@@ -2156,8 +2190,14 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		req.columns = cols
 		req.extended.Columns = cols
 	}
-	// Lazy streaming: allocate only colsCh (cheap). See simpleQuery.
-	req.colsCh = make(chan struct{})
+	// Lazy streaming: colsCh only needed when waitForQueryRows enters
+	// the select. Skip the alloc on the sync fast path success branch
+	// (re-allocated below before falling through to async wait) and on
+	// useDirect (driveDirect never selects on colsCh). See simpleQuery
+	// for the detailed rationale.
+	if !c.useDirect && c.syncLoop == nil {
+		req.colsCh = make(chan struct{})
+	}
 	// Direct mode drives reads on the caller goroutine; streaming would
 	// deadlock. Pin syncMode=true so dispatch never promotes.
 	if c.useDirect {
@@ -2182,7 +2222,7 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 		}
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
-		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecv)
+		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if werr != nil {
 			c.failReq(req, werr)
@@ -2206,38 +2246,36 @@ func (c *pgConn) doExtendedQuery(ctx context.Context, stmtName, query string, ar
 			c.touch()
 			return acquirePGRows(req.columns, req.rows, false, req, nil), nil
 		}
-		// Clear syncMode so async dispatch can promote to streaming.
+		// Allocate colsCh now so async dispatch can signal streaming
+		// promotion, then clear syncMode.
+		req.colsCh = make(chan struct{})
 		req.syncMode.Store(false)
 	} else {
-		var skipParse bool
-		payload := c.buildMessage(func(w *protocol.Writer) []byte {
-			var parseB []byte
-			if stmtName == "" {
-				parseB = protocol.WriteParse(w, "", query, nil)
-			}
-			bindB := protocol.WriteBind(w, "", stmtName, formats, values, resultFormats)
-			var descB []byte
-			if hasDescribe {
-				descB = protocol.WriteDescribe(w, 'P', "")
-			}
-			execB := protocol.WriteExecute(w, "", 0)
-			syncB := protocol.WriteSync(w)
-			if parseB != nil {
-				if descB != nil {
-					return joinBytes(parseB, bindB, descB, execB, syncB)
-				}
-				return joinBytes(parseB, bindB, execB, syncB)
-			}
-			skipParse = true
-			if descB != nil {
-				return joinBytes(bindB, descB, execB, syncB)
-			}
-			return joinBytes(bindB, execB, syncB)
-		})
-		if skipParse {
+		// Direct-mode extended query. Build the Parse+Bind+[Describe]+
+		// Execute+Sync sequence in-place on c.writer to avoid the per-
+		// message snapshot copies the Write* helpers return and the
+		// joinBytes fusion slice. One owned copy at the end so callers
+		// can release writerMu before hitting the wire.
+		c.writerMu.Lock()
+		c.writer.Reset()
+		if stmtName == "" {
+			protocol.AppendParse(c.writer, "", query, nil)
+		} else {
 			req.extended.SkipParse = true
 		}
-		if err := c.writeRaw(payload); err != nil {
+		protocol.AppendBind(c.writer, "", stmtName, formats, values, resultFormats)
+		if hasDescribe {
+			protocol.AppendDescribe(c.writer, 'P', "")
+		}
+		protocol.AppendExecute(c.writer, "", 0)
+		protocol.AppendSync(c.writer)
+		buf := c.writer.Bytes()
+		pslot := acquirePayloadBuf(len(buf))
+		pslot.buf = append(pslot.buf, buf...)
+		c.writerMu.Unlock()
+		err := c.writeRaw(pslot.buf)
+		releasePayloadBuf(pslot)
+		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
 			return nil, err
@@ -2265,10 +2303,11 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
-	values, formats, err := encodeArgs(args)
+	values, formats, encSlot, err := encodeArgs(args)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseEncodedArgs(encSlot)
 	req := acquirePgRequest()
 	req.ctx = ctx
 	req.kind = reqExtended
@@ -2291,7 +2330,7 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 		protocol.AppendBind(c.writer, "", stmtName, formats, values, nil)
 		protocol.AppendExecute(c.writer, "", 0)
 		protocol.AppendSync(c.writer)
-		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecv)
+		ok, werr := c.syncLoop.WriteAndPoll(c.fd, c.writer.Bytes(), c.syncBuf, c.onRecvFn)
 		c.writerMu.Unlock()
 		if werr != nil {
 			c.failReq(req, werr)
@@ -2316,20 +2355,23 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 			return res, nil
 		}
 	} else {
-		payload := c.buildMessage(func(w *protocol.Writer) []byte {
-			var parseB []byte
-			if stmtName == "" {
-				parseB = protocol.WriteParse(w, "", query, nil)
-			}
-			bindB := protocol.WriteBind(w, "", stmtName, formats, values, nil)
-			execB := protocol.WriteExecute(w, "", 0)
-			syncB := protocol.WriteSync(w)
-			if parseB != nil {
-				return joinBytes(parseB, bindB, execB, syncB)
-			}
-			return joinBytes(bindB, execB, syncB)
-		})
-		if err := c.writeRaw(payload); err != nil {
+		// Direct-mode extended exec — same in-place Append strategy as
+		// doExtendedQuery to eliminate intermediate snapshot allocs.
+		c.writerMu.Lock()
+		c.writer.Reset()
+		if stmtName == "" {
+			protocol.AppendParse(c.writer, "", query, nil)
+		}
+		protocol.AppendBind(c.writer, "", stmtName, formats, values, nil)
+		protocol.AppendExecute(c.writer, "", 0)
+		protocol.AppendSync(c.writer)
+		buf := c.writer.Bytes()
+		pslot := acquirePayloadBuf(len(buf))
+		pslot.buf = append(pslot.buf, buf...)
+		c.writerMu.Unlock()
+		err := c.writeRaw(pslot.buf)
+		releasePayloadBuf(pslot)
+		if err != nil {
 			c.failReq(req, err)
 			releasePgRequest(req)
 			return nil, err
@@ -2348,21 +2390,96 @@ func (c *pgConn) doExtendedExec(ctx context.Context, stmtName, query string, arg
 }
 
 // encodeArgs converts a NamedValue list into Bind-ready ([][]byte, []int16).
-func encodeArgs(args []driver.NamedValue) ([][]byte, []int16, error) {
-	if len(args) == 0 {
-		return nil, nil, nil
+// encodedArgsSlot holds the paired []byte+int16 slices that encodeArgs
+// returns to protocol.AppendBind. Both are sized to the same length, so
+// a single pooled struct amortises two allocations per query.
+type encodedArgsSlot struct {
+	values  [][]byte
+	formats []int16
+}
+
+var encodedArgsPool = sync.Pool{
+	New: func() any {
+		return &encodedArgsSlot{
+			values:  make([][]byte, 0, 8),
+			formats: make([]int16, 0, 8),
+		}
+	},
+}
+
+// releaseEncodedArgs returns slot to the pool. Callers MUST invoke this
+// once protocol.AppendBind has consumed values+formats (synchronously,
+// inside the write path).
+func releaseEncodedArgs(slot *encodedArgsSlot) {
+	if slot == nil {
+		return
 	}
-	values := make([][]byte, len(args))
-	formats := make([]int16, len(args))
+	// Zero []byte references so encoded payloads aren't pinned in the
+	// pool.
+	for i := range slot.values {
+		slot.values[i] = nil
+	}
+	slot.values = slot.values[:0]
+	slot.formats = slot.formats[:0]
+	encodedArgsPool.Put(slot)
+}
+
+// payloadBufSlot recycles the []byte snapshot of c.writer.Bytes() taken
+// on the direct-mode write path. The slab header lives on the heap once
+// (in the pool's New); subsequent Get/Put round-trips reuse the same
+// *payloadBufSlot pointer so there is no per-call slice-header alloc.
+type payloadBufSlot struct {
+	buf []byte
+}
+
+var payloadBufPool = sync.Pool{
+	New: func() any {
+		return &payloadBufSlot{buf: make([]byte, 0, 256)}
+	},
+}
+
+func acquirePayloadBuf(size int) *payloadBufSlot {
+	slot := payloadBufPool.Get().(*payloadBufSlot)
+	slot.buf = slot.buf[:0]
+	if cap(slot.buf) < size {
+		slot.buf = make([]byte, 0, size)
+	}
+	return slot
+}
+
+func releasePayloadBuf(slot *payloadBufSlot) {
+	if slot == nil {
+		return
+	}
+	slot.buf = slot.buf[:0]
+	payloadBufPool.Put(slot)
+}
+
+func encodeArgs(args []driver.NamedValue) ([][]byte, []int16, *encodedArgsSlot, error) {
+	if len(args) == 0 {
+		return nil, nil, nil, nil
+	}
+	slot := encodedArgsPool.Get().(*encodedArgsSlot)
+	if cap(slot.values) < len(args) {
+		slot.values = make([][]byte, len(args))
+	} else {
+		slot.values = slot.values[:len(args)]
+	}
+	if cap(slot.formats) < len(args) {
+		slot.formats = make([]int16, len(args))
+	} else {
+		slot.formats = slot.formats[:len(args)]
+	}
 	for i, a := range args {
 		b, fmtCode, err := encodeOne(a.Value)
 		if err != nil {
-			return nil, nil, fmt.Errorf("celeris-postgres: encode arg %d: %w", i+1, err)
+			releaseEncodedArgs(slot)
+			return nil, nil, nil, fmt.Errorf("celeris-postgres: encode arg %d: %w", i+1, err)
 		}
-		values[i] = b
-		formats[i] = fmtCode
+		slot.values[i] = b
+		slot.formats[i] = fmtCode
 	}
-	return values, formats, nil
+	return slot.values, slot.formats, slot, nil
 }
 
 // encodeOne picks a binary encoding for common Go types and falls back to
@@ -2396,11 +2513,10 @@ func encodeOne(v any) ([]byte, int16, error) {
 		// without requiring knowledge of the server-side parameter OID.
 		return []byte(x.Format(time.RFC3339Nano)), protocol.FormatText, nil
 	default:
-		// Previously: fmt.Sprint(v) was wired through as text. That silently
-		// produces garbage (e.g. "{1 2}") for struct types and anything else
-		// whose default fmt form is not a valid PG literal. Callers must
-		// convert to a supported type (bool, int64, float64, string,
-		// []byte, time.Time) or register a codec in the protocol package.
+		// Reject explicitly. A generic fmt.Sprint fallback silently
+		// produces non-PG-literal text for unsupported types (e.g.
+		// "{1 2}" for struct values), which the server rejects far
+		// from the call site.
 		return nil, 0, fmt.Errorf("celeris-postgres: unsupported argument type %T; convert to bool/int64/float64/string/[]byte/time.Time or register a codec", v)
 	}
 }

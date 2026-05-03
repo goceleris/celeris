@@ -49,10 +49,19 @@
 //	host=localhost port=5432 user=app password=secret dbname=mydb sslmode=disable
 //
 // Recognized DSN keys: host, port, user, password, dbname / database, sslmode,
-// connect_timeout (seconds), statement_cache_size, application_name. Any
-// other key is forwarded to the server as a StartupMessage parameter (so
-// search_path, timezone, statement_timeout, and similar GUCs can be set at
-// connect time).
+// connect_timeout (seconds), statement_cache_size, auto_cache_statements,
+// application_name. Any other key is forwarded to the server as a
+// StartupMessage parameter (so search_path, timezone, statement_timeout, and
+// similar GUCs can be set at connect time).
+//
+// auto_cache_statements (default true at the [Pool.Open] / [NewConnector]
+// layer): when true, cacheable SELECT-style QueryContext calls with
+// arguments transparently auto-prepare on first use and reuse the
+// prepared statement (Bind+Execute+Sync) on subsequent invocations.
+// Mirrors pgx's QueryExecModeCacheStatement default. Set
+// `auto_cache_statements=false` in the DSN to opt out and stay on the
+// extended-protocol-without-cache path. Arg-less queries always take the
+// simple-query path regardless.
 //
 // # Options
 //
@@ -195,12 +204,11 @@
 // underlying query that were deferred until iteration completed (e.g.
 // cancellation, network errors, or server-side errors on large result sets).
 //
-// # Known limitations (v1.4.0)
+// # Known limitations
 //
-//   - TLS is not supported in v1.4.0. sslmode=require, verify-ca, and
-//     verify-full are rejected at [Open] time with [ErrSSLNotSupported].
-//     Deploy over VPC, loopback, or a sidecar TLS terminator. TLS support
-//     is planned for v1.4.x.
+//   - TLS is not yet supported. sslmode=require, verify-ca, and verify-full
+//     are rejected at [Open] time with [ErrSSLNotSupported]. Deploy over
+//     VPC, loopback, or a sidecar TLS terminator.
 //   - Result sets are fully buffered before Rows.Next returns — there is no
 //     true row-by-row streaming. Callers with large result sets should page
 //     via LIMIT/OFFSET or a server-side DECLARE CURSOR inside a transaction.

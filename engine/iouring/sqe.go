@@ -76,13 +76,6 @@ func prepSend(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	}
 }
 
-func prepClose(sqePtr unsafe.Pointer, fd int) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opCLOSE
-	sqe[1] = sqeCQESkipSuccess // suppress CQE for successful close
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
-}
-
 // prepCloseDirect closes a fixed file entry by index. The fd field is unused
 // (set to 0); file_index identifies the slot.
 func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {
@@ -123,6 +116,29 @@ func prepSendPlain(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 func prepSendFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
 	prepSend(sqePtr, fd, buf, linked)
 	setSQEFixedFile(sqePtr)
+}
+
+// prepWritev prepares a WRITEV SQE for scatter-gather transmission. The
+// kernel reads from iov entries in order and issues a single writev(2)-
+// equivalent syscall. Used on TCP sockets so that a large response (a
+// small header block + a large body) can be sent in ONE syscall without
+// first memcpying the body into the engine's outbound buffer. Saves one
+// full body-sized memcpy per request on json-64k-style responses.
+//
+// iov must remain valid until the corresponding CQE fires. The iovec
+// Go struct is defined in golang.org/x/sys/unix; we pass a pointer to
+// the first iovec and the count. The kernel copies the iovec array into
+// its own state before returning from io_uring_enter, but the BUFFERS
+// pointed to by the iovecs must stay alive until completion.
+func prepWritev(sqePtr unsafe.Pointer, fd int, iovPtr unsafe.Pointer, iovLen int, linked bool) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opWRITEV
+	if linked {
+		sqe[1] = sqeIOLink
+	}
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(iovPtr))
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(iovLen)
 }
 
 // prepSendZC prepares a SEND_ZC (zero-copy send) SQE. The kernel avoids

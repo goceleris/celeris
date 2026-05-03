@@ -54,6 +54,7 @@ type connState struct {
 	_        [5]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
+	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
 
 	// Warm — second cache line:
 	pendingBytes int        // 8 bytes
@@ -95,6 +96,12 @@ type connState struct {
 	asyncCond   sync.Cond   // L = &asyncInMu; signaled by worker on new data or close
 	asyncRun    bool        // true while the dispatch goroutine is alive
 	asyncClosed atomic.Bool // set by worker's close path; goroutine exits next iter
+	// asyncH2Promoted signals that runAsyncHandler observed ErrUpgradeH2C
+	// and completed the cs-local H1→H2 swap under detachMu. The worker
+	// must finish the promotion in drainDetachQueue (append fd to
+	// l.h2Conns — the only worker-thread-owned piece) and keep the conn
+	// alive instead of closing it.
+	asyncH2Promoted atomic.Bool
 }
 
 var connStatePool = sync.Pool{
@@ -143,6 +150,7 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.bodyBuf = nil
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false

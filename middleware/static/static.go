@@ -18,10 +18,17 @@ import (
 	"github.com/goceleris/celeris"
 )
 
-// cachedFile stores the immutable content and content-type of an fs.FS file.
+// cachedFile stores the immutable content and content-type of an fs.FS file,
+// plus the pre-formatted last-modified and ETag strings. fs.FS is assumed
+// immutable (embed.FS, fstest.MapFS), so the formatted header strings
+// never go stale once populated. Freshness is verified against modTime
+// on every serve — a modTime mismatch invalidates the cached headers.
 type cachedFile struct {
-	data        []byte
-	contentType string
+	data            []byte
+	contentType     string
+	etag            string
+	lastModifiedStr string
+	modTime         time.Time
 }
 
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
@@ -52,6 +59,14 @@ func New(config ...Config) celeris.HandlerFunc {
 	var cleanRoot string
 	if root != "" {
 		cleanRoot = filepath.Clean(root)
+	}
+
+	// Precompute the cache-control header once — maxAge is closure-constant,
+	// so rebuilding "public, max-age=N" per request wasted an alloc + an
+	// strconv.Itoa on every cache-hit response.
+	var cacheControl string
+	if maxAge > 0 {
+		cacheControl = "public, max-age=" + strconv.Itoa(int(maxAge.Seconds()))
 	}
 
 	// Per-file cache for fs.FS content. Since fs.FS is immutable (especially
@@ -90,16 +105,16 @@ func New(config ...Config) celeris.HandlerFunc {
 		filePath = strings.TrimSuffix(filePath, "/")
 
 		if fsys != nil {
-			return serveFS(c, fsys, filePath, index, browse, spa, compress, maxAge, &fsCache)
+			return serveFS(c, fsys, filePath, index, browse, spa, compress, cacheControl, &fsCache)
 		}
-		return serveOS(c, cleanRoot, filePath, index, browse, spa, maxAge, compress)
+		return serveOS(c, cleanRoot, filePath, index, browse, spa, cacheControl, compress)
 	}
 }
 
 // serveOS serves a file from the OS filesystem using c.FileFromDir (which
 // handles directory traversal, symlink escape, and range requests).
 // cleanRoot must be filepath.Clean(root) — precomputed by New.
-func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, maxAge time.Duration, compress bool) error {
+func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa bool, cacheControl string, compress bool) error {
 	fullPath := filepath.Join(cleanRoot, filepath.FromSlash(filePath))
 
 	// Prevent directory traversal: filepath.Join resolves ".." segments,
@@ -146,7 +161,7 @@ func serveOS(c *celeris.Context, cleanRoot, filePath, index string, browse, spa 
 		}
 	}
 
-	etag := setCacheHeaders(c, info.ModTime(), info.Size(), maxAge)
+	etag := setCacheHeaders(c, info.ModTime(), info.Size(), cacheControl)
 	if notModified(c, etag, info.ModTime()) {
 		return c.NoContent(304)
 	}
@@ -190,7 +205,7 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string
 }
 
 // serveFS serves a file from an fs.FS with ETag/Last-Modified and range support.
-func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, maxAge time.Duration, cache *sync.Map) error {
+func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa, compress bool, cacheControl string, cache *sync.Map) error {
 	// 1. Open + stat + directory handling.
 	openPath := filePath
 	if openPath == "" {
@@ -200,7 +215,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	f, err := fsys.Open(openPath)
 	if err != nil {
 		if spa {
-			return serveFS(c, fsys, index, index, browse, false, compress, maxAge, cache)
+			return serveFS(c, fsys, index, index, browse, false, compress, cacheControl, cache)
 		}
 		return c.Next()
 	}
@@ -224,7 +239,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 			indexStat, statErr := indexFile.Stat()
 			_ = indexFile.Close()
 			if statErr == nil && !indexStat.IsDir() {
-				return serveFS(c, fsys, indexPath, index, browse, spa, compress, maxAge, cache)
+				return serveFS(c, fsys, indexPath, index, browse, spa, compress, cacheControl, cache)
 			}
 		}
 		if browse {
@@ -239,10 +254,29 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		return celeris.NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	// 3. Cache headers + 304 check.
+	// 3. Cache headers + 304 check. Reuse pre-formatted strings from the
+	// fs cache when present and the modTime matches.
 	modTime := stat.ModTime()
+	var cached *cachedFile
+	if cf, ok := cache.Load(filePath); ok {
+		if cf2 := cf.(*cachedFile); cf2.modTime.Equal(modTime) {
+			cached = cf2
+		}
+	}
+
+	var etag, lastModifiedStr string
 	if !modTime.IsZero() {
-		etag := setCacheHeaders(c, modTime, size, maxAge)
+		if cached != nil {
+			etag = cached.etag
+			lastModifiedStr = cached.lastModifiedStr
+		} else {
+			etag, lastModifiedStr = computeFSCacheStrings(modTime, size)
+		}
+		c.SetHeader("last-modified", lastModifiedStr)
+		c.SetHeader("etag", etag)
+		if cacheControl != "" {
+			c.SetHeader("cache-control", cacheControl)
+		}
 		if notModified(c, etag, modTime) {
 			return c.NoContent(304)
 		}
@@ -255,15 +289,13 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		}
 	}
 
-	// 5. Check fs.FS content cache.
+	// 5. Serve cached content if available.
 	c.SetHeader("accept-ranges", "bytes")
-
-	if cf, ok := cache.Load(filePath); ok {
-		cached := cf.(*cachedFile)
+	if cached != nil {
 		return serveFSCached(c, cached.data, cached.contentType)
 	}
 
-	// 6. Read, cache, and serve.
+	// 6. Read, cache (with headers), and serve.
 	var data []byte
 	var contentType string
 
@@ -281,8 +313,31 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		contentType = detectContentType(filePath, data)
 	}
 
-	cache.Store(filePath, &cachedFile{data: data, contentType: contentType})
+	cache.Store(filePath, &cachedFile{
+		data:            data,
+		contentType:     contentType,
+		etag:            etag,
+		lastModifiedStr: lastModifiedStr,
+		modTime:         modTime,
+	})
 	return serveFSCached(c, data, contentType)
+}
+
+// computeFSCacheStrings formats the Last-Modified and ETag strings for a
+// file with the given modTime and size. Shared between the cache-miss
+// path in serveFS (which stores the result on cachedFile) and one-off
+// renderings; setCacheHeaders still handles the serveOS path where no
+// per-file cache exists.
+func computeFSCacheStrings(modTime time.Time, size int64) (etag, lastModifiedStr string) {
+	lastModifiedStr = modTime.UTC().Format(http.TimeFormat)
+	var etagBuf [64]byte
+	dst := append(etagBuf[:0], 'W', '/', '"')
+	dst = strconv.AppendInt(dst, modTime.Unix(), 16)
+	dst = append(dst, '-')
+	dst = strconv.AppendInt(dst, size, 16)
+	dst = append(dst, '"')
+	etag = string(dst)
+	return
 }
 
 // servePreCompressedFS attempts to serve a pre-compressed variant (.br or .gz)
@@ -351,7 +406,14 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 func serveFSCached(c *celeris.Context, data []byte, contentType string) error {
 	if rng := c.Header("range"); rng != "" {
 		if start, end, ok := parseByteRange(rng, int64(len(data))); ok {
-			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, int64(len(data))))
+			var rngBuf [48]byte
+			dst := append(rngBuf[:0], "bytes "...)
+			dst = strconv.AppendInt(dst, start, 10)
+			dst = append(dst, '-')
+			dst = strconv.AppendInt(dst, end, 10)
+			dst = append(dst, '/')
+			dst = strconv.AppendInt(dst, int64(len(data)), 10)
+			c.SetHeader("content-range", string(dst))
 			return c.Blob(206, contentType, data[start:end+1])
 		}
 	}
@@ -399,15 +461,24 @@ func sniffContentType(rs io.ReadSeeker, filePath string) string {
 // is emitted. The mtime/size form static uses is preferable for static
 // files (no body hash required); etag's CRC-32 fallback only runs when no
 // ETag header is set.
-func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, maxAge time.Duration) string {
+func setCacheHeaders(c *celeris.Context, modTime time.Time, size int64, cacheControl string) string {
 	if modTime.IsZero() {
 		return ""
 	}
 	c.SetHeader("last-modified", modTime.UTC().Format(http.TimeFormat))
-	etag := fmt.Sprintf(`W/"%x-%x"`, modTime.Unix(), size)
+	// ETag is built without fmt to avoid per-request fmt.Sprintf overhead
+	// (formatter-scanner + arg boxing). int64 hex is ≤16 chars per field,
+	// plus W/"…-…" framing = 37 max; 64 is a safe margin.
+	var etagBuf [64]byte
+	dst := append(etagBuf[:0], 'W', '/', '"')
+	dst = strconv.AppendInt(dst, modTime.Unix(), 16)
+	dst = append(dst, '-')
+	dst = strconv.AppendInt(dst, size, 16)
+	dst = append(dst, '"')
+	etag := string(dst)
 	c.SetHeader("etag", etag)
-	if maxAge > 0 {
-		c.SetHeader("cache-control", fmt.Sprintf("public, max-age=%d", int(maxAge.Seconds())))
+	if cacheControl != "" {
+		c.SetHeader("cache-control", cacheControl)
 	}
 	return etag
 }

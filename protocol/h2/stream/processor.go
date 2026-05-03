@@ -253,23 +253,26 @@ func (p *Processor) ProcessFrame(ctx context.Context, frame http2.Frame) error {
 	}
 
 	header := frame.Header()
-	maxFrameSize := atomic.LoadUint32(&p.manager.maxFrameSize)
+	// RFC 7540 §4.2: inbound frames must not exceed OUR advertised
+	// SETTINGS_MAX_FRAME_SIZE (localMaxFrameSize). The peer's advertised
+	// value (manager.maxFrameSize) bounds what WE send, not what we accept.
+	localMaxFrame := p.manager.GetLocalMaxFrameSize()
 
 	switch frame.(type) {
 	case *http2.DataFrame:
-		if header.Length > maxFrameSize {
+		if header.Length > localMaxFrame {
 			if header.StreamID == 0 {
 				return p.GoAwayErr(0, http2.ErrCodeFrameSize, []byte("DATA frame too large"),
-					fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize))
+					fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, localMaxFrame))
 			}
 			_ = p.writer.WriteRSTStream(header.StreamID, http2.ErrCodeFrameSize)
 			p.flush()
-			return fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize)
+			return fmt.Errorf("DATA frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, localMaxFrame)
 		}
 	case *http2.HeadersFrame:
-		if header.Length > maxFrameSize {
+		if header.Length > localMaxFrame {
 			return p.GoAwayErr(0, http2.ErrCodeFrameSize, []byte("HEADERS frame too large"),
-				fmt.Errorf("HEADERS frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, maxFrameSize))
+				fmt.Errorf("HEADERS frame exceeds MAX_FRAME_SIZE: %d > %d", header.Length, localMaxFrame))
 		}
 	}
 
@@ -413,6 +416,13 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 			p.manager.mu.Lock()
 			atomic.StoreUint32(&p.manager.maxFrameSize, s.Val)
 			p.manager.mu.Unlock()
+			// Propagate to the frame writer so WriteData fragments by the
+			// peer's SETTINGS_MAX_FRAME_SIZE (RFC 7540 §4.2). The interface
+			// doesn't require SetMaxFrameSize — native engines implement it
+			// on *frame.Writer, stdlib/test mocks may not.
+			if setter, ok := p.writer.(interface{ SetMaxFrameSize(uint32) }); ok {
+				setter.SetMaxFrameSize(s.Val)
+			}
 		case http2.SettingMaxHeaderListSize:
 			// No specific validation
 		}

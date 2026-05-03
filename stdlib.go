@@ -56,7 +56,7 @@ func ToHandler(h HandlerFunc) http.Handler {
 				return
 			}
 			if len(body) > 0 {
-				_, _ = s.GetBuf().Write(body)
+				s.SetRawBody(body)
 			}
 		}
 

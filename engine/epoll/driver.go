@@ -375,15 +375,23 @@ func (e *Engine) NumWorkers() int {
 	return n
 }
 
-// WorkerLoop returns the worker loop at index n. Panics if n is out of
-// range or if the engine has not yet started listening.
+// WorkerLoop returns the worker loop at index n. Out-of-range n is
+// reduced modulo NumWorkers so callers can hash a connection / FD across
+// the available pool without first reading NumWorkers. Negative n is
+// mirrored to the positive side. Panics only when the engine has no
+// loops (i.e. Listen has not yet started).
 func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if n < 0 || n >= len(e.loops) {
-		panic(fmt.Sprintf("celeris/epoll: WorkerLoop index %d out of range [0, %d)", n, len(e.loops)))
+	count := len(e.loops)
+	if count == 0 {
+		panic("celeris/epoll: WorkerLoop called before Listen")
 	}
-	return e.loops[n]
+	idx := n % count
+	if idx < 0 {
+		idx += count
+	}
+	return e.loops[idx]
 }
 
 var (

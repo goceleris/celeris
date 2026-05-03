@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the semantic version of the celeris module.
-const Version = "1.4.0"
+const Version = "1.4.1"
 
 // ErrAlreadyStarted is returned when Start or StartWithContext is called on a
 // server that is already running.
@@ -495,7 +495,7 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			configureFn(&cfg)
 		}
 		if errs := cfg.Validate(); len(errs) > 0 {
-			s.startErr = fmt.Errorf("config validation: %w", errs[0])
+			s.startErr = fmt.Errorf("config validation: %w", errors.Join(errs...))
 			return
 		}
 

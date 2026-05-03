@@ -1,0 +1,55 @@
+---
+# Standalone cleanup playbook. Useful if a cluster bench was killed
+# mid-flight and the always-block in cluster-bench.yml didn't run.
+#
+# Idempotent: safe to run any number of times.
+
+- name: Force cleanup of all bench state on cluster nodes
+  hosts: cluster
+  gather_facts: false
+  tasks:
+    - name: Stop any lingering bench processes
+      become: true
+      # Match by exact process name to avoid pkill self-killing
+      # (pkill -f matches argv, including its own command line).
+      ansible.builtin.shell: |
+        pkill -x runner 2>/dev/null
+        pkill -x loadgen 2>/dev/null
+        true
+      changed_when: false
+
+    - name: Read dep manifest if present
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: cleanup_manifest
+      failed_when: false
+
+    - name: Decode manifest
+      ansible.builtin.set_fact:
+        to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
+      when: cleanup_manifest.content is defined
+
+    - name: Uninstall packages we added
+      become: true
+      ansible.builtin.apt:
+        name: "{{ to_remove }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when: to_remove is defined and to_remove | length > 0
+
+    - name: Remove manifest file
+      ansible.builtin.file:
+        path: "{{ manifest_path }}"
+        state: absent
+
+    - name: Remove bench staging dir
+      ansible.builtin.file:
+        path: "{{ bench_root }}"
+        state: absent
+
+    - name: Optionally remove results dir (set --extra-vars purge_results=true)
+      ansible.builtin.file:
+        path: "{{ results_root }}"
+        state: absent
+      when: purge_results | default(false) | bool

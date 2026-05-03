@@ -1,6 +1,24 @@
 package secure
 
-import "github.com/goceleris/celeris"
+import (
+	"fmt"
+
+	"github.com/goceleris/celeris"
+)
+
+// validateHeaderValue panics if v contains a CR, LF, or NUL byte.
+// Header values reach the wire via [Context.AppendRespHeader] which
+// skips per-request sanitization for performance — invariant must
+// hold at construction time. Failing fast at New() catches a
+// misconfiguration that would otherwise cause silent header injection
+// or a malformed response under high load.
+func validateHeaderValue(name, v string) {
+	for i := 0; i < len(v); i++ {
+		if b := v[i]; b == '\r' || b == '\n' || b == 0 {
+			panic(fmt.Sprintf("secure: header %q value contains CR/LF/NUL at byte %d (header injection); fix the config", name, i))
+		}
+	}
+}
 
 // New creates a security headers middleware with the given config.
 // All non-HSTS header values are pre-computed at initialization for
@@ -24,17 +42,27 @@ func New(config ...Config) celeris.HandlerFunc {
 	headers := buildHeaders(cfg)
 	hstsValue := buildHSTSValue(cfg)
 
+	// Validate values once at construction time so the per-request hot
+	// path can use [Context.AppendRespHeader] (no sanitization scan, no
+	// dedup walk). Keys are hardcoded lowercase ASCII in buildHeaders.
+	for _, h := range headers {
+		validateHeaderValue(h[0], h[1])
+	}
+	if hstsValue != "" {
+		validateHeaderValue("strict-transport-security", hstsValue)
+	}
+
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
 
 		for _, h := range headers {
-			c.SetHeader(h[0], h[1])
+			c.AppendRespHeader(h[0], h[1])
 		}
 
 		if hstsValue != "" && c.Scheme() == "https" {
-			c.SetHeader("strict-transport-security", hstsValue)
+			c.AppendRespHeader("strict-transport-security", hstsValue)
 		}
 
 		return c.Next()

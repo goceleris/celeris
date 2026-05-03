@@ -114,7 +114,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		if tokenProcessor != nil {
 			processed, err := tokenProcessor(tokenStr)
 			if err != nil {
-				return handleError(c, fmt.Errorf("%w: %w", ErrTokenInvalid, err))
+				return handleError(c, &classifiedError{outer: ErrTokenInvalid, inner: err})
 			}
 			tokenStr = processed
 		}
@@ -122,12 +122,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		claims := newClaims(claimsFactory, claimsTemplate)
 		token, err := parser.ParseWithClaims(tokenStr, claims, keyFunc)
 		if err != nil || !token.Valid {
-			// Release pooled token and claims on the error path to
-			// avoid leaking them back to GC instead of the pool.
+			// Release pooled token and claims on the error path so they
+			// return to their pools. token.Claims aliases claims when
+			// token != nil, so the MapClaims release happens exactly
+			// once either way (claims is always the live reference).
+			if m, ok := claims.(jwtparse.MapClaims); ok {
+				jwtparse.ReleaseMapClaims(m)
+			}
 			if token != nil {
-				if m, ok := token.Claims.(jwtparse.MapClaims); ok {
-					jwtparse.ReleaseMapClaims(m)
-				}
 				jwtparse.ReleaseToken(token)
 			}
 			wrappedErr := classifyTokenError(err)
@@ -137,16 +139,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.Set(tokenCtxKey, token)
 		c.Set(claimsCtxKey, token.Claims)
 
-		c.OnRelease(func() {
-			if v, ok := c.Get(tokenCtxKey); ok {
-				if t, ok := v.(*jwtparse.Token); ok {
-					if m, ok := t.Claims.(jwtparse.MapClaims); ok {
-						jwtparse.ReleaseMapClaims(m)
-					}
-					jwtparse.ReleaseToken(t)
-				}
-			}
-		})
+		// Using the pre-bound method value instead of an anonymous
+		// closure saves 1 alloc per request (full closure captures c and
+		// escapes via cross-package OnRelease).
+		c.OnRelease(token.OnReleaseFn())
 
 		if successHandler != nil {
 			successHandler(c)
@@ -235,20 +231,55 @@ func cloneClaims(template jwtparse.Claims) jwtparse.Claims {
 	}
 }
 
+// classifiedError pairs an HTTPError sentinel (outer) with the underlying
+// parser error (inner). Replaces fmt.Errorf("%w: %w", ...) — fmt.Errorf
+// allocates the formatter state, the message string, the wrapErrors
+// struct, and a []error unwrap slice per call; classifiedError is one
+// allocation. Error() materializes the concat lazily, so callers who only
+// errors.Is-check the result never pay for the string.
+type classifiedError struct {
+	outer error
+	inner error // nil when classifyTokenError receives a nil err
+}
+
+func (c *classifiedError) Error() string {
+	if c.inner == nil {
+		return c.outer.Error()
+	}
+	return c.outer.Error() + ": " + c.inner.Error()
+}
+
+// Is reports whether target matches outer or inner. Obviates Unwrap()
+// []error (which would require a per-call slice alloc) for errors.Is.
+func (c *classifiedError) Is(target error) bool {
+	if errors.Is(c.outer, target) {
+		return true
+	}
+	return c.inner != nil && errors.Is(c.inner, target)
+}
+
+// Unwrap returns outer so errors.As can reach the HTTPError sentinel.
+func (c *classifiedError) Unwrap() error { return c.outer }
+
+// errStaticTokenInvalid is the fixed "token not valid" inner used by
+// the err == nil branch of classifyTokenError. Pre-built once so the
+// branch matches the other three (one struct alloc, no string alloc).
+var errStaticTokenInvalid = errors.New("token not valid")
+
 // classifyTokenError inspects the parser error and wraps it with the
 // appropriate HTTPError sentinel so callers can distinguish expired
 // tokens from malformed ones without inspecting internal parse errors.
 func classifyTokenError(err error) error {
 	if err == nil {
-		return fmt.Errorf("%w: token not valid", ErrTokenInvalid)
+		return &classifiedError{outer: ErrTokenInvalid, inner: errStaticTokenInvalid}
 	}
 	if errors.Is(err, jwtparse.ErrTokenExpired) || errors.Is(err, jwtparse.ErrTokenNotValidYet) || errors.Is(err, jwtparse.ErrTokenUsedBeforeIssued) {
-		return fmt.Errorf("%w: %w", ErrJWTExpired, err)
+		return &classifiedError{outer: ErrJWTExpired, inner: err}
 	}
 	if errors.Is(err, jwtparse.ErrTokenMalformed) || errors.Is(err, jwtparse.ErrTokenUnverifiable) {
-		return fmt.Errorf("%w: %w", ErrJWTMalformed, err)
+		return &classifiedError{outer: ErrJWTMalformed, inner: err}
 	}
-	return fmt.Errorf("%w: %w", ErrTokenInvalid, err)
+	return &classifiedError{outer: ErrTokenInvalid, inner: err}
 }
 
 // preloadJWKS eagerly fetches JWKS keys at startup when enabled.

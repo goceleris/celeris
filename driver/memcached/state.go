@@ -201,6 +201,14 @@ type mcState struct {
 	pendingGet *mcRequest
 	// pendingStats is the in-progress stats request consuming STAT lines.
 	pendingStats *mcRequest
+
+	// multiPollLastReq is the request whose finished flag terminates the
+	// current WriteAndPollMulti spin (binary multi-packet ops, GETM with
+	// streaming VALUE blocks). Set by execBinaryMulti just before the
+	// poll call and consumed by *memcachedConn.pollIsDone — kept on the
+	// state so the cached method value can read it without capturing
+	// per-call locals into a fresh closure.
+	multiPollLastReq *mcRequest
 }
 
 // newMCState returns a state machine configured for the given protocol.

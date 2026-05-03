@@ -45,16 +45,33 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 		}
 
-		childCtx, cancel := context.WithTimeout(c.Context(), d)
-		defer cancel()
-
+		// Lazy-deadline wrap: avoids the eager [context.WithTimeout]
+		// timer allocation when the handler completes synchronously
+		// without observing ctx.Done(). Promotes to a real
+		// context.WithDeadline on first Done() access (e.g. by an
+		// http.Client or downstream goroutine watching for cancel),
+		// preserving full semantics for handlers that need it.
 		origCtx := c.Context()
-		c.SetContext(childCtx)
-		defer c.SetContext(origCtx)
+		lazy := newLazyDeadlineCtx(origCtx, time.Now().Add(d))
+		c.SetContext(lazy)
 
 		err := c.Next()
 
-		if childCtx.Err() == context.DeadlineExceeded {
+		c.SetContext(origCtx)
+		lazy.release()
+
+		// Done() may have promoted lazy.realCtx; trust its Err first.
+		// Otherwise fall back to wall-clock check so a handler that
+		// merely overran the deadline (without observing Done()) still
+		// reports as a timeout.
+		if lazy.realCtx != nil {
+			if lazy.realCtx.Err() == context.DeadlineExceeded {
+				if c.IsWritten() {
+					return ErrServiceUnavailable
+				}
+				return safeErrHandler(c, context.DeadlineExceeded, errHandler)
+			}
+		} else if lazy.expired() {
 			if c.IsWritten() {
 				return ErrServiceUnavailable
 			}

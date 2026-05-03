@@ -459,4 +459,3 @@ func TestBinary_DeltaBadval(t *testing.T) {
 	c.WriteRaw(c.writer.Bytes())
 	_ = c.ReadPacket(t)
 }
-

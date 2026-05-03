@@ -5,7 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
@@ -38,6 +37,7 @@ type concurrentTest struct {
 	enterOnce     sync.Once
 	wg            sync.WaitGroup
 	waiterArrived sync.WaitGroup
+	waiterJoined  sync.WaitGroup
 	waiterGate    chan struct{}
 	recs          []*celeristest.ResponseRecorder
 	errs          []error
@@ -57,6 +57,19 @@ func (ct *concurrentTest) init() {
 	ct.ctxs = make([]*celeris.Context, ct.n)
 	ct.wg.Add(ct.n)
 	ct.waiterArrived.Add(ct.n - 1)
+	ct.waiterJoined.Add(ct.n - 1)
+}
+
+// installWaiterHook wires the middleware's testHookWaiterJoined to
+// ct.waiterJoined and restores it on test cleanup. This turns the
+// race-prone "sleep 1ms then release leader" step into a deterministic
+// barrier: the test only closes gate after every waiter has committed
+// to the in-flight entry under g.mu.
+func (ct *concurrentTest) installWaiterHook(t *testing.T) {
+	t.Helper()
+	prev := testHookWaiterJoined
+	testHookWaiterJoined = func() { ct.waiterJoined.Done() }
+	t.Cleanup(func() { testHookWaiterJoined = prev })
 }
 
 func (ct *concurrentTest) cleanup(t *testing.T) {
@@ -88,6 +101,7 @@ func (ct *concurrentTest) makeMW() celeris.HandlerFunc {
 func (ct *concurrentTest) run(t *testing.T) {
 	t.Helper()
 	ct.init()
+	ct.installWaiterHook(t)
 	mw := ct.makeMW()
 
 	go func() {
@@ -119,9 +133,12 @@ func (ct *concurrentTest) run(t *testing.T) {
 	// Release waiters. They proceed to the group lock + map check.
 	// The leader is still blocked in the handler, so the key is in the map.
 	close(ct.waiterGate)
-	// Brief yield: waiters need only a lock acquire + map lookup to reach
-	// wg.Wait(). 1ms is orders of magnitude more than needed.
-	time.Sleep(time.Millisecond)
+	// Deterministic barrier: wait until every waiter has incremented
+	// entry.waiters under g.mu. Only then is it safe to release the
+	// leader — a straggler that has not yet taken g.mu would otherwise
+	// race the leader's delete and take the leader path itself,
+	// invoking the handler twice.
+	ct.waiterJoined.Wait()
 	// Release the leader handler.
 	close(ct.gate)
 	ct.wg.Wait()
@@ -131,6 +148,7 @@ func (ct *concurrentTest) run(t *testing.T) {
 func (ct *concurrentTest) runWithPanics(t *testing.T) {
 	t.Helper()
 	ct.init()
+	ct.installWaiterHook(t)
 	ct.panics = make([]any, ct.n)
 	mw := ct.makeMW()
 
@@ -162,7 +180,7 @@ func (ct *concurrentTest) runWithPanics(t *testing.T) {
 
 	ct.waiterArrived.Wait()
 	close(ct.waiterGate)
-	time.Sleep(time.Millisecond)
+	ct.waiterJoined.Wait()
 	close(ct.gate)
 	ct.wg.Wait()
 	ct.cleanup(t)

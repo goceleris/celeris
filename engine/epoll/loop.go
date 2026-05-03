@@ -64,6 +64,21 @@ type Loop struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
+	// inactive is the per-worker pause flag used by the dynamic worker
+	// scaler. ORed with acceptPaused (which is engine-wide) when computing
+	// effective paused state. The scaler flips this to deactivate idle
+	// loops under low load and reactivate them under burst load.
+	inactive atomic.Bool
+	// listenFDClosed signals that the loop has closed its listen FD in
+	// response to acceptPaused=true. PauseAccept polls this so it only
+	// returns once the SO_REUSEPORT group has actually shed this listener
+	// — important for the adaptive engine, where the standby's listen
+	// sockets must be out of the kernel routing pool before the bound
+	// address is exposed to the caller (otherwise the first burst of
+	// dials can land on the standby and get RST when it pauses).
+	// Reset to false in ResumeAccept so a Pause→Resume→Pause cycle
+	// re-arms the signal.
+	listenFDClosed atomic.Bool
 
 	reqCount         *atomic.Uint64
 	activeConns      *atomic.Int64
@@ -209,11 +224,39 @@ func (l *Loop) run(ctx context.Context) {
 		// Cache the atomic load: ACTIVE→DRAINING and SUSPENDED→ACTIVE
 		// branches both read it. Saves 1 atomic load per event-loop
 		// iteration on the steady-state hot path.
-		paused := l.acceptPaused.Load()
+		// OR with the per-loop inactive flag (dynamic scaler).
+		paused := l.acceptPaused.Load() || l.inactive.Load()
 		if l.listenFD >= 0 && paused {
+			// Drain any pending accepts from the kernel's listen queue so
+			// they get a clean shutdown (FIN) rather than the RST that
+			// close() of the listen FD would send. Loadgen's H2 dial
+			// retries handle FIN gracefully; an RST aborts the whole
+			// benchmark.
+			for {
+				connFD, _, accErr := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+				if accErr != nil {
+					break
+				}
+				_ = unix.Shutdown(connFD, unix.SHUT_RDWR)
+				_ = unix.Close(connFD)
+			}
 			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
 			_ = unix.Close(l.listenFD)
 			l.listenFD = -1
+		}
+		// Maintain the listenFDClosed signal that PauseAccept polls on.
+		// Set it whenever paused==true regardless of whether we just
+		// closed the FD or it was already -1 from a prior Pause-Resume
+		// cycle that hadn't re-created the socket yet (race window:
+		// ResumeAccept clears the flag and toggles paused=false; the
+		// worker may be mid-iteration when paused flips back to true,
+		// so listenFD can transiently be -1 while paused is true). Also
+		// clear the flag when paused goes false so a subsequent Pause
+		// observes a fresh signal once the new listenFD is created.
+		if paused {
+			l.listenFDClosed.Store(true)
+		} else {
+			l.listenFDClosed.Store(false)
 		}
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
@@ -328,7 +371,7 @@ func (l *Loop) run(ctx context.Context) {
 				}
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
-			} else if cs.writePos >= len(cs.writeBuf) {
+			} else if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
 				cs.pendingBytes = 0
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
@@ -336,7 +379,7 @@ func (l *Loop) run(ctx context.Context) {
 				l.removeDirty(cs)
 			} else {
 				// Sync pendingBytes with actual buffer state after partial write.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -384,9 +427,10 @@ func (l *Loop) run(ctx context.Context) {
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
-		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() {
+		// Combined paused: engine-wide OR per-loop (dynamic scaler).
+		if l.listenFD < 0 && l.connCount == 0 && (l.acceptPaused.Load() || l.inactive.Load()) {
 			l.wakeMu.Lock()
-			if !l.acceptPaused.Load() {
+			if !l.acceptPaused.Load() && !l.inactive.Load() {
 				l.wakeMu.Unlock()
 				continue
 			}
@@ -456,7 +500,14 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 
 		cs.lastActivity = now
 
-		if l.cfg.Protocol != engine.Auto {
+		// H2C + EnableH2Upgrade: defer protocol commit to detectProtocol
+		// on first recv. Locking cs.protocol = H2C on accept routed
+		// HTTP/1.1 upgrade requests into ProcessH2 instead of the H1
+		// parser, so the server emitted its SETTINGS frame without the
+		// mandatory 101 Switching Protocols response first. Mirrors the
+		// iouring engine fix.
+		if l.cfg.Protocol != engine.Auto &&
+			(l.cfg.Protocol != engine.H2C || !l.cfg.EnableH2Upgrade) {
 			cs.protocol = l.cfg.Protocol
 			cs.detected = true
 			l.initProtocol(cs)
@@ -474,7 +525,21 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 
 	for {
-		n, err := unix.Read(fd, cs.buf)
+		// Zero-copy body recv: when H1 is in a partial-body state we read
+		// directly into the tail of H1State.bodyBuf — skipping the
+		// cs.buf → bodyBuf memcpy that would otherwise happen on every
+		// read for a multi-read POST. Disabled in async mode: the
+		// dispatch goroutine owns h1State and the worker cannot safely
+		// observe NextRecvBuf without synchronization.
+		recvBuf := cs.buf
+		intoBody := false
+		if !l.async && cs.h1State != nil {
+			if b := cs.h1State.NextRecvBuf(); b != nil {
+				recvBuf = b
+				intoBody = true
+			}
+		}
+		n, err := unix.Read(fd, recvBuf)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
@@ -509,9 +574,75 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 
-		data := cs.buf[:n]
-
 		cs.lastActivity = now
+
+		// Direct-into-bodyBuf completion path: we read straight into
+		// H1State.bodyBuf; dispatch the handler if the body is full,
+		// otherwise continue the recv loop for the next chunk.
+		if intoBody {
+			complete := cs.h1State.ConsumeBodyRecv(n)
+			if !complete {
+				continue
+			}
+			rest, derr := cs.h1State.DispatchBufferedBody(cs.ctx, l.handler, cs.writeFn)
+			if errors.Is(derr, conn.ErrUpgradeH2C) {
+				if err := l.switchToH2(cs, cs.writeFn); err != nil {
+					l.closeConn(fd)
+					return
+				}
+			} else if derr != nil {
+				if errors.Is(derr, conn.ErrHijacked) {
+					return
+				}
+				if mu := cs.detachMu; mu != nil {
+					mu.Lock()
+				}
+				_ = flushWrites(cs)
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				l.closeConn(fd)
+				return
+			}
+			if len(rest) > 0 {
+				// Tail bytes after the body — feed them back through
+				// the normal parser for pipelined request(s).
+				if perr := conn.ProcessH1(cs.ctx, rest, cs.h1State, l.handler, cs.writeFn); perr != nil {
+					if errors.Is(perr, conn.ErrHijacked) {
+						return
+					}
+					if mu := cs.detachMu; mu != nil {
+						mu.Lock()
+					}
+					_ = flushWrites(cs)
+					if mu := cs.detachMu; mu != nil {
+						mu.Unlock()
+					}
+					l.closeConn(fd)
+					return
+				}
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
+			if err := flushWrites(cs); err != nil {
+				if mu := cs.detachMu; mu != nil {
+					mu.Unlock()
+				}
+				l.closeConn(fd)
+				return
+			}
+			dirty := len(cs.writeBuf)-cs.writePos > 0 || len(cs.bodyBuf) > 0
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			if dirty {
+				l.markDirty(cs)
+			}
+			continue
+		}
+
+		data := cs.buf[:n]
 
 		if !cs.detected {
 			proto, detectErr := detect.Detect(data)
@@ -578,6 +709,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 		}
 
 		var processErr error
+		// Stash worker-local "now" on H1State so populateCachedStream can
+		// copy it to the stream — HandleStream skips a per-request
+		// time.Now() vDSO call.
+		if cs.h1State != nil {
+			cs.h1State.NowNs = now
+		}
 		switch cs.protocol {
 		case engine.HTTP1:
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
@@ -613,7 +750,21 @@ func (l *Loop) drainRead(fd int, now int64) {
 				continue
 			}
 		case engine.H2C:
-			processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+			// Async-mode conns: serialize inline ProcessH2 against the
+			// runAsyncHandler goroutine that owns cs.writeBuf until its
+			// H1→H2 upgrade-flush (flushWrites) completes. Without the
+			// lock, a new recv arriving while the goroutine is mid-
+			// flush runs ProcessH2 → writeFn → cs.writeBuf manipulation
+			// concurrent with the goroutine's flushWrites — a data
+			// race caught by matrixBenchStrict (mirrors the iouring
+			// fix in engine/iouring/worker.go).
+			if cs.detachMu != nil {
+				cs.detachMu.Lock()
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+				cs.detachMu.Unlock()
+			} else {
+				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
+			}
 		}
 
 		l.reqBatch++
@@ -648,7 +799,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		if mu := cs.detachMu; mu != nil {
 			mu.Lock()
 		}
-		if cs.writePos < len(cs.writeBuf) {
+		if cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0 {
 			if fErr := flushWrites(cs); fErr != nil {
 				if cs.h1State != nil && cs.h1State.OnError != nil {
 					cs.h1State.OnError(fErr)
@@ -662,7 +813,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.closeConn(fd)
 				return
 			}
-			if cs.writePos >= len(cs.writeBuf) {
+			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
 				// Fully flushed — no dirty list needed.
 				cs.pendingBytes = 0
 				if cs.dirty {
@@ -670,7 +821,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				}
 			} else {
 				// Partial write — sync pendingBytes with actual buffer state.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
 				l.markDirty(cs)
 			}
 		}
@@ -736,6 +887,19 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.MaxRequestBodySize = l.cfg.MaxRequestBodySize
 		cs.h1State.OnExpectContinue = l.cfg.OnExpectContinue
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
+		cs.h1State.WorkerID = int32(l.id)
+		cs.h1State.WorkerIDSet = true
+		if !l.cfg.EnableH2Upgrade {
+			cs.h1State.DisableH2CDetect()
+		}
+		// Scatter-gather body writer: handler hands large bodies to the
+		// engine as a zero-copy slice; flushWrites emits writev(2) with
+		// [headers, body] so we save the respBuf → writeBuf memcpy.
+		// Disabled in async mode because cs.bodyBuf access would race
+		// with the dispatch goroutine without a mutex.
+		if !l.async {
+			cs.h1State.SetWriteBodyFn(l.makeWriteBodyFn(cs))
+		}
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
 			// In async mode cs.detachMu was already allocated at
@@ -841,9 +1005,20 @@ func (l *Loop) initProtocol(cs *connState) {
 // the H2 client preface and initial SETTINGS frame) are fed through
 // ProcessH2 synchronously so no data is dropped at the protocol boundary.
 func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
+	if err := l.switchToH2Local(cs, writeFn); err != nil {
+		return err
+	}
+	l.h2Conns = append(l.h2Conns, cs.fd)
+	return nil
+}
+
+// switchToH2Local does every part of switchToH2 except the l.h2Conns
+// append, which must happen on the worker goroutine (the slice is
+// worker-local and iterated without locks on the hot path). The async
+// dispatch goroutine uses this under cs.detachMu and then asks the
+// worker to finish via asyncH2Promoted + detachQueue.
+func (l *Loop) switchToH2Local(cs *connState, writeFn func([]byte)) error {
 	info := cs.h1State.UpgradeInfo
-	// Build H2 state FIRST. If it fails, cs.h1State remains intact so the
-	// caller's cleanup path can release it properly.
 	h2State, err := conn.NewH2StateFromUpgrade(l.handler, l.h2cfg, writeFn, l.eventFD, info)
 	if err != nil {
 		cs.h1State.UpgradeInfo = nil
@@ -856,22 +1031,18 @@ func (l *Loop) switchToH2(cs *connState, writeFn func([]byte)) error {
 	cs.h2State = h2State
 	cs.h2State.SetRemoteAddr(cs.remoteAddr)
 	cs.protocol = engine.H2C
-	l.h2Conns = append(l.h2Conns, cs.fd)
 
 	var processErr error
 	if len(info.Remaining) > 0 {
 		processErr = conn.ProcessH2(cs.ctx, info.Remaining, cs.h2State, l.handler, writeFn, l.h2cfg)
 	}
-	// Release after ProcessH2 since Remaining aliases the H1 buffer — the
-	// info fields are still read by ProcessH2 above. ReleaseUpgradeInfo
-	// nils the slices so the backing buffer becomes GC-eligible.
 	conn.ReleaseUpgradeInfo(info)
 	return processErr
 }
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		if cs.pendingBytes > cs.writeCap() {
+		if cs.pendingBytes+len(cs.bodyBuf) > cs.writeCap() {
 			return
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)
@@ -879,6 +1050,27 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 		// Don't markDirty here — drainRead's inline flush handles the
 		// happy path. Only markDirty if the inline flush partially
 		// completes, avoiding linked-list overhead per request.
+	}
+}
+
+// makeWriteBodyFn stages a zero-copy body slice for scatter-gather
+// writev at flush time. The body is NOT copied — it must remain valid
+// and unmutated until flushWrites drains it. Used by the H1 response
+// adapter for bodies ≥ 8 KiB to skip the respBuf → writeBuf memcpy.
+func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
+	return func(body []byte) {
+		if cs.pendingBytes+len(cs.bodyBuf)+len(body) > cs.writeCap() {
+			return
+		}
+		if cs.bodyBuf != nil {
+			// A second large-body write in the same request: fall back
+			// to copying (we only carry one writev body slot per flush).
+			cs.writeBuf = append(cs.writeBuf, body...)
+			cs.pendingBytes += len(body)
+			return
+		}
+		cs.bodyBuf = body
+		cs.pendingBytes += len(body)
 	}
 }
 
@@ -956,12 +1148,79 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		cs.asyncInMu.Unlock()
 
 		cs.detachMu.Lock()
+		// Re-check asyncClosed under detachMu; closeConn sets it
+		// BEFORE tearing down cs.h1State. Mirrors the iouring fix
+		// (see engine/iouring/worker.go:runAsyncHandler).
+		if cs.asyncClosed.Load() {
+			cs.detachMu.Unlock()
+			cs.asyncInMu.Lock()
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			return
+		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
+		// H1→H2 upgrade on the async path. ProcessH1 has written the
+		// 101 Switching Protocols response into cs.writeBuf and stashed
+		// the upgrade info on cs.h1State. Promote cs-local state here
+		// (safe — holding detachMu), flush the 101 + server preface,
+		// then hand the conn back to the worker to (a) finish the
+		// promotion via l.h2Conns append and (b) resume recv in H2
+		// mode. The goroutine exits because from now on this conn uses
+		// the inline H2 path.
+		if errors.Is(processErr, conn.ErrUpgradeH2C) {
+			promoteErr := l.switchToH2Local(cs, cs.writeFn)
+			if promoteErr == nil && cs.writePos < len(cs.writeBuf) {
+				// flushWrites may partially complete; residual bytes
+				// stay in cs.writeBuf and the worker retries via
+				// markDirty once drainDetachQueue picks us up.
+				if err := flushWrites(cs); err != nil {
+					promoteErr = err
+				}
+			}
+			cs.detachMu.Unlock()
+			if promoteErr != nil {
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+			} else {
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				cs.asyncH2Promoted.Store(true)
+			}
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
+			return
+		}
 		var flushErr error
-		if processErr == nil && cs.writePos < len(cs.writeBuf) {
+		if processErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {
 			flushErr = flushWrites(cs)
 		}
-		partial := flushErr == nil && cs.writePos < len(cs.writeBuf)
+		// Resync pendingBytes with actual buffer state. makeWriteFn uses
+		// pendingBytes to enforce writeCap backpressure; without this
+		// reset, it grows by len(response) on every request and after
+		// ~writeCap bytes of cumulative responses every subsequent
+		// makeWriteFn call silently drops its payload — the client then
+		// blocks forever on the missing response. Mirror the inline-flush
+		// path (drainRead) and dirty-loop accounting.
+		if flushErr == nil {
+			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
+				cs.pendingBytes = 0
+			} else {
+				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
+			}
+		}
+		partial := flushErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0)
 		cs.detachMu.Unlock()
 
 		if partial {
@@ -1021,6 +1280,17 @@ func (l *Loop) drainDetachQueue() {
 		// the teardown here.
 		if cs.asyncClosed.Load() {
 			l.closeConn(cs.fd)
+			continue
+		}
+		// Dispatch goroutine promoted the conn to H2 via switchToH2Local.
+		// Finish the worker-owned bits of the swap: register the fd on
+		// the H2 write-queue poll list. The conn stays alive and
+		// subsequent recvs dispatch via the inline H2 path (cs.protocol
+		// is already H2C).
+		if cs.asyncH2Promoted.Load() {
+			cs.asyncH2Promoted.Store(false)
+			l.h2Conns = append(l.h2Conns, cs.fd)
+			l.markDirty(cs)
 			continue
 		}
 		// Apply any pending pause/resume request from the WS middleware.
@@ -1203,10 +1473,23 @@ func (l *Loop) closeConn(fd int) {
 	// Close H1 state unless a real WS/SSE detach handed ownership to a
 	// middleware goroutine. Async-mode HTTP1 conns have detachMu set
 	// but h1State.Detached is false — we still own H1 state there.
+	//
+	// For detached / async-dispatched conns, hold detachMu while
+	// tearing down h1State. runAsyncHandler runs ProcessH1 under the
+	// same lock, and CloseH1 writes state.stream / state.bodyBuf /
+	// state.bodyNeeded that ProcessH1 reads; without the lock a peer
+	// close mid-request corrupts H1State (tracked as celeris#256 on
+	// the iouring side). cs.asyncClosed is set earlier; the goroutine
+	// checks it on loop re-entry, so acquiring detachMu here only
+	// blocks for the current ProcessH1 call.
 	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 	l.removeDirty(cs)
-	if !trulyDetached {
-		if cs.h1State != nil {
+	if !trulyDetached && cs.h1State != nil {
+		if detached {
+			cs.detachMu.Lock()
+			conn.CloseH1(cs.h1State)
+			cs.detachMu.Unlock()
+		} else {
 			conn.CloseH1(cs.h1State)
 		}
 	}
@@ -1215,9 +1498,19 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	drainRecvBuffer(fd)
-	_ = unix.Close(fd)
+	// Fast-close path for plain H1 connections: close() alone. Saves
+	// shutdown(SHUT_WR) + drainRecvBuffer syscalls (~2 per close) in
+	// the Connection:close churn hot path. Graceful path retained for
+	// H2 (GOAWAY / RST_STREAM flushing) and WS/SSE detach (middleware-
+	// queued close frames).
+	fastClose := !detached && cs.protocol == engine.HTTP1 && cs.h1State != nil && !trulyDetached
+	if fastClose {
+		_ = unix.Close(fd)
+	} else {
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		drainRecvBuffer(fd)
+		_ = unix.Close(fd)
+	}
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
@@ -1259,7 +1552,16 @@ func (l *Loop) shutdown() {
 		}
 		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 		if !trulyDetached && cs.h1State != nil {
-			conn.CloseH1(cs.h1State)
+			// Mirror the closeConn fix: hold detachMu while tearing
+			// down h1State so ProcessH1 in runAsyncHandler isn't still
+			// reading the fields CloseH1 writes.
+			if detached {
+				cs.detachMu.Lock()
+				conn.CloseH1(cs.h1State)
+				cs.detachMu.Unlock()
+			} else {
+				conn.CloseH1(cs.h1State)
+			}
 		}
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)

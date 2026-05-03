@@ -91,6 +91,21 @@ type memcachedConn struct {
 	// syncBuf is the per-conn read buffer used by the sync round-trip path.
 	syncBuf []byte
 
+	// onRecvFn / onCloseFn cache the method-value closures bound to this
+	// mcConn. Hot sync paths (WriteAndPoll on every command, every
+	// pipeline) would otherwise re-create `c.onRecv` per call, which Go's
+	// compiler heap-allocates whenever the receiver escapes into a func
+	// argument.
+	onRecvFn  func([]byte)
+	onCloseFn func(error)
+
+	// pollIsDoneFn is the cached method value used by execBinaryMulti's
+	// WriteAndPollMulti call. It reads c.state.multiPollLastReq instead
+	// of capturing the local req variable, so it can be created once at
+	// dial time and reused — saving one closure allocation per binary-
+	// multi-packet op (GETM, STATS, BIN-MGET).
+	pollIsDoneFn func() bool
+
 	state *mcState
 	cfg   Config
 
@@ -192,9 +207,12 @@ func dialMemcachedConn(ctx context.Context, prov engine.EventLoopProvider, cfg C
 	if smrt, ok := loop.(syncMultiRoundTripper); ok {
 		c.syncMulti = smrt
 	}
+	c.onRecvFn = c.onRecv
+	c.onCloseFn = c.onClose
+	c.pollIsDoneFn = c.pollIsDone
 	c.lastUsedAt.Store(time.Now().UnixNano())
 
-	if err := loop.RegisterConn(fd, c.onRecv, c.onClose); err != nil {
+	if err := loop.RegisterConn(fd, c.onRecvFn, c.onCloseFn); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
@@ -269,6 +287,14 @@ func (c *memcachedConn) onClose(err error) {
 	c.state.drainWithError(err)
 }
 
+// pollIsDone is the eventloop.WriteAndPollMulti predicate. Bound as a
+// cached method value (pollIsDoneFn) at dial time so binary multi-packet
+// ops can reuse it without allocating a fresh closure on every call.
+func (c *memcachedConn) pollIsDone() bool {
+	last := c.state.multiPollLastReq
+	return last != nil && last.finished.Load()
+}
+
 // handshake runs per-protocol validation. Text protocol has no handshake;
 // for binary we issue a VERSION opcode to confirm the server speaks binary.
 // (Some older stacks accept the TCP connection but send back a text ERROR
@@ -327,9 +353,9 @@ func (c *memcachedConn) execText(ctx context.Context, kind replyKind, encode fun
 		var ok bool
 		var err error
 		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
 		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
 		}
 		c.writerMu.Unlock()
 		if err != nil {
@@ -397,9 +423,9 @@ func (c *memcachedConn) execBinary(ctx context.Context, opcode byte, encode func
 		var ok bool
 		var err error
 		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
 		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
 		}
 		c.writerMu.Unlock()
 		if err != nil {
@@ -470,8 +496,9 @@ func (c *memcachedConn) execBinaryMulti(
 		// piggybacks on req.finished, which dispatchBinaryMulti flips once
 		// the terminator packet is parsed.
 		if c.syncMulti != nil {
-			isDone := func() bool { return req.finished.Load() }
-			ok, err := c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecv, isDone, nil)
+			c.state.multiPollLastReq = req
+			ok, err := c.syncMulti.WriteAndPollMulti(c.fd, buf, c.syncBuf, c.onRecvFn, c.pollIsDoneFn, nil)
+			c.state.multiPollLastReq = nil
 			c.writerMu.Unlock()
 			if err != nil {
 				_ = c.closeWithErr(err)
@@ -489,9 +516,9 @@ func (c *memcachedConn) execBinaryMulti(
 		var ok bool
 		var err error
 		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
 		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecv)
+			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
 		}
 		c.writerMu.Unlock()
 		if err != nil {

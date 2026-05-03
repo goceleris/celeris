@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis/protocol"
 )
@@ -36,6 +37,45 @@ func (c *Client) do(ctx context.Context, fn func(v protocol.Value) error, args .
 	ferr := fn(req.result)
 	c.pool.releaseCmd(conn)
 	return ferr
+}
+
+// doRead is the zero-closure fast path for Get/GetBytes/HGet/HGetAll/etc.
+// — any read that returns a single Value. Avoids the per-call heap-allocated
+// closure that `do` requires (the closure captures the caller's output var,
+// forcing it to escape). Callers must decode req.result themselves and call
+// releaseResult before the conn is released.
+//
+// Returns (result, err). The result aliases the conn's reader buffer and
+// is valid only until releaseResult is called — callers that retain bytes
+// must copy via asBytes / copyValueDetached first.
+func (c *Client) doRead(ctx context.Context, args ...string) (protocol.Value, *redisRequest, *redisConn, error) {
+	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
+	if err != nil {
+		return protocol.Value{}, nil, nil, err
+	}
+	req, err := conn.exec(ctx, args...)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			c.pool.discardCmd(conn)
+		} else {
+			c.pool.releaseCmd(conn)
+		}
+		return protocol.Value{}, nil, nil, err
+	}
+	if req.resultErr != nil {
+		rerr := req.resultErr
+		conn.releaseResult(req)
+		c.pool.releaseCmd(conn)
+		return protocol.Value{}, nil, nil, rerr
+	}
+	return req.result, req, conn, nil
+}
+
+// release finalises a doRead call — must be paired with every successful
+// doRead return.
+func (c *Client) releaseDoRead(req *redisRequest, conn *redisConn) {
+	conn.releaseResult(req)
+	c.pool.releaseCmd(conn)
 }
 
 // ---------- decoding helpers ----------
@@ -178,6 +218,19 @@ func asStringMap(v protocol.Value) (map[string]string, error) {
 	return nil, fmt.Errorf("celeris-redis: expected map reply, got %s", v.Type)
 }
 
+// unsafeStringFromBytes reinterprets a []byte as a string without
+// copying. The caller MUST guarantee that the returned string is only
+// used for read-only operations that complete before the backing slice
+// is mutated or freed. Used on the SetBytes / HSetBytes fast paths
+// where the written bytes are consumed synchronously by the RESP
+// writer + TCP Write and never retained.
+func unsafeStringFromBytes(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
 // argify converts a value to a string arg. Used by variadic commands.
 func argify(v any) string {
 	switch x := v.(type) {
@@ -210,30 +263,24 @@ func argify(v any) string {
 // Get retrieves the string value at key. Returns [ErrNil] when the key is
 // missing.
 func (c *Client) Get(ctx context.Context, key string) (string, error) {
-	var out string
-	err := c.do(ctx, func(v protocol.Value) error {
-		s, err := asString(v)
-		if err != nil {
-			return err
-		}
-		out = s
-		return nil
-	}, "GET", key)
-	return out, err
+	v, req, conn, err := c.doRead(ctx, "GET", key)
+	if err != nil {
+		return "", err
+	}
+	s, derr := asString(v)
+	c.releaseDoRead(req, conn)
+	return s, derr
 }
 
 // GetBytes is the []byte variant of Get. The returned slice is a fresh copy.
 func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
-	var out []byte
-	err := c.do(ctx, func(v protocol.Value) error {
-		b, err := asBytes(v)
-		if err != nil {
-			return err
-		}
-		out = b
-		return nil
-	}, "GET", key)
-	return out, err
+	v, req, conn, err := c.doRead(ctx, "GET", key)
+	if err != nil {
+		return nil, err
+	}
+	b, derr := asBytes(v)
+	c.releaseDoRead(req, conn)
+	return b, derr
 }
 
 // Set stores value at key. If expiration > 0, an EX argument is appended with
@@ -244,9 +291,31 @@ func (c *Client) Set(ctx context.Context, key string, value any, expiration time
 	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
 }
 
+// SetBytes is the allocation-lean variant of [Client.Set]. It converts the
+// caller-owned []byte into a string without copying via unsafe.String —
+// safe because the RESP writer only reads the bytes to stream to the wire
+// and does not retain the string past the round trip. Skips argify's
+// interface type switch + allocating string(x) for the []byte case.
+func (c *Client) SetBytes(ctx context.Context, key string, value []byte, expiration time.Duration) error {
+	args := []string{"SET", key, unsafeStringFromBytes(value)}
+	args = appendExpire(args, expiration)
+	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
+}
+
 // SetNX sets key only if it does not exist.
 func (c *Client) SetNX(ctx context.Context, key string, value any, expiration time.Duration) (bool, error) {
-	args := []string{"SET", key, argify(value)}
+	return c.setNX(ctx, key, argify(value), expiration)
+}
+
+// SetNXBytes is the allocation-lean variant of [Client.SetNX]. Skips
+// argify's string(x) copy via unsafe.String — same safety rationale as
+// [Client.SetBytes].
+func (c *Client) SetNXBytes(ctx context.Context, key string, value []byte, expiration time.Duration) (bool, error) {
+	return c.setNX(ctx, key, unsafeStringFromBytes(value), expiration)
+}
+
+func (c *Client) setNX(ctx context.Context, key, value string, expiration time.Duration) (bool, error) {
+	args := []string{"SET", key, value}
 	args = appendExpire(args, expiration)
 	args = append(args, "NX")
 	var ok bool
@@ -398,6 +467,20 @@ func (c *Client) HSet(ctx context.Context, key string, values ...any) (int64, er
 	return out, err
 }
 
+// HSetBytes is the allocation-lean variant of [Client.HSet] for a single
+// field/value pair where value is already a []byte. The field name is
+// still a string (hash fields are typed string).
+func (c *Client) HSetBytes(ctx context.Context, key, field string, value []byte) (int64, error) {
+	args := []string{"HSET", key, field, unsafeStringFromBytes(value)}
+	var out int64
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n
+		return e
+	}, args...)
+	return out, err
+}
+
 // HDel removes one or more fields.
 func (c *Client) HDel(ctx context.Context, key string, fields ...string) (int64, error) {
 	args := make([]string, 0, 2+len(fields))
@@ -474,12 +557,47 @@ func (c *Client) LPush(ctx context.Context, key string, values ...any) (int64, e
 	return out, err
 }
 
+// LPushBytes is the allocation-lean variant of [Client.LPush] for
+// callers that already hold the values as [][]byte. Skips argify's
+// string(x) copy per value.
+func (c *Client) LPushBytes(ctx context.Context, key string, values ...[]byte) (int64, error) {
+	args := make([]string, 0, 2+len(values))
+	args = append(args, "LPUSH", key)
+	for _, v := range values {
+		args = append(args, unsafeStringFromBytes(v))
+	}
+	var out int64
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n
+		return e
+	}, args...)
+	return out, err
+}
+
 // RPush appends one or more values.
 func (c *Client) RPush(ctx context.Context, key string, values ...any) (int64, error) {
 	args := make([]string, 0, 2+len(values))
 	args = append(args, "RPUSH", key)
 	for _, v := range values {
 		args = append(args, argify(v))
+	}
+	var out int64
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n
+		return e
+	}, args...)
+	return out, err
+}
+
+// RPushBytes is the allocation-lean variant of [Client.RPush]. Skips
+// argify's per-value string(x) copy.
+func (c *Client) RPushBytes(ctx context.Context, key string, values ...[]byte) (int64, error) {
+	args := make([]string, 0, 2+len(values))
+	args = append(args, "RPUSH", key)
+	for _, v := range values {
+		args = append(args, unsafeStringFromBytes(v))
 	}
 	var out int64
 	err := c.do(ctx, func(v protocol.Value) error {
@@ -968,6 +1086,19 @@ func (c *Client) GetDel(ctx context.Context, key string) (string, error) {
 	return out, err
 }
 
+// GetDelBytes is the []byte-returning variant of [Client.GetDel], skipping
+// the string→[]byte conversion that [Client.GetDel] callers otherwise incur
+// when passing the result through [middleware/store.KV].GetAndDelete.
+func (c *Client) GetDelBytes(ctx context.Context, key string) ([]byte, error) {
+	var out []byte
+	err := c.do(ctx, func(v protocol.Value) error {
+		b, e := asBytes(v)
+		out = b
+		return e
+	}, "GETDEL", key)
+	return out, err
+}
+
 // SetEX sets key to value with the given TTL (second granularity). This is
 // the atomic equivalent of SET + EXPIRE.
 func (c *Client) SetEX(ctx context.Context, key string, value any, ttl time.Duration) error {
@@ -977,6 +1108,16 @@ func (c *Client) SetEX(ctx context.Context, key string, value any, ttl time.Dura
 	}
 	return c.do(ctx, func(protocol.Value) error { return nil },
 		"SETEX", key, strconv.FormatInt(secs, 10), argify(value))
+}
+
+// SetEXBytes is the allocation-lean variant of [Client.SetEX].
+func (c *Client) SetEXBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	secs := int64(ttl / time.Second)
+	if secs <= 0 {
+		secs = 1
+	}
+	return c.do(ctx, func(protocol.Value) error { return nil },
+		"SETEX", key, strconv.FormatInt(secs, 10), unsafeStringFromBytes(value))
 }
 
 // Append appends value to key and returns the new string length.
@@ -1142,6 +1283,17 @@ func (c *Client) HSetNX(ctx context.Context, key, field string, value any) (bool
 		out = n == 1
 		return e
 	}, "HSETNX", key, field, argify(value))
+	return out, err
+}
+
+// HSetNXBytes is the allocation-lean variant of [Client.HSetNX].
+func (c *Client) HSetNXBytes(ctx context.Context, key, field string, value []byte) (bool, error) {
+	var out bool
+	err := c.do(ctx, func(v protocol.Value) error {
+		n, e := asInt(v)
+		out = n == 1
+		return e
+	}, "HSETNX", key, field, unsafeStringFromBytes(value))
 	return out, err
 }
 

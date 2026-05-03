@@ -144,6 +144,15 @@ func Open(dsnStr string, opts ...Option) (*Pool, error) {
 	if o.cfg.StatementCacheSize != 0 {
 		dsn.Options.StatementCacheSize = o.cfg.StatementCacheSize
 	}
+	// Pool.Open is the production entry point for application code; default
+	// to auto-prepared+cached statements unless the DSN explicitly opted
+	// out (auto_cache_statements=false). Mirrors pgx's default behaviour.
+	// Lower-level entry points (dialConn, the database/sql DSN-only path
+	// via OpenConnector) keep the field unset to preserve raw DSN parse
+	// semantics — this opt-in covers the realistic per-conn-pool path.
+	if !dsn.Options.autoCacheStatementsExplicit {
+		dsn.Options.AutoCacheStatements = true
+	}
 	if o.provider == nil {
 		prov, err := eventloop.Resolve(nil)
 		if err != nil {
@@ -212,6 +221,28 @@ func (p *Pool) dial(ctx context.Context, workerID int) (*pgConn, error) {
 	// netpoll — no LockOSThread involvement, so we skip the mini-loop
 	// entirely and keep the dispatch model symmetric with memcached.
 	directMode := !p.hasEngine || p.asyncEngine
+
+	// Additional case: WithEngine on an engine whose WorkerLoop does NOT
+	// implement syncRoundTripper (io_uring, epoll today). Without a sync
+	// path the driver's async write + channel-wait deadlocks on inline
+	// handlers: the engine worker is the goroutine executing the handler
+	// (LockOSThread'd), so when wait() parks on doneCh the M sits idle
+	// and never drains the CQE carrying PG's reply. Netpoll is M-safe,
+	// so direct mode sidesteps the deadlock with no correctness impact.
+	if !directMode {
+		p.providerMu.RLock()
+		prov := p.provider
+		p.providerMu.RUnlock()
+		if prov == nil {
+			return nil, ErrPoolClosed
+		}
+		if wl := prov.WorkerLoop(0); wl != nil {
+			if _, ok := wl.(syncRoundTripper); !ok {
+				directMode = true
+			}
+		}
+	}
+
 	if directMode {
 		c, err := dialDirectConn(ctx, p.dsn)
 		if err != nil {
@@ -344,13 +375,14 @@ func (p *Pool) QueryContext(ctx context.Context, query string, args ...any) (*Ro
 	if err != nil {
 		return nil, err
 	}
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	drows, err := c.QueryContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		p.release(c)
 		return nil, err
 	}
-	return &Rows{inner: drows, conn: c, pool: p}, nil
+	return acquireRows(drows, c, p), nil
 }
 
 // ExecContext runs a statement and returns a [Result].
@@ -360,8 +392,9 @@ func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (Resu
 		return Result{}, err
 	}
 	defer p.release(c)
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	r, err := c.ExecContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		return Result{}, err
 	}
@@ -398,16 +431,72 @@ func (p *Pool) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	return &Tx{inner: tx.(*pgTx), conn: c, pool: p}, nil
 }
 
+// namedArgsSlot holds a reusable []driver.NamedValue slab pooled via
+// namedArgsPool. The slab header lives on the heap exactly once (when
+// the pool's New runs); subsequent Get/Put round-trips reuse the same
+// *namedArgsSlot pointer so there is no per-call slice-header alloc.
+type namedArgsSlot struct {
+	buf []driver.NamedValue
+}
+
+var namedArgsPool = sync.Pool{
+	New: func() any {
+		return &namedArgsSlot{buf: make([]driver.NamedValue, 0, 8)}
+	},
+}
+
 // anysToNamed converts a variadic ...any arg list into driver.NamedValues.
-func anysToNamed(args []any) []driver.NamedValue {
+// On success it returns the slot for releaseNamedArgs to return to the
+// pool; for len(args)==0 it returns (nil, nil) so callers can skip the
+// release call entirely.
+func anysToNamed(args []any) ([]driver.NamedValue, *namedArgsSlot) {
 	if len(args) == 0 {
-		return nil
+		return nil, nil
 	}
-	out := make([]driver.NamedValue, len(args))
+	slot := namedArgsPool.Get().(*namedArgsSlot)
+	if cap(slot.buf) < len(args) {
+		slot.buf = make([]driver.NamedValue, len(args))
+	} else {
+		slot.buf = slot.buf[:len(args)]
+	}
 	for i, a := range args {
-		out[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
+		slot.buf[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
 	}
-	return out
+	return slot.buf, slot
+}
+
+// releaseNamedArgs returns the slot to the pool after zeroing the
+// backing slots so captured Values are not pinned. A nil slot is a no-op
+// (matches the zero-arg fast path).
+func releaseNamedArgs(slot *namedArgsSlot) {
+	if slot == nil {
+		return
+	}
+	for i := range slot.buf {
+		slot.buf[i] = driver.NamedValue{}
+	}
+	slot.buf = slot.buf[:0]
+	namedArgsPool.Put(slot)
+}
+
+// rowsPool recycles *Rows wrappers so QueryContext avoids a heap alloc per
+// query on the hot path. On Close the struct is zeroed and returned to the
+// pool; callers who retain the pointer past Close see a cleared wrapper
+// (same behavior as any other post-Close access — an API contract
+// violation already).
+var rowsPool = sync.Pool{New: func() any { return &Rows{} }}
+
+func acquireRows(inner driver.Rows, conn *pgConn, pool *Pool) *Rows {
+	r := rowsPool.Get().(*Rows)
+	r.inner = inner
+	r.conn = conn
+	r.pool = pool
+	return r
+}
+
+func releaseRows(r *Rows) {
+	*r = Rows{}
+	rowsPool.Put(r)
 }
 
 // Rows is the pool-level rows wrapper. It returns the underlying conn to the
@@ -455,6 +544,7 @@ func (r *Rows) Close() error {
 	if r.pool != nil && r.conn != nil {
 		r.pool.release(r.conn)
 	}
+	releaseRows(r)
 	return err
 }
 
@@ -950,8 +1040,9 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result
 	if t.done {
 		return Result{}, errors.New("celeris-postgres: tx already finished")
 	}
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	r, err := t.conn.ExecContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		return Result{}, err
 	}
@@ -965,12 +1056,13 @@ func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows
 	if t.done {
 		return nil, errors.New("celeris-postgres: tx already finished")
 	}
-	named := anysToNamed(args)
+	named, slot := anysToNamed(args)
 	drows, err := t.conn.QueryContext(ctx, query, named)
+	releaseNamedArgs(slot)
 	if err != nil {
 		return nil, err
 	}
-	return &Rows{inner: drows, conn: nil, pool: nil}, nil
+	return acquireRows(drows, nil, nil), nil
 }
 
 // QueryRow executes a query expected to return at most one row on the

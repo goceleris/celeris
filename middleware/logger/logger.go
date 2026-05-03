@@ -38,8 +38,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		headers = DefaultSensitiveHeaders()
 	}
 	sensitiveMap := make(map[string]struct{}, len(headers))
+	// Pre-built "header.<name>" keys so the hot-path redaction loop
+	// doesn't string-concat + escape on every request. One alloc per
+	// header per middleware instance (N) instead of N allocs per request.
+	sensitiveAttrKeys := make([]string, 0, len(headers))
 	for _, h := range headers {
-		sensitiveMap[strings.ToLower(h)] = struct{}{}
+		lc := strings.ToLower(h)
+		sensitiveMap[lc] = struct{}{}
+		sensitiveAttrKeys = append(sensitiveAttrKeys, "header."+lc)
 	}
 
 	handler := cfg.Output.Handler()
@@ -121,10 +127,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		if ip := c.ClientIP(); ip != "" {
 			attrs = append(attrs, slog.String("client_ip", ip))
 		}
-		if rid, ok := c.Get(celeris.RequestIDKey); ok {
-			if s, ok := rid.(string); ok && s != "" {
-				attrs = append(attrs, slog.String("request_id", s))
-			}
+		if s := c.RequestID(); s != "" {
+			attrs = append(attrs, slog.String("request_id", s))
 		} else if rid := c.Header("x-request-id"); rid != "" {
 			attrs = append(attrs, slog.String("request_id", rid))
 		}
@@ -227,10 +231,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		// Sensitive header redaction: always emit every configured header
 		// with "[REDACTED]" so the log entry is identical whether the
 		// header was sent or not (constant-presence, no info leak).
-		if len(sensitiveMap) > 0 {
-			for h := range sensitiveMap {
-				attrs = append(attrs, slog.String("header."+h, "[REDACTED]"))
-			}
+		// Uses pre-built "header.<name>" keys (see New()) to avoid the
+		// per-request string-concat + escape.
+		for _, k := range sensitiveAttrKeys {
+			attrs = append(attrs, slog.String(k, "[REDACTED]"))
 		}
 
 		ts := c.StartTime()

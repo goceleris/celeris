@@ -21,6 +21,38 @@ type Token struct {
 	Method    SigningMethod
 	Signature []byte
 	Valid     bool
+
+	// onReleaseFn is a pre-bound method value to ReleaseFromContext,
+	// stored so jwt middleware can register it with Context.OnRelease
+	// without materialising a fresh closure per request. Lazy-bound on
+	// first Middleware use — sync.Pool's New cannot do it directly
+	// because ReleaseFromContext references tokenPool (init cycle).
+	onReleaseFn func()
+}
+
+// ReleaseFromContext returns t and its MapClaims (if any) to their
+// respective pools. Designed to be registered as-is with
+// Context.OnRelease so the middleware hot path does not materialise a
+// closure capturing the context.
+func (t *Token) ReleaseFromContext() {
+	if t == nil {
+		return
+	}
+	if m, ok := t.Claims.(MapClaims); ok {
+		ReleaseMapClaims(m)
+	}
+	ReleaseToken(t)
+}
+
+// OnReleaseFn returns (and lazily binds) the cached method value for
+// Context.OnRelease registration. The caller is responsible for
+// ensuring the returned value is used only for the token's current
+// life-cycle.
+func (t *Token) OnReleaseFn() func() {
+	if t.onReleaseFn == nil {
+		t.onReleaseFn = t.ReleaseFromContext
+	}
+	return t.onReleaseFn
 }
 
 // Header is the JOSE header of a JWT.
@@ -31,6 +63,14 @@ type Header struct {
 }
 
 var tokenPool = sync.Pool{New: func() any { return &Token{} }}
+
+// Pooled 1024-byte scratch buffers for the claims JSON and signature
+// decoders. Stack allocation of [1024]byte inside ParseWithClaims
+// escapes to heap because the slice is passed through interface
+// methods (Claims.UnmarshalClaims, SigningMethod.Verify) that force
+// heap escape. A pool lets us reuse those 2 KiB per call.
+var claimsBufPool = sync.Pool{New: func() any { b := make([]byte, 1024); return &b }}
+var sigBufPool = sync.Pool{New: func() any { b := make([]byte, 1024); return &b }}
 
 func acquireToken() *Token {
 	t := tokenPool.Get().(*Token)
@@ -206,27 +246,34 @@ func (p *Parser) ParseWithClaims(tokenString string, claims Claims, keyFunc Keyf
 		}
 	}
 
-	// 5. Decode claims. Use stack buffer for MapClaims (typical JWT claims < 1KB);
-	// fall back to heap allocation when the decoded payload exceeds the buffer.
+	// 5. Decode claims. Pool-backed 1024-byte buffer for MapClaims (typical
+	// JWT claims < 1KB); fall back to heap allocation when the decoded
+	// payload exceeds the buffer. A plain stack [1024]byte escapes via the
+	// Claims interface call — the pool amortizes that instead.
 	claimsSeg := tokenString[dot1+1 : dot2]
 	if _, ok := claims.(MapClaims); ok {
 		var claimsData []byte
-		var claimsBuf [1024]byte
-		cn, cerr := base64Decode(claimsBuf[:], claimsSeg)
+		claimsBufPtr := claimsBufPool.Get().(*[]byte)
+		claimsBuf := *claimsBufPtr
+		cn, cerr := base64Decode(claimsBuf, claimsSeg)
 		if cerr != nil {
 			if base64.RawURLEncoding.DecodedLen(len(claimsSeg)) > len(claimsBuf) {
 				claimsData, cerr = base64DecodeAlloc(claimsSeg)
 				if cerr != nil {
+					claimsBufPool.Put(claimsBufPtr)
 					return nil, ErrTokenMalformed
 				}
 			} else {
+				claimsBufPool.Put(claimsBufPtr)
 				return nil, ErrTokenMalformed
 			}
 		}
 		if claimsData == nil {
 			claimsData = claimsBuf[:cn]
 		}
-		if err := unmarshalClaims(claimsData, claims); err != nil {
+		err := unmarshalClaims(claimsData, claims)
+		claimsBufPool.Put(claimsBufPtr)
+		if err != nil {
 			return nil, ErrTokenMalformed
 		}
 	} else {
@@ -239,12 +286,15 @@ func (p *Parser) ParseWithClaims(tokenString string, claims Claims, keyFunc Keyf
 		}
 	}
 
-	// 6. Decode signature into stack buffer (1024B covers RSA-4096 and future key sizes);
-	// fall back to heap for unusually large signatures.
+	// 6. Decode signature into pool-backed buffer (1024B covers RSA-4096);
+	// fall back to heap for unusually large signatures. Plain stack buffer
+	// escapes via SigningMethod.Verify's interface call; the pool amortizes.
 	sigSeg := tokenString[dot2+1:]
 	var sigBytes []byte
-	var sigBuf [1024]byte
-	sn, err := base64Decode(sigBuf[:], sigSeg)
+	sigBufPtr := sigBufPool.Get().(*[]byte)
+	sigBuf := *sigBufPtr
+	defer sigBufPool.Put(sigBufPtr)
+	sn, err := base64Decode(sigBuf, sigSeg)
 	if err != nil {
 		if base64.RawURLEncoding.DecodedLen(len(sigSeg)) > len(sigBuf) {
 			sigBytes, err = base64DecodeAlloc(sigSeg)
@@ -269,13 +319,13 @@ func (p *Parser) ParseWithClaims(tokenString string, claims Claims, keyFunc Keyf
 
 	key, err := keyFunc(token)
 	if err != nil {
-		return token, fmt.Errorf("%w: %w", ErrTokenUnverifiable, err)
+		return token, &wrapErr{outer: ErrTokenUnverifiable, inner: err}
 	}
 
 	// 8. Verify signature. signingInput is a substring of tokenString (zero alloc).
 	signingInput := tokenString[:dot2]
 	if err := method.Verify(signingInput, sig, key); err != nil {
-		return token, fmt.Errorf("%w: %w", ErrTokenSignatureInvalid, err)
+		return token, &wrapErr{outer: ErrTokenSignatureInvalid, inner: err}
 	}
 	// 9. Validate claims with leeway support.
 	if err := claims.Valid(); err != nil {

@@ -1,11 +1,13 @@
 package session
 
 import (
+	"strings"
 	"time"
 
 	"github.com/goceleris/celeris"
 
 	"github.com/goceleris/celeris/middleware/internal/randutil"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // ContextKey is the context store key for the session object.
@@ -33,10 +35,12 @@ func CookieExtractor(cookieName string) Extractor {
 
 // HeaderExtractor returns an [Extractor] that reads the session ID from
 // the named request header. Use this for API clients that cannot store
-// cookies.
+// cookies. Header name is pre-lowercased so c.Header's own fast-path
+// fires without allocating per request.
 func HeaderExtractor(headerName string) Extractor {
+	h := strings.ToLower(headerName)
 	return func(c *celeris.Context) string {
-		return c.Header(headerName)
+		return c.Header(h)
 	}
 }
 
@@ -56,8 +60,10 @@ type Config struct {
 	// SkipPaths lists paths to skip (exact match).
 	SkipPaths []string
 
-	// Store is the session backend. Default: NewMemoryStore().
-	Store Store
+	// Store is the session backend. Default: [NewMemoryStore].
+	// Sessions are JSON-encoded before persistence; custom [store.KV]
+	// backends (Redis, Postgres) must preserve byte slice contents.
+	Store store.KV
 
 	// Extractor extracts the session ID from the request. Default:
 	// CookieExtractor(CookieName). When a non-cookie extractor is used,

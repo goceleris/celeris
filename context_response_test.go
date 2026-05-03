@@ -1454,3 +1454,296 @@ func TestContextDeleteCookie(t *testing.T) {
 		t.Fatalf("expected Path=/, got %q", setCookie)
 	}
 }
+
+// TestJSONFastPathNested checks byte-identity for nested shapes: maps
+// containing slices, slices containing maps, etc. These are the
+// realistic list+envelope shapes of production API traffic, where the
+// fast path saves the most allocations vs encoding/json.
+func TestJSONFastPathNested(t *testing.T) {
+	cases := []any{
+		map[string]any{
+			"data": []any{
+				map[string]string{"id": "1", "name": "alice"},
+				map[string]string{"id": "2", "name": "bob"},
+			},
+			"total": int64(2),
+		},
+		map[string]any{
+			"items": []string{"a", "b", "c"},
+			"ok":    true,
+		},
+		[]any{
+			map[string]string{"k": "v"},
+			"bare",
+			int64(42),
+			nil,
+			true,
+		},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
+// TestJSONFastPathSliceString checks byte-identity of the []string
+// fast path against stdlib encoding/json for safe inputs.
+func TestJSONFastPathSliceString(t *testing.T) {
+	cases := [][]string{
+		nil,
+		{},
+		{"a"},
+		{"one", "two", "three"},
+		{"", "middle", ""},
+	}
+	for _, s := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, s); err != nil {
+			t.Fatalf("JSON(%v): %v", s, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(s)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", s, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
+// TestJSONFastPathFloats verifies the float format matches stdlib's
+// 1e-6/1e21 mode switch + exponent cleanup byte-for-byte. NaN/Inf
+// must continue to bail (stdlib returns an error for those).
+func TestJSONFastPathFloats(t *testing.T) {
+	cases := []any{
+		map[string]any{"zero": 0.0},
+		map[string]any{"one": 1.0},
+		map[string]any{"neg": -1.5},
+		map[string]any{"pi": 3.14},
+		map[string]any{"small": 1e-7},
+		map[string]any{"big": 1e20},
+		map[string]any{"mixed": []any{1e-7, 1e20, 0.5, -3.14}},
+		map[string]any{"f32": float32(2.5)},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
+// TestJSONFastPathPrimitiveSlices verifies []int, []int64, []uint64,
+// []bool fast paths against stdlib byte output.
+func TestJSONFastPathPrimitiveSlices(t *testing.T) {
+	cases := []any{
+		[]int(nil),
+		[]int{},
+		[]int{1, 2, 3},
+		[]int{-1, 0, 1},
+		[]int64{0, -9223372036854775808, 9223372036854775807}, // extremes
+		[]uint64{0, 1, 18446744073709551615},                  // max uint64
+		[]bool(nil),
+		[]bool{},
+		[]bool{true, false, true},
+		map[string]any{"ids": []int{1, 2, 3}, "flags": []bool{true, false}},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
+// TestJSONFastPathEscapedStrings verifies the in-place escape emitter
+// handles every byte stdlib escapes under SetEscapeHTML(false):
+// ", \, control chars with short forms (\b \t \n \f \r), control
+// chars without short forms (\u000b etc.), and U+2028/U+2029.
+func TestJSONFastPathEscapedStrings(t *testing.T) {
+	cases := []any{
+		map[string]string{"msg": "she said \"hi\""},
+		map[string]string{"path": "C:\\Users\\alice"},
+		map[string]string{"tab": "a\tb"},
+		map[string]string{"newline": "line1\nline2"},
+		map[string]string{"cr": "a\rb"},
+		map[string]string{"bell": "a\bb"},
+		map[string]string{"ff": "a\fb"},
+		map[string]string{"vt": "a\x0Bb"}, // no short form → \u000b
+		map[string]string{"null": "a\x00b"},
+		map[string]string{"ls": "\u2028"},
+		map[string]string{"ps": "\u2029"},
+		map[string]string{"mix": "\"\\\n\u2028café😀"},
+		[]string{"plain", "with \"quote\"", "back\\slash"},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
+// TestJSONFastPathUTF8 verifies the fast path emits valid UTF-8
+// strings (non-ASCII bytes) byte-identically to stdlib. After the
+// widened jsonIsSafeASCII check, common international content —
+// accented latin, Japanese, emoji — stays on the fast path.
+func TestJSONFastPathUTF8(t *testing.T) {
+	cases := []any{
+		map[string]string{"name": "café"},
+		map[string]string{"city": "東京"},
+		map[string]string{"mood": "😀✨"},
+		[]string{"α", "β", "γ"},
+	}
+	for _, v := range cases {
+		stream, rw := newTestStream("GET", "/test")
+		c := acquireContext(stream)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		stream.Release()
+	}
+}
+
+// TestJSONFastPathFallbacks checks that values the fast path cannot
+// emit byte-identically fall through to stdlib encoding/json rather
+// than being emitted incorrectly by the fast path.
+func TestJSONFastPathFallbacks(t *testing.T) {
+	// Every case below still takes the fast path now (float/escaped
+	// strings/nested slices are all supported). The test still serves
+	// as a byte-identity regression guard for the edge-case shapes we
+	// claim to handle.
+	cases := []any{
+		map[string]any{"pi": 3.14},
+		map[string]any{"big": 1e20},
+		map[string]string{"msg": "she said \"hi\""},
+		map[string]string{"path": "C:\\Users"},
+		map[string]string{"ln": "line1\nline2"},
+		map[string]string{"sep": "\u2028line"},
+		map[string]string{"sep2": "para\u2029break"},
+		map[string]any{"list": []int{1, 2}},
+	}
+	for _, v := range cases {
+		s, rw := newTestStream("GET", "/test")
+		c := acquireContext(s)
+		if err := c.JSON(200, v); err != nil {
+			t.Fatalf("JSON(%v): %v", v, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(v)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", v, got, want)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}
+
+// TestJSONFastPathMapAny checks byte-identity of the map[string]any
+// primitive fast-path against stdlib encoding/json for safe inputs.
+func TestJSONFastPathMapAny(t *testing.T) {
+	cases := []map[string]any{
+		{},
+		{"status": "ok"},
+		{"ok": true, "count": int64(42), "name": "alice"},
+		{"n": nil, "s": "str", "b": false, "i": int64(-7), "u": uint32(1000)},
+	}
+	for _, m := range cases {
+		s, rw := newTestStream("GET", "/test")
+		c := acquireContext(s)
+		if err := c.JSON(200, m); err != nil {
+			t.Fatalf("JSON(%v): %v", m, err)
+		}
+		got := string(rw.body)
+		want, _ := stdlibJSONEncode(m)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", m, got, want)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}
+
+// TestJSONFastPathMapString checks byte-identity of the map[string]string
+// fast-path against stdlib encoding/json. Any drift here is a bug —
+// the fast path exists to save allocations, not to produce different
+// output.
+func TestJSONFastPathMapString(t *testing.T) {
+	cases := []map[string]string{
+		{},
+		{"status": "ok"},
+		{"a": "1", "b": "2", "c": "3"},
+		{"message": "hello world"},
+		{"key": "value with spaces"},
+	}
+	for _, m := range cases {
+		s, _ := newTestStream("GET", "/test")
+		c := acquireContext(s)
+		if err := c.JSON(200, m); err != nil {
+			t.Fatalf("JSON(%v): %v", m, err)
+		}
+		got := string(s.ResponseWriter.(*mockResponseWriter).body)
+
+		want, _ := stdlibJSONEncode(m)
+		if got != want {
+			t.Fatalf("JSON(%v): got %q, want %q", m, got, want)
+		}
+		releaseContext(c)
+		s.Release()
+	}
+}
+
+func stdlibJSONEncode(v any) (string, error) {
+	var b bytes.Buffer
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(v); err != nil {
+		return "", err
+	}
+	out := b.Bytes()
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	return string(out), nil
+}

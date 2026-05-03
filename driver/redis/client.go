@@ -21,7 +21,7 @@ type Client struct {
 // established lazily on first command.
 func NewClient(addr string, opts ...Option) (*Client, error) {
 	if strings.HasPrefix(addr, "rediss://") {
-		return nil, errors.New("celeris-redis: TLS (rediss://) is not supported in v1.4.0; use redis:// for VPC/loopback deployments or wait for v1.4.x TLS support")
+		return nil, errors.New("celeris-redis: TLS (rediss://) is not yet supported; use redis:// for VPC/loopback deployments")
 	}
 	// Strip redis:// prefix if present.
 	addr = strings.TrimPrefix(addr, "redis://")
@@ -54,6 +54,20 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	provider, err := eventloop.Resolve(cfg.Engine)
 	if err != nil {
 		return nil, err
+	}
+	// WithEngine on an engine whose WorkerLoop doesn't implement
+	// syncRoundTripper (io_uring, epoll today) would deadlock the HELLO
+	// handshake: the handler goroutine is LockOSThread'd to the engine
+	// worker, so wait() parks the M and the CQE carrying the HELLO reply
+	// never drains. Fall back to direct mode (net.Conn via Go netpoll),
+	// which parks locked-M Gs cleanly.
+	if cfg.Engine != nil {
+		if wl := provider.WorkerLoop(0); wl != nil {
+			if _, ok := wl.(syncRoundTripper); !ok {
+				pool := newDirectCmdPool(cfg, provider)
+				return &Client{cfg: cfg, pool: pool}, nil
+			}
+		}
 	}
 	ownsLoop := cfg.Engine == nil
 	pool := newPool(cfg, provider, ownsLoop)

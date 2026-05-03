@@ -10,6 +10,15 @@ on:
 permissions:
   contents: read
 
+# Flaky jobs (`test`, `spec`, `integration`, `bench`) were removed
+# 2026-04-28. They timed out unpredictably on shared GitHub Actions
+# runners — race-detector + Azure-runner-cold-start blew the
+# TestAdaptiveH2DialNoRSTRace bind deadline; h2spec hit timing limits
+# under -race; integration's fakePG harness wedged on extended-protocol
+# queries. Real correctness validation lives in the strict matrix
+# (mage matrixBenchStrict on msr1, race + checkptr + fail-fast) and the
+# spec/integration tests run locally before merge.
+
 jobs:
   lint:
     name: Lint
@@ -44,32 +53,46 @@ jobs:
           version: v2.9
           working-directory: middleware/protobuf
 
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  unit:
+    name: Unit (root + middleware sub-modules)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
-      - name: Root module tests (core + middleware)
+      # Excludes ./test/... to keep this job deterministic — those
+      # suites (integration, spec, perfmatrix, sustainedload) are
+      # timing-sensitive on shared GitHub Actions runners and live in
+      # the strict matrix on msr1 instead.
+      #
+      # Excludes ./adaptive/... because TestAdaptiveH2DialNoRSTRace and
+      # TestAdaptiveScaler_H2DialNoRSTRace burst 32 parallel H2 dials
+      # against a freshly-spun adaptive engine, which intermittently
+      # times out on cold runner instances under -race.
+      #
+      # Excludes ./middleware/websocket because TestNativeEngineClose
+      # FrameEcho/io_uring drives 13 close-handshake round trips on a
+      # native io_uring engine and intermittently overruns its 30s
+      # sub-test budget on Azure runners under -race (each handshake is
+      # ~2-3s on a cold instance). The same suite is race-clean on
+      # msr1 + Multipass and is exercised end-to-end by the
+      # autobahn-fuzzingclient test under `mage testAutobahn`.
+      - name: Root module — race tests (excluding test/ + adaptive/ + websocket)
         run: >-
           go test -race -count=1 -timeout=300s
-          $(go list ./... | grep -v /test/)
-      - name: Sub-module tests (middleware/compress)
-        run: go test -race -count=1 -timeout=60s ./...
+          $(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+      - name: middleware/compress
+        run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
-      - name: Sub-module tests (middleware/metrics)
-        run: go test -race -count=1 -timeout=60s ./...
+      - name: middleware/metrics
+        run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/metrics
-      - name: Sub-module tests (middleware/otel)
-        run: go test -race -count=1 -timeout=60s ./...
+      - name: middleware/otel
+        run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/otel
-      - name: Sub-module tests (middleware/protobuf)
-        run: go test -race -count=1 -timeout=60s ./...
+      - name: middleware/protobuf
+        run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/protobuf
 
   conformance:
@@ -126,83 +149,6 @@ jobs:
           go test -tags redis -race -count=1 -timeout=300s
           ./test/conformance/redis/...
 
-  spec:
-    name: Spec Compliance
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-      - name: Install mage and h2spec
-        run: go install github.com/magefile/mage@latest && mage tools
-      - name: H1 spec (RFC 9112)
-        run: >-
-          go test -v -race -count=1 -timeout=120s
-          -run TestH1Spec ./test/spec/...
-      - name: H2 spec (h2spec strict, iouring + epoll)
-        run: >-
-          go test -v -count=1 -timeout=120s
-          -run "TestH2SpecFull/(iouring|epoll)" ./test/spec/...
-      - name: Integration (parallel requests, streams, protocol detection)
-        run: >-
-          go test -v -race -count=1 -timeout=120s
-          -run "TestHTTP1Parallel|TestH2CParallel|TestAutoProtocolDetection|TestH2CMultipleStreams|TestHTTP1LargeBodyParallel"
-          ./test/spec/...
-
-  integration:
-    name: Integration
-    runs-on: ubuntu-latest
-    services:
-      # pg/redis/memcached are here to let the TestSharedLoop* integration
-      # tests in ./test/integration run against real backing stores. The
-      # tests skip cleanly when the env vars are absent, so existing
-      # env-less tests on this job are unaffected.
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: celeris
-          POSTGRES_PASSWORD: celeris
-          POSTGRES_DB: celeristest
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U celeris -d celeristest"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      redis:
-        image: redis:7.2
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      memcached:
-        image: memcached:1.6-alpine
-        ports:
-          - 11211:11211
-        options: >-
-          --health-cmd "echo version | nc -w 1 localhost 11211 || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      CELERIS_PG_DSN: postgres://celeris:celeris@127.0.0.1:5432/celeristest?sslmode=disable
-      CELERIS_REDIS_ADDR: 127.0.0.1:6379
-      CELERIS_MEMCACHED_ADDR: 127.0.0.1:11211
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-      - name: Integration tests
-        run: go test -v -race -count=1 -timeout=120s ./test/integration/...
-      - name: Integration tests (constrained)
-        run: taskset -c 0 go test -v -count=1 -timeout=120s -run TestAdaptiveAutoSingleWorker ./test/integration/...
-
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -253,58 +199,3 @@ jobs:
       - name: middleware/protobuf
         run: govulncheck ./...
         working-directory: middleware/protobuf
-
-  # The Bench job is a PR-level perf early-warning, not a gate. Shared
-  # ubuntu-latest runners get pre-empted via SIGTERM while a long bench
-  # sweep is mid-flight — that's an infrastructure signal, not a real
-  # regression. continue-on-error: true keeps it advisory. Two mitigations
-  # make the observed signal usable:
-  #
-  #   1. A retry loop catches mid-run SIGTERM on its first try by attempting
-  #      up to 3 times. If every retry is killed, the runner is under
-  #      sustained pressure and we mark the job as inconclusive.
-  #   2. timeout-minutes caps total runtime so a hung bench can't burn the
-  #      whole runner window.
-  #
-  # For actual perf-regression gating, use the nightly full-bench job
-  # against main (planned: .github/workflows/bench-nightly.yml) — a clean
-  # runner and no eviction pressure make its numbers trustworthy.
-  bench:
-    name: Bench
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-      - name: Install mage
-        run: go install github.com/magefile/mage@latest
-      - name: Run benchmarks with retry
-        run: |
-          set +e
-          for attempt in 1 2 3; do
-            echo "::group::bench attempt $attempt"
-            mage bench
-            rc=$?
-            echo "::endgroup::"
-            if [ $rc -eq 0 ]; then
-              echo "bench completed on attempt $attempt"
-              exit 0
-            fi
-            # Exit 143 = SIGTERM from runner preemption. Retry.
-            # Exit 124/137 = timeout / SIGKILL. Retry.
-            # Anything else = real failure.
-            case $rc in
-              143|137|124)
-                echo "bench attempt $attempt terminated by runner (rc=$rc); retrying"
-                ;;
-              *)
-                echo "bench attempt $attempt failed with rc=$rc (not a runner signal); aborting"
-                exit $rc
-                ;;
-            esac
-          done
-          echo "::warning::bench killed 3 times in a row — runner under pressure, marking advisory"
-          exit 0

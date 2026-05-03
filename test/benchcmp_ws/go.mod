@@ -3,7 +3,7 @@ module github.com/goceleris/celeris/test/benchcmp_ws
 go 1.26.0
 
 require (
-	github.com/goceleris/celeris v1.3.3
+	github.com/goceleris/celeris v1.4.1
 	github.com/gorilla/websocket v1.5.3
 )
 

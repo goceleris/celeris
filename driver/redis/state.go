@@ -185,6 +185,14 @@ type redisState struct {
 	syncPipeReqs []*redisRequest
 	syncPipeIdx  int
 
+	// multiPollLastReq is the last request in the current sync pipeline
+	// batch — read by the cached pollIsDone method value to break out of
+	// the WriteAndPollMulti spin once the terminal response is parsed.
+	// Set by execManyCore immediately before WriteAndPollMulti and cleared
+	// in pollBeforeRearm. A field (rather than a per-call closure capture)
+	// keeps the func() bool / func() callbacks alloc-free.
+	multiPollLastReq *redisRequest
+
 	// copySlab is a single contiguous buffer used by copyValueSlab to batch
 	// all string copies during a sync pipeline dispatch. Instead of one
 	// allocation per response, all Str bytes are appended to this slab and
@@ -299,24 +307,36 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		req.resultErr = parseError(v.Str)
 		req.expect = expectNone
 		s.reader.Release(v)
-	} else if syncPipe && req.expect != expectNone {
+	} else if req.expect != expectNone {
 		// Direct-extraction fast path: extract the typed result without
 		// materializing a full protocol.Value copy. For scalar types (int,
 		// bool, float) this is zero-alloc. For string types only the final
 		// Go string is allocated (via slab), skipping the 120-byte Value.
+		//
+		// Safe in non-syncPipe (bridge) dispatch too: req.expect is only
+		// set to a non-None value by Pipeline.Exec (pipeline.go), which
+		// owns and resets the per-conn copySlab for the duration of the
+		// Exec call. A bridge dispatch with expect != expectNone is
+		// therefore always a pipeline tail-spillover (sync-pipe partial
+		// returned ok=false; pollBeforeRearm enqueued the remaining
+		// requests onto the bridge). Single-command paths (exec / Do /
+		// Get / Set / Incr) always leave expect at expectNone, so they
+		// keep the copyValueDetached fallback below.
 		s.extractDirect(req, v)
 		s.reader.Release(v)
 	} else {
-		// Detach the reply from the reader's internal buffer so the request
-		// remains valid across subsequent Feed/Compact cycles. Without this
-		// copy, a later chunk arriving on this conn can overwrite the
-		// backing array that an earlier reply's Str slice aliases — which
-		// manifests in pipelines as a reply that appears to carry the
-		// bytes of a later reply (e.g. "2\r" from ":2\r\n" overwriting
-		// "+OK\r\n").
+		// expect == expectNone: untyped path. Detach the reply from the
+		// reader's internal buffer so the request remains valid across
+		// subsequent Feed/Compact cycles. Without this copy, a later chunk
+		// arriving on this conn can overwrite the backing array that an
+		// earlier reply's Str slice aliases — which manifests in pipelines
+		// as a reply that appears to carry the bytes of a later reply
+		// (e.g. "2\r" from ":2\r\n" overwriting "+OK\r\n").
 		//
 		// For sync pipeline dispatch, use the slab-based copy which
-		// amortizes all string copies into one contiguous buffer.
+		// amortizes all string copies into one contiguous buffer (e.g.
+		// Pipeline cmds with kindArray, where kindToExpect returns
+		// expectNone).
 		if syncPipe {
 			req.result = s.copyValueSlab(v)
 		} else {
@@ -324,9 +344,6 @@ func (s *redisState) dispatch(v protocol.Value) error {
 		}
 		s.reader.Release(v)
 		req.owned = false
-		// Clear expect so the Exec copy loop knows a full Value was stored
-		// (not a direct-extracted typed result).
-		req.expect = expectNone
 	}
 	if syncPipe {
 		// Intermediate requests never need a signal — the caller reads their

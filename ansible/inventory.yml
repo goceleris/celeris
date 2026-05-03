@@ -1,0 +1,63 @@
+---
+# Cluster inventory for celeris benchmarking.
+#
+# Two address layers are tracked per host:
+#
+#   - inventory_hostname (the YAML key, e.g. "msa2-server"): used for
+#     ansible's SSH connection. Resolves via the Mac's resolver, which
+#     goes through Tailscale MagicDNS → tailnet IP. Reliable for
+#     orchestration even if the LAN reservation changes.
+#
+#   - lan_ip: LAN address pinned via DHCP reservation on the BD4 router.
+#     Used as the loadgen target so bench traffic flows over the 20G
+#     LACP fabric (NOT through Tailscale's WireGuard overlay). MagicDNS
+#     would otherwise rewrite all hostname forms — even `.lan` /
+#     `.local` — to the tailnet IP.
+#
+# `arch` is the GOARCH for cross-compiling binaries on the developer Mac.
+#
+# Update lan_ip here when you change a DHCP reservation. That's the only
+# place an IP appears in the cluster orchestration.
+all:
+  vars:
+    ansible_user: mini
+    # SSH-over-Tailscale survives bench load if we tune the keepalive
+    # aggressively. Default ConnectTimeout (10s) and ServerAlive (off)
+    # were dropping ControlMaster mid-bench when the host's CPU/network
+    # buffers were saturated. New settings:
+    #   ConnectTimeout=60         — slow handshake under load is OK
+    #   ServerAliveInterval=10    — heartbeat every 10s
+    #   ServerAliveCountMax=18    — survive ~3 minutes of dropped heartbeats
+    #   ControlPersist=600s       — long-lived ControlMaster across cells
+    #   TCPKeepAlive=yes          — kernel-level keepalive too
+    ansible_ssh_common_args: >-
+      -o ControlMaster=auto
+      -o ControlPersist=600s
+      -o ConnectTimeout=60
+      -o ServerAliveInterval=10
+      -o ServerAliveCountMax=18
+      -o TCPKeepAlive=yes
+      -o StrictHostKeyChecking=accept-new
+    ansible_command_timeout: 120
+    # All transient bench state lives under /tmp so a reboot wipes it.
+    bench_root: /tmp/celeris-bench
+    results_root: /tmp/celeris-results
+    manifest_path: /tmp/celeris-bench-manifest.json
+  children:
+    bench_targets:
+      hosts:
+        msa2-server:
+          lan_ip: 192.168.50.65
+          arch: amd64
+        msr1:
+          lan_ip: 192.168.50.199
+          arch: arm64
+    loadgen:
+      hosts:
+        msa2-client:
+          lan_ip: 192.168.50.195
+          arch: amd64
+    cluster:
+      children:
+        bench_targets:
+        loadgen:

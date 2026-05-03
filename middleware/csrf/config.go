@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // Config defines the CSRF middleware configuration.
@@ -73,7 +74,12 @@ type Config struct {
 	// When set, tokens are stored in the backend and validated against
 	// the store on unsafe methods. When nil, pure double-submit cookie
 	// mode is used.
-	Storage Storage
+	//
+	// For single-use tokens (SingleUseToken=true), backends that
+	// implement [store.GetAndDeleter] (Redis 6.2+, MemoryKV) provide
+	// TOCTOU-safe atomic fetch-and-delete; otherwise a non-atomic
+	// Get+Delete pair is used.
+	Storage store.KV
 
 	// Expiration is the token lifetime in server-side storage.
 	// Only used when Storage is set. Default: 1 hour.

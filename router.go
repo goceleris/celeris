@@ -2,6 +2,7 @@ package celeris
 
 import (
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 )
@@ -150,6 +151,9 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 	route := &Route{method: method, path: path, router: r}
 
 	if path == "/" {
+		if root.handlers != nil {
+			warnDuplicateRoute(method, "/")
+		}
 		root.handlers = handlers
 		root.fullPath = "/"
 		route.node = root
@@ -163,6 +167,9 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 	for _, seg := range segments {
 		current = insertChild(current, seg)
 	}
+	if current.handlers != nil {
+		warnDuplicateRoute(method, path)
+	}
 	current.handlers = handlers
 	current.fullPath = path
 	route.node = current
@@ -173,6 +180,16 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 	}
 
 	return route
+}
+
+// warnDuplicateRoute emits a warning when a route is registered twice for
+// the same method+path. The second registration silently overwrites the
+// first, which is almost always a bug (typo, accidental duplicate, or a
+// merge that kept two copies). We log instead of panicking to preserve
+// back-compat for apps that intentionally rebuild their routing table.
+func warnDuplicateRoute(method, path string) {
+	slog.Default().Warn("celeris: duplicate route registration; previous handler overwritten",
+		"method", method, "path", path)
 }
 
 // isStaticPath reports whether path contains no parameter (`:`) or catchAll

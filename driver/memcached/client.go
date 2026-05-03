@@ -57,6 +57,18 @@ func NewClient(addr string, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// WithEngine on an engine whose WorkerLoop doesn't implement
+	// syncRoundTripper (io_uring, epoll today) can deadlock any future
+	// multi-roundtrip handshake (e.g. SASL): the handler goroutine is
+	// LockOSThread'd to the engine worker, so a wait() blocks the M and
+	// the reply CQE never drains. Fall back to direct mode, which parks
+	// locked-M Gs cleanly through Go netpoll.
+	if wl := provider.WorkerLoop(0); wl != nil {
+		if _, ok := wl.(syncRoundTripper); !ok {
+			pool := newDirectPool(cfg)
+			return &Client{cfg: cfg, pool: pool}, nil
+		}
+	}
 	ownsLoop := false
 	pool := newPool(cfg, provider, ownsLoop)
 	return &Client{cfg: cfg, pool: pool}, nil

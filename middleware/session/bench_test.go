@@ -6,6 +6,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 func BenchmarkSessionNew(b *testing.B) {
@@ -26,13 +27,14 @@ func BenchmarkSessionNew(b *testing.B) {
 }
 
 func BenchmarkSessionExisting(b *testing.B) {
-	store := NewMemoryStore()
+	kv := NewMemoryStore()
 	mw := New(Config{
-		Store:        store,
+		Store:        kv,
 		KeyGenerator: func() string { return "bench-session-id" },
 	})
-	// Pre-populate store.
-	_ = store.Save(context.Background(), "bench-session-id", map[string]any{"user": "admin"}, 0)
+	// Pre-populate store with an encoded session blob.
+	buf, _ := store.EncodeJSON(map[string]any{"user": "admin"})
+	_ = kv.Set(context.Background(), "bench-session-id", buf, 0)
 
 	noop := func(c *celeris.Context) error {
 		s := FromContext(c)
@@ -53,23 +55,24 @@ func BenchmarkSessionExisting(b *testing.B) {
 }
 
 func BenchmarkMemoryStoreGet(b *testing.B) {
-	store := NewMemoryStore()
+	kv := NewMemoryStore()
 	ctx := context.Background()
-	_ = store.Save(ctx, "bench-id", map[string]any{"k": "v"}, 0)
+	buf, _ := store.EncodeJSON(map[string]any{"k": "v"})
+	_ = kv.Set(ctx, "bench-id", buf, 0)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		_, _ = store.Get(ctx, "bench-id")
+		_, _ = kv.Get(ctx, "bench-id")
 	}
 }
 
 func BenchmarkMemoryStoreSave(b *testing.B) {
-	store := NewMemoryStore()
+	kv := NewMemoryStore()
 	ctx := context.Background()
-	data := map[string]any{"k": "v"}
+	buf, _ := store.EncodeJSON(map[string]any{"k": "v"})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		_ = store.Save(ctx, "bench-id", data, 0)
+		_ = kv.Set(ctx, "bench-id", buf, 0)
 	}
 }

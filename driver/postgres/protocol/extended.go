@@ -289,11 +289,27 @@ func (e *ExtendedQueryState) Reset() {
 	}
 }
 
-// Handle consumes one server message. onRow is called for each DataRow;
-// payload alias rules match SimpleQueryState.
+// ExtendedQueryObserver is the dispatch sink for [ExtendedQueryState.Handle].
+// Same rationale as [SimpleQueryObserver]: passing an interface lets the
+// caller share an allocation-free dispatch object across many Handle
+// invocations. nil disables per-row dispatch.
+type ExtendedQueryObserver interface {
+	OnRow(fields [][]byte)
+}
+
+// ExtendedHandleCallback adapts a function value into an
+// [ExtendedQueryObserver] for callers (e.g. tests) that prefer closure
+// semantics. Allocates a function pointer per construction.
+type ExtendedHandleCallback func([][]byte)
+
+// OnRow implements ExtendedQueryObserver.
+func (f ExtendedHandleCallback) OnRow(fields [][]byte) { f(fields) }
+
+// Handle consumes one server message. obs may be nil to disable per-row
+// dispatch. Payload alias rules match SimpleQueryState.
 func (e *ExtendedQueryState) Handle(
 	msgType byte, payload []byte,
-	onRow func([][]byte),
+	obs ExtendedQueryObserver,
 ) (bool, error) {
 	if !e.init {
 		if e.SkipParse {
@@ -376,8 +392,8 @@ func (e *ExtendedQueryState) Handle(
 			return false, err
 		}
 		e.fieldScratch = fields
-		if onRow != nil {
-			onRow(fields)
+		if obs != nil {
+			obs.OnRow(fields)
 		}
 		return false, nil
 	case BackendCommandComplete:

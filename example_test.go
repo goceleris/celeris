@@ -354,3 +354,40 @@ func ExampleContext_AcceptsEncodings() {
 	fmt.Println(ctx.AcceptsEncodings("br", "gzip"))
 	// Output: gzip
 }
+
+func ExampleContext_RequestID() {
+	ctx, _ := celeristest.NewContext("GET", "/orders")
+	defer celeristest.ReleaseContext(ctx)
+
+	// Typically set by the requestid middleware; callers read it with
+	// c.RequestID() (zero-alloc) or c.Get(celeris.RequestIDKey) for
+	// back-compat.
+	ctx.SetRequestID("req-abc-123")
+
+	fmt.Println(ctx.RequestID())
+	v, _ := ctx.Get(celeris.RequestIDKey)
+	fmt.Println(v)
+	// Output:
+	// req-abc-123
+	// req-abc-123
+}
+
+func ExampleContext_SetString() {
+	ctx, _ := celeristest.NewContext("GET", "/tenant-api")
+	defer celeristest.ReleaseContext(ctx)
+
+	// Auth middleware stores a string without paying the interface-box
+	// cost of c.Set(key, value).
+	ctx.SetString("tenantID", "acme-prod")
+
+	s, ok := ctx.GetString("tenantID")
+	fmt.Println(ok, s)
+
+	// c.Get still returns the same value — the typed store composes
+	// with the any-typed store so downstream code keeps working.
+	v, _ := ctx.Get("tenantID")
+	fmt.Println(v)
+	// Output:
+	// true acme-prod
+	// acme-prod
+}

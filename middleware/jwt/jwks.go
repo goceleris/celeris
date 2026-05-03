@@ -1,13 +1,17 @@
 package jwt
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +21,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/middleware/jwt/internal/jwtparse"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 type jwksFetcher struct {
@@ -27,6 +32,20 @@ type jwksFetcher struct {
 	lastFetch time.Time
 	refresh   time.Duration
 	refreshMu sync.Mutex // guards fetch; only one goroutine fetches at a time
+
+	// cache is an optional shared JWKS response cache; when non-nil,
+	// fetch() checks the cache before issuing HTTP GET and writes back
+	// on success. Cache operations are best-effort; any error from the
+	// cache layer is logged and non-fatal.
+	cache store.KV
+}
+
+// cacheKey returns the store.KV key used for this fetcher's JWKS URL.
+// Hashing the URL avoids embedding secrets/tokens that may be present
+// in query strings and keeps keys bounded in length.
+func (f *jwksFetcher) cacheKey() string {
+	h := sha256.Sum256([]byte(f.url))
+	return "jwks:" + hex.EncodeToString(h[:])
 }
 
 func newJWKSFetcher(url string, refresh time.Duration) *jwksFetcher {
@@ -93,6 +112,20 @@ type jwksResponse struct {
 }
 
 func (f *jwksFetcher) fetch() error {
+	// Try the shared cache first. On hit, decode and install keys without
+	// an HTTP round trip. Cache errors (including ErrNotFound) fall
+	// through to the live fetch.
+	if f.cache != nil {
+		if body, err := f.cache.Get(context.Background(), f.cacheKey()); err == nil && len(body) > 0 {
+			if installErr := f.installKeysFromBody(body); installErr == nil {
+				return nil
+			}
+			// Fall through: cached body unparseable; go live.
+		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.Printf("jwt: JWKS cache read failed for %s: %v", f.url, err)
+		}
+	}
+
 	resp, err := f.client.Get(f.url)
 	if err != nil {
 		return err
@@ -106,6 +139,17 @@ func (f *jwksFetcher) fetch() error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
 	if err != nil {
 		return err
+	}
+
+	// Write-through the raw JSON to the cache for other instances.
+	if f.cache != nil {
+		ttl := f.refresh
+		if ttl <= 0 {
+			ttl = time.Hour
+		}
+		if serr := f.cache.Set(context.Background(), f.cacheKey(), body, ttl); serr != nil {
+			log.Printf("jwt: JWKS cache write failed for %s: %v", f.url, serr)
+		}
 	}
 
 	var jwks jwksResponse
@@ -154,6 +198,47 @@ func (f *jwksFetcher) fetch() error {
 	f.lastFetch = time.Now()
 	f.mu.Unlock()
 
+	return nil
+}
+
+// installKeysFromBody parses a raw JWKS JSON blob and installs it under
+// f.mu. Split out from [fetch] so cache hits can reuse the parse path
+// without duplicating RSA/EC/OKP decoding.
+func (f *jwksFetcher) installKeysFromBody(body []byte) error {
+	var jwks jwksResponse
+	if err := json.Unmarshal(body, &jwks); err != nil {
+		return fmt.Errorf("jwt: invalid JWKS JSON: %w", err)
+	}
+	newKeys := make(map[string]any, len(jwks.Keys))
+	for _, key := range jwks.Keys {
+		use, _ := key["use"].(string)
+		if use != "" && use != "sig" {
+			continue
+		}
+		kid, _ := key["kid"].(string)
+		if kid == "" && len(jwks.Keys) > 1 {
+			continue
+		}
+		kty, _ := key["kty"].(string)
+		switch kty {
+		case "RSA":
+			if pub, err := parseRSAKey(key); err == nil {
+				newKeys[kid] = pub
+			}
+		case "EC":
+			if pub, err := parseECKey(key); err == nil {
+				newKeys[kid] = pub
+			}
+		case "OKP":
+			if pub, err := parseOKPKey(key); err == nil {
+				newKeys[kid] = pub
+			}
+		}
+	}
+	f.mu.Lock()
+	f.keys = newKeys
+	f.lastFetch = time.Now()
+	f.mu.Unlock()
 	return nil
 }
 

@@ -631,6 +631,17 @@ func (p *Pipeline) Set(key string, value any, expiration time.Duration) *StatusC
 	return p.newStatusCmd(p.addCmd(kindStatus, p.argsScratch...))
 }
 
+// SetBytes is the allocation-lean variant of [Pipeline.Set] — uses
+// unsafe.String to avoid the argify string(x) copy.
+func (p *Pipeline) SetBytes(key string, value []byte, expiration time.Duration) *StatusCmd {
+	if expiration <= 0 {
+		return p.newStatusCmd(p.addCmd3(kindStatus, "SET", key, unsafeStringFromBytes(value)))
+	}
+	p.argsScratch = append(p.argsScratch[:0], "SET", key, unsafeStringFromBytes(value))
+	p.argsScratch = appendExpire(p.argsScratch, expiration)
+	return p.newStatusCmd(p.addCmd(kindStatus, p.argsScratch...))
+}
+
 // Del enqueues DEL.
 func (p *Pipeline) Del(keys ...string) *IntCmd {
 	if len(keys) == 1 {

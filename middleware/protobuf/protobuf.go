@@ -1,7 +1,6 @@
 package protobuf
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,7 +68,7 @@ func bindProtoBufWith(c *celeris.Context, v proto.Message, opts proto.UnmarshalO
 		return celeris.ErrEmptyBody
 	}
 	if err := opts.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidProtoBuf, err)
+		return &wrapErr{outer: ErrInvalidProtoBuf, inner: err}
 	}
 	return nil
 }

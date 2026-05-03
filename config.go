@@ -154,6 +154,17 @@ type Config struct {
 	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
 	//     the engine intentionally only serves HTTP/1.
 	EnableH2Upgrade *bool
+
+	// WorkerScaling configures the dynamic worker scaler. Nil disables
+	// scaling — the engine runs Workers workers all the time (legacy
+	// behaviour). Set to a non-nil pointer (zero-value struct OK) to
+	// enable scaling with sensible defaults; see resource.WorkerScalingConfig
+	// for tuning. The scaler keeps connections-per-active-worker around
+	// the target ratio by pausing/resuming workers; this dramatically
+	// improves CQE/event batching at low/mid concurrency where the static
+	// numCPU default would otherwise lose 30-90 % CPU/req to under-batched
+	// syscalls. See PR #257 for the full rationale and benchmark data.
+	WorkerScaling *resource.WorkerScalingConfig
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
@@ -204,6 +215,7 @@ func (c Config) toResourceConfig() resource.Config {
 	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
+	rc.WorkerScaling = c.WorkerScaling
 
 	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
 	// HTTP1/H2C → false). Non-nil → user override honored verbatim.

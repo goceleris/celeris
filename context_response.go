@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/goceleris/celeris/internal/negotiate"
@@ -79,9 +81,29 @@ func (c *Context) StatusBlob(contentType string, data []byte) error {
 	return c.Blob(c.statusCode, contentType, data)
 }
 
+// jsonFastBufPool backs the reflection-free fast path in [Context.JSON]
+// for common API response shapes (map[string]string with ASCII-safe
+// values). c.Blob either copies the payload into capturedBody
+// (buffered mode) or writes it synchronously to the stream, so the
+// buffer is always safe to recycle once Blob returns.
+var jsonFastBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
+
 // JSON serializes v as JSON and writes it with the given status code.
 // Returns ErrResponseWritten if a response has already been sent.
 func (c *Context) JSON(code int, v any) error {
+	// Fast path: primitive/map/slice shapes the reflection-free
+	// encoder can emit byte-identically to stdlib encoding/json.
+	// Nested maps and slices are supported recursively — covers the
+	// bulk of JSON-over-HTTP traffic (status envelopes, list endpoints,
+	// {"data": [...]} shapes). See jsonSafeValue for the whitelist.
+	if jsonSafeValue(v) {
+		bp := jsonFastBufPool.Get().(*[]byte)
+		buf := appendJSONValue((*bp)[:0], v)
+		err := c.Blob(code, "application/json", buf)
+		*bp = buf
+		jsonFastBufPool.Put(bp)
+		return err
+	}
 	js := jsonEncPool.Get().(*jsonState)
 	js.buf.Reset()
 	if err := js.enc.Encode(v); err != nil {
@@ -95,6 +117,394 @@ func (c *Context) JSON(code int, v any) error {
 	err := c.Blob(code, "application/json", b)
 	jsonEncPool.Put(js)
 	return err
+}
+
+// jsonFastMaxKeys caps the number of entries the map fast paths
+// handle. Keeps the key-sort stack buffer finite; larger maps fall
+// back to encoding/json. Captures the 99th percentile of status /
+// error / info response shapes.
+const jsonFastMaxKeys = 16
+
+// jsonSafeValue reports whether v and all nested values are shapes
+// and primitives the reflection-free encoder can emit byte-identically
+// to stdlib encoding/json. Floats, non-ASCII strings, maps with >16
+// keys, and anything outside the explicit whitelist fall through to
+// encoding/json — the fast path never emits a divergent byte.
+func jsonSafeValue(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return true
+	case string:
+		return jsonClassifyString(x) != jsonStringBail
+	case int, int8, int16, int32, int64,
+		uint8, uint16, uint32, uint, uint64, uintptr:
+		return true
+	case float32:
+		f := float64(x)
+		return !math.IsNaN(f) && !math.IsInf(f, 0)
+	case float64:
+		return !math.IsNaN(x) && !math.IsInf(x, 0)
+	case map[string]string:
+		if len(x) > jsonFastMaxKeys {
+			return false
+		}
+		for k, v := range x {
+			// Keys must be verbatim-safe (we don't escape keys); values
+			// can use the escape emitter.
+			if !jsonIsSafeASCII(k) || jsonClassifyString(v) == jsonStringBail {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		if len(x) > jsonFastMaxKeys {
+			return false
+		}
+		for k, v := range x {
+			if !jsonIsSafeASCII(k) || !jsonSafeValue(v) {
+				return false
+			}
+		}
+		return true
+	case []string:
+		for i := range x {
+			if jsonClassifyString(x[i]) == jsonStringBail {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for i := range x {
+			if !jsonSafeValue(x[i]) {
+				return false
+			}
+		}
+		return true
+	case []int, []int64, []bool, []uint64:
+		// Element types that emit byte-identically via strconv.Append*
+		// / "true"/"false". No per-element safety check needed.
+		return true
+	default:
+		_ = x
+		return false
+	}
+}
+
+// appendJSONValue emits v's JSON encoding into dst. Caller must have
+// verified v via jsonSafeValue — any other input results in undefined
+// output. Output is byte-identical to what encoding/json with
+// SetEscapeHTML(false) would produce.
+func appendJSONValue(dst []byte, v any) []byte {
+	switch x := v.(type) {
+	case nil:
+		return append(dst, "null"...)
+	case bool:
+		if x {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	case string:
+		return appendJSONString(dst, x)
+	case int:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int8:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int16:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int32:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int64:
+		return strconv.AppendInt(dst, x, 10)
+	case uint8:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint16:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint32:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint64:
+		return strconv.AppendUint(dst, x, 10)
+	case uintptr:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case float32:
+		return appendJSONFloat(dst, float64(x))
+	case float64:
+		return appendJSONFloat(dst, x)
+	case map[string]string:
+		var keyBuf [jsonFastMaxKeys]string
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sortJSONKeys(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':')
+			dst = appendJSONString(dst, x[k])
+		}
+		return append(dst, '}')
+	case map[string]any:
+		var keyBuf [jsonFastMaxKeys]string
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sortJSONKeys(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':')
+			dst = appendJSONValue(dst, x[k])
+		}
+		return append(dst, '}')
+	case []string:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, s := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONString(dst, s)
+		}
+		return append(dst, ']')
+	case []any:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, e := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONValue(dst, e)
+		}
+		return append(dst, ']')
+	case []int:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendInt(dst, int64(n), 10)
+		}
+		return append(dst, ']')
+	case []int64:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendInt(dst, n, 10)
+		}
+		return append(dst, ']')
+	case []uint64:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendUint(dst, n, 10)
+		}
+		return append(dst, ']')
+	case []bool:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, b := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			if b {
+				dst = append(dst, "true"...)
+			} else {
+				dst = append(dst, "false"...)
+			}
+		}
+		return append(dst, ']')
+	}
+	return dst
+}
+
+// sortJSONKeys is an in-place insertion sort for the small key slices
+// the JSON fast paths produce (≤ jsonFastMaxKeys = 16 entries). Avoids
+// the interface-conversion heap alloc that sort.Strings would require
+// and is competitive with quicksort at these sizes.
+func sortJSONKeys(keys []string) {
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+}
+
+// appendJSONFloat emits f using stdlib encoding/json's format rules:
+// 'f' notation inside [1e-6, 1e21) and 'e' outside. The exponent
+// gets stdlib's "e-09 → e-9" cleanup pass. Caller must have
+// excluded NaN/Inf via jsonSafeValue.
+func appendJSONFloat(dst []byte, f float64) []byte {
+	abs := math.Abs(f)
+	format := byte('f')
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	start := len(dst)
+	dst = strconv.AppendFloat(dst, f, format, -1, 64)
+	if format == 'e' {
+		n := len(dst)
+		if n-start >= 4 && dst[n-4] == 'e' && dst[n-3] == '-' && dst[n-2] == '0' {
+			dst[n-2] = dst[n-1]
+			dst = dst[:n-1]
+		}
+	}
+	return dst
+}
+
+// appendJSONString writes s as a JSON-quoted string with stdlib-
+// compatible escaping for ", \, control characters, and the
+// U+2028/U+2029 separators. Callers must have classified s as
+// non-bail via jsonClassifyString — invalid UTF-8 inputs produce
+// divergent output vs stdlib here.
+//
+// Runs of unescaped bytes are appended as a single span, so the
+// common case (no escapes at all) costs a single append plus the
+// two quote bytes.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		b := s[i]
+		// ASCII escape-needing bytes: < 0x20, " (0x22), \ (0x5C).
+		// 0x7F (DEL) is NOT escaped by stdlib under SetEscapeHTML(false),
+		// so we pass it through verbatim.
+		if b < 0x80 {
+			if b < 0x20 || b == '"' || b == '\\' {
+				dst = append(dst, s[start:i]...)
+				dst = appendJSONEscapeByte(dst, b)
+				i++
+				start = i
+				continue
+			}
+			i++
+			continue
+		}
+		// U+2028 (E2 80 A8) / U+2029 (E2 80 A9) — stdlib escapes even
+		// with HTML off. Detect without full UTF-8 decode.
+		if b == 0xE2 && i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xA8 || s[i+2] == 0xA9) {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, '\\', 'u', '2', '0', '2')
+			if s[i+2] == 0xA8 {
+				dst = append(dst, '8')
+			} else {
+				dst = append(dst, '9')
+			}
+			i += 3
+			start = i
+			continue
+		}
+		// Any other 0x80+ byte is a valid UTF-8 continuation/lead
+		// (classified non-bail by caller); emit verbatim.
+		i++
+	}
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+
+// appendJSONEscapeByte writes the stdlib-compatible escape for a
+// single byte known to require escaping (< 0x20, ", or \).
+func appendJSONEscapeByte(dst []byte, b byte) []byte {
+	switch b {
+	case '"':
+		return append(dst, '\\', '"')
+	case '\\':
+		return append(dst, '\\', '\\')
+	case '\n':
+		return append(dst, '\\', 'n')
+	case '\r':
+		return append(dst, '\\', 'r')
+	case '\t':
+		return append(dst, '\\', 't')
+	case '\b':
+		return append(dst, '\\', 'b')
+	case '\f':
+		return append(dst, '\\', 'f')
+	}
+	const hex = "0123456789abcdef"
+	return append(dst, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xF])
+}
+
+// jsonStringClass classifies how s can participate in the fast path.
+const (
+	jsonStringVerbatim = iota // emit as-is between quotes, no escaping
+	jsonStringEscape          // needs byte-level escaping but still fast
+	jsonStringBail            // invalid UTF-8; fall back to encoding/json
+)
+
+// jsonClassifyString returns jsonStringVerbatim when s is printable
+// ASCII + valid UTF-8 with no escape-triggering bytes, jsonStringEscape
+// when s is valid UTF-8 but contains " / \ / control chars /
+// U+2028 / U+2029 (which appendJSONEscapedString handles), and
+// jsonStringBail when s contains invalid UTF-8 (stdlib emits \ufffd
+// for each invalid byte — cheaper to fall back than to replicate).
+func jsonClassifyString(s string) int {
+	kind := jsonStringVerbatim
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b < 0x20 || b == '"' || b == '\\' {
+			kind = jsonStringEscape
+			i++
+			continue
+		}
+		if b < 0x80 {
+			// Printable ASCII and 0x7F: both pass through without
+			// escaping under SetEscapeHTML(false).
+			i++
+			continue
+		}
+		// Multi-byte UTF-8: validate and check for U+2028 / U+2029
+		// (the only non-ASCII runes stdlib still escapes with HTML
+		// off). Invalid UTF-8 bails — stdlib emits \ufffd for each
+		// invalid byte and that format is awkward to replicate.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return jsonStringBail
+		}
+		if r == 0x2028 || r == 0x2029 {
+			kind = jsonStringEscape
+		}
+		i += size
+	}
+	return kind
+}
+
+// jsonIsSafeASCII (legacy shim) returns true iff s is verbatim-safe.
+// The broader classification is jsonClassifyString; existing callers
+// (map/slice key scans) only care about the boolean answer.
+func jsonIsSafeASCII(s string) bool {
+	return jsonClassifyString(s) == jsonStringVerbatim
 }
 
 // XML serializes v as XML and writes it with the given status code.
@@ -153,6 +563,18 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		c.capturedStatus = code
 		c.capturedType = contentType
 	}
+	// Skip the stripCRLF function call when the contentType is already
+	// clean (the dominant case — handlers pass string literals like
+	// "application/json"). Inline the ContainsAny check so the common
+	// path is one branch + zero allocations.
+	ct := contentType
+	for i := 0; i < len(contentType); i++ {
+		b := contentType[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			ct = stripCRLF(contentType)
+			break
+		}
+	}
 	nUser := len(c.respHeaders)
 	total := nUser + 2
 	var headers [][2]string
@@ -163,12 +585,12 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		var tmp [14][2]string
 		copy(tmp[:nUser], c.respHeaders)
 		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
-		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
+		headers = append(headers, [2]string{"content-type", ct})
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, tmp[:nUser]...)
 	} else {
 		headers = make([][2]string, 0, total)
-		headers = append(headers, [2]string{"content-type", stripCRLF(contentType)})
+		headers = append(headers, [2]string{"content-type", ct})
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, c.respHeaders...)
 	}
@@ -230,6 +652,53 @@ func (c *Context) SetHeader(key, value string) {
 		}
 	}
 	c.respHeaders = append(c.respHeaders, [2]string{k, v})
+}
+
+// SetHeaderTrust replaces an existing header with the same key (or
+// appends a new one if absent) without sanitizing key or value. The
+// caller MUST guarantee:
+//
+//   - key is lowercase ASCII (no characters in [A-Z]) and contains no
+//     CR, LF, or NUL bytes
+//   - value contains no CR, LF, or NUL bytes
+//
+// Compared to [Context.SetHeader] this skips the byte-by-byte
+// sanitization scan; compared to [Context.AppendRespHeader] it keeps
+// the linear dedup walk so callers do not need to assert that a
+// matching key cannot already be present.
+//
+// Use [Context.SetHeader] when any of these invariants might not hold.
+// Suitable for middleware that emits a single header per request from
+// validated input (e.g. request-id middleware writing a generated UUID
+// under a config-validated header name).
+func (c *Context) SetHeaderTrust(key, value string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			c.respHeaders[i][1] = value
+			return
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{key, value})
+}
+
+// AppendRespHeader appends a response header without sanitization or
+// dedup walk. The caller MUST guarantee:
+//
+//   - key is lowercase ASCII (no characters in [A-Z]) and contains no
+//     CR, LF, or NUL bytes
+//   - value contains no CR, LF, or NUL bytes
+//   - no header with the same key already exists on the response
+//
+// Intended for middleware that pre-validates static header pairs at
+// initialization (e.g. the secure-headers middleware emitting fixed
+// X-Frame-Options / X-Content-Type-Options / etc.) so the per-request
+// hot path skips the byte-by-byte sanitization scan and the linear
+// dedup walk that [Context.SetHeader] performs.
+//
+// Use [Context.SetHeader] when any of these invariants might not hold
+// — it is the safe default.
+func (c *Context) AppendRespHeader(key, value string) {
+	c.respHeaders = append(c.respHeaders, [2]string{key, value})
 }
 
 // AddHeader appends a response header value. Unlike SetHeader, it does not
@@ -337,44 +806,48 @@ func stripCookieUnsafe(s string) string {
 // Semicolons in Name, Value, Path, and Domain are stripped to prevent
 // cookie attribute injection.
 func (c *Context) SetCookie(cookie *Cookie) {
-	var b strings.Builder
-	b.Grow(128)
-	b.WriteString(stripCookieUnsafe(cookie.Name))
-	b.WriteByte('=')
-	b.WriteString(stripCookieUnsafe(cookie.Value))
+	// Typical Set-Cookie values are <200B (session/csrf tokens with path,
+	// max-age, flags). The 256-byte stack buffer holds the common case
+	// without heap; oversize cookies grow via append into heap.
+	var buf [256]byte
+	dst := buf[:0]
+	dst = append(dst, stripCookieUnsafe(cookie.Name)...)
+	dst = append(dst, '=')
+	dst = append(dst, stripCookieUnsafe(cookie.Value)...)
 	if cookie.Path != "" {
-		b.WriteString("; Path=")
-		b.WriteString(stripCookieUnsafe(cookie.Path))
+		dst = append(dst, "; Path="...)
+		dst = append(dst, stripCookieUnsafe(cookie.Path)...)
 	}
 	if cookie.Domain != "" {
-		b.WriteString("; Domain=")
-		b.WriteString(stripCookieUnsafe(cookie.Domain))
+		dst = append(dst, "; Domain="...)
+		dst = append(dst, stripCookieUnsafe(cookie.Domain)...)
 	}
 	if !cookie.Expires.IsZero() {
-		b.WriteString("; Expires=")
-		b.WriteString(cookie.Expires.UTC().Format(http.TimeFormat))
+		dst = append(dst, "; Expires="...)
+		dst = cookie.Expires.UTC().AppendFormat(dst, http.TimeFormat)
 	}
 	if cookie.MaxAge > 0 {
-		b.WriteString("; Max-Age=")
-		b.WriteString(strconv.Itoa(cookie.MaxAge))
+		dst = append(dst, "; Max-Age="...)
+		// AppendInt avoids strconv.Itoa's intermediate string alloc.
+		dst = strconv.AppendInt(dst, int64(cookie.MaxAge), 10)
 	} else if cookie.MaxAge < 0 {
-		b.WriteString("; Max-Age=0")
+		dst = append(dst, "; Max-Age=0"...)
 	}
 	if cookie.HTTPOnly {
-		b.WriteString("; HttpOnly")
+		dst = append(dst, "; HttpOnly"...)
 	}
 	if cookie.Secure {
-		b.WriteString("; Secure")
+		dst = append(dst, "; Secure"...)
 	}
 	switch cookie.SameSite {
 	case SameSiteLaxMode:
-		b.WriteString("; SameSite=Lax")
+		dst = append(dst, "; SameSite=Lax"...)
 	case SameSiteStrictMode:
-		b.WriteString("; SameSite=Strict")
+		dst = append(dst, "; SameSite=Strict"...)
 	case SameSiteNoneMode:
-		b.WriteString("; SameSite=None")
+		dst = append(dst, "; SameSite=None"...)
 	}
-	c.AddHeader("set-cookie", b.String())
+	c.AddHeader("set-cookie", string(dst))
 }
 
 // File serves the named file. The content type is detected from the file
@@ -610,7 +1083,17 @@ func (c *Context) CaptureResponse() {
 // ResponseBody returns the captured response body, or nil if capture was not
 // enabled. Available after [Context.CaptureResponse] + c.Next(), or after
 // [Context.BufferResponse] + a response method (JSON, Blob, etc.).
-func (c *Context) ResponseBody() []byte { return c.capturedBody }
+func (c *Context) ResponseBody() []byte {
+	// The backing array of capturedBody persists across pool cycles for
+	// allocation reuse (see [Context.reset] — the slice header is reset
+	// to len=0 instead of nil when the cap fits the retention policy).
+	// Gate the return on the capture / buffered flags so callers who
+	// never opted into capture still observe nil.
+	if !c.captureBody && !c.buffered {
+		return nil
+	}
+	return c.capturedBody
+}
 
 // ResponseContentType returns the captured Content-Type, or "" if not captured.
 func (c *Context) ResponseContentType() string { return c.capturedType }
@@ -805,6 +1288,7 @@ func (c *Context) Detach() (done func()) {
 	// is reused for the next recv. Pseudo-header keys are string literals
 	// (safe), but their values (:authority, :path for non-"/" paths, :method
 	// for non-standard methods) may be UnsafeString backed by the buffer.
+	c.stream.MaterializeHeaders()
 	for i, h := range c.stream.Headers {
 		if len(h[0]) > 0 && h[0][0] == ':' {
 			c.stream.Headers[i][1] = strings.Clone(h[1])

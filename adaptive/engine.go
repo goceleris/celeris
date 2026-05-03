@@ -15,6 +15,7 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/epoll"
 	"github.com/goceleris/celeris/engine/iouring"
+	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -75,12 +76,20 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 
-	primary, err := epoll.New(cfg, handler)
+	// Suppress the per-engine built-in scaler in both sub-engines —
+	// adaptive runs ONE higher-level scaler that delegates to whichever
+	// sub-engine is currently active. Two scalers fighting over the same
+	// worker pool produced -54 % to +118 % variance on pinning tests
+	// during the spike-B exploration; gating this way eliminates that.
+	subCfg := cfg
+	subCfg.SkipBuiltinScaler = true
+
+	primary, err := epoll.New(subCfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("epoll sub-engine: %w", err)
 	}
 
-	secondary, err := iouring.New(cfg, handler)
+	secondary, err := iouring.New(subCfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
@@ -152,40 +161,72 @@ func (e *Engine) Listen(ctx context.Context) error {
 	})
 
 	// Wait for both engines to bind their addresses.
-	// io_uring may need multiple tier fallback attempts, so allow ample time.
+	// io_uring may need multiple tier fallback attempts, so allow ample time —
+	// but if either sub-engine has already returned an error to errCh
+	// (e.g. ENOMEM at io_uring_setup under low RLIMIT_MEMLOCK), surface it
+	// immediately instead of waiting out the deadline.
 	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		if e.primary.Addr() != nil && e.secondary.Addr() != nil {
-			break
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	bindWait := time.NewTimer(time.Until(deadline))
+	defer bindWait.Stop()
+	var startErr error
+bindLoop:
+	for e.primary.Addr() == nil || e.secondary.Addr() == nil {
+		select {
+		case startErr = <-errCh:
+			break bindLoop
+		case <-bindWait.C:
+			break bindLoop
+		case <-tick.C:
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 
+	if startErr != nil {
+		innerCancel()
+		wg.Wait()
+		return fmt.Errorf("sub-engine startup failed: %w", startErr)
+	}
 	if e.primary.Addr() == nil || e.secondary.Addr() == nil {
 		innerCancel()
 		wg.Wait()
-		return fmt.Errorf("sub-engines failed to initialize")
+		return fmt.Errorf("sub-engines failed to initialize within 20s deadline")
 	}
 
-	addr := e.primary.Addr()
-	e.addr.Store(&addr)
-
-	// Pause standby engine's accept. Read c.state.activeIsPrimary under
-	// switchMu to avoid racing with performSwitch → recordSwitch, which
-	// can fire from a concurrent ForceSwitch or controller tick before
-	// Listen finishes its own setup.
+	// Pause standby engine's accept BEFORE publishing Addr so the
+	// SO_REUSEPORT group only contains the active engine by the time
+	// callers start dialing. Without this gate, a burst of incoming
+	// connections in the window between secondary.Listen() succeeding
+	// and PauseAccept taking effect lands some dials on the standby's
+	// accept queue; closing that queue then RSTs them. H1 clients
+	// reconnect transparently but H2 prior-knowledge clients see the
+	// dial fail mid-handshake. Read c.state.activeIsPrimary under
+	// switchMu to avoid racing with performSwitch → recordSwitch (a
+	// concurrent ForceSwitch or controller tick can fire before Listen
+	// finishes its own setup).
 	e.switchMu.Lock()
 	activeIsPrimary := e.ctrl.state.activeIsPrimary
 	e.switchMu.Unlock()
 	if activeIsPrimary {
 		if ac, ok := e.secondary.(engine.AcceptController); ok {
-			_ = ac.PauseAccept()
+			if err := ac.PauseAccept(); err != nil {
+				innerCancel()
+				wg.Wait()
+				return fmt.Errorf("pause secondary: %w", err)
+			}
 		}
 	} else {
 		if ac, ok := e.primary.(engine.AcceptController); ok {
-			_ = ac.PauseAccept()
+			if err := ac.PauseAccept(); err != nil {
+				innerCancel()
+				wg.Wait()
+				return fmt.Errorf("pause primary: %w", err)
+			}
 		}
 	}
+
+	addr := e.primary.Addr()
+	e.addr.Store(&addr)
 
 	e.logger.Info("adaptive engine listening",
 		"addr", e.cfg.Addr,
@@ -196,6 +237,18 @@ func (e *Engine) Listen(ctx context.Context) error {
 	wg.Go(func() {
 		e.runEvalLoop(innerCtx)
 	})
+
+	// Start the higher-level dynamic worker scaler. This is the only
+	// worker scaler that runs in an adaptive setup — sub-engines have
+	// their built-in scalers suppressed via Config.SkipBuiltinScaler.
+	// Typed cfg.WorkerScaling takes precedence over env vars. The
+	// algorithm lives in engine/scaler; adaptive provides a switch-aware
+	// Source via adaptive/scaler.go.
+	if scalerCfg := scaler.Resolve(e.cfg, e.cfg.Resources.Resolve().Workers); scalerCfg.Enabled {
+		wg.Go(func() {
+			e.runScaler(innerCtx, scalerCfg)
+		})
+	}
 
 	select {
 	case <-ctx.Done():
@@ -236,18 +289,26 @@ func (e *Engine) performSwitch() {
 	// Driver FDs are pinned to whichever sub-engine's worker they were
 	// registered on — they cannot migrate across epoll ↔ io_uring. If any
 	// driver has live FDs we refuse the switch rather than orphan them.
-	// Hold freezeState for the entire swap so a concurrent acquireDriverFD
-	// either (a) observes the old active engine and registers on it before
-	// the swap starts, or (b) waits until after the swap lands and
-	// registers on the new active. There is no interleaving where a driver
-	// registers on the about-to-be-paused engine mid-swap.
+	// Hold freezeState while we (a) check the driver-FD count and
+	// (b) commit the active.Store swap, so a concurrent acquireDriverFD
+	// either observes the old active and registers on it before the
+	// swap, or waits until after active.Store lands and registers on
+	// the new active. We deliberately release freezeState BEFORE the
+	// final PauseAccept on the old active — synchronous PauseAccept can
+	// take O(ms) waiting for the loop to drain its listen queue, and
+	// holding freezeState across that wait blocks driver
+	// register/unregister flows long enough to trip their onClose
+	// timeouts (regression seen in TestAdaptiveConcurrentDriverChurnVsSwitch).
+	// Once active.Store has committed, no new driver registrations will
+	// land on the about-to-be-paused engine, so it's safe to drop the
+	// lock.
 	e.freezeState.Lock()
-	defer e.freezeState.Unlock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
 		e.logger.Warn("refusing engine switch: driver FDs still registered",
 			"driver_fds", e.driverFDs.Load(),
 		)
+		e.freezeState.Unlock()
 		return
 	}
 
@@ -274,15 +335,25 @@ func (e *Engine) performSwitch() {
 	if ac, ok := newActive.(engine.AcceptController); ok {
 		_ = ac.ResumeAccept()
 	}
-	if ac, ok := newStandby.(engine.AcceptController); ok {
-		_ = ac.PauseAccept()
-	}
 
 	eng := newActive
 	e.active.Store(&eng)
 	e.switchMu.Lock()
 	e.ctrl.recordSwitch(now)
 	e.switchMu.Unlock()
+
+	// Active has been committed — release freezeState so concurrent
+	// driver acquireDriverFD calls observe the new active and proceed.
+	e.freezeState.Unlock()
+
+	// Pause the old active. Inline (not in a goroutine) so unit tests
+	// observing pauseCalls right after performSwitch returns see the
+	// effect; PauseAccept itself caps its wait to 2s, but the
+	// freezeState release above means concurrent driver
+	// register/unregister flows are no longer blocked while we wait.
+	if ac, ok := newStandby.(engine.AcceptController); ok {
+		_ = ac.PauseAccept()
+	}
 
 	e.logger.Info("engine switch completed",
 		"now_active", newActive.Type().String(),

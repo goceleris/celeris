@@ -16,6 +16,14 @@ import (
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 )
 
+// Defaults for cluster failover behavior.
+const (
+	defaultFailureThreshold    uint32        = 2
+	defaultHealthProbeInterval time.Duration = 5 * time.Second
+	probeTimeout               time.Duration = 2 * time.Second
+	minProbeDelay              time.Duration = 1 * time.Second
+)
+
 // virtualNodesPerWeight is the number of ring points assigned to a node per
 // unit of weight. Matches libmemcached's default and the broader
 // ketama-compatible ecosystem (40 MD5 hashes × 4 ring points per digest).
@@ -52,6 +60,29 @@ type ClusterConfig struct {
 	// Engine hooks the cluster into a running celeris.Server's event loop.
 	// If nil, a standalone loop is resolved for each node client.
 	Engine eventloop.ServerProvider
+
+	// FailureThreshold is the number of consecutive infrastructure-level
+	// errors (dial failures, I/O errors, protocol corruption) that must
+	// be observed on a node before it is marked as failing and skipped
+	// by pickNode. Default: 2. A single transient blip must not reroute
+	// traffic; two consecutive errors is the libmemcached default.
+	//
+	// Protocol errors (ErrCacheMiss, ErrNotStored, ErrCASConflict,
+	// *MemcachedError) do NOT count toward the threshold — they are
+	// server responses to valid requests.
+	FailureThreshold uint32
+
+	// HealthProbeInterval is how often a background goroutine probes
+	// nodes marked as failing and clears the flag on success. Default:
+	// 5 seconds. Set to 0 to disable the background probe (passive
+	// healing on successful ops still applies).
+	HealthProbeInterval time.Duration
+
+	// MaxFailoverHops bounds the clockwise walk when the ring-assigned
+	// node is failing. Default: len(Addrs). Successor scans are O(n)
+	// in the number of nodes; this cap exists purely as a safety net
+	// against pathological inputs.
+	MaxFailoverHops int
 }
 
 // options materializes per-node [Option]s from the cluster config.
@@ -79,6 +110,25 @@ type clusterNode struct {
 	addr   string
 	weight uint32
 	client *Client
+
+	// failing is true when the node has exceeded FailureThreshold
+	// consecutive infrastructure errors. pickNode skips failing nodes.
+	failing atomic.Bool
+
+	// lastFailAt is the UnixNano of the last failing transition. Used
+	// by the probe goroutine to debounce probing immediately after a
+	// failure.
+	lastFailAt atomic.Int64
+
+	// consecutiveFails counts back-to-back infra errors. Reset to zero
+	// on any success.
+	consecutiveFails atomic.Int32
+
+	// index is the node's position in ClusterClient.nodes. Populated
+	// once at construction and used by pickNode for O(1) lookups when
+	// walking to a successor. Without it, pickNode would need to scan
+	// the nodes slice to locate the failing node.
+	index int
 }
 
 // ringPoint is one slot on the ketama ring. The ring is stored sorted by hash
@@ -106,6 +156,20 @@ type ClusterClient struct {
 	nodes  []*clusterNode // index order matches cfg.Addrs
 	ring   []ringPoint    // sorted by hash; built once at construction
 	closed atomic.Bool
+
+	// probeCancel stops the background health-probe goroutine. Nil
+	// when HealthProbeInterval <= 0.
+	probeCancel context.CancelFunc
+	// probeDone is closed by the probe goroutine on exit so Close
+	// can wait for it.
+	probeDone chan struct{}
+
+	// maxHops is the realized MaxFailoverHops value (copy from cfg,
+	// clamped to len(nodes) at construction).
+	maxHops int
+	// failureThreshold is the realized FailureThreshold (defaulted if
+	// the caller passed 0).
+	failureThreshold uint32
 }
 
 // NewClusterClient builds a ring across the given memcached endpoints. Each
@@ -165,9 +229,29 @@ func NewClusterClient(cfg ClusterConfig) (*ClusterClient, error) {
 			}
 			return nil, fmt.Errorf("celeris-memcached: dial %s: %w", addr, err)
 		}
-		nodes = append(nodes, &clusterNode{addr: addr, weight: weight, client: client})
+		nodes = append(nodes, &clusterNode{addr: addr, weight: weight, client: client, index: i})
 	}
 	c := &ClusterClient{cfg: cfg, nodes: nodes, ring: buildRing(nodes)}
+	c.failureThreshold = cfg.FailureThreshold
+	if c.failureThreshold == 0 {
+		c.failureThreshold = defaultFailureThreshold
+	}
+	c.maxHops = cfg.MaxFailoverHops
+	if c.maxHops <= 0 || c.maxHops > len(nodes) {
+		c.maxHops = len(nodes)
+	}
+
+	probeInterval := cfg.HealthProbeInterval
+	if probeInterval == 0 {
+		probeInterval = defaultHealthProbeInterval
+	}
+	if probeInterval > 0 {
+		pctx, cancel := context.WithCancel(context.Background())
+		c.probeCancel = cancel
+		c.probeDone = make(chan struct{})
+		go c.probeLoop(pctx, probeInterval)
+	}
+
 	return c, nil
 }
 
@@ -214,6 +298,21 @@ func hashKey(key string) uint32 {
 
 // pickNode returns the ring owner of key. The first ring point with
 // hash >= hashKey(key) wins, wrapping to ring[0] when no such point exists.
+//
+// When the ring-assigned node is currently marked as failing, pickNode
+// walks c.nodes clockwise from the failing node's index and returns the
+// first non-failing node it encounters. The walk is bounded by
+// MaxFailoverHops (default len(nodes)). If every node is failing, the
+// originally assigned node is returned so the resulting error
+// propagates to the caller rather than looping forever.
+//
+// Successor selection walks c.nodes (insertion order), NOT c.ring
+// positions. The ring contains ~160 points per unit weight per node,
+// so walking ring positions would cost O(virtual-nodes) hops to leave
+// a failing node's range; walking c.nodes is O(len(nodes)) at most.
+// This preserves the consistent-hash invariant that all keys formerly
+// routed to a failing node N now route to the same successor — not
+// scattered across the ring.
 func (c *ClusterClient) pickNode(key string) *clusterNode {
 	if len(c.ring) == 0 {
 		return nil
@@ -225,7 +324,21 @@ func (c *ClusterClient) pickNode(key string) *clusterNode {
 	if i == len(c.ring) {
 		i = 0
 	}
-	return c.ring[i].node
+	n := c.ring[i].node
+	if !n.failing.Load() {
+		return n
+	}
+	// Walk c.nodes forward looking for a healthy neighbor.
+	start := n.index
+	for hop := 1; hop <= c.maxHops; hop++ {
+		cand := c.nodes[(start+hop)%len(c.nodes)]
+		if !cand.failing.Load() {
+			return cand
+		}
+	}
+	// Every node is failing — return the originally assigned node so
+	// the caller sees the underlying error from the node's client.
+	return n
 }
 
 // NodeFor returns the addr of the node that key maps to. Exposed as a stable
@@ -255,6 +368,12 @@ func (c *ClusterClient) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	if c.probeCancel != nil {
+		c.probeCancel()
+	}
+	if c.probeDone != nil {
+		<-c.probeDone
+	}
 	var firstErr error
 	for _, n := range c.nodes {
 		if err := n.client.Close(); err != nil && firstErr == nil {
@@ -262,6 +381,122 @@ func (c *ClusterClient) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// NodeStats captures the health metadata the cluster tracks per node.
+// Used by diagnostic/monitoring code via [ClusterClient.NodeStats].
+type NodeStats struct {
+	Failing     bool
+	ConsecFails int32
+	LastFailAt  time.Time // zero when the node has never been marked failing
+}
+
+// NodeHealth returns a snapshot of each node's failing flag keyed by
+// address. Callers hold a copy; the map is safe to mutate.
+func (c *ClusterClient) NodeHealth() map[string]bool {
+	out := make(map[string]bool, len(c.nodes))
+	for _, n := range c.nodes {
+		out[n.addr] = n.failing.Load()
+	}
+	return out
+}
+
+// NodeStatsMap returns a snapshot of every node's [NodeStats]. Useful
+// for dashboards and readiness probes that want to distinguish "down"
+// nodes from healthy ones without peeking at atomics directly.
+func (c *ClusterClient) NodeStatsMap() map[string]NodeStats {
+	out := make(map[string]NodeStats, len(c.nodes))
+	for _, n := range c.nodes {
+		ns := NodeStats{
+			Failing:     n.failing.Load(),
+			ConsecFails: n.consecutiveFails.Load(),
+		}
+		if ts := n.lastFailAt.Load(); ts > 0 {
+			ns.LastFailAt = time.Unix(0, ts)
+		}
+		out[n.addr] = ns
+	}
+	return out
+}
+
+// recordResult updates the node's consecutive-failure counter and
+// toggles the failing flag based on err. Called after every client
+// operation dispatched through the cluster.
+//
+// Protocol errors (ErrCacheMiss, ErrNotStored, ErrCASConflict,
+// ErrInvalidCAS, *MemcachedError) are server responses to legitimate
+// requests and do NOT count as infrastructure failures.
+func (n *clusterNode) recordResult(err error, threshold uint32) {
+	if err == nil {
+		n.consecutiveFails.Store(0)
+		n.failing.Store(false)
+		return
+	}
+	if !isInfraError(err) {
+		// Reset on a "successful" protocol-level response — the server
+		// answered us coherently, so connectivity is fine.
+		n.consecutiveFails.Store(0)
+		n.failing.Store(false)
+		return
+	}
+	fails := n.consecutiveFails.Add(1)
+	if uint32(fails) >= threshold {
+		if n.failing.CompareAndSwap(false, true) {
+			n.lastFailAt.Store(time.Now().UnixNano())
+		}
+	}
+}
+
+// isInfraError returns true for errors that indicate an infrastructure
+// problem (connection/dial/I/O/protocol) rather than a protocol-level
+// server response.
+func isInfraError(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, ErrCacheMiss),
+		errors.Is(err, ErrNotStored),
+		errors.Is(err, ErrCASConflict),
+		errors.Is(err, ErrInvalidCAS),
+		errors.Is(err, ErrMalformedKey),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return false
+	}
+	var mcErr *MemcachedError
+	return !errors.As(err, &mcErr)
+}
+
+// probeLoop runs the background health probe. For each failing node
+// older than minProbeDelay, it issues a lightweight Version command
+// (the cheapest round trip) and clears the failing flag on success.
+func (c *ClusterClient) probeLoop(ctx context.Context, interval time.Duration) {
+	defer close(c.probeDone)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for _, n := range c.nodes {
+				if !n.failing.Load() {
+					continue
+				}
+				if time.Since(time.Unix(0, n.lastFailAt.Load())) < minProbeDelay {
+					continue
+				}
+				pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+				err := n.client.Ping(pctx)
+				cancel()
+				if err == nil {
+					n.consecutiveFails.Store(0)
+					n.failing.Store(false)
+				}
+			}
+		}
+	}
 }
 
 // isClosed is the standard guard at the top of every public API method.
@@ -278,7 +513,9 @@ func (c *ClusterClient) Get(ctx context.Context, key string) (string, error) {
 	if n == nil {
 		return "", ErrNoNodes
 	}
-	return n.client.Get(ctx, key)
+	v, err := n.client.Get(ctx, key)
+	n.recordResult(err, c.failureThreshold)
+	return v, err
 }
 
 // GetBytes forwards to the ring owner of key.
@@ -290,7 +527,9 @@ func (c *ClusterClient) GetBytes(ctx context.Context, key string) ([]byte, error
 	if n == nil {
 		return nil, ErrNoNodes
 	}
-	return n.client.GetBytes(ctx, key)
+	v, err := n.client.GetBytes(ctx, key)
+	n.recordResult(err, c.failureThreshold)
+	return v, err
 }
 
 // Set forwards to the ring owner of key.
@@ -302,7 +541,23 @@ func (c *ClusterClient) Set(ctx context.Context, key string, value any, ttl time
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Set(ctx, key, value, ttl)
+	err := n.client.Set(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
+}
+
+// SetBytes is the allocation-lean variant of [ClusterClient.Set].
+func (c *ClusterClient) SetBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return ErrNoNodes
+	}
+	err := n.client.SetBytes(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // Add forwards to the ring owner of key.
@@ -314,7 +569,23 @@ func (c *ClusterClient) Add(ctx context.Context, key string, value any, ttl time
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Add(ctx, key, value, ttl)
+	err := n.client.Add(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
+}
+
+// AddBytes is the allocation-lean variant of [ClusterClient.Add].
+func (c *ClusterClient) AddBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return ErrNoNodes
+	}
+	err := n.client.AddBytes(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // Replace forwards to the ring owner of key.
@@ -326,7 +597,23 @@ func (c *ClusterClient) Replace(ctx context.Context, key string, value any, ttl 
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Replace(ctx, key, value, ttl)
+	err := n.client.Replace(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
+}
+
+// ReplaceBytes is the allocation-lean variant of [ClusterClient.Replace].
+func (c *ClusterClient) ReplaceBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return ErrNoNodes
+	}
+	err := n.client.ReplaceBytes(ctx, key, value, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // Append forwards to the ring owner of key.
@@ -338,7 +625,9 @@ func (c *ClusterClient) Append(ctx context.Context, key, value string) error {
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Append(ctx, key, value)
+	err := n.client.Append(ctx, key, value)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // Prepend forwards to the ring owner of key.
@@ -350,7 +639,9 @@ func (c *ClusterClient) Prepend(ctx context.Context, key, value string) error {
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Prepend(ctx, key, value)
+	err := n.client.Prepend(ctx, key, value)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // CAS forwards to the ring owner of key.
@@ -362,7 +653,23 @@ func (c *ClusterClient) CAS(ctx context.Context, key string, value any, casID ui
 	if n == nil {
 		return false, ErrNoNodes
 	}
-	return n.client.CAS(ctx, key, value, casID, ttl)
+	ok, err := n.client.CAS(ctx, key, value, casID, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return ok, err
+}
+
+// CASBytes is the allocation-lean variant of [ClusterClient.CAS].
+func (c *ClusterClient) CASBytes(ctx context.Context, key string, value []byte, casID uint64, ttl time.Duration) (bool, error) {
+	if c.isClosed() {
+		return false, ErrClosed
+	}
+	n := c.pickNode(key)
+	if n == nil {
+		return false, ErrNoNodes
+	}
+	ok, err := n.client.CASBytes(ctx, key, value, casID, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return ok, err
 }
 
 // Delete forwards to the ring owner of key.
@@ -374,7 +681,9 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Delete(ctx, key)
+	err := n.client.Delete(ctx, key)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // Incr forwards to the ring owner of key.
@@ -386,7 +695,9 @@ func (c *ClusterClient) Incr(ctx context.Context, key string, delta uint64) (uin
 	if n == nil {
 		return 0, ErrNoNodes
 	}
-	return n.client.Incr(ctx, key, delta)
+	v, err := n.client.Incr(ctx, key, delta)
+	n.recordResult(err, c.failureThreshold)
+	return v, err
 }
 
 // Decr forwards to the ring owner of key.
@@ -398,7 +709,9 @@ func (c *ClusterClient) Decr(ctx context.Context, key string, delta uint64) (uin
 	if n == nil {
 		return 0, ErrNoNodes
 	}
-	return n.client.Decr(ctx, key, delta)
+	v, err := n.client.Decr(ctx, key, delta)
+	n.recordResult(err, c.failureThreshold)
+	return v, err
 }
 
 // Touch forwards to the ring owner of key.
@@ -410,7 +723,9 @@ func (c *ClusterClient) Touch(ctx context.Context, key string, ttl time.Duration
 	if n == nil {
 		return ErrNoNodes
 	}
-	return n.client.Touch(ctx, key, ttl)
+	err := n.client.Touch(ctx, key, ttl)
+	n.recordResult(err, c.failureThreshold)
+	return err
 }
 
 // Gets forwards to the ring owner of key.
@@ -422,7 +737,9 @@ func (c *ClusterClient) Gets(ctx context.Context, key string) (CASItem, error) {
 	if n == nil {
 		return CASItem{}, ErrNoNodes
 	}
-	return n.client.Gets(ctx, key)
+	item, err := n.client.Gets(ctx, key)
+	n.recordResult(err, c.failureThreshold)
+	return item, err
 }
 
 // ---------- multi-key fan-out ----------

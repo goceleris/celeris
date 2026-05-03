@@ -68,7 +68,9 @@ func validateKey(key string) error {
 }
 
 // asBytes converts a user-supplied value to its wire-level byte form. Used
-// by Set/Add/Replace/CAS/etc.
+// by Set/Add/Replace/CAS/etc. Numeric/float branches use strconv.Append* to
+// write straight into a fresh []byte, eliminating the intermediate string
+// allocation that strconv.Format* would produce.
 func asBytes(v any) ([]byte, error) {
 	switch x := v.(type) {
 	case []byte:
@@ -76,17 +78,17 @@ func asBytes(v any) ([]byte, error) {
 	case string:
 		return []byte(x), nil
 	case int:
-		return []byte(strconv.FormatInt(int64(x), 10)), nil
+		return strconv.AppendInt(nil, int64(x), 10), nil
 	case int64:
-		return []byte(strconv.FormatInt(x, 10)), nil
+		return strconv.AppendInt(nil, x, 10), nil
 	case int32:
-		return []byte(strconv.FormatInt(int64(x), 10)), nil
+		return strconv.AppendInt(nil, int64(x), 10), nil
 	case uint:
-		return []byte(strconv.FormatUint(uint64(x), 10)), nil
+		return strconv.AppendUint(nil, uint64(x), 10), nil
 	case uint64:
-		return []byte(strconv.FormatUint(x, 10)), nil
+		return strconv.AppendUint(nil, x, 10), nil
 	case uint32:
-		return []byte(strconv.FormatUint(uint64(x), 10)), nil
+		return strconv.AppendUint(nil, uint64(x), 10), nil
 	case float32:
 		return []byte(strconv.FormatFloat(float64(x), 'f', -1, 32)), nil
 	case float64:
@@ -169,6 +171,13 @@ func (c *Client) Set(ctx context.Context, key string, value any, ttl time.Durati
 	return c.storeCmd(ctx, "set", key, b, ttl)
 }
 
+// SetBytes is the allocation-lean variant of [Client.Set] for callers that
+// already have the value as bytes. Skips the `any` interface boxing and
+// the asBytes type switch — see the ratelimit/memcachedstore bench gap.
+func (c *Client) SetBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return c.storeCmd(ctx, "set", key, value, ttl)
+}
+
 // Add stores value at key only if the key does not already exist. Returns
 // [ErrNotStored] when the key is present.
 func (c *Client) Add(ctx context.Context, key string, value any, ttl time.Duration) error {
@@ -179,6 +188,11 @@ func (c *Client) Add(ctx context.Context, key string, value any, ttl time.Durati
 	return c.storeCmd(ctx, "add", key, b, ttl)
 }
 
+// AddBytes is the allocation-lean variant of [Client.Add]. See [Client.SetBytes].
+func (c *Client) AddBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return c.storeCmd(ctx, "add", key, value, ttl)
+}
+
 // Replace stores value at key only if the key already exists. Returns
 // [ErrNotStored] when the key is missing.
 func (c *Client) Replace(ctx context.Context, key string, value any, ttl time.Duration) error {
@@ -187,6 +201,11 @@ func (c *Client) Replace(ctx context.Context, key string, value any, ttl time.Du
 		return err
 	}
 	return c.storeCmd(ctx, "replace", key, b, ttl)
+}
+
+// ReplaceBytes is the allocation-lean variant of [Client.Replace].
+func (c *Client) ReplaceBytes(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return c.storeCmd(ctx, "replace", key, value, ttl)
 }
 
 // Append appends value to the existing value at key. Returns [ErrNotStored]
@@ -209,11 +228,6 @@ func (c *Client) CAS(ctx context.Context, key string, value any, casID uint64, t
 	if err := validateKey(key); err != nil {
 		return false, err
 	}
-	// Reject casID=0 explicitly. Both the text `cas` command and binary
-	// OpSet treat a CAS value of 0 as "don't check", degrading a CAS call
-	// into an unconditional Set — a silent behavior change that hides
-	// caller bugs (e.g. forgot to call Gets first, or copied the CAS
-	// token incorrectly). A legitimate CAS token from Gets is never 0.
 	if casID == 0 {
 		return false, ErrInvalidCAS
 	}
@@ -221,12 +235,35 @@ func (c *Client) CAS(ctx context.Context, key string, value any, casID uint64, t
 	if err != nil {
 		return false, err
 	}
+	return c.casBytes(ctx, key, b, casID, ttl)
+}
+
+// CASBytes is the allocation-lean variant of [Client.CAS]. Skips the `any`
+// boxing + asBytes type switch for callers that already have []byte.
+func (c *Client) CASBytes(ctx context.Context, key string, value []byte, casID uint64, ttl time.Duration) (bool, error) {
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
+	if casID == 0 {
+		return false, ErrInvalidCAS
+	}
+	return c.casBytes(ctx, key, value, casID, ttl)
+}
+
+// casBytes is the shared CAS implementation for CAS / CASBytes. Both enter
+// here after their own validation so the protocol flow is identical.
+//
+// Rejecting casID=0 is handled by the callers: both the text `cas` command
+// and binary OpSet treat a CAS of 0 as "don't check", degrading into an
+// unconditional Set — a silent behaviour change that hides caller bugs.
+// A legitimate CAS token from Gets is never 0.
+func (c *Client) casBytes(ctx context.Context, key string, value []byte, casID uint64, ttl time.Duration) (bool, error) {
 	var ok bool
-	err = c.run(ctx, func(ctx context.Context, conn *memcachedConn) error {
+	err := c.run(ctx, func(ctx context.Context, conn *memcachedConn) error {
 		if conn.binary {
 			exp := exptimeFromSeconds(exptime(ttl))
 			req, err := conn.execBinary(ctx, protocol.OpSet, func(w *protocol.BinaryWriter, opaque uint32) []byte {
-				return w.AppendStorage(protocol.OpSet, key, b, 0, exp, casID, opaque)
+				return w.AppendStorage(protocol.OpSet, key, value, 0, exp, casID, opaque)
 			})
 			defer putRequest(req)
 			if err != nil {
@@ -244,7 +281,7 @@ func (c *Client) CAS(ctx context.Context, key string, value any, casID uint64, t
 			return req.resultErr
 		}
 		req, err := conn.execText(ctx, kindStatusOnly, func(w *protocol.TextWriter) []byte {
-			return w.AppendStorage("cas", key, 0, exptime(ttl), b, casID, false)
+			return w.AppendStorage("cas", key, 0, exptime(ttl), value, casID, false)
 		})
 		defer putRequest(req)
 		if err != nil {
