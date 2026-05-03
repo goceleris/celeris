@@ -26,6 +26,7 @@ import (
 // just need "scaler + H2 dial burst" coverage in addition to the
 // no-scaler test's larger budget.
 func TestAdaptiveScaler_H2DialNoRSTRace(t *testing.T) {
+	skipIfMemlockInsufficientFor(t, 4) // matches Workers=4 set in runScalerH2Once
 	const iterations = 3
 	for i := 0; i < iterations; i++ {
 		runScalerH2Once(t, i)

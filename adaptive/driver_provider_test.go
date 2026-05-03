@@ -4,6 +4,7 @@ package adaptive
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,45 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
+
+// minMemlockPerWorker estimates the locked-page budget io_uring spends on
+// each worker's ring + buffers. 12 MB is comfortable headroom over the
+// typical 6-10 MB observed in profiling.
+const minMemlockPerWorker = 12 * 1024 * 1024
+
+// skipIfMemlockInsufficientFor skips when RLIMIT_MEMLOCK is too low for an
+// io_uring sub-engine to start `workers` rings. Without this guard, the
+// adaptive Listen polls for the io_uring secondary to bind for 20 s and
+// reports "engine never bound" — the real cause is ENOMEM at io_uring_setup
+// the moment any worker past index 0 tries to allocate its ring. Bench
+// harnesses use ulimit -l unlimited but go-test does not. workers ≤ 0 means
+// "use runtime.NumCPU()".
+func skipIfMemlockInsufficientFor(t *testing.T, workers int) {
+	t.Helper()
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	var rlim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
+		return
+	}
+	if rlim.Cur == ^uint64(0) {
+		return
+	}
+	needed := uint64(workers) * minMemlockPerWorker
+	if rlim.Cur < needed {
+		t.Skipf("RLIMIT_MEMLOCK soft=%d insufficient for %d workers (need ~%d); raise via `ulimit -l unlimited`, "+
+			"systemd LimitMEMLOCK=infinity, or run as root",
+			rlim.Cur, workers, needed)
+	}
+}
+
+// skipIfMemlockInsufficient is the NumCPU variant — used when the test
+// doesn't pin Workers explicitly and falls back to the engine default.
+func skipIfMemlockInsufficient(t *testing.T) {
+	t.Helper()
+	skipIfMemlockInsufficientFor(t, 0)
+}
 
 // noopHandler satisfies stream.Handler for tests that don't exercise HTTP.
 type noopHandler struct{}
@@ -29,6 +69,7 @@ var _ stream.Handler = noopHandler{}
 // (we need both primary + secondary up for a meaningful switch test).
 func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 	t.Helper()
+	skipIfMemlockInsufficient(t)
 	cfg := resource.Config{
 		Addr:     "127.0.0.1:0",
 		Protocol: engine.HTTP1,

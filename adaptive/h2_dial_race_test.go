@@ -62,6 +62,7 @@ func TestAdaptiveH2DialNoRSTRace(t *testing.T) {
 	// keeping ≥1 dial burst against a freshly-spun engine — the
 	// minimum needed to catch a regression of the original
 	// SO_REUSEPORT phantom-listener bug.
+	skipIfMemlockInsufficientFor(t, 2) // matches Workers=2 set in runOnce
 	const iterations = 5
 
 	for i := 0; i < iterations; i++ {
