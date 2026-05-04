@@ -80,6 +80,25 @@ func ExampleBroker() {
 	// Output: broker installed at /events
 }
 
+// Persist events through a ReplayStore so a reconnecting client can
+// resume from its Last-Event-ID without losing in-flight events. The
+// in-memory ring buffer keeps the last 256 events; swap to
+// NewKVReplayStore for durability across restarts.
+func ExampleNewRingBuffer() {
+	store := sse.NewRingBuffer(256)
+
+	s := celeris.New(celeris.Config{})
+	s.GET("/events", sse.New(sse.Config{
+		ReplayStore: store,
+		Handler: func(c *sse.Client) {
+			_ = c.Send(sse.Event{Data: "hello"})
+		},
+	}))
+
+	fmt.Println("replay-enabled SSE handler installed at /events")
+	// Output: replay-enabled SSE handler installed at /events
+}
+
 // Resume from a Last-Event-ID supplied by the browser's reconnect logic.
 func ExampleClient_LastEventID() {
 	handler := sse.New(sse.Config{

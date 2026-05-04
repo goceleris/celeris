@@ -2,6 +2,7 @@ package sse
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,11 @@ type Client struct {
 	drainDone     chan struct{}
 	onSlowClient  func(*Client, Event) SlowClientAction
 	droppedEvents atomic.Uint64
+
+	// replayStore, when non-nil, captures every Event Send writes so the
+	// next reconnect can resume via Last-Event-ID. Set per-handler from
+	// [Config.ReplayStore] in [New].
+	replayStore ReplayStore
 }
 
 // Send sends a complete SSE event. Thread-safe (serialized with heartbeat writes).
@@ -50,6 +56,14 @@ func (c *Client) Send(e Event) error {
 }
 
 func (c *Client) sendBlocking(e Event) error {
+	if c.replayStore != nil {
+		id, err := c.replayStore.Append(c.ctx, e)
+		if err != nil {
+			return err
+		}
+		e.ID = id
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -112,6 +126,17 @@ func (c *Client) sendQueued(e Event) error {
 func (c *Client) drain() {
 	defer close(c.drainDone)
 	for e := range c.queue {
+		// Replay-store Append happens at wire-delivery time so dropped
+		// events do not pollute the replay log. Performed before the
+		// c.mu.Lock so a slow store does not block the heartbeat writer.
+		if c.replayStore != nil {
+			id, err := c.replayStore.Append(c.ctx, e)
+			if err != nil {
+				c.cancel()
+				return
+			}
+			e.ID = id
+		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
@@ -226,6 +251,7 @@ func releaseClient(c *Client) {
 	c.drainDone = nil
 	c.onSlowClient = nil
 	c.droppedEvents.Store(0)
+	c.replayStore = nil
 	if cap(c.buf) <= maxPooledBufSize {
 		clientPool.Put(c)
 	}
@@ -351,6 +377,34 @@ func New(config ...Config) celeris.HandlerFunc {
 			client.mu.Unlock()
 			if err != nil {
 				return nil
+			}
+		}
+
+		// Bind the replay store to the client BEFORE the drain goroutine
+		// starts so an event enqueued the instant the handler runs hits
+		// Append on its way to the wire.
+		client.replayStore = cfg.ReplayStore
+
+		// Replay missed events from the previous session, if any.
+		// ErrLastIDUnknown is the documented "fresh start" signal: log
+		// at debug and continue; the user's Handler can still consult
+		// client.LastEventID() to react to the unknown cursor itself.
+		if cfg.ReplayStore != nil && lastEventID != "" {
+			missed, err := cfg.ReplayStore.Since(ctx, lastEventID)
+			if err != nil && !errors.Is(err, ErrLastIDUnknown) {
+				return nil
+			}
+			for i := range missed {
+				client.mu.Lock()
+				client.buf = formatEvent(client.buf, &missed[i])
+				_, werr := sw.Write(client.buf)
+				if werr == nil {
+					werr = sw.Flush()
+				}
+				client.mu.Unlock()
+				if werr != nil {
+					return nil
+				}
 			}
 		}
 

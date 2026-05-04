@@ -63,6 +63,19 @@ type Config struct {
 	// observability or escalating policies. Default: ActionDropEvent.
 	OnSlowClient func(c *Client, e Event) SlowClientAction
 
+	// ReplayStore persists events for Last-Event-ID resume. When nil
+	// (default), Client.LastEventID() returns the header but replay is
+	// the user's problem — matches today's behavior. When set, the
+	// middleware:
+	//   - on connect with a Last-Event-ID, reads Since(lastID) and
+	//     writes the missed events to the wire BEFORE invoking Handler;
+	//   - wraps Send so each call also Appends to the store, rewriting
+	//     the wire id: field with the canonical store-assigned ID;
+	//   - if Since returns ErrLastIDUnknown, logs at debug and still
+	//     invokes Handler (the user's resumption logic decides what to
+	//     do with a fresh start).
+	ReplayStore ReplayStore
+
 	// OnConnect is called when a new SSE client connects, before Handler.
 	// The celeris.Context is available for extracting request metadata.
 	// Return a non-nil error to reject the connection.
