@@ -85,11 +85,13 @@
             dest: "{{ bench_root }}/celeris/"
             remote_src: true
 
-        # Every Go env that could write outside the staging dir is
+        # Every tool env that could write outside the staging dir is
         # redirected here. XDG_CACHE_HOME and GOTMPDIR cover Go's
         # secondary caches (telemetry counters, tmpdir for builds);
-        # without them a `go install` can scribble to ~/.cache/go-build
-        # or ~/.config/go/telemetry on the host.
+        # MAGEFILE_CACHE redirects the compiled-magefile cache that
+        # otherwise lands in ~/.magefile; without these a `go install`
+        # or a `mage` run scribbles persistent files in the user's
+        # home dir.
         - name: Install mage into staging GOPATH
           environment: &gate_env
             PATH: "{{ bench_root }}/go/bin:{{ bench_root }}/gopath/bin:{{ ansible_env.PATH }}"
@@ -100,6 +102,7 @@
             GOTMPDIR: "{{ bench_root }}/gotmp"
             XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
             XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
+            MAGEFILE_CACHE: "{{ bench_root }}/magefile-cache"
             HOME: "{{ ansible_env.HOME }}"
           ansible.builtin.shell: |
             set -e
@@ -108,6 +111,12 @@
             ls -l {{ bench_root }}/gopath/bin/mage
           args:
             executable: /bin/bash
+
+        - name: Pre-create magefile cache dir (mage refuses to mkdir it itself)
+          ansible.builtin.file:
+            path: "{{ bench_root }}/magefile-cache"
+            state: directory
+            mode: '0755'
 
         - name: Run mage gate(s) — capture output to a log
           environment: *gate_env
@@ -172,19 +181,27 @@
 
         # mtime-based leak check — anything in ~ newer than the marker
         # we dropped at run-start is something we (or a child of mage)
-        # created during the run. The bench_root marker itself is gone
-        # at this point (rm -rf above) but its mtime survives via the
-        # ansible_date_time fact captured at gather_facts time.
+        # created during the run. Excludes:
+        #   * shell history / less / vim — touched by every login;
+        #   * ~/.ansible/, ~/.ansible_async/ — ansible itself creates
+        #     these to run the playbook; we cannot redirect them
+        #     because we run via ansible-playbook;
+        #   * ~/.ssh/known_hosts — first-time host-key acceptance;
+        #   * ~/.magefile/ — should not appear thanks to MAGEFILE_CACHE
+        #     in gate_env, but kept as a belt-and-braces exclusion in
+        #     case mage ignores the env (older versions did).
         - name: Find paths in ~ created/modified during the run
           ansible.builtin.shell: |
             find ~ -maxdepth 4 \
               -newermt '{{ ansible_date_time.iso8601_micro | default(ansible_date_time.iso8601) }}' \
-              -not -path '~/.bash_history*' \
-              -not -path '~/.viminfo*' \
-              -not -path '~/.lesshst*' \
-              -not -path '~/.cache/ansible*' \
-              -not -path '~/.ansible*' \
-              -not -path '~/.ssh/known_hosts*' \
+              -not -path "${HOME}/.bash_history*" \
+              -not -path "${HOME}/.viminfo*" \
+              -not -path "${HOME}/.lesshst*" \
+              -not -path "${HOME}/.cache/ansible*" \
+              -not -path "${HOME}/.ansible*" \
+              -not -path "${HOME}/.ansible_async*" \
+              -not -path "${HOME}/.ssh/known_hosts*" \
+              -not -path "${HOME}/.magefile*" \
               2>/dev/null \
               || true
           register: mtime_diff
