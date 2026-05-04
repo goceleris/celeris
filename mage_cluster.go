@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -345,6 +346,29 @@ func ClusterGoGate() error {
 	fmt.Printf("  timeout:        %s s\n", timeoutSec)
 	fmt.Printf("  log → %s/gate.log\n\n", resultsDir)
 
+	// Forward any PERFMATRIX_* / FUZZ_* / SOAK_* env vars the user set
+	// locally to the remote shell. The playbook reads gate_env (a JSON
+	// object) and exports each k=v before running mage.
+	gateEnv := map[string]string{}
+	forwardPrefixes := []string{"PERFMATRIX_", "FUZZ_", "SOAK_", "BENCHCMP_"}
+	for _, kv := range os.Environ() {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		k := kv[:eq]
+		for _, p := range forwardPrefixes {
+			if strings.HasPrefix(k, p) {
+				gateEnv[k] = kv[eq+1:]
+				break
+			}
+		}
+	}
+	gateEnvJSON, err := json.Marshal(gateEnv)
+	if err != nil {
+		return fmt.Errorf("encode gate_env: %w", err)
+	}
+
 	args := []string{
 		"-i", "inventory.yml", clusterGoGatePlaybook,
 		"--extra-vars", "gate_target_host=" + host,
@@ -354,6 +378,7 @@ func ClusterGoGate() error {
 		"--extra-vars", "source_tarball_local=" + srcTarball,
 		"--extra-vars", "results_local_dir=" + resultsDir,
 		"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
+		"--extra-vars", "gate_env=" + string(gateEnvJSON),
 	}
 	cmd := exec.Command("ansible-playbook", args...)
 	cmd.Dir = clusterAnsibleDir
