@@ -42,6 +42,44 @@ func ExampleNew() {
 	// Output: SSE handler installed at /events
 }
 
+// Fan-out from a single publisher to N subscribers. Broker formats each
+// event once into a PreparedEvent and dispatches the cached bytes to
+// every subscriber's per-subscriber queue, so the FormatEvent cost
+// stays constant as the subscriber count grows.
+func ExampleBroker() {
+	broker := sse.NewBroker(sse.BrokerConfig{
+		SubscriberBuffer: 64,
+		OnSlowSubscriber: func(_ *sse.Client, _ *sse.PreparedEvent) sse.BrokerPolicy {
+			return sse.BrokerPolicyDrop
+		},
+	})
+
+	s := celeris.New(celeris.Config{})
+	s.GET("/events", sse.New(sse.Config{
+		Handler: func(c *sse.Client) {
+			unsub := broker.Subscribe(c)
+			defer unsub()
+			<-c.Context().Done()
+		},
+	}))
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for i := 0; ; i++ {
+			<-ticker.C
+			broker.Publish(sse.Event{
+				ID:    strconv.Itoa(i),
+				Event: "tick",
+				Data:  "tick " + strconv.Itoa(i),
+			})
+		}
+	}()
+
+	fmt.Println("broker installed at /events")
+	// Output: broker installed at /events
+}
+
 // Resume from a Last-Event-ID supplied by the browser's reconnect logic.
 func ExampleClient_LastEventID() {
 	handler := sse.New(sse.Config{
