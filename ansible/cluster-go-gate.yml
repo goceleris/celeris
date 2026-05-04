@@ -13,8 +13,10 @@
 #                         the fewest other responsibilities)
 #   gate_mage_targets:    space-separated mage targets, e.g.
 #                         "FullCompliance" or "MatrixBenchStrict"
-#   go_tarball_local:     absolute path on dev Mac to a
+#   go_tarball_amd64:     absolute path on dev Mac to a
 #                         go<ver>.linux-amd64.tar.gz tarball
+#   go_tarball_arm64:     absolute path on dev Mac to a
+#                         go<ver>.linux-arm64.tar.gz tarball
 #   source_tarball_local: absolute path on dev Mac to a tar.gz of the
 #                         current branch (made via `git archive HEAD`)
 #   results_local_dir:    where to fetch the gate log back to on the Mac
@@ -33,7 +35,36 @@
         state: directory
         mode: '0755'
 
+    # Pristine snapshot — record which user-owned dirs existed BEFORE
+    # the run so the post-run leak check can ignore pre-existing state
+    # (the user may have their own ~/go or build cache from prior dev
+    # work). Anything else is a true leak from our staging.
+    - name: Snapshot pre-existing user dirs
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: pre_state
+      loop:
+        - "{{ ansible_env.HOME }}/go"
+        - "{{ ansible_env.HOME }}/goroot"
+        - "{{ ansible_env.HOME }}/gopath"
+        - "{{ ansible_env.HOME }}/celeris"
+        - "{{ ansible_env.HOME }}/.cache/go-build"
+
+    - name: Build set of paths that pre-existed
+      ansible.builtin.set_fact:
+        preexisting_paths: >-
+          {{ pre_state.results
+             | selectattr('stat.exists')
+             | map(attribute='item')
+             | list }}
+
     - block:
+        - name: Pick Go tarball matching the target architecture
+          ansible.builtin.set_fact:
+            go_tarball_local: >-
+              {{ go_tarball_amd64 if ansible_architecture in ['x86_64', 'amd64']
+                 else go_tarball_arm64 }}
+
         - name: Push Go tarball
           ansible.builtin.copy:
             src: "{{ go_tarball_local }}"
@@ -125,16 +156,30 @@
             path: "{{ bench_root }}"
             state: absent
 
-        - name: Verify nothing of ours remains in ~
-          ansible.builtin.shell: |
-            for p in ~/go ~/goroot ~/gopath ~/celeris ~/.cache/go-build ~/go-build; do
-              if [ -e "$p" ]; then echo "LEAK: $p"; fi
-            done
-            true
-          register: leak_check
-          changed_when: false
+        - name: Verify nothing of ours remains in ~ (post-snapshot leak check)
+          # A path is a real leak only if it exists now AND was NOT in
+          # the pre-existing snapshot. Pre-existing user state (e.g.
+          # the user's own ~/go from prior dev work) is left alone.
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          register: post_state
+          loop:
+            - "{{ ansible_env.HOME }}/go"
+            - "{{ ansible_env.HOME }}/goroot"
+            - "{{ ansible_env.HOME }}/gopath"
+            - "{{ ansible_env.HOME }}/celeris"
+            - "{{ ansible_env.HOME }}/.cache/go-build"
 
-        - name: Fail if anything leaked into ~
+        - name: Compute leaked paths (exist now, did not pre-exist)
+          ansible.builtin.set_fact:
+            leaked_paths: >-
+              {{ post_state.results
+                 | selectattr('stat.exists')
+                 | map(attribute='item')
+                 | reject('in', preexisting_paths | default([]))
+                 | list }}
+
+        - name: Fail if anything actually leaked into ~
           ansible.builtin.fail:
-            msg: "Pristine violation — found persistent files: {{ leak_check.stdout }}"
-          when: leak_check.stdout | length > 0
+            msg: "Pristine violation — newly created persistent files: {{ leaked_paths }}"
+          when: leaked_paths | length > 0

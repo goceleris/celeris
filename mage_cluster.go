@@ -312,9 +312,16 @@ func ClusterGoGate() error {
 	}
 	defer os.RemoveAll(stagingDir)
 
-	goTarball := filepath.Join(stagingDir, "go.linux-amd64.tar.gz")
-	if err := downloadGoTarball(goVer, goTarball); err != nil {
-		return fmt.Errorf("download Go %s: %w", goVer, err)
+	// Download both arch tarballs; the playbook picks the right one
+	// from ansible_architecture so the same staging dir works for any
+	// host. msa2-* are amd64; msr1 is arm64.
+	goAmd64 := filepath.Join(stagingDir, "go.linux-amd64.tar.gz")
+	goArm64 := filepath.Join(stagingDir, "go.linux-arm64.tar.gz")
+	if err := downloadGoTarball(goVer, "amd64", goAmd64); err != nil {
+		return fmt.Errorf("download Go %s/amd64: %w", goVer, err)
+	}
+	if err := downloadGoTarball(goVer, "arm64", goArm64); err != nil {
+		return fmt.Errorf("download Go %s/arm64: %w", goVer, err)
 	}
 
 	srcTarball := filepath.Join(stagingDir, "source.tar.gz")
@@ -342,7 +349,8 @@ func ClusterGoGate() error {
 		"-i", "inventory.yml", clusterGoGatePlaybook,
 		"--extra-vars", "gate_target_host=" + host,
 		"--extra-vars", "gate_mage_targets=" + target,
-		"--extra-vars", "go_tarball_local=" + goTarball,
+		"--extra-vars", "go_tarball_amd64=" + goAmd64,
+		"--extra-vars", "go_tarball_arm64=" + goArm64,
 		"--extra-vars", "source_tarball_local=" + srcTarball,
 		"--extra-vars", "results_local_dir=" + resultsDir,
 		"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
@@ -358,14 +366,14 @@ func ClusterGoGate() error {
 	return nil
 }
 
-// downloadGoTarball fetches go<ver>.linux-amd64.tar.gz from go.dev/dl
+// downloadGoTarball fetches go<ver>.linux-<arch>.tar.gz from go.dev/dl
 // into dst. Skips the download if dst already exists with non-zero size
-// (handy when iterating on the playbook).
-func downloadGoTarball(version, dst string) error {
+// (handy when iterating on the playbook). arch is "amd64" or "arm64".
+func downloadGoTarball(version, arch, dst string) error {
 	if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
 		return nil
 	}
-	url := "https://go.dev/dl/go" + version + ".linux-amd64.tar.gz"
+	url := "https://go.dev/dl/go" + version + ".linux-" + arch + ".tar.gz"
 	cmd := exec.Command("curl", "-fsSL", "-o", dst, url)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
