@@ -123,7 +123,10 @@ func TestRingBufferAppendAllocs(t *testing.T) {
 // integration build tag.
 func TestKVReplayStoreRoundTrip(t *testing.T) {
 	kv := store.NewMemoryKV()
-	r := NewKVReplayStore(kv, "test:", 0)
+	r, err := NewKVReplayStore(kv, "test:", 0)
+	if err != nil {
+		t.Fatalf("NewKVReplayStore: %v", err)
+	}
 	ctx := context.Background()
 
 	ids := make([]string, 0, 4)
@@ -147,16 +150,18 @@ func TestKVReplayStoreRoundTrip(t *testing.T) {
 	}
 }
 
-// TestNewKVReplayStorePanicsOnNilKV — defensive guard for the
-// constructor; callers passing nil get a clear panic instead of a
-// confusing nil-pointer panic later.
-func TestNewKVReplayStorePanicsOnNilKV(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Errorf("expected panic on nil store.KV")
-		}
-	}()
-	_ = NewKVReplayStore(nil, "x:", 0)
+// TestNewKVReplayStoreReturnsErrOnNilKV — defensive guard. Constructors
+// that need a backing store return an error instead of panicking, so
+// the misuse surfaces at the call site rather than as a confusing
+// nil-pointer panic on the first Append.
+func TestNewKVReplayStoreReturnsErrOnNilKV(t *testing.T) {
+	r, err := NewKVReplayStore(nil, "x:", 0)
+	if err == nil {
+		t.Errorf("NewKVReplayStore(nil) returned nil error")
+	}
+	if r != nil {
+		t.Errorf("NewKVReplayStore(nil) returned non-nil store: %T", r)
+	}
 }
 
 // TestReplayMiddlewareReplaysMissedEvents — end-to-end exit criterion

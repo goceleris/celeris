@@ -30,9 +30,13 @@ type Client struct {
 
 	// Queued-send mode (Config.MaxQueueDepth > 0). queue is nil in legacy
 	// blocking mode; a non-nil queue selects the asynchronous drain path.
+	// queueClosed flips to true the instant the handler defer is about to
+	// close c.queue, so a Send racing the defer observes "closed" and
+	// returns ErrClientClosed instead of panicking on send-to-closed-chan.
 	queue         chan Event
+	queueClosed   atomic.Bool
 	drainDone     chan struct{}
-	onSlowClient  func(*Client, Event) SlowClientAction
+	onSlowClient  func(*Client, Event) ClientPolicy
 	droppedEvents atomic.Uint64
 
 	// replayStore, when non-nil, captures every Event Send writes so the
@@ -42,12 +46,27 @@ type Client struct {
 }
 
 // Send sends a complete SSE event. Thread-safe (serialized with heartbeat writes).
-// Returns an error if the client has disconnected or the stream is closed.
+//
+// Return contract:
+//   - non-nil error: the event was NOT delivered (closed, context cancelled,
+//     or write failed); the caller may retry on a new connection.
+//   - nil error in blocking mode (MaxQueueDepth = 0): the event was written
+//     to the underlying stream and flushed.
+//   - nil error in queued mode (MaxQueueDepth > 0): the event was enqueued
+//     OR dropped silently per the [Config.OnSlowClient] policy; check
+//     [Client.DroppedEvents] to detect drops.
 //
 // When [Config.MaxQueueDepth] is zero (default), Send writes directly to the
 // wire — historical blocking semantics. When MaxQueueDepth is positive Send
 // enqueues onto a bounded channel that a per-client goroutine drains; if the
 // queue is full Send dispatches the configured [Config.OnSlowClient] policy.
+//
+// Send must NOT be called after the user's [Handler] has returned. The
+// handler defer closes the per-client queue; a Send racing that close
+// observes the queueClosed flag and returns [ErrClientClosed] instead of
+// panicking, but the contract still belongs to the caller — spawned
+// goroutines that publish into a Client must be joined before the handler
+// returns.
 func (c *Client) Send(e Event) error {
 	if c.queue != nil {
 		return c.sendQueued(e)
@@ -56,14 +75,6 @@ func (c *Client) Send(e Event) error {
 }
 
 func (c *Client) sendBlocking(e Event) error {
-	if c.replayStore != nil {
-		id, err := c.replayStore.Append(c.ctx, e)
-		if err != nil {
-			return err
-		}
-		e.ID = id
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -72,6 +83,20 @@ func (c *Client) sendBlocking(e Event) error {
 	}
 	if err := c.ctx.Err(); err != nil {
 		return err
+	}
+
+	// Append under the same lock that serialises the wire write so the
+	// store's monotonic ID order matches the on-wire order even with
+	// concurrent Send callers. Failed writes cancel the connection;
+	// the appended event is still in the store and will replay on the
+	// next reconnect — strictly correct (every appended event is
+	// either delivered now OR delivered on reconnect).
+	if c.replayStore != nil {
+		id, err := c.replayStore.Append(c.ctx, e)
+		if err != nil {
+			return err
+		}
+		e.ID = id
 	}
 
 	c.buf = formatEvent(c.buf, &e)
@@ -87,6 +112,9 @@ func (c *Client) sendBlocking(e Event) error {
 }
 
 func (c *Client) sendQueued(e Event) error {
+	if c.queueClosed.Load() {
+		return ErrClientClosed
+	}
 	if err := c.ctx.Err(); err != nil {
 		return err
 	}
@@ -96,23 +124,29 @@ func (c *Client) sendQueued(e Event) error {
 	default:
 	}
 
-	action := ActionDropEvent
+	action := ClientPolicyDrop
 	if c.onSlowClient != nil {
 		action = c.onSlowClient(c, e)
 	}
 	switch action {
-	case ActionDisconnectClient:
+	case ClientPolicyDisconnect:
 		c.droppedEvents.Add(1)
 		c.cancel()
 		return ErrClientClosed
-	case ActionBlock:
+	case ClientPolicyBlock:
+		// Re-check queueClosed inside the select so a defer that fires
+		// between the top-of-function check and here doesn't park the
+		// caller on a closed-chan send forever.
+		if c.queueClosed.Load() {
+			return ErrClientClosed
+		}
 		select {
 		case c.queue <- e:
 			return nil
 		case <-c.ctx.Done():
 			return c.ctx.Err()
 		}
-	default: // ActionDropEvent and any unknown value
+	default: // ClientPolicyDrop and any unknown value
 		c.droppedEvents.Add(1)
 		return nil
 	}
@@ -126,21 +160,20 @@ func (c *Client) sendQueued(e Event) error {
 func (c *Client) drain() {
 	defer close(c.drainDone)
 	for e := range c.queue {
-		// Replay-store Append happens at wire-delivery time so dropped
-		// events do not pollute the replay log. Performed before the
-		// c.mu.Lock so a slow store does not block the heartbeat writer.
-		if c.replayStore != nil {
-			id, err := c.replayStore.Append(c.ctx, e)
-			if err != nil {
-				c.cancel()
-				return
-			}
-			e.ID = id
-		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
 			return
+		}
+		// Append under the wire-write lock so store order matches the
+		// on-wire order even when Send + drain race. A failing Append
+		// proceeds with the wire-write using the user-supplied e.ID —
+		// a transient store hiccup must not kill an otherwise healthy
+		// connection. The next successful Send recovers the order.
+		if c.replayStore != nil {
+			if id, err := c.replayStore.Append(c.ctx, e); err == nil {
+				e.ID = id
+			}
 		}
 		c.buf = formatEvent(c.buf, &e)
 		_, err := c.sw.Write(c.buf)
@@ -156,7 +189,7 @@ func (c *Client) drain() {
 }
 
 // DroppedEvents returns the cumulative count of events dropped under
-// [ActionDropEvent] (or [ActionDisconnectClient]) since this client connected.
+// [ClientPolicyDrop] (or [ClientPolicyDisconnect]) since this client connected.
 // Always zero when [Config.MaxQueueDepth] is zero.
 func (c *Client) DroppedEvents() uint64 {
 	return c.droppedEvents.Load()
@@ -248,6 +281,7 @@ func releaseClient(c *Client) {
 	c.cancel = nil
 	c.lastEventID = ""
 	c.queue = nil
+	c.queueClosed.Store(false)
 	c.drainDone = nil
 	c.onSlowClient = nil
 	c.droppedEvents.Store(0)
@@ -345,12 +379,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		var heartbeatDone chan struct{}
 
 		defer func() {
-			// Close the queue first so the drain goroutine can flush every
-			// already-enqueued event before the underlying stream is shut.
-			// Closing happens AFTER the user's handler returns, so the
-			// "no Send after Handler returns" contract guarantees no
-			// concurrent writers panic on `send to closed channel`.
+			// Close the queue so the drain goroutine flushes every
+			// already-enqueued event before the underlying stream is
+			// shut. queueClosed is set BEFORE close(c.queue) so any
+			// Send racing the handler return observes closed first
+			// and returns ErrClientClosed instead of panicking on
+			// send-to-closed-chan.
 			if client.queue != nil {
+				client.queueClosed.Store(true)
 				close(client.queue)
 			}
 			if client.drainDone != nil {

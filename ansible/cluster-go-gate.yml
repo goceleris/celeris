@@ -35,28 +35,17 @@
         state: directory
         mode: '0755'
 
-    # Pristine snapshot — record which user-owned dirs existed BEFORE
-    # the run so the post-run leak check can ignore pre-existing state
-    # (the user may have their own ~/go or build cache from prior dev
-    # work). Anything else is a true leak from our staging.
-    - name: Snapshot pre-existing user dirs
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      register: pre_state
-      loop:
-        - "{{ ansible_env.HOME }}/go"
-        - "{{ ansible_env.HOME }}/goroot"
-        - "{{ ansible_env.HOME }}/gopath"
-        - "{{ ansible_env.HOME }}/celeris"
-        - "{{ ansible_env.HOME }}/.cache/go-build"
-
-    - name: Build set of paths that pre-existed
-      ansible.builtin.set_fact:
-        preexisting_paths: >-
-          {{ pre_state.results
-             | selectattr('stat.exists')
-             | map(attribute='item')
-             | list }}
+    # Pristine snapshot — drop a marker file under {{ bench_root }} so
+    # the post-run leak check can compare modification times against
+    # it and only flag files that we created or modified during the
+    # run. mtime-based diffing is exhaustive; the previous list-based
+    # approach missed leaks like ~/.config/go/, ~/.cache/go-telemetry/,
+    # ~/.netrc, ~/.gitconfig, etc.
+    - name: Drop run-start marker for mtime diff
+      ansible.builtin.file:
+        path: "{{ bench_root }}/run-start.marker"
+        state: touch
+        mode: '0644'
 
     - block:
         - name: Pick Go tarball matching the target architecture
@@ -96,42 +85,51 @@
             dest: "{{ bench_root }}/celeris/"
             remote_src: true
 
+        # Every Go env that could write outside the staging dir is
+        # redirected here. XDG_CACHE_HOME and GOTMPDIR cover Go's
+        # secondary caches (telemetry counters, tmpdir for builds);
+        # without them a `go install` can scribble to ~/.cache/go-build
+        # or ~/.config/go/telemetry on the host.
         - name: Install mage into staging GOPATH
-          environment:
-            PATH: "{{ bench_root }}/go/bin:{{ ansible_env.PATH }}"
+          environment: &gate_env
+            PATH: "{{ bench_root }}/go/bin:{{ bench_root }}/gopath/bin:{{ ansible_env.PATH }}"
             GOROOT: "{{ bench_root }}/go"
             GOPATH: "{{ bench_root }}/gopath"
             GOCACHE: "{{ bench_root }}/gocache"
             GOMODCACHE: "{{ bench_root }}/gomodcache"
+            GOTMPDIR: "{{ bench_root }}/gotmp"
+            XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
+            XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
             HOME: "{{ ansible_env.HOME }}"
           ansible.builtin.shell: |
             set -e
-            mkdir -p {{ bench_root }}/gopath/bin
+            mkdir -p {{ bench_root }}/gopath/bin {{ bench_root }}/gotmp {{ bench_root }}/xdg-cache {{ bench_root }}/xdg-config
             go install github.com/magefile/mage@latest
             ls -l {{ bench_root }}/gopath/bin/mage
           args:
             executable: /bin/bash
 
         - name: Run mage gate(s) — capture output to a log
-          environment:
-            PATH: "{{ bench_root }}/go/bin:{{ bench_root }}/gopath/bin:{{ ansible_env.PATH }}"
-            GOROOT: "{{ bench_root }}/go"
-            GOPATH: "{{ bench_root }}/gopath"
-            GOCACHE: "{{ bench_root }}/gocache"
-            GOMODCACHE: "{{ bench_root }}/gomodcache"
-            HOME: "{{ ansible_env.HOME }}"
+          environment: *gate_env
           # gate_env_exports is a literal block of shell `export k=q`
           # lines rendered by ClusterGoGate (which knows the user's
           # local env). Embedded directly into the shell — no Jinja
           # loop over dicts (--extra-vars values are always strings).
+          #
+          # The `timeout` wrapper ensures the kernel kills the mage
+          # subtree if ansible's async deadline is hit — without it
+          # the remote child keeps running headless after ansible
+          # gives up, which races with the cleanup rm -rf.
           ansible.builtin.shell: |
-            set -e -o pipefail
+            set -o pipefail
             cd {{ bench_root }}/celeris
             {{ gate_env_exports | default('') }}
-            for tgt in {{ gate_mage_targets }}; do
-              echo "=== Running mage $tgt on $(hostname) ==="
-              mage "$tgt"
-            done 2>&1 | tee {{ bench_root }}/gate.log
+            timeout --kill-after=30s {{ gate_timeout_seconds | default(28800) }}s bash -c '
+              for tgt in {{ gate_mage_targets }}; do
+                echo "=== Running mage $tgt on $(hostname) ==="
+                mage "$tgt" || exit $?
+              done
+            ' 2>&1 | tee {{ bench_root }}/gate.log
           args:
             executable: /bin/bash
           async: "{{ gate_timeout_seconds | default(28800) }}"
@@ -148,10 +146,23 @@
             flat: true
             fail_on_missing: false
 
+        # Kill any leftover mage / go / runner processes that ansible's
+        # async deadline cut loose. Without this, a SIGKILL'd async
+        # task can leave headless processes that race the cleanup.
+        - name: Stop any leftover gate processes
+          become: true
+          ansible.builtin.shell: |
+            pkill -x mage 2>/dev/null
+            pkill -x go 2>/dev/null
+            pkill -x runner 2>/dev/null
+            pkill -x loadgen 2>/dev/null
+            true
+          changed_when: false
+
+        # Cleanup with a become-fallback for files that any sudo'd mage
+        # step (ulimit -l unlimited, etc.) may have created as root.
         - name: Drop staging dir (Go, source, gopath, gocache — everything)
-          # Go's module cache marks files read-only (0444). ansible's
-          # file:state=absent does an rmtree() which fails on those.
-          # chmod -R u+w first so the recursive remove can proceed.
+          become: true
           ansible.builtin.shell: |
             chmod -R u+w {{ bench_root }} 2>/dev/null || true
             rm -rf {{ bench_root }}
@@ -159,30 +170,29 @@
             executable: /bin/bash
           changed_when: true
 
-        - name: Verify nothing of ours remains in ~ (post-snapshot leak check)
-          # A path is a real leak only if it exists now AND was NOT in
-          # the pre-existing snapshot. Pre-existing user state (e.g.
-          # the user's own ~/go from prior dev work) is left alone.
-          ansible.builtin.stat:
-            path: "{{ item }}"
-          register: post_state
-          loop:
-            - "{{ ansible_env.HOME }}/go"
-            - "{{ ansible_env.HOME }}/goroot"
-            - "{{ ansible_env.HOME }}/gopath"
-            - "{{ ansible_env.HOME }}/celeris"
-            - "{{ ansible_env.HOME }}/.cache/go-build"
+        # mtime-based leak check — anything in ~ newer than the marker
+        # we dropped at run-start is something we (or a child of mage)
+        # created during the run. The bench_root marker itself is gone
+        # at this point (rm -rf above) but its mtime survives via the
+        # ansible_date_time fact captured at gather_facts time.
+        - name: Find paths in ~ created/modified during the run
+          ansible.builtin.shell: |
+            find ~ -maxdepth 4 \
+              -newermt '{{ ansible_date_time.iso8601_micro | default(ansible_date_time.iso8601) }}' \
+              -not -path '~/.bash_history*' \
+              -not -path '~/.viminfo*' \
+              -not -path '~/.lesshst*' \
+              -not -path '~/.cache/ansible*' \
+              -not -path '~/.ansible*' \
+              -not -path '~/.ssh/known_hosts*' \
+              2>/dev/null \
+              || true
+          register: mtime_diff
+          changed_when: false
 
-        - name: Compute leaked paths (exist now, did not pre-exist)
-          ansible.builtin.set_fact:
-            leaked_paths: >-
-              {{ post_state.results
-                 | selectattr('stat.exists')
-                 | map(attribute='item')
-                 | reject('in', preexisting_paths | default([]))
-                 | list }}
-
-        - name: Fail if anything actually leaked into ~
+        - name: Fail if anything leaked into ~
           ansible.builtin.fail:
-            msg: "Pristine violation — newly created persistent files: {{ leaked_paths }}"
-          when: leaked_paths | length > 0
+            msg: |
+              Pristine violation — files in ~ newer than the run-start mark:
+              {{ mtime_diff.stdout }}
+          when: mtime_diff.stdout is defined and mtime_diff.stdout | trim | length > 0

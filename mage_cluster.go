@@ -55,10 +55,19 @@ func ClusterStatus() error {
 
 // ClusterDeploy cross-compiles the runner binary for both archs and
 // pushes it (plus loadgen) to /tmp/celeris-bench/ on the appropriate
-// hosts. No bench is executed. Idempotent.
+// hosts. Runs ClusterCleanup first so a prior run's stale staging
+// (e.g. a SIGKILL'd ClusterGoGate that bypassed its always-block) is
+// dropped before we re-stage; otherwise leftover Go toolchain at
+// /tmp/celeris-bench/go/ would still be present for the next run.
+// Idempotent.
 func ClusterDeploy() error {
 	if err := requireAnsible(); err != nil {
 		return err
+	}
+	if err := ClusterCleanup(); err != nil {
+		// Cleanup must not block deploy on a freshly provisioned host
+		// (no manifest yet → cleanup is a no-op anyway). Log + continue.
+		fmt.Fprintf(os.Stderr, "ClusterDeploy: pre-clean warning: %v\n", err)
 	}
 	bins, err := stageBinaries()
 	if err != nil {
@@ -351,7 +360,11 @@ func ClusterGoGate() error {
 		return fmt.Errorf("build source tarball: %w", err)
 	}
 
-	ts := time.Now().UTC().Format("20060102-150405")
+	// Sub-second + pid in the timestamp so back-to-back invocations
+	// (e.g. a CI job that runs FullCompliance then MatrixBenchStrict)
+	// land in distinct results dirs even when launched within the
+	// same wall-clock second.
+	ts := fmt.Sprintf("%s-p%d", time.Now().UTC().Format("20060102-150405.000"), os.Getpid())
 
 	fmt.Printf("\n=== Cluster go-gate ===\n")
 	fmt.Printf("  hosts:          %s\n", strings.Join(hosts, ", "))
@@ -359,14 +372,22 @@ func ClusterGoGate() error {
 	fmt.Printf("  Go version:     %s\n", goVer)
 	fmt.Printf("  timeout/host:   %s s\n\n", timeoutSec)
 
-	// Forward any PERFMATRIX_* / FUZZ_* / SOAK_* / BENCHCMP_* env vars
-	// the user set locally to the remote shell. We render them as
-	// `export k=q` lines and pass the resulting string as an extra-var
-	// the playbook embeds into its shell command — simpler than a
-	// Jinja loop over a dict (--extra-vars values are always strings,
-	// so dict-shaped gate_env trips object/items errors).
+	// Forward env vars the user set locally to the remote shell. We
+	// render them as `export k=q` lines and pass the resulting string
+	// as an extra-var the playbook embeds into its shell command —
+	// simpler than a Jinja loop over a dict (--extra-vars values are
+	// always strings, so dict-shaped gate_env trips object/items errors).
+	//
+	// Forwarded prefixes: project knobs (PERFMATRIX_, FUZZ_, SOAK_,
+	// BENCHCMP_) plus the standard Go runtime tuning vars a developer
+	// would expect to influence the gate (GOFLAGS, GOEXPERIMENT,
+	// GODEBUG, GOTRACEBACK, GORACE, GOMAXPROCS).
 	var envExports strings.Builder
-	forwardPrefixes := []string{"PERFMATRIX_", "FUZZ_", "SOAK_", "BENCHCMP_"}
+	forwardPrefixes := []string{
+		"PERFMATRIX_", "FUZZ_", "SOAK_", "BENCHCMP_",
+		"GOFLAGS", "GOEXPERIMENT", "GODEBUG",
+		"GOTRACEBACK", "GORACE", "GOMAXPROCS",
+	}
 	for _, kv := range os.Environ() {
 		eq := strings.IndexByte(kv, '=')
 		if eq < 0 {
@@ -374,7 +395,7 @@ func ClusterGoGate() error {
 		}
 		k := kv[:eq]
 		for _, p := range forwardPrefixes {
-			if strings.HasPrefix(k, p) {
+			if k == p || strings.HasPrefix(k, p+"_") || (strings.HasSuffix(p, "_") && strings.HasPrefix(k, p)) {
 				fmt.Fprintf(&envExports, "export %s=%s\n", k, shellQuote(kv[eq+1:]))
 				break
 			}
@@ -545,12 +566,15 @@ func stageBinaries() (*clusterBins, error) {
 		loadgenAmd64: filepath.Join(stagingDir, "loadgen-amd64"),
 	}
 
-	ts := time.Now().UTC().Format("20060102-150405")
+	// Time + PID suffix so two ClusterDistributedBench subprocesses
+	// kicked off within the same second from ClusterDistributedBenchParallel
+	// land in different result dirs.
+	ts := time.Now().UTC().Format("20060102-150405.000")
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	bins.resultsLocal = filepath.Join(cwd, "results", ts+"-cluster")
+	bins.resultsLocal = filepath.Join(cwd, "results", fmt.Sprintf("%s-p%d-cluster", ts, os.Getpid()))
 	if err := os.MkdirAll(bins.resultsLocal, 0o755); err != nil {
 		return nil, err
 	}

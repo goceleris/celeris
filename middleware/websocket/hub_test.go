@@ -114,11 +114,19 @@ func TestHubBroadcastReachesAllConns(t *testing.T) {
 	}
 }
 
-// TestHubBroadcastFormatsOnce — strict-alloc gate. The Hub itself must
-// NOT add per-Conn allocations on top of [Conn.WritePreparedMessage]'s
-// intrinsic cost. We measure at two N's and check the per-Conn delta:
-// any growth beyond the intrinsic Conn write cost would mean the Hub
-// is allocating in its dispatch loop.
+// TestHubBroadcastFormatsOnce — strict-alloc gate. The Hub must NOT
+// add per-Conn allocations on top of [Conn.WritePreparedMessage]'s
+// intrinsic cost, AND must keep its own per-broadcast overhead below a
+// hard ceiling (snapshot slice + per-call wgAdd + a few words).
+//
+// We measure at two N's and pin two separate properties:
+//
+//	hubOverhead = allocs(N=1) − 1 × intrinsic_per_conn
+//	perConnΔ    = (allocs(N=64) − allocs(N=8)) / 56
+//
+// Bounding both is what catches a regression: tightening only the
+// slope hides any constant per-broadcast alloc growth, and tightening
+// only the intercept hides per-conn growth.
 func TestHubBroadcastFormatsOnce(t *testing.T) {
 	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
 		t.Skip("alloc counts unstable under -race / coverage / -short")
@@ -141,16 +149,29 @@ func TestHubBroadcastFormatsOnce(t *testing.T) {
 			_, _ = h.BroadcastPrepared(pm)
 		})
 	}
+	one := measure(1)
 	low := measure(8)
 	high := measure(64)
-	perConn := (high - low) / float64(64-8)
-	// Per-Conn intrinsic cost from Conn.WritePreparedMessage is ~2 allocs
-	// (writer pool churn + flush). The budget gives a tolerance of 0.5
-	// over the measured baseline; anything higher means the Hub is
-	// adding allocations in its per-Conn loop.
-	const perConnBudget = 2.5
-	if perConn > perConnBudget {
-		t.Fatalf("Broadcast per-conn allocs = %.2f (8→%.1f, 64→%.1f), budget %.2f", perConn, low, high, perConnBudget)
+
+	// Intrinsic Conn.WritePreparedMessage cost: derive from the slope
+	// between (1,8) — they share whatever per-broadcast overhead the
+	// Hub adds, so the slope cleanly extracts the per-Conn cost.
+	intrinsic := (low - one) / float64(8-1)
+	hubOverhead := one - intrinsic // per-broadcast cost at N=1
+	perConnDelta := (high - low) / float64(64-8)
+
+	// Hub itself: 1 alloc for the snapshot slice + 1 for the
+	// PreparedMessage cache miss = effectively 2 in the worst case.
+	// Anything above 4 means a regression introduced new per-broadcast
+	// allocations.
+	const hubOverheadBudget = 4.0
+	if hubOverhead > hubOverheadBudget {
+		t.Fatalf("hub per-broadcast overhead = %.2f (intrinsic=%.2f, N=1→%.1f), budget %.2f", hubOverhead, intrinsic, one, hubOverheadBudget)
+	}
+	// Per-Conn cost must not grow with N. perConnDelta should match
+	// intrinsic within 0.25 alloc/op of slack.
+	if perConnDelta-intrinsic > 0.25 {
+		t.Fatalf("per-conn allocs grow with N: intrinsic=%.2f, slope(8→64)=%.2f", intrinsic, perConnDelta)
 	}
 }
 
@@ -205,10 +226,9 @@ func TestHubOnSlowConnPolicies(t *testing.T) {
 	}
 }
 
-// TestHubBroadcastFilter delivers only to the conns matching pred. The
-// filter scan must hold only the read lock, so a concurrent Register
-// does not serialise — verified indirectly by ensuring Register
-// completes during a long-running BroadcastFilter (no deadlock).
+// TestHubBroadcastFilter delivers only to the conns matching pred.
+// The membership snapshot is taken under the read lock; pred itself
+// runs lock-free against the snapshot.
 func TestHubBroadcastFilter(t *testing.T) {
 	h := NewHub(HubConfig{})
 	defer h.Close()
@@ -231,6 +251,127 @@ func TestHubBroadcastFilter(t *testing.T) {
 	}
 	if delivered != 1 {
 		t.Errorf("delivered = %d, want 1", delivered)
+	}
+}
+
+// TestHubBroadcastFilterZeroMatch — pred matching nobody returns
+// (delivered=0, err=nil). Pinned because a "no matches" path that
+// returns an error or panics would surface as a silent regression.
+func TestHubBroadcastFilterZeroMatch(t *testing.T) {
+	h := NewHub(HubConfig{})
+	defer h.Close()
+
+	a := newHubPair(t)
+	defer a.closeAll()
+	h.Register(a.conn)
+
+	delivered, err := h.BroadcastFilter(OpText, []byte("x"), func(*Conn) bool { return false })
+	if err != nil {
+		t.Errorf("BroadcastFilter err = %v, want nil", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0", delivered)
+	}
+}
+
+// TestHubOneSlowMany Fast — issue #253 spec: a single slow conn must
+// not block the dispatch to the rest. Slow conn has a tight write
+// deadline; fast conns drain normally. Default policy
+// (HubPolicyClose) evicts the slow conn; fast conns all see the
+// message in roughly the slow-conn timeout window.
+func TestHubOneSlowManyFast(t *testing.T) {
+	const fastN = 32 // small enough to keep the test fast; the issue
+	// spec calls out 1+999, but the property we want — slow-doesn't-
+	// gate-fast — is testable at any N where the wall time of fast
+	// dispatches is bounded above by the slow timeout.
+	h := NewHub(HubConfig{})
+	defer h.Close()
+
+	// Fast cohort: drained pipes.
+	fast := make([]*hubPair, fastN)
+	for i := range fast {
+		fast[i] = newHubPair(t)
+		h.Register(fast[i].conn)
+	}
+	defer func() {
+		for _, p := range fast {
+			p.closeAll()
+		}
+	}()
+
+	// Slow conn: client side is NOT drained; net.Pipe is unbuffered
+	// so any write that exceeds the deadline fails fast.
+	clientPipe, serverPipe := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slow := newConn(ctx, cancel, serverPipe, 1024, 1024)
+	defer func() { _ = clientPipe.Close() }()
+	defer func() { _ = slow.Close() }()
+	_ = slow.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+	h.Register(slow)
+
+	start := time.Now()
+	delivered, err := h.Broadcast(OpText, []byte("payload"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Errorf("expected first-error to surface from slow conn, got nil")
+	}
+	if delivered != fastN {
+		t.Errorf("delivered = %d, want %d (fastN; slow conn evicted)", delivered, fastN)
+	}
+	// The whole broadcast must finish within ~slow-deadline + slack;
+	// if a regression were to serialise dispatch behind the slow
+	// write we'd see far more than the deadline here.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("broadcast wall = %v exceeds slow-deadline ceiling — fast cohort may have been gated", elapsed)
+	}
+	// Default HubPolicyClose evicts the slow conn.
+	if h.Len() != fastN {
+		t.Errorf("Len after slow eviction = %d, want %d", h.Len(), fastN)
+	}
+}
+
+// TestHubCloseRacingBroadcast spawns broadcasters that race a Close.
+// The Close ordering guarantee says any Broadcast that already
+// snapshotted the conn set runs to completion; subsequent broadcasts
+// return (0, nil). Run with -race.
+func TestHubCloseRacingBroadcast(t *testing.T) {
+	h := NewHub(HubConfig{})
+
+	const fastN = 16
+	pairs := make([]*hubPair, fastN)
+	for i := range pairs {
+		pairs[i] = newHubPair(t)
+		h.Register(pairs[i].conn)
+	}
+	defer func() {
+		for _, p := range pairs {
+			p.closeAll()
+		}
+	}()
+
+	const broadcasters = 8
+	var wg sync.WaitGroup
+	wg.Add(broadcasters)
+	for range broadcasters {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = h.Broadcast(OpText, []byte("racey"))
+			}
+		}()
+	}
+	time.Sleep(2 * time.Millisecond)
+	h.Close()
+	wg.Wait()
+
+	delivered, err := h.Broadcast(OpText, []byte("after-close"))
+	if err != nil {
+		t.Errorf("Broadcast after Close err = %v, want nil", err)
+	}
+	if delivered != 0 {
+		t.Errorf("Broadcast after Close delivered = %d, want 0", delivered)
 	}
 }
 

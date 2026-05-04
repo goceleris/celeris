@@ -12,25 +12,27 @@ const (
 	DefaultHeartbeatInterval = 15 * time.Second
 )
 
-// SlowClientAction selects what the middleware does when a per-client
-// outbound queue is full at Send time. Used together with [Config.MaxQueueDepth]
-// and [Config.OnSlowClient].
-type SlowClientAction uint8
+// ClientPolicy selects what the middleware does when a per-client
+// outbound queue is full at Send time. Used together with
+// [Config.MaxQueueDepth] and [Config.OnSlowClient]. Naming mirrors
+// [BrokerPolicy] and websocket.HubPolicy for ecosystem consistency.
+type ClientPolicy uint8
 
 const (
-	// ActionDropEvent silently discards the Event and increments
+	// ClientPolicyDrop silently discards the Event and increments
 	// [Client.DroppedEvents]. Send returns nil.
-	ActionDropEvent SlowClientAction = iota
+	ClientPolicyDrop ClientPolicy = iota
 
-	// ActionDisconnectClient cancels the client's context, causing the
+	// ClientPolicyDisconnect cancels the client's context, causing the
 	// handler goroutine to exit. Send returns [ErrClientClosed].
-	ActionDisconnectClient
+	ClientPolicyDisconnect
 
-	// ActionBlock falls back to the legacy blocking semantics: Send waits
-	// for queue space until the context is cancelled. Provided so opt-in
-	// users who want backpressure on a single subscriber without disabling
-	// the queue infrastructure for the rest can do so.
-	ActionBlock
+	// ClientPolicyBlock falls back to the legacy blocking semantics:
+	// Send waits for queue space until the context is cancelled.
+	// Provided so opt-in users who want backpressure on a single
+	// subscriber without disabling the queue infrastructure for the
+	// rest can do so.
+	ClientPolicyBlock
 )
 
 // Config defines the SSE middleware configuration.
@@ -53,15 +55,15 @@ type Config struct {
 	// unbounded — the legacy blocking Send semantics are preserved exactly.
 	// When set, Send enqueues and returns immediately; a per-client drain
 	// goroutine writes to the wire. If the queue is full at Send time,
-	// OnSlowClient is invoked; if OnSlowClient is nil, [ActionDropEvent]
+	// OnSlowClient is invoked; if OnSlowClient is nil, [ClientPolicyDrop]
 	// is the default.
 	MaxQueueDepth int
 
 	// OnSlowClient decides what to do when [MaxQueueDepth] is exceeded.
 	// Only consulted when MaxQueueDepth > 0. The hook may inspect c (via
 	// DroppedEvents/QueueDepth) and the dropped Event to drive
-	// observability or escalating policies. Default: ActionDropEvent.
-	OnSlowClient func(c *Client, e Event) SlowClientAction
+	// observability or escalating policies. Default: [ClientPolicyDrop].
+	OnSlowClient func(c *Client, e Event) ClientPolicy
 
 	// ReplayStore persists events for Last-Event-ID resume. When nil
 	// (default), Client.LastEventID() returns the header but replay is

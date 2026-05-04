@@ -61,10 +61,16 @@ func TestPreparedEventFormatOnce(t *testing.T) {
 	if got := string(pe.Bytes()); got != want {
 		t.Errorf("Bytes() = %q, want %q", got, want)
 	}
-	first := &pe.Bytes()[0]
-	second := &pe.Bytes()[0]
-	if first != second {
-		t.Errorf("Bytes() returns a different backing array on repeated calls")
+	if pe.Len() != len(want) {
+		t.Errorf("Len() = %d, want %d", pe.Len(), len(want))
+	}
+	// Bytes() returns a defensive copy: mutating one returned slice
+	// must not be observable in a subsequent caller's view.
+	a := pe.Bytes()
+	a[0] = 'X'
+	b := pe.Bytes()
+	if string(b) != want {
+		t.Errorf("Bytes() returned data tainted by prior mutation: %q", b)
 	}
 }
 
@@ -339,6 +345,51 @@ func TestBrokerSubscribeAfterClose(t *testing.T) {
 			t.Errorf("Subscribe after Close registered the subscriber")
 		}
 	})
+}
+
+// TestBrokerUnsubscribeIdempotent — calling the returned unsubscribe
+// closure twice must be a no-op, not double-decrement SubscriberCount
+// or panic on close-of-closed-channel.
+func TestBrokerUnsubscribeIdempotent(t *testing.T) {
+	b := NewBroker(BrokerConfig{})
+	defer b.Close()
+
+	runWithClient(t, Config{}, func(c *Client) {
+		unsub := b.Subscribe(c)
+		if got := b.SubscriberCount(); got != 1 {
+			t.Errorf("after Subscribe SubscriberCount = %d, want 1", got)
+		}
+		unsub()
+		if got := b.SubscriberCount(); got != 0 {
+			t.Errorf("after first unsub SubscriberCount = %d, want 0", got)
+		}
+		unsub() // must not panic
+		if got := b.SubscriberCount(); got != 0 {
+			t.Errorf("after second unsub SubscriberCount = %d, want 0", got)
+		}
+	})
+}
+
+// TestBrokerSubscribeRacingClose stresses the order between a fresh
+// Subscribe and Close. Both paths take the broker mutex, so either
+// Subscribe wins (state added, then Close removes it) or Close wins
+// (Subscribe returns a no-op unsubscribe). Either is fine; what we
+// guard against is panics or zombie drain goroutines after Close.
+func TestBrokerSubscribeRacingClose(t *testing.T) {
+	const workers = 32
+	for range 50 {
+		b := NewBroker(BrokerConfig{SubscriberBuffer: 4})
+
+		_, teardown := runWithClients(t, workers, func(c *Client) {
+			unsub := b.Subscribe(c)
+			defer unsub()
+		})
+		// Race window: half the workers may still be inside Subscribe
+		// when Close fires.
+		time.Sleep(50 * time.Microsecond)
+		b.Close()
+		teardown()
+	}
 }
 
 // BenchmarkSSEBrokerPublishTo100Subs — exit-criterion benchmark from

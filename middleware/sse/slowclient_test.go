@@ -77,6 +77,74 @@ func newGatedContext(t *testing.T) (*celeris.Context, *gatedStreamer) {
 	return ctx, g
 }
 
+// TestPooledClientStateReset — running two sequential handlers through
+// the sync.Pool must not leak queued-mode state from the first run
+// into the second. Specifically: queue, drainDone, queueClosed,
+// onSlowClient, droppedEvents, replayStore must all be zeroed by
+// releaseClient between handler invocations.
+func TestPooledClientStateReset(t *testing.T) {
+	captured := make(chan *Client, 2)
+
+	// First handler: opt into the queued + replay paths so every new
+	// state field is non-zero by the time releaseClient fires.
+	cfg1 := Config{
+		HeartbeatInterval: -1,
+		MaxQueueDepth:     8,
+		ReplayStore:       NewRingBuffer(4),
+		OnSlowClient:      func(*Client, Event) ClientPolicy { return ClientPolicyDrop },
+		Handler: func(c *Client) {
+			_ = c.Send(Event{Data: "first"})
+			captured <- c
+		},
+	}
+	ctx1, _ := newSSEContext(t)
+	if err := New(cfg1)(ctx1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second handler: legacy blocking mode, no replay. The Client
+	// pulled from the pool must look like a fresh acquisition — every
+	// new state field zero.
+	cfg2 := Config{
+		HeartbeatInterval: -1,
+		Handler: func(c *Client) {
+			captured <- c
+			if c.queue != nil {
+				t.Errorf("pooled client carried queue from prior run: %v", c.queue)
+			}
+			if c.drainDone != nil {
+				t.Errorf("pooled client carried drainDone from prior run")
+			}
+			if c.queueClosed.Load() {
+				t.Errorf("pooled client carried queueClosed=true from prior run")
+			}
+			if c.onSlowClient != nil {
+				t.Errorf("pooled client carried onSlowClient from prior run")
+			}
+			if got := c.DroppedEvents(); got != 0 {
+				t.Errorf("pooled client carried DroppedEvents=%d from prior run", got)
+			}
+			if c.replayStore != nil {
+				t.Errorf("pooled client carried replayStore from prior run")
+			}
+		},
+	}
+	ctx2, _ := newSSEContext(t)
+	if err := New(cfg2)(ctx2); err != nil {
+		t.Fatal(err)
+	}
+
+	first := <-captured
+	second := <-captured
+	// Sanity: under sync.Pool the two handlers are very likely to share
+	// a Client instance (single-goroutine sequential run). If the
+	// runtime decides not to recycle, the test still verifies the
+	// fresh-state property — just less directly.
+	if first == second {
+		t.Logf("Client recycled across handlers — full reset path exercised")
+	}
+}
+
 // TestSlowClientLegacyBlocking pins the no-opt-in path: with MaxQueueDepth=0
 // the queue/drain machinery is dormant and Send writes synchronously.
 func TestSlowClientLegacyBlocking(t *testing.T) {
@@ -157,8 +225,8 @@ func TestSlowClientDisconnect(t *testing.T) {
 	handler := New(Config{
 		HeartbeatInterval: -1,
 		MaxQueueDepth:     1,
-		OnSlowClient: func(_ *Client, _ Event) SlowClientAction {
-			return ActionDisconnectClient
+		OnSlowClient: func(_ *Client, _ Event) ClientPolicy {
+			return ClientPolicyDisconnect
 		},
 		Handler: func(client *Client) {
 			for range 8 {
@@ -182,7 +250,7 @@ func TestSlowClientDisconnect(t *testing.T) {
 	}
 }
 
-// TestSlowClientBlockPolicy verifies ActionBlock falls through to a blocking
+// TestSlowClientBlockPolicy verifies ClientPolicyBlock falls through to a blocking
 // queue send: total Send time stretches to at least the gate-release delay
 // because at least one Send must wait on drain to free a slot.
 func TestSlowClientBlockPolicy(t *testing.T) {
@@ -200,14 +268,14 @@ func TestSlowClientBlockPolicy(t *testing.T) {
 	handler := New(Config{
 		HeartbeatInterval: -1,
 		MaxQueueDepth:     queueSize,
-		OnSlowClient: func(_ *Client, _ Event) SlowClientAction {
-			return ActionBlock
+		OnSlowClient: func(_ *Client, _ Event) ClientPolicy {
+			return ClientPolicyBlock
 		},
 		Handler: func(client *Client) {
 			start := time.Now()
 			for range total {
 				if err := client.Send(Event{Data: "x"}); err != nil {
-					t.Errorf("Send under ActionBlock returned %v", err)
+					t.Errorf("Send under ClientPolicyBlock returned %v", err)
 				}
 			}
 			blockedFor = time.Since(start)
@@ -218,7 +286,7 @@ func TestSlowClientBlockPolicy(t *testing.T) {
 	}
 	floor := gateDelay - 5*time.Millisecond
 	if blockedFor < floor {
-		t.Errorf("ActionBlock total Send time %v < %v — block path did not engage", blockedFor, floor)
+		t.Errorf("ClientPolicyBlock total Send time %v < %v — block path did not engage", blockedFor, floor)
 	}
 }
 

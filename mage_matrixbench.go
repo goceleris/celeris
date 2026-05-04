@@ -116,6 +116,23 @@ func MatrixBenchProfile() error {
 // run completes without aborting, the subsequent performance
 // matrix can be trusted to measure real numbers, not to be
 // hunting bugs in the background.
+// MatrixBenchStrict runs the perfmatrix runner with the race detector
+// and checkptr enabled — the release-gate matrix that catches data races,
+// pointer-arithmetic bugs, and similar runtime issues across every
+// (server × scenario × config) cell.
+//
+// Knobs (env, all optional):
+//
+//	PERFMATRIX_RUNS         repeats per cell (default 3)
+//	PERFMATRIX_DURATION     measured duration per run  (default 5s)
+//	PERFMATRIX_WARMUP       warmup before each measured run (default 1s)
+//	PERFMATRIX_CELLS        explicit cell glob (overrides defaults)
+//	PERFMATRIX_SERVICES     "local" (Docker-backed; default) or "none"
+//	                         (no Docker; auto-excludes driver-*/* cells)
+//
+// On Docker-less hosts (the cluster bench targets via ClusterGoGate)
+// pass PERFMATRIX_SERVICES=none. The runner skips driver-backed cells
+// and the strict matrix focuses on engine + protocol correctness.
 func MatrixBenchStrict() error {
 	runs, _ := strconv.Atoi(envOrDefault("PERFMATRIX_RUNS", "3"))
 	durStr := envOrDefault("PERFMATRIX_DURATION", "5s")
@@ -143,10 +160,11 @@ func MatrixBenchStrict() error {
 	// driver-backed scenarios so the runner does not attempt to bench
 	// cells that would deadlock or fail-fast against missing
 	// postgres / redis / memcached. Cell IDs are <scenario>/<server>;
-	// driver scenarios are named driver-pg-*, driver-redis-*,
-	// driver-mc-*, plus the session-* scenarios that share their backends.
+	// the only backend-bound scenarios in test/perfmatrix today are
+	// driver-pg-*, driver-redis-*, driver-mc-*, driver-session-rw —
+	// all caught by the single driver-*/* glob.
 	if services == "none" {
-		defaultExcludes += ",!driver-*/*,!session-*/*"
+		defaultExcludes += ",!driver-*/*"
 	}
 	cells := envOrDefault("PERFMATRIX_CELLS", "*,"+defaultExcludes)
 	return runMatrix(matrixFlags{

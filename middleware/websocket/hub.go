@@ -49,6 +49,11 @@ type Hub struct {
 	mu     sync.RWMutex
 	conns  map[*Conn]struct{}
 	closed bool
+	// inflight counts in-flight Broadcast / BroadcastPrepared /
+	// BroadcastFilter calls so Close can wait for them to drain. The
+	// counter is incremented under RLock at snapshot time and
+	// decremented when dispatch returns.
+	inflight sync.WaitGroup
 }
 
 // NewHub constructs a Hub with the given config.
@@ -103,14 +108,21 @@ func (h *Hub) Broadcast(messageType MessageType, data []byte) (delivered int, er
 // BroadcastPrepared dispatches an already-prepared message — useful in
 // dispatch loops where the same payload is published repeatedly.
 func (h *Hub) BroadcastPrepared(pm *PreparedMessage) (int, error) {
-	snap := h.snapshot()
+	snap, ok := h.snapshot()
+	if !ok {
+		return 0, nil
+	}
+	defer h.inflight.Done()
 	return h.dispatch(snap, pm, nil)
 }
 
 // BroadcastFilter sends only to Conns where pred returns true. Common
 // for room / channel routing — filter on Conn.Locals without building a
-// second Hub. The scan happens under the read lock, so a parallel
-// Register does not serialise.
+// second Hub.
+//
+// The membership snapshot happens under the Hub's read lock; pred is
+// invoked LOCK-FREE against that snapshot. Parallel Register / unregister
+// calls during dispatch are not observed by this broadcast.
 func (h *Hub) BroadcastFilter(messageType MessageType, data []byte, pred func(*Conn) bool) (int, error) {
 	if pred == nil {
 		return h.Broadcast(messageType, data)
@@ -119,18 +131,30 @@ func (h *Hub) BroadcastFilter(messageType MessageType, data []byte, pred func(*C
 	if err != nil {
 		return 0, err
 	}
-	snap := h.snapshot()
+	snap, ok := h.snapshot()
+	if !ok {
+		return 0, nil
+	}
+	defer h.inflight.Done()
 	return h.dispatch(snap, pm, pred)
 }
 
-func (h *Hub) snapshot() []*Conn {
+// snapshot copies the current conn set under RLock and registers an
+// inflight broadcast with the Hub's WaitGroup. Returns ok=false if the
+// Hub is already closed (so the caller skips dispatch and the WaitGroup
+// is NOT incremented).
+func (h *Hub) snapshot() ([]*Conn, bool) {
 	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.closed {
+		return nil, false
+	}
+	h.inflight.Add(1)
 	out := make([]*Conn, 0, len(h.conns))
 	for c := range h.conns {
 		out = append(out, c)
 	}
-	h.mu.RUnlock()
-	return out
+	return out, true
 }
 
 // dispatch performs the per-Conn write for snap. Removals/closes
@@ -184,8 +208,14 @@ func (h *Hub) unregister(c *Conn) {
 }
 
 // Close unregisters every Conn (applying [HubPolicyClose] to each) and
-// blocks subsequent Register calls. Idempotent. After Close returns the
-// Hub is empty and broadcasts deliver to zero conns.
+// blocks subsequent Register calls. Idempotent.
+//
+// Ordering guarantee: any in-flight Broadcast / BroadcastPrepared /
+// BroadcastFilter that already snapshotted the conn set runs to
+// completion before Close returns. Subsequent broadcasts return
+// (delivered=0, err=nil) without dispatching. This makes Close safe to
+// call from a shutdown path that needs to know "no more wire writes
+// will happen after this returns".
 func (h *Hub) Close() {
 	h.mu.Lock()
 	if h.closed {
@@ -199,6 +229,9 @@ func (h *Hub) Close() {
 	}
 	h.conns = map[*Conn]struct{}{}
 	h.mu.Unlock()
+	// Wait for any broadcast that already snapshotted the conn set to
+	// finish dispatching before we close the conns out from under it.
+	h.inflight.Wait()
 	for _, c := range conns {
 		_ = c.Close()
 	}
