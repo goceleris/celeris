@@ -1,0 +1,140 @@
+---
+# Stage Go + celeris source on a cluster node, run a mage target there,
+# fetch the log, then tear everything down. Used for linux-only or
+# port-bound gates (mage FullCompliance, mage MatrixBenchStrict) that
+# the dev Mac cannot run locally.
+#
+# Pristine semantics — every artifact lives under {{ bench_root }} so
+# the always-block can rm -rf it. Nothing is written to ~ on the node.
+#
+# Required extra-vars (set by `mage ClusterGoGate`):
+#   gate_target_host:     inventory_hostname to run the mage gate on
+#                         (default: msa2-client — the loadgen node has
+#                         the fewest other responsibilities)
+#   gate_mage_targets:    space-separated mage targets, e.g.
+#                         "FullCompliance" or "MatrixBenchStrict"
+#   go_tarball_local:     absolute path on dev Mac to a
+#                         go<ver>.linux-amd64.tar.gz tarball
+#   source_tarball_local: absolute path on dev Mac to a tar.gz of the
+#                         current branch (made via `git archive HEAD`)
+#   results_local_dir:    where to fetch the gate log back to on the Mac
+#   gate_timeout_seconds: ansible task timeout (default: 28800 = 8 h —
+#                         covers MatrixBenchStrict's worst case)
+#   gate_env:             optional dict of extra env vars to export
+#                         before running mage (e.g. PERFMATRIX_DURATION)
+
+- name: Run mage gate on a cluster node
+  hosts: "{{ gate_target_host | default('msa2-client') }}"
+  gather_facts: true
+  tasks:
+    - name: Ensure transient root exists
+      ansible.builtin.file:
+        path: "{{ bench_root }}"
+        state: directory
+        mode: '0755'
+
+    - block:
+        - name: Push Go tarball
+          ansible.builtin.copy:
+            src: "{{ go_tarball_local }}"
+            dest: "{{ bench_root }}/go.tar.gz"
+            mode: '0644'
+
+        - name: Push celeris source tarball
+          ansible.builtin.copy:
+            src: "{{ source_tarball_local }}"
+            dest: "{{ bench_root }}/source.tar.gz"
+            mode: '0644'
+
+        - name: Extract Go into staging dir (NOT ~)
+          ansible.builtin.unarchive:
+            src: "{{ bench_root }}/go.tar.gz"
+            dest: "{{ bench_root }}/"
+            remote_src: true
+            creates: "{{ bench_root }}/go/bin/go"
+
+        - name: Create celeris source dir
+          ansible.builtin.file:
+            path: "{{ bench_root }}/celeris"
+            state: directory
+            mode: '0755'
+
+        - name: Extract celeris source
+          ansible.builtin.unarchive:
+            src: "{{ bench_root }}/source.tar.gz"
+            dest: "{{ bench_root }}/celeris/"
+            remote_src: true
+
+        - name: Install mage into staging GOPATH
+          environment:
+            PATH: "{{ bench_root }}/go/bin:{{ ansible_env.PATH }}"
+            GOROOT: "{{ bench_root }}/go"
+            GOPATH: "{{ bench_root }}/gopath"
+            GOCACHE: "{{ bench_root }}/gocache"
+            GOMODCACHE: "{{ bench_root }}/gomodcache"
+            HOME: "{{ ansible_env.HOME }}"
+          ansible.builtin.shell: |
+            set -e
+            mkdir -p {{ bench_root }}/gopath/bin
+            go install github.com/magefile/mage@latest
+            ls -l {{ bench_root }}/gopath/bin/mage
+          args:
+            executable: /bin/bash
+
+        - name: Run mage gate(s) — capture output to a log
+          environment:
+            PATH: "{{ bench_root }}/go/bin:{{ bench_root }}/gopath/bin:{{ ansible_env.PATH }}"
+            GOROOT: "{{ bench_root }}/go"
+            GOPATH: "{{ bench_root }}/gopath"
+            GOCACHE: "{{ bench_root }}/gocache"
+            GOMODCACHE: "{{ bench_root }}/gomodcache"
+            HOME: "{{ ansible_env.HOME }}"
+          # Per-target env knobs (optional, e.g. PERFMATRIX_DURATION) get
+          # exported before mage runs. The shell module's `environment`
+          # cannot take a dynamic dict, so we expand inline.
+          ansible.builtin.shell: |
+            set -e -o pipefail
+            cd {{ bench_root }}/celeris
+            {% if gate_env is defined %}
+            {% for k, v in gate_env.items() %}
+            export {{ k }}={{ v | quote }}
+            {% endfor %}
+            {% endif %}
+            for tgt in {{ gate_mage_targets }}; do
+              echo "=== Running mage $tgt on $(hostname) ==="
+              mage "$tgt"
+            done 2>&1 | tee {{ bench_root }}/gate.log
+          args:
+            executable: /bin/bash
+          async: "{{ gate_timeout_seconds | default(28800) }}"
+          poll: 30
+          register: gate_result
+          # Note: mage exits non-zero on first failing target; tee
+          # preserves the log even when the pipeline fails.
+
+      always:
+        - name: Fetch gate log back to dev machine
+          ansible.builtin.fetch:
+            src: "{{ bench_root }}/gate.log"
+            dest: "{{ results_local_dir }}/"
+            flat: true
+            fail_on_missing: false
+
+        - name: Drop staging dir (Go, source, gopath, gocache — everything)
+          ansible.builtin.file:
+            path: "{{ bench_root }}"
+            state: absent
+
+        - name: Verify nothing of ours remains in ~
+          ansible.builtin.shell: |
+            for p in ~/go ~/goroot ~/gopath ~/celeris ~/.cache/go-build ~/go-build; do
+              if [ -e "$p" ]; then echo "LEAK: $p"; fi
+            done
+            true
+          register: leak_check
+          changed_when: false
+
+        - name: Fail if anything leaked into ~
+          ansible.builtin.fail:
+            msg: "Pristine violation — found persistent files: {{ leak_check.stdout }}"
+          when: leak_check.stdout | length > 0

@@ -367,17 +367,23 @@ func New(config ...Config) celeris.HandlerFunc {
 			done()
 		}()
 
-		// Send initial retry interval.
+		// Flush the SSE response headers immediately so EventSource
+		// clients can begin reading. Without this, the std engine
+		// buffers headers until the first body byte — fine for
+		// handlers that Send right away, but a deadlock for broker
+		// patterns that Subscribe and wait for the next Publish.
+		// The retry line piggybacks on the same flush when set.
+		client.mu.Lock()
+		var err error
 		if len(retryLine) > 0 {
-			client.mu.Lock()
-			_, err := sw.Write(retryLine)
-			if err == nil {
-				err = sw.Flush()
-			}
-			client.mu.Unlock()
-			if err != nil {
-				return nil
-			}
+			_, err = sw.Write(retryLine)
+		}
+		if err == nil {
+			err = sw.Flush()
+		}
+		client.mu.Unlock()
+		if err != nil {
+			return nil
 		}
 
 		// Bind the replay store to the client BEFORE the drain goroutine

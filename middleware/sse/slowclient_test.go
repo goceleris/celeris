@@ -42,8 +42,12 @@ func (g *gatedStreamer) Write(_ *stream.Stream, data []byte) error {
 	return nil
 }
 
+// Flush is not gated. The SSE middleware flushes once at handler start
+// to push response headers immediately (real-world behavior — without
+// this an EventSource client never sees the response). Gating Flush
+// would deadlock that initial flush; gating only Write keeps the test's
+// drain-progress control while letting the headers through.
 func (g *gatedStreamer) Flush(_ *stream.Stream) error {
-	<-g.writeReady
 	g.mu.Lock()
 	g.flushed++
 	g.mu.Unlock()

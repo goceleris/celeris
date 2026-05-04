@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,28 +35,44 @@ type subscriber struct {
 	done chan struct{}
 }
 
-// attachSubscribers opens n SSE connections to url and starts a body
-// drainer per connection so the server's writes never stall.
+// attachSubscribers opens n SSE connections to url in parallel and
+// starts a body drainer per connection. Each Do() may block until the
+// server flushes response headers — for libraries that delay headers
+// until the first event (tmaxmax/go-sse via Joe.Subscribe), the bench
+// caller must publish a warmup event during attach so the goroutines
+// can complete.
 func attachSubscribers(b *testing.B, client *http.Client, url string, n int) ([]subscriber, func()) {
 	b.Helper()
-	subs := make([]subscriber, 0, n)
-	for range n {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
-		resp, err := client.Do(req)
-		if err != nil {
-			b.Fatalf("subscribe: %v", err)
-		}
-		done := make(chan struct{})
-		go func(r *http.Response) {
-			defer close(done)
-			_, _ = io.Copy(io.Discard, r.Body)
-		}(resp)
-		subs = append(subs, subscriber{resp: resp, done: done})
+	subs := make([]subscriber, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(idx int) {
+			defer wg.Done()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+			req.Header.Set("Accept", "text/event-stream")
+			resp, err := client.Do(req)
+			if err != nil {
+				b.Errorf("subscribe[%d]: %v", idx, err)
+				return
+			}
+			done := make(chan struct{})
+			go func(r *http.Response) {
+				defer close(done)
+				_, _ = io.Copy(io.Discard, r.Body)
+			}(resp)
+			subs[idx] = subscriber{resp: resp, done: done}
+		}(i)
 	}
+	wg.Wait()
 	cleanup := func() {
 		for _, s := range subs {
-			_ = s.resp.Body.Close()
-			<-s.done
+			if s.resp != nil {
+				_ = s.resp.Body.Close()
+			}
+			if s.done != nil {
+				<-s.done
+			}
 		}
 	}
 	return subs, cleanup
@@ -107,9 +124,30 @@ func benchmarkGoSSE(b *testing.B, n int) {
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 
+	// go-sse buffers response headers until the first published event
+	// (Joe.Subscribe blocks the request goroutine before any write),
+	// so without a publisher running concurrently with attach, every
+	// subscriber's Do() would hang. The warmup goroutine flushes the
+	// initial headers; we stop it once attach completes.
+	warmupStop := make(chan struct{})
+	warmupMsg := &gosse.Message{}
+	warmupMsg.AppendData("warmup")
+	go func() {
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-warmupStop:
+				return
+			case <-t.C:
+				_ = server.Publish(warmupMsg)
+			}
+		}
+	}()
+
 	_, cleanup := attachSubscribers(b, ts.Client(), ts.URL, n)
+	close(warmupStop)
 	defer cleanup()
-	time.Sleep(100 * time.Millisecond)
 
 	msg := &gosse.Message{}
 	msg.AppendData("hello")

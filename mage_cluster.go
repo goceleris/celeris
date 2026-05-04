@@ -26,6 +26,7 @@ const (
 	clusterBenchPlaybook         = "cluster-bench.yml"
 	clusterCleanupPlaybook       = "cluster-cleanup.yml"
 	clusterDistributedPlaybook   = "cluster-distributed-bench.yml"
+	clusterGoGatePlaybook        = "cluster-go-gate.yml"
 
 	// perfmatrix lives in its own Go module (test/perfmatrix/go.mod).
 	// We cd in there before building runner/server.
@@ -276,6 +277,115 @@ func ClusterDistributedBenchParallel() error {
 	}
 	fmt.Println("\n=== Parallel cluster distributed bench complete on both targets ===")
 	return nil
+}
+
+// ClusterGoGate stages Go and the celeris source on a cluster node,
+// runs one or more mage targets there, fetches the log, and tears
+// everything down. Used for linux-only or port-bound gates that the
+// dev Mac cannot run locally (FullCompliance, MatrixBenchStrict).
+//
+// Pristine: every artifact lives under {{ bench_root }} on the node;
+// the always-block rm -rf's it. The playbook fails the run if anything
+// leaks into ~ on the node.
+//
+// Knobs (env):
+//
+//	CLUSTER_GO_TARGET     mage targets, space-separated  (required)
+//	CLUSTER_GO_HOST       inventory host                 (default: msa2-client)
+//	CLUSTER_GO_VERSION    Go version to stage            (default: 1.26.2)
+//	CLUSTER_GO_TIMEOUT    seconds                        (default: 28800 = 8h)
+func ClusterGoGate() error {
+	if err := requireAnsible(); err != nil {
+		return err
+	}
+	target := os.Getenv("CLUSTER_GO_TARGET")
+	if target == "" {
+		return fmt.Errorf("CLUSTER_GO_TARGET is required (e.g. \"FullCompliance\")")
+	}
+	host := envOrDefault("CLUSTER_GO_HOST", "msa2-client")
+	goVer := envOrDefault("CLUSTER_GO_VERSION", "1.26.2")
+	timeoutSec := envOrDefault("CLUSTER_GO_TIMEOUT", "28800")
+
+	stagingDir, err := os.MkdirTemp("", "celeris-go-gate-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stagingDir)
+
+	goTarball := filepath.Join(stagingDir, "go.linux-amd64.tar.gz")
+	if err := downloadGoTarball(goVer, goTarball); err != nil {
+		return fmt.Errorf("download Go %s: %w", goVer, err)
+	}
+
+	srcTarball := filepath.Join(stagingDir, "source.tar.gz")
+	if err := buildSourceTarball(srcTarball); err != nil {
+		return fmt.Errorf("build source tarball: %w", err)
+	}
+
+	ts := time.Now().UTC().Format("20060102-150405")
+	resultsDir, err := filepath.Abs(filepath.Join("results", ts+"-go-gate-"+host))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
+		return err
+	}
+
+	fmt.Printf("\n=== Cluster go-gate ===\n")
+	fmt.Printf("  host:           %s\n", host)
+	fmt.Printf("  mage target(s): %s\n", target)
+	fmt.Printf("  Go version:     %s\n", goVer)
+	fmt.Printf("  timeout:        %s s\n", timeoutSec)
+	fmt.Printf("  log → %s/gate.log\n\n", resultsDir)
+
+	args := []string{
+		"-i", "inventory.yml", clusterGoGatePlaybook,
+		"--extra-vars", "gate_target_host=" + host,
+		"--extra-vars", "gate_mage_targets=" + target,
+		"--extra-vars", "go_tarball_local=" + goTarball,
+		"--extra-vars", "source_tarball_local=" + srcTarball,
+		"--extra-vars", "results_local_dir=" + resultsDir,
+		"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
+	}
+	cmd := exec.Command("ansible-playbook", args...)
+	cmd.Dir = clusterAnsibleDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cluster go-gate failed: %w", err)
+	}
+	fmt.Printf("\n=== Cluster go-gate complete. Log in %s ===\n", resultsDir)
+	return nil
+}
+
+// downloadGoTarball fetches go<ver>.linux-amd64.tar.gz from go.dev/dl
+// into dst. Skips the download if dst already exists with non-zero size
+// (handy when iterating on the playbook).
+func downloadGoTarball(version, dst string) error {
+	if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
+		return nil
+	}
+	url := "https://go.dev/dl/go" + version + ".linux-amd64.tar.gz"
+	cmd := exec.Command("curl", "-fsSL", "-o", dst, url)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// buildSourceTarball runs `git archive HEAD | gzip > dst` to capture the
+// current branch state. Tracked files only — no /vendor, no .git, no
+// local artifacts. Identical to what dependabot or the GitHub PR diff
+// observes.
+func buildSourceTarball(dst string) error {
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	gitArchive := exec.Command("git", "archive", "--format=tar.gz", "HEAD")
+	gitArchive.Stdout = out
+	gitArchive.Stderr = os.Stderr
+	return gitArchive.Run()
 }
 
 // ClusterCleanup forces the cleanup phase across all nodes. Use after a
