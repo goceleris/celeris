@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -25,11 +26,30 @@ type Client struct {
 	buf         []byte
 	mu          sync.Mutex
 	closed      bool
+
+	// Queued-send mode (Config.MaxQueueDepth > 0). queue is nil in legacy
+	// blocking mode; a non-nil queue selects the asynchronous drain path.
+	queue         chan Event
+	drainDone     chan struct{}
+	onSlowClient  func(*Client, Event) SlowClientAction
+	droppedEvents atomic.Uint64
 }
 
 // Send sends a complete SSE event. Thread-safe (serialized with heartbeat writes).
 // Returns an error if the client has disconnected or the stream is closed.
+//
+// When [Config.MaxQueueDepth] is zero (default), Send writes directly to the
+// wire — historical blocking semantics. When MaxQueueDepth is positive Send
+// enqueues onto a bounded channel that a per-client goroutine drains; if the
+// queue is full Send dispatches the configured [Config.OnSlowClient] policy.
 func (c *Client) Send(e Event) error {
+	if c.queue != nil {
+		return c.sendQueued(e)
+	}
+	return c.sendBlocking(e)
+}
+
+func (c *Client) sendBlocking(e Event) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -50,6 +70,80 @@ func (c *Client) Send(e Event) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) sendQueued(e Event) error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.queue <- e:
+		return nil
+	default:
+	}
+
+	action := ActionDropEvent
+	if c.onSlowClient != nil {
+		action = c.onSlowClient(c, e)
+	}
+	switch action {
+	case ActionDisconnectClient:
+		c.droppedEvents.Add(1)
+		c.cancel()
+		return ErrClientClosed
+	case ActionBlock:
+		select {
+		case c.queue <- e:
+			return nil
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		}
+	default: // ActionDropEvent and any unknown value
+		c.droppedEvents.Add(1)
+		return nil
+	}
+}
+
+// drain pulls events off the per-client queue and writes them to the wire.
+// Started by [New] when Config.MaxQueueDepth > 0. The range exits when the
+// queue is closed by the handler defer (graceful close, remaining events
+// flushed) or when the closed flag flips after [Client.Close] (unhealthy
+// close, remaining events dropped — the connection is already gone).
+func (c *Client) drain() {
+	defer close(c.drainDone)
+	for e := range c.queue {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return
+		}
+		c.buf = formatEvent(c.buf, &e)
+		_, err := c.sw.Write(c.buf)
+		if err == nil {
+			err = c.sw.Flush()
+		}
+		c.mu.Unlock()
+		if err != nil {
+			c.cancel()
+			return
+		}
+	}
+}
+
+// DroppedEvents returns the cumulative count of events dropped under
+// [ActionDropEvent] (or [ActionDisconnectClient]) since this client connected.
+// Always zero when [Config.MaxQueueDepth] is zero.
+func (c *Client) DroppedEvents() uint64 {
+	return c.droppedEvents.Load()
+}
+
+// QueueDepth returns the current outbound-queue length, or zero when the
+// client is in legacy blocking mode.
+func (c *Client) QueueDepth() int {
+	if c.queue == nil {
+		return 0
+	}
+	return len(c.queue)
 }
 
 // SendData is a convenience for sending a data-only event.
@@ -128,6 +222,10 @@ func releaseClient(c *Client) {
 	c.ctx = nil
 	c.cancel = nil
 	c.lastEventID = ""
+	c.queue = nil
+	c.drainDone = nil
+	c.onSlowClient = nil
+	c.droppedEvents.Store(0)
 	if cap(c.buf) <= maxPooledBufSize {
 		clientPool.Put(c)
 	}
@@ -221,6 +319,17 @@ func New(config ...Config) celeris.HandlerFunc {
 		var heartbeatDone chan struct{}
 
 		defer func() {
+			// Close the queue first so the drain goroutine can flush every
+			// already-enqueued event before the underlying stream is shut.
+			// Closing happens AFTER the user's handler returns, so the
+			// "no Send after Handler returns" contract guarantees no
+			// concurrent writers panic on `send to closed channel`.
+			if client.queue != nil {
+				close(client.queue)
+			}
+			if client.drainDone != nil {
+				<-client.drainDone
+			}
 			_ = client.Close()
 			if heartbeatDone != nil {
 				<-heartbeatDone
@@ -243,6 +352,17 @@ func New(config ...Config) celeris.HandlerFunc {
 			if err != nil {
 				return nil
 			}
+		}
+
+		// Start per-client drain goroutine when queued-send mode is active.
+		// Stays in lockstep with the handler lifecycle: started after the
+		// retry line so the channel cannot leak events written before the
+		// client even saw the response, joined in the defer above.
+		if cfg.MaxQueueDepth > 0 {
+			client.queue = make(chan Event, cfg.MaxQueueDepth)
+			client.drainDone = make(chan struct{})
+			client.onSlowClient = cfg.OnSlowClient
+			go client.drain()
 		}
 
 		// Start heartbeat goroutine.
