@@ -279,21 +279,27 @@ func ClusterDistributedBenchParallel() error {
 	return nil
 }
 
-// ClusterGoGate stages Go and the celeris source on a cluster node,
-// runs one or more mage targets there, fetches the log, and tears
-// everything down. Used for linux-only or port-bound gates that the
-// dev Mac cannot run locally (FullCompliance, MatrixBenchStrict).
+// ClusterGoGate stages Go and the celeris source on one or more
+// cluster nodes (in parallel when multiple), runs one or more mage
+// targets there, fetches each host's log, and tears everything down.
+// Used for linux-only or port-bound gates that the dev Mac cannot run
+// locally (FullCompliance, MatrixBenchStrict).
 //
-// Pristine: every artifact lives under {{ bench_root }} on the node;
+// Pristine: every artifact lives under {{ bench_root }} on each node;
 // the always-block rm -rf's it. The playbook fails the run if anything
 // leaks into ~ on the node.
 //
 // Knobs (env):
 //
 //	CLUSTER_GO_TARGET     mage targets, space-separated  (required)
-//	CLUSTER_GO_HOST       inventory host                 (default: msa2-client)
+//	CLUSTER_GO_HOSTS      comma-separated host list      (default: bench targets, msa2-server,msr1)
+//	CLUSTER_GO_HOST       legacy alias for single host
 //	CLUSTER_GO_VERSION    Go version to stage            (default: 1.26.2)
-//	CLUSTER_GO_TIMEOUT    seconds                        (default: 28800 = 8h)
+//	CLUSTER_GO_TIMEOUT    seconds per host               (default: 28800 = 8h)
+//
+// When run on more than one host the per-host gate logs land in
+// results/<ts>-go-gate-<host>/gate.log and the overall mage target
+// fails if any host fails (each is reported with its own error).
 func ClusterGoGate() error {
 	if err := requireAnsible(); err != nil {
 		return err
@@ -302,19 +308,35 @@ func ClusterGoGate() error {
 	if target == "" {
 		return fmt.Errorf("CLUSTER_GO_TARGET is required (e.g. \"FullCompliance\")")
 	}
-	host := envOrDefault("CLUSTER_GO_HOST", "msa2-client")
+	// Resolve host list. CLUSTER_GO_HOSTS wins (comma-separated);
+	// CLUSTER_GO_HOST is the legacy single-host alias; default is the
+	// bench-target group (msa2-server, msr1) so MatrixBenchStrict and
+	// kin run on both arch'd nodes by default.
+	hostsRaw := os.Getenv("CLUSTER_GO_HOSTS")
+	if hostsRaw == "" {
+		hostsRaw = os.Getenv("CLUSTER_GO_HOST")
+	}
+	if hostsRaw == "" {
+		hostsRaw = "msa2-server,msr1"
+	}
+	var hosts []string
+	for _, h := range strings.Split(hostsRaw, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
 	goVer := envOrDefault("CLUSTER_GO_VERSION", "1.26.2")
 	timeoutSec := envOrDefault("CLUSTER_GO_TIMEOUT", "28800")
 
+	// Shared staging dir for the multi-host run: Go tarballs (both
+	// arches) + source tarball + extras yaml live here once, are
+	// pushed N times to the N target hosts.
 	stagingDir, err := os.MkdirTemp("", "celeris-go-gate-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(stagingDir)
 
-	// Download both arch tarballs; the playbook picks the right one
-	// from ansible_architecture so the same staging dir works for any
-	// host. msa2-* are amd64; msr1 is arm64.
 	goAmd64 := filepath.Join(stagingDir, "go.linux-amd64.tar.gz")
 	goArm64 := filepath.Join(stagingDir, "go.linux-arm64.tar.gz")
 	if err := downloadGoTarball(goVer, "amd64", goAmd64); err != nil {
@@ -330,20 +352,12 @@ func ClusterGoGate() error {
 	}
 
 	ts := time.Now().UTC().Format("20060102-150405")
-	resultsDir, err := filepath.Abs(filepath.Join("results", ts+"-go-gate-"+host))
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
-		return err
-	}
 
 	fmt.Printf("\n=== Cluster go-gate ===\n")
-	fmt.Printf("  host:           %s\n", host)
+	fmt.Printf("  hosts:          %s\n", strings.Join(hosts, ", "))
 	fmt.Printf("  mage target(s): %s\n", target)
 	fmt.Printf("  Go version:     %s\n", goVer)
-	fmt.Printf("  timeout:        %s s\n", timeoutSec)
-	fmt.Printf("  log → %s/gate.log\n\n", resultsDir)
+	fmt.Printf("  timeout/host:   %s s\n\n", timeoutSec)
 
 	// Forward any PERFMATRIX_* / FUZZ_* / SOAK_* / BENCHCMP_* env vars
 	// the user set locally to the remote shell. We render them as
@@ -372,36 +386,73 @@ func ClusterGoGate() error {
 	// alongside the staging dir and pass via @path. Single-line vars
 	// stay on the CLI for clarity.
 	extrasYAML := filepath.Join(stagingDir, "extras.yml")
-	yaml, err := os.Create(extrasYAML)
+	yamlF, err := os.Create(extrasYAML)
 	if err != nil {
 		return fmt.Errorf("create extras.yml: %w", err)
 	}
-	fmt.Fprintln(yaml, "---")
-	fmt.Fprintln(yaml, "gate_env_exports: |")
+	fmt.Fprintln(yamlF, "---")
+	fmt.Fprintln(yamlF, "gate_env_exports: |")
 	for _, line := range strings.Split(strings.TrimRight(envExports.String(), "\n"), "\n") {
-		fmt.Fprintln(yaml, "  "+line)
+		fmt.Fprintln(yamlF, "  "+line)
 	}
-	yaml.Close()
+	yamlF.Close()
 
-	args := []string{
-		"-i", "inventory.yml", clusterGoGatePlaybook,
-		"--extra-vars", "gate_target_host=" + host,
-		"--extra-vars", "gate_mage_targets=" + target,
-		"--extra-vars", "go_tarball_amd64=" + goAmd64,
-		"--extra-vars", "go_tarball_arm64=" + goArm64,
-		"--extra-vars", "source_tarball_local=" + srcTarball,
-		"--extra-vars", "results_local_dir=" + resultsDir,
-		"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
-		"--extra-vars", "@" + extrasYAML,
+	// Fan out across hosts in parallel. Each host gets its own
+	// per-host results dir + ansible-playbook subprocess; the shared
+	// staging dir holds the inputs (Go tarballs, source, extras).
+	type hostResult struct {
+		host       string
+		resultsDir string
+		err        error
 	}
-	cmd := exec.Command("ansible-playbook", args...)
-	cmd.Dir = clusterAnsibleDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cluster go-gate failed: %w", err)
+	results := make(chan hostResult, len(hosts))
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+			resultsDir, err := filepath.Abs(filepath.Join("results", ts+"-go-gate-"+host))
+			if err != nil {
+				results <- hostResult{host: host, err: err}
+				return
+			}
+			if err := os.MkdirAll(resultsDir, 0o755); err != nil {
+				results <- hostResult{host: host, err: err}
+				return
+			}
+			args := []string{
+				"-i", "inventory.yml", clusterGoGatePlaybook,
+				"--extra-vars", "gate_target_host=" + host,
+				"--extra-vars", "gate_mage_targets=" + target,
+				"--extra-vars", "go_tarball_amd64=" + goAmd64,
+				"--extra-vars", "go_tarball_arm64=" + goArm64,
+				"--extra-vars", "source_tarball_local=" + srcTarball,
+				"--extra-vars", "results_local_dir=" + resultsDir,
+				"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
+				"--extra-vars", "@" + extrasYAML,
+			}
+			cmd := exec.Command("ansible-playbook", args...)
+			cmd.Dir = clusterAnsibleDir
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			results <- hostResult{host: host, resultsDir: resultsDir, err: cmd.Run()}
+		}(h)
 	}
-	fmt.Printf("\n=== Cluster go-gate complete. Log in %s ===\n", resultsDir)
+	wg.Wait()
+	close(results)
+	var failed []string
+	for r := range results {
+		if r.err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", r.host, r.err))
+			fmt.Printf("=== %s: FAILED — log %s/gate.log ===\n", r.host, r.resultsDir)
+		} else {
+			fmt.Printf("=== %s: PASSED — log %s/gate.log ===\n", r.host, r.resultsDir)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("cluster go-gate failed on %d host(s): %s", len(failed), strings.Join(failed, "; "))
+	}
+	fmt.Printf("\n=== Cluster go-gate complete on %d host(s) ===\n", len(hosts))
 	return nil
 }
 
