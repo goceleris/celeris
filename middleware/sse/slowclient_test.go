@@ -64,12 +64,6 @@ func (g *gatedStreamer) release() {
 	}
 }
 
-func (g *gatedStreamer) chunkCount() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return len(g.chunks)
-}
-
 func newGatedContext(t *testing.T) (*celeris.Context, *gatedStreamer) {
 	t.Helper()
 	ctx, _ := celeristest.NewContextT(t, "GET", "/events")
@@ -107,10 +101,10 @@ func TestSlowClientLegacyBlocking(t *testing.T) {
 // asserts the configured drop policy increments DroppedEvents and leaves
 // QueueDepth saturated at the cap. The drain goroutine may have one event
 // in-flight (between channel-receive and gated Write), so the drop count is
-// either total-cap or total-cap-1 depending on scheduling.
+// either total-queueSize or total-queueSize-1 depending on scheduling.
 func TestSlowClientDropEvent(t *testing.T) {
 	ctx, gs := newGatedContext(t)
-	const cap = 4
+	const queueSize = 4
 	const total = 100
 
 	resultDropped := make(chan uint64, 1)
@@ -118,7 +112,7 @@ func TestSlowClientDropEvent(t *testing.T) {
 
 	handler := New(Config{
 		HeartbeatInterval: -1,
-		MaxQueueDepth:     cap,
+		MaxQueueDepth:     queueSize,
 		Handler: func(client *Client) {
 			for range total {
 				_ = client.Send(Event{Data: "x"})
@@ -134,10 +128,10 @@ func TestSlowClientDropEvent(t *testing.T) {
 	dropped := <-resultDropped
 	depth := <-resultDepth
 
-	if depth != cap {
-		t.Errorf("QueueDepth = %d, want %d (queue saturated)", depth, cap)
+	if depth != queueSize {
+		t.Errorf("QueueDepth = %d, want %d (queue saturated)", depth, queueSize)
 	}
-	minDrop, maxDrop := uint64(total-cap-1), uint64(total-cap)
+	minDrop, maxDrop := uint64(total-queueSize-1), uint64(total-queueSize)
 	if dropped < minDrop || dropped > maxDrop {
 		t.Errorf("DroppedEvents = %d, want %d..%d", dropped, minDrop, maxDrop)
 	}
@@ -189,7 +183,7 @@ func TestSlowClientDisconnect(t *testing.T) {
 // because at least one Send must wait on drain to free a slot.
 func TestSlowClientBlockPolicy(t *testing.T) {
 	ctx, gs := newGatedContext(t)
-	const cap = 2
+	const queueSize = 2
 	const total = 8
 	const gateDelay = 30 * time.Millisecond
 
@@ -201,7 +195,7 @@ func TestSlowClientBlockPolicy(t *testing.T) {
 	var blockedFor time.Duration
 	handler := New(Config{
 		HeartbeatInterval: -1,
-		MaxQueueDepth:     cap,
+		MaxQueueDepth:     queueSize,
 		OnSlowClient: func(_ *Client, _ Event) SlowClientAction {
 			return ActionBlock
 		},
@@ -218,12 +212,9 @@ func TestSlowClientBlockPolicy(t *testing.T) {
 	if err := handler(ctx); err != nil {
 		t.Fatal(err)
 	}
-	min := gateDelay - 5*time.Millisecond
-	if blockedFor < min {
-		t.Errorf("ActionBlock total Send time %v < %v — block path did not engage", blockedFor, min)
-	}
-	if dropped := uint64(0); blockedFor > 0 && dropped != 0 {
-		t.Errorf("DroppedEvents under ActionBlock = %d, want 0", dropped)
+	floor := gateDelay - 5*time.Millisecond
+	if blockedFor < floor {
+		t.Errorf("ActionBlock total Send time %v < %v — block path did not engage", blockedFor, floor)
 	}
 }
 

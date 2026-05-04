@@ -184,8 +184,8 @@ func TestHubOnSlowConnPolicies(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			slow := newConn(ctx, cancel, serverPipe, 1024, 1024)
-			defer clientPipe.Close()
-			defer slow.Close()
+			defer func() { _ = clientPipe.Close() }()
+			defer func() { _ = slow.Close() }()
 			_ = slow.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
 
 			h.Register(slow)

@@ -154,8 +154,15 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 			action = policy(c, pe)
 		}
 		if action == BrokerPolicyDisconnect {
-			b.removeSubscriber(c, slowStates[i])
+			state := slowStates[i]
+			b.removeSubscriber(c, state)
 			_ = c.Close()
+			// Wait for the drain goroutine to finish before letting
+			// the publisher continue. Without this join, the drain may
+			// still be reading c.closed when the SSE handler defer
+			// returns the Client to sync.Pool — race with the next
+			// handler's acquireClient writing c.closed = false.
+			<-state.done
 		}
 	}
 }

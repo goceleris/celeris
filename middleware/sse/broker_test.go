@@ -61,7 +61,9 @@ func TestPreparedEventFormatOnce(t *testing.T) {
 	if got := string(pe.Bytes()); got != want {
 		t.Errorf("Bytes() = %q, want %q", got, want)
 	}
-	if &pe.Bytes()[0] != &pe.Bytes()[0] {
+	first := &pe.Bytes()[0]
+	second := &pe.Bytes()[0]
+	if first != second {
 		t.Errorf("Bytes() returns a different backing array on repeated calls")
 	}
 }

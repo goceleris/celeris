@@ -45,11 +45,11 @@ func TestRingBufferAppendThenSince(t *testing.T) {
 // retained tail; Since on the cursor of a still-retained event returns
 // only the events strictly after it.
 func TestRingBufferRollover(t *testing.T) {
-	const cap = 4
-	r := NewRingBuffer(cap)
+	const ringSize = 4
+	r := NewRingBuffer(ringSize)
 	ctx := context.Background()
 
-	for i := 0; i < cap+2; i++ {
+	for i := 0; i < ringSize+2; i++ {
 		if _, err := r.Append(ctx, Event{Data: "x"}); err != nil {
 			t.Fatal(err)
 		}
@@ -59,8 +59,8 @@ func TestRingBufferRollover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Since(\"\"): %v", err)
 	}
-	if len(got) != cap {
-		t.Errorf("Since(\"\") returned %d, want %d (cap of retained tail)", len(got), cap)
+	if len(got) != ringSize {
+		t.Errorf("Since(\"\") returned %d, want %d (cap of retained tail)", len(got), ringSize)
 	}
 	if got[0].ID != "3" {
 		t.Errorf("oldest retained event ID = %q, want \"3\"", got[0].ID)

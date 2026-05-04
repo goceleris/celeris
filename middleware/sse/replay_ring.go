@@ -30,8 +30,8 @@ type ringEntry struct {
 type ringStore struct {
 	mu      sync.Mutex
 	entries []ringEntry
-	head    int    // index of the next slot to write
-	count   int    // number of valid entries (capped at cap)
+	head    int // index of the next slot to write
+	count   int // number of valid entries (capped at cap)
 	cap     int
 	nextSeq uint64
 }
