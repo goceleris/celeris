@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -346,10 +345,13 @@ func ClusterGoGate() error {
 	fmt.Printf("  timeout:        %s s\n", timeoutSec)
 	fmt.Printf("  log → %s/gate.log\n\n", resultsDir)
 
-	// Forward any PERFMATRIX_* / FUZZ_* / SOAK_* env vars the user set
-	// locally to the remote shell. The playbook reads gate_env (a JSON
-	// object) and exports each k=v before running mage.
-	gateEnv := map[string]string{}
+	// Forward any PERFMATRIX_* / FUZZ_* / SOAK_* / BENCHCMP_* env vars
+	// the user set locally to the remote shell. We render them as
+	// `export k=q` lines and pass the resulting string as an extra-var
+	// the playbook embeds into its shell command — simpler than a
+	// Jinja loop over a dict (--extra-vars values are always strings,
+	// so dict-shaped gate_env trips object/items errors).
+	var envExports strings.Builder
 	forwardPrefixes := []string{"PERFMATRIX_", "FUZZ_", "SOAK_", "BENCHCMP_"}
 	for _, kv := range os.Environ() {
 		eq := strings.IndexByte(kv, '=')
@@ -359,14 +361,10 @@ func ClusterGoGate() error {
 		k := kv[:eq]
 		for _, p := range forwardPrefixes {
 			if strings.HasPrefix(k, p) {
-				gateEnv[k] = kv[eq+1:]
+				fmt.Fprintf(&envExports, "export %s=%s\n", k, shellQuote(kv[eq+1:]))
 				break
 			}
 		}
-	}
-	gateEnvJSON, err := json.Marshal(gateEnv)
-	if err != nil {
-		return fmt.Errorf("encode gate_env: %w", err)
 	}
 
 	args := []string{
@@ -378,7 +376,7 @@ func ClusterGoGate() error {
 		"--extra-vars", "source_tarball_local=" + srcTarball,
 		"--extra-vars", "results_local_dir=" + resultsDir,
 		"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
-		"--extra-vars", "gate_env=" + string(gateEnvJSON),
+		"--extra-vars", "gate_env_exports=" + envExports.String(),
 	}
 	cmd := exec.Command("ansible-playbook", args...)
 	cmd.Dir = clusterAnsibleDir
@@ -389,6 +387,13 @@ func ClusterGoGate() error {
 	}
 	fmt.Printf("\n=== Cluster go-gate complete. Log in %s ===\n", resultsDir)
 	return nil
+}
+
+// shellQuote wraps s in single quotes safely for /bin/sh, so a value
+// containing spaces or shell metacharacters survives a literal `eval`
+// or `export` line. Embedded single quotes are split-and-re-escaped.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // downloadGoTarball fetches go<ver>.linux-<arch>.tar.gz from go.dev/dl

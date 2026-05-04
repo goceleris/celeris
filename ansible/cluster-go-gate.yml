@@ -120,17 +120,14 @@
             GOCACHE: "{{ bench_root }}/gocache"
             GOMODCACHE: "{{ bench_root }}/gomodcache"
             HOME: "{{ ansible_env.HOME }}"
-          # Per-target env knobs (optional, e.g. PERFMATRIX_DURATION) get
-          # exported before mage runs. The shell module's `environment`
-          # cannot take a dynamic dict, so we expand inline.
+          # gate_env_exports is a literal block of shell `export k=q`
+          # lines rendered by ClusterGoGate (which knows the user's
+          # local env). Embedded directly into the shell — no Jinja
+          # loop over dicts (--extra-vars values are always strings).
           ansible.builtin.shell: |
             set -e -o pipefail
             cd {{ bench_root }}/celeris
-            {% if gate_env is defined %}
-            {% for k, v in gate_env.items() %}
-            export {{ k }}={{ v | quote }}
-            {% endfor %}
-            {% endif %}
+            {{ gate_env_exports | default('') }}
             for tgt in {{ gate_mage_targets }}; do
               echo "=== Running mage $tgt on $(hostname) ==="
               mage "$tgt"
