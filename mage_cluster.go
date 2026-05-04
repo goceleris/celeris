@@ -367,6 +367,22 @@ func ClusterGoGate() error {
 		}
 	}
 
+	// Multi-line strings (the rendered exports block) do not survive a
+	// CLI --extra-vars k=v reliably — write the vars to a YAML file
+	// alongside the staging dir and pass via @path. Single-line vars
+	// stay on the CLI for clarity.
+	extrasYAML := filepath.Join(stagingDir, "extras.yml")
+	yaml, err := os.Create(extrasYAML)
+	if err != nil {
+		return fmt.Errorf("create extras.yml: %w", err)
+	}
+	fmt.Fprintln(yaml, "---")
+	fmt.Fprintln(yaml, "gate_env_exports: |")
+	for _, line := range strings.Split(strings.TrimRight(envExports.String(), "\n"), "\n") {
+		fmt.Fprintln(yaml, "  "+line)
+	}
+	yaml.Close()
+
 	args := []string{
 		"-i", "inventory.yml", clusterGoGatePlaybook,
 		"--extra-vars", "gate_target_host=" + host,
@@ -376,7 +392,7 @@ func ClusterGoGate() error {
 		"--extra-vars", "source_tarball_local=" + srcTarball,
 		"--extra-vars", "results_local_dir=" + resultsDir,
 		"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
-		"--extra-vars", "gate_env_exports=" + envExports.String(),
+		"--extra-vars", "@" + extrasYAML,
 	}
 	cmd := exec.Command("ansible-playbook", args...)
 	cmd.Dir = clusterAnsibleDir
