@@ -141,9 +141,12 @@ func MatrixBenchStrict() error {
 		"!*/iris-auto,!*/iris-h2c"
 	// When services=none (host has no Docker), additionally exclude
 	// driver-backed scenarios so the runner does not attempt to bench
-	// cells that would deadlock waiting for postgres/redis/memcached.
+	// cells that would deadlock or fail-fast against missing
+	// postgres / redis / memcached. Cell IDs are <scenario>/<server>;
+	// driver scenarios are named driver-pg-*, driver-redis-*,
+	// driver-mc-*, plus the session-* scenarios that share their backends.
 	if services == "none" {
-		defaultExcludes += ",!*/driver-*"
+		defaultExcludes += ",!driver-*/*,!session-*/*"
 	}
 	cells := envOrDefault("PERFMATRIX_CELLS", "*,"+defaultExcludes)
 	return runMatrix(matrixFlags{
