@@ -103,8 +103,8 @@ func TestRingBufferUnknownLastID(t *testing.T) {
 // TestRingBufferAppendAllocs — strict-alloc gate from issue #250: ≤ 1
 // alloc/op. The single permitted alloc covers the canonical ID string.
 func TestRingBufferAppendAllocs(t *testing.T) {
-	if testing.CoverMode() != "" || testing.Short() {
-		t.Skip("alloc counts unstable under coverage / -short")
+	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
+		t.Skip("alloc counts unstable under -race / coverage / -short")
 	}
 	r := NewRingBuffer(1024)
 	ctx := context.Background()

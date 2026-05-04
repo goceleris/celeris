@@ -268,8 +268,8 @@ func TestSlowClientRace(t *testing.T) {
 // happy-path enqueue. The queued Send must avoid heap growth in steady state
 // — a regression here would mean per-event garbage on every fan-out.
 func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
-	if testing.CoverMode() != "" || testing.Short() {
-		t.Skip("alloc counts unstable under coverage / -short")
+	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
+		t.Skip("alloc counts unstable under -race / coverage / -short")
 	}
 	ctx, gs := newGatedContext(t)
 

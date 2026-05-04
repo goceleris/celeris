@@ -120,8 +120,8 @@ func TestHubBroadcastReachesAllConns(t *testing.T) {
 // any growth beyond the intrinsic Conn write cost would mean the Hub
 // is allocating in its dispatch loop.
 func TestHubBroadcastFormatsOnce(t *testing.T) {
-	if testing.CoverMode() != "" || testing.Short() {
-		t.Skip("alloc counts unstable under coverage / -short")
+	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
+		t.Skip("alloc counts unstable under -race / coverage / -short")
 	}
 	measure := func(n int) float64 {
 		h := NewHub(HubConfig{})

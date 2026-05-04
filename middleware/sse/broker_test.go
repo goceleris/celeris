@@ -95,8 +95,8 @@ func TestWritePreparedEvent(t *testing.T) {
 // measuring allocs at two subscriber counts and asserting scaling stays
 // within a small tolerance.
 func TestBrokerFanOutFormatsOnce(t *testing.T) {
-	if testing.CoverMode() != "" || testing.Short() {
-		t.Skip("alloc counts unstable under coverage / -short")
+	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
+		t.Skip("alloc counts unstable under -race / coverage / -short")
 	}
 	allocsLow := measureBrokerPublishAllocs(t, 50)
 	allocsHigh := measureBrokerPublishAllocs(t, 500)
