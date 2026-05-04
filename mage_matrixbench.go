@@ -132,21 +132,27 @@ func MatrixBenchStrict() error {
 	// servers: celeris-std, stdhttp, chi, echo, gin, iris. fasthttp /
 	// fiber / hertz do not use x/net/http2 and stay included.
 	// Override via PERFMATRIX_CELLS to force-include.
-	cells := envOrDefault("PERFMATRIX_CELLS",
-		"*,"+
-			"!*/celeris-std-auto*,!*/celeris-std-h2c*,"+
-			"!*/stdhttp-auto,!*/stdhttp-h2c,"+
-			"!*/chi-auto,!*/chi-h2c,"+
-			"!*/echo-auto,!*/echo-h2c,"+
-			"!*/gin-auto,!*/gin-h2c,"+
-			"!*/iris-auto,!*/iris-h2c")
+	services := envOrDefault("PERFMATRIX_SERVICES", "local")
+	defaultExcludes := "!*/celeris-std-auto*,!*/celeris-std-h2c*," +
+		"!*/stdhttp-auto,!*/stdhttp-h2c," +
+		"!*/chi-auto,!*/chi-h2c," +
+		"!*/echo-auto,!*/echo-h2c," +
+		"!*/gin-auto,!*/gin-h2c," +
+		"!*/iris-auto,!*/iris-h2c"
+	// When services=none (host has no Docker), additionally exclude
+	// driver-backed scenarios so the runner does not attempt to bench
+	// cells that would deadlock waiting for postgres/redis/memcached.
+	if services == "none" {
+		defaultExcludes += ",!*/driver-*"
+	}
+	cells := envOrDefault("PERFMATRIX_CELLS", "*,"+defaultExcludes)
 	return runMatrix(matrixFlags{
 		runs:     runs,
 		duration: dur,
 		warmup:   warm,
 		cells:    cells,
 		profile:  false,
-		services: "local",
+		services: services,
 		strict:   true,
 	})
 }

@@ -152,9 +152,15 @@
             fail_on_missing: false
 
         - name: Drop staging dir (Go, source, gopath, gocache — everything)
-          ansible.builtin.file:
-            path: "{{ bench_root }}"
-            state: absent
+          # Go's module cache marks files read-only (0444). ansible's
+          # file:state=absent does an rmtree() which fails on those.
+          # chmod -R u+w first so the recursive remove can proceed.
+          ansible.builtin.shell: |
+            chmod -R u+w {{ bench_root }} 2>/dev/null || true
+            rm -rf {{ bench_root }}
+          args:
+            executable: /bin/bash
+          changed_when: true
 
         - name: Verify nothing of ours remains in ~ (post-snapshot leak check)
           # A path is a real leak only if it exists now AND was NOT in
