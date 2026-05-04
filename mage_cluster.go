@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -223,6 +225,56 @@ func ClusterDistributedBench() error {
 	}
 
 	fmt.Printf("\n=== Distributed bench complete. Results in %s ===\n", bins.resultsLocal)
+	return nil
+}
+
+// ClusterDistributedBenchParallel runs [ClusterDistributedBench] against
+// both bench targets (msa2-server and msr1) concurrently from a single
+// msa2-client load source. Each target gets its own subprocess and its
+// own results directory, so the two streams of bench data are easy to
+// diff post-run. Useful as the merge gate for v1.4.x release branches:
+// catches per-target regressions that single-target runs miss when the
+// regression is symmetric across the matrix.
+//
+// Honours every CLUSTER_DIST_* env knob from [ClusterDistributedBench]
+// — they apply identically to both target subprocesses. The combined
+// run fails if either target subprocess fails.
+func ClusterDistributedBenchParallel() error {
+	if err := requireAnsible(); err != nil {
+		return err
+	}
+	targets := []string{"msa2-server", "msr1"}
+	type runResult struct {
+		target string
+		err    error
+	}
+	results := make(chan runResult, len(targets))
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		wg.Add(1)
+		go func(tgt string) {
+			defer wg.Done()
+			cmd := exec.Command("mage", "ClusterDistributedBench")
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			env := append([]string{}, os.Environ()...)
+			env = append(env, "CLUSTER_DIST_TARGET="+tgt)
+			cmd.Env = env
+			results <- runResult{target: tgt, err: cmd.Run()}
+		}(target)
+	}
+	wg.Wait()
+	close(results)
+	var failed []string
+	for r := range results {
+		if r.err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", r.target, r.err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("parallel cluster distributed bench: %s", strings.Join(failed, "; "))
+	}
+	fmt.Println("\n=== Parallel cluster distributed bench complete on both targets ===")
 	return nil
 }
 
