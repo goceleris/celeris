@@ -99,6 +99,8 @@ func ExampleNewRingBuffer() {
 	// Output: replay-enabled SSE handler installed at /events
 }
 
+// (regression test moved to sse_test.go::TestSSEHandlerFlushesHeadersImmediately)
+
 // Resume from a Last-Event-ID supplied by the browser's reconnect logic.
 func ExampleClient_LastEventID() {
 	handler := sse.New(sse.Config{

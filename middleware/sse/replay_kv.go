@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,21 @@ type KVReplayStoreConfig struct {
 	// MaxIndex bounds the in-memory ID index. Zero or negative ⇒
 	// [MaxKVReplayIndex].
 	MaxIndex int
+
+	// AsyncAppend, when true, makes [ReplayStore.Append] return as
+	// soon as the local ID has been allocated — the actual KV.Set
+	// fires in a background goroutine. Trades durability for latency:
+	// an Append() that returns successfully is NOT guaranteed to be
+	// in the KV when the next reconnect happens. Use only when wire-
+	// write latency dominates and replay can tolerate eventual
+	// consistency.
+	AsyncAppend bool
+
+	// CounterKey is the KV key under which the cross-instance counter
+	// lives. Zero value ⇒ "<prefix>seq". Only consulted when the
+	// supplied [store.KV] also implements [store.Counter]; otherwise
+	// the constructor falls back to a per-process counter.
+	CounterKey string
 }
 
 // NewKVReplayStore backs the replay log with a [store.KV] for durability
@@ -45,6 +61,13 @@ func NewKVReplayStore(kv store.KV, prefix string, ttl time.Duration) (ReplayStor
 // NewKVReplayStoreWithConfig is the explicit-tuning constructor; the
 // zero-value [KVReplayStoreConfig] reproduces [NewKVReplayStore]'s
 // defaults.
+//
+// When the supplied [store.KV] also implements [store.Counter] (e.g.
+// the Redis adapter via INCR), IDs are allocated atomically against
+// that backend — multiple processes sharing the KV will see a single
+// monotonic ID space. When the KV does not implement Counter, the
+// store falls back to a per-process counter; multi-instance setups
+// will see ID collisions across instances.
 func NewKVReplayStoreWithConfig(kv store.KV, prefix string, ttl time.Duration, cfg KVReplayStoreConfig) (ReplayStore, error) {
 	if kv == nil {
 		return nil, errors.New("sse: NewKVReplayStore requires a non-nil store.KV")
@@ -53,20 +76,33 @@ func NewKVReplayStoreWithConfig(kv store.KV, prefix string, ttl time.Duration, c
 	if maxIdx <= 0 {
 		maxIdx = MaxKVReplayIndex
 	}
-	return &kvStore{
-		kv:       kv,
-		prefix:   prefix,
-		ttl:      ttl,
-		maxIndex: maxIdx,
-	}, nil
+	counterKey := cfg.CounterKey
+	if counterKey == "" {
+		counterKey = prefix + "seq"
+	}
+	s := &kvStore{
+		kv:          kv,
+		prefix:      prefix,
+		ttl:         ttl,
+		maxIndex:    maxIdx,
+		asyncAppend: cfg.AsyncAppend,
+		counterKey:  counterKey,
+	}
+	if c, ok := kv.(store.Counter); ok {
+		s.counter = c
+	}
+	return s, nil
 }
 
 type kvStore struct {
-	kv       store.KV
-	prefix   string
-	ttl      time.Duration
-	maxIndex int
-	nextSeq  atomic.Uint64
+	kv          store.KV
+	counter     store.Counter // nil ⇒ fall back to localSeq
+	prefix      string
+	counterKey  string
+	ttl         time.Duration
+	maxIndex    int
+	asyncAppend bool
+	localSeq    atomic.Uint64
 
 	indexMu sync.Mutex
 	index   []uint64 // ordered seqs the local instance has appended
@@ -76,15 +112,41 @@ func (s *kvStore) eventKey(id string) string {
 	return s.prefix + "events/" + id
 }
 
+func (s *kvStore) nextID(ctx context.Context) (uint64, string, error) {
+	if s.counter != nil {
+		n, err := s.counter.Increment(ctx, s.counterKey, s.ttl)
+		if err != nil {
+			return 0, "", fmt.Errorf("kv counter increment: %w", err)
+		}
+		if n <= 0 {
+			return 0, "", fmt.Errorf("kv counter returned non-positive value: %d", n)
+		}
+		return uint64(n), strconv.FormatInt(n, 10), nil
+	}
+	seq := s.localSeq.Add(1)
+	return seq, strconv.FormatUint(seq, 10), nil
+}
+
 func (s *kvStore) Append(ctx context.Context, e Event) (string, error) {
-	seq := s.nextSeq.Add(1)
-	id := strconv.FormatUint(seq, 10)
+	seq, id, err := s.nextID(ctx)
+	if err != nil {
+		return "", err
+	}
 	e.ID = id
 	blob, err := json.Marshal(e)
 	if err != nil {
 		return "", err
 	}
-	if err := s.kv.Set(ctx, s.eventKey(id), blob, s.ttl); err != nil {
+	if s.asyncAppend {
+		// Fire-and-log the KV write. Caller gets the id immediately;
+		// the event reaches the store after wire delivery (or never,
+		// if the KV rejects it). Suitable for low-latency publishing
+		// where a small replay-store gap during a backend hiccup is
+		// preferable to gating Send on backend latency.
+		go func() {
+			_ = s.kv.Set(context.Background(), s.eventKey(id), blob, s.ttl)
+		}()
+	} else if err := s.kv.Set(ctx, s.eventKey(id), blob, s.ttl); err != nil {
 		return "", err
 	}
 	s.indexMu.Lock()

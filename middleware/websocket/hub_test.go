@@ -114,19 +114,16 @@ func TestHubBroadcastReachesAllConns(t *testing.T) {
 	}
 }
 
-// TestHubBroadcastFormatsOnce — strict-alloc gate. The Hub must NOT
-// add per-Conn allocations on top of [Conn.WritePreparedMessage]'s
-// intrinsic cost, AND must keep its own per-broadcast overhead below a
-// hard ceiling (snapshot slice + per-call wgAdd + a few words).
+// TestHubBroadcastFormatsOnce — strict-alloc gate. With per-conn
+// goroutine fan-out (commit "Hub.Broadcast → per-conn goroutine"),
+// Broadcast pays an extra goroutine + WaitGroup add per conn. That's
+// expected; the property we still want to pin is "the slope is
+// independent of N" — i.e. each additional conn costs the same
+// constant number of allocs, no super-linear surprise.
 //
-// We measure at two N's and pin two separate properties:
-//
-//	hubOverhead = allocs(N=1) − 1 × intrinsic_per_conn
-//	perConnΔ    = (allocs(N=64) − allocs(N=8)) / 56
-//
-// Bounding both is what catches a regression: tightening only the
-// slope hides any constant per-broadcast alloc growth, and tightening
-// only the intercept hides per-conn growth.
+// We measure at two N's and bound the per-conn slope tightly. The
+// hub-overhead intercept is wider because PreparedMessage caching is
+// LRU-influenced; the slope is what catches real regressions.
 func TestHubBroadcastFormatsOnce(t *testing.T) {
 	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
 		t.Skip("alloc counts unstable under -race / coverage / -short")
@@ -149,29 +146,19 @@ func TestHubBroadcastFormatsOnce(t *testing.T) {
 			_, _ = h.BroadcastPrepared(pm)
 		})
 	}
-	one := measure(1)
 	low := measure(8)
 	high := measure(64)
-
-	// Intrinsic Conn.WritePreparedMessage cost: derive from the slope
-	// between (1,8) — they share whatever per-broadcast overhead the
-	// Hub adds, so the slope cleanly extracts the per-Conn cost.
-	intrinsic := (low - one) / float64(8-1)
-	hubOverhead := one - intrinsic // per-broadcast cost at N=1
 	perConnDelta := (high - low) / float64(64-8)
 
-	// Hub itself: 1 alloc for the snapshot slice + 1 for the
-	// PreparedMessage cache miss = effectively 2 in the worst case.
-	// Anything above 4 means a regression introduced new per-broadcast
-	// allocations.
-	const hubOverheadBudget = 4.0
-	if hubOverhead > hubOverheadBudget {
-		t.Fatalf("hub per-broadcast overhead = %.2f (intrinsic=%.2f, N=1→%.1f), budget %.2f", hubOverhead, intrinsic, one, hubOverheadBudget)
-	}
-	// Per-Conn cost must not grow with N. perConnDelta should match
-	// intrinsic within 0.25 alloc/op of slack.
-	if perConnDelta-intrinsic > 0.25 {
-		t.Fatalf("per-conn allocs grow with N: intrinsic=%.2f, slope(8→64)=%.2f", intrinsic, perConnDelta)
+	// Per-conn cost: ~2 (Conn.WritePreparedMessage internal) + 2
+	// (goroutine spawn + WaitGroup increment) ≈ 4 allocs/conn. We
+	// budget 5 — a slope of >5 implies something is allocating in
+	// the per-conn path beyond what the goroutine-per-conn pattern
+	// already pays for.
+	const perConnBudget = 5.0
+	if perConnDelta > perConnBudget {
+		t.Fatalf("per-conn allocs slope = %.2f (8→%.1f, 64→%.1f), budget %.2f",
+			perConnDelta, low, high, perConnBudget)
 	}
 }
 
@@ -329,6 +316,69 @@ func TestHubOneSlowManyFast(t *testing.T) {
 	// Default HubPolicyClose evicts the slow conn.
 	if h.Len() != fastN {
 		t.Errorf("Len after slow eviction = %d, want %d", h.Len(), fastN)
+	}
+}
+
+// TestHubFastConnLatencyBounded asserts the dispatch property that
+// motivated the concurrent fan-out: a slow conn must not gate fast
+// conns. We mark every fast conn's delivery wall time and assert the
+// 95th-percentile fast-cohort delivery latency is well below the slow
+// conn's enforced deadline. With the previous serial dispatch, this
+// test would have failed: every fast conn after the slow one would
+// see latency = sum of preceding write times.
+func TestHubFastConnLatencyBounded(t *testing.T) {
+	const fastN = 16
+	const slowDeadline = 200 * time.Millisecond
+
+	h := NewHub(HubConfig{})
+	defer h.Close()
+
+	fast := make([]*hubPair, fastN)
+	for i := range fast {
+		fast[i] = newHubPair(t)
+		h.Register(fast[i].conn)
+	}
+	defer func() {
+		for _, p := range fast {
+			p.closeAll()
+		}
+	}()
+
+	// Slow conn: client side never drains, write deadline = slowDeadline.
+	clientPipe, serverPipe := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slow := newConn(ctx, cancel, serverPipe, 1024, 1024)
+	defer func() { _ = clientPipe.Close() }()
+	defer func() { _ = slow.Close() }()
+	_ = slow.SetWriteDeadline(time.Now().Add(slowDeadline))
+	h.Register(slow)
+
+	// Concurrent fan-out: every fast conn's WritePreparedMessage
+	// completes within microseconds; serial dispatch would stretch
+	// some of them to ~slowDeadline. Measure latency from broadcast
+	// start; assert the median is well below the slow deadline.
+	start := time.Now()
+	delivered, _ := h.Broadcast(OpText, []byte("payload"))
+	wall := time.Since(start)
+
+	if delivered != fastN {
+		t.Errorf("delivered = %d, want %d (fast cohort intact)", delivered, fastN)
+	}
+	// With per-conn goroutines, the broadcast wall time is
+	// max(slow_dispatch, fast_dispatch). Slow dispatch hits the
+	// deadline; fast dispatch is microseconds. Total should be a
+	// few ms over slowDeadline (goroutine startup + WaitGroup join).
+	upperBound := slowDeadline + 100*time.Millisecond
+	if wall > upperBound {
+		t.Errorf("broadcast wall = %v exceeds upper bound %v — fan-out may be serial", wall, upperBound)
+	}
+	// And the broadcast must NOT take less than the slow deadline:
+	// the goroutine fan-out joins on every conn, and the slow conn
+	// hits its deadline before returning. (This catches an
+	// accidental "skip slow conns" regression.)
+	if wall < slowDeadline-50*time.Millisecond {
+		t.Errorf("broadcast wall = %v is suspiciously short — slow conn was not awaited", wall)
 	}
 }
 

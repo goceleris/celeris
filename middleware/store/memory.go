@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -236,6 +238,35 @@ func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.D
 	}
 	s.items[key] = &memItem{value: cp, expiry: exp}
 	return true, nil
+}
+
+// Increment atomically increments the integer counter at key by 1,
+// returning the post-increment value. Implements the [Counter]
+// extension. The stored value is the decimal-string encoding of the
+// current count; this matches the wire format Redis INCR returns and
+// keeps the on-disk shape compatible across backends.
+func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cur int64
+	if it, ok := s.items[key]; ok {
+		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
+			n, err := strconv.ParseInt(string(it.value), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("store: counter at %q has non-integer value: %w", key, err)
+			}
+			cur = n
+		}
+	}
+	cur++
+	encoded := strconv.AppendInt(nil, cur, 10)
+	var exp int64
+	if ttl > 0 {
+		exp = time.Now().Add(ttl).UnixNano()
+	}
+	s.items[key] = &memItem{value: encoded, expiry: exp}
+	return cur, nil
 }
 
 func (m *MemoryKV) cleanup(ctx context.Context, interval time.Duration) {

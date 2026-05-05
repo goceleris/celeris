@@ -125,7 +125,10 @@ func (b *Broker) Publish(e Event) *PreparedEvent {
 // subscriber. Slow subscribers — those whose queue is full at the
 // non-blocking send attempt — have the configured [BrokerPolicy] applied.
 // Fan-out is concurrent in effect (each subscriber has its own goroutine
-// draining its queue) but Publish itself does NOT block on wire I/O.
+// draining its queue) and Publish itself does NOT block on wire I/O,
+// the policy callback, or per-subscriber Close — those run in
+// dedicated goroutines so the publisher returns as soon as the
+// non-blocking send loop completes.
 func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	if pe == nil {
 		return
@@ -147,24 +150,24 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	if len(slowClients) == 0 {
 		return
 	}
+	// Run the policy callbacks (and any Disconnect cleanup) in a
+	// detached goroutine so the publisher does not gate on a slow
+	// user callback or a remote socket close.
 	policy := b.cfg.OnSlowSubscriber
-	for i, c := range slowClients {
-		action := BrokerPolicyDrop
-		if policy != nil {
-			action = policy(c, pe)
+	go func(clients []*Client, states []*brokerSubscriber) {
+		for i, c := range clients {
+			action := BrokerPolicyDrop
+			if policy != nil {
+				action = policy(c, pe)
+			}
+			if action == BrokerPolicyDisconnect {
+				state := states[i]
+				b.removeSubscriber(c, state)
+				_ = c.Close()
+				<-state.done
+			}
 		}
-		if action == BrokerPolicyDisconnect {
-			state := slowStates[i]
-			b.removeSubscriber(c, state)
-			_ = c.Close()
-			// Wait for the drain goroutine to finish before letting
-			// the publisher continue. Without this join, the drain may
-			// still be reading c.closed when the SSE handler defer
-			// returns the Client to sync.Pool — race with the next
-			// handler's acquireClient writing c.closed = false.
-			<-state.done
-		}
-	}
+	}(slowClients, slowStates)
 }
 
 func (b *Broker) removeSubscriber(c *Client, expected *brokerSubscriber) {

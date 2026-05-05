@@ -1,6 +1,9 @@
 package websocket
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // HubPolicy controls what the [Hub] does with a [Conn] whose
 // [Conn.WritePreparedMessage] failed during a Broadcast.
@@ -30,6 +33,14 @@ type HubConfig struct {
 	// (commonly [ErrWriteClosed], [ErrWriteTimeout], or a wrapped I/O
 	// error). When nil, [HubPolicyClose] is used.
 	OnSlowConn func(c *Conn, err error) HubPolicy
+
+	// MaxConcurrency caps the number of in-flight per-Conn writes
+	// during a Broadcast. The default (0) is unbounded — one goroutine
+	// per Conn for the duration of the dispatch, which gives the best
+	// wall-clock latency at the cost of N goroutine stacks. Set to a
+	// finite value (e.g. runtime.GOMAXPROCS(0) * 4) to bound goroutine
+	// pressure on very-large fan-outs.
+	MaxConcurrency int
 }
 
 // Hub is the connection-set abstraction for WebSocket fan-out: register
@@ -157,26 +168,53 @@ func (h *Hub) snapshot() ([]*Conn, bool) {
 	return out, true
 }
 
-// dispatch performs the per-Conn write for snap. Removals/closes
-// triggered by OnSlowConn are deferred until after the broadcast so the
-// snapshot we are iterating is not mutated mid-loop.
+// dispatch performs the per-Conn write for snap. Each conn's write
+// runs in its own goroutine so a slow conn cannot gate the rest;
+// MaxConcurrency, if positive, caps goroutine pressure via a semaphore.
+// Removals/closes triggered by OnSlowConn are deferred until after the
+// broadcast so the snapshot we are iterating is not mutated mid-loop.
 func (h *Hub) dispatch(snap []*Conn, pm *PreparedMessage, pred func(*Conn) bool) (int, error) {
-	delivered := 0
-	var firstErr error
-	var toRemove []*Conn
-	var toClose []*Conn
+	var (
+		delivered atomic.Int64
+		mu        sync.Mutex
+		firstErr  error
+		toRemove  []*Conn
+		toClose   []*Conn
+	)
 
+	// Optional bounded-concurrency semaphore. Zero ⇒ unbounded (one
+	// goroutine per matching conn).
+	var sema chan struct{}
+	if h.cfg.MaxConcurrency > 0 {
+		sema = make(chan struct{}, h.cfg.MaxConcurrency)
+	}
+
+	var wg sync.WaitGroup
 	for _, c := range snap {
 		if pred != nil && !pred(c) {
 			continue
 		}
-		if err := c.WritePreparedMessage(pm); err != nil {
-			if firstErr == nil {
-				firstErr = err
+		wg.Add(1)
+		if sema != nil {
+			sema <- struct{}{}
+		}
+		go func(c *Conn) {
+			defer wg.Done()
+			if sema != nil {
+				defer func() { <-sema }()
+			}
+			err := c.WritePreparedMessage(pm)
+			if err == nil {
+				delivered.Add(1)
+				return
 			}
 			policy := HubPolicyClose
 			if h.cfg.OnSlowConn != nil {
 				policy = h.cfg.OnSlowConn(c, err)
+			}
+			mu.Lock()
+			if firstErr == nil {
+				firstErr = err
 			}
 			switch policy {
 			case HubPolicyDrop:
@@ -186,10 +224,10 @@ func (h *Hub) dispatch(snap []*Conn, pm *PreparedMessage, pred func(*Conn) bool)
 			case HubPolicyClose:
 				toClose = append(toClose, c)
 			}
-			continue
-		}
-		delivered++
+			mu.Unlock()
+		}(c)
 	}
+	wg.Wait()
 
 	for _, c := range toRemove {
 		h.unregister(c)
@@ -198,7 +236,7 @@ func (h *Hub) dispatch(snap []*Conn, pm *PreparedMessage, pred func(*Conn) bool)
 		h.unregister(c)
 		_ = c.Close()
 	}
-	return delivered, firstErr
+	return int(delivered.Load()), firstErr
 }
 
 func (h *Hub) unregister(c *Conn) {
@@ -232,7 +270,26 @@ func (h *Hub) Close() {
 	// Wait for any broadcast that already snapshotted the conn set to
 	// finish dispatching before we close the conns out from under it.
 	h.inflight.Wait()
-	for _, c := range conns {
-		_ = c.Close()
+	// Fan out the per-conn Close calls. With the same MaxConcurrency
+	// budget as Broadcast (default unbounded), 10k conns close in
+	// parallel rather than 10k sequential calls.
+	var sema chan struct{}
+	if h.cfg.MaxConcurrency > 0 {
+		sema = make(chan struct{}, h.cfg.MaxConcurrency)
 	}
+	var wg sync.WaitGroup
+	wg.Add(len(conns))
+	for _, c := range conns {
+		if sema != nil {
+			sema <- struct{}{}
+		}
+		go func(c *Conn) {
+			defer wg.Done()
+			if sema != nil {
+				defer func() { <-sema }()
+			}
+			_ = c.Close()
+		}(c)
+	}
+	wg.Wait()
 }
