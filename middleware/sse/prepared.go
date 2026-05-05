@@ -17,18 +17,10 @@ func NewPreparedEvent(e Event) *PreparedEvent {
 	return &PreparedEvent{bytes: formatEvent(nil, &e)}
 }
 
-// Bytes returns a defensive copy of the cached wire-format bytes.
-// Exposed mainly for tests and benchmarks; production code should reach
-// the wire via [Client.WritePreparedEvent], which writes the cached
-// slice directly without copying.
-func (pe *PreparedEvent) Bytes() []byte {
-	out := make([]byte, len(pe.bytes))
-	copy(out, pe.bytes)
-	return out
-}
-
 // Len reports the byte length of the formatted wire payload — useful
-// for accounting + flow-control without forcing the [Bytes] copy.
+// for accounting + flow-control without exposing the cached bytes (and
+// matching the asymmetric API of websocket.PreparedMessage, which
+// also keeps its frame bytes private).
 func (pe *PreparedEvent) Len() int { return len(pe.bytes) }
 
 // WritePreparedEvent writes a [PreparedEvent] directly to the underlying

@@ -3,7 +3,8 @@ package sse
 import "sync"
 
 // BrokerPolicy controls what happens to a slow subscriber whose
-// per-subscriber queue is full at [Broker.Publish] time.
+// per-subscriber queue is full at [Broker.Publish] time. Values mirror
+// websocket.HubPolicy and [ClientPolicy] — same verbs, same semantics.
 type BrokerPolicy uint8
 
 const (
@@ -11,10 +12,16 @@ const (
 	// subscriber. Other subscribers are unaffected.
 	BrokerPolicyDrop BrokerPolicy = iota
 
-	// BrokerPolicyDisconnect removes the subscriber from the Broker and
-	// closes its underlying connection. Use when prolonged backpressure
-	// indicates a stuck client that should be evicted.
-	BrokerPolicyDisconnect
+	// BrokerPolicyRemove unregisters the subscriber from the Broker
+	// without closing the underlying [Client]. Use when the caller owns
+	// the connection lifecycle and only wants the broker to stop
+	// fanning events to that subscriber.
+	BrokerPolicyRemove
+
+	// BrokerPolicyClose unregisters the subscriber AND closes the
+	// underlying [Client]. Use when prolonged backpressure indicates
+	// a stuck client that should be evicted entirely.
+	BrokerPolicyClose
 )
 
 // BrokerConfig tunes a [Broker]. Both fields are optional; zero values
@@ -52,6 +59,18 @@ type Broker struct {
 type brokerSubscriber struct {
 	queue chan *PreparedEvent
 	done  chan struct{}
+	// closeOnce guards close(queue). Multiple paths may try to close
+	// it: removeSubscriber called from a slow-disconnect goroutine,
+	// the unsubscribe closure returned by Subscribe, and Broker.Close
+	// during shutdown. sync.Once collapses them into a single safe
+	// close — close-of-closed-channel is a runtime panic.
+	closeOnce sync.Once
+}
+
+// closeQueue closes s.queue exactly once, regardless of how many
+// callers reach this method.
+func (s *brokerSubscriber) closeQueue() {
+	s.closeOnce.Do(func() { close(s.queue) })
 }
 
 // NewBroker constructs a Broker with the provided config.
@@ -115,6 +134,12 @@ func (b *Broker) drain(c *Client, s *brokerSubscriber) {
 // Publish formats e once into a [PreparedEvent], dispatches it to every
 // current subscriber, and returns the PreparedEvent so the caller can
 // reuse it (e.g. for replay-store appends).
+//
+// Ordering: per subscriber, events are delivered in publish order
+// (the per-subscriber drain goroutine pulls from a FIFO channel).
+// Across subscribers there is no global ordering guarantee — fan-out
+// is concurrent and a fast subscriber may observe event N before a
+// slow subscriber observes event N-1.
 func (b *Broker) Publish(e Event) *PreparedEvent {
 	pe := NewPreparedEvent(e)
 	b.PublishPrepared(pe)
@@ -122,13 +147,19 @@ func (b *Broker) Publish(e Event) *PreparedEvent {
 }
 
 // PublishPrepared dispatches an already-prepared event to every current
-// subscriber. Slow subscribers — those whose queue is full at the
-// non-blocking send attempt — have the configured [BrokerPolicy] applied.
-// Fan-out is concurrent in effect (each subscriber has its own goroutine
-// draining its queue) and Publish itself does NOT block on wire I/O,
-// the policy callback, or per-subscriber Close — those run in
-// dedicated goroutines so the publisher returns as soon as the
-// non-blocking send loop completes.
+// subscriber. Each subscriber has its own bounded queue + drain
+// goroutine, so wire I/O for a fast subscriber never gates a slow
+// one. Slow subscribers — those whose queue is full at the non-
+// blocking send attempt — have the configured [BrokerPolicy] applied.
+//
+// The OnSlowSubscriber callback runs SYNCHRONOUSLY in the publisher's
+// goroutine, and any [BrokerPolicyRemove] / [BrokerPolicyClose]
+// cleanup completes before PublishPrepared returns. This is by
+// design: the cleanup ordering is required so a subsequent
+// [Subscribe] cannot race the [Client.Close] from a prior policy
+// firing. Callers that want a fast Publish must keep their
+// OnSlowSubscriber callbacks tight, or rely on [BrokerPolicyDrop]
+// (the no-callback default) which short-circuits without dispatch.
 func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	if pe == nil {
 		return
@@ -150,24 +181,35 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	if len(slowClients) == 0 {
 		return
 	}
-	// Run the policy callbacks (and any Disconnect cleanup) in a
-	// detached goroutine so the publisher does not gate on a slow
-	// user callback or a remote socket close.
 	policy := b.cfg.OnSlowSubscriber
-	go func(clients []*Client, states []*brokerSubscriber) {
-		for i, c := range clients {
-			action := BrokerPolicyDrop
-			if policy != nil {
-				action = policy(c, pe)
-			}
-			if action == BrokerPolicyDisconnect {
-				state := states[i]
-				b.removeSubscriber(c, state)
-				_ = c.Close()
-				<-state.done
-			}
+	if policy == nil {
+		// Default is BrokerPolicyDrop — nothing to clean up. The slow
+		// events were already dropped at the non-blocking-send default
+		// branch above; no further work.
+		return
+	}
+	// The policy callback runs synchronously: Remove/Close cleanup
+	// must complete before the publisher returns so that Pool reuse
+	// of the *Client cannot race with c.Close() from a detached
+	// goroutine. If the user's policy callback is slow, this gates
+	// the publisher — that is the documented contract; users wanting
+	// fast Publish should keep OnSlowSubscriber callbacks tight, or
+	// use BrokerPolicyDrop (which short-circuits above).
+	for i, c := range slowClients {
+		switch action := policy(c, pe); action {
+		case BrokerPolicyDrop:
+			// Keep the subscriber registered; this Publish dropped
+			// its event but future ones may land.
+		case BrokerPolicyRemove:
+			b.removeSubscriber(c, slowStates[i])
+			<-slowStates[i].done
+		case BrokerPolicyClose:
+			state := slowStates[i]
+			b.removeSubscriber(c, state)
+			_ = c.Close()
+			<-state.done
 		}
-	}(slowClients, slowStates)
+	}
 }
 
 func (b *Broker) removeSubscriber(c *Client, expected *brokerSubscriber) {
@@ -178,8 +220,8 @@ func (b *Broker) removeSubscriber(c *Client, expected *brokerSubscriber) {
 		return
 	}
 	delete(b.subscribers, c)
-	close(cur.queue)
 	b.mu.Unlock()
+	cur.closeQueue()
 }
 
 // SubscriberCount is a point-in-time gauge useful for observability.
@@ -209,7 +251,7 @@ func (b *Broker) Close() {
 	b.mu.Unlock()
 
 	for _, s := range states {
-		close(s.queue)
+		s.closeQueue()
 	}
 	for _, s := range states {
 		<-s.done

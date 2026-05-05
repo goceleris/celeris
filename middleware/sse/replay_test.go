@@ -3,8 +3,11 @@ package sse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris/celeristest"
 	"github.com/goceleris/celeris/middleware/store"
@@ -123,7 +126,7 @@ func TestRingBufferAppendAllocs(t *testing.T) {
 // integration build tag.
 func TestKVReplayStoreRoundTrip(t *testing.T) {
 	kv := store.NewMemoryKV()
-	r, err := NewKVReplayStore(kv, "test:", 0)
+	r, err := NewKVReplayStore(KVReplayStoreConfig{KV: kv, Prefix: "test:"})
 	if err != nil {
 		t.Fatalf("NewKVReplayStore: %v", err)
 	}
@@ -155,12 +158,12 @@ func TestKVReplayStoreRoundTrip(t *testing.T) {
 // the misuse surfaces at the call site rather than as a confusing
 // nil-pointer panic on the first Append.
 func TestNewKVReplayStoreReturnsErrOnNilKV(t *testing.T) {
-	r, err := NewKVReplayStore(nil, "x:", 0)
+	r, err := NewKVReplayStore(KVReplayStoreConfig{Prefix: "x:"})
 	if err == nil {
-		t.Errorf("NewKVReplayStore(nil) returned nil error")
+		t.Errorf("NewKVReplayStore{KV:nil} returned nil error")
 	}
 	if r != nil {
-		t.Errorf("NewKVReplayStore(nil) returned non-nil store: %T", r)
+		t.Errorf("NewKVReplayStore{KV:nil} returned non-nil store: %T", r)
 	}
 }
 
@@ -246,3 +249,149 @@ func TestReplayMiddlewareUnknownLastIDFallsThrough(t *testing.T) {
 		t.Errorf("fresh event not on wire: %q", ms.allData())
 	}
 }
+
+// TestKVReplayStoreCounterFallback — when the supplied KV does not
+// implement [store.Counter], NewKVReplayStore falls back to a per-
+// process atomic counter; IDs still come from a strictly increasing
+// integer source. Pins the no-Counter branch.
+func TestKVReplayStoreCounterFallback(t *testing.T) {
+	// kvWithoutCounter wraps a MemoryKV but explicitly does NOT
+	// expose Increment, so the type assertion in NewKVReplayStore
+	// fails over to localSeq.
+	kv := &noCounterKV{inner: store.NewMemoryKV()}
+	r, err := NewKVReplayStore(KVReplayStoreConfig{KV: kv, Prefix: "fb:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for want := 1; want <= 5; want++ {
+		id, err := r.Append(ctx, Event{Data: "x"})
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		got := 0
+		_, _ = fmt.Sscanf(id, "%d", &got)
+		if got != want {
+			t.Errorf("local fallback id #%d = %d, want %d", want, got, want)
+		}
+	}
+}
+
+type noCounterKV struct{ inner store.KV }
+
+func (k *noCounterKV) Get(ctx context.Context, key string) ([]byte, error) {
+	return k.inner.Get(ctx, key)
+}
+func (k *noCounterKV) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return k.inner.Set(ctx, key, value, ttl)
+}
+func (k *noCounterKV) Delete(ctx context.Context, key string) error {
+	return k.inner.Delete(ctx, key)
+}
+
+// TestKVReplayStoreCounterUsesShared — when the KV implements
+// [store.Counter], IDs come from that backend. Pin via a counting KV
+// that records each Increment call.
+func TestKVReplayStoreCounterUsesShared(t *testing.T) {
+	cnt := &countingCounterKV{inner: store.NewMemoryKV()}
+	r, err := NewKVReplayStore(KVReplayStoreConfig{KV: cnt, Prefix: "shared:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for range 4 {
+		if _, err := r.Append(ctx, Event{Data: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := cnt.incrCalls.Load(); got != 4 {
+		t.Errorf("Counter.Increment calls = %d, want 4", got)
+	}
+}
+
+type countingCounterKV struct {
+	inner     store.KV
+	incrCalls atomic.Int64
+}
+
+func (k *countingCounterKV) Get(ctx context.Context, key string) ([]byte, error) {
+	return k.inner.Get(ctx, key)
+}
+func (k *countingCounterKV) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return k.inner.Set(ctx, key, value, ttl)
+}
+func (k *countingCounterKV) Delete(ctx context.Context, key string) error {
+	return k.inner.Delete(ctx, key)
+}
+func (k *countingCounterKV) Increment(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	k.incrCalls.Add(1)
+	return k.inner.(store.Counter).Increment(ctx, key, ttl)
+}
+
+// TestKVReplayStoreAsyncAppendBackpressure — when AsyncAppend is on,
+// Append returns immediately while the KV.Set is in flight. With a
+// gated KV the test asserts (a) the first N concurrent Appends return
+// in microseconds even though the KV has not completed any Set, and
+// (b) the (N+1)th Append blocks on the asyncSlots semaphore until a
+// slot frees.
+func TestKVReplayStoreAsyncAppendBackpressure(t *testing.T) {
+	const slots = 4
+	gate := make(chan struct{})
+	gk := &gateKV{gate: gate}
+
+	r, err := NewKVReplayStore(KVReplayStoreConfig{
+		KV:                     gk,
+		Prefix:                 "async:",
+		AsyncAppend:            true,
+		AsyncAppendConcurrency: slots,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	// First slots Appends fill the semaphore but each returns fast
+	// because the goroutine takes the slot, not Append.
+	start := time.Now()
+	for range slots {
+		if _, err := r.Append(ctx, Event{Data: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Errorf("first %d Appends took %v, want <50ms", slots, d)
+	}
+
+	// Now spawn the (slots+1)th Append in a goroutine; assert it
+	// remains blocked until the gate releases.
+	blockedDone := make(chan struct{})
+	go func() {
+		_, _ = r.Append(ctx, Event{Data: "x"})
+		close(blockedDone)
+	}()
+	select {
+	case <-blockedDone:
+		t.Fatalf("Append #%d returned before gate released — semaphore not enforcing backpressure", slots+1)
+	case <-time.After(50 * time.Millisecond):
+		// expected: still blocked
+	}
+	close(gate) // release every gated KV.Set
+	select {
+	case <-blockedDone:
+	case <-time.After(time.Second):
+		t.Fatalf("Append #%d still blocked 1s after gate released", slots+1)
+	}
+}
+
+// gateKV is a minimal store.KV whose Set blocks until gate is closed.
+// Used to probe AsyncAppend backpressure deterministically.
+type gateKV struct {
+	gate chan struct{}
+}
+
+func (g *gateKV) Get(ctx context.Context, key string) ([]byte, error) { return nil, store.ErrNotFound }
+func (g *gateKV) Set(_ context.Context, _ string, _ []byte, _ time.Duration) error {
+	<-g.gate
+	return nil
+}
+func (g *gateKV) Delete(_ context.Context, _ string) error { return nil }

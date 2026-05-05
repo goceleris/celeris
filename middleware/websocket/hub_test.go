@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -562,5 +563,96 @@ func benchmarkHubBroadcast(b *testing.B, n int) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_, _ = h.BroadcastPrepared(pm)
+	}
+}
+
+// TestHubDispatchPanicRecover — a panicking OnSlowConn callback (or
+// a Conn.WritePreparedMessage) must NOT bring down the dispatch
+// goroutine fleet. Other conns still receive the message; firstErr
+// surfaces "panic in dispatch goroutine: …".
+func TestHubDispatchPanicRecover(t *testing.T) {
+	const fastN = 8
+
+	h := NewHub(HubConfig{
+		OnSlowConn: func(_ *Conn, _ error) HubPolicy {
+			panic("boom from OnSlowConn")
+		},
+	})
+	defer h.Close()
+
+	fast := make([]*hubPair, fastN)
+	for i := range fast {
+		fast[i] = newHubPair(t)
+		h.Register(fast[i].conn)
+	}
+	defer func() {
+		for _, p := range fast {
+			p.closeAll()
+		}
+	}()
+
+	// Slow conn whose write fails immediately — drives the policy
+	// callback into the panicking branch.
+	clientPipe, serverPipe := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slow := newConn(ctx, cancel, serverPipe, 1024, 1024)
+	defer func() { _ = clientPipe.Close() }()
+	defer func() { _ = slow.Close() }()
+	_ = slow.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+	h.Register(slow)
+
+	delivered, err := h.Broadcast(OpText, []byte("payload"))
+	if err == nil {
+		t.Errorf("expected non-nil err surfacing the panic")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Errorf("err = %v, want a panic message", err)
+	}
+	if delivered != fastN {
+		t.Errorf("delivered = %d, want %d (fast cohort survived panic)", delivered, fastN)
+	}
+}
+
+// TestHubCloseWaitsInflightBroadcast — Hub.Close must NOT return
+// until every broadcast that already snapshotted the conn set
+// finishes its dispatch. Pin the ordering invariant by making the
+// in-flight broadcast slow (it visits a conn with a write deadline)
+// and asserting Close blocks for at least the deadline.
+func TestHubCloseWaitsInflightBroadcast(t *testing.T) {
+	h := NewHub(HubConfig{})
+
+	clientPipe, serverPipe := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slow := newConn(ctx, cancel, serverPipe, 1024, 1024)
+	defer func() { _ = clientPipe.Close() }()
+	defer func() { _ = slow.Close() }()
+	_ = slow.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+	h.Register(slow)
+
+	bcastEntered := make(chan struct{})
+	bcastDone := make(chan struct{})
+	go func() {
+		// hubPair.snapshot() increments inflight; the slow Conn's
+		// write blocks until the deadline; Close.Wait() must wait
+		// for that goroutine to finish.
+		close(bcastEntered)
+		_, _ = h.Broadcast(OpText, []byte("x"))
+		close(bcastDone)
+	}()
+	<-bcastEntered
+
+	closeStart := time.Now()
+	h.Close()
+	closeDur := time.Since(closeStart)
+
+	select {
+	case <-bcastDone:
+	default:
+		t.Fatalf("Hub.Close returned before the in-flight broadcast goroutine exited")
+	}
+	if closeDur < 100*time.Millisecond {
+		t.Errorf("Hub.Close returned in %v but the slow-conn deadline was 150ms — Close did not actually wait", closeDur)
 	}
 }

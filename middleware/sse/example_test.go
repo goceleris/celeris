@@ -7,6 +7,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/middleware/sse"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 // Stream a counter to the client every second; client disconnects close
@@ -97,6 +98,39 @@ func ExampleNewRingBuffer() {
 
 	fmt.Println("replay-enabled SSE handler installed at /events")
 	// Output: replay-enabled SSE handler installed at /events
+}
+
+// Persist events through a KV-backed ReplayStore for durability across
+// restarts. With a [store.Counter]-aware KV (e.g. Redis INCR), multiple
+// processes share a single monotonic ID space so reconnects survive
+// load-balancer reshuffles. With AsyncAppend, the wire-write path
+// returns as soon as the local ID is allocated; the KV.Set fires in
+// the background, bounded by AsyncAppendConcurrency.
+func ExampleNewKVReplayStore() {
+	kv := store.NewMemoryKV()
+	defer kv.Close()
+
+	replay, err := sse.NewKVReplayStore(sse.KVReplayStoreConfig{
+		KV:                     kv,
+		Prefix:                 "myapp/sse/",
+		TTL:                    10 * time.Minute,
+		AsyncAppend:            true,
+		AsyncAppendConcurrency: 32,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	s := celeris.New(celeris.Config{})
+	s.GET("/events", sse.New(sse.Config{
+		ReplayStore: replay,
+		Handler: func(c *sse.Client) {
+			_ = c.Send(sse.Event{Data: "hello"})
+		},
+	}))
+
+	fmt.Println("KV-backed replay SSE handler installed at /events")
+	// Output: KV-backed replay SSE handler installed at /events
 }
 
 // (regression test moved to sse_test.go::TestSSEHandlerFlushesHeadersImmediately)

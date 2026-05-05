@@ -129,7 +129,7 @@ func (c *Client) sendQueued(e Event) error {
 		action = c.onSlowClient(c, e)
 	}
 	switch action {
-	case ClientPolicyDisconnect:
+	case ClientPolicyClose:
 		c.droppedEvents.Add(1)
 		c.cancel()
 		return ErrClientClosed
@@ -189,7 +189,7 @@ func (c *Client) drain() {
 }
 
 // DroppedEvents returns the cumulative count of events dropped under
-// [ClientPolicyDrop] (or [ClientPolicyDisconnect]) since this client connected.
+// [ClientPolicyDrop] (or [ClientPolicyClose]) since this client connected.
 // Always zero when [Config.MaxQueueDepth] is zero.
 func (c *Client) DroppedEvents() uint64 {
 	return c.droppedEvents.Load()

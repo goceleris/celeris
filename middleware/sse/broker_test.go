@@ -52,25 +52,14 @@ func runWithClients(t *testing.T, n int, ready func(*Client)) (clientStop chan s
 	}
 }
 
-// TestPreparedEventFormatOnce pins the contract that NewPreparedEvent
-// formats wire bytes a single time — the byte slice must round-trip
-// through repeated Bytes() calls without re-encoding.
-func TestPreparedEventFormatOnce(t *testing.T) {
+// TestPreparedEventLen pins the public surface: Len reports the
+// formatted wire-byte count without exposing the underlying buffer.
+// The wire round-trip is covered by TestWritePreparedEvent.
+func TestPreparedEventLen(t *testing.T) {
 	pe := NewPreparedEvent(Event{ID: "1", Event: "msg", Data: "hello"})
-	want := "id: 1\nevent: msg\ndata: hello\n\n"
-	if got := string(pe.Bytes()); got != want {
-		t.Errorf("Bytes() = %q, want %q", got, want)
-	}
-	if pe.Len() != len(want) {
-		t.Errorf("Len() = %d, want %d", pe.Len(), len(want))
-	}
-	// Bytes() returns a defensive copy: mutating one returned slice
-	// must not be observable in a subsequent caller's view.
-	a := pe.Bytes()
-	a[0] = 'X'
-	b := pe.Bytes()
-	if string(b) != want {
-		t.Errorf("Bytes() returned data tainted by prior mutation: %q", b)
+	want := len("id: 1\nevent: msg\ndata: hello\n\n")
+	if pe.Len() != want {
+		t.Errorf("Len() = %d, want %d", pe.Len(), want)
 	}
 }
 
@@ -266,15 +255,15 @@ func (d *delayStreamer) Write(s *stream.Stream, data []byte) error {
 	return d.mockStreamer.Write(s, data)
 }
 
-// TestBrokerSlowSubscriberDisconnectPolicy verifies the disconnect path
+// TestBrokerSlowSubscriberClosePolicy verifies the close path
 // removes the slow client from the broker AND closes its connection.
 // Uses a delaying (not gated) streamer so c.Close in the policy path
 // can acquire c.mu without waiting on a manually-released gate.
-func TestBrokerSlowSubscriberDisconnectPolicy(t *testing.T) {
+func TestBrokerSlowSubscriberClosePolicy(t *testing.T) {
 	b := NewBroker(BrokerConfig{
 		SubscriberBuffer: 1,
 		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
-			return BrokerPolicyDisconnect
+			return BrokerPolicyClose
 		},
 	})
 	defer b.Close()
@@ -434,5 +423,96 @@ func benchmarkBrokerFanOut(b *testing.B, n int) {
 	b.ReportAllocs()
 	for b.Loop() {
 		br.Publish(ev)
+	}
+}
+
+// TestBrokerSlowSubscriberRemovePolicy — BrokerPolicyRemove unregisters
+// the subscriber from the broker without closing the underlying
+// Client. Pins the new policy added in v1.4.2 alignment.
+func TestBrokerSlowSubscriberRemovePolicy(t *testing.T) {
+	b := NewBroker(BrokerConfig{
+		SubscriberBuffer: 1,
+		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+			return BrokerPolicyRemove
+		},
+	})
+	defer b.Close()
+
+	slow, slowCleanup := startDelayedClient(t, 25*time.Millisecond)
+	defer slowCleanup()
+	b.Subscribe(slow)
+
+	// Publish faster than the slow streamer drains so the queue fills
+	// and BrokerPolicyRemove fires.
+	for range 10 {
+		b.Publish(Event{Data: "x"})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && b.SubscriberCount() != 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := b.SubscriberCount(); got != 0 {
+		t.Errorf("SubscriberCount after Remove = %d, want 0", got)
+	}
+	// BrokerPolicyRemove does NOT close the client — handler ctx
+	// stays live, lifecycle owned by the caller.
+	if slow.Context().Err() != nil {
+		t.Errorf("slow client context cancelled by Remove policy; should only be cancelled by Close")
+	}
+}
+
+// TestBrokerCloseRacingSlowSubscriberClose — the close-of-closed-channel
+// regression we fixed in S1: Broker.Close iterates states and closes
+// each queue while a detached PublishPrepared goroutine running
+// removeSubscriber → closeQueue races on the same state. With the
+// closeOnce guard both paths are safe; without it this panicked.
+func TestBrokerCloseRacingSlowSubscriberClose(t *testing.T) {
+	for range 50 {
+		b := NewBroker(BrokerConfig{
+			SubscriberBuffer: 1,
+			OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+				return BrokerPolicyClose
+			},
+		})
+
+		slow, slowCleanup := startDelayedClient(t, 5*time.Millisecond)
+		b.Subscribe(slow)
+
+		// Burst publish to schedule the disconnect goroutine; almost
+		// immediately call Close to race the goroutine's
+		// removeSubscriber → closeQueue against Close's closeQueue.
+		for range 5 {
+			b.Publish(Event{Data: "x"})
+		}
+		b.Close()
+		slowCleanup()
+	}
+}
+
+// TestBrokerSlowSubscriberPolicyCallbackInvoked pins that
+// OnSlowSubscriber actually fires when a subscriber's queue overflows,
+// regardless of the policy returned. The callback runs synchronously
+// in the publisher's goroutine — by design — so that any Remove/Close
+// cleanup completes before pool reuse can race acquireClient.
+func TestBrokerSlowSubscriberPolicyCallbackInvoked(t *testing.T) {
+	var calls atomic.Int32
+	b := NewBroker(BrokerConfig{
+		SubscriberBuffer: 1,
+		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+			calls.Add(1)
+			return BrokerPolicyDrop
+		},
+	})
+	defer b.Close()
+
+	slow, slowCleanup := startDelayedClient(t, 5*time.Millisecond)
+	defer slowCleanup()
+	b.Subscribe(slow)
+
+	for range 20 {
+		b.Publish(Event{Data: "x"})
+	}
+	if got := calls.Load(); got == 0 {
+		t.Errorf("OnSlowSubscriber never invoked despite queue overflow")
 	}
 }

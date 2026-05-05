@@ -86,8 +86,9 @@ type Scripter interface {
 // to share a single ID space across processes that hit the same KV
 // backend — without a shared counter, multi-instance replay cannot
 // guarantee unique IDs across reconnects. When a KV does not implement
-// Counter, the SSE replay store falls back to a per-process counter
-// and logs a warning at construction time.
+// Counter the SSE replay store falls back silently to a per-process
+// counter; callers that need cross-instance monotonicity should
+// type-assert their KV against this interface at startup.
 //
 // Increment returns the value AFTER the increment, so a fresh counter
 // hands out 1, 2, 3, ... ttl bounds the counter's lifetime in the

@@ -1,6 +1,8 @@
 package websocket
 
 import (
+	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -35,13 +37,21 @@ type HubConfig struct {
 	OnSlowConn func(c *Conn, err error) HubPolicy
 
 	// MaxConcurrency caps the number of in-flight per-Conn writes
-	// during a Broadcast. The default (0) is unbounded — one goroutine
-	// per Conn for the duration of the dispatch, which gives the best
-	// wall-clock latency at the cost of N goroutine stacks. Set to a
-	// finite value (e.g. runtime.GOMAXPROCS(0) * 4) to bound goroutine
-	// pressure on very-large fan-outs.
+	// during a Broadcast. Zero means [DefaultHubConcurrency] —
+	// runtime.GOMAXPROCS(0)*4 — which keeps goroutine pressure
+	// bounded on very-large fan-outs while still leaving slow conns
+	// non-blocking for the rest. Set to a negative value to opt OUT
+	// (true unbounded) for benchmarks; set to a positive integer to
+	// override the default.
 	MaxConcurrency int
 }
+
+// DefaultHubConcurrency is used when [HubConfig.MaxConcurrency] is
+// zero. Sized at GOMAXPROCS*4 — enough headroom that fast-cohort
+// dispatches (where a slow conn is rare) never queue, while bounding
+// peak goroutine count under burst load to a small multiple of CPU
+// cores.
+func DefaultHubConcurrency() int { return runtime.GOMAXPROCS(0) * 4 }
 
 // Hub is the connection-set abstraction for WebSocket fan-out: register
 // connections, broadcast to all (or a filtered subset), unregister on
@@ -108,6 +118,12 @@ func (h *Hub) Len() int {
 // dispatches it to every registered Conn. Returns the count of Conns
 // the message reached and the first per-Conn error encountered (if any
 // — failures are routed through [HubConfig.OnSlowConn]).
+//
+// Ordering: each individual Conn's wire writes are serialised by
+// Conn's own write semaphore, so a single Broadcast's frame arrives
+// at every Conn intact. Across calls to Broadcast there is no
+// cross-Conn ordering guarantee — two parallel publishers may
+// interleave on different Conns.
 func (h *Hub) Broadcast(messageType MessageType, data []byte) (delivered int, err error) {
 	pm, err := NewPreparedMessage(messageType, data)
 	if err != nil {
@@ -182,11 +198,18 @@ func (h *Hub) dispatch(snap []*Conn, pm *PreparedMessage, pred func(*Conn) bool)
 		toClose   []*Conn
 	)
 
-	// Optional bounded-concurrency semaphore. Zero ⇒ unbounded (one
-	// goroutine per matching conn).
+	// Concurrency cap: 0 ⇒ DefaultHubConcurrency (GOMAXPROCS*4);
+	// negative ⇒ unbounded (one goroutine per matching conn). The
+	// default keeps peak goroutine count bounded on a 10K-conn fan-
+	// out without hurting the small-N case (the semaphore is unused
+	// when concurrent dispatches stay below the cap).
 	var sema chan struct{}
-	if h.cfg.MaxConcurrency > 0 {
-		sema = make(chan struct{}, h.cfg.MaxConcurrency)
+	maxConc := h.cfg.MaxConcurrency
+	if maxConc == 0 {
+		maxConc = DefaultHubConcurrency()
+	}
+	if maxConc > 0 {
+		sema = make(chan struct{}, maxConc)
 	}
 
 	var wg sync.WaitGroup
@@ -203,6 +226,19 @@ func (h *Hub) dispatch(snap []*Conn, pm *PreparedMessage, pred func(*Conn) bool)
 			if sema != nil {
 				defer func() { <-sema }()
 			}
+			// Recover from panics in c.WritePreparedMessage or in the
+			// user's OnSlowConn callback. Without this, one bad
+			// callback brings down the entire process — every other
+			// in-flight broadcast goroutine takes the panic with it.
+			defer func() {
+				if r := recover(); r != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("panic in dispatch goroutine: %v", r)
+					}
+					mu.Unlock()
+				}
+			}()
 			err := c.WritePreparedMessage(pm)
 			if err == nil {
 				delivered.Add(1)
@@ -254,6 +290,13 @@ func (h *Hub) unregister(c *Conn) {
 // (delivered=0, err=nil) without dispatching. This makes Close safe to
 // call from a shutdown path that needs to know "no more wire writes
 // will happen after this returns".
+//
+// Concurrency: per-Conn Close calls fan out under the same
+// [HubConfig.MaxConcurrency] cap that gates Broadcast (default
+// [DefaultHubConcurrency], i.e. GOMAXPROCS*4; negative opts out). The
+// semaphore is acquired INSIDE each goroutine, so a hung Conn.Close
+// cannot deadlock the fan-out — Close still returns once every per-
+// Conn Close returns.
 func (h *Hub) Close() {
 	h.mu.Lock()
 	if h.closed {
@@ -273,19 +316,29 @@ func (h *Hub) Close() {
 	// Fan out the per-conn Close calls. With the same MaxConcurrency
 	// budget as Broadcast (default unbounded), 10k conns close in
 	// parallel rather than 10k sequential calls.
+	//
+	// Sema acquire is INSIDE the goroutine — unlike dispatch — because
+	// Conn.Close has no inherent timeout. If a Conn.Close hung, an
+	// outside-goroutine sema acquire on a low MaxConcurrency would
+	// freeze the loop and Hub.Close would never return. Inside-the-
+	// goroutine sema acquire trades a small goroutine-burst (up to
+	// len(conns) goroutines blocked on sema) for the deadlock
+	// guarantee — Hub.Close always returns once every Close returns.
 	var sema chan struct{}
-	if h.cfg.MaxConcurrency > 0 {
-		sema = make(chan struct{}, h.cfg.MaxConcurrency)
+	maxConc := h.cfg.MaxConcurrency
+	if maxConc == 0 {
+		maxConc = DefaultHubConcurrency()
+	}
+	if maxConc > 0 {
+		sema = make(chan struct{}, maxConc)
 	}
 	var wg sync.WaitGroup
 	wg.Add(len(conns))
 	for _, c := range conns {
-		if sema != nil {
-			sema <- struct{}{}
-		}
 		go func(c *Conn) {
 			defer wg.Done()
 			if sema != nil {
+				sema <- struct{}{}
 				defer func() { <-sema }()
 			}
 			_ = c.Close()

@@ -19,8 +19,27 @@ import (
 // Set [KVReplayStoreConfig.MaxIndex] to override.
 const MaxKVReplayIndex = 65536
 
-// KVReplayStoreConfig tunes [NewKVReplayStoreWithConfig].
+// DefaultAsyncAppendConcurrency is the cap on in-flight async-append
+// goroutines when [KVReplayStoreConfig.AsyncAppend] is on. A stalled
+// KV without this cap could pile up unbounded goroutines under heavy
+// publish load.
+const DefaultAsyncAppendConcurrency = 64
+
+// KVReplayStoreConfig tunes [NewKVReplayStore]. The KV / Prefix / TTL
+// fields are required (the constructor errors when KV is nil); the
+// rest have sensible defaults.
 type KVReplayStoreConfig struct {
+	// KV is the backing store. Required.
+	KV store.KV
+
+	// Prefix is the namespace under which event blobs and the
+	// shared counter live. Defaults to no prefix when empty.
+	Prefix string
+
+	// TTL bounds the lifetime of stored event blobs. Zero means no
+	// expiry — same convention as [store.KV.Set].
+	TTL time.Duration
+
 	// MaxIndex bounds the in-memory ID index. Zero or negative ⇒
 	// [MaxKVReplayIndex].
 	MaxIndex int
@@ -28,11 +47,28 @@ type KVReplayStoreConfig struct {
 	// AsyncAppend, when true, makes [ReplayStore.Append] return as
 	// soon as the local ID has been allocated — the actual KV.Set
 	// fires in a background goroutine. Trades durability for latency:
-	// an Append() that returns successfully is NOT guaranteed to be
-	// in the KV when the next reconnect happens. Use only when wire-
-	// write latency dominates and replay can tolerate eventual
-	// consistency.
+	//   - An Append() that returns successfully is NOT guaranteed to
+	//     be in the KV when the next reconnect happens.
+	//   - A Since() that runs concurrently with a still-flight Append
+	//     may observe ErrNotFound on that id and skip it. Documented
+	//     visibility window for the AsyncAppend mode.
+	// Use only when wire-write latency dominates and replay can
+	// tolerate eventual consistency.
+	//
+	// Backpressure: at the [KVReplayStoreConfig.AsyncAppendConcurrency]
+	// cap, Append blocks the caller until a goroutine slot frees. This
+	// is intentional — under heavy publish load against a stalled KV,
+	// blocking the publisher is preferable to letting goroutine count
+	// explode. Visible-latency backpressure beats unbounded memory
+	// growth.
 	AsyncAppend bool
+
+	// AsyncAppendConcurrency caps the number of in-flight goroutines
+	// spawned by AsyncAppend. Zero means [DefaultAsyncAppendConcurrency].
+	// A slow / stalled KV (e.g. a Redis instance under degraded
+	// network) without this cap could pile up unbounded goroutines.
+	// At the cap, Append blocks (see [KVReplayStoreConfig.AsyncAppend]).
+	AsyncAppendConcurrency int
 
 	// CounterKey is the KV key under which the cross-instance counter
 	// lives. Zero value ⇒ "<prefix>seq". Only consulted when the
@@ -43,34 +79,19 @@ type KVReplayStoreConfig struct {
 
 // NewKVReplayStore backs the replay log with a [store.KV] for durability
 // across restarts and (with a shared backend) across processes. Events
-// live at "<prefix>events/<id>"; ttl bounds retention. IDs are the same
-// monotonic decimal strings the ring buffer emits, generated locally
-// from an in-process counter.
-//
-// Multi-instance caveat: each process maintains its own ID counter, so
-// ID collisions are possible across instances. For strict cross-instance
-// monotonicity use a backend that exposes a counter (e.g. Redis INCR via
-// a custom adapter); this default implementation is best-effort.
-//
-// ttl == 0 stores events without expiry (the underlying KV decides what
-// "no expiry" means). Returns an error when kv is nil.
-func NewKVReplayStore(kv store.KV, prefix string, ttl time.Duration) (ReplayStore, error) {
-	return NewKVReplayStoreWithConfig(kv, prefix, ttl, KVReplayStoreConfig{})
-}
-
-// NewKVReplayStoreWithConfig is the explicit-tuning constructor; the
-// zero-value [KVReplayStoreConfig] reproduces [NewKVReplayStore]'s
-// defaults.
+// live at "<Prefix>events/<id>"; TTL bounds retention.
 //
 // When the supplied [store.KV] also implements [store.Counter] (e.g.
 // the Redis adapter via INCR), IDs are allocated atomically against
-// that backend — multiple processes sharing the KV will see a single
+// that backend — multiple processes sharing the KV see a single
 // monotonic ID space. When the KV does not implement Counter, the
 // store falls back to a per-process counter; multi-instance setups
 // will see ID collisions across instances.
-func NewKVReplayStoreWithConfig(kv store.KV, prefix string, ttl time.Duration, cfg KVReplayStoreConfig) (ReplayStore, error) {
-	if kv == nil {
-		return nil, errors.New("sse: NewKVReplayStore requires a non-nil store.KV")
+//
+// Returns an error when [KVReplayStoreConfig.KV] is nil.
+func NewKVReplayStore(cfg KVReplayStoreConfig) (ReplayStore, error) {
+	if cfg.KV == nil {
+		return nil, errors.New("sse: NewKVReplayStore requires a non-nil KV")
 	}
 	maxIdx := cfg.MaxIndex
 	if maxIdx <= 0 {
@@ -78,17 +99,24 @@ func NewKVReplayStoreWithConfig(kv store.KV, prefix string, ttl time.Duration, c
 	}
 	counterKey := cfg.CounterKey
 	if counterKey == "" {
-		counterKey = prefix + "seq"
+		counterKey = cfg.Prefix + "seq"
+	}
+	asyncCap := cfg.AsyncAppendConcurrency
+	if asyncCap <= 0 {
+		asyncCap = DefaultAsyncAppendConcurrency
 	}
 	s := &kvStore{
-		kv:          kv,
-		prefix:      prefix,
-		ttl:         ttl,
+		kv:          cfg.KV,
+		prefix:      cfg.Prefix,
+		ttl:         cfg.TTL,
 		maxIndex:    maxIdx,
 		asyncAppend: cfg.AsyncAppend,
 		counterKey:  counterKey,
 	}
-	if c, ok := kv.(store.Counter); ok {
+	if cfg.AsyncAppend {
+		s.asyncSlots = make(chan struct{}, asyncCap)
+	}
+	if c, ok := cfg.KV.(store.Counter); ok {
 		s.counter = c
 	}
 	return s, nil
@@ -102,6 +130,7 @@ type kvStore struct {
 	ttl         time.Duration
 	maxIndex    int
 	asyncAppend bool
+	asyncSlots  chan struct{} // nil unless AsyncAppend; bounds goroutines
 	localSeq    atomic.Uint64
 
 	indexMu sync.Mutex
@@ -140,10 +169,14 @@ func (s *kvStore) Append(ctx context.Context, e Event) (string, error) {
 	if s.asyncAppend {
 		// Fire-and-log the KV write. Caller gets the id immediately;
 		// the event reaches the store after wire delivery (or never,
-		// if the KV rejects it). Suitable for low-latency publishing
-		// where a small replay-store gap during a backend hiccup is
-		// preferable to gating Send on backend latency.
+		// if the KV rejects it). asyncSlots caps the number of in-
+		// flight writes so a stalled KV cannot accumulate unbounded
+		// goroutines under heavy publish load — at the cap, Append
+		// blocks the caller until a slot frees, providing natural
+		// backpressure that mimics the sync path.
+		s.asyncSlots <- struct{}{}
 		go func() {
+			defer func() { <-s.asyncSlots }()
 			_ = s.kv.Set(context.Background(), s.eventKey(id), blob, s.ttl)
 		}()
 	} else if err := s.kv.Set(ctx, s.eventKey(id), blob, s.ttl); err != nil {

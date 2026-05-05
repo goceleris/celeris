@@ -245,6 +245,14 @@ func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.D
 // extension. The stored value is the decimal-string encoding of the
 // current count; this matches the wire format Redis INCR returns and
 // keeps the on-disk shape compatible across backends.
+//
+// Namespace: Increment shares the key namespace with [MemoryKV.Set] —
+// they are not separate maps. A key that holds a non-integer value
+// previously written via Set returns an error on the next Increment
+// (matching Redis "ERR value is not an integer or out of range"). A
+// Set on a key currently used as a counter overwrites the counter
+// state atomically, so the next Increment starts from the new value
+// (or errors if the new value is non-integer).
 func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
 	s := m.shard(key)
 	s.mu.Lock()

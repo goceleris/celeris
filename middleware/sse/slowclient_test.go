@@ -209,13 +209,13 @@ func TestSlowClientDropEvent(t *testing.T) {
 	}
 }
 
-// TestSlowClientDisconnect verifies the disconnect policy cancels the context
+// TestSlowClientClose verifies the close policy cancels the context
 // and surfaces an error once the queue overflows. The handler must release
 // the streamer gate before returning so the in-flight drain Write can
 // complete; otherwise the defer's drain join would deadlock. Send is looped
 // because drain scheduling determines whether the queue fills on Send #2
 // (drain hasn't pulled yet) or Send #3 (drain already holds one event).
-func TestSlowClientDisconnect(t *testing.T) {
+func TestSlowClientClose(t *testing.T) {
 	ctx, gs := newGatedContext(t)
 
 	var (
@@ -226,7 +226,7 @@ func TestSlowClientDisconnect(t *testing.T) {
 		HeartbeatInterval: -1,
 		MaxQueueDepth:     1,
 		OnSlowClient: func(_ *Client, _ Event) ClientPolicy {
-			return ClientPolicyDisconnect
+			return ClientPolicyClose
 		},
 		Handler: func(client *Client) {
 			for range 8 {
@@ -246,7 +246,7 @@ func TestSlowClientDisconnect(t *testing.T) {
 		t.Errorf("disconnect policy did not surface an error after queue overflow")
 	}
 	if ctxErr == nil {
-		t.Errorf("Context not cancelled after disconnect policy fired")
+		t.Errorf("Context not cancelled after close policy fired")
 	}
 }
 

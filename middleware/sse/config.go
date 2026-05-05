@@ -15,7 +15,10 @@ const (
 // ClientPolicy selects what the middleware does when a per-client
 // outbound queue is full at Send time. Used together with
 // [Config.MaxQueueDepth] and [Config.OnSlowClient]. Naming mirrors
-// [BrokerPolicy] and websocket.HubPolicy for ecosystem consistency.
+// [BrokerPolicy] and websocket.HubPolicy — same verbs, same semantics.
+//
+// Block is sse-Client-specific (it gates Send, not a fan-out
+// dispatch); the rest of the {Drop, Close} pair is shared.
 type ClientPolicy uint8
 
 const (
@@ -23,9 +26,9 @@ const (
 	// [Client.DroppedEvents]. Send returns nil.
 	ClientPolicyDrop ClientPolicy = iota
 
-	// ClientPolicyDisconnect cancels the client's context, causing the
+	// ClientPolicyClose cancels the client's context, causing the
 	// handler goroutine to exit. Send returns [ErrClientClosed].
-	ClientPolicyDisconnect
+	ClientPolicyClose
 
 	// ClientPolicyBlock falls back to the legacy blocking semantics:
 	// Send waits for queue space until the context is cancelled.
@@ -73,9 +76,19 @@ type Config struct {
 	//     writes the missed events to the wire BEFORE invoking Handler;
 	//   - wraps Send so each call also Appends to the store, rewriting
 	//     the wire id: field with the canonical store-assigned ID;
-	//   - if Since returns ErrLastIDUnknown, logs at debug and still
-	//     invokes Handler (the user's resumption logic decides what to
-	//     do with a fresh start).
+	//   - on Since returning [ErrLastIDUnknown], silently falls
+	//     through and still invokes Handler — the original header
+	//     value remains visible via [Client.LastEventID] so the
+	//     user's resumption logic can react.
+	//
+	// Performance note: synchronous Append runs INSIDE the per-Client
+	// write lock so wire order matches store order. A slow store
+	// (e.g. Redis over a degraded network) directly stalls Send and
+	// any concurrent heartbeat or SendComment. For low-latency
+	// publishing against a remote KV, prefer
+	// [NewKVReplayStore] with [KVReplayStoreConfig.AsyncAppend] = true
+	// so Append returns immediately and the actual KV.Set fires in
+	// the background.
 	ReplayStore ReplayStore
 
 	// OnConnect is called when a new SSE client connects, before Handler.
