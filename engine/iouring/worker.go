@@ -2556,12 +2556,18 @@ func createListenSocket(addr string) (int, error) {
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 
 	if err := unix.Bind(fd, sa); err != nil {
+		// Capture diagnostics BEFORE closing fd: SO_REUSEPORT/REUSEADDR
+		// state and the list of current listeners on this port. This
+		// turns "bind: address already in use" into a debuggable error
+		// the next time a port-recycling race fires.
+		diag := bindDiag(fd, sa)
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("bind: %w", err)
+		return -1, fmt.Errorf("bind: %w [%s]", err, diag)
 	}
 	if err := unix.Listen(fd, 4096); err != nil {
+		diag := bindDiag(fd, sa)
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("listen: %w", err)
+		return -1, fmt.Errorf("listen: %w [%s]", err, diag)
 	}
 
 	return fd, nil
