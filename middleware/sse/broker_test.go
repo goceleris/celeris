@@ -491,9 +491,10 @@ func TestBrokerCloseRacingSlowSubscriberClose(t *testing.T) {
 
 // TestBrokerSlowSubscriberPolicyCallbackInvoked pins that
 // OnSlowSubscriber actually fires when a subscriber's queue overflows,
-// regardless of the policy returned. The callback runs synchronously
-// in the publisher's goroutine — by design — so that any Remove/Close
-// cleanup completes before pool reuse can race acquireClient.
+// regardless of the policy returned. Callbacks run on per-subscriber
+// goroutines but the publisher waits on every one before returning,
+// so any Remove/Close cleanup completes before pool reuse can race
+// acquireClient.
 func TestBrokerSlowSubscriberPolicyCallbackInvoked(t *testing.T) {
 	var calls atomic.Int32
 	b := NewBroker(BrokerConfig{
@@ -516,3 +517,151 @@ func TestBrokerSlowSubscriberPolicyCallbackInvoked(t *testing.T) {
 		t.Errorf("OnSlowSubscriber never invoked despite queue overflow")
 	}
 }
+
+// subscribeGatedSlow wires N gated slow subscribers to b, then publishes
+// twice so each subscriber's queue is full and the next publish hits
+// the slow path for every one of them. Returns a teardown that releases
+// every gate and joins every handler.
+func subscribeGatedSlow(t *testing.T, b *Broker, n int) (teardown func()) {
+	t.Helper()
+	releases := make([]func(), 0, n)
+	cleanups := make([]func(), 0, n)
+	for range n {
+		slow, release, cleanup := startSlowClient(t)
+		b.Subscribe(slow)
+		releases = append(releases, release)
+		cleanups = append(cleanups, cleanup)
+	}
+	// Two publishes deterministically fill every gated subscriber's
+	// SubscriberBuffer=1 queue: drain pulls publish 1 → blocks on
+	// gated Write; publish 2 enqueues to the now-empty buffer; the
+	// next publish (trigger) finds every queue full → slow path.
+	for range 2 {
+		b.Publish(Event{Data: "fill"})
+	}
+	return func() {
+		for _, r := range releases {
+			r()
+		}
+		for _, c := range cleanups {
+			c()
+		}
+	}
+}
+
+// TestBrokerSlowSubscriberCallbackParallel — N slow subscribers with a
+// callback that sleeps D each must complete in roughly D, not N*D.
+// This locks in the parallel slow-path semantics so a future revert to
+// the serial loop is caught by CI.
+func TestBrokerSlowSubscriberCallbackParallel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing-sensitive; skipped under -short")
+	}
+	const slowN = 16
+	const callbackDelay = 50 * time.Millisecond
+
+	b := NewBroker(BrokerConfig{
+		SubscriberBuffer: 1,
+		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+			time.Sleep(callbackDelay)
+			return BrokerPolicyDrop
+		},
+	})
+	defer b.Close()
+
+	teardown := subscribeGatedSlow(t, b, slowN)
+	defer teardown()
+
+	start := time.Now()
+	b.Publish(Event{Data: "trigger"})
+	elapsed := time.Since(start)
+
+	// Serial would be slowN * callbackDelay (~800ms). Parallel should be
+	// roughly callbackDelay (~50ms) plus a small constant. Allow 4x
+	// callbackDelay as the upper bound — generous enough to absorb CI
+	// jitter, tight enough to fail if someone reverts to the serial loop.
+	upper := 4 * callbackDelay
+	if elapsed >= upper {
+		t.Fatalf("Publish(slow=%d, cb=%v) took %v, want < %v — slow path serialised?",
+			slowN, callbackDelay, elapsed, upper)
+	}
+}
+
+// TestBrokerSlowSubscriberCallbackPanicIsolated — a panic inside the
+// user's OnSlowSubscriber callback must NOT crash the publisher or
+// gate other slow subscribers' policies.
+func TestBrokerSlowSubscriberCallbackPanicIsolated(t *testing.T) {
+	const slowN = 8
+	var panicked atomic.Int32
+	var dropCalls atomic.Int32
+
+	b := NewBroker(BrokerConfig{
+		SubscriberBuffer: 1,
+		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+			// Panic for the FIRST goroutine to enter the callback;
+			// everyone else gets a normal Drop. CAS guarantees
+			// exactly-one panic regardless of fan-out scheduling.
+			if panicked.CompareAndSwap(0, 1) {
+				panic("intentional test panic")
+			}
+			dropCalls.Add(1)
+			return BrokerPolicyDrop
+		},
+	})
+	defer b.Close()
+
+	teardown := subscribeGatedSlow(t, b, slowN)
+	defer teardown()
+
+	// Trigger. The publisher must NOT propagate the panic; if it did,
+	// the test process would crash and we'd never reach the assertions.
+	b.Publish(Event{Data: "trigger"})
+
+	if panicked.Load() != 1 {
+		t.Fatalf("expected exactly one goroutine to panic, got panicked=%d", panicked.Load())
+	}
+	if got := dropCalls.Load(); got == 0 {
+		t.Fatalf("non-panicking subscribers' callbacks never ran (panic gated others?)")
+	}
+}
+
+// TestBrokerSlowSubscriberConcurrencyCap — at SlowSubscriberConcurrency=1
+// the slow path serialises across subscribers. Used to prove the cap is
+// load-bearing for users who want to dampen burst goroutine pressure.
+func TestBrokerSlowSubscriberConcurrencyCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing-sensitive; skipped under -short")
+	}
+	const slowN = 4
+	const callbackDelay = 30 * time.Millisecond
+
+	b := NewBroker(BrokerConfig{
+		SubscriberBuffer:          1,
+		SlowSubscriberConcurrency: 1, // force serialisation
+		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+			time.Sleep(callbackDelay)
+			return BrokerPolicyDrop
+		},
+	})
+	defer b.Close()
+
+	teardown := subscribeGatedSlow(t, b, slowN)
+	defer teardown()
+
+	start := time.Now()
+	b.Publish(Event{Data: "trigger"})
+	elapsed := time.Since(start)
+
+	// Serialised: slowN * callbackDelay (~120ms). Allow [floor, ceil]
+	// generous enough that scheduling jitter doesn't flake the test.
+	floor := time.Duration(float64(slowN*callbackDelay) * 0.6)
+	if elapsed < floor {
+		t.Fatalf("Publish elapsed %v < floor %v — concurrency cap not enforced?",
+			elapsed, floor)
+	}
+}
+
+// (BrokerPolicyClose under fan-out is covered by the existing
+// TestBrokerSlowSubscriberClosePolicy — adding a parallel variant
+// adds no signal because the fan-out machinery itself is policy-
+// agnostic and is already exercised by the Drop / Cap tests above.)

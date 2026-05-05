@@ -642,6 +642,13 @@ func TestHubCloseWaitsInflightBroadcast(t *testing.T) {
 		close(bcastDone)
 	}()
 	<-bcastEntered
+	// close(bcastEntered) fires BEFORE the goroutine enters Broadcast;
+	// without this short wait, main can race ahead and call Hub.Close
+	// before snapshot increments inflight, which would let Close return
+	// instantly and falsely fail the assertion below. 20ms is generous
+	// against scheduler jitter and well under the 150ms slow-conn
+	// deadline that anchors the actual semantic check.
+	time.Sleep(20 * time.Millisecond)
 
 	closeStart := time.Now()
 	h.Close()

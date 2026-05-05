@@ -1,6 +1,9 @@
 package sse
 
-import "sync"
+import (
+	"runtime"
+	"sync"
+)
 
 // BrokerPolicy controls what happens to a slow subscriber whose
 // per-subscriber queue is full at [Broker.Publish] time. Values mirror
@@ -24,7 +27,7 @@ const (
 	BrokerPolicyClose
 )
 
-// BrokerConfig tunes a [Broker]. Both fields are optional; zero values
+// BrokerConfig tunes a [Broker]. All fields are optional; zero values
 // produce reasonable defaults.
 type BrokerConfig struct {
 	// SubscriberBuffer bounds each subscriber's outbound queue inside the
@@ -35,11 +38,28 @@ type BrokerConfig struct {
 	// OnSlowSubscriber is consulted when a subscriber's queue is full at
 	// Publish time. When nil, [BrokerPolicyDrop] is used.
 	OnSlowSubscriber func(c *Client, pe *PreparedEvent) BrokerPolicy
+
+	// SlowSubscriberConcurrency caps the number of in-flight per-
+	// subscriber slow-path goroutines spawned by Publish/PublishPrepared
+	// when one or more subscribers' queues are full. Zero means
+	// [DefaultBrokerSlowConcurrency] — runtime.GOMAXPROCS(0)*4. Negative
+	// opts out (true unbounded) — useful for benchmarks; production
+	// callers should keep the cap on so a misbehaving OnSlowSubscriber
+	// callback cannot fan out into thousands of goroutines.
+	SlowSubscriberConcurrency int
 }
 
 // DefaultBrokerSubscriberBuffer is the queue capacity used when
 // [BrokerConfig.SubscriberBuffer] is zero.
 const DefaultBrokerSubscriberBuffer = 64
+
+// DefaultBrokerSlowConcurrency is used when
+// [BrokerConfig.SlowSubscriberConcurrency] is zero. Sized at
+// GOMAXPROCS*4 — same heuristic as
+// [middleware/websocket.DefaultHubConcurrency] — so a many-slow-
+// subscriber publish parallelises up to a small multiple of CPU cores
+// without spawning unbounded goroutines.
+func DefaultBrokerSlowConcurrency() int { return runtime.GOMAXPROCS(0) * 4 }
 
 // Broker fans out a single SSE event source to N subscribers without
 // re-formatting. Each subscriber gets its own bounded outbound queue plus
@@ -152,14 +172,27 @@ func (b *Broker) Publish(e Event) *PreparedEvent {
 // one. Slow subscribers — those whose queue is full at the non-
 // blocking send attempt — have the configured [BrokerPolicy] applied.
 //
-// The OnSlowSubscriber callback runs SYNCHRONOUSLY in the publisher's
-// goroutine, and any [BrokerPolicyRemove] / [BrokerPolicyClose]
-// cleanup completes before PublishPrepared returns. This is by
-// design: the cleanup ordering is required so a subsequent
-// [Subscribe] cannot race the [Client.Close] from a prior policy
-// firing. Callers that want a fast Publish must keep their
-// OnSlowSubscriber callbacks tight, or rely on [BrokerPolicyDrop]
-// (the no-callback default) which short-circuits without dispatch.
+// Slow-path concurrency: when N subscribers are slow, the per-
+// subscriber policy callback + cleanup runs in parallel across
+// goroutines bounded by [BrokerConfig.SlowSubscriberConcurrency]
+// (default GOMAXPROCS*4). Total slow-path latency is therefore
+// approximately max(callback) + cleanup rather than the sum across
+// subscribers. PublishPrepared still WAITS for every spawned slow-
+// path goroutine before returning — the join is required so a
+// subsequent [Subscribe] cannot race a [Client.Close] from a prior
+// policy firing (sync.Pool of *Client could otherwise hand a still-
+// closing pointer to a fresh connection).
+//
+// Panic isolation: a panic inside a user OnSlowSubscriber callback
+// is recovered inside the slow-path goroutine — other slow-path
+// goroutines continue, and the publisher returns normally. The
+// failing subscriber stays registered (the policy could not be
+// honoured); the panic is otherwise swallowed because the publisher
+// has no error channel to surface it on.
+//
+// Default OnSlowSubscriber == nil short-circuits without spawning
+// any slow-path goroutines: events were already dropped at the
+// non-blocking-send branch and no cleanup is required.
 func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	if pe == nil {
 		return
@@ -188,28 +221,58 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 		// branch above; no further work.
 		return
 	}
-	// The policy callback runs synchronously: Remove/Close cleanup
-	// must complete before the publisher returns so that Pool reuse
-	// of the *Client cannot race with c.Close() from a detached
-	// goroutine. If the user's policy callback is slow, this gates
-	// the publisher — that is the documented contract; users wanting
-	// fast Publish should keep OnSlowSubscriber callbacks tight, or
-	// use BrokerPolicyDrop (which short-circuits above).
-	for i, c := range slowClients {
-		switch action := policy(c, pe); action {
-		case BrokerPolicyDrop:
-			// Keep the subscriber registered; this Publish dropped
-			// its event but future ones may land.
-		case BrokerPolicyRemove:
-			b.removeSubscriber(c, slowStates[i])
-			<-slowStates[i].done
-		case BrokerPolicyClose:
-			state := slowStates[i]
-			b.removeSubscriber(c, state)
-			_ = c.Close()
-			<-state.done
-		}
+
+	// Concurrency cap: 0 ⇒ DefaultBrokerSlowConcurrency (GOMAXPROCS*4);
+	// negative ⇒ unbounded (one goroutine per slow subscriber). The
+	// default keeps peak goroutine count bounded on a many-slow fan-
+	// out without hurting the small-N case (the semaphore is unused
+	// when len(slowClients) ≤ cap).
+	var sema chan struct{}
+	maxConc := b.cfg.SlowSubscriberConcurrency
+	if maxConc == 0 {
+		maxConc = DefaultBrokerSlowConcurrency()
 	}
+	if maxConc > 0 {
+		sema = make(chan struct{}, maxConc)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(slowClients))
+	for i, c := range slowClients {
+		state := slowStates[i]
+		if sema != nil {
+			sema <- struct{}{}
+		}
+		go func(c *Client, state *brokerSubscriber) {
+			defer wg.Done()
+			if sema != nil {
+				defer func() { <-sema }()
+			}
+			// Recover from panics in the user policy callback. Without
+			// this, one bad callback brings down every other in-flight
+			// slow-path goroutine and the publisher itself. The
+			// subscriber stays registered on panic — we could not run
+			// the policy to decide otherwise.
+			defer func() { _ = recover() }()
+			switch policy(c, pe) {
+			case BrokerPolicyDrop:
+				// Keep the subscriber registered; this Publish dropped
+				// its event but future ones may land.
+			case BrokerPolicyRemove:
+				b.removeSubscriber(c, state)
+				<-state.done
+			case BrokerPolicyClose:
+				b.removeSubscriber(c, state)
+				_ = c.Close()
+				<-state.done
+			}
+		}(c, state)
+	}
+	// Wait gates publisher return on every slow-path goroutine. This
+	// is the load-bearing guarantee: a *Client returned to sync.Pool
+	// after the user's handler defer cannot be re-acquired by a fresh
+	// connection while a goroutine here still holds it.
+	wg.Wait()
 }
 
 func (b *Broker) removeSubscriber(c *Client, expected *brokerSubscriber) {
