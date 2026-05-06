@@ -427,11 +427,14 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 		// Stop. We surface only positive deltas at log time.
 		result.FDsAfterStop = countProcessFDs()
 		result.FDsLeaked = result.FDsAfterStop - result.FDsBefore
-		if result.FDsLeaked > 0 {
-			fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d leaked=+%d\n",
-				cell.Scenario.Name(), cell.Server.Name(),
-				result.FDsBefore, result.FDsAfterStop, result.FDsLeaked)
-		}
+		// Always log: the absolute count exposes drift even when the
+		// per-cell delta is zero. A leak that takes thousands of cells
+		// to materialise shows up as a slow upward slope across the
+		// before/after columns; the diff column flags any cell that
+		// added to the leak in a single execution.
+		fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d diff=%+d\n",
+			cell.Scenario.Name(), cell.Server.Name(),
+			result.FDsBefore, result.FDsAfterStop, result.FDsLeaked)
 	}()
 	target := ln.Addr()
 	targetAddr := target.String()
