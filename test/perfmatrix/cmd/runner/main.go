@@ -439,11 +439,62 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 	// lets -fail-fast stop the run so it can be investigated before
 	// polluting hours of downstream measurements.
 	if res != nil && res.Requests == 0 {
-		result.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s (server likely refused the client's protocol or hung mid-warmup)",
-			res.Errors, res.Duration)
+		// Capture process-level resource state at the moment of failure.
+		// 0-req cells are often tail-of-matrix accumulation symptoms (FD
+		// or goroutine leak, TCP TIME_WAIT exhaustion); dumping these
+		// counters into the cell error gives the next investigator a
+		// concrete starting point instead of "look at the whole matrix
+		// log and guess". Cheap to compute, only fires on failure.
+		diag := zeroReqDiag()
+		result.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s diag=[%s] (server likely refused the client's protocol, accumulated state exhausted resources, or hung mid-warmup)",
+			res.Errors, res.Duration, diag)
 		return errors.New(result.Error)
 	}
 	return nil
+}
+
+// zeroReqDiag captures a one-line snapshot of process resources useful
+// for diagnosing 0-request failures that only surface deep into a
+// long-running matrix. Goroutine count exposes worker leaks; open-FD
+// count exposes socket/listener leaks; ephemeral-port count exposes
+// TCP TIME_WAIT pool exhaustion.
+func zeroReqDiag() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "goroutines=%d", runtime.NumGoroutine())
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(&b, " heap_inuse=%d sys=%d", ms.HeapInuse, ms.Sys)
+
+	if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
+		fmt.Fprintf(&b, " open_fds=%d", len(entries))
+	}
+	// Loopback ephemeral port pressure: count TIME_WAIT lines in
+	// /proc/net/tcp{,6}. Cheap parse — we only need the count.
+	tw := 0
+	for _, p := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		if blob, err := os.ReadFile(p); err == nil {
+			for _, line := range strings.Split(string(blob), "\n") {
+				fields := strings.Fields(line)
+				// fields[3] is the state column; 06 = TCP_TIME_WAIT
+				if len(fields) >= 4 && fields[3] == "06" {
+					tw++
+				}
+			}
+		}
+	}
+	fmt.Fprintf(&b, " time_wait=%d", tw)
+	// Per-process limit + current usage from /proc/self/limits, picked
+	// out for "Max open files" only.
+	if blob, err := os.ReadFile("/proc/self/limits"); err == nil {
+		for _, line := range strings.Split(string(blob), "\n") {
+			if strings.HasPrefix(line, "Max open files") {
+				fmt.Fprintf(&b, " %s", strings.Join(strings.Fields(line), "_"))
+				break
+			}
+		}
+	}
+	return b.String()
 }
 
 // filterCells returns the subset of scenarios and servers selected by
