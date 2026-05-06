@@ -2555,14 +2555,33 @@ func createListenSocket(addr string) (int, error) {
 	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 
-	if err := unix.Bind(fd, sa); err != nil {
-		// Capture diagnostics BEFORE closing fd: SO_REUSEPORT/REUSEADDR
-		// state and the list of current listeners on this port. This
-		// turns "bind: address already in use" into a debuggable error
-		// the next time a port-recycling race fires.
+	// Concurrent bind() into a SO_REUSEPORT group races on the kernel's
+	// per-port bind table — observed on Linux 7.0 / aarch64 with the
+	// adaptive engine: epoll's 12 loops + iouring's 1 worker bind the
+	// same port concurrently, and the last bind occasionally hits
+	// EADDRINUSE despite SO_REUSEPORT. Retry with light backoff
+	// dissolves the race without serialising startup. A real conflict
+	// (not contention) escapes after the budget with bindDiag attached.
+	const bindRetries = 8
+	var bindErr error
+	for attempt := 0; attempt < bindRetries; attempt++ {
+		if attempt > 0 {
+			// 250 µs · 2^(attempt-1) → 250 µs, 500 µs, 1 ms, … 32 ms.
+			// Total worst-case across 7 retries ≈ 64 ms.
+			time.Sleep(time.Duration(250*(1<<(attempt-1))) * time.Microsecond)
+		}
+		bindErr = unix.Bind(fd, sa)
+		if bindErr == nil {
+			break
+		}
+		if !errors.Is(bindErr, unix.EADDRINUSE) {
+			break
+		}
+	}
+	if bindErr != nil {
 		diag := bindDiag(fd, sa)
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("bind: %w [%s]", err, diag)
+		return -1, fmt.Errorf("bind: %w [%s]", bindErr, diag)
 	}
 	if err := unix.Listen(fd, 4096); err != nil {
 		diag := bindDiag(fd, sa)
