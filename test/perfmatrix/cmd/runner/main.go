@@ -53,6 +53,11 @@ type Config struct {
 	// report or a SIGSEGV signal could sit buried for hours while the
 	// rest of the matrix keeps running).
 	FailFast bool
+	// FDTrace emits the per-cell `cell-fd: before=N after=M diff=±K`
+	// log line for every cell, not just cells with non-zero deltas.
+	// Off by default — leak hunts that need absolute counts to spot
+	// slow drift turn it on (PERFMATRIX_FD_TRACE=1 / -fd-trace).
+	FDTrace bool
 }
 
 // DefaultConfig is the set of defaults applied to a fresh flag.FlagSet.
@@ -96,6 +101,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 		"rng seed for any randomised orchestrator behaviour; 0 = time.Now().UnixNano()")
 	fs.BoolVar(&c.FailFast, "fail-fast", c.FailFast,
 		"abort the run at the first cell error (pair with -race / GORACE=halt_on_error for strict mode)")
+	fs.BoolVar(&c.FDTrace, "fd-trace", c.FDTrace,
+		"log per-cell FD counts even when the delta is zero (off by default — non-zero deltas always log)")
 }
 
 // ParseArgs parses argv (without the program name). out is used for flag
@@ -427,14 +434,17 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 		// Stop. We surface only positive deltas at log time.
 		result.FDsAfterStop = countProcessFDs()
 		result.FDsLeaked = result.FDsAfterStop - result.FDsBefore
-		// Always log: the absolute count exposes drift even when the
-		// per-cell delta is zero. A leak that takes thousands of cells
-		// to materialise shows up as a slow upward slope across the
-		// before/after columns; the diff column flags any cell that
-		// added to the leak in a single execution.
-		fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d diff=%+d\n",
-			cell.Scenario.Name(), cell.Server.Name(),
-			result.FDsBefore, result.FDsAfterStop, result.FDsLeaked)
+		// Default: only log on a non-zero delta — keeps gate.log
+		// readable. PERFMATRIX_FD_TRACE=1 forces per-cell before/after
+		// for active leak hunts (slow upward drift over thousands of
+		// cells is invisible without absolute counts). Either way the
+		// values land on the per-cell JSON via FDsBefore/FDsAfterStop
+		// for post-run analysis.
+		if result.FDsLeaked != 0 || cfg.FDTrace {
+			fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d diff=%+d\n",
+				cell.Scenario.Name(), cell.Server.Name(),
+				result.FDsBefore, result.FDsAfterStop, result.FDsLeaked)
+		}
 	}()
 	target := ln.Addr()
 	targetAddr := target.String()

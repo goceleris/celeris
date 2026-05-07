@@ -313,6 +313,12 @@ func runMatrix(fl matrixFlags) error {
 	if fl.strict {
 		args = append(args, "-fail-fast")
 	}
+	// FD-trace logs per-cell open-FD count for active leak hunts.
+	// PERFMATRIX_FD_TRACE=1 forwards as -fd-trace; otherwise the
+	// runner only logs cells with non-zero FD delta (the noise floor).
+	if v := os.Getenv("PERFMATRIX_FD_TRACE"); v == "1" || v == "true" {
+		args = append(args, "-fd-trace")
+	}
 	args = append(args, fl.extraArgs...)
 
 	fmt.Printf("perfmatrix: go %s\n", strings.Join(args, " "))

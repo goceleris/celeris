@@ -182,6 +182,15 @@ func (s *Server) Start(ctx context.Context, svcs *services.Handles) (net.Listene
 }
 
 // Stop implements servers.Server.
+//
+// Order: drain http.Server first (Shutdown waits for in-flight requests
+// to finish, then closes idle conns), then iris.Application.Shutdown
+// to release iris-internal resources (view engines, pluggable hosts,
+// auto-tls listeners). The matrix used to observe a transient +N FD
+// drift after iris cells because http.Server.Shutdown alone left a
+// few FDs queued on iris.Application's host list — they reaped
+// during the next cell's GC pass. Calling app.Shutdown closes them
+// synchronously, restoring the per-cell baseline.
 func (s *Server) Stop(ctx context.Context) error {
 	if s.srv == nil {
 		return nil
@@ -189,6 +198,11 @@ func (s *Server) Stop(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	err := s.srv.Shutdown(shutdownCtx)
+	if s.app != nil {
+		// Best-effort — iris's Shutdown returns an error only when its
+		// own host list is empty; we just want the side effects.
+		_ = s.app.Shutdown(shutdownCtx)
+	}
 	s.shutdownDriverHandlers()
 	return err
 }
