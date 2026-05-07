@@ -466,7 +466,18 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 
 	// Profile capture, if enabled and supported.
 	var profileArt *profileArtifact
-	cellCtx, cellCancel := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+30*time.Second)
+	// Per-cell timeout. The original Warmup+Duration+30s was too tight
+	// under the strict matrix (-race + checkptr) on slower hosts —
+	// observed on msr1 (aarch64) where the 1MB POST scenario's
+	// loadgen warmup naturally stretched well past 1s under -race
+	// overhead. When warmup eats most of the budget, post-warmup
+	// returns with 0 requests and the cell mis-fires fail-fast on a
+	// non-bug. Scaled buffer (5x Warmup + 2x Duration + 60s) keeps
+	// fast cells fast while letting slow ones complete, and the
+	// 0-req guard still catches genuine failures (server refused
+	// every connection, hung mid-handshake).
+	cellTimeout := 5*cfg.Warmup + 2*cfg.Duration + 60*time.Second
+	cellCtx, cellCancel := context.WithTimeout(parent, cellTimeout)
 	defer cellCancel()
 
 	var cpuWG sync.WaitGroup
