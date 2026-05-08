@@ -303,7 +303,7 @@ func ClusterDistributedBenchParallel() error {
 //	CLUSTER_GO_TARGET     mage targets, space-separated  (required)
 //	CLUSTER_GO_HOSTS      comma-separated host list      (default: bench targets, msa2-server,msr1)
 //	CLUSTER_GO_HOST       legacy alias for single host
-//	CLUSTER_GO_VERSION    Go version to stage            (default: 1.26.2)
+//	CLUSTER_GO_VERSION    Go version to stage            (default: 1.26.3)
 //	CLUSTER_GO_TIMEOUT    seconds per host               (default: 28800 = 8h)
 //
 // When run on more than one host the per-host gate logs land in
@@ -334,7 +334,7 @@ func ClusterGoGate() error {
 			hosts = append(hosts, h)
 		}
 	}
-	goVer := envOrDefault("CLUSTER_GO_VERSION", "1.26.2")
+	goVer := envOrDefault("CLUSTER_GO_VERSION", "1.26.3")
 	timeoutSec := envOrDefault("CLUSTER_GO_TIMEOUT", "28800")
 
 	// Shared staging dir for the multi-host run: Go tarballs (both
@@ -643,7 +643,7 @@ func buildLoadgenAmd64(outputPath string) error {
 	defer os.RemoveAll(tmpDir)
 
 	// Bootstrap a one-shot module that depends on loadgen.
-	gomod := "module loadgen-builder\n\ngo 1.26\n\nrequire github.com/goceleris/loadgen latest\n"
+	gomod := "module loadgen-builder\n\ngo 1.26.3\n\nrequire github.com/goceleris/loadgen latest\n"
 	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(gomod), 0o644); err != nil {
 		return err
 	}

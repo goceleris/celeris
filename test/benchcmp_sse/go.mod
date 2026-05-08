@@ -1,6 +1,6 @@
 module github.com/goceleris/celeris/test/benchcmp_sse
 
-go 1.26.0
+go 1.26.3
 
 require (
 	github.com/goceleris/celeris v1.4.1
