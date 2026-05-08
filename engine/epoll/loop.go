@@ -4,6 +4,7 @@ package epoll
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
