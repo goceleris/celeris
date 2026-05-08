@@ -19,7 +19,7 @@ import (
 // first Bind succeeds and returns nil with no sleep.
 func TestBindWithRetrySucceedsImmediately(t *testing.T) {
 	fd, sa := newReusePortSocket(t, "127.0.0.1:0")
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 
 	start := time.Now()
 	if err := BindWithRetry(fd, sa); err != nil {
@@ -65,10 +65,10 @@ func TestBindWithRetryEventuallyGivesUpOnPersistentEADDRINUSE(t *testing.T) {
 	// Hold a port open WITHOUT SO_REUSEPORT so a SO_REUSEPORT bind
 	// to the same port cannot succeed.
 	holder, port := holdPortNoReusePort(t)
-	defer holder.Close()
+	defer func() { _ = holder.Close() }()
 
 	fd, sa := newReusePortSocket(t, "127.0.0.1:"+strconv.Itoa(port))
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 
 	start := time.Now()
 	err := BindWithRetry(fd, sa)
@@ -119,7 +119,7 @@ func TestBindWithRetryUnderConcurrentSOReusePort(t *testing.T) {
 	for range N {
 		wg.Go(func() {
 			fd, addr := newReusePortSocketRaw(t, port)
-			defer unix.Close(fd)
+			defer func() { _ = unix.Close(fd) }()
 			if err := BindWithRetry(fd, addr); err == nil {
 				successes.Add(1)
 			} else {
@@ -149,7 +149,7 @@ func TestBindWithRetryUnderConcurrentSOReusePort(t *testing.T) {
 // messages) is caught.
 func TestFormatProducesStructuredString(t *testing.T) {
 	fd, sa := newReusePortSocket(t, "127.0.0.1:0")
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 
 	got := Format(fd, sa)
 

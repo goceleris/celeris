@@ -1,6 +1,8 @@
+//go:build linux
+
 // Package bindiag holds the shared bind/listen retry + diagnostic
 // helpers used by both the epoll and iouring engines. Linux-only
-// (the build tag below excludes everything else); on non-linux the
+// (the build tag above excludes everything else); on non-linux the
 // engines aren't compiled at all.
 //
 // Two responsibilities:
@@ -17,9 +19,6 @@
 //     attached to bind/listen error messages so a real conflict
 //     (post-retry-budget) carries enough state to triage without
 //     reproducing.
-
-//go:build linux
-
 package bindiag
 
 import (
