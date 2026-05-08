@@ -633,7 +633,13 @@ func TestBrokerSlowSubscriberConcurrencyCap(t *testing.T) {
 		t.Skip("timing-sensitive; skipped under -short")
 	}
 	const slowN = 4
-	const callbackDelay = 30 * time.Millisecond
+	// 80 ms × 4 callbacks × cap-1 ≈ 320 ms serialised. Bigger callback
+	// than would happen in practice, but the headroom is what makes
+	// the floor robust against scheduler jitter on shared CI runners
+	// (an earlier 30 ms × 4 → floor 72 ms run flaked at 61.5 ms when
+	// the host was under load — there was no real cap regression,
+	// the floor was just too close to the no-op elapsed time).
+	const callbackDelay = 80 * time.Millisecond
 
 	b := NewBroker(BrokerConfig{
 		SubscriberBuffer:          1,
@@ -652,9 +658,11 @@ func TestBrokerSlowSubscriberConcurrencyCap(t *testing.T) {
 	b.Publish(Event{Data: "trigger"})
 	elapsed := time.Since(start)
 
-	// Serialised: slowN * callbackDelay (~120ms). Allow [floor, ceil]
-	// generous enough that scheduling jitter doesn't flake the test.
-	floor := time.Duration(float64(slowN*callbackDelay) * 0.6)
+	// Serialised: slowN * callbackDelay = 320 ms. With a 0.5 floor we
+	// fail any cap regression that runs faster than 160 ms — well
+	// above the ~few-ms parallel-fanout achievable without the cap,
+	// so the test remains discriminating.
+	floor := time.Duration(float64(slowN*callbackDelay) * 0.5)
 	if elapsed < floor {
 		t.Fatalf("Publish elapsed %v < floor %v — concurrency cap not enforced?",
 			elapsed, floor)
