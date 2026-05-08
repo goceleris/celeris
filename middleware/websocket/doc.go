@@ -192,4 +192,44 @@
 // has stopped reading cannot stall the actual flush. On the engine path,
 // writes go into the engine's write buffer and never block at the
 // syscall level — only the lock-acquisition deadline applies.
+//
+// # Fan-out (Hub)
+//
+// For broadcasting a single message to N connections, use [Hub] with
+// [PreparedMessage]. The frame is encoded once per uncompressed /
+// compressed variant and reused across every [Conn.WritePreparedMessage]
+// dispatch — so per-message wire-encoding cost is O(1) regardless of
+// subscriber count, while per-Conn write throughput remains the
+// engine's normal write path.
+//
+//	hub := websocket.NewHub(websocket.HubConfig{
+//	    OnSlowConn: func(c *websocket.Conn, err error) websocket.HubPolicy {
+//	        return websocket.HubPolicyClose // boot misbehaving peers
+//	    },
+//	})
+//	server.GET("/ws", websocket.New(websocket.Config{
+//	    Handler: func(c *websocket.Conn) {
+//	        unregister := hub.Register(c)
+//	        defer unregister()
+//	        // your read loop here
+//	    },
+//	}))
+//	// Publishers anywhere in the app:
+//	hub.Broadcast(websocket.TextMessage, []byte(`{"type":"tick"}`))
+//
+// Hub.Close drains every in-flight Broadcast (via an internal
+// inflight WaitGroup) before tearing down conns, so a shutdown that
+// synchronises on Close cannot race a still-fanning-out message.
+//
+// Authorization MUST happen before [Hub.Register]. Hub broadcasts go
+// to every registered connection unfiltered; if a per-conn ACL is
+// required, use [Hub.BroadcastFilter] with a pure predicate.
+//
+// PreparedMessage rejects control opcodes (Ping/Pong/Close) at
+// construction time — control frames have RFC 6455 §5.5 size and
+// fragmentation constraints that the cache-and-reuse model can't
+// satisfy. Use [Conn.WriteControl] per-conn for those.
+//
+// See also: middleware/sse for the equivalent on Server-Sent Events,
+// where the same broker pattern lives as [middleware/sse.Broker].
 package websocket

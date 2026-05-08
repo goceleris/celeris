@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -167,13 +168,18 @@ func (s *kvStore) Append(ctx context.Context, e Event) (string, error) {
 		return "", err
 	}
 	if s.asyncAppend {
-		// Fire-and-log the KV write. Caller gets the id immediately;
+		// Fire-and-forget the KV write. Caller gets the id immediately;
 		// the event reaches the store after wire delivery (or never,
-		// if the KV rejects it). asyncSlots caps the number of in-
-		// flight writes so a stalled KV cannot accumulate unbounded
-		// goroutines under heavy publish load — at the cap, Append
-		// blocks the caller until a slot frees, providing natural
-		// backpressure that mimics the sync path.
+		// if the KV rejects it — the error is silently dropped, see
+		// [KVReplayStoreConfig.AsyncAppend] for the documented
+		// durability tradeoff). asyncSlots caps the number of in-flight
+		// writes so a stalled KV cannot accumulate unbounded goroutines
+		// under heavy publish load — at the cap, Append blocks the
+		// caller until a slot frees, providing natural backpressure
+		// that mimics the sync path. The goroutine uses
+		// context.Background() so a cancelled per-Send ctx does not
+		// abort an in-flight Set; on process exit, in-flight Sets may
+		// be lost.
 		s.asyncSlots <- struct{}{}
 		go func() {
 			defer func() { <-s.asyncSlots }()
@@ -182,8 +188,24 @@ func (s *kvStore) Append(ctx context.Context, e Event) (string, error) {
 	} else if err := s.kv.Set(ctx, s.eventKey(id), blob, s.ttl); err != nil {
 		return "", err
 	}
+	// Index insertion preserves monotonicity even under concurrent
+	// Appends. Two callers can hand off the kv.Set / async-spawn in
+	// different orders relative to the seq they were assigned, so a
+	// blind append would produce a non-monotonic index — Since()
+	// consumers rely on monotonicity to compute the resume cursor.
+	// Common case (in-order arrival): O(1) append. Out-of-order
+	// (concurrent Append + scheduler skew): binary-search to the
+	// correct slot and shift, O(n) worst case but bounded by maxIndex
+	// and rare in practice.
 	s.indexMu.Lock()
-	s.index = append(s.index, seq)
+	if n := len(s.index); n == 0 || s.index[n-1] < seq {
+		s.index = append(s.index, seq)
+	} else {
+		pos := sort.Search(n, func(i int) bool { return s.index[i] >= seq })
+		s.index = append(s.index, 0)
+		copy(s.index[pos+1:], s.index[pos:])
+		s.index[pos] = seq
+	}
 	// Soft cap on the in-memory index: when full, drop the oldest 25 %.
 	// The blobs themselves age out via ttl in the KV; what we shed here
 	// is only the local cursor list, so a Since() against an aged-out
@@ -227,8 +249,9 @@ func (s *kvStore) Since(ctx context.Context, lastID string) ([]Event, error) {
 		return nil, ErrLastIDUnknown
 	}
 
-	// Snapshot is monotonic (each Append appends in order). Find the
-	// first seq strictly greater than lastSeq.
+	// Snapshot is monotonic by construction — Append maintains the
+	// invariant via sorted insertion under indexMu. Find the first
+	// seq strictly greater than lastSeq.
 	startIdx := 0
 	for startIdx < len(snap) && snap[startIdx] <= lastSeq {
 		startIdx++

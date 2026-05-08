@@ -379,14 +379,25 @@ func New(config ...Config) celeris.HandlerFunc {
 		var heartbeatDone chan struct{}
 
 		defer func() {
-			// Close the queue so the drain goroutine flushes every
-			// already-enqueued event before the underlying stream is
-			// shut. queueClosed is set BEFORE close(c.queue) so any
-			// Send racing the handler return observes closed first
-			// and returns ErrClientClosed instead of panicking on
-			// send-to-closed-chan.
+			// Tear-down ordering — load-bearing:
+			//
+			//   1. queueClosed.Store(true) — fast-path Send check.
+			//   2. cancel() — wakes any Send parked in
+			//      ClientPolicyBlock's select on c.ctx.Done(). MUST
+			//      precede close(c.queue): a producer that observed
+			//      queueClosed==false in the fast path can be in the
+			//      select at the moment we close the queue, and would
+			//      panic on send-to-closed-chan if ctx was not
+			//      already done. With cancel ahead of close, the
+			//      ctx.Done() arm of the select wins instead.
+			//   3. close(c.queue) — drain goroutine ranges to
+			//      completion, flushing in-queue events.
+			//   4. <-c.drainDone — join the drain.
+			//   5. client.Close() — idempotent; cancel already fired,
+			//      so this is just the sw.Close + closed=true bookkeeping.
 			if client.queue != nil {
 				client.queueClosed.Store(true)
+				cancel()
 				close(client.queue)
 			}
 			if client.drainDone != nil {
@@ -428,26 +439,36 @@ func New(config ...Config) celeris.HandlerFunc {
 		client.replayStore = cfg.ReplayStore
 
 		// Replay missed events from the previous session, if any.
-		// ErrLastIDUnknown is the documented "fresh start" signal: log
-		// at debug and continue; the user's Handler can still consult
-		// client.LastEventID() to react to the unknown cursor itself.
+		// ErrLastIDUnknown is the documented "fresh start" signal:
+		// silently fall through and let Handler decide; the user's
+		// Handler can still consult client.LastEventID() to react to
+		// the unknown cursor itself.
+		//
+		// Holding client.mu across the entire replay loop is
+		// load-bearing for Last-Event-ID monotonicity: a concurrent
+		// Send (e.g. via a Broker.Publish that fires before the
+		// handler reaches its Subscribe) would otherwise interleave
+		// a newer event mid-replay; if the client disconnects mid-
+		// replay it would record the newer event's ID and skip the
+		// still-pending replay tail on next reconnect.
 		if cfg.ReplayStore != nil && lastEventID != "" {
 			missed, err := cfg.ReplayStore.Since(ctx, lastEventID)
 			if err != nil && !errors.Is(err, ErrLastIDUnknown) {
 				return nil
 			}
+			client.mu.Lock()
 			for i := range missed {
-				client.mu.Lock()
 				client.buf = formatEvent(client.buf, &missed[i])
 				_, werr := sw.Write(client.buf)
 				if werr == nil {
 					werr = sw.Flush()
 				}
-				client.mu.Unlock()
 				if werr != nil {
+					client.mu.Unlock()
 					return nil
 				}
 			}
+			client.mu.Unlock()
 		}
 
 		// Start per-client drain goroutine when queued-send mode is active.

@@ -663,3 +663,82 @@ func TestHubCloseWaitsInflightBroadcast(t *testing.T) {
 		t.Errorf("Hub.Close returned in %v but the slow-conn deadline was 150ms — Close did not actually wait", closeDur)
 	}
 }
+
+// TestNewPreparedMessageRejectsControlOpcodes pins the RFC 6455 §5.5
+// guard added in v1.4.2: control opcodes cannot be cached for fan-out
+// because PreparedMessage shares the same frame across many conns,
+// and a >125-byte control frame is a per-connection protocol
+// violation. Each control opcode must return ErrInvalidPreparedOpcode.
+func TestNewPreparedMessageRejectsControlOpcodes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   MessageType
+	}{
+		{"OpClose", OpClose},
+		{"OpPing", OpPing},
+		{"OpPong", OpPong},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pm, err := NewPreparedMessage(tc.op, []byte("x"))
+			if pm != nil {
+				t.Errorf("NewPreparedMessage(%s) returned non-nil pm; want nil", tc.name)
+			}
+			if !errors.Is(err, ErrInvalidPreparedOpcode) {
+				t.Errorf("NewPreparedMessage(%s) err=%v, want ErrInvalidPreparedOpcode", tc.name, err)
+			}
+		})
+	}
+
+	// Sanity: data opcodes still succeed.
+	for _, tc := range []struct {
+		name string
+		op   MessageType
+	}{
+		{"OpText", OpText},
+		{"OpBinary", OpBinary},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pm, err := NewPreparedMessage(tc.op, []byte("x"))
+			if err != nil {
+				t.Errorf("NewPreparedMessage(%s) err=%v; want nil", tc.name, err)
+			}
+			if pm == nil {
+				t.Errorf("NewPreparedMessage(%s) returned nil pm; want non-nil", tc.name)
+			}
+		})
+	}
+}
+
+// TestHubRegisterRacingClose pins that Register and Close, racing,
+// never leak the conn into the hub: after Close drains the registry,
+// Len must be 0 regardless of which side won the race. The unregister
+// returned by Register must be safe to call in either ordering.
+func TestHubRegisterRacingClose(t *testing.T) {
+	const iterations = 200
+
+	for range iterations {
+		h := NewHub(HubConfig{})
+		p := newHubPair(t)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var unreg func()
+		go func() {
+			defer wg.Done()
+			unreg = h.Register(p.conn)
+		}()
+		go func() {
+			defer wg.Done()
+			h.Close()
+		}()
+		wg.Wait()
+
+		if unreg != nil {
+			unreg() // must be safe in either ordering
+		}
+		if got := h.Len(); got != 0 {
+			t.Fatalf("after Register/Close race Len=%d, want 0", got)
+		}
+		p.closeAll()
+	}
+}

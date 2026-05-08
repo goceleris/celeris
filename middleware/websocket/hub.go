@@ -236,6 +236,13 @@ func (h *Hub) dispatch(snap []*Conn, pm *PreparedMessage, pred func(*Conn) bool)
 					if firstErr == nil {
 						firstErr = fmt.Errorf("panic in dispatch goroutine: %v", r)
 					}
+					// Treat a panicking conn as Close-policy: a Conn
+					// or callback that panics on this Broadcast is
+					// likely to panic on the next, and leaving it
+					// registered would amplify the failure. The
+					// recover already swallowed the panic so the
+					// goroutine exits cleanly via wg.Done.
+					toClose = append(toClose, c)
 					mu.Unlock()
 				}
 			}()
@@ -281,8 +288,10 @@ func (h *Hub) unregister(c *Conn) {
 	h.mu.Unlock()
 }
 
-// Close unregisters every Conn (applying [HubPolicyClose] to each) and
-// blocks subsequent Register calls. Idempotent.
+// Close unregisters every Conn and force-closes the underlying
+// connection (via [Conn.Close], NOT via [HubConfig.OnSlowConn] —
+// shutdown is unconditional). Blocks subsequent Register calls.
+// Idempotent.
 //
 // Ordering guarantee: any in-flight Broadcast / BroadcastPrepared /
 // BroadcastFilter that already snapshotted the conn set runs to
@@ -293,10 +302,16 @@ func (h *Hub) unregister(c *Conn) {
 //
 // Concurrency: per-Conn Close calls fan out under the same
 // [HubConfig.MaxConcurrency] cap that gates Broadcast (default
-// [DefaultHubConcurrency], i.e. GOMAXPROCS*4; negative opts out). The
-// semaphore is acquired INSIDE each goroutine, so a hung Conn.Close
-// cannot deadlock the fan-out — Close still returns once every per-
-// Conn Close returns.
+// [DefaultHubConcurrency], i.e. GOMAXPROCS*4; negative opts out).
+// The semaphore is acquired INSIDE each goroutine, so the fan-out
+// always spawns N goroutines that then queue on the sema. The
+// alternative — outside-goroutine acquire — would gate spawn on the
+// slowest Close, costing the same wall-clock for the *common* case
+// (every Close returns) but letting a single hung Conn.Close stall
+// the entire spawn loop. Inside-acquire trades a goroutine-burst
+// (up to len(conns) parked on the sema) for resilience to a hung
+// Close — Hub.Close still returns once every per-Conn Close returns,
+// without serialising the rest of the fan-out behind it.
 func (h *Hub) Close() {
 	h.mu.Lock()
 	if h.closed {
@@ -314,8 +329,8 @@ func (h *Hub) Close() {
 	// finish dispatching before we close the conns out from under it.
 	h.inflight.Wait()
 	// Fan out the per-conn Close calls. With the same MaxConcurrency
-	// budget as Broadcast (default unbounded), 10k conns close in
-	// parallel rather than 10k sequential calls.
+	// budget as Broadcast (default GOMAXPROCS*4; negative opts out),
+	// 10k conns close in parallel rather than 10k sequential calls.
 	//
 	// Sema acquire is INSIDE the goroutine — unlike dispatch — because
 	// Conn.Close has no inherent timeout. If a Conn.Close hung, an

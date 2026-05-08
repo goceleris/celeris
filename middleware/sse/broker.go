@@ -3,6 +3,7 @@ package sse
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // BrokerPolicy controls what happens to a slow subscriber whose
@@ -36,7 +37,13 @@ type BrokerConfig struct {
 	SubscriberBuffer int
 
 	// OnSlowSubscriber is consulted when a subscriber's queue is full at
-	// Publish time. When nil, [BrokerPolicyDrop] is used.
+	// Publish time. When nil, [BrokerPolicyDrop] is used. The Drop
+	// default is deliberate for SSE: dropping one event from one slow
+	// subscriber leaves the stream coherent (the next event with a
+	// fresh id replaces it, and replay via Last-Event-ID can recover).
+	// websocket.HubConfig.OnSlowConn defaults to Close instead — a
+	// dropped WS frame would corrupt the message-boundary contract,
+	// so the safer default is to evict the bad peer.
 	OnSlowSubscriber func(c *Client, pe *PreparedEvent) BrokerPolicy
 
 	// SlowSubscriberConcurrency caps the number of in-flight per-
@@ -74,6 +81,21 @@ type Broker struct {
 	mu          sync.RWMutex
 	subscribers map[*Client]*brokerSubscriber
 	closed      bool
+
+	// slowSema is the bounded semaphore for slow-path policy goroutines.
+	// Cached on the Broker rather than allocated per Publish — under
+	// sustained slow-subscriber load (queues briefly full during head-
+	// of-line bursts) every Publish would otherwise allocate a fresh
+	// chan + slice. nil means SlowSubscriberConcurrency was negative
+	// (opt-out for benchmarks); a positive cap is materialised once at
+	// construction time.
+	slowSema chan struct{}
+
+	// callbackPanics counts user OnSlowSubscriber callback panics
+	// recovered by the slow-path goroutine. Surfaced via
+	// [Broker.CallbackPanics] so operators can alert on a misbehaving
+	// callback instead of having panics swallowed silently.
+	callbackPanics atomic.Uint64
 }
 
 type brokerSubscriber struct {
@@ -98,9 +120,18 @@ func NewBroker(cfg BrokerConfig) *Broker {
 	if cfg.SubscriberBuffer <= 0 {
 		cfg.SubscriberBuffer = DefaultBrokerSubscriberBuffer
 	}
+	maxConc := cfg.SlowSubscriberConcurrency
+	if maxConc == 0 {
+		maxConc = DefaultBrokerSlowConcurrency()
+	}
+	var sema chan struct{}
+	if maxConc > 0 {
+		sema = make(chan struct{}, maxConc)
+	}
 	return &Broker{
 		cfg:         cfg,
 		subscribers: make(map[*Client]*brokerSubscriber),
+		slowSema:    sema,
 	}
 }
 
@@ -222,19 +253,9 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 		return
 	}
 
-	// Concurrency cap: 0 ⇒ DefaultBrokerSlowConcurrency (GOMAXPROCS*4);
-	// negative ⇒ unbounded (one goroutine per slow subscriber). The
-	// default keeps peak goroutine count bounded on a many-slow fan-
-	// out without hurting the small-N case (the semaphore is unused
-	// when len(slowClients) ≤ cap).
-	var sema chan struct{}
-	maxConc := b.cfg.SlowSubscriberConcurrency
-	if maxConc == 0 {
-		maxConc = DefaultBrokerSlowConcurrency()
-	}
-	if maxConc > 0 {
-		sema = make(chan struct{}, maxConc)
-	}
+	// Concurrency cap is materialised once on the Broker (see NewBroker).
+	// Re-aliased here so the loop body reads sema, not b.slowSema.
+	sema := b.slowSema
 
 	var wg sync.WaitGroup
 	wg.Add(len(slowClients))
@@ -252,8 +273,13 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 			// this, one bad callback brings down every other in-flight
 			// slow-path goroutine and the publisher itself. The
 			// subscriber stays registered on panic — we could not run
-			// the policy to decide otherwise.
-			defer func() { _ = recover() }()
+			// the policy to decide otherwise. callbackPanics is
+			// incremented for observability via [Broker.CallbackPanics].
+			defer func() {
+				if r := recover(); r != nil {
+					b.callbackPanics.Add(1)
+				}
+			}()
 			switch policy(c, pe) {
 			case BrokerPolicyDrop:
 				// Keep the subscriber registered; this Publish dropped
@@ -294,6 +320,17 @@ func (b *Broker) SubscriberCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.subscribers)
+}
+
+// CallbackPanics returns the cumulative count of user
+// OnSlowSubscriber callback panics recovered by the broker's slow-
+// path goroutines. A non-zero value points at a misbehaving callback
+// — the broker keeps running (panic was caught), but the affected
+// subscriber's policy decision was lost so it stays registered with
+// whatever queue state it had. Surface this via your metrics pipeline
+// to avoid silent callback breakage.
+func (b *Broker) CallbackPanics() uint64 {
+	return b.callbackPanics.Load()
 }
 
 // Close unsubscribes every current subscriber and blocks new Subscribe

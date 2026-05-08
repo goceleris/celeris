@@ -4,7 +4,6 @@ package epoll
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
@@ -1629,39 +1629,13 @@ func createListenSocket(addr string) (int, error) {
 	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 
-	// Concurrent bind() into a SO_REUSEPORT group races on the kernel's
-	// per-port bind table — observed on Linux 7.0 / aarch64: 11/12 loops
-	// bind successfully, the 12th gets EADDRINUSE despite SO_REUSEPORT
-	// being set on every member of the group. The condition is
-	// transient; the kernel bind table clears in microseconds. Compounds
-	// in adaptive (iouring + epoll engines start concurrently and both
-	// bind the same port). Retry with light backoff dissolves the race
-	// without serialising startup. A persistent EADDRINUSE — real
-	// conflict, not contention — escapes after the retry budget and
-	// surfaces with the bindDiag attachment as before.
-	const bindRetries = 8
-	var bindErr error
-	for attempt := 0; attempt < bindRetries; attempt++ {
-		if attempt > 0 {
-			// 250 µs · 2^(attempt-1) → 250 µs, 500 µs, 1 ms, … 32 ms.
-			// Total worst-case delay across 7 retries ≈ 64 ms.
-			time.Sleep(time.Duration(250*(1<<(attempt-1))) * time.Microsecond)
-		}
-		bindErr = unix.Bind(fd, sa)
-		if bindErr == nil {
-			break
-		}
-		if !errors.Is(bindErr, unix.EADDRINUSE) {
-			break
-		}
-	}
-	if bindErr != nil {
-		diag := bindDiag(fd, sa)
+	if err := bindiag.BindWithRetry(fd, sa); err != nil {
+		diag := bindiag.Format(fd, sa)
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("bind: %w [%s]", bindErr, diag)
+		return -1, fmt.Errorf("bind: %w [%s]", err, diag)
 	}
 	if err := unix.Listen(fd, 4096); err != nil {
-		diag := bindDiag(fd, sa)
+		diag := bindiag.Format(fd, sa)
 		_ = unix.Close(fd)
 		return -1, fmt.Errorf("listen: %w [%s]", err, diag)
 	}

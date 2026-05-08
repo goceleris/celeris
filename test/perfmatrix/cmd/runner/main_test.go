@@ -82,3 +82,44 @@ func TestParseArgsUnknownFlag(t *testing.T) {
 		t.Fatalf("expected error for unknown flag")
 	}
 }
+
+// TestCellTimeoutFormula pins the per-cell timeout schedule. The
+// formula is load-bearing: too-short timeouts produced spurious
+// 0-request failures under -race on slow hosts (msa2-server,
+// msr1 with checkptr=2). Locking it down means a future "let's
+// halve the timeout because cells finish fast on this host" change
+// gets caught in CI.
+func TestCellTimeoutFormula(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		warmup   time.Duration
+		duration time.Duration
+		want     time.Duration
+	}{
+		{"defaults", 2 * time.Second, 10 * time.Second, 5*2*time.Second + 2*10*time.Second + 60*time.Second},
+		{"zero", 0, 0, 60 * time.Second},
+		{"long", 10 * time.Second, 60 * time.Second, 50*time.Second + 120*time.Second + 60*time.Second},
+		{"short", 250 * time.Millisecond, time.Second, 1250*time.Millisecond + 2*time.Second + 60*time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cellTimeoutFor(tc.warmup, tc.duration); got != tc.want {
+				t.Errorf("cellTimeoutFor(%v, %v) = %v, want %v", tc.warmup, tc.duration, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCountProcessFDs sanity-checks the leak-diag helper. On Linux
+// (the bench hosts where it matters) at least the test process's own
+// stdin/stdout/stderr exist, so the count is positive. On macOS it
+// silently returns 0 — the helper is best-effort. Both behaviours
+// are valid; just ensure no panic and a non-negative count.
+func TestCountProcessFDs(t *testing.T) {
+	got := countProcessFDs()
+	if got < 0 {
+		t.Errorf("countProcessFDs() = %d, want >= 0", got)
+	}
+	// On Linux the test binary inherits at least 3 FDs (stdin, stdout,
+	// stderr) plus the /proc/self/fd directory handle itself, so > 0.
+	// On macOS /proc is absent → returns 0; don't over-pin.
+}

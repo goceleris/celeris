@@ -673,3 +673,105 @@ func TestBrokerSlowSubscriberConcurrencyCap(t *testing.T) {
 // TestBrokerSlowSubscriberClosePolicy — adding a parallel variant
 // adds no signal because the fan-out machinery itself is policy-
 // agnostic and is already exercised by the Drop / Cap tests above.)
+
+// TestBrokerSubscribeSameClientTwice — calling Subscribe twice with
+// the same Client returns a no-op unsubscribe and leaves the
+// SubscriberCount at 1. Without this guard, a defer-pair'd handler
+// that re-subscribes would silently double-register the same client
+// and double-deliver every Publish.
+func TestBrokerSubscribeSameClientTwice(t *testing.T) {
+	b := NewBroker(BrokerConfig{})
+	defer b.Close()
+
+	ctx, _ := newSSEContext(t)
+	cfg := Config{HeartbeatInterval: -1, Handler: func(c *Client) {
+		unsub1 := b.Subscribe(c)
+		unsub2 := b.Subscribe(c) // double subscribe
+		if got := b.SubscriberCount(); got != 1 {
+			t.Errorf("after double-Subscribe SubscriberCount=%d, want 1", got)
+		}
+		// Both unsubs must be safe to call (twice is also safe per Subscribe doc).
+		unsub2()
+		unsub1()
+		if got := b.SubscriberCount(); got != 0 {
+			t.Errorf("after both unsubs SubscriberCount=%d, want 0", got)
+		}
+	}}
+	if err := New(cfg)(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBrokerCallbackPanicsCounter — every recovered panic in a slow-
+// path policy callback bumps the CallbackPanics counter so an
+// observability pipeline can alert on a misbehaving callback instead
+// of silent panic-eating.
+func TestBrokerCallbackPanicsCounter(t *testing.T) {
+	const slowN = 4
+	var observed atomic.Int32
+	b := NewBroker(BrokerConfig{
+		SubscriberBuffer: 1,
+		OnSlowSubscriber: func(_ *Client, _ *PreparedEvent) BrokerPolicy {
+			observed.Add(1)
+			panic("intentional test panic")
+		},
+	})
+	defer b.Close()
+
+	teardown := subscribeGatedSlow(t, b, slowN)
+	defer teardown()
+
+	b.Publish(Event{Data: "trigger"})
+
+	// Across fill+trigger every subscriber's queue saturates exactly
+	// once → callback fires exactly once per subscriber, panics every
+	// time. The race in fill timing means some panics happen during
+	// setup and some on trigger, but the *total* must match `observed`.
+	// Pin the load-bearing property: every recovered panic increments
+	// the counter — counter == observed after the publisher's wg.Wait.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if int(observed.Load()) >= slowN && b.CallbackPanics() == uint64(observed.Load()) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := observed.Load(); got < int32(slowN) {
+		t.Fatalf("observed=%d, want >= %d (slow path didn't fire on every subscriber)", got, slowN)
+	}
+	if got, want := b.CallbackPanics(), uint64(observed.Load()); got != want {
+		t.Errorf("CallbackPanics=%d, want %d (recover must count every panic)", got, want)
+	}
+}
+
+// TestBrokerConfigNegativeSubscriberBuffer — negative SubscriberBuffer
+// is normalised to the default. Pin the silent-clamp behaviour so a
+// regression that lets through a chan-of-cap=-1 (panic on make) is
+// caught.
+func TestBrokerConfigNegativeSubscriberBuffer(t *testing.T) {
+	b := NewBroker(BrokerConfig{SubscriberBuffer: -1})
+	defer b.Close()
+	// If we got here without panic, the negative value was clamped.
+	// Sanity: the broker should accept a Subscribe and Publish.
+	ctx, _ := newSSEContext(t)
+	done := make(chan struct{})
+	handlerDone := make(chan struct{})
+	cfg := Config{HeartbeatInterval: -1, Handler: func(c *Client) {
+		unsub := b.Subscribe(c)
+		defer unsub()
+		<-done
+	}}
+	go func() {
+		defer close(handlerDone)
+		_ = New(cfg)(ctx)
+	}()
+	for b.SubscriberCount() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	b.Publish(Event{Data: "x"})
+	close(done)
+	// Wait for the handler to fully unwind before letting t.Cleanup
+	// release the *Context — otherwise the deferred Detach inside
+	// New(cfg)(ctx) races the celeristest cleanup hook.
+	<-handlerDone
+}

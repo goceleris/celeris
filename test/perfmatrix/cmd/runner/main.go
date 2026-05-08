@@ -486,7 +486,7 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 	// fast cells fast while letting slow ones complete, and the
 	// 0-req guard still catches genuine failures (server refused
 	// every connection, hung mid-handshake).
-	cellTimeout := 5*cfg.Warmup + 2*cfg.Duration + 60*time.Second
+	cellTimeout := cellTimeoutFor(cfg.Warmup, cfg.Duration)
 	cellCtx, cellCancel := context.WithTimeout(parent, cellTimeout)
 	defer cellCancel()
 
@@ -571,6 +571,20 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 		return errors.New(result.Error)
 	}
 	return nil
+}
+
+// cellTimeoutFor computes the per-cell ctx deadline. Pinning a single
+// constant collapses two failure modes (cells over-running their fast
+// duration; runtime overhead under -race) into one tunable formula.
+//
+// The 5x Warmup factor absorbs the cost of -race + -checkptr=2 setup
+// inside loadgen / server processes. The 2x Duration factor leaves
+// room for graceful drain. The 60s constant covers signal-handling
+// shutdown, FD leak diag, and per-cell file writes. Anything inside
+// this envelope is a real failure (server hung, deadlock); anything
+// outside is genuine timeout.
+func cellTimeoutFor(warmup, duration time.Duration) time.Duration {
+	return 5*warmup + 2*duration + 60*time.Second
 }
 
 // countProcessFDs returns the count of open file descriptors in the
