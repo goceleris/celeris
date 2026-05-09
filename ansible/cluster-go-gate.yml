@@ -47,6 +47,97 @@
         state: touch
         mode: '0644'
 
+    # ---------- system-package preflight ----------
+    # Mirrors the manifest pattern used by cluster-bench.yml: anything
+    # WE install gets recorded so the always-block can apt-purge it.
+    # docker.io is required for PERFMATRIX_SERVICES=local: the strict
+    # matrix's driver-* scenarios spawn postgres / redis / memcached
+    # via `docker run`. Without it the runner aborts with
+    # "perfmatrix/services: docker not available". We auto-install it
+    # so the gate covers the full cell schedule, and undo it on the way
+    # out so the bench targets stay pristine.
+    - name: Read existing dep manifest if present
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: gate_manifest_slurp
+      failed_when: false
+
+    - name: Initialize empty manifest fact
+      ansible.builtin.set_fact:
+        installed_packages: []
+        added_to_docker_group: false
+
+    - name: Restore manifest state from disk
+      ansible.builtin.set_fact:
+        installed_packages: "{{ (gate_manifest_slurp.content | b64decode | from_json).installed_packages | default([]) }}"
+        added_to_docker_group: "{{ (gate_manifest_slurp.content | b64decode | from_json).added_to_docker_group | default(false) }}"
+      when: gate_manifest_slurp is defined and gate_manifest_slurp.content is defined
+
+    - name: Detect missing system packages (docker.io)
+      ansible.builtin.shell: |
+        for pkg in docker.io; do
+          dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+        done
+      register: missing_pkgs
+      changed_when: false
+
+    - name: Install missing packages
+      become: true
+      ansible.builtin.apt:
+        name: "{{ missing_pkgs.stdout_lines }}"
+        state: present
+        update_cache: true
+      when: missing_pkgs.stdout_lines | length > 0
+
+    - name: Append newly installed packages to in-memory manifest
+      ansible.builtin.set_fact:
+        installed_packages: "{{ installed_packages + missing_pkgs.stdout_lines }}"
+      when: missing_pkgs.stdout_lines | length > 0
+
+    # The runner shells out to `docker` as the gate user. apt installs
+    # docker.io with the daemon socket group-owned by `docker`; user
+    # mini needs to be in that group to use the socket without sudo.
+    # Track the membership change so cleanup can undo it.
+    - name: Check whether the gate user is already in the docker group
+      ansible.builtin.command: id -nG {{ ansible_user_id }}
+      register: gate_user_groups
+      changed_when: false
+
+    - name: Add gate user to docker group (only if we just installed docker.io)
+      become: true
+      ansible.builtin.user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+      when:
+        - "'docker.io' in (missing_pkgs.stdout_lines | default([]))"
+        - "'docker' not in gate_user_groups.stdout.split()"
+      register: docker_group_add
+
+    - name: Record docker group membership in manifest fact
+      ansible.builtin.set_fact:
+        added_to_docker_group: true
+      when: docker_group_add is defined and docker_group_add.changed
+
+    - name: Write dep manifest to /tmp
+      ansible.builtin.copy:
+        content: |
+          {{ {'installed_packages': installed_packages, 'added_to_docker_group': added_to_docker_group} | to_nice_json }}
+        dest: "{{ manifest_path }}"
+        mode: '0644'
+
+    - name: Reset SSH connection so docker-group membership applies
+      ansible.builtin.meta: reset_connection
+      when: docker_group_add is defined and docker_group_add.changed
+
+    - name: Ensure docker daemon is running
+      become: true
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: false
+      when: "'docker.io' in installed_packages"
+
     - block:
         - name: Pick Go tarball matching the target architecture
           ansible.builtin.set_fact:
@@ -168,6 +259,24 @@
             true
           changed_when: false
 
+        # Stop any docker containers the runner spawned and didn't kill
+        # cleanly (runner uses `docker run -d --rm` so they auto-remove
+        # on stop). We only nuke EVERY running container when WE
+        # installed docker — that means the daemon was empty before our
+        # gate, so anything still running is ours. We never touch
+        # containers on a host that already had docker pre-installed
+        # for some other purpose.
+        - name: Kill leftover docker containers from our run (only if we installed docker)
+          become: true
+          ansible.builtin.shell: |
+            ids=$(docker ps -q 2>/dev/null)
+            if [ -n "$ids" ]; then
+              docker kill $ids 2>/dev/null || true
+            fi
+            true
+          when: "'docker.io' in (installed_packages | default([]))"
+          changed_when: false
+
         # Cleanup with a become-fallback for files that any sudo'd mage
         # step (ulimit -l unlimited, etc.) may have created as root.
         - name: Drop staging dir (Go, source, gopath, gocache — everything)
@@ -178,6 +287,51 @@
           args:
             executable: /bin/bash
           changed_when: true
+
+        # ---------- system-package teardown ----------
+        # Read the manifest the preflight wrote and undo its changes:
+        # apt-purge anything WE installed and remove the gate user from
+        # the docker group if WE added them. Idempotent if the manifest
+        # is missing (first ever run).
+        - name: Read manifest for cleanup
+          ansible.builtin.slurp:
+            src: "{{ manifest_path }}"
+          register: gate_cleanup_manifest
+          failed_when: false
+
+        - name: Decode manifest for cleanup
+          ansible.builtin.set_fact:
+            to_remove: "{{ (gate_cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
+            removed_from_docker_group: "{{ (gate_cleanup_manifest.content | b64decode | from_json).added_to_docker_group | default(false) }}"
+          when: gate_cleanup_manifest is defined and gate_cleanup_manifest.content is defined
+
+        - name: Stop docker daemon before purge
+          become: true
+          ansible.builtin.service:
+            name: docker
+            state: stopped
+          when: to_remove is defined and ('docker.io' in to_remove)
+
+        - name: Apt-purge packages we installed
+          become: true
+          ansible.builtin.apt:
+            name: "{{ to_remove }}"
+            state: absent
+            purge: true
+            autoremove: true
+          when: to_remove is defined and to_remove | length > 0
+
+        - name: Remove gate user from docker group (only if WE added them)
+          become: true
+          ansible.builtin.shell: |
+            gpasswd -d {{ ansible_user_id }} docker 2>/dev/null || true
+          when: removed_from_docker_group | default(false) | bool
+          changed_when: true
+
+        - name: Remove dep manifest
+          ansible.builtin.file:
+            path: "{{ manifest_path }}"
+            state: absent
 
         # mtime-based leak check — anything in ~ newer than the marker
         # we dropped at run-start is something we (or a child of mage)
