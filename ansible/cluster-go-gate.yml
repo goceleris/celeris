@@ -66,11 +66,13 @@
       ansible.builtin.set_fact:
         installed_packages: []
         added_to_docker_group: false
+        prior_sysctl: {}
 
     - name: Restore manifest state from disk
       ansible.builtin.set_fact:
         installed_packages: "{{ (gate_manifest_slurp.content | b64decode | from_json).installed_packages | default([]) }}"
         added_to_docker_group: "{{ (gate_manifest_slurp.content | b64decode | from_json).added_to_docker_group | default(false) }}"
+        prior_sysctl: "{{ (gate_manifest_slurp.content | b64decode | from_json).prior_sysctl | default({}) }}"
       when: gate_manifest_slurp is defined and gate_manifest_slurp.content is defined
 
     - name: Detect missing system packages (docker.io)
@@ -119,10 +121,55 @@
         added_to_docker_group: true
       when: docker_group_add is defined and docker_group_add.changed
 
+    # ---------- bench-host sysctl tuning ----------
+    # The strict matrix saturates the kernel ephemeral-port pool when
+    # all driver-* scenarios run back-to-back: each cell opens many
+    # short-lived HTTP/1.1 connections that linger in TIME_WAIT for
+    # 60s. With the Debian default port_range of 32768-60999 (28k
+    # slots) and tw_reuse=2 (loopback-only reuse), msa2-server hit
+    # zero-request fail-fast at cell 1432/2916 with time_wait=29085.
+    # Widening the pool to 1024-65535 (64k slots) and setting
+    # tw_reuse=1 (full reuse for outgoing) clears the bottleneck.
+    #
+    # Snapshot the current values into the manifest BEFORE writing so
+    # the always-block can restore them — no permanent mutation of the
+    # bench host's tuning.
+    - name: Snapshot current sysctl values (only on first run that touches them)
+      ansible.builtin.shell: |
+        printf '%s ' "$(sysctl -n net.ipv4.tcp_tw_reuse)"
+        printf '%s ' "$(sysctl -n net.ipv4.ip_local_port_range)"
+      register: prior_sysctl_raw
+      changed_when: false
+      when: prior_sysctl == {}
+
+    - name: Parse and persist prior sysctl values
+      ansible.builtin.set_fact:
+        prior_sysctl:
+          tcp_tw_reuse: "{{ prior_sysctl_raw.stdout.split() | first }}"
+          ip_local_port_range: "{{ prior_sysctl_raw.stdout.split()[1:3] | join(' ') }}"
+      when: prior_sysctl == {} and prior_sysctl_raw is defined and prior_sysctl_raw.stdout is defined
+
+    - name: Apply bench-host sysctl tuning
+      become: true
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: false
+      loop:
+        - { name: net.ipv4.tcp_tw_reuse, value: "1" }
+        - { name: net.ipv4.ip_local_port_range, value: "1024 65535" }
+      when: prior_sysctl != {}
+
     - name: Write dep manifest to /tmp
       ansible.builtin.copy:
         content: |
-          {{ {'installed_packages': installed_packages, 'added_to_docker_group': added_to_docker_group} | to_nice_json }}
+          {{ {
+            'installed_packages': installed_packages,
+            'added_to_docker_group': added_to_docker_group,
+            'prior_sysctl': prior_sysctl,
+          } | to_nice_json }}
         dest: "{{ manifest_path }}"
         mode: '0644'
 
@@ -303,7 +350,28 @@
           ansible.builtin.set_fact:
             to_remove: "{{ (gate_cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
             removed_from_docker_group: "{{ (gate_cleanup_manifest.content | b64decode | from_json).added_to_docker_group | default(false) }}"
+            sysctl_to_restore: "{{ (gate_cleanup_manifest.content | b64decode | from_json).prior_sysctl | default({}) }}"
           when: gate_cleanup_manifest is defined and gate_cleanup_manifest.content is defined
+
+        - name: Restore prior sysctl values (only restores what we snapshotted)
+          become: true
+          ansible.posix.sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            sysctl_set: true
+            state: present
+            reload: false
+          loop: "{{ sysctl_restore_pairs | default([]) }}"
+          vars:
+            sysctl_restore_pairs:
+              - name: net.ipv4.tcp_tw_reuse
+                value: "{{ sysctl_to_restore.tcp_tw_reuse | default('') }}"
+              - name: net.ipv4.ip_local_port_range
+                value: "{{ sysctl_to_restore.ip_local_port_range | default('') }}"
+          when:
+            - sysctl_to_restore is defined
+            - sysctl_to_restore | length > 0
+            - item.value != ''
 
         - name: Stop docker daemon before purge
           become: true
