@@ -16,7 +16,7 @@
 #   docker compose -f test/conformance/redis/docker-compose.cluster.yml down -v
 
 x-redis-node: &redis-node
-  image: ${REDIS_IMAGE:-redis:7.2}
+  image: ${REDIS_IMAGE:-redis:8.6}
   network_mode: host
   restart: unless-stopped
 
@@ -82,7 +82,7 @@ services:
       retries: 15
 
   cluster-init:
-    image: ${REDIS_IMAGE:-redis:7.2}
+    image: ${REDIS_IMAGE:-redis:8.6}
     network_mode: host
     container_name: celeris-cluster-init
     depends_on:

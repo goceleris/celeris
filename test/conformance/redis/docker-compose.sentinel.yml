@@ -23,7 +23,7 @@ services:
   # Linux-only; both our local Multipass VM and ubuntu-latest CI
   # runners are Linux, so this is fine for the conformance suite.
   redis-master:
-    image: ${REDIS_IMAGE:-redis:7.2}
+    image: ${REDIS_IMAGE:-redis:8.6}
     container_name: celeris-sentinel-master
     network_mode: host
     command:
@@ -43,7 +43,7 @@ services:
       retries: 10
 
   redis-replica:
-    image: ${REDIS_IMAGE:-redis:7.2}
+    image: ${REDIS_IMAGE:-redis:8.6}
     container_name: celeris-sentinel-replica
     network_mode: host
     depends_on:
@@ -70,7 +70,7 @@ services:
   # Three sentinels configured with quorum=2. Each writes a minimal
   # config at startup pointing at 127.0.0.1:6379 as master.
   sentinel-1:
-    image: ${REDIS_IMAGE:-redis:7.2}
+    image: ${REDIS_IMAGE:-redis:8.6}
     container_name: celeris-sentinel-1
     network_mode: host
     depends_on:
@@ -90,7 +90,7 @@ services:
         exec redis-sentinel /etc/sentinel.conf
 
   sentinel-2:
-    image: ${REDIS_IMAGE:-redis:7.2}
+    image: ${REDIS_IMAGE:-redis:8.6}
     container_name: celeris-sentinel-2
     network_mode: host
     depends_on:
@@ -110,7 +110,7 @@ services:
         exec redis-sentinel /etc/sentinel.conf
 
   sentinel-3:
-    image: ${REDIS_IMAGE:-redis:7.2}
+    image: ${REDIS_IMAGE:-redis:8.6}
     container_name: celeris-sentinel-3
     network_mode: host
     depends_on:
