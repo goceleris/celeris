@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/goceleris/celeris v1.4.1
-	github.com/tmaxmax/go-sse v0.10.0
+	github.com/tmaxmax/go-sse v0.11.0
 )
 
 require (

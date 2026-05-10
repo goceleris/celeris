@@ -9,18 +9,18 @@ require (
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/goceleris/celeris v1.4.1
 	github.com/goceleris/loadgen v1.4.3
-	github.com/gofiber/fiber/v3 v3.1.0
+	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/sessions v1.4.0
 	github.com/hertz-contrib/http2 v0.1.8
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/kataras/iris/v12 v12.2.11
-	github.com/labstack/echo/v4 v4.15.1
-	github.com/magefile/mage v1.17.1
-	github.com/redis/go-redis/v9 v9.18.0
-	github.com/valyala/fasthttp v1.70.0
+	github.com/labstack/echo/v4 v4.15.2
+	github.com/magefile/mage v1.17.2
+	github.com/redis/go-redis/v9 v9.19.0
+	github.com/valyala/fasthttp v1.71.0
 	golang.org/x/net v0.54.0
-	golang.org/x/time v0.14.0
+	golang.org/x/time v0.15.0
 )
 
 require (
@@ -38,7 +38,6 @@ require (
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/cloudwego/gopkg v0.1.4 // indirect
 	github.com/cloudwego/netpoll v0.7.2 // indirect
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/fatih/structs v1.1.0 // indirect
 	github.com/flosch/pongo2/v4 v4.0.2 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
@@ -49,8 +48,8 @@ require (
 	github.com/go-playground/validator/v10 v10.30.1 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
-	github.com/gofiber/schema v1.7.0 // indirect
-	github.com/gofiber/utils/v2 v2.0.2 // indirect
+	github.com/gofiber/schema v1.7.1 // indirect
+	github.com/gofiber/utils/v2 v2.0.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/gomarkdown/markdown v0.0.0-20240328165702-4d01890c35c0 // indirect
 	github.com/gorilla/css v1.0.0 // indirect
@@ -66,14 +65,14 @@ require (
 	github.com/kataras/pio v0.0.13 // indirect
 	github.com/kataras/sitemap v0.0.6 // indirect
 	github.com/kataras/tunnel v0.0.4 // indirect
-	github.com/klauspost/compress v1.18.5 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/labstack/gommon v0.4.2 // indirect
+	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mailgun/raymond/v2 v2.0.48 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.26 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
@@ -89,7 +88,7 @@ require (
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
-	github.com/tinylib/msgp v1.6.3 // indirect
+	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
@@ -105,7 +104,7 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
-	google.golang.org/protobuf v1.36.10 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
