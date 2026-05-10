@@ -28,6 +28,15 @@ type EngineMetrics = engine.EngineMetrics
 
 // Snapshot is a point-in-time copy of all collected metrics. All fields are
 // read-only values captured at the moment Collector.Snapshot was called.
+//
+// Snapshot embeds validationFields, which is defined in
+// collector_validation.go under -tags=validation to carry the
+// ValidationCounters field, and in collector_default.go as an empty
+// struct so production binaries don't pay for the extra word. Callers
+// running under -tags=validation reach the counters as
+// snapshot.ValidationCounters; production callers cannot reference
+// the field name at all (compile error), which is the explicit
+// contract — see validation/doc.go.
 type Snapshot struct {
 	// RequestsTotal is the cumulative number of handled requests.
 	RequestsTotal uint64
@@ -46,6 +55,8 @@ type Snapshot struct {
 	// CPUUtilization is the system CPU utilization as a fraction [0.0, 1.0].
 	// Returns -1 if no CPU monitor is configured or sampling failed.
 	CPUUtilization float64
+
+	validationFields
 }
 
 // CPUMonitor provides CPU utilization sampling. Implementations are
@@ -200,5 +211,10 @@ func (c *Collector) Snapshot() Snapshot {
 			snap.CPUUtilization = util
 		}
 	}
+	// fillValidation is a no-op in production builds (see
+	// collector_default.go); under -tags=validation it copies the
+	// atomic counters from the validation package into the
+	// snapshot's embedded validationFields.
+	snap.fillValidation()
 	return snap
 }

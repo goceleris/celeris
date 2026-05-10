@@ -148,6 +148,12 @@ func New(config ...Config) celeris.HandlerFunc {
 			successHandler(c)
 		}
 
+		// validateAdmission is a no-op in production (see
+		// validation_default.go); under -tags=validation it asserts
+		// exp >= now() and bumps validation.JWTLateAdmits on
+		// violation. token.Claims aliases the live claims pointer.
+		validateAdmission(token.Claims)
+
 		return c.Next()
 	}
 }

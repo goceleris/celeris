@@ -506,6 +506,12 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 
 		c.Set(ContextKey, sess)
 
+		// validateAdmission is a no-op in production (see
+		// validation_default.go); under -tags=validation it asserts
+		// session-owner binding and increments
+		// validation.SessionOwnerMismatches on violation.
+		validateAdmission(sess)
+
 		chainErr := c.Next()
 
 		if sess.destroyed {
