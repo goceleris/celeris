@@ -32,7 +32,10 @@ func TestServerPanicBumpsValidationCounter(t *testing.T) {
 	st.Release()
 
 	after := validation.PanicCount.Load()
-	if after != before+1 {
-		t.Fatalf("validation.PanicCount: got %d, want %d (before=%d)", after, before+1, before)
+	// Use >=, not equality: the counter is process-global and other
+	// concurrent tests may also bump it. We only need to observe at
+	// least one increment caused by this test.
+	if after < before+1 {
+		t.Fatalf("validation.PanicCount: got %d, want >=%d (before=%d)", after, before+1, before)
 	}
 }

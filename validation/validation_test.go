@@ -26,8 +26,10 @@ func TestPanicCountIncrement(t *testing.T) {
 		panic("synthetic")
 	}()
 	after := PanicCount.Load()
-	if after != before+1 {
-		t.Fatalf("PanicCount: got %d, want %d", after, before+1)
+	// Use >=, not equality: the counter is process-global and other
+	// tests in the package may also bump it concurrently.
+	if after < before+1 {
+		t.Fatalf("PanicCount: got %d, want >=%d", after, before+1)
 	}
 }
 

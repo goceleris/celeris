@@ -56,9 +56,3 @@ func Snapshot() Counters {
 		IouringSQECorruptions:    IouringSQECorruptions.Load(),
 	}
 }
-
-// Enabled reports whether this build has the validation tag enabled.
-// Always true under //go:build validation; the stub in disabled.go
-// returns false. Callers use this to gate test fixtures that should
-// only run under validation builds.
-func Enabled() bool { return true }

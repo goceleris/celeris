@@ -34,7 +34,3 @@ var (
 // exist and no socket is served. Kept defined so observe.Snapshot can
 // embed Counters unconditionally without a build-tag split.
 func Snapshot() Counters { return Counters{} }
-
-// Enabled reports whether this build has the validation tag enabled.
-// Always false in production.
-func Enabled() bool { return false }
