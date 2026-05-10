@@ -48,11 +48,6 @@ var JWTLateAdmits Counter
 // live conn.
 var IouringSQECorruptions Counter
 
-// AdaptiveSwitchFDLeaks counts cases where the post-switch FD set is
-// not a superset of the pre-switch set minus FDs closed during the
-// switch — i.e. a connection was orphaned across the engine swap.
-var AdaptiveSwitchFDLeaks Counter
-
 // Snapshot returns a value-typed copy of the counters at the moment
 // of the call. Each Load is independent so the snapshot is not a
 // consistent slice of a single instant, but counters monotonically
@@ -65,7 +60,6 @@ func Snapshot() Counters {
 		SessionOwnerMismatches:   SessionOwnerMismatches.Load(),
 		JWTLateAdmits:            JWTLateAdmits.Load(),
 		IouringSQECorruptions:    IouringSQECorruptions.Load(),
-		AdaptiveSwitchFDLeaks:    AdaptiveSwitchFDLeaks.Load(),
 	}
 }
 

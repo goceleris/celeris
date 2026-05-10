@@ -96,7 +96,6 @@ func TestSnapshotConsistency(t *testing.T) {
 	SessionOwnerMismatches.Store(14)
 	JWTLateAdmits.Store(15)
 	IouringSQECorruptions.Store(16)
-	AdaptiveSwitchFDLeaks.Store(17)
 	defer func() {
 		PanicCount.Store(0)
 		RaceFires.Store(0)
@@ -104,7 +103,6 @@ func TestSnapshotConsistency(t *testing.T) {
 		SessionOwnerMismatches.Store(0)
 		JWTLateAdmits.Store(0)
 		IouringSQECorruptions.Store(0)
-		AdaptiveSwitchFDLeaks.Store(0)
 	}()
 	got := Snapshot()
 	want := Counters{
@@ -114,7 +112,6 @@ func TestSnapshotConsistency(t *testing.T) {
 		SessionOwnerMismatches:   14,
 		JWTLateAdmits:            15,
 		IouringSQECorruptions:    16,
-		AdaptiveSwitchFDLeaks:    17,
 	}
 	if got != want {
 		t.Fatalf("Snapshot mismatch:\n got  %+v\n want %+v", got, want)

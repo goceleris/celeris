@@ -14,7 +14,6 @@ type Counters struct {
 	SessionOwnerMismatches   uint64 `json:"session_owner_mismatches"`
 	JWTLateAdmits            uint64 `json:"jwt_late_admits"`
 	IouringSQECorruptions    uint64 `json:"iouring_sqe_corruptions"`
-	AdaptiveSwitchFDLeaks    uint64 `json:"adaptive_switch_fd_leaks"`
 }
 
 // SocketPath is the hard-coded unix-socket path the validation

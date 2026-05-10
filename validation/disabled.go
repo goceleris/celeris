@@ -29,7 +29,6 @@ var (
 	SessionOwnerMismatches   Counter
 	JWTLateAdmits            Counter
 	IouringSQECorruptions    Counter
-	AdaptiveSwitchFDLeaks    Counter
 )
 
 // Snapshot returns the zero value in production builds — no counters
