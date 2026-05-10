@@ -56,6 +56,10 @@ type Snapshot struct {
 	// Returns -1 if no CPU monitor is configured or sampling failed.
 	CPUUtilization float64
 
+	// validationFields is empty in production builds and carries the
+	// ValidationCounters field under -tags=validation. The unused-linter
+	// doesn't track embedding-as-use, so suppress its false positive.
+	//nolint:unused // build-tag symmetry; non-empty under -tags=validation
 	validationFields
 }
 
