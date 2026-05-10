@@ -7,9 +7,10 @@ and optionally captures pprof per cell.
 
 ## Status
 
-Scaffold only (v1.4.1). Interfaces and package structure are stable; server
-implementations, scenarios, and the orchestrator body are filled in by
-wave-2 and wave-3 agents.
+Production. Drives `mage matrixBench` and `mage matrixBenchStrict` for
+release-gate validation. Scenarios, competitor servers (chi, echo,
+fasthttp, fiber, gin, hertz, iris, stdhttp), and driver-backed cells
+(postgres, redis, memcached) are all implemented.
 
 ## Why a separate submodule?
 
