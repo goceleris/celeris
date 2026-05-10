@@ -15,9 +15,3 @@ type Counters struct {
 	JWTLateAdmits            uint64 `json:"jwt_late_admits"`
 	IouringSQECorruptions    uint64 `json:"iouring_sqe_corruptions"`
 }
-
-// SocketPath is the hard-coded unix-socket path the validation
-// endpoint listens on. Not configurable on purpose: probatorium's
-// validator-checker compiles in the same constant so misconfiguration
-// cannot silently disable the cross-process predicate feed.
-const SocketPath = "/tmp/celeris-validation.sock"
