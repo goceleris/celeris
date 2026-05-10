@@ -305,6 +305,12 @@ func ClusterDistributedBenchParallel() error {
 //	CLUSTER_GO_HOST       legacy alias for single host
 //	CLUSTER_GO_VERSION    Go version to stage            (default: 1.26.3)
 //	CLUSTER_GO_TIMEOUT    seconds per host               (default: 28800 = 8h)
+//	CLUSTER_USE_LAN       1 → ssh to each host's lan_ip  (default: off; uses Tailscale)
+//
+// Whether docker is auto-installed on the host for the run is derived
+// from the target name: targets containing "Matrix" or "Bench" trigger
+// the install (driver-* scenarios need it); others (Fuzz, FullCompliance,
+// Spec) skip the install entirely.
 //
 // When run on more than one host the per-host gate logs land in
 // results/<ts>-go-gate-<host>/gate.log and the overall mage target
@@ -336,6 +342,32 @@ func ClusterGoGate() error {
 	}
 	goVer := envOrDefault("CLUSTER_GO_VERSION", "1.26.3")
 	timeoutSec := envOrDefault("CLUSTER_GO_TIMEOUT", "28800")
+
+	// gate_needs_docker auto-detects whether the target needs docker
+	// for driver-* matrix scenarios. Targets containing "Matrix" or
+	// "Bench" trigger docker install on the host. Other targets (Fuzz,
+	// FullCompliance, Spec, …) skip docker entirely, avoiding the
+	// install/purge cycle and the docker.sock chmod step.
+	needsDocker := false
+	for _, t := range strings.Fields(target) {
+		if strings.Contains(t, "Matrix") || strings.Contains(t, "Bench") {
+			needsDocker = true
+			break
+		}
+	}
+
+	// CLUSTER_USE_LAN=1 overrides the SSH target with each host's
+	// lan_ip from inventory.yml. Useful when running on the bench LAN
+	// while Tailscale auth is expired or off — long gates (multi-hour
+	// matrix runs) can outlive a Tailscale auth window. Static map
+	// matches inventory.yml; if you change a DHCP reservation, update
+	// inventory.yml AND this map.
+	lanIPs := map[string]string{
+		"msa2-server": "192.168.50.65",
+		"msa2-client": "192.168.50.195",
+		"msr1":        "192.168.50.199",
+	}
+	useLAN := os.Getenv("CLUSTER_USE_LAN") == "1"
 
 	// Shared staging dir for the multi-host run: Go tarballs (both
 	// arches) + source tarball + extras yaml live here once, are
@@ -370,7 +402,9 @@ func ClusterGoGate() error {
 	fmt.Printf("  hosts:          %s\n", strings.Join(hosts, ", "))
 	fmt.Printf("  mage target(s): %s\n", target)
 	fmt.Printf("  Go version:     %s\n", goVer)
-	fmt.Printf("  timeout/host:   %s s\n\n", timeoutSec)
+	fmt.Printf("  timeout/host:   %s s\n", timeoutSec)
+	fmt.Printf("  needs docker:   %t\n", needsDocker)
+	fmt.Printf("  use LAN IPs:    %t\n\n", useLAN)
 
 	// Forward env vars the user set locally to the remote shell. We
 	// render them as `export k=q` lines and pass the resulting string
@@ -445,12 +479,18 @@ func ClusterGoGate() error {
 				"-i", "inventory.yml", clusterGoGatePlaybook,
 				"--extra-vars", "gate_target_host=" + host,
 				"--extra-vars", "gate_mage_targets=" + target,
+				"--extra-vars", fmt.Sprintf("gate_needs_docker=%t", needsDocker),
 				"--extra-vars", "go_tarball_amd64=" + goAmd64,
 				"--extra-vars", "go_tarball_arm64=" + goArm64,
 				"--extra-vars", "source_tarball_local=" + srcTarball,
 				"--extra-vars", "results_local_dir=" + resultsDir,
 				"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
 				"--extra-vars", "@" + extrasYAML,
+			}
+			if useLAN {
+				if ip := lanIPs[host]; ip != "" {
+					args = append(args, "--extra-vars", "ansible_host="+ip)
+				}
 			}
 			cmd := exec.Command("ansible-playbook", args...)
 			cmd.Dir = clusterAnsibleDir
