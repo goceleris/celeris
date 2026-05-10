@@ -1,10 +1,13 @@
 version: 2
 updates:
-  # Single gomod entry covering every Go module in the repo. The
-  # `directories:` (plural) form runs the updater across all listed
-  # paths and groups updates with the same group name into ONE pull
-  # request — so a daily x/net bump produces a single PR touching root
-  # + every middleware + test module instead of seven racing PRs.
+  # ----- Go modules -----
+  # `directories:` (plural) lets a single ecosystem entry watch every
+  # go.mod in the monorepo. Combined with `groups.*.patterns: "*"`, all
+  # gomod updates across all directories collapse into ONE pull request
+  # per scheduled run — so a daily x/net bump produces a single PR
+  # touching root + every middleware + every test sub-module instead of
+  # eleven racing PRs. Add a path here whenever a new go.mod lands in
+  # the tree (run `find . -name go.mod` to verify coverage).
   - package-ecosystem: gomod
     directories:
       - /
@@ -12,8 +15,12 @@ updates:
       - /middleware/metrics
       - /middleware/otel
       - /middleware/protobuf
-      - /test/benchcmp
+      - /test/benchcmp_sse
       - /test/benchcmp_ws
+      - /test/drivercmp/memcached
+      - /test/drivercmp/postgres
+      - /test/drivercmp/redis
+      - /test/perfmatrix
     schedule:
       interval: daily
     groups:
@@ -23,6 +30,9 @@ updates:
     commit-message:
       prefix: "deps"
 
+  # ----- GitHub Actions -----
+  # Watches every workflow under .github/workflows. Group all action
+  # version bumps into ONE PR per scheduled run.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -33,3 +43,24 @@ updates:
           - "*"
     commit-message:
       prefix: "ci"
+
+  # ----- Docker Compose images -----
+  # Conformance / test compose files pin specific service-image
+  # versions (postgres, redis, memcached, autobahn). The driver-version
+  # CI matrix is authoritative, but keeping the compose defaults fresh
+  # via dependabot avoids drift between local-dev and CI baselines.
+  # Group into ONE PR per scheduled run.
+  - package-ecosystem: docker-compose
+    directories:
+      - /test/autobahn
+      - /test/conformance/memcached
+      - /test/conformance/postgres
+      - /test/conformance/redis
+    schedule:
+      interval: daily
+    groups:
+      all-compose-images:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps(compose)"
