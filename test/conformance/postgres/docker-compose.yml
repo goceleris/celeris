@@ -19,7 +19,7 @@
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     container_name: celeris-pg-conformance
     environment:
       POSTGRES_USER: celeris
