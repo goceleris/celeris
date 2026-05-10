@@ -177,6 +177,10 @@ func NewParser(opts ...ParserOption) *Parser {
 	return p
 }
 
+// Leeway returns the configured exp/nbf/iat leeway. Zero when no
+// WithLeeway option was supplied.
+func (p *Parser) Leeway() time.Duration { return p.leeway }
+
 // Parse parses a token string into MapClaims.
 func (p *Parser) Parse(tokenString string, keyFunc Keyfunc) (*Token, error) {
 	return p.ParseWithClaims(tokenString, MapClaims{}, keyFunc)
