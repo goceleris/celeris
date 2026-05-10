@@ -3,42 +3,46 @@
 package iouring
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/goceleris/celeris/validation"
 )
 
-// lastSQEWriteTail tracks the highest SQE tail value previously
-// observed inside GetSQE. The wave-7 invariant is: the ring's tail
-// is strictly monotonic from any one issuer thread (single-issuer
-// rings) and never decreases overall (multi-issuer rings, modulo
-// wrap). A drop in the observed tail means another goroutine raced
-// with the issuer that owns this ring — exactly the failure mode
-// that PR #36's send-queue corruption bug exhibited.
+// ringTails maps each *Ring to its own monotonic-tail tracker. Multi-worker
+// io_uring (the default) holds one Ring per worker, each with an
+// independent SQ tail; a single global tracker would false-positive on
+// every cross-ring write. The map is populated lazily on first
+// validateSQEWrite call for a given ring.
 //
-// We use a single global atomic rather than per-Ring state so the
-// counter increments on any cross-thread anomaly regardless of which
-// Ring instance hit it. The validator-checker downstream maps this
-// counter to the "no SQE corruption" property predicate.
-var lastSQEWriteTail atomic.Uint32
+// Memory note: the *Ring keys are leaked here for the process lifetime
+// of a validation build. That's acceptable: validation builds are
+// soak-test artefacts, not long-running production binaries, and ring
+// instances are bounded by worker count.
+var ringTails sync.Map
 
 // validateSQEWrite is invoked from GetSQE after it advances the SQ
 // tail. The supplied tail is the post-advance value (i.e. the index
 // just past the SQE we returned). If a later call observes a lower
-// tail than a previous call, the increment was non-monotonic
-// — exactly the violation the production-readiness audit said the
-// validation harness must catch.
+// tail than a previous call ON THE SAME RING, the increment was
+// non-monotonic — exactly the violation the production-readiness
+// audit said the validation harness must catch.
 //
 // We allow tail < prev when the gap is large (wrap of the 32-bit
 // counter). A naive less-than check would false-positive on every
-// 2^32 SQEs. The wave-7 builds run for hours, not weeks, so a real
-// wrap is unreachable; treat any prev > tail with prev-tail < 2^31
-// as a violation.
-func validateSQEWrite(_ *Ring, tail uint32) {
+// 2^32 SQEs. Treat any prev > tail with prev-tail < 2^31 as a
+// violation.
+func validateSQEWrite(r *Ring, tail uint32) {
+	v, ok := ringTails.Load(r)
+	if !ok {
+		var fresh atomic.Uint32
+		v, _ = ringTails.LoadOrStore(r, &fresh)
+	}
+	last := v.(*atomic.Uint32)
 	for {
-		prev := lastSQEWriteTail.Load()
+		prev := last.Load()
 		if tail >= prev || prev-tail >= 1<<31 {
-			if lastSQEWriteTail.CompareAndSwap(prev, tail) {
+			if last.CompareAndSwap(prev, tail) {
 				return
 			}
 			continue
