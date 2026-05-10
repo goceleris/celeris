@@ -248,6 +248,10 @@ func (l *shardedLimiter) allow(key string, now int64) (bool, int, int64) {
 	b.tokens--
 	remaining := int(b.tokens)
 	reset := now + int64(float64(time.Second)/l.rps)
+	// validateBucket is a no-op in production builds; under
+	// -tags=validation it asserts 0 <= tokens <= burst and bumps
+	// validation.RatelimitTokenViolations on violation.
+	validateBucket(b.tokens, l.burst)
 	s.mu.Unlock()
 	return true, remaining, reset
 }
@@ -262,6 +266,7 @@ func (l *shardedLimiter) undo(key string) {
 		if b.tokens > float64(l.burst) {
 			b.tokens = float64(l.burst)
 		}
+		validateBucket(b.tokens, l.burst)
 	}
 	s.mu.Unlock()
 }
