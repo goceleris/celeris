@@ -13,8 +13,7 @@ import (
 // startValidationEndpoint binds the unix socket at
 // validation.SocketPath and starts the JSON snapshot server.
 // Returns a stop callback that cleanly shuts the listener down and
-// removes the socket inode on process exit (defer rm contract from
-// the wave-7 spec).
+// removes the socket inode on process exit.
 func startValidationEndpoint(logger *slog.Logger) (func(), error) {
 	ep, err := validation.StartEndpoint()
 	if err != nil {

@@ -10,9 +10,9 @@ import (
 )
 
 // TestServerPanicBumpsValidationCounter is the integration version of
-// the synthetic panic check from the wave-7 acceptance criteria. It
-// exercises the same safety net as TestServerPanicRecovery, then
-// verifies the cross-package wiring into validation.PanicCount.
+// the synthetic panic check. It exercises the same safety net as
+// TestServerPanicRecovery, then verifies the cross-package wiring
+// into validation.PanicCount.
 func TestServerPanicBumpsValidationCounter(t *testing.T) {
 	before := validation.PanicCount.Load()
 

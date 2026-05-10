@@ -11,10 +11,10 @@ import (
 	"time"
 )
 
-// TestPanicCountIncrement is the synthetic-panic predicate from the
-// wave-7 acceptance criteria: bumping the counter directly is what
-// every higher-layer call site does, so verifying the counter
-// machinery isolates the wiring from the rest of the system.
+// TestPanicCountIncrement is the synthetic-panic predicate: bumping
+// the counter directly is what every higher-layer call site does, so
+// verifying the counter machinery isolates the wiring from the rest
+// of the system.
 func TestPanicCountIncrement(t *testing.T) {
 	before := PanicCount.Load()
 	func() {

@@ -15,9 +15,7 @@ package observe
 //nolint:unused // embedded into Snapshot in collector.go for build-tag symmetry
 type validationFields struct{}
 
-// fillValidation is the production no-op. The validation-tagged
-// override in collector_validation.go fills the embedded fields from
-// the live atomic counters.
-//
-//go:inline
+// fillValidation is the production no-op. The empty body inlines to
+// nothing. The validation-tagged override in collector_validation.go
+// fills the embedded fields from the live atomic counters.
 func (s *Snapshot) fillValidation() {}
