@@ -28,7 +28,7 @@ func validateAdmission(c jwtparse.Claims, leeway time.Duration) {
 	now := time.Now()
 	switch v := c.(type) {
 	case *jwtparse.RegisteredClaims:
-		if v.ExpiresAt != nil && now.After(v.ExpiresAt.Time.Add(leeway)) {
+		if v.ExpiresAt != nil && now.After(v.ExpiresAt.Add(leeway)) {
 			validation.JWTLateAdmits.Add(1)
 		}
 	case jwtparse.MapClaims:

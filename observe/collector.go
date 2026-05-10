@@ -57,9 +57,13 @@ type Snapshot struct {
 	CPUUtilization float64
 
 	// validationFields is empty in production builds and carries the
-	// ValidationCounters field under -tags=validation. The unused-linter
-	// doesn't track embedding-as-use, so suppress its false positive.
-	//nolint:unused // build-tag symmetry; non-empty under -tags=validation
+	// ValidationCounters field under -tags=validation. The unused-
+	// linter flags this under !validation builds (where the embedded
+	// type has no fields); under -tags=validation it's read by
+	// fillValidation. nolintlint allows the directive to be a no-op
+	// under the validation tag.
+	//
+	//nolint:unused,nolintlint // build-tag symmetry; non-empty under -tags=validation
 	validationFields
 }
 

@@ -47,7 +47,7 @@ func TestStartValidationEndpointBindsAndServesJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
@@ -89,7 +89,7 @@ func TestStartValidationEndpointSnapshotPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /snapshot: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
