@@ -327,6 +327,14 @@ func (e *Engine) performSwitch() {
 	}
 	e.switchMu.Unlock()
 
+	// validateSwitch is a no-op in production (see
+	// validation_default.go); under -tags=validation it asserts the
+	// pre/post-switch FD invariant and increments
+	// validation.AdaptiveSwitchFDLeaks on violation. Snapshot
+	// metrics on both engines so the post-switch check can see the
+	// full connection accounting from both halves of the swap.
+	preMetrics := e.Metrics()
+
 	// Resume new active BEFORE pausing old — this creates a brief overlap
 	// where both engines listen (via SO_REUSEPORT), which is correct. The
 	// alternative (pause first) creates a window where NEITHER listens,
@@ -354,6 +362,8 @@ func (e *Engine) performSwitch() {
 	if ac, ok := newStandby.(engine.AcceptController); ok {
 		_ = ac.PauseAccept()
 	}
+
+	validateSwitch(preMetrics, e.Metrics())
 
 	e.logger.Info("engine switch completed",
 		"now_active", newActive.Type().String(),

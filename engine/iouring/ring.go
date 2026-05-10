@@ -254,6 +254,11 @@ func (r *Ring) GetSQE() unsafe.Pointer {
 		atomic.StoreUint32((*uint32)(r.sqTail), tail+1)
 	}
 	r.pending++
+	// validateSQEWrite is a no-op in production (see
+	// validation_default.go); under -tags=validation it asserts
+	// monotonic tail across all GetSQE callers and increments
+	// validation.IouringSQECorruptions on violation.
+	validateSQEWrite(r, tail+1)
 	return sqePtr
 }
 
