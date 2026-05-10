@@ -24,11 +24,6 @@ func (c *Counter) Store(n uint64) { c.v.Store(n) }
 // celeris.routerAdapter.recoverAndRelease and by middleware/recovery.
 var PanicCount Counter
 
-// RaceFires is reserved for future use by sites that catch concurrent
-// access bugs at runtime (e.g. atomic.CompareAndSwap mismatches that
-// indicate a missing lock).
-var RaceFires Counter
-
 // RatelimitTokenViolations counts token-bucket invariant breaches
 // observed at the allow/undo sites in middleware/ratelimit: token
 // count outside [0, capacity], or undo restoring above capacity.
@@ -55,7 +50,6 @@ var IouringSQECorruptions Counter
 func Snapshot() Counters {
 	return Counters{
 		PanicCount:               PanicCount.Load(),
-		RaceFires:                RaceFires.Load(),
 		RatelimitTokenViolations: RatelimitTokenViolations.Load(),
 		SessionOwnerMismatches:   SessionOwnerMismatches.Load(),
 		JWTLateAdmits:            JWTLateAdmits.Load(),

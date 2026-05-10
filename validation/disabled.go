@@ -24,7 +24,6 @@ func (Counter) Store(uint64) {}
 // compile identically in both modes.
 var (
 	PanicCount               Counter
-	RaceFires                Counter
 	RatelimitTokenViolations Counter
 	SessionOwnerMismatches   Counter
 	JWTLateAdmits            Counter

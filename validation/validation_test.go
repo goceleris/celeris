@@ -91,14 +91,12 @@ func TestEndpointServesJSON(t *testing.T) {
 // to probatorium; this test catches the omission.
 func TestSnapshotConsistency(t *testing.T) {
 	PanicCount.Store(11)
-	RaceFires.Store(12)
 	RatelimitTokenViolations.Store(13)
 	SessionOwnerMismatches.Store(14)
 	JWTLateAdmits.Store(15)
 	IouringSQECorruptions.Store(16)
 	defer func() {
 		PanicCount.Store(0)
-		RaceFires.Store(0)
 		RatelimitTokenViolations.Store(0)
 		SessionOwnerMismatches.Store(0)
 		JWTLateAdmits.Store(0)
@@ -107,7 +105,6 @@ func TestSnapshotConsistency(t *testing.T) {
 	got := Snapshot()
 	want := Counters{
 		PanicCount:               11,
-		RaceFires:                12,
 		RatelimitTokenViolations: 13,
 		SessionOwnerMismatches:   14,
 		JWTLateAdmits:            15,

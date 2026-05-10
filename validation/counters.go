@@ -9,7 +9,6 @@ package validation
 // per-counter atomics in assertions.go.
 type Counters struct {
 	PanicCount               uint64 `json:"panic_count"`
-	RaceFires                uint64 `json:"race_fires"`
 	RatelimitTokenViolations uint64 `json:"ratelimit_token_violations"`
 	SessionOwnerMismatches   uint64 `json:"session_owner_mismatches"`
 	JWTLateAdmits            uint64 `json:"jwt_late_admits"`
