@@ -10,6 +10,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/validation"
 )
 
 type routerAdapter struct {
@@ -197,6 +198,11 @@ func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
 //
 //go:noinline
 func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
+	// validation.PanicCount is a no-op counter in production (zero-cost
+	// stub from validation/disabled.go); under -tags=validation it
+	// becomes a real atomic.Uint64 that probatorium reads via the unix
+	// socket to assert that no panics escape the recover safety net.
+	validation.PanicCount.Add(1)
 	a.server.logger().Error("handler panic recovered",
 		"error", fmt.Sprint(r),
 		"method", c.method,
