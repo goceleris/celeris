@@ -508,6 +508,14 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 
 		chainErr := c.Next()
 
+		// validateAdmission is a no-op in production (see
+		// validation_default.go); under -tags=validation it asserts
+		// session-owner binding and increments
+		// validation.SessionOwnerMismatches on violation. Runs AFTER
+		// c.Next() so the handler chain has had a chance to populate
+		// the owner data the assertion compares against.
+		validateAdmission(sess)
+
 		if sess.destroyed {
 			if useCookieExtractor {
 				ck := cookie

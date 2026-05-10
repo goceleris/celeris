@@ -148,6 +148,14 @@ func New(config ...Config) celeris.HandlerFunc {
 			successHandler(c)
 		}
 
+		// validateAdmission is a no-op in production (see
+		// validation_default.go); under -tags=validation it asserts
+		// exp + leeway >= now() and bumps validation.JWTLateAdmits on
+		// violation. token.Claims aliases the live claims pointer; the
+		// leeway value comes from the configured parser so this matches
+		// the parser's own validateClaimsWithLeeway predicate.
+		validateAdmission(token.Claims, parser.Leeway())
+
 		return c.Next()
 	}
 }

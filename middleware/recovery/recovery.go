@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/validation"
 )
 
 var (
@@ -78,6 +79,11 @@ func New(config ...Config) celeris.HandlerFunc {
 				if err, ok := r.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 					panic(r)
 				}
+
+				// validation.RecordPanic is a zero-cost no-op in
+				// production builds; under -tags=validation it backs
+				// the "no panic escaped recovery" predicate.
+				validation.RecordPanic()
 
 				panicVal := formatPanic(r)
 
