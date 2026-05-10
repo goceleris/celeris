@@ -1,0 +1,424 @@
+---
+# Stage Go + celeris source on a cluster node, run a mage target there,
+# fetch the log, then tear everything down. Used for linux-only or
+# port-bound gates (mage FullCompliance, mage MatrixBenchStrict) that
+# the dev Mac cannot run locally.
+#
+# Pristine semantics — every artifact lives under {{ bench_root }} so
+# the always-block can rm -rf it. Nothing is written to ~ on the node.
+#
+# Required extra-vars (set by `mage ClusterGoGate`):
+#   gate_target_host:     inventory_hostname to run the mage gate on
+#                         (default: msa2-client — the loadgen node has
+#                         the fewest other responsibilities)
+#   gate_mage_targets:    space-separated mage targets, e.g.
+#                         "FullCompliance" or "MatrixBenchStrict"
+#   go_tarball_amd64:     absolute path on dev Mac to a
+#                         go<ver>.linux-amd64.tar.gz tarball
+#   go_tarball_arm64:     absolute path on dev Mac to a
+#                         go<ver>.linux-arm64.tar.gz tarball
+#   source_tarball_local: absolute path on dev Mac to a tar.gz of the
+#                         current branch (made via `git archive HEAD`)
+#   results_local_dir:    where to fetch the gate log back to on the Mac
+#   gate_timeout_seconds: ansible task timeout (default: 28800 = 8 h —
+#                         covers MatrixBenchStrict's worst case)
+#   gate_env:             optional dict of extra env vars to export
+#                         before running mage (e.g. PERFMATRIX_DURATION)
+
+- name: Run mage gate on a cluster node
+  hosts: "{{ gate_target_host | default('msa2-client') }}"
+  gather_facts: true
+  tasks:
+    - name: Ensure transient root exists
+      ansible.builtin.file:
+        path: "{{ bench_root }}"
+        state: directory
+        mode: '0755'
+
+    # Pristine snapshot — drop a marker file under {{ bench_root }} so
+    # the post-run leak check can compare modification times against
+    # it and only flag files that we created or modified during the
+    # run. mtime-based diffing is exhaustive; the previous list-based
+    # approach missed leaks like ~/.config/go/, ~/.cache/go-telemetry/,
+    # ~/.netrc, ~/.gitconfig, etc.
+    - name: Drop run-start marker for mtime diff
+      ansible.builtin.file:
+        path: "{{ bench_root }}/run-start.marker"
+        state: touch
+        mode: '0644'
+
+    # ---------- system-package preflight ----------
+    # Mirrors the manifest pattern used by cluster-bench.yml: anything
+    # WE install gets recorded so the always-block can apt-purge it.
+    # docker.io is required for PERFMATRIX_SERVICES=local: the strict
+    # matrix's driver-* scenarios spawn postgres / redis / memcached
+    # via `docker run`. Without it the runner aborts with
+    # "perfmatrix/services: docker not available". We auto-install it
+    # so the gate covers the full cell schedule, and undo it on the way
+    # out so the bench targets stay pristine.
+    - name: Read existing dep manifest if present
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: gate_manifest_slurp
+      failed_when: false
+
+    - name: Initialize empty manifest fact
+      ansible.builtin.set_fact:
+        installed_packages: []
+        prior_sysctl: {}
+
+    - name: Restore manifest state from disk
+      ansible.builtin.set_fact:
+        installed_packages: "{{ (gate_manifest_slurp.content | b64decode | from_json).installed_packages | default([]) }}"
+        prior_sysctl: "{{ (gate_manifest_slurp.content | b64decode | from_json).prior_sysctl | default({}) }}"
+      when: gate_manifest_slurp is defined and gate_manifest_slurp.content is defined
+
+    # Only install docker when the target needs it (driver-* matrix
+    # scenarios). Fuzz, FullCompliance, etc. do not — saves ~30s per
+    # host on packageless gates AND avoids the reset_connection sudo
+    # timing race that bit pass 3 of the v1.4.2 strict-3x run.
+    - name: Detect missing system packages (docker.io)
+      ansible.builtin.shell: |
+        for pkg in docker.io; do
+          dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+        done
+      register: missing_pkgs
+      changed_when: false
+      when: gate_needs_docker | default(false) | bool
+
+    - name: Install missing packages
+      become: true
+      ansible.builtin.apt:
+        name: "{{ missing_pkgs.stdout_lines }}"
+        state: present
+        update_cache: true
+      when:
+        - gate_needs_docker | default(false) | bool
+        - missing_pkgs.stdout_lines is defined
+        - missing_pkgs.stdout_lines | length > 0
+
+    - name: Append newly installed packages to in-memory manifest
+      ansible.builtin.set_fact:
+        installed_packages: "{{ installed_packages + missing_pkgs.stdout_lines }}"
+      when:
+        - gate_needs_docker | default(false) | bool
+        - missing_pkgs.stdout_lines is defined
+        - missing_pkgs.stdout_lines | length > 0
+
+    # ---------- bench-host sysctl tuning ----------
+    # The strict matrix saturates the kernel ephemeral-port pool when
+    # all driver-* scenarios run back-to-back: each cell opens many
+    # short-lived HTTP/1.1 connections that linger in TIME_WAIT for
+    # 60s. With the Debian default port_range of 32768-60999 (28k
+    # slots) and tw_reuse=2 (loopback-only reuse), msa2-server hit
+    # zero-request fail-fast at cell 1432/2916 with time_wait=29085.
+    # Widening the pool to 1024-65535 (64k slots) and setting
+    # tw_reuse=1 (full reuse for outgoing) clears the bottleneck.
+    #
+    # Snapshot the current values into the manifest BEFORE writing so
+    # the always-block can restore them — no permanent mutation of the
+    # bench host's tuning.
+    - name: Snapshot current sysctl values (only on first run that touches them)
+      ansible.builtin.shell: |
+        printf '%s ' "$(sysctl -n net.ipv4.tcp_tw_reuse)"
+        printf '%s ' "$(sysctl -n net.ipv4.ip_local_port_range)"
+      register: prior_sysctl_raw
+      changed_when: false
+      when: prior_sysctl == {}
+
+    - name: Parse and persist prior sysctl values
+      ansible.builtin.set_fact:
+        prior_sysctl:
+          tcp_tw_reuse: "{{ prior_sysctl_raw.stdout.split() | first }}"
+          ip_local_port_range: "{{ prior_sysctl_raw.stdout.split()[1:3] | join(' ') }}"
+      when: prior_sysctl == {} and prior_sysctl_raw is defined and prior_sysctl_raw.stdout is defined
+
+    - name: Apply bench-host sysctl tuning
+      become: true
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: false
+      loop:
+        - { name: net.ipv4.tcp_tw_reuse, value: "1" }
+        - { name: net.ipv4.ip_local_port_range, value: "1024 65535" }
+      when: prior_sysctl != {}
+
+    - name: Write dep manifest to /tmp
+      ansible.builtin.copy:
+        content: |
+          {{ {
+            'installed_packages': installed_packages,
+            'prior_sysctl': prior_sysctl,
+          } | to_nice_json }}
+        dest: "{{ manifest_path }}"
+        mode: '0644'
+
+    - name: Ensure docker daemon is running
+      become: true
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: false
+      when: "'docker.io' in (installed_packages | default([]))"
+
+    # Grant the gate user direct access to /var/run/docker.sock without
+    # adding them to the docker group. Group membership only takes
+    # effect on the NEXT login — forcing a `meta: reset_connection`
+    # races against ansible's privilege-escalation timeout under SSH
+    # ControlMaster (12s). chmod 666 the socket on this run only —
+    # systemd recreates the socket with default mode (660) when docker
+    # restarts, so no permanent mutation. The gate hosts are dedicated
+    # bench targets with no other docker workload, so a temporarily
+    # world-writable socket is benign.
+    - name: Open docker socket for the gate user (no group membership / no reconnect)
+      become: true
+      ansible.builtin.file:
+        path: /var/run/docker.sock
+        mode: '0666'
+      when: "'docker.io' in (installed_packages | default([]))"
+
+    - block:
+        - name: Pick Go tarball matching the target architecture
+          ansible.builtin.set_fact:
+            go_tarball_local: >-
+              {{ go_tarball_amd64 if ansible_architecture in ['x86_64', 'amd64']
+                 else go_tarball_arm64 }}
+
+        - name: Push Go tarball
+          ansible.builtin.copy:
+            src: "{{ go_tarball_local }}"
+            dest: "{{ bench_root }}/go.tar.gz"
+            mode: '0644'
+
+        - name: Push celeris source tarball
+          ansible.builtin.copy:
+            src: "{{ source_tarball_local }}"
+            dest: "{{ bench_root }}/source.tar.gz"
+            mode: '0644'
+
+        - name: Extract Go into staging dir (NOT ~)
+          ansible.builtin.unarchive:
+            src: "{{ bench_root }}/go.tar.gz"
+            dest: "{{ bench_root }}/"
+            remote_src: true
+            creates: "{{ bench_root }}/go/bin/go"
+
+        - name: Create celeris source dir
+          ansible.builtin.file:
+            path: "{{ bench_root }}/celeris"
+            state: directory
+            mode: '0755'
+
+        - name: Extract celeris source
+          ansible.builtin.unarchive:
+            src: "{{ bench_root }}/source.tar.gz"
+            dest: "{{ bench_root }}/celeris/"
+            remote_src: true
+
+        # Every tool env that could write outside the staging dir is
+        # redirected here. XDG_CACHE_HOME and GOTMPDIR cover Go's
+        # secondary caches (telemetry counters, tmpdir for builds);
+        # MAGEFILE_CACHE redirects the compiled-magefile cache that
+        # otherwise lands in ~/.magefile; without these a `go install`
+        # or a `mage` run scribbles persistent files in the user's
+        # home dir.
+        - name: Install mage into staging GOPATH
+          environment: &gate_env
+            PATH: "{{ bench_root }}/go/bin:{{ bench_root }}/gopath/bin:{{ ansible_env.PATH }}"
+            GOROOT: "{{ bench_root }}/go"
+            GOPATH: "{{ bench_root }}/gopath"
+            GOCACHE: "{{ bench_root }}/gocache"
+            GOMODCACHE: "{{ bench_root }}/gomodcache"
+            GOTMPDIR: "{{ bench_root }}/gotmp"
+            XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
+            XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
+            MAGEFILE_CACHE: "{{ bench_root }}/magefile-cache"
+            HOME: "{{ ansible_env.HOME }}"
+          ansible.builtin.shell: |
+            set -e
+            mkdir -p {{ bench_root }}/gopath/bin {{ bench_root }}/gotmp {{ bench_root }}/xdg-cache {{ bench_root }}/xdg-config
+            go install github.com/magefile/mage@latest
+            ls -l {{ bench_root }}/gopath/bin/mage
+          args:
+            executable: /bin/bash
+
+        - name: Pre-create magefile cache dir (mage refuses to mkdir it itself)
+          ansible.builtin.file:
+            path: "{{ bench_root }}/magefile-cache"
+            state: directory
+            mode: '0755'
+
+        - name: Run mage gate(s) — capture output to a log
+          environment: *gate_env
+          # gate_env_exports is a literal block of shell `export k=q`
+          # lines rendered by ClusterGoGate (which knows the user's
+          # local env). Embedded directly into the shell — no Jinja
+          # loop over dicts (--extra-vars values are always strings).
+          #
+          # The `timeout` wrapper ensures the kernel kills the mage
+          # subtree if ansible's async deadline is hit — without it
+          # the remote child keeps running headless after ansible
+          # gives up, which races with the cleanup rm -rf.
+          ansible.builtin.shell: |
+            set -o pipefail
+            cd {{ bench_root }}/celeris
+            {{ gate_env_exports | default('') }}
+            timeout --kill-after=30s {{ gate_timeout_seconds | default(28800) }}s bash -c '
+              for tgt in {{ gate_mage_targets }}; do
+                echo "=== Running mage $tgt on $(hostname) ==="
+                mage "$tgt" || exit $?
+              done
+            ' 2>&1 | tee {{ bench_root }}/gate.log
+          args:
+            executable: /bin/bash
+          async: "{{ gate_timeout_seconds | default(28800) }}"
+          poll: 30
+          register: gate_result
+          # Note: mage exits non-zero on first failing target; tee
+          # preserves the log even when the pipeline fails.
+
+      always:
+        - name: Fetch gate log back to dev machine
+          ansible.builtin.fetch:
+            src: "{{ bench_root }}/gate.log"
+            dest: "{{ results_local_dir }}/"
+            flat: true
+            fail_on_missing: false
+
+        # Kill any leftover mage / go / runner processes that ansible's
+        # async deadline cut loose. Without this, a SIGKILL'd async
+        # task can leave headless processes that race the cleanup.
+        - name: Stop any leftover gate processes
+          become: true
+          ansible.builtin.shell: |
+            pkill -x mage 2>/dev/null
+            pkill -x go 2>/dev/null
+            pkill -x runner 2>/dev/null
+            pkill -x loadgen 2>/dev/null
+            true
+          changed_when: false
+
+        # Stop any docker containers the runner spawned and didn't kill
+        # cleanly (runner uses `docker run -d --rm` so they auto-remove
+        # on stop). We only nuke EVERY running container when WE
+        # installed docker — that means the daemon was empty before our
+        # gate, so anything still running is ours. We never touch
+        # containers on a host that already had docker pre-installed
+        # for some other purpose.
+        - name: Kill leftover docker containers from our run (only if we installed docker)
+          become: true
+          ansible.builtin.shell: |
+            ids=$(docker ps -q 2>/dev/null)
+            if [ -n "$ids" ]; then
+              docker kill $ids 2>/dev/null || true
+            fi
+            true
+          when: "'docker.io' in (installed_packages | default([]))"
+          changed_when: false
+
+        # Cleanup with a become-fallback for files that any sudo'd mage
+        # step (ulimit -l unlimited, etc.) may have created as root.
+        - name: Drop staging dir (Go, source, gopath, gocache — everything)
+          become: true
+          ansible.builtin.shell: |
+            chmod -R u+w {{ bench_root }} 2>/dev/null || true
+            rm -rf {{ bench_root }}
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        # ---------- system-package teardown ----------
+        # Read the manifest the preflight wrote and undo its changes:
+        # apt-purge anything WE installed and remove the gate user from
+        # the docker group if WE added them. Idempotent if the manifest
+        # is missing (first ever run).
+        - name: Read manifest for cleanup
+          ansible.builtin.slurp:
+            src: "{{ manifest_path }}"
+          register: gate_cleanup_manifest
+          failed_when: false
+
+        - name: Decode manifest for cleanup
+          ansible.builtin.set_fact:
+            to_remove: "{{ (gate_cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
+            sysctl_to_restore: "{{ (gate_cleanup_manifest.content | b64decode | from_json).prior_sysctl | default({}) }}"
+          when: gate_cleanup_manifest is defined and gate_cleanup_manifest.content is defined
+
+        - name: Restore prior sysctl values (only restores what we snapshotted)
+          become: true
+          ansible.posix.sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            sysctl_set: true
+            state: present
+            reload: false
+          loop: "{{ sysctl_restore_pairs | default([]) }}"
+          vars:
+            sysctl_restore_pairs:
+              - name: net.ipv4.tcp_tw_reuse
+                value: "{{ sysctl_to_restore.tcp_tw_reuse | default('') }}"
+              - name: net.ipv4.ip_local_port_range
+                value: "{{ sysctl_to_restore.ip_local_port_range | default('') }}"
+          when:
+            - sysctl_to_restore is defined
+            - sysctl_to_restore | length > 0
+            - item.value != ''
+
+        - name: Stop docker daemon before purge
+          become: true
+          ansible.builtin.service:
+            name: docker
+            state: stopped
+          when: to_remove is defined and ('docker.io' in to_remove)
+
+        - name: Apt-purge packages we installed
+          become: true
+          ansible.builtin.apt:
+            name: "{{ to_remove }}"
+            state: absent
+            purge: true
+            autoremove: true
+          when: to_remove is defined and to_remove | length > 0
+
+        - name: Remove dep manifest
+          ansible.builtin.file:
+            path: "{{ manifest_path }}"
+            state: absent
+
+        # mtime-based leak check — anything in ~ newer than the marker
+        # we dropped at run-start is something we (or a child of mage)
+        # created during the run. Excludes:
+        #   * shell history / less / vim — touched by every login;
+        #   * ~/.ansible/, ~/.ansible_async/ — ansible itself creates
+        #     these to run the playbook; we cannot redirect them
+        #     because we run via ansible-playbook;
+        #   * ~/.ssh/known_hosts — first-time host-key acceptance;
+        #   * ~/.magefile/ — should not appear thanks to MAGEFILE_CACHE
+        #     in gate_env, but kept as a belt-and-braces exclusion in
+        #     case mage ignores the env (older versions did).
+        - name: Find paths in ~ created/modified during the run
+          ansible.builtin.shell: |
+            find ~ -maxdepth 4 \
+              -newermt '{{ ansible_date_time.iso8601_micro | default(ansible_date_time.iso8601) }}' \
+              -not -path "${HOME}/.bash_history*" \
+              -not -path "${HOME}/.viminfo*" \
+              -not -path "${HOME}/.lesshst*" \
+              -not -path "${HOME}/.cache/ansible*" \
+              -not -path "${HOME}/.ansible*" \
+              -not -path "${HOME}/.ansible_async*" \
+              -not -path "${HOME}/.ssh/known_hosts*" \
+              -not -path "${HOME}/.magefile*" \
+              2>/dev/null \
+              || true
+          register: mtime_diff
+          changed_when: false
+
+        - name: Fail if anything leaked into ~
+          ansible.builtin.fail:
+            msg: |
+              Pristine violation — files in ~ newer than the run-start mark:
+              {{ mtime_diff.stdout }}
+          when: mtime_diff.stdout is defined and mtime_diff.stdout | trim | length > 0

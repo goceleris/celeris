@@ -293,3 +293,96 @@ func TestMemoryKVCleanupContext(t *testing.T) {
 	// Close should be a no-op after context cancel — verify it doesn't panic.
 	m.Close()
 }
+
+// TestMemoryKVIncrementMonotonic — fresh counter starts at 1 and
+// hands out monotonic increasing integers without gaps under sequential
+// access. Pins the post-increment-value contract from store.Counter.
+func TestMemoryKVIncrementMonotonic(t *testing.T) {
+	m := NewMemoryKV()
+	defer m.Close()
+	ctx := context.Background()
+
+	for i := int64(1); i <= 10; i++ {
+		got, err := m.Increment(ctx, "seq", 0)
+		if err != nil {
+			t.Fatalf("Increment: %v", err)
+		}
+		if got != i {
+			t.Errorf("Increment #%d = %d, want %d", i, got, i)
+		}
+	}
+}
+
+// TestMemoryKVIncrementTTL — counter respects ttl. After expiry the
+// next Increment sees a fresh "missing key" state and returns 1.
+func TestMemoryKVIncrementTTL(t *testing.T) {
+	m := NewMemoryKV()
+	defer m.Close()
+	ctx := context.Background()
+
+	if v, err := m.Increment(ctx, "k", 30*time.Millisecond); err != nil || v != 1 {
+		t.Fatalf("Increment fresh = (%d, %v), want (1, nil)", v, err)
+	}
+	if v, err := m.Increment(ctx, "k", 30*time.Millisecond); err != nil || v != 2 {
+		t.Fatalf("Increment fresh#2 = (%d, %v), want (2, nil)", v, err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	v, err := m.Increment(ctx, "k", 30*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Increment post-expiry: %v", err)
+	}
+	if v != 1 {
+		t.Errorf("Increment post-expiry = %d, want 1 (counter expired and reset)", v)
+	}
+}
+
+// TestMemoryKVIncrementCorrupt — Set then Increment on a non-numeric
+// value surfaces a parse error at Increment time, not silently returns
+// a wrong value.
+func TestMemoryKVIncrementCorrupt(t *testing.T) {
+	m := NewMemoryKV()
+	defer m.Close()
+	ctx := context.Background()
+
+	if err := m.Set(ctx, "k", []byte("not-a-number"), 0); err != nil {
+		t.Fatal(err)
+	}
+	v, err := m.Increment(ctx, "k", 0)
+	if err == nil {
+		t.Errorf("Increment on corrupt counter returned nil error, value=%d", v)
+	}
+}
+
+// TestMemoryKVIncrementContended — 64 goroutines × 250 increments on
+// a single shared counter must arrive at exactly 16000 with no lost
+// updates. Pins atomicity under shard contention.
+func TestMemoryKVIncrementContended(t *testing.T) {
+	m := NewMemoryKV()
+	defer m.Close()
+	ctx := context.Background()
+
+	const goroutines = 64
+	const perG = 250
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			for range perG {
+				if _, err := m.Increment(ctx, "shared", 0); err != nil {
+					t.Errorf("Increment: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	final, err := m.Increment(ctx, "shared", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := int64(goroutines*perG + 1)
+	if final != want {
+		t.Errorf("final = %d, want %d (lost updates)", final, want)
+	}
+}

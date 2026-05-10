@@ -53,6 +53,11 @@ type Config struct {
 	// report or a SIGSEGV signal could sit buried for hours while the
 	// rest of the matrix keeps running).
 	FailFast bool
+	// FDTrace emits the per-cell `cell-fd: before=N after=M diff=±K`
+	// log line for every cell, not just cells with non-zero deltas.
+	// Off by default — leak hunts that need absolute counts to spot
+	// slow drift turn it on (PERFMATRIX_FD_TRACE=1 / -fd-trace).
+	FDTrace bool
 }
 
 // DefaultConfig is the set of defaults applied to a fresh flag.FlagSet.
@@ -96,6 +101,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 		"rng seed for any randomised orchestrator behaviour; 0 = time.Now().UnixNano()")
 	fs.BoolVar(&c.FailFast, "fail-fast", c.FailFast,
 		"abort the run at the first cell error (pair with -race / GORACE=halt_on_error for strict mode)")
+	fs.BoolVar(&c.FDTrace, "fd-trace", c.FDTrace,
+		"log per-cell FD counts even when the delta is zero (off by default — non-zero deltas always log)")
 }
 
 // ParseArgs parses argv (without the program name). out is used for flag
@@ -124,6 +131,14 @@ type cellResultFile struct {
 	Error        string           `json:"error,omitempty"`
 	Result       *loadgen.Result  `json:"result,omitempty"`
 	Profile      *profileArtifact `json:"profile,omitempty"`
+	// Resource accounting (linux only — zero elsewhere).
+	// FDsBefore   = open FDs in the runner immediately before cell.Server.Start.
+	// FDsAfterStop = open FDs immediately after cell.Server.Stop returned.
+	// FDsLeaked   = FDsAfterStop - FDsBefore. Positive = the engine teardown
+	//              path failed to close everything it opened during the cell.
+	FDsBefore    int `json:"fds_before,omitempty"`
+	FDsAfterStop int `json:"fds_after_stop,omitempty"`
+	FDsLeaked    int `json:"fds_leaked,omitempty"`
 }
 
 // profileArtifact lists the pprof files captured for this cell, if any.
@@ -259,6 +274,18 @@ func run(cfg Config) error {
 	fmt.Fprintf(os.Stderr, "perfmatrix: %d cells across %d scenarios × %d servers × %d runs\n",
 		len(schedule), len(effScs), len(effSvs), cfg.Runs)
 
+	// Per-server FD-leak accumulator. Aggregates across all cells of
+	// the same server name so a cell-by-cell leak (e.g. epoll teardown
+	// missing one FD) shows up as a clear linear growth in the
+	// per-server total at the end of the run.
+	type leakStats struct {
+		count   int
+		total   int
+		maxCell int // largest single-cell leak observed
+	}
+	leakBy := map[string]*leakStats{}
+	preRunFDs := countProcessFDs()
+
 	var firstCellErr error
 	for i, cell := range schedule {
 		if rootCtx.Err() != nil {
@@ -267,6 +294,11 @@ func run(cfg Config) error {
 		}
 		fmt.Fprintf(os.Stderr, "[%d/%d] run=%d scenario=%s server=%s\n",
 			i+1, len(schedule), cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
+		// executeCell stamps FDsLeaked on the per-cell JSON via the
+		// Stop defer; we don't have direct access to that here, so the
+		// inline `cell-fd:` log line is the source of truth for the
+		// per-cell delta. The post-run summary below scans the per-
+		// cell JSON files to aggregate.
 		if err := executeCell(rootCtx, cfg, handles, cell); err != nil {
 			fmt.Fprintf(os.Stderr, "  cell error: %v\n", err)
 			if cfg.FailFast {
@@ -281,6 +313,57 @@ func run(cfg Config) error {
 			case <-rootCtx.Done():
 			case <-time.After(cfg.Cooldown):
 			}
+		}
+	}
+
+	// FD-leak post-run summary. Reads every per-cell JSON we wrote and
+	// groups by server name. Top offenders are printed first; a single
+	// server name showing leak/cell ≈ constant is the smoking gun for
+	// a teardown path that misses one FD per cell.
+	postRunFDs := countProcessFDs()
+	if err := filepath.Walk(cfg.Out, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(path, ".json") {
+			return nil
+		}
+		blob, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil
+		}
+		var c cellResultFile
+		if jerr := json.Unmarshal(blob, &c); jerr != nil || c.FDsLeaked <= 0 {
+			return nil
+		}
+		s := leakBy[c.ServerName]
+		if s == nil {
+			s = &leakStats{}
+			leakBy[c.ServerName] = s
+		}
+		s.count++
+		s.total += c.FDsLeaked
+		if c.FDsLeaked > s.maxCell {
+			s.maxCell = c.FDsLeaked
+		}
+		return nil
+	}); err == nil && len(leakBy) > 0 {
+		type row struct {
+			server string
+			st     *leakStats
+		}
+		rows := make([]row, 0, len(leakBy))
+		for sv, st := range leakBy {
+			rows = append(rows, row{sv, st})
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].st.total > rows[j].st.total })
+		fmt.Fprintf(os.Stderr, "perfmatrix: FD-leak summary — pre-run=%d post-run=%d delta=%d\n",
+			preRunFDs, postRunFDs, postRunFDs-preRunFDs)
+		fmt.Fprintln(os.Stderr, "perfmatrix: top leakers (server / leaking-cells / total / max-per-cell):")
+		for i, r := range rows {
+			if i >= 15 {
+				break
+			}
+			avg := float64(r.st.total) / float64(r.st.count)
+			fmt.Fprintf(os.Stderr, "  %-50s cells=%-5d total=%-6d max=%-4d avg=%.2f\n",
+				r.server, r.st.count, r.st.total, r.st.maxCell, avg)
 		}
 	}
 
@@ -320,6 +403,13 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 		}
 	}()
 
+	// FD accounting: count process FDs immediately before Server.Start
+	// so the after-Stop count gives a clean delta. The leak hunt that
+	// triggered this instrumentation traced 939 orphan socket FDs on
+	// msr1 across ~2000 cells — a per-cell delta isolates which engine
+	// teardown path is responsible.
+	result.FDsBefore = countProcessFDs()
+
 	// Server startup (2 s hard cap).
 	startCtx, startCancel := context.WithTimeout(parent, 2*time.Second)
 	ln, err := cell.Server.Start(startCtx, handles)
@@ -336,6 +426,25 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = cell.Server.Stop(stopCtx)
+		// FD-leak accounting: count again post-Stop and stamp the delta
+		// onto the result. Logged inline so the leak shows up in the
+		// matrix log even when the per-cell JSON is missed (fail-fast
+		// abort, Ctrl-C, …). Negative deltas are normal — long-lived
+		// listen FDs from prior cells can be reaped during this cell's
+		// Stop. We surface only positive deltas at log time.
+		result.FDsAfterStop = countProcessFDs()
+		result.FDsLeaked = result.FDsAfterStop - result.FDsBefore
+		// Default: only log on a non-zero delta — keeps gate.log
+		// readable. PERFMATRIX_FD_TRACE=1 forces per-cell before/after
+		// for active leak hunts (slow upward drift over thousands of
+		// cells is invisible without absolute counts). Either way the
+		// values land on the per-cell JSON via FDsBefore/FDsAfterStop
+		// for post-run analysis.
+		if result.FDsLeaked != 0 || cfg.FDTrace {
+			fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d diff=%+d\n",
+				cell.Scenario.Name(), cell.Server.Name(),
+				result.FDsBefore, result.FDsAfterStop, result.FDsLeaked)
+		}
 	}()
 	target := ln.Addr()
 	targetAddr := target.String()
@@ -367,7 +476,18 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 
 	// Profile capture, if enabled and supported.
 	var profileArt *profileArtifact
-	cellCtx, cellCancel := context.WithTimeout(parent, cfg.Warmup+cfg.Duration+30*time.Second)
+	// Per-cell timeout. The original Warmup+Duration+30s was too tight
+	// under the strict matrix (-race + checkptr) on slower hosts —
+	// observed on msr1 (aarch64) where the 1MB POST scenario's
+	// loadgen warmup naturally stretched well past 1s under -race
+	// overhead. When warmup eats most of the budget, post-warmup
+	// returns with 0 requests and the cell mis-fires fail-fast on a
+	// non-bug. Scaled buffer (5x Warmup + 2x Duration + 60s) keeps
+	// fast cells fast while letting slow ones complete, and the
+	// 0-req guard still catches genuine failures (server refused
+	// every connection, hung mid-handshake).
+	cellTimeout := cellTimeoutFor(cfg.Warmup, cfg.Duration)
+	cellCtx, cellCancel := context.WithTimeout(parent, cellTimeout)
 	defer cellCancel()
 
 	var cpuWG sync.WaitGroup
@@ -439,11 +559,88 @@ func executeCell(parent context.Context, cfg Config, handles *services.Handles, 
 	// lets -fail-fast stop the run so it can be investigated before
 	// polluting hours of downstream measurements.
 	if res != nil && res.Requests == 0 {
-		result.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s (server likely refused the client's protocol or hung mid-warmup)",
-			res.Errors, res.Duration)
+		// Capture process-level resource state at the moment of failure.
+		// 0-req cells are often tail-of-matrix accumulation symptoms (FD
+		// or goroutine leak, TCP TIME_WAIT exhaustion); dumping these
+		// counters into the cell error gives the next investigator a
+		// concrete starting point instead of "look at the whole matrix
+		// log and guess". Cheap to compute, only fires on failure.
+		diag := zeroReqDiag()
+		result.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s diag=[%s] (server likely refused the client's protocol, accumulated state exhausted resources, or hung mid-warmup)",
+			res.Errors, res.Duration, diag)
 		return errors.New(result.Error)
 	}
 	return nil
+}
+
+// cellTimeoutFor computes the per-cell ctx deadline. Pinning a single
+// constant collapses two failure modes (cells over-running their fast
+// duration; runtime overhead under -race) into one tunable formula.
+//
+// The 5x Warmup factor absorbs the cost of -race + -checkptr=2 setup
+// inside loadgen / server processes. The 2x Duration factor leaves
+// room for graceful drain. The 60s constant covers signal-handling
+// shutdown, FD leak diag, and per-cell file writes. Anything inside
+// this envelope is a real failure (server hung, deadlock); anything
+// outside is genuine timeout.
+func cellTimeoutFor(warmup, duration time.Duration) time.Duration {
+	return 5*warmup + 2*duration + 60*time.Second
+}
+
+// countProcessFDs returns the count of open file descriptors in the
+// runner process by reading /proc/self/fd. Returns 0 on platforms
+// without procfs (macOS dev runs) — leak detection is meaningful only
+// on the linux benchmark hosts where /proc is canonical.
+func countProcessFDs() int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return 0
+	}
+	return len(entries)
+}
+
+// zeroReqDiag captures a one-line snapshot of process resources useful
+// for diagnosing 0-request failures that only surface deep into a
+// long-running matrix. Goroutine count exposes worker leaks; open-FD
+// count exposes socket/listener leaks; ephemeral-port count exposes
+// TCP TIME_WAIT pool exhaustion.
+func zeroReqDiag() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "goroutines=%d", runtime.NumGoroutine())
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(&b, " heap_inuse=%d sys=%d", ms.HeapInuse, ms.Sys)
+
+	if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
+		fmt.Fprintf(&b, " open_fds=%d", len(entries))
+	}
+	// Loopback ephemeral port pressure: count TIME_WAIT lines in
+	// /proc/net/tcp{,6}. Cheap parse — we only need the count.
+	tw := 0
+	for _, p := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		if blob, err := os.ReadFile(p); err == nil {
+			for _, line := range strings.Split(string(blob), "\n") {
+				fields := strings.Fields(line)
+				// fields[3] is the state column; 06 = TCP_TIME_WAIT
+				if len(fields) >= 4 && fields[3] == "06" {
+					tw++
+				}
+			}
+		}
+	}
+	fmt.Fprintf(&b, " time_wait=%d", tw)
+	// Per-process limit + current usage from /proc/self/limits, picked
+	// out for "Max open files" only.
+	if blob, err := os.ReadFile("/proc/self/limits"); err == nil {
+		for _, line := range strings.Split(string(blob), "\n") {
+			if strings.HasPrefix(line, "Max open files") {
+				fmt.Fprintf(&b, " %s", strings.Join(strings.Fields(line), "_"))
+				break
+			}
+		}
+	}
+	return b.String()
 }
 
 // filterCells returns the subset of scenarios and servers selected by

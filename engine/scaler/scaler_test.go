@@ -188,9 +188,42 @@ func (s *fakeSource) numActive() int {
 	return n
 }
 
+// runAsync starts Run in a goroutine and returns a stop func plus a
+// Done chan so callers can poll the source state without depending on
+// the run-loop's wall-clock progress. Older versions of these tests
+// used a fixed-duration ctx and asserted at the end; under -race or
+// on slow CPUs the time.Ticker can fire fewer than expected times in
+// a 200ms window, leading to flakes (msa2-client hit "got 7" once).
+func runAsync(t *testing.T, src *fakeSource, cfg Config) (stop func(), done <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	d := make(chan struct{})
+	go func() {
+		defer close(d)
+		Run(ctx, src, cfg)
+	}()
+	return cancel, d
+}
+
+// waitForActive polls src.numActive() until it matches want or
+// timeout elapses. Returns true on success. Takes the place of a
+// fixed-time sleep in scaler tests.
+func waitForActive(t *testing.T, src *fakeSource, want int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if src.numActive() == want {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Errorf("numActive: waited %v for %d, last=%d", timeout, want, src.numActive())
+	return false
+}
+
 // TestRun_StartHighScalesDownOnIdle verifies the start-high default
 // behaviour: starts at NumWorkers active, scales down to a floor of
-// MinActive when load is low. Uses a tight Interval to keep the test fast.
+// MinActive when load is low.
 //
 // Floor: with ScaleDownHysteresis=0 the floor IS MinActive. With
 // hysteresis>0 the floor is MinActive+hysteresis to prevent flapping
@@ -206,13 +239,10 @@ func TestRun_StartHighScalesDownOnIdle(t *testing.T) {
 		ScaleUpStep: 2, ScaleDownStep: 1,
 		ScaleDownHysteresis: 0, ScaleDownIdleTicks: 2,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	Run(ctx, src, cfg)
-
-	if got := src.numActive(); got != 2 {
-		t.Errorf("expected scale-down to MinActive=2 with hyst=0, got %d active", got)
-	}
+	stop, done := runAsync(t, src, cfg)
+	waitForActive(t, src, 2, 2*time.Second)
+	stop()
+	<-done
 }
 
 // TestRun_HysteresisFloorPreservedAboveMinActive verifies that with the
@@ -229,14 +259,11 @@ func TestRun_HysteresisFloorPreservedAboveMinActive(t *testing.T) {
 		ScaleUpStep: 2, ScaleDownStep: 1,
 		ScaleDownHysteresis: 1, ScaleDownIdleTicks: 2,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	Run(ctx, src, cfg)
-
+	stop, done := runAsync(t, src, cfg)
 	// Floor is MinActive + hyst = 3.
-	if got := src.numActive(); got != 3 {
-		t.Errorf("expected scale-down floor at MinActive+hyst=3, got %d active", got)
-	}
+	waitForActive(t, src, 3, 2*time.Second)
+	stop()
+	<-done
 }
 
 // TestRun_StartLowScalesUpOnLoad verifies the start-low path: starts at
@@ -252,13 +279,10 @@ func TestRun_StartLowScalesUpOnLoad(t *testing.T) {
 	}
 	// Set conns so desired = ceil(160/20) = 8 (full pool).
 	src.setConns(160)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	Run(ctx, src, cfg)
-
-	if got := src.numActive(); got != 8 {
-		t.Errorf("expected scale-up to NumWorkers=8, got %d active", got)
-	}
+	stop, done := runAsync(t, src, cfg)
+	waitForActive(t, src, 8, 2*time.Second)
+	stop()
+	<-done
 }
 
 // TestRun_GenerationChangeRebaselines verifies that incrementing

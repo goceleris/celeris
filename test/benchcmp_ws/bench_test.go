@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,3 +166,111 @@ func BenchmarkWSEchoLarge_RawGorilla(b *testing.B) {
 		conn.ReadMessage()
 	}
 }
+
+// startCelerisHubWS spins up a celeris server whose WebSocket handler
+// registers each connection with the supplied Hub. Returns the URL and
+// a teardown.
+func startCelerisHubWS(b *testing.B, hub *celerisws.Hub) (string, func()) {
+	return startCelerisWS(b, func(c *celerisws.Conn) {
+		unreg := hub.Register(c)
+		defer unreg()
+		<-c.Context().Done()
+	})
+}
+
+// startRawGorillaHubWS spins up the gorilla equivalent: a hand-rolled
+// connection set + RWMutex broadcast loop, the pattern the celeris Hub
+// is designed to replace.
+type gorillaHub struct {
+	mu    sync.RWMutex
+	conns map[*gorillaws.Conn]struct{}
+}
+
+func (h *gorillaHub) register(c *gorillaws.Conn)   { h.mu.Lock(); h.conns[c] = struct{}{}; h.mu.Unlock() }
+func (h *gorillaHub) unregister(c *gorillaws.Conn) { h.mu.Lock(); delete(h.conns, c); h.mu.Unlock() }
+func (h *gorillaHub) broadcast(msg []byte) (int, error) {
+	h.mu.RLock()
+	conns := make([]*gorillaws.Conn, 0, len(h.conns))
+	for c := range h.conns {
+		conns = append(conns, c)
+	}
+	h.mu.RUnlock()
+	delivered := 0
+	for _, c := range conns {
+		if err := c.WriteMessage(gorillaws.TextMessage, msg); err == nil {
+			delivered++
+		}
+	}
+	return delivered, nil
+}
+
+func startGorillaHubServer(b *testing.B, hub *gorillaHub) (string, func()) {
+	return startRawWS(b, func(c *gorillaws.Conn) {
+		hub.register(c)
+		defer hub.unregister(c)
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+}
+
+func benchmarkHubBroadcast_Celeris(b *testing.B, n int) {
+	hub := celerisws.NewHub(celerisws.HubConfig{})
+	defer hub.Close()
+	url, shutdown := startCelerisHubWS(b, hub)
+	defer shutdown()
+	conns := make([]*gorillaws.Conn, n)
+	for i := range conns {
+		conns[i] = dial(b, url)
+	}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+	for hub.Len() != n {
+		time.Sleep(time.Millisecond)
+	}
+	pm, _ := celerisws.NewPreparedMessage(celerisws.OpText, []byte("payload"))
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = hub.BroadcastPrepared(pm)
+	}
+}
+
+func benchmarkHubBroadcast_GorillaHandRolled(b *testing.B, n int) {
+	hub := &gorillaHub{conns: make(map[*gorillaws.Conn]struct{})}
+	url, shutdown := startGorillaHubServer(b, hub)
+	defer shutdown()
+	conns := make([]*gorillaws.Conn, n)
+	for i := range conns {
+		conns[i] = dial(b, url)
+	}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		hub.mu.RLock()
+		l := len(hub.conns)
+		hub.mu.RUnlock()
+		if l == n {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	payload := []byte("payload")
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = hub.broadcast(payload)
+	}
+}
+
+func BenchmarkHubBroadcast100_Celeris(b *testing.B)         { benchmarkHubBroadcast_Celeris(b, 100) }
+func BenchmarkHubBroadcast100_GorillaHandRolled(b *testing.B) { benchmarkHubBroadcast_GorillaHandRolled(b, 100) }

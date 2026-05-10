@@ -13,7 +13,7 @@ Thank you for your interest in contributing to celeris!
 
 ### Prerequisites
 
-- Go 1.26+
+- Go 1.26.3+ (1.26.3 absorbs stdlib CVEs surfaced by govulncheck on 1.26.2: GO-2026-4971 in `net`, GO-2026-4918 in `net/http`)
 - [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@latest`
 - Linux (for io_uring/epoll engine tests) or macOS (std engine only)
 - [golangci-lint](https://golangci-lint.run/) v2.9+
@@ -28,6 +28,22 @@ mage test      # Run tests with race detection
 mage spec      # Run h2spec + h1spec compliance tests
 mage fuzz      # Run fuzz tests (30s default, set FUZZ_TIME to override)
 mage check     # Run all checks: lint + test + spec + build
+```
+
+### Cluster benchmarking
+
+For testing under realistic multi-host load (race detector + 1024-conn
+scenarios) the `mage cluster*` targets orchestrate the bench cluster
+via ansible. Every cluster install is manifest-tracked and torn down
+on completion — no host-side state survives.
+
+```bash
+mage clusterStatus                 # SSH health + disk/mem snapshot for all 3 nodes
+mage clusterDeploy                 # cross-compile + push runners
+mage clusterDistributedBench       # msa2-client → msa2-server / msr1
+mage clusterGoGate                 # stage Go toolchain + run a mage target
+mage matrixBenchStrict             # full perfmatrix under -race + checkptr
+PERFMATRIX_SERVICES=none mage matrixBenchStrict  # for hosts without Docker
 ```
 
 ### Sub-Module Testing

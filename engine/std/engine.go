@@ -15,7 +15,7 @@ import (
 	"github.com/goceleris/celeris/resource"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck // SA1019: h2c is deprecated in favour of http.Server.Protocols, which is only available on Go 1.27+. We pin Go 1.26.3 (see go.mod), so we keep h2c.NewHandler until the toolchain upgrade.
 )
 
 // Engine wraps net/http.Server to implement the engine.Engine interface.
@@ -55,7 +55,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			MaxReadFrameSize:     cfg.MaxFrameSize,
 		}
-		httpHandler = h2c.NewHandler(bridge, h2s)
+		httpHandler = h2c.NewHandler(bridge, h2s) //nolint:staticcheck // SA1019: h2c.NewHandler is deprecated in favour of http.Server.Protocols (Go 1.27+); we still target Go 1.26.3.
 	}
 
 	e.server = &http.Server{

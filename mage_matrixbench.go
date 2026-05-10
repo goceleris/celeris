@@ -116,6 +116,23 @@ func MatrixBenchProfile() error {
 // run completes without aborting, the subsequent performance
 // matrix can be trusted to measure real numbers, not to be
 // hunting bugs in the background.
+// MatrixBenchStrict runs the perfmatrix runner with the race detector
+// and checkptr enabled — the release-gate matrix that catches data races,
+// pointer-arithmetic bugs, and similar runtime issues across every
+// (server × scenario × config) cell.
+//
+// Knobs (env, all optional):
+//
+//	PERFMATRIX_RUNS         repeats per cell (default 3)
+//	PERFMATRIX_DURATION     measured duration per run  (default 5s)
+//	PERFMATRIX_WARMUP       warmup before each measured run (default 1s)
+//	PERFMATRIX_CELLS        explicit cell glob (overrides defaults)
+//	PERFMATRIX_SERVICES     "local" (Docker-backed; default) or "none"
+//	                         (no Docker; auto-excludes driver-*/* cells)
+//
+// On Docker-less hosts (the cluster bench targets via ClusterGoGate)
+// pass PERFMATRIX_SERVICES=none. The runner skips driver-backed cells
+// and the strict matrix focuses on engine + protocol correctness.
 func MatrixBenchStrict() error {
 	runs, _ := strconv.Atoi(envOrDefault("PERFMATRIX_RUNS", "3"))
 	durStr := envOrDefault("PERFMATRIX_DURATION", "5s")
@@ -132,21 +149,31 @@ func MatrixBenchStrict() error {
 	// servers: celeris-std, stdhttp, chi, echo, gin, iris. fasthttp /
 	// fiber / hertz do not use x/net/http2 and stay included.
 	// Override via PERFMATRIX_CELLS to force-include.
-	cells := envOrDefault("PERFMATRIX_CELLS",
-		"*,"+
-			"!*/celeris-std-auto*,!*/celeris-std-h2c*,"+
-			"!*/stdhttp-auto,!*/stdhttp-h2c,"+
-			"!*/chi-auto,!*/chi-h2c,"+
-			"!*/echo-auto,!*/echo-h2c,"+
-			"!*/gin-auto,!*/gin-h2c,"+
-			"!*/iris-auto,!*/iris-h2c")
+	services := envOrDefault("PERFMATRIX_SERVICES", "local")
+	defaultExcludes := "!*/celeris-std-auto*,!*/celeris-std-h2c*," +
+		"!*/stdhttp-auto,!*/stdhttp-h2c," +
+		"!*/chi-auto,!*/chi-h2c," +
+		"!*/echo-auto,!*/echo-h2c," +
+		"!*/gin-auto,!*/gin-h2c," +
+		"!*/iris-auto,!*/iris-h2c"
+	// When services=none (host has no Docker), additionally exclude
+	// driver-backed scenarios so the runner does not attempt to bench
+	// cells that would deadlock or fail-fast against missing
+	// postgres / redis / memcached. Cell IDs are <scenario>/<server>;
+	// the only backend-bound scenarios in test/perfmatrix today are
+	// driver-pg-*, driver-redis-*, driver-mc-*, driver-session-rw —
+	// all caught by the single driver-*/* glob.
+	if services == "none" {
+		defaultExcludes += ",!driver-*/*"
+	}
+	cells := envOrDefault("PERFMATRIX_CELLS", "*,"+defaultExcludes)
 	return runMatrix(matrixFlags{
 		runs:     runs,
 		duration: dur,
 		warmup:   warm,
 		cells:    cells,
 		profile:  false,
-		services: "local",
+		services: services,
 		strict:   true,
 	})
 }
@@ -285,6 +312,12 @@ func runMatrix(fl matrixFlags) error {
 	}
 	if fl.strict {
 		args = append(args, "-fail-fast")
+	}
+	// FD-trace logs per-cell open-FD count for active leak hunts.
+	// PERFMATRIX_FD_TRACE=1 forwards as -fd-trace; otherwise the
+	// runner only logs cells with non-zero FD delta (the noise floor).
+	if v := os.Getenv("PERFMATRIX_FD_TRACE"); v == "1" || v == "true" {
+		args = append(args, "-fd-trace")
 	}
 	args = append(args, fl.extraArgs...)
 

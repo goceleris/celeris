@@ -1,6 +1,6 @@
 module github.com/goceleris/celeris/middleware/protobuf
 
-go 1.26.0
+go 1.26.3
 
 require (
 	github.com/goceleris/celeris v1.4.1
@@ -8,9 +8,9 @@ require (
 )
 
 require (
-	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/net v0.54.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 )
 
 replace github.com/goceleris/celeris => ../../

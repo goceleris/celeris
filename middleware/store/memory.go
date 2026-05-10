@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -236,6 +238,62 @@ func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.D
 	}
 	s.items[key] = &memItem{value: cp, expiry: exp}
 	return true, nil
+}
+
+// Increment atomically increments the integer counter at key by 1,
+// returning the post-increment value. Implements the [Counter]
+// extension. The stored value is the decimal-string encoding of the
+// current count; this matches the wire format Redis INCR returns and
+// keeps the on-disk shape compatible across backends.
+//
+// Namespace: Increment shares the key namespace with [MemoryKV.Set] —
+// they are not separate maps. A key that holds a non-integer value
+// previously written via Set returns an error on the next Increment
+// (matching Redis "ERR value is not an integer or out of range"). A
+// Set on a key currently used as a counter overwrites the counter
+// state atomically, so the next Increment starts from the new value
+// (or errors if the new value is non-integer).
+//
+// TTL: ttl == 0 preserves any existing expiry on the key (matches
+// Redis INCR semantics, which never clears an existing TTL). ttl > 0
+// resets the expiry to now+ttl on every call — useful when the
+// counter's lifetime is bounded by recent activity (sliding window).
+// If the key did not previously exist, ttl == 0 stores the counter
+// with no expiry.
+func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		cur     int64
+		prevExp int64
+		hadKey  bool
+	)
+	if it, ok := s.items[key]; ok {
+		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
+			n, err := strconv.ParseInt(string(it.value), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("store: counter at %q has non-integer value: %w", key, err)
+			}
+			cur = n
+			prevExp = it.expiry
+			hadKey = true
+		}
+	}
+	cur++
+	encoded := strconv.AppendInt(nil, cur, 10)
+	// Match Redis INCR: ttl=0 preserves existing expiry; ttl>0 resets.
+	// When the key did not previously exist (or had expired), there is
+	// nothing to preserve and exp stays 0 (no expiry).
+	var exp int64
+	switch {
+	case ttl > 0:
+		exp = time.Now().Add(ttl).UnixNano()
+	case hadKey:
+		exp = prevExp
+	}
+	s.items[key] = &memItem{value: encoded, expiry: exp}
+	return cur, nil
 }
 
 func (m *MemoryKV) cleanup(ctx context.Context, interval time.Duration) {

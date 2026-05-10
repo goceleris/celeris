@@ -21,9 +21,28 @@ type prepareKey struct {
 	level    int
 }
 
+// ErrInvalidPreparedOpcode is returned by [NewPreparedMessage] when the
+// caller passes an opcode that cannot be safely cached for fan-out.
+//
+// Permitted opcodes are [OpText], [OpBinary], and [OpContinuation] (data
+// frames). Control opcodes ([OpClose], [OpPing], [OpPong]) are rejected
+// because RFC 6455 §5.5 requires control frames to be ≤125 bytes and
+// non-fragmented; PreparedMessage's whole purpose is to share the frame
+// across many [Conn.WritePreparedMessage] calls, but a >125-byte
+// control frame would be a per-connection protocol violation. Callers
+// who genuinely want to broadcast a control frame should use
+// [Conn.WriteControl] per-connection instead, which validates length.
+var ErrInvalidPreparedOpcode = errors.New("websocket: PreparedMessage rejects control opcodes (RFC 6455 §5.5)")
+
 // NewPreparedMessage creates a PreparedMessage from the given payload.
 // The data is copied; the caller retains ownership of the original slice.
+//
+// messageType MUST be a data opcode ([OpText] or [OpBinary]). Passing a
+// control opcode returns [ErrInvalidPreparedOpcode] — see RFC 6455 §5.5.
 func NewPreparedMessage(messageType MessageType, data []byte) (*PreparedMessage, error) {
+	if messageType.IsControl() {
+		return nil, ErrInvalidPreparedOpcode
+	}
 	pm := &PreparedMessage{
 		messageType: messageType,
 		data:        append([]byte(nil), data...),

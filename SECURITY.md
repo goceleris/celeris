@@ -2,16 +2,87 @@
 
 ## Supported Versions
 
-| Version        | Supported          |
-|----------------|--------------------|
-| >= 1.4.0       | Yes                |
-| 1.3.0 – 1.3.4  | Critical fixes only |
-| < 1.3.0        | No                 |
+| Version       | Supported |
+|---------------|-----------|
+| >= 1.4.0      | Yes       |
+| < 1.4.0       | No        |
 
-Only the latest minor release receives feature-level security patches.
-The 1.3.x line continues to receive critical fixes for vulnerabilities
-that cannot be mitigated by upgrading. Upgrade to the latest 1.4.x for
-all fixes.
+Security updates are issued only for the 1.4.x line. Earlier versions
+(1.3.x and below) no longer receive fixes, including critical ones —
+upgrade to the latest 1.4.x to remain covered.
+
+### v1.4.2 Security Improvements
+
+v1.4.2 ships SSE fan-out (`Broker` + `PreparedEvent` + `ReplayStore`),
+WebSocket fan-out (`Hub` + `PreparedMessage`), per-client SSE
+`MaxQueueDepth` + `OnSlowClient` policy, an engine-side bind retry
+on transient `EADDRINUSE`, and a Go 1.26.3 toolchain bump.
+Security-relevant changes:
+
+- **Slow-subscriber DoS posture (SSE)**: `sse.Broker.SubscriberBuffer`
+  bounds each subscriber's outbound queue; `sse.BrokerConfig.OnSlowSubscriber`
+  decides what happens when a queue fills (`Drop`, `Remove`, or `Close`).
+  Default is `Drop` — leaves the stream coherent (the next event's id
+  carries enough state for `Last-Event-ID` replay to resync). Per-client
+  `sse.Config.MaxQueueDepth` + `OnSlowClient` (`Drop`/`Close`/`Block`)
+  sit one layer below for direct `Client.Send` callers. The slow-path
+  goroutine fan-out is bounded by `SlowSubscriberConcurrency` so a
+  storm of slow callbacks cannot exhaust scheduler resources.
+
+- **Slow-conn DoS posture (WebSocket)**: `websocket.Hub` pairs the
+  same model — `OnSlowConn` defaults to `Close` (a dropped WS frame
+  would corrupt the message-boundary contract, so eviction is the
+  safer default). `MaxConcurrency` caps goroutine pressure on
+  fan-out; `Hub.Close` joins every in-flight Broadcast before tearing
+  down conns, so shutdown cannot race a still-fanning-out message.
+  **Authorization MUST happen before `Hub.Register`**: Hub broadcasts
+  go to every registered connection unfiltered. Use
+  `Hub.BroadcastFilter` with a pure predicate for per-conn ACL.
+
+- **`PreparedMessage` rejects control opcodes**: control frames are
+  bound by RFC 6455 §5.5 to ≤125 bytes and non-fragmented. The
+  cache-and-broadcast model can't honor those constraints safely, so
+  `NewPreparedMessage` returns `ErrInvalidPreparedOpcode` for
+  `OpClose` / `OpPing` / `OpPong`. Use `Conn.WriteControl` per-conn
+  for control frames.
+
+- **Replay-store memory bounds (SSE)**: `sse.NewRingBuffer(maxN)` is
+  bounded by N. `sse.NewKVReplayStore(KVReplayStoreConfig{TTL: …})`
+  is bounded by the supplied TTL — **always set TTL** to prevent
+  unbounded growth on a long-running broker. The in-memory ID index
+  is also soft-capped via `KVReplayStoreConfig.MaxIndex`. Multi-
+  instance ID monotonicity uses `store.Counter` (Redis `INCR`,
+  Postgres `RETURNING id`); when the KV doesn't implement Counter,
+  the store falls back to a per-process counter and multi-instance
+  setups will see ID collisions across instances on reconnect.
+
+- **Engine bind retry on `EADDRINUSE`**: `engine/{epoll,iouring}`
+  retry `unix.Bind` up to 9 times with exponential-jittered backoff
+  when EADDRINUSE fires on a SO_REUSEPORT-group join. The retry is
+  bounded (~½ second worst case) and does not mask a true conflict —
+  a persistent EADDRINUSE escapes the budget unchanged with the
+  full bind diagnostic attached. Non-EADDRINUSE errors short-circuit
+  immediately. The retry only smooths a documented kernel-side bind-
+  table race observed when 12+ sockets in a single process race into
+  the same SO_REUSEPORT group at startup.
+
+- **Go toolchain bump (1.26.2 → 1.26.3)**: absorbs two stdlib CVEs
+  surfaced by govulncheck on the 1.26.2 toolchain:
+  - `GO-2026-4971`: panic in `net.Dial` and `net.LookupPort` when
+    handling NUL-byte input on Windows.
+  - `GO-2026-4918`: infinite loop in `net/http/internal/http2`
+    transport on a malformed `SETTINGS_MAX_FRAME_SIZE` from a peer.
+  Both are fixed in `net@go1.26.3` / `net/http@go1.26.3`. Every
+  go.mod in the repo + the loadgen sub-module pin `go 1.26.3`; CI
+  workflows pin the same explicit patch version so a stale runner
+  cache cannot regress to 1.26.2.
+
+- **CVE-2023-44487 "HTTP/2 Rapid Reset" mitigation**: unchanged from
+  prior versions — `protocol/h2/stream/processor.go::handleRSTStream`
+  enforces a sliding 1-second window with a 100 reset/sec rate limit
+  and a 200 burst cap; exceeding it triggers GOAWAY with
+  `ENHANCE_YOUR_CALM`. The PR does not regress this path; matrix
+  spec compliance (`mage spec` / h2spec) re-validates it.
 
 ### v1.4.1 Security Improvements
 
@@ -91,82 +162,9 @@ posture is conservative:
   headers (e.g. `Upgrade: websocket, h2c`) are disqualified to prevent
   ambiguity attacks against simultaneous WebSocket / H2 negotiation.
 
-### v1.3.4 Security Improvements
+## Historical (unsupported)
 
-v1.3.4 introduces engine-integrated WebSocket/SSE plus a follow-up
-middleware audit. Security-relevant changes:
-
-- **WebSocket permessage-deflate decompression cap**: `truncWriter` was
-  rewritten to correctly reassemble the tail-4 sync-marker window when a
-  flate writer emits sub-4-byte trailing chunks (Autobahn 12.1.4-12.1.10
-  regression on v1.3.3). The decompression path now bounds output via
-  `io.LimitReader` capped by the per-connection `ReadLimit`, preventing
-  decompression-bomb DoS.
-- **WebSocket missing-Origin policy**: when `Config.CheckOrigin` is nil,
-  connections without an `Origin` header on `https://` are rejected by
-  default (CSRF mitigation for browser-origin assumptions). Non-browser
-  clients should set an explicit `CheckOrigin` to allow Origin-less
-  upgrades.
-- **SSE comment field sanitization**: `Client.SendComment` now strips
-  `\r` and `\n` from comment text, matching the treatment of `id` and
-  `event` fields. Prevents synthetic-event injection if a handler
-  forwards user-supplied text as a comment.
-- **Swagger ClientSecret removed**: `OAuth2Config.ClientSecret` was
-  rendered into served HTML in plaintext; the field is removed and the
-  documentation now requires PKCE for browser flows.
-- **basicauth HashedUsers default removed**: SHA-256 is no longer the
-  default password hash. Callers must supply `HashedUsersFunc`
-  (bcrypt/scrypt/argon2 example in package docs); the existing
-  `HashPassword` helper is retained but flagged as fast-hash for
-  deterministic identifiers, not credentials.
-- **Engine-integrated WebSocket auditability**: the `H1State` pause/
-  resume API surface (`OnError`, `PauseRecv`, `ResumeRecv`,
-  `IdleDeadlineNs`, `OnDetachClose`) is documented as the stable
-  middleware↔engine contract for long-lived connections; changes
-  require a major version bump.
-
-### v1.3.3 Security Improvements
-
-v1.3.3 includes security-hardened defaults in three new middleware packages:
-
-- **Pprof loopback-only default**: The pprof middleware restricts access to loopback IPs (127.0.0.1, ::1) by default. Exposing Go profiling data to untrusted networks reveals goroutine stacks, heap contents, and source code paths.
-- **Static path traversal protection**: The static middleware uses celeris's FileFromDir (with symlink resolution and prefix verification) for OS filesystem access. For fs.FS, paths are cleaned and .. components are rejected.
-- **Swagger path-only interception**: The swagger middleware only responds to exact path matches under its BasePath ({BasePath}/, {BasePath}/spec) and ignores all other requests. OpenAPI specs may reveal internal API structure — restrict access with upstream auth middleware or network-level controls.
-
-### v1.3.2 Security Improvements
-
-v1.3.2 includes a security fix and hardening in the new resilience middleware:
-
-- **Singleflight cross-user data leakage (fixed)**: The default deduplication key now includes `Authorization` and `Cookie` request headers. Without this, concurrent authenticated requests to the same endpoint would be coalesced, leaking one user's response (including PII, session cookies) to another user. Custom `KeyFunc` implementations must incorporate user identity for authenticated endpoints.
-- **Singleflight multi-value header replay (fixed)**: Waiter response replay now uses `SetResponseHeaders` (bulk replace) instead of a `SetHeader` loop, preserving multi-value headers like `Set-Cookie`. The previous implementation dropped all but the last value for duplicate header keys.
-- **Circuit breaker panic recording**: Handler panics are now recorded as failures in the sliding window via `defer/recover` before re-panicking. Previously, panics bypassed the circuit breaker entirely, making it blind to panic-heavy failure modes.
-- **Circuit breaker validation hardened**: `validate()` now rejects negative `CooldownPeriod`, `HalfOpenMax < 1`, `WindowSize < 10ms`, and `MinRequests < 1`. Previously only `Threshold` was validated, allowing configurations that caused division-by-zero panics or permanently stuck breakers.
-
-### v1.3.1 Security Improvements
-
-v1.3.1 includes security hardening in the new HTTP transport middleware and core:
-
-- **Scheme() trust model**: `Context.Scheme()` no longer reads `X-Forwarded-Proto` from untrusted clients. Only the proxy middleware (which validates against `TrustedProxies`) can set the scheme override. This prevents `HTTPSRedirect` bypass by direct-connect attackers.
-- **Proxy host validation**: `X-Forwarded-Host` is validated against CRLF injection, null bytes, path traversal (`/`, `\`), query injection (`?`, `#`), userinfo injection (`@`), and a 253-byte DNS length cap.
-- **Proxy IP validation**: `X-Real-IP` and custom headers (e.g., `CF-Connecting-IP`) are parsed with `netip.ParseAddr` — non-IP values are rejected.
-- **Method override target restriction**: `TargetMethods` whitelist (default: PUT, DELETE, PATCH) prevents overriding POST to arbitrary methods like CONNECT or TRACE.
-- **Negotiate q=0 exclusion**: `Accept-Encoding` entries with `q=0` are now correctly treated as "not acceptable" per RFC 9110, including wildcard exclusions (e.g., `*, br;q=0` excludes brotli).
-- **Redirect code validation**: Only valid redirect codes (301, 302, 303, 307, 308) are accepted. Non-redirect codes like 304 are rejected at init time.
-- **Compress BREACH warning**: Documentation warns about BREACH attacks when compressing HTTPS responses containing both user-controlled input and secrets.
-
-### v1.3.0 Security Improvements
-
-v1.3.0 includes hardening identified during a comprehensive 24-agent automated security review:
-
-- **CORS**: `MirrorRequestHeaders` now validates tokens against RFC 7230 tchar charset with size/count limits (prevents header injection). `AllowCredentials` with wildcard subdomain origins now panics at init.
-- **JWT**: Error classification distinguishes expired vs malformed vs invalid tokens. JWKS keys pre-fetched eagerly to eliminate first-request blocking.
-- **BasicAuth**: Case-insensitive "Basic" scheme matching per RFC 7617.
-- **KeyAuth**: `Vary` header on 401 responses for header-based lookups (cache correctness).
-- **Recovery**: Exported sentinel errors (`ErrPanic`, `ErrBrokenPipe`, `ErrPanicContextCancelled`, `ErrPanicResponseCommitted`) for programmatic error matching.
-
-### Previous Versions
-
-Versions prior to 1.3.0 contain known security gaps in CORS header mirroring, JWT error disclosure, and BasicAuth scheme parsing. Versions prior to 1.2.0 contain known vulnerabilities in the HTTP response writer, cookie handling, header sanitization, and the `Detach()` streaming mechanism. We strongly recommend upgrading immediately.
+Per-version security notes for the 1.3.x line and earlier are preserved in the git history of this file (`git log SECURITY.md`). Those releases no longer receive fixes — upgrade to the latest 1.4.x to remain covered.
 
 ## Reporting a Vulnerability
 

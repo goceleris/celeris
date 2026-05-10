@@ -34,6 +34,31 @@ func ExampleNew() {
 	// Output: WebSocket echo handler installed at /ws
 }
 
+// ExampleHub is the classic chat-room handler: every message a client
+// sends is broadcast to every other connected client. The Hub takes
+// care of registration, fan-out, slow-conn handling, and close.
+func ExampleHub() {
+	hub := websocket.NewHub(websocket.HubConfig{})
+
+	s := celeris.New(celeris.Config{})
+	s.GET("/chat", websocket.New(websocket.Config{
+		Handler: func(c *websocket.Conn) {
+			unregister := hub.Register(c)
+			defer unregister()
+			for {
+				mt, msg, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				_, _ = hub.Broadcast(mt, msg)
+			}
+		},
+	}))
+
+	fmt.Println("chat hub installed at /chat")
+	// Output: chat hub installed at /chat
+}
+
 // Use OnConnect to authenticate and OnDisconnect to release resources.
 func ExampleConfig_lifecycleHooks() {
 	cfg := websocket.Config{

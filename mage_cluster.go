@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +26,7 @@ const (
 	clusterBenchPlaybook         = "cluster-bench.yml"
 	clusterCleanupPlaybook       = "cluster-cleanup.yml"
 	clusterDistributedPlaybook   = "cluster-distributed-bench.yml"
+	clusterGoGatePlaybook        = "cluster-go-gate.yml"
 
 	// perfmatrix lives in its own Go module (test/perfmatrix/go.mod).
 	// We cd in there before building runner/server.
@@ -52,10 +55,19 @@ func ClusterStatus() error {
 
 // ClusterDeploy cross-compiles the runner binary for both archs and
 // pushes it (plus loadgen) to /tmp/celeris-bench/ on the appropriate
-// hosts. No bench is executed. Idempotent.
+// hosts. Runs ClusterCleanup first so a prior run's stale staging
+// (e.g. a SIGKILL'd ClusterGoGate that bypassed its always-block) is
+// dropped before we re-stage; otherwise leftover Go toolchain at
+// /tmp/celeris-bench/go/ would still be present for the next run.
+// Idempotent.
 func ClusterDeploy() error {
 	if err := requireAnsible(); err != nil {
 		return err
+	}
+	if err := ClusterCleanup(); err != nil {
+		// Cleanup must not block deploy on a freshly provisioned host
+		// (no manifest yet → cleanup is a no-op anyway). Log + continue.
+		fmt.Fprintf(os.Stderr, "ClusterDeploy: pre-clean warning: %v\n", err)
 	}
 	bins, err := stageBinaries()
 	if err != nil {
@@ -226,6 +238,322 @@ func ClusterDistributedBench() error {
 	return nil
 }
 
+// ClusterDistributedBenchParallel runs [ClusterDistributedBench] against
+// both bench targets (msa2-server and msr1) concurrently from a single
+// msa2-client load source. Each target gets its own subprocess and its
+// own results directory, so the two streams of bench data are easy to
+// diff post-run. Useful as the merge gate for v1.4.x release branches:
+// catches per-target regressions that single-target runs miss when the
+// regression is symmetric across the matrix.
+//
+// Honours every CLUSTER_DIST_* env knob from [ClusterDistributedBench]
+// — they apply identically to both target subprocesses. The combined
+// run fails if either target subprocess fails.
+func ClusterDistributedBenchParallel() error {
+	if err := requireAnsible(); err != nil {
+		return err
+	}
+	targets := []string{"msa2-server", "msr1"}
+	type runResult struct {
+		target string
+		err    error
+	}
+	results := make(chan runResult, len(targets))
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		wg.Add(1)
+		go func(tgt string) {
+			defer wg.Done()
+			cmd := exec.Command("mage", "ClusterDistributedBench")
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			env := append([]string{}, os.Environ()...)
+			env = append(env, "CLUSTER_DIST_TARGET="+tgt)
+			cmd.Env = env
+			results <- runResult{target: tgt, err: cmd.Run()}
+		}(target)
+	}
+	wg.Wait()
+	close(results)
+	var failed []string
+	for r := range results {
+		if r.err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", r.target, r.err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("parallel cluster distributed bench: %s", strings.Join(failed, "; "))
+	}
+	fmt.Println("\n=== Parallel cluster distributed bench complete on both targets ===")
+	return nil
+}
+
+// ClusterGoGate stages Go and the celeris source on one or more
+// cluster nodes (in parallel when multiple), runs one or more mage
+// targets there, fetches each host's log, and tears everything down.
+// Used for linux-only or port-bound gates that the dev Mac cannot run
+// locally (FullCompliance, MatrixBenchStrict).
+//
+// Pristine: every artifact lives under {{ bench_root }} on each node;
+// the always-block rm -rf's it. The playbook fails the run if anything
+// leaks into ~ on the node.
+//
+// Knobs (env):
+//
+//	CLUSTER_GO_TARGET     mage targets, space-separated  (required)
+//	CLUSTER_GO_HOSTS      comma-separated host list      (default: bench targets, msa2-server,msr1)
+//	CLUSTER_GO_HOST       legacy alias for single host
+//	CLUSTER_GO_VERSION    Go version to stage            (default: 1.26.3)
+//	CLUSTER_GO_TIMEOUT    seconds per host               (default: 28800 = 8h)
+//	CLUSTER_USE_LAN       1 → ssh to each host's lan_ip  (default: off; uses Tailscale)
+//
+// Whether docker is auto-installed on the host for the run is derived
+// from the target name: targets containing "Matrix" or "Bench" trigger
+// the install (driver-* scenarios need it); others (Fuzz, FullCompliance,
+// Spec) skip the install entirely.
+//
+// When run on more than one host the per-host gate logs land in
+// results/<ts>-go-gate-<host>/gate.log and the overall mage target
+// fails if any host fails (each is reported with its own error).
+func ClusterGoGate() error {
+	if err := requireAnsible(); err != nil {
+		return err
+	}
+	target := os.Getenv("CLUSTER_GO_TARGET")
+	if target == "" {
+		return fmt.Errorf("CLUSTER_GO_TARGET is required (e.g. \"FullCompliance\")")
+	}
+	// Resolve host list. CLUSTER_GO_HOSTS wins (comma-separated);
+	// CLUSTER_GO_HOST is the legacy single-host alias; default is the
+	// bench-target group (msa2-server, msr1) so MatrixBenchStrict and
+	// kin run on both arch'd nodes by default.
+	hostsRaw := os.Getenv("CLUSTER_GO_HOSTS")
+	if hostsRaw == "" {
+		hostsRaw = os.Getenv("CLUSTER_GO_HOST")
+	}
+	if hostsRaw == "" {
+		hostsRaw = "msa2-server,msr1"
+	}
+	var hosts []string
+	for _, h := range strings.Split(hostsRaw, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	goVer := envOrDefault("CLUSTER_GO_VERSION", "1.26.3")
+	timeoutSec := envOrDefault("CLUSTER_GO_TIMEOUT", "28800")
+
+	// gate_needs_docker auto-detects whether the target needs docker
+	// for driver-* matrix scenarios. Targets containing "Matrix" or
+	// "Bench" trigger docker install on the host. Other targets (Fuzz,
+	// FullCompliance, Spec, …) skip docker entirely, avoiding the
+	// install/purge cycle and the docker.sock chmod step.
+	needsDocker := false
+	for _, t := range strings.Fields(target) {
+		if strings.Contains(t, "Matrix") || strings.Contains(t, "Bench") {
+			needsDocker = true
+			break
+		}
+	}
+
+	// CLUSTER_USE_LAN=1 overrides the SSH target with each host's
+	// lan_ip from inventory.yml. Useful when running on the bench LAN
+	// while Tailscale auth is expired or off — long gates (multi-hour
+	// matrix runs) can outlive a Tailscale auth window. Static map
+	// matches inventory.yml; if you change a DHCP reservation, update
+	// inventory.yml AND this map.
+	lanIPs := map[string]string{
+		"msa2-server": "192.168.50.65",
+		"msa2-client": "192.168.50.195",
+		"msr1":        "192.168.50.199",
+	}
+	useLAN := os.Getenv("CLUSTER_USE_LAN") == "1"
+
+	// Shared staging dir for the multi-host run: Go tarballs (both
+	// arches) + source tarball + extras yaml live here once, are
+	// pushed N times to the N target hosts.
+	stagingDir, err := os.MkdirTemp("", "celeris-go-gate-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stagingDir)
+
+	goAmd64 := filepath.Join(stagingDir, "go.linux-amd64.tar.gz")
+	goArm64 := filepath.Join(stagingDir, "go.linux-arm64.tar.gz")
+	if err := downloadGoTarball(goVer, "amd64", goAmd64); err != nil {
+		return fmt.Errorf("download Go %s/amd64: %w", goVer, err)
+	}
+	if err := downloadGoTarball(goVer, "arm64", goArm64); err != nil {
+		return fmt.Errorf("download Go %s/arm64: %w", goVer, err)
+	}
+
+	srcTarball := filepath.Join(stagingDir, "source.tar.gz")
+	if err := buildSourceTarball(srcTarball); err != nil {
+		return fmt.Errorf("build source tarball: %w", err)
+	}
+
+	// Sub-second + pid in the timestamp so back-to-back invocations
+	// (e.g. a CI job that runs FullCompliance then MatrixBenchStrict)
+	// land in distinct results dirs even when launched within the
+	// same wall-clock second.
+	ts := fmt.Sprintf("%s-p%d", time.Now().UTC().Format("20060102-150405.000"), os.Getpid())
+
+	fmt.Printf("\n=== Cluster go-gate ===\n")
+	fmt.Printf("  hosts:          %s\n", strings.Join(hosts, ", "))
+	fmt.Printf("  mage target(s): %s\n", target)
+	fmt.Printf("  Go version:     %s\n", goVer)
+	fmt.Printf("  timeout/host:   %s s\n", timeoutSec)
+	fmt.Printf("  needs docker:   %t\n", needsDocker)
+	fmt.Printf("  use LAN IPs:    %t\n\n", useLAN)
+
+	// Forward env vars the user set locally to the remote shell. We
+	// render them as `export k=q` lines and pass the resulting string
+	// as an extra-var the playbook embeds into its shell command —
+	// simpler than a Jinja loop over a dict (--extra-vars values are
+	// always strings, so dict-shaped gate_env trips object/items errors).
+	//
+	// Forwarded prefixes: project knobs (PERFMATRIX_, FUZZ_, SOAK_,
+	// BENCHCMP_) plus the standard Go runtime tuning vars a developer
+	// would expect to influence the gate (GOFLAGS, GOEXPERIMENT,
+	// GODEBUG, GOTRACEBACK, GORACE, GOMAXPROCS).
+	var envExports strings.Builder
+	forwardPrefixes := []string{
+		"PERFMATRIX_", "FUZZ_", "SOAK_", "BENCHCMP_",
+		"GOFLAGS", "GOEXPERIMENT", "GODEBUG",
+		"GOTRACEBACK", "GORACE", "GOMAXPROCS",
+	}
+	for _, kv := range os.Environ() {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		k := kv[:eq]
+		for _, p := range forwardPrefixes {
+			if k == p || strings.HasPrefix(k, p+"_") || (strings.HasSuffix(p, "_") && strings.HasPrefix(k, p)) {
+				fmt.Fprintf(&envExports, "export %s=%s\n", k, shellQuote(kv[eq+1:]))
+				break
+			}
+		}
+	}
+
+	// Multi-line strings (the rendered exports block) do not survive a
+	// CLI --extra-vars k=v reliably — write the vars to a YAML file
+	// alongside the staging dir and pass via @path. Single-line vars
+	// stay on the CLI for clarity.
+	extrasYAML := filepath.Join(stagingDir, "extras.yml")
+	yamlF, err := os.Create(extrasYAML)
+	if err != nil {
+		return fmt.Errorf("create extras.yml: %w", err)
+	}
+	fmt.Fprintln(yamlF, "---")
+	fmt.Fprintln(yamlF, "gate_env_exports: |")
+	for _, line := range strings.Split(strings.TrimRight(envExports.String(), "\n"), "\n") {
+		fmt.Fprintln(yamlF, "  "+line)
+	}
+	yamlF.Close()
+
+	// Fan out across hosts in parallel. Each host gets its own
+	// per-host results dir + ansible-playbook subprocess; the shared
+	// staging dir holds the inputs (Go tarballs, source, extras).
+	type hostResult struct {
+		host       string
+		resultsDir string
+		err        error
+	}
+	results := make(chan hostResult, len(hosts))
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+			resultsDir, err := filepath.Abs(filepath.Join("results", ts+"-go-gate-"+host))
+			if err != nil {
+				results <- hostResult{host: host, err: err}
+				return
+			}
+			if err := os.MkdirAll(resultsDir, 0o755); err != nil {
+				results <- hostResult{host: host, err: err}
+				return
+			}
+			args := []string{
+				"-i", "inventory.yml", clusterGoGatePlaybook,
+				"--extra-vars", "gate_target_host=" + host,
+				"--extra-vars", "gate_mage_targets=" + target,
+				"--extra-vars", fmt.Sprintf("gate_needs_docker=%t", needsDocker),
+				"--extra-vars", "go_tarball_amd64=" + goAmd64,
+				"--extra-vars", "go_tarball_arm64=" + goArm64,
+				"--extra-vars", "source_tarball_local=" + srcTarball,
+				"--extra-vars", "results_local_dir=" + resultsDir,
+				"--extra-vars", "gate_timeout_seconds=" + timeoutSec,
+				"--extra-vars", "@" + extrasYAML,
+			}
+			if useLAN {
+				if ip := lanIPs[host]; ip != "" {
+					args = append(args, "--extra-vars", "ansible_host="+ip)
+				}
+			}
+			cmd := exec.Command("ansible-playbook", args...)
+			cmd.Dir = clusterAnsibleDir
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			results <- hostResult{host: host, resultsDir: resultsDir, err: cmd.Run()}
+		}(h)
+	}
+	wg.Wait()
+	close(results)
+	var failed []string
+	for r := range results {
+		if r.err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", r.host, r.err))
+			fmt.Printf("=== %s: FAILED — log %s/gate.log ===\n", r.host, r.resultsDir)
+		} else {
+			fmt.Printf("=== %s: PASSED — log %s/gate.log ===\n", r.host, r.resultsDir)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("cluster go-gate failed on %d host(s): %s", len(failed), strings.Join(failed, "; "))
+	}
+	fmt.Printf("\n=== Cluster go-gate complete on %d host(s) ===\n", len(hosts))
+	return nil
+}
+
+// shellQuote wraps s in single quotes safely for /bin/sh, so a value
+// containing spaces or shell metacharacters survives a literal `eval`
+// or `export` line. Embedded single quotes are split-and-re-escaped.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// downloadGoTarball fetches go<ver>.linux-<arch>.tar.gz from go.dev/dl
+// into dst. Skips the download if dst already exists with non-zero size
+// (handy when iterating on the playbook). arch is "amd64" or "arm64".
+func downloadGoTarball(version, arch, dst string) error {
+	if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
+		return nil
+	}
+	url := "https://go.dev/dl/go" + version + ".linux-" + arch + ".tar.gz"
+	cmd := exec.Command("curl", "-fsSL", "-o", dst, url)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// buildSourceTarball runs `git archive HEAD | gzip > dst` to capture the
+// current branch state. Tracked files only — no /vendor, no .git, no
+// local artifacts. Identical to what dependabot or the GitHub PR diff
+// observes.
+func buildSourceTarball(dst string) error {
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	gitArchive := exec.Command("git", "archive", "--format=tar.gz", "HEAD")
+	gitArchive.Stdout = out
+	gitArchive.Stderr = os.Stderr
+	return gitArchive.Run()
+}
+
 // ClusterCleanup forces the cleanup phase across all nodes. Use after a
 // failed/interrupted bench to ensure no apt packages or staging dirs
 // are left behind.
@@ -278,12 +606,15 @@ func stageBinaries() (*clusterBins, error) {
 		loadgenAmd64: filepath.Join(stagingDir, "loadgen-amd64"),
 	}
 
-	ts := time.Now().UTC().Format("20060102-150405")
+	// Time + PID suffix so two ClusterDistributedBench subprocesses
+	// kicked off within the same second from ClusterDistributedBenchParallel
+	// land in different result dirs.
+	ts := time.Now().UTC().Format("20060102-150405.000")
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	bins.resultsLocal = filepath.Join(cwd, "results", ts+"-cluster")
+	bins.resultsLocal = filepath.Join(cwd, "results", fmt.Sprintf("%s-p%d-cluster", ts, os.Getpid()))
 	if err := os.MkdirAll(bins.resultsLocal, 0o755); err != nil {
 		return nil, err
 	}
@@ -352,7 +683,7 @@ func buildLoadgenAmd64(outputPath string) error {
 	defer os.RemoveAll(tmpDir)
 
 	// Bootstrap a one-shot module that depends on loadgen.
-	gomod := "module loadgen-builder\n\ngo 1.26\n\nrequire github.com/goceleris/loadgen latest\n"
+	gomod := "module loadgen-builder\n\ngo 1.26.3\n\nrequire github.com/goceleris/loadgen latest\n"
 	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(gomod), 0o644); err != nil {
 		return err
 	}

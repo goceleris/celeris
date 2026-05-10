@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/bindiag"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
@@ -2555,13 +2556,15 @@ func createListenSocket(addr string) (int, error) {
 	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 
-	if err := unix.Bind(fd, sa); err != nil {
+	if err := bindiag.BindWithRetry(fd, sa); err != nil {
+		diag := bindiag.Format(fd, sa)
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("bind: %w", err)
+		return -1, fmt.Errorf("bind: %w [%s]", err, diag)
 	}
 	if err := unix.Listen(fd, 4096); err != nil {
+		diag := bindiag.Format(fd, sa)
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("listen: %w", err)
+		return -1, fmt.Errorf("listen: %w [%s]", err, diag)
 	}
 
 	return fd, nil

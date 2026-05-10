@@ -2,6 +2,8 @@ package sse
 
 import (
 	"context"
+	"net"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -699,5 +701,58 @@ func BenchmarkBurstEvents(b *testing.B) {
 		ctx := newDiscardContext()
 		_ = handler(ctx)
 		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// TestSSEHandlerFlushesHeadersImmediately is the regression gate for
+// the std-engine SSE header-flush bug fixed in v1.4.2. Before the fix,
+// celeris's std engine buffered response headers until the first body
+// byte; an SSE handler that followed the broker pattern (Subscribe and
+// wait for an external publish) left the HTTP client's Do() call
+// hanging indefinitely with no headers and no body.
+//
+// This test runs a real net/http client against a celeris.Std server,
+// installs an SSE handler that does NOT send any body bytes, and
+// asserts the client receives the response headers within a short
+// window. Without the unconditional sw.Flush() after WriteHeader, this
+// test would time out.
+func TestSSEHandlerFlushesHeadersImmediately(t *testing.T) {
+	srv := celeris.New(celeris.Config{Engine: celeris.Std})
+	srv.GET("/events", New(Config{
+		HeartbeatInterval: -1,
+		Handler: func(c *Client) {
+			// Intentionally no Send: simulates the broker pattern
+			// (Subscribe-and-wait). Without the header-flush fix,
+			// the client below would never see the response.
+			<-c.Context().Done()
+		},
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- srv.StartWithListener(ln) }()
+	t.Cleanup(func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		<-srvDone
+	})
+
+	url := "http://" + ln.Addr().String() + "/events"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v — header flush regressed; client hung waiting for headers", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
 	}
 }

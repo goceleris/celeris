@@ -156,6 +156,61 @@ func TestSoak() error {
 		"-v", "./middleware/websocket/...")
 }
 
+// BenchcmpSSE runs the head-to-head SSE benchmark suite at
+// test/benchcmp_sse, comparing celeris's middleware/sse Broker against
+// other Go SSE libraries (currently tmaxmax/go-sse). The directory is a
+// separate Go module so competitor deps stay isolated. Override the
+// benchmark count via BENCHCMP_COUNT (default 5) and benchtime via
+// BENCHCMP_BENCHTIME (default 3s).
+func BenchcmpSSE() error {
+	count := os.Getenv("BENCHCMP_COUNT")
+	if count == "" {
+		count = "5"
+	}
+	benchtime := os.Getenv("BENCHCMP_BENCHTIME")
+	if benchtime == "" {
+		benchtime = "3s"
+	}
+	cmd := exec.Command("go", "test",
+		"-bench", ".",
+		"-benchmem",
+		"-count", count,
+		"-benchtime", benchtime,
+		"-run", "^$",
+		"./...")
+	cmd.Dir = "test/benchcmp_sse"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return cmd.Run()
+}
+
+// BenchcmpWS runs the head-to-head WebSocket benchmark suite at
+// test/benchcmp_ws against gorilla/websocket. Same env knobs as
+// BenchcmpSSE.
+func BenchcmpWS() error {
+	count := os.Getenv("BENCHCMP_COUNT")
+	if count == "" {
+		count = "5"
+	}
+	benchtime := os.Getenv("BENCHCMP_BENCHTIME")
+	if benchtime == "" {
+		benchtime = "3s"
+	}
+	cmd := exec.Command("go", "test",
+		"-bench", ".",
+		"-benchmem",
+		"-count", count,
+		"-benchtime", benchtime,
+		"-run", "^$",
+		"./...")
+	cmd.Dir = "test/benchcmp_ws"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return cmd.Run()
+}
+
 // LintLinux runs golangci-lint for Linux cross-compilation.
 func LintLinux() error {
 	return runEnv(map[string]string{"GOOS": "linux", "GOARCH": "amd64"}, "golangci-lint", "run", "./...")

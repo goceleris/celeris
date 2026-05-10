@@ -42,7 +42,7 @@ Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uri
 go get github.com/goceleris/celeris@latest
 ```
 
-Requires **Go 1.26+**. Linux for io_uring/epoll engines; any OS for the std engine.
+Requires **Go 1.26.3+**. Linux for io_uring/epoll engines; any OS for the std engine.
 
 ## Hello World
 
@@ -131,12 +131,12 @@ All middleware is in-tree under [`middleware/`](middleware/):
 | [`secure`](middleware/secure) | Security headers (HSTS, CSP, COOP/CORP/COEP, OWASP defaults) |
 | [`session`](middleware/session) | Cookie-based sessions on the unified [`store.KV`](middleware/store) (memory / Redis / Postgres / memcached adapters) |
 | [`singleflight`](middleware/singleflight) | Request coalescing (collapse identical in-flight requests) |
-| [`sse`](middleware/sse) | Server-Sent Events with heartbeat + Last-Event-ID resumption |
+| [`sse`](middleware/sse) | Server-Sent Events: heartbeat, Last-Event-ID resumption with pluggable replay store (in-memory ring buffer or KV-backed for cross-restart durability), per-client `MaxQueueDepth` + `OnSlowClient` policy (Drop/Close/Block), and a `Broker` for fan-out to N subscribers with per-subscriber bounded queues + `OnSlowSubscriber` policy (Drop/Remove/Close) |
 | [`static`](middleware/static) | Static file serving with directory browse, ETag/Last-Modified caching |
 | [`store`](middleware/store) | Unified `KV` interface + adapters (memory LRU, Redis, Postgres, memcached) shared by session / csrf / ratelimit / cache / idempotency / jwt JWKS |
 | [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI/Scalar (CDN-loaded) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
-| [`websocket`](middleware/websocket) | RFC 6455 WebSocket with permessage-deflate + engine-integrated backpressure |
+| [`websocket`](middleware/websocket) | RFC 6455 WebSocket: permessage-deflate, engine-integrated backpressure, plus a `Hub` for fan-out broadcast to N connections (via cached `PreparedMessage` for O(1) per-message wire-encoding cost) with `OnSlowConn` policy (Drop/Remove/Close) and per-Conn filter via `BroadcastFilter` |
 
 ```go
 import (
@@ -301,7 +301,7 @@ test/           Conformance, spec compliance, integration, benchmarks
 
 ## Requirements
 
-- **Go 1.26+**
+- **Go 1.26.3+**
 - **Linux** for io_uring and epoll engines
 - **Any OS** for the std engine
 - Dependencies: `golang.org/x/sys`, `golang.org/x/net`
