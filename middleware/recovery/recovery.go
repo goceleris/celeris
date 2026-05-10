@@ -80,10 +80,10 @@ func New(config ...Config) celeris.HandlerFunc {
 					panic(r)
 				}
 
-				// validation.PanicCount is a zero-cost no-op in
+				// validation.RecordPanic is a zero-cost no-op in
 				// production builds; under -tags=validation it backs
-				// probatorium's "no panic escaped recovery" predicate.
-				validation.PanicCount.Add(1)
+				// the "no panic escaped recovery" predicate.
+				validation.RecordPanic()
 
 				panicVal := formatPanic(r)
 
