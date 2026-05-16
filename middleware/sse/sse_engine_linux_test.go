@@ -93,6 +93,15 @@ func TestSSEOnNativeEngines(t *testing.T) {
 			// repro binary that proves the fix on cluster hardware.
 			time.Sleep(500 * time.Millisecond)
 			if p := startErr.Load(); p != nil {
+				// Docker / minimal-kernel CI runners may lack io_uring
+				// support (e.g. seccomp filtering, kernel <5.1 emulation).
+				// Skip rather than fail — the test exercises a
+				// kernel-feature-gated path and the failure mode is
+				// "engine unavailable", not a celeris bug.
+				msg := (*p).Error()
+				if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
+					t.Skipf("engine unavailable on this runner: %v", *p)
+				}
 				t.Fatalf("server start: %v", *p)
 			}
 			defer func() {
@@ -110,7 +119,7 @@ func TestSSEOnNativeEngines(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 			req := "GET /events HTTP/1.1\r\n" +
 				"Host: " + addr + "\r\n" +
@@ -137,4 +146,3 @@ func TestSSEOnNativeEngines(t *testing.T) {
 		})
 	}
 }
-

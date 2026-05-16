@@ -113,6 +113,16 @@ type connState struct {
 	// deadlocked on its own re-entrant Lock attempt when the middleware
 	// emitted the 101 / SSE headers right after Detach.
 	asyncDetachUnlocked bool
+
+	// asyncDetachPending defers worker-private OnDetach mutations
+	// (detachedCount++ and eventfd allocation + EPOLL_CTL_ADD) to
+	// drainDetachQueue, which runs on the event-loop thread. In
+	// async mode the dispatch goroutine fires OnDetach and cannot
+	// safely mutate l.detachedCount (race with the event-loop's
+	// adaptiveTimeout read) or the eventFD slot (race with the event
+	// loop's epoll_wait set). The flag is set by OnDetach and
+	// cleared by drainDetachQueue once the bookkeeping runs.
+	asyncDetachPending bool
 }
 
 var connStatePool = sync.Pool{
@@ -167,6 +177,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.asyncDetachUnlocked = false
+	cs.asyncDetachPending = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

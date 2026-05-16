@@ -131,6 +131,16 @@ type connState struct {
 	// detachMu freshly through the guarded closure — no deadlock, no
 	// race with the worker's flushSend.
 	asyncDetachUnlocked bool
+
+	// asyncDetachPending is set by OnDetach in async mode to defer the
+	// worker-private bookkeeping (detachedCount++, prepareH2Poll arm)
+	// to drainDetachQueue, which runs on the worker thread. The
+	// dispatch goroutine MUST NOT mutate worker-owned state directly —
+	// w.detachedCount races with adaptiveTimeout's read on the worker
+	// thread, and the ring's SQE submission is SINGLE_ISSUER (only the
+	// worker may call GetSQE). Cleared by drainDetachQueue after the
+	// bookkeeping runs, and by releaseConnState on teardown.
+	asyncDetachPending bool
 }
 
 var connStatePool = sync.Pool{
@@ -194,6 +204,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.asyncDetachUnlocked = false
+	cs.asyncDetachPending = false
 	cs.bodyBuf = nil
 	cs.sendBody = nil
 	cs.fd = 0

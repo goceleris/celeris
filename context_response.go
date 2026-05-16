@@ -1284,11 +1284,11 @@ func (c *Context) SetWSIdleDeadline(ns int64) {
 // this before returning from the request handler:
 //
 //   - true:  return nil from the handler; the spawned goroutine writes
-//            via the engine's guarded write path and the engine flushes.
+//     via the engine's guarded write path and the engine flushes.
 //   - false: the spawned goroutine must complete before the handler
-//            returns (e.g. block on a done channel); otherwise the
-//            net/http server treats the response as finished and may
-//            close the conn underneath the still-running goroutine.
+//     returns (e.g. block on a done channel); otherwise the
+//     net/http server treats the response as finished and may
+//     close the conn underneath the still-running goroutine.
 //
 // Added in celeris v1.4.4 to fix the engine asymmetry that caused
 // goceleris/probatorium#103 to file celeris#273: SSE responses were

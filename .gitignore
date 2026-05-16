@@ -54,3 +54,5 @@ fullstack
 *.json
 benchmark_analysis.py
 .claude/scheduled_tasks.lock
+.sse_engine_test
+.ws_engine_test

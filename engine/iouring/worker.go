@@ -873,7 +873,20 @@ func (w *Worker) initProtocol(cs *connState) {
 				mu = &sync.Mutex{}
 				cs.detachMu = mu
 			}
-			w.detachedCount++
+			// Sync mode: OnDetach runs on the worker thread, so the
+			// worker-owned bookkeeping is safe to mutate here.
+			// Async mode: OnDetach runs on the per-conn dispatch
+			// goroutine — w.detachedCount races with the worker
+			// thread's adaptiveTimeout read and any ring SQE
+			// submission violates SINGLE_ISSUER. Defer both to
+			// drainDetachQueue via asyncDetachPending so the worker
+			// owns the mutation. The first guarded() write below
+			// enqueues+signals, so drainDetachQueue fires promptly.
+			if !w.async {
+				w.detachedCount++
+			} else {
+				cs.asyncDetachPending = true
+			}
 			orig := cs.writeFn
 			wakeupFD := w.h2EventFD
 			guarded := func(data []byte) {
@@ -935,7 +948,12 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 			}
 			// Ensure eventfd poll is armed so the worker wakes up.
-			if !w.h2PollArmed && w.h2EventFD >= 0 {
+			// Sync mode runs OnDetach on the worker thread, so this
+			// SQE submission is safe. Async mode defers to
+			// drainDetachQueue (worker-thread) via asyncDetachPending
+			// — see the SINGLE_ISSUER note on the asyncDetachPending
+			// field.
+			if !w.async && !w.h2PollArmed && w.h2EventFD >= 0 {
 				w.prepareH2Poll()
 				w.h2PollArmed = true
 			}
@@ -954,6 +972,24 @@ func (w *Worker) initProtocol(cs *connState) {
 			if w.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
+			}
+			// Async mode: enqueue cs so drainDetachQueue picks up the
+			// deferred bookkeeping (asyncDetachPending). The first
+			// guarded() write will also enqueue+signal, but the
+			// explicit signal here covers the rare case where the
+			// middleware returns without writing (e.g. a 4xx Detach
+			// rejection path). Idempotent — drainDetachQueue
+			// clears asyncDetachPending after running it.
+			if w.async {
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
+				w.detachQMu.Unlock()
+				if wakeupFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(wakeupFD, val[:])
+				}
 			}
 		}
 		if !cs.fixedFile {
@@ -2232,6 +2268,21 @@ func (w *Worker) drainDetachQueue() {
 			w.h2Conns = append(w.h2Conns, cs.fd)
 			w.markDirty(cs)
 			continue
+		}
+		// Async-mode Detach finalisation: OnDetach ran on the
+		// dispatch goroutine and cannot touch worker-owned state
+		// (w.detachedCount or the ring). It set asyncDetachPending
+		// and enqueued cs so we land here on the worker thread and
+		// run those mutations safely. Idempotent — the flag is
+		// cleared before the bookkeeping so a second drainDetachQueue
+		// pass (from the same enqueue burst) is a no-op.
+		if cs.asyncDetachPending {
+			cs.asyncDetachPending = false
+			w.detachedCount++
+			if !w.h2PollArmed && w.h2EventFD >= 0 {
+				w.prepareH2Poll()
+				w.h2PollArmed = true
+			}
 		}
 		// Apply pending pause/resume request from the WS middleware.
 		// Pause: cancel any in-flight RECV (multishot or single-shot)

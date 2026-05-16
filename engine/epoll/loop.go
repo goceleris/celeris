@@ -917,7 +917,17 @@ func (l *Loop) initProtocol(cs *connState) {
 				mu = &sync.Mutex{}
 				cs.detachMu = mu
 			}
-			l.detachedCount++
+			// Sync mode runs OnDetach on the event-loop thread, so
+			// the worker-owned bookkeeping is safe inline. Async
+			// mode defers to drainDetachQueue via asyncDetachPending
+			// — l.detachedCount races with adaptiveTimeout's read on
+			// the event-loop thread, and the eventfd allocation +
+			// EPOLL_CTL_ADD touches the loop's epoll set.
+			if !l.async {
+				l.detachedCount++
+			} else {
+				cs.asyncDetachPending = true
+			}
 			orig := cs.writeFn
 			guarded := func(data []byte) {
 				mu.Lock()
@@ -976,8 +986,11 @@ func (l *Loop) initProtocol(cs *connState) {
 					_, _ = unix.Write(l.eventFD, val[:])
 				}
 			}
-			// Ensure eventfd is available for wakeup.
-			if l.eventFD < 0 {
+			// Ensure eventfd is available for wakeup. Sync mode is
+			// safe to mutate l.eventFD inline (event-loop thread).
+			// Async mode defers to drainDetachQueue (worker thread)
+			// via asyncDetachPending — see the field's comment.
+			if !l.async && l.eventFD < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 				if err == nil {
 					l.eventFD = efd
@@ -1000,6 +1013,22 @@ func (l *Loop) initProtocol(cs *connState) {
 			if l.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
+			}
+			// Async mode: enqueue cs so drainDetachQueue picks up the
+			// deferred bookkeeping (asyncDetachPending). The first
+			// guarded() write will also enqueue+signal, but the
+			// explicit signal here covers the rare case where the
+			// middleware returns without writing.
+			if l.async {
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
 			}
 		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
@@ -1342,6 +1371,27 @@ func (l *Loop) drainDetachQueue() {
 			l.h2Conns = append(l.h2Conns, cs.fd)
 			l.markDirty(cs)
 			continue
+		}
+		// Async-mode Detach finalisation: OnDetach ran on the
+		// dispatch goroutine and cannot touch event-loop-owned state
+		// (l.detachedCount or l.eventFD). It set asyncDetachPending
+		// and enqueued cs so we land here on the event-loop thread
+		// and run those mutations safely. Idempotent — the flag is
+		// cleared before the bookkeeping so a second drainDetachQueue
+		// pass (from the same enqueue burst) is a no-op.
+		if cs.asyncDetachPending {
+			cs.asyncDetachPending = false
+			l.detachedCount++
+			if l.eventFD < 0 {
+				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+				if err == nil {
+					l.eventFD = efd
+					_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+						Events: unix.EPOLLIN | unix.EPOLLET,
+						Fd:     int32(efd),
+					})
+				}
+			}
 		}
 		// Apply any pending pause/resume request from the WS middleware.
 		// EPOLL_CTL_MOD with Events=0 stops EPOLLIN delivery; restoring
