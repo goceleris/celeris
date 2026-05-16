@@ -102,6 +102,27 @@ type connState struct {
 	// l.h2Conns — the only worker-thread-owned piece) and keep the conn
 	// alive instead of closing it.
 	asyncH2Promoted atomic.Bool
+
+	// asyncDetachUnlocked is set by OnDetach when it releases detachMu
+	// on behalf of the dispatch goroutine. runAsyncHandler observes it
+	// after ProcessH1 returns and skips the symmetric final Unlock
+	// (otherwise it would unlock an already-released mutex). Cleared by
+	// releaseConnState. See engine/iouring/conn.go for the full rationale
+	// (celeris#273) — pre-fix, /ws and /events would TIMEOUT on
+	// iouring+async or epoll+async because the dispatch goroutine
+	// deadlocked on its own re-entrant Lock attempt when the middleware
+	// emitted the 101 / SSE headers right after Detach.
+	asyncDetachUnlocked bool
+
+	// asyncDetachPending defers worker-private OnDetach mutations
+	// (detachedCount++ and eventfd allocation + EPOLL_CTL_ADD) to
+	// drainDetachQueue, which runs on the event-loop thread. In
+	// async mode the dispatch goroutine fires OnDetach and cannot
+	// safely mutate l.detachedCount (race with the event-loop's
+	// adaptiveTimeout read) or the eventFD slot (race with the event
+	// loop's epoll_wait set). The flag is set by OnDetach and
+	// cleared by drainDetachQueue once the bookkeeping runs.
+	asyncDetachPending bool
 }
 
 var connStatePool = sync.Pool{
@@ -155,6 +176,8 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.asyncDetachUnlocked = false
+	cs.asyncDetachPending = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

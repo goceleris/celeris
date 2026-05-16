@@ -873,7 +873,20 @@ func (w *Worker) initProtocol(cs *connState) {
 				mu = &sync.Mutex{}
 				cs.detachMu = mu
 			}
-			w.detachedCount++
+			// Sync mode: OnDetach runs on the worker thread, so the
+			// worker-owned bookkeeping is safe to mutate here.
+			// Async mode: OnDetach runs on the per-conn dispatch
+			// goroutine — w.detachedCount races with the worker
+			// thread's adaptiveTimeout read and any ring SQE
+			// submission violates SINGLE_ISSUER. Defer both to
+			// drainDetachQueue via asyncDetachPending so the worker
+			// owns the mutation. The first guarded() write below
+			// enqueues+signals, so drainDetachQueue fires promptly.
+			if !w.async {
+				w.detachedCount++
+			} else {
+				cs.asyncDetachPending = true
+			}
 			orig := cs.writeFn
 			wakeupFD := w.h2EventFD
 			guarded := func(data []byte) {
@@ -935,9 +948,48 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 			}
 			// Ensure eventfd poll is armed so the worker wakes up.
-			if !w.h2PollArmed && w.h2EventFD >= 0 {
+			// Sync mode runs OnDetach on the worker thread, so this
+			// SQE submission is safe. Async mode defers to
+			// drainDetachQueue (worker-thread) via asyncDetachPending
+			// — see the SINGLE_ISSUER note on the asyncDetachPending
+			// field.
+			if !w.async && !w.h2PollArmed && w.h2EventFD >= 0 {
 				w.prepareH2Poll()
 				w.h2PollArmed = true
+			}
+			// Async mode (HTTP1): the dispatch goroutine took detachMu
+			// around ProcessH1 so writeBuf access serialises with the
+			// worker's flushSend. Now that we've installed `guarded`
+			// (which re-acquires detachMu on every call), keeping the
+			// lock held would deadlock the very next write — including
+			// the middleware-emitted 101 / SSE headers that immediately
+			// follow Detach. Release the lock here and have the
+			// dispatch goroutine observe asyncDetachUnlocked to skip
+			// its symmetric Unlock when ProcessH1 returns. This is
+			// celeris#273 — pre-fix, /ws and /events would TIMEOUT on
+			// iouring + AsyncHandlers because the dispatch goroutine
+			// was deadlocked on its own re-entrant Lock attempt.
+			if w.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+				cs.asyncDetachUnlocked = true
+				cs.detachMu.Unlock()
+			}
+			// Async mode: enqueue cs so drainDetachQueue picks up the
+			// deferred bookkeeping (asyncDetachPending). The first
+			// guarded() write will also enqueue+signal, but the
+			// explicit signal here covers the rare case where the
+			// middleware returns without writing (e.g. a 4xx Detach
+			// rejection path). Idempotent — drainDetachQueue
+			// clears asyncDetachPending after running it.
+			if w.async {
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
+				w.detachQMu.Unlock()
+				if wakeupFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(wakeupFD, val[:])
+				}
 			}
 		}
 		if !cs.fixedFile {
@@ -1949,6 +2001,42 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			}
 			return
 		}
+		// celeris#273: a user handler may have called c.Detach() inside
+		// ProcessH1 (websocket or sse middleware). OnDetach released
+		// detachMu so subsequent guarded writeFn calls don't deadlock.
+		// The dispatch goroutine no longer owns the lock — skip the
+		// direct-write path (the bytes were already enqueued via
+		// guarded → detachQueue/eventfd, the worker will flushSend
+		// them) and skip the symmetric Unlock below.
+		if cs.asyncDetachUnlocked {
+			// ErrHijacked is a valid post-Detach return: the H1 parser
+			// considers a hijacked conn "done with the request". Treat
+			// it like nil here — the middleware now owns the conn and
+			// is responsible for its lifetime via the done() callback.
+			if processErr != nil && !errors.Is(processErr, conn.ErrHijacked) {
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				w.detachQMu.Lock()
+				w.detachQueue = append(w.detachQueue, cs)
+				w.detachQPending.Store(1)
+				w.detachQMu.Unlock()
+				if w.h2EventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(w.h2EventFD, val[:])
+				}
+				return
+			}
+			// Post-Detach: loop back to wait for more recv bytes (WS
+			// frames delivered via WSDataDelivery, or SSE conn-close
+			// detection). The handler runs in its own goroutine
+			// spawned by the middleware; this dispatch goroutine just
+			// shuttles RX bytes into ProcessH1 → WSDataDelivery.
+			continue
+		}
 		// Direct-write fast path: on the async-handler goroutine, call
 		// unix.Write(fd, writeBuf) inline instead of bouncing through
 		// the detachQueue → eventfd → worker → SEND-SQE round-trip.
@@ -2180,6 +2268,21 @@ func (w *Worker) drainDetachQueue() {
 			w.h2Conns = append(w.h2Conns, cs.fd)
 			w.markDirty(cs)
 			continue
+		}
+		// Async-mode Detach finalisation: OnDetach ran on the
+		// dispatch goroutine and cannot touch worker-owned state
+		// (w.detachedCount or the ring). It set asyncDetachPending
+		// and enqueued cs so we land here on the worker thread and
+		// run those mutations safely. Idempotent — the flag is
+		// cleared before the bookkeeping so a second drainDetachQueue
+		// pass (from the same enqueue burst) is a no-op.
+		if cs.asyncDetachPending {
+			cs.asyncDetachPending = false
+			w.detachedCount++
+			if !w.h2PollArmed && w.h2EventFD >= 0 {
+				w.prepareH2Poll()
+				w.h2PollArmed = true
+			}
 		}
 		// Apply pending pause/resume request from the WS middleware.
 		// Pause: cancel any in-flight RECV (multishot or single-shot)

@@ -222,7 +222,19 @@ func acquireContext(s *stream.Stream) *Context {
 func releaseContext(c *Context) {
 	// If the context is cached on the stream for reuse, reset but
 	// do not return to the pool. The stream owns its lifecycle.
-	cached := c.stream != nil && c.stream.CachedCtx == c
+	//
+	// Detached contexts (Server-Sent Events, WebSocket) are released
+	// from a goroutine that fires when the user-handler signals
+	// done(). At that point the engine's request-side stream cleanup
+	// may already be running (std engine: deferred Stream.Release in
+	// Bridge.ServeHTTP; iouring/epoll: closeConn → CloseH1 →
+	// stream.Release). Reading c.stream.CachedCtx here races those
+	// writers — and the caching optimisation is irrelevant for a
+	// detached context anyway because the conn is single-use SSE /
+	// long-lived WS, not pooled keep-alive H1. Always pool the
+	// Context directly in that case; see celeris#273 for the failure
+	// mode the race detector pinned.
+	cached := !c.detached && c.stream != nil && c.stream.CachedCtx == c
 	c.reset()
 	if !cached {
 		contextPool.Put(c)

@@ -917,7 +917,17 @@ func (l *Loop) initProtocol(cs *connState) {
 				mu = &sync.Mutex{}
 				cs.detachMu = mu
 			}
-			l.detachedCount++
+			// Sync mode runs OnDetach on the event-loop thread, so
+			// the worker-owned bookkeeping is safe inline. Async
+			// mode defers to drainDetachQueue via asyncDetachPending
+			// — l.detachedCount races with adaptiveTimeout's read on
+			// the event-loop thread, and the eventfd allocation +
+			// EPOLL_CTL_ADD touches the loop's epoll set.
+			if !l.async {
+				l.detachedCount++
+			} else {
+				cs.asyncDetachPending = true
+			}
 			orig := cs.writeFn
 			guarded := func(data []byte) {
 				mu.Lock()
@@ -976,8 +986,11 @@ func (l *Loop) initProtocol(cs *connState) {
 					_, _ = unix.Write(l.eventFD, val[:])
 				}
 			}
-			// Ensure eventfd is available for wakeup.
-			if l.eventFD < 0 {
+			// Ensure eventfd is available for wakeup. Sync mode is
+			// safe to mutate l.eventFD inline (event-loop thread).
+			// Async mode defers to drainDetachQueue (worker thread)
+			// via asyncDetachPending — see the field's comment.
+			if !l.async && l.eventFD < 0 {
 				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 				if err == nil {
 					l.eventFD = efd
@@ -985,6 +998,36 @@ func (l *Loop) initProtocol(cs *connState) {
 						Events: unix.EPOLLIN | unix.EPOLLET,
 						Fd:     int32(efd),
 					})
+				}
+			}
+			// Async mode (HTTP1): the dispatch goroutine took detachMu
+			// around ProcessH1 so writeBuf access serialises with the
+			// event loop's flushWrites. Now that we've installed
+			// `guarded` (which re-acquires detachMu on every call),
+			// keeping the lock held would deadlock the very next write
+			// — including the middleware-emitted 101 / SSE headers
+			// that immediately follow Detach. Release the lock here
+			// and have the dispatch goroutine observe
+			// asyncDetachUnlocked to skip its symmetric Unlock when
+			// ProcessH1 returns. See celeris#273.
+			if l.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+				cs.asyncDetachUnlocked = true
+				cs.detachMu.Unlock()
+			}
+			// Async mode: enqueue cs so drainDetachQueue picks up the
+			// deferred bookkeeping (asyncDetachPending). The first
+			// guarded() write will also enqueue+signal, but the
+			// explicit signal here covers the rare case where the
+			// middleware returns without writing.
+			if l.async {
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
 				}
 			}
 		}
@@ -1203,6 +1246,41 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			}
 			return
 		}
+		// celeris#273: a user handler may have called c.Detach() inside
+		// ProcessH1 (websocket or sse middleware). OnDetach released
+		// detachMu so subsequent guarded writeFn calls don't deadlock.
+		// The dispatch goroutine no longer owns the lock — skip the
+		// inline-flush path (the bytes were already enqueued via
+		// guarded → detachQueue/eventfd, the event loop will flush
+		// them) and skip the symmetric Unlock below.
+		if cs.asyncDetachUnlocked {
+			// ErrHijacked is a valid post-Detach return: the H1 parser
+			// considers a hijacked conn "done with the request". Treat
+			// it like nil here — the middleware now owns the conn.
+			if processErr != nil && !errors.Is(processErr, conn.ErrHijacked) {
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
+				return
+			}
+			// Post-Detach: loop back to wait for more recv bytes (WS
+			// frames delivered via WSDataDelivery, or SSE conn-close
+			// detection). The handler runs in its own goroutine
+			// spawned by the middleware; this dispatch goroutine just
+			// shuttles RX bytes into ProcessH1 → WSDataDelivery.
+			continue
+		}
 		var flushErr error
 		if processErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {
 			flushErr = flushWrites(cs)
@@ -1293,6 +1371,27 @@ func (l *Loop) drainDetachQueue() {
 			l.h2Conns = append(l.h2Conns, cs.fd)
 			l.markDirty(cs)
 			continue
+		}
+		// Async-mode Detach finalisation: OnDetach ran on the
+		// dispatch goroutine and cannot touch event-loop-owned state
+		// (l.detachedCount or l.eventFD). It set asyncDetachPending
+		// and enqueued cs so we land here on the event-loop thread
+		// and run those mutations safely. Idempotent — the flag is
+		// cleared before the bookkeeping so a second drainDetachQueue
+		// pass (from the same enqueue burst) is a no-op.
+		if cs.asyncDetachPending {
+			cs.asyncDetachPending = false
+			l.detachedCount++
+			if l.eventFD < 0 {
+				efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+				if err == nil {
+					l.eventFD = efd
+					_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, efd, &unix.EpollEvent{
+						Events: unix.EPOLLIN | unix.EPOLLET,
+						Fd:     int32(efd),
+					})
+				}
+			}
 		}
 		// Apply any pending pause/resume request from the WS middleware.
 		// EPOLL_CTL_MOD with Events=0 stops EPOLLIN delivery; restoring

@@ -113,6 +113,34 @@ type connState struct {
 	// keeps the conn alive, rather than routing it through the
 	// asyncClosed teardown.
 	asyncH2Promoted atomic.Bool
+
+	// asyncDetachUnlocked is set by OnDetach when it releases detachMu
+	// on behalf of the dispatch goroutine. runAsyncHandler observes it
+	// after ProcessH1 returns and skips the symmetric final Unlock
+	// (otherwise it would unlock an already-released mutex). Cleared by
+	// releaseConnState.
+	//
+	// Background: in async mode the dispatch goroutine takes detachMu
+	// around ProcessH1 so writeBuf access serialises with the worker's
+	// flushSend. After Detach, the engine swaps writeFn to a "guarded"
+	// closure that re-acquires detachMu — which would deadlock if the
+	// dispatch goroutine still holds it. OnDetach therefore releases
+	// the lock early, and this flag prevents runAsyncHandler from
+	// double-unlocking. Post-Detach writes (from the dispatch goroutine
+	// itself or from spawned middleware goroutines like ws/sse) acquire
+	// detachMu freshly through the guarded closure — no deadlock, no
+	// race with the worker's flushSend.
+	asyncDetachUnlocked bool
+
+	// asyncDetachPending is set by OnDetach in async mode to defer the
+	// worker-private bookkeeping (detachedCount++, prepareH2Poll arm)
+	// to drainDetachQueue, which runs on the worker thread. The
+	// dispatch goroutine MUST NOT mutate worker-owned state directly —
+	// w.detachedCount races with adaptiveTimeout's read on the worker
+	// thread, and the ring's SQE submission is SINGLE_ISSUER (only the
+	// worker may call GetSQE). Cleared by drainDetachQueue after the
+	// bookkeeping runs, and by releaseConnState on teardown.
+	asyncDetachPending bool
 }
 
 var connStatePool = sync.Pool{
@@ -175,6 +203,8 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.asyncDetachUnlocked = false
+	cs.asyncDetachPending = false
 	cs.bodyBuf = nil
 	cs.sendBody = nil
 	cs.fd = 0
