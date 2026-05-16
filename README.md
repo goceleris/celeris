@@ -1,9 +1,16 @@
 # celeris
 
 [![CI](https://github.com/goceleris/celeris/actions/workflows/ci.yml/badge.svg)](https://github.com/goceleris/celeris/actions/workflows/ci.yml)
+[![Probatorium · Nightly](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml/badge.svg?branch=main&event=schedule)](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml?query=event%3Aschedule+branch%3Amain)
+[![Probatorium · Weekend](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml/badge.svg?branch=main&event=schedule)](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml?query=event%3Aschedule+branch%3Amain)
 [![Go Reference](https://pkg.go.dev/badge/github.com/goceleris/celeris.svg)](https://pkg.go.dev/github.com/goceleris/celeris)
 [![Go Report Card](https://goreportcard.com/badge/github.com/goceleris/celeris)](https://goreportcard.com/report/github.com/goceleris/celeris)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
+> The two **Probatorium** badges above are the integration-test signal for celeris: they reflect the most recent
+> probatorium full-matrix run (refapp × engine × arch) against this repo's current `main`. Green means no HIGH-severity
+> invariant violations, no cross-engine / cross-arch divergence. Nightly = 1h budget, every day at 02:00 UTC.
+> Weekend = 24h soak, Sundays 02:00 UTC. See [goceleris/probatorium](https://github.com/goceleris/probatorium) for the harness.
 
 Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uring & epoll) designed for high-throughput infrastructure and zero-allocation microservices. It provides a familiar route-group and middleware API similar to Gin and Echo, so teams can adopt it without learning a new programming model.
 
