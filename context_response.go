@@ -1273,6 +1273,31 @@ func (c *Context) SetWSIdleDeadline(ns int64) {
 	}
 }
 
+// EngineSupportsAsyncDetach reports whether the active engine has the
+// machinery to keep the connection alive after the request handler
+// returns. True on native engines (epoll, io_uring) and on stream
+// transports that have wired an OnDetach hook; false on the std engine
+// (which closes the conn the moment the request handler returns).
+//
+// Middleware that spawns a goroutine to drive a long-lived stream
+// (Server-Sent Events, WebSocket, chunked progress) should consult
+// this before returning from the request handler:
+//
+//   - true:  return nil from the handler; the spawned goroutine writes
+//            via the engine's guarded write path and the engine flushes.
+//   - false: the spawned goroutine must complete before the handler
+//            returns (e.g. block on a done channel); otherwise the
+//            net/http server treats the response as finished and may
+//            close the conn underneath the still-running goroutine.
+//
+// Added in celeris v1.4.4 to fix the engine asymmetry that caused
+// goceleris/probatorium#103 to file celeris#273: SSE responses were
+// hanging on native engines because the middleware ran the user
+// handler inline and blocked the worker thread.
+func (c *Context) EngineSupportsAsyncDetach() bool {
+	return c != nil && c.stream != nil && c.stream.OnDetach != nil
+}
+
 // Detach removes the Context from the handler chain's lifecycle.
 // After Detach, the Context will not be released when the handler returns.
 // The caller MUST call the returned done function when finished with the Context —

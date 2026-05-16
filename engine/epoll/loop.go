@@ -987,6 +987,20 @@ func (l *Loop) initProtocol(cs *connState) {
 					})
 				}
 			}
+			// Async mode (HTTP1): the dispatch goroutine took detachMu
+			// around ProcessH1 so writeBuf access serialises with the
+			// event loop's flushWrites. Now that we've installed
+			// `guarded` (which re-acquires detachMu on every call),
+			// keeping the lock held would deadlock the very next write
+			// — including the middleware-emitted 101 / SSE headers
+			// that immediately follow Detach. Release the lock here
+			// and have the dispatch goroutine observe
+			// asyncDetachUnlocked to skip its symmetric Unlock when
+			// ProcessH1 returns. See celeris#273.
+			if l.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+				cs.asyncDetachUnlocked = true
+				cs.detachMu.Unlock()
+			}
 		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
 			return l.hijackConn(cs.fd)
@@ -1202,6 +1216,41 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 				_, _ = unix.Write(l.eventFD, val[:])
 			}
 			return
+		}
+		// celeris#273: a user handler may have called c.Detach() inside
+		// ProcessH1 (websocket or sse middleware). OnDetach released
+		// detachMu so subsequent guarded writeFn calls don't deadlock.
+		// The dispatch goroutine no longer owns the lock — skip the
+		// inline-flush path (the bytes were already enqueued via
+		// guarded → detachQueue/eventfd, the event loop will flush
+		// them) and skip the symmetric Unlock below.
+		if cs.asyncDetachUnlocked {
+			// ErrHijacked is a valid post-Detach return: the H1 parser
+			// considers a hijacked conn "done with the request". Treat
+			// it like nil here — the middleware now owns the conn.
+			if processErr != nil && !errors.Is(processErr, conn.ErrHijacked) {
+				cs.asyncClosed.Store(true)
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = cs.asyncInBuf[:0]
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				l.detachQMu.Lock()
+				l.detachQueue = append(l.detachQueue, cs)
+				l.detachQPending.Store(1)
+				l.detachQMu.Unlock()
+				if l.eventFD >= 0 {
+					var val [8]byte
+					val[0] = 1
+					_, _ = unix.Write(l.eventFD, val[:])
+				}
+				return
+			}
+			// Post-Detach: loop back to wait for more recv bytes (WS
+			// frames delivered via WSDataDelivery, or SSE conn-close
+			// detection). The handler runs in its own goroutine
+			// spawned by the middleware; this dispatch goroutine just
+			// shuttles RX bytes into ProcessH1 → WSDataDelivery.
+			continue
 		}
 		var flushErr error
 		if processErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {

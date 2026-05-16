@@ -365,155 +365,192 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		done := c.Detach()
 
-		if err := sw.WriteHeader(200, sseHeaders); err != nil {
-			cancel()
-			releaseClient(client)
-			done()
-			return err
-		}
-
+		// Engine asymmetry (celeris#273):
+		//
+		//   - native engines (epoll, io_uring): the handler runs on the
+		//     event-loop thread (sync) or the per-conn dispatch
+		//     goroutine (AsyncHandlers=true). A handler that blocks —
+		//     and every SSE handler blocks until the client disconnects
+		//     — blocks the engine from processing this conn's writes,
+		//     so the response headers and every Send sit in the engine
+		//     buffer forever. The middleware therefore spawns its own
+		//     goroutine to drive the stream and returns from the
+		//     request handler immediately, freeing the engine thread.
+		//   - std engine: the handler runs in net/http's per-request
+		//     goroutine. Returning from the request handler signals
+		//     "response complete" and net/http closes the conn. The
+		//     middleware must run the stream inline.
+		//
+		// Pre-v1.4.4 the middleware always ran inline, which manifested
+		// as the SSE row of celeris#273's repro matrix
+		// (iouring|epoll × any AsyncHandlers → TIMEOUT on /events).
 		// heartbeatDone is closed by the heartbeat goroutine on exit so the
 		// defer can wait for it before returning the Client to the pool.
 		// Without this, the goroutine could read client.closed after a
 		// future test reused the pooled Client (data race).
 		var heartbeatDone chan struct{}
 
-		defer func() {
-			// Tear-down ordering — load-bearing:
-			//
-			//   1. queueClosed.Store(true) — fast-path Send check.
-			//   2. cancel() — wakes any Send parked in
-			//      ClientPolicyBlock's select on c.ctx.Done(). MUST
-			//      precede close(c.queue): a producer that observed
-			//      queueClosed==false in the fast path can be in the
-			//      select at the moment we close the queue, and would
-			//      panic on send-to-closed-chan if ctx was not
-			//      already done. With cancel ahead of close, the
-			//      ctx.Done() arm of the select wins instead.
-			//   3. close(c.queue) — drain goroutine ranges to
-			//      completion, flushing in-queue events.
-			//   4. <-c.drainDone — join the drain.
-			//   5. client.Close() — idempotent; cancel already fired,
-			//      so this is just the sw.Close + closed=true bookkeeping.
-			if client.queue != nil {
-				client.queueClosed.Store(true)
+		// writeErr captures the first error from sw.WriteHeader /
+		// sw.Write / sw.Flush during the bootstrap (pre-handler) phase
+		// so the inline std-engine path can surface it as the request
+		// handler's return value — preserves the v1.4.3 contract that
+		// TestWriteErrorOnHeaders pins. The native-engine goroutine
+		// path returns nil from the request handler before bootstrap
+		// runs, so it discards writeErr (the engine has already
+		// committed to "this conn is detached and the stream owns it").
+		var writeErr error
+
+		runStream := func() {
+			defer func() {
+				// Tear-down ordering — load-bearing:
+				//
+				//   1. queueClosed.Store(true) — fast-path Send check.
+				//   2. cancel() — wakes any Send parked in
+				//      ClientPolicyBlock's select on c.ctx.Done(). MUST
+				//      precede close(c.queue): a producer that observed
+				//      queueClosed==false in the fast path can be in the
+				//      select at the moment we close the queue, and would
+				//      panic on send-to-closed-chan if ctx was not
+				//      already done. With cancel ahead of close, the
+				//      ctx.Done() arm of the select wins instead.
+				//   3. close(c.queue) — drain goroutine ranges to
+				//      completion, flushing in-queue events.
+				//   4. <-c.drainDone — join the drain.
+				//   5. client.Close() — idempotent; cancel already fired,
+				//      so this is just the sw.Close + closed=true bookkeeping.
+				if client.queue != nil {
+					client.queueClosed.Store(true)
+					cancel()
+					close(client.queue)
+				}
+				if client.drainDone != nil {
+					<-client.drainDone
+				}
+				_ = client.Close()
+				if heartbeatDone != nil {
+					<-heartbeatDone
+				}
+				if onDisconnect != nil {
+					onDisconnect(c, client)
+				}
+				releaseClient(client)
+				done()
+			}()
+
+			if err := sw.WriteHeader(200, sseHeaders); err != nil {
+				writeErr = err
 				cancel()
-				close(client.queue)
+				return
 			}
-			if client.drainDone != nil {
-				<-client.drainDone
-			}
-			_ = client.Close()
-			if heartbeatDone != nil {
-				<-heartbeatDone
-			}
-			if onDisconnect != nil {
-				onDisconnect(c, client)
-			}
-			releaseClient(client)
-			done()
-		}()
 
-		// Flush the SSE response headers immediately so EventSource
-		// clients can begin reading. Without this, the std engine
-		// buffers headers until the first body byte — fine for
-		// handlers that Send right away, but a deadlock for broker
-		// patterns that Subscribe and wait for the next Publish.
-		// The retry line piggybacks on the same flush when set.
-		client.mu.Lock()
-		var err error
-		if len(retryLine) > 0 {
-			_, err = sw.Write(retryLine)
-		}
-		if err == nil {
-			err = sw.Flush()
-		}
-		client.mu.Unlock()
-		if err != nil {
-			return nil
-		}
-
-		// Bind the replay store to the client BEFORE the drain goroutine
-		// starts so an event enqueued the instant the handler runs hits
-		// Append on its way to the wire.
-		client.replayStore = cfg.ReplayStore
-
-		// Replay missed events from the previous session, if any.
-		// ErrLastIDUnknown is the documented "fresh start" signal:
-		// silently fall through and let Handler decide; the user's
-		// Handler can still consult client.LastEventID() to react to
-		// the unknown cursor itself.
-		//
-		// Holding client.mu across the entire replay loop is
-		// load-bearing for Last-Event-ID monotonicity: a concurrent
-		// Send (e.g. via a Broker.Publish that fires before the
-		// handler reaches its Subscribe) would otherwise interleave
-		// a newer event mid-replay; if the client disconnects mid-
-		// replay it would record the newer event's ID and skip the
-		// still-pending replay tail on next reconnect.
-		if cfg.ReplayStore != nil && lastEventID != "" {
-			missed, err := cfg.ReplayStore.Since(ctx, lastEventID)
-			if err != nil && !errors.Is(err, ErrLastIDUnknown) {
-				return nil
-			}
+			// Flush the SSE response headers immediately so EventSource
+			// clients can begin reading. Without this, the std engine
+			// buffers headers until the first body byte — fine for
+			// handlers that Send right away, but a deadlock for broker
+			// patterns that Subscribe and wait for the next Publish.
+			// The retry line piggybacks on the same flush when set.
 			client.mu.Lock()
-			for i := range missed {
-				client.buf = formatEvent(client.buf, &missed[i])
-				_, werr := sw.Write(client.buf)
-				if werr == nil {
-					werr = sw.Flush()
-				}
-				if werr != nil {
-					client.mu.Unlock()
-					return nil
-				}
+			var err error
+			if len(retryLine) > 0 {
+				_, err = sw.Write(retryLine)
+			}
+			if err == nil {
+				err = sw.Flush()
 			}
 			client.mu.Unlock()
-		}
+			if err != nil {
+				writeErr = err
+				return
+			}
 
-		// Start per-client drain goroutine when queued-send mode is active.
-		// Stays in lockstep with the handler lifecycle: started after the
-		// retry line so the channel cannot leak events written before the
-		// client even saw the response, joined in the defer above.
-		if cfg.MaxQueueDepth > 0 {
-			client.queue = make(chan Event, cfg.MaxQueueDepth)
-			client.drainDone = make(chan struct{})
-			client.onSlowClient = cfg.OnSlowClient
-			go client.drain()
-		}
+			// Bind the replay store to the client BEFORE the drain goroutine
+			// starts so an event enqueued the instant the handler runs hits
+			// Append on its way to the wire.
+			client.replayStore = cfg.ReplayStore
 
-		// Start heartbeat goroutine.
-		if heartbeatInterval > 0 {
-			heartbeatDone = make(chan struct{})
-			go func() {
-				defer close(heartbeatDone)
-				ticker := time.NewTicker(heartbeatInterval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						client.mu.Lock()
-						if client.closed {
-							client.mu.Unlock()
-							return
-						}
-						_, err := sw.Write(heartbeatBytes)
-						if err == nil {
-							err = sw.Flush()
-						}
+			// Replay missed events from the previous session, if any.
+			// ErrLastIDUnknown is the documented "fresh start" signal:
+			// silently fall through and let Handler decide; the user's
+			// Handler can still consult client.LastEventID() to react to
+			// the unknown cursor itself.
+			//
+			// Holding client.mu across the entire replay loop is
+			// load-bearing for Last-Event-ID monotonicity: a concurrent
+			// Send (e.g. via a Broker.Publish that fires before the
+			// handler reaches its Subscribe) would otherwise interleave
+			// a newer event mid-replay; if the client disconnects mid-
+			// replay it would record the newer event's ID and skip the
+			// still-pending replay tail on next reconnect.
+			if cfg.ReplayStore != nil && lastEventID != "" {
+				missed, err := cfg.ReplayStore.Since(ctx, lastEventID)
+				if err != nil && !errors.Is(err, ErrLastIDUnknown) {
+					return
+				}
+				client.mu.Lock()
+				for i := range missed {
+					client.buf = formatEvent(client.buf, &missed[i])
+					_, werr := sw.Write(client.buf)
+					if werr == nil {
+						werr = sw.Flush()
+					}
+					if werr != nil {
 						client.mu.Unlock()
-						if err != nil {
-							cancel()
-							return
-						}
+						return
 					}
 				}
-			}()
+				client.mu.Unlock()
+			}
+
+			// Start per-client drain goroutine when queued-send mode is active.
+			// Stays in lockstep with the handler lifecycle: started after the
+			// retry line so the channel cannot leak events written before the
+			// client even saw the response, joined in the defer above.
+			if cfg.MaxQueueDepth > 0 {
+				client.queue = make(chan Event, cfg.MaxQueueDepth)
+				client.drainDone = make(chan struct{})
+				client.onSlowClient = cfg.OnSlowClient
+				go client.drain()
+			}
+
+			// Start heartbeat goroutine.
+			if heartbeatInterval > 0 {
+				heartbeatDone = make(chan struct{})
+				go func() {
+					defer close(heartbeatDone)
+					ticker := time.NewTicker(heartbeatInterval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-ticker.C:
+							client.mu.Lock()
+							if client.closed {
+								client.mu.Unlock()
+								return
+							}
+							_, err := sw.Write(heartbeatBytes)
+							if err == nil {
+								err = sw.Flush()
+							}
+							client.mu.Unlock()
+							if err != nil {
+								cancel()
+								return
+							}
+						}
+					}
+				}()
+			}
+
+			handler(client)
 		}
 
-		handler(client)
-		return nil
+		if c.EngineSupportsAsyncDetach() {
+			go runStream()
+			return nil
+		}
+		runStream()
+		return writeErr
 	}
 }
