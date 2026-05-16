@@ -1,6 +1,8 @@
 # celeris
 
 [![CI](https://github.com/goceleris/celeris/actions/workflows/ci.yml/badge.svg)](https://github.com/goceleris/celeris/actions/workflows/ci.yml)
+[![Probatorium · Nightly](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml/badge.svg?branch=main&event=schedule)](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml?query=event%3Aschedule+branch%3Amain)
+[![Probatorium · Weekend](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml/badge.svg?branch=main&event=schedule)](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml?query=event%3Aschedule+branch%3Amain)
 [![Go Reference](https://pkg.go.dev/badge/github.com/goceleris/celeris.svg)](https://pkg.go.dev/github.com/goceleris/celeris)
 [![Go Report Card](https://goreportcard.com/badge/github.com/goceleris/celeris)](https://goreportcard.com/report/github.com/goceleris/celeris)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
