@@ -6,10 +6,16 @@
 //   - For per-run scalars (RPS, errors, bytes/sec) we sort the per-run
 //     values and take the sample median + 5th/95th percentiles as the
 //     confidence bounds.
-//   - For latency percentiles we take the median of each percentile ACROSS
-//     runs (median-of-medians). Loadgen only exposes the per-run
-//     percentile summary, not the raw histogram, so the overall P99 cannot
-//     be computed exactly — median-of-P99s is the conventional workaround.
+//   - For latency percentiles we merge the V2-compressed HdrHistogram
+//     payload from each run (loadgen v1.4.4+) and read the percentiles
+//     off the merged distribution. This produces the exact fleet-wide
+//     P99 / P99.9 / P99.99 rather than the median-of-medians
+//     approximation older runs needed (loadgen ≤ v1.4.3 only emitted
+//     per-run percentile summaries).
+//   - For samples missing the Histogram payload (legacy runs, mixed-
+//     version corpora) the per-percentile median across runs is used as
+//     a fallback so a v1.4.3-format JSON still aggregates without
+//     errors.
 //
 // All statistics are stable under permutation of the input Samples slice
 // so running the same cells in a different order produces the same
@@ -23,7 +29,21 @@ import (
 	"sort"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/goceleris/loadgen"
+)
+
+// hdrLowest / hdrHighest / hdrDigits match loadgen's internal recorder
+// tuning so a fresh merge target has the same buckets the per-run
+// histograms were recorded into. Mirroring keeps the bit-for-bit
+// equivalence: ValueAtQuantile on the merged distribution returns the
+// same value loadgen's own MergedHistogram would, were the runs joined
+// in a single process. Magic numbers cited from
+// loadgen/latency.go constants.
+const (
+	hdrLowest  int64 = 1
+	hdrHighest int64 = int64(30 * time.Second)
+	hdrDigits        = 3
 )
 
 // CellResult is the per-cell collection of samples produced by the
@@ -113,11 +133,26 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 	return out
 }
 
-// medianLatency computes the per-percentile median across runs. Each run
-// contributes one value per percentile; we sort those slices independently
-// and take the median of each, yielding a "typical tail" that isn't
-// pulled by a single outlier run.
+// medianLatency computes fleet-wide latency percentiles across runs.
+//
+// loadgen v1.4.4+ ships the V2-compressed HdrHistogram payload on every
+// Result; this function decodes each run's payload, merges them, and
+// reads the percentiles off the merged distribution — the exact answer
+// (loadgen/issue #49). When every sample carries a Histogram the merged
+// percentiles supersede the per-run summary.
+//
+// When one or more samples are missing the Histogram payload (legacy
+// v1.4.3 runs, mixed-version corpora) the function falls back to the
+// per-percentile median across runs: each run contributes one value per
+// percentile, the values are sorted independently, and the median of
+// each is taken. This yields a "typical tail" that isn't pulled by a
+// single outlier run and matches the pre-v1.4.4 behaviour bit-for-bit.
 func medianLatency(samples []loadgen.Result) Percentiles {
+	if n := len(samples); n > 0 {
+		if merged := mergedHistogramPercentiles(samples); merged != nil {
+			return *merged
+		}
+	}
 	n := len(samples)
 	if n == 0 {
 		return Percentiles{}
@@ -143,6 +178,40 @@ func medianLatency(samples []loadgen.Result) Percentiles {
 		P999:  time.Duration(medianInt64(p999)),
 		P9999: time.Duration(medianInt64(p9999)),
 		Max:   time.Duration(medianInt64(maxv)),
+	}
+}
+
+// mergedHistogramPercentiles decodes the per-run HdrHistogram payloads
+// and merges them. Returns nil when any sample is missing the payload
+// or when decoding fails — the caller falls back to medianInt64 of
+// per-run summaries to preserve pre-v1.4.4 behaviour on legacy corpora.
+// Returning a half-merged distribution would silently bias the result,
+// so any error trips the fallback.
+func mergedHistogramPercentiles(samples []loadgen.Result) *Percentiles {
+	merged := hdrhistogram.New(hdrLowest, hdrHighest, hdrDigits)
+	any := false
+	for i := range samples {
+		blob := samples[i].Histogram
+		if len(blob) == 0 {
+			return nil
+		}
+		dec, err := loadgen.DecodeHistogram(blob)
+		if err != nil || dec == nil {
+			return nil
+		}
+		merged.Merge(dec)
+		any = true
+	}
+	if !any || merged.TotalCount() == 0 {
+		return nil
+	}
+	return &Percentiles{
+		P50:   time.Duration(merged.ValueAtQuantile(50)),
+		P90:   time.Duration(merged.ValueAtQuantile(90)),
+		P99:   time.Duration(merged.ValueAtQuantile(99)),
+		P999:  time.Duration(merged.ValueAtQuantile(99.9)),
+		P9999: time.Duration(merged.ValueAtQuantile(99.99)),
+		Max:   time.Duration(merged.Max()),
 	}
 }
 

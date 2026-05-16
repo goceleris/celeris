@@ -3,12 +3,13 @@ module github.com/goceleris/celeris/test/perfmatrix
 go 1.26.3
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
 	github.com/cloudwego/hertz v0.10.4
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-chi/chi/v5 v5.2.5
-	github.com/goceleris/celeris v1.4.2
-	github.com/goceleris/loadgen v1.4.3
+	github.com/goceleris/celeris v1.4.3
+	github.com/goceleris/loadgen v1.4.4
 	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/sessions v1.4.0

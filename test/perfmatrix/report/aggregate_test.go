@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/goceleris/loadgen"
 )
 
@@ -78,6 +79,76 @@ func TestAggregateLatencyMedianOfMedians(t *testing.T) {
 	}
 	if c.LatencyMedian.P9999 != 6*time.Millisecond {
 		t.Errorf("P9999 median: want 6ms, got %s", c.LatencyMedian.P9999)
+	}
+}
+
+// TestAggregateLatencyMergedHistograms verifies the v1.4.4 path: when
+// every sample carries a V2-compressed HdrHistogram payload, the
+// reported percentiles come from the merged distribution rather than
+// the median-of-medians fallback.
+//
+// Setup: three "runs" record into separate HdrHistograms and emit
+// V2-compressed payloads. Run 1 fills 1000 samples uniformly in
+// [100µs, 1ms]. Run 2 fills 1000 samples uniformly in [100µs, 2ms].
+// Run 3 fills 1000 samples uniformly in [100µs, 3ms]. The merged P99
+// over 3000 samples is approximately 2.97 ms (the top 1% spans
+// run-2 tail + most of run-3 tail). Median-of-P99s would have given
+// ~1.98 ms — much less.
+func TestAggregateLatencyMergedHistograms(t *testing.T) {
+	mk := func(maxNs int64) loadgen.Result {
+		h := hdrhistogram.New(1, int64(30*time.Second), 3)
+		for i := int64(0); i < 1000; i++ {
+			h.RecordValue(100_000 + (maxNs-100_000)*i/999)
+		}
+		blob, err := h.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		return loadgen.Result{
+			RequestsPerSec: 100,
+			Latency: loadgen.Percentiles{
+				P99: time.Duration(maxNs),
+			},
+			Histogram: blob,
+		}
+	}
+	samples := []loadgen.Result{
+		mk(int64(time.Millisecond)),
+		mk(int64(2 * time.Millisecond)),
+		mk(int64(3 * time.Millisecond)),
+	}
+	agg := Aggregate([]CellResult{{ScenarioName: "sc", ServerName: "sv", Samples: samples}})
+	c := agg[CellID("sc", "sv")]
+	// Merged P99 is in run-3's tail. Allow ±50µs for hdrhistogram
+	// bucket quantisation (3 significant digits).
+	if c.LatencyMedian.P99 < (29*time.Millisecond/10) || c.LatencyMedian.P99 > (3*time.Millisecond+100*time.Microsecond) {
+		t.Errorf("merged P99 out of expected range [2.9ms, 3.1ms]: got %s", c.LatencyMedian.P99)
+	}
+	// Sanity: max across runs is 3ms (within bucket quantisation).
+	if c.LatencyMedian.Max < (29*time.Millisecond/10) || c.LatencyMedian.Max > (3*time.Millisecond+100*time.Microsecond) {
+		t.Errorf("merged Max out of expected range [2.9ms, 3.1ms]: got %s", c.LatencyMedian.Max)
+	}
+}
+
+// TestAggregateLatencyFallbackOnMissingHistogram verifies the
+// median-of-medians fallback engages when even one sample is missing
+// the Histogram payload (mixed-version corpora, legacy v1.4.3 JSON).
+func TestAggregateLatencyFallbackOnMissingHistogram(t *testing.T) {
+	h := hdrhistogram.New(1, int64(30*time.Second), 3)
+	h.RecordValue(int64(time.Millisecond))
+	blob, _ := h.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+	samples := []loadgen.Result{
+		// Has histogram.
+		{RequestsPerSec: 100, Latency: loadgen.Percentiles{P99: 1 * time.Millisecond}, Histogram: blob},
+		// Legacy: no histogram. Forces fallback for the whole cell.
+		{RequestsPerSec: 100, Latency: loadgen.Percentiles{P99: 5 * time.Millisecond}},
+		{RequestsPerSec: 100, Latency: loadgen.Percentiles{P99: 9 * time.Millisecond}},
+	}
+	agg := Aggregate([]CellResult{{ScenarioName: "sc", ServerName: "sv", Samples: samples}})
+	c := agg[CellID("sc", "sv")]
+	// Median of {1ms, 5ms, 9ms} = 5ms.
+	if c.LatencyMedian.P99 != 5*time.Millisecond {
+		t.Errorf("fallback P99: want 5ms, got %s", c.LatencyMedian.P99)
 	}
 }
 
