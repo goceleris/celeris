@@ -24,12 +24,12 @@ import (
 // the bug for std cells.
 func TestH1ResponseAdapter_EmptyBodyContentLength(t *testing.T) {
 	cases := []struct {
-		name           string
-		status         int
-		headers        [][2]string
-		body           []byte
-		wantCL         string // "" = must NOT appear
-		wantCLAbsent   bool   // explicitly assert no Content-Length (for 1xx/204)
+		name         string
+		status       int
+		headers      [][2]string
+		body         []byte
+		wantCL       string // "" = must NOT appear
+		wantCLAbsent bool   // explicitly assert no Content-Length (for 1xx/204)
 	}{
 		{
 			name:    "301_redirect_no_body",
