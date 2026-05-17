@@ -73,11 +73,17 @@ type Config struct {
 	// sub-engine, so the iouring + epoll built-in scalers must stay quiet
 	// to avoid two scalers fighting over the same worker pool.
 	SkipBuiltinScaler bool
-	// WorkerScaling configures the dynamic worker scaler. Nil disables the
-	// scaler (default — workers stays at Resources.Workers and never adapts).
+	// WorkerScaling configures the dynamic worker scaler. As of v1.4.6
+	// (issue #281), [celeris.Config.toResourceConfig] sets this to a
+	// zero-value struct whenever the user-facing field was nil — the
+	// scaler is therefore DEFAULT-ON for any user constructing the
+	// server via celeris.New. Direct callers of resource.Config (i.e.
+	// engine tests + the resource_test suite) still see nil-as-disabled
+	// to keep the legacy contract for that low-level surface.
+	//
 	// When set, the scaler activates and deactivates workers based on
-	// observed load to keep CQE/event batching density in the sweet spot.
-	// See WorkerScalingConfig for tuning details.
+	// observed load to keep CQE/event batching density in the sweet
+	// spot. See WorkerScalingConfig for tuning details.
 	WorkerScaling *WorkerScalingConfig
 }
 

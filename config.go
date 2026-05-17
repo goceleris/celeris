@@ -155,15 +155,32 @@ type Config struct {
 	//     the engine intentionally only serves HTTP/1.
 	EnableH2Upgrade *bool
 
-	// WorkerScaling configures the dynamic worker scaler. Nil disables
-	// scaling — the engine runs Workers workers all the time (legacy
-	// behaviour). Set to a non-nil pointer (zero-value struct OK) to
-	// enable scaling with sensible defaults; see resource.WorkerScalingConfig
-	// for tuning. The scaler keeps connections-per-active-worker around
-	// the target ratio by pausing/resuming workers; this dramatically
-	// improves CQE/event batching at low/mid concurrency where the static
-	// numCPU default would otherwise lose 30-90 % CPU/req to under-batched
-	// syscalls. See PR #257 for the full rationale and benchmark data.
+	// WorkerScaling configures the dynamic worker scaler. As of v1.4.6
+	// the scaler is DEFAULT-ON — leaving this field nil resolves to a
+	// zero-value [resource.WorkerScalingConfig], which activates the
+	// scaler with the data-validated defaults (Strategy=StartHigh,
+	// MinActive=max(2, NumCPU/2), TargetConnsPerWorker=20,
+	// Interval=250ms, ScaleUpStep=2, ScaleDownStep=1,
+	// ScaleDownHysteresis=1, ScaleDownIdleTicks=4). This matches the
+	// "just-works" public design intent already in place for the
+	// Engine=Adaptive and Protocol=Auto defaults.
+	//
+	// Pre-v1.4.6 behaviour (scaler always disabled unless explicitly
+	// configured) is achievable by passing a non-nil struct that
+	// effectively makes the scaler a no-op:
+	//
+	//	WorkerScaling: &resource.WorkerScalingConfig{
+	//	    MinActive: runtime.GOMAXPROCS(0), // pin at NumCPU; never scale down
+	//	}
+	//
+	// Set to a non-nil pointer with custom values to override one or
+	// more defaults. See [resource.WorkerScalingConfig] for tuning.
+	// The scaler keeps connections-per-active-worker around the target
+	// ratio by pausing/resuming workers; this dramatically improves
+	// CQE/event batching at low/mid concurrency where the static
+	// numCPU default would otherwise lose 30-90 % CPU/req to under-
+	// batched syscalls. See PR #257 / issue #281 for the full
+	// rationale and benchmark data.
 	WorkerScaling *resource.WorkerScalingConfig
 }
 
@@ -215,7 +232,17 @@ func (c Config) toResourceConfig() resource.Config {
 	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
-	rc.WorkerScaling = c.WorkerScaling
+	// Dynamic worker scaler default-on (issue #281). A nil
+	// WorkerScaling field — i.e. the user did not configure it — now
+	// resolves to a zero-value struct so the scaler activates with
+	// the data-validated defaults. Opt-out is documented as setting
+	// MinActive=NumCPU (no-op scaler), which preserves backward
+	// compatibility for users who really do want pre-v1.4.6 behaviour.
+	if c.WorkerScaling != nil {
+		rc.WorkerScaling = c.WorkerScaling
+	} else {
+		rc.WorkerScaling = &resource.WorkerScalingConfig{}
+	}
 
 	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
 	// HTTP1/H2C → false). Non-nil → user override honored verbatim.

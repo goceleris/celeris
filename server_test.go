@@ -11,6 +11,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/resource"
 )
 
 func TestServerEngineInfo(t *testing.T) {
@@ -1011,6 +1012,43 @@ func TestConfigZeroValuesNotMapped(t *testing.T) {
 	}
 	if rc.Resources.MaxConns != 0 {
 		t.Fatalf("expected 0 MaxConns, got %d", rc.Resources.MaxConns)
+	}
+}
+
+// TestConfigWorkerScalingDefaultOn pins the v1.4.6 default-on contract
+// for issue #281: nil Config.WorkerScaling resolves to a non-nil,
+// zero-value resource.WorkerScalingConfig — the scaler activates
+// automatically with the data-validated defaults
+// (Strategy=StartHigh, MinActive=max(2,NumCPU/2),
+// TargetConnsPerWorker=20, Interval=250ms, ScaleUpStep=2,
+// ScaleDownStep=1, ScaleDownHysteresis=1, ScaleDownIdleTicks=4).
+//
+// This brings the "just-works" public design intent (Adaptive engine,
+// Auto protocol) into alignment for the third major default.
+func TestConfigWorkerScalingDefaultOn(t *testing.T) {
+	cfg := Config{Addr: ":8080"} // no WorkerScaling field set
+	rc := cfg.toResourceConfig()
+	if rc.WorkerScaling == nil {
+		t.Fatal("nil Config.WorkerScaling did not resolve to a non-nil resource.WorkerScalingConfig — scaler default-on regressed")
+	}
+	if *rc.WorkerScaling != (resource.WorkerScalingConfig{}) {
+		t.Fatalf("expected zero-value WorkerScalingConfig (so scaler picks data-validated defaults), got %+v", *rc.WorkerScaling)
+	}
+}
+
+// TestConfigWorkerScalingExplicitPreserved pins that user-supplied
+// values are passed through verbatim: the default-on path only fires
+// when the user did NOT configure the scaler.
+func TestConfigWorkerScalingExplicitPreserved(t *testing.T) {
+	want := &resource.WorkerScalingConfig{
+		Strategy:             resource.ScalingStrategyStartLow,
+		MinActive:            7,
+		TargetConnsPerWorker: 99,
+	}
+	cfg := Config{Addr: ":8080", WorkerScaling: want}
+	rc := cfg.toResourceConfig()
+	if rc.WorkerScaling != want {
+		t.Fatalf("explicit WorkerScaling pointer was not preserved: got %p, want %p", rc.WorkerScaling, want)
 	}
 }
 
