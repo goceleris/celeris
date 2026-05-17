@@ -176,6 +176,33 @@ func (a *h1ResponseAdapter) Hijack(_ *stream.Stream) (net.Conn, error) {
 
 var _ stream.Hijacker = (*h1ResponseAdapter)(nil)
 
+// mustFrameEmptyBody reports whether an HTTP/1.1 response with no body
+// requires explicit framing (Content-Length: 0 or Transfer-Encoding) on
+// a keep-alive connection.
+//
+// RFC 9110 §15 + RFC 9112 §6.2:
+//
+//   - 1xx (Informational) and 204 (No Content) MUST NOT include
+//     Content-Length, and have no body — keep-alive parsers know they
+//     finish at the trailing CRLF, no framing required.
+//   - 304 (Not Modified) — Content-Length is optional, and parsers
+//     never expect a body. We omit it for symmetry with 1xx/204.
+//   - Every other status (2xx ≠ 204, 3xx, 4xx, 5xx) with an empty body
+//     MUST advertise the absence to the keep-alive client; otherwise
+//     the client waits for body bytes forever — exactly the hang
+//     observed by the probatorium walker against iouring/epoll when
+//     it received a 301 redirect from c.Redirect / c.NoContent.
+func mustFrameEmptyBody(status int) bool {
+	switch {
+	case status >= 100 && status < 200:
+		return false
+	case status == 204, status == 304:
+		return false
+	default:
+		return true
+	}
+}
+
 func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	// Reuse per-connection buffer. This eliminates sync.Pool Get/Put
 	// per response (~40ns). The buffer grows as needed and persists
@@ -299,7 +326,7 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 			buf = append(buf, h[1]...)
 			buf = append(buf, crlf...)
 		}
-		if !hasContentLength && len(body) > 0 {
+		if !hasContentLength && (len(body) > 0 || mustFrameEmptyBody(status)) {
 			buf = append(buf, clPrefix...)
 			buf = strconv.AppendInt(buf, int64(len(body)), 10)
 			buf = append(buf, crlf...)
