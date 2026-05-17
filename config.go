@@ -53,10 +53,21 @@ type Config struct {
 	Workers int
 
 	// ReadTimeout is the max duration for reading the entire request.
-	// Zero uses the default (300s). Set to -1 for no timeout.
+	// Zero uses the default (60s). Set to -1 for no timeout.
 	ReadTimeout time.Duration
+	// ReadHeaderTimeout caps the read of just the request line + headers
+	// (separately from the request body, which ReadTimeout covers). This
+	// is the canonical slow-loris defence: clients that drip headers one
+	// byte at a time get killed in seconds instead of holding a worker
+	// + listener-backlog slot for the full ReadTimeout window. Zero uses
+	// the default (10s); -1 disables.
+	//
+	// The std engine wires this to http.Server.ReadHeaderTimeout; the
+	// iouring/epoll engines enforce the same budget inside their H1
+	// header read loop.
+	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response.
-	// Zero uses the default (300s). Set to -1 for no timeout.
+	// Zero uses the default (60s). Set to -1 for no timeout.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout.
@@ -201,6 +212,7 @@ func (c Config) toResourceConfig() resource.Config {
 		Protocol:             engine.Protocol(c.Protocol),
 		Engine:               engine.EngineType(c.Engine),
 		ReadTimeout:          c.ReadTimeout,
+		ReadHeaderTimeout:    c.ReadHeaderTimeout,
 		WriteTimeout:         c.WriteTimeout,
 		IdleTimeout:          c.IdleTimeout,
 		MaxHeaderBytes:       c.MaxHeaderBytes,

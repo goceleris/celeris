@@ -39,6 +39,22 @@ type Config struct {
 	InitialWindowSize uint32
 	// ReadTimeout is the max duration for reading the entire request.
 	ReadTimeout time.Duration
+	// ReadHeaderTimeout is the max duration for reading the request
+	// headers ONLY (status line + headers + final CRLF). Zero falls
+	// back to ReadTimeout. A short value here is the canonical defence
+	// against slowloris-style DoS: clients that dribble headers byte-
+	// by-byte get their connection killed within ReadHeaderTimeout
+	// instead of holding a goroutine + listener-backlog slot for the
+	// full ReadTimeout. The std engine wires this to
+	// http.Server.ReadHeaderTimeout. The iouring + epoll engines
+	// enforce it inside their H1 header read loop.
+	//
+	// Note: iouring/epoll's own SO_REUSEPORT-fronted multi-worker
+	// design absorbs a lot of slowloris pressure through queue
+	// scaling (16 workers × 4096 backlog ≈ 64 k slots). Std is on
+	// a single net.Listen() queue and falls over much sooner. The
+	// fix matters most for std but is sound on all engines.
+	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response.
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
@@ -305,6 +321,18 @@ func (c Config) WithDefaults() Config {
 		c.ReadTimeout = 60 * time.Second
 	case c.ReadTimeout < 0:
 		c.ReadTimeout = 0 // -1 → no timeout
+	}
+	// ReadHeaderTimeout default: 10s. Short enough to defeat slow-
+	// loris (whose canonical pattern is one byte every few hundred ms
+	// for tens of seconds), long enough that legitimate proxies +
+	// satellite clients still complete header reads. Mirrors nginx's
+	// client_header_timeout default of 60s/10s and Go's
+	// http.Server.ReadHeaderTimeout convention.
+	switch {
+	case c.ReadHeaderTimeout == 0:
+		c.ReadHeaderTimeout = 10 * time.Second
+	case c.ReadHeaderTimeout < 0:
+		c.ReadHeaderTimeout = 0 // -1 → no timeout (legacy behaviour)
 	}
 	switch {
 	case c.WriteTimeout == 0:
