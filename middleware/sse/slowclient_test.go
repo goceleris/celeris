@@ -20,10 +20,23 @@ type gatedStreamer struct {
 	closed     bool
 	writeReady chan struct{} // closed once: blocks Write until released
 	released   atomic.Bool
+
+	// writeReachedOnce is closed the first time Write is entered (before
+	// it blocks on writeReady). Tests that need to synchronize on
+	// "drain goroutine has pulled an event and is now blocked at the
+	// gate" wait on this channel — fixes a flake in
+	// TestBrokerSlowSubscriberConcurrencyCap where pub2 was enqueueing
+	// before the drain goroutine had pulled pub1, so the queue-full
+	// slow path fired on the wrong publish.
+	writeReachedOnce chan struct{}
+	writeReachedFlag atomic.Bool
 }
 
 func newGatedStreamer() *gatedStreamer {
-	return &gatedStreamer{writeReady: make(chan struct{})}
+	return &gatedStreamer{
+		writeReady:       make(chan struct{}),
+		writeReachedOnce: make(chan struct{}),
+	}
 }
 
 func (g *gatedStreamer) WriteResponse(_ *stream.Stream, _ int, _ [][2]string, _ []byte) error {
@@ -35,6 +48,9 @@ func (g *gatedStreamer) WriteHeader(_ *stream.Stream, _ int, _ [][2]string) erro
 }
 
 func (g *gatedStreamer) Write(_ *stream.Stream, data []byte) error {
+	if g.writeReachedFlag.CompareAndSwap(false, true) {
+		close(g.writeReachedOnce)
+	}
 	<-g.writeReady
 	g.mu.Lock()
 	g.chunks = append(g.chunks, append([]byte(nil), data...))
