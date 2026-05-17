@@ -131,11 +131,15 @@ func measureBrokerPublishAllocs(t *testing.T, subscribers int) float64 {
 
 // startSlowClient spins up an SSE handler whose underlying streamer is
 // gated, so writes block until the returned release() function fires.
-// Returns the *Client, a release callback, and a cleanup that drives the
-// handler to completion. Avoids sharing stop chans across roles.
-func startSlowClient(t *testing.T) (slow *Client, release func(), cleanup func()) {
+// Returns the *Client, a release callback, a cleanup that drives the
+// handler to completion, and the gated streamer (so the caller can
+// wait on `<-gate.writeReachedOnce` to synchronize on "drain has pulled
+// an event and is now blocked at the gate"). Avoids sharing stop chans
+// across roles.
+func startSlowClient(t *testing.T) (slow *Client, release func(), cleanup func(), gate *gatedStreamer) {
 	t.Helper()
-	ctx, gate := newGatedContext(t)
+	ctx, gs := newGatedContext(t)
+	gate = gs
 	ready := make(chan *Client, 1)
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -157,14 +161,14 @@ func startSlowClient(t *testing.T) (slow *Client, release func(), cleanup func()
 			return
 		}
 		released = true
-		gate.release()
+		gs.release()
 	}
 	cleanup = func() {
 		release()
 		close(stop)
 		<-done
 	}
-	return slow, release, cleanup
+	return slow, release, cleanup, gate
 }
 
 // TestBrokerSlowSubscriberDropPolicy: 1 slow client + many fast — the
@@ -180,7 +184,7 @@ func TestBrokerSlowSubscriberDropPolicy(t *testing.T) {
 	})
 	defer b.Close()
 
-	slow, releaseSlow, slowCleanup := startSlowClient(t)
+	slow, releaseSlow, slowCleanup, _ := startSlowClient(t)
 	slowUnsub := b.Subscribe(slow)
 
 	fastClients := make(chan *Client, fastN)
@@ -518,27 +522,49 @@ func TestBrokerSlowSubscriberPolicyCallbackInvoked(t *testing.T) {
 	}
 }
 
-// subscribeGatedSlow wires N gated slow subscribers to b, then publishes
-// twice so each subscriber's queue is full and the next publish hits
+// subscribeGatedSlow wires N gated slow subscribers to b, then arranges
+// for each subscriber's queue to be full so a subsequent Publish hits
 // the slow path for every one of them. Returns a teardown that releases
 // every gate and joins every handler.
+//
+// Synchronisation contract:
+//
+//  1. Publish "fill1" → enqueue into every subscriber's queue (size 1).
+//  2. Wait for each subscriber's gatedStreamer.writeReachedOnce — proof
+//     that the drain goroutine has pulled fill1 and is now blocked at
+//     the gate, so the queue is empty and the drain won't pull again.
+//  3. Publish "fill2" → enqueue (queue size 1/1, drain still blocked).
+//  4. Any subsequent Publish finds every queue full → slow path.
+//
+// Without (2), the drain may not yet have started by the time fill2 is
+// enqueued, so fill2 hits the slow path on the wrong publish and the
+// trigger publish fast-paths — causing
+// TestBrokerSlowSubscriberConcurrencyCap to see only one callback's
+// worth of elapsed time. Observed on shared CI runners.
 func subscribeGatedSlow(t *testing.T, b *Broker, n int) (teardown func()) {
 	t.Helper()
 	releases := make([]func(), 0, n)
 	cleanups := make([]func(), 0, n)
+	gates := make([]*gatedStreamer, 0, n)
 	for range n {
-		slow, release, cleanup := startSlowClient(t)
+		slow, release, cleanup, gate := startSlowClient(t)
 		b.Subscribe(slow)
 		releases = append(releases, release)
 		cleanups = append(cleanups, cleanup)
+		gates = append(gates, gate)
 	}
-	// Two publishes deterministically fill every gated subscriber's
-	// SubscriberBuffer=1 queue: drain pulls publish 1 → blocks on
-	// gated Write; publish 2 enqueues to the now-empty buffer; the
-	// next publish (trigger) finds every queue full → slow path.
-	for range 2 {
-		b.Publish(Event{Data: "fill"})
+	// Step 1: enqueue fill1 to every subscriber.
+	b.Publish(Event{Data: "fill1"})
+	// Step 2: wait for every drain goroutine to reach the gate.
+	for i, g := range gates {
+		select {
+		case <-g.writeReachedOnce:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("subscribeGatedSlow: subscriber %d drain did not reach gate within 2s", i)
+		}
 	}
+	// Step 3: enqueue fill2 — now strictly behind the blocked drain.
+	b.Publish(Event{Data: "fill2"})
 	return func() {
 		for _, r := range releases {
 			r()
