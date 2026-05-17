@@ -545,6 +545,23 @@ func (c *Context) reset() {
 	c.fullPath = ""
 	c.statusCode = 200
 	if n := len(c.respHeaders); n > 0 {
+		// respHeaders shares the respHdrBuf backing array up to its
+		// fixed capacity (16). Middleware stacks that emit more than 16
+		// response headers (kitchen_sink with secure + cache + ratelimit
+		// + etag etc. easily exceeds it) trigger append() to allocate a
+		// new backing array — respHeaders now has > 16 entries but
+		// respHdrBuf is still just 16. Without this clamp,
+		// `clear(c.respHdrBuf[:n])` panics with "slice bounds out of
+		// range [:N] with length 16" — the panic propagates through
+		// recoverAndRelease and aborts the iouring/epoll async handler
+		// AFTER WriteResponse has queued bytes into the per-conn
+		// writeBuf but BEFORE flushSend pushes them to the socket, so
+		// the client sees an empty response. std-engine escapes the
+		// damage because Go's net/http writes the response inline
+		// before the cleanup panic.
+		if n > len(c.respHdrBuf) {
+			n = len(c.respHdrBuf)
+		}
 		clear(c.respHdrBuf[:n])
 	}
 	c.respHeaders = c.respHdrBuf[:0]

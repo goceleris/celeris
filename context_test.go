@@ -3,6 +3,7 @@ package celeris
 import (
 	"context"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -199,6 +200,52 @@ func TestContextFullPath(t *testing.T) {
 	c.fullPath = "/users/:id"
 	if c.FullPath() != "/users/:id" {
 		t.Fatalf("expected /users/:id, got %q", c.FullPath())
+	}
+}
+
+// TestContextResetWithOverflowedRespHeaders locks in the overflow-safe
+// reset path. Pre-fix (probatorium nightly 25993346060 root cause) a
+// middleware stack that emitted ≥ 17 response headers (kitchen_sink:
+// recovery + requestid + secure × 8 + cors + ratelimit × 3 + etag +
+// cache + x-cache + x-request-id) caused c.reset() to slice the
+// fixed-size respHdrBuf beyond its capacity:
+//
+//	clear(c.respHdrBuf[:n])  →  panic: runtime error: slice bounds
+//	                            out of range [:17] with length 16
+//
+// On the iouring/epoll engines the panic propagated through
+// recoverAndRelease AFTER WriteResponse had queued bytes into the
+// per-conn writeBuf but BEFORE the worker's flushSend pushed those
+// bytes to the socket — the client saw zero bytes, the connection
+// stalled, the validator's walker timed out. std-engine escaped
+// the wire-visible damage because net/http writes inline.
+func TestContextResetWithOverflowedRespHeaders(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+
+	c := acquireContext(s)
+	// Push 20 headers — overflows respHdrBuf (16 slots) and forces
+	// append() to allocate a new backing array.
+	for i := 0; i < 20; i++ {
+		c.SetHeader("x-test-"+strconv.Itoa(i), "v")
+	}
+	if got := len(c.respHeaders); got != 20 {
+		t.Fatalf("expected 20 headers staged, got %d", got)
+	}
+
+	// Pre-fix this would panic with "slice bounds out of range
+	// [:20] with length 16". Recover so the test framework reports
+	// the panic clearly rather than crashing the whole process.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("reset panicked with overflowed respHeaders: %v", r)
+		}
+	}()
+	releaseContext(c)
+
+	// After release, respHeaders is reset back to respHdrBuf[:0].
+	if cap(c.respHeaders) < len(c.respHdrBuf) {
+		t.Fatalf("respHeaders capacity collapsed below respHdrBuf size: cap=%d", cap(c.respHeaders))
 	}
 }
 
