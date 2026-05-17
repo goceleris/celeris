@@ -59,13 +59,14 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	}
 
 	e.server = &http.Server{
-		Addr:           cfg.Addr,
-		Handler:        httpHandler,
-		ReadTimeout:    cfg.ReadTimeout,
-		WriteTimeout:   cfg.WriteTimeout,
-		IdleTimeout:    cfg.IdleTimeout,
-		MaxHeaderBytes: cfg.MaxHeaderBytes,
-		ConnState:      e.connStateHook,
+		Addr:              cfg.Addr,
+		Handler:           httpHandler,
+		ReadTimeout:       cfg.ReadTimeout,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
+		ConnState:         e.connStateHook,
 	}
 
 	return e, nil

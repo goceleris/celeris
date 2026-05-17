@@ -208,11 +208,35 @@ func TestWithDefaults(t *testing.T) {
 	if d.ReadTimeout != 60*time.Second {
 		t.Errorf("ReadTimeout = %v, want 1m0s", d.ReadTimeout)
 	}
+	if d.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 10s (slowloris defence)", d.ReadHeaderTimeout)
+	}
 	if d.WriteTimeout != 60*time.Second {
 		t.Errorf("WriteTimeout = %v, want 1m0s", d.WriteTimeout)
 	}
 	if d.IdleTimeout != 600*time.Second {
 		t.Errorf("IdleTimeout = %v, want 10m0s", d.IdleTimeout)
+	}
+}
+
+// TestWithDefaults_ReadHeaderTimeoutOptOut verifies the -1 sentinel
+// disables the header-read timeout (legacy slowloris-exposed
+// behaviour).
+func TestWithDefaults_ReadHeaderTimeoutOptOut(t *testing.T) {
+	c := Config{ReadHeaderTimeout: -1}
+	d := c.WithDefaults()
+	if d.ReadHeaderTimeout != 0 {
+		t.Errorf("ReadHeaderTimeout = %v, want 0 (no timeout) when caller passed -1", d.ReadHeaderTimeout)
+	}
+}
+
+// TestWithDefaults_ReadHeaderTimeoutCustom verifies caller-supplied
+// values pass through untouched.
+func TestWithDefaults_ReadHeaderTimeoutCustom(t *testing.T) {
+	c := Config{ReadHeaderTimeout: 3 * time.Second}
+	d := c.WithDefaults()
+	if d.ReadHeaderTimeout != 3*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 3s (caller-supplied)", d.ReadHeaderTimeout)
 	}
 }
 
