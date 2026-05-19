@@ -1191,12 +1191,29 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		data := cs.asyncOutBuf
 		cs.asyncInMu.Unlock()
 
-		cs.detachMu.Lock()
-		// Re-check asyncClosed under detachMu; closeConn sets it
-		// BEFORE tearing down cs.h1State. Mirrors the iouring fix
-		// (see engine/iouring/worker.go:runAsyncHandler).
+		// Post-detach iterations (WS / SSE): ProcessH1's only job is to
+		// deliver `data` to state.WSDataDelivery (writes flow through
+		// the guarded writeFn, which acquires cs.detachMu on its own).
+		// Re-Locking here on every torture-frame delivery and then
+		// skipping the symmetric Unlock in the asyncDetachUnlocked
+		// branch leaks the mutex, which deadlocks the WS handler's
+		// writeCloseProtocol → writeCloseFrame → guarded → Lock chain
+		// (celeris#284: per-worker WS handler hang manifesting as
+		// "first WS upgrade succeeds, every subsequent /ws upgrade on
+		// the same worker fails with EOF on status line"). The fix
+		// mirrors iouring's runAsyncHandler.
+		acquiredDetachMu := false
+		if !cs.asyncDetachUnlocked {
+			cs.detachMu.Lock()
+			acquiredDetachMu = true
+		}
+		// Re-check asyncClosed under detachMu when we acquired it;
+		// closeConn sets asyncClosed BEFORE tearing down cs.h1State.
+		// Mirrors the iouring fix.
 		if cs.asyncClosed.Load() {
-			cs.detachMu.Unlock()
+			if acquiredDetachMu {
+				cs.detachMu.Unlock()
+			}
 			cs.asyncInMu.Lock()
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
