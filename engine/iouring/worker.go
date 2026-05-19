@@ -1932,15 +1932,38 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		data := cs.asyncOutBuf
 		cs.asyncInMu.Unlock()
 
-		cs.detachMu.Lock()
-		// Re-check asyncClosed under detachMu. closeConn sets
-		// asyncClosed BEFORE taking detachMu to run CloseH1; if we
-		// raced past the top-of-loop check but closeConn acquired
-		// detachMu first, by the time we hold detachMu our cs.h1State
-		// may already be torn down. Bail out here so we don't call
-		// ProcessH1 on a closed state.
+		// Post-detach iterations (WS / SSE): ProcessH1's only job is to
+		// deliver `data` to state.WSDataDelivery (writes flow through the
+		// guarded writeFn, which acquires cs.detachMu on its own). Taking
+		// detachMu here would re-Lock it on every torture-frame delivery
+		// — and the post-ProcessH1 branch below (asyncDetachUnlocked)
+		// would then skip the symmetric Unlock, leaking the mutex.
+		// Once leaked, the WS handler's writeCloseProtocol →
+		// writeCloseFrame → guarded → cs.detachMu.Lock() deadlocks
+		// forever, which is exactly the per-worker WS-handler hang that
+		// celeris#284 surfaced (handler never returns, deferred ws.Close
+		// never runs, idleDeadlineFn(1) never fires, conn stays
+		// "detached forever," subsequent /ws upgrades on the same worker
+		// accumulate stuck state). The pre-detach iteration (the one
+		// where the WS middleware calls c.Detach inside ProcessH1) still
+		// needs the lock because the handler chain may write a response
+		// to cs.writeBuf before Detach fires; OnDetach itself drops the
+		// lock on celeris#273's behalf (see line 974).
+		acquiredDetachMu := false
+		if !cs.asyncDetachUnlocked {
+			cs.detachMu.Lock()
+			acquiredDetachMu = true
+		}
+		// Re-check asyncClosed under detachMu (when we acquired it).
+		// closeConn sets asyncClosed BEFORE taking detachMu to run
+		// CloseH1; if we raced past the top-of-loop check but closeConn
+		// acquired detachMu first, by the time we hold detachMu our
+		// cs.h1State may already be torn down. Bail out here so we
+		// don't call ProcessH1 on a closed state.
 		if cs.asyncClosed.Load() {
-			cs.detachMu.Unlock()
+			if acquiredDetachMu {
+				cs.detachMu.Unlock()
+			}
 			cs.asyncInMu.Lock()
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
