@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
 
@@ -126,7 +127,42 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 	return s, nil
 }
 
+// ensureSchema creates the sessions table and its supporting index if
+// they do not already exist.
+//
+// The DDL is wrapped in a transaction-scoped advisory lock
+// (pg_advisory_xact_lock) keyed on the table name. CREATE TABLE IF NOT
+// EXISTS is NOT atomic in PostgreSQL: the existence pre-check happens
+// outside the row-insertion path into pg_class/pg_type, so two
+// concurrent racers can both pass the "does it exist?" gate and then
+// race in the catalog. The loser surfaces SQLSTATE 23505 (unique
+// violation on pg_type_typname_nsp_index) — a class of failure
+// observed in the probatorium matrix nightly when both arch hosts
+// (amd64 + arm64) boot a driver_postgres refapp simultaneously against
+// the same PostgreSQL instance.
+//
+// The advisory key is derived from a 64-bit FNV-1a hash of
+// "postgresstore:ensureSchema:" + table name. Different tables get
+// different keys (no blocking between unrelated stores); the same
+// table always gets the same key (concurrent racers serialize). The
+// lock is released automatically at COMMIT/ROLLBACK.
 func (s *Store) ensureSchema(ctx context.Context) error {
+	tx, err := s.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: begin tx: %w", err)
+	}
+	// Defer rollback for the error paths; a no-op after Commit succeeds.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(s.table)); err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: acquire advisory lock: %w", err)
+	}
+
 	stmts := []string{
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			id TEXT PRIMARY KEY,
@@ -137,11 +173,29 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			ON %s (expires_at) WHERE expires_at IS NOT NULL`, s.table, s.table),
 	}
 	for _, q := range stmts {
-		if _, err := s.pool.ExecContext(ctx, q); err != nil {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("postgresstore: ensure schema: %w", err)
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: commit: %w", err)
+	}
+	committed = true
 	return nil
+}
+
+// advisoryLockKey derives a stable int64 key for pg_advisory_xact_lock
+// from the target table name. FNV-1a/64 is a non-cryptographic hash;
+// collisions across unrelated table names are acceptable here — the
+// worst case is two stores serializing their schema-init unnecessarily,
+// not a correctness issue. The int64 cast preserves the bit pattern;
+// PostgreSQL accepts the full int64 range.
+func advisoryLockKey(table string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("postgresstore:ensureSchema:"))
+	_, _ = h.Write([]byte(table))
+	return int64(h.Sum64()) // #nosec G115 — intentional bitwise cast
 }
 
 // Close stops the cleanup goroutine. Safe to call multiple times.
