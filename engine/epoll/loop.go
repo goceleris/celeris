@@ -1299,7 +1299,24 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			continue
 		}
 		var flushErr error
-		if processErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {
+		// Flush any pending response bytes BEFORE the close-path check
+		// below. Gating this on `processErr == nil` is wrong for
+		// errConnectionClose (HTTP/1.1 Connection: close) — the handler
+		// staged a valid response in cs.writeBuf, ProcessH1 returned an
+		// internal "close after this response" sentinel, and falling
+		// through to the asyncClosed→closeConn→fastClose path without
+		// flushing means the response bytes never leave the kernel send
+		// buffer before unix.Close fires. Wireshark confirms: under
+		// epoll + AsyncHandlers + Connection: close, the server sends
+		// only FIN — no HTTP response data — and curl reports
+		// code=000 with a sub-ms time. The sync (non-async) dispatcher
+		// already does this unconditional flush at line ~783.
+		//
+		// Only ErrHijacked stays gated: a hijacked conn's bytes belong
+		// to the middleware's goroutine now and re-flushing here would
+		// race the middleware's own write path.
+		if !errors.Is(processErr, conn.ErrHijacked) &&
+			(cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {
 			flushErr = flushWrites(cs)
 		}
 		// Resync pendingBytes with actual buffer state. makeWriteFn uses
