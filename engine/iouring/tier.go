@@ -52,8 +52,6 @@ func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) Tier
 			multishotAccept: profile.MultishotAccept,
 			multishotRecv:   profile.MultishotRecv,
 		}
-	case profile.IOUringTier >= engine.Mid && profile.CoopTaskrun:
-		return &midTier{}
 	case profile.IOUringTier >= engine.Base:
 		return &baseTier{}
 	default:
@@ -92,45 +90,6 @@ func (t *baseTier) PrepareRecv(ring *Ring, fd int, buf []byte) {
 }
 
 func (t *baseTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
-	sqe := ring.GetSQE()
-	if sqe == nil {
-		return
-	}
-	prepSend(sqe, fd, buf, linked)
-	setSQEUserData(sqe, encodeUserData(udSend, fd))
-}
-
-// midTier: kernel 5.13+, adds COOP_TASKRUN.
-type midTier struct{}
-
-func (t *midTier) Tier() engine.Tier             { return engine.Mid }
-func (t *midTier) SetupFlags() uint32            { return setupCoopTaskrun }
-func (t *midTier) SupportsProvidedBuffers() bool { return false }
-func (t *midTier) SupportsMultishotAccept() bool { return false }
-func (t *midTier) SupportsMultishotRecv() bool   { return false }
-func (t *midTier) SupportsFixedFiles() bool      { return false }
-func (t *midTier) SupportsSendZC() bool          { return false }
-func (t *midTier) SQPollIdle() uint32            { return 0 }
-
-func (t *midTier) PrepareAccept(ring *Ring, listenFD int) {
-	sqe := ring.GetSQE()
-	if sqe == nil {
-		return
-	}
-	prepAccept(sqe, listenFD, 0)
-	setSQEUserData(sqe, encodeUserData(udAccept, listenFD))
-}
-
-func (t *midTier) PrepareRecv(ring *Ring, fd int, buf []byte) {
-	sqe := ring.GetSQE()
-	if sqe == nil {
-		return
-	}
-	prepRecv(sqe, fd, buf)
-	setSQEUserData(sqe, encodeUserData(udRecv, fd))
-}
-
-func (t *midTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	sqe := ring.GetSQE()
 	if sqe == nil {
 		return
