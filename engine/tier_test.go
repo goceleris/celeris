@@ -9,7 +9,6 @@ func TestTierString(t *testing.T) {
 	}{
 		{None, "none"},
 		{Base, "base"},
-		{Mid, "mid"},
 		{High, "high"},
 		{Optional, "optional"},
 		{Tier(255), "unknown"},
@@ -25,7 +24,7 @@ func TestTierAvailable(t *testing.T) {
 	if None.Available() {
 		t.Error("None.Available() = true, want false")
 	}
-	for _, tier := range []Tier{Base, Mid, High, Optional} {
+	for _, tier := range []Tier{Base, High, Optional} {
 		if !tier.Available() {
 			t.Errorf("%v.Available() = false, want true", tier)
 		}
@@ -33,7 +32,7 @@ func TestTierAvailable(t *testing.T) {
 }
 
 func TestTierOrdering(t *testing.T) {
-	ordered := []Tier{None, Base, Mid, High, Optional}
+	ordered := []Tier{None, Base, High, Optional}
 	for i := 0; i < len(ordered)-1; i++ {
 		if ordered[i] >= ordered[i+1] {
 			t.Errorf("expected %v < %v", ordered[i], ordered[i+1])

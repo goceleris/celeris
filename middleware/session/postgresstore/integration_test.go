@@ -119,3 +119,54 @@ func TestTruncateEmptyPrefix_Integration(t *testing.T) {
 		t.Fatal("TRUNCATE should remove all rows")
 	}
 }
+
+// TestEnsureSchema_ConcurrentRacers_Integration pins the v1.4.9 fix
+// for the postgresstore schema-init race surfaced by probatorium's
+// matrix nightly. Two driver_postgres refapps booting simultaneously
+// against the same PostgreSQL instance (msa2-server amd64 + msr1
+// arm64 in the cluster) each call New → ensureSchema. Pre-fix, the
+// loser hit SQLSTATE 23505 (unique violation on pg_type_typname_nsp_index)
+// because CREATE TABLE IF NOT EXISTS is not atomic at the catalog
+// level. Post-fix, pg_advisory_xact_lock serializes them.
+//
+// Concurrency factor 8 generates enough collision pressure that the
+// pre-fix code reliably failed within a few iterations.
+func TestEnsureSchema_ConcurrentRacers_Integration(t *testing.T) {
+	dsn := os.Getenv("CELERIS_PG_DSN")
+	if dsn == "" {
+		t.Skip("CELERIS_PG_DSN unset; skipping integration test")
+	}
+	pool, err := postgres.Open(dsn)
+	if err != nil {
+		t.Fatalf("postgres.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	// All racers target the SAME table — that's the race surface.
+	table := fmt.Sprintf("celeris_sessions_race_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.ExecContext(context.Background(),
+			fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	})
+
+	const racers = 8
+	errCh := make(chan error, racers)
+	startCh := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		go func() {
+			<-startCh
+			_, err := New(context.Background(), pool, Options{
+				TableName:       table,
+				CleanupInterval: 0, // disable cleanup goroutine — we only care about schema init
+			})
+			errCh <- err
+		}()
+	}
+	close(startCh) // release all racers simultaneously
+
+	for i := 0; i < racers; i++ {
+		if err := <-errCh; err != nil {
+			t.Errorf("racer %d: %v", i, err)
+		}
+	}
+}

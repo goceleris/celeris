@@ -30,20 +30,26 @@ func TestSelectTierBase(t *testing.T) {
 	}
 }
 
-func TestSelectTierMid(t *testing.T) {
+// TestSelectTierMidCollapsesToBase pins the v1.4.8 retirement of the
+// `Mid` tier (celeris#287). 5.13–5.18 kernels no longer carry their own
+// strategy — they share `baseTier` because COOP_TASKRUN, the only
+// feature `Mid` used to gate, doesn't actually exist before 5.19.
+// Backwards-compat test: a profile reporting tier=Base with CoopTaskrun
+// (which determineTier post-fix will never produce, but a hand-built
+// profile might) selects baseTier and does not surface CoopTaskrun.
+func TestSelectTierMidCollapsesToBase(t *testing.T) {
 	profile := engine.CapabilityProfile{
-		IOUringTier: engine.Mid,
-		CoopTaskrun: true,
+		IOUringTier: engine.Base,
 	}
 	tier := SelectTier(profile, 0)
 	if tier == nil {
 		t.Fatal("expected non-nil tier")
 	}
-	if tier.Tier() != engine.Mid {
-		t.Errorf("expected Mid tier, got %v", tier.Tier())
+	if tier.Tier() != engine.Base {
+		t.Errorf("expected Base tier, got %v", tier.Tier())
 	}
 	if tier.SupportsFixedFiles() {
-		t.Error("mid tier should not support fixed files")
+		t.Error("base tier should not support fixed files")
 	}
 }
 

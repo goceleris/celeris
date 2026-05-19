@@ -261,6 +261,11 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 	return workers, nil
 }
 
+// fallbackTier drops the current tier strategy one rung. Invoked when
+// NewRing fails (e.g. the kernel rejected a setup flag we asked for) so
+// the engine can re-attempt at a lower capability instead of refusing
+// to start. The `Mid` tier was retired in v1.4.8 (celeris#287), so
+// `highTier` falls back directly to `baseTier`.
 func fallbackTier(current TierStrategy) TierStrategy {
 	switch t := current.(type) {
 	case *optionalTier:
@@ -272,8 +277,6 @@ func fallbackTier(current TierStrategy) TierStrategy {
 			multishotRecv:   t.multishotRecv,
 		}
 	case *highTier:
-		return &midTier{}
-	case *midTier:
 		return &baseTier{}
 	default:
 		return nil

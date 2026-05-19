@@ -26,7 +26,10 @@ func parseTierName(s string) engine.Tier {
 	case "high":
 		return engine.High
 	case "mid":
-		return engine.Mid
+		// Backwards-compat alias: the `Mid` tier was retired in v1.4.8
+		// (see celeris#287). Map any existing CELERIS_MAX_IOURING_TIER=mid
+		// configuration to Base so deployed manifests don't break.
+		return engine.Base
 	case "base":
 		return engine.Base
 	default:
@@ -43,7 +46,9 @@ func capIOUringTier(p engine.CapabilityProfile, maxTier engine.Tier) engine.Capa
 	if maxTier < engine.Optional {
 		p.SQPoll = false
 		p.SendZC = false
-		p.SingleIssuer = false
+		// SingleIssuer is cleared in the `maxTier < High` branch below
+		// — it landed in 5.19 (High) alongside COOP_TASKRUN, not in 6.0
+		// (Optional). See celeris#287.
 	}
 	if maxTier < engine.High {
 		p.MultishotAccept = false
@@ -51,9 +56,12 @@ func capIOUringTier(p engine.CapabilityProfile, maxTier engine.Tier) engine.Capa
 		p.ProvidedBuffers = false
 		p.FixedFiles = false
 		p.DeferTaskrun = false
-	}
-	if maxTier < engine.Mid {
+		// COOP_TASKRUN + SINGLE_ISSUER were introduced together in 5.19
+		// and land at the High tier (see celeris#287). Pre-fix the Mid
+		// tier owned CoopTaskrun at 5.13; that was wrong, the flag did
+		// not exist before 5.19.
 		p.CoopTaskrun = false
+		p.SingleIssuer = false
 	}
 	if maxTier < engine.Base {
 		p.LinkedSQEs = false
@@ -89,6 +97,13 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 		profile.EpollAvailable = sp.ProbeEpoll()
 	}
 
+	// 5.10 is celeris's LTS-stable io_uring floor. The io_uring syscall
+	// itself landed in 5.1, but pre-5.10 kernels carry pre-LTS-stability
+	// io_uring bugs (deadlocks, credential races, registered-fd surprises)
+	// that are not worth supporting in a production HTTP engine. 5.10 is
+	// the cut-off: Debian 11, RHEL 8.5+, and every distro since carry
+	// 5.10+. Kernels below 5.10 fall through to the epoll path above.
+	// See celeris#287 Finding 3.
 	if kv.AtLeast(5, 10) && sp.ProbeIOUring != nil {
 		features, ops, err := sp.ProbeIOUring()
 		if err == nil {
