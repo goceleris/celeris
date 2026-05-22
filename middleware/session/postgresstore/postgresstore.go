@@ -43,6 +43,24 @@ type Options struct {
 	// provisioned the schema out-of-band or the role does not have
 	// DDL privileges.
 	SkipSchemaInit bool
+
+	// PhaseHook, when non-nil, is invoked with a short tag at each
+	// significant step of New() / ensureSchema(). Tags:
+	//
+	//   ensure_schema:begin_tx           — pool.BeginTx() about to run
+	//   ensure_schema:set_lock_timeout   — SET LOCAL lock_timeout
+	//   ensure_schema:acquire_lock       — pg_advisory_xact_lock
+	//   ensure_schema:lock_acquired      — lock now held
+	//   ensure_schema:run_ddl            — CREATE TABLE / INDEX
+	//   ensure_schema:commit             — tx.Commit() about to run
+	//   ensure_schema:done               — committed cleanly
+	//
+	// Used by diagnostic harnesses (probatorium matrix nightly) to
+	// pinpoint which step blocks under pathological contention. The
+	// hook MUST NOT block — it runs inline on the schema-init path
+	// and is called with no locks held but on the same goroutine as
+	// the SQL operations. Production deployments leave this nil.
+	PhaseHook func(phase string)
 }
 
 // Store is a [store.KV] backed by a PostgreSQL table. Implements
@@ -61,11 +79,25 @@ type Store struct {
 	qDeletePrefix string
 	qCleanup      string
 
+	// phaseHook is copied from Options.PhaseHook at New() time and
+	// remains immutable for the lifetime of the Store. Used today
+	// only by ensureSchema's diagnostic path; future Set/Get-level
+	// phase events would attach here too. Nil = no-op.
+	phaseHook func(phase string)
+
 	cancel context.CancelFunc
 	done   chan struct{}
 
 	mu     sync.Mutex
 	closed bool
+}
+
+// emitPhase invokes s.phaseHook if set. Centralised so callers don't
+// each carry a nil-check.
+func (s *Store) emitPhase(phase string) {
+	if s.phaseHook != nil {
+		s.phaseHook(phase)
+	}
 }
 
 // New creates a PostgreSQL-backed session store. The schema is
@@ -83,6 +115,7 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 		}
 		o.SkipSchemaInit = opts[0].SkipSchemaInit
 		o.CleanupContext = opts[0].CleanupContext
+		o.PhaseHook = opts[0].PhaseHook
 	}
 	if !validIdent(o.TableName) {
 		return nil, fmt.Errorf("postgresstore: invalid TableName %q — must be [A-Za-z_][A-Za-z0-9_]*", o.TableName)
@@ -105,6 +138,7 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 		qTruncate:     fmt.Sprintf(`TRUNCATE TABLE %s`, o.TableName),
 		qDeletePrefix: fmt.Sprintf(`DELETE FROM %s WHERE id LIKE $1 ESCAPE '\'`, o.TableName),
 		qCleanup:      fmt.Sprintf(`DELETE FROM %s WHERE expires_at IS NOT NULL AND expires_at <= NOW()`, o.TableName),
+		phaseHook:     o.PhaseHook,
 	}
 
 	if !o.SkipSchemaInit {
@@ -170,6 +204,7 @@ const ensureSchemaLockTimeout = "3s"
 // The lock acquisition is bounded by `SET LOCAL lock_timeout =
 // ensureSchemaLockTimeout` — see the constant for the rationale.
 func (s *Store) ensureSchema(ctx context.Context) error {
+	s.emitPhase("ensure_schema:begin_tx")
 	tx, err := s.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("postgresstore: ensure schema: begin tx: %w", err)
@@ -185,11 +220,13 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	// SET LOCAL applies only for the duration of this transaction —
 	// no global state mutation, no risk of leaking the override to
 	// other code paths sharing the pool.
+	s.emitPhase("ensure_schema:set_lock_timeout")
 	if _, err := tx.ExecContext(ctx,
 		"SET LOCAL lock_timeout = '"+ensureSchemaLockTimeout+"'"); err != nil {
 		return fmt.Errorf("postgresstore: ensure schema: set lock_timeout: %w", err)
 	}
 
+	s.emitPhase("ensure_schema:acquire_lock")
 	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(s.table)); err != nil {
 		// Distinguishable failure modes:
 		//  - 55P03 lock_not_available: another racer is holding the lock
@@ -199,7 +236,9 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		//  - anything else: legitimate error worth surfacing as-is.
 		return fmt.Errorf("postgresstore: ensure schema: acquire advisory lock: %w", err)
 	}
+	s.emitPhase("ensure_schema:lock_acquired")
 
+	s.emitPhase("ensure_schema:run_ddl")
 	stmts := []string{
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			id TEXT PRIMARY KEY,
@@ -215,10 +254,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		}
 	}
 
+	s.emitPhase("ensure_schema:commit")
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("postgresstore: ensure schema: commit: %w", err)
 	}
 	committed = true
+	s.emitPhase("ensure_schema:done")
 	return nil
 }
 

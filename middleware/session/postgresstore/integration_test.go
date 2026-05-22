@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -241,10 +242,22 @@ func TestEnsureSchema_LockTimeout_Integration(t *testing.T) {
 
 	// Goroutine B: call ensureSchema with the lock held. With the v1.4.10
 	// lock_timeout fix this should fail in ~3 s, not wait the full 5 s.
+	// Capture phases via PhaseHook so the test asserts on the diagnostic
+	// surface AS WELL AS the timeout — proving that a future failure in
+	// the field surfaces an actionable phase trail.
+	var (
+		phaseMu sync.Mutex
+		phases  []string
+	)
 	start := time.Now()
 	_, newErr := New(context.Background(), pool, Options{
 		TableName:       table,
 		CleanupInterval: 0,
+		PhaseHook: func(p string) {
+			phaseMu.Lock()
+			phases = append(phases, p)
+			phaseMu.Unlock()
+		},
 	})
 	elapsed := time.Since(start)
 
@@ -265,5 +278,28 @@ func TestEnsureSchema_LockTimeout_Integration(t *testing.T) {
 	// stage failed.
 	if !strings.Contains(newErr.Error(), "acquire advisory lock") {
 		t.Errorf("error string should identify lock-acquire stage, got: %v", newErr)
+	}
+
+	// Phase trail sanity: the hook must have observed the
+	// acquire_lock event (we tried) but NOT lock_acquired (we
+	// failed). This is the postmortem invariant probatorium will
+	// rely on to triage future production hangs.
+	phaseMu.Lock()
+	defer phaseMu.Unlock()
+	hasAcquire := false
+	hasAcquired := false
+	for _, p := range phases {
+		if p == "ensure_schema:acquire_lock" {
+			hasAcquire = true
+		}
+		if p == "ensure_schema:lock_acquired" {
+			hasAcquired = true
+		}
+	}
+	if !hasAcquire {
+		t.Errorf("expected ensure_schema:acquire_lock phase in %v", phases)
+	}
+	if hasAcquired {
+		t.Errorf("did NOT expect ensure_schema:lock_acquired (lock should have failed), phases=%v", phases)
 	}
 }
