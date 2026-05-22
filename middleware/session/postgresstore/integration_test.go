@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,5 +169,101 @@ func TestEnsureSchema_ConcurrentRacers_Integration(t *testing.T) {
 		if err := <-errCh; err != nil {
 			t.Errorf("racer %d: %v", i, err)
 		}
+	}
+}
+
+// TestEnsureSchema_LockTimeout_Integration pins the v1.4.10 follow-up:
+// the advisory lock acquisition must NOT block indefinitely. v1.4.9
+// introduced pg_advisory_xact_lock to serialize schema-init racers,
+// but the lock had no timeout — under pathological contention (orphaned
+// conn awaiting TCP-keepalive grace, brief postgres pressure) waiters
+// blocked silently until the holder committed, exceeding the
+// validator-side 10 s ReadyTimeout. Surfaced by probatorium soak
+// 26132324582 (6 errored Tier-3 seeds, all timed out at exactly
+// 10.001 s with no captured refapp stderr).
+//
+// Fix: SET LOCAL lock_timeout = '3s' before SELECT pg_advisory_xact_lock.
+// This test scenario:
+//  1. Goroutine A opens a tx, takes the advisory lock by HAND on the
+//     same key ensureSchema would compute, and sleeps holding it for 5 s.
+//  2. Goroutine B calls ensureSchema while A holds the lock.
+//  3. Expectation: B fails within ~3 s with the lock-not-available
+//     error path, NOT after waiting the full 5 s.
+//
+// Validates both the timeout firing AND that the error surface is
+// recognisable so the caller can act on it.
+func TestEnsureSchema_LockTimeout_Integration(t *testing.T) {
+	dsn := os.Getenv("CELERIS_PG_DSN")
+	if dsn == "" {
+		t.Skip("CELERIS_PG_DSN unset; skipping integration test")
+	}
+	pool, err := postgres.Open(dsn)
+	if err != nil {
+		t.Fatalf("postgres.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	table := fmt.Sprintf("celeris_sessions_locktimeout_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.ExecContext(context.Background(),
+			fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	})
+
+	// Pre-create a Store struct purely to expose advisoryLockKey via the
+	// same computation ensureSchema uses. Don't call ensureSchema yet —
+	// we want to hold the lock manually first.
+	holderStore := &Store{table: table}
+	key := advisoryLockKey(holderStore.table)
+
+	// Goroutine A: hold the advisory lock for 5 s.
+	holderReady := make(chan struct{})
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		tx, err := pool.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Errorf("holder: BeginTx: %v", err)
+			close(holderReady)
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(context.Background(),
+			"SELECT pg_advisory_xact_lock($1)", key); err != nil {
+			t.Errorf("holder: lock: %v", err)
+			close(holderReady)
+			return
+		}
+		close(holderReady) // signal: lock held, holder will sleep
+		time.Sleep(5 * time.Second)
+	}()
+
+	<-holderReady
+
+	// Goroutine B: call ensureSchema with the lock held. With the v1.4.10
+	// lock_timeout fix this should fail in ~3 s, not wait the full 5 s.
+	start := time.Now()
+	_, newErr := New(context.Background(), pool, Options{
+		TableName:       table,
+		CleanupInterval: 0,
+	})
+	elapsed := time.Since(start)
+
+	// Cleanup: wait for the holder to release.
+	<-holderDone
+
+	if newErr == nil {
+		t.Fatal("expected New to fail with lock_timeout, got nil")
+	}
+	// 3 s timeout ± a generous 2 s grace (network, tx setup, postgres
+	// signal propagation). If we get past 5 s the timeout didn't fire
+	// at all — that's the v1.4.9 regression we're guarding against.
+	if elapsed >= 5*time.Second {
+		t.Errorf("New blocked for %v — exceeds lock_timeout grace, fix not effective", elapsed)
+	}
+	// Error string sanity check — must mention the acquire-lock step
+	// (not "begin tx" or "commit") so postmortem readers can tell what
+	// stage failed.
+	if !strings.Contains(newErr.Error(), "acquire advisory lock") {
+		t.Errorf("error string should identify lock-acquire stage, got: %v", newErr)
 	}
 }

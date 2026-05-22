@@ -127,6 +127,26 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 	return s, nil
 }
 
+// ensureSchemaLockTimeout caps the worst-case wait when acquiring the
+// transaction-scoped advisory lock that serializes schema-init racers.
+// Set as `SET LOCAL lock_timeout = '3s'` on the schema-init tx; with the
+// lock held only across two trivial IF-NOT-EXISTS DDL statements +
+// COMMIT (typical wall time ~10 ms), 3 s is two orders of magnitude
+// above the normal-case wait — long enough to absorb a brief stall, far
+// short of the validator-side 10 s ReadyTimeout that bounds refapp
+// boot.
+//
+// Surfaced by probatorium soak 26132324582 (post-v1.4.9): 6 errored
+// Tier-3 seeds timed out at exactly 10.001 s (sub-millisecond precision
+// at the validator's ReadyTimeout boundary) with no captured refapp
+// stderr — only possible if blocked silently in this advisory-lock
+// path. Pre-fix, the lock had no timeout; a stuck holder (e.g. orphaned
+// conn awaiting TCP-keepalive grace) could block waiters indefinitely.
+// Post-fix, contended waiters surface SQLSTATE 55P03 (lock_not_available)
+// within 3 s and the caller can decide whether to retry, fail fast, or
+// log diagnostically.
+const ensureSchemaLockTimeout = "3s"
+
 // ensureSchema creates the sessions table and its supporting index if
 // they do not already exist.
 //
@@ -146,6 +166,9 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 // different keys (no blocking between unrelated stores); the same
 // table always gets the same key (concurrent racers serialize). The
 // lock is released automatically at COMMIT/ROLLBACK.
+//
+// The lock acquisition is bounded by `SET LOCAL lock_timeout =
+// ensureSchemaLockTimeout` — see the constant for the rationale.
 func (s *Store) ensureSchema(ctx context.Context) error {
 	tx, err := s.pool.BeginTx(ctx, nil)
 	if err != nil {
@@ -159,7 +182,21 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		}
 	}()
 
+	// SET LOCAL applies only for the duration of this transaction —
+	// no global state mutation, no risk of leaking the override to
+	// other code paths sharing the pool.
+	if _, err := tx.ExecContext(ctx,
+		"SET LOCAL lock_timeout = '"+ensureSchemaLockTimeout+"'"); err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: set lock_timeout: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(s.table)); err != nil {
+		// Distinguishable failure modes:
+		//  - 55P03 lock_not_available: another racer is holding the lock
+		//    past lock_timeout. Caller can retry safely; the lock will
+		//    eventually free even if the prior holder's conn was orphaned
+		//    (postgres reclaims it via TCP keepalive).
+		//  - anything else: legitimate error worth surfacing as-is.
 		return fmt.Errorf("postgresstore: ensure schema: acquire advisory lock: %w", err)
 	}
 
