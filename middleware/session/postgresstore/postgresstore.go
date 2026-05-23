@@ -51,7 +51,10 @@ type Options struct {
 	//   ensure_schema:set_lock_timeout   — SET LOCAL lock_timeout
 	//   ensure_schema:acquire_lock       — pg_advisory_xact_lock
 	//   ensure_schema:lock_acquired      — lock now held
-	//   ensure_schema:run_ddl            — CREATE TABLE / INDEX
+	//   ensure_schema:check_table        — pg_class lookup for the table
+	//   ensure_schema:create_table       — CREATE TABLE (only on bootstrap)
+	//   ensure_schema:check_index        — pg_class lookup for the index
+	//   ensure_schema:create_index       — CREATE INDEX (only on bootstrap)
 	//   ensure_schema:commit             — tx.Commit() about to run
 	//   ensure_schema:done               — committed cleanly
 	//
@@ -238,19 +241,62 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 	s.emitPhase("ensure_schema:lock_acquired")
 
-	s.emitPhase("ensure_schema:run_ddl")
-	stmts := []string{
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			id TEXT PRIMARY KEY,
-			value BYTEA NOT NULL,
-			expires_at TIMESTAMPTZ
-		)`, s.table),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_expires_at
-			ON %s (expires_at) WHERE expires_at IS NOT NULL`, s.table, s.table),
+	// Pre-existence check — the crux of the v1.4.10 fix.
+	//
+	// Probatorium soak 26276913309 (24h torture) reproduced 92 errored
+	// refapp boots with the diagnostic build, all bottlenecking inside
+	// run_ddl, NOT in the advisory lock acquisition. The dossier trail:
+	//
+	//   ensure_schema:lock_acquired   ← advisory lock fine
+	//   ensure_schema:run_ddl          ← started DDL
+	//   <3s later>
+	//   ERROR: canceling statement due to lock timeout (SQLSTATE 55P03)
+	//
+	// Even with IF NOT EXISTS, PostgreSQL's CREATE TABLE and CREATE
+	// INDEX still acquire ACCESS EXCLUSIVE on the existing relation
+	// while checking. Concurrent session-table writers (cleanupLoop's
+	// DELETE, in-flight INSERT ... ON CONFLICT) hold row locks that
+	// the DDL waits on — and now with lock_timeout=3s the wait
+	// surfaces as a hard error rather than silently blocking.
+	//
+	// Fix: query pg_class / pg_indexes first. These reads take only
+	// ACCESS SHARE on the catalog and DO NOT block on writers.
+	// Skip CREATE entirely when the object already exists — which is
+	// the common case after the very first refapp on a fresh database
+	// has bootstrapped the schema. Net effect: 99%+ of refapp boots
+	// take ZERO blocking DDL locks; only the genuinely-bootstrap
+	// refapp pays the CREATE cost, and at that point there are no
+	// concurrent writers because no one has used the table yet.
+	s.emitPhase("ensure_schema:check_table")
+	tableExists, err := s.relationExists(ctx, tx, s.table)
+	if err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: check table exists: %w", err)
 	}
-	for _, q := range stmts {
-		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("postgresstore: ensure schema: %w", err)
+	if !tableExists {
+		s.emitPhase("ensure_schema:create_table")
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`CREATE TABLE IF NOT EXISTS %s (
+				id TEXT PRIMARY KEY,
+				value BYTEA NOT NULL,
+				expires_at TIMESTAMPTZ
+			)`, s.table)); err != nil {
+			return fmt.Errorf("postgresstore: ensure schema: create table: %w", err)
+		}
+	}
+
+	indexName := s.table + "_expires_at"
+	s.emitPhase("ensure_schema:check_index")
+	indexExists, err := s.indexExists(ctx, tx, indexName)
+	if err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: check index exists: %w", err)
+	}
+	if !indexExists {
+		s.emitPhase("ensure_schema:create_index")
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS %s
+				ON %s (expires_at) WHERE expires_at IS NOT NULL`,
+			indexName, s.table)); err != nil {
+			return fmt.Errorf("postgresstore: ensure schema: create index: %w", err)
 		}
 	}
 
@@ -261,6 +307,51 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	committed = true
 	s.emitPhase("ensure_schema:done")
 	return nil
+}
+
+// relationExists queries pg_class for a regular table with the given
+// name in the current search_path. The query takes only ACCESS SHARE
+// on the catalog and does NOT block on concurrent writers to the
+// target relation — that's the entire point of the v1.4.10 fix.
+//
+// Scoping to relkind='r' filters out indexes, views, sequences, etc.,
+// any of which could accidentally share a name with a table in some
+// odd schema configurations. The to_regclass() approach would also
+// work but returns NULL on missing relations, which complicates the
+// scan; the explicit EXISTS form is more transparent.
+func (s *Store) relationExists(ctx context.Context, tx *postgres.Tx, name string) (bool, error) {
+	var exists bool
+	row := tx.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1
+			  AND c.relkind = 'r'
+			  AND n.nspname = ANY (current_schemas(true))
+		)`, name)
+	if err := row.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// indexExists queries pg_class for an index relation with the given
+// name in the current search_path. Same ACCESS SHARE non-blocking
+// semantics as relationExists.
+func (s *Store) indexExists(ctx context.Context, tx *postgres.Tx, name string) (bool, error) {
+	var exists bool
+	row := tx.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1
+			  AND c.relkind = 'i'
+			  AND n.nspname = ANY (current_schemas(true))
+		)`, name)
+	if err := row.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // advisoryLockKey derives a stable int64 key for pg_advisory_xact_lock
