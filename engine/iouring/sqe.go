@@ -112,14 +112,22 @@ func setSQEUserData(sqePtr unsafe.Pointer, data uint64) {
 // count = 0: timer fires only on deadline (relative).
 // flags = 0: relative timer; pass IORING_TIMEOUT_ABS (1) for absolute.
 //
+// All non-timeout fields of the SQE are explicitly zeroed because the
+// SQ ring is reused — stale bytes from a previous SQE (fd, ioprio,
+// rw_flags) would otherwise confuse the kernel's IORING_OP_TIMEOUT
+// handler. Mirrors the prepAccept/prepRecv pattern in this file.
+//
 // New in v1.4.11 for the per-conn ReadHeaderTimeout enforcement.
 func prepTimeout(sqePtr unsafe.Pointer, ts unsafe.Pointer, count uint32, flags uint32) {
 	sqe := (*[sqeSize]byte)(sqePtr)
 	sqe[0] = opTIMEOUT
+	sqe[1] = 0                                          // flags
+	*(*uint16)(unsafe.Pointer(&sqe[2])) = 0             // ioprio
+	*(*int32)(unsafe.Pointer(&sqe[4])) = 0              // fd (unused)
+	*(*uint64)(unsafe.Pointer(&sqe[8])) = uint64(count) // off = count
 	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(ts))
-	*(*uint32)(unsafe.Pointer(&sqe[24])) = 1 // sqe.len: must be 1 for timeout
-	*(*uint64)(unsafe.Pointer(&sqe[8])) = uint64(count)
-	*(*uint32)(unsafe.Pointer(&sqe[28])) = flags // sqe.timeout_flags at off28
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = 1     // len: must be 1
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = flags // timeout_flags
 }
 
 // setSQEFixedFile sets the IOSQE_FIXED_FILE flag on an SQE after initial prep.

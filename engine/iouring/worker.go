@@ -494,6 +494,12 @@ func (w *Worker) run(ctx context.Context) {
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udProvide:
+				case udHeaderTimer:
+					// MUST be in the inlined hot path — processCQE
+					// (which has the same case) is only called from
+					// the cancel path. Without this case, slowloris-
+					// defence timer CQEs are silently dropped.
+					w.handleHeaderTimer(fd, now)
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -692,11 +698,16 @@ func (w *Worker) handleHeaderTimer(fd int, now int64) {
 		// fresh timer SQE.
 		return
 	}
+	// Re-read now from the kernel — cachedNow is refreshed only every
+	// 64 iterations, which could be 60+ms stale under bursty load.
+	// A stale now < dl comparison would spuriously re-arm a fresh
+	// 10s timer and effectively double the slowloris window. The
+	// fresh time.Now() costs one vDSO call, called only when a timer
+	// CQE arrives (rare in the hot path).
+	now = time.Now().UnixNano()
 	if now < dl {
-		// Spurious early fire (clock drift) or deadline got extended
-		// somehow — re-submit a fresh timer for the current deadline.
-		// Should be unreachable with idempotent ArmHeaderDeadline, but
-		// defensive.
+		// True early fire (kernel clock drift, very rare). Re-arm
+		// a fresh timer for the actual remaining time.
 		w.armHeaderTimer(cs)
 		return
 	}
