@@ -648,6 +648,8 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udH2Wakeup:
 		w.handleH2Wakeup()
 	case udProvide:
+	case udHeaderTimer:
+		w.handleHeaderTimer(fd, now)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
 	case udDriverSend:
@@ -655,6 +657,91 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udDriverClose:
 		w.handleDriverClose(fd)
 	}
+}
+
+// handleHeaderTimer processes an IORING_OP_TIMEOUT CQE submitted by
+// armHeaderTimer. The kernel fires it at the absolute deadline regardless
+// of CQE traffic on the worker, giving slowloris defence parity with
+// std's SetReadDeadline-based enforcement. The CQE is always processed —
+// no res check — because:
+//   - res == -ETIME on timer expiry (normal)
+//   - res == -ECANCELED if cancelled (we don't cancel, only let it fire)
+//   - res != 0 on any other error (we still need to clear headerTimerArmed)
+//
+// Race-free against ProcessH1's ClearHeaderDeadline: HeaderDeadlineNs is
+// atomic; if cleared between SQE submission and CQE arrival, the close
+// gate below skips the close. If re-armed in the same window (next
+// keep-alive request), the ArmHeaderDeadline callback submits a fresh
+// timer SQE — so we don't need to re-arm here.
+func (w *Worker) handleHeaderTimer(fd int, now int64) {
+	if fd < 0 || fd > w.maxFD {
+		return
+	}
+	cs := w.conns[fd]
+	if cs == nil {
+		return
+	}
+	cs.headerTimerArmed = false
+	if cs.closing || cs.h1State == nil {
+		return
+	}
+	dl := cs.h1State.HeaderDeadlineNs.Load()
+	if dl == 0 {
+		// Headers completed before the timer fired; no-op. The next
+		// ArmHeaderDeadline (keep-alive next request) will submit a
+		// fresh timer SQE.
+		return
+	}
+	if now < dl {
+		// Spurious early fire (clock drift) or deadline got extended
+		// somehow — re-submit a fresh timer for the current deadline.
+		// Should be unreachable with idempotent ArmHeaderDeadline, but
+		// defensive.
+		w.armHeaderTimer(cs)
+		return
+	}
+	// Deadline exceeded — slowloris defence fires.
+	w.closeConn(fd)
+}
+
+// armHeaderTimer submits an IORING_OP_TIMEOUT SQE that fires at
+// cs.h1State.HeaderDeadlineNs. Called from initProtocol on conn-accept
+// and from the OnHeaderDeadlineArmed callback when ProcessH1 re-arms
+// for a keep-alive next request.
+//
+// Idempotent: if a timer is already in flight (cs.headerTimerArmed),
+// the new arm is a no-op — the in-flight timer's CQE will check the
+// current HeaderDeadlineNs and either close or re-submit as needed.
+// Without this guard a fast-cycling keep-alive client could queue many
+// in-flight timer SQEs for the same conn, exhausting the SQ ring.
+func (w *Worker) armHeaderTimer(cs *connState) {
+	if cs.h1State == nil || cs.headerTimerArmed {
+		return
+	}
+	dl := cs.h1State.HeaderDeadlineNs.Load()
+	if dl == 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	remaining := dl - now
+	if remaining <= 0 {
+		// Deadline already past — close immediately rather than queue
+		// a zero-duration timer (kernel would fire it instantly anyway).
+		w.closeConn(cs.fd)
+		return
+	}
+	cs.headerTimerSpec.Sec = remaining / int64(time.Second)
+	cs.headerTimerSpec.Nsec = remaining % int64(time.Second)
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		// Ring full — fall back to sweep-based checkTimeouts. Not
+		// bulletproof but acceptable: the next CQE batch will drain
+		// the ring and the next initProtocol/arm will have a slot.
+		return
+	}
+	prepTimeout(sqe, unsafe.Pointer(&cs.headerTimerSpec), 0, 0)
+	setSQEUserData(sqe, encodeUserData(udHeaderTimer, cs.fd))
+	cs.headerTimerArmed = true
 }
 
 // adaptiveTimeout returns a wait timeout that scales with idle duration.
@@ -848,11 +935,16 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
 		cs.h1State.WorkerID = int32(w.id)
 		cs.h1State.WorkerIDSet = true
-		// Slowloris defence: arm the header read deadline so checkTimeouts
-		// closes any conn that fails to complete headers in time. ProcessH1
-		// clears it on successful parse; it rearms on return-nil
-		// (await-more-data) using ReadHeaderTimeoutNs stored here.
+		// Slowloris defence: kernel-enforced per-conn header deadline.
+		// The OnHeaderDeadlineArmed callback submits IORING_OP_TIMEOUT
+		// SQEs on every arm-transition (initial accept + each keep-alive
+		// next-request transition). The kernel fires the timer at the
+		// absolute deadline regardless of CQE traffic on the worker,
+		// giving parity with std's SetReadDeadline-based defence.
+		// checkTimeouts is the belt-and-braces fallback (now also gated
+		// tightly when ReadHeaderTimeout > 0).
 		cs.h1State.ReadHeaderTimeoutNs = int64(w.cfg.ReadHeaderTimeout)
+		cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
 		cs.h1State.ArmHeaderDeadline()
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()

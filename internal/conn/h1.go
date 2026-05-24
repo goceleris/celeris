@@ -60,6 +60,11 @@ func (s *H1State) ArmHeaderDeadline() {
 		return
 	}
 	s.HeaderDeadlineNs.Store(timeNow().UnixNano() + s.ReadHeaderTimeoutNs)
+	// Notify the engine so it can submit a kernel-enforced timer
+	// (iouring IORING_OP_TIMEOUT SQE) — see field docstring.
+	if s.OnHeaderDeadlineArmed != nil {
+		s.OnHeaderDeadlineArmed()
+	}
 }
 
 // errConnectionClose is returned when the client requests Connection: close.
@@ -158,6 +163,17 @@ type H1State struct {
 	// loop) without ProcessH1 needing access to the engine's *cfg.
 	// 0 = no header deadline (config disabled).
 	ReadHeaderTimeoutNs int64
+
+	// OnHeaderDeadlineArmed is invoked synchronously by ArmHeaderDeadline
+	// whenever the deadline transitions from 0 → armed. The iouring
+	// engine sets this to submit an IORING_OP_TIMEOUT SQE so the kernel
+	// closes the conn at the deadline regardless of sweep cadence. The
+	// epoll engine leaves it nil (uses per-worker timerfd instead). nil
+	// = no-op.
+	//
+	// The callback runs on the engine's worker thread (ProcessH1's
+	// caller). It MUST NOT block — SQE submission only.
+	OnHeaderDeadlineArmed func()
 
 	// EnableH2Upgrade, when true, permits this connection to honor a
 	// valid RFC 7540 §3.2 h2c upgrade request. Set by the engine at

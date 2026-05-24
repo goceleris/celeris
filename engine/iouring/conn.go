@@ -141,6 +141,16 @@ type connState struct {
 	// worker may call GetSQE). Cleared by drainDetachQueue after the
 	// bookkeeping runs, and by releaseConnState on teardown.
 	asyncDetachPending bool
+
+	// headerTimerSpec is the kernelTimespec passed to IORING_OP_TIMEOUT
+	// SQEs that enforce ReadHeaderTimeout per-conn. Owned by the conn
+	// (rather than per-SQE allocated) so the spec memory stays valid
+	// while the SQE is in the kernel queue. Re-used each arm.
+	headerTimerSpec kernelTimespec
+	// headerTimerArmed is true when a header-timer SQE has been submitted
+	// and the corresponding CQE has not yet been processed. Used to
+	// avoid duplicate timer SQEs.
+	headerTimerArmed bool
 }
 
 var connStatePool = sync.Pool{
@@ -199,6 +209,8 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.headerTimerSpec = kernelTimespec{}
+	cs.headerTimerArmed = false
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
