@@ -711,6 +711,23 @@ func (w *Worker) handleHeaderTimer(fd int) {
 		return
 	}
 	// Deadline exceeded — slowloris defence fires.
+	//
+	// Force RST instead of FIN: comparison with std (which had 0
+	// hangs) revealed std processed 4-15x MORE slowloris attempts
+	// per cell budget than iouring, meaning std's close caused the
+	// walker to immediately fail its next write. iouring's graceful
+	// SHUT_WR+drain+close path (used by async mode) sent FIN; the
+	// walker's small drip writes could continue buffering locally
+	// past the close, often reaching the 12s hang budget without
+	// noticing.
+	//
+	// SO_LINGER {1, 0} discards any pending TX data and sends RST
+	// on close — walker observes ECONNRESET on its very next write,
+	// independent of TCP send-buffer state. The conn is being
+	// terminated for being slow regardless, so we don't care about
+	// graceful tx drain. Mirrors how production proxies (nginx
+	// reset_timedout_connection on) handle the same case.
+	_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
 	w.closeConn(fd)
 }
 
@@ -2669,13 +2686,12 @@ func (w *Worker) checkTimeouts() {
 		// ReadHeaderTimeout: slowloris defence. Set by the engine on
 		// fresh conns and after each successful request parse — cleared
 		// when ProcessH1 finishes a request. A non-zero value past the
-		// deadline means the peer is dripping headers slowly: close.
-		// Pre-v1.4.11 this check was missing on iouring/epoll; only the
-		// std engine honored ReadHeaderTimeout. Probatorium soak
-		// 26363052652 surfaced 1,910 adv_hang events distributed across
-		// iouring + epoll cells that had this gap.
+		// deadline means the peer is dripping headers slowly: force RST
+		// close so the peer observes the termination on its very next
+		// write. See handleHeaderTimer for the SO_LINGER {1,0} rationale.
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
 				w.closeConn(fd)
 				continue
 			}

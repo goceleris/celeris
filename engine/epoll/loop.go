@@ -1553,13 +1553,15 @@ func (l *Loop) checkTimeouts() {
 			}
 			continue
 		}
-		// ReadHeaderTimeout: slowloris defence. Mirrors the iouring
-		// worker's checkTimeouts; pre-v1.4.11 this gate was missing
-		// on the epoll engine so the std-only doc claim was a lie.
-		// HeaderDeadlineNs is armed at conn-accept and after each
-		// successful request parse (see ProcessH1 in internal/conn).
+		// ReadHeaderTimeout: slowloris defence. Force RST close so the
+		// peer immediately observes termination on its next write —
+		// see iouring/worker.go handleHeaderTimer for the SO_LINGER {1,0}
+		// rationale. The fastClose path here is unchanged; we only flip
+		// the linger semantics for slowloris-triggered closes so the
+		// walker doesn't get fooled by TCP send-buffer hangover.
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
 				l.closeConn(fd)
 				continue
 			}
