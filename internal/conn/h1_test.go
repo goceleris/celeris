@@ -2,9 +2,64 @@ package conn
 
 import (
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris/protocol/h1"
 )
+
+// TestHeaderDeadline_ClearArmCycle pins the v1.4.11 slowloris-defence
+// state machine for iouring + epoll. Pre-fix neither engine enforced
+// ReadHeaderTimeout (only std did, via http.Server). The state machine:
+//
+//   1. Engine sets ReadHeaderTimeoutNs + ArmHeaderDeadline at conn-
+//      accept. HeaderDeadlineNs is now > 0.
+//   2. ProcessH1 calls ClearHeaderDeadline at its entry (we're
+//      actively parsing, not waiting). HeaderDeadlineNs == 0.
+//   3. ProcessH1's deferred ArmHeaderDeadline fires on return-nil
+//      (awaiting next request's bytes). HeaderDeadlineNs > 0 again.
+//   4. If ReadHeaderTimeoutNs is 0 (config disabled), all arm calls
+//      are no-ops.
+//
+// checkTimeouts in each engine closes the conn when now > deadline.
+func TestHeaderDeadline_ClearArmCycle(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
+
+	// Arm — deadline should be ~10s in the future.
+	before := time.Now().UnixNano()
+	s.ArmHeaderDeadline()
+	after := time.Now().UnixNano()
+	dl := s.HeaderDeadlineNs.Load()
+	if dl < before+s.ReadHeaderTimeoutNs || dl > after+s.ReadHeaderTimeoutNs {
+		t.Errorf("ArmHeaderDeadline: dl=%d not in [%d, %d]",
+			dl, before+s.ReadHeaderTimeoutNs, after+s.ReadHeaderTimeoutNs)
+	}
+
+	// Clear — deadline should be 0.
+	s.ClearHeaderDeadline()
+	if dl := s.HeaderDeadlineNs.Load(); dl != 0 {
+		t.Errorf("ClearHeaderDeadline: dl=%d, want 0", dl)
+	}
+
+	// Re-arm — back to a future deadline.
+	s.ArmHeaderDeadline()
+	if dl := s.HeaderDeadlineNs.Load(); dl <= 0 {
+		t.Errorf("Re-ArmHeaderDeadline: dl=%d, want positive", dl)
+	}
+}
+
+// TestHeaderDeadline_DisabledNoArm verifies the no-op behaviour when
+// ReadHeaderTimeoutNs is 0 (config disabled via -1 or omitted on a
+// custom build that doesn't set a default). ArmHeaderDeadline must
+// leave HeaderDeadlineNs at 0 so checkTimeouts skips the check.
+func TestHeaderDeadline_DisabledNoArm(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = 0 // disabled
+	s.ArmHeaderDeadline()
+	if dl := s.HeaderDeadlineNs.Load(); dl != 0 {
+		t.Errorf("ArmHeaderDeadline with disabled config must be no-op, got dl=%d", dl)
+	}
+}
 
 func TestH1StateMaxBodySize(t *testing.T) {
 	s := NewH1State()

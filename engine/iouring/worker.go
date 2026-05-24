@@ -848,6 +848,12 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
 		cs.h1State.WorkerID = int32(w.id)
 		cs.h1State.WorkerIDSet = true
+		// Slowloris defence: arm the header read deadline so checkTimeouts
+		// closes any conn that fails to complete headers in time. ProcessH1
+		// clears it on successful parse; it rearms on return-nil
+		// (await-more-data) using ReadHeaderTimeoutNs stored here.
+		cs.h1State.ReadHeaderTimeoutNs = int64(w.cfg.ReadHeaderTimeout)
+		cs.h1State.ArmHeaderDeadline()
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
@@ -2557,6 +2563,20 @@ func (w *Worker) checkTimeouts() {
 				w.closeConn(fd)
 			}
 			continue
+		}
+		// ReadHeaderTimeout: slowloris defence. Set by the engine on
+		// fresh conns and after each successful request parse — cleared
+		// when ProcessH1 finishes a request. A non-zero value past the
+		// deadline means the peer is dripping headers slowly: close.
+		// Pre-v1.4.11 this check was missing on iouring/epoll; only the
+		// std engine honored ReadHeaderTimeout. Probatorium soak
+		// 26363052652 surfaced 1,910 adv_hang events distributed across
+		// iouring + epoll cells that had this gap.
+		if cs.h1State != nil {
+			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				w.closeConn(fd)
+				continue
+			}
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty || cs.sending {
