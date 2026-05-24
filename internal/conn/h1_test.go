@@ -61,6 +61,61 @@ func TestHeaderDeadline_DisabledNoArm(t *testing.T) {
 	}
 }
 
+// TestHeaderDeadline_ArmIdempotent pins the slowloris-bypass guard:
+// calling ArmHeaderDeadline twice MUST NOT advance the deadline. The
+// budget is absolute (from "first byte arrives" to "headers complete"),
+// not per-read. Without this guard a slow-drip client could call into
+// the engine (re-trigger ProcessH1's entry-arm) every few hundred ms
+// and indefinitely extend the budget.
+func TestHeaderDeadline_ArmIdempotent(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
+
+	s.ArmHeaderDeadline()
+	first := s.HeaderDeadlineNs.Load()
+	if first == 0 {
+		t.Fatal("first ArmHeaderDeadline must arm")
+	}
+
+	// Sleep a bit so re-arming would observably shift the deadline.
+	time.Sleep(20 * time.Millisecond)
+
+	s.ArmHeaderDeadline() // must be no-op while already armed
+	second := s.HeaderDeadlineNs.Load()
+	if second != first {
+		t.Errorf("re-arm without clear must NOT shift deadline: first=%d second=%d (drift=%dns)",
+			first, second, second-first)
+	}
+}
+
+// TestHeaderDeadline_KeepAliveIdleNotKilled is the regression test for
+// the subtle bug caught during the v1.4.11 implementation review: my
+// earlier "defer arm on return-nil" design would have re-armed the
+// deadline at the end of EVERY successful request. The conn then enters
+// keep-alive idle (waiting for the next request), and 10s later
+// checkTimeouts would close it — killing the conn at ReadHeaderTimeout
+// instead of IdleTimeout.
+//
+// Correct semantic: after ClearHeaderDeadline (called when headers are
+// parsed), the deadline stays 0 through body / handler / keep-alive
+// idle. It only re-arms when the NEXT request's first byte arrives
+// (ProcessH1 entry observes deadline == 0 and arms).
+//
+// This test simulates: arm → clear → simulate idle window → confirm
+// the deadline is still 0 (NOT something we'd push past).
+func TestHeaderDeadline_KeepAliveIdleNotKilled(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
+
+	s.ArmHeaderDeadline() // conn-accept arm
+	s.ClearHeaderDeadline() // headers parsed
+	// Simulate keep-alive idle window. checkTimeouts sees deadline==0
+	// → skips the check. IdleTimeout takes over (different code path).
+	if dl := s.HeaderDeadlineNs.Load(); dl != 0 {
+		t.Errorf("after clear, keep-alive idle must observe deadline=0, got %d", dl)
+	}
+}
+
 func TestH1StateMaxBodySize(t *testing.T) {
 	s := NewH1State()
 
