@@ -8,11 +8,16 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	h1 "github.com/goceleris/celeris/protocol/h1"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
+
+// timeNow is a package-level alias so tests can stub the clock when
+// exercising the read-header-deadline path. Production = time.Now.
+var timeNow = time.Now
 
 func init() {
 	// Wire the H1-package helpers so protocol/h2/stream can lazily
@@ -24,6 +29,26 @@ func init() {
 // ErrHijacked is returned by ProcessH1 when the connection was hijacked.
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
+
+// ClearHeaderDeadline drops the slowloris-defence read-header deadline
+// — called after a successful ParseRequest signals that the next state
+// is request handling, not header reading. The engine's checkTimeouts
+// sweep treats 0 as "no deadline" and skips the check.
+func (s *H1State) ClearHeaderDeadline() {
+	s.HeaderDeadlineNs.Store(0)
+}
+
+// ArmHeaderDeadline rearms the slowloris-defence read-header deadline
+// to now + ReadHeaderTimeoutNs. Called by ProcessH1 when transitioning
+// from request-complete back to await-next-request state, and by the
+// engine at conn accept. No-op if ReadHeaderTimeoutNs == 0 (config
+// disabled or std-engine compat mode).
+func (s *H1State) ArmHeaderDeadline() {
+	if s.ReadHeaderTimeoutNs == 0 {
+		return
+	}
+	s.HeaderDeadlineNs.Store(timeNow().UnixNano() + s.ReadHeaderTimeoutNs)
+}
 
 // errConnectionClose is returned when the client requests Connection: close.
 // Pre-allocated to avoid per-request fmt.Errorf allocation.
@@ -101,6 +126,26 @@ type H1State struct {
 	// the engine's idle sweep checks it on detached connections. 0 = no
 	// deadline.
 	IdleDeadlineNs atomic.Int64
+
+	// HeaderDeadlineNs holds the absolute deadline (Unix nanoseconds) by
+	// which the next request's headers must be fully received, or the
+	// engine must close the connection. This is the canonical slowloris
+	// defence on the iouring + epoll engines (std wires the equivalent
+	// via http.Server.ReadHeaderTimeout). Set by the engine at conn-
+	// accept and after each successful request parse (so the next
+	// pipelined / keep-alive request gets a fresh budget). Cleared when
+	// ProcessH1 returns having fully parsed a request. 0 = no deadline
+	// (e.g. -1 in config explicitly disables; ReadHeaderTimeout was
+	// otherwise unenforced on iouring + epoll prior to celeris v1.4.11).
+	HeaderDeadlineNs atomic.Int64
+
+	// ReadHeaderTimeoutNs is the configured ReadHeaderTimeout in
+	// nanoseconds, supplied by the engine at initProtocol. Used by
+	// ProcessH1 to re-arm HeaderDeadlineNs after each request parse —
+	// keeps the deadline logic local to where it matters (the parsing
+	// loop) without ProcessH1 needing access to the engine's *cfg.
+	// 0 = no header deadline (config disabled).
+	ReadHeaderTimeoutNs int64
 
 	// EnableH2Upgrade, when true, permits this connection to honor a
 	// valid RFC 7540 §3.2 h2c upgrade request. Set by the engine at
@@ -254,7 +299,7 @@ func CloseH1(state *H1State) {
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
 // The write callback is used to send response bytes back to the connection.
 func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.Handler,
-	write func([]byte)) error {
+	write func([]byte)) (retErr error) {
 
 	// WebSocket upgrade: deliver raw bytes to the middleware goroutine
 	// instead of parsing as H1. The delivery callback writes to an io.Pipe
@@ -263,6 +308,22 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		state.WSDataDelivery(data)
 		return nil
 	}
+
+	// Slowloris defence: clear the read-header deadline while we're
+	// actively parsing (we're not stuck waiting for headers). On
+	// return-nil (await more data) the deadline is rearmed for the
+	// next request — see the defer below. Errors / close / upgrade
+	// return paths intentionally leave the deadline cleared because
+	// the conn is about to be closed or handed off.
+	state.ClearHeaderDeadline()
+	defer func() {
+		if retErr == nil {
+			// ProcessH1 returns nil to signal "await more data". Arm
+			// the deadline so checkTimeouts closes a peer that drips
+			// bytes too slowly. No-op if ReadHeaderTimeout disabled.
+			state.ArmHeaderDeadline()
+		}
+	}()
 
 	// In-progress fixed-length body spanning multiple reads. Append into
 	// the dedicated bodyBuf (no state.buffer memcpy), then re-parse the

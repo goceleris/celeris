@@ -890,6 +890,12 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
 		cs.h1State.WorkerID = int32(l.id)
 		cs.h1State.WorkerIDSet = true
+		// Slowloris defence: configure + arm the read-header deadline.
+		// ProcessH1 clears on successful parse and rearms on return-nil
+		// (waiting for next request); checkTimeouts closes any conn
+		// that exceeds the deadline.
+		cs.h1State.ReadHeaderTimeoutNs = int64(l.cfg.ReadHeaderTimeout)
+		cs.h1State.ArmHeaderDeadline()
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
@@ -1546,6 +1552,17 @@ func (l *Loop) checkTimeouts() {
 				l.closeConn(fd)
 			}
 			continue
+		}
+		// ReadHeaderTimeout: slowloris defence. Mirrors the iouring
+		// worker's checkTimeouts; pre-v1.4.11 this gate was missing
+		// on the epoll engine so the std-only doc claim was a lie.
+		// HeaderDeadlineNs is armed at conn-accept and after each
+		// successful request parse (see ProcessH1 in internal/conn).
+		if cs.h1State != nil {
+			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				l.closeConn(fd)
+				continue
+			}
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty {
