@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,5 +170,270 @@ func TestEnsureSchema_ConcurrentRacers_Integration(t *testing.T) {
 		if err := <-errCh; err != nil {
 			t.Errorf("racer %d: %v", i, err)
 		}
+	}
+}
+
+// TestEnsureSchema_LockTimeout_Integration pins the v1.4.10 follow-up:
+// the advisory lock acquisition must NOT block indefinitely. v1.4.9
+// introduced pg_advisory_xact_lock to serialize schema-init racers,
+// but the lock had no timeout — under pathological contention (orphaned
+// conn awaiting TCP-keepalive grace, brief postgres pressure) waiters
+// blocked silently until the holder committed, exceeding the
+// validator-side 10 s ReadyTimeout. Surfaced by probatorium soak
+// 26132324582 (6 errored Tier-3 seeds, all timed out at exactly
+// 10.001 s with no captured refapp stderr).
+//
+// Fix: SET LOCAL lock_timeout = '3s' before SELECT pg_advisory_xact_lock.
+// This test scenario:
+//  1. Goroutine A opens a tx, takes the advisory lock by HAND on the
+//     same key ensureSchema would compute, and sleeps holding it for 5 s.
+//  2. Goroutine B calls ensureSchema while A holds the lock.
+//  3. Expectation: B fails within ~3 s with the lock-not-available
+//     error path, NOT after waiting the full 5 s.
+//
+// Validates both the timeout firing AND that the error surface is
+// recognisable so the caller can act on it.
+func TestEnsureSchema_LockTimeout_Integration(t *testing.T) {
+	dsn := os.Getenv("CELERIS_PG_DSN")
+	if dsn == "" {
+		t.Skip("CELERIS_PG_DSN unset; skipping integration test")
+	}
+	pool, err := postgres.Open(dsn)
+	if err != nil {
+		t.Fatalf("postgres.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	table := fmt.Sprintf("celeris_sessions_locktimeout_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.ExecContext(context.Background(),
+			fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	})
+
+	// Pre-create a Store struct purely to expose advisoryLockKey via the
+	// same computation ensureSchema uses. Don't call ensureSchema yet —
+	// we want to hold the lock manually first.
+	holderStore := &Store{table: table}
+	key := advisoryLockKey(holderStore.table)
+
+	// Goroutine A: hold the advisory lock for 5 s.
+	holderReady := make(chan struct{})
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		tx, err := pool.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Errorf("holder: BeginTx: %v", err)
+			close(holderReady)
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(context.Background(),
+			"SELECT pg_advisory_xact_lock($1)", key); err != nil {
+			t.Errorf("holder: lock: %v", err)
+			close(holderReady)
+			return
+		}
+		close(holderReady) // signal: lock held, holder will sleep
+		time.Sleep(5 * time.Second)
+	}()
+
+	<-holderReady
+
+	// Goroutine B: call ensureSchema with the lock held. With the v1.4.10
+	// lock_timeout fix this should fail in ~3 s, not wait the full 5 s.
+	// Capture phases via PhaseHook so the test asserts on the diagnostic
+	// surface AS WELL AS the timeout — proving that a future failure in
+	// the field surfaces an actionable phase trail.
+	var (
+		phaseMu sync.Mutex
+		phases  []string
+	)
+	start := time.Now()
+	_, newErr := New(context.Background(), pool, Options{
+		TableName:       table,
+		CleanupInterval: 0,
+		PhaseHook: func(p string) {
+			phaseMu.Lock()
+			phases = append(phases, p)
+			phaseMu.Unlock()
+		},
+	})
+	elapsed := time.Since(start)
+
+	// Cleanup: wait for the holder to release.
+	<-holderDone
+
+	if newErr == nil {
+		t.Fatal("expected New to fail with lock_timeout, got nil")
+	}
+	// 3 s timeout ± a generous 2 s grace (network, tx setup, postgres
+	// signal propagation). If we get past 5 s the timeout didn't fire
+	// at all — that's the v1.4.9 regression we're guarding against.
+	if elapsed >= 5*time.Second {
+		t.Errorf("New blocked for %v — exceeds lock_timeout grace, fix not effective", elapsed)
+	}
+	// Error string sanity check — must mention the acquire-lock step
+	// (not "begin tx" or "commit") so postmortem readers can tell what
+	// stage failed.
+	if !strings.Contains(newErr.Error(), "acquire advisory lock") {
+		t.Errorf("error string should identify lock-acquire stage, got: %v", newErr)
+	}
+
+	// Phase trail sanity: the hook must have observed the
+	// acquire_lock event (we tried) but NOT lock_acquired (we
+	// failed). This is the postmortem invariant probatorium will
+	// rely on to triage future production hangs.
+	phaseMu.Lock()
+	defer phaseMu.Unlock()
+	hasAcquire := false
+	hasAcquired := false
+	for _, p := range phases {
+		if p == "ensure_schema:acquire_lock" {
+			hasAcquire = true
+		}
+		if p == "ensure_schema:lock_acquired" {
+			hasAcquired = true
+		}
+	}
+	if !hasAcquire {
+		t.Errorf("expected ensure_schema:acquire_lock phase in %v", phases)
+	}
+	if hasAcquired {
+		t.Errorf("did NOT expect ensure_schema:lock_acquired (lock should have failed), phases=%v", phases)
+	}
+}
+
+// TestEnsureSchema_SkipsCreateWhenObjectsExist_Integration pins the
+// v1.4.10 curative fix surfaced by torture soak 26276913309: 92 errored
+// refapp boots all bottlenecked inside CREATE TABLE/INDEX IF NOT EXISTS,
+// not in the advisory lock. PostgreSQL takes ACCESS EXCLUSIVE on the
+// target relation while checking IF NOT EXISTS, which conflicts with
+// concurrent session-table writers (cleanupLoop's DELETE, in-flight
+// INSERT ... ON CONFLICT).
+//
+// The fix: query pg_class first (ACCESS SHARE, doesn't block on
+// writers) and skip CREATE entirely when the object exists.
+//
+// This test scenario:
+//  1. First New() creates the schema (bootstrap path).
+//  2. A goroutine starts a tx that takes a row lock on the table
+//     (SELECT ... FOR UPDATE on a sentinel row) and holds it for 5 s.
+//     Pre-fix, this row lock conflicted with CREATE TABLE/INDEX IF NOT
+//     EXISTS's ACCESS EXCLUSIVE attempt, blocking schema-init.
+//  3. Second New() is called while the row lock is held. Post-fix,
+//     this must complete near-instantly because pg_class returns true
+//     for both objects and CREATE never executes.
+//
+// Validates: the phase trail must include check_table + check_index,
+// must NOT include create_table or create_index, and total duration
+// must be far under the 3 s lock_timeout.
+func TestEnsureSchema_SkipsCreateWhenObjectsExist_Integration(t *testing.T) {
+	dsn := os.Getenv("CELERIS_PG_DSN")
+	if dsn == "" {
+		t.Skip("CELERIS_PG_DSN unset; skipping integration test")
+	}
+	pool, err := postgres.Open(dsn)
+	if err != nil {
+		t.Fatalf("postgres.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	table := fmt.Sprintf("celeris_sessions_precheck_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = pool.ExecContext(context.Background(),
+			fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+	})
+
+	// 1. Bootstrap: first New() creates the schema.
+	if _, err := New(context.Background(), pool, Options{
+		TableName:       table,
+		CleanupInterval: 0,
+	}); err != nil {
+		t.Fatalf("bootstrap New: %v", err)
+	}
+
+	// Seed a sentinel row so we have something to FOR UPDATE on.
+	if _, err := pool.ExecContext(context.Background(),
+		fmt.Sprintf("INSERT INTO %s (id, value) VALUES ('sentinel', '\\x00')", table)); err != nil {
+		t.Fatalf("seed sentinel: %v", err)
+	}
+
+	// 2. Goroutine: take a row lock and hold for 5 s.
+	holderReady := make(chan struct{})
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		tx, err := pool.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Errorf("holder: BeginTx: %v", err)
+			close(holderReady)
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		var dummy []byte
+		row := tx.QueryRow(context.Background(),
+			fmt.Sprintf("SELECT value FROM %s WHERE id='sentinel' FOR UPDATE", table))
+		if err := row.Scan(&dummy); err != nil {
+			t.Errorf("holder: FOR UPDATE: %v", err)
+			close(holderReady)
+			return
+		}
+		close(holderReady)
+		time.Sleep(5 * time.Second)
+	}()
+
+	<-holderReady
+
+	// 3. Second New() with row lock held — must NOT block.
+	var (
+		phaseMu sync.Mutex
+		phases  []string
+	)
+	start := time.Now()
+	_, err = New(context.Background(), pool, Options{
+		TableName:       table,
+		CleanupInterval: 0,
+		PhaseHook: func(p string) {
+			phaseMu.Lock()
+			phases = append(phases, p)
+			phaseMu.Unlock()
+		},
+	})
+	elapsed := time.Since(start)
+
+	<-holderDone
+
+	if err != nil {
+		t.Fatalf("second New (with row lock held): %v", err)
+	}
+	// Should complete near-instantly. Generous 2 s ceiling for postgres
+	// round-trip + tx overhead. The pre-fix code would block ~3 s here
+	// hitting lock_timeout on CREATE INDEX; post-fix should be ~50 ms.
+	if elapsed > 2*time.Second {
+		t.Errorf("second New took %v with row lock held — expected <2s (precheck didn't skip CREATE)", elapsed)
+	}
+
+	// Phase sanity: must observe check_* but NOT create_*.
+	phaseMu.Lock()
+	defer phaseMu.Unlock()
+	seen := map[string]bool{}
+	for _, p := range phases {
+		seen[p] = true
+	}
+	if !seen["ensure_schema:check_table"] {
+		t.Errorf("expected check_table phase, got: %v", phases)
+	}
+	if !seen["ensure_schema:check_index"] {
+		t.Errorf("expected check_index phase, got: %v", phases)
+	}
+	if seen["ensure_schema:create_table"] {
+		t.Errorf("did NOT expect create_table (table already exists), phases=%v", phases)
+	}
+	if seen["ensure_schema:create_index"] {
+		t.Errorf("did NOT expect create_index (index already exists), phases=%v", phases)
+	}
+	if !seen["ensure_schema:done"] {
+		t.Errorf("expected done phase, got: %v", phases)
 	}
 }

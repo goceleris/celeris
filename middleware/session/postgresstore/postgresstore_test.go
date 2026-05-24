@@ -56,6 +56,38 @@ func TestNewRejectsBadTableName(t *testing.T) {
 	}
 }
 
+// TestPhaseHook_NilSafe pins the contract that emitPhase tolerates a
+// nil hook (the production path — non-diagnostic deployments never
+// set Options.PhaseHook). Underpins the v1.4.10 phase-logging feature.
+func TestPhaseHook_NilSafe(t *testing.T) {
+	s := &Store{} // phaseHook left zero
+	// Must not panic.
+	s.emitPhase("any-tag")
+	s.emitPhase("another-tag")
+}
+
+// TestPhaseHook_EmittedInOrder pins the contract that emitPhase invokes
+// the hook synchronously with the supplied tag — the order of tags
+// observed by the hook reflects the order of emitPhase calls. This
+// matters for diagnostic consumers (probatorium refapps) that print
+// each phase to stderr to pinpoint where boot blocks.
+func TestPhaseHook_EmittedInOrder(t *testing.T) {
+	var phases []string
+	s := &Store{phaseHook: func(p string) { phases = append(phases, p) }}
+	s.emitPhase("a")
+	s.emitPhase("b")
+	s.emitPhase("c")
+	want := []string{"a", "b", "c"}
+	if len(phases) != len(want) {
+		t.Fatalf("phases: got %v, want %v", phases, want)
+	}
+	for i, w := range want {
+		if phases[i] != w {
+			t.Errorf("phase[%d]: got %q, want %q", i, phases[i], w)
+		}
+	}
+}
+
 // TestAdvisoryLockKey_DeterministicPerTable pins the contract that
 // advisoryLockKey is stable across calls for the same table (so two
 // racers serialize on the same lock) and differs between tables (so

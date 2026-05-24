@@ -43,6 +43,27 @@ type Options struct {
 	// provisioned the schema out-of-band or the role does not have
 	// DDL privileges.
 	SkipSchemaInit bool
+
+	// PhaseHook, when non-nil, is invoked with a short tag at each
+	// significant step of New() / ensureSchema(). Tags:
+	//
+	//   ensure_schema:begin_tx           — pool.BeginTx() about to run
+	//   ensure_schema:set_lock_timeout   — SET LOCAL lock_timeout
+	//   ensure_schema:acquire_lock       — pg_advisory_xact_lock
+	//   ensure_schema:lock_acquired      — lock now held
+	//   ensure_schema:check_table        — pg_class lookup for the table
+	//   ensure_schema:create_table       — CREATE TABLE (only on bootstrap)
+	//   ensure_schema:check_index        — pg_class lookup for the index
+	//   ensure_schema:create_index       — CREATE INDEX (only on bootstrap)
+	//   ensure_schema:commit             — tx.Commit() about to run
+	//   ensure_schema:done               — committed cleanly
+	//
+	// Used by diagnostic harnesses (probatorium matrix nightly) to
+	// pinpoint which step blocks under pathological contention. The
+	// hook MUST NOT block — it runs inline on the schema-init path
+	// and is called with no locks held but on the same goroutine as
+	// the SQL operations. Production deployments leave this nil.
+	PhaseHook func(phase string)
 }
 
 // Store is a [store.KV] backed by a PostgreSQL table. Implements
@@ -61,11 +82,25 @@ type Store struct {
 	qDeletePrefix string
 	qCleanup      string
 
+	// phaseHook is copied from Options.PhaseHook at New() time and
+	// remains immutable for the lifetime of the Store. Used today
+	// only by ensureSchema's diagnostic path; future Set/Get-level
+	// phase events would attach here too. Nil = no-op.
+	phaseHook func(phase string)
+
 	cancel context.CancelFunc
 	done   chan struct{}
 
 	mu     sync.Mutex
 	closed bool
+}
+
+// emitPhase invokes s.phaseHook if set. Centralised so callers don't
+// each carry a nil-check.
+func (s *Store) emitPhase(phase string) {
+	if s.phaseHook != nil {
+		s.phaseHook(phase)
+	}
 }
 
 // New creates a PostgreSQL-backed session store. The schema is
@@ -83,6 +118,7 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 		}
 		o.SkipSchemaInit = opts[0].SkipSchemaInit
 		o.CleanupContext = opts[0].CleanupContext
+		o.PhaseHook = opts[0].PhaseHook
 	}
 	if !validIdent(o.TableName) {
 		return nil, fmt.Errorf("postgresstore: invalid TableName %q — must be [A-Za-z_][A-Za-z0-9_]*", o.TableName)
@@ -105,6 +141,7 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 		qTruncate:     fmt.Sprintf(`TRUNCATE TABLE %s`, o.TableName),
 		qDeletePrefix: fmt.Sprintf(`DELETE FROM %s WHERE id LIKE $1 ESCAPE '\'`, o.TableName),
 		qCleanup:      fmt.Sprintf(`DELETE FROM %s WHERE expires_at IS NOT NULL AND expires_at <= NOW()`, o.TableName),
+		phaseHook:     o.PhaseHook,
 	}
 
 	if !o.SkipSchemaInit {
@@ -127,6 +164,26 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 	return s, nil
 }
 
+// ensureSchemaLockTimeout caps the worst-case wait when acquiring the
+// transaction-scoped advisory lock that serializes schema-init racers.
+// Set as `SET LOCAL lock_timeout = '3s'` on the schema-init tx; with the
+// lock held only across two trivial IF-NOT-EXISTS DDL statements +
+// COMMIT (typical wall time ~10 ms), 3 s is two orders of magnitude
+// above the normal-case wait — long enough to absorb a brief stall, far
+// short of the validator-side 10 s ReadyTimeout that bounds refapp
+// boot.
+//
+// Surfaced by probatorium soak 26132324582 (post-v1.4.9): 6 errored
+// Tier-3 seeds timed out at exactly 10.001 s (sub-millisecond precision
+// at the validator's ReadyTimeout boundary) with no captured refapp
+// stderr — only possible if blocked silently in this advisory-lock
+// path. Pre-fix, the lock had no timeout; a stuck holder (e.g. orphaned
+// conn awaiting TCP-keepalive grace) could block waiters indefinitely.
+// Post-fix, contended waiters surface SQLSTATE 55P03 (lock_not_available)
+// within 3 s and the caller can decide whether to retry, fail fast, or
+// log diagnostically.
+const ensureSchemaLockTimeout = "3s"
+
 // ensureSchema creates the sessions table and its supporting index if
 // they do not already exist.
 //
@@ -146,7 +203,11 @@ func New(ctx context.Context, pool *postgres.Pool, opts ...Options) (*Store, err
 // different keys (no blocking between unrelated stores); the same
 // table always gets the same key (concurrent racers serialize). The
 // lock is released automatically at COMMIT/ROLLBACK.
+//
+// The lock acquisition is bounded by `SET LOCAL lock_timeout =
+// ensureSchemaLockTimeout` — see the constant for the rationale.
 func (s *Store) ensureSchema(ctx context.Context) error {
+	s.emitPhase("ensure_schema:begin_tx")
 	tx, err := s.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("postgresstore: ensure schema: begin tx: %w", err)
@@ -159,30 +220,138 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		}
 	}()
 
-	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(s.table)); err != nil {
-		return fmt.Errorf("postgresstore: ensure schema: acquire advisory lock: %w", err)
+	// SET LOCAL applies only for the duration of this transaction —
+	// no global state mutation, no risk of leaking the override to
+	// other code paths sharing the pool.
+	s.emitPhase("ensure_schema:set_lock_timeout")
+	if _, err := tx.ExecContext(ctx,
+		"SET LOCAL lock_timeout = '"+ensureSchemaLockTimeout+"'"); err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: set lock_timeout: %w", err)
 	}
 
-	stmts := []string{
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			id TEXT PRIMARY KEY,
-			value BYTEA NOT NULL,
-			expires_at TIMESTAMPTZ
-		)`, s.table),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_expires_at
-			ON %s (expires_at) WHERE expires_at IS NOT NULL`, s.table, s.table),
+	s.emitPhase("ensure_schema:acquire_lock")
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(s.table)); err != nil {
+		// Distinguishable failure modes:
+		//  - 55P03 lock_not_available: another racer is holding the lock
+		//    past lock_timeout. Caller can retry safely; the lock will
+		//    eventually free even if the prior holder's conn was orphaned
+		//    (postgres reclaims it via TCP keepalive).
+		//  - anything else: legitimate error worth surfacing as-is.
+		return fmt.Errorf("postgresstore: ensure schema: acquire advisory lock: %w", err)
 	}
-	for _, q := range stmts {
-		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("postgresstore: ensure schema: %w", err)
+	s.emitPhase("ensure_schema:lock_acquired")
+
+	// Pre-existence check — the crux of the v1.4.10 fix.
+	//
+	// Probatorium soak 26276913309 (24h torture) reproduced 92 errored
+	// refapp boots with the diagnostic build, all bottlenecking inside
+	// run_ddl, NOT in the advisory lock acquisition. The dossier trail:
+	//
+	//   ensure_schema:lock_acquired   ← advisory lock fine
+	//   ensure_schema:run_ddl          ← started DDL
+	//   <3s later>
+	//   ERROR: canceling statement due to lock timeout (SQLSTATE 55P03)
+	//
+	// Even with IF NOT EXISTS, PostgreSQL's CREATE TABLE and CREATE
+	// INDEX still acquire ACCESS EXCLUSIVE on the existing relation
+	// while checking. Concurrent session-table writers (cleanupLoop's
+	// DELETE, in-flight INSERT ... ON CONFLICT) hold row locks that
+	// the DDL waits on — and now with lock_timeout=3s the wait
+	// surfaces as a hard error rather than silently blocking.
+	//
+	// Fix: query pg_class / pg_indexes first. These reads take only
+	// ACCESS SHARE on the catalog and DO NOT block on writers.
+	// Skip CREATE entirely when the object already exists — which is
+	// the common case after the very first refapp on a fresh database
+	// has bootstrapped the schema. Net effect: 99%+ of refapp boots
+	// take ZERO blocking DDL locks; only the genuinely-bootstrap
+	// refapp pays the CREATE cost, and at that point there are no
+	// concurrent writers because no one has used the table yet.
+	s.emitPhase("ensure_schema:check_table")
+	tableExists, err := s.relationExists(ctx, tx, s.table)
+	if err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: check table exists: %w", err)
+	}
+	if !tableExists {
+		s.emitPhase("ensure_schema:create_table")
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`CREATE TABLE IF NOT EXISTS %s (
+				id TEXT PRIMARY KEY,
+				value BYTEA NOT NULL,
+				expires_at TIMESTAMPTZ
+			)`, s.table)); err != nil {
+			return fmt.Errorf("postgresstore: ensure schema: create table: %w", err)
 		}
 	}
 
+	indexName := s.table + "_expires_at"
+	s.emitPhase("ensure_schema:check_index")
+	indexExists, err := s.indexExists(ctx, tx, indexName)
+	if err != nil {
+		return fmt.Errorf("postgresstore: ensure schema: check index exists: %w", err)
+	}
+	if !indexExists {
+		s.emitPhase("ensure_schema:create_index")
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS %s
+				ON %s (expires_at) WHERE expires_at IS NOT NULL`,
+			indexName, s.table)); err != nil {
+			return fmt.Errorf("postgresstore: ensure schema: create index: %w", err)
+		}
+	}
+
+	s.emitPhase("ensure_schema:commit")
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("postgresstore: ensure schema: commit: %w", err)
 	}
 	committed = true
+	s.emitPhase("ensure_schema:done")
 	return nil
+}
+
+// relationExists queries pg_class for a regular table with the given
+// name in the current search_path. The query takes only ACCESS SHARE
+// on the catalog and does NOT block on concurrent writers to the
+// target relation — that's the entire point of the v1.4.10 fix.
+//
+// Scoping to relkind='r' filters out indexes, views, sequences, etc.,
+// any of which could accidentally share a name with a table in some
+// odd schema configurations. The to_regclass() approach would also
+// work but returns NULL on missing relations, which complicates the
+// scan; the explicit EXISTS form is more transparent.
+func (s *Store) relationExists(ctx context.Context, tx *postgres.Tx, name string) (bool, error) {
+	var exists bool
+	row := tx.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1
+			  AND c.relkind = 'r'
+			  AND n.nspname = ANY (current_schemas(true))
+		)`, name)
+	if err := row.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// indexExists queries pg_class for an index relation with the given
+// name in the current search_path. Same ACCESS SHARE non-blocking
+// semantics as relationExists.
+func (s *Store) indexExists(ctx context.Context, tx *postgres.Tx, name string) (bool, error) {
+	var exists bool
+	row := tx.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1
+			  AND c.relkind = 'i'
+			  AND n.nspname = ANY (current_schemas(true))
+		)`, name)
+	if err := row.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // advisoryLockKey derives a stable int64 key for pg_advisory_xact_lock
