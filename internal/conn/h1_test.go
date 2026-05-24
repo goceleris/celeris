@@ -11,14 +11,14 @@ import (
 // state machine for iouring + epoll. Pre-fix neither engine enforced
 // ReadHeaderTimeout (only std did, via http.Server). The state machine:
 //
-//   1. Engine sets ReadHeaderTimeoutNs + ArmHeaderDeadline at conn-
-//      accept. HeaderDeadlineNs is now > 0.
-//   2. ProcessH1 calls ClearHeaderDeadline at its entry (we're
-//      actively parsing, not waiting). HeaderDeadlineNs == 0.
-//   3. ProcessH1's deferred ArmHeaderDeadline fires on return-nil
-//      (awaiting next request's bytes). HeaderDeadlineNs > 0 again.
-//   4. If ReadHeaderTimeoutNs is 0 (config disabled), all arm calls
-//      are no-ops.
+//  1. Engine sets ReadHeaderTimeoutNs + ArmHeaderDeadline at conn-
+//     accept. HeaderDeadlineNs is now > 0.
+//  2. ProcessH1 calls ClearHeaderDeadline at its entry (we're
+//     actively parsing, not waiting). HeaderDeadlineNs == 0.
+//  3. ProcessH1's deferred ArmHeaderDeadline fires on return-nil
+//     (awaiting next request's bytes). HeaderDeadlineNs > 0 again.
+//  4. If ReadHeaderTimeoutNs is 0 (config disabled), all arm calls
+//     are no-ops.
 //
 // checkTimeouts in each engine closes the conn when now > deadline.
 func TestHeaderDeadline_ClearArmCycle(t *testing.T) {
@@ -107,7 +107,7 @@ func TestHeaderDeadline_KeepAliveIdleNotKilled(t *testing.T) {
 	s := NewH1State()
 	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
 
-	s.ArmHeaderDeadline() // conn-accept arm
+	s.ArmHeaderDeadline()   // conn-accept arm
 	s.ClearHeaderDeadline() // headers parsed
 	// Simulate keep-alive idle window. checkTimeouts sees deadline==0
 	// → skips the check. IdleTimeout takes over (different code path).
