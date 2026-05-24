@@ -417,10 +417,13 @@ func (l *Loop) run(ctx context.Context) {
 		// Check connection timeouts. Default cadence is every 1024 iterations
 		// (~100ms under load); when detached conns exist with idle deadlines
 		// the gate tightens to every 32 iterations (~50ms idle wall time)
-		// so the WS idle-close fires within its configured budget.
+		// so the WS idle-close fires within its configured budget. When
+		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
+		// the gate ALSO tightens to 0x1F — see iouring/worker.go for the
+		// shared rationale.
 		l.tickCounter++
 		gate := uint32(0x3FF)
-		if l.detachedCount > 0 {
+		if l.detachedCount > 0 || l.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
 		if l.tickCounter&gate == 0 {
@@ -1509,6 +1512,13 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	maxMs := 500
 	if l.detachedCount > 0 {
 		maxMs = 50
+	}
+	// Slowloris defence: when ReadHeaderTimeout is enabled, cap the
+	// epoll_wait timeout so checkTimeouts can fire the HeaderDeadline
+	// reliably even under low traffic. 25ms * 0x1F gate = 800ms worst-
+	// case sweep latency, well below the walker's 2s drip-budget slack.
+	if l.cfg.ReadHeaderTimeout > 0 && maxMs > 25 {
+		maxMs = 25
 	}
 	switch {
 	case l.consecutiveEmpty == 0:

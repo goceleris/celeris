@@ -597,10 +597,18 @@ func (w *Worker) run(ctx context.Context) {
 		// iterations (~100ms under load); when detached conns exist with
 		// idle deadlines the gate tightens to every 32 iterations
 		// (~50ms idle wall time) so the WS idle-close fires within its
-		// configured budget.
+		// configured budget. When ReadHeaderTimeout is enabled (default
+		// 10s in config), the gate ALSO tightens to 0x1F so the
+		// slowloris-defence deadline fires within its expected budget
+		// even under low CQE traffic — surfaced by probatorium nightly
+		// 26366632586, where the prior 0x3FF gate combined with the
+		// 100ms adaptive wait cap could delay checkTimeouts by 100+
+		// seconds on under-utilised workers, letting slow-drip clients
+		// bypass the deadline. The v1.4.11 slowloris defence is only
+		// bulletproof with this tighter cadence.
 		w.tickCounter++
 		gate := uint32(0x3FF)
-		if w.detachedCount > 0 {
+		if w.detachedCount > 0 || w.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
 		if w.tickCounter&gate == 0 {
@@ -677,6 +685,15 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	maxWait := 100 * time.Millisecond
 	if w.detachedCount > 0 {
 		maxWait = 50 * time.Millisecond
+	}
+	// Slowloris defence: when ReadHeaderTimeout is enabled, the
+	// checkTimeouts cadence has a wall-time ceiling of maxWait * gate.
+	// To keep the worst-case sweep latency under 1s (well below the
+	// walker's 2s drip-budget slack), cap maxWait at 25ms when the
+	// header timeout is configured. Combined with the 0x1F gate (32
+	// iters): 25ms * 32 = 800ms worst case.
+	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond {
+		maxWait = 25 * time.Millisecond
 	}
 	switch {
 	case w.emptyIters <= 10:
