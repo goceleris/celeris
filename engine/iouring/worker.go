@@ -499,7 +499,7 @@ func (w *Worker) run(ctx context.Context) {
 					// (which has the same case) is only called from
 					// the cancel path. Without this case, slowloris-
 					// defence timer CQEs are silently dropped.
-					w.handleHeaderTimer(fd, now)
+					w.handleHeaderTimer(fd)
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -655,7 +655,7 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 		w.handleH2Wakeup()
 	case udProvide:
 	case udHeaderTimer:
-		w.handleHeaderTimer(fd, now)
+		w.handleHeaderTimer(fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
 	case udDriverSend:
@@ -679,7 +679,12 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 // gate below skips the close. If re-armed in the same window (next
 // keep-alive request), the ArmHeaderDeadline callback submits a fresh
 // timer SQE — so we don't need to re-arm here.
-func (w *Worker) handleHeaderTimer(fd int, now int64) {
+// handleHeaderTimer ignores the caller's `now` because cachedNow is
+// refreshed only every 64 iterations (60+ms stale under bursty load)
+// and a stale now < dl comparison would spuriously re-arm a fresh 10s
+// timer, effectively doubling the slowloris window. One vDSO call per
+// timer CQE — rare in the hot path — is the right trade-off.
+func (w *Worker) handleHeaderTimer(fd int) {
 	if fd < 0 || fd > w.maxFD {
 		return
 	}
@@ -698,13 +703,7 @@ func (w *Worker) handleHeaderTimer(fd int, now int64) {
 		// fresh timer SQE.
 		return
 	}
-	// Re-read now from the kernel — cachedNow is refreshed only every
-	// 64 iterations, which could be 60+ms stale under bursty load.
-	// A stale now < dl comparison would spuriously re-arm a fresh
-	// 10s timer and effectively double the slowloris window. The
-	// fresh time.Now() costs one vDSO call, called only when a timer
-	// CQE arrives (rare in the hot path).
-	now = time.Now().UnixNano()
+	now := time.Now().UnixNano()
 	if now < dl {
 		// True early fire (kernel clock drift, very rare). Re-arm
 		// a fresh timer for the actual remaining time.
