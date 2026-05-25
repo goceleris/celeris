@@ -752,10 +752,20 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 	cs.headerTimerSpec.Nsec = remaining % int64(time.Second)
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
-		// Ring full — fall back to sweep-based checkTimeouts. Not
-		// bulletproof but acceptable: the next CQE batch will drain
-		// the ring and the next initProtocol/arm will have a slot.
-		return
+		// Ring full — submit pending SQEs to drain, then retry.
+		// Without this, high-CQE-traffic cells (observability,
+		// static_swagger_proxy with concurrent Markov + adversarial
+		// walkers) silently dropped a fraction of timer arms; those
+		// conns then relied on the sweep, hitting the cadence floor.
+		// Surfaced by nightly 26397557463 where slow refapps still
+		// showed 62% slowloris hang rate post-forceRSTClose fix.
+		if _, err := w.ring.Submit(); err != nil {
+			return
+		}
+		sqe = w.ring.GetSQE()
+		if sqe == nil {
+			return
+		}
 	}
 	prepTimeout(sqe, unsafe.Pointer(&cs.headerTimerSpec), 0, 0)
 	setSQEUserData(sqe, encodeUserData(udHeaderTimer, cs.fd))
