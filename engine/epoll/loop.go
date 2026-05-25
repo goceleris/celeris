@@ -1666,16 +1666,19 @@ func (l *Loop) closeConn(fd int) {
 	// H2 (GOAWAY / RST_STREAM flushing) and WS/SSE detach (middleware-
 	// queued close frames).
 	//
-	// forceRSTClose (slowloris-defence) ALSO takes the fast path: the
-	// caller already set SO_LINGER {1, 0}, so a plain close() RSTs.
-	// Skipping SHUT_WR is critical — without it the conn would enter
-	// FIN_WAIT_1 first and the linger semantics may not trigger RST
-	// on some kernels (the walker's drip writes would keep succeeding
-	// locally past the close).
+	// forceRSTClose (slowloris-defence): SHUT_RDWR + SO_LINGER {1,0} +
+	// close = guaranteed RST even when the receive buffer is fully
+	// drained (which it is for our event-loop, unlike std's
+	// http.Server). See iouring/worker.go finishCloseDetached for the
+	// detailed rationale.
 	fastClose := !detached && cs.protocol == engine.HTTP1 && cs.h1State != nil && !trulyDetached
-	if fastClose || cs.forceRSTClose {
+	switch {
+	case cs.forceRSTClose:
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
-	} else {
+	case fastClose:
+		_ = unix.Close(fd)
+	default:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		drainRecvBuffer(fd)
 		_ = unix.Close(fd)

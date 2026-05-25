@@ -1931,10 +1931,16 @@ func (w *Worker) finishClose(fd int) {
 	// close() without shutdown is equivalent on localhost and within
 	// noise on real networks.
 	//
-	// forceRSTClose (slowloris-defence) also lands here: SO_LINGER {1,0}
-	// was set by the caller, so this plain close() will RST. The
-	// fastClose branch is fine for this case — H1, no in-flight body.
-	if fastClose || (cs != nil && cs.forceRSTClose) {
+	// forceRSTClose (slowloris-defence): SHUT_RDWR + SO_LINGER {1,0}
+	// + close = guaranteed RST regardless of receive-buffer state.
+	// See finishCloseDetached for the rationale.
+	if cs != nil && cs.forceRSTClose {
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
+		_ = unix.Close(fd)
+		return
+	}
+	// fastClose: plain H1 no-body conn → close() alone suffices.
+	if fastClose {
 		_ = unix.Close(fd)
 		return
 	}
@@ -1998,14 +2004,20 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	}
 
 	// forceRSTClose: slowloris-defence path requested RST instead of
-	// FIN. Skip Shutdown(SHUT_WR) and drainRecvBuffer entirely —
-	// SO_LINGER {1, 0} was already set by the caller (see
-	// handleHeaderTimer / checkTimeouts HeaderDeadline branch), so
-	// close() will RST. SHUT_WR before close would put the conn into
-	// FIN_WAIT_1 first and may neutralise the linger semantics on some
-	// kernels; this path ensures the peer observes RST on its very
-	// next write regardless of state.
+	// FIN. SO_LINGER {1, 0} alone isn't reliable when the receive
+	// buffer is fully drained (our recv SQE consumed every slowloris
+	// drip byte as it arrived) — the kernel may still send FIN since
+	// there's no unread data to "discard". shutdown(SHUT_RDWR) FORCES
+	// abortive close: combined with LINGER 0 it always RSTs.
+	//
+	// std's http.Server gets this for free because its read goroutine
+	// frequently has unread bytes in the recv buffer when ReadHeader-
+	// Timeout fires (the deadline can interrupt a partial recv), so
+	// close() RSTs naturally. Our event-loop drains as bytes arrive,
+	// leaving the buffer empty at close time — hence the need for
+	// explicit SHUT_RDWR.
 	if cs.forceRSTClose {
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
 		return
 	}
