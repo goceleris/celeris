@@ -51,6 +51,7 @@ type Loop struct {
 	epollFD      int
 	listenFD     int
 	eventFD      int // eventfd for H2 write queue wakeup (-1 if unavailable)
+	timerFD      int // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
 	events       []unix.EpollEvent
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
@@ -131,6 +132,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		epollFD:      -1,
 		listenFD:     -1,
 		eventFD:      -1,
+		timerFD:      -1,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
 		conns:        make([]*connState, connTableSize),
 		handler:      handler,
@@ -210,6 +212,35 @@ func (l *Loop) run(ctx context.Context) {
 		}
 	}
 	l.eventFD = efd
+
+	// timerfd: forces checkTimeouts to run on a kernel-enforced 25ms
+	// cadence regardless of socket-event traffic. Without this, idle
+	// or low-traffic workers ran checkTimeouts only every ~800ms in
+	// the worst case (gate × adaptive_wait), eating into the
+	// slowloris walker's 2s slack budget for slow refapps. Mirrors
+	// the kernel-precision that iouring gets from per-conn
+	// IORING_OP_TIMEOUT SQEs.
+	if l.cfg.ReadHeaderTimeout > 0 {
+		tfd, tfdErr := unix.TimerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
+		if tfdErr == nil {
+			// 25ms periodic; first fire at 25ms too.
+			spec := unix.ItimerSpec{
+				Interval: unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
+				Value:    unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
+			}
+			if err := unix.TimerfdSettime(tfd, 0, &spec, nil); err != nil {
+				_ = unix.Close(tfd)
+				tfd = -1
+			} else if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, tfd, &unix.EpollEvent{
+				Events: unix.EPOLLIN,
+				Fd:     int32(tfd),
+			}); err != nil {
+				_ = unix.Close(tfd)
+				tfd = -1
+			}
+			l.timerFD = tfd
+		}
+	}
 
 	l.ready <- nil
 
@@ -313,6 +344,18 @@ func (l *Loop) run(ctx context.Context) {
 			if fd == l.eventFD && l.eventFD >= 0 {
 				var buf [8]byte
 				_, _ = unix.Read(l.eventFD, buf[:])
+				continue
+			}
+
+			// timerfd wakeup: drain the 8-byte expiration counter and
+			// fire checkTimeouts NOW so the slowloris HeaderDeadline
+			// hits within the kernel-precise 25ms cadence rather than
+			// the sweep gate's worst-case window. Mirrors iouring's
+			// per-conn IORING_OP_TIMEOUT precision on the epoll engine.
+			if fd == l.timerFD && l.timerFD >= 0 {
+				var buf [8]byte
+				_, _ = unix.Read(l.timerFD, buf[:])
+				l.checkTimeouts()
 				continue
 			}
 
@@ -1749,6 +1792,9 @@ func (l *Loop) shutdown() {
 	}
 	if l.eventFD >= 0 {
 		_ = unix.Close(l.eventFD)
+	}
+	if l.timerFD >= 0 {
+		_ = unix.Close(l.timerFD)
 	}
 	_ = unix.Close(l.epollFD)
 	// Wait for async dispatch goroutines to exit. They've been
