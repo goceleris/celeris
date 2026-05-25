@@ -1931,11 +1931,11 @@ func (w *Worker) finishClose(fd int) {
 	// close() without shutdown is equivalent on localhost and within
 	// noise on real networks.
 	//
-	// forceRSTClose (slowloris-defence): SHUT_RDWR + SO_LINGER {1,0}
-	// + close = guaranteed RST regardless of receive-buffer state.
-	// See finishCloseDetached for the rationale.
+	// forceRSTClose (slowloris-defence): plain close() with the
+	// SO_LINGER {1, 0} the caller already set. NO shutdown before —
+	// shutdown(SHUT_*) sends FIN first which puts the conn in
+	// CLOSE_WAIT/FIN_WAIT_1 where LINGER may no longer trigger RST.
 	if cs != nil && cs.forceRSTClose {
-		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
 		return
 	}
@@ -2003,21 +2003,20 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		return
 	}
 
-	// forceRSTClose: slowloris-defence path requested RST instead of
-	// FIN. SO_LINGER {1, 0} alone isn't reliable when the receive
-	// buffer is fully drained (our recv SQE consumed every slowloris
-	// drip byte as it arrived) — the kernel may still send FIN since
-	// there's no unread data to "discard". shutdown(SHUT_RDWR) FORCES
-	// abortive close: combined with LINGER 0 it always RSTs.
+	// forceRSTClose: slowloris-defence path requested RST. The recipe
+	// to force RST on Linux regardless of receive-buffer state:
 	//
-	// std's http.Server gets this for free because its read goroutine
-	// frequently has unread bytes in the recv buffer when ReadHeader-
-	// Timeout fires (the deadline can interrupt a partial recv), so
-	// close() RSTs naturally. Our event-loop drains as bytes arrive,
-	// leaving the buffer empty at close time — hence the need for
-	// explicit SHUT_RDWR.
+	//   1. setsockopt TCP_REPAIR=1  (no-op fallback if not permitted)
+	//   2. setsockopt SO_LINGER {1, 0}  (caller already did this)
+	//   3. close(fd)  — kernel discards both TX and RX queues, RSTs
+	//
+	// Earlier attempt with shutdown(SHUT_RDWR) before close was
+	// trying to FORCE abortive close, but SHUT_RDWR sends FIN
+	// FIRST — the conn enters CLOSE_WAIT/FIN_WAIT_1 and SO_LINGER
+	// may no longer trigger RST on subsequent close. Removing the
+	// shutdown lets SO_LINGER take its intended effect on a
+	// still-ESTABLISHED conn.
 	if cs.forceRSTClose {
-		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
 		return
 	}
