@@ -151,6 +151,15 @@ type connState struct {
 	// and the corresponding CQE has not yet been processed. Used to
 	// avoid duplicate timer SQEs.
 	headerTimerArmed bool
+	// forceRSTClose is set by the slowloris-defence close paths
+	// (handleHeaderTimer + checkTimeouts HeaderDeadline branch) to
+	// signal that the conn should be torn down via RST instead of the
+	// usual graceful FIN+drain. finishClose / finishCloseDetached
+	// honor the flag by skipping Shutdown+drainRecvBuffer entirely and
+	// calling close() directly — SO_LINGER {1, 0} (set by the caller
+	// before closeConn) then forces RST. The walker's next write hits
+	// ECONNRESET immediately regardless of TCP send-buffer state.
+	forceRSTClose bool
 }
 
 var connStatePool = sync.Pool{
@@ -211,6 +220,7 @@ func releaseConnState(cs *connState) {
 	cs.recvPauseDesired.Store(false)
 	cs.headerTimerSpec = kernelTimespec{}
 	cs.headerTimerArmed = false
+	cs.forceRSTClose = false
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false

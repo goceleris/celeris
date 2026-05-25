@@ -1566,12 +1566,11 @@ func (l *Loop) checkTimeouts() {
 		// ReadHeaderTimeout: slowloris defence. Force RST close so the
 		// peer immediately observes termination on its next write —
 		// see iouring/worker.go handleHeaderTimer for the SO_LINGER {1,0}
-		// rationale. The fastClose path here is unchanged; we only flip
-		// the linger semantics for slowloris-triggered closes so the
-		// walker doesn't get fooled by TCP send-buffer hangover.
+		// + forceRSTClose rationale.
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
 				_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
+				cs.forceRSTClose = true
 				l.closeConn(fd)
 				continue
 			}
@@ -1666,8 +1665,15 @@ func (l *Loop) closeConn(fd int) {
 	// the Connection:close churn hot path. Graceful path retained for
 	// H2 (GOAWAY / RST_STREAM flushing) and WS/SSE detach (middleware-
 	// queued close frames).
+	//
+	// forceRSTClose (slowloris-defence) ALSO takes the fast path: the
+	// caller already set SO_LINGER {1, 0}, so a plain close() RSTs.
+	// Skipping SHUT_WR is critical — without it the conn would enter
+	// FIN_WAIT_1 first and the linger semantics may not trigger RST
+	// on some kernels (the walker's drip writes would keep succeeding
+	// locally past the close).
 	fastClose := !detached && cs.protocol == engine.HTTP1 && cs.h1State != nil && !trulyDetached
-	if fastClose {
+	if fastClose || cs.forceRSTClose {
 		_ = unix.Close(fd)
 	} else {
 		_ = unix.Shutdown(fd, unix.SHUT_WR)

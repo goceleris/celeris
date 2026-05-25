@@ -710,24 +710,15 @@ func (w *Worker) handleHeaderTimer(fd int) {
 		w.armHeaderTimer(cs)
 		return
 	}
-	// Deadline exceeded — slowloris defence fires.
-	//
-	// Force RST instead of FIN: comparison with std (which had 0
-	// hangs) revealed std processed 4-15x MORE slowloris attempts
-	// per cell budget than iouring, meaning std's close caused the
-	// walker to immediately fail its next write. iouring's graceful
-	// SHUT_WR+drain+close path (used by async mode) sent FIN; the
-	// walker's small drip writes could continue buffering locally
-	// past the close, often reaching the 12s hang budget without
-	// noticing.
-	//
-	// SO_LINGER {1, 0} discards any pending TX data and sends RST
-	// on close — walker observes ECONNRESET on its very next write,
-	// independent of TCP send-buffer state. The conn is being
-	// terminated for being slow regardless, so we don't care about
-	// graceful tx drain. Mirrors how production proxies (nginx
-	// reset_timedout_connection on) handle the same case.
+	// Deadline exceeded — slowloris defence fires. Force RST close so
+	// the peer observes ECONNRESET on its next write, independent of
+	// TCP send-buffer state. SO_LINGER {1, 0} + forceRSTClose=true
+	// (which makes finishClose / finishCloseDetached skip the
+	// graceful SHUT_WR+drain path that would otherwise leave the conn
+	// in FIN_WAIT and let the walker's drip writes succeed locally
+	// past the close). Mirrors nginx reset_timedout_connection on.
 	_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
+	cs.forceRSTClose = true
 	w.closeConn(fd)
 }
 
@@ -1929,7 +1920,11 @@ func (w *Worker) finishClose(fd int) {
 	// frames so the peer sees them. For H1 without a body in-flight,
 	// close() without shutdown is equivalent on localhost and within
 	// noise on real networks.
-	if fastClose {
+	//
+	// forceRSTClose (slowloris-defence) also lands here: SO_LINGER {1,0}
+	// was set by the caller, so this plain close() will RST. The
+	// fastClose branch is fine for this case — H1, no in-flight body.
+	if fastClose || (cs != nil && cs.forceRSTClose) {
 		_ = unix.Close(fd)
 		return
 	}
@@ -1992,6 +1987,18 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		return
 	}
 
+	// forceRSTClose: slowloris-defence path requested RST instead of
+	// FIN. Skip Shutdown(SHUT_WR) and drainRecvBuffer entirely —
+	// SO_LINGER {1, 0} was already set by the caller (see
+	// handleHeaderTimer / checkTimeouts HeaderDeadline branch), so
+	// close() will RST. SHUT_WR before close would put the conn into
+	// FIN_WAIT_1 first and may neutralise the linger semantics on some
+	// kernels; this path ensures the peer observes RST on its very
+	// next write regardless of state.
+	if cs.forceRSTClose {
+		_ = unix.Close(fd)
+		return
+	}
 	// Detached connections still use the graceful half-close path —
 	// middleware (WebSocket / SSE) may have queued a close-frame echo
 	// that we want to let finish cleanly, and the middleware goroutine
@@ -2688,10 +2695,12 @@ func (w *Worker) checkTimeouts() {
 		// when ProcessH1 finishes a request. A non-zero value past the
 		// deadline means the peer is dripping headers slowly: force RST
 		// close so the peer observes the termination on its very next
-		// write. See handleHeaderTimer for the SO_LINGER {1,0} rationale.
+		// write. See handleHeaderTimer for the SO_LINGER {1,0} +
+		// forceRSTClose rationale.
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
 				_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
+				cs.forceRSTClose = true
 				w.closeConn(fd)
 				continue
 			}
