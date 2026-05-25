@@ -417,10 +417,14 @@ func (l *Loop) run(ctx context.Context) {
 		// Check connection timeouts. Default cadence is every 1024 iterations
 		// (~100ms under load); when detached conns exist with idle deadlines
 		// the gate tightens to every 32 iterations (~50ms idle wall time)
-		// so the WS idle-close fires within its configured budget.
+		// so the WS idle-close fires within its configured budget. When
+		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
+		// the gate ALSO tightens to 0x1F — the in-process synthetic
+		// reproducer (test/integration/slowloris_synthetic_test.go) showed
+		// epoll's HeaderDeadline firing 2s late without this.
 		l.tickCounter++
 		gate := uint32(0x3FF)
-		if l.detachedCount > 0 {
+		if l.detachedCount > 0 || l.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
 		if l.tickCounter&gate == 0 {
@@ -1509,6 +1513,12 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	maxMs := 500
 	if l.detachedCount > 0 {
 		maxMs = 50
+	}
+	// Slowloris defence: cap epoll_wait when ReadHeaderTimeout is enabled
+	// so checkTimeouts fires the HeaderDeadline reliably under low traffic.
+	// 25ms × 0x1F gate = 800ms worst-case sweep latency.
+	if l.cfg.ReadHeaderTimeout > 0 && maxMs > 25 {
+		maxMs = 25
 	}
 	switch {
 	case l.consecutiveEmpty == 0:
