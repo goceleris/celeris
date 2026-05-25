@@ -1931,11 +1931,10 @@ func (w *Worker) finishClose(fd int) {
 	// close() without shutdown is equivalent on localhost and within
 	// noise on real networks.
 	//
-	// forceRSTClose (slowloris-defence): plain close() with the
-	// SO_LINGER {1, 0} the caller already set. NO shutdown before —
-	// shutdown(SHUT_*) sends FIN first which puts the conn in
-	// CLOSE_WAIT/FIN_WAIT_1 where LINGER may no longer trigger RST.
+	// forceRSTClose (slowloris-defence): SHUT_RDWR + close. See
+	// finishCloseDetached for the rationale.
 	if cs != nil && cs.forceRSTClose {
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
 		return
 	}
@@ -2003,20 +2002,14 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		return
 	}
 
-	// forceRSTClose: slowloris-defence path requested RST. The recipe
-	// to force RST on Linux regardless of receive-buffer state:
-	//
-	//   1. setsockopt TCP_REPAIR=1  (no-op fallback if not permitted)
-	//   2. setsockopt SO_LINGER {1, 0}  (caller already did this)
-	//   3. close(fd)  — kernel discards both TX and RX queues, RSTs
-	//
-	// Earlier attempt with shutdown(SHUT_RDWR) before close was
-	// trying to FORCE abortive close, but SHUT_RDWR sends FIN
-	// FIRST — the conn enters CLOSE_WAIT/FIN_WAIT_1 and SO_LINGER
-	// may no longer trigger RST on subsequent close. Removing the
-	// shutdown lets SO_LINGER take its intended effect on a
-	// still-ESTABLISHED conn.
+	// forceRSTClose: slowloris-defence path requested RST. Empirical
+	// data (nightly 26418830572 vs 26414322152): SHUT_RDWR + close
+	// gives ~50% more reliable observable-RST than plain close +
+	// LINGER on iouring. The SHUT_RDWR + LINGER combo wins because
+	// SHUT_RDWR drops the receive queue too (close() with LINGER
+	// only drops TX). Walker observes the abortive close immediately.
 	if cs.forceRSTClose {
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
 		return
 	}
