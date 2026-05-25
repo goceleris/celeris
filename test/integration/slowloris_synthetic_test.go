@@ -288,9 +288,10 @@ func TestSlowlorisSyntheticConcurrent(t *testing.T) {
 			close(startBarrier)
 
 			var (
-				ok, failed int
-				maxClose   time.Duration
-				latencies  []time.Duration
+				ok, failed   int
+				maxClose     time.Duration
+				latencySum   time.Duration
+				latencyCount int
 			)
 			for i := 0; i < nSlowloris; i++ {
 				r := <-results
@@ -300,11 +301,17 @@ func TestSlowlorisSyntheticConcurrent(t *testing.T) {
 					continue
 				}
 				ok++
-				latencies = append(latencies, r.closeObservedAt)
+				latencySum += r.closeObservedAt
+				latencyCount++
 				if r.closeObservedAt > maxClose {
 					maxClose = r.closeObservedAt
 				}
 			}
+			var avgClose time.Duration
+			if latencyCount > 0 {
+				avgClose = latencySum / time.Duration(latencyCount)
+			}
+			t.Logf("[%s] avg close-latency=%v across %d defended clients", tc.name, avgClose, latencyCount)
 			t.Logf("[%s] %d clients defended, %d failed; max close-latency=%v (deadline=%v slack=%v)",
 				tc.name, ok, failed, maxClose, readHdrTO, slackBudget)
 			if failed > 0 {
