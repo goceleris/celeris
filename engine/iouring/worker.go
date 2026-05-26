@@ -978,16 +978,34 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.WorkerID = int32(w.id)
 		cs.h1State.WorkerIDSet = true
 		// Slowloris defence: kernel-enforced per-conn header deadline.
-		// The OnHeaderDeadlineArmed callback submits IORING_OP_TIMEOUT
-		// SQEs on every arm-transition (initial accept + each keep-alive
-		// next-request transition). The kernel fires the timer at the
-		// absolute deadline regardless of CQE traffic on the worker,
-		// giving parity with std's SetReadDeadline-based defence.
-		// checkTimeouts is the belt-and-braces fallback (now also gated
-		// tightly when ReadHeaderTimeout > 0).
+		//
+		// Sync mode (!w.async): ProcessH1 runs inline on the worker thread,
+		// so OnHeaderDeadlineArmed → armHeaderTimer is always a worker-
+		// thread call. Safe.
+		//
+		// Async mode (w.async): ProcessH1 runs on the per-conn dispatch
+		// goroutine. The keep-alive re-arm path (ProcessH1 sees
+		// HeaderDeadlineNs == 0 and calls ArmHeaderDeadline at line 360
+		// of internal/conn/h1.go) would fire OnHeaderDeadlineArmed from
+		// the goroutine, which would call w.ring.GetSQE — a violation of
+		// IORING_SETUP_SINGLE_ISSUER that can silently drop SQEs or
+		// corrupt the SQ ring. Leave OnHeaderDeadlineArmed nil in async
+		// mode; the initial accept-time arm fires via the direct
+		// armHeaderTimer call below (worker thread, safe), the recv-
+		// path retry (handleRecv) covers SQ-pressure drops, and keep-
+		// alive re-arms fall back to checkTimeouts which now runs every
+		// 32 iters × 25ms = 800ms worst case.
 		cs.h1State.ReadHeaderTimeoutNs = int64(w.cfg.ReadHeaderTimeout)
-		cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
+		if !w.async {
+			cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
+		}
 		cs.h1State.ArmHeaderDeadline()
+		if w.async {
+			// Direct worker-thread arm for the initial deadline; the
+			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
+			// only stamped HeaderDeadlineNs, not the SQE.
+			w.armHeaderTimer(cs)
+		}
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
