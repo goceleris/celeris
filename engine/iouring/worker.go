@@ -1393,6 +1393,19 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			cs.asyncCond.Signal()
 		}
 		w.reqBatch++
+		// Re-attempt the slowloris-defence timer arm if the initial
+		// attempt (from initProtocol on accept) silently dropped under
+		// SQ-ring pressure. ArmHeaderDeadline is idempotent on
+		// HeaderDeadlineNs, so it won't reset the deadline; but
+		// armHeaderTimer's headerTimerArmed gate means we only retry
+		// the SQE submission if the prior arm is not in flight. This
+		// is the explicit "retry on next recv" path that was missing —
+		// without it, a conn whose initial arm failed relies entirely
+		// on the sweep, doubling worst-case close latency on slow
+		// refapps (observability/static_swagger_proxy).
+		if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
+			w.armHeaderTimer(cs)
+		}
 		if !cqeHasMore(c.Flags) && !cs.recvPaused {
 			if !w.prepareRecv(fd, cs.buf) {
 				cs.needsRecv = true
@@ -1494,6 +1507,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	w.reqBatch++
+
+	// Slowloris-defence: retry timer arm if the initial attempt dropped
+	// silently under SQ-ring pressure. Mirrors the async-path retry above.
+	// Sync mode: ProcessH1 is idempotent on HeaderDeadlineNs so it won't
+	// re-trigger OnHeaderDeadlineArmed if the deadline is already set,
+	// leaving conns whose initial arm failed dependent on the sweep alone.
+	if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
+		w.armHeaderTimer(cs)
+	}
 
 	// lastActivity already set above; timeout checked in checkTimeouts.
 
