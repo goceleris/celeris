@@ -600,13 +600,22 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		// Check connection timeouts. Default cadence is every 1024
-		// iterations (~100ms under load); when detached conns exist with
-		// idle deadlines the gate tightens to every 32 iterations
-		// (~50ms idle wall time) so the WS idle-close fires within its
-		// configured budget.
+		// iterations (~100ms under load); the gate tightens to every 32
+		// iterations (~50ms idle wall time) in two cases:
+		//   - detached conns exist with idle deadlines → WS idle-close
+		//     must fire within its configured budget.
+		//   - ReadHeaderTimeout > 0 → slowloris defence. The per-conn
+		//     IORING_OP_TIMEOUT is the primary mechanism but it can
+		//     silently drop arms under SQ-ring pressure (armHeaderTimer
+		//     returns without arming if GetSQE+Submit retry still fails).
+		//     The sweep is the belt-and-braces fallback; under heavy
+		//     legit traffic (observability+static_swagger_proxy) the
+		//     0x3FF gate is too coarse and the walker times out before
+		//     the sweep notices. Tightening to 0x1F caps the worst-case
+		//     close latency on a dropped arm to ~50ms.
 		w.tickCounter++
 		gate := uint32(0x3FF)
-		if w.detachedCount > 0 {
+		if w.detachedCount > 0 || w.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
 		if w.tickCounter&gate == 0 {
@@ -777,8 +786,10 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 // periods, backs off to reduce syscall overhead (up to 100ms). When the
 // listen socket is closed (draining), uses 1s. When H2 connections exist
 // without eventfd, uses 100us for write queue polling. When detached
-// conns exist with idle deadlines, the cap drops to 50ms so checkTimeouts
-// can fire the WS-supplied IdleDeadline before its expiry.
+// conns exist with idle deadlines or ReadHeaderTimeout is configured, the
+// cap drops to 25ms so checkTimeouts can fire detached-idle deadlines
+// before expiry AND back up the per-conn IORING_OP_TIMEOUT for slowloris
+// defence when the kernel timer SQE failed to arm under SQ-ring pressure.
 func (w *Worker) adaptiveTimeout() time.Duration {
 	if w.listenFD < 0 {
 		return 1 * time.Second
@@ -792,6 +803,9 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	maxWait := 100 * time.Millisecond
 	if w.detachedCount > 0 {
 		maxWait = 50 * time.Millisecond
+	}
+	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond {
+		maxWait = 25 * time.Millisecond
 	}
 	switch {
 	case w.emptyIters <= 10:
