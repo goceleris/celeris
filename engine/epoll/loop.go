@@ -1706,22 +1706,27 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	// Plain unix.Close for H1 connections (both sync and async-mode pre-
-	// allocated detachMu but not truly detached). Mirrors std/net.http
-	// c.close() → c.rwc.Close(): no shutdown, no linger, no drain. The
-	// shutdown+drain combo was leaving a ~5-7% walker-hang rate on
-	// probatorium slow-refapp slowloris cells (nightly 26429150655 et
-	// al), pointing at our extra syscalls racing with the peer's
-	// in-flight Write rather than at FIN/RST signaling per se.
+	// H1 close: SHUT_WR + Close. The shutdown call forces FIN regardless
+	// of the kernel recv-buffer state — important under slowloris where
+	// the peer is still writing drips and a plain Close on a non-empty
+	// recv buffer would send RST instead (which is not retransmitted by
+	// TCP, so a single packet loss strands the walker).
 	//
-	// Graceful path retained for H2 (GOAWAY / RST_STREAM flushing) and
-	// for truly detached WS/SSE conns (middleware-queued close frames).
+	// No drainRecvBuffer between SHUT_WR and Close: an empty drain leaves
+	// no race, but a non-empty one introduces a multi-µs window in which
+	// a fresh peer drip queues — then Close sees it and emits RST anyway.
+	// Just trust SHUT_WR's FIN to be retransmitted until ACK'd.
+	//
+	// Graceful drain path retained for H2 (GOAWAY / RST_STREAM flushing)
+	// and for truly detached WS/SSE conns (middleware-queued close
+	// frames).
 	plainClose := cs.h1State != nil && !trulyDetached && cs.h2State == nil
 	switch {
 	case cs.forceRSTClose:
 		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
 	case plainClose:
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		_ = unix.Close(fd)
 	default:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)

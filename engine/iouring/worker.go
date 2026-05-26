@@ -2072,13 +2072,21 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// Async-mode HTTP1 conns are NOT truly detached (no WS/SSE middleware
 	// owns them) — they just pre-allocate detachMu in acquireConnState so
 	// the dispatch goroutine and worker can serialize writeBuf access.
-	// For these, plain unix.Close matches what std/net.http does on the
-	// equivalent path (c.close() → c.rwc.Close()) and avoids the
-	// SHUT_WR+drain race against a peer that may still be writing —
-	// the empirical signal from probatorium slow-refapp cells (nightly
-	// 26429150655 et al). SHUT_WR+drain+Close left a ~5-7% walker-hang
-	// rate; std's plain Close on the same probatorium walker shows 0.
+	//
+	// Plain unix.Close (matching net/http) sends FIN if the kernel recv
+	// buffer is empty, RST if non-empty. For slowloris, walker is still
+	// writing drips so the buffer often has unread bytes — close → RST.
+	// RST is NOT retransmitted by TCP, so if it's lost on the cluster
+	// fabric the walker never observes the close (walker hangs).
+	//
+	// SHUT_WR forces FIN explicitly (writer half-close) BEFORE close,
+	// regardless of recv-buffer state. FIN IS retransmitted from
+	// FIN_WAIT_1 until ACK'd, so packet loss can't strand the walker.
+	// No drainRecvBuffer (which was the prior approach's race source —
+	// the drain syscall and the close syscall left a multi-µs window in
+	// which a fresh walker drip would queue, making the close → RST).
 	if cs.h1State != nil && !cs.h1State.Detached {
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		_ = unix.Close(fd)
 		return
 	}
