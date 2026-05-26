@@ -719,44 +719,19 @@ func (w *Worker) handleHeaderTimer(fd int) {
 		w.armHeaderTimer(cs)
 		return
 	}
-	// Deadline exceeded — slowloris defence fires.
-	//
-	// Pre-fix: SHUT_RDWR + close + SO_LINGER{1,0} to force RST. Empirically
-	// this left ~5-7% of slowloris conns in walker-hang state across slow-
-	// refapp cells (observability + static_swagger_proxy on iouring +
-	// epoll) — FIN/RST visibility under cluster load is just unreliable
-	// enough that the walker's drip-budget timer (20s) fires before its
-	// kernel observes the close on a small but consistent fraction of
-	// attempts. Same shape on iouring AND epoll, ruling out engine-
-	// specific causes.
-	//
-	// Fix: write a 408 Request Timeout response BEFORE closing. The
-	// response bytes flow through TCP's reliable-delivery path
-	// (retransmits if dropped), and the walker's Read returns 1 byte of
-	// response data → wellReject. No dependency on FIN/RST signaling. The
-	// kernel sends FIN after the response drains (graceful close, no
-	// LINGER) — walker observes EOF on its next Read too, belt-and-braces.
-	//
-	// cs.writeFn appends to cs.writeBuf — safe from the worker thread.
-	// closeConn sees the non-empty writeBuf and defers the close until
-	// the SEND CQE completes; finishCloseDetached then takes the graceful
-	// SHUT_WR + drainRecvBuffer + Close path (no forceRSTClose), so the
-	// 408 reliably leaves the kernel before the FIN.
-	cs.writeFn(requestTimeoutResponse)
+	// Deadline exceeded — slowloris defence fires. Mirror std/net.http's
+	// approach: plain unix.Close, no shutdown, no linger, no response.
+	// net/http on hdrDeadline → isCommonNetReadError → "don't reply",
+	// then c.close() → c.rwc.Close() (plain TCP close). Std walker shows
+	// 0 hangs on the exact same probatorium test. We previously tried:
+	//   - SHUT_RDWR + close + LINGER{1,0} (RST) → ~17-21 hangs per cell
+	//   - 408 response + SHUT_WR + drain + close → ~17-25 hangs per cell
+	// Both elaborate paths had the same ~5-7% walker-hang rate.
+	// Suspect: SHUT_*/drain syscalls + LINGER each create their own
+	// timing race vs. the walker's drip Write; plain close is simpler
+	// and matches the observed-working std behavior exactly.
 	w.closeConn(fd)
 }
-
-// requestTimeoutResponse is the canonical HTTP/1.1 408 Request Timeout
-// response sent to slowloris clients before their conn is closed. Static
-// across calls (no per-conn state); single allocation at package init.
-// Content-Length: 0 matches the no-body convention and keeps the response
-// to a single TCP segment (~80 bytes well under MSS).
-var requestTimeoutResponse = []byte(
-	"HTTP/1.1 408 Request Timeout\r\n" +
-		"Connection: close\r\n" +
-		"Content-Length: 0\r\n" +
-		"\r\n",
-)
 
 // armHeaderTimer submits an IORING_OP_TIMEOUT SQE that fires at
 // cs.h1State.HeaderDeadlineNs. Called from initProtocol on conn-accept
@@ -2094,14 +2069,23 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		_ = unix.Close(fd)
 		return
 	}
-	// Detached connections still use the graceful half-close path —
-	// middleware (WebSocket / SSE) may have queued a close-frame echo
-	// that we want to let finish cleanly, and the middleware goroutine
-	// already drove the protocol handshake to completion before asking
-	// the engine to drop the FD. RST close (as used by closeNonFixedFD
-	// for plain H1/H2) would cut that echo off. The graceful path is
-	// still SYNC (unix.Close directly) to avoid the async-SQE pile-up
-	// that plagued the pre-patch version.
+	// Async-mode HTTP1 conns are NOT truly detached (no WS/SSE middleware
+	// owns them) — they just pre-allocate detachMu in acquireConnState so
+	// the dispatch goroutine and worker can serialize writeBuf access.
+	// For these, plain unix.Close matches what std/net.http does on the
+	// equivalent path (c.close() → c.rwc.Close()) and avoids the
+	// SHUT_WR+drain race against a peer that may still be writing —
+	// the empirical signal from probatorium slow-refapp cells (nightly
+	// 26429150655 et al). SHUT_WR+drain+Close left a ~5-7% walker-hang
+	// rate; std's plain Close on the same probatorium walker shows 0.
+	if cs.h1State != nil && !cs.h1State.Detached {
+		_ = unix.Close(fd)
+		return
+	}
+	// Truly detached (WS/SSE): graceful half-close so middleware-queued
+	// close-frame echoes flush before the FIN. Sync unix.Close (not via
+	// io_uring) to avoid the async-SQE pile-up that plagued the pre-patch
+	// version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
 	_ = unix.Close(fd)
@@ -2785,19 +2769,11 @@ func (w *Worker) checkTimeouts() {
 			}
 			continue
 		}
-		// ReadHeaderTimeout: slowloris defence. Set by the engine on
-		// fresh conns and after each successful request parse — cleared
-		// when ProcessH1 finishes a request. A non-zero value past the
-		// deadline means the peer is dripping headers slowly. Write a
-		// 408 Request Timeout response then graceful-close — see
-		// handleHeaderTimer for the TCP-reliable-delivery rationale (the
-		// RST-only approach left ~5-7% walker-side hangs under cluster
-		// load due to FIN/RST packet-loss; response bytes are
-		// retransmitted, response data → walker Read returns 1 byte →
-		// wellReject without any dependency on FIN/RST visibility).
+		// ReadHeaderTimeout: slowloris defence. Plain unix.Close path
+		// (handled by closeConn → finishCloseDetached fastClose branch).
+		// See handleHeaderTimer for the rationale (mirrors net/http).
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				cs.writeFn(requestTimeoutResponse)
 				w.closeConn(fd)
 				continue
 			}

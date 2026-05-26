@@ -1588,18 +1588,6 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms).
-// requestTimeoutResponse is the canonical HTTP/1.1 408 Request Timeout
-// response sent to slowloris clients before their conn is closed. Static
-// across calls; one allocation at package init. Content-Length: 0 keeps
-// the response to a single TCP segment (~80 bytes, well under MSS) so a
-// single unix.Write delivers it in one shot to the kernel send buffer.
-var requestTimeoutResponse = []byte(
-	"HTTP/1.1 408 Request Timeout\r\n" +
-		"Connection: close\r\n" +
-		"Content-Length: 0\r\n" +
-		"\r\n",
-)
-
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
 	for fd := 0; fd <= l.maxFD; fd++ {
@@ -1618,30 +1606,17 @@ func (l *Loop) checkTimeouts() {
 			}
 			continue
 		}
-		// ReadHeaderTimeout: slowloris defence.
-		//
-		// Pre-fix: SHUT_RDWR + close + SO_LINGER{1,0} for RST. Empirically
-		// this left ~5-7% walker-side hangs on slow-refapp cells
-		// (observability + static_swagger_proxy) — FIN/RST visibility
-		// under cluster load is just unreliable enough that the walker's
-		// 20s drip-budget fires before its kernel observes the close on a
-		// small consistent fraction of attempts. Same shape on iouring +
-		// epoll despite their close paths being independent.
-		//
-		// Fix: write a 408 Request Timeout response synchronously via
-		// unix.Write (bytes hit the kernel send buffer immediately), then
-		// graceful-close via the default closeConn path. TCP retransmits
-		// response bytes if dropped → walker's Read returns 1 byte of
-		// response data → wellReject. No dependency on FIN/RST signaling.
-		//
-		// Sync write is fine on the event-loop thread: the response is
-		// ~80 bytes, well under MSS; the conn's send buffer is empty
-		// (server never wrote anything for slowloris) so EAGAIN is
-		// practically impossible. Even on partial write the walker
-		// observes the first byte and exits its drip loop.
+		// ReadHeaderTimeout: slowloris defence. Mirror net/http behavior:
+		// plain unix.Close (handled inside closeConn → fastClose branch),
+		// no shutdown, no linger, no response body. net/http on header
+		// timeout calls c.close() → plain Close; std walker shows 0
+		// hangs in probatorium. SHUT_RDWR+LINGER and 408+SHUT_WR+drain
+		// approaches both retained ~5-7% walker-hangs (nightly
+		// 26429150655 and predecessors), pointing at our extra syscalls
+		// racing with the walker's drip Write rather than at FIN/RST
+		// signaling. Simplest mirrors std.
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				_, _ = unix.Write(fd, requestTimeoutResponse)
 				l.closeConn(fd)
 				continue
 			}
@@ -1731,20 +1706,22 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	// Fast-close path for plain H1 connections: close() alone. Saves
-	// shutdown(SHUT_WR) + drainRecvBuffer syscalls (~2 per close) in
-	// the Connection:close churn hot path. Graceful path retained for
-	// H2 (GOAWAY / RST_STREAM flushing) and WS/SSE detach (middleware-
-	// queued close frames).
+	// Plain unix.Close for H1 connections (both sync and async-mode pre-
+	// allocated detachMu but not truly detached). Mirrors std/net.http
+	// c.close() → c.rwc.Close(): no shutdown, no linger, no drain. The
+	// shutdown+drain combo was leaving a ~5-7% walker-hang rate on
+	// probatorium slow-refapp slowloris cells (nightly 26429150655 et
+	// al), pointing at our extra syscalls racing with the peer's
+	// in-flight Write rather than at FIN/RST signaling per se.
 	//
-	// forceRSTClose (slowloris-defence): SHUT_RDWR + close — see
-	// iouring/worker.go finishCloseDetached for rationale.
-	fastClose := !detached && cs.protocol == engine.HTTP1 && cs.h1State != nil && !trulyDetached
+	// Graceful path retained for H2 (GOAWAY / RST_STREAM flushing) and
+	// for truly detached WS/SSE conns (middleware-queued close frames).
+	plainClose := cs.h1State != nil && !trulyDetached && cs.h2State == nil
 	switch {
 	case cs.forceRSTClose:
 		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
-	case fastClose:
+	case plainClose:
 		_ = unix.Close(fd)
 	default:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
