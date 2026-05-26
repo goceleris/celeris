@@ -37,6 +37,25 @@ var stackPool = sync.Pool{New: func() any {
 }}
 
 // New creates a recovery middleware with the given config.
+//
+// Performance note: by default `cfg.Logger` falls back to `slog.Default()`,
+// which on most Go programs is the stdlib text-handler writing to
+// `os.Stderr`. Stderr writes serialize on a global mutex inside Go's
+// default handler. Under iouring/epoll's async-dispatch model the
+// dispatch goroutine holds `cs.detachMu` across the `ProcessH1` call,
+// so a synchronous `log.LogAttrs` here will gate the worker thread for
+// the duration of the stderr write — sustained panic loads can drop
+// engine throughput by an order of magnitude (~14×) and let
+// slowloris-defence header-deadlines slip past on concurrent conns.
+// If your handlers can panic at >100 req/sec (recovery middleware is
+// usually the only thing standing between a buggy handler and a
+// process crash), pass an explicit non-blocking Logger:
+//
+//	slog.New(slog.NewTextHandler(io.Discard, nil))  // drop logs
+//	slog.New(myAsyncHandler)                        // async sink
+//
+// or initialize `slog.SetDefault(...)` to a non-blocking handler at
+// process startup.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
 	if len(config) > 0 {
