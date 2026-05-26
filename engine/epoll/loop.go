@@ -1588,6 +1588,18 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms).
+// requestTimeoutResponse is the canonical HTTP/1.1 408 Request Timeout
+// response sent to slowloris clients before their conn is closed. Static
+// across calls; one allocation at package init. Content-Length: 0 keeps
+// the response to a single TCP segment (~80 bytes, well under MSS) so a
+// single unix.Write delivers it in one shot to the kernel send buffer.
+var requestTimeoutResponse = []byte(
+	"HTTP/1.1 408 Request Timeout\r\n" +
+		"Connection: close\r\n" +
+		"Content-Length: 0\r\n" +
+		"\r\n",
+)
+
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
 	for fd := 0; fd <= l.maxFD; fd++ {
@@ -1606,14 +1618,30 @@ func (l *Loop) checkTimeouts() {
 			}
 			continue
 		}
-		// ReadHeaderTimeout: slowloris defence. Force RST close so the
-		// peer immediately observes termination on its next write —
-		// see iouring/worker.go handleHeaderTimer for the SO_LINGER {1,0}
-		// + forceRSTClose rationale.
+		// ReadHeaderTimeout: slowloris defence.
+		//
+		// Pre-fix: SHUT_RDWR + close + SO_LINGER{1,0} for RST. Empirically
+		// this left ~5-7% walker-side hangs on slow-refapp cells
+		// (observability + static_swagger_proxy) — FIN/RST visibility
+		// under cluster load is just unreliable enough that the walker's
+		// 20s drip-budget fires before its kernel observes the close on a
+		// small consistent fraction of attempts. Same shape on iouring +
+		// epoll despite their close paths being independent.
+		//
+		// Fix: write a 408 Request Timeout response synchronously via
+		// unix.Write (bytes hit the kernel send buffer immediately), then
+		// graceful-close via the default closeConn path. TCP retransmits
+		// response bytes if dropped → walker's Read returns 1 byte of
+		// response data → wellReject. No dependency on FIN/RST signaling.
+		//
+		// Sync write is fine on the event-loop thread: the response is
+		// ~80 bytes, well under MSS; the conn's send buffer is empty
+		// (server never wrote anything for slowloris) so EAGAIN is
+		// practically impossible. Even on partial write the walker
+		// observes the first byte and exits its drip loop.
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
-				cs.forceRSTClose = true
+				_, _ = unix.Write(fd, requestTimeoutResponse)
 				l.closeConn(fd)
 				continue
 			}

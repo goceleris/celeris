@@ -719,17 +719,44 @@ func (w *Worker) handleHeaderTimer(fd int) {
 		w.armHeaderTimer(cs)
 		return
 	}
-	// Deadline exceeded — slowloris defence fires. Force RST close so
-	// the peer observes ECONNRESET on its next write, independent of
-	// TCP send-buffer state. SO_LINGER {1, 0} + forceRSTClose=true
-	// (which makes finishClose / finishCloseDetached skip the
-	// graceful SHUT_WR+drain path that would otherwise leave the conn
-	// in FIN_WAIT and let the walker's drip writes succeed locally
-	// past the close). Mirrors nginx reset_timedout_connection on.
-	_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
-	cs.forceRSTClose = true
+	// Deadline exceeded — slowloris defence fires.
+	//
+	// Pre-fix: SHUT_RDWR + close + SO_LINGER{1,0} to force RST. Empirically
+	// this left ~5-7% of slowloris conns in walker-hang state across slow-
+	// refapp cells (observability + static_swagger_proxy on iouring +
+	// epoll) — FIN/RST visibility under cluster load is just unreliable
+	// enough that the walker's drip-budget timer (20s) fires before its
+	// kernel observes the close on a small but consistent fraction of
+	// attempts. Same shape on iouring AND epoll, ruling out engine-
+	// specific causes.
+	//
+	// Fix: write a 408 Request Timeout response BEFORE closing. The
+	// response bytes flow through TCP's reliable-delivery path
+	// (retransmits if dropped), and the walker's Read returns 1 byte of
+	// response data → wellReject. No dependency on FIN/RST signaling. The
+	// kernel sends FIN after the response drains (graceful close, no
+	// LINGER) — walker observes EOF on its next Read too, belt-and-braces.
+	//
+	// cs.writeFn appends to cs.writeBuf — safe from the worker thread.
+	// closeConn sees the non-empty writeBuf and defers the close until
+	// the SEND CQE completes; finishCloseDetached then takes the graceful
+	// SHUT_WR + drainRecvBuffer + Close path (no forceRSTClose), so the
+	// 408 reliably leaves the kernel before the FIN.
+	cs.writeFn(requestTimeoutResponse)
 	w.closeConn(fd)
 }
+
+// requestTimeoutResponse is the canonical HTTP/1.1 408 Request Timeout
+// response sent to slowloris clients before their conn is closed. Static
+// across calls (no per-conn state); single allocation at package init.
+// Content-Length: 0 matches the no-body convention and keeps the response
+// to a single TCP segment (~80 bytes well under MSS).
+var requestTimeoutResponse = []byte(
+	"HTTP/1.1 408 Request Timeout\r\n" +
+		"Connection: close\r\n" +
+		"Content-Length: 0\r\n" +
+		"\r\n",
+)
 
 // armHeaderTimer submits an IORING_OP_TIMEOUT SQE that fires at
 // cs.h1State.HeaderDeadlineNs. Called from initProtocol on conn-accept
@@ -2761,14 +2788,16 @@ func (w *Worker) checkTimeouts() {
 		// ReadHeaderTimeout: slowloris defence. Set by the engine on
 		// fresh conns and after each successful request parse — cleared
 		// when ProcessH1 finishes a request. A non-zero value past the
-		// deadline means the peer is dripping headers slowly: force RST
-		// close so the peer observes the termination on its very next
-		// write. See handleHeaderTimer for the SO_LINGER {1,0} +
-		// forceRSTClose rationale.
+		// deadline means the peer is dripping headers slowly. Write a
+		// 408 Request Timeout response then graceful-close — see
+		// handleHeaderTimer for the TCP-reliable-delivery rationale (the
+		// RST-only approach left ~5-7% walker-side hangs under cluster
+		// load due to FIN/RST packet-loss; response bytes are
+		// retransmitted, response data → walker Read returns 1 byte →
+		// wellReject without any dependency on FIN/RST visibility).
 		if cs.h1State != nil {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 0})
-				cs.forceRSTClose = true
+				cs.writeFn(requestTimeoutResponse)
 				w.closeConn(fd)
 				continue
 			}
