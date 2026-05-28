@@ -51,6 +51,7 @@ type Loop struct {
 	epollFD      int
 	listenFD     int
 	eventFD      int // eventfd for H2 write queue wakeup (-1 if unavailable)
+	timerFD      int // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
 	events       []unix.EpollEvent
 	conns        []*connState
 	connCount    int // number of active connections (local, for draining check)
@@ -131,6 +132,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		epollFD:      -1,
 		listenFD:     -1,
 		eventFD:      -1,
+		timerFD:      -1,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
 		conns:        make([]*connState, connTableSize),
 		handler:      handler,
@@ -210,6 +212,35 @@ func (l *Loop) run(ctx context.Context) {
 		}
 	}
 	l.eventFD = efd
+
+	// timerfd: forces checkTimeouts to run on a kernel-enforced 25ms
+	// cadence regardless of socket-event traffic. Without this, idle
+	// or low-traffic workers ran checkTimeouts only every ~800ms in
+	// the worst case (gate × adaptive_wait), eating into the
+	// slowloris walker's 2s slack budget for slow refapps. Mirrors
+	// the kernel-precision that iouring gets from per-conn
+	// IORING_OP_TIMEOUT SQEs.
+	if l.cfg.ReadHeaderTimeout > 0 {
+		tfd, tfdErr := unix.TimerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
+		if tfdErr == nil {
+			// 25ms periodic; first fire at 25ms too.
+			spec := unix.ItimerSpec{
+				Interval: unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
+				Value:    unix.Timespec{Sec: 0, Nsec: 25 * 1000 * 1000},
+			}
+			if err := unix.TimerfdSettime(tfd, 0, &spec, nil); err != nil {
+				_ = unix.Close(tfd)
+				tfd = -1
+			} else if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, tfd, &unix.EpollEvent{
+				Events: unix.EPOLLIN,
+				Fd:     int32(tfd),
+			}); err != nil {
+				_ = unix.Close(tfd)
+				tfd = -1
+			}
+			l.timerFD = tfd
+		}
+	}
 
 	l.ready <- nil
 
@@ -316,6 +347,18 @@ func (l *Loop) run(ctx context.Context) {
 				continue
 			}
 
+			// timerfd wakeup: drain the 8-byte expiration counter and
+			// fire checkTimeouts NOW so the slowloris HeaderDeadline
+			// hits within the kernel-precise 25ms cadence rather than
+			// the sweep gate's worst-case window. Mirrors iouring's
+			// per-conn IORING_OP_TIMEOUT precision on the epoll engine.
+			if fd == l.timerFD && l.timerFD >= 0 {
+				var buf [8]byte
+				_, _ = unix.Read(l.timerFD, buf[:])
+				l.checkTimeouts()
+				continue
+			}
+
 			if fd == l.listenFD && l.listenFD >= 0 {
 				l.acceptAll(ctx, now)
 				continue
@@ -417,10 +460,14 @@ func (l *Loop) run(ctx context.Context) {
 		// Check connection timeouts. Default cadence is every 1024 iterations
 		// (~100ms under load); when detached conns exist with idle deadlines
 		// the gate tightens to every 32 iterations (~50ms idle wall time)
-		// so the WS idle-close fires within its configured budget.
+		// so the WS idle-close fires within its configured budget. When
+		// ReadHeaderTimeout is enabled (the v1.4.11 slowloris defence),
+		// the gate ALSO tightens to 0x1F — the in-process synthetic
+		// reproducer (test/integration/slowloris_synthetic_test.go) showed
+		// epoll's HeaderDeadline firing 2s late without this.
 		l.tickCounter++
 		gate := uint32(0x3FF)
-		if l.detachedCount > 0 {
+		if l.detachedCount > 0 || l.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
 		if l.tickCounter&gate == 0 {
@@ -890,6 +937,12 @@ func (l *Loop) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = l.cfg.EnableH2Upgrade
 		cs.h1State.WorkerID = int32(l.id)
 		cs.h1State.WorkerIDSet = true
+		// Slowloris defence: configure + arm the read-header deadline.
+		// ProcessH1 clears on successful parse and rearms on return-nil
+		// (waiting for next request); checkTimeouts closes any conn
+		// that exceeds the deadline.
+		cs.h1State.ReadHeaderTimeoutNs = int64(l.cfg.ReadHeaderTimeout)
+		cs.h1State.ArmHeaderDeadline()
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
@@ -1504,6 +1557,12 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	if l.detachedCount > 0 {
 		maxMs = 50
 	}
+	// Slowloris defence: cap epoll_wait when ReadHeaderTimeout is enabled
+	// so checkTimeouts fires the HeaderDeadline reliably under low traffic.
+	// 25ms × 0x1F gate = 800ms worst-case sweep latency.
+	if l.cfg.ReadHeaderTimeout > 0 && maxMs > 25 {
+		maxMs = 25
+	}
 	switch {
 	case l.consecutiveEmpty == 0:
 		return base
@@ -1546,6 +1605,21 @@ func (l *Loop) checkTimeouts() {
 				l.closeConn(fd)
 			}
 			continue
+		}
+		// ReadHeaderTimeout: slowloris defence. Mirror net/http behavior:
+		// plain unix.Close (handled inside closeConn → fastClose branch),
+		// no shutdown, no linger, no response body. net/http on header
+		// timeout calls c.close() → plain Close; std walker shows 0
+		// hangs in probatorium. SHUT_RDWR+LINGER and 408+SHUT_WR+drain
+		// approaches both retained ~5-7% walker-hangs (nightly
+		// 26429150655 and predecessors), pointing at our extra syscalls
+		// racing with the walker's drip Write rather than at FIN/RST
+		// signaling. Simplest mirrors std.
+		if cs.h1State != nil {
+			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				l.closeConn(fd)
+				continue
+			}
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty {
@@ -1632,15 +1706,29 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	// Fast-close path for plain H1 connections: close() alone. Saves
-	// shutdown(SHUT_WR) + drainRecvBuffer syscalls (~2 per close) in
-	// the Connection:close churn hot path. Graceful path retained for
-	// H2 (GOAWAY / RST_STREAM flushing) and WS/SSE detach (middleware-
-	// queued close frames).
-	fastClose := !detached && cs.protocol == engine.HTTP1 && cs.h1State != nil && !trulyDetached
-	if fastClose {
+	// H1 close: SHUT_WR + Close. The shutdown call forces FIN regardless
+	// of the kernel recv-buffer state — important under slowloris where
+	// the peer is still writing drips and a plain Close on a non-empty
+	// recv buffer would send RST instead (which is not retransmitted by
+	// TCP, so a single packet loss strands the walker).
+	//
+	// No drainRecvBuffer between SHUT_WR and Close: an empty drain leaves
+	// no race, but a non-empty one introduces a multi-µs window in which
+	// a fresh peer drip queues — then Close sees it and emits RST anyway.
+	// Just trust SHUT_WR's FIN to be retransmitted until ACK'd.
+	//
+	// Graceful drain path retained for H2 (GOAWAY / RST_STREAM flushing)
+	// and for truly detached WS/SSE conns (middleware-queued close
+	// frames).
+	plainClose := cs.h1State != nil && !trulyDetached && cs.h2State == nil
+	switch {
+	case cs.forceRSTClose:
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
 		_ = unix.Close(fd)
-	} else {
+	case plainClose:
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		_ = unix.Close(fd)
+	default:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		drainRecvBuffer(fd)
 		_ = unix.Close(fd)
@@ -1711,6 +1799,9 @@ func (l *Loop) shutdown() {
 	}
 	if l.eventFD >= 0 {
 		_ = unix.Close(l.eventFD)
+	}
+	if l.timerFD >= 0 {
+		_ = unix.Close(l.timerFD)
 	}
 	_ = unix.Close(l.epollFD)
 	// Wait for async dispatch goroutines to exit. They've been

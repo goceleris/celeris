@@ -30,7 +30,9 @@ const (
 	opNOP            = 0
 	opREADV          = 1
 	opWRITEV         = 2
-	opPOLLADD        = 6 // IORING_OP_POLL_ADD
+	opPOLLADD        = 6  // IORING_OP_POLL_ADD
+	opTIMEOUT        = 11 // IORING_OP_TIMEOUT (kernel 5.4+)
+	opTIMEOUTREMOVE  = 12 // IORING_OP_TIMEOUT_REMOVE (kernel 5.5+)
 	opACCEPT         = 13
 	opASYNCCANCEL    = 14
 	opCLOSE          = 19

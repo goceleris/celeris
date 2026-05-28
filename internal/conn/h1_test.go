@@ -2,9 +2,119 @@ package conn
 
 import (
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris/protocol/h1"
 )
+
+// TestHeaderDeadline_ClearArmCycle pins the v1.4.11 slowloris-defence
+// state machine for iouring + epoll. Pre-fix neither engine enforced
+// ReadHeaderTimeout (only std did, via http.Server). The state machine:
+//
+//  1. Engine sets ReadHeaderTimeoutNs + ArmHeaderDeadline at conn-
+//     accept. HeaderDeadlineNs is now > 0.
+//  2. ProcessH1 calls ClearHeaderDeadline at its entry (we're
+//     actively parsing, not waiting). HeaderDeadlineNs == 0.
+//  3. ProcessH1's deferred ArmHeaderDeadline fires on return-nil
+//     (awaiting next request's bytes). HeaderDeadlineNs > 0 again.
+//  4. If ReadHeaderTimeoutNs is 0 (config disabled), all arm calls
+//     are no-ops.
+//
+// checkTimeouts in each engine closes the conn when now > deadline.
+func TestHeaderDeadline_ClearArmCycle(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
+
+	// Arm — deadline should be ~10s in the future.
+	before := time.Now().UnixNano()
+	s.ArmHeaderDeadline()
+	after := time.Now().UnixNano()
+	dl := s.HeaderDeadlineNs.Load()
+	if dl < before+s.ReadHeaderTimeoutNs || dl > after+s.ReadHeaderTimeoutNs {
+		t.Errorf("ArmHeaderDeadline: dl=%d not in [%d, %d]",
+			dl, before+s.ReadHeaderTimeoutNs, after+s.ReadHeaderTimeoutNs)
+	}
+
+	// Clear — deadline should be 0.
+	s.ClearHeaderDeadline()
+	if dl := s.HeaderDeadlineNs.Load(); dl != 0 {
+		t.Errorf("ClearHeaderDeadline: dl=%d, want 0", dl)
+	}
+
+	// Re-arm — back to a future deadline.
+	s.ArmHeaderDeadline()
+	if dl := s.HeaderDeadlineNs.Load(); dl <= 0 {
+		t.Errorf("Re-ArmHeaderDeadline: dl=%d, want positive", dl)
+	}
+}
+
+// TestHeaderDeadline_DisabledNoArm verifies the no-op behaviour when
+// ReadHeaderTimeoutNs is 0 (config disabled via -1 or omitted on a
+// custom build that doesn't set a default). ArmHeaderDeadline must
+// leave HeaderDeadlineNs at 0 so checkTimeouts skips the check.
+func TestHeaderDeadline_DisabledNoArm(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = 0 // disabled
+	s.ArmHeaderDeadline()
+	if dl := s.HeaderDeadlineNs.Load(); dl != 0 {
+		t.Errorf("ArmHeaderDeadline with disabled config must be no-op, got dl=%d", dl)
+	}
+}
+
+// TestHeaderDeadline_ArmIdempotent pins the slowloris-bypass guard:
+// calling ArmHeaderDeadline twice MUST NOT advance the deadline. The
+// budget is absolute (from "first byte arrives" to "headers complete"),
+// not per-read. Without this guard a slow-drip client could call into
+// the engine (re-trigger ProcessH1's entry-arm) every few hundred ms
+// and indefinitely extend the budget.
+func TestHeaderDeadline_ArmIdempotent(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
+
+	s.ArmHeaderDeadline()
+	first := s.HeaderDeadlineNs.Load()
+	if first == 0 {
+		t.Fatal("first ArmHeaderDeadline must arm")
+	}
+
+	// Sleep a bit so re-arming would observably shift the deadline.
+	time.Sleep(20 * time.Millisecond)
+
+	s.ArmHeaderDeadline() // must be no-op while already armed
+	second := s.HeaderDeadlineNs.Load()
+	if second != first {
+		t.Errorf("re-arm without clear must NOT shift deadline: first=%d second=%d (drift=%dns)",
+			first, second, second-first)
+	}
+}
+
+// TestHeaderDeadline_KeepAliveIdleNotKilled is the regression test for
+// the subtle bug caught during the v1.4.11 implementation review: my
+// earlier "defer arm on return-nil" design would have re-armed the
+// deadline at the end of EVERY successful request. The conn then enters
+// keep-alive idle (waiting for the next request), and 10s later
+// checkTimeouts would close it — killing the conn at ReadHeaderTimeout
+// instead of IdleTimeout.
+//
+// Correct semantic: after ClearHeaderDeadline (called when headers are
+// parsed), the deadline stays 0 through body / handler / keep-alive
+// idle. It only re-arms when the NEXT request's first byte arrives
+// (ProcessH1 entry observes deadline == 0 and arms).
+//
+// This test simulates: arm → clear → simulate idle window → confirm
+// the deadline is still 0 (NOT something we'd push past).
+func TestHeaderDeadline_KeepAliveIdleNotKilled(t *testing.T) {
+	s := NewH1State()
+	s.ReadHeaderTimeoutNs = int64(10 * time.Second)
+
+	s.ArmHeaderDeadline()   // conn-accept arm
+	s.ClearHeaderDeadline() // headers parsed
+	// Simulate keep-alive idle window. checkTimeouts sees deadline==0
+	// → skips the check. IdleTimeout takes over (different code path).
+	if dl := s.HeaderDeadlineNs.Load(); dl != 0 {
+		t.Errorf("after clear, keep-alive idle must observe deadline=0, got %d", dl)
+	}
+}
 
 func TestH1StateMaxBodySize(t *testing.T) {
 	s := NewH1State()

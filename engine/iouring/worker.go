@@ -494,6 +494,12 @@ func (w *Worker) run(ctx context.Context) {
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udProvide:
+				case udHeaderTimer:
+					// MUST be in the inlined hot path — processCQE
+					// (which has the same case) is only called from
+					// the cancel path. Without this case, slowloris-
+					// defence timer CQEs are silently dropped.
+					w.handleHeaderTimer(fd)
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -594,13 +600,22 @@ func (w *Worker) run(ctx context.Context) {
 		}
 
 		// Check connection timeouts. Default cadence is every 1024
-		// iterations (~100ms under load); when detached conns exist with
-		// idle deadlines the gate tightens to every 32 iterations
-		// (~50ms idle wall time) so the WS idle-close fires within its
-		// configured budget.
+		// iterations (~100ms under load); the gate tightens to every 32
+		// iterations (~50ms idle wall time) in two cases:
+		//   - detached conns exist with idle deadlines → WS idle-close
+		//     must fire within its configured budget.
+		//   - ReadHeaderTimeout > 0 → slowloris defence. The per-conn
+		//     IORING_OP_TIMEOUT is the primary mechanism but it can
+		//     silently drop arms under SQ-ring pressure (armHeaderTimer
+		//     returns without arming if GetSQE+Submit retry still fails).
+		//     The sweep is the belt-and-braces fallback; under heavy
+		//     legit traffic (observability+static_swagger_proxy) the
+		//     0x3FF gate is too coarse and the walker times out before
+		//     the sweep notices. Tightening to 0x1F caps the worst-case
+		//     close latency on a dropped arm to ~50ms.
 		w.tickCounter++
 		gate := uint32(0x3FF)
-		if w.detachedCount > 0 {
+		if w.detachedCount > 0 || w.cfg.ReadHeaderTimeout > 0 {
 			gate = 0x1F
 		}
 		if w.tickCounter&gate == 0 {
@@ -648,6 +663,8 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udH2Wakeup:
 		w.handleH2Wakeup()
 	case udProvide:
+	case udHeaderTimer:
+		w.handleHeaderTimer(fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
 	case udDriverSend:
@@ -657,13 +674,124 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	}
 }
 
+// handleHeaderTimer processes an IORING_OP_TIMEOUT CQE submitted by
+// armHeaderTimer. The kernel fires it at the absolute deadline regardless
+// of CQE traffic on the worker, giving slowloris defence parity with
+// std's SetReadDeadline-based enforcement. The CQE is always processed —
+// no res check — because:
+//   - res == -ETIME on timer expiry (normal)
+//   - res == -ECANCELED if cancelled (we don't cancel, only let it fire)
+//   - res != 0 on any other error (we still need to clear headerTimerArmed)
+//
+// Race-free against ProcessH1's ClearHeaderDeadline: HeaderDeadlineNs is
+// atomic; if cleared between SQE submission and CQE arrival, the close
+// gate below skips the close. If re-armed in the same window (next
+// keep-alive request), the ArmHeaderDeadline callback submits a fresh
+// timer SQE — so we don't need to re-arm here.
+// handleHeaderTimer ignores the caller's `now` because cachedNow is
+// refreshed only every 64 iterations (60+ms stale under bursty load)
+// and a stale now < dl comparison would spuriously re-arm a fresh 10s
+// timer, effectively doubling the slowloris window. One vDSO call per
+// timer CQE — rare in the hot path — is the right trade-off.
+func (w *Worker) handleHeaderTimer(fd int) {
+	if fd < 0 || fd > w.maxFD {
+		return
+	}
+	cs := w.conns[fd]
+	if cs == nil {
+		return
+	}
+	cs.headerTimerArmed = false
+	if cs.closing || cs.h1State == nil {
+		return
+	}
+	dl := cs.h1State.HeaderDeadlineNs.Load()
+	if dl == 0 {
+		// Headers completed before the timer fired; no-op. The next
+		// ArmHeaderDeadline (keep-alive next request) will submit a
+		// fresh timer SQE.
+		return
+	}
+	now := time.Now().UnixNano()
+	if now < dl {
+		// True early fire (kernel clock drift, very rare). Re-arm
+		// a fresh timer for the actual remaining time.
+		w.armHeaderTimer(cs)
+		return
+	}
+	// Deadline exceeded — slowloris defence fires. Mirror std/net.http's
+	// approach: plain unix.Close, no shutdown, no linger, no response.
+	// net/http on hdrDeadline → isCommonNetReadError → "don't reply",
+	// then c.close() → c.rwc.Close() (plain TCP close). Std walker shows
+	// 0 hangs on the exact same probatorium test. We previously tried:
+	//   - SHUT_RDWR + close + LINGER{1,0} (RST) → ~17-21 hangs per cell
+	//   - 408 response + SHUT_WR + drain + close → ~17-25 hangs per cell
+	// Both elaborate paths had the same ~5-7% walker-hang rate.
+	// Suspect: SHUT_*/drain syscalls + LINGER each create their own
+	// timing race vs. the walker's drip Write; plain close is simpler
+	// and matches the observed-working std behavior exactly.
+	w.closeConn(fd)
+}
+
+// armHeaderTimer submits an IORING_OP_TIMEOUT SQE that fires at
+// cs.h1State.HeaderDeadlineNs. Called from initProtocol on conn-accept
+// and from the OnHeaderDeadlineArmed callback when ProcessH1 re-arms
+// for a keep-alive next request.
+//
+// Idempotent: if a timer is already in flight (cs.headerTimerArmed),
+// the new arm is a no-op — the in-flight timer's CQE will check the
+// current HeaderDeadlineNs and either close or re-submit as needed.
+// Without this guard a fast-cycling keep-alive client could queue many
+// in-flight timer SQEs for the same conn, exhausting the SQ ring.
+func (w *Worker) armHeaderTimer(cs *connState) {
+	if cs.h1State == nil || cs.headerTimerArmed {
+		return
+	}
+	dl := cs.h1State.HeaderDeadlineNs.Load()
+	if dl == 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	remaining := dl - now
+	if remaining <= 0 {
+		// Deadline already past — close immediately rather than queue
+		// a zero-duration timer (kernel would fire it instantly anyway).
+		w.closeConn(cs.fd)
+		return
+	}
+	cs.headerTimerSpec.Sec = remaining / int64(time.Second)
+	cs.headerTimerSpec.Nsec = remaining % int64(time.Second)
+	sqe := w.ring.GetSQE()
+	if sqe == nil {
+		// Ring full — submit pending SQEs to drain, then retry.
+		// Without this, high-CQE-traffic cells (observability,
+		// static_swagger_proxy with concurrent Markov + adversarial
+		// walkers) silently dropped a fraction of timer arms; those
+		// conns then relied on the sweep, hitting the cadence floor.
+		// Surfaced by nightly 26397557463 where slow refapps still
+		// showed 62% slowloris hang rate post-forceRSTClose fix.
+		if _, err := w.ring.Submit(); err != nil {
+			return
+		}
+		sqe = w.ring.GetSQE()
+		if sqe == nil {
+			return
+		}
+	}
+	prepTimeout(sqe, unsafe.Pointer(&cs.headerTimerSpec), 0, 0)
+	setSQEUserData(sqe, encodeUserData(udHeaderTimer, cs.fd))
+	cs.headerTimerArmed = true
+}
+
 // adaptiveTimeout returns a wait timeout that scales with idle duration.
 // Under load (CQEs arriving), returns 1ms for minimal latency. During idle
 // periods, backs off to reduce syscall overhead (up to 100ms). When the
 // listen socket is closed (draining), uses 1s. When H2 connections exist
 // without eventfd, uses 100us for write queue polling. When detached
-// conns exist with idle deadlines, the cap drops to 50ms so checkTimeouts
-// can fire the WS-supplied IdleDeadline before its expiry.
+// conns exist with idle deadlines or ReadHeaderTimeout is configured, the
+// cap drops to 25ms so checkTimeouts can fire detached-idle deadlines
+// before expiry AND back up the per-conn IORING_OP_TIMEOUT for slowloris
+// defence when the kernel timer SQE failed to arm under SQ-ring pressure.
 func (w *Worker) adaptiveTimeout() time.Duration {
 	if w.listenFD < 0 {
 		return 1 * time.Second
@@ -677,6 +805,9 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	maxWait := 100 * time.Millisecond
 	if w.detachedCount > 0 {
 		maxWait = 50 * time.Millisecond
+	}
+	if w.cfg.ReadHeaderTimeout > 0 && maxWait > 25*time.Millisecond {
+		maxWait = 25 * time.Millisecond
 	}
 	switch {
 	case w.emptyIters <= 10:
@@ -848,6 +979,35 @@ func (w *Worker) initProtocol(cs *connState) {
 		cs.h1State.EnableH2Upgrade = w.cfg.EnableH2Upgrade
 		cs.h1State.WorkerID = int32(w.id)
 		cs.h1State.WorkerIDSet = true
+		// Slowloris defence: kernel-enforced per-conn header deadline.
+		//
+		// Sync mode (!w.async): ProcessH1 runs inline on the worker thread,
+		// so OnHeaderDeadlineArmed → armHeaderTimer is always a worker-
+		// thread call. Safe.
+		//
+		// Async mode (w.async): ProcessH1 runs on the per-conn dispatch
+		// goroutine. The keep-alive re-arm path (ProcessH1 sees
+		// HeaderDeadlineNs == 0 and calls ArmHeaderDeadline at line 360
+		// of internal/conn/h1.go) would fire OnHeaderDeadlineArmed from
+		// the goroutine, which would call w.ring.GetSQE — a violation of
+		// IORING_SETUP_SINGLE_ISSUER that can silently drop SQEs or
+		// corrupt the SQ ring. Leave OnHeaderDeadlineArmed nil in async
+		// mode; the initial accept-time arm fires via the direct
+		// armHeaderTimer call below (worker thread, safe), the recv-
+		// path retry (handleRecv) covers SQ-pressure drops, and keep-
+		// alive re-arms fall back to checkTimeouts which now runs every
+		// 32 iters × 25ms = 800ms worst case.
+		cs.h1State.ReadHeaderTimeoutNs = int64(w.cfg.ReadHeaderTimeout)
+		if !w.async {
+			cs.h1State.OnHeaderDeadlineArmed = func() { w.armHeaderTimer(cs) }
+		}
+		cs.h1State.ArmHeaderDeadline()
+		if w.async {
+			// Direct worker-thread arm for the initial deadline; the
+			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
+			// only stamped HeaderDeadlineNs, not the SQE.
+			w.armHeaderTimer(cs)
+		}
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
@@ -1253,6 +1413,19 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			cs.asyncCond.Signal()
 		}
 		w.reqBatch++
+		// Re-attempt the slowloris-defence timer arm if the initial
+		// attempt (from initProtocol on accept) silently dropped under
+		// SQ-ring pressure. ArmHeaderDeadline is idempotent on
+		// HeaderDeadlineNs, so it won't reset the deadline; but
+		// armHeaderTimer's headerTimerArmed gate means we only retry
+		// the SQE submission if the prior arm is not in flight. This
+		// is the explicit "retry on next recv" path that was missing —
+		// without it, a conn whose initial arm failed relies entirely
+		// on the sweep, doubling worst-case close latency on slow
+		// refapps (observability/static_swagger_proxy).
+		if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
+			w.armHeaderTimer(cs)
+		}
 		if !cqeHasMore(c.Flags) && !cs.recvPaused {
 			if !w.prepareRecv(fd, cs.buf) {
 				cs.needsRecv = true
@@ -1354,6 +1527,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	w.reqBatch++
+
+	// Slowloris-defence: retry timer arm if the initial attempt dropped
+	// silently under SQ-ring pressure. Mirrors the async-path retry above.
+	// Sync mode: ProcessH1 is idempotent on HeaderDeadlineNs so it won't
+	// re-trigger OnHeaderDeadlineArmed if the deadline is already set,
+	// leaving conns whose initial arm failed dependent on the sweep alone.
+	if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
+		w.armHeaderTimer(cs)
+	}
 
 	// lastActivity already set above; timeout checked in checkTimeouts.
 
@@ -1804,6 +1986,15 @@ func (w *Worker) finishClose(fd int) {
 	// frames so the peer sees them. For H1 without a body in-flight,
 	// close() without shutdown is equivalent on localhost and within
 	// noise on real networks.
+	//
+	// forceRSTClose (slowloris-defence): SHUT_RDWR + close. See
+	// finishCloseDetached for the rationale.
+	if cs != nil && cs.forceRSTClose {
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
+		_ = unix.Close(fd)
+		return
+	}
+	// fastClose: plain H1 no-body conn → close() alone suffices.
 	if fastClose {
 		_ = unix.Close(fd)
 		return
@@ -1867,14 +2058,42 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		return
 	}
 
-	// Detached connections still use the graceful half-close path —
-	// middleware (WebSocket / SSE) may have queued a close-frame echo
-	// that we want to let finish cleanly, and the middleware goroutine
-	// already drove the protocol handshake to completion before asking
-	// the engine to drop the FD. RST close (as used by closeNonFixedFD
-	// for plain H1/H2) would cut that echo off. The graceful path is
-	// still SYNC (unix.Close directly) to avoid the async-SQE pile-up
-	// that plagued the pre-patch version.
+	// forceRSTClose: slowloris-defence path requested RST. Empirical
+	// data (nightly 26418830572 vs 26414322152): SHUT_RDWR + close
+	// gives ~50% more reliable observable-RST than plain close +
+	// LINGER on iouring. The SHUT_RDWR + LINGER combo wins because
+	// SHUT_RDWR drops the receive queue too (close() with LINGER
+	// only drops TX). Walker observes the abortive close immediately.
+	if cs.forceRSTClose {
+		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
+		_ = unix.Close(fd)
+		return
+	}
+	// Async-mode HTTP1 conns are NOT truly detached (no WS/SSE middleware
+	// owns them) — they just pre-allocate detachMu in acquireConnState so
+	// the dispatch goroutine and worker can serialize writeBuf access.
+	//
+	// Plain unix.Close (matching net/http) sends FIN if the kernel recv
+	// buffer is empty, RST if non-empty. For slowloris, walker is still
+	// writing drips so the buffer often has unread bytes — close → RST.
+	// RST is NOT retransmitted by TCP, so if it's lost on the cluster
+	// fabric the walker never observes the close (walker hangs).
+	//
+	// SHUT_WR forces FIN explicitly (writer half-close) BEFORE close,
+	// regardless of recv-buffer state. FIN IS retransmitted from
+	// FIN_WAIT_1 until ACK'd, so packet loss can't strand the walker.
+	// No drainRecvBuffer (which was the prior approach's race source —
+	// the drain syscall and the close syscall left a multi-µs window in
+	// which a fresh walker drip would queue, making the close → RST).
+	if cs.h1State != nil && !cs.h1State.Detached {
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		_ = unix.Close(fd)
+		return
+	}
+	// Truly detached (WS/SSE): graceful half-close so middleware-queued
+	// close-frame echoes flush before the FIN. Sync unix.Close (not via
+	// io_uring) to avoid the async-SQE pile-up that plagued the pre-patch
+	// version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
 	drainRecvBuffer(fd)
 	_ = unix.Close(fd)
@@ -2557,6 +2776,15 @@ func (w *Worker) checkTimeouts() {
 				w.closeConn(fd)
 			}
 			continue
+		}
+		// ReadHeaderTimeout: slowloris defence. Plain unix.Close path
+		// (handled by closeConn → finishCloseDetached fastClose branch).
+		// See handleHeaderTimer for the rationale (mirrors net/http).
+		if cs.h1State != nil {
+			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				w.closeConn(fd)
+				continue
+			}
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty || cs.sending {

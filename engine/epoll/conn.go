@@ -123,6 +123,15 @@ type connState struct {
 	// loop's epoll_wait set). The flag is set by OnDetach and
 	// cleared by drainDetachQueue once the bookkeeping runs.
 	asyncDetachPending bool
+
+	// forceRSTClose is set by the slowloris-defence path (checkTimeouts'
+	// HeaderDeadline branch) to signal closeConn should skip the graceful
+	// Shutdown(SHUT_WR)+drainRecvBuffer dance and instead call close()
+	// directly — SO_LINGER {1, 0} (set by the caller before closeConn)
+	// then forces RST so the walker observes ECONNRESET on its next
+	// write regardless of TCP send-buffer state. Mirrors the iouring
+	// engine's same-named flag.
+	forceRSTClose bool
 }
 
 var connStatePool = sync.Pool{
@@ -178,6 +187,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncClosed.Store(false)
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
+	cs.forceRSTClose = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

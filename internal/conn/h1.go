@@ -8,11 +8,16 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
 	h1 "github.com/goceleris/celeris/protocol/h1"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
+
+// timeNow is a package-level alias so tests can stub the clock when
+// exercising the read-header-deadline path. Production = time.Now.
+var timeNow = time.Now
 
 func init() {
 	// Wire the H1-package helpers so protocol/h2/stream can lazily
@@ -24,6 +29,43 @@ func init() {
 // ErrHijacked is returned by ProcessH1 when the connection was hijacked.
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
+
+// ClearHeaderDeadline drops the slowloris-defence read-header deadline
+// — called after a successful ParseRequest signals that the next state
+// is request handling, not header reading. The engine's checkTimeouts
+// sweep treats 0 as "no deadline" and skips the check.
+func (s *H1State) ClearHeaderDeadline() {
+	s.HeaderDeadlineNs.Store(0)
+}
+
+// ArmHeaderDeadline arms the slowloris-defence read-header deadline
+// to now + ReadHeaderTimeoutNs. Called by:
+//   - the engine at conn accept (covers "client never sends a byte"),
+//   - ProcessH1 when it observes data arriving on a conn whose deadline
+//     was cleared (post-handler-idle keep-alive state).
+//
+// Idempotent: if HeaderDeadlineNs is already non-zero, this is a no-op
+// — the deadline is an ABSOLUTE budget for header completion, NOT
+// per-read. Resetting on every read would let a slow-drip client
+// extend the budget indefinitely (the bug this fix is meant to defeat).
+//
+// No-op if ReadHeaderTimeoutNs == 0 (config disabled or std-engine
+// compat mode).
+func (s *H1State) ArmHeaderDeadline() {
+	if s.ReadHeaderTimeoutNs == 0 {
+		return
+	}
+	if s.HeaderDeadlineNs.Load() != 0 {
+		// Already armed; don't reset (slowloris-bypass guard).
+		return
+	}
+	s.HeaderDeadlineNs.Store(timeNow().UnixNano() + s.ReadHeaderTimeoutNs)
+	// Notify the engine so it can submit a kernel-enforced timer
+	// (iouring IORING_OP_TIMEOUT SQE) — see field docstring.
+	if s.OnHeaderDeadlineArmed != nil {
+		s.OnHeaderDeadlineArmed()
+	}
+}
 
 // errConnectionClose is returned when the client requests Connection: close.
 // Pre-allocated to avoid per-request fmt.Errorf allocation.
@@ -101,6 +143,37 @@ type H1State struct {
 	// the engine's idle sweep checks it on detached connections. 0 = no
 	// deadline.
 	IdleDeadlineNs atomic.Int64
+
+	// HeaderDeadlineNs holds the absolute deadline (Unix nanoseconds) by
+	// which the next request's headers must be fully received, or the
+	// engine must close the connection. This is the canonical slowloris
+	// defence on the iouring + epoll engines (std wires the equivalent
+	// via http.Server.ReadHeaderTimeout). Set by the engine at conn-
+	// accept and after each successful request parse (so the next
+	// pipelined / keep-alive request gets a fresh budget). Cleared when
+	// ProcessH1 returns having fully parsed a request. 0 = no deadline
+	// (e.g. -1 in config explicitly disables; ReadHeaderTimeout was
+	// otherwise unenforced on iouring + epoll prior to celeris v1.4.11).
+	HeaderDeadlineNs atomic.Int64
+
+	// ReadHeaderTimeoutNs is the configured ReadHeaderTimeout in
+	// nanoseconds, supplied by the engine at initProtocol. Used by
+	// ProcessH1 to re-arm HeaderDeadlineNs after each request parse —
+	// keeps the deadline logic local to where it matters (the parsing
+	// loop) without ProcessH1 needing access to the engine's *cfg.
+	// 0 = no header deadline (config disabled).
+	ReadHeaderTimeoutNs int64
+
+	// OnHeaderDeadlineArmed is invoked synchronously by ArmHeaderDeadline
+	// whenever the deadline transitions from 0 → armed. The iouring
+	// engine sets this to submit an IORING_OP_TIMEOUT SQE so the kernel
+	// closes the conn at the deadline regardless of sweep cadence. The
+	// epoll engine leaves it nil (uses per-worker timerfd instead). nil
+	// = no-op.
+	//
+	// The callback runs on the engine's worker thread (ProcessH1's
+	// caller). It MUST NOT block — SQE submission only.
+	OnHeaderDeadlineArmed func()
 
 	// EnableH2Upgrade, when true, permits this connection to honor a
 	// valid RFC 7540 §3.2 h2c upgrade request. Set by the engine at
@@ -254,7 +327,7 @@ func CloseH1(state *H1State) {
 // ProcessH1 processes incoming H1 data, parsing requests and calling the handler.
 // The write callback is used to send response bytes back to the connection.
 func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.Handler,
-	write func([]byte)) error {
+	write func([]byte)) (retErr error) {
 
 	// WebSocket upgrade: deliver raw bytes to the middleware goroutine
 	// instead of parsing as H1. The delivery callback writes to an io.Pipe
@@ -262,6 +335,30 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	if state.Detached && state.WSDataDelivery != nil {
 		state.WSDataDelivery(data)
 		return nil
+	}
+
+	// Slowloris defence — ReadHeaderTimeout state machine.
+	//
+	// Semantic: the deadline tracks the absolute time by which the
+	// current request's HEADERS must be fully received. It must NOT
+	// be confused with keep-alive idle (which IdleTimeout handles).
+	//
+	//   - conn-accept: engine arms once (covers "client never sends")
+	//   - ProcessH1 entry with data arriving on a request not yet in
+	//     body/parsed state, and deadline currently 0 (post-clear or
+	//     post-handler-idle): arm. Don't reset an already-armed
+	//     deadline — that would let a slow-drip client extend its
+	//     budget indefinitely.
+	//   - ParseRequest success (consumed > 0): clear. Body / handler /
+	//     keep-alive idle phases do NOT have a header deadline.
+	//
+	// Why entry-arm-if-zero (not entry-clear-then-defer-arm): the
+	// keep-alive idle window between requests must NOT count against
+	// ReadHeaderTimeout. With defer-arm, every successful request
+	// would re-arm the deadline; the next keep-alive idle conn would
+	// get killed at ReadHeaderTimeout instead of IdleTimeout.
+	if state.HeaderDeadlineNs.Load() == 0 && state.bodyNeeded == 0 && !state.Detached {
+		state.ArmHeaderDeadline()
 	}
 
 	// In-progress fixed-length body spanning multiple reads. Append into
@@ -286,6 +383,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			writeErrorResponse(write, 400, "Bad Request")
 			return err
 		}
+		// Headers complete (this is a re-parse from buffer, so the
+		// original parse already succeeded — clear is idempotent).
+		state.ClearHeaderDeadline()
 		state.buffer.Reset()
 		bodyData := state.bodyBuf
 		if err := tryUpgradeH2C(state, bodyData, rest, write); err != nil {
@@ -325,6 +425,11 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 				state.buffer.Write(data[offset:])
 				return nil
 			}
+			// Headers complete — clear the slowloris deadline. The
+			// body / handler / keep-alive idle that follow are NOT
+			// header-deadline-eligible. Re-arm happens at the next
+			// ProcessH1 entry that observes deadline == 0.
+			state.ClearHeaderDeadline()
 
 			bodyNeeded := int64(0)
 			if state.req.ChunkedEncoding {
@@ -445,6 +550,9 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if consumed == 0 {
 			break
 		}
+		// Headers complete — clear the slowloris deadline. See the
+		// state-machine comment at the top of ProcessH1.
+		state.ClearHeaderDeadline()
 
 		bodyNeeded := int64(0)
 		if state.req.ChunkedEncoding {

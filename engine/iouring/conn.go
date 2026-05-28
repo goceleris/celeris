@@ -141,6 +141,25 @@ type connState struct {
 	// worker may call GetSQE). Cleared by drainDetachQueue after the
 	// bookkeeping runs, and by releaseConnState on teardown.
 	asyncDetachPending bool
+
+	// headerTimerSpec is the kernelTimespec passed to IORING_OP_TIMEOUT
+	// SQEs that enforce ReadHeaderTimeout per-conn. Owned by the conn
+	// (rather than per-SQE allocated) so the spec memory stays valid
+	// while the SQE is in the kernel queue. Re-used each arm.
+	headerTimerSpec kernelTimespec
+	// headerTimerArmed is true when a header-timer SQE has been submitted
+	// and the corresponding CQE has not yet been processed. Used to
+	// avoid duplicate timer SQEs.
+	headerTimerArmed bool
+	// forceRSTClose is set by the slowloris-defence close paths
+	// (handleHeaderTimer + checkTimeouts HeaderDeadline branch) to
+	// signal that the conn should be torn down via RST instead of the
+	// usual graceful FIN+drain. finishClose / finishCloseDetached
+	// honor the flag by skipping Shutdown+drainRecvBuffer entirely and
+	// calling close() directly — SO_LINGER {1, 0} (set by the caller
+	// before closeConn) then forces RST. The walker's next write hits
+	// ECONNRESET immediately regardless of TCP send-buffer state.
+	forceRSTClose bool
 }
 
 var connStatePool = sync.Pool{
@@ -199,6 +218,9 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.headerTimerSpec = kernelTimespec{}
+	cs.headerTimerArmed = false
+	cs.forceRSTClose = false
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false

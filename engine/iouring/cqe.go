@@ -17,6 +17,12 @@ const (
 	udClose    uint64 = 0x04 << 56
 	udProvide  uint64 = 0x06 << 56
 	udH2Wakeup uint64 = 0x07 << 56
+	// udHeaderTimer tags IORING_OP_TIMEOUT SQEs submitted by initProtocol /
+	// ProcessH1's arm-callback to enforce ReadHeaderTimeout per-conn. The
+	// timer fires absolutely at the deadline; CQE handler closes the conn
+	// iff HeaderDeadlineNs is still > 0 and now > deadline (race-free
+	// against ClearHeaderDeadline). New in v1.4.11.
+	udHeaderTimer uint64 = 0x08 << 56
 	// Driver tags for EventLoopProvider — kept non-overlapping with HTTP tags
 	// so the main CQE dispatch can route them to the driver path without
 	// consulting the driverConns map.
