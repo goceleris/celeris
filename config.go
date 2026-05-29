@@ -129,6 +129,18 @@ type Config struct {
 	// workloads; enable it for any workload that touches a DB, cache, or
 	// upstream service.
 	//
+	// AsyncHandlers is the SERVER-LEVEL default. Individual routes and
+	// groups can override it per handler with [Route.Async] /
+	// [RouteGroup.Async] (most-specific wins: route > group > this
+	// default), so a server with mostly CPU routes + a few DB routes can
+	// keep this false and mark just the DB routes .Async(), or set this
+	// true and mark hot CPU routes .Async(false). On HTTP/2 the override
+	// is honored per-stream (sync routes run inline on the event loop,
+	// async routes dispatch to the worker pool). Note: celeris drivers
+	// opened WithEngine(srv) consult the server-level AsyncHandlers (not
+	// per-route overrides) for their auto-async path selection — set this
+	// true when using WithEngine drivers under per-route async.
+	//
 	// Default: false.
 	AsyncHandlers bool
 
