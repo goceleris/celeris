@@ -519,6 +519,21 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			s.trustedNets = append(s.trustedNets, ipNet)
 		}
 
+		// Per-route async: when any route opted into async dispatch
+		// (Route.Async / RouteGroup.Async), the engine must stand up the
+		// async dispatch infrastructure even if the global default
+		// (Config.AsyncHandlers) is sync — otherwise an async-marked
+		// route (e.g. a DB handler) would run inline on the event-loop /
+		// worker thread and block it. This only adjusts the resource
+		// Config handed to the engine; the public Server.AsyncHandlers()
+		// still reflects the user-supplied Config. The H2 processor
+		// applies the per-route flag at finer (per-stream) granularity
+		// via the AsyncRouteResolver regardless of this server-level
+		// enable.
+		if s.router.hasAsyncRoutes() {
+			cfg.AsyncHandlers = true
+		}
+
 		ra := &routerAdapter{server: s}
 		if s.notFoundHandler != nil {
 			ra.notFoundChain = make([]HandlerFunc, 0, len(s.middleware)+1)

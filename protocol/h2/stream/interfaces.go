@@ -32,6 +32,11 @@ type Handler interface {
 // implement it fall back to the prior characteristic-based heuristic.
 type AsyncRouteResolver interface {
 	RouteAsync(method, path string) bool
+	// HasAsyncRoutes reports whether the server has ANY async-marked
+	// route. The processor uses it as a fast-out: when false it skips
+	// per-stream route resolution entirely, so a pure-sync H2 server
+	// pays zero extra cost on the inline hot path.
+	HasAsyncRoutes() bool
 }
 
 // HandlerFunc is an adapter to use functions as stream handlers.

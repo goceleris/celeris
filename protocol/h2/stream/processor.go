@@ -92,6 +92,15 @@ type Processor struct {
 	InlineCount          uint64    // number of requests handled inline (for metrics)
 	MaxRequestBodySize   int64     // 0 = use default (100 MB)
 
+	// asyncResolver, when set, lets per-stream dispatch honor the
+	// per-route .Async() flag: a stream whose route is async is forced
+	// onto the worker pool instead of running inline on the event loop.
+	// perRouteAsync caches asyncResolver.HasAsyncRoutes() so a pure-sync
+	// server skips per-stream route resolution entirely (zero added cost
+	// on the inline hot path).
+	asyncResolver AsyncRouteResolver
+	perRouteAsync bool
+
 	// CVE-2023-44487 "HTTP/2 Rapid Reset" mitigation. Track RST_STREAM
 	// rate per connection; if a peer exceeds the threshold we emit
 	// GOAWAY(ENHANCE_YOUR_CALM). Window is a sliding per-second bucket:
@@ -150,12 +159,17 @@ func (p *Processor) FlushInlineCleanup() {
 // before any subsequent request, this avoids a ~4 KB dynamic-table
 // allocation the decoder would otherwise hold for the connection's life.
 func NewProcessor(handler Handler, writer FrameWriter, conn h2Conn) *Processor {
-	return &Processor{
+	p := &Processor{
 		manager:    NewManager(),
 		handler:    handler,
 		writer:     writer,
 		connWriter: conn,
 	}
+	if r, ok := handler.(AsyncRouteResolver); ok {
+		p.asyncResolver = r
+		p.perRouteAsync = r.HasAsyncRoutes()
+	}
+	return p
 }
 
 // ensureHPACKDecoder initializes p.hpackDecoder on first use. Called from
@@ -466,8 +480,52 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 // loop. Eligible: END_STREAM set (GET/HEAD), no CONTINUATION pending,
 // connection window > 0 (can send response immediately).
 func (p *Processor) canRunInline(stream *Stream) bool {
-	return stream.EndStream &&
-		!p.continuationActive.Load()
+	if !stream.EndStream || p.continuationActive.Load() {
+		return false
+	}
+	// Per-route async: a stream whose matched route opted into async
+	// dispatch must run on the worker pool, not inline on the event
+	// loop, so a blocking handler (DB, etc.) doesn't stall frame
+	// processing for every other stream on the connection. Gated by
+	// perRouteAsync so pure-sync servers skip the header scan + lookup.
+	if p.perRouteAsync && p.streamRouteAsync(stream) {
+		return false
+	}
+	return true
+}
+
+// streamRouteAsync extracts :method and :path from the stream's received
+// pseudo-headers and asks the resolver whether the matched route is async.
+// Returns false when the resolver is absent or the pseudo-headers are
+// missing (malformed request — handled elsewhere; default to inline-eligible).
+func (p *Processor) streamRouteAsync(stream *Stream) bool {
+	if p.asyncResolver == nil {
+		return false
+	}
+	var method, path string
+	for _, h := range stream.Headers {
+		switch h[0] {
+		case ":method":
+			method = h[1]
+		case ":path":
+			path = h[1]
+		}
+		if method != "" && path != "" {
+			break
+		}
+	}
+	if method == "" || path == "" {
+		return false
+	}
+	// Strip the query string — the router matches on path only (mirrors
+	// the Context's :path → c.path split at '?').
+	for i := 0; i < len(path); i++ {
+		if path[i] == '?' {
+			path = path[:i]
+			break
+		}
+	}
+	return p.asyncResolver.RouteAsync(method, path)
 }
 
 // runHandler dispatches the stream handler. For inline-eligible streams

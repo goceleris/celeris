@@ -303,6 +303,11 @@ func (a *routerAdapter) RouteAsync(method, path string) bool {
 	return a.server.router.routeAsync(method, path)
 }
 
+// HasAsyncRoutes reports whether any route opted into async dispatch.
+func (a *routerAdapter) HasAsyncRoutes() bool {
+	return a.server.router.hasAsyncRoutes()
+}
+
 var (
 	_ stream.Handler            = (*routerAdapter)(nil)
 	_ stream.AsyncRouteResolver = (*routerAdapter)(nil)
