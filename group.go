@@ -9,6 +9,11 @@ type RouteGroup struct {
 	prefix     string
 	middleware []HandlerFunc
 	server     *Server
+	// async is the group-level dispatch override applied to routes
+	// registered on this group (and inherited by sub-groups). Routes
+	// can still override per-route via Route.Async. asyncDefault means
+	// "inherit the server default (Config.AsyncHandlers)".
+	async asyncSetting
 }
 
 func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route {
@@ -17,7 +22,24 @@ func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route
 	chain = append(chain, g.server.middleware...)
 	chain = append(chain, g.middleware...)
 	chain = append(chain, handlers...)
-	return g.server.router.addRoute(method, fullPath, chain)
+	return g.server.router.addRouteWithAsync(method, fullPath, chain, g.async)
+}
+
+// Async sets the dispatch mode for all routes registered on this group
+// after this call (and inherited by sub-groups created after it). With no
+// argument it means async (true); pass false to force the group sync even
+// on an async-default server. Individual routes can still override via
+// Route.Async. Chainable:
+//
+//	api := srv.Group("/api").Async()   // async for all /api/* routes
+//	api.GET("/products", productHandler)
+func (g *RouteGroup) Async(opt ...bool) *RouteGroup {
+	if len(opt) > 0 && !opt[0] {
+		g.async = asyncOff
+	} else {
+		g.async = asyncOn
+	}
+	return g
 }
 
 // Use adds middleware to this group. Group middleware runs after server-level
@@ -95,6 +117,7 @@ func (g *RouteGroup) Group(prefix string, middleware ...HandlerFunc) *RouteGroup
 		prefix:     g.prefix + prefix,
 		middleware: append(g.combineMiddleware(), middleware...),
 		server:     g.server,
+		async:      g.async, // inherit parent's dispatch override
 	}
 }
 

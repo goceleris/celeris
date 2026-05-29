@@ -23,6 +23,17 @@ type Handler interface {
 	HandleStream(ctx context.Context, stream *Stream) error
 }
 
+// AsyncRouteResolver is an optional interface a Handler may implement to
+// let the protocol layer learn, before invoking the handler, whether the
+// route matching a given method+path is configured for async dispatch
+// (per-route .Async()). The H2 processor uses it to decide per-stream
+// whether to run the handler inline on the event loop (sync route) or
+// dispatch it to the async worker pool (async route). Handlers that don't
+// implement it fall back to the prior characteristic-based heuristic.
+type AsyncRouteResolver interface {
+	RouteAsync(method, path string) bool
+}
+
 // HandlerFunc is an adapter to use functions as stream handlers.
 type HandlerFunc func(ctx context.Context, stream *Stream) error
 

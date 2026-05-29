@@ -112,12 +112,14 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 		handlers = cached
 		fullPath = s.CachedRouteFullPath
 	} else {
-		handlers, fullPath = a.server.router.find(c.method, c.path, &c.params)
+		var routeAsync bool
+		handlers, fullPath, routeAsync = a.server.router.find(c.method, c.path, &c.params)
 		if handlers != nil && len(c.params) == 0 {
 			s.CachedRouteMethod = strings.Clone(c.method)
 			s.CachedRoutePath = strings.Clone(c.path)
 			s.CachedRouteHandlers = handlers
 			s.CachedRouteFullPath = fullPath
+			s.CachedRouteAsync = routeAsync
 		}
 	}
 
@@ -294,4 +296,14 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 	}
 }
 
-var _ stream.Handler = (*routerAdapter)(nil)
+// RouteAsync reports whether the route matching method+path is configured
+// for async dispatch. Implements stream.AsyncRouteResolver so the H2
+// processor can choose inline vs. pooled handler execution per stream.
+func (a *routerAdapter) RouteAsync(method, path string) bool {
+	return a.server.router.routeAsync(method, path)
+}
+
+var (
+	_ stream.Handler            = (*routerAdapter)(nil)
+	_ stream.AsyncRouteResolver = (*routerAdapter)(nil)
+)

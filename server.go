@@ -82,6 +82,9 @@ func New(cfg Config) *Server {
 		config: cfg,
 		router: newRouter(),
 	}
+	// Seed the router's per-route async resolution with the server-level
+	// default so routes/groups that don't override inherit it.
+	s.router.defaultAsync = cfg.AsyncHandlers
 	if !cfg.DisableMetrics {
 		s.collector = observe.NewCollector()
 	}

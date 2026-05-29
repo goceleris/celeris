@@ -13,7 +13,7 @@ func TestRouterStaticRoutes(t *testing.T) {
 
 	var params Params
 
-	handlers, fp := r.find("GET", "/", &params)
+	handlers, fp, _ := r.find("GET", "/", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /")
 	}
@@ -26,7 +26,7 @@ func TestRouterStaticRoutes(t *testing.T) {
 	}
 
 	params = params[:0]
-	handlers, fp = r.find("GET", "/hello", &params)
+	handlers, fp, _ = r.find("GET", "/hello", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /hello")
 	}
@@ -39,7 +39,7 @@ func TestRouterStaticRoutes(t *testing.T) {
 	}
 
 	params = params[:0]
-	handlers, fp = r.find("GET", "/hello/world", &params)
+	handlers, fp, _ = r.find("GET", "/hello/world", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /hello/world")
 	}
@@ -59,7 +59,7 @@ func TestRouterParamRoutes(t *testing.T) {
 
 	var params Params
 
-	handlers, fp := r.find("GET", "/users/42", &params)
+	handlers, fp, _ := r.find("GET", "/users/42", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /users/42")
 	}
@@ -71,7 +71,7 @@ func TestRouterParamRoutes(t *testing.T) {
 	}
 
 	params = params[:0]
-	handlers, fp = r.find("GET", "/users/7/posts/99", &params)
+	handlers, fp, _ = r.find("GET", "/users/7/posts/99", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /users/7/posts/99")
 	}
@@ -94,7 +94,7 @@ func TestRouterCatchAll(t *testing.T) {
 	r.addRoute("GET", "/files/*filepath", []HandlerFunc{func(_ *Context) error { return nil }})
 
 	var params Params
-	handlers, fp := r.find("GET", "/files/css/style.css", &params)
+	handlers, fp, _ := r.find("GET", "/files/css/style.css", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /files/css/style.css")
 	}
@@ -111,12 +111,12 @@ func TestRouterNotFound(t *testing.T) {
 	r.addRoute("GET", "/hello", []HandlerFunc{func(_ *Context) error { return nil }})
 
 	var params Params
-	handlers, _ := r.find("GET", "/notfound", &params)
+	handlers, _, _ := r.find("GET", "/notfound", &params)
 	if handlers != nil {
 		t.Fatal("expected nil handlers for /notfound")
 	}
 
-	handlers, _ = r.find("POST", "/hello", &params)
+	handlers, _, _ = r.find("POST", "/hello", &params)
 	if handlers != nil {
 		t.Fatal("expected nil handlers for POST /hello")
 	}
@@ -130,7 +130,7 @@ func TestRouterMethodSeparation(t *testing.T) {
 	r.addRoute("POST", "/test", []HandlerFunc{func(_ *Context) error { postCalled = true; return nil }})
 
 	var params Params
-	handlers, _ := r.find("GET", "/test", &params)
+	handlers, _, _ := r.find("GET", "/test", &params)
 	if handlers == nil {
 		t.Fatal("expected GET handler")
 	}
@@ -139,7 +139,7 @@ func TestRouterMethodSeparation(t *testing.T) {
 		t.Fatal("GET handler not called")
 	}
 
-	handlers, _ = r.find("POST", "/test", &params)
+	handlers, _, _ = r.find("POST", "/test", &params)
 	if handlers == nil {
 		t.Fatal("expected POST handler")
 	}
@@ -181,13 +181,13 @@ func TestRouterOverlappingPaths(t *testing.T) {
 
 	var params Params
 
-	handlers, _ := r.find("GET", "/api/users", &params)
+	handlers, _, _ := r.find("GET", "/api/users", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /api/users")
 	}
 
 	params = params[:0]
-	handlers, _ = r.find("GET", "/api/users/123", &params)
+	handlers, _, _ = r.find("GET", "/api/users/123", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /api/users/123")
 	}
@@ -196,7 +196,7 @@ func TestRouterOverlappingPaths(t *testing.T) {
 	}
 
 	params = params[:0]
-	handlers, _ = r.find("GET", "/api/posts", &params)
+	handlers, _, _ = r.find("GET", "/api/posts", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /api/posts")
 	}
@@ -223,7 +223,7 @@ func TestRouterFullPath(t *testing.T) {
 
 	for _, tt := range tests {
 		var params Params
-		handlers, fp := r.find("GET", tt.path, &params)
+		handlers, fp, _ := r.find("GET", tt.path, &params)
 		if tt.wantNil {
 			if handlers != nil {
 				t.Fatalf("path %s: expected nil handlers", tt.path)
@@ -262,7 +262,7 @@ func TestRouterStaticPriorityOverParam(t *testing.T) {
 	var params Params
 
 	// /users/new should match the static route.
-	handlers, _ := r.find("GET", "/users/new", &params)
+	handlers, _, _ := r.find("GET", "/users/new", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /users/new")
 	}
@@ -278,7 +278,7 @@ func TestRouterStaticPriorityOverParam(t *testing.T) {
 	paramCalled = false
 	staticCalled = false
 	params = params[:0]
-	handlers, _ = r.find("GET", "/users/42", &params)
+	handlers, _, _ = r.find("GET", "/users/42", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /users/42")
 	}
@@ -300,7 +300,7 @@ func TestCatchAllDedup(t *testing.T) {
 	r.addRoute("GET", "/files/*path", h2)
 
 	var params Params
-	handlers, _ := r.find("GET", "/files/a.txt", &params)
+	handlers, _, _ := r.find("GET", "/files/a.txt", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /files/a.txt")
 	}
@@ -320,7 +320,7 @@ func TestTrailingSlashSeparateRoutes(t *testing.T) {
 
 	var params Params
 
-	handlers, _ := r.find("GET", "/users", &params)
+	handlers, _, _ := r.find("GET", "/users", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /users")
 	}
@@ -329,7 +329,7 @@ func TestTrailingSlashSeparateRoutes(t *testing.T) {
 		t.Fatal("expected /users handler")
 	}
 
-	handlers, _ = r.find("GET", "/users/", &params)
+	handlers, _, _ = r.find("GET", "/users/", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /users/")
 	}
@@ -344,7 +344,7 @@ func TestParamAtRoot(t *testing.T) {
 	r.addRoute("GET", "/:id", []HandlerFunc{func(_ *Context) error { return nil }})
 
 	var params Params
-	handlers, fp := r.find("GET", "/42", &params)
+	handlers, fp, _ := r.find("GET", "/42", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /42")
 	}
@@ -361,7 +361,7 @@ func TestCatchAllAtRoot(t *testing.T) {
 	r.addRoute("GET", "/*filepath", []HandlerFunc{func(_ *Context) error { return nil }})
 
 	var params Params
-	handlers, fp := r.find("GET", "/a/b/c", &params)
+	handlers, fp, _ := r.find("GET", "/a/b/c", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /a/b/c")
 	}
