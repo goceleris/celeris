@@ -61,12 +61,6 @@
 // dispatch, per-stream H2 dispatch). On the std engine the per-route flag
 // is a no-op (net/http already runs handler-per-goroutine).
 //
-// Migrating from v1.4.11: if you previously set Config.AsyncHandlers=true
-// to handle a small set of blocking routes, you can now flip the default
-// back to false and mark only those routes .Async() — recovering the
-// ~3–5 % CPU regression the goroutine-per-request model imposed on the
-// inline hot path.
-//
 // SAFETY: do NOT call .Sync() / .Async(false) on a handler that hijacks
 // or detaches the connection (WebSocket upgrade, SSE). Detached flows run
 // async by construction.

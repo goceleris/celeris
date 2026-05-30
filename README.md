@@ -225,8 +225,6 @@ api.GET("/cached", cachedHandler).Sync()    // opt back to sync
 
 Precedence is **route > group > server default** (`Config.AsyncHandlers`). Works identically across all engines — iouring/epoll use a single-allocation `ErrAsyncDispatch` handoff per connection, H2 uses per-stream inline vs. worker-pool dispatch. The `Async`/`Sync` distinction is a no-op on the `std` engine (net/http already does goroutine-per-request).
 
-**Migrating from v1.4.11:** if your server set `Config.AsyncHandlers: true` to handle one blocking route, you can now flip the default back to `false` and mark only that route `.Async()` to recover the ~3–5 % CPU regression on the inline hot path. See the [`Route.Async`](https://pkg.go.dev/github.com/goceleris/celeris#Route.Async) godoc and the [`v1.4.12` release notes](https://github.com/goceleris/celeris/releases/tag/v1.4.12) for the full design.
-
 ## net/http Compatibility
 
 Wrap existing `net/http` handlers and middleware:
