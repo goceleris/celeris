@@ -26,13 +26,23 @@ func (g *RouteGroup) handle(method, path string, handlers ...HandlerFunc) *Route
 }
 
 // Async sets the dispatch mode for all routes registered on this group
-// after this call (and inherited by sub-groups created after it). With no
-// argument it means async (true); pass false to force the group sync even
+// after this call (and inherited by sub-groups created after it),
+// overriding the server-level [Config.AsyncHandlers] default. Async() with
+// no argument means async (true); pass false to force the group sync even
 // on an async-default server. Individual routes can still override via
-// Route.Async. Chainable:
+// [Route.Async] (route > group > server precedence). Must be called before
+// [Server.Start]. Chainable:
 //
-//	api := srv.Group("/api").Async()   // async for all /api/* routes
+//	api := srv.Group("/api").Async()              // async for all /api/* routes
 //	api.GET("/products", productHandler)
+//	api.GET("/cached", cachedHandler).Async(false) // opt this one out
+//
+// Async only affects routes registered AFTER the call. To make the entire
+// group async, call .Async() immediately after Group(...).
+//
+// Do NOT use .Async(false) on a group whose handlers hijack/detach the
+// connection (WebSocket upgrade, SSE): detached flows are async by
+// construction. See [Route.Async] for details.
 func (g *RouteGroup) Async(opt ...bool) *RouteGroup {
 	if len(opt) > 0 && !opt[0] {
 		g.async = asyncOff

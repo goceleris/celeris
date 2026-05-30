@@ -300,6 +300,7 @@ func (s *Stream) resetAndPool() {
 	s.CachedRoutePath = ""
 	s.CachedRouteHandlers = nil
 	s.CachedRouteFullPath = ""
+	s.CachedRouteAsync = false
 	s.WorkerID = 0
 	s.WorkerIDSet = false
 	s.StartTimeNs = 0

@@ -991,9 +991,11 @@ func (l *Loop) initProtocol(cs *connState) {
 		// Per-handler async (celeris #300): wire the route resolver so
 		// ProcessH1, when run inline on the event loop (InlineMode), can
 		// detect an async route and bail to the dispatch goroutine. Only
-		// meaningful in async mode.
+		// meaningful in async mode; gated on HasAsyncRoutes so pure-sync
+		// servers running with Config.AsyncHandlers=true don't pay the
+		// per-recv resolver call.
 		if l.async {
-			if r, ok := l.handler.(routeAsyncResolver); ok {
+			if r, ok := l.handler.(stream.AsyncRouteResolver); ok && r.HasAsyncRoutes() {
 				cs.h1State.RouteAsync = r.RouteAsync
 			}
 		}
@@ -1239,13 +1241,6 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 // every request from that slice in order, and responses appear in the
 // same order on cs.writeBuf before the flush. The "one goroutine at a
 // time per conn" invariant is enforced by cs.asyncRun.
-// routeAsyncResolver is implemented by the engine's stream.Handler (the
-// celeris routerAdapter) to resolve whether a route is async — used to set
-// H1State.RouteAsync for the inline per-handler async fast path (#300).
-type routeAsyncResolver interface {
-	RouteAsync(method, path string) bool
-}
-
 func (l *Loop) runAsyncHandler(cs *connState) {
 	defer l.asyncWG.Done()
 	// Last-resort panic safety net. User handlers SHOULD use recovery

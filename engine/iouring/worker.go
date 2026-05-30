@@ -1010,9 +1010,10 @@ func (w *Worker) initProtocol(cs *connState) {
 			// Per-handler async (celeris #300): wire the route resolver so
 			// ProcessH1, when run inline on the worker (InlineMode), can
 			// detect an async route and bail to the dispatch goroutine.
-			// Only meaningful in async mode; the resolver is the
-			// routerAdapter (the engine's stream.Handler).
-			if r, ok := w.handler.(routeAsyncResolver); ok {
+			// Only meaningful in async mode; gated on HasAsyncRoutes so
+			// pure-sync servers running with Config.AsyncHandlers=true
+			// don't pay the per-recv resolver call.
+			if r, ok := w.handler.(stream.AsyncRouteResolver); ok && r.HasAsyncRoutes() {
 				cs.h1State.RouteAsync = r.RouteAsync
 			}
 		}
@@ -2169,13 +2170,6 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // Preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
 // request in the slice in order, and responses land on cs.writeBuf in
 // the same order before the flush.
-// routeAsyncResolver is implemented by the engine's stream.Handler (the
-// celeris routerAdapter) to resolve whether a route is async — used to set
-// H1State.RouteAsync for the inline per-handler async fast path (#300).
-type routeAsyncResolver interface {
-	RouteAsync(method, path string) bool
-}
-
 // promoteConnToAsync hands a conn that bailed from the inline fast path
 // (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
