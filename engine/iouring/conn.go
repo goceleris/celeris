@@ -106,6 +106,12 @@ type connState struct {
 	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
+	// asyncPromoted is set once an async-marked route has been observed
+	// on this conn while it ran inline on the worker (per-handler async,
+	// celeris #300). Sticky: once promoted every subsequent recv goes
+	// straight to the dispatch goroutine instead of retrying the inline
+	// fast path. Reset on release.
+	asyncPromoted bool
 	// asyncH2Promoted signals the worker that runAsyncHandler observed
 	// ErrUpgradeH2C and completed the cs-local H1→H2 state swap under
 	// detachMu. drainDetachQueue finishes the promotion by appending
@@ -225,6 +231,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
 	cs.bodyBuf = nil

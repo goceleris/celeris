@@ -15,6 +15,14 @@ type node struct {
 	handlers []HandlerFunc
 	paramKey string
 	fullPath string
+	// async is the resolved per-route dispatch mode: true when the
+	// handler chain for this route should run on the async dispatch
+	// path (off the event-loop / worker thread). Resolved at
+	// registration from the server default (Config.AsyncHandlers),
+	// the owning group's override, and the route-level .Async()
+	// override (most-specific wins). Read on the hot path via
+	// search/find and the params-free routeAsync resolver.
+	async bool
 }
 
 type segment struct {
@@ -153,7 +161,7 @@ func insertStatic(parent *node, text string) *node {
 	return child
 }
 
-func search(n *node, path string, params *Params) ([]HandlerFunc, string) {
+func search(n *node, path string, params *Params) ([]HandlerFunc, string, bool) {
 	for _, ch := range n.children {
 		switch ch.nType {
 		case static:
@@ -161,18 +169,18 @@ func search(n *node, path string, params *Params) ([]HandlerFunc, string) {
 				remaining := path[len(ch.path):]
 				if remaining == "" {
 					if ch.handlers != nil {
-						return ch.handlers, ch.fullPath
+						return ch.handlers, ch.fullPath, ch.async
 					}
 					for _, gc := range ch.children {
 						if gc.nType == catchAll {
 							*params = append(*params, Param{Key: gc.paramKey, Value: ""})
-							return gc.handlers, gc.fullPath
+							return gc.handlers, gc.fullPath, gc.async
 						}
 					}
-					return nil, ""
+					return nil, "", false
 				}
-				if handlers, fp := search(ch, remaining, params); handlers != nil {
-					return handlers, fp
+				if handlers, fp, as := search(ch, remaining, params); handlers != nil {
+					return handlers, fp, as
 				}
 			}
 
@@ -185,22 +193,22 @@ func search(n *node, path string, params *Params) ([]HandlerFunc, string) {
 			remaining := path[end:]
 			if remaining == "" {
 				if ch.handlers != nil {
-					return ch.handlers, ch.fullPath
+					return ch.handlers, ch.fullPath, ch.async
 				}
 				*params = (*params)[:len(*params)-1]
 				continue
 			}
-			if handlers, fp := search(ch, remaining, params); handlers != nil {
-				return handlers, fp
+			if handlers, fp, as := search(ch, remaining, params); handlers != nil {
+				return handlers, fp, as
 			}
 			*params = (*params)[:len(*params)-1]
 
 		case catchAll:
 			*params = append(*params, Param{Key: ch.paramKey, Value: "/" + path})
-			return ch.handlers, ch.fullPath
+			return ch.handlers, ch.fullPath, ch.async
 		}
 	}
-	return nil, ""
+	return nil, "", false
 }
 
 func longestPrefix(a, b string) int {

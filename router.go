@@ -12,6 +12,31 @@ import (
 type staticEntry struct {
 	handlers []HandlerFunc
 	fullPath string
+	async    bool
+}
+
+// asyncSetting is the tri-state per-route/per-group dispatch override
+// carried from the registration API down to the router. asyncDefault
+// means "inherit the server default (Config.AsyncHandlers)"; asyncOn /
+// asyncOff are explicit overrides set by .Async(true) / .Async(false).
+type asyncSetting int8
+
+const (
+	asyncDefault asyncSetting = iota
+	asyncOn
+	asyncOff
+)
+
+// resolveAsync collapses a setting against the router's server default.
+func (r *router) resolveAsync(s asyncSetting) bool {
+	switch s {
+	case asyncOn:
+		return true
+	case asyncOff:
+		return false
+	default:
+		return r.defaultAsync
+	}
 }
 
 // Method index constants for array-indexed trees and static routes.
@@ -60,6 +85,16 @@ type router struct {
 	customStatic map[string]map[string]staticEntry // overflow for non-standard methods
 	namedRoutes  map[string]*Route
 	namedMu      sync.RWMutex
+
+	// defaultAsync is the server-level dispatch default, set from
+	// Config.AsyncHandlers at server construction. Routes/groups that
+	// don't override inherit it.
+	defaultAsync bool
+	// asyncRouteCount tracks how many registered routes resolve to
+	// async dispatch. hasAsyncRoutes() reads it to let the engine
+	// decide whether the async dispatch infrastructure is needed at
+	// all (a server with zero async routes keeps the inline fast path).
+	asyncRouteCount int
 }
 
 // Route is an opaque handle to a registered route. Use the Name method to
@@ -119,11 +154,78 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 	chain = append(chain, final)
 	r.node.handlers = chain
 
-	// Keep the static fast-path map in sync with the updated chain.
+	// Keep the static fast-path map in sync with the updated chain,
+	// preserving the route's resolved async flag.
 	if r.router != nil {
 		if m := r.router.getStaticMap(r.method); m != nil {
 			if _, ok := m[r.path]; ok {
-				m[r.path] = staticEntry{handlers: chain, fullPath: r.path}
+				m[r.path] = staticEntry{handlers: chain, fullPath: r.path, async: r.node.async}
+			}
+		}
+	}
+	return r
+}
+
+// Async marks this route for the per-conn dispatch goroutine, overriding
+// any group-level or server-level (Config.AsyncHandlers) default.
+// SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
+// handler — detached flows run async by construction.
+//
+// Precedence is route > group > server default. Must be called before
+// [Server.Start]. Chainable. Async() with no argument means true; the
+// variadic-bool form is kept for back-compat — prefer .Sync() to opt a
+// single route out of an async-default group/server.
+//
+//	srv.GET("/users/:id", userHandler).Async()      // async, this route
+//	api.GET("/cached", cachedHandler).Sync()        // opt out of group async
+//
+// See [Config.AsyncHandlers] for the server-level default and the
+// per-handler async design overview.
+func (r *Route) Async(opt ...bool) *Route {
+	want := true
+	if len(opt) > 0 {
+		want = opt[0]
+	}
+	return r.setAsync(want)
+}
+
+// Sync forces this route to run inline on the worker / event-loop thread,
+// overriding any group-level or server-level async default. Equivalent to
+// .Async(false) but reads more naturally at the call site:
+//
+//	api := srv.Group("/api").Async()
+//	api.GET("/products", productHandler)            // async (from group)
+//	api.GET("/healthz", healthHandler).Sync()       // opt this one back to sync
+//
+// SAFETY: do NOT call .Sync() on a handler that hijacks/detaches the
+// connection (WebSocket upgrade, SSE). Detached flows run async by
+// construction (a middleware goroutine owns the connection after Detach),
+// so the per-route flag cannot downgrade them to sync.
+func (r *Route) Sync() *Route {
+	return r.setAsync(false)
+}
+
+// setAsync is the shared implementation of [Route.Async] and [Route.Sync].
+// Updates the node, the router's asyncRouteCount, and the static-fast-path
+// map entry so all three observers see the same async flag.
+func (r *Route) setAsync(want bool) *Route {
+	if r.node == nil {
+		return r
+	}
+	if r.node.async != want && r.router != nil {
+		if want {
+			r.router.asyncRouteCount++
+		} else if r.router.asyncRouteCount > 0 {
+			r.router.asyncRouteCount--
+		}
+	}
+	r.node.async = want
+	// Keep the static fast-path map in sync.
+	if r.router != nil {
+		if m := r.router.getStaticMap(r.method); m != nil {
+			if e, ok := m[r.path]; ok {
+				e.async = want
+				m[r.path] = e
 			}
 		}
 	}
@@ -136,11 +238,21 @@ func newRouter() *router {
 	}
 }
 
+// addRoute registers a route inheriting the server-level async default.
+// Kept as the 3-arg form for existing callers/tests; addRouteWithAsync is
+// the underlying implementation that also accepts a per-route/group
+// dispatch override.
 func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
+	return r.addRouteWithAsync(method, path, handlers, asyncDefault)
+}
+
+func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, as asyncSetting) *Route {
 	if path == "" || path[0] != '/' {
 		panic("path must begin with '/'")
 	}
 	validatePath(path)
+
+	async := r.resolveAsync(as)
 
 	root := r.getTree(method)
 	if root == nil {
@@ -156,8 +268,12 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 		}
 		root.handlers = handlers
 		root.fullPath = "/"
+		root.async = async
 		route.node = root
-		r.setStaticEntry(method, "/", staticEntry{handlers: handlers, fullPath: "/"})
+		r.setStaticEntry(method, "/", staticEntry{handlers: handlers, fullPath: "/", async: async})
+		if async {
+			r.asyncRouteCount++
+		}
 		return route
 	}
 
@@ -172,14 +288,52 @@ func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
 	}
 	current.handlers = handlers
 	current.fullPath = path
+	current.async = async
 	route.node = current
 
 	// Register in static map for O(1) lookup on fully static paths.
 	if isStaticPath(path) {
-		r.setStaticEntry(method, path, staticEntry{handlers: handlers, fullPath: path})
+		r.setStaticEntry(method, path, staticEntry{handlers: handlers, fullPath: path, async: async})
+	}
+
+	if async {
+		r.asyncRouteCount++
 	}
 
 	return route
+}
+
+// hasAsyncRoutes reports whether any registered route resolves to async
+// dispatch. The engine uses this (OR'd with the server default) to decide
+// whether to wire up the async dispatch infrastructure at all.
+func (r *router) hasAsyncRoutes() bool {
+	return r.asyncRouteCount > 0
+}
+
+// routeAsync resolves whether the route matching method+path runs async,
+// without filling a Params slice for the caller. Fully static routes (the
+// common async-annotated case, e.g. /api/...) resolve via the O(1) static
+// map with zero allocation; parameterised routes pay a scratch Params walk.
+// Returns false when no route matches (unmatched → 404 handler, which is
+// never async).
+func (r *router) routeAsync(method, path string) bool {
+	idx := methodIndex(method)
+	if idx >= 0 {
+		if m := r.staticRoutes[idx]; m != nil {
+			if e, ok := m[path]; ok {
+				return e.async
+			}
+		}
+	} else if r.customStatic != nil {
+		if m := r.customStatic[method]; m != nil {
+			if e, ok := m[path]; ok {
+				return e.async
+			}
+		}
+	}
+	var params Params
+	_, _, async := r.find(method, path, &params)
+	return async
 }
 
 // warnDuplicateRoute emits a warning when a route is registered twice for
@@ -203,7 +357,7 @@ func isStaticPath(path string) bool {
 	return true
 }
 
-func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string) {
+func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
 	idx := methodIndex(method)
 	var root *node
 
@@ -211,7 +365,7 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 	if idx >= 0 {
 		if m := r.staticRoutes[idx]; m != nil {
 			if e, ok := m[path]; ok {
-				return e.handlers, e.fullPath
+				return e.handlers, e.fullPath, e.async
 			}
 		}
 		root = r.trees[idx]
@@ -220,7 +374,7 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 		if r.customStatic != nil {
 			if m := r.customStatic[method]; m != nil {
 				if e, ok := m[path]; ok {
-					return e.handlers, e.fullPath
+					return e.handlers, e.fullPath, e.async
 				}
 			}
 		}
@@ -230,14 +384,14 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 	}
 
 	if root == nil {
-		return nil, ""
+		return nil, "", false
 	}
 
 	// Collapse consecutive slashes: "//a///b" → "/a/b".
 	path = cleanPath(path)
 
 	if path == "/" {
-		return root.handlers, root.fullPath
+		return root.handlers, root.fullPath, root.async
 	}
 	if len(path) > 1 && path[0] == '/' {
 		path = path[1:]
@@ -260,7 +414,7 @@ func (r *router) allowedMethods(path string, except string) []string {
 			continue
 		}
 		params = params[:0]
-		if handlers, _ := r.find(method, path, &params); handlers != nil {
+		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
 			allowed = append(allowed, method)
 		}
 	}
@@ -269,7 +423,7 @@ func (r *router) allowedMethods(path string, except string) []string {
 			continue
 		}
 		params = params[:0]
-		if handlers, _ := r.find(method, path, &params); handlers != nil {
+		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
 			allowed = append(allowed, method)
 		}
 	}

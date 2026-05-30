@@ -26,6 +26,14 @@ func init() {
 	stream.SetLazyHeaderHelpers(h1.UnsafeLowerHeader, h1.UnsafeString)
 }
 
+// ErrAsyncDispatch is returned by ProcessH1 when, running inline on the
+// worker (H1State.InlineMode), it parses a request whose route is async
+// (H1State.RouteAsync). The handler has NOT run; the unconsumed bytes
+// (this request onward) are stashed in state.buffer. The engine must hand
+// the connection to its per-conn dispatch goroutine and re-run ProcessH1
+// with InlineMode=false. Mirrors the ErrUpgradeH2C handoff pattern.
+var ErrAsyncDispatch = errors.New("celeris: route requires async dispatch")
+
 // ErrHijacked is returned by ProcessH1 when the connection was hijacked.
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
@@ -196,6 +204,45 @@ type H1State struct {
 	// ProcessH1; populateCachedStream copies it to the stream so the
 	// handler can record start time without a per-request time.Now() vDSO.
 	NowNs int64
+
+	// InlineMode + RouteAsync implement per-handler async dispatch on the
+	// H1 path (celeris #300). When the engine runs ProcessH1 inline on
+	// the worker thread (InlineMode=true) and RouteAsync reports that the
+	// just-parsed request's route is async, ProcessH1 stops BEFORE
+	// invoking the handler, stashes the unconsumed bytes (this request
+	// onward) in state.buffer, and returns ErrAsyncDispatch. The engine
+	// then hands the connection to its per-conn dispatch goroutine, which
+	// re-runs ProcessH1 with InlineMode=false (every request runs on the
+	// goroutine). This lets sync routes run inline on the worker (fast,
+	// no handoff) while async routes never block it — per-request, on a
+	// server that mixes both. Both nil/false on the dispatch-goroutine
+	// path and on pure-sync / pure-async servers (no behavior change).
+	InlineMode bool
+	RouteAsync func(method, path string) bool
+}
+
+// TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the
+// parse buffer (notably the request that triggered ErrAsyncDispatch, plus
+// any pipelined bytes) and clears the buffer. The engine uses it to hand
+// the stashed request to the per-conn dispatch goroutine. Returns nil when
+// the buffer is empty.
+func (s *H1State) TakeBufferedBytes() []byte {
+	if s.buffer.Len() == 0 {
+		return nil
+	}
+	b := make([]byte, s.buffer.Len())
+	copy(b, s.buffer.Bytes())
+	s.buffer.Reset()
+	return b
+}
+
+// HasPendingData reports whether ProcessH1 left partial-request state that a
+// subsequent recv must continue (buffered headers awaiting more bytes, or a
+// fixed-length body still accumulating). The engine uses it after an inline
+// ProcessH1 to decide whether to promote the conn to its dispatch goroutine
+// for the continuation (so the partial-state parse paths never run inline).
+func (s *H1State) HasPendingData() bool {
+	return s.buffer.Len() > 0 || s.bodyNeeded > 0
 }
 
 // UpdateWriteFn replaces the response adapter's write function. Called by
@@ -430,6 +477,22 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			// header-deadline-eligible. Re-arm happens at the next
 			// ProcessH1 entry that observes deadline == 0.
 			state.ClearHeaderDeadline()
+
+			// Per-handler async (celeris #300): running inline on the
+			// worker, if this request's route is async, stop before the
+			// handler runs, stash this request (+ any pipelined bytes)
+			// in state.buffer, and signal the engine to promote the conn
+			// to its dispatch goroutine. data[offset:] starts at this
+			// request (offset is the request head; consumed has not been
+			// applied to offset yet). The engine re-runs ProcessH1 with
+			// InlineMode=false, draining state.buffer via the buffered
+			// path below — every request then runs on the goroutine.
+			if state.InlineMode && state.RouteAsync != nil &&
+				state.RouteAsync(state.req.Method, state.req.Path) {
+				state.buffer.Reset()
+				state.buffer.Write(data[offset:])
+				return ErrAsyncDispatch
+			}
 
 			bodyNeeded := int64(0)
 			if state.req.ChunkedEncoding {

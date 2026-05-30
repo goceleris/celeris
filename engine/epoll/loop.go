@@ -37,13 +37,6 @@ const connTableSize = 65536
 // connection cleanly (read returns 0 bytes / EOF).
 var errPeerClosed = errors.New("celeris: peer closed connection")
 
-// asyncHandlers (legacy env-var fallback) dispatches HTTP handlers to a
-// goroutine per connection instead of running them inline on the
-// LockOSThread'd worker. The canonical switch is now Config.AsyncHandlers;
-// the env var remains as a diagnostic override and is OR'd with the config
-// flag inside run().
-var asyncHandlersEnv = os.Getenv("CELERIS_ASYNC_HANDLERS") == "1"
-
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id           int
@@ -85,7 +78,8 @@ type Loop struct {
 	reqCount         *atomic.Uint64
 	activeConns      *atomic.Int64
 	errCount         *atomic.Uint64
-	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
+	asyncPromoted    *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	reqBatch         uint64         // batched request count, flushed to reqCount per iteration
 	tickCounter      uint32
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -115,16 +109,19 @@ type Loop struct {
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 
 	// async dispatches HTTP1 handlers to spawned goroutines. Set by
-	// Config.AsyncHandlers (OR'd with the CELERIS_ASYNC_HANDLERS env-var
-	// override for diagnostic flips). Checked on every drainRead; keep it
-	// as a plain bool so the no-async path is a single mov+test.
+	// Config.AsyncHandlers (the canonical server-level default) or
+	// auto-enabled in doPrepare when the router has any .Async() routes.
+	// Per-route .Async()/.Async(false) overrides further refine dispatch
+	// per request via the InlineMode → ErrAsyncDispatch handoff. Checked
+	// on every drainRead; keep it a plain bool so the no-async path is a
+	// single mov+test.
 	async bool
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) *Loop {
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) *Loop {
 
 	return &Loop{
 		id:           id,
@@ -149,16 +146,17 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			RecvBuf:     resolved.SocketRecv,
 			SendBuf:     resolved.SocketSend,
 		},
-		reqCount:    reqCount,
-		activeConns: activeConns,
-		errCount:    errCount,
+		reqCount:      reqCount,
+		activeConns:   activeConns,
+		errCount:      errCount,
+		asyncPromoted: asyncPromoted,
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		},
-		async: cfg.AsyncHandlers || asyncHandlersEnv,
+		async: cfg.AsyncHandlers,
 	}
 }
 
@@ -723,10 +721,16 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// processes any buffered batch monotonically. Matches
 		// net/http's goroutine-per-conn model.
 		//
-		// Gated by Config.AsyncHandlers (+ CELERIS_ASYNC_HANDLERS env
-		// override for ops diagnostics). The inline path below is
-		// unchanged and zero-cost when async is off.
-		if l.async && cs.protocol == engine.HTTP1 {
+		// Gated by Config.AsyncHandlers (or auto-enabled by hasAsyncRoutes
+		// in doPrepare). The inline path below is unchanged and zero-cost
+		// when async is off.
+		// Per-handler async (celeris #300): only PROMOTED conns go straight
+		// to the dispatch goroutine. A fresh async-mode HTTP1 conn first
+		// tries the inline fast path below (InlineMode); ProcessH1 bails
+		// with ErrAsyncDispatch on the first async route, promoting the
+		// conn — so sync routes run inline on the event loop on a server
+		// that mixes sync + async handlers.
+		if l.async && cs.asyncPromoted && cs.protocol == engine.HTTP1 {
 			cs.asyncInMu.Lock()
 			// Backpressure: drop the conn if the dispatch goroutine is
 			// falling behind. A client that pipelines faster than we
@@ -763,9 +767,44 @@ func (l *Loop) drainRead(fd int, now int64) {
 		if cs.h1State != nil {
 			cs.h1State.NowNs = now
 		}
+		// Per-handler async (celeris #300): on an async-mode HTTP1 conn not
+		// yet promoted, run ProcessH1 inline in InlineMode so it bails
+		// (ErrAsyncDispatch) on the first async route.
+		tryInline := l.async && !cs.asyncPromoted && cs.h1State != nil &&
+			cs.protocol == engine.HTTP1
 		switch cs.protocol {
 		case engine.HTTP1:
+			if tryInline {
+				cs.h1State.InlineMode = true
+			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
+			if tryInline {
+				cs.h1State.InlineMode = false
+			}
+			if errors.Is(processErr, conn.ErrAsyncDispatch) {
+				// Async route: promote the conn and hand the stashed
+				// request (+ any pipelined bytes) to the dispatch
+				// goroutine. Any response already written inline (a
+				// preceding pipelined sync request) stays in cs.writeBuf
+				// and is flushed in order by the dispatch path.
+				cs.asyncPromoted = true
+				l.asyncPromoted.Add(1)
+				stashed := cs.h1State.TakeBufferedBytes()
+				cs.asyncInMu.Lock()
+				cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
+				starting := !cs.asyncRun
+				if starting {
+					cs.asyncRun = true
+				}
+				cs.asyncInMu.Unlock()
+				if starting {
+					l.asyncWG.Add(1)
+					go l.runAsyncHandler(cs)
+				} else {
+					cs.asyncCond.Signal()
+				}
+				continue
+			}
 			if errors.Is(processErr, conn.ErrUpgradeH2C) {
 				// H1→H2 promotion. switchToH2 consumes the upgrade info,
 				// installs H2 state, and feeds any preface bytes synchronously.
@@ -813,6 +852,16 @@ func (l *Loop) drainRead(fd int, now int64) {
 			} else {
 				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, l.handler, writeFn, l.h2cfg)
 			}
+		}
+
+		// Per-handler async (celeris #300): inline ProcessH1 handled the
+		// request(s). If it left partial state (buffered headers /
+		// accumulating body), promote so the continuation runs on the
+		// dispatch goroutine — the partial-state parse paths must not run
+		// inline (only the fresh-parse site honors the async check).
+		if tryInline && processErr == nil && cs.h1State.HasPendingData() {
+			cs.asyncPromoted = true
+			l.asyncPromoted.Add(1)
 		}
 
 		l.reqBatch++
@@ -943,6 +992,17 @@ func (l *Loop) initProtocol(cs *connState) {
 		// that exceeds the deadline.
 		cs.h1State.ReadHeaderTimeoutNs = int64(l.cfg.ReadHeaderTimeout)
 		cs.h1State.ArmHeaderDeadline()
+		// Per-handler async (celeris #300): wire the route resolver so
+		// ProcessH1, when run inline on the event loop (InlineMode), can
+		// detect an async route and bail to the dispatch goroutine. Only
+		// meaningful in async mode; gated on HasAsyncRoutes so pure-sync
+		// servers running with Config.AsyncHandlers=true don't pay the
+		// per-recv resolver call.
+		if l.async {
+			if r, ok := l.handler.(stream.AsyncRouteResolver); ok && r.HasAsyncRoutes() {
+				cs.h1State.RouteAsync = r.RouteAsync
+			}
+		}
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}

@@ -136,10 +136,11 @@ type Worker struct {
 	// RST as it pauses).
 	listenFDClosed atomic.Bool
 
-	reqCount    *atomic.Uint64
-	activeConns *atomic.Int64
-	errCount    *atomic.Uint64
-	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
+	reqCount      *atomic.Uint64
+	activeConns   *atomic.Int64
+	errCount      *atomic.Uint64
+	asyncPromoted *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	reqBatch      uint64         // batched request count, flushed to reqCount per iteration
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -191,7 +192,7 @@ type Worker struct {
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
 	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
 	// binding) so that the kernel allocates socket internal buffers on the
@@ -199,26 +200,27 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	// queue operations on multi-socket systems.
 
 	return &Worker{
-		id:           id,
-		cpuID:        cpuID,
-		listenFD:     -1,
-		h2EventFD:    -1,
-		tier:         tier,
-		sqpoll:       tier.SQPollIdle() > 0,
-		sendZC:       tier.SupportsSendZC(),
-		async:        cfg.AsyncHandlers,
-		h1Only:       cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
-		conns:        make([]*connState, fixedFileTableSize),
-		handler:      handler,
-		resolved:     resolved,
-		cfg:          cfg,
-		logger:       cfg.Logger,
-		reqCount:     reqCount,
-		activeConns:  activeConns,
-		errCount:     errCount,
-		acceptPaused: acceptPaused,
-		wake:         make(chan struct{}),
-		ready:        make(chan error, 1),
+		id:            id,
+		cpuID:         cpuID,
+		listenFD:      -1,
+		h2EventFD:     -1,
+		tier:          tier,
+		sqpoll:        tier.SQPollIdle() > 0,
+		sendZC:        tier.SupportsSendZC(),
+		async:         cfg.AsyncHandlers,
+		h1Only:        cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
+		conns:         make([]*connState, fixedFileTableSize),
+		handler:       handler,
+		resolved:      resolved,
+		cfg:           cfg,
+		logger:        cfg.Logger,
+		reqCount:      reqCount,
+		activeConns:   activeConns,
+		errCount:      errCount,
+		asyncPromoted: asyncPromoted,
+		acceptPaused:  acceptPaused,
+		wake:          make(chan struct{}),
+		ready:         make(chan error, 1),
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
@@ -1007,6 +1009,15 @@ func (w *Worker) initProtocol(cs *connState) {
 			// nil OnHeaderDeadlineArmed above means ArmHeaderDeadline
 			// only stamped HeaderDeadlineNs, not the SQE.
 			w.armHeaderTimer(cs)
+			// Per-handler async (celeris #300): wire the route resolver so
+			// ProcessH1, when run inline on the worker (InlineMode), can
+			// detect an async route and bail to the dispatch goroutine.
+			// Only meaningful in async mode; gated on HasAsyncRoutes so
+			// pure-sync servers running with Config.AsyncHandlers=true
+			// don't pay the per-recv resolver call.
+			if r, ok := w.handler.(stream.AsyncRouteResolver); ok && r.HasAsyncRoutes() {
+				cs.h1State.RouteAsync = r.RouteAsync
+			}
 		}
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
@@ -1378,7 +1389,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// immediately. The goroutine runs ProcessH1 under cs.detachMu and
 	// enqueues on detachQueue so this worker submits SEND SQEs on its
 	// own goroutine (SINGLE_ISSUER). Mirrors the epoll W3 shape.
-	if w.async && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+	//
+	// Per-handler async (celeris #300): only PROMOTED conns go straight
+	// to the dispatch goroutine here. A fresh async-mode HTTP1 conn first
+	// tries the inline fast path below (InlineMode); ProcessH1 bails with
+	// ErrAsyncDispatch the moment it parses an async-marked route, at
+	// which point the conn is promoted and its stashed request handed to
+	// the goroutine. This lets sync routes run inline on the worker
+	// (no handoff) on a server that mixes sync + async handlers.
+	if w.async && cs.asyncPromoted && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
 		cs.asyncInMu.Lock()
 		// Backpressure: drop the conn if the dispatch goroutine is
 		// falling behind. Prevents a pipelining client from ballooning
@@ -1442,6 +1461,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	if cs.h1State != nil {
 		cs.h1State.NowNs = now
 	}
+	// Per-handler async (celeris #300): on an async-mode HTTP1 conn that
+	// hasn't been promoted yet, run ProcessH1 inline in InlineMode so it
+	// bails (ErrAsyncDispatch) when it hits an async route. The flag is
+	// set only around the ProcessH1 call(s) below.
+	tryInline := w.async && !cs.asyncPromoted && cs.h1State != nil &&
+		(w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1)
 	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic
 	// Load, no switch dispatch, no upgrade-handling block — ProcessH1
 	// cannot return ErrUpgradeH2C because tryUpgradeH2C is gated off
@@ -1449,11 +1474,23 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// hitting any of the H2 / upgrade machinery in the binary's hot
 	// section.
 	if w.h1Only {
+		if tryInline {
+			cs.h1State.InlineMode = true
+		}
 		processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+		if tryInline {
+			cs.h1State.InlineMode = false
+		}
 	} else {
 		switch engine.Protocol(cs.protocol.Load()) {
 		case engine.HTTP1:
+			if tryInline {
+				cs.h1State.InlineMode = true
+			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+			if tryInline {
+				cs.h1State.InlineMode = false
+			}
 			if errors.Is(processErr, conn.ErrUpgradeH2C) {
 				// H1→H2 upgrade. switchToH2 consumes the upgrade info and
 				// re-arms recv so subsequent data is parsed as H2.
@@ -1515,6 +1552,47 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			} else {
 				processErr = conn.ProcessH2(cs.ctx, data, cs.h2State, w.handler, cs.writeFn, w.h2cfg)
 			}
+		}
+	}
+
+	// Per-handler async (celeris #300): handle the inline → dispatch
+	// handoff. ProcessH1 (InlineMode) returned ErrAsyncDispatch the moment
+	// it parsed an async-marked route; the request (+ any pipelined bytes)
+	// is stashed in the H1 buffer. Promote the conn and hand the stashed
+	// bytes to its dispatch goroutine, then return — every subsequent recv
+	// goes straight to the dispatch path (asyncPromoted guard above).
+	if tryInline {
+		if errors.Is(processErr, conn.ErrAsyncDispatch) {
+			cs.asyncPromoted = true
+			w.asyncPromoted.Add(1)
+			stashed := cs.h1State.TakeBufferedBytes()
+			// Flush any inline-handled response (pipelined sync request
+			// before the async one) before promoting, so the sync
+			// response ships immediately instead of waiting on the async
+			// handler runtime (#300 L1). flushSend self-gates on
+			// cs.sending / cs.zcNotifPending — when a SEND is already
+			// in flight it's a no-op and the dispatch goroutine's later
+			// flush picks up writeBuf intact, preserving order. SQ
+			// pressure (returns true) is non-fatal: the dispatch
+			// goroutine's direct unix.Write will still ship the bytes.
+			if len(cs.writeBuf) > 0 && !cs.sending && !cs.zcNotifPending {
+				_ = w.flushSend(cs)
+			}
+			if hasProvidedBuf {
+				w.bufRing.PushBuffer(providedBufID)
+				w.hasBufReturns = true
+			}
+			w.promoteConnToAsync(cs, fd, stashed, c)
+			return
+		}
+		// Inline handled the request(s). If ProcessH1 left partial state
+		// (buffered headers / accumulating body), promote so the
+		// continuation runs on the dispatch goroutine — the partial-state
+		// parse paths must not run inline (only the fresh-parse site
+		// honors the async check).
+		if processErr == nil && cs.h1State.HasPendingData() {
+			cs.asyncPromoted = true
+			w.asyncPromoted.Add(1)
 		}
 	}
 
@@ -2108,6 +2186,36 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // Preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
 // request in the slice in order, and responses land on cs.writeBuf in
 // the same order before the flush.
+// promoteConnToAsync hands a conn that bailed from the inline fast path
+// (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
+// stashed request bytes. Mirrors the tail of the async-dispatch block. The
+// caller has already set cs.asyncPromoted and returned the provided buffer.
+func (w *Worker) promoteConnToAsync(cs *connState, fd int, stashed []byte, c *completionEntry) {
+	cs.asyncInMu.Lock()
+	cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
+	starting := !cs.asyncRun
+	if starting {
+		cs.asyncRun = true
+	}
+	cs.asyncInMu.Unlock()
+	if starting {
+		w.asyncWG.Add(1)
+		go w.runAsyncHandler(cs)
+	} else {
+		cs.asyncCond.Signal()
+	}
+	w.reqBatch++
+	if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
+		w.armHeaderTimer(cs)
+	}
+	if !cqeHasMore(c.Flags) && !cs.recvPaused {
+		if !w.prepareRecv(fd, cs.buf) {
+			cs.needsRecv = true
+			w.markDirty(cs)
+		}
+	}
+}
+
 func (w *Worker) runAsyncHandler(cs *connState) {
 	defer w.asyncWG.Done()
 	defer func() {

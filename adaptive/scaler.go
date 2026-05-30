@@ -72,7 +72,13 @@ func (s *adaptiveScalerSource) NumWorkers() int {
 }
 
 func (s *adaptiveScalerSource) ActiveConns() int64 {
-	return (*s.e.active.Load()).Metrics().ActiveConnections
+	// Sum BOTH sub-engines' active conns, not just the currently-active
+	// one. During an adaptive switch, in-flight conns on the OLD
+	// sub-engine continue to be served until their clients close — the
+	// scaler must count them so the desired-worker calculation doesn't
+	// undershoot the real CPU load (#300 G1).
+	return s.e.primary.Metrics().ActiveConnections +
+		s.e.secondary.Metrics().ActiveConnections
 }
 
 func (s *adaptiveScalerSource) PauseWorker(i int) {

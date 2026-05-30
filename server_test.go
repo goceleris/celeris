@@ -786,7 +786,7 @@ func TestRouterSplitPreservesFullPath(t *testing.T) {
 	r.addRoute("GET", "/api/posts", []HandlerFunc{func(_ *Context) error { return nil }})
 
 	var params Params
-	handlers, fp := r.find("GET", "/api/users", &params)
+	handlers, fp, _ := r.find("GET", "/api/users", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /api/users")
 	}
@@ -795,7 +795,7 @@ func TestRouterSplitPreservesFullPath(t *testing.T) {
 	}
 
 	params = params[:0]
-	handlers, fp = r.find("GET", "/api/posts", &params)
+	handlers, fp, _ = r.find("GET", "/api/posts", &params)
 	if handlers == nil {
 		t.Fatal("expected handlers for /api/posts")
 	}
@@ -891,13 +891,13 @@ func TestDoubleSlashNormalization(t *testing.T) {
 
 	var params Params
 	// "//" should match "/"
-	handlers, _ := s.router.find("GET", "//", &params)
+	handlers, _, _ := s.router.find("GET", "//", &params)
 	if handlers == nil {
 		t.Fatal("expected // to match /")
 	}
 	// "///api///data" should match "/api/data"
 	params = params[:0]
-	handlers, fp := s.router.find("GET", "///api///data", &params)
+	handlers, fp, _ := s.router.find("GET", "///api///data", &params)
 	if handlers == nil {
 		t.Fatalf("expected ///api///data to match /api/data")
 	}

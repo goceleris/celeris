@@ -391,3 +391,47 @@ func ExampleContext_SetString() {
 	// true acme-prod
 	// acme-prod
 }
+
+// ExampleRoute_Async demonstrates per-handler async dispatch on a mixed
+// server: most routes run inline on the worker (sync, lowest latency)
+// and only blocking-I/O routes opt into the per-conn dispatch goroutine.
+// See [celeris.Config.AsyncHandlers] for the server-level default.
+func ExampleRoute_Async() {
+	s := celeris.New(celeris.Config{Addr: ":8080"})
+
+	// CPU-bound — runs inline (default; no .Async() call).
+	s.GET("/healthz", func(c *celeris.Context) error {
+		return c.String(200, "ok")
+	})
+
+	// Blocking I/O — opt into the dispatch goroutine so the worker
+	// stays free to serve other conns while this handler waits on
+	// the database.
+	s.GET("/db", func(c *celeris.Context) error {
+		// db.Query(...) etc.
+		return c.String(200, "row")
+	}).Async()
+
+	_ = s
+	fmt.Println("server configured")
+	// Output: server configured
+}
+
+// ExampleRouteGroup_Async demonstrates the inverse layout: declare a
+// group as async, then opt individual routes back to sync with .Sync().
+func ExampleRouteGroup_Async() {
+	s := celeris.New(celeris.Config{Addr: ":8080"})
+
+	api := s.Group("/api").Async() // all /api/* are async by default
+	api.GET("/products", func(c *celeris.Context) error { return c.String(200, "ok") })
+	api.GET("/orders", func(c *celeris.Context) error { return c.String(200, "ok") })
+
+	// /api/cached is CPU-only — opt back to sync.
+	api.GET("/cached", func(c *celeris.Context) error {
+		return c.String(200, "cached")
+	}).Sync()
+
+	_ = s
+	fmt.Println("group configured")
+	// Output: group configured
+}

@@ -68,6 +68,7 @@ type Stream struct {
 	CachedRoutePath     string
 	CachedRouteHandlers any // []celeris.HandlerFunc — typed any to avoid cycle
 	CachedRouteFullPath string
+	CachedRouteAsync    bool // resolved per-route async dispatch flag (cached with the chain)
 	// StartTimeNs is the engine's cached time.Now().UnixNano() for the
 	// recv that produced this request. populated by populateCachedStream
 	// from the engine's worker-local clock cache so HandleStream avoids a
@@ -299,6 +300,7 @@ func (s *Stream) resetAndPool() {
 	s.CachedRoutePath = ""
 	s.CachedRouteHandlers = nil
 	s.CachedRouteFullPath = ""
+	s.CachedRouteAsync = false
 	s.WorkerID = 0
 	s.WorkerIDSet = false
 	s.StartTimeNs = 0
