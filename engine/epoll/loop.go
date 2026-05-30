@@ -78,7 +78,8 @@ type Loop struct {
 	reqCount         *atomic.Uint64
 	activeConns      *atomic.Int64
 	errCount         *atomic.Uint64
-	reqBatch         uint64 // batched request count, flushed to reqCount per iteration
+	asyncPromoted    *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	reqBatch         uint64         // batched request count, flushed to reqCount per iteration
 	tickCounter      uint32
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -120,7 +121,7 @@ type Loop struct {
 func newLoop(id, cpuID int, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) *Loop {
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) *Loop {
 
 	return &Loop{
 		id:           id,
@@ -145,9 +146,10 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			RecvBuf:     resolved.SocketRecv,
 			SendBuf:     resolved.SocketSend,
 		},
-		reqCount:    reqCount,
-		activeConns: activeConns,
-		errCount:    errCount,
+		reqCount:      reqCount,
+		activeConns:   activeConns,
+		errCount:      errCount,
+		asyncPromoted: asyncPromoted,
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
@@ -786,6 +788,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// preceding pipelined sync request) stays in cs.writeBuf
 				// and is flushed in order by the dispatch path.
 				cs.asyncPromoted = true
+				l.asyncPromoted.Add(1)
 				stashed := cs.h1State.TakeBufferedBytes()
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
@@ -858,6 +861,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// inline (only the fresh-parse site honors the async check).
 		if tryInline && processErr == nil && cs.h1State.HasPendingData() {
 			cs.asyncPromoted = true
+			l.asyncPromoted.Add(1)
 		}
 
 		l.reqBatch++

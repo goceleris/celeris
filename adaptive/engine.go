@@ -382,14 +382,24 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 func (e *Engine) Metrics() engine.EngineMetrics {
 	pm := e.primary.Metrics()
 	sm := e.secondary.Metrics()
+	// Both sub-engines were built from the same handler + cfg, so their
+	// AsyncRoutes counts are identical; take one (not the sum) for the
+	// adaptive view. AsyncPromotedConns IS additive — promotions on the
+	// old sub-engine during a switch still count.
+	asyncRoutes := pm.AsyncRoutes
+	if asyncRoutes == 0 {
+		asyncRoutes = sm.AsyncRoutes
+	}
 	return engine.EngineMetrics{
-		RequestCount:      pm.RequestCount + sm.RequestCount,
-		ActiveConnections: pm.ActiveConnections + sm.ActiveConnections,
-		ErrorCount:        pm.ErrorCount + sm.ErrorCount,
-		Throughput:        pm.Throughput + sm.Throughput,
-		LatencyP50:        max(pm.LatencyP50, sm.LatencyP50),
-		LatencyP99:        max(pm.LatencyP99, sm.LatencyP99),
-		LatencyP999:       max(pm.LatencyP999, sm.LatencyP999),
+		RequestCount:       pm.RequestCount + sm.RequestCount,
+		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
+		ErrorCount:         pm.ErrorCount + sm.ErrorCount,
+		Throughput:         pm.Throughput + sm.Throughput,
+		LatencyP50:         max(pm.LatencyP50, sm.LatencyP50),
+		LatencyP99:         max(pm.LatencyP99, sm.LatencyP99),
+		LatencyP999:        max(pm.LatencyP999, sm.LatencyP999),
+		AsyncRoutes:        asyncRoutes,
+		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 	}
 }
 

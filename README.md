@@ -201,9 +201,31 @@ s := celeris.New(celeris.Config{
 	IdleTimeout:        120 * time.Second,
 	ShutdownTimeout:    10 * time.Second,    // max wait for in-flight requests (default 30s)
 	MaxRequestBodySize: 50 << 20,            // 50 MB (default 100 MB, -1 for unlimited)
+	AsyncHandlers:      false,               // server-level default (per-route .Async() overrides)
 	Logger:             slog.Default(),
 })
 ```
+
+## Async Handlers (per-route)
+
+Celeris runs every handler **inline on the I/O worker** by default — lowest latency, zero handoff. For handlers that block on I/O (database, RPC, file system) you can opt **per-route** into the per-connection dispatch goroutine, so the worker stays free to drive other connections:
+
+```go
+// CPU-only / cache-only — runs inline (default).
+s.GET("/healthz", healthHandler)
+
+// Blocking I/O — async, runs on per-conn goroutine.
+s.GET("/db", dbHandler).Async()
+
+// Or flip the default at the group level:
+api := s.Group("/api").Async()
+api.GET("/products", productHandler)        // async (inherited)
+api.GET("/cached", cachedHandler).Sync()    // opt back to sync
+```
+
+Precedence is **route > group > server default** (`Config.AsyncHandlers`). Works identically across all engines — iouring/epoll use a single-allocation `ErrAsyncDispatch` handoff per connection, H2 uses per-stream inline vs. worker-pool dispatch. The `Async`/`Sync` distinction is a no-op on the `std` engine (net/http already does goroutine-per-request).
+
+**Migrating from v1.4.11:** if your server set `Config.AsyncHandlers: true` to handle one blocking route, you can now flip the default back to `false` and mark only that route `.Async()` to recover the ~3–5 % CPU regression on the inline hot path. See the [`Route.Async`](https://pkg.go.dev/github.com/goceleris/celeris#Route.Async) godoc and the [`v1.4.12` release notes](https://github.com/goceleris/celeris/releases/tag/v1.4.12) for the full design.
 
 ## net/http Compatibility
 

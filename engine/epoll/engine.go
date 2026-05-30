@@ -30,7 +30,13 @@ type Engine struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		errCount    atomic.Uint64
+		// asyncPromoted counts inline → dispatch-goroutine promotions
+		// across all loops (celeris #300).
+		asyncPromoted atomic.Uint64
 	}
+	// asyncRoutes is the static AsyncRoutes count snapshotted at
+	// construction from the handler's AsyncRouteCount (#300 G3).
+	asyncRoutes int
 }
 
 // New creates a new epoll engine.
@@ -40,10 +46,15 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	return &Engine{
+	e := &Engine{
 		cfg:     cfg,
 		handler: handler,
-	}, nil
+	}
+	// Snapshot the static AsyncRoutes count (#300 G3).
+	if r, ok := handler.(interface{ AsyncRouteCount() int }); ok {
+		e.asyncRoutes = r.AsyncRouteCount()
+	}
+	return e, nil
 }
 
 // Listen starts the epoll engine and blocks until context is canceled.
@@ -79,7 +90,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l := newLoop(i, cpus[i], e.handler,
 			resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
-			&e.acceptPaused)
+			&e.metrics.asyncPromoted, &e.acceptPaused)
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -147,9 +158,11 @@ func (e *Engine) Shutdown(_ context.Context) error {
 // Metrics returns a snapshot of engine metrics.
 func (e *Engine) Metrics() engine.EngineMetrics {
 	return engine.EngineMetrics{
-		RequestCount:      e.metrics.reqCount.Load(),
-		ActiveConnections: e.metrics.activeConns.Load(),
-		ErrorCount:        e.metrics.errCount.Load(),
+		RequestCount:       e.metrics.reqCount.Load(),
+		ActiveConnections:  e.metrics.activeConns.Load(),
+		ErrorCount:         e.metrics.errCount.Load(),
+		AsyncRoutes:        e.asyncRoutes,
+		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
 	}
 }
 

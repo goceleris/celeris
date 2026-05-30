@@ -39,6 +39,38 @@
 //	api := s.Group("/api")
 //	api.GET("/items", listItems)
 //
+// # Async Handlers
+//
+// By default every handler runs inline on the I/O worker — lowest latency,
+// zero handoff. Routes that block on I/O (database, RPC, file system) can
+// opt per-route into the per-connection dispatch goroutine so the worker
+// stays free to drive other connections:
+//
+//	s.GET("/healthz", healthHandler)             // sync (default), inline on worker
+//	s.GET("/db", dbHandler).Async()              // async, per-conn goroutine
+//
+// Or flip the default at the group / server level and opt routes back to
+// sync individually:
+//
+//	api := s.Group("/api").Async()               // async for all /api/* routes
+//	api.GET("/products", productHandler)
+//	api.GET("/cached", cachedHandler).Sync()     // opt this one back to sync
+//
+// Precedence is route > group > server default ([Config.AsyncHandlers]).
+// Works identically across iouring, epoll and adaptive (per-request H1
+// dispatch, per-stream H2 dispatch). On the std engine the per-route flag
+// is a no-op (net/http already runs handler-per-goroutine).
+//
+// Migrating from v1.4.11: if you previously set Config.AsyncHandlers=true
+// to handle a small set of blocking routes, you can now flip the default
+// back to false and mark only those routes .Async() — recovering the
+// ~3–5 % CPU regression the goroutine-per-request model imposed on the
+// inline hot path.
+//
+// SAFETY: do NOT call .Sync() / .Async(false) on a handler that hijacks
+// or detaches the connection (WebSocket upgrade, SSE). Detached flows run
+// async by construction.
+//
 // # Middleware
 //
 // Middleware is provided by the in-tree middleware/ packages (e.g.

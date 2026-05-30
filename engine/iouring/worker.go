@@ -136,10 +136,11 @@ type Worker struct {
 	// RST as it pauses).
 	listenFDClosed atomic.Bool
 
-	reqCount    *atomic.Uint64
-	activeConns *atomic.Int64
-	errCount    *atomic.Uint64
-	reqBatch    uint64 // batched request count, flushed to reqCount per iteration
+	reqCount      *atomic.Uint64
+	activeConns   *atomic.Int64
+	errCount      *atomic.Uint64
+	asyncPromoted *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	reqBatch      uint64         // batched request count, flushed to reqCount per iteration
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -191,7 +192,7 @@ type Worker struct {
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
 	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
 	// binding) so that the kernel allocates socket internal buffers on the
@@ -199,26 +200,27 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	// queue operations on multi-socket systems.
 
 	return &Worker{
-		id:           id,
-		cpuID:        cpuID,
-		listenFD:     -1,
-		h2EventFD:    -1,
-		tier:         tier,
-		sqpoll:       tier.SQPollIdle() > 0,
-		sendZC:       tier.SupportsSendZC(),
-		async:        cfg.AsyncHandlers,
-		h1Only:       cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
-		conns:        make([]*connState, fixedFileTableSize),
-		handler:      handler,
-		resolved:     resolved,
-		cfg:          cfg,
-		logger:       cfg.Logger,
-		reqCount:     reqCount,
-		activeConns:  activeConns,
-		errCount:     errCount,
-		acceptPaused: acceptPaused,
-		wake:         make(chan struct{}),
-		ready:        make(chan error, 1),
+		id:            id,
+		cpuID:         cpuID,
+		listenFD:      -1,
+		h2EventFD:     -1,
+		tier:          tier,
+		sqpoll:        tier.SQPollIdle() > 0,
+		sendZC:        tier.SupportsSendZC(),
+		async:         cfg.AsyncHandlers,
+		h1Only:        cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
+		conns:         make([]*connState, fixedFileTableSize),
+		handler:       handler,
+		resolved:      resolved,
+		cfg:           cfg,
+		logger:        cfg.Logger,
+		reqCount:      reqCount,
+		activeConns:   activeConns,
+		errCount:      errCount,
+		asyncPromoted: asyncPromoted,
+		acceptPaused:  acceptPaused,
+		wake:          make(chan struct{}),
+		ready:         make(chan error, 1),
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
@@ -1562,7 +1564,20 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	if tryInline {
 		if errors.Is(processErr, conn.ErrAsyncDispatch) {
 			cs.asyncPromoted = true
+			w.asyncPromoted.Add(1)
 			stashed := cs.h1State.TakeBufferedBytes()
+			// Flush any inline-handled response (pipelined sync request
+			// before the async one) before promoting, so the sync
+			// response ships immediately instead of waiting on the async
+			// handler runtime (#300 L1). flushSend self-gates on
+			// cs.sending / cs.zcNotifPending — when a SEND is already
+			// in flight it's a no-op and the dispatch goroutine's later
+			// flush picks up writeBuf intact, preserving order. SQ
+			// pressure (returns true) is non-fatal: the dispatch
+			// goroutine's direct unix.Write will still ship the bytes.
+			if len(cs.writeBuf) > 0 && !cs.sending && !cs.zcNotifPending {
+				_ = w.flushSend(cs)
+			}
 			if hasProvidedBuf {
 				w.bufRing.PushBuffer(providedBufID)
 				w.hasBufReturns = true
@@ -1577,6 +1592,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// honors the async check).
 		if processErr == nil && cs.h1State.HasPendingData() {
 			cs.asyncPromoted = true
+			w.asyncPromoted.Add(1)
 		}
 	}
 

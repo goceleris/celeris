@@ -112,3 +112,85 @@ func waitPath(t *testing.T, ch chan string) string {
 		return ""
 	}
 }
+
+// TestProcessor_CanRunInlineGateOrdering pins the gate ordering inside
+// canRunInline: (1) END_STREAM check, (2) continuationActive check,
+// (3) per-route async check. Specifically a stream WITH end_stream that
+// the processor would otherwise consider for inline must still return
+// false while CONTINUATION is active, regardless of the per-route async
+// decision. Prevents a refactor that flips the order of the gates.
+func TestProcessor_CanRunInlineGateOrdering(t *testing.T) {
+	h := &asyncRouteTestHandler{asyncPaths: map[string]bool{"/db": true}}
+	p := NewProcessor(h, newTestFrameWriter(), newTestResponseWriter())
+
+	// Helper: a stream that meets the EndStream precondition.
+	mkStream := func(path string) *Stream {
+		return &Stream{
+			EndStream: true,
+			Headers:   [][2]string{{":method", "GET"}, {":path", path}},
+		}
+	}
+
+	// (a) sync route, no CONTINUATION → inline-eligible.
+	if !p.canRunInline(mkStream("/cpu")) {
+		t.Fatal("sync route, no continuation: want canRunInline=true")
+	}
+	// (b) async route, no CONTINUATION → NOT inline (per-route gate).
+	if p.canRunInline(mkStream("/db")) {
+		t.Fatal("async route: want canRunInline=false")
+	}
+	// (c) sync route, CONTINUATION active → NOT inline (continuation gate
+	// must fire before the per-route gate; otherwise async routes that
+	// arrive during a CONTINUATION storm could be falsely promoted).
+	p.continuationActive.Store(true)
+	if p.canRunInline(mkStream("/cpu")) {
+		t.Fatal("continuation active: want canRunInline=false for sync route")
+	}
+	// (d) async route, CONTINUATION active → NOT inline (either gate
+	// is sufficient; both firing is the safe overlap case).
+	if p.canRunInline(mkStream("/db")) {
+		t.Fatal("continuation active + async route: want canRunInline=false")
+	}
+	p.continuationActive.Store(false)
+
+	// (e) confirm no EndStream returns false regardless of route.
+	noEnd := &Stream{EndStream: false, Headers: [][2]string{{":method", "POST"}, {":path", "/cpu"}}}
+	if p.canRunInline(noEnd) {
+		t.Fatal("no EndStream: want canRunInline=false")
+	}
+}
+
+// TestProcessor_StreamRouteAsyncStripsQuery pins the path-query strip in
+// streamRouteAsync — /db?id=5 must resolve as /db so a route registered
+// without a query string is matched correctly.
+func TestProcessor_StreamRouteAsyncStripsQuery(t *testing.T) {
+	h := &asyncRouteTestHandler{asyncPaths: map[string]bool{"/db": true}}
+	p := NewProcessor(h, newTestFrameWriter(), newTestResponseWriter())
+
+	withQuery := &Stream{Headers: [][2]string{{":method", "GET"}, {":path", "/db?id=5"}}}
+	if !p.streamRouteAsync(withQuery) {
+		t.Fatal("/db?id=5 must strip to /db and resolve async")
+	}
+	without := &Stream{Headers: [][2]string{{":method", "GET"}, {":path", "/cpu?x"}}}
+	if p.streamRouteAsync(without) {
+		t.Fatal("/cpu?x must strip to /cpu and resolve sync")
+	}
+}
+
+// TestProcessor_StreamRouteAsyncMissingPseudoHeaders verifies that a
+// missing :path or :method makes streamRouteAsync return false (=
+// inline-eligible) so the inline path still runs and the malformed
+// request fails normally inside the handler chain.
+func TestProcessor_StreamRouteAsyncMissingPseudoHeaders(t *testing.T) {
+	h := &asyncRouteTestHandler{asyncPaths: map[string]bool{"/db": true}}
+	p := NewProcessor(h, newTestFrameWriter(), newTestResponseWriter())
+
+	noPath := &Stream{Headers: [][2]string{{":method", "GET"}}}
+	if p.streamRouteAsync(noPath) {
+		t.Fatal("missing :path: want streamRouteAsync=false")
+	}
+	noMethod := &Stream{Headers: [][2]string{{":path", "/db"}}}
+	if p.streamRouteAsync(noMethod) {
+		t.Fatal("missing :method: want streamRouteAsync=false")
+	}
+}

@@ -33,7 +33,14 @@ type Engine struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		errCount    atomic.Uint64
+		// asyncPromoted counts the cumulative inline → dispatch-goroutine
+		// promotions across all workers (celeris #300).
+		asyncPromoted atomic.Uint64
 	}
+	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
+	// at construction so Metrics() doesn't pay the type-assertion per
+	// call. Snapshot-at-Listen — static post-Start.
+	asyncRoutes int
 }
 
 // New creates a new io_uring engine.
@@ -112,12 +119,18 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		"send_zc", tier.SupportsSendZC(),
 	)
 
-	return &Engine{
+	e := &Engine{
 		tier:    tier,
 		profile: profile,
 		cfg:     cfg,
 		handler: handler,
-	}, nil
+	}
+	// Snapshot the static AsyncRoutes count from the handler so
+	// Metrics() doesn't pay a type-assertion per call (#300 G3).
+	if r, ok := handler.(interface{ AsyncRouteCount() int }); ok {
+		e.asyncRoutes = r.AsyncRouteCount()
+	}
+	return e, nil
 }
 
 // Listen starts the io_uring engine and blocks until context is canceled.
@@ -246,7 +259,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
-			&e.acceptPaused)
+			&e.metrics.asyncPromoted, &e.acceptPaused)
 		if err != nil {
 			// Clean up already-created workers.
 			for _, prev := range workers[:i] {
@@ -297,9 +310,11 @@ func (e *Engine) Shutdown(_ context.Context) error {
 // Metrics returns a snapshot of engine metrics.
 func (e *Engine) Metrics() engine.EngineMetrics {
 	return engine.EngineMetrics{
-		RequestCount:      e.metrics.reqCount.Load(),
-		ActiveConnections: e.metrics.activeConns.Load(),
-		ErrorCount:        e.metrics.errCount.Load(),
+		RequestCount:       e.metrics.reqCount.Load(),
+		ActiveConnections:  e.metrics.activeConns.Load(),
+		ErrorCount:         e.metrics.errCount.Load(),
+		AsyncRoutes:        e.asyncRoutes,
+		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
 	}
 }
 

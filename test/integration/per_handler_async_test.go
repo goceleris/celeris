@@ -173,3 +173,107 @@ func TestPerHandlerAsync_ConcurrentMixed(t *testing.T) {
 		})
 	}
 }
+
+// TestPerHandlerAsync_StickinessMetric verifies the engine-level
+// asyncPromoted counter (#300 G3) increments exactly once per fresh
+// async-mode H1 connection that touches an async route, and stays
+// monotonic across many requests on the same conn (stickiness).
+func TestPerHandlerAsync_StickinessMetric(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{
+		{"iouring", celeris.IOUring},
+		{"epoll", celeris.Epoll},
+	} {
+		t.Run(e.name, func(t *testing.T) {
+			srv, _, addr := startAsyncServer(t, e.eng, false /* sync default */)
+			info := srv.EngineInfo()
+			if info == nil {
+				t.Skip("engine not running")
+			}
+			if info.Metrics.AsyncRoutes == 0 {
+				t.Fatalf("expected AsyncRoutes>0 for mixed-routes server; got %d", info.Metrics.AsyncRoutes)
+			}
+			base0 := srv.EngineInfo().Metrics.AsyncPromotedConns
+
+			// One keep-alive client → many requests; promotion should
+			// fire ONCE on the first /db hit and not again.
+			client := &http.Client{Transport: &http.Transport{
+				MaxIdleConnsPerHost: 1,
+				DisableKeepAlives:   false,
+			}}
+			defer client.CloseIdleConnections()
+
+			// First request is sync — must NOT promote.
+			if _, err := client.Get("http://" + addr + "/cpu"); err != nil {
+				t.Fatalf("get /cpu: %v", err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if got := srv.EngineInfo().Metrics.AsyncPromotedConns - base0; got != 0 {
+				t.Fatalf("sync-only request must NOT promote: delta=%d", got)
+			}
+			// First async hit on this conn — must promote exactly once.
+			if _, err := client.Get("http://" + addr + "/db"); err != nil {
+				t.Fatalf("get /db: %v", err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if got := srv.EngineInfo().Metrics.AsyncPromotedConns - base0; got != 1 {
+				t.Fatalf("first async hit must promote exactly once: delta=%d", got)
+			}
+			// Subsequent requests on the SAME conn (sync or async) must
+			// not promote again — sticky.
+			for i := 0; i < 5; i++ {
+				_, _ = client.Get("http://" + addr + "/db")
+				_, _ = client.Get("http://" + addr + "/cpu")
+			}
+			time.Sleep(100 * time.Millisecond)
+			if got := srv.EngineInfo().Metrics.AsyncPromotedConns - base0; got != 1 {
+				t.Fatalf("promotion must be sticky: delta=%d after 10 more reqs, want 1", got)
+			}
+		})
+	}
+}
+
+// TestPerHandlerAsync_KeepAliveOrdering walks 12 pipelined-but-sequential
+// requests with a sync/async/sync/async pattern over ONE keep-alive
+// connection and asserts response ordering on iouring + epoll. Catches
+// any regression in the inline-flush-then-promote handoff (#300 L1).
+func TestPerHandlerAsync_KeepAliveOrdering(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{
+		{"iouring", celeris.IOUring},
+		{"epoll", celeris.Epoll},
+	} {
+		t.Run(e.name, func(t *testing.T) {
+			_, _, addr := startAsyncServer(t, e.eng, false)
+			tr := &http.Transport{MaxIdleConnsPerHost: 1}
+			client := &http.Client{Transport: tr}
+			defer client.CloseIdleConnections()
+
+			seq := []string{"/cpu", "/db", "/cached", "/db", "/cpu", "/api/products",
+				"/api/static", "/db", "/users/42", "/cpu", "/db", "/api/products"}
+			wantByPath := map[string]string{
+				"/cpu": "cpu", "/db": "db", "/cached": "cached",
+				"/api/products": "products", "/api/static": "static",
+				"/users/42": "user:42",
+			}
+			for i, p := range seq {
+				resp, err := client.Get("http://" + addr + p)
+				if err != nil {
+					t.Fatalf("[%s] req %d %s: %v", e.name, i, p, err)
+				}
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("[%s] req %d %s: status=%d", e.name, i, p, resp.StatusCode)
+				}
+				if got := string(b); got != wantByPath[p] {
+					t.Fatalf("[%s] req %d %s: got=%q want=%q", e.name, i, p, got, wantByPath[p])
+				}
+			}
+		})
+	}
+}

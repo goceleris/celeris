@@ -166,25 +166,49 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 	return r
 }
 
-// Async overrides the dispatch mode for this specific route, taking
-// precedence over any group-level or server-level (Config.AsyncHandlers)
-// default. Async() with no argument means async (true); pass false to
-// force this route sync even on an async-default server/group. Must be
-// called before [Server.Start]. Chainable:
+// Async marks this route for the per-conn dispatch goroutine, overriding
+// any group-level or server-level (Config.AsyncHandlers) default.
+// SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
+// handler — detached flows run async by construction.
 //
-//	srv.GET("/users/:id", userHandler).Async()       // async, this route
-//	api.GET("/cached", cachedHandler).Async(false)   // opt out of group async
+// Precedence is route > group > server default. Must be called before
+// [Server.Start]. Chainable. Async() with no argument means true; the
+// variadic-bool form is kept for back-compat — prefer .Sync() to opt a
+// single route out of an async-default group/server.
 //
-// Do NOT mark a handler that hijacks/detaches the connection (WebSocket
-// upgrade, SSE) with .Async(false): detached flows run async by
-// construction (a middleware goroutine owns the connection after Detach),
-// so the per-route flag cannot downgrade them to sync. Leave such routes
-// at the default or .Async(true).
+//	srv.GET("/users/:id", userHandler).Async()      // async, this route
+//	api.GET("/cached", cachedHandler).Sync()        // opt out of group async
+//
+// See [Config.AsyncHandlers] for the server-level default and the
+// per-handler async design overview.
 func (r *Route) Async(opt ...bool) *Route {
 	want := true
 	if len(opt) > 0 {
 		want = opt[0]
 	}
+	return r.setAsync(want)
+}
+
+// Sync forces this route to run inline on the worker / event-loop thread,
+// overriding any group-level or server-level async default. Equivalent to
+// .Async(false) but reads more naturally at the call site:
+//
+//	api := srv.Group("/api").Async()
+//	api.GET("/products", productHandler)            // async (from group)
+//	api.GET("/healthz", healthHandler).Sync()       // opt this one back to sync
+//
+// SAFETY: do NOT call .Sync() on a handler that hijacks/detaches the
+// connection (WebSocket upgrade, SSE). Detached flows run async by
+// construction (a middleware goroutine owns the connection after Detach),
+// so the per-route flag cannot downgrade them to sync.
+func (r *Route) Sync() *Route {
+	return r.setAsync(false)
+}
+
+// setAsync is the shared implementation of [Route.Async] and [Route.Sync].
+// Updates the node, the router's asyncRouteCount, and the static-fast-path
+// map entry so all three observers see the same async flag.
+func (r *Route) setAsync(want bool) *Route {
 	if r.node == nil {
 		return r
 	}

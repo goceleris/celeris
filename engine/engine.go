@@ -79,4 +79,19 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	LatencyP99 time.Duration
 	// LatencyP999 is the 99.9th-percentile request latency.
 	LatencyP999 time.Duration
+	// AsyncRoutes is the count of routes registered with .Async(true) on
+	// this engine's handler. Static after Listen — derived from the
+	// router's per-route async flags and exposed for diagnostics so
+	// operators can see how many handlers run on the per-conn dispatch
+	// goroutine vs inline on the worker. Zero on engines whose handler
+	// does not implement [github.com/goceleris/celeris/protocol/h2/stream.AsyncRouteResolver].
+	AsyncRoutes int
+	// AsyncPromotedConns is the cumulative number of connections that
+	// have been promoted from inline-on-worker to the per-conn dispatch
+	// goroutine via per-handler async (celeris #300). Counts promotions,
+	// not currently-promoted conns — every fresh async-mode connection
+	// that hits an async route increments this once. Useful to observe
+	// how often the inline → goroutine handoff fires vs the pure-sync
+	// inline fast path.
+	AsyncPromotedConns uint64
 }
