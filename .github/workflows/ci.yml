@@ -52,6 +52,13 @@ jobs:
         with:
           version: v2.9
           working-directory: middleware/protobuf
+      - name: actionlint
+        # Workflow-YAML lint: catches script-injection vectors, unknown
+        # runner labels, malformed shell, action input misuse — the
+        # whole class golangci-lint can't see.
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@latest
+          actionlint -color
 
   unit:
     name: Unit (root + middleware sub-modules)
