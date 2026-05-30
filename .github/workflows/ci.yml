@@ -86,9 +86,10 @@ jobs:
       # msr1 + Multipass and is exercised end-to-end by the
       # autobahn-fuzzingclient test under `mage testAutobahn`.
       - name: Root module — race tests (excluding test/ + adaptive/ + websocket)
-        run: >-
-          go test -race -count=1 -timeout=300s
-          $(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+        run: |
+          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+          # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
+          go test -race -count=1 -timeout=300s $pkgs
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
