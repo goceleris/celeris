@@ -389,7 +389,7 @@ jobs:
       - name: Start sentinel stack
         run: |
           docker compose -f test/conformance/redis/docker-compose.sentinel.yml up -d
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if docker exec celeris-sentinel-1 redis-cli -p 26379 \
                 sentinel master mymaster 2>/dev/null | grep -q "^127.0.0.1$"; then
               echo "sentinels ready"
