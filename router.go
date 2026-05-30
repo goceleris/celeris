@@ -174,6 +174,12 @@ func (r *Route) Use(middleware ...HandlerFunc) *Route {
 //
 //	srv.GET("/users/:id", userHandler).Async()       // async, this route
 //	api.GET("/cached", cachedHandler).Async(false)   // opt out of group async
+//
+// Do NOT mark a handler that hijacks/detaches the connection (WebSocket
+// upgrade, SSE) with .Async(false): detached flows run async by
+// construction (a middleware goroutine owns the connection after Detach),
+// so the per-route flag cannot downgrade them to sync. Leave such routes
+// at the default or .Async(true).
 func (r *Route) Async(opt ...bool) *Route {
 	want := true
 	if len(opt) > 0 {
