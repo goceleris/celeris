@@ -37,13 +37,6 @@ const connTableSize = 65536
 // connection cleanly (read returns 0 bytes / EOF).
 var errPeerClosed = errors.New("celeris: peer closed connection")
 
-// asyncHandlers (legacy env-var fallback) dispatches HTTP handlers to a
-// goroutine per connection instead of running them inline on the
-// LockOSThread'd worker. The canonical switch is now Config.AsyncHandlers;
-// the env var remains as a diagnostic override and is OR'd with the config
-// flag inside run().
-var asyncHandlersEnv = os.Getenv("CELERIS_ASYNC_HANDLERS") == "1"
-
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id           int
@@ -115,9 +108,12 @@ type Loop struct {
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
 
 	// async dispatches HTTP1 handlers to spawned goroutines. Set by
-	// Config.AsyncHandlers (OR'd with the CELERIS_ASYNC_HANDLERS env-var
-	// override for diagnostic flips). Checked on every drainRead; keep it
-	// as a plain bool so the no-async path is a single mov+test.
+	// Config.AsyncHandlers (the canonical server-level default) or
+	// auto-enabled in doPrepare when the router has any .Async() routes.
+	// Per-route .Async()/.Async(false) overrides further refine dispatch
+	// per request via the InlineMode → ErrAsyncDispatch handoff. Checked
+	// on every drainRead; keep it a plain bool so the no-async path is a
+	// single mov+test.
 	async bool
 }
 
@@ -158,7 +154,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
 		},
-		async: cfg.AsyncHandlers || asyncHandlersEnv,
+		async: cfg.AsyncHandlers,
 	}
 }
 
@@ -723,9 +719,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 		// processes any buffered batch monotonically. Matches
 		// net/http's goroutine-per-conn model.
 		//
-		// Gated by Config.AsyncHandlers (+ CELERIS_ASYNC_HANDLERS env
-		// override for ops diagnostics). The inline path below is
-		// unchanged and zero-cost when async is off.
+		// Gated by Config.AsyncHandlers (or auto-enabled by hasAsyncRoutes
+		// in doPrepare). The inline path below is unchanged and zero-cost
+		// when async is off.
 		// Per-handler async (celeris #300): only PROMOTED conns go straight
 		// to the dispatch goroutine. A fresh async-mode HTTP1 conn first
 		// tries the inline fast path below (InlineMode); ProcessH1 bails
