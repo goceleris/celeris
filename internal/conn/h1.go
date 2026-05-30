@@ -221,6 +221,30 @@ type H1State struct {
 	RouteAsync func(method, path string) bool
 }
 
+// TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the
+// parse buffer (notably the request that triggered ErrAsyncDispatch, plus
+// any pipelined bytes) and clears the buffer. The engine uses it to hand
+// the stashed request to the per-conn dispatch goroutine. Returns nil when
+// the buffer is empty.
+func (s *H1State) TakeBufferedBytes() []byte {
+	if s.buffer.Len() == 0 {
+		return nil
+	}
+	b := make([]byte, s.buffer.Len())
+	copy(b, s.buffer.Bytes())
+	s.buffer.Reset()
+	return b
+}
+
+// HasPendingData reports whether ProcessH1 left partial-request state that a
+// subsequent recv must continue (buffered headers awaiting more bytes, or a
+// fixed-length body still accumulating). The engine uses it after an inline
+// ProcessH1 to decide whether to promote the conn to its dispatch goroutine
+// for the continuation (so the partial-state parse paths never run inline).
+func (s *H1State) HasPendingData() bool {
+	return s.buffer.Len() > 0 || s.bodyNeeded > 0
+}
+
 // UpdateWriteFn replaces the response adapter's write function. Called by
 // OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
 func (s *H1State) UpdateWriteFn(fn func([]byte)) {
