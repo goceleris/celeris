@@ -1140,7 +1140,22 @@ func (w *Worker) initProtocol(cs *connState) {
 			// celeris#273 — pre-fix, /ws and /events would TIMEOUT on
 			// iouring + AsyncHandlers because the dispatch goroutine
 			// was deadlocked on its own re-entrant Lock attempt.
-			if w.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+			//
+			// Gate on cs.asyncPromoted: detachMu is Locked around
+			// ProcessH1 ONLY by runAsyncHandler (the dispatch goroutine),
+			// which runs exclusively for PROMOTED conns. With per-handler
+			// async (#300/#302) a not-yet-promoted async-mode conn runs
+			// its FIRST request INLINE on the worker thread (tryInline);
+			// a SYNC route — the WebSocket /ws upgrade or SSE /events
+			// stream, which are not themselves .Async() — does not bail
+			// with ErrAsyncDispatch, so its handler runs inline and calls
+			// Context.Detach() → OnDetach while detachMu was NEVER Locked.
+			// Unlocking here under the old w.async-only guard then faulted
+			// with "sync: unlock of unlocked mutex", fatally crashing the
+			// process on the first /ws or /events request. The
+			// asyncPromoted gate restricts the Unlock to the dispatch-
+			// goroutine path that actually holds the lock. See celeris#309.
+			if w.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
 			}
