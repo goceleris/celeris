@@ -2990,13 +2990,27 @@ func (w *Worker) shutdown() {
 	w.asyncWG.Wait()
 }
 
-// drainRecvBuffer reads and discards any data in the socket receive buffer.
-// This prevents close() from sending RST (which discards unsent data like GOAWAY).
+// drainRecvMaxReads bounds drainRecvBuffer so a peer that keeps trickling bytes
+// on a half-closed connection cannot pin the worker. 64 × 512 B = 32 KiB is far
+// more than any legitimate post-shutdown tail (a queued GOAWAY / WS close echo).
+const drainRecvMaxReads = 64
+
+// drainRecvBuffer non-blockingly reads and discards whatever is already in the
+// socket receive buffer, so the following close() will not send an RST that
+// discards unsent data still staged in the send buffer (a queued GOAWAY / WS
+// close frame).
+//
+// It MUST NOT block. It runs on the io_uring event-loop worker thread and the
+// socket is in blocking mode, so a plain unix.Read here waits for data or FIN
+// that may never arrive on a churn-closed / half-closed detached connection —
+// wedging the worker, and with enough concurrent detached-closes the whole
+// engine (it accepts connections and then services nothing). See celeris#311.
+// MSG_DONTWAIT makes each read return EAGAIN the moment the buffer is empty.
 func drainRecvBuffer(fd int) {
 	var buf [512]byte
-	for {
-		n, _ := unix.Read(fd, buf[:])
-		if n <= 0 {
+	for i := 0; i < drainRecvMaxReads; i++ {
+		n, _, err := unix.Recvfrom(fd, buf[:], unix.MSG_DONTWAIT)
+		if n <= 0 || err != nil {
 			return
 		}
 	}
