@@ -591,6 +591,14 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 			return
 		}
 
+		// Free the MAX_CONCURRENT_STREAMS slot before removal. A handler that
+		// returned without writing a response (error return, empty/204-style
+		// handler, recovered panic) or a stream left half-closed-local still
+		// counts as active, and RemoveStreamFromMap does NOT touch
+		// activeStreams — so transition to Closed here, decrementing exactly
+		// once via updateActiveCount. Idempotent: a fully-completed stream
+		// already transitioned to Closed above is a no-op (no double-decrement).
+		stream.SetState(StateClosed)
 		p.manager.RemoveStreamFromMap(stream.ID)
 		stream.Release()
 	}()
@@ -683,6 +691,12 @@ func (p *Processor) executeHandler(stream *Stream) {
 			return
 		}
 
+		// Free the MAX_CONCURRENT_STREAMS slot before removal (see
+		// executeHandlerInline): a no-write handler, an error return, or a
+		// half-closed-local stream still counts as active and RemoveStreamFromMap
+		// does not decrement, so transition to Closed here (idempotent for an
+		// already-Closed stream — no double-decrement).
+		stream.SetState(StateClosed)
 		p.manager.RemoveStreamFromMap(stream.ID)
 		stream.Release()
 	}()

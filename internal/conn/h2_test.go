@@ -466,6 +466,60 @@ func TestProcessH2_ServerRSTFreesSlot(t *testing.T) {
 	}
 }
 
+// TestProcessH2_NoWriteHandlerFreesSlot is a regression test for a
+// MAX_CONCURRENT_STREAMS slot leak on the inline early-return path. An
+// inline-eligible request (GET/HEAD with END_STREAM, so the stream is
+// HalfClosedRemote = active/counted) whose handler returns WITHOUT writing a
+// response takes the `!headersSent` branch (the adapter emits an empty 200) and
+// returns BEFORE the state transition — so the teardown defer removed the
+// still-active stream via RemoveStreamFromMap, which never decrements
+// activeStreams, leaking one slot per request until the limit pinned (map
+// empty, every new HEADERS REFUSED). Trigger in prod: any inline GET/HEAD route
+// that returns without writing (early return, 204-style, recovered panic). The
+// fix transitions the stream to Closed in the defer so the slot frees on every
+// exit path. Pre-fix: activeStreams pins at 1 after the first stream.
+func TestProcessH2_NoWriteHandlerFreesSlot(t *testing.T) {
+	const (
+		maxStreams = 8
+		nStreams   = 40 // >> maxStreams: a leaked slot pins the limit fast
+	)
+	h := silentHandler{}
+	write := func([]byte) {}
+	cfg := H2Config{MaxConcurrentStreams: maxStreams}
+	state := NewH2State(h, cfg, write, -1)
+	mgr := state.processor.GetManager()
+
+	var preface bytes.Buffer
+	preface.WriteString(frame.ClientPreface)
+	pf := http2.NewFramer(&preface, nil)
+	if err := pf.WriteSettings(); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+	if err := ProcessH2(context.Background(), preface.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2 preface: %v", err)
+	}
+
+	hdr := encodeH2Headers(t, [][2]string{
+		{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
+	})
+	for i := 0; i < nStreams; i++ {
+		sid := uint32(2*i + 1)
+		var b bytes.Buffer
+		fr := http2.NewFramer(&b, nil)
+		if err := fr.WriteRawFrame(http2.FrameHeaders,
+			http2.FlagHeadersEndStream|http2.FlagHeadersEndHeaders, sid, hdr); err != nil {
+			t.Fatalf("WriteHeaders sid=%d: %v", sid, err)
+		}
+		if err := ProcessH2(context.Background(), b.Bytes(), state, h, write, cfg); err != nil {
+			t.Fatalf("ProcessH2 sid=%d: %v", sid, err)
+		}
+		if got := mgr.CountActiveStreams(); got != 0 {
+			t.Fatalf("after no-write stream %d: activeStreams=%d, want 0 (slot leaked — streamCount=%d)",
+				sid, got, mgr.StreamCount())
+		}
+	}
+}
+
 // countGoAwayFlowControl parses captured server output and returns how many
 // GOAWAY frames carry FLOW_CONTROL_ERROR — the symptom of the connection-window
 // overflow bug.
