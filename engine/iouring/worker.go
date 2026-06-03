@@ -1140,7 +1140,22 @@ func (w *Worker) initProtocol(cs *connState) {
 			// celeris#273 — pre-fix, /ws and /events would TIMEOUT on
 			// iouring + AsyncHandlers because the dispatch goroutine
 			// was deadlocked on its own re-entrant Lock attempt.
-			if w.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+			//
+			// Gate on cs.asyncPromoted: detachMu is Locked around
+			// ProcessH1 ONLY by runAsyncHandler (the dispatch goroutine),
+			// which runs exclusively for PROMOTED conns. With per-handler
+			// async (#300/#302) a not-yet-promoted async-mode conn runs
+			// its FIRST request INLINE on the worker thread (tryInline);
+			// a SYNC route — the WebSocket /ws upgrade or SSE /events
+			// stream, which are not themselves .Async() — does not bail
+			// with ErrAsyncDispatch, so its handler runs inline and calls
+			// Context.Detach() → OnDetach while detachMu was NEVER Locked.
+			// Unlocking here under the old w.async-only guard then faulted
+			// with "sync: unlock of unlocked mutex", fatally crashing the
+			// process on the first /ws or /events request. The
+			// asyncPromoted gate restricts the Unlock to the dispatch-
+			// goroutine path that actually holds the lock. See celeris#309.
+			if w.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
 			}
@@ -2975,13 +2990,27 @@ func (w *Worker) shutdown() {
 	w.asyncWG.Wait()
 }
 
-// drainRecvBuffer reads and discards any data in the socket receive buffer.
-// This prevents close() from sending RST (which discards unsent data like GOAWAY).
+// drainRecvMaxReads bounds drainRecvBuffer so a peer that keeps trickling bytes
+// on a half-closed connection cannot pin the worker. 64 × 512 B = 32 KiB is far
+// more than any legitimate post-shutdown tail (a queued GOAWAY / WS close echo).
+const drainRecvMaxReads = 64
+
+// drainRecvBuffer non-blockingly reads and discards whatever is already in the
+// socket receive buffer, so the following close() will not send an RST that
+// discards unsent data still staged in the send buffer (a queued GOAWAY / WS
+// close frame).
+//
+// It MUST NOT block. It runs on the io_uring event-loop worker thread and the
+// socket is in blocking mode, so a plain unix.Read here waits for data or FIN
+// that may never arrive on a churn-closed / half-closed detached connection —
+// wedging the worker, and with enough concurrent detached-closes the whole
+// engine (it accepts connections and then services nothing). See celeris#311.
+// MSG_DONTWAIT makes each read return EAGAIN the moment the buffer is empty.
 func drainRecvBuffer(fd int) {
 	var buf [512]byte
-	for {
-		n, _ := unix.Read(fd, buf[:])
-		if n <= 0 {
+	for i := 0; i < drainRecvMaxReads; i++ {
+		n, _, err := unix.Recvfrom(fd, buf[:], unix.MSG_DONTWAIT)
+		if n <= 0 || err != nil {
 			return
 		}
 	}
