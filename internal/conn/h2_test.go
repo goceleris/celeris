@@ -6,6 +6,9 @@ import (
 	"sync"
 	"testing"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/goceleris/celeris/protocol/h2/frame"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
@@ -171,5 +174,109 @@ func TestInjectStreamHeaders_WithBody(t *testing.T) {
 	}
 	if h.method != "POST" || h.path != "/submit" || h.body != "hello world" {
 		t.Fatalf("method=%q path=%q body=%q", h.method, h.path, h.body)
+	}
+}
+
+// respondHandler answers every stream with a fixed 200 response so the inline
+// handler path runs to completion (END_STREAM sent) and reaches the stream-slot
+// reclamation logic under test.
+type respondHandler struct{ body []byte }
+
+func (h respondHandler) HandleStream(_ context.Context, s *stream.Stream) error {
+	if s.ResponseWriter == nil {
+		return nil
+	}
+	return s.ResponseWriter.WriteResponse(s, 200, [][2]string{{"content-type", "text/plain"}}, h.body)
+}
+
+func encodeH2Headers(t *testing.T, headers [][2]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	for _, h := range headers {
+		if err := enc.WriteField(hpack.HeaderField{Name: h[0], Value: h[1]}); err != nil {
+			t.Fatalf("hpack encode: %v", err)
+		}
+	}
+	return buf.Bytes()
+}
+
+// TestProcessH2_PipelinedCompletedStreamsNotRefused is a regression test for the
+// REFUSED_STREAM storm (probatorium grid get-json-64k-h2: ~50M stream errors).
+// When a single recv buffer carries more pipelined, already-complete GET
+// requests than SETTINGS_MAX_CONCURRENT_STREAMS, the server must NOT refuse the
+// excess: inline handlers run sequentially, so each stream completes
+// (END_STREAM) before the next opens — at most one stream is ever genuinely
+// open. A completed stream must free its concurrency slot immediately even
+// though its map removal is deferred to FlushInlineCleanup (hasMoreFrames=true
+// for the whole batch). Before the fix, streams past the limit got
+// RST_STREAM(REFUSED_STREAM); after, all are served.
+func TestProcessH2_PipelinedCompletedStreamsNotRefused(t *testing.T) {
+	const (
+		maxStreams = 8
+		nStreams   = 20 // > maxStreams: pre-fix refused streams 9..20
+	)
+	h := respondHandler{body: []byte("ok")}
+	var mu sync.Mutex
+	var writes []byte
+	write := func(b []byte) {
+		mu.Lock()
+		writes = append(writes, b...)
+		mu.Unlock()
+	}
+	cfg := H2Config{MaxConcurrentStreams: maxStreams}
+	state := NewH2State(h, cfg, write, -1)
+
+	// One buffer: client preface + empty client SETTINGS + nStreams complete
+	// GET HEADERS frames (odd stream IDs). Delivering them in a single
+	// ProcessH2 call sets hasMoreFrames=true for the whole batch — the
+	// precondition for the deferred-cleanup bug.
+	hdr := encodeH2Headers(t, [][2]string{
+		{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
+	})
+	var in bytes.Buffer
+	in.WriteString(frame.ClientPreface)
+	fr := http2.NewFramer(&in, nil)
+	if err := fr.WriteSettings(); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+	for i := 0; i < nStreams; i++ {
+		sid := uint32(2*i + 1)
+		if err := fr.WriteRawFrame(http2.FrameHeaders,
+			http2.FlagHeadersEndStream|http2.FlagHeadersEndHeaders, sid, hdr); err != nil {
+			t.Fatalf("WriteHeaders sid=%d: %v", sid, err)
+		}
+	}
+	if err := ProcessH2(context.Background(), in.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2: %v", err)
+	}
+
+	// Parse the server output: no stream may be REFUSED, and every request
+	// must be answered.
+	mu.Lock()
+	out := append([]byte(nil), writes...)
+	mu.Unlock()
+	refused, served := 0, 0
+	rf := http2.NewFramer(nil, bytes.NewReader(out))
+	rf.SetMaxReadFrameSize(1 << 20)
+	for {
+		f, err := rf.ReadFrame()
+		if err != nil {
+			break
+		}
+		switch v := f.(type) {
+		case *http2.RSTStreamFrame:
+			if v.ErrCode == http2.ErrCodeRefusedStream {
+				refused++
+			}
+		case *http2.HeadersFrame:
+			served++
+		}
+	}
+	if refused != 0 {
+		t.Fatalf("got %d RST_STREAM(REFUSED_STREAM), want 0 — completed inline streams must free their MAX_CONCURRENT_STREAMS slot", refused)
+	}
+	if served != nStreams {
+		t.Fatalf("server answered %d/%d pipelined requests", served, nStreams)
 	}
 }

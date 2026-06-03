@@ -615,17 +615,17 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 		return
 	}
 
-	// When more frames follow in the recv buffer, defer the state
-	// transition and cleanup until FlushInlineCleanup (after the frame
-	// loop). This keeps activeStreams elevated so TryOpenStream correctly
-	// enforces MAX_CONCURRENT_STREAMS for subsequent HEADERS frames.
-	// Fixes h2spec: concurrent stream limit exceeded.
-	if p.hasMoreFrames {
-		p.pendingInlineCleanup = append(p.pendingInlineCleanup, stream)
-		keepAlive = true
-		return
-	}
-
+	// Transition the stream state NOW so a fully-completed stream (END_STREAM
+	// sent, no buffered outbound) stops counting toward MAX_CONCURRENT_STREAMS
+	// immediately. Per RFC 7540 §5.1.2 only open / half-closed streams count,
+	// so a closed stream must free its slot at once — otherwise a single recv
+	// buffer carrying more than MAX_CONCURRENT_STREAMS pipelined complete
+	// requests (e.g. 64 KB GETs whose responses backpressure TCP) would see
+	// the 101st+ HEADERS spuriously REFUSED even though streams 1..100 are
+	// already done. Inline handlers run sequentially, so at most one stream is
+	// genuinely open at a time; a still-open stream never reaches this point
+	// (it returns early above), so the concurrency limit stays enforced for
+	// real concurrent streams.
 	state := stream.GetState()
 	if state == StateOpen || state == StateHalfClosedRemote {
 		if state == StateHalfClosedRemote {
@@ -633,6 +633,17 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 		} else {
 			stream.SetState(StateHalfClosedLocal)
 		}
+	}
+
+	// When more frames follow in the recv buffer, defer only the map removal
+	// and Release to FlushInlineCleanup (after the frame loop) so later frames
+	// in the same batch that reference this stream still find it. The state
+	// transition above already ran; FlushInlineCleanup re-applies it
+	// idempotently before removing the stream.
+	if p.hasMoreFrames {
+		p.pendingInlineCleanup = append(p.pendingInlineCleanup, stream)
+		keepAlive = true
+		return
 	}
 }
 
