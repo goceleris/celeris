@@ -8,13 +8,13 @@ require (
 	github.com/cloudwego/hertz v0.10.4
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-chi/chi/v5 v5.3.0
-	github.com/goceleris/celeris v1.4.3
-	github.com/goceleris/loadgen v1.4.4
+	github.com/goceleris/celeris v1.4.10
+	github.com/goceleris/loadgen v1.4.5
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/sessions v1.4.0
 	github.com/hertz-contrib/http2 v0.1.8
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/kataras/iris/v12 v12.2.11
 	github.com/labstack/echo/v4 v4.15.2
 	github.com/magefile/mage v1.17.2
