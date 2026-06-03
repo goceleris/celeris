@@ -134,6 +134,15 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 // If the stream has an async handler goroutine running (asyncRunning=true),
 // the stream is removed from the map but NOT released — the goroutine
 // will release it upon completion via ReleaseAsyncStream.
+//
+// A stream that is still in an active state when it is deleted (e.g. a
+// server-initiated RST_STREAM on a stalled stream, or a half-closed-local
+// stream whose outbound was fully flushed) must free its
+// MAX_CONCURRENT_STREAMS slot here. updateActiveCount is idempotent — if the
+// caller already transitioned the stream to Closed (the normal completion
+// path) the state is no longer active and no second decrement occurs — so
+// this is the single choke point that guarantees every removed stream frees
+// its slot exactly once, regardless of which close path reached it.
 func (m *Manager) DeleteStream(id uint32) {
 	m.mu.Lock()
 	s, ok := m.streams[id]
@@ -146,6 +155,9 @@ func (m *Manager) DeleteStream(id uint32) {
 	if !ok {
 		return
 	}
+
+	prev := State(s.state.Swap(int32(StateClosed)))
+	m.updateActiveCount(prev, StateClosed)
 
 	m.windowUpdateMu.Lock()
 	delete(m.pendingStreamUpdates, id)

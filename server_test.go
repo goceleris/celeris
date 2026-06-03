@@ -26,21 +26,15 @@ func TestServerEngineInfo(t *testing.T) {
 	var fe engine.Engine = &fakeEngine{}
 	s.engineRef.Store(&fe)
 	info := s.EngineInfo()
-	if info == nil {
-		t.Fatal("expected non-nil EngineInfo")
-	}
-	if info.Type != Std {
-		t.Fatalf("expected Std, got %v", info.Type)
+	if info == nil || info.Type != Std {
+		t.Fatalf("expected non-nil EngineInfo of type Std, got %+v", info)
 	}
 }
 
 func TestNewServer(t *testing.T) {
 	s := New(Config{Addr: ":9090"})
-	if s == nil {
-		t.Fatal("expected non-nil server")
-	}
-	if s.config.Addr != ":9090" {
-		t.Fatalf("expected :9090, got %s", s.config.Addr)
+	if s == nil || s.config.Addr != ":9090" {
+		t.Fatalf("expected non-nil server with addr :9090, got %+v", s)
 	}
 }
 

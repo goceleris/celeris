@@ -9,11 +9,8 @@ import (
 
 func TestNewParser(t *testing.T) {
 	p := NewParser()
-	if p == nil {
-		t.Fatal("NewParser returned nil")
-	}
-	if p.buf == nil {
-		t.Fatal("Parser buffer is nil")
+	if p == nil || p.buf == nil {
+		t.Fatalf("NewParser returned nil or nil-buffer parser: %+v", p)
 	}
 }
 

@@ -226,7 +226,7 @@ func cloneClaims(template jwtparse.Claims) jwtparse.Claims {
 		return &jwtparse.RegisteredClaims{}
 	default:
 		t := reflect.TypeOf(template)
-		if t.Kind() == reflect.Ptr {
+		if t.Kind() == reflect.Pointer {
 			if t.Elem().Kind() != reflect.Struct {
 				panic(fmt.Sprintf("jwt: unsupported custom claims type %T; use ClaimsFactory for non-struct pointer types", template))
 			}

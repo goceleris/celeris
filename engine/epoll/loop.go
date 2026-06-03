@@ -1123,7 +1123,28 @@ func (l *Loop) initProtocol(cs *connState) {
 			// and have the dispatch goroutine observe
 			// asyncDetachUnlocked to skip its symmetric Unlock when
 			// ProcessH1 returns. See celeris#273.
-			if l.async && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+			//
+			// Gate on cs.asyncPromoted: detachMu is Locked around
+			// ProcessH1 ONLY by runAsyncHandler (the dispatch goroutine),
+			// which runs exclusively for PROMOTED conns. With per-handler
+			// async (celeris#300/#302) an async-mode conn (l.async==true,
+			// forced on whenever any route opts into .Async()) runs its
+			// FIRST request INLINE on the event-loop thread when the conn
+			// is not yet promoted (tryInline at drainRead). A SYNC route
+			// — e.g. the WebSocket /ws upgrade or the SSE /events stream,
+			// which are not themselves .Async() — does not bail with
+			// ErrAsyncDispatch, so its handler runs inline and calls
+			// Context.Detach() → OnDetach while detachMu was NEVER Locked
+			// (the inline path locks it only at the post-handler flush,
+			// loop.go:896). Unlocking here under the old `l.async`-only
+			// guard then faulted with "sync: unlock of unlocked mutex",
+			// fatally crashing the process on the first /ws or /events
+			// request. The asyncPromoted gate restricts the Unlock to the
+			// dispatch-goroutine path that actually holds the lock; the
+			// inline flush owns its own Lock/Unlock around flushWrites, so
+			// the guarded writeFn (which re-locks) still serialises with
+			// the event loop. See celeris#309.
+			if l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
 			}

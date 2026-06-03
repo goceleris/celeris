@@ -1,6 +1,8 @@
 package stream
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/net/http2"
@@ -152,5 +154,88 @@ func TestBatchThreshold(t *testing.T) {
 	}
 	if fw.windowUpdates[1] != windowUpdateThreshold {
 		t.Errorf("Stream update: got %d, want %d", fw.windowUpdates[1], windowUpdateThreshold)
+	}
+}
+
+// TestReserveSendWindowConcurrent proves the connection-level send window
+// cannot be over-subscribed under concurrent reservations — the race the H2
+// 64 KB fix closes. The pre-fix path (load window, clamp, then a separate
+// atomic add) let two goroutines clamp against the same stale window and both
+// debit, driving the shared connection window negative and sending past the
+// peer-authorized credit (RFC 7540 §6.9). ReserveSendWindow does the clamp and
+// debit in one CAS, so N goroutines reserving from one window partition it
+// EXACTLY: the grants sum to the initial credit and the window lands on 0,
+// never below. Runs clean under -race.
+func TestReserveSendWindowConcurrent(t *testing.T) {
+	const (
+		initialConn = 100_000
+		goroutines  = 16
+		chunk       = 137 // odd so grants never divide the window evenly
+	)
+	m := NewManager()
+	atomic.StoreInt32(&m.connectionWindow, initialConn)
+
+	streams := make([]*Stream, goroutines)
+	for g := range streams {
+		s := m.CreateStream(uint32(2*g + 1))
+		s.SetWindowSize(1 << 30) // huge per-stream window → conn window is the only bottleneck
+		streams[g] = s
+	}
+
+	granted := make([]int64, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(idx int, st *Stream) {
+			defer wg.Done()
+			for {
+				n := m.ReserveSendWindow(st, chunk)
+				if n <= 0 {
+					return
+				}
+				granted[idx] += int64(n)
+			}
+		}(g, streams[g])
+	}
+	wg.Wait()
+
+	var total int64
+	for _, gtd := range granted {
+		total += gtd
+	}
+	if total != initialConn {
+		t.Fatalf("total granted = %d, want exactly %d (window over/under-subscribed)", total, initialConn)
+	}
+	if cw := m.GetConnectionWindow(); cw != 0 {
+		t.Fatalf("connectionWindow = %d after exhaustion, want 0 (must never go negative)", cw)
+	}
+}
+
+// TestReserveSendWindowClampsBothWindows checks the per-stream window binds when
+// smaller than the connection window, and that the connection window is debited
+// by exactly the granted (clamped) amount — never over-debited when the stream
+// window is the bottleneck.
+func TestReserveSendWindowClampsBothWindows(t *testing.T) {
+	m := NewManager()
+	atomic.StoreInt32(&m.connectionWindow, 10_000)
+	s := m.CreateStream(1)
+	s.SetWindowSize(300) // stream window is the bottleneck
+
+	if got := m.ReserveSendWindow(s, 1000); got != 300 {
+		t.Fatalf("grant = %d, want 300 (clamped by the per-stream window)", got)
+	}
+	if sw := s.GetWindowSize(); sw != 0 {
+		t.Fatalf("stream window = %d, want 0 (debited by grant)", sw)
+	}
+	if cw := m.GetConnectionWindow(); cw != 10_000-300 {
+		t.Fatalf("connection window = %d, want %d (debited by grant, not the request)", cw, 10_000-300)
+	}
+	// Stream window exhausted → further reservations grant 0 and must not touch
+	// the connection window.
+	if got := m.ReserveSendWindow(s, 1000); got != 0 {
+		t.Fatalf("grant after stream exhaustion = %d, want 0", got)
+	}
+	if cw := m.GetConnectionWindow(); cw != 10_000-300 {
+		t.Fatalf("connection window leaked: %d, want %d", cw, 10_000-300)
 	}
 }
