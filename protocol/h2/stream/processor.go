@@ -1220,15 +1220,10 @@ func (p *Processor) flushStreamOutbound(s *Stream) bool {
 	}
 
 	buffered := s.OutboundBuffer.Bytes()
-	streamWin := s.windowSize.Load()
-	connWin := atomic.LoadInt32(&p.manager.connectionWindow)
-	sendLen := len(buffered)
-	if int32(sendLen) > streamWin {
-		sendLen = int(streamWin)
-	}
-	if int32(sendLen) > connWin {
-		sendLen = int(connWin)
-	}
+	// Atomically reserve+debit both windows for exactly the bytes we are about
+	// to send, so a concurrent async-path reservation can never push a shared
+	// window past the peer-authorized credit (RFC 7540 §6.9).
+	sendLen := int(p.manager.ReserveSendWindow(s, int32(len(buffered))))
 	if sendLen <= 0 {
 		// No room on at least one window — leave everything buffered.
 		s.mu.Unlock()
@@ -1236,8 +1231,6 @@ func (p *Processor) flushStreamOutbound(s *Stream) bool {
 	}
 
 	isEnd := sendLen == len(buffered) && s.OutboundEndStream
-	s.windowSize.Add(-int32(sendLen))
-	atomic.AddInt32(&p.manager.connectionWindow, -int32(sendLen))
 	s.mu.Unlock()
 
 	_ = p.writer.WriteData(s.ID, isEnd, buffered[:sendLen])

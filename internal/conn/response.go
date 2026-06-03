@@ -365,43 +365,31 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	return nil
 }
 
-// h2SendableLen returns how many of the first n body bytes may be sent right
-// now, clamped by BOTH the per-stream and the connection-level send windows
-// (RFC 7540 §6.9). A return ≤ 0 means the stream must stall (buffer the whole
-// body) because at least one window is exhausted. When mgr is nil (unit-test
-// adapters constructed without a manager) only the per-stream window applies.
-func h2SendableLen(mgr *stream.Manager, s *stream.Stream, n int) int {
-	streamWin := s.GetWindowSize()
-	connWin := int32(0x7fffffff)
+// h2ReserveSend atomically reserves AND debits up to n bytes of send credit for
+// stream s across BOTH the per-stream and the connection-level send windows
+// (RFC 7540 §6.9), returning how many bytes may be sent now (the caller MUST
+// send exactly that many and buffer the rest). A return ≤ 0 means the stream
+// must stall because at least one window is exhausted. Reserving+debiting in
+// one atomic step (vs clamp-then-debit against a stale window) is what prevents
+// the event loop and a worker goroutine from over-subscribing a shared window.
+// When mgr is nil (unit-test adapters constructed without a manager) only the
+// per-stream window applies, preserving the single-window behaviour.
+func h2ReserveSend(mgr *stream.Manager, s *stream.Stream, n int) int {
+	if n <= 0 {
+		return 0
+	}
 	if mgr != nil {
-		connWin = mgr.GetConnectionWindow()
+		return int(mgr.ReserveSendWindow(s, int32(n)))
 	}
-	win := streamWin
-	if connWin < win {
-		win = connWin
-	}
+	win := s.GetWindowSize()
 	if win <= 0 {
 		return 0
 	}
 	if int32(n) > win {
-		return int(win)
-	}
-	return n
-}
-
-// h2DeductWindows debits both the per-stream and the connection-level send
-// windows after n DATA bytes were written. ConsumeSendWindowFast debits both
-// in one call; with a nil manager (unit tests) only the per-stream window is
-// debited so the existing single-window behaviour is preserved.
-func h2DeductWindows(mgr *stream.Manager, s *stream.Stream, n int) {
-	if n <= 0 {
-		return
-	}
-	if mgr != nil {
-		mgr.ConsumeSendWindowFast(s, int32(n))
-		return
+		n = int(win)
 	}
 	s.DeductWindow(int32(n))
+	return n
 }
 
 // h2InlineResponseAdapter writes H2 response frames directly to outBuf.
@@ -492,14 +480,14 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 	// send windows for DATA frames (RFC 7540 §6.9). HEADERS don't consume
 	// either window, so they are always sent inline above.
 	if len(body) > 0 {
-		sendLen := h2SendableLen(a.manager, s, len(body))
+		// Reserve+debit both windows atomically for exactly what we send.
+		sendLen := h2ReserveSend(a.manager, s, len(body))
 		if sendLen <= 0 {
 			s.BufferOutbound(body, true)
 		} else {
 			isEnd := sendLen == len(body)
 			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE (not our own).
 			writeH2DataFragmented(a.outBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-			h2DeductWindows(a.manager, s, sendLen)
 			if !isEnd {
 				s.BufferOutbound(body[sendLen:], true)
 			}
@@ -586,14 +574,14 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			}
 			frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
 			if len(body) > 0 {
-				sendLen := h2SendableLen(a.manager, s, len(body))
+				// Reserve+debit both windows atomically for exactly what we send.
+				sendLen := h2ReserveSend(a.manager, s, len(body))
 				if sendLen <= 0 {
 					s.BufferOutbound(body, true)
 				} else {
 					isEnd := sendLen == len(body)
 					// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
 					frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-					h2DeductWindows(a.manager, s, sendLen)
 					if !isEnd {
 						s.BufferOutbound(body[sendLen:], true)
 					}
@@ -640,14 +628,14 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
 
 	if len(body) > 0 {
-		sendLen := h2SendableLen(a.manager, s, len(body))
+		// Reserve+debit both windows atomically for exactly what we send.
+		sendLen := h2ReserveSend(a.manager, s, len(body))
 		if sendLen <= 0 {
 			s.BufferOutbound(body, true)
 		} else {
 			isEnd := sendLen == len(body)
 			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
 			frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-			h2DeductWindows(a.manager, s, sendLen)
 
 			if !isEnd {
 				s.BufferOutbound(body[sendLen:], true)
