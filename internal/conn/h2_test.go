@@ -465,3 +465,272 @@ func TestProcessH2_ServerRSTFreesSlot(t *testing.T) {
 		}
 	}
 }
+
+// countGoAwayFlowControl parses captured server output and returns how many
+// GOAWAY frames carry FLOW_CONTROL_ERROR — the symptom of the connection-window
+// overflow bug.
+func countGoAwayFlowControl(t *testing.T, out []byte) int {
+	t.Helper()
+	rf := http2.NewFramer(nil, bytes.NewReader(out))
+	rf.SetMaxReadFrameSize(1 << 20)
+	n := 0
+	for {
+		f, err := rf.ReadFrame()
+		if err != nil {
+			break
+		}
+		if ga, ok := f.(*http2.GoAwayFrame); ok && ga.ErrCode == http2.ErrCodeFlowControl {
+			n++
+		}
+	}
+	return n
+}
+
+// TestProcessH2_ConnectionWindowNotOverflowed is the regression test for the
+// 64 KB H2 "error storm" (probatorium grid get-json-64k-h2: ~300–560M loadgen
+// errors). celeris never enforced/debited the CONNECTION-level SEND flow-control
+// window (RFC 7540 §6.9): the send path debited only the per-stream window. A
+// well-behaved client replenishes the connection window with WINDOW_UPDATE(0)
+// credit equal to the DATA it has consumed; because the server never spent the
+// connection window, that credit accumulated on top of a never-shrinking window
+// and climbed 65535 → 2^31-1 → overflow, at which point celeris aborted the
+// WHOLE connection with GOAWAY(FLOW_CONTROL_ERROR, lastStreamID=0), killing
+// every in-flight stream. (Go net/http2 — chi/echo — debits the connection
+// send window, so it stays bounded and never overflows.)
+//
+// The client here advertises a huge per-stream INITIAL_WINDOW_SIZE so the
+// per-stream window is never the bottleneck — every large response is gated by
+// the 65535-byte CONNECTION window exactly as a 64 KB body is on the live grid —
+// and replenishes the connection window with credit EQUAL to the bytes it
+// consumed (faithful client behaviour). With the fix the window is debited by
+// every send, so credit only refills what was spent and the window stays pinned
+// near its initial value; pre-fix it never shrinks, so the matching credit piles
+// up unbounded (and the connection-stalled tail never even re-flushes, so bodies
+// hang). Assertions: no FLOW_CONTROL GOAWAY, the window stays bounded, every
+// body is delivered in full, and no concurrency slot leaks.
+func TestProcessH2_ConnectionWindowNotOverflowed(t *testing.T) {
+	const (
+		nStreams  = 512      // pre-fix the window climbs by ~bodyLen each → ≫ bound
+		bodyLen   = 64 << 10 // 64 KB responses (the live get-json-64k-h2 shape)
+		streamWin = 1 << 30  // 1 GiB per-stream window: never the bottleneck
+		initConn  = 65535    // RFC-default connection window celeris starts with
+		creditPer = 64 << 10 // client credits exactly the body it consumed
+	)
+	h := respondHandler{body: bytes.Repeat([]byte("x"), bodyLen)}
+	var mu sync.Mutex
+	var writes []byte
+	write := func(b []byte) {
+		mu.Lock()
+		writes = append(writes, b...)
+		mu.Unlock()
+	}
+	cfg := H2Config{MaxConcurrentStreams: 100}
+	state := NewH2State(h, cfg, write, -1)
+	mgr := state.processor.GetManager()
+
+	// Preface + client SETTINGS advertising a huge per-stream initial window.
+	var preface bytes.Buffer
+	preface.WriteString(frame.ClientPreface)
+	pf := http2.NewFramer(&preface, nil)
+	if err := pf.WriteSettings(http2.Setting{
+		ID: http2.SettingInitialWindowSize, Val: streamWin,
+	}); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+	if err := ProcessH2(context.Background(), preface.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2 preface: %v", err)
+	}
+
+	hdr := encodeH2Headers(t, [][2]string{
+		{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
+	})
+
+	var totalData int
+	for i := 0; i < nStreams; i++ {
+		sid := uint32(2*i + 1)
+
+		// HEADERS (complete GET). The response (64 KB) sends up to the current
+		// connection window then stalls on it; the per-stream window has room.
+		var hb bytes.Buffer
+		hf := http2.NewFramer(&hb, nil)
+		if err := hf.WriteRawFrame(http2.FrameHeaders,
+			http2.FlagHeadersEndStream|http2.FlagHeadersEndHeaders, sid, hdr); err != nil {
+			t.Fatalf("WriteHeaders sid=%d: %v", sid, err)
+		}
+		if err := ProcessH2(context.Background(), hb.Bytes(), state, h, write, cfg); err != nil {
+			t.Fatalf("ProcessH2 headers sid=%d: %v", sid, err)
+		}
+
+		// Replenish the connection window with exactly what the body consumed,
+		// as a real client does once it reads the 64 KB response off the wire.
+		var wb bytes.Buffer
+		wf := http2.NewFramer(&wb, nil)
+		if err := wf.WriteWindowUpdate(0, creditPer); err != nil {
+			t.Fatalf("WriteWindowUpdate(0) i=%d: %v", i, err)
+		}
+		if err := ProcessH2(context.Background(), wb.Bytes(), state, h, write, cfg); err != nil {
+			t.Fatalf("ProcessH2 conn window-update i=%d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	out := append([]byte(nil), writes...)
+	mu.Unlock()
+
+	// (a) No GOAWAY(FLOW_CONTROL) may ever be emitted.
+	if n := countGoAwayFlowControl(t, out); n != 0 {
+		t.Fatalf("got %d GOAWAY(FLOW_CONTROL_ERROR), want 0 — connection send window overflowed", n)
+	}
+
+	// (b) The connection window must stay bounded, NOT monotonically climb with
+	//     each stream. With the fix every send debits it so the matching credit
+	//     only refills the spend and it hovers near its initial value. Pre-fix
+	//     it never shrinks, so nStreams × creditPer (~32 MB here) piles on top.
+	if got := mgr.GetConnectionWindow(); got > initConn+creditPer {
+		t.Fatalf("connection window climbed to %d (bound %d) — sends are not debiting it",
+			got, initConn+creditPer)
+	}
+
+	// (c) Every body must be delivered in full. Pre-fix the connection-stalled
+	//     tail of each response never re-flushes (the WINDOW_UPDATE(0) handler
+	//     did not resume connection-stalled streams), so bytes go missing.
+	rf := http2.NewFramer(nil, bytes.NewReader(out))
+	rf.SetMaxReadFrameSize(1 << 20)
+	for {
+		f, err := rf.ReadFrame()
+		if err != nil {
+			break
+		}
+		if df, ok := f.(*http2.DataFrame); ok {
+			totalData += len(df.Data())
+		}
+	}
+	if want := nStreams * bodyLen; totalData != want {
+		t.Fatalf("delivered %d DATA bytes across all streams, want %d (connection-stalled tails dropped)",
+			totalData, want)
+	}
+
+	// (d) No concurrency slot may leak — every stream completed and released.
+	if got := mgr.CountActiveStreams(); got != 0 {
+		t.Fatalf("activeStreams=%d after all streams completed, want 0 (stalled streams leaked their slot)", got)
+	}
+}
+
+// streamDataBytes parses captured output and returns total DATA payload bytes
+// for streamID and whether a DATA frame carried END_STREAM.
+func streamDataBytes(t *testing.T, out []byte, streamID uint32) (total int, sawEnd bool) {
+	t.Helper()
+	rf := http2.NewFramer(nil, bytes.NewReader(out))
+	rf.SetMaxReadFrameSize(1 << 20)
+	for {
+		f, err := rf.ReadFrame()
+		if err != nil {
+			break
+		}
+		if df, ok := f.(*http2.DataFrame); ok && df.StreamID == streamID {
+			total += len(df.Data())
+			if df.StreamEnded() {
+				sawEnd = true
+			}
+		}
+	}
+	return total, sawEnd
+}
+
+// TestProcessH2_ConnWindowStallResumes proves two things:
+//
+//  1. The server MUST NOT send more body bytes than the CONNECTION window has
+//     authorized (RFC 7540 §6.9). Pre-fix the send path only consulted the
+//     per-stream window, so with a huge per-stream window it shipped the entire
+//     100 KB body even though the connection window only authorized 65535 bytes
+//     — a flow-control violation that on a real client triggers the overflow
+//     storm this PR fixes.
+//  2. A stream that stalls on the connection window RESUMES and delivers its
+//     full body once WINDOW_UPDATE(stream 0) credit arrives — the connection
+//     window re-flush. Without it the stalled tail would hang forever (the
+//     per-stream WINDOW_UPDATE path never fires; the peer only sends connection
+//     credit).
+func TestProcessH2_ConnWindowStallResumes(t *testing.T) {
+	const (
+		bodyLen   = 100 << 10 // 100 KB > the 65535-byte initial connection window
+		streamWin = 1 << 30   // per-stream window never blocks
+		initConn  = 65535     // RFC-default connection window celeris starts with
+	)
+	body := bytes.Repeat([]byte("y"), bodyLen)
+	h := respondHandler{body: body}
+	var mu sync.Mutex
+	var writes []byte
+	write := func(b []byte) {
+		mu.Lock()
+		writes = append(writes, b...)
+		mu.Unlock()
+	}
+	cfg := H2Config{MaxConcurrentStreams: 100}
+	state := NewH2State(h, cfg, write, -1)
+
+	var preface bytes.Buffer
+	preface.WriteString(frame.ClientPreface)
+	pf := http2.NewFramer(&preface, nil)
+	if err := pf.WriteSettings(http2.Setting{
+		ID: http2.SettingInitialWindowSize, Val: streamWin,
+	}); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+	if err := ProcessH2(context.Background(), preface.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2 preface: %v", err)
+	}
+
+	hdr := encodeH2Headers(t, [][2]string{
+		{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
+	})
+	sid := uint32(1)
+	var hb bytes.Buffer
+	hf := http2.NewFramer(&hb, nil)
+	if err := hf.WriteRawFrame(http2.FrameHeaders,
+		http2.FlagHeadersEndStream|http2.FlagHeadersEndHeaders, sid, hdr); err != nil {
+		t.Fatalf("WriteHeaders: %v", err)
+	}
+	if err := ProcessH2(context.Background(), hb.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2 headers: %v", err)
+	}
+
+	// Before ANY connection credit: at most the initial connection window may
+	// have been sent. Pre-fix the server ships the whole 100 KB body here
+	// (per-stream window had room), exceeding what the connection authorized.
+	mu.Lock()
+	afterHeaders := append([]byte(nil), writes...)
+	mu.Unlock()
+	if sent, _ := streamDataBytes(t, afterHeaders, sid); sent > initConn {
+		t.Fatalf("server sent %d body bytes with only %d connection window authorized — connection flow control not enforced",
+			sent, initConn)
+	}
+
+	// Drip connection credit in chunks until the whole body is delivered. The
+	// stalled tail must resume off the WINDOW_UPDATE(0) re-flush.
+	for i := 0; i < 8; i++ {
+		var wb bytes.Buffer
+		wf := http2.NewFramer(&wb, nil)
+		if err := wf.WriteWindowUpdate(0, 32<<10); err != nil {
+			t.Fatalf("WriteWindowUpdate(0): %v", err)
+		}
+		if err := ProcessH2(context.Background(), wb.Bytes(), state, h, write, cfg); err != nil {
+			t.Fatalf("ProcessH2 conn window-update %d: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	out := append([]byte(nil), writes...)
+	mu.Unlock()
+
+	if n := countGoAwayFlowControl(t, out); n != 0 {
+		t.Fatalf("got %d GOAWAY(FLOW_CONTROL_ERROR), want 0", n)
+	}
+
+	dataBytes, sawEndStream := streamDataBytes(t, out, sid)
+	if dataBytes != bodyLen {
+		t.Fatalf("delivered %d body bytes, want %d (stream stalled on connection window never resumed fully)", dataBytes, bodyLen)
+	}
+	if !sawEndStream {
+		t.Fatal("no END_STREAM DATA frame — response did not complete")
+	}
+}

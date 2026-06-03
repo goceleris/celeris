@@ -365,6 +365,45 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	return nil
 }
 
+// h2SendableLen returns how many of the first n body bytes may be sent right
+// now, clamped by BOTH the per-stream and the connection-level send windows
+// (RFC 7540 §6.9). A return ≤ 0 means the stream must stall (buffer the whole
+// body) because at least one window is exhausted. When mgr is nil (unit-test
+// adapters constructed without a manager) only the per-stream window applies.
+func h2SendableLen(mgr *stream.Manager, s *stream.Stream, n int) int {
+	streamWin := s.GetWindowSize()
+	connWin := int32(0x7fffffff)
+	if mgr != nil {
+		connWin = mgr.GetConnectionWindow()
+	}
+	win := streamWin
+	if connWin < win {
+		win = connWin
+	}
+	if win <= 0 {
+		return 0
+	}
+	if int32(n) > win {
+		return int(win)
+	}
+	return n
+}
+
+// h2DeductWindows debits both the per-stream and the connection-level send
+// windows after n DATA bytes were written. ConsumeSendWindowFast debits both
+// in one call; with a nil manager (unit tests) only the per-stream window is
+// debited so the existing single-window behaviour is preserved.
+func h2DeductWindows(mgr *stream.Manager, s *stream.Stream, n int) {
+	if n <= 0 {
+		return
+	}
+	if mgr != nil {
+		mgr.ConsumeSendWindowFast(s, int32(n))
+		return
+	}
+	s.DeductWindow(int32(n))
+}
+
 // h2InlineResponseAdapter writes H2 response frames directly to outBuf.
 // Used by inline handlers that execute on the event loop thread. Bypasses
 // the sharded write queue entirely (no mutex, no eventfd, no goroutine).
@@ -449,21 +488,18 @@ func (a *h2InlineResponseAdapter) WriteResponse(s *stream.Stream, status int, he
 		a.outBuf.Write(appendH2Headers(nil, s.ID, endStream, headerBlock, maxFrame))
 	}
 
-	// Flow control: respect stream window for DATA frames (matches async
-	// adapter pattern). HEADERS don't consume window, always sent inline.
+	// Flow control: respect BOTH the per-stream and the connection-level
+	// send windows for DATA frames (RFC 7540 §6.9). HEADERS don't consume
+	// either window, so they are always sent inline above.
 	if len(body) > 0 {
-		window := s.GetWindowSize()
-		if window <= 0 {
+		sendLen := h2SendableLen(a.manager, s, len(body))
+		if sendLen <= 0 {
 			s.BufferOutbound(body, true)
 		} else {
-			sendLen := len(body)
-			if int32(sendLen) > window {
-				sendLen = int(window)
-			}
 			isEnd := sendLen == len(body)
 			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE (not our own).
 			writeH2DataFragmented(a.outBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-			s.DeductWindow(int32(sendLen))
+			h2DeductWindows(a.manager, s, sendLen)
 			if !isEnd {
 				s.BufferOutbound(body[sendLen:], true)
 			}
@@ -550,18 +586,14 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			}
 			frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
 			if len(body) > 0 {
-				window := s.GetWindowSize()
-				if window <= 0 {
+				sendLen := h2SendableLen(a.manager, s, len(body))
+				if sendLen <= 0 {
 					s.BufferOutbound(body, true)
 				} else {
-					sendLen := len(body)
-					if int32(sendLen) > window {
-						sendLen = int(window)
-					}
 					isEnd := sendLen == len(body)
 					// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
 					frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-					s.DeductWindow(int32(sendLen))
+					h2DeductWindows(a.manager, s, sendLen)
 					if !isEnd {
 						s.BufferOutbound(body[sendLen:], true)
 					}
@@ -608,19 +640,14 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
 
 	if len(body) > 0 {
-		window := s.GetWindowSize()
-
-		if window <= 0 {
+		sendLen := h2SendableLen(a.manager, s, len(body))
+		if sendLen <= 0 {
 			s.BufferOutbound(body, true)
 		} else {
-			sendLen := len(body)
-			if int32(sendLen) > window {
-				sendLen = int(window)
-			}
 			isEnd := sendLen == len(body)
 			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
 			frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-			s.DeductWindow(int32(sendLen))
+			h2DeductWindows(a.manager, s, sendLen)
 
 			if !isEnd {
 				s.BufferOutbound(body[sendLen:], true)

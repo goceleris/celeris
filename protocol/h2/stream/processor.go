@@ -107,6 +107,12 @@ type Processor struct {
 	// simple, cheap, and enough to shut down a flood loop.
 	rstCount     uint32 // RST_STREAM count within the current second
 	rstWindowSec int64  // unix-second marker for the current window
+
+	// connFlushScratch is reused by flushConnWindowStalledStreams to snapshot
+	// candidate streams without allocating on every WINDOW_UPDATE(0). Frame
+	// processing is single-threaded per connection (event loop under
+	// H2State.mu), so a per-processor scratch slice is safe.
+	connFlushScratch []*Stream
 }
 
 // rstRateLimit and rstBurstLimit bound RST_STREAM arrivals. An honest
@@ -1121,94 +1127,176 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 				break
 			}
 		}
-	} else {
-		stream, ok := p.manager.GetStream(f.StreamID)
-		if !ok {
-			if f.StreamID <= p.manager.GetLastClientStreamID() {
-				return nil
-			}
-			return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
-				[]byte("WINDOW_UPDATE on idle stream"),
-				fmt.Errorf("WINDOW_UPDATE on idle stream %d", f.StreamID))
-		}
+		// Connection-level credit may unblock streams that stalled on the
+		// CONNECTION window (their per-stream window had room but the shared
+		// connection window was exhausted). Re-flush every such stream — the
+		// mirror of the per-stream branch below. Without this a stream that
+		// ran the connection window to 0 would never resume and the response
+		// would hang.
+		p.flushConnWindowStalledStreams()
+		return nil
+	}
 
-		streamState := stream.GetState()
-		if streamState == StateClosed {
+	stream, ok := p.manager.GetStream(f.StreamID)
+	if !ok {
+		if f.StreamID <= p.manager.GetLastClientStreamID() {
 			return nil
 		}
+		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+			[]byte("WINDOW_UPDATE on idle stream"),
+			fmt.Errorf("WINDOW_UPDATE on idle stream %d", f.StreamID))
+	}
 
-		// CAS loop for atomic window update with overflow check.
-		var newWin int32
-		for {
-			old := stream.LoadWindowSize()
-			newWindow := int64(old) + int64(f.Increment)
-			if newWindow > 0x7fffffff {
-				// RST and reclaim the slot via the shared close path so the
-				// active stream's MAX_CONCURRENT_STREAMS slot is freed.
-				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeFlowControl)
-				return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, old, f.Increment)
-			}
-			//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
-			newWin = int32(newWindow)
-			if stream.CompareAndSwapWindowSize(old, newWin) {
-				break
-			}
+	streamState := stream.GetState()
+	if streamState == StateClosed {
+		return nil
+	}
+
+	// CAS loop for atomic window update with overflow check.
+	for {
+		old := stream.LoadWindowSize()
+		newWindow := int64(old) + int64(f.Increment)
+		if newWindow > 0x7fffffff {
+			// RST and reclaim the slot via the shared close path so the
+			// active stream's MAX_CONCURRENT_STREAMS slot is freed.
+			_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeFlowControl)
+			return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, old, f.Increment)
 		}
-
-		// Flush buffered outbound data now that window space is available.
-		var flushedAll bool
-		stream.mu.Lock()
-		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-			if newWin > 0 {
-				buffered := stream.OutboundBuffer.Bytes()
-				sendLen := len(buffered)
-				if int32(sendLen) > newWin {
-					sendLen = int(newWin)
-				}
-				isEnd := sendLen == len(buffered) && stream.OutboundEndStream
-				stream.windowSize.Add(-int32(sendLen))
-				stream.mu.Unlock()
-
-				_ = p.writer.WriteData(f.StreamID, isEnd, buffered[:sendLen])
-				p.flush()
-
-				stream.mu.Lock()
-				if sendLen == len(buffered) {
-					stream.OutboundBuffer.Reset()
-					if isEnd {
-						flushedAll = true
-					}
-				} else {
-					remaining := make([]byte, len(buffered)-sendLen)
-					copy(remaining, buffered[sendLen:])
-					stream.OutboundBuffer.Reset()
-					stream.OutboundBuffer.Write(remaining)
-				}
-			}
+		//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
+		if stream.CompareAndSwapWindowSize(old, int32(newWindow)) {
+			break
 		}
-		stream.mu.Unlock()
+	}
 
-		// If all buffered data has been flushed with END_STREAM, the handler
-		// goroutine already completed. Transition to closed and clean up.
-		if flushedAll {
-			switch streamState {
-			case StateHalfClosedRemote:
-				stream.SetState(StateClosed)
-			case StateOpen:
-				stream.SetState(StateHalfClosedLocal)
-			}
-			p.manager.DeleteStream(f.StreamID)
+	// Flush buffered outbound data now that per-stream window space is
+	// available (clamped + debited against the connection window too).
+	if p.flushStreamOutbound(stream) {
+		switch streamState {
+		case StateHalfClosedRemote:
+			stream.SetState(StateClosed)
+		case StateOpen:
+			stream.SetState(StateHalfClosedLocal)
 		}
+		p.manager.DeleteStream(f.StreamID)
+	}
 
-		if stream.ReceivedWindowUpd != nil {
-			select {
-			//nolint:gosec // G115: safe conversion
-			case stream.ReceivedWindowUpd <- int32(f.Increment):
-			default:
-			}
+	if stream.ReceivedWindowUpd != nil {
+		select {
+		//nolint:gosec // G115: safe conversion
+		case stream.ReceivedWindowUpd <- int32(f.Increment):
+		default:
 		}
 	}
 	return nil
+}
+
+// flushStreamOutbound sends as much of a stream's buffered outbound DATA as
+// the current per-stream AND connection send windows allow, debiting both
+// windows (RFC 7540 §6.9). It returns true only when the entire buffer was
+// flushed AND it carried END_STREAM — i.e. the stream is now fully sent and
+// the caller should transition it to closed and reclaim its slot. A stream
+// that still has bytes buffered (because either window was exhausted mid-flush)
+// returns false and stays alive for the next WINDOW_UPDATE.
+func (p *Processor) flushStreamOutbound(s *Stream) bool {
+	flushedAll := false
+	s.mu.Lock()
+	if s.OutboundBuffer == nil || s.OutboundBuffer.Len() == 0 {
+		s.mu.Unlock()
+		return false
+	}
+
+	buffered := s.OutboundBuffer.Bytes()
+	streamWin := s.windowSize.Load()
+	connWin := atomic.LoadInt32(&p.manager.connectionWindow)
+	sendLen := len(buffered)
+	if int32(sendLen) > streamWin {
+		sendLen = int(streamWin)
+	}
+	if int32(sendLen) > connWin {
+		sendLen = int(connWin)
+	}
+	if sendLen <= 0 {
+		// No room on at least one window — leave everything buffered.
+		s.mu.Unlock()
+		return false
+	}
+
+	isEnd := sendLen == len(buffered) && s.OutboundEndStream
+	s.windowSize.Add(-int32(sendLen))
+	atomic.AddInt32(&p.manager.connectionWindow, -int32(sendLen))
+	s.mu.Unlock()
+
+	_ = p.writer.WriteData(s.ID, isEnd, buffered[:sendLen])
+	p.flush()
+
+	s.mu.Lock()
+	if sendLen == len(buffered) {
+		s.OutboundBuffer.Reset()
+		if isEnd {
+			flushedAll = true
+		}
+	} else {
+		remaining := make([]byte, len(buffered)-sendLen)
+		copy(remaining, buffered[sendLen:])
+		s.OutboundBuffer.Reset()
+		s.OutboundBuffer.Write(remaining)
+	}
+	s.mu.Unlock()
+	return flushedAll
+}
+
+// flushConnWindowStalledStreams re-flushes every stream that still has
+// buffered outbound DATA after a connection-level WINDOW_UPDATE(0) credited
+// the shared window. A stream whose per-stream window had room but which
+// stalled because the connection window hit zero is invisible to the
+// per-stream WINDOW_UPDATE path (the peer only sends connection credit), so
+// this is the sole place such a stream resumes. Fully-sent streams are
+// transitioned to closed and have their MAX_CONCURRENT_STREAMS slot reclaimed,
+// mirroring the per-stream branch.
+func (p *Processor) flushConnWindowStalledStreams() {
+	// Nothing can be unblocked if the connection window is still empty.
+	if atomic.LoadInt32(&p.manager.connectionWindow) <= 0 {
+		return
+	}
+	// Snapshot the candidate streams under the manager lock; flushing itself
+	// takes per-stream locks and may call DeleteStream, so it must run outside
+	// the manager read lock. The scratch slice is reused across calls to avoid
+	// allocating on this path.
+	candidates := p.connFlushScratch[:0]
+	p.manager.mu.RLock()
+	for _, s := range p.manager.streams {
+		if s.GetState() == StateClosed {
+			continue
+		}
+		candidates = append(candidates, s)
+	}
+	p.manager.mu.RUnlock()
+
+	for _, s := range candidates {
+		// Bail out early once the connection window is exhausted again —
+		// no further stream can make progress until the next credit.
+		if atomic.LoadInt32(&p.manager.connectionWindow) <= 0 {
+			break
+		}
+		streamState := s.GetState()
+		if streamState == StateClosed {
+			continue
+		}
+		if p.flushStreamOutbound(s) {
+			switch streamState {
+			case StateHalfClosedRemote:
+				s.SetState(StateClosed)
+			case StateOpen:
+				s.SetState(StateHalfClosedLocal)
+			}
+			p.manager.DeleteStream(s.ID)
+		}
+	}
+
+	// Retain the grown backing array for the next call but drop the *Stream
+	// references so released (pooled) streams aren't pinned between calls.
+	clear(candidates)
+	p.connFlushScratch = candidates[:0]
 }
 
 // handleRSTStream processes RST_STREAM frames. Enforces a rate limit
@@ -1519,6 +1607,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 				break
 			}
 		}
+		p.flushConnWindowStalledStreams()
 		return nil
 	}
 
@@ -1532,11 +1621,11 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			fmt.Errorf("WINDOW_UPDATE on idle stream %d", streamID))
 	}
 
-	if stream.GetState() == StateClosed {
+	streamState := stream.GetState()
+	if streamState == StateClosed {
 		return nil
 	}
 
-	var newWin int32
 	for {
 		old := stream.LoadWindowSize()
 		newWindow := int64(old) + int64(increment)
@@ -1547,47 +1636,14 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", streamID, old, increment)
 		}
 		//nolint:gosec // G115: safe conversion
-		newWin = int32(newWindow)
-		if stream.CompareAndSwapWindowSize(old, newWin) {
+		if stream.CompareAndSwapWindowSize(old, int32(newWindow)) {
 			break
 		}
 	}
 
-	// Flush buffered outbound data now that window space is available.
-	var flushedAll bool
-	streamState := stream.GetState()
-	stream.mu.Lock()
-	if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
-		if newWin > 0 {
-			buffered := stream.OutboundBuffer.Bytes()
-			sendLen := len(buffered)
-			if int32(sendLen) > newWin {
-				sendLen = int(newWin)
-			}
-			isEnd := sendLen == len(buffered) && stream.OutboundEndStream
-			stream.windowSize.Add(-int32(sendLen))
-			stream.mu.Unlock()
-
-			_ = p.writer.WriteData(streamID, isEnd, buffered[:sendLen])
-			p.flush()
-
-			stream.mu.Lock()
-			if sendLen == len(buffered) {
-				stream.OutboundBuffer.Reset()
-				if isEnd {
-					flushedAll = true
-				}
-			} else {
-				remaining := make([]byte, len(buffered)-sendLen)
-				copy(remaining, buffered[sendLen:])
-				stream.OutboundBuffer.Reset()
-				stream.OutboundBuffer.Write(remaining)
-			}
-		}
-	}
-	stream.mu.Unlock()
-
-	if flushedAll {
+	// Flush buffered outbound data now that per-stream window space is
+	// available (clamped + debited against the connection window too).
+	if p.flushStreamOutbound(stream) {
 		switch streamState {
 		case StateHalfClosedRemote:
 			stream.SetState(StateClosed)
