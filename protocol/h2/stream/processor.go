@@ -1143,8 +1143,9 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			old := stream.LoadWindowSize()
 			newWindow := int64(old) + int64(f.Increment)
 			if newWindow > 0x7fffffff {
-				_ = p.writer.WriteRSTStream(f.StreamID, http2.ErrCodeFlowControl)
-				p.flush()
+				// RST and reclaim the slot via the shared close path so the
+				// active stream's MAX_CONCURRENT_STREAMS slot is freed.
+				_ = p.sendRSTStreamAndMarkClosed(f.StreamID, http2.ErrCodeFlowControl)
 				return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", f.StreamID, old, f.Increment)
 			}
 			//nolint:gosec // G115: safe conversion, newWindow validated <= 2^31-1 above
@@ -1540,8 +1541,9 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 		old := stream.LoadWindowSize()
 		newWindow := int64(old) + int64(increment)
 		if newWindow > 0x7fffffff {
-			_ = p.writer.WriteRSTStream(streamID, http2.ErrCodeFlowControl)
-			p.flush()
+			// RST and reclaim the slot via the shared close path so the
+			// active stream's MAX_CONCURRENT_STREAMS slot is freed.
+			_ = p.sendRSTStreamAndMarkClosed(streamID, http2.ErrCodeFlowControl)
 			return fmt.Errorf("stream %d window overflow: %d + %d > 2^31-1", streamID, old, increment)
 		}
 		//nolint:gosec // G115: safe conversion

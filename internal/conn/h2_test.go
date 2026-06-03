@@ -280,3 +280,188 @@ func TestProcessH2_PipelinedCompletedStreamsNotRefused(t *testing.T) {
 		t.Fatalf("server answered %d/%d pipelined requests", served, nStreams)
 	}
 }
+
+// TestProcessH2_StalledStreamsReleaseSlot is a regression test for the
+// MAX_CONCURRENT_STREAMS slot LEAK under sustained large responses that
+// backpressure on flow control (probatorium grid get-json-64k-h2:
+// ~410M stream errors / sustained REFUSED storm).
+//
+// With a small per-stream INITIAL_WINDOW_SIZE, every response STALLS: the
+// handler buffers the un-sendable tail of the body and the inline path keeps
+// the stream alive (state half-closed-remote, counting toward activeStreams)
+// until a WINDOW_UPDATE opens the window. If the WINDOW_UPDATE flush path
+// fails to transition the now-fully-sent stream to closed AND decrement the
+// active count exactly once, the slot LEAKS. Over many sequential
+// stalled-then-released streams the leak accumulates until activeStreams
+// pins at the limit and every new HEADERS is RST'd with REFUSED_STREAM.
+//
+// Each stream here is delivered + released in its OWN ProcessH2 call (one
+// recv buffer per stream), mirroring the live load where streams arrive
+// over wall-time rather than all in one batch.
+func TestProcessH2_StalledStreamsReleaseSlot(t *testing.T) {
+	const (
+		maxStreams = 8
+		nStreams   = 256 // >> maxStreams: a leaking slot pins the limit fast
+		window     = 16  // tiny window: body tail always stalls on flow control
+	)
+	// Body larger than the window so the response always buffers a tail and
+	// stalls — the precondition for the leak.
+	h := respondHandler{body: bytes.Repeat([]byte("x"), 64)}
+	var mu sync.Mutex
+	var writes []byte
+	write := func(b []byte) {
+		mu.Lock()
+		writes = append(writes, b...)
+		mu.Unlock()
+	}
+	cfg := H2Config{MaxConcurrentStreams: maxStreams}
+	state := NewH2State(h, cfg, write, -1)
+
+	hdr := encodeH2Headers(t, [][2]string{
+		{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
+	})
+
+	mgr := state.processor.GetManager()
+
+	// Preface + client SETTINGS in the first buffer. The client advertises a
+	// tiny SETTINGS_INITIAL_WINDOW_SIZE so OUR per-stream SEND window starts
+	// small — every response then stalls on flow control, exactly as a 64 KB
+	// body does against the RFC-default 65535 window on the live grid.
+	var preface bytes.Buffer
+	preface.WriteString(frame.ClientPreface)
+	pf := http2.NewFramer(&preface, nil)
+	if err := pf.WriteSettings(http2.Setting{
+		ID: http2.SettingInitialWindowSize, Val: window,
+	}); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+	if err := ProcessH2(context.Background(), preface.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2 preface: %v", err)
+	}
+
+	for i := 0; i < nStreams; i++ {
+		sid := uint32(2*i + 1)
+
+		// 1) HEADERS (complete GET). Response stalls: body tail buffered,
+		//    stream stays active pending WINDOW_UPDATE.
+		var hb bytes.Buffer
+		hf := http2.NewFramer(&hb, nil)
+		if err := hf.WriteRawFrame(http2.FrameHeaders,
+			http2.FlagHeadersEndStream|http2.FlagHeadersEndHeaders, sid, hdr); err != nil {
+			t.Fatalf("WriteHeaders sid=%d: %v", sid, err)
+		}
+		if err := ProcessH2(context.Background(), hb.Bytes(), state, h, write, cfg); err != nil {
+			t.Fatalf("ProcessH2 headers sid=%d: %v", sid, err)
+		}
+
+		// 2) WINDOW_UPDATEs to open the window fully so the buffered tail
+		//    flushes with END_STREAM and the stream completes. Send enough
+		//    increments to cover the whole body.
+		var wb bytes.Buffer
+		wf := http2.NewFramer(&wb, nil)
+		for sent := window; sent < len(h.body); sent += window {
+			if err := wf.WriteWindowUpdate(sid, uint32(window)); err != nil {
+				t.Fatalf("WriteWindowUpdate sid=%d: %v", sid, err)
+			}
+		}
+		if err := ProcessH2(context.Background(), wb.Bytes(), state, h, write, cfg); err != nil {
+			t.Fatalf("ProcessH2 window-update sid=%d: %v", sid, err)
+		}
+
+		// After each stream is fully released, activeStreams must return to 0.
+		// If the slot leaks, this climbs to maxStreams and never recovers.
+		if got := mgr.CountActiveStreams(); got != 0 {
+			t.Fatalf("after stream %d completed: activeStreams=%d, want 0 (slot leaked)", sid, got)
+		}
+	}
+
+	// Belt-and-suspenders: no stream may ever have been REFUSED.
+	mu.Lock()
+	out := append([]byte(nil), writes...)
+	mu.Unlock()
+	refused := 0
+	rf := http2.NewFramer(nil, bytes.NewReader(out))
+	rf.SetMaxReadFrameSize(1 << 20)
+	for {
+		f, err := rf.ReadFrame()
+		if err != nil {
+			break
+		}
+		if v, ok := f.(*http2.RSTStreamFrame); ok && v.ErrCode == http2.ErrCodeRefusedStream {
+			refused++
+		}
+	}
+	if refused != 0 {
+		t.Fatalf("got %d RST_STREAM(REFUSED_STREAM), want 0 — stalled streams must free their slot after flush", refused)
+	}
+}
+
+// silentHandler never writes a response, leaving the stream active so a
+// server-initiated RST fires while the stream still counts toward the limit.
+type silentHandler struct{}
+
+func (silentHandler) HandleStream(_ context.Context, _ *stream.Stream) error { return nil }
+
+// TestProcessH2_ServerRSTFreesSlot is a regression test for the
+// MAX_CONCURRENT_STREAMS slot LEAK that produced the sustained
+// REFUSED_STREAM storm on the get-json-64k-h2 grid cell (~410M errors over
+// 40 s, throughput degrading as activeStreams pinned at the limit).
+//
+// A server-initiated RST_STREAM on a still-active stream (here: request body
+// exceeds MaxRequestBodySize) removed the stream from the manager map but
+// never decremented activeStreams — the stream vanished yet its concurrency
+// slot was leaked forever. Under sustained load a steady trickle of streams
+// hit a transient RST condition, leaking one slot each, until activeStreams
+// saturated at MaxConcurrentStreams and every new HEADERS was refused. The
+// fix decrements the active count for any active stream removed via
+// DeleteStream, regardless of which close path reached it.
+//
+// The smoking gun: after each RST the stream is GONE from the map
+// (StreamCount → 0) but activeStreams stays pinned — map empty, limit full.
+func TestProcessH2_ServerRSTFreesSlot(t *testing.T) {
+	const (
+		maxStreams = 8
+		nStreams   = 40 // >> maxStreams: a leaked slot pins the limit fast
+	)
+	h := silentHandler{}
+	write := func([]byte) {}
+	cfg := H2Config{MaxConcurrentStreams: maxStreams, MaxRequestBodySize: 4}
+	state := NewH2State(h, cfg, write, -1)
+	mgr := state.processor.GetManager()
+
+	var preface bytes.Buffer
+	preface.WriteString(frame.ClientPreface)
+	pf := http2.NewFramer(&preface, nil)
+	if err := pf.WriteSettings(); err != nil {
+		t.Fatalf("WriteSettings: %v", err)
+	}
+	if err := ProcessH2(context.Background(), preface.Bytes(), state, h, write, cfg); err != nil {
+		t.Fatalf("ProcessH2 preface: %v", err)
+	}
+
+	hdr := encodeH2Headers(t, [][2]string{
+		{":method", "POST"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
+	})
+	for i := 0; i < nStreams; i++ {
+		sid := uint32(2*i + 1)
+		// Open the stream (HEADERS, no END_STREAM → active), then send a DATA
+		// frame whose body exceeds MaxRequestBodySize → server RST_STREAM via
+		// sendRSTStreamAndMarkClosed on an active, in-map stream.
+		var b bytes.Buffer
+		fr := http2.NewFramer(&b, nil)
+		if err := fr.WriteRawFrame(http2.FrameHeaders, http2.FlagHeadersEndHeaders, sid, hdr); err != nil {
+			t.Fatalf("WriteHeaders sid=%d: %v", sid, err)
+		}
+		if err := fr.WriteData(sid, false, []byte("body-too-large")); err != nil {
+			t.Fatalf("WriteData sid=%d: %v", sid, err)
+		}
+		// A frame-level error may surface as a ProcessH2 error on the body-cap
+		// path; that is fine — we only care that the slot is reclaimed.
+		_ = ProcessH2(context.Background(), b.Bytes(), state, h, write, cfg)
+
+		if got := mgr.CountActiveStreams(); got != 0 {
+			t.Fatalf("after RST of stream %d: activeStreams=%d, want 0 (slot leaked — streamCount=%d)",
+				sid, got, mgr.StreamCount())
+		}
+	}
+}
