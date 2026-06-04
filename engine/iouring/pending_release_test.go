@@ -81,7 +81,7 @@ func TestPendingReleaseDrainsFIFOByDeadline(t *testing.T) {
 	w.queuePendingRelease(&connState{})
 	d2 := w.pendingRelease[2].releaseAtNanos
 
-	if !(d0 < d2) {
+	if d0 >= d2 {
 		t.Fatalf("deadlines not monotonic: d0=%d d2=%d", d0, d2)
 	}
 
