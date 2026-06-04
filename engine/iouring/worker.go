@@ -70,20 +70,28 @@ const bufRingCount = 1024
 // what we need; the recycle path resetting fields would race with the
 // goroutine's defer that reads cs.fd / cs.asyncInBuf.
 type pendingReleaseEntry struct {
-	cs            *connState
-	releaseAtIter uint64
-	detached      bool
+	cs             *connState
+	releaseAtNanos int64
+	detached       bool
 }
 
-// pendingReleaseIters is the number of event-loop iterations to
-// hold a closed connState before returning to the pool. io_uring's
-// unix.Close(fd) → cancel-pending-ops → ECANCELED CQE path
-// completes within ~1 ms on Linux 6.x even under load, so ~5 000
-// iterations (≈50 ms on a worker looping at 100 k+ iter/s) is an
-// order-of-magnitude safety margin. Pushing this higher only
-// inflates the queue depth × per-cs memory footprint under
-// churn-close load without adding real safety.
-const pendingReleaseIters uint64 = 5_000
+// pendingReleaseHoldNanos is the WALL-CLOCK duration to hold a closed
+// connState before returning it to the pool. io_uring's
+// unix.Close(fd) → cancel-pending-ops → ECANCELED CQE path completes
+// within ~1 ms on Linux 6.x even under load, so 100 ms is an
+// order-of-magnitude safety margin.
+//
+// This MUST be time-based, not iteration-based. An iteration count is
+// meaningless across load regimes: under churn-close the loop spins
+// fast so a fixed N iterations elapses in well under a millisecond
+// (risking the #256 use-after-free it guards against) while the high
+// close rate piles tens of thousands of connStates into the queue
+// (~16 KB each → multi-GB RSS); and when the loop is idle the wait is
+// SubmitAndWaitTimeout(adaptiveTimeout) up to 100 ms per iteration, so
+// N iterations stretches to minutes and pins that memory long after
+// the load drops. A wall-clock window bounds the queue to
+// close_rate × hold and drains promptly once churn stops.
+const pendingReleaseHoldNanos int64 = int64(100 * time.Millisecond)
 
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
@@ -158,9 +166,9 @@ type Worker struct {
 	// for its stack pool, yielding a SIGSEGV in runtime.stackalloc
 	// dereferencing HTTP request bytes as a pointer (#256 SEGV
 	// class — not race-detectable because the writer is the kernel,
-	// not Go code). Holding cs for pendingReleaseIters iterations
-	// after close keeps cs.buf's backing array alive through the
-	// cancellation window.
+	// not Go code). Holding cs for pendingReleaseHoldNanos of
+	// wall-clock time after close keeps cs.buf's backing array alive
+	// through the cancellation window.
 	pendingRelease []pendingReleaseEntry
 
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
@@ -1976,8 +1984,8 @@ func (w *Worker) closeConn(fd int) {
 // invariant this enforces.
 func (w *Worker) queuePendingRelease(cs *connState) {
 	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
-		cs:            cs,
-		releaseAtIter: w.iterCount + pendingReleaseIters,
+		cs:             cs,
+		releaseAtNanos: time.Now().UnixNano() + pendingReleaseHoldNanos,
 	})
 }
 
@@ -1990,22 +1998,25 @@ func (w *Worker) queuePendingRelease(cs *connState) {
 // recover() block, reading cs.fd and re-clearing cs.asyncInBuf, when
 // finishCloseDetached returns. Recycling cs through releaseConnState
 // at this point races those reads. We just keep the strong ref alive
-// for pendingReleaseIters and let GC collect — the goroutine has long
+// for pendingReleaseHoldNanos and let GC collect — the goroutine has long
 // since finished by then, the kernel has long since drained any
 // pending recv targeting cs.buf, and Go's GC reclaims cs and cs.buf
 // without any chance of the kernel writing inbound HTTP bytes into
 // memory the runtime has repurposed (#256 SIGSEGV class).
 func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
-		cs:            cs,
-		releaseAtIter: w.iterCount + pendingReleaseIters,
-		detached:      true,
+		cs:             cs,
+		releaseAtNanos: time.Now().UnixNano() + pendingReleaseHoldNanos,
+		detached:       true,
 	})
 }
 
 // drainPendingRelease returns any connStates whose deferred-release
 // window has elapsed to the sync.Pool. FIFO because queue entries are
-// always appended with monotonically increasing releaseAtIter.
+// always appended with monotonically increasing releaseAtNanos.
+// Compared against cachedNow (refreshed each loop pass); the hold is
+// computed from a fresh time.Now() at enqueue so the window is always
+// >= pendingReleaseHoldNanos of real time even when cachedNow lags.
 //
 // Detached entries skip the pool recycle (releaseConnState would
 // reset fields that goroutine closures may still observe via the
@@ -2013,7 +2024,7 @@ func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 // can reclaim the cs.
 func (w *Worker) drainPendingRelease() {
 	n := 0
-	for n < len(w.pendingRelease) && w.pendingRelease[n].releaseAtIter <= w.iterCount {
+	for n < len(w.pendingRelease) && w.pendingRelease[n].releaseAtNanos <= w.cachedNow {
 		entry := &w.pendingRelease[n]
 		if !entry.detached {
 			releaseConnState(entry.cs)
@@ -2136,7 +2147,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// addr 0x48202f20544547 (#256 class, fingerprint matches the
 	// strict-matrix run2 trip on churn-close × iouring-async).
 	//
-	// pendingReleaseIters (5 000 ≈ 50 ms under load) is comfortably
+	// pendingReleaseHoldNanos (100 ms wall-clock) is comfortably
 	// longer than io_uring's close-cancels-pending-ops latency on
 	// Linux 6.x and longer than any reasonable runAsyncHandler tail.
 	w.queuePendingReleaseDetached(cs)
