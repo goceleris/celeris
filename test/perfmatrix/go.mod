@@ -8,8 +8,8 @@ require (
 	github.com/cloudwego/hertz v0.10.4
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-chi/chi/v5 v5.3.0
-	github.com/goceleris/celeris v1.4.10
-	github.com/goceleris/loadgen v1.4.5
+	github.com/goceleris/celeris v1.4.15
+	github.com/goceleris/loadgen v1.4.7
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/sessions v1.4.0
@@ -103,7 +103,7 @@ require (
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/exp v0.0.0-20240404231335-c0f41cb1a7a0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
