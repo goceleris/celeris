@@ -298,10 +298,10 @@ func TestProbeSendfileAndZerocopy(t *testing.T) {
 		t.Skip("tier detection requires linux GOOS")
 	}
 	tests := []struct {
-		name    string
-		kernel  string
-		wantSF  bool
-		wantZC  bool
+		name   string
+		kernel string
+		wantSF bool
+		wantZC bool
 	}{
 		{"4.19 (pre-zerocopy)", "4.19.0", true, false},
 		{"5.0 (zerocopy boundary)", "5.0.0", true, true},

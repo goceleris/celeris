@@ -171,18 +171,36 @@ func TestZerocopyInflightAddAndFree(t *testing.T) {
 	}
 }
 
+func TestZerocopyInflightDrainEmptyQueue(t *testing.T) {
+	// Drain against an FD with no completions queued must return
+	// (0, nil) — the recvmsg(MSG_ERRQUEUE) returns EAGAIN immediately
+	// on an empty error queue and the loop breaks.
+	a, b := socketpair(t)
+	defer func() { _ = unix.Close(a) }()
+	defer func() { _ = unix.Close(b) }()
+
+	z := zerocopyInflight{}
+	z.add(0) // 0 bytes pending; the drain on an empty queue still works
+	got, err := z.drain(a)
+	if err != nil {
+		t.Errorf("drain empty queue: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("drain empty: got %d, want 0", got)
+	}
+}
+
 func TestEngineImplementsSendfileCapable(t *testing.T) {
 	// Compile-time + runtime assertion that the epoll Engine satisfies
 	// engine.SendfileCapable. The interface is satisfied by virtue of
 	// (e *Engine) Sendfile being defined; the dynamic assertion is the
 	// test.
 	e := &Engine{}
-	var _ = e //nolint:staticcheck // satisfies the interface check below
 	if _, ok := any(e).(interface {
 		Sendfile(int, *os.File, int64, int64, []byte) (int64, error)
 	}); !ok {
 		t.Errorf("*Engine does not implement the Sendfile shape; method signature changed")
 	}
 	_ = net.Conn(nil) // keep net import alive (used in other test files)
-	_ = io.EOF       // keep io import alive
+	_ = io.EOF        // keep io import alive
 }

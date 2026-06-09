@@ -64,7 +64,6 @@ const (
 //	           buffers, fixed files, COOP_TASKRUN, SINGLE_ISSUER.
 //	Optional — kernel ≥ 6.0. Adds SQPOLL and SEND_ZC. With kernel ≥ 6.1,
 //	           DEFER_TASKRUN replaces COOP_TASKRUN in setup flags.
-//
 func determineTier(kv KernelVersion, features uint32, _ []uint8) (tier engine.Tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs, deferTaskrun, fixedFiles, sendZC bool) {
 	if !kv.AtLeast(5, 10) {
 		return engine.None, false, false, false, false, false, false, false, false, false, false

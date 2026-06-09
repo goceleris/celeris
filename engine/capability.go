@@ -56,7 +56,7 @@ func NewDefaultProfile() CapabilityProfile {
 		IOUringTier: None,
 		// sendfile(2) is universally available on Linux. Non-Linux
 		// platforms (where Sendfile is irrelevant) leave it false.
-		Sendfile: false,
+		Sendfile:  false,
 		NUMANodes: 1,
 	}
 }

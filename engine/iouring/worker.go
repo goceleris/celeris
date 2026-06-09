@@ -167,21 +167,21 @@ type Worker struct {
 	// can Wait on them before returning. See engine/epoll/loop.go
 	// for rationale — keeps dispatch Gs from touching connState
 	// memory after the engine claims to have stopped.
-	asyncWG      sync.WaitGroup
-	conns        []*connState
-	connCount    int // number of active connections (local, for draining check)
-	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
+	asyncWG   sync.WaitGroup
+	conns     []*connState
+	connCount int // number of active connections (local, for draining check)
+	maxFD     int // upper bound fd for iteration in checkTimeouts/shutdown
 	// liveConns is a dense slice of currently-active FDs, maintained
 	// alongside the sparse conns map. checkTimeouts and shutdown iterate
 	// liveConns to avoid the O(maxFD) scan that dominated the worker
 	// hot path above ~8 Ki conns (celeris#318). Append-on-register,
 	// swap-with-last-on-deregister; the slice is owned by the worker
 	// thread so no locking is required.
-	liveConns []int
-	handler   stream.Handler
-	resolved  resource.ResolvedResources
-	sockOpts  sockopts.Options
-	bufRing   *BufferRing // ring-mapped provided buffers for multishot recv
+	liveConns    []int
+	handler      stream.Handler
+	resolved     resource.ResolvedResources
+	sockOpts     sockopts.Options
+	bufRing      *BufferRing // ring-mapped provided buffers for multishot recv
 	logger       *slog.Logger
 	cfg          resource.Config
 	ready        chan error
