@@ -35,6 +35,15 @@ type CapabilityProfile struct {
 	FixedFiles bool
 	// SendZC is true if io_uring zero-copy send is available.
 	SendZC bool
+	// Sendfile is true if sendfile(2) is available for file responses
+	// (Linux 2.6.33+ on the kernel side; always available on every
+	// platform celeris supports).
+	Sendfile bool
+	// Zerocopy is true if MSG_ZEROCOPY is available for large-body sends
+	// (Linux 4.14+ for UDP, 5.0+ for TCP). Epoll engine uses it on the
+	// large-body send path; iouring has IORING_OP_SEND_ZC (kernel 6.0+)
+	// which is a separate flag (SendZC above).
+	Zerocopy bool
 	// NumCPU is the number of logical CPUs.
 	NumCPU int
 	// NUMANodes is the number of NUMA nodes detected.
@@ -45,6 +54,9 @@ type CapabilityProfile struct {
 func NewDefaultProfile() CapabilityProfile {
 	return CapabilityProfile{
 		IOUringTier: None,
-		NUMANodes:   1,
+		// sendfile(2) is universally available on Linux. Non-Linux
+		// platforms (where Sendfile is irrelevant) leave it false.
+		Sendfile: false,
+		NUMANodes: 1,
 	}
 }

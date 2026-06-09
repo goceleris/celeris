@@ -86,6 +86,18 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 	profile.KernelMajor = kv.Major
 	profile.KernelMinor = kv.Minor
 
+	// sendfile(2) is universally available on Linux (kernel 2.6.33+ via
+	// pipe + splice; kernel 2.6.23+ for the actual syscall, every distro
+	// ships well past that). Set it true here unconditionally — the
+	// runtime probe (probeSendfile) is a no-op because the syscall can't
+	// fail at registration time, only at call time per file.
+	profile.Sendfile = true
+	// MSG_ZEROCOPY on TCP send paths requires kernel 5.0+. UDP supports
+	// it from 4.14+ but celeris is TCP-only. Gate on 5.0 to be safe.
+	if kv.AtLeast(5, 0) {
+		profile.Zerocopy = true
+	}
+
 	if kv.AtLeast(2, 6) && sp.ProbeEpoll != nil {
 		profile.EpollAvailable = sp.ProbeEpoll()
 	}

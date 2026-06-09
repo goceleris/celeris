@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"net"
+	"os"
 	"time"
 )
 
@@ -59,6 +60,27 @@ type WorkerScaler interface {
 	// ResumeWorker reactivates worker i. Wakes the worker if SUSPENDED.
 	// Idempotent — resuming an active worker is a no-op.
 	ResumeWorker(i int)
+}
+
+// SendfileCapable is an optional interface implemented by engines that
+// support zero-copy file responses via sendfile(2) (epoll) or the io_uring
+// equivalent. The response adapter type-asserts; engines that do not
+// implement it fall back to read+write. See celeris#317.
+//
+// The fdOut argument is the engine's per-connection socket FD; the
+// caller is responsible for the connState lifecycle (locking, dirty-list
+// membership, timeout tracking) — the engine's sendfile path is purely
+// a syscall shim.
+//
+// offset and length describe the slice of the source file to send.
+// length ≤ 0 means "send to EOF." The headers slice is flushed via
+// write(2) before the sendfile loop; engines that can fuse headers
+// into a single iovec may do so.
+//
+// Returns the number of body bytes sent (0 on error) and an error.
+// EAGAIN/EWOULDBLOCK are surfaced as errors for the caller to defer.
+type SendfileCapable interface {
+	Sendfile(fdOut int, file *os.File, offset, length int64, headers []byte) (int64, error)
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance

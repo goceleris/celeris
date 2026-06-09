@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -153,6 +154,18 @@ func (e *Engine) Listen(ctx context.Context) error {
 // explicit drain semantics.
 func (e *Engine) Shutdown(_ context.Context) error {
 	return nil
+}
+
+// Sendfile implements engine.SendfileCapable using sendfile(2) (celeris#317).
+// Writes `headers` via write(2) then transfers the file body to the socket
+// via the kernel's zero-copy path. Returns the number of body bytes sent.
+//
+// The connection FD must be non-blocking (the epoll engine sets SOCK_NONBLOCK
+// on accept). EAGAIN is surfaced to the caller, which defers the rest of the
+// response to the next epoll_wait iteration. The source file is owned by
+// the caller; the engine does not close it.
+func (e *Engine) Sendfile(fdOut int, file *os.File, offset, length int64, headers []byte) (int64, error) {
+	return sendfileH1(fdOut, file, offset, length, headers)
 }
 
 // Metrics returns a snapshot of engine metrics.

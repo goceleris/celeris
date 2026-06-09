@@ -206,7 +206,6 @@ func TestProbeWithBaseTier(t *testing.T) {
 	}
 	sp := mockProber("5.10.0", nil, true, false, 1)
 	profile := ProbeWith(sp)
-
 	if profile.IOUringTier != engine.Base {
 		t.Fatalf("expected Base tier, got %s", profile.IOUringTier)
 	}
@@ -287,6 +286,39 @@ func TestProbeNUMANodes(t *testing.T) {
 
 	if profile.NUMANodes != 4 {
 		t.Fatalf("expected 4 NUMA nodes, got %d", profile.NUMANodes)
+	}
+}
+
+// TestProbeSendfileAndZerocopy pins the new sendfile / zerocopy
+// capability flags (celeris#317). Sendfile is unconditional on Linux
+// (kernel 2.6.23+, every distro past 2.6.33); Zerocopy requires kernel
+// 5.0+ for TCP sendmsg.
+func TestProbeSendfileAndZerocopy(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("tier detection requires linux GOOS")
+	}
+	tests := []struct {
+		name    string
+		kernel  string
+		wantSF  bool
+		wantZC  bool
+	}{
+		{"4.19 (pre-zerocopy)", "4.19.0", true, false},
+		{"5.0 (zerocopy boundary)", "5.0.0", true, true},
+		{"5.10 (celer's LTS floor)", "5.10.0", true, true},
+		{"6.6 (current LTS)", "6.6.0", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sp := mockProber(tt.kernel, nil, true, false, 1)
+			p := ProbeWith(sp)
+			if p.Sendfile != tt.wantSF {
+				t.Errorf("kernel %s: Sendfile = %v, want %v", tt.kernel, p.Sendfile, tt.wantSF)
+			}
+			if p.Zerocopy != tt.wantZC {
+				t.Errorf("kernel %s: Zerocopy = %v, want %v", tt.kernel, p.Zerocopy, tt.wantZC)
+			}
+		})
 	}
 }
 
