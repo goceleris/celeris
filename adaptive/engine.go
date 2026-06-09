@@ -16,6 +16,7 @@ import (
 	"github.com/goceleris/celeris/engine/epoll"
 	"github.com/goceleris/celeris/engine/iouring"
 	"github.com/goceleris/celeris/engine/scaler"
+	"github.com/goceleris/celeris/internal/cpumon"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -60,7 +61,12 @@ type Engine struct {
 // switch to io_uring if telemetry indicates it would perform better for the workload.
 // Both sub-engines get the full resource config. This is safe because standby
 // workers are fully suspended (zero CPU, zero connections, listen sockets closed).
-func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
+//
+// cpuMon, when non-nil, supplies the live sampler with CPU utilization data so
+// the io_uring bias can fire in the empirical sweet spot. Pass nil for tests or
+// when CPU monitoring is not available; the sampler degrades gracefully with
+// CPUUtilization=0 in the snapshot.
+func New(cfg resource.Config, handler stream.Handler, cpuMon cpumon.Monitor) (*Engine, error) {
 	cfg = cfg.WithDefaults()
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
@@ -94,7 +100,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
 
-	sampler := newLiveSampler()
+	sampler := newLiveSampler(cpuMon)
 	logger := cfg.Logger
 
 	e := &Engine{

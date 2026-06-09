@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/cpumon"
 )
 
 // TelemetrySnapshot captures a point-in-time view of engine performance,
@@ -19,7 +20,8 @@ type TelemetrySnapshot struct {
 	ErrorRate float64
 	// ActiveConnections is the current number of open connections.
 	ActiveConnections int64
-	// CPUUtilization is the estimated CPU usage fraction (0.0-1.0). Currently unused.
+	// CPUUtilization is the estimated CPU usage fraction (0.0-1.0). Read from
+	// the live sampler's CPUMonitor; zero when no monitor is wired.
 	CPUUtilization float64
 }
 
@@ -32,18 +34,14 @@ type TelemetrySampler interface {
 type liveSampler struct {
 	prevMetrics map[engine.EngineType]engine.EngineMetrics
 	prevTime    map[engine.EngineType]time.Time
-	cpuMon      cpuMonitor
+	cpuMon      cpumon.Monitor
 }
 
-// cpuMonitor abstracts CPU sampling (implemented by cpumon package).
-type cpuMonitor interface {
-	Sample() (float64, error) // returns utilization 0.0-1.0
-}
-
-func newLiveSampler() *liveSampler {
+func newLiveSampler(cpuMon cpumon.Monitor) *liveSampler {
 	return &liveSampler{
 		prevMetrics: make(map[engine.EngineType]engine.EngineMetrics),
 		prevTime:    make(map[engine.EngineType]time.Time),
+		cpuMon:      cpuMon,
 	}
 }
 
@@ -76,8 +74,8 @@ func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
 
 	// Sample CPU utilization if monitor is available.
 	if s.cpuMon != nil {
-		if util, err := s.cpuMon.Sample(); err == nil {
-			snap.CPUUtilization = util
+		if sample, err := s.cpuMon.Sample(); err == nil {
+			snap.CPUUtilization = sample.Utilization
 		}
 	}
 

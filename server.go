@@ -14,13 +14,14 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/cpumon"
 	"github.com/goceleris/celeris/observe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
 
 // Version is the semantic version of the celeris module.
-const Version = "1.4.1"
+const Version = "1.5.0"
 
 // ErrAlreadyStarted is returned when Start or StartWithContext is called on a
 // server that is already running.
@@ -58,6 +59,12 @@ type Server struct {
 	// consistent value without taking a mutex.
 	engineRef atomic.Pointer[engine.Engine]
 	collector *observe.Collector
+	// cpuMon, when non-nil, supplies the adaptive engine's live sampler with
+	// CPU utilization data and powers CPUUtilization in observe.Collector
+	// snapshots. Created lazily in doPrepare and closed in Shutdown so
+	// resources (e.g. the /proc/stat file descriptor on Linux) are released
+	// when the server stops.
+	cpuMon cpumon.Monitor
 
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
@@ -350,13 +357,16 @@ func (s *Server) Start() error {
 // Shutdown gracefully shuts down the server. Returns nil if the server has not
 // been started. After the engine stops accepting new connections and drains
 // in-flight requests, any hooks registered via [Server.OnShutdown] fire in
-// registration order with the provided context.
+// registration order with the provided context. The CPUMonitor owned by the
+// Server is closed as part of shutdown.
 func (s *Server) Shutdown(ctx context.Context) error {
 	eng := s.loadEngine()
 	if eng == nil {
+		s.closeCPUMonitor()
 		return nil
 	}
 	err := eng.Shutdown(ctx)
+	s.closeCPUMonitor()
 	for _, fn := range s.shutdownHooks {
 		func() {
 			defer func() { _ = recover() }()
@@ -364,6 +374,52 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}()
 	}
 	return err
+}
+
+// closeCPUMonitor releases the /proc/stat file descriptor on Linux. Idempotent
+// and safe to call from Shutdown even if the monitor was never installed (e.g.
+// the engine failed to start, or Start was never called).
+func (s *Server) closeCPUMonitor() {
+	if s.cpuMon == nil {
+		return
+	}
+	if c, ok := s.cpuMon.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
+	s.cpuMon = nil
+}
+
+// cpuMonAdapter wraps the internal cpumon.Monitor so it satisfies the
+// public observe.CPUMonitor interface (Sample returns float64 instead of
+// the internal CPUSample struct). Defined here rather than in observe/ to
+// avoid a circular import (observe already imports nothing from celeris).
+type cpuMonAdapter struct {
+	m cpumon.Monitor
+}
+
+func (a cpuMonAdapter) Sample() (float64, error) {
+	s, err := a.m.Sample()
+	if err != nil {
+		return 0, err
+	}
+	return s.Utilization, nil
+}
+
+func (a cpuMonAdapter) Close() error {
+	if c, ok := a.m.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// newCPUMonitor returns a platform-appropriate CPU monitor. On Linux this
+// reads /proc/stat; on other platforms it falls back to a runtime/metrics
+// based estimator. Returns an error only if the platform-specific
+// constructor itself fails (e.g. /proc/stat is unreadable on Linux); the
+// caller should treat that as a non-fatal degradation and continue with
+// a nil monitor.
+func newCPUMonitor() (cpumon.Monitor, error) {
+	return newPlatformCPUMonitor()
 }
 
 // Addr returns the listener's bound address, or nil if the server has not been
@@ -547,8 +603,20 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		}
 		ra.errorHandler = s.errorHandler
 		var handler stream.Handler = ra
+
+		// CPUMonitor: constructed eagerly here so the adaptive engine can
+		// wire it into its live sampler (the sampler takes the monitor at
+		// construction time). Stored on the Server so Shutdown can close it.
+		// On any failure we fall back to a nil monitor — the live sampler
+		// degrades to CPUUtilization=0 (no bias contribution).
+		cpuMon, cpuMonErr := newCPUMonitor()
+		if cpuMonErr != nil {
+			cfg.Logger.Warn("CPUMonitor unavailable, bias will not fire", "err", cpuMonErr)
+		}
+		s.cpuMon = cpuMon
+
 		var err error
-		eng, err = createEngine(cfg, handler)
+		eng, err = createEngine(cfg, handler, cpuMon)
 		if err != nil {
 			s.startErr = fmt.Errorf("create engine: %w", err)
 			return
@@ -559,6 +627,9 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {
 				return eng.Metrics()
 			})
+			if cpuMon != nil {
+				s.collector.SetCPUMonitor(cpuMonAdapter{cpuMon})
+			}
 		}
 
 		logger := cfg.Logger
