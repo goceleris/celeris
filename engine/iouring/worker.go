@@ -576,7 +576,6 @@ func (w *Worker) run(ctx context.Context) {
 					w.handleClose(fd)
 				case udH2Wakeup:
 					w.handleH2Wakeup()
-				case udProvide:
 				case udHeaderTimer:
 					// MUST be in the inlined hot path — processCQE
 					// (which has the same case) is only called from
@@ -745,7 +744,6 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 		w.handleAccept(ctx, c, fd, now)
 	case udH2Wakeup:
 		w.handleH2Wakeup()
-	case udProvide:
 	case udHeaderTimer:
 		w.handleHeaderTimer(fd)
 	case udDriverRecv:

@@ -87,16 +87,6 @@ func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {
 	*(*uint32)(unsafe.Pointer(&sqe[44])) = uint32(fileIndex)
 }
 
-func prepProvideBuffers(sqePtr unsafe.Pointer, addr unsafe.Pointer, bufLen int, count int, groupID uint16, bufID uint16) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opPROVIDEBUFFERS
-	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(addr))
-	*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(bufLen)
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(count)
-	*(*uint16)(unsafe.Pointer(&sqe[30])) = groupID
-	*(*uint16)(unsafe.Pointer(&sqe[28])) = bufID
-}
-
 func setSQEUserData(sqePtr unsafe.Pointer, data uint64) {
 	*(*uint64)(unsafe.Pointer(uintptr(sqePtr) + 32)) = data
 }

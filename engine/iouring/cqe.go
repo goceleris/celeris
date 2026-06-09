@@ -15,6 +15,13 @@ const (
 	udRecv     uint64 = 0x02 << 56
 	udSend     uint64 = 0x03 << 56
 	udClose    uint64 = 0x04 << 56
+	// udProvide is a sentinel "ignore this CQE" tag. The recv-pause
+	// cancellation path in worker.go tags the cancel SQE with this value
+	// so the main dispatcher's switch has no matching case and drops
+	// the CQE on the floor instead of routing through handleRecv. Name
+	// kept from the legacy PROVIDE_BUFFERS path (BufferGroup, removed
+	// in v1.5.0/celeris#320); the value (0x06 << 56) is unchanged to
+	// preserve the user-data tag layout for any persisted snapshots.
 	udProvide  uint64 = 0x06 << 56
 	udH2Wakeup uint64 = 0x07 << 56
 	// udHeaderTimer tags IORING_OP_TIMEOUT SQEs submitted by initProtocol /
