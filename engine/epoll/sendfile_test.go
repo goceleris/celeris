@@ -28,18 +28,28 @@ func socketpair(t *testing.T) (int, int) {
 
 // drainAll reads every byte from the given FD into a buffer. Used to
 // pull what the engine "sent" off the kernel side of the socketpair.
+//
+// The read loop terminates after `maxEmptyReads` consecutive EAGAINs —
+// under -race the sender may have already written everything but be
+// blocked before the next sendfile can continue; counting empty reads
+// avoids a deadlock in that case. Empirically the sender completes
+// within a handful of EAGAIN rounds; 64 is a comfortable ceiling.
 func drainAll(t *testing.T, fd int) []byte {
 	t.Helper()
 	var out []byte
 	buf := make([]byte, 4096)
-	for {
+	const maxEmptyReads = 64
+	emptyReads := 0
+	for emptyReads < maxEmptyReads {
 		n, err := unix.Read(fd, buf)
 		if n > 0 {
 			out = append(out, buf[:n]...)
+			emptyReads = 0
+			continue
 		}
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
-				// short pause to let in-flight bytes settle, then re-read
+				emptyReads++
 				continue
 			}
 			break

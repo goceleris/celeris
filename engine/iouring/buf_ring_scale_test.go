@@ -16,10 +16,14 @@ func TestResolveBufRingCountDefaults(t *testing.T) {
 		targetConns int
 		want        int
 	}{
-		{name: "default target falls through to 20", workers: 4, targetConns: 0, want: 256}, // 2*4*20=160, nextPow2=256
-		{name: "explicit 20", workers: 4, targetConns: 20, want: 256},
-		{name: "8 workers * 20 target = 320 → 512", workers: 8, targetConns: 20, want: 512},
-		{name: "16 workers * 20 = 640 → 1024", workers: 16, targetConns: 20, want: 1024},
+		// Formula: 2 * Workers * TargetConnsPerWorker, rounded up to a
+		// power of 2, clamped to [bufRingCountMin=1024, bufRingCountMax].
+		// At low worker counts the formula's natural nextPowerOf2 lands
+		// below the 1024 floor and gets clamped up to 1024.
+		{name: "default target falls through to 20; 2*4*20=160→256→floor 1024", workers: 4, targetConns: 0, want: 1024},
+		{name: "explicit 20; same as above", workers: 4, targetConns: 20, want: 1024},
+		{name: "8 workers * 20 = 320 → 512 → floor 1024", workers: 8, targetConns: 20, want: 1024},
+		{name: "16 workers * 20 = 640 → 1024 (at floor)", workers: 16, targetConns: 20, want: 1024},
 		{name: "32 workers * 20 = 1280 → 2048", workers: 32, targetConns: 20, want: 2048},
 		{name: "below floor", workers: 1, targetConns: 1, want: bufRingCountMin},
 		{name: "capped at max", workers: 1024, targetConns: 1024, want: bufRingCountMax},
