@@ -27,22 +27,22 @@ const (
 
 // io_uring opcodes.
 const (
-	opNOP            = 0
-	opREADV          = 1
-	opWRITEV         = 2
-	opPOLLADD        = 6  // IORING_OP_POLL_ADD
-	opTIMEOUT        = 11 // IORING_OP_TIMEOUT (kernel 5.4+)
-	opTIMEOUTREMOVE  = 12 // IORING_OP_TIMEOUT_REMOVE (kernel 5.5+)
-	opACCEPT         = 13
-	opASYNCCANCEL    = 14
-	opCLOSE          = 19
-	opSEND           = 26
-	opRECV           = 27
+	opNOP           = 0
+	opREADV         = 1
+	opWRITEV        = 2
+	opPOLLADD       = 6  // IORING_OP_POLL_ADD
+	opTIMEOUT       = 11 // IORING_OP_TIMEOUT (kernel 5.4+)
+	opTIMEOUTREMOVE = 12 // IORING_OP_TIMEOUT_REMOVE (kernel 5.5+)
+	opACCEPT        = 13
+	opASYNCCANCEL   = 14
+	opCLOSE         = 19
+	opSEND          = 26
+	opRECV          = 27
 	// opPROVIDEBUFFERS = 31 removed in v1.5.0 (celeris#320) — the legacy
 	// BufferGroup / PROVIDE_BUFFERS SQE was never wired into the engine.
 	// The supported path is IORING_REGISTER_PBUF_RING (BufferRing above).
-	opSHUTDOWN       = 52 // IORING_OP_SHUTDOWN (kernel 5.11+)
-	opSENDZC         = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
+	opSHUTDOWN = 52 // IORING_OP_SHUTDOWN (kernel 5.11+)
+	opSENDZC   = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
 )
 
 // SQE flags.

@@ -11,10 +11,10 @@ type completionEntry struct {
 
 // UserData encoding: upper 8 bits = op tag, lower 56 bits = fd.
 const (
-	udAccept   uint64 = 0x01 << 56
-	udRecv     uint64 = 0x02 << 56
-	udSend     uint64 = 0x03 << 56
-	udClose    uint64 = 0x04 << 56
+	udAccept uint64 = 0x01 << 56
+	udRecv   uint64 = 0x02 << 56
+	udSend   uint64 = 0x03 << 56
+	udClose  uint64 = 0x04 << 56
 	// udProvide is a sentinel "ignore this CQE" tag. The recv-pause
 	// cancellation path in worker.go tags the cancel SQE with this value
 	// so the main dispatcher's switch has no matching case and drops
