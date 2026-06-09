@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,15 +48,67 @@ func errIORingSend(res int32) error {
 // bufRingGroupID is the provided buffer ring group ID.
 const bufRingGroupID = 0
 
-// bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2. Only used when multishot recv is opted into via
-// CELERIS_IOURING_MULTISHOT_RECV=1; the default single-shot-recv path
-// uses per-connection buffers and ignores this ring entirely. 1024
-// supports 1024 concurrent in-flight multishot recvs per worker
-// (128 was too small for the 1500+ conn churn test patterns —
-// ENOBUFS terminations kept burning the per-conn re-arm path).
-// With 8 KB buffers: 1024 × 8 KB = 8 MB per worker.
-const bufRingCount = 1024
+// bufRingCountMin is the floor for the scaled provided-buffer-ring size.
+// Below ~1024 entries the kernel reports ENOBUFS under 1500+ conn churn
+// (the per-conn re-arm path fires constantly and burns the latency
+// budget). The formula below keeps this as the floor and scales up from
+// there. See resolveBufRingCount for the full rationale.
+const bufRingCountMin = 1024
+
+// bufRingCountMax caps the scaled provided-buffer-ring size to keep the
+// mmap'd region (count × BufferSize) within sane RSS bounds. At the
+// default 8 KiB BufferSize this is 2 MiB of buffer memory per worker —
+// negligible against the ring's own ~12 MB RLIMIT_MEMLOCK cost. Operators
+// with unusual workloads can override via the env var.
+const bufRingCountMax = 1 << 18 // 256 Ki entries × 8 KiB = 2 GiB worst case
+
+// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled provided-buffer-ring
+// size. Must be a power of 2 and at least bufRingCountMin. Use this when
+// the default scaling formula under-provisions your workload — typically
+// the case for very-high-concurrency benchmarks (16k+ connections) where
+// each worker may have more in-flight multishot recvs than the formula
+// anticipates. Setting 0 (or leaving the env var unset) reverts to
+// auto-scaling from Workers × TargetConnsPerWorker.
+const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
+
+// resolveBufRingCount picks the provided-buffer-ring size for a worker.
+// The default formula is `nextPowerOf2(max(bufRingCountMin, 2 * Workers *
+// TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
+// steady-state target — enough headroom that the kernel rarely stalls
+// waiting for buffer returns. Above 1024 conns the previous hard-coded
+// 1024 was too small: buffers were reused aggressively, the kernel
+// stalled, and the very behaviour the ring is designed to optimise
+// (multishot recv CQE batching) collapsed into CQE storms (celeris#322).
+// Operators can override via CELERIS_IOURING_PBUF_COUNT.
+func resolveBufRingCount(resolved resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
+	if v := os.Getenv(envPbufCount); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n&(n-1) != 0 {
+				n = resource.NextPowerOf2(n)
+			}
+			return clampBufRingCount(n)
+		}
+	}
+	target := scalerTargetConnsPerWorker
+	if target <= 0 {
+		target = 20 // mirrors scaler.Resolve's default
+	}
+	scaled := 2 * resolved.Workers * target
+	if scaled < bufRingCountMin {
+		scaled = bufRingCountMin
+	}
+	return clampBufRingCount(resource.NextPowerOf2(scaled))
+}
+
+func clampBufRingCount(n int) int {
+	if n < bufRingCountMin {
+		return bufRingCountMin
+	}
+	if n > bufRingCountMax {
+		return bufRingCountMax
+	}
+	return n
+}
 
 // pendingReleaseEntry queues a connState for deferred release — its
 // fd has been closed but the kernel may still have SQEs referencing
@@ -311,11 +364,23 @@ func (w *Worker) run(ctx context.Context) {
 	// Opt back in with CELERIS_IOURING_MULTISHOT_RECV=1 for workloads
 	// that are known to be dominated by long-lived keep-alive conns
 	// and that benefit from the CQE-batching multishot provides.
+	//
+	// The ring size scales with the worker's per-conn target (celeris#322):
+	// the previous hard-coded 1024 entries was undersized above ~1024 conns
+	// and produced CQE storms as the kernel stalled waiting for buffer
+	// returns. The formula gives 2 buffers per conn at the scaler's
+	// steady-state target — comfortable headroom without runaway RSS.
+	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
 	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
+		var targetConns int
+		if w.cfg.WorkerScaling != nil {
+			targetConns = w.cfg.WorkerScaling.TargetConnsPerWorker
+		}
+		bufRingCount := resolveBufRingCount(w.resolved, targetConns)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
 			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
-				"worker", w.id, "err", err)
+				"worker", w.id, "err", err, "buf_ring_count", bufRingCount)
 		} else {
 			w.bufRing = br
 		}

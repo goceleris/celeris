@@ -299,6 +299,7 @@ For Prometheus exposition and debug endpoints, use the [`middleware/metrics`](mi
 | Provided buffers | yes (5.19+) | no | no |
 | Multishot accept | yes (5.19+) | no | no |
 | Multishot recv | opt-in (5.19+, `CELERIS_IOURING_MULTISHOT_RECV=1`) | no | no |
+| Provided-buffer ring size | auto-scaled (`CELERIS_IOURING_PBUF_COUNT=N` to override) | n/a | n/a |
 | Zero-alloc HEADERS | yes | yes | no |
 | Inline H2 handlers | yes | yes | no |
 | Detach / StreamWriter | yes | yes | yes |
