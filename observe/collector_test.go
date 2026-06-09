@@ -94,7 +94,6 @@ func TestSnapshotWithEngineMetrics(t *testing.T) {
 		return EngineMetrics{
 			RequestCount:      100,
 			ActiveConnections: 10,
-			LatencyP50:        5 * time.Millisecond,
 		}
 	})
 	snap := c.Snapshot()
@@ -103,9 +102,6 @@ func TestSnapshotWithEngineMetrics(t *testing.T) {
 	}
 	if snap.EngineMetrics.ActiveConnections != 10 {
 		t.Fatalf("expected 10 active conns, got %d", snap.EngineMetrics.ActiveConnections)
-	}
-	if snap.EngineMetrics.LatencyP50 != 5*time.Millisecond {
-		t.Fatalf("expected 5ms p50, got %v", snap.EngineMetrics.LatencyP50)
 	}
 }
 

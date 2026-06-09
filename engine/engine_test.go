@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"testing"
-	"time"
 )
 
 type mockEngine struct{}
@@ -31,15 +30,6 @@ func TestEngineMetricsZeroValue(t *testing.T) {
 	if m.Throughput != 0 {
 		t.Errorf("Throughput = %f, want 0", m.Throughput)
 	}
-	if m.LatencyP50 != 0 {
-		t.Errorf("LatencyP50 = %v, want 0", m.LatencyP50)
-	}
-	if m.LatencyP99 != 0 {
-		t.Errorf("LatencyP99 = %v, want 0", m.LatencyP99)
-	}
-	if m.LatencyP999 != 0 {
-		t.Errorf("LatencyP999 = %v, want 0", m.LatencyP999)
-	}
 }
 
 func TestMockEngineMetricsReturnsZero(t *testing.T) {
@@ -63,9 +53,6 @@ func TestEngineMetricsFieldValues(t *testing.T) {
 		ActiveConnections: 50,
 		ErrorCount:        3,
 		Throughput:        12345.67,
-		LatencyP50:        500 * time.Microsecond,
-		LatencyP99:        5 * time.Millisecond,
-		LatencyP999:       50 * time.Millisecond,
 	}
 	if m.RequestCount != 1000 {
 		t.Errorf("RequestCount = %d, want 1000", m.RequestCount)
@@ -78,14 +65,5 @@ func TestEngineMetricsFieldValues(t *testing.T) {
 	}
 	if m.Throughput != 12345.67 {
 		t.Errorf("Throughput = %f, want 12345.67", m.Throughput)
-	}
-	if m.LatencyP50 != 500*time.Microsecond {
-		t.Errorf("LatencyP50 = %v, want 500us", m.LatencyP50)
-	}
-	if m.LatencyP99 != 5*time.Millisecond {
-		t.Errorf("LatencyP99 = %v, want 5ms", m.LatencyP99)
-	}
-	if m.LatencyP999 != 50*time.Millisecond {
-		t.Errorf("LatencyP999 = %v, want 50ms", m.LatencyP999)
 	}
 }

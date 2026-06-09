@@ -401,9 +401,6 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
 		ErrorCount:         pm.ErrorCount + sm.ErrorCount,
 		Throughput:         pm.Throughput + sm.Throughput,
-		LatencyP50:         max(pm.LatencyP50, sm.LatencyP50),
-		LatencyP99:         max(pm.LatencyP99, sm.LatencyP99),
-		LatencyP999:        max(pm.LatencyP999, sm.LatencyP999),
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 	}

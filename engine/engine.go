@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"time"
 )
 
 // Engine is the interface that all I/O engine implementations must satisfy.
@@ -86,6 +85,14 @@ type SendfileCapable interface {
 // EngineMetrics is a point-in-time snapshot of engine-level performance
 // counters. Each engine maintains internal atomic counters and populates a
 // fresh snapshot on each [Engine.Metrics] call.
+//
+// v1.5.0: LatencyP50 / LatencyP99 / LatencyP999 were removed (celeris#321).
+// The fields were declared but never written by any sub-engine (the
+// sub-engines don't track per-request latency histograms — they only
+// count requests). The adaptive engine's aggregator at
+// adaptive/engine.go was the only reader and it received zeros from
+// both sub-engines, so removing the fields changes nothing observable.
+// SyscallRate, referenced by the issue, never existed in the tree.
 type EngineMetrics struct { //nolint:revive // user-approved name
 	// RequestCount is the cumulative number of requests handled by this engine.
 	RequestCount uint64
@@ -95,12 +102,6 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	ErrorCount uint64
 	// Throughput is the recent requests-per-second rate.
 	Throughput float64
-	// LatencyP50 is the 50th-percentile (median) request latency.
-	LatencyP50 time.Duration
-	// LatencyP99 is the 99th-percentile request latency.
-	LatencyP99 time.Duration
-	// LatencyP999 is the 99.9th-percentile request latency.
-	LatencyP999 time.Duration
 	// AsyncRoutes is the count of routes registered with .Async(true) on
 	// this engine's handler. Static after Listen — derived from the
 	// router's per-route async flags and exposed for diagnostics so
