@@ -8,9 +8,9 @@ import (
 )
 
 // Probe detects system capabilities using the platform-default syscall prober.
-// If CELERIS_MAX_IOURING_TIER is set (none/base/mid/high/optional), the
-// detected io_uring tier and associated features are capped at that level.
-// This allows CI to exercise every tier's code path on modern kernels.
+// If CELERIS_MAX_IOURING_TIER is set (none/base/high/optional), the detected
+// io_uring tier and associated features are capped at that level. This allows
+// CI to exercise every tier's code path on modern kernels.
 func Probe() engine.CapabilityProfile {
 	profile := ProbeWith(defaultProber())
 	if maxTier := os.Getenv("CELERIS_MAX_IOURING_TIER"); maxTier != "" {
@@ -25,11 +25,6 @@ func parseTierName(s string) engine.Tier {
 		return engine.Optional
 	case "high":
 		return engine.High
-	case "mid":
-		// Backwards-compat alias: the `Mid` tier was retired in v1.4.8
-		// (see celeris#287). Map any existing CELERIS_MAX_IOURING_TIER=mid
-		// configuration to Base so deployed manifests don't break.
-		return engine.Base
 	case "base":
 		return engine.Base
 	default:
@@ -57,9 +52,7 @@ func capIOUringTier(p engine.CapabilityProfile, maxTier engine.Tier) engine.Capa
 		p.FixedFiles = false
 		p.DeferTaskrun = false
 		// COOP_TASKRUN + SINGLE_ISSUER were introduced together in 5.19
-		// and land at the High tier (see celeris#287). Pre-fix the Mid
-		// tier owned CoopTaskrun at 5.13; that was wrong, the flag did
-		// not exist before 5.19.
+		// and land at the High tier.
 		p.CoopTaskrun = false
 		p.SingleIssuer = false
 	}

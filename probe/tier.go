@@ -37,6 +37,8 @@ const (
 //     io_uring_setup with a flag the kernel rejects with -EINVAL,
 //     forcing a noisy fall-back to Base. With the gate at 5.19, the
 //     5.13–5.18 range simply uses Base without the failed setup probe.
+//     The historical `Mid` tier that briefly represented 5.13–5.18 was
+//     retired in v1.4.8 (celeris#287) and is gone from this enum.
 //   - 5.19 SETUP_SINGLE_ISSUER:  landed in 5.19 alongside COOP_TASKRUN
 //     and the multishot / provided-buffer set; treated as one
 //     capability tier (High).
@@ -63,11 +65,6 @@ const (
 //	Optional — kernel ≥ 6.0. Adds SQPOLL and SEND_ZC. With kernel ≥ 6.1,
 //	           DEFER_TASKRUN replaces COOP_TASKRUN in setup flags.
 //
-// Note: the previous `engine.Mid` tier (5.13–5.18) was retired in
-// celeris v1.4.8 — its only distinguishing feature (COOP_TASKRUN) was
-// version-gated incorrectly. With the gate corrected, the 5.13–5.18
-// range carries no additional capability over 5.10–5.12, so the tier
-// collapses into Base. See celeris#287.
 func determineTier(kv KernelVersion, features uint32, _ []uint8) (tier engine.Tier, multishotAccept, multishotRecv, providedBuffers, sqpoll, coopTaskrun, singleIssuer, linkedSQEs, deferTaskrun, fixedFiles, sendZC bool) {
 	if !kv.AtLeast(5, 10) {
 		return engine.None, false, false, false, false, false, false, false, false, false, false

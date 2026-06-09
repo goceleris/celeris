@@ -90,7 +90,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// off when this probe fails.
 	if profile.ProvidedBuffers {
 		if ok, pbReason := probeProvidedBuffersCached(); !ok {
-			cfg.Logger.Info("provided buffers runtime probe failed, disabling (downgrades to mid tier and disables multishot recv)", "reason", pbReason)
+			cfg.Logger.Info("provided buffers runtime probe failed, disabling (downgrades to base tier and disables multishot recv)", "reason", pbReason)
 			profile.ProvidedBuffers = false
 			profile.MultishotRecv = false
 		}
@@ -277,8 +277,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 // fallbackTier drops the current tier strategy one rung. Invoked when
 // NewRing fails (e.g. the kernel rejected a setup flag we asked for) so
 // the engine can re-attempt at a lower capability instead of refusing
-// to start. The `Mid` tier was retired in v1.4.8 (celeris#287), so
-// `highTier` falls back directly to `baseTier`.
+// to start.
 func fallbackTier(current TierStrategy) TierStrategy {
 	switch t := current.(type) {
 	case *optionalTier:
