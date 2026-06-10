@@ -51,10 +51,20 @@ type connState struct {
 	protocol engine.Protocol // 1 byte
 	detected bool            // 1 byte
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
-	_        [5]byte         // padding to 8-byte alignment
+	epollOut bool            // 1 byte: true while level-triggered EPOLLOUT is armed (write backpressure)
+	_        [4]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
 	bodyBuf  []byte          // 24 bytes: zero-copy body slice for writev scatter-gather
+
+	// sendfile holds an in-progress zero-copy sendfile(2) response. Set by
+	// the H1 response adapter's SetSendFileFn hook (non-async mode only).
+	// flushWrites drives it AFTER writeBuf/bodyBuf drain (preserving
+	// ordering with any prior pipelined bytes); on completion or conn close
+	// the engine closes the dup'd file it owns. Mutually exclusive with
+	// bodyBuf for a given response (the body comes from a file, not a
+	// slice). nil when no sendfile is pending.
+	sendfile *sendfileState
 
 	// Warm — second cache line:
 	pendingBytes int        // 8 bytes
@@ -130,14 +140,20 @@ type connState struct {
 	// cleared by drainDetachQueue once the bookkeeping runs.
 	asyncDetachPending bool
 
-	// forceRSTClose is set by the slowloris-defence path (checkTimeouts'
-	// HeaderDeadline branch) to signal closeConn should skip the graceful
-	// Shutdown(SHUT_WR)+drainRecvBuffer dance and instead call close()
-	// directly — SO_LINGER {1, 0} (set by the caller before closeConn)
-	// then forces RST so the walker observes ECONNRESET on its next
-	// write regardless of TCP send-buffer state. Mirrors the iouring
-	// engine's same-named flag.
-	forceRSTClose bool
+	// liveIdx is this conn's index into l.liveConns (the dense slice of
+	// active FDs iterated by checkTimeouts/shutdown). -1 when not present.
+	// Maintained by addLiveConn/removeLiveConn for O(1) removal. (#318)
+	liveIdx int
+
+	// hijacked is set by hijackConn (Context.Hijack) once the fd has been
+	// detached from the engine and handed to the caller as a net.Conn. In
+	// async mode hijackConn runs ON the dispatch goroutine (inside
+	// ProcessH1 → ErrHijacked), which still touches cs after ProcessH1
+	// returns — so the pooled connState MUST NOT be released by hijackConn.
+	// The release is deferred to the worker via the asyncClosed +
+	// detachQueue → drainDetachQueue handoff, which sees this flag and runs
+	// releaseConnState only after the goroutine has exited. (#3.1)
+	hijacked bool
 }
 
 var connStatePool = sync.Pool{
@@ -152,6 +168,7 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	cs := connStatePool.Get().(*connState)
 	cs.fd = fd
 	cs.ctx = ctx
+	cs.liveIdx = -1
 	cs.writeBuf = cs.writeBuf[:0]
 	cs.writePos = 0
 	if cap(cs.buf) >= bufSize {
@@ -179,6 +196,7 @@ func releaseConnState(cs *connState) {
 	cs.protocol = 0
 	cs.detected = false
 	cs.dirty = false
+	cs.epollOut = false
 	cs.pendingBytes = 0
 	cs.writePos = 0
 	cs.lastActivity = 0
@@ -187,6 +205,10 @@ func releaseConnState(cs *connState) {
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
 	cs.bodyBuf = nil
+	if cs.sendfile != nil {
+		cs.sendfile.close()
+		cs.sendfile = nil
+	}
 	cs.asyncInBuf = cs.asyncInBuf[:0]
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
@@ -194,7 +216,8 @@ func releaseConnState(cs *connState) {
 	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
-	cs.forceRSTClose = false
+	cs.liveIdx = -1
+	cs.hijacked = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

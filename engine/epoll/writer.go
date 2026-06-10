@@ -23,7 +23,9 @@ func flushWrites(cs *connState) error {
 	if cs.writePos >= len(cs.writeBuf) {
 		cs.writeBuf = cs.writeBuf[:0]
 		cs.writePos = 0
-		return nil
+		// writeBuf is empty — if a zero-copy sendfile response is pending,
+		// drive it now (after any prior pipelined writeBuf bytes flushed).
+		return flushSendfile(cs)
 	}
 	n, err := unix.Write(cs.fd, cs.writeBuf[cs.writePos:])
 	if err != nil {
@@ -39,6 +41,9 @@ func flushWrites(cs *connState) error {
 		// Fully flushed
 		cs.writeBuf = cs.writeBuf[:0]
 		cs.writePos = 0
+		// writeBuf drained this call — continue into the sendfile body if a
+		// sendfile response is pending. Keeps header→body ordering correct.
+		return flushSendfile(cs)
 	} else if cs.writePos > cap(cs.writeBuf)/2 {
 		// Amortized compaction: only copy when more than half the buffer is consumed.
 		// This reduces the average cost from O(n) per partial write to O(1) amortized.
@@ -48,6 +53,66 @@ func flushWrites(cs *connState) error {
 		cs.writePos = 0
 	}
 	return nil
+}
+
+// flushSendfile drives a pending zero-copy sendfile(2) response as far as
+// the kernel send buffer allows. Called by flushWrites only once
+// writeBuf/bodyBuf are fully drained, so the sendfile header+body always
+// follow any prior pipelined bytes in order.
+//
+// On EAGAIN the kernel send buffer is full: returns nil (not an error)
+// and leaves cs.sendfile in place so the EPOLLOUT/dirty resume machinery
+// retries on the next writable edge — identical backpressure handling to
+// the writeBuf path above. On a real I/O error the file is released and
+// the error is surfaced (the caller closes the conn). On completion the
+// dup'd file is closed and cs.sendfile cleared.
+func flushSendfile(cs *connState) error {
+	st := cs.sendfile
+	if st == nil {
+		return nil
+	}
+	_, err := st.advance(cs.fd)
+	if err != nil {
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			return nil // send buffer full; resume on next writable edge
+		}
+		// Real error (or the header write surfaced one): release the file
+		// and surface to the caller, which closes the connection.
+		st.close()
+		cs.sendfile = nil
+		return err
+	}
+	if st.done {
+		st.close()
+		cs.sendfile = nil
+	}
+	return nil
+}
+
+// csWritePending reports whether cs has any unsent output: buffered bytes
+// in writeBuf, a staged scatter-gather bodyBuf, or an in-progress
+// sendfile response. The flush paths use it to decide whether the
+// connection is fully drained (disarm EPOLLOUT, clear dirty) or still
+// needs a writable-edge resume.
+func csWritePending(cs *connState) bool {
+	return cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0 || cs.sendfile != nil
+}
+
+// csPendingBytes returns the number of bytes still queued for this
+// connection across all output sources: the unflushed writeBuf tail, the
+// staged scatter-gather bodyBuf, and any header+body remainder of an
+// in-progress sendfile response. Used to keep cs.pendingBytes (the
+// back-pressure accounting that gates writeCap) accurate while a sendfile
+// is draining so a stalled file transfer is not masked.
+func csPendingBytes(cs *connState) int {
+	n := len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
+	if st := cs.sendfile; st != nil {
+		n += len(st.headers) - st.headerOff
+		if st.remaining > 0 {
+			n += int(st.remaining)
+		}
+	}
+	return n
 }
 
 // flushWritesV handles the writev path: headers in cs.writeBuf[writePos:]

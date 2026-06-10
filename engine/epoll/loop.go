@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -29,8 +30,13 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
-// connTableSize is the number of slots in the flat connection array.
-// Must accommodate the maximum number of concurrent connections per worker.
+// connTableSize is the number of slots in the flat connection array, and
+// thus the HARD CAP on concurrent connections per worker: an accepted fd
+// >= connTableSize cannot be indexed into l.conns and is rejected (closed)
+// by acceptAll with an errCount bump + a rate-limited Warn. The kernel
+// hands out the lowest free fd, so this is reached only when a worker is
+// genuinely holding ~65 K live conns (plus the listen/epoll/event/timer
+// fds). Raise this if a single worker must sustain more.
 const connTableSize = 65536
 
 // errPeerClosed is returned via H1State.OnError when the peer closes the
@@ -39,16 +45,28 @@ var errPeerClosed = errors.New("celeris: peer closed connection")
 
 // Loop is an epoll-based event loop worker.
 type Loop struct {
-	id           int
-	cpuID        int
-	epollFD      int
-	listenFD     int
-	eventFD      int // eventfd for H2 write queue wakeup (-1 if unavailable)
-	timerFD      int // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
-	events       []unix.EpollEvent
-	conns        []*connState
-	connCount    int // number of active connections (local, for draining check)
-	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
+	id        int
+	cpuID     int
+	epollFD   int
+	listenFD  int
+	eventFD   int // eventfd for H2 write queue wakeup (-1 if unavailable)
+	timerFD   int // timerfd for kernel-enforced checkTimeouts cadence (-1 if disabled)
+	events    []unix.EpollEvent
+	conns     []*connState
+	connCount int // number of active connections (local, for draining check)
+	maxFD     int // upper bound fd for iteration in checkTimeouts/shutdown
+	// liveConns is a dense slice of currently-active FDs. checkTimeouts
+	// and shutdown iterate it instead of the sparse 0..maxFD range, so
+	// their cost is O(active conns) regardless of the FD space (maxFD
+	// never shrinks). Maintained by addLiveConn/removeLiveConn on every
+	// accept/close path. Worker-thread-only — no synchronization. (#318)
+	liveConns []int
+	// listenHot is set by acceptAll when it stops with the listen backlog
+	// possibly non-empty (per-call cap hit, or EMFILE/ENFILE back-off).
+	// The listen socket is edge-triggered, so the queued SYNs won't
+	// re-signal; the event loop re-enters acceptAll with a 0ms epoll_wait
+	// while this is set to drain the remainder. Worker-thread-only.
+	listenHot    bool
 	handler      stream.Handler
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
@@ -82,7 +100,16 @@ type Loop struct {
 	reqBatch         uint64         // batched request count, flushed to reqCount per iteration
 	tickCounter      uint32
 	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
-	cachedNow        int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
+	cachedNow        int64  // cached time.Now().UnixNano(), refreshed once per events return
+
+	// fdCapDrops counts accepted fds that fell outside the l.conns table
+	// (fd >= connTableSize) and were force-closed in acceptAll. Worker-
+	// thread-only. fdCapWarned latches so the diagnostic Warn is emitted
+	// at most once per worker — the condition is sticky (a worker at the
+	// cap stays there), so one log line is enough to make it diagnosable
+	// without flooding under sustained overload.
+	fdCapDrops  uint64
+	fdCapWarned bool
 
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	h2Conns        []int      // FDs of H2 connections (for write queue polling)
@@ -132,6 +159,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		timerFD:      -1,
 		events:       make([]unix.EpollEvent, resolved.MaxEvents),
 		conns:        make([]*connState, connTableSize),
+		liveConns:    make([]int, 0, 1024),
 		handler:      handler,
 		resolved:     resolved,
 		cfg:          cfg,
@@ -273,6 +301,9 @@ func (l *Loop) run(ctx context.Context) {
 			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
 			_ = unix.Close(l.listenFD)
 			l.listenFD = -1
+			// No listen fd to drain — clear the re-arm flag so it doesn't
+			// pin epoll_wait at 0ms (busy-spin) while paused/suspended.
+			l.listenHot = false
 		}
 		// Maintain the listenFDClosed signal that PauseAccept polls on.
 		// Set it whenever paused==true regardless of whether we just
@@ -313,6 +344,12 @@ func (l *Loop) run(ctx context.Context) {
 		if l.listenFD < 0 {
 			timeoutMs = 500
 		}
+		// acceptAll stopped with the listen backlog possibly non-empty
+		// (per-call cap hit, or EMFILE/ENFILE back-off). The listen socket
+		// is edge-triggered, so don't block — poll immediately and re-drain.
+		if l.listenHot {
+			timeoutMs = 0
+		}
 
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
 		if err != nil {
@@ -325,12 +362,15 @@ func (l *Loop) run(ctx context.Context) {
 
 		var now int64
 		if n > 0 {
-			// Refresh cached timestamp every 64 iterations to amortize
-			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
-			// uses multi-second windows so ~1ms resolution is sufficient.
-			if l.tickCounter&0x3F == 0 {
-				l.cachedNow = time.Now().UnixNano()
-			}
+			// Refresh the cached timestamp on every events-bearing
+			// epoll_wait return. The previous &0x3F gate refreshed only
+			// every 64th return, so lastActivity (written from this `now`
+			// on accept/read) could lag wall-clock by up to ~63 returns
+			// while checkTimeouts compares against a FRESH time.Now() —
+			// closing still-active conns early. The vDSO cost (~50ns) is
+			// negligible amortized over the whole event batch. cachedNow
+			// is loop-thread-local, so no synchronization is needed.
+			l.cachedNow = time.Now().UnixNano()
 			now = l.cachedNow
 		}
 		for i := range n {
@@ -378,11 +418,34 @@ func (l *Loop) run(ctx context.Context) {
 				l.drainRead(fd, now)
 			}
 
+			// EPOLLOUT: the socket became writable again for a conn that hit
+			// write backpressure (armEpollOut). Flush the pending bytes and
+			// disarm once drained. drainRead above may have closed the conn,
+			// so re-validate the slot. Level-triggered EPOLLOUT keeps firing
+			// while writable, so a partial flush simply resumes next edge.
+			if ev.Events&unix.EPOLLOUT != 0 {
+				if fd >= 0 && fd < len(l.conns) {
+					if cs := l.conns[fd]; cs != nil && cs.epollOut {
+						l.handleWritable(cs)
+					}
+				}
+			}
+
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
 				}
 			}
+		}
+
+		// listenHot: acceptAll capped/backed-off last round with the listen
+		// backlog possibly non-empty. The edge-triggered listen socket won't
+		// re-signal those queued SYNs, and this epoll_wait may have returned
+		// for an unrelated fd (or timed out at 0ms with no event), so re-drain
+		// explicitly here rather than relying on a listen-fd event. acceptAll
+		// clears or re-sets listenHot based on whether the backlog drained.
+		if l.listenHot && l.listenFD >= 0 {
+			l.acceptAll(ctx, time.Now().UnixNano())
 		}
 
 		// Adaptive timeout tracking.
@@ -413,17 +476,28 @@ func (l *Loop) run(ctx context.Context) {
 				}
 				l.removeDirty(cs)
 				l.closeConn(cs.fd)
-			} else if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
+			} else if !csWritePending(cs) {
 				cs.pendingBytes = 0
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
 				l.removeDirty(cs)
 			} else {
-				// Sync pendingBytes with actual buffer state after partial write.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
+				// Partial write: kernel send buffer full. Sync pendingBytes,
+				// then for a non-detached HTTP/H2 conn hand off to level-
+				// triggered EPOLLOUT (armEpollOut removes it from the dirty
+				// list) so the loop stops busy-retrying it. Truly-detached
+				// WS/SSE conns stay on the dirty list — their writes are
+				// goroutine-driven and re-signalled via the eventfd path.
+				// `next` was captured above, so the removeDirty inside
+				// armEpollOut is safe mid-iteration.
+				cs.pendingBytes = csPendingBytes(cs)
+				detachedWS := cs.h1State != nil && cs.h1State.Detached
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
+				}
+				if !detachedWS {
+					l.armEpollOut(cs)
 				}
 			}
 			cs = next
@@ -440,7 +514,9 @@ func (l *Loop) run(ctx context.Context) {
 						l.removeDirty(cs)
 						l.closeConn(fd)
 					} else if cs.writePos < len(cs.writeBuf) {
-						l.markDirty(cs)
+						// Send buffer full: arm EPOLLOUT instead of the dirty
+						// list so we don't busy-poll the backpressured H2 conn.
+						l.armEpollOut(cs)
 					}
 				}
 			}
@@ -495,21 +571,66 @@ func (l *Loop) run(ctx context.Context) {
 	}
 }
 
+// acceptAllCap bounds how many connections acceptAll drains in a single
+// call so one worker can't starve its other ready FDs under an accept
+// flood. The listen socket is edge-triggered (EPOLLIN|EPOLLET): with ET we
+// MUST drain to EAGAIN or we won't get another readiness edge for already-
+// queued SYNs. So when the cap is hit with the backlog possibly non-empty
+// we set listenHot, which makes the event loop re-enter acceptAll on the
+// next iteration with a 0ms epoll_wait — draining the rest without waiting
+// for a fresh SYN edge.
+const acceptAllCap = 1024
+
 func (l *Loop) acceptAll(ctx context.Context, now int64) {
-	for i := 0; i < 64; i++ {
+	for i := 0; i < acceptAllCap; i++ {
 		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			switch err {
+			case unix.EAGAIN:
+				// Listen queue fully drained — ET edge satisfied.
+				// (EWOULDBLOCK == EAGAIN on Linux, so one case covers both.)
+				l.listenHot = false
+				return
+			case unix.EINTR, unix.ECONNABORTED:
+				// Transient: a SYN was aborted (RST before accept) or the
+				// syscall was interrupted. The backlog may still hold other
+				// connections, so retry this round rather than returning —
+				// a bare return would strand them until the next SYN edge.
+				continue
+			case unix.EMFILE, unix.ENFILE:
+				// Out of file descriptors (per-process / system-wide). The
+				// SYN at the head of the queue is un-acceptable right now;
+				// bare-continuing would busy-loop on the same EMFILE. Back
+				// off this round and re-arm so we retry next iteration once
+				// an fd may have freed up — with ET we can't just wait for a
+				// new edge, the queued SYNs won't re-signal.
+				l.errCount.Add(1)
+				l.listenHot = true
+				return
+			default:
+				// Unexpected accept error. Count it and stop this round; the
+				// listen fd stays armed (ET) and a fresh edge re-enters.
+				l.errCount.Add(1)
+				l.listenHot = false
 				return
 			}
-			l.errCount.Add(1)
-			return
 		}
 
-		// Bounds check: reject FDs outside the flat conn array.
+		// Bounds check: reject FDs outside the flat conn array. An fd at or
+		// above the table cap cannot be indexed into l.conns, so it would
+		// be silently dropped (errCount++) and stay invisible. Latch a
+		// one-shot Warn so a worker that has saturated its 64 K conn table
+		// is diagnosable rather than just "connections vanishing".
 		if newFD < 0 || newFD >= len(l.conns) {
 			_ = unix.Close(newFD)
 			l.errCount.Add(1)
+			l.fdCapDrops++
+			if !l.fdCapWarned && l.logger != nil {
+				l.fdCapWarned = true
+				l.logger.Warn("accepted fd exceeds conn table cap; dropping",
+					"loop", l.id, "fd", newFD, "cap", len(l.conns),
+					"hint", "worker is at its per-worker connection limit (connTableSize)")
+			}
 			continue
 		}
 
@@ -533,6 +654,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
 		cs.remoteAddr = sockaddrString(sa)
 		l.conns[newFD] = cs
+		l.addLiveConn(cs)
 		l.connCount++
 		if newFD > l.maxFD {
 			l.maxFD = newFD
@@ -559,6 +681,10 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 			l.initProtocol(cs)
 		}
 	}
+	// Cap hit without reaching EAGAIN: more SYNs may be queued. With ET we
+	// won't get a fresh readiness edge for them, so re-arm to drain the
+	// remainder on the next loop iteration (epoll_wait(0) via listenHot).
+	l.listenHot = true
 }
 
 func (l *Loop) drainRead(fd int, now int64) {
@@ -683,7 +809,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 				mu.Unlock()
 			}
 			if dirty {
-				l.markDirty(cs)
+				// Send buffer full after the body-recv response flush. This
+				// path is sync-only (intoBody is gated on !l.async), so the
+				// conn is never detached — arm EPOLLOUT to avoid busy-polling.
+				l.armEpollOut(cs)
 			}
 			continue
 		}
@@ -828,8 +957,11 @@ func (l *Loop) drainRead(fd int, now int64) {
 							l.removeDirty(cs)
 						}
 					} else {
+						// 101 + H2 preface didn't fully drain: send buffer
+						// full. Newly-H2 conn (not detached) — arm EPOLLOUT
+						// rather than the busy-polling dirty list.
 						cs.pendingBytes = len(cs.writeBuf) - cs.writePos
-						l.markDirty(cs)
+						l.armEpollOut(cs)
 					}
 				}
 				// Fall through to continue the loop; subsequent reads go
@@ -896,7 +1028,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 		if mu := cs.detachMu; mu != nil {
 			mu.Lock()
 		}
-		if cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0 {
+		if csWritePending(cs) {
 			if fErr := flushWrites(cs); fErr != nil {
 				if cs.h1State != nil && cs.h1State.OnError != nil {
 					cs.h1State.OnError(fErr)
@@ -910,16 +1042,29 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.closeConn(fd)
 				return
 			}
-			if cs.writePos >= len(cs.writeBuf) && len(cs.bodyBuf) == 0 {
-				// Fully flushed — no dirty list needed.
+			if !csWritePending(cs) {
+				// Fully flushed (including any sendfile body) — no dirty
+				// list / EPOLLOUT needed.
 				cs.pendingBytes = 0
 				if cs.dirty {
 					l.removeDirty(cs)
 				}
+				l.disarmEpollOut(cs)
 			} else {
-				// Partial write — sync pendingBytes with actual buffer state.
-				cs.pendingBytes = len(cs.writeBuf) - cs.writePos + len(cs.bodyBuf)
-				l.markDirty(cs)
+				// Partial write — the kernel send buffer is full (write
+				// backpressure). Sync pendingBytes and arm level-triggered
+				// EPOLLOUT instead of busy-retrying via the dirty list, which
+				// would spin epoll_wait(0)→write(EAGAIN) at 100% CPU. Truly-
+				// detached WS/SSE conns keep the goroutine-driven dirty/
+				// detachQueue path (their writes flow through guarded writeFn
+				// + eventfd, not this inline HTTP flush). A pending sendfile
+				// is resumed by handleWritable on the next EPOLLOUT edge.
+				cs.pendingBytes = csPendingBytes(cs)
+				if cs.h1State != nil && cs.h1State.Detached {
+					l.markDirty(cs)
+				} else {
+					l.armEpollOut(cs)
+				}
 			}
 		}
 		// Capture pendingBytes inside the lock so the check below is safe
@@ -965,14 +1110,53 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
+	// Detach the conn from the engine synchronously: drop it from epoll,
+	// the live set, and the conn table, and update the counters. All of
+	// this is worker-state that's only safe to touch from this thread —
+	// and in async mode hijackConn runs ON the dispatch goroutine (inside
+	// ProcessH1 → ErrHijacked). That's tolerable because the worker won't
+	// see another EPOLLIN for fd after EPOLL_CTL_DEL, and these l.* fields
+	// are only read by the worker between epoll_wait returns, never while a
+	// dispatch goroutine is mid-ProcessH1.
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	releaseConnState(cs)
+	l.removeLiveConn(cs)
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
+
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
+
+	// CRITICAL (#3.1): defer the pool release whenever a dispatch goroutine
+	// (runAsyncHandler) is alive for this conn. When the handler calls
+	// Hijack from inside that goroutine's ProcessH1, the goroutine STILL
+	// touches cs after ProcessH1 returns ErrHijacked — it Unlocks
+	// cs.detachMu, resyncs cs.pendingBytes, sets cs.asyncClosed, clears
+	// cs.asyncInBuf, and enqueues cs on detachQueue. Recycling cs now would
+	// hand pooled-and-reissued memory to that goroutine. Mark it hijacked
+	// and let the worker-thread teardown (drainDetachQueue, reached via the
+	// goroutine's asyncClosed + detachQueue handoff) run the pool release
+	// once the goroutine has exited.
+	//
+	// When no dispatch goroutine is running, hijackConn was called inline on
+	// the worker thread (sync mode, or an async-mode conn not yet promoted
+	// running its first request inline). drainRead returns immediately on
+	// ErrHijacked without touching cs again and nothing will enqueue cs, so
+	// release synchronously here — gating only on detachMu would leak the
+	// connState in the inline-async case. asyncRun is read under asyncInMu
+	// (the same lock the dispatch goroutine sets it under).
+	deferRelease := false
+	if cs.detachMu != nil {
+		cs.asyncInMu.Lock()
+		deferRelease = cs.asyncRun
+		cs.asyncInMu.Unlock()
+	}
+	if deferRelease {
+		cs.hijacked = true
+	} else {
+		releaseConnState(cs)
+	}
 	return c, err
 }
 
@@ -1013,6 +1197,11 @@ func (l *Loop) initProtocol(cs *connState) {
 		// with the dispatch goroutine without a mutex.
 		if !l.async {
 			cs.h1State.SetWriteBodyFn(l.makeWriteBodyFn(cs))
+			// Zero-copy sendfile(2) for large static-file responses: the
+			// H1 adapter's WriteFileResponse routes file bodies ≥ threshold
+			// through this hook. Disabled in async mode (the dispatch
+			// goroutine would race the worker on cs.sendfile / cs.writeBuf).
+			cs.h1State.SetSendFileFn(l.makeSendFileFn(cs))
 		}
 		cs.h1State.OnDetach = func() {
 			cs.h1State.Detached = true
@@ -1250,6 +1439,96 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 		cs.bodyBuf = body
 		cs.pendingBytes += len(body)
 	}
+}
+
+// makeSendFileFn returns the zero-copy sendfile(2) hook installed on the
+// H1 response adapter via SetSendFileFn. It is invoked synchronously from
+// the handler (inside ProcessH1 on the event-loop thread) when
+// WriteFileResponse serves a large file body. It stages the transfer in
+// cs.sendfile; the post-handler inline flush in drainRead (and, on
+// backpressure, the EPOLLOUT resume in handleWritable) drives it to
+// completion — exactly the same machinery as a buffered write, so partial
+// sends, ordering with prior pipelined bytes, and timeout tracking all
+// work without a separate code path.
+//
+// The engine dups the caller's descriptor so the file's lifetime is
+// independent of the handler's `defer f.Close()` (the handler returns
+// long before the kernel finishes a backpressured transfer). The dup is
+// closed by flushSendfile on completion or by closeConn / releaseConnState
+// on teardown.
+//
+// Pipelined file requests in a single recv (cs.sendfile already set) and
+// rare dup failures fall back to a buffered copy of this response into
+// writeBuf, so the engine never needs two concurrent sendfile slots and
+// response ordering is always preserved.
+func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, offset, length int64) error {
+	return func(header []byte, file *os.File, offset, length int64) error {
+		if cs.sendfile != nil {
+			return bufferedFileFallback(cs, header, file, offset, length)
+		}
+		dupfd, err := unix.Dup(int(file.Fd()))
+		if err != nil {
+			return bufferedFileFallback(cs, header, file, offset, length)
+		}
+		df := os.NewFile(uintptr(dupfd), file.Name())
+		st, err := newSendfileState(df, offset, length, header)
+		if err != nil {
+			_ = df.Close()
+			return err
+		}
+		cs.sendfile = st
+		cs.pendingBytes = csPendingBytes(cs)
+		return nil
+	}
+}
+
+// bufferedFileFallback copies a file response (header block + the file
+// slice [offset, offset+length)) into cs.writeBuf for the normal write
+// path. Used when the zero-copy sendfile slot is unavailable (a prior
+// sendfile still draining on a pipelined conn, or a dup failure). The
+// caller still owns and closes the *os.File. Correctness over zero-copy:
+// the response is delivered byte-exact, just without the syscall savings.
+func bufferedFileFallback(cs *connState, header []byte, file *os.File, offset, length int64) error {
+	if length <= 0 {
+		fi, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		length = fi.Size() - offset
+		if length < 0 {
+			length = 0
+		}
+	}
+	cs.writeBuf = append(cs.writeBuf, header...)
+	start := len(cs.writeBuf)
+	cs.writeBuf = append(cs.writeBuf, make([]byte, length)...)
+	if _, err := readFullAt(file, cs.writeBuf[start:start+int(length)], offset); err != nil {
+		// Roll back the reserved body region; keep the header (a partial
+		// header-only response would corrupt framing, so surface the error
+		// and let the caller close the conn).
+		cs.writeBuf = cs.writeBuf[:start-len(header)]
+		return err
+	}
+	cs.pendingBytes = csPendingBytes(cs)
+	return nil
+}
+
+// readFullAt reads len(buf) bytes from file starting at offset, looping
+// over short reads. Uses ReadAt so it does not disturb the file's seek
+// offset (the caller may reuse the descriptor).
+func readFullAt(file *os.File, buf []byte, offset int64) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := file.ReadAt(buf[total:], offset+int64(total))
+		total += n
+		if err != nil {
+			if err == io.EOF && total == len(buf) {
+				return total, nil
+			}
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
@@ -1522,6 +1801,17 @@ func (l *Loop) drainDetachQueue() {
 		if cs.detachClosed {
 			continue
 		}
+		// Hijacked conn (#3.1): hijackConn already detached the fd from
+		// epoll/live set/conn table and handed it to the caller as a
+		// net.Conn (the original fd is closed; the caller owns a dup). It
+		// deferred ONLY the pool release to here, where the dispatch
+		// goroutine that referenced cs has now exited (it enqueued cs on
+		// its way out). Release cs and skip closeConn — there is no fd to
+		// close and l.conns[fd] is already nil.
+		if cs.hijacked {
+			releaseConnState(cs)
+			continue
+		}
 		// Dispatch goroutine signaled close via asyncClosed. Only the
 		// worker can safely touch l.conns / dirty list, so we handle
 		// the teardown here.
@@ -1594,6 +1884,83 @@ func (l *Loop) markDirty(cs *connState) {
 	l.dirtyHead = cs
 }
 
+// armEpollOut handles socket write backpressure on an HTTP/H2 conn: a
+// flushWrites left bytes pending because the kernel send buffer is full
+// (write(2) returned EAGAIN / a short count). Instead of re-flushing into a
+// guaranteed EAGAIN on every iteration — which made adaptiveTimeoutMs spin
+// at epoll_wait(0) → write(EAGAIN) at 100% CPU under backpressure — we add
+// a level-triggered EPOLLOUT to the conn's interest set and DROP it from the
+// dirty list. The worker then blocks in epoll_wait until the socket is
+// writable again, at which point handleWritable flushes and disarms.
+//
+// EPOLLIN stays edge-triggered (EPOLLET applies only to EPOLLIN); EPOLLOUT
+// is level-triggered so it keeps firing while the socket is writable and
+// there is no missed-wakeup risk. Mirrors driver.go's flushDriverSendLocked.
+func (l *Loop) armEpollOut(cs *connState) {
+	// Backpressure replaces the dirty-list retry; the two must not coexist
+	// or adaptiveTimeoutMs would still return 0 and busy-poll.
+	l.removeDirty(cs)
+	if cs.epollOut {
+		return
+	}
+	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
+		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLOUT,
+		Fd:     int32(cs.fd),
+	}); err == nil {
+		cs.epollOut = true
+	} else {
+		// MOD failed (should not happen for a registered fd); fall back to
+		// the dirty-list retry so the pending bytes still get flushed.
+		l.markDirty(cs)
+	}
+}
+
+// disarmEpollOut removes the level-triggered EPOLLOUT interest once a conn's
+// pending writes have fully drained, restoring the read-only edge-triggered
+// interest so an idle fd doesn't wake the loop on every writable signal.
+func (l *Loop) disarmEpollOut(cs *connState) {
+	if !cs.epollOut {
+		return
+	}
+	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
+		Events: unix.EPOLLIN | unix.EPOLLET,
+		Fd:     int32(cs.fd),
+	})
+	cs.epollOut = false
+}
+
+// handleWritable resumes a backpressured conn on an EPOLLOUT event: flush
+// the pending bytes and, if fully drained, disarm EPOLLOUT and restore the
+// read-only interest. A still-partial flush leaves EPOLLOUT armed so the
+// next writable edge resumes. Returns false if the conn was closed.
+func (l *Loop) handleWritable(cs *connState) {
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+	}
+	err := flushWrites(cs)
+	drained := err == nil && !csWritePending(cs)
+	if err == nil {
+		if drained {
+			cs.pendingBytes = 0
+		} else {
+			cs.pendingBytes = csPendingBytes(cs)
+		}
+	}
+	if err != nil && cs.h1State != nil && cs.h1State.OnError != nil {
+		cs.h1State.OnError(err)
+	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Unlock()
+	}
+	if err != nil {
+		l.closeConn(cs.fd)
+		return
+	}
+	if drained {
+		l.disarmEpollOut(cs)
+	}
+}
+
 func (l *Loop) removeH2Conn(fd int) {
 	for i, f := range l.h2Conns {
 		if f == fd {
@@ -1619,6 +1986,38 @@ func (l *Loop) removeDirty(cs *connState) {
 	}
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil
+}
+
+// addLiveConn records a newly-accepted fd in the dense liveConns slice and
+// stamps cs.liveIdx so removeLiveConn is O(1). Worker-thread-only. (#318)
+func (l *Loop) addLiveConn(cs *connState) {
+	cs.liveIdx = len(l.liveConns)
+	l.liveConns = append(l.liveConns, cs.fd)
+}
+
+// removeLiveConn removes cs's fd from liveConns in O(1) via swap-with-last,
+// using cs.liveIdx rather than the O(N) scan the iouring engine still does.
+// The element swapped into cs's old slot has its own liveIdx fixed up so a
+// later removeLiveConn for that conn stays correct. Worker-thread-only and
+// idempotent (liveIdx<0 means not present). (#318)
+func (l *Loop) removeLiveConn(cs *connState) {
+	if cs == nil {
+		return
+	}
+	i := cs.liveIdx
+	if i < 0 || i >= len(l.liveConns) || l.liveConns[i] != cs.fd {
+		return
+	}
+	last := len(l.liveConns) - 1
+	if i != last {
+		movedFD := l.liveConns[last]
+		l.liveConns[i] = movedFD
+		if moved := l.conns[movedFD]; moved != nil {
+			moved.liveIdx = i
+		}
+	}
+	l.liveConns = l.liveConns[:last]
+	cs.liveIdx = -1
 }
 
 func (l *Loop) adaptiveTimeoutMs(base int) int {
@@ -1669,9 +2068,17 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms).
+//
+// Iterates the dense liveConns slice (#318) rather than the sparse
+// 0..maxFD range, so the cost is O(active conns) regardless of FD space.
+// Iterating by REVERSE index is load-bearing: closeConn → removeLiveConn
+// swaps the closed conn's slot with the last entry, so a forward scan
+// would skip the swapped-in element. Walking high→low means any swap only
+// touches indices we've already visited.
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
-	for fd := 0; fd <= l.maxFD; fd++ {
+	for i := len(l.liveConns) - 1; i >= 0; i-- {
+		fd := l.liveConns[i]
 		cs := l.conns[fd]
 		if cs == nil {
 			continue
@@ -1773,6 +2180,14 @@ func (l *Loop) closeConn(fd int) {
 	// blocks for the current ProcessH1 call.
 	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
 	l.removeDirty(cs)
+	// Release any in-progress sendfile transfer's dup'd descriptor. Sendfile
+	// responses only run on non-detached H1 conns, so releaseConnState would
+	// also catch it, but close it here too so the dup fd is reclaimed
+	// promptly even on the detached branch (which skips releaseConnState).
+	if cs.sendfile != nil {
+		cs.sendfile.close()
+		cs.sendfile = nil
+	}
 	if !trulyDetached && cs.h1State != nil {
 		if detached {
 			cs.detachMu.Lock()
@@ -1803,9 +2218,6 @@ func (l *Loop) closeConn(fd int) {
 	// frames).
 	plainClose := cs.h1State != nil && !trulyDetached && cs.h2State == nil
 	switch {
-	case cs.forceRSTClose:
-		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
-		_ = unix.Close(fd)
 	case plainClose:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		_ = unix.Close(fd)
@@ -1814,6 +2226,7 @@ func (l *Loop) closeConn(fd int) {
 		drainRecvBuffer(fd)
 		_ = unix.Close(fd)
 	}
+	l.removeLiveConn(cs)
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
@@ -1832,7 +2245,19 @@ func (l *Loop) closeConn(fd int) {
 
 func (l *Loop) shutdown() {
 	l.shutdownDrivers()
-	for fd := 0; fd <= l.maxFD; fd++ {
+
+	// Phase 1: signal every async dispatch / detached goroutine to stop and
+	// tear down protocol state — but do NOT close any fd and do NOT release
+	// any connState yet. asyncClosed + the cond Broadcast MUST happen before
+	// the asyncWG.Wait() below, or Wait deadlocks on a goroutine parked in
+	// asyncCond.Wait(). fds and the pool release are deferred to phase 3 so a
+	// still-running dispatch goroutine cannot write into a closed/reused fd
+	// or touch pooled-and-reissued connState memory (the shutdown counterpart
+	// to the hijackConn use-after-release fix). Iterate liveConns by reverse
+	// index for consistency with checkTimeouts (no removal happens here, but
+	// keeping the idiom avoids surprises).
+	for i := len(l.liveConns) - 1; i >= 0; i-- {
+		fd := l.liveConns[i]
 		cs := l.conns[fd]
 		if cs == nil {
 			continue
@@ -1869,12 +2294,34 @@ func (l *Loop) shutdown() {
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
+	}
+
+	// Phase 2: wait for async dispatch goroutines to exit. They were
+	// signaled (asyncClosed + Broadcast) in phase 1; this join guarantees
+	// no goroutine is still inside ProcessH1 / writeFn against cs before we
+	// close fds or recycle connState below.
+	l.asyncWG.Wait()
+
+	// Phase 3: now that the async dispatch goroutines have exited (phase 2),
+	// close the fds and release the connState back to the pool. The pool
+	// release stays gated on !detached for the same reason as closeConn: a
+	// truly-detached WS/SSE conn's middleware goroutine is NOT tracked by
+	// asyncWG and may still hold a reference, so we let GC reclaim cs once
+	// that goroutine drops its closure refs rather than recycling it here.
+	for i := len(l.liveConns) - 1; i >= 0; i-- {
+		fd := l.liveConns[i]
+		cs := l.conns[fd]
+		if cs == nil {
+			continue
+		}
 		_ = unix.Close(fd)
-		if !detached {
+		if cs.detachMu == nil {
 			releaseConnState(cs)
 		}
 		l.conns[fd] = nil
 	}
+	l.liveConns = l.liveConns[:0]
+
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)
 	}
@@ -1885,11 +2332,6 @@ func (l *Loop) shutdown() {
 		_ = unix.Close(l.timerFD)
 	}
 	_ = unix.Close(l.epollFD)
-	// Wait for async dispatch goroutines to exit. They've been
-	// signaled via asyncClosed + Broadcast above; this join ensures
-	// the engine has no outstanding Gs touching connState memory
-	// before Listen returns.
-	l.asyncWG.Wait()
 }
 
 // drainRecvBuffer reads and discards any data in the socket receive buffer.
