@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/internal/cpumon"
 )
 
 // TelemetrySnapshot captures a point-in-time view of engine performance,
@@ -34,10 +33,10 @@ type TelemetrySampler interface {
 type liveSampler struct {
 	prevMetrics map[engine.EngineType]engine.EngineMetrics
 	prevTime    map[engine.EngineType]time.Time
-	cpuMon      cpumon.Monitor
+	cpuMon      engine.CPUMonitor
 }
 
-func newLiveSampler(cpuMon cpumon.Monitor) *liveSampler {
+func newLiveSampler(cpuMon engine.CPUMonitor) *liveSampler {
 	return &liveSampler{
 		prevMetrics: make(map[engine.EngineType]engine.EngineMetrics),
 		prevTime:    make(map[engine.EngineType]time.Time),

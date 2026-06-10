@@ -37,9 +37,8 @@ func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 	if err != nil {
 		t.Skipf("adaptive.New unsupported here: %v", err)
 	}
-	// Ensure switching is possible (cooldown off, minObserve off).
+	// Ensure switching is possible (cooldown off).
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

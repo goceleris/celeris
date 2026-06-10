@@ -108,7 +108,6 @@ func TestSwitchTrigger(t *testing.T) {
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.evalInterval = 1 * time.Millisecond
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	// Make active (io_uring) score 100.
 	sampler.Set(engine.IOUring, TelemetrySnapshot{ThroughputRPS: 100, ErrorRate: 0.01})
@@ -143,7 +142,6 @@ func TestHysteresis(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 1 * time.Hour // Very long cooldown to test blocking.
-	e.ctrl.minObserve = 0
 
 	// Pre-seed standby historical score so initial switch triggers.
 	now := time.Now()
@@ -174,7 +172,6 @@ func TestConnectionDraining(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	// Initial state: primary active, secondary should be paused.
 	// Simulate the initial pause that Listen() would do.
@@ -212,7 +209,6 @@ func TestOscillationLock(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	now := time.Now()
 
@@ -261,7 +257,6 @@ func TestOverloadFreeze(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	now := time.Now()
 	sampler.Set(engine.IOUring, TelemetrySnapshot{ThroughputRPS: 50})
@@ -329,7 +324,6 @@ func TestHistoricalScoreSeeding(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	// Active (io_uring) has score 100. No standby history yet.
 	sampler.Set(engine.IOUring, TelemetrySnapshot{ThroughputRPS: 100})
@@ -357,7 +351,6 @@ func TestSwitchAfterActiveDegrades(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	now := time.Now()
 
