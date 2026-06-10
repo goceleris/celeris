@@ -62,22 +62,29 @@ type WorkerScaler interface {
 }
 
 // SendfileCapable is an optional interface implemented by engines that
-// support zero-copy file responses via sendfile(2) (epoll) or the io_uring
-// equivalent. The response adapter type-asserts; engines that do not
-// implement it fall back to read+write. See celeris#317.
+// support zero-copy file responses via sendfile(2). The H1 static-file
+// response path type-asserts the engine for it; engines that do not
+// implement it (iouring, std) fall back to the buffered read+write path.
+// See celeris#317. The epoll engine implements it.
 //
-// The fdOut argument is the engine's per-connection socket FD; the
-// caller is responsible for the connState lifecycle (locking, dirty-list
-// membership, timeout tracking) — the engine's sendfile path is purely
-// a syscall shim.
+// The fdOut argument is the engine's per-connection socket FD. The
+// caller drives the connState lifecycle (locking, dirty-list membership,
+// timeout tracking, EAGAIN resume) — the engine's sendfile path is a
+// syscall shim that advances as far as the kernel send buffer allows and
+// reports backpressure for the caller to resume.
 //
 // offset and length describe the slice of the source file to send.
-// length ≤ 0 means "send to EOF." The headers slice is flushed via
-// write(2) before the sendfile loop; engines that can fuse headers
-// into a single iovec may do so.
+// length ≤ 0 means "send to EOF" (the implementation stats the file and
+// uses size-offset). The headers slice, when non-empty, is flushed via
+// write(2) before the sendfile loop begins.
 //
-// Returns the number of body bytes sent (0 on error) and an error.
-// EAGAIN/EWOULDBLOCK are surfaced as errors for the caller to defer.
+// Returns the number of BODY bytes sent on this call and an error. A
+// short send under kernel-send-buffer pressure surfaces
+// EAGAIN/EWOULDBLOCK (via errors.Is) along with the partial body count,
+// so the caller defers and resumes; the returned count is never
+// corrupted on EAGAIN. EINTR is retried internally. The HEAD-request
+// invariant (never send a body) is the caller's responsibility — the
+// caller must not invoke Sendfile for a HEAD request.
 type SendfileCapable interface {
 	Sendfile(fdOut int, file *os.File, offset, length int64, headers []byte) (int64, error)
 }

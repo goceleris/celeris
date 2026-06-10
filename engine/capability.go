@@ -35,14 +35,22 @@ type CapabilityProfile struct {
 	FixedFiles bool
 	// SendZC is true if io_uring zero-copy send is available.
 	SendZC bool
-	// Sendfile is true if sendfile(2) is available for file responses
-	// (Linux 2.6.33+ on the kernel side; always available on every
-	// platform celeris supports).
+	// Sendfile is true if sendfile(2) is available for zero-copy file
+	// responses. True on Linux (kernel 2.6.33+, which every supported
+	// distro is well past); false on non-Linux platforms. The epoll
+	// engine implements engine.SendfileCapable and the H1 static-file
+	// response path uses it (Context.File, middleware/static); engines
+	// without SendfileCapable (iouring, std) fall back to read+write.
 	Sendfile bool
-	// Zerocopy is true if MSG_ZEROCOPY is available for large-body sends
-	// (Linux 4.14+ for UDP, 5.0+ for TCP). Epoll engine uses it on the
-	// large-body send path; iouring has IORING_OP_SEND_ZC (kernel 6.0+)
-	// which is a separate flag (SendZC above).
+	// Zerocopy is true if a MSG_ZEROCOPY userspace-buffer send path is
+	// available. Currently always false: the engine does not ship a
+	// MSG_ZEROCOPY send path (a correct one needs SO_ZEROCOPY +
+	// sendmsg(MSG_ZEROCOPY) + errqueue completion draining + buffer
+	// pinning). sendfile(2) covers the zero-copy file-serving workload
+	// via the Sendfile flag above; iouring has IORING_OP_SEND_ZC (kernel
+	// 6.0+) which is a separate flag (SendZC above). TCP MSG_ZEROCOPY
+	// landed in Linux 4.14, UDP in 5.0 — flip this on (gated at 4.14)
+	// only when the send path is actually implemented.
 	Zerocopy bool
 	// NumCPU is the number of logical CPUs.
 	NumCPU int

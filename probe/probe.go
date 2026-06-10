@@ -92,11 +92,17 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 	// runtime probe (probeSendfile) is a no-op because the syscall can't
 	// fail at registration time, only at call time per file.
 	profile.Sendfile = true
-	// MSG_ZEROCOPY on TCP send paths requires kernel 5.0+. UDP supports
-	// it from 4.14+ but celeris is TCP-only. Gate on 5.0 to be safe.
-	if kv.AtLeast(5, 0) {
-		profile.Zerocopy = true
-	}
+	// MSG_ZEROCOPY landed for TCP send paths in Linux 4.14 (commit
+	// f214f915e7db); UDP support came later, in 5.0 (commit b5947e5d1e71).
+	// celeris is TCP-only, so 4.14 would be the correct floor — BUT the
+	// engine does not currently ship a MSG_ZEROCOPY send path (a correct
+	// implementation needs SO_ZEROCOPY + sendmsg(MSG_ZEROCOPY) + errqueue
+	// completion draining integrated into the event loop + buffer pinning;
+	// see engine/epoll/sendfile.go). Leaving Zerocopy false avoids
+	// advertising a capability the tree does not deliver. sendfile(2)
+	// already provides zero-copy for the file-serving workload. Flip this
+	// to `kv.AtLeast(4, 14)` only when the MSG_ZEROCOPY send path lands.
+	profile.Zerocopy = false
 
 	if kv.AtLeast(2, 6) && sp.ProbeEpoll != nil {
 		profile.EpollAvailable = sp.ProbeEpoll()
@@ -124,8 +130,25 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 			profile.FixedFiles = fixedFiles
 			profile.SendZC = sendZC
 
-			if tier >= engine.Optional && sp.CheckCapSysNice != nil {
-				profile.SQPoll = sqpoll || sp.CheckCapSysNice()
+			// SQPoll (IORING_SETUP_SQPOLL) lands at the Optional tier
+			// (kernel 6.0+), where `sqpoll` from determineTier is already
+			// true. On 6.0+ the basic SQ-polling mode does not require
+			// CAP_SYS_NICE (that requirement was for pinning the poll
+			// thread to a CPU and for pre-5.13 kernels), so the tier flag
+			// alone is the correct gate. The previous `sqpoll ||
+			// CheckCapSysNice()` was a constant-true short-circuit
+			// (CheckCapSysNice never ran) AND the old CheckCapSysNice
+			// implementation mutated the process scheduling priority via
+			// Setpriority — a probe must never have side effects. The
+			// capability is now a genuine read-only check (see
+			// probe_linux.go) and is consulted only when the tier itself
+			// does not already enable SQPoll, so it can never re-disable a
+			// supported feature.
+			if tier >= engine.Optional {
+				profile.SQPoll = sqpoll
+				if !profile.SQPoll && sp.CheckCapSysNice != nil {
+					profile.SQPoll = sp.CheckCapSysNice()
+				}
 			}
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -156,12 +157,32 @@ func putResponseBuffer(p *[]byte) {
 type h1ResponseAdapter struct {
 	write     func([]byte)
 	writeBody func([]byte) // optional scatter-gather body writer (zero-copy body)
+	// sendFile, when non-nil, drives a zero-copy sendfile(2) response on
+	// the owning engine. It receives the pre-built response header block
+	// (status line + date + headers + framing, ending in the blank CRLF)
+	// and the file slice to transfer. The engine takes responsibility for
+	// the file slice from the call onward (it dups the descriptor), so the
+	// caller may close its own *os.File once WriteFileResponse returns.
+	// Installed by sendfile-capable engines (epoll); nil elsewhere, which
+	// makes WriteFileResponse decline (handled=false) so the caller falls
+	// back to the buffered path. Only set in non-async mode — the async
+	// dispatch goroutine would race the worker on the sendfile state.
+	sendFile  func(header []byte, file *os.File, offset, length int64) error
 	keepAlive bool
 	isHEAD    bool
 	hijackFn  func() (net.Conn, error)
 	hijacked  bool
 	respBuf   []byte // per-connection reusable response buffer, avoids sync.Pool per request
 }
+
+// sendfileThreshold is the minimum body size at which the H1 response
+// path prefers sendfile(2) over a buffered write. Below ~16 KiB a
+// buffered write coalesces with the header block into a single send and
+// avoids the extra sendfile syscall (and the loss of header+body fusion);
+// the zero-copy win only materialises for larger bodies. Static-file
+// benchmarks and the kernel's own small-send copy threshold both put the
+// crossover in this neighbourhood.
+const sendfileThreshold = 16 << 10
 
 func (a *h1ResponseAdapter) Hijack(_ *stream.Stream) (net.Conn, error) {
 	if a.hijackFn == nil {
@@ -175,6 +196,7 @@ func (a *h1ResponseAdapter) Hijack(_ *stream.Stream) (net.Conn, error) {
 }
 
 var _ stream.Hijacker = (*h1ResponseAdapter)(nil)
+var _ stream.FileResponder = (*h1ResponseAdapter)(nil)
 
 // mustFrameEmptyBody reports whether an HTTP/1.1 response with no body
 // requires explicit framing (Content-Length: 0 or Transfer-Encoding) on
@@ -363,6 +385,101 @@ func (a *h1ResponseAdapter) WriteResponse(_ *stream.Stream, status int, headers 
 	a.write(buf)
 	a.respBuf = buf
 	return nil
+}
+
+// appendFileResponseHead builds the H1 response header block for a
+// sendfile body: status line + date, the caller's headers (with cached
+// content-type lines reused), an injected content-length of bodyLen
+// unless the caller already supplied one, the connection-close line when
+// not keep-alive, and the terminating blank CRLF. It mirrors the general
+// (non-fast) path of WriteResponse so a sendfile response is byte-for-byte
+// equivalent to the buffered response that would otherwise be emitted.
+func (a *h1ResponseAdapter) appendFileResponseHead(buf []byte, status int, headers [][2]string, bodyLen int64) []byte {
+	if status == 200 {
+		buf = appendCachedStatus200Date(buf)
+	} else {
+		buf = appendStatusLine(buf, status)
+		buf = appendCachedDate(buf)
+	}
+	hasContentLength := false
+	for _, h := range headers {
+		if h[0] == "content-length" {
+			hasContentLength = true
+		}
+		if h[0] == "content-type" {
+			switch h[1] {
+			case "application/json":
+				buf = append(buf, ctJSON...)
+				continue
+			case "text/plain":
+				buf = append(buf, ctPlain...)
+				continue
+			case "text/html; charset=utf-8":
+				buf = append(buf, ctHTML...)
+				continue
+			case "application/xml":
+				buf = append(buf, ctXML...)
+				continue
+			case "application/octet-stream":
+				buf = append(buf, ctOctet...)
+				continue
+			}
+		}
+		// Headers reach this path pre-validated CRLF-free (same invariant
+		// as WriteResponse — Context.Set* sanitize at set time).
+		buf = append(buf, h[0]...)
+		buf = append(buf, ": "...)
+		buf = append(buf, h[1]...)
+		buf = append(buf, crlf...)
+	}
+	if !hasContentLength {
+		buf = append(buf, clPrefix...)
+		buf = strconv.AppendInt(buf, bodyLen, 10)
+		buf = append(buf, crlf...)
+	}
+	if !a.keepAlive {
+		buf = append(buf, "connection: close\r\n"...)
+	}
+	return append(buf, crlf...)
+}
+
+// WriteFileResponse implements stream.FileResponder. It serves [offset,
+// offset+length) of file as the response body via the engine's zero-copy
+// sendfile(2) path. Returns handled=false (emitting nothing) when the
+// zero-copy path is unavailable or unwanted — no sendfile hook installed
+// (engine not sendfile-capable, or async mode), or the body is below
+// sendfileThreshold — so the caller falls back to the buffered path.
+//
+// The HEAD-request invariant is enforced here: for HEAD we emit the
+// header block (with the correct content-length) and NO body bytes, and
+// we never invoke the sendfile hook.
+func (a *h1ResponseAdapter) WriteFileResponse(_ *stream.Stream, status int, headers [][2]string, file *os.File, offset, length int64) (bool, error) {
+	if a.sendFile == nil {
+		return false, nil
+	}
+	// HEAD: headers only, no body, no sendfile. Build + write the header
+	// block (content-length reflects the would-be GET body size) and return
+	// handled — the caller must not also write a body.
+	if a.isHEAD {
+		buf := a.respBuf[:0]
+		buf = a.appendFileResponseHead(buf, status, headers, length)
+		a.write(buf)
+		a.respBuf = buf
+		return true, nil
+	}
+	if length < sendfileThreshold {
+		// Small body: a buffered write coalesces header+body better than a
+		// separate sendfile syscall. Decline so the caller uses read+write.
+		return false, nil
+	}
+	// Build the header block into a fresh buffer (NOT a.respBuf — the
+	// engine keeps the header slice referenced until the sendfile drains,
+	// and a.respBuf is reused by the next response on this conn).
+	header := a.appendFileResponseHead(nil, status, headers, length)
+	if err := a.sendFile(header, file, offset, length); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // h2ReserveSend atomically reserves AND debits up to n bytes of send credit for
