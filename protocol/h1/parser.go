@@ -7,16 +7,26 @@ import (
 
 // H1 parser sentinel errors.
 var (
-	ErrBufferExhausted        = errors.New("buffer exhausted")
-	ErrInvalidRequestLine     = errors.New("invalid request line")
-	ErrInvalidHeader          = errors.New("invalid header line")
-	ErrMissingHost            = errors.New("missing Host header")
-	ErrUnsupportedVersion     = errors.New("unsupported HTTP version")
-	ErrHeadersTooLarge        = errors.New("headers too large")
-	ErrTooManyHeaders         = errors.New("too many headers")
-	ErrInvalidContentLength   = errors.New("invalid content-length")
-	ErrDuplicateContentLength = errors.New("duplicate content-length with conflicting values")
+	ErrBufferExhausted         = errors.New("buffer exhausted")
+	ErrInvalidRequestLine      = errors.New("invalid request line")
+	ErrInvalidHeader           = errors.New("invalid header line")
+	ErrMissingHost             = errors.New("missing Host header")
+	ErrUnsupportedVersion      = errors.New("unsupported HTTP version")
+	ErrHeadersTooLarge         = errors.New("headers too large")
+	ErrTooManyHeaders          = errors.New("too many headers")
+	ErrInvalidContentLength    = errors.New("invalid content-length")
+	ErrDuplicateContentLength  = errors.New("duplicate content-length with conflicting values")
+	ErrRequestLineTooLong      = errors.New("request line too long")
+	ErrConflictingFraming      = errors.New("both content-length and transfer-encoding present")
+	ErrInvalidTransferEncoding = errors.New("invalid transfer-encoding")
 )
+
+// MaxRequestLineSize bounds the request line (method + URI + version). 8 KiB
+// matches nginx's default large_client_header_buffers single-buffer size. The
+// header block has its own MaxHeaderSize / MaxHeaderCount caps; without this
+// the request line could grow to the whole read buffer (long-URI DoS). Exceeding
+// it maps to 414 URI Too Long.
+const MaxRequestLineSize = 8 << 10
 
 // Parser is a zero-allocation HTTP/1.x request parser.
 type Parser struct {
@@ -94,6 +104,10 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 			req.Headers = make([][2]string, 0, 16)
 		}
 	}
+	// Reset RawHeaders alongside Headers: appendHeader appends to RawHeaders,
+	// so a caller reusing *Request via ParseRequest without Request.Reset would
+	// otherwise leak the prior request's raw headers into this one.
+	req.RawHeaders = req.RawHeaders[:0]
 	req.ContentLength = -1
 	req.KeepAlive = req.Version == sHTTP11
 
@@ -128,7 +142,16 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 func (p *Parser) parseRequestLine(req *Request) (bool, error) {
 	lineEnd := bytes.Index(p.buf[p.pos:], bCRLF)
 	if lineEnd == -1 {
+		// No CRLF yet. If what we have already exceeds the bound, the line is
+		// too long regardless of what follows — reject now rather than buffering
+		// an unbounded request line (long-URI DoS).
+		if len(p.buf)-p.pos > MaxRequestLineSize {
+			return false, ErrRequestLineTooLong
+		}
 		return false, nil
+	}
+	if lineEnd > MaxRequestLineSize {
+		return false, ErrRequestLineTooLong
 	}
 	line := p.buf[p.pos : p.pos+lineEnd]
 	p.pos += lineEnd + 2
@@ -186,11 +209,91 @@ func (p *Parser) parseHeaders(req *Request) (bool, error) {
 		if colonIdx == -1 {
 			return false, ErrInvalidHeader
 		}
-		rawName := trimSpace(line[:colonIdx])
+		// RFC 9112 §5.1: no whitespace is allowed between the field-name and
+		// the colon — a server MUST reject it (400). A byte immediately before
+		// the colon that is SP/HTAB means the name carries trailing whitespace.
+		if colonIdx == 0 || line[colonIdx-1] == ' ' || line[colonIdx-1] == '\t' {
+			return false, ErrInvalidHeader
+		}
+		rawName := line[:colonIdx]
+		// Value OWS (leading/trailing SP/HTAB) is stripped per RFC 9112 §5.1.
 		rawValue := trimSpace(line[colonIdx+1:])
+		// RFC 9110 §5.1/§5.5: field-name must be all tchar; field-value must
+		// not contain controls (NUL, bare CR, ...) except HTAB. Reject both —
+		// bare CR in a value is a response-splitting primitive.
+		if !isValidHeaderName(rawName) || !isValidHeaderValue(rawValue) {
+			return false, ErrInvalidHeader
+		}
 		if err := p.appendHeader(req, rawName, rawValue); err != nil {
 			return false, err
 		}
+	}
+}
+
+// transferEncodingIsChunked applies RFC 9112 §6.1/§6.3 token-list semantics to
+// a Transfer-Encoding value. The value is a comma-separated list of transfer-
+// codings; the message is chunked iff the LAST non-empty coding is "chunked"
+// (case-insensitive). A substring like "xchunkedx" is NOT chunked, and
+// "chunked" in a non-final position (e.g. "chunked, gzip") is malformed.
+//
+// Returns (true, nil) when chunked is the final coding, (false, nil) when no
+// "chunked" token appears at all, and (false, err) when a "chunked" token is
+// present but not last (malformed framing — a smuggling vector).
+func transferEncodingIsChunked(value []byte) (bool, error) {
+	var lastTok []byte
+	var sawChunkedNotLast bool
+	b := value
+	for {
+		idx := bytes.IndexByte(b, ',')
+		var tok []byte
+		if idx < 0 {
+			tok = trimSpace(b)
+		} else {
+			tok = trimSpace(b[:idx])
+		}
+		if len(tok) > 0 {
+			if lastTok != nil && asciiEqualFold(lastTok, "chunked") {
+				// A "chunked" we previously recorded is followed by another
+				// coding → chunked is not last.
+				sawChunkedNotLast = true
+			}
+			lastTok = tok
+		}
+		if idx < 0 {
+			break
+		}
+		b = b[idx+1:]
+	}
+	if lastTok == nil {
+		return false, nil // empty / whitespace-only value
+	}
+	lastIsChunked := asciiEqualFold(lastTok, "chunked")
+	if sawChunkedNotLast || (!lastIsChunked && teListContainsChunked(value)) {
+		return false, ErrInvalidTransferEncoding
+	}
+	return lastIsChunked, nil
+}
+
+// teListContainsChunked reports whether any token in the comma-separated TE
+// value equals "chunked" (case-insensitive). Used only to distinguish a
+// genuinely chunkless TE ("gzip") from a malformed one ("chunked, gzip").
+func teListContainsChunked(value []byte) bool {
+	b := value
+	for {
+		idx := bytes.IndexByte(b, ',')
+		var tok []byte
+		if idx < 0 {
+			tok = trimSpace(b)
+		} else {
+			tok = trimSpace(b[:idx])
+		}
+		if asciiEqualFold(tok, "chunked") {
+			return true
+		}
+		if idx < 0 {
+			return false
+		}
+		b = b[idx+1:]
 	}
 }
 
@@ -211,8 +314,10 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 			req.Host = value
 		case "content-length":
 			if req.ChunkedEncoding {
-				// RFC 7230 §3.3.3: if Transfer-Encoding is present, Content-Length is ignored
-				return nil
+				// RFC 9112 §6.3: a message with both Transfer-Encoding and
+				// Content-Length is malformed (a smuggling vector when
+				// intermediaries disagree on framing) — reject with 400.
+				return ErrConflictingFraming
 			}
 			cl, ok := parseInt64Bytes(rawValue)
 			if !ok {
@@ -223,7 +328,14 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 			}
 			req.ContentLength = cl
 		case "transfer-encoding":
-			if asciiContainsFoldString(value, "chunked") {
+			chunked, terr := transferEncodingIsChunked(rawValue)
+			if terr != nil {
+				return terr
+			}
+			if chunked {
+				if req.ContentLength >= 0 {
+					return ErrConflictingFraming
+				}
 				req.ChunkedEncoding = true
 				req.ContentLength = -1
 			}
@@ -254,7 +366,8 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 	case 'c':
 		if asciiEqualFold(rawName, "Content-Length") {
 			if req.ChunkedEncoding {
-				return nil
+				// RFC 9112 §6.3: CL + TE is malformed — reject (400).
+				return ErrConflictingFraming
 			}
 			cl, ok := parseInt64Bytes(rawValue)
 			if !ok {
@@ -276,7 +389,14 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 		}
 	case 't':
 		if asciiEqualFold(rawName, "Transfer-Encoding") {
-			if asciiContainsFoldBytes(rawValue, "chunked") {
+			chunked, terr := transferEncodingIsChunked(rawValue)
+			if terr != nil {
+				return terr
+			}
+			if chunked {
+				if req.ContentLength >= 0 {
+					return ErrConflictingFraming
+				}
 				req.ChunkedEncoding = true
 				req.ContentLength = -1
 			}
