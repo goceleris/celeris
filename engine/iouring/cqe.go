@@ -9,7 +9,19 @@ type completionEntry struct {
 	Flags    uint32
 }
 
-// UserData encoding: upper 8 bits = op tag, lower 56 bits = fd.
+// UserData encoding (v1.5.0, review 2.6): a per-conn generation tag is
+// folded between the op and fd so a late/in-flight CQE from a CLOSED
+// connection cannot be misattributed to a NEW connection that has since
+// reused the same fd (or fixed-file slot).
+//
+//	bits 56-63 (8)  : op tag      (udMask)
+//	bits 40-47 (8)  : generation  (genMask) — connState.generation, conn-bound ops only
+//	bits  0-39 (40) : fd / fixed-file index (fdMask)
+//
+// 40 bits comfortably covers every real fd and fixed-file index (both
+// < 65536 in practice). gen=0 is used for ops that are NOT bound to a
+// connState (accept on listenFD, the H2 wakeup eventfd, the udProvide
+// cancel sentinel, and the driver ops which have their own lifecycle).
 const (
 	udAccept uint64 = 0x01 << 56
 	udRecv   uint64 = 0x02 << 56
@@ -37,15 +49,32 @@ const (
 	udDriverSend  uint64 = 0x11 << 56
 	udDriverClose uint64 = 0x12 << 56
 	udMask        uint64 = 0xFF << 56
-	fdMask        uint64 = (1 << 56) - 1
+	genShift             = 40
+	genMask       uint64 = 0xFF << genShift
+	fdMask        uint64 = (1 << 40) - 1
 )
 
+// encodeUserData encodes a NON-conn-bound op (gen=0). Used for accept
+// (listenFD, no conn yet), udH2Wakeup (global eventfd), udProvide (the
+// cancel sentinel) and the driver ops (separate lifecycle).
 func encodeUserData(op uint64, fd int) uint64 {
 	return op | (uint64(fd) & fdMask)
 }
 
+// encodeUserDataGen encodes a CONN-BOUND op, stamping the owning
+// connState's generation so a stale CQE from a prior fd occupant is
+// detectable at dispatch (see decodeGen). gen=0 collapses to the same
+// value encodeUserData would produce.
+func encodeUserDataGen(op uint64, fd int, gen uint8) uint64 {
+	return op | (uint64(gen) << genShift) | (uint64(fd) & fdMask)
+}
+
 func decodeOp(userData uint64) uint64 {
 	return userData & udMask
+}
+
+func decodeGen(userData uint64) uint8 {
+	return uint8((userData & genMask) >> genShift)
 }
 
 func decodeFD(userData uint64) int {

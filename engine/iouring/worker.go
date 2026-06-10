@@ -55,12 +55,15 @@ const bufRingGroupID = 0
 // there. See resolveBufRingCount for the full rationale.
 const bufRingCountMin = 1024
 
-// bufRingCountMax caps the scaled provided-buffer-ring size to keep the
-// mmap'd region (count × BufferSize) within sane RSS bounds. At the
-// default 8 KiB BufferSize this is 2 MiB of buffer memory per worker —
-// negligible against the ring's own ~12 MB RLIMIT_MEMLOCK cost. Operators
-// with unusual workloads can override via the env var.
-const bufRingCountMax = 1 << 18 // 256 Ki entries × 8 KiB = 2 GiB worst case
+// bufRingCountMax caps the scaled provided-buffer-ring size. The hard
+// ceiling is the kernel's IORING_REGISTER_PBUF_RING limit of 32768
+// entries (a ring larger than that is rejected by the kernel) — which is
+// also the largest count the uint16 tail/mask/bid arithmetic in
+// BufferRing can address. At the default 8 KiB BufferSize this is 256 MiB
+// of buffer memory per worker at the absolute max; the auto-scaling
+// formula stays far below this in practice. Operators with unusual
+// workloads can override via the env var, but never past this cap.
+const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (kernel PBUF_RING cap)
 
 // CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled provided-buffer-ring
 // size. Must be a power of 2 and at least bufRingCountMin. Use this when
@@ -72,13 +75,20 @@ const bufRingCountMax = 1 << 18 // 256 Ki entries × 8 KiB = 2 GiB worst case
 const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 
 // resolveBufRingCount picks the provided-buffer-ring size for a worker.
-// The default formula is `nextPowerOf2(max(bufRingCountMin, 2 * Workers *
+// The default formula is `nextPowerOf2(max(bufRingCountMin, 2 *
 // TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
 // steady-state target — enough headroom that the kernel rarely stalls
 // waiting for buffer returns. Above 1024 conns the previous hard-coded
 // 1024 was too small: buffers were reused aggressively, the kernel
 // stalled, and the very behaviour the ring is designed to optimise
 // (multishot recv CQE batching) collapsed into CQE storms (celeris#322).
+//
+// The ring is PER-WORKER: NewBufferRing is created once per Worker on its
+// own ring, so the scaling MUST be driven by the per-worker conn target,
+// NOT by the engine-wide Workers count. Multiplying by Workers over-sized
+// every worker's ring by the worker count, wasting count×BufferSize of
+// mmap'd RSS per worker and risking the kernel cap on large boxes
+// (celeris#322 follow-up).
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
 func resolveBufRingCount(resolved resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
 	if v := os.Getenv(envPbufCount); v != "" {
@@ -93,7 +103,7 @@ func resolveBufRingCount(resolved resource.ResolvedResources, scalerTargetConnsP
 	if target <= 0 {
 		target = 20 // mirrors scaler.Resolve's default
 	}
-	scaled := 2 * resolved.Workers * target
+	scaled := 2 * target
 	if scaled < bufRingCountMin {
 		scaled = bufRingCountMin
 	}
@@ -567,13 +577,22 @@ func (w *Worker) run(ctx context.Context) {
 				fd := int(ud & fdMask)
 				switch ud & udMask {
 				case udRecv:
-					w.handleRecv(entry, fd, now)
+					// Generation gate (review 2.6): drop a stale CQE from a
+					// prior fd occupant (recycling its provided buffer)
+					// before routing to the handler.
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleRecv(entry, fd, now)
+					}
 				case udSend:
-					w.handleSend(entry, fd, now)
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleSend(entry, fd, now)
+					}
 				case udAccept:
 					w.handleAccept(ctx, entry, fd, now)
 				case udClose:
-					w.handleClose(fd)
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleClose(fd)
+					}
 				case udH2Wakeup:
 					w.handleH2Wakeup()
 				case udHeaderTimer:
@@ -581,7 +600,9 @@ func (w *Worker) run(ctx context.Context) {
 					// (which has the same case) is only called from
 					// the cancel path. Without this case, slowloris-
 					// defence timer CQEs are silently dropped.
-					w.handleHeaderTimer(fd)
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleHeaderTimer(fd)
+					}
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -656,7 +677,16 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				sqFull := w.flushSend(cs)
 				if cs.needsRecv && !cs.recvPaused {
-					if w.prepareRecv(cs.fd, cs.buf) {
+					// Arm via pickRecvTarget so a deferred BODY recv re-arms
+					// into the H1 bodyBuf with cs.recvIntoBody set, instead of
+					// blindly re-arming into cs.buf. Re-arming into cs.buf
+					// while recvIntoBody stayed true made handleRecv take the
+					// body branch on a cs.buf-sized CQE and corrupt the body
+					// (v1.5.0 review 2.4). pickRecvTarget MUTATES recvIntoBody,
+					// so call it exactly once per arm; it is idempotent across
+					// SQ-full retries because NextRecvBuf returns the same tail
+					// while bodyBuf state is unchanged.
+					if w.prepareRecv(cs.fd, w.pickRecvTarget(cs), cs.generation) {
 						cs.needsRecv = false
 					}
 				}
@@ -708,7 +738,14 @@ func (w *Worker) run(ctx context.Context) {
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
 		// Combined paused: engine-wide OR per-worker (dynamic scaler).
-		if w.listenFD < 0 && w.connCount == 0 && (w.acceptPaused.Load() || w.inactive.Load()) {
+		//
+		// hasDriverConns gate: connCount only counts HTTP conns. An
+		// EventLoopProvider driver may still have live conns in
+		// w.driverConns even when connCount==0; suspending the worker would
+		// park its event loop and starve those driver conns of CQE
+		// servicing. Stay active while any driver conn is registered (v1.5.0
+		// review 2.10).
+		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && (w.acceptPaused.Load() || w.inactive.Load()) {
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() && !w.inactive.Load() {
 				w.wakeMu.Unlock()
@@ -729,22 +766,63 @@ func (w *Worker) run(ctx context.Context) {
 	}
 }
 
+// staleConnCQE reports whether c is a late/in-flight CQE from a PRIOR
+// occupant of fd (review 2.6). A CQE is stale when the slot is empty
+// (cs == nil) or the conn currently at fd has a different generation than
+// the one stamped into the CQE's user_data at SQE-submission time. Only
+// conn-bound ops (udRecv/udSend/udClose/udHeaderTimer) carry a generation;
+// callers must not invoke this for non-conn-bound ops.
+//
+// CRITICAL: a stale recv CQE may still own a provided ring buffer. Dropping
+// it without returning the buffer leaks a ring entry → ENOBUFS → the
+// CQE-storm regression (celeris#322). When stale, we therefore recycle the
+// buffer exactly as handleRecv's unknown/closing branch does (PushBuffer +
+// hasBufReturns, published once per loop pass). The recycle is keyed on the
+// CQE flags, not the conn, so it is correct even though the conn is gone.
+func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
+	var cs *connState
+	if fd >= 0 && fd < len(w.conns) {
+		cs = w.conns[fd]
+	}
+	if cs != nil && cs.generation == decodeGen(ud) {
+		return false
+	}
+	if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+		w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+		w.hasBufReturns = true
+	}
+	return true
+}
+
 func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) {
-	op := decodeOp(c.UserData)
-	fd := decodeFD(c.UserData)
+	ud := c.UserData
+	op := decodeOp(ud)
+	fd := decodeFD(ud)
 
 	switch op {
 	case udRecv:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleRecv(c, fd, now)
 	case udSend:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleSend(c, fd, now)
 	case udClose:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleClose(fd)
 	case udAccept:
 		w.handleAccept(ctx, c, fd, now)
 	case udH2Wakeup:
 		w.handleH2Wakeup()
 	case udHeaderTimer:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleHeaderTimer(fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
@@ -860,7 +938,7 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 		}
 	}
 	prepTimeout(sqe, unsafe.Pointer(&cs.headerTimerSpec), 0, 0)
-	setSQEUserData(sqe, encodeUserData(udHeaderTimer, cs.fd))
+	setSQEUserData(sqe, encodeUserDataGen(udHeaderTimer, cs.fd, cs.generation))
 	cs.headerTimerArmed = true
 }
 
@@ -922,7 +1000,16 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			return
 		}
 		w.errCount.Add(1)
-		if w.listenFD >= 0 && !w.tier.SupportsMultishotAccept() {
+		// Re-arm accept whenever the kernel is not going to deliver more
+		// CQEs from the current SQE. In single-shot mode !cqeHasMore is
+		// always true (each accept produces exactly one CQE), so this
+		// preserves the old single-shot re-arm. In multishot mode an error
+		// CQE clears F_MORE to signal the multishot was terminated — and
+		// without this re-arm the worker would permanently stop accepting
+		// (the old `!SupportsMultishotAccept()` guard never re-armed in
+		// multishot mode, silently killing accept on a transient ENOMEM /
+		// EMFILE). See celeris v1.5.0 review 2.1.
+		if w.listenFD >= 0 && !cqeHasMore(c.Flags) {
 			w.prepareAccept()
 		}
 		return
@@ -980,7 +1067,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 
 	w.conns[newFD] = cs
 	w.connCount++
-	w.addLiveConn(newFD)
+	w.addLiveConn(cs)
 	if newFD > w.maxFD {
 		w.maxFD = newFD
 	}
@@ -994,8 +1081,8 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	cs.lastActivity = now
 
 	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
-	// upgrades too", so route it through detectProtocol (like Auto) on the
-	// first recv rather than locking cs.protocol=H2C on accept. Without
+	// upgrades too", so route it through the recv-time detection path (like
+	// Auto) rather than locking cs.protocol=H2C on accept. Without
 	// this, the first HTTP/1.1 upgrade request was fed to ProcessH2 and
 	// the PRI-preface check silently failed, leaving the client with 27
 	// bytes of server SETTINGS frame and no 101 Switching Protocols
@@ -1006,28 +1093,10 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		cs.detected = true
 		w.initProtocol(cs)
 	}
-	if !w.prepareRecv(newFD, cs.buf) {
+	if !w.prepareRecv(newFD, cs.buf, cs.generation) {
 		cs.needsRecv = true
 		w.markDirty(cs)
 	}
-}
-
-// detectProtocol performs protocol detection on the first received bytes.
-// Returns true if detection succeeded and the data should be processed.
-func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
-	proto, err := detect.Detect(data)
-	if err != nil {
-		if err == detect.ErrInsufficientData {
-			// Need more data — re-arm recv. The data is already in cs.buf
-			// so we don't lose it; the next recv appends after it.
-			return false
-		}
-		return false
-	}
-	cs.protocol.Store(int32(proto))
-	cs.detected = true
-	w.initProtocol(cs)
-	return true
 }
 
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
@@ -1041,8 +1110,8 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
+	w.removeLiveConn(cs)
 	w.conns[fd] = nil
-	w.removeLiveConn(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 	releaseConnState(cs)
@@ -1351,7 +1420,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if c.Res == -105 && w.bufRing != nil {
 			w.bufRing.PublishBuffers()
 			if !cs.recvPaused {
-				if !w.prepareRecv(fd, cs.buf) {
+				if !w.prepareRecv(fd, cs.buf, cs.generation) {
 					cs.needsRecv = true
 					w.markDirty(cs)
 				}
@@ -1386,7 +1455,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		complete := cs.h1State.ConsumeBodyRecv(int(c.Res))
 		if !complete {
 			if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-				if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+				if !w.prepareRecv(fd, w.pickRecvTarget(cs), cs.generation) {
 					cs.needsRecv = true
 					w.markDirty(cs)
 				}
@@ -1439,7 +1508,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			mu.Unlock()
 		}
 		if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-			if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+			if !w.prepareRecv(fd, w.pickRecvTarget(cs), cs.generation) {
 				cs.needsRecv = true
 				w.markDirty(cs)
 			}
@@ -1463,20 +1532,54 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
-		if !w.detectProtocol(cs, data) {
-			// Need more data or unknown protocol — re-arm recv.
+		// Accumulate across recvs so a protocol prefix that spans multiple
+		// packets (notably the 24-byte H2 client preface) is not lost. The
+		// single-shot path re-arms into cs.buf at offset 0 and the bufRing
+		// path returns each provided buffer, so the only durable place to
+		// hold partial bytes is cs.detectAccum (a Go-heap buffer the kernel
+		// never targets). The fast common case — detection resolves on the
+		// first recv — pays no copy (v1.5.0 review 2.8).
+		detectData := data
+		if len(cs.detectAccum) > 0 {
+			cs.detectAccum = append(cs.detectAccum, data...)
+			detectData = cs.detectAccum
+		}
+		proto, derr := detect.Detect(detectData)
+		if derr != nil {
+			// ErrInsufficientData (more bytes needed) AND ErrUnknownProtocol
+			// both re-arm recv and wait — matching the pre-2.8 behavior
+			// (the slowloris header timer / idle timeout reaps a conn that
+			// never produces recognizable bytes). The ONLY change here is
+			// that partial bytes are preserved in cs.detectAccum across
+			// recvs instead of being overwritten at cs.buf offset 0.
+			if derr == detect.ErrInsufficientData && len(cs.detectAccum) == 0 {
+				// First partial recv — begin accumulating.
+				cs.detectAccum = append(cs.detectAccum, data...)
+			}
 			if hasProvidedBuf {
-				// Early return: publish immediately since we're skipping the
-				// normal CQE drain loop's batch publish (P0).
+				// Provided-buffer bytes are now copied into detectAccum (for
+				// the ErrInsufficientData path); return the buffer to the
+				// kernel (early — we skip the normal batch publish, P0).
 				w.bufRing.ReturnBuffer(providedBufID)
 			}
 			if !cqeHasMore(c.Flags) {
-				if !w.prepareRecv(fd, cs.buf) {
+				if !w.prepareRecv(fd, cs.buf, cs.generation) {
 					cs.needsRecv = true
 					w.markDirty(cs)
 				}
 			}
 			return
+		}
+		cs.protocol.Store(int32(proto))
+		cs.detected = true
+		w.initProtocol(cs)
+		// If we accumulated across recvs, hand the FULL accumulated prefix
+		// (not just this last recv) to the protocol handler below. Reset the
+		// accumulator header; `data`'s own slice header keeps the backing
+		// array alive for the rest of this function.
+		if len(cs.detectAccum) > 0 {
+			data = cs.detectAccum
+			cs.detectAccum = cs.detectAccum[:0]
 		}
 	}
 
@@ -1542,7 +1645,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.armHeaderTimer(cs)
 		}
 		if !cqeHasMore(c.Flags) && !cs.recvPaused {
-			if !w.prepareRecv(fd, cs.buf) {
+			if !w.prepareRecv(fd, cs.buf, cs.generation) {
 				cs.needsRecv = true
 				w.markDirty(cs)
 			}
@@ -1625,7 +1728,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 				// occasionally lose END_STREAM delivery for later streams
 				// (observed as flaky TestH2CUpgradeSubsequentStreams/iouring).
 				if !cqeHasMore(c.Flags) && !cs.recvLinked {
-					if !w.prepareRecv(fd, cs.buf) {
+					if !w.prepareRecv(fd, cs.buf, cs.generation) {
 						cs.needsRecv = true
 						w.markDirty(cs)
 					}
@@ -1771,7 +1874,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
 	// Don't re-arm if recv is paused (WebSocket backpressure).
 	if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-		if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+		if !w.prepareRecv(fd, w.pickRecvTarget(cs), cs.generation) {
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
@@ -1928,7 +2031,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		if cs.needsRecv && !cs.recvPaused {
-			if w.prepareRecv(fd, cs.buf) {
+			if w.prepareRecv(fd, cs.buf, cs.generation) {
 				cs.needsRecv = false
 			} else {
 				w.markDirty(cs)
@@ -2115,8 +2218,12 @@ func (w *Worker) drainPendingRelease() {
 
 func (w *Worker) finishClose(fd int) {
 	cs := w.conns[fd]
+	// Remove from liveConns BEFORE niling w.conns[fd]: removeLiveConn swaps
+	// the last live entry into cs.liveIdx and updates that swapped-in
+	// connState's liveIdx via w.conns[swappedFD], so the conns slice must
+	// still be intact (v1.5.0 review 1.8 hazard).
+	w.removeLiveConn(cs)
 	w.conns[fd] = nil
-	w.removeLiveConn(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 
@@ -2141,10 +2248,19 @@ func (w *Worker) finishClose(fd int) {
 
 	if fixedFile {
 		// Fixed file: close via io_uring direct close (no real FD to shutdown).
+		// Stamp the closing conn's generation so its close CQE is matched to
+		// THIS occupant — a stale close-error CQE for a freed+reused slot is
+		// dropped at dispatch before reaching handleClose, so it can no longer
+		// nil the new occupant (review 2.2 error path). cs is still valid here:
+		// queuePendingRelease only DEFERS releaseConnState.
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
 			prepCloseDirect(sqe, fd)
-			setSQEUserData(sqe, encodeUserData(udClose, fd))
+			gen := uint8(0)
+			if cs != nil {
+				gen = cs.generation
+			}
+			setSQEUserData(sqe, encodeUserDataGen(udClose, fd, gen))
 		}
 		// Explicitly reset the fixed file slot to -1 so the kernel's
 		// IORING_FILE_INDEX_ALLOC allocator can reuse it. Without this,
@@ -2201,8 +2317,10 @@ func (w *Worker) finishCloseAny(fd int, cs *connState) {
 // WITHOUT returning the connState to the pool. Used when a detached goroutine
 // still holds closure references to the connState.
 func (w *Worker) finishCloseDetached(fd int, cs *connState) {
+	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
+	// finishClose — removeLiveConn touches w.conns[swappedFD]).
+	w.removeLiveConn(cs)
 	w.conns[fd] = nil
-	w.removeLiveConn(fd)
 	w.connCount--
 	w.activeConns.Add(-1)
 
@@ -2234,7 +2352,9 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
 			prepCloseDirect(sqe, fd)
-			setSQEUserData(sqe, encodeUserData(udClose, fd))
+			// Stamp the closing conn's generation (review 2.2 error path) —
+			// cs is the non-nil param and stays valid (deferred release).
+			setSQEUserData(sqe, encodeUserDataGen(udClose, fd, cs.generation))
 		}
 		_ = w.ring.UpdateFixedFile(fd, -1)
 		return
@@ -2313,7 +2433,7 @@ func (w *Worker) promoteConnToAsync(cs *connState, fd int, stashed []byte, c *co
 		w.armHeaderTimer(cs)
 	}
 	if !cqeHasMore(c.Flags) && !cs.recvPaused {
-		if !w.prepareRecv(fd, cs.buf) {
+		if !w.prepareRecv(fd, cs.buf, cs.generation) {
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
@@ -2648,7 +2768,7 @@ func (w *Worker) prepareAccept() {
 // prepareRecv submits a recv SQE. Uses multishot recv with ring-mapped provided
 // buffers when available; falls back to single-shot per-connection buffer recv.
 // Returns true if the SQE was submitted, false if the SQ ring was full.
-func (w *Worker) prepareRecv(fd int, buf []byte) bool {
+func (w *Worker) prepareRecv(fd int, buf []byte, gen uint8) bool {
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		return false
@@ -2658,7 +2778,7 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 	} else {
 		prepRecv(sqe, fd, buf)
 	}
-	setSQEUserData(sqe, encodeUserData(udRecv, fd))
+	setSQEUserData(sqe, encodeUserDataGen(udRecv, fd, gen))
 	return true
 }
 
@@ -2671,6 +2791,11 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 // cs.buf path is picked.
 func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	cs.recvIntoBody = false
+	// Drop any prior body-recv pin: pickRecvTarget is only invoked to arm a
+	// NEW recv, which means the previous (single-shot) recv already
+	// completed, so no kernel SQE still targets the old bodyBuf array. The
+	// body path below re-sets the pin when it arms into bodyBuf again.
+	cs.bodyRecvPin = nil
 	// Async mode: the dispatch goroutine owns h1State; the worker cannot
 	// safely observe NextRecvBuf without synchronization. Always use
 	// cs.buf so the goroutine handles body accumulation on its side.
@@ -2682,6 +2807,12 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	}
 	if b := cs.h1State.NextRecvBuf(); b != nil {
 		cs.recvIntoBody = true
+		// Pin the bodyBuf backing array (b shares it) so a later
+		// conn.CloseH1 → state.bodyBuf=nil cannot let GC reclaim it while
+		// this recv SQE is still in flight (#256 body-buffer UAF; see
+		// connState.bodyRecvPin). Released by releaseConnState after the
+		// pendingRelease window drains.
+		cs.bodyRecvPin = b
 		return b
 	}
 	return cs.buf
@@ -2749,11 +2880,24 @@ func (w *Worker) drainDetachQueue() {
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
 			if desired {
 				if sqe := w.ring.GetSQE(); sqe != nil {
-					prepCancelFDSkipSuccess(sqe, cs.fd)
+					// Cancel the in-flight recv. cs.fd is a fixed-file
+					// INDEX when fixed files are on, so cancelling by raw
+					// fd would match nothing; match by the recv's
+					// user_data instead, which is unambiguous in both
+					// modes (v1.5.0 review 2.5). The match MUST include the
+					// conn's generation — the recv SQE carries it (review
+					// 2.6), so a gen-less target would match nothing. The
+					// cancel SQE itself carries the udProvide tag so the
+					// dispatcher drops its CQE.
+					if cs.fixedFile {
+						prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
+					} else {
+						prepCancelFDSkipSuccess(sqe, cs.fd)
+					}
 					setSQEUserData(sqe, encodeUserData(udProvide, cs.fd))
 				}
 			} else {
-				if w.prepareRecv(cs.fd, cs.buf) {
+				if w.prepareRecv(cs.fd, cs.buf, cs.generation) {
 					cs.needsRecv = false
 				} else {
 					cs.needsRecv = true
@@ -2829,7 +2973,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 			return true // SQ ring full — caller should markDirty
 		}
 		w.prepSendSQE(sqe, cs, false)
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 		cs.sending = true
 		w.sendsPending = true
 		return false
@@ -2866,7 +3010,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		if cs.fixedFile {
 			setSQEFixedFile(sqe)
 		}
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 		cs.sending = true
 		w.sendsPending = true
 		return false
@@ -2879,7 +3023,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		return true
 	}
 	w.prepSendSQE(sqe, cs, false)
-	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+	setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 	cs.sending = true
 	w.sendsPending = true
 	return false
@@ -2951,40 +3095,64 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		} else {
 			prepSendPlain(sqe, cs.fd, cs.sendBuf, true)
 		}
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 		prepRecv(recvSQE, cs.fd, cs.buf)
-		setSQEUserData(recvSQE, encodeUserData(udRecv, cs.fd))
+		setSQEUserData(recvSQE, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 		cs.recvLinked = true
 	} else {
 		// Only one SQE slot — unlinked send, can use ZC if available.
 		w.prepSendSQE(sqe, cs, false)
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 	}
 	cs.sending = true
 	w.sendsPending = true
 	return false
 }
 
-// addLiveConn records a new active FD in the dense liveConns slice.
-// Worker-thread-only (the slice is unsynchronised); called from
-// onAcceptedFD and the close-restoration path. (celeris#318)
-func (w *Worker) addLiveConn(fd int) {
-	w.liveConns = append(w.liveConns, fd)
+// addLiveConn records a new active FD in the dense liveConns slice and
+// stamps cs.liveIdx with its position so removeLiveConn can find it in
+// O(1). Worker-thread-only (the slice is unsynchronised); called from
+// onAcceptedFD. (celeris#318 / v1.5.0 review 1.8)
+func (w *Worker) addLiveConn(cs *connState) {
+	cs.liveIdx = len(w.liveConns)
+	w.liveConns = append(w.liveConns, cs.fd)
 }
 
-// removeLiveConn swaps the FD with the last entry and truncates.
-// O(1) instead of the O(N) memmove of a slice delete. Worker-thread-only.
-// (celeris#318)
-func (w *Worker) removeLiveConn(fd int) {
-	for i, f := range w.liveConns {
-		if f == fd {
-			n := len(w.liveConns) - 1
-			w.liveConns[i] = w.liveConns[n]
-			w.liveConns[n] = 0
-			w.liveConns = w.liveConns[:n]
-			return
+// removeLiveConn removes cs's FD from liveConns in O(1) by swapping the
+// last entry into cs.liveIdx and truncating. The swapped-in connState's
+// liveIdx is updated to its new position. Worker-thread-only.
+// (celeris#318 / v1.5.0 review 1.8)
+//
+// Callers MUST pass the live connState (not look it up via w.conns[fd]),
+// because the close paths nil w.conns[fd] around this call. The defensive
+// guards below make a stale / double call a no-op rather than corrupting
+// the slice.
+func (w *Worker) removeLiveConn(cs *connState) {
+	if cs == nil {
+		return
+	}
+	i := cs.liveIdx
+	if i < 0 || i >= len(w.liveConns) || w.liveConns[i] != cs.fd {
+		// Not actually in liveConns at the recorded index (already removed,
+		// never added, or hijacked). Don't touch the slice.
+		return
+	}
+	n := len(w.liveConns) - 1
+	if i != n {
+		swappedFD := w.liveConns[n]
+		w.liveConns[i] = swappedFD
+		// Update the swapped-in element's recorded index. Guard against a
+		// niled conns slot (shouldn't happen for a live entry, but keeps
+		// this robust against teardown ordering).
+		if swappedFD >= 0 && swappedFD < len(w.conns) {
+			if scs := w.conns[swappedFD]; scs != nil {
+				scs.liveIdx = i
+			}
 		}
 	}
+	w.liveConns[n] = 0
+	w.liveConns = w.liveConns[:n]
+	cs.liveIdx = -1
 }
 
 // checkTimeouts scans active connections and closes any that have exceeded
@@ -2999,7 +3167,27 @@ func (w *Worker) removeLiveConn(fd int) {
 // conns) regardless of FD space.
 func (w *Worker) checkTimeouts() {
 	now := time.Now().UnixNano()
-	for _, fd := range w.liveConns {
+	// Drain the deferred-release queue here too. drainPendingRelease gates on
+	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
+	// block; on a fully idle worker (no CQEs) cachedNow never advances and
+	// closed connStates would be pinned indefinitely. checkTimeouts runs on
+	// the ~100ms idle cadence, so refreshing cachedNow and draining here
+	// bounds the hold to the wall-clock window even with zero CQE traffic.
+	// NOTE: the enqueue-time stamp stays a fresh time.Now()+hold (see
+	// queuePendingRelease) so the hold window remains >= cancellation latency
+	// regardless of cachedNow staleness (v1.5.0 review 2.9).
+	w.cachedNow = now
+	if len(w.pendingRelease) > 0 {
+		w.drainPendingRelease()
+	}
+	// Iterate in REVERSE by index: closeConn → finishClose → removeLiveConn
+	// swap-removes the FD with the last live entry and shrinks the slice. A
+	// forward `range` would then (a) skip the swapped-in conn (moved into an
+	// already-visited slot) and (b) read a stale/zeroed tail slot as fd 0,
+	// dereferencing w.conns[0]. Reverse-by-index visits each conn exactly
+	// once even as entries are swap-removed from the tail (v1.5.0 review 1.9).
+	for i := len(w.liveConns) - 1; i >= 0; i-- {
+		fd := w.liveConns[i]
 		cs := w.conns[fd]
 		if cs == nil || cs.closing {
 			continue
@@ -3044,7 +3232,12 @@ func (w *Worker) shutdown() {
 	// Fire onClose for every registered driver conn before tearing down
 	// ring/listen fd. Otherwise driver callbacks are silently dropped.
 	w.shutdownDrivers()
-	for _, fd := range w.liveConns {
+	// Reverse-by-index for the same reason as checkTimeouts (v1.5.0 review
+	// 1.9): any teardown path that swap-removes from liveConns must not cause
+	// a forward range to skip a swapped-in conn or read a zeroed tail slot
+	// as fd 0.
+	for i := len(w.liveConns) - 1; i >= 0; i-- {
+		fd := w.liveConns[i]
 		cs := w.conns[fd]
 		if cs == nil {
 			continue
@@ -3191,12 +3384,37 @@ func boundAddr(fd int) net.Addr {
 	return nil
 }
 
+// sockaddrString formats a peer address as "ip:port" (IPv4) or
+// "[ip]:port" (IPv6). It runs on the accept hot path (once per OnConnect),
+// so it avoids the fmt.Sprintf reflection/allocation cost: the IPv4 path
+// builds the dotted-quad + port directly into a stack buffer with
+// strconv.AppendInt and the IPv6 path appends net.IP's canonical form
+// (the one remaining short-lived allocation) without fmt. See v1.5.0
+// review 2.11.
 func sockaddrString(sa unix.Sockaddr) string {
 	switch v := sa.(type) {
 	case *unix.SockaddrInet4:
-		return fmt.Sprintf("%s:%d", net.IP(v.Addr[:]), v.Port)
+		// Max "255.255.255.255:65535" = 21 bytes.
+		var b [21]byte
+		buf := b[:0]
+		buf = strconv.AppendInt(buf, int64(v.Addr[0]), 10)
+		buf = append(buf, '.')
+		buf = strconv.AppendInt(buf, int64(v.Addr[1]), 10)
+		buf = append(buf, '.')
+		buf = strconv.AppendInt(buf, int64(v.Addr[2]), 10)
+		buf = append(buf, '.')
+		buf = strconv.AppendInt(buf, int64(v.Addr[3]), 10)
+		buf = append(buf, ':')
+		buf = strconv.AppendInt(buf, int64(v.Port), 10)
+		return string(buf)
 	case *unix.SockaddrInet6:
-		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
+		ip := net.IP(v.Addr[:]).String()
+		buf := make([]byte, 0, len(ip)+8)
+		buf = append(buf, '[')
+		buf = append(buf, ip...)
+		buf = append(buf, ']', ':')
+		buf = strconv.AppendInt(buf, int64(v.Port), 10)
+		return string(buf)
 	}
 	return ""
 }

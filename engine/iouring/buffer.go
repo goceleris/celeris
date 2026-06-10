@@ -42,6 +42,14 @@ func NewBufferRing(ring *Ring, groupID uint16, count, size int) (*BufferRing, er
 	if count&(count-1) != 0 {
 		return nil, fmt.Errorf("buffer ring count must be power of 2, got %d", count)
 	}
+	// The kernel's IORING_REGISTER_PBUF_RING accepts at most 32768 entries,
+	// and BufferRing's uint16 tail/mask/bid arithmetic cannot address more
+	// than 32768 distinct buffer IDs without wrapping. Reject over-large
+	// rings explicitly rather than letting the kernel return an opaque
+	// EINVAL or, worse, silently aliasing buffer IDs (celeris#322).
+	if count > bufRingCountMax {
+		return nil, fmt.Errorf("buffer ring count %d exceeds kernel PBUF_RING cap of %d", count, bufRingCountMax)
+	}
 
 	// Allocate ring entry memory via mmap. Each entry is 16 bytes (io_uring_buf).
 	ringSize := count * bufRingEntrySize

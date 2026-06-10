@@ -16,17 +16,17 @@ func TestResolveBufRingCountDefaults(t *testing.T) {
 		targetConns int
 		want        int
 	}{
-		// Formula: 2 * Workers * TargetConnsPerWorker, rounded up to a
-		// power of 2, clamped to [bufRingCountMin=1024, bufRingCountMax].
-		// At low worker counts the formula's natural nextPowerOf2 lands
-		// below the 1024 floor and gets clamped up to 1024.
-		{name: "default target falls through to 20; 2*4*20=160→256→floor 1024", workers: 4, targetConns: 0, want: 1024},
+		// Formula: 2 * TargetConnsPerWorker, rounded up to a power of 2,
+		// clamped to [bufRingCountMin=1024, bufRingCountMax]. The ring is
+		// PER-WORKER, so the result MUST NOT depend on Workers (celeris#322
+		// follow-up — the prior 2*Workers*target over-sized every worker's
+		// ring by the worker count).
+		{name: "default target falls through to 20; 2*20=40→64→floor 1024", workers: 4, targetConns: 0, want: 1024},
 		{name: "explicit 20; same as above", workers: 4, targetConns: 20, want: 1024},
-		{name: "8 workers * 20 = 320 → 512 → floor 1024", workers: 8, targetConns: 20, want: 1024},
-		{name: "16 workers * 20 = 640 → 1024 (at floor)", workers: 16, targetConns: 20, want: 1024},
-		{name: "32 workers * 20 = 1280 → 2048", workers: 32, targetConns: 20, want: 2048},
+		{name: "more workers must not change result; 2*20→floor 1024", workers: 64, targetConns: 20, want: 1024},
+		{name: "target 600 → 2*600=1200 → 2048", workers: 4, targetConns: 600, want: 2048},
 		{name: "below floor", workers: 1, targetConns: 1, want: bufRingCountMin},
-		{name: "capped at max", workers: 1024, targetConns: 1024, want: bufRingCountMax},
+		{name: "capped at max", workers: 1, targetConns: 1 << 20, want: bufRingCountMax},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -37,6 +37,20 @@ func TestResolveBufRingCountDefaults(t *testing.T) {
 					tt.workers, tt.targetConns, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestResolveBufRingCountIndependentOfWorkers is the regression guard for
+// celeris#322 follow-up: the provided-buffer ring is created once PER WORKER,
+// so its size must depend only on the per-worker conn target, never on the
+// engine-wide Workers count. Before the fix, 2*Workers*target made a 64-worker
+// box allocate a 64× larger ring on every worker.
+func TestResolveBufRingCountIndependentOfWorkers(t *testing.T) {
+	const target = 20
+	got1 := resolveBufRingCount(resource.ResolvedResources{Workers: 1, BufferSize: 8192}, target)
+	got64 := resolveBufRingCount(resource.ResolvedResources{Workers: 64, BufferSize: 8192}, target)
+	if got1 != got64 {
+		t.Fatalf("ring size depends on Workers: workers=1→%d, workers=64→%d (must be equal)", got1, got64)
 	}
 }
 
