@@ -1502,7 +1502,7 @@ func bufferedFileFallback(cs *connState, header []byte, file *os.File, offset, l
 	cs.writeBuf = append(cs.writeBuf, header...)
 	start := len(cs.writeBuf)
 	cs.writeBuf = append(cs.writeBuf, make([]byte, length)...)
-	if _, err := readFullAt(file, cs.writeBuf[start:start+int(length)], offset); err != nil {
+	if err := readFullAt(file, cs.writeBuf[start:start+int(length)], offset); err != nil {
 		// Roll back the reserved body region; keep the header (a partial
 		// header-only response would corrupt framing, so surface the error
 		// and let the caller close the conn).
@@ -1516,19 +1516,19 @@ func bufferedFileFallback(cs *connState, header []byte, file *os.File, offset, l
 // readFullAt reads len(buf) bytes from file starting at offset, looping
 // over short reads. Uses ReadAt so it does not disturb the file's seek
 // offset (the caller may reuse the descriptor).
-func readFullAt(file *os.File, buf []byte, offset int64) (int, error) {
+func readFullAt(file *os.File, buf []byte, offset int64) error {
 	total := 0
 	for total < len(buf) {
 		n, err := file.ReadAt(buf[total:], offset+int64(total))
 		total += n
 		if err != nil {
 			if err == io.EOF && total == len(buf) {
-				return total, nil
+				return nil
 			}
-			return total, err
+			return err
 		}
 	}
-	return total, nil
+	return nil
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when

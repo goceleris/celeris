@@ -90,7 +90,7 @@ const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 // mmap'd RSS per worker and risking the kernel cap on large boxes
 // (celeris#322 follow-up).
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
-func resolveBufRingCount(resolved resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
+func resolveBufRingCount(_ resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
 	if v := os.Getenv(envPbufCount); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			if n&(n-1) != 0 {
@@ -2653,7 +2653,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
 // caller has already set cs.asyncPromoted and returned the provided buffer.
-func (w *Worker) promoteConnToAsync(cs *connState, fd int, stashed []byte, c *completionEntry) {
+func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *completionEntry) {
 	cs.asyncInMu.Lock()
 	cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
 	starting := !cs.asyncRun

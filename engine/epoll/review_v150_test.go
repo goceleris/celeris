@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/resource"
-	"golang.org/x/sys/unix"
 )
 
 // regLive registers a connState at fd in l.conns and adds it to liveConns,

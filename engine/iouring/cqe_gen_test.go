@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"context"
 	"testing"
 	"unsafe"
 )
@@ -235,11 +236,11 @@ func TestStaleConnCQENoBufferNoRecycle(t *testing.T) {
 func TestGenerationDiffersAcrossReuse(t *testing.T) {
 	const fd = 11
 
-	cs1 := acquireConnState(nil, fd, 0, false)
+	cs1 := acquireConnState(context.TODO(), fd, 0, false)
 	oldGen := cs1.generation
 	releaseConnState(cs1) // returns to pool; generation NOT reset
 
-	cs2 := acquireConnState(nil, fd, 0, false)
+	cs2 := acquireConnState(context.TODO(), fd, 0, false)
 	newGen := cs2.generation
 	defer releaseConnState(cs2)
 

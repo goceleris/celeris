@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/resource"
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/resource"
 )
 
 // TestCheckTimeoutsClosesFDZero is the regression guard for v1.5.0 review 1.9.

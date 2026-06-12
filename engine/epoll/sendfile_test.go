@@ -293,7 +293,7 @@ func TestSendfileH1EAGAINPartialAndResume(t *testing.T) {
 	// First advance: expect a partial send surfacing EAGAIN (the peer has
 	// not read anything yet, so the windows fill).
 	n1, err1 := st.advance(serverFD)
-	if !(errors.Is(err1, unix.EAGAIN) || errors.Is(err1, unix.EWOULDBLOCK)) {
+	if !errors.Is(err1, unix.EAGAIN) && !errors.Is(err1, unix.EWOULDBLOCK) {
 		// On a generous-buffer kernel the whole file might go in one shot;
 		// only assert resumability when we actually hit backpressure.
 		if err1 == nil && st.done {
@@ -346,7 +346,7 @@ func TestSendfileH1EAGAINPartialAndResume(t *testing.T) {
 		}
 		n, aerr := st.advance(serverFD)
 		total += n
-		if aerr != nil && !(errors.Is(aerr, unix.EAGAIN) || errors.Is(aerr, unix.EWOULDBLOCK)) {
+		if aerr != nil && !errors.Is(aerr, unix.EAGAIN) && !errors.Is(aerr, unix.EWOULDBLOCK) {
 			t.Fatalf("resume advance: %v", aerr)
 		}
 		if errors.Is(aerr, unix.EAGAIN) || errors.Is(aerr, unix.EWOULDBLOCK) {
@@ -467,7 +467,7 @@ func TestSendfileH1HeaderPartialResume(t *testing.T) {
 			t.Fatalf("did not complete; headerOff=%d remaining=%d", st.headerOff, st.remaining)
 		}
 		_, aerr := st.advance(serverFD)
-		if aerr != nil && !(errors.Is(aerr, unix.EAGAIN) || errors.Is(aerr, unix.EWOULDBLOCK)) {
+		if aerr != nil && !errors.Is(aerr, unix.EAGAIN) && !errors.Is(aerr, unix.EWOULDBLOCK) {
 			t.Fatalf("advance: %v", aerr)
 		}
 		// Header bytes must never exceed the header length (no double-count).

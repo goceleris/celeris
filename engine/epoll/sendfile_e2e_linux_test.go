@@ -61,7 +61,7 @@ func (h *fileServeHandler) HandleStream(_ context.Context, s *stream.Stream) err
 
 	// Fallback: buffered read + WriteResponse.
 	data := make([]byte, size)
-	if _, rerr := readFullAt(f, data, 0); rerr != nil {
+	if rerr := readFullAt(f, data, 0); rerr != nil {
 		return rerr
 	}
 	return s.ResponseWriter.WriteResponse(s, 200,
@@ -323,7 +323,7 @@ func (h *rangeServeHandler) HandleStream(_ context.Context, s *stream.Stream) er
 	if !handled {
 		// Buffered fallback for the range.
 		data := make([]byte, length)
-		if _, rerr := readFullAt(f, data, h.start); rerr != nil {
+		if rerr := readFullAt(f, data, h.start); rerr != nil {
 			return rerr
 		}
 		return s.ResponseWriter.WriteResponse(s, 206, headers, data)
