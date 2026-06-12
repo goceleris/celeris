@@ -337,11 +337,11 @@ func (w *Worker) handleDriverRecv(c *completionEntry, fd int) {
 		if c.Res == -int32(unix.ECANCELED) {
 			return // cancel; handleDriverClose will finalize when inflight hits 0
 		}
-		w.finalizeDriver(dc, errIORingRecv(c.Res))
+		w.failDriverConn(dc, errIORingRecv(c.Res))
 		return
 	}
 	if c.Res == 0 {
-		w.finalizeDriver(dc, nil)
+		w.failDriverConn(dc, nil)
 		return
 	}
 	// onRecv receives a slice valid only for this call (contract).
@@ -381,7 +381,7 @@ func (w *Worker) handleDriverSend(c *completionEntry, fd int) {
 		if c.Res == -int32(unix.ECANCELED) {
 			return
 		}
-		w.finalizeDriver(dc, errIORingSend(c.Res))
+		w.failDriverConn(dc, errIORingSend(c.Res))
 		return
 	}
 	sent := int(c.Res)
@@ -422,12 +422,45 @@ func (w *Worker) handleDriverClose(fd int) {
 	dc.mu.Lock()
 	if dc.inflightOps > 0 {
 		dc.closePending = true
-		// closeErr stays nil — user-initiated cancel completes cleanly.
+		// closeErr stays as whoever set it first: nil for a user-initiated
+		// cancel (UnregisterConn), the I/O error for failDriverConn.
 		dc.mu.Unlock()
 		return
 	}
+	closeErr := dc.closeErr
 	dc.mu.Unlock()
-	w.finalizeDriver(dc, nil)
+	w.finalizeDriver(dc, closeErr)
+}
+
+// failDriverConn finalizes dc with err — but only once no kernel ops
+// remain in flight. The error branches of handleDriverRecv /
+// handleDriverSend used to finalize unconditionally, which released the
+// worker's reference to dc while the OTHER op could still be kernel-held
+// (a send error with the recv SQE still armed on dc.buf, or vice versa):
+// the same kernel-writes-freed-memory class as the HTTP close path
+// (#256 class, v1.4.15/7beebb9 variant), bypassing the inflightOps gating that handleDriverClose
+// applies. When ops remain, record the first error, mark the close
+// pending, and submit an ASYNC_CANCEL so their terminal CQEs arrive
+// promptly; the closePending checks in the CQE handlers finalize once the
+// counter drains. Runs on the worker goroutine (CQE dispatch), so SQE
+// submission is safe.
+func (w *Worker) failDriverConn(dc *driverConn, err error) {
+	dc.mu.Lock()
+	if dc.inflightOps > 0 {
+		dc.closing = true
+		dc.closePending = true
+		if dc.closeErr == nil {
+			dc.closeErr = err
+		}
+		dc.mu.Unlock()
+		if sqe := w.getCancelSQE(); sqe != nil {
+			prepCancelFDDriver(sqe, dc.fd)
+			setSQEUserData(sqe, encodeUserData(udDriverClose, dc.fd))
+		}
+		return
+	}
+	dc.mu.Unlock()
+	w.finalizeDriver(dc, err)
 }
 
 // errEngineShutdown is passed to driver onClose callbacks when the Worker
