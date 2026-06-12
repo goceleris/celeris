@@ -51,6 +51,30 @@ type iovec struct {
 
 type connState struct {
 	fd int // 8: real FD, or fixed file index
+	// generation tags every conn-bound SQE's user_data (review 2.6). It is
+	// INCREMENTED on each acquireConnState (never reset on release), so a
+	// reused connState/fd gets a different gen from its predecessor. A
+	// late/in-flight CQE carrying the OLD gen is dropped at dispatch
+	// instead of being misrouted to the new occupant (fixes the
+	// use-after-reuse / wrong-conn-write / error-CQE-nils-live-slot class:
+	// 2.2 error path, 2.7 hijack/close fd-reuse).
+	//
+	// uint16, widened from uint8 in v1.5.0: generations are per-connState
+	// OBJECT (pool-recycled), not per-fd, so the conn that re-occupies an
+	// fd draws its gen from a different counter and can collide with a
+	// closed predecessor that still has terminal CQEs in flight. A
+	// collision misroutes those CQEs to the live conn at dispatch
+	// (staleConnCQE), misdecrementing its kernelInflight — at 1→0 that
+	// disarms the close-time cancel and re-opens the early-release UAF
+	// this release fixed. 16 bits drops the per-reuse collision odds from
+	// 1/256 to 1/65536; wrap-around remains fine — 65536 generations
+	// outlast any in-flight CQE.
+	generation uint16 // 2
+	// liveIdx is this conn's index into Worker.liveConns, maintained so
+	// removeLiveConn is O(1) (swap-with-last) instead of an O(N) linear
+	// scan (celeris#318 follow-up / v1.5.0 review 1.8). -1 when the conn is
+	// not in liveConns (freshly acquired / released). Worker-thread-only.
+	liveIdx int // 8
 	// protocol is accessed concurrently: the worker reads it on every
 	// recv completion, and the async dispatch goroutine writes it once
 	// via switchToH2Local during an H1→H2 upgrade. atomic.Int32 keeps
@@ -69,13 +93,30 @@ type connState struct {
 	zcSentBytes    int32        // bytes sent from first SEND_ZC CQE (processed on NOTIF)
 	sendBuf        []byte       // 24: in-flight buffer (accessed with sending flag)
 
-	writeBuf  []byte     // 24: append buffer for handler writes
-	bodyBuf   []byte     // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
-	sendBody  []byte     // 24: in-flight body slice during WRITEV (cleared by completeSend)
-	buf       []byte     // 24: per-connection recv buffer
-	iov       [2]iovec   // 32: iovec storage for WRITEV SQEs (sendBuf + sendBody)
-	dirtyNext *connState // 8
-	dirtyPrev *connState // 8
+	writeBuf []byte // 24: append buffer for handler writes
+	bodyBuf  []byte // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
+	sendBody []byte // 24: in-flight body slice during WRITEV (cleared by completeSend)
+	buf      []byte // 24: per-connection recv buffer
+	// detectAccum accumulates the first bytes of a connection across
+	// multiple recvs while protocol detection is still inconclusive
+	// (ErrInsufficientData). Single-shot recv re-arms into cs.buf at offset
+	// 0 each time, and the bufRing path returns each provided buffer, so
+	// without accumulating here a multi-recv H2 client preface (24 bytes
+	// split across packets) would lose its earlier bytes (v1.5.0 review
+	// 2.8). Empty/nil once cs.detected is set; only the slow split-preface
+	// path ever allocates it.
+	detectAccum []byte // 24
+	// bodyRecvPin retains the H1State.bodyBuf backing array while a
+	// single-shot recv has been armed directly into it (pickRecvTarget's
+	// recvIntoBody path). conn.CloseH1 nils H1State.bodyBuf on close, which
+	// would otherwise let GC reclaim the backing array while a kernel recv
+	// SQE still targets it — the #256 use-after-free class, body-buffer
+	// variant. Holding the slice here keeps the array alive until the
+	// connState drains from pendingRelease (mirrors how cs.buf is held).
+	bodyRecvPin []byte     // 24
+	iov         [2]iovec   // 32: iovec storage for WRITEV SQEs (sendBuf + sendBody)
+	dirtyNext   *connState // 8
+	dirtyPrev   *connState // 8
 
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
@@ -166,6 +207,32 @@ type connState struct {
 	// before closeConn) then forces RST. The walker's next write hits
 	// ECONNRESET immediately regardless of TCP send-buffer state.
 	forceRSTClose bool
+
+	// kernelInflight counts conn-buffer-referencing kernel ops — RECVs
+	// targeting cs.buf / h1State.bodyBuf and SEND/WRITEV/SEND_ZC reading
+	// cs.sendBuf / cs.sendBody / cs.iov — that have been submitted but
+	// have not yet delivered their TERMINAL CQE (success, -ECANCELED,
+	// -ECONNRESET, ...; for multishot recv and SEND_ZC the terminal CQE
+	// is the one WITHOUT CQE_F_MORE). Incremented at SQE submission
+	// (prepareRecv / flushSend / flushSendLink), decremented at CQE
+	// dispatch (staleConnCQE — both the live and the stale-generation
+	// path, the latter via Worker.closedOps). Worker-thread-only.
+	//
+	// This is the release gate for the #256-class use-after-free (v1.4.15/7beebb9 allocCount variant):
+	// unix.Close(fd) does NOT complete a pending io_uring recv (the op
+	// holds its own file reference), so a closed conn's cs.buf must stay
+	// reachable until every kernel-held op has terminated — otherwise a
+	// retransmitted/straggler segment is DMA'd into memory the Go runtime
+	// has repurposed. drainPendingRelease only releases a connState once
+	// this counter reaches zero (with a wall-clock backstop for kernel
+	// anomalies). Mirrors driverConn.inflightOps.
+	kernelInflight int32
+	// recvArmed is true while a recv SQE (single-shot or multishot) is
+	// kernel-held for this conn. Set by prepareRecv / flushSendLink's
+	// linked recv, cleared when the recv's terminal CQE is dispatched.
+	// The close paths use it to target an ASYNC_CANCEL at the armed
+	// recv's exact generation-tagged user_data. Worker-thread-only.
+	recvArmed bool
 }
 
 var connStatePool = sync.Pool{
@@ -180,6 +247,12 @@ var connStatePool = sync.Pool{
 func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *connState {
 	cs := connStatePool.Get().(*connState)
 	cs.fd = fd
+	// Bump the generation on every acquire (wrap-around is fine). Not reset
+	// in releaseConnState — incrementing here guarantees a reused
+	// connState/fd never shares its predecessor's gen, so a stale CQE
+	// stamped with the old gen is dropped at dispatch (review 2.6).
+	cs.generation++
+	cs.liveIdx = -1
 	cs.ctx = ctx
 	cs.writeBuf = cs.writeBuf[:0]
 	cs.sendBuf = cs.sendBuf[:0]
@@ -236,6 +309,19 @@ func releaseConnState(cs *connState) {
 	cs.asyncDetachPending = false
 	cs.bodyBuf = nil
 	cs.sendBody = nil
+	// bodyRecvPin is cleared here, after every kernel-held op delivered its
+	// terminal CQE (releaseConnState is only called from drainPendingRelease
+	// once cs.kernelInflight drained — or its backstop fired), so the kernel
+	// can no longer be writing into the pinned bodyBuf array (#256
+	// body-buffer UAF guard).
+	cs.bodyRecvPin = nil
+	cs.detectAccum = cs.detectAccum[:0]
+	// kernelInflight is zero on every normal release (drainPendingRelease
+	// gates on it); reset defensively for the wall-clock-backstop path,
+	// where the worker gave up waiting on a CQE the kernel never produced.
+	cs.kernelInflight = 0
+	cs.recvArmed = false
 	cs.fd = 0
+	cs.liveIdx = -1
 	connStatePool.Put(cs)
 }

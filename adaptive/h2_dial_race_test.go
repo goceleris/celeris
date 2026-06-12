@@ -87,7 +87,7 @@ func runOnce(t *testing.T, iter int) {
 			Workers: 2,
 		},
 	}
-	e, err := New(cfg, &h2PrefaceHandler{})
+	e, err := New(cfg, &h2PrefaceHandler{}, nil)
 	if err != nil {
 		t.Skipf("iter %d: adaptive engine unavailable: %v", iter, err)
 	}

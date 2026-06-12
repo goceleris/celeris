@@ -61,3 +61,9 @@ func nextPowerOf2(v int) int {
 	v++
 	return v
 }
+
+// NextPowerOf2 returns the smallest power of two ≥ v. Exposed for
+// engine packages that need to size io_uring rings, provided buffer
+// rings, and similar power-of-two kernel structures from a base count
+// derived from user-supplied config.
+func NextPowerOf2(v int) int { return nextPowerOf2(v) }

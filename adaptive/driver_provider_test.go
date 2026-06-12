@@ -33,13 +33,12 @@ func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 		Addr:     "127.0.0.1:0",
 		Protocol: engine.HTTP1,
 	}
-	e, err := New(cfg, noopHandler{})
+	e, err := New(cfg, noopHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive.New unsupported here: %v", err)
 	}
-	// Ensure switching is possible (cooldown off, minObserve off).
+	// Ensure switching is possible (cooldown off).
 	e.ctrl.cooldown = 0
-	e.ctrl.minObserve = 0
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

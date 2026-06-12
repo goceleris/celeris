@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 
 	"golang.org/x/net/http2"
 )
@@ -64,6 +65,28 @@ type FrameWriter interface {
 // All engine adapters, test recorders, and stdlib bridges implement this.
 type ResponseWriter interface {
 	WriteResponse(stream *Stream, status int, headers [][2]string, body []byte) error
+}
+
+// FileResponder is an optional interface a ResponseWriter may implement
+// to serve a regular file as the response body via a zero-copy path
+// (sendfile(2) on the epoll engine). The celeris Context's file-serving
+// methods (File, FileFromDir, FileFromFS, and middleware/static) type-
+// assert the connection's ResponseWriter for it.
+//
+// WriteFileResponse emits the status line + headers (with a
+// content-length of `length`) and then the slice [offset, offset+length)
+// of file as the body. It reports handled=false when it declined to use
+// the zero-copy path — e.g. the underlying engine is not sendfile-capable,
+// the body is below the size threshold where a buffered write coalesces
+// better, or the response is HTTP/2 (framed). On handled=false the caller
+// MUST fall back to the buffered read+write path; the writer guarantees it
+// emitted nothing in that case. On handled=true it owns the response
+// (including the HEAD-request invariant: headers only, no body bytes for
+// HEAD). The caller retains ownership of file and may close it as soon as
+// WriteFileResponse returns — a sendfile-capable engine that needs the
+// file beyond this call dups the descriptor.
+type FileResponder interface {
+	WriteFileResponse(s *Stream, status int, headers [][2]string, file *os.File, offset, length int64) (handled bool, err error)
 }
 
 // H2Controller provides HTTP/2 connection-level control operations.

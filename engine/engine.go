@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"net"
-	"time"
+	"os"
 )
 
 // Engine is the interface that all I/O engine implementations must satisfy.
@@ -61,9 +61,45 @@ type WorkerScaler interface {
 	ResumeWorker(i int)
 }
 
+// SendfileCapable is an optional interface implemented by engines that
+// support zero-copy file responses via sendfile(2). The H1 static-file
+// response path type-asserts the engine for it; engines that do not
+// implement it (iouring, std) fall back to the buffered read+write path.
+// See celeris#317. The epoll engine implements it.
+//
+// The fdOut argument is the engine's per-connection socket FD. The
+// caller drives the connState lifecycle (locking, dirty-list membership,
+// timeout tracking, EAGAIN resume) — the engine's sendfile path is a
+// syscall shim that advances as far as the kernel send buffer allows and
+// reports backpressure for the caller to resume.
+//
+// offset and length describe the slice of the source file to send.
+// length ≤ 0 means "send to EOF" (the implementation stats the file and
+// uses size-offset). The headers slice, when non-empty, is flushed via
+// write(2) before the sendfile loop begins.
+//
+// Returns the number of BODY bytes sent on this call and an error. A
+// short send under kernel-send-buffer pressure surfaces
+// EAGAIN/EWOULDBLOCK (via errors.Is) along with the partial body count,
+// so the caller defers and resumes; the returned count is never
+// corrupted on EAGAIN. EINTR is retried internally. The HEAD-request
+// invariant (never send a body) is the caller's responsibility — the
+// caller must not invoke Sendfile for a HEAD request.
+type SendfileCapable interface {
+	Sendfile(fdOut int, file *os.File, offset, length int64, headers []byte) (int64, error)
+}
+
 // EngineMetrics is a point-in-time snapshot of engine-level performance
 // counters. Each engine maintains internal atomic counters and populates a
 // fresh snapshot on each [Engine.Metrics] call.
+//
+// v1.5.0: LatencyP50 / LatencyP99 / LatencyP999 were removed (celeris#321).
+// The fields were declared but never written by any sub-engine (the
+// sub-engines don't track per-request latency histograms — they only
+// count requests). The adaptive engine's aggregator at
+// adaptive/engine.go was the only reader and it received zeros from
+// both sub-engines, so removing the fields changes nothing observable.
+// SyscallRate, referenced by the issue, never existed in the tree.
 type EngineMetrics struct { //nolint:revive // user-approved name
 	// RequestCount is the cumulative number of requests handled by this engine.
 	RequestCount uint64
@@ -73,12 +109,6 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	ErrorCount uint64
 	// Throughput is the recent requests-per-second rate.
 	Throughput float64
-	// LatencyP50 is the 50th-percentile (median) request latency.
-	LatencyP50 time.Duration
-	// LatencyP99 is the 99th-percentile request latency.
-	LatencyP99 time.Duration
-	// LatencyP999 is the 99.9th-percentile request latency.
-	LatencyP999 time.Duration
 	// AsyncRoutes is the count of routes registered with .Async(true) on
 	// this engine's handler. Static after Listen — derived from the
 	// router's per-route async flags and exposed for diagnostics so

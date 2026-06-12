@@ -577,14 +577,20 @@ func TestParseRequest_DuplicateContentLength_Identical(t *testing.T) {
 	}
 }
 
-func TestParseRequest_DuplicateContentLength_ChunkedIgnored(t *testing.T) {
+// TestParseRequest_ContentLengthAndChunked_Rejected covers RFC 9112 §6.3:
+// a message carrying BOTH Transfer-Encoding: chunked and Content-Length is
+// malformed and MUST be rejected (request-smuggling vector). This test
+// previously (as TestParseRequest_DuplicateContentLength_ChunkedIgnored)
+// asserted the OLD lax behavior — strip CL and let chunked win — which
+// finding 4.2 identifies as wrong; it is updated to require a 400.
+func TestParseRequest_ContentLengthAndChunked_Rejected(t *testing.T) {
 	for _, zeroCopy := range []bool{false, true} {
 		name := "standard"
 		if zeroCopy {
 			name = "zerocopy"
 		}
 		t.Run(name, func(t *testing.T) {
-			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n"
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 50\r\n\r\n"
 			p := NewParser()
 			if zeroCopy {
 				p.noStringHeaders = true
@@ -592,14 +598,8 @@ func TestParseRequest_DuplicateContentLength_ChunkedIgnored(t *testing.T) {
 			p.Reset([]byte(raw))
 			var req Request
 			_, err := p.ParseRequest(&req)
-			if err != nil {
-				t.Fatalf("conflicting CL with chunked TE should be ignored, got: %v", err)
-			}
-			if !req.ChunkedEncoding {
-				t.Fatal("chunked encoding not detected")
-			}
-			if req.ContentLength != -1 {
-				t.Fatalf("content-length = %d, want -1 for chunked", req.ContentLength)
+			if !errors.Is(err, ErrConflictingFraming) {
+				t.Fatalf("got error %v, want %v", err, ErrConflictingFraming)
 			}
 		})
 	}
@@ -793,4 +793,261 @@ func TestRequest_Reset_ClearsUpgrade(t *testing.T) {
 	if req.HTTP2Settings != "" {
 		t.Fatalf("HTTP2Settings = %q, want empty", req.HTTP2Settings)
 	}
+}
+
+// 4.2: Transfer-Encoding must be parsed as a token list with "chunked" only
+// honored as the final coding; substrings and non-final chunked are rejected.
+func TestParseRequest_TransferEncodingTokenParse(t *testing.T) {
+	cases := []struct {
+		name        string
+		te          string
+		wantChunked bool
+		wantErr     error
+	}{
+		{"xchunkedx not chunked", "xchunkedx", false, nil},
+		{"chunked-not-last rejected", "chunked, gzip", false, ErrInvalidTransferEncoding},
+		{"gzip-then-chunked ok", "gzip, chunked", true, nil},
+		{"plain chunked ok", "chunked", true, nil},
+		{"chunked with OWS ok", "  chunked  ", true, nil},
+		{"gzip only not chunked", "gzip", false, nil},
+		{"empty not chunked", "", false, nil},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, tc := range cases {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				raw := "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: " + tc.te + "\r\n\r\n"
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) {
+						t.Fatalf("got error %v, want %v", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if req.ChunkedEncoding != tc.wantChunked {
+					t.Fatalf("ChunkedEncoding = %v, want %v", req.ChunkedEncoding, tc.wantChunked)
+				}
+			})
+		}
+	}
+}
+
+// 4.2: a request carrying both Content-Length and Transfer-Encoding: chunked
+// is malformed and must be rejected, regardless of header order.
+func TestParseRequest_ContentLengthAndChunked_BothOrders(t *testing.T) {
+	orders := []struct {
+		name string
+		raw  string
+	}{
+		{"TE-then-CL", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"},
+		{"CL-then-TE", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, o := range orders {
+			t.Run(mode+"/"+o.name, func(t *testing.T) {
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(o.raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if !errors.Is(err, ErrConflictingFraming) {
+					t.Fatalf("got error %v, want %v", err, ErrConflictingFraming)
+				}
+			})
+		}
+	}
+}
+
+// 4.3: whitespace between the header name and the colon is rejected (400);
+// value OWS is still trimmed.
+func TestParseRequest_WhitespaceBeforeColon(t *testing.T) {
+	bad := []struct {
+		name string
+		raw  string
+	}{
+		{"space before colon", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo : v\r\n\r\n"},
+		{"tab before colon", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo\t: v\r\n\r\n"},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, tc := range bad {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(tc.raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if !errors.Is(err, ErrInvalidHeader) {
+					t.Fatalf("got error %v, want %v", err, ErrInvalidHeader)
+				}
+			})
+		}
+	}
+
+	// Value OWS must still be trimmed.
+	t.Run("value OWS trimmed", func(t *testing.T) {
+		raw := "GET / HTTP/1.1\r\nHost: h\r\nX-Foo:   v  \r\n\r\n"
+		p := NewParser()
+		p.Reset([]byte(raw))
+		var req Request
+		_, err := p.ParseRequest(&req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var got string
+		for _, h := range req.Headers {
+			if h[0] == "x-foo" {
+				got = h[1]
+			}
+		}
+		if got != "v" {
+			t.Fatalf("value = %q, want %q", got, "v")
+		}
+	})
+}
+
+// 4.5: ParseRequest must reset RawHeaders so a reused *Request (without an
+// explicit Request.Reset between parses) does not leak the prior request's
+// raw headers.
+func TestParseRequest_RawHeadersResetWithoutReset(t *testing.T) {
+	p := NewParser()
+	var req Request
+
+	raw1 := "GET /one HTTP/1.1\r\nHost: a\r\nX-First: 1\r\n\r\n"
+	p.Reset([]byte(raw1))
+	if _, err := p.ParseRequest(&req); err != nil {
+		t.Fatalf("request 1 error: %v", err)
+	}
+
+	// Deliberately do NOT call req.Reset() between parses.
+	raw2 := "GET /two HTTP/1.1\r\nHost: b\r\nX-Second: 2\r\n\r\n"
+	p.Reset([]byte(raw2))
+	if _, err := p.ParseRequest(&req); err != nil {
+		t.Fatalf("request 2 error: %v", err)
+	}
+
+	for _, rh := range req.RawHeaders {
+		name := string(rh[0])
+		if name == "X-First" || name == "Host" && string(rh[1]) == "a" {
+			t.Fatalf("request 2 RawHeaders leaked request 1 header %q=%q", name, rh[1])
+		}
+	}
+	// Request 2 should have exactly its own two headers.
+	if len(req.RawHeaders) != 2 {
+		t.Fatalf("request 2 RawHeaders count = %d, want 2: %v", len(req.RawHeaders), rawNames(req.RawHeaders))
+	}
+}
+
+func rawNames(rh [][2][]byte) []string {
+	out := make([]string, len(rh))
+	for i, h := range rh {
+		out[i] = string(h[0])
+	}
+	return out
+}
+
+// 4.6: the request line / URI is bounded by MaxRequestLineSize.
+func TestParseRequest_RequestLineTooLong(t *testing.T) {
+	uri := "/" + strings.Repeat("a", 64<<10) // 64 KiB URI
+	raw := "GET " + uri + " HTTP/1.1\r\nHost: h\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrRequestLineTooLong) {
+		t.Fatalf("got error %v, want %v", err, ErrRequestLineTooLong)
+	}
+}
+
+// 4.6: an over-long request line with no CRLF yet must also be rejected
+// promptly (not buffered unbounded).
+func TestParseRequest_RequestLineTooLong_NoCRLF(t *testing.T) {
+	raw := "GET /" + strings.Repeat("a", 64<<10) // no CRLF
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrRequestLineTooLong) {
+		t.Fatalf("got error %v, want %v", err, ErrRequestLineTooLong)
+	}
+}
+
+// 4.7: control bytes (NUL, bare CR, other controls) in header names/values
+// are rejected; HTAB and mid-value SP are still accepted.
+func TestParseRequest_ControlBytesRejected(t *testing.T) {
+	bad := []struct {
+		name string
+		raw  string
+	}{
+		{"NUL in value", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\x00b\r\n\r\n"},
+		{"NUL in name", "GET / HTTP/1.1\r\nHost: h\r\nX-\x00Foo: v\r\n\r\n"},
+		{"bare CR in value", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\rb\r\n\r\n"},
+		{"control 0x01 in value", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\x01b\r\n\r\n"},
+		{"non-tchar in name", "GET / HTTP/1.1\r\nHost: h\r\nX(Foo): v\r\n\r\n"},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, tc := range bad {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(tc.raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if !errors.Is(err, ErrInvalidHeader) {
+					t.Fatalf("got error %v, want %v", err, ErrInvalidHeader)
+				}
+			})
+		}
+	}
+
+	// HTAB inside a value (mid-value, after OWS trim) and a normal SP-bearing
+	// value must still be accepted.
+	t.Run("HTAB and SP in value accepted", func(t *testing.T) {
+		raw := "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\tb c\r\n\r\n"
+		p := NewParser()
+		p.Reset([]byte(raw))
+		var req Request
+		_, err := p.ParseRequest(&req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var got string
+		for _, h := range req.Headers {
+			if h[0] == "x-foo" {
+				got = h[1]
+			}
+		}
+		if got != "a\tb c" {
+			t.Fatalf("value = %q, want %q", got, "a\tb c")
+		}
+	})
 }

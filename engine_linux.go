@@ -10,18 +10,19 @@ import (
 	"github.com/goceleris/celeris/engine/epoll"
 	"github.com/goceleris/celeris/engine/iouring"
 	"github.com/goceleris/celeris/engine/std"
+	"github.com/goceleris/celeris/internal/cpumon"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
 
-func createEngine(cfg resource.Config, handler stream.Handler) (engine.Engine, error) {
+func createEngine(cfg resource.Config, handler stream.Handler, cpuMon cpumon.Monitor) (engine.Engine, error) {
 	switch cfg.Engine {
 	case engine.IOUring:
 		return iouring.New(cfg, handler)
 	case engine.Epoll:
 		return epoll.New(cfg, handler)
 	case engine.Adaptive:
-		return adaptive.New(cfg, handler)
+		return adaptive.New(cfg, handler, cpuMon)
 	case engine.Std:
 		return std.New(cfg, handler)
 	default:

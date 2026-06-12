@@ -887,6 +887,12 @@ func (c *Context) File(filePath string) error {
 	if rng := c.Header("range"); rng != "" {
 		if start, end, ok := parseRange(rng, size); ok {
 			length := end - start + 1
+			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			// Zero-copy sendfile(2) path (epoll). Falls through to the
+			// buffered read+seek path when the engine can't / won't take it.
+			if handled, err := c.trySendFile(f, 206, contentType, start, length); handled {
+				return err
+			}
 			if _, err := f.Seek(start, io.SeekStart); err != nil {
 				return err
 			}
@@ -894,9 +900,13 @@ func (c *Context) File(filePath string) error {
 			if _, err := io.ReadFull(f, data); err != nil {
 				return err
 			}
-			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 			return c.Blob(206, contentType, data)
 		}
+	}
+
+	// Zero-copy sendfile(2) path for the full-file (200) response.
+	if handled, err := c.trySendFile(f, 200, contentType, 0, size); handled {
+		return err
 	}
 
 	data, err := io.ReadAll(f)
@@ -904,6 +914,57 @@ func (c *Context) File(filePath string) error {
 		return err
 	}
 	return c.Blob(200, contentType, data)
+}
+
+// trySendFile attempts to serve [offset, offset+length) of f as the
+// response body via the engine's zero-copy sendfile(2) path
+// (stream.FileResponder, implemented by the epoll H1 response adapter).
+//
+// It returns handled=false (having emitted nothing) — so the caller MUST
+// fall back to the buffered read+write path — when:
+//   - the response is already written or detached;
+//   - response buffering or body capture is active (the body must pass
+//     through userspace to be buffered/captured);
+//   - the ResponseWriter does not implement FileResponder (iouring, std,
+//     HTTP/2), or it declines (body below the sendfile threshold).
+//
+// contentType is emitted as the content-type header; any headers already
+// set via c.SetHeader (accept-ranges, content-range, etag, last-modified,
+// cache-control, …) are carried through. content-length is supplied by
+// the responder from length.
+func (c *Context) trySendFile(f *os.File, status int, contentType string, offset, length int64) (bool, error) {
+	if c.written || c.detached {
+		return false, nil
+	}
+	// Buffering / capture need the body in userspace; decline so the
+	// buffered path runs and the bytes are captured/replayable.
+	if c.bufferDepth > 0 || c.captureBody {
+		return false, nil
+	}
+	if c.stream == nil {
+		return false, nil
+	}
+	fr, ok := c.stream.ResponseWriter.(stream.FileResponder)
+	if !ok {
+		return false, nil
+	}
+	// Build the header slice: content-type first, then the user headers
+	// already accumulated on the Context. content-length is injected by
+	// the responder. Mirrors c.Blob's header ordering minus content-length.
+	headers := make([][2]string, 0, len(c.respHeaders)+1)
+	headers = append(headers, [2]string{"content-type", contentType})
+	headers = append(headers, c.respHeaders...)
+
+	handled, err := fr.WriteFileResponse(c.stream, status, headers, f, offset, length)
+	if !handled {
+		return false, nil
+	}
+	c.statusCode = status
+	c.written = true
+	if length >= 0 {
+		c.bytesWritten = int(length)
+	}
+	return true, err
 }
 
 // FileFromDir safely serves a file from within baseDir. The userPath is
@@ -965,14 +1026,23 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 		return NewHTTPError(413, "file exceeds 100MB limit")
 	}
 
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-
 	contentType := mime.TypeByExtension(filepath.Ext(name))
 	if contentType == "" {
 		contentType = "application/octet-stream"
+	}
+
+	// Zero-copy sendfile(2) when the fs.FS file is backed by a real
+	// *os.File (e.g. os.DirFS). embed.FS and in-memory FSes are not, so
+	// this falls through to the buffered read below.
+	if osFile, ok := f.(*os.File); ok {
+		if handled, err := c.trySendFile(osFile, 200, contentType, 0, size); handled {
+			return err
+		}
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
 	}
 	return c.Blob(200, contentType, data)
 }

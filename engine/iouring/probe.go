@@ -176,7 +176,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 		return SendZCUnsupported, fmt.Sprintf("kernel rejected SEND_ZC opcode: cqe.res=%d (likely -ENOSYS=-38 or -EINVAL=-22)", res)
 	}
 
-	flags := *(*uint32)(unsafe.Add(unsafe.Pointer(entry), 8))
+	flags := entry.Flags
 	hasMore := flags&0x02 != 0 // CQE_F_MORE
 	ring.EndCQ(cqHead + 1)
 
@@ -200,7 +200,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 	}
 
 	entry = ring.cqeAt(cqHead)
-	notifFlags := *(*uint32)(unsafe.Add(unsafe.Pointer(entry), 8))
+	notifFlags := entry.Flags
 	isNotif := notifFlags&0x04 != 0 // CQE_F_NOTIF
 	notifRes := entry.Res
 	ring.EndCQ(cqHead + 1)
@@ -390,7 +390,7 @@ func probeMultishotAccept() (bool, string) {
 	}
 	cqe := ring.cqeAt(head)
 	res := cqe.Res
-	flags := *(*uint32)(unsafe.Add(unsafe.Pointer(cqe), 8))
+	flags := cqe.Flags
 	ring.EndCQ(head + 1)
 
 	if res < 0 {

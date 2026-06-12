@@ -87,16 +87,6 @@ func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {
 	*(*uint32)(unsafe.Pointer(&sqe[44])) = uint32(fileIndex)
 }
 
-func prepProvideBuffers(sqePtr unsafe.Pointer, addr unsafe.Pointer, bufLen int, count int, groupID uint16, bufID uint16) {
-	sqe := (*[sqeSize]byte)(sqePtr)
-	sqe[0] = opPROVIDEBUFFERS
-	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(addr))
-	*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(bufLen)
-	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(count)
-	*(*uint16)(unsafe.Pointer(&sqe[30])) = groupID
-	*(*uint16)(unsafe.Pointer(&sqe[28])) = bufID
-}
-
 func setSQEUserData(sqePtr unsafe.Pointer, data uint64) {
 	*(*uint64)(unsafe.Pointer(uintptr(sqePtr) + 32)) = data
 }
@@ -210,4 +200,26 @@ func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {
 	sqe[1] = sqeCQESkipSuccess
 	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
 	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
+}
+
+// prepCancelUserDataSkipSuccess prepares an ASYNC_CANCEL SQE that matches the
+// in-flight op by its user_data (the kernel's default cancel key when no FD
+// flag is set), with CQE_SKIP_SUCCESS to suppress the success CQE.
+//
+// This is the fixed-file-safe way to cancel a pending recv: when fixed files
+// are enabled the recv SQE's "fd" field is a fixed-file INDEX, so cancelling
+// by raw fd (prepCancelFDSkipSuccess) matches nothing or the wrong file.
+// user_data is unambiguous regardless of fixed files (v1.5.0 review 2.5).
+// targetUD is the encodeUserDataGen(udRecv, fd, gen) value the recv SQE
+// carried — it MUST include the conn's generation (review 2.6) or the
+// kernel match finds nothing.
+func prepCancelUserDataSkipSuccess(sqePtr unsafe.Pointer, targetUD uint64) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = sqeCQESkipSuccess
+	// addr (offset 16) holds the target user_data to match against.
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = targetUD
+	// cancel_flags (offset 28): cancelAll only — no cancelFD, so the kernel
+	// matches by user_data.
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelAll
 }

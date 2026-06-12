@@ -5,6 +5,7 @@ package probe
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -84,11 +85,32 @@ func probeEpollLinux() bool {
 	return true
 }
 
+// capSysNiceBit is CAP_SYS_NICE in the Linux capability bitmask
+// (include/uapi/linux/capability.h: #define CAP_SYS_NICE 23).
+const capSysNiceBit = 23
+
+// checkCapSysNiceLinux reports whether the process holds CAP_SYS_NICE.
+// It is a READ-ONLY capability check: it parses the effective capability
+// set from /proc/self/status (the "CapEff:" line, a 64-bit hex mask) and
+// tests bit 23. A probe must never have side effects — the previous
+// implementation called Setpriority(PRIO_PROCESS, 0, -1), which actually
+// *raised* the process scheduling priority as a probe, corrupting the
+// scheduler state of any process it ran in.
 func checkCapSysNiceLinux() bool {
-	err := unix.Setpriority(unix.PRIO_PROCESS, 0, -1)
-	if err == nil {
-		_ = unix.Setpriority(unix.PRIO_PROCESS, 0, 0)
-		return true
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(line, "CapEff:")
+		if !ok {
+			continue
+		}
+		mask, perr := strconv.ParseUint(strings.TrimSpace(rest), 16, 64)
+		if perr != nil {
+			return false
+		}
+		return mask&(1<<capSysNiceBit) != 0
 	}
 	return false
 }

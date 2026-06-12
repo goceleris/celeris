@@ -8,9 +8,9 @@ import (
 )
 
 // Probe detects system capabilities using the platform-default syscall prober.
-// If CELERIS_MAX_IOURING_TIER is set (none/base/mid/high/optional), the
-// detected io_uring tier and associated features are capped at that level.
-// This allows CI to exercise every tier's code path on modern kernels.
+// If CELERIS_MAX_IOURING_TIER is set (none/base/high/optional), the detected
+// io_uring tier and associated features are capped at that level. This allows
+// CI to exercise every tier's code path on modern kernels.
 func Probe() engine.CapabilityProfile {
 	profile := ProbeWith(defaultProber())
 	if maxTier := os.Getenv("CELERIS_MAX_IOURING_TIER"); maxTier != "" {
@@ -25,11 +25,6 @@ func parseTierName(s string) engine.Tier {
 		return engine.Optional
 	case "high":
 		return engine.High
-	case "mid":
-		// Backwards-compat alias: the `Mid` tier was retired in v1.4.8
-		// (see celeris#287). Map any existing CELERIS_MAX_IOURING_TIER=mid
-		// configuration to Base so deployed manifests don't break.
-		return engine.Base
 	case "base":
 		return engine.Base
 	default:
@@ -57,9 +52,7 @@ func capIOUringTier(p engine.CapabilityProfile, maxTier engine.Tier) engine.Capa
 		p.FixedFiles = false
 		p.DeferTaskrun = false
 		// COOP_TASKRUN + SINGLE_ISSUER were introduced together in 5.19
-		// and land at the High tier (see celeris#287). Pre-fix the Mid
-		// tier owned CoopTaskrun at 5.13; that was wrong, the flag did
-		// not exist before 5.19.
+		// and land at the High tier.
 		p.CoopTaskrun = false
 		p.SingleIssuer = false
 	}
@@ -93,6 +86,24 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 	profile.KernelMajor = kv.Major
 	profile.KernelMinor = kv.Minor
 
+	// sendfile(2) is universally available on Linux (kernel 2.6.33+ via
+	// pipe + splice; kernel 2.6.23+ for the actual syscall, every distro
+	// ships well past that). Set it true here unconditionally — the
+	// runtime probe (probeSendfile) is a no-op because the syscall can't
+	// fail at registration time, only at call time per file.
+	profile.Sendfile = true
+	// MSG_ZEROCOPY landed for TCP send paths in Linux 4.14 (commit
+	// f214f915e7db); UDP support came later, in 5.0 (commit b5947e5d1e71).
+	// celeris is TCP-only, so 4.14 would be the correct floor — BUT the
+	// engine does not currently ship a MSG_ZEROCOPY send path (a correct
+	// implementation needs SO_ZEROCOPY + sendmsg(MSG_ZEROCOPY) + errqueue
+	// completion draining integrated into the event loop + buffer pinning;
+	// see engine/epoll/sendfile.go). Leaving Zerocopy false avoids
+	// advertising a capability the tree does not deliver. sendfile(2)
+	// already provides zero-copy for the file-serving workload. Flip this
+	// to `kv.AtLeast(4, 14)` only when the MSG_ZEROCOPY send path lands.
+	profile.Zerocopy = false
+
 	if kv.AtLeast(2, 6) && sp.ProbeEpoll != nil {
 		profile.EpollAvailable = sp.ProbeEpoll()
 	}
@@ -119,8 +130,25 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 			profile.FixedFiles = fixedFiles
 			profile.SendZC = sendZC
 
-			if tier >= engine.Optional && sp.CheckCapSysNice != nil {
-				profile.SQPoll = sqpoll || sp.CheckCapSysNice()
+			// SQPoll (IORING_SETUP_SQPOLL) lands at the Optional tier
+			// (kernel 6.0+), where `sqpoll` from determineTier is already
+			// true. On 6.0+ the basic SQ-polling mode does not require
+			// CAP_SYS_NICE (that requirement was for pinning the poll
+			// thread to a CPU and for pre-5.13 kernels), so the tier flag
+			// alone is the correct gate. The previous `sqpoll ||
+			// CheckCapSysNice()` was a constant-true short-circuit
+			// (CheckCapSysNice never ran) AND the old CheckCapSysNice
+			// implementation mutated the process scheduling priority via
+			// Setpriority — a probe must never have side effects. The
+			// capability is now a genuine read-only check (see
+			// probe_linux.go) and is consulted only when the tier itself
+			// does not already enable SQPoll, so it can never re-disable a
+			// supported feature.
+			if tier >= engine.Optional {
+				profile.SQPoll = sqpoll
+				if !profile.SQPoll && sp.CheckCapSysNice != nil {
+					profile.SQPoll = sp.CheckCapSysNice()
+				}
 			}
 		}
 	}

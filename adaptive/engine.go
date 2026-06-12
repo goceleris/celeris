@@ -43,15 +43,24 @@ type Engine struct {
 	// Zero means no cooldown (default).
 	freezeCooldown time.Duration
 
+	// listenMu guards listenCancel/listenDone, which let Shutdown deterministically
+	// stop and JOIN the evaluation/scaler goroutines started by Listen. Without
+	// this, Shutdown could return (sub-engines stopped) while the eval loop is
+	// still mid-Sample on the CPU monitor the server is about to close.
+	listenMu     sync.Mutex
+	listenCancel context.CancelFunc
+	listenDone   chan struct{}
+
 	// freezeState synchronises the three counters below. The counters are
 	// atomic so read-only checks (performSwitch) stay lock-free, but any
 	// mutation that may flip frozen must hold this mutex to avoid races
 	// where two goroutines observe counters==0 and simultaneously transition
 	// frozen in opposite directions.
-	freezeState    sync.Mutex
-	userFreezes    atomic.Int32  // calls to FreezeSwitching not yet matched by UnfreezeSwitching
-	driverFDs      atomic.Int32  // driver FDs currently registered via the provider
-	switchRejected atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
+	freezeState     sync.Mutex
+	userFreezes     atomic.Int32  // calls to FreezeSwitching not yet matched by UnfreezeSwitching
+	driverFDs       atomic.Int32  // driver FDs currently registered via the provider
+	cooldownFreezes atomic.Int32  // post-switch cooldown timers currently holding the freeze
+	switchRejected  atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
 }
 
 // New creates a new adaptive engine with epoll as primary and io_uring as secondary.
@@ -60,7 +69,14 @@ type Engine struct {
 // switch to io_uring if telemetry indicates it would perform better for the workload.
 // Both sub-engines get the full resource config. This is safe because standby
 // workers are fully suspended (zero CPU, zero connections, listen sockets closed).
-func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
+//
+// cpuMon is an engine.CPUMonitor (the public interface); when non-nil it
+// supplies the live sampler with CPU utilization data so the io_uring bias can
+// fire in the empirical sweet spot. External callers can pass their own
+// implementation or the built-in /proc/stat monitor. Pass nil for tests or
+// when CPU monitoring is not available; the sampler degrades gracefully with
+// CPUUtilization=0 in the snapshot.
+func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) (*Engine, error) {
 	cfg = cfg.WithDefaults()
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return nil, fmt.Errorf("config validation: %w", errs[0])
@@ -94,7 +110,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
 
-	sampler := newLiveSampler()
+	sampler := newLiveSampler(cpuMon)
 	logger := cfg.Logger
 
 	e := &Engine{
@@ -143,6 +159,16 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 func (e *Engine) Listen(ctx context.Context) error {
 	innerCtx, innerCancel := context.WithCancel(ctx)
 	defer innerCancel()
+
+	// Publish the cancel + a done channel so Shutdown can stop and join the
+	// goroutines this Listen owns (eval loop, scaler) before the server closes
+	// shared resources such as the CPU monitor.
+	done := make(chan struct{})
+	e.listenMu.Lock()
+	e.listenCancel = innerCancel
+	e.listenDone = done
+	e.listenMu.Unlock()
+	defer close(done)
 
 	var wg sync.WaitGroup
 
@@ -251,7 +277,9 @@ bindLoop:
 	}
 
 	select {
-	case <-ctx.Done():
+	case <-innerCtx.Done():
+		// Parent context cancelled, or Shutdown cancelled innerCtx directly to
+		// stop and join the eval/scaler goroutines.
 	case err := <-errCh:
 		innerCancel()
 		wg.Wait()
@@ -360,18 +388,65 @@ func (e *Engine) performSwitch() {
 		"now_standby", newStandby.Type().String(),
 	)
 
-	// Suppress further switches for the cooldown period.
+	// Suppress further switches for the cooldown period. The cooldown is
+	// tracked as its own freeze reason routed through freezeState so it
+	// never clobbers a concurrent user or driver freeze: the thaw at the end
+	// of the timer only clears frozen when userFreezes, driverFDs AND any
+	// other in-flight cooldown timers have all reached zero. Two overlapping
+	// switches therefore can't have one timer thaw while the other still
+	// wants the gate held.
 	if e.freezeCooldown > 0 {
+		e.freezeState.Lock()
+		e.cooldownFreezes.Add(1)
 		e.frozen.Store(true)
+		e.freezeState.Unlock()
 		go func() {
 			time.Sleep(e.freezeCooldown)
-			e.frozen.Store(false)
+			e.freezeState.Lock()
+			e.cooldownFreezes.Add(-1)
+			e.maybeThawLocked()
+			e.freezeState.Unlock()
 		}()
 	}
 }
 
+// maybeThawLocked clears the frozen gate only when no freeze reason remains —
+// no external freezes, no live driver FDs, and no in-flight post-switch
+// cooldown timers. Callers must hold freezeState. This is the single chokepoint
+// that flips frozen false so independent freeze reasons never clobber each
+// other.
+func (e *Engine) maybeThawLocked() {
+	if e.userFreezes.Load() == 0 && e.driverFDs.Load() == 0 && e.cooldownFreezes.Load() == 0 {
+		e.frozen.Store(false)
+	}
+}
+
 // Shutdown gracefully shuts down both sub-engines.
+//
+// It first cancels and JOINS the goroutines started by Listen (the evaluation
+// loop and worker scaler), so that no controller tick can still be sampling
+// telemetry — including the CPU monitor the server closes immediately after
+// Shutdown returns — by the time this function completes. Only then are the
+// sub-engines shut down. This is purely a join/sequencing concern; it does not
+// touch the ACTIVE→DRAINING→SUSPENDED worker lifecycle.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	e.listenMu.Lock()
+	cancel := e.listenCancel
+	done := e.listenDone
+	e.listenMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Honour the caller's deadline even if Listen is slow to unwind;
+			// the ProcStat closed-flag still makes a late Sample safe.
+		}
+	}
+
 	return errors.Join(
 		e.primary.Shutdown(ctx),
 		e.secondary.Shutdown(ctx),
@@ -395,9 +470,6 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
 		ErrorCount:         pm.ErrorCount + sm.ErrorCount,
 		Throughput:         pm.Throughput + sm.Throughput,
-		LatencyP50:         max(pm.LatencyP50, sm.LatencyP50),
-		LatencyP99:         max(pm.LatencyP99, sm.LatencyP99),
-		LatencyP999:        max(pm.LatencyP999, sm.LatencyP999),
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 	}
@@ -441,9 +513,7 @@ func (e *Engine) UnfreezeSwitching() {
 		e.userFreezes.Store(0)
 		return
 	}
-	if e.userFreezes.Load() == 0 && e.driverFDs.Load() == 0 {
-		e.frozen.Store(false)
-	}
+	e.maybeThawLocked()
 }
 
 // acquireDriverFD registers that a driver has attached a FD to the adaptive
@@ -466,9 +536,7 @@ func (e *Engine) releaseDriverFD() {
 		e.driverFDs.Store(0)
 		return
 	}
-	if e.userFreezes.Load() == 0 && e.driverFDs.Load() == 0 {
-		e.frozen.Store(false)
-	}
+	e.maybeThawLocked()
 }
 
 // DriverFDCount reports the number of driver FDs currently registered on

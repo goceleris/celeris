@@ -51,7 +51,7 @@ func runScalerH2Once(t *testing.T, iter int) {
 		},
 		WorkerScaling: &resource.WorkerScalingConfig{}, // zero value → start-high
 	}
-	e, err := New(cfg, &h2PrefaceHandler{})
+	e, err := New(cfg, &h2PrefaceHandler{}, nil)
 	if err != nil {
 		t.Skipf("iter %d: adaptive engine unavailable: %v", iter, err)
 	}
