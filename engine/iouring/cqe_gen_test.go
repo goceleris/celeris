@@ -8,13 +8,15 @@ import (
 )
 
 // TestEncodeDecodeUserDataGenRoundTrip verifies the v1.5.0 review-2.6 user_data
-// layout: op(bits 56-63) | gen(bits 40-47) | fd(bits 0-39). Every op tag, the
-// full generation range (0..255), and fd values up to 65535 (every real fd /
-// fixed-file index) must survive an encode→decode round trip independently.
+// layout: op(bits 56-63) | gen(bits 40-55, widened to 16 bits) | fd(bits 0-39).
+// Every op tag, generation values spanning the full 16-bit range (including
+// the old 8-bit boundary 255/256 and the new boundary 65535), and fd values up
+// to 65535 (every real fd / fixed-file index) must survive an encode→decode
+// round trip independently.
 func TestEncodeDecodeUserDataGenRoundTrip(t *testing.T) {
 	ops := []uint64{udRecv, udSend, udClose, udHeaderTimer}
 	fds := []int{0, 1, 2, 3, 255, 256, 1023, 1024, 4095, 65534, 65535}
-	gens := []uint8{0, 1, 2, 127, 128, 200, 254, 255}
+	gens := []uint16{0, 1, 2, 127, 128, 200, 254, 255, 256, 257, 4096, 32767, 32768, 65534, 65535}
 
 	for _, op := range ops {
 		for _, fd := range fds {
@@ -53,12 +55,42 @@ func TestEncodeUserDataGenZeroEqualsLegacy(t *testing.T) {
 // fd := int(ud & fdMask) directly, so a non-zero gen must NOT bleed into fd.
 func TestDecodeFDIgnoresGenBits(t *testing.T) {
 	const fd = 12345
-	ud := encodeUserDataGen(udRecv, fd, 0xFF)
+	ud := encodeUserDataGen(udRecv, fd, 0xFFFF)
 	if got := int(ud & fdMask); got != fd {
 		t.Fatalf("ud&fdMask = %d, want %d (gen bits bled into fd)", got, fd)
 	}
 	if got := decodeFD(ud); got != fd {
 		t.Fatalf("decodeFD = %d, want %d", got, fd)
+	}
+}
+
+// TestGenNoAliasAcrossOldEightBitBoundary guards the v1.5.0 widening of the
+// generation tag to 16 bits. Generations congruent mod 256 (1 vs 257) ALIASED
+// under the old 8-bit tag — the fd-reuse collision that misattributes a closed
+// predecessor's terminal CQE to the live occupant, misdecrementing its
+// kernelInflight and re-opening the close-time early-release UAF. With the
+// 16-bit tag they must encode distinct user_data, and staleConnCQE must report
+// the old-gen CQE stale instead of touching the live conn's accounting.
+func TestGenNoAliasAcrossOldEightBitBoundary(t *testing.T) {
+	const fd = 13
+	const oldGen, liveGen uint16 = 1, 257 // 257 % 256 == 1: aliased pre-widening
+
+	if encodeUserDataGen(udRecv, fd, oldGen) == encodeUserDataGen(udRecv, fd, liveGen) {
+		t.Fatalf("gen %d and %d alias in user_data: generation tag is not 16-bit", oldGen, liveGen)
+	}
+
+	w := &Worker{conns: make([]*connState, 64)}
+	live := &connState{fd: fd, generation: liveGen, kernelInflight: 1, recvArmed: true}
+	w.conns[fd] = live
+
+	// Terminal recv CQE from the closed predecessor (oldGen): must be stale.
+	c := &completionEntry{UserData: encodeUserDataGen(udRecv, fd, oldGen), Res: -125}
+	if !w.staleConnCQE(c, fd, c.UserData) {
+		t.Fatalf("old-gen (%d) CQE misattributed to live conn gen=%d", oldGen, liveGen)
+	}
+	if live.kernelInflight != 1 || !live.recvArmed {
+		t.Fatalf("stale CQE touched live conn accounting: inflight=%d recvArmed=%v, want 1/true",
+			live.kernelInflight, live.recvArmed)
 	}
 }
 
@@ -95,7 +127,7 @@ func cqeFlagsWithBuffer(bufID uint16) uint32 {
 // ring leaks an entry → ENOBUFS → CQE storm (celeris#322).
 func TestStaleConnCQEDropsAndRecyclesBuffer(t *testing.T) {
 	const fd = 7
-	const liveGen uint8 = 42
+	const liveGen uint16 = 42
 
 	w := &Worker{
 		conns:   make([]*connState, 64),

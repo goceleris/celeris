@@ -243,9 +243,16 @@ func TestStaleTerminalOpIgnoresIntermediateCQEs(t *testing.T) {
 
 // TestLiveTerminalCQEUpdatesInflight verifies the live-conn side of the
 // accounting chokepoint: a matching-generation terminal recv CQE clears
-// recvArmed and decrements kernelInflight (clamped at zero so a 1-in-256
-// generation-collision misroute can never push a live conn negative and
-// unlock an early release at its own close).
+// recvArmed and decrements kernelInflight.
+//
+// The zero clamp exercised at the end is DAMAGE LIMITATION, not full
+// protection: it only stops a misrouted CQE (generation collision across
+// fd reuse, 1/65536 per reuse with the 16-bit tag) from pushing an
+// already-drained counter negative. A misroute that lands while the live
+// conn still has ops in flight under-counts it — a 1→0 misdecrement
+// unlocks early release at that conn's own close (see the known-residual
+// comment in staleConnCQE). The residual's production signal is the
+// orphaned closedOps entry firing the 5 s backstop WARN.
 func TestLiveTerminalCQEUpdatesInflight(t *testing.T) {
 	const fd, gen = 6, 2
 	w := &Worker{conns: make([]*connState, 32)}

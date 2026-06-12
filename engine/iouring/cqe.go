@@ -15,13 +15,22 @@ type completionEntry struct {
 // reused the same fd (or fixed-file slot).
 //
 //	bits 56-63 (8)  : op tag      (udMask)
-//	bits 40-47 (8)  : generation  (genMask) — connState.generation, conn-bound ops only
+//	bits 40-55 (16) : generation  (genMask) — connState.generation, conn-bound ops only
 //	bits  0-39 (40) : fd / fixed-file index (fdMask)
 //
 // 40 bits comfortably covers every real fd and fixed-file index (both
 // < 65536 in practice). gen=0 is used for ops that are NOT bound to a
 // connState (accept on listenFD, the H2 wakeup eventfd, the udProvide
 // cancel sentinel, and the driver ops which have their own lifecycle).
+//
+// The generation was widened from 8 to 16 bits in v1.5.0 (bits 48-55
+// were unused): generations are per-connState-object, so under fd reuse
+// a terminal CQE from a closed predecessor can collide with the live
+// occupant's (fd, gen) identity and be misattributed at dispatch —
+// misdecrementing the LIVE conn's kernelInflight and re-opening the
+// close-time early-release window (see staleConnCQE). 16 bits cuts the
+// per-reuse collision probability 256x, from 1/256 to 1/65536. Old
+// 8-bit-encoded values decode identically (bits 48-55 were zero).
 const (
 	udAccept uint64 = 0x01 << 56
 	udRecv   uint64 = 0x02 << 56
@@ -50,7 +59,7 @@ const (
 	udDriverClose uint64 = 0x12 << 56
 	udMask        uint64 = 0xFF << 56
 	genShift             = 40
-	genMask       uint64 = 0xFF << genShift
+	genMask       uint64 = 0xFFFF << genShift
 	fdMask        uint64 = (1 << 40) - 1
 )
 
@@ -65,7 +74,7 @@ func encodeUserData(op uint64, fd int) uint64 {
 // connState's generation so a stale CQE from a prior fd occupant is
 // detectable at dispatch (see decodeGen). gen=0 collapses to the same
 // value encodeUserData would produce.
-func encodeUserDataGen(op uint64, fd int, gen uint8) uint64 {
+func encodeUserDataGen(op uint64, fd int, gen uint16) uint64 {
 	return op | (uint64(gen) << genShift) | (uint64(fd) & fdMask)
 }
 
@@ -73,8 +82,8 @@ func decodeOp(userData uint64) uint64 {
 	return userData & udMask
 }
 
-func decodeGen(userData uint64) uint8 {
-	return uint8((userData & genMask) >> genShift)
+func decodeGen(userData uint64) uint16 {
+	return uint16((userData & genMask) >> genShift)
 }
 
 func decodeFD(userData uint64) int {
@@ -92,7 +101,7 @@ func connOpKey(userData uint64) uint64 {
 
 // encodeConnOpKey builds the same (generation, fd) identity from a closed
 // conn's fields — the value connOpKey extracts from its ops' user_data.
-func encodeConnOpKey(fd int, gen uint8) uint64 {
+func encodeConnOpKey(fd int, gen uint16) uint64 {
 	return (uint64(gen) << genShift) | (uint64(fd) & fdMask)
 }
 

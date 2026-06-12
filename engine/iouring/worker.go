@@ -847,10 +847,24 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			if op == udRecv {
 				cs.recvArmed = false
 			}
-			// Clamp at zero: a 1-in-256 generation collision across fd
-			// reuse can misroute a stale CQE here (pre-existing gen-tag
-			// limitation); never let it push a live conn's counter
-			// negative and unlock an early release.
+			// KNOWN RESIDUAL — gen-collision misroute. A closed
+			// predecessor's terminal CQE that arrives after this fd was
+			// re-occupied by a conn with a COLLIDING generation (gens are
+			// per-connState-object; 1/65536 per reuse with the 16-bit
+			// tag) is indistinguishable from the live conn's own CQE and
+			// lands here. The clamp below only stops an already-drained
+			// counter going negative; a misdecrement from >=1 DOES
+			// under-count the live conn (and may clear recvArmed above
+			// with its recv still kernel-armed), so its own close can
+			// skip the cancel and release early — the UAF class this
+			// accounting exists to prevent. Reachability is narrow:
+			// non-SQPOLL task-work ordering posts the close-path
+			// -ECANCELED during the submit syscall, before the fd can be
+			// re-accepted; the window needs a dropped cancel SQE (full SQ
+			// ring) or SQPOLL's decoupled completion ordering ON TOP of
+			// the gen collision. When it fires, the closed conn's
+			// closedOps entry is left orphaned and the 5 s backstop WARN
+			// in drainPendingRelease is the production signal.
 			if cs.kernelInflight > 0 {
 				cs.kernelInflight--
 			}
@@ -2480,7 +2494,7 @@ func (w *Worker) finishClose(fd int) {
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
 			prepCloseDirect(sqe, fd)
-			gen := uint8(0)
+			gen := uint16(0)
 			if cs != nil {
 				gen = cs.generation
 			}

@@ -57,9 +57,19 @@ type connState struct {
 	// late/in-flight CQE carrying the OLD gen is dropped at dispatch
 	// instead of being misrouted to the new occupant (fixes the
 	// use-after-reuse / wrong-conn-write / error-CQE-nils-live-slot class:
-	// 2.2 error path, 2.7 hijack/close fd-reuse). uint8 wrap is fine —
-	// 256 generations outlast any in-flight CQE.
-	generation uint8 // 1
+	// 2.2 error path, 2.7 hijack/close fd-reuse).
+	//
+	// uint16, widened from uint8 in v1.5.0: generations are per-connState
+	// OBJECT (pool-recycled), not per-fd, so the conn that re-occupies an
+	// fd draws its gen from a different counter and can collide with a
+	// closed predecessor that still has terminal CQEs in flight. A
+	// collision misroutes those CQEs to the live conn at dispatch
+	// (staleConnCQE), misdecrementing its kernelInflight — at 1→0 that
+	// disarms the close-time cancel and re-opens the early-release UAF
+	// this release fixed. 16 bits drops the per-reuse collision odds from
+	// 1/256 to 1/65536; wrap-around remains fine — 65536 generations
+	// outlast any in-flight CQE.
+	generation uint16 // 2
 	// liveIdx is this conn's index into Worker.liveConns, maintained so
 	// removeLiveConn is O(1) (swap-with-last) instead of an O(N) linear
 	// scan (celeris#318 follow-up / v1.5.0 review 1.8). -1 when the conn is
