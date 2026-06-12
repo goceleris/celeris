@@ -197,6 +197,32 @@ type connState struct {
 	// before closeConn) then forces RST. The walker's next write hits
 	// ECONNRESET immediately regardless of TCP send-buffer state.
 	forceRSTClose bool
+
+	// kernelInflight counts conn-buffer-referencing kernel ops — RECVs
+	// targeting cs.buf / h1State.bodyBuf and SEND/WRITEV/SEND_ZC reading
+	// cs.sendBuf / cs.sendBody / cs.iov — that have been submitted but
+	// have not yet delivered their TERMINAL CQE (success, -ECANCELED,
+	// -ECONNRESET, ...; for multishot recv and SEND_ZC the terminal CQE
+	// is the one WITHOUT CQE_F_MORE). Incremented at SQE submission
+	// (prepareRecv / flushSend / flushSendLink), decremented at CQE
+	// dispatch (staleConnCQE — both the live and the stale-generation
+	// path, the latter via Worker.closedOps). Worker-thread-only.
+	//
+	// This is the release gate for the #256-class use-after-free (v1.4.15/7beebb9 allocCount variant):
+	// unix.Close(fd) does NOT complete a pending io_uring recv (the op
+	// holds its own file reference), so a closed conn's cs.buf must stay
+	// reachable until every kernel-held op has terminated — otherwise a
+	// retransmitted/straggler segment is DMA'd into memory the Go runtime
+	// has repurposed. drainPendingRelease only releases a connState once
+	// this counter reaches zero (with a wall-clock backstop for kernel
+	// anomalies). Mirrors driverConn.inflightOps.
+	kernelInflight int32
+	// recvArmed is true while a recv SQE (single-shot or multishot) is
+	// kernel-held for this conn. Set by prepareRecv / flushSendLink's
+	// linked recv, cleared when the recv's terminal CQE is dispatched.
+	// The close paths use it to target an ASYNC_CANCEL at the armed
+	// recv's exact generation-tagged user_data. Worker-thread-only.
+	recvArmed bool
 }
 
 var connStatePool = sync.Pool{
@@ -273,12 +299,18 @@ func releaseConnState(cs *connState) {
 	cs.asyncDetachPending = false
 	cs.bodyBuf = nil
 	cs.sendBody = nil
-	// bodyRecvPin is cleared here, after the pendingRelease hold window has
-	// elapsed (releaseConnState is only called from drainPendingRelease for
-	// recycled conns), so the kernel can no longer be writing into the pinned
-	// bodyBuf array (#256 body-buffer UAF guard).
+	// bodyRecvPin is cleared here, after every kernel-held op delivered its
+	// terminal CQE (releaseConnState is only called from drainPendingRelease
+	// once cs.kernelInflight drained — or its backstop fired), so the kernel
+	// can no longer be writing into the pinned bodyBuf array (#256
+	// body-buffer UAF guard).
 	cs.bodyRecvPin = nil
 	cs.detectAccum = cs.detectAccum[:0]
+	// kernelInflight is zero on every normal release (drainPendingRelease
+	// gates on it); reset defensively for the wall-clock-backstop path,
+	// where the worker gave up waiting on a CQE the kernel never produced.
+	cs.kernelInflight = 0
+	cs.recvArmed = false
 	cs.fd = 0
 	cs.liveIdx = -1
 	connStatePool.Put(cs)

@@ -81,6 +81,21 @@ func decodeFD(userData uint64) int {
 	return int(userData & fdMask)
 }
 
+// connOpKey strips the op tag from a conn-bound user_data, leaving the
+// (generation, fd) identity that every in-flight op of one conn shares.
+// Used as the Worker.closedOps map key so a terminal recv/send CQE
+// arriving AFTER its conn closed can still be attributed to the closed
+// connState for kernelInflight accounting (release gating).
+func connOpKey(userData uint64) uint64 {
+	return userData &^ udMask
+}
+
+// encodeConnOpKey builds the same (generation, fd) identity from a closed
+// conn's fields — the value connOpKey extracts from its ops' user_data.
+func encodeConnOpKey(fd int, gen uint8) uint64 {
+	return (uint64(gen) << genShift) | (uint64(fd) & fdMask)
+}
+
 func cqeBufferID(flags uint32) uint16 {
 	return uint16(flags >> 16)
 }
