@@ -63,8 +63,12 @@ type Server struct {
 	// CPU utilization data and powers CPUUtilization in observe.Collector
 	// snapshots. Created lazily in doPrepare and closed in Shutdown so
 	// resources (e.g. the /proc/stat file descriptor on Linux) are released
-	// when the server stops.
-	cpuMon cpumon.Monitor
+	// when the server stops. cpuMonMu serializes the doPrepare write against
+	// the Shutdown read/close: Start (doPrepare) and Shutdown run on
+	// different goroutines and the sync.Once guarding doPrepare gives no
+	// happens-before to Shutdown, so the field handoff must be locked.
+	cpuMon   cpumon.Monitor
+	cpuMonMu sync.Mutex
 
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
@@ -380,6 +384,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // and safe to call from Shutdown even if the monitor was never installed (e.g.
 // the engine failed to start, or Start was never called).
 func (s *Server) closeCPUMonitor() {
+	s.cpuMonMu.Lock()
+	defer s.cpuMonMu.Unlock()
 	if s.cpuMon == nil {
 		return
 	}
@@ -613,7 +619,13 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		if cpuMonErr != nil {
 			cfg.Logger.Warn("CPUMonitor unavailable, bias will not fire", "err", cpuMonErr)
 		}
+		// Locked handoff: a concurrent Shutdown reads/closes s.cpuMon under
+		// the same mutex. The monitor is fully constructed above (same
+		// goroutine) before the lock publishes it, so Shutdown either sees
+		// nil or a complete monitor — never a half-built one.
+		s.cpuMonMu.Lock()
 		s.cpuMon = cpuMon
+		s.cpuMonMu.Unlock()
 
 		var err error
 		eng, err = createEngine(cfg, handler, cpuMon)
