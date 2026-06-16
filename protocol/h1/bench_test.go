@@ -52,6 +52,33 @@ func BenchmarkParseRequest_ManyHeaders(b *testing.B) {
 	}
 }
 
+// BenchmarkParseRequest_KeepAliveGET_H2CDetect mirrors the engine hot path:
+// zero-copy headers with h2c-upgrade detection enabled (the default Auto config,
+// EnableH2Upgrade=true). The request carries a realistic browser-ish header set
+// where most field-names cannot begin an h2c signal (Upgrade/HTTP2-Settings/
+// Connection), so the per-header detection call is pure overhead on these.
+func BenchmarkParseRequest_KeepAliveGET_H2CDetect(b *testing.B) {
+	raw := []byte("GET /api/users/42 HTTP/1.1\r\n" +
+		"Host: api.example.com\r\n" +
+		"User-Agent: Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/140.0\r\n" +
+		"Accept: application/json,text/plain,*/*\r\n" +
+		"Accept-Encoding: gzip, deflate, br\r\n" +
+		"Accept-Language: en-US,en;q=0.9\r\n" +
+		"Referer: https://example.com/dashboard\r\n" +
+		"Connection: keep-alive\r\n\r\n")
+	p := NewParser()
+	p.SetZeroCopy(true) // engines parse in zero-copy mode
+	var req Request
+	b.SetBytes(int64(len(raw)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Reset(raw)
+		req.Reset()
+		_, _ = p.ParseRequest(&req)
+	}
+}
+
 func BenchmarkGetBody_ZeroCopy(b *testing.B) {
 	body := strings.Repeat("x", 4096)
 	raw := []byte(fmt.Sprintf("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n%s", len(body), body))

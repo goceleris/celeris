@@ -302,8 +302,17 @@ func (p *Parser) appendHeader(req *Request, rawName, rawValue []byte) error {
 	// h2c upgrade detection (RFC 7540 §3.2). Run on raw bytes regardless of
 	// noStringHeaders mode so the detection is uniform across paths. Skipped
 	// when the engine has already ruled out h2c upgrade.
-	if !p.disableH2CDetect {
-		p.detectH2CHeader(req, rawName, rawValue)
+	//
+	// Only Upgrade / HTTP2-Settings / Connection field-names carry an h2c
+	// signal (detectH2CHeader switches on exactly u/h/c). Gate the
+	// non-inlinable call on the first byte here so the majority of headers
+	// — which can never match — skip the call entirely. This is a pure no-op
+	// elision: every header that would do real work in detectH2CHeader still
+	// reaches it.
+	if !p.disableH2CDetect && len(rawName) > 0 {
+		if c := rawName[0] | 0x20; c == 'u' || c == 'h' || c == 'c' {
+			p.detectH2CHeader(req, rawName, rawValue)
+		}
 	}
 	if !p.noStringHeaders {
 		name := internOrLowerHeader(rawName)
