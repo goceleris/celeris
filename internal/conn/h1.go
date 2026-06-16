@@ -107,7 +107,7 @@ type H1State struct {
 	MaxRequestBodySize int64                                               // 0 = use default (100 MB)
 	OnExpectContinue   func(method, path string, headers [][2]string) bool // nil = always accept
 	OnDetach           func()                                              // set by engine; called on Context.Detach
-	Detached           bool                                                // set by OnDetach; breaks pipelining loop
+	Detached           atomic.Bool                                         // set by OnDetach; breaks pipelining loop. atomic: written on the dispatch/handler goroutine (Context.Detach -> OnDetach), read on the engine worker goroutine.
 
 	// WSDataDelivery is set by the WebSocket middleware after upgrade (101 sent).
 	// When non-nil and Detached, subsequent reads are delivered as raw bytes
@@ -336,7 +336,7 @@ func (s *H1State) DispatchBufferedBody(ctx context.Context, handler stream.Handl
 	}
 	s.bodyBuf = s.bodyBuf[:0]
 	s.bodyNeeded = 0
-	if s.Detached {
+	if s.Detached.Load() {
 		return nil, nil
 	}
 	if !s.req.KeepAlive {
@@ -391,7 +391,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	// WebSocket upgrade: deliver raw bytes to the middleware goroutine
 	// instead of parsing as H1. The delivery callback writes to an io.Pipe
 	// that the goroutine reads from.
-	if state.Detached && state.WSDataDelivery != nil {
+	if state.Detached.Load() && state.WSDataDelivery != nil {
 		state.WSDataDelivery(data)
 		return nil
 	}
@@ -416,7 +416,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	// ReadHeaderTimeout. With defer-arm, every successful request
 	// would re-arm the deadline; the next keep-alive idle conn would
 	// get killed at ReadHeaderTimeout instead of IdleTimeout.
-	if state.HeaderDeadlineNs.Load() == 0 && state.bodyNeeded == 0 && !state.Detached {
+	if state.HeaderDeadlineNs.Load() == 0 && state.bodyNeeded == 0 && !state.Detached.Load() {
 		state.ArmHeaderDeadline()
 	}
 
@@ -458,7 +458,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		}
 		state.bodyBuf = state.bodyBuf[:0]
 		state.bodyNeeded = 0
-		if state.Detached {
+		if state.Detached.Load() {
 			return nil
 		}
 		if !state.req.KeepAlive {
@@ -552,7 +552,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 						if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 							return err
 						}
-						if state.Detached {
+						if state.Detached.Load() {
 							return nil
 						}
 						if !state.req.KeepAlive {
@@ -596,7 +596,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 			if err := handleH1Request(ctx, state, nil, handler, write); err != nil {
 				return err
 			}
-			if state.Detached {
+			if state.Detached.Load() {
 				// Handler called Detach — a goroutine now writes through
 				// the mutex-guarded writeFn. We must NOT continue parsing
 				// pipelined requests with the stale `write` parameter
@@ -724,7 +724,7 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 		if err := handleH1Request(ctx, state, bodyData, handler, write); err != nil {
 			return err
 		}
-		if state.Detached {
+		if state.Detached.Load() {
 			return nil // see fast-path comment above
 		}
 		if !state.req.KeepAlive {

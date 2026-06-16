@@ -492,7 +492,7 @@ func (l *Loop) run(ctx context.Context) {
 				// `next` was captured above, so the removeDirty inside
 				// armEpollOut is safe mid-iteration.
 				cs.pendingBytes = csPendingBytes(cs)
-				detachedWS := cs.h1State != nil && cs.h1State.Detached
+				detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -1060,7 +1060,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// + eventfd, not this inline HTTP flush). A pending sendfile
 				// is resumed by handleWritable on the next EPOLLOUT edge.
 				cs.pendingBytes = csPendingBytes(cs)
-				if cs.h1State != nil && cs.h1State.Detached {
+				if cs.h1State != nil && cs.h1State.Detached.Load() {
 					l.markDirty(cs)
 				} else {
 					l.armEpollOut(cs)
@@ -1204,7 +1204,6 @@ func (l *Loop) initProtocol(cs *connState) {
 			cs.h1State.SetSendFileFn(l.makeSendFileFn(cs))
 		}
 		cs.h1State.OnDetach = func() {
-			cs.h1State.Detached = true
 			// In async mode cs.detachMu was already allocated at
 			// acquireConnState time. Reuse it so the dispatch
 			// goroutine (which closes over cs.detachMu) and the
@@ -1353,6 +1352,15 @@ func (l *Loop) initProtocol(cs *connState) {
 					_, _ = unix.Write(l.eventFD, val[:])
 				}
 			}
+			// Publish barrier: Store(true) LAST so a worker that observes
+			// Detached.Load()==true is guaranteed (atomic happens-before) to
+			// also see every detach side effect set above — detachMu install,
+			// guarded writeFn/RawWriteFn, pause/resume callbacks, async
+			// bookkeeping. The worker reads Detached on the hot path
+			// (writeCap, drainRead, WS delivery); publishing it first would
+			// let the worker act on a half-installed detach. See the data-race
+			// fix making Detached atomic.
+			cs.h1State.Detached.Store(true)
 		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
 			return l.hijackConn(cs.fd)
@@ -2088,7 +2096,7 @@ func (l *Loop) checkTimeouts() {
 		// engine-config-driven idle/read/write timeouts since the middleware
 		// owns the I/O lifecycle. Async-mode conns set detachMu up front
 		// without a true detach — fall through to the normal scan for those.
-		if cs.h1State != nil && cs.h1State.Detached {
+		if cs.h1State != nil && cs.h1State.Detached.Load() {
 			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
 				l.closeConn(fd)
 			}
@@ -2162,7 +2170,7 @@ func (l *Loop) closeConn(fd int) {
 		// Only decrement when OnDetach actually fired (WS/SSE detach).
 		// Async-mode HTTP1 conns pre-allocate detachMu without bumping
 		// detachedCount, so decrementing would underflow here.
-		if cs.h1State != nil && cs.h1State.Detached && l.detachedCount > 0 {
+		if cs.h1State != nil && cs.h1State.Detached.Load() && l.detachedCount > 0 {
 			l.detachedCount--
 		}
 	}
@@ -2178,7 +2186,7 @@ func (l *Loop) closeConn(fd int) {
 	// the iouring side). cs.asyncClosed is set earlier; the goroutine
 	// checks it on loop re-entry, so acquiring detachMu here only
 	// blocks for the current ProcessH1 call.
-	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached.Load()
 	l.removeDirty(cs)
 	// Release any in-progress sendfile transfer's dup'd descriptor. Sendfile
 	// responses only run on non-detached H1 conns, so releaseConnState would
@@ -2278,7 +2286,7 @@ func (l *Loop) shutdown() {
 			}
 			cs.detachMu.Unlock()
 		}
-		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached.Load()
 		if !trulyDetached && cs.h1State != nil {
 			// Mirror the closeConn fix: hold detachMu while tearing
 			// down h1State so ProcessH1 in runAsyncHandler isn't still

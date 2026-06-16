@@ -1304,7 +1304,6 @@ func (w *Worker) initProtocol(cs *connState) {
 			cs.h1State.SetWriteBodyFn(w.makeWriteBodyFn(cs))
 		}
 		cs.h1State.OnDetach = func() {
-			cs.h1State.Detached = true
 			// Async mode may have already allocated detachMu in
 			// acquireConnState; reuse it so the async goroutine and the
 			// middleware goroutine share one mutex. Otherwise create
@@ -1447,6 +1446,16 @@ func (w *Worker) initProtocol(cs *connState) {
 					_, _ = unix.Write(wakeupFD, val[:])
 				}
 			}
+			// Publish barrier: Store(true) LAST so a worker that observes
+			// Detached.Load()==true is guaranteed (atomic happens-before) to
+			// also see every detach side effect set above — detachMu install,
+			// guarded writeFn/RawWriteFn, pause/resume callbacks, async
+			// bookkeeping. In async mode OnDetach runs on the dispatch
+			// goroutine while the worker reads Detached on the hot path
+			// (writeCap, drainRecv, WS delivery); publishing it first would
+			// let the worker act on a half-installed detach. See the data-race
+			// fix making Detached atomic.
+			cs.h1State.Detached.Store(true)
 		}
 		if !cs.fixedFile {
 			cs.h1State.HijackFn = func() (net.Conn, error) {
@@ -2213,7 +2222,7 @@ func (w *Worker) closeConn(fd int) {
 		// Async mode pre-allocates detachMu in acquireConnState but does
 		// NOT increment detachedCount, so decrementing here would cause
 		// underflow for plain async-HTTP1 conns.
-		if cs.h1State != nil && cs.h1State.Detached && w.detachedCount > 0 {
+		if cs.h1State != nil && cs.h1State.Detached.Load() && w.detachedCount > 0 {
 			w.detachedCount--
 		}
 	}
@@ -2234,7 +2243,7 @@ func (w *Worker) closeConn(fd int) {
 	// and the goroutine checks it on loop re-entry, so acquiring
 	// detachMu here only blocks for the duration of the current
 	// ProcessH1 call.
-	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached.Load()
 	if !trulyDetached && cs.h1State != nil {
 		if detached {
 			cs.detachMu.Lock()
@@ -2468,7 +2477,7 @@ func (w *Worker) finishClose(fd int) {
 
 	// Capture close-path decisions before queueing cs for deferred release.
 	fixedFile := cs != nil && cs.fixedFile
-	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached
+	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached.Load()
 	// Cancel-then-release discipline (v1.4.15/7beebb9 corruption fix): ASYNC_CANCEL any kernel-held
 	// op still targeting cs's buffers (the single-shot recv is virtually
 	// ALWAYS armed here — closing the fd below does NOT complete it), then
@@ -2626,7 +2635,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// No drainRecvBuffer (which was the prior approach's race source —
 	// the drain syscall and the close syscall left a multi-µs window in
 	// which a fresh walker drip would queue, making the close → RST).
-	if cs.h1State != nil && !cs.h1State.Detached {
+	if cs.h1State != nil && !cs.h1State.Detached.Load() {
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
 		_ = unix.Close(fd)
 		return
@@ -3455,7 +3464,7 @@ func (w *Worker) checkTimeouts() {
 		// I/O lifecycle. Async-mode conns set detachMu up front without
 		// a real detach — fall through to the normal timeout scan for
 		// those.
-		if cs.h1State != nil && cs.h1State.Detached {
+		if cs.h1State != nil && cs.h1State.Detached.Load() {
 			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
 				w.closeConn(fd)
 			}
@@ -3515,7 +3524,7 @@ func (w *Worker) shutdown() {
 			}
 			cs.detachMu.Unlock()
 		}
-		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached
+		trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached.Load()
 		if !trulyDetached && cs.h1State != nil {
 			// Mirror the closeConn fix: hold detachMu while tearing
 			// down h1State so ProcessH1 in runAsyncHandler isn't still
