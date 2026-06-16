@@ -36,6 +36,43 @@ func TestIoUringBiasConnFactorFalloff(t *testing.T) {
 	}
 }
 
+// TestIoUringBiasErrorRateGuard verifies the overload/churn guard: a workload
+// shedding errors above biasErrorRateCutoff yields zero bias even when it is
+// otherwise squarely in the io_uring sweet spot. This is the churn-close
+// signature (celeris#331) — io_uring must not be modeled as favorable there.
+func TestIoUringBiasErrorRateGuard(t *testing.T) {
+	sweetSpot := TelemetrySnapshot{ActiveConnections: 2048, CPUUtilization: 1.0}
+
+	// Sanity: with no errors, the sweet spot produces a positive bias.
+	if got := ioUringBias(sweetSpot); got <= 0 {
+		t.Fatalf("expected positive bias in the sweet spot with no errors, got %v", got)
+	}
+
+	tests := []struct {
+		name      string
+		errorRate float64
+		wantZero  bool
+	}{
+		{name: "healthy: tiny error rate keeps bias", errorRate: biasErrorRateCutoff / 2, wantZero: false},
+		{name: "at cutoff: still allowed", errorRate: biasErrorRateCutoff, wantZero: false},
+		{name: "above cutoff: bias zeroed", errorRate: biasErrorRateCutoff * 2, wantZero: true},
+		{name: "churn-close signature: bias zeroed", errorRate: 0.998, wantZero: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := sweetSpot
+			snap.ErrorRate = tt.errorRate
+			got := ioUringBias(snap)
+			if tt.wantZero && got != 0 {
+				t.Errorf("ioUringBias(errorRate=%v) = %v, want 0", tt.errorRate, got)
+			}
+			if !tt.wantZero && got <= 0 {
+				t.Errorf("ioUringBias(errorRate=%v) = %v, want > 0", tt.errorRate, got)
+			}
+		})
+	}
+}
+
 func TestComputeScoreTwoTerm(t *testing.T) {
 	w := DefaultWeights()
 	snap := TelemetrySnapshot{ThroughputRPS: 1000, ErrorRate: 0.05}

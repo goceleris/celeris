@@ -47,9 +47,22 @@ func computeScore(snap TelemetrySnapshot, w ScoreWeights) float64 {
 // x86 — see the bench data above — not a bug. If #318 identifies a
 // different cause (e.g. a PbufRing bottleneck, fixed by #322), update
 // this comment to point at the new finding.
+// biasErrorRateCutoff is the error fraction above which ioUringBias refuses to
+// model io_uring as favorable: io_uring's accept/close lifecycle degrades under
+// connection churn (#331), and that overload surfaces as a high error fraction.
+// Biasing toward io_uring while a workload is shedding errors would proactively
+// switch onto the engine failing the hardest.
+const biasErrorRateCutoff = 0.02
+
 func ioUringBias(snap TelemetrySnapshot) float64 {
 	conns := snap.ActiveConnections
 	cpu := snap.CPUUtilization
+
+	// Overload/churn guard: never model io_uring as favorable while the
+	// workload is shedding errors (see biasErrorRateCutoff).
+	if snap.ErrorRate > biasErrorRateCutoff {
+		return 0
+	}
 
 	// No bias at very low or very high connection counts.
 	if conns < 128 || conns > 8192 {

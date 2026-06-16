@@ -27,6 +27,7 @@ func TestControllerOrganicSwitch(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
+	e.ctrl.biasEnabled = true // proactive bias is off by default; exercise it here
 
 	// Active epoll snapshot lands squarely in io_uring's empirical sweet spot.
 	sampler.Set(engine.Epoll, TelemetrySnapshot{
@@ -51,6 +52,36 @@ func TestControllerOrganicSwitch(t *testing.T) {
 	}
 	if !switched {
 		t.Fatal("expected organic epoll→io_uring switch in the io_uring sweet spot")
+	}
+}
+
+// TestControllerBiasDisabledByDefault verifies the safe default: with the
+// proactive io_uring bias OFF (the default), even a snapshot squarely in the
+// io_uring "sweet spot" (high conns + high CPU) must NOT trigger a switch off
+// epoll. Switching must require a measured advantage, which a synthetic standby
+// with no observed history cannot provide.
+func TestControllerBiasDisabledByDefault(t *testing.T) {
+	primary := newMockEngine(engine.Epoll)     // active, faster engine
+	secondary := newMockEngine(engine.IOUring) // standby
+	sampler := newSyntheticSampler()
+
+	cfg := resource.Config{Protocol: engine.HTTP1}
+	e := newFromEngines(primary, secondary, sampler, cfg)
+	e.ctrl.cooldown = 0
+	// biasEnabled deliberately left at its default (false).
+
+	// Exact snapshot that DID drive a switch in TestControllerOrganicSwitch.
+	sampler.Set(engine.Epoll, TelemetrySnapshot{
+		ThroughputRPS:     1000,
+		ActiveConnections: 2048,
+		CPUUtilization:    0.9,
+	})
+
+	now := time.Now()
+	for i := range 10 {
+		if e.ctrl.evaluate(now.Add(time.Duration(i+1)*time.Minute), false) {
+			t.Fatal("bias is off by default: must not switch off epoll without a measured advantage")
+		}
 	}
 }
 
@@ -80,6 +111,7 @@ func TestControllerNoSwitchOutsideSweetSpot(t *testing.T) {
 			cfg := resource.Config{Protocol: engine.HTTP1}
 			e := newFromEngines(primary, secondary, sampler, cfg)
 			e.ctrl.cooldown = 0
+			e.ctrl.biasEnabled = true // exercise the sweet-spot gating, not the global off-switch
 
 			sampler.Set(engine.Epoll, tc.snap)
 

@@ -31,7 +31,14 @@ type controller struct {
 	evalInterval time.Duration
 	cooldown     time.Duration
 	threshold    float64
-	logger       *slog.Logger
+	// biasEnabled gates the proactive io_uring bias (ioUringBias). Default OFF:
+	// the bias can recommend a switch with no measured throughput advantage, so
+	// when its modeled assumptions do not match a deployment it can move the
+	// controller onto a slower engine. With it off, switching is driven by
+	// measured score alone. Enable only once the bias has been re-baselined
+	// against current engine performance (see #331, #332).
+	biasEnabled bool
+	logger      *slog.Logger
 }
 
 func newController(primary, secondary engine.Engine, sampler TelemetrySampler, logger *slog.Logger) *controller {
@@ -83,8 +90,14 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	baselineActiveScore := computeScore(activeSnap, c.weights)
 
 	// io_uring bias: the modeled io_uring advantage given the current workload
-	// (connection count + CPU pressure). Zero outside the empirical sweet spot.
-	bias := ioUringBias(activeSnap)
+	// (connection count + CPU pressure). Zero outside the empirical sweet spot,
+	// and disabled entirely unless biasEnabled (default off — see field doc).
+	// With the bias off, switching is driven purely by measured scores, which
+	// correctly keeps the faster engine active.
+	bias := 0.0
+	if c.biasEnabled {
+		bias = ioUringBias(activeSnap)
+	}
 
 	// Apply the bias to the ACTIVE score: reinforce io_uring when it is already
 	// active (resist leaving it), lightly penalise epoll when conditions favor
