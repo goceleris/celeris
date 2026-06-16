@@ -131,6 +131,11 @@ func fromTyped(c *resource.WorkerScalingConfig, numWorkers int) Config {
 }
 
 func fromEnv(numWorkers int) Config {
+	// The CELERIS_DYN_* env vars are the legacy fallback for the typed
+	// [resource.WorkerScalingConfig]. They remain active so deployed
+	// manifests that pre-date v1.4.6 (when the typed config shipped)
+	// keep working without an edit. New code should use
+	// celeris.Config.WorkerScaling directly.
 	getInt := func(k string, def int) int {
 		if v := os.Getenv(k); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {

@@ -26,7 +26,7 @@ func TestAdaptiveAutoProtocol(t *testing.T) {
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 2
 
-	e, err := adaptive.New(cfg, &echoHandler{})
+	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive engine not available: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestAdaptiveAutoSingleWorker(t *testing.T) {
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 0 // will default based on NumCPU
 
-	e, err := adaptive.New(cfg, &echoHandler{})
+	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive engine not available: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestAdaptiveSwitchUnderLoad(t *testing.T) {
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 2
 
-	e, err := adaptive.New(cfg, &echoHandler{})
+	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive engine not available: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestAdaptiveResourceCleanup(t *testing.T) {
 	cfg.Resources.Workers = 2
 
 	ctx, cancel := context.WithCancel(t.Context())
-	e, err := adaptive.New(cfg, &echoHandler{})
+	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive engine not available: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestAdaptiveConstrainedRing(t *testing.T) {
 	cfg.Engine = engine.Adaptive
 	cfg.Resources.Workers = 2
 
-	e, err := adaptive.New(cfg, &echoHandler{})
+	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive engine not available: %v", err)
 	}

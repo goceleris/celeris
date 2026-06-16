@@ -69,7 +69,9 @@ func TestProbeWithOptionalTier(t *testing.T) {
 		t.Fatal("expected FixedFiles on kernel 5.19+")
 	}
 	if !profile.SQPoll {
-		t.Fatal("expected SQPoll with CAP_SYS_NICE")
+		// SQPoll is gated on the Optional tier (kernel 6.0+) alone; on
+		// 6.0+ the basic SQ-polling mode does not require CAP_SYS_NICE.
+		t.Fatal("expected SQPoll on Optional tier (kernel 6.0+)")
 	}
 	if !profile.SendZC {
 		t.Fatal("expected SendZC on kernel 6.0+")
@@ -206,7 +208,6 @@ func TestProbeWithBaseTier(t *testing.T) {
 	}
 	sp := mockProber("5.10.0", nil, true, false, 1)
 	profile := ProbeWith(sp)
-
 	if profile.IOUringTier != engine.Base {
 		t.Fatalf("expected Base tier, got %s", profile.IOUringTier)
 	}
@@ -287,6 +288,95 @@ func TestProbeNUMANodes(t *testing.T) {
 
 	if profile.NUMANodes != 4 {
 		t.Fatalf("expected 4 NUMA nodes, got %d", profile.NUMANodes)
+	}
+}
+
+// TestSQPollGateAtOptionalTier pins finding 5.2: the SQPoll gate must be
+// tier-driven (Optional / kernel 6.0+) and must NOT depend on
+// CheckCapSysNice short-circuiting. SQPoll is enabled at Optional tier
+// regardless of CAP_SYS_NICE, and CheckCapSysNice (when present) must be
+// a pure, side-effect-free predicate. Here we assert SQPoll is true with
+// capSysNice both false and true at Optional, and that the prober is not
+// required to grant it.
+func TestSQPollGateAtOptionalTier(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("tier detection requires linux GOOS")
+	}
+	for _, capNice := range []bool{false, true} {
+		sp := mockProber("6.1.0-18-generic", nil, true, capNice, 1)
+		profile := ProbeWith(sp)
+		if profile.IOUringTier != engine.Optional {
+			t.Fatalf("capNice=%v: expected Optional tier, got %s", capNice, profile.IOUringTier)
+		}
+		if !profile.SQPoll {
+			t.Fatalf("capNice=%v: SQPoll must be true at Optional tier regardless of CAP_SYS_NICE", capNice)
+		}
+	}
+}
+
+// TestCheckCapSysNiceIsSideEffectFree guards against a regression of the
+// dangerous Setpriority-based probe (finding 5.2): the real read-only
+// implementation must not change the process scheduling priority. We
+// snapshot the current nice value, run the check, and assert it is
+// unchanged. The boolean result itself is environment-dependent and not
+// asserted.
+func TestCheckCapSysNiceIsSideEffectFree(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("CAP_SYS_NICE check is linux-only")
+	}
+	sp := defaultProber()
+	if sp.CheckCapSysNice == nil {
+		t.Skip("no CheckCapSysNice on this platform")
+	}
+	before, err := getNice(t)
+	if err != nil {
+		t.Skipf("cannot read nice value: %v", err)
+	}
+	_ = sp.CheckCapSysNice() // result is environment-dependent; we test for side effects
+	after, err := getNice(t)
+	if err != nil {
+		t.Fatalf("cannot read nice value after check: %v", err)
+	}
+	if before != after {
+		t.Fatalf("CheckCapSysNice mutated process nice: before=%d after=%d", before, after)
+	}
+}
+
+// TestProbeSendfileAndZerocopy pins the sendfile / zerocopy capability
+// flags (celeris#317). Sendfile is unconditional on Linux (kernel
+// 2.6.23+, every distro past 2.6.33) and is now actually wired into the
+// epoll H1 static-file path. Zerocopy is ALWAYS false: the engine does
+// not ship a MSG_ZEROCOPY userspace-buffer send path (TCP MSG_ZEROCOPY
+// landed in 4.14, UDP in 5.0, but the send path itself is unimplemented;
+// see engine/capability.go and engine/epoll/sendfile.go). The flag must
+// not advertise a capability the tree does not deliver.
+func TestProbeSendfileAndZerocopy(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("tier detection requires linux GOOS")
+	}
+	tests := []struct {
+		name   string
+		kernel string
+		wantSF bool
+		wantZC bool
+	}{
+		{"4.13 (pre-tcp-zerocopy)", "4.13.0", true, false},
+		{"4.14 (tcp zerocopy boundary)", "4.14.0", true, false},
+		{"5.0 (udp zerocopy boundary)", "5.0.0", true, false},
+		{"5.10 (celeris LTS floor)", "5.10.0", true, false},
+		{"6.6 (current LTS)", "6.6.0", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sp := mockProber(tt.kernel, nil, true, false, 1)
+			p := ProbeWith(sp)
+			if p.Sendfile != tt.wantSF {
+				t.Errorf("kernel %s: Sendfile = %v, want %v", tt.kernel, p.Sendfile, tt.wantSF)
+			}
+			if p.Zerocopy != tt.wantZC {
+				t.Errorf("kernel %s: Zerocopy = %v, want %v", tt.kernel, p.Zerocopy, tt.wantZC)
+			}
+		})
 	}
 }
 

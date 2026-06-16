@@ -5,7 +5,8 @@ import (
 )
 
 var (
-	bCRLF = []byte("\r\n")
+	bCRLF     = []byte("\r\n")
+	bCRLFCRLF = []byte("\r\n\r\n")
 )
 
 var (

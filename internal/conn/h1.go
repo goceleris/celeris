@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -261,6 +262,17 @@ func (s *H1State) UpdateWriteFn(fn func([]byte)) {
 // adapter then falls back to the single-buffer path.
 func (s *H1State) SetWriteBodyFn(fn func([]byte)) {
 	s.rw.writeBody = fn
+}
+
+// SetSendFileFn installs a zero-copy sendfile(2) hook on the response
+// adapter. When non-nil, h1ResponseAdapter.WriteFileResponse routes
+// large file bodies through it (the engine takes the file slice and dups
+// the descriptor); when nil, WriteFileResponse declines and the caller
+// falls back to the buffered read+write path. Installed only by sendfile-
+// capable engines (epoll) and only in non-async mode — the async dispatch
+// goroutine would race the worker on the per-connection sendfile state.
+func (s *H1State) SetSendFileFn(fn func(header []byte, file *os.File, offset, length int64) error) {
+	s.rw.sendFile = fn
 }
 
 func (s *H1State) maxBodySize() int64 {

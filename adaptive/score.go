@@ -36,6 +36,17 @@ func computeScore(snap TelemetrySnapshot, w ScoreWeights) float64 {
 //   - io_uring p99 tail: 17-39% better at 1024-4096 connections
 //   - Throughput: equivalent (±2%) at 256-4096 connections
 //   - io_uring loses at <64 connections (fixed overhead) and >8192 on x86
+//
+// Pre-v1.5.0 this function was effectively dead: liveSampler.cpuMon was
+// never assigned (celeris#316), so snap.CPUUtilization was always 0 and
+// cpuFactor was always 0, making the function return 0 unconditionally.
+// v1.5.0 wires the CPU monitor at engine construction; the bias now fires
+// when CPU is above 30% and conns land in the 128-8192 sweet spot.
+//
+// The conn-factor falloff above 8192 is the empirical cost structure on
+// x86 — see the bench data above — not a bug. If #318 identifies a
+// different cause (e.g. a PbufRing bottleneck, fixed by #322), update
+// this comment to point at the new finding.
 func ioUringBias(snap TelemetrySnapshot) float64 {
 	conns := snap.ActiveConnections
 	cpu := snap.CPUUtilization

@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,20 +48,85 @@ func errIORingSend(res int32) error {
 // bufRingGroupID is the provided buffer ring group ID.
 const bufRingGroupID = 0
 
-// bufRingCount is the number of buffers in the provided buffer ring.
-// Must be a power of 2. Only used when multishot recv is opted into via
-// CELERIS_IOURING_MULTISHOT_RECV=1; the default single-shot-recv path
-// uses per-connection buffers and ignores this ring entirely. 1024
-// supports 1024 concurrent in-flight multishot recvs per worker
-// (128 was too small for the 1500+ conn churn test patterns —
-// ENOBUFS terminations kept burning the per-conn re-arm path).
-// With 8 KB buffers: 1024 × 8 KB = 8 MB per worker.
-const bufRingCount = 1024
+// bufRingCountMin is the floor for the scaled provided-buffer-ring size.
+// Below ~1024 entries the kernel reports ENOBUFS under 1500+ conn churn
+// (the per-conn re-arm path fires constantly and burns the latency
+// budget). The formula below keeps this as the floor and scales up from
+// there. See resolveBufRingCount for the full rationale.
+const bufRingCountMin = 1024
+
+// bufRingCountMax caps the scaled provided-buffer-ring size. The hard
+// ceiling is the kernel's IORING_REGISTER_PBUF_RING limit of 32768
+// entries (a ring larger than that is rejected by the kernel) — which is
+// also the largest count the uint16 tail/mask/bid arithmetic in
+// BufferRing can address. At the default 8 KiB BufferSize this is 256 MiB
+// of buffer memory per worker at the absolute max; the auto-scaling
+// formula stays far below this in practice. Operators with unusual
+// workloads can override via the env var, but never past this cap.
+const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (kernel PBUF_RING cap)
+
+// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled provided-buffer-ring
+// size. Must be a power of 2 and at least bufRingCountMin. Use this when
+// the default scaling formula under-provisions your workload — typically
+// the case for very-high-concurrency benchmarks (16k+ connections) where
+// each worker may have more in-flight multishot recvs than the formula
+// anticipates. Setting 0 (or leaving the env var unset) reverts to
+// auto-scaling from Workers × TargetConnsPerWorker.
+const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
+
+// resolveBufRingCount picks the provided-buffer-ring size for a worker.
+// The default formula is `nextPowerOf2(max(bufRingCountMin, 2 *
+// TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
+// steady-state target — enough headroom that the kernel rarely stalls
+// waiting for buffer returns. Above 1024 conns the previous hard-coded
+// 1024 was too small: buffers were reused aggressively, the kernel
+// stalled, and the very behaviour the ring is designed to optimise
+// (multishot recv CQE batching) collapsed into CQE storms (celeris#322).
+//
+// The ring is PER-WORKER: NewBufferRing is created once per Worker on its
+// own ring, so the scaling MUST be driven by the per-worker conn target,
+// NOT by the engine-wide Workers count. Multiplying by Workers over-sized
+// every worker's ring by the worker count, wasting count×BufferSize of
+// mmap'd RSS per worker and risking the kernel cap on large boxes
+// (celeris#322 follow-up).
+// Operators can override via CELERIS_IOURING_PBUF_COUNT.
+func resolveBufRingCount(_ resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
+	if v := os.Getenv(envPbufCount); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n&(n-1) != 0 {
+				n = resource.NextPowerOf2(n)
+			}
+			return clampBufRingCount(n)
+		}
+	}
+	target := scalerTargetConnsPerWorker
+	if target <= 0 {
+		target = 20 // mirrors scaler.Resolve's default
+	}
+	scaled := 2 * target
+	if scaled < bufRingCountMin {
+		scaled = bufRingCountMin
+	}
+	return clampBufRingCount(resource.NextPowerOf2(scaled))
+}
+
+func clampBufRingCount(n int) int {
+	if n < bufRingCountMin {
+		return bufRingCountMin
+	}
+	if n > bufRingCountMax {
+		return bufRingCountMax
+	}
+	return n
+}
 
 // pendingReleaseEntry queues a connState for deferred release — its
 // fd has been closed but the kernel may still have SQEs referencing
-// its buffers; we hold it past the cancellation window before
-// returning to the pool. See Worker.pendingRelease docstring.
+// its buffers; we hold it until cs.kernelInflight reports every
+// kernel-held op has produced its terminal CQE (the close path submits
+// ASYNC_CANCELs so this is normally within a loop pass or two), with
+// releaseAtNanos as the wall-clock BACKSTOP for kernel anomalies. See
+// Worker.pendingRelease docstring.
 //
 // detached entries (async-dispatch / WS / SSE conns) skip the pool
 // recycle: their cs has live state (h1State, asyncCond, asyncInBuf
@@ -68,30 +134,52 @@ const bufRingCount = 1024
 // worker observes asyncClosed and runs finishCloseDetached. Holding
 // the strong ref alive past the kernel's recv-SQE drain window is
 // what we need; the recycle path resetting fields would race with the
-// goroutine's defer that reads cs.fd / cs.asyncInBuf.
+// goroutine's defer that reads cs.fd / cs.asyncInBuf. (The goroutine's
+// own closure references remain visible to GC after we drop ours, so
+// dropping the ref once the kernel ops drained is safe.)
 type pendingReleaseEntry struct {
 	cs             *connState
 	releaseAtNanos int64
 	detached       bool
 }
 
-// pendingReleaseHoldNanos is the WALL-CLOCK duration to hold a closed
-// connState before returning it to the pool. io_uring's
-// unix.Close(fd) → cancel-pending-ops → ECANCELED CQE path completes
-// within ~1 ms on Linux 6.x even under load, so 100 ms is an
-// order-of-magnitude safety margin.
+// closedOpsEntry is the Worker.closedOps value: the conn(s) closed under
+// one (fd, generation) user_data identity and the total number of
+// terminal recv/send CQEs the kernel still owes them. conns has one
+// element except under an fd+generation collision, where the CQEs are
+// indistinguishable and every colliding conn is held until the combined
+// count drains (release-late is safe; release-early is the UAF).
+type closedOpsEntry struct {
+	inflight int32
+	conns    []*connState
+}
+
+// pendingReleaseHoldNanos is the WALL-CLOCK BACKSTOP for releasing a
+// closed connState whose kernel ops never produced a terminal CQE.
 //
-// This MUST be time-based, not iteration-based. An iteration count is
-// meaningless across load regimes: under churn-close the loop spins
-// fast so a fixed N iterations elapses in well under a millisecond
-// (risking the #256 use-after-free it guards against) while the high
-// close rate piles tens of thousands of connStates into the queue
-// (~16 KB each → multi-GB RSS); and when the loop is idle the wait is
-// SubmitAndWaitTimeout(adaptiveTimeout) up to 100 ms per iteration, so
-// N iterations stretches to minutes and pins that memory long after
-// the load drops. A wall-clock window bounds the queue to
-// close_rate × hold and drains promptly once churn stops.
-const pendingReleaseHoldNanos int64 = int64(100 * time.Millisecond)
+// It is NOT the primary release gate. Release is gated on
+// cs.kernelInflight == 0: the close path ASYNC_CANCELs the armed
+// recv/send by generation-tagged user_data and drainPendingRelease
+// frees the connState only once every cancelled/completed op has
+// delivered its terminal CQE. That is exact — no window to
+// tune. The wall clock only matters if the kernel never delivers a
+// terminal CQE at all (or the cancel SQE was dropped on a full SQ
+// ring); when it fires, drainPendingRelease logs a WARN because a
+// kernel-held op may still reference cs.buf and releasing is a
+// last-resort trade of a potential use-after-free against an
+// unbounded memory leak.
+//
+// 5 s is comfortably above any plausible straggler window: TCP
+// retransmits begin at RTO_MIN = 200 ms and a 4 KiB POST tail
+// straggling through several backoffs stays well under a second —
+// the 100 ms hold this replaces sat BELOW RTO_MIN, which is exactly
+// how the v1.4.15/7beebb9 heap corruption slipped past it.
+//
+// The backstop MUST stay time-based, not iteration-based: under
+// churn-close the loop spins sub-millisecond per iteration while idle
+// iterations stretch to 100 ms+ (see the v1.5.0 review 2.9 history on
+// queuePendingRelease).
+const pendingReleaseHoldNanos int64 = int64(5 * time.Second)
 
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
@@ -114,10 +202,17 @@ type Worker struct {
 	// can Wait on them before returning. See engine/epoll/loop.go
 	// for rationale — keeps dispatch Gs from touching connState
 	// memory after the engine claims to have stopped.
-	asyncWG      sync.WaitGroup
-	conns        []*connState
-	connCount    int // number of active connections (local, for draining check)
-	maxFD        int // upper bound fd for iteration in checkTimeouts/shutdown
+	asyncWG   sync.WaitGroup
+	conns     []*connState
+	connCount int // number of active connections (local, for draining check)
+	maxFD     int // upper bound fd for iteration in checkTimeouts/shutdown
+	// liveConns is a dense slice of currently-active FDs, maintained
+	// alongside the sparse conns map. checkTimeouts and shutdown iterate
+	// liveConns to avoid the O(maxFD) scan that dominated the worker
+	// hot path above ~8 Ki conns (celeris#318). Append-on-register,
+	// swap-with-last-on-deregister; the slice is owned by the worker
+	// thread so no locking is required.
+	liveConns    []int
 	handler      stream.Handler
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
@@ -155,21 +250,41 @@ type Worker struct {
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 
 	// pendingRelease defers returning connState structs to the pool
-	// until the kernel has drained any in-flight I/O SQEs that may
-	// still hold pointers into cs.buf / cs.sendBuf. On close the fd
-	// is unix.Close'd, which triggers io_uring to cancel pending ops
-	// — but the cancellation is asynchronous and the cancelled CQEs
-	// arrive on subsequent event-loop iterations. If we release cs
-	// immediately, Go's GC can reclaim cs.buf's backing array; the
-	// kernel then writes incoming bytes (that landed in flight just
-	// before close) into memory the Go runtime has since repurposed
-	// for its stack pool, yielding a SIGSEGV in runtime.stackalloc
-	// dereferencing HTTP request bytes as a pointer (#256 SEGV
-	// class — not race-detectable because the writer is the kernel,
-	// not Go code). Holding cs for pendingReleaseHoldNanos of
-	// wall-clock time after close keeps cs.buf's backing array alive
-	// through the cancellation window.
+	// until the kernel has drained every in-flight I/O SQE that may
+	// still hold pointers into cs.buf / cs.sendBuf. unix.Close(fd)
+	// does NOT complete a pending io_uring recv (the op holds its own
+	// file reference — only inbound data, FIN, or an ASYNC_CANCEL
+	// completes it), so the close path cancels the armed ops and this
+	// queue holds cs until cs.kernelInflight confirms their terminal
+	// CQEs arrived. If we released cs earlier, Go's GC could reclaim
+	// cs.buf's backing array; the kernel then writes straggler bytes
+	// (e.g. a retransmitted POST segment at RTO ≥ 200 ms) into memory
+	// the runtime has repurposed — historically a SIGSEGV in
+	// runtime.stackalloc dereferencing HTTP bytes as a pointer (#256),
+	// and on Go 1.26 (Green Tea GC, in-span alloc/mark bits) a fatal
+	// "s.allocCount != s.nelems" span-corruption (v1.4.15/7beebb9, both bench runs). Neither is
+	// race-detectable because the writer is the kernel, not Go code.
+	// releaseAtNanos is only the anomaly backstop — see
+	// pendingReleaseHoldNanos.
 	pendingRelease []pendingReleaseEntry
+
+	// closedOps routes terminal recv/send CQEs that arrive AFTER their
+	// conn was closed (w.conns[fd] already nil or reused) back to the
+	// closed connState for kernelInflight accounting. Keyed by
+	// connOpKey (generation<<40 | fd) — the op tag is stripped so one
+	// entry covers a conn's recv and send. Populated by
+	// noteClosedInflight on the close paths, consumed by
+	// noteStaleTerminalOp at CQE dispatch; nil/empty whenever no
+	// closed conn has kernel ops outstanding, so the hot path pays a
+	// single len check. Worker-thread-only.
+	//
+	// A (fd, generation) collision — two closed conns whose ops share
+	// a user_data identity, possible under fd reuse because generations
+	// are per-connState-object — makes their terminal CQEs mutually
+	// indistinguishable, so the entry carries a COMBINED count and
+	// releases all colliding conns only after every expected terminal
+	// CQE arrived (errs toward holding longer; see closedOpsEntry).
+	closedOps map[uint64]*closedOpsEntry
 
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns  bool       // set when provided buffers need publishing
@@ -218,6 +333,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		async:         cfg.AsyncHandlers,
 		h1Only:        cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
 		conns:         make([]*connState, fixedFileTableSize),
+		liveConns:     make([]int, 0, 1024),
 		handler:       handler,
 		resolved:      resolved,
 		cfg:           cfg,
@@ -311,11 +427,23 @@ func (w *Worker) run(ctx context.Context) {
 	// Opt back in with CELERIS_IOURING_MULTISHOT_RECV=1 for workloads
 	// that are known to be dominated by long-lived keep-alive conns
 	// and that benefit from the CQE-batching multishot provides.
+	//
+	// The ring size scales with the worker's per-conn target (celeris#322):
+	// the previous hard-coded 1024 entries was undersized above ~1024 conns
+	// and produced CQE storms as the kernel stalled waiting for buffer
+	// returns. The formula gives 2 buffers per conn at the scaler's
+	// steady-state target — comfortable headroom without runaway RSS.
+	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
 	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
+		var targetConns int
+		if w.cfg.WorkerScaling != nil {
+			targetConns = w.cfg.WorkerScaling.TargetConnsPerWorker
+		}
+		bufRingCount := resolveBufRingCount(w.resolved, targetConns)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
 			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
-				"worker", w.id, "err", err)
+				"worker", w.id, "err", err, "buf_ring_count", bufRingCount)
 		} else {
 			w.bufRing = br
 		}
@@ -494,22 +622,32 @@ func (w *Worker) run(ctx context.Context) {
 				fd := int(ud & fdMask)
 				switch ud & udMask {
 				case udRecv:
-					w.handleRecv(entry, fd, now)
+					// Generation gate (review 2.6): drop a stale CQE from a
+					// prior fd occupant (recycling its provided buffer)
+					// before routing to the handler.
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleRecv(entry, fd, now)
+					}
 				case udSend:
-					w.handleSend(entry, fd, now)
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleSend(entry, fd, now)
+					}
 				case udAccept:
 					w.handleAccept(ctx, entry, fd, now)
 				case udClose:
-					w.handleClose(fd)
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleClose(fd)
+					}
 				case udH2Wakeup:
 					w.handleH2Wakeup()
-				case udProvide:
 				case udHeaderTimer:
 					// MUST be in the inlined hot path — processCQE
 					// (which has the same case) is only called from
 					// the cancel path. Without this case, slowloris-
 					// defence timer CQEs are silently dropped.
-					w.handleHeaderTimer(fd)
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleHeaderTimer(fd)
+					}
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -584,7 +722,16 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				sqFull := w.flushSend(cs)
 				if cs.needsRecv && !cs.recvPaused {
-					if w.prepareRecv(cs.fd, cs.buf) {
+					// Arm via pickRecvTarget so a deferred BODY recv re-arms
+					// into the H1 bodyBuf with cs.recvIntoBody set, instead of
+					// blindly re-arming into cs.buf. Re-arming into cs.buf
+					// while recvIntoBody stayed true made handleRecv take the
+					// body branch on a cs.buf-sized CQE and corrupt the body
+					// (v1.5.0 review 2.4). pickRecvTarget MUTATES recvIntoBody,
+					// so call it exactly once per arm; it is idempotent across
+					// SQ-full retries because NextRecvBuf returns the same tail
+					// while bodyBuf state is unchanged.
+					if w.prepareRecv(cs, w.pickRecvTarget(cs)) {
 						cs.needsRecv = false
 					}
 				}
@@ -636,7 +783,14 @@ func (w *Worker) run(ctx context.Context) {
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
 		// Combined paused: engine-wide OR per-worker (dynamic scaler).
-		if w.listenFD < 0 && w.connCount == 0 && (w.acceptPaused.Load() || w.inactive.Load()) {
+		//
+		// hasDriverConns gate: connCount only counts HTTP conns. An
+		// EventLoopProvider driver may still have live conns in
+		// w.driverConns even when connCount==0; suspending the worker would
+		// park its event loop and starve those driver conns of CQE
+		// servicing. Stay active while any driver conn is registered (v1.5.0
+		// review 2.10).
+		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && (w.acceptPaused.Load() || w.inactive.Load()) {
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() && !w.inactive.Load() {
 				w.wakeMu.Unlock()
@@ -657,23 +811,129 @@ func (w *Worker) run(ctx context.Context) {
 	}
 }
 
+// staleConnCQE reports whether c is a late/in-flight CQE from a PRIOR
+// occupant of fd (review 2.6). A CQE is stale when the slot is empty
+// (cs == nil) or the conn currently at fd has a different generation than
+// the one stamped into the CQE's user_data at SQE-submission time. Only
+// conn-bound ops (udRecv/udSend/udClose/udHeaderTimer) carry a generation;
+// callers must not invoke this for non-conn-bound ops.
+//
+// As the single chokepoint every conn-bound CQE passes through, this is
+// also where kernelInflight accounting happens (v1.4.15/7beebb9 corruption fix): a TERMINAL
+// recv/send CQE — one without CQE_F_MORE; multishot recv and SEND_ZC
+// post intermediate F_MORE CQEs, and a cancel op's own CQE carries the
+// udProvide tag so it never reaches here — decrements the owning conn's
+// in-flight op count. For a live conn that is cs directly; for a stale
+// CQE the closed conn is resolved through Worker.closedOps, keeping the
+// bookkeeping on the OLD connState captured at arm time rather than
+// whatever currently occupies w.conns[fd]. The decrement is what lets
+// drainPendingRelease return the closed connState to the pool.
+//
+// CRITICAL: a stale recv CQE may still own a provided ring buffer. Dropping
+// it without returning the buffer leaks a ring entry → ENOBUFS → the
+// CQE-storm regression (celeris#322). When stale, we therefore recycle the
+// buffer exactly as handleRecv's unknown/closing branch does (PushBuffer +
+// hasBufReturns, published once per loop pass). The recycle is keyed on the
+// CQE flags, not the conn, so it is correct even though the conn is gone.
+func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
+	var cs *connState
+	if fd >= 0 && fd < len(w.conns) {
+		cs = w.conns[fd]
+	}
+	op := ud & udMask
+	terminalOp := (op == udRecv || op == udSend) && !cqeHasMore(c.Flags)
+	if cs != nil && cs.generation == decodeGen(ud) {
+		if terminalOp {
+			if op == udRecv {
+				cs.recvArmed = false
+			}
+			// KNOWN RESIDUAL — gen-collision misroute. A closed
+			// predecessor's terminal CQE that arrives after this fd was
+			// re-occupied by a conn with a COLLIDING generation (gens are
+			// per-connState-object; 1/65536 per reuse with the 16-bit
+			// tag) is indistinguishable from the live conn's own CQE and
+			// lands here. The clamp below only stops an already-drained
+			// counter going negative; a misdecrement from >=1 DOES
+			// under-count the live conn (and may clear recvArmed above
+			// with its recv still kernel-armed), so its own close can
+			// skip the cancel and release early — the UAF class this
+			// accounting exists to prevent. Reachability is narrow:
+			// non-SQPOLL task-work ordering posts the close-path
+			// -ECANCELED during the submit syscall, before the fd can be
+			// re-accepted; the window needs a dropped cancel SQE (full SQ
+			// ring) or SQPOLL's decoupled completion ordering ON TOP of
+			// the gen collision. When it fires, the closed conn's
+			// closedOps entry is left orphaned and the 5 s backstop WARN
+			// in drainPendingRelease is the production signal.
+			if cs.kernelInflight > 0 {
+				cs.kernelInflight--
+			}
+		}
+		return false
+	}
+	if terminalOp {
+		w.noteStaleTerminalOp(ud)
+	}
+	if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+		w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+		w.hasBufReturns = true
+	}
+	return true
+}
+
+// noteStaleTerminalOp attributes a terminal recv/send CQE that arrived
+// after its conn closed to the closed connState(s) registered under the
+// CQE's (fd, generation) identity, releasing them for drainPendingRelease
+// once the kernel owes them nothing. No-op when the identity is unknown
+// (conn closed with zero in-flight ops, or already backstop-released).
+func (w *Worker) noteStaleTerminalOp(ud uint64) {
+	if len(w.closedOps) == 0 {
+		return
+	}
+	key := connOpKey(ud)
+	e := w.closedOps[key]
+	if e == nil {
+		return
+	}
+	e.inflight--
+	if e.inflight > 0 {
+		return
+	}
+	for _, cs := range e.conns {
+		cs.kernelInflight = 0
+	}
+	delete(w.closedOps, key)
+}
+
 func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) {
-	op := decodeOp(c.UserData)
-	fd := decodeFD(c.UserData)
+	ud := c.UserData
+	op := decodeOp(ud)
+	fd := decodeFD(ud)
 
 	switch op {
 	case udRecv:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleRecv(c, fd, now)
 	case udSend:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleSend(c, fd, now)
 	case udClose:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleClose(fd)
 	case udAccept:
 		w.handleAccept(ctx, c, fd, now)
 	case udH2Wakeup:
 		w.handleH2Wakeup()
-	case udProvide:
 	case udHeaderTimer:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
 		w.handleHeaderTimer(fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
@@ -789,7 +1049,7 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 		}
 	}
 	prepTimeout(sqe, unsafe.Pointer(&cs.headerTimerSpec), 0, 0)
-	setSQEUserData(sqe, encodeUserData(udHeaderTimer, cs.fd))
+	setSQEUserData(sqe, encodeUserDataGen(udHeaderTimer, cs.fd, cs.generation))
 	cs.headerTimerArmed = true
 }
 
@@ -851,7 +1111,16 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			return
 		}
 		w.errCount.Add(1)
-		if w.listenFD >= 0 && !w.tier.SupportsMultishotAccept() {
+		// Re-arm accept whenever the kernel is not going to deliver more
+		// CQEs from the current SQE. In single-shot mode !cqeHasMore is
+		// always true (each accept produces exactly one CQE), so this
+		// preserves the old single-shot re-arm. In multishot mode an error
+		// CQE clears F_MORE to signal the multishot was terminated — and
+		// without this re-arm the worker would permanently stop accepting
+		// (the old `!SupportsMultishotAccept()` guard never re-armed in
+		// multishot mode, silently killing accept on a transient ENOMEM /
+		// EMFILE). See celeris v1.5.0 review 2.1.
+		if w.listenFD >= 0 && !cqeHasMore(c.Flags) {
 			w.prepareAccept()
 		}
 		return
@@ -909,6 +1178,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 
 	w.conns[newFD] = cs
 	w.connCount++
+	w.addLiveConn(cs)
 	if newFD > w.maxFD {
 		w.maxFD = newFD
 	}
@@ -922,8 +1192,8 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	cs.lastActivity = now
 
 	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
-	// upgrades too", so route it through detectProtocol (like Auto) on the
-	// first recv rather than locking cs.protocol=H2C on accept. Without
+	// upgrades too", so route it through the recv-time detection path (like
+	// Auto) rather than locking cs.protocol=H2C on accept. Without
 	// this, the first HTTP/1.1 upgrade request was fed to ProcessH2 and
 	// the PRI-preface check silently failed, leaving the client with 27
 	// bytes of server SETTINGS frame and no 101 Switching Protocols
@@ -934,28 +1204,10 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		cs.detected = true
 		w.initProtocol(cs)
 	}
-	if !w.prepareRecv(newFD, cs.buf) {
+	if !w.prepareRecv(cs, cs.buf) {
 		cs.needsRecv = true
 		w.markDirty(cs)
 	}
-}
-
-// detectProtocol performs protocol detection on the first received bytes.
-// Returns true if detection succeeded and the data should be processed.
-func (w *Worker) detectProtocol(cs *connState, data []byte) bool {
-	proto, err := detect.Detect(data)
-	if err != nil {
-		if err == detect.ErrInsufficientData {
-			// Need more data — re-arm recv. The data is already in cs.buf
-			// so we don't lose it; the next recv appends after it.
-			return false
-		}
-		return false
-	}
-	cs.protocol.Store(int32(proto))
-	cs.detected = true
-	w.initProtocol(cs)
-	return true
 }
 
 func (w *Worker) hijackConn(fd int) (net.Conn, error) {
@@ -969,10 +1221,20 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
+	w.removeLiveConn(cs)
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
-	releaseConnState(cs)
+	// Cancel-then-release discipline, hijack variant: a single-shot
+	// recv SQE is virtually always still armed on cs.buf here. The fd
+	// lives on under the caller's net.Conn, so an uncancelled recv would
+	// not only pin cs.buf past release (the #256-class UAF) but also
+	// STEAL the first bytes the hijacker tries to read. Cancel it by its
+	// generation-tagged user_data and defer the pool release until the
+	// terminal CQE arrives, exactly like finishClose.
+	w.cancelConnOps(fd, cs)
+	w.noteClosedInflight(cs)
+	w.queuePendingRelease(cs)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
@@ -1278,7 +1540,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if c.Res == -105 && w.bufRing != nil {
 			w.bufRing.PublishBuffers()
 			if !cs.recvPaused {
-				if !w.prepareRecv(fd, cs.buf) {
+				if !w.prepareRecv(cs, cs.buf) {
 					cs.needsRecv = true
 					w.markDirty(cs)
 				}
@@ -1313,7 +1575,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		complete := cs.h1State.ConsumeBodyRecv(int(c.Res))
 		if !complete {
 			if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-				if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+				if !w.prepareRecv(cs, w.pickRecvTarget(cs)) {
 					cs.needsRecv = true
 					w.markDirty(cs)
 				}
@@ -1366,7 +1628,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			mu.Unlock()
 		}
 		if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-			if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+			if !w.prepareRecv(cs, w.pickRecvTarget(cs)) {
 				cs.needsRecv = true
 				w.markDirty(cs)
 			}
@@ -1390,20 +1652,54 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 
 	// Auto protocol detection on first recv (no MSG_PEEK needed).
 	if !cs.detected {
-		if !w.detectProtocol(cs, data) {
-			// Need more data or unknown protocol — re-arm recv.
+		// Accumulate across recvs so a protocol prefix that spans multiple
+		// packets (notably the 24-byte H2 client preface) is not lost. The
+		// single-shot path re-arms into cs.buf at offset 0 and the bufRing
+		// path returns each provided buffer, so the only durable place to
+		// hold partial bytes is cs.detectAccum (a Go-heap buffer the kernel
+		// never targets). The fast common case — detection resolves on the
+		// first recv — pays no copy (v1.5.0 review 2.8).
+		detectData := data
+		if len(cs.detectAccum) > 0 {
+			cs.detectAccum = append(cs.detectAccum, data...)
+			detectData = cs.detectAccum
+		}
+		proto, derr := detect.Detect(detectData)
+		if derr != nil {
+			// ErrInsufficientData (more bytes needed) AND ErrUnknownProtocol
+			// both re-arm recv and wait — matching the pre-2.8 behavior
+			// (the slowloris header timer / idle timeout reaps a conn that
+			// never produces recognizable bytes). The ONLY change here is
+			// that partial bytes are preserved in cs.detectAccum across
+			// recvs instead of being overwritten at cs.buf offset 0.
+			if derr == detect.ErrInsufficientData && len(cs.detectAccum) == 0 {
+				// First partial recv — begin accumulating.
+				cs.detectAccum = append(cs.detectAccum, data...)
+			}
 			if hasProvidedBuf {
-				// Early return: publish immediately since we're skipping the
-				// normal CQE drain loop's batch publish (P0).
+				// Provided-buffer bytes are now copied into detectAccum (for
+				// the ErrInsufficientData path); return the buffer to the
+				// kernel (early — we skip the normal batch publish, P0).
 				w.bufRing.ReturnBuffer(providedBufID)
 			}
 			if !cqeHasMore(c.Flags) {
-				if !w.prepareRecv(fd, cs.buf) {
+				if !w.prepareRecv(cs, cs.buf) {
 					cs.needsRecv = true
 					w.markDirty(cs)
 				}
 			}
 			return
+		}
+		cs.protocol.Store(int32(proto))
+		cs.detected = true
+		w.initProtocol(cs)
+		// If we accumulated across recvs, hand the FULL accumulated prefix
+		// (not just this last recv) to the protocol handler below. Reset the
+		// accumulator header; `data`'s own slice header keeps the backing
+		// array alive for the rest of this function.
+		if len(cs.detectAccum) > 0 {
+			data = cs.detectAccum
+			cs.detectAccum = cs.detectAccum[:0]
 		}
 	}
 
@@ -1469,7 +1765,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.armHeaderTimer(cs)
 		}
 		if !cqeHasMore(c.Flags) && !cs.recvPaused {
-			if !w.prepareRecv(fd, cs.buf) {
+			if !w.prepareRecv(cs, cs.buf) {
 				cs.needsRecv = true
 				w.markDirty(cs)
 			}
@@ -1552,7 +1848,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 				// occasionally lose END_STREAM delivery for later streams
 				// (observed as flaky TestH2CUpgradeSubsequentStreams/iouring).
 				if !cqeHasMore(c.Flags) && !cs.recvLinked {
-					if !w.prepareRecv(fd, cs.buf) {
+					if !w.prepareRecv(cs, cs.buf) {
 						cs.needsRecv = true
 						w.markDirty(cs)
 					}
@@ -1698,7 +1994,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// For linked SEND→RECV, the RECV is already queued — skip standalone re-arm.
 	// Don't re-arm if recv is paused (WebSocket backpressure).
 	if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-		if !w.prepareRecv(fd, w.pickRecvTarget(cs)) {
+		if !w.prepareRecv(cs, w.pickRecvTarget(cs)) {
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
@@ -1855,7 +2151,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	// All data sent — re-arm recv if needed, remove from dirty list.
 	if len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		if cs.needsRecv && !cs.recvPaused {
-			if w.prepareRecv(fd, cs.buf) {
+			if w.prepareRecv(cs, cs.buf) {
 				cs.needsRecv = false
 			} else {
 				w.markDirty(cs)
@@ -1881,6 +2177,9 @@ func (w *Worker) handleClose(fd int) {
 	if fd >= 0 && fd < len(w.conns) {
 		w.conns[fd] = nil
 	}
+	// Note: liveConns removal is the caller's responsibility — every
+	// path that calls finishCloseAny reaches here through closeConn or
+	// a similar path that already removed the FD from liveConns.
 }
 
 func (w *Worker) closeConn(fd int) {
@@ -1979,8 +2278,98 @@ func (w *Worker) closeConn(fd int) {
 	w.finishClose(fd)
 }
 
-// queuePendingRelease enqueues cs for release at a future iteration.
-// See Worker.pendingRelease docstring for the kernel-buffer-lifetime
+// cancelConnOps submits ASYNC_CANCEL SQEs for every conn-buffer-targeting
+// op the kernel still holds for cs — the armed recv and (belt-and-braces;
+// the close paths drain sends first) an in-flight send. Called by the
+// close paths BEFORE the fd is closed: unix.Close does not complete a
+// pending io_uring recv, so without the cancel the op would sit armed on
+// cs.buf until straggler data (e.g. a retransmitted POST segment at
+// RTO ≥ 200 ms) completes it — the v1.4.15/7beebb9 heap-corruption trigger. With the
+// cancel, the terminal CQE (-ECANCELED, or the op's natural completion if
+// it raced the cancel) arrives within a loop pass or two and
+// drainPendingRelease can release cs promptly.
+//
+// Targeting mirrors prepCancelUserDataSkipSuccess's WS-pause usage: match
+// by the op's exact generation-tagged user_data, which is unambiguous for
+// both real fds and fixed-file indexes, and — because the cancel SQE
+// enters the ring BEFORE the fd/slot can be reused — can never hit a
+// successor conn's op. The cancel's own CQE is suppressed on success and
+// tagged udProvide on failure (-ENOENT/-EALREADY when the op completed
+// first), so the dispatcher drops it; only the cancelled op's own
+// terminal CQE feeds the kernelInflight accounting.
+//
+// On a full SQ ring, mirror armHeaderTimer: Submit to drain, retry once,
+// and otherwise proceed without the cancel — the op then terminates on
+// peer data/FIN or the pendingRelease backstop reaps cs with a WARN.
+func (w *Worker) cancelConnOps(fd int, cs *connState) {
+	if cs.recvArmed {
+		if sqe := w.getCancelSQE(); sqe != nil {
+			prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, fd, cs.generation))
+			setSQEUserData(sqe, encodeUserData(udProvide, fd))
+		}
+	}
+	if cs.sending || cs.zcNotifPending {
+		if sqe := w.getCancelSQE(); sqe != nil {
+			prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udSend, fd, cs.generation))
+			setSQEUserData(sqe, encodeUserData(udProvide, fd))
+		}
+	}
+}
+
+// getCancelSQE returns an SQE for a close-path cancel, submitting the
+// pending SQ ring once to make room if it is full (the armHeaderTimer
+// pattern). Returns nil only if the ring is full even after the submit.
+func (w *Worker) getCancelSQE() unsafe.Pointer {
+	sqe := w.ring.GetSQE()
+	if sqe != nil {
+		return sqe
+	}
+	if _, err := w.ring.Submit(); err != nil {
+		return nil
+	}
+	return w.ring.GetSQE()
+}
+
+// noteClosedInflight registers cs in Worker.closedOps when it still has
+// kernel-held ops at close time, so their terminal CQEs — which arrive
+// after w.conns[fd] is niled and therefore dispatch as stale — can be
+// attributed back to cs (noteStaleTerminalOp) and unblock its release.
+// Must be called by every close path that queues cs for deferred release,
+// after the last arm/cancel decision for cs has been made.
+func (w *Worker) noteClosedInflight(cs *connState) {
+	if cs.kernelInflight <= 0 {
+		return
+	}
+	if w.closedOps == nil {
+		w.closedOps = make(map[uint64]*closedOpsEntry)
+	}
+	key := encodeConnOpKey(cs.fd, cs.generation)
+	e := w.closedOps[key]
+	if e == nil {
+		e = &closedOpsEntry{}
+		w.closedOps[key] = e
+	}
+	e.inflight += cs.kernelInflight
+	e.conns = append(e.conns, cs)
+}
+
+// dropClosedOps removes cs's identity from Worker.closedOps when the
+// wall-clock backstop releases it with ops still unaccounted for. Without
+// this, a terminal CQE arriving after the backstop would write through
+// the map into a connState the pool may have already handed to a new
+// conn. Any conns colliding on the same identity lose their accounting
+// too and will be reaped by their own backstop — acceptable for a path
+// that only fires on kernel anomalies.
+func (w *Worker) dropClosedOps(cs *connState) {
+	if len(w.closedOps) == 0 {
+		return
+	}
+	delete(w.closedOps, encodeConnOpKey(cs.fd, cs.generation))
+}
+
+// queuePendingRelease enqueues cs for deferred release: drainPendingRelease
+// recycles it once cs.kernelInflight hits zero (or the wall-clock backstop
+// fires). See Worker.pendingRelease docstring for the kernel-buffer-lifetime
 // invariant this enforces.
 func (w *Worker) queuePendingRelease(cs *connState) {
 	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
@@ -1998,11 +2387,11 @@ func (w *Worker) queuePendingRelease(cs *connState) {
 // recover() block, reading cs.fd and re-clearing cs.asyncInBuf, when
 // finishCloseDetached returns. Recycling cs through releaseConnState
 // at this point races those reads. We just keep the strong ref alive
-// for pendingReleaseHoldNanos and let GC collect — the goroutine has long
-// since finished by then, the kernel has long since drained any
-// pending recv targeting cs.buf, and Go's GC reclaims cs and cs.buf
-// without any chance of the kernel writing inbound HTTP bytes into
-// memory the runtime has repurposed (#256 SIGSEGV class).
+// until the kernel ops drain (cs.kernelInflight == 0) and let GC
+// collect — the goroutine's own closure references keep cs alive for
+// however long it still needs it, but only THIS queue's strong ref is
+// visible on behalf of the kernel's invisible recv pointer, so it must
+// outlive every pending op targeting cs.buf // span-corruption class).
 func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
 		cs:             cs,
@@ -2011,34 +2400,64 @@ func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 	})
 }
 
-// drainPendingRelease returns any connStates whose deferred-release
-// window has elapsed to the sync.Pool. FIFO because queue entries are
-// always appended with monotonically increasing releaseAtNanos.
-// Compared against cachedNow (refreshed each loop pass); the hold is
-// computed from a fresh time.Now() at enqueue so the window is always
-// >= pendingReleaseHoldNanos of real time even when cachedNow lags.
+// drainPendingRelease releases queued connStates whose kernel-held ops
+// have all delivered their terminal CQE (cs.kernelInflight == 0 — the
+// close path's ASYNC_CANCELs make that prompt), compacting the queue in
+// place. Entries still holding kernel ops stay queued until their
+// wall-clock backstop (releaseAtNanos vs cachedNow; the deadline is a
+// fresh time.Now()+hold from enqueue so the window is real time even
+// when cachedNow lags — v1.5.0 review 2.9). The backstop firing means
+// the kernel never delivered a terminal CQE for an op we believe it
+// holds — log a WARN, since releasing now trades a potential
+// use-after-free against an unbounded leak, and scrub the conn from
+// closedOps so a later CQE cannot touch the released memory.
 //
 // Detached entries skip the pool recycle (releaseConnState would
 // reset fields that goroutine closures may still observe via the
 // runAsyncHandler defer block) and just drop the strong ref so GC
 // can reclaim the cs.
+//
+// In steady state entries drain within a loop pass or two, so the queue
+// stays a handful of entries deep and the full scan is cheap; it is the
+// straggler entries themselves that would otherwise block a FIFO-prefix
+// scan, so compaction is required for prompt release behind them.
 func (w *Worker) drainPendingRelease() {
-	n := 0
-	for n < len(w.pendingRelease) && w.pendingRelease[n].releaseAtNanos <= w.cachedNow {
-		entry := &w.pendingRelease[n]
-		if !entry.detached {
-			releaseConnState(entry.cs)
+	kept := w.pendingRelease[:0]
+	for i := range w.pendingRelease {
+		entry := &w.pendingRelease[i]
+		cs := entry.cs
+		if cs.kernelInflight > 0 {
+			if entry.releaseAtNanos > w.cachedNow {
+				kept = append(kept, *entry)
+				continue
+			}
+			// Backstop: kernel anomaly, not normal flow.
+			if w.logger != nil {
+				w.logger.Warn("releasing connState with kernel ops unaccounted for after backstop hold",
+					"worker", w.id, "fd", cs.fd, "generation", cs.generation,
+					"inflight", cs.kernelInflight, "detached", entry.detached)
+			}
+			w.dropClosedOps(cs)
 		}
-		entry.cs = nil // drop strong ref from the slice's backing array
-		n++
+		if !entry.detached {
+			releaseConnState(cs)
+		}
 	}
-	if n > 0 {
-		w.pendingRelease = w.pendingRelease[n:]
+	// Nil out the tail slots so the backing array drops its strong refs
+	// to released connStates.
+	for i := len(kept); i < len(w.pendingRelease); i++ {
+		w.pendingRelease[i].cs = nil
 	}
+	w.pendingRelease = kept
 }
 
 func (w *Worker) finishClose(fd int) {
 	cs := w.conns[fd]
+	// Remove from liveConns BEFORE niling w.conns[fd]: removeLiveConn swaps
+	// the last live entry into cs.liveIdx and updates that swapped-in
+	// connState's liveIdx via w.conns[swappedFD], so the conns slice must
+	// still be intact (v1.5.0 review 1.8 hazard).
+	w.removeLiveConn(cs)
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
@@ -2050,24 +2469,36 @@ func (w *Worker) finishClose(fd int) {
 	// Capture close-path decisions before queueing cs for deferred release.
 	fixedFile := cs != nil && cs.fixedFile
 	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached
-	// Defer pool release. Returning cs to sync.Pool now would let Go's
-	// GC reclaim cs.buf's backing array; the kernel's still-pending
-	// recv SQE would then write inbound bytes into memory Go has
-	// repurposed (typically the runtime stack pool), yielding a SEGV
-	// when stackalloc later dereferences HTTP bytes as a pointer
-	// (#256 class). Hold cs in pendingRelease for a window longer
-	// than io_uring's cancellation latency before returning to the
-	// pool.
+	// Cancel-then-release discipline (v1.4.15/7beebb9 corruption fix): ASYNC_CANCEL any kernel-held
+	// op still targeting cs's buffers (the single-shot recv is virtually
+	// ALWAYS armed here — closing the fd below does NOT complete it), then
+	// register cs for stale-CQE accounting and defer the pool release
+	// until every op has delivered its terminal CQE. Returning cs to
+	// sync.Pool before that would let Go's GC reclaim cs.buf's backing
+	// array; the kernel's still-pending recv SQE would then write
+	// straggler bytes into memory Go has repurposed — the #256 stackalloc
+	// SIGSEGV / Green-Tea-GC span-corruption class.
 	if cs != nil {
+		w.cancelConnOps(fd, cs)
+		w.noteClosedInflight(cs)
 		w.queuePendingRelease(cs)
 	}
 
 	if fixedFile {
 		// Fixed file: close via io_uring direct close (no real FD to shutdown).
+		// Stamp the closing conn's generation so its close CQE is matched to
+		// THIS occupant — a stale close-error CQE for a freed+reused slot is
+		// dropped at dispatch before reaching handleClose, so it can no longer
+		// nil the new occupant (review 2.2 error path). cs is still valid here:
+		// queuePendingRelease only DEFERS releaseConnState.
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
 			prepCloseDirect(sqe, fd)
-			setSQEUserData(sqe, encodeUserData(udClose, fd))
+			gen := uint16(0)
+			if cs != nil {
+				gen = cs.generation
+			}
+			setSQEUserData(sqe, encodeUserDataGen(udClose, fd, gen))
 		}
 		// Explicitly reset the fixed file slot to -1 so the kernel's
 		// IORING_FILE_INDEX_ALLOC allocator can reuse it. Without this,
@@ -2124,6 +2555,9 @@ func (w *Worker) finishCloseAny(fd int, cs *connState) {
 // WITHOUT returning the connState to the pool. Used when a detached goroutine
 // still holds closure references to the connState.
 func (w *Worker) finishCloseDetached(fd int, cs *connState) {
+	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
+	// finishClose — removeLiveConn touches w.conns[swappedFD]).
+	w.removeLiveConn(cs)
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
@@ -2135,28 +2569,31 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	fixedFile := cs.fixedFile
 	// Do NOT call releaseConnState — goroutine closures still reference cs.
 	//
-	// Hold cs alive in pendingRelease past the kernel's recv-SQE drain
-	// window. After the goroutine exits (which happens promptly once
-	// closeConn sets asyncClosed and broadcasts asyncCond), cs has no
-	// remaining references and becomes GC-eligible. Without this hold,
-	// GC would reclaim cs.buf while the kernel still has a pending recv
-	// SQE targeting &cs.buf[0]; on the next inbound byte the kernel
-	// writes HTTP request bytes into memory Go has repurposed for
-	// runtime stack pages — the next stackalloc walks an mspan list
-	// where a pointer slot now reads "GET / HTTP/1.1" and SIGSEGVs at
-	// addr 0x48202f20544547 (#256 class, fingerprint matches the
-	// strict-matrix run2 trip on churn-close × iouring-async).
-	//
-	// pendingReleaseHoldNanos (100 ms wall-clock) is comfortably
-	// longer than io_uring's close-cancels-pending-ops latency on
-	// Linux 6.x and longer than any reasonable runAsyncHandler tail.
+	// Cancel-then-release discipline (v1.4.15/7beebb9 corruption fix): ASYNC_CANCEL the armed recv
+	// (closing the fd below does NOT complete it — the op holds its own
+	// file reference), then hold cs alive in pendingRelease until its
+	// terminal CQE arrives. After the goroutine exits (which happens
+	// promptly once closeConn sets asyncClosed and broadcasts asyncCond),
+	// only this queue's strong ref stands in for the kernel's invisible
+	// recv pointer. Without it, GC would reclaim cs.buf while the kernel
+	// still has a pending recv SQE targeting &cs.buf[0]; a straggler
+	// segment then writes HTTP bytes into memory Go has repurposed —
+	// historically a stackalloc SIGSEGV at addr 0x48202f20544547 (#256,
+	// strict-matrix churn-close × iouring-async), and on Go 1.26 a fatal
+	// "s.allocCount != s.nelems" span corruption (v1.4.15/7beebb9: the old 100 ms
+	// wall-clock hold sat below TCP's 200 ms RTO_MIN, so retransmitted
+	// POST segments landed after release).
+	w.cancelConnOps(fd, cs)
+	w.noteClosedInflight(cs)
 	w.queuePendingReleaseDetached(cs)
 
 	if fixedFile {
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
 			prepCloseDirect(sqe, fd)
-			setSQEUserData(sqe, encodeUserData(udClose, fd))
+			// Stamp the closing conn's generation (review 2.2 error path) —
+			// cs is the non-nil param and stays valid (deferred release).
+			setSQEUserData(sqe, encodeUserDataGen(udClose, fd, cs.generation))
 		}
 		_ = w.ring.UpdateFixedFile(fd, -1)
 		return
@@ -2216,7 +2653,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
 // caller has already set cs.asyncPromoted and returned the provided buffer.
-func (w *Worker) promoteConnToAsync(cs *connState, fd int, stashed []byte, c *completionEntry) {
+func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *completionEntry) {
 	cs.asyncInMu.Lock()
 	cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
 	starting := !cs.asyncRun
@@ -2235,7 +2672,7 @@ func (w *Worker) promoteConnToAsync(cs *connState, fd int, stashed []byte, c *co
 		w.armHeaderTimer(cs)
 	}
 	if !cqeHasMore(c.Flags) && !cs.recvPaused {
-		if !w.prepareRecv(fd, cs.buf) {
+		if !w.prepareRecv(cs, cs.buf) {
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
@@ -2567,20 +3004,28 @@ func (w *Worker) prepareAccept() {
 	setSQEUserData(sqe, encodeUserData(udAccept, w.listenFD))
 }
 
-// prepareRecv submits a recv SQE. Uses multishot recv with ring-mapped provided
-// buffers when available; falls back to single-shot per-connection buffer recv.
-// Returns true if the SQE was submitted, false if the SQ ring was full.
-func (w *Worker) prepareRecv(fd int, buf []byte) bool {
+// prepareRecv submits a recv SQE for cs. Uses multishot recv with
+// ring-mapped provided buffers when available; falls back to single-shot
+// per-connection buffer recv. Returns true if the SQE was submitted,
+// false if the SQ ring was full.
+//
+// Takes the connState (not fd+gen) so the arm and its kernelInflight /
+// recvArmed bookkeeping cannot diverge: every armed recv MUST be counted,
+// or the close path would release cs.buf while the kernel still holds a
+// write pointer into it (v1.4.15/7beebb9 corruption).
+func (w *Worker) prepareRecv(cs *connState, buf []byte) bool {
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		return false
 	}
 	if w.bufRing != nil {
-		prepMultishotRecv(sqe, fd, bufRingGroupID, w.fixedFiles)
+		prepMultishotRecv(sqe, cs.fd, bufRingGroupID, w.fixedFiles)
 	} else {
-		prepRecv(sqe, fd, buf)
+		prepRecv(sqe, cs.fd, buf)
 	}
-	setSQEUserData(sqe, encodeUserData(udRecv, fd))
+	setSQEUserData(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
+	cs.recvArmed = true
+	cs.kernelInflight++
 	return true
 }
 
@@ -2593,6 +3038,11 @@ func (w *Worker) prepareRecv(fd int, buf []byte) bool {
 // cs.buf path is picked.
 func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	cs.recvIntoBody = false
+	// Drop any prior body-recv pin: pickRecvTarget is only invoked to arm a
+	// NEW recv, which means the previous (single-shot) recv already
+	// completed, so no kernel SQE still targets the old bodyBuf array. The
+	// body path below re-sets the pin when it arms into bodyBuf again.
+	cs.bodyRecvPin = nil
 	// Async mode: the dispatch goroutine owns h1State; the worker cannot
 	// safely observe NextRecvBuf without synchronization. Always use
 	// cs.buf so the goroutine handles body accumulation on its side.
@@ -2604,6 +3054,12 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	}
 	if b := cs.h1State.NextRecvBuf(); b != nil {
 		cs.recvIntoBody = true
+		// Pin the bodyBuf backing array (b shares it) so a later
+		// conn.CloseH1 → state.bodyBuf=nil cannot let GC reclaim it while
+		// this recv SQE is still in flight (#256 body-buffer UAF; see
+		// connState.bodyRecvPin). Released by releaseConnState after the
+		// pendingRelease window drains.
+		cs.bodyRecvPin = b
 		return b
 	}
 	return cs.buf
@@ -2671,11 +3127,24 @@ func (w *Worker) drainDetachQueue() {
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
 			if desired {
 				if sqe := w.ring.GetSQE(); sqe != nil {
-					prepCancelFDSkipSuccess(sqe, cs.fd)
+					// Cancel the in-flight recv. cs.fd is a fixed-file
+					// INDEX when fixed files are on, so cancelling by raw
+					// fd would match nothing; match by the recv's
+					// user_data instead, which is unambiguous in both
+					// modes (v1.5.0 review 2.5). The match MUST include the
+					// conn's generation — the recv SQE carries it (review
+					// 2.6), so a gen-less target would match nothing. The
+					// cancel SQE itself carries the udProvide tag so the
+					// dispatcher drops its CQE.
+					if cs.fixedFile {
+						prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
+					} else {
+						prepCancelFDSkipSuccess(sqe, cs.fd)
+					}
 					setSQEUserData(sqe, encodeUserData(udProvide, cs.fd))
 				}
 			} else {
-				if w.prepareRecv(cs.fd, cs.buf) {
+				if w.prepareRecv(cs, cs.buf) {
 					cs.needsRecv = false
 				} else {
 					cs.needsRecv = true
@@ -2751,8 +3220,9 @@ func (w *Worker) flushSend(cs *connState) bool {
 			return true // SQ ring full — caller should markDirty
 		}
 		w.prepSendSQE(sqe, cs, false)
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 		cs.sending = true
+		cs.kernelInflight++
 		w.sendsPending = true
 		return false
 	}
@@ -2788,8 +3258,9 @@ func (w *Worker) flushSend(cs *connState) bool {
 		if cs.fixedFile {
 			setSQEFixedFile(sqe)
 		}
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 		cs.sending = true
+		cs.kernelInflight++
 		w.sendsPending = true
 		return false
 	}
@@ -2801,8 +3272,9 @@ func (w *Worker) flushSend(cs *connState) bool {
 		return true
 	}
 	w.prepSendSQE(sqe, cs, false)
-	setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+	setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 	cs.sending = true
+	cs.kernelInflight++
 	w.sendsPending = true
 	return false
 }
@@ -2873,18 +3345,71 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		} else {
 			prepSendPlain(sqe, cs.fd, cs.sendBuf, true)
 		}
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 		prepRecv(recvSQE, cs.fd, cs.buf)
-		setSQEUserData(recvSQE, encodeUserData(udRecv, cs.fd))
+		setSQEUserData(recvSQE, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 		cs.recvLinked = true
+		// The linked recv is a kernel-held op like any prepareRecv arm:
+		// count it and mark it armed so the close path cancels it and
+		// release waits for its terminal CQE (a failed linked SEND makes
+		// the kernel post -ECANCELED for it — still a terminal CQE).
+		cs.recvArmed = true
+		cs.kernelInflight++
 	} else {
 		// Only one SQE slot — unlinked send, can use ZC if available.
 		w.prepSendSQE(sqe, cs, false)
-		setSQEUserData(sqe, encodeUserData(udSend, cs.fd))
+		setSQEUserData(sqe, encodeUserDataGen(udSend, cs.fd, cs.generation))
 	}
 	cs.sending = true
+	cs.kernelInflight++
 	w.sendsPending = true
 	return false
+}
+
+// addLiveConn records a new active FD in the dense liveConns slice and
+// stamps cs.liveIdx with its position so removeLiveConn can find it in
+// O(1). Worker-thread-only (the slice is unsynchronised); called from
+// onAcceptedFD. (celeris#318 / v1.5.0 review 1.8)
+func (w *Worker) addLiveConn(cs *connState) {
+	cs.liveIdx = len(w.liveConns)
+	w.liveConns = append(w.liveConns, cs.fd)
+}
+
+// removeLiveConn removes cs's FD from liveConns in O(1) by swapping the
+// last entry into cs.liveIdx and truncating. The swapped-in connState's
+// liveIdx is updated to its new position. Worker-thread-only.
+// (celeris#318 / v1.5.0 review 1.8)
+//
+// Callers MUST pass the live connState (not look it up via w.conns[fd]),
+// because the close paths nil w.conns[fd] around this call. The defensive
+// guards below make a stale / double call a no-op rather than corrupting
+// the slice.
+func (w *Worker) removeLiveConn(cs *connState) {
+	if cs == nil {
+		return
+	}
+	i := cs.liveIdx
+	if i < 0 || i >= len(w.liveConns) || w.liveConns[i] != cs.fd {
+		// Not actually in liveConns at the recorded index (already removed,
+		// never added, or hijacked). Don't touch the slice.
+		return
+	}
+	n := len(w.liveConns) - 1
+	if i != n {
+		swappedFD := w.liveConns[n]
+		w.liveConns[i] = swappedFD
+		// Update the swapped-in element's recorded index. Guard against a
+		// niled conns slot (shouldn't happen for a live entry, but keeps
+		// this robust against teardown ordering).
+		if swappedFD >= 0 && swappedFD < len(w.conns) {
+			if scs := w.conns[swappedFD]; scs != nil {
+				scs.liveIdx = i
+			}
+		}
+	}
+	w.liveConns[n] = 0
+	w.liveConns = w.liveConns[:n]
+	cs.liveIdx = -1
 }
 
 // checkTimeouts scans active connections and closes any that have exceeded
@@ -2892,9 +3417,34 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 // replaces the timer wheel: instead of allocating entries and updating maps
 // on every recv/send, we store a single lastActivity timestamp on the
 // connState and scan here.
+//
+// Iterates the dense liveConns slice (celeris#318) rather than the sparse
+// 0..maxFD range. The previous O(maxFD) scan was the dominant cost above
+// ~8 Ki conns on a 16-core box; with liveConns the scan cost is O(active
+// conns) regardless of FD space.
 func (w *Worker) checkTimeouts() {
 	now := time.Now().UnixNano()
-	for fd := 0; fd <= w.maxFD; fd++ {
+	// Drain the deferred-release queue here too. drainPendingRelease gates on
+	// w.cachedNow, which is otherwise only refreshed inside the CQE-processing
+	// block; on a fully idle worker (no CQEs) cachedNow never advances and
+	// closed connStates would be pinned indefinitely. checkTimeouts runs on
+	// the ~100ms idle cadence, so refreshing cachedNow and draining here
+	// bounds the hold to the wall-clock window even with zero CQE traffic.
+	// NOTE: the enqueue-time stamp stays a fresh time.Now()+hold (see
+	// queuePendingRelease) so the hold window remains >= cancellation latency
+	// regardless of cachedNow staleness (v1.5.0 review 2.9).
+	w.cachedNow = now
+	if len(w.pendingRelease) > 0 {
+		w.drainPendingRelease()
+	}
+	// Iterate in REVERSE by index: closeConn → finishClose → removeLiveConn
+	// swap-removes the FD with the last live entry and shrinks the slice. A
+	// forward `range` would then (a) skip the swapped-in conn (moved into an
+	// already-visited slot) and (b) read a stale/zeroed tail slot as fd 0,
+	// dereferencing w.conns[0]. Reverse-by-index visits each conn exactly
+	// once even as entries are swap-removed from the tail (v1.5.0 review 1.9).
+	for i := len(w.liveConns) - 1; i >= 0; i-- {
+		fd := w.liveConns[i]
 		cs := w.conns[fd]
 		if cs == nil || cs.closing {
 			continue
@@ -2939,7 +3489,12 @@ func (w *Worker) shutdown() {
 	// Fire onClose for every registered driver conn before tearing down
 	// ring/listen fd. Otherwise driver callbacks are silently dropped.
 	w.shutdownDrivers()
-	for fd := 0; fd <= w.maxFD; fd++ {
+	// Reverse-by-index for the same reason as checkTimeouts (v1.5.0 review
+	// 1.9): any teardown path that swap-removes from liveConns must not cause
+	// a forward range to skip a swapped-in conn or read a zeroed tail slot
+	// as fd 0.
+	for i := len(w.liveConns) - 1; i >= 0; i-- {
+		fd := w.liveConns[i]
 		cs := w.conns[fd]
 		if cs == nil {
 			continue
@@ -2979,9 +3534,14 @@ func (w *Worker) shutdown() {
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}
-		if !detached {
-			releaseConnState(cs)
-		}
+		// Do NOT releaseConnState here, detached or not. Conns being torn
+		// down by shutdown almost always have a recv SQE armed on cs.buf,
+		// and the ring is only closed AFTER this loop — recycling cs into
+		// the shared connStatePool now could hand cs.buf to a conn on a
+		// still-running sibling worker while this ring's kernel side can
+		// still write into it (same #256-class UAF, shutdown variant).
+		// The conns remain reachable via w.conns until the Worker itself
+		// is collected, well after the ring teardown cancels its ops.
 	}
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
@@ -3086,12 +3646,37 @@ func boundAddr(fd int) net.Addr {
 	return nil
 }
 
+// sockaddrString formats a peer address as "ip:port" (IPv4) or
+// "[ip]:port" (IPv6). It runs on the accept hot path (once per OnConnect),
+// so it avoids the fmt.Sprintf reflection/allocation cost: the IPv4 path
+// builds the dotted-quad + port directly into a stack buffer with
+// strconv.AppendInt and the IPv6 path appends net.IP's canonical form
+// (the one remaining short-lived allocation) without fmt. See v1.5.0
+// review 2.11.
 func sockaddrString(sa unix.Sockaddr) string {
 	switch v := sa.(type) {
 	case *unix.SockaddrInet4:
-		return fmt.Sprintf("%s:%d", net.IP(v.Addr[:]), v.Port)
+		// Max "255.255.255.255:65535" = 21 bytes.
+		var b [21]byte
+		buf := b[:0]
+		buf = strconv.AppendInt(buf, int64(v.Addr[0]), 10)
+		buf = append(buf, '.')
+		buf = strconv.AppendInt(buf, int64(v.Addr[1]), 10)
+		buf = append(buf, '.')
+		buf = strconv.AppendInt(buf, int64(v.Addr[2]), 10)
+		buf = append(buf, '.')
+		buf = strconv.AppendInt(buf, int64(v.Addr[3]), 10)
+		buf = append(buf, ':')
+		buf = strconv.AppendInt(buf, int64(v.Port), 10)
+		return string(buf)
 	case *unix.SockaddrInet6:
-		return fmt.Sprintf("[%s]:%d", net.IP(v.Addr[:]), v.Port)
+		ip := net.IP(v.Addr[:]).String()
+		buf := make([]byte, 0, len(ip)+8)
+		buf = append(buf, '[')
+		buf = append(buf, ip...)
+		buf = append(buf, ']', ':')
+		buf = strconv.AppendInt(buf, int64(v.Port), 10)
+		return string(buf)
 	}
 	return ""
 }

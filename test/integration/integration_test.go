@@ -14,7 +14,7 @@ func TestAdaptiveEngineLifecycle(t *testing.T) {
 	cfg := defaultTestConfig(port, engine.Auto)
 	cfg.Engine = engine.Adaptive
 
-	e, err := adaptive.New(cfg, &echoHandler{})
+	e, err := adaptive.New(cfg, &echoHandler{}, nil)
 	if err != nil {
 		t.Skipf("adaptive engine not available: %v", err)
 	}
