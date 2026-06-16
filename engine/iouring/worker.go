@@ -74,6 +74,31 @@ const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (
 // auto-scaling from Workers × TargetConnsPerWorker.
 const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 
+// CELERIS_IOURING_SENDZC_MIN sets the minimum send payload size, in bytes, for
+// which zero-copy SEND_ZC is used; smaller sends use a plain SEND. SEND_ZC
+// produces two CQEs (the send result plus a buffer-reuse notification) and
+// holds the buffer until the notification arrives, so for small responses it
+// adds a CQE round-trip without the page-pinning payoff. Defaults to
+// defaultSendZCMinBytes; set 0 to always use SEND_ZC.
+const envSendZCMin = "CELERIS_IOURING_SENDZC_MIN"
+
+// defaultSendZCMinBytes is the SEND_ZC payload threshold when the env is unset:
+// below it the copy is cheaper than the extra notification CQE and the stall
+// that holds the send buffer until the notification lands.
+const defaultSendZCMinBytes = 4096
+
+// resolveSendZCMin reads the SEND_ZC size threshold from the environment,
+// falling back to defaultSendZCMinBytes. 0 disables the threshold (always
+// SEND_ZC); a negative or malformed value uses the default.
+func resolveSendZCMin() int {
+	if v := os.Getenv(envSendZCMin); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultSendZCMinBytes
+}
+
 // resolveBufRingCount picks the provided-buffer-ring size for a worker.
 // The default formula is `nextPowerOf2(max(bufRingCountMin, 2 *
 // TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
@@ -191,7 +216,11 @@ type Worker struct {
 	fixedFiles bool // runtime flag: true if ACCEPT_DIRECT is working
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
-	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	// sendZCMin is the minimum send payload, in bytes, for which SEND_ZC is
+	// used; smaller sends fall back to a plain SEND (one CQE, no notification
+	// round-trip). Tunable via CELERIS_IOURING_SENDZC_MIN; see resolveSendZCMin.
+	sendZCMin int
+	async     bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
 	// h1Only is true when engine config locks every conn to HTTP/1.1
 	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
 	// once at registerConn and never written, so the recv hot path can
@@ -330,6 +359,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		tier:          tier,
 		sqpoll:        tier.SQPollIdle() > 0,
 		sendZC:        tier.SupportsSendZC(),
+		sendZCMin:     resolveSendZCMin(),
 		async:         cfg.AsyncHandlers,
 		h1Only:        cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
 		conns:         make([]*connState, fixedFileTableSize),
@@ -3280,10 +3310,12 @@ func (w *Worker) flushSend(cs *connState) bool {
 }
 
 // prepSendSQE prepares a SEND or SEND_ZC SQE based on worker capabilities.
-// SEND_ZC is only used for unlinked sends (the notification CQE would break
-// the link chain). Linked sends always use regular SEND.
+// SEND_ZC is only used for unlinked sends (the notification CQE would break the
+// link chain) whose payload is at least sendZCMin bytes — below that the extra
+// notification CQE costs more than the copy it saves. Linked and small sends
+// use a regular SEND.
 func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
-	if w.sendZC && !linked {
+	if w.sendZC && !linked && len(cs.sendBuf) >= w.sendZCMin {
 		if cs.fixedFile {
 			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
 		} else {
