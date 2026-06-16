@@ -74,6 +74,17 @@ const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (
 // auto-scaling from Workers × TargetConnsPerWorker.
 const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 
+// CELERIS_IOURING_SKIP_SLOT_RESET=1 skips the explicit per-close
+// UpdateFixedFile(slot,-1) register call in the ACCEPT_DIRECT close path,
+// relying on IORING_OP_CLOSE (prepCloseDirect) to recycle the fixed-file slot
+// itself. That register call is a synchronous io_uring_register syscall issued
+// on the event-loop thread for EVERY close, so under connection churn it
+// serializes the accept/recv/send pipeline (celeris#331). On kernels where
+// CLOSE_DIRECT recycles the slot the reset is redundant; on kernels that do not
+// recycle it (the reset's original reason) the fixed-file table would exhaust
+// under sustained churn — so this stays opt-in until evaluated per kernel.
+const envSkipSlotReset = "CELERIS_IOURING_SKIP_SLOT_RESET"
+
 // resolveBufRingCount picks the provided-buffer-ring size for a worker.
 // The default formula is `nextPowerOf2(max(bufRingCountMin, 2 *
 // TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
@@ -191,7 +202,11 @@ type Worker struct {
 	fixedFiles bool // runtime flag: true if ACCEPT_DIRECT is working
 	sqpoll     bool // true when SQPOLL is active (kernel submits SQEs)
 	sendZC     bool // true when SEND_ZC is available (kernel 6.0+)
-	async      bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
+	// skipSlotReset omits the per-close UpdateFixedFile(slot,-1) register
+	// syscall, relying on CLOSE_DIRECT to recycle the slot. Opt-in via
+	// CELERIS_IOURING_SKIP_SLOT_RESET; see envSkipSlotReset.
+	skipSlotReset bool
+	async         bool // true when Config.AsyncHandlers dispatches handlers to spawned Gs
 	// h1Only is true when engine config locks every conn to HTTP/1.1
 	// (Protocol == HTTP1 AND EnableH2Upgrade == false). cs.protocol is set
 	// once at registerConn and never written, so the recv hot path can
@@ -330,6 +345,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		tier:          tier,
 		sqpoll:        tier.SQPollIdle() > 0,
 		sendZC:        tier.SupportsSendZC(),
+		skipSlotReset: os.Getenv(envSkipSlotReset) == "1",
 		async:         cfg.AsyncHandlers,
 		h1Only:        cfg.Protocol == engine.HTTP1 && !cfg.EnableH2Upgrade,
 		conns:         make([]*connState, fixedFileTableSize),
@@ -2504,7 +2520,12 @@ func (w *Worker) finishClose(fd int) {
 		// IORING_FILE_INDEX_ALLOC allocator can reuse it. Without this,
 		// some kernels (e.g., AWS 6.17) fail to recycle CLOSE_DIRECT'd
 		// slots, exhausting the 65536-entry table under sustained churn.
-		_ = w.ring.UpdateFixedFile(fd, -1)
+		// This is a synchronous register syscall on the event-loop thread;
+		// skipSlotReset omits it on kernels that recycle the slot via
+		// CLOSE_DIRECT alone (see envSkipSlotReset).
+		if !w.skipSlotReset {
+			_ = w.ring.UpdateFixedFile(fd, -1)
+		}
 		return
 	}
 
@@ -2595,7 +2616,11 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 			// cs is the non-nil param and stays valid (deferred release).
 			setSQEUserData(sqe, encodeUserDataGen(udClose, fd, cs.generation))
 		}
-		_ = w.ring.UpdateFixedFile(fd, -1)
+		// See finishClose: skipSlotReset omits this synchronous per-close
+		// register syscall on kernels that recycle the slot via CLOSE_DIRECT.
+		if !w.skipSlotReset {
+			_ = w.ring.UpdateFixedFile(fd, -1)
+		}
 		return
 	}
 
