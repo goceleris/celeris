@@ -113,14 +113,21 @@ func TestSSEOnNativeEngines(t *testing.T) {
 				}
 			}()
 
-			// Open the SSE stream with a 2 s read deadline; require at
-			// least two `event: tick` lines.
-			conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+			// Open the SSE stream and require at least two `event: tick`
+			// lines. The handler ticks every 50 ms, so two events arrive
+			// in ~100 ms on real hardware; the deadline only guards
+			// against the engine hanging the stream entirely. It is set
+			// generously (10 s) because constrained CI runners under the
+			// race detector — where io_uring degrades to single-shot and
+			// scheduling is slow — occasionally needed more than the old
+			// 2 s, producing a flake that never reproduces on real
+			// io_uring hardware (verified 20/20 -race on cluster).
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = conn.Close() }()
-			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			req := "GET /events HTTP/1.1\r\n" +
 				"Host: " + addr + "\r\n" +
 				"Accept: text/event-stream\r\n" +
