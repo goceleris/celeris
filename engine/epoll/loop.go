@@ -145,6 +145,29 @@ type Loop struct {
 	async bool
 }
 
+// CELERIS_EPOLL_BUSY_POLL_US overrides the SO_BUSY_POLL window, in microseconds,
+// applied to accepted connections. Busy-poll lowers single-connection latency
+// but spins a CPU per polled socket, which can waste cycles at high connection
+// counts. 0 disables busy-poll entirely (and with it SO_PREFER_BUSY_POLL /
+// SO_BUSY_POLL_BUDGET, removing two setsockopt calls per accept).
+const envEpollBusyPollUS = "CELERIS_EPOLL_BUSY_POLL_US"
+
+// defaultEpollBusyPollUS is the SO_BUSY_POLL window when the env is unset.
+const defaultEpollBusyPollUS = 50
+
+// resolveBusyPoll reads the SO_BUSY_POLL window from the environment, defaulting
+// to defaultEpollBusyPollUS microseconds. 0 disables busy-poll; a negative or
+// malformed value uses the default.
+func resolveBusyPoll() time.Duration {
+	us := defaultEpollBusyPollUS
+	if v := os.Getenv(envEpollBusyPollUS); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			us = n
+		}
+	}
+	return time.Duration(us) * time.Microsecond
+}
+
 func newLoop(id, cpuID int, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
@@ -170,7 +193,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		sockOpts: sockopts.Options{
 			TCPNoDelay:  true,
 			TCPQuickAck: true,
-			SOBusyPoll:  50 * time.Microsecond,
+			SOBusyPoll:  resolveBusyPoll(),
 			RecvBuf:     resolved.SocketRecv,
 			SendBuf:     resolved.SocketSend,
 		},
