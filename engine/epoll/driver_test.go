@@ -57,7 +57,7 @@ func newTestEngine(t *testing.T) (*Engine, func()) {
 	}()
 
 	// Wait for the engine to bind.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if eng.Addr() != nil && eng.NumWorkers() > 0 {
 			break

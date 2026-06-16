@@ -236,45 +236,61 @@ func TestStaleConnCQENoBufferNoRecycle(t *testing.T) {
 func TestGenerationDiffersAcrossReuse(t *testing.T) {
 	const fd = 11
 
-	cs1 := acquireConnState(context.TODO(), fd, 0, false)
-	oldGen := cs1.generation
-	releaseConnState(cs1) // returns to pool; generation NOT reset
-
-	cs2 := acquireConnState(context.TODO(), fd, 0, false)
-	newGen := cs2.generation
-	defer releaseConnState(cs2)
-
-	if newGen == oldGen {
-		t.Fatalf("generation did not advance across reuse: old=%d new=%d", oldGen, newGen)
+	// Per-object invariant: acquireConnState increments the generation of
+	// the object it returns and releaseConnState never resets it, so any
+	// connState that is REUSED carries a strictly higher generation than its
+	// previous life. That per-object monotonicity is what staleConnCQE
+	// relies on. connStatePool is a sync.Pool, which does NOT guarantee
+	// returning the just-released object, so we assert the advance only when
+	// the SAME object reappears (across many cycles it reliably does) —
+	// asserting it unconditionally was a flake: a fresh pool object starts
+	// at generation 1, colliding with a once-used object's 1.
+	seen := map[*connState]uint16{}
+	for i := 0; i < 256; i++ {
+		cs := acquireConnState(context.TODO(), fd, 0, false)
+		if prev, ok := seen[cs]; ok && cs.generation <= prev {
+			t.Fatalf("generation did not advance on reuse of same object: prev=%d now=%d", prev, cs.generation)
+		}
+		seen[cs] = cs.generation
+		releaseConnState(cs)
 	}
+
+	// staleConnCQE: a CQE whose generation differs from the fd occupant's
+	// current generation is dropped (and its provided buffer recycled); a
+	// CQE matching the occupant's generation is handled. Both generations
+	// are constructed deterministically rather than relying on pool identity.
+	cs := acquireConnState(context.TODO(), fd, 0, false)
+	defer releaseConnState(cs)
+	curGen := cs.generation
+	staleGen := curGen - 1 // the previous occupant's generation (always != curGen; curGen >= 1)
 
 	w := &Worker{
 		conns:   make([]*connState, 64),
 		bufRing: newTestBufferRing(8, 64),
 	}
-	w.conns[fd] = cs2 // the new occupant
+	w.conns[fd] = cs // the current occupant
 
-	// CQE from the OLD occupant (oldGen) → stale → dropped + buffer recycled.
+	// CQE stamped with the OLD generation → stale → dropped + buffer recycled.
 	tailBefore := w.bufRing.tail
 	old := &completionEntry{
-		UserData: encodeUserDataGen(udRecv, fd, oldGen),
+		UserData: encodeUserDataGen(udRecv, fd, staleGen),
 		Res:      8,
 		Flags:    cqeFlagsWithBuffer(1),
 	}
 	if !w.staleConnCQE(old, fd, old.UserData) {
-		t.Fatalf("old-generation CQE (gen=%d) not dropped against live gen=%d", oldGen, newGen)
+		t.Fatalf("old-generation CQE (gen=%d) not dropped against live gen=%d", staleGen, curGen)
 	}
 	if w.bufRing.tail != tailBefore+1 {
 		t.Fatalf("old-generation buffer not recycled: tail %d → %d", tailBefore, w.bufRing.tail)
 	}
 
-	// CQE for the CURRENT occupant (newGen) → not stale.
+	// CQE for the CURRENT occupant (curGen) → not stale.
 	cur := &completionEntry{
-		UserData: encodeUserDataGen(udRecv, fd, newGen),
+		UserData: encodeUserDataGen(udRecv, fd, curGen),
 		Res:      8,
 		Flags:    cqeFlagsWithBuffer(2),
 	}
 	if w.staleConnCQE(cur, fd, cur.UserData) {
-		t.Fatalf("current-generation CQE (gen=%d) wrongly dropped", newGen)
+		t.Fatalf("current-generation CQE (gen=%d) wrongly dropped", curGen)
 	}
 }

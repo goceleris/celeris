@@ -35,7 +35,7 @@ const (
 // detachMu up front without being truly detached; they keep the H1/H2
 // limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
 func (cs *connState) sendCap() int {
-	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached {
+	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
 		return maxSendQueueBytesDetached
 	}
 	return maxSendQueueBytes
