@@ -5,6 +5,7 @@ package platform
 
 import (
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -197,4 +198,58 @@ func readNodeCPUs(numaNodes int) [][]int {
 		return nil
 	}
 	return result
+}
+
+// DetectCoreTopology probes the CPU core layout via sysfs. Logical comes from
+// runtime.NumCPU; Physical is the count of distinct physical cores derived from
+// each CPU's topology/thread_siblings_list (all hardware threads of one core
+// share an identical sibling list, so the deduplicated list count is the
+// physical-core count). SMT is Logical/Physical (>=1). Falls back gracefully to
+// a no-SMT view when sysfs is unavailable.
+func DetectCoreTopology() CoreTopology {
+	logical := runtime.NumCPU()
+	if logical < 1 {
+		logical = 1
+	}
+	physical := detectPhysicalCores()
+	if physical < 1 || physical > logical {
+		physical = logical
+	}
+	smt := logical / physical
+	if smt < 1 {
+		smt = 1
+	}
+	return CoreTopology{
+		Logical:   logical,
+		Physical:  physical,
+		SMT:       smt,
+		NUMANodes: DetectNUMA().NumNodes,
+	}
+}
+
+// detectPhysicalCores counts distinct physical cores by deduplicating the
+// thread_siblings_list of every cpuN entry under /sys/devices/system/cpu.
+// Returns 0 when sysfs topology is unavailable so the caller can fall back.
+func detectPhysicalCores() int {
+	entries, err := os.ReadDir("/sys/devices/system/cpu")
+	if err != nil {
+		return 0
+	}
+	seen := make(map[string]struct{})
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "cpu") {
+			continue
+		}
+		// Only cpuN entries (skip cpufreq, cpuidle, etc.).
+		if _, err := strconv.Atoi(name[3:]); err != nil {
+			continue
+		}
+		data, err := os.ReadFile("/sys/devices/system/cpu/" + name + "/topology/thread_siblings_list")
+		if err != nil {
+			continue
+		}
+		seen[strings.TrimSpace(string(data))] = struct{}{}
+	}
+	return len(seen)
 }

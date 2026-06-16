@@ -66,3 +66,28 @@ func TestPinToCPU(_ *testing.T) {
 	// On non-linux this is a no-op. On linux it may fail without root but shouldn't panic.
 	_ = PinToCPU(0)
 }
+
+func TestDetectCoreTopology(t *testing.T) {
+	// Invariants must hold on every platform: the non-Linux fallback reports
+	// Physical == Logical / SMT == 1, and the Linux sysfs reader is bounded by
+	// the same constraints.
+	topo := DetectCoreTopology()
+	if topo.Logical < 1 {
+		t.Fatalf("Logical = %d, want >= 1", topo.Logical)
+	}
+	if topo.Physical < 1 || topo.Physical > topo.Logical {
+		t.Errorf("Physical = %d, want in [1, %d]", topo.Physical, topo.Logical)
+	}
+	if topo.SMT < 1 {
+		t.Errorf("SMT = %d, want >= 1", topo.SMT)
+	}
+	// SMT is the integer threads-per-core ratio; Physical*SMT must not exceed
+	// Logical (it is floor(Logical/Physical)).
+	if topo.Physical*topo.SMT > topo.Logical {
+		t.Errorf("Physical(%d)*SMT(%d) = %d exceeds Logical(%d)",
+			topo.Physical, topo.SMT, topo.Physical*topo.SMT, topo.Logical)
+	}
+	if topo.NUMANodes < 1 {
+		t.Errorf("NUMANodes = %d, want >= 1", topo.NUMANodes)
+	}
+}

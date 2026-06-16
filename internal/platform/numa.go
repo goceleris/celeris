@@ -5,6 +5,19 @@ import (
 	"strings"
 )
 
+// CoreTopology describes the CPU core layout used by the worker formula.
+// Logical is the number of hardware threads (runtime.NumCPU); Physical is the
+// number of distinct physical cores; SMT is the threads-per-core factor
+// (Logical/Physical, >=1, e.g. 2 on a hyperthreaded x86 host). NUMANodes is the
+// socket count. DetectCoreTopology fills these from sysfs on Linux and falls
+// back to a single-node, no-SMT view elsewhere.
+type CoreTopology struct {
+	Logical   int
+	Physical  int
+	SMT       int
+	NUMANodes int
+}
+
 // parseCPUList parses a Linux CPU list string (e.g., "0-23,48-71") into
 // individual CPU IDs.
 func parseCPUList(s string) []int {
