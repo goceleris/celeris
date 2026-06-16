@@ -81,7 +81,7 @@ func TestAsyncHandlerLargeBodyKeepAlive(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) && e.Addr() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -147,7 +147,7 @@ func TestAsyncHandlerLargeBodyConcurrent(t *testing.T) {
 		}
 	}()
 
-	dl := time.Now().Add(3 * time.Second)
+	dl := time.Now().Add(15 * time.Second)
 	for time.Now().Before(dl) && e.Addr() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}

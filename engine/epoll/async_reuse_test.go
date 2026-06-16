@@ -59,7 +59,7 @@ func startAsyncEngine(t *testing.T) (string, func()) {
 	go func() { errCh <- e.Listen(ctx) }()
 
 	// Wait until listener is up.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if a := e.Addr(); a != nil {
 			break

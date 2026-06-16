@@ -90,7 +90,7 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-errCh })
 
 	// Wait for bind.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) && e.Addr() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}

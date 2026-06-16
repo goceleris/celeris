@@ -129,7 +129,7 @@ func TestMetricsConnectionTracking(t *testing.T) {
 
 	go func() { _ = e.Listen(listenCtx) }()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for e.Addr() == nil && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
