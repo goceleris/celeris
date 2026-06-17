@@ -167,8 +167,10 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		acceptPaused: acceptPaused,
 		wake:         make(chan struct{}),
 		ready:        make(chan error, 1),
+		// TCPNoDelay is omitted here: accepted sockets inherit TCP_NODELAY
+		// from the listen socket (set in createListenSocket), so per-accept
+		// ApplyFD doesn't need to re-issue it.
 		sockOpts: sockopts.Options{
-			TCPNoDelay:  true,
 			TCPQuickAck: true,
 			SOBusyPoll:  50 * time.Microsecond,
 			RecvBuf:     resolved.SocketRecv,
@@ -2379,6 +2381,10 @@ func createListenSocket(addr string) (int, error) {
 		return -1, err
 	}
 
+	// TCP_NODELAY on the listen socket: Linux copies it onto every accepted
+	// socket at SYN time, so per-accept ApplyFD can skip its own NODELAY
+	// setsockopt (one fewer syscall per accept on the hot path).
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	// TCP_DEFER_ACCEPT: kernel holds connections until data arrives,
 	// eliminating wasted accept+wait cycles for idle connections.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
