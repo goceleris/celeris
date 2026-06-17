@@ -41,8 +41,8 @@ const (
 	// opPROVIDEBUFFERS = 31 removed in v1.5.0 (celeris#320) — the legacy
 	// BufferGroup / PROVIDE_BUFFERS SQE was never wired into the engine.
 	// The supported path is IORING_REGISTER_PBUF_RING (BufferRing above).
-	opSHUTDOWN = 52 // IORING_OP_SHUTDOWN (kernel 5.11+)
-	opSENDZC   = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
+	opSHUTDOWN = 34 // IORING_OP_SHUTDOWN (kernel 5.11+)
+	opSENDZC   = 47 // IORING_OP_SEND_ZC (kernel 6.0+)
 )
 
 // SQE flags.
@@ -57,7 +57,7 @@ const (
 const (
 	cqeFBuffer = 1 << 0
 	cqeFMore   = 1 << 1
-	cqeFNotif  = 1 << 2 // IORING_CQE_F_NOTIF: zero-copy send notification
+	cqeFNotif  = 1 << 3 // IORING_CQE_F_NOTIF: zero-copy send notification
 )
 
 // Accept flags.
