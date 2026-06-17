@@ -589,7 +589,14 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, tmp[:nUser]...)
 	} else {
-		headers = make([][2]string, 0, total)
+		// Reuse a per-Context scratch instead of allocating per request — the
+		// dominant chain-fullstack alloc (18 headers > respHdrBuf's 16) lived
+		// here. respHeaders never aliases blobHdrScratch (separate buffers; the
+		// append below copies the [2]string values).
+		if cap(c.blobHdrScratch) < total {
+			c.blobHdrScratch = make([][2]string, 0, total)
+		}
+		headers = c.blobHdrScratch[:0]
 		headers = append(headers, [2]string{"content-type", ct})
 		headers = append(headers, [2]string{"content-length", itoa(len(data))})
 		headers = append(headers, c.respHeaders...)

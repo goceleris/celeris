@@ -174,6 +174,13 @@ type Context struct {
 	// requests so a >16-header route reallocates once per pooled Context, not
 	// once per request. nil until the first overflow.
 	respHdrScratch [][2]string
+	// blobHdrScratch is the reused assembly buffer for Blob's response header
+	// list (content-type + content-length + user headers) when the total exceeds
+	// respHdrBuf's 16 slots. Without it, Blob allocates make([][2]string,0,total)
+	// on EVERY many-header response (chain-fullstack: 18 headers ⇒ the dominant
+	// per-request alloc + GC pressure). Reused so it reallocates once per pooled
+	// Context, not once per request. nil until the first many-header Blob.
+	blobHdrScratch [][2]string
 
 	trustedNets []*net.IPNet
 

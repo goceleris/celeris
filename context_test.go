@@ -281,6 +281,41 @@ func TestContextRespHeaderOverflowReuseZeroAlloc(t *testing.T) {
 	}
 }
 
+// nopRW is a no-op ResponseWriter so an alloc test can isolate the Context path
+// from the mock writer's own header/body copies.
+type nopRW struct{}
+
+func (nopRW) WriteResponse(_ *stream.Stream, _ int, _ [][2]string, _ []byte) error { return nil }
+
+// TestContextBlobManyHeadersZeroAlloc locks in the chain-fullstack fix: when a
+// response carries more than the inline-buffer's headers (15 user + content-type
+// + content-length = 17 > 16), Blob must reuse blobHdrScratch instead of
+// allocating make([][2]string,0,total) every request — that was the dominant
+// per-request allocation (≈77% of chain-fullstack allocs → GC pressure).
+func TestContextBlobManyHeadersZeroAlloc(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+	s.ResponseWriter = nopRW{} // the default mock writer allocates; isolate Blob
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	// 15 user headers ⇒ total 17 > respHdrBuf's 16 ⇒ Blob's many-header path.
+	for i := 0; i < 15; i++ {
+		c.SetHeader("h"+strconv.Itoa(i), "v")
+	}
+	body := []byte("hello")
+	avg := testing.AllocsPerRun(500, func() {
+		c.written = false
+		_ = c.Blob(200, "application/json", body)
+	})
+	if avg != 0 {
+		t.Fatalf("Blob many-header path must reuse blobHdrScratch: got %.2f allocs/op, want 0", avg)
+	}
+	if cap(c.blobHdrScratch) < 17 {
+		t.Fatalf("blobHdrScratch should retain a >=17 cap backing array, got cap=%d", cap(c.blobHdrScratch))
+	}
+}
+
 func TestContextFullPathResetOnRelease(t *testing.T) {
 	s, _ := newTestStream("GET", "/test")
 	defer s.Release()
