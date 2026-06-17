@@ -21,16 +21,27 @@ func TestRouteAsync_ServerDefaultSync(t *testing.T) {
 	}
 }
 
-// TestRouteAsync_ServerDefaultAsync verifies routes inherit an async
-// server default (Config.AsyncHandlers=true) when not overridden.
-func TestRouteAsync_ServerDefaultAsync(t *testing.T) {
+// TestRouteAsync_ServerDefaultAdaptive verifies the celeris#356 contract: a
+// route that inherits the AsyncHandlers=true default (not an explicit .Async())
+// is ADAPTIVE — it starts INLINE (routeAsync=false, the ring-batched fast path)
+// and is promoted to async only after a blocking inline run. hasAsyncRoutes
+// stays true because adaptive routes may promote and need the async infra.
+func TestRouteAsync_ServerDefaultAdaptive(t *testing.T) {
 	s := New(Config{AsyncHandlers: true})
 	s.GET("/ping", noopHandler)
-	if !s.router.routeAsync("GET", "/ping") {
-		t.Fatal("route should inherit async server default")
+	if s.router.routeAsync("GET", "/ping") {
+		t.Fatal("adaptive route should start INLINE (not async) until it blocks")
+	}
+	if !s.router.adaptiveRoutes["/ping"] {
+		t.Fatal("/ping should be registered adaptive under AsyncHandlers=true")
 	}
 	if !s.router.hasAsyncRoutes() {
-		t.Fatal("hasAsyncRoutes should be true when default is async")
+		t.Fatal("hasAsyncRoutes should be true (adaptive routes may promote)")
+	}
+	// A blocking inline run promotes the route; it then resolves async.
+	s.router.promoteRoute("/ping")
+	if !s.router.routeAsync("GET", "/ping") {
+		t.Fatal("after promotion the adaptive route should resolve async")
 	}
 }
 
@@ -51,17 +62,24 @@ func TestRouteAsync_RouteOverrideOn(t *testing.T) {
 	}
 }
 
-// TestRouteAsync_RouteOverrideOff forces a single route sync on an
-// async-default server.
+// TestRouteAsync_RouteOverrideOff verifies that on an async-default server, an
+// inherited route is adaptive (inline-first, celeris#356) while an explicit
+// .Async(false) route is hard-sync and never adaptive.
 func TestRouteAsync_RouteOverrideOff(t *testing.T) {
 	s := New(Config{AsyncHandlers: true})
-	s.GET("/db", noopHandler)
-	s.GET("/cached", noopHandler).Async(false)
-	if !s.router.routeAsync("GET", "/db") {
-		t.Fatal("/db should inherit async default")
+	s.GET("/db", noopHandler)                  // inherits default → adaptive
+	s.GET("/cached", noopHandler).Async(false) // explicit sync → never adaptive
+	if s.router.routeAsync("GET", "/db") {
+		t.Fatal("/db inherits the async default → adaptive, starts inline")
+	}
+	if !s.router.adaptiveRoutes["/db"] {
+		t.Fatal("/db should be adaptive")
 	}
 	if s.router.routeAsync("GET", "/cached") {
 		t.Fatal("/cached should be forced sync via Async(false)")
+	}
+	if s.router.adaptiveRoutes["/cached"] {
+		t.Fatal("/cached is explicitly sync → must not be adaptive")
 	}
 }
 
@@ -168,5 +186,28 @@ func TestRouteAsync_ResolverInterface(t *testing.T) {
 	}
 	if ra.RouteAsync("GET", "/missing") {
 		t.Fatal("adapter RouteAsync should report unmatched sync")
+	}
+}
+
+// TestRouteAsync_AdaptiveHysteresis verifies celeris#356 promotion hysteresis:
+// a single slow inline run (cold start / GC) must NOT promote a route, but
+// adaptivePromoteStreak consecutive slow runs (a genuinely-blocking handler)
+// must. A fast run resets the streak.
+func TestRouteAsync_AdaptiveHysteresis(t *testing.T) {
+	s := New(Config{AsyncHandlers: true})
+	s.GET("/h", noopHandler)
+	rt := s.router
+	// One slow outlier, then a fast run → no promotion.
+	rt.recordInlineRun("/h", true)
+	rt.recordInlineRun("/h", false)
+	if rt.routeAsync("GET", "/h") {
+		t.Fatal("a single slow run must not promote (cold-start hysteresis)")
+	}
+	// Sustained slowness (blocking handler) → promotion after the streak.
+	for i := 0; i < adaptivePromoteStreak; i++ {
+		rt.recordInlineRun("/h", true)
+	}
+	if !rt.routeAsync("GET", "/h") {
+		t.Fatalf("%d consecutive slow runs must promote to async", adaptivePromoteStreak)
 	}
 }
