@@ -183,6 +183,17 @@ const adaptivePromoteStreak = 8
 // promotes long before it could settle.
 const adaptiveSettleStreak = 256
 
+// adaptivePromoteTTL bounds how long a promotion lasts before the route is
+// re-evaluated inline (celeris#364). Promotion is otherwise terminal — a
+// promoted route runs async and is never re-timed — so a CPU-bound chain that
+// was falsely promoted by a transient load/jitter spike (inline wall-clock
+// crossing adaptivePromoteThreshold under worker contention, not actual
+// blocking) stayed on the ~32%-slower async path until restart. After the TTL
+// the route runs inline again and re-settles if fast, or re-promotes within
+// adaptivePromoteStreak runs if genuinely blocking. The clock is read only for
+// already-promoted routes, so the fast path is unaffected.
+const adaptivePromoteTTL = 5 * time.Second
+
 // recoverAndRelease handles panic recovery and context release. Extracted to a
 // separate noinline function so that HandleStream's stack frame is not inflated
 // by the deferred closure and debug.Stack() call (P5).

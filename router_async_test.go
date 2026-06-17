@@ -276,3 +276,111 @@ func TestRouteAsync_AdaptiveSettles(t *testing.T) {
 		t.Fatal("explicit .Sync() must clear the settled state")
 	}
 }
+
+// stubNowNano installs a controllable clock for the adaptive promotion TTL
+// (celeris#364) and returns a pointer to advance it plus a restore func.
+func stubNowNano() (clock *int64, restore func()) {
+	old := nowNano
+	var c int64
+	nowNano = func() int64 { return c }
+	return &c, func() { nowNano = old }
+}
+
+// TestRouteAsync_PromotionExpires verifies celeris#364: promotion is reversible.
+// A route promoted by a transient spike must de-promote after adaptivePromoteTTL
+// and run inline again, and the de-promotion must reset the slow streak so a
+// single later slow run does not immediately re-promote.
+func TestRouteAsync_PromotionExpires(t *testing.T) {
+	clock, restore := stubNowNano()
+	defer restore()
+
+	s := New(Config{AsyncHandlers: true})
+	s.GET("/d", noopHandler)
+	rt := s.router
+
+	for i := 0; i < adaptivePromoteStreak; i++ {
+		rt.recordInlineRun("/d", true)
+	}
+	if !rt.routeAsync("GET", "/d") {
+		t.Fatal("expected promotion after the slow streak")
+	}
+
+	// Within the TTL → still promoted.
+	*clock += int64(adaptivePromoteTTL) - 1
+	if !rt.routeAsync("GET", "/d") {
+		t.Fatal("promotion must persist within the TTL")
+	}
+
+	// Past the TTL → de-promoted, route runs inline again.
+	*clock += 2
+	if rt.routeAsync("GET", "/d") {
+		t.Fatal("promotion must expire after the TTL (route runs inline again)")
+	}
+	if _, ok := rt.promoted.Load("/d"); ok {
+		t.Fatal("expired promotion must be removed from the promoted set")
+	}
+
+	// The slow streak was reset: one slow run must NOT immediately re-promote.
+	rt.recordInlineRun("/d", true)
+	if rt.routeAsync("GET", "/d") {
+		t.Fatal("de-promotion must reset the slow streak (one slow run must not re-promote)")
+	}
+}
+
+// TestRouteAsync_DePromotedRouteCanSettle verifies that after a falsely-promoted
+// route de-promotes, sustained fast runs SETTLE it (proven non-blocking, inline
+// forever) — i.e. re-evaluation works end to end.
+func TestRouteAsync_DePromotedRouteCanSettle(t *testing.T) {
+	clock, restore := stubNowNano()
+	defer restore()
+
+	s := New(Config{AsyncHandlers: true})
+	s.GET("/d", noopHandler)
+	rt := s.router
+
+	for i := 0; i < adaptivePromoteStreak; i++ {
+		rt.recordInlineRun("/d", true)
+	}
+	*clock += int64(adaptivePromoteTTL) + 1
+	if rt.routeAsync("GET", "/d") {
+		t.Fatal("expected de-promotion at expiry")
+	}
+
+	for i := 0; i < adaptiveSettleStreak; i++ {
+		rt.recordInlineRun("/d", false)
+	}
+	if rt.adaptiveLearning("/d") {
+		t.Fatal("a de-promoted route that runs fast must settle (inline forever)")
+	}
+	if rt.routeAsync("GET", "/d") {
+		t.Fatal("a settled route runs inline, not async")
+	}
+}
+
+// TestRouteAsync_RePromotesAfterExpiryWhenBlocking verifies a genuinely-blocking
+// adaptive route re-promotes after the TTL re-evaluation — de-promotion must not
+// pin a blocking handler to the inline path.
+func TestRouteAsync_RePromotesAfterExpiryWhenBlocking(t *testing.T) {
+	clock, restore := stubNowNano()
+	defer restore()
+
+	s := New(Config{AsyncHandlers: true})
+	s.GET("/b", noopHandler)
+	rt := s.router
+
+	for i := 0; i < adaptivePromoteStreak; i++ {
+		rt.recordInlineRun("/b", true)
+	}
+	*clock += int64(adaptivePromoteTTL) + 1
+	if rt.routeAsync("GET", "/b") {
+		t.Fatal("expected de-promotion at expiry")
+	}
+
+	// Still blocking → re-promotes after a fresh streak.
+	for i := 0; i < adaptivePromoteStreak; i++ {
+		rt.recordInlineRun("/b", true)
+	}
+	if !rt.routeAsync("GET", "/b") {
+		t.Fatal("a still-blocking route must re-promote after expiry")
+	}
+}
