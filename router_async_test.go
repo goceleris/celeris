@@ -83,6 +83,28 @@ func TestRouteAsync_RouteOverrideOff(t *testing.T) {
 	}
 }
 
+// TestRouteAsync_ExplicitAsyncOptsOutOfAdaptive is the celeris#356
+// no-regression guard for blocking handlers. A route explicitly marked
+// .Async() on an async-default server (exactly how the probatorium driver
+// routes — /cache, /db, /mc — register) must be hard-async, NOT adaptive:
+// it must never enter the inline-first window, so a blocking handler never
+// runs inline and stalls a worker. This is what makes #356 safe to ship
+// without a driver-backend regression: trivial routes inherit (adaptive →
+// inline win) while explicitly-async blocking routes stay always-async.
+func TestRouteAsync_ExplicitAsyncOptsOutOfAdaptive(t *testing.T) {
+	s := New(Config{AsyncHandlers: true})
+	s.GET("/cache/:key", noopHandler).Async() // blocking driver route
+	if s.router.adaptiveRoutes["/cache/:key"] {
+		t.Fatal("explicit .Async() route must be removed from the adaptive set")
+	}
+	if _, promoted := s.router.promoted.Load("/cache/:key"); promoted {
+		t.Fatal("explicit .Async() route must carry no promotion state")
+	}
+	if !s.router.routeAsync("GET", "/cache/42") {
+		t.Fatal("explicit .Async() route must resolve hard-async (never inline)")
+	}
+}
+
 // TestRouteAsync_GroupInherit verifies group-level Async applies to its
 // routes.
 func TestRouteAsync_GroupInherit(t *testing.T) {
