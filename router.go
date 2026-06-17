@@ -115,6 +115,16 @@ type router struct {
 	// cache) accumulates adaptivePromoteStreak slow runs and gets promoted. A
 	// fast run resets the streak.
 	slowStreak sync.Map
+	// fastStreak tracks consecutive FAST inline runs per adaptive fullPath
+	// (fullPath -> *atomic.Int32). Once a route is fast on adaptiveSettleStreak
+	// consecutive runs it is provably non-blocking and gets SETTLED — future
+	// requests skip the per-request inline timing (two time.Now() vDSO calls)
+	// entirely (celeris#361). A slow run resets it.
+	fastStreak sync.Map
+	// settled holds adaptive fullPaths proven non-blocking (see fastStreak).
+	// A settled route is no longer timed/promotable; it runs inline like a
+	// plain sync route. Explicit .Async()/.Sync() clears it (setAsync).
+	settled sync.Map
 }
 
 // Route is an opaque handle to a registered route. Use the Name method to
@@ -240,6 +250,9 @@ func (r *Route) setAsync(want bool) *Route {
 		if r.router.adaptiveRoutes[r.path] {
 			delete(r.router.adaptiveRoutes, r.path)
 			r.router.promoted.Delete(r.path)
+			r.router.settled.Delete(r.path)
+			r.router.fastStreak.Delete(r.path)
+			r.router.slowStreak.Delete(r.path)
 			// Adaptive routes were already counted (they may promote): keep the
 			// count when the explicit choice is async, drop it when sync.
 			if !want && r.router.asyncRouteCount > 0 {
@@ -298,12 +311,35 @@ func (r *router) recordInlineRun(fullPath string, slow bool) {
 		if v, ok := r.slowStreak.Load(fullPath); ok {
 			v.(*atomic.Int32).Store(0)
 		}
+		// celeris#361: a route fast on adaptiveSettleStreak CONSECUTIVE runs is
+		// provably non-blocking — settle it so adaptiveLearning short-circuits
+		// and handler.go stops timing every request forever.
+		fv, _ := r.fastStreak.LoadOrStore(fullPath, new(atomic.Int32))
+		if fv.(*atomic.Int32).Add(1) >= adaptiveSettleStreak {
+			r.settled.Store(fullPath, struct{}{})
+		}
 		return
+	}
+	if v, ok := r.fastStreak.Load(fullPath); ok {
+		v.(*atomic.Int32).Store(0)
 	}
 	v, _ := r.slowStreak.LoadOrStore(fullPath, new(atomic.Int32))
 	if v.(*atomic.Int32).Add(1) >= adaptivePromoteStreak {
 		r.promoteRoute(fullPath)
 	}
+}
+
+// adaptiveLearning reports whether an adaptive route is still being observed —
+// i.e. neither settled (proven non-blocking, celeris#361) nor promoted (proven
+// blocking, celeris#356). Only learning routes pay the per-request inline
+// timing in handler.go; once decided, the hot path skips it. Steady state is a
+// single sync.Map.Load (settled), the same lookup cost the prior isPromoted
+// check carried, but without the two time.Now() vDSO calls per request.
+func (r *router) adaptiveLearning(fullPath string) bool {
+	if _, ok := r.settled.Load(fullPath); ok {
+		return false
+	}
+	return !r.isPromoted(fullPath)
 }
 
 // addRoute registers a route inheriting the server-level async default.

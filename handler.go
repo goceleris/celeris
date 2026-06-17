@@ -138,7 +138,7 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	// goroutine instead of stalling the event-loop worker. Non-adaptive configs
 	// (no AsyncHandlers default) hit the empty-map fast path and skip timing.
 	rt := a.server.router
-	if rt.adaptiveRoutes[fullPath] && !rt.isPromoted(fullPath) {
+	if rt.adaptiveRoutes[fullPath] && rt.adaptiveLearning(fullPath) {
 		start := time.Now()
 		err := c.Next()
 		rt.recordInlineRun(fullPath, time.Since(start) > adaptivePromoteThreshold)
@@ -167,6 +167,15 @@ const adaptivePromoteThreshold = 50 * time.Microsecond
 // streak) makes a one-off cold start / GC pause harmless, while a handler that
 // blocks on every request promotes within a handful of requests.
 const adaptivePromoteStreak = 8
+
+// adaptiveSettleStreak is how many CONSECUTIVE fast inline runs SETTLE an
+// adaptive route (celeris#361): proven non-blocking, it is removed from the
+// timed path so the hot loop stops paying two time.Now() vDSO calls per
+// request forever. High enough that only consistently-static routes settle (a
+// slow run resets the streak); at scale a static route settles in well under a
+// millisecond. A genuinely-blocking handler should be marked .Async() — it
+// promotes long before it could settle.
+const adaptiveSettleStreak = 256
 
 // recoverAndRelease handles panic recovery and context release. Extracted to a
 // separate noinline function so that HandleStream's stack frame is not inflated

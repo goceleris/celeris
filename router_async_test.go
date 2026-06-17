@@ -233,3 +233,46 @@ func TestRouteAsync_AdaptiveHysteresis(t *testing.T) {
 		t.Fatalf("%d consecutive slow runs must promote to async", adaptivePromoteStreak)
 	}
 }
+
+// TestRouteAsync_AdaptiveSettles verifies celeris#361: a route fast on
+// adaptiveSettleStreak CONSECUTIVE inline runs SETTLES (leaves the timed
+// learning path so the hot loop stops paying two time.Now() per request), and a
+// slow run before the streak completes resets it. A settled route still runs
+// inline (not async).
+func TestRouteAsync_AdaptiveSettles(t *testing.T) {
+	s := New(Config{AsyncHandlers: true})
+	route := s.GET("/s", noopHandler)
+	rt := s.router
+
+	// One short of the streak → still learning.
+	for i := 0; i < adaptiveSettleStreak-1; i++ {
+		rt.recordInlineRun("/s", false)
+	}
+	if !rt.adaptiveLearning("/s") {
+		t.Fatal("route must still be learning before the settle streak completes")
+	}
+
+	// A slow run resets the fast streak; the next near-full run must NOT settle.
+	rt.recordInlineRun("/s", true)
+	for i := 0; i < adaptiveSettleStreak-1; i++ {
+		rt.recordInlineRun("/s", false)
+	}
+	if !rt.adaptiveLearning("/s") {
+		t.Fatal("a slow run must reset the fast streak — route not settled yet")
+	}
+
+	// One more fast run completes the streak → settle.
+	rt.recordInlineRun("/s", false)
+	if rt.adaptiveLearning("/s") {
+		t.Fatalf("route must settle after %d consecutive fast runs", adaptiveSettleStreak)
+	}
+	if rt.routeAsync("GET", "/s") {
+		t.Fatal("a settled route runs INLINE, not async")
+	}
+
+	// An explicit override clears the settled state (setAsync).
+	route.Sync()
+	if _, settled := rt.settled.Load("/s"); settled {
+		t.Fatal("explicit .Sync() must clear the settled state")
+	}
+}
