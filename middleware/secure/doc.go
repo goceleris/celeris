@@ -14,14 +14,16 @@
 //   - Referrer-Policy: "strict-origin-when-cross-origin"
 //   - Cross-Origin-Opener-Policy: "same-origin"
 //   - Cross-Origin-Resource-Policy: "same-origin"
-//   - Cross-Origin-Embedder-Policy: "require-corp"
 //   - X-DNS-Prefetch-Control: "off"
 //   - X-Permitted-Cross-Domain-Policies: "none"
 //   - Origin-Agent-Cluster: "?1"
-//   - X-Download-Options: "noopen"
 //
-// Content-Security-Policy and Permissions-Policy are only included when
-// their respective [Config] fields are non-empty.
+// Cross-Origin-Embedder-Policy ("require-corp") and X-Download-Options
+// ("noopen") are OPT-IN (off by default, #338): COEP-by-default breaks
+// cross-origin resource loads (matching helmet, which leaves it off), and
+// X-Download-Options only affected legacy Internet Explorer. Content-Security-
+// Policy and Permissions-Policy are likewise only emitted when their [Config]
+// fields are non-empty.
 //
 // # Usage
 //
@@ -64,8 +66,8 @@
 // # CORS Interaction
 //
 // When using CORS middleware alongside secure, note that the default
-// CrossOriginEmbedderPolicy (require-corp) and CrossOriginResourcePolicy
-// (same-origin) block cross-origin resource loading. APIs serving
-// cross-origin requests should set CrossOriginResourcePolicy: "cross-origin"
-// and CrossOriginEmbedderPolicy: [Suppress].
+// CrossOriginResourcePolicy (same-origin) blocks cross-origin resource
+// loading; APIs serving cross-origin requests should set
+// CrossOriginResourcePolicy: "cross-origin". COEP is off by default so it no
+// longer needs suppressing; enable it explicitly only when isolating the page.
 package secure

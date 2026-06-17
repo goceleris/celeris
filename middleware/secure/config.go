@@ -67,12 +67,13 @@ type Config struct {
 	CrossOriginResourcePolicy string `yaml:"cross_origin_resource_policy"`
 
 	// CrossOriginEmbedderPolicy sets the Cross-Origin-Embedder-Policy header.
-	// Default: "require-corp".
+	// Default: "" (NOT emitted — opt-in).
 	//
-	// WARNING: "require-corp" blocks cross-origin resources (images, scripts,
-	// etc.) that do not carry a Cross-Origin-Resource-Policy header or valid
-	// CORS headers. If your application loads third-party assets, use
-	// "credentialless" or [Suppress] to avoid breakage.
+	// COEP is off by default because "require-corp" blocks cross-origin
+	// resources (images, scripts, etc.) that lack a Cross-Origin-Resource-Policy
+	// or valid CORS headers — enabling it by default silently breaks many sites,
+	// so like helmet we leave it opt-in. Set "require-corp" or "credentialless"
+	// to enable.
 	CrossOriginEmbedderPolicy string `yaml:"cross_origin_embedder_policy"`
 
 	// XDNSPrefetchControl sets the X-DNS-Prefetch-Control header.
@@ -88,7 +89,9 @@ type Config struct {
 	OriginAgentCluster string `yaml:"origin_agent_cluster"`
 
 	// XDownloadOptions sets the X-Download-Options header.
-	// Default: "noopen".
+	// Default: "" (NOT emitted — opt-in). This header only affected legacy
+	// Internet Explorer downloads and is obsolete on modern browsers; set
+	// "noopen" to restore it.
 	XDownloadOptions string `yaml:"x_download_options"`
 }
 
@@ -103,11 +106,14 @@ var defaultConfig = Config{
 	ReferrerPolicy:            "strict-origin-when-cross-origin",
 	CrossOriginOpenerPolicy:   "same-origin",
 	CrossOriginResourcePolicy: "same-origin",
-	CrossOriginEmbedderPolicy: "require-corp",
+	// COEP off by default (opt-in): require-corp breaks cross-origin resource
+	// loads; enabling it by default is a footgun (matches helmet). #338.
+	CrossOriginEmbedderPolicy: "",
 	XDNSPrefetchControl:       "off",
 	XPermittedCrossDomain:     "none",
 	OriginAgentCluster:        "?1",
-	XDownloadOptions:          "noopen",
+	// X-Download-Options off by default (opt-in): legacy IE-only, obsolete.
+	XDownloadOptions: "",
 }
 
 func applyDefaults(cfg Config) Config {
