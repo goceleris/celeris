@@ -201,7 +201,7 @@ func probeSendZC() (SendZCProbeResult, string) {
 
 	entry = ring.cqeAt(cqHead)
 	notifFlags := entry.Flags
-	isNotif := notifFlags&0x04 != 0 // CQE_F_NOTIF
+	isNotif := notifFlags&cqeFNotif != 0 // CQE_F_NOTIF (1<<3); 0x04 is SOCK_NONEMPTY
 	notifRes := entry.Res
 	ring.EndCQ(cqHead + 1)
 
