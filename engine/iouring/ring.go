@@ -231,6 +231,14 @@ func (r *Ring) mmap() error {
 }
 
 // GetSQE returns a pointer to the next available SQE, or nil if the ring is full.
+//
+// NOT SQPOLL-safe: this advances the SHARED SQ tail before the caller writes
+// the SQE payload, which is correct only because io_uring_enter is the kernel
+// sync point on the non-SQPOLL submit path. Under IORING_SETUP_SQPOLL the
+// kernel poll thread reads the tail continuously and could consume a
+// half-written SQE — so SQPOLL must not be enabled without first switching to
+// a deferred local tail + a release-store publish after fill. No tier selects
+// SQPOLL (see optionalTier / #377), so this path is never exercised today.
 func (r *Ring) GetSQE() unsafe.Pointer {
 	var tail, head uint32
 	if r.singleIssuer {
