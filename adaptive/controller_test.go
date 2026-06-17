@@ -13,12 +13,8 @@ import (
 // TestControllerOrganicSwitch verifies that, in the io_uring sweet spot
 // (high connection count + high CPU), the controller eventually recommends an
 // epoll→io_uring switch driven purely by the io_uring bias — no pre-seeded
-// standby history, no active degradation.
-//
-// This FAILS against the pre-fix logic: the standby was seeded at
-// activeScore*0.80 and only decayed, so standby/active maxed out at ~0.70 and
-// could never clear the 1+threshold (1.15) bar. The bias-modeled standby
-// estimate makes the switch reachable.
+// standby history, no active degradation. The bias is opt-in (celeris#341), so
+// this exercises it with biasEnabled forced on.
 func TestControllerOrganicSwitch(t *testing.T) {
 	primary := newMockEngine(engine.Epoll)     // active
 	secondary := newMockEngine(engine.IOUring) // standby
@@ -27,6 +23,7 @@ func TestControllerOrganicSwitch(t *testing.T) {
 	cfg := resource.Config{Protocol: engine.HTTP1}
 	e := newFromEngines(primary, secondary, sampler, cfg)
 	e.ctrl.cooldown = 0
+	e.ctrl.biasEnabled = true // bias is opt-in; this test exercises it
 
 	// Active epoll snapshot lands squarely in io_uring's empirical sweet spot.
 	sampler.Set(engine.Epoll, TelemetrySnapshot{
@@ -51,6 +48,38 @@ func TestControllerOrganicSwitch(t *testing.T) {
 	}
 	if !switched {
 		t.Fatal("expected organic epoll→io_uring switch in the io_uring sweet spot")
+	}
+}
+
+// TestControllerNoSpeculativeSwitchBiasOff is the celeris#341 safety guard: with
+// the io_uring bias OFF (the default), the SAME io_uring-sweet-spot workload
+// must NOT switch — the standby has never been measured, so the only basis for a
+// switch would be the fabricated bias estimate, which could land adaptive on a
+// measurably-slower engine. Off-by-default keeps adaptive measurement-driven.
+func TestControllerNoSpeculativeSwitchBiasOff(t *testing.T) {
+	primary := newMockEngine(engine.Epoll)     // active
+	secondary := newMockEngine(engine.IOUring) // standby, never measured
+	sampler := newSyntheticSampler()
+
+	cfg := resource.Config{Protocol: engine.HTTP1}
+	e := newFromEngines(primary, secondary, sampler, cfg)
+	e.ctrl.cooldown = 0
+	if e.ctrl.biasEnabled {
+		t.Skip("CELERIS_ADAPTIVE_IOURING_BIAS set in env; default-off assertion N/A")
+	}
+
+	// Squarely in the io_uring bias sweet spot — would switch if the bias were on.
+	sampler.Set(engine.Epoll, TelemetrySnapshot{
+		ThroughputRPS:     1000,
+		ActiveConnections: 2048,
+		CPUUtilization:    0.9,
+	})
+
+	now := time.Now()
+	for i := range 5 {
+		if e.ctrl.evaluate(now.Add(time.Duration(i+1)*time.Minute), false) {
+			t.Fatal("bias off: must NOT speculatively switch to the unmeasured io_uring standby")
+		}
 	}
 }
 

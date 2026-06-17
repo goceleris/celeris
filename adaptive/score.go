@@ -47,7 +47,13 @@ func computeScore(snap TelemetrySnapshot, w ScoreWeights) float64 {
 // x86 — see the bench data above — not a bug. If #318 identifies a
 // different cause (e.g. a PbufRing bottleneck, fixed by #322), update
 // this comment to point at the new finding.
-func ioUringBias(snap TelemetrySnapshot) float64 {
+func ioUringBias(snap TelemetrySnapshot, enabled bool) float64 {
+	// Off by default (celeris#341): this heuristic never reads the standby's
+	// measured throughput, so an ungated bias can speculatively switch adaptive
+	// onto a measurably-slower engine. Gated behind envIOUringBias.
+	if !enabled {
+		return 0
+	}
 	conns := snap.ActiveConnections
 	cpu := snap.CPUUtilization
 

@@ -27,7 +27,7 @@ func TestIoUringBiasConnFactorFalloff(t *testing.T) {
 				ActiveConnections: tt.conns,
 				CPUUtilization:    tt.cpu,
 			}
-			got := ioUringBias(snap)
+			got := ioUringBias(snap, true)
 			if absDiff(got, tt.wantBias) > tt.tolerance {
 				t.Errorf("ioUringBias(conns=%d, cpu=%.2f) = %v, want %v ± %v",
 					tt.conns, tt.cpu, got, tt.wantBias, tt.tolerance)
