@@ -314,6 +314,12 @@ func (s *Stream) resetAndPool() {
 }
 
 // ResetH1Stream performs a lightweight per-request reset for H1 stream reuse.
+// It clears ONLY the fields populateCachedStream + handleH1Request do not
+// unconditionally overwrite on the next request. rawBody is load-bearing: the
+// caller installs it only when the request carries a body, so a bodyless GET
+// would otherwise inherit the previous request's body. Headers/Method/Path/
+// Scheme/Authority/LazyRawHeaders/IsHEAD/EndStream/ResponseWriter/state are all
+// re-set per request (h1.go:852-941), so re-zeroing them here is dead work.
 func ResetH1Stream(s *Stream) {
 	if s.Data != nil {
 		s.Data.Reset()
@@ -321,19 +327,9 @@ func ResetH1Stream(s *Stream) {
 		s.Data = nil
 	}
 	s.rawBody = nil
-	s.Headers = s.hdrBuf[:0]
-	s.LazyRawHeaders = nil
 	s.lazyHeadersBuilt = false
 	s.pseudoMaterialized = false
-	s.Method = ""
-	s.Path = ""
-	s.Scheme = ""
-	s.Authority = ""
 	s.headersSent.Store(false)
-	s.EndStream = false
-	s.ResponseWriter = nil
-	s.IsHEAD = false
-	s.state.Store(int32(StateIdle))
 }
 
 // MaterializeHeaders ensures that every header carried by this H1 stream
