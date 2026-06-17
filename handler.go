@@ -131,7 +131,21 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	c.handlers = handlers
 	c.fullPath = fullPath
 
-	if err := c.Next(); err != nil {
+	// celeris#356: an adaptive route (inherited the AsyncHandlers=true default)
+	// runs INLINE here until observed to block. Time this inline run; if the
+	// handler chain exceeds adaptivePromoteThreshold it is genuinely blocking,
+	// so promote the route to async dispatch — future requests then run on a
+	// goroutine instead of stalling the event-loop worker. Non-adaptive configs
+	// (no AsyncHandlers default) hit the empty-map fast path and skip timing.
+	rt := a.server.router
+	if rt.adaptiveRoutes[fullPath] && !rt.isPromoted(fullPath) {
+		start := time.Now()
+		err := c.Next()
+		rt.recordInlineRun(fullPath, time.Since(start) > adaptivePromoteThreshold)
+		if err != nil {
+			a.handleError(c, s, err)
+		}
+	} else if err := c.Next(); err != nil {
 		a.handleError(c, s, err)
 	}
 	if c.buffered && !c.written {
@@ -140,6 +154,19 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	}
 	return nil
 }
+
+// adaptivePromoteThreshold is the inline handler duration that counts as a
+// "slow" run for adaptive promotion (celeris#356). A non-blocking handler
+// (route + middleware, no I/O) returns in single-digit microseconds; a blocking
+// one (DB/cache round-trip) takes 100µs+. 50µs separates them with margin for
+// GC/scheduling jitter.
+const adaptivePromoteThreshold = 50 * time.Microsecond
+
+// adaptivePromoteStreak is how many CONSECUTIVE slow inline runs promote an
+// adaptive route to async. The consecutive requirement (a fast run resets the
+// streak) makes a one-off cold start / GC pause harmless, while a handler that
+// blocks on every request promotes within a handful of requests.
+const adaptivePromoteStreak = 8
 
 // recoverAndRelease handles panic recovery and context release. Extracted to a
 // separate noinline function so that HandleStream's stack frame is not inflated
