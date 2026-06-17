@@ -10,13 +10,14 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
-// envIOUringBias gates the io_uring workload bias (celeris#341). It is OFF
-// unless explicitly enabled, because the bias is a heuristic that does NOT read
-// the standby engine's measured throughput — ungated it can speculatively
-// switch adaptive onto an engine that is measurably SLOWER on the live
-// workload. With it off, adaptive is purely measurement-driven and never leaves
-// a faster active engine for an unmeasured estimate. Re-enable to re-validate
-// once the bias is gated behind a real measured-parity check.
+// envIOUringBias gates the io_uring workload bias. The bias is now REVERSIBLE
+// (celeris#338): it only EXPLORES — boosting the io_uring standby so an
+// epoll→io_uring switch is reachable when the workload model favors it — and
+// never inflates the active score nor suppresses the epoll standby, so a
+// wrongly-explored io_uring always reverts on measurement. That makes it safe
+// ON by default (adaptive picks the real high-concurrency winner instead of
+// parking on epoll); set CELERIS_ADAPTIVE_IOURING_BIAS=0 to force the
+// conservative measurement-only controller.
 const envIOUringBias = "CELERIS_ADAPTIVE_IOURING_BIAS"
 
 type controllerState struct {
@@ -54,7 +55,7 @@ func newController(primary, secondary engine.Engine, sampler TelemetrySampler, l
 		evalInterval: 5 * time.Second,
 		cooldown:     30 * time.Second,
 		threshold:    0.15,
-		biasEnabled:  os.Getenv(envIOUringBias) == "1",
+		biasEnabled:  os.Getenv(envIOUringBias) != "0",
 		logger:       logger,
 		state: controllerState{
 			activeIsPrimary: true,
@@ -101,40 +102,30 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	// onto a measurably-slower engine.
 	bias := ioUringBias(activeSnap, c.biasEnabled)
 
-	// Apply the bias to the ACTIVE score: reinforce io_uring when it is already
-	// active (resist leaving it), lightly penalise epoll when conditions favor
-	// io_uring (encourage leaving it).
+	// Reversible bias (celeris#338): the ACTIVE score is ALWAYS the pure
+	// measurement — never inflated or penalised — so leaving the active engine
+	// is decided measured-vs-measured, never blocked by a sticky bias bonus.
 	activeScore := baselineActiveScore
-	if active.Type() == engine.IOUring {
-		activeScore *= (1.0 + bias) // Bonus: io_uring already active, reinforce
-	} else if bias > 0 {
-		activeScore *= (1.0 - bias*0.5) // Penalty: epoll active but conditions favor io_uring
-	}
 
-	// Store active's (biased) score for historical reference.
-	c.state.lastActiveScore[active.Type()] = activeScore
+	// Record the measured (unbiased) score as history, so a later revert
+	// compares real throughput rather than a biased estimate.
+	c.state.lastActiveScore[active.Type()] = baselineActiveScore
 	c.state.lastActiveTime[active.Type()] = now
 
-	// Seed standby with 80% of active if no history exists.
+	// Seed standby with 80% of active if no history exists. Harmless: 0.8 never
+	// clears the switch threshold on its own — only the explore-bias does.
 	if _, ok := c.state.lastActiveScore[standby.Type()]; !ok {
-		c.state.lastActiveScore[standby.Type()] = activeScore * 0.80
+		c.state.lastActiveScore[standby.Type()] = baselineActiveScore * 0.80
 		c.state.lastActiveTime[standby.Type()] = now
 	}
 
-	// Standby estimate. Two independent signals, combined by max:
-	//
-	//  1. Historical: the last directly-observed score for the standby engine,
-	//     decayed at 1%/sec. This drives switching when the ACTIVE engine
-	//     genuinely degrades below a previously-measured standby.
-	//
-	//  2. Bias-modeled: the standby score implied by the io_uring bias for the
-	//     CURRENT workload, recomputed EACH tick. When io_uring is the standby
-	//     and conditions favor it, the standby is modeled as the unbiased active
-	//     baseline scaled up by the bias; when epoll is the standby (io_uring
-	//     active and favored) it is scaled DOWN so we do not switch back. This
-	//     is what makes an organic epoll→io_uring switch reachable — the
-	//     historical-only path could never exceed the threshold (max attainable
-	//     ratio ~0.70 < 1+threshold).
+	// Standby estimate. The historical (measured, decayed) score ALWAYS counts —
+	// it is what drives a measurement-based revert. The io_uring bias may
+	// additionally EXPLORE: it boosts the io_uring standby when the workload
+	// model favors it (making an organic epoll→io_uring switch reachable), but
+	// it NEVER suppresses the epoll standby — so reverting from a wrongly-explored
+	// io_uring is always allowed on measurement. A bad exploration self-corrects
+	// the next eval; the oscillation lock bounds any thrash.
 	standbyScore := c.historicalScore(standby.Type(), now)
 	if modeled := c.biasModeledStandbyScore(standby.Type(), baselineActiveScore, bias); modeled > standbyScore {
 		standbyScore = modeled
@@ -153,27 +144,21 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	return false
 }
 
-// biasModeledStandbyScore models the standby engine's score for the CURRENT
-// workload from the io_uring bias, using the unbiased active baseline as the
-// reference point. The sign of the adjustment depends on which engine is the
-// standby:
+// biasModeledStandbyScore models the io_uring standby's score for the CURRENT
+// workload from the io_uring bias (celeris#338): when conditions favor io_uring
+// it is modeled as bias-better than the active baseline → standby =
+// baseline*(1+bias), making an organic epoll→io_uring EXPLORATION reachable
+// (the historical-only path could never clear 1+threshold from a cold standby).
 //
-//   - io_uring standby: when conditions favor io_uring (bias>0) it is modeled
-//     as bias-better than the active baseline → standby = baseline*(1+bias).
-//   - epoll standby (io_uring active and favored): epoll is modeled as
-//     bias-worse → standby = baseline*(1-bias), so a favorable-for-io_uring
-//     workload never recommends switching back to epoll.
-//
-// Recomputed every tick so the estimate tracks live conditions rather than a
-// stale seed.
+// It returns 0 for the epoll standby — the bias never models epoll DOWN. That
+// asymmetry is the reversibility guarantee: a revert from a wrongly-explored
+// io_uring back to epoll is driven purely by epoll's real (historical)
+// measurement and is never blocked by the bias.
 func (c *controller) biasModeledStandbyScore(standby engine.EngineType, baselineActiveScore, bias float64) float64 {
-	if bias <= 0 {
-		return baselineActiveScore
+	if bias <= 0 || standby != engine.IOUring {
+		return 0
 	}
-	if standby == engine.IOUring {
-		return baselineActiveScore * (1.0 + bias)
-	}
-	return baselineActiveScore * (1.0 - bias)
+	return baselineActiveScore * (1.0 + bias)
 }
 
 // historicalScore returns the last known score for an engine type, decayed
