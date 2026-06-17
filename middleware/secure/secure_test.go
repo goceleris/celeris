@@ -28,11 +28,13 @@ func TestDefaultConfigSetsAllHeaders(t *testing.T) {
 	testutil.AssertHeader(t, rec, "referrer-policy", "strict-origin-when-cross-origin")
 	testutil.AssertHeader(t, rec, "cross-origin-opener-policy", "same-origin")
 	testutil.AssertHeader(t, rec, "cross-origin-resource-policy", "same-origin")
-	testutil.AssertHeader(t, rec, "cross-origin-embedder-policy", "require-corp")
+	// COEP (require-corp) and X-Download-Options (legacy IE) are OFF by default
+	// — opt-in (#338); COEP-by-default breaks cross-origin loads.
+	testutil.AssertNoHeader(t, rec, "cross-origin-embedder-policy")
 	testutil.AssertHeader(t, rec, "x-dns-prefetch-control", "off")
 	testutil.AssertHeader(t, rec, "x-permitted-cross-domain-policies", "none")
 	testutil.AssertHeader(t, rec, "origin-agent-cluster", "?1")
-	testutil.AssertHeader(t, rec, "x-download-options", "noopen")
+	testutil.AssertNoHeader(t, rec, "x-download-options")
 }
 
 func TestDefaultConfigOmitsCSPAndPermissionsPolicy(t *testing.T) {
@@ -56,8 +58,8 @@ func TestHeaderDefaultsAndOverrides(t *testing.T) {
 		{"xss-protection custom", &Config{XSSProtection: "1; mode=block"}, "x-xss-protection", "1; mode=block"},
 		{"origin-agent-cluster default", nil, "origin-agent-cluster", "?1"},
 		{"origin-agent-cluster custom", &Config{OriginAgentCluster: "?0"}, "origin-agent-cluster", "?0"},
-		{"x-download-options default", nil, "x-download-options", "noopen"},
-		{"x-download-options custom", &Config{XDownloadOptions: "custom"}, "x-download-options", "custom"},
+		{"x-download-options custom (opt-in)", &Config{XDownloadOptions: "custom"}, "x-download-options", "custom"},
+		{"coep opt-in", &Config{CrossOriginEmbedderPolicy: "require-corp"}, "cross-origin-embedder-policy", "require-corp"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -275,8 +277,8 @@ func TestApplyDefaultsFillsEmptyFields(t *testing.T) {
 	if cfg.CrossOriginResourcePolicy != "same-origin" {
 		t.Fatalf("CrossOriginResourcePolicy: got %q, want %q", cfg.CrossOriginResourcePolicy, "same-origin")
 	}
-	if cfg.CrossOriginEmbedderPolicy != "require-corp" {
-		t.Fatalf("CrossOriginEmbedderPolicy: got %q, want %q", cfg.CrossOriginEmbedderPolicy, "require-corp")
+	if cfg.CrossOriginEmbedderPolicy != "" {
+		t.Fatalf("CrossOriginEmbedderPolicy: got %q, want %q (opt-in default, #338)", cfg.CrossOriginEmbedderPolicy, "")
 	}
 	if cfg.XDNSPrefetchControl != "off" {
 		t.Fatalf("XDNSPrefetchControl: got %q, want %q", cfg.XDNSPrefetchControl, "off")
@@ -287,8 +289,8 @@ func TestApplyDefaultsFillsEmptyFields(t *testing.T) {
 	if cfg.OriginAgentCluster != "?1" {
 		t.Fatalf("OriginAgentCluster: got %q, want %q", cfg.OriginAgentCluster, "?1")
 	}
-	if cfg.XDownloadOptions != "noopen" {
-		t.Fatalf("XDownloadOptions: got %q, want %q", cfg.XDownloadOptions, "noopen")
+	if cfg.XDownloadOptions != "" {
+		t.Fatalf("XDownloadOptions: got %q, want %q (opt-in default, #338)", cfg.XDownloadOptions, "")
 	}
 }
 
@@ -342,14 +344,14 @@ func TestBuildHeadersSkipsEmptyStrings(t *testing.T) {
 func TestBuildHeadersDefaultCount(t *testing.T) {
 	cfg := applyDefaults(Config{})
 	headers := buildHeaders(cfg)
-	// Default config should produce 11 headers (no CSP, no PermissionsPolicy).
-	// x-content-type-options, x-frame-options, x-xss-protection,
-	// referrer-policy, cross-origin-opener-policy, cross-origin-resource-policy,
-	// cross-origin-embedder-policy, x-dns-prefetch-control, x-permitted-cross-domain-policies,
-	// origin-agent-cluster, x-download-options.
-	// Note: HSTS is not in buildHeaders (runtime check).
-	if len(headers) != 11 {
-		t.Fatalf("expected 11 headers from default config, got %d", len(headers))
+	// Default config produces 9 headers (no CSP, no PermissionsPolicy; COEP +
+	// X-Download-Options are opt-in, #338): x-content-type-options,
+	// x-frame-options, x-xss-protection, referrer-policy,
+	// cross-origin-opener-policy, cross-origin-resource-policy,
+	// x-dns-prefetch-control, x-permitted-cross-domain-policies,
+	// origin-agent-cluster. Note: HSTS is not in buildHeaders (runtime check).
+	if len(headers) != 9 {
+		t.Fatalf("expected 9 headers from default config, got %d", len(headers))
 	}
 }
 
@@ -359,9 +361,9 @@ func TestBuildHeadersWithCSPAndPermissions(t *testing.T) {
 		PermissionsPolicy:     "camera=()",
 	})
 	headers := buildHeaders(cfg)
-	// 11 defaults + CSP + PermissionsPolicy = 13.
-	if len(headers) != 13 {
-		t.Fatalf("expected 13 headers, got %d", len(headers))
+	// 9 defaults + CSP + PermissionsPolicy = 11.
+	if len(headers) != 11 {
+		t.Fatalf("expected 11 headers, got %d", len(headers))
 	}
 }
 
