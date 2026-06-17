@@ -156,11 +156,17 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 }
 
 // adaptivePromoteThreshold is the inline handler duration that counts as a
-// "slow" run for adaptive promotion (celeris#356). A non-blocking handler
-// (route + middleware, no I/O) returns in single-digit microseconds; a blocking
-// one (DB/cache round-trip) takes 100µs+. 50µs separates them with margin for
-// GC/scheduling jitter.
-const adaptivePromoteThreshold = 50 * time.Microsecond
+// "slow" run for adaptive promotion (celeris#356). A non-blocking handler —
+// even a heavy middleware chain — returns in tens of microseconds; a blocking
+// one (DB/cache round-trip) takes hundreds of µs to ms. The bar sits well above
+// the CPU-bound range so a transient GC/scheduling burst cannot push a
+// CPU-bound chain over it for adaptivePromoteStreak consecutive runs and
+// wrongly promote it to the slower async path — a 50µs bar did exactly that,
+// intermittently collapsing iouring-async chain-fullstack (celeris#364).
+// Genuinely-blocking routes are marked .Async() explicitly (opting out of
+// adaptive); auto-promotion is a safety net for an unmarked handler that blocks
+// on EVERY request.
+const adaptivePromoteThreshold = 300 * time.Microsecond
 
 // adaptivePromoteStreak is how many CONSECUTIVE slow inline runs promote an
 // adaptive route to async. The consecutive requirement (a fast run resets the
