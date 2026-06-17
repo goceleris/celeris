@@ -260,6 +260,15 @@ func (s *H1State) HasPendingDispatchState() bool {
 	return s.buffer.Len() > 0 && s.bodyNeeded <= 0
 }
 
+// CurrentRoute returns the method and path of the request currently parsed into
+// the H1 state. The engine records these when a route forces an async promotion
+// so the dispatch goroutine can revert the connection to inline once that
+// route's promotion expires (celeris#364). req.Method/req.Path are interned
+// (stable) strings, safe to retain past the recv buffer's lifetime.
+func (s *H1State) CurrentRoute() (method, path string) {
+	return s.req.Method, s.req.Path
+}
+
 // UpdateWriteFn replaces the response adapter's write function. Called by
 // OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
 func (s *H1State) UpdateWriteFn(fn func([]byte)) {

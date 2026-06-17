@@ -1424,7 +1424,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// process on the first /ws or /events request. The
 			// asyncPromoted gate restricts the Unlock to the dispatch-
 			// goroutine path that actually holds the lock. See celeris#309.
-			if w.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+			if w.async && cs.asyncPromoted.Load() && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
 			}
@@ -1725,8 +1725,20 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// which point the conn is promoted and its stashed request handed to
 	// the goroutine. This lets sync routes run inline on the worker
 	// (no handoff) on a server that mixes sync + async handlers.
-	if w.async && cs.asyncPromoted && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+	asyncFeed := false
+	if w.async && cs.asyncPromoted.Load() && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
 		cs.asyncInMu.Lock()
+		// celeris#364: re-check under asyncInMu — the dispatch goroutine clears
+		// asyncPromoted (reverting the conn to inline) under this same lock. If
+		// it won the race, do NOT feed asyncInBuf (the goroutine is exiting);
+		// fall through to inline with the unconsumed `data` instead.
+		if cs.asyncPromoted.Load() {
+			asyncFeed = true
+		} else {
+			cs.asyncInMu.Unlock()
+		}
+	}
+	if asyncFeed {
 		// Backpressure: drop the conn if the dispatch goroutine is
 		// falling behind. Prevents a pipelining client from ballooning
 		// asyncInBuf without bound.
@@ -1793,7 +1805,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// hasn't been promoted yet, run ProcessH1 inline in InlineMode so it
 	// bails (ErrAsyncDispatch) when it hits an async route. The flag is
 	// set only around the ProcessH1 call(s) below.
-	tryInline := w.async && !cs.asyncPromoted && cs.h1State != nil &&
+	tryInline := w.async && !cs.asyncPromoted.Load() && cs.h1State != nil &&
 		(w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1)
 	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic
 	// Load, no switch dispatch, no upgrade-handling block — ProcessH1
@@ -1891,7 +1903,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// goes straight to the dispatch path (asyncPromoted guard above).
 	if tryInline {
 		if errors.Is(processErr, conn.ErrAsyncDispatch) {
-			cs.asyncPromoted = true
+			// celeris#364: record the route that forced promotion (single-shot
+			// recv only — the revert path assumes the worker-owned cs.buf recv
+			// model). Set BEFORE asyncPromoted/goroutine start so the dispatch
+			// goroutine observes it (happens-before). Empty path => the
+			// goroutine treats the conn as not revert-eligible.
+			if w.bufRing == nil {
+				cs.promotedMethod, cs.promotedPath = cs.h1State.CurrentRoute()
+			}
+			cs.asyncPromoted.Store(true)
 			w.asyncPromoted.Add(1)
 			stashed := cs.h1State.TakeBufferedBytes()
 			// Flush any inline-handled response (pipelined sync request
@@ -1919,7 +1939,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// parse paths must not run inline (only the fresh-parse site
 		// honors the async check).
 		if processErr == nil && cs.h1State.HasPendingDispatchState() {
-			cs.asyncPromoted = true
+			// No complete request parsed yet (buffered headers / chunked), so
+			// no route to record — leave promotedPath empty: not revert-eligible.
+			cs.asyncPromoted.Store(true)
 			w.asyncPromoted.Add(1)
 		}
 	}
@@ -2688,6 +2710,21 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 	}
 }
 
+// canRevertToInline reports whether a promoted conn should be reverted to the
+// inline fast path (celeris#364). True when single-shot recv is in use, the
+// conn recorded the route that promoted it, and that route's promotion has
+// since expired (RouteAsync now false — the route-level TTL de-promotion).
+// Called by runAsyncHandler ONLY while holding asyncInMu with asyncInBuf empty.
+func (w *Worker) canRevertToInline(cs *connState) bool {
+	return w.bufRing == nil && cs.promotedPath != "" && cs.h1State != nil &&
+		cs.h1State.RouteAsync != nil &&
+		// Clean request boundary only: never revert mid-request (a partial body
+		// or buffered headers still accumulating), so h1State ownership flips
+		// back to the worker between requests, exactly like a fresh inline conn.
+		!cs.h1State.HasPendingData() &&
+		!cs.h1State.RouteAsync(cs.promotedMethod, cs.promotedPath)
+}
+
 func (w *Worker) runAsyncHandler(cs *connState) {
 	defer w.asyncWG.Done()
 	defer func() {
@@ -2720,6 +2757,19 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 	for {
 		cs.asyncInMu.Lock()
 		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
+			// celeris#364: revert this conn to inline when the route that
+			// promoted it has de-promoted (its TTL expired). Safe ONLY here:
+			// asyncInBuf is empty (no in-flight input, last response already
+			// written) and we hold asyncInMu, which the worker's feed path
+			// re-acquires and re-checks asyncPromoted against — so clearing it
+			// here cannot race a concurrent feed. The worker owns recv and
+			// resumes the inline fast path on the next CQE.
+			if w.canRevertToInline(cs) {
+				cs.asyncPromoted.Store(false)
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				return
+			}
 			cs.asyncCond.Wait()
 		}
 		if cs.asyncClosed.Load() {
@@ -3058,7 +3108,7 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	// worker itself (tryInline), so the worker owns h1State exactly as the
 	// sync path does and the zero-copy direct-into-bodyBuf recv is safe —
 	// gate the bail on cs.asyncPromoted, not blanket w.async.
-	if (w.async && cs.asyncPromoted) || w.bufRing != nil || cs.h1State == nil {
+	if (w.async && cs.asyncPromoted.Load()) || w.bufRing != nil || cs.h1State == nil {
 		return cs.buf
 	}
 	if !w.h1Only && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
