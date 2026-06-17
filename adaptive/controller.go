@@ -4,10 +4,20 @@ package adaptive
 
 import (
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/goceleris/celeris/engine"
 )
+
+// envIOUringBias gates the io_uring workload bias (celeris#341). It is OFF
+// unless explicitly enabled, because the bias is a heuristic that does NOT read
+// the standby engine's measured throughput — ungated it can speculatively
+// switch adaptive onto an engine that is measurably SLOWER on the live
+// workload. With it off, adaptive is purely measurement-driven and never leaves
+// a faster active engine for an unmeasured estimate. Re-enable to re-validate
+// once the bias is gated behind a real measured-parity check.
+const envIOUringBias = "CELERIS_ADAPTIVE_IOURING_BIAS"
 
 type controllerState struct {
 	activeIsPrimary bool
@@ -31,6 +41,7 @@ type controller struct {
 	evalInterval time.Duration
 	cooldown     time.Duration
 	threshold    float64
+	biasEnabled  bool
 	logger       *slog.Logger
 }
 
@@ -43,6 +54,7 @@ func newController(primary, secondary engine.Engine, sampler TelemetrySampler, l
 		evalInterval: 5 * time.Second,
 		cooldown:     30 * time.Second,
 		threshold:    0.15,
+		biasEnabled:  os.Getenv(envIOUringBias) == "1",
 		logger:       logger,
 		state: controllerState{
 			activeIsPrimary: true,
@@ -82,9 +94,12 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	activeSnap := c.sampler.Sample(active)
 	baselineActiveScore := computeScore(activeSnap, c.weights)
 
-	// io_uring bias: the modeled io_uring advantage given the current workload
-	// (connection count + CPU pressure). Zero outside the empirical sweet spot.
-	bias := ioUringBias(activeSnap)
+	// io_uring bias: the modeled io_uring advantage for the current workload.
+	// Zero outside the empirical sweet spot, AND zero unless explicitly enabled
+	// (celeris#341, envIOUringBias). It never reads the standby's real
+	// throughput, so off-by-default keeps adaptive from speculatively switching
+	// onto a measurably-slower engine.
+	bias := ioUringBias(activeSnap, c.biasEnabled)
 
 	// Apply the bias to the ACTIVE score: reinforce io_uring when it is already
 	// active (resist leaving it), lightly penalise epoll when conditions favor
