@@ -149,10 +149,20 @@ type connState struct {
 	asyncClosed atomic.Bool
 	// asyncPromoted is set once an async-marked route has been observed
 	// on this conn while it ran inline on the worker (per-handler async,
-	// celeris #300). Sticky: once promoted every subsequent recv goes
-	// straight to the dispatch goroutine instead of retrying the inline
-	// fast path. Reset on release.
-	asyncPromoted bool
+	// celeris #300). Once promoted, recv goes to the dispatch goroutine.
+	// REVERSIBLE (celeris#364): the dispatch goroutine clears it to revert
+	// the conn to inline when the promoting route de-promotes. Atomic because
+	// the worker reads it on the recv hot path while the goroutine may clear
+	// it; the worker re-reads it under asyncInMu before feeding to close the
+	// feed-vs-revert race. Reset on release.
+	asyncPromoted atomic.Bool
+	// promotedMethod/promotedPath record the route that forced this conn's
+	// promotion (celeris#364). Written by the worker before the dispatch
+	// goroutine starts (happens-before), read by the goroutine to decide
+	// revert. Empty => not revert-eligible (e.g. promoted for a buffered
+	// partial-header / chunked continuation, where no full route is known).
+	promotedMethod string
+	promotedPath   string
 	// asyncH2Promoted signals the worker that runAsyncHandler observed
 	// ErrUpgradeH2C and completed the cs-local H1→H2 state swap under
 	// detachMu. drainDetachQueue finishes the promotion by appending
@@ -304,7 +314,9 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
-	cs.asyncPromoted = false
+	cs.asyncPromoted.Store(false)
+	cs.promotedMethod = ""
+	cs.promotedPath = ""
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
 	cs.bodyBuf = nil

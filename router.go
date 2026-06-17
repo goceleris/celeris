@@ -6,7 +6,13 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// nowNano returns the current time in Unix nanoseconds. A package var so the
+// adaptive promotion TTL (celeris#364) can be exercised deterministically in
+// tests without sleeping.
+var nowNano = func() int64 { return time.Now().UnixNano() }
 
 // staticEntry holds the pre-composed handler chain and full path for a fully
 // static route, enabling O(1) map lookup instead of a trie walk.
@@ -286,18 +292,43 @@ func newRouter() *router {
 	}
 }
 
-// isPromoted reports whether an adaptive route (celeris#356) has been promoted
-// to async dispatch after a blocking inline run.
+// isPromoted reports whether an adaptive route (celeris#356) is currently
+// promoted to async dispatch.
+//
+// Promotion is REVERSIBLE (celeris#364): it expires after adaptivePromoteTTL.
+// Once expired, the route is dropped from the promoted set and its slow streak
+// is cleared, so the next request runs INLINE again and is re-timed — both the
+// routing decision (adaptivePromoted) and the per-request timing decision
+// (adaptiveLearning) key off this method, so they flip back together. A route
+// that is genuinely blocking re-promotes within adaptivePromoteStreak runs; a
+// route that was promoted by a transient load/jitter spike (a CPU-bound chain
+// whose inline wall-clock briefly crossed the threshold under contention) stays
+// inline. Without this, a single spike pinned a route to the slower async path
+// until process restart (the intermittent ~32% chain collapse).
+//
+// The clock is read only for routes actually in the promoted set, so learning
+// and settled routes pay nothing here.
 func (r *router) isPromoted(fullPath string) bool {
-	_, ok := r.promoted.Load(fullPath)
-	return ok
+	v, ok := r.promoted.Load(fullPath)
+	if !ok {
+		return false
+	}
+	if nowNano()-v.(int64) > int64(adaptivePromoteTTL) {
+		// Expired: re-enter the learning/inline path to re-evaluate.
+		r.promoted.Delete(fullPath)
+		if sv, ok := r.slowStreak.Load(fullPath); ok {
+			sv.(*atomic.Int32).Store(0)
+		}
+		return false
+	}
+	return true
 }
 
 // promoteRoute marks an adaptive route as async after sustained blocking inline
-// runs. Idempotent; subsequent routeAsync lookups return true so the engine
-// dispatches the route to a goroutine.
+// runs, stamped with the promotion time so isPromoted can expire it
+// (celeris#364). Re-promotion refreshes the stamp.
 func (r *router) promoteRoute(fullPath string) {
-	r.promoted.Store(fullPath, struct{}{})
+	r.promoted.Store(fullPath, nowNano())
 }
 
 // recordInlineRun feeds one inline-run observation into the adaptive
