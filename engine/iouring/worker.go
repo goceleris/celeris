@@ -1918,7 +1918,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// continuation runs on the dispatch goroutine — the partial-state
 		// parse paths must not run inline (only the fresh-parse site
 		// honors the async check).
-		if processErr == nil && cs.h1State.HasPendingData() {
+		if processErr == nil && cs.h1State.HasPendingDispatchState() {
 			cs.asyncPromoted = true
 			w.asyncPromoted.Add(1)
 		}
@@ -3052,10 +3052,13 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	// completed, so no kernel SQE still targets the old bodyBuf array. The
 	// body path below re-sets the pin when it arms into bodyBuf again.
 	cs.bodyRecvPin = nil
-	// Async mode: the dispatch goroutine owns h1State; the worker cannot
-	// safely observe NextRecvBuf without synchronization. Always use
-	// cs.buf so the goroutine handles body accumulation on its side.
-	if w.async || w.bufRing != nil || cs.h1State == nil {
+	// Async mode: only a PROMOTED conn hands h1State to the dispatch
+	// goroutine, which the worker cannot safely observe NextRecvBuf against.
+	// A non-promoted conn (celeris#356 inline-first) runs ProcessH1 on the
+	// worker itself (tryInline), so the worker owns h1State exactly as the
+	// sync path does and the zero-copy direct-into-bodyBuf recv is safe —
+	// gate the bail on cs.asyncPromoted, not blanket w.async.
+	if (w.async && cs.asyncPromoted) || w.bufRing != nil || cs.h1State == nil {
 		return cs.buf
 	}
 	if !w.h1Only && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
