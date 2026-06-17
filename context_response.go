@@ -761,9 +761,13 @@ func (c *Context) SetResponseHeaders(headers [][2]string) {
 	if len(headers) <= len(c.respHdrBuf) {
 		copy(c.respHdrBuf[:len(headers)], headers)
 		c.respHeaders = c.respHdrBuf[:len(headers)]
+	} else if cap(c.respHdrScratch) >= len(headers) {
+		c.respHeaders = c.respHdrScratch[:len(headers)]
+		copy(c.respHeaders, headers)
 	} else {
 		c.respHeaders = make([][2]string, len(headers))
 		copy(c.respHeaders, headers)
+		c.respHdrScratch = c.respHeaders
 	}
 }
 
