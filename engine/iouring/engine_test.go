@@ -197,9 +197,11 @@ func TestSelectTierOptionalWithoutSendZC(t *testing.T) {
 	}
 }
 
-func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
-	// SQPOLL is incompatible with both DEFER_TASKRUN and COOP_TASKRUN.
-	// SQPOLL path must use neither IPI-related flag.
+func TestSelectTierOptionalUsesTaskrunNotSQPoll(t *testing.T) {
+	// #377: SQPOLL is never selected. Per-worker rings would spawn one kernel
+	// poll thread per worker (N spinning cores), and the dormant SQPOLL submit
+	// path has a latent SQ-tail-publish race. The optional tier uses the
+	// task-run completion model like the high tier instead.
 	profile := engine.CapabilityProfile{
 		IOUringTier:  engine.Optional,
 		CoopTaskrun:  true,
@@ -212,17 +214,35 @@ func TestSelectTierOptionalWithDeferTaskrun(t *testing.T) {
 		t.Fatal("expected non-nil tier")
 	}
 	flags := tier.SetupFlags()
-	if flags&setupDeferTaskrun != 0 {
-		t.Error("DEFER_TASKRUN must not be set with SQPOLL (incompatible)")
+	if flags&setupSQPoll != 0 {
+		t.Error("SQPOLL must not be selected (#377)")
 	}
-	if flags&setupCoopTaskrun != 0 {
-		t.Error("COOP_TASKRUN must not be set with SQPOLL (incompatible)")
+	if flags&setupDeferTaskrun == 0 {
+		t.Error("expected DEFER_TASKRUN when available")
 	}
-	if flags&setupSQPoll == 0 {
-		t.Error("expected SQPOLL in setup flags")
+	if flags&setupSingleIssuer == 0 {
+		t.Error("expected SINGLE_ISSUER")
+	}
+	if tier.SQPollIdle() != 0 {
+		t.Error("SQPollIdle must be 0 when SQPOLL is disabled")
 	}
 	if !tier.SupportsFixedFiles() {
 		t.Error("fixed files should be enabled when profile.FixedFiles is true")
+	}
+
+	// Without DEFER_TASKRUN (e.g. a 6.0 kernel), fall back to COOP_TASKRUN —
+	// still never SQPOLL.
+	coopProfile := engine.CapabilityProfile{
+		IOUringTier: engine.Optional,
+		CoopTaskrun: true,
+		SQPoll:      true,
+	}
+	coopFlags := SelectTier(coopProfile, 0).SetupFlags()
+	if coopFlags&setupSQPoll != 0 {
+		t.Error("SQPOLL must not be selected without DeferTaskrun either (#377)")
+	}
+	if coopFlags&setupCoopTaskrun == 0 {
+		t.Error("expected COOP_TASKRUN when DEFER_TASKRUN unavailable")
 	}
 }
 
