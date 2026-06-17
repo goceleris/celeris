@@ -3289,10 +3289,12 @@ func (w *Worker) flushSend(cs *connState) bool {
 }
 
 // prepSendSQE prepares a SEND or SEND_ZC SQE based on worker capabilities.
-// SEND_ZC is only used for unlinked sends (the notification CQE would break
-// the link chain). Linked sends always use regular SEND.
+// SEND_ZC is only used for unlinked sends at or above sendZCMinBytes (the
+// notification CQE would break the link chain, and on small payloads its extra
+// completion costs more than the avoided memcpy). Smaller and linked sends use
+// regular SEND.
 func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
-	if w.sendZC && !linked {
+	if useSendZC(w.sendZC, linked, len(cs.sendBuf)) {
 		if cs.fixedFile {
 			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
 		} else {
@@ -3303,6 +3305,13 @@ func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	} else {
 		prepSendPlain(sqe, cs.fd, cs.sendBuf, linked)
 	}
+}
+
+// useSendZC decides whether a send should use zero-copy. ZC is only viable for
+// unlinked sends whose payload is large enough that the saved memcpy outweighs
+// the extra NOTIF CQE (see sendZCMinBytes).
+func useSendZC(sendZC, linked bool, n int) bool {
+	return sendZC && !linked && n >= sendZCMinBytes
 }
 
 // flushSendLink is like flushSend but links a RECV SQE after the SEND using

@@ -104,3 +104,11 @@ const (
 	sqeSize = 64
 	cqeSize = 16
 )
+
+// sendZCMinBytes is the payload threshold below which SEND_ZC is not worth its
+// cost. Zero-copy adds a second (NOTIF) CQE per send and holds zcNotifPending
+// across the buffer's DMA lifetime, stalling the next flush; it also forfeits
+// the SEND→RECV link on the keep-alive fast path. Only above this size does the
+// avoided memcpy outweigh the extra completion, so small responses use a plain
+// linked SEND (1 CQE, immediate buffer reuse).
+const sendZCMinBytes = 4096

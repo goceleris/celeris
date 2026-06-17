@@ -156,7 +156,7 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	if sqe == nil {
 		return
 	}
-	if t.sendZC && !linked {
+	if useSendZC(t.sendZC, linked, len(buf)) {
 		if t.fixedFiles {
 			prepSendZCFixed(sqe, fd, buf, false)
 		} else {
@@ -224,7 +224,7 @@ func (t *optionalTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) 
 	if sqe == nil {
 		return
 	}
-	if t.sendZC && !linked {
+	if useSendZC(t.sendZC, linked, len(buf)) {
 		// SEND_ZC cannot be linked (the notification CQE would break
 		// the link chain), so fall back to regular SEND for linked ops.
 		if t.fixedFiles {
