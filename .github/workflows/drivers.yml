@@ -91,7 +91,7 @@ jobs:
     env:
       CELERIS_PG_DSN: postgres://celeris:celeris@127.0.0.1:5432/celeristest?sslmode=disable
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
@@ -132,7 +132,7 @@ jobs:
     env:
       CELERIS_REDIS_ADDR: 127.0.0.1:6379
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
@@ -173,7 +173,7 @@ jobs:
     env:
       CELERIS_REDIS_ADDR: 127.0.0.1:6379
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
@@ -210,7 +210,7 @@ jobs:
     env:
       CELERIS_MEMCACHED_ADDR: 127.0.0.1:11211
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
@@ -263,7 +263,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
@@ -296,7 +296,7 @@ jobs:
       REDIS_IMAGE: redis:${{ matrix.redis }}
       CELERIS_REDIS_CLUSTER_ADDRS: "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
@@ -382,7 +382,7 @@ jobs:
       CELERIS_REDIS_SENTINEL_ADDRS: "127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381"
       CELERIS_REDIS_SENTINEL_MASTER: mymaster
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
