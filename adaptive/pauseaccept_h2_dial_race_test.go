@@ -16,23 +16,27 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
-// TestAdaptiveScaler_H2DialNoRSTRace mirrors TestAdaptiveH2DialNoRSTRace
-// with the dynamic worker scaler enabled. Locks in that the scaler's
-// start-high default does not pause workers before the listen FDs
-// settle in the SO_REUSEPORT group — which would RST in-flight H2
-// prior-knowledge handshakes mid-flush.
+// TestAdaptivePauseAccept_H2DialNoRSTRace is a second angle on the
+// H2-dial-RST race that TestAdaptiveH2DialNoRSTRace guards, run with a
+// larger (4) worker pool so the standby engine has more listen FDs to
+// evict from the SO_REUSEPORT group before Addr() is published. The
+// race is the same: if PauseAccept on the standby has not synchronously
+// removed every listen FD from the routing pool by the time adaptive
+// exposes Addr, a burst of dials gets split across active and standby,
+// and the standby's FD close RSTs the conns that landed on it — fatal
+// for H2 prior-knowledge handshakes mid-flush.
 //
 // Iterations bound at 3: the race only fires on engine spin-up, so we
-// just need "scaler + H2 dial burst" coverage in addition to the
-// no-scaler test's larger budget.
-func TestAdaptiveScaler_H2DialNoRSTRace(t *testing.T) {
+// just need an additional burst against a wider pool in addition to the
+// main test's larger budget.
+func TestAdaptivePauseAccept_H2DialNoRSTRace(t *testing.T) {
 	const iterations = 3
 	for i := 0; i < iterations; i++ {
-		runScalerH2Once(t, i)
+		runPauseAcceptH2Once(t, i)
 	}
 }
 
-func runScalerH2Once(t *testing.T, iter int) {
+func runPauseAcceptH2Once(t *testing.T, iter int) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -47,9 +51,8 @@ func runScalerH2Once(t *testing.T, iter int) {
 		Protocol:        engine.Auto,
 		EnableH2Upgrade: true,
 		Resources: resource.Resources{
-			Workers: 4, // 4 workers so MinActive=2 has 2 paused at start
+			Workers: 4,
 		},
-		WorkerScaling: &resource.WorkerScalingConfig{}, // zero value → start-high
 	}
 	e, err := New(cfg, &h2PrefaceHandler{}, nil)
 	if err != nil {

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -124,16 +123,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 		e.cfg.Logger.Info(
 			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
 		)
-	}
-
-	// Dynamic loop scaler. Typed cfg.WorkerScaling takes precedence over
-	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
-	// higher-level scaler that delegates to the active sub-engine. The
-	// algorithm itself lives in engine/scaler.
-	if !e.cfg.SkipBuiltinScaler {
-		if scalerCfg := scaler.Resolve(e.cfg, len(e.loops)); scalerCfg.Enabled {
-			go e.runScaler(innerCtx, scalerCfg, &e.metrics.activeConns)
-		}
 	}
 
 	<-ctx.Done()
@@ -250,7 +239,6 @@ func (e *Engine) ResumeAccept() error {
 var (
 	_ engine.Engine           = (*Engine)(nil)
 	_ engine.AcceptController = (*Engine)(nil)
-	_ engine.WorkerScaler     = (*Engine)(nil)
 )
 
 // Addr returns the bound listener address.

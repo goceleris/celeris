@@ -77,11 +77,6 @@ type Loop struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
-	// inactive is the per-worker pause flag used by the dynamic worker
-	// scaler. ORed with acceptPaused (which is engine-wide) when computing
-	// effective paused state. The scaler flips this to deactivate idle
-	// loops under low load and reactivate them under burst load.
-	inactive atomic.Bool
 	// listenFDClosed signals that the loop has closed its listen FD in
 	// response to acceptPaused=true. PauseAccept polls this so it only
 	// returns once the SO_REUSEPORT group has actually shed this listener
@@ -284,8 +279,7 @@ func (l *Loop) run(ctx context.Context) {
 		// Cache the atomic load: ACTIVE→DRAINING and SUSPENDED→ACTIVE
 		// branches both read it. Saves 1 atomic load per event-loop
 		// iteration on the steady-state hot path.
-		// OR with the per-loop inactive flag (dynamic scaler).
-		paused := l.acceptPaused.Load() || l.inactive.Load()
+		paused := l.acceptPaused.Load()
 		if l.listenFD >= 0 && paused {
 			// Drain any pending accepts from the kernel's listen queue so
 			// they get a clean shutdown (FIN) rather than the RST that
@@ -551,10 +545,9 @@ func (l *Loop) run(ctx context.Context) {
 		}
 
 		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
-		// Combined paused: engine-wide OR per-loop (dynamic scaler).
-		if l.listenFD < 0 && l.connCount == 0 && (l.acceptPaused.Load() || l.inactive.Load()) {
+		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() {
 			l.wakeMu.Lock()
-			if !l.acceptPaused.Load() && !l.inactive.Load() {
+			if !l.acceptPaused.Load() {
 				l.wakeMu.Unlock()
 				continue
 			}

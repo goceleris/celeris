@@ -71,17 +71,24 @@ const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (
 // the case for very-high-concurrency benchmarks (16k+ connections) where
 // each worker may have more in-flight multishot recvs than the formula
 // anticipates. Setting 0 (or leaving the env var unset) reverts to
-// auto-scaling from Workers × TargetConnsPerWorker.
+// auto-scaling from the per-worker conn target.
 const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
+
+// defaultConnsPerWorker is the per-worker connection target used to size
+// the provided-buffer ring. The ring is sized at 2 buffers per conn at
+// this target, giving comfortable headroom so the kernel rarely stalls
+// waiting for buffer returns. Operators override the resulting ring size
+// directly via CELERIS_IOURING_PBUF_COUNT.
+const defaultConnsPerWorker = 20
 
 // resolveBufRingCount picks the provided-buffer-ring size for a worker.
 // The default formula is `nextPowerOf2(max(bufRingCountMin, 2 *
-// TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
-// steady-state target — enough headroom that the kernel rarely stalls
-// waiting for buffer returns. Above 1024 conns the previous hard-coded
-// 1024 was too small: buffers were reused aggressively, the kernel
-// stalled, and the very behaviour the ring is designed to optimise
-// (multishot recv CQE batching) collapsed into CQE storms (celeris#322).
+// connsPerWorker))`, i.e. two buffers per conn at the per-worker conn
+// target — enough headroom that the kernel rarely stalls waiting for
+// buffer returns. Above 1024 conns the previous hard-coded 1024 was too
+// small: buffers were reused aggressively, the kernel stalled, and the
+// very behaviour the ring is designed to optimise (multishot recv CQE
+// batching) collapsed into CQE storms (celeris#322).
 //
 // The ring is PER-WORKER: NewBufferRing is created once per Worker on its
 // own ring, so the scaling MUST be driven by the per-worker conn target,
@@ -90,7 +97,7 @@ const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 // mmap'd RSS per worker and risking the kernel cap on large boxes
 // (celeris#322 follow-up).
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
-func resolveBufRingCount(_ resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
+func resolveBufRingCount(_ resource.ResolvedResources, connsPerWorker int) int {
 	if v := os.Getenv(envPbufCount); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			if n&(n-1) != 0 {
@@ -99,9 +106,9 @@ func resolveBufRingCount(_ resource.ResolvedResources, scalerTargetConnsPerWorke
 			return clampBufRingCount(n)
 		}
 	}
-	target := scalerTargetConnsPerWorker
+	target := connsPerWorker
 	if target <= 0 {
-		target = 20 // mirrors scaler.Resolve's default
+		target = defaultConnsPerWorker
 	}
 	scaled := 2 * target
 	if scaled < bufRingCountMin {
@@ -224,11 +231,6 @@ type Worker struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
-	// inactive is the per-worker pause flag used by the dynamic worker
-	// scaler. ORed with acceptPaused (which is engine-wide) when computing
-	// effective paused state. The scaler flips this to deactivate idle
-	// workers under low load and reactivate them under burst load.
-	inactive atomic.Bool
 	// listenFDClosed signals that the worker has cancelled in-flight
 	// accept SQEs and closed its listen FD in response to acceptPaused
 	// being set. PauseAccept polls this so it only returns once the
@@ -431,15 +433,11 @@ func (w *Worker) run(ctx context.Context) {
 	// The ring size scales with the worker's per-conn target (celeris#322):
 	// the previous hard-coded 1024 entries was undersized above ~1024 conns
 	// and produced CQE storms as the kernel stalled waiting for buffer
-	// returns. The formula gives 2 buffers per conn at the scaler's
-	// steady-state target — comfortable headroom without runaway RSS.
+	// returns. The formula gives 2 buffers per conn at the per-worker conn
+	// target — comfortable headroom without runaway RSS.
 	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
 	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
-		var targetConns int
-		if w.cfg.WorkerScaling != nil {
-			targetConns = w.cfg.WorkerScaling.TargetConnsPerWorker
-		}
-		bufRingCount := resolveBufRingCount(w.resolved, targetConns)
+		bufRingCount := resolveBufRingCount(w.resolved, defaultConnsPerWorker)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
 			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
@@ -481,8 +479,7 @@ func (w *Worker) run(ctx context.Context) {
 		// Cache the atomic load: same value used by the two branches
 		// below and (further down) the SUSPENDED check. Saves 2 atomic
 		// loads per event-loop iteration on the steady-state hot path.
-		// OR with the per-worker inactive flag (dynamic scaler).
-		paused := w.acceptPaused.Load() || w.inactive.Load()
+		paused := w.acceptPaused.Load()
 		if w.listenFD >= 0 && paused {
 			if sqe := w.ring.GetSQE(); sqe != nil {
 				prepCancelFDSkipSuccess(sqe, w.listenFD)
@@ -782,7 +779,6 @@ func (w *Worker) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
-		// Combined paused: engine-wide OR per-worker (dynamic scaler).
 		//
 		// hasDriverConns gate: connCount only counts HTTP conns. An
 		// EventLoopProvider driver may still have live conns in
@@ -790,9 +786,9 @@ func (w *Worker) run(ctx context.Context) {
 		// park its event loop and starve those driver conns of CQE
 		// servicing. Stay active while any driver conn is registered (v1.5.0
 		// review 2.10).
-		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && (w.acceptPaused.Load() || w.inactive.Load()) {
+		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && w.acceptPaused.Load() {
 			w.wakeMu.Lock()
-			if !w.acceptPaused.Load() && !w.inactive.Load() {
+			if !w.acceptPaused.Load() {
 				w.wakeMu.Unlock()
 				continue
 			}

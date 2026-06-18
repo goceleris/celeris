@@ -15,7 +15,6 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/epoll"
 	"github.com/goceleris/celeris/engine/iouring"
-	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -44,7 +43,7 @@ type Engine struct {
 	freezeCooldown time.Duration
 
 	// listenMu guards listenCancel/listenDone, which let Shutdown deterministically
-	// stop and JOIN the evaluation/scaler goroutines started by Listen. Without
+	// stop and JOIN the evaluation-loop goroutine started by Listen. Without
 	// this, Shutdown could return (sub-engines stopped) while the eval loop is
 	// still mid-Sample on the CPU monitor the server is about to close.
 	listenMu     sync.Mutex
@@ -92,20 +91,12 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		}
 	}
 
-	// Suppress the per-engine built-in scaler in both sub-engines —
-	// adaptive runs ONE higher-level scaler that delegates to whichever
-	// sub-engine is currently active. Two scalers fighting over the same
-	// worker pool produced -54 % to +118 % variance on pinning tests
-	// during the spike-B exploration; gating this way eliminates that.
-	subCfg := cfg
-	subCfg.SkipBuiltinScaler = true
-
-	primary, err := epoll.New(subCfg, handler)
+	primary, err := epoll.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("epoll sub-engine: %w", err)
 	}
 
-	secondary, err := iouring.New(subCfg, handler)
+	secondary, err := iouring.New(cfg, handler)
 	if err != nil {
 		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 	}
@@ -161,7 +152,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	defer innerCancel()
 
 	// Publish the cancel + a done channel so Shutdown can stop and join the
-	// goroutines this Listen owns (eval loop, scaler) before the server closes
+	// goroutine this Listen owns (the eval loop) before the server closes
 	// shared resources such as the CPU monitor.
 	done := make(chan struct{})
 	e.listenMu.Lock()
@@ -264,22 +255,10 @@ bindLoop:
 		e.runEvalLoop(innerCtx)
 	})
 
-	// Start the higher-level dynamic worker scaler. This is the only
-	// worker scaler that runs in an adaptive setup — sub-engines have
-	// their built-in scalers suppressed via Config.SkipBuiltinScaler.
-	// Typed cfg.WorkerScaling takes precedence over env vars. The
-	// algorithm lives in engine/scaler; adaptive provides a switch-aware
-	// Source via adaptive/scaler.go.
-	if scalerCfg := scaler.Resolve(e.cfg, e.cfg.Resources.Resolve().Workers); scalerCfg.Enabled {
-		wg.Go(func() {
-			e.runScaler(innerCtx, scalerCfg)
-		})
-	}
-
 	select {
 	case <-innerCtx.Done():
 		// Parent context cancelled, or Shutdown cancelled innerCtx directly to
-		// stop and join the eval/scaler goroutines.
+		// stop and join the eval-loop goroutine.
 	case err := <-errCh:
 		innerCancel()
 		wg.Wait()
@@ -423,8 +402,8 @@ func (e *Engine) maybeThawLocked() {
 
 // Shutdown gracefully shuts down both sub-engines.
 //
-// It first cancels and JOINS the goroutines started by Listen (the evaluation
-// loop and worker scaler), so that no controller tick can still be sampling
+// It first cancels and JOINS the goroutine started by Listen (the evaluation
+// loop), so that no controller tick can still be sampling
 // telemetry — including the CPU monitor the server closes immediately after
 // Shutdown returns — by the time this function completes. Only then are the
 // sub-engines shut down. This is purely a join/sequencing concern; it does not
