@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/epoll"
 	"github.com/goceleris/celeris/engine/iouring"
+	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -25,9 +27,19 @@ var (
 )
 
 // Engine is an adaptive meta-engine that switches between io_uring and epoll.
+//
+// The two sub-engine slots map to a fixed protocol direction the controller
+// keys off: primary is ALWAYS the epoll engine (the controller's
+// activeIsPrimary==true means epoll is active) and secondary is ALWAYS the
+// io_uring engine. On the public New() path only the START engine is built
+// eagerly; the other slot stays nil until the first switch actually needs it
+// (see buildStandby + performSwitch). On a modern kernel that starts on
+// io_uring and never reverts, the epoll standby is never constructed, so its
+// GC-rooted heap never exists. newFromEngines (tests) populates BOTH slots
+// eagerly, exercising the standby-already-exists switch path.
 type Engine struct {
-	primary   engine.Engine // io_uring
-	secondary engine.Engine // epoll
+	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
+	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
 	active    atomic.Pointer[engine.Engine]
 	ctrl      *controller
 	cfg       resource.Config
@@ -37,6 +49,24 @@ type Engine struct {
 	switchMu  sync.Mutex // protects evaluate + performSwitch coordination
 	frozen    atomic.Bool
 	logger    *slog.Logger
+
+	// startType is the engine type chosen for the eager start engine. The
+	// standby is the other type; buildStandby constructs it on demand.
+	startType engine.EngineType
+
+	// buildStandby constructs the LAZY standby sub-engine on first switch.
+	// It captures cfg + handler (+ cpuMon for the sampler symmetry) and is
+	// nil on the newFromEngines (tests) path where both engines are eager.
+	buildStandby func() (engine.Engine, error)
+
+	// listenCtx / listenWG are captured by Listen so performSwitch can start a
+	// freshly-built standby's Listen goroutine under the SAME context and wait
+	// group as the active engine. Shutdown then joins it implicitly via the
+	// wait group (wg.Wait in Listen) — a never-built standby added nothing to
+	// the group, so there is nothing to join. Guarded by mu (performSwitch
+	// holds mu across the whole switch; Listen sets these once under mu).
+	listenCtx context.Context
+	listenWG  *sync.WaitGroup
 
 	// freezeCooldown is the duration to suppress further switches after a switch.
 	// Zero means no cooldown (default).
@@ -62,12 +92,57 @@ type Engine struct {
 	switchRejected  atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
 }
 
-// New creates a new adaptive engine with epoll as primary and io_uring as secondary.
-// Epoll starts first because it has lower H2 latency on current kernels (single-pass
-// read→process→write vs io_uring's two-iteration CQE model). The controller may
-// switch to io_uring if telemetry indicates it would perform better for the workload.
-// Both sub-engines get the full resource config. This is safe because standby
-// workers are fully suspended (zero CPU, zero connections, listen sockets closed).
+// chooseStartEngine selects which sub-engine the adaptive meta-engine should
+// start (and build eagerly) given the probed io_uring capability profile.
+//
+// io_uring loses to epoll on old kernels (pre-LTS-stability bugs, missing the
+// fast-path setup flags) but wins on modern ones for thin-HTTP, so the start
+// engine is feature-gated:
+//
+//   - IOUring when io_uring is mature for thin-HTTP — either the kernel is in
+//     the "bundles" era (>6.10, where multishot + provided buffers + defer
+//     taskrun are all stable and tuned) OR the 6.1+ fast tier is present
+//     (DEFER_TASKRUN + SINGLE_ISSUER + MULTISHOT_RECV + PROVIDED_BUFFERS).
+//   - Epoll otherwise (old kernels, or io_uring missing the fast tier).
+//
+// The env var CELERIS_ADAPTIVE_START overrides the rule:
+//
+//	iouring | epoll — force that start engine.
+//	auto (or unset) — use the capability rule above.
+//
+// NOTE: the exact capability rule will be refined by a kernel-matrix sweep;
+// treat the thresholds here as the current best estimate, not a final answer.
+func chooseStartEngine(p engine.CapabilityProfile) engine.EngineType {
+	switch os.Getenv("CELERIS_ADAPTIVE_START") {
+	case "iouring":
+		return engine.IOUring
+	case "epoll":
+		return engine.Epoll
+	case "auto", "":
+		// fall through to the capability rule
+	default:
+		// Unknown value: fall through to auto rather than fail hard.
+	}
+
+	bundlesEra := p.KernelMajor > 6 || (p.KernelMajor == 6 && p.KernelMinor >= 10)
+	fastTier := p.DeferTaskrun && p.SingleIssuer && p.MultishotRecv && p.ProvidedBuffers
+	if bundlesEra || fastTier {
+		return engine.IOUring
+	}
+	return engine.Epoll
+}
+
+// New creates a new adaptive engine. Only the START engine is built and
+// Listen'd eagerly; the other engine (the standby) is constructed lazily on the
+// first switch that actually needs it. The start engine is chosen by
+// chooseStartEngine from the probed io_uring capabilities (feature-gated, with a
+// CELERIS_ADAPTIVE_START env override).
+//
+// Both sub-engines bind the SAME SO_REUSEPORT port so the adaptive switch is
+// transparent: resolvePort pins a concrete port up front, and the lazily-built
+// standby reuses it. Building only the start engine eliminates the parked
+// standby's GC-rooted heap — on a modern kernel that starts on io_uring and
+// never reverts, the epoll standby is never constructed (≈0 standby tax).
 //
 // cpuMon is an engine.CPUMonitor (the public interface); when non-nil it
 // supplies the live sampler with CPU utilization data so the io_uring bias can
@@ -91,39 +166,99 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		}
 	}
 
-	primary, err := epoll.New(cfg, handler)
-	if err != nil {
-		return nil, fmt.Errorf("epoll sub-engine: %w", err)
-	}
-
-	secondary, err := iouring.New(cfg, handler)
-	if err != nil {
-		return nil, fmt.Errorf("io_uring sub-engine: %w", err)
-	}
+	// probe.Probe() reads kernel version + io_uring setup feature bits WITHOUT
+	// constructing an engine, so it is cheap enough for the start decision.
+	startType := chooseStartEngine(probe.Probe())
 
 	sampler := newLiveSampler(cpuMon)
 	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	// Constructors for each slot. The standby's constructor is stored on the
+	// Engine and only invoked on the first switch. The io_uring constructor
+	// does not take cpuMon (iouring.New has no such parameter); cpuMon already
+	// feeds the shared sampler via newLiveSampler above.
+	buildEpoll := func() (engine.Engine, error) {
+		eng, err := epoll.New(cfg, handler)
+		if err != nil {
+			return nil, fmt.Errorf("epoll sub-engine: %w", err)
+		}
+		return eng, nil
+	}
+	buildIOUring := func() (engine.Engine, error) {
+		eng, err := iouring.New(cfg, handler)
+		if err != nil {
+			return nil, fmt.Errorf("io_uring sub-engine: %w", err)
+		}
+		return eng, nil
+	}
 
 	e := &Engine{
-		primary:   primary,
-		secondary: secondary,
 		cfg:       cfg,
 		handler:   handler,
 		logger:    logger,
+		startType: startType,
 	}
 
-	e.ctrl = newController(primary, secondary, sampler, logger)
+	var startEngine engine.Engine
+	if startType == engine.IOUring {
+		// io_uring is the eager start; epoll is the lazy standby.
+		// io_uring construction can fail on a kernel that probed as capable
+		// but cannot actually set up the ring (e.g. low RLIMIT_MEMLOCK). Fall
+		// back to starting on epoll rather than failing New outright.
+		eng, err := buildIOUring()
+		if err != nil {
+			logger.Warn("io_uring start engine unavailable, falling back to epoll start", "error", err)
+			startType = engine.Epoll
+			e.startType = engine.Epoll
+			eng, err = buildEpoll()
+			if err != nil {
+				return nil, err
+			}
+			startEngine = eng
+			e.primary = eng
+			e.buildStandby = buildIOUring
+		} else {
+			startEngine = eng
+			e.secondary = eng
+			e.buildStandby = buildEpoll
+		}
+	} else {
+		// epoll is the eager start; io_uring is the lazy standby.
+		eng, err := buildEpoll()
+		if err != nil {
+			return nil, err
+		}
+		startEngine = eng
+		e.primary = eng
+		e.buildStandby = buildIOUring
+	}
 
-	// Start with primary (epoll) for all protocols. Epoll has better H2
-	// throughput on current kernels and matches H1 performance.
-	var initialActive engine.Engine = primary
-	e.ctrl.state.activeIsPrimary = true
-	e.active.Store(&initialActive)
+	// The controller needs BOTH engine TYPES to decide switch direction even
+	// while the standby engine is nil, but it only ever dereferences the
+	// ACTIVE engine (activeEngine()). Pass the start engine for the active slot
+	// and nil for the lazy standby slot — newController stores them; activeIsPrimary
+	// records which slot the start engine occupies (primary==epoll).
+	e.ctrl = newController(e.primary, e.secondary, sampler, logger)
+	e.ctrl.state.activeIsPrimary = e.startType == engine.Epoll
+	// Conns-per-worker UP/DOWN switching is OFF in production: the feature-gated
+	// chooseStartEngine already selects the engine that is best at every
+	// concurrency on this kernel, and (because pinned conns never migrate) the
+	// down-revert would only fire on idle/warmup dips and strand load on the
+	// wrong engine. The always-on error-revert in the controller is unaffected.
+	// A future middle-tier kernel with a genuine crossover can flip this on
+	// (validated by the kernel matrix).
+	e.ctrl.connSwitchEnabled = false
 
+	e.active.Store(&startEngine)
 	return e, nil
 }
 
-// newFromEngines creates an adaptive engine from pre-built engines (for testing).
+// newFromEngines creates an adaptive engine from pre-built engines (for
+// testing). BOTH slots are populated eagerly and buildStandby is left nil, so
+// performSwitch exercises the "standby already exists" path (no lazy build).
 func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, cfg resource.Config) *Engine {
 	logger := cfg.Logger
 	if logger == nil {
@@ -135,6 +270,7 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 		secondary: secondary,
 		cfg:       cfg,
 		logger:    logger,
+		startType: engine.Epoll,
 	}
 
 	e.ctrl = newController(primary, secondary, sampler, logger)
@@ -146,7 +282,9 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 	return e
 }
 
-// Listen starts both sub-engines and the evaluation loop.
+// Listen starts ONLY the active sub-engine and the evaluation loop. The standby
+// is built and Listen'd lazily by performSwitch on the first switch (joined
+// under the same ctx + wait group captured here).
 func (e *Engine) Listen(ctx context.Context) error {
 	innerCtx, innerCancel := context.WithCancel(ctx)
 	defer innerCancel()
@@ -163,23 +301,25 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 
+	// Publish ctx + wg so performSwitch can launch the lazily-built standby's
+	// Listen goroutine under the same lifetime (Shutdown joins it via wg.Wait).
+	e.mu.Lock()
+	e.listenCtx = innerCtx
+	e.listenWG = &wg
+	e.mu.Unlock()
+
 	errCh := make(chan error, 2)
 
+	active := *e.active.Load()
 	wg.Go(func() {
-		if err := e.primary.Listen(innerCtx); err != nil {
-			errCh <- fmt.Errorf("primary (epoll): %w", err)
+		if err := active.Listen(innerCtx); err != nil {
+			errCh <- fmt.Errorf("active (%s): %w", active.Type().String(), err)
 		}
 	})
 
-	wg.Go(func() {
-		if err := e.secondary.Listen(innerCtx); err != nil {
-			errCh <- fmt.Errorf("secondary (io_uring): %w", err)
-		}
-	})
-
-	// Wait for both engines to bind their addresses.
+	// Wait for the ACTIVE engine to bind its address.
 	// io_uring may need multiple tier fallback attempts, so allow ample time —
-	// but if either sub-engine has already returned an error to errCh
+	// but if the active sub-engine has already returned an error to errCh
 	// (e.g. ENOMEM at io_uring_setup under low RLIMIT_MEMLOCK), surface it
 	// immediately instead of waiting out the deadline.
 	deadline := time.Now().Add(20 * time.Second)
@@ -189,7 +329,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	defer bindWait.Stop()
 	var startErr error
 bindLoop:
-	for e.primary.Addr() == nil || e.secondary.Addr() == nil {
+	for active.Addr() == nil {
 		select {
 		case startErr = <-errCh:
 			break bindLoop
@@ -204,50 +344,22 @@ bindLoop:
 		wg.Wait()
 		return fmt.Errorf("sub-engine startup failed: %w", startErr)
 	}
-	if e.primary.Addr() == nil || e.secondary.Addr() == nil {
+	if active.Addr() == nil {
 		innerCancel()
 		wg.Wait()
-		return fmt.Errorf("sub-engines failed to initialize within 20s deadline")
+		return fmt.Errorf("active sub-engine failed to initialize within 20s deadline")
 	}
 
-	// Pause standby engine's accept BEFORE publishing Addr so the
-	// SO_REUSEPORT group only contains the active engine by the time
-	// callers start dialing. Without this gate, a burst of incoming
-	// connections in the window between secondary.Listen() succeeding
-	// and PauseAccept taking effect lands some dials on the standby's
-	// accept queue; closing that queue then RSTs them. H1 clients
-	// reconnect transparently but H2 prior-knowledge clients see the
-	// dial fail mid-handshake. Read c.state.activeIsPrimary under
-	// switchMu to avoid racing with performSwitch → recordSwitch (a
-	// concurrent ForceSwitch or controller tick can fire before Listen
-	// finishes its own setup).
-	e.switchMu.Lock()
-	activeIsPrimary := e.ctrl.state.activeIsPrimary
-	e.switchMu.Unlock()
-	if activeIsPrimary {
-		if ac, ok := e.secondary.(engine.AcceptController); ok {
-			if err := ac.PauseAccept(); err != nil {
-				innerCancel()
-				wg.Wait()
-				return fmt.Errorf("pause secondary: %w", err)
-			}
-		}
-	} else {
-		if ac, ok := e.primary.(engine.AcceptController); ok {
-			if err := ac.PauseAccept(); err != nil {
-				innerCancel()
-				wg.Wait()
-				return fmt.Errorf("pause primary: %w", err)
-			}
-		}
-	}
-
-	addr := e.primary.Addr()
+	// No standby to pause: only the active engine is in the SO_REUSEPORT group,
+	// so publishing Addr cannot expose a dial to a phantom standby listener.
+	// (The original pause-standby-before-publish-Addr step guarded that window;
+	// with a lazy standby there is no standby listening here.)
+	addr := active.Addr()
 	e.addr.Store(&addr)
 
 	e.logger.Info("adaptive engine listening",
 		"addr", e.cfg.Addr,
-		"active", (*e.active.Load()).Type().String(),
+		"active", active.Type().String(),
 	)
 
 	// Start evaluation loop.
@@ -289,6 +401,47 @@ func (e *Engine) runEvalLoop(ctx context.Context) {
 	}
 }
 
+// buildAndStartStandby constructs the lazy standby sub-engine, launches its
+// Listen goroutine under the same ctx + wait group Listen captured (so Shutdown
+// joins it), and waits — bounded — for it to bind the shared SO_REUSEPORT port.
+// The caller holds e.mu. wantType is purely for error messages. On any failure
+// it returns an error and the engine state is left untouched (no slot stored),
+// so the current active keeps serving.
+func (e *Engine) buildAndStartStandby(wantType engine.EngineType) (engine.Engine, error) {
+	if e.buildStandby == nil {
+		return nil, fmt.Errorf("no standby builder for %s", wantType.String())
+	}
+	if e.listenCtx == nil || e.listenWG == nil {
+		return nil, fmt.Errorf("cannot build standby before Listen has started")
+	}
+
+	built, err := e.buildStandby()
+	if err != nil {
+		return nil, fmt.Errorf("build %s standby: %w", wantType.String(), err)
+	}
+
+	ctx := e.listenCtx
+	wg := e.listenWG
+	wg.Go(func() {
+		if lerr := built.Listen(ctx); lerr != nil {
+			e.logger.Warn("lazy standby Listen returned error",
+				"standby", built.Type().String(), "error", lerr)
+		}
+	})
+
+	// Wait (bounded) for the standby to bind the shared port — once Addr() is
+	// non-nil it has joined the SO_REUSEPORT group and is accepting, so the
+	// resume-before-pause overlap is real and connections are never dropped.
+	deadline := time.Now().Add(5 * time.Second)
+	for built.Addr() == nil {
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return nil, fmt.Errorf("%s standby failed to bind within 5s", wantType.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return built, nil
+}
+
 func (e *Engine) performSwitch() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -318,21 +471,92 @@ func (e *Engine) performSwitch() {
 		e.freezeState.Unlock()
 		return
 	}
+	// Release freezeState across the (possibly slow) lazy standby build +
+	// Listen + bind-wait below; re-acquired before the active.Store commit.
+	// Holding it across a multi-second build would block driver
+	// register/unregister flows (same reasoning as the PauseAccept release
+	// at the end of this function). e.mu (held for the whole function)
+	// already serialises performSwitch against itself, so no other switch
+	// can race the build.
+	e.freezeState.Unlock()
 
 	now := time.Now()
 
+	// Determine the direction. activeIsPrimary toggles on recordSwitch, so it
+	// always reflects the engine we are switching AWAY from.
 	e.switchMu.Lock()
+	switchingFromPrimary := e.ctrl.state.activeIsPrimary
+	e.switchMu.Unlock()
+
+	// Resolve the standby slot for this direction. On the lazy New() path the
+	// target slot may be nil and must be built + Listen'd now (it binds the
+	// shared SO_REUSEPORT port and joins the accept pool). On the
+	// newFromEngines (tests) path both slots are pre-populated and buildStandby
+	// is nil, so the build is skipped.
+	freshlyBuilt := false
+	if switchingFromPrimary {
+		// primary (active) → secondary (standby).
+		if e.secondary == nil {
+			built, err := e.buildAndStartStandby(engine.IOUring)
+			if err != nil {
+				e.logger.Warn("aborting switch: lazy standby build failed; staying on current active",
+					"standby", engine.IOUring.String(), "error", err)
+				return
+			}
+			// Publish the built engine to both the Engine and controller
+			// slots under switchMu so a concurrent evaluate (ForceSwitch
+			// racing the eval loop) never reads a torn controller slot.
+			e.switchMu.Lock()
+			e.secondary = built
+			e.ctrl.secondary = built
+			e.switchMu.Unlock()
+			freshlyBuilt = true
+		}
+	} else {
+		// secondary (active) → primary (standby).
+		if e.primary == nil {
+			built, err := e.buildAndStartStandby(engine.Epoll)
+			if err != nil {
+				e.logger.Warn("aborting switch: lazy standby build failed; staying on current active",
+					"standby", engine.Epoll.String(), "error", err)
+				return
+			}
+			e.switchMu.Lock()
+			e.primary = built
+			e.ctrl.primary = built
+			e.switchMu.Unlock()
+			freshlyBuilt = true
+		}
+	}
+
 	var newActive, newStandby engine.Engine
-	if e.ctrl.state.activeIsPrimary {
-		// Switching: primary → secondary.
+	if switchingFromPrimary {
 		newActive = e.secondary
 		newStandby = e.primary
 	} else {
-		// Switching: secondary → primary.
 		newActive = e.primary
 		newStandby = e.secondary
 	}
-	e.switchMu.Unlock()
+
+	// Re-acquire freezeState for the commit and RE-CHECK driverFDs: a driver
+	// may have registered during the build window above. If so, abort — but the
+	// freshly-built standby stays cached for the next attempt. Pause its accept
+	// first so it does not sit in the SO_REUSEPORT pool alongside the (still
+	// active) old engine; the next switch ResumeAccepts it.
+	e.freezeState.Lock()
+	if e.driverFDs.Load() > 0 {
+		e.switchRejected.Add(1)
+		e.logger.Warn("refusing engine switch: driver FDs registered during standby build",
+			"driver_fds", e.driverFDs.Load(),
+		)
+		e.freezeState.Unlock()
+		if freshlyBuilt {
+			if ac, ok := newActive.(engine.AcceptController); ok {
+				_ = ac.PauseAccept()
+			}
+		}
+		return
+	}
 
 	// Resume new active BEFORE pausing old — this creates a brief overlap
 	// where both engines listen (via SO_REUSEPORT), which is correct. The
@@ -426,16 +650,40 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	return errors.Join(
-		e.primary.Shutdown(ctx),
-		e.secondary.Shutdown(ctx),
-	)
+	// Only shut down engines that exist. On the lazy New() path the standby
+	// slot is nil if no switch ever built it; cancelling listenCtx (above)
+	// already unwound the active engine's Listen goroutine and any lazily
+	// started standby Listen goroutine (both share that ctx + wait group).
+	e.mu.Lock()
+	primary := e.primary
+	secondary := e.secondary
+	e.mu.Unlock()
+
+	var errs []error
+	if primary != nil {
+		errs = append(errs, primary.Shutdown(ctx))
+	}
+	if secondary != nil {
+		errs = append(errs, secondary.Shutdown(ctx))
+	}
+	return errors.Join(errs...)
 }
 
-// Metrics aggregates metrics from both sub-engines.
+// Metrics aggregates metrics from whichever sub-engines exist. On the lazy
+// New() path a never-built standby is nil and contributes nothing.
 func (e *Engine) Metrics() engine.EngineMetrics {
-	pm := e.primary.Metrics()
-	sm := e.secondary.Metrics()
+	e.mu.Lock()
+	primary := e.primary
+	secondary := e.secondary
+	e.mu.Unlock()
+
+	var pm, sm engine.EngineMetrics
+	if primary != nil {
+		pm = primary.Metrics()
+	}
+	if secondary != nil {
+		sm = secondary.Metrics()
+	}
 	// Both sub-engines were built from the same handler + cfg, so their
 	// AsyncRoutes counts are identical; take one (not the sum) for the
 	// adaptive view. AsyncPromotedConns IS additive — promotions on the

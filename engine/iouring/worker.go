@@ -241,11 +241,17 @@ type Worker struct {
 	// RST as it pauses).
 	listenFDClosed atomic.Bool
 
-	reqCount      *atomic.Uint64
-	activeConns   *atomic.Int64
-	errCount      *atomic.Uint64
-	asyncPromoted *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
-	reqBatch      uint64         // batched request count, flushed to reqCount per iteration
+	reqCount          *atomic.Uint64
+	activeConns       *atomic.Int64
+	errCount          *atomic.Uint64
+	asyncPromoted     *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	acceptCount       *atomic.Uint64 // cumulative accepts (engine-wide, shared)
+	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
+	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
+	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
+	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
+	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -317,7 +323,8 @@ type Worker struct {
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool,
+	acceptCount, closeCount, bytesRead, bytesWritten *atomic.Uint64) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
 	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
 	// binding) so that the kernel allocates socket internal buffers on the
@@ -344,6 +351,10 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		activeConns:   activeConns,
 		errCount:      errCount,
 		asyncPromoted: asyncPromoted,
+		acceptCount:   acceptCount,
+		closeCount:    closeCount,
+		bytesRead:     bytesRead,
+		bytesWritten:  bytesWritten,
 		acceptPaused:  acceptPaused,
 		wake:          make(chan struct{}),
 		ready:         make(chan error, 1),
@@ -669,6 +680,17 @@ func (w *Worker) run(ctx context.Context) {
 		if w.reqBatch > 0 {
 			w.reqCount.Add(w.reqBatch)
 			w.reqBatch = 0
+		}
+
+		// Flush batched payload-byte counters with the same per-iteration
+		// cadence as reqCount, for the same cache-line-contention reason.
+		if w.bytesReadBatch > 0 {
+			w.bytesRead.Add(w.bytesReadBatch)
+			w.bytesReadBatch = 0
+		}
+		if w.bytesWrittenBatch > 0 {
+			w.bytesWritten.Add(w.bytesWrittenBatch)
+			w.bytesWrittenBatch = 0
 		}
 
 		// Single atomic publish for all batched buffer returns (P0).
@@ -1180,6 +1202,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 	cs.writeFn = w.makeWriteFn(cs)
 	w.activeConns.Add(1)
+	w.acceptCount.Add(1)
 
 	if w.cfg.OnConnect != nil {
 		w.cfg.OnConnect(cs.remoteAddr)
@@ -1221,6 +1244,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	w.closeCount.Add(1)
 	// Cancel-then-release discipline, hijack variant: a single-shot
 	// recv SQE is virtually always still armed on cs.buf here. The fd
 	// lives on under the caller's net.Conn, so an uncancelled recv would
@@ -1569,6 +1593,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	cs.lastActivity = now
+	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
+	// on this recv CQE, regardless of which buffer they landed in.
+	w.bytesReadBatch += uint64(c.Res)
 
 	// Direct-into-bodyBuf path: the previous recv SQE targeted
 	// H1State.bodyBuf (NextRecvBuf). The CQE's Res applies to bodyBuf,
@@ -2137,6 +2164,11 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 		return
 	}
 
+	// sent >= 0 here: payload bytes flushed by this send completion
+	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
+	// reach completeSend with the byte count).
+	w.bytesWrittenBatch += uint64(sent)
+
 	// Partial-send handling, split by whether we issued a plain SEND
 	// (sendBuf only) or a WRITEV (sendBuf + sendBody). Partial WRITEV
 	// responses collapse the remainder into sendBuf so the retry path
@@ -2488,6 +2520,7 @@ func (w *Worker) finishClose(fd int) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	w.closeCount.Add(1)
 
 	if w.cfg.OnDisconnect != nil && cs != nil {
 		w.cfg.OnDisconnect(cs.remoteAddr)
@@ -2588,6 +2621,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	w.closeCount.Add(1)
 
 	if w.cfg.OnDisconnect != nil {
 		w.cfg.OnDisconnect(cs.remoteAddr)

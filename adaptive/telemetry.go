@@ -22,6 +22,20 @@ type TelemetrySnapshot struct {
 	// CPUUtilization is the estimated CPU usage fraction (0.0-1.0). Read from
 	// the live sampler's CPUMonitor; zero when no monitor is wired.
 	CPUUtilization float64
+	// ConnsPerWorker is ActiveConnections divided by the engine's worker
+	// count. This is the PRIMARY load signal driving engine selection:
+	// epoll and io_uring tie at low conns/worker, but io_uring pulls ahead
+	// and keeps scaling above ~20/worker while epoll plateaus.
+	ConnsPerWorker float64
+	// AcceptRate is the new-connection arrival rate (accepts/sec) over the
+	// last sampling interval, derived like ThroughputRPS. A secondary load
+	// signal: a high accept rate indicates connection churn.
+	AcceptRate float64
+	// BytesPerReq is the average payload size (read+written bytes per
+	// request) over the last interval. When this exceeds the controller's
+	// large-payload threshold the workload is link-bound — the engines tie
+	// — so the controller suppresses an io_uring switch to avoid churn.
+	BytesPerReq float64
 }
 
 // TelemetrySampler produces telemetry snapshots from an engine.
@@ -54,6 +68,11 @@ func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
 		ActiveConnections: m.ActiveConnections,
 	}
 
+	// ConnsPerWorker is a point-in-time ratio (not a delta), so it needs no
+	// prior sample. max(Workers, 1) guards the pre-Listen window where the
+	// worker count is still zero.
+	snap.ConnsPerWorker = float64(m.ActiveConnections) / float64(max(m.Workers, 1))
+
 	prev, hasPrev := s.prevMetrics[et]
 	prevT, hasT := s.prevTime[et]
 	if hasPrev && hasT {
@@ -61,9 +80,13 @@ func (s *liveSampler) Sample(e engine.Engine) TelemetrySnapshot {
 		if elapsed > 0 {
 			deltaReqs := m.RequestCount - prev.RequestCount
 			deltaErrs := m.ErrorCount - prev.ErrorCount
+			deltaAccepts := m.AcceptCount - prev.AcceptCount
+			deltaBytes := (m.BytesRead + m.BytesWritten) - (prev.BytesRead + prev.BytesWritten)
 			snap.ThroughputRPS = float64(deltaReqs) / elapsed
+			snap.AcceptRate = float64(deltaAccepts) / elapsed
 			if deltaReqs > 0 {
 				snap.ErrorRate = float64(deltaErrs) / float64(deltaReqs)
+				snap.BytesPerReq = float64(deltaBytes) / float64(deltaReqs)
 			}
 		}
 	}

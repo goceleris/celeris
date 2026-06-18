@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -29,6 +30,14 @@ var _ stream.Handler = noopHandler{}
 // (we need both primary + secondary up for a meaningful switch test).
 func newBoundAdaptive(t *testing.T) (*Engine, func()) {
 	t.Helper()
+	// These tests need BOTH sub-engines for a meaningful switch. Since New()
+	// now LAZILY builds the standby (and falls back to an epoll start when
+	// io_uring is unavailable), a no-io_uring host would let New() succeed yet
+	// fail the first switch when the io_uring standby cannot be built. Skip up
+	// front when io_uring is genuinely unavailable.
+	if !probe.Probe().IOUringTier.Available() {
+		t.Skip("io_uring unavailable: switch test needs both sub-engines")
+	}
 	cfg := resource.Config{
 		Addr:     "127.0.0.1:0",
 		Protocol: engine.HTTP1,
@@ -347,13 +356,8 @@ func TestAdaptiveSwitchAfterDriverQuiescence(t *testing.T) {
 	e, stop := newBoundAdaptive(t)
 	defer stop()
 
-	// Seed historical scores so ForceSwitch actually flips active.
-	now := time.Now()
-	e.ctrl.state.lastActiveScore[engine.Epoll] = 100
-	e.ctrl.state.lastActiveScore[engine.IOUring] = 500
-	e.ctrl.state.lastActiveTime[engine.Epoll] = now
-	e.ctrl.state.lastActiveTime[engine.IOUring] = now
-
+	// ForceSwitch bypasses the decision policy and flips the active engine
+	// directly, so no telemetry seeding is needed here.
 	local, peer := socketpairNonblocking(t)
 	defer func() { _ = unix.Close(peer) }()
 	defer func() { _ = unix.Close(local) }()

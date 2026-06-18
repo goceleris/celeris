@@ -88,14 +88,20 @@ type Loop struct {
 	// re-arms the signal.
 	listenFDClosed atomic.Bool
 
-	reqCount         *atomic.Uint64
-	activeConns      *atomic.Int64
-	errCount         *atomic.Uint64
-	asyncPromoted    *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
-	reqBatch         uint64         // batched request count, flushed to reqCount per iteration
-	tickCounter      uint32
-	consecutiveEmpty uint32 // consecutive iterations with no events (for adaptive timeout)
-	cachedNow        int64  // cached time.Now().UnixNano(), refreshed once per events return
+	reqCount          *atomic.Uint64
+	activeConns       *atomic.Int64
+	errCount          *atomic.Uint64
+	asyncPromoted     *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	acceptCount       *atomic.Uint64 // cumulative accepts (engine-wide, shared)
+	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
+	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
+	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
+	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
+	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
+	tickCounter       uint32
+	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
+	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
 
 	// fdCapDrops counts accepted fds that fell outside the l.conns table
 	// (fd >= connTableSize) and were force-closed in acceptAll. Worker-
@@ -143,7 +149,8 @@ type Loop struct {
 func newLoop(id, cpuID int, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) *Loop {
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool,
+	acceptCount, closeCount, bytesRead, bytesWritten *atomic.Uint64) *Loop {
 
 	return &Loop{
 		id:           id,
@@ -175,6 +182,10 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		activeConns:   activeConns,
 		errCount:      errCount,
 		asyncPromoted: asyncPromoted,
+		acceptCount:   acceptCount,
+		closeCount:    closeCount,
+		bytesRead:     bytesRead,
+		bytesWritten:  bytesWritten,
 		h2cfg: conn.H2Config{
 			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
 			InitialWindowSize:    cfg.InitialWindowSize,
@@ -461,7 +472,7 @@ func (l *Loop) run(ctx context.Context) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
-			err := flushWrites(cs)
+			err := l.flushWrites(cs, true)
 			if err != nil {
 				// Surface I/O failure to detached middleware before closing.
 				if cs.h1State != nil && cs.h1State.OnError != nil {
@@ -506,7 +517,7 @@ func (l *Loop) run(ctx context.Context) {
 			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
 				cs.h2State.DrainWriteQueue(cs.writeFn)
 				if cs.writePos < len(cs.writeBuf) {
-					if fErr := flushWrites(cs); fErr != nil {
+					if fErr := l.flushWrites(cs, true); fErr != nil {
 						l.removeDirty(cs)
 						l.closeConn(fd)
 					} else if cs.writePos < len(cs.writeBuf) {
@@ -525,6 +536,17 @@ func (l *Loop) run(ctx context.Context) {
 		if l.reqBatch > 0 {
 			l.reqCount.Add(l.reqBatch)
 			l.reqBatch = 0
+		}
+
+		// Flush batched payload-byte counters with the same per-iteration
+		// cadence as reqCount, for the same cache-line-contention reason.
+		if l.bytesReadBatch > 0 {
+			l.bytesRead.Add(l.bytesReadBatch)
+			l.bytesReadBatch = 0
+		}
+		if l.bytesWrittenBatch > 0 {
+			l.bytesWritten.Add(l.bytesWrittenBatch)
+			l.bytesWrittenBatch = 0
 		}
 
 		// Check connection timeouts. Default cadence is every 1024 iterations
@@ -656,6 +678,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 		}
 		cs.writeFn = l.makeWriteFn(cs)
 		l.activeConns.Add(1)
+		l.acceptCount.Add(1)
 
 		if l.cfg.OnConnect != nil {
 			l.cfg.OnConnect(cs.remoteAddr)
@@ -714,7 +737,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
-			_ = flushWrites(cs)
+			_ = l.flushWrites(cs, true)
 			// Surface read failure to detached middleware (e.g. WS).
 			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(err)
@@ -729,7 +752,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
-			_ = flushWrites(cs)
+			_ = l.flushWrites(cs, true)
 			// Surface peer-close (EOF) to detached middleware.
 			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(errPeerClosed)
@@ -742,6 +765,9 @@ func (l *Loop) drainRead(fd int, now int64) {
 		}
 
 		cs.lastActivity = now
+		// n > 0 here (the err and EOF cases returned above): bytes read on
+		// this iteration, into either cs.buf or the zero-copy bodyBuf.
+		l.bytesReadBatch += uint64(n)
 
 		// Direct-into-bodyBuf completion path: we read straight into
 		// H1State.bodyBuf; dispatch the handler if the body is full,
@@ -764,7 +790,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				if mu := cs.detachMu; mu != nil {
 					mu.Lock()
 				}
-				_ = flushWrites(cs)
+				_ = l.flushWrites(cs, true)
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -781,7 +807,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 					if mu := cs.detachMu; mu != nil {
 						mu.Lock()
 					}
-					_ = flushWrites(cs)
+					_ = l.flushWrites(cs, true)
 					if mu := cs.detachMu; mu != nil {
 						mu.Unlock()
 					}
@@ -792,7 +818,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
-			if err := flushWrites(cs); err != nil {
+			if err := l.flushWrites(cs, true); err != nil {
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -942,7 +968,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// skipped by the `continue` so we must flush explicitly here,
 				// otherwise the client blocks forever waiting for the 101.
 				if cs.writePos < len(cs.writeBuf) {
-					if fErr := flushWrites(cs); fErr != nil {
+					if fErr := l.flushWrites(cs, true); fErr != nil {
 						l.closeConn(fd)
 						return
 					}
@@ -1003,7 +1029,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Lock()
 			}
-			_ = flushWrites(cs)
+			_ = l.flushWrites(cs, true)
 			cs.pendingBytes = 0
 			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(processErr)
@@ -1024,7 +1050,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			mu.Lock()
 		}
 		if csWritePending(cs) {
-			if fErr := flushWrites(cs); fErr != nil {
+			if fErr := l.flushWrites(cs, true); fErr != nil {
 				if cs.h1State != nil && cs.h1State.OnError != nil {
 					cs.h1State.OnError(fErr)
 				}
@@ -1118,6 +1144,7 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
+	l.closeCount.Add(1)
 
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
@@ -1650,7 +1677,10 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 				// flushWrites may partially complete; residual bytes
 				// stay in cs.writeBuf and the worker retries via
 				// markDirty once drainDetachQueue picks us up.
-				if err := flushWrites(cs); err != nil {
+				// Dispatch-goroutine call site: not the loop thread, so
+				// byte accounting must hit the shared atomic, not the
+				// per-loop batch (false → atomic path).
+				if err := l.flushWrites(cs, false); err != nil {
 					promoteErr = err
 				}
 			}
@@ -1733,7 +1763,8 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		// race the middleware's own write path.
 		if !errors.Is(processErr, conn.ErrHijacked) &&
 			(cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0) {
-			flushErr = flushWrites(cs)
+			// Dispatch-goroutine call site (false → shared-atomic byte path).
+			flushErr = l.flushWrites(cs, false)
 		}
 		// Resync pendingBytes with actual buffer state. makeWriteFn uses
 		// pendingBytes to enforce writeCap backpressure; without this
@@ -1940,7 +1971,7 @@ func (l *Loop) handleWritable(cs *connState) {
 	if mu := cs.detachMu; mu != nil {
 		mu.Lock()
 	}
-	err := flushWrites(cs)
+	err := l.flushWrites(cs, true)
 	drained := err == nil && !csWritePending(cs)
 	if err == nil {
 		if drained {
@@ -2233,6 +2264,7 @@ func (l *Loop) closeConn(fd int) {
 	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
+	l.closeCount.Add(1)
 
 	if l.cfg.OnDisconnect != nil {
 		l.cfg.OnDisconnect(cs.remoteAddr)

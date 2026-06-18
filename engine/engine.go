@@ -106,4 +106,27 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// how often the inline → goroutine handoff fires vs the pure-sync
 	// inline fast path.
 	AsyncPromotedConns uint64
+	// Workers is the number of I/O workers (io_uring) or event loops
+	// (epoll) the engine is running. Static after Listen. The adaptive
+	// controller divides ActiveConnections by it to derive the
+	// conns-per-worker load signal that drives engine selection.
+	Workers int
+	// AcceptCount is the cumulative number of connections accepted by this
+	// engine since start. Together with elapsed time it yields the accept
+	// rate (new-connection arrival rate) used as a secondary load signal.
+	AcceptCount uint64
+	// CloseCount is the cumulative number of connections closed by this
+	// engine since start. AcceptCount - CloseCount tracks the live count;
+	// a high close rate relative to accepts indicates short-lived
+	// churn-style connections.
+	CloseCount uint64
+	// BytesRead is the cumulative number of payload bytes received from
+	// the network across all connections. Used with BytesWritten and
+	// RequestCount to derive the average bytes-per-request signal that
+	// suppresses io_uring selection for link-bound (large-payload)
+	// workloads where the engines tie.
+	BytesRead uint64
+	// BytesWritten is the cumulative number of payload bytes sent to the
+	// network across all connections. See BytesRead.
+	BytesWritten uint64
 }

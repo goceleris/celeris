@@ -16,16 +16,33 @@ import (
 // writev(2) with iovec = [writeBuf[writePos:], bodyBuf]. Saves one
 // full body-sized memcpy per request compared to appending the body
 // into writeBuf first.
-func flushWrites(cs *connState) error {
+// onLoopThread distinguishes the worker (event-loop) call sites from the
+// async-dispatch-goroutine ones. Loop-thread bytes accumulate in the
+// non-atomic per-loop batch (flushed once per iteration, like reqBatch);
+// goroutine bytes go straight to the shared atomic. Keeping the two paths
+// apart is what makes the batch field worker-thread-only and therefore
+// race-free — the dispatch goroutine never touches bytesWrittenBatch.
+func (l *Loop) addWrittenBytes(n int, onLoopThread bool) {
+	if n <= 0 {
+		return
+	}
+	if onLoopThread {
+		l.bytesWrittenBatch += uint64(n)
+		return
+	}
+	l.bytesWritten.Add(uint64(n))
+}
+
+func (l *Loop) flushWrites(cs *connState, onLoopThread bool) error {
 	if len(cs.bodyBuf) > 0 {
-		return flushWritesV(cs)
+		return l.flushWritesV(cs, onLoopThread)
 	}
 	if cs.writePos >= len(cs.writeBuf) {
 		cs.writeBuf = cs.writeBuf[:0]
 		cs.writePos = 0
 		// writeBuf is empty — if a zero-copy sendfile response is pending,
 		// drive it now (after any prior pipelined writeBuf bytes flushed).
-		return flushSendfile(cs)
+		return l.flushSendfile(cs, onLoopThread)
 	}
 	n, err := unix.Write(cs.fd, cs.writeBuf[cs.writePos:])
 	if err != nil {
@@ -36,6 +53,7 @@ func flushWrites(cs *connState) error {
 		cs.writePos = 0
 		return err
 	}
+	l.addWrittenBytes(n, onLoopThread)
 	cs.writePos += n
 	if cs.writePos >= len(cs.writeBuf) {
 		// Fully flushed
@@ -43,7 +61,7 @@ func flushWrites(cs *connState) error {
 		cs.writePos = 0
 		// writeBuf drained this call — continue into the sendfile body if a
 		// sendfile response is pending. Keeps header→body ordering correct.
-		return flushSendfile(cs)
+		return l.flushSendfile(cs, onLoopThread)
 	} else if cs.writePos > cap(cs.writeBuf)/2 {
 		// Amortized compaction: only copy when more than half the buffer is consumed.
 		// This reduces the average cost from O(n) per partial write to O(1) amortized.
@@ -66,12 +84,13 @@ func flushWrites(cs *connState) error {
 // the writeBuf path above. On a real I/O error the file is released and
 // the error is surfaced (the caller closes the conn). On completion the
 // dup'd file is closed and cs.sendfile cleared.
-func flushSendfile(cs *connState) error {
+func (l *Loop) flushSendfile(cs *connState, onLoopThread bool) error {
 	st := cs.sendfile
 	if st == nil {
 		return nil
 	}
-	_, err := st.advance(cs.fd)
+	sent, err := st.advance(cs.fd)
+	l.addWrittenBytes(int(sent), onLoopThread)
 	if err != nil {
 		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 			return nil // send buffer full; resume on next writable edge
@@ -120,7 +139,7 @@ func csPendingBytes(cs *connState) int {
 // is non-nil; clears bodyBuf once fully sent. Partial writev collapses
 // the remainder into writeBuf so the next flushWrites call uses the
 // plain write path.
-func flushWritesV(cs *connState) error {
+func (l *Loop) flushWritesV(cs *connState, onLoopThread bool) error {
 	headerRem := cs.writeBuf[cs.writePos:]
 	iovs := [2][]byte{headerRem, cs.bodyBuf}
 	n, err := unix.Writev(cs.fd, iovs[:])
@@ -133,6 +152,7 @@ func flushWritesV(cs *connState) error {
 		cs.bodyBuf = nil
 		return err
 	}
+	l.addWrittenBytes(n, onLoopThread)
 	total := len(headerRem) + len(cs.bodyBuf)
 	switch {
 	case n >= total:
