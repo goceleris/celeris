@@ -158,13 +158,20 @@ type Config struct {
 	// groups can override it per handler with [Route.Async] /
 	// [RouteGroup.Async] (most-specific wins: route > group > this
 	// default), so a server with mostly CPU routes + a few DB routes can
-	// keep this false and mark just the DB routes .Async(), or set this
-	// true and mark hot CPU routes .Async(false). On HTTP/2 the override
-	// is honored per-stream (sync routes run inline on the event loop,
-	// async routes dispatch to the worker pool). Note: celeris drivers
-	// opened WithEngine(srv) consult the server-level AsyncHandlers (not
-	// per-route overrides) for their auto-async path selection — set this
-	// true when using WithEngine drivers under per-route async.
+	// keep this false and mark just the DB routes .Async() / .UsesDriver(),
+	// or set this true and mark hot CPU routes .Async(false). On HTTP/2 the
+	// override is honored per-stream (sync routes run inline on the event
+	// loop, async routes dispatch to the worker pool).
+	//
+	// DRIVERS: celeris drivers opened WithEngine(srv) pick their netpoll-park
+	// fast path from the server's EFFECTIVE async state — true when this flag
+	// is set OR any route is .Async(). So "keep this false + mark DB routes
+	// .Async()/.UsesDriver()" selects the fast driver path too, PROVIDED the
+	// driver is opened AFTER those routes are registered (the effective state
+	// is read at driver construction); otherwise set this true. Setting this
+	// true also enables the adaptive safety net that auto-promotes any unmarked
+	// handler slower than ~300µs, at a small learning-phase cost that settles to
+	// zero for static routes.
 	//
 	// Default: false.
 	AsyncHandlers bool

@@ -476,7 +476,16 @@ func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 //     (their net.TCPConn goroutines keep running regardless of which
 //     sub-engine is active).
 func (s *Server) AsyncHandlers() bool {
-	if !s.config.AsyncHandlers {
+	// Report the EFFECTIVE async state, not the raw Config flag: the server
+	// stands up async-dispatch infrastructure when the server-level default is
+	// set OR any route opted in via .Async() (doPrepare flips the engine cfg the
+	// same way via hasAsyncRoutes). WithEngine drivers consult this to pick their
+	// netpoll-park fast path; keying on the raw config alone put a driver called
+	// from a per-route-.Async() handler on the slower mini-loop path — the
+	// documented footgun. NOTE: hasAsyncRoutes reflects routes registered so far,
+	// so open WithEngine drivers AFTER registering .Async() routes (or set
+	// Config.AsyncHandlers=true) to be order-independent.
+	if !s.config.AsyncHandlers && !s.router.hasAsyncRoutes() {
 		return false
 	}
 	switch s.config.Engine {

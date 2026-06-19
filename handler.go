@@ -141,7 +141,14 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	if rt.adaptiveRoutes[fullPath] && rt.adaptiveLearning(fullPath) {
 		start := time.Now()
 		err := c.Next()
-		rt.recordInlineRun(fullPath, time.Since(start) > adaptivePromoteThreshold)
+		dur := time.Since(start)
+		if dur > adaptiveBlockingThreshold {
+			// Unambiguously a blocking I/O round-trip: promote on the first such
+			// run rather than waiting for adaptivePromoteStreak slow runs.
+			rt.promoteRouteImmediate(fullPath)
+		} else {
+			rt.recordInlineRun(fullPath, dur > adaptivePromoteThreshold)
+		}
 		if err != nil {
 			a.handleError(c, s, err)
 		}
@@ -167,6 +174,16 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 // adaptive); auto-promotion is a safety net for an unmarked handler that blocks
 // on EVERY request.
 const adaptivePromoteThreshold = 300 * time.Microsecond
+
+// adaptiveBlockingThreshold is the inline duration that is UNAMBIGUOUSLY a
+// blocking I/O round-trip (not CPU work under contention). A single inline run
+// over this bar promotes the route IMMEDIATELY, skipping the
+// adaptivePromoteStreak hysteresis — a genuinely-blocking handler that an
+// operator forgot to mark .Async() then stalls a worker for at most one request
+// instead of adaptivePromoteStreak of them. The bar sits far above any CPU-bound
+// chain's wall-clock (even under GC/scheduling jitter), so it cannot misfire on
+// a CPU route; the 300µs/streak path still handles the borderline 300µs–2ms band.
+const adaptiveBlockingThreshold = 2 * time.Millisecond
 
 // adaptivePromoteStreak is how many CONSECUTIVE slow inline runs promote an
 // adaptive route to async. The consecutive requirement (a fast run resets the

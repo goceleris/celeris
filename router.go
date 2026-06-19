@@ -241,6 +241,22 @@ func (r *Route) Sync() *Route {
 	return r.setAsync(false)
 }
 
+// UsesDriver marks a route whose handler performs a blocking backend round-trip
+// via a celeris driver (postgres / redis / memcached) opened WithEngine(srv).
+// It is exactly equivalent to .Async() — the route is dispatched off the worker
+// so the blocking call parks the handler goroutine on netpoll instead of
+// stalling an I/O worker — but reads as intent at the call site and is the
+// recommended way to mark driver routes:
+//
+//	srv.GET("/users/:id", getUser).UsesDriver()   // == .Async(), clearer intent
+//
+// The adaptive safety net (Config.AsyncHandlers=true) only auto-promotes
+// handlers slower than ~300µs, so a fast localhost driver call (sub-300µs) would
+// otherwise keep blocking a worker every request — mark such routes explicitly.
+func (r *Route) UsesDriver() *Route {
+	return r.setAsync(true)
+}
+
 // setAsync is the shared implementation of [Route.Async] and [Route.Sync].
 // Updates the node, the router's asyncRouteCount, and the static-fast-path
 // map entry so all three observers see the same async flag.
@@ -329,6 +345,18 @@ func (r *router) isPromoted(fullPath string) bool {
 // (celeris#364). Re-promotion refreshes the stamp.
 func (r *router) promoteRoute(fullPath string) {
 	r.promoted.Store(fullPath, nowNano())
+}
+
+// promoteRouteImmediate promotes an adaptive route after a single
+// unambiguously-blocking inline run (> adaptiveBlockingThreshold), skipping the
+// adaptivePromoteStreak hysteresis. The fast streak is cleared so a burst of
+// prior fast runs cannot settle the route once the promotion TTL expires and it
+// re-enters the learning path.
+func (r *router) promoteRouteImmediate(fullPath string) {
+	if fv, ok := r.fastStreak.Load(fullPath); ok {
+		fv.(*atomic.Int32).Store(0)
+	}
+	r.promoteRoute(fullPath)
 }
 
 // recordInlineRun feeds one inline-run observation into the adaptive
