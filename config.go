@@ -40,6 +40,25 @@ const (
 // String returns the engine type name.
 func (t EngineType) String() string { return engine.EngineType(t).String() }
 
+// WorkloadHint is an OPTIONAL declaration of expected steady-state concurrency,
+// used only by the Adaptive engine's start-engine decision. Because connections
+// cannot migrate between epoll and io_uring, the START engine decides keep-alive
+// throughput — and the concurrency is unknowable when the server binds. This
+// hint is the ONLY way to make Adaptive START on io_uring; without it Adaptive
+// starts on epoll (best for the ramp-from-zero / low-concurrency / latency case)
+// and promotes new connections to io_uring under sustained high load.
+type WorkloadHint resource.WorkloadHint
+
+const (
+	// WorkloadUnspecified (default) → start epoll, promote under load.
+	WorkloadUnspecified WorkloadHint = WorkloadHint(resource.WorkloadUnspecified)
+	// WorkloadLowConcurrency → thin/latency-sensitive traffic; stay epoll.
+	WorkloadLowConcurrency WorkloadHint = WorkloadHint(resource.WorkloadLowConcurrency)
+	// WorkloadHighConcurrency → many h1 keep-alive conns/worker; start io_uring
+	// (when the kernel and RLIMIT_MEMLOCK allow it).
+	WorkloadHighConcurrency WorkloadHint = WorkloadHint(resource.WorkloadHighConcurrency)
+)
+
 // Config holds the public server configuration.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
@@ -51,6 +70,12 @@ type Config struct {
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
 	Workers int
+
+	// WorkloadHint optionally declares the expected steady-state concurrency.
+	// It only affects the Adaptive engine's start-engine choice (see WorkloadHint):
+	// the zero value starts on epoll; WorkloadHighConcurrency starts on io_uring
+	// when the kernel + memlock allow.
+	WorkloadHint WorkloadHint
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (60s). Set to -1 for no timeout.
@@ -222,6 +247,7 @@ func (c Config) toResourceConfig() resource.Config {
 	if c.MaxConns > 0 {
 		rc.Resources.MaxConns = c.MaxConns
 	}
+	rc.Resources.WorkloadHint = resource.WorkloadHint(c.WorkloadHint)
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize
 	rc.AsyncHandlers = c.AsyncHandlers

@@ -65,10 +65,10 @@ func TestConnSwitchDisabledGate(t *testing.T) {
 }
 
 // TestUpSwitchRequiresSustain verifies the normal epoll→io_uring switch needs
-// sustainTicks (2) consecutive ticks at or above the up threshold (20).
+// sustainTicks (2) consecutive ticks at or above the up threshold (24).
 func TestUpSwitchRequiresSustain(t *testing.T) {
 	c, sampler := newCtrlEpollActive()
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 20})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 24})
 
 	now := time.Now()
 	if c.evaluate(now, false) {
@@ -88,7 +88,7 @@ func TestUpSwitchSustainResetsOnDip(t *testing.T) {
 	c, sampler := newCtrlEpollActive()
 	now := time.Now()
 
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 22})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 26})
 	if c.evaluate(now, false) {
 		t.Fatal("first tick must not switch")
 	}
@@ -101,7 +101,7 @@ func TestUpSwitchSustainResetsOnDip(t *testing.T) {
 		t.Fatalf("upTicks = %d, want 0 after a dip below the up threshold", c.state.upTicks)
 	}
 	// Back above threshold: needs two more ticks now.
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 22})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 26})
 	if c.evaluate(now.Add(2*time.Second), false) {
 		t.Fatal("first tick after reset must not switch")
 	}
@@ -111,17 +111,17 @@ func TestUpSwitchSustainResetsOnDip(t *testing.T) {
 }
 
 // TestFastPathSnapsImmediately verifies conns/worker at/above the high
-// watermark (32) switches on a single tick.
+// watermark (48) switches on a single tick.
 func TestFastPathSnapsImmediately(t *testing.T) {
 	c, sampler := newCtrlEpollActive()
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 32})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 48})
 
 	if !c.evaluate(time.Now(), false) {
 		t.Fatal("conns/worker at the high watermark must snap on one tick")
 	}
 }
 
-// TestHysteresisBandNoFlap verifies the 12–20 band switches neither way.
+// TestHysteresisBandNoFlap verifies the 12–24 band switches neither way.
 func TestHysteresisBandNoFlap(t *testing.T) {
 	for _, cpw := range []float64{12, 14, 16, 18, 19.9} {
 		c, sampler := newCtrlEpollActive()
@@ -140,7 +140,7 @@ func TestHysteresisBandNoFlap(t *testing.T) {
 func TestLargePayloadSuppression(t *testing.T) {
 	c, sampler := newCtrlEpollActive()
 	// Exactly at the threshold counts as large (>=).
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 64, BytesPerReq: 16384})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 64, BytesPerReq: 8192})
 
 	now := time.Now()
 	for i := range 5 {
@@ -150,7 +150,7 @@ func TestLargePayloadSuppression(t *testing.T) {
 	}
 
 	// Drop below the large-payload threshold → fast path fires.
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 64, BytesPerReq: 16383})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 64, BytesPerReq: 8191})
 	if !c.evaluate(now.Add(10*time.Second), false) {
 		t.Fatal("small payload above high watermark must switch")
 	}
@@ -204,7 +204,7 @@ func TestCooldownGatesRevert(t *testing.T) {
 
 	now := time.Now()
 	// First switch is not gated (lastSwitch is zero).
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50})
 	if !c.evaluate(now, false) {
 		t.Fatal("first switch must not be cooldown-gated")
 	}
@@ -273,10 +273,10 @@ func TestRecordSwitchResetsTicks(t *testing.T) {
 // guards against a config drift in the documented thresholds.
 func TestDefaultThresholds(t *testing.T) {
 	c, _ := newCtrlEpollActive()
-	if c.upThreshold != 20 || c.downThreshold != 12 || c.highWatermark != 32 {
+	if c.upThreshold != 24 || c.downThreshold != 12 || c.highWatermark != 48 {
 		t.Fatalf("threshold drift: up=%.0f down=%.0f hwm=%.0f", c.upThreshold, c.downThreshold, c.highWatermark)
 	}
-	if c.largePayloadBytes != 16384 || c.errorRevertRate != 0.05 || c.sustainTicks != 2 {
+	if c.largePayloadBytes != 8192 || c.errorRevertRate != 0.05 || c.sustainTicks != 2 {
 		t.Fatalf("policy drift: largePayload=%.0f errRevert=%.3f sustain=%d",
 			c.largePayloadBytes, c.errorRevertRate, c.sustainTicks)
 	}

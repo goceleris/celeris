@@ -33,10 +33,12 @@ var (
 // activeIsPrimary==true means epoll is active) and secondary is ALWAYS the
 // io_uring engine. On the public New() path only the START engine is built
 // eagerly; the other slot stays nil until the first switch actually needs it
-// (see buildStandby + performSwitch). On a modern kernel that starts on
-// io_uring and never reverts, the epoll standby is never constructed, so its
-// GC-rooted heap never exists. newFromEngines (tests) populates BOTH slots
-// eagerly, exercising the standby-already-exists switch path.
+// (see buildStandby + performSwitch). Under the default policy the start engine
+// is epoll, so the io_uring standby is built lazily — and only if a sustained
+// high-concurrency ramp promotes new conns to it; an engine that never switches
+// never constructs its standby, so that heap never exists. newFromEngines
+// (tests) populates BOTH slots eagerly, exercising the standby-already-exists
+// switch path.
 type Engine struct {
 	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
 	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
@@ -92,41 +94,80 @@ type Engine struct {
 	switchRejected  atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
 }
 
-// chooseStartEngine selects which sub-engine the adaptive meta-engine should
-// start (and build eagerly) given the probed io_uring capability profile.
+// ioUringViable reports whether io_uring is worth running at all on this host:
+// the kernel must expose the fast tier AND RLIMIT_MEMLOCK must be able to fund
+// the requested worker count. These are the two t0-knowable disqualifiers from
+// the epoll-vs-io_uring sweep:
 //
-// io_uring loses to epoll on old kernels (pre-LTS-stability bugs, missing the
-// fast-path setup flags) but wins on modern ones for thin-HTTP, so the start
-// engine is feature-gated:
+//   - Kernel/feature: io_uring loses to epoll on old kernels (missing the
+//     fast-path setup flags); require the "bundles" era (>6.10) OR the 6.1+
+//     fast tier (DEFER_TASKRUN + SINGLE_ISSUER + MULTISHOT_RECV + PROVIDED_BUFFERS).
+//   - Memlock: io_uring's provided-buffer rings need locked pages per worker
+//     (minMemlockPerWorker). If RLIMIT_MEMLOCK can't fund the requested workers,
+//     io_uring caps to a fraction of them and its throughput collapses; epoll
+//     does not memlock buffer rings, so it keeps all workers. In that case
+//     io_uring is never the right engine.
+func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
+	bundlesEra := p.KernelMajor > 6 || (p.KernelMajor == 6 && p.KernelMinor >= 10)
+	fastTier := p.DeferTaskrun && p.SingleIssuer && p.MultishotRecv && p.ProvidedBuffers
+	if !bundlesEra && !fastTier {
+		return false
+	}
+	wantWorkers := cfg.Resources.Resolve().Workers
+	if maxW := maxWorkersForMemlock(); maxW != -1 && maxW < wantWorkers {
+		return false
+	}
+	return true
+}
+
+// maxWorkersForMemlock is the io_uring memlock worker-ceiling probe behind a var
+// so tests can inject a low cap without mutating the process RLIMIT_MEMLOCK.
+var maxWorkersForMemlock = iouring.MaxWorkersForMemlock
+
+// chooseStartEngine selects which sub-engine the adaptive meta-engine starts
+// (and builds eagerly), from facts knowable at Listen() time only.
 //
-//   - IOUring when io_uring is mature for thin-HTTP — either the kernel is in
-//     the "bundles" era (>6.10, where multishot + provided buffers + defer
-//     taskrun are all stable and tuned) OR the 6.1+ fast tier is present
-//     (DEFER_TASKRUN + SINGLE_ISSUER + MULTISHOT_RECV + PROVIDED_BUFFERS).
-//   - Epoll otherwise (old kernels, or io_uring missing the fast tier).
+// THE PINNING CONSTRAINT: an established connection cannot migrate between
+// epoll and io_uring, so the START engine decides keep-alive throughput; the
+// runtime switch can only route NEW connections. And the workload's
+// concurrency — the thing that actually decides which engine wins — is
+// unknowable here (no connections exist yet). So the start decision is gated
+// only on t0-knowable disqualifiers, with a safe default:
 //
-// The env var CELERIS_ADAPTIVE_START overrides the rule:
+//	1. env override CELERIS_ADAPTIVE_START=iouring|epoll (operator escape hatch).
+//	2. io_uring not viable (old kernel / missing fast tier / memlock too low) → epoll.
+//	3. configured Protocol == H2C → epoll (io_uring's win is h1-small-payload only;
+//	   h2c never benefits — its framing/HPACK cost dwarfs the engine delta).
+//	4. explicit operator WorkloadHint == HighConcurrency → io_uring (the ONLY
+//	   input that can express a high-concurrency expectation up front).
+//	5. DEFAULT → epoll. Every server ramps from zero connections, i.e. the
+//	   low-concurrency regime where epoll wins on throughput AND tail latency;
+//	   the runtime switch then promotes new conns to io_uring if sustained
+//	   high load develops.
 //
-//	iouring | epoll — force that start engine.
-//	auto (or unset) — use the capability rule above.
-//
-// NOTE: the exact capability rule will be refined by a kernel-matrix sweep;
-// treat the thresholds here as the current best estimate, not a final answer.
-func chooseStartEngine(p engine.CapabilityProfile) engine.EngineType {
+// This flips the previous default (io_uring on modern kernels): io_uring now
+// wins the start only on an explicit high-concurrency hint, because the
+// benchmark-shaped "saturating burst at t0" is the only case where defaulting
+// io_uring helps, and it costs the common low/mid-conc + latency cases.
+func chooseStartEngine(p engine.CapabilityProfile, cfg resource.Config) engine.EngineType {
 	switch os.Getenv("CELERIS_ADAPTIVE_START") {
 	case "iouring":
 		return engine.IOUring
 	case "epoll":
 		return engine.Epoll
 	case "auto", "":
-		// fall through to the capability rule
+		// fall through to the policy below
 	default:
 		// Unknown value: fall through to auto rather than fail hard.
 	}
 
-	bundlesEra := p.KernelMajor > 6 || (p.KernelMajor == 6 && p.KernelMinor >= 10)
-	fastTier := p.DeferTaskrun && p.SingleIssuer && p.MultishotRecv && p.ProvidedBuffers
-	if bundlesEra || fastTier {
+	if !ioUringViable(p, cfg) {
+		return engine.Epoll
+	}
+	if cfg.Protocol == engine.H2C {
+		return engine.Epoll
+	}
+	if cfg.Resources.WorkloadHint == resource.WorkloadHighConcurrency {
 		return engine.IOUring
 	}
 	return engine.Epoll
@@ -168,7 +209,8 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 
 	// probe.Probe() reads kernel version + io_uring setup feature bits WITHOUT
 	// constructing an engine, so it is cheap enough for the start decision.
-	startType := chooseStartEngine(probe.Probe())
+	profile := probe.Probe()
+	startType := chooseStartEngine(profile, cfg)
 
 	sampler := newLiveSampler(cpuMon)
 	logger := cfg.Logger
@@ -243,14 +285,25 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	// records which slot the start engine occupies (primary==epoll).
 	e.ctrl = newController(e.primary, e.secondary, sampler, logger)
 	e.ctrl.state.activeIsPrimary = e.startType == engine.Epoll
-	// Conns-per-worker UP/DOWN switching is OFF in production: the feature-gated
-	// chooseStartEngine already selects the engine that is best at every
-	// concurrency on this kernel, and (because pinned conns never migrate) the
-	// down-revert would only fire on idle/warmup dips and strand load on the
-	// wrong engine. The always-on error-revert in the controller is unaffected.
-	// A future middle-tier kernel with a genuine crossover can flip this on
-	// (validated by the kernel matrix).
-	e.ctrl.connSwitchEnabled = false
+	// Re-enable the conns-per-worker UP switch ONLY on the epoll-start path with
+	// io_uring viable and a non-h2c protocol. Rationale from the sweep:
+	//   - When we START on epoll (the new default), a sustained high-concurrency
+	//     ramp should promote NEW connections to io_uring (it wins ≥~24 conns/
+	//     worker for h1 small payloads). The switch routes new SYNs only —
+	//     pinned conns stay on epoll — so it helps ramps/churn, and is inert for
+	//     a pure keep-alive burst (which is fine; that case wants WorkloadHint).
+	//   - When we START on io_uring there is nothing better to switch UP to, and
+	//     a load-driven DOWN-revert would only strand pinned io_uring conns — so
+	//     leave switching OFF there (the always-on error-revert still applies).
+	//   - h2c never benefits from io_uring, so never switch up for it.
+	// The controller's load-driven DOWN-revert is disabled regardless (pinning);
+	// only the always-on io_uring error-revert can move us back to epoll.
+	e.ctrl.connSwitchEnabled = e.startType == engine.Epoll &&
+		ioUringViable(profile, cfg) &&
+		cfg.Protocol != engine.H2C
+	// Load-driven down-revert is always off in production (pinning makes it
+	// harmful); only the always-on io_uring error-revert can return us to epoll.
+	e.ctrl.loadDownRevert = false
 
 	e.active.Store(&startEngine)
 	return e, nil

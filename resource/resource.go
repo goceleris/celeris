@@ -1,5 +1,29 @@
 package resource
 
+// WorkloadHint is an OPTIONAL operator declaration of the expected steady-state
+// concurrency, consumed only by the adaptive engine's start-engine decision.
+//
+// Because established connections cannot migrate between epoll and io_uring,
+// the START engine decides keep-alive throughput; and the expected concurrency
+// is unknowable at Listen() time (no connections exist yet). This hint is the
+// ONLY input that can make the adaptive engine START on io_uring. Absent it,
+// the engine defaults to epoll (every server ramps from zero connections — the
+// low-concurrency regime where epoll wins on both throughput and tail latency)
+// and lets the runtime switch route NEW connections up to io_uring under load.
+type WorkloadHint int
+
+const (
+	// WorkloadUnspecified (zero value) leaves the start-engine choice to the
+	// default policy: start epoll, promote new conns to io_uring under load.
+	WorkloadUnspecified WorkloadHint = iota
+	// WorkloadLowConcurrency explicitly declares thin/latency-sensitive traffic
+	// — start (and stay) on epoll.
+	WorkloadLowConcurrency
+	// WorkloadHighConcurrency explicitly declares many h1 keep-alive
+	// connections per worker — start on io_uring (when kernel + memlock allow).
+	WorkloadHighConcurrency
+)
+
 // Resources allows user overrides of default resource values.
 // Zero values mean "use engine default".
 type Resources struct {
@@ -13,6 +37,9 @@ type Resources struct {
 	SocketSend int
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
 	MaxConns int
+	// WorkloadHint is an OPTIONAL operator concurrency declaration; the only
+	// input that can make the adaptive engine START on io_uring (see WorkloadHint).
+	WorkloadHint WorkloadHint
 }
 
 // ResolvedResources contains the final computed values after applying defaults,

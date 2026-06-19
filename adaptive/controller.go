@@ -66,16 +66,23 @@ type controller struct {
 	errorRevertRate   float64 // io_uring error rate above which we revert to epoll
 	sustainTicks      int     // consecutive ticks required for a normal switch
 
-	// connSwitchEnabled gates the conns-per-worker UP/DOWN switching. It is
-	// OFF for the kernel regimes where the feature-gated start engine is
-	// already the best at every concurrency (io_uring-best on bundles/6.10+,
-	// epoll-best on <6.1) — there, switching only churns and, worse, the
-	// down-revert fires during idle/warmup dips and strands load on the wrong
-	// engine (since pinned conns never migrate). The always-on error-revert
-	// below is independent of this flag. A future middle-tier kernel where a
-	// genuine crossover exists can re-enable it (validated by the kernel
-	// matrix). The engine sets it via SetConnSwitchEnabled from the profile.
+	// connSwitchEnabled gates the conns-per-worker UP switch (epoll→io_uring).
+	// Production sets it true ONLY on the epoll-start path with io_uring viable
+	// and a non-h2c protocol: there, a sustained high-concurrency ramp should
+	// promote NEW connections to io_uring (it wins ≥~24 conns/worker for h1
+	// small payloads). It is false when io_uring is the start engine (nothing
+	// better to switch up to), when io_uring is unviable, or for h2c. The
+	// always-on error-revert below is independent of this flag. The engine sets
+	// it directly from the profile in New().
 	connSwitchEnabled bool
+
+	// loadDownRevert gates the LOAD-driven io_uring→epoll revert (evaluateDown).
+	// It is OFF in production: because pinned conns never migrate, reverting on
+	// a load dip strands established io_uring keep-alives and routes new conns
+	// back to epoll mid-ramp — pure harm. The always-on error-revert is
+	// independent of this flag. Defaults true in newController so the
+	// conns-per-worker unit tests exercise evaluateDown; New() sets it false.
+	loadDownRevert bool
 
 	logger *slog.Logger
 }
@@ -87,16 +94,21 @@ func newController(primary, secondary engine.Engine, sampler TelemetrySampler, l
 		sampler:           sampler,
 		evalInterval:      1 * time.Second,
 		cooldown:          30 * time.Second,
-		upThreshold:       20.0,
+		// Thresholds from the epoll-vs-io_uring sweep: io_uring overtakes epoll
+		// at ~24 conns/worker for h1 small payloads (was 20); the heavy-load
+		// fast-path snaps only well past the crossover (48); large payloads are
+		// link-bound (engines tie) above 8 KB so suppress the switch there.
+		upThreshold:       24.0,
 		downThreshold:     12.0,
-		highWatermark:     32.0,
-		largePayloadBytes: 16384.0,
+		highWatermark:     48.0,
+		largePayloadBytes: 8192.0,
 		errorRevertRate:   0.05,
 		sustainTicks:      2,
-		// Default ON so the conns-per-worker unit tests exercise the policy;
-		// the production New() path sets it from the kernel/feature profile
-		// (currently OFF — the feature-gated start engine is authoritative).
+		// Both default ON so the conns-per-worker unit tests exercise the policy;
+		// the production New() path sets connSwitchEnabled from the kernel/feature
+		// profile and loadDownRevert=false (pinning makes load-revert harmful).
 		connSwitchEnabled: true,
+		loadDownRevert:    true,
 		logger:            logger,
 		state: controllerState{
 			activeIsPrimary: true,
@@ -138,7 +150,10 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 			c.logSwitch("io_uring", "epoll", "error-rate safety revert", cpw, snap)
 			return true
 		}
-		if !c.connSwitchEnabled {
+		if !c.connSwitchEnabled || !c.loadDownRevert {
+			// Load-driven down-revert is disabled in production: pinned conns
+			// never migrate, so reverting only strands io_uring keep-alives and
+			// routes new conns to epoll mid-ramp. Only the error-revert above moves us.
 			return false
 		}
 		return c.evaluateDown(snap, cpw)

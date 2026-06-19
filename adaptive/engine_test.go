@@ -155,7 +155,7 @@ func TestSwitchTrigger(t *testing.T) {
 // on a single tick (no sustain wait).
 func TestSwitchFastPath(t *testing.T) {
 	e, sampler := newAdaptiveStartingOnEpoll(t)
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50})
 
 	if !e.ctrl.evaluate(time.Now(), false) {
 		t.Fatal("expected heavy-load fast-path snap on a single tick")
@@ -238,7 +238,7 @@ func TestCooldownGate(t *testing.T) {
 
 	now := time.Now()
 	// Fast-path switch epoll→io_uring.
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40})
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50})
 	if !e.ctrl.evaluate(now, false) {
 		t.Fatal("expected initial fast-path switch")
 	}
@@ -261,7 +261,7 @@ func TestConnectionDraining(t *testing.T) {
 	secondary.pauseCalls.Store(0) // reset counter
 
 	now := time.Now()
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40}) // fast-path
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50}) // fast-path
 
 	if !e.ctrl.evaluate(now, false) {
 		t.Fatal("expected switch")
@@ -288,7 +288,7 @@ func TestOscillationLock(t *testing.T) {
 	for range 3 {
 		switch e.ActiveEngine().Type() {
 		case engine.Epoll:
-			sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40}) // switch up
+			sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50}) // switch up
 		case engine.IOUring:
 			sampler.Set(engine.IOUring, TelemetrySnapshot{ConnsPerWorker: 40, ErrorRate: 0.5}) // error revert
 		}
@@ -302,7 +302,7 @@ func TestOscillationLock(t *testing.T) {
 	// Fourth switch should be locked (3 switches within 5 minutes).
 	switch e.ActiveEngine().Type() {
 	case engine.Epoll:
-		sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40})
+		sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50})
 	case engine.IOUring:
 		sampler.Set(engine.IOUring, TelemetrySnapshot{ConnsPerWorker: 40, ErrorRate: 0.5})
 	}
@@ -318,7 +318,7 @@ func TestOverloadFreeze(t *testing.T) {
 	e, sampler := newAdaptiveStartingOnEpoll(t)
 
 	now := time.Now()
-	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 40}) // fast-path load
+	sampler.Set(engine.Epoll, TelemetrySnapshot{ConnsPerWorker: 50}) // fast-path load
 
 	// Freeze switching.
 	e.FreezeSwitching()
@@ -338,87 +338,9 @@ func TestOverloadFreeze(t *testing.T) {
 
 // --- Part A: feature-gated start-engine selection ------------------------
 
-// TestChooseStartEngine covers the capability rule (no env override).
-func TestChooseStartEngine(t *testing.T) {
-	t.Setenv("CELERIS_ADAPTIVE_START", "") // ensure auto
-
-	tests := []struct {
-		name    string
-		profile engine.CapabilityProfile
-		want    engine.EngineType
-	}{
-		{
-			name:    "7.0 bundles era",
-			profile: engine.CapabilityProfile{KernelMajor: 7, KernelMinor: 0},
-			want:    engine.IOUring,
-		},
-		{
-			name:    "6.10 bundles era boundary",
-			profile: engine.CapabilityProfile{KernelMajor: 6, KernelMinor: 10},
-			want:    engine.IOUring,
-		},
-		{
-			name: "6.1 fast tier (defer+single+multishotrecv+providedbuffers)",
-			profile: engine.CapabilityProfile{
-				KernelMajor: 6, KernelMinor: 1,
-				DeferTaskrun: true, SingleIssuer: true,
-				MultishotRecv: true, ProvidedBuffers: true,
-			},
-			want: engine.IOUring,
-		},
-		{
-			name:    "5.15 LTS (no fast tier)",
-			profile: engine.CapabilityProfile{KernelMajor: 5, KernelMinor: 15},
-			want:    engine.Epoll,
-		},
-		{
-			name: "6.1 missing one fast-tier bit -> epoll",
-			profile: engine.CapabilityProfile{
-				KernelMajor: 6, KernelMinor: 1,
-				DeferTaskrun: true, SingleIssuer: true,
-				MultishotRecv: true, ProvidedBuffers: false,
-			},
-			want: engine.Epoll,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := chooseStartEngine(tt.profile); got != tt.want {
-				t.Errorf("chooseStartEngine = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestChooseStartEngineEnvOverride covers CELERIS_ADAPTIVE_START.
-func TestChooseStartEngineEnvOverride(t *testing.T) {
-	// An old-kernel profile that the capability rule would send to epoll.
-	oldKernel := engine.CapabilityProfile{KernelMajor: 5, KernelMinor: 15}
-	// A modern profile the rule would send to io_uring.
-	newKernel := engine.CapabilityProfile{KernelMajor: 7, KernelMinor: 0}
-
-	tests := []struct {
-		val     string
-		profile engine.CapabilityProfile
-		want    engine.EngineType
-	}{
-		{"iouring", oldKernel, engine.IOUring}, // force iouring on old kernel
-		{"epoll", newKernel, engine.Epoll},     // force epoll on new kernel
-		{"auto", oldKernel, engine.Epoll},      // auto -> rule
-		{"auto", newKernel, engine.IOUring},    // auto -> rule
-		{"garbage", newKernel, engine.IOUring}, // unknown -> falls back to rule
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.val, func(t *testing.T) {
-			t.Setenv("CELERIS_ADAPTIVE_START", tt.val)
-			if got := chooseStartEngine(tt.profile); got != tt.want {
-				t.Errorf("CELERIS_ADAPTIVE_START=%q chooseStartEngine = %v, want %v", tt.val, got, tt.want)
-			}
-		})
-	}
-}
+// chooseStartEngine + env-override + ioUringViable coverage now lives in
+// start_test.go (the policy was redesigned: default epoll, io_uring only on an
+// explicit high-concurrency hint with a viable kernel + memlock + non-h2c).
 
 // --- Part B: lazy standby build on first switch + reuse ------------------
 
