@@ -30,14 +30,37 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
-// connTableSize is the number of slots in the flat connection array, and
-// thus the HARD CAP on concurrent connections per worker: an accepted fd
-// >= connTableSize cannot be indexed into l.conns and is rejected (closed)
-// by acceptAll with an errCount bump + a rate-limited Warn. The kernel
-// hands out the lowest free fd, so this is reached only when a worker is
-// genuinely holding ~65 K live conns (plus the listen/epoll/event/timer
-// fds). Raise this if a single worker must sustain more.
-const connTableSize = 65536
+// connTableSize is the HARD CAP on slots in the flat connection array, and
+// thus on concurrent connections per worker: an accepted fd >= connTableSize
+// cannot be indexed into l.conns and is rejected (closed) by acceptAll with
+// an errCount bump + a rate-limited Warn. The kernel hands out the lowest
+// free fd, so this is reached only when a worker is genuinely holding ~65 K
+// live conns (plus the listen/epoll/event/timer fds). Raise this if a single
+// worker must sustain more.
+//
+// connTableInitSize is the slice's INITIAL length. The table previously
+// allocated all 65536 pointer slots (512 KiB) eagerly per worker even when a
+// worker only ever sees a handful of conns — pure peak-RSS overhead. It now
+// starts small and grows on demand (growConns) up to connTableSize as higher
+// fds arrive. The grow is power-of-two and rare (only on a new high-water
+// fd), so it never touches the steady hot path.
+const (
+	connTableSize     = 65536
+	connTableInitSize = 4096
+)
+
+// maxEpollEvents caps the per-worker epoll_wait events array independently of
+// resource.MaxEvents (8192). The array only needs to hold the max FDs that can
+// be simultaneously ready in one epoll_wait return; the documented bench grid
+// maxes at 1024 concurrent conns, so 2048 is comfortably above what a single
+// epoll_wait can usefully batch while shedding ~96 KiB of eager per-worker RSS
+// (8192→2048 × 16 B/event). MaxEvents is consumed ONLY here in the epoll
+// engine (verified across engines), so clamping locally leaves iouring and the
+// resource defaults untouched. A ready FD that doesn't fit one batch simply
+// surfaces on the next epoll_wait — edge-/level-triggered readiness is not
+// lost, only spread across an extra wait, which is irrelevant below the grid
+// ceiling.
+const maxEpollEvents = 2048
 
 // errPeerClosed is returned via H1State.OnError when the peer closes the
 // connection cleanly (read returns 0 bytes / EOF).
@@ -159,8 +182,8 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		listenFD:     -1,
 		eventFD:      -1,
 		timerFD:      -1,
-		events:       make([]unix.EpollEvent, resolved.MaxEvents),
-		conns:        make([]*connState, connTableSize),
+		events:       make([]unix.EpollEvent, min(resolved.MaxEvents, maxEpollEvents)),
+		conns:        make([]*connState, connTableInitSize),
 		liveConns:    make([]int, 0, 1024),
 		handler:      handler,
 		resolved:     resolved,
@@ -633,22 +656,30 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 			}
 		}
 
-		// Bounds check: reject FDs outside the flat conn array. An fd at or
-		// above the table cap cannot be indexed into l.conns, so it would
-		// be silently dropped (errCount++) and stay invisible. Latch a
-		// one-shot Warn so a worker that has saturated its 64 K conn table
-		// is diagnosable rather than just "connections vanishing".
-		if newFD < 0 || newFD >= len(l.conns) {
+		// Hard-cap check: reject FDs at or above the table's MAX size. An fd
+		// >= connTableSize can never be indexed into l.conns, so it would be
+		// silently dropped (errCount++) and stay invisible. Latch a one-shot
+		// Warn so a worker that has saturated its 64 K conn table is
+		// diagnosable rather than just "connections vanishing".
+		if newFD < 0 || newFD >= connTableSize {
 			_ = unix.Close(newFD)
 			l.errCount.Add(1)
 			l.fdCapDrops++
 			if !l.fdCapWarned && l.logger != nil {
 				l.fdCapWarned = true
 				l.logger.Warn("accepted fd exceeds conn table cap; dropping",
-					"loop", l.id, "fd", newFD, "cap", len(l.conns),
+					"loop", l.id, "fd", newFD, "cap", connTableSize,
 					"hint", "worker is at its per-worker connection limit (connTableSize)")
 			}
 			continue
+		}
+
+		// Grow-on-demand: the table starts at connTableInitSize and grows
+		// toward the connTableSize hard cap as higher fds arrive, so a worker
+		// that only ever sees a few conns never pays the full 512 KiB. Rare
+		// (only on a new high-water fd) and off the steady hot path.
+		if newFD >= len(l.conns) {
+			l.growConns(newFD)
 		}
 
 		_ = sockopts.ApplyFD(newFD, l.sockOpts)
@@ -703,6 +734,38 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 	// won't get a fresh readiness edge for them, so re-arm to drain the
 	// remainder on the next loop iteration (epoll_wait(0) via listenHot).
 	l.listenHot = true
+}
+
+// growConns enlarges l.conns so that index fd is in range, doubling the
+// length (power-of-two growth) until it covers fd, clamped to connTableSize.
+// Caller (acceptAll) has already verified 0 <= fd < connTableSize.
+//
+// RACE INVARIANT: l.conns slots and header are read on the worker goroutine
+// UNLOCKED (the hot path: drainRead, handleWritable, the run loop's flush
+// passes) — same-goroutine as this grow, so those never tear. The
+// cross-goroutine accessors are (1) RegisterConn (driver path) under
+// l.driverMu, reading `fd < len(l.conns) && l.conns[fd] != nil`, and (2)
+// hijackConn, which in async mode runs ON a dispatch goroutine and both reads
+// the header and nils l.conns[fd]. growConns therefore performs BOTH the
+// full-slot copy and the header swap under l.driverMu, and hijackConn takes
+// l.driverMu for its l.conns read + slot write — so the grow's copy never
+// reads a slot a hijack is concurrently niling, and no reader observes a torn
+// header (base + len). Allocation stays outside the lock to keep the critical
+// section to a copy + pointer store; growth is rare (only on a new high-water
+// fd), so the lock is well off the steady hot path.
+func (l *Loop) growConns(fd int) {
+	newLen := len(l.conns)
+	for newLen <= fd {
+		newLen *= 2
+	}
+	if newLen > connTableSize {
+		newLen = connTableSize
+	}
+	grown := make([]*connState, newLen)
+	l.driverMu.Lock()
+	copy(grown, l.conns)
+	l.conns = grown
+	l.driverMu.Unlock()
 }
 
 func (l *Loop) drainRead(fd int, now int64) {
@@ -1127,7 +1190,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 }
 
 func (l *Loop) hijackConn(fd int) (net.Conn, error) {
+	// l.conns access is guarded by driverMu: in async mode this runs on a
+	// dispatch goroutine, so the read of the header/slot must be serialized
+	// against growConns' concurrent copy + header swap (see growConns).
+	l.driverMu.Lock()
 	cs := l.conns[fd]
+	l.driverMu.Unlock()
 	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
@@ -1138,10 +1206,13 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// ProcessH1 → ErrHijacked). That's tolerable because the worker won't
 	// see another EPOLLIN for fd after EPOLL_CTL_DEL, and these l.* fields
 	// are only read by the worker between epoll_wait returns, never while a
-	// dispatch goroutine is mid-ProcessH1.
+	// dispatch goroutine is mid-ProcessH1. The l.conns[fd] slot write takes
+	// driverMu so it can't race growConns' copy.
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	l.removeLiveConn(cs)
+	l.driverMu.Lock()
 	l.conns[fd] = nil
+	l.driverMu.Unlock()
 	l.connCount--
 	l.activeConns.Add(-1)
 	l.closeCount.Add(1)
