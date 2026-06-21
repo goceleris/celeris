@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -302,10 +303,25 @@ func validSessionID(s string) bool {
 type Handler struct {
 	store store.KV
 	mw    celeris.HandlerFunc
+	wb    *writeBehindWriter // non-nil only when Config.WriteBehind is set
 }
 
 // Middleware returns the [celeris.HandlerFunc] to pass to server.Use().
 func (h *Handler) Middleware() celeris.HandlerFunc { return h.mw }
+
+// Close flushes any deferred write-behind session writes and stops the
+// background worker. When [Config].WriteBehind is false it is a no-op.
+//
+// Call this on graceful shutdown (e.g. from a server OnShutdown hook) to
+// guarantee no enqueued session write is lost: Close blocks until every
+// in-flight and queued store write has been applied. Safe to call multiple
+// times.
+func (h *Handler) Close() error {
+	if h.wb != nil {
+		return h.wb.Close()
+	}
+	return nil
+}
 
 // GetByID retrieves a session by its raw ID without an HTTP context.
 // This is intended for admin tools, background jobs, or WebSocket handlers
@@ -346,11 +362,16 @@ func NewHandler(config ...Config) *Handler {
 	cfg.validate()
 
 	h := &Handler{store: cfg.Store}
-	h.mw = newMiddleware(cfg)
+	h.mw, h.wb = newMiddleware(cfg)
 	return h
 }
 
 // New creates a session middleware with the given config.
+//
+// Note: when [Config].WriteBehind is enabled, prefer [NewWithCloser] or
+// [NewHandler] so you have a handle to flush deferred writes on shutdown.
+// New on its own gives no such handle; a graceful stop cannot drain the
+// write-behind queue and the final updates of in-flight requests may be lost.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
 	if len(config) > 0 {
@@ -358,10 +379,42 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 	cfg = applyDefaults(cfg)
 	cfg.validate()
-	return newMiddleware(cfg)
+	mw, _ := newMiddleware(cfg)
+	return mw
 }
 
-func newMiddleware(cfg Config) celeris.HandlerFunc {
+// NewWithCloser creates a session middleware and returns it together with an
+// [io.Closer] that flushes the write-behind queue on graceful shutdown.
+//
+// When [Config].WriteBehind is false the returned closer is a no-op, so it is
+// always safe to wire into a shutdown hook regardless of configuration:
+//
+//	mw, closer := session.NewWithCloser(session.Config{WriteBehind: true})
+//	server.Use(mw)
+//	defer closer.Close() // drains pending session writes, loses nothing
+func NewWithCloser(config ...Config) (celeris.HandlerFunc, io.Closer) {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
+	mw, wb := newMiddleware(cfg)
+	return mw, closerFunc(func() error {
+		if wb != nil {
+			return wb.Close()
+		}
+		return nil
+	})
+}
+
+// closerFunc adapts a func() error to io.Closer so NewWithCloser can return a
+// no-op closer when write-behind is disabled without allocating a struct.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
 	for _, p := range cfg.SkipPaths {
 		skipMap[p] = struct{}{}
@@ -395,7 +448,21 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 
 	kv := cfg.Store
 
-	return func(c *celeris.Context) error {
+	var wb *writeBehindWriter
+	if cfg.WriteBehind {
+		// onError surfaces deferred-write failures: the request goroutine has
+		// already returned, so the only path back to the application is the
+		// configured ErrorHandler (called with a nil Context — the request is
+		// gone). When no ErrorHandler is set, the failure is dropped, matching
+		// the "fire and forget" contract the flag opts into.
+		var onErr func(error)
+		if cfg.ErrorHandler != nil {
+			onErr = func(err error) { _ = cfg.ErrorHandler(nil, err) }
+		}
+		wb = newWriteBehindWriter(kv, onErr)
+	}
+
+	mw := func(c *celeris.Context) error {
 		if cfg.Skip != nil && cfg.Skip(c) {
 			return c.Next()
 		}
@@ -540,14 +607,26 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 				}
 				return errorHandler(c, encErr)
 			}
-			saveErr := kv.Set(reqCtx, sess.id, buf, expiry)
-			if saveErr != nil {
-				// Issue #11: wrap chainErr with save error so neither
-				// is swallowed.
-				if chainErr != nil {
-					return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", saveErr, chainErr))
+			if wb != nil {
+				// Write-behind path: buf is a fresh json.Marshal snapshot,
+				// independent of sess.data (which returnToPool recycles), so
+				// handing it to the background worker cannot race the next
+				// request's reuse of the pooled map. The store write is moved
+				// off the response critical path; the cookie is still emitted
+				// synchronously below so the client's next request carries the
+				// (already-snapshotted) session ID. sess.id is an immutable
+				// string for this request, also safe to capture by value.
+				wb.enqueue(sess.id, buf, expiry)
+			} else {
+				saveErr := kv.Set(reqCtx, sess.id, buf, expiry)
+				if saveErr != nil {
+					// Issue #11: wrap chainErr with save error so neither
+					// is swallowed.
+					if chainErr != nil {
+						return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", saveErr, chainErr))
+					}
+					return errorHandler(c, saveErr)
 				}
-				return errorHandler(c, saveErr)
 			}
 			if useCookieExtractor {
 				ck := cookie
@@ -563,4 +642,6 @@ func newMiddleware(cfg Config) celeris.HandlerFunc {
 
 		return chainErr
 	}
+
+	return mw, wb
 }

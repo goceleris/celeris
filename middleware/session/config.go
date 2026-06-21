@@ -122,6 +122,35 @@ type Config struct {
 	// ErrorHandler is called when a store operation fails. If nil, the error
 	// is returned up the middleware chain.
 	ErrorHandler func(c *celeris.Context, err error) error
+
+	// WriteBehind moves the post-handler session store write OFF the response
+	// critical path. Default: false (the store write completes before the
+	// response is sent, exactly as it does today).
+	//
+	// When true, the encoded session body is snapshotted and handed to a
+	// single bounded background worker, so the store.Set overlaps the next
+	// request instead of gating the current response. This closes the gap to
+	// write-behind competitors on session-heavy workloads.
+	//
+	// Durability tradeoff (opt-in for a reason): a response acknowledged to
+	// the client is no longer a guarantee the session is already durable in
+	// the store. An abrupt process death (SIGKILL, panic, power loss) between
+	// the response and the deferred write loses that one update. A graceful
+	// shutdown does NOT: closing the middleware ([Handler.Close], or the
+	// io.Closer returned by [NewWithCloser]) drains every in-flight and
+	// queued write before returning. Leave this false for flows where the
+	// next read after a write must observe it across a crash (e.g. financial
+	// state, anti-replay nonces); enable it for high-throughput,
+	// crash-tolerant session updates (last-seen, view counters, cart state).
+	//
+	// Concurrency is bounded: one worker goroutine, never a per-request
+	// goroutine fan-out, so a slow store applies backpressure rather than
+	// exploding goroutine count. Writes are serialized in enqueue order.
+	//
+	// WriteBehind has no effect on [Session.Destroy] (cookie/session removal
+	// stays synchronous) and is independent of the cookie write, which is
+	// always emitted on the response.
+	WriteBehind bool
 }
 
 // defaultCookieMaxAge is the default cookie Max-Age in seconds (24h).
