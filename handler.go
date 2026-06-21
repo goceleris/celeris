@@ -131,7 +131,28 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	c.handlers = handlers
 	c.fullPath = fullPath
 
-	if err := c.Next(); err != nil {
+	// celeris#356: an adaptive route (inherited the AsyncHandlers=true default)
+	// runs INLINE here until observed to block. Time this inline run; if the
+	// handler chain exceeds adaptivePromoteThreshold it is genuinely blocking,
+	// so promote the route to async dispatch — future requests then run on a
+	// goroutine instead of stalling the event-loop worker. Non-adaptive configs
+	// (no AsyncHandlers default) hit the empty-map fast path and skip timing.
+	rt := a.server.router
+	if rt.adaptiveRoutes[fullPath] && rt.adaptiveLearning(fullPath) {
+		start := time.Now()
+		err := c.Next()
+		dur := time.Since(start)
+		if dur > adaptiveBlockingThreshold {
+			// Unambiguously a blocking I/O round-trip: promote on the first such
+			// run rather than waiting for adaptivePromoteStreak slow runs.
+			rt.promoteRouteImmediate(fullPath)
+		} else {
+			rt.recordInlineRun(fullPath, dur > adaptivePromoteThreshold)
+		}
+		if err != nil {
+			a.handleError(c, s, err)
+		}
+	} else if err := c.Next(); err != nil {
 		a.handleError(c, s, err)
 	}
 	if c.buffered && !c.written {
@@ -140,6 +161,55 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	}
 	return nil
 }
+
+// adaptivePromoteThreshold is the inline handler duration that counts as a
+// "slow" run for adaptive promotion (celeris#356). A non-blocking handler —
+// even a heavy middleware chain — returns in tens of microseconds; a blocking
+// one (DB/cache round-trip) takes hundreds of µs to ms. The bar sits well above
+// the CPU-bound range so a transient GC/scheduling burst cannot push a
+// CPU-bound chain over it for adaptivePromoteStreak consecutive runs and
+// wrongly promote it to the slower async path — a 50µs bar did exactly that,
+// intermittently collapsing iouring-async chain-fullstack (celeris#364).
+// Genuinely-blocking routes are marked .Async() explicitly (opting out of
+// adaptive); auto-promotion is a safety net for an unmarked handler that blocks
+// on EVERY request.
+const adaptivePromoteThreshold = 300 * time.Microsecond
+
+// adaptiveBlockingThreshold is the inline duration that is UNAMBIGUOUSLY a
+// blocking I/O round-trip (not CPU work under contention). A single inline run
+// over this bar promotes the route IMMEDIATELY, skipping the
+// adaptivePromoteStreak hysteresis — a genuinely-blocking handler that an
+// operator forgot to mark .Async() then stalls a worker for at most one request
+// instead of adaptivePromoteStreak of them. The bar sits far above any CPU-bound
+// chain's wall-clock (even under GC/scheduling jitter), so it cannot misfire on
+// a CPU route; the 300µs/streak path still handles the borderline 300µs–2ms band.
+const adaptiveBlockingThreshold = 2 * time.Millisecond
+
+// adaptivePromoteStreak is how many CONSECUTIVE slow inline runs promote an
+// adaptive route to async. The consecutive requirement (a fast run resets the
+// streak) makes a one-off cold start / GC pause harmless, while a handler that
+// blocks on every request promotes within a handful of requests.
+const adaptivePromoteStreak = 8
+
+// adaptiveSettleStreak is how many CONSECUTIVE fast inline runs SETTLE an
+// adaptive route (celeris#361): proven non-blocking, it is removed from the
+// timed path so the hot loop stops paying two time.Now() vDSO calls per
+// request forever. High enough that only consistently-static routes settle (a
+// slow run resets the streak); at scale a static route settles in well under a
+// millisecond. A genuinely-blocking handler should be marked .Async() — it
+// promotes long before it could settle.
+const adaptiveSettleStreak = 256
+
+// adaptivePromoteTTL bounds how long a promotion lasts before the route is
+// re-evaluated inline (celeris#364). Promotion is otherwise terminal — a
+// promoted route runs async and is never re-timed — so a CPU-bound chain that
+// was falsely promoted by a transient load/jitter spike (inline wall-clock
+// crossing adaptivePromoteThreshold under worker contention, not actual
+// blocking) stayed on the ~32%-slower async path until restart. After the TTL
+// the route runs inline again and re-settles if fast, or re-promotes within
+// adaptivePromoteStreak runs if genuinely blocking. The clock is read only for
+// already-promoted routes, so the fast path is unaffected.
+const adaptivePromoteTTL = 5 * time.Second
 
 // recoverAndRelease handles panic recovery and context release. Extracted to a
 // separate noinline function so that HandleStream's stack frame is not inflated

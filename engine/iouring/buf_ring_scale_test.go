@@ -16,7 +16,7 @@ func TestResolveBufRingCountDefaults(t *testing.T) {
 		targetConns int
 		want        int
 	}{
-		// Formula: 2 * TargetConnsPerWorker, rounded up to a power of 2,
+		// Formula: 2 * connsPerWorker, rounded up to a power of 2,
 		// clamped to [bufRingCountMin=1024, bufRingCountMax]. The ring is
 		// PER-WORKER, so the result MUST NOT depend on Workers (celeris#322
 		// follow-up — the prior 2*Workers*target over-sized every worker's

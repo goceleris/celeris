@@ -71,17 +71,24 @@ const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (
 // the case for very-high-concurrency benchmarks (16k+ connections) where
 // each worker may have more in-flight multishot recvs than the formula
 // anticipates. Setting 0 (or leaving the env var unset) reverts to
-// auto-scaling from Workers × TargetConnsPerWorker.
+// auto-scaling from the per-worker conn target.
 const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
+
+// defaultConnsPerWorker is the per-worker connection target used to size
+// the provided-buffer ring. The ring is sized at 2 buffers per conn at
+// this target, giving comfortable headroom so the kernel rarely stalls
+// waiting for buffer returns. Operators override the resulting ring size
+// directly via CELERIS_IOURING_PBUF_COUNT.
+const defaultConnsPerWorker = 20
 
 // resolveBufRingCount picks the provided-buffer-ring size for a worker.
 // The default formula is `nextPowerOf2(max(bufRingCountMin, 2 *
-// TargetConnsPerWorker))`, i.e. two buffers per conn in the scaler's
-// steady-state target — enough headroom that the kernel rarely stalls
-// waiting for buffer returns. Above 1024 conns the previous hard-coded
-// 1024 was too small: buffers were reused aggressively, the kernel
-// stalled, and the very behaviour the ring is designed to optimise
-// (multishot recv CQE batching) collapsed into CQE storms (celeris#322).
+// connsPerWorker))`, i.e. two buffers per conn at the per-worker conn
+// target — enough headroom that the kernel rarely stalls waiting for
+// buffer returns. Above 1024 conns the previous hard-coded 1024 was too
+// small: buffers were reused aggressively, the kernel stalled, and the
+// very behaviour the ring is designed to optimise (multishot recv CQE
+// batching) collapsed into CQE storms (celeris#322).
 //
 // The ring is PER-WORKER: NewBufferRing is created once per Worker on its
 // own ring, so the scaling MUST be driven by the per-worker conn target,
@@ -90,7 +97,7 @@ const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 // mmap'd RSS per worker and risking the kernel cap on large boxes
 // (celeris#322 follow-up).
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
-func resolveBufRingCount(_ resource.ResolvedResources, scalerTargetConnsPerWorker int) int {
+func resolveBufRingCount(_ resource.ResolvedResources, connsPerWorker int) int {
 	if v := os.Getenv(envPbufCount); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			if n&(n-1) != 0 {
@@ -99,9 +106,9 @@ func resolveBufRingCount(_ resource.ResolvedResources, scalerTargetConnsPerWorke
 			return clampBufRingCount(n)
 		}
 	}
-	target := scalerTargetConnsPerWorker
+	target := connsPerWorker
 	if target <= 0 {
-		target = 20 // mirrors scaler.Resolve's default
+		target = defaultConnsPerWorker
 	}
 	scaled := 2 * target
 	if scaled < bufRingCountMin {
@@ -224,11 +231,6 @@ type Worker struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
-	// inactive is the per-worker pause flag used by the dynamic worker
-	// scaler. ORed with acceptPaused (which is engine-wide) when computing
-	// effective paused state. The scaler flips this to deactivate idle
-	// workers under low load and reactivate them under burst load.
-	inactive atomic.Bool
 	// listenFDClosed signals that the worker has cancelled in-flight
 	// accept SQEs and closed its listen FD in response to acceptPaused
 	// being set. PauseAccept polls this so it only returns once the
@@ -239,11 +241,17 @@ type Worker struct {
 	// RST as it pauses).
 	listenFDClosed atomic.Bool
 
-	reqCount      *atomic.Uint64
-	activeConns   *atomic.Int64
-	errCount      *atomic.Uint64
-	asyncPromoted *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
-	reqBatch      uint64         // batched request count, flushed to reqCount per iteration
+	reqCount          *atomic.Uint64
+	activeConns       *atomic.Int64
+	errCount          *atomic.Uint64
+	asyncPromoted     *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	acceptCount       *atomic.Uint64 // cumulative accepts (engine-wide, shared)
+	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
+	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
+	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
+	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
+	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -315,7 +323,8 @@ type Worker struct {
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	resolved resource.ResolvedResources,
 	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
-	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
+	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool,
+	acceptCount, closeCount, bytesRead, bytesWritten *atomic.Uint64) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
 	// Listen socket creation is deferred to run() (after CPU pinning and NUMA
 	// binding) so that the kernel allocates socket internal buffers on the
@@ -342,6 +351,10 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		activeConns:   activeConns,
 		errCount:      errCount,
 		asyncPromoted: asyncPromoted,
+		acceptCount:   acceptCount,
+		closeCount:    closeCount,
+		bytesRead:     bytesRead,
+		bytesWritten:  bytesWritten,
 		acceptPaused:  acceptPaused,
 		wake:          make(chan struct{}),
 		ready:         make(chan error, 1),
@@ -431,15 +444,11 @@ func (w *Worker) run(ctx context.Context) {
 	// The ring size scales with the worker's per-conn target (celeris#322):
 	// the previous hard-coded 1024 entries was undersized above ~1024 conns
 	// and produced CQE storms as the kernel stalled waiting for buffer
-	// returns. The formula gives 2 buffers per conn at the scaler's
-	// steady-state target — comfortable headroom without runaway RSS.
+	// returns. The formula gives 2 buffers per conn at the per-worker conn
+	// target — comfortable headroom without runaway RSS.
 	// CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled value.
 	if w.tier.SupportsMultishotRecv() && os.Getenv("CELERIS_IOURING_MULTISHOT_RECV") == "1" {
-		var targetConns int
-		if w.cfg.WorkerScaling != nil {
-			targetConns = w.cfg.WorkerScaling.TargetConnsPerWorker
-		}
-		bufRingCount := resolveBufRingCount(w.resolved, targetConns)
+		bufRingCount := resolveBufRingCount(w.resolved, defaultConnsPerWorker)
 		br, err := NewBufferRing(w.ring, bufRingGroupID, bufRingCount, w.resolved.BufferSize)
 		if err != nil {
 			w.logger.Warn("ring-mapped buffer registration failed, using per-connection buffers",
@@ -481,8 +490,7 @@ func (w *Worker) run(ctx context.Context) {
 		// Cache the atomic load: same value used by the two branches
 		// below and (further down) the SUSPENDED check. Saves 2 atomic
 		// loads per event-loop iteration on the steady-state hot path.
-		// OR with the per-worker inactive flag (dynamic scaler).
-		paused := w.acceptPaused.Load() || w.inactive.Load()
+		paused := w.acceptPaused.Load()
 		if w.listenFD >= 0 && paused {
 			if sqe := w.ring.GetSQE(); sqe != nil {
 				prepCancelFDSkipSuccess(sqe, w.listenFD)
@@ -674,6 +682,17 @@ func (w *Worker) run(ctx context.Context) {
 			w.reqBatch = 0
 		}
 
+		// Flush batched payload-byte counters with the same per-iteration
+		// cadence as reqCount, for the same cache-line-contention reason.
+		if w.bytesReadBatch > 0 {
+			w.bytesRead.Add(w.bytesReadBatch)
+			w.bytesReadBatch = 0
+		}
+		if w.bytesWrittenBatch > 0 {
+			w.bytesWritten.Add(w.bytesWrittenBatch)
+			w.bytesWrittenBatch = 0
+		}
+
 		// Single atomic publish for all batched buffer returns (P0).
 		if w.hasBufReturns {
 			w.bufRing.PublishBuffers()
@@ -782,7 +801,6 @@ func (w *Worker) run(ctx context.Context) {
 		// DRAINING → SUSPENDED: no listen socket, no connections, CQEs processed.
 		// Checked after CQE processing so accept CQEs for connections that
 		// completed before the listen socket close are served, not leaked.
-		// Combined paused: engine-wide OR per-worker (dynamic scaler).
 		//
 		// hasDriverConns gate: connCount only counts HTTP conns. An
 		// EventLoopProvider driver may still have live conns in
@@ -790,9 +808,9 @@ func (w *Worker) run(ctx context.Context) {
 		// park its event loop and starve those driver conns of CQE
 		// servicing. Stay active while any driver conn is registered (v1.5.0
 		// review 2.10).
-		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && (w.acceptPaused.Load() || w.inactive.Load()) {
+		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && w.acceptPaused.Load() {
 			w.wakeMu.Lock()
-			if !w.acceptPaused.Load() && !w.inactive.Load() {
+			if !w.acceptPaused.Load() {
 				w.wakeMu.Unlock()
 				continue
 			}
@@ -1184,6 +1202,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 	cs.writeFn = w.makeWriteFn(cs)
 	w.activeConns.Add(1)
+	w.acceptCount.Add(1)
 
 	if w.cfg.OnConnect != nil {
 		w.cfg.OnConnect(cs.remoteAddr)
@@ -1225,6 +1244,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	w.closeCount.Add(1)
 	// Cancel-then-release discipline, hijack variant: a single-shot
 	// recv SQE is virtually always still armed on cs.buf here. The fd
 	// lives on under the caller's net.Conn, so an uncancelled recv would
@@ -1424,7 +1444,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// process on the first /ws or /events request. The
 			// asyncPromoted gate restricts the Unlock to the dispatch-
 			// goroutine path that actually holds the lock. See celeris#309.
-			if w.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+			if w.async && cs.asyncPromoted.Load() && cs.detachMu != nil && !cs.asyncDetachUnlocked {
 				cs.asyncDetachUnlocked = true
 				cs.detachMu.Unlock()
 			}
@@ -1573,6 +1593,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	cs.lastActivity = now
+	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
+	// on this recv CQE, regardless of which buffer they landed in.
+	w.bytesReadBatch += uint64(c.Res)
 
 	// Direct-into-bodyBuf path: the previous recv SQE targeted
 	// H1State.bodyBuf (NextRecvBuf). The CQE's Res applies to bodyBuf,
@@ -1725,8 +1748,20 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// which point the conn is promoted and its stashed request handed to
 	// the goroutine. This lets sync routes run inline on the worker
 	// (no handoff) on a server that mixes sync + async handlers.
-	if w.async && cs.asyncPromoted && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+	asyncFeed := false
+	if w.async && cs.asyncPromoted.Load() && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
 		cs.asyncInMu.Lock()
+		// celeris#364: re-check under asyncInMu — the dispatch goroutine clears
+		// asyncPromoted (reverting the conn to inline) under this same lock. If
+		// it won the race, do NOT feed asyncInBuf (the goroutine is exiting);
+		// fall through to inline with the unconsumed `data` instead.
+		if cs.asyncPromoted.Load() {
+			asyncFeed = true
+		} else {
+			cs.asyncInMu.Unlock()
+		}
+	}
+	if asyncFeed {
 		// Backpressure: drop the conn if the dispatch goroutine is
 		// falling behind. Prevents a pipelining client from ballooning
 		// asyncInBuf without bound.
@@ -1793,7 +1828,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// hasn't been promoted yet, run ProcessH1 inline in InlineMode so it
 	// bails (ErrAsyncDispatch) when it hits an async route. The flag is
 	// set only around the ProcessH1 call(s) below.
-	tryInline := w.async && !cs.asyncPromoted && cs.h1State != nil &&
+	tryInline := w.async && !cs.asyncPromoted.Load() && cs.h1State != nil &&
 		(w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1)
 	// h1Only mode (Protocol=HTTP1 + EnableH2Upgrade=false): no atomic
 	// Load, no switch dispatch, no upgrade-handling block — ProcessH1
@@ -1891,7 +1926,15 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// goes straight to the dispatch path (asyncPromoted guard above).
 	if tryInline {
 		if errors.Is(processErr, conn.ErrAsyncDispatch) {
-			cs.asyncPromoted = true
+			// celeris#364: record the route that forced promotion (single-shot
+			// recv only — the revert path assumes the worker-owned cs.buf recv
+			// model). Set BEFORE asyncPromoted/goroutine start so the dispatch
+			// goroutine observes it (happens-before). Empty path => the
+			// goroutine treats the conn as not revert-eligible.
+			if w.bufRing == nil {
+				cs.promotedMethod, cs.promotedPath = cs.h1State.CurrentRoute()
+			}
+			cs.asyncPromoted.Store(true)
 			w.asyncPromoted.Add(1)
 			stashed := cs.h1State.TakeBufferedBytes()
 			// Flush any inline-handled response (pipelined sync request
@@ -1918,8 +1961,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// continuation runs on the dispatch goroutine — the partial-state
 		// parse paths must not run inline (only the fresh-parse site
 		// honors the async check).
-		if processErr == nil && cs.h1State.HasPendingData() {
-			cs.asyncPromoted = true
+		if processErr == nil && cs.h1State.HasPendingDispatchState() {
+			// No complete request parsed yet (buffered headers / chunked), so
+			// no route to record — leave promotedPath empty: not revert-eligible.
+			cs.asyncPromoted.Store(true)
 			w.asyncPromoted.Add(1)
 		}
 	}
@@ -2118,6 +2163,11 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 		}
 		return
 	}
+
+	// sent >= 0 here: payload bytes flushed by this send completion
+	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
+	// reach completeSend with the byte count).
+	w.bytesWrittenBatch += uint64(sent)
 
 	// Partial-send handling, split by whether we issued a plain SEND
 	// (sendBuf only) or a WRITEV (sendBuf + sendBody). Partial WRITEV
@@ -2470,6 +2520,7 @@ func (w *Worker) finishClose(fd int) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	w.closeCount.Add(1)
 
 	if w.cfg.OnDisconnect != nil && cs != nil {
 		w.cfg.OnDisconnect(cs.remoteAddr)
@@ -2570,6 +2621,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
+	w.closeCount.Add(1)
 
 	if w.cfg.OnDisconnect != nil {
 		w.cfg.OnDisconnect(cs.remoteAddr)
@@ -2688,6 +2740,21 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 	}
 }
 
+// canRevertToInline reports whether a promoted conn should be reverted to the
+// inline fast path (celeris#364). True when single-shot recv is in use, the
+// conn recorded the route that promoted it, and that route's promotion has
+// since expired (RouteAsync now false — the route-level TTL de-promotion).
+// Called by runAsyncHandler ONLY while holding asyncInMu with asyncInBuf empty.
+func (w *Worker) canRevertToInline(cs *connState) bool {
+	return w.bufRing == nil && cs.promotedPath != "" && cs.h1State != nil &&
+		cs.h1State.RouteAsync != nil &&
+		// Clean request boundary only: never revert mid-request (a partial body
+		// or buffered headers still accumulating), so h1State ownership flips
+		// back to the worker between requests, exactly like a fresh inline conn.
+		!cs.h1State.HasPendingData() &&
+		!cs.h1State.RouteAsync(cs.promotedMethod, cs.promotedPath)
+}
+
 func (w *Worker) runAsyncHandler(cs *connState) {
 	defer w.asyncWG.Done()
 	defer func() {
@@ -2720,6 +2787,19 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 	for {
 		cs.asyncInMu.Lock()
 		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
+			// celeris#364: revert this conn to inline when the route that
+			// promoted it has de-promoted (its TTL expired). Safe ONLY here:
+			// asyncInBuf is empty (no in-flight input, last response already
+			// written) and we hold asyncInMu, which the worker's feed path
+			// re-acquires and re-checks asyncPromoted against — so clearing it
+			// here cannot race a concurrent feed. The worker owns recv and
+			// resumes the inline fast path on the next CQE.
+			if w.canRevertToInline(cs) {
+				cs.asyncPromoted.Store(false)
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				return
+			}
 			cs.asyncCond.Wait()
 		}
 		if cs.asyncClosed.Load() {
@@ -3052,10 +3132,13 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 	// completed, so no kernel SQE still targets the old bodyBuf array. The
 	// body path below re-sets the pin when it arms into bodyBuf again.
 	cs.bodyRecvPin = nil
-	// Async mode: the dispatch goroutine owns h1State; the worker cannot
-	// safely observe NextRecvBuf without synchronization. Always use
-	// cs.buf so the goroutine handles body accumulation on its side.
-	if w.async || w.bufRing != nil || cs.h1State == nil {
+	// Async mode: only a PROMOTED conn hands h1State to the dispatch
+	// goroutine, which the worker cannot safely observe NextRecvBuf against.
+	// A non-promoted conn (celeris#356 inline-first) runs ProcessH1 on the
+	// worker itself (tryInline), so the worker owns h1State exactly as the
+	// sync path does and the zero-copy direct-into-bodyBuf recv is safe —
+	// gate the bail on cs.asyncPromoted, not blanket w.async.
+	if (w.async && cs.asyncPromoted.Load()) || w.bufRing != nil || cs.h1State == nil {
 		return cs.buf
 	}
 	if !w.h1Only && engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
@@ -3289,10 +3372,12 @@ func (w *Worker) flushSend(cs *connState) bool {
 }
 
 // prepSendSQE prepares a SEND or SEND_ZC SQE based on worker capabilities.
-// SEND_ZC is only used for unlinked sends (the notification CQE would break
-// the link chain). Linked sends always use regular SEND.
+// SEND_ZC is only used for unlinked sends at or above sendZCMinBytes (the
+// notification CQE would break the link chain, and on small payloads its extra
+// completion costs more than the avoided memcpy). Smaller and linked sends use
+// regular SEND.
 func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
-	if w.sendZC && !linked {
+	if useSendZC(w.sendZC, linked, len(cs.sendBuf)) {
 		if cs.fixedFile {
 			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
 		} else {
@@ -3303,6 +3388,13 @@ func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	} else {
 		prepSendPlain(sqe, cs.fd, cs.sendBuf, linked)
 	}
+}
+
+// useSendZC decides whether a send should use zero-copy. ZC is only viable for
+// unlinked sends whose payload is large enough that the saved memcpy outweighs
+// the extra NOTIF CQE (see sendZCMinBytes).
+func useSendZC(sendZC, linked bool, n int) bool {
+	return sendZC && !linked && n >= sendZCMinBytes
 }
 
 // flushSendLink is like flushSend but links a RECV SQE after the SEND using

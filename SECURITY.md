@@ -2,14 +2,58 @@
 
 ## Supported Versions
 
-| Version       | Supported |
-|---------------|-----------|
-| >= 1.4.0      | Yes       |
-| < 1.4.0       | No        |
+| Version  | Supported |
+|----------|-----------|
+| >= 1.5.0 | Yes       |
+| 1.4.x    | No        |
+| < 1.4.0  | No        |
 
-Security updates are issued only for the 1.4.x line. Earlier versions
-(1.3.x and below) no longer receive fixes, including critical ones —
-upgrade to the latest 1.4.x to remain covered.
+Security updates are issued only for the 1.5.x line. The 1.4.x line and
+earlier (1.3.x and below) no longer receive fixes, including critical
+ones — upgrade to the latest 1.5.x to remain covered.
+
+### v1.5.x Security Improvements
+
+The 1.5.x line is the core-engine performance milestone (io_uring / epoll /
+adaptive). Several of its changes are memory-safety or DoS-posture
+relevant:
+
+- **io_uring use-after-free hardening under churn**: the io_uring engine
+  serializes close behind in-flight completions (cancel-then-release) and
+  tags each completion's `user_data` with a 16-bit per-connection
+  generation counter. A stale CQE arriving after a socket's slot has been
+  recycled is now detected by the generation mismatch and dropped instead
+  of being misrouted to the new connection occupying that slot — closing a
+  gen-collision window that could cross-wire two connections' buffers or
+  corrupt the heap under sustained POST / connection-churn load.
+
+- **H1 parser request-smuggling hardening**: the H1 request parser was
+  hardened against request-smuggling vectors and RFC 9110/9112 framing
+  violations (conflicting / duplicate `Content-Length`, `Transfer-Encoding`
+  vs `Content-Length` ambiguity, malformed chunk framing), so a
+  front-end / back-end desync cannot be induced through celeris.
+
+- **Latent data-race / memory-safety fixes**: two races that are
+  memory-safety bugs under the Go memory model were closed — a
+  `Start` / `Shutdown` race on the server CPU monitor, and the epoll
+  async-detach path's `h1State.Detached` flag, now an `atomic.Bool`
+  published with a release barrier so a detaching connection cannot be
+  observed half-initialized by the engine loop.
+
+- **`middleware/secure` default hardening (behavior change)**:
+  `Cross-Origin-Embedder-Policy` (`require-corp`) and `X-Download-Options`
+  (`noopen`) are now **off by default** and opt-in, matching Helmet's
+  posture. The previous COEP default silently broke cross-origin resources
+  without a corresponding security win for most apps; set
+  `CrossOriginEmbedderPolicy: "require-corp"` (or `"credentialless"`)
+  explicitly where cross-origin isolation is required. The default
+  secure-header count drops from 11 to 9 — **audit your deployment if you
+  relied on the implicit COEP header**.
+
+- **Go toolchain bump (1.26.3 → 1.26.4)**: every `go.mod` in the repo
+  (and the loadgen sub-module) moves to `go 1.26.4` for the stdlib
+  security fixes in that patch release; CI pins the explicit patch version
+  so a stale runner cache cannot regress.
 
 ### v1.4.2 Security Improvements
 
@@ -164,7 +208,7 @@ posture is conservative:
 
 ## Historical (unsupported)
 
-Per-version security notes for the 1.3.x line and earlier are preserved in the git history of this file (`git log SECURITY.md`). Those releases no longer receive fixes — upgrade to the latest 1.4.x to remain covered.
+Per-version security notes for the 1.3.x line and earlier are preserved in the git history of this file (`git log SECURITY.md`). Those releases no longer receive fixes — upgrade to the latest 1.5.x to remain covered.
 
 ## Reporting a Vulnerability
 

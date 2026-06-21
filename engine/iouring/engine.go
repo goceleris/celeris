@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -36,6 +35,17 @@ type Engine struct {
 		// asyncPromoted counts the cumulative inline → dispatch-goroutine
 		// promotions across all workers (celeris #300).
 		asyncPromoted atomic.Uint64
+		// acceptCount / closeCount track cumulative connection lifecycle
+		// events; bytesRead / bytesWritten track cumulative payload bytes.
+		// All four feed the adaptive controller's load signals. Bytes are
+		// batched per-worker and flushed once per event-loop iteration
+		// (mirroring reqCount) to avoid hot-path cache-line bouncing;
+		// accepts/closes are infrequent so they increment directly like
+		// activeConns.
+		acceptCount  atomic.Uint64
+		closeCount   atomic.Uint64
+		bytesRead    atomic.Uint64
+		bytesWritten atomic.Uint64
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -235,16 +245,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 		)
 	}
 
-	// Dynamic worker scaler. Typed cfg.WorkerScaling takes precedence over
-	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
-	// higher-level scaler that delegates to the active sub-engine. The
-	// algorithm itself lives in engine/scaler; this is just the call site.
-	if !e.cfg.SkipBuiltinScaler {
-		if scalerCfg := scaler.Resolve(e.cfg, len(workers)); scalerCfg.Enabled {
-			go e.runScaler(innerCtx, scalerCfg, &e.metrics.activeConns)
-		}
-	}
-
 	<-ctx.Done()
 	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,
 	// so they will exit within ~100ms of context cancellation.
@@ -259,7 +259,9 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
-			&e.metrics.asyncPromoted, &e.acceptPaused)
+			&e.metrics.asyncPromoted, &e.acceptPaused,
+			&e.metrics.acceptCount, &e.metrics.closeCount,
+			&e.metrics.bytesRead, &e.metrics.bytesWritten)
 		if err != nil {
 			// Clean up already-created workers.
 			for _, prev := range workers[:i] {
@@ -314,6 +316,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ErrorCount:         e.metrics.errCount.Load(),
 		AsyncRoutes:        e.asyncRoutes,
 		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
+		Workers:            len(e.workers),
+		AcceptCount:        e.metrics.acceptCount.Load(),
+		CloseCount:         e.metrics.closeCount.Load(),
+		BytesRead:          e.metrics.bytesRead.Load(),
+		BytesWritten:       e.metrics.bytesWritten.Load(),
 	}
 }
 
@@ -388,7 +395,6 @@ var (
 	_ engine.Engine            = (*Engine)(nil)
 	_ engine.AcceptController  = (*Engine)(nil)
 	_ engine.EventLoopProvider = (*Engine)(nil)
-	_ engine.WorkerScaler      = (*Engine)(nil)
 )
 
 // NumWorkers returns the number of worker event loops available for

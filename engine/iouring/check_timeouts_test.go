@@ -65,6 +65,7 @@ func TestCheckTimeoutsSwapRemoveNoSkip(t *testing.T) {
 		liveConns:   make([]int, 0, n),
 		errCount:    &atomic.Uint64{},
 		activeConns: &atomic.Int64{},
+		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},
 	}
 	past := time.Now().Add(-time.Hour).UnixNano()

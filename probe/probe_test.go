@@ -314,34 +314,6 @@ func TestSQPollGateAtOptionalTier(t *testing.T) {
 	}
 }
 
-// TestCheckCapSysNiceIsSideEffectFree guards against a regression of the
-// dangerous Setpriority-based probe (finding 5.2): the real read-only
-// implementation must not change the process scheduling priority. We
-// snapshot the current nice value, run the check, and assert it is
-// unchanged. The boolean result itself is environment-dependent and not
-// asserted.
-func TestCheckCapSysNiceIsSideEffectFree(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("CAP_SYS_NICE check is linux-only")
-	}
-	sp := defaultProber()
-	if sp.CheckCapSysNice == nil {
-		t.Skip("no CheckCapSysNice on this platform")
-	}
-	before, err := getNice(t)
-	if err != nil {
-		t.Skipf("cannot read nice value: %v", err)
-	}
-	_ = sp.CheckCapSysNice() // result is environment-dependent; we test for side effects
-	after, err := getNice(t)
-	if err != nil {
-		t.Fatalf("cannot read nice value after check: %v", err)
-	}
-	if before != after {
-		t.Fatalf("CheckCapSysNice mutated process nice: before=%d after=%d", before, after)
-	}
-}
-
 // TestProbeSendfileAndZerocopy pins the sendfile / zerocopy capability
 // flags (celeris#317). Sendfile is unconditional on Linux (kernel
 // 2.6.23+, every distro past 2.6.33) and is now actually wired into the

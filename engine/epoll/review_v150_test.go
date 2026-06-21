@@ -80,11 +80,15 @@ func TestCheckTimeoutsClosesAllExpired(t *testing.T) {
 	t.Cleanup(func() { _ = unix.Close(epfd) })
 
 	l := &Loop{
-		epollFD:     epfd,
-		conns:       make([]*connState, 1024),
-		liveConns:   make([]int, 0, 8),
-		activeConns: &atomic.Int64{},
-		cfg:         resource.Config{IdleTimeout: time.Second},
+		epollFD:      epfd,
+		conns:        make([]*connState, 1024),
+		liveConns:    make([]int, 0, 8),
+		activeConns:  &atomic.Int64{},
+		closeCount:   &atomic.Uint64{},
+		acceptCount:  &atomic.Uint64{},
+		bytesRead:    &atomic.Uint64{},
+		bytesWritten: &atomic.Uint64{},
+		cfg:          resource.Config{IdleTimeout: time.Second},
 	}
 	past := time.Now().Add(-time.Hour).UnixNano()
 
@@ -168,17 +172,21 @@ func TestAcceptAllDrainsBacklogNoStrand(t *testing.T) {
 	}
 
 	l := &Loop{
-		epollFD:     epfd,
-		listenFD:    lfd,
-		conns:       make([]*connState, connTableSize),
-		liveConns:   make([]int, 0, 256),
-		activeConns: &atomic.Int64{},
-		errCount:    &atomic.Uint64{},
-		reqCount:    &atomic.Uint64{},
-		eventFD:     -1,
-		timerFD:     -1,
-		resolved:    resource.ResolvedResources{BufferSize: 8192},
-		cfg:         resource.Config{},
+		epollFD:      epfd,
+		listenFD:     lfd,
+		conns:        make([]*connState, connTableSize),
+		liveConns:    make([]int, 0, 256),
+		activeConns:  &atomic.Int64{},
+		errCount:     &atomic.Uint64{},
+		reqCount:     &atomic.Uint64{},
+		acceptCount:  &atomic.Uint64{},
+		closeCount:   &atomic.Uint64{},
+		bytesRead:    &atomic.Uint64{},
+		bytesWritten: &atomic.Uint64{},
+		eventFD:      -1,
+		timerFD:      -1,
+		resolved:     resource.ResolvedResources{BufferSize: 8192},
+		cfg:          resource.Config{},
 	}
 
 	const want = 200
@@ -261,12 +269,16 @@ func TestHijackDefersReleaseWhileAsyncGoroutineActive(t *testing.T) {
 	}
 
 	l := &Loop{
-		epollFD:     epfd,
-		conns:       make([]*connState, connTableSize),
-		liveConns:   make([]int, 0, 8),
-		activeConns: &atomic.Int64{},
-		eventFD:     -1,
-		cfg:         resource.Config{},
+		epollFD:      epfd,
+		conns:        make([]*connState, connTableSize),
+		liveConns:    make([]int, 0, 8),
+		activeConns:  &atomic.Int64{},
+		closeCount:   &atomic.Uint64{},
+		acceptCount:  &atomic.Uint64{},
+		bytesRead:    &atomic.Uint64{},
+		bytesWritten: &atomic.Uint64{},
+		eventFD:      -1,
+		cfg:          resource.Config{},
 	}
 
 	// Async-mode conn: detachMu set, dispatch goroutine "alive" (asyncRun).
@@ -345,12 +357,16 @@ func TestHijackSyncReleasesImmediately(t *testing.T) {
 	}
 
 	l := &Loop{
-		epollFD:     epfd,
-		conns:       make([]*connState, connTableSize),
-		liveConns:   make([]int, 0, 8),
-		activeConns: &atomic.Int64{},
-		eventFD:     -1,
-		cfg:         resource.Config{},
+		epollFD:      epfd,
+		conns:        make([]*connState, connTableSize),
+		liveConns:    make([]int, 0, 8),
+		activeConns:  &atomic.Int64{},
+		closeCount:   &atomic.Uint64{},
+		acceptCount:  &atomic.Uint64{},
+		bytesRead:    &atomic.Uint64{},
+		bytesWritten: &atomic.Uint64{},
+		eventFD:      -1,
+		cfg:          resource.Config{},
 	}
 	// Sync mode: detachMu nil, no dispatch goroutine.
 	cs := &connState{fd: local, liveIdx: -1}

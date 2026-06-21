@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/andybalholm/brotli v1.2.1
-	github.com/goceleris/celeris v1.4.4
+	github.com/goceleris/celeris v1.5.3
 	github.com/klauspost/compress v1.18.6
 )
 

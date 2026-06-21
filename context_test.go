@@ -249,6 +249,73 @@ func TestContextResetWithOverflowedRespHeaders(t *testing.T) {
 	}
 }
 
+// TestContextRespHeaderOverflowReuseZeroAlloc locks in celeris#360: once a
+// middleware stack pushes respHeaders past the inline 16-slot respHdrBuf, the
+// grown heap backing array is retained as respHdrScratch and reused on every
+// subsequent request — so a >16-header route allocates the backing array ONCE
+// per pooled Context, not once per request (chain-fullstack: 17 headers).
+func TestContextRespHeaderOverflowReuseZeroAlloc(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	// 17 clean lowercase headers > respHdrBuf's 16 slots → forces the heap path.
+	hdrs := [][2]string{
+		{"h00", "v"}, {"h01", "v"}, {"h02", "v"}, {"h03", "v"}, {"h04", "v"},
+		{"h05", "v"}, {"h06", "v"}, {"h07", "v"}, {"h08", "v"}, {"h09", "v"},
+		{"h10", "v"}, {"h11", "v"}, {"h12", "v"}, {"h13", "v"}, {"h14", "v"},
+		{"h15", "v"}, {"h16", "v"},
+	}
+	avg := testing.AllocsPerRun(500, func() {
+		for _, h := range hdrs {
+			c.SetHeader(h[0], h[1])
+		}
+		c.reset()
+	})
+	if avg != 0 {
+		t.Fatalf("overflowed respHeaders must reuse the scratch backing array: got %.2f allocs/op, want 0", avg)
+	}
+	if cap(c.respHdrScratch) < len(hdrs) {
+		t.Fatalf("respHdrScratch should retain a >=%d cap backing array, got cap=%d", len(hdrs), cap(c.respHdrScratch))
+	}
+}
+
+// nopRW is a no-op ResponseWriter so an alloc test can isolate the Context path
+// from the mock writer's own header/body copies.
+type nopRW struct{}
+
+func (nopRW) WriteResponse(_ *stream.Stream, _ int, _ [][2]string, _ []byte) error { return nil }
+
+// TestContextBlobManyHeadersZeroAlloc locks in the chain-fullstack fix: when a
+// response carries more than the inline-buffer's headers (15 user + content-type
+// + content-length = 17 > 16), Blob must reuse blobHdrScratch instead of
+// allocating make([][2]string,0,total) every request — that was the dominant
+// per-request allocation (≈77% of chain-fullstack allocs → GC pressure).
+func TestContextBlobManyHeadersZeroAlloc(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+	s.ResponseWriter = nopRW{} // the default mock writer allocates; isolate Blob
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	// 15 user headers ⇒ total 17 > respHdrBuf's 16 ⇒ Blob's many-header path.
+	for i := 0; i < 15; i++ {
+		c.SetHeader("h"+strconv.Itoa(i), "v")
+	}
+	body := []byte("hello")
+	avg := testing.AllocsPerRun(500, func() {
+		c.written = false
+		_ = c.Blob(200, "application/json", body)
+	})
+	if avg != 0 {
+		t.Fatalf("Blob many-header path must reuse blobHdrScratch: got %.2f allocs/op, want 0", avg)
+	}
+	if cap(c.blobHdrScratch) < 17 {
+		t.Fatalf("blobHdrScratch should retain a >=17 cap backing array, got cap=%d", cap(c.blobHdrScratch))
+	}
+}
+
 func TestContextFullPathResetOnRelease(t *testing.T) {
 	s, _ := newTestStream("GET", "/test")
 	defer s.Release()

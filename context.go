@@ -168,6 +168,19 @@ type Context struct {
 	hostOverride     string
 
 	respHdrBuf [16][2]string // reusable buffer for response headers (avoids heap escape)
+	// respHdrScratch retains the heap backing array the moment a middleware
+	// stack pushes respHeaders past respHdrBuf's 16 slots (e.g. chain-fullstack:
+	// 15 user headers + content-type + content-length = 17). Reused across
+	// requests so a >16-header route reallocates once per pooled Context, not
+	// once per request. nil until the first overflow.
+	respHdrScratch [][2]string
+	// blobHdrScratch is the reused assembly buffer for Blob's response header
+	// list (content-type + content-length + user headers) when the total exceeds
+	// respHdrBuf's 16 slots. Without it, Blob allocates make([][2]string,0,total)
+	// on EVERY many-header response (chain-fullstack: 18 headers ⇒ the dominant
+	// per-request alloc + GC pressure). Reused so it reallocates once per pooled
+	// Context, not once per request. nil until the first many-header Blob.
+	blobHdrScratch [][2]string
 
 	trustedNets []*net.IPNet
 
@@ -545,26 +558,27 @@ func (c *Context) reset() {
 	c.fullPath = ""
 	c.statusCode = 200
 	if n := len(c.respHeaders); n > 0 {
-		// respHeaders shares the respHdrBuf backing array up to its
-		// fixed capacity (16). Middleware stacks that emit more than 16
-		// response headers (kitchen_sink with secure + cache + ratelimit
-		// + etag etc. easily exceeds it) trigger append() to allocate a
-		// new backing array — respHeaders now has > 16 entries but
-		// respHdrBuf is still just 16. Without this clamp,
-		// `clear(c.respHdrBuf[:n])` panics with "slice bounds out of
-		// range [:N] with length 16" — the panic propagates through
-		// recoverAndRelease and aborts the iouring/epoll async handler
-		// AFTER WriteResponse has queued bytes into the per-conn
-		// writeBuf but BEFORE flushSend pushes them to the socket, so
-		// the client sees an empty response. std-engine escapes the
-		// damage because Go's net/http writes the response inline
-		// before the cleanup panic.
-		if n > len(c.respHdrBuf) {
-			n = len(c.respHdrBuf)
+		// When a middleware stack emits >16 response headers (secure + cache
+		// + ratelimit + etag + ... easily exceeds it), append() has moved
+		// respHeaders onto a heap backing array. Retain it as respHdrScratch
+		// and reuse it next request rather than dropping it (which forced a
+		// fresh ~576B alloc on every header-heavy request). The cap check is
+		// the correct discriminator: cap<=16 means respHeaders is still the
+		// inline respHdrBuf, so clear only its used prefix; cap>16 means a
+		// heap array, clear its full length. (This also removes the old clamp
+		// that papered over a clear(respHdrBuf[:n>16]) bounds panic.)
+		if cap(c.respHeaders) > len(c.respHdrBuf) {
+			clear(c.respHeaders)
+			c.respHdrScratch = c.respHeaders
+		} else {
+			clear(c.respHdrBuf[:n])
 		}
-		clear(c.respHdrBuf[:n])
 	}
-	c.respHeaders = c.respHdrBuf[:0]
+	if c.respHdrScratch != nil {
+		c.respHeaders = c.respHdrScratch[:0]
+	} else {
+		c.respHeaders = c.respHdrBuf[:0]
+	}
 	c.written = false
 	c.aborted = false
 	c.bytesWritten = 0

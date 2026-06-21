@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/scaler"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -34,6 +33,17 @@ type Engine struct {
 		// asyncPromoted counts inline → dispatch-goroutine promotions
 		// across all loops (celeris #300).
 		asyncPromoted atomic.Uint64
+		// acceptCount / closeCount track cumulative connection lifecycle
+		// events; bytesRead / bytesWritten track cumulative payload bytes.
+		// All four feed the adaptive controller's load signals. Bytes are
+		// batched per-loop and flushed once per event-loop iteration
+		// (mirroring reqCount) to avoid hot-path cache-line bouncing;
+		// accepts/closes are infrequent so they increment directly like
+		// activeConns.
+		acceptCount  atomic.Uint64
+		closeCount   atomic.Uint64
+		bytesRead    atomic.Uint64
+		bytesWritten atomic.Uint64
 	}
 	// asyncRoutes is the static AsyncRoutes count snapshotted at
 	// construction from the handler's AsyncRouteCount (#300 G3).
@@ -91,7 +101,9 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l := newLoop(i, cpus[i], e.handler,
 			resolved, e.cfg,
 			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
-			&e.metrics.asyncPromoted, &e.acceptPaused)
+			&e.metrics.asyncPromoted, &e.acceptPaused,
+			&e.metrics.acceptCount, &e.metrics.closeCount,
+			&e.metrics.bytesRead, &e.metrics.bytesWritten)
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -124,16 +136,6 @@ func (e *Engine) Listen(ctx context.Context) error {
 		e.cfg.Logger.Info(
 			"AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker",
 		)
-	}
-
-	// Dynamic loop scaler. Typed cfg.WorkerScaling takes precedence over
-	// env vars. Suppressed when wrapped by adaptive — adaptive runs ONE
-	// higher-level scaler that delegates to the active sub-engine. The
-	// algorithm itself lives in engine/scaler.
-	if !e.cfg.SkipBuiltinScaler {
-		if scalerCfg := scaler.Resolve(e.cfg, len(e.loops)); scalerCfg.Enabled {
-			go e.runScaler(innerCtx, scalerCfg, &e.metrics.activeConns)
-		}
 	}
 
 	<-ctx.Done()
@@ -176,6 +178,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ErrorCount:         e.metrics.errCount.Load(),
 		AsyncRoutes:        e.asyncRoutes,
 		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
+		Workers:            len(e.loops),
+		AcceptCount:        e.metrics.acceptCount.Load(),
+		CloseCount:         e.metrics.closeCount.Load(),
+		BytesRead:          e.metrics.bytesRead.Load(),
+		BytesWritten:       e.metrics.bytesWritten.Load(),
 	}
 }
 
@@ -250,7 +257,6 @@ func (e *Engine) ResumeAccept() error {
 var (
 	_ engine.Engine           = (*Engine)(nil)
 	_ engine.AcceptController = (*Engine)(nil)
-	_ engine.WorkerScaler     = (*Engine)(nil)
 )
 
 // Addr returns the bound listener address.

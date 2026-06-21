@@ -86,15 +86,12 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 		return 0, nil
 	}
 
-	remaining := p.buf[p.pos:]
-	// Quick check: if remaining starts with \r\n, headers are empty (no headers).
-	// Otherwise use SIMD-accelerated findHeaderEnd to verify \r\n\r\n is present.
-	if len(remaining) < 2 || remaining[0] != '\r' || remaining[1] != '\n' {
-		if findHeaderEnd(remaining) < 0 {
-			return 0, nil
-		}
-	}
-
+	// No upfront whole-block findHeaderEnd scan: parseHeaders detects an
+	// incomplete block itself (a final line with no CRLF yields lineEnd==-1 →
+	// (false,nil)), and every caller Reset()s parser+req before re-parsing, so
+	// a partial parse is always retried cleanly. Scanning here first would
+	// CRLF-walk the same bytes parseHeaders walks again — pure double work on
+	// the common single-read request.
 	if p.noStringHeaders {
 		req.Headers = req.Headers[:0]
 	} else {

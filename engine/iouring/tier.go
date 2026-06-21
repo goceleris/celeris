@@ -24,9 +24,9 @@ type TierStrategy interface {
 }
 
 // SelectTier returns the highest available tier strategy for the given profile.
-// sqPollIdle is the objective-specific SQPOLL thread idle timeout; if zero,
-// defaults to 2000ms.
-func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) TierStrategy {
+// The sqPollIdle parameter is retained for signature stability but no longer
+// used: SQPOLL is not selected by any tier (see optionalTier doc / #377).
+func SelectTier(profile engine.CapabilityProfile, _ time.Duration) TierStrategy {
 	switch {
 	// DEFER_TASKRUN: completions run in worker's context (no extra kernel thread).
 	// Preferred over SQPOLL because the SQPOLL kernel thread steals CPU from workers.
@@ -40,12 +40,7 @@ func SelectTier(profile engine.CapabilityProfile, sqPollIdle time.Duration) Tier
 			multishotRecv:   profile.MultishotRecv,
 		}
 	case profile.IOUringTier >= engine.Optional && profile.SQPoll:
-		idle := uint32(sqPollIdle.Milliseconds())
-		if idle == 0 {
-			idle = 2000
-		}
 		return &optionalTier{
-			sqPollIdle:      idle,
 			deferTaskrun:    profile.DeferTaskrun,
 			fixedFiles:      profile.FixedFiles,
 			sendZC:          profile.SendZC,
@@ -156,7 +151,7 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	if sqe == nil {
 		return
 	}
-	if t.sendZC && !linked {
+	if useSendZC(t.sendZC, linked, len(buf)) {
 		if t.fixedFiles {
 			prepSendZCFixed(sqe, fd, buf, false)
 		} else {
@@ -171,9 +166,18 @@ func (t *highTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) {
 	setSQEUserData(sqe, encodeUserData(udSend, fd))
 }
 
-// optionalTier: kernel 6.0+, adds SQPOLL, SEND_ZC. With 6.1+: DEFER_TASKRUN, fixed files.
+// optionalTier: kernel 6.0+ with provided buffers but below the High tier
+// (e.g. a 6.x kernel where the provided-buffers probe disabled the High path).
+// Uses the task-run completion model, NOT SQPOLL.
+//
+// SQPOLL is deliberately never used here: celeris runs one io_uring ring per
+// worker, so SQPOLL would spawn one kernel poll thread PER worker (N spinning
+// cores — measured -83% throughput / 75% idle CPU on a 16-worker box), and the
+// dormant SQPOLL submit path has a latent SQ-tail-publish race in GetSQE
+// (the shared tail is advanced before the SQE payload is written, which is
+// safe only because io_uring_enter is the sync point on the non-SQPOLL path).
+// See #377. SQPollIdle returns 0 so the worker never enters the SQPOLL branch.
 type optionalTier struct {
-	sqPollIdle      uint32
 	deferTaskrun    bool
 	fixedFiles      bool
 	sendZC          bool
@@ -183,16 +187,20 @@ type optionalTier struct {
 
 func (t *optionalTier) Tier() engine.Tier { return engine.Optional }
 func (t *optionalTier) SetupFlags() uint32 {
-	// SQPOLL is incompatible with both DEFER_TASKRUN and COOP_TASKRUN.
-	// SINGLE_ISSUER is compatible and enables SQ head optimization.
-	return setupSQPoll | setupSingleIssuer
+	// Mirror highTier: task-run completions in the worker's own context, no
+	// extra kernel thread. (Was setupSQPoll|setupSingleIssuer — see the type
+	// doc and #377 for why SQPOLL is not used.)
+	if t.deferTaskrun {
+		return setupDeferTaskrun | setupSingleIssuer
+	}
+	return setupCoopTaskrun | setupSingleIssuer
 }
 func (t *optionalTier) SupportsProvidedBuffers() bool { return true }
 func (t *optionalTier) SupportsMultishotAccept() bool { return t.multishotAccept }
 func (t *optionalTier) SupportsMultishotRecv() bool   { return t.multishotRecv }
 func (t *optionalTier) SupportsFixedFiles() bool      { return t.fixedFiles }
 func (t *optionalTier) SupportsSendZC() bool          { return t.sendZC }
-func (t *optionalTier) SQPollIdle() uint32            { return t.sqPollIdle }
+func (t *optionalTier) SQPollIdle() uint32            { return 0 } // SQPOLL disabled — see type doc / #377
 
 func (t *optionalTier) PrepareAccept(ring *Ring, listenFD int) {
 	sqe := ring.GetSQE()
@@ -224,7 +232,7 @@ func (t *optionalTier) PrepareSend(ring *Ring, fd int, buf []byte, linked bool) 
 	if sqe == nil {
 		return
 	}
-	if t.sendZC && !linked {
+	if useSendZC(t.sendZC, linked, len(buf)) {
 		// SEND_ZC cannot be linked (the notification CQE would break
 		// the link chain), so fall back to regular SEND for linked ops.
 		if t.fixedFiles {

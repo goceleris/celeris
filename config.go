@@ -40,6 +40,25 @@ const (
 // String returns the engine type name.
 func (t EngineType) String() string { return engine.EngineType(t).String() }
 
+// WorkloadHint is an OPTIONAL declaration of expected steady-state concurrency,
+// used only by the Adaptive engine's start-engine decision. Because connections
+// cannot migrate between epoll and io_uring, the START engine decides keep-alive
+// throughput — and the concurrency is unknowable when the server binds. This
+// hint is the ONLY way to make Adaptive START on io_uring; without it Adaptive
+// starts on epoll (best for the ramp-from-zero / low-concurrency / latency case)
+// and promotes new connections to io_uring under sustained high load.
+type WorkloadHint resource.WorkloadHint
+
+const (
+	// WorkloadUnspecified (default) → start epoll, promote under load.
+	WorkloadUnspecified WorkloadHint = WorkloadHint(resource.WorkloadUnspecified)
+	// WorkloadLowConcurrency → thin/latency-sensitive traffic; stay epoll.
+	WorkloadLowConcurrency WorkloadHint = WorkloadHint(resource.WorkloadLowConcurrency)
+	// WorkloadHighConcurrency → many h1 keep-alive conns/worker; start io_uring
+	// (when the kernel and RLIMIT_MEMLOCK allow it).
+	WorkloadHighConcurrency WorkloadHint = WorkloadHint(resource.WorkloadHighConcurrency)
+)
+
 // Config holds the public server configuration.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
@@ -51,6 +70,12 @@ type Config struct {
 
 	// Workers is the number of I/O worker goroutines (default GOMAXPROCS).
 	Workers int
+
+	// WorkloadHint optionally declares the expected steady-state concurrency.
+	// It only affects the Adaptive engine's start-engine choice (see WorkloadHint):
+	// the zero value starts on epoll; WorkloadHighConcurrency starts on io_uring
+	// when the kernel + memlock allow.
+	WorkloadHint WorkloadHint
 
 	// ReadTimeout is the max duration for reading the entire request.
 	// Zero uses the default (60s). Set to -1 for no timeout.
@@ -133,13 +158,20 @@ type Config struct {
 	// groups can override it per handler with [Route.Async] /
 	// [RouteGroup.Async] (most-specific wins: route > group > this
 	// default), so a server with mostly CPU routes + a few DB routes can
-	// keep this false and mark just the DB routes .Async(), or set this
-	// true and mark hot CPU routes .Async(false). On HTTP/2 the override
-	// is honored per-stream (sync routes run inline on the event loop,
-	// async routes dispatch to the worker pool). Note: celeris drivers
-	// opened WithEngine(srv) consult the server-level AsyncHandlers (not
-	// per-route overrides) for their auto-async path selection — set this
-	// true when using WithEngine drivers under per-route async.
+	// keep this false and mark just the DB routes .Async() / .UsesDriver(),
+	// or set this true and mark hot CPU routes .Async(false). On HTTP/2 the
+	// override is honored per-stream (sync routes run inline on the event
+	// loop, async routes dispatch to the worker pool).
+	//
+	// DRIVERS: celeris drivers opened WithEngine(srv) pick their netpoll-park
+	// fast path from the server's EFFECTIVE async state — true when this flag
+	// is set OR any route is .Async(). So "keep this false + mark DB routes
+	// .Async()/.UsesDriver()" selects the fast driver path too, PROVIDED the
+	// driver is opened AFTER those routes are registered (the effective state
+	// is read at driver construction); otherwise set this true. Setting this
+	// true also enables the adaptive safety net that auto-promotes any unmarked
+	// handler slower than ~300µs, at a small learning-phase cost that settles to
+	// zero for static routes.
 	//
 	// Default: false.
 	AsyncHandlers bool
@@ -177,34 +209,6 @@ type Config struct {
 	//   - non-nil false: force disabled, even on Protocol=Auto. Useful when
 	//     the engine intentionally only serves HTTP/1.
 	EnableH2Upgrade *bool
-
-	// WorkerScaling configures the dynamic worker scaler. As of v1.4.6
-	// the scaler is DEFAULT-ON — leaving this field nil resolves to a
-	// zero-value [resource.WorkerScalingConfig], which activates the
-	// scaler with the data-validated defaults (Strategy=StartHigh,
-	// MinActive=max(2, NumCPU/2), TargetConnsPerWorker=20,
-	// Interval=250ms, ScaleUpStep=2, ScaleDownStep=1,
-	// ScaleDownHysteresis=1, ScaleDownIdleTicks=4). This matches the
-	// "just-works" public design intent already in place for the
-	// Engine=Adaptive and Protocol=Auto defaults.
-	//
-	// Pre-v1.4.6 behaviour (scaler always disabled unless explicitly
-	// configured) is achievable by passing a non-nil struct that
-	// effectively makes the scaler a no-op:
-	//
-	//	WorkerScaling: &resource.WorkerScalingConfig{
-	//	    MinActive: runtime.GOMAXPROCS(0), // pin at NumCPU; never scale down
-	//	}
-	//
-	// Set to a non-nil pointer with custom values to override one or
-	// more defaults. See [resource.WorkerScalingConfig] for tuning.
-	// The scaler keeps connections-per-active-worker around the target
-	// ratio by pausing/resuming workers; this dramatically improves
-	// CQE/event batching at low/mid concurrency where the static
-	// numCPU default would otherwise lose 30-90 % CPU/req to under-
-	// batched syscalls. See PR #257 / issue #281 for the full
-	// rationale and benchmark data.
-	WorkerScaling *resource.WorkerScalingConfig
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
@@ -250,23 +254,13 @@ func (c Config) toResourceConfig() resource.Config {
 	if c.MaxConns > 0 {
 		rc.Resources.MaxConns = c.MaxConns
 	}
+	rc.Resources.WorkloadHint = resource.WorkloadHint(c.WorkloadHint)
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize
 	rc.AsyncHandlers = c.AsyncHandlers
 	rc.OnExpectContinue = c.OnExpectContinue
 	rc.OnConnect = c.OnConnect
 	rc.OnDisconnect = c.OnDisconnect
-	// Dynamic worker scaler default-on (issue #281). A nil
-	// WorkerScaling field — i.e. the user did not configure it — now
-	// resolves to a zero-value struct so the scaler activates with
-	// the data-validated defaults. Opt-out is documented as setting
-	// MinActive=NumCPU (no-op scaler), which preserves backward
-	// compatibility for users who really do want pre-v1.4.6 behaviour.
-	if c.WorkerScaling != nil {
-		rc.WorkerScaling = c.WorkerScaling
-	} else {
-		rc.WorkerScaling = &resource.WorkerScalingConfig{}
-	}
 
 	// h2c upgrade resolution. Nil → protocol-dependent default (Auto → true,
 	// HTTP1/H2C → false). Non-nil → user override honored verbatim.

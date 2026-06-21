@@ -43,24 +43,6 @@ type SwitchFreezer interface {
 	UnfreezeSwitching()
 }
 
-// WorkerScaler is implemented by engines that support per-worker pause/resume
-// for dynamic capacity adjustment based on load. Used by the higher-level
-// scaler in the adaptive engine to delegate worker activation to whichever
-// sub-engine is currently active. Per-worker pause is asynchronous — the
-// worker drains in-flight connections before going SUSPENDED. Resume wakes a
-// suspended worker so it re-creates its listen socket and rejoins the
-// SO_REUSEPORT group.
-type WorkerScaler interface {
-	// NumWorkers returns the total worker pool size (max active count).
-	NumWorkers() int
-	// PauseWorker deactivates worker i. Asynchronous; returns immediately.
-	// Idempotent — pausing an already-paused worker is a no-op.
-	PauseWorker(i int)
-	// ResumeWorker reactivates worker i. Wakes the worker if SUSPENDED.
-	// Idempotent — resuming an active worker is a no-op.
-	ResumeWorker(i int)
-}
-
 // SendfileCapable is an optional interface implemented by engines that
 // support zero-copy file responses via sendfile(2). The H1 static-file
 // response path type-asserts the engine for it; engines that do not
@@ -124,4 +106,27 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// how often the inline → goroutine handoff fires vs the pure-sync
 	// inline fast path.
 	AsyncPromotedConns uint64
+	// Workers is the number of I/O workers (io_uring) or event loops
+	// (epoll) the engine is running. Static after Listen. The adaptive
+	// controller divides ActiveConnections by it to derive the
+	// conns-per-worker load signal that drives engine selection.
+	Workers int
+	// AcceptCount is the cumulative number of connections accepted by this
+	// engine since start. Together with elapsed time it yields the accept
+	// rate (new-connection arrival rate) used as a secondary load signal.
+	AcceptCount uint64
+	// CloseCount is the cumulative number of connections closed by this
+	// engine since start. AcceptCount - CloseCount tracks the live count;
+	// a high close rate relative to accepts indicates short-lived
+	// churn-style connections.
+	CloseCount uint64
+	// BytesRead is the cumulative number of payload bytes received from
+	// the network across all connections. Used with BytesWritten and
+	// RequestCount to derive the average bytes-per-request signal that
+	// suppresses io_uring selection for link-bound (large-payload)
+	// workloads where the engines tie.
+	BytesRead uint64
+	// BytesWritten is the cumulative number of payload bytes sent to the
+	// network across all connections. See BytesRead.
+	BytesWritten uint64
 }

@@ -41,8 +41,8 @@ const (
 	// opPROVIDEBUFFERS = 31 removed in v1.5.0 (celeris#320) — the legacy
 	// BufferGroup / PROVIDE_BUFFERS SQE was never wired into the engine.
 	// The supported path is IORING_REGISTER_PBUF_RING (BufferRing above).
-	opSHUTDOWN = 52 // IORING_OP_SHUTDOWN (kernel 5.11+)
-	opSENDZC   = 53 // IORING_OP_SEND_ZC (kernel 6.0+)
+	opSHUTDOWN = 34 // IORING_OP_SHUTDOWN (kernel 5.11+)
+	opSENDZC   = 47 // IORING_OP_SEND_ZC (kernel 6.0+)
 )
 
 // SQE flags.
@@ -57,7 +57,7 @@ const (
 const (
 	cqeFBuffer = 1 << 0
 	cqeFMore   = 1 << 1
-	cqeFNotif  = 1 << 2 // IORING_CQE_F_NOTIF: zero-copy send notification
+	cqeFNotif  = 1 << 3 // IORING_CQE_F_NOTIF: zero-copy send notification
 )
 
 // Accept flags.
@@ -104,3 +104,11 @@ const (
 	sqeSize = 64
 	cqeSize = 16
 )
+
+// sendZCMinBytes is the payload threshold below which SEND_ZC is not worth its
+// cost. Zero-copy adds a second (NOTIF) CQE per send and holds zcNotifPending
+// across the buffer's DMA lifetime, stalling the next flush; it also forfeits
+// the SEND→RECV link on the keep-alive fast path. Only above this size does the
+// avoided memcpy outweigh the extra completion, so small responses use a plain
+// linked SEND (1 CQE, immediate buffer reuse).
+const sendZCMinBytes = 4096

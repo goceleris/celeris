@@ -9,6 +9,30 @@ import (
 	"github.com/goceleris/celeris/engine"
 )
 
+// The adaptive engine starts on epoll and switches to io_uring under load
+// using a DIRECT conns-per-worker policy (no benchmark fingerprinting, no
+// CPU monitor required). The thresholds come from the empirical crossover on
+// this hardware: epoll and io_uring tie up to ~16 conns/worker; io_uring
+// pulls ahead above ~20/worker and keeps scaling while epoll plateaus
+// (io_uring ~+14% at 64 conns/worker); epoll wins at ~1 conn (lower latency).
+//
+// Policy:
+//   - On epoll, switch UP to io_uring when conns/worker sustains the up
+//     threshold for sustainTicks consecutive ticks, OR snap immediately when
+//     conns/worker crosses the heavy-load high-watermark (the fast path).
+//   - On io_uring, revert DOWN to epoll when conns/worker sustains BELOW the
+//     down threshold for sustainTicks ticks. The down threshold sits well
+//     under the up threshold so the band between them is a hysteresis zone
+//     that prevents flapping.
+//   - Large-payload workloads (avg bytes/req above largePayloadBytes) are
+//     link-bound — the engines tie — so an io_uring switch is suppressed to
+//     avoid pointless churn.
+//   - A safety revert fires if io_uring is active and the error rate climbs
+//     above errorRevertRate, regardless of load.
+//
+// The oscillation lock (3 switches in 5 min → 5 min lock) and the post-switch
+// cooldown bound any residual thrash and hold io_uring after the fast snap.
+
 type controllerState struct {
 	activeIsPrimary bool
 	lastSwitch      time.Time
@@ -17,21 +41,50 @@ type controllerState struct {
 	switchCount     int
 	locked          bool
 	lockUntil       time.Time
-	lastActiveScore map[engine.EngineType]float64
-	lastActiveTime  map[engine.EngineType]time.Time
+
+	// upTicks / downTicks count consecutive evaluations that satisfy the
+	// switch-up / switch-down condition; a normal switch needs sustainTicks
+	// of them, the heavy-load fast path needs only one. Reset on a switch
+	// (recordSwitch) and whenever the condition lapses.
+	upTicks   int
+	downTicks int
 }
 
 type controller struct {
-	primary   engine.Engine
-	secondary engine.Engine
+	primary   engine.Engine // epoll  (low-conns winner / starting engine)
+	secondary engine.Engine // io_uring (high-conns winner)
 	sampler   TelemetrySampler
-	weights   ScoreWeights
 	state     controllerState
 
 	evalInterval time.Duration
 	cooldown     time.Duration
-	threshold    float64
-	logger       *slog.Logger
+
+	upThreshold       float64 // conns/worker: epoll → io_uring
+	downThreshold     float64 // conns/worker: io_uring → epoll (hysteresis low edge)
+	highWatermark     float64 // conns/worker: heavy-load fast-path snap
+	largePayloadBytes float64 // avg bytes/req above which io_uring is suppressed
+	errorRevertRate   float64 // io_uring error rate above which we revert to epoll
+	sustainTicks      int     // consecutive ticks required for a normal switch
+
+	// connSwitchEnabled gates the conns-per-worker UP switch (epoll→io_uring).
+	// Production sets it true ONLY on the epoll-start path with io_uring viable
+	// and a non-h2c protocol: there, a sustained high-concurrency ramp should
+	// promote NEW connections to io_uring (it wins ≥~24 conns/worker for h1
+	// small payloads). It is false when io_uring is the start engine (nothing
+	// better to switch up to), when io_uring is unviable, or for h2c. The
+	// always-on error-revert below is independent of this flag. The engine sets
+	// it directly from the profile in New().
+	connSwitchEnabled bool
+
+	// loadDownRevert gates the LOAD-driven io_uring→epoll revert (evaluateDown).
+	// It is OFF in production: because pinned conns never migrate, reverting on
+	// a load dip strands established io_uring keep-alives and routes new conns
+	// back to epoll mid-ramp — pure harm. The always-on error-revert is
+	// independent of this flag. Defaults true in newController so the
+	// conns-per-worker unit tests exercise evaluateDown; New() sets it false.
+	loadDownRevert bool
+
+	logger *slog.Logger
 }
 
 func newController(primary, secondary engine.Engine, sampler TelemetrySampler, logger *slog.Logger) *controller {
@@ -39,20 +92,34 @@ func newController(primary, secondary engine.Engine, sampler TelemetrySampler, l
 		primary:      primary,
 		secondary:    secondary,
 		sampler:      sampler,
-		weights:      DefaultWeights(),
-		evalInterval: 5 * time.Second,
+		evalInterval: 1 * time.Second,
 		cooldown:     30 * time.Second,
-		threshold:    0.15,
-		logger:       logger,
+		// Thresholds from the epoll-vs-io_uring sweep: io_uring overtakes epoll
+		// at ~24 conns/worker for h1 small payloads (was 20); the heavy-load
+		// fast-path snaps only well past the crossover (48); large payloads are
+		// link-bound (engines tie) above 8 KB so suppress the switch there.
+		upThreshold:       24.0,
+		downThreshold:     12.0,
+		highWatermark:     48.0,
+		largePayloadBytes: 8192.0,
+		errorRevertRate:   0.05,
+		sustainTicks:      2,
+		// Both default ON so the conns-per-worker unit tests exercise the policy;
+		// the production New() path sets connSwitchEnabled from the kernel/feature
+		// profile and loadDownRevert=false (pinning makes load-revert harmful).
+		connSwitchEnabled: true,
+		loadDownRevert:    true,
+		logger:            logger,
 		state: controllerState{
 			activeIsPrimary: true,
-			lastActiveScore: make(map[engine.EngineType]float64),
-			lastActiveTime:  make(map[engine.EngineType]time.Time),
 		},
 	}
 }
 
-// evaluate checks whether a switch is warranted. Returns true if a switch should occur.
+// evaluate decides whether a switch is warranted given the current load. It
+// returns true when the engine should switch to its standby. The decision is
+// driven entirely by conns-per-worker (with payload-size and error-rate
+// refinements); the frozen check, oscillation lock and cooldown gate it.
 func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	if frozen {
 		return false
@@ -70,112 +137,111 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 		return false
 	}
 
-	var active, standby engine.Engine
-	if c.state.activeIsPrimary {
-		active = c.primary
-		standby = c.secondary
-	} else {
-		active = c.secondary
-		standby = c.primary
-	}
+	active := c.activeEngine()
+	snap := c.sampler.Sample(active)
+	cpw := snap.ConnsPerWorker
 
-	activeSnap := c.sampler.Sample(active)
-	baselineActiveScore := computeScore(activeSnap, c.weights)
-
-	// io_uring bias: the modeled io_uring advantage given the current workload
-	// (connection count + CPU pressure). Zero outside the empirical sweet spot.
-	bias := ioUringBias(activeSnap)
-
-	// Apply the bias to the ACTIVE score: reinforce io_uring when it is already
-	// active (resist leaving it), lightly penalise epoll when conditions favor
-	// io_uring (encourage leaving it).
-	activeScore := baselineActiveScore
 	if active.Type() == engine.IOUring {
-		activeScore *= (1.0 + bias) // Bonus: io_uring already active, reinforce
-	} else if bias > 0 {
-		activeScore *= (1.0 - bias*0.5) // Penalty: epoll active but conditions favor io_uring
+		// Safety error-revert is ALWAYS active, independent of connSwitchEnabled:
+		// if io_uring starts erroring on this deployment, fall back to epoll.
+		if snap.ErrorRate > c.errorRevertRate {
+			c.state.downTicks = 0
+			c.state.upTicks = 0
+			c.logSwitch("io_uring", "epoll", "error-rate safety revert", cpw, snap)
+			return true
+		}
+		if !c.connSwitchEnabled || !c.loadDownRevert {
+			// Load-driven down-revert is disabled in production: pinned conns
+			// never migrate, so reverting only strands io_uring keep-alives and
+			// routes new conns to epoll mid-ramp. Only the error-revert above moves us.
+			return false
+		}
+		return c.evaluateDown(snap, cpw)
 	}
-
-	// Store active's (biased) score for historical reference.
-	c.state.lastActiveScore[active.Type()] = activeScore
-	c.state.lastActiveTime[active.Type()] = now
-
-	// Seed standby with 80% of active if no history exists.
-	if _, ok := c.state.lastActiveScore[standby.Type()]; !ok {
-		c.state.lastActiveScore[standby.Type()] = activeScore * 0.80
-		c.state.lastActiveTime[standby.Type()] = now
+	// epoll active.
+	if !c.connSwitchEnabled {
+		return false
 	}
+	return c.evaluateUp(snap, cpw)
+}
 
-	// Standby estimate. Two independent signals, combined by max:
-	//
-	//  1. Historical: the last directly-observed score for the standby engine,
-	//     decayed at 1%/sec. This drives switching when the ACTIVE engine
-	//     genuinely degrades below a previously-measured standby.
-	//
-	//  2. Bias-modeled: the standby score implied by the io_uring bias for the
-	//     CURRENT workload, recomputed EACH tick. When io_uring is the standby
-	//     and conditions favor it, the standby is modeled as the unbiased active
-	//     baseline scaled up by the bias; when epoll is the standby (io_uring
-	//     active and favored) it is scaled DOWN so we do not switch back. This
-	//     is what makes an organic epoll→io_uring switch reachable — the
-	//     historical-only path could never exceed the threshold (max attainable
-	//     ratio ~0.70 < 1+threshold).
-	standbyScore := c.historicalScore(standby.Type(), now)
-	if modeled := c.biasModeledStandbyScore(standby.Type(), baselineActiveScore, bias); modeled > standbyScore {
-		standbyScore = modeled
-	}
+// evaluateUp runs while epoll is active and considers a switch UP to io_uring.
+func (c *controller) evaluateUp(snap TelemetrySnapshot, cpw float64) bool {
+	// Large payloads are link-bound: the engines tie, so never switch up.
+	// Keep upTicks pinned at zero so a later small-payload burst restarts the
+	// sustain count from scratch.
+	largePayload := snap.BytesPerReq >= c.largePayloadBytes
 
-	if standbyScore > activeScore*(1.0+c.threshold) {
-		c.logger.Info("switch recommended",
-			"active", active.Type().String(),
-			"standby", standby.Type().String(),
-			"active_score", activeScore,
-			"standby_score", standbyScore,
-		)
+	switch {
+	case !largePayload && cpw >= c.highWatermark:
+		// Heavy-load fast path: snap immediately on a single tick.
+		c.state.upTicks++
+		c.state.downTicks = 0
+		c.logSwitch("epoll", "io_uring", "heavy-load fast path", cpw, snap)
 		return true
+	case !largePayload && cpw >= c.upThreshold:
+		c.state.upTicks++
+		c.state.downTicks = 0
+		if c.state.upTicks >= c.sustainTicks {
+			c.logSwitch("epoll", "io_uring", "sustained high load", cpw, snap)
+			return true
+		}
+	default:
+		c.state.upTicks = 0
 	}
-
+	c.state.downTicks = 0
 	return false
 }
 
-// biasModeledStandbyScore models the standby engine's score for the CURRENT
-// workload from the io_uring bias, using the unbiased active baseline as the
-// reference point. The sign of the adjustment depends on which engine is the
-// standby:
-//
-//   - io_uring standby: when conditions favor io_uring (bias>0) it is modeled
-//     as bias-better than the active baseline → standby = baseline*(1+bias).
-//   - epoll standby (io_uring active and favored): epoll is modeled as
-//     bias-worse → standby = baseline*(1-bias), so a favorable-for-io_uring
-//     workload never recommends switching back to epoll.
-//
-// Recomputed every tick so the estimate tracks live conditions rather than a
-// stale seed.
-func (c *controller) biasModeledStandbyScore(standby engine.EngineType, baselineActiveScore, bias float64) float64 {
-	if bias <= 0 {
-		return baselineActiveScore
+// evaluateDown runs while io_uring is active and considers a revert to epoll.
+func (c *controller) evaluateDown(snap TelemetrySnapshot, cpw float64) bool {
+	// Safety revert: an error storm on io_uring beats any load consideration.
+	if snap.ErrorRate > c.errorRevertRate {
+		c.state.downTicks = 0
+		c.state.upTicks = 0
+		c.logSwitch("io_uring", "epoll", "error-rate safety revert", cpw, snap)
+		return true
 	}
-	if standby == engine.IOUring {
-		return baselineActiveScore * (1.0 + bias)
+
+	if cpw < c.downThreshold {
+		c.state.downTicks++
+		if c.state.downTicks >= c.sustainTicks {
+			c.state.upTicks = 0
+			c.logSwitch("io_uring", "epoll", "sustained low load", cpw, snap)
+			return true
+		}
+	} else {
+		c.state.downTicks = 0
 	}
-	return baselineActiveScore * (1.0 - bias)
+	c.state.upTicks = 0
+	return false
 }
 
-// historicalScore returns the last known score for an engine type, decayed
-// at 1% per second since the score was recorded.
-func (c *controller) historicalScore(et engine.EngineType, now time.Time) float64 {
-	score, ok := c.state.lastActiveScore[et]
-	if !ok {
-		return 0
+func (c *controller) activeEngine() engine.Engine {
+	if c.state.activeIsPrimary {
+		return c.primary
 	}
-	elapsed := now.Sub(c.state.lastActiveTime[et]).Seconds()
-	return score * max(0, 1.0-0.01*elapsed)
+	return c.secondary
+}
+
+func (c *controller) logSwitch(from, to, reason string, cpw float64, snap TelemetrySnapshot) {
+	c.logger.Info("engine switch recommended",
+		"from", from,
+		"to", to,
+		"reason", reason,
+		"conns_per_worker", cpw,
+		"bytes_per_req", snap.BytesPerReq,
+		"error_rate", snap.ErrorRate,
+		"active_connections", snap.ActiveConnections,
+	)
 }
 
 // recordSwitch updates controller state after a switch has been performed.
 func (c *controller) recordSwitch(now time.Time) {
 	c.state.activeIsPrimary = !c.state.activeIsPrimary
 	c.state.lastSwitch = now
+	c.state.upTicks = 0
+	c.state.downTicks = 0
 
 	c.state.switchTimes[c.state.switchIdx%len(c.state.switchTimes)] = now
 	c.state.switchIdx++

@@ -19,6 +19,29 @@ import (
 // we already promised it'd fit.
 const minMemlockPerWorker = 12 * 1024 * 1024
 
+// MaxWorkersForMemlock returns the io_uring worker ceiling imposed by
+// RLIMIT_MEMLOCK, or -1 when the soft limit is unlimited (RLIM_INFINITY) or
+// cannot be read — i.e. "no cap". It performs no syscall beyond Getrlimit and
+// constructs no ring, so it is safe to call from the adaptive start decision
+// BEFORE building the io_uring engine. The returned ceiling is at least 1 when
+// a finite limit is present (createWorkers/NewRing will surface a precise
+// ENOMEM if even one worker doesn't fit). This is the single source of truth
+// for the rlim.Cur / minMemlockPerWorker math (capWorkersToMemlock calls it).
+func MaxWorkersForMemlock() int {
+	var rlim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
+		return -1
+	}
+	if rlim.Cur == ^uint64(0) {
+		return -1
+	}
+	maxByMemlock := int(rlim.Cur / minMemlockPerWorker)
+	if maxByMemlock < 1 {
+		maxByMemlock = 1
+	}
+	return maxByMemlock
+}
+
 // capWorkersToMemlock returns min(want, RLIMIT_MEMLOCK / minMemlockPerWorker).
 // When the soft limit is unlimited (RLIM_INFINITY), the request is honoured
 // as-is. When the cap forces a reduction, the chosen logger is informed so
@@ -30,20 +53,15 @@ func capWorkersToMemlock(want int, logger *slog.Logger) int {
 	if want <= 1 {
 		return want
 	}
-	var rlim unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
+	maxByMemlock := MaxWorkersForMemlock()
+	if maxByMemlock == -1 {
 		return want
-	}
-	if rlim.Cur == ^uint64(0) {
-		return want
-	}
-	maxByMemlock := int(rlim.Cur / minMemlockPerWorker)
-	if maxByMemlock < 1 {
-		maxByMemlock = 1
 	}
 	if maxByMemlock >= want {
 		return want
 	}
+	var rlim unix.Rlimit
+	_ = unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim)
 	if logger != nil {
 		logger.Warn("io_uring workers capped by RLIMIT_MEMLOCK",
 			"requested", want,
@@ -231,6 +249,14 @@ func (r *Ring) mmap() error {
 }
 
 // GetSQE returns a pointer to the next available SQE, or nil if the ring is full.
+//
+// NOT SQPOLL-safe: this advances the SHARED SQ tail before the caller writes
+// the SQE payload, which is correct only because io_uring_enter is the kernel
+// sync point on the non-SQPOLL submit path. Under IORING_SETUP_SQPOLL the
+// kernel poll thread reads the tail continuously and could consume a
+// half-written SQE — so SQPOLL must not be enabled without first switching to
+// a deferred local tail + a release-store publish after fill. No tier selects
+// SQPOLL (see optionalTier / #377), so this path is never exercised today.
 func (r *Ring) GetSQE() unsafe.Pointer {
 	var tail, head uint32
 	if r.singleIssuer {

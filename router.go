@@ -5,7 +5,14 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// nowNano returns the current time in Unix nanoseconds. A package var so the
+// adaptive promotion TTL (celeris#364) can be exercised deterministically in
+// tests without sleeping.
+var nowNano = func() int64 { return time.Now().UnixNano() }
 
 // staticEntry holds the pre-composed handler chain and full path for a fully
 // static route, enabling O(1) map lookup instead of a trie walk.
@@ -95,6 +102,35 @@ type router struct {
 	// decide whether the async dispatch infrastructure is needed at
 	// all (a server with zero async routes keeps the inline fast path).
 	asyncRouteCount int
+
+	// adaptiveRoutes (celeris#356) holds the fullPaths of routes that
+	// inherited the server-level AsyncHandlers=true default (rather than an
+	// explicit .Async()). They start INLINE (ring-batched send, the cheap
+	// path) and are promoted to async dispatch only when an inline run is
+	// observed to block — so trivial handlers keep io_uring's syscall
+	// batching while genuinely-blocking handlers still get goroutine
+	// isolation. Built at registration; read-only while serving.
+	adaptiveRoutes map[string]bool
+	// promoted records adaptive fullPaths that have been promoted to async
+	// after sustained blocking inline runs. sync.Map: concurrent reads on the
+	// hot path, rare writes at promotion time.
+	promoted sync.Map
+	// slowStreak tracks consecutive slow inline runs per adaptive fullPath
+	// (fullPath -> *atomic.Int32). Hysteresis: a one-off cold/GC outlier must
+	// not poison a fast route; only a handler that blocks on EVERY run (DB/
+	// cache) accumulates adaptivePromoteStreak slow runs and gets promoted. A
+	// fast run resets the streak.
+	slowStreak sync.Map
+	// fastStreak tracks consecutive FAST inline runs per adaptive fullPath
+	// (fullPath -> *atomic.Int32). Once a route is fast on adaptiveSettleStreak
+	// consecutive runs it is provably non-blocking and gets SETTLED — future
+	// requests skip the per-request inline timing (two time.Now() vDSO calls)
+	// entirely (celeris#361). A slow run resets it.
+	fastStreak sync.Map
+	// settled holds adaptive fullPaths proven non-blocking (see fastStreak).
+	// A settled route is no longer timed/promotable; it runs inline like a
+	// plain sync route. Explicit .Async()/.Sync() clears it (setAsync).
+	settled sync.Map
 }
 
 // Route is an opaque handle to a registered route. Use the Name method to
@@ -205,6 +241,22 @@ func (r *Route) Sync() *Route {
 	return r.setAsync(false)
 }
 
+// UsesDriver marks a route whose handler performs a blocking backend round-trip
+// via a celeris driver (postgres / redis / memcached) opened WithEngine(srv).
+// It is exactly equivalent to .Async() — the route is dispatched off the worker
+// so the blocking call parks the handler goroutine on netpoll instead of
+// stalling an I/O worker — but reads as intent at the call site and is the
+// recommended way to mark driver routes:
+//
+//	srv.GET("/users/:id", getUser).UsesDriver()   // == .Async(), clearer intent
+//
+// The adaptive safety net (Config.AsyncHandlers=true) only auto-promotes
+// handlers slower than ~300µs, so a fast localhost driver call (sub-300µs) would
+// otherwise keep blocking a worker every request — mark such routes explicitly.
+func (r *Route) UsesDriver() *Route {
+	return r.setAsync(true)
+}
+
 // setAsync is the shared implementation of [Route.Async] and [Route.Sync].
 // Updates the node, the router's asyncRouteCount, and the static-fast-path
 // map entry so all three observers see the same async flag.
@@ -212,11 +264,28 @@ func (r *Route) setAsync(want bool) *Route {
 	if r.node == nil {
 		return r
 	}
-	if r.node.async != want && r.router != nil {
-		if want {
-			r.router.asyncRouteCount++
-		} else if r.router.asyncRouteCount > 0 {
-			r.router.asyncRouteCount--
+	if r.router != nil {
+		// celeris#356: an explicit .Async()/.Sync() overrides the adaptive
+		// (server-default) classification — the route is no longer
+		// inline-first-with-promotion, so drop it from the adaptive set and
+		// clear any prior promotion.
+		if r.router.adaptiveRoutes[r.path] {
+			delete(r.router.adaptiveRoutes, r.path)
+			r.router.promoted.Delete(r.path)
+			r.router.settled.Delete(r.path)
+			r.router.fastStreak.Delete(r.path)
+			r.router.slowStreak.Delete(r.path)
+			// Adaptive routes were already counted (they may promote): keep the
+			// count when the explicit choice is async, drop it when sync.
+			if !want && r.router.asyncRouteCount > 0 {
+				r.router.asyncRouteCount--
+			}
+		} else if r.node.async != want {
+			if want {
+				r.router.asyncRouteCount++
+			} else if r.router.asyncRouteCount > 0 {
+				r.router.asyncRouteCount--
+			}
 		}
 	}
 	r.node.async = want
@@ -234,8 +303,102 @@ func (r *Route) setAsync(want bool) *Route {
 
 func newRouter() *router {
 	return &router{
-		namedRoutes: make(map[string]*Route),
+		namedRoutes:    make(map[string]*Route),
+		adaptiveRoutes: make(map[string]bool),
 	}
+}
+
+// isPromoted reports whether an adaptive route (celeris#356) is currently
+// promoted to async dispatch.
+//
+// Promotion is REVERSIBLE (celeris#364): it expires after adaptivePromoteTTL.
+// Once expired, the route is dropped from the promoted set and its slow streak
+// is cleared, so the next request runs INLINE again and is re-timed — both the
+// routing decision (adaptivePromoted) and the per-request timing decision
+// (adaptiveLearning) key off this method, so they flip back together. A route
+// that is genuinely blocking re-promotes within adaptivePromoteStreak runs; a
+// route that was promoted by a transient load/jitter spike (a CPU-bound chain
+// whose inline wall-clock briefly crossed the threshold under contention) stays
+// inline. Without this, a single spike pinned a route to the slower async path
+// until process restart (the intermittent ~32% chain collapse).
+//
+// The clock is read only for routes actually in the promoted set, so learning
+// and settled routes pay nothing here.
+func (r *router) isPromoted(fullPath string) bool {
+	v, ok := r.promoted.Load(fullPath)
+	if !ok {
+		return false
+	}
+	if nowNano()-v.(int64) > int64(adaptivePromoteTTL) {
+		// Expired: re-enter the learning/inline path to re-evaluate.
+		r.promoted.Delete(fullPath)
+		if sv, ok := r.slowStreak.Load(fullPath); ok {
+			sv.(*atomic.Int32).Store(0)
+		}
+		return false
+	}
+	return true
+}
+
+// promoteRoute marks an adaptive route as async after sustained blocking inline
+// runs, stamped with the promotion time so isPromoted can expire it
+// (celeris#364). Re-promotion refreshes the stamp.
+func (r *router) promoteRoute(fullPath string) {
+	r.promoted.Store(fullPath, nowNano())
+}
+
+// promoteRouteImmediate promotes an adaptive route after a single
+// unambiguously-blocking inline run (> adaptiveBlockingThreshold), skipping the
+// adaptivePromoteStreak hysteresis. The fast streak is cleared so a burst of
+// prior fast runs cannot settle the route once the promotion TTL expires and it
+// re-enters the learning path.
+func (r *router) promoteRouteImmediate(fullPath string) {
+	if fv, ok := r.fastStreak.Load(fullPath); ok {
+		fv.(*atomic.Int32).Store(0)
+	}
+	r.promoteRoute(fullPath)
+}
+
+// recordInlineRun feeds one inline-run observation into the adaptive
+// classifier (celeris#356). A fast run resets the slow streak; a slow run
+// increments it, and once a route is slow on adaptivePromoteStreak CONSECUTIVE
+// runs it is promoted to async. The consecutive requirement makes a single cold
+// start / GC pause harmless while a genuinely-blocking handler (slow on every
+// run) promotes within a handful of requests.
+func (r *router) recordInlineRun(fullPath string, slow bool) {
+	if !slow {
+		if v, ok := r.slowStreak.Load(fullPath); ok {
+			v.(*atomic.Int32).Store(0)
+		}
+		// celeris#361: a route fast on adaptiveSettleStreak CONSECUTIVE runs is
+		// provably non-blocking — settle it so adaptiveLearning short-circuits
+		// and handler.go stops timing every request forever.
+		fv, _ := r.fastStreak.LoadOrStore(fullPath, new(atomic.Int32))
+		if fv.(*atomic.Int32).Add(1) >= adaptiveSettleStreak {
+			r.settled.Store(fullPath, struct{}{})
+		}
+		return
+	}
+	if v, ok := r.fastStreak.Load(fullPath); ok {
+		v.(*atomic.Int32).Store(0)
+	}
+	v, _ := r.slowStreak.LoadOrStore(fullPath, new(atomic.Int32))
+	if v.(*atomic.Int32).Add(1) >= adaptivePromoteStreak {
+		r.promoteRoute(fullPath)
+	}
+}
+
+// adaptiveLearning reports whether an adaptive route is still being observed —
+// i.e. neither settled (proven non-blocking, celeris#361) nor promoted (proven
+// blocking, celeris#356). Only learning routes pay the per-request inline
+// timing in handler.go; once decided, the hot path skips it. Steady state is a
+// single sync.Map.Load (settled), the same lookup cost the prior isPromoted
+// check carried, but without the two time.Now() vDSO calls per request.
+func (r *router) adaptiveLearning(fullPath string) bool {
+	if _, ok := r.settled.Load(fullPath); ok {
+		return false
+	}
+	return !r.isPromoted(fullPath)
 }
 
 // addRoute registers a route inheriting the server-level async default.
@@ -253,6 +416,15 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 	validatePath(path)
 
 	async := r.resolveAsync(as)
+	// celeris#356: a route that inherits the server-level AsyncHandlers=true
+	// default (rather than an explicit .Async()) starts INLINE and is promoted
+	// to async only when an inline run is observed to block. Explicit
+	// .Async(true)/.Async(false) is honored verbatim.
+	adaptive := as == asyncDefault && r.defaultAsync
+	if adaptive {
+		async = false
+		r.adaptiveRoutes[path] = true
+	}
 
 	root := r.getTree(method)
 	if root == nil {
@@ -271,7 +443,7 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 		root.async = async
 		route.node = root
 		r.setStaticEntry(method, "/", staticEntry{handlers: handlers, fullPath: "/", async: async})
-		if async {
+		if async || adaptive {
 			r.asyncRouteCount++
 		}
 		return route
@@ -296,7 +468,7 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 		r.setStaticEntry(method, path, staticEntry{handlers: handlers, fullPath: path, async: async})
 	}
 
-	if async {
+	if async || adaptive {
 		r.asyncRouteCount++
 	}
 
@@ -321,19 +493,28 @@ func (r *router) routeAsync(method, path string) bool {
 	if idx >= 0 {
 		if m := r.staticRoutes[idx]; m != nil {
 			if e, ok := m[path]; ok {
-				return e.async
+				return e.async || r.adaptivePromoted(e.fullPath)
 			}
 		}
 	} else if r.customStatic != nil {
 		if m := r.customStatic[method]; m != nil {
 			if e, ok := m[path]; ok {
-				return e.async
+				return e.async || r.adaptivePromoted(e.fullPath)
 			}
 		}
 	}
 	var params Params
-	_, _, async := r.find(method, path, &params)
-	return async
+	_, fullPath, async := r.find(method, path, &params)
+	return async || r.adaptivePromoted(fullPath)
+}
+
+// adaptivePromoted reports whether an adaptive (server-default-async) route has
+// been promoted to async dispatch after a blocking inline run (celeris#356).
+// The adaptiveRoutes map is read-only while serving, so the lookup is a plain
+// (lock-free) map read followed by a sync.Map load only for adaptive routes;
+// non-adaptive configs (no AsyncHandlers default) keep the empty-map fast path.
+func (r *router) adaptivePromoted(fullPath string) bool {
+	return r.adaptiveRoutes[fullPath] && r.isPromoted(fullPath)
 }
 
 // warnDuplicateRoute emits a warning when a route is registered twice for

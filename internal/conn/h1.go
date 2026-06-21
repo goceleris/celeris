@@ -246,6 +246,29 @@ func (s *H1State) HasPendingData() bool {
 	return s.buffer.Len() > 0 || s.bodyNeeded > 0
 }
 
+// HasPendingDispatchState reports whether ProcessH1 left partial state that
+// MUST be continued on the dispatch goroutine (InlineMode=false): buffered
+// partial headers or a chunked body in progress, both of which resume via the
+// buffered parse path that does not re-run the per-route async check. A
+// fixed-length body in progress (bodyNeeded > 0) is deliberately EXCLUDED: its
+// continuation re-parses the already-async-checked (so provably non-async)
+// request and dispatches the handler inline on the worker — exactly as the
+// sync engine does — so it must NOT force the conn onto the slower async
+// dispatch path. Promoting on it permanently poisoned keep-alive conns that
+// hit even one split-across-recvs body (the post-4k regression).
+func (s *H1State) HasPendingDispatchState() bool {
+	return s.buffer.Len() > 0 && s.bodyNeeded <= 0
+}
+
+// CurrentRoute returns the method and path of the request currently parsed into
+// the H1 state. The engine records these when a route forces an async promotion
+// so the dispatch goroutine can revert the connection to inline once that
+// route's promotion expires (celeris#364). req.Method/req.Path are interned
+// (stable) strings, safe to retain past the recv buffer's lifetime.
+func (s *H1State) CurrentRoute() (method, path string) {
+	return s.req.Method, s.req.Path
+}
+
 // UpdateWriteFn replaces the response adapter's write function. Called by
 // OnDetach to route StreamWriter writes through the mutex-guarded writeFn.
 func (s *H1State) UpdateWriteFn(fn func([]byte)) {
