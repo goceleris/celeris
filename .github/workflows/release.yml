@@ -31,7 +31,7 @@ jobs:
     needs: [validate-tag, ci]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Create sub-module tags
@@ -70,7 +70,7 @@ jobs:
     needs: [validate-tag, ci, tag-submodules]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.4"
