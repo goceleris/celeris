@@ -59,6 +59,15 @@ const (
 	WorkloadHighConcurrency WorkloadHint = WorkloadHint(resource.WorkloadHighConcurrency)
 )
 
+// DeriveMemoryLimit returns a generous soft heap ceiling for a server with
+// `workers` I/O workers — max(256 MiB, workers*32 MiB) — for use as
+// [Config.MemoryLimitBytes]. Sized HIGH on purpose: the goal is to clip the
+// connection-ramp balloon, not to run the heap tight. Never applied
+// implicitly; pass it explicitly.
+func DeriveMemoryLimit(workers int) int64 {
+	return resource.DeriveMemoryLimit(workers)
+}
+
 // Config holds the public server configuration.
 type Config struct {
 	// Addr is the TCP address to listen on (e.g. ":8080").
@@ -129,6 +138,18 @@ type Config struct {
 	SocketSendBuf int
 	// MaxConns is the max simultaneous connections per worker (0 = unlimited).
 	MaxConns int
+
+	// MemoryLimitBytes is an OPTIONAL soft heap ceiling applied via
+	// runtime/debug.SetMemoryLimit at Start. 0 = unset: celeris does not
+	// touch the process GC, so embedders keep full control. When >0, the GC
+	// collects before the heap balloons during a connection-ramp burst
+	// (under the default GOGC=100 that ramp spike is the dominant peak-RSS
+	// contributor), trading a few extra GC cycles during the ramp for a
+	// lower high-water mark; steady RSS sits far below the limit so steady
+	// throughput is unaffected. NOTE: SetMemoryLimit is PROCESS-GLOBAL, so
+	// this is opt-in only — set it when celeris owns the process (e.g. a
+	// dedicated server binary). See [DeriveMemoryLimit] for a sized default.
+	MemoryLimitBytes int64
 
 	// DisableMetrics disables the built-in metrics collector. When true,
 	// [Server.Collector] returns nil and per-request metric recording is skipped.
@@ -254,6 +275,7 @@ func (c Config) toResourceConfig() resource.Config {
 	if c.MaxConns > 0 {
 		rc.Resources.MaxConns = c.MaxConns
 	}
+	rc.Resources.MemoryLimitBytes = c.MemoryLimitBytes
 	rc.Resources.WorkloadHint = resource.WorkloadHint(c.WorkloadHint)
 
 	rc.MaxRequestBodySize = c.MaxRequestBodySize
