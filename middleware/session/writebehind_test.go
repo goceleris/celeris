@@ -53,7 +53,7 @@ func TestWriteBehindDefaultOffIsSynchronous(t *testing.T) {
 	gs := newGateStore()
 	gs.release()                                   // never block; we only assert completion ordering
 	mw, closer := NewWithCloser(Config{Store: gs}) // WriteBehind defaults to false
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 
 	handler := func(c *celeris.Context) error {
 		FromContext(c).Set("k", "v")

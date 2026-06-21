@@ -39,49 +39,20 @@ func (c *Client) do(ctx context.Context, fn func(v protocol.Value) error, args .
 	return ferr
 }
 
-// doRead is the zero-closure fast path for Get/GetBytes/HGet/HGetAll/etc.
-// — any read that returns a single Value. Avoids the per-call heap-allocated
-// closure that `do` requires (the closure captures the caller's output var,
-// forcing it to escape). Callers must decode req.result themselves and call
-// releaseResult before the conn is released.
-//
-// Returns (result, err). The result aliases the conn's reader buffer and
-// is valid only until releaseResult is called — callers that retain bytes
-// must copy via asBytes / copyValueDetached first.
-func (c *Client) doRead(ctx context.Context, args ...string) (protocol.Value, *redisRequest, *redisConn, error) {
-	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
-	if err != nil {
-		return protocol.Value{}, nil, nil, err
-	}
-	req, err := conn.exec(ctx, args...)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			c.pool.discardCmd(conn)
-		} else {
-			c.pool.releaseCmd(conn)
-		}
-		return protocol.Value{}, nil, nil, err
-	}
-	if req.resultErr != nil {
-		rerr := req.resultErr
-		conn.releaseResult(req)
-		c.pool.releaseCmd(conn)
-		return protocol.Value{}, nil, nil, rerr
-	}
-	return req.result, req, conn, nil
-}
-
-// release finalises a doRead call — must be paired with every successful
-// doRead return.
+// releaseDoRead finalises a fixed-arity read (doRead2/doRead3) — must be
+// paired with every successful read return. Callers decode req.result
+// themselves and call this before the conn is reused.
 func (c *Client) releaseDoRead(req *redisRequest, conn *redisConn) {
 	conn.releaseResult(req)
 	c.pool.releaseCmd(conn)
 }
 
-// doRead2 is the fixed-arity (2-arg) sibling of [Client.doRead]. It threads
+// doRead2 is the fixed-arity (2-arg) zero-closure read fast path. It threads
 // the verb+key through [redisConn.exec2], which encodes via WriteCommand2 —
-// avoiding the per-call []string{verb, key} slice that variadic doRead heap-
-// allocates. Used by the hot single-key reads (GET, GETDEL, ...).
+// avoiding both the per-call heap-allocated closure that `do` requires AND
+// the per-call []string{verb, key} arg slice. Used by the hot single-key
+// reads (GET, GETDEL, ...). The result aliases the conn's reader buffer and
+// is valid only until releaseDoRead — retained bytes must be copied first.
 func (c *Client) doRead2(ctx context.Context, a0, a1 string) (protocol.Value, *redisRequest, *redisConn, error) {
 	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
 	if err != nil {
