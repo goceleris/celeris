@@ -89,11 +89,11 @@ type controller struct {
 
 func newController(primary, secondary engine.Engine, sampler TelemetrySampler, logger *slog.Logger) *controller {
 	return &controller{
-		primary:           primary,
-		secondary:         secondary,
-		sampler:           sampler,
-		evalInterval:      1 * time.Second,
-		cooldown:          30 * time.Second,
+		primary:      primary,
+		secondary:    secondary,
+		sampler:      sampler,
+		evalInterval: 1 * time.Second,
+		cooldown:     30 * time.Second,
 		// Thresholds from the epoll-vs-io_uring sweep: io_uring overtakes epoll
 		// at ~24 conns/worker for h1 small payloads (was 20); the heavy-load
 		// fast-path snaps only well past the crossover (48); large payloads are

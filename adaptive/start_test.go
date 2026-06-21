@@ -23,10 +23,10 @@ func oldProfile() engine.CapabilityProfile {
 }
 
 // withMemlock overrides the memlock probe for the duration of a test.
-func withMemlock(t *testing.T, max int) {
+func withMemlock(t *testing.T, maxWorkers int) {
 	t.Helper()
 	prev := maxWorkersForMemlock
-	maxWorkersForMemlock = func() int { return max }
+	maxWorkersForMemlock = func() int { return maxWorkers }
 	t.Cleanup(func() { maxWorkersForMemlock = prev })
 }
 

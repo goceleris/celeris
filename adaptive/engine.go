@@ -134,16 +134,16 @@ var maxWorkersForMemlock = iouring.MaxWorkersForMemlock
 // unknowable here (no connections exist yet). So the start decision is gated
 // only on t0-knowable disqualifiers, with a safe default:
 //
-//	1. env override CELERIS_ADAPTIVE_START=iouring|epoll (operator escape hatch).
-//	2. io_uring not viable (old kernel / missing fast tier / memlock too low) → epoll.
-//	3. configured Protocol == H2C → epoll (io_uring's win is h1-small-payload only;
-//	   h2c never benefits — its framing/HPACK cost dwarfs the engine delta).
-//	4. explicit operator WorkloadHint == HighConcurrency → io_uring (the ONLY
-//	   input that can express a high-concurrency expectation up front).
-//	5. DEFAULT → epoll. Every server ramps from zero connections, i.e. the
-//	   low-concurrency regime where epoll wins on throughput AND tail latency;
-//	   the runtime switch then promotes new conns to io_uring if sustained
-//	   high load develops.
+//  1. env override CELERIS_ADAPTIVE_START=iouring|epoll (operator escape hatch).
+//  2. io_uring not viable (old kernel / missing fast tier / memlock too low) → epoll.
+//  3. configured Protocol == H2C → epoll (io_uring's win is h1-small-payload only;
+//     h2c never benefits — its framing/HPACK cost dwarfs the engine delta).
+//  4. explicit operator WorkloadHint == HighConcurrency → io_uring (the ONLY
+//     input that can express a high-concurrency expectation up front).
+//  5. DEFAULT → epoll. Every server ramps from zero connections, i.e. the
+//     low-concurrency regime where epoll wins on throughput AND tail latency;
+//     the runtime switch then promotes new conns to io_uring if sustained
+//     high load develops.
 //
 // This flips the previous default (io_uring on modern kernels): io_uring now
 // wins the start only on an explicit high-concurrency hint, because the
@@ -253,7 +253,6 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		eng, err := buildIOUring()
 		if err != nil {
 			logger.Warn("io_uring start engine unavailable, falling back to epoll start", "error", err)
-			startType = engine.Epoll
 			e.startType = engine.Epoll
 			eng, err = buildEpoll()
 			if err != nil {
