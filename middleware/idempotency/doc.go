@@ -1,42 +1,21 @@
-// Package idempotency implements the HTTP Idempotency-Key request pattern.
+// Package idempotency implements the HTTP Idempotency-Key request pattern for Celeris.
 //
-// # Semantics
+// [New] returns a middleware that deduplicates retried writes. When a request
+// carries the header named by [Config.KeyHeader] (default "Idempotency-Key"),
+// the middleware acquires an atomic lock via [KVStore], runs the handler once,
+// persists the response, and replays it on subsequent requests with the same
+// key. Concurrent duplicates return 409 Conflict (overridable via
+// [Config.OnConflict]). Requests without the key header pass through unchanged.
 //
-// The middleware looks up the header named by [Config.KeyHeader]
-// (default "Idempotency-Key") and:
+// Key types: [Config] controls all behaviour; [KVStore] is the store interface
+// ([store.KV] + [store.SetNXer]); [NewMemoryStore] provides a sharded
+// in-memory default suitable for single-instance deployments. For
+// multi-instance deployments, supply a Redis-backed store and namespace it
+// with [store.Prefixed]. Set [Config.BodyHash] to detect key reuse with
+// different payloads (returns 422 on mismatch). [ErrStoreMissingSetNX] is
+// returned by [New] when a provided store lacks atomic SetNX support.
 //
-//  1. Validates the key is 1..MaxKeyLength printable ASCII.
-//  2. Attempts to atomically acquire a lock via [store.SetNXer].
-//  3. On acquisition, runs the handler and stores the captured
-//     response under the key with [Config.TTL] expiry. The lock
-//     entry is replaced by the completed entry atomically.
-//  4. On contention with an in-flight duplicate, returns 409 Conflict
-//     via [Config.OnConflict] (no wait-and-retry).
-//  5. On a subsequent request that finds a completed entry, replays
-//     the stored response without running the handler.
+// # Documentation
 //
-// # Body hash
-//
-// [Config.BodyHash] enables SHA-256 hashing of the request body (up
-// to [Config.MaxBodyBytes]) and compares it to the stored hash on
-// replay. Mismatches return 422 Unprocessable Entity — catching
-// clients that reuse a key with different payloads, which the IETF
-// draft recommends rejecting. Disabled by default because hashing
-// large bodies costs memory.
-//
-// # Store requirements
-//
-// The store must implement both [store.KV] and [store.SetNXer]. The
-// default [NewMemoryStore] is in-memory and sharded, suitable for
-// single-instance deployments. For multi-instance deployments, wire
-// a [middleware/session/redisstore.Store] — it satisfies both
-// interfaces. (Wrap with [store.Prefixed] to namespace alongside
-// session data.)
-//
-// # Lock expiry
-//
-// A crashed handler leaves the lock entry behind. Once
-// [Config.LockTimeout] passes, the key becomes acquirable again.
-// Choose LockTimeout ≥ the worst-case handler latency plus network
-// margin to avoid a second execution of a still-running request.
+// Full guides and examples: https://goceleris.dev/docs/middleware-traffic
 package idempotency

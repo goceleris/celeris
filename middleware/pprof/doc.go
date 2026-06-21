@@ -5,54 +5,17 @@
 // (default "/debug/pprof") and dispatches to the matching pprof handler.
 // Non-matching requests pass through to the next handler with zero overhead.
 //
-// # Security
-//
-// By default, access is restricted to loopback addresses (127.0.0.1, ::1)
-// via [Config].AuthFunc. This uses the raw TCP peer address, NOT
-// X-Forwarded-For. Behind a reverse proxy, set AuthFunc to a scheme that
-// does not rely on RemoteAddr (e.g., shared secret header).
-//
-// Profiling endpoints expose sensitive runtime internals. Never expose them
-// publicly in production without proper authentication.
-//
-// # Endpoints
-//
-// All endpoints are relative to the configured prefix:
-//
-//	{prefix}/           — index page listing available profiles
-//	{prefix}/cmdline    — command-line arguments
-//	{prefix}/profile    — CPU profile (accepts ?seconds=N)
-//	{prefix}/symbol     — symbol lookup
-//	{prefix}/trace      — execution trace (accepts ?seconds=N)
-//	{prefix}/allocs     — allocation profile
-//	{prefix}/block      — block profile
-//	{prefix}/goroutine  — goroutine stacks
-//	{prefix}/heap       — heap profile
-//	{prefix}/mutex      — mutex contention profile
-//	{prefix}/threadcreate — thread creation profile
-//
-// # Ordering
-//
-// Place pprof after the debug middleware in the middleware chain. Since pprof
-// intercepts by path prefix, it can be installed at any position, but placing
-// it after debug avoids shadowing debug endpoints when both share the
-// /debug/ prefix namespace.
-//
-// # Basic usage
+// Use [New] with an optional [Config] to mount the profiling endpoints:
 //
 //	server.Use(pprof.New())
 //
-// # Custom AuthFunc
+// [Config].Prefix controls the URL prefix (default "/debug/pprof").
+// [Config].AuthFunc gates access; the default restricts to loopback addresses
+// (127.0.0.1 and ::1) using the raw TCP peer address — set a custom AuthFunc
+// when running behind a reverse proxy. [Config].Skip and [Config].SkipPaths
+// provide request-level bypass logic.
 //
-//	server.Use(pprof.New(pprof.Config{
-//	    AuthFunc: func(c *celeris.Context) bool {
-//	        return c.Header("x-pprof-token") == os.Getenv("PPROF_TOKEN")
-//	    },
-//	}))
+// # Documentation
 //
-// # Skipping
-//
-// Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for
-// exact-match path exclusions. Skipped requests call c.Next() without
-// invoking the auth check or serving profiles.
+// Full guides and examples: https://goceleris.dev/docs/observability
 package pprof

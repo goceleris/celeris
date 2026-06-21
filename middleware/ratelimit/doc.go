@@ -1,78 +1,36 @@
-// Package ratelimit provides token-bucket rate limiting middleware for
-// celeris.
+// Package ratelimit provides token-bucket and sliding-window rate limiting
+// middleware for Celeris.
 //
-// The limiter uses a sharded token-bucket algorithm keyed by client IP
-// (by default). Each key gets an independent bucket that refills at the
-// configured rate up to the burst capacity. A background goroutine
-// periodically evicts expired buckets.
+// [New] returns a [celeris.HandlerFunc] that enforces per-key request limits
+// using a sharded token-bucket algorithm by default. Keys default to the client
+// IP via [celeris.Context.ClientIP]; supply [Config.KeyFunc] to key on anything
+// else (API key, user ID, etc.).
 //
-// Basic usage with defaults (10 RPS, burst 20):
+// Core configuration fields: [Config.RPS] and [Config.Burst] set the static
+// rate; [Config.Rate] accepts human-readable strings ("100-M", "1000-H") parsed
+// by [ParseRate]. [Config.RateFunc] selects a per-request rate string, with
+// distinct limiters cached up to [Config.MaxDynamicLimiters] (default 1024).
+// [Config.SlidingWindow] switches to a sliding-window counter for smoother
+// limiting near window boundaries. [Config.Store] plugs in an external backend
+// (e.g. Redis) that implements [Store]; [StoreUndo] is the optional extension
+// for token refunds used by [Config.SkipFailedRequests] and
+// [Config.SkipSuccessfulRequests].
 //
-//	server.Use(ratelimit.New())
+// On every allowed response the middleware sets X-RateLimit-Limit,
+// X-RateLimit-Remaining, and X-RateLimit-Reset headers; denied responses
+// (429) also receive Retry-After. Set [Config.DisableHeaders] to suppress all
+// rate-limit headers. [Config.ErrorHandler] customises the 429 response (it
+// supersedes the deprecated [Config.LimitReached]). The sentinel error
+// [ErrTooManyRequests] is passed to ErrorHandler and is usable with errors.Is.
+// [ErrDynamicLimitersExhausted] is returned when MaxDynamicLimiters is full.
 //
-// Human-readable rate string (100 per minute, burst 200):
+// [ValidateConfig] checks a [Config] for errors without panicking, useful when
+// loading configuration from files or untrusted sources before calling [New].
+// [New] spawns background goroutines for bucket eviction; set
+// [Config.CleanupContext] to a cancellable context to stop them when the
+// middleware is no longer needed.
 //
-//	server.Use(ratelimit.New(ratelimit.Config{
-//	    Rate:  "100-M",
-//	    Burst: 200,
-//	}))
+// # Documentation
 //
-// Custom limits keyed by API key:
-//
-//	server.Use(ratelimit.New(ratelimit.Config{
-//	    RPS:   100,
-//	    Burst: 200,
-//	    KeyFunc: func(c *celeris.Context) string {
-//	        return c.Header("x-api-key")
-//	    },
-//	}))
-//
-// The middleware sets X-RateLimit-Limit, X-RateLimit-Remaining, and
-// X-RateLimit-Reset headers on every allowed response, and Retry-After
-// on denied responses (429 Too Many Requests). Set DisableHeaders to
-// suppress all rate limit headers.
-//
-// [Config].SlidingWindow enables a sliding window counter algorithm for
-// smoother rate limiting near window boundaries.
-//
-// [Config].RateFunc allows per-request rate selection, with distinct
-// limiters cached up to [Config].MaxDynamicLimiters (default 1024).
-//
-// [ParseRate] parses rate strings in "<count>-<unit>" format (S, M, H, D)
-// into RPS and burst values, returning an error for malformed input.
-//
-// [ErrTooManyRequests] is the exported sentinel error (429) returned on
-// deny, usable with errors.Is for error handling in upstream middleware.
-//
-// Set [Config].Skip to bypass the middleware dynamically, or
-// [Config].SkipPaths for exact-match path exclusions.
-//
-// [Config].Store allows plugging in an external storage backend (e.g., Redis)
-// that implements the [Store] interface. The store handles its own rate logic.
-//
-// [Config].SkipFailedRequests and [Config].SkipSuccessfulRequests refund
-// tokens for requests that fail (status >= 400) or succeed (status < 400),
-// respectively. Store backends must implement [StoreUndo] for refunds.
-//
-// [Config].CleanupContext controls the lifetime of background goroutines.
-// When the context is cancelled, cleanup goroutines stop. If nil, they run
-// until the process exits.
-//
-// Note: [New] spawns one or more background goroutines for bucket eviction.
-// Set CleanupContext to a cancellable context to ensure they are stopped
-// when the middleware is no longer needed.
-//
-// # Reverse Proxy Integration
-//
-// The default KeyFunc uses c.ClientIP(). When behind a reverse proxy,
-// install the proxy middleware via Server.Pre() so rate limits apply to
-// real client IPs, not the proxy's IP:
-//
-//	server.Pre(proxy.New(proxy.Config{
-//	    TrustedProxies: []string{"10.0.0.0/8"},
-//	}))
-//	server.Use(ratelimit.New()) // rate-limits by real client IP
-//
-// Without proxy middleware, all clients behind the same proxy share a
-// single rate-limit bucket.
+// Full guides and examples: https://goceleris.dev/docs/middleware-traffic
 package ratelimit

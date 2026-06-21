@@ -4,11 +4,12 @@
 // and exposes them in Prometheus text exposition format at a configurable
 // endpoint (default "/metrics").
 //
-// Basic usage:
+// Register with default settings:
 //
 //	server.Use(metrics.New())
 //
-// Custom configuration:
+// Or supply a [Config] to customise the endpoint path, namespace, subsystem,
+// histogram buckets, label extensions, or the backing [prometheus.Registry]:
 //
 //	server.Use(metrics.New(metrics.Config{
 //	    Path:      "/prom",
@@ -32,19 +33,9 @@
 //   - {ns}_{sub}_active_requests (Gauge): in-flight requests
 //
 // The subsystem segment is omitted when [Config].Subsystem is empty.
-//
-// # Custom Labels
-//
-// Use [Config].LabelFuncs to add custom label dimensions. Functions are
-// called after c.Next() returns:
-//
-//	server.Use(metrics.New(metrics.Config{
-//	    LabelFuncs: map[string]func(*celeris.Context) string{
-//	        "region": func(c *celeris.Context) string {
-//	            return c.Header("x-region")
-//	        },
-//	    },
-//	}))
+// Base labels on all metrics are method, path, and status. Add custom
+// dimensions via [Config].LabelFuncs; keys must not conflict with the
+// three reserved base labels.
 //
 // # Cardinality Protection
 //
@@ -53,10 +44,7 @@
 //
 // # Histogram Buckets
 //
-// [DefaultBuckets] provides fine-grained latency boundaries:
-//
-//	[]float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 5}
-//
+// [DefaultBuckets] provides fine-grained sub-millisecond latency boundaries.
 // Override with [Config].Buckets for duration histograms or
 // [Config].SizeBuckets for request/response size histograms.
 //
@@ -73,4 +61,8 @@
 // (metrics before compress), this records the uncompressed application-level
 // size. If metrics runs after compress, it records the compressed network-level
 // size. Be aware of this when interpreting response size dashboards.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/observability
 package metrics

@@ -1,82 +1,28 @@
 // Package logger provides HTTP request logging middleware for celeris.
 //
-// The middleware logs each request with configurable fields including
-// method, path, status, latency, and bytes written. It supports
-// both standard slog handlers and the zero-alloc [FastHandler].
+// [New] returns a [celeris.HandlerFunc] that logs each request with method,
+// path, status, latency, bytes written, client IP, and request ID. All output
+// is routed through Go's [log/slog] package; supply any slog.Handler via
+// [Config].Output, or use [NewFastHandler] for zero-alloc pooled-buffer output.
 //
-// Basic usage with the default slog output:
+// Two preset constructors cover the most common cases: [CLFConfig] produces
+// Common Log Format style output; [JSONConfig] produces structured JSON via
+// slog.JSONHandler. Both return a [Config] that can be further customised before
+// passing to [New].
 //
-//	server.Use(logger.New())
+// Notable Config fields:
+//   - CaptureRequestBody / CaptureResponseBody — log bodies, truncated to MaxCaptureBytes (default 4096).
+//   - SensitiveHeaders — header values to redact; nil uses [DefaultSensitiveHeaders].
+//   - LogFormValues / SensitiveFormFields — log form fields with optional redaction; use [DefaultSensitiveFormFields] as a safe starting list.
+//   - Skip / SkipPaths — bypass the middleware dynamically or for exact-match paths.
+//   - Fields / Done — callbacks for custom attributes and post-log hooks.
+//   - LogContextKeys — emit arbitrary context-store values as "ctx.<key>" attributes.
 //
-// Using the zero-alloc FastHandler with color output:
+// Register after the requestid middleware so request IDs are available in every
+// log entry. When running behind a reverse proxy, install the proxy middleware
+// via Server.Pre() before logger.New() so the real client IP is recorded.
 //
-//	mw := logger.New(logger.Config{
-//	    Output: slog.New(logger.NewFastHandler(os.Stderr, &logger.FastHandlerOptions{
-//	        Color: true,
-//	    })),
-//	})
-//	server.Use(mw)
+// # Documentation
 //
-// # Body Capture
-//
-// Set [Config].CaptureRequestBody and/or [Config].CaptureResponseBody to
-// log request and response bodies. Bodies are truncated to
-// [Config].MaxCaptureBytes (default 4096).
-//
-// # Sensitive Header Redaction
-//
-// [Config].SensitiveHeaders lists header names whose values are redacted.
-// When nil, [DefaultSensitiveHeaders] is used. Set to an empty slice to
-// disable all redaction.
-//
-// # Request ID Integration
-//
-// The middleware reads the request ID from the context store
-// (key "request_id") first, falling back to the x-request-id header.
-//
-// # Predefined Configurations
-//
-// [CLFConfig] returns a Config for Common Log Format style output.
-// [JSONConfig] returns a Config for structured JSON output.
-// Both return a [Config] value that can be further customized:
-//
-//	cfg := logger.CLFConfig()
-//	cfg.SkipPaths = []string{"/health"}
-//	server.Use(logger.New(cfg))
-//
-// # Design Rationale
-//
-// All output is structured through Go's [log/slog] package. No template
-// strings are provided. The [Config].Fields callback supplies arbitrary
-// extensibility. [FastHandler] formats directly into pooled byte buffers,
-// avoiding fmt.Sprintf and time.Format entirely.
-//
-// # Query Parameter Security
-//
-// Security: LogQueryParams logs raw query strings which may contain
-// sensitive values (OAuth tokens, API keys, session identifiers).
-// Consider using SkipPaths for sensitive endpoints or implementing a
-// custom Fields function that redacts sensitive query parameters.
-//
-// # Skipping
-//
-// Set [Config].Skip to bypass dynamically, or [Config].SkipPaths for
-// exact-match path exclusions.
-//
-// # Middleware Order
-//
-// Register after requestid for request ID inclusion in logs.
-//
-// # Reverse Proxy Integration
-//
-// When running behind a reverse proxy, install the proxy middleware via
-// Server.Pre() so that Logger sees the real client IP:
-//
-//	server.Pre(proxy.New(proxy.Config{
-//	    TrustedProxies: []string{"10.0.0.0/8"},
-//	}))
-//	server.Use(logger.New()) // now logs the real client IP
-//
-// Without proxy middleware, Logger records the reverse proxy's IP address,
-// not the end user's.
+// Full guides and examples: https://goceleris.dev/docs/observability
 package logger

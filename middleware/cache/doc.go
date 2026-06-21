@@ -36,4 +36,8 @@
 //   - [Invalidate] removes a single computed key
 //   - [InvalidatePrefix] removes every key with the given prefix
 //     (requires store.PrefixDeleter)
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/middleware-content
 package cache

@@ -1,50 +1,26 @@
 // Package protobuf provides Protocol Buffers serialization for celeris.
 //
-// Protocol Buffers was removed from the celeris core to avoid forcing
-// google.golang.org/protobuf as a transitive dependency. This package
-// provides equivalent functionality as standalone functions.
+// Protocol Buffers support was split from the celeris core to avoid pulling
+// google.golang.org/protobuf as a transitive dependency. This package provides
+// equivalent functionality as standalone helpers and an optional middleware.
 //
-// # Basic Usage
+// Key exports:
+//   - [Write] — marshal a proto.Message and write it with status code.
+//   - [BindProtoBuf] — read the request body and unmarshal it as protobuf.
+//   - [Bind] — like BindProtoBuf but first checks the Content-Type header,
+//     returning [ErrNotProtoBuf] when it is not a protobuf content type.
+//   - [Respond] — content-negotiate between protobuf and JSON using the
+//     Accept header, honoring q=0 exclusions per RFC 7231 §5.3.1.
+//   - [New] / [Config] — optional middleware that stashes marshal/unmarshal
+//     options in the request context for retrieval via [FromContext].
+//   - [PoolEvictions] — monotonic counter for buffers discarded from the
+//     internal marshal pool; wire into metrics to detect large messages.
 //
-// Write a protobuf response:
+// Both "application/x-protobuf" ([ContentType]) and "application/protobuf"
+// ([ContentTypeAlt]) are accepted on inbound requests. Responses written by
+// [Write] always use "application/x-protobuf".
 //
-//	protobuf.Write(c, 200, &myProto)
+// # Documentation
 //
-// Parse a protobuf request:
-//
-//	var msg pb.MyMessage
-//	if err := protobuf.BindProtoBuf(c, &msg); err != nil {
-//	    return err
-//	}
-//
-// Auto-detect content type:
-//
-//	var msg pb.MyMessage
-//	if err := protobuf.Bind(c, &msg); err != nil {
-//	    return err
-//	}
-//
-// # Content Negotiation
-//
-// Use [Respond] to serve protobuf or JSON based on the Accept header:
-//
-//	protobuf.Respond(c, 200, &myProto, myJSONStruct)
-//
-// # Middleware with Custom Options
-//
-// Install the middleware for custom marshal/unmarshal options:
-//
-//	s.Use(protobuf.New(protobuf.Config{
-//	    MarshalOptions: proto.MarshalOptions{Deterministic: true},
-//	}))
-//
-// Then use [FromContext] in handlers:
-//
-//	pb := protobuf.FromContext(c)
-//	pb.Write(200, &myProto)
-//
-// # Content Types
-//
-// Both "application/x-protobuf" (primary) and "application/protobuf" are
-// recognized. Responses use "application/x-protobuf".
+// Full guides and examples: https://goceleris.dev/docs/middleware-content
 package protobuf

@@ -1,147 +1,24 @@
-// Package middleware provides production-ready middleware for celeris.
+// Package middleware is the umbrella for celeris's production-ready middleware catalog.
 //
-// # Pre-Routing Middleware (Server.Pre)
+// It declares no exported symbols of its own. Each piece of middleware lives in
+// its own subpackage and exposes a New constructor returning a
+// celeris.HandlerFunc (for example cors.New, jwt.New, ratelimit.New,
+// compress.New). Install them at one of two points:
 //
-// These run before the router matches the request and can mutate the
-// request method, path, scheme, host, or client IP:
+//   - Server.Use installs route middleware that runs after the router matches a
+//     request (logging, recovery, auth, CORS, rate limiting, compression, ...).
+//   - Server.Pre installs pre-routing middleware that runs before matching and
+//     may mutate the request method, path, scheme, host, or client IP
+//     (proxy, redirect, rewrite, methodoverride). Pre-routing middleware that
+//     writes a response MUST return without calling c.Next().
 //
-//	proxy          — extract real client IP/scheme/host from trusted proxy headers
-//	redirect       — HTTPS, www, trailing-slash URL normalization
-//	rewrite        — regex-based URL rewriting (pattern → replacement)
-//	methodoverride — override POST method via _method form field or header
+// Ordering matters: each layer should see the context the layers before it
+// established. See the documentation hub below for the recommended install
+// order, per-middleware configuration, and cross-cutting conventions (auth
+// stacking, the Vary header contract, and how the observe/metrics/otel
+// measurement systems relate).
 //
-// Order matters: install proxy first (sets real client IP/scheme for all
-// downstream middleware), then redirect (uses scheme from proxy), then
-// rewrite (modifies path after redirect normalizes the URL), then
-// methodoverride (after path is finalized).
+// # Documentation
 //
-// Short-circuit contract: writing a response in pre-routing middleware does
-// NOT auto-abort the chain. Custom pre-routing middleware that responds
-// (e.g. a redirect or 4xx error) MUST return WITHOUT calling c.Next() — the
-// shipped redirect middleware does this. If a pre-middleware writes a body
-// AND calls c.Next(), the router will run and may write a second response.
-//
-// # Recommended Middleware Ordering (Server.Use)
-//
-// Install middleware in this order so each layer sees the right context:
-//
-//	healthcheck — health probes respond early; place first to skip downstream middleware
-//	              (install with Server.Use, NEVER with Server.Pre — pre-routing
-//	              rewrite rules could otherwise retarget the probe paths)
-//	requestid   — assign request ID first; all downstream logs include it
-//	metrics/otel — Prometheus / OpenTelemetry: can also go after logger
-//	logger      — log every request with the ID from requestid
-//	recovery    — catch panics from everything below; logger records the 500
-//	secure      — set OWASP security headers before any response can escape
-//	cors        — handle preflight; must run before auth rejects OPTIONS
-//	bodylimit   — reject oversized bodies before parsing begins
-//	ratelimit   — shed load before expensive auth/business logic
-//	circuitbreaker — trip open on error rate spike; after ratelimit, before timeout
-//	[auth]      — jwt / keyauth / basicauth (see Auth Stacking below)
-//	csrf        — validate CSRF token after authentication is established
-//	session     — load session (may depend on authenticated user)
-//	debug       — intercepts by path prefix (e.g. /debug/); can go anywhere
-//	pprof       — Go profiling endpoints (loopback-only by default)
-//	swagger     — OpenAPI spec + UI (CDN-loaded Swagger UI or Scalar)
-//	static      — static file server with directory browse (after security/auth if protecting)
-//	adapters    — (utility) stdlib ↔ celeris middleware conversion; not a chain member
-//	timeout     — bound handler execution; innermost wrapper before the route
-//	singleflight — collapse identical in-flight requests; after timeout
-//	compress    — response compression; wraps etag (computes on uncompressed body)
-//	etag        — conditional responses (304 Not Modified); innermost transform
-//	[handler]   — route handler
-//
-// Example production stack:
-//
-//	// Pre-routing
-//	s.Pre(proxy.New(proxy.Config{TrustedProxies: []string{"10.0.0.0/8"}}))
-//	s.Pre(redirect.HTTPSRedirect())
-//	s.Pre(rewrite.New(rewrite.Config{Rules: []rewrite.Rule{{Pattern: `^/old/(.*)$`, Replacement: "/new/$1"}}}))
-//	s.Pre(methodoverride.New())
-//
-//	// Route middleware (install per the ordering list above; entries
-//	// commented out below are optional but, when used, must keep their
-//	// position in the chain).
-//	s.Use(healthcheck.New())
-//	s.Use(requestid.New())
-//	// s.Use(metrics.New(...))     // optional: Prometheus
-//	// s.Use(otel.New(...))        // optional: OpenTelemetry
-//	// s.Use(logger.New())         // optional: structured request logs
-//	s.Use(recovery.New())
-//	s.Use(secure.New())
-//	s.Use(cors.New())
-//	// s.Use(bodylimit.New(...))   // optional: cap request body
-//	// s.Use(ratelimit.New(...))   // optional: shed load
-//	s.Use(circuitbreaker.New())
-//	// s.Use(jwt.New(...))         // optional: auth (see Auth Stacking)
-//	// s.Use(csrf.New())           // optional: after auth
-//	// s.Use(session.New(...))     // optional: after auth
-//	s.Use(timeout.New(timeout.Config{Timeout: 30 * time.Second}))
-//	s.Use(singleflight.New())
-//	s.Use(compress.New())
-//	s.Use(etag.New())
-//
-// # Measurement System Roles
-//
-// Three complementary systems serve different operational needs:
-//
-// Core Collector (github.com/goceleris/celeris/observe) — Built into the
-// framework. Tracks total requests, error counts, and latency percentiles
-// including unmatched routes and panic recoveries. Zero external dependencies.
-// Use for lightweight internal diagnostics and health checks.
-//
-// Prometheus middleware (github.com/goceleris/celeris/middleware/metrics) — Production
-// metrics pipeline. Emits per-path, per-method, per-status histograms and
-// counters to Prometheus. Integrates with Grafana dashboards and alerting.
-// Use for production monitoring and SLO tracking.
-//
-// OpenTelemetry middleware (github.com/goceleris/celeris/middleware/otel) — Distributed
-// tracing and metrics. Creates spans per request with W3C trace context
-// propagation. Exports to any OTLP-compatible backend (Jaeger, Tempo, etc.).
-// Use for cross-service request correlation and latency breakdown.
-//
-// Counter overlap: each system records the same request independently —
-// observe.Collector.TotalRequests, prometheus celeris_requests_total, and
-// otel http.server.request.duration count are NOT shared. Enabling all
-// three gives three independent views of the same traffic; do NOT add
-// numbers across systems. Pick one as the source of truth for a given
-// chart, alert, or SLO.
-//
-// # Auth Stacking Pattern
-//
-// JWT and keyauth both support ContinueOnIgnoredError, which calls c.Next()
-// when ErrorHandler returns nil (i.e., the error was intentionally ignored).
-// Chain them for JWT-preferred authentication with API key fallback:
-//
-//	jwtAuth := jwt.New(jwt.Config{
-//	    SigningKey:             hmacSecret,
-//	    ContinueOnIgnoredError: true,
-//	    ErrorHandler: func(c *celeris.Context, err error) error {
-//	        return nil // ignore JWT failure, let keyauth try
-//	    },
-//	})
-//	keyAuth := keyauth.New(keyauth.Config{
-//	    Validator: func(c *celeris.Context, key string) (bool, error) {
-//	        return key == apiKey, nil
-//	    },
-//	})
-//	api := s.Group("/api", jwtAuth, keyAuth)
-//
-// Requests with a valid JWT proceed after jwtAuth. Requests without a JWT
-// (or with an invalid one) fall through to keyAuth. If neither succeeds,
-// keyAuth returns 401.
-//
-// # Vary Header Convention
-//
-// Several middleware set the Vary response header:
-//
-//   - cors: Vary: Origin
-//   - compress: Vary: Accept-Encoding
-//
-// All middleware use AddHeader (not SetHeader) for Vary to preserve values
-// set by other middleware. Handlers that need to set Vary MUST also use
-// AddHeader to avoid clobbering middleware-set values:
-//
-//	c.AddHeader("vary", "Accept-Language")  // correct
-//	c.SetHeader("vary", "Accept-Language")  // WRONG: clobbers cors/compress Vary
+// Full guides and examples: https://goceleris.dev/docs/middleware
 package middleware

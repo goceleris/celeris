@@ -9,4 +9,8 @@
 //
 // Application code should not import these packages directly — interact
 // with HTTP/2 through the celeris [Server] and [Context] types.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/engines
 package h2

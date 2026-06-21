@@ -35,4 +35,8 @@
 //
 // Server and Collector are optional; when nil, /routes returns [] and
 // /metrics returns 501.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/observability
 package debug

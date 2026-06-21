@@ -1,9 +1,8 @@
 // Package secure provides OWASP security headers middleware for celeris.
 //
-// The middleware sets a comprehensive suite of HTTP security headers on
-// every response. All non-empty header values are pre-computed into a flat
-// slice at initialization. The hot path iterates this slice with zero
-// allocations.
+// The middleware sets a comprehensive suite of HTTP security headers on every
+// response. All non-empty header values are pre-computed into a flat slice at
+// initialization; the hot path iterates this slice with zero allocations.
 //
 // Default headers set on every response:
 //
@@ -18,56 +17,16 @@
 //   - X-Permitted-Cross-Domain-Policies: "none"
 //   - Origin-Agent-Cluster: "?1"
 //
-// Cross-Origin-Embedder-Policy ("require-corp") and X-Download-Options
-// ("noopen") are OPT-IN (off by default, #338): COEP-by-default breaks
-// cross-origin resource loads (matching helmet, which leaves it off), and
-// X-Download-Options only affected legacy Internet Explorer. Content-Security-
-// Policy and Permissions-Policy are likewise only emitted when their [Config]
-// fields are non-empty.
+// Cross-Origin-Embedder-Policy and X-Download-Options are opt-in (off by
+// default). Content-Security-Policy and Permissions-Policy are only emitted
+// when their [Config] fields are non-empty.
 //
-// # Usage
+// Use [New] to create the middleware. Pass a [Config] to override defaults.
+// Set any string field to [Suppress] ("-") to omit that individual header.
+// Use [Config].DisableHSTS to omit Strict-Transport-Security entirely.
+// Use [Config].Skip or [Config].SkipPaths to bypass the middleware per request.
 //
-// Default configuration (all OWASP-recommended headers):
+// # Documentation
 //
-//	server.Use(secure.New())
-//
-// Custom configuration:
-//
-//	server.Use(secure.New(secure.Config{
-//	    ContentSecurityPolicy: "default-src 'self'",
-//	    HSTSMaxAge:            31536000,
-//	    HSTSPreload:           true,
-//	}))
-//
-// # Suppressing Individual Headers
-//
-// Set any string field to [Suppress] ("-") to omit that header:
-//
-//	server.Use(secure.New(secure.Config{
-//	    XFrameOptions: secure.Suppress,
-//	}))
-//
-// For HSTS, set [Config].DisableHSTS to true to omit the header entirely.
-// HSTSMaxAge defaults to 2 years (63072000 seconds) whether or not other
-// fields are customized — there is no zero-value trap.
-//
-// # HSTS Preload Validation
-//
-// When [Config].HSTSPreload is true, validate() panics at initialization
-// if HSTSMaxAge < 31536000 or HSTSExcludeSubdomains is true, enforcing
-// HSTS preload list requirements.
-//
-// # Skipping
-//
-// Use [Config].Skip for dynamic skip logic or [Config].SkipPaths for
-// exact-match path exclusions. Skipped requests receive no security
-// headers at all.
-//
-// # CORS Interaction
-//
-// When using CORS middleware alongside secure, note that the default
-// CrossOriginResourcePolicy (same-origin) blocks cross-origin resource
-// loading; APIs serving cross-origin requests should set
-// CrossOriginResourcePolicy: "cross-origin". COEP is off by default so it no
-// longer needs suppressing; enable it explicitly only when isolating the page.
+// Full guides and examples: https://goceleris.dev/docs/middleware-security
 package secure

@@ -1,42 +1,44 @@
 // Package store defines the unified byte-level key-value interface shared
-// by celeris middleware (session, csrf, ratelimit, jwt, cache, idempotency).
+// by celeris middleware (session, csrf, cache, idempotency, SSE replay).
 //
-// # Interfaces
+// # Core interface
 //
 // [KV] is the minimal required surface: Get, Set with TTL, Delete. All
 // implementations must be safe for concurrent use and honor the contract
-// that Get returns (nil, [ErrNotFound]) on a missing key.
+// that Get returns (nil, [ErrNotFound]) on a missing key; returning
+// (nil, nil) is forbidden.
 //
-// Optional extension interfaces ([GetAndDeleter], [Scanner], [PrefixDeleter],
-// [SetNXer], [Scripter]) surface backend capabilities. Middleware feature-
-// detect these via type assertion and fall back to emulation or no-op
-// semantics when a backend does not implement them.
+// Optional extension interfaces surface backend capabilities; middleware
+// feature-detects them via type assertion and falls back to emulation
+// or no-op semantics when a backend does not implement them:
 //
-// # Reference backends
+//   - [GetAndDeleter] — atomic GET+DEL (e.g. Redis GETDEL); used by csrf.
+//   - [Scanner] — key enumeration by prefix; used by session Reset.
+//   - [PrefixDeleter] — bulk delete by prefix; used by cache InvalidatePrefix.
+//   - [SetNXer] — atomic set-if-not-exists; used by idempotency lock acquisition.
+//   - [Counter] — atomic monotonic counter (INCR); used by SSE replay for cross-process IDs.
+//   - [Scripter] — server-side atomic scripts (EVALSHA); used by ratelimit Redis adapter.
 //
-//   - [MemoryKV] — in-memory, sharded implementation. Implements every
-//     optional extension. Used as the default store and in tests.
-//   - middleware/session/redisstore — Redis-backed via driver/redis.
-//     Implements KV + Scanner; GetAndDeleter when Redis >= 6.2.
-//   - middleware/session/postgresstore — PostgreSQL-backed via driver/postgres.
-//     Implements KV only; Reset via TRUNCATE (exposed as io.Closer).
-//   - middleware/csrf/redisstore — Redis-backed CSRF storage.
-//     Implements KV + GetAndDeleter (GETDEL).
-//   - middleware/ratelimit/redisstore — Redis-backed ratelimit store.
-//     Implements ratelimit.Store via EVALSHA; not a KV adapter.
+// # Reference implementations
 //
-// # Response wire format
+//   - [MemoryKV] / [NewMemoryKV] — in-memory sharded store. Implements KV,
+//     GetAndDeleter, Scanner, PrefixDeleter, SetNXer, and Counter.
+//     Default store for single-process deployments and tests.
+//   - middleware/session/redisstore — Redis-backed; KV + Scanner + GetAndDeleter.
+//   - middleware/session/postgresstore — PostgreSQL-backed; KV only.
+//   - middleware/csrf/redisstore — Redis-backed CSRF; KV + GetAndDeleter.
+//   - middleware/ratelimit/redisstore — Redis-backed ratelimit via EVALSHA; implements Scripter.
 //
-// [EncodedResponse] + [ResponseWireVersion] define a byte-efficient
-// snapshot format used by cache and idempotency middleware to persist
-// captured HTTP responses. The format is versioned to allow forward
-// compatibility; decoders reject unknown versions.
+// # Utilities
 //
-// # Contract summary
+// [Prefixed] wraps any [KV] so all keys are transparently namespaced with a
+// prefix — useful when sharing one backend among multiple middleware.
+// [EncodeJSON] / [DecodeJSON] are convenience helpers for adapters that
+// persist structured payloads through the byte-level [KV] surface.
+// [EncodedResponse] + [ResponseWireVersion] define the versioned wire format
+// used by cache and idempotency middleware to persist captured HTTP responses.
 //
-//   - Get returns (nil, [ErrNotFound]) on miss. (nil, nil) is forbidden.
-//   - Set with ttl == 0 stores with no expiry.
-//   - Delete is idempotent: deleting a missing key returns nil.
-//   - Values returned by Get are caller-owned; backends must copy.
-//   - All methods are safe for concurrent use.
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/data-stores
 package store
