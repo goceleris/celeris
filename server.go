@@ -538,8 +538,9 @@ func (s *Server) ResumeAccept() error {
 	return ac.ResumeAccept()
 }
 
-// Collector returns the metrics collector, or nil if the server has not been
-// started or if Config.DisableMetrics is true.
+// Collector returns the metrics collector. It is created eagerly in New, so it
+// is non-nil before Start is called; it returns nil only when
+// Config.DisableMetrics is true.
 func (s *Server) Collector() *observe.Collector {
 	return s.collector
 }

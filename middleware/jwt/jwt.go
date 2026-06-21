@@ -16,19 +16,28 @@ import (
 // errors.Is checks work (e.g. mixed jwt+keyauth stacks).
 var ErrUnauthorized = celeris.ErrUnauthorized
 
+// unauthorizedCause carries a jwt-specific detail message while chaining to
+// celeris.ErrUnauthorized. It lets errors.Is(err, celeris.ErrUnauthorized) match
+// every jwt rejection — consistent with keyauth and basicauth — without changing
+// the text surfaced by HTTPError.Error.
+type unauthorizedCause struct{ msg string }
+
+func (u *unauthorizedCause) Error() string { return u.msg }
+func (u *unauthorizedCause) Unwrap() error { return celeris.ErrUnauthorized }
+
 // ErrTokenMissing is returned when no token is found in the request.
-var ErrTokenMissing = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: missing or malformed token")}
+var ErrTokenMissing = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: &unauthorizedCause{"jwt: missing or malformed token"}}
 
 // ErrTokenInvalid is returned when the token fails validation for reasons
 // other than expiration or malformation (e.g., bad signature, unknown kid).
-var ErrTokenInvalid = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: invalid or expired token")}
+var ErrTokenInvalid = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: &unauthorizedCause{"jwt: invalid or expired token"}}
 
 // ErrJWTExpired is returned when the token's exp claim is in the past.
-var ErrJWTExpired = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: token has expired")}
+var ErrJWTExpired = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: &unauthorizedCause{"jwt: token has expired"}}
 
 // ErrJWTMalformed is returned when the token cannot be parsed (bad
 // encoding, wrong number of segments, etc.).
-var ErrJWTMalformed = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("jwt: token is malformed")}
+var ErrJWTMalformed = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: &unauthorizedCause{"jwt: token is malformed"}}
 
 // New creates a JWT authentication middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
