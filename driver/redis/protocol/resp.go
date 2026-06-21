@@ -606,6 +606,21 @@ func (w *Writer) WriteCommand(args ...string) []byte {
 	return w.AppendCommand(args...)
 }
 
+// WriteCommand2 resets the buffer and writes a 2-arg command without
+// allocating a []string slice — the fixed-arity sibling of [Writer.WriteCommand]
+// for hot single-key ops (e.g. GET key).
+func (w *Writer) WriteCommand2(a0, a1 string) []byte {
+	w.buf = w.buf[:0]
+	return w.AppendCommand2(a0, a1)
+}
+
+// WriteCommand3 resets the buffer and writes a 3-arg command without
+// allocating a []string slice (e.g. SET key val).
+func (w *Writer) WriteCommand3(a0, a1, a2 string) []byte {
+	w.buf = w.buf[:0]
+	return w.AppendCommand3(a0, a1, a2)
+}
+
 // AppendCommand appends one command to the buffer without resetting.
 func (w *Writer) AppendCommand(args ...string) []byte {
 	w.buf = append(w.buf, '*')

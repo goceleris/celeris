@@ -389,8 +389,16 @@ func (c *redisConn) sendRaw(data []byte) error {
 // EPOLLIN transparently.
 func (c *redisConn) execDirect(ctx context.Context, req *redisRequest, args ...string) (*redisRequest, error) {
 	c.writerMu.Lock()
-	defer c.writerMu.Unlock()
 	buf := c.state.writer.WriteCommand(args...)
+	return c.execDirectBuf(ctx, req, buf)
+}
+
+// execDirectBuf is the buffer-taking core of execDirect. The caller MUST hold
+// c.writerMu on entry; execDirectBuf releases it (it holds the lock for the
+// whole write+read round trip so concurrent writes can't clobber the buffer).
+// Shared by execDirect / exec2 / exec3.
+func (c *redisConn) execDirectBuf(ctx context.Context, req *redisRequest, buf []byte) (*redisRequest, error) {
+	defer c.writerMu.Unlock()
 	if c.syncBuf == nil {
 		c.syncBuf = make([]byte, 16<<10)
 	}
@@ -505,32 +513,7 @@ func (c *redisConn) exec(ctx context.Context, args ...string) (*redisRequest, er
 	if c.sync != nil {
 		c.writerMu.Lock()
 		buf := c.state.writer.WriteCommand(args...)
-		if c.syncBuf == nil {
-			c.syncBuf = make([]byte, 16<<10)
-		}
-		var ok bool
-		var err error
-		if c.useBusy {
-			ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
-		} else {
-			ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
-		}
-		c.writerMu.Unlock()
-		if err != nil {
-			_ = c.closeWithErr(err)
-			return nil, err
-		}
-		if ok {
-			select {
-			case <-req.doneCh:
-				return req, req.resultErr
-			default:
-			}
-			// Response processed but doneCh not yet signaled — rare, fall
-			// through to normal wait.
-		}
-		// EAGAIN or partial: fall through to blocking wait.
-		return req, c.wait(ctx, req)
+		return c.execSyncBuf(ctx, req, buf)
 	}
 
 	// Async path.
@@ -538,6 +521,101 @@ func (c *redisConn) exec(ctx context.Context, args ...string) (*redisRequest, er
 		_ = c.closeWithErr(err)
 		return nil, err
 	}
+	return req, c.wait(ctx, req)
+}
+
+// exec2 is the fixed-arity sibling of [redisConn.exec] for 2-arg commands
+// (e.g. GET key). It encodes via [protocol.Writer.WriteCommand2], avoiding
+// the per-call []string{...} argument slice that the variadic exec heap-
+// allocates. Wire bytes are byte-identical to exec("GET", key).
+func (c *redisConn) exec2(ctx context.Context, a0, a1 string) (*redisRequest, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
+	req := getRequest(ctx)
+	c.state.bridge.Enqueue(req)
+
+	if c.useDirect {
+		c.writerMu.Lock()
+		buf := c.state.writer.WriteCommand2(a0, a1)
+		return c.execDirectBuf(ctx, req, buf)
+	}
+	if c.sync != nil {
+		c.writerMu.Lock()
+		buf := c.state.writer.WriteCommand2(a0, a1)
+		return c.execSyncBuf(ctx, req, buf)
+	}
+	c.writerMu.Lock()
+	buf := c.state.writer.WriteCommand2(a0, a1)
+	err := c.loop.Write(c.fd, buf)
+	c.writerMu.Unlock()
+	if err != nil {
+		_ = c.closeWithErr(err)
+		return nil, err
+	}
+	return req, c.wait(ctx, req)
+}
+
+// exec3 is the fixed-arity sibling of [redisConn.exec] for 3-arg commands
+// (e.g. SET key val). Same allocation rationale as [redisConn.exec2].
+func (c *redisConn) exec3(ctx context.Context, a0, a1, a2 string) (*redisRequest, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
+	req := getRequest(ctx)
+	c.state.bridge.Enqueue(req)
+
+	if c.useDirect {
+		c.writerMu.Lock()
+		buf := c.state.writer.WriteCommand3(a0, a1, a2)
+		return c.execDirectBuf(ctx, req, buf)
+	}
+	if c.sync != nil {
+		c.writerMu.Lock()
+		buf := c.state.writer.WriteCommand3(a0, a1, a2)
+		return c.execSyncBuf(ctx, req, buf)
+	}
+	c.writerMu.Lock()
+	buf := c.state.writer.WriteCommand3(a0, a1, a2)
+	err := c.loop.Write(c.fd, buf)
+	c.writerMu.Unlock()
+	if err != nil {
+		_ = c.closeWithErr(err)
+		return nil, err
+	}
+	return req, c.wait(ctx, req)
+}
+
+// execSyncBuf drives the sync fast path given an already-encoded command
+// buffer. The caller MUST hold c.writerMu on entry; execSyncBuf releases it.
+// Shared by exec / exec2 / exec3 so the fixed-arity paths reuse the exact
+// poll logic without re-encoding.
+func (c *redisConn) execSyncBuf(ctx context.Context, req *redisRequest, buf []byte) (*redisRequest, error) {
+	if c.syncBuf == nil {
+		c.syncBuf = make([]byte, 16<<10)
+	}
+	var ok bool
+	var err error
+	if c.useBusy {
+		ok, err = c.syncBusy.WriteAndPollBusy(c.fd, buf, c.syncBuf, c.onRecvFn)
+	} else {
+		ok, err = c.sync.WriteAndPoll(c.fd, buf, c.syncBuf, c.onRecvFn)
+	}
+	c.writerMu.Unlock()
+	if err != nil {
+		_ = c.closeWithErr(err)
+		return nil, err
+	}
+	if ok {
+		select {
+		case <-req.doneCh:
+			return req, req.resultErr
+		default:
+		}
+		// Response processed but doneCh not yet signaled — rare, fall
+		// through to normal wait.
+	}
+	// EAGAIN or partial: fall through to blocking wait.
 	return req, c.wait(ctx, req)
 }
 
