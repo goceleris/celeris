@@ -129,4 +129,11 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// BytesWritten is the cumulative number of payload bytes sent to the
 	// network across all connections. See BytesRead.
 	BytesWritten uint64
+	// AdaptiveSwitches is the cumulative count of completed epoll⇄io_uring
+	// switches performed by the adaptive engine. Zero for non-adaptive
+	// engines, which never switch. Live switching is the adaptive engine's
+	// most complex path; surfacing the count lets ops and benchmarks
+	// correlate a throughput or tail-latency anomaly with switching activity
+	// (a rare switch transient can skew a single benchmark pass).
+	AdaptiveSwitches uint64
 }

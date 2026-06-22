@@ -39,6 +39,18 @@ var (
 // never constructs its standby, so that heap never exists. newFromEngines
 // (tests) populates BOTH slots eagerly, exercising the standby-already-exists
 // switch path.
+//
+// Lifecycle: the engine starts on epoll under the default policy and promotes
+// NEW connections to io_uring once a sustained high-concurrency ramp develops
+// (established connections are pinned and never migrate). Live switching is the
+// most complex path in this package and has historically been the source of
+// rare, hard-to-reproduce issues; the SwitchRejectedCount /
+// EngineMetrics.AdaptiveSwitches counters exist so a throughput anomaly can be
+// correlated with switching activity. Operators who need fully deterministic
+// behaviour can pin the start engine via CELERIS_ADAPTIVE_START=epoll|iouring
+// (see chooseStartEngine), which disables the runtime switch. For benchmarking,
+// run the adaptive columns multiple times: a rare switch transient can skew a
+// single pass.
 type Engine struct {
 	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
 	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
@@ -92,6 +104,12 @@ type Engine struct {
 	driverFDs       atomic.Int32  // driver FDs currently registered via the provider
 	cooldownFreezes atomic.Int32  // post-switch cooldown timers currently holding the freeze
 	switchRejected  atomic.Uint64 // telemetry: how many switches were blocked by driver FDs
+
+	// switchesTotal is the monotonic count of SUCCESSFUL epoll⇄io_uring
+	// switches (committed via active.Store). Rejected switches (driver FDs
+	// live, aborted lazy build) never increment it. Surfaced on Metrics as
+	// EngineMetrics.AdaptiveSwitches.
+	switchesTotal atomic.Uint64
 }
 
 // ioUringViable reports whether io_uring is worth running at all on this host:
@@ -621,6 +639,7 @@ func (e *Engine) performSwitch() {
 
 	eng := newActive
 	e.active.Store(&eng)
+	e.switchesTotal.Add(1)
 	e.switchMu.Lock()
 	e.ctrl.recordSwitch(now)
 	e.switchMu.Unlock()
@@ -751,6 +770,7 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		Throughput:         pm.Throughput + sm.Throughput,
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
+		AdaptiveSwitches:   e.switchesTotal.Load(),
 	}
 }
 
