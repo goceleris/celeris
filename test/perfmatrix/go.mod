@@ -18,7 +18,7 @@ require (
 	github.com/kataras/iris/v12 v12.2.11
 	github.com/labstack/echo/v4 v4.15.4
 	github.com/magefile/mage v1.17.2
-	github.com/redis/go-redis/v9 v9.20.1
+	github.com/redis/go-redis/v9 v9.21.0
 	github.com/valyala/fasthttp v1.71.0
 	golang.org/x/net v0.56.0
 	golang.org/x/time v0.15.0
