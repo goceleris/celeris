@@ -30,7 +30,32 @@ const (
 	// memory. Same ceiling as the output side (4 MiB) — a full
 	// saturated buffer pair is 8 MiB per conn.
 	maxPendingInputBytes = 4 << 20
+	// pooledBufCap is the largest backing-array capacity a per-conn
+	// buffer may retain when its connState returns to connStatePool.
+	// asyncInBuf / asyncOutBuf / writeBuf all grow via append to hold a
+	// burst (up to writeCap = 4–64 MiB); a single multi-MB request would
+	// otherwise pin that oversized array in the pool forever, inflating
+	// pooled connState memory (the epoll-h1-async peak-RSS outlier). On
+	// release a buffer whose cap exceeds this bound is dropped (set nil)
+	// so the GC reclaims it; acquireConnState / append lazily re-grow a
+	// fresh small backing array. Buffers at or below the bound keep their
+	// capacity, so the zero-alloc steady state (small responses, sub-64 K
+	// pipelines) is unchanged. cs.buf is intentionally excluded: it is
+	// fixed at resource.BufferSize and never grows past it.
+	pooledBufCap = 64 << 10
 )
+
+// trimPooledBuf returns b reset to zero length if its capacity is within the
+// pooled bound, or nil if it grew past pooledBufCap. Dropping the oversized
+// backing array on release keeps a connState that handled one large burst
+// from permanently inflating connStatePool; the common small-buffer path
+// keeps its capacity and stays allocation-free.
+func trimPooledBuf(b []byte) []byte {
+	if cap(b) > pooledBufCap {
+		return nil
+	}
+	return b[:0]
+}
 
 // writeCap returns the effective back-pressure limit for cs, accounting
 // for whether the connection is detached. Async-mode HTTP1 conns set
@@ -209,8 +234,9 @@ func releaseConnState(cs *connState) {
 		cs.sendfile.close()
 		cs.sendfile = nil
 	}
-	cs.asyncInBuf = cs.asyncInBuf[:0]
-	cs.asyncOutBuf = cs.asyncOutBuf[:0]
+	cs.asyncInBuf = trimPooledBuf(cs.asyncInBuf)
+	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
+	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.asyncPromoted = false

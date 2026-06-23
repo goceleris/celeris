@@ -119,6 +119,41 @@ func BenchmarkContextBlob(b *testing.B) {
 	}
 }
 
+// BenchmarkContextBlobFullStackHeadersCold measures a Blob response carrying a
+// fullstack-volume header set (18 user + content-type + content-length = 20)
+// on a cold Context — each iteration resets respHeaders to the inline buffer
+// and nils the scratch arrays, mirroring the first header-heavy request a
+// freshly-pooled Context serves under production pool churn. With the old
+// 16-slot respHdrBuf this path allocated the overflow scratch every iteration;
+// the 24-slot buffer keeps it inline (zero allocations).
+func BenchmarkContextBlobFullStackHeadersCold(b *testing.B) {
+	s, _ := newTestStream("GET", "/")
+	defer s.Release()
+	s.ResponseWriter = nopRW{} // isolate the header-buffer path from writer copies
+
+	keys := make([]string, 18)
+	for i := range keys {
+		keys[i] = "x-h" + string(rune('a'+i))
+	}
+	payload := []byte("Hello, World!")
+	c := acquireContext(s)
+	defer releaseContext(c)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		// Simulate a cold pooled Context: inline buffer, no warm scratch.
+		c.respHeaders = c.respHdrBuf[:0]
+		c.respHdrScratch = nil
+		c.blobHdrScratch = nil
+		c.written = false
+		for _, k := range keys {
+			c.SetHeaderTrust(k, "v")
+		}
+		_ = c.Blob(200, "application/json", payload)
+	}
+}
+
 func BenchmarkHandlerChain(b *testing.B) {
 	s, rw := newTestStream("GET", "/")
 	defer s.Release()

@@ -22,48 +22,19 @@
 //	    JWKSRefresh: 30 * time.Minute,
 //	}))
 //
-// # Retrieving Token and Claims
+// Retrieve the validated token and claims in a handler:
 //
 //	token := jwt.TokenFromContext(c)
 //	claims, ok := jwt.ClaimsFromContext[jwt.MapClaims](c)
 //
-// # Token Lookup
+// Key configuration options: [Config].TokenLookup controls where the token is
+// extracted (comma-separated "source:name[:prefix]" pairs tried in order;
+// default "header:Authorization:Bearer "). [Config].ClaimsFactory creates a
+// fresh [Claims] instance per request for custom struct types. [Config].Skip
+// and [Config].SkipPaths bypass the middleware dynamically or by exact path.
+// Use [SignToken] to create signed tokens for testing or token issuance.
 //
-// [Config].TokenLookup supports comma-separated sources tried in order.
-// Format: "source:name[:prefix]". Sources: header, query, cookie, form, param.
+// # Documentation
 //
-// # Custom Claims
-//
-// Use [Config].ClaimsFactory for custom struct claims types:
-//
-//	jwt.New(jwt.Config{
-//	    SigningKey: secret,
-//	    ClaimsFactory: func() jwt.Claims { return &MyClaims{} },
-//	})
-//
-// # Creating Tokens
-//
-//	token, err := jwt.SignToken(jwt.SigningMethodHS256, jwt.MapClaims{
-//	    "sub": "user-123",
-//	    "exp": float64(time.Now().Add(time.Hour).Unix()),
-//	}, []byte("secret"))
-//
-// # Security Best Practices
-//
-// Always set "exp" on issued tokens. Use "aud" with [WithAudience] to
-// prevent token confusion. Prefer asymmetric algorithms (RS256, ES256) in
-// multi-service deployments. Store keys in environment variables or a
-// secrets manager. Serve JWKS endpoints over HTTPS.
-//
-// # Algorithm-Key-Type Binding
-//
-//   - HS256/HS384/HS512: []byte
-//   - RS256/RS384/RS512/PS256/PS384/PS512: *rsa.PublicKey / *rsa.PrivateKey
-//   - ES256/ES384/ES512: *ecdsa.PublicKey / *ecdsa.PrivateKey
-//   - EdDSA: ed25519.PublicKey / ed25519.PrivateKey
-//
-// # Skipping
-//
-// Set [Config].Skip to bypass dynamically, or [Config].SkipPaths for
-// exact-match path exclusions.
+// Full guides and examples: https://goceleris.dev/docs/middleware-auth
 package jwt

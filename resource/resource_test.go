@@ -156,3 +156,31 @@ func TestConfigMaxRequestBodySizeDefaults(t *testing.T) {
 		t.Fatalf("expected 0 (unlimited), got %d", c.MaxRequestBodySize)
 	}
 }
+
+func TestDeriveMemoryLimit(t *testing.T) {
+	const mib = 1 << 20
+	// Floor: low worker counts clamp to 256 MiB.
+	if got := DeriveMemoryLimit(0); got != 256*mib {
+		t.Fatalf("DeriveMemoryLimit(0) = %d, want %d", got, 256*mib)
+	}
+	if got := DeriveMemoryLimit(4); got != 256*mib {
+		t.Fatalf("DeriveMemoryLimit(4) = %d, want %d (4*32=128 MiB < floor)", got, 256*mib)
+	}
+	// Above the floor: scales at 32 MiB/worker.
+	if got := DeriveMemoryLimit(16); got != 512*mib {
+		t.Fatalf("DeriveMemoryLimit(16) = %d, want %d", got, 512*mib)
+	}
+}
+
+func TestMemoryLimitBytesValidation(t *testing.T) {
+	// 0 (unset) and positive values are accepted; negative is rejected.
+	if err := (Config{Resources: Resources{MemoryLimitBytes: 0}}).Validate(); err != nil {
+		t.Fatalf("MemoryLimitBytes=0 must be valid (unset), got %v", err)
+	}
+	if err := (Config{Resources: Resources{MemoryLimitBytes: 256 << 20}}).Validate(); err != nil {
+		t.Fatalf("MemoryLimitBytes=256MiB must be valid, got %v", err)
+	}
+	if err := (Config{Resources: Resources{MemoryLimitBytes: -1}}).Validate(); err == nil {
+		t.Fatal("MemoryLimitBytes=-1 must be rejected")
+	}
+}

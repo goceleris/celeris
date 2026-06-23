@@ -1,55 +1,35 @@
 // Package recovery provides panic recovery middleware for celeris.
 //
-// The middleware catches panics from downstream handlers, logs the
-// stack trace via slog, and returns a configurable error response
-// instead of crashing the server.
+// The middleware catches panics from downstream handlers, logs the stack trace
+// via slog, and returns a configurable error response instead of crashing the
+// server. Register it as early as possible in the middleware chain so it wraps
+// all other handlers.
 //
 // Basic usage with defaults (4 KB stack trace, JSON 500 response):
 //
 //	server.Use(recovery.New())
 //
-// Custom error handler and stack size:
+// [New] accepts an optional [Config] to customise behaviour. Key fields:
+//   - [Config].ErrorHandlerErr — preferred error handler (receives a typed error).
+//   - [Config].ErrorHandler — legacy handler (receives any); kept for compatibility.
+//   - [Config].BrokenPipeHandler — custom handler for broken pipe / ECONNRESET panics.
+//   - [Config].StackSize — max bytes for stack trace capture (default 4096; 0 disables).
+//   - [Config].DisableLogStack — suppress all panic log output when true.
+//   - [Config].LogLevel — slog level for normal panic entries (default [slog.LevelError]).
+//   - [Config].Logger — slog logger (default [slog.Default]).
+//   - [Config].Skip / [Config].SkipPaths — skip recovery for selected requests.
 //
-//	server.Use(recovery.New(recovery.Config{
-//	    StackSize: 8192,
-//	    ErrorHandler: func(c *celeris.Context, err any) error {
-//	        return c.String(500, "Something went wrong")
-//	    },
-//	}))
+// Panics with [http.ErrAbortHandler] are re-panicked to preserve standard
+// library abort semantics. Broken pipe and ECONNRESET panics are logged at
+// WARN level without a stack trace.
 //
-// Set [Config].StackSize to 0 to disable stack trace capture (the panic
-// value, method, and path are still logged). Set [Config].DisableLogStack
-// to true to suppress panic logging entirely.
+// The package exports sentinel errors for use with [errors.Is]:
+//   - [ErrPanic]: generic panic recovery.
+//   - [ErrBrokenPipe]: broken pipe or ECONNRESET.
+//   - [ErrPanicContextCancelled]: panic after request context was cancelled.
+//   - [ErrPanicResponseCommitted]: panic after response has been committed.
 //
-// # Special Panic Types
+// # Documentation
 //
-// Panics with [http.ErrAbortHandler] are re-panicked rather than
-// recovered, preserving the standard library's abort semantics.
-//
-// Broken pipe and ECONNRESET errors are detected automatically and
-// logged at WARN level without a stack trace. Use
-// [Config].BrokenPipeHandler to customize the response for these cases.
-//
-// # Nested Recovery
-//
-// If [Config].ErrorHandler itself panics, the middleware falls back to
-// a default 500 Internal Server Error response.
-//
-// # Log Level
-//
-// Set [Config].LogLevel to control the slog level for normal panic log
-// entries (default: [slog.LevelError]). Broken pipe panics are always
-// logged at [slog.LevelWarn] regardless of this setting.
-//
-// # Sentinel Errors
-//
-// The package exports sentinel errors for use with errors.Is:
-//   - [ErrPanic]: generic panic recovery
-//   - [ErrBrokenPipe]: broken pipe or ECONNRESET
-//   - [ErrPanicContextCancelled]: panic after the request context was cancelled
-//   - [ErrPanicResponseCommitted]: panic after the response has been committed
-//
-// # Middleware Order
-//
-// Register after logger/metrics so they see the 500 status from recovered panics.
+// Full guides and examples: https://goceleris.dev/docs/error-handling
 package recovery

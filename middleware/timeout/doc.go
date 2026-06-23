@@ -1,54 +1,34 @@
 // Package timeout provides request timeout middleware for celeris.
 //
-// The middleware wraps each request's context with a deadline. If the
-// downstream handler does not complete before the deadline, the context
-// is cancelled and a configurable error response is returned.
+// [New] returns a [celeris.HandlerFunc] that wraps each request's context
+// with a deadline. If the downstream handler does not complete within the
+// configured duration, the context is cancelled and a configurable error
+// response is returned.
 //
-// Basic usage with the default 5-second timeout:
+// Key exported symbols:
 //
-//	server.Use(timeout.New())
+//   - [New] — constructs the middleware from a [Config].
+//   - [Config] — options: [Config.Timeout] (static duration, default 5 s),
+//     [Config.TimeoutFunc] (per-request duration; overrides Timeout when > 0),
+//     [Config.ErrorHandler] (called on timeout; default returns 503),
+//     [Config.TimeoutErrors] (treat matching upstream errors as timeouts),
+//     [Config.Preemptive] (run handler in a goroutine; see below),
+//     [Config.Skip] / [Config.SkipPaths] (bypass the middleware).
+//   - [ErrServiceUnavailable] — sentinel 503 error; aliases
+//     celeris.ErrServiceUnavailable for cross-middleware errors.Is matching.
 //
-// Custom timeout and error handler:
+// Cooperative mode (default, Preemptive: false): the handler runs in the
+// request goroutine with the context deadline set. Handlers must observe
+// c.Context().Done() to respect the cancellation. No goroutine or buffer
+// overhead.
 //
-//	server.Use(timeout.New(timeout.Config{
-//	    Timeout: 10 * time.Second,
-//	    ErrorHandler: func(c *celeris.Context, err error) error {
-//	        return c.JSON(503, map[string]string{"error": "timed out"})
-//	    },
-//	}))
+// Preemptive mode (Preemptive: true): the handler runs in a spawned goroutine
+// with the response buffered. When the deadline expires the middleware waits
+// for the goroutine to exit, discards the buffered response, and invokes the
+// error handler. Handlers MUST exit promptly on context cancellation to avoid
+// blocking the connection. Incompatible with streaming (StreamWriter).
 //
-// Set [Config].Preemptive to true to run the handler in a separate
-// goroutine with response buffering. In preemptive mode, the middleware
-// returns the timeout error immediately when the deadline expires, even
-// if the handler is blocked on a non-context-aware operation.
+// # Documentation
 //
-// Set [Config].TimeoutFunc to compute a timeout dynamically per request.
-// The static [Config].Timeout is used as a fallback when TimeoutFunc is
-// nil or returns a non-positive duration.
-//
-// In cooperative mode (default), the handler runs in the request
-// goroutine. The context deadline is set, but the handler must check
-// c.Context().Done() to respect the timeout. Cooperative mode has no
-// extra goroutine overhead and no response buffering cost.
-//
-// [Config].ErrorHandler receives the triggering error
-// (context.DeadlineExceeded, a matched TimeoutErrors entry, or a
-// panic-wrapped error). If it panics, [ErrServiceUnavailable] is
-// returned as a last-resort fallback.
-//
-// [Config].TimeoutErrors lists errors that should be treated as
-// timeouts even if the deadline has not been reached (e.g., database
-// query timeouts).
-//
-// [ErrServiceUnavailable] is the exported sentinel error (503) returned
-// when no custom error handler is configured, usable with errors.Is.
-//
-// Set [Config].Skip to bypass the middleware dynamically, or
-// [Config].SkipPaths for exact-match path exclusions.
-//
-// Warning: In preemptive mode, if the handler does not exit promptly
-// after context cancellation, the middleware goroutine blocks waiting
-// for the handler to complete. This ties up the connection and prevents
-// the Context from being returned to the pool. Handlers MUST check
-// c.Context().Done() and return quickly on cancellation.
+// Full guides and examples: https://goceleris.dev/docs/middleware-traffic
 package timeout

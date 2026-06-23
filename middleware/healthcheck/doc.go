@@ -5,29 +5,20 @@
 // paths (default "/livez", "/readyz", "/startupz") and returns a JSON
 // status response. Non-matching requests pass through with zero overhead.
 //
-// Basic usage (all probes return 200):
+// Key exported symbols: [New] constructs the handler; [Config] controls probe
+// paths, per-probe [Checker] functions, the [Config].Skip bypass predicate,
+// and [Config].CheckerTimeout (default [DefaultCheckerTimeout], 5 s). Set
+// [Config].CheckerTimeout to [FastPathTimeout] for trivial checkers that
+// cannot block (runs inline, no goroutine overhead). Panicking checkers are
+// recovered and return 503.
 //
-//	server.Use(healthcheck.New())
-//
-// Custom readiness check:
-//
-//	server.Use(healthcheck.New(healthcheck.Config{
-//	    ReadyChecker: func(_ *celeris.Context) bool {
-//	        return db.Ping() == nil
-//	    },
-//	}))
-//
-// Each checker is guarded by [Config].CheckerTimeout (default 5s); if it
-// does not return in time the probe responds 503. Set CheckerTimeout to
-// [FastPathTimeout] for trivial checkers that cannot block (runs inline,
-// no goroutine overhead). Panicking checkers are recovered and return 503.
-//
-// Setting a probe path to "" disables that probe. [Config].Skip bypasses
-// the middleware before path matching.
-//
-// Invalid paths (missing leading '/') or overlapping enabled paths cause
-// a panic at initialization. These are programming errors caught early.
+// Setting a probe path to "" disables that probe. Invalid paths (missing
+// leading '/') or overlapping enabled paths cause a panic at initialization.
 //
 // Response format: 200 {"status":"ok"} / 503 {"status":"unavailable"}.
 // HEAD requests return the status code with no body.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/middleware
 package healthcheck

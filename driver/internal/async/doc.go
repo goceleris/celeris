@@ -21,7 +21,7 @@
 //   - [Backoff]: exponential-with-jitter delay computation for retry
 //     loops. Not safe for concurrent use.
 //
-//   - Internal [health] checker scheduled by the pool.
+//   - Internal health checker scheduled by the pool.
 //
 // Drivers build their user-facing API (postgres.Pool, redis.Client) by
 // composing these primitives with a protocol-specific dispatch loop.

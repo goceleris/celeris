@@ -211,7 +211,7 @@ func TestContextFullPath(t *testing.T) {
 // fixed-size respHdrBuf beyond its capacity:
 //
 //	clear(c.respHdrBuf[:n])  →  panic: runtime error: slice bounds
-//	                            out of range [:17] with length 16
+//	                            out of range [:n] with length len(respHdrBuf)
 //
 // On the iouring/epoll engines the panic propagated through
 // recoverAndRelease AFTER WriteResponse had queued bytes into the
@@ -224,17 +224,18 @@ func TestContextResetWithOverflowedRespHeaders(t *testing.T) {
 	defer s.Release()
 
 	c := acquireContext(s)
-	// Push 20 headers — overflows respHdrBuf (16 slots) and forces
+	// Push 28 headers — overflows respHdrBuf (24 slots) and forces
 	// append() to allocate a new backing array.
-	for i := 0; i < 20; i++ {
+	const nHdr = 28
+	for i := 0; i < nHdr; i++ {
 		c.SetHeader("x-test-"+strconv.Itoa(i), "v")
 	}
-	if got := len(c.respHeaders); got != 20 {
-		t.Fatalf("expected 20 headers staged, got %d", got)
+	if got := len(c.respHeaders); got != nHdr {
+		t.Fatalf("expected %d headers staged, got %d", nHdr, got)
 	}
 
 	// Pre-fix this would panic with "slice bounds out of range
-	// [:20] with length 16". Recover so the test framework reports
+	// [:28] with length 24". Recover so the test framework reports
 	// the panic clearly rather than crashing the whole process.
 	defer func() {
 		if r := recover(); r != nil {
@@ -250,22 +251,23 @@ func TestContextResetWithOverflowedRespHeaders(t *testing.T) {
 }
 
 // TestContextRespHeaderOverflowReuseZeroAlloc locks in celeris#360: once a
-// middleware stack pushes respHeaders past the inline 16-slot respHdrBuf, the
-// grown heap backing array is retained as respHdrScratch and reused on every
-// subsequent request — so a >16-header route allocates the backing array ONCE
-// per pooled Context, not once per request (chain-fullstack: 17 headers).
+// middleware stack pushes respHeaders past the inline respHdrBuf, the grown
+// heap backing array is retained as respHdrScratch and reused on every
+// subsequent request — so an overflow route allocates the backing array ONCE
+// per pooled Context, not once per request.
 func TestContextRespHeaderOverflowReuseZeroAlloc(t *testing.T) {
 	s, _ := newTestStream("GET", "/test")
 	defer s.Release()
 	c := acquireContext(s)
 	defer releaseContext(c)
 
-	// 17 clean lowercase headers > respHdrBuf's 16 slots → forces the heap path.
+	// 25 clean lowercase headers > respHdrBuf's 24 slots → forces the heap path.
 	hdrs := [][2]string{
 		{"h00", "v"}, {"h01", "v"}, {"h02", "v"}, {"h03", "v"}, {"h04", "v"},
 		{"h05", "v"}, {"h06", "v"}, {"h07", "v"}, {"h08", "v"}, {"h09", "v"},
 		{"h10", "v"}, {"h11", "v"}, {"h12", "v"}, {"h13", "v"}, {"h14", "v"},
-		{"h15", "v"}, {"h16", "v"},
+		{"h15", "v"}, {"h16", "v"}, {"h17", "v"}, {"h18", "v"}, {"h19", "v"},
+		{"h20", "v"}, {"h21", "v"}, {"h22", "v"}, {"h23", "v"}, {"h24", "v"},
 	}
 	avg := testing.AllocsPerRun(500, func() {
 		for _, h := range hdrs {
@@ -288,8 +290,8 @@ type nopRW struct{}
 func (nopRW) WriteResponse(_ *stream.Stream, _ int, _ [][2]string, _ []byte) error { return nil }
 
 // TestContextBlobManyHeadersZeroAlloc locks in the chain-fullstack fix: when a
-// response carries more than the inline-buffer's headers (15 user + content-type
-// + content-length = 17 > 16), Blob must reuse blobHdrScratch instead of
+// response carries more than the inline-buffer's headers (25 user + content-type
+// + content-length = 27 > 24), Blob must reuse blobHdrScratch instead of
 // allocating make([][2]string,0,total) every request — that was the dominant
 // per-request allocation (≈77% of chain-fullstack allocs → GC pressure).
 func TestContextBlobManyHeadersZeroAlloc(t *testing.T) {
@@ -299,8 +301,9 @@ func TestContextBlobManyHeadersZeroAlloc(t *testing.T) {
 	c := acquireContext(s)
 	defer releaseContext(c)
 
-	// 15 user headers ⇒ total 17 > respHdrBuf's 16 ⇒ Blob's many-header path.
-	for i := 0; i < 15; i++ {
+	// 25 user headers ⇒ total 27 > respHdrBuf's 24 ⇒ Blob's many-header path.
+	const nUser = 25
+	for i := 0; i < nUser; i++ {
 		c.SetHeader("h"+strconv.Itoa(i), "v")
 	}
 	body := []byte("hello")
@@ -311,8 +314,49 @@ func TestContextBlobManyHeadersZeroAlloc(t *testing.T) {
 	if avg != 0 {
 		t.Fatalf("Blob many-header path must reuse blobHdrScratch: got %.2f allocs/op, want 0", avg)
 	}
-	if cap(c.blobHdrScratch) < 17 {
-		t.Fatalf("blobHdrScratch should retain a >=17 cap backing array, got cap=%d", cap(c.blobHdrScratch))
+	if cap(c.blobHdrScratch) < nUser+2 {
+		t.Fatalf("blobHdrScratch should retain a >=%d cap backing array, got cap=%d", nUser+2, cap(c.blobHdrScratch))
+	}
+}
+
+// TestContextFullStackHeadersInlineNoScratch locks in the B4 respHdrBuf bump:
+// a fullstack-volume response (18 user headers + content-type + content-length
+// = 20) now fits the inline respHdrBuf, so neither the respHdrScratch (SetHeader
+// overflow) nor the blobHdrScratch (Blob overflow) heap backing array is ever
+// allocated for it. With the old 16-slot buffer both were forced into being on
+// the first such request per pooled Context; 24 slots absorb the chain inline.
+func TestContextFullStackHeadersInlineNoScratch(t *testing.T) {
+	s, _ := newTestStream("GET", "/test")
+	defer s.Release()
+	s.ResponseWriter = nopRW{}
+	c := acquireContext(s)
+	defer releaseContext(c)
+	// Start from a pristine inline buffer: a pooled Context may carry a warm
+	// scratch array from a prior test, which would mask the buffer-size check.
+	c.respHeaders = c.respHdrBuf[:0]
+	c.respHdrScratch = nil
+	c.blobHdrScratch = nil
+
+	for i := 0; i < 18; i++ {
+		c.SetHeaderTrust("h"+strconv.Itoa(i), "v")
+	}
+	if got, want := len(c.respHeaders), 18; got != want {
+		t.Fatalf("expected %d staged headers, got %d", want, got)
+	}
+	// 18 user headers must not have grown respHeaders off the inline buffer.
+	if cap(c.respHeaders) > len(c.respHdrBuf) {
+		t.Fatalf("18 headers escaped the inline respHdrBuf: cap=%d > %d", cap(c.respHeaders), len(c.respHdrBuf))
+	}
+	if c.respHdrScratch != nil {
+		t.Fatal("respHdrScratch allocated for a 18-header response that fits inline")
+	}
+	if err := c.Blob(200, "application/json", []byte("hello")); err != nil {
+		t.Fatalf("Blob: %v", err)
+	}
+	// 20 total headers (18 + content-type + content-length) must not have hit
+	// Blob's many-header scratch path.
+	if c.blobHdrScratch != nil {
+		t.Fatal("blobHdrScratch allocated for a 20-header response that fits inline")
 	}
 }
 

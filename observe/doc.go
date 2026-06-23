@@ -7,4 +7,8 @@
 //
 // For Prometheus and debug endpoint integration, see the
 // middleware/metrics package.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/observability
 package observe

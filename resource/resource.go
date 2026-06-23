@@ -40,6 +40,32 @@ type Resources struct {
 	// WorkloadHint is an OPTIONAL operator concurrency declaration; the only
 	// input that can make the adaptive engine START on io_uring (see WorkloadHint).
 	WorkloadHint WorkloadHint
+	// MemoryLimitBytes is an OPTIONAL soft heap ceiling (runtime/debug
+	// SetMemoryLimit). 0 = unset: celeris does not touch the process GC, so
+	// embedders keep full control. When >0, the server applies it at start —
+	// the GC then collects before the heap balloons during a connection-ramp
+	// burst (with the default GOGC=100 the live-heap-doubling ramp spike is
+	// the dominant peak-RSS contributor), trading a few extra GC cycles
+	// during the ramp for a lower high-water mark; steady-state RSS sits far
+	// below the limit so steady throughput is unaffected. NOTE: SetMemoryLimit
+	// is PROCESS-GLOBAL, so this is opt-in only — set it just when celeris
+	// owns the process (e.g. a dedicated server binary). See DeriveMemoryLimit.
+	MemoryLimitBytes int64
+}
+
+// DeriveMemoryLimit returns a generous soft heap ceiling for `workers` I/O
+// workers: max(256 MiB, workers*32 MiB). It is sized HIGH on purpose — the
+// goal is to clip the connection-ramp balloon, not to run the heap tight
+// (a too-tight limit GC-thrashes under load). Operators that want the
+// peak-RSS reduction pass this into Resources.MemoryLimitBytes; it is never
+// applied implicitly.
+func DeriveMemoryLimit(workers int) int64 {
+	const floor = 256 << 20 // 256 MiB
+	per := int64(workers) * (32 << 20)
+	if per < floor {
+		return floor
+	}
+	return per
 }
 
 // ResolvedResources contains the final computed values after applying defaults,

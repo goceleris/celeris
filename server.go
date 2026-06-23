@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -538,8 +539,9 @@ func (s *Server) ResumeAccept() error {
 	return ac.ResumeAccept()
 }
 
-// Collector returns the metrics collector, or nil if the server has not been
-// started or if Config.DisableMetrics is true.
+// Collector returns the metrics collector. It is created eagerly in New, so it
+// is non-nil before Start is called; it returns nil only when
+// Config.DisableMetrics is true.
 func (s *Server) Collector() *observe.Collector {
 	return s.collector
 }
@@ -635,6 +637,16 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		s.cpuMonMu.Lock()
 		s.cpuMon = cpuMon
 		s.cpuMonMu.Unlock()
+
+		// Optional process-global soft heap ceiling, applied before the
+		// engine allocates its per-worker tables so the first GC target is
+		// already in force during the connection ramp. Opt-in only
+		// (Resources.MemoryLimitBytes>0) — see the field doc for the
+		// library-global caveat. -1 (no limit) is the runtime default we
+		// never override implicitly.
+		if lim := cfg.Resources.MemoryLimitBytes; lim > 0 {
+			debug.SetMemoryLimit(lim)
+		}
 
 		var err error
 		eng, err = createEngine(cfg, handler, cpuMon)

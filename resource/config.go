@@ -125,6 +125,10 @@ func (c Config) Validate() []error {
 		errs = append(errs, fmt.Errorf("bufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
 	}
 
+	if c.Resources.MemoryLimitBytes < 0 {
+		errs = append(errs, fmt.Errorf("memoryLimitBytes must be >= 0 (0 = unset), got %d", c.Resources.MemoryLimitBytes))
+	}
+
 	if c.ReadTimeout < -1 {
 		errs = append(errs, fmt.Errorf("readTimeout must be >= -1, got %v", c.ReadTimeout))
 	}

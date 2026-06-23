@@ -6,4 +6,8 @@
 // that alias the connection's read buffer — callers must materialize
 // (clone) any value they retain past the next [ParseRequest] call on the
 // same connection.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/engines
 package h1

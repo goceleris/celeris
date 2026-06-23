@@ -39,21 +39,26 @@ func (c *Client) do(ctx context.Context, fn func(v protocol.Value) error, args .
 	return ferr
 }
 
-// doRead is the zero-closure fast path for Get/GetBytes/HGet/HGetAll/etc.
-// — any read that returns a single Value. Avoids the per-call heap-allocated
-// closure that `do` requires (the closure captures the caller's output var,
-// forcing it to escape). Callers must decode req.result themselves and call
-// releaseResult before the conn is released.
-//
-// Returns (result, err). The result aliases the conn's reader buffer and
-// is valid only until releaseResult is called — callers that retain bytes
-// must copy via asBytes / copyValueDetached first.
-func (c *Client) doRead(ctx context.Context, args ...string) (protocol.Value, *redisRequest, *redisConn, error) {
+// releaseDoRead finalises a fixed-arity read (doRead2/doRead3) — must be
+// paired with every successful read return. Callers decode req.result
+// themselves and call this before the conn is reused.
+func (c *Client) releaseDoRead(req *redisRequest, conn *redisConn) {
+	conn.releaseResult(req)
+	c.pool.releaseCmd(conn)
+}
+
+// doRead2 is the fixed-arity (2-arg) zero-closure read fast path. It threads
+// the verb+key through [redisConn.exec2], which encodes via WriteCommand2 —
+// avoiding both the per-call heap-allocated closure that `do` requires AND
+// the per-call []string{verb, key} arg slice. Used by the hot single-key
+// reads (GET, GETDEL, ...). The result aliases the conn's reader buffer and
+// is valid only until releaseDoRead — retained bytes must be copied first.
+func (c *Client) doRead2(ctx context.Context, a0, a1 string) (protocol.Value, *redisRequest, *redisConn, error) {
 	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
 	if err != nil {
 		return protocol.Value{}, nil, nil, err
 	}
-	req, err := conn.exec(ctx, args...)
+	req, err := conn.exec2(ctx, a0, a1)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			c.pool.discardCmd(conn)
@@ -71,11 +76,27 @@ func (c *Client) doRead(ctx context.Context, args ...string) (protocol.Value, *r
 	return req.result, req, conn, nil
 }
 
-// release finalises a doRead call — must be paired with every successful
-// doRead return.
-func (c *Client) releaseDoRead(req *redisRequest, conn *redisConn) {
+// do3 is the fixed-arity (3-arg) sibling of [Client.do] for write commands
+// whose reply is discarded (e.g. SET key val). Encodes via WriteCommand3 to
+// skip the per-call []string{verb, key, val} slice.
+func (c *Client) do3(ctx context.Context, a0, a1, a2 string) error {
+	conn, err := c.pool.acquireCmd(ctx, workerFromCtx(ctx))
+	if err != nil {
+		return err
+	}
+	req, err := conn.exec3(ctx, a0, a1, a2)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			c.pool.discardCmd(conn)
+		} else {
+			c.pool.releaseCmd(conn)
+		}
+		return err
+	}
+	rerr := req.resultErr
 	conn.releaseResult(req)
 	c.pool.releaseCmd(conn)
+	return rerr
 }
 
 // ---------- decoding helpers ----------
@@ -263,7 +284,7 @@ func argify(v any) string {
 // Get retrieves the string value at key. Returns [ErrNil] when the key is
 // missing.
 func (c *Client) Get(ctx context.Context, key string) (string, error) {
-	v, req, conn, err := c.doRead(ctx, "GET", key)
+	v, req, conn, err := c.doRead2(ctx, "GET", key)
 	if err != nil {
 		return "", err
 	}
@@ -274,7 +295,7 @@ func (c *Client) Get(ctx context.Context, key string) (string, error) {
 
 // GetBytes is the []byte variant of Get. The returned slice is a fresh copy.
 func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
-	v, req, conn, err := c.doRead(ctx, "GET", key)
+	v, req, conn, err := c.doRead2(ctx, "GET", key)
 	if err != nil {
 		return nil, err
 	}
@@ -286,6 +307,9 @@ func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
 // Set stores value at key. If expiration > 0, an EX argument is appended with
 // whole-second granularity (or PX for sub-second).
 func (c *Client) Set(ctx context.Context, key string, value any, expiration time.Duration) error {
+	if expiration <= 0 {
+		return c.do3(ctx, "SET", key, argify(value))
+	}
 	args := []string{"SET", key, argify(value)}
 	args = appendExpire(args, expiration)
 	return c.do(ctx, func(protocol.Value) error { return nil }, args...)
@@ -297,6 +321,9 @@ func (c *Client) Set(ctx context.Context, key string, value any, expiration time
 // and does not retain the string past the round trip. Skips argify's
 // interface type switch + allocating string(x) for the []byte case.
 func (c *Client) SetBytes(ctx context.Context, key string, value []byte, expiration time.Duration) error {
+	if expiration <= 0 {
+		return c.do3(ctx, "SET", key, unsafeStringFromBytes(value))
+	}
 	args := []string{"SET", key, unsafeStringFromBytes(value)}
 	args = appendExpire(args, expiration)
 	return c.do(ctx, func(protocol.Value) error { return nil }, args...)

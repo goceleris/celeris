@@ -581,8 +581,10 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 	if total <= len(c.respHdrBuf) {
 		// respHeaders shares backing array with respHdrBuf — copy user
 		// headers to a stack temporary before overwriting the buffer.
-		// Max user headers in fast path: len(respHdrBuf) - 2 = 14.
-		var tmp [14][2]string
+		// Sized respHdrBufCap - 2: the max user headers reachable on this
+		// path once content-type + content-length take two slots. Derived
+		// from the same const as respHdrBuf so the two cannot drift.
+		var tmp [respHdrBufCap - 2][2]string
 		copy(tmp[:nUser], c.respHeaders)
 		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
 		headers = append(headers, [2]string{"content-type", ct})
@@ -590,8 +592,8 @@ func (c *Context) Blob(code int, contentType string, data []byte) error {
 		headers = append(headers, tmp[:nUser]...)
 	} else {
 		// Reuse a per-Context scratch instead of allocating per request — the
-		// dominant chain-fullstack alloc (18 headers > respHdrBuf's 16) lived
-		// here. respHeaders never aliases blobHdrScratch (separate buffers; the
+		// dominant header-heavy Blob alloc (total > respHdrBuf) lived here.
+		// respHeaders never aliases blobHdrScratch (separate buffers; the
 		// append below copies the [2]string values).
 		if cap(c.blobHdrScratch) < total {
 			c.blobHdrScratch = make([][2]string, 0, total)

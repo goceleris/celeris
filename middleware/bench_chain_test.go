@@ -227,7 +227,7 @@ func BenchmarkChainPreRouting(b *testing.B) {
 }
 
 // deepSecureConfig suppresses most secure headers to keep total response
-// headers under the 16-slot inline buffer. This isolates the chain-depth
+// headers within the inline respHdrBuf. This isolates the chain-depth
 // overhead from the header-count bug (respHdrBuf overflow on reset).
 var deepSecureConfig = secure.Config{
 	XContentTypeOptions:       "nosniff",
@@ -679,6 +679,55 @@ func BenchmarkChainStaticServe(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		ctx, _ := celeristest.NewContext("GET", "/style.css", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// fullStackHeaders mirrors the response-header volume of the fullstack
+// middleware chain (requestid + secure×8 + cors + ratelimit×3 + etag +
+// cache + x-cache + ...): 18 user headers staged before the body write.
+// With content-type + content-length that is 20 headers per response —
+// the count that overflowed the old 16-slot inline respHdrBuf and forced
+// one heap alloc per request inside Blob.
+var fullStackHeaders = [...][2]string{
+	{"x-request-id", "0123456789abcdef0123456789abcdef"},
+	{"x-content-type-options", "nosniff"},
+	{"x-frame-options", "SAMEORIGIN"},
+	{"x-xss-protection", "1; mode=block"},
+	{"referrer-policy", "no-referrer"},
+	{"cross-origin-opener-policy", "same-origin"},
+	{"cross-origin-resource-policy", "same-origin"},
+	{"cross-origin-embedder-policy", "require-corp"},
+	{"strict-transport-security", "max-age=31536000; includeSubDomains"},
+	{"access-control-allow-origin", "https://example.com"},
+	{"vary", "origin"},
+	{"x-ratelimit-limit", "1000"},
+	{"x-ratelimit-remaining", "999"},
+	{"x-ratelimit-reset", "60"},
+	{"etag", `W/"deadbeef"`},
+	{"cache-control", "public, max-age=300"},
+	{"x-cache", "HIT"},
+	{"x-served-by", "celeris"},
+}
+
+// BenchmarkChainFullStackHeaders isolates the response-header buffer cost of
+// a fullstack-volume response (18 user headers + content-type +
+// content-length = 20). The body is written via Blob so the headers flow
+// through the inline-vs-heap respHdrBuf branch — the alloc the buffer-size
+// bump targets.
+func BenchmarkChainFullStackHeaders(b *testing.B) {
+	handler := func(c *celeris.Context) error {
+		for _, h := range fullStackHeaders {
+			c.AppendRespHeader(h[0], h[1])
+		}
+		return c.Blob(200, "application/json", json1KB)
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(handler)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
 		_ = ctx.Next()
 		celeristest.ReleaseContext(ctx)
 	}

@@ -11,4 +11,8 @@
 //
 // Users select the adaptive engine via celeris.Config{Engine: celeris.Adaptive}.
 // It is the default engine on Linux.
+//
+// # Documentation
+//
+// Full guides and examples: https://goceleris.dev/docs/engines
 package adaptive
