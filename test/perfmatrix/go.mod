@@ -8,8 +8,8 @@ require (
 	github.com/cloudwego/hertz v0.10.5
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-chi/chi/v5 v5.3.0
-	github.com/goceleris/celeris v1.4.15
-	github.com/goceleris/loadgen v1.4.9
+	github.com/goceleris/celeris v1.5.4
+	github.com/goceleris/loadgen v1.4.10
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/sessions v1.4.0
@@ -18,7 +18,7 @@ require (
 	github.com/kataras/iris/v12 v12.2.11
 	github.com/labstack/echo/v4 v4.15.4
 	github.com/magefile/mage v1.17.2
-	github.com/redis/go-redis/v9 v9.20.1
+	github.com/redis/go-redis/v9 v9.21.0
 	github.com/valyala/fasthttp v1.71.0
 	golang.org/x/net v0.56.0
 	golang.org/x/time v0.15.0
