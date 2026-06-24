@@ -3,7 +3,7 @@ module github.com/goceleris/celeris/middleware/protobuf
 go 1.26.4
 
 require (
-	github.com/goceleris/celeris v1.5.4
+	github.com/goceleris/celeris v1.5.5
 	google.golang.org/protobuf v1.36.11
 )
 

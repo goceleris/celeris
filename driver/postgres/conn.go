@@ -1595,6 +1595,29 @@ func (c *pgConn) ExecContext(ctx context.Context, query string, args []driver.Na
 		}
 		return newPGResult(tag), nil
 	}
+	// autoCache (symmetric with QueryContext): cacheable single-verb writes
+	// (INSERT/UPDATE/DELETE) with args are auto-prepared on first use and
+	// reused via Bind+Execute+Sync on subsequent calls, skipping the per-call
+	// Parse + server-side re-plan. Without this an unnamed statement re-parses
+	// every Exec — the gap behind pgx's QueryExecModeCacheStatement (which
+	// caches Exec too) on a hot repeated INSERT. extendedExec with a cached
+	// name sets SkipParse and carries the prepared-statement-not-found
+	// re-prepare fallback, so a server-side statement loss self-heals.
+	if c.autoCache && len(args) > 0 && isCacheableWrite(query) {
+		if stmt, ok := c.stmtCache.get(query); ok {
+			return c.extendedExec(ctx, stmt.Name, query, args)
+		}
+		name := c.mintStmtName()
+		prep, err := c.prepareStatement(ctx, name, query)
+		if err == nil {
+			evicted := c.stmtCache.put(query, prep)
+			for _, ev := range evicted {
+				c.dropPreparedAsync(ev)
+			}
+			return c.extendedExec(ctx, name, query, args)
+		}
+		// Prepare failed — fall through to the unnamed path.
+	}
 	// Unnamed statement (stmtName="") is replaced on every Parse — no stale
 	// state to clean up, so we don't mark the session dirty.
 	return c.extendedExec(ctx, "", query, args)
@@ -1743,6 +1766,46 @@ func isCacheableQuery(q string) bool {
 			hasKeywordPrefix(rest, "VALUES") ||
 			hasKeywordPrefix(rest, "SHOW") ||
 			hasKeywordPrefix(rest, "TABLE")
+	}
+	return false
+}
+
+// isCacheableWrite returns true when the query is a single-verb data
+// modification (INSERT / UPDATE / DELETE) that can safely be prepared and
+// cached per-conn — the write-side counterpart to [isCacheableQuery]. The
+// word-boundary keyword guard (hasKeywordPrefix) avoids matching identifiers
+// like "UPDATELOG". Anything else (DDL, SET, COPY, TRUNCATE, CTE-wrapped
+// writes via WITH, etc.) returns false and takes the unnamed-statement path,
+// preserving today's behaviour. Multi-statement and RETURNING writes are NOT
+// special-cased because the unnamed path already routes them through the same
+// extended protocol — caching only changes whether Parse is re-sent.
+func isCacheableWrite(q string) bool {
+	for i := 0; i < len(q); {
+		c := q[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		if c == '-' && i+1 < len(q) && q[i+1] == '-' {
+			// Line comment — skip to newline.
+			for i < len(q) && q[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(q) && q[i+1] == '*' {
+			// Block comment — skip to */.
+			i += 2
+			for i+1 < len(q) && (q[i] != '*' || q[i+1] != '/') {
+				i++
+			}
+			i += 2
+			continue
+		}
+		rest := q[i:]
+		return hasKeywordPrefix(rest, "INSERT") ||
+			hasKeywordPrefix(rest, "UPDATE") ||
+			hasKeywordPrefix(rest, "DELETE")
 	}
 	return false
 }
