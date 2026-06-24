@@ -2373,6 +2373,27 @@ func (w *Worker) cancelConnOps(fd int, cs *connState) {
 			setSQEUserData(sqe, encodeUserData(udProvide, fd))
 		}
 	}
+	// Cancel the armed slowloris header timer too. armHeaderTimer leaves an
+	// IORING_OP_TIMEOUT in flight that fires ReadHeaderTimeout (default 10s)
+	// after arm; handleHeaderTimer's "we don't cancel, only let it fire"
+	// predated the close-path cancel infrastructure. Leaving it pending means
+	// every closed connection — especially under churn-close (keep-alive off,
+	// one request per conn) — accumulates a per-conn kernel timer that only
+	// expires 10s later, pressuring the kernel timer-wheel and posting a
+	// delayed -ETIME CQE storm that competes with live request CQEs. Cancel
+	// it here so it terminates promptly as -ECANCELED instead (handleHeaderTimer
+	// no-ops on a closing conn). This does NOT change slowloris defence: the
+	// timer is still armed and enforced for live connections; it is only
+	// reaped when the conn is already being torn down. Safe against the
+	// release gate: udHeaderTimer is not a terminalOp (staleConnCQE) and the
+	// timer is outside kernelInflight accounting, so its -ECANCELED CQE can
+	// never decrement the recv/send in-flight count or release cs early.
+	if cs.headerTimerArmed {
+		if sqe := w.getCancelSQE(); sqe != nil {
+			prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udHeaderTimer, fd, cs.generation))
+			setSQEUserData(sqe, encodeUserData(udProvide, fd))
+		}
+	}
 }
 
 // getCancelSQE returns an SQE for a close-path cancel, submitting the
