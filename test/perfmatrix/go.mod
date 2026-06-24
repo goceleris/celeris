@@ -8,8 +8,8 @@ require (
 	github.com/cloudwego/hertz v0.10.5
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-chi/chi/v5 v5.3.0
-	github.com/goceleris/celeris v1.5.4
-	github.com/goceleris/loadgen v1.4.10
+	github.com/goceleris/celeris v1.5.5
+	github.com/goceleris/loadgen v1.4.11
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/sessions v1.4.0
