@@ -14,8 +14,8 @@
 //	Expand       — signal best-effort worker widening; pass through
 //	Reap         — opt-in runtime.GC() then pass through
 //	Reorder      — low-priority requests return 503; others pass
-//	Backpressure — low-priority requests sleep BackpressureDelay; others
-//	               return 503; exempt pass through
+//	Backpressure — low-priority requests return BackpressureStatus (503);
+//	               others sleep BackpressureDelay then pass; exempt pass through
 //	Reject       — all non-exempt requests return 503 + Retry-After
 //
 // Priority is application-defined via [Config.PriorityFunc]. Without it,

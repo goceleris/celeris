@@ -1,7 +1,6 @@
 package keyauth
 
 import (
-	"errors"
 	"strings"
 
 	"github.com/goceleris/celeris"
@@ -13,9 +12,21 @@ import (
 // errors.Is checks work.
 var ErrUnauthorized = celeris.ErrUnauthorized
 
+// unauthorizedCause is the non-HTTPError cause wrapped inside keyauth's 401
+// sentinels so errors.Is(err, celeris.ErrUnauthorized) matches — the same
+// pattern the jwt middleware uses — without changing the text that
+// HTTPError.Error surfaces.
+type unauthorizedCause struct{ msg string }
+
+func (u *unauthorizedCause) Error() string { return u.msg }
+func (u *unauthorizedCause) Unwrap() error { return celeris.ErrUnauthorized }
+
 // ErrMissingKey is returned when no API key is found in the request.
-// Do not mutate: this is a shared sentinel value used with errors.Is.
-var ErrMissingKey = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: errors.New("keyauth: missing API key")}
+// Do not mutate: this is a shared sentinel value used with errors.Is. Its
+// cause chains to [celeris.ErrUnauthorized] (like [ErrUnauthorized] and the
+// jwt sentinels) so a centralized errors.Is(err, celeris.ErrUnauthorized)
+// handler catches a missing key, not just a rejected one.
+var ErrMissingKey = &celeris.HTTPError{Code: 401, Message: "Unauthorized", Err: &unauthorizedCause{"keyauth: missing API key"}}
 
 // New creates a key auth middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
