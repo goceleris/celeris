@@ -7,7 +7,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/goceleris/celeris)](https://goreportcard.com/report/github.com/goceleris/celeris)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Ultra-low latency Go HTTP engine with a protocol-aware dual-architecture (io_uring & epoll) designed for high-throughput infrastructure and zero-allocation microservices. It provides a familiar route-group and middleware API similar to Gin and Echo, so teams can adopt it without learning a new programming model.
+celeris is a high-throughput, load-bearing Go HTTP engine built on a protocol-aware dual-architecture (io_uring & epoll). Its standout strength is **best-in-class throughput under load** — across the [probatorium](https://github.com/goceleris/probatorium) cross-framework matrix it leads the field on driver-backed (PostgreSQL / Redis / memcached) and write-heavy workloads, sustaining the highest request rates while holding tail-latency SLOs. It provides a familiar route-group and middleware API similar to Gin and Echo, so teams can adopt it without learning a new programming model, with zero-allocation hot paths on the H1 / H2 fast paths.
 
 ## Highlights
 
