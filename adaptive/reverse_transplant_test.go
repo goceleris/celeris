@@ -74,8 +74,11 @@ func newBoundAdaptiveH(t *testing.T, h stream.Handler, async bool) (*Engine, str
 }
 
 // driveKeepAlive opens `conns` keep-alive HTTP/1.1 connections that loop
-// write-request / read-response until stop is closed. Counts oks and errors.
-func driveKeepAlive(addr string, conns int, stop <-chan struct{}, ok, errc *atomic.Int64) *sync.WaitGroup {
+// write-request / read-response until pause is closed, then hold the conn open
+// (idle) until stop is closed. Counts oks and errors. The pause phase lets a
+// test measure the CONVERGED transplant state (idle conns all migrated) vs the
+// in-flight snapshot taken while load is running.
+func driveKeepAlive(addr string, conns int, pause, stop <-chan struct{}, ok, errc *atomic.Int64) *sync.WaitGroup {
 	var wg sync.WaitGroup
 	for i := 0; i < conns; i++ {
 		wg.Add(1)
@@ -91,6 +94,9 @@ func driveKeepAlive(addr string, conns int, stop <-chan struct{}, ok, errc *atom
 			for {
 				select {
 				case <-stop:
+					return
+				case <-pause:
+					<-stop // hold the conn open + idle until teardown
 					return
 				default:
 				}
@@ -125,9 +131,10 @@ func reverseScenario(t *testing.T, h stream.Handler, async bool) {
 	time.Sleep(150 * time.Millisecond)
 
 	const conns = 64
+	pauseLoad := make(chan struct{})
 	stopLoad := make(chan struct{})
 	var okCount, errCount atomic.Int64
-	wg := driveKeepAlive(addr, conns, stopLoad, &okCount, &errCount)
+	wg := driveKeepAlive(addr, conns, pauseLoad, stopLoad, &okCount, &errCount)
 
 	time.Sleep(700 * time.Millisecond)
 	epoBefore := e.primary.Metrics().ActiveConnections
@@ -136,23 +143,33 @@ func reverseScenario(t *testing.T, h stream.Handler, async bool) {
 
 	e.ForceSwitch() // io_uring -> epoll (fires reverse transplant)
 	time.Sleep(1500 * time.Millisecond)
-	epoAfter := e.primary.Metrics().ActiveConnections
-	iouAfter := e.secondary.Metrics().ActiveConnections
+	// In-flight snapshot: taken while load runs, so conns mid-request are still
+	// counted on io_uring (async migration is deferred to the goroutine's park).
+	epoInflight := e.primary.Metrics().ActiveConnections
+	iouInflight := e.secondary.Metrics().ActiveConnections
+
+	// Converged snapshot: pause the load so every conn goes idle → its goroutine
+	// parks → self-transplants. This shows the true migration completeness.
+	close(pauseLoad)
+	time.Sleep(1500 * time.Millisecond)
+	epoConverged := e.primary.Metrics().ActiveConnections
+	iouConverged := e.secondary.Metrics().ActiveConnections
 
 	close(stopLoad)
 	wg.Wait()
 
-	t.Logf("[async=%v] before revert: epoll=%d io_uring=%d (io_uring promoted=%d) | after: epoll=%d io_uring=%d | ok=%d err=%d",
-		async, epoBefore, iouBefore, promoted, epoAfter, iouAfter, okCount.Load(), errCount.Load())
+	t.Logf("[async=%v] before revert: epoll=%d io_uring=%d (promoted=%d) | in-flight: epoll=%d io_uring=%d | CONVERGED: epoll=%d io_uring=%d | ok=%d err=%d",
+		async, epoBefore, iouBefore, promoted, epoInflight, iouInflight, epoConverged, iouConverged, okCount.Load(), errCount.Load())
 
 	if async && promoted == 0 {
 		t.Errorf("async test never promoted any conn to the dispatch goroutine — async path not exercised")
 	}
-	if epoAfter < conns/2 {
-		t.Errorf("reverse transplant did not migrate conns to epoll: epoll=%d after revert (want ~%d)", epoAfter, conns)
+	// Converged: essentially all conns must have migrated to epoll.
+	if epoConverged < conns-2 {
+		t.Errorf("reverse transplant did not converge: epoll=%d (want ~%d)", epoConverged, conns)
 	}
-	if iouAfter > conns/4 {
-		t.Errorf("io_uring did not drain on revert: io_uring=%d after revert (want ~0)", iouAfter)
+	if iouConverged > 2 {
+		t.Errorf("io_uring did not drain on convergence: io_uring=%d (want ~0)", iouConverged)
 	}
 	if errCount.Load() > int64(conns) {
 		t.Errorf("too many request errors across the revert: %d (conns=%d)", errCount.Load(), conns)
@@ -168,9 +185,10 @@ func flapScenario(t *testing.T, h stream.Handler, async bool) {
 	defer stop()
 
 	const conns = 64
+	noPause := make(chan struct{}) // never closed: flap keeps load running throughout
 	stopLoad := make(chan struct{})
 	var okCount, errCount atomic.Int64
-	wg := driveKeepAlive(addr, conns, stopLoad, &okCount, &errCount)
+	wg := driveKeepAlive(addr, conns, noPause, stopLoad, &okCount, &errCount)
 
 	time.Sleep(500 * time.Millisecond) // conns establish on epoll (default active)
 
