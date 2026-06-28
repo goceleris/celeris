@@ -21,7 +21,7 @@ import (
 
 // respHandler writes a tiny 200 so keep-alive clients can read a real response
 // (noopHandler writes nothing, which is fine for churn-close but not for a
-// request/response keep-alive load).
+// request/response keep-alive load). Sync: runs inline on the worker/loop.
 type respHandler struct{}
 
 func (respHandler) HandleStream(_ context.Context, s *stream.Stream) error {
@@ -33,18 +33,28 @@ func (respHandler) HandleStream(_ context.Context, s *stream.Stream) error {
 		[]byte("ok"))
 }
 
-// TestReverseTransplant exercises the #383 REVERSE direction (io_uring→epoll):
-// start on io_uring, run a steady keep-alive load so conns live on io_uring,
-// then revert io_uring→epoll and confirm the established conns MIGRATE to epoll
-// (not stranded on the now-standby io_uring) while requests keep succeeding.
-func TestReverseTransplant(t *testing.T) {
-	if testing.Short() {
-		t.Skip("reverse-transplant integration test")
-	}
+// asyncRespHandler is respHandler that ALSO marks every route async
+// (AsyncRouteResolver), so with Config.AsyncHandlers=true each conn promotes to
+// the per-conn dispatch goroutine — exercising the async transplant path.
+type asyncRespHandler struct{ respHandler }
+
+func (asyncRespHandler) RouteAsync(_, _ string) bool { return true }
+func (asyncRespHandler) HasAsyncRoutes() bool        { return true }
+
+var (
+	_ stream.Handler            = respHandler{}
+	_ stream.AsyncRouteResolver = asyncRespHandler{}
+)
+
+// newBoundAdaptiveH builds an adaptive engine bound to 127.0.0.1:0 with the given
+// handler and async flag, starts Listen, waits for bind, and disables the switch
+// cooldown so the test can ForceSwitch freely.
+func newBoundAdaptiveH(t *testing.T, h stream.Handler, async bool) (*Engine, string, func()) {
+	t.Helper()
 	if !probe.Probe().IOUringTier.Available() {
 		t.Skip("io_uring unavailable: needs both sub-engines")
 	}
-	e, err := New(resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1}, respHandler{}, nil)
+	e, err := New(resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1, AsyncHandlers: async}, h, nil)
 	if err != nil {
 		t.Skipf("adaptive.New unsupported here: %v", err)
 	}
@@ -52,66 +62,79 @@ func TestReverseTransplant(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- e.Listen(ctx) }()
-	defer func() { cancel(); <-done }()
 	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if e.Addr() == nil {
+		cancel()
+		<-done
 		t.Fatal("adaptive engine never bound")
 	}
-	addr := e.Addr().String()
+	return e, e.Addr().String(), func() { cancel(); <-done }
+}
 
-	// Start on io_uring so the conns land + live there.
-	e.ForceSwitch() // epoll -> io_uring
-	time.Sleep(150 * time.Millisecond)
-
-	const conns = 64
+// driveKeepAlive opens `conns` keep-alive HTTP/1.1 connections that loop
+// write-request / read-response until stop is closed. Counts oks and errors.
+func driveKeepAlive(addr string, conns int, stop <-chan struct{}, ok, errc *atomic.Int64) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	stopLoad := make(chan struct{})
-	var okCount, errCount atomic.Int64
 	for i := 0; i < conns; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			c, derr := net.DialTimeout("tcp", addr, 2*time.Second)
 			if derr != nil {
-				errCount.Add(1)
+				errc.Add(1)
 				return
 			}
 			defer func() { _ = c.Close() }()
 			br := bufio.NewReader(c)
 			for {
 				select {
-				case <-stopLoad:
+				case <-stop:
 					return
 				default:
 				}
 				if _, werr := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); werr != nil {
-					errCount.Add(1)
+					errc.Add(1)
 					return
 				}
 				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 				resp, rerr := http.ReadResponse(br, nil)
 				if rerr != nil {
-					errCount.Add(1)
+					errc.Add(1)
 					return
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
-				okCount.Add(1)
+				ok.Add(1)
 			}
 		}()
 	}
+	return &wg
+}
 
-	// Let the conns establish + run on io_uring.
+// reverseScenario: start on io_uring, run keep-alive load so conns live on
+// io_uring, revert io_uring→epoll, and confirm the established conns MIGRATE to
+// epoll (not stranded on the now-standby io_uring) while requests keep flowing.
+func reverseScenario(t *testing.T, h stream.Handler, async bool) {
+	t.Helper()
+	e, addr, stop := newBoundAdaptiveH(t, h, async)
+	defer stop()
+
+	e.ForceSwitch() // epoll -> io_uring
+	time.Sleep(150 * time.Millisecond)
+
+	const conns = 64
+	stopLoad := make(chan struct{})
+	var okCount, errCount atomic.Int64
+	wg := driveKeepAlive(addr, conns, stopLoad, &okCount, &errCount)
+
 	time.Sleep(700 * time.Millisecond)
-	epoBefore := e.primary.Metrics().ActiveConnections   // epoll
-	iouBefore := e.secondary.Metrics().ActiveConnections // io_uring
+	epoBefore := e.primary.Metrics().ActiveConnections
+	iouBefore := e.secondary.Metrics().ActiveConnections
+	promoted := e.secondary.Metrics().AsyncPromotedConns
 
-	// Revert io_uring -> epoll: this fires the reverse transplant.
-	e.ForceSwitch()
-
-	// Drain window: conns migrate to epoll as their requests hit a boundary.
+	e.ForceSwitch() // io_uring -> epoll (fires reverse transplant)
 	time.Sleep(1500 * time.Millisecond)
 	epoAfter := e.primary.Metrics().ActiveConnections
 	iouAfter := e.secondary.Metrics().ActiveConnections
@@ -119,11 +142,11 @@ func TestReverseTransplant(t *testing.T) {
 	close(stopLoad)
 	wg.Wait()
 
-	t.Logf("before revert: epoll=%d io_uring=%d | after revert: epoll=%d io_uring=%d | ok=%d err=%d",
-		epoBefore, iouBefore, epoAfter, iouAfter, okCount.Load(), errCount.Load())
+	t.Logf("[async=%v] before revert: epoll=%d io_uring=%d (io_uring promoted=%d) | after: epoll=%d io_uring=%d | ok=%d err=%d",
+		async, epoBefore, iouBefore, promoted, epoAfter, iouAfter, okCount.Load(), errCount.Load())
 
-	if iouBefore < conns/2 {
-		t.Logf("WARN: only %d/%d conns were on io_uring before revert", iouBefore, conns)
+	if async && promoted == 0 {
+		t.Errorf("async test never promoted any conn to the dispatch goroutine — async path not exercised")
 	}
 	if epoAfter < conns/2 {
 		t.Errorf("reverse transplant did not migrate conns to epoll: epoll=%d after revert (want ~%d)", epoAfter, conns)
@@ -131,91 +154,31 @@ func TestReverseTransplant(t *testing.T) {
 	if iouAfter > conns/4 {
 		t.Errorf("io_uring did not drain on revert: io_uring=%d after revert (want ~0)", iouAfter)
 	}
-	// Some transient errors during the switch window are acceptable; a gross
-	// failure (every conn erroring) is not.
 	if errCount.Load() > int64(conns) {
 		t.Errorf("too many request errors across the revert: %d (conns=%d)", errCount.Load(), conns)
 	}
 }
 
-// TestBidirectionalFlap establishes keep-alive conns on epoll, then flaps the
-// engine epoll→io_uring→epoll→io_uring under sustained load. Each flap must
-// migrate the SAME established conns to the newly active engine (forward then
-// reverse then forward), proving both transplant directions work back-to-back
-// and that StartTransplant/StopTransplant don't strand conns mid-flap.
-func TestBidirectionalFlap(t *testing.T) {
-	if testing.Short() {
-		t.Skip("bidirectional-flap integration test")
-	}
-	if !probe.Probe().IOUringTier.Available() {
-		t.Skip("io_uring unavailable: needs both sub-engines")
-	}
-	e, err := New(resource.Config{Addr: "127.0.0.1:0", Protocol: engine.HTTP1}, respHandler{}, nil)
-	if err != nil {
-		t.Skipf("adaptive.New unsupported here: %v", err)
-	}
-	e.ctrl.cooldown = 0
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
-	defer func() { cancel(); <-done }()
-	for dl := time.Now().Add(3 * time.Second); e.Addr() == nil && time.Now().Before(dl); {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if e.Addr() == nil {
-		t.Fatal("adaptive engine never bound")
-	}
-	addr := e.Addr().String()
+// flapScenario: establish conns on epoll, then flap epoll→io_uring→epoll→io_uring
+// under load. Each flap must migrate the same conns to the new active engine
+// (forward, reverse, forward) — exercising both transplant directions.
+func flapScenario(t *testing.T, h stream.Handler, async bool) {
+	t.Helper()
+	e, addr, stop := newBoundAdaptiveH(t, h, async)
+	defer stop()
 
 	const conns = 64
-	var wg sync.WaitGroup
 	stopLoad := make(chan struct{})
 	var okCount, errCount atomic.Int64
-	for i := 0; i < conns; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			c, derr := net.DialTimeout("tcp", addr, 2*time.Second)
-			if derr != nil {
-				errCount.Add(1)
-				return
-			}
-			defer func() { _ = c.Close() }()
-			br := bufio.NewReader(c)
-			for {
-				select {
-				case <-stopLoad:
-					return
-				default:
-				}
-				if _, werr := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); werr != nil {
-					errCount.Add(1)
-					return
-				}
-				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-				resp, rerr := http.ReadResponse(br, nil)
-				if rerr != nil {
-					errCount.Add(1)
-					return
-				}
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-				okCount.Add(1)
-			}
-		}()
-	}
+	wg := driveKeepAlive(addr, conns, stopLoad, &okCount, &errCount)
 
-	// Conns establish on epoll (the default active engine).
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond) // conns establish on epoll (default active)
 
-	// Flap: each ForceSwitch toggles active epoll<->io_uring. After settling,
-	// the active engine must hold ~all conns and the standby ~none.
 	for flap := 1; flap <= 3; flap++ {
 		e.ForceSwitch()
 		time.Sleep(1200 * time.Millisecond)
-		epo := e.primary.Metrics().ActiveConnections   // epoll
-		iou := e.secondary.Metrics().ActiveConnections // io_uring
-		// After odd flaps active=io_uring; after even flaps active=epoll.
+		epo := e.primary.Metrics().ActiveConnections
+		iou := e.secondary.Metrics().ActiveConnections
 		activeIsIOUring := flap%2 == 1
 		var active, standby int64
 		var activeName string
@@ -224,8 +187,8 @@ func TestBidirectionalFlap(t *testing.T) {
 		} else {
 			active, standby, activeName = epo, iou, "epoll"
 		}
-		t.Logf("flap %d -> active=%s: epoll=%d io_uring=%d (ok=%d err=%d)",
-			flap, activeName, epo, iou, okCount.Load(), errCount.Load())
+		t.Logf("[async=%v] flap %d -> active=%s: epoll=%d io_uring=%d (ok=%d err=%d)",
+			async, flap, activeName, epo, iou, okCount.Load(), errCount.Load())
 		if active < conns/2 {
 			t.Errorf("flap %d: transplant did not migrate to %s: active=%d (want ~%d)", flap, activeName, active, conns)
 		}
@@ -236,8 +199,41 @@ func TestBidirectionalFlap(t *testing.T) {
 
 	close(stopLoad)
 	wg.Wait()
-	t.Logf("total ok=%d err=%d", okCount.Load(), errCount.Load())
+	t.Logf("[async=%v] total ok=%d err=%d | epoll promoted=%d io_uring promoted=%d",
+		async, okCount.Load(), errCount.Load(),
+		e.primary.Metrics().AsyncPromotedConns, e.secondary.Metrics().AsyncPromotedConns)
+	if async && e.primary.Metrics().AsyncPromotedConns == 0 && e.secondary.Metrics().AsyncPromotedConns == 0 {
+		t.Errorf("async flap never promoted any conn — async path not exercised")
+	}
 	if errCount.Load() > int64(conns) {
 		t.Errorf("too many request errors across flaps: %d (conns=%d)", errCount.Load(), conns)
 	}
+}
+
+func TestReverseTransplant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("reverse-transplant integration test")
+	}
+	reverseScenario(t, respHandler{}, false)
+}
+
+func TestReverseTransplantAsync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("reverse-transplant async integration test")
+	}
+	reverseScenario(t, asyncRespHandler{}, true)
+}
+
+func TestBidirectionalFlap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("bidirectional-flap integration test")
+	}
+	flapScenario(t, respHandler{}, false)
+}
+
+func TestBidirectionalFlapAsync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("bidirectional-flap async integration test")
+	}
+	flapScenario(t, asyncRespHandler{}, true)
 }
