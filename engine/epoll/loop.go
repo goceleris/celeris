@@ -167,6 +167,14 @@ type Loop struct {
 	// on every drainRead; keep it a plain bool so the no-async path is a
 	// single mov+test.
 	async bool
+
+	// transplant (#383) is non-nil while a drain-to-io_uring is in progress.
+	// Set by Engine.StartTransplant (controller goroutine) and read on this
+	// loop's own thread after each drainRead; the atomic.Pointer load is the
+	// only cost the hot path pays when no drain is active (nil). When set, an
+	// eligible conn at a request boundary is detached and handed to the target
+	// io_uring engine. See docs/design/383-connection-transplant.md.
+	transplant atomic.Pointer[transplantState]
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -486,6 +494,15 @@ func (l *Loop) run(ctx context.Context) {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
 				}
+			}
+
+			// #383: if a drain-to-io_uring is in progress, this fd just finished
+			// a request cycle (EPOLLIN → drainRead) and may now be at a clean
+			// keep-alive boundary — try to transplant it. tryTransplant re-checks
+			// the slot, so a close above is harmless. The pointer load is the
+			// whole cost when no drain is active.
+			if l.transplant.Load() != nil {
+				l.tryTransplant(fd)
 			}
 		}
 
@@ -1717,7 +1734,8 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 	}()
 	for {
 		cs.asyncInMu.Lock()
-		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
+		cs.asyncParked = true
+		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() && !cs.asyncQuiesce.Load() {
 			// Park until the worker appends more bytes or the conn is
 			// being torn down. Stays alive across keep-alive requests
 			// so we don't pay the ~1.5µs goroutine spawn cost per
@@ -1725,9 +1743,28 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			// epoll+async CPU on high-rps redis workloads.
 			cs.asyncCond.Wait()
 		}
+		cs.asyncParked = false
 		if cs.asyncClosed.Load() {
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
+			return
+		}
+		// #383: transplant quiesce requested and input drained — exit cleanly
+		// (do NOT close the conn) and signal the loop to finish the hand-off to
+		// io_uring. tryTransplant only sets asyncQuiesce on a parked, flushed
+		// conn whose fd it has already detached, so asyncInBuf is empty here.
+		if cs.asyncQuiesce.Load() && len(cs.asyncInBuf) == 0 {
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
 			return
 		}
 		// Double-buffer swap: hand asyncInBuf to the goroutine, reuse
@@ -1937,6 +1974,14 @@ func (l *Loop) drainDetachQueue() {
 	l.detachQMu.Unlock()
 	for _, cs := range l.detachQSpare {
 		if cs.detachClosed {
+			continue
+		}
+		// #383 transplant: the dispatch goroutine quiesced and exited; the fd was
+		// already removed from epoll by tryTransplant (at a flushed, clean
+		// boundary). Finish the hand-off to io_uring. Checked before the
+		// asyncClosed/close paths so a quiescing conn is migrated, not closed.
+		if cs.transplantPending {
+			l.finishTransplantHandoff(cs)
 			continue
 		}
 		// Hijacked conn (#3.1): hijackConn already detached the fd from

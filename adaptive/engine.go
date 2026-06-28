@@ -463,12 +463,52 @@ func (e *Engine) runEvalLoop(ctx context.Context) {
 		case now := <-ticker.C:
 			e.switchMu.Lock()
 			shouldSwitch := e.ctrl.evaluate(now, e.frozen.Load())
+			if adaptiveDebugEnabled {
+				e.logTickDebug(now, shouldSwitch)
+			}
 			e.switchMu.Unlock()
 			if shouldSwitch {
 				e.performSwitch()
 			}
 		}
 	}
+}
+
+// adaptiveDebugEnabled gates the per-tick controller trace added for issue #396
+// (Adaptive never promotes to io_uring at 1024c). Set CELERIS_ADAPTIVE_DEBUG=1
+// to make every eval tick's gate state directly observable — frozen / cooldown
+// / oscillation-lock / conns-per-worker / up-ticks — instead of inferred from
+// the rps-only timeseries. Off by default = zero production overhead.
+var adaptiveDebugEnabled = os.Getenv("CELERIS_ADAPTIVE_DEBUG") != ""
+
+// logTickDebug emits the full per-tick decision context. The caller holds
+// switchMu, so the controller-state reads below are consistent with the
+// evaluate() call that just ran on the same tick.
+func (e *Engine) logTickDebug(now time.Time, shouldSwitch bool) {
+	act := e.ctrl.activeEngine()
+	m := act.Metrics()
+	cpw := float64(m.ActiveConnections) / float64(max(m.Workers, 1))
+	cdRemain := time.Duration(0)
+	if !e.ctrl.state.lastSwitch.IsZero() {
+		if d := e.ctrl.cooldown - now.Sub(e.ctrl.state.lastSwitch); d > 0 {
+			cdRemain = d
+		}
+	}
+	e.ctrl.logger.Info("adaptive_tick",
+		"active", act.Type().String(),
+		"frozen", e.frozen.Load(),
+		"driver_fds", e.driverFDs.Load(),
+		"cooldown_freezes", e.cooldownFreezes.Load(),
+		"cooldown_remaining", cdRemain.String(),
+		"locked", e.ctrl.state.locked,
+		"active_conns", m.ActiveConnections,
+		"workers", m.Workers,
+		"cpw", cpw,
+		"bytes_total", m.BytesRead+m.BytesWritten,
+		"up_ticks", e.ctrl.state.upTicks,
+		"down_ticks", e.ctrl.state.downTicks,
+		"should_switch", shouldSwitch,
+	)
 }
 
 // buildAndStartStandby constructs the lazy standby sub-engine, launches its
@@ -661,6 +701,14 @@ func (e *Engine) performSwitch() {
 		"now_active", newActive.Type().String(),
 		"now_standby", newStandby.Type().String(),
 	)
+
+	// #383: when promoting to io_uring, drain epoll's pinned keep-alives onto it
+	// so they actually benefit from io_uring instead of being stranded on the
+	// now-standby epoll — the hollow-promotion forfeit measured in #396. Only
+	// HTTP/1 conns at a clean, flushed request boundary are moved (see
+	// epoll.tryTransplant); H2/h2c/mid-upgrade/detached/driver conns are never
+	// touched, so this is safe to run unconditionally.
+	e.applyTransplant(newActive, newStandby)
 
 	// Suppress further switches for the cooldown period. The cooldown is
 	// tracked as its own freeze reason routed through freezeState so it

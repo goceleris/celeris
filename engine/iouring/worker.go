@@ -223,7 +223,8 @@ type Worker struct {
 	handler      stream.Handler
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
-	bufRing      *BufferRing // ring-mapped provided buffers for multishot recv
+	runCtx       context.Context //nolint:containedctx // stored so #383 transplant attach (off the accept path) can derive a conn ctx
+	bufRing      *BufferRing     // ring-mapped provided buffers for multishot recv
 	logger       *slog.Logger
 	cfg          resource.Config
 	ready        chan error
@@ -249,6 +250,7 @@ type Worker struct {
 	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
 	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
 	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	transplantCount   *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
 	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
 	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
@@ -377,6 +379,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 func (w *Worker) run(ctx context.Context) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	w.runCtx = ctx
 
 	_ = platform.PinToCPU(w.cpuID)
 

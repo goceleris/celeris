@@ -69,11 +69,19 @@ const (
 	driverActionRegister driverActionKind = iota + 1
 	driverActionUnregister
 	driverActionWrite
+	// driverActionAdopt (#383) adopts a real fd handed off from another engine
+	// (epoll) as a full HTTP connection on this worker. Reuses the driver-action
+	// queue purely as the existing cross-thread wakeup primitive; the adopted fd
+	// becomes a normal entry in w.conns (not a driverConn).
+	driverActionAdopt
 )
 
 type driverAction struct {
 	kind driverActionKind
 	dc   *driverConn
+	// adopt-only (#383): the real fd to adopt + its carried-over state.
+	adoptFD    int
+	adoptCarry engine.Carryover
 }
 
 // addDriverAction enqueues work for the worker and wakes the ring.
@@ -214,6 +222,8 @@ func (w *Worker) drainDriverActions() {
 			w.cancelDriverConn(a.dc)
 		case driverActionWrite:
 			w.flushDriverSend(a.dc)
+		case driverActionAdopt:
+			w.attachAdoptedFD(a.adoptFD, a.adoptCarry)
 		}
 	}
 	w.driverActionSpare = w.driverActionSpare[:0]
