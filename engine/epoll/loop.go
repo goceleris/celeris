@@ -144,6 +144,15 @@ type Loop struct {
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
 	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
 
+	// adoptQueue holds io_uring→epoll transplant hand-offs (#383 reverse
+	// direction): real connected fds to adopt onto this loop. Cross-thread:
+	// AdoptConn appends + wakes via eventFD; the loop applies them in
+	// drainAdoptQueue on its own thread (where epoll_ctl + connState setup are safe).
+	adoptQueue    []adoptItem
+	adoptQMu      sync.Mutex
+	adoptQSpare   []adoptItem
+	adoptQPending atomic.Int32
+
 	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
 	// can Wait on them before returning. Without this the engine's
 	// top-level wg.Wait joins only the worker/Listen goroutines, and
@@ -527,6 +536,16 @@ func (l *Loop) run(ctx context.Context) {
 		// data written by goroutines (e.g. WebSocket responses) is flushed
 		// in the same event loop iteration.
 		l.drainDetachQueue()
+
+		// #383 reverse: adopt any conns transplanted to us from io_uring. Use a
+		// fresh timestamp when the batch carried no events (now==0 then).
+		if l.adoptQPending.Load() != 0 {
+			an := now
+			if an == 0 {
+				an = l.cachedNow
+			}
+			l.drainAdoptQueue(ctx, an)
+		}
 
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext

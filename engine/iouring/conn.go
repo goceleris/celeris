@@ -147,6 +147,18 @@ type connState struct {
 	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
+	// transplantPending (#383 reverse, async) is set by the dispatch
+	// goroutine when it reaches a clean park boundary while an io_uring→epoll
+	// drain is active: it marks itself for hand-off, sets asyncRun=false,
+	// enqueues cs on the worker's detachQueue, and EXITS. drainDetachQueue
+	// (worker thread) then does the SQE work (cancel recv) + dup + hand the
+	// fd to epoll. Because the goroutine has already exited when the worker
+	// acts, there is no goroutine-vs-release race. The recv feed path clears
+	// this (aborting the transplant) if a new request arrives first, so no
+	// request is lost. Atomic: goroutine writes under asyncInMu; the worker
+	// reads it on the recv path and in drainDetachQueue. Mirrors the
+	// asyncH2Promoted hand-off shape.
+	transplantPending atomic.Bool
 	// asyncPromoted is set once an async-marked route has been observed
 	// on this conn while it ran inline on the worker (per-handler async,
 	// celeris #300). Once promoted, recv goes to the dispatch goroutine.
@@ -314,6 +326,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.transplantPending.Store(false)
 	cs.asyncPromoted.Store(false)
 	cs.promotedMethod = ""
 	cs.promotedPath = ""
