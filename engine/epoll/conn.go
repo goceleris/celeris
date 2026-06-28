@@ -109,6 +109,11 @@ type connState struct {
 	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
 
+	// peerClosed is set when EPOLLRDHUP reports the peer half-closed (FIN) while
+	// a response was still flushing (write backpressure). The conn is closed once
+	// its pending write drains, so the response is not truncated. Reset on release.
+	peerClosed bool
+
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (single-threaded write)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
@@ -237,6 +242,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncInBuf = trimPooledBuf(cs.asyncInBuf)
 	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
+	cs.peerClosed = false
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.asyncPromoted = false

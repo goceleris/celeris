@@ -461,6 +461,27 @@ func (l *Loop) run(ctx context.Context) {
 				}
 			}
 
+			// EPOLLRDHUP: peer half-closed (sent FIN). drainRead's short-read
+			// fast path returns without a trailing EAGAIN read, so a FIN that
+			// rode the same readable edge as the request (client writes then
+			// immediately closes) leaves the EOF unread and — with EPOLLET — no
+			// further edge fires. Close here once the response has flushed; if a
+			// write is still pending (backpressure), defer via cs.peerClosed so
+			// the response is not truncated. Skip detached (WS/SSE) conns: their
+			// middleware owns the close lifecycle.
+			if ev.Events&unix.EPOLLRDHUP != 0 {
+				if fd >= 0 && fd < len(l.conns) {
+					if cs := l.conns[fd]; cs != nil && !cs.detachClosed &&
+						(cs.h1State == nil || !cs.h1State.Detached.Load()) {
+						if csWritePending(cs) {
+							cs.peerClosed = true
+						} else {
+							l.closeConn(fd)
+						}
+					}
+				}
+			}
+
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
@@ -512,6 +533,10 @@ func (l *Loop) run(ctx context.Context) {
 					mu.Unlock()
 				}
 				l.removeDirty(cs)
+				// Deferred peer-close (EPOLLRDHUP arrived mid-response): now flushed.
+				if cs.peerClosed {
+					l.closeConn(cs.fd)
+				}
 			} else {
 				// Partial write: kernel send buffer full. Sync pendingBytes,
 				// then for a non-detached HTTP/H2 conn hand off to level-
@@ -684,8 +709,16 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 
 		_ = sockopts.ApplyFD(newFD, l.sockOpts)
 
+		// EPOLLRDHUP: report peer half-close (FIN) as a distinct condition. The
+		// short-read fast path in drainRead returns without a trailing EAGAIN
+		// read, so a FIN piggybacked in the SAME readable edge as the request
+		// (a client that writes a request then immediately closes) would
+		// otherwise leave the EOF unread — and with EPOLLET no new edge fires
+		// for a still-readable-at-EOF socket, stranding the conn until an idle
+		// timeout (which may be unset). EPOLLRDHUP rides the same event, so the
+		// run loop can close the conn after flushing its response.
 		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET,
+			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 			Fd:     int32(newFD),
 		}); err != nil {
 			_ = unix.Close(newFD)
@@ -2009,7 +2042,7 @@ func (l *Loop) armEpollOut(cs *connState) {
 		return
 	}
 	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLOUT,
+		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLOUT | unix.EPOLLRDHUP,
 		Fd:     int32(cs.fd),
 	}); err == nil {
 		cs.epollOut = true
@@ -2028,7 +2061,7 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 		return
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET,
+		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 		Fd:     int32(cs.fd),
 	})
 	cs.epollOut = false
@@ -2063,6 +2096,11 @@ func (l *Loop) handleWritable(cs *connState) {
 	}
 	if drained {
 		l.disarmEpollOut(cs)
+		// Deferred peer-close (EPOLLRDHUP arrived mid-response): the response is
+		// now fully flushed, so close the conn rather than strand it.
+		if cs.peerClosed {
+			l.closeConn(cs.fd)
+		}
 	}
 }
 
