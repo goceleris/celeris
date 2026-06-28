@@ -48,6 +48,9 @@ type Engine struct {
 	// asyncRoutes is the static AsyncRoutes count snapshotted at
 	// construction from the handler's AsyncRouteCount (#300 G3).
 	asyncRoutes int
+
+	// adoptRR round-robins io_uring→epoll transplant adoptions across loops (#383).
+	adoptRR atomic.Uint64
 }
 
 // New creates a new epoll engine.

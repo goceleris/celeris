@@ -320,6 +320,12 @@ type Worker struct {
 	driverActionSpare   []driverAction
 	driverActionMu      sync.Mutex
 	driverActionPending atomic.Int32
+
+	// transplant (#383 reverse) is non-nil while a drain-to-epoll is in progress.
+	// Set by Engine.StartTransplant (controller goroutine), read on this worker's
+	// own thread after each handleRecv; when set, an idle H1 conn at a clean
+	// boundary is detached and handed to the target epoll engine.
+	transplant atomic.Pointer[transplantTargetHolder]
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -638,10 +644,23 @@ func (w *Worker) run(ctx context.Context) {
 					// before routing to the handler.
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleRecv(entry, fd, now)
+						// #383 reverse: if a drain-to-epoll is in progress, this
+						// conn just finished a request and may be at a clean
+						// boundary — try to transplant it back to epoll.
+						if w.transplant.Load() != nil {
+							w.tryTransplant(fd)
+						}
 					}
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleSend(entry, fd, now)
+						// #383 reverse: io_uring flushes the response
+						// asynchronously, so the clean, fully-flushed boundary
+						// is reached HERE (send completed) — not at udRecv where
+						// the send is still in flight. Try to transplant now.
+						if w.transplant.Load() != nil {
+							w.tryTransplant(fd)
+						}
 					}
 				case udAccept:
 					w.handleAccept(ctx, entry, fd, now)
