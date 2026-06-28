@@ -30,21 +30,13 @@ mage fuzz      # Run fuzz tests (30s default, set FUZZ_TIME to override)
 mage check     # Run all checks: lint + test + spec + build
 ```
 
-### Cluster benchmarking
+### Cross-framework benchmarking
 
-For testing under realistic multi-host load (race detector + 1024-conn
-scenarios) the `mage cluster*` targets orchestrate the bench cluster
-via ansible. Every cluster install is manifest-tracked and torn down
-on completion — no host-side state survives.
-
-```bash
-mage clusterStatus                 # SSH health + disk/mem snapshot for all 3 nodes
-mage clusterDeploy                 # cross-compile + push runners
-mage clusterDistributedBench       # msa2-client → msa2-server / msr1
-mage clusterGoGate                 # stage Go toolchain + run a mage target
-mage matrixBenchStrict             # full perfmatrix under -race + checkptr
-PERFMATRIX_SERVICES=none mage matrixBenchStrict  # for hosts without Docker
-```
+Cross-framework performance and adversarial cluster validation live in
+[goceleris/probatorium](https://github.com/goceleris/probatorium), the
+authoritative bench harness (run on real hardware via its own cluster
+matrix). See that repo for the scenario × server × protocol matrix and
+release-gate numbers.
 
 ### Sub-Module Testing
 
@@ -133,7 +125,7 @@ mage -l    # List all available targets
 - Unit tests go in `*_test.go` files alongside the code
 - Integration tests (multi-engine, adaptive, etc.) go in `test/integration/`
 - Conformance tests (HTTP/1.1 RFC 9112, HTTP/2 h2spec) go in `test/spec/`
-- Cross-framework performance benchmarks go in `test/perfmatrix/` (scenario × server × protocol matrix driven by `loadgen`); driver-isolation benchmarks in `test/drivercmp/`; WebSocket comparisons in `test/benchcmp_ws/`.
+- Cross-framework performance benchmarks (scenario × server × protocol matrix driven by `loadgen`) live in [goceleris/probatorium](https://github.com/goceleris/probatorium); driver-isolation benchmarks go in `test/drivercmp/`; WebSocket comparisons in `test/benchcmp_ws/`.
 - Use the `celeristest` package for Context/ResponseRecorder test helpers
 - Run with `-race` flag (all CI runs use race detection)
 

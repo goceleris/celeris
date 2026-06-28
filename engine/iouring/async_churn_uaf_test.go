@@ -49,9 +49,9 @@ func (h *asyncChurnHandler) HandleStream(_ context.Context, s *stream.Stream) er
 // aggressive GC pressure. It catches gross regressions (server panics,
 // 100 % request failure) but the precise UAF timing is environment-
 // sensitive and doesn't reproduce reliably inside a short test budget;
-// the gold-standard regression detection is the strict matrix
-// (churn-close × celeris-iouring-*-async cells) and the standalone
-// loadgen reproducer at test/perfmatrix/cmd/churnrepro.
+// the gold-standard regression detection is the adversarial cluster
+// matrix in goceleris/probatorium (churn-close × celeris-iouring-*-async
+// cells) and the standalone loadgen reproducer it ships.
 //
 // Gated on testing.Short() — 60 s of -race churn is heavy for CI.
 func TestAsyncChurnNoUseAfterFree(t *testing.T) {

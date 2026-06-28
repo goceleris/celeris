@@ -14,8 +14,9 @@ import (
 
 // Probe results are cached process-wide via sync.Once: kernel capabilities
 // don't change inside a running process, but iouring.New() can be called
-// hundreds-to-thousands of times in benchmark harnesses (perfmatrix runs
-// 1980 cells in one process with -race), and re-running every probe
+// hundreds-to-thousands of times in benchmark harnesses (a cross-framework
+// matrix can run thousands of cells in one process with -race), and
+// re-running every probe
 // (each opens a temp ring + a TCP listener + a dial) on every New() is
 // pure overhead.
 var (
