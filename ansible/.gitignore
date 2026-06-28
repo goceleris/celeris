@@ -1,3 +1,0 @@
-*.retry
-vault_pass.txt
-.ansible/

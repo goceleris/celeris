@@ -20,7 +20,6 @@ updates:
       - /test/drivercmp/memcached
       - /test/drivercmp/postgres
       - /test/drivercmp/redis
-      - /test/perfmatrix
     schedule:
       interval: daily
     groups:

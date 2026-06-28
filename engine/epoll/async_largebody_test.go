@@ -111,8 +111,8 @@ func TestAsyncHandlerLargeBodyKeepAlive(t *testing.T) {
 }
 
 // TestAsyncHandlerLargeBodyConcurrent stresses the async path with many
-// concurrent conns doing large-body GETs. Matches the perfmatrix
-// get-json-64k scenario that flagged the bug.
+// concurrent conns doing large-body GETs. Matches the cross-framework
+// get-json-64k bench scenario that flagged the bug.
 func TestAsyncHandlerLargeBodyConcurrent(t *testing.T) {
 	const bodySize = 64 * 1024
 	body := bytes.Repeat([]byte{'b'}, bodySize)

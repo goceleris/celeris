@@ -15,9 +15,9 @@ permissions:
 # runners — race-detector + Azure-runner-cold-start blew the
 # TestAdaptiveH2DialNoRSTRace bind deadline; h2spec hit timing limits
 # under -race; integration's fakePG harness wedged on extended-protocol
-# queries. Real correctness validation lives in the strict matrix
-# (mage matrixBenchStrict on msr1, race + checkptr + fail-fast) and the
-# spec/integration tests run locally before merge.
+# queries. Real correctness validation lives in the adversarial cluster
+# matrix run by goceleris/probatorium (race + checkptr + fail-fast on
+# real hardware) and the spec/integration tests run locally before merge.
 
 jobs:
   lint:
@@ -69,9 +69,9 @@ jobs:
         with:
           go-version: "1.26.4"
       # Excludes ./test/... to keep this job deterministic — those
-      # suites (integration, spec, perfmatrix, sustainedload) are
-      # timing-sensitive on shared GitHub Actions runners and live in
-      # the strict matrix on msr1 instead.
+      # suites (integration, spec, sustainedload) are timing-sensitive
+      # on shared GitHub Actions runners and run locally / in the
+      # goceleris/probatorium cluster matrix instead.
       #
       # Excludes ./adaptive/... because TestAdaptiveH2DialNoRSTRace and
       # TestAdaptiveScaler_H2DialNoRSTRace burst 32 parallel H2 dials

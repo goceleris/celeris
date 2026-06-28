@@ -307,9 +307,9 @@ For Prometheus exposition and debug endpoints, use the [`middleware/metrics`](mi
 
 ## Benchmarks
 
-Cross-framework performance benchmarks live in [`test/perfmatrix/`](test/perfmatrix/) — a (scenario × server × protocol) matrix driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen). Run the full sweep with `mage matrixBench` or the dev-loop subset with `mage matrixBenchQuick`. Driver-isolation benchmarks remain in [`test/drivercmp/`](test/drivercmp/) and WebSocket comparisons in [`test/benchcmp_ws/`](test/benchcmp_ws/). Reproducible release-gate numbers are published by [probatorium](https://github.com/goceleris/probatorium)'s `publish-results` workflow.
+Cross-framework performance benchmarks — the (scenario × server × protocol) matrix driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen) — live in [goceleris/probatorium](https://github.com/goceleris/probatorium), the authoritative cross-framework bench harness. Reproducible release-gate numbers are published by probatorium's `publish-results` workflow. Driver-isolation benchmarks remain in-tree at [`test/drivercmp/`](test/drivercmp/) and WebSocket comparisons at [`test/benchcmp_ws/`](test/benchcmp_ws/).
 
-> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use `test/perfmatrix/` for fair cross-framework comparisons.
+> **Note:** In-tree middleware benchmarks (e.g., `middleware/compress/bench_test.go`) use `celeristest` which provides pool-based contexts with no HTTP overhead. These numbers measure pure middleware logic and should not be compared directly with `httptest`-based competitor benchmarks. Use [probatorium](https://github.com/goceleris/probatorium) for fair cross-framework comparisons.
 
 ## Continuous Validation
 
@@ -335,7 +335,7 @@ observe/        Collector, CPUMonitor, Snapshot
 probe/          System capability detection (kernel version, io_uring feature probe)
 protocol/       Protocol parsers (h1, h2, detect)
 resource/       Configuration, presets, defaults
-test/           Conformance, spec compliance, integration, benchmarks (perfmatrix, drivercmp, benchcmp_ws, …)
+test/           Conformance, spec compliance, integration, benchmarks (drivercmp, benchcmp_ws, …)
 validation/     Runtime invariant assertions + validation hooks (debug builds)
 ```
 
