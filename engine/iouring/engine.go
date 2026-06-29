@@ -46,6 +46,11 @@ type Engine struct {
 		closeCount   atomic.Uint64
 		bytesRead    atomic.Uint64
 		bytesWritten atomic.Uint64
+		// transplantCount / transplantRR support #383 connection transplant:
+		// the cumulative number of conns adopted from another engine, and a
+		// round-robin cursor for spreading adopts across workers.
+		transplantCount atomic.Uint64
+		transplantRR    atomic.Uint64
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -271,6 +276,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 			}
 			return nil, err
 		}
+		w.transplantCount = &e.metrics.transplantCount // #383 transplant counter
 		workers[i] = w
 	}
 	return workers, nil

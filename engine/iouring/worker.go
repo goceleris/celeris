@@ -223,7 +223,8 @@ type Worker struct {
 	handler      stream.Handler
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
-	bufRing      *BufferRing // ring-mapped provided buffers for multishot recv
+	runCtx       context.Context //nolint:containedctx // stored so #383 transplant attach (off the accept path) can derive a conn ctx
+	bufRing      *BufferRing     // ring-mapped provided buffers for multishot recv
 	logger       *slog.Logger
 	cfg          resource.Config
 	ready        chan error
@@ -249,6 +250,7 @@ type Worker struct {
 	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
 	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
 	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	transplantCount   *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
 	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
 	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
@@ -318,6 +320,12 @@ type Worker struct {
 	driverActionSpare   []driverAction
 	driverActionMu      sync.Mutex
 	driverActionPending atomic.Int32
+
+	// transplant (#383 reverse) is non-nil while a drain-to-epoll is in progress.
+	// Set by Engine.StartTransplant (controller goroutine), read on this worker's
+	// own thread after each handleRecv; when set, an idle H1 conn at a clean
+	// boundary is detached and handed to the target epoll engine.
+	transplant atomic.Pointer[transplantTargetHolder]
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -377,6 +385,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 func (w *Worker) run(ctx context.Context) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	w.runCtx = ctx
 
 	_ = platform.PinToCPU(w.cpuID)
 
@@ -635,10 +644,23 @@ func (w *Worker) run(ctx context.Context) {
 					// before routing to the handler.
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleRecv(entry, fd, now)
+						// #383 reverse: if a drain-to-epoll is in progress, this
+						// conn just finished a request and may be at a clean
+						// boundary — try to transplant it back to epoll.
+						if w.transplant.Load() != nil {
+							w.tryTransplant(fd)
+						}
 					}
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleSend(entry, fd, now)
+						// #383 reverse: io_uring flushes the response
+						// asynchronously, so the clean, fully-flushed boundary
+						// is reached HERE (send completed) — not at udRecv where
+						// the send is still in flight. Try to transplant now.
+						if w.transplant.Load() != nil {
+							w.tryTransplant(fd)
+						}
 					}
 				case udAccept:
 					w.handleAccept(ctx, entry, fd, now)
@@ -1756,6 +1778,13 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// it won the race, do NOT feed asyncInBuf (the goroutine is exiting);
 		// fall through to inline with the unconsumed `data` instead.
 		if cs.asyncPromoted.Load() {
+			// #383 reverse (async): a new request raced a self-transplant. The
+			// goroutine marked this conn for hand-off to epoll and exited, but
+			// the client sent again first. ABORT the transplant (clear the flag
+			// so drainDetachQueue skips it) and feed normally — `starting` below
+			// is true (asyncRun==false), so we respawn the goroutine and the
+			// request is served on io_uring. No request lost; retried next park.
+			cs.transplantPending.Store(false)
 			asyncFeed = true
 		} else {
 			cs.asyncInMu.Unlock()
@@ -2821,6 +2850,21 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 				cs.asyncInMu.Unlock()
 				return
 			}
+			// #383 reverse (async): at a clean park boundary while an
+			// io_uring→epoll drain is active, hand THIS conn to epoll. We are at
+			// a true boundary (asyncInBuf empty, last response direct-written and
+			// flushed). Mark + enqueue + EXIT — the worker finishes the SQE work
+			// (cancel recv) + dup + hand-off in drainDetachQueue, after we are
+			// gone, so there is no goroutine-vs-release race. If a new request
+			// arrives first, the feed path clears transplantPending and respawns
+			// us, so no request is lost. SINGLE_ISSUER: we submit no SQE here.
+			if w.transplant.Load() != nil && w.asyncTransplantEligible(cs) {
+				cs.transplantPending.Store(true)
+				cs.asyncRun = false
+				cs.asyncInMu.Unlock()
+				w.enqueueDetach(cs)
+				return
+			}
 			cs.asyncCond.Wait()
 		}
 		if cs.asyncClosed.Load() {
@@ -3197,6 +3241,19 @@ func (w *Worker) drainDetachQueue() {
 		// goroutine can't touch w.conns or the dirty list safely).
 		if cs.asyncClosed.Load() {
 			w.closeConn(cs.fd)
+			continue
+		}
+		// #383 reverse (async): the dispatch goroutine reached a clean park
+		// boundary while an io_uring→epoll drain was active and handed the conn
+		// to us. Finish on the worker thread: dup the fd for epoll, cancel the
+		// armed recv, defer the connState release to its terminal CQE, close the
+		// original. The goroutine has already exited, so there is no
+		// goroutine-vs-release race. If the drain was stopped meanwhile (or the
+		// dup fails), finishAsyncTransplant leaves the conn in place and the next
+		// recv respawns its goroutine — nothing is lost.
+		if cs.transplantPending.Load() {
+			cs.transplantPending.Store(false)
+			w.finishAsyncTransplant(cs)
 			continue
 		}
 		// Dispatch goroutine promoted the conn to H2 via switchToH2Local

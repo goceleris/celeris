@@ -144,6 +144,15 @@ type Loop struct {
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
 	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
 
+	// adoptQueue holds io_uring→epoll transplant hand-offs (#383 reverse
+	// direction): real connected fds to adopt onto this loop. Cross-thread:
+	// AdoptConn appends + wakes via eventFD; the loop applies them in
+	// drainAdoptQueue on its own thread (where epoll_ctl + connState setup are safe).
+	adoptQueue    []adoptItem
+	adoptQMu      sync.Mutex
+	adoptQSpare   []adoptItem
+	adoptQPending atomic.Int32
+
 	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
 	// can Wait on them before returning. Without this the engine's
 	// top-level wg.Wait joins only the worker/Listen goroutines, and
@@ -167,6 +176,14 @@ type Loop struct {
 	// on every drainRead; keep it a plain bool so the no-async path is a
 	// single mov+test.
 	async bool
+
+	// transplant (#383) is non-nil while a drain-to-io_uring is in progress.
+	// Set by Engine.StartTransplant (controller goroutine) and read on this
+	// loop's own thread after each drainRead; the atomic.Pointer load is the
+	// only cost the hot path pays when no drain is active (nil). When set, an
+	// eligible conn at a request boundary is detached and handed to the target
+	// io_uring engine. See docs/design/383-connection-transplant.md.
+	transplant atomic.Pointer[transplantState]
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -461,10 +478,40 @@ func (l *Loop) run(ctx context.Context) {
 				}
 			}
 
+			// EPOLLRDHUP: peer half-closed (sent FIN). drainRead's short-read
+			// fast path returns without a trailing EAGAIN read, so a FIN that
+			// rode the same readable edge as the request (client writes then
+			// immediately closes) leaves the EOF unread and — with EPOLLET — no
+			// further edge fires. Close here once the response has flushed; if a
+			// write is still pending (backpressure), defer via cs.peerClosed so
+			// the response is not truncated. Skip detached (WS/SSE) conns: their
+			// middleware owns the close lifecycle.
+			if ev.Events&unix.EPOLLRDHUP != 0 {
+				if fd >= 0 && fd < len(l.conns) {
+					if cs := l.conns[fd]; cs != nil && !cs.detachClosed &&
+						(cs.h1State == nil || !cs.h1State.Detached.Load()) {
+						if csWritePending(cs) {
+							cs.peerClosed = true
+						} else {
+							l.closeConn(fd)
+						}
+					}
+				}
+			}
+
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				if fd >= 0 && fd < len(l.conns) && l.conns[fd] != nil {
 					l.closeConn(fd)
 				}
+			}
+
+			// #383: if a drain-to-io_uring is in progress, this fd just finished
+			// a request cycle (EPOLLIN → drainRead) and may now be at a clean
+			// keep-alive boundary — try to transplant it. tryTransplant re-checks
+			// the slot, so a close above is harmless. The pointer load is the
+			// whole cost when no drain is active.
+			if l.transplant.Load() != nil {
+				l.tryTransplant(fd)
 			}
 		}
 
@@ -490,6 +537,16 @@ func (l *Loop) run(ctx context.Context) {
 		// in the same event loop iteration.
 		l.drainDetachQueue()
 
+		// #383 reverse: adopt any conns transplanted to us from io_uring. Use a
+		// fresh timestamp when the batch carried no events (now==0 then).
+		if l.adoptQPending.Load() != 0 {
+			an := now
+			if an == 0 {
+				an = l.cachedNow
+			}
+			l.drainAdoptQueue(ctx, an)
+		}
+
 		for cs := l.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
 			if mu := cs.detachMu; mu != nil {
@@ -512,6 +569,10 @@ func (l *Loop) run(ctx context.Context) {
 					mu.Unlock()
 				}
 				l.removeDirty(cs)
+				// Deferred peer-close (EPOLLRDHUP arrived mid-response): now flushed.
+				if cs.peerClosed {
+					l.closeConn(cs.fd)
+				}
 			} else {
 				// Partial write: kernel send buffer full. Sync pendingBytes,
 				// then for a non-detached HTTP/H2 conn hand off to level-
@@ -684,8 +745,16 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 
 		_ = sockopts.ApplyFD(newFD, l.sockOpts)
 
+		// EPOLLRDHUP: report peer half-close (FIN) as a distinct condition. The
+		// short-read fast path in drainRead returns without a trailing EAGAIN
+		// read, so a FIN piggybacked in the SAME readable edge as the request
+		// (a client that writes a request then immediately closes) would
+		// otherwise leave the EOF unread — and with EPOLLET no new edge fires
+		// for a still-readable-at-EOF socket, stranding the conn until an idle
+		// timeout (which may be unset). EPOLLRDHUP rides the same event, so the
+		// run loop can close the conn after flushing its response.
 		if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, newFD, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET,
+			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 			Fd:     int32(newFD),
 		}); err != nil {
 			_ = unix.Close(newFD)
@@ -1684,7 +1753,8 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 	}()
 	for {
 		cs.asyncInMu.Lock()
-		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
+		cs.asyncParked = true
+		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() && !cs.asyncQuiesce.Load() {
 			// Park until the worker appends more bytes or the conn is
 			// being torn down. Stays alive across keep-alive requests
 			// so we don't pay the ~1.5µs goroutine spawn cost per
@@ -1692,9 +1762,28 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			// epoll+async CPU on high-rps redis workloads.
 			cs.asyncCond.Wait()
 		}
+		cs.asyncParked = false
 		if cs.asyncClosed.Load() {
 			cs.asyncRun = false
 			cs.asyncInMu.Unlock()
+			return
+		}
+		// #383: transplant quiesce requested and input drained — exit cleanly
+		// (do NOT close the conn) and signal the loop to finish the hand-off to
+		// io_uring. tryTransplant only sets asyncQuiesce on a parked, flushed
+		// conn whose fd it has already detached, so asyncInBuf is empty here.
+		if cs.asyncQuiesce.Load() && len(cs.asyncInBuf) == 0 {
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+			l.detachQMu.Lock()
+			l.detachQueue = append(l.detachQueue, cs)
+			l.detachQPending.Store(1)
+			l.detachQMu.Unlock()
+			if l.eventFD >= 0 {
+				var val [8]byte
+				val[0] = 1
+				_, _ = unix.Write(l.eventFD, val[:])
+			}
 			return
 		}
 		// Double-buffer swap: hand asyncInBuf to the goroutine, reuse
@@ -1906,6 +1995,14 @@ func (l *Loop) drainDetachQueue() {
 		if cs.detachClosed {
 			continue
 		}
+		// #383 transplant: the dispatch goroutine quiesced and exited; the fd was
+		// already removed from epoll by tryTransplant (at a flushed, clean
+		// boundary). Finish the hand-off to io_uring. Checked before the
+		// asyncClosed/close paths so a quiescing conn is migrated, not closed.
+		if cs.transplantPending {
+			l.finishTransplantHandoff(cs)
+			continue
+		}
 		// Hijacked conn (#3.1): hijackConn already detached the fd from
 		// epoll/live set/conn table and handed it to the caller as a
 		// net.Conn (the original fd is closed; the caller owns a dup). It
@@ -2009,7 +2106,7 @@ func (l *Loop) armEpollOut(cs *connState) {
 		return
 	}
 	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLOUT,
+		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLOUT | unix.EPOLLRDHUP,
 		Fd:     int32(cs.fd),
 	}); err == nil {
 		cs.epollOut = true
@@ -2028,7 +2125,7 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 		return
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET,
+		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 		Fd:     int32(cs.fd),
 	})
 	cs.epollOut = false
@@ -2063,6 +2160,11 @@ func (l *Loop) handleWritable(cs *connState) {
 	}
 	if drained {
 		l.disarmEpollOut(cs)
+		// Deferred peer-close (EPOLLRDHUP arrived mid-response): the response is
+		// now fully flushed, so close the conn rather than strand it.
+		if cs.peerClosed {
+			l.closeConn(cs.fd)
+		}
 	}
 }
 

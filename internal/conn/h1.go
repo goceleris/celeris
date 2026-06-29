@@ -97,8 +97,16 @@ type H1State struct {
 	// state.buffer (*bytes.Buffer) doubling-grow and the paired
 	// cs.buf→state.buffer memcpy that previously dominated the 1 MiB POST
 	// hot path.
-	bodyBuf            []byte
-	bodyNeeded         int
+	bodyBuf    []byte
+	bodyNeeded int
+	// chunkedInProgress is true while a chunked-transfer-encoding request body
+	// is mid-accumulation in state.buffer (the chunked loop returned on an
+	// incomplete chunk). Unlike a fixed-length body it leaves bodyNeeded==0, so
+	// it is the one "current request continuation" state that buffer.Len()>0
+	// alone cannot distinguish from buffered pipelined NEXT-request bytes. The
+	// #383 transplant boundary check (AtRequestBoundary) uses it to refuse a
+	// conn whose buffer holds a half-received chunked body.
+	chunkedInProgress  bool
 	req                h1.Request
 	rw                 h1ResponseAdapter // embedded — reused per request, avoids heap alloc
 	stream             *stream.Stream    // per-connection cached stream (avoids pool Get/Put per request)
@@ -244,6 +252,20 @@ func (s *H1State) TakeBufferedBytes() []byte {
 // for the continuation (so the partial-state parse paths never run inline).
 func (s *H1State) HasPendingData() bool {
 	return s.buffer.Len() > 0 || s.bodyNeeded > 0
+}
+
+// AtRequestBoundary reports whether the parser is BETWEEN requests — no part of
+// the current request remains in progress, so any bytes still buffered are the
+// start of subsequent (pipelined) requests and can be safely replayed on a fresh
+// H1State. This is the #383 transplant precondition. It is FALSE while a
+// fixed-length body (bodyNeeded>0) or a chunked body (chunkedInProgress) is
+// mid-receive, or a mid-flight H2C upgrade is pending — states whose continuation
+// lives in this H1State and would be lost by a fresh-parser replay. Note a clean
+// boundary may still have buffer.Len()>0 (buffered pipelined next requests):
+// those ARE safe, which is exactly why HasPendingData (true for any buffered
+// bytes) is too conservative for the transplant carry-over decision.
+func (s *H1State) AtRequestBoundary() bool {
+	return s.bodyNeeded == 0 && !s.chunkedInProgress && s.UpgradeInfo == nil
 }
 
 // HasPendingDispatchState reports whether ProcessH1 left partial state that
@@ -720,6 +742,10 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					return cerr
 				}
 				if chunkConsumed == 0 {
+					// Incomplete chunked body: the current request continues in
+					// state.buffer across the next recv. Flag it so #383 transplant
+					// won't mistake this for buffered next-request bytes.
+					state.chunkedInProgress = true
 					return nil
 				}
 				state.buffer.Next(chunkConsumed)
@@ -732,6 +758,8 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 					return fmt.Errorf("chunked body exceeds %d byte limit", limit)
 				}
 			}
+			// Chunked body fully received; the request is no longer in progress.
+			state.chunkedInProgress = false
 			bodyData = chunks.Bytes()
 		default:
 			state.buffer.Next(consumed)

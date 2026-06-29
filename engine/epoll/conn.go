@@ -109,6 +109,11 @@ type connState struct {
 	detachMu     *sync.Mutex  // non-nil after Detach(); guards writeBuf from event loop + goroutine
 	detachClosed bool         // true after closeConn on a detached conn; writeFn becomes no-op
 
+	// peerClosed is set when EPOLLRDHUP reports the peer half-closed (FIN) while
+	// a response was still flushing (write backpressure). The conn is closed once
+	// its pending write drains, so the response is not truncated. Reset on release.
+	peerClosed bool
+
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (single-threaded write)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
@@ -130,7 +135,18 @@ type connState struct {
 	asyncInMu   sync.Mutex
 	asyncCond   sync.Cond   // L = &asyncInMu; signaled by worker on new data or close
 	asyncRun    bool        // true while the dispatch goroutine is alive
+	asyncParked bool        // true while the dispatch goroutine is parked in asyncCond.Wait (idle between requests); guarded by asyncInMu. #383 transplant only moves a promoted conn caught parked (not mid-ProcessH1, since the double-buffer swap empties asyncInBuf during processing).
 	asyncClosed atomic.Bool // set by worker's close path; goroutine exits next iter
+	// asyncQuiesce (#383) asks a promoted conn's dispatch goroutine to exit
+	// cleanly (NOT close the conn) so the fd can be transplanted to io_uring.
+	// Set by tryTransplant on the loop thread after detaching the fd from epoll;
+	// the goroutine, on its next park, sees it, exits, and enqueues cs on
+	// detachQueue for the loop to finish the handoff.
+	asyncQuiesce atomic.Bool
+	// transplantPending (#383, loop-thread-only) marks a conn detached for
+	// transplant whose dispatch goroutine must drain+exit first; drainDetachQueue
+	// completes the handoff once it sees the enqueued cs with this set.
+	transplantPending bool
 	// asyncPromoted: once an async-marked route is observed on this conn
 	// while it ran inline on the event loop (per-handler async, celeris
 	// #300), the conn is promoted (sticky) — every subsequent recv goes
@@ -237,8 +253,12 @@ func releaseConnState(cs *connState) {
 	cs.asyncInBuf = trimPooledBuf(cs.asyncInBuf)
 	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
+	cs.peerClosed = false
 	cs.asyncRun = false
+	cs.asyncParked = false
 	cs.asyncClosed.Store(false)
+	cs.asyncQuiesce.Store(false)
+	cs.transplantPending = false
 	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
