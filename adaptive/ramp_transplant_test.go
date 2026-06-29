@@ -16,11 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
-	"golang.org/x/net/http2"
 )
 
 // newRampAdaptive builds an adaptive engine wired for a CONTROLLER-DRIVEN ramp:
