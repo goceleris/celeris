@@ -1404,9 +1404,18 @@ func (l *Loop) initProtocol(cs *connState) {
 				// from this goroutine — dirtyHead is event-loop-local.
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
-				l.detachQPending.Store(1)
+				// Edge-triggered wakeup: only the enqueue that takes the detach
+				// queue empty->non-empty writes the wakeup eventfd. This Swap and
+				// the drain's detachQPending.Store(0) both run under detachQMu, so
+				// a racing enqueue is either captured by the drain's swap or
+				// observes pending==0 and re-arms — never both missed (see
+				// drainDetachQueue). Coalesces the per-message wakeup-syscall storm
+				// under a hot broadcast fan-out. The detachMu-guarded writeBuf
+				// mutation is untouched, so the WS-write-vs-flushWrites ordering
+				// invariant (celeris#284) is preserved.
+				wasEmpty := l.detachQPending.Swap(1) == 0
 				l.detachQMu.Unlock()
-				if l.eventFD >= 0 {
+				if wasEmpty && l.eventFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(l.eventFD, val[:])
@@ -1427,9 +1436,11 @@ func (l *Loop) initProtocol(cs *connState) {
 				}
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
-				l.detachQPending.Store(1)
+				// Coalesce the wakeup on the detach queue's empty->non-empty
+				// edge — see the write closure above and drainDetachQueue.
+				wasEmpty := l.detachQPending.Swap(1) == 0
 				l.detachQMu.Unlock()
-				if l.eventFD >= 0 {
+				if wasEmpty && l.eventFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(l.eventFD, val[:])
@@ -1441,9 +1452,11 @@ func (l *Loop) initProtocol(cs *connState) {
 				}
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
-				l.detachQPending.Store(1)
+				// Coalesce the wakeup on the detach queue's empty->non-empty
+				// edge — see the write closure above and drainDetachQueue.
+				wasEmpty := l.detachQPending.Swap(1) == 0
 				l.detachQMu.Unlock()
-				if l.eventFD >= 0 {
+				if wasEmpty && l.eventFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(l.eventFD, val[:])
@@ -1506,9 +1519,11 @@ func (l *Loop) initProtocol(cs *connState) {
 			if l.async {
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
-				l.detachQPending.Store(1)
+				// Coalesce the wakeup on the detach queue's empty->non-empty
+				// edge — see the write closure above and drainDetachQueue.
+				wasEmpty := l.detachQPending.Swap(1) == 0
 				l.detachQMu.Unlock()
-				if l.eventFD >= 0 {
+				if wasEmpty && l.eventFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(l.eventFD, val[:])

@@ -1383,9 +1383,19 @@ func (w *Worker) initProtocol(cs *connState) {
 				// from this goroutine — dirtyHead is worker-local.
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
-				w.detachQPending.Store(1)
+				// Edge-triggered wakeup: only the enqueue that takes the detach
+				// queue empty->non-empty writes the wakeup eventfd. This Swap and
+				// the drain's detachQPending.Store(0) both run under detachQMu, so
+				// a racing enqueue is either captured by the drain's swap or
+				// observes pending==0 and re-arms the wakeup — never both missed
+				// (see drainDetachQueue). Coalesces the per-message wakeup-syscall
+				// storm under a hot broadcast fan-out — previously one unix.Write
+				// per message per connection. The detachMu-guarded writeBuf
+				// mutation is untouched, so the WS-write-vs-flushSend ordering
+				// invariant (celeris#284) is fully preserved.
+				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wakeupFD >= 0 {
+				if wasEmpty && wakeupFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(wakeupFD, val[:])
@@ -1407,9 +1417,11 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
-				w.detachQPending.Store(1)
+				// Coalesce the wakeup on the detach queue's empty->non-empty
+				// edge — see the write closure above and drainDetachQueue.
+				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wakeupFD >= 0 {
+				if wasEmpty && wakeupFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(wakeupFD, val[:])
@@ -1421,9 +1433,11 @@ func (w *Worker) initProtocol(cs *connState) {
 				}
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
-				w.detachQPending.Store(1)
+				// Coalesce the wakeup on the detach queue's empty->non-empty
+				// edge — see the write closure above and drainDetachQueue.
+				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wakeupFD >= 0 {
+				if wasEmpty && wakeupFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(wakeupFD, val[:])
@@ -1480,9 +1494,11 @@ func (w *Worker) initProtocol(cs *connState) {
 			if w.async {
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
-				w.detachQPending.Store(1)
+				// Coalesce the wakeup on the detach queue's empty->non-empty
+				// edge — see the write closure above and drainDetachQueue.
+				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wakeupFD >= 0 {
+				if wasEmpty && wakeupFD >= 0 {
 					var val [8]byte
 					val[0] = 1
 					_, _ = unix.Write(wakeupFD, val[:])
