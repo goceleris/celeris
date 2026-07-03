@@ -164,9 +164,17 @@ type engineWriter struct {
 	conn *Conn
 }
 
+// storedWriteErr boxes the engine-reported error so Conn.writeErr (an
+// atomic.Value) always holds ONE concrete type. The engine surfaces errors of
+// varying concrete types via OnError (errPeerClosed, syscall errors,
+// ErrWriteClosed, …); storing them directly panics atomic.Value with "store of
+// inconsistently typed value" on the second differing type. Boxing keeps the
+// stored dynamic type constant.
+type storedWriteErr struct{ err error }
+
 func (w *engineWriter) Write(p []byte) (int, error) {
-	if e := w.conn.writeErr.Load(); e != nil {
-		return 0, e.(error)
+	if v := w.conn.writeErr.Load(); v != nil {
+		return 0, v.(storedWriteErr).err
 	}
 	if w.conn.closed.Load() {
 		return 0, ErrWriteClosed

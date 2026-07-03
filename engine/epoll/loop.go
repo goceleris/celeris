@@ -2404,14 +2404,23 @@ func (l *Loop) closeConn(fd int) {
 		// goroutine is mid-write, we block until it finishes.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
-		if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
+		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
+		// and the ws.Close() it calls — races the upgrade installing it and the
+		// rest of the ws state on the async goroutine after Detach released
+		// detachMu (peer RST mid-upgrade). Not-yet-wired conns are still torn
+		// down via the fd close + read path below.
+		if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
 			cs.h1State.OnDetachClose()
 			cs.h1State.OnDetachClose = nil
 		}
 		cs.detachMu.Unlock()
-		// Drop callbacks once the engine relinquishes the conn so any
-		// late goroutine references resolve to no-ops without crashing.
-		if cs.h1State != nil {
+		// Drop callbacks once the engine relinquishes the conn so any late
+		// goroutine references resolve to no-ops without crashing. Same acquire
+		// barrier as OnDetachClose above: only drop them once the WS upgrade has
+		// finished reading them (via WSReadPauser) and published WSReady — before
+		// that, the async upgrade goroutine is still reading PauseRecv/ResumeRecv.
+		if cs.h1State != nil && cs.h1State.WSReady.Load() {
 			cs.h1State.PauseRecv = nil
 			cs.h1State.ResumeRecv = nil
 		}
@@ -2529,7 +2538,10 @@ func (l *Loop) shutdown() {
 			}
 			cs.detachMu.Lock()
 			cs.detachClosed = true
-			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+			// Acquire barrier — see closeConn: skip OnDetachClose until the WS
+			// upgrade has fully wired the conn (WSReady) to avoid racing the
+			// post-Detach wiring on the async goroutine.
+			if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
 				cs.h1State.OnDetachClose()
 				cs.h1State.OnDetachClose = nil
 			}
