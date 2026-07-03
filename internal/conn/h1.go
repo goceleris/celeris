@@ -140,6 +140,21 @@ type H1State struct {
 	// the celeris public API: changes require a major version bump.
 	OnDetachClose func()
 
+	// WSReady is the WebSocket-upgrade completion barrier. The WS middleware
+	// installs the detached-conn callbacks (RawWriteFn, pause/resume,
+	// idle-deadline, and OnDetachClose LAST) on the async-handler goroutine
+	// AFTER Context.Detach — which releases cs.detachMu (celeris#273/#309, so
+	// the guarded write path can re-lock it) — so those writes are NOT
+	// lock-serialised against the engine's closeConn, which reads OnDetachClose
+	// (and calls ws.Close through it) while tearing the conn down when a peer
+	// RSTs mid-upgrade. WSReady is Stored(true) as the final wiring step (in the
+	// OnWSDetachClose setter), publishing every prior write with release
+	// semantics; closeConn Loads it with acquire semantics before invoking
+	// OnDetachClose, so it either observes a fully-wired connection or skips WS
+	// teardown entirely (the conn is still closed via the fd/read path). Fresh
+	// per connection (NewH1State), so it starts false.
+	WSReady atomic.Bool
+
 	// OnError is called by the engine when an I/O failure occurs on a
 	// detached connection (read error, write error, EPIPE, ECONNRESET, etc).
 	// The WebSocket middleware uses this to surface engine-side errors
@@ -942,6 +957,11 @@ func populateCachedStream(state *H1State, req *h1.Request, body []byte) *stream.
 		}
 		s.OnWSDetachClose = func(closeFn func()) {
 			state.OnDetachClose = closeFn
+			// Release barrier: OnDetachClose is the LAST detached-conn callback
+			// the WS upgrade installs, so publishing WSReady here makes every
+			// prior wiring write (RawWriteFn, pause/resume, idle-deadline, and
+			// this OnDetachClose) visible to a closeConn that observes WSReady.
+			state.WSReady.Store(true)
 		}
 		s.OnWSSetError = func(errFn func(error)) {
 			state.OnError = errFn

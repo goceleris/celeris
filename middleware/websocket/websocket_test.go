@@ -2312,9 +2312,10 @@ func TestEngineWriteErrorPropagation(t *testing.T) {
 		t.Fatalf("first write failed: %v", err)
 	}
 
-	// Simulate engine reporting an EPIPE.
+	// Simulate engine reporting an EPIPE. Stored boxed (storedWriteErr) exactly
+	// as the OnError handler does, so atomic.Value holds one concrete type.
 	want := errors.New("synthetic EPIPE")
-	ws.writeErr.Store(want)
+	ws.writeErr.Store(storedWriteErr{want})
 
 	// Subsequent writes return the engine error verbatim.
 	err := ws.WriteMessage(TextMessage, []byte("second"))

@@ -1378,9 +1378,41 @@ func (w *Worker) initProtocol(cs *connState) {
 					return
 				}
 				orig(data)
+				// Inline egress fast path (io_uring, SINGLE_ISSUER-safe): the
+				// ring may only be driven by the worker thread, but a raw
+				// unix.Write(2) on the socket fd is legal from any goroutine iff
+				// NO ring SEND is in-flight for this conn (else the two writes
+				// interleave on the wire). detachMu (held) gates it: the worker
+				// submits every SEND under detachMu and sets cs.sending, and
+				// completeSend now clears it under detachMu too, so with
+				// cs.sending==false && !zcNotifPending && sendBuf/bodyBuf empty no
+				// SEND is outstanding and none can start while we hold the lock —
+				// writeBuf is the only pending data, so the raw write is exclusive
+				// and correctly ordered. Requires a REAL fd: under ACCEPT_DIRECT
+				// (fixedFile) cs.fd is a ring file-table index, not a syscall'able
+				// fd, so those conns skip the fast path and use the ring (same
+				// guard hijack uses). This parallelises WS/SSE egress across the
+				// dispatch goroutines like the std engine instead of funnelling
+				// every send through the single worker thread. On full drain we
+				// skip the worker handoff; on partial we compact the remainder to
+				// the front (the worker's flushSend swaps writeBuf→sendBuf next);
+				// on EAGAIN/error we leave writeBuf and fall through — the worker
+				// ring-sends the rest and surfaces any I/O error via completeSend.
+				if !cs.fixedFile && !cs.sending && !cs.zcNotifPending &&
+					len(cs.sendBuf) == 0 && len(cs.bodyBuf) == 0 && len(cs.writeBuf) > 0 {
+					if n, werr := unix.Write(cs.fd, cs.writeBuf); werr == nil {
+						w.bytesWritten.Add(uint64(n))
+						if n >= len(cs.writeBuf) {
+							cs.writeBuf = cs.writeBuf[:0]
+							mu.Unlock()
+							return
+						}
+						cs.writeBuf = cs.writeBuf[:copy(cs.writeBuf, cs.writeBuf[n:])]
+					}
+				}
 				mu.Unlock()
-				// Signal the event loop to flush. Do NOT call markDirty
-				// from this goroutine — dirtyHead is worker-local.
+				// Signal the event loop to flush the remainder. Do NOT call
+				// markDirty from this goroutine — dirtyHead is worker-local.
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
 				// Edge-triggered wakeup: only the enqueue that takes the detach
@@ -2109,7 +2141,16 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
 	// Now safe to modify/reuse sendBuf. Process the deferred result.
 	if cqeIsNotif(c.Flags) {
-		cs.zcNotifPending = false
+		// zcNotifPending is read by the inline-egress guard on the dispatch
+		// goroutine under detachMu; clear it under the lock (completeSend
+		// re-acquires detachMu, so release first).
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+			cs.zcNotifPending = false
+			mu.Unlock()
+		} else {
+			cs.zcNotifPending = false
+		}
 		w.completeSend(cs, fd, int(cs.zcSentBytes), now)
 		return
 	}
@@ -2117,6 +2158,12 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC first CQE: result is ready but buffer is still in DMA.
 	// Store the result and wait for the notification before touching sendBuf.
 	if w.sendZC && cqeHasMore(c.Flags) {
+		// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
+		// the dispatch goroutine under detachMu; mutate them under the lock.
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+			defer mu.Unlock()
+		}
 		if c.Res < 0 {
 			cs.sending = false
 			cs.zcNotifPending = true
@@ -2137,24 +2184,37 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
 	// Disable ZC for this worker and retry the send with regular SEND.
 	if c.Res == -22 && w.sendZC {
-		cs.sending = false
 		w.sendZC = false
 		w.logger.Warn("SEND_ZC not supported (EINVAL), falling back to regular SEND",
 			"worker", w.id)
+		// cs.sending is read by the inline-egress guard under detachMu; clear it
+		// and re-flush under the lock (flushSend for a detached conn is always
+		// called under detachMu, as in the dirty-flush loop).
+		mu := cs.detachMu
+		if mu != nil {
+			mu.Lock()
+		}
+		cs.sending = false
 		if w.flushSend(cs) {
 			w.markDirty(cs)
+		}
+		if mu != nil {
+			mu.Unlock()
 		}
 		return
 	}
 
 	if c.Res < 0 {
-		cs.sending = false
 		w.errCount.Add(1)
-		cs.sendBuf = cs.sendBuf[:0]
+		// cs.sending / cs.sendBuf are read by the inline-egress guard under
+		// detachMu; reset them (and writeBuf) inside the lock rather than before
+		// it, so the dispatch-goroutine read never races this error completion.
 		mu := cs.detachMu
 		if mu != nil {
 			mu.Lock()
 		}
+		cs.sending = false
+		cs.sendBuf = cs.sendBuf[:0]
 		cs.writeBuf = cs.writeBuf[:0]
 		if cs.h1State != nil && cs.h1State.OnError != nil {
 			cs.h1State.OnError(errIORingSend(c.Res))
@@ -2182,15 +2242,17 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // exists, otherwise the goroutine read races the event-loop write —
 // observed via -race in TestNativeEngineLargePayload/io_uring.
 func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
-	cs.sending = false
-
-	// Take the lock up-front for detached connections so the entire
-	// state mutation (sendBuf truncate / writeBuf reset / OnError fire)
-	// is serialized against the goroutine writeFn path.
+	// Take the lock up-front for detached connections so the entire state
+	// mutation (cs.sending clear / sendBuf truncate / writeBuf reset / OnError
+	// fire) is serialized against the goroutine writeFn path. The inline-egress
+	// fast path (the initProtocol guarded closure) reads cs.sending under
+	// detachMu to decide whether a ring SEND is in-flight, so the clear MUST be
+	// inside the lock — otherwise that read races this completion.
 	if mu := cs.detachMu; mu != nil {
 		mu.Lock()
 		defer mu.Unlock()
 	}
+	cs.sending = false
 
 	if sent < 0 {
 		w.errCount.Add(1)
@@ -2302,14 +2364,23 @@ func (w *Worker) closeConn(fd int) {
 		// Signal the detached goroutine's writeFn to stop writing.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
-		if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
+		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
+		// and the ws.Close() it calls — races the upgrade installing it and the
+		// rest of the ws state on the async goroutine after Detach released
+		// detachMu (peer RST mid-upgrade). Not-yet-wired conns are still torn
+		// down via the fd close + read path below.
+		if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
 			cs.h1State.OnDetachClose()
 			cs.h1State.OnDetachClose = nil
 		}
 		cs.detachMu.Unlock()
-		// Drop callbacks once the engine relinquishes the conn so any
-		// late goroutine references resolve to no-ops without crashing.
-		if cs.h1State != nil {
+		// Drop callbacks once the engine relinquishes the conn so any late
+		// goroutine references resolve to no-ops without crashing. Same acquire
+		// barrier as OnDetachClose above: only drop them once the WS upgrade has
+		// finished reading them (via WSReadPauser) and published WSReady — before
+		// that, the async upgrade goroutine is still reading PauseRecv/ResumeRecv.
+		if cs.h1State != nil && cs.h1State.WSReady.Load() {
 			cs.h1State.PauseRecv = nil
 			cs.h1State.ResumeRecv = nil
 		}
@@ -3704,7 +3775,10 @@ func (w *Worker) shutdown() {
 			}
 			cs.detachMu.Lock()
 			cs.detachClosed = true
-			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+			// Acquire barrier — see the primary close path: skip OnDetachClose
+			// until the WS upgrade has fully wired the conn (WSReady) to avoid
+			// racing the post-Detach wiring on the async goroutine.
+			if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
 				cs.h1State.OnDetachClose()
 				cs.h1State.OnDetachClose = nil
 			}

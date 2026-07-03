@@ -1399,9 +1399,43 @@ func (l *Loop) initProtocol(cs *connState) {
 					return
 				}
 				orig(data)
+				// Inline egress fast path (WS/SSE): issue the send on THIS
+				// dispatch goroutine instead of funnelling every detached-conn
+				// write through the single event-loop thread. detachMu (held)
+				// is the SAME lock the loop-thread dirty-flush takes around
+				// flushWrites, and closeConn takes it before tearing the fd
+				// down (loop.go:2371) — so the write here can neither race the
+				// loop's flush nor touch a closed fd. writeBuf is one ordered
+				// buffer flushed from writePos, so dispatch-side and loop-side
+				// flushWrites can never reorder a conn's bytes. Reconcile
+				// pendingBytes exactly as the dirty-flush does (loop.go:568/587).
+				// This parallelises the write(2) across all cores like the std
+				// engine, lifting the single-loop-thread broadcast ceiling. On
+				// full drain we return WITHOUT enqueuing — the loop never touches
+				// the conn. On partial/EAGAIN/error we fall through to the
+				// existing enqueue path so the loop finishes the remainder
+				// (detached WS conns stay on the dirty list) or tears it down.
+				if err := l.flushWrites(cs, false); err != nil {
+					// Surface the specific I/O error (EPIPE/ECONNRESET/…) to the
+					// detached middleware before teardown, matching the loop-thread
+					// dirty-flush (loop.go:558) and handleWritable. Without this the
+					// handler would see a generic io.EOF/ErrWriteClosed from the
+					// asyncClosed→OnDetachClose path instead of the real errno.
+					if cs.h1State != nil && cs.h1State.OnError != nil {
+						cs.h1State.OnError(err)
+					}
+					cs.asyncClosed.Store(true) // teardown via drainDetachQueue
+				} else if !csWritePending(cs) {
+					cs.pendingBytes = 0
+					mu.Unlock()
+					return
+				} else {
+					cs.pendingBytes = csPendingBytes(cs)
+				}
 				mu.Unlock()
-				// Signal the event loop to flush. Do NOT call markDirty
-				// from this goroutine — dirtyHead is event-loop-local.
+				// Signal the event loop to flush the remainder / tear down. Do
+				// NOT call markDirty from this goroutine — dirtyHead is
+				// event-loop-local.
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
 				// Edge-triggered wakeup: only the enqueue that takes the detach
@@ -2370,14 +2404,23 @@ func (l *Loop) closeConn(fd int) {
 		// goroutine is mid-write, we block until it finishes.
 		cs.detachMu.Lock()
 		cs.detachClosed = true
-		if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
+		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
+		// and the ws.Close() it calls — races the upgrade installing it and the
+		// rest of the ws state on the async goroutine after Detach released
+		// detachMu (peer RST mid-upgrade). Not-yet-wired conns are still torn
+		// down via the fd close + read path below.
+		if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
 			cs.h1State.OnDetachClose()
 			cs.h1State.OnDetachClose = nil
 		}
 		cs.detachMu.Unlock()
-		// Drop callbacks once the engine relinquishes the conn so any
-		// late goroutine references resolve to no-ops without crashing.
-		if cs.h1State != nil {
+		// Drop callbacks once the engine relinquishes the conn so any late
+		// goroutine references resolve to no-ops without crashing. Same acquire
+		// barrier as OnDetachClose above: only drop them once the WS upgrade has
+		// finished reading them (via WSReadPauser) and published WSReady — before
+		// that, the async upgrade goroutine is still reading PauseRecv/ResumeRecv.
+		if cs.h1State != nil && cs.h1State.WSReady.Load() {
 			cs.h1State.PauseRecv = nil
 			cs.h1State.ResumeRecv = nil
 		}
@@ -2495,7 +2538,10 @@ func (l *Loop) shutdown() {
 			}
 			cs.detachMu.Lock()
 			cs.detachClosed = true
-			if cs.h1State != nil && cs.h1State.OnDetachClose != nil {
+			// Acquire barrier — see closeConn: skip OnDetachClose until the WS
+			// upgrade has fully wired the conn (WSReady) to avoid racing the
+			// post-Detach wiring on the async goroutine.
+			if cs.h1State != nil && cs.h1State.WSReady.Load() && cs.h1State.OnDetachClose != nil {
 				cs.h1State.OnDetachClose()
 				cs.h1State.OnDetachClose = nil
 			}

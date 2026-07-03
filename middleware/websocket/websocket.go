@@ -229,7 +229,9 @@ func tryEngineUpgrade(c *celeris.Context, acceptKey, subproto string,
 	ws.subprotocol = subproto
 
 	c.SetWSErrorHandler(func(err error) {
-		ws.writeErr.Store(err)
+		if err != nil {
+			ws.writeErr.Store(storedWriteErr{err})
+		}
 		reader.closeWith(err)
 	})
 
