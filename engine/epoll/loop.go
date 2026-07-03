@@ -1399,9 +1399,43 @@ func (l *Loop) initProtocol(cs *connState) {
 					return
 				}
 				orig(data)
+				// Inline egress fast path (WS/SSE): issue the send on THIS
+				// dispatch goroutine instead of funnelling every detached-conn
+				// write through the single event-loop thread. detachMu (held)
+				// is the SAME lock the loop-thread dirty-flush takes around
+				// flushWrites, and closeConn takes it before tearing the fd
+				// down (loop.go:2371) — so the write here can neither race the
+				// loop's flush nor touch a closed fd. writeBuf is one ordered
+				// buffer flushed from writePos, so dispatch-side and loop-side
+				// flushWrites can never reorder a conn's bytes. Reconcile
+				// pendingBytes exactly as the dirty-flush does (loop.go:568/587).
+				// This parallelises the write(2) across all cores like the std
+				// engine, lifting the single-loop-thread broadcast ceiling. On
+				// full drain we return WITHOUT enqueuing — the loop never touches
+				// the conn. On partial/EAGAIN/error we fall through to the
+				// existing enqueue path so the loop finishes the remainder
+				// (detached WS conns stay on the dirty list) or tears it down.
+				if err := l.flushWrites(cs, false); err != nil {
+					// Surface the specific I/O error (EPIPE/ECONNRESET/…) to the
+					// detached middleware before teardown, matching the loop-thread
+					// dirty-flush (loop.go:558) and handleWritable. Without this the
+					// handler would see a generic io.EOF/ErrWriteClosed from the
+					// asyncClosed→OnDetachClose path instead of the real errno.
+					if cs.h1State != nil && cs.h1State.OnError != nil {
+						cs.h1State.OnError(err)
+					}
+					cs.asyncClosed.Store(true) // teardown via drainDetachQueue
+				} else if !csWritePending(cs) {
+					cs.pendingBytes = 0
+					mu.Unlock()
+					return
+				} else {
+					cs.pendingBytes = csPendingBytes(cs)
+				}
 				mu.Unlock()
-				// Signal the event loop to flush. Do NOT call markDirty
-				// from this goroutine — dirtyHead is event-loop-local.
+				// Signal the event loop to flush the remainder / tear down. Do
+				// NOT call markDirty from this goroutine — dirtyHead is
+				// event-loop-local.
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
 				// Edge-triggered wakeup: only the enqueue that takes the detach
