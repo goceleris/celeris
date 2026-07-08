@@ -5,6 +5,7 @@ package websocket_test
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,28 +16,45 @@ import (
 )
 
 // TestWSRSTMidUpgradeTorture reproduces the v1.5.7 weekend-soak crash over
-// REAL TCP on the epoll engine with async handlers: many concurrent clients
+// REAL TCP on the native engines with async handlers: many concurrent clients
 // upgrade to WebSocket and then abort with a TCP RST (SO_LINGER=0) either
 // mid-upgrade or just after, while inbound frame bytes are in flight. That
 // drives the engine's OnError -> reader.closeWith concurrently with the
-// UpgradeWebSocket data callback's chanReader.Append. On the buggy reader
-// (which close(r.ch)'d) this panics with "send on closed channel" and kills
-// the process; with the done-channel fix it runs clean.
+// UpgradeWebSocket data callback's chanReader.Append, AND drives closeConn ->
+// CloseH1 concurrently with the async upgrade goroutine's Context.Detach ->
+// WSRawWriteFn. On the buggy code this panics ("send on closed channel", then
+// a Context/stream use-after-recycle nil-deref) and cascades into pooled-object
+// -race corruption; with the fixes it runs clean.
 //
 // Run with -race (and ideally -gcflags=all=-d=checkptr) to match the soak
-// build. Skipped under -short (it runs for several seconds under load).
+// build. Skipped under -short (it runs for several seconds under load). Runs on
+// BOTH native engines — the epoll-only variant is what let the io_uring copy of
+// the use-after-recycle race slip through review.
 func TestWSRSTMidUpgradeTorture(t *testing.T) {
 	if testing.Short() {
 		t.Skip("torture test; skipped under -short")
 	}
+	for _, tc := range []struct {
+		name   string
+		engine celeris.EngineType
+	}{
+		{"epoll", celeris.Epoll},
+		{"iouring", celeris.IOUring},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wsrstTorture(t, tc.engine)
+		})
+	}
+}
 
+func wsrstTorture(t *testing.T, engine celeris.EngineType) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
 
-	srv := celeris.New(celeris.Config{Engine: celeris.Epoll, AsyncHandlers: true})
+	srv := celeris.New(celeris.Config{Engine: engine, AsyncHandlers: true})
 	srv.GET("/ws", websocket.New(websocket.Config{
 		CheckOrigin: func(c *celeris.Context) bool { return true },
 		Handler: func(c *websocket.Conn) {
@@ -53,9 +71,24 @@ func TestWSRSTMidUpgradeTorture(t *testing.T) {
 	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var startErr atomic.Pointer[error]
 	done := make(chan struct{})
-	go func() { defer close(done); _ = srv.StartWithListenerAndContext(ctx, ln) }()
+	go func() {
+		defer close(done)
+		if e := srv.StartWithListenerAndContext(ctx, ln); e != nil {
+			startErr.Store(&e)
+		}
+	}()
 	time.Sleep(500 * time.Millisecond) // SO_REUSEPORT rebind settle
+	if p := startErr.Load(); p != nil {
+		// Docker / minimal-kernel runners may lack io_uring — skip rather
+		// than fail (feature-gated path, not a celeris bug).
+		msg := (*p).Error()
+		if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
+			t.Skipf("engine unavailable on this runner: %v", *p)
+		}
+		t.Fatalf("server start: %v", *p)
+	}
 	defer func() {
 		cancel()
 		select {
@@ -106,5 +139,5 @@ func TestWSRSTMidUpgradeTorture(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
-	t.Logf("completed %d RST-mid-upgrade cycles across %d workers; server did not panic", cycles.Load(), workers)
+	t.Logf("%s: completed %d RST-mid-upgrade cycles across %d workers; no panic", t.Name(), cycles.Load(), workers)
 }
