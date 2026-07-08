@@ -24,9 +24,13 @@ import (
 // in-flight chunks may still arrive after pause is requested — that
 // headroom is the difference between cap(ch) and highWater.
 type chanReader struct {
-	ch     chan []byte
-	cur    []byte // partially consumed current chunk
-	closed atomic.Bool
+	ch  chan []byte
+	cur []byte // partially consumed current chunk
+	// done is closed exactly once, by closeWith, to signal shutdown. We
+	// close done — NEVER ch — so a concurrent Append can never send on a
+	// closed channel. Both Append and Read select on done to observe close.
+	done   chan struct{}
+	closed atomic.Bool  // CAS guard so done is closed exactly once
 	err    atomic.Value // error sent to the next Read after closing
 
 	// Backpressure callbacks (set after construction by the WS middleware
@@ -65,6 +69,7 @@ func newChanReader(capacity, highPct, lowPct int) *chanReader {
 	}
 	r := &chanReader{
 		ch:        make(chan []byte, capacity),
+		done:      make(chan struct{}),
 		highWater: capacity * highPct / 100,
 		lowWater:  capacity * lowPct / 100,
 	}
@@ -106,6 +111,12 @@ func (r *chanReader) SetPauser(pause, resume func()) {
 // The caller is responsible for COPYING the chunk before calling Append
 // (the engine reuses its read buffer after the callback returns).
 func (r *chanReader) Append(chunk []byte) bool {
+	// Fast path: already closed → drop. This is safe now that ch is NEVER
+	// closed (see closeWith): even if the close lands right after this
+	// check, the send below targets an open channel and cannot panic, and
+	// the <-r.done case then drops the chunk. The OLD design closed ch,
+	// which made this very check a TOCTOU — the send could then panic with
+	// "send on closed channel", exactly the v1.5.7 weekend-soak crash.
 	if r.closed.Load() {
 		return false
 	}
@@ -124,6 +135,9 @@ func (r *chanReader) Append(chunk []byte) bool {
 			}
 		}
 		return true
+	case <-r.done:
+		// Reader closed concurrently; drop the chunk.
+		return false
 	default:
 		r.dropped.Add(1)
 		// Should not happen with backpressure correctly wired, but if it
@@ -140,19 +154,16 @@ func (r *chanReader) Append(chunk []byte) bool {
 func (r *chanReader) Read(p []byte) (int, error) {
 	if len(r.cur) == 0 {
 		if r.closed.Load() {
-			if e := r.err.Load(); e != nil {
-				return 0, e.(error)
-			}
-			return 0, io.EOF
+			return 0, r.closeErr()
 		}
-		chunk, ok := <-r.ch
-		if !ok {
-			if e := r.err.Load(); e != nil {
-				return 0, e.(error)
-			}
-			return 0, io.EOF
+		// Block for the next chunk, waking on close via done. r.ch is never
+		// closed, so a closed-channel receive can't be the wake signal here.
+		select {
+		case chunk := <-r.ch:
+			r.cur = chunk
+		case <-r.done:
+			return 0, r.closeErr()
 		}
-		r.cur = chunk
 
 		// Edge-triggered resume: when depth falls below low-water, lift
 		// backpressure so the engine resumes inbound reads.
@@ -181,9 +192,23 @@ func (r *chanReader) closeWith(err error) {
 	if err != nil {
 		r.err.Store(err)
 	}
-	// Closing the channel wakes any blocked Read.
-	defer func() { _ = recover() }() // tolerate double-close races
-	close(r.ch)
+	// Close done — NOT ch — to wake any blocked Read and to signal any
+	// in-flight Append to drop its chunk. The CAS above guarantees exactly
+	// one closer, so this close is never doubled. We deliberately never
+	// close ch: a concurrent Append may still be selecting on "r.ch <-
+	// chunk", and closing ch under it would panic ("send on closed
+	// channel") — the very race this reader must not have. err is stored
+	// before the close so a Read woken by done observes it (the close is a
+	// happens-before edge).
+	close(r.done)
+}
+
+// closeErr returns the stored close error, or io.EOF if none was set.
+func (r *chanReader) closeErr() error {
+	if e := r.err.Load(); e != nil {
+		return e.(error)
+	}
+	return io.EOF
 }
 
 // Dropped returns the number of inbound chunks dropped due to a full

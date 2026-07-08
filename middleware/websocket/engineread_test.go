@@ -3,6 +3,8 @@ package websocket
 import (
 	"errors"
 	"io"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -155,6 +157,80 @@ func TestChanReaderSmallCapacityNoThrash(t *testing.T) {
 	_, _ = r.Read(buf)
 	if res := resumes.Load(); res != 2 {
 		t.Errorf("expected 2 resumes after redrain, got %d", res)
+	}
+}
+
+// TestChanReaderAppendAfterCloseNoPanic verifies Append never panics once
+// the reader is closed and returns false. Under the previous close(r.ch)
+// design a send racing the close panicked with "send on closed channel";
+// with the done-channel design the channel is never closed, so Append that
+// observes the close simply drops the chunk.
+func TestChanReaderAppendAfterCloseNoPanic(t *testing.T) {
+	r := newChanReader(4, 0, 0)
+	r.closeWith(io.EOF)
+	for i := range 16 {
+		if ok := r.Append([]byte{byte(i)}); ok {
+			t.Fatalf("Append after close returned true (i=%d)", i)
+		}
+	}
+}
+
+// TestChanReaderAppendCloseRace reproduces the v1.5.7 weekend-soak crash:
+// an Append (engine event-loop callback) racing a closeWith (peer-RST error
+// handler). Before the done-channel fix, Append's "r.ch <- chunk" could send
+// on a channel that closeWith had just closed — "send on closed channel"
+// panic, which killed the epoll loop goroutine and tripped I-LIVENESS on
+// both arches. Run under -race: the old design also data-races close(r.ch)
+// against the send. This must be panic-free and race-clean.
+func TestChanReaderAppendCloseRace(t *testing.T) {
+	iters := 300
+	if testing.Short() {
+		iters = 40
+	}
+	for range iters {
+		r := newChanReader(4, 0, 0) // small cap so sends stay live against the drain
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+
+		// Reader: drains so the "r.ch <- chunk" send path (not just the
+		// full/default path) stays live while the close lands underneath it.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			buf := make([]byte, 8)
+			for {
+				if _, err := r.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		// Sender: the engine event-loop Append callback. Must not panic
+		// when closeWith fires beneath it.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := range 500 {
+				r.Append([]byte{byte(i)})
+			}
+		}()
+
+		// Closer: the peer-RST SetWSErrorHandler path, interleaved with
+		// in-flight sends via a short scheduler spin.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 20 {
+				runtime.Gosched()
+			}
+			r.closeWith(io.ErrUnexpectedEOF)
+		}()
+
+		close(start)
+		wg.Wait()
 	}
 }
 
