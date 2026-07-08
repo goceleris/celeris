@@ -986,8 +986,6 @@ func (l *Loop) drainRead(fd int, now int64) {
 			l.initProtocol(cs)
 		}
 
-		writeFn := cs.writeFn
-
 		// Async handler dispatch — goroutine-per-conn with an input buffer.
 		//
 		// The worker appends this read's bytes to cs.asyncInBuf. If a
@@ -1041,6 +1039,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 			}
 			continue
 		}
+
+		// writeFn is read here — NOT before the async-dispatch branch above.
+		// A promoted-async conn is owned by its dispatch goroutine, which can
+		// rewrite cs.writeFn during Context.Detach (the OnDetach callback at
+		// initProtocol). The async branch does not use this local, so reading
+		// it only on the inline path keeps the event loop from racing that
+		// write (the pre-existing loop.go:989-vs-1458 data race).
+		writeFn := cs.writeFn
 
 		var processErr error
 		// Stash worker-local "now" on H1State so populateCachedStream can
