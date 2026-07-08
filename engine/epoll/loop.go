@@ -1547,9 +1547,17 @@ func (l *Loop) initProtocol(cs *connState) {
 			// inline flush owns its own Lock/Unlock around flushWrites, so
 			// the guarded writeFn (which re-locks) still serialises with
 			// the event loop. See celeris#309.
-			if l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked {
+			// Do NOT release detachMu here — defer it to AFTER Detached.Store(
+			// true) below. A concurrent closeConn (peer RST mid-upgrade)
+			// acquires detachMu before CloseH1 and re-reads Detached under it;
+			// holding the lock across the Store guarantees closeConn observes
+			// the ownership handoff and skips CloseH1, instead of recycling the
+			// Context/stream this WS/SSE middleware goroutine is still using —
+			// the loop.go:2465-vs-websocket.go:243 use-after-recycle that
+			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
+			unlockDetachMu := l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked
+			if unlockDetachMu {
 				cs.asyncDetachUnlocked = true
-				cs.detachMu.Unlock()
 			}
 			// Async mode: enqueue cs so drainDetachQueue picks up the
 			// deferred bookkeeping (asyncDetachPending). The first
@@ -1578,6 +1586,14 @@ func (l *Loop) initProtocol(cs *connState) {
 			// let the worker act on a half-installed detach. See the data-race
 			// fix making Detached atomic.
 			cs.h1State.Detached.Store(true)
+			// Release detachMu now that Detached is published, so the guarded
+			// writeFn the middleware calls next (the 101 / SSE headers) can
+			// re-acquire it. A closeConn blocked on detachMu now proceeds and
+			// reads Detached==true, so it skips CloseH1 and leaves teardown to
+			// the middleware goroutine.
+			if unlockDetachMu {
+				cs.detachMu.Unlock()
+			}
 		}
 		cs.h1State.HijackFn = func() (net.Conn, error) {
 			return l.hijackConn(cs.fd)
@@ -2462,7 +2478,19 @@ func (l *Loop) closeConn(fd int) {
 	if !trulyDetached && cs.h1State != nil {
 		if detached {
 			cs.detachMu.Lock()
-			conn.CloseH1(cs.h1State)
+			// Re-read Detached UNDER the lock. An in-flight Context.Detach()
+			// (OnDetach on the async dispatch goroutine) publishes Detached and
+			// only then releases detachMu (see initProtocol), so acquiring the
+			// lock the handler held observes the final ownership. If the conn
+			// detached while we waited, the WS/SSE middleware goroutine owns
+			// teardown — skip CloseH1; otherwise we would recycle a
+			// Context/stream it is still using (the use-after-recycle that
+			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade).
+			if cs.h1State.Detached.Load() {
+				trulyDetached = true
+			} else {
+				conn.CloseH1(cs.h1State)
+			}
 			cs.detachMu.Unlock()
 		} else {
 			conn.CloseH1(cs.h1State)
@@ -2560,7 +2588,15 @@ func (l *Loop) shutdown() {
 			// reading the fields CloseH1 writes.
 			if detached {
 				cs.detachMu.Lock()
-				conn.CloseH1(cs.h1State)
+				// Re-read Detached under the lock (see closeConn): an in-flight
+				// OnDetach publishes Detached before releasing detachMu, so
+				// skip CloseH1 if the conn detached while we waited — else we
+				// recycle a Context/stream the middleware goroutine still uses.
+				if cs.h1State.Detached.Load() {
+					trulyDetached = true
+				} else {
+					conn.CloseH1(cs.h1State)
+				}
 				cs.detachMu.Unlock()
 			} else {
 				conn.CloseH1(cs.h1State)
