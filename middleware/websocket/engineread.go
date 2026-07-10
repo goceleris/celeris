@@ -111,12 +111,15 @@ func (r *chanReader) SetPauser(pause, resume func()) {
 // The caller is responsible for COPYING the chunk before calling Append
 // (the engine reuses its read buffer after the callback returns).
 func (r *chanReader) Append(chunk []byte) bool {
-	// Fast path: already closed → drop. This is safe now that ch is NEVER
-	// closed (see closeWith): even if the close lands right after this
-	// check, the send below targets an open channel and cannot panic, and
-	// the <-r.done case then drops the chunk. The OLD design closed ch,
-	// which made this very check a TOCTOU — the send could then panic with
-	// "send on closed channel", exactly the v1.5.7 weekend-soak crash.
+	// Fast path: already closed → drop. Safe because ch is NEVER closed
+	// (closeWith closes `done`, not `ch`): even if the close lands right after
+	// this check, the send below targets an open channel and cannot panic — a
+	// chunk buffered as the reader closes is just never Read and is GC'd. No
+	// <-r.done case is needed in the select (the send can neither panic nor
+	// block forever — it is a non-blocking select-with-default), so Append
+	// keeps the cheap single-op select. The OLD design closed ch, which made
+	// this check a TOCTOU: the send could then panic with "send on closed
+	// channel" — the v1.5.7 weekend-soak crash.
 	if r.closed.Load() {
 		return false
 	}
@@ -135,9 +138,6 @@ func (r *chanReader) Append(chunk []byte) bool {
 			}
 		}
 		return true
-	case <-r.done:
-		// Reader closed concurrently; drop the chunk.
-		return false
 	default:
 		r.dropped.Add(1)
 		// Should not happen with backpressure correctly wired, but if it
