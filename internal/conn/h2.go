@@ -526,6 +526,9 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	// peer's SETTINGS lands.
 	s.adapter.manager = mgr
 	s.inlineAdapter.manager = mgr
+	// The inline adapter delegates incremental streaming to the queue adapter
+	// so StreamWriter()-based responses stay safe on inline routes (celeris#408).
+	s.inlineAdapter.queue = &s.adapter
 
 	p := frame.NewParser()
 	p.InitReader(&s.inBuf)

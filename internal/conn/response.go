@@ -518,6 +518,13 @@ type h2InlineResponseAdapter struct {
 	maxFrameSize uint32          // peer's advertised MAX_FRAME_SIZE (updated via Refresh)
 	manager      *stream.Manager // peer-SETTINGS-aware source of max frame size
 	enc          h2StreamEncoder // per-connection encoder (no sync.Pool needed for inline path)
+	// queue is this connection's sharded-queue adapter. Incremental streaming
+	// (the Streamer methods: WriteHeader/Write/Flush/Close) MUST delegate to it
+	// — a streaming response (SSE, chunked) may be produced by a detached/async
+	// goroutine that cannot write outBuf directly (outBuf is event-loop-thread +
+	// H2State.mu only). Only WriteResponse — the buffered inline GET/HEAD fast
+	// path, always on the event loop — writes straight to outBuf. See celeris#408.
+	queue *h2ResponseAdapter
 }
 
 // peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE.
@@ -628,6 +635,31 @@ func (a *h2InlineResponseAdapter) WriteRSTStreamPriority(_ uint32, _ http2.ErrCo
 }
 
 func (a *h2InlineResponseAdapter) CloseConn() error { return nil }
+
+// h2InlineResponseAdapter implements stream.Streamer by delegating incremental
+// streaming to the sharded write queue (a.queue). This is what keeps
+// StreamWriter()-based responses (SSE, chunked) working when an inline-eligible
+// route streams: Context.StreamWriter() type-asserts ResponseWriter.(Streamer),
+// so the inline writer MUST be a Streamer or streaming 500s. The queue path is
+// safe from a detached/async streaming goroutine; direct-outBuf (WriteResponse)
+// is not. See celeris#408.
+func (a *h2InlineResponseAdapter) WriteHeader(s *stream.Stream, status int, headers [][2]string) error {
+	return a.queue.WriteHeader(s, status, headers)
+}
+
+func (a *h2InlineResponseAdapter) Write(s *stream.Stream, data []byte) error {
+	return a.queue.Write(s, data)
+}
+
+func (a *h2InlineResponseAdapter) Flush(s *stream.Stream) error {
+	return a.queue.Flush(s)
+}
+
+func (a *h2InlineResponseAdapter) Close(s *stream.Stream) error {
+	return a.queue.Close(s)
+}
+
+var _ stream.Streamer = (*h2InlineResponseAdapter)(nil)
 
 type h2ResponseAdapter struct {
 	write        func([]byte)

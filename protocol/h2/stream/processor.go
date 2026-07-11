@@ -557,12 +557,22 @@ func (p *Processor) runHandler(stream *Stream) {
 }
 
 // executeHandlerInline runs the handler synchronously on the event loop.
-// Response writes go directly to outBuf (via connWriter) instead of the
-// async write queue, eliminating goroutine dispatch, shard mutex ops,
-// eventfd syscall, and drain loop overhead.
+// Because it runs ON the event-loop thread (under H2State.mu), a buffered
+// response (WriteResponse — the common inline GET/HEAD END_STREAM path) goes
+// straight to outBuf via InlineWriter, skipping the sharded write queue's mutex
+// + pooled buffer and — the real win — the eventfd self-wake syscall Enqueue
+// fires on every response. Incremental streaming (StreamWriter) still routes
+// through the queue: InlineWriter is a stream.Streamer that delegates its
+// streaming methods to connWriter, so SSE/chunked stays safe (celeris#408).
+// Falls back to connWriter when InlineWriter is unset (Processors built without
+// the conn layer, e.g. unit tests).
 func (p *Processor) executeHandlerInline(stream *Stream) {
 	p.InlineCount++
-	stream.ResponseWriter = p.connWriter
+	if p.InlineWriter != nil {
+		stream.ResponseWriter = p.InlineWriter
+	} else {
+		stream.ResponseWriter = p.connWriter
+	}
 
 	if p.InlineCachedCtx != nil {
 		stream.CachedCtx = p.InlineCachedCtx
