@@ -2592,9 +2592,7 @@ func (l *Loop) shutdown() {
 				// OnDetach publishes Detached before releasing detachMu, so
 				// skip CloseH1 if the conn detached while we waited — else we
 				// recycle a Context/stream the middleware goroutine still uses.
-				if cs.h1State.Detached.Load() {
-					trulyDetached = true
-				} else {
+				if !cs.h1State.Detached.Load() {
 					conn.CloseH1(cs.h1State)
 				}
 				cs.detachMu.Unlock()

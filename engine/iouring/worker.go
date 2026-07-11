@@ -2434,9 +2434,7 @@ func (w *Worker) closeConn(fd int) {
 			// goroutine owns teardown — skip CloseH1; else we recycle a
 			// Context/stream it is still using (the use-after-recycle that
 			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade).
-			if cs.h1State.Detached.Load() {
-				trulyDetached = true
-			} else {
+			if !cs.h1State.Detached.Load() {
 				conn.CloseH1(cs.h1State)
 			}
 			cs.detachMu.Unlock()
@@ -3819,9 +3817,7 @@ func (w *Worker) shutdown() {
 				// Re-read Detached under the lock (mirrors epoll e100873): skip
 				// CloseH1 if the conn detached while we waited, else we recycle
 				// a Context/stream the middleware goroutine still uses.
-				if cs.h1State.Detached.Load() {
-					trulyDetached = true
-				} else {
+				if !cs.h1State.Detached.Load() {
 					conn.CloseH1(cs.h1State)
 				}
 				cs.detachMu.Unlock()
