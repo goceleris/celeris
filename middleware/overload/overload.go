@@ -231,6 +231,12 @@ func run(ctx context.Context, cfg Config,
 	defer close(stopped)
 	t := time.NewTicker(cfg.PollInterval)
 	defer t.Stop()
+	// prevStage tracks the stage applied on the previous tick so the opt-in
+	// Reap GC fires only on the transition INTO Reap, not on every tick the
+	// stage lingers in the band (celeris#407). Goroutine-local: run() is the
+	// sole writer of the `stage` atomic and the sole owner of prevStage, so
+	// this does not affect the stage value the hot path reads.
+	prevStage := StageNormal
 	for {
 		select {
 		case <-ctx.Done():
@@ -256,11 +262,19 @@ func run(ctx context.Context, cfg Config,
 				newStage = latencyStage
 			}
 			stage.Store(int32(newStage))
-			if newStage == StageReap && cfg.EnableReap {
+			// Fire the opt-in GC only on ENTRY into Reap. A forced GC every
+			// PollInterval while the stage lingers in the Reap band (celeris#407)
+			// wrecks tail latency and defeats the stage's purpose — a Reap GC is
+			// a one-shot capacity reclaim, not a periodic sweep. Re-entry
+			// (Reap→Reorder→Reap) correctly re-fires. The col==nil / cpu<0 skip
+			// branches above `continue` before both stage.Store and this
+			// assignment, so a skipped tick advances neither.
+			if cfg.EnableReap && newStage == StageReap && prevStage != StageReap {
 				if cfg.ReapAggressiveness >= 1 {
 					runtime.GC()
 				}
 			}
+			prevStage = newStage
 			_ = inFlight // surfaced through Controller; not needed in poll
 		}
 	}
