@@ -158,8 +158,10 @@ type Config struct {
 	// can measure the effect.
 	EnableReap bool
 
-	// ReapAggressiveness: 1=GC hint, 2=GC + encourage pool drain.
-	// Default: 1.
+	// ReapAggressiveness gates the opt-in GC fired on entry into StageReap:
+	// any value >= 1 triggers a one-shot runtime.GC(). Level 2 ("GC + encourage
+	// pool drain") is reserved and currently behaves identically to level 1 —
+	// no pool-drain primitive is wired yet (celeris#407). Default: 1.
 	ReapAggressiveness int
 
 	// Skip defines a function to skip this middleware for certain

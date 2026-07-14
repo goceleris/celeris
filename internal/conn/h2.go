@@ -104,7 +104,14 @@ type h2QueueShard struct {
 // Enqueue appends pre-encoded frame bytes to the write queue.
 // Called from handler goroutines. Shards by stream ID.
 func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
-	shard := &q.shards[streamID%h2QueueShards]
+	// Client request streams are always odd (RFC 9113 §5.1.1) and Celeris does
+	// no server push, so streamID%h2QueueShards would only ever hit the odd
+	// residues (shards 1,3) and leave 0,2 dead — a 2-shard queue in disguise.
+	// Shift off the constant low bit first so odd IDs 1,3,5,7,… spread across
+	// ALL shards. Still a pure function of streamID → every frame of a stream
+	// maps to one shard (per-stream HEADERS-before-DATA FIFO + single-writer
+	// drain preserved). See celeris#406.
+	shard := &q.shards[(streamID>>1)%h2QueueShards]
 	shard.mu.Lock()
 	shard.bufs = append(shard.bufs, data)
 	shard.mu.Unlock()
@@ -519,6 +526,9 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 	// peer's SETTINGS lands.
 	s.adapter.manager = mgr
 	s.inlineAdapter.manager = mgr
+	// The inline adapter delegates incremental streaming to the queue adapter
+	// so StreamWriter()-based responses stay safe on inline routes (celeris#408).
+	s.inlineAdapter.queue = &s.adapter
 
 	p := frame.NewParser()
 	p.InitReader(&s.inBuf)
