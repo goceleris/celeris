@@ -23,9 +23,9 @@ Full documentation lives at [goceleris.dev](https://goceleris.dev).
 - **First-party event-loop drivers** — native PostgreSQL, Redis, and memcached clients that colocate socket I/O with your handlers, no CGo, no separate reactor.
 - **Continuously validated** — an adversarial [probatorium](https://github.com/goceleris/probatorium) cluster matrix runs nightly, plus a deeper weekend soak; see the badges above.
 
-## What's new in v1.5.7
+## What's new in v1.5.8
 
-Native-engine WebSocket and SSE **broadcast egress now runs inline on the dispatch goroutine** rather than being funneled through a single event-loop thread. This lifts the per-loop fan-out ceiling that previously capped broadcast throughput, parallelizing writes across dispatch goroutines the way the std engine does — while keeping the loop thread free to drive I/O. The change spans both native engines ([`engine/epoll/loop.go`](engine/epoll/loop.go), [`engine/iouring/worker.go`](engine/iouring/worker.go)) and shipped with detach-queue wakeup coalescing (PR #403) and the inline-egress path plus its upgrade/close race fixes (PR #404).
+A correctness-focused release. Three concurrency fixes on the WebSocket and engine paths: a WebSocket-upgrade crash (a `chanReader` send-on-closed-channel panic when a peer RSTs mid-upgrade, now redesigned around a single-close done-channel), a Context/stream use-after-recycle in the epoll and io_uring engines during async upgrade, and HTTP/2 write-queue plus overload-manager hardening. Validated with a clean 24h weekend soak on both amd64 and arm64 (zero high-severity invariant violations), and an interleaved A/B benchmark confirming no throughput regression versus v1.5.7.
 
 ## Features
 
@@ -380,9 +380,9 @@ For Prometheus exposition and debug endpoints, use [`middleware/metrics`](middle
   <img src=".github/benchmark.png" alt="Celeris has the highest throughput — plaintext GET at 1024 connections">
 </p>
 
-<p align="center"><em>Plaintext GET at 1024 connections, saturation req/s, linux/amd64, celeris v1.5.6 bench data.</em></p>
+<p align="center"><em>Plaintext GET at 1024 connections, saturation req/s, linux/amd64.</em></p>
 
-Across the cross-language field in the chart above (45 servers, 10 languages), celeris tops the plaintext-GET throughput leaderboard — ahead of hand-tuned C, C++, Rust, and Java servers — and the published headline is **fastest Go framework in 25 of 29 scenarios**, sweeping the driver-backed database workloads. Full interactive results are at [goceleris.dev](https://goceleris.dev).
+celeris tops the plaintext-GET throughput leaderboard shown above — ahead of hand-tuned C, C++, Rust, and Java servers. Across the full published matrix (52 servers, 10 languages), the headline is **fastest Go framework in 26 of 29 scenarios**, sweeping the driver-backed database workloads. Benchmarks run on amd64; arm64 is fully validated in the nightly and weekend soak matrix but excluded from the benchmark target pending an upstream kernel NIC fix on the arm test board ([#312](https://github.com/goceleris/celeris/issues/312)). Full interactive results are at [goceleris.dev](https://goceleris.dev).
 
 The cross-framework matrix (scenario × server × protocol, driven by [`goceleris/loadgen`](https://github.com/goceleris/loadgen)) lives in [`goceleris/probatorium`](https://github.com/goceleris/probatorium), the authoritative bench harness; its `publish-results` workflow emits the release-gate numbers. In-tree comparison modules run in isolation:
 
