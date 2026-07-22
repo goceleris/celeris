@@ -92,7 +92,7 @@ jobs:
       CELERIS_PG_DSN: postgres://celeris:celeris@127.0.0.1:5432/celeristest?sslmode=disable
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Conformance
@@ -133,7 +133,7 @@ jobs:
       CELERIS_REDIS_ADDR: 127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Conformance
@@ -174,7 +174,7 @@ jobs:
       CELERIS_REDIS_ADDR: 127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Conformance (Redis driver against Valkey)
@@ -211,7 +211,7 @@ jobs:
       CELERIS_MEMCACHED_ADDR: 127.0.0.1:11211
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Conformance
@@ -264,7 +264,7 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Cluster conformance
@@ -297,7 +297,7 @@ jobs:
       CELERIS_REDIS_CLUSTER_ADDRS: "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Start cluster
@@ -383,7 +383,7 @@ jobs:
       CELERIS_REDIS_SENTINEL_MASTER: mymaster
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
       - name: Start sentinel stack
