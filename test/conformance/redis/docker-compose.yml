@@ -15,7 +15,7 @@
 
 services:
   redis:
-    image: redis:8.8
+    image: redis:8.10
     container_name: celeris-redis-conformance
     ports:
       - "6379:6379"
