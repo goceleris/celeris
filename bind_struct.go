@@ -247,11 +247,11 @@ func bindStruct(rv reflect.Value, tagName string, lookup lookupFunc) error {
 
 		vals, present := lookup(key)
 		if !present {
-			if def, hasDef := field.Tag.Lookup("default"); hasDef {
-				vals, present = []string{def}, true
-			} else {
+			def, hasDef := field.Tag.Lookup("default")
+			if !hasDef {
 				continue
 			}
+			vals = []string{def}
 		}
 
 		if err := setFieldValue(fv, vals); err != nil {
