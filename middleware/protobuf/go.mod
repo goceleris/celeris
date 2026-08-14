@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/goceleris/celeris v1.5.5
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
