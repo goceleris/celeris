@@ -131,8 +131,14 @@ func WithBody(body []byte) Option {
 }
 
 // WithHeader adds a request header.
+//
+// The key is lowercased, matching what a real request produces: HTTP/2
+// mandates lowercase field names and the H1 parser normalizes to lowercase,
+// which is why [celeris.Context.Header] lowercases its lookup key. Without
+// this, WithHeader("X-Request-Id", …) stored a key that Header() could never
+// match, so the header silently did not exist for the code under test.
 func WithHeader(key, value string) Option {
-	return func(c *config) { c.headers = append(c.headers, [2]string{key, value}) }
+	return func(c *config) { c.headers = append(c.headers, [2]string{strings.ToLower(key), value}) }
 }
 
 // WithQuery adds a query parameter.
