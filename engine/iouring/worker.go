@@ -3775,27 +3775,6 @@ func (w *Worker) checkTimeouts() {
 		if cs == nil || cs.closing {
 			continue
 		}
-		// Detached connections (e.g. WebSocket): honor an explicit deadline
-		// supplied by the middleware via SetWSIdleDeadline. Skip the
-		// engine-config-driven timeouts since the middleware owns the
-		// I/O lifecycle. Async-mode conns set detachMu up front without
-		// a real detach — fall through to the normal timeout scan for
-		// those.
-		if cs.h1State != nil && cs.h1State.Detached.Load() {
-			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
-				w.closeConn(fd)
-			}
-			continue
-		}
-		// ReadHeaderTimeout: slowloris defence. Plain unix.Close path
-		// (handled by closeConn → finishCloseDetached fastClose branch).
-		// See handleHeaderTimer for the rationale (mirrors net/http).
-		if cs.h1State != nil {
-			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				w.closeConn(fd)
-				continue
-			}
-		}
 		// celeris#470 wedge diagnostic. A connection accepted long ago that
 		// has never received a byte is the exact shape the h2c churn walker
 		// reports as h2c_hang: the peer connected, wrote a request, and the
@@ -3859,6 +3838,27 @@ func (w *Worker) checkTimeouts() {
 					"worker_live_conns", len(w.liveConns),
 					"ring_pending", w.ring.Pending(),
 				)
+			}
+		}
+		// Detached connections (e.g. WebSocket): honor an explicit deadline
+		// supplied by the middleware via SetWSIdleDeadline. Skip the
+		// engine-config-driven timeouts since the middleware owns the
+		// I/O lifecycle. Async-mode conns set detachMu up front without
+		// a real detach — fall through to the normal timeout scan for
+		// those.
+		if cs.h1State != nil && cs.h1State.Detached.Load() {
+			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
+				w.closeConn(fd)
+			}
+			continue
+		}
+		// ReadHeaderTimeout: slowloris defence. Plain unix.Close path
+		// (handled by closeConn → finishCloseDetached fastClose branch).
+		// See handleHeaderTimer for the rationale (mirrors net/http).
+		if cs.h1State != nil {
+			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
+				w.closeConn(fd)
+				continue
 			}
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
