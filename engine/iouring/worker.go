@@ -97,6 +97,27 @@ const defaultConnsPerWorker = 20
 // mmap'd RSS per worker and risking the kernel cap on large boxes
 // (celeris#322 follow-up).
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
+// wedgeDebugAfter enables the celeris#470 wedge diagnostic. When
+// CELERIS_IOURING_WEDGE_DEBUG is set to a duration (e.g. "5s"), checkTimeouts
+// reports any connection that has been accepted for longer than that without
+// ever receiving a byte -- the exact signature of the h2c-churn wedge, where
+// the peer sees an accepted socket that then stays silent.
+//
+// Unset (the default) costs one already-loaded int64 compare per connection
+// per ~100ms sweep and nothing else: the debug fields are only written when
+// this is non-zero.
+var wedgeDebugAfter = func() time.Duration {
+	v := os.Getenv("CELERIS_IOURING_WEDGE_DEBUG")
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}()
+
 func resolveBufRingCount(_ resource.ResolvedResources, connsPerWorker int) int {
 	if v := os.Getenv(envPbufCount); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -1231,6 +1252,11 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 
 	cs.lastActivity = now
+	if wedgeDebugAfter > 0 {
+		cs.dbgAcceptedNs = now
+		cs.dbgFirstByteNs = 0
+		cs.dbgWedgeLogged = false
+	}
 
 	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
 	// upgrades too", so route it through the recv-time detection path (like
@@ -1678,6 +1704,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	cs.lastActivity = now
+	if wedgeDebugAfter > 0 && cs.dbgFirstByteNs == 0 {
+		cs.dbgFirstByteNs = now
+	}
 	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)
@@ -3757,6 +3786,50 @@ func (w *Worker) checkTimeouts() {
 			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
 				w.closeConn(fd)
 				continue
+			}
+		}
+		// celeris#470 wedge diagnostic. A connection accepted long ago that
+		// has never received a byte is the exact shape the h2c churn walker
+		// reports as h2c_hang: the peer connected, wrote a request, and the
+		// server produced nothing. Dump the engine-side state that decides
+		// whether a recv is outstanding, so the next nightly says WHY.
+		if wedgeDebugAfter > 0 && !cs.dbgWedgeLogged && cs.dbgFirstByteNs == 0 &&
+			cs.dbgAcceptedNs > 0 && time.Duration(now-cs.dbgAcceptedNs) > wedgeDebugAfter {
+			cs.dbgWedgeLogged = true
+			detached := cs.h1State != nil && cs.h1State.Detached.Load()
+			// The decisive field. SIOCINQ is how many bytes the kernel has
+			// already queued on this socket. rx_queued > 0 while the engine
+			// has never read a byte means the request IS there and we are
+			// simply not reading it -- a real wedge, not a client that
+			// connected and stayed silent. Only meaningful for a real fd,
+			// so skip it under fixed files (fd is a table index there).
+			rxQueued := -1
+			if !cs.fixedFile {
+				if n, err := unix.IoctlGetInt(fd, unix.TIOCINQ); err == nil {
+					rxQueued = n
+				}
+			}
+			if w.logger != nil {
+				w.logger.Warn("iouring: WEDGE accepted-but-silent conn (celeris#470)",
+					"fd", fd,
+					"remote", cs.remoteAddr,
+					"age", time.Duration(now-cs.dbgAcceptedNs).String(),
+					"rx_queued", rxQueued,
+					"recv_armed", cs.recvArmed,
+					"needs_recv", cs.needsRecv,
+					"recv_paused", cs.recvPaused,
+					"recv_linked", cs.recvLinked,
+					"recv_into_body", cs.recvIntoBody,
+					"dirty", cs.dirty,
+					"sending", cs.sending,
+					"closing", cs.closing,
+					"detected", cs.detected,
+					"has_h1state", cs.h1State != nil,
+					"detached", detached,
+					"protocol", cs.protocol.Load(),
+					"worker_live_conns", len(w.liveConns),
+					"ring_pending", w.ring.Pending(),
+				)
 			}
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
