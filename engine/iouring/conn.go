@@ -127,6 +127,7 @@ type connState struct {
 	// dbgWedgeLogged keeps the report to once per connection.
 	dbgAcceptedNs  int64
 	dbgFirstByteNs int64
+	dbgFirstSendNs int64
 	dbgWedgeLogged bool
 
 	h1State      *conn.H1State
@@ -326,6 +327,7 @@ func releaseConnState(cs *connState) {
 	cs.lastActivity = 0
 	cs.dbgAcceptedNs = 0
 	cs.dbgFirstByteNs = 0
+	cs.dbgFirstSendNs = 0
 	cs.dbgWedgeLogged = false
 	cs.detachMu = nil
 	cs.detachClosed = false

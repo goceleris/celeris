@@ -99,9 +99,14 @@ const defaultConnsPerWorker = 20
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
 // wedgeDebugAfter enables the celeris#470 wedge diagnostic. When
 // CELERIS_IOURING_WEDGE_DEBUG is set to a duration (e.g. "5s"), checkTimeouts
-// reports any connection that has been accepted for longer than that without
-// ever receiving a byte -- the exact signature of the h2c-churn wedge, where
-// the peer sees an accepted socket that then stays silent.
+// reports any connection accepted for longer than that which has never SENT a
+// byte. Never-sent is the right predicate because it is the symptom the h2c
+// churn walker actually reports: the peer wrote a request and the server
+// produced nothing. Keying on never-RECEIVED (the first cut) missed the case
+// where the engine consumes the request and then fails to reply.
+//
+// Each hit is classified as idle-client (benign), not-reading, or
+// read-no-response -- see the switch at the report site.
 //
 // Unset (the default) costs one already-loaded int64 compare per connection
 // per ~100ms sweep and nothing else: the debug fields are only written when
@@ -2286,6 +2291,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // exists, otherwise the goroutine read races the event-loop write —
 // observed via -race in TestNativeEngineLargePayload/io_uring.
 func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
+	if wedgeDebugAfter > 0 && cs.dbgFirstSendNs == 0 && sent > 0 {
+		cs.dbgFirstSendNs = now
+	}
 	// Take the lock up-front for detached connections so the entire state
 	// mutation (cs.sending clear / sendBuf truncate / writeBuf reset / OnError
 	// fire) is serialized against the goroutine writeFn path. The inline-egress
@@ -3793,7 +3801,7 @@ func (w *Worker) checkTimeouts() {
 		// reports as h2c_hang: the peer connected, wrote a request, and the
 		// server produced nothing. Dump the engine-side state that decides
 		// whether a recv is outstanding, so the next nightly says WHY.
-		if wedgeDebugAfter > 0 && !cs.dbgWedgeLogged && cs.dbgFirstByteNs == 0 &&
+		if wedgeDebugAfter > 0 && !cs.dbgWedgeLogged && cs.dbgFirstSendNs == 0 &&
 			cs.dbgAcceptedNs > 0 && time.Duration(now-cs.dbgAcceptedNs) > wedgeDebugAfter {
 			cs.dbgWedgeLogged = true
 			detached := cs.h1State != nil && cs.h1State.Detached.Load()
@@ -3809,8 +3817,29 @@ func (w *Worker) checkTimeouts() {
 					rxQueued = n
 				}
 			}
+			// Classify, so a hit is actionable without cross-referencing:
+			//   idle-client      client connected and sent nothing. BENIGN --
+			//                    the engine has a recv armed and the kernel has
+			//                    no data, so there is nothing to respond to.
+			//   not-reading      bytes ARE queued in the kernel and the engine
+			//                    has never read one. Real wedge.
+			//   read-no-response engine consumed the request and never wrote a
+			//                    reply. Real wedge, different cause.
+			kind := "idle-client"
+			switch {
+			case cs.dbgFirstByteNs != 0:
+				kind = "read-no-response"
+			case rxQueued > 0:
+				kind = "not-reading"
+			}
+			sinceFirstByte := "never"
+			if cs.dbgFirstByteNs != 0 {
+				sinceFirstByte = time.Duration(now - cs.dbgFirstByteNs).String()
+			}
 			if w.logger != nil {
 				w.logger.Warn("iouring: WEDGE accepted-but-silent conn (celeris#470)",
+					"kind", kind,
+					"since_first_byte", sinceFirstByte,
 					"fd", fd,
 					"remote", cs.remoteAddr,
 					"age", time.Duration(now-cs.dbgAcceptedNs).String(),
