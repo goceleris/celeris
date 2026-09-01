@@ -66,17 +66,23 @@ func TestAdoptConnServesTransplantedFD(t *testing.T) {
 	}()
 
 	// Wait until the engine is actually listening.
+	// A successful dial only proves the listening socket is bound. Listen
+	// publishes e.workers under e.mu AFTER that, so dial-readiness alone races
+	// AdoptConn, which rejects an empty worker set ("no workers available to
+	// adopt fd N") -- observed flaking CI on main. Require both.
 	listening := false
 	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); {
 		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
 			_ = c.Close()
-			listening = true
-			break
+			if e.NumWorkers() > 0 {
+				listening = true
+				break
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !listening {
-		t.Skipf("engine did not start listening on %s (constrained runner)", addr)
+		t.Skipf("engine did not start listening with workers on %s (constrained runner)", addr)
 	}
 
 	// Create a TCP connection the engine has NEVER seen, via our own listener.
@@ -179,17 +185,23 @@ func TestAdoptConnReplaysBufferedRequest(t *testing.T) {
 		}
 	}()
 
+	// A successful dial only proves the listening socket is bound. Listen
+	// publishes e.workers under e.mu AFTER that, so dial-readiness alone races
+	// AdoptConn, which rejects an empty worker set ("no workers available to
+	// adopt fd N") -- observed flaking CI on main. Require both.
 	listening := false
 	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); {
 		if c, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond); derr == nil {
 			_ = c.Close()
-			listening = true
-			break
+			if e.NumWorkers() > 0 {
+				listening = true
+				break
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !listening {
-		t.Skipf("engine did not start listening on %s (constrained runner)", addr)
+		t.Skipf("engine did not start listening with workers on %s (constrained runner)", addr)
 	}
 
 	extLn, err := net.Listen("tcp", "127.0.0.1:0")
