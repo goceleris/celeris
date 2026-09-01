@@ -28,6 +28,16 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.0"
+      # Magefiles carry `//go:build mage`, so `go vet ./...`, `go build` and
+      # `go test` ALL skip them — only mage itself compiles them, which means a
+      # broken magefile can reach main green. Compile them here.
+      - name: Install mage
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: mage compiles
+        run: mage -compile /tmp/mage-compile-check
+
       - name: Lint root module
         uses: golangci/golangci-lint-action@v9
         with:
