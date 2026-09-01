@@ -120,6 +120,15 @@ type connState struct {
 
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
+	// Debug-only (celeris#470). Populated ONLY when wedgeDebugAfter > 0, i.e.
+	// when CELERIS_IOURING_WEDGE_DEBUG is set. dbgAcceptedNs stamps accept;
+	// dbgFirstByteNs stays 0 until the first recv CQE carrying bytes, so
+	// (dbgFirstByteNs == 0) is an exact "never received a byte" predicate.
+	// dbgWedgeLogged keeps the report to once per connection.
+	dbgAcceptedNs  int64
+	dbgFirstByteNs int64
+	dbgWedgeLogged bool
+
 	h1State      *conn.H1State
 	h2State      *conn.H2State
 	ctx          context.Context
@@ -315,6 +324,9 @@ func releaseConnState(cs *connState) {
 	cs.zcNotifPending = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
+	cs.dbgAcceptedNs = 0
+	cs.dbgFirstByteNs = 0
+	cs.dbgWedgeLogged = false
 	cs.detachMu = nil
 	cs.detachClosed = false
 	cs.recvPaused = false
