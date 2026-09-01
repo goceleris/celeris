@@ -2,7 +2,6 @@ package jwt
 
 import (
 	"context"
-	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -284,41 +283,41 @@ func parseECKey(key map[string]any) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("jwt: invalid EC y coordinate: %w", err)
 	}
 
-	var ecdhCurve ecdh.Curve
 	var curve elliptic.Curve
 	switch crv {
 	case "P-256":
-		ecdhCurve = ecdh.P256()
 		curve = elliptic.P256()
 	case "P-384":
-		ecdhCurve = ecdh.P384()
 		curve = elliptic.P384()
 	case "P-521":
-		ecdhCurve = ecdh.P521()
 		curve = elliptic.P521()
 	default:
 		return nil, fmt.Errorf("jwt: unsupported EC curve: %s", crv)
 	}
 
-	// Build the uncompressed point (0x04 || X || Y) and validate via ecdh.
+	// The coordinates are attacker-controlled: they come from whatever the
+	// remote JWKS endpoint served. Reject anything wider than the curve BEFORE
+	// the right-aligned copies below, whose start index goes negative on an
+	// oversized coordinate and panics the process.
 	byteLen := (curve.Params().BitSize + 7) / 8
+	if len(xBytes) > byteLen || len(yBytes) > byteLen {
+		return nil, fmt.Errorf("jwt: EC coordinate wider than curve %s", crv)
+	}
+
+	// Build the uncompressed point (0x04 || X || Y). ParseUncompressedPublicKey
+	// checks the point is on the curve and is not the point at infinity, so it
+	// subsumes the ecdh round-trip this used to do -- and it replaces the
+	// PublicKey.X/.Y assignment, deprecated since Go 1.26.
 	uncompressed := make([]byte, 1+2*byteLen)
 	uncompressed[0] = 0x04
 	copy(uncompressed[1+byteLen-len(xBytes):1+byteLen], xBytes)
 	copy(uncompressed[1+2*byteLen-len(yBytes):], yBytes)
 
-	if _, err := ecdhCurve.NewPublicKey(uncompressed); err != nil {
+	pub, err := ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
+	if err != nil {
 		return nil, fmt.Errorf("jwt: EC point is not on curve %s", crv)
 	}
-
-	x := new(big.Int).SetBytes(xBytes)
-	y := new(big.Int).SetBytes(yBytes)
-
-	return &ecdsa.PublicKey{
-		Curve: curve,
-		X:     x,
-		Y:     y,
-	}, nil
+	return pub, nil
 }
 
 func parseOKPKey(key map[string]any) (ed25519.PublicKey, error) {

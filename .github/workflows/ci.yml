@@ -31,26 +31,26 @@ jobs:
       - name: Lint root module
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
       - name: Lint middleware/compress
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
           working-directory: middleware/compress
       - name: Lint middleware/metrics
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
           working-directory: middleware/metrics
       - name: Lint middleware/otel
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
           working-directory: middleware/otel
       - name: Lint middleware/protobuf
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
           working-directory: middleware/protobuf
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown

@@ -967,3 +967,33 @@ func TestMultiJWKSKeyFuncUnknownKidAllProviders(t *testing.T) {
 		t.Fatal("expected error for unknown kid across all providers")
 	}
 }
+
+// TestJWKSParseECKeyOversizedCoordinate pins the fix for a remote-triggerable
+// panic: parseECKey right-aligns x and y into a curve-sized buffer, and with a
+// coordinate wider than the curve the copy's start index went negative
+// ("slice bounds out of range [-67:]"). The coordinates come from whatever the
+// JWKS endpoint served, so a hostile or compromised endpoint could crash the
+// process. Oversized coordinates must be rejected as an error, never panic.
+func TestJWKSParseECKeyOversizedCoordinate(t *testing.T) {
+	good := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	oversized := base64.RawURLEncoding.EncodeToString(make([]byte, 100))
+
+	for _, tc := range []struct{ name, x, y string }{
+		{"x oversized", oversized, good},
+		{"y oversized", good, oversized},
+		{"both oversized", oversized, oversized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parseECKey panicked on an oversized coordinate: %v", r)
+				}
+			}()
+			if _, err := parseECKey(map[string]any{
+				"kty": "EC", "crv": "P-256", "x": tc.x, "y": tc.y,
+			}); err == nil {
+				t.Fatal("parseECKey accepted a coordinate wider than P-256")
+			}
+		})
+	}
+}
