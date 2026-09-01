@@ -1,6 +1,6 @@
 module github.com/goceleris/celeris/test/drivercmp/redis
 
-go 1.26.4
+go 1.27.0
 
 require (
 	github.com/goceleris/celeris v0.0.0
@@ -10,9 +10,9 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 )
 
 replace github.com/goceleris/celeris => ../../..
