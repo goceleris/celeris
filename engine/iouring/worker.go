@@ -2438,7 +2438,16 @@ func (w *Worker) closeConn(fd int) {
 	if wedgeDebugAfter > 0 && w.logger != nil &&
 		cs.dbgFirstByteNs != 0 && cs.dbgFirstSendNs == 0 && !cs.dbgCloseLogged &&
 		cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() == 0 &&
-		!dbgPeerGone(cs.dbgLastRecvRes) {
+		!dbgPeerGone(cs.dbgLastRecvRes) &&
+		// Exclude a DEFERRED close. Below, closeConn parks on
+		// `cs.sending || cs.zcNotifPending || len(sendBuf) > 0 || len(writeBuf) > 0`
+		// and only finishes once the send completes -- the reply IS still on
+		// its way, so this is not a close-without-reply. dbgFirstSendNs is
+		// stamped in completeSend, which by definition has not run yet, so
+		// without this the tracer flags every one: 2188 of 2188 records in a
+		// local churn reproduction were exactly this shape (ProcessH1 error ->
+		// flushSend -> closeConn with sending=true), and that run had HANG=0.
+		!cs.sending && !cs.zcNotifPending && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		cs.dbgCloseLogged = true
 		w.logger.Warn("iouring: CLOSE-WITHOUT-REPLY (celeris#470)",
 			"fd", fd,
