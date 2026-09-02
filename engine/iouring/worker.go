@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -97,45 +98,6 @@ const defaultConnsPerWorker = 20
 // mmap'd RSS per worker and risking the kernel cap on large boxes
 // (celeris#322 follow-up).
 // Operators can override via CELERIS_IOURING_PBUF_COUNT.
-// wedgeDebugAfter enables the celeris#470 wedge diagnostic. When
-// CELERIS_IOURING_WEDGE_DEBUG is set to a duration (e.g. "5s"), checkTimeouts
-// reports any connection accepted for longer than that which has never SENT a
-// byte. Never-sent is the right predicate because it is the symptom the h2c
-// churn walker actually reports: the peer wrote a request and the server
-// produced nothing. Keying on never-RECEIVED (the first cut) missed the case
-// where the engine consumes the request and then fails to reply.
-//
-// Each hit is classified as idle-client (benign), not-reading, or
-// read-no-response -- see the switch at the report site.
-//
-// Unset (the default) costs one already-loaded int64 compare per connection
-// per ~100ms sweep and nothing else: the debug fields are only written when
-// this is non-zero.
-// dbgNoRecvErr is the sentinel for "no recv error seen on this conn". A real
-// recv error CQE is always <= 0, so 1 cannot collide with one.
-const dbgNoRecvErr int32 = 1
-
-// dbgPeerGone reports whether the last recv result means the CLIENT went away,
-// which is exactly what the churn walker's RST-before-read / RST-after-101
-// modes do on purpose -- the walker counts those as intentional_rst, not hang.
-// 1215 of the 1311 close records in run 33587016428 were this shape, closing
-// via handleRecv at ~160ms. res == 0 is EOF; -ECONNRESET is a peer reset.
-func dbgPeerGone(res int32) bool {
-	return res == 0 || res == -int32(unix.ECONNRESET) || res == -int32(unix.EPIPE)
-}
-
-var wedgeDebugAfter = func() time.Duration {
-	v := os.Getenv("CELERIS_IOURING_WEDGE_DEBUG")
-	if v == "" {
-		return 0
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil || d <= 0 {
-		return 0
-	}
-	return d
-}()
-
 func resolveBufRingCount(_ resource.ResolvedResources, connsPerWorker int) int {
 	if v := os.Getenv(envPbufCount); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -1270,13 +1232,6 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 
 	cs.lastActivity = now
-	if wedgeDebugAfter > 0 {
-		cs.dbgAcceptedNs = now
-		cs.dbgFirstByteNs = 0
-		cs.dbgWedgeLogged = false
-		cs.dbgCloseLogged = false
-		cs.dbgLastRecvRes = dbgNoRecvErr
-	}
 
 	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
 	// upgrades too", so route it through the recv-time detection path (like
@@ -1684,9 +1639,6 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	if c.Res <= 0 {
-		if wedgeDebugAfter > 0 {
-			cs.dbgLastRecvRes = c.Res
-		}
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
@@ -1727,16 +1679,6 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	cs.lastActivity = now
-	if wedgeDebugAfter > 0 && cs.dbgFirstByteNs == 0 {
-		cs.dbgFirstByteNs = now
-		// Stash the request head so a record names the request it belongs to.
-		// The h2c churn walker's population is identifiable by "Upgrade: h2c";
-		// every other walker (markov / adversarial / ws / sse) looks different,
-		// and only the churn one feeds the h2c_hang counter.
-		if n := copy(cs.dbgReqPrefix[:], cs.buf[:min(int(c.Res), len(cs.dbgReqPrefix))]); n > 0 {
-			cs.dbgReqPrefixN = n
-		}
-	}
 	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)
@@ -2288,9 +2230,6 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 			mu.Lock()
 		}
 		cs.sending = false
-		if wedgeDebugAfter > 0 {
-			cs.dbgLastSendRes = c.Res
-		}
 		cs.sendBuf = cs.sendBuf[:0]
 		cs.writeBuf = cs.writeBuf[:0]
 		if cs.h1State != nil && cs.h1State.OnError != nil {
@@ -2319,9 +2258,6 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // exists, otherwise the goroutine read races the event-loop write —
 // observed via -race in TestNativeEngineLargePayload/io_uring.
 func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
-	if wedgeDebugAfter > 0 && cs.dbgFirstSendNs == 0 && sent > 0 {
-		cs.dbgFirstSendNs = now
-	}
 	// Take the lock up-front for detached connections so the entire state
 	// mutation (cs.sending clear / sendBuf truncate / writeBuf reset / OnError
 	// fire) is serialized against the goroutine writeFn path. The inline-egress
@@ -2735,54 +2671,7 @@ func (w *Worker) drainPendingRelease() {
 	w.pendingRelease = kept
 }
 
-// dbgTraceCloseWithoutReply reports a connection being torn down for good that
-// received a request and never sent a byte -- which the walker counts as
-// h2c_hang, since it scores `err != nil || n == 0` and an immediate EOF is
-// indistinguishable from a stall.
-//
-// It lives at the TERMINAL close, not in closeConn, for two reasons. closeConn
-// defers whenever a send is in flight, so at that point "nothing sent yet" is
-// normal and says nothing. And the deferred path finishes through
-// finishCloseAny -> finishClose/finishCloseDetached, which bypasses closeConn
-// completely -- so a response whose SEND later fails was invisible there. By
-// the terminal close the question is settled: completeSend has stamped
-// dbgFirstSendNs if the reply actually went out, and has not if it never did.
-func (w *Worker) dbgTraceCloseWithoutReply(fd int, cs *connState) {
-	if wedgeDebugAfter <= 0 || w.logger == nil || cs == nil {
-		return
-	}
-	if cs.dbgFirstByteNs == 0 || cs.dbgFirstSendNs != 0 || cs.dbgCloseLogged {
-		return
-	}
-	if dbgPeerGone(cs.dbgLastRecvRes) || dbgPeerGone(cs.dbgLastSendRes) {
-		return
-	}
-	if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 {
-		return // still reading headers: slowloris defence, working as designed
-	}
-	cs.dbgCloseLogged = true
-	now := time.Now().UnixNano()
-	w.logger.Warn("iouring: CLOSE-WITHOUT-REPLY (celeris#470)",
-		"fd", fd,
-		"remote", cs.remoteAddr,
-		"age", time.Duration(now-cs.dbgAcceptedNs).String(),
-		"since_first_byte", time.Duration(now-cs.dbgFirstByteNs).String(),
-		"since_last_activity", time.Duration(now-cs.lastActivity).String(),
-		"last_recv_res", cs.dbgLastRecvRes,
-		"last_send_res", cs.dbgLastSendRes,
-		"req_prefix", strconv.Quote(string(cs.dbgReqPrefix[:cs.dbgReqPrefixN])),
-		"recv_armed", cs.recvArmed,
-		"dirty", cs.dirty,
-		"sending", cs.sending,
-		"closing", cs.closing,
-		"detected", cs.detected,
-		"protocol", cs.protocol.Load(),
-		"stack", string(debug.Stack()),
-	)
-}
-
 func (w *Worker) finishClose(fd int) {
-	w.dbgTraceCloseWithoutReply(fd, w.conns[fd])
 	cs := w.conns[fd]
 	// Remove from liveConns BEFORE niling w.conns[fd]: removeLiveConn swaps
 	// the last live entry into cs.liveIdx and updates that swapped-in
@@ -2887,7 +2776,6 @@ func (w *Worker) finishCloseAny(fd int, cs *connState) {
 // WITHOUT returning the connState to the pool. Used when a detached goroutine
 // still holds closure references to the connState.
 func (w *Worker) finishCloseDetached(fd int, cs *connState) {
-	w.dbgTraceCloseWithoutReply(fd, cs)
 	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
 	// finishClose — removeLiveConn touches w.conns[swappedFD]).
 	w.removeLiveConn(cs)
@@ -3850,98 +3738,6 @@ func (w *Worker) checkTimeouts() {
 		cs := w.conns[fd]
 		if cs == nil || cs.closing {
 			continue
-		}
-		// celeris#470 wedge diagnostic. A connection accepted long ago that
-		// has never received a byte is the exact shape the h2c churn walker
-		// reports as h2c_hang: the peer connected, wrote a request, and the
-		// server produced nothing. Dump the engine-side state that decides
-		// whether a recv is outstanding, so the next nightly says WHY.
-		if wedgeDebugAfter > 0 && !cs.dbgWedgeLogged && cs.dbgFirstSendNs == 0 &&
-			cs.dbgAcceptedNs > 0 && time.Duration(now-cs.dbgAcceptedNs) > wedgeDebugAfter {
-			cs.dbgWedgeLogged = true
-			detached := cs.h1State != nil && cs.h1State.Detached.Load()
-			// The decisive field. SIOCINQ is how many bytes the kernel has
-			// already queued on this socket. rx_queued > 0 while the engine
-			// has never read a byte means the request IS there and we are
-			// simply not reading it -- a real wedge, not a client that
-			// connected and stayed silent. Only meaningful for a real fd,
-			// so skip it under fixed files (fd is a table index there).
-			rxQueued := -1
-			if !cs.fixedFile {
-				if n, err := unix.IoctlGetInt(fd, unix.TIOCINQ); err == nil {
-					rxQueued = n
-				}
-			}
-			// Classify, so a hit is actionable without cross-referencing:
-			//   idle-client      client connected and sent nothing. BENIGN --
-			//                    the engine has a recv armed and the kernel has
-			//                    no data, so there is nothing to respond to.
-			//   not-reading      bytes ARE queued in the kernel and the engine
-			//                    has never read one. Real wedge.
-			//   read-no-response engine consumed the request and never wrote a
-			//                    reply. Real wedge, different cause.
-			// HeaderDeadlineNs is armed at accept and cleared the moment
-			// headers parse (internal/conn/h1.go). So an unanswered conn with
-			// the deadline STILL armed is just a client that has not finished
-			// sending its request -- the adversarial walker's slowloris mode
-			// does this ~20/s and produced 800+ false hits in run 33572975275.
-			// Deadline cleared + bytes read + nothing sent is the real wedge:
-			// the request completed and no reply was ever produced.
-			hdrArmed := cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0
-			kind := "idle-client"
-			switch {
-			case cs.dbgFirstByteNs != 0 && hdrArmed:
-				kind = "awaiting-headers"
-			case cs.dbgFirstByteNs != 0:
-				kind = "read-no-response"
-			case rxQueued > 0:
-				kind = "not-reading"
-			}
-			// Async dispatch state: the prime suspect for read-no-response is
-			// the per-conn dispatch goroutine exiting or parking with input
-			// still queued, which strands the request until bytes that never
-			// come. Read under asyncInMu, same as the feed path.
-			// TryLock, never Lock: this runs on the worker event loop, and a
-			// debug probe must never be able to stall it behind the dispatch
-			// goroutine. -1 means "held, not sampled".
-			asyncRun, asyncQueued := false, -1
-			if cs.asyncInMu.TryLock() {
-				asyncRun, asyncQueued = cs.asyncRun, len(cs.asyncInBuf)
-				cs.asyncInMu.Unlock()
-			}
-			sinceFirstByte := "never"
-			if cs.dbgFirstByteNs != 0 {
-				sinceFirstByte = time.Duration(now - cs.dbgFirstByteNs).String()
-			}
-			if w.logger != nil {
-				w.logger.Warn("iouring: WEDGE accepted-but-silent conn (celeris#470)",
-					"kind", kind,
-					"since_first_byte", sinceFirstByte,
-					"hdr_deadline_armed", hdrArmed,
-					"async_run", asyncRun,
-					"async_queued_bytes", asyncQueued,
-					"async_promoted", cs.asyncPromoted.Load(),
-					"async_closed", cs.asyncClosed.Load(),
-					"fd", fd,
-					"remote", cs.remoteAddr,
-					"age", time.Duration(now-cs.dbgAcceptedNs).String(),
-					"rx_queued", rxQueued,
-					"recv_armed", cs.recvArmed,
-					"needs_recv", cs.needsRecv,
-					"recv_paused", cs.recvPaused,
-					"recv_linked", cs.recvLinked,
-					"recv_into_body", cs.recvIntoBody,
-					"dirty", cs.dirty,
-					"sending", cs.sending,
-					"closing", cs.closing,
-					"detected", cs.detected,
-					"has_h1state", cs.h1State != nil,
-					"detached", detached,
-					"protocol", cs.protocol.Load(),
-					"worker_live_conns", len(w.liveConns),
-					"ring_pending", w.ring.Pending(),
-				)
-			}
 		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
