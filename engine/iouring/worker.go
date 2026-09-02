@@ -1729,6 +1729,13 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	cs.lastActivity = now
 	if wedgeDebugAfter > 0 && cs.dbgFirstByteNs == 0 {
 		cs.dbgFirstByteNs = now
+		// Stash the request head so a record names the request it belongs to.
+		// The h2c churn walker's population is identifiable by "Upgrade: h2c";
+		// every other walker (markov / adversarial / ws / sse) looks different,
+		// and only the churn one feeds the h2c_hang counter.
+		if n := copy(cs.dbgReqPrefix[:], cs.buf[:min(int(c.Res), len(cs.dbgReqPrefix))]); n > 0 {
+			cs.dbgReqPrefixN = n
+		}
 	}
 	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
 	// on this recv CQE, regardless of which buffer they landed in.
@@ -2281,6 +2288,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 			mu.Lock()
 		}
 		cs.sending = false
+		if wedgeDebugAfter > 0 {
+			cs.dbgLastSendRes = c.Res
+		}
 		cs.sendBuf = cs.sendBuf[:0]
 		cs.writeBuf = cs.writeBuf[:0]
 		if cs.h1State != nil && cs.h1State.OnError != nil {
@@ -2438,7 +2448,7 @@ func (w *Worker) closeConn(fd int) {
 	if wedgeDebugAfter > 0 && w.logger != nil &&
 		cs.dbgFirstByteNs != 0 && cs.dbgFirstSendNs == 0 && !cs.dbgCloseLogged &&
 		cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() == 0 &&
-		!dbgPeerGone(cs.dbgLastRecvRes) &&
+		!dbgPeerGone(cs.dbgLastRecvRes) && !dbgPeerGone(cs.dbgLastSendRes) &&
 		// Exclude a DEFERRED close. Below, closeConn parks on
 		// `cs.sending || cs.zcNotifPending || len(sendBuf) > 0 || len(writeBuf) > 0`
 		// and only finishes once the send completes -- the reply IS still on
@@ -2461,6 +2471,8 @@ func (w *Worker) closeConn(fd int) {
 			"detected", cs.detected,
 			"protocol", cs.protocol.Load(),
 			"last_recv_res", cs.dbgLastRecvRes,
+			"last_send_res", cs.dbgLastSendRes,
+			"req_prefix", strconv.Quote(string(cs.dbgReqPrefix[:cs.dbgReqPrefixN])),
 			// checkTimeouts closes on `now - cs.lastActivity > ReadTimeout`.
 			// Records from run 33587016428 show it closing conns aged 1.99ms
 			// and 13.6ms, which is only possible if lastActivity is far in the

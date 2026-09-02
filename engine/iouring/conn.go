@@ -131,6 +131,9 @@ type connState struct {
 	dbgWedgeLogged bool
 	dbgCloseLogged bool
 	dbgLastRecvRes int32
+	dbgLastSendRes int32
+	dbgReqPrefix   [48]byte
+	dbgReqPrefixN  int
 
 	h1State      *conn.H1State
 	h2State      *conn.H2State
@@ -333,6 +336,8 @@ func releaseConnState(cs *connState) {
 	cs.dbgWedgeLogged = false
 	cs.dbgCloseLogged = false
 	cs.dbgLastRecvRes = dbgNoRecvErr
+	cs.dbgLastSendRes = dbgNoRecvErr
+	cs.dbgReqPrefixN = 0
 	cs.detachMu = nil
 	cs.detachClosed = false
 	cs.recvPaused = false
