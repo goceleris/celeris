@@ -2405,6 +2405,36 @@ func (w *Worker) closeConn(fd int) {
 	if cs == nil {
 		return
 	}
+	// celeris#470: the walker counts h2c_hang on `err != nil || n == 0`, so a
+	// server that CLOSES without replying is counted exactly like one that
+	// stalls -- an immediate EOF is a hang. checkTimeouts can never observe
+	// that (it skips cs.closing and the conn is gone by the next sweep), which
+	// is why the cell that recorded h2c_hang in run 33579882260 produced no
+	// diagnostic hit at all. Catch it here instead, at the moment of the close,
+	// with the stack so the responsible path names itself.
+	// Only the ANOMALY: headers COMPLETE (deadline cleared) yet closed with no
+	// reply. A close with the deadline still armed is the slowloris defence
+	// doing its job -- handleHeaderTimer deliberately closes those without a
+	// response, and the adversarial walker generates them constantly, so
+	// logging them would drown the signal exactly like the 5s threshold did.
+	if wedgeDebugAfter > 0 && w.logger != nil &&
+		cs.dbgFirstByteNs != 0 && cs.dbgFirstSendNs == 0 && !cs.dbgCloseLogged &&
+		cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() == 0 {
+		cs.dbgCloseLogged = true
+		w.logger.Warn("iouring: CLOSE-WITHOUT-REPLY (celeris#470)",
+			"fd", fd,
+			"remote", cs.remoteAddr,
+			"age", time.Duration(time.Now().UnixNano()-cs.dbgAcceptedNs).String(),
+			"since_first_byte", time.Duration(time.Now().UnixNano()-cs.dbgFirstByteNs).String(),
+			"hdr_deadline", cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0,
+			"recv_armed", cs.recvArmed,
+			"dirty", cs.dirty,
+			"sending", cs.sending,
+			"detected", cs.detected,
+			"protocol", cs.protocol.Load(),
+			"stack", string(debug.Stack()),
+		)
+	}
 	detached := cs.detachMu != nil
 	if detached {
 		cs.asyncClosed.Store(true)
