@@ -3804,12 +3804,34 @@ func (w *Worker) checkTimeouts() {
 			//                    has never read one. Real wedge.
 			//   read-no-response engine consumed the request and never wrote a
 			//                    reply. Real wedge, different cause.
+			// HeaderDeadlineNs is armed at accept and cleared the moment
+			// headers parse (internal/conn/h1.go). So an unanswered conn with
+			// the deadline STILL armed is just a client that has not finished
+			// sending its request -- the adversarial walker's slowloris mode
+			// does this ~20/s and produced 800+ false hits in run 33572975275.
+			// Deadline cleared + bytes read + nothing sent is the real wedge:
+			// the request completed and no reply was ever produced.
+			hdrArmed := cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0
 			kind := "idle-client"
 			switch {
+			case cs.dbgFirstByteNs != 0 && hdrArmed:
+				kind = "awaiting-headers"
 			case cs.dbgFirstByteNs != 0:
 				kind = "read-no-response"
 			case rxQueued > 0:
 				kind = "not-reading"
+			}
+			// Async dispatch state: the prime suspect for read-no-response is
+			// the per-conn dispatch goroutine exiting or parking with input
+			// still queued, which strands the request until bytes that never
+			// come. Read under asyncInMu, same as the feed path.
+			// TryLock, never Lock: this runs on the worker event loop, and a
+			// debug probe must never be able to stall it behind the dispatch
+			// goroutine. -1 means "held, not sampled".
+			asyncRun, asyncQueued := false, -1
+			if cs.asyncInMu.TryLock() {
+				asyncRun, asyncQueued = cs.asyncRun, len(cs.asyncInBuf)
+				cs.asyncInMu.Unlock()
 			}
 			sinceFirstByte := "never"
 			if cs.dbgFirstByteNs != 0 {
@@ -3819,6 +3841,11 @@ func (w *Worker) checkTimeouts() {
 				w.logger.Warn("iouring: WEDGE accepted-but-silent conn (celeris#470)",
 					"kind", kind,
 					"since_first_byte", sinceFirstByte,
+					"hdr_deadline_armed", hdrArmed,
+					"async_run", asyncRun,
+					"async_queued_bytes", asyncQueued,
+					"async_promoted", cs.asyncPromoted.Load(),
+					"async_closed", cs.asyncClosed.Load(),
 					"fd", fd,
 					"remote", cs.remoteAddr,
 					"age", time.Duration(now-cs.dbgAcceptedNs).String(),
