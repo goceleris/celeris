@@ -111,6 +111,19 @@ const defaultConnsPerWorker = 20
 // Unset (the default) costs one already-loaded int64 compare per connection
 // per ~100ms sweep and nothing else: the debug fields are only written when
 // this is non-zero.
+// dbgNoRecvErr is the sentinel for "no recv error seen on this conn". A real
+// recv error CQE is always <= 0, so 1 cannot collide with one.
+const dbgNoRecvErr int32 = 1
+
+// dbgPeerGone reports whether the last recv result means the CLIENT went away,
+// which is exactly what the churn walker's RST-before-read / RST-after-101
+// modes do on purpose -- the walker counts those as intentional_rst, not hang.
+// 1215 of the 1311 close records in run 33587016428 were this shape, closing
+// via handleRecv at ~160ms. res == 0 is EOF; -ECONNRESET is a peer reset.
+func dbgPeerGone(res int32) bool {
+	return res == 0 || res == -int32(unix.ECONNRESET) || res == -int32(unix.EPIPE)
+}
+
 var wedgeDebugAfter = func() time.Duration {
 	v := os.Getenv("CELERIS_IOURING_WEDGE_DEBUG")
 	if v == "" {
@@ -1261,6 +1274,8 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		cs.dbgAcceptedNs = now
 		cs.dbgFirstByteNs = 0
 		cs.dbgWedgeLogged = false
+		cs.dbgCloseLogged = false
+		cs.dbgLastRecvRes = dbgNoRecvErr
 	}
 
 	// H2C + EnableH2Upgrade is semantically "H2-first but accept H1→H2
@@ -1669,6 +1684,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	if c.Res <= 0 {
+		if wedgeDebugAfter > 0 {
+			cs.dbgLastRecvRes = c.Res
+		}
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
@@ -2419,7 +2437,8 @@ func (w *Worker) closeConn(fd int) {
 	// logging them would drown the signal exactly like the 5s threshold did.
 	if wedgeDebugAfter > 0 && w.logger != nil &&
 		cs.dbgFirstByteNs != 0 && cs.dbgFirstSendNs == 0 && !cs.dbgCloseLogged &&
-		cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() == 0 {
+		cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() == 0 &&
+		!dbgPeerGone(cs.dbgLastRecvRes) {
 		cs.dbgCloseLogged = true
 		w.logger.Warn("iouring: CLOSE-WITHOUT-REPLY (celeris#470)",
 			"fd", fd,
@@ -2432,6 +2451,13 @@ func (w *Worker) closeConn(fd int) {
 			"sending", cs.sending,
 			"detected", cs.detected,
 			"protocol", cs.protocol.Load(),
+			"last_recv_res", cs.dbgLastRecvRes,
+			// checkTimeouts closes on `now - cs.lastActivity > ReadTimeout`.
+			// Records from run 33587016428 show it closing conns aged 1.99ms
+			// and 13.6ms, which is only possible if lastActivity is far in the
+			// past -- so print the value it actually compared.
+			"since_last_activity", time.Duration(time.Now().UnixNano()-cs.lastActivity).String(),
+			"last_activity_ns", cs.lastActivity,
 			"stack", string(debug.Stack()),
 		)
 	}
