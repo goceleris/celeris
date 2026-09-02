@@ -2433,55 +2433,6 @@ func (w *Worker) closeConn(fd int) {
 	if cs == nil {
 		return
 	}
-	// celeris#470: the walker counts h2c_hang on `err != nil || n == 0`, so a
-	// server that CLOSES without replying is counted exactly like one that
-	// stalls -- an immediate EOF is a hang. checkTimeouts can never observe
-	// that (it skips cs.closing and the conn is gone by the next sweep), which
-	// is why the cell that recorded h2c_hang in run 33579882260 produced no
-	// diagnostic hit at all. Catch it here instead, at the moment of the close,
-	// with the stack so the responsible path names itself.
-	// Only the ANOMALY: headers COMPLETE (deadline cleared) yet closed with no
-	// reply. A close with the deadline still armed is the slowloris defence
-	// doing its job -- handleHeaderTimer deliberately closes those without a
-	// response, and the adversarial walker generates them constantly, so
-	// logging them would drown the signal exactly like the 5s threshold did.
-	if wedgeDebugAfter > 0 && w.logger != nil &&
-		cs.dbgFirstByteNs != 0 && cs.dbgFirstSendNs == 0 && !cs.dbgCloseLogged &&
-		cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() == 0 &&
-		!dbgPeerGone(cs.dbgLastRecvRes) && !dbgPeerGone(cs.dbgLastSendRes) &&
-		// Exclude a DEFERRED close. Below, closeConn parks on
-		// `cs.sending || cs.zcNotifPending || len(sendBuf) > 0 || len(writeBuf) > 0`
-		// and only finishes once the send completes -- the reply IS still on
-		// its way, so this is not a close-without-reply. dbgFirstSendNs is
-		// stamped in completeSend, which by definition has not run yet, so
-		// without this the tracer flags every one: 2188 of 2188 records in a
-		// local churn reproduction were exactly this shape (ProcessH1 error ->
-		// flushSend -> closeConn with sending=true), and that run had HANG=0.
-		!cs.sending && !cs.zcNotifPending && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
-		cs.dbgCloseLogged = true
-		w.logger.Warn("iouring: CLOSE-WITHOUT-REPLY (celeris#470)",
-			"fd", fd,
-			"remote", cs.remoteAddr,
-			"age", time.Duration(time.Now().UnixNano()-cs.dbgAcceptedNs).String(),
-			"since_first_byte", time.Duration(time.Now().UnixNano()-cs.dbgFirstByteNs).String(),
-			"hdr_deadline", cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0,
-			"recv_armed", cs.recvArmed,
-			"dirty", cs.dirty,
-			"sending", cs.sending,
-			"detected", cs.detected,
-			"protocol", cs.protocol.Load(),
-			"last_recv_res", cs.dbgLastRecvRes,
-			"last_send_res", cs.dbgLastSendRes,
-			"req_prefix", strconv.Quote(string(cs.dbgReqPrefix[:cs.dbgReqPrefixN])),
-			// checkTimeouts closes on `now - cs.lastActivity > ReadTimeout`.
-			// Records from run 33587016428 show it closing conns aged 1.99ms
-			// and 13.6ms, which is only possible if lastActivity is far in the
-			// past -- so print the value it actually compared.
-			"since_last_activity", time.Duration(time.Now().UnixNano()-cs.lastActivity).String(),
-			"last_activity_ns", cs.lastActivity,
-			"stack", string(debug.Stack()),
-		)
-	}
 	detached := cs.detachMu != nil
 	if detached {
 		cs.asyncClosed.Store(true)
@@ -2784,7 +2735,54 @@ func (w *Worker) drainPendingRelease() {
 	w.pendingRelease = kept
 }
 
+// dbgTraceCloseWithoutReply reports a connection being torn down for good that
+// received a request and never sent a byte -- which the walker counts as
+// h2c_hang, since it scores `err != nil || n == 0` and an immediate EOF is
+// indistinguishable from a stall.
+//
+// It lives at the TERMINAL close, not in closeConn, for two reasons. closeConn
+// defers whenever a send is in flight, so at that point "nothing sent yet" is
+// normal and says nothing. And the deferred path finishes through
+// finishCloseAny -> finishClose/finishCloseDetached, which bypasses closeConn
+// completely -- so a response whose SEND later fails was invisible there. By
+// the terminal close the question is settled: completeSend has stamped
+// dbgFirstSendNs if the reply actually went out, and has not if it never did.
+func (w *Worker) dbgTraceCloseWithoutReply(fd int, cs *connState) {
+	if wedgeDebugAfter <= 0 || w.logger == nil || cs == nil {
+		return
+	}
+	if cs.dbgFirstByteNs == 0 || cs.dbgFirstSendNs != 0 || cs.dbgCloseLogged {
+		return
+	}
+	if dbgPeerGone(cs.dbgLastRecvRes) || dbgPeerGone(cs.dbgLastSendRes) {
+		return
+	}
+	if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 {
+		return // still reading headers: slowloris defence, working as designed
+	}
+	cs.dbgCloseLogged = true
+	now := time.Now().UnixNano()
+	w.logger.Warn("iouring: CLOSE-WITHOUT-REPLY (celeris#470)",
+		"fd", fd,
+		"remote", cs.remoteAddr,
+		"age", time.Duration(now-cs.dbgAcceptedNs).String(),
+		"since_first_byte", time.Duration(now-cs.dbgFirstByteNs).String(),
+		"since_last_activity", time.Duration(now-cs.lastActivity).String(),
+		"last_recv_res", cs.dbgLastRecvRes,
+		"last_send_res", cs.dbgLastSendRes,
+		"req_prefix", strconv.Quote(string(cs.dbgReqPrefix[:cs.dbgReqPrefixN])),
+		"recv_armed", cs.recvArmed,
+		"dirty", cs.dirty,
+		"sending", cs.sending,
+		"closing", cs.closing,
+		"detected", cs.detected,
+		"protocol", cs.protocol.Load(),
+		"stack", string(debug.Stack()),
+	)
+}
+
 func (w *Worker) finishClose(fd int) {
+	w.dbgTraceCloseWithoutReply(fd, w.conns[fd])
 	cs := w.conns[fd]
 	// Remove from liveConns BEFORE niling w.conns[fd]: removeLiveConn swaps
 	// the last live entry into cs.liveIdx and updates that swapped-in
@@ -2889,6 +2887,7 @@ func (w *Worker) finishCloseAny(fd int, cs *connState) {
 // WITHOUT returning the connState to the pool. Used when a detached goroutine
 // still holds closure references to the connState.
 func (w *Worker) finishCloseDetached(fd int, cs *connState) {
+	w.dbgTraceCloseWithoutReply(fd, cs)
 	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
 	// finishClose — removeLiveConn touches w.conns[swappedFD]).
 	w.removeLiveConn(cs)
