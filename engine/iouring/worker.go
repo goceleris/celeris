@@ -3,7 +3,6 @@
 package iouring
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
