@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,7 +91,9 @@ func (l *slidingWindowLimiter) allow(key string, now int64) (bool, int, int64) {
 			currCount:   0,
 			windowStart: now,
 		}
-		s.windows[key] = w
+		// key comes from KeyFunc (default ClientIP, which may be a
+		// substring of a zero-copy header view); clone before retaining.
+		s.windows[strings.Clone(key)] = w
 	}
 
 	l.advanceWindow(w, now)
@@ -220,7 +223,8 @@ func (l *shardedLimiter) allow(key string, now int64) (bool, int, int64) {
 			tokens:   float64(l.burst) - 1,
 			lastFill: now,
 		}
-		s.buckets[key] = b
+		// See windows above: never retain a request-derived key as-is.
+		s.buckets[strings.Clone(key)] = b
 		s.mu.Unlock()
 		reset := now + int64(float64(time.Second)/l.rps)
 		return true, l.burst - 1, reset

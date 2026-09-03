@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -122,7 +123,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			dynamicMu.Lock()
 			if e2, ok2 := dynamicLimiters[rateStr]; ok2 {
 				e2.lastUsed = now
-				dynamicLimiters[rateStr] = e2
+				dynamicLimiters[strings.Clone(rateStr)] = e2 // rateStr may alias a header view
 				dynamicMu.Unlock()
 				return e2.lim, e2.burst, nil
 			}
