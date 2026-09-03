@@ -8,16 +8,21 @@ import (
 	"unsafe"
 )
 
-// TestEncodeDecodeUserDataGenRoundTrip verifies the v1.5.0 review-2.6 user_data
-// layout: op(bits 56-63) | gen(bits 40-55, widened to 16 bits) | fd(bits 0-39).
-// Every op tag, generation values spanning the full 16-bit range (including
-// the old 8-bit boundary 255/256 and the new boundary 65535), and fd values up
-// to 65535 (every real fd / fixed-file index) must survive an encode→decode
-// round trip independently.
+// TestEncodeDecodeUserDataGenRoundTrip verifies the user_data layout:
+// op(bits 56-63) | gen(bits 24-55, 32 bits) | fd(bits 0-23).
+// Every op tag, generation values spanning the full 32-bit range (including
+// the old 8-bit boundary 255/256 and the old 16-bit boundary 65535/65536), and
+// fd values up to 65535 (onAcceptedFD rejects anything >= fixedFileTableSize)
+// must survive an encode→decode round trip independently.
 func TestEncodeDecodeUserDataGenRoundTrip(t *testing.T) {
 	ops := []uint64{udRecv, udSend, udClose, udHeaderTimer}
 	fds := []int{0, 1, 2, 3, 255, 256, 1023, 1024, 4095, 65534, 65535}
-	gens := []uint16{0, 1, 2, 127, 128, 200, 254, 255, 256, 257, 4096, 32767, 32768, 65534, 65535}
+	gens := []uint32{
+		0, 1, 2, 127, 128, 200, 254, 255, 256, 257, 4096, 32767, 32768,
+		// the old 16-bit ceiling: values past it aliased before the widening
+		65534, 65535, 65536, 65537, 131071, 131072,
+		1 << 20, 1<<31 - 1, 1 << 31, 0xFFFFFFFE, 0xFFFFFFFF,
+	}
 
 	for _, op := range ops {
 		for _, fd := range fds {
@@ -51,12 +56,12 @@ func TestEncodeUserDataGenZeroEqualsLegacy(t *testing.T) {
 	}
 }
 
-// TestDecodeFDIgnoresGenBits guards that the 40-bit fd mask isolates the fd even
+// TestDecodeFDIgnoresGenBits guards that the 24-bit fd mask isolates the fd even
 // when high generation bits are set — the inlined run() dispatch decodes
 // fd := int(ud & fdMask) directly, so a non-zero gen must NOT bleed into fd.
 func TestDecodeFDIgnoresGenBits(t *testing.T) {
 	const fd = 12345
-	ud := encodeUserDataGen(udRecv, fd, 0xFFFF)
+	ud := encodeUserDataGen(udRecv, fd, 0xFFFFFFFF)
 	if got := int(ud & fdMask); got != fd {
 		t.Fatalf("ud&fdMask = %d, want %d (gen bits bled into fd)", got, fd)
 	}
@@ -74,10 +79,15 @@ func TestDecodeFDIgnoresGenBits(t *testing.T) {
 // the old-gen CQE stale instead of touching the live conn's accounting.
 func TestGenNoAliasAcrossOldEightBitBoundary(t *testing.T) {
 	const fd = 13
-	const oldGen, liveGen uint16 = 1, 257 // 257 % 256 == 1: aliased pre-widening
+	const oldGen, liveGen uint32 = 1, 257 // 257 % 256 == 1: aliased under the 8-bit tag
 
 	if encodeUserDataGen(udRecv, fd, oldGen) == encodeUserDataGen(udRecv, fd, liveGen) {
-		t.Fatalf("gen %d and %d alias in user_data: generation tag is not 16-bit", oldGen, liveGen)
+		t.Fatalf("gen %d and %d alias in user_data: generation tag is too narrow", oldGen, liveGen)
+	}
+	// Same guard at the old 16-bit ceiling (celeris#470 widened it to 32):
+	// 1 and 65537 are congruent mod 65536 and aliased before the widening.
+	if encodeUserDataGen(udRecv, fd, 1) == encodeUserDataGen(udRecv, fd, 65537) {
+		t.Fatalf("gen 1 and 65537 alias in user_data: generation tag is not 32-bit")
 	}
 
 	w := &Worker{conns: make([]*connState, 64)}
@@ -128,7 +138,7 @@ func cqeFlagsWithBuffer(bufID uint16) uint32 {
 // ring leaks an entry → ENOBUFS → CQE storm (celeris#322).
 func TestStaleConnCQEDropsAndRecyclesBuffer(t *testing.T) {
 	const fd = 7
-	const liveGen uint16 = 42
+	const liveGen uint32 = 42
 
 	w := &Worker{
 		conns:   make([]*connState, 64),
@@ -236,22 +246,21 @@ func TestStaleConnCQENoBufferNoRecycle(t *testing.T) {
 func TestGenerationDiffersAcrossReuse(t *testing.T) {
 	const fd = 11
 
-	// Per-object invariant: acquireConnState increments the generation of
-	// the object it returns and releaseConnState never resets it, so any
-	// connState that is REUSED carries a strictly higher generation than its
-	// previous life. That per-object monotonicity is what staleConnCQE
-	// relies on. connStatePool is a sync.Pool, which does NOT guarantee
-	// returning the just-released object, so we assert the advance only when
-	// the SAME object reappears (across many cycles it reliably does) —
-	// asserting it unconditionally was a flake: a fresh pool object starts
-	// at generation 1, colliding with a once-used object's 1.
-	seen := map[*connState]uint16{}
+	// Generations are drawn from a process-monotonic counter, so EVERY
+	// acquire is unique regardless of whether sync.Pool hands back the same
+	// object. The previous version of this test could only assert the advance
+	// when the same object reappeared, because "a fresh pool object starts at
+	// generation 1, colliding with a once-used object's 1" -- that collision
+	// was celeris#470 observed as a test flake and worked around here rather
+	// than recognised as the defect. Assert it unconditionally now.
+	seenGen := map[uint32]int{}
 	for i := 0; i < 256; i++ {
 		cs := acquireConnState(context.TODO(), fd, 0, false)
-		if prev, ok := seen[cs]; ok && cs.generation <= prev {
-			t.Fatalf("generation did not advance on reuse of same object: prev=%d now=%d", prev, cs.generation)
+		if prev, dup := seenGen[cs.generation]; dup {
+			t.Fatalf("generation %d reused at acquire #%d and #%d for the same fd (celeris#470)",
+				cs.generation, prev, i)
 		}
-		seen[cs] = cs.generation
+		seenGen[cs.generation] = i
 		releaseConnState(cs)
 	}
 
