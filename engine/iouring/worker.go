@@ -2714,7 +2714,7 @@ func (w *Worker) finishClose(fd int) {
 		sqe := w.ring.GetSQE()
 		if sqe != nil {
 			prepCloseDirect(sqe, fd)
-			gen := uint16(0)
+			gen := uint32(0)
 			if cs != nil {
 				gen = cs.generation
 			}

@@ -26,7 +26,7 @@ import (
 // object is freshly allocated. Pre-fix this fails on the second iteration.
 func TestConnGenerationUniqueAcrossFreshAllocations(t *testing.T) {
 	const n = 256
-	seen := make(map[uint16]int, n)
+	seen := make(map[uint32]int, n)
 	held := make([]*connState, 0, n) // never released: forces fresh allocations
 	for i := 0; i < n; i++ {
 		cs := acquireConnState(context.Background(), 42, 0, false)
@@ -65,7 +65,7 @@ func TestConnGenerationNeverZero(t *testing.T) {
 // too: even when the pool DOES hand back the same object, consecutive
 // occupants of an fd must not share a generation.
 func TestConnGenerationDistinctAcrossPoolRecycle(t *testing.T) {
-	seen := make(map[uint16]bool, 1024)
+	seen := make(map[uint32]bool, 1024)
 	for i := 0; i < 1024; i++ {
 		cs := acquireConnState(context.Background(), 99, 0, false)
 		if seen[cs.generation] {

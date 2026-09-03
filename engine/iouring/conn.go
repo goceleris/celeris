@@ -69,7 +69,7 @@ type connState struct {
 	// this release fixed. 16 bits drops the per-reuse collision odds from
 	// 1/256 to 1/65536; wrap-around remains fine — 65536 generations
 	// outlast any in-flight CQE.
-	generation uint16 // 2
+	generation uint32 // 4
 	// liveIdx is this conn's index into Worker.liveConns, maintained so
 	// removeLiveConn is O(1) (swap-with-last) instead of an O(N) linear
 	// scan (celeris#318 follow-up / v1.5.0 review 1.8). -1 when the conn is
@@ -287,9 +287,16 @@ var connStatePool = sync.Pool{
 // bytes, FIN then RST, ~273us after SYN. Proven by connection identity --
 // fd=130 live_cid=8255 killed by a cancel from cid=6241, 80us earlier.
 //
-// A process-monotonic source makes the collision require 65536 intervening
-// accepts on the same fd, which the microsecond-wide cancel window cannot
-// span.
+// A process-monotonic source plus the 32-bit generation field makes a
+// collision require 2^32 intervening accepts process-wide. At the measured
+// end-to-end rate on this cluster (~32k accepts/s) that is ~37 hours, which
+// no engine-side window can span -- and the binding window is NOT the
+// microsecond cancel latency but the paths where no cancel is submitted at
+// all: cancelConnOps skips the cancel when the SQ ring is full, leaving the
+// op to the 5s pendingRelease backstop, and an armed udHeaderTimer lives for
+// ReadHeaderTimeout (10s default). At 16 bits those windows spanned 2.4 and
+// 4.9 wraps respectively, so a 16-bit generation would have left a real
+// residual rather than closing the bug.
 var connGenSeq atomic.Uint32
 
 func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *connState {
@@ -298,9 +305,9 @@ func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *con
 	// Draw a process-unique generation. gen==0 is skipped: encodeUserDataGen
 	// collapses gen=0 onto the plain encodeUserData value, which would make a
 	// conn-bound CQE indistinguishable from a non-conn-bound one.
-	g := uint16(connGenSeq.Add(1))
+	g := connGenSeq.Add(1)
 	if g == 0 {
-		g = uint16(connGenSeq.Add(1))
+		g = connGenSeq.Add(1)
 	}
 	cs.generation = g
 	cs.liveIdx = -1
