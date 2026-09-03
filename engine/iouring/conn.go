@@ -266,14 +266,43 @@ var connStatePool = sync.Pool{
 	},
 }
 
+// connGenSeq issues connection generations. It is process-monotonic rather
+// than a per-connState counter, and that distinction is load-bearing.
+//
+// connStatePool is a sync.Pool, so GC drains it under connection churn and
+// almost every acquire returns a FRESHLY ALLOCATED connState — for which
+// `cs.generation++` yields 1, every time. Measured on the validation
+// workload: 973/973 connections and 628/628 close-path cancels carried
+// gen=1. The generation therefore provided ZERO disambiguation between
+// successive occupants of the same fd, which is the one thing it exists to
+// do (review 2.6).
+//
+// The consequence is celeris#470. cancelConnOps submits an ASYNC_CANCEL
+// keyed on the recv's user_data (udRecv, fd, gen). If the fd is recycled
+// before the kernel runs that cancel, the key matches the NEXT connection's
+// recv byte-for-byte; staleConnCQE sees the generations agree, accepts the
+// CQE as that connection's own, and handleRecv treats the resulting
+// -ECANCELED as a fatal read error and closes a healthy connection without
+// ever reading its request. On the wire: request ACKed, zero response
+// bytes, FIN then RST, ~273us after SYN. Proven by connection identity --
+// fd=130 live_cid=8255 killed by a cancel from cid=6241, 80us earlier.
+//
+// A process-monotonic source makes the collision require 65536 intervening
+// accepts on the same fd, which the microsecond-wide cancel window cannot
+// span.
+var connGenSeq atomic.Uint32
+
 func acquireConnState(ctx context.Context, fd int, bufSize int, async bool) *connState {
 	cs := connStatePool.Get().(*connState)
 	cs.fd = fd
-	// Bump the generation on every acquire (wrap-around is fine). Not reset
-	// in releaseConnState — incrementing here guarantees a reused
-	// connState/fd never shares its predecessor's gen, so a stale CQE
-	// stamped with the old gen is dropped at dispatch (review 2.6).
-	cs.generation++
+	// Draw a process-unique generation. gen==0 is skipped: encodeUserDataGen
+	// collapses gen=0 onto the plain encodeUserData value, which would make a
+	// conn-bound CQE indistinguishable from a non-conn-bound one.
+	g := uint16(connGenSeq.Add(1))
+	if g == 0 {
+		g = uint16(connGenSeq.Add(1))
+	}
+	cs.generation = g
 	cs.liveIdx = -1
 	cs.ctx = ctx
 	cs.writeBuf = cs.writeBuf[:0]
