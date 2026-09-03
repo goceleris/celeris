@@ -3416,11 +3416,29 @@ func (w *Worker) drainDetachQueue() {
 					// 2.6), so a gen-less target would match nothing. The
 					// cancel SQE itself carries the udProvide tag so the
 					// dispatcher drops its CQE.
-					if cs.fixedFile {
-						prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
-					} else {
-						prepCancelFDSkipSuccess(sqe, cs.fd)
-					}
+					// Cancel the in-flight recv by its generation-tagged
+					// user_data -- ALWAYS, never by raw fd (celeris#482).
+					//
+					// The fd-keyed form (IORING_ASYNC_CANCEL_FD|CANCEL_ALL)
+					// matches EVERY op on the socket, not just the recv: it
+					// also kills a SEND that is poll-armed on a full peer
+					// buffer. That send's -ECANCELED lands in handleSend /
+					// completeSend, which treat any negative result as a
+					// fatal I/O error and close a healthy connection
+					// mid-write; on the SEND_ZC path the close stalls and
+					// the conn leaks as a paused ESTAB socket that never
+					// sees the peer's FIN. The two conditions coincide by
+					// construction: a send is cancellable precisely when the
+					// peer is slow, which is the same backpressure that
+					// triggers this pause.
+					//
+					// user_data is unambiguous in both fixed-file and raw-fd
+					// modes (v1.5.0 review 2.5) and MUST include the conn's
+					// generation -- the recv SQE carries it (review 2.6).
+					// cancelConnOps already uses exactly this form
+					// unconditionally. The cancel's own CQE is tagged
+					// udProvide so the dispatcher drops it.
+					prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 					setSQEUserData(sqe, encodeUserData(udProvide, cs.fd))
 				}
 			} else {
