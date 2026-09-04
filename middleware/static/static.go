@@ -313,7 +313,14 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		contentType = detectContentType(filePath, data)
 	}
 
-	cache.Store(filePath, &cachedFile{
+	// filePath is a sub-slice of c.Path(), which on the native engines is
+	// a zero-copy view over the connection's read buffer. sync.Map retains
+	// the key; the buffer is reused by the next request on that conn, so
+	// the stored key's bytes would mutate under the map and corrupt its
+	// hash trie ("internal/sync.HashTrieMap: ran out of hash bits" panics,
+	// ~67k/150s under a GET flood). Clone on the miss path only -- the hit
+	// path's Load does not retain its argument.
+	cache.Store(strings.Clone(filePath), &cachedFile{
 		data:            data,
 		contentType:     contentType,
 		etag:            etag,
