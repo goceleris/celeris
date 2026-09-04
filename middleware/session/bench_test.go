@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
@@ -43,15 +44,20 @@ func BenchmarkSessionAnonymous(b *testing.B) {
 	}
 }
 
+const benchSessionID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func BenchmarkSessionExisting(b *testing.B) {
 	kv := NewMemoryStore()
 	mw := New(Config{
 		Store:        kv,
-		KeyGenerator: func() string { return "bench-session-id" },
+		KeyGenerator: func() string { return benchSessionID },
 	})
-	// Pre-populate store with an encoded session blob.
-	buf, _ := store.EncodeJSON(map[string]any{"user": "admin"})
-	_ = kv.Set(context.Background(), "bench-session-id", buf, 0)
+	// Pre-populate store with an encoded session blob containing a valid _abs_exp.
+	buf, _ := store.EncodeJSON(map[string]any{
+		"user":    "admin",
+		absExpKey: time.Now().UnixNano(),
+	})
+	_ = kv.Set(context.Background(), benchSessionID, buf, 0)
 
 	noop := func(c *celeris.Context) error {
 		s := FromContext(c)
@@ -59,7 +65,7 @@ func BenchmarkSessionExisting(b *testing.B) {
 		return nil
 	}
 	opts := []celeristest.Option{
-		celeristest.WithCookie("celeris_session", "bench-session-id"),
+		celeristest.WithCookie("celeris_session", benchSessionID),
 		celeristest.WithHandlers(mw, noop),
 	}
 	b.ReportAllocs()

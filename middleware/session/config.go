@@ -164,6 +164,11 @@ type Config struct {
 	// under anonymous load (celeris#487). The session's absolute timeout
 	// window starts on its first write.
 	//
+	// Legacy edge: a client presenting a cookie for a blob persisted by an
+	// older build (missing _abs_exp) is treated as expired; previously it was
+	// silently issued a new session and cookie, now a read-only request leaves
+	// nothing until the handler writes.
+	//
 	// Set to true only if your application requires assigning persistent session
 	// IDs and tracking cookies to anonymous visitors before any session data
 	// is written.

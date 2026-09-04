@@ -2804,3 +2804,37 @@ func TestUnmodifiedFreshSessionWriteBehindNotPersisted(t *testing.T) {
 		t.Fatalf("expected 0 saves for unmodified fresh writebehind sessions, got %d", saves)
 	}
 }
+
+// celeris#487 regression guard: a fresh session whose handler calls Set then
+// Save() explicitly must still get a Set-Cookie header emitted on the response.
+func TestFreshSessionExplicitSaveEmitsCookie(t *testing.T) {
+	ts := &trackingStore{inner: NewMemoryStore()}
+	mw := New(Config{Store: ts})
+	handler := func(c *celeris.Context) error {
+		s := FromContext(c)
+		s.Set("key", "val")
+		if err := s.Save(); err != nil {
+			return err
+		}
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+	err := ctx.Next()
+	testutil.AssertNoError(t, err)
+
+	found := false
+	for _, h := range ctx.ResponseHeaders() {
+		if h[0] == "set-cookie" && strings.Contains(h[1], "celeris_session=") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected set-cookie header for fresh session with explicit Save()")
+	}
+	if ts.saveCount() == 0 {
+		t.Fatal("expected store write for fresh session with explicit Save()")
+	}
+}
