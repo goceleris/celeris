@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	celerisengine "github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/probe"
 )
 
 // TestBackpressureInboundSequenceIntegrity (celeris#484 oracle): every inbound
@@ -26,7 +28,9 @@ import (
 // verifies the tail sequence number transmitted in the Close frame.
 func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 	conns := envInt("WS484_CONNS", 96)
-	bpBuf := envInt("WS484_BP", 512)
+	// bpBuf is the chanReader backpressure buffer capacity (default 256, matching the
+	// original #484 reproduction fixture; verified at both 256 and 512).
+	bpBuf := envInt("WS484_BP", 256)
 	bursts := envInt("WS484_BURSTS", 4)
 	perBurst := envInt("WS484_BURST_FRAMES", 16000) // frames per burst per conn
 	if testing.Short() {
@@ -61,9 +65,15 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 			t.Run(testName, func(t *testing.T) {
 				if v.mshotEnv != "" {
 					t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", v.mshotEnv)
+					p := probe.Probe()
+					t.Logf("%s: multishot_recv sub-run: kernel=%s tier=%s providedBuffers=%t multishotRecv=%t",
+						testName, p.KernelVersion, p.IOUringTier.String(), p.ProvidedBuffers, p.MultishotRecv)
+					if !p.ProvidedBuffers || p.IOUringTier < celerisengine.High {
+						t.Skip("skipping multishot_recv sub-run: kernel does not support provided buffers (need High tier + ProvidedBuffers)")
+					}
 				}
 
-				var gaps, parseErr, protoErr, framesIn, framesSent atomic.Int64
+				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent atomic.Int64
 				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
 
 				connLastSeq := make([]int64, conns)
@@ -94,6 +104,10 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 											gaps.Add(1)
 										}
 									}
+								} else if errors.Is(err, ErrReadLimit) {
+									// Channel capacity overflow at chanReader.Append when async pause latency
+									// outpaces headroom. Tracked separately from wire frame corruption.
+									overflowErr.Add(1)
 								} else if !isCloseErr(err) {
 									protoErr.Add(1)
 									if myConnIdx >= 0 {
@@ -263,8 +277,8 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				wg.Wait()
 
-				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d closeTimeout=%d dialFail=%d hsFail=%d",
-					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
+				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d closeTimeout=%d dialFail=%d hsFail=%d",
+					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
 
 				if dialFail.Load()+hsFail.Load() > 0 {
 					t.Fatalf("environment: %d dial/handshake failures", dialFail.Load()+hsFail.Load())
@@ -278,6 +292,9 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				if closeTimeout.Load() != 0 {
 					t.Errorf("%s: %d connection(s) timed out waiting for Close handshake", testName, closeTimeout.Load())
+				}
+				if bpBuf >= 256 && overflowErr.Load() != 0 {
+					t.Errorf("%s: %d channel overflow error(s) observed at buffer capacity %d", testName, overflowErr.Load(), bpBuf)
 				}
 
 				for i := range conns {
@@ -335,7 +352,6 @@ func isParseErr(err error) bool {
 	return errors.Is(err, ErrProtocol) ||
 		errors.Is(err, ErrReservedBits) ||
 		errors.Is(err, ErrInvalidUTF8) ||
-		errors.Is(err, ErrReadLimit) ||
 		errors.Is(err, ErrFrameTooLarge) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
 }
