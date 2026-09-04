@@ -112,6 +112,12 @@ jobs:
       - name: middleware/protobuf
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/protobuf
+      - name: middleware/websocket — backpressure tests
+        env:
+          WS484_CONNS: "16"
+          WS484_BURSTS: "2"
+          WS484_BURST_FRAMES: "1000"
+        run: go test -race -count=1 -timeout=120s -run '^TestBackpressure' ./middleware/websocket/...
 
   conformance:
     name: Conformance

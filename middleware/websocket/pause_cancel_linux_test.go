@@ -47,11 +47,9 @@ import (
 //     the client times out instead of seeing EOF);
 //  3. engine shutdown completes within a bound (paused zombies block it).
 //
-// NOTE: this test deliberately does NOT assert inbound frame integrity. A
-// separate, pre-existing io_uring defect drops buffered inbound bytes under
-// frequent backpressure pause/resume (truncating a WS frame); it is present
-// with and without this fix and is tracked as its own issue. Conflating it
-// here would make this #482 regression guard fail on a bug it does not cover.
+// NOTE: inbound stream integrity is verified by the sequence-oracle test
+// (TestBackpressureInboundSequenceIntegrity, #484); this test asserts the #482
+// fix: no ECANCELED on in-flight sends, clean close handshakes, and clean shutdown.
 func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	if testing.Short() {
 		t.Skip("needs ~20s of loopback flood")
