@@ -70,7 +70,7 @@ func probeMultishotAcceptCached() (bool, string) {
 
 // SEND_ZC ioprio flags and notification result values.
 const (
-	sendZCReportUsage        = 1 << 3   // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
+	sendZCReportUsage         = 1 << 3  // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
 	notifUsageZCCopied uint32 = 1 << 31 // IORING_NOTIF_USAGE_ZC_COPIED: data was copied, not zero-copied
 )
 
@@ -177,17 +177,17 @@ func probeSendZC() (SendZCProbeResult, string) {
 	ring.EndCQ(cqHead + 1)
 
 	if initialRes < 0 || initialFlags&0x02 == 0 {
-		return parseSendZCResult(initialRes, initialFlags, false, 0, 0)
+		return parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0)
 	}
 
 	// Wait for the notification CQE.
 	if err := ring.SubmitAndWaitTimeout(2 * time.Second); err != nil {
-		return parseSendZCResult(initialRes, initialFlags, false, 0, 0)
+		return parseSendZCResult(initialRes, initialFlags, false, err, 0, 0)
 	}
 
 	cqHead, cqTail = ring.BeginCQ()
 	if cqHead == cqTail {
-		return parseSendZCResult(initialRes, initialFlags, false, 0, 0)
+		return parseSendZCResult(initialRes, initialFlags, false, nil, 0, 0)
 	}
 
 	entry = ring.cqeAt(cqHead)
@@ -200,18 +200,21 @@ func probeSendZC() (SendZCProbeResult, string) {
 	_ = accepted.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	_, _ = accepted.Read(buf)
 
-	return parseSendZCResult(initialRes, initialFlags, true, notifRes, notifFlags)
+	return parseSendZCResult(initialRes, initialFlags, true, nil, notifRes, notifFlags)
 }
 
 // parseSendZCResult evaluates the CQE outcomes from the SEND_ZC probe.
 // Factored out of probeSendZC so the evaluation logic can be verified
 // against synthetic CQEs across all four outcomes (celeris#465).
-func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool, notifRes int32, notifFlags uint32) (SendZCProbeResult, string) {
+func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool, waitErr error, notifRes int32, notifFlags uint32) (SendZCProbeResult, string) {
 	if initialRes < 0 {
 		return SendZCUnsupported, fmt.Sprintf("kernel rejected SEND_ZC opcode: cqe.res=%d (likely -ENOSYS=-38 or -EINVAL=-22)", initialRes)
 	}
 	if initialFlags&0x02 == 0 {
 		return SendZCCopyFallback, "first CQE missing CQE_F_MORE flag (no notification will follow)"
+	}
+	if waitErr != nil {
+		return SendZCBroken, "notification CQE wait timed out: " + waitErr.Error()
 	}
 	if !notifArrived {
 		return SendZCBroken, "no notification CQE produced (waited 2s)"
@@ -231,10 +234,8 @@ func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool,
 // Values:
 //   - "on", "1", "true": force enabled if functional probe passed.
 //   - "off", "0", "false": force disabled.
-//   - "auto", "" (default): disabled by default because copy-fallback (where the
-//     kernel copies data anyway but incurs two-CQE notification overhead) provides
-//     no performance benefit over regular SEND. On verified zero-copy DMA hardware,
-//     operators opt in via CELERIS_IOURING_SEND_ZC=on (celeris#465).
+//   - "auto", "" (default): preserves current default behavior (enabled when functional probe
+//     passed). Final default decision pending cluster A/B fabric benchmark (celeris#465).
 func resolveSendZCPolicy(functional bool, envVal string) bool {
 	if !functional {
 		return false
@@ -245,10 +246,10 @@ func resolveSendZCPolicy(functional bool, envVal string) bool {
 	case "0", "off", "false":
 		return false
 	case "auto", "":
-		// Default to off until cluster A/B benchmarks confirm physical NIC win.
-		return false
+		// Default unchanged: enabled when functional probe passed.
+		return functional
 	default:
-		return false
+		return functional
 	}
 }
 

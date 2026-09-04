@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -19,79 +20,89 @@ func TestNotifUsageZCCopiedConstant(t *testing.T) {
 // TestParseSendZCResult exercises all four probe outcomes against synthetic CQEs (celeris#465).
 func TestParseSendZCResult(t *testing.T) {
 	cases := []struct {
-		name         string
-		initialRes   int32
-		initialFlags uint32
-		notifArrived bool
-		notifRes     int32
-		notifFlags   uint32
-		wantResult   SendZCProbeResult
+		name          string
+		initialRes    int32
+		initialFlags  uint32
+		notifArrived  bool
+		waitErr       error
+		notifRes      int32
+		notifFlags    uint32
+		wantResult    SendZCProbeResult
 		wantReasonSub string
 	}{
 		{
-			name:         "unsupported-enosys",
-			initialRes:   -38, // -ENOSYS
-			initialFlags: 0,
-			wantResult:   SendZCUnsupported,
+			name:          "unsupported-enosys",
+			initialRes:    -38, // -ENOSYS
+			initialFlags:  0,
+			wantResult:    SendZCUnsupported,
 			wantReasonSub: "kernel rejected SEND_ZC opcode",
 		},
 		{
-			name:         "unsupported-einval",
-			initialRes:   -22, // -EINVAL
-			initialFlags: 0,
-			wantResult:   SendZCUnsupported,
+			name:          "unsupported-einval",
+			initialRes:    -22, // -EINVAL
+			initialFlags:  0,
+			wantResult:    SendZCUnsupported,
 			wantReasonSub: "kernel rejected SEND_ZC opcode",
 		},
 		{
-			name:         "copy-fallback-missing-f-more",
-			initialRes:   64,
-			initialFlags: 0, // missing CQE_F_MORE (0x02)
-			wantResult:   SendZCCopyFallback,
+			name:          "copy-fallback-missing-f-more",
+			initialRes:    64,
+			initialFlags:  0, // missing CQE_F_MORE (0x02)
+			wantResult:    SendZCCopyFallback,
 			wantReasonSub: "missing CQE_F_MORE flag",
 		},
 		{
-			name:         "broken-missing-notification",
-			initialRes:   64,
-			initialFlags: 0x02, // CQE_F_MORE
-			notifArrived: false,
-			wantResult:   SendZCBroken,
+			name:          "broken-wait-timeout",
+			initialRes:    64,
+			initialFlags:  0x02, // CQE_F_MORE
+			notifArrived:  false,
+			waitErr:       errors.New("deadline exceeded"),
+			wantResult:    SendZCBroken,
+			wantReasonSub: "notification CQE wait timed out: deadline exceeded",
+		},
+		{
+			name:          "broken-missing-notification",
+			initialRes:    64,
+			initialFlags:  0x02, // CQE_F_MORE
+			notifArrived:  false,
+			wantResult:    SendZCBroken,
 			wantReasonSub: "no notification CQE produced",
 		},
 		{
-			name:         "broken-missing-notif-flag",
-			initialRes:   64,
-			initialFlags: 0x02,
-			notifArrived: true,
-			notifRes:     0,
-			notifFlags:   0, // missing CQE_F_NOTIF (1<<3)
-			wantResult:   SendZCBroken,
+			name:          "broken-missing-notif-flag",
+			initialRes:    64,
+			initialFlags:  0x02,
+			notifArrived:  true,
+			notifRes:      0,
+			notifFlags:    0, // missing CQE_F_NOTIF (1<<3)
+			wantResult:    SendZCBroken,
 			wantReasonSub: "second CQE missing CQE_F_NOTIF flag",
 		},
 		{
-			name:         "copy-fallback-zc-copied-bit31",
-			initialRes:   64,
-			initialFlags: 0x02,
-			notifArrived: true,
-			notifRes:     int32(-2147483648), // 0x80000000: bit 31 set (IORING_NOTIF_USAGE_ZC_COPIED)
-			notifFlags:   cqeFNotif,
-			wantResult:   SendZCCopyFallback,
+			name:          "copy-fallback-zc-copied-bit31",
+			initialRes:    64,
+			initialFlags:  0x02,
+			notifArrived:  true,
+			notifRes:      int32(-2147483648), // 0x80000000: bit 31 set (IORING_NOTIF_USAGE_ZC_COPIED)
+			notifFlags:    cqeFNotif,
+			wantResult:    SendZCCopyFallback,
 			wantReasonSub: "IORING_NOTIF_USAGE_ZC_COPIED",
 		},
 		{
-			name:         "true-zero-copy-bit31-clear",
-			initialRes:   64,
-			initialFlags: 0x02,
-			notifArrived: true,
-			notifRes:     0, // bit 31 clear
-			notifFlags:   cqeFNotif,
-			wantResult:   SendZCTrueZeroCopy,
+			name:          "true-zero-copy-bit31-clear",
+			initialRes:    64,
+			initialFlags:  0x02,
+			notifArrived:  true,
+			notifRes:      0, // bit 31 clear
+			notifFlags:    cqeFNotif,
+			wantResult:    SendZCTrueZeroCopy,
 			wantReasonSub: "",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotRes, gotReason := parseSendZCResult(tc.initialRes, tc.initialFlags, tc.notifArrived, tc.notifRes, tc.notifFlags)
+			gotRes, gotReason := parseSendZCResult(tc.initialRes, tc.initialFlags, tc.notifArrived, tc.waitErr, tc.notifRes, tc.notifFlags)
 			if gotRes != tc.wantResult {
 				t.Fatalf("parseSendZCResult() result = %v (%s), want %v (%s)",
 					gotRes, gotRes.String(), tc.wantResult, tc.wantResult.String())
@@ -121,9 +132,9 @@ func TestResolveSendZCPolicy(t *testing.T) {
 		{"functional-env-off", true, "off", false},
 		{"functional-env-0", true, "0", false},
 		{"functional-env-false", true, "false", false},
-		{"functional-env-auto", true, "auto", false},
-		{"functional-env-empty", true, "", false},
-		{"functional-env-unknown", true, "invalid", false},
+		{"functional-env-auto", true, "auto", true},
+		{"functional-env-empty", true, "", true},
+		{"functional-env-unknown", true, "invalid", true},
 	}
 
 	for _, tc := range cases {
