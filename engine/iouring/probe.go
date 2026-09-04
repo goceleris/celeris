@@ -5,6 +5,7 @@ package iouring
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -69,8 +70,8 @@ func probeMultishotAcceptCached() (bool, string) {
 
 // SEND_ZC ioprio flags and notification result values.
 const (
-	sendZCReportUsage  = 1 << 3 // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
-	notifUsageZCCopied = 2      // IORING_NOTIF_USAGE_ZC_COPIED: data was copied, not zero-copied
+	sendZCReportUsage        = 1 << 3   // IORING_SEND_ZC_REPORT_USAGE: request ZC usage info in notification
+	notifUsageZCCopied uint32 = 1 << 31 // IORING_NOTIF_USAGE_ZC_COPIED: data was copied, not zero-copied
 )
 
 // SendZCProbeResult describes the outcome of the SEND_ZC runtime probe.
@@ -171,56 +172,84 @@ func probeSendZC() (SendZCProbeResult, string) {
 		return SendZCUnsupported, "no initial CQE produced after submit"
 	}
 	entry := ring.cqeAt(cqHead)
-	if entry.Res < 0 {
-		res := entry.Res
-		ring.EndCQ(cqHead + 1)
-		return SendZCUnsupported, fmt.Sprintf("kernel rejected SEND_ZC opcode: cqe.res=%d (likely -ENOSYS=-38 or -EINVAL=-22)", res)
-	}
-
-	flags := entry.Flags
-	hasMore := flags&0x02 != 0 // CQE_F_MORE
+	initialRes := entry.Res
+	initialFlags := entry.Flags
 	ring.EndCQ(cqHead + 1)
 
-	if !hasMore {
-		// Kernel accepted SEND_ZC but fell back to copy without entering the
-		// zero-copy path at all. No notification CQE will follow. Buffer is
-		// safe to reuse immediately. On mainline kernels this shouldn't happen
-		// (CQE_F_MORE is always set), but some patched kernels skip it.
-		// Treat as copy fallback — SEND_ZC works but has no ZC benefit.
-		return SendZCCopyFallback, "first CQE missing CQE_F_MORE flag (no notification will follow)"
+	if initialRes < 0 || initialFlags&0x02 == 0 {
+		return parseSendZCResult(initialRes, initialFlags, false, 0, 0)
 	}
 
 	// Wait for the notification CQE.
 	if err := ring.SubmitAndWaitTimeout(2 * time.Second); err != nil {
-		return SendZCBroken, "notification CQE wait timed out: " + err.Error()
+		return parseSendZCResult(initialRes, initialFlags, false, 0, 0)
 	}
 
 	cqHead, cqTail = ring.BeginCQ()
 	if cqHead == cqTail {
-		return SendZCBroken, "no notification CQE produced (waited 2s)"
+		return parseSendZCResult(initialRes, initialFlags, false, 0, 0)
 	}
 
 	entry = ring.cqeAt(cqHead)
 	notifFlags := entry.Flags
-	isNotif := notifFlags&cqeFNotif != 0 // CQE_F_NOTIF (1<<3); 0x04 is SOCK_NONEMPTY
 	notifRes := entry.Res
 	ring.EndCQ(cqHead + 1)
-
-	if !isNotif {
-		return SendZCBroken, fmt.Sprintf("second CQE missing CQE_F_NOTIF flag (flags=%#x)", notifFlags)
-	}
-
-	// Check the notification's res field for REPORT_USAGE result.
-	if notifRes&notifUsageZCCopied != 0 {
-		return SendZCCopyFallback, "REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
-	}
 
 	// Clean up: read the sent data on the receiver side.
 	buf := make([]byte, 64)
 	_ = accepted.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	_, _ = accepted.Read(buf)
 
+	return parseSendZCResult(initialRes, initialFlags, true, notifRes, notifFlags)
+}
+
+// parseSendZCResult evaluates the CQE outcomes from the SEND_ZC probe.
+// Factored out of probeSendZC so the evaluation logic can be verified
+// against synthetic CQEs across all four outcomes (celeris#465).
+func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool, notifRes int32, notifFlags uint32) (SendZCProbeResult, string) {
+	if initialRes < 0 {
+		return SendZCUnsupported, fmt.Sprintf("kernel rejected SEND_ZC opcode: cqe.res=%d (likely -ENOSYS=-38 or -EINVAL=-22)", initialRes)
+	}
+	if initialFlags&0x02 == 0 {
+		return SendZCCopyFallback, "first CQE missing CQE_F_MORE flag (no notification will follow)"
+	}
+	if !notifArrived {
+		return SendZCBroken, "no notification CQE produced (waited 2s)"
+	}
+	if notifFlags&cqeFNotif == 0 {
+		return SendZCBroken, fmt.Sprintf("second CQE missing CQE_F_NOTIF flag (flags=%#x)", notifFlags)
+	}
+	if uint32(notifRes)&notifUsageZCCopied != 0 {
+		return SendZCCopyFallback, "REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
+	}
 	return SendZCTrueZeroCopy, ""
+}
+
+// resolveSendZCPolicy evaluates the SEND_ZC policy given the functional probe result
+// and the CELERIS_IOURING_SEND_ZC environment setting.
+//
+// Values:
+//   - "on", "1", "true": force enabled if functional probe passed.
+//   - "off", "0", "false": force disabled.
+//   - "auto", "" (default): disabled by default because copy-fallback (where the
+//     kernel copies data anyway but incurs two-CQE notification overhead) provides
+//     no performance benefit over regular SEND. On verified zero-copy DMA hardware,
+//     operators opt in via CELERIS_IOURING_SEND_ZC=on (celeris#465).
+func resolveSendZCPolicy(functional bool, envVal string) bool {
+	if !functional {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(envVal)) {
+	case "1", "on", "true":
+		return true
+	case "0", "off", "false":
+		return false
+	case "auto", "":
+		// Default to off until cluster A/B benchmarks confirm physical NIC win.
+		return false
+	default:
+		return false
+	}
 }
 
 // probeFixedFiles tests whether ACCEPT_DIRECT (fixed files) works end-to-end.

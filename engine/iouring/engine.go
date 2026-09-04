@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,22 +78,24 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
 	if profile.SendZC {
 		zcResult, zcReason := probeSendZCCached()
-		if zcReason != "" {
-			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String(), "reason", zcReason)
-		} else {
-			cfg.Logger.Info("SEND_ZC probe result", "result", zcResult.String())
-		}
+		functional := zcResult == SendZCTrueZeroCopy || zcResult == SendZCCopyFallback
 		switch zcResult {
 		case SendZCTrueZeroCopy:
-			// True zero-copy on this NIC — keep enabled.
+			cfg.Logger.Info("SEND_ZC probe result", "functional", true, "loopback", "true zero-copy")
 		case SendZCCopyFallback:
-			// Works but copies data (loopback, or NIC without scatter-gather DMA).
-			// No performance benefit over regular SEND — disable.
-			profile.SendZC = false
+			if zcReason != "" {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", true, "loopback", "copy-fallback (expected)", "reason", zcReason)
+			} else {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", true, "loopback", "copy-fallback (expected)")
+			}
 		default:
-			// Unsupported or broken — disable.
-			profile.SendZC = false
+			if zcReason != "" {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", false, "result", zcResult.String(), "reason", zcReason)
+			} else {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", false, "result", zcResult.String())
+			}
 		}
+		profile.SendZC = resolveSendZCPolicy(functional, os.Getenv("CELERIS_IOURING_SEND_ZC"))
 	}
 	if profile.FixedFiles {
 		if ok, ffReason := probeFixedFilesCached(); !ok {
