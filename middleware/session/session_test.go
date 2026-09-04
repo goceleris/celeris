@@ -1068,8 +1068,20 @@ func TestNewSessionSaveUnmodifiedStoresAbsExp(t *testing.T) {
 		return nil
 	}
 	chain := []celeris.HandlerFunc{mw, handler}
-	_, err := testutil.RunChain(t, chain, "GET", "/")
+	ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+	err := ctx.Next()
 	testutil.AssertNoError(t, err)
+
+	foundCookie := false
+	for _, h := range ctx.ResponseHeaders() {
+		if h[0] == "set-cookie" && strings.Contains(h[1], "celeris_session="+sid) {
+			foundCookie = true
+			break
+		}
+	}
+	if !foundCookie {
+		t.Fatal("expected set-cookie header for unmodified fresh session when SaveUnmodified=true")
+	}
 
 	data, _ := loadMap(t, store, sid)
 	if data == nil {
@@ -1082,6 +1094,40 @@ func TestNewSessionSaveUnmodifiedStoresAbsExp(t *testing.T) {
 	created := int64(asFloat(ts))
 	if time.Since(time.Unix(0, created)) > time.Second {
 		t.Fatal("expected _abs_exp to be recent")
+	}
+}
+
+func TestNewSessionSaveUnmodifiedWriteBehindStoresAbsExp(t *testing.T) {
+	store := NewMemoryStore()
+	mw, closer := NewWithCloser(Config{Store: store, SaveUnmodified: true, WriteBehind: true})
+	defer func() { _ = closer.Close() }()
+	var sid string
+
+	handler := func(c *celeris.Context) error {
+		s := FromContext(c)
+		sid = s.ID()
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+	err := ctx.Next()
+	testutil.AssertNoError(t, err)
+
+	foundCookie := false
+	for _, h := range ctx.ResponseHeaders() {
+		if h[0] == "set-cookie" && strings.Contains(h[1], "celeris_session="+sid) {
+			foundCookie = true
+			break
+		}
+	}
+	if !foundCookie {
+		t.Fatal("expected set-cookie header for unmodified fresh session when SaveUnmodified=true (write-behind)")
+	}
+
+	_ = closer.Close()
+	data, _ := loadMap(t, store, sid)
+	if data == nil {
+		t.Fatal("expected session in store when SaveUnmodified=true (write-behind)")
 	}
 }
 
@@ -2805,18 +2851,17 @@ func TestUnmodifiedFreshSessionWriteBehindNotPersisted(t *testing.T) {
 	}
 }
 
-// celeris#487 regression guard: a fresh session whose handler calls Set then
-// Save() explicitly must still get a Set-Cookie header emitted on the response.
+// celeris#487 regression guard: a fresh session whose handler calls only
+// Save() explicitly (no s.Set) must still get a Set-Cookie header emitted on
+// the response and the store entry must be reachable by that cookie ID.
 func TestFreshSessionExplicitSaveEmitsCookie(t *testing.T) {
 	ts := &trackingStore{inner: NewMemoryStore()}
 	mw := New(Config{Store: ts})
+	var sid string
 	handler := func(c *celeris.Context) error {
 		s := FromContext(c)
-		s.Set("key", "val")
-		if err := s.Save(); err != nil {
-			return err
-		}
-		return nil
+		sid = s.ID()
+		return s.Save()
 	}
 	chain := []celeris.HandlerFunc{mw, handler}
 
@@ -2826,15 +2871,50 @@ func TestFreshSessionExplicitSaveEmitsCookie(t *testing.T) {
 
 	found := false
 	for _, h := range ctx.ResponseHeaders() {
-		if h[0] == "set-cookie" && strings.Contains(h[1], "celeris_session=") {
+		if h[0] == "set-cookie" && strings.Contains(h[1], "celeris_session="+sid) {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatal("expected set-cookie header for fresh session with explicit Save()")
+		t.Fatal("expected set-cookie header for fresh session with explicit Save() only")
 	}
-	if ts.saveCount() == 0 {
-		t.Fatal("expected store write for fresh session with explicit Save()")
+	data, _ := loadMap(t, ts.inner, sid)
+	if data == nil {
+		t.Fatal("expected session in store reachable by cookie ID after explicit Save()")
+	}
+}
+
+// Write-behind variant: explicit Save() on fresh unmodified session with write-behind.
+func TestFreshSessionExplicitSaveWriteBehindEmitsCookie(t *testing.T) {
+	ts := &trackingStore{inner: NewMemoryStore()}
+	mw, closer := NewWithCloser(Config{Store: ts, WriteBehind: true})
+	defer func() { _ = closer.Close() }()
+	var sid string
+	handler := func(c *celeris.Context) error {
+		s := FromContext(c)
+		sid = s.ID()
+		return s.Save()
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+	err := ctx.Next()
+	testutil.AssertNoError(t, err)
+
+	found := false
+	for _, h := range ctx.ResponseHeaders() {
+		if h[0] == "set-cookie" && strings.Contains(h[1], "celeris_session="+sid) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected set-cookie header for fresh session with explicit Save() only (write-behind)")
+	}
+	_ = closer.Close()
+	data, _ := loadMap(t, ts.inner, sid)
+	if data == nil {
+		t.Fatal("expected session in store reachable by cookie ID after explicit Save() (write-behind)")
 	}
 }
