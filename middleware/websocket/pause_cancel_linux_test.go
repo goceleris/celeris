@@ -64,7 +64,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	for _, kind := range engineKinds(t) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
-			var ecanceled, otherWriteErr atomic.Int64
+			var ecanceled, otherWriteErr, protoErr atomic.Int64
 			addr, shutdownEngine := startNativeServer(t, kind, Config{
 				CheckOrigin:           func(*celeris.Context) bool { return true },
 				ReadLimit:             256 * 1024,
@@ -73,6 +73,9 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					for {
 						mt, msg, err := c.ReadMessage()
 						if err != nil {
+							if !isCloseErr(err) {
+								protoErr.Add(1)
+							}
 							return
 						}
 						if err := c.WriteMessage(mt, msg); err != nil {
@@ -201,8 +204,8 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				t.Errorf("%d client conn(s) ended mid-frame -- test client bug, not a server verdict", clientMisaligned.Load())
 			}
 
-			t.Logf("%s: conns=%d ecanceled=%d otherWriteErr=%d closedOK=%d closeTimeout=%d dialFail=%d hsFail=%d",
-				kind, conns, ecanceled.Load(), otherWriteErr.Load(), closedOK.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
+			t.Logf("%s: conns=%d protoErr=%d clientCloseFail=%d ecanceled=%d otherWriteErr=%d closedOK=%d closeTimeout=%d dialFail=%d hsFail=%d",
+				kind, conns, protoErr.Load(), clientCloseFail.Load(), ecanceled.Load(), otherWriteErr.Load(), closedOK.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
 			if dialFail.Load()+hsFail.Load() > 0 {
 				t.Fatalf("%d conns failed to dial/handshake -- environment problem, not a verdict", dialFail.Load()+hsFail.Load())
 			}
