@@ -595,7 +595,7 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 			} else {
 				c.SetHeader(cookieName, "")
 			}
-		} else if sess.modified || sess.fresh {
+		} else if sess.modified || (sess.fresh && cfg.SaveUnmodified) {
 			expiry := idleTimeout
 			if sess.idleOverride > 0 {
 				expiry = sess.idleOverride

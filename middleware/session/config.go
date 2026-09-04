@@ -151,6 +151,23 @@ type Config struct {
 	// stays synchronous) and is independent of the cookie write, which is
 	// always emitted on the response.
 	WriteBehind bool
+
+	// SaveUnmodified forces eager persistence of fresh, unmodified sessions.
+	// Default: false (lazy session creation: a fresh session is only persisted
+	// and its cookie emitted if the handler modifies the session data, e.g. via
+	// [Session.Set], [Session.Delete], [Session.Clear], [Session.Regenerate],
+	// or [Session.SetIdleTimeout]).
+	//
+	// Under the default (false), cookieless requests that do not mutate the
+	// session (crawlers, health checks, read-only API calls) never write to the
+	// store or emit a Set-Cookie header, preventing unbounded store growth
+	// under anonymous load (celeris#487). The session's absolute timeout
+	// window starts on its first write.
+	//
+	// Set to true only if your application requires assigning persistent session
+	// IDs and tracking cookies to anonymous visitors before any session data
+	// is written.
+	SaveUnmodified bool
 }
 
 // defaultCookieMaxAge is the default cookie Max-Age in seconds (24h).

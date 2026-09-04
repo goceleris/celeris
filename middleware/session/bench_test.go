@@ -26,6 +26,23 @@ func BenchmarkSessionNew(b *testing.B) {
 	}
 }
 
+func BenchmarkSessionAnonymous(b *testing.B) {
+	mw := New()
+	noop := func(c *celeris.Context) error {
+		s := FromContext(c)
+		_ = s.ID()
+		return nil
+	}
+	opts := []celeristest.Option{celeristest.WithHandlers(mw, noop)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
 func BenchmarkSessionExisting(b *testing.B) {
 	kv := NewMemoryStore()
 	mw := New(Config{

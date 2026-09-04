@@ -1035,6 +1035,7 @@ func TestNewSessionStoresAbsExp(t *testing.T) {
 
 	handler := func(c *celeris.Context) error {
 		s := FromContext(c)
+		s.Set("init", true)
 		sid = s.ID()
 		return nil
 	}
@@ -1045,6 +1046,34 @@ func TestNewSessionStoresAbsExp(t *testing.T) {
 	data, _ := loadMap(t, store, sid)
 	if data == nil {
 		t.Fatal("expected session in store")
+	}
+	ts, ok := data[absExpKey]
+	if !ok {
+		t.Fatal("expected _abs_exp key in new session data")
+	}
+	created := int64(asFloat(ts))
+	if time.Since(time.Unix(0, created)) > time.Second {
+		t.Fatal("expected _abs_exp to be recent")
+	}
+}
+
+func TestNewSessionSaveUnmodifiedStoresAbsExp(t *testing.T) {
+	store := NewMemoryStore()
+	mw := New(Config{Store: store, SaveUnmodified: true})
+	var sid string
+
+	handler := func(c *celeris.Context) error {
+		s := FromContext(c)
+		sid = s.ID()
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	_, err := testutil.RunChain(t, chain, "GET", "/")
+	testutil.AssertNoError(t, err)
+
+	data, _ := loadMap(t, store, sid)
+	if data == nil {
+		t.Fatal("expected session in store when SaveUnmodified=true")
 	}
 	ts, ok := data[absExpKey]
 	if !ok {
@@ -2720,4 +2749,58 @@ func TestGetByIDPanicsOnDestroy(t *testing.T) {
 		}
 	}()
 	_ = sess.Destroy()
+}
+
+// celeris#487: a fresh, never-modified session must not be persisted to the
+// store or emit a Set-Cookie header under cookieless (anonymous) load.
+func TestUnmodifiedFreshSessionNotPersisted(t *testing.T) {
+	ts := &trackingStore{inner: NewMemoryStore()}
+	mw := New(Config{Store: ts})
+	handler := func(c *celeris.Context) error {
+		s := FromContext(c)
+		_, _ = s.Get("missing")
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+	for i := range 1000 {
+		ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+		err := ctx.Next()
+		testutil.AssertNoError(t, err)
+		for _, h := range ctx.ResponseHeaders() {
+			if h[0] == "set-cookie" {
+				t.Fatalf("request %d: expected no set-cookie for unmodified fresh session, got %q", i, h[1])
+			}
+		}
+	}
+	if saves := ts.saveCount(); saves != 0 {
+		t.Fatalf("expected 0 saves for unmodified fresh sessions, got %d", saves)
+	}
+}
+
+func TestUnmodifiedFreshSessionWriteBehindNotPersisted(t *testing.T) {
+	ts := &trackingStore{inner: NewMemoryStore()}
+	mw, closer := NewWithCloser(Config{Store: ts, WriteBehind: true})
+	defer func() { _ = closer.Close() }()
+	handler := func(c *celeris.Context) error {
+		s := FromContext(c)
+		_, _ = s.Get("missing")
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	for i := range 1000 {
+		ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+		err := ctx.Next()
+		testutil.AssertNoError(t, err)
+		for _, h := range ctx.ResponseHeaders() {
+			if h[0] == "set-cookie" {
+				t.Fatalf("request %d: expected no set-cookie for unmodified fresh session, got %q", i, h[1])
+			}
+		}
+	}
+
+	_ = closer.Close()
+	if saves := ts.saveCount(); saves != 0 {
+		t.Fatalf("expected 0 saves for unmodified fresh writebehind sessions, got %d", saves)
+	}
 }
