@@ -17,7 +17,7 @@ func TestNotifUsageZCCopiedConstant(t *testing.T) {
 	}
 }
 
-// TestParseSendZCResult exercises all four probe outcomes against synthetic CQEs (celeris#465).
+// TestParseSendZCResult exercises probe outcomes against synthetic CQEs (celeris#465).
 func TestParseSendZCResult(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -45,20 +45,20 @@ func TestParseSendZCResult(t *testing.T) {
 			wantReasonSub: "kernel rejected SEND_ZC opcode",
 		},
 		{
-			name:          "copy-fallback-missing-f-more",
+			name:          "no-notification-missing-f-more",
 			initialRes:    64,
 			initialFlags:  0, // missing CQE_F_MORE (0x02)
-			wantResult:    SendZCCopyFallback,
-			wantReasonSub: "missing CQE_F_MORE flag",
+			wantResult:    SendZCNoNotification,
+			wantReasonSub: "first CQE missing CQE_F_MORE flag",
 		},
 		{
-			name:          "broken-wait-timeout",
+			name:          "broken-wait-failed",
 			initialRes:    64,
 			initialFlags:  0x02, // CQE_F_MORE
 			notifArrived:  false,
 			waitErr:       errors.New("deadline exceeded"),
 			wantResult:    SendZCBroken,
-			wantReasonSub: "notification CQE wait timed out: deadline exceeded",
+			wantReasonSub: "notification CQE wait failed: deadline exceeded",
 		},
 		{
 			name:          "broken-missing-notification",
@@ -114,34 +114,36 @@ func TestParseSendZCResult(t *testing.T) {
 	}
 }
 
-// TestResolveSendZCPolicy verifies SEND_ZC policy gating under all options (celeris#465).
+// TestResolveSendZCPolicy verifies SEND_ZC policy gating and unrecognized value detection (celeris#465).
 func TestResolveSendZCPolicy(t *testing.T) {
 	cases := []struct {
-		name       string
-		functional bool
-		envVal     string
-		want       bool
+		name           string
+		functional     bool
+		envVal         string
+		wantEnabled    bool
+		wantRecognized bool
 	}{
-		{"non-functional-env-on", false, "on", false},
-		{"non-functional-env-1", false, "1", false},
-		{"non-functional-env-auto", false, "auto", false},
-		{"non-functional-env-empty", false, "", false},
-		{"functional-env-on", true, "on", true},
-		{"functional-env-1", true, "1", true},
-		{"functional-env-true", true, "true", true},
-		{"functional-env-off", true, "off", false},
-		{"functional-env-0", true, "0", false},
-		{"functional-env-false", true, "false", false},
-		{"functional-env-auto", true, "auto", true},
-		{"functional-env-empty", true, "", true},
-		{"functional-env-unknown", true, "invalid", true},
+		{"non-functional-env-on", false, "on", false, true},
+		{"non-functional-env-1", false, "1", false, true},
+		{"non-functional-env-auto", false, "auto", false, true},
+		{"non-functional-env-empty", false, "", false, true},
+		{"functional-env-on", true, "on", true, true},
+		{"functional-env-1", true, "1", true, true},
+		{"functional-env-true", true, "true", true, true},
+		{"functional-env-off", true, "off", false, true},
+		{"functional-env-0", true, "0", false, true},
+		{"functional-env-false", true, "false", false, true},
+		{"functional-env-auto", true, "auto", true, true},
+		{"functional-env-empty", true, "", true, true},
+		{"functional-env-unknown", true, "invalid", true, false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveSendZCPolicy(tc.functional, tc.envVal)
-			if got != tc.want {
-				t.Fatalf("resolveSendZCPolicy(%v, %q) = %v, want %v", tc.functional, tc.envVal, got, tc.want)
+			gotEnabled, gotRec := resolveSendZCPolicy(tc.functional, tc.envVal)
+			if gotEnabled != tc.wantEnabled || gotRec != tc.wantRecognized {
+				t.Fatalf("resolveSendZCPolicy(%v, %q) = (%v, %v), want (%v, %v)",
+					tc.functional, tc.envVal, gotEnabled, gotRec, tc.wantEnabled, tc.wantRecognized)
 			}
 		})
 	}
@@ -152,6 +154,9 @@ func TestResolveSendZCPolicy(t *testing.T) {
 func TestProbeSendZCLiveLoopback(t *testing.T) {
 	res, reason := probeSendZC()
 	t.Logf("probeSendZC() live result: %v (%s), reason: %q", res, res.String(), reason)
+	if res == SendZCUnsupported {
+		t.Skipf("skipping: SEND_ZC unsupported on this kernel/runner (%s)", reason)
+	}
 	if res != SendZCCopyFallback {
 		t.Fatalf("expected loopback probe to report SendZCCopyFallback, got %v (%s)", res, res.String())
 	}

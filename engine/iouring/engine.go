@@ -1,6 +1,5 @@
 //go:build linux
 
-// Package iouring implements an engine backed by Linux io_uring.
 package iouring
 
 import (
@@ -95,7 +94,12 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 				cfg.Logger.Info("SEND_ZC probe result", "functional", false, "result", zcResult.String())
 			}
 		}
-		profile.SendZC = resolveSendZCPolicy(functional, os.Getenv("CELERIS_IOURING_SEND_ZC"))
+		envVal := os.Getenv("CELERIS_IOURING_SEND_ZC")
+		enabled, recognized := resolveSendZCPolicy(functional, envVal)
+		if !recognized {
+			cfg.Logger.Warn("unrecognized CELERIS_IOURING_SEND_ZC value, falling back to auto", "value", envVal)
+		}
+		profile.SendZC = enabled
 	}
 	if profile.FixedFiles {
 		if ok, ffReason := probeFixedFilesCached(); !ok {

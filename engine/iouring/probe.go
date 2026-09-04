@@ -83,10 +83,13 @@ const (
 	// SendZCBroken means the kernel accepts SEND_ZC but the notification CQE
 	// never arrives (e.g., ENA driver DMA completion bug).
 	SendZCBroken
-	// SendZCCopyFallback means SEND_ZC works but the kernel copies data instead
-	// of using DMA zero-copy. The notification arrives correctly. This happens
-	// on loopback or NICs without scatter-gather DMA. SEND_ZC is functional
-	// but provides no performance benefit over regular SEND.
+	// SendZCNoNotification means the kernel accepted SEND_ZC but the initial CQE
+	// was missing CQE_F_MORE, so no notification followed. Notification delivery
+	// was unobserved, so the feature cannot be treated as functional.
+	SendZCNoNotification
+	// SendZCCopyFallback means SEND_ZC opcode and notification delivery are functional,
+	// but the kernel copied data instead of using DMA zero-copy (expected on loopback
+	// or NICs without scatter-gather DMA).
 	SendZCCopyFallback
 	// SendZCTrueZeroCopy means SEND_ZC uses real DMA zero-copy. The notification
 	// arrives and reports actual zero-copy usage. This is the optimal case.
@@ -99,6 +102,8 @@ func (r SendZCProbeResult) String() string {
 		return "unsupported"
 	case SendZCBroken:
 		return "broken (notification missing)"
+	case SendZCNoNotification:
+		return "no notification (CQE_F_MORE missing)"
 	case SendZCCopyFallback:
 		return "copy fallback"
 	case SendZCTrueZeroCopy:
@@ -141,8 +146,12 @@ func probeSendZC() (SendZCProbeResult, string) {
 	}
 
 	var fd int
-	_ = rawConn.Control(func(f uintptr) { fd = int(f) })
-
+	if err := rawConn.Control(func(f uintptr) { fd = int(f) }); err != nil {
+		return SendZCUnsupported, "SyscallConn.Control failed: " + err.Error()
+	}
+	if fd <= 0 {
+		return SendZCUnsupported, fmt.Sprintf("invalid socket fd from Control: %d", fd)
+	}
 	ring, err := NewRing(4, 0, 0)
 	if err != nil {
 		return SendZCUnsupported, "NewRing failed: " + err.Error()
@@ -205,16 +214,16 @@ func probeSendZC() (SendZCProbeResult, string) {
 
 // parseSendZCResult evaluates the CQE outcomes from the SEND_ZC probe.
 // Factored out of probeSendZC so the evaluation logic can be verified
-// against synthetic CQEs across all four outcomes (celeris#465).
+// against synthetic CQEs across all outcomes (celeris#465).
 func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool, waitErr error, notifRes int32, notifFlags uint32) (SendZCProbeResult, string) {
 	if initialRes < 0 {
 		return SendZCUnsupported, fmt.Sprintf("kernel rejected SEND_ZC opcode: cqe.res=%d (likely -ENOSYS=-38 or -EINVAL=-22)", initialRes)
 	}
 	if initialFlags&0x02 == 0 {
-		return SendZCCopyFallback, "first CQE missing CQE_F_MORE flag (no notification will follow)"
+		return SendZCNoNotification, "first CQE missing CQE_F_MORE flag (no notification will follow)"
 	}
 	if waitErr != nil {
-		return SendZCBroken, "notification CQE wait timed out: " + waitErr.Error()
+		return SendZCBroken, "notification CQE wait failed: " + waitErr.Error()
 	}
 	if !notifArrived {
 		return SendZCBroken, "no notification CQE produced (waited 2s)"
@@ -236,20 +245,20 @@ func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool,
 //   - "off", "0", "false": force disabled.
 //   - "auto", "" (default): preserves current default behavior (enabled when functional probe
 //     passed). Final default decision pending cluster A/B fabric benchmark (celeris#465).
-func resolveSendZCPolicy(functional bool, envVal string) bool {
+//   - any other value: returns recognized=false and falls back to auto behavior.
+func resolveSendZCPolicy(functional bool, envVal string) (enabled, recognized bool) {
 	if !functional {
-		return false
+		return false, true
 	}
 	switch strings.ToLower(strings.TrimSpace(envVal)) {
 	case "1", "on", "true":
-		return true
+		return true, true
 	case "0", "off", "false":
-		return false
+		return false, true
 	case "auto", "":
-		// Default unchanged: enabled when functional probe passed.
-		return functional
+		return functional, true
 	default:
-		return functional
+		return functional, false
 	}
 }
 

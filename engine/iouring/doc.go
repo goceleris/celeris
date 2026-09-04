@@ -16,7 +16,9 @@
 //     (IORING_REGISTER_PBUF_RING + IORING_RECV_MULTISHOT). Set to "1" to enable. Disabled by default.
 //
 //   - CELERIS_IOURING_PBUF_COUNT: Overrides the auto-scaled provided-buffer-ring size per worker.
-//     Must be a power of 2 (e.g. 1024, 2048, 4096).
+//     Must be a power of 2 (e.g. 1024, 2048, 4096); values are clamped to [16, 32768].
+//     Non-power-of-2 values cause ring registration failure and automatic fallback to
+//     single-shot per-connection buffers.
 //
 //   - CELERIS_MAX_IOURING_TIER: Caps the detected io_uring tier at startup ("none", "base", "high",
 //     "optional"). Used primarily by CI to exercise lower-tier fallback paths on modern kernels.
