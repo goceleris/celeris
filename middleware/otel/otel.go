@@ -264,9 +264,15 @@ func New(config ...Config) celeris.HandlerFunc {
 				// this middleware (recovery ordered outside otel).
 				defer activeRequests.Add(spanCtx, -1, activeAttrSet)
 			}
-			err := c.Next()
-
+			// Inject the response trace context BEFORE the handler runs:
+			// celeris writes response headers to the wire as soon as the
+			// handler emits a body, so a header added after c.Next() would be
+			// silently dropped (the same defect as celeris#507 for the
+			// session cookie). The span context is fixed once the span has
+			// started, so injecting here is equivalent for the client.
 			propagators.Inject(spanCtx, carrier)
+
+			err := c.Next()
 
 			duration := time.Since(c.StartTime()).Seconds()
 			status := c.StatusCode()
@@ -302,9 +308,10 @@ func New(config ...Config) celeris.HandlerFunc {
 			return err
 		}
 
-		err := c.Next()
-
+		// See above: inject before the handler can write the body.
 		propagators.Inject(spanCtx, carrier)
+
+		err := c.Next()
 
 		status := c.StatusCode()
 
