@@ -104,6 +104,10 @@ type Config struct {
 
 	// SpecURL is a URL to an externally hosted spec file. When set,
 	// SpecContent is ignored and no /spec endpoint is registered.
+	//
+	// Scalar reads it from a URL attribute (data-url), where only relative,
+	// http and https URLs are supported; other schemes are neutralised
+	// by html/template. Swagger UI and ReDoc receive it as a JS string.
 	SpecURL string
 
 	// SpecFile is the original filename of the spec (e.g. "openapi.yaml").

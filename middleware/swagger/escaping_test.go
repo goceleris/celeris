@@ -3,6 +3,7 @@ package swagger
 import (
 	"encoding/json"
 	"html"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -18,8 +19,8 @@ import (
 // `\a`, which is not a JS/JSON escape) and U+2028 (a JS line terminator).
 const hostile = "x\"y'z</script>&\a end"
 
-// assetsVariants covers both Sprintf sites in every renderer: the CDN
-// template and the AssetsPath template.
+// assetsVariants covers both asset sources in every renderer: the CDN URLs
+// and the AssetsPath-derived URLs.
 var assetsVariants = []struct {
 	name       string
 	assetsPath string
@@ -72,6 +73,16 @@ func assertJSString(t *testing.T, body string, re *regexp.Regexp, want string) {
 	if got != want {
 		t.Fatalf("JS string literal %s decodes to %q, want %q", lit, got, want)
 	}
+}
+
+// dataURLAttr extracts the value of the Scalar data-url attribute.
+func dataURLAttr(t *testing.T, body string) string {
+	t.Helper()
+	m := dataURLRe.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("no data-url attribute in:\n%s", body)
+	}
+	return m[1]
 }
 
 // assertScriptBlocksBalanced asserts that no interpolated value terminated
@@ -137,24 +148,43 @@ func TestScalarEscapesDataURLAttribute(t *testing.T) {
 			if o, c := strings.Count(body, "<script"), strings.Count(body, "</script>"); o != c {
 				t.Fatalf("unbalanced script tags: %d <script vs %d </script> in:\n%s", o, c, body)
 			}
-			m := dataURLRe.FindStringSubmatch(body)
-			if m == nil {
-				t.Fatalf("no data-url attribute in:\n%s", body)
-			}
-			attr := m[1]
-			for _, raw := range []string{`"`, `'`, `<`, `>`} {
+			attr := dataURLAttr(t, body)
+			for _, raw := range []string{`"`, `'`, `<`, `>`, " ", "\a", "\u2028"} {
 				if strings.Contains(attr, raw) {
-					t.Fatalf("data-url attribute value %q contains raw %s", attr, raw)
+					t.Fatalf("data-url attribute value %q contains raw %q", attr, raw)
 				}
 			}
-			if got := html.UnescapeString(attr); got != hostile {
-				t.Fatalf("data-url attribute %q unescapes to %q, want %q", attr, got, hostile)
+			// data-url is a URL-typed attribute to html/template: characters
+			// that are not valid in a URL are percent-encoded and the result
+			// is then HTML-escaped, so the round trip is HTML entities first,
+			// percent-encoding second — exactly what a browser does before
+			// fetching the URL.
+			got, err := url.PathUnescape(html.UnescapeString(attr))
+			if err != nil {
+				t.Fatalf("data-url attribute %q is not valid percent-encoding: %v", attr, err)
 			}
-			// The adjacent data-configuration attribute keeps its existing
-			// html.EscapeString(json.Marshal(options)) escaping.
+			if got != hostile {
+				t.Fatalf("data-url attribute %q decodes to %q, want %q", attr, got, hostile)
+			}
+			// The adjacent data-configuration attribute keeps its
+			// HTML-attribute escaping of the marshalled options.
 			assertContains(t, body, `data-configuration='`+html.EscapeString(`{"theme":"default"}`)+`'`)
 			assertContains(t, body, "<title>"+html.EscapeString(hostile)+"</title>")
 		})
+	}
+}
+
+// TestScalarNeutralisesUnsafeSpecURLScheme pins the URL-attribute
+// semantics documented on Config.SpecURL: a scheme other than http(s)
+// never reaches the data-url attribute verbatim.
+func TestScalarNeutralisesUnsafeSpecURLScheme(t *testing.T) {
+	t.Parallel()
+	body := servePage(t, Config{
+		SpecURL:  "javascript:alert(1)",
+		Renderer: RendererScalar,
+	})
+	if attr := dataURLAttr(t, body); strings.Contains(strings.ToLower(attr), "javascript") {
+		t.Fatalf("data-url attribute %q carries the unsafe scheme", attr)
 	}
 }
 
