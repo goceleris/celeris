@@ -41,7 +41,6 @@ type sseCell struct {
 	name   string
 	engine celeris.EngineType
 	async  bool
-	native bool
 }
 
 // sseDisconnectCells returns every available native cell plus std as the
@@ -52,13 +51,13 @@ func sseDisconnectCells(t *testing.T) []sseCell {
 	var cells []sseCell
 	for _, kind := range sseNativeEngineKinds(t) {
 		cells = append(cells,
-			sseCell{kind.String() + "/async", kind, true, true},
-			sseCell{kind.String() + "/sync", kind, false, true},
+			sseCell{kind.String() + "/async", kind, true},
+			sseCell{kind.String() + "/sync", kind, false},
 		)
 	}
 	cells = append(cells,
-		sseCell{"std/async", celeris.Std, true, false},
-		sseCell{"std/sync", celeris.Std, false, false},
+		sseCell{"std/async", celeris.Std, true},
+		sseCell{"std/sync", celeris.Std, false},
 	)
 	return cells
 }
@@ -201,10 +200,9 @@ func readTicks(tb testing.TB, br *bufio.Reader, n int) {
 //     parks on client.Context().Done() (the bench refapp shape). Nothing
 //     but engine-driven cancellation can wake it, so this mode proves the
 //     engine → Client.Context() binding rather than write-error luck.
-//     Native cells only: on std, c.Context() is context.Background() too
-//     and no write ever fails while the handler is parked, a pre-existing
-//     gap outside celeris#494. Do NOT "fix" this test by adding std here
-//     without also giving std a disconnect signal.
+//     On std the signal is net/http's request context, exposed through
+//     the same SetWSDetachClose hook by engine/std/bridge.go, so std
+//     runs this mode as well.
 //
 // Half the clients close with SO_LINGER 0 (RST — exercises OnError via
 // ECONNRESET), half with a plain Close (FIN — exercises the recv-EOF path:
@@ -225,9 +223,6 @@ func TestClientDisconnectCancelsStream(t *testing.T) {
 	cells := sseDisconnectCells(t)
 	for _, mode := range modes {
 		for _, cell := range cells {
-			if mode.ctxOnly && !cell.native {
-				continue // see the doc comment: std has no ctx signal
-			}
 			t.Run(mode.name+"/"+cell.name, func(t *testing.T) {
 				runDisconnectCell(t, cell, mode.heartbeat, mode.ctxOnly, clients)
 			})

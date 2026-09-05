@@ -1310,8 +1310,10 @@ func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
 // May be called either before or after [Context.Detach] — the underlying
 // H1State.OnDetachClose field is just stored; the engine reads it when
 // firing the close. Installing it BEFORE Detach is preferred so a peer
-// RST landing in the Detach race window is not lost. No-op on engines
-// that do not support engine-integrated detached streams (e.g. H2).
+// RST landing in the Detach race window is not lost. On the std engine
+// the callback is backed by context.AfterFunc on the request context, so
+// it fires when the client connection closes or when ServeHTTP returns.
+// No-op on H2 streams.
 func (c *Context) SetWSDetachClose(fn func()) {
 	if c.stream.OnWSDetachClose != nil {
 		c.stream.OnWSDetachClose(fn)

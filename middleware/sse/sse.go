@@ -17,10 +17,10 @@ import (
 //
 // Handler MUST return when client.Context() is done or when Send returns
 // an error. On epoll/io_uring the engine cancels client.Context() as soon
-// as it detects the peer went away (celeris#494); on std a broken pipe
-// surfaces through Send (or the heartbeat). A handler that ignores both
-// keeps its goroutine and the detached celeris.Context alive for the life
-// of the process.
+// as it detects the peer went away (celeris#494); on std the request
+// context does the same and a broken pipe additionally surfaces through
+// Send (or the heartbeat). A handler that ignores both keeps its goroutine
+// and the detached celeris.Context alive for the life of the process.
 type Handler func(client *Client)
 
 // Client provides the API for sending SSE events to a connected client.
@@ -409,7 +409,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		// engine thread itself. SetWSDetachClose goes last because its
 		// setter publishes WSReady, whose only other effect is nil-ing
 		// PauseRecv/ResumeRecv in closeConn — which SSE never reads.
-		// Both are no-ops on std and on H2 streams (no OnWS* hooks).
+		// On std SetWSErrorHandler is a no-op and SetWSDetachClose is
+		// backed by net/http's request context (engine/std/bridge.go),
+		// so a client that goes away cancels the ctx there as well.
+		// Both are no-ops on H2 streams (no OnWS* hooks).
 		c.SetWSErrorHandler(func(_ error) { cancel() })
 		c.SetWSDetachClose(cancel)
 
