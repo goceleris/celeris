@@ -22,6 +22,30 @@
 // prevent session fixation), or [Session.SetIdleTimeout] to override the
 // per-session idle window ("remember me" flows).
 //
+// # When the cookie is emitted
+//
+// celeris puts the response headers on the wire the moment a handler calls
+// c.JSON, c.String, c.Blob or another body writer, so the session cookie
+// cannot be added after the handler returns. The middleware therefore emits
+// the Set-Cookie header (or, with a non-cookie [Extractor], the session-id
+// response header) at the FIRST of: a mutation ([Session.Set],
+// [Session.Delete], [Session.Clear], [Session.SetIdleTimeout]), an explicit
+// [Session.Save], [Session.Regenerate] (which re-emits with the new ID),
+// [Session.Destroy] (which emits the clearing cookie), or — when
+// [Config.SaveUnmodified] is set — before the handler runs for a fresh
+// session. Exactly one session Set-Cookie is ever present on a response.
+//
+// Mutate the session before writing the response body:
+//
+//	s := session.FromContext(c)
+//	s.Set("user", id)           // cookie goes on the response here
+//	return c.JSON(200, payload) // headers, cookie included, hit the wire
+//
+// A mutation made after the body was written still persists the session,
+// but no cookie can reach the client; the request is counted in
+// [DroppedCookies] (and validation.SessionCookieDrops under -tags=validation)
+// and the client starts a new session on its next request.
+//
 // [CookieExtractor], [HeaderExtractor], [QueryExtractor], and
 // [ChainExtractor] control where the session ID is read from. For
 // out-of-band access (admin tools, background jobs) use [NewHandler], which

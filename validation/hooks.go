@@ -16,3 +16,9 @@ package validation
 //     consistent makes the call-site grep a one-liner: any direct
 //     Counter.Add outside a validate*() function is a bug.
 func RecordPanic() { PanicCount.Add(1) }
+
+// RecordSessionCookieDrop increments [SessionCookieDrops]: the session
+// middleware had a session id (or clearing cookie) to send but the
+// handler had already written the response body, so no Set-Cookie could
+// reach the client. Same build-tag contract as RecordPanic.
+func RecordSessionCookieDrop() { SessionCookieDrops.Add(1) }

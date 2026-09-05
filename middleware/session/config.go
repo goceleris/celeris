@@ -149,7 +149,8 @@ type Config struct {
 	//
 	// WriteBehind has no effect on [Session.Destroy] (cookie/session removal
 	// stays synchronous) and is independent of the cookie write, which is
-	// emitted synchronously whenever the session is persisted (see SaveUnmodified).
+	// emitted synchronously at the first mutation of the request (see the
+	// package documentation and SaveUnmodified).
 	WriteBehind bool
 
 	// SaveUnmodified forces eager persistence of fresh, unmodified sessions.
@@ -157,6 +158,10 @@ type Config struct {
 	// and its cookie emitted if the handler modifies the session data, e.g. via
 	// [Session.Set], [Session.Delete], [Session.Clear], [Session.Regenerate],
 	// [Session.SetIdleTimeout], or explicit [Session.Save]).
+	//
+	// When true, a fresh session's cookie is put on the response before the
+	// handler runs, so it reaches the client regardless of whether — or when —
+	// the handler writes a body.
 	//
 	// Under the default (false), cookieless requests that do not mutate the
 	// session (crawlers, health checks, read-only API calls) never write to the
