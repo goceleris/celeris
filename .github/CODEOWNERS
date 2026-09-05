@@ -1,0 +1,14 @@
+# Code owners for goceleris/celeris.
+#
+# Every pull request needs an approving review from a code owner of the
+# files it touches before it can merge (see GOVERNANCE.md, "How changes
+# get merged"). The last matching pattern wins, so keep the catch-all
+# first and add narrower delegations below it.
+#
+# Syntax: https://docs.github.com/articles/about-code-owners
+
+* @FumingPower3925
+
+# Area delegation example — uncomment and adjust when a contributor
+# takes ownership of a subtree:
+# /middleware/ @FumingPower3925 @WdnLiu
