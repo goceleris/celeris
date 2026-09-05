@@ -229,9 +229,19 @@ type Worker struct {
 	cfg          resource.Config
 	ready        chan error
 	acceptPaused *atomic.Bool
-	wake         chan struct{}
-	wakeMu       sync.Mutex
-	suspended    atomic.Bool
+	// acceptRearmPending is set when prepareAccept could not place the
+	// accept SQE because the SQ ring was full. In multishot mode the
+	// listen socket has exactly one accept SQE in flight, re-armed only
+	// from handleAccept when a CQE arrives without F_MORE; if that re-arm
+	// is dropped nothing else ever arms accept again and this worker's
+	// SO_REUSEPORT listen socket goes deaf while the kernel keeps
+	// completing TCP handshakes into its backlog. The event loop retries
+	// the arm at the top of every iteration until it lands. Loop-thread
+	// only, like listenFD.
+	acceptRearmPending bool
+	wake               chan struct{}
+	wakeMu             sync.Mutex
+	suspended          atomic.Bool
 	// listenFDClosed signals that the worker has cancelled in-flight
 	// accept SQEs and closed its listen FD in response to acceptPaused
 	// being set. PauseAccept polls this so it only returns once the
@@ -551,6 +561,10 @@ func (w *Worker) run(ctx context.Context) {
 				w.logger.Error("submit after listen re-create", "worker", w.id, "err", err)
 			}
 		}
+
+		// A previous accept re-arm that hit a full SQ ring is retried here,
+		// before this iteration's submit, so it rides the same syscall.
+		w.rearmAcceptIfPending(paused)
 
 		var cqHead, cqTail uint32
 		if w.sqpoll {
@@ -3256,8 +3270,12 @@ func (w *Worker) handleH2Wakeup() {
 func (w *Worker) prepareAccept() {
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
+		// SQ ring full: remember, the loop retries next iteration once
+		// Submit has drained the ring (see acceptRearmPending).
+		w.acceptRearmPending = true
 		return
 	}
+	w.acceptRearmPending = false
 	if w.fixedFiles {
 		prepMultishotAcceptDirect(sqe, w.listenFD)
 	} else if w.tier.SupportsMultishotAccept() {
@@ -3266,6 +3284,16 @@ func (w *Worker) prepareAccept() {
 		prepAccept(sqe, w.listenFD, 0)
 	}
 	setSQEUserData(sqe, encodeUserData(udAccept, w.listenFD))
+}
+
+// rearmAcceptIfPending re-issues an accept arm that was dropped by
+// prepareAccept on a full SQ ring. No-op unless a drop is pending and the
+// worker still owns an un-paused listen socket.
+func (w *Worker) rearmAcceptIfPending(paused bool) {
+	if !w.acceptRearmPending || w.listenFD < 0 || paused {
+		return
+	}
+	w.prepareAccept()
 }
 
 // prepareRecv submits a recv SQE for cs. Uses multishot recv with
