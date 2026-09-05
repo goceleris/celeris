@@ -1,6 +1,7 @@
 package std
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -87,7 +88,21 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := &stdResponseWriter{w: w}
 	s.ResponseWriter = rw
 
-	if err := b.handler.HandleStream(r.Context(), s); err != nil {
+	// celeris#494 parity: the native engines tell detached-stream
+	// middleware (SSE, WebSocket) that the peer went away through
+	// H1State.OnDetachClose. On std the equivalent signal is r.Context(),
+	// which net/http cancels when the client connection closes (and at the
+	// latest when ServeHTTP returns). Expose it through the same
+	// SetWSDetachClose hook so an SSE handler that only watches
+	// client.Context() — heartbeat disabled, no Send to fail — is woken on
+	// std too. OnDetach stays nil (EngineSupportsAsyncDetach() stays false,
+	// SSE keeps running inline here) and OnWSSetError stays nil. The
+	// AfterFunc registration is dropped when rctx ends, so nothing
+	// outlives the request; s is pooled and Release() nils the hook.
+	rctx := r.Context()
+	s.OnWSDetachClose = func(fn func()) { context.AfterFunc(rctx, fn) }
+
+	if err := b.handler.HandleStream(rctx, s); err != nil {
 		b.engine.metrics.errCount.Add(1)
 		if !rw.flushed {
 			http.Error(w, "handler error", http.StatusInternalServerError)
