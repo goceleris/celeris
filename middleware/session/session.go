@@ -19,20 +19,27 @@ import (
 // ErrSessionDestroyed is returned when Save is called after Destroy.
 var ErrSessionDestroyed = errors.New("session: cannot save a destroyed session")
 
-// droppedCookies counts requests on which the session cookie could not be
-// emitted because the response body had already been written when the
-// session was first mutated or destroyed. See [DroppedCookies].
+// droppedCookies counts requests on which a session cookie that would have
+// changed what the client holds could not be emitted because the response
+// body had already been written. See [DroppedCookies].
 var droppedCookies atomic.Uint64
 
 // DroppedCookies returns the number of requests on which the middleware had
-// a session cookie (a new session id, a clearing cookie, or the session-id
-// response header in extractor mode) to send but could not, because the
-// handler had already written the response body when the session was first
-// mutated. celeris puts the response headers on the wire the moment a
-// handler calls c.JSON/String/Blob, so nothing added afterwards can reach
+// a session cookie that would have CHANGED what the client holds — a new
+// session id (fresh session or [Session.Regenerate]) or the clearing cookie
+// ([Session.Destroy]); the session-id response header in extractor mode —
+// to send but could not, because the handler had already written the
+// response body. celeris puts the response headers on the wire the moment
+// a handler calls c.JSON/String/Blob, so nothing added afterwards can reach
 // the client. Such a request still persists (or deletes) the session
-// exactly as usual, but the client never learns the session id and starts
-// a new session on its next request; the orphaned record idles out.
+// exactly as usual, but the client never learns the new id (or keeps the
+// destroyed one) and starts a new session on its next request; an orphaned
+// record idles out.
+//
+// Mutating a LOADED session after the body was written is not counted: the
+// client already holds exactly the cookie the middleware would re-send, and
+// the data is persisted under that same id, so nothing is orphaned — only
+// the cookie's Max-Age refresh is lost for that request.
 //
 // Mutate the session before writing the response body. The counter is
 // advanced once per affected request; a validation build (-tags=validation)
@@ -93,6 +100,11 @@ type Session struct {
 	emittedID  string // session id the response currently carries; "" = none
 	clearSent  bool   // the clearing cookie is already on the response
 	cookieDrop bool   // this request already counted a dropped cookie
+	// presentedID is the valid session id the request arrived with (the
+	// cookie the client already holds), "" for a fresh session. A cookie
+	// carrying this id only refreshes Max-Age: failing to send it is not a
+	// drop, and a failed save does not retract it.
+	presentedID string
 }
 
 // returnToPool is the cleanup hook registered with c.OnRelease on the
@@ -128,6 +140,7 @@ func (s *Session) returnToPool() {
 	s.emittedID = ""
 	s.clearSent = false
 	s.cookieDrop = false
+	s.presentedID = ""
 	sessionPool.Put(s)
 }
 
@@ -155,12 +168,15 @@ func (s *Session) emitSessionCookie() {
 // the deletion cookie (Max-Age=0). A session cookie emitted earlier in the
 // request (Regenerate after a mutation, Destroy after an early emission) is
 // replaced, never duplicated. When the response is already written nothing
-// can reach the client any more: the drop is counted once per request and
-// the call is otherwise a no-op — mutating after the body is not an error.
+// can reach the client any more and the call is a no-op — mutating after the
+// body is not an error. It counts as a drop (once per request) only when the
+// undelivered header would have changed what the client holds: a new id or
+// the clearing cookie. Re-sending the id the request arrived with merely
+// refreshes Max-Age; losing that is harmless, so it is not counted.
 func (s *Session) emitCookie(value string, clearing bool) {
 	c := s.releaseCtx
 	if c.IsWritten() {
-		if !s.cookieDrop {
+		if !s.cookieDrop && (clearing || value != s.presentedID) {
 			s.cookieDrop = true
 			droppedCookies.Add(1)
 			validation.RecordSessionCookieDrop()
@@ -189,20 +205,48 @@ func (s *Session) emitCookie(value string, clearing bool) {
 	s.clearSent = clearing
 }
 
+// retractCookie takes back a session cookie (or session-id header) emitted
+// earlier in the request whose id the store never received, because the
+// post-chain save failed. Without it the error response would hand the
+// client an id that does not exist server-side; with it the failed response
+// carries no session cookie, exactly as it did before the cookie moved to
+// the first mutation. A cookie carrying the id the request arrived with is
+// left alone — that id is still valid in the store and the client holds it
+// anyway — and nothing can be taken back once the headers are on the wire.
+func (s *Session) retractCookie() {
+	c := s.releaseCtx
+	if s.emittedID == "" || s.emittedID == s.presentedID || c.IsWritten() {
+		return
+	}
+	s.removeSessionCookie(c)
+	s.emittedID = ""
+}
+
 // removeSessionCookie drops the previously emitted Set-Cookie for the
-// session cookie name from the pending response headers. Other Set-Cookie
+// session cookie name (or, in header-extractor mode, the session-id
+// response header) from the pending response headers. Other Set-Cookie
 // headers (CSRF, application cookies) are left untouched. This is the rare
-// path (a second emission in one request), so it rebuilds the header list
-// through SetResponseHeaders rather than mutating the slice ResponseHeaders
-// returns.
+// path (a second emission in one request, or a retraction after a failed
+// save), so it rebuilds the header list through SetResponseHeaders rather
+// than mutating the slice ResponseHeaders returns.
 func (s *Session) removeSessionCookie(c *celeris.Context) {
 	hdrs := c.ResponseHeaders()
-	prefix := s.cookieName + "="
 	idx := -1
-	for i, h := range hdrs {
-		if h[0] == "set-cookie" && strings.HasPrefix(h[1], prefix) {
-			idx = i
-			break
+	if s.useCookie {
+		prefix := s.cookieName + "="
+		for i, h := range hdrs {
+			if h[0] == "set-cookie" && strings.HasPrefix(h[1], prefix) {
+				idx = i
+				break
+			}
+		}
+	} else {
+		key := strings.ToLower(s.cookieName) // SetHeader lowercases keys
+		for i, h := range hdrs {
+			if h[0] == key {
+				idx = i
+				break
+			}
 		}
 	}
 	if idx < 0 {
@@ -649,6 +693,7 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 		sess.emittedID = ""
 		sess.clearSent = false
 		sess.cookieDrop = false
+		sess.presentedID = ""
 
 		// Register cleanup callback to return session to pool on all exit
 		// paths — including panics (issue #12: pool leak on error paths).
@@ -717,6 +762,7 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 			if data != nil {
 				sess.id = sid
 				sess.data = data
+				sess.presentedID = sid
 				loaded = true
 			}
 		}
@@ -772,6 +818,9 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 			}
 			buf, encErr := store.EncodeJSON(sess.data)
 			if encErr != nil {
+				// Nothing was persisted: an id emitted at the first
+				// mutation must not reach the client (see retractCookie).
+				sess.retractCookie()
 				if chainErr != nil {
 					return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", encErr, chainErr))
 				}
@@ -793,9 +842,13 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 				if saveErr != nil {
 					// Issue #11: wrap chainErr with save error so neither
 					// is swallowed. A cookie emitted at the first mutation
-					// stays on the (error) response; it points at a session
-					// the store never received, so the client's next request
-					// simply starts fresh.
+					// would point at a session the store never received;
+					// take it back so the failed response carries no
+					// session cookie, as before early emission. (The
+					// write-behind branch above cannot fail here: its store
+					// errors surface later through ErrorHandler, and the
+					// cookie stays, by design.)
+					sess.retractCookie()
 					if chainErr != nil {
 						return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", saveErr, chainErr))
 					}

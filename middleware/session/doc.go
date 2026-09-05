@@ -42,9 +42,23 @@
 //	return c.JSON(200, payload) // headers, cookie included, hit the wire
 //
 // A mutation made after the body was written still persists the session,
-// but no cookie can reach the client; the request is counted in
-// [DroppedCookies] (and validation.SessionCookieDrops under -tags=validation)
-// and the client starts a new session on its next request.
+// but no cookie can reach the client. When that cookie would have changed
+// what the client holds — a fresh session's id, a regenerated id, or the
+// clearing cookie — the request is counted in [DroppedCookies] (and
+// validation.SessionCookieDrops under -tags=validation) and the client
+// starts a new session on its next request. Mutating a loaded session late
+// is not counted: the client already holds that id and the data is saved
+// under it; only the cookie's Max-Age refresh is lost.
+//
+// When the post-handler save fails (store.Set or JSON encoding), the error
+// goes to [Config.ErrorHandler] and any session cookie emitted earlier in the
+// request for an id the store never received — a fresh session's, or the
+// new id after [Session.Regenerate] — is taken back off the response, so
+// the failed response carries no session cookie, exactly as it did when the
+// cookie was emitted after the save. A loaded session's own id stays on the
+// response: it is still valid server-side. With [Config.WriteBehind] the
+// save cannot fail synchronously (the store error reaches ErrorHandler
+// later, with a nil Context) and the cookie stays.
 //
 // [CookieExtractor], [HeaderExtractor], [QueryExtractor], and
 // [ChainExtractor] control where the session ID is read from. For

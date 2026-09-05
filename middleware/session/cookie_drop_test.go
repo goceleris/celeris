@@ -86,3 +86,59 @@ func TestMutationAfterBodyWrittenDropsCookieOnce(t *testing.T) {
 	testutil.AssertNoError(t, ctx3.Next())
 	assertSingleSessionCookie(t, rec3.Headers, sid3)
 }
+
+// A LOADED session mutated after the body was written is not a drop: the
+// client already holds exactly the cookie the middleware would re-send and
+// the data is persisted under that same id, so nothing is orphaned. Only a
+// late change of id (Regenerate) or a late Destroy counts.
+func TestLoadedSessionLateMutationIsNotADrop(t *testing.T) {
+	kv := NewMemoryStore()
+	mw := New(Config{Store: kv})
+	sid := hexID(0x5e)
+	saveMap(t, kv, sid, map[string]any{"user": "alice", absExpKey: nowNano()}, 0)
+
+	before := DroppedCookies()
+	touch := func(c *celeris.Context) error {
+		if err := c.JSON(200, map[string]string{"user": "alice"}); err != nil {
+			return err
+		}
+		s := FromContext(c)
+		s.Set("last_seen", "now") // refresh-after-write: the client holds sid already
+		s.SetIdleTimeout(0)
+		return s.Save()
+	}
+	ctx, rec := celeristest.NewContextT(t, "GET", "/me",
+		celeristest.WithCookie("celeris_session", sid),
+		celeristest.WithHandlers(mw, touch))
+	testutil.AssertNoError(t, ctx.Next())
+	if scs := headerValues(rec.Headers, "set-cookie"); len(scs) != 0 {
+		t.Fatalf("Set-Cookie reached the wire after the body was written: %q", scs)
+	}
+	if got := DroppedCookies() - before; got != 0 {
+		t.Fatalf("DroppedCookies advanced by %d for a loaded-session refresh, want 0", got)
+	}
+	data, ok := loadMap(t, kv, sid)
+	if !ok || data["last_seen"] != "now" || data["user"] != "alice" {
+		t.Fatalf("late mutation not persisted under the presented id %s: %v (ok=%v)", sid, data, ok)
+	}
+
+	// Regenerate after the write changes the id the client should hold:
+	// that IS a drop (the client keeps a cookie for a deleted session).
+	before = DroppedCookies()
+	rotate := func(c *celeris.Context) error {
+		if err := c.JSON(200, "ok"); err != nil {
+			return err
+		}
+		return FromContext(c).Regenerate()
+	}
+	ctx2, _ := celeristest.NewContextT(t, "POST", "/login",
+		celeristest.WithCookie("celeris_session", sid),
+		celeristest.WithHandlers(mw, rotate))
+	testutil.AssertNoError(t, ctx2.Next())
+	if got := DroppedCookies() - before; got != 1 {
+		t.Fatalf("DroppedCookies advanced by %d after a late Regenerate, want exactly 1", got)
+	}
+	if _, ok := loadMap(t, kv, sid); ok {
+		t.Fatalf("old session %s still in store after Regenerate", sid)
+	}
+}
