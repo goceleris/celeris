@@ -296,6 +296,22 @@ func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (
 	return cur, nil
 }
 
+// Sweep bounds (celeris#493). A shard is never ranged in full under its
+// lock: every lock acquisition scans at most sweepBatch entries, and a shard
+// pass runs at most sweepMaxRounds such rounds, stopping early once a round
+// finds fewer than sweepMinHitPct percent expired entries. Go map iteration
+// starts at a random bucket on every range, so successive bounded rounds
+// sample different regions and expiry converges across passes; Get and Set
+// also expire lazily. The bound is the invariant: on the 2026-09-04 soak the
+// unbounded range over a multi-million-entry shard held the lock for seconds
+// and every io_uring worker, calling Set inline from the session middleware,
+// stalled behind it (new connections unserved for up to 10 s).
+const (
+	sweepBatch     = 2048
+	sweepMaxRounds = 64
+	sweepMinHitPct = 5
+)
+
 func (m *MemoryKV) cleanup(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -311,16 +327,38 @@ func (m *MemoryKV) cleanup(ctx context.Context, interval time.Duration) {
 		case now := <-ticker.C:
 			nowNano := now.UnixNano()
 			for range perTick {
-				s := &m.shards[shardIdx%len(m.shards)]
+				m.sweepShard(&m.shards[shardIdx%len(m.shards)], nowNano)
 				shardIdx++
-				s.mu.Lock()
-				for k, it := range s.items {
-					if it.expiry > 0 && nowNano > it.expiry {
-						delete(s.items, k)
-					}
-				}
-				s.mu.Unlock()
 			}
 		}
 	}
+}
+
+// sweepShard expires entries of one shard in bounded rounds (see the sweep
+// constants). Returns the number of entries deleted.
+func (m *MemoryKV) sweepShard(s *memShard, nowNano int64) int {
+	deleted := 0
+	for round := 0; round < sweepMaxRounds; round++ {
+		scanned, hits := 0, 0
+		s.mu.Lock()
+		for k, it := range s.items {
+			if scanned >= sweepBatch {
+				break
+			}
+			scanned++
+			if it.expiry > 0 && nowNano > it.expiry {
+				delete(s.items, k)
+				hits++
+			}
+		}
+		s.mu.Unlock()
+		deleted += hits
+		if scanned < sweepBatch || hits*100 < scanned*sweepMinHitPct {
+			// Shard exhausted in one round, or too few expired entries to
+			// justify another lock acquisition now; the next tick continues.
+			break
+		}
+		runtime.Gosched()
+	}
+	return deleted
 }

@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"math"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -159,6 +160,18 @@ func (l *slidingWindowLimiter) advanceWindow(w *swBucket, now int64) {
 	}
 }
 
+// Sweep bounds (celeris#493): a limiter shard is never ranged in full under
+// its lock. Each lock acquisition scans at most sweepBatch entries; a shard
+// pass runs at most sweepMaxRounds rounds and stops early once a round finds
+// fewer than sweepMinHitPct percent evictable entries. Go map iteration starts
+// at a random bucket per range, so rounds sample different regions and
+// eviction converges across passes. Mirrors middleware/store.MemoryKV.
+const (
+	sweepBatch     = 2048
+	sweepMaxRounds = 64
+	sweepMinHitPct = 5
+)
+
 func (l *slidingWindowLimiter) cleanup(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -178,13 +191,27 @@ func (l *slidingWindowLimiter) cleanup(ctx context.Context, interval time.Durati
 				s := &l.shards[shardIdx%len(l.shards)]
 				// Wrap shardIdx to avoid overflow on 32-bit (issue #12).
 				shardIdx = (shardIdx + 1) % len(l.shards)
-				s.mu.Lock()
-				for k, w := range s.windows {
-					if w.windowStart < expiry && w.currCount == 0 && w.prevCount == 0 {
-						delete(s.windows, k)
+				// Bounded rounds (celeris#493): never range a whole shard
+				// under its lock; see sweepBatch / sweepMaxRounds.
+				for round := 0; round < sweepMaxRounds; round++ {
+					scanned, hits := 0, 0
+					s.mu.Lock()
+					for k, w := range s.windows {
+						if scanned >= sweepBatch {
+							break
+						}
+						scanned++
+						if w.windowStart < expiry && w.currCount == 0 && w.prevCount == 0 {
+							delete(s.windows, k)
+							hits++
+						}
 					}
+					s.mu.Unlock()
+					if scanned < sweepBatch || hits*100 < scanned*sweepMinHitPct {
+						break
+					}
+					runtime.Gosched()
 				}
-				s.mu.Unlock()
 			}
 		}
 	}
@@ -299,13 +326,27 @@ func (l *shardedLimiter) cleanup(ctx context.Context, interval time.Duration) {
 				s := &l.shards[shardIdx%len(l.shards)]
 				// Wrap shardIdx to avoid overflow on 32-bit (issue #12).
 				shardIdx = (shardIdx + 1) % len(l.shards)
-				s.mu.Lock()
-				for k, b := range s.buckets {
-					if b.lastFill < expiry && b.tokens >= float64(l.burst) {
-						delete(s.buckets, k)
+				// Bounded rounds (celeris#493), same shape as the sliding
+				// window sweep above.
+				for round := 0; round < sweepMaxRounds; round++ {
+					scanned, hits := 0, 0
+					s.mu.Lock()
+					for k, b := range s.buckets {
+						if scanned >= sweepBatch {
+							break
+						}
+						scanned++
+						if b.lastFill < expiry && b.tokens >= float64(l.burst) {
+							delete(s.buckets, k)
+							hits++
+						}
 					}
+					s.mu.Unlock()
+					if scanned < sweepBatch || hits*100 < scanned*sweepMinHitPct {
+						break
+					}
+					runtime.Gosched()
 				}
-				s.mu.Unlock()
 			}
 		}
 	}
