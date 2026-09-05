@@ -12,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
 	"github.com/goceleris/celeris/driver/postgres"
+	"github.com/goceleris/celeris/middleware/session"
 	"github.com/goceleris/celeris/middleware/store"
 )
 
@@ -435,5 +438,38 @@ func TestEnsureSchema_SkipsCreateWhenObjectsExist_Integration(t *testing.T) {
 	}
 	if !seen["ensure_schema:done"] {
 		t.Errorf("expected done phase, got: %v", phases)
+	}
+}
+
+// celeris#487: cookieless read-only requests must leave the store empty.
+func TestCookielessReadOnlyLeavesStoreEmpty_Integration(t *testing.T) {
+	pool, s := runWithPG(t)
+	mw := session.New(session.Config{Store: s})
+	handler := func(c *celeris.Context) error {
+		sess := session.FromContext(c)
+		_, _ = sess.Get("missing")
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	for range 100 {
+		ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+		if err := ctx.Next(); err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range ctx.ResponseHeaders() {
+			if h[0] == "set-cookie" {
+				t.Fatalf("expected no set-cookie header, got %q", h[1])
+			}
+		}
+	}
+
+	var count int64
+	row := pool.QueryRow(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", s.table))
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected postgres session store to be empty, got %d rows", count)
 	}
 }

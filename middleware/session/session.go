@@ -161,9 +161,17 @@ func (s *Session) Clear() {
 }
 
 // ID returns the session identifier.
+//
+// Under default lazy session creation ([Config.SaveUnmodified]=false), a fresh
+// session's ID is provisional until the session is modified (or explicitly saved);
+// if the request completes without writing, the ID is never stored or sent to
+// the client (celeris#487).
 func (s *Session) ID() string { return s.id }
 
-// IsFresh returns true if this is a newly created session (no prior cookie).
+// IsFresh returns true if this is a newly created session (no prior valid cookie).
+//
+// When true under default lazy session creation, the session remains provisional
+// and will not be persisted unless modified during the request.
 func (s *Session) IsFresh() bool { return s.fresh }
 
 // Keys returns a sorted list of all user-visible keys in the session data.
@@ -205,7 +213,15 @@ func (s *Session) Save() error {
 	if err != nil {
 		return err
 	}
-	return s.store.Set(s.ctx, s.id, buf, s.expiry)
+	expiry := s.expiry
+	if s.idleOverride > 0 {
+		expiry = s.idleOverride
+	}
+	if err := s.store.Set(s.ctx, s.id, buf, expiry); err != nil {
+		return err
+	}
+	s.modified = true
+	return nil
 }
 
 // Destroy invalidates the session by clearing data and deleting it from
@@ -595,7 +611,7 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 			} else {
 				c.SetHeader(cookieName, "")
 			}
-		} else if sess.modified || sess.fresh {
+		} else if sess.modified || (sess.fresh && cfg.SaveUnmodified) {
 			expiry := idleTimeout
 			if sess.idleOverride > 0 {
 				expiry = sess.idleOverride

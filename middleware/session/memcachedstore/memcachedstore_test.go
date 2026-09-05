@@ -6,8 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/celeristest"
 	celmc "github.com/goceleris/celeris/driver/memcached"
 	"github.com/goceleris/celeris/middleware/internal/fakememcached"
+	"github.com/goceleris/celeris/middleware/session"
 	"github.com/goceleris/celeris/middleware/store"
 )
 
@@ -70,4 +73,33 @@ func TestPrefixIsolation(t *testing.T) {
 func TestInterfaceConformance(t *testing.T) {
 	c, _ := newTestClient(t)
 	var _ store.KV = New(c)
+}
+
+// celeris#487: cookieless read-only requests must leave the store empty.
+func TestCookielessReadOnlyLeavesStoreEmpty(t *testing.T) {
+	c, srv := newTestClient(t)
+	st := New(c)
+	mw := session.New(session.Config{Store: st})
+	handler := func(c *celeris.Context) error {
+		s := session.FromContext(c)
+		_, _ = s.Get("missing")
+		return nil
+	}
+	chain := []celeris.HandlerFunc{mw, handler}
+
+	for range 100 {
+		ctx, _ := celeristest.NewContextT(t, "GET", "/", celeristest.WithHandlers(chain...))
+		if err := ctx.Next(); err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range ctx.ResponseHeaders() {
+			if h[0] == "set-cookie" {
+				t.Fatalf("expected no set-cookie header, got %q", h[1])
+			}
+		}
+	}
+
+	if data := srv.Data(); len(data) != 0 {
+		t.Fatalf("expected memcached store to be empty, got %d entries: %v", len(data), data)
+	}
 }
