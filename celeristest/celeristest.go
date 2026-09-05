@@ -72,7 +72,12 @@ type recorderWriter struct {
 
 func (w *recorderWriter) WriteResponse(_ *stream.Stream, status int, headers [][2]string, body []byte) error {
 	w.rec.StatusCode = status
-	w.rec.Headers = headers
+	// Snapshot the headers instead of retaining the slice: headers aliases
+	// the Context's inline header buffer, which keeps being mutated after
+	// the write (a middleware calling SetCookie/SetHeader post-chain lands
+	// in the same backing array). Without the copy the recorder reported
+	// headers that never reached the wire — and overwrote ones that did.
+	w.rec.Headers = append(w.rec.Headers[:0], headers...)
 	w.rec.Body = append(w.rec.Body[:0], body...)
 	return nil
 }
