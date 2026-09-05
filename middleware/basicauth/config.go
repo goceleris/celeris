@@ -35,15 +35,18 @@ type Config struct {
 	// HashedUsers maps usernames to opaque hash strings. The format is
 	// determined by HashedUsersFunc — bcrypt's $2y$..., argon2id's $argon2..,
 	// scrypt, etc. HashedUsersFunc is REQUIRED whenever HashedUsers is
-	// non-empty; basicauth.New() panics otherwise. There is no built-in
-	// password-hash default because all general-purpose hashes (SHA-2,
+	// non-empty, with one exception: when every value was produced by
+	// [HashPasswordPBKDF2] (tag "pbkdf2-sha256$"), [VerifyPassword] is
+	// wired in automatically. basicauth.New() panics otherwise. There is
+	// no fast-hash default because all general-purpose hashes (SHA-2,
 	// SHA-3, BLAKE2) are too fast to safely store credentials with.
 	HashedUsers map[string]string
 
 	// HashedUsersFunc receives the stored hash string and the plaintext
-	// candidate; returns true on match. Required when HashedUsers is set.
-	// Callers typically wrap bcrypt.CompareHashAndPassword or
-	// argon2.IDKey + subtle.ConstantTimeCompare.
+	// candidate; returns true on match. Required when HashedUsers is set
+	// (unless all hashes are pbkdf2-sha256, see HashedUsers). Callers
+	// typically pass [VerifyPassword] or wrap bcrypt.CompareHashAndPassword
+	// or argon2.IDKey + subtle.ConstantTimeCompare.
 	//
 	// IMPORTANT: The function MUST take constant time for any input,
 	// including empty or invalid hash strings. For bcrypt, this means
@@ -105,11 +108,18 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.Validator == nil && cfg.ValidatorWithContext == nil && len(cfg.HashedUsers) > 0 {
 		if cfg.HashedUsersFunc == nil {
-			// SHA-256 is fast — adversaries can crack it on commodity GPUs
-			// at billions of guesses per second. The default has been
-			// removed so callers must wire bcrypt / scrypt / argon2 (or
-			// equivalent) explicitly. See package docs for an example.
-			panic("basicauth: HashedUsers requires HashedUsersFunc (use bcrypt or argon2; SHA-256 is not credential-grade)")
+			if !allPBKDF2(cfg.HashedUsers) {
+				// SHA-256 is fast — adversaries can crack it on commodity
+				// GPUs at billions of guesses per second. There is no
+				// fast-hash default: callers must wire VerifyPassword,
+				// bcrypt / scrypt / argon2 (or equivalent) explicitly.
+				// See package docs for the migration path.
+				panic("basicauth: HashedUsers requires HashedUsersFunc unless every hash is pbkdf2-sha256 " +
+					"(use HashPasswordPBKDF2 + VerifyPassword, bcrypt, or argon2; plain SHA-256 is not credential-grade)")
+			}
+			// Every hash is a slow, salted KDF we produced ourselves, so a
+			// built-in verifier is safe here.
+			cfg.HashedUsersFunc = VerifyPassword
 		}
 		hashCopy := make(map[string]string, len(cfg.HashedUsers))
 		for u, h := range cfg.HashedUsers {
@@ -142,11 +152,13 @@ func hmacSHA256(key, data []byte) []byte {
 
 // HashPassword returns the hex-encoded SHA-256 hash of password.
 //
-// DEPRECATED: SHA-256 is not credential-grade — adversaries can crack it
-// at billions of guesses per second on commodity GPUs. Use bcrypt or
-// argon2 with [Config.HashedUsersFunc] instead. This helper is retained
-// for backwards-compatibility but may be removed in a future major
-// release.
+// Deprecated: an unsalted, fast SHA-256 digest is not a credential-storage
+// hash — identical passwords share a digest and it is brute-forceable at
+// GPU speed (CodeQL go/weak-sensitive-data-hashing, celeris#503). Use
+// [HashPasswordPBKDF2] to produce new hashes; [VerifyPassword] accepts both
+// formats so existing stores can migrate one entry at a time. This helper's
+// behaviour is frozen for backwards-compatibility and it may be removed in
+// a future major release.
 func HashPassword(password string) string {
 	h := sha256.Sum256([]byte(password))
 	return hex.EncodeToString(h[:])
