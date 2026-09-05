@@ -22,6 +22,22 @@ func marshalOptions(opts map[string]any) string {
 	return string(b)
 }
 
+// jsString renders s as a JavaScript string literal safe to embed inside an
+// inline <script> block. json.Marshal is the context-correct escaper here:
+// a JSON string is a valid JS string literal, and Go's encoder escapes '<',
+// '>' and '&' (so "</script>" cannot terminate the block) as well as U+2028
+// and U+2029 (JS line terminators). Go's %q is NOT suitable: it leaves
+// "</script>" intact and emits escapes JS lacks (\a, \x, \U).
+func jsString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		// json.Marshal of a string cannot fail (invalid UTF-8 is replaced
+		// with U+FFFD); keep a safe fallback anyway.
+		return `""`
+	}
+	return string(b)
+}
+
 // New creates a swagger middleware that serves an OpenAPI spec viewer.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
@@ -117,7 +133,7 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 
 	var oauth2Redirect string
 	if ui.OAuth2RedirectURL != "" {
-		oauth2Redirect = fmt.Sprintf(",\n  oauth2RedirectUrl: %q", ui.OAuth2RedirectURL)
+		oauth2Redirect = fmt.Sprintf(",\n  oauth2RedirectUrl: %s", jsString(ui.OAuth2RedirectURL))
 	}
 
 	var oauth2Init string
@@ -125,19 +141,19 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		oa := ui.OAuth2
 		var oaParts []string
 		if oa.ClientID != "" {
-			oaParts = append(oaParts, fmt.Sprintf("clientId: %q", oa.ClientID))
+			oaParts = append(oaParts, "clientId: "+jsString(oa.ClientID))
 		}
 		if oa.UsePKCE {
 			oaParts = append(oaParts, "usePkceWithAuthorizationCodeGrant: true")
 		}
 		if oa.Realm != "" {
-			oaParts = append(oaParts, fmt.Sprintf("realm: %q", oa.Realm))
+			oaParts = append(oaParts, "realm: "+jsString(oa.Realm))
 		}
 		if oa.AppName != "" {
-			oaParts = append(oaParts, fmt.Sprintf("appName: %q", oa.AppName))
+			oaParts = append(oaParts, "appName: "+jsString(oa.AppName))
 		}
 		if len(oa.Scopes) > 0 {
-			oaParts = append(oaParts, fmt.Sprintf("scopes: %q", strings.Join(oa.Scopes, " ")))
+			oaParts = append(oaParts, "scopes: "+jsString(strings.Join(oa.Scopes, " ")))
 		}
 		oauth2Init = fmt.Sprintf("\nui.initOAuth({%s});", strings.Join(oaParts, ", "))
 	}
@@ -156,11 +172,11 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 <script src="%s"></script>
 <script>
 const ui = SwaggerUIBundle({
-  url: %q,
+  url: %s,
   dom_id: "#swagger-ui",
   presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
   layout: "StandaloneLayout",
-  docExpansion: %q,
+  docExpansion: %s,
   deepLinking: %v,
   persistAuthorization: %v,
   defaultModelsExpandDepth: %d%s
@@ -168,7 +184,7 @@ const ui = SwaggerUIBundle({
 </script>
 </body>
 </html>`, html.EscapeString(ui.Title), cssURL, bundleURL, presetURL,
-		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization,
+		jsString(specURL), jsString(ui.DocExpansion), ui.DeepLinking, ui.PersistAuthorization,
 		depth, oauth2Redirect, oauth2Init)
 }
 
@@ -179,16 +195,20 @@ func buildScalarPage(cfg Config, specURL string) string {
 	if scalarOpts == nil {
 		scalarOpts = map[string]any{"theme": "default"}
 	}
+	// Both data-* values are HTML attribute values: html.EscapeString is the
+	// context-correct escaper (Go's %q would leave '&' raw and emit \" which
+	// HTML does not honour).
+	dataURL := html.EscapeString(specURL)
 	dataCfg := html.EscapeString(marshalOptions(scalarOpts))
 
 	var scriptTag string
 	if cfg.AssetsPath != "" {
 		base := strings.TrimRight(cfg.AssetsPath, "/")
-		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='%s'></script>
-<script src="%s/standalone.min.js"></script>`, specURL, dataCfg, html.EscapeString(base))
+		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url="%s" data-configuration='%s'></script>
+<script src="%s/standalone.min.js"></script>`, dataURL, dataCfg, html.EscapeString(base))
 	} else {
-		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='%s'></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>`, specURL, dataCfg)
+		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url="%s" data-configuration='%s'></script>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>`, dataURL, dataCfg)
 	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
@@ -227,8 +247,8 @@ func buildReDocPage(cfg Config, specURL string) string {
 <div id="redoc-container"></div>
 <script src="%s"></script>
 <script>
-Redoc.init(%q, %s, document.getElementById("redoc-container"));
+Redoc.init(%s, %s, document.getElementById("redoc-container"));
 </script>
 </body>
-</html>`, html.EscapeString(ui.Title), jsURL, specURL, opts)
+</html>`, html.EscapeString(ui.Title), jsURL, jsString(specURL), opts)
 }
