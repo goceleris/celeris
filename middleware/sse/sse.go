@@ -499,9 +499,16 @@ func New(config ...Config) celeris.HandlerFunc {
 				// (checkTimeouts honours only IdleDeadlineNs on Detached
 				// conns) and never resume parsing it, so without this a
 				// finished SSE conn stays open — holding its fd and
-				// connState — until the peer happens to close, and a
-				// keep-alive reuse would re-enter ProcessH1 on a Detached
-				// H1State whose cached Context this stream just released.
+				// connState — until the peer happens to close. It also
+				// narrows (one idle sweep, ~25 ms) the window in which a
+				// keep-alive reuse re-enters ProcessH1 on a Detached
+				// H1State whose cached Context this stream just released;
+				// it does NOT close that gap: ProcessH1 only short-circuits
+				// a Detached conn when WSDataDelivery is set (WebSocket),
+				// so bytes a client sends on an SSE conn while the stream
+				// is live are still parsed as a new request on the same
+				// cached stream/Context. That is a pre-existing H1-layer
+				// bug tracked separately from celeris#494.
 				// A 1 ns deadline makes the next idle sweep run closeConn:
 				// OnDetachClose fires our (idempotent, already spent)
 				// cancel and the engine sends FIN after the terminal chunk

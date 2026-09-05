@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"runtime"
 	"strings"
@@ -205,8 +206,16 @@ func readTicks(tb testing.TB, br *bufio.Reader, n int) {
 //     runs this mode as well.
 //
 // Half the clients close with SO_LINGER 0 (RST — exercises OnError via
-// ECONNRESET), half with a plain Close (FIN — exercises the recv-EOF path:
-// iouring Res==0 / epoll errPeerClosed). Every handler must return within
+// ECONNRESET), half half-close with shutdown(SHUT_WR) via CloseWrite (FIN —
+// exercises the recv-EOF path: iouring Res==0 / epoll errPeerClosed). The
+// FIN half deliberately does NOT use a plain Close: the clients stop
+// reading after two ticks while the handler keeps writing, so by the time
+// the kill loop runs every conn has unread bytes in its receive queue and
+// Linux tcp_close() then emits RST, not FIN (RFC 2525 §2.17). CloseWrite
+// sends FIN regardless of unread data and leaves the receive side open, so
+// those clients can additionally observe the server's FIN: the engine
+// reaps a Detached conn inline on recv-EOF, so the client must read EOF
+// shortly after its handler returned. Every handler must return within
 // 3 s and the goroutine count must fall back to baseline within 5 s,
 // sampled BEFORE shutdown (Engine.Shutdown on the native engines returns
 // immediately and never cancels SSE streams, so it cannot mask a leak).
@@ -283,16 +292,19 @@ func runDisconnectCell(t *testing.T, cell sseCell, heartbeat time.Duration, ctxO
 		t.Fatalf("started=%d handlers, want %d", got, clients)
 	}
 
-	// Kill the clients: even = RST (SO_LINGER 0), odd = FIN.
+	// Kill the clients: even = RST (SO_LINGER 0 + Close), odd = FIN
+	// (CloseWrite; see the doc comment for why not Close). The conns stay
+	// in the slice so the deferred loop closes the half-open ones after
+	// the assertions below have read the server's FIN from them.
 	for i, c := range conns {
+		tc := c.(*net.TCPConn)
 		if i%2 == 0 {
-			if tc, ok := c.(*net.TCPConn); ok {
-				_ = tc.SetLinger(0)
-			}
+			_ = tc.SetLinger(0)
+			_ = tc.Close()
+		} else if err := tc.CloseWrite(); err != nil {
+			t.Fatalf("client %d CloseWrite: %v", i, err)
 		}
-		_ = c.Close()
 	}
-	conns = conns[:0]
 
 	deadline := time.Now().Add(3 * time.Second)
 	for returned.Load() < int32(clients) && time.Now().Before(deadline) {
@@ -322,5 +334,90 @@ func runDisconnectCell(t *testing.T, cell sseCell, heartbeat time.Duration, ctxO
 			"expected leaked frames per stream: the sse Handler, sse.New.func1.1.2 (heartbeat) and "+
 			"celeris.(*routerAdapter).recoverAndRelease.func1 (<-c.detachDone) — celeris#494",
 			baseline, n, n-baseline, pad, clients)
+	}
+
+	// The half-closed (FIN) clients must see the server's FIN: on the
+	// native engines recv-EOF on a Detached conn runs closeConn inline
+	// (epoll errPeerClosed / io_uring Res==0), so the fd is gone as soon
+	// as the engine observed the peer's FIN. std is not pinned here:
+	// net/http's connection lifecycle after a half-close is its own
+	// business and not what celeris#494 is about.
+	if cell.engine == celeris.Std {
+		return
+	}
+	for i, c := range conns {
+		if i%2 == 0 {
+			continue
+		}
+		if err := expectEOF(c, 2*time.Second); err != nil {
+			t.Errorf("client %d (FIN): server did not close the connection after its handler returned: %v", i, err)
+		}
+	}
+}
+
+// expectEOF drains c until EOF and returns nil, or the read error (a
+// timeout when the server never closed its side) otherwise.
+func expectEOF(c net.Conn, within time.Duration) error {
+	_ = c.SetReadDeadline(time.Now().Add(within))
+	_, err := io.Copy(io.Discard, c)
+	return err
+}
+
+// TestStreamEndClosesConnection pins the second celeris#494 commit: after
+// Detach the native engines apply none of their configured timeouts to a
+// connection and never resume parsing it, so a finished SSE stream used to
+// leave the TCP connection open (fd + connState) until the peer closed it.
+// runStream's defer now arms a 1 ns idle deadline so the next sweep runs
+// closeConn and the server sends FIN right after the terminal chunk.
+//
+// The client here stays fully open and reads: the handler ends on its own
+// after three ticks, and the client must observe the chunked terminator
+// followed by EOF within 2 s. Only the native engines are exercised — the
+// idle-deadline hook is a no-op on std, whose keep-alive conn legitimately
+// stays open for the next request.
+func TestStreamEndClosesConnection(t *testing.T) {
+	for _, kind := range sseNativeEngineKinds(t) {
+		for _, async := range []bool{true, false} {
+			name := kind.String() + "/sync"
+			if async {
+				name = kind.String() + "/async"
+			}
+			t.Run(name, func(t *testing.T) {
+				runStreamEndCell(t, kind, async)
+			})
+		}
+	}
+}
+
+func runStreamEndCell(t *testing.T, engine celeris.EngineType, async bool) {
+	t.Helper()
+	handler := sse.New(sse.Config{
+		HeartbeatInterval: -1,
+		Handler: func(client *sse.Client) {
+			for n := 1; n <= 3; n++ {
+				if err := client.Send(sse.Event{Event: "tick", Data: fmt.Sprintf("%d", n)}); err != nil {
+					return
+				}
+			}
+		},
+	})
+	addr, shutdown := startSSEServer(t, engine, async, handler)
+	defer shutdown()
+
+	const clients = 8
+	for i := 0; i < clients; i++ {
+		conn, br := openSSEStream(t, addr)
+		readTicks(t, br, 3)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		tail, err := io.ReadAll(br)
+		if err != nil {
+			_ = conn.Close()
+			t.Fatalf("client %d: no server FIN within 2s after the SSE handler returned (read %d trailing bytes, err=%v) — "+
+				"the finished Detached conn was never reaped (celeris#494, SetWSIdleDeadline)", i, len(tail), err)
+		}
+		if !strings.HasSuffix(string(tail), "0\r\n\r\n") {
+			t.Errorf("client %d: stream did not end with the chunked terminator before FIN; tail=%q", i, tail)
+		}
+		_ = conn.Close()
 	}
 }
