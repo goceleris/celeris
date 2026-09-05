@@ -490,6 +490,23 @@ func New(config ...Config) celeris.HandlerFunc {
 					onDisconnect(c, client)
 				}
 				releaseClient(client)
+				// Ask the engine to reap the connection now that the
+				// stream is over. After Detach the native engines apply
+				// none of their configured timeouts to this conn
+				// (checkTimeouts honours only IdleDeadlineNs on Detached
+				// conns) and never resume parsing it, so without this a
+				// finished SSE conn stays open — holding its fd and
+				// connState — until the peer happens to close, and a
+				// keep-alive reuse would re-enter ProcessH1 on a Detached
+				// H1State whose cached Context this stream just released.
+				// A 1 ns deadline makes the next idle sweep run closeConn:
+				// OnDetachClose fires our (idempotent, already spent)
+				// cancel and the engine sends FIN after the terminal chunk
+				// (io_uring defers the fd close until pending sends drain;
+				// epoll's guarded fn flushed inline). Atomic store; MUST
+				// precede done() because c is returned to the pool once
+				// detachDone closes. No-op on std and H2 (no hook).
+				c.SetWSIdleDeadline(1)
 				done()
 			}()
 
