@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a new feature or an improvement
+title: "[feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Large or breaking proposals are best discussed here before any
+        code is written (see [GOVERNANCE.md](../blob/main/GOVERNANCE.md)).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this feature solve? Who hits it, and how often?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the API or behaviour you have in mind. Sketches of Go code are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other approaches you considered, including "do nothing", and why they fall short.
