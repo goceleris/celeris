@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a bug in celeris
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in the
+        environment fields — engine and architecture matter a lot for
+        celeris, since the io_uring, epoll and std engines take different
+        code paths.
+
+        **Security vulnerabilities must not be reported here.** Use the
+        repository's Security tab → "Report a vulnerability" instead (see
+        [SECURITY.md](../blob/main/SECURITY.md)).
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: Which engine were you running when the bug occurred?
+      options:
+        - std
+        - epoll
+        - io_uring
+        - adaptive
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - amd64
+        - arm64
+        - other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: celeris version
+      description: Output of `go list -m github.com/goceleris/celeris`, or the commit SHA.
+      placeholder: v1.6.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / kernel
+      description: Distribution and kernel version (`uname -sr`). Kernel matters for io_uring.
+      placeholder: Ubuntu 24.04, Linux 6.8.0
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A self-contained Go program (or test) that reproduces the problem. The smaller, the faster we can fix it.
+      render: go
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What did you expect to happen, and what happened instead? Include logs, panics or `-race` output if you have them.
