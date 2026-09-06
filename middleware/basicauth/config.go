@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"strconv"
 
 	"github.com/goceleris/celeris"
 )
@@ -35,11 +36,13 @@ type Config struct {
 	// HashedUsers maps usernames to opaque hash strings. The format is
 	// determined by HashedUsersFunc — bcrypt's $2y$..., argon2id's $argon2..,
 	// scrypt, etc. HashedUsersFunc is REQUIRED whenever HashedUsers is
-	// non-empty, with one exception: when every value was produced by
-	// [HashPasswordPBKDF2] (tag "pbkdf2-sha256$"), [VerifyPassword] is
-	// wired in automatically. basicauth.New() panics otherwise. There is
-	// no fast-hash default because all general-purpose hashes (SHA-2,
-	// SHA-3, BLAKE2) are too fast to safely store credentials with.
+	// non-empty, with one exception: when every value carries the
+	// "pbkdf2-sha256$" tag of [HashPasswordPBKDF2] and parses within the
+	// window [VerifyPassword] accepts, VerifyPassword is wired in
+	// automatically. basicauth.New() panics otherwise — naming the entry
+	// when a tagged value is malformed or out of window. There is no
+	// fast-hash default because all general-purpose hashes (SHA-2, SHA-3,
+	// BLAKE2) are too fast to safely store credentials with.
 	HashedUsers map[string]string
 
 	// HashedUsersFunc receives the stored hash string and the plaintext
@@ -53,6 +56,8 @@ type Config struct {
 	// pre-computing a dummy hash (via bcrypt.GenerateFromPassword) and
 	// comparing against it for unknown users, rather than letting
 	// bcrypt.CompareHashAndPassword fail instantly on an empty hash.
+	// [VerifyPassword] meets this: it performs one PBKDF2 derivation for
+	// every input, whatever format the stored hash is in.
 	HashedUsersFunc func(hash, password string) bool
 
 	// Realm is the authentication realm. Default: "Restricted".
@@ -117,19 +122,25 @@ func applyDefaults(cfg Config) Config {
 				panic("basicauth: HashedUsers requires HashedUsersFunc unless every hash is pbkdf2-sha256 " +
 					"(use HashPasswordPBKDF2 + VerifyPassword, bcrypt, or argon2; plain SHA-256 is not credential-grade)")
 			}
-			// Every hash is a slow, salted KDF we produced ourselves, so a
-			// built-in verifier is safe here.
+			if u, bad := malformedPBKDF2Entry(cfg.HashedUsers); bad {
+				// A tagged value VerifyPassword cannot honour would 401
+				// that user on every request; fail at startup instead and
+				// say which entry.
+				panic("basicauth: HashedUsers entry for " + strconv.Quote(u) + " is not a valid pbkdf2-sha256 hash " +
+					"(want pbkdf2-sha256$<iter>$<salt-b64>$<hash-b64> with " +
+					strconv.Itoa(minPBKDF2Iterations) + " <= iter <= " + strconv.Itoa(maxPBKDF2Iterations) +
+					", salt of at least " + strconv.Itoa(minPBKDF2SaltLen) + " bytes, hash of exactly " +
+					strconv.Itoa(pbkdf2KeyLen) + " bytes)")
+			}
+			// Every hash is a slow, salted KDF inside the window we
+			// enforce, so a built-in verifier is safe here.
 			cfg.HashedUsersFunc = VerifyPassword
 		}
 		hashCopy := make(map[string]string, len(cfg.HashedUsers))
 		for u, h := range cfg.HashedUsers {
 			hashCopy[u] = h
 		}
-		var dummyHash string
-		for _, h := range hashCopy {
-			dummyHash = h
-			break
-		}
+		dummyHash := pickDummyHash(hashCopy)
 		verifyFn := cfg.HashedUsersFunc
 		cfg.Validator = func(user, pass string) bool {
 			h, ok := hashCopy[user]
@@ -141,6 +152,29 @@ func applyDefaults(cfg Config) Config {
 		}
 	}
 	return cfg
+}
+
+// pickDummyHash chooses the stored hash the auto-generated Validator
+// verifies unknown usernames against. It is a real stored value so a
+// caller-supplied verifier (bcrypt, argon2) pays its genuine cost on a
+// miss. A pbkdf2-sha256 entry is preferred when the store is mixed —
+// VerifyPassword costs the same for every format, but a custom verifier
+// that dispatches on the tag may not — and ties break on username so the
+// choice does not depend on map-iteration order. Returns "" for an empty
+// map.
+func pickDummyHash(hashes map[string]string) string {
+	var best, bestUser string
+	bestRank := -1
+	for u, h := range hashes {
+		rank := 0
+		if isPBKDF2Hash(h) {
+			rank = 1
+		}
+		if rank > bestRank || (rank == bestRank && u < bestUser) {
+			best, bestUser, bestRank = h, u, rank
+		}
+	}
+	return best
 }
 
 // hmacSHA256 computes HMAC-SHA256(key, data) and returns the 32-byte tag.

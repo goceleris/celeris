@@ -25,6 +25,42 @@ const (
 	// pbkdf2KeyLen is the derived-key length in bytes; fixed at the SHA-256
 	// digest size so a truncated (weaker) stored hash is rejected outright.
 	pbkdf2KeyLen = sha256.Size
+
+	// VerifyPassword honours the parameters carried by a stored hash only
+	// inside the window below. HashPasswordPBKDF2 itself always emits
+	// PBKDF2Iterations and pbkdf2SaltLen; the window exists to bound what
+	// a hostile or mistyped stored value can make the verifier do — a
+	// stored hash reaches the verifier on every request for that user and,
+	// through applyDefaults' dummy hash, on every request for an unknown
+	// user too — while leaving headroom for hashes produced elsewhere at a
+	// higher cost.
+	//
+	// minPBKDF2Iterations refuses downgrades: an entry below the count this
+	// package emits would verify at a fraction of the intended cost, which
+	// is exactly the fast-hash storage the package refuses to default to.
+	// It is a literal, not an alias of PBKDF2Iterations: if the default is
+	// ever raised, this stays at the lowest count ever emitted so hashes
+	// already sitting in stores keep verifying.
+	minPBKDF2Iterations = 600_000
+	// maxPBKDF2Iterations caps the CPU one verification can burn. Cost is
+	// linear in the count (~0.2 s at the default, ~3 s at this cap on a
+	// 2026 laptop); the 31-bit count the parser used to accept would have
+	// cost ~10 minutes per request.
+	maxPBKDF2Iterations = 10_000_000
+	// minPBKDF2SaltLen refuses salts shorter than the 128 bits this package
+	// emits (NIST SP 800-132 §5.1). Same rule as the iteration floor: a
+	// literal pinned at the shortest salt ever emitted.
+	minPBKDF2SaltLen = 16
+)
+
+// Compile-time guard: HashPasswordPBKDF2's own parameters must sit inside
+// the window VerifyPassword enforces, or the default wiring would reject
+// every hash it produces. A negative untyped constant does not convert to
+// uint, so a bad edit fails to build.
+const (
+	_ = uint(PBKDF2Iterations - minPBKDF2Iterations)
+	_ = uint(maxPBKDF2Iterations - PBKDF2Iterations)
+	_ = uint(pbkdf2SaltLen - minPBKDF2SaltLen)
 )
 
 // HashPasswordPBKDF2 derives a salted, slow credential hash of password
@@ -65,16 +101,30 @@ func HashPasswordPBKDF2(password string) string {
 // this package has ever produced:
 //
 //   - pbkdf2-sha256$<iter>$<salt>$<hash> from [HashPasswordPBKDF2]
-//     (preferred);
+//     (preferred). The stored parameters are honoured only within a fixed
+//     window — 600,000 ≤ iterations ≤ 10,000,000, salt of at least 16
+//     bytes, key of exactly 32 bytes — so a stored value can neither
+//     downgrade the derivation below the cost this package emits nor make
+//     it cost minutes of CPU. Anything outside the window fails, after the
+//     same work as below;
 //   - a bare hex SHA-256 digest from the deprecated [HashPassword], kept so
 //     existing deployments keep authenticating while they migrate.
 //
-// The comparison uses [subtle.ConstantTimeCompare]. A malformed hash still
-// performs a derivation before returning false, so the format-error branch
-// is not distinguishable by timing from a wrong password. Per-request cost
-// is one PBKDF2 derivation (hundreds of milliseconds at 600k iterations),
-// which is the point: cache authenticated sessions upstream if the
-// endpoint is hot.
+// Timing: every call performs exactly one PBKDF2 derivation — at the
+// stored iteration count for a well-formed pbkdf2-sha256 hash, and at
+// [PBKDF2Iterations] for everything else (a legacy digest, a malformed or
+// out-of-window string, or "" as callers pass for unknown users) — followed
+// by a [subtle.ConstantTimeCompare]. The format of the stored hash is
+// therefore not recoverable from response time, which is what the
+// HashedUsersFunc contract asks for. What does remain observable is a
+// non-default iteration count in a pbkdf2-sha256 entry, exactly as
+// bcrypt's cost factor is; the microsecond-scale parsing that differs
+// between the two formats is lost in the hundreds of milliseconds of
+// derivation.
+//
+// That derivation is the per-request cost for every entry, legacy digests
+// included — which is the point: cache authenticated sessions upstream if
+// the endpoint is hot.
 func VerifyPassword(hash, password string) bool {
 	if isPBKDF2Hash(hash) {
 		return verifyPBKDF2(hash, password)
@@ -92,11 +142,7 @@ func isPBKDF2Hash(hash string) bool {
 func verifyPBKDF2(hash, password string) bool {
 	iter, salt, want, ok := parsePBKDF2(hash)
 	if !ok {
-		// Burn the same work a well-formed hash would, then fail.
-		var dummySalt [pbkdf2SaltLen]byte
-		var dummy [pbkdf2KeyLen]byte
-		got, _ := pbkdf2.Key(sha256.New, password, dummySalt[:], PBKDF2Iterations, pbkdf2KeyLen)
-		_ = subtle.ConstantTimeCompare(got, dummy[:])
+		burnPBKDF2(password)
 		return false
 	}
 	got, err := pbkdf2.Key(sha256.New, password, salt, iter, pbkdf2KeyLen)
@@ -106,24 +152,34 @@ func verifyPBKDF2(hash, password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// burnPBKDF2 derives a key from password at the default cost and discards
+// it. Every VerifyPassword path that does not derive against a stored
+// pbkdf2-sha256 hash calls this instead, so the verifier costs one
+// derivation whatever the stored value looks like.
+func burnPBKDF2(password string) {
+	var dummySalt [pbkdf2SaltLen]byte
+	var dummy [pbkdf2KeyLen]byte
+	got, _ := pbkdf2.Key(sha256.New, password, dummySalt[:], PBKDF2Iterations, pbkdf2KeyLen)
+	_ = subtle.ConstantTimeCompare(got, dummy[:])
+}
+
 // parsePBKDF2 splits and decodes a HashPasswordPBKDF2 string. It rejects
-// anything that is not exactly four fields, a positive decimal iteration
-// count, a non-empty base64 salt, and a base64 hash of exactly
-// pbkdf2KeyLen bytes.
+// anything that is not exactly four fields, a decimal iteration count in
+// [minPBKDF2Iterations, maxPBKDF2Iterations], a base64 salt of at least
+// minPBKDF2SaltLen bytes, and a base64 hash of exactly pbkdf2KeyLen bytes.
 func parsePBKDF2(hash string) (iter int, salt, key []byte, ok bool) {
 	parts := strings.Split(hash, "$")
 	if len(parts) != 4 || parts[0] != pbkdf2Tag {
 		return 0, nil, nil, false
 	}
-	// ParseUint (not Atoi) refuses signs and is bounded to 31 bits so a
-	// hostile iteration count can neither go negative nor overflow int
-	// on 32-bit targets.
-	n, err := strconv.ParseUint(parts[1], 10, 31)
-	if err != nil || n == 0 {
+	// ParseUint (not Atoi) refuses signs; the window check is the real
+	// bound, and keeps int(n) safe on 32-bit targets as a side effect.
+	n, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil || n < minPBKDF2Iterations || n > maxPBKDF2Iterations {
 		return 0, nil, nil, false
 	}
 	salt, err = base64.StdEncoding.DecodeString(parts[2])
-	if err != nil || len(salt) == 0 {
+	if err != nil || len(salt) < minPBKDF2SaltLen {
 		return 0, nil, nil, false
 	}
 	key, err = base64.StdEncoding.DecodeString(parts[3])
@@ -134,17 +190,24 @@ func parsePBKDF2(hash string) (iter int, salt, key []byte, ok bool) {
 }
 
 // verifyLegacySHA256 checks password against a bare hex SHA-256 digest as
-// produced by the deprecated HashPassword. Constant-time per the
-// HashedUsersFunc contract, including on malformed input.
+// produced by the deprecated HashPassword. It burns one default-cost PBKDF2
+// derivation first — on the valid-hex and the malformed path alike, ""
+// included — so a legacy entry, an unknown user and a pbkdf2-sha256 entry
+// all cost the same. The candidate digest comes from HashPassword itself,
+// the one deliberately retained (deprecated, CodeQL-tracked) fast-hash
+// site, rather than a second inline SHA-256 over the password; the stored
+// hex is re-encoded so both sides are 64-byte lower-case strings for the
+// constant-time compare.
 func verifyLegacySHA256(hash, password string) bool {
+	burnPBKDF2(password)
 	want, err := hex.DecodeString(hash)
-	got := sha256.Sum256([]byte(password))
-	if err != nil || len(want) != sha256.Size {
-		var dummy [sha256.Size]byte
-		_ = subtle.ConstantTimeCompare(got[:], dummy[:])
-		return false
+	malformed := err != nil || len(want) != sha256.Size
+	if malformed {
+		want = make([]byte, sha256.Size)
 	}
-	return subtle.ConstantTimeCompare(got[:], want) == 1
+	match := subtle.ConstantTimeCompare(
+		[]byte(HashPassword(password)), []byte(hex.EncodeToString(want))) == 1
+	return match && !malformed
 }
 
 // allPBKDF2 reports whether every stored hash carries the pbkdf2-sha256
@@ -157,4 +220,19 @@ func allPBKDF2(hashes map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// malformedPBKDF2Entry returns the username of a stored hash that carries
+// the pbkdf2-sha256 tag but does not parse within the accepted window
+// (bad=true), or bad=false when every entry parses. applyDefaults uses it
+// to turn a mistyped iteration count or salt in an auto-wired store into a
+// startup panic that names the entry, instead of a 401 on every request
+// for that user.
+func malformedPBKDF2Entry(hashes map[string]string) (user string, bad bool) {
+	for u, h := range hashes {
+		if _, _, _, ok := parsePBKDF2(h); !ok {
+			return u, true
+		}
+	}
+	return "", false
 }
