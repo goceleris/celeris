@@ -34,6 +34,16 @@ var RatelimitTokenViolations Counter
 // asserted (e.g. session id reused across logical users).
 var SessionOwnerMismatches Counter
 
+// SessionCookieDrops counts requests on which the session middleware
+// could not emit a Set-Cookie (or session-id header) that would have
+// CHANGED what the client holds — a fresh or regenerated session id, or
+// the clearing cookie — because the handler had already written the
+// response body. The client never learns the new id on such a request;
+// the persisted session is orphaned until it idles out. A late mutation
+// of a loaded session (the client already holds that id) is NOT counted:
+// only the cookie's Max-Age refresh is lost, nothing is orphaned.
+var SessionCookieDrops Counter
+
 // JWTLateAdmits counts JWTs that the middleware admitted with an
 // effective exp claim earlier than the wall-clock time at admission.
 var JWTLateAdmits Counter
@@ -52,6 +62,7 @@ func Snapshot() Counters {
 		PanicCount:               PanicCount.Load(),
 		RatelimitTokenViolations: RatelimitTokenViolations.Load(),
 		SessionOwnerMismatches:   SessionOwnerMismatches.Load(),
+		SessionCookieDrops:       SessionCookieDrops.Load(),
 		JWTLateAdmits:            JWTLateAdmits.Load(),
 		IouringSQECorruptions:    IouringSQECorruptions.Load(),
 	}
