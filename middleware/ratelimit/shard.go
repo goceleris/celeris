@@ -336,7 +336,26 @@ func (l *shardedLimiter) cleanup(ctx context.Context, interval time.Duration) {
 							break
 						}
 						scanned++
-						if b.lastFill < expiry && b.tokens >= float64(l.burst) {
+						// Idle past the expiry window is the ONLY condition
+						// needed. The old form also required
+						// b.tokens >= float64(l.burst), which can never hold
+						// for a bucket driven through allow(): a bucket is
+						// created with burst-1 tokens (shard.go:250),
+						// refill clamps at burst and allow() then ALWAYS
+						// decrements, and refill runs only inside allow() --
+						// so an idle bucket is frozen at <= burst-1 forever
+						// and nothing was ever evicted (celeris#510). Only
+						// undo(), reachable solely via SkipFailedRequests /
+						// SkipSuccessfulRequests, can reach burst.
+						//
+						// Dropping the token clause does not weaken the
+						// limit. expiryDuration is max(10s, 2*burst/rps),
+						// which is at least twice the burst/rps needed to
+						// refill from empty, so any bucket idle that long has
+						// conceptually refilled to burst already: deleting it
+						// and recreating it on the next request yields the
+						// same budget as keeping it.
+						if b.lastFill < expiry {
 							delete(s.buckets, k)
 							hits++
 						}
