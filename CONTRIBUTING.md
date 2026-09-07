@@ -111,6 +111,51 @@ mage -l    # List all available targets
 - Write clear commit messages following the `type: description` format (e.g., `feat:`, `fix:`, `perf:`, `security:`, `test:`, `chore:`)
 - Security-sensitive changes should note the CWE number in the commit message
 
+### How changes get merged
+
+The full rule lives in [GOVERNANCE.md](GOVERNANCE.md); the short version:
+
+- Every change to `main` goes through a pull request — maintainers included.
+- A PR merges when **all required checks are green** and it has an
+  **approving review from a code owner** of the files it touches
+  ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+- The author merges if they have write access (a member of the
+  `contributors` team or a maintainer); otherwise the approving maintainer
+  merges, usually via auto-merge.
+- **Nobody merges their own PR without a code-owner approval.** The
+  maintainer's admin bypass is reserved for release/infra emergencies and
+  is visible in the audit log.
+
+Who the maintainers and `contributors` members are, and how to become one,
+is in [MAINTAINERS.md](MAINTAINERS.md).
+
+### Labels and release notes
+
+Release notes are **generated from PR labels** (see
+[`.github/release.yml`](.github/release.yml)); GitHub Releases is the
+changelog and there is **no `CHANGELOG.md`**. Label every PR with the
+category it belongs to so it lands in the right section:
+
+| Label          | Release-notes section |
+|----------------|-----------------------|
+| `breaking`     | Breaking changes      |
+| `security`     | Security              |
+| `bug`          | Fixes                 |
+| `performance`  | Performance           |
+| `enhancement`  | Features              |
+| `dependencies` | excluded (dependabot) |
+
+Anything else lands under "Other". If a change is breaking, label it
+`breaking` *and* say so in the PR description.
+
+### Commit sign-off
+
+We recommend signing off your commits with `git commit -s`, which adds a
+`Signed-off-by:` trailer certifying the
+[Developer Certificate of Origin](https://developercertificate.org/). It is
+not mandatory yet, but it may become a required check in the future, so
+getting into the habit now costs nothing.
+
 ## Code Style
 
 - Follow standard Go conventions
@@ -131,6 +176,15 @@ mage -l    # List all available targets
 
 ## Reporting Issues
 
-Use GitHub Issues with the provided templates for bug reports and feature requests.
+Use GitHub Issues with the provided forms for bug reports and feature
+requests. Bug reports ask for the engine (std / epoll / io_uring /
+adaptive), the architecture and a minimal reproduction — please fill them
+in, they decide how fast the bug gets fixed.
 
-For security vulnerabilities, see [SECURITY.md](SECURITY.md).
+For security vulnerabilities, **do not open an issue**: use the Security
+tab → "Report a vulnerability" as described in [SECURITY.md](SECURITY.md).
+
+## Project governance
+
+- [GOVERNANCE.md](GOVERNANCE.md) — roles, merge rule, decisions, releases
+- [MAINTAINERS.md](MAINTAINERS.md) — who maintains celeris and how to join

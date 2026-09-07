@@ -26,6 +26,7 @@ var (
 	PanicCount               Counter
 	RatelimitTokenViolations Counter
 	SessionOwnerMismatches   Counter
+	SessionCookieDrops       Counter
 	JWTLateAdmits            Counter
 	IouringSQECorruptions    Counter
 )

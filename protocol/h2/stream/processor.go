@@ -1578,11 +1578,6 @@ func (p *Processor) sendRSTStreamAndMarkClosed(streamID uint32, code http2.ErrCo
 	return nil
 }
 
-// FlushBufferedData exposes flushBufferedData for external callers.
-func (p *Processor) FlushBufferedData(_ uint32) {
-	// Placeholder for transport-layer integration
-}
-
 // GetStreamPriority returns the priority score for a stream.
 func (p *Processor) GetStreamPriority(streamID uint32) int {
 	return p.manager.priorityTree.CalculateStreamPriority(streamID)
