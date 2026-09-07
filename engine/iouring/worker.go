@@ -3433,8 +3433,27 @@ func (w *Worker) drainDetachQueue() {
 		// CQEs) is tagged with udProvide so the main dispatcher silently
 		// ignores it instead of routing through handleRecv.
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
+			applied := true
 			if desired {
-				if sqe := w.ring.GetSQE(); sqe != nil {
+				// getCancelSQE (not a bare GetSQE): it submits and retries
+				// once when the SQ ring is full, exactly as the close path
+				// does. A dropped pause is not benign here -- see below.
+				sqe := w.getCancelSQE()
+				if sqe == nil {
+					// The ring stayed full. Do NOT record the conn as
+					// paused: its multishot recv is still kernel-armed, and
+					// the matching resume would take the re-arm branch and
+					// arm a SECOND multishot recv on the same socket, so two
+					// armed recvs would deliver interleaved data (celeris#482
+					// bug 2). PauseRecv only enqueues on the false->true
+					// transition and recvPauseDesired is already true, so
+					// nothing would retry on its own -- re-enqueue here.
+					applied = false
+					w.detachQMu.Lock()
+					w.detachQueue = append(w.detachQueue, cs)
+					w.detachQPending.Store(1)
+					w.detachQMu.Unlock()
+				} else {
 					// Cancel the in-flight recv. cs.fd is a fixed-file
 					// INDEX when fixed files are on, so cancelling by raw
 					// fd would match nothing; match by the recv's
@@ -3476,7 +3495,9 @@ func (w *Worker) drainDetachQueue() {
 					cs.needsRecv = true
 				}
 			}
-			cs.recvPaused = desired
+			if applied {
+				cs.recvPaused = desired
+			}
 		}
 		w.markDirty(cs)
 	}
