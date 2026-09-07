@@ -222,3 +222,68 @@ func TestMarkStreamBufferedEmpty(t *testing.T) {
 		t.Error("Stream should not be marked as buffered after MarkStreamEmpty")
 	}
 }
+
+// TestCloseCancelsAsyncRunningStream pins celeris#498 item 1: an H2 stream
+// whose handler is still running on the worker pool must have its context
+// cancelled when the connection dies, or a detached long-lived handler (an
+// SSE stream parked on client.Context().Done()) never learns the peer is
+// gone and leaks — the celeris#494 shape, on H2 instead of H1. H2 streams
+// carry none of the OnWS* hooks the H1 path uses to deliver that signal, so
+// Manager.Close is the only place it can come from. Cancel must NOT release:
+// the stream object is still owned by the async goroutine, which releases it
+// on completion.
+func TestCloseCancelsAsyncRunningStream(t *testing.T) {
+	m := NewManager()
+	s, ok := m.TryOpenStream(1)
+	if !ok {
+		t.Fatal("TryOpenStream(1) failed")
+	}
+	s.flags.Or(flagAsyncRunning)
+
+	// A parked handler holds the Done channel, exactly as
+	// context.WithCancel(c.Context()) does inside the SSE middleware.
+	ctx := s.Context()
+	done := ctx.Done()
+
+	m.Close()
+
+	select {
+	case <-done:
+	default:
+		t.Error("Manager.Close did not cancel the async-running stream: a detached " +
+			"handler parked on ctx.Done() leaks for the process lifetime — celeris#498")
+	}
+	if err := ctx.Err(); err == nil {
+		t.Error("stream context Err() is nil after Manager.Close, want context.Canceled")
+	}
+	// Release zeroes ID and returns the stream to the pool; the async
+	// goroutine still owns it, so Close must not have done that.
+	if s.ID != 1 {
+		t.Errorf("Manager.Close released a stream still owned by its async handler "+
+			"goroutine (ID=%d, want 1)", s.ID)
+	}
+}
+
+// TestCloseReleasesIdleStream is the control for the test above: a stream
+// with no async handler running is released — and therefore cancelled — by
+// Close, which is what already happened before celeris#498.
+func TestCloseReleasesIdleStream(t *testing.T) {
+	m := NewManager()
+	s, ok := m.TryOpenStream(1)
+	if !ok {
+		t.Fatal("TryOpenStream(1) failed")
+	}
+	ctx := s.Context()
+	done := ctx.Done()
+
+	m.Close()
+
+	select {
+	case <-done:
+	default:
+		t.Error("Manager.Close did not cancel an idle stream")
+	}
+	if m.StreamCount() != 0 {
+		t.Errorf("Stream count after Close: got %d, want 0", m.StreamCount())
+	}
+}

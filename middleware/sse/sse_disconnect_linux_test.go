@@ -5,14 +5,18 @@ package sse_test
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/goceleris/celeris"
 	celerisengine "github.com/goceleris/celeris/engine"
@@ -37,28 +41,39 @@ func sseNativeEngineKinds(t *testing.T) []celeris.EngineType {
 	return kinds
 }
 
-// sseCell is one engine × AsyncHandlers configuration of the matrix.
+// sseCell is one engine × AsyncHandlers × transport configuration of the
+// matrix. h2c cells drive the same handler over prior-knowledge HTTP/2
+// instead of HTTP/1.1.
 type sseCell struct {
 	name   string
 	engine celeris.EngineType
 	async  bool
+	h2c    bool
 }
 
 // sseDisconnectCells returns every available native cell plus std as the
 // control (std detects a dead peer through net/http's write error, so it
 // is the cell that passes on main and pins the expected behaviour).
+//
+// Each native engine also gets an h2c cell (celeris#498). H2 needs no
+// AsyncHandlers row: the H2 processor picks inline-vs-pooled dispatch per
+// stream from the route's own async flag, not from Config.AsyncHandlers
+// (which on the native engines only governs the per-conn H1 dispatch
+// goroutine), so the two rows would be the same server. The h2c cell marks
+// /events async explicitly — see startSSEServer.
 func sseDisconnectCells(t *testing.T) []sseCell {
 	t.Helper()
 	var cells []sseCell
 	for _, kind := range sseNativeEngineKinds(t) {
 		cells = append(cells,
-			sseCell{kind.String() + "/async", kind, true},
-			sseCell{kind.String() + "/sync", kind, false},
+			sseCell{name: kind.String() + "/async", engine: kind, async: true},
+			sseCell{name: kind.String() + "/sync", engine: kind, async: false},
+			sseCell{name: kind.String() + "/h2c", engine: kind, async: true, h2c: true},
 		)
 	}
 	cells = append(cells,
-		sseCell{"std/async", celeris.Std, true},
-		sseCell{"std/sync", celeris.Std, false},
+		sseCell{name: "std/async", engine: celeris.Std, async: true},
+		sseCell{name: "std/sync", engine: celeris.Std, async: false},
 	)
 	return cells
 }
@@ -66,14 +81,26 @@ func sseDisconnectCells(t *testing.T) []sseCell {
 // startSSEServer boots celeris with the given engine on a fresh loopback
 // listener, mounts h at /events and returns the address plus a shutdown
 // closure. Same shape as middleware/websocket's startNativeServer.
-func startSSEServer(tb testing.TB, engine celeris.EngineType, async bool, h celeris.HandlerFunc) (string, func()) {
+//
+// routeAsync marks /events .Async(). It is what the h2c cells need: the H2
+// processor runs an END_STREAM GET inline on the event-loop thread unless
+// the matched route opted into async dispatch, and an SSE handler blocks
+// until its client goes away — inline it would wedge the loop for every
+// other connection on that worker. Marking the route async puts the stream
+// on the H2 worker pool, which is also the flagAsyncRunning path
+// celeris#498 is about. The H1 cells leave it off: there the per-conn
+// dispatch goroutine is chosen by Config.AsyncHandlers.
+func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync bool, h celeris.HandlerFunc) (string, func()) {
 	tb.Helper()
 	s := celeris.New(celeris.Config{
 		Engine:          engine,
 		AsyncHandlers:   async,
 		ShutdownTimeout: 2 * time.Second,
 	})
-	s.GET("/events", h)
+	r := s.GET("/events", h)
+	if routeAsync {
+		r.Async()
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -166,6 +193,60 @@ func openSSEStream(tb testing.TB, addr string) (net.Conn, *bufio.Reader) {
 	}
 }
 
+// openSSEStreamH2C is openSSEStream over prior-knowledge h2c. It builds a
+// transport per client so every stream gets its own TCP connection (an
+// http2.Transport would otherwise multiplex all 32 onto one, and killing
+// that conn would prove nothing about a single stream), and hands back the
+// raw conn the dialer produced so the caller can RST or half-close it the
+// same way as an H1 client. The returned closer shuts the transport's idle
+// connections down so its read/write goroutines do not count against the
+// leak assertion.
+//
+// The 10 s read deadline bounds the open — mirroring openSSEStream — and the
+// caller clears it once the head is read. It must NOT survive into the
+// assertion window: expiring there would make the transport reset the stream,
+// and the server would then cancel the handler through handleRSTStream, i.e.
+// through a path other than the one under test.
+func openSSEStreamH2C(tb testing.TB, addr string) (net.Conn, *bufio.Reader, func()) {
+	tb.Helper()
+	var raw net.Conn
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+			c, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, network, addr)
+			if err == nil {
+				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+				raw = c
+			}
+			return c, err
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/events", nil)
+	if err != nil {
+		tb.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		tr.CloseIdleConnections()
+		tb.Fatalf("h2c round trip: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		tr.CloseIdleConnections()
+		tb.Fatalf("h2c status %d, want 200", resp.StatusCode)
+	}
+	if raw == nil {
+		_ = resp.Body.Close()
+		tr.CloseIdleConnections()
+		tb.Fatal("h2c dialer never ran — no raw conn to kill")
+	}
+	return raw, bufio.NewReader(resp.Body), func() {
+		_ = resp.Body.Close()
+		tr.CloseIdleConnections()
+	}
+}
+
 // readTicks consumes body lines until n "event: tick" lines were seen.
 func readTicks(tb testing.TB, br *bufio.Reader, n int) {
 	tb.Helper()
@@ -219,6 +300,14 @@ func readTicks(tb testing.TB, br *bufio.Reader, n int) {
 // 3 s and the goroutine count must fall back to baseline within 5 s,
 // sampled BEFORE shutdown (Engine.Shutdown on the native engines returns
 // immediately and never cancels SSE streams, so it cannot mask a leak).
+//
+// The h2c cells extend the pin to HTTP/2 (celeris#498). H2 has the same
+// hole for a different reason: an H2 stream's Context IS cancellable, but
+// closeConn → CloseH2 → Manager.Close used to skip streams whose handler
+// was still running on the H2 worker pool — precisely the SSE ones — so
+// nothing ever cancelled them. Both modes leaked all 32 handlers, and
+// because the H2 pool is process-global the parked handlers went on to
+// starve every later H2 connection in the same binary.
 func TestClientDisconnectCancelsStream(t *testing.T) {
 	const clients = 32
 	modes := []struct {
@@ -271,22 +360,39 @@ func runDisconnectCell(t *testing.T, cell sseCell, heartbeat time.Duration, ctxO
 		},
 	})
 
-	addr, shutdown := startSSEServer(t, cell.engine, cell.async, handler)
+	addr, shutdown := startSSEServer(t, cell.engine, cell.async, cell.h2c, handler)
 	defer shutdown()
 
 	runtime.GC()
 	baseline := runtime.NumGoroutine()
 
 	conns := make([]net.Conn, 0, clients)
+	var closers []func()
 	defer func() {
 		for _, c := range conns {
 			_ = c.Close()
 		}
+		for _, cl := range closers {
+			cl()
+		}
 	}()
 	for i := 0; i < clients; i++ {
-		conn, br := openSSEStream(t, addr)
+		var conn net.Conn
+		var br *bufio.Reader
+		if cell.h2c {
+			var closeClient func()
+			conn, br, closeClient = openSSEStreamH2C(t, addr)
+			closers = append(closers, closeClient)
+		} else {
+			conn, br = openSSEStream(t, addr)
+		}
 		conns = append(conns, conn)
 		readTicks(t, br, 2)
+		if cell.h2c {
+			// Head read — drop the open deadline before the kill so it
+			// cannot fire during the assertions (see openSSEStreamH2C).
+			_ = conn.SetReadDeadline(time.Time{})
+		}
 	}
 	if got := started.Load(); got != int32(clients) {
 		t.Fatalf("started=%d handlers, want %d", got, clients)
@@ -341,8 +447,10 @@ func runDisconnectCell(t *testing.T, cell sseCell, heartbeat time.Duration, ctxO
 	// (epoll errPeerClosed / io_uring Res==0), so the fd is gone as soon
 	// as the engine observed the peer's FIN. std is not pinned here:
 	// net/http's connection lifecycle after a half-close is its own
-	// business and not what celeris#494 is about.
-	if cell.engine == celeris.Std {
+	// business and not what celeris#494 is about. Nor is h2c: an H2 conn
+	// is never Detached, so it is the ordinary H2 read loop that reaps it
+	// on recv-EOF, which is not the behaviour under test.
+	if cell.engine == celeris.Std || cell.h2c {
 		return
 	}
 	for i, c := range conns {
@@ -401,7 +509,7 @@ func runStreamEndCell(t *testing.T, engine celeris.EngineType, async bool) {
 			}
 		},
 	})
-	addr, shutdown := startSSEServer(t, engine, async, handler)
+	addr, shutdown := startSSEServer(t, engine, async, false, handler)
 	defer shutdown()
 
 	const clients = 8

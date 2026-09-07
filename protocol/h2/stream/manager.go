@@ -358,13 +358,23 @@ func (m *Manager) GetSendWindowsAndMaxFrameFast(s *Stream) (connWindow int32, st
 	return
 }
 
-// Close releases all streams still held by the manager. Called when the
-// H2 connection is closed to prevent stream objects from leaking in the map.
+// Close cancels and releases all streams still held by the manager. Called
+// when the H2 connection is closed to prevent stream objects from leaking in
+// the map, and to tell any handler still running on one that its client is
+// gone.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	for id, s := range m.streams {
 		delete(m.streams, id)
-		// Only release streams that aren't running async handlers.
+		// Cancel every stream, async or not. A detached long-lived handler
+		// (an SSE stream parked on client.Context().Done()) learns the peer
+		// is gone only through its stream context: H2 streams carry none of
+		// the OnWS* hooks the H1 path uses for that signal, so without this
+		// the handler, its heartbeat and the release goroutine leak for the
+		// process lifetime — celeris#494's shape on H2 (celeris#498).
+		// Cancelling only signals; releasing stays the async goroutine's job,
+		// as in handleGoAway, because it still owns the stream object.
+		s.Cancel()
 		if s.flags.Load()&flagAsyncRunning == 0 {
 			s.Release()
 		}
