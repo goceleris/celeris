@@ -2510,7 +2510,11 @@ func TestContextKeyNilAfterPoolReturn(t *testing.T) {
 		return nil
 	}
 	chain := []celeris.HandlerFunc{mw, handler}
-	ctx, _ := celeristest.NewContextT(t, "GET", "/",
+	// NewContext, not NewContextT: this test must release mid-body to observe
+	// OnRelease, so it owns the release. NewContextT would ALSO register a
+	// cleanup release, returning the same Context to the pool twice
+	// (celeris#512).
+	ctx, _ := celeristest.NewContext("GET", "/",
 		celeristest.WithHandlers(chain...),
 	)
 	err := ctx.Next()
