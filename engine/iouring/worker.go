@@ -3445,14 +3445,21 @@ func (w *Worker) drainDetachQueue() {
 					// the matching resume would take the re-arm branch and
 					// arm a SECOND multishot recv on the same socket, so two
 					// armed recvs would deliver interleaved data (celeris#482
-					// bug 2). PauseRecv only enqueues on the false->true
-					// transition and recvPauseDesired is already true, so
-					// nothing would retry on its own -- re-enqueue here.
+					// bug 2).
+					//
+					// Deliberately do NOT re-enqueue. The worker loop calls
+					// drainDetachQueue every iteration, so re-enqueueing here
+					// (and re-arming detachQPending) would make the worker
+					// spin on this conn instead of reaping the completions
+					// that free the ring -- and each pass would append the
+					// same conn again, growing the queue without bound. The
+					// pause is simply deferred: recvPauseDesired stays true
+					// and recvPaused stays false, so the next drain retries.
+					// A conn under backpressure is by definition still moving
+					// data, so another drain is imminent. Until then recv
+					// stays armed, which costs throughput on one conn but is
+					// always safe -- unlike a phantom pause.
 					applied = false
-					w.detachQMu.Lock()
-					w.detachQueue = append(w.detachQueue, cs)
-					w.detachQPending.Store(1)
-					w.detachQMu.Unlock()
 				} else {
 					// Cancel the in-flight recv. cs.fd is a fixed-file
 					// INDEX when fixed files are on, so cancelling by raw
