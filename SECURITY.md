@@ -216,14 +216,25 @@ If you discover a security vulnerability in celeris, please report it responsibl
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Instead, please email security@goceleris.dev with:
+Preferred channel — **private vulnerability reporting** (enabled on this
+repository): open the repository's **Security** tab and choose
+**"Report a vulnerability"**, or go directly to
+<https://github.com/goceleris/celeris/security/advisories/new>. The report
+is visible only to the maintainers, and the resulting advisory, CVE and
+credit are handled in the same place.
+
+Alternative channel: email **security@goceleris.dev**.
+
+Either way, please include:
 
 - A description of the vulnerability
-- Steps to reproduce
-- Potential impact
+- Steps to reproduce (a minimal Go program is ideal)
+- Potential impact and the engine(s) affected (std / epoll / io_uring / adaptive)
 - Suggested fix (if any)
 
-We will acknowledge receipt within 48 hours and aim to provide a fix within 7 days for critical issues.
+We will **acknowledge receipt within 72 hours** and aim to provide a fix
+within 7 days for critical issues. Fixes ship as a patch release of the
+supported line and are announced through a GitHub Security Advisory.
 
 ## Scope
 

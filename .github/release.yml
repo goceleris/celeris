@@ -1,0 +1,30 @@
+# Automatically generated release notes (GitHub Releases is the
+# changelog — there is no CHANGELOG.md). PRs are grouped by label; label
+# every PR with exactly one of the category labels below so it lands in
+# the right section. Dependency bumps are excluded from the notes.
+#
+# https://docs.github.com/repositories/releasing-projects-on-github/automatically-generated-release-notes
+changelog:
+  exclude:
+    labels:
+      - dependencies
+      - github_actions
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking
+    - title: Security
+      labels:
+        - security
+    - title: Fixes
+      labels:
+        - bug
+    - title: Performance
+      labels:
+        - performance
+    - title: Features
+      labels:
+        - enhancement
+    - title: Other
+      labels:
+        - "*"

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -704,6 +705,40 @@ func decodeToValue(raw []byte, codec *protocol.TypeCodec, col protocol.ColumnDes
 	return cp, nil
 }
 
+// The int64→narrower helpers below are the scan-side counterpart of the
+// encoder's "int4 overflow" / "int2 overflow" checks: a value that does not
+// fit the destination fails the scan instead of wrapping silently
+// (celeris#502). Each returns the zero value with the error so callers can
+// leave the destination untouched.
+
+func int64ToInt(n int64) (int, error) {
+	if n < math.MinInt || n > math.MaxInt {
+		return 0, fmt.Errorf("celeris-postgres: scan: value %d out of range for int", n)
+	}
+	return int(n), nil
+}
+
+func int64ToInt32(n int64) (int32, error) {
+	if n < math.MinInt32 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("celeris-postgres: scan: value %d out of range for int32", n)
+	}
+	return int32(n), nil
+}
+
+func int64ToInt16(n int64) (int16, error) {
+	if n < math.MinInt16 || n > math.MaxInt16 {
+		return 0, fmt.Errorf("celeris-postgres: scan: value %d out of range for int16", n)
+	}
+	return int16(n), nil
+}
+
+func int64ToUint32(n int64) (uint32, error) {
+	if n < 0 || n > math.MaxUint32 {
+		return 0, fmt.Errorf("celeris-postgres: scan: value %d out of range for uint32", n)
+	}
+	return uint32(n), nil
+}
+
 // decodeBinaryInto decodes raw binary-format bytes directly into dest
 // for the common primitive types. Returns (true, err) when the type was
 // handled (err may be non-nil for decode failures); (false, nil) when
@@ -715,7 +750,11 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		if err != nil {
 			return true, err
 		}
-		*d = int(n)
+		v, err := int64ToInt(n)
+		if err != nil {
+			return true, err
+		}
+		*d = v
 		return true, nil
 	case *int64:
 		n, err := protocol.DecodeIntBinary(raw, codec)
@@ -729,21 +768,33 @@ func decodeBinaryInto(dest any, raw []byte, codec *protocol.TypeCodec) (bool, er
 		if err != nil {
 			return true, err
 		}
-		*d = int32(n)
+		v, err := int64ToInt32(n)
+		if err != nil {
+			return true, err
+		}
+		*d = v
 		return true, nil
 	case *int16:
 		n, err := protocol.DecodeIntBinary(raw, codec)
 		if err != nil {
 			return true, err
 		}
-		*d = int16(n)
+		v, err := int64ToInt16(n)
+		if err != nil {
+			return true, err
+		}
+		*d = v
 		return true, nil
 	case *uint32:
 		n, err := protocol.DecodeIntBinary(raw, codec)
 		if err != nil {
 			return true, err
 		}
-		*d = uint32(n)
+		v, err := int64ToUint32(n)
+		if err != nil {
+			return true, err
+		}
+		*d = v
 		return true, nil
 	case *string:
 		// Fast path for text/varchar/etc.: no interface boxing, single
@@ -774,7 +825,11 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 		if err != nil {
 			return true, err
 		}
-		*d = int(n)
+		v, err := int64ToInt(n)
+		if err != nil {
+			return true, err
+		}
+		*d = v
 		return true, nil
 	case *int64:
 		n, err := protocol.ParseIntTextASCII(raw)
@@ -788,7 +843,11 @@ func decodeTextInto(dest any, raw []byte, _ *protocol.TypeCodec) (bool, error) {
 		if err != nil {
 			return true, err
 		}
-		*d = int32(n)
+		v, err := int64ToInt32(n)
+		if err != nil {
+			return true, err
+		}
+		*d = v
 		return true, nil
 	case *string:
 		*d = string(raw)
@@ -868,7 +927,11 @@ func convertAssign(dest any, src any) error {
 	case *int:
 		switch s := src.(type) {
 		case int64:
-			*d = int(s)
+			v, err := int64ToInt(s)
+			if err != nil {
+				return err
+			}
+			*d = v
 		case float64:
 			*d = int(s)
 		case string:
@@ -888,14 +951,22 @@ func convertAssign(dest any, src any) error {
 	case *int32:
 		switch s := src.(type) {
 		case int64:
-			*d = int32(s)
+			v, err := int64ToInt32(s)
+			if err != nil {
+				return err
+			}
+			*d = v
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to int32", src)
 		}
 	case *int16:
 		switch s := src.(type) {
 		case int64:
-			*d = int16(s)
+			v, err := int64ToInt16(s)
+			if err != nil {
+				return err
+			}
+			*d = v
 		default:
 			return fmt.Errorf("celeris-postgres: scan: cannot convert %T to int16", src)
 		}

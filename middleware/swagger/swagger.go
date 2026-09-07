@@ -3,14 +3,126 @@ package swagger
 import (
 	"encoding/json"
 	"fmt"
-	"html"
+	"html/template"
+	"strconv"
 	"strings"
 
 	"github.com/goceleris/celeris"
 )
 
+// The UI pages are html/template templates: it is Go's context-aware
+// escaper, so every interpolated configuration value is escaped for the
+// exact context it lands in — RCDATA for <title>, URL attribute for href /
+// src / data-url (percent-normalised, then HTML-escaped; non-http(s)
+// schemes are neutralised), plain attribute for data-configuration, and a
+// JSON string literal (with '<', '>', '&', U+2028 and U+2029 escaped, so it
+// cannot close the enclosing <script> block) for values inside <script>.
+// Bool and int literals are passed as template.JS so html/template does
+// not pad them with spaces; they are never configuration strings.
+var (
+	swaggerUITmpl = template.Must(template.New("swagger-ui").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<link rel="stylesheet" href="{{.CSSURL}}">
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="{{.BundleURL}}"></script>
+<script src="{{.PresetURL}}"></script>
+<script>
+const ui = SwaggerUIBundle({
+  url: {{.SpecURL}},
+  dom_id: "#swagger-ui",
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+  layout: "StandaloneLayout",
+  docExpansion: {{.DocExpansion}},
+  deepLinking: {{.DeepLinking}},
+  persistAuthorization: {{.PersistAuthorization}},
+  defaultModelsExpandDepth: {{.DefaultModelsExpandDepth}}{{if .OAuth2RedirectURL}},
+  oauth2RedirectUrl: {{.OAuth2RedirectURL}}{{end}}
+});{{if .InitOAuth}}
+ui.initOAuth({ {{- range $i, $p := .OAuth2}}{{if $i}}, {{end}}{{$p.Key}}: {{$p.Value}}{{end}}});{{end}}
+</script>
+</body>
+</html>`))
+
+	scalarTmpl = template.Must(template.New("scalar").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+</head>
+<body>
+<script id="api-reference" data-url="{{.SpecURL}}" data-configuration='{{.Configuration}}'></script>
+<script src="{{.ScriptURL}}"></script>
+</body>
+</html>`))
+
+	redocTmpl = template.Must(template.New("redoc").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+</head>
+<body>
+<div id="redoc-container"></div>
+<script src="{{.ScriptURL}}"></script>
+<script>
+Redoc.init({{.SpecURL}}, {{.Options}}, document.getElementById("redoc-container"));
+</script>
+</body>
+</html>`))
+)
+
+// jsProp is one property of the ui.initOAuth({...}) object literal. Key is
+// a constant JavaScript identifier chosen by this package, never
+// configuration, hence template.JS; Value is either a configuration string
+// (escaped by html/template as a JS string literal) or a template.JS
+// literal.
+type jsProp struct {
+	Key   template.JS
+	Value any
+}
+
+// swaggerUIPage is the data for swaggerUITmpl.
+type swaggerUIPage struct {
+	Title                    string
+	CSSURL                   string
+	BundleURL                string
+	PresetURL                string
+	SpecURL                  string
+	DocExpansion             string
+	DeepLinking              template.JS
+	PersistAuthorization     template.JS
+	DefaultModelsExpandDepth template.JS
+	OAuth2RedirectURL        string
+	InitOAuth                bool
+	OAuth2                   []jsProp
+}
+
+// scalarPage is the data for scalarTmpl.
+type scalarPage struct {
+	Title         string
+	SpecURL       string
+	Configuration string
+	ScriptURL     string
+}
+
+// redocPage is the data for redocTmpl.
+type redocPage struct {
+	Title     string
+	ScriptURL string
+	SpecURL   string
+	Options   map[string]any
+}
+
 // marshalOptions serializes the Options map to a JSON string for embedding
-// in HTML templates. Returns "{}" when opts is nil or empty.
+// in an HTML attribute. Returns "{}" when opts is nil or empty.
 func marshalOptions(opts map[string]any) string {
 	if len(opts) == 0 {
 		return "{}"
@@ -20,6 +132,18 @@ func marshalOptions(opts map[string]any) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// renderPage executes tmpl with data. Every field is a plain string, a
+// bool/int literal or an Options map that validate() has already proven
+// JSON-serializable, so Execute cannot fail; a failure is a template bug
+// and New() is startup code.
+func renderPage(tmpl *template.Template, data any) string {
+	var b strings.Builder
+	if err := tmpl.Execute(&b, data); err != nil {
+		panic(fmt.Sprintf("swagger: render %s page: %v", tmpl.Name(), err))
+	}
+	return b.String()
 }
 
 // New creates a swagger middleware that serves an OpenAPI spec viewer.
@@ -102,133 +226,82 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		depth = *ui.DefaultModelsExpandDepth
 	}
 
-	var cssURL, bundleURL, presetURL string
+	assets := "https://unpkg.com/swagger-ui-dist@5"
 	if cfg.AssetsPath != "" {
-		base := strings.TrimRight(cfg.AssetsPath, "/")
-		cssURL = html.EscapeString(base + "/swagger-ui.css")
-		bundleURL = html.EscapeString(base + "/swagger-ui-bundle.js")
-		presetURL = html.EscapeString(base + "/swagger-ui-standalone-preset.js")
-	} else {
-		const cdn = "https://unpkg.com/swagger-ui-dist@5"
-		cssURL = cdn + "/swagger-ui.css"
-		bundleURL = cdn + "/swagger-ui-bundle.js"
-		presetURL = cdn + "/swagger-ui-standalone-preset.js"
+		assets = strings.TrimRight(cfg.AssetsPath, "/")
 	}
 
-	var oauth2Redirect string
-	if ui.OAuth2RedirectURL != "" {
-		oauth2Redirect = fmt.Sprintf(",\n  oauth2RedirectUrl: %q", ui.OAuth2RedirectURL)
+	data := swaggerUIPage{
+		Title:                    ui.Title,
+		CSSURL:                   assets + "/swagger-ui.css",
+		BundleURL:                assets + "/swagger-ui-bundle.js",
+		PresetURL:                assets + "/swagger-ui-standalone-preset.js",
+		SpecURL:                  specURL,
+		DocExpansion:             ui.DocExpansion,
+		DeepLinking:              template.JS(strconv.FormatBool(ui.DeepLinking)),
+		PersistAuthorization:     template.JS(strconv.FormatBool(ui.PersistAuthorization)),
+		DefaultModelsExpandDepth: template.JS(strconv.Itoa(depth)),
+		OAuth2RedirectURL:        ui.OAuth2RedirectURL,
 	}
 
-	var oauth2Init string
-	if ui.OAuth2 != nil {
-		oa := ui.OAuth2
-		var oaParts []string
+	if oa := ui.OAuth2; oa != nil {
+		data.InitOAuth = true
 		if oa.ClientID != "" {
-			oaParts = append(oaParts, fmt.Sprintf("clientId: %q", oa.ClientID))
+			data.OAuth2 = append(data.OAuth2, jsProp{"clientId", oa.ClientID})
 		}
 		if oa.UsePKCE {
-			oaParts = append(oaParts, "usePkceWithAuthorizationCodeGrant: true")
+			data.OAuth2 = append(data.OAuth2, jsProp{"usePkceWithAuthorizationCodeGrant", template.JS("true")})
 		}
 		if oa.Realm != "" {
-			oaParts = append(oaParts, fmt.Sprintf("realm: %q", oa.Realm))
+			data.OAuth2 = append(data.OAuth2, jsProp{"realm", oa.Realm})
 		}
 		if oa.AppName != "" {
-			oaParts = append(oaParts, fmt.Sprintf("appName: %q", oa.AppName))
+			data.OAuth2 = append(data.OAuth2, jsProp{"appName", oa.AppName})
 		}
 		if len(oa.Scopes) > 0 {
-			oaParts = append(oaParts, fmt.Sprintf("scopes: %q", strings.Join(oa.Scopes, " ")))
+			data.OAuth2 = append(data.OAuth2, jsProp{"scopes", strings.Join(oa.Scopes, " ")})
 		}
-		oauth2Init = fmt.Sprintf("\nui.initOAuth({%s});", strings.Join(oaParts, ", "))
 	}
 
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>%s</title>
-<link rel="stylesheet" href="%s">
-</head>
-<body>
-<div id="swagger-ui"></div>
-<script src="%s"></script>
-<script src="%s"></script>
-<script>
-const ui = SwaggerUIBundle({
-  url: %q,
-  dom_id: "#swagger-ui",
-  presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
-  layout: "StandaloneLayout",
-  docExpansion: %q,
-  deepLinking: %v,
-  persistAuthorization: %v,
-  defaultModelsExpandDepth: %d%s
-});%s
-</script>
-</body>
-</html>`, html.EscapeString(ui.Title), cssURL, bundleURL, presetURL,
-		specURL, ui.DocExpansion, ui.DeepLinking, ui.PersistAuthorization,
-		depth, oauth2Redirect, oauth2Init)
+	return renderPage(swaggerUITmpl, data)
 }
 
 func buildScalarPage(cfg Config, specURL string) string {
-	ui := cfg.UI
-
 	scalarOpts := cfg.Options
 	if scalarOpts == nil {
 		scalarOpts = map[string]any{"theme": "default"}
 	}
-	dataCfg := html.EscapeString(marshalOptions(scalarOpts))
 
-	var scriptTag string
+	scriptURL := "https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"
 	if cfg.AssetsPath != "" {
-		base := strings.TrimRight(cfg.AssetsPath, "/")
-		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='%s'></script>
-<script src="%s/standalone.min.js"></script>`, specURL, dataCfg, html.EscapeString(base))
-	} else {
-		scriptTag = fmt.Sprintf(`<script id="api-reference" data-url=%q data-configuration='%s'></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>`, specURL, dataCfg)
+		scriptURL = strings.TrimRight(cfg.AssetsPath, "/") + "/standalone.min.js"
 	}
 
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>%s</title>
-</head>
-<body>
-%s
-</body>
-</html>`, html.EscapeString(ui.Title), scriptTag)
+	return renderPage(scalarTmpl, scalarPage{
+		Title:         cfg.UI.Title,
+		SpecURL:       specURL,
+		Configuration: marshalOptions(scalarOpts),
+		ScriptURL:     scriptURL,
+	})
 }
 
 func buildReDocPage(cfg Config, specURL string) string {
-	ui := cfg.UI
-	opts := marshalOptions(cfg.Options)
-
-	var jsURL string
-	if cfg.AssetsPath != "" {
-		base := strings.TrimRight(cfg.AssetsPath, "/")
-		jsURL = html.EscapeString(base + "/redoc.standalone.js")
-	} else {
-		jsURL = "https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"
+	// html/template marshals the map itself as the JS object literal; an
+	// empty map (rather than nil) keeps the "{}" default.
+	opts := cfg.Options
+	if len(opts) == 0 {
+		opts = map[string]any{}
 	}
 
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>%s</title>
-</head>
-<body>
-<div id="redoc-container"></div>
-<script src="%s"></script>
-<script>
-Redoc.init(%q, %s, document.getElementById("redoc-container"));
-</script>
-</body>
-</html>`, html.EscapeString(ui.Title), jsURL, specURL, opts)
+	scriptURL := "https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"
+	if cfg.AssetsPath != "" {
+		scriptURL = strings.TrimRight(cfg.AssetsPath, "/") + "/redoc.standalone.js"
+	}
+
+	return renderPage(redocTmpl, redocPage{
+		Title:     cfg.UI.Title,
+		ScriptURL: scriptURL,
+		SpecURL:   specURL,
+		Options:   opts,
+	})
 }

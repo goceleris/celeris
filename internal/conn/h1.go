@@ -129,9 +129,11 @@ type H1State struct {
 	RawWriteFn func([]byte)
 
 	// OnDetachClose is called by the engine when it closes a detached
-	// connection (timeout, error, shutdown). The WebSocket middleware sets
-	// this to close the io.Pipe and data channel, unblocking the handler
-	// goroutine. Called under cs.detachMu — must not block.
+	// connection (timeout, error, shutdown). Set by long-lived-stream
+	// middleware: WebSocket closes the io.Pipe and data channel through it,
+	// SSE cancels its Client.Context() (celeris#494) — either way it
+	// unblocks the handler goroutine. Called under cs.detachMu — must not
+	// block.
 	//
 	// Detached-connection API surface — stable. The fields below
 	// (OnDetachClose, OnError, PauseRecv, ResumeRecv, IdleDeadlineNs) form
@@ -153,13 +155,22 @@ type H1State struct {
 	// OnDetachClose, so it either observes a fully-wired connection or skips WS
 	// teardown entirely (the conn is still closed via the fd/read path). Fresh
 	// per connection (NewH1State), so it starts false.
+	//
+	// Also flipped by the SSE middleware, which installs OnError and then
+	// OnDetachClose (via the same setter) BEFORE Context.Detach — under
+	// cs.detachMu in async mode, on the engine thread in sync mode — so for
+	// SSE the flag is a plain enable bit rather than a publication barrier.
+	// Its only effects in closeConn are the OnDetachClose call and the
+	// PauseRecv/ResumeRecv nil-out, which SSE never uses. WSReady==true
+	// therefore does NOT mean the conn is a WebSocket.
 	WSReady atomic.Bool
 
 	// OnError is called by the engine when an I/O failure occurs on a
 	// detached connection (read error, write error, EPIPE, ECONNRESET, etc).
-	// The WebSocket middleware uses this to surface engine-side errors
-	// from the next user-level Read or Write call. Called under cs.detachMu
-	// — must not block.
+	// Set by long-lived-stream middleware: WebSocket surfaces the error from
+	// the next user-level Read or Write call, SSE cancels its
+	// Client.Context() (celeris#494). Called under cs.detachMu — must not
+	// block.
 	OnError func(err error)
 
 	// PauseRecv and ResumeRecv are set by the engine in OnDetach. The
