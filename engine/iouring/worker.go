@@ -3435,30 +3435,25 @@ func (w *Worker) drainDetachQueue() {
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
 			if desired {
 				// getCancelSQE, not a bare GetSQE: it submits and retries
-				// once when the SQ ring is full, so the cancel actually
-				// lands far more often. That is the whole of the change
-				// here -- the state assignment below stays unconditional.
-				sqe := w.getCancelSQE()
-				if sqe == nil {
-					// The ring stayed full even after a submit. Mark the
-					// conn paused anyway: that is the behaviour this engine
-					// has always shipped, and the alternative is worse.
-					//
-					// Leaving it unpaused means the middleware's requested
-					// pause NEVER takes effect -- recvPauseDesired stays true,
-					// recvPaused stays false, and PauseRecv only enqueues on
-					// the false->true transition, so nothing retries. Under
-					// sustained backpressure the peer keeps filling a buffer
-					// nobody is draining and the conn hangs; that regressed
-					// the celeris#482 guard with close-timeouts on kernel 6.17
-					// runners where the ring fills readily.
-					//
-					// The residual risk is the one #482 documented: the recv
-					// is still kernel-armed while we record it as paused, so a
-					// later resume can arm a second multishot recv. That is
-					// pre-existing, rare, and strictly less harmful than a
-					// pause that never happens.
-				} else {
+				// once when the SQ ring is full, so the cancel lands far
+				// more often. That is the whole of the improvement here.
+				//
+				// The state assignment below stays UNCONDITIONAL, even when
+				// no SQE is available. Leaving the conn unpaused would mean
+				// the middleware's requested pause never takes effect --
+				// recvPauseDesired stays true, recvPaused stays false, and
+				// PauseRecv only enqueues on the false->true transition, so
+				// nothing retries. Under sustained backpressure the peer then
+				// keeps filling a buffer nobody drains and the conn hangs;
+				// that regressed the celeris#482 guard with close-timeouts on
+				// kernel 6.17 runners, where the ring fills readily.
+				//
+				// The residual risk is the one #482 documented: on a full
+				// ring the recv is still kernel-armed while we record it as
+				// paused, so a later resume can arm a second multishot recv.
+				// Pre-existing, rare, and strictly less harmful than a pause
+				// that never happens at all.
+				if sqe := w.getCancelSQE(); sqe != nil {
 					// Cancel the in-flight recv. cs.fd is a fixed-file
 					// INDEX when fixed files are on, so cancelling by raw
 					// fd would match nothing; match by the recv's
