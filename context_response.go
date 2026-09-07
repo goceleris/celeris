@@ -1299,12 +1299,21 @@ func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
 
 // SetWSDetachClose installs a callback that the engine invokes when it
 // closes a detached connection (timeout, error, shutdown). This allows
-// the WebSocket middleware to unblock its handler goroutine.
+// detached-stream middleware (WebSocket, SSE) to unblock its handler
+// goroutine: WebSocket closes its io.Pipe and data channel, SSE cancels
+// Client.Context() (celeris#494).
+//
+// The callback runs on the engine thread under the connection's detach
+// mutex and must not block, take middleware locks, or call back into the
+// StreamWriter / raw write function.
 //
 // May be called either before or after [Context.Detach] — the underlying
 // H1State.OnDetachClose field is just stored; the engine reads it when
 // firing the close. Installing it BEFORE Detach is preferred so a peer
-// RST landing in the Detach race window is not lost.
+// RST landing in the Detach race window is not lost. On the std engine
+// the callback is backed by context.AfterFunc on the request context, so
+// it fires when the client connection closes or when ServeHTTP returns.
+// No-op on H2 streams.
 func (c *Context) SetWSDetachClose(fn func()) {
 	if c.stream.OnWSDetachClose != nil {
 		c.stream.OnWSDetachClose(fn)
@@ -1324,10 +1333,16 @@ func (c *Context) WSRawWriteFn() func([]byte) {
 // SetWSErrorHandler installs a handler called by the engine when an I/O
 // failure occurs on this detached connection. The WebSocket middleware uses
 // this to surface engine-side errors from the next user-level Read or Write
-// call. May be called either before or after [Context.Detach] — installing
+// call; the SSE middleware uses it to cancel Client.Context() (celeris#494).
+//
+// The handler runs on the engine thread under the connection's detach
+// mutex and must not block, take middleware locks, or call back into the
+// StreamWriter / raw write function.
+//
+// May be called either before or after [Context.Detach] — installing
 // BEFORE Detach is preferred so a pre-existing peer RST landing in the
 // Detach race window is not lost. No-op on engines that do not support
-// engine-integrated WebSocket (e.g. std).
+// engine-integrated detached streams (e.g. std, H2).
 func (c *Context) SetWSErrorHandler(fn func(error)) {
 	if c.stream.OnWSSetError != nil {
 		c.stream.OnWSSetError(fn)

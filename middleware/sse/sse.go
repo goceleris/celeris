@@ -14,6 +14,13 @@ import (
 // Handler is the function signature for SSE endpoint handlers.
 // The Client is valid for the duration of the call. When Handler returns,
 // the SSE stream is closed automatically.
+//
+// Handler MUST return when client.Context() is done or when Send returns
+// an error. On epoll/io_uring the engine cancels client.Context() as soon
+// as it detects the peer went away (celeris#494); on std the request
+// context does the same and a broken pipe additionally surfaces through
+// Send (or the heartbeat). A handler that ignores both keeps its goroutine
+// and the detached celeris.Context alive for the life of the process.
 type Handler func(client *Client)
 
 // Client provides the API for sending SSE events to a connected client.
@@ -363,6 +370,52 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 		}
 
+		// celeris#494: on epoll/io_uring the H1 StreamWriter can never
+		// fail — h1ResponseAdapter.Write/Flush/Close return nil over an
+		// error-less engine writeFn whose post-Detach guard silently
+		// drops bytes once the engine has closed the conn — and
+		// c.Context() is context.Background() for every H1 stream. A
+		// client that goes away is therefore invisible to this
+		// middleware unless the engine says so. It already does, through
+		// the two detached-conn callbacks the WebSocket middleware relies
+		// on: H1State.OnError (recv EOF/ECONNRESET, send EPIPE, parse
+		// error — fired before closeConn) and H1State.OnDetachClose
+		// (fired inside closeConn/shutdown for every close cause,
+		// including EPOLLERR/HUP-only closes, send-cap overflow, the idle
+		// deadline and engine shutdown; gated on H1State.WSReady, which
+		// the SetWSDetachClose setter itself stores). Route both into the
+		// local cancel: client.Context() fires, Send returns ctx.Err(),
+		// the heartbeat goroutine exits, the user handler returns and
+		// runStream's defer tears down and calls done().
+		//
+		// Contract: both callbacks run on the engine thread UNDER
+		// cs.detachMu and must not block. cancel() takes no celeris lock —
+		// in particular not client.mu, which sits above detachMu in the
+		// write path (sendBlocking holds client.mu while sw.Write → the
+		// guarded writeFn → detachMu.Lock). Capture only the local
+		// `cancel`: the Client is pooled and releaseClient nils
+		// client.cancel, while the engine keeps OnError installed for the
+		// conn's remaining lifetime, so a late fire must be a harmless
+		// no-op on a finished ctx. Never call done(), client.Close() or
+		// close(client.queue) from here — the defer chain owns teardown.
+		//
+		// Ordering: installed AFTER OnConnect, so a rejected request
+		// leaves no stale hook on a keep-alive conn that keeps serving,
+		// and BEFORE Detach, so a peer RST landing in the Detach window
+		// is not lost. That is safe because in async mode the dispatch
+		// goroutine holds cs.detachMu across ProcessH1 until OnDetach
+		// publishes Detached and unlocks, so these writes are serialised
+		// against every closeConn/OnError read; sync mode runs on the
+		// engine thread itself. SetWSDetachClose goes last because its
+		// setter publishes WSReady, whose only other effect is nil-ing
+		// PauseRecv/ResumeRecv in closeConn — which SSE never reads.
+		// On std SetWSErrorHandler is a no-op and SetWSDetachClose is
+		// backed by net/http's request context (engine/std/bridge.go),
+		// so a client that goes away cancels the ctx there as well.
+		// Both are no-ops on H2 streams (no OnWS* hooks).
+		c.SetWSErrorHandler(func(_ error) { cancel() })
+		c.SetWSDetachClose(cancel)
+
 		done := c.Detach()
 
 		// Engine asymmetry (celeris#273):
@@ -384,6 +437,12 @@ func New(config ...Config) celeris.HandlerFunc {
 		// Pre-v1.4.4 the middleware always ran inline, which manifested
 		// as the SSE row of celeris#273's repro matrix
 		// (iouring|epoll × any AsyncHandlers → TIMEOUT on /events).
+		//
+		// Disconnect detection on the native engines is engine-driven
+		// via the SetWSErrorHandler/SetWSDetachClose hooks installed
+		// above (celeris#494); the heartbeat keeps proxies/NATs from
+		// idling the stream out and is how std notices a dead peer, not
+		// the primary liveness signal.
 		// heartbeatDone is closed by the heartbeat goroutine on exit so the
 		// defer can wait for it before returning the Client to the pool.
 		// Without this, the goroutine could read client.closed after a
@@ -434,6 +493,30 @@ func New(config ...Config) celeris.HandlerFunc {
 					onDisconnect(c, client)
 				}
 				releaseClient(client)
+				// Ask the engine to reap the connection now that the
+				// stream is over. After Detach the native engines apply
+				// none of their configured timeouts to this conn
+				// (checkTimeouts honours only IdleDeadlineNs on Detached
+				// conns) and never resume parsing it, so without this a
+				// finished SSE conn stays open — holding its fd and
+				// connState — until the peer happens to close. It also
+				// narrows (one idle sweep, ~25 ms) the window in which a
+				// keep-alive reuse re-enters ProcessH1 on a Detached
+				// H1State whose cached Context this stream just released;
+				// it does NOT close that gap: ProcessH1 only short-circuits
+				// a Detached conn when WSDataDelivery is set (WebSocket),
+				// so bytes a client sends on an SSE conn while the stream
+				// is live are still parsed as a new request on the same
+				// cached stream/Context. That is a pre-existing H1-layer
+				// bug tracked separately from celeris#494.
+				// A 1 ns deadline makes the next idle sweep run closeConn:
+				// OnDetachClose fires our (idempotent, already spent)
+				// cancel and the engine sends FIN after the terminal chunk
+				// (io_uring defers the fd close until pending sends drain;
+				// epoll's guarded fn flushed inline). Atomic store; MUST
+				// precede done() because c is returned to the pool once
+				// detachDone closes. No-op on std and H2 (no hook).
+				c.SetWSIdleDeadline(1)
 				done()
 			}()
 

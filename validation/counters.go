@@ -11,6 +11,7 @@ type Counters struct {
 	PanicCount               uint64 `json:"panic_count"`
 	RatelimitTokenViolations uint64 `json:"ratelimit_token_violations"`
 	SessionOwnerMismatches   uint64 `json:"session_owner_mismatches"`
+	SessionCookieDrops       uint64 `json:"session_cookie_drops"`
 	JWTLateAdmits            uint64 `json:"jwt_late_admits"`
 	IouringSQECorruptions    uint64 `json:"iouring_sqe_corruptions"`
 }

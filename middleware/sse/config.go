@@ -7,8 +7,12 @@ import (
 )
 
 const (
-	// DefaultHeartbeatInterval is the default interval between heartbeat
-	// comments sent to detect client disconnects.
+	// DefaultHeartbeatInterval is the default interval between the
+	// ": heartbeat" comment lines that keep proxies and NATs from idling
+	// the stream out. On the std engine a heartbeat write is also how a
+	// dead peer is noticed (Send returns the broken-pipe error); on
+	// epoll/io_uring the engine cancels Client.Context() directly when
+	// the peer goes away, regardless of this setting (celeris#494).
 	DefaultHeartbeatInterval = 15 * time.Second
 )
 
@@ -44,9 +48,13 @@ type Config struct {
 	// Required; panics at init if nil.
 	Handler Handler
 
-	// HeartbeatInterval is the interval between heartbeat comments sent to
-	// detect client disconnects. Set to a negative value to disable.
-	// Default: 15s.
+	// HeartbeatInterval is the interval between ": heartbeat" comment
+	// lines that keep proxies and NATs from idling the stream out. On the
+	// std engine a heartbeat write additionally surfaces a broken pipe
+	// through Send, which is how std notices a dead peer; on epoll/io_uring
+	// client disconnects are reported by the engine to Client.Context()
+	// regardless of this setting (celeris#494). Set to a negative value to
+	// disable. Default: 15s.
 	HeartbeatInterval time.Duration
 
 	// RetryInterval is the reconnection time (in milliseconds) sent to the
