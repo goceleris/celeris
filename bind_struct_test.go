@@ -18,7 +18,6 @@ func TestBindQueryDefaultsAndConversion(t *testing.T) {
 		celeristest.WithQuery("tag", "a"),
 		celeristest.WithQuery("tag", "b"),
 	)
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Page  int      `query:"page"  default:"1"`
@@ -44,7 +43,6 @@ func TestBindParamsAndHeader(t *testing.T) {
 		celeristest.WithParam("id", "42"),
 		celeristest.WithHeader("X-Request-Id", "trace-abc"),
 	)
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		ID    int    `param:"id"`
@@ -71,7 +69,6 @@ func TestBindAllBodyWinsOverQuery(t *testing.T) {
 		celeristest.WithContentType("application/json"),
 		celeristest.WithBody([]byte(`{"name":"frombody"}`)),
 	)
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Name string `query:"name" json:"name"`
@@ -92,7 +89,6 @@ func TestBindAllBodyWinsOverQuery(t *testing.T) {
 
 func TestBindAllWithoutBodyIsNotAnError(t *testing.T) {
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x", celeristest.WithQuery("page", "5"))
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Page int `query:"page"`
@@ -107,7 +103,6 @@ func TestBindAllWithoutBodyIsNotAnError(t *testing.T) {
 
 func TestBindConversionErrorIsTyped(t *testing.T) {
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x", celeristest.WithQuery("page", "notanumber"))
-	defer celeristest.ReleaseContext(ctx)
 
 	var v struct {
 		Page int `query:"page"`
@@ -130,7 +125,6 @@ func TestBindDurationAndBool(t *testing.T) {
 		celeristest.WithQuery("timeout", "1500ms"),
 		celeristest.WithQuery("debug", "true"),
 	)
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Timeout time.Duration `query:"timeout"`
@@ -149,7 +143,6 @@ func TestBindDurationAndBool(t *testing.T) {
 
 func TestBindPointerFieldStaysNilWhenAbsent(t *testing.T) {
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x")
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Cursor *string `query:"cursor"`
@@ -164,7 +157,6 @@ func TestBindPointerFieldStaysNilWhenAbsent(t *testing.T) {
 
 func TestBindPointerFieldSetWhenPresent(t *testing.T) {
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x", celeristest.WithQuery("cursor", "abc"))
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Cursor *string `query:"cursor"`
@@ -179,7 +171,6 @@ func TestBindPointerFieldSetWhenPresent(t *testing.T) {
 
 func TestBindRequiresNonNilStructPointer(t *testing.T) {
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x")
-	defer celeristest.ReleaseContext(ctx)
 
 	var s struct{}
 	if err := ctx.BindQuery(s); err == nil {
@@ -200,7 +191,6 @@ func TestUntaggedFieldsAreLeftAlone(t *testing.T) {
 		celeristest.WithQuery("page", "1"),
 		celeristest.WithQuery("Internal", "hacked"),
 	)
-	defer celeristest.ReleaseContext(ctx)
 
 	got := struct {
 		Page     int `query:"page"`
@@ -221,7 +211,6 @@ func TestBindEmbeddedStruct(t *testing.T) {
 		Limit int `query:"limit" default:"10"`
 	}
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x", celeristest.WithQuery("page", "4"))
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Pagination
@@ -244,7 +233,6 @@ func TestBindForm(t *testing.T) {
 		celeristest.WithContentType("application/x-www-form-urlencoded"),
 		celeristest.WithBody([]byte(form.Encode())),
 	)
-	defer celeristest.ReleaseContext(ctx)
 
 	var got struct {
 		Name string `form:"name"`
@@ -267,7 +255,6 @@ func (s stubValidator) Validate(any) error { return s.err }
 func TestValidateWithoutValidatorIsAnError(t *testing.T) {
 	celeris.SetValidator(nil)
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x")
-	defer celeristest.ReleaseContext(ctx)
 
 	err := ctx.Validate(&struct{}{})
 	if !errors.Is(err, celeris.ErrNoValidator) {
@@ -281,7 +268,6 @@ func TestBindAndValidateRunsTheValidator(t *testing.T) {
 	t.Cleanup(func() { celeris.SetValidator(nil) })
 
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x", celeristest.WithQuery("page", "2"))
-	defer celeristest.ReleaseContext(ctx)
 
 	var v struct {
 		Page int `query:"page"`
@@ -300,7 +286,6 @@ func TestBindAndValidateSucceedsWhenValidatorPasses(t *testing.T) {
 	t.Cleanup(func() { celeris.SetValidator(nil) })
 
 	ctx, _ := celeristest.NewContextT(t, "GET", "/x", celeristest.WithQuery("page", "9"))
-	defer celeristest.ReleaseContext(ctx)
 
 	var v struct {
 		Page int `query:"page"`

@@ -134,7 +134,14 @@ type Context struct {
 	bytesWritten int
 	streamWriter *StreamWriter
 
-	detached   bool
+	detached bool
+	// pooled guards against a double release. Returning one Context to
+	// contextPool twice lets two concurrent Get calls hand the SAME object
+	// to two goroutines, which then both write c.stream / c.index in
+	// acquireContext -- a data race whose symptom appears in whatever
+	// unrelated test or request next draws from the pool (celeris#512).
+	// Release is therefore idempotent: the second call is a no-op.
+	pooled     bool
 	detachDone chan struct{}
 	// detachSnap is allocated only when Detach() runs and stores the
 	// status + elapsed snapshot captured by done() so the metrics
@@ -235,6 +242,7 @@ func acquireContext(s *stream.Stream) *Context {
 			s.CachedCtx = c
 		}
 	}
+	c.pooled = false
 	c.stream = s
 	c.index = -1
 	c.statusCode = 200
@@ -245,6 +253,15 @@ func acquireContext(s *stream.Stream) *Context {
 }
 
 func releaseContext(c *Context) {
+	// Idempotent: a second release is a no-op. Returning one Context to
+	// contextPool twice lets two concurrent Get calls hand the SAME object
+	// to two goroutines (celeris#512); the symptom then surfaces in whatever
+	// unrelated code next draws from the pool, which makes it very hard to
+	// trace back. Callers that release both explicitly and via a cleanup
+	// hook land here.
+	if c.pooled {
+		return
+	}
 	// If the context is cached on the stream for reuse, reset but
 	// do not return to the pool. The stream owns its lifecycle.
 	//
@@ -262,6 +279,7 @@ func releaseContext(c *Context) {
 	cached := !c.detached && c.stream != nil && c.stream.CachedCtx == c
 	c.reset()
 	if !cached {
+		c.pooled = true
 		contextPool.Put(c)
 	}
 }
