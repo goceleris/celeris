@@ -462,9 +462,33 @@ func ProcessH1(ctx context.Context, data []byte, state *H1State, handler stream.
 	// WebSocket upgrade: deliver raw bytes to the middleware goroutine
 	// instead of parsing as H1. The delivery callback writes to an io.Pipe
 	// that the goroutine reads from.
-	if state.Detached.Load() && state.WSDataDelivery != nil {
-		state.WSDataDelivery(data)
-		return nil
+	if state.Detached.Load() {
+		if state.WSDataDelivery != nil {
+			state.WSDataDelivery(data)
+			return nil
+		}
+		// Detached WITHOUT a WebSocket sink -- Server-Sent Events, or any
+		// handler that took the connection over. The stream is single-
+		// response by contract, so there is no second request to serve on
+		// it. Parsing these bytes would reuse the SAME per-connection
+		// cached stream and Context: populateCachedStream resets
+		// state.stream while acquireContext hands back s.CachedCtx, i.e.
+		// the still-detached Context, and mutates it underneath the live
+		// handler. The consequences are all real (celeris#497):
+		//
+		//   - the second response interleaves with SSE chunks through the
+		//     shared guarded write function;
+		//   - if the second request hits the SSE route again it overwrites
+		//     state.OnError / state.OnDetachClose, losing the first
+		//     stream's cancel (the celeris#494 leak shape);
+		//   - recoverAndRelease starts a second <-c.detachDone waiter, so
+		//     the first stream's done() releases the same Context twice.
+		//
+		// A peer sending here is violating the contract, so close rather
+		// than silently discarding: dropping the bytes would leave a
+		// half-talking client waiting forever for a response we will never
+		// send.
+		return errConnectionClose
 	}
 
 	// Slowloris defence — ReadHeaderTimeout state machine.
