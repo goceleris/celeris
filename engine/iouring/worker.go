@@ -3433,33 +3433,31 @@ func (w *Worker) drainDetachQueue() {
 		// CQEs) is tagged with udProvide so the main dispatcher silently
 		// ignores it instead of routing through handleRecv.
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
-			applied := true
 			if desired {
-				// getCancelSQE (not a bare GetSQE): it submits and retries
-				// once when the SQ ring is full, exactly as the close path
-				// does. A dropped pause is not benign here -- see below.
+				// getCancelSQE, not a bare GetSQE: it submits and retries
+				// once when the SQ ring is full, so the cancel actually
+				// lands far more often. That is the whole of the change
+				// here -- the state assignment below stays unconditional.
 				sqe := w.getCancelSQE()
 				if sqe == nil {
-					// The ring stayed full. Do NOT record the conn as
-					// paused: its multishot recv is still kernel-armed, and
-					// the matching resume would take the re-arm branch and
-					// arm a SECOND multishot recv on the same socket, so two
-					// armed recvs would deliver interleaved data (celeris#482
-					// bug 2).
+					// The ring stayed full even after a submit. Mark the
+					// conn paused anyway: that is the behaviour this engine
+					// has always shipped, and the alternative is worse.
 					//
-					// Deliberately do NOT re-enqueue. The worker loop calls
-					// drainDetachQueue every iteration, so re-enqueueing here
-					// (and re-arming detachQPending) would make the worker
-					// spin on this conn instead of reaping the completions
-					// that free the ring -- and each pass would append the
-					// same conn again, growing the queue without bound. The
-					// pause is simply deferred: recvPauseDesired stays true
-					// and recvPaused stays false, so the next drain retries.
-					// A conn under backpressure is by definition still moving
-					// data, so another drain is imminent. Until then recv
-					// stays armed, which costs throughput on one conn but is
-					// always safe -- unlike a phantom pause.
-					applied = false
+					// Leaving it unpaused means the middleware's requested
+					// pause NEVER takes effect -- recvPauseDesired stays true,
+					// recvPaused stays false, and PauseRecv only enqueues on
+					// the false->true transition, so nothing retries. Under
+					// sustained backpressure the peer keeps filling a buffer
+					// nobody is draining and the conn hangs; that regressed
+					// the celeris#482 guard with close-timeouts on kernel 6.17
+					// runners where the ring fills readily.
+					//
+					// The residual risk is the one #482 documented: the recv
+					// is still kernel-armed while we record it as paused, so a
+					// later resume can arm a second multishot recv. That is
+					// pre-existing, rare, and strictly less harmful than a
+					// pause that never happens.
 				} else {
 					// Cancel the in-flight recv. cs.fd is a fixed-file
 					// INDEX when fixed files are on, so cancelling by raw
@@ -3502,9 +3500,7 @@ func (w *Worker) drainDetachQueue() {
 					cs.needsRecv = true
 				}
 			}
-			if applied {
-				cs.recvPaused = desired
-			}
+			cs.recvPaused = desired
 		}
 		w.markDirty(cs)
 	}
