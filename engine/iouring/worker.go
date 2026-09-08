@@ -239,6 +239,16 @@ type Worker struct {
 	// the arm at the top of every iteration until it lands. Loop-thread
 	// only, like listenFD.
 	acceptRearmPending bool
+
+	// h2PollRearmPending is set when prepareH2Poll could not place its
+	// POLL_ADD because the SQ ring was full. The poll is SINGLE-SHOT and
+	// nothing anywhere clears h2PollArmed, so a dropped arm leaves the
+	// eventfd permanently deaf: no later caller re-arms it, and the detach
+	// queue's wakeup write is coalesced on the empty -> non-empty edge, so
+	// no later enqueue writes the fd either. A worker with no other traffic
+	// then sleeps in SubmitAndWait with queued work it will never see.
+	// Retried at the top of the loop, like the accept arm.
+	h2PollRearmPending bool
 	wake               chan struct{}
 	wakeMu             sync.Mutex
 	suspended          atomic.Bool
@@ -565,6 +575,7 @@ func (w *Worker) run(ctx context.Context) {
 		// A previous accept re-arm that hit a full SQ ring is retried here,
 		// before this iteration's submit, so it rides the same syscall.
 		w.rearmAcceptIfPending(paused)
+		w.rearmH2PollIfPending()
 
 		var cqHead, cqTail uint32
 		if w.sqpoll {
@@ -1496,8 +1507,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// — see the SINGLE_ISSUER note on the asyncDetachPending
 			// field.
 			if !w.async && !w.h2PollArmed && w.h2EventFD >= 0 {
-				w.prepareH2Poll()
-				w.h2PollArmed = true
+				w.h2PollArmed = w.prepareH2Poll()
 			}
 			// Async mode (HTTP1): the dispatch goroutine took detachMu
 			// around ProcessH1 so writeBuf access serialises with the
@@ -1587,8 +1597,7 @@ func (w *Worker) initProtocol(cs *connState) {
 		// Arm eventfd POLL_ADD on first H2 connection so the ring wakes
 		// event-driven when handler goroutines enqueue responses.
 		if !w.h2PollArmed && w.h2EventFD >= 0 {
-			w.prepareH2Poll()
-			w.h2PollArmed = true
+			w.h2PollArmed = w.prepareH2Poll()
 		}
 		w.h2Conns = append(w.h2Conns, cs.fd)
 	}
@@ -1604,8 +1613,7 @@ func (w *Worker) switchToH2(cs *connState) error {
 		return err
 	}
 	if !w.h2PollArmed && w.h2EventFD >= 0 {
-		w.prepareH2Poll()
-		w.h2PollArmed = true
+		w.h2PollArmed = w.prepareH2Poll()
 	}
 	w.h2Conns = append(w.h2Conns, cs.fd)
 	return nil
@@ -3296,13 +3304,30 @@ func (w *Worker) makeWriteBodyFn(cs *connState) func([]byte) {
 // prepareH2Poll submits a single-shot POLL_ADD SQE on the H2 eventfd.
 // When handler goroutines write the eventfd, the CQE wakes the ring
 // event-driven, replacing the 100μs polling timeout.
-func (w *Worker) prepareH2Poll() {
+// Reports whether the arm was placed. A full SQ ring must NOT be swallowed:
+// the poll is single-shot and w.h2PollArmed is never cleared anywhere else,
+// so a dropped arm leaves the eventfd deaf for the life of the worker.
+// Callers assign the result to w.h2PollArmed; the loop retries via
+// rearmH2PollIfPending.
+func (w *Worker) prepareH2Poll() bool {
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
-		return
+		w.h2PollRearmPending = true
+		return false
 	}
 	prepPollAdd(sqe, w.h2EventFD, unix.POLLIN)
 	setSQEUserData(sqe, encodeUserData(udH2Wakeup, w.h2EventFD))
+	w.h2PollRearmPending = false
+	return true
+}
+
+// rearmH2PollIfPending re-issues an H2 eventfd poll that prepareH2Poll had
+// to drop on a full SQ ring. No-op unless a drop is pending.
+func (w *Worker) rearmH2PollIfPending() {
+	if !w.h2PollRearmPending || w.h2PollArmed || w.h2EventFD < 0 {
+		return
+	}
+	w.h2PollArmed = w.prepareH2Poll()
 }
 
 // handleH2Wakeup drains the eventfd counter and re-arms the poll.
@@ -3310,7 +3335,7 @@ func (w *Worker) prepareH2Poll() {
 func (w *Worker) handleH2Wakeup() {
 	var buf [8]byte
 	_, _ = unix.Read(w.h2EventFD, buf[:])
-	w.prepareH2Poll()
+	w.h2PollArmed = w.prepareH2Poll()
 }
 
 // prepareAccept submits an accept SQE using the best available mode.
@@ -3449,8 +3474,7 @@ func (w *Worker) drainDetachQueue() {
 		if cs.asyncH2Promoted.Load() {
 			cs.asyncH2Promoted.Store(false)
 			if !w.h2PollArmed && w.h2EventFD >= 0 {
-				w.prepareH2Poll()
-				w.h2PollArmed = true
+				w.h2PollArmed = w.prepareH2Poll()
 			}
 			w.h2Conns = append(w.h2Conns, cs.fd)
 			w.markDirty(cs)
@@ -3467,8 +3491,7 @@ func (w *Worker) drainDetachQueue() {
 			cs.asyncDetachPending = false
 			w.detachedCount++
 			if !w.h2PollArmed && w.h2EventFD >= 0 {
-				w.prepareH2Poll()
-				w.h2PollArmed = true
+				w.h2PollArmed = w.prepareH2Poll()
 			}
 		}
 		// Apply pending pause/resume request from the WS middleware.
