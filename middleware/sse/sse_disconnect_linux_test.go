@@ -202,11 +202,12 @@ func openSSEStream(tb testing.TB, addr string) (net.Conn, *bufio.Reader) {
 // connections down so its read/write goroutines do not count against the
 // leak assertion.
 //
-// The 10 s read deadline bounds the open — mirroring openSSEStream — and the
-// caller clears it once the head is read. It must NOT survive into the
-// assertion window: expiring there would make the transport reset the stream,
-// and the server would then cancel the handler through handleRSTStream, i.e.
-// through a path other than the one under test.
+// The open is bounded by a request context, NOT by a read deadline on the raw
+// conn: http2.Transport keeps a persistent read loop over that socket for the
+// life of the stream, so an absolute deadline would reset the stream from the
+// client side and the server would cancel the handler through handleRSTStream
+// — a different path from the one under test, and a false pass or a flake
+// depending on timing.
 func openSSEStreamH2C(tb testing.TB, addr string) (net.Conn, *bufio.Reader, func()) {
 	tb.Helper()
 	var raw net.Conn
@@ -215,13 +216,25 @@ func openSSEStreamH2C(tb testing.TB, addr string) (net.Conn, *bufio.Reader, func
 		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
 			c, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, network, addr)
 			if err == nil {
-				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 				raw = c
 			}
 			return c, err
 		},
 	}
-	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/events", nil)
+	// Bound the OPEN with a request context, never with a read deadline on
+	// the raw conn. http2.Transport runs a persistent read loop over that
+	// socket for the life of the stream, so an absolute SetReadDeadline
+	// kills the connection N seconds after dial no matter how healthy it
+	// is -- and an SSE stream is deliberately held open far longer than
+	// that. It survived on a fast host and failed on a slower CI runner,
+	// where the deadline expired inside RoundTrip itself.
+	//
+	// The context is cancelled at test cleanup rather than when this
+	// function returns: cancelling on return would tear down the very
+	// stream the caller is about to assert on.
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	tb.Cleanup(cancelReq)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://"+addr+"/events", nil)
 	if err != nil {
 		tb.Fatalf("new request: %v", err)
 	}
