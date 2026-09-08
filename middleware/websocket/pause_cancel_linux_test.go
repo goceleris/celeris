@@ -212,8 +212,20 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					"cancel killed an in-flight SEND (celeris#482)", n)
 			}
 			if n := closeTimeout.Load(); n != 0 {
-				t.Errorf("%d conn(s) never completed the Close handshake: recv paused and never re-armed "+
-					"(the leaked-ESTAB symptom of celeris#482)", n)
+				// Deliberately does NOT name a cause. This counter only says
+				// the server never closed its side within the client's
+				// window; it cannot distinguish a conn whose recv stayed
+				// paused (celeris#482) from one whose send accounting
+				// desynchronised so the dirty-list flush skipped it forever
+				// (celeris#519), and asserting the former sent three separate
+				// investigations down the wrong path -- in the #519 failures
+				// nothing was paused at all.
+				t.Errorf("%d conn(s) never completed the Close handshake within the client's read window "+
+					"after sending Close: "+
+					"the server never closed its side. Cause is NOT implied by this counter -- dump the "+
+					"engine's per-conn state (recvPaused/recvArmed/sending/dirty/closing) to tell a "+
+					"stuck pause (celeris#482) from stranded send accounting (celeris#519)",
+					n)
 			}
 		})
 	}
