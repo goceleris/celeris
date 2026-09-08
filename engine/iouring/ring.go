@@ -294,7 +294,6 @@ func (r *Ring) Submit() (int, error) {
 		return 0, nil
 	}
 	n := r.pending
-	r.pending = 0
 	ret, _, errno := unix.Syscall6(
 		uintptr(sysIOUringEnter),
 		uintptr(r.fd),
@@ -302,8 +301,10 @@ func (r *Ring) Submit() (int, error) {
 		0, 0, 0, 0,
 	)
 	if errno != 0 {
+		r.pending = retryPending(n, errno)
 		return 0, fmt.Errorf("io_uring_enter submit: %w", errno)
 	}
+	r.pending = n - uint32(ret)
 	return int(ret), nil
 }
 
@@ -325,8 +326,7 @@ func (r *Ring) WaitCQE() error {
 // SubmitAndWait submits pending SQEs and waits for at least one CQE.
 func (r *Ring) SubmitAndWait() error {
 	n := r.pending
-	r.pending = 0
-	_, _, errno := unix.Syscall6(
+	ret, _, errno := unix.Syscall6(
 		uintptr(sysIOUringEnter),
 		uintptr(r.fd),
 		uintptr(n),
@@ -335,8 +335,10 @@ func (r *Ring) SubmitAndWait() error {
 		0, 0,
 	)
 	if errno != 0 {
+		r.pending = retryPending(n, errno)
 		return fmt.Errorf("io_uring_enter submit+wait: %w", errno)
 	}
+	r.pending = n - uint32(ret)
 	return nil
 }
 
@@ -344,7 +346,6 @@ func (r *Ring) SubmitAndWait() error {
 // with a timeout. Returns nil on timeout (ETIME) or EINTR.
 func (r *Ring) SubmitAndWaitTimeout(timeout time.Duration) error {
 	n := r.pending
-	r.pending = 0
 
 	ts := kernelTimespec{
 		Sec:  int64(timeout / time.Second),
@@ -354,7 +355,7 @@ func (r *Ring) SubmitAndWaitTimeout(timeout time.Duration) error {
 		Ts: uint64(uintptr(unsafe.Pointer(&ts))),
 	}
 
-	_, _, errno := unix.Syscall6(
+	ret, _, errno := unix.Syscall6(
 		uintptr(sysIOUringEnter),
 		uintptr(r.fd),
 		uintptr(n),
@@ -364,12 +365,30 @@ func (r *Ring) SubmitAndWaitTimeout(timeout time.Duration) error {
 		unsafe.Sizeof(arg),
 	)
 	if errno != 0 {
+		r.pending = retryPending(n, errno)
 		if errno == unix.ETIME || errno == unix.EINTR {
 			return nil
 		}
 		return fmt.Errorf("io_uring_enter submit+wait timeout: %w", errno)
 	}
+	r.pending = n - uint32(ret)
 	return nil
+}
+
+// retryPending decides how many SQEs remain unsubmitted after io_uring_enter
+// failed, so the next call re-offers them instead of dropping them.
+//
+// EAGAIN and EBUSY mean the kernel took NOTHING -- the CQ ring is full or the
+// submission was refused outright -- so all n stay pending. Every other errno
+// (including ETIME and EINTR, where submission completes before the wait
+// begins) means the batch was consumed; the enter syscall reports no partial
+// count on the error path, so treating it as fully submitted is the only
+// option that cannot double-submit an SQE the kernel already owns.
+func retryPending(n uint32, errno unix.Errno) uint32 {
+	if errno == unix.EAGAIN || errno == unix.EBUSY {
+		return n
+	}
+	return 0
 }
 
 // Pending returns the number of SQEs submitted but not yet sent to the kernel.
