@@ -2225,7 +2225,21 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 
 	// SEND_ZC first CQE: result is ready but buffer is still in DMA.
 	// Store the result and wait for the notification before touching sendBuf.
-	if w.sendZC && cqeHasMore(c.Flags) {
+	//
+	// Keyed on IORING_CQE_F_MORE ALONE, never on w.sendZC. How a completion
+	// must be interpreted is fixed by how its SQE was submitted, and
+	// w.sendZC is mutable: the EINVAL/ENOMEM fallbacks flip it to false
+	// while ZC sends are still in flight. Gating this branch on it meant
+	// every in-flight ZC send's first CQE fell through to completeSend,
+	// which cleared cs.sending and re-flushed -- and then the real
+	// notification arrived and ran completeSend a SECOND time against a
+	// stale cs.zcSentBytes, clearing cs.sending for a send that was
+	// genuinely in flight. The connection ends up with cs.sending stuck
+	// true and nothing to clear it, and the dirty-list flush skips any
+	// conn with cs.sending set, so it is stranded for the life of the
+	// process (celeris#519). F_MORE on a udSend completion is set by the
+	// kernel only for SEND_ZC, so it is the accurate test.
+	if cqeHasMore(c.Flags) {
 		// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
 		// the dispatch goroutine under detachMu; mutate them under the lock.
 		if mu := cs.detachMu; mu != nil {
