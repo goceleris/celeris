@@ -2180,7 +2180,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		} else {
 			cs.zcNotifPending = false
 		}
-		w.completeSend(cs, fd, int(cs.zcSentBytes), now)
+		if w.completeSend(cs, fd, int(cs.zcSentBytes), now) {
+			w.closeConn(fd)
+		}
 		return
 	}
 
@@ -2210,12 +2212,17 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// paths — so we skip the entry-reset to save one write per request
 	// on the hot success path.
 
-	// SEND_ZC EINVAL fallback: kernel does not support the opcode.
-	// Disable ZC for this worker and retry the send with regular SEND.
-	if c.Res == -22 && w.sendZC {
+	// SEND_ZC fallback. EINVAL: the kernel does not support the opcode.
+	// ENOMEM: SEND_ZC pins the user buffer against RLIMIT_MEMLOCK, and a
+	// host with a low limit returns ENOMEM once enough sends are in flight
+	// -- the same limit that caps the worker count on a CI runner. Both are
+	// reasons to stop using ZC on this worker, NOT reasons to close a
+	// healthy connection, which is what the celeris#519 reproduction shows
+	// happening. Disable ZC and retry the send with a regular SEND.
+	if (c.Res == -22 || c.Res == -int32(unix.ENOMEM)) && w.sendZC {
 		w.sendZC = false
-		w.logger.Warn("SEND_ZC not supported (EINVAL), falling back to regular SEND",
-			"worker", w.id)
+		w.logger.Warn("SEND_ZC unavailable, falling back to regular SEND",
+			"worker", w.id, "err", -c.Res)
 		// cs.sending is read by the inline-egress guard under detachMu; clear it
 		// and re-flush under the lock (flushSend for a detached conn is always
 		// called under detachMu, as in the dirty-flush loop).
@@ -2259,7 +2266,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	w.completeSend(cs, fd, int(c.Res), now)
+	if w.completeSend(cs, fd, int(c.Res), now) {
+		w.closeConn(fd)
+	}
 }
 
 // completeSend processes a send result after the buffer is safe to modify.
@@ -2270,7 +2279,21 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // All cs.sendBuf mutations below MUST be guarded by detachMu when one
 // exists, otherwise the goroutine read races the event-loop write —
 // observed via -race in TestNativeEngineLargePayload/io_uring.
-func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
+// Reports whether the CALLER must close the connection. closeConn takes
+// cs.detachMu, and this function holds that same lock for its whole body;
+// sync.Mutex is not reentrant, so closing inline wedges the worker thread
+// against itself -- and with it the entire event loop: no CQE is processed,
+// the detach queue is never drained (so every WebSocket recv-pause the
+// middleware asked to lift stays paused), no timeout sweep runs, and
+// graceful shutdown never completes. Releasing the lock early instead is
+// NOT the fix: it opens the window the lock exists to close, and measurably
+// corrupts streams (protoErr 0 -> 47 on the celeris#519 reproduction). The
+// caller closes once the deferred unlock has run.
+//
+// A multi-worker engine only loses the one worker to this, so its
+// connections hang while the others keep serving; on a single-worker engine
+// -- what RLIMIT_MEMLOCK forces on a CI runner -- it takes the server down.
+func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) (closeAfter bool) {
 	// Take the lock up-front for detached connections so the entire state
 	// mutation (cs.sending clear / sendBuf truncate / writeBuf reset / OnError
 	// fire) is serialized against the goroutine writeFn path. The inline-egress
@@ -2283,6 +2306,28 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	}
 	cs.sending = false
 
+	if sent == -int(unix.ENOMEM) && w.sendZC {
+		// SEND_ZC pins the user buffer against RLIMIT_MEMLOCK. A host with
+		// a low limit returns ENOMEM once enough sends are in flight --
+		// the same limit that caps the worker count on a CI runner
+		// ("io_uring workers capped by RLIMIT_MEMLOCK ... capped_to=1").
+		// That is a transient resource shortage, not a broken connection:
+		// closing here drops healthy connections mid-stream, which is
+		// exactly what the celeris#519 reproduction shows (16 conns killed
+		// with -12 in one 40 s run). Fall back to regular SEND for this
+		// worker and re-flush, mirroring the EINVAL/unsupported path.
+		//
+		// cs.sending was cleared above and cs.sendBuf still holds the
+		// unsent bytes, so flushSend re-issues them without ZC.
+		w.sendZC = false
+		w.logger.Warn("SEND_ZC returned ENOMEM (RLIMIT_MEMLOCK), falling back to regular SEND",
+			"worker", w.id)
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+		return false
+	}
+
 	if sent < 0 {
 		w.errCount.Add(1)
 		cs.sendBuf = cs.sendBuf[:0]
@@ -2293,11 +2338,12 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 			cs.h1State.OnError(errIORingSend(int32(sent)))
 		}
 		if cs.closing {
+			// finishCloseAny only READS cs.detachMu (to pick the detached
+			// variant); it never takes it, so it is safe under the lock.
 			w.finishCloseAny(fd, cs)
-		} else {
-			w.closeConn(fd)
+			return false
 		}
-		return
+		return true
 	}
 
 	// sent >= 0 here: payload bytes flushed by this send completion
@@ -2363,6 +2409,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) {
 	if w.flushSend(cs) {
 		w.markDirty(cs)
 	}
+	return false
 }
 
 func (w *Worker) handleClose(fd int) {
