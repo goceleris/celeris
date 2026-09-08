@@ -27,7 +27,13 @@ type Engine struct {
 	handler  stream.Handler
 	cfg      resource.Config
 	logger   *slog.Logger
-	metrics  struct {
+	// baseCtx parents every request context this server hands out
+	// (http.Server.BaseContext); baseCancel is Shutdown's lever for
+	// reaching handlers that are still running when the drain budget
+	// runs out. See Shutdown.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	metrics    struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		errCount    atomic.Uint64
@@ -48,6 +54,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		cfg:     cfg,
 		logger:  cfg.Logger,
 	}
+	e.baseCtx, e.baseCancel = context.WithCancel(context.Background())
 
 	bridge := &Bridge{engine: e, handler: handler}
 
@@ -69,6 +76,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		IdleTimeout:       cfg.IdleTimeout,
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 		ConnState:         e.connStateHook,
+		BaseContext:       func(net.Listener) context.Context { return e.baseCtx },
 	}
 
 	return e, nil
@@ -108,13 +116,47 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 }
 
-// Shutdown gracefully shuts down the server.
+// Shutdown gracefully shuts down the server: in-flight requests drain
+// until ctx expires, and whatever is still running once that budget is
+// spent is woken through its request context.
+//
+// http.Server.Shutdown only waits for connections to go idle — it cancels
+// nothing. A detached stream on std (an SSE handler with heartbeats off,
+// parked on client.Context()) runs inline in ServeHTTP, so its connection
+// never goes idle: the drain burns its whole budget and the handler
+// goroutine, its request context and the connection then survive shutdown
+// for the lifetime of the process (celeris#498). So the drain budget also
+// bounds how long a request context stays live: cancelling the base
+// context propagates to every r.Context() and the handlers unwind
+// cooperatively, rather than having their connections yanked out from
+// under them. Ordinary requests are untouched while the budget holds —
+// they drain exactly as before.
+//
+// The escalation is armed off ctx rather than only after the drain
+// returns because callers race for the once: Listen shuts down with a
+// background context when its own context is cancelled, so it can win the
+// drain with no budget at all while the caller that does have one
+// (Server.Shutdown with Config.ShutdownTimeout) waits behind it.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, e.baseCancel)
 	var err error
 	e.once.Do(func() {
 		err = e.server.Shutdown(ctx)
 	})
-	return err
+	if err != nil {
+		// Cancel here too: when ctx expires, Shutdown's own select and
+		// the AfterFunc callback race, and we must not report the drain
+		// as over before the escalation is guaranteed. CancelFunc is
+		// idempotent.
+		e.baseCancel()
+		return err
+	}
+	// Drained cleanly with budget left, so nothing needs waking: disarm,
+	// or the caller's usual `defer cancel()` would cancel the contexts of
+	// handlers a graceful shutdown deliberately leaves alone (a hijacked
+	// WebSocket session, which http.Server stops tracking on hijack).
+	stop()
+	return nil
 }
 
 // Metrics returns a snapshot of engine metrics.
