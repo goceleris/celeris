@@ -114,6 +114,14 @@ type connState struct {
 	// its pending write drains, so the response is not truncated. Reset on release.
 	peerClosed bool
 
+	// drainDeadline bounds how long checkTimeouts defers the idle-deadline
+	// reap of a truly-detached conn whose terminal bytes (SSE last event, WS
+	// close echo) are still queued: stamped now+detachDrainGrace on the first
+	// deferred sweep, cleared whenever the middleware pushes the idle deadline
+	// back out. 0 when no drain is being waited on. Worker-thread-only;
+	// reset on release.
+	drainDeadline int64
+
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (single-threaded write)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
@@ -254,6 +262,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.peerClosed = false
+	cs.drainDeadline = 0
 	cs.asyncRun = false
 	cs.asyncParked = false
 	cs.asyncClosed.Store(false)

@@ -484,15 +484,18 @@ func (l *Loop) run(ctx context.Context) {
 			// immediately closes) leaves the EOF unread and — with EPOLLET — no
 			// further edge fires. Close here once the response has flushed; if a
 			// write is still pending (backpressure), defer via cs.peerClosed so
-			// the response is not truncated. Skip detached (WS/SSE) conns: their
-			// middleware owns the close lifecycle.
+			// the response is not truncated. Detached (WS/SSE) conns keep their
+			// middleware's close lifecycle, but they still have to LEARN the
+			// peer is gone — see notifyDetachedPeerClosed.
 			if ev.Events&unix.EPOLLRDHUP != 0 {
 				if fd >= 0 && fd < len(l.conns) {
-					if cs := l.conns[fd]; cs != nil && !cs.detachClosed &&
-						(cs.h1State == nil || !cs.h1State.Detached.Load()) {
-						if csWritePending(cs) {
+					if cs := l.conns[fd]; cs != nil && !cs.detachClosed {
+						switch {
+						case cs.h1State != nil && cs.h1State.Detached.Load():
+							l.notifyDetachedPeerClosed(cs)
+						case csWritePending(cs):
 							cs.peerClosed = true
-						} else {
+						default:
 							l.closeConn(fd)
 						}
 					}
@@ -669,6 +672,42 @@ func (l *Loop) run(ctx context.Context) {
 			}
 			continue
 		}
+	}
+}
+
+// notifyDetachedPeerClosed reports an EPOLLRDHUP (peer half-close) to the
+// middleware that owns a detached WS/SSE connection. The engine does NOT close
+// here — after Detach the close lifecycle belongs to that middleware — it only
+// makes sure the middleware finds out, which is the whole gap celeris#494 left
+// open on the RDHUP path: the FIN that rode the request's readable edge is
+// never read (drainRead's short-read fast path returns first, and EPOLLET
+// yields no further edge), and an SSE handler that never writes again never
+// earns an EPIPE either, so its handler, heartbeat and release goroutines leak
+// for the life of the process.
+//
+// WebSocket conns are excluded: a WS peer that shuts down its write side after
+// a Close frame is still reading our reply, and its own middleware surfaces the
+// half-close on the next frame read. WSDataDelivery is the discriminator, and
+// reading it here is race-free for the same reason ProcessH1's delivery check
+// is: the WS middleware installs it via UpgradeWebSocket BEFORE Context.Detach,
+// so a thread that observes Detached==true observes it too.
+//
+// OnError runs under cs.detachMu, matching every other OnError site in this
+// file, so it serialises with the middleware goroutine's guarded writes. Do not
+// close the conn from here — closeConn takes the same (non-reentrant) mutex.
+func (l *Loop) notifyDetachedPeerClosed(cs *connState) {
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+	}
+	// Re-read h1State UNDER the lock: the async dispatch goroutine nils it in
+	// switchToH2Local while holding the same mutex (the #256 TOCTOU class).
+	// A detached conn is never h2c-upgraded, so this is belt-and-braces — but
+	// it is the idiom every cross-goroutine h1State read here uses.
+	if h1 := cs.h1State; h1 != nil && h1.WSDataDelivery == nil && h1.OnError != nil {
+		h1.OnError(errPeerClosed)
+	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Unlock()
 	}
 }
 
@@ -2344,6 +2383,16 @@ func (l *Loop) adaptiveTimeoutMs(base int) int {
 	}
 }
 
+// detachDrainGrace caps how long the idle-deadline reap waits for a
+// truly-detached conn's already-queued terminal bytes to reach the wire
+// before it sends FIN anyway. Generous enough to cover several WAN
+// round-trips for a peer that is merely behind, short enough that a peer
+// which has stopped reading for good releases its fd (and the loop's
+// dirty-list spin) promptly. A peer that is actually gone never waits this
+// long: the next flush surfaces EPIPE/ECONNRESET and the dirty-list error
+// branch closes the conn immediately.
+const detachDrainGrace = time.Second
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms).
 //
@@ -2367,9 +2416,36 @@ func (l *Loop) checkTimeouts() {
 		// owns the I/O lifecycle. Async-mode conns set detachMu up front
 		// without a true detach — fall through to the normal scan for those.
 		if cs.h1State != nil && cs.h1State.Detached.Load() {
-			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
-				l.closeConn(fd)
+			dl := cs.h1State.IdleDeadlineNs.Load()
+			if dl <= 0 || now <= dl {
+				// Unset, or pushed back out by the middleware (a WS frame
+				// extends it): forget any grace stamp so a later expiry
+				// starts with a full drain window.
+				cs.drainDeadline = 0
+				continue
 			}
+			// The reap doubles as "this stream is over, drop the conn":
+			// the SSE middleware stores a 1 ns deadline once its last event
+			// is queued (celeris#494) and the WS middleware does the same
+			// behind the close echo. closeConn's SHUT_WR commits only what
+			// the KERNEL already took, so reaping while writeBuf still holds
+			// those bytes truncates the stream — and a truly-detached conn is
+			// precisely the one that parks its EAGAIN remainder on the dirty
+			// list (armEpollOut is skipped for it), where nothing else closes
+			// on drain. Let the dirty flush finish first, mirroring iouring's
+			// deferred close (cs.closing while sends are pending) and the
+			// EPOLLRDHUP path's cs.peerClosed defer. Bounded: a peer that
+			// stops reading for good must not strand the fd, and a dirty conn
+			// holds the loop at a 0 ms epoll_wait.
+			if csWritePending(cs) {
+				if cs.drainDeadline == 0 {
+					cs.drainDeadline = now + int64(detachDrainGrace)
+				}
+				if now <= cs.drainDeadline {
+					continue
+				}
+			}
+			l.closeConn(fd)
 			continue
 		}
 		// ReadHeaderTimeout: slowloris defence. Mirror net/http behavior:

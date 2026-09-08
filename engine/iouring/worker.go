@@ -188,6 +188,35 @@ type closedOpsEntry struct {
 // queuePendingRelease).
 const pendingReleaseHoldNanos int64 = int64(5 * time.Second)
 
+// closingDrainTimeoutNanos bounds the deferred-close drain: how long a
+// connection may sit with cs.closing set, waiting for the SENDs queued at
+// close time to reach the kernel, before checkTimeouts tears it down anyway.
+//
+// The drain had no other bound. closeConn defers the fd close so the last
+// bytes (GOAWAY / RST_STREAM / WS close-echo) reach the client, and its only
+// exit is the SEND's own CQE via completeSend. A peer that stops reading — a
+// killed SSE client whose socket lingers, a WS client behind a wedged proxy —
+// never lets that SEND complete, and the timeout sweep skips cs.closing conns,
+// so the fd, the connState and the activeConns slot were held until the peer
+// eventually disconnected (celeris#498).
+//
+// 5 s, matching pendingReleaseHoldNanos: both are last-resort wall-clock
+// backstops for an operation the kernel may never complete, and keeping them
+// on one scale means a wedged conn is fully reclaimed — fd here, connState
+// when the close-path ASYNC_CANCEL's terminal CQE lands — inside one such
+// window rather than two unrelated ones. It is deliberately NOT derived from
+// cfg.WriteTimeout: that governs a LIVE conn whose handler is still producing
+// bytes at its own pace, whereas a closing conn's queue is final (writeFn
+// no-ops once detachClosed is set, drainDetachQueue skips it, and handleRecv
+// drops incoming data on a closing conn), so this is not a throughput budget
+// but the point at which we conclude the peer will never take the bytes.
+//
+// Prompt completions are untouched: the SEND CQE normally lands within a loop
+// pass or two — microseconds on localhost, four orders of magnitude inside
+// this window — so a conn whose sends drain still closes via completeSend's
+// path and never reaches the sweep.
+const closingDrainTimeoutNanos int64 = int64(5 * time.Second)
+
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
 	id         int
@@ -2527,6 +2556,15 @@ func (w *Worker) closeConn(fd int) {
 	// would never leave the kernel.
 	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		cs.closing = true
+		// lastActivity is the deadline base for checkTimeouts'
+		// closingDrainTimeoutNanos sweep, so restamp it here: the close we are
+		// deferring is most often one the sweep itself just triggered (idle /
+		// read / WS-idle deadline), which means lastActivity is already hours
+		// stale and the next sweep would reap the conn before the bytes below
+		// could reach the kernel — killing the very flush this branch exists
+		// for. cachedNow (not time.Now) keeps the churn-close close path free
+		// of a vDSO call; its ~100 ms staleness is noise against a 5 s bound.
+		cs.lastActivity = w.cachedNow
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
@@ -3851,7 +3889,28 @@ func (w *Worker) checkTimeouts() {
 	for i := len(w.liveConns) - 1; i >= 0; i-- {
 		fd := w.liveConns[i]
 		cs := w.conns[fd]
-		if cs == nil || cs.closing {
+		if cs == nil {
+			continue
+		}
+		// Deferred close (closeConn): the fd stays open until the queued SENDs
+		// complete, which normally happens within a loop pass or two. Nothing
+		// else reaps such a conn, so bound the wait — a peer that has stopped
+		// reading never completes the SEND at all (celeris#498). The remaining
+		// timeouts below are meaningless here: the handler is gone, so there is
+		// no read to time out and no new bytes can join the queue.
+		if cs.closing {
+			if now-cs.lastActivity > closingDrainTimeoutNanos {
+				// Everything closeConn does before deferring (detach
+				// signalling, CloseH1, detachedCount) has already run, so
+				// finish exactly where completeSend would have. removeDirty
+				// first: finishClose does not unlink cs, and because the SEND
+				// is cancelled rather than completed, cs.sending is never
+				// cleared — the dirty-list loop skips a sending conn, so it
+				// would never unlink it either and the connState would leak
+				// through dirtyHead.
+				w.removeDirty(cs)
+				w.finishCloseAny(fd, cs)
+			}
 			continue
 		}
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
