@@ -28,8 +28,26 @@ var headersSlicePoolIn = sync.Pool{New: func() any { s := make([][2]string, 0, 1
 // h2WorkerPool is a global goroutine pool for executing H2 stream handlers.
 // A single pool is shared across all connections to avoid per-connection
 // goroutine overhead (8 goroutines × N connections was catastrophic).
+//
+// A task is only ever QUEUED when a worker is parked waiting for one. That
+// rule is the whole design: an H2 handler is not guaranteed to return. A
+// Server-Sent Events stream, a long poll or any handler that streams for the
+// life of its client holds its worker until the peer goes away, so a pool
+// that queues into a buffered channel whenever the channel has room wedges as
+// soon as `size` such handlers are running -- every later stream sits in the
+// buffer behind workers that will never come back, on EVERY connection in the
+// process, because the pool is global (celeris#520). Work that finds no
+// parked worker runs on its own goroutine instead, which is what net/http
+// does for every stream unconditionally.
 type h2WorkerPool struct {
 	work chan h2Task
+	// idle is (workers parked in the receive) - (tasks sitting in work).
+	// A worker credits it before blocking on the channel; Submit claims a
+	// credit before it is allowed to queue. It is therefore positive only
+	// when a parked worker will pick the task up promptly, and drops to
+	// zero the moment the queue catches up with the parked workers -- see
+	// the invariant proof in TestH2Pool_IdleCreditTracksParkedWorkers.
+	idle atomic.Int32
 }
 
 type h2Task struct {
@@ -49,19 +67,57 @@ func newH2WorkerPool(size int) *h2WorkerPool {
 	return p
 }
 
+// run is one pool worker.
 func (p *h2WorkerPool) run() {
-	for task := range p.work {
+	for {
+		// Credit the pool before parking. Submit spends exactly one
+		// credit per queued task, so the counter stays equal to
+		// parked-workers minus queued-tasks no matter which worker
+		// ends up taking which task.
+		p.idle.Add(1)
+		task, ok := <-p.work
+		if !ok {
+			p.idle.Add(-1)
+			return
+		}
 		task.proc.executeHandler(task.stream)
 	}
 }
 
-// Submit tries to dispatch to a pooled worker. If all workers are busy
-// and the channel is full, falls back to a one-shot goroutine to avoid
-// blocking the event loop (which would stall frame processing).
+// Submit dispatches a stream handler. It queues onto the shared pool while a
+// worker is parked waiting for work, and otherwise runs the handler on its
+// own goroutine.
+//
+// It never blocks the event loop: blocking there would stall frame
+// processing for every stream on the connection.
+//
+// Growing the pool instead of spawning a one-shot goroutine was measured and
+// rejected: a surplus worker that joins the pool and retires on an idle TTL
+// made the dispatch benchmark SLOWER (865 ns/op vs 793) while adding a
+// window in which a traffic spike is held as parked goroutines. The spawn is
+// what net/http pays for every stream, unconditionally.
 func (p *h2WorkerPool) Submit(proc *Processor, s *Stream) {
+	for {
+		n := p.idle.Load()
+		if n <= 0 {
+			// No parked worker. Queueing here is what used to wedge the
+			// pool (celeris#520): a streaming handler holds its worker
+			// for the life of the stream, so a queued task would wait
+			// behind handlers that never return.
+			go proc.executeHandler(s)
+			return
+		}
+		if p.idle.CompareAndSwap(n, n-1) {
+			break
+		}
+	}
 	select {
 	case p.work <- h2Task{proc, s}:
 	default:
+		// Unreachable while the buffer is size*16 and we only queue
+		// against a parked worker, but a dropped task would hang a
+		// stream forever, so hand it a goroutine rather than trust that.
+		p.idle.Add(1)
 		go proc.executeHandler(s)
 	}
 }
