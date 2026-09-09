@@ -498,6 +498,15 @@ func (w *Worker) shutdownDrivers() {
 	}
 	w.driverConns = nil
 	w.hasDriverConns.Store(false)
+	// Retain the strong references (celeris#545). Dropping the map here is
+	// the only thing keeping these driverConns — and their dc.buf backing
+	// arrays — alive, and the kernel may still hold a RECV writing into one.
+	// Unlike UnregisterConn, this path issues no ASYNC_CANCEL and does not
+	// wait for inflightOps to reach zero, because the loop is ending and
+	// those CQEs would never be processed. What cancels the ops is closing
+	// the ring, which happens later in shutdown(); holding the slice on the
+	// Worker keeps the buffers reachable across that window.
+	w.shutdownDriverHold = append(w.shutdownDriverHold, conns...)
 	w.driverMu.Unlock()
 
 	for _, dc := range conns {
