@@ -364,6 +364,13 @@ func releaseConnState(cs *connState) {
 	cs.asyncClosed.Store(false)
 	cs.transplantPending.Store(false)
 	cs.asyncPromoted.Store(false)
+	// asyncH2Promoted was missing here while every sibling was reset, so a
+	// pooled connState came back still marked H2-promoted and was then
+	// permanently ineligible for transplant (asyncTransplantEligible tests
+	// it directly). celeris#544 — TestReleaseConnStateResetsEveryAtomicBool
+	// enumerates these by reflection so the next field added cannot be
+	// forgotten the same way.
+	cs.asyncH2Promoted.Store(false)
 	cs.promotedMethod = ""
 	cs.promotedPath = ""
 	cs.asyncDetachUnlocked = false
