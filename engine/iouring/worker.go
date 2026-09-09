@@ -370,6 +370,17 @@ type Worker struct {
 	driverActionMu      sync.Mutex
 	driverActionPending atomic.Int32
 
+	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
+	// reachable until the Worker itself is collected, which is after the ring
+	// has been closed. The kernel may still own a RECV pointing into dc.buf at
+	// that moment: shutdownDrivers deliberately does not wait for inflightOps
+	// to settle (the loop is ending and would never process those CQEs), so
+	// without this the buffers become garbage while an op is still live —
+	// the celeris#256 class, where GC repurposed memory the kernel then wrote
+	// HTTP bytes into. Closing the ring is what actually cancels the ops;
+	// this only has to outlive that.
+	shutdownDriverHold []*driverConn
+
 	// transplant (#383 reverse) is non-nil while a drain-to-epoll is in progress.
 	// Set by Engine.StartTransplant (controller goroutine), read on this worker's
 	// own thread after each handleRecv; when set, an idle H1 conn at a clean
