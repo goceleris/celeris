@@ -95,6 +95,15 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent atomic.Int64
 				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
+				// An RST is NOT a clean close (celeris#530). Linux emits one
+				// when a socket is closed with unread data still in its
+				// receive queue, which is precisely the signature of a
+				// connection torn down mid-stream — the failure this oracle
+				// exists to catch. Both sides folded it into closedOK, so a
+				// hard teardown scored as success. Counted separately at both
+				// ends: serverRST when the handler's read is reset, clientRST
+				// when the client's is.
+				var serverRST, clientRST atomic.Int64
 
 				connLastSeq := make([]int64, conns)
 				for i := range conns {
@@ -128,6 +137,10 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 									// Channel capacity overflow at chanReader.Append when async pause latency
 									// outpaces headroom. Tracked separately from wire frame corruption.
 									overflowErr.Add(1)
+								} else if errors.Is(err, syscall.ECONNRESET) {
+									// Must precede the isCloseErr test below,
+									// which counts ECONNRESET as a close.
+									serverRST.Add(1)
 								} else if !isCloseErr(err) {
 									protoErr.Add(1)
 									if myConnIdx >= 0 {
@@ -294,7 +307,9 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 						for {
 							if _, err := c.Read(buf); err != nil {
-								if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+								if errors.Is(err, syscall.ECONNRESET) {
+									clientRST.Add(1)
+								} else if errors.Is(err, io.EOF) {
 									closedOK.Add(1)
 								} else {
 									closeTimeout.Add(1)
@@ -306,8 +321,8 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				wg.Wait()
 
-				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d closeTimeout=%d dialFail=%d hsFail=%d",
-					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
+				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d clientRST=%d serverRST=%d closeTimeout=%d dialFail=%d hsFail=%d",
+					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), clientRST.Load(), serverRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
 
 				if dialFail.Load()+hsFail.Load() > 0 {
 					t.Fatalf("environment: %d dial/handshake failures", dialFail.Load()+hsFail.Load())
