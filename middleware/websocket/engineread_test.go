@@ -102,31 +102,151 @@ func TestChanReaderPauseResumeWatermarks(t *testing.T) {
 	}
 }
 
-// TestChanReaderDropsOnOverflow verifies that exceeding the channel
-// capacity poisons the reader with ErrReadLimit and increments the
-// dropped counter.
-func TestChanReaderDropsOnOverflow(t *testing.T) {
-	r := newChanReader(2, 0, 0) // tiny channel — no pause callback wired
-	r.Append([]byte("a"))
-	r.Append([]byte("b"))
+// TestChanReaderSpillsOnOverflow verifies that chunks arriving after the
+// channel fills are queued in the bounded spill buffer rather than
+// discarded (celeris#484), and that ErrReadLimit is raised only once both
+// the channel and the spill are full.
+func TestChanReaderSpillsOnOverflow(t *testing.T) {
+	r := newChanReader(2, 0, 0) // cap 2, spillMax 2 — no pause callback wired
+	for _, c := range []string{"a", "b"} {
+		if !r.Append([]byte(c)) {
+			t.Fatalf("Append(%q) into empty channel must succeed", c)
+		}
+	}
+	// Channel is full; these must spill, not drop.
+	for _, c := range []string{"c", "d"} {
+		if !r.Append([]byte(c)) {
+			t.Errorf("Append(%q) must spill rather than drop", c)
+		}
+	}
+	if r.Spilled() != 2 {
+		t.Errorf("expected 2 spilled chunks, got %d", r.Spilled())
+	}
+	if r.Dropped() != 0 {
+		t.Errorf("expected 0 drops while spill has room, got %d", r.Dropped())
+	}
 
-	// Third append must overflow because no pause callback is wired.
-	if ok := r.Append([]byte("c")); ok {
-		t.Error("expected third Append to fail (channel full)")
+	// Everything accepted must be readable, in arrival order.
+	got := drainString(t, r)
+	if got != "abcd" {
+		t.Errorf("spilled chunks lost or reordered: got %q, want %q", got, "abcd")
+	}
+}
+
+// TestChanReaderReadLimitWhenSpillFull verifies that once both the channel
+// and the spill are full the reader reports ErrReadLimit — the peer really
+// is outrunning twice the configured buffer, which the spill exists to
+// bound rather than to hide.
+func TestChanReaderReadLimitWhenSpillFull(t *testing.T) {
+	r := newChanReader(2, 0, 0) // cap 2, spillMax 2
+	for _, c := range []string{"a", "b", "c", "d"} {
+		if !r.Append([]byte(c)) {
+			t.Fatalf("Append(%q) must be accepted below the limit", c)
+		}
+	}
+	if ok := r.Append([]byte("e")); ok {
+		t.Error("expected Append to fail once channel and spill are both full")
 	}
 	if r.Dropped() != 1 {
 		t.Errorf("expected 1 drop, got %d", r.Dropped())
 	}
-
-	// Subsequent reads should yield ErrReadLimit eventually.
-	buf := make([]byte, 4)
-	// Drain the two queued chunks.
-	_, _ = r.Read(buf)
-	_, _ = r.Read(buf)
-	_, err := r.Read(buf)
-	if err != ErrReadLimit {
-		t.Errorf("expected ErrReadLimit after overflow, got %v", err)
+	if _, err := r.Read(make([]byte, 4)); err != ErrReadLimit {
+		t.Errorf("expected ErrReadLimit after the spill filled, got %v", err)
 	}
+}
+
+// TestChanReaderSpillPreservesOrder is the ordering oracle for the spill
+// path: chunks that overflow into the spill must be handed back strictly
+// after those already in the channel, with none lost or duplicated. A
+// reordering here would corrupt the WebSocket frame stream exactly as a
+// dropped chunk would.
+func TestChanReaderSpillPreservesOrder(t *testing.T) {
+	const capacity = 8
+	r := newChanReader(capacity, 0, 0)
+
+	// Fill the channel and then half the spill, interleaving reads so the
+	// refill path (spill -> channel tail) is exercised mid-stream.
+	var want []byte
+	next := byte('A')
+	for i := 0; i < capacity+capacity/2; i++ {
+		if !r.Append([]byte{next}) {
+			t.Fatalf("Append %d rejected before the limit", i)
+		}
+		want = append(want, next)
+		next++
+	}
+	// Drain two chunks, which promotes spilled chunks into the channel.
+	buf := make([]byte, 1)
+	var got []byte
+	for i := 0; i < 2; i++ {
+		n, err := r.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		got = append(got, buf[:n]...)
+	}
+	// Append more now that room exists; these are later still.
+	for i := 0; i < 2; i++ {
+		if !r.Append([]byte{next}) {
+			t.Fatalf("post-drain Append %d rejected", i)
+		}
+		want = append(want, next)
+		next++
+	}
+	got = append(got, []byte(drainString(t, r))...)
+	if string(got) != string(want) {
+		t.Errorf("stream reordered:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestChanReaderNoResumeWhileSpilled verifies the reader does not signal
+// resume while chunks are still spilled. The buffer is over-full in that
+// state, which is the opposite of the drained condition resume means.
+func TestChanReaderNoResumeWhileSpilled(t *testing.T) {
+	var resumes atomic.Uint32
+	r := newChanReader(4, 75, 25) // highWater=3, lowWater=1
+	r.SetPauser(func() {}, func() { resumes.Add(1) })
+
+	for i := 0; i < 6; i++ { // 4 into the channel, 2 spilled
+		if !r.Append([]byte{byte('a' + i)}) {
+			t.Fatalf("Append %d rejected", i)
+		}
+	}
+	if !r.hasSpill() {
+		t.Fatal("expected chunks to be spilled")
+	}
+	// Read down to lowWater. Resume must stay silent while spill is live.
+	buf := make([]byte, 1)
+	for i := 0; i < 3; i++ {
+		if _, err := r.Read(buf); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if r.hasSpill() && resumes.Load() != 0 {
+			t.Fatalf("resumed at read %d while %d chunks were still spilled", i, r.spillLen.Load())
+		}
+	}
+}
+
+// buffered reports the chunks currently held by the reader: channel depth
+// plus anything spilled behind it. Test-only.
+func (r *chanReader) buffered() int {
+	return len(r.ch) + int(r.spillLen.Load())
+}
+
+// drainString reads exactly the currently buffered chunks (channel depth
+// plus spill) so it never blocks waiting for an append that will not come.
+func drainString(t *testing.T, r *chanReader) string {
+	t.Helper()
+	var out []byte
+	buf := make([]byte, 64)
+	for r.buffered() > 0 || len(r.cur) > 0 {
+		n, err := r.Read(buf)
+		if err != nil {
+			t.Fatalf("drain read: %v", err)
+		}
+		out = append(out, buf[:n]...)
+	}
+	return string(out)
 }
 
 // TestChanReaderSmallCapacityNoThrash verifies that a very small capacity
