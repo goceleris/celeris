@@ -77,9 +77,9 @@ func TestFinishCloseUnlinksFromDirtyList(t *testing.T) {
 			// the whole binary down with SIGPIPE on the next write.
 			fd, other := socketPairFDs(t)
 			keepFD, keepOther := socketPairFDs(t)
-			defer unix.Close(other)
-			defer unix.Close(keepOther)
-			defer unix.Close(keepFD)
+			defer func() { _ = unix.Close(other) }()
+			defer func() { _ = unix.Close(keepOther) }()
+			defer func() { _ = unix.Close(keepFD) }()
 
 			w := newDirtyTestWorker(fd, keepFD)
 			keep := &connState{fd: keepFD, liveIdx: -1}
@@ -135,7 +135,7 @@ func TestFinishCloseUnlinksFromDirtyList(t *testing.T) {
 // self-referential node, and the dirty loop then spins forever.
 func TestFinishCloseUnlinksDirtyHead(t *testing.T) {
 	fd, other := socketPairFDs(t)
-	defer unix.Close(other)
+	defer func() { _ = unix.Close(other) }()
 	w := newDirtyTestWorker(fd)
 	head := &connState{fd: fd, liveIdx: -1}
 	w.conns[fd] = head
@@ -177,7 +177,7 @@ func TestHijackConnUnlinksFromDirtyList(t *testing.T) {
 	// would close whatever descriptor the test process happens to have at
 	// that number.
 	fd, other := socketPairFDs(t)
-	defer unix.Close(other)
+	defer func() { _ = unix.Close(other) }()
 
 	w := newDirtyTestWorker(fd)
 	cs := &connState{fd: fd, liveIdx: -1}
@@ -189,7 +189,7 @@ func TestHijackConnUnlinksFromDirtyList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hijackConn: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	if cs.dirty || w.dirtyHead == cs {
 		t.Fatal("hijacked connState is still linked in the dirty list")
