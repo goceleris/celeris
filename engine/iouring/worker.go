@@ -1381,6 +1381,25 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.fixedFile {
 		return nil, errors.New("celeris: cannot hijack fixed file connection")
 	}
+	// Refuse on the async dispatch path (celeris#539). Everything below is
+	// worker-owned: w.conns, w.connCount, w.liveConns, the dirty list, and an
+	// ASYNC_CANCEL SQE, which the engine treats as single-issuer. In async
+	// mode the handler — and therefore this call, through h1State.HijackFn —
+	// runs on the per-connection dispatch goroutine, so doing any of it here
+	// races the worker's own loop and submits an SQE off the issuing thread.
+	//
+	// Every other goroutine-to-worker hand-off goes through detachQueue for
+	// exactly this reason. Hijack cannot use it as-is because Hijack() is
+	// synchronous (internal/conn/response.go calls hijackFn and returns its
+	// result to the handler), so it needs a blocking round trip with a
+	// shutdown escape or the handler hangs when the worker stops. That is
+	// tracked for v1.7.0; refusing is the safe behaviour until then, because
+	// the alternative is silently corrupting worker state.
+	if w.async {
+		return nil, errors.New("celeris: Hijack is not supported on the io_uring engine with " +
+			"AsyncHandlers enabled (celeris#539); use the engine-integrated WebSocket/SSE path, " +
+			"or run with AsyncHandlers disabled")
+	}
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
