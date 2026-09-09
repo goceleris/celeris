@@ -150,8 +150,52 @@ func TestChanReaderReadLimitWhenSpillFull(t *testing.T) {
 	if r.Dropped() != 1 {
 		t.Errorf("expected 1 drop, got %d", r.Dropped())
 	}
+	// The four accepted chunks are still delivered before the error: they
+	// arrived before the limit was hit.
+	if got := drainString(t, r); got != "abcd" {
+		t.Errorf("buffered chunks lost at the limit: got %q, want %q", got, "abcd")
+	}
 	if _, err := r.Read(make([]byte, 4)); err != ErrReadLimit {
-		t.Errorf("expected ErrReadLimit after the spill filled, got %v", err)
+		t.Errorf("expected ErrReadLimit once drained, got %v", err)
+	}
+}
+
+// TestChanReaderDrainsBufferedChunksBeforeClose is the truncation oracle for
+// celeris#484: a reader closed while chunks are still buffered must hand
+// those chunks to the handler before reporting the close. Reporting it early
+// cuts the stream mid-frame and surfaces as "unexpected EOF". Measured under
+// flood, readers were being closed holding a completely full channel.
+func TestChanReaderDrainsBufferedChunksBeforeClose(t *testing.T) {
+	r := newChanReader(8, 0, 0)
+	for _, c := range []string{"one", "two", "three"} {
+		if !r.Append([]byte(c)) {
+			t.Fatalf("Append(%q) rejected", c)
+		}
+	}
+	// The peer goes away with everything still queued.
+	r.closeWith(io.EOF)
+
+	if got := drainString(t, r); got != "onetwothree" {
+		t.Errorf("buffered chunks discarded on close: got %q, want %q", got, "onetwothree")
+	}
+	if _, err := r.Read(make([]byte, 8)); err != io.EOF {
+		t.Errorf("expected io.EOF once drained, got %v", err)
+	}
+}
+
+// TestChanReaderCloseErrorSurvivesDrain verifies the close error is still
+// reported after the buffer is drained, not swallowed by the drain path.
+func TestChanReaderCloseErrorSurvivesDrain(t *testing.T) {
+	r := newChanReader(4, 0, 0)
+	r.Append([]byte("tail"))
+	want := errors.New("engine read failed")
+	r.closeWith(want)
+
+	if got := drainString(t, r); got != "tail" {
+		t.Errorf("buffered chunk discarded: got %q", got)
+	}
+	if _, err := r.Read(make([]byte, 4)); !errors.Is(err, want) {
+		t.Errorf("close error lost after drain: got %v, want %v", err, want)
 	}
 }
 

@@ -262,16 +262,38 @@ func (r *chanReader) refillFromSpill() {
 // in the steady state.
 func (r *chanReader) Read(p []byte) (int, error) {
 	if len(r.cur) == 0 {
-		if r.closed.Load() {
-			return 0, r.closeErr()
-		}
-		// Block for the next chunk, waking on close via done. r.ch is never
-		// closed, so a closed-channel receive can't be the wake signal here.
+		// Buffered chunks were received BEFORE the close and must be
+		// delivered before it (celeris#484). A peer that sent data and
+		// then went away still sent that data; reporting the close while
+		// chunks are queued truncates the stream mid-frame and the
+		// handler sees "unexpected EOF". Measured under flood: readers
+		// were closed holding a completely full channel — 256 chunks
+		// discarded per connection. So try the buffer first, and only
+		// report the close once it is drained.
 		select {
 		case chunk := <-r.ch:
 			r.cur = chunk
-		case <-r.done:
-			return 0, r.closeErr()
+		default:
+			if r.closed.Load() {
+				return 0, r.closeErr()
+			}
+			// Block for the next chunk, waking on close via done. r.ch is
+			// never closed, so a closed-channel receive can't be the wake
+			// signal here.
+			select {
+			case chunk := <-r.ch:
+				r.cur = chunk
+			case <-r.done:
+				// The close and a final chunk can land together; select
+				// picks randomly among ready cases, so re-check the
+				// buffer rather than dropping what did arrive.
+				select {
+				case chunk := <-r.ch:
+					r.cur = chunk
+				default:
+					return 0, r.closeErr()
+				}
+			}
 		}
 
 		// Taking a chunk freed a slot: promote spilled chunks into the
