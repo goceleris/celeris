@@ -15,9 +15,6 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c" //nolint:staticcheck // SA1019: h2c is deprecated in favour of http.Server.Protocols, which is only available on Go 1.27+. We pin Go 1.26.3 (see go.mod), so we keep h2c.NewHandler until the toolchain upgrade.
 )
 
 // Engine wraps net/http.Server to implement the engine.Engine interface.
@@ -58,18 +55,9 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	bridge := &Bridge{engine: e, handler: handler}
 
-	var httpHandler http.Handler = bridge
-	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
-		h2s := &http2.Server{
-			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
-			MaxReadFrameSize:     cfg.MaxFrameSize,
-		}
-		httpHandler = h2c.NewHandler(bridge, h2s) //nolint:staticcheck // SA1019: h2c.NewHandler is deprecated in favour of http.Server.Protocols (Go 1.27+); we still target Go 1.26.3.
-	}
-
 	e.server = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpHandler,
+		Handler:           bridge,
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -77,6 +65,28 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 		ConnState:         e.connStateHook,
 		BaseContext:       func(net.Listener) context.Context { return e.baseCtx },
+	}
+
+	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
+		// Cleartext HTTP/2 through net/http's own HTTP/2 server, selected by
+		// Protocols.SetUnencryptedHTTP2. This replaces x/net/http2/h2c, which
+		// is deprecated (celeris#440). HTTP/1.1 stays enabled alongside it so
+		// a plain H1 request on an H2C listener is still served, matching what
+		// h2c.NewHandler did by falling through to the wrapped handler.
+		//
+		// Scope: this covers prior-knowledge h2c (client preface on a fresh
+		// connection). It does NOT cover the RFC 7540 3.2 HTTP/1.1 Upgrade
+		// handshake, which RFC 9113 removed from the specification and
+		// net/http does not implement. The io_uring and epoll engines still
+		// honour Config.EnableH2Upgrade; the std engine no longer does.
+		p := new(http.Protocols)
+		p.SetHTTP1(true)
+		p.SetUnencryptedHTTP2(true)
+		e.server.Protocols = p
+		e.server.HTTP2 = &http.HTTP2Config{
+			MaxConcurrentStreams: int(cfg.MaxConcurrentStreams),
+			MaxReadFrameSize:     int(cfg.MaxFrameSize),
+		}
 	}
 
 	return e, nil
