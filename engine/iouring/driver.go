@@ -209,9 +209,15 @@ func (w *Worker) drainDriverActions() {
 	// Arm the eventfd poll so subsequent wakeups from driver goroutines
 	// reach the ring event-driven rather than waiting for the adaptive
 	// timeout (up to 100ms).
+	// Assign the result — do NOT mark it armed unconditionally. prepareH2Poll
+	// reports whether the arm was actually placed, and its docstring spells
+	// out why that matters: the poll is single-shot and w.h2PollArmed is
+	// never cleared anywhere else, so swallowing a full SQ ring leaves the
+	// eventfd deaf for the life of the worker. The loop retries through
+	// rearmH2PollIfPending. Every other call site already does this; this one
+	// was missed by celeris#523 (celeris#537).
 	if !w.h2PollArmed && w.h2EventFD >= 0 {
-		w.prepareH2Poll()
-		w.h2PollArmed = true
+		w.h2PollArmed = w.prepareH2Poll()
 	}
 
 	for _, a := range w.driverActionSpare {
