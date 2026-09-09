@@ -138,9 +138,12 @@ func (w *Worker) tryTransplant(fd int) {
 // boundary can be handed to epoll (#383 reverse). Called by runAsyncHandler on the
 // DISPATCH GOROUTINE, which owns cs.h1State / cs.h2State / cs.writeBuf between
 // requests — so these reads are race-free there. It deliberately reads no
-// worker-owned send fields (cs.sending / cs.sendBuf): in async mode the response is
-// direct-written by the goroutine, so an empty writeBuf at the park boundary already
-// proves the response is fully flushed.
+// worker-owned send fields (cs.sending / cs.sendBuf), which it cannot read safely
+// from that goroutine. An empty writeBuf here does NOT prove the response is fully
+// flushed — the partial-write path converts a direct write back into a ring SEND,
+// which empties writeBuf while sendBuf is still in flight (celeris#529). The
+// egress check is therefore re-done in finishAsyncTransplant, on the worker
+// thread, and this predicate is only a cheap first filter.
 func (w *Worker) asyncTransplantEligible(cs *connState) bool {
 	if cs.fixedFile {
 		return false
@@ -183,6 +186,32 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	h := w.transplant.Load()
 	if h == nil {
 		return // drain stopped — leave the conn; next recv respawns its goroutine
+	}
+	// Re-validate egress here, on the worker thread (celeris#529).
+	//
+	// asyncTransplantEligible runs on the DISPATCH goroutine and deliberately
+	// reads no worker-owned send fields, inferring "the response is fully
+	// flushed" from an empty writeBuf. That inference does not hold. The
+	// direct-write path in runAsyncHandler sets partial on a short write or
+	// EAGAIN, compacts the remainder BACK into cs.writeBuf and enqueues the
+	// conn; drainDetachQueue markDirty's it, and the dirty loop's flushSend
+	// then swaps writeBuf into sendBuf and submits a ring SEND. At that point
+	// writeBuf is empty — exactly the condition read as "flushed" — while a
+	// SEND is in flight against sendBuf.
+	//
+	// Transplanting then dups the fd for epoll and closes the original, so
+	// that SEND's CQE arrives against a closed fd and is dropped by
+	// staleConnCQE: cs.sending is never cleared (and the dirty loop skips a
+	// sending conn — celeris#527), and the bytes may never have reached the
+	// wire with nothing reporting it.
+	//
+	// sending / zcNotifPending / sendBuf are worker-owned, so reading them is
+	// race-free HERE even though it would not have been in the caller. Leaving
+	// the conn in place is the same fallback the dup-failure path takes: its
+	// next recv respawns the dispatch goroutine, and the transplant is retried
+	// at the following park boundary.
+	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) != 0 || len(cs.writeBuf) != 0 {
+		return
 	}
 	fd := cs.fd
 	newFD, err := unix.Dup(fd)
