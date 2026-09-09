@@ -2137,16 +2137,35 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if errors.Is(processErr, conn.ErrHijacked) {
 			return // FD already detached
 		}
-		// Flush pending writes (e.g. error responses) before closing.
-		_ = w.flushSend(cs)
-		// Check cs.h1State under detachMu (same TOCTOU class fixed at
-		// line 944 — see handleRecv recv-failure path).
-		if cs.detachMu != nil {
-			cs.detachMu.Lock()
+		// Flush pending writes (e.g. error responses) before closing, and
+		// read cs.h1State, both under detachMu.
+		//
+		// The flush was previously outside the lock. completeSend's docstring
+		// states the invariant it broke: for a detached connection cs.sendBuf
+		// is read by the makeWriteFn closure on the user's goroutine, so every
+		// mutation of it needs detachMu. flushSend swaps sendBuf with writeBuf
+		// and sets cs.sending, so calling it unlocked races a handler that is
+		// writing — the same access pattern the race detector caught on the
+		// call sites that were fixed when that docstring was written
+		// (celeris#528). Reachable within one request: a handler can Detach
+		// (SSE, or a WebSocket upgrade) and then have ProcessH1 surface an
+		// error, with the guarded write closure already installed.
+		//
+		// The h1State read has its own reason to be under the lock: the async
+		// dispatch goroutine's switchToH2Local nils cs.h1State under the same
+		// mutex (the #256 TOCTOU class).
+		//
+		// engine/epoll/loop.go does exactly this — one lock spanning the
+		// flush and OnError.
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+			_ = w.flushSend(cs)
 			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(processErr)
 			}
-			cs.detachMu.Unlock()
+			mu.Unlock()
+		} else {
+			_ = w.flushSend(cs)
 		}
 		w.closeConn(fd)
 		return
