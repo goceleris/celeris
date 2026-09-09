@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -73,6 +74,25 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					}
 				}
 
+				// Handler goroutines must NEVER call t.Errorf/t.Fatalf: they
+				// outlive the subtest (the engine is shut down in a defer,
+				// after the assertions), and testing panics with "Fail in
+				// goroutine after <test> has completed". That turned a
+				// perfectly ordinary parse error into a panic that took the
+				// whole package down with no summary at all — roughly one
+				// run in ten. Every one of these sites already bumps a
+				// counter that is asserted below, so the message is only a
+				// diagnostic: record it and let the counter fail the test.
+				var detailMu sync.Mutex
+				var details []string
+				note := func(format string, args ...any) {
+					detailMu.Lock()
+					if len(details) < 16 {
+						details = append(details, fmt.Sprintf(format, args...))
+					}
+					detailMu.Unlock()
+				}
+
 				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent atomic.Int64
 				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
 
@@ -99,7 +119,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 										finalCount := int64(binary.BigEndian.Uint64([]byte(ce.Text)))
 										expectedCount := connLastSeq[myConnIdx] + 1
 										if expectedCount != finalCount {
-											t.Errorf("conn %d: tail loss: last seq=%d, client sent=%d",
+											note("conn %d: tail loss: last seq=%d, client sent=%d",
 												myConnIdx, connLastSeq[myConnIdx], finalCount)
 											gaps.Add(1)
 										}
@@ -115,7 +135,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 									}
 									if isParseErr(err) {
 										parseErr.Add(1)
-										t.Errorf("parse error on conn %d: %v", myConnIdx, err)
+										note("parse error on conn %d: %v", myConnIdx, err)
 									}
 								}
 								return
@@ -123,27 +143,27 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 							if len(msg) != plen {
 								parseErr.Add(1)
-								t.Errorf("invalid frame length: got %d, want %d", len(msg), plen)
+								note("invalid frame length: got %d, want %d", len(msg), plen)
 								return
 							}
 
 							cIdx := int(binary.BigEndian.Uint64(msg[8:16]))
 							if cIdx < 0 || cIdx >= conns {
 								parseErr.Add(1)
-								t.Errorf("invalid conn index in payload: %d", cIdx)
+								note("invalid conn index in payload: %d", cIdx)
 								return
 							}
 							if myConnIdx < 0 {
 								myConnIdx = cIdx
 							} else if myConnIdx != cIdx {
 								parseErr.Add(1)
-								t.Errorf("conn index mismatch: frame claimed %d, connection was %d", cIdx, myConnIdx)
+								note("conn index mismatch: frame claimed %d, connection was %d", cIdx, myConnIdx)
 								return
 							}
 
 							if !bytes.Equal(msg[16:], expectedPad) {
 								parseErr.Add(1)
-								t.Errorf("conn %d: payload padding corrupted", cIdx)
+								note("conn %d: payload padding corrupted", cIdx)
 								return
 							}
 
@@ -151,7 +171,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 							expectedSeq := connLastSeq[cIdx] + 1
 							if seq != expectedSeq {
 								gaps.Add(1)
-								t.Errorf("conn %d: seq gap: got %d, want %d", cIdx, seq, expectedSeq)
+								note("conn %d: seq gap: got %d, want %d", cIdx, seq, expectedSeq)
 							}
 							connLastSeq[cIdx] = seq
 							connFramesIn[cIdx].Add(1)
@@ -163,15 +183,24 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						}
 					},
 				})
-				defer func() {
-					done := make(chan struct{})
-					go func() { shutdown(); close(done) }()
-					select {
-					case <-done:
-					case <-time.After(20 * time.Second):
-						t.Errorf("engine shutdown did not complete within 20s")
-					}
-				}()
+				// Shutting the engine down is what drains the handler
+				// goroutines, so it must happen BEFORE the assertions or
+				// every counter below is read off a moving target. Kept in
+				// a Once so the defer is a no-op on the normal path and
+				// still cleans up if the body returns early.
+				var shutdownOnce sync.Once
+				settle := func() {
+					shutdownOnce.Do(func() {
+						done := make(chan struct{})
+						go func() { shutdown(); close(done) }()
+						select {
+						case <-done:
+						case <-time.After(20 * time.Second):
+							t.Errorf("engine shutdown did not complete within 20s")
+						}
+					})
+				}
+				defer settle()
 
 				hostPort := strings.TrimSuffix(strings.TrimPrefix(addr, "ws://"), "/ws")
 				dialer := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -283,6 +312,14 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				if dialFail.Load()+hsFail.Load() > 0 {
 					t.Fatalf("environment: %d dial/handshake failures", dialFail.Load()+hsFail.Load())
 				}
+
+				// Drain the handlers, then assert on settled counters.
+				settle()
+				detailMu.Lock()
+				for _, d := range details {
+					t.Logf("%s: %s", testName, d)
+				}
+				detailMu.Unlock()
 
 				if parseErr.Load() != 0 {
 					t.Errorf("%s: %d frame parse error(s) observed — frames were corrupted", testName, parseErr.Load())
