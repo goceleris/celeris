@@ -642,13 +642,24 @@ func TestHubCloseWaitsInflightBroadcast(t *testing.T) {
 		close(bcastDone)
 	}()
 	<-bcastEntered
-	// close(bcastEntered) fires BEFORE the goroutine enters Broadcast;
-	// without this short wait, main can race ahead and call Hub.Close
-	// before snapshot increments inflight, which would let Close return
-	// instantly and falsely fail the assertion below. 20ms is generous
-	// against scheduler jitter and well under the 150ms slow-conn
-	// deadline that anchors the actual semantic check.
-	time.Sleep(20 * time.Millisecond)
+	// close(bcastEntered) fires BEFORE the goroutine enters Broadcast, so
+	// something has to establish that snapshot() has run and incremented
+	// inflight before Hub.Close is called. This used to be a 20ms sleep,
+	// which failed about one run in eighteen under CPU contention: the
+	// goroutine had not been scheduled, Close found nothing in flight and
+	// returned instantly, and the assertion below fired (celeris#555).
+	// h.inflight is a sync.WaitGroup and exposes no counter, so it cannot be
+	// polled.
+	//
+	// net.Pipe is synchronous and unbuffered, which gives a real signal: a
+	// byte can only reach clientPipe once Broadcast has taken its snapshot
+	// and begun the write. Read exactly ONE byte — the writer stays blocked
+	// on the rest of the frame, so the conn is still "slow" and the 150ms
+	// write deadline still anchors the semantic check.
+	_ = clientPipe.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := clientPipe.Read(make([]byte, 1)); err != nil {
+		t.Fatalf("broadcast never reached the wire, so there was nothing in flight to wait for: %v", err)
+	}
 
 	closeStart := time.Now()
 	h.Close()
