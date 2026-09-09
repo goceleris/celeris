@@ -106,7 +106,23 @@ type Config struct {
 	// successful frame read. On the std (hijack) path this is enforced via
 	// net.Conn.SetReadDeadline; on native engines (epoll/io_uring) it is
 	// enforced via the engine's idle sweep using SetWSIdleDeadline.
-	// Zero means no idle timeout.
+	//
+	// Zero means no idle timeout, and on the native engines that means the
+	// connection has NO liveness bound at all (celeris#524). Once a
+	// connection detaches, the engine deliberately stops applying its own
+	// ReadTimeout / IdleTimeout / WriteTimeout — the middleware owns the I/O
+	// lifecycle from that point — and reaps a detached connection only when
+	// the middleware has published a deadline. This field is what publishes
+	// one. Leave it zero and nothing will ever close an idle connection,
+	// which is correct for a long-lived WebSocket and is why zero is the
+	// default.
+	//
+	// Worth setting anyway if you want a backstop. A connection that is
+	// WEDGED rather than merely idle is indistinguishable from a healthy
+	// quiet one without a deadline, so any engine-side liveness bug becomes
+	// permanent for that connection instead of self-limiting. Several such
+	// bugs have been found and fixed (celeris#527, #482); a deadline is what
+	// would have made them survivable.
 	IdleTimeout time.Duration
 
 	// MaxBackpressureBuffer is the maximum number of inbound chunks
