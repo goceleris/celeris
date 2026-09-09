@@ -1456,6 +1456,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// enqueues+signals, so drainDetachQueue fires promptly.
 			if !w.async {
 				w.detachedCount++
+				cs.detachCounted = true
 			} else {
 				cs.asyncDetachPending = true
 			}
@@ -2570,9 +2571,7 @@ func (w *Worker) closeConn(fd int) {
 		// Async mode pre-allocates detachMu in acquireConnState but does
 		// NOT increment detachedCount, so decrementing here would cause
 		// underflow for plain async-HTTP1 conns.
-		if cs.h1State != nil && cs.h1State.Detached.Load() && w.detachedCount > 0 {
-			w.detachedCount--
-		}
+		w.releaseDetachedCount(cs)
 	}
 	w.removeDirty(cs)
 	// Close H1 state unless a real WS/SSE detach handed ownership to a
@@ -3629,6 +3628,7 @@ func (w *Worker) drainDetachQueue() {
 		if cs.asyncDetachPending {
 			cs.asyncDetachPending = false
 			w.detachedCount++
+			cs.detachCounted = true
 			if !w.h2PollArmed && w.h2EventFD >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()
 			}
@@ -3690,6 +3690,30 @@ func (w *Worker) drainDetachQueue() {
 		w.markDirty(cs)
 	}
 	w.detachQSpare = w.detachQSpare[:0]
+}
+
+// releaseDetachedCount gives back this conn's contribution to
+// w.detachedCount, if it ever made one.
+//
+// Keyed on cs.detachCounted, which is set at the two sites that actually bump
+// the counter — NOT inferred from h1State.Detached, which is what went wrong.
+// In async mode the dispatch goroutine sets Detached in OnDetach while the
+// increment is deferred to drainDetachQueue, so a close landing in that window
+// decremented for a conn that had never counted; drainDetachQueue then skipped
+// its increment on the detachClosed guard, making the loss permanent
+// (celeris#549). detachedCount gates the idle sweep, so drifting it toward
+// zero silently removes idle enforcement from detached WS/SSE conns.
+//
+// Clearing the flag makes it idempotent: a second close cannot double-count.
+// Worker-thread only, like both increment sites.
+func (w *Worker) releaseDetachedCount(cs *connState) {
+	if !cs.detachCounted {
+		return
+	}
+	cs.detachCounted = false
+	if w.detachedCount > 0 {
+		w.detachedCount--
+	}
 }
 
 func (w *Worker) markDirty(cs *connState) {
