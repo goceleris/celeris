@@ -330,8 +330,12 @@ func probeFixedFiles() (bool, string) {
 	cqe := ring.cqeAt(head)
 	res := cqe.Res
 	ring.EndCQ(head + 1)
-	// Res = -EINVAL (-22) means the kernel registered files but refuses
-	// ACCEPT_DIRECT (seen on 6.6.10-cix aarch64). Treat as unsupported.
+	// Res < 0 means the kernel registered files but would not complete this
+	// accept-direct. Historically this reported -EINVAL everywhere and was
+	// attributed to the kernel ("seen on 6.6.10-cix aarch64"); the real cause
+	// was our own SQE passing SOCK_CLOEXEC alongside a fixed file slot, which
+	// io_accept_prep rejects by design. That is fixed (celeris#541), so a
+	// rejection here is now genuinely the kernel's.
 	if res < 0 {
 		return false, fmt.Sprintf("ACCEPT_DIRECT rejected by kernel: cqe.res=%d (likely -EINVAL=-22)", res)
 	}

@@ -137,7 +137,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		"multishot_accept", tier.SupportsMultishotAccept(),
 		"multishot_recv", tier.SupportsMultishotRecv(),
 		"provided_buffers", tier.SupportsProvidedBuffers(),
-		"fixed_files", tier.SupportsFixedFiles(),
+		// The EFFECTIVE value, not the tier capability: this used to print
+		// the capability and so reported fixed_files=true while the feature
+		// was gated off (celeris#541).
+		"fixed_files", fixedFilesEnabled(tier.SupportsFixedFiles()),
 		"send_zc", tier.SupportsSendZC(),
 	)
 
@@ -247,7 +250,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		"workers", resolved.Workers,
 		"sqpoll", tier.SQPollIdle() > 0,
 		"send_zc", tier.SupportsSendZC(),
-		"fixed_files", tier.SupportsFixedFiles(),
+		"fixed_files", fixedFilesEnabled(tier.SupportsFixedFiles()),
 		"numa_nodes", e.profile.NUMANodes,
 		"kernel", e.profile.KernelVersion,
 	)
