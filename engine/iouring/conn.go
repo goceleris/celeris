@@ -131,6 +131,13 @@ type connState struct {
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (worker-thread only)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
+	// recvCancelPending is true from the moment the backpressure pause
+	// submits its ASYNC_CANCEL until that cancel's effect is observed. It
+	// tells handleRecv that a -ECANCELED recv CQE is one this worker asked
+	// for, so a pause the middleware withdraws before the cancel lands
+	// re-arms the connection instead of closing a healthy one.
+	// Worker-thread only, like recvPaused.
+	recvCancelPending bool
 
 	// Async handler dispatch (Worker.async=true, HTTP1 only):
 	// Incoming recv bytes are appended under asyncInMu by the worker.
@@ -364,6 +371,7 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
+	cs.recvCancelPending = false
 	cs.headerTimerSpec = kernelTimespec{}
 	cs.headerTimerArmed = false
 	cs.forceRSTClose = false

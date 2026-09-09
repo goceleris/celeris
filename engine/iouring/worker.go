@@ -865,7 +865,14 @@ func (w *Worker) run(ctx context.Context) {
 					mu.Lock()
 				}
 				sqFull := w.flushSend(cs)
-				if cs.needsRecv && !cs.recvPaused {
+				// The recvArmed check keeps pickRecvTarget out of the
+				// picture while a recv is in flight: it MUTATES
+				// cs.recvIntoBody, so calling it for an arm that
+				// prepareRecv is going to decline would mis-route the
+				// in-flight recv's CQE through the direct-body path.
+				if cs.needsRecv && !cs.recvPaused && cs.recvArmed {
+					cs.needsRecv = false
+				} else if cs.needsRecv && !cs.recvPaused {
 					// Arm via pickRecvTarget so a deferred BODY recv re-arms
 					// into the H1 bodyBuf with cs.recvIntoBody set, instead of
 					// blindly re-arming into cs.buf. Re-arming into cs.buf
@@ -1790,6 +1797,21 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// Recv was cancelled by drainDetachQueue (WS backpressure pause).
 		// Don't close — the connection stays open until ResumeRecv re-arms.
 		if c.Res == -int32(unix.ECANCELED) && cs.recvPaused {
+			cs.recvCancelPending = false
+			return
+		}
+		// Same cancel, but the middleware drained its buffer and withdrew
+		// the pause before the cancel landed. The connection is healthy and
+		// now unarmed, so re-arm it. Closing here — which is what the
+		// generic negative-result path below does — tore down a working
+		// connection whenever a burst was consumed faster than the pause
+		// round trip (celeris#484).
+		if c.Res == -int32(unix.ECANCELED) && cs.recvCancelPending {
+			cs.recvCancelPending = false
+			if !w.prepareRecv(cs, cs.buf) {
+				cs.needsRecv = true
+				w.markDirty(cs)
+			}
 			return
 		}
 		// ENOBUFS (-105): provided buffer ring exhausted. The multishot recv
@@ -3573,6 +3595,19 @@ func (w *Worker) rearmAcceptIfPending(paused bool) {
 // or the close path would release cs.buf while the kernel still holds a
 // write pointer into it (v1.4.15/7beebb9 corruption).
 func (w *Worker) prepareRecv(cs *connState, buf []byte) bool {
+	// One recv per connection, always. A second recv armed while the first
+	// is still in flight points two kernel writes at the same cs.buf, so
+	// the later write lands on top of the earlier one's unread bytes and
+	// the inbound stream is corrupted mid-frame — a WebSocket parser then
+	// finds a frame boundary at the wrong offset (celeris#484). The window
+	// is the backpressure pause: the pause submits an ASYNC_CANCEL, and a
+	// resume that arrives before that cancel lands used to arm
+	// unconditionally. Returning true reports the postcondition every
+	// caller actually wants — "a recv is armed for this conn" — so none of
+	// them schedules a redundant retry.
+	if cs.recvArmed {
+		return true
+	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		return false
@@ -3734,6 +3769,7 @@ func (w *Worker) drainDetachQueue() {
 					// udProvide so the dispatcher drops it.
 					prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 					setSQEUserData(sqe, encodeUserData(udProvide, cs.fd))
+					cs.recvCancelPending = true
 				}
 			} else {
 				if w.prepareRecv(cs, cs.buf) {
