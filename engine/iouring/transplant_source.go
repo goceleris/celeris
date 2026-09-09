@@ -115,6 +115,10 @@ func (w *Worker) tryTransplant(fd int) {
 	// Detach from io_uring (mirror hijackConn): drop from live set/conn table,
 	// cancel the armed recv, defer the connState release to its terminal CQE, and
 	// close the ORIGINAL fd (the dup keeps the socket alive for epoll).
+	// Unlink from the dirty list (celeris#527): the original fd is closed
+	// below and its number may be re-accepted, so a dirty-loop retry would
+	// call prepareRecv on a stranger's socket.
+	w.removeDirty(cs)
 	w.removeLiveConn(cs)
 	w.conns[fd] = nil
 	w.connCount--
@@ -191,6 +195,11 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	}
 	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
 
+	// Unlink from the dirty list (celeris#527). This is the one teardown
+	// path with no cs.sending guard at all, so it is the only way a detached
+	// connState reaches the list with a SEND in flight — the immortal-entry
+	// case that pins the worker at 100% CPU. See also celeris#529.
+	w.removeDirty(cs)
 	w.removeLiveConn(cs)
 	w.conns[fd] = nil
 	w.connCount--

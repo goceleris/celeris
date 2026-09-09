@@ -1316,6 +1316,12 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	if cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 {
 		return nil, errors.New("celeris: cannot hijack with pending sends")
 	}
+	// Unlink from the dirty list (celeris#527). Here it is not just a leak:
+	// the fd stays open under the caller's net.Conn, and the dirty loop's
+	// retry pass calls prepareRecv on whatever it walks — re-arming exactly
+	// the recv this function cancels below to stop it stealing the
+	// hijacker's first bytes.
+	w.removeDirty(cs)
 	w.removeLiveConn(cs)
 	w.conns[fd] = nil
 	w.connCount--
@@ -2137,16 +2143,35 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if errors.Is(processErr, conn.ErrHijacked) {
 			return // FD already detached
 		}
-		// Flush pending writes (e.g. error responses) before closing.
-		_ = w.flushSend(cs)
-		// Check cs.h1State under detachMu (same TOCTOU class fixed at
-		// line 944 — see handleRecv recv-failure path).
-		if cs.detachMu != nil {
-			cs.detachMu.Lock()
+		// Flush pending writes (e.g. error responses) before closing, and
+		// read cs.h1State, both under detachMu.
+		//
+		// The flush was previously outside the lock. completeSend's docstring
+		// states the invariant it broke: for a detached connection cs.sendBuf
+		// is read by the makeWriteFn closure on the user's goroutine, so every
+		// mutation of it needs detachMu. flushSend swaps sendBuf with writeBuf
+		// and sets cs.sending, so calling it unlocked races a handler that is
+		// writing — the same access pattern the race detector caught on the
+		// call sites that were fixed when that docstring was written
+		// (celeris#528). Reachable within one request: a handler can Detach
+		// (SSE, or a WebSocket upgrade) and then have ProcessH1 surface an
+		// error, with the guarded write closure already installed.
+		//
+		// The h1State read has its own reason to be under the lock: the async
+		// dispatch goroutine's switchToH2Local nils cs.h1State under the same
+		// mutex (the #256 TOCTOU class).
+		//
+		// engine/epoll/loop.go does exactly this — one lock spanning the
+		// flush and OnError.
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+			_ = w.flushSend(cs)
 			if cs.h1State != nil && cs.h1State.OnError != nil {
 				cs.h1State.OnError(processErr)
 			}
-			cs.detachMu.Unlock()
+			mu.Unlock()
+		} else {
+			_ = w.flushSend(cs)
 		}
 		w.closeConn(fd)
 		return
@@ -2793,6 +2818,18 @@ func (w *Worker) drainPendingRelease() {
 
 func (w *Worker) finishClose(fd int) {
 	cs := w.conns[fd]
+	// Unlink from the dirty list before the connState leaves w.conns
+	// (celeris#527). Nothing downstream can do it: the dirty loop's only
+	// removeDirty sits inside "if !cs.sending", so a conn torn down with a
+	// SEND in flight is skipped by the very code that would unlink it, and
+	// releaseConnState clears cs.dirty before pooling the object, which
+	// turns a later removeDirty into a no-op while the predecessor's
+	// dirtyNext still points at it — truncating the list and stranding
+	// every entry behind it. removeDirty is idempotent, so this is purely
+	// additive next to closeConn's existing unlink.
+	if cs != nil {
+		w.removeDirty(cs)
+	}
 	// Remove from liveConns BEFORE niling w.conns[fd]: removeLiveConn swaps
 	// the last live entry into cs.liveIdx and updates that swapped-in
 	// connState's liveIdx via w.conns[swappedFD], so the conns slice must
@@ -2896,6 +2933,13 @@ func (w *Worker) finishCloseAny(fd int, cs *connState) {
 // WITHOUT returning the connState to the pool. Used when a detached goroutine
 // still holds closure references to the connState.
 func (w *Worker) finishCloseDetached(fd int, cs *connState) {
+	// Unlink from the dirty list first (celeris#527). Detached entries skip
+	// releaseConnState entirely, so one torn down with cs.sending true is
+	// otherwise immortal: nothing ever clears sending (the cancelled SEND's
+	// -ECANCELED is dropped by staleConnCQE once w.conns[fd] is nil), the
+	// dirty loop skips it forever, and adaptiveTimeout returns 0 while
+	// dirtyHead is non-nil — so the worker busy-spins at 100% CPU even idle.
+	w.removeDirty(cs)
 	// Remove from liveConns BEFORE niling w.conns[fd] (same hazard as
 	// finishClose — removeLiveConn touches w.conns[swappedFD]).
 	w.removeLiveConn(cs)
