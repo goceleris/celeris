@@ -74,6 +74,22 @@ const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (
 // auto-scaling from the per-worker conn target.
 const envPbufCount = "CELERIS_IOURING_PBUF_COUNT"
 
+// envFixedFiles opts into the registered-file-table path. Development only:
+// the feature is incomplete (celeris#541) and the default single-shot recv
+// omits IOSQE_FIXED_FILE, so enabling it makes connections read from
+// unrelated descriptors.
+const envFixedFiles = "CELERIS_IOURING_FIXED_FILES"
+
+// fixedFilesEnabled reports whether the registered-file path should actually
+// be used: the tier must support it AND it must be explicitly opted into.
+//
+// Kept as one function so the worker's gate and the engine's startup log
+// cannot disagree. They did: the log reported the tier CAPABILITY, so it
+// printed fixed_files=true while the feature was off.
+func fixedFilesEnabled(tierSupports bool) bool {
+	return tierSupports && os.Getenv(envFixedFiles) == "1"
+}
+
 // defaultConnsPerWorker is the per-worker connection target used to size
 // the provided-buffer ring. The ring is sized at 2 buffers per conn at
 // this target, giving comfortable headroom so the kernel rarely stalls
@@ -479,13 +495,35 @@ func (w *Worker) run(ctx context.Context) {
 	}
 	w.ring = ring
 
-	// Register fixed file table if the tier supports it.
-	if w.tier.SupportsFixedFiles() {
+	// Fixed files are OFF unless explicitly opted into, and that gate is
+	// deliberate — see celeris#541.
+	//
+	// Until now they were off by ACCIDENT: prepMultishotAcceptDirect set
+	// SOCK_CLOEXEC alongside IORING_FILE_INDEX_ALLOC, io_accept_prep rejects
+	// that combination with -EINVAL, and the runtime probe read the rejection
+	// as "this kernel refuses ACCEPT_DIRECT". So cs.fixedFile has never been
+	// true on any kernel, and every branch gated on it is unexecuted code. An
+	// audit of those branches found eleven defects, none refuted, including
+	// the DEFAULT receive path: prepRecv has no fixed-file variant and never
+	// sets the flags byte, so every connection would arm a recv against a raw
+	// fd equal to its slot index, colliding with real sockets in the process.
+	//
+	// Relying on that accident is not safe. It depends on a kernel continuing
+	// to reject a malformed SQE; one that tolerated it would silently switch
+	// the whole broken path on. The SQE bug is fixed in this change, so the
+	// interlock is now this gate rather than an -EINVAL, and completing the
+	// feature means working through celeris#541's checklist and removing this
+	// block — not discovering the flags bug and assuming that was all.
+	if fixedFilesEnabled(w.tier.SupportsFixedFiles()) {
 		if err := w.ring.RegisterFiles(fixedFileTableSize); err != nil {
 			w.logger.Warn("fixed file table registration failed, falling back",
 				"worker", w.id, "err", err)
 		} else {
 			w.fixedFiles = true
+			w.logger.Warn("fixed files enabled via "+envFixedFiles+": this path is INCOMPLETE "+
+				"(celeris#541) — the default single-shot recv omits IOSQE_FIXED_FILE and will "+
+				"read from unrelated descriptors. Do not use outside development.",
+				"worker", w.id)
 		}
 	}
 
