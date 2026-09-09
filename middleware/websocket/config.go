@@ -115,6 +115,14 @@ type Config struct {
 	// BackpressureHighPct, the engine pauses inbound delivery for this
 	// connection (TCP-level backpressure); when it drains below
 	// BackpressureLowPct, delivery is resumed.
+	//
+	// The pause is applied asynchronously on the engine worker, so chunks
+	// already in flight keep arriving after it is requested and can exceed
+	// the (1 - BackpressureHighPct) headroom. Those chunks are queued
+	// rather than discarded (celeris#484), so the worst-case buffered
+	// depth is TWICE this value; a peer that outruns even that is cut off
+	// with ErrReadLimit. Size it for memory as 2 x this many chunks per
+	// connection.
 	// Default: 256. Ignored on the std (hijack) engine path.
 	MaxBackpressureBuffer int
 
