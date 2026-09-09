@@ -1077,10 +1077,29 @@ func (w *Worker) handleHeaderTimer(fd int) {
 		return
 	}
 	cs.headerTimerArmed = false
-	if cs.closing || cs.h1State == nil {
+	if cs.closing {
 		return
 	}
-	dl := cs.h1State.HeaderDeadlineNs.Load()
+	// Snapshot under detachMu — same TOCTOU as checkTimeouts (celeris#548):
+	// switchToH2Local nils cs.h1State under this lock on the dispatch
+	// goroutine, so a check here followed by a dereference below can take a
+	// nil pointer. Released immediately; the close path below takes the same
+	// mutex.
+	var dl int64
+	var haveH1 bool
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+	}
+	if h1 := cs.h1State; h1 != nil {
+		haveH1 = true
+		dl = h1.HeaderDeadlineNs.Load()
+	}
+	if mu := cs.detachMu; mu != nil {
+		mu.Unlock()
+	}
+	if !haveH1 {
+		return
+	}
 	if dl == 0 {
 		// Headers completed before the timer fired; no-op. The next
 		// ArmHeaderDeadline (keep-alive next request) will submit a
@@ -4001,8 +4020,34 @@ func (w *Worker) checkTimeouts() {
 		// I/O lifecycle. Async-mode conns set detachMu up front without
 		// a real detach — fall through to the normal timeout scan for
 		// those.
-		if cs.h1State != nil && cs.h1State.Detached.Load() {
-			if dl := cs.h1State.IdleDeadlineNs.Load(); dl > 0 && now > dl {
+		// Snapshot h1State under detachMu (celeris#548). The async dispatch
+		// goroutine's switchToH2Local nils cs.h1State under this same lock,
+		// so testing it and then dereferencing it again is a TOCTOU: the
+		// pointer can go nil between the two reads and the event loop takes
+		// a nil dereference. This is the invariant stated twice elsewhere in
+		// this file, at the two sites where it was already fixed.
+		//
+		// The lock is RELEASED before acting: closeConn takes the same
+		// mutex, so holding it across the call would deadlock. Everything
+		// the decision needs is copied out first.
+		var h1Detached bool
+		var idleDL, hdrDL int64
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
+		if h1 := cs.h1State; h1 != nil {
+			h1Detached = h1.Detached.Load()
+			idleDL = h1.IdleDeadlineNs.Load()
+			hdrDL = h1.HeaderDeadlineNs.Load()
+		}
+		if mu := cs.detachMu; mu != nil {
+			mu.Unlock()
+		}
+
+		// engine-config-driven timeouts do not apply to a detached conn —
+		// the middleware owns its I/O lifecycle.
+		if h1Detached {
+			if idleDL > 0 && now > idleDL {
 				w.closeConn(fd)
 			}
 			continue
@@ -4010,11 +4055,9 @@ func (w *Worker) checkTimeouts() {
 		// ReadHeaderTimeout: slowloris defence. Plain unix.Close path
 		// (handled by closeConn → finishCloseDetached fastClose branch).
 		// See handleHeaderTimer for the rationale (mirrors net/http).
-		if cs.h1State != nil {
-			if dl := cs.h1State.HeaderDeadlineNs.Load(); dl > 0 && now > dl {
-				w.closeConn(fd)
-				continue
-			}
+		if hdrDL > 0 && now > hdrDL {
+			w.closeConn(fd)
+			continue
 		}
 		elapsed := time.Duration(now - cs.lastActivity)
 		if cs.dirty || cs.sending {
