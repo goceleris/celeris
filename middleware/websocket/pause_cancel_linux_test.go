@@ -106,6 +106,12 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 			hostPort = strings.TrimSuffix(hostPort, "/ws")
 
 			var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail, clientMisaligned, framesSent atomic.Int64
+			// An RST is NOT a clean close (celeris#530). Linux emits one when
+			// a socket is closed with unread data still in its receive queue,
+			// which is the signature of a connection torn down mid-stream —
+			// one of the failure modes this oracle exists to catch. Folding
+			// it into closedOK scored a hard teardown as success.
+			var clientRST atomic.Int64
 			var wg sync.WaitGroup
 			batch := maskedTextFrames(2048, 120)
 			dialer := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -184,7 +190,9 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						if err == nil {
 							continue
 						}
-						if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+						if errors.Is(err, syscall.ECONNRESET) {
+							clientRST.Add(1)
+						} else if errors.Is(err, io.EOF) {
 							closedOK.Add(1)
 						} else {
 							closeTimeout.Add(1)
@@ -202,14 +210,36 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				t.Errorf("%d client conn(s) ended mid-frame -- test client bug, not a server verdict", clientMisaligned.Load())
 			}
 
-			t.Logf("%s: conns=%d protoErr=%d clientCloseFail=%d ecanceled=%d otherWriteErr=%d closedOK=%d closeTimeout=%d dialFail=%d hsFail=%d",
-				kind, conns, protoErr.Load(), clientCloseFail.Load(), ecanceled.Load(), otherWriteErr.Load(), closedOK.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
+			t.Logf("%s: conns=%d protoErr=%d clientCloseFail=%d ecanceled=%d otherWriteErr=%d closedOK=%d clientRST=%d closeTimeout=%d dialFail=%d hsFail=%d",
+				kind, conns, protoErr.Load(), clientCloseFail.Load(), ecanceled.Load(), otherWriteErr.Load(), closedOK.Load(), clientRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
 			if dialFail.Load()+hsFail.Load() > 0 {
 				t.Fatalf("%d conns failed to dial/handshake -- environment problem, not a verdict", dialFail.Load()+hsFail.Load())
 			}
 			if n := ecanceled.Load(); n != 0 {
 				t.Errorf("%d WebSocket handler(s) observed ECANCELED from WriteMessage: the recv-pause "+
 					"cancel killed an in-flight SEND (celeris#482)", n)
+			}
+			// protoErr and otherWriteErr were logged but never asserted, so a
+			// server that killed a healthy connection mid-write passed on
+			// these counters alone (celeris#530). Measured zero on both
+			// engines across repeated runs before this assertion was added.
+			if n := protoErr.Load(); n != 0 {
+				t.Errorf("%d handler(s) saw a protocol error on the read side: the engine "+
+					"mis-delivered or tore down a healthy connection", n)
+			}
+			// Measured zero on both engines across repeated runs before this
+			// was asserted: nothing was actually being hidden inside closedOK
+			// here, unlike the sibling inbound oracle where the same folding
+			// masked a connection that lost 12,735 frames. Asserting it keeps
+			// the distinction from decaying back.
+			if n := clientRST.Load(); n != 0 {
+				t.Errorf("%d conn(s) were RESET rather than closed cleanly: Linux emits RST when a "+
+					"socket is closed with unread data still queued, which is a connection torn "+
+					"down mid-stream, not a clean close (celeris#530)", n)
+			}
+			if n := otherWriteErr.Load(); n != 0 {
+				t.Errorf("%d handler(s) saw a non-ECANCELED write error: the engine failed a "+
+					"WriteMessage on a connection it should have kept alive", n)
 			}
 			if n := closeTimeout.Load(); n != 0 {
 				// Deliberately does NOT name a cause. This counter only says
