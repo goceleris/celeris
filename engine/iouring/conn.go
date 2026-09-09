@@ -210,6 +210,15 @@ type connState struct {
 	// worker may call GetSQE). Cleared by drainDetachQueue after the
 	// bookkeeping runs, and by releaseConnState on teardown.
 	asyncDetachPending bool
+	// detachCounted records that this conn actually contributed to
+	// w.detachedCount, so the close path decrements only what was
+	// incremented. Inferring it from h1State.Detached was wrong: in async
+	// mode the dispatch goroutine sets Detached in OnDetach while the
+	// increment is deferred to drainDetachQueue, so a close landing in that
+	// window decremented for a conn that never counted (celeris#549).
+	// Worker-thread only — both the increment sites and the decrement run
+	// there.
+	detachCounted bool
 
 	// headerTimerSpec is the kernelTimespec passed to IORING_OP_TIMEOUT
 	// SQEs that enforce ReadHeaderTimeout per-conn. Owned by the conn
@@ -375,6 +384,7 @@ func releaseConnState(cs *connState) {
 	cs.promotedPath = ""
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
+	cs.detachCounted = false
 	cs.bodyBuf = nil
 	cs.sendBody = nil
 	// bodyRecvPin is cleared here, after every kernel-held op delivered its
