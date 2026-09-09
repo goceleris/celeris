@@ -3198,7 +3198,13 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		// dispatch via the inline H2 path (cs.protocol is now H2C).
 		if errors.Is(processErr, conn.ErrUpgradeH2C) {
 			promoteErr := w.switchToH2Local(cs)
-			if promoteErr == nil && len(cs.writeBuf) > 0 {
+			// NOT for a fixed-file conn: cs.fd is then a registered-file
+			// TABLE INDEX, not a descriptor, so unix.Write would send the
+			// 101 to whatever real fd holds that number (celeris#538).
+			// Leaving the bytes in writeBuf takes the same disposition as
+			// the EAGAIN branch below — the worker ring-sends them, and the
+			// ring resolves the index correctly.
+			if promoteErr == nil && !cs.fixedFile && len(cs.writeBuf) > 0 {
 				n, werr := unix.Write(cs.fd, cs.writeBuf)
 				switch {
 				case werr == nil && n == len(cs.writeBuf):
@@ -3290,7 +3296,14 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		// iouring (95 µs/op → target ~30 µs/op, matching epoll and
 		// go-redis + stdlib).
 		var partial bool
-		if processErr == nil && len(cs.writeBuf) > 0 {
+		if processErr == nil && cs.fixedFile && len(cs.writeBuf) > 0 {
+			// Fixed-file conn: cs.fd is a registered-file TABLE INDEX, not a
+			// descriptor, so the direct write below would go to whatever real
+			// fd holds that number (celeris#538). Take the same route as a
+			// full socket buffer — hand the bytes to the worker, whose ring
+			// SEND resolves the index correctly.
+			partial = true
+		} else if processErr == nil && len(cs.writeBuf) > 0 {
 			n, werr := unix.Write(cs.fd, cs.writeBuf)
 			if werr != nil {
 				if werr == unix.EAGAIN || werr == unix.EWOULDBLOCK {
