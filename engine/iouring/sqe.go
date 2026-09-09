@@ -28,8 +28,16 @@ func prepMultishotAccept(sqePtr unsafe.Pointer, listenFD int) {
 // FDs directly into the io_uring fixed file table. The CQE result is a fixed
 // file index, not a regular FD.
 func prepMultishotAcceptDirect(sqePtr unsafe.Pointer, listenFD int) {
-	prepMultishotAccept(sqePtr, listenFD)
+	// SOCK_NONBLOCK only — NOT SOCK_CLOEXEC. io_accept_prep rejects a fixed
+	// file slot combined with SOCK_CLOEXEC with -EINVAL, because a direct
+	// descriptor lives in the ring's file table rather than the process fd
+	// table, so close-on-exec is meaningless for it. Building on
+	// prepMultishotAccept (which sets both flags) made every accept-direct
+	// probe fail, and the failure was read as "this kernel refuses
+	// ACCEPT_DIRECT" — see the probe's own comment. celeris#541.
+	prepAccept(sqePtr, listenFD, uint32(unix.SOCK_NONBLOCK))
 	sqe := (*[sqeSize]byte)(sqePtr)
+	*(*uint16)(unsafe.Pointer(&sqe[2])) = acceptMultishot // ioprio at offset 2
 	// file_index at offset 44: IORING_FILE_INDEX_ALLOC for auto-allocation.
 	*(*uint32)(unsafe.Pointer(&sqe[44])) = fileIndexAlloc
 }
