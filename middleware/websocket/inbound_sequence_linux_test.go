@@ -93,7 +93,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					detailMu.Unlock()
 				}
 
-				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent atomic.Int64
+				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent, echoErr atomic.Int64
 				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
 				// An RST is NOT a clean close (celeris#530). Linux emits one
 				// when a socket is closed with unread data still in its
@@ -110,6 +110,10 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					connLastSeq[i] = -1
 				}
 				connFramesIn := make([]atomic.Int64, conns)
+				// Frames the server successfully echoed, and which conns saw an
+				// echo failure — the server-side half of every truncation report.
+				connEchoed := make([]atomic.Int64, conns)
+				connEchoErr := make([]atomic.Int64, conns)
 				connProtoErr := make([]atomic.Int64, conns)
 				connSent := make([]atomic.Int64, conns)
 				clientFailed := make([]atomic.Bool, conns)
@@ -191,8 +195,18 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 							framesIn.Add(1)
 
 							if err := c.WriteMessage(mt, msg); err != nil {
+								// The handler's own echo failure used to be
+								// swallowed here. A client reporting a truncated
+								// stream could not be told apart from a server
+								// that stopped writing, which is the ambiguity
+								// celeris#562 spent several rounds inside.
+								echoErr.Add(1)
+								connEchoErr[cIdx].Store(1)
+								note("conn %d: echo write failed after %d frames: %v",
+									cIdx, connEchoed[cIdx].Load(), err)
 								return
 							}
+							connEchoed[cIdx].Add(1)
 						}
 					},
 				})
@@ -344,6 +358,13 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				detailMu.Unlock()
 
+				t.Logf("%s: echoWriteErrors=%d", testName, echoErr.Load())
+				for i := range conns {
+					if connEchoErr[i].Load() != 0 {
+						t.Logf("%s: conn %d echo state: echoed=%d in=%d sent=%d",
+							testName, i, connEchoed[i].Load(), connFramesIn[i].Load(), connSent[i].Load())
+					}
+				}
 				if parseErr.Load() != 0 {
 					t.Errorf("%s: %d frame parse error(s) observed — frames were corrupted", testName, parseErr.Load())
 				}
