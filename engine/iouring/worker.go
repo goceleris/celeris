@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -34,8 +35,18 @@ import (
 // Must accommodate the maximum number of concurrent connections per worker.
 const fixedFileTableSize = 65536
 
+// errPeerClosed is what detached middleware is told when the peer performs an
+// orderly shutdown. It wraps io.EOF because every consumer classifies a clean
+// disconnect with errors.Is(err, io.EOF). Handing them the recv result instead
+// produced unix.Errno(0) — printed as "errno 0" — which matches nothing, so an
+// ordinary disconnect was scored as a protocol error (celeris#564). epoll
+// reports the same condition through its own errPeerClosed.
+var errPeerClosed = fmt.Errorf("celeris: peer closed connection: %w", io.EOF)
+
 // errIORingRecv wraps a negative io_uring recv result as a syscall.Errno.
 // Used to surface concrete errors to detached middleware via H1State.OnError.
+// Callers MUST handle res == 0 before reaching here: a zero result is an
+// orderly shutdown, not a failure, and unix.Errno(0) is not a usable error.
 func errIORingRecv(res int32) error {
 	return unix.Errno(uint32(-res))
 }
@@ -1793,6 +1804,21 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
+		}
+		// A zero-length recv completion is the peer's FIN, not a failure.
+		// Surfacing it through errIORingRecv gave middleware unix.Errno(0),
+		// which no error classifier recognises, so every ordinary disconnect
+		// read as a protocol error (celeris#564).
+		if c.Res == 0 {
+			if cs.detachMu != nil {
+				cs.detachMu.Lock()
+				if cs.h1State != nil && cs.h1State.OnError != nil {
+					cs.h1State.OnError(errPeerClosed)
+				}
+				cs.detachMu.Unlock()
+			}
+			w.closeConn(fd)
+			return
 		}
 		// Recv was cancelled by drainDetachQueue (WS backpressure pause).
 		// Don't close — the connection stays open until ResumeRecv re-arms.
