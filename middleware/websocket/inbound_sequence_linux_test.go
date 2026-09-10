@@ -118,11 +118,15 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				connSent := make([]atomic.Int64, conns)
 				clientFailed := make([]atomic.Bool, conns)
 
+				// Handlers must finish before the engine goes away — see settle().
+				var handlerWG sync.WaitGroup
 				addr, shutdown := startNativeServer(t, kind, Config{
 					CheckOrigin:           func(*celeris.Context) bool { return true },
 					ReadLimit:             256 * 1024,
 					MaxBackpressureBuffer: bpBuf,
 					Handler: func(c *Conn) {
+						handlerWG.Add(1)
+						defer handlerWG.Done()
 						var myConnIdx = -1
 						for {
 							mt, msg, err := c.ReadMessage()
@@ -210,14 +214,35 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						}
 					},
 				})
-				// Shutting the engine down is what drains the handler
-				// goroutines, so it must happen BEFORE the assertions or
-				// every counter below is read off a moving target. Kept in
-				// a Once so the defer is a no-op on the normal path and
-				// still cleans up if the body returns early.
+				// Wait for the HANDLERS, then shut the engine down.
+				//
+				// Shutting down does not drain them, it truncates them.
+				// Worker.shutdown closes every detached connection, which
+				// closes its inbound reader with a bare io.EOF, and a handler
+				// sitting in io.ReadFull part-way through a frame turns that
+				// into io.ErrUnexpectedEOF — which isParseErr scores as frame
+				// corruption. The clients joining does not mean the handlers
+				// have: under the backpressure this test creates on purpose, a
+				// handler can be several frames behind.
+				//
+				// Joined by peer address over 36 runs: 4789 connections closed
+				// by the normal per-connection path produced no truncation, and
+				// all 6 closed by Worker.shutdown truncated — 6 of 6. Draining
+				// first takes that to 0 of 36 (celeris#562).
+				//
+				// A handler that will not finish is reported as exactly that,
+				// so a genuinely stuck one still fails, and loudly.
 				var shutdownOnce sync.Once
 				settle := func() {
 					shutdownOnce.Do(func() {
+						handlersDrained := make(chan struct{})
+						go func() { handlerWG.Wait(); close(handlersDrained) }()
+						select {
+						case <-handlersDrained:
+						case <-time.After(20 * time.Second):
+							t.Errorf("%s: handlers still running 20s after the clients "+
+								"finished; shutting down now would truncate them", testName)
+						}
 						done := make(chan struct{})
 						go func() { shutdown(); close(done) }()
 						select {
