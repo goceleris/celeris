@@ -64,7 +64,7 @@ const maxEpollEvents = 2048
 
 // errPeerClosed is returned via H1State.OnError when the peer closes the
 // connection cleanly (read returns 0 bytes / EOF).
-var errPeerClosed = errors.New("celeris: peer closed connection")
+var errPeerClosed = fmt.Errorf("celeris: peer closed connection: %w", io.EOF)
 
 // Loop is an epoll-based event loop worker.
 type Loop struct {
