@@ -27,6 +27,15 @@ import (
 // floods without reading (forcing repeated pause/resume) and the server handler
 // validates sequence continuity per connection, payload content integrity, and
 // verifies the tail sequence number transmitted in the Close frame.
+// closeHandshakeBudget is how long a client waits for the server to close
+// after sending its Close frame, and closeHandshakeSlow is the point past
+// which that wait is worth reporting. See the client loop for the measured
+// distribution behind these numbers (celeris#566).
+const (
+	closeHandshakeBudget = 30 * time.Second
+	closeHandshakeSlow   = 10 * time.Second
+)
+
 func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 	conns := envInt("WS484_CONNS", 96)
 	// bpBuf is the chanReader backpressure buffer capacity (default 256, matching the
@@ -93,7 +102,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					detailMu.Unlock()
 				}
 
-				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent, echoErr atomic.Int64
+				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent, echoErr, slowClose atomic.Int64
 				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
 				// An RST is NOT a clean close (celeris#530). Linux emits one
 				// when a socket is closed with unread data still in its
@@ -343,9 +352,30 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 							return
 						}
 
-						_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+						// The server routinely takes ~12s to close after the
+						// client's Close frame on this workload: 96 connections
+						// are driven into backpressure on purpose, so a handler
+						// is still draining its queue when the client stops.
+						// Measured over 48 runs, every late close landed between
+						// 11.88s and 12.91s and none exceeded it — a tight
+						// cluster just past the old 10s deadline, not a tail.
+						// At 10s the oracle reported "the server never closed
+						// its side" for a server that closes two seconds later
+						// (celeris#566).
+						//
+						// The budget is generous enough that a genuine hang is
+						// still what fails, and the latency is recorded so a
+						// regression shows up as a number rather than as a
+						// boolean that silently starts tripping.
+						closeSentAt := time.Now()
+						_ = c.SetReadDeadline(closeSentAt.Add(closeHandshakeBudget))
 						for {
 							if _, err := c.Read(buf); err != nil {
+								if d := time.Since(closeSentAt); d > closeHandshakeSlow {
+									slowClose.Add(1)
+									note("conn %d: server closed %v after the client's Close",
+										connID, d.Round(time.Millisecond))
+								}
 								if errors.Is(err, syscall.ECONNRESET) {
 									clientRST.Add(1)
 								} else if errors.Is(err, io.EOF) {
@@ -383,7 +413,8 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				detailMu.Unlock()
 
-				t.Logf("%s: echoWriteErrors=%d", testName, echoErr.Load())
+				t.Logf("%s: echoWriteErrors=%d slowCloses=%d (>%v, budget %v)",
+					testName, echoErr.Load(), slowClose.Load(), closeHandshakeSlow, closeHandshakeBudget)
 				for i := range conns {
 					if connEchoErr[i].Load() != 0 {
 						t.Logf("%s: conn %d echo state: echoed=%d in=%d sent=%d",
