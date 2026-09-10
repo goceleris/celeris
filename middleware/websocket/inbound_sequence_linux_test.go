@@ -321,15 +321,23 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				wg.Wait()
 
-				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d clientRST=%d serverRST=%d closeTimeout=%d dialFail=%d hsFail=%d",
-					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), clientRST.Load(), serverRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
-
 				if dialFail.Load()+hsFail.Load() > 0 {
 					t.Fatalf("environment: %d dial/handshake failures", dialFail.Load()+hsFail.Load())
 				}
 
 				// Drain the handlers, then assert on settled counters.
 				settle()
+
+				// The summary belongs AFTER settle(), not before it. Printed
+				// ahead of the drain it is a snapshot of counters the handler
+				// goroutines are still incrementing, so it disagrees with the
+				// assertions below on exactly the runs that matter: six runs
+				// whose summary read parseErr=0 went on to fail the parse-error
+				// assertion. Anyone comparing two builds by grepping this line
+				// is reading stale numbers.
+				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d clientRST=%d serverRST=%d closeTimeout=%d dialFail=%d hsFail=%d",
+					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), clientRST.Load(), serverRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
+
 				detailMu.Lock()
 				for _, d := range details {
 					t.Logf("%s: %s", testName, d)
