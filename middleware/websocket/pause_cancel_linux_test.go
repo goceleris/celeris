@@ -63,6 +63,21 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
 			var ecanceled, otherWriteErr, protoErr atomic.Int64
+			// protoErr counts every read error that is not a close, so on its
+			// own it cannot distinguish a frame the engine mis-delivered from
+			// a chanReader that hit ErrReadLimit because the asynchronous
+			// pause overshot its buffer. Those want opposite fixes. Record
+			// the errors and print them with the verdict; handler goroutines
+			// outlive the subtest, so they must never touch t directly.
+			var readErrMu sync.Mutex
+			readErrs := map[string]int{}
+			noteReadErr := func(err error) {
+				readErrMu.Lock()
+				if len(readErrs) < 16 {
+					readErrs[err.Error()]++
+				}
+				readErrMu.Unlock()
+			}
 			addr, shutdownEngine := startNativeServer(t, kind, Config{
 				CheckOrigin:           func(*celeris.Context) bool { return true },
 				ReadLimit:             256 * 1024,
@@ -73,6 +88,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						if err != nil {
 							if !isCloseErr(err) {
 								protoErr.Add(1)
+								noteReadErr(err)
 							}
 							return
 						}
@@ -224,6 +240,11 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 			// these counters alone (celeris#530). Measured zero on both
 			// engines across repeated runs before this assertion was added.
 			if n := protoErr.Load(); n != 0 {
+				readErrMu.Lock()
+				for msg, count := range readErrs {
+					t.Logf("%s: read error x%d: %s", kind, count, msg)
+				}
+				readErrMu.Unlock()
 				t.Errorf("%d handler(s) saw a protocol error on the read side: the engine "+
 					"mis-delivered or tore down a healthy connection", n)
 			}
