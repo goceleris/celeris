@@ -2180,6 +2180,11 @@ func (l *Loop) drainDetachQueue() {
 		}
 		l.markDirty(cs)
 	}
+	// Drop the strong refs before reusing the array (see the io_uring
+	// worker's drainDetachQueue and drainPendingRelease for the same
+	// guard): [:0] alone leaves every *connState reachable in the
+	// backing array until some later drain overwrites its slot.
+	clear(l.detachQSpare)
 	l.detachQSpare = l.detachQSpare[:0]
 }
 

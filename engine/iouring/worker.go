@@ -3808,6 +3808,13 @@ func (w *Worker) drainDetachQueue() {
 		}
 		w.markDirty(cs)
 	}
+	// Drop the strong refs before reusing the array. Truncating to [:0]
+	// leaves every *connState in the backing array reachable until some
+	// later drain overwrites that slot, so the queue pins its own
+	// high-water mark worth of connStates -- each one holding its buffers
+	// and, for a detached conn, its H1State and whatever the middleware
+	// hung off it. drainPendingRelease already guards the same hazard.
+	clear(w.detachQSpare)
 	w.detachQSpare = w.detachQSpare[:0]
 }
 
