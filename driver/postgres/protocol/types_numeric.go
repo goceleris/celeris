@@ -17,7 +17,7 @@ import (
 //   int16  dscale    display scale (number of digits after decimal point)
 //   int16  digits[ndigits]  base-10000 digits, MSD first
 //
-// Implementing a full arbitrary-precision encoder is deferred. For v1.4.0 we
+// Implementing a full arbitrary-precision encoder is deferred. For now we
 // decode into a canonical string form and require callers to pass a string
 // when encoding so the server parses it in text form.
 
@@ -138,7 +138,7 @@ func init() {
 		Name:         "numeric",
 		DecodeBinary: decodeNumericBinary,
 		DecodeText:   decodeNumericText,
-		EncodeBinary: nil, // binary encode not implemented in v1.4.0
+		EncodeBinary: nil, // binary encode not implemented
 		EncodeText:   encodeNumericText,
 		ScanType:     reflect.TypeOf(""),
 	})

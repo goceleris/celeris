@@ -61,7 +61,7 @@ A correctness-focused release. Three concurrency fixes on the WebSocket and engi
 go get github.com/goceleris/celeris@latest
 ```
 
-Requires **Go 1.26.4+**. Linux for the io_uring / epoll / adaptive engines; any OS for the std engine.
+Requires **Go 1.27.0+** (the `go` directive in `go.mod` is the source of truth). Linux for the io_uring / epoll / adaptive engines; any OS for the std engine.
 
 ```go
 package main
@@ -424,7 +424,7 @@ validation/     Runtime invariant assertions + validation hooks (debug builds)
 
 ## Requirements
 
-- **Go 1.26.4+**
+- **Go 1.27.0+** (see the `go` directive in `go.mod`)
 - **Linux** for the io_uring / epoll / adaptive engines (kernel 5.10+ for io_uring; 5.19+ for the multishot / provided-buffers tier)
 - **Any OS** for the std engine
 - Direct runtime dependencies: `golang.org/x/sys` and `golang.org/x/net` only (`golang.org/x/text` is indirect)

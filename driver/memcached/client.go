@@ -30,7 +30,7 @@ type Client struct {
 //
 // addr may optionally include a "memcache://" or "memcached://" scheme
 // prefix; the prefix is stripped and the remaining "host:port" is used
-// verbatim. TLS is not supported in v1.4.0.
+// verbatim. TLS is not supported.
 func NewClient(addr string, opts ...Option) (*Client, error) {
 	addr = strings.TrimPrefix(addr, "memcached://")
 	addr = strings.TrimPrefix(addr, "memcache://")
