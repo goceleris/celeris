@@ -15,6 +15,17 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
+
+	"golang.org/x/net/http2"
+	//nolint:staticcheck // SA1019: h2c is deprecated, and its replacement
+	// (http.Server.Protocols + SetUnencryptedHTTP2) does NOT cover the
+	// RFC 7540 3.2 Upgrade handshake -- net/http implements the upgrade path
+	// internally but exposes no way for a caller to reach it. celeris#440
+	// migrated to the stdlib and silently dropped h2c Upgrade from this
+	// engine; the epoll and io_uring engines still honour it, and the
+	// nightly caught the asymmetry. Until the stdlib exposes an equivalent,
+	// this package is the only way to keep the three engines agreeing.
+	"golang.org/x/net/http2/h2c"
 )
 
 // Engine wraps net/http.Server to implement the engine.Engine interface.
@@ -55,9 +66,29 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	bridge := &Bridge{engine: e, handler: handler}
 
+	// h2c through the deprecated handler rather than http.Protocols,
+	// because it is the only one of the two that performs the RFC 7540 3.2
+	// Upgrade handshake. See the import comment: dropping it took the
+	// std engine out of step with epoll and io_uring, which both honour
+	// Config.EnableH2Upgrade, and made the validation harness's h2c-churn
+	// slice vacuous on std -- 3,597 upgrade preambles, not one 101.
+	//
+	// h2c.NewHandler serves BOTH shapes: a client that opens with the
+	// HTTP/2 preface (prior knowledge) and one that asks to upgrade from
+	// HTTP/1.1. Plain HTTP/1.1 requests fall through to the wrapped
+	// handler, so an H2C listener still serves H1.
+	var httpHandler http.Handler = bridge
+	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
+		h2s := &http2.Server{
+			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
+			MaxReadFrameSize:     cfg.MaxFrameSize,
+		}
+		httpHandler = h2c.NewHandler(bridge, h2s) //nolint:staticcheck // SA1019: see the import comment -- no stdlib equivalent covers Upgrade.
+	}
+
 	e.server = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           bridge,
+		Handler:           httpHandler,
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -65,28 +96,6 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 		ConnState:         e.connStateHook,
 		BaseContext:       func(net.Listener) context.Context { return e.baseCtx },
-	}
-
-	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
-		// Cleartext HTTP/2 through net/http's own HTTP/2 server, selected by
-		// Protocols.SetUnencryptedHTTP2. This replaces x/net/http2/h2c, which
-		// is deprecated (celeris#440). HTTP/1.1 stays enabled alongside it so
-		// a plain H1 request on an H2C listener is still served, matching what
-		// h2c.NewHandler did by falling through to the wrapped handler.
-		//
-		// Scope: this covers prior-knowledge h2c (client preface on a fresh
-		// connection). It does NOT cover the RFC 7540 3.2 HTTP/1.1 Upgrade
-		// handshake, which RFC 9113 removed from the specification and
-		// net/http does not implement. The io_uring and epoll engines still
-		// honour Config.EnableH2Upgrade; the std engine no longer does.
-		p := new(http.Protocols)
-		p.SetHTTP1(true)
-		p.SetUnencryptedHTTP2(true)
-		e.server.Protocols = p
-		e.server.HTTP2 = &http.HTTP2Config{
-			MaxConcurrentStreams: int(cfg.MaxConcurrentStreams),
-			MaxReadFrameSize:     int(cfg.MaxFrameSize),
-		}
 	}
 
 	return e, nil
