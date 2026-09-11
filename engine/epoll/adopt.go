@@ -70,6 +70,9 @@ func (l *Loop) drainAdoptQueue(ctx context.Context, now int64) {
 	for _, it := range l.adoptQSpare {
 		l.attachAdoptedFD(ctx, it.fd, it.carry, now)
 	}
+	// Same guard as the detach queue: adoptItem carries a Carryover with
+	// the peer address string, so stale slots pin it after the handoff.
+	clear(l.adoptQSpare)
 	l.adoptQSpare = l.adoptQSpare[:0]
 }
 

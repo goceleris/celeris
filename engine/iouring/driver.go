@@ -232,6 +232,9 @@ func (w *Worker) drainDriverActions() {
 			w.attachAdoptedFD(a.adoptFD, a.adoptCarry)
 		}
 	}
+	// Same guard as the detach queue: a driverAction holds pointers, so
+	// stale slots keep them reachable after the action has been applied.
+	clear(w.driverActionSpare)
 	w.driverActionSpare = w.driverActionSpare[:0]
 }
 
