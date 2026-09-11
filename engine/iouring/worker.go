@@ -3023,7 +3023,7 @@ func (w *Worker) finishClose(fd int) {
 	// Fast-close path for H1 non-detached connections: close() alone.
 	// The response bytes we wrote are already in the kernel send buffer
 	// and will go out before the socket tears down; localhost ACKs
-	// within microseconds. Skipping shutdown(SHUT_WR) + drainRecvBuffer
+	// within microseconds. Skipping shutdown(SHUT_WR) + the recv drain
 	// saves two syscalls per close and is the difference between hertz
 	// territory (~30 k rps) and ~24 k rps under bench-harness churn.
 	//
@@ -3047,7 +3047,7 @@ func (w *Worker) finishClose(fd int) {
 		return
 	}
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	drainRecvBuffer(fd)
+	sockopts.DrainRecvBuffer(fd)
 	_ = unix.Close(fd)
 }
 
@@ -3143,7 +3143,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// SHUT_WR forces FIN explicitly (writer half-close) BEFORE close,
 	// regardless of recv-buffer state. FIN IS retransmitted from
 	// FIN_WAIT_1 until ACK'd, so packet loss can't strand the walker.
-	// No drainRecvBuffer (which was the prior approach's race source —
+	// No recv drain (which was the prior approach's race source —
 	// the drain syscall and the close syscall left a multi-µs window in
 	// which a fresh walker drip would queue, making the close → RST).
 	if cs.h1State != nil && !cs.h1State.Detached.Load() {
@@ -3156,7 +3156,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// io_uring) to avoid the async-SQE pile-up that plagued the pre-patch
 	// version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	drainRecvBuffer(fd)
+	sockopts.DrainRecvBuffer(fd)
 	_ = unix.Close(fd)
 }
 
@@ -4299,32 +4299,6 @@ func (w *Worker) shutdown() {
 	// asyncClosed + Broadcast above. Prevents stale-memory races
 	// after the engine claims to have stopped.
 	w.asyncWG.Wait()
-}
-
-// drainRecvMaxReads bounds drainRecvBuffer so a peer that keeps trickling bytes
-// on a half-closed connection cannot pin the worker. 64 × 512 B = 32 KiB is far
-// more than any legitimate post-shutdown tail (a queued GOAWAY / WS close echo).
-const drainRecvMaxReads = 64
-
-// drainRecvBuffer non-blockingly reads and discards whatever is already in the
-// socket receive buffer, so the following close() will not send an RST that
-// discards unsent data still staged in the send buffer (a queued GOAWAY / WS
-// close frame).
-//
-// It MUST NOT block. It runs on the io_uring event-loop worker thread and the
-// socket is in blocking mode, so a plain unix.Read here waits for data or FIN
-// that may never arrive on a churn-closed / half-closed detached connection —
-// wedging the worker, and with enough concurrent detached-closes the whole
-// engine (it accepts connections and then services nothing). See celeris#311.
-// MSG_DONTWAIT makes each read return EAGAIN the moment the buffer is empty.
-func drainRecvBuffer(fd int) {
-	var buf [512]byte
-	for i := 0; i < drainRecvMaxReads; i++ {
-		n, _, err := unix.Recvfrom(fd, buf[:], unix.MSG_DONTWAIT)
-		if n <= 0 || err != nil {
-			return
-		}
-	}
 }
 
 func createListenSocket(addr string) (int, error) {
