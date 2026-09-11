@@ -254,7 +254,7 @@ func applyDefaults(d *DSN) {
 // CheckSSL returns ErrSSLNotSupported if the DSN requests a TLS mode this
 // driver version cannot satisfy.
 //
-// In v1.4.0 the driver has no TLS stack. sslmode semantics:
+// The driver has no TLS stack. sslmode semantics:
 //
 //   - "" / "disable"         : plaintext, always allowed.
 //   - "prefer" / "allow"     : the libpq semantics are "try TLS, fall

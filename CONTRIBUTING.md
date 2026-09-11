@@ -13,7 +13,9 @@ Thank you for your interest in contributing to celeris!
 
 ### Prerequisites
 
-- Go 1.26.3+ (1.26.3 absorbs stdlib CVEs surfaced by govulncheck on 1.26.2: GO-2026-4971 in `net`, GO-2026-4918 in `net/http`)
+- Go 1.27.0+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
+  CI pins the same version. Quote it from there rather than restating it here, so the two
+  cannot drift apart again.
 - [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@latest`
 - Linux (for io_uring/epoll engine tests) or macOS (std engine only)
 - [golangci-lint](https://golangci-lint.run/) v2.9+

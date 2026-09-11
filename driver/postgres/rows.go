@@ -207,7 +207,7 @@ func (r *pgRows) ColumnTypeDatabaseTypeName(i int) string {
 }
 
 // HasNextResultSet reports whether a multi-statement simple query produced
-// another result set after the current one. For v1.4.0 we flatten multi-
+// another result set after the current one. The driver flattens multi-
 // statement results into a single pgRows, so this is always false.
 func (r *pgRows) HasNextResultSet() bool { return false }
 

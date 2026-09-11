@@ -56,10 +56,10 @@ type ClusterConfig struct {
 	// error is returned. Default: 3.
 	MaxRedirects int
 	// RouteByLatency, when true, sends reads to the lowest-latency node.
-	// Not implemented in v1.4.0; reserved for future use.
+	// Not implemented; reserved for future use.
 	RouteByLatency bool
 	// ReadOnly, when true, allows reads from replica nodes.
-	// Not implemented in v1.4.0; reserved for future use.
+	// Not implemented; reserved for future use.
 	ReadOnly bool
 
 	Engine eventloop.ServerProvider

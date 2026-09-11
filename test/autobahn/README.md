@@ -27,7 +27,7 @@ each celeris engine.
 
 - Docker (for the Autobahn container — the project no longer ships
   native macOS binaries).
-- Go 1.22+ to build the celeris server.
+- A Go toolchain matching the `go` directive in the root `go.mod` to build the celeris server.
 - On Linux, `make autobahn` runs all three engines (std/epoll/io_uring)
   in parallel. On macOS only `std` is exercised.
 
