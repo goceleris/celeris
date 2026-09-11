@@ -2583,7 +2583,7 @@ func (l *Loop) closeConn(fd int) {
 	// recv buffer would send RST instead (which is not retransmitted by
 	// TCP, so a single packet loss strands the walker).
 	//
-	// No drainRecvBuffer between SHUT_WR and Close: an empty drain leaves
+	// No recv drain between SHUT_WR and Close: an empty drain leaves
 	// no race, but a non-empty one introduces a multi-µs window in which
 	// a fresh peer drip queues — then Close sees it and emits RST anyway.
 	// Just trust SHUT_WR's FIN to be retransmitted until ACK'd.
@@ -2598,7 +2598,7 @@ func (l *Loop) closeConn(fd int) {
 		_ = unix.Close(fd)
 	default:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
-		drainRecvBuffer(fd)
+		sockopts.DrainRecvBuffer(fd)
 		_ = unix.Close(fd)
 	}
 	l.removeLiveConn(cs)
@@ -2717,18 +2717,6 @@ func (l *Loop) shutdown() {
 		_ = unix.Close(l.timerFD)
 	}
 	_ = unix.Close(l.epollFD)
-}
-
-// drainRecvBuffer reads and discards any data in the socket receive buffer.
-// This prevents close() from sending RST (which discards unsent data like GOAWAY).
-func drainRecvBuffer(fd int) {
-	var buf [4096]byte
-	for {
-		n, _ := unix.Read(fd, buf[:])
-		if n <= 0 {
-			return
-		}
-	}
 }
 
 func createListenSocket(addr string) (int, error) {
