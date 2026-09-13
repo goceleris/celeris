@@ -17,7 +17,7 @@ import (
 	"github.com/goceleris/celeris/resource"
 
 	"golang.org/x/net/http2"
-	//nolint:staticcheck // SA1019: h2c is deprecated, and its replacement
+	//nolint:staticcheck // SA1019: h2c (and, since x/net 0.59, http2.Server) is deprecated, and its replacement
 	// (http.Server.Protocols + SetUnencryptedHTTP2) does NOT cover the
 	// RFC 7540 3.2 Upgrade handshake -- net/http implements the upgrade path
 	// internally but exposes no way for a caller to reach it. celeris#440
@@ -79,11 +79,12 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// handler, so an H2C listener still serves H1.
 	var httpHandler http.Handler = bridge
 	if cfg.Protocol == engine.H2C || cfg.Protocol == engine.Auto {
-		h2s := &http2.Server{
-			MaxConcurrentStreams: cfg.MaxConcurrentStreams,
-			MaxReadFrameSize:     cfg.MaxFrameSize,
-		}
-		httpHandler = h2c.NewHandler(bridge, h2s) //nolint:staticcheck // SA1019: see the import comment -- no stdlib equivalent covers Upgrade.
+		//
+		// x/net 0.59 deprecated http2.Server along with the handler; it is
+		// still the only type h2c.NewHandler accepts, so the two carry the
+		// same waiver. Keep the literal on one line so the waiver covers it.
+		h2s := &http2.Server{MaxConcurrentStreams: cfg.MaxConcurrentStreams, MaxReadFrameSize: cfg.MaxFrameSize} //nolint:staticcheck // SA1019: the type h2c.NewHandler takes; see the import comment.
+		httpHandler = h2c.NewHandler(bridge, h2s)                                                                //nolint:staticcheck // SA1019: see the import comment -- no stdlib equivalent covers Upgrade.
 	}
 
 	e.server = &http.Server{

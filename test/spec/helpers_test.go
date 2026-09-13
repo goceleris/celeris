@@ -4,7 +4,6 @@ package spec
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,8 +15,6 @@ import (
 	stdengine "github.com/goceleris/celeris/engine/std"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
-
-	"golang.org/x/net/http2"
 )
 
 type specEngine struct {
@@ -156,12 +153,8 @@ func startSpecEngineWithConfig(t *testing.T, se specEngine, customize func(*reso
 func probeEngine(addr string, proto engine.Protocol) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	if proto == engine.H2C {
-		client.Transport = &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, a)
-			},
+		client.Transport = &http.Transport{
+			Protocols: h2cOnly(),
 		}
 	}
 	resp, err := client.Get("http://" + addr + "/healthz")
@@ -271,4 +264,13 @@ func rawSendRecv(t *testing.T, addr, request string) *http.Response {
 		t.Fatalf("read response: %v", err)
 	}
 	return resp
+}
+
+// h2cOnly makes an http.Transport speak prior-knowledge cleartext HTTP/2
+// and nothing else: the stdlib replacement for the deprecated
+// http2.Transport{AllowHTTP: true} shape.
+func h2cOnly() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return p
 }

@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -16,8 +15,6 @@ import (
 	"github.com/goceleris/celeris/adaptive"
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/epoll"
-
-	"golang.org/x/net/http2"
 )
 
 func TestAdaptiveAutoProtocol(t *testing.T) {
@@ -415,11 +412,20 @@ func TestEpollPauseResume(t *testing.T) {
 func h2cClient(addr string) *http.Client {
 	return &http.Client{
 		Timeout: 3 * time.Second,
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+		Transport: &http.Transport{
+			Protocols: h2cOnly(),
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, network, addr)
 			},
 		},
 	}
+}
+
+// h2cOnly makes an http.Transport speak prior-knowledge cleartext HTTP/2
+// and nothing else: the stdlib replacement for the deprecated
+// http2.Transport{AllowHTTP: true} shape.
+func h2cOnly() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return p
 }

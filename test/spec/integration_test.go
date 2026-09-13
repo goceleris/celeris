@@ -1,11 +1,8 @@
 package spec
 
 import (
-	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,8 +10,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-
-	"golang.org/x/net/http2"
 )
 
 // TestHTTP1Parallel sends concurrent HTTP/1.1 requests to each engine.
@@ -70,12 +65,8 @@ func TestH2CParallel(t *testing.T) {
 	for _, se := range specEngines {
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngine(t, se, engine.H2C)
-			transport := &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, network, a)
-				},
+			transport := &http.Transport{
+				Protocols: h2cOnly(),
 			}
 			client := &http.Client{
 				Timeout:   10 * time.Second,
@@ -145,12 +136,8 @@ func TestAutoProtocolDetection(t *testing.T) {
 			})
 
 			t.Run("H2C", func(t *testing.T) {
-				transport := &http2.Transport{
-					AllowHTTP: true,
-					DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
-						var d net.Dialer
-						return d.DialContext(ctx, network, a)
-					},
+				transport := &http.Transport{
+					Protocols: h2cOnly(),
 				}
 				client := &http.Client{Timeout: 5 * time.Second, Transport: transport}
 				resp, err := client.Get("http://" + addr + "/auto-h2c")
@@ -175,12 +162,8 @@ func TestAutoProtocolDetection(t *testing.T) {
 					Timeout:   5 * time.Second,
 					Transport: &http.Transport{MaxConnsPerHost: 20},
 				}
-				h2Transport := &http2.Transport{
-					AllowHTTP: true,
-					DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
-						var d net.Dialer
-						return d.DialContext(ctx, network, a)
-					},
+				h2Transport := &http.Transport{
+					Protocols: h2cOnly(),
 				}
 				h2Client := &http.Client{Timeout: 5 * time.Second, Transport: h2Transport}
 
@@ -234,12 +217,8 @@ func TestH2CMultipleStreams(t *testing.T) {
 	for _, se := range specEngines {
 		t.Run(se.name, func(t *testing.T) {
 			addr := startSpecEngine(t, se, engine.H2C)
-			transport := &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, network, a)
-				},
+			transport := &http.Transport{
+				Protocols: h2cOnly(),
 			}
 			client := &http.Client{Timeout: 10 * time.Second, Transport: transport}
 

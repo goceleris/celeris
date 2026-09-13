@@ -1,16 +1,11 @@
 package conformance
 
 import (
-	"context"
-	"crypto/tls"
-	"net"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris/engine"
-
-	"golang.org/x/net/http2"
 )
 
 func TestH2CLifecycle(t *testing.T) {
@@ -23,13 +18,7 @@ func TestH2CLifecycle(t *testing.T) {
 			addr, cleanup := startEngine(t, ef, engine.H2C)
 			defer cleanup()
 
-			transport := &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, network, addr)
-				},
-			}
+			transport := &http.Transport{Protocols: h2cOnly()}
 
 			client := &http.Client{
 				Transport: transport,
