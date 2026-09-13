@@ -237,7 +237,7 @@ func detachedCountWindow(t *testing.T, engine celeris.EngineType) {
 		if err != nil {
 			return err
 		}
-		defer a.Close()
+		defer func() { _ = a.Close() }()
 		tc := a.(*net.TCPConn)
 		br := bufio.NewReader(a)
 		// Warm the trigger conn with one fully-read request: /sync keeps it
