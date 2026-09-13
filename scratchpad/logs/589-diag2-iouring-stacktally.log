@@ -1,0 +1,65 @@
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/iouring
+=== RUN   TestAdaptiveSettledRouteStall589/iouring/negctrl_async
+2026/09/13 15:26:35 INFO SEND_ZC probe result functional=true loopback="copy-fallback (expected)" reason="REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
+2026/09/13 15:26:35 INFO io_uring engine selected tier=high multishot_accept=true multishot_recv=true provided_buffers=true fixed_files=false send_zc=true
+2026/09/13 15:26:35 INFO celeris starting with listener addr=127.0.0.1:45631 engine=io_uring protocol=auto
+2026/09/13 15:26:35 INFO iouring: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45631
+2026/09/13 15:26:35 INFO io_uring engine listening addr=127.0.0.1:45631 tier=high workers=2 sqpoll=false send_zc=true fixed_files=false numa_nodes=1 kernel=7.0.12-linuxkit
+2026/09/13 15:26:35 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:268: STACK589 first stalled sample, event-loop goroutine:
+        goroutine 32 [sync.Mutex.Lock, locked to thread]:
+        internal/sync.runtime_SemacquireMutex(0xc0001f7868?, 0x48?, 0xc0001f7898?)
+        	/usr/local/go/src/runtime/sema.go:95 +0x28
+        internal/sync.(*Mutex).lockSlow(0xc0000b2168)
+        	/usr/local/go/src/internal/sync/mutex.go:149 +0x1e0
+        internal/sync.(*Mutex).Lock(0xc0000b2168)
+        	/usr/local/go/src/internal/sync/mutex.go:70 +0x4c
+        sync.(*Mutex).Lock(0x1aa?)
+        	/usr/local/go/src/sync/mutex.go:46 +0x20
+        github.com/goceleris/celeris/engine/iouring.(*Worker).checkTimeouts(0xc0002d6008)
+        	/src/engine/iouring/worker.go:4186 +0x408
+        github.com/goceleris/celeris/engine/iouring.(*Worker).run(0xc0002d6008, {0xc2d250, 0xc0001e05f0})
+        	/src/engine/iouring/worker.go:941 +0x2118
+        github.com/goceleris/celeris/engine/iouring.(*Engine).Listen.func1()
+        	/src/engine/iouring/engine.go:223 +0x84
+        created by github.com/goceleris/celeris/engine/iouring.(*Engine).Listen in goroutine 30
+        	/src/engine/iouring/engine.go:221 +0x9c0
+    adaptive_settled_retime_linux_test.go:268: LAT589 engine=iouring mode=negctrl_async fresh=false n=102 ms=[0.4 0.7 0.4 268.8 0.4 0.8 277.5 0.6 1.0 271.3 0.4 0.5 269.9 0.4 0.5 272.1 0.4 0.5 272.1 0.5 0.5 264.6 0.3 0.3 0.3 262.1 0.4 0.6 0.3 257.6 0.4 0.4 270.1 0.3 0.6 273.3 0.4 0.5 267.1 0.4 0.4 272.3 0.4 0.7 265.2 0.4 0.4 265.7 0.4 0.3 273.6 0.3 0.4 271.5 0.3 0.4 265.2 0.3 0.5 277.3 0.4 0.6 275.2 0.4 0.5 276.2 0.4 0.5 271.6 0.3 0.3 271.7 0.4 0.5 269.5 0.4 0.6 270.1 0.4 0.6 270.1 0.4 0.4 266.0 0.4 0.7 277.9 0.3 0.6 270.7 0.4 0.4 268.3 0.4 0.5 269.6 0.4 0.4 264.2 0.2 0.4 274.6]
+    adaptive_settled_retime_linux_test.go:285: RESULT589 engine=iouring mode=negctrl_async run=1 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10126 samples=102 stalled=33 stalled_frac=0.324 stalled_time_ms=8913 ping_min_ms=0.210 ping_med_ms=0.519 ping_max_ms=277.887 claim_assert=fail(/kv is not in router.settled after the slow window)
+    adaptive_settled_retime_linux_test.go:285: STACKTALLY589 engine=iouring mode=negctrl_async stalled=33 captures=33 loop_goroutines=66 checkTimeouts_detachMu_Lock=44 github.com/goceleris/celeris/engine/iouring.=22
+--- PASS: TestAdaptiveSettledRouteStall589 (10.76s)
+    --- PASS: TestAdaptiveSettledRouteStall589/iouring (10.76s)
+        --- PASS: TestAdaptiveSettledRouteStall589/iouring/negctrl_async (10.76s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/iouring
+=== RUN   TestAdaptiveSettledRouteStall589/iouring/negctrl_async
+2026/09/13 15:26:46 INFO SEND_ZC probe result functional=true loopback="copy-fallback (expected)" reason="REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
+2026/09/13 15:26:46 INFO io_uring engine selected tier=high multishot_accept=true multishot_recv=true provided_buffers=true fixed_files=false send_zc=true
+2026/09/13 15:26:46 INFO celeris starting with listener addr=127.0.0.1:37033 engine=io_uring protocol=auto
+2026/09/13 15:26:46 INFO iouring: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:37033
+2026/09/13 15:26:46 INFO io_uring engine listening addr=127.0.0.1:37033 tier=high workers=2 sqpoll=false send_zc=true fixed_files=false numa_nodes=1 kernel=7.0.12-linuxkit
+2026/09/13 15:26:46 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:268: LAT589 engine=iouring mode=negctrl_async fresh=false n=101 ms=[0.6 0.7 0.3 260.3 0.5 0.8 266.0 0.4 0.5 268.7 0.4 0.4 276.5 0.6 0.9 270.1 0.3 0.4 272.1 0.4 0.5 274.5 0.2 0.4 269.2 0.4 0.3 268.1 0.4 0.4 278.5 0.4 0.6 271.6 0.3 0.6 273.4 0.4 0.7 267.5 0.7 0.7 267.0 0.4 0.7 272.0 0.3 0.3 269.8 0.4 0.5 273.4 0.4 0.5 269.1 0.3 0.4 0.3 261.6 0.3 0.4 275.6 0.6 0.5 275.6 0.6 0.5 272.7 0.6 0.5 265.1 0.3 0.6 273.1 0.4 0.4 273.1 0.4 0.6 271.7 0.3 0.5 266.3 0.4 0.5 275.9 0.3 0.4 276.1 0.5 0.6 276.3 0.8 0.6 268.0 0.5 0.7 268.2 0.2 0.2 272.7]
+    adaptive_settled_retime_linux_test.go:285: RESULT589 engine=iouring mode=negctrl_async run=2 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=308 window_ms=10122 samples=101 stalled=33 stalled_frac=0.327 stalled_time_ms=8940 ping_min_ms=0.211 ping_med_ms=0.557 ping_max_ms=278.501 claim_assert=fail(/kv is not in router.settled after the slow window)
+    adaptive_settled_retime_linux_test.go:285: STACKTALLY589 engine=iouring mode=negctrl_async stalled=33 captures=33 loop_goroutines=66 checkTimeouts_detachMu_Lock=48 github.com/goceleris/celeris/engine/iouring.=18
+--- PASS: TestAdaptiveSettledRouteStall589 (10.76s)
+    --- PASS: TestAdaptiveSettledRouteStall589/iouring (10.76s)
+        --- PASS: TestAdaptiveSettledRouteStall589/iouring/negctrl_async (10.76s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/iouring
+=== RUN   TestAdaptiveSettledRouteStall589/iouring/negctrl_async
+2026/09/13 15:26:57 INFO SEND_ZC probe result functional=true loopback="copy-fallback (expected)" reason="REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
+2026/09/13 15:26:57 INFO io_uring engine selected tier=high multishot_accept=true multishot_recv=true provided_buffers=true fixed_files=false send_zc=true
+2026/09/13 15:26:57 INFO celeris starting with listener addr=127.0.0.1:45395 engine=io_uring protocol=auto
+2026/09/13 15:26:57 INFO iouring: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45395
+2026/09/13 15:26:57 INFO io_uring engine listening addr=127.0.0.1:45395 tier=high workers=2 sqpoll=false send_zc=true fixed_files=false numa_nodes=1 kernel=7.0.12-linuxkit
+2026/09/13 15:26:57 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:268: LAT589 engine=iouring mode=negctrl_async fresh=false n=106 ms=[0.5 0.5 0.3 266.5 0.4 0.5 0.3 261.9 0.3 0.4 274.8 0.5 0.5 275.9 0.4 0.4 270.6 0.3 0.3 273.8 0.4 0.5 266.0 0.4 0.5 267.2 0.3 0.4 278.3 0.8 0.6 0.5 258.4 0.4 0.9 269.5 0.4 0.5 270.3 0.3 0.5 265.9 0.5 0.4 278.1 0.4 0.4 268.6 0.3 0.3 276.3 0.5 0.4 275.8 0.3 0.4 277.7 0.5 0.4 0.3 260.6 0.4 0.3 268.3 0.3 0.2 276.2 0.3 0.7 0.3 260.9 0.4 0.5 0.3 265.8 0.3 0.7 274.6 0.3 0.4 274.2 0.5 0.4 277.9 0.6 0.5 276.9 0.4 0.6 274.3 0.6 1.0 271.5 0.3 0.4 274.0 0.5 0.5 267.6 0.3 0.3 0.4 261.4 0.5 0.4 276.4]
+    adaptive_settled_retime_linux_test.go:285: RESULT589 engine=iouring mode=negctrl_async run=3 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=307 window_ms=10123 samples=106 stalled=33 stalled_frac=0.311 stalled_time_ms=8936 ping_min_ms=0.235 ping_med_ms=0.485 ping_max_ms=278.322 claim_assert=fail(/kv is not in router.settled after the slow window)
+    adaptive_settled_retime_linux_test.go:285: STACKTALLY589 engine=iouring mode=negctrl_async stalled=33 captures=33 loop_goroutines=66 checkTimeouts_detachMu_Lock=46 github.com/goceleris/celeris/engine/iouring.=20
+--- PASS: TestAdaptiveSettledRouteStall589 (10.77s)
+    --- PASS: TestAdaptiveSettledRouteStall589/iouring (10.77s)
+        --- PASS: TestAdaptiveSettledRouteStall589/iouring/negctrl_async (10.77s)
+PASS
+ok  	github.com/goceleris/celeris	33.313s

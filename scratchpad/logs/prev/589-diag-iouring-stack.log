@@ -1,0 +1,224 @@
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/iouring
+=== RUN   TestAdaptiveSettledRouteStall589/iouring/negctrl_async
+2026/09/13 11:50:03 INFO SEND_ZC probe result functional=true loopback="copy-fallback (expected)" reason="REPORT_USAGE notification reports IORING_NOTIF_USAGE_ZC_COPIED (kernel did the copy)"
+2026/09/13 11:50:03 INFO io_uring engine selected tier=high multishot_accept=true multishot_recv=true provided_buffers=true fixed_files=false send_zc=true
+2026/09/13 11:50:03 INFO celeris starting with listener addr=127.0.0.1:32855 engine=io_uring protocol=auto
+2026/09/13 11:50:03 INFO iouring: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:32855
+2026/09/13 11:50:03 INFO io_uring engine listening addr=127.0.0.1:32855 tier=high workers=2 sqpoll=false send_zc=true fixed_files=false numa_nodes=1 kernel=7.0.12-linuxkit
+2026/09/13 11:50:03 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 51 [chan receive]:
+        github.com/goceleris/celeris/engine/iouring.(*Engine).Listen(0xc00020ad20, {0xc2c6e0, 0xc000412000})
+        	/src/engine/iouring/engine.go:263 +0x1128
+        github.com/goceleris/celeris.(*Server).StartWithListenerAndContext(0xc00041e000, {0xc2c6e0, 0xc000412000}, {0xc2b938, 0xc00042c080})
+        	/src/server.go:740 +0x1a0
+        github.com/goceleris/celeris.runStall589.func3()
+        	/src/adaptive_settled_retime_linux_test.go:301 +0x5c
+        created by github.com/goceleris/celeris.runStall589 in goroutine 44
+        	/src/adaptive_settled_retime_linux_test.go:301 +0xb14
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 46 [sync.Mutex.Lock, locked to thread]:
+        internal/sync.runtime_SemacquireMutex(0xc000405868?, 0x48?, 0xc000405898?)
+        	/usr/local/go/src/runtime/sema.go:95 +0x28
+        internal/sync.(*Mutex).lockSlow(0xc000400298)
+        	/usr/local/go/src/internal/sync/mutex.go:149 +0x1e0
+        internal/sync.(*Mutex).Lock(0xc000400298)
+        	/usr/local/go/src/internal/sync/mutex.go:70 +0x4c
+        sync.(*Mutex).Lock(0x1aa?)
+        	/usr/local/go/src/sync/mutex.go:46 +0x20
+        github.com/goceleris/celeris/engine/iouring.(*Worker).checkTimeouts(0xc00025e008)
+        	/src/engine/iouring/worker.go:4186 +0x408
+        github.com/goceleris/celeris/engine/iouring.(*Worker).run(0xc00025e008, {0xc2c6e0, 0xc00015e550})
+        	/src/engine/iouring/worker.go:941 +0x2118
+        github.com/goceleris/celeris/engine/iouring.(*Engine).Listen.func1()
+        	/src/engine/iouring/engine.go:223 +0x84
+        created by github.com/goceleris/celeris/engine/iouring.(*Engine).Listen in goroutine 51
+        	/src/engine/iouring/engine.go:221 +0x9c0
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 47 [sync.Mutex.Lock, locked to thread]:
+        internal/sync.runtime_SemacquireMutex(0xc00020f868?, 0x48?, 0xc00020f898?)
+        	/usr/local/go/src/runtime/sema.go:95 +0x28
+        internal/sync.(*Mutex).lockSlow(0xc000400278)
+        	/usr/local/go/src/internal/sync/mutex.go:149 +0x1e0
+        internal/sync.(*Mutex).Lock(0xc000400278)
+        	/usr/local/go/src/internal/sync/mutex.go:70 +0x4c
+        sync.(*Mutex).Lock(0x1aa?)
+        	/usr/local/go/src/sync/mutex.go:46 +0x20
+        github.com/goceleris/celeris/engine/iouring.(*Worker).checkTimeouts(0xc00025e408)
+        	/src/engine/iouring/worker.go:4186 +0x408
+        github.com/goceleris/celeris/engine/iouring.(*Worker).run(0xc00025e408, {0xc2c6e0, 0xc00015e550})
+        	/src/engine/iouring/worker.go:941 +0x2118
+        github.com/goceleris/celeris/engine/iouring.(*Engine).Listen.func1()
+        	/src/engine/iouring/engine.go:223 +0x84
+        created by github.com/goceleris/celeris/engine/iouring.(*Engine).Listen in goroutine 51
+        	/src/engine/iouring/engine.go:221 +0x9c0
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 82 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc00029207f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc0001e8008)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc0001e8008)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc0000b5980}, 0xc0001e6008)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc0000b5980}, 0xc0000ea6c8, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc0000b0090)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc0000b5980}, {0xc0000b7900, 0x1f, 0x20}, 0xc0000ea6c8, {0xc28140, 0xc000036c80}, 0xc0000b0090)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e008, 0xc0000ea488)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 46
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 83 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc00062003f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc0001e8708)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc0001e8708)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc0000b5a10}, 0xc0001e6408)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc0000b5a10}, 0xc0000eab48, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc0000b00a0)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc0000b5a10}, {0xc0000b7940, 0x1f, 0x20}, 0xc0000eab48, {0xc28140, 0xc000036c80}, 0xc0000b00a0)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e008, 0xc0000ea908)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 46
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 52 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc0000b203f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc0003a6008)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc0003a6008)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc00040ca50}, 0xc0003a2008)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc00040ca50}, 0xc0004306c8, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc000410200)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc00040ca50}, {0xc000438420, 0x1f, 0x20}, 0xc0004306c8, {0xc28140, 0xc000036c80}, 0xc000410200)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e408, 0xc000430488)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 47
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 84 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc00032603f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc0001e8e08)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc0001e8e08)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc0000b5aa0}, 0xc0001e6808)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc0000b5aa0}, 0xc0000eafc8, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc0000b00b0)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc0000b5aa0}, {0xc0000b7980, 0x1f, 0x20}, 0xc0000eafc8, {0xc28140, 0xc000036c80}, 0xc0000b00b0)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e008, 0xc0000ead88)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 46
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 85 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc00032602f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc00033a008)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc00033a008)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc0000b5b30}, 0xc000338008)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc0000b5b30}, 0xc0000eb448, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc0000b00c0)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc0000b5b30}, {0xc0000b79c0, 0x1f, 0x20}, 0xc0000eb448, {0xc28140, 0xc000036c80}, 0xc0000b00c0)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e008, 0xc0000eb208)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 46
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 86 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc00029208f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc0003a6708)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc0003a6708)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc0000b5bc0}, 0xc0003a2408)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc0000b5bc0}, 0xc0000eb8c8, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc0000b00d0)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc0000b5bc0}, {0xc0000b7a00, 0x1f, 0x20}, 0xc0000eb8c8, {0xc28140, 0xc000036c80}, 0xc0000b00d0)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e008, 0xc0000eb688)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 46
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 53 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc0000b202f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc00033a708)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc00033a708)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc00040cae0}, 0xc000338408)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc00040cae0}, 0xc000430b48, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc000410210)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc00040cae0}, {0xc000438460, 0x1f, 0x20}, 0xc000430b48, {0xc28140, 0xc000036c80}, 0xc000410210)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e408, 0xc000430908)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 47
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:177: STACK589 during stall:
+        goroutine 54 [sleep]:
+        time.Sleep(0x11e1a300)
+        	/usr/local/go/src/runtime/time.go:368 +0x150
+        github.com/goceleris/celeris.(*gatedKV).Set(0xc00040c240, {0xc2c600, 0xce21c0}, {0x6f5430, 0x1}, {0xc0001a602f, 0x1, 0x1}, 0xdf8475800)
+        	/src/adaptive_settled_retime_linux_test.go:85 +0x70
+        github.com/goceleris/celeris.runStall589.func2(0xc00061c008)
+        	/src/adaptive_settled_retime_linux_test.go:279 +0xdc
+        github.com/goceleris/celeris.(*Context).Next(0xc00061c008)
+        	/src/context.go:345 +0x120
+        github.com/goceleris/celeris.(*routerAdapter).HandleStream(0xc000036c80, {0xc2c6a8, 0xc00040cb70}, 0xc000296008)
+        	/src/handler.go:155 +0xb54
+        github.com/goceleris/celeris/internal/conn.handleH1Request({0xc2c6a8, 0xc00040cb70}, 0xc000430fc8, {0x0, 0x0, 0x0}, {0xc28140, 0xc000036c80}, 0xc000410220)
+        	/src/internal/conn/h1.go:957 +0x294
+        github.com/goceleris/celeris/internal/conn.ProcessH1({0xc2c6a8, 0xc00040cb70}, {0xc0001360c0, 0x1f, 0x20}, 0xc000430fc8, {0xc28140, 0xc000036c80}, 0xc000410220)
+        	/src/internal/conn/h1.go:691 +0x20b8
+        github.com/goceleris/celeris/engine/iouring.(*Worker).runAsyncHandler(0xc00025e008, 0xc000430d88)
+        	/src/engine/iouring/worker.go:3325 +0x32c
+        created by github.com/goceleris/celeris/engine/iouring.(*Worker).promoteConnToAsync in goroutine 46
+        	/src/engine/iouring/worker.go:3186 +0x204
+    adaptive_settled_retime_linux_test.go:194: RESULT589 engine=iouring mode=negctrl_async run=1 verdict=CONTROL_BROKEN settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 warm_reqs=100 slow_calls=287 kv_reqs=287 pre_sample_ms=603 window_ms=10052 samples=100 stalled=33 stalled_frac=0.330 stalled_time_ms=8939 ping_min_ms=0.202 ping_med_ms=0.557 ping_max_ms=273.453 claim_assert=fail(/kv is not in router.settled after the slow window)
+    adaptive_settled_retime_linux_test.go:196: stalled fraction 0.330 > 0.05 with the same blocked Set
+--- FAIL: TestAdaptiveSettledRouteStall589 (10.99s)
+    --- FAIL: TestAdaptiveSettledRouteStall589/iouring (10.99s)
+        --- FAIL: TestAdaptiveSettledRouteStall589/iouring/negctrl_async (10.99s)
+FAIL
+FAIL	github.com/goceleris/celeris	10.997s
+FAIL
+exit=1

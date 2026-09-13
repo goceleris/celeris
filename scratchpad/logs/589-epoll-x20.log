@@ -1,0 +1,502 @@
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:53:29 INFO celeris starting with listener addr=127.0.0.1:46617 engine=epoll protocol=auto
+2026/09/13 15:53:29 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:46617
+2026/09/13 15:53:29 INFO epoll engine listening addr=127.0.0.1:46617 loops=2
+2026/09/13 15:53:29 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=1 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1208 window_ms=10111 samples=33 stalled=33 stalled_frac=1.000 stalled_time_ms=9704 ping_min_ms=287.818 ping_med_ms=294.195 ping_max_ms=299.706 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:53:43 INFO celeris starting with listener addr=127.0.0.1:46203 engine=epoll protocol=auto
+2026/09/13 15:53:43 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:46203
+2026/09/13 15:53:43 INFO epoll engine listening addr=127.0.0.1:46203 loops=2
+2026/09/13 15:53:43 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=2 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=306 window_ms=10008 samples=918 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.061 ping_max_ms=0.495 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:53:53 INFO celeris starting with listener addr=127.0.0.1:41647 engine=epoll protocol=auto
+2026/09/13 15:53:53 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:41647
+2026/09/13 15:53:53 INFO epoll engine listening addr=127.0.0.1:41647 loops=2
+2026/09/13 15:53:53 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=3 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=604 window_ms=10002 samples=923 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.029 ping_med_ms=0.065 ping_max_ms=0.850 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.92s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.91s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.47s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.58s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:54:04 INFO celeris starting with listener addr=127.0.0.1:43037 engine=epoll protocol=auto
+2026/09/13 15:54:04 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43037
+2026/09/13 15:54:04 INFO epoll engine listening addr=127.0.0.1:43037 loops=2
+2026/09/13 15:54:04 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=4 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1209 window_ms=10001 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9875 ping_min_ms=892.851 ping_med_ms=896.915 ping_max_ms=904.872 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:54:17 INFO celeris starting with listener addr=127.0.0.1:35437 engine=epoll protocol=auto
+2026/09/13 15:54:17 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35437
+2026/09/13 15:54:17 INFO epoll engine listening addr=127.0.0.1:35437 loops=2
+2026/09/13 15:54:17 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=5 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10004 samples=933 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.029 ping_med_ms=0.055 ping_max_ms=0.406 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:54:27 INFO celeris starting with listener addr=127.0.0.1:42839 engine=epoll protocol=auto
+2026/09/13 15:54:27 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:42839
+2026/09/13 15:54:27 INFO epoll engine listening addr=127.0.0.1:42839 loops=2
+2026/09/13 15:54:27 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=6 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=602 window_ms=10007 samples=941 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.059 ping_max_ms=0.300 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.18s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.18s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.74s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.87s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:54:38 INFO celeris starting with listener addr=127.0.0.1:34161 engine=epoll protocol=auto
+2026/09/13 15:54:38 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:34161
+2026/09/13 15:54:38 INFO epoll engine listening addr=127.0.0.1:34161 loops=2
+2026/09/13 15:54:38 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=7 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1210 window_ms=10007 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9885 ping_min_ms=893.309 ping_med_ms=898.628 ping_max_ms=907.901 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:54:51 INFO celeris starting with listener addr=127.0.0.1:38023 engine=epoll protocol=auto
+2026/09/13 15:54:51 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:38023
+2026/09/13 15:54:51 INFO epoll engine listening addr=127.0.0.1:38023 loops=2
+2026/09/13 15:54:51 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=8 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=305 window_ms=10007 samples=940 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.036 ping_med_ms=0.073 ping_max_ms=0.455 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:55:02 INFO celeris starting with listener addr=127.0.0.1:35459 engine=epoll protocol=auto
+2026/09/13 15:55:02 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35459
+2026/09/13 15:55:02 INFO epoll engine listening addr=127.0.0.1:35459 loops=2
+2026/09/13 15:55:02 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=9 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=607 window_ms=10006 samples=951 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.061 ping_max_ms=0.330 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.19s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.19s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.75s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:55:12 INFO celeris starting with listener addr=127.0.0.1:44933 engine=epoll protocol=auto
+2026/09/13 15:55:12 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:44933
+2026/09/13 15:55:12 INFO epoll engine listening addr=127.0.0.1:44933 loops=2
+2026/09/13 15:55:12 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=10 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=84 kv_reqs=84 pre_sample_ms=1205 window_ms=10304 samples=17 stalled=17 stalled_frac=1.000 stalled_time_ms=10113 ping_min_ms=588.967 ping_med_ms=592.490 ping_max_ms=612.200 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:55:26 INFO celeris starting with listener addr=127.0.0.1:40677 engine=epoll protocol=auto
+2026/09/13 15:55:26 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:40677
+2026/09/13 15:55:26 INFO epoll engine listening addr=127.0.0.1:40677 loops=2
+2026/09/13 15:55:26 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=11 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10005 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.061 ping_max_ms=0.459 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:55:36 INFO celeris starting with listener addr=127.0.0.1:35607 engine=epoll protocol=auto
+2026/09/13 15:55:36 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35607
+2026/09/13 15:55:36 INFO epoll engine listening addr=127.0.0.1:35607 loops=2
+2026/09/13 15:55:36 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=12 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=608 window_ms=10000 samples=951 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.053 ping_max_ms=0.610 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.77s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.77s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.34s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:55:47 INFO celeris starting with listener addr=127.0.0.1:42363 engine=epoll protocol=auto
+2026/09/13 15:55:47 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:42363
+2026/09/13 15:55:47 INFO epoll engine listening addr=127.0.0.1:42363 loops=2
+2026/09/13 15:55:47 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=13 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=86 kv_reqs=86 pre_sample_ms=1204 window_ms=10585 samples=6 stalled=6 stalled_frac=1.000 stalled_time_ms=10521 ping_min_ms=1508.935 ping_med_ms=1800.275 ping_max_ms=1811.690 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:56:01 INFO celeris starting with listener addr=127.0.0.1:35479 engine=epoll protocol=auto
+2026/09/13 15:56:01 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35479
+2026/09/13 15:56:01 INFO epoll engine listening addr=127.0.0.1:35479 loops=2
+2026/09/13 15:56:01 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=14 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=321 window_ms=10004 samples=953 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.058 ping_max_ms=2.355 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:56:11 INFO celeris starting with listener addr=127.0.0.1:41687 engine=epoll protocol=auto
+2026/09/13 15:56:11 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:41687
+2026/09/13 15:56:11 INFO epoll engine listening addr=127.0.0.1:41687 loops=2
+2026/09/13 15:56:11 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=15 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=608 window_ms=10002 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.056 ping_max_ms=0.390 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (35.08s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (35.08s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.61s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.60s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:56:22 INFO celeris starting with listener addr=127.0.0.1:43531 engine=epoll protocol=auto
+2026/09/13 15:56:22 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43531
+2026/09/13 15:56:22 INFO epoll engine listening addr=127.0.0.1:43531 loops=2
+2026/09/13 15:56:22 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=16 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=88 kv_reqs=88 pre_sample_ms=1205 window_ms=10898 samples=9 stalled=9 stalled_frac=1.000 stalled_time_ms=10797 ping_min_ms=1193.726 ping_med_ms=1196.244 ping_max_ms=1214.883 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:56:36 INFO celeris starting with listener addr=127.0.0.1:45617 engine=epoll protocol=auto
+2026/09/13 15:56:36 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45617
+2026/09/13 15:56:36 INFO epoll engine listening addr=127.0.0.1:45617 loops=2
+2026/09/13 15:56:36 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=17 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=307 window_ms=10002 samples=950 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.057 ping_max_ms=1.167 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:56:46 INFO celeris starting with listener addr=127.0.0.1:39795 engine=epoll protocol=auto
+2026/09/13 15:56:46 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:39795
+2026/09/13 15:56:46 INFO epoll engine listening addr=127.0.0.1:39795 loops=2
+2026/09/13 15:56:46 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=18 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=604 window_ms=10000 samples=946 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.065 ping_max_ms=0.437 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.75s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.75s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.33s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.56s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.85s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:56:57 INFO celeris starting with listener addr=127.0.0.1:44463 engine=epoll protocol=auto
+2026/09/13 15:56:57 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:44463
+2026/09/13 15:56:57 INFO epoll engine listening addr=127.0.0.1:44463 loops=2
+2026/09/13 15:56:57 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=19 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=88 kv_reqs=88 pre_sample_ms=1207 window_ms=11048 samples=9 stalled=9 stalled_frac=1.000 stalled_time_ms=10937 ping_min_ms=1202.353 ping_med_ms=1210.323 ping_max_ms=1239.150 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:57:11 INFO celeris starting with listener addr=127.0.0.1:45467 engine=epoll protocol=auto
+2026/09/13 15:57:11 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45467
+2026/09/13 15:57:11 INFO epoll engine listening addr=127.0.0.1:45467 loops=2
+2026/09/13 15:57:11 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=20 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=307 window_ms=10001 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.025 ping_med_ms=0.048 ping_max_ms=0.689 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:57:21 INFO celeris starting with listener addr=127.0.0.1:44543 engine=epoll protocol=auto
+2026/09/13 15:57:21 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:44543
+2026/09/13 15:57:21 INFO epoll engine listening addr=127.0.0.1:44543 loops=2
+2026/09/13 15:57:21 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=21 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=605 window_ms=10001 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.052 ping_max_ms=0.310 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.92s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.92s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.50s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.56s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:57:32 INFO celeris starting with listener addr=127.0.0.1:41131 engine=epoll protocol=auto
+2026/09/13 15:57:32 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:41131
+2026/09/13 15:57:32 INFO epoll engine listening addr=127.0.0.1:41131 loops=2
+2026/09/13 15:57:32 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=22 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1211 window_ms=10085 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9945 ping_min_ms=898.687 ping_med_ms=902.687 ping_max_ms=918.325 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:57:45 INFO celeris starting with listener addr=127.0.0.1:39303 engine=epoll protocol=auto
+2026/09/13 15:57:45 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:39303
+2026/09/13 15:57:45 INFO epoll engine listening addr=127.0.0.1:39303 loops=2
+2026/09/13 15:57:45 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=23 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10000 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.055 ping_max_ms=0.423 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:57:55 INFO celeris starting with listener addr=127.0.0.1:43967 engine=epoll protocol=auto
+2026/09/13 15:57:55 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43967
+2026/09/13 15:57:55 INFO epoll engine listening addr=127.0.0.1:43967 loops=2
+2026/09/13 15:57:55 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=24 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=605 window_ms=10002 samples=947 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.059 ping_max_ms=0.739 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.27s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.27s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.84s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:58:06 INFO celeris starting with listener addr=127.0.0.1:41949 engine=epoll protocol=auto
+2026/09/13 15:58:06 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:41949
+2026/09/13 15:58:06 INFO epoll engine listening addr=127.0.0.1:41949 loops=2
+2026/09/13 15:58:06 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=25 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=86 kv_reqs=86 pre_sample_ms=1210 window_ms=10692 samples=7 stalled=7 stalled_frac=1.000 stalled_time_ms=10610 ping_min_ms=1505.018 ping_med_ms=1516.188 ping_max_ms=1524.581 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:58:20 INFO celeris starting with listener addr=127.0.0.1:35631 engine=epoll protocol=auto
+2026/09/13 15:58:20 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35631
+2026/09/13 15:58:20 INFO epoll engine listening addr=127.0.0.1:35631 loops=2
+2026/09/13 15:58:20 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=26 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=304 window_ms=10007 samples=946 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.031 ping_med_ms=0.069 ping_max_ms=0.825 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:58:30 INFO celeris starting with listener addr=127.0.0.1:39077 engine=epoll protocol=auto
+2026/09/13 15:58:30 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:39077
+2026/09/13 15:58:30 INFO epoll engine listening addr=127.0.0.1:39077 loops=2
+2026/09/13 15:58:30 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=27 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=605 window_ms=10005 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.049 ping_max_ms=0.728 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.88s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.88s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.45s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:58:41 INFO celeris starting with listener addr=127.0.0.1:36261 engine=epoll protocol=auto
+2026/09/13 15:58:41 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:36261
+2026/09/13 15:58:41 INFO epoll engine listening addr=127.0.0.1:36261 loops=2
+2026/09/13 15:58:41 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=28 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=88 kv_reqs=88 pre_sample_ms=1207 window_ms=11021 samples=9 stalled=9 stalled_frac=1.000 stalled_time_ms=10911 ping_min_ms=1205.990 ping_med_ms=1213.218 ping_max_ms=1218.773 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:58:55 INFO celeris starting with listener addr=127.0.0.1:37551 engine=epoll protocol=auto
+2026/09/13 15:58:55 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:37551
+2026/09/13 15:58:55 INFO epoll engine listening addr=127.0.0.1:37551 loops=2
+2026/09/13 15:58:55 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=29 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10002 samples=950 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.049 ping_max_ms=0.600 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:59:05 INFO celeris starting with listener addr=127.0.0.1:33787 engine=epoll protocol=auto
+2026/09/13 15:59:05 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:33787
+2026/09/13 15:59:05 INFO epoll engine listening addr=127.0.0.1:33787 loops=2
+2026/09/13 15:59:05 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=30 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=608 window_ms=10006 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.025 ping_med_ms=0.052 ping_max_ms=0.247 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.89s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.89s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.48s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.84s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:59:16 INFO celeris starting with listener addr=127.0.0.1:45839 engine=epoll protocol=auto
+2026/09/13 15:59:16 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45839
+2026/09/13 15:59:16 INFO epoll engine listening addr=127.0.0.1:45839 loops=2
+2026/09/13 15:59:16 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=31 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1207 window_ms=10116 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9984 ping_min_ms=897.607 ping_med_ms=908.367 ping_max_ms=922.053 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 15:59:29 INFO celeris starting with listener addr=127.0.0.1:34201 engine=epoll protocol=auto
+2026/09/13 15:59:29 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:34201
+2026/09/13 15:59:29 INFO epoll engine listening addr=127.0.0.1:34201 loops=2
+2026/09/13 15:59:29 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=32 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10005 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.054 ping_max_ms=0.502 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 15:59:39 INFO celeris starting with listener addr=127.0.0.1:46511 engine=epoll protocol=auto
+2026/09/13 15:59:39 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:46511
+2026/09/13 15:59:39 INFO epoll engine listening addr=127.0.0.1:46511 loops=2
+2026/09/13 15:59:39 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=33 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=607 window_ms=10006 samples=951 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.025 ping_med_ms=0.047 ping_max_ms=0.324 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.30s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.30s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.86s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 15:59:50 INFO celeris starting with listener addr=127.0.0.1:38653 engine=epoll protocol=auto
+2026/09/13 15:59:50 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:38653
+2026/09/13 15:59:50 INFO epoll engine listening addr=127.0.0.1:38653 loops=2
+2026/09/13 15:59:50 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=34 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=88 kv_reqs=88 pre_sample_ms=1207 window_ms=11022 samples=9 stalled=9 stalled_frac=1.000 stalled_time_ms=10908 ping_min_ms=1203.696 ping_med_ms=1212.444 ping_max_ms=1217.928 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:00:04 INFO celeris starting with listener addr=127.0.0.1:43863 engine=epoll protocol=auto
+2026/09/13 16:00:04 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43863
+2026/09/13 16:00:04 INFO epoll engine listening addr=127.0.0.1:43863 loops=2
+2026/09/13 16:00:04 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=35 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10008 samples=947 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.058 ping_max_ms=0.439 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:00:14 INFO celeris starting with listener addr=127.0.0.1:35121 engine=epoll protocol=auto
+2026/09/13 16:00:14 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35121
+2026/09/13 16:00:14 INFO epoll engine listening addr=127.0.0.1:35121 loops=2
+2026/09/13 16:00:14 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=36 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=607 window_ms=10000 samples=946 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.058 ping_max_ms=0.383 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.91s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.91s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.48s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:00:25 INFO celeris starting with listener addr=127.0.0.1:36859 engine=epoll protocol=auto
+2026/09/13 16:00:25 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:36859
+2026/09/13 16:00:25 INFO epoll engine listening addr=127.0.0.1:36859 loops=2
+2026/09/13 16:00:25 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=37 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1205 window_ms=10103 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9963 ping_min_ms=899.491 ping_med_ms=906.309 ping_max_ms=917.096 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:00:38 INFO celeris starting with listener addr=127.0.0.1:45253 engine=epoll protocol=auto
+2026/09/13 16:00:38 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45253
+2026/09/13 16:00:38 INFO epoll engine listening addr=127.0.0.1:45253 loops=2
+2026/09/13 16:00:38 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=38 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=306 window_ms=10010 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.058 ping_max_ms=0.402 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:00:49 INFO celeris starting with listener addr=127.0.0.1:45881 engine=epoll protocol=auto
+2026/09/13 16:00:49 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:45881
+2026/09/13 16:00:49 INFO epoll engine listening addr=127.0.0.1:45881 loops=2
+2026/09/13 16:00:49 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=39 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=608 window_ms=10001 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.025 ping_med_ms=0.053 ping_max_ms=0.341 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.27s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.27s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.85s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:01:00 INFO celeris starting with listener addr=127.0.0.1:33977 engine=epoll protocol=auto
+2026/09/13 16:01:00 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:33977
+2026/09/13 16:01:00 INFO epoll engine listening addr=127.0.0.1:33977 loops=2
+2026/09/13 16:01:00 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=40 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=88 kv_reqs=88 pre_sample_ms=1208 window_ms=11045 samples=9 stalled=9 stalled_frac=1.000 stalled_time_ms=10930 ping_min_ms=1207.758 ping_med_ms=1212.091 ping_max_ms=1223.398 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:01:13 INFO celeris starting with listener addr=127.0.0.1:32885 engine=epoll protocol=auto
+2026/09/13 16:01:13 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:32885
+2026/09/13 16:01:13 INFO epoll engine listening addr=127.0.0.1:32885 loops=2
+2026/09/13 16:01:13 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=41 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=304 window_ms=10008 samples=953 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.025 ping_med_ms=0.040 ping_max_ms=0.287 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:01:24 INFO celeris starting with listener addr=127.0.0.1:38831 engine=epoll protocol=auto
+2026/09/13 16:01:24 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:38831
+2026/09/13 16:01:24 INFO epoll engine listening addr=127.0.0.1:38831 loops=2
+2026/09/13 16:01:24 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=42 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=607 window_ms=10006 samples=951 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.024 ping_med_ms=0.043 ping_max_ms=0.469 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.94s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.94s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.51s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:01:34 INFO celeris starting with listener addr=127.0.0.1:46475 engine=epoll protocol=auto
+2026/09/13 16:01:34 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:46475
+2026/09/13 16:01:34 INFO epoll engine listening addr=127.0.0.1:46475 loops=2
+2026/09/13 16:01:34 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=43 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=86 kv_reqs=86 pre_sample_ms=1210 window_ms=10726 samples=7 stalled=7 stalled_frac=1.000 stalled_time_ms=10643 ping_min_ms=1513.906 ping_med_ms=1519.951 ping_max_ms=1529.535 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:01:48 INFO celeris starting with listener addr=127.0.0.1:43519 engine=epoll protocol=auto
+2026/09/13 16:01:48 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43519
+2026/09/13 16:01:48 INFO epoll engine listening addr=127.0.0.1:43519 loops=2
+2026/09/13 16:01:48 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=44 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=304 window_ms=10004 samples=951 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.024 ping_med_ms=0.040 ping_max_ms=0.285 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:01:59 INFO celeris starting with listener addr=127.0.0.1:36253 engine=epoll protocol=auto
+2026/09/13 16:01:59 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:36253
+2026/09/13 16:01:59 INFO epoll engine listening addr=127.0.0.1:36253 loops=2
+2026/09/13 16:01:59 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=45 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=607 window_ms=10003 samples=951 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.023 ping_med_ms=0.043 ping_max_ms=0.521 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.88s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.88s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.48s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.55s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:02:09 INFO celeris starting with listener addr=127.0.0.1:46763 engine=epoll protocol=auto
+2026/09/13 16:02:09 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:46763
+2026/09/13 16:02:09 INFO epoll engine listening addr=127.0.0.1:46763 loops=2
+2026/09/13 16:02:09 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=46 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1209 window_ms=10099 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9965 ping_min_ms=901.482 ping_med_ms=905.649 ping_max_ms=912.933 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:02:22 INFO celeris starting with listener addr=127.0.0.1:33743 engine=epoll protocol=auto
+2026/09/13 16:02:22 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:33743
+2026/09/13 16:02:22 INFO epoll engine listening addr=127.0.0.1:33743 loops=2
+2026/09/13 16:02:22 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=47 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=307 window_ms=10006 samples=950 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.048 ping_max_ms=0.331 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:02:33 INFO celeris starting with listener addr=127.0.0.1:46271 engine=epoll protocol=auto
+2026/09/13 16:02:33 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:46271
+2026/09/13 16:02:33 INFO epoll engine listening addr=127.0.0.1:46271 loops=2
+2026/09/13 16:02:33 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=48 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=605 window_ms=10004 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.027 ping_med_ms=0.053 ping_max_ms=0.322 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.28s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.28s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.86s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:02:44 INFO celeris starting with listener addr=127.0.0.1:35041 engine=epoll protocol=auto
+2026/09/13 16:02:44 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:35041
+2026/09/13 16:02:44 INFO epoll engine listening addr=127.0.0.1:35041 loops=2
+2026/09/13 16:02:44 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=49 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=56 kv_reqs=56 pre_sample_ms=2408 window_ms=12076 samples=5 stalled=5 stalled_frac=1.000 stalled_time_ms=12022 ping_min_ms=2397.861 ping_med_ms=2405.276 ping_max_ms=2410.030 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:03:01 INFO celeris starting with listener addr=127.0.0.1:39089 engine=epoll protocol=auto
+2026/09/13 16:03:01 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:39089
+2026/09/13 16:03:01 INFO epoll engine listening addr=127.0.0.1:39089 loops=2
+2026/09/13 16:03:01 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=50 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=305 window_ms=10010 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.057 ping_max_ms=0.425 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:03:11 INFO celeris starting with listener addr=127.0.0.1:36151 engine=epoll protocol=auto
+2026/09/13 16:03:11 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:36151
+2026/09/13 16:03:11 INFO epoll engine listening addr=127.0.0.1:36151 loops=2
+2026/09/13 16:03:11 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=51 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=605 window_ms=10000 samples=949 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.024 ping_med_ms=0.049 ping_max_ms=0.603 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (38.34s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (38.34s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (16.91s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.56s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:03:22 INFO celeris starting with listener addr=127.0.0.1:34649 engine=epoll protocol=auto
+2026/09/13 16:03:22 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:34649
+2026/09/13 16:03:22 INFO epoll engine listening addr=127.0.0.1:34649 loops=2
+2026/09/13 16:03:22 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=52 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=82 kv_reqs=82 pre_sample_ms=1211 window_ms=10102 samples=11 stalled=11 stalled_frac=1.000 stalled_time_ms=9964 ping_min_ms=900.493 ping_med_ms=904.949 ping_max_ms=912.135 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:03:35 INFO celeris starting with listener addr=127.0.0.1:36775 engine=epoll protocol=auto
+2026/09/13 16:03:35 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:36775
+2026/09/13 16:03:35 INFO epoll engine listening addr=127.0.0.1:36775 loops=2
+2026/09/13 16:03:35 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=53 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=303 window_ms=10005 samples=947 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.028 ping_med_ms=0.057 ping_max_ms=0.415 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:03:45 INFO celeris starting with listener addr=127.0.0.1:37283 engine=epoll protocol=auto
+2026/09/13 16:03:45 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:37283
+2026/09/13 16:03:45 INFO epoll engine listening addr=127.0.0.1:37283 loops=2
+2026/09/13 16:03:45 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=54 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=608 window_ms=10005 samples=947 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.033 ping_med_ms=0.064 ping_max_ms=0.677 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.29s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.29s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (12.86s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.56s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:03:56 INFO celeris starting with listener addr=127.0.0.1:43423 engine=epoll protocol=auto
+2026/09/13 16:03:56 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43423
+2026/09/13 16:03:56 INFO epoll engine listening addr=127.0.0.1:43423 loops=2
+2026/09/13 16:03:56 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=55 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=86 kv_reqs=86 pre_sample_ms=1212 window_ms=10712 samples=7 stalled=7 stalled_frac=1.000 stalled_time_ms=10627 ping_min_ms=1502.551 ping_med_ms=1520.146 ping_max_ms=1526.388 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:04:10 INFO celeris starting with listener addr=127.0.0.1:41367 engine=epoll protocol=auto
+2026/09/13 16:04:10 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:41367
+2026/09/13 16:04:10 INFO epoll engine listening addr=127.0.0.1:41367 loops=2
+2026/09/13 16:04:10 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=56 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=307 window_ms=10009 samples=952 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.024 ping_med_ms=0.046 ping_max_ms=0.353 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:04:20 INFO celeris starting with listener addr=127.0.0.1:37103 engine=epoll protocol=auto
+2026/09/13 16:04:20 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:37103
+2026/09/13 16:04:20 INFO epoll engine listening addr=127.0.0.1:37103 loops=2
+2026/09/13 16:04:20 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=57 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=606 window_ms=10007 samples=947 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.030 ping_med_ms=0.062 ping_max_ms=0.643 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.89s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.89s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.46s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+=== RUN   TestAdaptiveSettledRouteStall589
+=== RUN   TestAdaptiveSettledRouteStall589/epoll
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/settled
+2026/09/13 16:04:31 INFO celeris starting with listener addr=127.0.0.1:43679 engine=epoll protocol=auto
+2026/09/13 16:04:31 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43679
+2026/09/13 16:04:31 INFO epoll engine listening addr=127.0.0.1:43679 loops=2
+2026/09/13 16:04:31 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:279: RESULT589 engine=epoll mode=settled run=58 verdict=CONFIRM settled_before=true promoted_before=false adaptive=true settled_after=true promoted_after=false async_promoted_conns=0 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=256 slow_calls=86 kv_reqs=86 pre_sample_ms=1210 window_ms=10704 samples=7 stalled=7 stalled_frac=1.000 stalled_time_ms=10621 ping_min_ms=1509.981 ping_med_ms=1513.471 ping_max_ms=1527.417 claim_assert=pass
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_async
+2026/09/13 16:04:45 INFO celeris starting with listener addr=127.0.0.1:43277 engine=epoll protocol=auto
+2026/09/13 16:04:45 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:43277
+2026/09/13 16:04:45 INFO epoll engine listening addr=127.0.0.1:43277 loops=2
+2026/09/13 16:04:45 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:302: RESULT589 engine=epoll mode=negctrl_async run=59 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=false settled_after=false promoted_after=false async_promoted_conns=9 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=280 kv_reqs=280 pre_sample_ms=308 window_ms=10005 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.024 ping_med_ms=0.051 ping_max_ms=0.473 claim_assert=fail(/kv is not in router.settled after the slow window)
+=== RUN   TestAdaptiveSettledRouteStall589/epoll/negctrl_learning
+2026/09/13 16:04:55 INFO celeris starting with listener addr=127.0.0.1:38881 engine=epoll protocol=auto
+2026/09/13 16:04:55 INFO epoll: closing supplied listener to rebind via SO_REUSEPORT addr=127.0.0.1:38881
+2026/09/13 16:04:55 INFO epoll engine listening addr=127.0.0.1:38881 loops=2
+2026/09/13 16:04:55 INFO AsyncHandlers + EnableH2Upgrade: async dispatch applies to HTTP/1.1 only; H2 conns still run inline on the worker
+    adaptive_settled_retime_linux_test.go:327: RESULT589 engine=epoll mode=negctrl_learning run=60 verdict=CONTROL_OK settled_before=false promoted_before=false adaptive=true settled_after=false promoted_after=true async_promoted_conns=8 workers=2 kv_conns=8 gomaxprocs=4 warm_reqs=100 slow_calls=282 kv_reqs=282 pre_sample_ms=606 window_ms=10004 samples=948 stalled=0 stalled_frac=0.000 stalled_time_ms=0 ping_min_ms=0.026 ping_med_ms=0.057 ping_max_ms=0.380 claim_assert=fail(/kv is not in router.settled after the slow window)
+--- PASS: TestAdaptiveSettledRouteStall589 (34.90s)
+    --- PASS: TestAdaptiveSettledRouteStall589/epoll (34.90s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/settled (13.47s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_async (10.57s)
+        --- PASS: TestAdaptiveSettledRouteStall589/epoll/negctrl_learning (10.86s)
+PASS
+ok  	github.com/goceleris/celeris	697.904s

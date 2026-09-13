@@ -1,0 +1,21 @@
+2026-09-13T15:26:35Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-stacktally.log
+2026-09-13T15:27:09Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-stacktally.log exit=0 results=3
+2026-09-13T15:27:09Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-epoll-stacktally.log
+2026-09-13T15:27:31Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-epoll-stacktally.log exit=0 results=2
+2026-09-13T15:27:31Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-kvconns1.log
+2026-09-13T15:29:41Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-kvconns1.log exit=0 results=12
+2026-09-13T15:29:41Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-w4-gmp8.log
+2026-09-13T15:30:15Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-w4-gmp8.log exit=0 results=3
+2026-09-13T15:30:15Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-learning-stacktally.log
+2026-09-13T15:30:28Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag2-iouring-learning-stacktally.log exit=0 results=1
+2026-09-13T15:30:28Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-iouring-x20.log
+2026-09-13T15:40:28Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-iouring-x20.log exit=0 results=50
+2026-09-13T15:40:28Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-epoll-x20.log
+2026-09-13T15:41:37Z RESTART with -timeout 40m
+2026-09-13T15:41:37Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-iouring-x20.log
+2026-09-13T15:53:29Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-iouring-x20.log exit=0 results=60
+2026-09-13T15:53:29Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-epoll-x20.log
+2026-09-13T16:05:07Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-epoll-x20.log exit=0 results=60
+2026-09-13T16:05:07Z START /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag3-iouring-stacktally.log
+2026-09-13T16:05:41Z END   /Users/fuming/Documents/github/celeris/celeris/.claude/worktrees/wf_fa89913b-589/scratchpad/logs/589-diag3-iouring-stacktally.log exit=0 results=3
+2026-09-13T16:05:41Z ALL DONE C
