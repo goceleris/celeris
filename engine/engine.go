@@ -164,4 +164,18 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// engine lost track of, the only witness of a double recv that the
 	// userspace guard cannot see. Must stay 0. Zero on other engines.
 	RecvCQEUnaccounted uint64
+	// DetachedConnections is the current number of connections handed to a
+	// detached middleware goroutine (WebSocket / SSE), summed over the
+	// io_uring workers. It mirrors the per-worker detachedCount that gates
+	// the idle-deadline sweep cadence, so a drift between this gauge and the
+	// number of live detached streams is the celeris#549 accounting bug made
+	// visible (celeris#584). Zero on engines that do not keep the count.
+	DetachedConnections int64
+	// DetachWindowCloses is the cumulative number of io_uring async-mode
+	// connections that closed between the middleware's Detach and the
+	// worker's deferred detachedCount increment. Each one is a close the
+	// pre-#551 accounting decremented without a matching increment; the
+	// counter is the exposure proof that the celeris#549 window was entered
+	// at all (celeris#584). Zero on other engines.
+	DetachWindowCloses uint64
 }
