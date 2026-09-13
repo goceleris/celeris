@@ -325,14 +325,24 @@ func (e *Engine) Shutdown(_ context.Context) error {
 }
 
 // Metrics returns a snapshot of engine metrics.
+//
+// The worker count is read under e.mu. Listen starts the worker
+// goroutines before it assigns e.workers (it waits for every ring to
+// come up first), so a worker already serving a request can reach this
+// method through Server.EngineInfo while the slice is still being
+// written; the race detector reported exactly that pair in 7 of 16
+// io_uring cells of probatorium's first -race matrix run (celeris#578).
 func (e *Engine) Metrics() engine.EngineMetrics {
+	e.mu.Lock()
+	workers := len(e.workers)
+	e.mu.Unlock()
 	return engine.EngineMetrics{
 		RequestCount:       e.metrics.reqCount.Load(),
 		ActiveConnections:  e.metrics.activeConns.Load(),
 		ErrorCount:         e.metrics.errCount.Load(),
 		AsyncRoutes:        e.asyncRoutes,
 		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
-		Workers:            len(e.workers),
+		Workers:            workers,
 		AcceptCount:        e.metrics.acceptCount.Load(),
 		CloseCount:         e.metrics.closeCount.Load(),
 		BytesRead:          e.metrics.bytesRead.Load(),
