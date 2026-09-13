@@ -51,6 +51,14 @@ type Engine struct {
 		// round-robin cursor for spreading adopts across workers.
 		transplantCount atomic.Uint64
 		transplantRR    atomic.Uint64
+		// detachedConns mirrors the sum of the workers' private detachedCount
+		// (one atomic add per detach and per detached close, none per
+		// request); detachWindowCloses counts closes that landed inside the
+		// celeris#549 window (Detach published, deferred count not yet
+		// taken). Both exist so the accounting can be observed from outside
+		// the worker thread (celeris#584).
+		detachedConns      atomic.Int64
+		detachWindowCloses atomic.Uint64
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -287,6 +295,8 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 			return nil, err
 		}
 		w.transplantCount = &e.metrics.transplantCount // #383 transplant counter
+		w.detachedConns = &e.metrics.detachedConns
+		w.detachWindowCloses = &e.metrics.detachWindowCloses
 		workers[i] = w
 	}
 	return workers, nil
@@ -337,16 +347,18 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 	workers := len(e.workers)
 	e.mu.Unlock()
 	return engine.EngineMetrics{
-		RequestCount:       e.metrics.reqCount.Load(),
-		ActiveConnections:  e.metrics.activeConns.Load(),
-		ErrorCount:         e.metrics.errCount.Load(),
-		AsyncRoutes:        e.asyncRoutes,
-		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
-		Workers:            workers,
-		AcceptCount:        e.metrics.acceptCount.Load(),
-		CloseCount:         e.metrics.closeCount.Load(),
-		BytesRead:          e.metrics.bytesRead.Load(),
-		BytesWritten:       e.metrics.bytesWritten.Load(),
+		RequestCount:        e.metrics.reqCount.Load(),
+		ActiveConnections:   e.metrics.activeConns.Load(),
+		ErrorCount:          e.metrics.errCount.Load(),
+		AsyncRoutes:         e.asyncRoutes,
+		AsyncPromotedConns:  e.metrics.asyncPromoted.Load(),
+		Workers:             workers,
+		AcceptCount:         e.metrics.acceptCount.Load(),
+		CloseCount:          e.metrics.closeCount.Load(),
+		BytesRead:           e.metrics.bytesRead.Load(),
+		BytesWritten:        e.metrics.bytesWritten.Load(),
+		DetachedConnections: e.metrics.detachedConns.Load(),
+		DetachWindowCloses:  e.metrics.detachWindowCloses.Load(),
 	}
 }
 
