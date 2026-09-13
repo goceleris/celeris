@@ -1,6 +1,20 @@
 name: Release
 
+# Two ways in, one gate. The intended path is the manual dispatch from
+# `main` with the version as input: the gate verifies every hand-written
+# version stamp (mage CheckRelease), CI runs, and only then does the
+# workflow create the tag and the GitHub Release itself, so a stale stamp
+# means no tag exists. The `release: published` path covers a release
+# created by hand: it runs the same gate and stops before touching
+# sub-module tags or the Go proxy (see GOVERNANCE.md, Releases, for the
+# recovery recipe).
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, vX.Y.Z (or vX.Y.Z-rc.N); every stamp must already say it"
+        required: true
+        type: string
   release:
     types: [published]
 
@@ -8,30 +22,99 @@ permissions:
   contents: read
 
 jobs:
-  validate-tag:
-    name: Validate Tag
+  resolve:
+    name: Resolve version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      dispatch: ${{ steps.v.outputs.dispatch }}
     steps:
-      - name: Check semver format
+      - name: Version and semver format
+        id: v
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
+          TAG="${INPUT_VERSION:-$RELEASE_TAG}"
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
             echo "::error::Tag '$TAG' is not valid semver (expected vX.Y.Z or vX.Y.Z-beta.N)"
             exit 1
           fi
-          echo "Tag $TAG is valid"
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main, not from $REF"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "dispatch=$([ "$EVENT" = workflow_dispatch ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG ($EVENT)"
+
+  gate:
+    name: Version stamps agree
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag must not exist yet (dispatch)
+        if: needs.resolve.outputs.dispatch == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${VERSION} already exists; a version is never re-tagged"
+            exit 1
+          fi
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: false # zizmor cache-poisoning: a release workflow must not restore a cache anyone could have written
+      - name: Install mage
+        run: |
+          go install github.com/magefile/mage@v1.17.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: mage CheckRelease
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: mage CheckRelease
 
   ci:
     name: CI
-    needs: validate-tag
+    needs: [resolve, gate]
     uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 rejects the `$/` form
+
+  publish:
+    name: Create tag and release
+    needs: [resolve, gate, ci]
+    if: needs.resolve.outputs.dispatch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: gh release create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ github.sha }}
+        run: |
+          # The tag is created at the exact commit the gate and CI ran on.
+          # A release published with the job token does not re-trigger this
+          # workflow, so the sub-module tags and the proxy ping below run
+          # from this same run.
+          gh release create "$VERSION" --target "$TARGET" --title "$VERSION" --generate-notes --verify-tag=false
+          echo "Created $VERSION at $TARGET"
 
   tag-submodules:
     name: Tag Sub-Modules
-    needs: [validate-tag, ci]
+    needs: [resolve, gate, ci, publish]
+    if: always() && needs.gate.result == 'success' && needs.ci.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     runs-on: ubuntu-latest
-    # The only job that writes to the repository (pushes sub-module tags).
+    # The only job that pushes to the repository (sub-module tags).
     permissions:
       contents: write
     steps:
@@ -39,9 +122,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: # zizmor: ignore[artipacked]
           fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.version }}
       - name: Create sub-module tags
         env:
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           SUBMODULES="middleware/compress middleware/metrics middleware/otel middleware/protobuf"
           for sub in $SUBMODULES; do
@@ -54,58 +138,22 @@ jobs:
             fi
           done
           git push origin --tags
-      - name: Update sub-module go.mod versions
-        env:
-          VERSION: ${{ github.event.release.tag_name }}
-        run: |
-          SUBMODULES="middleware/compress middleware/metrics middleware/otel middleware/protobuf"
-          for sub in $SUBMODULES; do
-            GOMOD="${sub}/go.mod"
-            if [ -f "$GOMOD" ]; then
-              echo "Checking ${GOMOD} for stale celeris version..."
-              CURRENT=$(grep 'github.com/goceleris/celeris ' "$GOMOD" | awk '{print $2}')
-              if [ "$CURRENT" != "$VERSION" ]; then
-                echo "::warning::${GOMOD} pins celeris ${CURRENT}, not ${VERSION}. Update before next sub-module release."
-              else
-                echo "${GOMOD} already at ${VERSION}"
-              fi
-            fi
-          done
 
   notify-proxy:
     name: Notify Go Proxy
-    needs: [validate-tag, ci, tag-submodules]
+    needs: [resolve, tag-submodules]
+    if: always() && needs.tag-submodules.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
           cache: false
-      - name: Request root module from proxy
+      - name: Request the root module and the sub-modules from the proxy
         env:
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          MODULE="github.com/goceleris/celeris"
-          echo "Notifying proxy for ${MODULE}@${VERSION}..."
-          for attempt in 1 2 3; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info")
-            if [ "$STATUS" = "200" ]; then
-              echo "Proxy responded with 200 for ${MODULE}@${VERSION}"
-              break
-            fi
-            echo "Attempt $attempt: proxy returned $STATUS, retrying in 10s..."
-            sleep 10
-          done
-      - name: Request sub-module versions from proxy
-        env:
-          VERSION: ${{ github.event.release.tag_name }}
-        run: |
-          SUBMODULES="middleware/compress middleware/metrics middleware/otel middleware/protobuf"
-          for sub in $SUBMODULES; do
-            MODULE="github.com/goceleris/celeris/${sub}"
+          for MODULE in github.com/goceleris/celeris github.com/goceleris/celeris/middleware/compress github.com/goceleris/celeris/middleware/metrics github.com/goceleris/celeris/middleware/otel github.com/goceleris/celeris/middleware/protobuf; do
             echo "Notifying proxy for ${MODULE}@${VERSION}..."
             for attempt in 1 2 3; do
               STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info")
@@ -119,10 +167,8 @@ jobs:
           done
       - name: Verify module availability
         env:
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          go list -m "github.com/goceleris/celeris@${VERSION}" || echo "Root module not yet indexed"
-          go list -m "github.com/goceleris/celeris/middleware/compress@${VERSION}" || echo "compress sub-module not yet indexed"
-          go list -m "github.com/goceleris/celeris/middleware/metrics@${VERSION}" || echo "metrics sub-module not yet indexed"
-          go list -m "github.com/goceleris/celeris/middleware/otel@${VERSION}" || echo "otel sub-module not yet indexed"
-          go list -m "github.com/goceleris/celeris/middleware/protobuf@${VERSION}" || echo "protobuf sub-module not yet indexed"
+          for MODULE in github.com/goceleris/celeris github.com/goceleris/celeris/middleware/compress github.com/goceleris/celeris/middleware/metrics github.com/goceleris/celeris/middleware/otel github.com/goceleris/celeris/middleware/protobuf; do
+            go list -m "${MODULE}@${VERSION}" || echo "${MODULE} not yet indexed"
+          done
