@@ -80,11 +80,15 @@ so the design can be discussed without a diff attached.
   `middleware/*/go.mod` pins, the README "What's new" heading), runs the
   full CI, and only then creates the tag and the GitHub Release. A stale
   stamp means no tag is created, so there is nothing to undo.
-- Before that, the stamps are moved in one normal PR:
-  `VERSION=vX.Y.Z mage PrepRelease` rewrites all of them and leaves a
-  placeholder under the README heading that `CheckRelease` refuses until
-  the release prose is written. CI runs `mage CheckRelease` on every PR,
-  so the stamps cannot drift apart between releases.
+- Before that, the stamps are moved in one normal PR, the **last PR before
+  the release**: `VERSION=vX.Y.Z mage PrepRelease` rewrites all of them and
+  leaves a placeholder under the README heading that `CheckRelease` refuses
+  until the release prose is written. Between releases the four
+  `middleware/*/go.mod` pins stay at the last released tag on purpose: a
+  sub-module that requires an unreleased root version cannot be consumed at
+  a pseudo-version (probatorium pins celeris `main` between releases). CI
+  runs `mage CheckRelease` on every PR, so the stamps cannot drift apart or
+  be half-moved.
 - The workflow runs only after the
   [goceleris/probatorium](https://github.com/goceleris/probatorium)
   **nightly** validation matrix and the **weekend soak** have passed on
