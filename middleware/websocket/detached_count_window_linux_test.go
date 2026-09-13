@@ -70,7 +70,9 @@ import (
 //     FIN under websocket.Config{IdleTimeout: 1s}. The count gates the idle
 //     sweep cadence (0x1F x 50 ms when > 0, 0x3FF x 100 ms when 0), so a
 //     drifted-to-zero worker reaps ~100 s late; the fixed tree must reap
-//     within IdleTimeout + 1.6 s.
+//     within IdleTimeout + 1.6 s. Only observable with ReadHeaderTimeout
+//     disabled (-1): the default 10 s slowloris timeout pins the gate to
+//     0x1F and the idle wait to <= 25 ms whatever the count says.
 //
 // io_uring only (the count is an io_uring worker field); skipped when the
 // engine is unavailable. Runs for ~10 s; skipped under -short.
@@ -110,6 +112,14 @@ func detachedCountWindow(t *testing.T, engine celeris.EngineType) {
 		AsyncHandlers: true,
 		Workers:       dcwWorkers,
 		Logger:        slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		// -1 disables the slowloris header timeout (0 means the 10 s
+		// default). With it enabled the sweep gate is 0x1F and the idle
+		// wait <= 25 ms REGARDLESS of detachedCount (worker.go gate and
+		// adaptiveTimeout), so O3 could not tell a drifted count from a
+		// correct one — measured: the control build reaped every anchor
+		// within 1.3 s under the default. The cadence consequence #549
+		// names exists only when ReadHeaderTimeout is disabled.
+		ReadHeaderTimeout: -1,
 	})
 	// Adaptive route (inherits AsyncHandlers, no explicit .Async()), like the
 	// refapp's /ws: runs inline on an unpromoted conn, on the dispatch
