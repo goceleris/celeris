@@ -211,6 +211,42 @@ const adaptiveSettleStreak = 256
 // already-promoted routes, so the fast path is unaffected.
 const adaptivePromoteTTL = 5 * time.Second
 
+// adaptiveSettleTTL bounds how long a SETTLED classification lasts before the
+// route is re-timed (celeris#592). Settling is otherwise TERMINAL — a settled
+// route is dropped from the timed path (adaptiveLearning short-circuits on
+// `settled`) and the only statement that ever removed it again was an explicit
+// .Async()/.Sync() at registration — so a route that settled while its backend
+// was fast (a sub-300µs store call) and whose backend LATER turns slow kept
+// running inline on the engine worker for every request, forever, pinning the
+// worker and queueing every other connection on it behind the blocking call
+// (measured under celeris#589: 20/20 runs on both native engines ended
+// settled, never promoted, with an unrelated /ping on the same worker stalled
+// in 100% of samples at a ~1.2 s median).
+//
+// Mirrors adaptivePromoteTTL so both terminal states are re-evaluated on the
+// same cadence: the promoted set expires per-route on read, the settled set is
+// cleared wholesale by a background ticker (router.startSettleReopener).
+//
+// Why a ticker instead of per-request sampling: the whole point of celeris#361
+// was to take the two time.Now() vDSO calls OFF the settled hot path, so the
+// re-timing decision must not put anything back on it — no counter, no clock
+// read, no extra atomic. The fast path is byte-for-byte what it was: one
+// sync.Map load in adaptiveLearning. The re-opener runs off-path on one
+// per-server goroutine that wakes every adaptiveSettleTTL and clears the
+// settled set.
+//
+// Cost: the fast STREAK is deliberately NOT reset by the re-open, so a route
+// that is still fast re-settles on its very next run (fastStreak is already at
+// adaptiveSettleStreak, so recordInlineRun stores it back immediately). The
+// amortized price of the re-timing is therefore exactly ONE timed inline run
+// (two time.Now() calls) per adaptive route per adaptiveSettleTTL — at 1M
+// req/s on one route that is 1 request in 5,000,000. A route whose backend has
+// turned slow is caught by that one run: 300µs–2ms feeds the
+// adaptivePromoteStreak hysteresis, and anything over adaptiveBlockingThreshold
+// promotes immediately. Worst-case detection latency is therefore
+// adaptiveSettleTTL plus one request.
+const adaptiveSettleTTL = 5 * time.Second
+
 // recoverAndRelease handles panic recovery and context release. Extracted to a
 // separate noinline function so that HandleStream's stack frame is not inflated
 // by the deferred closure and debug.Stack() call (P5).

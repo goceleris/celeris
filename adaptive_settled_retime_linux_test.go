@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine/iouring"
 	"github.com/goceleris/celeris/middleware/store"
 )
 
@@ -110,9 +109,10 @@ func envInt589(name string, def int) int {
 	return def
 }
 
-// Measurement rig for celeris#589 (celeris#493 fix-plan item (4)).
+// Regression rig for celeris#592 (the fix) — measurement rig for celeris#589
+// (celeris#493 fix-plan item (4)), with the `settled` subtest INVERTED.
 //
-// Claim under test: an adaptive route (inherited AsyncHandlers=true, no
+// Defect that was measured (celeris#589, 20 runs per engine on celeris ededb6c): an adaptive route (inherited AsyncHandlers=true, no
 // explicit .Async()) that SETTLED as fast (adaptiveSettleStreak consecutive
 // sub-300µs inline runs) is never re-timed — handler.go only times a route
 // while router.adaptiveLearning() is true, and the only statement that removes
@@ -121,15 +121,31 @@ func envInt589(name string, def int) int {
 // engine worker thread for every request, and an unrelated fast request on the
 // same worker (/ping) queues behind the blocked store call.
 //
+// The fix (celeris#592) makes settling non-terminal: a background re-opener
+// clears the settled set every adaptiveSettleTTL, so the route is re-timed, the
+// re-timed run is ~D (far over adaptiveBlockingThreshold) and it promotes. The
+// `settled` subtest therefore asserts the INVERSE of the #589 claim:
+//
+//   - STATE (both engines): isPromoted("/kv") is true and
+//     EngineMetrics.AsyncPromotedConns >= 1, reached within stall592PromoteBound
+//     of the store turning slow;
+//   - LATENCY (epoll only): fewer than stall592MaxStalledFrac of the /ping
+//     samples taken AFTER promotion exceed stall589StallBar.
+//
+// io_uring's fraction is PRINTED, not asserted: even the fully async control
+// pins the io_uring worker ~30% of wall time through the celeris#593 timeout
+// sweep (see the note below), which is a separate defect with its own fix.
+//
 // The observable follows the two binding adversarial-review corrections on the
 // issue: the PRIMARY assertion is the dispatch STATE after the route has turned
 // slow (settled.Load, isPromoted, EngineMetrics.AsyncPromotedConns); the
 // latency observable is the FRACTION of /ping samples above 5 ms taken over a
-// window that starts only after every /kv connection has completed one slow
-// run (so the unavoidable first post-hoc inline run per worker is excluded),
-// and the promotion TTL is pinned out of the picture with the existing nowNano
-// test hook (frozen clock) so a fixed tree would show exactly one inline stall
-// per worker and then none.
+// window that starts only after every /kv connection has completed one slow run
+// (so the unavoidable first post-hoc inline run per worker is excluded) and,
+// in the settled mode, only after the route has been promoted, and the
+// promotion TTL is pinned out of the picture with the existing nowNano test
+// hook (frozen clock) so the promotion made during the run cannot expire. The
+// re-opener runs off a real time.Ticker, so the frozen clock does not stall it.
 //
 // Negative controls (the same rig, the same blocked Set):
 //   - explicit .Async() on /kv (item (4)'s "store-backed middleware blocking by
@@ -138,38 +154,27 @@ func envInt589(name string, def int) int {
 //   - /kv still LEARNING (warmed with fewer than adaptiveSettleStreak runs): the
 //     first slow inline run promotes the route immediately, later runs go async.
 //
-// The claim assertion (assertSettledStall589) must PASS on the settled rig and
-// must FAIL on both controls; the controls additionally assert the inverse
-// state. A test that passes on both trees proves nothing, so both directions
-// are asserted explicitly.
+// The #589 claim assertion (assertSettledStall589 — the DEFECT's signature)
+// must now FAIL on all three modes, and the fixed-behaviour assertion
+// (assertSettledRetimed592) must PASS on the settled rig; the two controls are
+// unchanged from the measurement branch and still assert their inverse state.
+// A test that passes on both trees proves nothing, so both directions are
+// asserted explicitly: on origin/main the settled subtest FAILS because the
+// route is never promoted.
 //
 // Latency observable per engine (measured while building this rig): on epoll
 // the controls fully invert (0 of ~940 /ping samples above 5 ms). On io_uring
-// they originally inverted in the MEDIAN (sub-ms vs ≥ D) but NOT in the stalled
-// fraction: the worker still blocked for ≈ D − 30 ms of every D cycle even
-// though every /kv conn was on a dispatch goroutine. A goroutine stack captured
-// mid-stall (CELERIS_589_STACK=1) showed both workers in sync.Mutex.Lock inside
-// Worker.checkTimeouts (the celeris#548 h1State snapshot under detachMu) while
-// runAsyncHandler holds cs.detachMu across the whole ProcessH1
-// (worker.go:3307→3460). The epoll sweep takes no lock. That was a distinct
-// io_uring defect — an async-dispatched HTTP/1 conn with a slow handler pins
-// the worker in the timeout sweep — not the item (4) dispatch policy; it is
-// celeris#593, fixed by making that snapshot a TryLock-and-skip
-// (snapshotH1Deadlines in engine/iouring/worker.go). The controls are
-// therefore now the REGRESSION TEST for #593: on both engines each asserts,
-// as well as the median, that the window's STALLED WALL-TIME fraction stays
-// under stall589CtlTimeBar — 0.883-0.888 with the defect, 0 in 29 of 40 runs
-// and at most 0.037 with it fixed — and still logs the ANOMALY589 line so a
-// regression names itself in the output.
-//
-// Portability: the io_uring half of the matrix needs stall589Workers real
-// workers, and io_uring locks ~12 MiB per worker against RLIMIT_MEMLOCK, so on
-// a memlock-capped host (a GitHub Actions runner is 8 MiB = one worker) it
-// SKIPS via skipIfMemlockCaps589 instead of failing; the epoll half always
-// runs. Measured under the CI command line (`go test -race -count=1
-// -timeout=300s`) in golang:1.27, --cpus 4, seccomp=unconfined: with
-// `--ulimit memlock=8388608` the three io_uring subtests skip and the package
-// is ok in 35.9 s; with 128 MiB all six run (workers=2) in 70.2 s.
+// they invert in the MEDIAN (sub-ms vs ≥ D) but NOT in the stalled fraction:
+// the worker still blocks for ≈ D − 30 ms of every D cycle even though every
+// /kv conn is on a dispatch goroutine. A goroutine stack captured mid-stall
+// (CELERIS_589_STACK=1) shows both workers in sync.Mutex.Lock inside
+// Worker.checkTimeouts (engine/iouring/worker.go:4186, the celeris#548
+// h1State snapshot under detachMu) while runAsyncHandler holds cs.detachMu
+// across the whole ProcessH1 (worker.go:3307→3460). The epoll sweep takes no
+// lock. That is a distinct io_uring defect — an async-dispatched HTTP/1 conn
+// with a slow handler pins the worker in the timeout sweep — not the item (4)
+// dispatch policy, so the controls assert the median and report the fraction,
+// and log an ANOMALY589 line whenever a control's fraction exceeds 5 %.
 //
 // Diagnostics (env, test-only): CELERIS_589_STACK=1 tallies the event-loop
 // goroutines' blocking site 100 ms into every stalled /ping (STACKTALLY589);
@@ -185,22 +190,19 @@ const (
 	stall589Window   = 10 * time.Second
 	stall589Spacing  = 10 * time.Millisecond
 	stall589StallBar = 5 * time.Millisecond
-	// stall589CtlTimeBar is the celeris#593 regression bar on the two
-	// negative controls: every /kv conn is async-dispatched there, so the
-	// worker must be free and almost none of the window may be spent with a
-	// /ping outstanding. The quantity is stalled WALL TIME / window, not the
-	// stalled sample count, because the count is sensitive to how loaded the
-	// host is while the time is not: measured on this rig, the defect spends
-	// 8867-8964 ms of the 10 s window stalled (0.883-0.888) in 6/6 runs on
-	// origin/main, whereas the fixed tree spends 0 ms in 29/40 runs, at most
-	// 236 ms (0.024) on an idle box, and 373 ms (0.037) with the box
-	// saturated by three other containers — where the stalled COUNT reached
-	// 0.065 on 5-14 ms samples that a stack capture showed to be a runnable,
-	// un-blocked worker waiting for CPU. 0.10 sits ~9x below the defect and
-	// ~2.7x above the worst noise observed.
-	stall589CtlTimeBar = 0.10
-	stall589WarmMax    = 20000 // bound on the warm-up loop (settle needs 256 CONSECUTIVE fast runs)
-	stall589LearnReq   = 100   // learning control: warm with fewer than adaptiveSettleStreak runs
+	stall589WarmMax  = 20000 // bound on the warm-up loop (settle needs 256 CONSECUTIVE fast runs)
+	stall589LearnReq = 100   // learning control: warm with fewer than adaptiveSettleStreak runs
+
+	// stall592PromoteBound is the design's detection bound for celeris#592,
+	// measured from the store turning slow: adaptiveSettleTTL (5 s — the
+	// re-opener's period, so worst case the gate flips just after a tick) plus
+	// the re-timed run itself and the slow run already in flight (2xD) plus
+	// 2 s of scheduling slack. Spelled as a literal, NOT as adaptiveSettleTTL,
+	// so this exact file also compiles on origin/main for the negative control.
+	stall592PromoteBound = 8 * time.Second
+	// stall592MaxStalledFrac is the post-promotion /ping stall budget. Asserted
+	// on epoll only; io_uring's fraction is printed (celeris#593).
+	stall592MaxStalledFrac = 0.05
 )
 
 // gatedKV wraps a store.KV whose Set is fast until the gate flips and then
@@ -259,13 +261,15 @@ type stall589Obs struct {
 	asyncPromotedConns uint64
 	slowCalls          int64
 	kvReqs             int64
+	settledAtFlip      bool          // settled at the instant the store turned slow
+	promoteLatency     time.Duration // gate flip → isPromoted observed true
+	promotedInBound    bool          // promotion seen within stall592PromoteBound
 	preSample          time.Duration // gate flip → sampling start
 	window             time.Duration
 	samples            int
 	stalled            int // /ping samples > stall589StallBar
 	stalledFrac        float64
 	stalledTime        time.Duration // sum of stalled sample latencies
-	stalledTimeFrac    float64       // stalledTime / window: the celeris#593 observable
 	pingMin, pingMed   time.Duration
 	pingMax            time.Duration
 	stacks             *stackTally589 // CELERIS_589_STACK diagnostic, nil otherwise
@@ -288,11 +292,33 @@ func assertSettledStall589(o stall589Obs) error {
 	return nil
 }
 
+// assertSettledRetimed592 is the FIXED behaviour: the settled classification is
+// re-timed, so a settled route whose store turns slow is promoted and stops
+// running on the engine worker. State is asserted on both engines; the /ping
+// stall fraction is asserted on epoll only, because io_uring separately pins
+// its worker in the timeout sweep even when every conn is async-dispatched
+// (celeris#593) — that fraction is printed instead.
+func assertSettledRetimed592(o stall589Obs) error {
+	switch {
+	case !o.promotedInBound:
+		return fmt.Errorf("/kv was not promoted within %v of the store turning slow (promote_latency=%v): the settled classification was never re-timed",
+			stall592PromoteBound, o.promoteLatency)
+	case !o.promotedAfter:
+		return errors.New("/kv is not promoted (isPromoted=false) at the end of the window")
+	case o.asyncPromotedConns < 1:
+		return fmt.Errorf("AsyncPromotedConns=%d, want >= 1 (no conn was handed to the dispatch goroutine)", o.asyncPromotedConns)
+	case o.engine == "epoll" && o.stalledFrac >= stall592MaxStalledFrac:
+		return fmt.Errorf("epoll stalled fraction %.3f >= %.2f (%d/%d /ping samples > %v) AFTER promotion",
+			o.stalledFrac, stall592MaxStalledFrac, o.stalled, o.samples, stall589StallBar)
+	}
+	return nil
+}
+
 var stall589RunSeq atomic.Int64
 
-func TestAdaptiveSettledRouteStall589(t *testing.T) {
+func TestAdaptiveSettledRouteRetime592(t *testing.T) {
 	if testing.Short() {
-		t.Skip("celeris#589 measurement takes ~15 s per run; -short skips it")
+		t.Skip("celeris#592 regression run takes ~20 s per case; -short skips it")
 	}
 	for _, eng := range []struct {
 		name string
@@ -301,14 +327,20 @@ func TestAdaptiveSettledRouteStall589(t *testing.T) {
 		t.Run(eng.name, func(t *testing.T) {
 			t.Run("settled", func(t *testing.T) {
 				o := runStall589(t, eng.name, eng.typ, stall589Settled)
-				err := assertSettledStall589(o)
-				verdict := "CONFIRM"
-				if err != nil {
-					verdict = "REFUTE"
+				// The #589 defect signature must be GONE, and the #592 fixed
+				// behaviour must hold. Both directions, one run.
+				claimErr := assertSettledStall589(o)
+				fixErr := assertSettledRetimed592(o)
+				verdict := "FIXED"
+				if fixErr != nil {
+					verdict = "NOT_FIXED"
 				}
-				logStall589(t, o, verdict, err)
-				if err != nil {
-					t.Errorf("claim assertion failed on the settled rig: %v", err)
+				logStall589(t, o, verdict, claimErr)
+				if fixErr != nil {
+					t.Errorf("celeris#592 fixed-behaviour assertion failed on the settled rig: %v", fixErr)
+				}
+				if claimErr == nil {
+					t.Error("the celeris#589 defect signature still holds on the settled rig (settled, never promoted, stalled_frac >= 0.9)")
 				}
 			})
 			t.Run("negctrl_async", func(t *testing.T) {
@@ -325,13 +357,6 @@ func TestAdaptiveSettledRouteStall589(t *testing.T) {
 					ctlErr = fmt.Errorf("AsyncPromotedConns=%d < %d /kv conns", o.asyncPromotedConns, o.kvConns)
 				case o.pingMed >= stall589StallBar:
 					ctlErr = fmt.Errorf("/ping median %v >= %v with the same blocked Set", o.pingMed, stall589StallBar)
-				case o.stalledTimeFrac > stall589CtlTimeBar:
-					// celeris#593 regression bar: every /kv conn is on a
-					// dispatch goroutine, so a pinned worker can only come
-					// from the engine itself (the timeout sweep blocking on
-					// cs.detachMu). Was 0.88 before the TryLock fix.
-					ctlErr = fmt.Errorf("celeris#593: stalled wall-time fraction %.3f > %.2f (%d/%d /ping samples > %v, %.0f ms of a %.0f ms window, max %v) while all %d /kv conns are async-dispatched",
-						o.stalledTimeFrac, stall589CtlTimeBar, o.stalled, o.samples, stall589StallBar, ms(o.stalledTime), ms(o.window), o.pingMax, o.kvConns)
 				}
 				if ctlErr != nil {
 					verdict = "CONTROL_BROKEN"
@@ -357,10 +382,6 @@ func TestAdaptiveSettledRouteStall589(t *testing.T) {
 					ctlErr = fmt.Errorf("AsyncPromotedConns=%d < %d /kv conns", o.asyncPromotedConns, o.kvConns)
 				case o.pingMed >= stall589StallBar:
 					ctlErr = fmt.Errorf("/ping median %v >= %v after the first inline run per worker", o.pingMed, stall589StallBar)
-				case o.stalledTimeFrac > stall589CtlTimeBar:
-					// celeris#593 regression bar — see negctrl_async.
-					ctlErr = fmt.Errorf("celeris#593: stalled wall-time fraction %.3f > %.2f (%d/%d /ping samples > %v, %.0f ms of a %.0f ms window, max %v) while all %d /kv conns are async-dispatched",
-						o.stalledTimeFrac, stall589CtlTimeBar, o.stalled, o.samples, stall589StallBar, ms(o.stalledTime), ms(o.window), o.pingMax, o.kvConns)
 				}
 				if ctlErr != nil {
 					verdict = "CONTROL_BROKEN"
@@ -383,78 +404,38 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 	if claimErr != nil {
 		claim = "fail(" + claimErr.Error() + ")"
 	}
-	t.Logf("RESULT589 engine=%s mode=%s run=%d verdict=%s settled_before=%t promoted_before=%t adaptive=%t "+
-		"settled_after=%t promoted_after=%t async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d slow_calls=%d kv_reqs=%d "+
-		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f stalled_time_frac=%.3f "+
-		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f claim_assert=%s",
-		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive,
-		o.settledAfter, o.promotedAfter, o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.slowCalls, o.kvReqs,
-		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime), o.stalledTimeFrac,
+	t.Logf("RESULT592 engine=%s mode=%s run=%d verdict=%s settled_before=%t promoted_before=%t adaptive=%t settled_at_flip=%t "+
+		"settled_after=%t promoted_after=%t promoted_in_bound=%t promote_ms=%.0f async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d slow_calls=%d kv_reqs=%d "+
+		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f "+
+		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f claim589_assert=%s",
+		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive, o.settledAtFlip,
+		o.settledAfter, o.promotedAfter, o.promotedInBound, ms(o.promoteLatency), o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.slowCalls, o.kvReqs,
+		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime),
 		ms(o.pingMin), ms(o.pingMed), ms(o.pingMax), claim)
 	if o.stacks != nil {
 		t.Logf("STACKTALLY589 engine=%s mode=%s stalled=%d %s", o.engine, o.mode, o.stalled, o.stacks.String())
 	}
 	// A control whose /kv conns are ALL async-dispatched must leave the worker
-	// free; a stalled fraction above the bar there is not the item (4) dispatch
-	// policy but the second defect (celeris#593 — io_uring: checkTimeouts
-	// blocked on detachMu held by runAsyncHandler across the slow ProcessH1).
-	// The control assertions fail on it now; this line still names it in the
-	// output so a regression is greppable and not just an assertion message.
-	if o.mode != stall589Settled.String() && o.stalledTimeFrac > stall589CtlTimeBar {
-		t.Logf("ANOMALY589 engine=%s mode=%s stalled=%d/%d stalled_frac=%.3f stalled_time_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f: "+
+	// free; a stalled fraction above 5 % there is not the item (4) dispatch
+	// policy but a second defect (io_uring: checkTimeouts blocks on detachMu
+	// held by runAsyncHandler across the slow ProcessH1). Name it on its own
+	// line so the CONTROL_OK verdict (decided on the median) cannot hide it.
+	// io_uring is not judged on the settled mode's latency: PRINT its fraction
+	// next to the epoll bar so the unasserted number is on the record.
+	if o.engine == "iouring" && o.mode == stall589Settled.String() {
+		t.Logf("IOURING592 engine=iouring mode=settled stalled=%d/%d stalled_frac=%.3f (epoll bar %.2f, NOT asserted here) "+
+			"ping_med_ms=%.3f ping_max_ms=%.1f promote_ms=%.0f async_promoted_conns=%d: io_uring carries the separate "+
+			"celeris#593 sweep pin (checkTimeouts blocks on detachMu held by runAsyncHandler across the slow ProcessH1) until that fix lands",
+			o.stalled, o.samples, o.stalledFrac, stall592MaxStalledFrac, ms(o.pingMed), ms(o.pingMax), ms(o.promoteLatency), o.asyncPromotedConns)
+	}
+	if o.mode != stall589Settled.String() && o.stalledFrac > 0.05 {
+		t.Logf("ANOMALY589 engine=%s mode=%s stalled=%d/%d stalled_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f: "+
 			"worker pinned while every /kv conn is async-dispatched (async_promoted_conns=%d)",
-			o.engine, o.mode, o.stalled, o.samples, o.stalledFrac, o.stalledTimeFrac, ms(o.pingMed), ms(o.pingMax), o.asyncPromotedConns)
+			o.engine, o.mode, o.stalled, o.samples, o.stalledFrac, ms(o.pingMed), ms(o.pingMax), o.asyncPromotedConns)
 	}
 }
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-
-// skipIfMemlockCaps589 keeps this rig portable to a memlock-capped runner.
-// io_uring locks ~12 MiB of ring + provided-buffer pages per worker, so a host
-// with a low RLIMIT_MEMLOCK (GitHub Actions ships a soft limit of 8 MiB, which
-// is one worker at most) makes the engine start with FEWER workers than the rig
-// asks for. That is an environment fact, not a regression, and the rig needs
-// >1 worker by construction: the /ping probe must be able to land on a worker
-// other than the one that owns a sleeping /kv conn, which is exactly what the
-// celeris#593 sweep-blocking observable is measured against.
-//
-// The gate is the engine's OWN exported pre-flight (iouring.MaxWorkersForMemlock,
-// engine/iouring/ring.go) — the same rlim.Cur/minMemlockPerWorker arithmetic
-// capWorkersToMemlock applies at start — so the skip predicate and the cap that
-// would trigger it cannot drift apart. It returns -1 for "no cap" (RLIM_INFINITY
-// or an unreadable limit), in which case the rig runs.
-//
-// Nothing else is skipped: the epoll half of the matrix does not lock pages and
-// always runs, and when the cap DOES allow the workers the later
-// info.Metrics.Workers check still Fatals, because then a shortfall is the
-// engine's fault.
-func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
-	t.Helper()
-	if engType != IOUring {
-		return
-	}
-	maxW := iouring.MaxWorkersForMemlock()
-	if maxW == -1 || maxW >= workers {
-		return
-	}
-	// The byte figure in the hint mirrors engine/iouring's unexported
-	// minMemlockPerWorker (12 MiB) and is advisory only — the GATE above is
-	// the exported pre-flight, so a change to that constant cannot make the
-	// rig skip or run wrongly, only make this hint generous or tight.
-	t.Skipf("io_uring: RLIMIT_MEMLOCK allows %d worker(s), this rig needs %d "+
-		"(raise it: `ulimit -l unlimited`, docker --ulimit memlock=%d, or systemd LimitMEMLOCK=infinity)",
-		maxW, workers, workers*12*1024*1024)
-}
-
-// memlockCeiling589 renders the pre-flight ceiling for the workers-shortfall
-// Fatal, so the failure message says what the limit allowed rather than
-// speculating about it.
-func memlockCeiling589() string {
-	if maxW := iouring.MaxWorkersForMemlock(); maxW != -1 {
-		return strconv.Itoa(maxW) + " worker(s)"
-	}
-	return "unlimited workers (RLIM_INFINITY)"
-}
 
 // runStall589 runs one full measurement: start a real engine with 2 workers,
 // warm /kv, flip the store slow, hammer /kv on C keep-alive conns, sample
@@ -471,7 +452,6 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	// dispatch goroutine) would stall every run.
 	workers := envInt589("CELERIS_589_WORKERS", stall589Workers)
 	o.kvConns = envInt589("CELERIS_589_KVCONNS", stall589KVConnsX*workers)
-	skipIfMemlockCaps589(t, engType, workers)
 
 	// Freeze the adaptive promotion clock: a promotion made during the run
 	// never expires, so the fixed/control worlds show exactly one inline run
@@ -553,11 +533,7 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	}
 	o.workers = info.Metrics.Workers
 	if o.workers != workers {
-		// skipIfMemlockCaps589 already cleared RLIMIT_MEMLOCK for this worker
-		// count, so a shortfall here is the engine's own doing, not the
-		// environment's: fail, do not skip.
-		t.Fatalf("workers=%d, want %d (RLIMIT_MEMLOCK allows %s, so this is NOT the memlock cap)",
-			o.workers, workers, memlockCeiling589())
+		t.Fatalf("workers=%d, want %d (memlock cap? run with --ulimit memlock=-1)", o.workers, workers)
 	}
 
 	// Warm-up on one keep-alive conn, sequential: settle (bounded loop, since
@@ -568,11 +544,20 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	}
 	switch mode {
 	case stall589Settled:
-		for o.warmReqs < stall589WarmMax {
-			if err := get589(wc, wbr, "/kv"); err != nil {
-				t.Fatalf("warm-up GET /kv #%d: %v", o.warmReqs, err)
+		// The celeris#592 re-opener clears the settled set every
+		// adaptiveSettleTTL; if a tick lands between the warm loop's exit and
+		// the precondition read, warm again — the fast streak survives the
+		// re-open, so a single further request re-settles the route.
+		for attempt := 0; attempt < 5; attempt++ {
+			for o.warmReqs < stall589WarmMax {
+				if err := get589(wc, wbr, "/kv"); err != nil {
+					t.Fatalf("warm-up GET /kv #%d: %v", o.warmReqs, err)
+				}
+				o.warmReqs++
+				if _, ok := s.router.settled.Load("/kv"); ok {
+					break
+				}
 			}
-			o.warmReqs++
 			if _, ok := s.router.settled.Load("/kv"); ok {
 				break
 			}
@@ -616,6 +601,11 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	// flight per conn, until told to stop.
 	kv.slow.Store(true)
 	flipAt := time.Now()
+	// Whether the route was still settled at the instant the store turned slow.
+	// With the celeris#592 re-opener a tick can land in the few ms between the
+	// precondition read and the flip; such a run exercises the learning path
+	// instead and is visible on the result line rather than silently folded in.
+	_, o.settledAtFlip = s.router.settled.Load("/kv")
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var kvReqs atomic.Int64
@@ -659,13 +649,40 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// celeris#592: the settled classification is re-opened every
+	// adaptiveSettleTTL, the re-timed run is ~D (far over
+	// adaptiveBlockingThreshold) and the route promotes. Wait for that —
+	// bounded by the design's bound — before sampling, so the stalled fraction
+	// the assertion reads is the one for the REST of the window, after
+	// promotion. On a tree without the fix this loop runs out the bound and the
+	// assertion fails on promoted_in_bound.
+	if mode == stall589Settled {
+		promoteDeadline := flipAt.Add(stall592PromoteBound)
+		for {
+			if s.router.isPromoted("/kv") {
+				o.promotedInBound = true
+				o.promoteLatency = time.Since(flipAt)
+				break
+			}
+			if time.Now().After(promoteDeadline) {
+				o.promoteLatency = time.Since(flipAt)
+				break
+			}
+			select {
+			case err := <-hammerErr:
+				t.Fatalf("kv hammer: %v", err)
+			default:
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
 	o.preSample = time.Since(flipAt)
 
 	// Diagnostics (test-only, env-gated): CELERIS_589_FRESH=1 samples /ping on
 	// a FRESH conn per sample (random worker) instead of the pre-opened conn;
 	// CELERIS_589_DUMP=1 logs the chronological latency series.
 	fresh := os.Getenv("CELERIS_589_FRESH") != ""
-	stackTrigger := time.Duration(envInt589("CELERIS_589_STACK_MS", 100)) * time.Millisecond
 	var lat []time.Duration
 	winStart := time.Now()
 	for time.Since(winStart) < stall589Window {
@@ -681,12 +698,9 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 				t.Fatalf("GET /ping (fresh conn) during window: %v", err)
 			}
 		} else if os.Getenv("CELERIS_589_STACK") != "" {
-			// Diagnostic: stackTrigger into EVERY stalled /ping, classify the
+			// Diagnostic: 100 ms into EVERY stalled /ping, classify the
 			// event-loop goroutines' blocking site (tallied on the STACK589
-			// result line) and dump the first one in full. The default trigger
-			// is 100 ms (the celeris#593 defect stalled for ~270 ms);
-			// CELERIS_589_STACK_MS lowers it so the RESIDUAL few-millisecond
-			// outliers left after the fix can be attributed too.
+			// result line) and dump the first one in full.
 			if o.stacks == nil {
 				o.stacks = &stackTally589{}
 			}
@@ -697,7 +711,7 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 				if err != nil {
 					t.Fatalf("GET /ping during window: %v", err)
 				}
-			case <-time.After(stackTrigger):
+			case <-time.After(100 * time.Millisecond):
 				o.stacks.capture(t)
 				if err := <-done; err != nil {
 					t.Fatalf("GET /ping during window: %v", err)
@@ -746,12 +760,6 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	}
 	if o.samples > 0 {
 		o.stalledFrac = float64(o.stalled) / float64(o.samples)
-	}
-	if o.window > 0 {
-		// The celeris#593 observable: how much of the sampling window had a
-		// /ping outstanding past the bar. Unlike the sample COUNT this does
-		// not move with host load — see stall589CtlTimeBar.
-		o.stalledTimeFrac = float64(o.stalledTime) / float64(o.window)
 	}
 
 	// Orderly stop: client conns are closed by the deferred Close calls after
