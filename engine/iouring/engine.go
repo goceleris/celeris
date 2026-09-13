@@ -51,6 +51,8 @@ type Engine struct {
 		// round-robin cursor for spreading adopts across workers.
 		transplantCount atomic.Uint64
 		transplantRR    atomic.Uint64
+		// recvArm holds the recv-arming witnesses (celeris#586).
+		recvArm recvArmStats
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -287,6 +289,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 			return nil, err
 		}
 		w.transplantCount = &e.metrics.transplantCount // #383 transplant counter
+		w.recvArm = &e.metrics.recvArm                 // #586 recv-arming witnesses
 		workers[i] = w
 	}
 	return workers, nil
@@ -347,6 +350,12 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		CloseCount:         e.metrics.closeCount.Load(),
 		BytesRead:          e.metrics.bytesRead.Load(),
 		BytesWritten:       e.metrics.bytesWritten.Load(),
+
+		RecvResumeWhileCancelPending: e.metrics.recvArm.resumeWhileCancelPending.Load(),
+		RecvResumeWhileRecvInFlight:  e.metrics.recvArm.resumeWhileRecvInFlight.Load(),
+		RecvArmDeclined:              e.metrics.recvArm.armDeclined.Load(),
+		RecvDoubleArmed:              e.metrics.recvArm.doubleArmed.Load(),
+		RecvCQEUnaccounted:           e.metrics.recvArm.cqeUnaccounted.Load(),
 	}
 }
 

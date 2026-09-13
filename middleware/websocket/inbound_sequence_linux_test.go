@@ -129,7 +129,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 				// Handlers must finish before the engine goes away — see settle().
 				var handlerWG sync.WaitGroup
-				addr, shutdown := startNativeServer(t, kind, Config{
+				addr, shutdown, srv := startNativeServerWithHandle(t, kind, Config{
 					CheckOrigin:           func(*celeris.Context) bool { return true },
 					ReadLimit:             256 * 1024,
 					MaxBackpressureBuffer: bpBuf,
@@ -415,6 +415,33 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 				t.Logf("%s: echoWriteErrors=%d slowCloses=%d (>%v, budget %v)",
 					testName, echoErr.Load(), slowClose.Load(), closeHandshakeSlow, closeHandshakeBudget)
+
+				// Recv-arming witnesses (celeris#586), read AFTER settle() so
+				// every worker has left its loop: the counters are direct
+				// atomics, so nothing is left in a per-iteration batch.
+				// RecvResumeWhileCancelPending says the load reached the
+				// celeris#484 window at all; RecvDoubleArmed (a second recv
+				// SQE placed) and RecvCQEUnaccounted (a terminal recv CQE the
+				// bookkeeping did not expect — the kernel-side witness) are
+				// per-event invariants and one event fails the run.
+				if kind == celeris.IOUring {
+					info := srv.EngineInfo()
+					if info == nil {
+						t.Fatalf("%s: EngineInfo() is nil after shutdown; cannot read the recv-arming witnesses", testName)
+					}
+					m := info.Metrics
+					t.Logf("%s: RECVARM bp=%d resumeWhileCancelPending=%d resumeWhileRecvInFlight=%d armDeclined=%d doubleArmed=%d cqeUnaccounted=%d parseErr=%d",
+						testName, bpBuf, m.RecvResumeWhileCancelPending, m.RecvResumeWhileRecvInFlight, m.RecvArmDeclined,
+						m.RecvDoubleArmed, m.RecvCQEUnaccounted, parseErr.Load())
+					if m.RecvDoubleArmed != 0 {
+						t.Errorf("%s: RecvDoubleArmed=%d — a second recv SQE was placed on a connection that already had one (celeris#484)",
+							testName, m.RecvDoubleArmed)
+					}
+					if m.RecvCQEUnaccounted != 0 {
+						t.Errorf("%s: RecvCQEUnaccounted=%d — the kernel completed a recv the engine had not counted (celeris#586)",
+							testName, m.RecvCQEUnaccounted)
+					}
+				}
 				for i := range conns {
 					if connEchoErr[i].Load() != 0 {
 						t.Logf("%s: conn %d echo state: echoed=%d in=%d sent=%d",

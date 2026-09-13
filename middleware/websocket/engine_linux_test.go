@@ -53,6 +53,15 @@ func engineKinds(t *testing.T) []celeris.EngineType {
 // Uses StartWithListener so the test owns the port lifecycle.
 func startNativeServer(tb testing.TB, kind celeris.EngineType, cfg Config) (string, func()) {
 	tb.Helper()
+	addr, shutdown, _ := startNativeServerWithHandle(tb, kind, cfg)
+	return addr, shutdown
+}
+
+// startNativeServerWithHandle is startNativeServer plus the *celeris.Server,
+// for oracles that read engine metrics after shutdown (the engine reference
+// survives shutdown, so EngineInfo() still answers).
+func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Config) (string, func(), *celeris.Server) {
+	tb.Helper()
 	s := celeris.New(celeris.Config{Engine: kind})
 	s.GET("/ws", New(cfg))
 
@@ -70,7 +79,7 @@ func startNativeServer(tb testing.TB, kind celeris.EngineType, cfg Config) (stri
 	return addr, func() {
 		serverCancel()
 		<-done
-	}
+	}, s
 }
 
 // TestNativeEngineEcho exercises the engine-integrated WebSocket path

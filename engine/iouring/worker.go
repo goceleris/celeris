@@ -318,18 +318,21 @@ type Worker struct {
 	// RST as it pauses).
 	listenFDClosed atomic.Bool
 
-	reqCount          *atomic.Uint64
-	activeConns       *atomic.Int64
-	errCount          *atomic.Uint64
-	asyncPromoted     *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
-	acceptCount       *atomic.Uint64 // cumulative accepts (engine-wide, shared)
-	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
-	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
-	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
-	transplantCount   *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
-	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
-	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
-	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
+	reqCount        *atomic.Uint64
+	activeConns     *atomic.Int64
+	errCount        *atomic.Uint64
+	asyncPromoted   *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	acceptCount     *atomic.Uint64 // cumulative accepts (engine-wide, shared)
+	closeCount      *atomic.Uint64 // cumulative closes (engine-wide, shared)
+	bytesRead       *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
+	bytesWritten    *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	transplantCount *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
+	// recvArm is the engine-wide recv-arming witness set (celeris#586);
+	// nil-safe so a bare test Worker literal can skip it.
+	recvArm           *recvArmStats
+	reqBatch          uint64 // batched request count, flushed to reqCount per iteration
+	bytesReadBatch    uint64 // batched recv bytes, flushed to bytesRead per iteration
+	bytesWrittenBatch uint64 // batched send bytes, flushed to bytesWritten per iteration
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -413,6 +416,92 @@ type Worker struct {
 	// own thread after each handleRecv; when set, an idle H1 conn at a clean
 	// boundary is detached and handed to the target epoll engine.
 	transplant atomic.Pointer[transplantTargetHolder]
+}
+
+// recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
+// exported through engine.EngineMetrics so an oracle can read them after
+// Shutdown (celeris#586). They are direct atomic adds, not per-iteration
+// batches like reqBatch: a batch flushed at the top of the loop is lost
+// when the loop returns before its next pass, and these are per-event
+// invariants whose decision rule is "one event refutes". They fire at
+// most a handful of times per run, so the cache-line cost is irrelevant.
+//
+//   - resumeWhileCancelPending: drainDetachQueue took the resume branch
+//     with the pause's ASYNC_CANCEL still marked pending
+//     (recvCancelPending). Over-approximates the window: the flag also
+//     stays set after a cancel that MISSED (see the resume branch).
+//   - resumeWhileRecvInFlight: the subset of those where the cancelled
+//     recv was still armed at the resume. This is the exact window #484
+//     lived in — the only state in which a second arm can land on top of
+//     a kernel-held recv — and the witness that the load reached it.
+//   - armDeclined: prepareRecv was asked to arm while a recv was already
+//     armed and declined (any caller; the #560 guard).
+//   - doubleArmed: connState.recvOutstanding reached 2 — a second recv SQE
+//     was PLACED for one connection, by prepareRecv or flushSendLink's
+//     linked recv. Cannot fire through prepareRecv while the guard holds;
+//     it is the control-build witness.
+//   - cqeUnaccounted: a terminal udRecv CQE reached the live conn (same
+//     generation) while recvOutstanding was already 0 — the kernel held a
+//     recv the bookkeeping did not know about. This is the only witness
+//     independent of recvArmed: a stale-false recvArmed lets the guard pass
+//     a second arm with recvOutstanding going 0→1, never 2, and only the
+//     second terminal CQE exposes it.
+type recvArmStats struct {
+	resumeWhileCancelPending atomic.Uint64
+	resumeWhileRecvInFlight  atomic.Uint64
+	armDeclined              atomic.Uint64
+	doubleArmed              atomic.Uint64
+	cqeUnaccounted           atomic.Uint64
+}
+
+func (s *recvArmStats) noteResumeWhileCancelPending() {
+	if s != nil {
+		s.resumeWhileCancelPending.Add(1)
+	}
+}
+
+func (s *recvArmStats) noteResumeWhileRecvInFlight() {
+	if s != nil {
+		s.resumeWhileRecvInFlight.Add(1)
+	}
+}
+
+func (s *recvArmStats) noteArmDeclined() {
+	if s != nil {
+		s.armDeclined.Add(1)
+	}
+}
+
+func (s *recvArmStats) noteDoubleArmed() {
+	if s != nil {
+		s.doubleArmed.Add(1)
+	}
+}
+
+func (s *recvArmStats) noteCQEUnaccounted() {
+	if s != nil {
+		s.cqeUnaccounted.Add(1)
+	}
+}
+
+// noteRecvPlaced records that a recv SQE was placed for cs at one of the
+// two placement sites (prepareRecv, flushSendLink). Worker-thread-only.
+func (w *Worker) noteRecvPlaced(cs *connState) {
+	cs.recvOutstanding++
+	if cs.recvOutstanding >= 2 {
+		w.recvArm.noteDoubleArmed()
+	}
+}
+
+// noteRecvTerminal records the terminal udRecv CQE for a live cs. A CQE
+// arriving with nothing outstanding is a recv the kernel held that the
+// bookkeeping never counted. Worker-thread-only.
+func (w *Worker) noteRecvTerminal(cs *connState) {
+	if cs.recvOutstanding > 0 {
+		cs.recvOutstanding--
+		return
+	}
+	w.recvArm.noteCQEUnaccounted()
 }
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
@@ -1007,6 +1096,7 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 		if terminalOp {
 			if op == udRecv {
 				cs.recvArmed = false
+				w.noteRecvTerminal(cs)
 			}
 			// KNOWN RESIDUAL — gen-collision misroute. A closed
 			// predecessor's terminal CQE that arrives after this fd was
@@ -3632,6 +3722,7 @@ func (w *Worker) prepareRecv(cs *connState, buf []byte) bool {
 	// caller actually wants — "a recv is armed for this conn" — so none of
 	// them schedules a redundant retry.
 	if cs.recvArmed {
+		w.recvArm.noteArmDeclined()
 		return true
 	}
 	sqe := w.ring.GetSQE()
@@ -3646,6 +3737,7 @@ func (w *Worker) prepareRecv(cs *connState, buf []byte) bool {
 	setSQEUserData(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 	cs.recvArmed = true
 	cs.kernelInflight++
+	w.noteRecvPlaced(cs)
 	return true
 }
 
@@ -3798,6 +3890,23 @@ func (w *Worker) drainDetachQueue() {
 					cs.recvCancelPending = true
 				}
 			} else {
+				// The #484 window: the pause's cancel has not landed yet
+				// and the middleware already withdrew the pause. Counted
+				// BEFORE prepareRecv so the witness is the window itself,
+				// not whether the guard declined (celeris#586).
+				if cs.recvCancelPending {
+					w.recvArm.noteResumeWhileCancelPending()
+					// recvCancelPending stays set when the cancel MISSED
+					// (the recv completed with data before the cancel ran;
+					// the cancel's -ENOENT CQE is dropped as udProvide), so
+					// the count above also includes resumes with nothing in
+					// flight. The narrower witness is a resume with the
+					// cancelled recv still armed: only then can a second arm
+					// be placed on top of it.
+					if cs.recvArmed {
+						w.recvArm.noteResumeWhileRecvInFlight()
+					}
+				}
 				if w.prepareRecv(cs, cs.buf) {
 					cs.needsRecv = false
 				} else {
@@ -4049,6 +4158,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		// the kernel post -ECANCELED for it — still a terminal CQE).
 		cs.recvArmed = true
 		cs.kernelInflight++
+		w.noteRecvPlaced(cs)
 	} else {
 		// Only one SQE slot — unlinked send, can use ZC if available.
 		w.prepSendSQE(sqe, cs, false)
