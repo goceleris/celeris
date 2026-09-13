@@ -82,15 +82,27 @@ func stampValue(s releaseStamp) (string, error) {
 	}
 }
 
-// CheckRelease verifies that every version stamp agrees. With VERSION set
-// (v1.6.0 or 1.6.0) each stamp must equal it; without, they must all equal
-// server.go's Version. CI runs the second form on every PR; the release
-// workflow runs the first before it creates a tag. It also fails while
-// README.md still carries PrepRelease's placeholder.
+// CheckRelease verifies the version stamps.
+//
+// Release mode (VERSION set, v1.6.0 or 1.6.0): every stamp must equal it.
+// The release workflow runs this before it creates a tag.
+//
+// Consistency mode (VERSION unset, what CI runs on every PR): server.go's
+// Version and the README heading must agree, and the four sub-module pins
+// must agree with each other and be either that version (the tree is
+// release-ready) or an older one (between releases). The pins deliberately
+// stay at the LAST RELEASED tag until the final prep PR: a sub-module
+// go.mod that requires an unreleased root version breaks every consumer
+// that pins the sub-module at a pseudo-version (probatorium pins celeris
+// main between releases and hit exactly that on 2026-09-13), because
+// go.mod resolution needs the required version to exist as a tag.
+//
+// Both modes fail while README.md still carries PrepRelease's placeholder.
 func CheckRelease() error {
 	want := stripV(os.Getenv("VERSION"))
 	stamps := releaseStamps()
-	if want == "" {
+	release := want != ""
+	if !release {
 		v, err := stampValue(stamps[0])
 		if err != nil {
 			return err
@@ -101,6 +113,7 @@ func CheckRelease() error {
 		return fmt.Errorf("version %q is not vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N", want)
 	}
 	var bad []string
+	var pins []string
 	for _, s := range stamps {
 		got, err := stampValue(s)
 		if err != nil {
@@ -108,11 +121,24 @@ func CheckRelease() error {
 			continue
 		}
 		mark := "ok  "
-		if got != want {
+		switch {
+		case strings.HasSuffix(s.path, "/go.mod") && !release:
+			pins = append(pins, got)
+			if got != want && !semverLess(got, want) {
+				mark = "MISMATCH"
+				bad = append(bad, fmt.Sprintf("%s pins %s, which is newer than Version %s", s.path, got, want))
+			}
+		case got != want:
 			mark = "MISMATCH"
 			bad = append(bad, fmt.Sprintf("%s carries %s, want %s", s.path, got, want))
 		}
 		fmt.Printf("  %-8s %-32s %s\n", mark, s.path, got)
+	}
+	for _, p := range pins {
+		if p != pins[0] {
+			bad = append(bad, fmt.Sprintf("the sub-module pins disagree with each other (%s): a half-done PrepRelease", strings.Join(pins, ", ")))
+			break
+		}
 	}
 	if b, err := os.ReadFile("README.md"); err == nil && strings.Contains(string(b), readmePlaceholder) {
 		bad = append(bad, "README.md: the What's new section is still the PrepRelease placeholder; write the release prose")
@@ -120,16 +146,57 @@ func CheckRelease() error {
 	if len(bad) > 0 {
 		return fmt.Errorf("release stamps disagree with %s:\n  %s\n(run: VERSION=v%s mage PrepRelease)", want, strings.Join(bad, "\n  "), want)
 	}
-	fmt.Printf("release stamps agree: %s\n", want)
+	if release || len(pins) == 0 || pins[0] == want {
+		fmt.Printf("release stamps agree: %s\n", want)
+	} else {
+		fmt.Printf("stamps consistent: Version %s, sub-module pins at the last release %s (VERSION=v%s mage PrepRelease moves them in the final prep PR)\n", want, pins[0], want)
+	}
 	return nil
+}
+
+// semverLess reports whether a < b for X.Y.Z[-pre.N] strings that already
+// matched semverRe; a pre-release sorts before its release.
+func semverLess(a, b string) bool {
+	pa, pb := semverParts(a), semverParts(b)
+	for i := 0; i < 3; i++ {
+		if pa.num[i] != pb.num[i] {
+			return pa.num[i] < pb.num[i]
+		}
+	}
+	if (pa.pre == "") != (pb.pre == "") {
+		return pa.pre != ""
+	}
+	return pa.pre < pb.pre
+}
+
+type semverKey struct {
+	num [3]int
+	pre string
+}
+
+func semverParts(v string) semverKey {
+	var k semverKey
+	core, pre, _ := strings.Cut(v, "-")
+	for i, f := range strings.SplitN(core, ".", 3) {
+		n := 0
+		for _, c := range f {
+			n = n*10 + int(c-'0')
+		}
+		k.num[i] = n
+	}
+	k.pre = pre
+	return k
 }
 
 // PrepRelease sets every version stamp to VERSION (v1.6.0 or 1.6.0): the
 // Version constant, the four sub-module pins and the README heading. When
 // the README heading moves it leaves a placeholder under the new heading
 // that CheckRelease refuses, so the release prose cannot be forgotten
-// either. Commit the result through a normal PR, then run the Release
-// workflow with the same version; it re-checks everything before tagging.
+// either. Run it in the FINAL PR before the release (it moves the
+// sub-module pins to a tag that does not exist yet, which is only
+// harmless for the short life of that PR; see CheckRelease), then run the
+// Release workflow with the same version; it re-checks everything before
+// tagging.
 func PrepRelease() error {
 	want := stripV(os.Getenv("VERSION"))
 	if !semverRe.MatchString(want) {
