@@ -3159,7 +3159,11 @@ func (w *Worker) finishClose(fd int) {
 		return
 	}
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	sockopts.DrainRecvBuffer(fd)
+	raddr := ""
+	if cs != nil {
+		raddr = cs.remoteAddr
+	}
+	sockopts.CloseDrain(fd, "iouring/finishClose", raddr)
 	_ = unix.Close(fd)
 }
 
@@ -3268,7 +3272,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// io_uring) to avoid the async-SQE pile-up that plagued the pre-patch
 	// version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	sockopts.DrainRecvBuffer(fd)
+	sockopts.CloseDrain(fd, "iouring/finishCloseDetached", cs.remoteAddr)
 	_ = unix.Close(fd)
 }
 

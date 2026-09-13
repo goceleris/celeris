@@ -1,0 +1,16 @@
+TestBackpressureInboundSequenceIntegrity epoll exit=0 elapsed=5s closeProbes=97 inqBeforePos=0
+TestBackpressurePauseDoesNotCancelInflightSend epoll exit=0 elapsed=3s closeProbes=97 inqBeforePos=0
+TestBackpressureInboundSequenceIntegrity io_uring exit=0 elapsed=27s closeProbes=194 inqBeforePos=3
+TestBackpressurePauseDoesNotCancelInflightSend io_uring exit=0 elapsed=22s closeProbes=97 inqBeforePos=2
+== CLOSE-PROBE records with inq_before>0 ==
+CLOSE-PROBE site=iouring/finishCloseDetached fd=156 raddr=127.0.0.1:60326 skip=false inq_before=308700 drained=32768 inq_after=275932 outq=2506752
+CLOSE-PROBE site=iouring/finishCloseDetached fd=108 raddr=127.0.0.1:60136 skip=false inq_before=206336 drained=32768 inq_after=173568 outq=1081344
+CLOSE-PROBE site=iouring/finishCloseDetached fd=163 raddr=127.0.0.1:60616 skip=false inq_before=612772 drained=32768 inq_after=580004 outq=1917108
+CLOSE-PROBE site=iouring/finishCloseDetached fd=184 raddr=127.0.0.1:45824 skip=false inq_before=231212 drained=32768 inq_after=198444 outq=2494728
+CLOSE-PROBE site=iouring/finishCloseDetached fd=157 raddr=127.0.0.1:45880 skip=false inq_before=45815 drained=32768 inq_after=13047 outq=3982661
+== oracle summary lines ==
+epoll: conns=96 framesSent=6092749 framesIn=6092749 seqGaps=0 parseErr=0 overflowErr=0 protocolErrors=0 clientCloseFail=7 closedOK=96 clientRST=0 serverRST=0 closeTimeout=0 dialFail=0 hsFail=0
+io_uring: conns=96 framesSent=5502324 framesIn=5566527 seqGaps=0 parseErr=0 overflowErr=0 protocolErrors=0 clientCloseFail=65 closedOK=92 clientRST=0 serverRST=4 closeTimeout=0 dialFail=0 hsFail=0
+io_uring/multishot_recv: conns=96 framesSent=6144000 framesIn=6144000 seqGaps=0 parseErr=0 overflowErr=0 protocolErrors=0 clientCloseFail=0 closedOK=96 clientRST=0 serverRST=0 closeTimeout=0 dialFail=0 hsFail=0
+epoll: conns=96 protoErr=0 clientCloseFail=0 ecanceled=0 otherWriteErr=0 closedOK=96 clientRST=0 closeTimeout=0 dialFail=0 hsFail=0
+io_uring: conns=96 protoErr=0 clientCloseFail=3 ecanceled=0 otherWriteErr=0 closedOK=93 clientRST=0 closeTimeout=0 dialFail=0 hsFail=0
