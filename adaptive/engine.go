@@ -819,6 +819,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 		AdaptiveSwitches:   e.switchesTotal.Load(),
+		// Both are io_uring-only and additive: a detached conn lives on
+		// exactly one sub-engine, and window closes are cumulative events.
+		DetachedConnections: pm.DetachedConnections + sm.DetachedConnections,
+		DetachWindowCloses:  pm.DetachWindowCloses + sm.DetachWindowCloses,
 	}
 }
 

@@ -53,6 +53,14 @@ type Engine struct {
 		transplantRR    atomic.Uint64
 		// recvArm holds the recv-arming witnesses (celeris#586).
 		recvArm recvArmStats
+		// detachedConns mirrors the sum of the workers' private detachedCount
+		// (one atomic add per detach and per detached close, none per
+		// request); detachWindowCloses counts closes that landed inside the
+		// celeris#549 window (Detach published, deferred count not yet
+		// taken). Both exist so the accounting can be observed from outside
+		// the worker thread (celeris#584).
+		detachedConns      atomic.Int64
+		detachWindowCloses atomic.Uint64
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -290,6 +298,8 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		}
 		w.transplantCount = &e.metrics.transplantCount // #383 transplant counter
 		w.recvArm = &e.metrics.recvArm                 // #586 recv-arming witnesses
+		w.detachedConns = &e.metrics.detachedConns
+		w.detachWindowCloses = &e.metrics.detachWindowCloses
 		workers[i] = w
 	}
 	return workers, nil
@@ -356,6 +366,8 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		RecvArmDeclined:              e.metrics.recvArm.armDeclined.Load(),
 		RecvDoubleArmed:              e.metrics.recvArm.doubleArmed.Load(),
 		RecvCQEUnaccounted:           e.metrics.recvArm.cqeUnaccounted.Load(),
+		DetachedConnections:          e.metrics.detachedConns.Load(),
+		DetachWindowCloses:           e.metrics.detachWindowCloses.Load(),
 	}
 }
 

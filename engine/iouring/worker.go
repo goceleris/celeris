@@ -388,6 +388,14 @@ type Worker struct {
 	detachQSpare   []*connState
 	detachQPending atomic.Int32 // 1 when detachQueue has entries; gates the hot-path drain
 	detachedCount  int          // number of currently-detached conns; gates idle-deadline sweep
+	// detachedConns mirrors detachedCount into an engine-wide atomic so the
+	// accounting is observable off the worker thread; detachWindowCloses
+	// counts closes that land inside the celeris#549 window (Detach
+	// published, deferred increment not yet taken). Engine-wide, shared,
+	// nil-safe (hand-built Workers in unit tests leave them nil). See
+	// celeris#584.
+	detachedConns      *atomic.Int64
+	detachWindowCloses *atomic.Uint64
 
 	// EventLoopProvider state. driverConns is keyed by real FD and is
 	// completely disjoint from the HTTP conns array. hasDriverConns is the
@@ -1622,6 +1630,9 @@ func (w *Worker) initProtocol(cs *connState) {
 			if !w.async {
 				w.detachedCount++
 				cs.detachCounted = true
+				if w.detachedConns != nil {
+					w.detachedConns.Add(1)
+				}
 			} else {
 				cs.asyncDetachPending = true
 			}
@@ -2741,6 +2752,14 @@ func (w *Worker) closeConn(fd int) {
 		}
 		// Signal the detached goroutine's writeFn to stop writing.
 		cs.detachMu.Lock()
+		// celeris#549 window (celeris#584 exposure counter): OnDetach has
+		// published the detach (asyncDetachPending set on the dispatch
+		// goroutine, or inline on this thread in async mode) but the
+		// deferred increment in drainDetachQueue has not run, and it never
+		// will for this conn because the drain skips on detachClosed. Read
+		// under detachMu — the flag is written under it on the promoted
+		// path — and only on the first close of the conn.
+		windowClose := !cs.detachClosed && cs.asyncDetachPending && !cs.detachCounted
 		cs.detachClosed = true
 		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
 		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
@@ -2766,6 +2785,9 @@ func (w *Worker) closeConn(fd int) {
 		// Async mode pre-allocates detachMu in acquireConnState but does
 		// NOT increment detachedCount, so decrementing here would cause
 		// underflow for plain async-HTTP1 conns.
+		if windowClose && w.detachWindowCloses != nil {
+			w.detachWindowCloses.Add(1)
+		}
 		w.releaseDetachedCount(cs)
 	}
 	w.removeDirty(cs)
@@ -3839,6 +3861,9 @@ func (w *Worker) drainDetachQueue() {
 			cs.asyncDetachPending = false
 			w.detachedCount++
 			cs.detachCounted = true
+			if w.detachedConns != nil {
+				w.detachedConns.Add(1)
+			}
 			if !w.h2PollArmed && w.h2EventFD >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()
 			}
@@ -3948,6 +3973,9 @@ func (w *Worker) releaseDetachedCount(cs *connState) {
 	cs.detachCounted = false
 	if w.detachedCount > 0 {
 		w.detachedCount--
+		if w.detachedConns != nil {
+			w.detachedConns.Add(-1)
+		}
 	}
 }
 
