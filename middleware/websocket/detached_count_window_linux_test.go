@@ -71,8 +71,10 @@ import (
 //     sweep cadence (0x1F x 50 ms when > 0, 0x3FF x 100 ms when 0), so a
 //     drifted-to-zero worker reaps ~100 s late; the fixed tree must reap
 //     within IdleTimeout + 1.6 s. Only observable with ReadHeaderTimeout
-//     disabled (-1): the default 10 s slowloris timeout pins the gate to
-//     0x1F and the idle wait to <= 25 ms whatever the count says.
+//     truly disabled: the default 10 s slowloris timeout pins the gate to
+//     0x1F and the idle wait to <= 25 ms whatever the count says, and today
+//     -1 is re-defaulted to 10 s by the engine (see the Config below), so
+//     O3 is a sanity bound, not a discriminator, on both builds.
 //
 // io_uring only (the count is an io_uring worker field); skipped when the
 // engine is unavailable. Runs for ~10 s; skipped under -short.
@@ -112,13 +114,17 @@ func detachedCountWindow(t *testing.T, engine celeris.EngineType) {
 		AsyncHandlers: true,
 		Workers:       dcwWorkers,
 		Logger:        slog.New(slog.NewTextHandler(os.Stderr, nil)),
-		// -1 disables the slowloris header timeout (0 means the 10 s
-		// default). With it enabled the sweep gate is 0x1F and the idle
-		// wait <= 25 ms REGARDLESS of detachedCount (worker.go gate and
-		// adaptiveTimeout), so O3 could not tell a drifted count from a
-		// correct one — measured: the control build reaped every anchor
-		// within 1.3 s under the default. The cadence consequence #549
-		// names exists only when ReadHeaderTimeout is disabled.
+		// -1 is documented to disable the slowloris header timeout (0 means
+		// the 10 s default). With the timeout enabled the sweep gate is 0x1F
+		// and the idle wait <= 25 ms REGARDLESS of detachedCount (worker.go
+		// gate and adaptiveTimeout), so O3 cannot tell a drifted count from
+		// a correct one — measured: the control build reaped every anchor
+		// within 1.3 s. MEASURED TOO: -1 does not survive to the worker
+		// today — Server.doPrepare applies WithDefaults (-1 → 0) and
+		// iouring.New applies it AGAIN (0 → 10 s), so the worker still sees
+		// 10 s (traced w.cfg.ReadHeaderTimeout=10s). Kept so O3 starts to
+		// discriminate once that double normalisation is fixed; until then
+		// O3 is a non-discriminating sanity bound on both builds.
 		ReadHeaderTimeout: -1,
 	})
 	// Adaptive route (inherits AsyncHandlers, no explicit .Async()), like the
