@@ -3858,11 +3858,11 @@ func (w *Worker) drainDetachQueue() {
 // Clearing the flag makes it idempotent: a second close cannot double-count.
 // Worker-thread only, like both increment sites.
 func (w *Worker) releaseDetachedCount(cs *connState) {
-	if !cs.detachCounted {
-		return
-	}
+	// NEGATIVE CONTROL (celeris#584): the pre-#551 inference, restored
+	// verbatim from worker.go before 9fdae20 — decrement whenever the conn
+	// says Detached, whether or not it ever incremented.
 	cs.detachCounted = false
-	if w.detachedCount > 0 {
+	if cs.h1State != nil && cs.h1State.Detached.Load() && w.detachedCount > 0 {
 		w.detachedCount--
 		if w.detachedConns != nil {
 			w.detachedConns.Add(-1)
