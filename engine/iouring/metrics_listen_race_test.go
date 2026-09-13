@@ -60,8 +60,11 @@ func TestMetricsDuringListenIsRaceFree(t *testing.T) {
 		}
 	}()
 
+	// Wait for the count to be published, whatever it is: CI caps io_uring
+	// to a single worker through RLIMIT_MEMLOCK, so the resolved count is
+	// not the requested one, and the race is the same with one worker.
 	deadline := time.Now().Add(5 * time.Second)
-	for e.Metrics().Workers != 4 {
+	for e.Metrics().Workers == 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("workers never published: %+v", e.Metrics())
 		}
