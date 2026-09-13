@@ -72,13 +72,33 @@ so the design can be discussed without a diff attached.
 
 ## Releases
 
-- The maintainer tags **`vX.Y.Z`** on `main` after the
+- A release is **cut by the Release workflow, never by hand**. The
+  maintainer runs it from `main` with the version as input
+  (`gh workflow run release.yml -f version=vX.Y.Z`, or the Actions UI).
+  The workflow checks that every version stamp already says `X.Y.Z`
+  (`mage CheckRelease`: `celeris.Version` in `server.go`, the four
+  `middleware/*/go.mod` pins, the README "What's new" heading), runs the
+  full CI, and only then creates the tag and the GitHub Release. A stale
+  stamp means no tag is created, so there is nothing to undo.
+- Before that, the stamps are moved in one normal PR:
+  `VERSION=vX.Y.Z mage PrepRelease` rewrites all of them and leaves a
+  placeholder under the README heading that `CheckRelease` refuses until
+  the release prose is written. CI runs `mage CheckRelease` on every PR,
+  so the stamps cannot drift apart between releases.
+- The workflow runs only after the
   [goceleris/probatorium](https://github.com/goceleris/probatorium)
   **nightly** validation matrix and the **weekend soak** have passed on
   the release candidate. A release that has not been through both is not
   cut.
-- Sub-module tags (`middleware/<name>/vX.Y.Z`) are created automatically
-  by the release workflow.
+- Sub-module tags (`middleware/<name>/vX.Y.Z`) are created by the same
+  workflow, at the same commit.
+- If a GitHub Release is ever created by hand, the workflow still runs the
+  same checks first and stops before tagging sub-modules or notifying the
+  Go proxy. Recovery: while `https://proxy.golang.org/github.com/goceleris/celeris/@v/vX.Y.Z.info`
+  still answers 404 nobody has fetched the version and
+  `gh release delete vX.Y.Z --cleanup-tag` is harmless; once the proxy
+  has served it the version is burned, and the fix ships as the next
+  patch version.
 - **Release notes are generated from PR labels** (`breaking`, `security`,
   `bug`, `performance`, `enhancement`; see
   [`.github/release.yml`](.github/release.yml)) plus hand-written

@@ -3,7 +3,7 @@ module github.com/goceleris/celeris/middleware/metrics
 go 1.27.0
 
 require (
-	github.com/goceleris/celeris v1.5.8
+	github.com/goceleris/celeris v1.6.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/common v0.71.0

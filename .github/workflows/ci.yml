@@ -39,6 +39,13 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: mage compiles
         run: mage -compile /tmp/mage-compile-check
+      # Every hand-written version stamp (server.go Version, the sub-module
+      # pins, the README heading) must agree; the release workflow refuses to
+      # tag while they disagree with the tag, and this refuses a PR that
+      # leaves them disagreeing with each other. `VERSION=vX.Y.Z mage
+      # PrepRelease` moves all of them at once.
+      - name: Release stamps agree
+        run: mage CheckRelease
 
       - name: Lint root module
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0

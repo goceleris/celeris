@@ -23,10 +23,9 @@ Full documentation lives at [goceleris.dev](https://goceleris.dev).
 - **First-party event-loop drivers** — native PostgreSQL, Redis, and memcached clients that colocate socket I/O with your handlers, no CGo, no separate reactor.
 - **Continuously validated** — an adversarial [probatorium](https://github.com/goceleris/probatorium) cluster matrix runs nightly, plus a deeper weekend soak; see the badges above.
 
-## What's new in v1.5.8
+## What's new in v1.6.0
 
-A correctness-focused release. Three concurrency fixes on the WebSocket and engine paths: a WebSocket-upgrade crash (a `chanReader` send-on-closed-channel panic when a peer RSTs mid-upgrade, now redesigned around a single-close done-channel), a Context/stream use-after-recycle in the epoll and io_uring engines during async upgrade, and HTTP/2 write-queue plus overload-manager hardening. Validated with a clean 24h weekend soak on both amd64 and arm64 (zero high-severity invariant violations), and an interleaved A/B benchmark confirming no throughput regression versus v1.5.7.
-
+An engine-correctness release, driven by what the [probatorium](https://github.com/goceleris/probatorium) matrix found rather than by features. io_uring: the async-mode teardown and transplant paths were audited end to end and fixed (dead connection states left on the dirty list, a ring SEND still in flight when a connection was handed to epoll, short-submit accounting, detached-count drift, a pause/resume that armed a second recv and corrupted WebSocket streams, `Metrics` racing `Listen`), live heap retained on the refapp that serves both WebSocket and SSE, and a SEND_ZC probe that could never detect copy fallback. epoll: receive drains are bounded. All engines: bytes arriving on a detached connection are no longer parsed as a new request, detached WebSocket connections get a liveness bound, and the HTTP/2 worker pool no longer starves later streams once every worker holds a streaming handler. The std engine regained the h2c Upgrade handshake, so the three engines agree again. Middleware: the rate limiter's eviction actually runs, `basicauth` hashes with a salt, and struct request binding with validation is new. Dependencies: `golang.org/x/net` 0.59.
 ## Features
 
 - **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept/recv, provided buffers, SQ poll, fixed files) for your kernel.
