@@ -271,6 +271,12 @@ type connState struct {
 	// The close paths use it to target an ASYNC_CANCEL at the armed
 	// recv's exact generation-tagged user_data. Worker-thread-only.
 	recvArmed bool
+	// recvOutstanding counts recv SQEs placed for this conn (prepareRecv,
+	// flushSendLink's linked recv) minus terminal udRecv CQEs dispatched
+	// to it. Mirrors recvArmed as a count so a second placement (2) and a
+	// terminal CQE with nothing outstanding (0) are each observable —
+	// see Worker.recvArm (celeris#586). Worker-thread-only.
+	recvOutstanding int8
 }
 
 var connStatePool = sync.Pool{
@@ -407,6 +413,7 @@ func releaseConnState(cs *connState) {
 	// where the worker gave up waiting on a CQE the kernel never produced.
 	cs.kernelInflight = 0
 	cs.recvArmed = false
+	cs.recvOutstanding = 0
 	cs.fd = 0
 	cs.liveIdx = -1
 	connStatePool.Put(cs)

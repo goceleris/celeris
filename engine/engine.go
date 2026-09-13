@@ -136,4 +136,32 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// correlate a throughput or tail-latency anomaly with switching activity
 	// (a rare switch transient can skew a single benchmark pass).
 	AdaptiveSwitches uint64
+	// RecvResumeWhileCancelPending is the cumulative number of times the
+	// io_uring engine processed a WebSocket backpressure resume while the
+	// pause's ASYNC_CANCEL was still in flight — the exact window in which
+	// celeris#484 armed a second recv. Zero on other engines. A load that
+	// never moves it has not exercised the #560 guard (celeris#586).
+	RecvResumeWhileCancelPending uint64
+	// RecvResumeWhileRecvInFlight is the subset of RecvResumeWhileCancelPending
+	// in which the cancelled recv was still armed when the resume was
+	// processed — the only state in which a second recv could be placed on
+	// top of a kernel-held one. RecvResumeWhileCancelPending also counts
+	// resumes after a cancel that missed (the recv completed first), so this
+	// is the witness that the celeris#484 window was actually reached.
+	RecvResumeWhileRecvInFlight uint64
+	// RecvArmDeclined is the cumulative number of recv arms the io_uring
+	// engine declined because a recv was already armed on that connection
+	// (the #560 guard, any caller). Zero on other engines.
+	RecvArmDeclined uint64
+	// RecvDoubleArmed is the cumulative number of times a second recv SQE
+	// was placed for one io_uring connection while the first was still
+	// outstanding — the celeris#484 defect itself, as bookkept in
+	// userspace. Must stay 0. Zero on other engines.
+	RecvDoubleArmed uint64
+	// RecvCQEUnaccounted is the cumulative number of terminal recv
+	// completions the io_uring engine received for a live connection that
+	// had no recv outstanding in its bookkeeping — a kernel-held recv the
+	// engine lost track of, the only witness of a double recv that the
+	// userspace guard cannot see. Must stay 0. Zero on other engines.
+	RecvCQEUnaccounted uint64
 }
