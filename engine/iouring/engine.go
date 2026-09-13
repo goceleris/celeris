@@ -328,9 +328,15 @@ func fallbackTier(current TierStrategy) TierStrategy {
 
 // Shutdown is a no-op for the io_uring engine — graceful shutdown is
 // driven by context cancellation on Listen's parent context. Workers
-// exit their run loops on ctx.Done and call Worker.shutdown, which
-// joins async dispatch goroutines via asyncWG. See epoll engine
+// exit their run loops on ctx.Done, drain the responses still queued for
+// the ring (Worker.hasPendingSends, celeris#595) and call Worker.shutdown,
+// which joins async dispatch goroutines via asyncWG. See epoll engine
 // Shutdown for the same rationale.
+//
+// That parent context is always cancellable: every Server.Start* entry
+// point owns one and Server.Shutdown cancels it after the graceful phase.
+// Handing Listen a context.Background() is what made Start hang here
+// (celeris#595), since this method cannot wake it.
 func (e *Engine) Shutdown(_ context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
