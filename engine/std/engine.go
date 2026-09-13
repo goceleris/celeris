@@ -88,18 +88,59 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	}
 
 	e.server = &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           httpHandler,
-		ReadTimeout:       cfg.ReadTimeout,
-		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
-		WriteTimeout:      cfg.WriteTimeout,
-		IdleTimeout:       cfg.IdleTimeout,
+		Addr:    cfg.Addr,
+		Handler: httpHandler,
+		// stdTimeout, not the raw value: celeris carries "disabled" as 0
+		// and net/http does NOT read 0 as disabled on every field. See
+		// stdTimeout (celeris#594).
+		ReadTimeout:       stdTimeout(cfg.ReadTimeout),
+		ReadHeaderTimeout: stdTimeout(cfg.ReadHeaderTimeout),
+		WriteTimeout:      stdTimeout(cfg.WriteTimeout),
+		IdleTimeout:       stdTimeout(cfg.IdleTimeout),
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 		ConnState:         e.connStateHook,
 		BaseContext:       func(net.Listener) context.Context { return e.baseCtx },
 	}
 
 	return e, nil
+}
+
+// stdTimeout translates celeris's internal "disabled" encoding into the value
+// net/http actually treats as disabled for the field it is assigned to.
+//
+// resource.Config.WithDefaults resolves the documented -1 "no timeout"
+// sentinel to 0, because 0 is what every celeris consumer reads as off (the
+// `> 0` guards in the iouring and epoll loops). net/http is not uniform about
+// 0 (go1.27 src/net/http/server.go):
+//
+//	ReadTimeout        zero OR negative => no timeout
+//	                   (readRequest, server.go:1039: `if d := c.server.ReadTimeout; d > 0`)
+//	WriteTimeout       zero OR negative => no timeout
+//	                   (readRequest, server.go:1042: `if d := c.server.WriteTimeout; d > 0`)
+//	ReadHeaderTimeout  zero => FALL BACK TO ReadTimeout; negative => no timeout
+//	                   (Server.readHeaderTimeout, server.go:3752, consumed at
+//	                   server.go:2038 and :2177 with `d > 0`)
+//	IdleTimeout        zero => FALL BACK TO ReadTimeout; negative => no timeout
+//	                   (Server.idleTimeout, server.go:3745, consumed at
+//	                   server.go:2163 with `d > 0`)
+//
+// So a 0 ReadHeaderTimeout next to the 60s default ReadTimeout is not
+// "disabled", it is "60s" — which is exactly how celeris#594 survived into the
+// std engine after WithDefaults was made idempotent: the sentinel reached
+// http.Server as 0 and net/http quietly re-armed it from ReadTimeout. The same
+// holds for IdleTimeout.
+//
+// Mapping to -1 is safe on all four fields: every consumption site listed
+// above guards with `d > 0`, so a negative value is never turned into a
+// deadline — it only ever means "no timeout", and on ReadHeaderTimeout and
+// IdleTimeout it additionally suppresses the ReadTimeout fallback. Using the
+// same encoding for all four keeps the intent legible rather than relying on
+// two fields happening to accept 0.
+func stdTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return -1 // net/http: a negative duration is "no timeout" on all four fields
+	}
+	return d
 }
 
 // Listen starts the server and blocks until the context is canceled or an error occurs.
