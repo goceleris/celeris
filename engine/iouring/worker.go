@@ -1234,26 +1234,24 @@ func (w *Worker) handleHeaderTimer(fd int) {
 	if cs.closing {
 		return
 	}
-	// Snapshot under detachMu — same TOCTOU as checkTimeouts (celeris#548):
-	// switchToH2Local nils cs.h1State under this lock on the dispatch
-	// goroutine, so a check here followed by a dereference below can take a
-	// nil pointer. Released immediately; the close path below takes the same
-	// mutex.
-	var dl int64
-	var haveH1 bool
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-	}
-	if h1 := cs.h1State; h1 != nil {
-		haveH1 = true
-		dl = h1.HeaderDeadlineNs.Load()
-	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Unlock()
-	}
-	if !haveH1 {
+	// Snapshot under detachMu — same TOCTOU as checkTimeouts (celeris#548) and
+	// the same TryLock for the same reason (celeris#593): this runs on the
+	// LockOSThread'd worker, and runAsyncHandler holds detachMu for the whole
+	// of ProcessH1. See snapshotH1Deadlines.
+	snap, ok := snapshotH1Deadlines(cs)
+	if !ok {
+		// detachMu held ⇒ the conn is inside its handler, not waiting for a
+		// request line, so the header deadline cannot be live. Dropping this
+		// timer costs nothing: checkTimeouts re-reads HeaderDeadlineNs on its
+		// ~50ms slowloris cadence and is the documented fallback for a timer
+		// that failed to arm. Re-arming here instead would spin — the spec's
+		// deadline has already passed, so the fresh timer would fire at once.
 		return
 	}
+	if !snap.haveH1 {
+		return
+	}
+	dl := snap.hdrDL
 	if dl == 0 {
 		// Headers completed before the timer fired; no-op. The next
 		// ArmHeaderDeadline (keep-alive next request) will submit a
@@ -4244,6 +4242,68 @@ func (w *Worker) removeLiveConn(cs *connState) {
 	cs.liveIdx = -1
 }
 
+// h1DeadlineSnapshot is the set of cs.h1State fields the two worker-thread
+// timeout paths (checkTimeouts and handleHeaderTimer) base their decision on.
+type h1DeadlineSnapshot struct {
+	haveH1   bool
+	detached bool
+	idleDL   int64
+	hdrDL    int64
+}
+
+// snapshotH1Deadlines copies those fields out of cs.h1State under cs.detachMu
+// and releases the lock before returning, so the caller can act (closeConn
+// takes the same mutex, so holding it across the call would deadlock).
+//
+// Taking the lock at all is the celeris#548 invariant: the async dispatch
+// goroutine's switchToH2Local calls conn.CloseH1(cs.h1State) and then nils
+// cs.h1State under this same lock, so testing the pointer and dereferencing
+// it again outside the lock is a TOCTOU — the pointer can go nil between the
+// two reads and the event loop takes a nil dereference. That invariant is
+// stated twice elsewhere in this file and is UNCHANGED here: every read below
+// still happens with the lock held. (An atomic shadow copy of the pointer
+// would not preserve it — the loser of the race would dereference an H1State
+// that CloseH1 has already recycled.)
+//
+// ok=false means the lock was held by someone else and NOTHING was read: this
+// uses TryLock, not Lock (celeris#593). runAsyncHandler holds cs.detachMu
+// across the whole of ProcessH1, i.e. for the entire handler call, so a
+// blocking Lock on the worker thread parks the LockOSThread'd worker — and
+// therefore every other connection it owns — until a slow async handler
+// returns. Measured on the celeris#589 rig: with a 300 ms handler on an
+// explicitly .Async() route, an unrelated /ping on the same worker was stalled
+// for 270 ms of every 300 ms (stalled_frac 0.30-0.33 in 40/40 runs) and 99/99
+// stalled samples showed a worker goroutine in checkTimeouts →
+// sync.Mutex.Lock; epoll scored 0/40 because its sweep reads h1State without
+// a lock.
+//
+// Skipping the connection for this pass is correct, not merely cheaper.
+// detachMu is held exactly while the dispatch goroutine is inside the handler
+// (or inside a guarded egress write) — i.e. while the connection is demonstrably
+// active — and none of the deadlines the callers evaluate govern a request that
+// is executing: the idle and read deadlines are measured between requests, and
+// the header deadline is only non-zero while the connection is waiting for a
+// request line, which is not a moment at which a handler can hold the lock.
+// The sweep re-runs every ~50-100 ms (the 0x1F/0x3FF gate in run()), so the
+// worst case is one sweep period of extra timeout latency on a connection that
+// is by definition not idle. A connection with no detachMu is read directly.
+func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
+	mu := cs.detachMu
+	if mu != nil {
+		if !mu.TryLock() {
+			return snap, false
+		}
+		defer mu.Unlock()
+	}
+	if h1 := cs.h1State; h1 != nil {
+		snap.haveH1 = true
+		snap.detached = h1.Detached.Load()
+		snap.idleDL = h1.IdleDeadlineNs.Load()
+		snap.hdrDL = h1.HeaderDeadlineNs.Load()
+	}
+	return snap, true
+}
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms). This
 // replaces the timer wheel: instead of allocating entries and updating maps
@@ -4308,29 +4368,17 @@ func (w *Worker) checkTimeouts() {
 		// I/O lifecycle. Async-mode conns set detachMu up front without
 		// a real detach — fall through to the normal timeout scan for
 		// those.
-		// Snapshot h1State under detachMu (celeris#548). The async dispatch
-		// goroutine's switchToH2Local nils cs.h1State under this same lock,
-		// so testing it and then dereferencing it again is a TOCTOU: the
-		// pointer can go nil between the two reads and the event loop takes
-		// a nil dereference. This is the invariant stated twice elsewhere in
-		// this file, at the two sites where it was already fixed.
-		//
-		// The lock is RELEASED before acting: closeConn takes the same
-		// mutex, so holding it across the call would deadlock. Everything
-		// the decision needs is copied out first.
-		var h1Detached bool
-		var idleDL, hdrDL int64
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
+		// Snapshot h1State under detachMu (celeris#548), with TryLock so a
+		// slow async handler holding that lock across ProcessH1 cannot pin
+		// this worker (celeris#593). Both rules, and why skipping is the
+		// correct outcome, are on snapshotH1Deadlines.
+		snap, ok := snapshotH1Deadlines(cs)
+		if !ok {
+			// detachMu held: the conn is inside its handler, so none of the
+			// deadlines below apply to it right now. Re-examined next sweep.
+			continue
 		}
-		if h1 := cs.h1State; h1 != nil {
-			h1Detached = h1.Detached.Load()
-			idleDL = h1.IdleDeadlineNs.Load()
-			hdrDL = h1.HeaderDeadlineNs.Load()
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
+		h1Detached, idleDL, hdrDL := snap.detached, snap.idleDL, snap.hdrDL
 
 		// engine-config-driven timeouts do not apply to a detached conn —
 		// the middleware owns its I/O lifecycle.
