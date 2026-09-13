@@ -70,6 +70,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
+          cache: false # zizmor cache-poisoning: a release workflow must not restore a cache anyone could have written
       - name: Install mage
         run: |
           go install github.com/magefile/mage@v1.17.2
