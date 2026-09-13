@@ -2,7 +2,6 @@ package conformance
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -13,8 +12,6 @@ import (
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
-
-	"golang.org/x/net/http2"
 )
 
 // testHandler is a simple echo handler for conformance testing.
@@ -140,12 +137,8 @@ func clientForProto(proto engine.Protocol) *http.Client {
 	if proto == engine.H2C {
 		return &http.Client{
 			Timeout: 5 * time.Second,
-			Transport: &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, network, addr)
-				},
+			Transport: &http.Transport{
+				Protocols: h2cOnly(),
 			},
 		}
 	}
@@ -184,4 +177,13 @@ func sendRequestProto(t *testing.T, addr, method, path string, body io.Reader, p
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	return resp
+}
+
+// h2cOnly makes an http.Transport speak prior-knowledge cleartext HTTP/2
+// and nothing else: the stdlib replacement for the deprecated
+// http2.Transport{AllowHTTP: true} shape.
+func h2cOnly() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return p
 }

@@ -5,7 +5,6 @@ package sse_test
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -15,8 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
 
 	"github.com/goceleris/celeris"
 	celerisengine "github.com/goceleris/celeris/engine"
@@ -195,7 +192,7 @@ func openSSEStream(tb testing.TB, addr string) (net.Conn, *bufio.Reader) {
 
 // openSSEStreamH2C is openSSEStream over prior-knowledge h2c. It builds a
 // transport per client so every stream gets its own TCP connection (an
-// http2.Transport would otherwise multiplex all 32 onto one, and killing
+// an HTTP/2 transport would otherwise multiplex all 32 onto one, and killing
 // that conn would prove nothing about a single stream), and hands back the
 // raw conn the dialer produced so the caller can RST or half-close it the
 // same way as an H1 client. The returned closer shuts the transport's idle
@@ -203,7 +200,7 @@ func openSSEStream(tb testing.TB, addr string) (net.Conn, *bufio.Reader) {
 // leak assertion.
 //
 // The open is bounded by a request context, NOT by a read deadline on the raw
-// conn: http2.Transport keeps a persistent read loop over that socket for the
+// conn: the HTTP/2 transport keeps a persistent read loop over that socket for the
 // life of the stream, so an absolute deadline would reset the stream from the
 // client side and the server would cancel the handler through handleRSTStream
 // — a different path from the one under test, and a false pass or a flake
@@ -211,9 +208,11 @@ func openSSEStream(tb testing.TB, addr string) (net.Conn, *bufio.Reader) {
 func openSSEStreamH2C(tb testing.TB, addr string) (net.Conn, *bufio.Reader, func()) {
 	tb.Helper()
 	var raw net.Conn
-	tr := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+	h2only := new(http.Protocols)
+	h2only.SetUnencryptedHTTP2(true)
+	tr := &http.Transport{
+		Protocols: h2only,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			c, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, network, addr)
 			if err == nil {
 				raw = c
@@ -222,7 +221,7 @@ func openSSEStreamH2C(tb testing.TB, addr string) (net.Conn, *bufio.Reader, func
 		},
 	}
 	// Bound the OPEN with a request context, never with a read deadline on
-	// the raw conn. http2.Transport runs a persistent read loop over that
+	// the raw conn. The HTTP/2 transport runs a persistent read loop over that
 	// socket for the life of the stream, so an absolute SetReadDeadline
 	// kills the connection N seconds after dial no matter how healthy it
 	// is -- and an SSE stream is deliberately held open far longer than

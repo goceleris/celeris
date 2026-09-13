@@ -5,7 +5,6 @@ package adaptive
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -15,8 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/probe"
@@ -209,9 +206,9 @@ func h1Client(addr string, stop <-chan struct{}, ok, errc *atomic.Int64) {
 // issuing one request at a time over it until stop. Each client owns its own
 // Transport, so it maps to exactly one TCP connection.
 func h2cClient(addr string, stop <-chan struct{}, ok, errc *atomic.Int64) {
-	tr := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, a string, _ *tls.Config) (net.Conn, error) {
+	tr := &http.Transport{
+		Protocols: unencryptedHTTP2Only(),
+		DialContext: func(ctx context.Context, network, a string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, a)
 		},
@@ -513,4 +510,13 @@ func TestRampAutoMixedAsync(t *testing.T) {
 	if h2.errc.Load() > 0 {
 		t.Errorf("h2 conns broke across switches: %d errors (want 0 — non-transplantable conns must survive)", h2.errc.Load())
 	}
+}
+
+// unencryptedHTTP2Only makes an http.Transport speak prior-knowledge
+// cleartext HTTP/2 (h2c) and nothing else, the stdlib replacement for the
+// deprecated http2.Transport{AllowHTTP: true} shape.
+func unencryptedHTTP2Only() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return p
 }

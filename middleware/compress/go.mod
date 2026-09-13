@@ -9,9 +9,9 @@ require (
 )
 
 require (
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
 
 // In the monorepo, build against the in-tree celeris core so submodule
