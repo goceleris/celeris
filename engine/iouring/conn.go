@@ -135,6 +135,33 @@ type connState struct {
 
 	lastActivity int64 // nanosecond timestamp of last I/O activity (for timeout checks)
 
+	// recvStallSince is the nanosecond timestamp at which this connection
+	// entered a recv-arming stall: needsRecv set (an arm was dropped on a
+	// full SQ ring), not paused, no recv in the kernel, and the dirty-list
+	// retry declining to act because a SEND is still outstanding. Zero
+	// when no stall is open. Worker-thread only — every read and write
+	// sits on the event loop, next to cs.needsRecv itself. It exists only
+	// to time the episode for the celeris#607 witnesses; the arming
+	// decision never reads it.
+	recvStallSince int64
+
+	// lastRecvCQE / stallReported / pausesApplied back the silence
+	// watchdog (CELERIS_DEBUG_RECV_STALL). lastRecvCQE is stamped on every
+	// recv completion, stallReported keeps the watchdog to one record per
+	// connection, and pausesApplied counts the backpressure pauses the
+	// worker actually applied to it. All worker-thread-only, and all
+	// written only while the probe gate is on.
+	// linkArmedAt is when flushSendLink chained a RECV behind a SEND on
+	// this connection, or 0 when no chain is outstanding. Worker-thread
+	// only. The kernel will not start that recv until the send completes,
+	// so the interval from here to the send's completion is time the
+	// connection provably could not receive (celeris#607).
+	linkArmedAt int64
+
+	lastRecvCQE   int64
+	stallReported bool
+	pausesApplied uint32
+
 	h1State      *conn.H1State
 	h2State      *conn.H2State
 	ctx          context.Context
@@ -403,6 +430,11 @@ func releaseConnState(cs *connState) {
 	cs.sendIsZC = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
+	cs.recvStallSince = 0
+	cs.linkArmedAt = 0
+	cs.lastRecvCQE = 0
+	cs.stallReported = false
+	cs.pausesApplied = 0
 	cs.detachMu = nil
 	cs.detachClosed = false
 	cs.recvPaused = false

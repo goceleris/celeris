@@ -351,6 +351,11 @@ type Worker struct {
 	// rather than an atomic add because completeSend IS the per-request
 	// send path (celeris#591).
 	ringBytesBatch uint64
+	// linkArmBatch is the batched count of SEND→RECV chains armed by
+	// flushSendLink, flushed to recvArm.linkedRecvArms once per event-loop
+	// iteration alongside reqBatch. flushSendLink IS the per-request send
+	// path, so the witness must not put an atomic on it (celeris#607).
+	linkArmBatch uint64
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -479,12 +484,49 @@ type Worker struct {
 //     independent of recvArmed: a stale-false recvArmed lets the guard pass
 //     a second arm with recvOutstanding going 0→1, never 2, and only the
 //     second terminal CQE exposes it.
+//
+// The last four are the celeris#607 witnesses — the inbound direction of
+// the same arming machinery, where the failure is a recv that is never
+// re-armed rather than one armed twice:
+//
+//   - sqFullRecv: prepareRecv could not get an SQE. That is the only way
+//     cs.needsRecv is ever set, so it bounds every stall below.
+//   - stallEpisodes: a dirty connection that wanted a recv arm was passed
+//     over by the dirty-list retry because a SEND was still outstanding.
+//     Counted once per episode, on the transition into it, not once per
+//     event-loop pass: the loop revisits a dirty conn thousands of times a
+//     second and a per-pass counter would be both meaningless and hot.
+//   - stallNanos / stallMaxNanos: the cumulative and worst-case wall time
+//     those episodes lasted, measured from the first skipped pass to the
+//     arm (or to the connection leaving the dirty list). The maximum is
+//     the discriminating number: a stall that outlives the peer's read
+//     budget is a connection that went silent, not one that went slow.
+//   - linkedRecvArms / linkedRecvBlockedNanos / linkedRecvBlockedMax: the
+//     OTHER way inbound can be made hostage to outbound, and the one that
+//     actually fires. flushSendLink chains the next RECV behind the SEND
+//     with IOSQE_IO_LINK, so the kernel does not start the recv until the
+//     send completes. Measured at the send's completion, while the chained
+//     recv is provably still queued (cs.recvLinked is cleared only by that
+//     recv's own CQE), so the interval is the coupling itself and not the
+//     peer's idleness. The maximum is again the number that matters: a
+//     request/response cycle pays microseconds, a peer that stopped
+//     reading makes it seconds. Arms are batched per event-loop iteration
+//     and waits are only recorded past linkBlockedFloorNanos, because
+//     flushSendLink and the send completion are both the per-request hot
+//     path and neither may grow an atomic or a clock read.
 type recvArmStats struct {
 	resumeWhileCancelPending atomic.Uint64
 	resumeWhileRecvInFlight  atomic.Uint64
 	armDeclined              atomic.Uint64
 	doubleArmed              atomic.Uint64
 	cqeUnaccounted           atomic.Uint64
+	sqFullRecv               atomic.Uint64
+	stallEpisodes            atomic.Uint64
+	stallNanos               atomic.Uint64
+	stallMaxNanos            atomic.Uint64
+	linkedRecvArms           atomic.Uint64
+	linkedRecvBlockedNanos   atomic.Uint64
+	linkedRecvBlockedMax     atomic.Uint64
 }
 
 // zcStats are the SEND_ZC exposure witnesses behind celeris#585 (the
@@ -573,6 +615,80 @@ func (s *recvArmStats) noteCQEUnaccounted() {
 	if s != nil {
 		s.cqeUnaccounted.Add(1)
 	}
+}
+
+// linkBlockedFloorNanos is the shortest linked-recv wait the celeris#607
+// witness records. Below it the chain resolved inside an event-loop pass,
+// which is the whole point of the chain; above it the connection was
+// genuinely unable to read for that long.
+const linkBlockedFloorNanos = int64(time.Millisecond)
+
+func (s *recvArmStats) noteSQFullRecv() {
+	if s != nil {
+		s.sqFullRecv.Add(1)
+	}
+}
+
+// noteStallEnd folds one completed recv-arming stall into the totals and
+// the running maximum. The CAS loop is the only unbounded work in the
+// witness, and it runs once per episode, off the per-request path.
+func (s *recvArmStats) noteStallEnd(d int64) {
+	if s == nil || d <= 0 {
+		return
+	}
+	n := uint64(d)
+	s.stallNanos.Add(n)
+	for {
+		cur := s.stallMaxNanos.Load()
+		if n <= cur || s.stallMaxNanos.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// noteLinkedRecvBlocked folds one linked-recv wait into the totals and the
+// running maximum, exactly as noteStallEnd does for the dirty-list stall.
+func (s *recvArmStats) noteLinkedRecvBlocked(d int64) {
+	if s == nil || d <= 0 {
+		return
+	}
+	n := uint64(d)
+	s.linkedRecvBlockedNanos.Add(n)
+	for {
+		cur := s.linkedRecvBlockedMax.Load()
+		if n <= cur || s.linkedRecvBlockedMax.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// beginRecvStall opens a recv-arming stall episode on cs if one is not
+// already open. Called from the dirty-list retry when it declines to act
+// on a connection whose recv arm is owed, so the clock read happens once
+// per episode and not once per pass (celeris#607).
+func (w *Worker) beginRecvStall(cs *connState) {
+	if cs.recvStallSince != 0 {
+		return
+	}
+	cs.recvStallSince = time.Now().UnixNano()
+	if w.recvArm != nil {
+		w.recvArm.stallEpisodes.Add(1)
+	}
+}
+
+// endRecvStall closes an open stall episode on cs. Called wherever the
+// stall can be resolved: the arm lands, the conn is paused, or the conn
+// leaves the dirty list (including teardown, via removeDirty). No-op when
+// nothing is open, which is the overwhelmingly common case — one branch on
+// a worker-local int64.
+func (w *Worker) endRecvStall(cs *connState) {
+	if cs.recvStallSince == 0 {
+		return
+	}
+	d := time.Now().UnixNano() - cs.recvStallSince
+	cs.recvStallSince = 0
+	w.recvArm.noteStallEnd(d)
+	recvStallProbe(cs, d)
 }
 
 // noteRecvPlaced records that a recv SQE was placed for cs at one of the
@@ -1055,6 +1171,13 @@ func (w *Worker) run(ctx context.Context) {
 			w.zc.noteRingBytes(w.ringBytesBatch)
 			w.ringBytesBatch = 0
 		}
+		// Same cadence for the celeris#607 link-arm exposure witness.
+		if w.linkArmBatch > 0 {
+			if w.recvArm != nil {
+				w.recvArm.linkedRecvArms.Add(w.linkArmBatch)
+			}
+			w.linkArmBatch = 0
+		}
 
 		// Single atomic publish for all batched buffer returns (P0).
 		if w.hasBufReturns {
@@ -1098,7 +1221,16 @@ func (w *Worker) run(ctx context.Context) {
 		// (SQ ring was full earlier). Typically empty under normal load.
 		for cs := w.dirtyHead; cs != nil; {
 			next := cs.dirtyNext
-			if !cs.sending {
+			if cs.sending {
+				// celeris#607 witness. The retry below is gated on the
+				// send, so a connection that is owed a recv arm and has a
+				// SEND outstanding is passed over entirely — for as long
+				// as the send stays outstanding, which under a slow peer
+				// is seconds. Time the episode, once, on the way in.
+				if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
+					w.beginRecvStall(cs)
+				}
+			} else {
 				if mu := cs.detachMu; mu != nil {
 					mu.Lock()
 				}
@@ -1125,6 +1257,9 @@ func (w *Worker) run(ctx context.Context) {
 					}
 				}
 				canRemove := !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && (!cs.needsRecv || cs.recvPaused)
+				if !cs.needsRecv || cs.recvPaused || cs.recvArmed {
+					w.endRecvStall(cs)
+				}
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
@@ -2092,6 +2227,9 @@ func (w *Worker) switchToH2Local(cs *connState) error {
 
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	cs := w.conns[fd]
+	if recvStallProbeActive && cs != nil {
+		cs.lastRecvCQE = now
+	}
 	if cs == nil || cs.closing {
 		// If multishot recv with provided buffers, batch-return the buffer
 		// even for unknown/closing connections to prevent buffer leak (P0).
@@ -2872,6 +3010,25 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 		defer mu.Unlock()
 	}
 	cs.sending = false
+	// celeris#607 witness. cs.recvLinked is cleared only when the chained
+	// recv's own CQE is processed, and that recv cannot run before this
+	// send completes — so reaching here with it still set means the recv
+	// was queued behind this send for the whole interval, and that is how
+	// long the connection was unable to read.
+	//
+	// `now` is the loop's cached clock, not a fresh vDSO read, and the
+	// atomics are behind linkBlockedFloorNanos. A healthy request/response
+	// send completes inside one loop pass, so the hot path pays one
+	// subtract and one compare and never reaches the counters; only a send
+	// that actually held its recv for a millisecond or more is recorded.
+	if cs.recvLinked && cs.linkArmedAt != 0 {
+		blocked := now - cs.linkArmedAt
+		cs.linkArmedAt = 0
+		if blocked >= linkBlockedFloorNanos {
+			w.recvArm.noteLinkedRecvBlocked(blocked)
+			linkedRecvProbe(cs, blocked)
+		}
+	}
 
 	if fromZC && (sent == -int(unix.ENOMEM) || sent == -int(unix.EINVAL)) {
 		// SEND_ZC pins the user buffer against RLIMIT_MEMLOCK. A host with
@@ -2975,6 +3132,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 		if cs.needsRecv && !cs.recvPaused {
 			if w.prepareRecv(cs, cs.buf) {
 				cs.needsRecv = false
+				w.endRecvStall(cs)
 			} else {
 				w.markDirty(cs)
 				return
@@ -4021,6 +4179,10 @@ func (w *Worker) prepareRecv(cs *connState, buf []byte) bool {
 	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
+		// The only way cs.needsRecv is ever set: every caller reads the
+		// false and defers the arm. Counted so a stall below can be told
+		// apart from a stall that never had an arm to owe (celeris#607).
+		w.recvArm.noteSQFullRecv()
 		return false
 	}
 	if w.bufRing != nil {
@@ -4195,6 +4357,7 @@ func (w *Worker) drainDetachQueue() {
 					prepCancelUserDataReported(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 					setSQEUserData(sqe, encodeUserDataGen(udRecvCancel, cs.fd, cs.generation))
 					cs.recvCancelPending++
+					cs.pausesApplied++
 				}
 			} else {
 				// The #484 window: the pause's cancel has not landed yet
@@ -4220,6 +4383,7 @@ func (w *Worker) drainDetachQueue() {
 				}
 				if w.prepareRecv(cs, cs.buf) {
 					cs.needsRecv = false
+					w.endRecvStall(cs)
 				} else {
 					cs.needsRecv = true
 				}
@@ -4289,6 +4453,13 @@ func (w *Worker) removeH2Conn(fd int) {
 }
 
 func (w *Worker) removeDirty(cs *connState) {
+	// Leaving the dirty list ends any open stall episode, whichever way
+	// it ends: the arm landed, the conn paused, or the conn is being torn
+	// down (closeConn removes it from the list). Nothing revisits the
+	// conn afterwards, so an episode left open here would never be timed
+	// at all and the worst case — the stall that outlived its connection
+	// — is exactly the one that must not go missing (celeris#607).
+	w.endRecvStall(cs)
 	if !cs.dirty {
 		return
 	}
@@ -4485,6 +4656,15 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		prepRecv(recvSQE, cs.fd, cs.buf)
 		setSQEUserData(recvSQE, encodeUserDataGen(udRecv, cs.fd, cs.generation))
 		cs.recvLinked = true
+		// celeris#607 witness: stamp when the chain was armed. The recv
+		// cannot start before the send completes, so this is the start of
+		// the interval during which the connection cannot receive. Stamped
+		// from the loop's cached clock and counted into a worker-local
+		// batch: this is the per-request send path, and the effect being
+		// measured is seconds long, so neither a vDSO call nor an atomic
+		// belongs here.
+		cs.linkArmedAt = w.cachedNow
+		w.linkArmBatch++
 		// The linked recv is a kernel-held op like any prepareRecv arm:
 		// count it and mark it armed so the close path cancels it and
 		// release waits for its terminal CQE (a failed linked SEND makes
@@ -4647,6 +4827,9 @@ func (w *Worker) checkTimeouts() {
 		cs := w.conns[fd]
 		if cs == nil {
 			continue
+		}
+		if recvStallProbeActive {
+			w.reportRecvSilence(cs, now)
 		}
 		// Deferred close (closeConn): the fd stays open until the queued SENDs
 		// complete, which normally happens within a loop pass or two. Nothing
