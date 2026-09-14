@@ -74,7 +74,15 @@ type Conn struct {
 	closeMu   sync.Mutex
 	closeSent atomic.Bool
 	closeRecv bool
-	closed    atomic.Bool
+	// closeEchoErr records the error from the automatic Close-frame echo
+	// that handleCloseFrame sends when the peer closes first. That error
+	// used to be discarded, which is the celeris#611 weakness one layer
+	// down: when a peer reports "the server never completed the close
+	// handshake", whether the server's reply even reached the write path
+	// is the first thing worth knowing, and nothing recorded it. Written
+	// at most once per connection, on the close path only.
+	closeEchoErr atomic.Value // storedWriteErr
+	closed       atomic.Bool
 
 	// Engine-integrated state (native engines only — std uses raw net.Conn).
 	engine        bool         // true when using engine-integrated I/O
@@ -578,10 +586,14 @@ func (c *Conn) handleCloseFrame(payload []byte) error {
 	// the peer sent an empty-payload close we echo an empty-payload close
 	// (writeCloseFrame treats code==0 as "no payload").
 	if !c.closeSent.Load() {
+		var werr error
 		if len(payload) == 0 {
-			_ = c.writeCloseFrame(0, "")
+			werr = c.writeCloseFrame(0, "")
 		} else {
-			_ = c.writeCloseFrame(code, text)
+			werr = c.writeCloseFrame(code, text)
+		}
+		if werr != nil {
+			c.closeEchoErr.Store(storedWriteErr{werr})
 		}
 	}
 	return &CloseError{Code: code, Text: text}

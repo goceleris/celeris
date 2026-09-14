@@ -4,6 +4,7 @@ package websocket
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,162 @@ import (
 
 	"github.com/goceleris/celeris"
 )
+
+// --- celeris#607 close-handshake probe -------------------------------------
+//
+// closeTimeout records only that the close handshake did not finish inside
+// the client's window. It says nothing about WHERE it stopped, and three
+// separate investigations (celeris#482, #519, #566) have started from that
+// counter and gone in different directions. The probe below closes that gap
+// by recording, per connection and joined across both sides by the client's
+// local address:
+//
+//	client side  — when it sent Close, how many bytes it received afterwards,
+//	               when the LAST of those bytes arrived, whether the server's
+//	               Close frame (88 02 03 E8) was the final thing on the wire,
+//	               and the error that ended the wait;
+//	server side  — when the handler first and last read, how many bytes it
+//	               echoed, when it observed the peer's Close, whether the
+//	               automatic Close echo hit a write error, and when the
+//	               handler goroutine exited.
+//
+// The two halves join through the ?id= query parameter carried in the
+// handshake: Conn.RemoteAddr() is nil on the engine path, so the handler
+// cannot learn the peer address, and the engine's own logs print
+// raddr=cs.remoteAddr, which matches the client's LocalAddr. ADDRMAP lines
+// carry that mapping so an engine-side log can be joined in too.
+//
+// Discipline (celeris#484, and the io_uring defect an every-event log took
+// from 8/24 to 0/24): everything here is COLD. Per-read work is one integer
+// add and — only inside the post-Close window — one time.Now() and an
+// 8-byte copy. Nothing is logged until the subtest is over, and only for
+// connections that did not close cleanly and promptly.
+//
+// The distinguishing question this answers: a connection whose bytes are
+// still arriving when the window expires is a server that is BUSY (the
+// deadline is too tight for the backlog this workload builds on purpose),
+// whereas one that fell silent early and then waited is a server that is
+// STUCK. Those want opposite fixes.
+
+// closeBudget is how long the client waits for the server's FIN after
+// sending its own Close, and closeSlow is the point past which that wait is
+// worth a per-connection record. The defaults reproduce the shipped
+// behaviour exactly (a 10s read deadline, no grace), so the probe does not
+// move the failure it is measuring; WS482_CLOSE_BUDGET raises the ceiling
+// for a measurement run, turning the boolean into a latency.
+func closeBudget() time.Duration { return envDur("WS482_CLOSE_BUDGET", 10*time.Second) }
+func closeSlow() time.Duration   { return envDur("WS482_CLOSE_SLOW", 10*time.Second) }
+
+func envDur(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
+// clientProbe is one connection's client-side timeline. Written only by that
+// connection's own goroutine, read only after wg.Wait().
+type clientProbe struct {
+	laddr    string
+	outcome  string // closedOK | rst | closeTimeout | tailFixFail | closeWriteFail | dialFail | hsFail
+	dialedAt time.Duration
+	floodEnd time.Duration
+	// preDrain is the "a real WS client reads" loop that runs before Close.
+	preDrainBytes int64
+	preDrainEnd   time.Duration
+	closeSentAt   time.Duration // absolute, since t0
+	// Everything below is measured from the instant the Close frame was written.
+	postBytes  int64
+	postReads  int64
+	lastByteAt time.Duration // -1 when no byte ever arrived after Close
+	endAt      time.Duration
+	finalErr   string
+	tail       [8]byte
+	tailLen    int
+	writeErr   string // the error that ended a failed writeAll, if any
+}
+
+func (p *clientProbe) sawServerClose() bool {
+	t := p.tail[:p.tailLen]
+	return bytes.HasSuffix(t, []byte{0x88, 0x02, 0x03, 0xE8}) || bytes.HasSuffix(t, []byte{0x88, 0x00})
+}
+
+// noteTail keeps the last 8 bytes of the post-Close stream. The server's
+// Close reply is the last frame it writes, so the tail says whether the
+// reply arrived — without parsing the stream on the hot path.
+func (p *clientProbe) noteTail(b []byte) {
+	if len(b) >= len(p.tail) {
+		copy(p.tail[:], b[len(b)-len(p.tail):])
+		p.tailLen = len(p.tail)
+		return
+	}
+	keep := p.tailLen + len(b)
+	if keep > len(p.tail) {
+		copy(p.tail[:], p.tail[keep-len(p.tail):p.tailLen])
+		p.tailLen = len(p.tail) - len(b)
+	}
+	copy(p.tail[p.tailLen:], b)
+	p.tailLen += len(b)
+}
+
+// handlerProbe is one connection's server-side timeline, recorded by the
+// handler goroutine at exit. Handler goroutines outlive the subtest, so the
+// record is published under a mutex and never touches *testing.T.
+type handlerProbe struct {
+	set         bool
+	firstReadAt time.Duration
+	lastReadAt  time.Duration
+	reads       int64
+	echoBytes   int64
+	readErr     string
+	readErrAt   time.Duration
+	sawClose    bool
+	closeEcho   string // error from the automatic Close-frame echo, "" = none
+	exitAt      time.Duration
+}
+
+// readerState is the middleware's own view of a connection's inbound
+// backpressure, sampled cold at dump time. It is the line between two
+// verdicts that closeTimeout cannot tell apart: an EMPTY channel with
+// paused=true means the chanReader never lifted its own pause, while an
+// empty channel with paused=false means the middleware did ask the engine
+// to resume and no byte followed — the engine dropped the resume.
+type readerState struct {
+	ok              bool
+	depth, capacity int
+	spill           int64
+	paused          bool
+	closed          bool
+	dropped         uint64
+	spilled         uint64
+	high, low       int
+	wsClosed        bool
+	wsCloseSent     bool
+}
+
+func snapshotReader(c *Conn) readerState {
+	var s readerState
+	if c == nil {
+		return s
+	}
+	s.wsClosed, s.wsCloseSent = c.closed.Load(), c.closeSent.Load()
+	r := c.engineReader
+	if r == nil {
+		return s
+	}
+	s.ok = true
+	s.depth, s.capacity = len(r.ch), cap(r.ch)
+	s.spill = r.spillLen.Load()
+	s.closed = r.closed.Load()
+	s.dropped, s.spilled = r.dropped.Load(), r.spilled.Load()
+	s.high, s.low = r.highWater, r.lowWater
+	r.pausedMu.Lock()
+	s.paused = r.pausedState
+	r.pausedMu.Unlock()
+	return s
+}
 
 // TestBackpressurePauseDoesNotCancelInflightSend is the celeris#482
 // regression guard.
@@ -58,10 +216,14 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	bpBuf := envInt("WS482_BP", 256)
 	bursts := envInt("WS482_BURSTS", 4)
 	perBurst := envInt("WS482_BURST_BYTES", 2<<20)
+	budget, slow := closeBudget(), closeSlow()
 
 	for _, kind := range engineKinds(t) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
+			t0 := time.Now()
+			since := func() time.Duration { return time.Since(t0) }
+
 			var ecanceled, otherWriteErr, protoErr atomic.Int64
 			// protoErr counts every read error that is not a close, so on its
 			// own it cannot distinguish a frame the engine mis-delivered from
@@ -78,21 +240,69 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				}
 				readErrMu.Unlock()
 			}
+
+			// Server-side half of the celeris#607 probe.
+			var hpMu sync.Mutex
+			hprobe := make([]handlerProbe, conns)
+			hconn := make([]*Conn, conns)
+			var handlersLive atomic.Int64
+			register := func(id int, c *Conn) {
+				if id < 0 || id >= conns {
+					return
+				}
+				hpMu.Lock()
+				hconn[id] = c
+				hpMu.Unlock()
+			}
+			publish := func(id int, hp handlerProbe) {
+				if id < 0 || id >= conns {
+					return
+				}
+				hp.set = true
+				hpMu.Lock()
+				hprobe[id] = hp
+				hpMu.Unlock()
+			}
+
 			addr, shutdownEngine := startNativeServer(t, kind, Config{
 				CheckOrigin:           func(*celeris.Context) bool { return true },
 				ReadLimit:             256 * 1024,
 				MaxBackpressureBuffer: bpBuf, // realistic buffer; headroom (cap-highWater) must exceed async pause-apply latency, else Append drops a chunk (ErrReadLimit) -- a config artifact, not engine reordering
 				Handler: func(c *Conn) {
+					// Conn.RemoteAddr() is nil on the engine path, so the
+					// join key travels in the handshake query instead.
+					id, _ := strconv.Atoi(c.Query("id"))
+					handlersLive.Add(1)
+					register(id, c)
+					var hp handlerProbe
+					hp.firstReadAt = -1
+					defer func() {
+						hp.exitAt = since()
+						if v := c.closeEchoErr.Load(); v != nil {
+							hp.closeEcho = v.(storedWriteErr).err.Error()
+						}
+						publish(id, hp)
+						handlersLive.Add(-1)
+					}()
 					for {
 						mt, msg, err := c.ReadMessage()
 						if err != nil {
+							hp.readErrAt = since()
+							hp.readErr = err.Error()
+							hp.sawClose = isCloseErr(err)
 							if !isCloseErr(err) {
 								protoErr.Add(1)
 								noteReadErr(err)
 							}
 							return
 						}
+						if hp.firstReadAt < 0 {
+							hp.firstReadAt = since()
+						}
+						hp.reads++
 						if err := c.WriteMessage(mt, msg); err != nil {
+							hp.readErrAt = since()
+							hp.readErr = "write: " + err.Error()
 							if errors.Is(err, syscall.ECANCELED) {
 								ecanceled.Add(1)
 							} else if !errors.Is(err, ErrWriteClosed) {
@@ -100,6 +310,8 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 							}
 							return
 						}
+						hp.lastReadAt = since()
+						hp.echoBytes += int64(len(msg))
 					}
 				},
 			})
@@ -122,12 +334,14 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 			hostPort = strings.TrimSuffix(hostPort, "/ws")
 
 			var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail, clientMisaligned, framesSent atomic.Int64
+			var slowClose atomic.Int64
 			// An RST is NOT a clean close (celeris#530). Linux emits one when
 			// a socket is closed with unread data still in its receive queue,
 			// which is the signature of a connection torn down mid-stream —
 			// one of the failure modes this oracle exists to catch. Folding
 			// it into closedOK scored a hard teardown as success.
 			var clientRST atomic.Int64
+			cprobe := make([]clientProbe, conns)
 			var wg sync.WaitGroup
 			batch := maskedTextFrames(2048, 120)
 			dialer := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
@@ -140,17 +354,24 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				return serr
 			}}
 			for i := 0; i < conns; i++ {
+				i := i
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
+					p := &cprobe[i]
+					p.lastByteAt = -1
 					c, err := dialer.Dial("tcp", hostPort)
 					if err != nil {
 						dialFail.Add(1)
+						p.outcome, p.writeErr = "dialFail", err.Error()
 						return
 					}
 					defer func() { _ = c.Close() }()
-					if err := wsHandshake(c, hostPort); err != nil {
+					p.laddr = c.LocalAddr().String()
+					p.dialedAt = since()
+					if err := wsHandshakeID(c, hostPort, i); err != nil {
 						hsFail.Add(1)
+						p.outcome, p.writeErr = "hsFail", err.Error()
 						return
 					}
 					wrote := 0
@@ -171,14 +392,16 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						}
 						time.Sleep(200 * time.Millisecond)
 					}
+					p.floodEnd = since()
 					// Complete the current frame so the wire is a whole number of frames. writeAll
 					// retries to completion: once the flood stops the server drains and the send
 					// buffer empties. A conn the server wrongly killed surfaces as an error here.
 					if rem := wrote % 126; rem != 0 {
 						need := 126 - rem
 						start := wrote % len(batch)
-						if !writeAll(c, batch[start:start+need], 15*time.Second) {
+						if err := writeAllErr(c, batch[start:start+need], 15*time.Second); err != nil {
 							clientCloseFail.Add(1)
+							p.outcome, p.writeErr = "tailFixFail", err.Error()
 							return
 						}
 						wrote += need
@@ -187,38 +410,67 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					buf := make([]byte, 64<<10)
 					for {
 						_ = c.SetReadDeadline(time.Now().Add(1 * time.Second))
-						if _, err := c.Read(buf); err != nil {
+						n, err := c.Read(buf)
+						p.preDrainBytes += int64(n)
+						if err != nil {
 							break
 						}
 					}
+					p.preDrainEnd = since()
 					if wrote%126 != 0 {
 						clientMisaligned.Add(1)
 					}
 					framesSent.Add(int64(wrote / 126))
-					if !writeAll(c, maskedCloseFrame(), 10*time.Second) {
+					if err := writeAllErr(c, maskedCloseFrame(), 10*time.Second); err != nil {
 						clientCloseFail.Add(1)
+						p.outcome, p.writeErr = "closeWriteFail", err.Error()
 						return
 					}
-					_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+					_ = c.SetReadDeadline(time.Now().Add(budget))
 					tClose := time.Now()
+					p.closeSentAt = since()
 					for {
-						_, err := c.Read(buf)
+						n, err := c.Read(buf)
+						if n > 0 {
+							p.postBytes += int64(n)
+							p.postReads++
+							p.lastByteAt = time.Since(tClose)
+							p.noteTail(buf[:n])
+						}
 						if err == nil {
 							continue
 						}
+						d := time.Since(tClose)
+						p.endAt, p.finalErr = d, err.Error()
 						if errors.Is(err, syscall.ECONNRESET) {
 							clientRST.Add(1)
+							p.outcome = "rst"
 						} else if errors.Is(err, io.EOF) {
 							closedOK.Add(1)
+							p.outcome = "closedOK"
 						} else {
 							closeTimeout.Add(1)
-							t.Logf("close-timeout %s: %v after Close sent", c.LocalAddr(), time.Since(tClose).Round(time.Millisecond))
+							p.outcome = "closeTimeout"
+							t.Logf("close-timeout %s: %v after Close sent", c.LocalAddr(), d.Round(time.Millisecond))
+						}
+						if d > slow && p.outcome != "closeTimeout" {
+							slowClose.Add(1)
 						}
 						return
 					}
 				}()
 			}
 			wg.Wait()
+
+			// Drain the handlers before reading the server-side half of the
+			// probe, and report how long that took: #568 established that a
+			// handler finishing IS the server closing its side, so "every
+			// handler completed" is itself evidence (celeris#566).
+			drainStart := time.Now()
+			for handlersLive.Load() > 0 && time.Since(drainStart) < 25*time.Second {
+				time.Sleep(20 * time.Millisecond)
+			}
+			handlerDrain := time.Since(drainStart)
 
 			t.Logf("%s: clientMisaligned=%d framesSent=%d (if misaligned>0 the client truncated; if 0 while protocol errors>0 the engine mis-delivered)",
 				kind, clientMisaligned.Load(), framesSent.Load())
@@ -228,6 +480,12 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 
 			t.Logf("%s: conns=%d protoErr=%d clientCloseFail=%d ecanceled=%d otherWriteErr=%d closedOK=%d clientRST=%d closeTimeout=%d dialFail=%d hsFail=%d",
 				kind, conns, protoErr.Load(), clientCloseFail.Load(), ecanceled.Load(), otherWriteErr.Load(), closedOK.Load(), clientRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load())
+			t.Logf("%s: closeBudget=%v closeSlow=%v slowClose=%d handlersLive=%d after %v",
+				kind, budget, slow, slowClose.Load(), handlersLive.Load(), handlerDrain.Round(time.Millisecond))
+			hpMu.Lock()
+			dumpCloseProbe(t, kind.String(), cprobe, hprobe, hconn, slow)
+			hpMu.Unlock()
+
 			if dialFail.Load()+hsFail.Load() > 0 {
 				t.Fatalf("%d conns failed to dial/handshake -- environment problem, not a verdict", dialFail.Load()+hsFail.Load())
 			}
@@ -270,15 +528,76 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				// desynchronised so the dirty-list flush skipped it forever
 				// (celeris#519), and asserting the former sent three separate
 				// investigations down the wrong path -- in the #519 failures
-				// nothing was paused at all.
+				// nothing was paused at all. The CLOSEPROBE lines above carry
+				// the discriminator (celeris#607): a connection still
+				// receiving bytes when the window expired was waiting on a
+				// busy server, not a stuck one.
 				t.Errorf("%d conn(s) never completed the Close handshake within the client's read window "+
 					"after sending Close: "+
-					"the server never closed its side. Cause is NOT implied by this counter -- dump the "+
-					"engine's per-conn state (recvPaused/recvArmed/sending/dirty/closing) to tell a "+
+					"the server never closed its side. Cause is NOT implied by this counter -- read the "+
+					"CLOSEPROBE record for each address above, and dump the engine's per-conn state "+
+					"(recvPaused/recvArmed/sending/dirty/closing) to tell a "+
 					"stuck pause (celeris#482) from stranded send accounting (celeris#519)",
 					n)
 			}
 		})
+	}
+}
+
+// dumpCloseProbe prints the per-connection close record for every connection
+// that did not close cleanly and promptly, plus the ADDRMAP line that joins a
+// record to the engine's own raddr= logging. Cold: it runs once, after the
+// subtest's traffic is over, and prints nothing when every connection was
+// clean.
+func dumpCloseProbe(t *testing.T, kind string, cp []clientProbe, hp []handlerProbe, hc []*Conn, slow time.Duration) {
+	t.Helper()
+	ids := make([]int, 0, 8)
+	for i := range cp {
+		p := &cp[i]
+		interesting := p.outcome != "closedOK" || p.endAt > slow
+		if interesting {
+			ids = append(ids, i)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	sort.Slice(ids, func(a, b int) bool { return cp[ids[a]].endAt > cp[ids[b]].endAt })
+	if len(ids) > 24 {
+		ids = ids[:24]
+	}
+	for _, i := range ids {
+		p := &cp[i]
+		t.Logf("%s ADDRMAP conn %d laddr=%s", kind, i, p.laddr)
+		lastByte := "never"
+		if p.lastByteAt >= 0 {
+			lastByte = p.lastByteAt.Round(time.Millisecond).String()
+		}
+		t.Logf("%s CLOSEPROBE conn %d laddr=%s outcome=%s closeSentAt=%v wait=%v "+
+			"postBytes=%d postReads=%d lastByteAfterClose=%s serverCloseFrameSeen=%v tail=%x finalErr=%q "+
+			"preDrainBytes=%d floodEnd=%v preDrainEnd=%v writeErr=%q",
+			kind, i, p.laddr, p.outcome,
+			p.closeSentAt.Round(time.Millisecond), p.endAt.Round(time.Millisecond),
+			p.postBytes, p.postReads, lastByte, p.sawServerClose(), p.tail[:p.tailLen], p.finalErr,
+			p.preDrainBytes, p.floodEnd.Round(time.Millisecond), p.preDrainEnd.Round(time.Millisecond), p.writeErr)
+		h := &hp[i]
+		if !h.set {
+			t.Logf("%s HANDLERPROBE conn %d laddr=%s STILL RUNNING at dump time", kind, i, p.laddr)
+		} else {
+			t.Logf("%s HANDLERPROBE conn %d laddr=%s firstRead=%v lastRead=%v reads=%d echoBytes=%d "+
+				"sawClose=%v readErrAt=%v readErr=%q closeEchoErr=%q exitAt=%v",
+				kind, i, p.laddr, h.firstReadAt.Round(time.Millisecond), h.lastReadAt.Round(time.Millisecond),
+				h.reads, h.echoBytes, h.sawClose, h.readErrAt.Round(time.Millisecond), h.readErr, h.closeEcho,
+				h.exitAt.Round(time.Millisecond))
+		}
+		if i < len(hc) {
+			if s := snapshotReader(hc[i]); s.ok {
+				t.Logf("%s READERPROBE conn %d laddr=%s depth=%d/%d high=%d low=%d spill=%d paused=%v "+
+					"readerClosed=%v spilled=%d dropped=%d wsClosed=%v wsCloseSent=%v",
+					kind, i, p.laddr, s.depth, s.capacity, s.high, s.low, s.spill, s.paused,
+					s.closed, s.spilled, s.dropped, s.wsClosed, s.wsCloseSent)
+			}
+		}
 	}
 }
 
@@ -292,9 +611,21 @@ func envInt(k string, def int) int {
 }
 
 func wsHandshake(c net.Conn, hostPort string) error {
+	return wsHandshakePath(c, hostPort, "/ws")
+}
+
+// wsHandshakeID upgrades on /ws?id=N. The id is the only join key available
+// to an engine-path handler: the connection is detached from the HTTP layer
+// and Conn.RemoteAddr() returns nil there, so nothing else identifies which
+// client a handler is serving (celeris#607).
+func wsHandshakeID(c net.Conn, hostPort string, id int) error {
+	return wsHandshakePath(c, hostPort, "/ws?id="+strconv.Itoa(id))
+}
+
+func wsHandshakePath(c net.Conn, hostPort, path string) error {
 	key := make([]byte, 16)
 	_, _ = rand.Read(key)
-	req := "GET /ws HTTP/1.1\r\nHost: " + hostPort + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+	req := "GET " + path + " HTTP/1.1\r\nHost: " + hostPort + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + base64.StdEncoding.EncodeToString(key) + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
 	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 	defer func() { _ = c.SetDeadline(time.Time{}) }()
@@ -338,16 +669,27 @@ func maskedTextFrames(n, plen int) []byte {
 // stays well-formed regardless of backpressure timing. Returns false on error
 // or deadline (e.g. the server killed the conn -- the celeris#482 symptom).
 func writeAll(c net.Conn, buf []byte, within time.Duration) bool {
+	return writeAllErr(c, buf, within) == nil
+}
+
+// writeAllErr is writeAll keeping the error. A client that cannot finish
+// writing never reaches the close handshake at all, so which error stopped
+// it is the difference between "the server tore this conn down" and "the
+// server is merely too slow to drain it" (celeris#607).
+func writeAllErr(c net.Conn, buf []byte, within time.Duration) error {
 	end := time.Now().Add(within)
 	for len(buf) > 0 {
 		_ = c.SetWriteDeadline(end)
 		n, err := c.Write(buf)
 		buf = buf[n:]
 		if err != nil {
-			return len(buf) == 0
+			if len(buf) == 0 {
+				return nil
+			}
+			return err
 		}
 	}
-	return true
+	return nil
 }
 
 // maskedCloseFrame is a client->server Close (opcode 8) with status 1000.
