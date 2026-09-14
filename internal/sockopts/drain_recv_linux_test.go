@@ -20,21 +20,33 @@ import (
 // engine stopped servicing requests.
 //
 // This test puts a blocking-mode socket in exactly that state (empty receive
-// buffer, peer still open so no FIN) and asserts the drain returns promptly.
-// With a blocking Read it hangs and trips the timeout; with MSG_DONTWAIT it
-// returns immediately.
+// buffer, peer still open so no FIN) and asserts the read returns promptly.
+// With a blocking read it hangs and trips the timeout; with MSG_DONTWAIT it
+// returns EAGAIN immediately.
+//
+// It calls drainRecvRound DIRECTLY, and that is the whole point of the test.
+// Going in through DrainRecvBuffer would take the SIOCINQ == 0 early return
+// on an empty queue and never issue a read at all, so an implementation that
+// dropped MSG_DONTWAIT would pass — which is what this guard looked like
+// after the celeris#569 fix added that early return, and #311 is much too
+// expensive a bug to guard vacuously. The flag lives on the read, so the
+// assertion has to reach the read.
 func TestDrainRecvBufferNonBlocking(t *testing.T) {
 	fds := socketpair(t)
 
-	done := make(chan struct{})
+	buf := make([]byte, drainRecvBufSize)
+	done := make(chan roundResult, 1)
 	go func() {
-		DrainRecvBuffer(fds[0])
-		close(done)
+		drained, empty := drainRecvRound(fds[0], buf, drainRecvBufSize, time.Time{})
+		done <- roundResult{drained: drained, empty: empty}
 	}()
 	select {
-	case <-done:
+	case r := <-done:
+		if r.drained != 0 || !r.empty {
+			t.Fatalf("a read of an empty queue reported drained=%d empty=%t, want 0 and true", r.drained, r.empty)
+		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("DrainRecvBuffer blocked on an empty blocking socket (celeris#311 regression)")
+		t.Fatal("the drain's read blocked on an empty BLOCKING socket whose peer is still open: MSG_DONTWAIT is gone (celeris#311 regression)")
 	}
 }
 
@@ -42,32 +54,68 @@ func TestDrainRecvBufferNonBlocking(t *testing.T) {
 // it consumes data already queued in the receive buffer (so close() does not
 // RST away a staged GOAWAY / close frame) and then returns once the buffer is
 // empty — without blocking on the still-open peer.
+//
+// Two halves, because neither covers the other. The first runs the whole
+// DrainRecvBuffer as the engines call it. The second is the #311 guard on the
+// OTHER exit: a round whose byte budget is larger than what is queued cannot
+// end on `drained == budget`, so it has to take one more read, and that read
+// finds the queue empty with the peer still open. Through DrainRecvBuffer
+// that read is unreachable — the budget is the SIOCINQ snapshot, which is
+// exactly what is queued — so the direct call is what makes the EAGAIN real.
 func TestDrainRecvBufferDrainsThenReturns(t *testing.T) {
-	fds := socketpair(t)
+	payload := []byte("queued bytes the drain must discard")
 
-	if _, err := unix.Write(fds[1], []byte("queued bytes the drain must discard")); err != nil {
+	fds := socketpair(t)
+	if _, err := unix.Write(fds[1], payload); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-
-	done := make(chan struct{})
-	go func() {
-		DrainRecvBuffer(fds[0])
-		close(done)
-	}()
+	done := make(chan int, 1)
+	go func() { done <- DrainRecvBuffer(fds[0]) }()
 	select {
-	case <-done:
+	case drained := <-done:
+		if drained != len(payload) {
+			t.Fatalf("DrainRecvBuffer consumed %d of the %d queued bytes", drained, len(payload))
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("DrainRecvBuffer blocked after draining queued data (celeris#311 regression)")
 	}
-
-	var buf [64]byte
-	n, _, rerr := unix.Recvfrom(fds[0], buf[:], unix.MSG_DONTWAIT)
+	var tail [64]byte
+	n, _, rerr := unix.Recvfrom(fds[0], tail[:], unix.MSG_DONTWAIT)
 	if n > 0 {
 		t.Fatalf("DrainRecvBuffer left %d bytes undrained", n)
 	}
 	if rerr != unix.EAGAIN && rerr != unix.EWOULDBLOCK {
 		t.Fatalf("expected EAGAIN after drain, got n=%d err=%v", n, rerr)
 	}
+
+	// The same drain against an over-large budget, so the loop must reach
+	// the read that finds the queue empty.
+	fds2 := socketpair(t)
+	if _, err := unix.Write(fds2[1], payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, drainRecvBufSize)
+	round := make(chan roundResult, 1)
+	go func() {
+		drained, empty := drainRecvRound(fds2[0], buf, 4*len(payload), time.Time{})
+		round <- roundResult{drained: drained, empty: empty}
+	}()
+	select {
+	case r := <-round:
+		if r.drained != len(payload) || !r.empty {
+			t.Fatalf("round over a %d-byte budget with %d bytes queued reported drained=%d empty=%t, want %d and true",
+				4*len(payload), len(payload), r.drained, r.empty, len(payload))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the drain's read blocked once it had emptied the queue of a still-open BLOCKING peer: MSG_DONTWAIT is gone (celeris#311 regression)")
+	}
+}
+
+// roundResult carries what one drainRecvRound reported out of the goroutine a
+// blocking read would otherwise wedge.
+type roundResult struct {
+	drained int
+	empty   bool
 }
 
 // TestDrainRecvBufferDrainsPastTheOldFixedCap is the regression guard for
@@ -135,8 +183,14 @@ func TestDrainRecvBufferByteBoundIsComputedOnce(t *testing.T) {
 		_ = unix.Close(fds[1])
 	})
 
-	const datagrams = 3
-	chunk := make([]byte, drainRecvBufSize)
+	// Deliberately NOT drainRecvBufSize: the discriminator is that the
+	// budget stops the drain one datagram in, which must hold whatever size
+	// one read happens to be.
+	const (
+		datagrams  = 3
+		dgramBytes = 4096
+	)
+	chunk := make([]byte, dgramBytes)
 	for i := range datagrams {
 		if _, err := unix.Write(fds[1], chunk); err != nil {
 			t.Fatalf("write %d: %v", i, err)
@@ -146,16 +200,16 @@ func TestDrainRecvBufferByteBoundIsComputedOnce(t *testing.T) {
 	if err != nil {
 		t.Skipf("SIOCINQ on a datagram socket: %v", err)
 	}
-	if inq != drainRecvBufSize {
-		t.Skipf("SIOCINQ reports %d, not the single-datagram %d this kernel is assumed to report", inq, drainRecvBufSize)
+	if inq != dgramBytes {
+		t.Skipf("SIOCINQ reports %d, not the single-datagram %d this kernel is assumed to report", inq, dgramBytes)
 	}
 
 	drained := DrainRecvBuffer(fds[0])
 	inqAfter, _ := unix.IoctlGetInt(fds[0], unix.SIOCINQ)
-	t.Logf("dgram byte bound: entry SIOCINQ=%d queued=%d drained=%d inq_after=%d", inq, datagrams*drainRecvBufSize, drained, inqAfter)
+	t.Logf("dgram byte bound: entry SIOCINQ=%d queued=%d drained=%d inq_after=%d", inq, datagrams*dgramBytes, drained, inqAfter)
 	if drained != inq {
 		t.Fatalf("drain consumed %d bytes against an entry SIOCINQ of %d with %d queued: the byte bound is re-snapshotted per round, not computed once (celeris#571)",
-			drained, inq, datagrams*drainRecvBufSize)
+			drained, inq, datagrams*dgramBytes)
 	}
 }
 
@@ -201,8 +255,11 @@ func TestDrainRecvBufferStopsAtTheTimeBudget(t *testing.T) {
 	elapsed := time.Since(start)
 	stopFlood()
 	// The slack is for the goroutine handoff and the one read the deadline
-	// check cannot preempt, not for the budget: 20x a 1 ms budget still fails
-	// long before a regression to the old between-rounds-only bound would.
+	// check cannot preempt, not for the budget. The multiple is what absorbs
+	// a loaded runner; the CONSTANT is what makes the assertion mean
+	// something, so it stays expressed in drainRecvTimeBudget and fails long
+	// before a regression to an unbounded chase, or to the old
+	// between-rounds-only bound, could hide.
 	if limit := 20 * drainRecvTimeBudget; elapsed > limit {
 		t.Fatalf("drain against a non-stopping peer took %s, past %dx the %s budget (celeris#571)", elapsed, int64(limit/drainRecvTimeBudget), drainRecvTimeBudget)
 	}
@@ -248,8 +305,12 @@ func TestDrainRecvRoundStopsAtItsByteBudget(t *testing.T) {
 func TestDrainRecvRoundStopsAtItsDeadline(t *testing.T) {
 	fds := socketpair(t)
 
+	// Any non-empty queue discriminates here (a round that checks its
+	// deadline only on the way out reads all of it), so the floor is a
+	// literal rather than drainRecvBufSize — which is now larger than some
+	// hosts' whole default socket buffer.
 	queued := fillSocket(t, fds[1], 1<<20)
-	if queued <= drainRecvBufSize {
+	if queued < 4096 {
 		t.Skipf("socket buffer held only %d bytes", queued)
 	}
 

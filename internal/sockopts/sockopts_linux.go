@@ -3,6 +3,7 @@
 package sockopts
 
 import (
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -40,25 +41,58 @@ func applyFD(fd int, opts Options) error {
 	return nil
 }
 
-// drainRecvBufSize is the size of one drain read.
+// drainRecvBufSize is the size of one drain read, and the reason the buffer
+// is pooled rather than a stack array.
+//
+// It was 4 KiB, which made the 128 KiB a real flood close queues cost 32 recv
+// syscalls — and that syscall count, not the byte count, is what put the time
+// backstop below within reach of a scheduler. On the GitHub runner (kernel
+// 6.17.0-1022-azure, -race, every other package building alongside) those 32
+// syscalls took more than 1 ms on 1 repetition in 20: the drain stopped at
+// 72 KiB with 56 KiB still queued and close(2) reset, which is celeris#569's
+// own defect reproduced by this fix's own bound. At 64 KiB the same close is
+// two reads and the loop's exit.
+//
+// 64 KiB is too much to put on the closing goroutine's stack: a frame that
+// size makes the event-loop worker grow its stack, and copy it, on a close
+// path that used to touch neither. So the buffer comes from
+// drainRecvBufPool — one per in-flight close, and since nothing ever reads
+// what is in it, it goes back unzeroed.
 //
 // drainRecvFallbackBudget is the byte bound for one close when neither
 // SIOCINQ nor SO_RCVBUF can be read (a non-socket fd, or a socket type
 // without them). It is the 32 KiB cap this drain carried between celeris#311
 // and celeris#572, kept only as that fallback.
 //
-// drainRecvTimeBudget bounds the drain in the unit celeris#571 is actually
-// about: the harm of a drain that chases a peer is holding the event-loop
-// thread, and with it every other connection on that loop. It is checked
-// between the reads, not only around them, so it bounds the call and not just
-// a loop outside it. With the window clamp below in effect a real close needs
-// ~14 us of it (measured on the celeris#583 rig); the budget is what keeps a
-// kernel that ignores the clamp bounded rather than chasing.
+// drainRecvTimeBudget is a BACKSTOP, not the bound. What bounds the work is
+// the byte budget — min(SIOCINQ-at-entry, SO_RCVBUF), computed once, which
+// nothing the peer does afterwards can extend. The wall clock is only there
+// for reads that are pathologically slow for a reason the byte count cannot
+// see (a stalled host, a runner thrashing), so it has to sit far above any
+// healthy drain or it becomes the thing that truncates one. At 1 ms it did
+// not sit above it: measured over 4950 closes on the celeris#583 rig with
+// these read sizes, a close costs p50 10 us, p95 141 us, p99 285 us — but
+// the tail reaches 1.9 ms under container scheduling, and one close in 4950
+// crossed 1 ms even at 64 KiB a read. 10 ms is 5x that worst case, 35x the
+// p99, and still three orders of magnitude under the 30 s default
+// ShutdownTimeout the close path lives inside. It is checked between the
+// reads, not only around them, so it bounds the call and not just a loop
+// outside it.
 const (
-	drainRecvBufSize        = 4096
+	drainRecvBufSize        = 64 << 10
 	drainRecvFallbackBudget = 32 << 10
-	drainRecvTimeBudget     = time.Millisecond
+	drainRecvTimeBudget     = 10 * time.Millisecond
 )
+
+// drainRecvBufPool holds the discard buffers the drain reads into. The bytes
+// are never looked at, so a buffer goes back unzeroed and is shared by every
+// close on the process.
+var drainRecvBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, drainRecvBufSize)
+		return &b
+	},
+}
 
 // DrainRecvBuffer reads and discards what is in fd's socket receive buffer, so
 // the close(2) that follows sends FIN rather than RST. An RST would
@@ -99,8 +133,11 @@ const (
 //     round after round and only the wall clock ever stops it, which is
 //     celeris#571's complaint.
 //   - Time: drainRecvTimeBudget, checked BETWEEN THE READS, so the worst case
-//     is that budget plus one 4 KiB read — not that budget plus a whole
-//     SO_RCVBUF's worth of reading.
+//     is that budget plus one drainRecvBufSize read — not that budget plus a
+//     whole SO_RCVBUF's worth of reading. It is a backstop against a
+//     pathologically slow read, not the bound: the byte budget is what makes
+//     the work finite, and the reads are sized (64 KiB) so that a real close
+//     costs a handful of syscalls and never approaches it.
 //
 // Neither bound can be raised by anything the peer does after the call starts.
 // Chasing further could not help anyway — bytes that arrive after close(2) are
@@ -129,9 +166,11 @@ const (
 // reads late keeps the Close frame on 128 of 128 flood-cell closes on epoll
 // and 127 of 128 on io_uring, rather than 0 of 128 and 28 of 128 with the
 // clamp. It was not taken because the cost is 20-40x this drain's and it is
-// itself unreliable at the bound: with the same 1 ms budget the backlog drain
-// overran on 1 of 768 closes per engine and that close reset — which is where
-// the 127 of 128 above comes from — losing the frame for a prompt reader too.
+// itself unreliable at the bound: under the 1 ms budget in force when that
+// round was measured, the backlog drain overran on 1 of 768 closes per engine
+// and that close reset — which is where the 127 of 128 above comes from —
+// losing the frame for a prompt reader too. (Those figures are carried over
+// from that round and have not been re-measured against the budget below.)
 // A peer that reads what is already in its receive queue before writing again
 // — every well-behaved client, since the FIN is there to be read — sees the
 // Close frame and the whole staged backlog either way, which is the outcome
@@ -169,10 +208,11 @@ func DrainRecvBuffer(fd int) int {
 	// window stays zero.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, 1)
 
-	var buf [drainRecvBufSize]byte
-	drained, _ := drainRecvRound(fd, buf[:],
+	bufp := drainRecvBufPool.Get().(*[]byte)
+	drained, _ := drainRecvRound(fd, *bufp,
 		drainRecvBudget(fd, inq, inqErr),
 		time.Now().Add(drainRecvTimeBudget))
+	drainRecvBufPool.Put(bufp)
 	return drained
 }
 

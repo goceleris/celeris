@@ -43,10 +43,13 @@ import (
 // point every byte the client sends stays in the kernel receive queue.
 // Two inbound cells:
 //
-//   - small: after the pause the client sends <= 16 KiB more (below the
-//     32 KiB drain cap) and stops;
-//   - flood: the client keeps writing until its write blocks (the server's
-//     autotuned receive buffer is full: far above the cap).
+//   - small: after the pause the client sends <= 16 KiB more and stops —
+//     what the old fixed 32 KiB cap could still empty, so the cell where
+//     the pre-celeris#569 drain and this one agree;
+//   - flood: the client keeps writing until its write blocks, i.e. the
+//     server's autotuned receive buffer is full at 128-131 KiB. That is
+//     four times the old cap, and the cell where it left ~96 KiB queued and
+//     close(2) reset every time.
 //
 // The client never reads during the flood and has an 8 KiB SO_RCVBUF, so
 // the server's echo backlog and its Close frame are staged in the kernel
