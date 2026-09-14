@@ -126,6 +126,13 @@ type Loop struct {
 	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
 	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
 
+	// The #383 transplant ledger, engine-wide and shared like the counters
+	// above; all three are nil-safe so a bare test Loop literal can skip
+	// them (celeris#624).
+	transplantAdopted      *atomic.Uint64 // conns adopted FROM io_uring (no OnConnect fired)
+	transplantDetached     *atomic.Uint64 // conns detached FOR io_uring (no OnDisconnect fired)
+	transplantSlotOccupied *atomic.Uint64 // adoptions refused on an occupied slot (fd not closed)
+
 	// fdCapDrops counts accepted fds that fell outside the l.conns table
 	// (fd >= connTableSize) and were force-closed in acceptAll. Worker-
 	// thread-only. fdCapWarned latches so the diagnostic Warn is emitted

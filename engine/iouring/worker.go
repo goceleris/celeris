@@ -336,6 +336,11 @@ type Worker struct {
 	bytesRead       *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
 	bytesWritten    *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
 	transplantCount *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
+	// The rest of the #383 hand-off ledger (celeris#624), all engine-wide,
+	// shared and nil-safe so a bare test Worker literal can skip them.
+	transplantDetached     *atomic.Uint64 // conns detached FOR epoll (no OnDisconnect fired)
+	transplantSlotOccupied *atomic.Uint64 // adoptions refused on an occupied slot (fd not closed)
+	closeMissingConnState  *atomic.Uint64 // finishClose on a nil connState (OnDisconnect skipped)
 	// recvArm is the engine-wide recv-arming witness set (celeris#586);
 	// nil-safe so a bare test Worker literal can skip it.
 	recvArm *recvArmStats
@@ -3356,6 +3361,14 @@ func (w *Worker) finishClose(fd int) {
 
 	if w.cfg.OnDisconnect != nil && cs != nil {
 		w.cfg.OnDisconnect(cs.remoteAddr)
+	}
+	// A nil connState here means the gauge and closeCount moved above but
+	// no OnDisconnect could fire: the close is invisible to every
+	// hook-derived counter. The nil guard was written because the author
+	// judged the state reachable, so count the reach instead of leaving
+	// the path silent (celeris#624). Must stay 0.
+	if cs == nil && w.closeMissingConnState != nil {
+		w.closeMissingConnState.Add(1)
 	}
 
 	// Capture close-path decisions before queueing cs for deferred release.

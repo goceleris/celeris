@@ -149,8 +149,22 @@ func TestAdoptConnServesTransplantedFD(t *testing.T) {
 	if got := e.TransplantCount(); got != 1 {
 		t.Fatalf("TransplantCount = %d, want 1", got)
 	}
-	if got := e.Metrics().ActiveConnections; got != 1 {
+	m := e.Metrics()
+	if got := m.ActiveConnections; got != 1 {
 		t.Fatalf("ActiveConnections = %d, want 1", got)
+	}
+	// The same adopt, seen from outside the process: /debug/vars is the only
+	// view the validation artifact has, so an adopt that moves the internal
+	// counter but not the exported one is still an unpairable hand-off
+	// (celeris#624).
+	if m.TransplantAdopted != 1 {
+		t.Fatalf("Metrics().TransplantAdopted = %d, want 1", m.TransplantAdopted)
+	}
+	// Adopting fires no OnConnect and no close: the ledger's other entries
+	// must stay put, or the residual would not mean what it says.
+	if m.TransplantDetached != 0 || m.TransplantAdoptSlotOccupied != 0 || m.CloseMissingConnState != 0 {
+		t.Fatalf("clean adopt moved detached=%d occupied=%d missing_state=%d, want all 0",
+			m.TransplantDetached, m.TransplantAdoptSlotOccupied, m.CloseMissingConnState)
 	}
 }
 

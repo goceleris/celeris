@@ -867,6 +867,17 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 	if asyncRoutes == 0 {
 		asyncRoutes = sm.AsyncRoutes
 	}
+	// The STANDBY's share of the two connection-lifecycle aggregates
+	// (celeris#624). ActiveConnections and CloseCount stay sums — the sum
+	// is the public contract and the controller divides it by Workers —
+	// but a promotion leaves every pre-switch keep-alive pinned on the
+	// standby until the transplant drain moves it, so only the split says
+	// which sub-engine a live-gauge step came from. Read from the active
+	// pointer rather than the controller's activeIsPrimary, which is
+	// switchMu-guarded; a switch concurrent with this call attributes the
+	// halves to the other side for one sample, which no cumulative or
+	// gauge value depends on. Zero while the lazy standby is unbuilt.
+	standby := standbyMetrics(e.active.Load(), primary, secondary, pm, sm)
 	return engine.EngineMetrics{
 		RequestCount:       pm.RequestCount + sm.RequestCount,
 		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
@@ -875,6 +886,23 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 		AdaptiveSwitches:   e.switchesTotal.Load(),
+		// A close is attributed to whichever sub-engine owned the conn, so
+		// the cumulative total is additive across a switch exactly like
+		// AsyncPromotedConns. Without it the engine's own close count is
+		// invisible on the only engine that can lose a conn to a hand-off,
+		// and engine_closed vs hook_closed cannot be compared at all
+		// (celeris#624).
+		CloseCount:               pm.CloseCount + sm.CloseCount,
+		StandbyActiveConnections: standby.ActiveConnections,
+		StandbyCloseCount:        standby.CloseCount,
+		// The #383 hand-off ledger. Both halves of a transplant are
+		// cumulative and land on opposite sub-engines, so summing them is
+		// what makes TransplantDetached - TransplantAdopted the count of
+		// conns currently in flight between the two (celeris#624).
+		TransplantAdopted:           pm.TransplantAdopted + sm.TransplantAdopted,
+		TransplantDetached:          pm.TransplantDetached + sm.TransplantDetached,
+		TransplantAdoptSlotOccupied: pm.TransplantAdoptSlotOccupied + sm.TransplantAdoptSlotOccupied,
+		CloseMissingConnState:       pm.CloseMissingConnState + sm.CloseMissingConnState,
 		// Both are io_uring-only and additive: a detached conn lives on
 		// exactly one sub-engine, and window closes are cumulative events.
 		DetachedConnections: pm.DetachedConnections + sm.DetachedConnections,
@@ -887,6 +915,30 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		InlineBytes:      pm.InlineBytes + sm.InlineBytes,
 		RingBytes:        pm.RingBytes + sm.RingBytes,
 	}
+}
+
+// standbyMetrics returns the snapshot belonging to the sub-engine that is NOT
+// currently active (celeris#624). active is the pointer published by e.active;
+// pm and sm are the snapshots already taken from primary and secondary, so the
+// split costs no second Metrics() call and no second round of atomic loads —
+// and both halves are guaranteed to come from the same pair of snapshots the
+// sums were computed from.
+//
+// Returns the zero snapshot when the active slot is unpublished or matches
+// neither sub-engine, which is also what an unbuilt lazy standby yields: a
+// standby that does not exist holds no connections.
+func standbyMetrics(active *engine.Engine, primary, secondary engine.Engine,
+	pm, sm engine.EngineMetrics) engine.EngineMetrics {
+	if active == nil {
+		return engine.EngineMetrics{}
+	}
+	switch *active {
+	case primary:
+		return sm
+	case secondary:
+		return pm
+	}
+	return engine.EngineMetrics{}
 }
 
 // Type returns the engine type.
