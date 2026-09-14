@@ -781,6 +781,12 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 // In both cases, the caller must not Accept on or close the supplied
 // listener after calling this function.
 //
+// On the adaptive engine (the default on Linux) the listener goes to whichever
+// sub-engine starts, and a later switch binds the second sub-engine to that
+// same address; ln must therefore be a TCP listener, and the server keeps
+// serving on ln's port across the switch. [Config.Addr] is ignored in favour
+// of ln's address.
+//
 // Returns [ErrAlreadyStarted] if called more than once.
 func (s *Server) StartWithListener(ln net.Listener) error {
 	eng, err := s.prepareWithListener(ln)
