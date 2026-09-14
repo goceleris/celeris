@@ -90,14 +90,20 @@ type clientProbe struct {
 	preDrainEnd   time.Duration
 	closeSentAt   time.Duration // absolute, since t0
 	// Everything below is measured from the instant the Close frame was written.
-	postBytes  int64
-	postReads  int64
-	lastByteAt time.Duration // -1 when no byte ever arrived after Close
-	endAt      time.Duration
-	finalErr   string
-	tail       [8]byte
-	tailLen    int
-	writeErr   string // the error that ended a failed writeAll, if any
+	postBytes int64
+	postReads int64
+	// firstByteAt/lastByteAt bracket the post-Close stream. Both are
+	// needed: lastByteAt alone cannot tell a connection that trickled for
+	// twelve seconds from one that sat silent for eleven and then took a
+	// burst, and those are opposite verdicts (busy server versus stalled
+	// one). -1 when no byte ever arrived after Close.
+	firstByteAt time.Duration
+	lastByteAt  time.Duration
+	endAt       time.Duration
+	finalErr    string
+	tail        [8]byte
+	tailLen     int
+	writeErr    string // the error that ended a failed writeAll, if any
 }
 
 func (p *clientProbe) sawServerClose() bool {
@@ -367,7 +373,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					p := &cprobe[i]
-					p.lastByteAt = -1
+					p.firstByteAt, p.lastByteAt = -1, -1
 					c, err := dialer.Dial("tcp", hostPort)
 					if err != nil {
 						dialFail.Add(1)
@@ -442,6 +448,9 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						if n > 0 {
 							p.postBytes += int64(n)
 							p.postReads++
+							if p.firstByteAt < 0 {
+								p.firstByteAt = time.Since(tClose)
+							}
 							p.lastByteAt = time.Since(tClose)
 							p.noteTail(buf[:n])
 						}
@@ -577,16 +586,17 @@ func dumpCloseProbe(t *testing.T, kind string, cp []clientProbe, hp []handlerPro
 	for _, i := range ids {
 		p := &cp[i]
 		t.Logf("%s ADDRMAP conn %d laddr=%s", kind, i, p.laddr)
-		lastByte := "never"
+		firstByte, lastByte := "never", "never"
 		if p.lastByteAt >= 0 {
+			firstByte = p.firstByteAt.Round(time.Millisecond).String()
 			lastByte = p.lastByteAt.Round(time.Millisecond).String()
 		}
 		t.Logf("%s CLOSEPROBE conn %d laddr=%s outcome=%s closeSentAt=%v wait=%v "+
-			"postBytes=%d postReads=%d lastByteAfterClose=%s serverCloseFrameSeen=%v tail=%x finalErr=%q "+
+			"postBytes=%d postReads=%d firstByteAfterClose=%s lastByteAfterClose=%s serverCloseFrameSeen=%v tail=%x finalErr=%q "+
 			"preDrainBytes=%d floodEnd=%v preDrainEnd=%v writeErr=%q",
 			kind, i, p.laddr, p.outcome,
 			p.closeSentAt.Round(time.Millisecond), p.endAt.Round(time.Millisecond),
-			p.postBytes, p.postReads, lastByte, p.sawServerClose(), p.tail[:p.tailLen], p.finalErr,
+			p.postBytes, p.postReads, firstByte, lastByte, p.sawServerClose(), p.tail[:p.tailLen], p.finalErr,
 			p.preDrainBytes, p.floodEnd.Round(time.Millisecond), p.preDrainEnd.Round(time.Millisecond), p.writeErr)
 		h := &hp[i]
 		if !h.set {
