@@ -110,17 +110,17 @@ func TestDrainRecvBufferTCPTruthTable(t *testing.T) {
 						// unread=0 in both arms (negative control 1) and every
 						// drain-on cell (the closure's mechanism): the queue is
 						// empty at close(2), close sends FIN, nothing is reset.
-						if agg.eof != reps || agg.abortOnClose != 0 || agg.abortOnData != 0 || agg.inqAfterPos != 0 || agg.soErrNone != reps {
-							t.Errorf("drain=%t unread=%d: close(2) must find an empty queue and send FIN; got EOF=%d/%d SO_ERROR=0 on %d abortOnClose=%d abortOnData=%d inq_after>0 on %d",
-								drain, unread, agg.eof, reps, agg.soErrNone, agg.abortOnClose, agg.abortOnData, agg.inqAfterPos)
+						if agg.eof != reps || agg.inqAfterPos != 0 || agg.soErrNone != reps {
+							t.Errorf("drain=%t unread=%d: close(2) must find an empty queue and send FIN; got EOF=%d/%d SO_ERROR=0 on %d inq_after>0 on %d (netstat, diagnostic only: abortOnClose=%d abortOnData=%d)",
+								drain, unread, agg.eof, reps, agg.soErrNone, agg.inqAfterPos, agg.abortOnClose, agg.abortOnData)
 						}
 					default:
 						// drain-off with unread>0 (negative control 3, at both
 						// 16 KiB and 128 KiB): close(2) finds unread bytes and
 						// resets, attributed to TCPAbortOnClose.
-						if agg.abortOnClose != reps || agg.inqAfterPos != reps {
-							t.Errorf("drain=%t unread=%d: close(2) must reset every time (TCPAbortOnClose +1 each, inq_after>0); got abortOnClose=%d/%d inq_after>0 on %d",
-								drain, unread, agg.abortOnClose, reps, agg.inqAfterPos)
+						if agg.inqAfterPos != reps {
+							t.Errorf("drain=%t unread=%d: close(2) must find bytes still queued every time; got inq_after>0 on %d/%d (netstat, diagnostic only: abortOnClose=%d)",
+								drain, unread, agg.inqAfterPos, reps, agg.abortOnClose)
 						}
 						if staged == 0 {
 							// The FIN from SHUT_WR is already at the peer: its
@@ -183,18 +183,8 @@ func TestDrainRecvBufferTCPTruthTable(t *testing.T) {
 				t.Logf("TIER0 post_close_write drain=%t rep=%d peer=%s peerSoErr=%s secondWrite=%q abortOnClose=%+d abortOnData=%+d", drain, rep, r.peerKind, r.peerSoErr, r.secondWriteErr, r.abortOnClose, r.abortOnData)
 			}
 			t.Logf("TIER0-CELL post_close_write drain=%t tcp_fin_timeout=%d n=%d RST=%d secondWriteErr=%d abortOnClose=%d abortOnData=%d", drain, finTimeout, reps, rst, secondWriteErr, onClose, onData)
-			if onClose != 0 {
-				t.Errorf("post-close write must never be attributed to TCPAbortOnClose; got %d over %d", onClose, reps)
-			}
 			if secondWriteErr != reps {
 				t.Errorf("the peer's second write after the reset must fail (EPIPE/ECONNRESET) on every rep; got %d/%d", secondWriteErr, reps)
-			}
-			if finTimeout > 60 {
-				if onData != reps {
-					t.Errorf("tcp_fin_timeout=%d keeps the orphan a full FIN_WAIT2 socket, so post-close data must count TCPAbortOnData +1 per rep; got %d/%d", finTimeout, onData, reps)
-				}
-			} else if onData != 0 {
-				t.Errorf("tcp_fin_timeout=%d converts the orphan to time-wait inside close(2), whose reset has no MIB counter; expected abortOnData=0, got %d", finTimeout, onData)
 			}
 		})
 	}
@@ -256,6 +246,19 @@ func TestDrainRecvBufferEmptiesAWindowBlockedPeer(t *testing.T) {
 	before := readTCPExt(t)
 	_ = unix.Close(srv)
 	after := readTCPExt(t)
+	// NOTE (celeris#608): these two deltas are DIAGNOSTIC ONLY and nothing
+	// asserts on them. TcpExt counters in /proc/net/netstat are per network
+	// NAMESPACE, not per socket, so any other socket in the namespace that
+	// closes with unread data, or receives data after close, moves them. On a
+	// shared CI runner that happens, and it turned this table intermittently
+	// red on main: `expected abortOnData=0, got 1` over 20 reps, twice in one
+	// day, with every peer-observable column correct. The peer-side columns
+	// (EOF vs ECONNRESET, SO_ERROR, bytes received, the second write's error)
+	// and our own socket's SIOCINQ are per-connection and cannot be
+	// contaminated, and they already discriminate every row of this table —
+	// the celeris#569 signal is `inq_after > 0` plus a reset the peer sees,
+	// which needs no MIB at all. Keep printing the deltas: they are the
+	// kernel's own attribution and they are worth reading when a row fails.
 	abortOnClose := after["TCPAbortOnClose"] - before["TCPAbortOnClose"]
 	kind, _ := readToTerminal(peer)
 	t.Logf("TIER0-WINDOWBLOCKED sent=%d inq_before=%d drained=%d inq_after=%d rcvbuf=%d elapsed=%s abortOnClose=%+d peer=%s",
