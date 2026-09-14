@@ -231,3 +231,27 @@ func prepCancelUserDataSkipSuccess(sqePtr unsafe.Pointer, targetUD uint64) {
 	// matches by user_data.
 	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelAll
 }
+
+// prepCancelUserDataReported is prepCancelUserDataSkipSuccess without
+// CQE_SKIP_SUCCESS, so the cancel ALWAYS posts its own CQE and the caller
+// learns what it did.
+//
+// Needed because with IORING_ASYNC_CANCEL_ALL the kernel reports a cancel
+// that matched nothing as res == 0 — a SUCCESS — so CQE_SKIP_SUCCESS
+// suppresses exactly the completion that says "nothing was cancelled".
+// Measured on Linux 7.0.12: a miss produces no CQE at all with skip-success,
+// and res == 0 without it. A caller that must know whether an -ECANCELED is
+// coming (the WS backpressure pause, celeris#596) therefore cannot use the
+// skip-success form; res > 0 is the number of ops cancelled, res <= 0 means
+// none were.
+//
+// Not for the close-path cancels (cancelConnOps): those conns are being torn
+// down and nothing reads the outcome, so they keep the suppressed form and
+// its one-CQE-per-close saving.
+func prepCancelUserDataReported(sqePtr unsafe.Pointer, targetUD uint64) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = 0
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = targetUD
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelAll
+}
