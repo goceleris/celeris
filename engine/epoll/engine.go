@@ -44,6 +44,15 @@ type Engine struct {
 		closeCount   atomic.Uint64
 		bytesRead    atomic.Uint64
 		bytesWritten atomic.Uint64
+		// transplantAdopted / transplantDetached / transplantSlotOccupied
+		// are the #383 hand-off ledger, exported so the two halves of a
+		// transplant can be reconciled from outside the engine
+		// (celeris#624). detachFromEpoll fires no OnDisconnect and
+		// attachAdoptedFD fires no OnConnect by design, so without these
+		// the hand-off is invisible to every hook-derived counter.
+		transplantAdopted      atomic.Uint64
+		transplantDetached     atomic.Uint64
+		transplantSlotOccupied atomic.Uint64
 	}
 	// asyncRoutes is the static AsyncRoutes count snapshotted at
 	// construction from the handler's AsyncRouteCount (#300 G3).
@@ -107,6 +116,11 @@ func (e *Engine) Listen(ctx context.Context) error {
 			&e.metrics.asyncPromoted, &e.acceptPaused,
 			&e.metrics.acceptCount, &e.metrics.closeCount,
 			&e.metrics.bytesRead, &e.metrics.bytesWritten)
+		// #383 transplant ledger (celeris#624). Assigned after
+		// construction, like io_uring's, rather than widening newLoop.
+		l.transplantAdopted = &e.metrics.transplantAdopted
+		l.transplantDetached = &e.metrics.transplantDetached
+		l.transplantSlotOccupied = &e.metrics.transplantSlotOccupied
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -186,6 +200,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		CloseCount:         e.metrics.closeCount.Load(),
 		BytesRead:          e.metrics.bytesRead.Load(),
 		BytesWritten:       e.metrics.bytesWritten.Load(),
+
+		TransplantAdopted:           e.metrics.transplantAdopted.Load(),
+		TransplantDetached:          e.metrics.transplantDetached.Load(),
+		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
 	}
 }
 

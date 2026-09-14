@@ -72,7 +72,15 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 		// slot holder; do NOT close the fd here, since the slot holder may close
 		// the same descriptor number later and a double-close could hit an
 		// unrelated reused fd. Counts as an error; never observed in testing.
+		//
+		// "Never observed" was only ever true of the generic ErrorCount it
+		// bumps, which every other error path shares. The connection is
+		// lost here with no close and no hook, so it gets its own counter
+		// (celeris#624) and the claim becomes checkable.
 		w.errCount.Add(1)
+		if w.transplantSlotOccupied != nil {
+			w.transplantSlotOccupied.Add(1)
+		}
 		return
 	}
 

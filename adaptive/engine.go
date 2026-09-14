@@ -867,6 +867,26 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 	if asyncRoutes == 0 {
 		asyncRoutes = sm.AsyncRoutes
 	}
+	// The STANDBY's share of the two connection-lifecycle aggregates
+	// (celeris#624). ActiveConnections and CloseCount stay sums — the sum
+	// is the public contract and the controller divides it by Workers —
+	// but a promotion leaves every pre-switch keep-alive pinned on the
+	// standby until the transplant drain moves it, so only the split says
+	// which sub-engine a live-gauge step came from. Read from the active
+	// pointer rather than the controller's activeIsPrimary, which is
+	// switchMu-guarded; a switch concurrent with this call attributes the
+	// halves to the other side for one sample, which no cumulative or
+	// gauge value depends on. Zero while the lazy standby is unbuilt.
+	standby := standbyMetrics(e.active.Load(), primary, secondary, pm, sm)
+	// EVERY field below is listed in the order [engine.EngineMetrics]
+	// declares them, and every new field must be added here too. This
+	// literal silently dropped ten of them (celeris#627): a field absent
+	// from it is not "inherited", it is reported as zero, and the adaptive
+	// column of nightly 34893230678 duly published engine_workers=0,
+	// bytes_read=0 and bytes_written=0 on a cell serving 101 live
+	// connections. TestMetricsCarriesEveryFieldReflectively enforces the
+	// rule without naming fields, so the next one added cannot be dropped
+	// the same way.
 	return engine.EngineMetrics{
 		RequestCount:       pm.RequestCount + sm.RequestCount,
 		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
@@ -874,7 +894,34 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		Throughput:         pm.Throughput + sm.Throughput,
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
-		AdaptiveSwitches:   e.switchesTotal.Load(),
+		// Workers is summed, not taken from the active sub-engine: both
+		// exist simultaneously (the standby keeps its loops up and keeps
+		// serving its pinned keep-alives), so the sum is the divisor that
+		// matches the summed ActiveConnections above. It is 0 before Listen
+		// and while the lazy standby is unbuilt contributes nothing.
+		Workers: pm.Workers + sm.Workers,
+		// Cumulative connection-lifecycle and byte totals, additive across
+		// a switch exactly like AsyncPromotedConns: each event is
+		// attributed to whichever sub-engine owned the connection at the
+		// time. CloseCount in particular is what makes engine_closed vs
+		// hook_closed comparable on the only engine that can lose a
+		// connection to a hand-off (celeris#624).
+		AcceptCount:  pm.AcceptCount + sm.AcceptCount,
+		CloseCount:   pm.CloseCount + sm.CloseCount,
+		BytesRead:    pm.BytesRead + sm.BytesRead,
+		BytesWritten: pm.BytesWritten + sm.BytesWritten,
+		// The adaptive engine's own counter, not the sub-engines' (neither
+		// of them switches).
+		AdaptiveSwitches: e.switchesTotal.Load(),
+		// The celeris#586 recv-arming witnesses. io_uring-only and
+		// cumulative. RecvDoubleArmed and RecvCQEUnaccounted are
+		// must-stay-zero defect witnesses, so dropping them here made the
+		// adaptive engine report "clean" unconditionally (celeris#627).
+		RecvResumeWhileCancelPending: pm.RecvResumeWhileCancelPending + sm.RecvResumeWhileCancelPending,
+		RecvResumeWhileRecvInFlight:  pm.RecvResumeWhileRecvInFlight + sm.RecvResumeWhileRecvInFlight,
+		RecvArmDeclined:              pm.RecvArmDeclined + sm.RecvArmDeclined,
+		RecvDoubleArmed:              pm.RecvDoubleArmed + sm.RecvDoubleArmed,
+		RecvCQEUnaccounted:           pm.RecvCQEUnaccounted + sm.RecvCQEUnaccounted,
 		// Both are io_uring-only and additive: a detached conn lives on
 		// exactly one sub-engine, and window closes are cumulative events.
 		DetachedConnections: pm.DetachedConnections + sm.DetachedConnections,
@@ -886,7 +933,43 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ZCNotifs:         pm.ZCNotifs + sm.ZCNotifs,
 		InlineBytes:      pm.InlineBytes + sm.InlineBytes,
 		RingBytes:        pm.RingBytes + sm.RingBytes,
+		// The standby's share of the two gauges above — the only fields
+		// here that are NOT sums (celeris#624).
+		StandbyActiveConnections: standby.ActiveConnections,
+		StandbyCloseCount:        standby.CloseCount,
+		// The #383 hand-off ledger. Both halves of a transplant are
+		// cumulative and land on opposite sub-engines, so summing them is
+		// what makes TransplantDetached - TransplantAdopted the count of
+		// conns currently in flight between the two (celeris#624).
+		TransplantAdopted:           pm.TransplantAdopted + sm.TransplantAdopted,
+		TransplantDetached:          pm.TransplantDetached + sm.TransplantDetached,
+		TransplantAdoptSlotOccupied: pm.TransplantAdoptSlotOccupied + sm.TransplantAdoptSlotOccupied,
+		CloseMissingConnState:       pm.CloseMissingConnState + sm.CloseMissingConnState,
 	}
+}
+
+// standbyMetrics returns the snapshot belonging to the sub-engine that is NOT
+// currently active (celeris#624). active is the pointer published by e.active;
+// pm and sm are the snapshots already taken from primary and secondary, so the
+// split costs no second Metrics() call and no second round of atomic loads —
+// and both halves are guaranteed to come from the same pair of snapshots the
+// sums were computed from.
+//
+// Returns the zero snapshot when the active slot is unpublished or matches
+// neither sub-engine, which is also what an unbuilt lazy standby yields: a
+// standby that does not exist holds no connections.
+func standbyMetrics(active *engine.Engine, primary, secondary engine.Engine,
+	pm, sm engine.EngineMetrics) engine.EngineMetrics {
+	if active == nil {
+		return engine.EngineMetrics{}
+	}
+	switch *active {
+	case primary:
+		return sm
+	case secondary:
+		return pm
+	}
+	return engine.EngineMetrics{}
 }
 
 // Type returns the engine type.
