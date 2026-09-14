@@ -27,6 +27,7 @@ import (
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/validation"
 
 	"golang.org/x/sys/unix"
 )
@@ -329,10 +330,19 @@ type Worker struct {
 	transplantCount *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
 	// recvArm is the engine-wide recv-arming witness set (celeris#586);
 	// nil-safe so a bare test Worker literal can skip it.
-	recvArm           *recvArmStats
+	recvArm *recvArmStats
+	// zc is the engine-wide SEND_ZC exposure witness set (celeris#591);
+	// nil-safe so a bare test Worker literal can skip it.
+	zc                *zcStats
 	reqBatch          uint64 // batched request count, flushed to reqCount per iteration
 	bytesReadBatch    uint64 // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64 // batched send bytes, flushed to bytesWritten per iteration
+	// ringBytesBatch is the ring-send share of bytesWrittenBatch (the
+	// complement of the inline-egress bytes counted at the write site),
+	// flushed to zc.ringBytes on the same per-iteration cadence. Batched
+	// rather than an atomic add because completeSend IS the per-request
+	// send path (celeris#591).
+	ringBytesBatch uint64
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -460,6 +470,64 @@ type recvArmStats struct {
 	armDeclined              atomic.Uint64
 	doubleArmed              atomic.Uint64
 	cqeUnaccounted           atomic.Uint64
+}
+
+// zcStats are the SEND_ZC exposure witnesses behind celeris#585 (the
+// fabric A/B) and celeris#587 (the race tier on the ZC send state),
+// exported through engine.EngineMetrics (celeris#591). They answer the
+// one question those two cannot ask today: did the zero-copy branch run
+// at all? A clean A/B result or a clean race run with submits == 0 is
+// not evidence about SEND_ZC, it is evidence the code path was never
+// entered.
+//
+//   - submits: an IORING_OP_SEND_ZC SQE was armed by prepSendSQE. The
+//     add sits INSIDE the ZC arm, so the plain-SEND path that every
+//     sub-sendZCMinBytes response takes gains nothing.
+//   - notifs: a CQE_F_NOTIF completion was processed — the kernel
+//     released the pinned send buffer. submits - notifs is the number
+//     of buffers still pinned in DMA.
+//   - inlineBytes: payload bytes written by the detached inline-egress
+//     fast path's raw unix.Write(2), which bypasses the ring entirely
+//     and therefore can never be zero-copy.
+//   - ringBytes: payload bytes completed through ring sends. Fed from
+//     the worker-local ringBytesBatch with one atomic per event-loop
+//     iteration (see bytesWrittenBatch): the completion site is the
+//     per-request hot path and must not grow an atomic.
+//
+// inlineBytes + ringBytes is the egress-fabric split of BytesWritten —
+// without it a SEND_ZC throughput delta cannot be attributed, because a
+// WebSocket workload can ship most of its bytes off-ring.
+type zcStats struct {
+	submits     atomic.Uint64
+	notifs      atomic.Uint64
+	inlineBytes atomic.Uint64
+	ringBytes   atomic.Uint64
+}
+
+func (s *zcStats) noteSubmit() {
+	if s != nil {
+		s.submits.Add(1)
+	}
+}
+
+func (s *zcStats) noteNotif() {
+	if s != nil {
+		s.notifs.Add(1)
+	}
+}
+
+func (s *zcStats) noteInlineBytes(n uint64) {
+	if s != nil {
+		s.inlineBytes.Add(n)
+	}
+}
+
+// noteRingBytes publishes a worker's accumulated ring-send bytes. Called
+// once per event-loop iteration from the batch flush, never per send.
+func (s *zcStats) noteRingBytes(n uint64) {
+	if s != nil {
+		s.ringBytes.Add(n)
+	}
 }
 
 func (s *recvArmStats) noteResumeWhileCancelPending() {
@@ -924,6 +992,11 @@ func (w *Worker) run(ctx context.Context) {
 		if w.bytesWrittenBatch > 0 {
 			w.bytesWritten.Add(w.bytesWrittenBatch)
 			w.bytesWrittenBatch = 0
+		}
+		// Same cadence for the ring share of those bytes (celeris#591).
+		if w.ringBytesBatch > 0 {
+			w.zc.noteRingBytes(w.ringBytesBatch)
+			w.ringBytesBatch = 0
 		}
 
 		// Single atomic publish for all batched buffer returns (P0).
@@ -1669,6 +1742,14 @@ func (w *Worker) initProtocol(cs *connState) {
 					len(cs.sendBuf) == 0 && len(cs.bodyBuf) == 0 && len(cs.writeBuf) > 0 {
 					if n, werr := unix.Write(cs.fd, cs.writeBuf); werr == nil {
 						w.bytesWritten.Add(uint64(n))
+						// celeris#591: these bytes never touch the ring, so
+						// SEND_ZC cannot apply to them. InlineBytes vs
+						// RingBytes is the egress-fabric split the #585 A/B
+						// needs to attribute a throughput delta. One atomic
+						// per inline write, alongside the bytesWritten add
+						// that is already here — no per-request cost, this
+						// path only exists for detached (WS/SSE) egress.
+						w.zc.noteInlineBytes(uint64(n))
 						if n >= len(cs.writeBuf) {
 							cs.writeBuf = cs.writeBuf[:0]
 							mu.Unlock()
@@ -1676,6 +1757,16 @@ func (w *Worker) initProtocol(cs *connState) {
 						}
 						cs.writeBuf = cs.writeBuf[:copy(cs.writeBuf, cs.writeBuf[n:])]
 					}
+				} else if cs.zcNotifPending {
+					// celeris#591: the fast path declined with a SEND_ZC
+					// notification still outstanding — the kernel holds
+					// cs.sendBuf pinned for DMA and an inline write here
+					// would interleave with it on the wire. This is the
+					// witness that the ZC-vs-inline window was entered at
+					// all; a #587 race run that reports zero here never
+					// reached the interleaving it set out to test. Under
+					// detachMu (held), so not a racy read.
+					validation.IouringInlineGuardBlockedZC.Add(1)
 				}
 				mu.Unlock()
 				// Signal the event loop to flush the remainder. Do NOT call
@@ -2469,14 +2560,30 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
 	// Now safe to modify/reuse sendBuf. Process the deferred result.
 	if cqeIsNotif(c.Flags) {
+		// celeris#591: one atomic per NOTIF. Reached only on the ZC path —
+		// a plain SEND never produces a CQE_F_NOTIF completion.
+		w.zc.noteNotif()
+		validation.IouringSendZCNotifs.Add(1)
 		// zcNotifPending is read by the inline-egress guard on the dispatch
 		// goroutine under detachMu; clear it under the lock (completeSend
 		// re-acquires detachMu, so release first).
 		if mu := cs.detachMu; mu != nil {
 			mu.Lock()
+			// celeris#591: the NOTIF is the instant the guard reopens. If
+			// writeBuf already holds queued bytes, the very next inline
+			// unix.Write is admitted against data the worker has not yet
+			// flushed — the ordering celeris#587 exercises. Read under
+			// detachMu, the same lock the dispatch goroutine writes it
+			// under, so this witness is not itself a race.
+			if len(cs.writeBuf) > 0 {
+				validation.IouringZCCompletionWithPendingWrite.Add(1)
+			}
 			cs.zcNotifPending = false
 			mu.Unlock()
 		} else {
+			if len(cs.writeBuf) > 0 {
+				validation.IouringZCCompletionWithPendingWrite.Add(1)
+			}
 			cs.zcNotifPending = false
 		}
 		if w.completeSend(cs, fd, int(cs.zcSentBytes), now) {
@@ -2663,6 +2770,10 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) (close
 	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
 	// reach completeSend with the byte count).
 	w.bytesWrittenBatch += uint64(sent)
+	// celeris#591: the ring-send share of those bytes. Plain local add on
+	// the per-request send path — it is published with one atomic per
+	// event-loop iteration next to bytesWrittenBatch, never per request.
+	w.ringBytesBatch += uint64(sent)
 
 	// Partial-send handling, split by whether we issued a plain SEND
 	// (sendBuf only) or a WRITEV (sendBuf + sendBody). Partial WRITEV
@@ -4112,6 +4223,18 @@ func (w *Worker) flushSend(cs *connState) bool {
 // regular SEND.
 func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	if useSendZC(w.sendZC, linked, len(cs.sendBuf)) {
+		// celeris#591 exposure witnesses. Deliberately inside the ZC arm:
+		// every sub-sendZCMinBytes and every linked send — the per-request
+		// hot path — falls to the plain-SEND branches below and pays
+		// nothing. The detached split is keyed on h1State.Detached because
+		// a ZC send on a detached conn is the one that can race the
+		// dispatch goroutine's inline unix.Write (celeris#587); h1State is
+		// nil for a driver/EventLoopProvider conn.
+		w.zc.noteSubmit()
+		validation.IouringSendZCSubmits.Add(1)
+		if cs.h1State != nil && cs.h1State.Detached.Load() {
+			validation.IouringSendZCSubmitsDetached.Add(1)
+		}
 		if cs.fixedFile {
 			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
 		} else {
