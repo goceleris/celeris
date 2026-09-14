@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/engine/iouring"
 	"github.com/goceleris/celeris/middleware/store"
 )
 
@@ -160,6 +161,15 @@ func envInt589(name string, def int) int {
 // under stall589CtlTimeBar — 0.883-0.888 with the defect, 0 in 29 of 40 runs
 // and at most 0.037 with it fixed — and still logs the ANOMALY589 line so a
 // regression names itself in the output.
+//
+// Portability: the io_uring half of the matrix needs stall589Workers real
+// workers, and io_uring locks ~12 MiB per worker against RLIMIT_MEMLOCK, so on
+// a memlock-capped host (a GitHub Actions runner is 8 MiB = one worker) it
+// SKIPS via skipIfMemlockCaps589 instead of failing; the epoll half always
+// runs. Measured under the CI command line (`go test -race -count=1
+// -timeout=300s`) in golang:1.27, --cpus 4, seccomp=unconfined: with
+// `--ulimit memlock=8388608` the three io_uring subtests skip and the package
+// is ok in 35.9 s; with 128 MiB all six run (workers=2) in 70.2 s.
 //
 // Diagnostics (env, test-only): CELERIS_589_STACK=1 tallies the event-loop
 // goroutines' blocking site 100 ms into every stalled /ping (STACKTALLY589);
@@ -399,6 +409,53 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
+// skipIfMemlockCaps589 keeps this rig portable to a memlock-capped runner.
+// io_uring locks ~12 MiB of ring + provided-buffer pages per worker, so a host
+// with a low RLIMIT_MEMLOCK (GitHub Actions ships a soft limit of 8 MiB, which
+// is one worker at most) makes the engine start with FEWER workers than the rig
+// asks for. That is an environment fact, not a regression, and the rig needs
+// >1 worker by construction: the /ping probe must be able to land on a worker
+// other than the one that owns a sleeping /kv conn, which is exactly what the
+// celeris#593 sweep-blocking observable is measured against.
+//
+// The gate is the engine's OWN exported pre-flight (iouring.MaxWorkersForMemlock,
+// engine/iouring/ring.go) — the same rlim.Cur/minMemlockPerWorker arithmetic
+// capWorkersToMemlock applies at start — so the skip predicate and the cap that
+// would trigger it cannot drift apart. It returns -1 for "no cap" (RLIM_INFINITY
+// or an unreadable limit), in which case the rig runs.
+//
+// Nothing else is skipped: the epoll half of the matrix does not lock pages and
+// always runs, and when the cap DOES allow the workers the later
+// info.Metrics.Workers check still Fatals, because then a shortfall is the
+// engine's fault.
+func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
+	t.Helper()
+	if engType != IOUring {
+		return
+	}
+	maxW := iouring.MaxWorkersForMemlock()
+	if maxW == -1 || maxW >= workers {
+		return
+	}
+	// The byte figure in the hint mirrors engine/iouring's unexported
+	// minMemlockPerWorker (12 MiB) and is advisory only — the GATE above is
+	// the exported pre-flight, so a change to that constant cannot make the
+	// rig skip or run wrongly, only make this hint generous or tight.
+	t.Skipf("io_uring: RLIMIT_MEMLOCK allows %d worker(s), this rig needs %d "+
+		"(raise it: `ulimit -l unlimited`, docker --ulimit memlock=%d, or systemd LimitMEMLOCK=infinity)",
+		maxW, workers, workers*12*1024*1024)
+}
+
+// memlockCeiling589 renders the pre-flight ceiling for the workers-shortfall
+// Fatal, so the failure message says what the limit allowed rather than
+// speculating about it.
+func memlockCeiling589() string {
+	if maxW := iouring.MaxWorkersForMemlock(); maxW != -1 {
+		return strconv.Itoa(maxW) + " worker(s)"
+	}
+	return "unlimited workers (RLIM_INFINITY)"
+}
+
 // runStall589 runs one full measurement: start a real engine with 2 workers,
 // warm /kv, flip the store slow, hammer /kv on C keep-alive conns, sample
 // /ping on a pre-opened keep-alive conn, read the dispatch state, shut down.
@@ -414,6 +471,7 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	// dispatch goroutine) would stall every run.
 	workers := envInt589("CELERIS_589_WORKERS", stall589Workers)
 	o.kvConns = envInt589("CELERIS_589_KVCONNS", stall589KVConnsX*workers)
+	skipIfMemlockCaps589(t, engType, workers)
 
 	// Freeze the adaptive promotion clock: a promotion made during the run
 	// never expires, so the fixed/control worlds show exactly one inline run
@@ -495,7 +553,11 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	}
 	o.workers = info.Metrics.Workers
 	if o.workers != workers {
-		t.Fatalf("workers=%d, want %d (memlock cap? run with --ulimit memlock=-1)", o.workers, workers)
+		// skipIfMemlockCaps589 already cleared RLIMIT_MEMLOCK for this worker
+		// count, so a shortfall here is the engine's own doing, not the
+		// environment's: fail, do not skip.
+		t.Fatalf("workers=%d, want %d (RLIMIT_MEMLOCK allows %s, so this is NOT the memlock cap)",
+			o.workers, workers, memlockCeiling589())
 	}
 
 	// Warm-up on one keep-alive conn, sequential: settle (bounded loop, since
