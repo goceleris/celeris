@@ -216,6 +216,14 @@ type closedOpsEntry struct {
 // queuePendingRelease).
 const pendingReleaseHoldNanos int64 = int64(5 * time.Second)
 
+// shutdownSendDrainNanos bounds the send drain the run loop performs after
+// its context is cancelled (celeris#595): responses prepared by handlers that
+// were still running when Server.Shutdown fired are submitted and completed
+// through the normal loop rather than being discarded with the fd. 250 ms is
+// far above a loopback/LAN send completion yet small enough to stay inside
+// any sane Shutdown budget; a peer that has stopped reading simply hits it.
+const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
+
 // closingDrainTimeoutNanos bounds the deferred-close drain: how long a
 // connection may sit with cs.closing set, waiting for the SENDs queued at
 // close time to reach the kernel, before checkTimeouts tears it down anyway.
@@ -384,6 +392,12 @@ type Worker struct {
 	// releases all colliding conns only after every expected terminal
 	// CQE arrived (errs toward holding longer; see closedOpsEntry).
 	closedOps map[uint64]*closedOpsEntry
+
+	// shutdownDrainDeadline is the wall-clock (UnixNano) bound on the
+	// send drain the run loop performs once its context is cancelled
+	// (celeris#595). Zero until the first cancelled iteration; worker
+	// thread only, never read on the hot path.
+	shutdownDrainDeadline int64
 
 	dirtyHead      *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns  bool       // set when provided buffers need publishing
@@ -775,8 +789,29 @@ func (w *Worker) run(ctx context.Context) {
 
 	for {
 		if ctx.Err() != nil {
-			w.shutdown()
-			return
+			// celeris#595: a response produced by a handler that was
+			// still running when the context was cancelled has only been
+			// PREPARED at this point — flushSend sets cs.sending when it
+			// writes the SEND SQE, but the submit that hands it to the
+			// kernel happens further down this same loop, AFTER this
+			// check. Tearing down here closed the fd with the response
+			// still sitting in the SQ ring, so a request in flight at
+			// Server.Shutdown died as a connection reset instead of
+			// completing. Keep pumping the loop — which submits those
+			// SQEs and reaps their completions through the normal path —
+			// until no send is queued or in flight, bounded by
+			// shutdownSendDrainNanos so a peer that stopped reading
+			// cannot hold shutdown open. The loop keeps accepting for
+			// that window — it is the ordinary iteration — which is the
+			// graceful side of the trade: a connection that arrives
+			// inside it is answered rather than reset.
+			if w.shutdownDrainDeadline == 0 {
+				w.shutdownDrainDeadline = time.Now().UnixNano() + shutdownSendDrainNanos
+			}
+			if !w.hasPendingSends() || time.Now().UnixNano() > w.shutdownDrainDeadline {
+				w.shutdown()
+				return
+			}
 		}
 
 		// ACTIVE → DRAINING: cancel pending io_uring operations on the listen
@@ -4626,6 +4661,48 @@ func (w *Worker) checkTimeouts() {
 			}
 		}
 	}
+}
+
+// hasPendingSends reports whether any live connection still has response bytes
+// queued for the ring or a SEND in flight in the kernel. Called only from the
+// shutdown drain in run() (celeris#595), never on the hot path, so the
+// O(live conns) scan costs nothing per request.
+//
+// Conns with detachMu (detached streams AND async-dispatch conns) have their
+// buffers written by another goroutine, so they are inspected under that
+// mutex — with TryLock, never a blocking Lock: a dispatch goroutine parked
+// inside a write must not be able to wedge shutdown. A conn whose mutex is
+// held right now counts as pending, which at worst spends the drain window
+// on it and then tears down exactly as before.
+func (w *Worker) hasPendingSends() bool {
+	for _, fd := range w.liveConns {
+		cs := w.conns[fd]
+		if cs == nil {
+			continue
+		}
+		if mu := cs.detachMu; mu != nil {
+			if !mu.TryLock() {
+				return true
+			}
+			pending := connSendPending(cs)
+			mu.Unlock()
+			if pending {
+				return true
+			}
+			continue
+		}
+		if connSendPending(cs) {
+			return true
+		}
+	}
+	return false
+}
+
+// connSendPending reports whether cs has response bytes staged for a SEND or
+// a SEND already handed to the kernel. Callers own the synchronisation (see
+// hasPendingSends).
+func connSendPending(cs *connState) bool {
+	return cs.sending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 || len(cs.bodyBuf) > 0
 }
 
 func (w *Worker) shutdown() {
