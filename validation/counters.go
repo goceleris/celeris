@@ -24,4 +24,11 @@ type Counters struct {
 	IouringSendZCNotifs                 uint64 `json:"iouring_send_zc_notifs"`
 	IouringInlineGuardBlockedZC         uint64 `json:"iouring_inline_guard_blocked_zc"`
 	IouringZCCompletionWithPendingWrite uint64 `json:"iouring_zc_completion_with_pending_write"`
+
+	// IouringSendZCFallbacks is the celeris#609 witness: SEND_ZC
+	// completions that failed with EINVAL/ENOMEM and were retried as a
+	// plain SEND rather than closing the connection. Anything above the
+	// worker count means sends armed before the opcode was retired
+	// completed after it and were classified correctly.
+	IouringSendZCFallbacks uint64 `json:"iouring_send_zc_fallbacks"`
 }
