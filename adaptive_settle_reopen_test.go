@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -322,8 +323,15 @@ func TestRouteAdaptive_NoReopenerWhenEngineCreationFails(t *testing.T) {
 // a tight loop, so the two rates are measured separately rather than inferred
 // from this test's own (artificially fast) re-open cadence.
 func TestRouteAdaptive_SettleReopenCost(t *testing.T) {
-	if testing.Short() {
-		t.Skip("celeris#592 cost measurement saturates every core for a few seconds; -short skips it")
+	// Opt-in, like the other measurement rigs in this tree. CI's race job
+	// runs `go test -race -count=1 -timeout=300s` over the root package with
+	// NO -short, so a testing.Short() guard would not skip it there: measured
+	// at 35 s under -race on 2 cores, against a step that takes 154 s today.
+	// It is also a THROUGHPUT measurement, so a shared CI runner is the wrong
+	// instrument for it regardless of the cost. Run it with
+	// CELERIS_592_COST=1 (see the commit that added it for the numbers).
+	if os.Getenv("CELERIS_592_COST") == "" {
+		t.Skip("celeris#592 cost measurement: set CELERIS_592_COST=1 to run it (saturates every core for ~35 s under -race)")
 	}
 	const (
 		path      = "/s"
