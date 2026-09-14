@@ -133,9 +133,13 @@ func envInt589(name string, def int) int {
 //   - LATENCY (epoll only): fewer than stall592MaxStalledFrac of the /ping
 //     samples taken AFTER promotion exceed stall589StallBar.
 //
-// io_uring's fraction is PRINTED, not asserted: even the fully async control
-// pins the io_uring worker ~30% of wall time through the celeris#593 timeout
-// sweep (see the note below), which is a separate defect with its own fix.
+// io_uring's fraction is PRINTED, not asserted: when this rig was written even
+// the fully async control pinned the io_uring worker ~30 % of wall time through
+// the celeris#593 timeout sweep (see the note below), a separate defect with
+// its own fix. That fix is PR #604, which now sits underneath this branch, and
+// the io_uring fraction measured on this tree is 0.000 in 10/10 settled runs.
+// The bar stays epoll-only so this change does one thing; the IOURING592 line
+// carries the number for whoever tightens it.
 //
 // The observable follows the two binding adversarial-review corrections on the
 // issue: the PRIMARY assertion is the dispatch STATE after the route has turned
@@ -177,13 +181,30 @@ func envInt589(name string, def int) int {
 // dispatch policy, so the controls assert the median and report the fraction,
 // and log an ANOMALY589 line whenever a control's fraction exceeds 5 %.
 //
+// That paragraph is now HISTORY, and the two fixes compose. celeris#593 is
+// fixed on main by PR #604 (checkTimeouts/handleHeaderTimer TryLock the
+// h1State snapshot instead of blocking on detachMu), and re-measured on this
+// rebased tree — 10 runs per engine, golang:1.27, --cpus 4,
+// seccomp=unconfined, --ulimit memlock=128 MiB — every one of the 60 subtests
+// passes with stalled_frac 0.000: io_uring settled 0/874-960 samples over 5 ms
+// in 10/10 (ping_max 0.30-2.49 ms, previously ~0.30 of the window), epoll
+// settled 0.000 in 10/10, and both controls 0.000 on both engines. The route
+// promotes in 5415-5422 ms of the 8 s bound with AsyncPromotedConns=8 every
+// run, and claim589_assert reports the #589 defect signature as absent in all
+// 60. No ANOMALY589 line was emitted and no data race was reported.
+//
 // Portability: the io_uring half of the matrix needs stall589Workers real
 // workers, and io_uring locks ~12 MiB per worker against RLIMIT_MEMLOCK, so on
 // a memlock-capped host (a GitHub Actions runner is 8 MiB = one worker) it
 // SKIPS via skipIfMemlockCaps589 instead of failing; the epoll half always
 // runs. Without that pre-flight the capped runner does not merely under-fill
 // the engine, it fails the readiness wait below (which holds out for the whole
-// worker set) — the shape that failed CI on PR #603.
+// worker set) — the shape that failed CI on PR #603 (`server did not become
+// ready (... Workers:1 ...), want 2 workers`, memlock_cur_bytes=8388608).
+// Measured under the CI command line (`go test -race -count=1 -timeout=300s`)
+// in golang:1.27, --cpus 4, seccomp=unconfined: with `--ulimit
+// memlock=8388608` the three io_uring subtests SKIP with the memlock reason,
+// epoll runs 3/3 and the package is ok; with 128 MiB all six run at workers=2.
 //
 // Diagnostics (env, test-only): CELERIS_589_STACK=1 tallies the event-loop
 // goroutines' blocking site 100 ms into every stalled /ping (STACKTALLY589);
@@ -304,9 +325,12 @@ func assertSettledStall589(o stall589Obs) error {
 // assertSettledRetimed592 is the FIXED behaviour: the settled classification is
 // re-timed, so a settled route whose store turns slow is promoted and stops
 // running on the engine worker. State is asserted on both engines; the /ping
-// stall fraction is asserted on epoll only, because io_uring separately pins
+// stall fraction is asserted on epoll only, because io_uring separately pinned
 // its worker in the timeout sweep even when every conn is async-dispatched
-// (celeris#593) — that fraction is printed instead.
+// (celeris#593) — that fraction is printed instead. #593 is fixed on main by
+// PR #604, which now sits underneath this branch, and the printed io_uring
+// fraction is 0; the bar is left epoll-only so this PR changes exactly one
+// thing, but the IOURING592 line carries the number if it is ever tightened.
 func assertSettledRetimed592(o stall589Obs) error {
 	switch {
 	case !o.promotedInBound:
@@ -430,11 +454,17 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 	// held by runAsyncHandler across the slow ProcessH1). Name it on its own
 	// line so the CONTROL_OK verdict (decided on the median) cannot hide it.
 	// io_uring is not judged on the settled mode's latency: PRINT its fraction
-	// next to the epoll bar so the unasserted number is on the record.
+	// next to the epoll bar so the unasserted number is on the record. The
+	// celeris#593 sweep pin this allowance was written for is FIXED on main
+	// (PR #604, the checkTimeouts/handleHeaderTimer TryLock), and the printed
+	// fraction is 0 on this tree — so the line is now a witness that the two
+	// fixes compose, and the number to watch if the bar is ever tightened to
+	// cover both engines.
 	if o.engine == "iouring" && o.mode == stall589Settled.String() {
 		t.Logf("IOURING592 engine=iouring mode=settled stalled=%d/%d stalled_frac=%.3f (epoll bar %.2f, NOT asserted here) "+
-			"ping_med_ms=%.3f ping_max_ms=%.1f promote_ms=%.0f async_promoted_conns=%d: io_uring carries the separate "+
-			"celeris#593 sweep pin (checkTimeouts blocks on detachMu held by runAsyncHandler across the slow ProcessH1) until that fix lands",
+			"ping_med_ms=%.3f ping_max_ms=%.1f promote_ms=%.0f async_promoted_conns=%d: reported, not asserted — the "+
+			"celeris#593 sweep pin (checkTimeouts blocking on detachMu held by runAsyncHandler across the slow ProcessH1) "+
+			"is fixed by PR #604 underneath this branch",
 			o.stalled, o.samples, o.stalledFrac, stall592MaxStalledFrac, ms(o.pingMed), ms(o.pingMax), ms(o.promoteLatency), o.asyncPromotedConns)
 	}
 	if o.mode != stall589Settled.String() && o.stalledFrac > 0.05 {
