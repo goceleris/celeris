@@ -109,7 +109,11 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// Workers is the number of I/O workers (io_uring) or event loops
 	// (epoll) the engine is running. Static after Listen. The adaptive
 	// controller divides ActiveConnections by it to derive the
-	// conns-per-worker load signal that drives engine selection.
+	// conns-per-worker load signal that drives engine selection — and it
+	// reads that pair off the ACTIVE sub-engine, not off the adaptive
+	// wrapper, which reports the SUM over both sub-engines (both run at
+	// once, so the sum is the divisor matching the summed
+	// ActiveConnections). Zero before Listen.
 	Workers int
 	// AcceptCount is the cumulative number of connections accepted by this
 	// engine since start. Together with elapsed time it yields the accept
