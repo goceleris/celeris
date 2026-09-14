@@ -104,6 +104,68 @@ type clientProbe struct {
 	tail        [8]byte
 	tailLen     int
 	writeErr    string // the error that ended a failed writeAll, if any
+	// Snapshots taken at the instant the wait ended, while both sockets
+	// are still open. Post-mortem is useless here: the client defers
+	// Close, so by dump time the kernel has forgotten the connection and
+	// the reader has been torn down.
+	sock sockPair
+	rdr  readerState
+}
+
+// sockPair is what the kernel says about both ends of one connection,
+// read from /proc/net/tcp. It is the layer below every counter in this
+// test: when a peer reports that the close handshake never finished, the
+// first fork in the road is whether the bytes are still sitting in the
+// SERVER's receive queue -- the engine is not reading a socket that has
+// data -- or whether that queue is empty, in which case nothing was lost
+// below the middleware. No counter in this oracle could see that.
+type sockPair struct {
+	ok                       bool
+	clientState, serverState string
+	clientTx, clientRx       int64
+	serverTx, serverRx       int64
+}
+
+// tcpState names the /proc/net/tcp st column.
+var tcpState = map[string]string{
+	"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1",
+	"05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT",
+	"09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING",
+}
+
+// snapshotSockets reads /proc/net/tcp and returns both ends of the
+// connection whose CLIENT side is bound to localPort. Cold: called only
+// for a connection whose close wait already went wrong.
+func snapshotSockets(localPort int) sockPair {
+	var sp sockPair
+	b, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return sp
+	}
+	want := fmt.Sprintf(":%04X", localPort)
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || f[0] == "sl" {
+			continue
+		}
+		local, rem, st, q := f[1], f[2], f[3], f[4]
+		tx, rx := int64(-1), int64(-1)
+		if i := strings.IndexByte(q, ':'); i > 0 {
+			tx, _ = strconv.ParseInt(q[:i], 16, 64)
+			rx, _ = strconv.ParseInt(q[i+1:], 16, 64)
+		}
+		name := tcpState[strings.ToUpper(st)]
+		if name == "" {
+			name = st
+		}
+		switch {
+		case strings.HasSuffix(local, want):
+			sp.ok, sp.clientState, sp.clientTx, sp.clientRx = true, name, tx, rx
+		case strings.HasSuffix(rem, want):
+			sp.ok, sp.serverState, sp.serverTx, sp.serverRx = true, name, tx, rx
+		}
+	}
+	return sp
 }
 
 func (p *clientProbe) sawServerClose() bool {
@@ -416,6 +478,16 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						if err := writeAllErr(c, batch[start:start+need], 15*time.Second); err != nil {
 							clientCloseFail.Add(1)
 							p.outcome, p.writeErr = "tailFixFail", err.Error()
+							if _, ps, perr := net.SplitHostPort(p.laddr); perr == nil {
+								if pn, cerr := strconv.Atoi(ps); cerr == nil {
+									p.sock = snapshotSockets(pn)
+								}
+							}
+							hpMu.Lock()
+							if i < len(hconn) {
+								p.rdr = snapshotReader(hconn[i])
+							}
+							hpMu.Unlock()
 							return
 						}
 						wrote += need
@@ -472,6 +544,22 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						}
 						if d > slow && p.outcome != "closeTimeout" {
 							slowClose.Add(1)
+						}
+						// Cold: only a connection that already went wrong
+						// pays for this, and both sockets are still open
+						// here, which is the only moment the kernel can
+						// still answer.
+						if p.outcome != "closedOK" || d > slow {
+							if _, ps, perr := net.SplitHostPort(p.laddr); perr == nil {
+								if pn, cerr := strconv.Atoi(ps); cerr == nil {
+									p.sock = snapshotSockets(pn)
+								}
+							}
+							hpMu.Lock()
+							if i < len(hconn) {
+								p.rdr = snapshotReader(hconn[i])
+							}
+							hpMu.Unlock()
 						}
 						return
 					}
@@ -598,6 +686,18 @@ func dumpCloseProbe(t *testing.T, kind string, cp []clientProbe, hp []handlerPro
 			p.closeSentAt.Round(time.Millisecond), p.endAt.Round(time.Millisecond),
 			p.postBytes, p.postReads, firstByte, lastByte, p.sawServerClose(), p.tail[:p.tailLen], p.finalErr,
 			p.preDrainBytes, p.floodEnd.Round(time.Millisecond), p.preDrainEnd.Round(time.Millisecond), p.writeErr)
+		if p.sock.ok {
+			t.Logf("%s SOCKPROBE conn %d laddr=%s client=%s tx=%d rx=%d | server=%s tx=%d rx=%d "+
+				"(server rx>0 with an idle handler = the engine is not reading a socket that has data)",
+				kind, i, p.laddr, p.sock.clientState, p.sock.clientTx, p.sock.clientRx,
+				p.sock.serverState, p.sock.serverTx, p.sock.serverRx)
+		}
+		if p.rdr.ok {
+			t.Logf("%s LIVEREADER conn %d laddr=%s depth=%d/%d high=%d low=%d spill=%d paused=%v "+
+				"readerClosed=%v spilled=%d dropped=%d wsClosed=%v wsCloseSent=%v (sampled AT the failure, not after)",
+				kind, i, p.laddr, p.rdr.depth, p.rdr.capacity, p.rdr.high, p.rdr.low, p.rdr.spill,
+				p.rdr.paused, p.rdr.closed, p.rdr.spilled, p.rdr.dropped, p.rdr.wsClosed, p.rdr.wsCloseSent)
+		}
 		h := &hp[i]
 		if !h.set {
 			t.Logf("%s HANDLERPROBE conn %d laddr=%s STILL RUNNING at dump time", kind, i, p.laddr)
