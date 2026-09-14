@@ -1,6 +1,7 @@
 package celeris
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -277,13 +278,54 @@ func TestRouteAsync_AdaptiveSettles(t *testing.T) {
 	}
 }
 
-// stubNowNano installs a controllable clock for the adaptive promotion TTL
-// (celeris#364) and returns a pointer to advance it plus a restore func.
-func stubNowNano() (clock *int64, restore func()) {
-	old := nowNano
-	var c int64
-	nowNano = func() int64 { return c }
-	return &c, func() { nowNano = old }
+// nowNano (router.go) is a package var so the adaptive promotion TTL
+// (celeris#364) can be driven deterministically from tests. ASSIGNING to it
+// from a test is a data race whenever an engine is serving: the event-loop
+// goroutines read it through router.isPromoted -> adaptivePromoted ->
+// routeAsync on every request for a promoted route. celeris#620: the
+// celeris#592 rig restored the clock from a t.Fatalf's runtime.Goexit while
+// its epoll loop was still up, so EVERY failure of that test also reported a
+// WARNING: DATA RACE and the real diagnosis had to be dug out from under it.
+//
+// The fix is structural rather than a rule about cleanup ordering, because a
+// rule only holds until the next test forgets it: the indirection is installed
+// exactly ONCE, in this init, before any test has had the chance to start a
+// server, and stubbing after that only flips atomics. nowNano itself is never
+// written again for the life of the test binary, so no call site — this rig
+// or any future one — can reintroduce the write that raced.
+//
+// Cost is one atomic.Bool load per nowNano call, in the test binary only
+// (this file is _test.go), on a path that already only runs for routes in the
+// promoted set.
+var (
+	realNowNano  = nowNano
+	stubbedNow   atomic.Int64
+	stubbedNowOn atomic.Bool
+)
+
+func init() {
+	nowNano = func() int64 {
+		if stubbedNowOn.Load() {
+			return stubbedNow.Load()
+		}
+		return realNowNano()
+	}
+}
+
+// stubNowNano freezes the adaptive clock for the rest of t and returns the
+// frozen value for the test to Store/Add. It is released by a t.Cleanup, which
+// runs after every deferred call in the test body and after every cleanup
+// registered later — so a server the test starts is shut down first even
+// though the release is now race-free either way. Stubs do not nest: a second
+// concurrent stub would silently steal the first one's clock.
+func stubNowNano(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	if !stubbedNowOn.CompareAndSwap(false, true) {
+		t.Fatal("the adaptive clock is already stubbed (stubNowNano does not nest)")
+	}
+	stubbedNow.Store(0)
+	t.Cleanup(func() { stubbedNowOn.Store(false) })
+	return &stubbedNow
 }
 
 // TestRouteAsync_PromotionExpires verifies celeris#364: promotion is reversible.
@@ -291,8 +333,7 @@ func stubNowNano() (clock *int64, restore func()) {
 // and run inline again, and the de-promotion must reset the slow streak so a
 // single later slow run does not immediately re-promote.
 func TestRouteAsync_PromotionExpires(t *testing.T) {
-	clock, restore := stubNowNano()
-	defer restore()
+	clock := stubNowNano(t)
 
 	s := New(Config{AsyncHandlers: true})
 	s.GET("/d", noopHandler)
@@ -306,13 +347,13 @@ func TestRouteAsync_PromotionExpires(t *testing.T) {
 	}
 
 	// Within the TTL → still promoted.
-	*clock += int64(adaptivePromoteTTL) - 1
+	clock.Add(int64(adaptivePromoteTTL) - 1)
 	if !rt.routeAsync("GET", "/d") {
 		t.Fatal("promotion must persist within the TTL")
 	}
 
 	// Past the TTL → de-promoted, route runs inline again.
-	*clock += 2
+	clock.Add(2)
 	if rt.routeAsync("GET", "/d") {
 		t.Fatal("promotion must expire after the TTL (route runs inline again)")
 	}
@@ -331,8 +372,7 @@ func TestRouteAsync_PromotionExpires(t *testing.T) {
 // route de-promotes, sustained fast runs SETTLE it (proven non-blocking, inline
 // forever) — i.e. re-evaluation works end to end.
 func TestRouteAsync_DePromotedRouteCanSettle(t *testing.T) {
-	clock, restore := stubNowNano()
-	defer restore()
+	clock := stubNowNano(t)
 
 	s := New(Config{AsyncHandlers: true})
 	s.GET("/d", noopHandler)
@@ -341,7 +381,7 @@ func TestRouteAsync_DePromotedRouteCanSettle(t *testing.T) {
 	for i := 0; i < adaptivePromoteStreak; i++ {
 		rt.recordInlineRun("/d", true)
 	}
-	*clock += int64(adaptivePromoteTTL) + 1
+	clock.Add(int64(adaptivePromoteTTL) + 1)
 	if rt.routeAsync("GET", "/d") {
 		t.Fatal("expected de-promotion at expiry")
 	}
@@ -361,8 +401,7 @@ func TestRouteAsync_DePromotedRouteCanSettle(t *testing.T) {
 // adaptive route re-promotes after the TTL re-evaluation — de-promotion must not
 // pin a blocking handler to the inline path.
 func TestRouteAsync_RePromotesAfterExpiryWhenBlocking(t *testing.T) {
-	clock, restore := stubNowNano()
-	defer restore()
+	clock := stubNowNano(t)
 
 	s := New(Config{AsyncHandlers: true})
 	s.GET("/b", noopHandler)
@@ -371,7 +410,7 @@ func TestRouteAsync_RePromotesAfterExpiryWhenBlocking(t *testing.T) {
 	for i := 0; i < adaptivePromoteStreak; i++ {
 		rt.recordInlineRun("/b", true)
 	}
-	*clock += int64(adaptivePromoteTTL) + 1
+	clock.Add(int64(adaptivePromoteTTL) + 1)
 	if rt.routeAsync("GET", "/b") {
 		t.Fatal("expected de-promotion at expiry")
 	}
