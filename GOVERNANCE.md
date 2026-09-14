@@ -96,13 +96,22 @@ so the design can be discussed without a diff attached.
   cut.
 - Sub-module tags (`middleware/<name>/vX.Y.Z`) are created by the same
   workflow, at the same commit.
-- If a GitHub Release is ever created by hand, the workflow still runs the
-  same checks first and stops before tagging sub-modules or notifying the
-  Go proxy. Recovery: while `https://proxy.golang.org/github.com/goceleris/celeris/@v/vX.Y.Z.info`
-  still answers 404 nobody has fetched the version and
-  `gh release delete vX.Y.Z --cleanup-tag` is harmless; once the proxy
-  has served it the version is burned, and the fix ships as the next
-  patch version.
+- If a GitHub Release is ever created by hand, the workflow runs the same
+  version-stamp gate and the same CI, and then **stops**: the sub-module
+  tags and the Go-proxy notification are reached only from the dispatch
+  path. Recovery is therefore still open: while
+  `https://proxy.golang.org/github.com/goceleris/celeris/@v/vX.Y.Z.info`
+  answers 404 nobody has fetched the version and
+  `gh release delete vX.Y.Z --cleanup-tag` is harmless; once the proxy has
+  served it the version is burned and the fix ships as the next patch.
+- **The workflow's tag creation needs a ruleset bypass that is not granted
+  today.** The `Release tags` ruleset blocks `creation` on `refs/tags/v*`
+  and lists only `OrganizationAdmin` as a bypass actor, so
+  `gh release create` running as `github-actions[bot]` is refused. Until
+  the Actions identity is added to that ruleset's bypass list, the
+  dispatch path stops at the tag and the maintainer must create the tag by
+  hand — which lands on the stop-early path above. Every release cut so
+  far has been hand-tagged, so this path has never executed.
 - **Release notes are generated from PR labels** (`breaking`, `security`,
   `bug`, `performance`, `enhancement`; see
   [`.github/release.yml`](.github/release.yml)) plus hand-written

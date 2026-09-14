@@ -112,7 +112,14 @@ jobs:
   tag-submodules:
     name: Tag Sub-Modules
     needs: [resolve, gate, ci, publish]
-    if: always() && needs.gate.result == 'success' && needs.ci.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    # Only the dispatch path continues. On the hand-created-release path
+    # `publish` is SKIPPED, and the previous `|| skipped` here meant this job
+    # and the proxy ping below ran anyway — the exact opposite of what this
+    # file's header and GOVERNANCE.md promise, and it burned the version on
+    # the Go proxy, closing the documented recovery (delete while the proxy
+    # still answers 404). A hand-created release now gets the gate and CI and
+    # stops here.
+    if: always() && needs.resolve.outputs.dispatch == 'true' && needs.gate.result == 'success' && needs.ci.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     # The only job that pushes to the repository (sub-module tags).
     permissions:
@@ -142,7 +149,7 @@ jobs:
   notify-proxy:
     name: Notify Go Proxy
     needs: [resolve, tag-submodules]
-    if: always() && needs.tag-submodules.result == 'success'
+    if: always() && needs.resolve.outputs.dispatch == 'true' && needs.tag-submodules.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
