@@ -119,7 +119,7 @@ type Loop struct {
 	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
 	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
 	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
-	reqBatch          uint64         // batched request count, flushed to reqCount per iteration
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 3 increment sites, all on the loop (celeris#626)
 	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
 	tickCounter       uint32
@@ -1083,6 +1083,16 @@ func (l *Loop) drainRead(fd int, now int64) {
 				// Goroutine is parked in asyncCond.Wait — wake it.
 				cs.asyncCond.Signal()
 			}
+			// celeris#626: count this recv. The dispatch path `continue`s,
+			// so it never reaches the inline reqBatch++ below — before this
+			// line an async-promoted conn stopped being counted entirely and
+			// RequestCount (plus Throughput and the adaptive controller's
+			// BytesPerReq, which divides by it) silently flat-lined on the
+			// busiest conns. Counted HERE, on the loop thread, so reqBatch
+			// stays worker-thread-only exactly like bytesReadBatch and
+			// addWrittenBytes(_, true); the dispatch goroutine must never
+			// touch it. Mirrors iouring's asyncFeed site (worker.go).
+			l.reqBatch++
 			continue
 		}
 
@@ -1137,6 +1147,14 @@ func (l *Loop) drainRead(fd int, now int64) {
 				} else {
 					cs.asyncCond.Signal()
 				}
+				// celeris#626: count the promoting recv exactly once, here.
+				// This branch `continue`s, so the inline reqBatch++ below is
+				// NOT also reached — no double count at the promotion
+				// boundary. The stashed bytes are replayed by the dispatch
+				// goroutine, which does not count; every later recv on this
+				// conn is counted by the asyncFeed site above. Mirrors
+				// iouring's promoteConnToAsync.
+				l.reqBatch++
 				continue
 			}
 			if errors.Is(processErr, conn.ErrUpgradeH2C) {
