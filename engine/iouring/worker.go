@@ -4614,6 +4614,39 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 		return false
 	}
 
+	// Never chain on a DETACHED connection (celeris#607).
+	//
+	// IOSQE_IO_LINK is an ordering constraint: the kernel does not start
+	// the RECV until the SEND completes. On the H1 request/response cycle
+	// that costs nothing, because the peer does not send the next request
+	// until it has read this response — the two directions alternate by
+	// protocol, so ordering them changes nothing.
+	//
+	// A detached connection (WebSocket / SSE) has no such alternation. Its
+	// two directions are independent streams, and a peer is free to keep
+	// sending while it stops reading — which is exactly what backpressure
+	// IS. The send then blocks on the peer's closed receive window, and
+	// because the recv is chained behind it the connection cannot read at
+	// all for as long as that lasts: measured at up to 14 s here, with the
+	// peer's own bytes piling up unread in the server's receive queue and
+	// cs.recvArmed true the whole time, so no other arming site will place
+	// a second recv (and it must not — that is celeris#484). The peer's
+	// Close frame sits in that queue and the close handshake times out.
+	//
+	// Unchained, the detached path becomes exactly what the provided-buffer
+	// path has always been: flushSend here, and the caller's own
+	// `!cqeHasMore && !cs.recvLinked && !cs.recvPaused` tail arms the recv
+	// independently — the same standalone arm that runs today whenever the
+	// ring has only one free SQE. The syscall count is unchanged either
+	// way: both SQEs go to the kernel in the same io_uring_enter, so what
+	// the chain buys is ordering, and on H1 that ordering is worth having
+	// (the recv starts only once the peer could plausibly have sent, so it
+	// tends to find data rather than arm a poll). A detached conn gets no
+	// such benefit and pays the liveness cost, so it does not chain.
+	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
+		return w.flushSend(cs)
+	}
+
 	// Partial send remainder — no linking (RECV may already be in flight).
 	if len(cs.sendBuf) > 0 {
 		return w.flushSend(cs)
