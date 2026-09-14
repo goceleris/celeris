@@ -3,6 +3,7 @@
 package adaptive
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/goceleris/celeris/engine"
@@ -130,5 +131,117 @@ func TestMetricsStandbyZeroWhenStandbyUnbuilt(t *testing.T) {
 		t.Errorf("unbuilt standby reported active %d / close %d, want 0 / 0 — the "+
 			"split is attributing the ACTIVE engine's conns to a standby that "+
 			"does not exist", m.StandbyActiveConnections, m.StandbyCloseCount)
+	}
+}
+
+// fillEveryField sets every field of an EngineMetrics to a distinct nonzero
+// value, reflectively, so the test never has to name them. base separates the
+// two sub-engines' values so a "sum" that silently picks one side is still
+// caught by the exact-value assertions below.
+func fillEveryField(base int) engine.EngineMetrics {
+	var m engine.EngineMetrics
+	v := reflect.ValueOf(&m).Elem()
+	for i := range v.NumField() {
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.Int, reflect.Int32, reflect.Int64:
+			f.SetInt(int64(base + i))
+		case reflect.Uint, reflect.Uint32, reflect.Uint64:
+			f.SetUint(uint64(base + i))
+		case reflect.Float32, reflect.Float64:
+			f.SetFloat(float64(base + i))
+		default:
+			// A new field of an unhandled kind would be left at zero and
+			// would then fail the aggregation check below for the wrong
+			// reason. Fail loudly instead of silently skipping it.
+			panic("fillEveryField: unhandled kind " + f.Kind().String() +
+				" for EngineMetrics." + v.Type().Field(i).Name)
+		}
+	}
+	return m
+}
+
+// TestMetricsCarriesEveryFieldReflectively is celeris#627.
+//
+// adaptive.Engine.Metrics() builds its result as a field-by-field struct
+// literal, and a field omitted from that literal is not inherited from the
+// sub-engines — it is reported as ZERO. Ten fields were missing, including
+// Workers, AcceptCount, BytesRead/BytesWritten and the must-stay-zero
+// celeris#586 recv witnesses, so nightly 34893230678's adaptive column
+// published engine_workers=0 and bytes_read=0 on a cell serving 101 live
+// connections while the epoll and io_uring columns of the same refapp
+// reported 12 workers and tens of megabytes.
+//
+// The check is driven over the struct by reflection ON PURPOSE. A test that
+// enumerates today's field names would drop the next field added exactly the
+// way the literal dropped these ten: the failure mode is an omission, and you
+// cannot enumerate your way out of an omission.
+func TestMetricsCarriesEveryFieldReflectively(t *testing.T) {
+	e, _ := newAdaptiveStartingOnEpoll(t)
+	e.primary.(*mockEngine).SetMetrics(fillEveryField(1000))
+	e.secondary.(*mockEngine).SetMetrics(fillEveryField(2000))
+	// AdaptiveSwitches is the one field sourced from the adaptive engine
+	// itself rather than from a sub-engine, so give it a nonzero source too
+	// — the rule below then applies to every field with no exemptions.
+	e.switchesTotal.Store(7)
+
+	got := reflect.ValueOf(e.Metrics())
+	typ := got.Type()
+	var dropped []string
+	for i := range got.NumField() {
+		if got.Field(i).IsZero() {
+			dropped = append(dropped, typ.Field(i).Name)
+		}
+	}
+	if len(dropped) > 0 {
+		t.Errorf("adaptive Metrics() reports ZERO for %d field(s) that both "+
+			"sub-engines report nonzero: %v\n"+
+			"A field missing from the struct literal in adaptive.Engine.Metrics() "+
+			"is published as 0, not inherited (celeris#627).", len(dropped), dropped)
+	}
+}
+
+// TestMetricsSumsTheFieldsCelerisGH627Dropped pins the aggregation RULE for
+// the fields #627 found missing, which the reflective test above can only see
+// as nonzero. Workers is summed rather than taken from the active sub-engine
+// because both sub-engines run at once — the standby keeps its loops up and
+// keeps serving the keep-alives pinned to it — so the sum is the divisor that
+// matches the summed ActiveConnections.
+func TestMetricsSumsTheFieldsCelerisGH627Dropped(t *testing.T) {
+	e, _ := newAdaptiveStartingOnEpoll(t)
+	e.primary.(*mockEngine).SetMetrics(engine.EngineMetrics{
+		Workers: 12, AcceptCount: 3000, CloseCount: 2900,
+		BytesRead: 53170564, BytesWritten: 1011018543,
+		RecvResumeWhileCancelPending: 11, RecvResumeWhileRecvInFlight: 5,
+		RecvArmDeclined: 9, RecvDoubleArmed: 1, RecvCQEUnaccounted: 2,
+	})
+	e.secondary.(*mockEngine).SetMetrics(engine.EngineMetrics{
+		Workers: 12, AcceptCount: 400, CloseCount: 380,
+		BytesRead: 51373746, BytesWritten: 448635451,
+		RecvResumeWhileCancelPending: 3, RecvResumeWhileRecvInFlight: 1,
+		RecvArmDeclined: 4, RecvDoubleArmed: 2, RecvCQEUnaccounted: 3,
+	})
+
+	m := e.Metrics()
+	for _, c := range []struct {
+		field string
+		got   uint64
+		want  uint64
+	}{
+		{"Workers", uint64(m.Workers), 24},
+		{"AcceptCount", m.AcceptCount, 3400},
+		{"CloseCount", m.CloseCount, 3280},
+		{"BytesRead", m.BytesRead, 104544310},
+		{"BytesWritten", m.BytesWritten, 1459653994},
+		{"RecvResumeWhileCancelPending", m.RecvResumeWhileCancelPending, 14},
+		{"RecvResumeWhileRecvInFlight", m.RecvResumeWhileRecvInFlight, 6},
+		{"RecvArmDeclined", m.RecvArmDeclined, 13},
+		{"RecvDoubleArmed", m.RecvDoubleArmed, 3},
+		{"RecvCQEUnaccounted", m.RecvCQEUnaccounted, 5},
+	} {
+		if c.got != c.want {
+			t.Errorf("Metrics().%s = %d, want %d (sum of both sub-engines)",
+				c.field, c.got, c.want)
+		}
 	}
 }

@@ -878,6 +878,15 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 	// halves to the other side for one sample, which no cumulative or
 	// gauge value depends on. Zero while the lazy standby is unbuilt.
 	standby := standbyMetrics(e.active.Load(), primary, secondary, pm, sm)
+	// EVERY field below is listed in the order [engine.EngineMetrics]
+	// declares them, and every new field must be added here too. This
+	// literal silently dropped ten of them (celeris#627): a field absent
+	// from it is not "inherited", it is reported as zero, and the adaptive
+	// column of nightly 34893230678 duly published engine_workers=0,
+	// bytes_read=0 and bytes_written=0 on a cell serving 101 live
+	// connections. TestMetricsCarriesEveryFieldReflectively enforces the
+	// rule without naming fields, so the next one added cannot be dropped
+	// the same way.
 	return engine.EngineMetrics{
 		RequestCount:       pm.RequestCount + sm.RequestCount,
 		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
@@ -885,24 +894,34 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		Throughput:         pm.Throughput + sm.Throughput,
 		AsyncRoutes:        asyncRoutes,
 		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
-		AdaptiveSwitches:   e.switchesTotal.Load(),
-		// A close is attributed to whichever sub-engine owned the conn, so
-		// the cumulative total is additive across a switch exactly like
-		// AsyncPromotedConns. Without it the engine's own close count is
-		// invisible on the only engine that can lose a conn to a hand-off,
-		// and engine_closed vs hook_closed cannot be compared at all
-		// (celeris#624).
-		CloseCount:               pm.CloseCount + sm.CloseCount,
-		StandbyActiveConnections: standby.ActiveConnections,
-		StandbyCloseCount:        standby.CloseCount,
-		// The #383 hand-off ledger. Both halves of a transplant are
-		// cumulative and land on opposite sub-engines, so summing them is
-		// what makes TransplantDetached - TransplantAdopted the count of
-		// conns currently in flight between the two (celeris#624).
-		TransplantAdopted:           pm.TransplantAdopted + sm.TransplantAdopted,
-		TransplantDetached:          pm.TransplantDetached + sm.TransplantDetached,
-		TransplantAdoptSlotOccupied: pm.TransplantAdoptSlotOccupied + sm.TransplantAdoptSlotOccupied,
-		CloseMissingConnState:       pm.CloseMissingConnState + sm.CloseMissingConnState,
+		// Workers is summed, not taken from the active sub-engine: both
+		// exist simultaneously (the standby keeps its loops up and keeps
+		// serving its pinned keep-alives), so the sum is the divisor that
+		// matches the summed ActiveConnections above. It is 0 before Listen
+		// and while the lazy standby is unbuilt contributes nothing.
+		Workers: pm.Workers + sm.Workers,
+		// Cumulative connection-lifecycle and byte totals, additive across
+		// a switch exactly like AsyncPromotedConns: each event is
+		// attributed to whichever sub-engine owned the connection at the
+		// time. CloseCount in particular is what makes engine_closed vs
+		// hook_closed comparable on the only engine that can lose a
+		// connection to a hand-off (celeris#624).
+		AcceptCount:  pm.AcceptCount + sm.AcceptCount,
+		CloseCount:   pm.CloseCount + sm.CloseCount,
+		BytesRead:    pm.BytesRead + sm.BytesRead,
+		BytesWritten: pm.BytesWritten + sm.BytesWritten,
+		// The adaptive engine's own counter, not the sub-engines' (neither
+		// of them switches).
+		AdaptiveSwitches: e.switchesTotal.Load(),
+		// The celeris#586 recv-arming witnesses. io_uring-only and
+		// cumulative. RecvDoubleArmed and RecvCQEUnaccounted are
+		// must-stay-zero defect witnesses, so dropping them here made the
+		// adaptive engine report "clean" unconditionally (celeris#627).
+		RecvResumeWhileCancelPending: pm.RecvResumeWhileCancelPending + sm.RecvResumeWhileCancelPending,
+		RecvResumeWhileRecvInFlight:  pm.RecvResumeWhileRecvInFlight + sm.RecvResumeWhileRecvInFlight,
+		RecvArmDeclined:              pm.RecvArmDeclined + sm.RecvArmDeclined,
+		RecvDoubleArmed:              pm.RecvDoubleArmed + sm.RecvDoubleArmed,
+		RecvCQEUnaccounted:           pm.RecvCQEUnaccounted + sm.RecvCQEUnaccounted,
 		// Both are io_uring-only and additive: a detached conn lives on
 		// exactly one sub-engine, and window closes are cumulative events.
 		DetachedConnections: pm.DetachedConnections + sm.DetachedConnections,
@@ -914,6 +933,18 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ZCNotifs:         pm.ZCNotifs + sm.ZCNotifs,
 		InlineBytes:      pm.InlineBytes + sm.InlineBytes,
 		RingBytes:        pm.RingBytes + sm.RingBytes,
+		// The standby's share of the two gauges above — the only fields
+		// here that are NOT sums (celeris#624).
+		StandbyActiveConnections: standby.ActiveConnections,
+		StandbyCloseCount:        standby.CloseCount,
+		// The #383 hand-off ledger. Both halves of a transplant are
+		// cumulative and land on opposite sub-engines, so summing them is
+		// what makes TransplantDetached - TransplantAdopted the count of
+		// conns currently in flight between the two (celeris#624).
+		TransplantAdopted:           pm.TransplantAdopted + sm.TransplantAdopted,
+		TransplantDetached:          pm.TransplantDetached + sm.TransplantDetached,
+		TransplantAdoptSlotOccupied: pm.TransplantAdoptSlotOccupied + sm.TransplantAdoptSlotOccupied,
+		CloseMissingConnState:       pm.CloseMissingConnState + sm.CloseMissingConnState,
 	}
 }
 
