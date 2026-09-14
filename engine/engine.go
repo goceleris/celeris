@@ -181,4 +181,34 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// counter is the exposure proof that the celeris#549 window was entered
 	// at all (celeris#584). Zero on other engines.
 	DetachWindowCloses uint64
+	// ZCSendsSubmitted is the cumulative number of IORING_OP_SEND_ZC SQEs
+	// the io_uring engine armed. It is the exposure witness for the
+	// zero-copy send path: a benchmark or soak that reports a clean ZC
+	// result with this at 0 never ran the branch (celeris#585/#587/#591).
+	// One atomic add per ZC submit, inside the ZC arm only — sub-threshold
+	// and linked sends (the per-request hot path) add nothing. Zero on
+	// other engines and whenever CELERIS_IOURING_SEND_ZC disables ZC.
+	ZCSendsSubmitted uint64
+	// ZCNotifs is the cumulative number of SEND_ZC notification CQEs
+	// (IORING_CQE_F_NOTIF) the io_uring engine processed — the completions
+	// that release the kernel-pinned send buffer. ZCSendsSubmitted minus
+	// ZCNotifs is the number of ZC sends whose buffer is still pinned, so
+	// the pair bounds how long the ZC cycle stayed open. Zero on other
+	// engines.
+	ZCNotifs uint64
+	// InlineBytes is the cumulative number of payload bytes the io_uring
+	// engine wrote with a raw unix.Write(2) from a detached middleware
+	// goroutine (the WebSocket / SSE inline-egress fast path) instead of
+	// through the ring. Those bytes can never be zero-copy, so
+	// InlineBytes vs RingBytes is the egress-fabric split the SEND_ZC A/B
+	// needs to interpret a throughput delta (celeris#585). Zero on other
+	// engines.
+	InlineBytes uint64
+	// RingBytes is the cumulative number of payload bytes the io_uring
+	// engine flushed through ring SEND / SEND_ZC / WRITEV completions —
+	// the complement of InlineBytes within BytesWritten. Accumulated in a
+	// worker-local counter and published with one atomic per event-loop
+	// iteration, exactly like BytesWritten, because this site IS the
+	// per-request send path. Zero on other engines.
+	RingBytes uint64
 }
