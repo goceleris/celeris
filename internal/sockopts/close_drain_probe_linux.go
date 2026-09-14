@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -37,6 +38,10 @@ type CloseProbe struct {
 	Drained   int  // bytes DrainRecvBuffer consumed (0 on the drain-off arm)
 	InqAfter  int  // SIOCINQ after the drain; >0 means close(2) will RST
 	Outq      int  // SIOCOUTQ immediately before close(2)
+	// Elapsed is how long DrainRecvBuffer held the closing thread: the cost
+	// side of the bounds in [DrainRecvBuffer], measured per close rather than
+	// argued from the budget (celeris#569). Zero on the drain-off arm.
+	Elapsed time.Duration
 }
 
 // CloseProbeHook, when set, receives every CloseProbe record on the closing
@@ -64,13 +69,15 @@ func CloseDrain(fd int, site, raddr string) int {
 	rec := CloseProbe{Site: site, FD: fd, RAddr: raddr, Skipped: skipCloseDrain}
 	rec.InqBefore, _ = unix.IoctlGetInt(fd, unix.SIOCINQ)
 	if !skipCloseDrain {
+		start := time.Now()
 		rec.Drained = DrainRecvBuffer(fd)
+		rec.Elapsed = time.Since(start)
 	}
 	rec.InqAfter, _ = unix.IoctlGetInt(fd, unix.SIOCINQ)
 	rec.Outq, _ = unix.IoctlGetInt(fd, unix.SIOCOUTQ)
 	fmt.Fprintf(os.Stderr,
-		"CLOSE-PROBE site=%s fd=%d raddr=%s skip=%t inq_before=%d drained=%d inq_after=%d outq=%d\n",
-		rec.Site, rec.FD, rec.RAddr, rec.Skipped, rec.InqBefore, rec.Drained, rec.InqAfter, rec.Outq)
+		"CLOSE-PROBE site=%s fd=%d raddr=%s skip=%t inq_before=%d drained=%d inq_after=%d outq=%d drain_ns=%d\n",
+		rec.Site, rec.FD, rec.RAddr, rec.Skipped, rec.InqBefore, rec.Drained, rec.InqAfter, rec.Outq, rec.Elapsed.Nanoseconds())
 	if h := CloseProbeHook.Load(); h != nil {
 		(*h)(rec)
 	}
