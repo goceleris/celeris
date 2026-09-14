@@ -1,0 +1,795 @@
+//go:build linux
+
+package celeris
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/goceleris/celeris/engine/iouring"
+	"github.com/goceleris/celeris/middleware/store"
+)
+
+// stackDumped589 guards the one-shot full-stack dump of the CELERIS_589_STACK
+// diagnostic; the per-stall tally (stackTally589) runs on every stalled sample.
+var stackDumped589 atomic.Bool
+
+// stackTally589 classifies every engine event-loop goroutine at the moment a
+// /ping sample has been outstanding for 100 ms, so the site that pins the
+// worker is COUNTED across the window rather than named once. The io_uring
+// worker is the goroutine running (*Worker).run; the epoll one (*Loop).run.
+type stackTally589 struct {
+	captures int            // stalled samples at which a stack was taken
+	loops    int            // event-loop goroutines seen across captures
+	where    map[string]int // event-loop goroutine → blocking site
+}
+
+func classifyLoopStack589(g string) string {
+	switch {
+	case strings.Contains(g, "checkTimeouts") && strings.Contains(g, "sync.(*Mutex).Lock"):
+		return "checkTimeouts_detachMu_Lock"
+	case strings.Contains(g, "sync.(*Mutex).Lock"):
+		return "other_Mutex_Lock"
+	case strings.Contains(g, "SubmitAndWait") || strings.Contains(g, "EpollWait"):
+		return "kernel_wait" // io_uring_enter / epoll_wait: the loop is idle, not pinned
+	case strings.Contains(g, "ProcessH1") || strings.Contains(g, "HandleStream"):
+		return "inline_handler"
+	}
+	// Fallback: the first celeris frame's function name (package.Recv.Method).
+	for _, ln := range strings.Split(g, "\n")[1:] {
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "github.com/goceleris/celeris") {
+			continue
+		}
+		if i := strings.Index(ln, "(0x"); i > 0 {
+			return ln[:i]
+		}
+		if i := strings.Index(ln, "({"); i > 0 {
+			return ln[:i]
+		}
+		return strings.TrimSuffix(ln, "()")
+	}
+	return "unclassified"
+}
+
+func (st *stackTally589) capture(t *testing.T) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	st.captures++
+	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+		isLoop := strings.Contains(g, "engine/iouring.(*Worker).run(") || strings.Contains(g, "engine/epoll.(*Loop).run(")
+		if !isLoop {
+			continue
+		}
+		st.loops++
+		if st.where == nil {
+			st.where = map[string]int{}
+		}
+		st.where[classifyLoopStack589(g)]++
+		if stackDumped589.CompareAndSwap(false, true) {
+			t.Logf("STACK589 first stalled sample, event-loop goroutine:\n%s", g)
+		}
+	}
+}
+
+func (st *stackTally589) String() string {
+	keys := make([]string, 0, len(st.where))
+	for k := range st.where {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, st.where[k]))
+	}
+	return fmt.Sprintf("captures=%d loop_goroutines=%d %s", st.captures, st.loops, strings.Join(parts, " "))
+}
+
+// envInt589 reads a positive integer diagnostic override or returns def.
+func envInt589(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// Measurement rig for celeris#589 (celeris#493 fix-plan item (4)).
+//
+// Claim under test: an adaptive route (inherited AsyncHandlers=true, no
+// explicit .Async()) that SETTLED as fast (adaptiveSettleStreak consecutive
+// sub-300µs inline runs) is never re-timed — handler.go only times a route
+// while router.adaptiveLearning() is true, and the only statement that removes
+// a route from `settled` is an explicit .Async()/.Sync() at registration. So a
+// store-backed handler that later turns slow keeps running inline on the
+// engine worker thread for every request, and an unrelated fast request on the
+// same worker (/ping) queues behind the blocked store call.
+//
+// The observable follows the two binding adversarial-review corrections on the
+// issue: the PRIMARY assertion is the dispatch STATE after the route has turned
+// slow (settled.Load, isPromoted, EngineMetrics.AsyncPromotedConns); the
+// latency observable is the FRACTION of /ping samples above 5 ms taken over a
+// window that starts only after every /kv connection has completed one slow
+// run (so the unavoidable first post-hoc inline run per worker is excluded),
+// and the promotion TTL is pinned out of the picture with the existing nowNano
+// test hook (frozen clock) so a fixed tree would show exactly one inline stall
+// per worker and then none.
+//
+// Negative controls (the same rig, the same blocked Set):
+//   - explicit .Async() on /kv (item (4)'s "store-backed middleware blocking by
+//     default" flavour): the route is never adaptive, every /kv conn is handed
+//     to the dispatch goroutine, the worker stays free;
+//   - /kv still LEARNING (warmed with fewer than adaptiveSettleStreak runs): the
+//     first slow inline run promotes the route immediately, later runs go async.
+//
+// The claim assertion (assertSettledStall589) must PASS on the settled rig and
+// must FAIL on both controls; the controls additionally assert the inverse
+// state. A test that passes on both trees proves nothing, so both directions
+// are asserted explicitly.
+//
+// Latency observable per engine (measured while building this rig): on epoll
+// the controls fully invert (0 of ~940 /ping samples above 5 ms). On io_uring
+// they originally inverted in the MEDIAN (sub-ms vs ≥ D) but NOT in the stalled
+// fraction: the worker still blocked for ≈ D − 30 ms of every D cycle even
+// though every /kv conn was on a dispatch goroutine. A goroutine stack captured
+// mid-stall (CELERIS_589_STACK=1) showed both workers in sync.Mutex.Lock inside
+// Worker.checkTimeouts (the celeris#548 h1State snapshot under detachMu) while
+// runAsyncHandler holds cs.detachMu across the whole ProcessH1
+// (worker.go:3307→3460). The epoll sweep takes no lock. That was a distinct
+// io_uring defect — an async-dispatched HTTP/1 conn with a slow handler pins
+// the worker in the timeout sweep — not the item (4) dispatch policy; it is
+// celeris#593, fixed by making that snapshot a TryLock-and-skip
+// (snapshotH1Deadlines in engine/iouring/worker.go). The controls are
+// therefore now the REGRESSION TEST for #593: on both engines each asserts,
+// as well as the median, that the window's STALLED WALL-TIME fraction stays
+// under stall589CtlTimeBar — 0.883-0.888 with the defect, 0 in 29 of 40 runs
+// and at most 0.037 with it fixed — and still logs the ANOMALY589 line so a
+// regression names itself in the output.
+//
+// Portability: the io_uring half of the matrix needs stall589Workers real
+// workers, and io_uring locks ~12 MiB per worker against RLIMIT_MEMLOCK, so on
+// a memlock-capped host (a GitHub Actions runner is 8 MiB = one worker) it
+// SKIPS via skipIfMemlockCaps589 instead of failing; the epoll half always
+// runs. Measured under the CI command line (`go test -race -count=1
+// -timeout=300s`) in golang:1.27, --cpus 4, seccomp=unconfined: with
+// `--ulimit memlock=8388608` the three io_uring subtests skip and the package
+// is ok in 35.9 s; with 128 MiB all six run (workers=2) in 70.2 s.
+//
+// Diagnostics (env, test-only): CELERIS_589_STACK=1 tallies the event-loop
+// goroutines' blocking site 100 ms into every stalled /ping (STACKTALLY589);
+// CELERIS_589_DUMP=1 logs the /ping latency series; CELERIS_589_FRESH=1 samples
+// on a fresh conn per request; CELERIS_589_DELAY_MS, CELERIS_589_WORKERS and
+// CELERIS_589_KVCONNS override D, the worker count and the slow-conn count
+// (KVCONNS=1 with 2 workers makes the stall bimodal across runs if — and only
+// if — it is local to the worker that owns the sleeping async conn).
+const (
+	stall589Delay    = 300 * time.Millisecond // D: injected per-call Set latency (CELERIS_589_DELAY_MS overrides)
+	stall589Workers  = 2                      // CELERIS_589_WORKERS overrides (diagnostic)
+	stall589KVConnsX = 4                      // C = 4×Workers so every worker holds a /kv conn (p≈1-2·2^-8); CELERIS_589_KVCONNS overrides
+	stall589Window   = 10 * time.Second
+	stall589Spacing  = 10 * time.Millisecond
+	stall589StallBar = 5 * time.Millisecond
+	// stall589CtlTimeBar is the celeris#593 regression bar on the two
+	// negative controls: every /kv conn is async-dispatched there, so the
+	// worker must be free and almost none of the window may be spent with a
+	// /ping outstanding. The quantity is stalled WALL TIME / window, not the
+	// stalled sample count, because the count is sensitive to how loaded the
+	// host is while the time is not: measured on this rig, the defect spends
+	// 8867-8964 ms of the 10 s window stalled (0.883-0.888) in 6/6 runs on
+	// origin/main, whereas the fixed tree spends 0 ms in 29/40 runs, at most
+	// 236 ms (0.024) on an idle box, and 373 ms (0.037) with the box
+	// saturated by three other containers — where the stalled COUNT reached
+	// 0.065 on 5-14 ms samples that a stack capture showed to be a runnable,
+	// un-blocked worker waiting for CPU. 0.10 sits ~9x below the defect and
+	// ~2.7x above the worst noise observed.
+	stall589CtlTimeBar = 0.10
+	stall589WarmMax    = 20000 // bound on the warm-up loop (settle needs 256 CONSECUTIVE fast runs)
+	stall589LearnReq   = 100   // learning control: warm with fewer than adaptiveSettleStreak runs
+)
+
+// gatedKV wraps a store.KV whose Set is fast until the gate flips and then
+// sleeps stall589Delay on every call — the #493 shape ("the store got slow
+// after the route settled"). slowCalls counts COMPLETED slow calls, so waiting
+// for slowCalls ≥ C guarantees every /kv conn's first slow run has returned.
+type gatedKV struct {
+	store.KV
+	slow      atomic.Bool
+	delay     time.Duration
+	slowCalls atomic.Int64
+}
+
+func (g *gatedKV) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if g.slow.Load() {
+		time.Sleep(g.delay)
+		g.slowCalls.Add(1)
+	}
+	return g.KV.Set(ctx, key, value, ttl)
+}
+
+type stall589Mode int
+
+const (
+	stall589Settled       stall589Mode = iota // the claim: /kv settled before the store turns slow
+	stall589ExplicitAsync                     // control M1-a: /kv registered .Async()
+	stall589Learning                          // control M1-b: /kv warmed <256 runs, still learning
+)
+
+func (m stall589Mode) String() string {
+	switch m {
+	case stall589Settled:
+		return "settled"
+	case stall589ExplicitAsync:
+		return "negctrl_async"
+	case stall589Learning:
+		return "negctrl_learning"
+	}
+	return "?"
+}
+
+// stall589Obs is one run's observation set. Every field is final before the
+// assertion reads it (the hammer goroutines are joined and the state is read
+// after the window closes).
+type stall589Obs struct {
+	engine, mode       string
+	workers            int
+	kvConns            int
+	gomaxprocs         int
+	warmReqs           int
+	settledBefore      bool // after warm-up, before the gate flips
+	promotedBefore     bool
+	adaptive           bool // router.adaptiveRoutes["/kv"]
+	settledAfter       bool // after the slow window
+	promotedAfter      bool
+	asyncPromotedConns uint64
+	slowCalls          int64
+	kvReqs             int64
+	preSample          time.Duration // gate flip → sampling start
+	window             time.Duration
+	samples            int
+	stalled            int // /ping samples > stall589StallBar
+	stalledFrac        float64
+	stalledTime        time.Duration // sum of stalled sample latencies
+	stalledTimeFrac    float64       // stalledTime / window: the celeris#593 observable
+	pingMin, pingMed   time.Duration
+	pingMax            time.Duration
+	stacks             *stackTally589 // CELERIS_589_STACK diagnostic, nil otherwise
+}
+
+// assertSettledStall589 is the CLAIM: on current main a settled route that
+// turns slow stays inline and pins the worker. It returns nil when the
+// observation matches the claim and an error naming the first mismatch.
+func assertSettledStall589(o stall589Obs) error {
+	switch {
+	case !o.settledAfter:
+		return errors.New("/kv is not in router.settled after the slow window")
+	case o.promotedAfter:
+		return errors.New("/kv was promoted (isPromoted=true) after the slow window")
+	case o.asyncPromotedConns != 0:
+		return fmt.Errorf("AsyncPromotedConns=%d, expected 0 (a conn was handed to the dispatch goroutine)", o.asyncPromotedConns)
+	case o.stalledFrac < 0.9:
+		return fmt.Errorf("stalled fraction %.3f < 0.9 (%d/%d /ping samples > %v)", o.stalledFrac, o.stalled, o.samples, stall589StallBar)
+	}
+	return nil
+}
+
+var stall589RunSeq atomic.Int64
+
+func TestAdaptiveSettledRouteStall589(t *testing.T) {
+	if testing.Short() {
+		t.Skip("celeris#589 measurement takes ~15 s per run; -short skips it")
+	}
+	for _, eng := range []struct {
+		name string
+		typ  EngineType
+	}{{"iouring", IOUring}, {"epoll", Epoll}} {
+		t.Run(eng.name, func(t *testing.T) {
+			t.Run("settled", func(t *testing.T) {
+				o := runStall589(t, eng.name, eng.typ, stall589Settled)
+				err := assertSettledStall589(o)
+				verdict := "CONFIRM"
+				if err != nil {
+					verdict = "REFUTE"
+				}
+				logStall589(t, o, verdict, err)
+				if err != nil {
+					t.Errorf("claim assertion failed on the settled rig: %v", err)
+				}
+			})
+			t.Run("negctrl_async", func(t *testing.T) {
+				o := runStall589(t, eng.name, eng.typ, stall589ExplicitAsync)
+				err := assertSettledStall589(o)
+				verdict := "CONTROL_OK"
+				var ctlErr error
+				switch {
+				case err == nil:
+					ctlErr = errors.New("claim assertion PASSED on the explicit-.Async() tree (control does not discriminate)")
+				case o.adaptive || o.settledAfter:
+					ctlErr = errors.New("explicit .Async() route must not be adaptive/settled")
+				case int(o.asyncPromotedConns) < o.kvConns:
+					ctlErr = fmt.Errorf("AsyncPromotedConns=%d < %d /kv conns", o.asyncPromotedConns, o.kvConns)
+				case o.pingMed >= stall589StallBar:
+					ctlErr = fmt.Errorf("/ping median %v >= %v with the same blocked Set", o.pingMed, stall589StallBar)
+				case o.stalledTimeFrac > stall589CtlTimeBar:
+					// celeris#593 regression bar: every /kv conn is on a
+					// dispatch goroutine, so a pinned worker can only come
+					// from the engine itself (the timeout sweep blocking on
+					// cs.detachMu). Was 0.88 before the TryLock fix.
+					ctlErr = fmt.Errorf("celeris#593: stalled wall-time fraction %.3f > %.2f (%d/%d /ping samples > %v, %.0f ms of a %.0f ms window, max %v) while all %d /kv conns are async-dispatched",
+						o.stalledTimeFrac, stall589CtlTimeBar, o.stalled, o.samples, stall589StallBar, ms(o.stalledTime), ms(o.window), o.pingMax, o.kvConns)
+				}
+				if ctlErr != nil {
+					verdict = "CONTROL_BROKEN"
+				}
+				logStall589(t, o, verdict, err)
+				if ctlErr != nil {
+					t.Error(ctlErr)
+				}
+			})
+			t.Run("negctrl_learning", func(t *testing.T) {
+				o := runStall589(t, eng.name, eng.typ, stall589Learning)
+				err := assertSettledStall589(o)
+				verdict := "CONTROL_OK"
+				var ctlErr error
+				switch {
+				case err == nil:
+					ctlErr = errors.New("claim assertion PASSED on the still-learning tree (control does not discriminate)")
+				case o.settledBefore || o.settledAfter:
+					ctlErr = errors.New("learning control must never settle")
+				case !o.promotedAfter:
+					ctlErr = errors.New("the first >2ms inline run must promote a learning route (isPromoted=false)")
+				case int(o.asyncPromotedConns) < o.kvConns:
+					ctlErr = fmt.Errorf("AsyncPromotedConns=%d < %d /kv conns", o.asyncPromotedConns, o.kvConns)
+				case o.pingMed >= stall589StallBar:
+					ctlErr = fmt.Errorf("/ping median %v >= %v after the first inline run per worker", o.pingMed, stall589StallBar)
+				case o.stalledTimeFrac > stall589CtlTimeBar:
+					// celeris#593 regression bar — see negctrl_async.
+					ctlErr = fmt.Errorf("celeris#593: stalled wall-time fraction %.3f > %.2f (%d/%d /ping samples > %v, %.0f ms of a %.0f ms window, max %v) while all %d /kv conns are async-dispatched",
+						o.stalledTimeFrac, stall589CtlTimeBar, o.stalled, o.samples, stall589StallBar, ms(o.stalledTime), ms(o.window), o.pingMax, o.kvConns)
+				}
+				if ctlErr != nil {
+					verdict = "CONTROL_BROKEN"
+				}
+				logStall589(t, o, verdict, err)
+				if ctlErr != nil {
+					t.Error(ctlErr)
+				}
+			})
+		})
+	}
+}
+
+// logStall589 emits the single greppable line per run. It is called AFTER the
+// assertion has been evaluated on the final observation, so every number on it
+// is the number the verdict was decided on.
+func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
+	t.Helper()
+	claim := "pass"
+	if claimErr != nil {
+		claim = "fail(" + claimErr.Error() + ")"
+	}
+	t.Logf("RESULT589 engine=%s mode=%s run=%d verdict=%s settled_before=%t promoted_before=%t adaptive=%t "+
+		"settled_after=%t promoted_after=%t async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d slow_calls=%d kv_reqs=%d "+
+		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f stalled_time_frac=%.3f "+
+		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f claim_assert=%s",
+		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive,
+		o.settledAfter, o.promotedAfter, o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.slowCalls, o.kvReqs,
+		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime), o.stalledTimeFrac,
+		ms(o.pingMin), ms(o.pingMed), ms(o.pingMax), claim)
+	if o.stacks != nil {
+		t.Logf("STACKTALLY589 engine=%s mode=%s stalled=%d %s", o.engine, o.mode, o.stalled, o.stacks.String())
+	}
+	// A control whose /kv conns are ALL async-dispatched must leave the worker
+	// free; a stalled fraction above the bar there is not the item (4) dispatch
+	// policy but the second defect (celeris#593 — io_uring: checkTimeouts
+	// blocked on detachMu held by runAsyncHandler across the slow ProcessH1).
+	// The control assertions fail on it now; this line still names it in the
+	// output so a regression is greppable and not just an assertion message.
+	if o.mode != stall589Settled.String() && o.stalledTimeFrac > stall589CtlTimeBar {
+		t.Logf("ANOMALY589 engine=%s mode=%s stalled=%d/%d stalled_frac=%.3f stalled_time_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f: "+
+			"worker pinned while every /kv conn is async-dispatched (async_promoted_conns=%d)",
+			o.engine, o.mode, o.stalled, o.samples, o.stalledFrac, o.stalledTimeFrac, ms(o.pingMed), ms(o.pingMax), o.asyncPromotedConns)
+	}
+}
+
+func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+
+// skipIfMemlockCaps589 keeps this rig portable to a memlock-capped runner.
+// io_uring locks ~12 MiB of ring + provided-buffer pages per worker, so a host
+// with a low RLIMIT_MEMLOCK (GitHub Actions ships a soft limit of 8 MiB, which
+// is one worker at most) makes the engine start with FEWER workers than the rig
+// asks for. That is an environment fact, not a regression, and the rig needs
+// >1 worker by construction: the /ping probe must be able to land on a worker
+// other than the one that owns a sleeping /kv conn, which is exactly what the
+// celeris#593 sweep-blocking observable is measured against.
+//
+// The gate is the engine's OWN exported pre-flight (iouring.MaxWorkersForMemlock,
+// engine/iouring/ring.go) — the same rlim.Cur/minMemlockPerWorker arithmetic
+// capWorkersToMemlock applies at start — so the skip predicate and the cap that
+// would trigger it cannot drift apart. It returns -1 for "no cap" (RLIM_INFINITY
+// or an unreadable limit), in which case the rig runs.
+//
+// Nothing else is skipped: the epoll half of the matrix does not lock pages and
+// always runs, and when the cap DOES allow the workers the later
+// info.Metrics.Workers check still Fatals, because then a shortfall is the
+// engine's fault.
+func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
+	t.Helper()
+	if engType != IOUring {
+		return
+	}
+	maxW := iouring.MaxWorkersForMemlock()
+	if maxW == -1 || maxW >= workers {
+		return
+	}
+	// The byte figure in the hint mirrors engine/iouring's unexported
+	// minMemlockPerWorker (12 MiB) and is advisory only — the GATE above is
+	// the exported pre-flight, so a change to that constant cannot make the
+	// rig skip or run wrongly, only make this hint generous or tight.
+	t.Skipf("io_uring: RLIMIT_MEMLOCK allows %d worker(s), this rig needs %d "+
+		"(raise it: `ulimit -l unlimited`, docker --ulimit memlock=%d, or systemd LimitMEMLOCK=infinity)",
+		maxW, workers, workers*12*1024*1024)
+}
+
+// memlockCeiling589 renders the pre-flight ceiling for the workers-shortfall
+// Fatal, so the failure message says what the limit allowed rather than
+// speculating about it.
+func memlockCeiling589() string {
+	if maxW := iouring.MaxWorkersForMemlock(); maxW != -1 {
+		return strconv.Itoa(maxW) + " worker(s)"
+	}
+	return "unlimited workers (RLIM_INFINITY)"
+}
+
+// runStall589 runs one full measurement: start a real engine with 2 workers,
+// warm /kv, flip the store slow, hammer /kv on C keep-alive conns, sample
+// /ping on a pre-opened keep-alive conn, read the dispatch state, shut down.
+func runStall589(t *testing.T, engName string, engType EngineType, mode stall589Mode) stall589Obs {
+	t.Helper()
+	o := stall589Obs{engine: engName, mode: mode.String(), gomaxprocs: runtime.GOMAXPROCS(0)}
+	// Diagnostic overrides: CELERIS_589_WORKERS (engine workers, default 2)
+	// and CELERIS_589_KVCONNS (slow /kv conns, default 4×workers). With
+	// KVCONNS=1 and 2 workers the single sleeping async conn shares a worker
+	// with the /ping probe in ~half the runs, so a stall that is worker-local
+	// (a lock the worker takes) shows as a bimodal 0 / >0 stalled count across
+	// runs, whereas a process-global cause (GOMAXPROCS, scheduler, the
+	// dispatch goroutine) would stall every run.
+	workers := envInt589("CELERIS_589_WORKERS", stall589Workers)
+	o.kvConns = envInt589("CELERIS_589_KVCONNS", stall589KVConnsX*workers)
+	skipIfMemlockCaps589(t, engType, workers)
+
+	// Freeze the adaptive promotion clock: a promotion made during the run
+	// never expires, so the fixed/control worlds show exactly one inline run
+	// per worker rather than one per TTL (review correction 1).
+	clock, restore := stubNowNano()
+	*clock = time.Now().UnixNano()
+	defer restore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	delay := stall589Delay
+	if v := os.Getenv("CELERIS_589_DELAY_MS"); v != "" { // diagnostic override of D
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			delay = time.Duration(n) * time.Millisecond
+		}
+	}
+	kv := &gatedKV{
+		KV:    store.NewMemoryKV(store.MemoryKVConfig{CleanupContext: ctx}),
+		delay: delay,
+	}
+	s := New(Config{Engine: engType, AsyncHandlers: true, Workers: workers})
+	s.GET("/ping", func(c *Context) error { return c.String(http.StatusOK, "ok") })
+	route := s.GET("/kv", func(c *Context) error {
+		if err := kv.Set(c.Context(), "k", []byte("v"), time.Minute); err != nil {
+			return err
+		}
+		return c.String(http.StatusOK, "ok")
+	})
+	if mode == stall589ExplicitAsync {
+		route.Async()
+	}
+	o.adaptive = s.router.adaptiveRoutes["/kv"]
+	if mode != stall589ExplicitAsync && !o.adaptive {
+		t.Fatal("/kv must be adaptive under AsyncHandlers=true without an explicit override")
+	}
+	if !s.router.adaptiveRoutes["/ping"] {
+		t.Fatal("/ping must be adaptive (it is the inline-on-worker probe)")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	startErr := make(chan error, 1)
+	go func() { startErr <- s.StartWithListenerAndContext(ctx, ln) }()
+
+	// Readiness on /ping over a throwaway conn; an early Start error (no
+	// io_uring in this kernel/seccomp profile) is reported, not hidden.
+	deadline := time.Now().Add(10 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) && !ready {
+		select {
+		case err := <-startErr:
+			if engType == IOUring {
+				t.Skipf("io_uring engine failed to start (run with --security-opt seccomp=unconfined): %v", err)
+			}
+			t.Fatalf("engine failed to start: %v", err)
+		default:
+		}
+		c, br, err := dial589(addr)
+		if err == nil {
+			if err = get589(c, br, "/ping"); err == nil {
+				ready = true
+			}
+			_ = c.Close()
+		}
+		if !ready {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if !ready {
+		t.Fatal("server did not become ready")
+	}
+	info := s.EngineInfo()
+	if info == nil || info.Type != engType {
+		t.Fatalf("engine type = %v, want %v (silent fallback would invalidate the run)", info, engType)
+	}
+	o.workers = info.Metrics.Workers
+	if o.workers != workers {
+		// skipIfMemlockCaps589 already cleared RLIMIT_MEMLOCK for this worker
+		// count, so a shortfall here is the engine's own doing, not the
+		// environment's: fail, do not skip.
+		t.Fatalf("workers=%d, want %d (RLIMIT_MEMLOCK allows %s, so this is NOT the memlock cap)",
+			o.workers, workers, memlockCeiling589())
+	}
+
+	// Warm-up on one keep-alive conn, sequential: settle (bounded loop, since
+	// one >300µs jitter run resets the fast streak) or a fixed sub-streak count.
+	wc, wbr, err := dial589(addr)
+	if err != nil {
+		t.Fatalf("dial warm conn: %v", err)
+	}
+	switch mode {
+	case stall589Settled:
+		for o.warmReqs < stall589WarmMax {
+			if err := get589(wc, wbr, "/kv"); err != nil {
+				t.Fatalf("warm-up GET /kv #%d: %v", o.warmReqs, err)
+			}
+			o.warmReqs++
+			if _, ok := s.router.settled.Load("/kv"); ok {
+				break
+			}
+		}
+	default:
+		for o.warmReqs < stall589LearnReq {
+			if err := get589(wc, wbr, "/kv"); err != nil {
+				t.Fatalf("warm-up GET /kv #%d: %v", o.warmReqs, err)
+			}
+			o.warmReqs++
+		}
+	}
+	_ = wc.Close()
+	_, o.settledBefore = s.router.settled.Load("/kv")
+	o.promotedBefore = s.router.isPromoted("/kv")
+	switch mode {
+	case stall589Settled:
+		if !o.settledBefore || o.promotedBefore {
+			t.Fatalf("precondition: /kv must be settled and not promoted after warm-up (settled=%t promoted=%t after %d runs)",
+				o.settledBefore, o.promotedBefore, o.warmReqs)
+		}
+	case stall589Learning:
+		if o.settledBefore || o.promotedBefore || !s.router.adaptiveLearning("/kv") {
+			t.Fatalf("precondition: /kv must still be learning after %d runs (settled=%t promoted=%t)",
+				o.warmReqs, o.settledBefore, o.promotedBefore)
+		}
+	}
+
+	// The /ping probe conn is opened BEFORE the store turns slow so it is
+	// already pinned to a worker.
+	pc, pbr, err := dial589(addr)
+	if err != nil {
+		t.Fatalf("dial ping conn: %v", err)
+	}
+	defer func() { _ = pc.Close() }()
+	if err := get589(pc, pbr, "/ping"); err != nil {
+		t.Fatalf("pre-flip GET /ping: %v", err)
+	}
+
+	// Flip the gate, then hammer /kv on C keep-alive conns, one request in
+	// flight per conn, until told to stop.
+	kv.slow.Store(true)
+	flipAt := time.Now()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var kvReqs atomic.Int64
+	hammerErr := make(chan error, o.kvConns)
+	for i := 0; i < o.kvConns; i++ {
+		c, br, err := dial589(addr)
+		if err != nil {
+			t.Fatalf("dial kv conn %d: %v", i, err)
+		}
+		defer func() { _ = c.Close() }()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := get589(c, br, "/kv"); err != nil {
+					hammerErr <- err
+					return
+				}
+				kvReqs.Add(1)
+			}
+		}()
+	}
+
+	// Sampling starts only once every /kv conn has completed one slow run —
+	// the post-hoc classifier can only act AFTER a slow run returns, so the
+	// first inline run per worker is the same in every world and is excluded.
+	waitDeadline := time.Now().Add(30 * time.Second)
+	for kv.slowCalls.Load() < int64(o.kvConns) {
+		if time.Now().After(waitDeadline) {
+			t.Fatalf("only %d slow calls completed in 30 s", kv.slowCalls.Load())
+		}
+		select {
+		case err := <-hammerErr:
+			t.Fatalf("kv hammer: %v", err)
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	o.preSample = time.Since(flipAt)
+
+	// Diagnostics (test-only, env-gated): CELERIS_589_FRESH=1 samples /ping on
+	// a FRESH conn per sample (random worker) instead of the pre-opened conn;
+	// CELERIS_589_DUMP=1 logs the chronological latency series.
+	fresh := os.Getenv("CELERIS_589_FRESH") != ""
+	stackTrigger := time.Duration(envInt589("CELERIS_589_STACK_MS", 100)) * time.Millisecond
+	var lat []time.Duration
+	winStart := time.Now()
+	for time.Since(winStart) < stall589Window {
+		t0 := time.Now()
+		if fresh {
+			fc, fbr, err := dial589(addr)
+			if err != nil {
+				t.Fatalf("dial fresh ping conn: %v", err)
+			}
+			err = get589(fc, fbr, "/ping")
+			_ = fc.Close()
+			if err != nil {
+				t.Fatalf("GET /ping (fresh conn) during window: %v", err)
+			}
+		} else if os.Getenv("CELERIS_589_STACK") != "" {
+			// Diagnostic: stackTrigger into EVERY stalled /ping, classify the
+			// event-loop goroutines' blocking site (tallied on the STACK589
+			// result line) and dump the first one in full. The default trigger
+			// is 100 ms (the celeris#593 defect stalled for ~270 ms);
+			// CELERIS_589_STACK_MS lowers it so the RESIDUAL few-millisecond
+			// outliers left after the fix can be attributed too.
+			if o.stacks == nil {
+				o.stacks = &stackTally589{}
+			}
+			done := make(chan error, 1)
+			go func() { done <- get589(pc, pbr, "/ping") }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("GET /ping during window: %v", err)
+				}
+			case <-time.After(stackTrigger):
+				o.stacks.capture(t)
+				if err := <-done; err != nil {
+					t.Fatalf("GET /ping during window: %v", err)
+				}
+			}
+		} else if err := get589(pc, pbr, "/ping"); err != nil {
+			t.Fatalf("GET /ping during window: %v", err)
+		}
+		lat = append(lat, time.Since(t0))
+		time.Sleep(stall589Spacing)
+	}
+	o.window = time.Since(winStart)
+	if os.Getenv("CELERIS_589_DUMP") != "" {
+		series := make([]string, 0, len(lat))
+		for _, d := range lat {
+			series = append(series, fmt.Sprintf("%.1f", ms(d)))
+		}
+		t.Logf("LAT589 engine=%s mode=%s fresh=%t n=%d ms=[%s]", engName, mode, fresh, len(lat), strings.Join(series, " "))
+	}
+
+	// Join the hammers (each finishes its in-flight request), THEN read the
+	// state so every field is final before the assertion.
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-hammerErr:
+		t.Fatalf("kv hammer: %v", err)
+	default:
+	}
+	o.kvReqs = kvReqs.Load()
+	o.slowCalls = kv.slowCalls.Load()
+	_, o.settledAfter = s.router.settled.Load("/kv")
+	o.promotedAfter = s.router.isPromoted("/kv")
+	o.asyncPromotedConns = s.EngineInfo().Metrics.AsyncPromotedConns
+
+	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+	o.samples = len(lat)
+	if o.samples > 0 {
+		o.pingMin, o.pingMed, o.pingMax = lat[0], lat[o.samples/2], lat[o.samples-1]
+	}
+	for _, d := range lat {
+		if d > stall589StallBar {
+			o.stalled++
+			o.stalledTime += d
+		}
+	}
+	if o.samples > 0 {
+		o.stalledFrac = float64(o.stalled) / float64(o.samples)
+	}
+	if o.window > 0 {
+		// The celeris#593 observable: how much of the sampling window had a
+		// /ping outstanding past the bar. Unlike the sample COUNT this does
+		// not move with host load — see stall589CtlTimeBar.
+		o.stalledTimeFrac = float64(o.stalledTime) / float64(o.window)
+	}
+
+	// Orderly stop: client conns are closed by the deferred Close calls after
+	// the engine has exited, so no handler is cut mid-frame by the rig.
+	cancel()
+	select {
+	case err := <-startErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("Start returned after cancel: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("engine did not exit within 30 s of cancel")
+	}
+	return o
+}
+
+func dial589(addr string) (net.Conn, *bufio.Reader, error) {
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, bufio.NewReader(c), nil
+}
+
+// get589 issues one keep-alive GET on the conn and fully reads the response.
+func get589(c net.Conn, br *bufio.Reader, path string) error {
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := io.WriteString(c, "GET "+path+" HTTP/1.1\r\nHost: 589\r\n\r\n"); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: status %d", path, resp.StatusCode)
+	}
+	return nil
+}
