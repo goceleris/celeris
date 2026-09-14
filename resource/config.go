@@ -43,14 +43,13 @@ type Config struct {
 	// "disabled".
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout is the max duration for reading the request
-	// headers ONLY (status line + headers + final CRLF). Zero falls
-	// back to ReadTimeout. A short value here is the canonical defence
-	// against slowloris-style DoS: clients that dribble headers byte-
-	// by-byte get their connection killed within ReadHeaderTimeout
-	// instead of holding a goroutine + listener-backlog slot for the
-	// full ReadTimeout. The std engine wires this to
-	// http.Server.ReadHeaderTimeout. The iouring + epoll engines
-	// enforce it inside their H1 header read loop.
+	// headers ONLY (status line + headers + final CRLF). A short value
+	// here is the canonical defence against slowloris-style DoS:
+	// clients that dribble headers byte-by-byte get their connection
+	// killed within ReadHeaderTimeout instead of holding a goroutine
+	// and a listener-backlog slot for the full ReadTimeout. The std
+	// engine wires this to http.Server.ReadHeaderTimeout. The iouring
+	// and epoll engines enforce it inside their H1 header read loop.
 	//
 	// Note: iouring/epoll's own SO_REUSEPORT-fronted multi-worker
 	// design absorbs a lot of slowloris pressure through queue
