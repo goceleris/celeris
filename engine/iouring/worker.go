@@ -2696,7 +2696,7 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 			}
 			cs.zcNotifPending = false
 		}
-		if w.completeSend(cs, fd, int(cs.zcSentBytes), now) {
+		if w.completeSend(cs, fd, int(cs.zcSentBytes), now, true) {
 			w.closeConn(fd)
 		}
 		return
@@ -2749,10 +2749,17 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// reasons to stop using ZC on this worker, NOT reasons to close a
 	// healthy connection, which is what the celeris#519 reproduction shows
 	// happening. Disable ZC and retry the send with a regular SEND.
-	if (c.Res == -22 || c.Res == -int32(unix.ENOMEM)) && w.sendZC {
-		w.sendZC = false
-		w.logger.Warn("SEND_ZC unavailable, falling back to regular SEND",
-			"worker", w.id, "err", -c.Res)
+	//
+	// Gated on cs.sendIsZC, the provenance of THIS completion, never on
+	// w.sendZC (celeris#609). w.sendZC is cleared by the first fallback on
+	// the worker, so keying the classification on it absorbed exactly one
+	// failure and sent every ZC send still in flight behind it down the
+	// generic c.Res < 0 path below -- OnError(-ENOMEM) then closeConn, a
+	// healthy connection torn down by a transient resource shortage. This
+	// is the same correction already made thirty lines above for the
+	// CQE_F_MORE branch selection.
+	if cs.sendIsZC && (c.Res == -int32(unix.EINVAL) || c.Res == -int32(unix.ENOMEM)) {
+		w.retireSendZC(-c.Res, "SEND_ZC unavailable, falling back to regular SEND")
 		// cs.sending is read by the inline-egress guard under detachMu; clear it
 		// and re-flush under the lock (flushSend for a detached conn is always
 		// called under detachMu, as in the dirty-flush loop).
@@ -2796,8 +2803,33 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	if w.completeSend(cs, fd, int(c.Res), now) {
+	if w.completeSend(cs, fd, int(c.Res), now, cs.sendIsZC) {
 		w.closeConn(fd)
+	}
+}
+
+// retireSendZC handles a send completion that failed for a reason that
+// condemns the SEND_ZC opcode rather than the connection: EINVAL (the kernel
+// does not support it) or ENOMEM (SEND_ZC pins the user buffer against
+// RLIMIT_MEMLOCK, and a host with a low limit returns ENOMEM once enough
+// sends are in flight).
+//
+// It separates the two things the old inline `w.sendZC = false` conflated
+// (celeris#609). Turning the opcode off and telling the operator about it is
+// a ONCE-per-worker event, so both are guarded on w.sendZC still being set.
+// Deciding that the completion was survivable is a PER-COMPLETION judgement,
+// so it is the caller's branch condition and happens every time, including
+// for every ZC send that was already in flight when the first failure
+// cleared the flag. The counter is the witness that the second group exists:
+// under the defect it was exactly the set of connections that got closed.
+func (w *Worker) retireSendZC(errno int32, msg string) {
+	validation.IouringSendZCFallbacks.Add(1)
+	if !w.sendZC {
+		return
+	}
+	w.sendZC = false
+	if w.logger != nil {
+		w.logger.Warn(msg, "worker", w.id, "err", errno)
 	}
 }
 
@@ -2823,7 +2855,12 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 // A multi-worker engine only loses the one worker to this, so its
 // connections hang while the others keep serving; on a single-worker engine
 // -- what RLIMIT_MEMLOCK forces on a CI runner -- it takes the server down.
-func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) (closeAfter bool) {
+// fromZC says whether the completion being processed belongs to a SEND_ZC
+// SQE. It is the caller's knowledge, not a re-derivation: the NOTIF handler
+// passes true because a CQE_F_NOTIF completion is produced by nothing else,
+// and the plain-SEND call site passes cs.sendIsZC, the provenance recorded
+// when that SQE was armed. Never w.sendZC (celeris#609).
+func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC bool) (closeAfter bool) {
 	// Take the lock up-front for detached connections so the entire state
 	// mutation (cs.sending clear / sendBuf truncate / writeBuf reset / OnError
 	// fire) is serialized against the goroutine writeFn path. The inline-egress
@@ -2836,7 +2873,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) (close
 	}
 	cs.sending = false
 
-	if sent == -int(unix.ENOMEM) && w.sendZC {
+	if fromZC && (sent == -int(unix.ENOMEM) || sent == -int(unix.EINVAL)) {
 		// SEND_ZC pins the user buffer against RLIMIT_MEMLOCK. A host with
 		// a low limit returns ENOMEM once enough sends are in flight --
 		// the same limit that caps the worker count on a CI runner
@@ -2849,9 +2886,19 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) (close
 		//
 		// cs.sending was cleared above and cs.sendBuf still holds the
 		// unsent bytes, so flushSend re-issues them without ZC.
-		w.sendZC = false
-		w.logger.Warn("SEND_ZC returned ENOMEM (RLIMIT_MEMLOCK), falling back to regular SEND",
-			"worker", w.id)
+		//
+		// celeris#609: gated on fromZC -- the provenance of this very
+		// completion -- and NOT on w.sendZC, which the first fallback on
+		// the worker has already cleared. Under the old `&& w.sendZC`
+		// guard the first ENOMEM was absorbed and every zero-copy send
+		// already in flight behind it fell through to the `sent < 0` path
+		// below, which fires OnError(-ENOMEM) and tells handleSend to
+		// closeConn. EINVAL rides the same branch for the same reason it
+		// does in handleSend: it is a reason to stop using the opcode, not
+		// a reason to kill the connection. The retry is armed by flushSend
+		// with w.sendZC already false, so it is a plain SEND and a second
+		// failure takes the generic error path -- exactly one retry.
+		w.retireSendZC(int32(-sent), "SEND_ZC notification reported failure, falling back to regular SEND")
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
@@ -4316,6 +4363,7 @@ func (w *Worker) flushSend(cs *connState) bool {
 		cs.iov[n].Len = uint64(len(cs.sendBody))
 		n++
 		prepWritev(sqe, cs.fd, unsafe.Pointer(&cs.iov[0]), n, false)
+		cs.sendIsZC = false // WRITEV is never zero-copy (celeris#609)
 		if cs.fixedFile {
 			setSQEFixedFile(sqe)
 		}
@@ -4346,7 +4394,12 @@ func (w *Worker) flushSend(cs *connState) bool {
 // completion costs more than the avoided memcpy). Smaller and linked sends use
 // regular SEND.
 func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
-	if useSendZC(w.sendZC, linked, len(cs.sendBuf)) {
+	// Record the provenance of THIS send before arming it. The completion
+	// classifier reads cs.sendIsZC, never w.sendZC, because the fallbacks
+	// clear w.sendZC while sends armed under it are still in flight
+	// (celeris#609).
+	cs.sendIsZC = useSendZC(w.sendZC, linked, len(cs.sendBuf))
+	if cs.sendIsZC {
 		// celeris#591 exposure witnesses. Deliberately inside the ZC arm:
 		// every sub-sendZCMinBytes and every linked send — the per-request
 		// hot path — falls to the plain-SEND branches below and pays
@@ -4422,6 +4475,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 	recvSQE := w.ring.GetSQE()
 	if recvSQE != nil {
 		// Link SEND → RECV (always regular SEND, never ZC).
+		cs.sendIsZC = false // celeris#609 provenance: linked sends are plain
 		if cs.fixedFile {
 			prepSendFixed(sqe, cs.fd, cs.sendBuf, true)
 		} else {
