@@ -425,6 +425,9 @@ func (s *Server) cancelListen() {
 // shut-down state, so a Start racing it returns instead of parking on a
 // context nothing will ever cancel (celeris#595).
 func (s *Server) Shutdown(ctx context.Context) error {
+	// celeris#592: stop the settled-route re-opener so a shut-down server
+	// leaves no goroutine behind. Idempotent, and a no-op if it never started.
+	s.router.stopSettleReopener()
 	eng := s.loadEngine()
 	if eng == nil {
 		s.cancelListen()
@@ -717,6 +720,21 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			return
 		}
 		s.engineRef.Store(&eng)
+
+		// celeris#592: re-time settled adaptive routes. Settling is
+		// otherwise terminal, so a route that settled while its backend was
+		// fast and whose backend later turns slow runs inline on the engine
+		// worker forever. The re-opener is a single per-server goroutine
+		// (none when there are no adaptive routes) and adds nothing to the
+		// request path; Shutdown stops it.
+		//
+		// Started only AFTER the engine exists and is published: a failed
+		// createEngine returns from doPrepare with startErr set and no engine
+		// ever stored, so the caller gets an error instead of a Server, never
+		// calls Shutdown, and nothing would stop a ticker started earlier —
+		// it would run until the process exits. Nothing can settle before the
+		// engine serves a request, so the later start costs no coverage.
+		s.router.startSettleReopener(adaptiveSettleTTL)
 
 		if s.collector != nil {
 			s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {

@@ -211,6 +211,59 @@ const adaptiveSettleStreak = 256
 // already-promoted routes, so the fast path is unaffected.
 const adaptivePromoteTTL = 5 * time.Second
 
+// adaptiveSettleTTL bounds how long a SETTLED classification lasts before the
+// route is re-timed (celeris#592). Settling is otherwise TERMINAL — a settled
+// route is dropped from the timed path (adaptiveLearning short-circuits on
+// `settled`) and the only statement that ever removed it again was an explicit
+// .Async()/.Sync() at registration — so a route that settled while its backend
+// was fast (a sub-300µs store call) and whose backend LATER turns slow kept
+// running inline on the engine worker for every request, forever, pinning the
+// worker and queueing every other connection on it behind the blocking call
+// (measured under celeris#589: 20/20 runs on both native engines ended
+// settled, never promoted, with an unrelated /ping on the same worker stalled
+// in 100% of samples at a ~1.2 s median).
+//
+// Mirrors adaptivePromoteTTL so both terminal states are re-evaluated on the
+// same cadence: the promoted set expires per-route on read, the settled set is
+// cleared wholesale by a background ticker (router.startSettleReopener).
+//
+// Why a ticker instead of per-request sampling: the whole point of celeris#361
+// was to take the two time.Now() vDSO calls OFF the settled hot path, so the
+// re-timing decision must not put anything back on it — no counter, no clock
+// read, no extra atomic. The fast path is byte-for-byte what it was: one
+// sync.Map load in adaptiveLearning. The re-opener runs off-path on one
+// per-server goroutine that wakes every adaptiveSettleTTL and clears the
+// settled set.
+//
+// Cost, MEASURED (TestRouteAdaptive_SettleReopenCost, 200 re-opens per case).
+// Clearing the settled set opens a gate that stays open until the FIRST
+// re-timed run returns and stores `settled` again — the fast streak is
+// deliberately not reset, so a route that is still fast re-settles on its very
+// next run — and every inline run that passes the gate inside that window is
+// timed. That is one timed run per CONCURRENTLY-EXECUTING inline handler, not
+// one per tick and not one per request: an inline run occupies its engine
+// worker for the whole run, so that worker's next request cannot start until
+// the route has already re-settled. Timed runs per re-open at K concurrent
+// inline runners, with the maximum seen in any single re-open in brackets:
+//
+//	darwin/arm64, 10 cores:  K=1 1.00 [1]  K=2 1.96 [2]  K=4 3.96 [4]  K=8 7.75 [8]
+//	golang:1.27, 4 CPUs:     K=1 1.00 [1]  K=2 1.99 [2]  K=4 3.39 [4]  K=8 3.02 [8]
+//
+// The maximum is exactly K at every K on both; the 4-CPU mean falls below K
+// from K=4 because only GOMAXPROCS runs are truly concurrent there, which is
+// the same bound seen from the other side. One timed run costs a measured
+// 124 ns more than a settled one in the container (116 ns on darwin/arm64) —
+// two time.Now() calls plus recordInlineRun — so a route served inline by W
+// workers pays W×~120 ns, under 1 µs, of extra CPU per adaptiveSettleTTL. As a
+// share of traffic: at 1M req/s on one route with 4 workers that is ~3.4 timed
+// runs per 5 s, about 1 request in 1.5 million.
+//
+// A route whose backend has turned slow is caught by the first re-timed run:
+// 300µs–2ms feeds the adaptivePromoteStreak hysteresis, and anything over
+// adaptiveBlockingThreshold promotes immediately. Worst-case detection latency
+// is therefore adaptiveSettleTTL plus one request.
+const adaptiveSettleTTL = 5 * time.Second
+
 // recoverAndRelease handles panic recovery and context release. Extracted to a
 // separate noinline function so that HandleStream's stack frame is not inflated
 // by the deferred closure and debug.Stack() call (P5).
