@@ -96,8 +96,13 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	if l.conns[fd] != nil {
 		// Slot occupied — the source detached fd before handing it off, so this
 		// should not happen; refuse rather than clobber a live conn. Do not close
-		// (the slot holder may close the same descriptor later).
+		// (the slot holder may close the same descriptor later). The connection
+		// is lost here with no close and no hook, so count it separately from
+		// the generic error total (celeris#624).
 		l.errCount.Add(1)
+		if l.transplantSlotOccupied != nil {
+			l.transplantSlotOccupied.Add(1)
+		}
 		return
 	}
 
@@ -121,6 +126,13 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	}
 	cs.writeFn = l.makeWriteFn(cs)
 	l.activeConns.Add(1)
+	// Counted on the same statement as the gauge increment, and fired with
+	// no OnConnect (the source already counted this conn when it accepted
+	// it), so TransplantAdopted is the exact partner of the source's
+	// TransplantDetached (celeris#624).
+	if l.transplantAdopted != nil {
+		l.transplantAdopted.Add(1)
+	}
 	cs.lastActivity = now
 
 	// #383 adopts HTTP/1 keep-alive conns only; lock the protocol and install a
