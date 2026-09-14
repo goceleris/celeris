@@ -2603,7 +2603,7 @@ func (l *Loop) closeConn(fd int) {
 		_ = unix.Close(fd)
 	default:
 		_ = unix.Shutdown(fd, unix.SHUT_WR)
-		sockopts.DrainRecvBuffer(fd)
+		sockopts.CloseDrain(fd, "epoll/closeConn", cs.remoteAddr)
 		_ = unix.Close(fd)
 	}
 	l.removeLiveConn(cs)
