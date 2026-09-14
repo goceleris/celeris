@@ -61,6 +61,8 @@ type Engine struct {
 		// the worker thread (celeris#584).
 		detachedConns      atomic.Int64
 		detachWindowCloses atomic.Uint64
+		// zc holds the SEND_ZC exposure witnesses (celeris#591).
+		zc zcStats
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -300,6 +302,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.recvArm = &e.metrics.recvArm                 // #586 recv-arming witnesses
 		w.detachedConns = &e.metrics.detachedConns
 		w.detachWindowCloses = &e.metrics.detachWindowCloses
+		w.zc = &e.metrics.zc // #591 SEND_ZC exposure witnesses
 		workers[i] = w
 	}
 	return workers, nil
@@ -374,6 +377,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		RecvCQEUnaccounted:           e.metrics.recvArm.cqeUnaccounted.Load(),
 		DetachedConnections:          e.metrics.detachedConns.Load(),
 		DetachWindowCloses:           e.metrics.detachWindowCloses.Load(),
+		ZCSendsSubmitted:             e.metrics.zc.submits.Load(),
+		ZCNotifs:                     e.metrics.zc.notifs.Load(),
+		InlineBytes:                  e.metrics.zc.inlineBytes.Load(),
+		RingBytes:                    e.metrics.zc.ringBytes.Load(),
 	}
 }
 

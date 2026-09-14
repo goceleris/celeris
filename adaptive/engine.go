@@ -823,6 +823,13 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		// exactly one sub-engine, and window closes are cumulative events.
 		DetachedConnections: pm.DetachedConnections + sm.DetachedConnections,
 		DetachWindowCloses:  pm.DetachWindowCloses + sm.DetachWindowCloses,
+		// io_uring-only and cumulative, so additive across a switch: the
+		// epoll sub-engine contributes zero and a ZC send / notif / byte
+		// is attributed to whichever sub-engine issued it (celeris#591).
+		ZCSendsSubmitted: pm.ZCSendsSubmitted + sm.ZCSendsSubmitted,
+		ZCNotifs:         pm.ZCNotifs + sm.ZCNotifs,
+		InlineBytes:      pm.InlineBytes + sm.InlineBytes,
+		RingBytes:        pm.RingBytes + sm.RingBytes,
 	}
 }
 

@@ -29,6 +29,12 @@ var (
 	SessionCookieDrops       Counter
 	JWTLateAdmits            Counter
 	IouringSQECorruptions    Counter
+
+	IouringSendZCSubmits                Counter
+	IouringSendZCSubmitsDetached        Counter
+	IouringSendZCNotifs                 Counter
+	IouringInlineGuardBlockedZC         Counter
+	IouringZCCompletionWithPendingWrite Counter
 )
 
 // Snapshot returns the zero value in production builds — no counters

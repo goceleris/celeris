@@ -27,6 +27,7 @@ import (
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/validation"
 
 	"golang.org/x/sys/unix"
 )
@@ -337,10 +338,19 @@ type Worker struct {
 	transplantCount *atomic.Uint64 // cumulative #383 adopt-from-other-engine count (engine-wide, shared; nil-safe)
 	// recvArm is the engine-wide recv-arming witness set (celeris#586);
 	// nil-safe so a bare test Worker literal can skip it.
-	recvArm           *recvArmStats
+	recvArm *recvArmStats
+	// zc is the engine-wide SEND_ZC exposure witness set (celeris#591);
+	// nil-safe so a bare test Worker literal can skip it.
+	zc                *zcStats
 	reqBatch          uint64 // batched request count, flushed to reqCount per iteration
 	bytesReadBatch    uint64 // batched recv bytes, flushed to bytesRead per iteration
 	bytesWrittenBatch uint64 // batched send bytes, flushed to bytesWritten per iteration
+	// ringBytesBatch is the ring-send share of bytesWrittenBatch (the
+	// complement of the inline-egress bytes counted at the write site),
+	// flushed to zc.ringBytes on the same per-iteration cadence. Batched
+	// rather than an atomic add because completeSend IS the per-request
+	// send path (celeris#591).
+	ringBytesBatch uint64
 
 	tickCounter uint32
 	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
@@ -474,6 +484,64 @@ type recvArmStats struct {
 	armDeclined              atomic.Uint64
 	doubleArmed              atomic.Uint64
 	cqeUnaccounted           atomic.Uint64
+}
+
+// zcStats are the SEND_ZC exposure witnesses behind celeris#585 (the
+// fabric A/B) and celeris#587 (the race tier on the ZC send state),
+// exported through engine.EngineMetrics (celeris#591). They answer the
+// one question those two cannot ask today: did the zero-copy branch run
+// at all? A clean A/B result or a clean race run with submits == 0 is
+// not evidence about SEND_ZC, it is evidence the code path was never
+// entered.
+//
+//   - submits: an IORING_OP_SEND_ZC SQE was armed by prepSendSQE. The
+//     add sits INSIDE the ZC arm, so the plain-SEND path that every
+//     sub-sendZCMinBytes response takes gains nothing.
+//   - notifs: a CQE_F_NOTIF completion was processed — the kernel
+//     released the pinned send buffer. submits - notifs is the number
+//     of buffers still pinned in DMA.
+//   - inlineBytes: payload bytes written by the detached inline-egress
+//     fast path's raw unix.Write(2), which bypasses the ring entirely
+//     and therefore can never be zero-copy.
+//   - ringBytes: payload bytes completed through ring sends. Fed from
+//     the worker-local ringBytesBatch with one atomic per event-loop
+//     iteration (see bytesWrittenBatch): the completion site is the
+//     per-request hot path and must not grow an atomic.
+//
+// inlineBytes + ringBytes is the egress-fabric split of BytesWritten —
+// without it a SEND_ZC throughput delta cannot be attributed, because a
+// WebSocket workload can ship most of its bytes off-ring.
+type zcStats struct {
+	submits     atomic.Uint64
+	notifs      atomic.Uint64
+	inlineBytes atomic.Uint64
+	ringBytes   atomic.Uint64
+}
+
+func (s *zcStats) noteSubmit() {
+	if s != nil {
+		s.submits.Add(1)
+	}
+}
+
+func (s *zcStats) noteNotif() {
+	if s != nil {
+		s.notifs.Add(1)
+	}
+}
+
+func (s *zcStats) noteInlineBytes(n uint64) {
+	if s != nil {
+		s.inlineBytes.Add(n)
+	}
+}
+
+// noteRingBytes publishes a worker's accumulated ring-send bytes. Called
+// once per event-loop iteration from the batch flush, never per send.
+func (s *zcStats) noteRingBytes(n uint64) {
+	if s != nil {
+		s.ringBytes.Add(n)
+	}
 }
 
 func (s *recvArmStats) noteResumeWhileCancelPending() {
@@ -960,6 +1028,11 @@ func (w *Worker) run(ctx context.Context) {
 			w.bytesWritten.Add(w.bytesWrittenBatch)
 			w.bytesWrittenBatch = 0
 		}
+		// Same cadence for the ring share of those bytes (celeris#591).
+		if w.ringBytesBatch > 0 {
+			w.zc.noteRingBytes(w.ringBytesBatch)
+			w.ringBytesBatch = 0
+		}
 
 		// Single atomic publish for all batched buffer returns (P0).
 		if w.hasBufReturns {
@@ -1269,26 +1342,24 @@ func (w *Worker) handleHeaderTimer(fd int) {
 	if cs.closing {
 		return
 	}
-	// Snapshot under detachMu — same TOCTOU as checkTimeouts (celeris#548):
-	// switchToH2Local nils cs.h1State under this lock on the dispatch
-	// goroutine, so a check here followed by a dereference below can take a
-	// nil pointer. Released immediately; the close path below takes the same
-	// mutex.
-	var dl int64
-	var haveH1 bool
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-	}
-	if h1 := cs.h1State; h1 != nil {
-		haveH1 = true
-		dl = h1.HeaderDeadlineNs.Load()
-	}
-	if mu := cs.detachMu; mu != nil {
-		mu.Unlock()
-	}
-	if !haveH1 {
+	// Snapshot under detachMu — same TOCTOU as checkTimeouts (celeris#548) and
+	// the same TryLock for the same reason (celeris#593): this runs on the
+	// LockOSThread'd worker, and runAsyncHandler holds detachMu for the whole
+	// of ProcessH1. See snapshotH1Deadlines.
+	snap, ok := snapshotH1Deadlines(cs)
+	if !ok {
+		// detachMu held ⇒ the conn is inside its handler, not waiting for a
+		// request line, so the header deadline cannot be live. Dropping this
+		// timer costs nothing: checkTimeouts re-reads HeaderDeadlineNs on its
+		// ~50ms slowloris cadence and is the documented fallback for a timer
+		// that failed to arm. Re-arming here instead would spin — the spec's
+		// deadline has already passed, so the fresh timer would fire at once.
 		return
 	}
+	if !snap.haveH1 {
+		return
+	}
+	dl := snap.hdrDL
 	if dl == 0 {
 		// Headers completed before the timer fired; no-op. The next
 		// ArmHeaderDeadline (keep-alive next request) will submit a
@@ -1704,6 +1775,14 @@ func (w *Worker) initProtocol(cs *connState) {
 					len(cs.sendBuf) == 0 && len(cs.bodyBuf) == 0 && len(cs.writeBuf) > 0 {
 					if n, werr := unix.Write(cs.fd, cs.writeBuf); werr == nil {
 						w.bytesWritten.Add(uint64(n))
+						// celeris#591: these bytes never touch the ring, so
+						// SEND_ZC cannot apply to them. InlineBytes vs
+						// RingBytes is the egress-fabric split the #585 A/B
+						// needs to attribute a throughput delta. One atomic
+						// per inline write, alongside the bytesWritten add
+						// that is already here — no per-request cost, this
+						// path only exists for detached (WS/SSE) egress.
+						w.zc.noteInlineBytes(uint64(n))
 						if n >= len(cs.writeBuf) {
 							cs.writeBuf = cs.writeBuf[:0]
 							mu.Unlock()
@@ -1711,6 +1790,16 @@ func (w *Worker) initProtocol(cs *connState) {
 						}
 						cs.writeBuf = cs.writeBuf[:copy(cs.writeBuf, cs.writeBuf[n:])]
 					}
+				} else if cs.zcNotifPending {
+					// celeris#591: the fast path declined with a SEND_ZC
+					// notification still outstanding — the kernel holds
+					// cs.sendBuf pinned for DMA and an inline write here
+					// would interleave with it on the wire. This is the
+					// witness that the ZC-vs-inline window was entered at
+					// all; a #587 race run that reports zero here never
+					// reached the interleaving it set out to test. Under
+					// detachMu (held), so not a racy read.
+					validation.IouringInlineGuardBlockedZC.Add(1)
 				}
 				mu.Unlock()
 				// Signal the event loop to flush the remainder. Do NOT call
@@ -2504,14 +2593,30 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
 	// Now safe to modify/reuse sendBuf. Process the deferred result.
 	if cqeIsNotif(c.Flags) {
+		// celeris#591: one atomic per NOTIF. Reached only on the ZC path —
+		// a plain SEND never produces a CQE_F_NOTIF completion.
+		w.zc.noteNotif()
+		validation.IouringSendZCNotifs.Add(1)
 		// zcNotifPending is read by the inline-egress guard on the dispatch
 		// goroutine under detachMu; clear it under the lock (completeSend
 		// re-acquires detachMu, so release first).
 		if mu := cs.detachMu; mu != nil {
 			mu.Lock()
+			// celeris#591: the NOTIF is the instant the guard reopens. If
+			// writeBuf already holds queued bytes, the very next inline
+			// unix.Write is admitted against data the worker has not yet
+			// flushed — the ordering celeris#587 exercises. Read under
+			// detachMu, the same lock the dispatch goroutine writes it
+			// under, so this witness is not itself a race.
+			if len(cs.writeBuf) > 0 {
+				validation.IouringZCCompletionWithPendingWrite.Add(1)
+			}
 			cs.zcNotifPending = false
 			mu.Unlock()
 		} else {
+			if len(cs.writeBuf) > 0 {
+				validation.IouringZCCompletionWithPendingWrite.Add(1)
+			}
 			cs.zcNotifPending = false
 		}
 		if w.completeSend(cs, fd, int(cs.zcSentBytes), now) {
@@ -2698,6 +2803,10 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64) (close
 	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
 	// reach completeSend with the byte count).
 	w.bytesWrittenBatch += uint64(sent)
+	// celeris#591: the ring-send share of those bytes. Plain local add on
+	// the per-request send path — it is published with one atomic per
+	// event-loop iteration next to bytesWrittenBatch, never per request.
+	w.ringBytesBatch += uint64(sent)
 
 	// Partial-send handling, split by whether we issued a plain SEND
 	// (sendBuf only) or a WRITEV (sendBuf + sendBody). Partial WRITEV
@@ -3194,7 +3303,11 @@ func (w *Worker) finishClose(fd int) {
 		return
 	}
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	sockopts.DrainRecvBuffer(fd)
+	raddr := ""
+	if cs != nil {
+		raddr = cs.remoteAddr
+	}
+	sockopts.CloseDrain(fd, "iouring/finishClose", raddr)
 	_ = unix.Close(fd)
 }
 
@@ -3303,7 +3416,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// io_uring) to avoid the async-SQE pile-up that plagued the pre-patch
 	// version.
 	_ = unix.Shutdown(fd, unix.SHUT_WR)
-	sockopts.DrainRecvBuffer(fd)
+	sockopts.CloseDrain(fd, "iouring/finishCloseDetached", cs.remoteAddr)
 	_ = unix.Close(fd)
 }
 
@@ -4143,6 +4256,18 @@ func (w *Worker) flushSend(cs *connState) bool {
 // regular SEND.
 func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	if useSendZC(w.sendZC, linked, len(cs.sendBuf)) {
+		// celeris#591 exposure witnesses. Deliberately inside the ZC arm:
+		// every sub-sendZCMinBytes and every linked send — the per-request
+		// hot path — falls to the plain-SEND branches below and pays
+		// nothing. The detached split is keyed on h1State.Detached because
+		// a ZC send on a detached conn is the one that can race the
+		// dispatch goroutine's inline unix.Write (celeris#587); h1State is
+		// nil for a driver/EventLoopProvider conn.
+		w.zc.noteSubmit()
+		validation.IouringSendZCSubmits.Add(1)
+		if cs.h1State != nil && cs.h1State.Detached.Load() {
+			validation.IouringSendZCSubmitsDetached.Add(1)
+		}
 		if cs.fixedFile {
 			prepSendZCFixed(sqe, cs.fd, cs.sendBuf, false)
 		} else {
@@ -4279,6 +4404,68 @@ func (w *Worker) removeLiveConn(cs *connState) {
 	cs.liveIdx = -1
 }
 
+// h1DeadlineSnapshot is the set of cs.h1State fields the two worker-thread
+// timeout paths (checkTimeouts and handleHeaderTimer) base their decision on.
+type h1DeadlineSnapshot struct {
+	haveH1   bool
+	detached bool
+	idleDL   int64
+	hdrDL    int64
+}
+
+// snapshotH1Deadlines copies those fields out of cs.h1State under cs.detachMu
+// and releases the lock before returning, so the caller can act (closeConn
+// takes the same mutex, so holding it across the call would deadlock).
+//
+// Taking the lock at all is the celeris#548 invariant: the async dispatch
+// goroutine's switchToH2Local calls conn.CloseH1(cs.h1State) and then nils
+// cs.h1State under this same lock, so testing the pointer and dereferencing
+// it again outside the lock is a TOCTOU — the pointer can go nil between the
+// two reads and the event loop takes a nil dereference. That invariant is
+// stated twice elsewhere in this file and is UNCHANGED here: every read below
+// still happens with the lock held. (An atomic shadow copy of the pointer
+// would not preserve it — the loser of the race would dereference an H1State
+// that CloseH1 has already recycled.)
+//
+// ok=false means the lock was held by someone else and NOTHING was read: this
+// uses TryLock, not Lock (celeris#593). runAsyncHandler holds cs.detachMu
+// across the whole of ProcessH1, i.e. for the entire handler call, so a
+// blocking Lock on the worker thread parks the LockOSThread'd worker — and
+// therefore every other connection it owns — until a slow async handler
+// returns. Measured on the celeris#589 rig: with a 300 ms handler on an
+// explicitly .Async() route, an unrelated /ping on the same worker was stalled
+// for 270 ms of every 300 ms (stalled_frac 0.30-0.33 in 40/40 runs) and 99/99
+// stalled samples showed a worker goroutine in checkTimeouts →
+// sync.Mutex.Lock; epoll scored 0/40 because its sweep reads h1State without
+// a lock.
+//
+// Skipping the connection for this pass is correct, not merely cheaper.
+// detachMu is held exactly while the dispatch goroutine is inside the handler
+// (or inside a guarded egress write) — i.e. while the connection is demonstrably
+// active — and none of the deadlines the callers evaluate govern a request that
+// is executing: the idle and read deadlines are measured between requests, and
+// the header deadline is only non-zero while the connection is waiting for a
+// request line, which is not a moment at which a handler can hold the lock.
+// The sweep re-runs every ~50-100 ms (the 0x1F/0x3FF gate in run()), so the
+// worst case is one sweep period of extra timeout latency on a connection that
+// is by definition not idle. A connection with no detachMu is read directly.
+func snapshotH1Deadlines(cs *connState) (snap h1DeadlineSnapshot, ok bool) {
+	mu := cs.detachMu
+	if mu != nil {
+		if !mu.TryLock() {
+			return snap, false
+		}
+		defer mu.Unlock()
+	}
+	if h1 := cs.h1State; h1 != nil {
+		snap.haveH1 = true
+		snap.detached = h1.Detached.Load()
+		snap.idleDL = h1.IdleDeadlineNs.Load()
+		snap.hdrDL = h1.HeaderDeadlineNs.Load()
+	}
+	return snap, true
+}
+
 // checkTimeouts scans active connections and closes any that have exceeded
 // their configured timeout. Called every 1024 iterations (~100ms). This
 // replaces the timer wheel: instead of allocating entries and updating maps
@@ -4343,29 +4530,17 @@ func (w *Worker) checkTimeouts() {
 		// I/O lifecycle. Async-mode conns set detachMu up front without
 		// a real detach — fall through to the normal timeout scan for
 		// those.
-		// Snapshot h1State under detachMu (celeris#548). The async dispatch
-		// goroutine's switchToH2Local nils cs.h1State under this same lock,
-		// so testing it and then dereferencing it again is a TOCTOU: the
-		// pointer can go nil between the two reads and the event loop takes
-		// a nil dereference. This is the invariant stated twice elsewhere in
-		// this file, at the two sites where it was already fixed.
-		//
-		// The lock is RELEASED before acting: closeConn takes the same
-		// mutex, so holding it across the call would deadlock. Everything
-		// the decision needs is copied out first.
-		var h1Detached bool
-		var idleDL, hdrDL int64
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
+		// Snapshot h1State under detachMu (celeris#548), with TryLock so a
+		// slow async handler holding that lock across ProcessH1 cannot pin
+		// this worker (celeris#593). Both rules, and why skipping is the
+		// correct outcome, are on snapshotH1Deadlines.
+		snap, ok := snapshotH1Deadlines(cs)
+		if !ok {
+			// detachMu held: the conn is inside its handler, so none of the
+			// deadlines below apply to it right now. Re-examined next sweep.
+			continue
 		}
-		if h1 := cs.h1State; h1 != nil {
-			h1Detached = h1.Detached.Load()
-			idleDL = h1.IdleDeadlineNs.Load()
-			hdrDL = h1.HeaderDeadlineNs.Load()
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
+		h1Detached, idleDL, hdrDL := snap.detached, snap.idleDL, snap.hdrDL
 
 		// engine-config-driven timeouts do not apply to a detached conn —
 		// the middleware owns its I/O lifecycle.
