@@ -460,8 +460,9 @@ type Worker struct {
 //
 //   - resumeWhileCancelPending: drainDetachQueue took the resume branch
 //     with the pause's ASYNC_CANCEL still marked pending
-//     (recvCancelPending). Over-approximates the window: the flag also
-//     stays set after a cancel that MISSED (see the resume branch).
+//     (recvCancelPending non-zero). Slightly over-approximates the window:
+//     a cancel that missed stays counted until its own completion is
+//     processed (handleRecvCancel), a loop pass or two (celeris#596).
 //   - resumeWhileRecvInFlight: the subset of those where the cancelled
 //     recv was still armed at the resume. This is the exact window #484
 //     lived in — the only state in which a second arm can land on top of
@@ -580,6 +581,19 @@ func (w *Worker) noteRecvPlaced(cs *connState) {
 	cs.recvOutstanding++
 	if cs.recvOutstanding >= 2 {
 		w.recvArm.noteDoubleArmed()
+	}
+}
+
+// retireRecvCancel accounts for one of cs's outstanding backpressure-pause
+// ASYNC_CANCELs having resolved, whether by cancelling a recv (the recv's
+// -ECANCELED) or by cancelling nothing (the cancel's own completion). The
+// clamp is defensive: one cancel carries IORING_ASYNC_CANCEL_ALL and would
+// produce two -ECANCELEDs if a connection ever held two recvs, which is the
+// celeris#484 defect RecvDoubleArmed exists to assert against.
+// Worker-thread only.
+func retireRecvCancel(cs *connState) {
+	if cs.recvCancelPending > 0 {
+		cs.recvCancelPending--
 	}
 }
 
@@ -992,6 +1006,14 @@ func (w *Worker) run(ctx context.Context) {
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleHeaderTimer(fd)
 					}
+				case udRecvCancel:
+					// Same rule as udHeaderTimer: this case must exist in
+					// the inlined dispatch or the recv-pause cancel's
+					// failure CQE is dropped and recvCancelPending goes
+					// stale again (celeris#596).
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleRecvCancel(entry, fd)
+					}
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -1187,10 +1209,13 @@ func (w *Worker) run(ctx context.Context) {
 // As the single chokepoint every conn-bound CQE passes through, this is
 // also where kernelInflight accounting happens (v1.4.15/7beebb9 corruption fix): a TERMINAL
 // recv/send CQE — one without CQE_F_MORE; multishot recv and SEND_ZC
-// post intermediate F_MORE CQEs, and a cancel op's own CQE carries the
-// udProvide tag so it never reaches here — decrements the owning conn's
-// in-flight op count. For a live conn that is cs directly; for a stale
-// CQE the closed conn is resolved through Worker.closedOps, keeping the
+// post intermediate F_MORE CQEs, and a cancel op's own CQE is never a
+// udRecv/udSend op (the close-path cancels carry udProvide and are
+// dropped before reaching here; the recv-pause cancel carries
+// udRecvCancel and does pass through, for the generation gate alone) —
+// decrements the owning conn's in-flight op count. For a live conn that
+// is cs directly; for a stale CQE the closed conn is resolved through
+// Worker.closedOps, keeping the
 // bookkeeping on the OLD connState captured at arm time rather than
 // whatever currently occupies w.conns[fd]. The decrement is what lets
 // drainPendingRelease return the closed connState to the pool.
@@ -1302,6 +1327,11 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleHeaderTimer(fd)
+	case udRecvCancel:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
+		w.handleRecvCancel(c, fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
 	case udDriverSend:
@@ -1309,6 +1339,53 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 	case udDriverClose:
 		w.handleDriverClose(fd)
 	}
+}
+
+// handleRecvCancel processes the CQE of the WebSocket backpressure pause's
+// ASYNC_CANCEL (udRecvCancel) and retires cs.recvCancelPending when that
+// cancel turns out to have cancelled nothing.
+//
+// With IORING_ASYNC_CANCEL_ALL the result is the NUMBER of ops cancelled:
+//
+//   - res > 0: the recv was cancelled and its -ECANCELED is on the way. This
+//     cancel is NOT retired here — that -ECANCELED retires it, in handleRecv,
+//     which reads the count to tell a pause still in force (return, stay
+//     unarmed) from a pause the middleware already withdrew (re-arm, the
+//     celeris#484 fix) apart from a genuine I/O error, which closes the conn.
+//   - res == 0, or -ENOENT on a kernel that reports the miss as an error:
+//     nothing matched. The recv had already completed on its own — with data,
+//     before the cancel ran — or was never armed, and NO -ECANCELED will ever
+//     arrive. This is the miss, and this CQE is the only event that can
+//     observe it.
+//   - -EALREADY: the op was found with cancellation already under way, so its
+//     -ECANCELED is still coming. Treated as res > 0.
+//
+// Exactly one retirement per cancel either way, which is what lets several
+// cancels be outstanding at once without their outcomes stealing each other's
+// state (see connState.recvCancelPending).
+//
+// Until celeris#596 this cancel used the CQE_SKIP_SUCCESS form, which
+// suppresses completions with res >= 0 — that is, precisely the res == 0 that
+// reports the miss, so the miss produced no CQE at all. recvCancelPending then
+// stayed set from the first missed cancel until some later cancel actually
+// landed, and the resume branch, which reads it to witness the celeris#484
+// window, counted every resume in between: 10 993 against 1 real entry at
+// MaxBackpressureBuffer=8.
+//
+// Off the per-request path entirely: this op exists only while a detached
+// WebSocket is in backpressure.
+func (w *Worker) handleRecvCancel(c *completionEntry, fd int) {
+	if fd < 0 || fd >= len(w.conns) {
+		return
+	}
+	cs := w.conns[fd]
+	if cs == nil {
+		return
+	}
+	if c.Res > 0 || c.Res == -int32(unix.EALREADY) {
+		return
+	}
+	retireRecvCancel(cs)
 }
 
 // handleHeaderTimer processes an IORING_OP_TIMEOUT CQE submitted by
@@ -2048,7 +2125,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// Recv was cancelled by drainDetachQueue (WS backpressure pause).
 		// Don't close — the connection stays open until ResumeRecv re-arms.
 		if c.Res == -int32(unix.ECANCELED) && cs.recvPaused {
-			cs.recvCancelPending = false
+			retireRecvCancel(cs)
 			return
 		}
 		// Same cancel, but the middleware drained its buffer and withdrew
@@ -2057,8 +2134,8 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// generic negative-result path below does — tore down a working
 		// connection whenever a burst was consumed faster than the pause
 		// round trip (celeris#484).
-		if c.Res == -int32(unix.ECANCELED) && cs.recvCancelPending {
-			cs.recvCancelPending = false
+		if c.Res == -int32(unix.ECANCELED) && cs.recvCancelPending > 0 {
+			retireRecvCancel(cs)
 			if !w.prepareRecv(cs, cs.buf) {
 				cs.needsRecv = true
 				w.markDirty(cs)
@@ -4021,9 +4098,9 @@ func (w *Worker) drainDetachQueue() {
 		// targeting this fd. Once cancelled, no recv is re-armed until
 		// resume is called. Resume: re-arm recv via prepareRecv.
 		//
-		// The cancel CQE (if any — sqeCQESkipSuccess suppresses success
-		// CQEs) is tagged with udProvide so the main dispatcher silently
-		// ignores it instead of routing through handleRecv.
+		// The cancel's own CQE is tagged udRecvCancel and routed to
+		// handleRecvCancel, which retires cs.recvCancelPending when the
+		// cancel turns out to have matched nothing (celeris#596).
 		if desired := cs.recvPauseDesired.Load(); desired != cs.recvPaused {
 			if desired {
 				if sqe := w.ring.GetSQE(); sqe != nil {
@@ -4034,8 +4111,8 @@ func (w *Worker) drainDetachQueue() {
 					// modes (v1.5.0 review 2.5). The match MUST include the
 					// conn's generation — the recv SQE carries it (review
 					// 2.6), so a gen-less target would match nothing. The
-					// cancel SQE itself carries the udProvide tag so the
-					// dispatcher drops its CQE.
+					// cancel SQE itself carries the udRecvCancel tag so the
+					// dispatcher can see whether it matched anything.
 					// Cancel the in-flight recv by its generation-tagged
 					// user_data -- ALWAYS, never by raw fd (celeris#482).
 					//
@@ -4056,26 +4133,40 @@ func (w *Worker) drainDetachQueue() {
 					// modes (v1.5.0 review 2.5) and MUST include the conn's
 					// generation -- the recv SQE carries it (review 2.6).
 					// cancelConnOps already uses exactly this form
-					// unconditionally. The cancel's own CQE is tagged
-					// udProvide so the dispatcher drops it.
-					prepCancelUserDataSkipSuccess(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
-					setSQEUserData(sqe, encodeUserData(udProvide, cs.fd))
-					cs.recvCancelPending = true
+					// unconditionally.
+					//
+					// The cancel's own CQE is REPORTED (no
+					// CQE_SKIP_SUCCESS) and tagged udRecvCancel rather than
+					// the udProvide "drop it" sentinel, because its result
+					// is the only thing that can retire recvCancelPending
+					// when the cancel misses: with IORING_ASYNC_CANCEL_ALL a
+					// cancel that matched nothing completes as res == 0, a
+					// SUCCESS, so the suppressed form posted no CQE at all
+					// and the count never came back down for the rest of
+					// the conn's life (celeris#596). One extra CQE per
+					// backpressure pause, off the per-request path entirely.
+					prepCancelUserDataReported(sqe, encodeUserDataGen(udRecv, cs.fd, cs.generation))
+					setSQEUserData(sqe, encodeUserDataGen(udRecvCancel, cs.fd, cs.generation))
+					cs.recvCancelPending++
 				}
 			} else {
 				// The #484 window: the pause's cancel has not landed yet
 				// and the middleware already withdrew the pause. Counted
 				// BEFORE prepareRecv so the witness is the window itself,
 				// not whether the guard declined (celeris#586).
-				if cs.recvCancelPending {
+				if cs.recvCancelPending > 0 {
 					w.recvArm.noteResumeWhileCancelPending()
-					// recvCancelPending stays set when the cancel MISSED
-					// (the recv completed with data before the cancel ran;
-					// the cancel's -ENOENT CQE is dropped as udProvide), so
-					// the count above also includes resumes with nothing in
-					// flight. The narrower witness is a resume with the
-					// cancelled recv still armed: only then can a second arm
-					// be placed on top of it.
+					// A cancel that MISSED (the recv completed with data
+					// before the cancel ran, or nothing was armed) used to
+					// stay counted indefinitely, because its completion was
+					// suppressed as a success and dropped as udProvide — so
+					// every later resume was counted as if it were inside
+					// the window (celeris#596). handleRecvCancel now retires
+					// it on that completion, leaving only the resumes that
+					// fall between the missed cancel and its CQE. The
+					// narrower witness is still a resume with the cancelled
+					// recv actually armed: only then can a second arm be
+					// placed on top of a kernel-held one.
 					if cs.recvArmed {
 						w.recvArm.noteResumeWhileRecvInFlight()
 					}

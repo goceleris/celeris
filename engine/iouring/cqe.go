@@ -38,15 +38,33 @@ const (
 	udRecv   uint64 = 0x02 << 56
 	udSend   uint64 = 0x03 << 56
 	udClose  uint64 = 0x04 << 56
-	// udProvide is a sentinel "ignore this CQE" tag. The recv-pause
-	// cancellation path in worker.go tags the cancel SQE with this value
-	// so the main dispatcher's switch has no matching case and drops
-	// the CQE on the floor instead of routing through handleRecv. Name
-	// kept from the legacy PROVIDE_BUFFERS path (BufferGroup, removed
-	// in v1.5.0/celeris#320); the value (0x06 << 56) is unchanged to
-	// preserve the user-data tag layout for any persisted snapshots.
-	udProvide  uint64 = 0x06 << 56
-	udH2Wakeup uint64 = 0x07 << 56
+	// udProvide is a sentinel "ignore this CQE" tag: the main dispatcher's
+	// switch has no matching case, so the CQE is dropped on the floor
+	// instead of routing through handleRecv. cancelConnOps tags its
+	// close-path ASYNC_CANCELs with it. The recv-pause cancel used it too
+	// until celeris#596 gave that one its own tag (udRecvCancel) so its
+	// -ENOENT could be read. Name kept from the legacy PROVIDE_BUFFERS
+	// path (BufferGroup, removed in v1.5.0/celeris#320); the value
+	// (0x06 << 56) is unchanged to preserve the user-data tag layout for
+	// any persisted snapshots.
+	udProvide uint64 = 0x06 << 56
+	// udRecvCancel tags the ASYNC_CANCEL SQE that the WebSocket
+	// backpressure pause submits for the conn's armed recv, so its
+	// completion reaches handleRecvCancel instead of being dropped. It
+	// carried udProvide — the "drop this CQE" sentinel — until celeris#596:
+	// that threw away the only event that can say the cancel MISSED (the
+	// recv had already completed, so no -ECANCELED is coming), and
+	// cs.recvCancelPending stayed stale for the rest of the conn's life,
+	// over-counting the celeris#484 resume window ~1000x.
+	//
+	// Conn-bound, so it is stamped with the generation and passes the same
+	// stale-CQE gate as the recv it targets. It is NOT a terminalOp, so it
+	// stays outside the kernelInflight accounting exactly as the udProvide
+	// form did. The close path's cancels (cancelConnOps) keep udProvide and
+	// their suppressed CQE: their conn is being torn down and has no flag
+	// left to correct.
+	udRecvCancel uint64 = 0x05 << 56
+	udH2Wakeup   uint64 = 0x07 << 56
 	// udHeaderTimer tags IORING_OP_TIMEOUT SQEs submitted by initProtocol /
 	// ProcessH1's arm-callback to enforce ReadHeaderTimeout per-conn. The
 	// timer fires absolutely at the deadline; CQE handler closes the conn

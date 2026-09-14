@@ -132,8 +132,8 @@ func TestResumeBeforeCancelLandsPlacesNoSecondRecv(t *testing.T) {
 	f.submit(t)
 
 	f.pause()
-	if !cs.recvPaused || !cs.recvCancelPending {
-		t.Fatalf("pause did not place the cancel: recvPaused=%v recvCancelPending=%v", cs.recvPaused, cs.recvCancelPending)
+	if !cs.recvPaused || cs.recvCancelPending != 1 {
+		t.Fatalf("pause did not place the cancel: recvPaused=%v recvCancelPending=%d", cs.recvPaused, cs.recvCancelPending)
 	}
 	if ring.Pending() != 1 {
 		t.Fatalf("pause placed %d SQEs, want exactly the cancel", ring.Pending())
@@ -155,20 +155,47 @@ func TestResumeBeforeCancelLandsPlacesNoSecondRecv(t *testing.T) {
 		t.Fatal("resume did not clear recvPaused")
 	}
 
-	// Let the cancel land. Its own CQE is skip-success; the recv's
-	// -ECANCELED is the only completion, and it must re-arm exactly once.
+	// Let the cancel land. Two completions now: the cancel's own, reporting
+	// how many ops it cancelled (celeris#596 made it reported rather than
+	// skip-success), and the recv's -ECANCELED.
+	//
+	// The cancel HIT here, and that is the half of celeris#596 that must not
+	// regress: a cancel that cancelled something leaves recvCancelPending set,
+	// because handleRecv's -ECANCELED branch reads it to tell a withdrawn
+	// pause (re-arm, the celeris#484 fix) from an I/O error (close).
 	f.submit(t)
 	cqes := f.reap(t, 2*time.Second)
-	if len(cqes) != 1 || decodeOp(cqes[0].UserData) != udRecv || cqes[0].Res != -int32(unix.ECANCELED) {
-		t.Fatalf("expected one -ECANCELED recv CQE, got %+v", cqes)
+	if len(cqes) != 2 {
+		t.Fatalf("expected the cancel's own CQE and the recv's -ECANCELED, got %+v", cqes)
+	}
+	var recvCQE *completionEntry
+	for i := range cqes {
+		if decodeOp(cqes[i].UserData) == udRecv {
+			if cqes[i].Res != -int32(unix.ECANCELED) {
+				t.Fatalf("recv CQE res=%d, want -ECANCELED", cqes[i].Res)
+			}
+			recvCQE = &cqes[i]
+			continue
+		}
+		if cqes[i].Res <= 0 {
+			t.Fatalf("the cancel reported res=%d, want > 0: it was supposed to cancel the armed recv", cqes[i].Res)
+		}
+		w.processCQE(t.Context(), &cqes[i], time.Now().UnixNano())
+		if cs.recvCancelPending != 1 {
+			t.Fatal("a cancel that HIT retired recvCancelPending; the -ECANCELED that follows " +
+				"would then fall through to the generic error path and close a healthy conn (celeris#484)")
+		}
+	}
+	if recvCQE == nil {
+		t.Fatalf("no recv CQE among %+v", cqes)
 	}
 	pendingBefore := ring.Pending()
-	w.processCQE(t.Context(), &cqes[0], time.Now().UnixNano())
+	w.processCQE(t.Context(), recvCQE, time.Now().UnixNano())
 	if got := ring.Pending(); got != pendingBefore+1 {
 		t.Fatalf("the withdrawn pause's -ECANCELED re-armed %d recvs, want exactly 1", got-pendingBefore)
 	}
-	if cs.recvOutstanding != 1 || cs.recvCancelPending {
-		t.Fatalf("after -ECANCELED re-arm: outstanding=%d recvCancelPending=%v, want 1/false", cs.recvOutstanding, cs.recvCancelPending)
+	if cs.recvOutstanding != 1 || cs.recvCancelPending != 0 {
+		t.Fatalf("after -ECANCELED re-arm: outstanding=%d recvCancelPending=%d, want 1/0", cs.recvOutstanding, cs.recvCancelPending)
 	}
 	f.submit(t)
 
