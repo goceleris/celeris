@@ -71,6 +71,21 @@ type Server struct {
 	cpuMon   cpumon.Monitor
 	cpuMonMu sync.Mutex
 
+	// listenCancel cancels the context handed to Engine.Listen by the
+	// Start* entry points; Shutdown calls it once the engine's graceful
+	// phase is over. Without it Start/StartWithListener never return on
+	// the native engines (celeris#595): iouring/epoll Listen parks on
+	// <-ctx.Done() and their Engine.Shutdown is a documented no-op, so a
+	// Listen handed context.Background() has nothing that can wake it.
+	// shutdownCalled closes the Start/Shutdown race — a Shutdown that
+	// lands before the cancel is published makes the next listen context
+	// start out already cancelled instead of blocking forever.
+	// lifecycleMu guards both; it is never held across Listen or across
+	// the cancel call itself.
+	lifecycleMu    sync.Mutex
+	listenCancel   context.CancelFunc
+	shutdownCalled bool
+
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
 	errorHandler            func(*Context, error)
@@ -356,7 +371,43 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	return eng.Listen(context.Background())
+	ctx, cancel := s.listenContext(context.Background())
+	defer cancel()
+	return eng.Listen(ctx)
+}
+
+// listenContext derives the context handed to Engine.Listen from parent and
+// publishes its CancelFunc so Shutdown can unblock Listen (celeris#595). The
+// derivation keeps caller-context semantics intact: cancelling parent still
+// cancels Listen exactly as before, this only adds a second way to wake it.
+// If Shutdown already ran (or is racing prepare), the returned context is
+// already cancelled so Listen returns immediately instead of parking forever.
+func (s *Server) listenContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	s.lifecycleMu.Lock()
+	alreadyShutdown := s.shutdownCalled
+	if !alreadyShutdown {
+		s.listenCancel = cancel
+	}
+	s.lifecycleMu.Unlock()
+	if alreadyShutdown {
+		cancel()
+	}
+	return ctx, cancel
+}
+
+// cancelListen wakes a Listen parked on the context published by
+// listenContext and latches the shut-down state for any Start racing us.
+// Idempotent: context.CancelFunc is safe to call more than once.
+func (s *Server) cancelListen() {
+	s.lifecycleMu.Lock()
+	s.shutdownCalled = true
+	cancel := s.listenCancel
+	s.listenCancel = nil
+	s.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // Shutdown gracefully shuts down the server. Returns nil if the server has not
@@ -364,16 +415,27 @@ func (s *Server) Start() error {
 // in-flight requests, any hooks registered via [Server.OnShutdown] fire in
 // registration order with the provided context. The CPUMonitor owned by the
 // Server is closed as part of shutdown.
+//
+// The listen context published by the Start* entry points is cancelled AFTER
+// the engine's graceful phase, never before: on std, Engine.Shutdown IS the
+// drain, and Listen's own ctx.Done branch shuts the engine down with a
+// background context (no budget). Cancelling first would let Listen win
+// Engine.Shutdown's sync.Once and strip the deadline the caller passed here.
+// A Shutdown that arrives before the server ever started still latches the
+// shut-down state, so a Start racing it returns instead of parking on a
+// context nothing will ever cancel (celeris#595).
 func (s *Server) Shutdown(ctx context.Context) error {
 	// celeris#592: stop the settled-route re-opener so a shut-down server
 	// leaves no goroutine behind. Idempotent, and a no-op if it never started.
 	s.router.stopSettleReopener()
 	eng := s.loadEngine()
 	if eng == nil {
+		s.cancelListen()
 		s.closeCPUMonitor()
 		return nil
 	}
 	err := eng.Shutdown(ctx)
+	s.cancelListen()
 	s.closeCPUMonitor()
 	for _, fn := range s.shutdownHooks {
 		func() {
@@ -725,7 +787,9 @@ func (s *Server) StartWithListener(ln net.Listener) error {
 	if err != nil {
 		return err
 	}
-	return eng.Listen(context.Background())
+	ctx, cancel := s.listenContext(context.Background())
+	defer cancel()
+	return eng.Listen(ctx)
 }
 
 // StartWithListenerAndContext combines [Server.StartWithListener] and
@@ -755,7 +819,11 @@ func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listene
 		}
 	}()
 
-	err = eng.Listen(ctx)
+	// Derived from the caller's ctx: cancelling ctx still stops Listen, and
+	// a direct Server.Shutdown (without cancelling ctx) can stop it too.
+	listenCtx, cancelListen := s.listenContext(ctx)
+	defer cancelListen()
+	err = eng.Listen(listenCtx)
 	close(listenDone)
 	return err
 }
@@ -808,7 +876,10 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 		}
 	}()
 
-	err = eng.Listen(ctx)
+	// Derived from the caller's ctx — see StartWithListenerAndContext.
+	listenCtx, cancelListen := s.listenContext(ctx)
+	defer cancelListen()
+	err = eng.Listen(listenCtx)
 	close(listenDone)
 	return err
 }
