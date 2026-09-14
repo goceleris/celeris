@@ -129,8 +129,16 @@ type router struct {
 	fastStreak sync.Map
 	// settled holds adaptive fullPaths proven non-blocking (see fastStreak).
 	// A settled route is no longer timed/promotable; it runs inline like a
-	// plain sync route. Explicit .Async()/.Sync() clears it (setAsync).
+	// plain sync route. Explicit .Async()/.Sync() clears it (setAsync), and
+	// the background re-opener clears it every adaptiveSettleTTL so a route
+	// whose backend later turns slow is re-timed (celeris#592).
 	settled sync.Map
+
+	// reopenMu guards reopenStop, the stop channel of the settle re-opener
+	// goroutine (celeris#592). Start and stop run on different goroutines
+	// (Server.doPrepare vs Server.Shutdown) and both must be idempotent.
+	reopenMu   sync.Mutex
+	reopenStop chan struct{}
 }
 
 // Route is an opaque handle to a registered route. Use the Name method to
@@ -373,8 +381,23 @@ func (r *router) recordInlineRun(fullPath string, slow bool) {
 		// celeris#361: a route fast on adaptiveSettleStreak CONSECUTIVE runs is
 		// provably non-blocking — settle it so adaptiveLearning short-circuits
 		// and handler.go stops timing every request forever.
+		//
+		// celeris#592: CLAMP at the threshold. Settling used to be terminal,
+		// so this counter stopped being incremented the moment it first
+		// reached adaptiveSettleStreak. Now the re-opener returns the route to
+		// the timed path every adaptiveSettleTTL, so an unclamped Add would
+		// keep growing for the life of the process — one per re-open at least,
+		// more when several requests are in flight in the re-open window — and
+		// on int32 wrap it would go NEGATIVE, at which point `>= streak` stops
+		// holding and the route could never settle again: the fix would have
+		// turned into a permanent re-introduction of the per-request timing it
+		// exists to avoid. Storing the threshold keeps the counter saturated,
+		// so the invariant is 0 <= fastStreak <= adaptiveSettleStreak forever
+		// and "already at the threshold ⇒ re-settles on the next fast run"
+		// still holds.
 		fv, _ := r.fastStreak.LoadOrStore(fullPath, new(atomic.Int32))
-		if fv.(*atomic.Int32).Add(1) >= adaptiveSettleStreak {
+		if c := fv.(*atomic.Int32); c.Add(1) >= adaptiveSettleStreak {
+			c.Store(adaptiveSettleStreak)
 			r.settled.Store(fullPath, struct{}{})
 		}
 		return
@@ -399,6 +422,70 @@ func (r *router) adaptiveLearning(fullPath string) bool {
 		return false
 	}
 	return !r.isPromoted(fullPath)
+}
+
+// reopenSettled returns every settled adaptive route to the timed learning
+// path (celeris#592). Settling used to be terminal, so a route that settled
+// while its backend was fast and whose backend later turned slow ran inline on
+// the engine worker forever — see the adaptiveSettleTTL doc for the mechanism
+// and the measured stall.
+//
+// The fast STREAK is intentionally left alone: a route that is still fast is
+// already at adaptiveSettleStreak (clamped there — see recordInlineRun), so its
+// very next inline run re-settles it. The gate is therefore open for exactly
+// one handler run, and the cost of the re-timing is one timed inline run per
+// CONCURRENTLY-EXECUTING inline handler — measured at a maximum of K per
+// re-open at K concurrent runners, ~120 ns each, in
+// TestRouteAdaptive_SettleReopenCost. Nothing at all is added to the settled
+// fast path.
+func (r *router) reopenSettled() {
+	r.settled.Clear()
+}
+
+// startSettleReopener starts the background goroutine that calls
+// reopenSettled every adaptiveSettleTTL (celeris#592). Called from
+// Server.doPrepare; a no-op when the server has no adaptive routes (nothing
+// can settle) or when the re-opener is already running. Idempotent.
+//
+// Off the request path by construction: the alternative designs (sample every
+// Nth request, or stamp the settled entry with a deadline and compare a clock)
+// both put work back on the hot path that celeris#361 removed, for the same
+// detection bound.
+func (r *router) startSettleReopener(interval time.Duration) {
+	if len(r.adaptiveRoutes) == 0 || interval <= 0 {
+		return
+	}
+	r.reopenMu.Lock()
+	defer r.reopenMu.Unlock()
+	if r.reopenStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	r.reopenStop = stop
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				r.reopenSettled()
+			}
+		}
+	}()
+}
+
+// stopSettleReopener stops the re-opener goroutine (celeris#592). Called from
+// Server.Shutdown so a stopped server leaves no goroutine behind; idempotent
+// and safe on a router whose re-opener was never started.
+func (r *router) stopSettleReopener() {
+	r.reopenMu.Lock()
+	defer r.reopenMu.Unlock()
+	if r.reopenStop != nil {
+		close(r.reopenStop)
+		r.reopenStop = nil
+	}
 }
 
 // addRoute registers a route inheriting the server-level async default.
