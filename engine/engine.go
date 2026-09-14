@@ -145,9 +145,12 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// RecvResumeWhileRecvInFlight is the subset of RecvResumeWhileCancelPending
 	// in which the cancelled recv was still armed when the resume was
 	// processed — the only state in which a second recv could be placed on
-	// top of a kernel-held one. RecvResumeWhileCancelPending also counts
-	// resumes after a cancel that missed (the recv completed first), so this
-	// is the witness that the celeris#484 window was actually reached.
+	// top of a kernel-held one, and so the witness that the celeris#484
+	// window was actually reached. RecvResumeWhileCancelPending also counts
+	// the resumes that land between a cancel that missed (the recv completed
+	// first, so nothing was cancelled) and that cancel's own completion, so
+	// it sits a handful above this one; before celeris#596 a missed cancel
+	// was never retired at all and it sat ~1000x above.
 	RecvResumeWhileRecvInFlight uint64
 	// RecvArmDeclined is the cumulative number of recv arms the io_uring
 	// engine declined because a recv was already armed on that connection
