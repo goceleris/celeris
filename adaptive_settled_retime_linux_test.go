@@ -516,7 +516,18 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		c, br, err := dial589(addr)
 		if err == nil {
 			if err = get589(c, br, "/ping"); err == nil {
-				ready = true
+				// A served /ping is NOT full readiness: the native engines
+				// rebind per-worker SO_REUSEPORT sockets, so the FIRST worker
+				// answers requests while EngineInfo().Metrics.Workers is still
+				// 0 or 1. Measured once in 40 io_uring runs of the 20-run
+				// celeris#592 campaign, where the worker-count precondition
+				// below aborted a run on an engine that was in fact fine. Wait
+				// for the whole worker set to be published before the run
+				// starts; a genuine memlock cap still runs the deadline out
+				// and fails the precondition.
+				if info := s.EngineInfo(); info != nil && info.Metrics.Workers == workers {
+					ready = true
+				}
 			}
 			_ = c.Close()
 		}
@@ -525,7 +536,7 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		}
 	}
 	if !ready {
-		t.Fatal("server did not become ready")
+		t.Fatalf("server did not become ready (engine info %+v, want %d workers)", s.EngineInfo(), workers)
 	}
 	info := s.EngineInfo()
 	if info == nil || info.Type != engType {

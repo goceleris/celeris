@@ -651,14 +651,6 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			debug.SetMemoryLimit(lim)
 		}
 
-		// celeris#592: re-time settled adaptive routes. Settling is
-		// otherwise terminal, so a route that settled while its backend was
-		// fast and whose backend later turns slow runs inline on the engine
-		// worker forever. The re-opener is a single per-server goroutine
-		// (none when there are no adaptive routes) and adds nothing to the
-		// request path; Shutdown stops it.
-		s.router.startSettleReopener(adaptiveSettleTTL)
-
 		var err error
 		eng, err = createEngine(cfg, handler, cpuMon)
 		if err != nil {
@@ -666,6 +658,21 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			return
 		}
 		s.engineRef.Store(&eng)
+
+		// celeris#592: re-time settled adaptive routes. Settling is
+		// otherwise terminal, so a route that settled while its backend was
+		// fast and whose backend later turns slow runs inline on the engine
+		// worker forever. The re-opener is a single per-server goroutine
+		// (none when there are no adaptive routes) and adds nothing to the
+		// request path; Shutdown stops it.
+		//
+		// Started only AFTER the engine exists and is published: a failed
+		// createEngine returns from doPrepare with startErr set and no engine
+		// ever stored, so the caller gets an error instead of a Server, never
+		// calls Shutdown, and nothing would stop a ticker started earlier —
+		// it would run until the process exits. Nothing can settle before the
+		// engine serves a request, so the later start costs no coverage.
+		s.router.startSettleReopener(adaptiveSettleTTL)
 
 		if s.collector != nil {
 			s.collector.SetEngineMetricsFn(func() observe.EngineMetrics {

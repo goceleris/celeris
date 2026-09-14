@@ -381,8 +381,23 @@ func (r *router) recordInlineRun(fullPath string, slow bool) {
 		// celeris#361: a route fast on adaptiveSettleStreak CONSECUTIVE runs is
 		// provably non-blocking — settle it so adaptiveLearning short-circuits
 		// and handler.go stops timing every request forever.
+		//
+		// celeris#592: CLAMP at the threshold. Settling used to be terminal,
+		// so this counter stopped being incremented the moment it first
+		// reached adaptiveSettleStreak. Now the re-opener returns the route to
+		// the timed path every adaptiveSettleTTL, so an unclamped Add would
+		// keep growing for the life of the process — one per re-open at least,
+		// more when several requests are in flight in the re-open window — and
+		// on int32 wrap it would go NEGATIVE, at which point `>= streak` stops
+		// holding and the route could never settle again: the fix would have
+		// turned into a permanent re-introduction of the per-request timing it
+		// exists to avoid. Storing the threshold keeps the counter saturated,
+		// so the invariant is 0 <= fastStreak <= adaptiveSettleStreak forever
+		// and "already at the threshold ⇒ re-settles on the next fast run"
+		// still holds.
 		fv, _ := r.fastStreak.LoadOrStore(fullPath, new(atomic.Int32))
-		if fv.(*atomic.Int32).Add(1) >= adaptiveSettleStreak {
+		if c := fv.(*atomic.Int32); c.Add(1) >= adaptiveSettleStreak {
+			c.Store(adaptiveSettleStreak)
 			r.settled.Store(fullPath, struct{}{})
 		}
 		return
@@ -416,9 +431,13 @@ func (r *router) adaptiveLearning(fullPath string) bool {
 // and the measured stall.
 //
 // The fast STREAK is intentionally left alone: a route that is still fast is
-// already at adaptiveSettleStreak, so its very next inline run re-settles it in
-// recordInlineRun. One timed run per route per tick is the entire cost of the
-// re-timing, and nothing at all is added to the settled fast path.
+// already at adaptiveSettleStreak (clamped there — see recordInlineRun), so its
+// very next inline run re-settles it. The gate is therefore open for exactly
+// one handler run, and the cost of the re-timing is one timed inline run per
+// CONCURRENTLY-EXECUTING inline handler — measured at a maximum of K per
+// re-open at K concurrent runners, ~120 ns each, in
+// TestRouteAdaptive_SettleReopenCost. Nothing at all is added to the settled
+// fast path.
 func (r *router) reopenSettled() {
 	r.settled.Clear()
 }

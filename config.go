@@ -192,10 +192,11 @@ type Config struct {
 	// is read at driver construction); otherwise set this true. Setting this
 	// true also enables the adaptive safety net that auto-promotes any unmarked
 	// handler slower than ~300µs, at a small learning-phase cost that settles to
-	// near zero for static routes: a settled route is re-timed for a single run
-	// every adaptiveSettleTTL (celeris#592), so a handler whose backend turns
-	// slow after it settled is still promoted within that bound instead of
-	// blocking an engine worker forever.
+	// near zero for static routes: a settled route is re-timed for one handler
+	// run every adaptiveSettleTTL (celeris#592) — measured at one timed run per
+	// concurrently-executing inline handler per tick, ~120 ns each — so a
+	// handler whose backend turns slow after it settled is still promoted
+	// within that bound instead of blocking an engine worker forever.
 	//
 	// Default: false.
 	AsyncHandlers bool
