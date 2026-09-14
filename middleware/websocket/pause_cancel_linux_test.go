@@ -310,7 +310,15 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 							}
 							return
 						}
-						hp.lastReadAt = since()
+						// Sampled, not per-frame: this loop runs ~15k times
+						// per connection and a clock read on every pass is
+						// the hot-path probe that took a prior io_uring
+						// defect from 8/24 to 0/24 (celeris#484). Every 64th
+						// frame is sub-millisecond resolution on a workload
+						// whose stalls are measured in seconds.
+						if hp.reads&63 == 0 {
+							hp.lastReadAt = since()
+						}
 						hp.echoBytes += int64(len(msg))
 					}
 				},
