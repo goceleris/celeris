@@ -131,13 +131,27 @@ type connState struct {
 	// WebSocket recv backpressure (detached conns only):
 	recvPaused       bool        // engine-side current state (worker-thread only)
 	recvPauseDesired atomic.Bool // requested state from middleware goroutine
-	// recvCancelPending is true from the moment the backpressure pause
-	// submits its ASYNC_CANCEL until that cancel's effect is observed. It
-	// tells handleRecv that a -ECANCELED recv CQE is one this worker asked
-	// for, so a pause the middleware withdraws before the cancel lands
-	// re-arms the connection instead of closing a healthy one.
+	// recvCancelPending counts the backpressure pause's ASYNC_CANCELs whose
+	// effect has not been observed yet: incremented when the pause submits
+	// one, decremented by the -ECANCELED of a recv it cancelled or by the
+	// cancel's own completion when it turns out to have cancelled nothing.
+	// Non-zero tells handleRecv that a -ECANCELED recv CQE is one this
+	// worker asked for, so a pause the middleware withdraws before the
+	// cancel lands re-arms the connection instead of closing a healthy one.
+	//
+	// A COUNT, not a flag, because more than one can be outstanding: a conn
+	// that pauses, resumes and pauses again before the ring is drained has
+	// two cancels in flight, and they can resolve in either order. As a bool,
+	// the first one to resolve as a MISS cleared the state the second — which
+	// HIT — still needed, and its -ECANCELED then fell through handleRecv's
+	// generic negative-result path and closed a healthy connection
+	// mid-stream: the celeris#484 failure, reintroduced. Measured once in 12
+	// oracle runs at MaxBackpressureBuffer=8 while celeris#596 was being
+	// fixed with a bool. uint16 rather than uint8 so a burst of pause cycles
+	// cannot wrap the count.
+	//
 	// Worker-thread only, like recvPaused.
-	recvCancelPending bool
+	recvCancelPending uint16
 
 	// Async handler dispatch (Worker.async=true, HTTP1 only):
 	// Incoming recv bytes are appended under asyncInMu by the worker.
@@ -377,7 +391,7 @@ func releaseConnState(cs *connState) {
 	cs.detachClosed = false
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
-	cs.recvCancelPending = false
+	cs.recvCancelPending = 0
 	cs.headerTimerSpec = kernelTimespec{}
 	cs.headerTimerArmed = false
 	cs.forceRSTClose = false
