@@ -53,6 +53,46 @@ var JWTLateAdmits Counter
 // live conn.
 var IouringSQECorruptions Counter
 
+// IouringSendZCSubmits counts SEND_ZC SQEs the io_uring worker armed
+// (the zero-copy arm of prepSendSQE). It is the exposure witness the
+// SEND_ZC fabric A/B (celeris#585) and the ZC race tier (celeris#587)
+// need: without it a clean run cannot be told apart from a run in
+// which the ZC branch never executed. Bumped only inside the ZC arm,
+// so the plain-SEND per-request hot path is untouched.
+var IouringSendZCSubmits Counter
+
+// IouringSendZCSubmitsDetached is the subset of IouringSendZCSubmits
+// whose connection had already been handed to a detached middleware
+// goroutine (cs.h1State.Detached) — WebSocket / SSE egress. Those are
+// the sends that race the inline unix.Write fast path, which is the
+// interleaving celeris#587 exercises; a run with submits but zero
+// detached submits never put a ZC send and a dispatch-goroutine write
+// on the same connection.
+var IouringSendZCSubmitsDetached Counter
+
+// IouringSendZCNotifs counts SEND_ZC notification CQEs (CQE_F_NOTIF)
+// processed by the worker — the point at which the kernel releases the
+// pinned send buffer. A submit without a matching notif is a buffer
+// still pinned in DMA, so the submits/notifs pair bounds how long the
+// ZC completion cycle stayed open.
+var IouringSendZCNotifs Counter
+
+// IouringInlineGuardBlockedZC counts times the detached inline-egress
+// fast path declined to issue its raw unix.Write because a SEND_ZC
+// notification was still outstanding on that connection
+// (cs.zcNotifPending). It is the witness that the guard which keeps a
+// dispatch-goroutine write from interleaving with a kernel-held ZC
+// buffer actually fired; zero means the ZC-vs-inline window was never
+// entered by the load.
+var IouringInlineGuardBlockedZC Counter
+
+// IouringZCCompletionWithPendingWrite counts SEND_ZC notification CQEs
+// that landed while the connection still had queued bytes in
+// cs.writeBuf. That is the state in which the notification hands the
+// buffer back and the very next inline write is admitted against data
+// the worker has not yet flushed — the ordering celeris#587 checks.
+var IouringZCCompletionWithPendingWrite Counter
+
 // Snapshot returns a value-typed copy of the counters at the moment
 // of the call. Each Load is independent so the snapshot is not a
 // consistent slice of a single instant, but counters monotonically
@@ -65,5 +105,11 @@ func Snapshot() Counters {
 		SessionCookieDrops:       SessionCookieDrops.Load(),
 		JWTLateAdmits:            JWTLateAdmits.Load(),
 		IouringSQECorruptions:    IouringSQECorruptions.Load(),
+
+		IouringSendZCSubmits:                IouringSendZCSubmits.Load(),
+		IouringSendZCSubmitsDetached:        IouringSendZCSubmitsDetached.Load(),
+		IouringSendZCNotifs:                 IouringSendZCNotifs.Load(),
+		IouringInlineGuardBlockedZC:         IouringInlineGuardBlockedZC.Load(),
+		IouringZCCompletionWithPendingWrite: IouringZCCompletionWithPendingWrite.Load(),
 	}
 }
