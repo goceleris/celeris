@@ -35,6 +35,7 @@ var (
 	IouringSendZCNotifs                 Counter
 	IouringInlineGuardBlockedZC         Counter
 	IouringZCCompletionWithPendingWrite Counter
+	IouringSendZCFallbacks              Counter
 )
 
 // Snapshot returns the zero value in production builds — no counters

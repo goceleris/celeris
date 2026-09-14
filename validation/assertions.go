@@ -93,6 +93,16 @@ var IouringInlineGuardBlockedZC Counter
 // the worker has not yet flushed — the ordering celeris#587 checks.
 var IouringZCCompletionWithPendingWrite Counter
 
+// IouringSendZCFallbacks counts SEND_ZC completions that failed with
+// EINVAL or ENOMEM and were retried as a plain SEND instead of closing
+// the connection (celeris#609). Only the FIRST one per worker flips
+// w.sendZC off and logs; the rest are the zero-copy sends that were
+// already in flight when the opcode was retired, and before the fix
+// every one of them was misread as a broken connection and torn down.
+// So a value greater than the number of io_uring workers is the witness
+// that the defect's window was entered and survived.
+var IouringSendZCFallbacks Counter
+
 // Snapshot returns a value-typed copy of the counters at the moment
 // of the call. Each Load is independent so the snapshot is not a
 // consistent slice of a single instant, but counters monotonically
@@ -111,5 +121,6 @@ func Snapshot() Counters {
 		IouringSendZCNotifs:                 IouringSendZCNotifs.Load(),
 		IouringInlineGuardBlockedZC:         IouringInlineGuardBlockedZC.Load(),
 		IouringZCCompletionWithPendingWrite: IouringZCCompletionWithPendingWrite.Load(),
+		IouringSendZCFallbacks:              IouringSendZCFallbacks.Load(),
 	}
 }

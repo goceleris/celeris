@@ -90,8 +90,23 @@ type connState struct {
 	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
 	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
-	zcSentBytes    int32        // bytes sent from first SEND_ZC CQE (processed on NOTIF)
-	sendBuf        []byte       // 24: in-flight buffer (accessed with sending flag)
+	// sendIsZC records how the send SQE currently in flight for this
+	// connection was ARMED: true for IORING_OP_SEND_ZC, false for a plain
+	// SEND / WRITEV / linked SEND. It is the provenance flag the error
+	// classification in handleSend and completeSend keys on (celeris#609).
+	//
+	// w.sendZC cannot serve that purpose: it is the worker's forward-looking
+	// capability bit, and the EINVAL/ENOMEM fallbacks clear it while other
+	// connections' ZC sends are still in flight. Classifying on it meant the
+	// FIRST failing ZC completion per worker was absorbed and every sibling
+	// behind it was read as a broken connection and closed. Written only
+	// where a send SQE is armed (prepSendSQE and the two non-ZC arming sites
+	// in flushSend / flushSendLink); at most one send SQE is in flight per
+	// connection — flushSend/flushSendLink both bail on cs.sending ||
+	// cs.zcNotifPending — so one flag is exact. Worker-thread-only.
+	sendIsZC    bool   // 1: the in-flight send SQE was armed as SEND_ZC
+	zcSentBytes int32  // bytes sent from first SEND_ZC CQE (processed on NOTIF)
+	sendBuf     []byte // 24: in-flight buffer (accessed with sending flag)
 
 	writeBuf []byte // 24: append buffer for handler writes
 	bodyBuf  []byte // 24: zero-copy body slice; sent as iovec[1] alongside sendBuf
@@ -385,6 +400,7 @@ func releaseConnState(cs *connState) {
 	cs.needsRecv = false
 	cs.recvIntoBody = false
 	cs.zcNotifPending = false
+	cs.sendIsZC = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
 	cs.detachMu = nil
