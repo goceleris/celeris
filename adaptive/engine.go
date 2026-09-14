@@ -198,10 +198,17 @@ func chooseStartEngine(p engine.CapabilityProfile, cfg resource.Config) engine.E
 // CELERIS_ADAPTIVE_START env override).
 //
 // Both sub-engines bind the SAME SO_REUSEPORT port so the adaptive switch is
-// transparent: resolvePort pins a concrete port up front, and the lazily-built
-// standby reuses it. Building only the start engine eliminates the parked
-// standby's GC-rooted heap — on a modern kernel that starts on io_uring and
-// never reverts, the epoll standby is never constructed (≈0 standby tax).
+// transparent: the address is pinned to a concrete host:port up front and the
+// lazily-built standby reuses it. Building only the start engine eliminates
+// the parked standby's GC-rooted heap — on a modern kernel that starts on
+// io_uring and never reverts, the epoll standby is never constructed (≈0
+// standby tax).
+//
+// Pre-bound listeners (Server.StartWithListener, socket activation, graceful
+// restart) are handed to the START sub-engine, which owns them: epoll and
+// io_uring both close the supplied listener in Listen and rebind their own
+// SO_REUSEPORT sockets on its address. The standby is built later, from the
+// address alone, and joins that group. See the address-resolution block below.
 //
 // cpuMon is an engine.CPUMonitor (the public interface); when non-nil it
 // supplies the live sampler with CPU utilization data so the io_uring bias can
@@ -215,10 +222,29 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		return nil, fmt.Errorf("config validation: %w", errs[0])
 	}
 
-	// Both sub-engines must share the same port (SO_REUSEPORT) so the
-	// adaptive switch works transparently. If the user specified :0,
-	// resolve it to a concrete port before creating sub-engines.
-	if cfg.Addr != "" {
+	// Both sub-engines must serve the SAME concrete host:port — the switch is
+	// only transparent because the standby joins the active engine's
+	// SO_REUSEPORT group on that exact address — and each sub-engine's every
+	// worker binds cfg.Addr independently (epoll.createListenSocket per loop,
+	// io_uring per worker), so a ":0" that reached them would scatter workers
+	// across different ephemeral ports. The address therefore has to be
+	// decided here, and there are two mutually exclusive ways to decide it.
+	//
+	// A pre-bound Listener has ALREADY decided it. Running resolvePort in that
+	// case invented a SECOND, different port, wrote it into cfg.Addr, and the
+	// sub-engine constructor then rejected the pair it had just been handed
+	// ("ambiguous configuration: Addr=... but Listener is bound to ...") — so
+	// the default engine could not start via Server.StartWithListener at all
+	// (celeris#614). The listener is the source of truth; resolvePort must not
+	// run.
+	switch {
+	case cfg.Listener != nil:
+		lnAddr, err := reusePortAddr(cfg.Listener)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Addr = lnAddr
+	case cfg.Addr != "":
 		resolved, err := resolvePort(cfg.Addr)
 		if err == nil {
 			cfg.Addr = resolved
@@ -236,19 +262,45 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		logger = slog.Default()
 	}
 
+	// Only ONE listener ever arrives, so only ONE sub-engine may receive it:
+	// the START engine, which consumes it in Listen (closes it and rebinds its
+	// own SO_REUSEPORT sockets on the same address, making it the group's
+	// first member). The standby is built later — possibly minutes later, on
+	// the first switch — and binds by address, joining the group the start
+	// engine created.
+	//
+	// Clearing it for the standby is deliberate, not incidental. A *net.TCPListener
+	// happens to survive the alternative (its Addr() still answers after Close
+	// and a second Close is a no-op error), but that is an accident of the
+	// stdlib type, and net.Listener is an interface: a socket-activation or
+	// inherited-fd wrapper is under no obligation to keep answering Addr()
+	// after it has been closed, and the standby would be asking it minutes
+	// after the start engine closed it. The standby has the address it needs;
+	// it must not reach for a socket that is not its own.
+	//
+	// This is also why the caller's listener does NOT need SO_REUSEPORT set:
+	// it is never in the group. It is closed before the start engine binds,
+	// and the sockets that form the group are all created by the sub-engines
+	// with SO_REUSEPORT (see epoll/iouring createListenSocket). The only
+	// listener shape adaptive genuinely cannot serve is a non-TCP one, and
+	// reusePortAddr above rejects that at New() rather than at switch time.
+	startCfg := cfg
+	standbyCfg := cfg
+	standbyCfg.Listener = nil
+
 	// Constructors for each slot. The standby's constructor is stored on the
 	// Engine and only invoked on the first switch. The io_uring constructor
 	// does not take cpuMon (iouring.New has no such parameter); cpuMon already
 	// feeds the shared sampler via newLiveSampler above.
-	buildEpoll := func() (engine.Engine, error) {
-		eng, err := epoll.New(cfg, handler)
+	buildEpoll := func(c resource.Config) (engine.Engine, error) {
+		eng, err := epoll.New(c, handler)
 		if err != nil {
 			return nil, fmt.Errorf("epoll sub-engine: %w", err)
 		}
 		return eng, nil
 	}
-	buildIOUring := func() (engine.Engine, error) {
-		eng, err := iouring.New(cfg, handler)
+	buildIOUring := func(c resource.Config) (engine.Engine, error) {
+		eng, err := iouring.New(c, handler)
 		if err != nil {
 			return nil, fmt.Errorf("io_uring sub-engine: %w", err)
 		}
@@ -256,7 +308,9 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	}
 
 	e := &Engine{
-		cfg:       cfg,
+		// standbyCfg, not startCfg: cfg is only read for logging, and holding
+		// the listener here would pin a closed socket for the engine's life.
+		cfg:       standbyCfg,
 		handler:   handler,
 		logger:    logger,
 		startType: startType,
@@ -268,31 +322,33 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		// io_uring construction can fail on a kernel that probed as capable
 		// but cannot actually set up the ring (e.g. low RLIMIT_MEMLOCK). Fall
 		// back to starting on epoll rather than failing New outright.
-		eng, err := buildIOUring()
+		eng, err := buildIOUring(startCfg)
 		if err != nil {
+			// iouring.New failed before Listen, so it never touched the
+			// listener: epoll still gets it as the start engine.
 			logger.Warn("io_uring start engine unavailable, falling back to epoll start", "error", err)
 			e.startType = engine.Epoll
-			eng, err = buildEpoll()
+			eng, err = buildEpoll(startCfg)
 			if err != nil {
 				return nil, err
 			}
 			startEngine = eng
 			e.primary = eng
-			e.buildStandby = buildIOUring
+			e.buildStandby = func() (engine.Engine, error) { return buildIOUring(standbyCfg) }
 		} else {
 			startEngine = eng
 			e.secondary = eng
-			e.buildStandby = buildEpoll
+			e.buildStandby = func() (engine.Engine, error) { return buildEpoll(standbyCfg) }
 		}
 	} else {
 		// epoll is the eager start; io_uring is the lazy standby.
-		eng, err := buildEpoll()
+		eng, err := buildEpoll(startCfg)
 		if err != nil {
 			return nil, err
 		}
 		startEngine = eng
 		e.primary = eng
-		e.buildStandby = buildIOUring
+		e.buildStandby = func() (engine.Engine, error) { return buildIOUring(standbyCfg) }
 	}
 
 	// The controller needs BOTH engine TYPES to decide switch direction even
@@ -926,8 +982,47 @@ func (e *Engine) ForceSwitch() {
 	e.performSwitch()
 }
 
+// reusePortAddr returns the address a caller-supplied listener owns, and is
+// the ONLY source of the bind address on the pre-bound-listener path.
+//
+// It also fails EARLY — at New(), not at the first switch — for a listener
+// whose address the two sub-engines cannot both bind. The adaptive engine
+// needs to put two independent sets of SO_REUSEPORT sockets on one address,
+// which is a TCP-only arrangement; a Unix-socket listener would start fine on
+// the start engine and only blow up later, as a 5-second bind timeout inside
+// buildAndStartStandby on the first promotion. Refusing it here turns a latent
+// switch-time failure into a startup error the caller can act on.
+func reusePortAddr(ln net.Listener) (string, error) {
+	a := ln.Addr()
+	if a == nil {
+		return "", fmt.Errorf("supplied Listener has no address")
+	}
+	switch a.Network() {
+	case "tcp", "tcp4", "tcp6":
+		return a.String(), nil
+	default:
+		return "", fmt.Errorf(
+			"adaptive engine needs a TCP listener, got %s listener %q: both sub-engines must bind the same address with SO_REUSEPORT so the switch is transparent; use the std engine for this listener",
+			a.Network(), a.String())
+	}
+}
+
 // resolvePort resolves ":0" to a concrete ":PORT" by briefly binding a
-// listener. Both sub-engines need the same port for SO_REUSEPORT switching.
+// listener. Both sub-engines need the same port for SO_REUSEPORT switching,
+// and each of their workers binds cfg.Addr independently, so the port cannot
+// be left at 0.
+//
+// This is a time-of-check-to-time-of-use window: the port is bound, closed,
+// and only bound for real when the start engine Listens, so another process
+// can take it in between. The window is accepted rather than closed here
+// because (a) the callers that most need a stable port — graceful restart,
+// socket activation — supply a pre-bound listener and never reach this
+// function, (b) closing it means holding a bound-but-not-listening
+// SO_REUSEPORT socket across New→Listen, i.e. owning an fd whose lifetime no
+// current Engine method covers, and (c) the failure it leaves is a loud
+// EADDRINUSE at startup, not a silent misbind. It is a separate defect from
+// the pre-bound-listener fix and deliberately out of that fix's scope; do not
+// widen the window (in particular, do not move this call earlier).
 func resolvePort(addr string) (string, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
