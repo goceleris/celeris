@@ -38,16 +38,27 @@ func TestMetricsDuringListenIsRaceFree(t *testing.T) {
 		t.Skipf("iouring engine unavailable: %v", err)
 	}
 
+	// started closes after the reader's FIRST call, and the publish loop
+	// below waits on it. Without that handshake the test raced itself: if
+	// Listen published the worker count before the reader goroutine was
+	// ever scheduled, stop was set first, the reader exited with n == 0 and
+	// the test failed "the reader never ran" — a scheduling accident on a
+	// loaded runner, not a defect in Metrics.
 	var stop atomic.Bool
 	reads := make(chan int64, 1)
+	started := make(chan struct{})
 	go func() {
 		var n int64
 		for !stop.Load() {
 			_ = e.Metrics()
 			n++
+			if n == 1 {
+				close(started)
+			}
 		}
 		reads <- n
 	}()
+	<-started
 
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
@@ -72,6 +83,6 @@ func TestMetricsDuringListenIsRaceFree(t *testing.T) {
 	}
 	stop.Store(true)
 	if n := <-reads; n == 0 {
-		t.Fatal("the reader never ran")
+		t.Fatal("the reader never ran, despite the started handshake")
 	}
 }
