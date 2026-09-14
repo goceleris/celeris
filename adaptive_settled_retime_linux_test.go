@@ -158,6 +158,28 @@ func envInt589(name string, def int) int {
 //     to the dispatch goroutine, the worker stays free;
 //   - /kv still LEARNING (warmed with fewer than adaptiveSettleStreak runs): the
 //     first slow inline run promotes the route immediately, later runs go async.
+//     The learning state is ESTABLISHED, not hoped for (celeris#620 fault 2).
+//
+// Every warm-up here runs against a FAST store, so a promotion during warm-up
+// is runner jitter, never a property of the tree under test: handler.go calls
+// promoteRouteImmediate on a SINGLE inline run over adaptiveBlockingThreshold,
+// so one jittery request is enough, and because this rig freezes the promotion
+// clock the TTL that would normally undo it never fires. That cost the
+// learning control its precondition on run 34863046623 (`precondition: /kv
+// must still be learning after 100 runs (settled=false promoted=true)`) before
+// the control had tested anything, and it is worse in the settled arm, where
+// the same promotion also clears the fast streak and takes the route off the
+// timed path — the route can then never settle, and the warm loop burns its
+// whole 20000-request bound before failing the same way.
+//
+// So both adaptive warm loops drive any such promotion back out through the
+// engine's own de-promotion transition (depromote589, the body of isPromoted's
+// expiry branch) and count it on the result line as warm_depromotions. The
+// preconditions are still asserted afterwards — reaching one now means the
+// de-promotion itself did not take, which is a real defect — and neither
+// control's claims change: promoted after the flip, every /kv conn
+// async-dispatched, a sub-5 ms /ping median, the #589 signature absent. They
+// still have to invert.
 //
 // The #589 claim assertion (assertSettledStall589 — the DEFECT's signature)
 // must now FAIL on all three modes, and the fixed-behaviour assertion
@@ -221,7 +243,7 @@ const (
 	stall589Spacing  = 10 * time.Millisecond
 	stall589StallBar = 5 * time.Millisecond
 	stall589WarmMax  = 20000 // bound on the warm-up loop (settle needs 256 CONSECUTIVE fast runs)
-	stall589LearnReq = 100   // learning control: warm with fewer than adaptiveSettleStreak runs
+	stall589LearnReq = 100   // learning control: warm with fewer than adaptiveSettleStreak runs (jitter promotions are undone, see depromote589)
 
 	// stall592PromoteBound is the design's detection bound for celeris#592,
 	// measured from the store turning slow: adaptiveSettleTTL (5 s — the
@@ -283,6 +305,7 @@ type stall589Obs struct {
 	kvConns            int
 	gomaxprocs         int
 	warmReqs           int
+	depromotions       int  // learning control: jitter promotions undone during warm-up (celeris#620)
 	settledBefore      bool // after warm-up, before the gate flips
 	promotedBefore     bool
 	adaptive           bool // router.adaptiveRoutes["/kv"]
@@ -438,11 +461,11 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 		claim = "fail(" + claimErr.Error() + ")"
 	}
 	t.Logf("RESULT592 engine=%s mode=%s run=%d verdict=%s settled_before=%t promoted_before=%t adaptive=%t settled_at_flip=%t "+
-		"settled_after=%t promoted_after=%t promoted_in_bound=%t promote_ms=%.0f async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d slow_calls=%d kv_reqs=%d "+
+		"settled_after=%t promoted_after=%t promoted_in_bound=%t promote_ms=%.0f async_promoted_conns=%d workers=%d kv_conns=%d gomaxprocs=%d warm_reqs=%d warm_depromotions=%d slow_calls=%d kv_reqs=%d "+
 		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f "+
 		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f claim589_assert=%s",
 		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive, o.settledAtFlip,
-		o.settledAfter, o.promotedAfter, o.promotedInBound, ms(o.promoteLatency), o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.slowCalls, o.kvReqs,
+		o.settledAfter, o.promotedAfter, o.promotedInBound, ms(o.promoteLatency), o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.depromotions, o.slowCalls, o.kvReqs,
 		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime),
 		ms(o.pingMin), ms(o.pingMed), ms(o.pingMax), claim)
 	if o.stacks != nil {
@@ -542,10 +565,13 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 
 	// Freeze the adaptive promotion clock: a promotion made during the run
 	// never expires, so the fixed/control worlds show exactly one inline run
-	// per worker rather than one per TTL (review correction 1).
-	clock, restore := stubNowNano()
-	*clock = time.Now().UnixNano()
-	defer restore()
+	// per worker rather than one per TTL (review correction 1). The stub is an
+	// atomic flip and is released by a t.Cleanup that runs after this frame's
+	// defers, so releasing it can no longer race the engine's own clock reads
+	// (celeris#620 fault 1); stopEngine below makes the ordering explicit as
+	// well as safe.
+	clock := stubNowNano(t)
+	clock.Store(time.Now().UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -587,6 +613,43 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	startErr := make(chan error, 1)
 	go func() { startErr <- s.StartWithListenerAndContext(ctx, ln) }()
 
+	// celeris#620 fault 1: every exit path from here on must JOIN the engine,
+	// not merely cancel its context. The `defer cancel()` above only signals;
+	// the event-loop goroutines keep serving — and keep reading the adaptive
+	// clock and the router's sync.Maps — after the test frame is gone, which
+	// is how a t.Fatalf anywhere below used to leave a live engine racing the
+	// clock stub's restore and leak two workers into the next subtest.
+	//
+	// StartWithListenerAndContext returns only after Engine.Listen has
+	// returned, and both native engines join their loops before that (epoll
+	// and io_uring alike end Listen with `<-ctx.Done()` then `wg.Wait()`), so
+	// receiving from startErr is a real barrier: no engine goroutine is left
+	// running once it fires.
+	//
+	// Registered AFTER the clock stub, so the LIFO order on a t.Fatalf's
+	// runtime.Goexit is: stop the engine, close the client conns, release the
+	// clock (a t.Cleanup, which runs after every defer in this frame).
+	engineStopped := false
+	stopEngine := func() {
+		if engineStopped {
+			return
+		}
+		engineStopped = true
+		cancel()
+		select {
+		case err := <-startErr:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Logf("Start returned after cancel: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			// t.Errorf, not t.Fatalf: this also runs from a deferred call
+			// during another failure's runtime.Goexit, where a second Goexit
+			// would abandon the remaining defers and cleanups.
+			t.Errorf("engine did not exit within 30 s of cancel")
+		}
+	}
+	defer stopEngine()
+
 	// Readiness on /ping over a throwaway conn; an early Start error (no
 	// io_uring in this kernel/seccomp profile) is reported, not hidden.
 	deadline := time.Now().Add(10 * time.Second)
@@ -594,6 +657,9 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	for time.Now().Before(deadline) && !ready {
 		select {
 		case err := <-startErr:
+			// The only value startErr will ever carry has just been taken,
+			// so stopEngine must not go on to wait 30 s for a second one.
+			engineStopped = true
 			if engType == IOUring {
 				t.Skipf("io_uring engine failed to start (run with --security-opt seccomp=unconfined): %v", err)
 			}
@@ -656,6 +722,16 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 					t.Fatalf("warm-up GET /kv #%d: %v", o.warmReqs, err)
 				}
 				o.warmReqs++
+				// Same jitter promotion as the learning control
+				// (celeris#620 fault 2), and worse here: promoting also
+				// CLEARS the fast streak and takes the route off the timed
+				// path, so with the clock frozen the route could never
+				// settle again and this loop would burn its whole bound
+				// before failing the precondition. Undo it and let the
+				// streak accumulate.
+				if depromote589(s.router, "/kv") {
+					o.depromotions++
+				}
 				if _, ok := s.router.settled.Load("/kv"); ok {
 					break
 				}
@@ -670,9 +746,25 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 				t.Fatalf("warm-up GET /kv #%d: %v", o.warmReqs, err)
 			}
 			o.warmReqs++
+			// celeris#620 fault 2: the store is still FAST here, so a
+			// promotion at this point is runner jitter (a warm-up run that
+			// overran adaptiveBlockingThreshold), not a property of the tree
+			// under test — and with the clock frozen it would never expire.
+			// Undo it immediately so the remaining warm-up runs are timed
+			// inline, which is what "still learning" means.
+			if mode == stall589Learning && depromote589(s.router, "/kv") {
+				o.depromotions++
+			}
 		}
 	}
 	_ = wc.Close()
+	// Re-establish the learning control's precondition once more after the
+	// last warm-up run, then assert it below: no /kv request runs between
+	// here and the gate flip, so the state read next is the state the control
+	// measures against.
+	if mode == stall589Learning && depromote589(s.router, "/kv") {
+		o.depromotions++
+	}
 	_, o.settledBefore = s.router.settled.Load("/kv")
 	o.promotedBefore = s.router.isPromoted("/kv")
 	switch mode {
@@ -682,9 +774,12 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 				o.settledBefore, o.promotedBefore, o.warmReqs)
 		}
 	case stall589Learning:
+		// depromote589 has already undone any jitter promotion, so reaching
+		// this Fatalf means the de-promotion itself did not take — a real
+		// defect in the transition, not a loaded runner.
 		if o.settledBefore || o.promotedBefore || !s.router.adaptiveLearning("/kv") {
-			t.Fatalf("precondition: /kv must still be learning after %d runs (settled=%t promoted=%t)",
-				o.warmReqs, o.settledBefore, o.promotedBefore)
+			t.Fatalf("precondition: /kv must still be learning after %d runs (settled=%t promoted=%t, %d jitter promotions undone)",
+				o.warmReqs, o.settledBefore, o.promotedBefore, o.depromotions)
 		}
 	}
 
@@ -866,16 +961,33 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 
 	// Orderly stop: client conns are closed by the deferred Close calls after
 	// the engine has exited, so no handler is cut mid-frame by the rig.
-	cancel()
-	select {
-	case err := <-startErr:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Logf("Start returned after cancel: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("engine did not exit within 30 s of cancel")
-	}
+	stopEngine()
 	return o
+}
+
+// depromote589 returns an adaptive route from the promoted set to the timed
+// learning path. It performs exactly the transition router.isPromoted performs
+// when a promotion expires — drop the entry, clear the slow streak — and
+// reports whether the route was promoted at all.
+//
+// The learning control (celeris#620 fault 2) needs it because the rig freezes
+// the promotion clock, so the TTL that would normally undo a spurious
+// promotion never fires: a single warm-up run over adaptiveBlockingThreshold
+// on a loaded runner pins /kv to "promoted" for the whole run and the control
+// aborts on its precondition before testing anything. Only the rig's own
+// warm-up calls this, while the store is still fast and no other /kv request
+// is in flight; the fast streak is deliberately left alone (the control's only
+// requirement is that it stays below adaptiveSettleStreak, which 100 warm-up
+// runs cannot reach).
+func depromote589(rt *router, fullPath string) bool {
+	if _, ok := rt.promoted.Load(fullPath); !ok {
+		return false
+	}
+	rt.promoted.Delete(fullPath)
+	if v, ok := rt.slowStreak.Load(fullPath); ok {
+		v.(*atomic.Int32).Store(0)
+	}
+	return true
 }
 
 func dial589(addr string) (net.Conn, *bufio.Reader, error) {
