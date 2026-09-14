@@ -38,26 +38,32 @@ type Config struct {
 	// InitialWindowSize is the H2 initial stream flow-control window size.
 	InitialWindowSize uint32
 	// ReadTimeout is the max duration for reading the entire request.
+	// 0 asks for the default (60s); -1 disables it. After WithDefaults
+	// the field is either > 0 or 0, which every consumer reads as
+	// "disabled".
 	ReadTimeout time.Duration
 	// ReadHeaderTimeout is the max duration for reading the request
-	// headers ONLY (status line + headers + final CRLF). Zero falls
-	// back to ReadTimeout. A short value here is the canonical defence
-	// against slowloris-style DoS: clients that dribble headers byte-
-	// by-byte get their connection killed within ReadHeaderTimeout
-	// instead of holding a goroutine + listener-backlog slot for the
-	// full ReadTimeout. The std engine wires this to
-	// http.Server.ReadHeaderTimeout. The iouring + epoll engines
-	// enforce it inside their H1 header read loop.
+	// headers ONLY (status line + headers + final CRLF). A short value
+	// here is the canonical defence against slowloris-style DoS:
+	// clients that dribble headers byte-by-byte get their connection
+	// killed within ReadHeaderTimeout instead of holding a goroutine
+	// and a listener-backlog slot for the full ReadTimeout. The std
+	// engine wires this to http.Server.ReadHeaderTimeout. The iouring
+	// and epoll engines enforce it inside their H1 header read loop.
 	//
 	// Note: iouring/epoll's own SO_REUSEPORT-fronted multi-worker
 	// design absorbs a lot of slowloris pressure through queue
 	// scaling (16 workers × 4096 backlog ≈ 64 k slots). Std is on
 	// a single net.Listen() queue and falls over much sooner. The
 	// fix matters most for std but is sound on all engines.
+	//
+	// 0 asks for the default (10s); -1 disables it (0 after WithDefaults).
 	ReadHeaderTimeout time.Duration
 	// WriteTimeout is the max duration for writing the response.
+	// 0 asks for the default (60s); -1 disables it (0 after WithDefaults).
 	WriteTimeout time.Duration
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
+	// 0 asks for the default (600s); -1 disables it (0 after WithDefaults).
 	IdleTimeout time.Duration
 	// DisableKeepAlive disables HTTP keep-alive.
 	DisableKeepAlive bool
@@ -83,6 +89,27 @@ type Config struct {
 	// from celeris.Config.EnableH2Upgrade (pointer, may be nil) and Protocol.
 	// Always a concrete value after WithDefaults.
 	EnableH2Upgrade bool
+
+	// defaulted records that WithDefaults has already resolved this
+	// Config's sentinel fields, which is what makes a second pass a
+	// no-op (celeris#594).
+	//
+	// The timeouts and MaxRequestBodySize accept a negative sentinel
+	// meaning "disabled", and WithDefaults collapses it to 0 because 0
+	// is what every consumer already reads as "off" (`> 0` guards in
+	// the iouring/epoll loops, http.Server's own `d > 0` checks in std).
+	// But 0 on the way *in* means "give me the default", so the mapping
+	// is not idempotent on its own — and normalisation runs at least
+	// twice on every start: Server.doPrepare normalises, then each
+	// engine's New normalises again (three times through adaptive,
+	// which normalises before building its sub-engine). That turned a
+	// documented ReadHeaderTimeout=-1 into the 10s default.
+	//
+	// The marker distinguishes "0 = the caller wants the default" from
+	// "0 = already resolved to disabled". It is unexported, so a Config
+	// a caller builds as a literal always starts un-normalised and gets
+	// the full default pass; it travels with the value on copy.
+	defaulted bool
 }
 
 // Validate checks all config fields and returns any validation errors.
@@ -167,7 +194,16 @@ func (c Config) Validate() []error {
 	return errs
 }
 
-// WithDefaults returns a copy of Config with zero-value fields set to sensible defaults.
+// WithDefaults returns a copy of Config with zero-value fields set to sensible
+// defaults.
+//
+// It is idempotent: WithDefaults(WithDefaults(c)) resolves to the same values
+// as WithDefaults(c). That matters because normalisation runs more than once
+// on every start — Server.doPrepare normalises, then the engine constructor
+// normalises again (adaptive a third time, before building its sub-engine) —
+// and the negative "disabled" sentinels (ReadTimeout, ReadHeaderTimeout,
+// WriteTimeout, IdleTimeout, MaxRequestBodySize) are carried internally as 0,
+// which is also the "unset" input. See the defaulted field (celeris#594).
 func (c Config) WithDefaults() Config {
 	if c.Addr == "" {
 		c.Addr = ":8080"
@@ -209,10 +245,10 @@ func (c Config) WithDefaults() Config {
 		c.MaxHeaderBytes = 16 << 20
 	}
 	switch {
-	case c.MaxRequestBodySize == 0:
-		c.MaxRequestBodySize = 100 << 20 // 100 MB
 	case c.MaxRequestBodySize < 0:
-		c.MaxRequestBodySize = 0 // 0 internally means unlimited
+		c.MaxRequestBodySize = 0 // -1 → unlimited; 0 internally means unlimited
+	case c.MaxRequestBodySize == 0 && !c.defaulted:
+		c.MaxRequestBodySize = 100 << 20 // 100 MB
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -223,35 +259,36 @@ func (c Config) WithDefaults() Config {
 	// nginx's client_header_timeout / client_body_timeout and
 	// covers legitimate slow-network cases. Users who need longer
 	// (streaming uploads, big downloads) should set explicit values.
-	switch {
-	case c.ReadTimeout == 0:
-		c.ReadTimeout = 60 * time.Second
-	case c.ReadTimeout < 0:
-		c.ReadTimeout = 0 // -1 → no timeout
-	}
+	c.ReadTimeout = resolveTimeout(c.ReadTimeout, 60*time.Second, c.defaulted)
 	// ReadHeaderTimeout default: 10s. Short enough to defeat slow-
 	// loris (whose canonical pattern is one byte every few hundred ms
 	// for tens of seconds), long enough that legitimate proxies +
 	// satellite clients still complete header reads. Mirrors nginx's
 	// client_header_timeout default of 60s/10s and Go's
 	// http.Server.ReadHeaderTimeout convention.
-	switch {
-	case c.ReadHeaderTimeout == 0:
-		c.ReadHeaderTimeout = 10 * time.Second
-	case c.ReadHeaderTimeout < 0:
-		c.ReadHeaderTimeout = 0 // -1 → no timeout (legacy behaviour)
-	}
-	switch {
-	case c.WriteTimeout == 0:
-		c.WriteTimeout = 60 * time.Second
-	case c.WriteTimeout < 0:
-		c.WriteTimeout = 0 // -1 → no timeout
-	}
-	switch {
-	case c.IdleTimeout == 0:
-		c.IdleTimeout = 600 * time.Second
-	case c.IdleTimeout < 0:
-		c.IdleTimeout = 0 // -1 → no timeout
-	}
+	c.ReadHeaderTimeout = resolveTimeout(c.ReadHeaderTimeout, 10*time.Second, c.defaulted)
+	c.WriteTimeout = resolveTimeout(c.WriteTimeout, 60*time.Second, c.defaulted)
+	c.IdleTimeout = resolveTimeout(c.IdleTimeout, 600*time.Second, c.defaulted)
+	c.defaulted = true
 	return c
+}
+
+// resolveTimeout applies one timeout field's sentinel rules exactly once.
+//
+// A negative value is the documented "no timeout" sentinel and becomes 0,
+// the internal "disabled" encoding every consumer already tests with `> 0`.
+// A zero means "unset" only on the first pass: once normalised is true, 0 is
+// a disabled timeout this function must leave alone, otherwise the second
+// WithDefaults (in the engine constructor) reinstates the default over an
+// explicitly disabled timeout — celeris#594. Any positive value is kept
+// verbatim on every pass, so N stays N.
+func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
+	switch {
+	case v < 0:
+		return 0 // -1 → no timeout
+	case v == 0 && !normalised:
+		return def
+	default:
+		return v
+	}
 }
