@@ -20,9 +20,10 @@ import (
 // connection instead of argued from tcp_close(). The AF_UNIX socketpair the
 // sibling tests use has no FIN/RST semantics and cannot see any of this.
 //
-// Twelve cells — drain {on, off} x unread-at-close {0, 16 KiB (< cap),
-// 128 KiB (> cap)} x server-outbound-staged {0, 64 KiB with a peer that is
-// NOT reading} — each repeated t0Reps times. Every repetition runs exactly
+// Twelve cells — drain {on, off} x unread-at-close {0, 16 KiB, 128 KiB (both
+// above and below the fixed 32 KiB cap this drain used to stop at)} x
+// server-outbound-staged {0, 64 KiB with a peer that is NOT reading} — each
+// repeated t0Reps times. Every repetition runs exactly
 // the engines' close sequence (shutdown(SHUT_WR) -> [DrainRecvBuffer] ->
 // close(2)) and records, per connection:
 //
@@ -67,9 +68,7 @@ func TestDrainRecvBufferTCPTruthTable(t *testing.T) {
 		}
 	}
 	finTimeout := readIntFile(t, "/proc/sys/net/ipv4/tcp_fin_timeout")
-	t.Logf("TIER0-ENV kernel=%s tcp_fin_timeout=%d reps=%d cap=%d", kernelRelease(), finTimeout, reps, drainRecvBufSize*drainRecvMaxReads)
-
-	capBytes := drainRecvBufSize * drainRecvMaxReads
+	t.Logf("TIER0-ENV kernel=%s tcp_fin_timeout=%d reps=%d fallbackBudget=%d", kernelRelease(), finTimeout, reps, drainRecvFallbackBudget)
 	unreadSizes := []int{0, 16 << 10, 128 << 10}
 	stagedSizes := []int{0, t0StagedBytes}
 
@@ -98,19 +97,26 @@ func TestDrainRecvBufferTCPTruthTable(t *testing.T) {
 					// The kernel's FIN/RST rule depends on nothing but whether
 					// close(2) finds unread bytes. The peer stopped sending before
 					// the close in every cell, so these rows are deterministic.
-					resetSent := unread > 0 && (!drain || unread > capBytes)
+					//
+					// The drain-on rows no longer depend on how much is unread:
+					// the drain's budget is the SIOCINQ snapshot, capped by
+					// SO_RCVBUF, so it empties the queue at 128 KiB exactly as it
+					// does at 16 KiB. Before the celeris#569 fix the 128 KiB
+					// drain-on cell stopped at the fixed 32 KiB cap, left ~96 KiB
+					// queued and reset, which is what this row now refutes.
+					resetSent := unread > 0 && !drain
 					switch {
 					case !resetSent:
-						// unread=0 in both arms (negative control 1) and drain-on
-						// with unread <= cap (the closure's mechanism): the queue is
+						// unread=0 in both arms (negative control 1) and every
+						// drain-on cell (the closure's mechanism): the queue is
 						// empty at close(2), close sends FIN, nothing is reset.
 						if agg.eof != reps || agg.abortOnClose != 0 || agg.abortOnData != 0 || agg.inqAfterPos != 0 || agg.soErrNone != reps {
 							t.Errorf("drain=%t unread=%d: close(2) must find an empty queue and send FIN; got EOF=%d/%d SO_ERROR=0 on %d abortOnClose=%d abortOnData=%d inq_after>0 on %d",
 								drain, unread, agg.eof, reps, agg.soErrNone, agg.abortOnClose, agg.abortOnData, agg.inqAfterPos)
 						}
 					default:
-						// drain-off with unread>0 (negative control 3 at 16 KiB) and
-						// drain-on above the cap: close(2) finds unread bytes and
+						// drain-off with unread>0 (negative control 3, at both
+						// 16 KiB and 128 KiB): close(2) finds unread bytes and
 						// resets, attributed to TCPAbortOnClose.
 						if agg.abortOnClose != reps || agg.inqAfterPos != reps {
 							t.Errorf("drain=%t unread=%d: close(2) must reset every time (TCPAbortOnClose +1 each, inq_after>0); got abortOnClose=%d/%d inq_after>0 on %d",
@@ -133,6 +139,14 @@ func TestDrainRecvBufferTCPTruthTable(t *testing.T) {
 					// kernel accepted; on the RST path the unsent remainder is
 					// purged and the peer, whose window (16 KiB SO_RCVBUF) cannot
 					// hold the 64 KiB, receives strictly less.
+					if drain && unread > 0 {
+						// celeris#569: the drain consumed the whole queue, not a
+						// fixed 32 KiB prefix of it.
+						if agg.drainedMin != unread || agg.inqAfterPos != 0 {
+							t.Errorf("drain-on unread=%d: the drain must consume the whole queue; drainedMin=%d drainedMax=%d inq_after>0 on %d/%d",
+								unread, agg.drainedMin, agg.drainedMax, agg.inqAfterPos, reps)
+						}
+					}
 					if staged > 0 {
 						if agg.outqDataPos != reps {
 							t.Errorf("staged cell: a non-reading peer must leave outq>1 at close on every rep; got %d/%d", agg.outqDataPos, reps)
@@ -183,6 +197,91 @@ func TestDrainRecvBufferTCPTruthTable(t *testing.T) {
 				t.Errorf("tcp_fin_timeout=%d converts the orphan to time-wait inside close(2), whose reset has no MIB counter; expected abortOnData=0, got %d", finTimeout, onData)
 			}
 		})
+	}
+}
+
+// TestDrainRecvBufferEmptiesAWindowBlockedPeer is the Tier 0 cell for the
+// close celeris#569 is about, and the guard on the mechanism that makes it
+// work: a peer that has filled the server's receive buffer AND its own send
+// buffer, i.e. one that is window-blocked with megabytes still to deliver.
+//
+// Without the window clamp every drain read reopens the window and the peer's
+// backlog follows the drain in, so the queue is never empty when close(2)
+// runs and the kernel resets (measured on the WebSocket rig: 32 of 32 closes,
+// 20-22 snapshots and 2.6 MB to empty it by reading alone). With the clamp the
+// peer stays blocked, one snapshot empties the queue and close(2) sends FIN.
+func TestDrainRecvBufferEmptiesAWindowBlockedPeer(t *testing.T) {
+	srv, peer := loopbackTCPPair(t)
+
+	// Fill the server's receive buffer and then the peer's send buffer: the
+	// write stops at EAGAIN with the connection window-blocked.
+	if err := unix.SetNonblock(peer, true); err != nil {
+		t.Fatalf("setnonblock(peer): %v", err)
+	}
+	chunk := make([]byte, 64<<10)
+	sent := 0
+	for sent < 64<<20 {
+		n, err := unix.Write(peer, chunk)
+		if n > 0 {
+			sent += n
+		}
+		if err != nil {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				break
+			}
+			t.Fatalf("peer write: %v", err)
+		}
+	}
+	if err := unix.SetNonblock(peer, false); err != nil {
+		t.Fatalf("setnonblock(peer, false): %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	inqBefore, err := unix.IoctlGetInt(srv, unix.SIOCINQ)
+	if err != nil {
+		t.Fatalf("SIOCINQ: %v", err)
+	}
+	if inqBefore <= drainRecvFallbackBudget {
+		t.Skipf("only %d bytes queued, not the window-blocked cell", inqBefore)
+	}
+
+	if err := unix.Shutdown(srv, unix.SHUT_WR); err != nil {
+		t.Fatalf("shutdown(SHUT_WR): %v", err)
+	}
+	start := time.Now()
+	drained := DrainRecvBuffer(srv)
+	elapsed := time.Since(start)
+	inqAfter, _ := unix.IoctlGetInt(srv, unix.SIOCINQ)
+	rcvbuf, rcvbufErr := unix.GetsockoptInt(srv, unix.SOL_SOCKET, unix.SO_RCVBUF)
+	before := readTCPExt(t)
+	_ = unix.Close(srv)
+	after := readTCPExt(t)
+	abortOnClose := after["TCPAbortOnClose"] - before["TCPAbortOnClose"]
+	kind, _ := readToTerminal(peer)
+	t.Logf("TIER0-WINDOWBLOCKED sent=%d inq_before=%d drained=%d inq_after=%d rcvbuf=%d elapsed=%s abortOnClose=%+d peer=%s",
+		sent, inqBefore, drained, inqAfter, rcvbuf, elapsed, abortOnClose, kind)
+
+	if inqAfter != 0 {
+		t.Errorf("the drain left %d bytes queued, so close(2) resets: the window clamp is not holding the peer off (celeris#569)", inqAfter)
+	}
+	if abortOnClose != 0 {
+		t.Errorf("close(2) reset the connection (TCPAbortOnClose +%d): the peer loses the staged send buffer (celeris#569)", abortOnClose)
+	}
+	if kind != "EOF" {
+		t.Errorf("the peer must see the FIN as EOF, got %s", kind)
+	}
+	// The byte bound on a real TCP socket with megabytes still to come: the
+	// drain must not have chased the peer past the buffer that queue lives
+	// in. (It cannot be compared against the test's own inqBefore, which is
+	// read before SHUT_WR and so before the drain's own entry snapshot.)
+	if rcvbufErr == nil && drained > rcvbuf {
+		t.Errorf("the drain consumed %d bytes with SO_RCVBUF=%d and %d MB still queued at the peer: the byte bound is not min(SIOCINQ, SO_RCVBUF) (celeris#571)", drained, rcvbuf, sent>>20)
+	}
+	// The cost side of the same close, on the real socket rather than argued
+	// from the budget: with the window clamped this is ~14 us, and the bound
+	// that holds it is drainRecvTimeBudget, not a round number.
+	if limit := 20 * drainRecvTimeBudget; elapsed > limit {
+		t.Errorf("the drain held the closing thread for %s, past %dx the %s budget (celeris#571)", elapsed, int64(limit/drainRecvTimeBudget), drainRecvTimeBudget)
 	}
 }
 

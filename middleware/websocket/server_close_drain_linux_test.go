@@ -43,10 +43,13 @@ import (
 // point every byte the client sends stays in the kernel receive queue.
 // Two inbound cells:
 //
-//   - small: after the pause the client sends <= 16 KiB more (below the
-//     32 KiB drain cap) and stops;
-//   - flood: the client keeps writing until its write blocks (the server's
-//     autotuned receive buffer is full: far above the cap).
+//   - small: after the pause the client sends <= 16 KiB more and stops —
+//     what the old fixed 32 KiB cap could still empty, so the cell where
+//     the pre-celeris#569 drain and this one agree;
+//   - flood: the client keeps writing until its write blocks, i.e. the
+//     server's autotuned receive buffer is full at 128-131 KiB. That is
+//     four times the old cap, and the cell where it left ~96 KiB queued and
+//     close(2) reset every time.
 //
 // The client never reads during the flood and has an 8 KiB SO_RCVBUF, so
 // the server's echo backlog and its Close frame are staged in the kernel
@@ -566,6 +569,8 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 	var soEPIPE, soRST, so0 int
 	var inqBeforeMin, inqBeforeMax, drainedMin, drainedMax, inqAfterMin, inqAfterMax, outqMin, outqMax int
 	var drainedSum, inqBeforeSum int64
+	// The cost side of the drain's bounds, per close (celeris#569).
+	var drainNsMin, drainNsMax, drainNsSum int64
 	var spilledSum uint64
 	var probeWaitMax time.Duration
 	sites := map[string]int{}
@@ -650,6 +655,14 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 				outqDataPos++
 			}
 			drainedSum += int64(r.Drained)
+			ns := r.Elapsed.Nanoseconds()
+			drainNsSum += ns
+			if first || ns < drainNsMin {
+				drainNsMin = ns
+			}
+			if first || ns > drainNsMax {
+				drainNsMax = ns
+			}
 			inqBeforeSum += int64(r.InqBefore)
 			t1MinMax(first, r.InqBefore, &inqBeforeMin, &inqBeforeMax)
 			t1MinMax(first, r.Drained, &drainedMin, &drainedMax)
@@ -680,9 +693,9 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 				st.fullRx++
 			}
 		}
-		t.Logf("TIER1-CONN engine=%s cell=%s arm=%s conn=%d laddr=%s stoppedOK=%t pauseSeen=%t pausedState=%t chDepth=%d/%d spillLen=%d writeBlocked=%t sent=%d phase2Sent=%d spilled=%d probe=%t probeWait=%s site=%s inq_before=%d drained=%d inq_after=%d outq=%d peer=%s soErr=%s bytesRx=%d expectedRx=%d echoRx=%d echoed=%d closeRx=%t truncTail=%t fail=%q",
+		t.Logf("TIER1-CONN engine=%s cell=%s arm=%s conn=%d laddr=%s stoppedOK=%t pauseSeen=%t pausedState=%t chDepth=%d/%d spillLen=%d writeBlocked=%t sent=%d phase2Sent=%d spilled=%d probe=%t probeWait=%s site=%s inq_before=%d drained=%d inq_after=%d outq=%d drain_ns=%d peer=%s soErr=%s bytesRx=%d expectedRx=%d echoRx=%d echoed=%d closeRx=%t truncTail=%t fail=%q",
 			engineName, cell, p.arm, i, tm.laddr, slots[i].stoppedOK.Load(), tm.pauseSeen, tm.pausedState, tm.chDepth, tm.highWater, tm.spillLen, tm.writeBlocked, tm.sentBytes, tm.phase2Sent, tm.spilled,
-			tm.probeSeen, tm.probeWait.Round(time.Millisecond), tm.rec.Site, tm.rec.InqBefore, tm.rec.Drained, tm.rec.InqAfter, tm.rec.Outq,
+			tm.probeSeen, tm.probeWait.Round(time.Millisecond), tm.rec.Site, tm.rec.InqBefore, tm.rec.Drained, tm.rec.InqAfter, tm.rec.Outq, tm.rec.Elapsed.Nanoseconds(),
 			tm.kind, tm.soErr, tm.bytesRx, expectedRx, tm.echoRx, slots[i].echoed.Load(), tm.closeRx, tm.truncTail, tm.fail)
 	}
 	pInqBefore := 0.0
@@ -694,10 +707,10 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 	for k, v := range sites {
 		siteStr += fmt.Sprintf("%s:%d,", k, v)
 	}
-	t.Logf("TIER1-CELL engine=%s cell=%s arm=%s probe=%t workers=%d conns=%d joined=%d sites=%s unjoinedProbes=%d ignoredProbes=%d dupProbes=%d probeTimeouts=%d probeWaitMax=%s stoppedOK=%d pauseSeen=%d blockedNoPause=%d writeBlocked=%d writeErrs=%d spilledSum=%d inqBeforePos=%d pInqBefore=%.3f inqBeforeMin=%d inqBeforeMax=%d inqBeforeSum=%d drainedMin=%d drainedMax=%d drainedSum=%d inqAfterPos=%d inqAfterMin=%d inqAfterMax=%d outqDataPos=%d outqMin=%d outqMax=%d EOF=%d RST=%d timeout=%d other=%d soErrEPIPE=%d soErrECONNRESET=%d soErr0=%d closeFrameRx=%d fullRx=%d truncTail=%d handlerReadErr=%d handlerBadFrame=%d handlerEchoErr=%d handlerStopped=%d closeNowTimeout=%d dialFail=%d hsFail=%d harnessFail=%d abortOnClose=%d abortOnData=%d informative=%t",
+	t.Logf("TIER1-CELL engine=%s cell=%s arm=%s probe=%t workers=%d conns=%d joined=%d sites=%s unjoinedProbes=%d ignoredProbes=%d dupProbes=%d probeTimeouts=%d probeWaitMax=%s stoppedOK=%d pauseSeen=%d blockedNoPause=%d writeBlocked=%d writeErrs=%d spilledSum=%d inqBeforePos=%d pInqBefore=%.3f inqBeforeMin=%d inqBeforeMax=%d inqBeforeSum=%d drainedMin=%d drainedMax=%d drainedSum=%d drainNsMin=%d drainNsMax=%d drainNsSum=%d inqAfterPos=%d inqAfterMin=%d inqAfterMax=%d outqDataPos=%d outqMin=%d outqMax=%d EOF=%d RST=%d timeout=%d other=%d soErrEPIPE=%d soErrECONNRESET=%d soErr0=%d closeFrameRx=%d fullRx=%d truncTail=%d handlerReadErr=%d handlerBadFrame=%d handlerEchoErr=%d handlerStopped=%d closeNowTimeout=%d dialFail=%d hsFail=%d harnessFail=%d abortOnClose=%d abortOnData=%d informative=%t",
 		engineName, cell, p.arm, p.probeOn, workers, p.conns, joined, siteStr, unjoinedProbes.Load(), ignoredProbes.Load(), dupProbes.Load(), probeTimeouts, probeWaitMax.Round(time.Millisecond),
 		stoppedOK, pauseSeen, blockedNoPause, writeBlocked, writeErrs, spilledSum,
-		inqBeforePos, pInqBefore, inqBeforeMin, inqBeforeMax, inqBeforeSum, drainedMin, drainedMax, drainedSum,
+		inqBeforePos, pInqBefore, inqBeforeMin, inqBeforeMax, inqBeforeSum, drainedMin, drainedMax, drainedSum, drainNsMin, drainNsMax, drainNsSum,
 		inqAfterPos, inqAfterMin, inqAfterMax, outqDataPos, outqMin, outqMax,
 		eof, rst, timeout, other, soEPIPE, soRST, so0, closeRx, fullRx, truncTail,
 		handlerReadErr.Load(), handlerBadFrame.Load(), handlerEchoErr.Load(), handlerStopped.Load(), closeNowTimeout.Load(),
@@ -746,6 +759,49 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 	}
 	if !informative {
 		t.Logf("TIER1-VERDICT engine=%s cell=%s arm=%s UNINFORMATIVE: P(inq_before>0)=%.3f < 0.20 over %d joined closes", engineName, cell, p.arm, pInqBefore, joined)
+		return
+	}
+
+	// The outcome, asserted (celeris#569). Before the fix the drain stopped at
+	// a fixed 32 KiB, so the flood cell — the recv-paused close this issue is
+	// about, 127-131 KiB queued — left ~96 KiB in the queue and close(2) reset
+	// on 2304 of 2304 closes on both loop engines, purging the 19-26 KiB echo
+	// backlog and the Close frame. The drain's budget is now the SIOCINQ
+	// snapshot (ceiling SO_RCVBUF), so both cells must end the same way.
+	if !p.probeOn {
+		return
+	}
+	switch p.arm {
+	case "drain_on":
+		if inqAfterPos != 0 {
+			t.Errorf("drain-on: the drain must empty the receive queue before close(2); inq_after>0 on %d of %d closes (max %d bytes left)", inqAfterPos, joined, inqAfterMax)
+		}
+		if eof != joined || rst != 0 {
+			t.Errorf("drain-on: close(2) must send FIN on every close; EOF=%d/%d ECONNRESET=%d timeout=%d other=%d", eof, joined, rst, timeout, other)
+		}
+		if closeRx != joined {
+			t.Errorf("drain-on: the peer must receive the WebSocket Close frame on every close; closeFrameRx=%d/%d", closeRx, joined)
+		}
+		if fullRx != joined {
+			t.Errorf("drain-on: the peer must receive every byte the server staged; fullRx=%d/%d truncTail=%d", fullRx, joined, truncTail)
+		}
+		if abortOnClose != 0 {
+			t.Errorf("drain-on: no close may be attributed to TCPAbortOnClose; delta=%d over %d closes", abortOnClose, joined)
+		}
+	case "drain_off":
+		// The negative control arm, which only ever runs with
+		// CELERIS_DEBUG_SKIP_CLOSE_DRAIN=1: with no drain at all the same
+		// closes must still reset and still lose the Close frame, so a
+		// drain-on pass cannot be the workload having gone quiet.
+		if rst != joined {
+			t.Errorf("drain-off: close(2) must reset on every close; ECONNRESET=%d/%d EOF=%d timeout=%d", rst, joined, eof, timeout)
+		}
+		if closeRx != 0 {
+			t.Errorf("drain-off: the reset must destroy the Close frame; closeFrameRx=%d of %d", closeRx, joined)
+		}
+		if int(abortOnClose) < joined {
+			t.Errorf("drain-off: every reset must be attributed to TCPAbortOnClose; delta=%d over %d closes", abortOnClose, joined)
+		}
 	}
 }
 
