@@ -65,12 +65,19 @@ const (
 //
 // Both loop engines share this one implementation so the bound cannot drift
 // back apart (celeris#571).
-func DrainRecvBuffer(fd int) {
+//
+// It returns the number of bytes it consumed. The close path ignores the
+// value; it exists so the drain's effect can be measured against the
+// kernel's FIN/RST decision (celeris#583).
+func DrainRecvBuffer(fd int) int {
 	var buf [drainRecvBufSize]byte
+	drained := 0
 	for range drainRecvMaxReads {
 		n, _, err := unix.Recvfrom(fd, buf[:], unix.MSG_DONTWAIT)
 		if n <= 0 || err != nil {
-			return
+			return drained
 		}
+		drained += n
 	}
+	return drained
 }
