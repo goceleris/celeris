@@ -830,11 +830,29 @@ func (w *Worker) run(ctx context.Context) {
 	}
 	w.listenFD = listenFD
 
+	// celeris#656: from here until ready, a failure must close what this
+	// worker has created. shutdown is the only other code that closes a
+	// worker's descriptors, and it runs from the event loop, which a worker
+	// that never became ready does not reach; Listen joins the failed worker
+	// and returns its error without ever publishing it. A listen socket left
+	// open stays LISTENing in the port's SO_REUSEPORT group for the life of
+	// the process, and the kernel keeps hashing a share of new connections
+	// into a backlog that nobody accepts. The failure sites below release
+	// before they report, so the socket is gone by the time Listen sees the
+	// error; this defer covers any return that does not.
+	initDone := false
+	defer func() {
+		if !initDone {
+			w.releaseFailedInit()
+		}
+	}()
+
 	// Create ring after LockOSThread — SINGLE_ISSUER requires all ring
 	// operations from the same OS thread. NewRingCPU pins the kernel's SQPOLL
 	// thread to the same CPU as this worker, ensuring NUMA-local SQ ring polling.
-	ring, err := NewRingCPU(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle(), w.cpuID)
+	ring, err := newWorkerRing(uint32(w.resolved.SQERingSize), w.tier.SetupFlags(), w.tier.SQPollIdle(), w.cpuID)
 	if err != nil {
+		w.releaseFailedInit()
 		w.ready <- fmt.Errorf("worker %d ring setup: %w", w.id, err)
 		return
 	}
@@ -920,7 +938,10 @@ func (w *Worker) run(ctx context.Context) {
 	w.h2EventFD = efd
 
 	w.prepareAccept()
-	if _, err := w.ring.Submit(); err != nil {
+	if _, err := submitInitialAccept(w.ring); err != nil {
+		// celeris#656: the ring, the eventfd and any buffer ring exist now
+		// too, and nothing past this return would close them either.
+		w.releaseFailedInit()
 		w.ready <- fmt.Errorf("worker %d initial submit: %w", w.id, err)
 		return
 	}
@@ -928,6 +949,8 @@ func (w *Worker) run(ctx context.Context) {
 	// celeris#639: listenFD is certainly this worker's socket here; after
 	// ready a cancelled context closes it in shutdown.
 	w.listenAddr = listenAddrOf(w.listenFD)
+	// From ready on, shutdown owns these descriptors (celeris#656).
+	initDone = true
 	w.ready <- nil
 	w.cachedNow = time.Now().UnixNano()
 
@@ -5225,6 +5248,36 @@ func (w *Worker) shutdown() {
 	w.asyncWG.Wait()
 }
 
+// releaseFailedInit closes what run created for a worker that failed before
+// it signalled ready: its listen socket and, when it got that far, its ring,
+// buffer ring and H2 eventfd (celeris#656). It runs on the worker's own thread
+// while nothing else can reach the worker (Listen publishes e.workers only
+// after every worker is ready), so it needs no locks and touches no
+// connection state, of which there is none yet. Never call it after ready:
+// shutdown owns these descriptors then, and a second close could hit a number
+// already reused for a connection. Each field is reset, so a second call is a
+// no-op. The ring is closed before the listen socket: on these paths the
+// accept SQE never reached the kernel, so nothing holds the socket's file,
+// and closing in this order keeps that true if one ever does.
+func (w *Worker) releaseFailedInit() {
+	if w.bufRing != nil && w.ring != nil {
+		w.bufRing.Close(w.ring)
+	}
+	w.bufRing = nil
+	if w.ring != nil {
+		_ = w.ring.Close()
+		w.ring = nil
+	}
+	if w.h2EventFD >= 0 {
+		_ = unix.Close(w.h2EventFD)
+		w.h2EventFD = -1
+	}
+	if w.listenFD >= 0 {
+		_ = unix.Close(w.listenFD)
+		w.listenFD = -1
+	}
+}
+
 func createListenSocket(addr string) (int, error) {
 	sa, err := parseAddr(addr)
 	if err != nil {
@@ -5273,6 +5326,15 @@ func createListenSocket(addr string) (int, error) {
 // listenAddrOf is boundAddr behind a var so a test can make every worker
 // fail to report its address (celeris#639).
 var listenAddrOf = boundAddr
+
+// newWorkerRing and submitInitialAccept are the worker's ring setup and its
+// first submit behind vars, so a test can make either fail for one worker
+// after its listen socket exists (celeris#656). The loop's other submits call
+// the ring directly.
+var (
+	newWorkerRing       = NewRingCPU
+	submitInitialAccept = (*Ring).Submit
+)
 
 func boundAddr(fd int) net.Addr {
 	sa, err := unix.Getsockname(fd)
