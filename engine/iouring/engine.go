@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
@@ -31,7 +32,9 @@ type Engine struct {
 	metrics      struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
-		errCount    atomic.Uint64
+		// errs is the per-cause ErrorCount breakdown (celeris#645).
+		// EngineMetrics.ErrorCount is its sum; no separate total exists.
+		errs errclass.Counters
 		// asyncPromoted counts the cumulative inline → dispatch-goroutine
 		// promotions across all workers (celeris #300).
 		asyncPromoted atomic.Uint64
@@ -297,7 +300,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 	for i := range workers {
 		w, err := newWorker(i, cpus[i], tier, e.handler,
 			resolved, e.cfg,
-			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
+			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errs,
 			&e.metrics.asyncPromoted, &e.acceptPaused,
 			&e.metrics.acceptCount, &e.metrics.closeCount,
 			&e.metrics.bytesRead, &e.metrics.bytesWritten)
@@ -375,10 +378,9 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 	e.mu.Lock()
 	workers := len(e.workers)
 	e.mu.Unlock()
-	return engine.EngineMetrics{
+	m := engine.EngineMetrics{
 		RequestCount:       e.metrics.reqCount.Load(),
 		ActiveConnections:  e.metrics.activeConns.Load(),
-		ErrorCount:         e.metrics.errCount.Load(),
 		AsyncRoutes:        e.asyncRoutes,
 		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
 		Workers:            workers,
@@ -411,6 +413,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
 		CloseMissingConnState:       e.metrics.closeMissingConnState.Load(),
 	}
+	// ErrorCount and its eleven buckets, together, from one snapshot
+	// (celeris#645).
+	engine.FillErrorClasses(&m, e.metrics.errs.Snapshot())
+	return m
 }
 
 // Type returns the engine type.

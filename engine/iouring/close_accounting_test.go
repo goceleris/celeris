@@ -9,6 +9,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/resource"
 )
@@ -25,7 +26,7 @@ import (
 // paths need, mirroring what createWorkers wires per worker.
 func newLedgerWorker(fds ...int) *Worker {
 	w := newDirtyTestWorker(fds...)
-	w.errCount = new(atomic.Uint64)
+	w.errs = &errclass.Counters{}
 	w.transplantCount = new(atomic.Uint64)
 	w.transplantDetached = new(atomic.Uint64)
 	w.transplantSlotOccupied = new(atomic.Uint64)
@@ -122,8 +123,12 @@ func TestAttachAdoptedFDCountsAnOccupiedSlot(t *testing.T) {
 		t.Errorf("transplantSlotOccupied = %d, want 1 — the refusal is still "+
 			"indistinguishable from every other ErrorCount bump", got)
 	}
-	if got := w.errCount.Load(); got != 1 {
-		t.Errorf("errCount = %d, want 1 (the generic counter must still move)", got)
+	if got := w.errs.TransplantAdopt.Load(); got != 1 {
+		t.Errorf("errs.TransplantAdopt = %d, want 1 (celeris#645: the refusal must "+
+			"be counted in the adoption bucket, not folded into the generic total)", got)
+	}
+	if got := w.errs.Total(); got != 1 {
+		t.Errorf("errs.Total() = %d, want 1 (ErrorCount must still move)", got)
 	}
 	if w.conns[fd] != occupant {
 		t.Error("the occupied slot was clobbered")

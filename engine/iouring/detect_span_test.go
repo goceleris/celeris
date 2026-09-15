@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/protocol/h2/frame"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -28,7 +29,7 @@ func TestDetectSpanningH2Preface(t *testing.T) {
 		liveConns:   make([]int, 0, 4),
 		handler:     noopHandler,
 		h2EventFD:   -1,
-		errCount:    &atomic.Uint64{},
+		errs:        &errclass.Counters{},
 		reqCount:    &atomic.Uint64{},
 		activeConns: &atomic.Int64{},
 		cfg:         resource.Config{Protocol: engine.Auto},

@@ -87,7 +87,7 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	}
 	if fd >= connTableSize {
 		_ = unix.Close(fd)
-		l.errCount.Add(1)
+		l.errs.ConnTableCap.Add(1)
 		return
 	}
 	if fd >= len(l.conns) {
@@ -99,7 +99,7 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 		// (the slot holder may close the same descriptor later). The connection
 		// is lost here with no close and no hook, so count it separately from
 		// the generic error total (celeris#624).
-		l.errCount.Add(1)
+		l.errs.TransplantAdopt.Add(1)
 		if l.transplantSlotOccupied != nil {
 			l.transplantSlotOccupied.Add(1)
 		}
@@ -112,7 +112,7 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 		Fd:     int32(fd),
 	}); err != nil {
 		_ = unix.Close(fd)
-		l.errCount.Add(1)
+		l.errs.ConnRegister.Add(1)
 		return
 	}
 

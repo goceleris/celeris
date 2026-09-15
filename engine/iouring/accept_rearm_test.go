@@ -4,8 +4,9 @@ package iouring
 
 import (
 	"context"
-	"sync/atomic"
 	"testing"
+
+	"github.com/goceleris/celeris/engine/internal/errclass"
 )
 
 // newTestRing creates a bare io_uring for unit tests that need to observe SQE
@@ -32,7 +33,7 @@ func TestHandleAcceptRearmsOnError(t *testing.T) {
 	w := &Worker{
 		ring:     ring,
 		listenFD: 3, // any valid-looking fd; prepareAccept only encodes it
-		errCount: &atomic.Uint64{},
+		errs:     &errclass.Counters{},
 		// highTier with multishotAccept reports multishot accept support so
 		// the test exercises the multishot branch the bug lived in.
 		tier: &highTier{multishotAccept: true},
@@ -47,8 +48,19 @@ func TestHandleAcceptRearmsOnError(t *testing.T) {
 	if after != before+1 {
 		t.Fatalf("handleAccept did not submit a re-arm accept SQE: pending %d→%d (want +1)", before, after)
 	}
-	if got := w.errCount.Load(); got != 1 {
-		t.Errorf("errCount = %d, want 1 (the error CQE should be counted)", got)
+	if got := w.errs.Total(); got != 1 {
+		t.Errorf("error total = %d, want 1 (the error CQE should be counted)", got)
+	}
+	// celeris#645: ENOMEM is neither a descriptor shortage nor a cancelled
+	// accept, so it must land in AcceptOther and in nothing else. The whole
+	// point of the split is that these three have different answers — an
+	// EMFILE means raise the limit, a cancel is usually a deliberate pause.
+	if got := w.errs.AcceptOther.Load(); got != 1 {
+		t.Errorf("errs.AcceptOther = %d, want 1 — ENOMEM on accept belongs in "+
+			"AcceptOther", got)
+	}
+	if got := w.errs.AcceptFDLimit.Load() + w.errs.AcceptCancelled.Load(); got != 0 {
+		t.Errorf("ENOMEM also moved AcceptFDLimit/AcceptCancelled by %d, want 0", got)
 	}
 }
 
@@ -60,7 +72,7 @@ func TestHandleAcceptNoRearmWhenMoreSet(t *testing.T) {
 	w := &Worker{
 		ring:     ring,
 		listenFD: 3,
-		errCount: &atomic.Uint64{},
+		errs:     &errclass.Counters{},
 		tier:     &highTier{multishotAccept: true},
 	}
 

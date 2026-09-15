@@ -3,9 +3,10 @@
 package iouring
 
 import (
-	"sync/atomic"
 	"testing"
 	"unsafe"
+
+	"github.com/goceleris/celeris/engine/internal/errclass"
 )
 
 // TestAcceptRearmRetriedAfterSQFull guards the accept-loss found by the
@@ -27,7 +28,7 @@ func TestAcceptRearmRetriedAfterSQFull(t *testing.T) {
 	w := &Worker{
 		ring:     ring,
 		listenFD: 3, // prepareAccept only encodes it
-		errCount: &atomic.Uint64{},
+		errs:     &errclass.Counters{},
 		tier:     &highTier{multishotAccept: true},
 	}
 

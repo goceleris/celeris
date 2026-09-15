@@ -4,11 +4,12 @@ package iouring
 
 import (
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/engine/internal/errclass"
 )
 
 // recvArmFixture is a real ring plus one connState on a socketpair, wired so
@@ -37,7 +38,7 @@ func newRecvArmFixture(t *testing.T) *recvArmFixture {
 	w := &Worker{
 		ring:      ring,
 		conns:     make([]*connState, local+1),
-		errCount:  &atomic.Uint64{},
+		errs:      &errclass.Counters{},
 		recvArm:   &recvArmStats{},
 		h2EventFD: -1, // enqueueDetach then skips the wakeup write
 	}

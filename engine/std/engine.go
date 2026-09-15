@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 
@@ -44,7 +45,11 @@ type Engine struct {
 	metrics    struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
-		errCount    atomic.Uint64
+		// errs is the per-cause ErrorCount breakdown (celeris#645).
+		// EngineMetrics.ErrorCount is its sum; no separate total exists.
+		// std reaches only the two request-path buckets: it never accepts
+		// a descriptor of its own (net/http does) and never transplants.
+		errs errclass.Counters
 		// closeCount is the cumulative close count EngineMetrics declares
 		// and this engine used to leave at zero (celeris#624). It is
 		// incremented on exactly the ConnState transitions that decrement
@@ -229,12 +234,14 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 
 // Metrics returns a snapshot of engine metrics.
 func (e *Engine) Metrics() engine.EngineMetrics {
-	return engine.EngineMetrics{
+	m := engine.EngineMetrics{
 		RequestCount:      e.metrics.reqCount.Load(),
 		ActiveConnections: e.metrics.activeConns.Load(),
-		ErrorCount:        e.metrics.errCount.Load(),
 		CloseCount:        e.metrics.closeCount.Load(),
 	}
+	// ErrorCount and its buckets, together, from one snapshot (celeris#645).
+	engine.FillErrorClasses(&m, e.metrics.errs.Snapshot())
+	return m
 }
 
 // Type returns the engine type.

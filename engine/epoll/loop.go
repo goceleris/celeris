@@ -21,6 +21,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/internal/bindiag"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
@@ -33,7 +34,7 @@ import (
 // connTableSize is the HARD CAP on slots in the flat connection array, and
 // thus on concurrent connections per worker: an accepted fd >= connTableSize
 // cannot be indexed into l.conns and is rejected (closed) by acceptAll with
-// an errCount bump + a rate-limited Warn. The kernel hands out the lowest
+// an ErrorConnTableCap bump + a rate-limited Warn. The kernel hands out the lowest
 // free fd, so this is reached only when a worker is genuinely holding ~65 K
 // live conns (plus the listen/epoll/event/timer fds). Raise this if a single
 // worker must sustain more.
@@ -111,9 +112,12 @@ type Loop struct {
 	// re-arms the signal.
 	listenFDClosed atomic.Bool
 
-	reqCount          *atomic.Uint64
-	activeConns       *atomic.Int64
-	errCount          *atomic.Uint64
+	reqCount    *atomic.Uint64
+	activeConns *atomic.Int64
+	// errs is the engine-wide per-cause ErrorCount breakdown, shared by
+	// every loop (celeris#645). There is no aggregate counter beside it:
+	// EngineMetrics.ErrorCount is the sum of these buckets.
+	errs              *errclass.Counters
 	asyncPromoted     *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
 	acceptCount       *atomic.Uint64 // cumulative accepts (engine-wide, shared)
 	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
@@ -195,7 +199,7 @@ type Loop struct {
 
 func newLoop(id, cpuID int, handler stream.Handler,
 	resolved resource.ResolvedResources,
-	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
+	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errs *errclass.Counters,
 	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool,
 	acceptCount, closeCount, bytesRead, bytesWritten *atomic.Uint64) *Loop {
 
@@ -227,7 +231,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		},
 		reqCount:      reqCount,
 		activeConns:   activeConns,
-		errCount:      errCount,
+		errs:          errs,
 		asyncPromoted: asyncPromoted,
 		acceptCount:   acceptCount,
 		closeCount:    closeCount,
@@ -378,6 +382,10 @@ func (l *Loop) run(ctx context.Context) {
 		if l.listenFD < 0 && !paused {
 			fd, err := createListenSocket(l.cfg.Addr)
 			if err != nil {
+				// This loop is about to stop accepting for good, so
+				// the bump is not a rate: it is the one record that
+				// the engine lost a listener (celeris#645).
+				l.errs.ListenerRecreate.Add(1)
 				l.logger.Error("re-create listen socket", "loop", l.id, "err", err)
 				l.shutdown()
 				return
@@ -386,6 +394,7 @@ func (l *Loop) run(ctx context.Context) {
 				Events: unix.EPOLLIN | unix.EPOLLET,
 				Fd:     int32(fd),
 			}); err != nil {
+				l.errs.ListenerRecreate.Add(1)
 				l.logger.Error("epoll_ctl re-add listen", "loop", l.id, "err", err)
 				_ = unix.Close(fd)
 				l.shutdown()
@@ -751,13 +760,13 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 				// off this round and re-arm so we retry next iteration once
 				// an fd may have freed up — with ET we can't just wait for a
 				// new edge, the queued SYNs won't re-signal.
-				l.errCount.Add(1)
+				l.errs.AcceptFDLimit.Add(1)
 				l.listenHot = true
 				return
 			default:
 				// Unexpected accept error. Count it and stop this round; the
 				// listen fd stays armed (ET) and a fresh edge re-enters.
-				l.errCount.Add(1)
+				l.errs.AcceptOther.Add(1)
 				l.listenHot = false
 				return
 			}
@@ -765,12 +774,12 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 
 		// Hard-cap check: reject FDs at or above the table's MAX size. An fd
 		// >= connTableSize can never be indexed into l.conns, so it would be
-		// silently dropped (errCount++) and stay invisible. Latch a one-shot
-		// Warn so a worker that has saturated its 64 K conn table is
-		// diagnosable rather than just "connections vanishing".
+		// silently dropped (ErrorConnTableCap++) and stay invisible. Latch
+		// a one-shot Warn so a worker that has saturated its 64 K conn
+		// table is diagnosable rather than just "connections vanishing".
 		if newFD < 0 || newFD >= connTableSize {
 			_ = unix.Close(newFD)
-			l.errCount.Add(1)
+			l.errs.ConnTableCap.Add(1)
 			l.fdCapDrops++
 			if !l.fdCapWarned && l.logger != nil {
 				l.fdCapWarned = true
@@ -804,7 +813,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 			Fd:     int32(newFD),
 		}); err != nil {
 			_ = unix.Close(newFD)
-			l.errCount.Add(1)
+			l.errs.ConnRegister.Add(1)
 			continue
 		}
 
