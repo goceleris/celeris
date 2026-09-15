@@ -2671,6 +2671,47 @@ func (l *Loop) closeConn(fd int) {
 		// The mutex serializes with any in-progress write — if the
 		// goroutine is mid-write, we block until it finishes.
 		cs.detachMu.Lock()
+		// celeris#654: re-validate ownership now that we hold the lock.
+		// Under AsyncHandlers the user handler runs inside ProcessH1 with
+		// detachMu held, and Context.Hijack → hijackConn does the ENTIRE
+		// engine-side teardown right there on the dispatch goroutine:
+		// EPOLL_CTL_DEL, removeLiveConn, l.conns[fd] = nil, the three
+		// counters, and close() of the original descriptor (the caller keeps
+		// a dup). We captured cs BEFORE that ran and then parked on this
+		// lock, so without a re-check we redo every one of those steps on a
+		// conn the engine no longer owns: the close is counted twice and the
+		// live gauge goes negative (which also means the DRAINING→SUSPENDED
+		// connCount == 0 gate can never pass again on this loop), and the
+		// SHUT_WR + Close below lands on a descriptor NUMBER the kernel's
+		// lowest-free-fd rule has already reissued to something else —
+		// another loop's accept, an fd the handler opened, a driver conn
+		// registered off-thread into this same epfd.
+		//
+		// One check suffices. The slot is only cleared off-thread by
+		// hijackConn, which in async mode runs under this very mutex, and
+		// asyncClosed (stored above) keeps the dispatch goroutine from
+		// entering another ProcessH1 once we release it — so no hijack can
+		// slip in between here and the CloseH1 re-lock further down.
+		//
+		// Returning early is also the correct teardown, not just the safe
+		// one: it leaves detachClosed false so drainDetachQueue still reaches
+		// its cs.hijacked branch and returns the connState to the pool
+		// (detachClosed is tested first and would strand it), and it skips
+		// OnDisconnect, matching the sync hijack path, which never fires it.
+		l.driverMu.RLock()
+		owned := fd < len(l.conns) && l.conns[fd] == cs
+		l.driverMu.RUnlock()
+		if !owned {
+			// hijackConn does not unlink cs from the dirty list and
+			// releaseConnState only clears the conn's own links, so drop it
+			// here: a hijacked conn left on the list would have the loop
+			// flush pending bytes to a reissued descriptor. No-op unless the
+			// conn really was dirty (a partial write from a prior pipelined
+			// response on this keep-alive conn).
+			l.removeDirty(cs)
+			cs.detachMu.Unlock()
+			return
+		}
 		cs.detachClosed = true
 		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
 		// fully wired the conn (WSReady). Otherwise the read of OnDetachClose —
