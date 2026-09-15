@@ -454,10 +454,22 @@ func (e *Engine) Listen(ctx context.Context) error {
 	bindWait := time.NewTimer(time.Until(deadline))
 	defer bindWait.Stop()
 	var startErr error
+	var stopped bool
 bindLoop:
 	for active.Addr() == nil {
 		select {
 		case startErr = <-errCh:
+			break bindLoop
+		case <-innerCtx.Done():
+			// Shutdown, or the caller's context, ended the engine before the
+			// active sub-engine published an address. Without this case the
+			// wait runs to its own 20s deadline no matter what: Server.Shutdown
+			// cancels this context and then JOINS this Listen, so a Listen
+			// parked here burns the caller's whole shutdown deadline and then
+			// keeps Start parked for the rest of the 20s — the celeris#595
+			// contract, broken on the one path that fix did not reach
+			// (celeris#638).
+			stopped = true
 			break bindLoop
 		case <-bindWait.C:
 			break bindLoop
@@ -469,6 +481,13 @@ bindLoop:
 		innerCancel()
 		wg.Wait()
 		return fmt.Errorf("sub-engine startup failed: %w", startErr)
+	}
+	if stopped {
+		// An ordinary stop, not a startup failure: unwind and report no
+		// error, exactly as a Listen that had finished starting would.
+		innerCancel()
+		wg.Wait()
+		return nil
 	}
 	if active.Addr() == nil {
 		innerCancel()
