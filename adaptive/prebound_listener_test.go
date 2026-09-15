@@ -158,6 +158,7 @@ func TestAdaptiveSwitchesWithPreBoundListener(t *testing.T) {
 
 	e, want, stop := preBoundAdaptive(t, 2)
 	defer stop()
+	requireUpSwitch(t, e)
 
 	if code := getOnce(t, want); code != 200 {
 		t.Fatalf("pre-switch GET %s = %d, want 200", want, code)
