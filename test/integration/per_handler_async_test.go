@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -174,10 +175,78 @@ func TestPerHandlerAsync_ConcurrentMixed(t *testing.T) {
 	}
 }
 
+// connTally counts the TCP connections a keep-alive client actually used, via
+// httptrace. The stickiness claim — "the counter increments once per promoted
+// connection and never again on that connection" — is only about a connection
+// that is REUSED, so "the client reused one connection" is a precondition of
+// the claim and is measured here rather than assumed (celeris#631).
+type connTally struct {
+	mu     sync.Mutex
+	fresh  int // GotConn with Reused=false: a new TCP connection was dialled
+	reused int // GotConn with Reused=true: the idle connection came back
+}
+
+func (ct *connTally) record(reused bool) {
+	ct.mu.Lock()
+	if reused {
+		ct.reused++
+	} else {
+		ct.fresh++
+	}
+	ct.mu.Unlock()
+}
+
+func (ct *connTally) read() (fresh, reused int) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	return ct.fresh, ct.reused
+}
+
+// getKeepAlive issues one GET, records which connection served it, and — the
+// part this test used to get wrong (celeris#631) — DRAINS AND CLOSES the
+// response body. net/http only returns a connection to the idle pool once its
+// body has been read to EOF and closed: a discarded *http.Response pins the
+// connection, so the next request dials a fresh one. That is how this test
+// defeated itself. Every /db hit landed on a NEW connection, each promoted
+// legitimately, and the "sticky" assertion read delta=6 on both engines while
+// never once exercising stickiness.
+func getKeepAlive(t *testing.T, client *http.Client, ct *connTally, url string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request %s: %v", url, err)
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { ct.record(info.Reused) },
+	}))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("drain %s: %v", url, err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s: status %d", url, resp.StatusCode)
+	}
+}
+
 // TestPerHandlerAsync_StickinessMetric verifies the engine-level
 // asyncPromoted counter (#300 G3) increments exactly once per fresh
 // async-mode H1 connection that touches an async route, and stays
 // monotonic across many requests on the same conn (stickiness).
+//
+// celeris#631: the connection reuse the claim rests on is now ASSERTED from
+// httptrace (one dial, eleven reuses) before the counter is judged, so the
+// test can no longer pass — or fail — for reasons that have nothing to do
+// with stickiness. Measured on unmodified main before the body-drain fix, both
+// engines: twelve requests, twelve connections, delta=6 (`promotion must be
+// sticky: delta=6 after 10 more reqs, want 1`); after it: one connection,
+// eleven reuses, delta=1.
 func TestPerHandlerAsync_StickinessMetric(t *testing.T) {
 	for _, e := range []struct {
 		name string
@@ -204,19 +273,16 @@ func TestPerHandlerAsync_StickinessMetric(t *testing.T) {
 				DisableKeepAlives:   false,
 			}}
 			defer client.CloseIdleConnections()
+			ct := &connTally{}
 
 			// First request is sync — must NOT promote.
-			if _, err := client.Get("http://" + addr + "/cpu"); err != nil {
-				t.Fatalf("get /cpu: %v", err)
-			}
+			getKeepAlive(t, client, ct, "http://"+addr+"/cpu")
 			time.Sleep(50 * time.Millisecond)
 			if got := srv.EngineInfo().Metrics.AsyncPromotedConns - base0; got != 0 {
 				t.Fatalf("sync-only request must NOT promote: delta=%d", got)
 			}
 			// First async hit on this conn — must promote exactly once.
-			if _, err := client.Get("http://" + addr + "/db"); err != nil {
-				t.Fatalf("get /db: %v", err)
-			}
+			getKeepAlive(t, client, ct, "http://"+addr+"/db")
 			time.Sleep(50 * time.Millisecond)
 			if got := srv.EngineInfo().Metrics.AsyncPromotedConns - base0; got != 1 {
 				t.Fatalf("first async hit must promote exactly once: delta=%d", got)
@@ -224,12 +290,23 @@ func TestPerHandlerAsync_StickinessMetric(t *testing.T) {
 			// Subsequent requests on the SAME conn (sync or async) must
 			// not promote again — sticky.
 			for i := 0; i < 5; i++ {
-				_, _ = client.Get("http://" + addr + "/db")
-				_, _ = client.Get("http://" + addr + "/cpu")
+				getKeepAlive(t, client, ct, "http://"+addr+"/db")
+				getKeepAlive(t, client, ct, "http://"+addr+"/cpu")
 			}
 			time.Sleep(100 * time.Millisecond)
+			// The claim is about ONE connection, so check that first: a
+			// second dial would make the counter's value say nothing about
+			// stickiness, whatever it happens to be.
+			fresh, reused := ct.read()
+			t.Logf("[%s] stickiness conns: fresh_dials=%d reused=%d over 12 requests, async_promoted_delta=%d",
+				e.name, fresh, reused, srv.EngineInfo().Metrics.AsyncPromotedConns-base0)
+			if fresh != 1 || reused != 11 {
+				t.Fatalf("the 12 requests must run on ONE reused keep-alive conn (celeris#631): fresh_dials=%d reused=%d, want 1 and 11 — "+
+					"the stickiness assertion below is vacuous on a conn that is never reused", fresh, reused)
+			}
 			if got := srv.EngineInfo().Metrics.AsyncPromotedConns - base0; got != 1 {
-				t.Fatalf("promotion must be sticky: delta=%d after 10 more reqs, want 1", got)
+				t.Fatalf("promotion must be sticky: delta=%d after 10 more reqs on the same conn (fresh_dials=%d reused=%d), want 1",
+					got, fresh, reused)
 			}
 		})
 	}
