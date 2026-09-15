@@ -392,6 +392,43 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// that run. Zero on other engines, whose close paths hold a non-nil
 	// connection state by construction.
 	CloseMissingConnState uint64
+	// TransplantHandoffRefused is the cumulative number of hand-offs in
+	// which the SOURCE engine had already relinquished the descriptor —
+	// dropped it from its event loop, live set and conn table, with no
+	// OnDisconnect — and the target then refused it
+	// ([TransplantTarget.AdoptConn] returned an error). Before celeris#624
+	// every one of these closed the descriptor outright: the live gauge had
+	// already fallen, no hook fired, and no counter moved, which is exactly
+	// the unattributable step this issue chased. The source now re-adopts
+	// the connection onto itself instead, so a nonzero value here is paired
+	// with a matching TransplantAdopted on the SAME engine and the residual
+	// stays zero.
+	TransplantHandoffRefused uint64
+	// TransplantDrainStopped is the cumulative number of deferred hand-offs
+	// that found the drain already stopped ([Engine] reverted) between the
+	// detach and the hand-off. The connection is healthy and at a clean
+	// boundary, so it is re-adopted onto the source rather than closed —
+	// the same silent-close branch as TransplantHandoffRefused, reached by
+	// a different route, and counted apart because the fix for a revert
+	// race is not the fix for a target that cannot take the descriptor.
+	TransplantDrainStopped uint64
+	// TransplantStranded is the cumulative number of transplant-pending
+	// connections the source's detach-queue drain dropped without handing
+	// off, closing, or firing a hook — the already-closed check that runs
+	// ahead of the transplant branch. It must stay 0: the two flags are
+	// mutually exclusive by construction (a close on an already-detached
+	// descriptor returns before it can set the closed flag), and this
+	// counter is what makes that argument checkable rather than asserted.
+	TransplantStranded uint64
+	// TransplantAdoptRefused is the cumulative number of adoptions the
+	// TARGET refused for a reason other than an occupied slot — a
+	// descriptor outside its conn table, or an event-loop registration
+	// that failed. The target owns the descriptor by then, so it closes
+	// it AND fires OnDisconnect, keeping accepted - closed - active
+	// balanced. Distinct from TransplantAdoptSlotOccupied, which cannot
+	// close (the slot holder may close the same number later) and so
+	// leaks by design.
+	TransplantAdoptRefused uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and
