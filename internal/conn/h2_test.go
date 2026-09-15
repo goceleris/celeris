@@ -71,7 +71,7 @@ func TestNewH2StateFromUpgrade_Basic(t *testing.T) {
 		writes = append(writes, b...)
 		mu.Unlock()
 	}
-	state, err := NewH2StateFromUpgrade(h, H2Config{}, write, -1, info)
+	state, err := NewH2StateFromUpgrade(h, H2Config{}, write, nil, info)
 	if err != nil {
 		t.Fatalf("NewH2StateFromUpgrade: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestProcessH2_PartialPreface(t *testing.T) {
 		writes = append(writes, b...)
 		mu.Unlock()
 	}
-	state, err := NewH2StateFromUpgrade(h, H2Config{}, write, -1, info)
+	state, err := NewH2StateFromUpgrade(h, H2Config{}, write, nil, info)
 	if err != nil {
 		t.Fatalf("NewH2StateFromUpgrade: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestProcessH2_WrongPrefaceRejected(t *testing.T) {
 	// No upgrade — plain H2 connection.
 	h := &captureHandler{}
 	write := func([]byte) {}
-	state := NewH2State(h, H2Config{}, write, -1)
+	state := NewH2State(h, H2Config{}, write, nil)
 	garbage := []byte("GET / HTTP/1.1\r\n\r\n")
 	err := ProcessH2(context.Background(), garbage, state, h, write, H2Config{})
 	if err == nil {
@@ -164,7 +164,7 @@ func TestInjectStreamHeaders_WithBody(t *testing.T) {
 	}
 	h := &captureHandler{}
 	write := func([]byte) {}
-	state, err := NewH2StateFromUpgrade(h, H2Config{}, write, -1, info)
+	state, err := NewH2StateFromUpgrade(h, H2Config{}, write, nil, info)
 	_ = state
 	if err != nil {
 		t.Fatalf("NewH2StateFromUpgrade: %v", err)
@@ -225,7 +225,7 @@ func TestProcessH2_PipelinedCompletedStreamsNotRefused(t *testing.T) {
 		mu.Unlock()
 	}
 	cfg := H2Config{MaxConcurrentStreams: maxStreams}
-	state := NewH2State(h, cfg, write, -1)
+	state := NewH2State(h, cfg, write, nil)
 
 	// One buffer: client preface + empty client SETTINGS + nStreams complete
 	// GET HEADERS frames (odd stream IDs). Delivering them in a single
@@ -315,7 +315,7 @@ func TestProcessH2_StalledStreamsReleaseSlot(t *testing.T) {
 		mu.Unlock()
 	}
 	cfg := H2Config{MaxConcurrentStreams: maxStreams}
-	state := NewH2State(h, cfg, write, -1)
+	state := NewH2State(h, cfg, write, nil)
 
 	hdr := encodeH2Headers(t, [][2]string{
 		{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"},
@@ -426,7 +426,7 @@ func TestProcessH2_ServerRSTFreesSlot(t *testing.T) {
 	h := silentHandler{}
 	write := func([]byte) {}
 	cfg := H2Config{MaxConcurrentStreams: maxStreams, MaxRequestBodySize: 4}
-	state := NewH2State(h, cfg, write, -1)
+	state := NewH2State(h, cfg, write, nil)
 	mgr := state.processor.GetManager()
 
 	var preface bytes.Buffer
@@ -486,7 +486,7 @@ func TestProcessH2_NoWriteHandlerFreesSlot(t *testing.T) {
 	h := silentHandler{}
 	write := func([]byte) {}
 	cfg := H2Config{MaxConcurrentStreams: maxStreams}
-	state := NewH2State(h, cfg, write, -1)
+	state := NewH2State(h, cfg, write, nil)
 	mgr := state.processor.GetManager()
 
 	var preface bytes.Buffer
@@ -579,7 +579,7 @@ func TestProcessH2_ConnectionWindowNotOverflowed(t *testing.T) {
 		mu.Unlock()
 	}
 	cfg := H2Config{MaxConcurrentStreams: 100}
-	state := NewH2State(h, cfg, write, -1)
+	state := NewH2State(h, cfg, write, nil)
 	mgr := state.processor.GetManager()
 
 	// Preface + client SETTINGS advertising a huge per-stream initial window.
@@ -720,7 +720,7 @@ func TestProcessH2_ConnWindowStallResumes(t *testing.T) {
 		mu.Unlock()
 	}
 	cfg := H2Config{MaxConcurrentStreams: 100}
-	state := NewH2State(h, cfg, write, -1)
+	state := NewH2State(h, cfg, write, nil)
 
 	var preface bytes.Buffer
 	preface.WriteString(frame.ClientPreface)

@@ -8,12 +8,12 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/protocol/h2/frame"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
-	"golang.org/x/sys/unix"
 )
 
 // frameBuffer wraps bytes.Buffer for incremental H2 frame parsing.
@@ -90,9 +90,13 @@ const h2QueueShards = 4
 // Handler goroutines enqueue response frame data; the event loop drains it.
 // Sharding by stream ID eliminates cross-stream lock contention.
 type h2ShardedQueue struct {
-	shards   [h2QueueShards]h2QueueShard
-	pending  atomic.Bool
-	wakeupFD int // eventfd for signaling event loop (-1 if unavailable)
+	shards  [h2QueueShards]h2QueueShard
+	pending atomic.Bool
+	// wake is the event loop's wakeup eventfd, or nil when the engine has
+	// none. A handle, not a number: the engine closes it at shutdown, and a
+	// pool goroutine that enqueues a frame afterwards must not write a
+	// descriptor number that has since been recycled (celeris#655).
+	wake *wakefd.WakeFD
 }
 
 type h2QueueShard struct {
@@ -118,10 +122,8 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 	// CAS coalescing: only signal the event loop if no prior enqueue already
 	// set pending. If CAS fails, pending is already true and a prior enqueue
 	// already wrote the eventfd — the event loop will drain all shards.
-	if q.pending.CompareAndSwap(false, true) && q.wakeupFD >= 0 {
-		var val [8]byte
-		val[0] = 1
-		_, _ = unix.Write(q.wakeupFD, val[:])
+	if q.pending.CompareAndSwap(false, true) {
+		q.wake.Signal()
 	}
 }
 
@@ -480,16 +482,16 @@ func (s *H2State) DrainWriteQueue(write func([]byte)) {
 	}
 }
 
-// NewH2State creates a new H2 connection state. wakeupFD is an eventfd used
-// to signal the event loop when handler goroutines enqueue responses (-1 to
-// disable, falling back to polling).
-func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeupFD int) *H2State {
+// NewH2State creates a new H2 connection state. wake is the event loop's
+// wakeup eventfd, signalled when handler goroutines enqueue responses (nil
+// to disable, falling back to polling).
+func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *wakefd.WakeFD) *H2State {
 	cfg = cfg.withDefaults()
 
 	// Single heap allocation for the whole H2State. Substructures are
 	// embedded as values; we fill them in place and hand out pointers below.
 	s := &H2State{cfg: cfg}
-	s.writeQueue.wakeupFD = wakeupFD
+	s.writeQueue.wake = wake
 	s.adapter = h2ResponseAdapter{
 		write:        write,
 		outBuf:       &s.outBuf,
@@ -559,8 +561,8 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wakeup
 // Unlike NewH2State, this function writes to the connection directly
 // (before returning) because the 101 response has already been sent and
 // the client is entitled to see the server SETTINGS immediately.
-func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]byte), wakeupFD int, info *UpgradeInfo) (*H2State, error) {
-	state := NewH2State(handler, cfg, write, wakeupFD)
+func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]byte), wake *wakefd.WakeFD, info *UpgradeInfo) (*H2State, error) {
+	state := NewH2State(handler, cfg, write, wake)
 
 	// Apply client's settings from the HTTP2-Settings header. Settings
 	// payload is a sequence of {u16 id, u32 val} pairs (already validated

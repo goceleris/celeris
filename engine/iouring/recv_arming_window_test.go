@@ -36,11 +36,11 @@ func newRecvArmFixture(t *testing.T) *recvArmFixture {
 	t.Cleanup(func() { _ = unix.Close(peer); _ = unix.Close(local) })
 
 	w := &Worker{
-		ring:      ring,
-		conns:     make([]*connState, local+1),
-		errs:      &errclass.Counters{},
-		recvArm:   &recvArmStats{},
-		h2EventFD: -1, // enqueueDetach then skips the wakeup write
+		ring:    ring,
+		conns:   make([]*connState, local+1),
+		errs:    &errclass.Counters{},
+		recvArm: &recvArmStats{},
+		// a nil wakeFD is a disabled handle: enqueueDetach signals nothing
 	}
 	cs := &connState{
 		fd:         local,

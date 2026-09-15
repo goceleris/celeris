@@ -34,7 +34,6 @@ func newReapLoop(t *testing.T) *Loop {
 		acceptCount:  &atomic.Uint64{},
 		bytesRead:    &atomic.Uint64{},
 		bytesWritten: &atomic.Uint64{},
-		eventFD:      -1,
 		timerFD:      -1,
 		cfg:          resource.Config{},
 	}
