@@ -84,7 +84,9 @@ type driverAction struct {
 	adoptCarry engine.Carryover
 }
 
-// addDriverAction enqueues work for the worker and wakes the ring.
+// addDriverAction enqueues work for the worker and wakes it: the eventfd
+// reaches a worker waiting on its ring, wakeIfSuspended one parked in
+// DRAINING→SUSPENDED (celeris#658).
 func (w *Worker) addDriverAction(a driverAction) {
 	w.driverActionMu.Lock()
 	w.driverActionQueue = append(w.driverActionQueue, a)
@@ -95,6 +97,40 @@ func (w *Worker) addDriverAction(a driverAction) {
 		val[0] = 1
 		_, _ = unix.Write(w.h2EventFD, val[:])
 	}
+	// After releasing driverActionMu: wakeMu is a leaf lock.
+	w.wakeIfSuspended()
+}
+
+// addAdoptAction queues a transplanted descriptor for this worker (#383). It is
+// addDriverAction with one difference: it can refuse. Once the worker has shut
+// down nothing will ever drain the queue, and an adoption accepted there is a
+// descriptor the source has let go of and no engine owns (celeris#658). The
+// error leaves fd with the caller, whose reclaim path takes the connection
+// back.
+//
+// The eventfd is written under driverActionMu: Worker.shutdown takes this lock
+// (closeAdoptQueue) before it closes the eventfd, so the write can never land
+// on a closed — possibly reused — descriptor number.
+func (w *Worker) addAdoptAction(fd int, carry engine.Carryover) error {
+	w.driverActionMu.Lock()
+	if w.adoptClosed {
+		w.driverActionMu.Unlock()
+		return fmt.Errorf("celeris/iouring: worker %d has shut down, cannot adopt fd %d", w.id, fd)
+	}
+	w.driverActionQueue = append(w.driverActionQueue,
+		driverAction{kind: driverActionAdopt, adoptFD: fd, adoptCarry: carry})
+	w.driverActionPending.Store(1)
+	if w.h2EventFD >= 0 {
+		var val [8]byte
+		val[0] = 1
+		_, _ = unix.Write(w.h2EventFD, val[:])
+	}
+	w.driverActionMu.Unlock()
+	// A standby worker parked in DRAINING→SUSPENDED does not read the
+	// eventfd; kick it (celeris#658). After releasing driverActionMu:
+	// wakeMu is a leaf lock.
+	w.wakeIfSuspended()
+	return nil
 }
 
 // RegisterConn adds fd to this worker's driver map and schedules a single-shot

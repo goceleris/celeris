@@ -300,15 +300,40 @@ func (e *Engine) ResumeAccept() error {
 		// blocks on the new listen FD rather than the previously-closed
 		// one.
 		l.listenFDClosed.Store(false)
-		l.wakeMu.Lock()
-		if l.suspended.Load() {
-			close(l.wake)
-			l.wake = make(chan struct{})
-			l.suspended.Store(false)
-		}
-		l.wakeMu.Unlock()
+		l.wakeIfSuspended()
 	}
 	return nil
+}
+
+// wakeIfSuspended ends a DRAINING→SUSPENDED park: if the loop is parked, close
+// its wake channel, give it a fresh one and clear suspended. Safe from any
+// goroutine; a no-op on a loop that is running.
+//
+// The park waits on a Go channel, not in epoll_wait, so an eventfd write does
+// not end it — only this does. ResumeAccept is one caller. AdoptConn is the
+// other: it arrives from another goroutine while the loop has no connection
+// and no listener to wake it for, and without the kick a standby loop slept
+// through the adoption until the next ResumeAccept — forever, if the engine
+// stayed the standby — while the source already counted the hand-off done
+// (celeris#658).
+//
+// No wakeup can be lost. A waker publishes its work — sets the flag the park
+// watches — BEFORE it takes wakeMu, and the loop re-checks those flags UNDER
+// wakeMu before it sets suspended. The mutex serialises the two: if the loop's
+// check runs first, the waker finds suspended set and closes wake; if the
+// waker's runs first, the flag is already set and the loop does not park.
+//
+// Lock order: e.mu → wakeMu (ResumeAccept) is the only nesting. wakeMu is a
+// leaf — nothing is acquired while it is held — so no caller may hold adoptQMu
+// or detachQMu when it calls this.
+func (l *Loop) wakeIfSuspended() {
+	l.wakeMu.Lock()
+	if l.suspended.Load() {
+		close(l.wake)
+		l.wake = make(chan struct{})
+		l.suspended.Store(false)
+	}
+	l.wakeMu.Unlock()
 }
 
 var (

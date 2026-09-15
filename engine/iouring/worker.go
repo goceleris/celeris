@@ -450,6 +450,9 @@ type Worker struct {
 	driverActionSpare   []driverAction
 	driverActionMu      sync.Mutex
 	driverActionPending atomic.Int32
+	// adoptClosed is set under driverActionMu by closeAdoptQueue when the
+	// worker shuts down; AdoptConn refuses from then on (celeris#658).
+	adoptClosed bool
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring
@@ -1351,11 +1354,21 @@ func (w *Worker) run(ctx context.Context) {
 		// epoll side lost one on its own detach queue: open, owned by
 		// nobody, no hook, no close. The same flag covers a queued driver
 		// register/unregister/write.
+		//
+		// Tested here alone, though, the flag is not enough: AdoptConn runs
+		// on another goroutine, so it can queue between this test and the
+		// park, and its eventfd write cannot end a park. That lost wakeup is
+		// celeris#658 — the adopt sat queued on a standby worker until the
+		// next ResumeAccept, forever if none came. So the flags are
+		// re-checked under wakeMu below, and every driver-action enqueue
+		// kicks a parked worker through wakeIfSuspended; see there for why
+		// the pair cannot lose a wakeup.
 		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
 			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
 			w.acceptPaused.Load() {
 			w.wakeMu.Lock()
-			if !w.acceptPaused.Load() {
+			if !w.acceptPaused.Load() ||
+				w.driverActionPending.Load() != 0 || w.detachQPending.Load() != 0 {
 				w.wakeMu.Unlock()
 				continue
 			}
@@ -5054,6 +5067,12 @@ func connSendPending(cs *connState) bool {
 }
 
 func (w *Worker) shutdown() {
+	// First: close every adoption still queued, and refuse every AdoptConn
+	// from here on. Everything below walks the conn table only, which a
+	// queued adoption is not in yet — and closeAdoptQueue must run before
+	// h2EventFD is closed, because addAdoptAction writes it under the same
+	// lock (celeris#658).
+	w.closeAdoptQueue()
 	// Fire onClose for every registered driver conn before tearing down
 	// ring/listen fd. Otherwise driver callbacks are silently dropped.
 	w.shutdownDrivers()

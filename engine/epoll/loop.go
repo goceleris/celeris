@@ -185,6 +185,9 @@ type Loop struct {
 	adoptQMu      sync.Mutex
 	adoptQSpare   []adoptItem
 	adoptQPending atomic.Int32
+	// adoptQClosed is set under adoptQMu by closeAdoptQueue when the loop
+	// shuts down; AdoptConn refuses from then on (celeris#658).
+	adoptQClosed bool
 
 	// asyncWG tracks runAsyncHandler goroutines so graceful shutdown
 	// can Wait on them before returning. Without this the engine's
@@ -728,14 +731,24 @@ func (l *Loop) run(ctx context.Context) {
 		// increment (tryTransplant) and its decrement
 		// (finishTransplantHandoff) run on THIS thread, so it cannot go
 		// nonzero between the test and the park. The two queue flags are
-		// defence in depth for future deferred work — every other enqueue
-		// site holds a conn in the table, so connCount > 0 already keeps
-		// the loop awake for them.
+		// NOT race-free, and for the adopt queue that matters: AdoptConn
+		// arrives from another goroutine with nothing in this loop's table,
+		// so it can enqueue between this test and the park, and its eventfd
+		// write cannot end a park. That lost wakeup left a relinquished
+		// descriptor queued on a standby loop until the next ResumeAccept —
+		// forever, if none came (celeris#658). The flags are therefore
+		// re-checked under wakeMu below, and AdoptConn kicks a parked loop
+		// through wakeIfSuspended; see there for why the pair cannot lose a
+		// wakeup. (Every detach-queue enqueue still happens with the conn in
+		// the table, under transplantInFlight, or for a conn that is already
+		// closed, so the detach flag needs no kick — the re-check is for
+		// symmetry.)
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
 			l.transplantInFlight == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
 			l.wakeMu.Lock()
-			if !l.acceptPaused.Load() {
+			if !l.acceptPaused.Load() ||
+				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {
 				l.wakeMu.Unlock()
 				continue
 			}
@@ -2727,6 +2740,10 @@ func (l *Loop) closeConn(fd int) {
 }
 
 func (l *Loop) shutdown() {
+	// First: close every adoption still queued, and refuse every AdoptConn
+	// from here on. Everything below walks the conn table only, which a
+	// queued adoption is not in yet (celeris#658).
+	l.closeAdoptQueue()
 	l.shutdownDrivers()
 
 	// Phase 1: signal every async dispatch / detached goroutine to stop and
