@@ -486,6 +486,7 @@ func activeName(e *Engine) string {
 func rampScenario(t *testing.T, h stream.Handler, cfg resource.Config, client func(string, <-chan struct{}, *atomic.Int64, *atomic.Int64), async bool) {
 	e, addr, stop := newRampAdaptive(t, h, cfg)
 	defer stop()
+	requireUpSwitch(t, e)
 	p := &rampPool{addr: addr, client: client}
 	defer p.stopAll()
 
@@ -640,6 +641,7 @@ func TestRampAutoMixedH1H2(t *testing.T) {
 	}
 	e, addr, stop := newRampAdaptive(t, respHandler{}, resource.Config{Protocol: engine.Auto, EnableH2Upgrade: true})
 	defer stop()
+	requireUpSwitch(t, e)
 
 	const heldH2 = 32
 	h2 := &rampPool{addr: addr, client: h2cClient}
@@ -699,6 +701,7 @@ func TestRampAutoMixedAsync(t *testing.T) {
 	}
 	e, addr, stop := newRampAdaptive(t, asyncRespHandler{}, resource.Config{Protocol: engine.Auto, EnableH2Upgrade: true, AsyncHandlers: true})
 	defer stop()
+	requireUpSwitch(t, e)
 
 	const heldH2 = 32
 	h2 := &rampPool{addr: addr, client: h2cClient}
