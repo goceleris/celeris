@@ -50,10 +50,11 @@ func bucketDeltas(before, after engine.EngineMetrics) map[string]uint64 {
 //
 // Pausing an io_uring engine cancels each worker's in-flight multishot accept
 // and closes its listen descriptor. The kernel completes the cancelled accept
-// with -ECANCELED, and the re-arm that raced the close completes with -EBADF;
-// both reach handleAccept's c.Res < 0 branch, and both used to be a bare
-// ErrorCount bump indistinguishable from an EMFILE drop or a conn-table
-// overflow — the two causes that actually lose a connection.
+// with -ECANCELED, which reaches handleAccept's c.Res < 0 branch and used to be
+// a bare ErrorCount bump indistinguishable from an EMFILE drop or a conn-table
+// overflow — the two causes that actually lose a connection. (The pause also
+// used to re-arm accept on the descriptor it closed, adding an -EBADF per
+// worker; celeris#662 removed that re-arm.)
 //
 // PauseAccept is not an incidental path on the adaptive engine: it runs on
 // every switch, once per worker. So this is the per-switch floor under
@@ -82,8 +83,8 @@ func TestPauseAcceptChargesItsTeardownToAcceptCancelled(t *testing.T) {
 	if err := eng.PauseAccept(); err != nil {
 		t.Fatalf("PauseAccept: %v", err)
 	}
-	// PauseAccept returns once the listen descriptors are closed; the -EBADF
-	// completion for a re-arm that raced the close lands an iteration later.
+	// PauseAccept returns once the listen descriptors are closed; anything
+	// the pause queued on the ring completes an iteration later.
 	time.Sleep(300 * time.Millisecond)
 	after := eng.Metrics()
 
