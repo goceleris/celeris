@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -29,7 +30,9 @@ type Engine struct {
 	metrics      struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
-		errCount    atomic.Uint64
+		// errs is the per-cause ErrorCount breakdown (celeris#645).
+		// EngineMetrics.ErrorCount is its sum; no separate total exists.
+		errs errclass.Counters
 		// asyncPromoted counts inline → dispatch-goroutine promotions
 		// across all loops (celeris #300).
 		asyncPromoted atomic.Uint64
@@ -112,7 +115,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 	for i := range resolved.Workers {
 		l := newLoop(i, cpus[i], e.handler,
 			resolved, e.cfg,
-			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errCount,
+			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errs,
 			&e.metrics.asyncPromoted, &e.acceptPaused,
 			&e.metrics.acceptCount, &e.metrics.closeCount,
 			&e.metrics.bytesRead, &e.metrics.bytesWritten)
@@ -189,10 +192,9 @@ func (e *Engine) Sendfile(fdOut int, file *os.File, offset, length int64, header
 
 // Metrics returns a snapshot of engine metrics.
 func (e *Engine) Metrics() engine.EngineMetrics {
-	return engine.EngineMetrics{
+	m := engine.EngineMetrics{
 		RequestCount:       e.metrics.reqCount.Load(),
 		ActiveConnections:  e.metrics.activeConns.Load(),
-		ErrorCount:         e.metrics.errCount.Load(),
 		AsyncRoutes:        e.asyncRoutes,
 		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
 		Workers:            len(e.loops),
@@ -205,6 +207,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantDetached:          e.metrics.transplantDetached.Load(),
 		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
 	}
+	// ErrorCount and its eleven buckets, together, from one snapshot
+	// (celeris#645).
+	engine.FillErrorClasses(&m, e.metrics.errs.Snapshot())
+	return m
 }
 
 // Type returns the engine type.

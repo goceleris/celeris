@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -44,7 +45,7 @@ func newLedgerLoop(t *testing.T) *Loop {
 		activeConns:            &atomic.Int64{},
 		closeCount:             &atomic.Uint64{},
 		acceptCount:            &atomic.Uint64{},
-		errCount:               &atomic.Uint64{},
+		errs:                   &errclass.Counters{},
 		bytesRead:              &atomic.Uint64{},
 		bytesWritten:           &atomic.Uint64{},
 		transplantAdopted:      &atomic.Uint64{},
@@ -115,8 +116,8 @@ func TestAttachAdoptedFDCountsTheAdopt(t *testing.T) {
 	l.attachAdoptedFD(context.Background(), fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"}, time.Now().UnixNano())
 
 	if l.conns[fd] == nil {
-		t.Fatalf("fd %d was not adopted (errCount=%d) — test setup, not the counter",
-			fd, l.errCount.Load())
+		t.Fatalf("fd %d was not adopted (errors=%d) — test setup, not the counter",
+			fd, l.errs.Total())
 	}
 	t.Cleanup(func() { _ = unix.Close(fd) })
 	if got := l.transplantAdopted.Load(); got != 1 {
@@ -145,8 +146,12 @@ func TestAttachAdoptedFDCountsAnOccupiedSlot(t *testing.T) {
 		t.Errorf("transplantSlotOccupied = %d, want 1 — the refusal is still "+
 			"indistinguishable from every other ErrorCount bump", got)
 	}
-	if got := l.errCount.Load(); got != 1 {
-		t.Errorf("errCount = %d, want 1 (the generic counter must still move)", got)
+	if got := l.errs.TransplantAdopt.Load(); got != 1 {
+		t.Errorf("errs.TransplantAdopt = %d, want 1 (celeris#645: the refusal must "+
+			"be counted in the adoption bucket, not folded into the generic total)", got)
+	}
+	if got := l.errs.Total(); got != 1 {
+		t.Errorf("errs.Total() = %d, want 1 (ErrorCount must still move)", got)
 	}
 	if l.conns[fd] != occupant {
 		t.Error("the occupied slot was clobbered")

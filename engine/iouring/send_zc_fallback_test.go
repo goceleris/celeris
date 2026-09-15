@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/resource"
 )
@@ -133,7 +134,7 @@ func newZCFallbackWorker(t *testing.T, n int) (*Worker, []*zcConn) {
 		ring:        ring,
 		conns:       make([]*connState, maxFD+1),
 		liveConns:   make([]int, 0, n),
-		errCount:    &atomic.Uint64{},
+		errs:        &errclass.Counters{},
 		activeConns: &atomic.Int64{},
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},
@@ -204,7 +205,7 @@ func runSiblingCase(t *testing.T, errno unix.Errno, complete func(*zcConn, *Work
 			"the fixture never reached the state under test", errno)
 	}
 
-	errsBefore := w.errCount.Load()
+	errsBefore := w.errs.Total()
 	complete(sibling, w, errno)
 
 	if errs := sibling.failures(); len(errs) != 0 {
@@ -215,7 +216,7 @@ func runSiblingCase(t *testing.T, errno unix.Errno, complete func(*zcConn, *Work
 			"provenance, not on the worker's forward-looking w.sendZC flag",
 			errno, errs)
 	}
-	if got := w.errCount.Load() - errsBefore; got != 0 {
+	if got := w.errs.Total() - errsBefore; got != 0 {
 		t.Errorf("celeris#609: the sibling's %v completion counted %d engine error(s); "+
 			"a fallback is not an error", errno, got)
 	}
@@ -280,7 +281,7 @@ func TestPlainSendErrorStillFailsTheConnection(t *testing.T) {
 		t.Error("a plain SEND that failed with ENOMEM was silently swallowed; " +
 			"only zero-copy sends have a fallback to retry into")
 	}
-	if w.errCount.Load() == 0 {
-		t.Error("a plain SEND failure was not counted as an engine error")
+	if w.errs.Send.Load() == 0 {
+		t.Error("a plain SEND failure was not counted in the celeris#645 send bucket")
 	}
 }

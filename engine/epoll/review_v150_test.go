@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/resource"
 )
@@ -177,7 +178,7 @@ func TestAcceptAllDrainsBacklogNoStrand(t *testing.T) {
 		conns:        make([]*connState, connTableSize),
 		liveConns:    make([]int, 0, 256),
 		activeConns:  &atomic.Int64{},
-		errCount:     &atomic.Uint64{},
+		errs:         &errclass.Counters{},
 		reqCount:     &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},
 		closeCount:   &atomic.Uint64{},

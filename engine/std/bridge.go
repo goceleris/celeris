@@ -63,12 +63,12 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = r.Body.Close()
 		if err != nil {
-			b.engine.metrics.errCount.Add(1)
+			b.engine.metrics.errs.RequestBody.Add(1)
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
 		}
 		if maxBodySize > 0 && int64(len(body)) > maxBodySize {
-			b.engine.metrics.errCount.Add(1)
+			b.engine.metrics.errs.RequestBody.Add(1)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -103,7 +103,7 @@ func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.OnWSDetachClose = func(fn func()) { context.AfterFunc(rctx, fn) }
 
 	if err := b.handler.HandleStream(rctx, s); err != nil {
-		b.engine.metrics.errCount.Add(1)
+		b.engine.metrics.errs.Handler.Add(1)
 		if !rw.flushed {
 			http.Error(w, "handler error", http.StatusInternalServerError)
 		}

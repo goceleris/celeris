@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"os"
+
+	"github.com/goceleris/celeris/engine/internal/errclass"
 )
 
 // Engine is the interface that all I/O engine implementations must satisfy.
@@ -87,8 +89,87 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	RequestCount uint64
 	// ActiveConnections is the current number of open connections.
 	ActiveConnections int64
-	// ErrorCount is the cumulative number of connection-level or protocol errors.
+	// ErrorCount is the cumulative number of connection-level or protocol
+	// errors. It is the SUM of the eleven Error* buckets below and is derived
+	// from them rather than counted alongside them, so the total and the
+	// parts cannot disagree. Read the buckets to find out what happened;
+	// this field only says how much of it there was.
 	ErrorCount uint64
+	// ErrorAcceptFDLimit is the share of ErrorCount from accepts refused
+	// for want of a descriptor: EMFILE (per-process) or ENFILE
+	// (system-wide). Populated by epoll and io_uring.
+	ErrorAcceptFDLimit uint64
+	// ErrorAcceptCancelled is the share of ErrorCount from accept failures
+	// that mean the accept went away rather than the host running out of
+	// something: ECANCELED and EBADF (the listen descriptor was cancelled
+	// and closed under it, which is exactly what PauseAccept does),
+	// ECONNABORTED and EINTR.
+	//
+	// This is the bucket a PauseAccept lands in, so on the adaptive engine
+	// it is a per-switch cost rather than a fault, and it is the one that
+	// separates a switch transient from a sustained accept-side loss. Note
+	// the asymmetry it exposes: io_uring reports all four through a
+	// completion and counts them, while epoll's accept4 loop retries
+	// ECONNABORTED and EINTR in place and counts neither — so an epoll
+	// column reading 0 next to a nonzero io_uring column on the same
+	// refapp is partly this, not a difference in what the two engines
+	// suffered.
+	ErrorAcceptCancelled uint64
+	// ErrorAcceptOther is the share of ErrorCount from accept failures
+	// that are neither of the two above.
+	ErrorAcceptOther uint64
+	// ErrorConnTableCap is the share of ErrorCount from descriptors
+	// dropped because they fall outside the worker's flat connection
+	// table — the epoll conn-table cap and io_uring's equivalent bound —
+	// counted on both the accept path and the transplant adoption path.
+	// The descriptor is closed and the connection is lost, so a nonzero
+	// value means a worker is at its per-worker connection limit.
+	ErrorConnTableCap uint64
+	// ErrorConnRegister is the share of ErrorCount from descriptors
+	// dropped because registering them with the event loop failed
+	// (epoll_ctl ADD), on both the accept and the adoption path. epoll
+	// only.
+	ErrorConnRegister uint64
+	// ErrorListenerRecreate is the share of ErrorCount from failures to
+	// re-create a listen socket after a ResumeAccept. The loop or worker
+	// that hits one shuts itself down, so a nonzero value is an engine
+	// that has permanently lost accept capacity on that worker.
+	ErrorListenerRecreate uint64
+	// ErrorTransplantAdopt is the share of ErrorCount from adoptions
+	// refused because the target's conn-table slot for that descriptor was
+	// already occupied. It tracks TransplantAdoptSlotOccupied exactly; the
+	// same event is counted in both because it is both a lost hand-off and
+	// an error, and celeris#624's hand-off ledger has to stand on its own.
+	ErrorTransplantAdopt uint64
+	// ErrorSendPeerGone is the share of ErrorCount from send completions
+	// that failed because the peer was already gone — EPIPE, ECONNRESET,
+	// ECONNABORTED, ENOTCONN. One count per connection whose client
+	// stopped reading before its response flushed, so it measures how
+	// often clients abandon requests and scales with offered load and
+	// client timeouts, not with any server fault.
+	//
+	// io_uring only, and that asymmetry is the finding behind celeris#645:
+	// epoll reports a dead peer through the handler's OnError and has
+	// never fed ErrorCount at all, so the SAME abandoned request costs
+	// io_uring one ErrorCount and epoll zero. Any epoll-vs-io_uring
+	// ErrorCount comparison is dominated by this bucket, and on the
+	// adaptive engine it switches on at the promotion — not because
+	// anything started failing, but because the sub-engine that counts it
+	// started serving.
+	ErrorSendPeerGone uint64
+	// ErrorSend is the share of ErrorCount from send completions that
+	// failed for any other reason — a genuine transmit fault rather than a
+	// client that left. io_uring only, for the same reason as
+	// ErrorSendPeerGone.
+	ErrorSend uint64
+	// ErrorRequestBody is the share of ErrorCount from requests rejected
+	// before the handler ran because the body would not read or exceeded
+	// MaxRequestBodySize. std only.
+	ErrorRequestBody uint64
+	// ErrorHandler is the share of ErrorCount from handler invocations
+	// that returned an error. std only — the native engines do not fold a
+	// handler error into ErrorCount.
+	ErrorHandler uint64
 	// Throughput is the recent requests-per-second rate.
 	Throughput float64
 	// AsyncRoutes is the count of routes registered with .Async(true) on
@@ -265,6 +346,15 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// adaptive engine's STANDBY sub-engine, on the same split as
 	// StandbyActiveConnections. Zero on every non-adaptive engine.
 	StandbyCloseCount uint64
+	// StandbyErrorCount is the share of ErrorCount contributed by the
+	// adaptive engine's STANDBY sub-engine, on the same split as
+	// StandbyActiveConnections — the other half of celeris#645's question.
+	// The cause buckets say WHAT went wrong; this says which sub-engine it
+	// went wrong on, and the two together are what turn a single adaptive
+	// number into "the standby's accepts were cancelled at the promotion"
+	// or "the promoted engine is failing sends". Zero on every
+	// non-adaptive engine and while the lazy standby is unbuilt.
+	StandbyErrorCount uint64
 	// TransplantAdopted is the cumulative number of connections this engine
 	// has ADOPTED from the other engine through
 	// [TransplantTarget.AdoptConn] (#383). The adopting side fires no
@@ -302,4 +392,30 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// that run. Zero on other engines, whose close paths hold a non-nil
 	// connection state by construction.
 	CloseMissingConnState uint64
+}
+
+// FillErrorClasses copies one engine's per-cause error tally into m and
+// derives ErrorCount from it. It is the single wiring point between
+// [errclass.Snapshot] and the Error* fields of EngineMetrics, so a bucket
+// added to the former has exactly one place to be forgotten in — and
+// TestFillErrorClassesSetsEveryBucket fails when it is.
+//
+// ErrorCount is assigned here, from the buckets, and nowhere else. No engine
+// keeps a separate running total that could drift from its parts.
+//
+// The errclass argument type is internal, so this is reachable only from
+// within engine/... — the sub-engines that own the counters.
+func FillErrorClasses(m *EngineMetrics, s errclass.Snapshot) {
+	m.ErrorCount = s.Total()
+	m.ErrorAcceptFDLimit = s.AcceptFDLimit
+	m.ErrorAcceptCancelled = s.AcceptCancelled
+	m.ErrorAcceptOther = s.AcceptOther
+	m.ErrorConnTableCap = s.ConnTableCap
+	m.ErrorConnRegister = s.ConnRegister
+	m.ErrorListenerRecreate = s.ListenerRecreate
+	m.ErrorTransplantAdopt = s.TransplantAdopt
+	m.ErrorSendPeerGone = s.SendPeerGone
+	m.ErrorSend = s.Send
+	m.ErrorRequestBody = s.RequestBody
+	m.ErrorHandler = s.Handler
 }

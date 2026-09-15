@@ -3,8 +3,9 @@
 package iouring
 
 import (
-	"sync/atomic"
 	"testing"
+
+	"github.com/goceleris/celeris/engine/internal/errclass"
 )
 
 // TestPrepareRecvRefusesSecondArm guards the corruption found in celeris#484.
@@ -22,7 +23,7 @@ import (
 // callers act on — a false would make them set needsRecv and retry forever.
 func TestPrepareRecvRefusesSecondArm(t *testing.T) {
 	ring := newTestRing(t)
-	w := &Worker{ring: ring, errCount: &atomic.Uint64{}}
+	w := &Worker{ring: ring, errs: &errclass.Counters{}}
 
 	cs := &connState{fd: 7, generation: 3, buf: make([]byte, 4096)}
 

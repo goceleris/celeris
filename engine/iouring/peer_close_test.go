@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/resource"
 )
@@ -43,7 +44,7 @@ func TestPeerCloseSurfacesEOF(t *testing.T) {
 		ring:        ring,
 		conns:       make([]*connState, local+1),
 		liveConns:   make([]int, 0, 4),
-		errCount:    &atomic.Uint64{},
+		errs:        &errclass.Counters{},
 		activeConns: &atomic.Int64{},
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},

@@ -21,6 +21,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/internal/bindiag"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
@@ -328,9 +329,12 @@ type Worker struct {
 	// RST as it pauses).
 	listenFDClosed atomic.Bool
 
-	reqCount        *atomic.Uint64
-	activeConns     *atomic.Int64
-	errCount        *atomic.Uint64
+	reqCount    *atomic.Uint64
+	activeConns *atomic.Int64
+	// errs is the engine-wide per-cause ErrorCount breakdown, shared by
+	// every worker (celeris#645). There is no aggregate counter beside it:
+	// EngineMetrics.ErrorCount is the sum of these buckets.
+	errs            *errclass.Counters
 	asyncPromoted   *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
 	acceptCount     *atomic.Uint64 // cumulative accepts (engine-wide, shared)
 	closeCount      *atomic.Uint64 // cumulative closes (engine-wide, shared)
@@ -732,7 +736,7 @@ func (w *Worker) noteRecvTerminal(cs *connState) {
 
 func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 	resolved resource.ResolvedResources,
-	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errCount *atomic.Uint64,
+	cfg resource.Config, reqCount *atomic.Uint64, activeConns *atomic.Int64, errs *errclass.Counters,
 	asyncPromoted *atomic.Uint64, acceptPaused *atomic.Bool,
 	acceptCount, closeCount, bytesRead, bytesWritten *atomic.Uint64) (*Worker, error) { //nolint:unparam // error return used by callers for future fallible init
 
@@ -759,7 +763,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		logger:        cfg.Logger,
 		reqCount:      reqCount,
 		activeConns:   activeConns,
-		errCount:      errCount,
+		errs:          errs,
 		asyncPromoted: asyncPromoted,
 		acceptCount:   acceptCount,
 		closeCount:    closeCount,
@@ -986,6 +990,10 @@ func (w *Worker) run(ctx context.Context) {
 		if w.listenFD < 0 && !paused {
 			fd, err := createListenSocket(w.cfg.Addr)
 			if err != nil {
+				// This worker is about to stop accepting for good, so
+				// the bump is not a rate: it is the one record that
+				// the engine lost a listener (celeris#645).
+				w.errs.ListenerRecreate.Add(1)
 				w.logger.Error("re-create listen socket", "worker", w.id, "err", err)
 				w.shutdown()
 				return
@@ -1712,7 +1720,13 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			}
 			return
 		}
-		w.errCount.Add(1)
+		// Classify by errno rather than folding every failed accept into
+		// one number (celeris#645). The cancel-and-close pair a
+		// PauseAccept leaves behind (ECANCELED on the in-flight multishot,
+		// then EBADF on the re-arm that raced the close) lands in
+		// ErrorAcceptCancelled, which is what makes an adaptive switch's
+		// accept cost separable from a sustained accept-side loss.
+		w.errs.AcceptFailed(unix.Errno(-c.Res))
 		// Re-arm accept whenever the kernel is not going to deliver more
 		// CQEs from the current SQE. In single-shot mode !cqeHasMore is
 		// always true (each accept produces exactly one CQE), so this
@@ -1752,7 +1766,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 		if !isFixedFile {
 			_ = unix.Close(newFD)
 		}
-		w.errCount.Add(1)
+		w.errs.ConnTableCap.Add(1)
 		return
 	}
 
@@ -2941,7 +2955,12 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	}
 
 	if c.Res < 0 {
-		w.errCount.Add(1)
+		// A peer that left before the response flushed gets its own
+		// bucket (celeris#645): it is one count per abandoned request,
+		// not an engine fault, and it is the bucket an io_uring column
+		// carries while the epoll column of the same refapp counts
+		// nothing at all.
+		w.errs.SendFailed(unix.Errno(-c.Res))
 		// cs.sending / cs.sendBuf are read by the inline-egress guard under
 		// detachMu; reset them (and writeBuf) inside the lock rather than before
 		// it, so the dispatch-goroutine read never races this error completion.
@@ -3088,7 +3107,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	}
 
 	if sent < 0 {
-		w.errCount.Add(1)
+		w.errs.SendFailed(unix.Errno(-sent))
 		cs.sendBuf = cs.sendBuf[:0]
 		cs.writeBuf = cs.writeBuf[:0]
 		cs.sendBody = nil

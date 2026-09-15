@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/resource"
 )
 
@@ -27,7 +28,7 @@ func TestCheckTimeoutsClosesFDZero(t *testing.T) {
 	w := &Worker{
 		conns:     make([]*connState, 1024),
 		liveConns: make([]int, 0, 8),
-		errCount:  &atomic.Uint64{},
+		errs:      &errclass.Counters{},
 		// sending=true routes the timeout check to the WriteTimeout branch.
 		cfg: resource.Config{WriteTimeout: time.Second},
 	}
@@ -63,7 +64,7 @@ func TestCheckTimeoutsSwapRemoveNoSkip(t *testing.T) {
 	w := &Worker{
 		conns:       make([]*connState, 65536),
 		liveConns:   make([]int, 0, n),
-		errCount:    &atomic.Uint64{},
+		errs:        &errclass.Counters{},
 		activeConns: &atomic.Int64{},
 		closeCount:  &atomic.Uint64{},
 		cfg:         resource.Config{IdleTimeout: time.Second},

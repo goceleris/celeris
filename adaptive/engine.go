@@ -907,12 +907,28 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 	// rule without naming fields, so the next one added cannot be dropped
 	// the same way.
 	return engine.EngineMetrics{
-		RequestCount:       pm.RequestCount + sm.RequestCount,
-		ActiveConnections:  pm.ActiveConnections + sm.ActiveConnections,
-		ErrorCount:         pm.ErrorCount + sm.ErrorCount,
-		Throughput:         pm.Throughput + sm.Throughput,
-		AsyncRoutes:        asyncRoutes,
-		AsyncPromotedConns: pm.AsyncPromotedConns + sm.AsyncPromotedConns,
+		RequestCount:      pm.RequestCount + sm.RequestCount,
+		ActiveConnections: pm.ActiveConnections + sm.ActiveConnections,
+		ErrorCount:        pm.ErrorCount + sm.ErrorCount,
+		// The celeris#645 cause split. Every bucket is cumulative and
+		// engine-local, so every one of them adds — and because each
+		// sub-engine derives its own ErrorCount as the sum of its
+		// buckets, summing the buckets here keeps the adaptive total
+		// equal to the adaptive parts as well.
+		ErrorAcceptFDLimit:    pm.ErrorAcceptFDLimit + sm.ErrorAcceptFDLimit,
+		ErrorAcceptCancelled:  pm.ErrorAcceptCancelled + sm.ErrorAcceptCancelled,
+		ErrorAcceptOther:      pm.ErrorAcceptOther + sm.ErrorAcceptOther,
+		ErrorConnTableCap:     pm.ErrorConnTableCap + sm.ErrorConnTableCap,
+		ErrorConnRegister:     pm.ErrorConnRegister + sm.ErrorConnRegister,
+		ErrorListenerRecreate: pm.ErrorListenerRecreate + sm.ErrorListenerRecreate,
+		ErrorTransplantAdopt:  pm.ErrorTransplantAdopt + sm.ErrorTransplantAdopt,
+		ErrorSendPeerGone:     pm.ErrorSendPeerGone + sm.ErrorSendPeerGone,
+		ErrorSend:             pm.ErrorSend + sm.ErrorSend,
+		ErrorRequestBody:      pm.ErrorRequestBody + sm.ErrorRequestBody,
+		ErrorHandler:          pm.ErrorHandler + sm.ErrorHandler,
+		Throughput:            pm.Throughput + sm.Throughput,
+		AsyncRoutes:           asyncRoutes,
+		AsyncPromotedConns:    pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 		// Workers is summed, not taken from the active sub-engine: both
 		// exist simultaneously (the standby keeps its loops up and keeps
 		// serving its pinned keep-alives), so the sum is the divisor that
@@ -952,10 +968,16 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ZCNotifs:         pm.ZCNotifs + sm.ZCNotifs,
 		InlineBytes:      pm.InlineBytes + sm.InlineBytes,
 		RingBytes:        pm.RingBytes + sm.RingBytes,
-		// The standby's share of the two gauges above — the only fields
-		// here that are NOT sums (celeris#624).
+		// The standby's share — the only fields here that are NOT sums
+		// (celeris#624, celeris#645).
 		StandbyActiveConnections: standby.ActiveConnections,
 		StandbyCloseCount:        standby.CloseCount,
+		// The third of the deliberately-one-sided fields (celeris#645).
+		// The buckets above say what went wrong; this says which
+		// sub-engine it went wrong on, and only the pair can tell a
+		// standby that is losing accepts at the promotion from a
+		// promoted engine that is failing sends.
+		StandbyErrorCount: standby.ErrorCount,
 		// The #383 hand-off ledger. Both halves of a transplant are
 		// cumulative and land on opposite sub-engines, so summing them is
 		// what makes TransplantDetached - TransplantAdopted the count of

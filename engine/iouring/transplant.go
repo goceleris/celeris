@@ -62,7 +62,7 @@ var _ engine.TransplantTarget = (*Engine)(nil)
 func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	if newFD < 0 || newFD >= len(w.conns) {
 		_ = unix.Close(newFD)
-		w.errCount.Add(1)
+		w.errs.ConnTableCap.Add(1)
 		return
 	}
 	if w.conns[newFD] != nil {
@@ -77,7 +77,7 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 		// bumps, which every other error path shares. The connection is
 		// lost here with no close and no hook, so it gets its own counter
 		// (celeris#624) and the claim becomes checkable.
-		w.errCount.Add(1)
+		w.errs.TransplantAdopt.Add(1)
 		if w.transplantSlotOccupied != nil {
 			w.transplantSlotOccupied.Add(1)
 		}
