@@ -167,6 +167,13 @@ func envInt589(name string, def int) int {
 //     first slow inline run promotes the route immediately, later runs go async.
 //     The learning state is ESTABLISHED, not hoped for (celeris#620 fault 2).
 //
+// Both controls' latency observable is RELATIVE too (celeris#628). They used
+// to end on the same absolute 5 ms bar celeris#622 took off the settled arm —
+// and it failed them 3 runs in 20 on a loaded box, at 8.56 ms and 5.43 ms,
+// after their state assertions had already proven the worker free. They now
+// divide what a blocked Set costs a client in the same window (the /kv
+// hammer's own median) by the /ping median: assertCtlWorkerFree628.
+//
 // Every warm-up here runs against a FAST store, so a promotion during warm-up
 // is runner jitter, never a property of the tree under test: handler.go calls
 // promoteRouteImmediate on a SINGLE inline run over adaptiveBlockingThreshold,
@@ -314,6 +321,54 @@ const (
 	stall592MinSpeedup    = 5.0
 	stall592QueuedNotice  = 0.05
 	stall592MinRefSamples = 2
+
+	// The CONTROL arms' latency observable, celeris#628. Both controls used
+	// to end with `o.pingMed >= stall589StallBar` — the same absolute 5 ms of
+	// wall clock celeris#622 removed from the settled arm, one level down.
+	// Measured over 20 runs of this rig in CI's exact shape on a loaded box
+	// (load average ~30), 3 failed and the two captured were this line:
+	// io_uring negctrl_async at a /ping median of 8.56 ms and
+	// negctrl_learning at 5.43 ms. Both arms had already proven the state
+	// they exist to prove — route not adaptive/settled (or still learning),
+	// every /kv conn async-dispatched — so the failures said nothing about
+	// dispatch policy and everything about the runner. GitHub's hosted CI
+	// skips the io_uring arms, so the bar never reddened a pull request; it
+	// waits for the cluster.
+	//
+	// What a control claims is that the expected DIFFERENCE does not appear:
+	// /ping did not queue behind a blocked Set. So it is now judged as a
+	// comparison taken inside the run. The rig already has the pinned
+	// magnitude to divide by — what a blocked Set costs a client on THIS box
+	// under THIS load, measured by the /kv hammer over the very same window
+	// the /ping samples come from, by the same kind of keep-alive client
+	// against the same store. A worker that never waits for a Set answers
+	// /ping in a small fraction of one; a pinned one answers it in about one
+	// (the settled arm's pinned window measured 0.29-2.10 s of /ping against
+	// a 300 ms D, because each worker serves its /kv conns serially before
+	// the probe). stall592MinCtlSpeedup = 5 therefore says "/ping cost at
+	// most a fifth of one blocked Set, so it cannot have waited for one",
+	// and a loaded runner inflates both medians together.
+	//
+	// Measured, golang:1.27, --cpus 4, --ulimit memlock=128M, 28 spinners
+	// plus two cold-cache `go build -a` loops in the same cgroup, load
+	// average 1.3-39.7, 20 paired runs of CI's own command line alternating
+	// this binary with main's: 80 control arms, ratio 161.1x-1981.3x, none
+	// within an order of magnitude of the 5x bar. The same 80 arms put the
+	// old bar's worst case at 1.87 ms against its 5 ms — 2.7x from failing,
+	// where the ratio's worst case is 32.2x from failing. With async
+	// dispatch disabled (the difference the control exists to exclude made
+	// to appear) it collapses to 1.0-1.7x and all four arms fail.
+	//
+	// The legacy 5 ms median stays on the RESULT592 line (ping_med_ms) and
+	// gets a CTL628 notice line, unasserted, so the historical series and
+	// the old signal survive the change.
+	//
+	// stall592MinCtlRefSamples is the floor on the /kv window: below it there
+	// is no measured cost-of-a-Set to divide by and the ratio is skipped, the
+	// state assertions carrying the arm. Eight conns at ~D each over a 10 s
+	// window normally give a few hundred.
+	stall592MinCtlSpeedup    = 5.0
+	stall592MinCtlRefSamples = 4
 )
 
 // gatedKV wraps a store.KV whose Set is fast until the gate flips and then
@@ -333,6 +388,15 @@ func (g *gatedKV) Set(ctx context.Context, key string, value []byte, ttl time.Du
 		g.slowCalls.Add(1)
 	}
 	return g.KV.Set(ctx, key, value, ttl)
+}
+
+// kvSample589 is one completed /kv request: how long it took and when it
+// finished. The instant is what lets the control's reference median be taken
+// over exactly the /ping window rather than over the whole hammer run
+// (celeris#628).
+type kvSample589 struct {
+	done time.Time
+	lat  time.Duration
 }
 
 type stall589Mode int
@@ -402,6 +466,18 @@ type stall589Obs struct {
 	refQueued   int // reference samples > queuedBar (the pinned world's own rate, reported)
 	refQueuedFr float64
 
+	// The controls' in-run reference (celeris#628): what one blocked Set
+	// costs a keep-alive client on this box under this load, measured by the
+	// /kv hammer over the SAME window the /ping samples were taken in. Only
+	// requests that COMPLETED inside the window are counted, so the two
+	// medians carry the same runner. ctlSpeedup is kvMed/pingMed — a free
+	// worker answers /ping in a small fraction of a blocked Set, a pinned one
+	// in about one of them.
+	kvSamples  int
+	kvMed      time.Duration
+	kvMax      time.Duration
+	ctlSpeedup float64
+
 	stacks *stackTally589 // CELERIS_589_STACK diagnostic, nil otherwise
 }
 
@@ -464,6 +540,41 @@ func assertSettledRetimed592(o stall589Obs) error {
 	return nil
 }
 
+// assertCtlWorkerFree628 is the CONTROL arms' latency observable: with every
+// /kv conn on a dispatch goroutine, the engine worker never waits for the
+// blocked Set, so a /ping on a conn that shares those workers must cost a
+// small fraction of what one blocked Set costs — not "under 5 ms", which is a
+// statement about the runner (celeris#628).
+//
+// Both quantities come from the SAME window of the SAME run: o.pingMed is the
+// median of the /ping samples taken over it, o.kvMed the median of the /kv
+// requests that COMPLETED inside it, each measured client-side across a
+// keep-alive conn to the same engine. A loaded box inflates both, so the ratio
+// is a property of the dispatch policy rather than of the machine. It is
+// skipped only when the window caught fewer than stall592MinCtlRefSamples /kv
+// completions, in which case there is nothing measured to divide by and the
+// control's state assertions carry the arm.
+//
+// The pinned world it must exclude is the rig's own #589 signature: a /ping
+// that queues behind an in-flight Set costs ~D and usually several multiples
+// of it (0.29-2.10 s measured against a 300 ms D in the settled arm's pinned
+// window, because a worker serves its /kv conns serially before the probe), so
+// there the ratio is at or below 1.
+func assertCtlWorkerFree628(o stall589Obs) error {
+	if o.kvSamples < stall592MinCtlRefSamples || o.pingMed <= 0 {
+		return nil
+	}
+	if o.ctlSpeedup < stall592MinCtlSpeedup {
+		return fmt.Errorf("%s: /ping median %v is only %.1fx cheaper than one blocked Set (want >= %.0fx): "+
+			"%d /ping samples against a /kv median of %v over %d completions in the same window, same box, same run — "+
+			"a worker whose /kv conns are ALL async-dispatched must not be paying for the Set "+
+			"(async_promoted_conns=%d kv_conns=%d)",
+			o.engine, o.pingMed, o.ctlSpeedup, stall592MinCtlSpeedup,
+			o.samples, o.kvMed, o.kvSamples, o.asyncPromotedConns, o.kvConns)
+	}
+	return nil
+}
+
 // queuedBar589 is the latency at which a /ping sample is counted as having
 // waited for the blocked Set rather than for the scheduler: half the delay the
 // rig itself injects into the store (D/2 = 150 ms at the default D). It is
@@ -521,8 +632,8 @@ func TestAdaptiveSettledRouteRetime592(t *testing.T) {
 					ctlErr = errors.New("explicit .Async() route must not be adaptive/settled")
 				case int(o.asyncPromotedConns) < o.kvConns:
 					ctlErr = fmt.Errorf("AsyncPromotedConns=%d < %d /kv conns", o.asyncPromotedConns, o.kvConns)
-				case o.pingMed >= stall589StallBar:
-					ctlErr = fmt.Errorf("/ping median %v >= %v with the same blocked Set", o.pingMed, stall589StallBar)
+				default:
+					ctlErr = assertCtlWorkerFree628(o)
 				}
 				if ctlErr != nil {
 					verdict = "CONTROL_BROKEN"
@@ -546,8 +657,8 @@ func TestAdaptiveSettledRouteRetime592(t *testing.T) {
 					ctlErr = errors.New("the first >2ms inline run must promote a learning route (isPromoted=false)")
 				case int(o.asyncPromotedConns) < o.kvConns:
 					ctlErr = fmt.Errorf("AsyncPromotedConns=%d < %d /kv conns", o.asyncPromotedConns, o.kvConns)
-				case o.pingMed >= stall589StallBar:
-					ctlErr = fmt.Errorf("/ping median %v >= %v after the first inline run per worker", o.pingMed, stall589StallBar)
+				default:
+					ctlErr = assertCtlWorkerFree628(o)
 				}
 				if ctlErr != nil {
 					verdict = "CONTROL_BROKEN"
@@ -575,12 +686,14 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 		"pre_sample_ms=%.0f window_ms=%.0f samples=%d stalled=%d stalled_frac=%.3f stalled_time_ms=%.0f "+
 		"ping_min_ms=%.3f ping_med_ms=%.3f ping_max_ms=%.3f "+
 		"queued_bar_ms=%.0f queued=%d queued_frac=%.3f speedup=%.1f "+
+		"kv_samples=%d kv_med_ms=%.3f kv_max_ms=%.3f ctl_speedup=%.1f "+
 		"ref_samples=%d ref_window_ms=%.0f ref_ping_med_ms=%.3f ref_ping_max_ms=%.3f ref_stalled=%d ref_queued_frac=%.3f claim589_assert=%s",
 		o.engine, o.mode, stall589RunSeq.Add(1), verdict, o.settledBefore, o.promotedBefore, o.adaptive, o.settledAtFlip,
 		o.settledAfter, o.promotedAfter, o.promotedInBound, ms(o.promoteLatency), o.asyncPromotedConns, o.workers, o.kvConns, o.gomaxprocs, o.warmReqs, o.depromotions, o.slowCalls, o.kvReqs,
 		ms(o.preSample), ms(o.window), o.samples, o.stalled, o.stalledFrac, ms(o.stalledTime),
 		ms(o.pingMin), ms(o.pingMed), ms(o.pingMax),
 		ms(o.queuedBar), o.queued, o.queuedFrac, o.speedup,
+		o.kvSamples, ms(o.kvMed), ms(o.kvMax), o.ctlSpeedup,
 		o.refSamples, ms(o.refWindow), ms(o.refPingMed), ms(o.refPingMax), o.refStalled, o.refQueuedFr, claim)
 	if o.stacks != nil {
 		t.Logf("STACKTALLY589 engine=%s mode=%s stalled=%d %s", o.engine, o.mode, o.stalled, o.stacks.String())
@@ -616,6 +729,17 @@ func logStall589(t *testing.T, o stall589Obs, verdict string, claimErr error) {
 		t.Logf("QUEUED592 engine=%s mode=settled queued=%d/%d queued_frac=%.3f over %v (reported, not asserted) speedup=%.1fx "+
 			"ping_med_ms=%.3f ping_max_ms=%.1f ref_ping_med_ms=%.3f: read the speedup — a pinned worker moves BOTH",
 			o.engine, o.queued, o.samples, o.queuedFrac, o.queuedBar, o.speedup, ms(o.pingMed), ms(o.pingMax), ms(o.refPingMed))
+	}
+	// The control arms' legacy signal (celeris#628): the absolute 5 ms bar
+	// they used to be judged on. It is REPORTED, never asserted — it is the
+	// number that failed 3 runs in 20 on a loaded box while the arms' own
+	// state proved the worker free — so the historical series survives and a
+	// tally of old-bar-vs-new can be recomputed from these very lines.
+	if o.mode != stall589Settled.String() && o.pingMed >= stall589StallBar {
+		t.Logf("CTL628 engine=%s mode=%s ping_med_ms=%.3f >= legacy bar %v (reported, not asserted) "+
+			"ctl_speedup=%.1fx against a %v /kv median over %d completions in the same window (bar %.0fx): "+
+			"read the ratio — a worker paying for the blocked Set moves BOTH",
+			o.engine, o.mode, ms(o.pingMed), stall589StallBar, o.ctlSpeedup, o.kvMed, o.kvSamples, stall592MinCtlSpeedup)
 	}
 	if o.mode != stall589Settled.String() && o.stalledFrac > 0.05 {
 		t.Logf("ANOMALY589 engine=%s mode=%s stalled=%d/%d stalled_frac=%.3f ping_med_ms=%.3f ping_max_ms=%.1f: "+
@@ -934,6 +1058,13 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 	var wg sync.WaitGroup
 	var kvReqs atomic.Int64
 	hammerErr := make(chan error, o.kvConns)
+	// celeris#628: every /kv request is timed client-side and kept with the
+	// instant it completed, so the assertion can take the median over exactly
+	// the /ping window. Each hammer fills a private slice and publishes it
+	// under kvLatMu on the way out — no shared state on the hot path, and the
+	// merge happens before wg.Wait() returns, so kvLat is final when read.
+	var kvLatMu sync.Mutex
+	var kvLat []kvSample589
 	for i := 0; i < o.kvConns; i++ {
 		c, br, err := dial589(addr)
 		if err != nil {
@@ -942,17 +1073,26 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		defer func() { _ = c.Close() }()
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			var mine []kvSample589
+			defer func() {
+				kvLatMu.Lock()
+				kvLat = append(kvLat, mine...)
+				kvLatMu.Unlock()
+				wg.Done()
+			}()
 			for {
 				select {
 				case <-stop:
 					return
 				default:
 				}
+				t0 := time.Now()
 				if err := get589(c, br, "/kv"); err != nil {
 					hammerErr <- err
 					return
 				}
+				done := time.Now()
+				mine = append(mine, kvSample589{done: done, lat: done.Sub(t0)})
 				kvReqs.Add(1)
 			}
 		}()
@@ -1122,7 +1262,8 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		}
 		time.Sleep(stall589Spacing)
 	}
-	o.window = time.Since(winStart)
+	winEnd := time.Now()
+	o.window = winEnd.Sub(winStart)
 	if os.Getenv("CELERIS_589_DUMP") != "" {
 		series := make([]string, 0, len(lat))
 		for _, d := range lat {
@@ -1188,6 +1329,27 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 		o.refQueuedFr = float64(o.refQueued) / float64(o.refSamples)
 		if o.pingMed > 0 {
 			o.speedup = float64(o.refPingMed) / float64(o.pingMed)
+		}
+	}
+
+	// The controls' in-run reference (celeris#628): what one blocked Set cost
+	// a client over the same window the /ping medians were taken in. Only
+	// completions inside [winStart, winEnd] count, so a request that spanned
+	// the pre-window wait (where the conns were still catching their first
+	// slow run) cannot contribute. Computed for every mode — the settled arm
+	// only prints it, its bar being the pinned /ping window.
+	inWin := make([]time.Duration, 0, len(kvLat))
+	for _, s := range kvLat {
+		if !s.done.Before(winStart) && !s.done.After(winEnd) {
+			inWin = append(inWin, s.lat)
+		}
+	}
+	sort.Slice(inWin, func(i, j int) bool { return inWin[i] < inWin[j] })
+	o.kvSamples = len(inWin)
+	if o.kvSamples > 0 {
+		o.kvMed, o.kvMax = inWin[o.kvSamples/2], inWin[o.kvSamples-1]
+		if o.pingMed > 0 {
+			o.ctlSpeedup = float64(o.kvMed) / float64(o.pingMed)
 		}
 	}
 

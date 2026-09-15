@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2661,8 +2662,27 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			// model). Set BEFORE asyncPromoted/goroutine start so the dispatch
 			// goroutine observes it (happens-before). Empty path => the
 			// goroutine treats the conn as not revert-eligible.
+			//
+			// CLONED, not aliased (celeris#631). CurrentRoute returns
+			// h1.Request.Method/Path, and internPath/internMethod hand back
+			// UnsafeString views INTO THE PARSER BUFFER — zero-copy, valid
+			// only "while the H1 handler runs synchronously before the buffer
+			// is reused" (protocol/h1/intern.go). These two fields outlive
+			// that window by design: they are read on every later park of the
+			// dispatch goroutine, by which time cs.buf holds a LATER request.
+			// Measured on the fixed stickiness rig: a conn promoted on "/db"
+			// read its promotedPath back as "/cp" — the first three bytes of
+			// the "/cpu" request that overwrote the buffer — so
+			// canRevertToInline asked RouteAsync("GET", "/cp"), got false for
+			// an unrouted path, and de-promoted a conn whose promoting route
+			// is permanently async. The conn then re-promoted on the next /db
+			// and the pair repeated once per request: 5 promotions across 12
+			// requests on ONE connection instead of 1, the dispatch goroutine
+			// spawned and joined each time, and the #364 revert deciding on
+			// bytes that no longer belong to it.
 			if w.bufRing == nil {
-				cs.promotedMethod, cs.promotedPath = cs.h1State.CurrentRoute()
+				method, path := cs.h1State.CurrentRoute()
+				cs.promotedMethod, cs.promotedPath = strings.Clone(method), strings.Clone(path)
 			}
 			cs.asyncPromoted.Store(true)
 			w.asyncPromoted.Add(1)
