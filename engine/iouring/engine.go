@@ -51,6 +51,18 @@ type Engine struct {
 		// round-robin cursor for spreading adopts across workers.
 		transplantCount atomic.Uint64
 		transplantRR    atomic.Uint64
+		// transplantDetached / transplantSlotOccupied complete the #383
+		// hand-off ledger transplantCount starts (celeris#624):
+		// conns detached FOR epoll (reverse direction) and adoptions
+		// refused because the conn-table slot was taken. Neither side of a
+		// hand-off fires a lifecycle hook, so the pair is the only way to
+		// reconcile one from outside the engine.
+		transplantDetached     atomic.Uint64
+		transplantSlotOccupied atomic.Uint64
+		// closeMissingConnState counts finishClose calls that moved the
+		// gauge and closeCount for an already-nil connState, which skips
+		// OnDisconnect — the silent close path of celeris#624.
+		closeMissingConnState atomic.Uint64
 		// recvArm holds the recv-arming witnesses (celeris#586).
 		recvArm recvArmStats
 		// detachedConns mirrors the sum of the workers' private detachedCount
@@ -303,6 +315,11 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.detachedConns = &e.metrics.detachedConns
 		w.detachWindowCloses = &e.metrics.detachWindowCloses
 		w.zc = &e.metrics.zc // #591 SEND_ZC exposure witnesses
+		// The rest of the #383 hand-off ledger + the silent-close counter
+		// (celeris#624).
+		w.transplantDetached = &e.metrics.transplantDetached
+		w.transplantSlotOccupied = &e.metrics.transplantSlotOccupied
+		w.closeMissingConnState = &e.metrics.closeMissingConnState
 		workers[i] = w
 	}
 	return workers, nil
@@ -375,12 +392,24 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		RecvArmDeclined:              e.metrics.recvArm.armDeclined.Load(),
 		RecvDoubleArmed:              e.metrics.recvArm.doubleArmed.Load(),
 		RecvCQEUnaccounted:           e.metrics.recvArm.cqeUnaccounted.Load(),
+		RecvSQFull:                   e.metrics.recvArm.sqFullRecv.Load(),
+		RecvStallEpisodes:            e.metrics.recvArm.stallEpisodes.Load(),
+		RecvStallNanos:               e.metrics.recvArm.stallNanos.Load(),
+		RecvStallMaxNanos:            e.metrics.recvArm.stallMaxNanos.Load(),
+		RecvLinkedArms:               e.metrics.recvArm.linkedRecvArms.Load(),
+		RecvLinkedBlockedNanos:       e.metrics.recvArm.linkedRecvBlockedNanos.Load(),
+		RecvLinkedBlockedMaxNanos:    e.metrics.recvArm.linkedRecvBlockedMax.Load(),
 		DetachedConnections:          e.metrics.detachedConns.Load(),
 		DetachWindowCloses:           e.metrics.detachWindowCloses.Load(),
 		ZCSendsSubmitted:             e.metrics.zc.submits.Load(),
 		ZCNotifs:                     e.metrics.zc.notifs.Load(),
 		InlineBytes:                  e.metrics.zc.inlineBytes.Load(),
 		RingBytes:                    e.metrics.zc.ringBytes.Load(),
+
+		TransplantAdopted:           e.metrics.transplantCount.Load(),
+		TransplantDetached:          e.metrics.transplantDetached.Load(),
+		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
+		CloseMissingConnState:       e.metrics.closeMissingConnState.Load(),
 	}
 }
 

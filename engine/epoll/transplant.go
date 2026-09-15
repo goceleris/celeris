@@ -166,6 +166,11 @@ func (l *Loop) flushedAtBoundary(cs *connState) bool {
 // table and adjusts counters, WITHOUT closing the fd or releasing the connState.
 // Used by both the synchronous detach (detachForTransplant) and the deferred
 // async path (where the dispatch goroutine still references cs until it exits).
+// It fires NO OnDisconnect — the connection is not ending, it is moving —
+// so the live-connection gauge drops here with no hook movement at all.
+// transplantDetached is the only record of that decrement; paired against
+// the target's TransplantAdopted it turns an in-flight hand-off into a
+// residual instead of an unexplained gauge step (celeris#624).
 func (l *Loop) detachFromEpoll(fd int, cs *connState) {
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	l.removeLiveConn(cs)
@@ -174,6 +179,9 @@ func (l *Loop) detachFromEpoll(fd int, cs *connState) {
 	l.driverMu.Unlock()
 	l.connCount--
 	l.activeConns.Add(-1)
+	if l.transplantDetached != nil {
+		l.transplantDetached.Add(1)
+	}
 }
 
 // detachForTransplant fully detaches cs/fd (epoll + connState release) WITHOUT

@@ -124,6 +124,12 @@ func (w *Worker) tryTransplant(fd int) {
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
+	// Detach-for-transplant, not a close: no OnDisconnect fires (the conn
+	// lives on under epoll), so the ledger entry is the only record of this
+	// decrement (celeris#624).
+	if w.transplantDetached != nil {
+		w.transplantDetached.Add(1)
+	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingRelease(cs)
@@ -234,6 +240,11 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
+	// Same detach-for-transplant ledger entry as tryTransplant's, on the
+	// self-initiated async path (celeris#624).
+	if w.transplantDetached != nil {
+		w.transplantDetached.Add(1)
+	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
 	// Detached release: the dispatch goroutine may still be in its deferred

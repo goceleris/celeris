@@ -109,7 +109,11 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// Workers is the number of I/O workers (io_uring) or event loops
 	// (epoll) the engine is running. Static after Listen. The adaptive
 	// controller divides ActiveConnections by it to derive the
-	// conns-per-worker load signal that drives engine selection.
+	// conns-per-worker load signal that drives engine selection — and it
+	// reads that pair off the ACTIVE sub-engine, not off the adaptive
+	// wrapper, which reports the SUM over both sub-engines (both run at
+	// once, so the sum is the divisor matching the summed
+	// ActiveConnections). Zero before Listen.
 	Workers int
 	// AcceptCount is the cumulative number of connections accepted by this
 	// engine since start. Together with elapsed time it yields the accept
@@ -167,6 +171,42 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// engine lost track of, the only witness of a double recv that the
 	// userspace guard cannot see. Must stay 0. Zero on other engines.
 	RecvCQEUnaccounted uint64
+	// RecvSQFull is the cumulative number of recv arms the io_uring engine
+	// could not place because the submission queue had no free entry. It
+	// is the only way a connection is ever left owing a recv, so it bounds
+	// RecvStallEpisodes from above. Zero on other engines.
+	RecvSQFull uint64
+	// RecvStallEpisodes is the cumulative number of times the io_uring
+	// dirty-list retry passed over a connection that was owed a recv arm
+	// because a SEND was still outstanding on it. Counted once per
+	// episode, at the transition into it. Zero on other engines.
+	RecvStallEpisodes uint64
+	// RecvStallNanos is the total wall time those episodes lasted, from
+	// the first skipped pass to the arm (or to the connection leaving the
+	// dirty list). Zero on other engines.
+	RecvStallNanos uint64
+	// RecvStallMaxNanos is the longest single such episode. This is the
+	// discriminating one: SQ-ring pressure resolving inside a pass is
+	// normal, while an episode measured in seconds is a connection that
+	// received nothing for seconds with its peer's bytes sitting unread in
+	// the kernel (celeris#607). Zero on other engines.
+	RecvStallMaxNanos uint64
+	// RecvLinkedArms is the cumulative number of times the io_uring engine
+	// chained a RECV behind a SEND with IOSQE_IO_LINK (the single-shot
+	// request/response fast path). Zero on other engines.
+	RecvLinkedArms uint64
+	// RecvLinkedBlockedNanos is the total time those chained recvs spent
+	// waiting for their send to complete — time the connection could not
+	// receive, because the kernel does not start a linked operation until
+	// its predecessor finishes. Measured at the send's completion, with
+	// the recv provably still queued. Zero on other engines.
+	RecvLinkedBlockedNanos uint64
+	// RecvLinkedBlockedMaxNanos is the longest single such wait. A
+	// request/response cycle pays microseconds; a peer that has stopped
+	// reading turns it into seconds, during which the peer's own bytes
+	// pile up unread in the server's receive queue (celeris#607). Zero on
+	// other engines.
+	RecvLinkedBlockedMaxNanos uint64
 	// DetachedConnections is the current number of connections handed to a
 	// detached middleware goroutine (WebSocket / SSE), summed over the
 	// io_uring workers. It mirrors the per-worker detachedCount that gates
@@ -211,4 +251,55 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// iteration, exactly like BytesWritten, because this site IS the
 	// per-request send path. Zero on other engines.
 	RingBytes uint64
+	// StandbyActiveConnections is the share of ActiveConnections held by
+	// the adaptive engine's STANDBY sub-engine. ActiveConnections stays the
+	// sum of both sub-engines (the controller divides it by Workers), so
+	// the active engine's own share is ActiveConnections minus this field.
+	// After a promotion the standby keeps serving the keep-alives that were
+	// established before the switch until the transplant drain moves them,
+	// and only the split says which side a live-gauge step came from
+	// (celeris#624). Zero on every non-adaptive engine, and zero on an
+	// adaptive engine whose lazy standby was never built.
+	StandbyActiveConnections int64
+	// StandbyCloseCount is the share of CloseCount contributed by the
+	// adaptive engine's STANDBY sub-engine, on the same split as
+	// StandbyActiveConnections. Zero on every non-adaptive engine.
+	StandbyCloseCount uint64
+	// TransplantAdopted is the cumulative number of connections this engine
+	// has ADOPTED from the other engine through
+	// [TransplantTarget.AdoptConn] (#383). The adopting side fires no
+	// OnConnect — the connection was already counted when the source engine
+	// accepted it — so this counter is the only record of the increment
+	// half of a hand-off. On the adaptive engine it is the sum over both
+	// sub-engines. Zero on engines that never adopt.
+	TransplantAdopted uint64
+	// TransplantDetached is the cumulative number of connections this
+	// engine has DETACHED for a transplant: dropped from its event loop,
+	// live set and conn table, with the fd deliberately left open and
+	// NO OnDisconnect fired (#383). TransplantDetached - TransplantAdopted
+	// is the number of connections currently in flight between the two
+	// sub-engines; on the adaptive engine, where both halves are summed, a
+	// residual that never returns to zero is a hand-off that was lost
+	// mid-flight and names hypothesis (A) of celeris#624 — the engine's
+	// live gauge fell with no hook movement because nothing closed.
+	// Zero on engines that never transplant.
+	TransplantDetached uint64
+	// TransplantAdoptSlotOccupied is the cumulative number of adoptions
+	// refused because the target engine's conn-table slot for that
+	// descriptor was already occupied. The branch bumps ErrorCount,
+	// returns, and deliberately does NOT close the descriptor (the slot
+	// holder may close the same number later), so the connection is lost
+	// with no close and no hook — silent before this counter existed. It
+	// is one of the candidate silent drop points in celeris#624 and must
+	// stay 0; a nonzero value IS the answer for that run.
+	TransplantAdoptSlotOccupied uint64
+	// CloseMissingConnState is the cumulative number of io_uring closes
+	// that decremented the live-connection gauge and bumped CloseCount for
+	// a descriptor whose connection state was already nil, so the
+	// OnDisconnect hook was skipped. That makes the close invisible to
+	// every hook-derived counter while the engine gauge moves — hypothesis
+	// (B) of celeris#624. Must stay 0; a nonzero value IS the answer for
+	// that run. Zero on other engines, whose close paths hold a non-nil
+	// connection state by construction.
+	CloseMissingConnState uint64
 }

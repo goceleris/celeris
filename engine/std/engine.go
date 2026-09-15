@@ -45,6 +45,13 @@ type Engine struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		errCount    atomic.Uint64
+		// closeCount is the cumulative close count EngineMetrics declares
+		// and this engine used to leave at zero (celeris#624). It is
+		// incremented on exactly the ConnState transitions that decrement
+		// activeConns, so engine_closed - hook_closed is identically zero
+		// here — which is what makes std the control engine when the same
+		// difference is nonzero on epoll or io_uring.
+		closeCount atomic.Uint64
 	}
 	once sync.Once
 }
@@ -226,6 +233,7 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		RequestCount:      e.metrics.reqCount.Load(),
 		ActiveConnections: e.metrics.activeConns.Load(),
 		ErrorCount:        e.metrics.errCount.Load(),
+		CloseCount:        e.metrics.closeCount.Load(),
 	}
 }
 
@@ -302,6 +310,7 @@ func (e *Engine) connStateHook(conn net.Conn, state http.ConnState) {
 		}
 	case http.StateClosed, http.StateHijacked:
 		e.metrics.activeConns.Add(-1)
+		e.metrics.closeCount.Add(1)
 		if e.cfg.OnDisconnect != nil {
 			e.safeCallback(e.cfg.OnDisconnect, conn.RemoteAddr().String())
 		}
