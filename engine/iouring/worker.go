@@ -346,6 +346,10 @@ type Worker struct {
 	transplantDetached     *atomic.Uint64 // conns detached FOR epoll (no OnDisconnect fired)
 	transplantSlotOccupied *atomic.Uint64 // adoptions refused on an occupied slot (fd not closed)
 	closeMissingConnState  *atomic.Uint64 // finishClose on a nil connState (OnDisconnect skipped)
+	// One bucket per remaining silent drop point on the hand-off path
+	// (celeris#624).
+	transplantHandoffRefused *atomic.Uint64 // target refused an already-relinquished fd
+	transplantAdoptRefused   *atomic.Uint64 // adoption refused for a reason other than a taken slot
 	// recvArm is the engine-wide recv-arming witness set (celeris#586);
 	// nil-safe so a bare test Worker literal can skip it.
 	recvArm *recvArmStats
@@ -1327,7 +1331,18 @@ func (w *Worker) run(ctx context.Context) {
 		// park its event loop and starve those driver conns of CQE
 		// servicing. Stay active while any driver conn is registered (v1.5.0
 		// review 2.10).
-		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() && w.acceptPaused.Load() {
+		// driverActionPending gate (celeris#624): AdoptConn hands a
+		// transplanted descriptor to this worker by queuing a
+		// driverActionAdopt and returns success immediately — the source
+		// engine has ALREADY relinquished the conn by then. This park is
+		// indefinite (a Go channel only ResumeAccept closes), so parking
+		// on a queued adopt would lose that descriptor exactly the way the
+		// epoll side lost one on its own detach queue: open, owned by
+		// nobody, no hook, no close. The same flag covers a queued driver
+		// register/unregister/write.
+		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
+			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
+			w.acceptPaused.Load() {
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() {
 				w.wakeMu.Unlock()

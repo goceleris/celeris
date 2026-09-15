@@ -56,6 +56,13 @@ type Engine struct {
 		transplantAdopted      atomic.Uint64
 		transplantDetached     atomic.Uint64
 		transplantSlotOccupied atomic.Uint64
+		// The remaining silent drop points on the #383 path, one bucket
+		// each (celeris#624). Every one of them used to lose a
+		// relinquished connection with no close, no hook and no counter.
+		transplantHandoffRefused atomic.Uint64
+		transplantDrainStopped   atomic.Uint64
+		transplantStranded       atomic.Uint64
+		transplantAdoptRefused   atomic.Uint64
 	}
 	// asyncRoutes is the static AsyncRoutes count snapshotted at
 	// construction from the handler's AsyncRouteCount (#300 G3).
@@ -124,6 +131,10 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.transplantAdopted = &e.metrics.transplantAdopted
 		l.transplantDetached = &e.metrics.transplantDetached
 		l.transplantSlotOccupied = &e.metrics.transplantSlotOccupied
+		l.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
+		l.transplantDrainStopped = &e.metrics.transplantDrainStopped
+		l.transplantStranded = &e.metrics.transplantStranded
+		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -206,6 +217,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantAdopted:           e.metrics.transplantAdopted.Load(),
 		TransplantDetached:          e.metrics.transplantDetached.Load(),
 		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
+		TransplantHandoffRefused:    e.metrics.transplantHandoffRefused.Load(),
+		TransplantDrainStopped:      e.metrics.transplantDrainStopped.Load(),
+		TransplantStranded:          e.metrics.transplantStranded.Load(),
+		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).

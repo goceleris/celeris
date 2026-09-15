@@ -131,11 +131,33 @@ type Loop struct {
 	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
 
 	// The #383 transplant ledger, engine-wide and shared like the counters
-	// above; all three are nil-safe so a bare test Loop literal can skip
+	// above; all of them are nil-safe so a bare test Loop literal can skip
 	// them (celeris#624).
 	transplantAdopted      *atomic.Uint64 // conns adopted FROM io_uring (no OnConnect fired)
 	transplantDetached     *atomic.Uint64 // conns detached FOR io_uring (no OnDisconnect fired)
 	transplantSlotOccupied *atomic.Uint64 // adoptions refused on an occupied slot (fd not closed)
+	// One bucket per remaining silent drop point on the hand-off path
+	// (celeris#624). Each of these used to lose a relinquished connection
+	// with no close, no hook and nothing recorded.
+	transplantHandoffRefused *atomic.Uint64 // target refused an already-relinquished fd
+	transplantDrainStopped   *atomic.Uint64 // drain stopped between detach and hand-off
+	transplantStranded       *atomic.Uint64 // transplant-pending conn dropped by the detach drain
+	transplantAdoptRefused   *atomic.Uint64 // adoption refused for a reason other than a taken slot
+
+	// runCtx is this loop's run context, published at the top of run and
+	// read only on this thread. reclaimTransplant needs one to build a
+	// connState with (celeris#624).
+	runCtx context.Context
+
+	// transplantInFlight counts connections this loop has detached for a
+	// transplant whose hand-off is not finished yet — the deferred async
+	// path, where tryTransplant detaches and drainDetachQueue completes.
+	// Loop-thread-only on BOTH ends, which is what lets the standby
+	// suspend gate trust it: the count cannot become nonzero between that
+	// gate's test and its park. Without it the gate reads connCount == 0
+	// — already decremented by the detach — and parks the loop forever on
+	// top of its own unfinished hand-off (celeris#624).
+	transplantInFlight int
 
 	// fdCapDrops counts accepted fds that fell outside the l.conns table
 	// (fd >= connTableSize) and were force-closed in acceptAll. Worker-
@@ -248,6 +270,10 @@ func newLoop(id, cpuID int, handler stream.Handler,
 }
 
 func (l *Loop) run(ctx context.Context) {
+	// Publish the run context for the loop-thread paths that need to build
+	// a connState but are not called from this frame — reclaimTransplant
+	// (celeris#624). Written and read on this thread only.
+	l.runCtx = ctx
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -669,8 +695,34 @@ func (l *Loop) run(ctx context.Context) {
 			l.checkTimeouts()
 		}
 
-		// DRAINING → SUSPENDED: no listen socket, no connections, events processed.
-		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() {
+		// DRAINING → SUSPENDED: no listen socket, no connections, events
+		// processed, and NO CROSS-ENGINE HAND-OFF STILL OWED.
+		//
+		// That last clause is celeris#624. This park is indefinite — the
+		// loop leaves epoll_wait entirely and waits on a Go channel that
+		// only ResumeAccept closes — so anything still owed to
+		// drainDetachQueue or drainAdoptQueue at this point is owed
+		// forever. And connCount == 0 does NOT mean nothing is owed:
+		// detachFromEpoll decrements it the instant a conn is detached FOR
+		// A TRANSPLANT, while the hand-off itself is finished later, by
+		// this loop, in drainDetachQueue. So the LAST connection a standby
+		// loop drains — connCount hits 0 on the detach, the dispatch
+		// goroutine has not enqueued it yet — used to park the loop on top
+		// of its own unfinished hand-off: the descriptor stayed open and
+		// owned by no engine, io_uring never heard of it, no OnDisconnect
+		// fired, and the live gauge stayed one short for the life of the
+		// process. One lost connection per loop that finishes its drain.
+		//
+		// transplantInFlight is the race-free half of the guard: both its
+		// increment (tryTransplant) and its decrement
+		// (finishTransplantHandoff) run on THIS thread, so it cannot go
+		// nonzero between the test and the park. The two queue flags are
+		// defence in depth for future deferred work — every other enqueue
+		// site holds a conn in the table, so connCount > 0 already keeps
+		// the loop awake for them.
+		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
+			l.transplantInFlight == 0 &&
+			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() {
 				l.wakeMu.Unlock()
@@ -2136,15 +2188,20 @@ func (l *Loop) drainDetachQueue() {
 	l.detachQPending.Store(0)
 	l.detachQMu.Unlock()
 	for _, cs := range l.detachQSpare {
-		if cs.detachClosed {
-			continue
-		}
 		// #383 transplant: the dispatch goroutine quiesced and exited; the fd was
 		// already removed from epoll by tryTransplant (at a flushed, clean
-		// boundary). Finish the hand-off to io_uring. Checked before the
-		// asyncClosed/close paths so a quiescing conn is migrated, not closed.
+		// boundary). Finish the hand-off to io_uring. Checked before EVERY
+		// other branch — including the already-closed guard below — so a
+		// quiescing conn is migrated, not dropped. The old ordering put
+		// detachClosed first, which would strand such a conn: no hand-off,
+		// no close, no hook, no counter, and the live gauge already
+		// decremented (celeris#624). finishTransplantHandoff re-checks
+		// detachClosed and counts the coincidence.
 		if cs.transplantPending {
 			l.finishTransplantHandoff(cs)
+			continue
+		}
+		if cs.detachClosed {
 			continue
 		}
 		// Hijacked conn (#3.1): hijackConn already detached the fd from

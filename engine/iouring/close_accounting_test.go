@@ -145,9 +145,15 @@ func TestAttachAdoptedFDCountsAnOccupiedSlot(t *testing.T) {
 }
 
 // TestTryTransplantCountsTheDetach covers the worker-side (sync) half of the
-// io_uring→epoll hand-off. It closes the ORIGINAL fd and bumps closeCount, but
-// fires no OnDisconnect — the conn lives on under epoll — so without the
-// ledger entry the hand-off's departure is unattributable.
+// io_uring→epoll hand-off. It closes the ORIGINAL fd (the dup carries the
+// socket to epoll) but fires no OnDisconnect — the conn lives on under epoll —
+// so without the ledger entry the hand-off's departure is unattributable.
+//
+// It must not count a close either. It used to: closeCount ran one ahead of
+// the OnDisconnect count for every reverse transplant, and "engine closes vs
+// hook closes" is the exact discriminator celeris#624 uses to tell a close
+// that skipped its hook from a hand-off that was lost. epoll's detachFromEpoll
+// never counted a detach as a close; this now matches it.
 func TestTryTransplantCountsTheDetach(t *testing.T) {
 	fd, other := socketPairFDs(t)
 	defer func() { _ = unix.Close(other) }()
@@ -184,6 +190,11 @@ func TestTryTransplantCountsTheDetach(t *testing.T) {
 	if got := w.transplantCount.Load(); got != 0 {
 		t.Errorf("transplantCount = %d, want 0 — the source engine adopts nothing", got)
 	}
+	if got := w.closeCount.Load(); got != 0 {
+		t.Errorf("closeCount = %d, want 0 — a detach-for-transplant is not a close, "+
+			"and counting one here makes EngineMetrics.CloseCount disagree with the "+
+			"OnDisconnect count for a connection that never ended (celeris#624)", got)
+	}
 }
 
 // TestFinishAsyncTransplantCountsTheDetach is the same ledger entry on the
@@ -218,6 +229,10 @@ func TestFinishAsyncTransplantCountsTheDetach(t *testing.T) {
 	}
 	if hooks != 0 {
 		t.Errorf("OnDisconnect fired %d times, want 0 — a transplant is not a close", hooks)
+	}
+	if got := w.closeCount.Load(); got != 0 {
+		t.Errorf("closeCount = %d, want 0 — the self-initiated detach is not a close "+
+			"either (celeris#624)", got)
 	}
 }
 

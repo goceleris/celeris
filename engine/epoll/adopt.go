@@ -76,6 +76,33 @@ func (l *Loop) drainAdoptQueue(ctx context.Context, now int64) {
 	l.adoptQSpare = l.adoptQSpare[:0]
 }
 
+// refuseAdopt finishes a target-side adoption this loop cannot complete: the
+// descriptor is outside the conn table, or epoll_ctl refused it. The source
+// has already dropped the conn from its live gauge WITHOUT firing
+// OnDisconnect, so if this engine simply closed the descriptor — which is
+// what every one of these branches used to do — the connection would vanish
+// from accepted - closed - active for good, with no hook and no counter
+// (celeris#624). Close it AND fire the hook, so the lifecycle ledger balances
+// on the engine that actually ended the connection.
+//
+// activeConns is deliberately untouched: this conn never entered this
+// engine's gauge, and the source already decremented its own.
+func (l *Loop) refuseAdopt(fd int, carry engine.Carryover) {
+	if l.transplantAdoptRefused != nil {
+		l.transplantAdoptRefused.Add(1)
+	}
+	if fd >= 0 {
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		_ = unix.Close(fd)
+	}
+	if l.closeCount != nil {
+		l.closeCount.Add(1)
+	}
+	if l.cfg.OnDisconnect != nil {
+		l.cfg.OnDisconnect(carry.RemoteAddr)
+	}
+}
+
 // attachAdoptedFD registers a transplanted real fd onto this loop as a fresh
 // HTTP/1 connection. Mirrors acceptAll's per-conn setup. Runs on the loop thread
 // (epoll_ctl + connState setup are loop-owned). The fd is assumed to be at a
@@ -83,11 +110,12 @@ func (l *Loop) drainAdoptQueue(ctx context.Context, now int64) {
 // socket receive buffer and are picked up by the EPOLLIN edge after registration.
 func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryover, now int64) {
 	if fd < 0 {
+		l.refuseAdopt(fd, carry)
 		return
 	}
 	if fd >= connTableSize {
-		_ = unix.Close(fd)
 		l.errs.ConnTableCap.Add(1)
+		l.refuseAdopt(fd, carry)
 		return
 	}
 	if fd >= len(l.conns) {
@@ -111,8 +139,8 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 		Fd:     int32(fd),
 	}); err != nil {
-		_ = unix.Close(fd)
 		l.errs.ConnRegister.Add(1)
+		l.refuseAdopt(fd, carry)
 		return
 	}
 
