@@ -28,7 +28,6 @@ func TestDetectSpanningH2Preface(t *testing.T) {
 		conns:       make([]*connState, 1024),
 		liveConns:   make([]int, 0, 4),
 		handler:     noopHandler,
-		h2EventFD:   -1,
 		errs:        &errclass.Counters{},
 		reqCount:    &atomic.Uint64{},
 		activeConns: &atomic.Int64{},

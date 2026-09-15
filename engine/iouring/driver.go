@@ -84,7 +84,9 @@ type driverAction struct {
 	adoptCarry engine.Carryover
 }
 
-// addDriverAction enqueues work for the worker and wakes it: the eventfd
+// addDriverAction enqueues work for the worker and wakes it: the wakeup
+// handle (celeris#655: a handle, so a driver that registers an fd on a
+// worker that has already shut down cannot write a recycled descriptor)
 // reaches a worker waiting on its ring, wakeIfSuspended one parked in
 // DRAINING→SUSPENDED (celeris#658).
 func (w *Worker) addDriverAction(a driverAction) {
@@ -92,11 +94,7 @@ func (w *Worker) addDriverAction(a driverAction) {
 	w.driverActionQueue = append(w.driverActionQueue, a)
 	w.driverActionPending.Store(1)
 	w.driverActionMu.Unlock()
-	if w.h2EventFD >= 0 {
-		var val [8]byte
-		val[0] = 1
-		_, _ = unix.Write(w.h2EventFD, val[:])
-	}
+	w.wakeFD.Signal()
 	// After releasing driverActionMu: wakeMu is a leaf lock.
 	w.wakeIfSuspended()
 }
@@ -108,9 +106,10 @@ func (w *Worker) addDriverAction(a driverAction) {
 // error leaves fd with the caller, whose reclaim path takes the connection
 // back.
 //
-// The eventfd is written under driverActionMu: Worker.shutdown takes this lock
-// (closeAdoptQueue) before it closes the eventfd, so the write can never land
-// on a closed — possibly reused — descriptor number.
+// The wakeup is signalled under driverActionMu: Worker.shutdown takes this
+// lock (closeAdoptQueue) before it closes the eventfd. Since celeris#655 the
+// handle enforces that on its own — Signal and Close share a lock — and the
+// ordering is kept here because it also publishes the queue entry.
 func (w *Worker) addAdoptAction(fd int, carry engine.Carryover) error {
 	w.driverActionMu.Lock()
 	if w.adoptClosed {
@@ -120,11 +119,7 @@ func (w *Worker) addAdoptAction(fd int, carry engine.Carryover) error {
 	w.driverActionQueue = append(w.driverActionQueue,
 		driverAction{kind: driverActionAdopt, adoptFD: fd, adoptCarry: carry})
 	w.driverActionPending.Store(1)
-	if w.h2EventFD >= 0 {
-		var val [8]byte
-		val[0] = 1
-		_, _ = unix.Write(w.h2EventFD, val[:])
-	}
+	w.wakeFD.Signal()
 	w.driverActionMu.Unlock()
 	// A standby worker parked in DRAINING→SUSPENDED does not read the
 	// eventfd; kick it (celeris#658). After releasing driverActionMu:
@@ -252,7 +247,7 @@ func (w *Worker) drainDriverActions() {
 	// eventfd deaf for the life of the worker. The loop retries through
 	// rearmH2PollIfPending. Every other call site already does this; this one
 	// was missed by celeris#523 (celeris#537).
-	if !w.h2PollArmed && w.h2EventFD >= 0 {
+	if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 		w.h2PollArmed = w.prepareH2Poll()
 	}
 

@@ -53,15 +53,12 @@ func (e *Engine) AdoptConn(fd int, carry engine.Carryover) error {
 	l.adoptQueue = append(l.adoptQueue, adoptItem{fd: fd, carry: carry})
 	l.adoptQPending.Store(1)
 	// Wake the loop so the adopt is applied promptly (the loop drains the
-	// eventfd counter and then drainAdoptQueue). Written under adoptQMu:
+	// eventfd counter and then drainAdoptQueue). Signalled under adoptQMu:
 	// Loop.shutdown takes this lock (closeAdoptQueue) before it closes the
-	// eventfd, so the write can never land on a closed — possibly reused —
-	// descriptor number.
-	if l.eventFD >= 0 {
-		var val [8]byte
-		val[0] = 1
-		_, _ = unix.Write(l.eventFD, val[:])
-	}
+	// eventfd. Since celeris#655 the handle enforces that on its own —
+	// Signal and Close share a lock — and the ordering is kept here because
+	// it also publishes the queue entry.
+	l.wakeFD.Signal()
 	l.adoptQMu.Unlock()
 	// The eventfd only reaches a loop that is in epoll_wait. A standby loop
 	// parked in DRAINING→SUSPENDED waits on a channel instead, and used to

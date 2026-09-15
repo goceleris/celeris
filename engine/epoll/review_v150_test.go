@@ -184,7 +184,6 @@ func TestAcceptAllDrainsBacklogNoStrand(t *testing.T) {
 		closeCount:   &atomic.Uint64{},
 		bytesRead:    &atomic.Uint64{},
 		bytesWritten: &atomic.Uint64{},
-		eventFD:      -1,
 		timerFD:      -1,
 		resolved:     resource.ResolvedResources{BufferSize: 8192},
 		cfg:          resource.Config{},
@@ -278,7 +277,6 @@ func TestHijackDefersReleaseWhileAsyncGoroutineActive(t *testing.T) {
 		acceptCount:  &atomic.Uint64{},
 		bytesRead:    &atomic.Uint64{},
 		bytesWritten: &atomic.Uint64{},
-		eventFD:      -1,
 		cfg:          resource.Config{},
 	}
 
@@ -366,7 +364,6 @@ func TestHijackSyncReleasesImmediately(t *testing.T) {
 		acceptCount:  &atomic.Uint64{},
 		bytesRead:    &atomic.Uint64{},
 		bytesWritten: &atomic.Uint64{},
-		eventFD:      -1,
 		cfg:          resource.Config{},
 	}
 	// Sync mode: detachMu nil, no dispatch goroutine.
