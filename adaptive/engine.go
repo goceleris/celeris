@@ -985,7 +985,15 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantAdopted:           pm.TransplantAdopted + sm.TransplantAdopted,
 		TransplantDetached:          pm.TransplantDetached + sm.TransplantDetached,
 		TransplantAdoptSlotOccupied: pm.TransplantAdoptSlotOccupied + sm.TransplantAdoptSlotOccupied,
-		CloseMissingConnState:       pm.CloseMissingConnState + sm.CloseMissingConnState,
+		// The four silent drop points the residual above used to hide.
+		// Cumulative, one per lost-or-recovered hand-off, and a hand-off
+		// has exactly one source and one target, so summing the pair is
+		// the count of events — never a double count (celeris#624).
+		TransplantHandoffRefused: pm.TransplantHandoffRefused + sm.TransplantHandoffRefused,
+		TransplantDrainStopped:   pm.TransplantDrainStopped + sm.TransplantDrainStopped,
+		TransplantStranded:       pm.TransplantStranded + sm.TransplantStranded,
+		TransplantAdoptRefused:   pm.TransplantAdoptRefused + sm.TransplantAdoptRefused,
+		CloseMissingConnState:    pm.CloseMissingConnState + sm.CloseMissingConnState,
 
 		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
 		// so the epoll half contributes zero and a switch simply moves which

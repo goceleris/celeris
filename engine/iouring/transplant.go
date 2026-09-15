@@ -52,6 +52,30 @@ func (e *Engine) TransplantCount() uint64 { return e.metrics.transplantCount.Loa
 
 var _ engine.TransplantTarget = (*Engine)(nil)
 
+// refuseAdopt finishes a target-side adoption this worker cannot complete
+// (the descriptor is outside its conn table). The source already dropped the
+// conn from its live gauge with NO OnDisconnect, so a bare close here loses
+// it from accepted - closed - active for good, with no hook and no counter —
+// one of the silent drop points of celeris#624. Close it AND fire the hook.
+//
+// activeConns is deliberately untouched: the conn never entered this
+// engine's gauge, and the source already decremented its own.
+func (w *Worker) refuseAdopt(fd int, carry engine.Carryover) {
+	if w.transplantAdoptRefused != nil {
+		w.transplantAdoptRefused.Add(1)
+	}
+	if fd >= 0 {
+		_ = unix.Shutdown(fd, unix.SHUT_WR)
+		_ = unix.Close(fd)
+	}
+	if w.closeCount != nil {
+		w.closeCount.Add(1)
+	}
+	if w.cfg.OnDisconnect != nil {
+		w.cfg.OnDisconnect(carry.RemoteAddr)
+	}
+}
+
 // attachAdoptedFD runs on the worker thread (via drainDriverActions) and turns a
 // real, already-connected fd into a full HTTP/1 connection on this worker. It
 // mirrors the non-fixed-file path of onAcceptedFD. The fd is assumed to be at a
@@ -61,8 +85,8 @@ var _ engine.TransplantTarget = (*Engine)(nil)
 // the kernel socket receive buffer — is served by the multishot recv armed here.
 func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	if newFD < 0 || newFD >= len(w.conns) {
-		_ = unix.Close(newFD)
 		w.errs.ConnTableCap.Add(1)
+		w.refuseAdopt(newFD, carry)
 		return
 	}
 	if w.conns[newFD] != nil {

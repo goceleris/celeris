@@ -3,6 +3,10 @@
 package epoll
 
 import (
+	"context"
+	"sync/atomic"
+	"time"
+
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
@@ -121,6 +125,11 @@ func (l *Loop) tryTransplant(fd int) {
 		}
 		l.detachFromEpoll(fd, cs)
 		cs.transplantPending = true
+		// The hand-off is now OWED to this loop's drainDetachQueue. Keep
+		// the standby suspend gate awake until it is paid: connCount has
+		// just been decremented and is no longer a witness for this conn
+		// (celeris#624).
+		l.transplantInFlight++
 		cs.asyncQuiesce.Store(true)
 		cs.asyncInMu.Lock()
 		cs.asyncCond.Broadcast() // wake the parked goroutine so it sees quiesce and exits
@@ -146,9 +155,44 @@ func (l *Loop) tryTransplant(fd int) {
 	l.detachForTransplant(fd, cs)
 	if err := ts.target.AdoptConn(fd, carry); err != nil {
 		// Target refused the fd (out of range / no workers). We already
-		// relinquished it, so close it to avoid a descriptor leak.
-		_ = unix.Close(fd)
+		// relinquished it — dropped from the live gauge, no OnDisconnect —
+		// so the old `unix.Close(fd)` here killed a healthy keep-alive AND
+		// left accepted-closed-active permanently short by one, with
+		// nothing recorded (celeris#624). Take it back instead.
+		l.reclaimTransplant(fd, carry, l.transplantHandoffRefused, err)
 	}
+}
+
+// reclaimTransplant takes back a connection this loop had already
+// relinquished for a hand-off that then failed. The conn is at a clean,
+// fully-flushed HTTP/1 boundary by construction (tryTransplant's gate), the
+// descriptor is still open and owned by nobody, and the peer has noticed
+// nothing — so re-adopting it onto this loop is strictly better than closing
+// it, and it is what keeps the ledger balanced: the detach that fired no
+// OnDisconnect is paired by the adopt that fires no OnConnect, and
+// TransplantDetached - TransplantAdopted returns to zero.
+//
+// bucket names WHY the hand-off failed and is the only record that it did;
+// attachAdoptedFD owns every failure mode from here on (it closes and fires
+// the hook if it cannot take the fd either), so this never drops a conn.
+// Runs on the loop thread — both call sites already do.
+func (l *Loop) reclaimTransplant(fd int, carry engine.Carryover, bucket *atomic.Uint64, cause error) {
+	if bucket != nil {
+		bucket.Add(1)
+	}
+	if l.logger != nil {
+		l.logger.Warn("transplant hand-off failed; reclaiming the conn onto epoll (#383, celeris#624)",
+			"loop", l.id, "fd", fd, "remote", carry.RemoteAddr, "err", cause)
+	}
+	ctx := l.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := l.cachedNow
+	if now == 0 {
+		now = time.Now().UnixNano()
+	}
+	l.attachAdoptedFD(ctx, fd, carry, now)
 }
 
 // flushedAtBoundary reports whether cs is at a clean HTTP/1 request boundary with
@@ -204,14 +248,39 @@ func (l *Loop) detachForTransplant(fd int, cs *connState) {
 // (from drainDetachQueue).
 func (l *Loop) finishTransplantHandoff(cs *connState) {
 	cs.transplantPending = false
+	// The debt tracked for the standby suspend gate is settled here, on
+	// every path out of this function (celeris#624).
+	if l.transplantInFlight > 0 {
+		l.transplantInFlight--
+	}
+	// A conn cannot be both detached-for-transplant and closed: closeConn
+	// bails on a nil conn-table slot, and detachFromEpoll nils that slot
+	// before transplantPending is ever set, so the close can never reach
+	// the statement that sets detachClosed. The drain used to test
+	// detachClosed FIRST and silently drop such a conn, which made that
+	// argument load-bearing and unverifiable. The transplant branch now
+	// runs first, and this is the witness that the exclusion holds
+	// (celeris#624).
+	if cs.detachClosed {
+		if l.transplantStranded != nil {
+			l.transplantStranded.Add(1)
+		}
+		return
+	}
 	fd := cs.fd
 	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
 	releaseConnState(cs)
-	if ts := l.transplant.Load(); ts != nil {
-		if err := ts.target.AdoptConn(fd, carry); err == nil {
-			return
-		}
+	ts := l.transplant.Load()
+	if ts == nil {
+		// The drain was stopped between the detach and here (the adaptive
+		// engine reverted). The conn is healthy and at a clean boundary and
+		// this engine is the active one again, so take it back rather than
+		// closing it — closing was the silent, hook-free drop of
+		// celeris#624.
+		l.reclaimTransplant(fd, carry, l.transplantDrainStopped, nil)
+		return
 	}
-	// Transplant was stopped, or the target refused the fd — close it.
-	_ = unix.Close(fd)
+	if err := ts.target.AdoptConn(fd, carry); err != nil {
+		l.reclaimTransplant(fd, carry, l.transplantHandoffRefused, err)
+	}
 }

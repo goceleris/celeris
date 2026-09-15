@@ -62,6 +62,10 @@ type Engine struct {
 		// reconcile one from outside the engine.
 		transplantDetached     atomic.Uint64
 		transplantSlotOccupied atomic.Uint64
+		// The remaining silent drop points on the #383 path, one bucket
+		// each (celeris#624).
+		transplantHandoffRefused atomic.Uint64
+		transplantAdoptRefused   atomic.Uint64
 		// closeMissingConnState counts finishClose calls that moved the
 		// gauge and closeCount for an already-nil connState, which skips
 		// OnDisconnect — the silent close path of celeris#624.
@@ -323,6 +327,8 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.transplantDetached = &e.metrics.transplantDetached
 		w.transplantSlotOccupied = &e.metrics.transplantSlotOccupied
 		w.closeMissingConnState = &e.metrics.closeMissingConnState
+		w.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
+		w.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		workers[i] = w
 	}
 	return workers, nil
@@ -411,6 +417,8 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantAdopted:           e.metrics.transplantCount.Load(),
 		TransplantDetached:          e.metrics.transplantDetached.Load(),
 		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
+		TransplantHandoffRefused:    e.metrics.transplantHandoffRefused.Load(),
+		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
 		CloseMissingConnState:       e.metrics.closeMissingConnState.Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot

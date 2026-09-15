@@ -123,10 +123,15 @@ func (w *Worker) tryTransplant(fd int) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
-	w.closeCount.Add(1)
 	// Detach-for-transplant, not a close: no OnDisconnect fires (the conn
 	// lives on under epoll), so the ledger entry is the only record of this
-	// decrement (celeris#624).
+	// decrement (celeris#624). closeCount is deliberately NOT bumped here.
+	// It used to be, which made EngineMetrics.CloseCount run one ahead of
+	// the OnDisconnect count for every reverse transplant — and "engine
+	// closes vs hook closes" is the exact discriminator celeris#624 uses to
+	// tell a close that skipped its hook from a hand-off that was lost.
+	// epoll's detachFromEpoll never counted a detach as a close; this now
+	// matches it.
 	if w.transplantDetached != nil {
 		w.transplantDetached.Add(1)
 	}
@@ -136,8 +141,28 @@ func (w *Worker) tryTransplant(fd int) {
 	_ = unix.Close(fd)
 
 	if err := h.target.AdoptConn(newFD, carry); err != nil {
-		_ = unix.Close(newFD)
+		w.reclaimTransplant(newFD, carry, err)
 	}
+}
+
+// reclaimTransplant takes back a connection this worker had already
+// relinquished for a hand-off epoll then refused. The dup'd descriptor is
+// open, connected and at a clean HTTP/1 boundary, and the peer has noticed
+// nothing, so re-adopting it here is strictly better than the bare
+// unix.Close this replaces — which killed a healthy keep-alive and left
+// accepted - closed - active permanently short by one, with no hook and
+// nothing recorded (celeris#624). attachAdoptedFD owns every remaining
+// failure mode, so this never drops the conn. Worker thread only; both call
+// sites already are.
+func (w *Worker) reclaimTransplant(newFD int, carry engine.Carryover, cause error) {
+	if w.transplantHandoffRefused != nil {
+		w.transplantHandoffRefused.Add(1)
+	}
+	if w.logger != nil {
+		w.logger.Warn("transplant hand-off failed; reclaiming the conn onto io_uring (#383, celeris#624)",
+			"worker", w.id, "fd", newFD, "remote", carry.RemoteAddr, "err", cause)
+	}
+	w.attachAdoptedFD(newFD, carry)
 }
 
 // asyncTransplantEligible reports whether a promoted async conn sitting at its park
@@ -239,9 +264,9 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	w.conns[fd] = nil
 	w.connCount--
 	w.activeConns.Add(-1)
-	w.closeCount.Add(1)
 	// Same detach-for-transplant ledger entry as tryTransplant's, on the
-	// self-initiated async path (celeris#624).
+	// self-initiated async path — and, for the same reason, no closeCount
+	// bump: a detach is not a close (celeris#624).
 	if w.transplantDetached != nil {
 		w.transplantDetached.Add(1)
 	}
@@ -254,6 +279,6 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	_ = unix.Close(fd)
 
 	if err := h.target.AdoptConn(newFD, carry); err != nil {
-		_ = unix.Close(newFD)
+		w.reclaimTransplant(newFD, carry, err)
 	}
 }
