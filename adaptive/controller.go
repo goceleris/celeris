@@ -48,7 +48,23 @@ type controllerState struct {
 	// (recordSwitch) and whenever the condition lapses.
 	upTicks   int
 	downTicks int
+
+	// buildFailures counts consecutive failed lazy standby builds, and
+	// buildRetryAt is when evaluate may next recommend a switch after the
+	// last of them (celeris#656). Without it the controller, whose load has
+	// not changed, recommends the same failing build on the very next tick.
+	// Neither touches lastSwitch or switchTimes: nothing switched, so the
+	// cooldown and the oscillation lock must not count it.
+	buildFailures int
+	buildRetryAt  time.Time
 }
+
+// A failed lazy standby build backs off for standbyBuildBackoffBase, doubling
+// with each consecutive failure up to standbyBuildBackoffMax (celeris#656).
+const (
+	standbyBuildBackoffBase = 30 * time.Second
+	standbyBuildBackoffMax  = 10 * time.Minute
+)
 
 type controller struct {
 	primary   engine.Engine // epoll  (low-conns winner / starting engine)
@@ -134,6 +150,11 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 	}
 
 	if !c.state.lastSwitch.IsZero() && now.Sub(c.state.lastSwitch) < c.cooldown {
+		return false
+	}
+
+	// celeris#656: hold off while a failed lazy standby build backs off.
+	if now.Before(c.state.buildRetryAt) {
 		return false
 	}
 
@@ -258,4 +279,28 @@ func (c *controller) recordSwitch(now time.Time) {
 			c.logger.Warn("oscillation detected, locking switches", "until", c.state.lockUntil)
 		}
 	}
+}
+
+// recordStandbyBuildFailure updates controller state after a lazy standby
+// build failed and the switch was abandoned, and returns how long evaluate
+// now holds off (celeris#656). The sustain count restarts too, so a sustained
+// ramp must be seen again after the backoff.
+func (c *controller) recordStandbyBuildFailure(now time.Time) time.Duration {
+	c.state.buildFailures++
+	backoff := standbyBuildBackoffMax
+	// The shift is bounded: 30s<<5 is already past the cap, and an unbounded
+	// count of failures over a long uptime would overflow it.
+	if n := c.state.buildFailures - 1; n < 5 {
+		backoff = min(standbyBuildBackoffBase<<n, standbyBuildBackoffMax)
+	}
+	c.state.buildRetryAt = now.Add(backoff)
+	c.state.upTicks = 0
+	c.state.downTicks = 0
+	return backoff
+}
+
+// recordStandbyBuilt clears the build backoff once a lazy standby has started.
+func (c *controller) recordStandbyBuilt() {
+	c.state.buildFailures = 0
+	c.state.buildRetryAt = time.Time{}
 }

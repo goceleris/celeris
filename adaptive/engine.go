@@ -582,16 +582,19 @@ func (e *Engine) logTickDebug(now time.Time, shouldSwitch bool) {
 		"bytes_total", m.BytesRead+m.BytesWritten,
 		"up_ticks", e.ctrl.state.upTicks,
 		"down_ticks", e.ctrl.state.downTicks,
+		"standby_build_failures", e.ctrl.state.buildFailures,
+		"standby_build_retry_in", max(e.ctrl.state.buildRetryAt.Sub(now), 0).String(),
 		"should_switch", shouldSwitch,
 	)
 }
 
 // buildAndStartStandby constructs the lazy standby sub-engine, launches its
-// Listen goroutine under the same ctx + wait group Listen captured (so Shutdown
-// joins it), and waits — bounded — for it to bind the shared SO_REUSEPORT port.
-// The caller holds e.mu. wantType is purely for error messages. On any failure
-// it returns an error and the engine state is left untouched (no slot stored),
-// so the current active keeps serving.
+// Listen goroutine under a child of the ctx Listen captured and in the same
+// wait group (so Shutdown joins it), and waits — bounded — for it to bind the
+// shared SO_REUSEPORT port. The caller holds e.mu. wantType is purely for error
+// messages. On any failure it returns an error, stops the standby it started,
+// and leaves the engine state untouched (no slot stored), so the current
+// active keeps serving.
 func (e *Engine) buildAndStartStandby(wantType engine.EngineType) (engine.Engine, error) {
 	if e.buildStandby == nil {
 		return nil, fmt.Errorf("no standby builder for %s", wantType.String())
@@ -605,26 +608,77 @@ func (e *Engine) buildAndStartStandby(wantType engine.EngineType) (engine.Engine
 		return nil, fmt.Errorf("build %s standby: %w", wantType.String(), err)
 	}
 
-	ctx := e.listenCtx
+	// celeris#656: the standby gets its own child context so that one this
+	// function gives up on is stopped. It used to run under the Listen context
+	// itself, so a standby that bound after the deadline below kept running:
+	// in the SO_REUSEPORT group, accepting, and in no slot, where no later
+	// switch would pause it and Shutdown would never name it. Only a standby
+	// that is returned keeps running, until the Listen context ends.
+	ctx, cancel := context.WithCancel(e.listenCtx)
+	started := false
+	defer func() {
+		if !started {
+			cancel()
+		}
+	}()
 	wg := e.listenWG
+	listenErr := make(chan error, 1)
 	wg.Go(func() {
-		if lerr := built.Listen(ctx); lerr != nil {
+		lerr := built.Listen(ctx)
+		if lerr != nil {
 			e.logger.Warn("lazy standby Listen returned error",
 				"standby", built.Type().String(), "error", lerr)
 		}
+		listenErr <- lerr
 	})
 
 	// Wait (bounded) for the standby to bind the shared port — once Addr() is
 	// non-nil it has joined the SO_REUSEPORT group and is accepting, so the
 	// resume-before-pause overlap is real and connections are never dropped.
-	deadline := time.Now().Add(5 * time.Second)
+	//
+	// celeris#656: a Listen that returns has failed to start, and it will
+	// never publish an address. The wait used to ignore that and poll Addr()
+	// for the full 5 s regardless, holding e.mu, on every retry of the switch.
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
 	for built.Addr() == nil {
-		if time.Now().After(deadline) || ctx.Err() != nil {
+		select {
+		case lerr := <-listenErr:
+			if lerr == nil {
+				lerr = errors.New("Listen returned before binding")
+			}
+			return nil, fmt.Errorf("%s standby failed to start: %w", wantType.String(), lerr)
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%s standby stopped before it bound: %w", wantType.String(), ctx.Err())
+		case <-deadline.C:
 			return nil, fmt.Errorf("%s standby failed to bind within 5s", wantType.String())
+		case <-tick.C:
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
+	started = true
 	return built, nil
+}
+
+// abortStandbyBuild records a failed lazy standby build so the controller backs
+// off before recommending the switch again, and logs the abandoned switch.
+//
+// celeris#656: this path used to record nothing. The load that triggered the
+// switch was still there on the next tick, so the controller recommended the
+// same build again, and every attempt that failed the way an io_uring engine
+// with a failing worker does put that engine's sockets on the serving port
+// again. The backoff is kept apart from recordSwitch: nothing switched, so
+// activeIsPrimary, the cooldown and the oscillation lock must not move.
+// ForceSwitch calls performSwitch directly and is not held back by it.
+func (e *Engine) abortStandbyBuild(standby engine.EngineType, err error) {
+	e.switchMu.Lock()
+	retryIn := e.ctrl.recordStandbyBuildFailure(time.Now())
+	failures := e.ctrl.state.buildFailures
+	e.switchMu.Unlock()
+	e.logger.Warn("aborting switch: lazy standby build failed; staying on current active",
+		"standby", standby.String(), "error", err,
+		"consecutive_failures", failures, "retry_in", retryIn.String())
 }
 
 func (e *Engine) performSwitch() {
@@ -684,8 +738,7 @@ func (e *Engine) performSwitch() {
 		if e.secondary == nil {
 			built, err := e.buildAndStartStandby(engine.IOUring)
 			if err != nil {
-				e.logger.Warn("aborting switch: lazy standby build failed; staying on current active",
-					"standby", engine.IOUring.String(), "error", err)
+				e.abortStandbyBuild(engine.IOUring, err)
 				return
 			}
 			// Publish the built engine to both the Engine and controller
@@ -694,6 +747,7 @@ func (e *Engine) performSwitch() {
 			e.switchMu.Lock()
 			e.secondary = built
 			e.ctrl.secondary = built
+			e.ctrl.recordStandbyBuilt()
 			e.switchMu.Unlock()
 			freshlyBuilt = true
 		}
@@ -702,13 +756,13 @@ func (e *Engine) performSwitch() {
 		if e.primary == nil {
 			built, err := e.buildAndStartStandby(engine.Epoll)
 			if err != nil {
-				e.logger.Warn("aborting switch: lazy standby build failed; staying on current active",
-					"standby", engine.Epoll.String(), "error", err)
+				e.abortStandbyBuild(engine.Epoll, err)
 				return
 			}
 			e.switchMu.Lock()
 			e.primary = built
 			e.ctrl.primary = built
+			e.ctrl.recordStandbyBuilt()
 			e.switchMu.Unlock()
 			freshlyBuilt = true
 		}
