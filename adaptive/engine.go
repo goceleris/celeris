@@ -964,6 +964,26 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantDetached:          pm.TransplantDetached + sm.TransplantDetached,
 		TransplantAdoptSlotOccupied: pm.TransplantAdoptSlotOccupied + sm.TransplantAdoptSlotOccupied,
 		CloseMissingConnState:       pm.CloseMissingConnState + sm.CloseMissingConnState,
+
+		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
+		// so the epoll half contributes zero and a switch simply moves which
+		// side is counting.
+		//
+		// Counts and total durations are cumulative, so they add. The two
+		// *MaxNanos fields are NOT: each is the longest SINGLE episode on its
+		// sub-engine, and adding two maxima would manufacture an episode
+		// nothing observed. That distinction matters here more than most,
+		// because #607's whole discriminator is that an episode measured in
+		// SECONDS means a connection received nothing while its peer's bytes
+		// sat unread — summing two sub-second maxima into a seconds-long one
+		// would fabricate exactly the signal the field exists to detect.
+		RecvSQFull:                pm.RecvSQFull + sm.RecvSQFull,
+		RecvStallEpisodes:         pm.RecvStallEpisodes + sm.RecvStallEpisodes,
+		RecvStallNanos:            pm.RecvStallNanos + sm.RecvStallNanos,
+		RecvStallMaxNanos:         max(pm.RecvStallMaxNanos, sm.RecvStallMaxNanos),
+		RecvLinkedArms:            pm.RecvLinkedArms + sm.RecvLinkedArms,
+		RecvLinkedBlockedNanos:    pm.RecvLinkedBlockedNanos + sm.RecvLinkedBlockedNanos,
+		RecvLinkedBlockedMaxNanos: max(pm.RecvLinkedBlockedMaxNanos, sm.RecvLinkedBlockedMaxNanos),
 	}
 }
 
