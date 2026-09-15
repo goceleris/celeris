@@ -78,7 +78,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				}
 				readErrMu.Unlock()
 			}
-			addr, shutdownEngine := startNativeServer(t, kind, Config{
+			addr, shutdownEngine, srv := startNativeServerWithHandle(t, kind, Config{
 				CheckOrigin:           func(*celeris.Context) bool { return true },
 				ReadLimit:             256 * 1024,
 				MaxBackpressureBuffer: bpBuf, // realistic buffer; headroom (cap-highWater) must exceed async pause-apply latency, else Append drops a chunk (ErrReadLimit) -- a config artifact, not engine reordering
@@ -116,6 +116,32 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					t.Errorf("engine shutdown did not complete within 20s: paused connections " +
 						"that were never re-armed are blocking graceful shutdown (celeris#482)")
 				}
+				// Recv-arming witnesses, read after shutdown so every worker
+				// has left its loop and no stall episode is still open. They
+				// are direct atomics, so nothing is stranded in a
+				// per-iteration batch. RECVSTALL is the celeris#607 witness:
+				// a connection owed a recv arm that the dirty-list retry
+				// passed over because a SEND was outstanding. Logged, not
+				// asserted -- an episode is normal SQ-ring pressure; it is
+				// the DURATION, joined against closeTimeout above, that
+				// carries the verdict.
+				if kind != celeris.IOUring {
+					return
+				}
+				info := srv.EngineInfo()
+				if info == nil {
+					t.Errorf("EngineInfo() is nil after shutdown; cannot read the recv-arming witnesses")
+					return
+				}
+				m := info.Metrics
+				t.Logf("%s: RECVSTALL sqFull=%d episodes=%d totalMs=%d maxMs=%d armDeclined=%d resumeWhileCancelPending=%d doubleArmed=%d cqeUnaccounted=%d",
+					kind, m.RecvSQFull, m.RecvStallEpisodes,
+					m.RecvStallNanos/1e6, m.RecvStallMaxNanos/1e6,
+					m.RecvArmDeclined, m.RecvResumeWhileCancelPending,
+					m.RecvDoubleArmed, m.RecvCQEUnaccounted)
+				t.Logf("%s: LINKBLOCK arms=%d blockedTotalMs=%d blockedMaxMs=%d",
+					kind, m.RecvLinkedArms, m.RecvLinkedBlockedNanos/1e6,
+					m.RecvLinkedBlockedMaxNanos/1e6)
 			}()
 
 			hostPort := strings.TrimPrefix(addr, "ws://")
