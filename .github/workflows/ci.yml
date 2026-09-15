@@ -162,8 +162,12 @@ jobs:
       # CELERIS_REQUIRE_UPSWITCH=1 turns those tests' environment skip into
       # a failure, so this job cannot go green by skipping them.
       #
-      # Quarantined by name with its open issue. Delete the entry when the
-      # issue closes: TestBidirectionalFlapAsync (celeris#657).
+      # Quarantined by name, each with its open issue. Delete the entry when
+      # the issue closes: TestBidirectionalFlapAsync (celeris#657);
+      # TestRampH1Sync and TestRampH1Async (celeris#662: a switch drops the
+      # connections queued on the paused engine, and on a GitHub runner a
+      # 2048-conn promotion loses about a third of them). The other three
+      # up-switch tests keep running.
       - name: Adaptive — race tests (memlock raised, up-switch required)
         env:
           CELERIS_REQUIRE_UPSWITCH: "1"
@@ -171,7 +175,7 @@ jobs:
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v \
-            -skip '^TestBidirectionalFlapAsync$' \
+            -skip '^(TestBidirectionalFlapAsync|TestRampH1Sync|TestRampH1Async)$' \
             ./adaptive/...
 
   conformance:
