@@ -158,7 +158,22 @@ func (e *Engine) Listen(ctx context.Context) error {
 	}
 
 	if len(e.loops) > 0 {
-		addr := boundAddr(e.loops[0].listenFD)
+		// celeris#639: publish an address a loop recorded before it signalled
+		// ready, never getsockname on a listenFD the loop may have closed since,
+		// and refuse to start rather than publish nil: every caller that polls
+		// Addr() reads nil as "not bound yet" and waits.
+		var addr net.Addr
+		for _, l := range e.loops {
+			if l.listenAddr != nil {
+				addr = l.listenAddr
+				break
+			}
+		}
+		if addr == nil {
+			innerCancel()
+			wg.Wait()
+			return fmt.Errorf("epoll: no loop could report the address it bound for %s", e.cfg.Addr)
+		}
 		e.addr.Store(&addr)
 	}
 

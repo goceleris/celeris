@@ -217,6 +217,14 @@ type Loop struct {
 	// eligible conn at a request boundary is detached and handed to the target
 	// io_uring engine. See docs/design/383-connection-transplant.md.
 	transplant atomic.Pointer[transplantState]
+
+	// listenAddr is the address listenFD was bound to, recorded on this
+	// loop's thread before it signals ready (celeris#639). Past ready the
+	// loop may already have closed listenFD — a context cancelled during
+	// startup runs shutdown at once — so Listen publishes this instead of
+	// asking the kernel about a descriptor number that may now belong to
+	// something else. Written once before ready; read only after it.
+	listenAddr net.Addr
 }
 
 func newLoop(id, cpuID int, handler stream.Handler,
@@ -353,6 +361,9 @@ func (l *Loop) run(ctx context.Context) {
 		}
 	}
 
+	// celeris#639: listenFD is certainly this loop's socket here; after ready
+	// a cancelled context closes it in shutdown.
+	l.listenAddr = listenAddrOf(l.listenFD)
 	l.ready <- nil
 
 	activeTimeoutMs := 1 // 1ms default epoll timeout
@@ -2862,6 +2873,10 @@ func createListenSocket(addr string) (int, error) {
 	}
 	return fd, nil
 }
+
+// listenAddrOf is boundAddr behind a var so a test can make every loop fail
+// to report its address (celeris#639).
+var listenAddrOf = boundAddr
 
 func boundAddr(fd int) net.Addr {
 	sa, err := unix.Getsockname(fd)

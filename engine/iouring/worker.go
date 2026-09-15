@@ -467,6 +467,14 @@ type Worker struct {
 	// own thread after each handleRecv; when set, an idle H1 conn at a clean
 	// boundary is detached and handed to the target epoll engine.
 	transplant atomic.Pointer[transplantTargetHolder]
+
+	// listenAddr is the address listenFD was bound to, recorded on this
+	// worker's thread before it signals ready (celeris#639). Past ready the
+	// worker may already have closed listenFD — a context cancelled during
+	// startup runs shutdown at once — so Listen publishes this instead of
+	// asking the kernel about a descriptor number that may now belong to
+	// something else. Written once before ready; read only after it.
+	listenAddr net.Addr
 }
 
 // recvArmStats are the recv-arming witnesses behind celeris#484 / #560,
@@ -914,6 +922,9 @@ func (w *Worker) run(ctx context.Context) {
 		return
 	}
 
+	// celeris#639: listenFD is certainly this worker's socket here; after
+	// ready a cancelled context closes it in shutdown.
+	w.listenAddr = listenAddrOf(w.listenFD)
 	w.ready <- nil
 	w.cachedNow = time.Now().UnixNano()
 
@@ -5170,6 +5181,10 @@ func createListenSocket(addr string) (int, error) {
 
 	return fd, nil
 }
+
+// listenAddrOf is boundAddr behind a var so a test can make every worker
+// fail to report its address (celeris#639).
+var listenAddrOf = boundAddr
 
 func boundAddr(fd int) net.Addr {
 	sa, err := unix.Getsockname(fd)
