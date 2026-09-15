@@ -39,10 +39,51 @@ func (e *Engine) AdoptConn(fd int, carry engine.Carryover) error {
 	w := e.workers[int(e.metrics.transplantRR.Add(1)-1)%n]
 	e.mu.Unlock()
 
-	// addDriverAction takes the worker's own lock + wakes its ring; safe to call
-	// outside e.mu.
-	w.addDriverAction(driverAction{kind: driverActionAdopt, adoptFD: fd, adoptCarry: carry})
-	return nil
+	// addAdoptAction takes the worker's own lock and wakes it, parked or not;
+	// safe to call outside e.mu. It refuses once the worker has shut down, and
+	// the caller then still owns fd (celeris#658).
+	return w.addAdoptAction(fd, carry)
+}
+
+// closeAdoptQueue refuses every adoption still queued when the worker shuts
+// down, and every AdoptConn after it. Worker.shutdown calls it first, on the
+// worker thread.
+//
+// A queued adoption is a connection the source has ALREADY let go of:
+// AdoptConn returned nil, so the source dropped it from its live gauge with no
+// OnDisconnect. Worker.shutdown only walks the conn table, so an adopt still in
+// the driver-action queue used to outlive the engine — descriptor open, owned
+// by nobody (celeris#658). The wakeup does not make that state unreachable: a
+// worker woken out of its park checks its context at the top of the next
+// iteration, before drainDriverActions. So each queued adopt is finished here
+// like any other adoption this worker cannot complete (refuseAdopt: close,
+// count, fire the hook), and adoptClosed, set under the same lock, turns a
+// later AdoptConn into an error the source can reclaim from.
+//
+// The other driver actions stay queued exactly as before: they carry no
+// descriptor the engine owns (a driver closes its own fds), and
+// shutdownDrivers already fires onClose for every registered driver conn.
+func (w *Worker) closeAdoptQueue() {
+	w.driverActionMu.Lock()
+	w.adoptClosed = true
+	var adopts []driverAction
+	kept := w.driverActionQueue[:0]
+	for _, a := range w.driverActionQueue {
+		if a.kind == driverActionAdopt {
+			adopts = append(adopts, a)
+			continue
+		}
+		kept = append(kept, a)
+	}
+	clear(w.driverActionQueue[len(kept):])
+	w.driverActionQueue = kept
+	if len(kept) == 0 {
+		w.driverActionPending.Store(0)
+	}
+	w.driverActionMu.Unlock()
+	for _, a := range adopts {
+		w.refuseAdopt(a.adoptFD, a.adoptCarry)
+	}
 }
 
 // TransplantCount returns the cumulative number of connections this engine has

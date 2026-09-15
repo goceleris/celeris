@@ -499,15 +499,41 @@ func (e *Engine) ResumeAccept() error {
 		// blocks on the new listen FD rather than the previously-closed
 		// one.
 		w.listenFDClosed.Store(false)
-		w.wakeMu.Lock()
-		if w.suspended.Load() {
-			close(w.wake)
-			w.wake = make(chan struct{})
-			w.suspended.Store(false)
-		}
-		w.wakeMu.Unlock()
+		w.wakeIfSuspended()
 	}
 	return nil
+}
+
+// wakeIfSuspended ends a DRAINING→SUSPENDED park: if the worker is parked,
+// close its wake channel, give it a fresh one and clear suspended. Safe from
+// any goroutine; a no-op on a worker that is running.
+//
+// The park waits on a Go channel, not on the ring, so an eventfd write does
+// not end it — only this does. ResumeAccept is one caller. The driver-action
+// queue is the other: AdoptConn (and a driver's RegisterConn / Write /
+// UnregisterConn) arrives from another goroutine while the worker has no
+// connection and no listener to wake it for, and without the kick a standby
+// worker slept through a transplanted descriptor until the next ResumeAccept —
+// forever, if the engine stayed the standby — while the source already counted
+// the hand-off done (celeris#658).
+//
+// No wakeup can be lost. A waker publishes its work — sets the flag the park
+// watches — BEFORE it takes wakeMu, and the worker re-checks those flags UNDER
+// wakeMu before it sets suspended. The mutex serialises the two: if the
+// worker's check runs first, the waker finds suspended set and closes wake; if
+// the waker's runs first, the flag is already set and the worker does not park.
+//
+// Lock order: e.mu → wakeMu (ResumeAccept) is the only nesting. wakeMu is a
+// leaf — nothing is acquired while it is held — so no caller may hold
+// driverActionMu or detachQMu when it calls this.
+func (w *Worker) wakeIfSuspended() {
+	w.wakeMu.Lock()
+	if w.suspended.Load() {
+		close(w.wake)
+		w.wake = make(chan struct{})
+		w.suspended.Store(false)
+	}
+	w.wakeMu.Unlock()
 }
 
 var (

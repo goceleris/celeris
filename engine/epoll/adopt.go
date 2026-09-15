@@ -42,20 +42,63 @@ func (e *Engine) AdoptConn(fd int, carry engine.Carryover) error {
 	}
 	l := e.loops[int(e.adoptRR.Add(1)-1)%n]
 	l.adoptQMu.Lock()
+	if l.adoptQClosed {
+		l.adoptQMu.Unlock()
+		// The loop has shut down and will never drain its queue again. A nil
+		// return here would hand the descriptor to nobody; an error leaves it
+		// with the source, whose reclaim path takes the connection back
+		// (celeris#658).
+		return fmt.Errorf("celeris/epoll: loop %d has shut down, cannot adopt fd %d", l.id, fd)
+	}
 	l.adoptQueue = append(l.adoptQueue, adoptItem{fd: fd, carry: carry})
 	l.adoptQPending.Store(1)
-	l.adoptQMu.Unlock()
 	// Wake the loop so the adopt is applied promptly (the loop drains the
-	// eventfd counter and then drainAdoptQueue).
+	// eventfd counter and then drainAdoptQueue). Written under adoptQMu:
+	// Loop.shutdown takes this lock (closeAdoptQueue) before it closes the
+	// eventfd, so the write can never land on a closed — possibly reused —
+	// descriptor number.
 	if l.eventFD >= 0 {
 		var val [8]byte
 		val[0] = 1
 		_, _ = unix.Write(l.eventFD, val[:])
 	}
+	l.adoptQMu.Unlock()
+	// The eventfd only reaches a loop that is in epoll_wait. A standby loop
+	// parked in DRAINING→SUSPENDED waits on a channel instead, and used to
+	// sleep through this adoption (celeris#658). Kick it — after releasing
+	// adoptQMu, because wakeMu is a leaf lock.
+	l.wakeIfSuspended()
 	return nil
 }
 
 var _ engine.TransplantTarget = (*Engine)(nil)
+
+// closeAdoptQueue refuses every adoption still queued when the loop shuts
+// down, and every AdoptConn after it. Loop.shutdown calls it first, on the
+// loop thread.
+//
+// A queued adoption is a connection the source has ALREADY let go of:
+// AdoptConn returned nil, so the source dropped it from its live gauge with no
+// OnDisconnect. Loop.shutdown only walks the conn table, so an item still in
+// the queue used to outlive the engine — descriptor open, owned by nobody, in
+// CLOSE_WAIT once the peer gave up (celeris#658). The wakeup in AdoptConn does
+// not make that state unreachable: a loop woken out of its park checks its
+// context at the top of the next iteration, before drainAdoptQueue. So each
+// item is finished here like any other adoption this loop cannot complete
+// (refuseAdopt: close, count, fire the hook), and marking the queue closed
+// under the same lock is what turns a later AdoptConn into an error the
+// source can reclaim from, instead of a queue entry nothing will ever drain.
+func (l *Loop) closeAdoptQueue() {
+	l.adoptQMu.Lock()
+	l.adoptQClosed = true
+	queued := l.adoptQueue
+	l.adoptQueue = nil
+	l.adoptQPending.Store(0)
+	l.adoptQMu.Unlock()
+	for _, it := range queued {
+		l.refuseAdopt(it.fd, it.carry)
+	}
+}
 
 // drainAdoptQueue applies pending io_uring→epoll adoptions on the loop thread.
 // Called from the run loop after the event batch.
