@@ -171,11 +171,26 @@ func TestSkipFunction(t *testing.T) {
 	}
 }
 
+// TestTokenRefill covers the middleware end of the bucket: one request spends
+// the burst and the next is refused. The refill ARITHMETIC is covered
+// separately and deterministically by TestShardedLimiterRefillIsExact,
+// because asserting it here means racing the wall clock.
+//
+// This used to run at 1000 RPS with a burst of 1, which refills a token every
+// millisecond, so the 429 held only if the second request reached the limiter
+// inside that millisecond. Between the two calls sit a middleware
+// construction, two full RunMiddleware round trips and the race detector's
+// bookkeeping; on a loaded shared runner a millisecond is not a budget, and
+// when it was exceeded the token had refilled and the request was allowed
+// (celeris#610). One request per second gives the same assertion a window a
+// thousand times longer, and nothing in it depends on the window being any
+// particular size -- only on it being longer than two in-process calls.
 func TestTokenRefill(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// 1000 RPS = 1 token per ms, burst of 1.
-	mw := New(Config{RPS: 1000, Burst: 1, CleanupInterval: time.Hour, CleanupContext: ctx})
+	// 1 RPS = one token per second, burst of 1. The second request cannot be
+	// allowed unless a full second elapses between two in-process calls.
+	mw := New(Config{RPS: 1, Burst: 1, CleanupInterval: time.Hour, CleanupContext: ctx})
 
 	// Use the token.
 	_, err := testutil.RunMiddleware(t, mw, celeristest.WithHeader("x-forwarded-for", "1.2.3.4"))
@@ -184,13 +199,53 @@ func TestTokenRefill(t *testing.T) {
 	// Should be blocked now.
 	_, err = testutil.RunMiddleware(t, mw, celeristest.WithHeader("x-forwarded-for", "1.2.3.4"))
 	testutil.AssertHTTPError(t, err, 429)
+}
 
-	// Wait for refill (at 1000 RPS, 5ms gives ~5 tokens).
-	time.Sleep(5 * time.Millisecond)
+// TestShardedLimiterRefillIsExact drives the bucket with explicit timestamps,
+// so the refill boundary is asserted rather than waited for. allow() already
+// takes `now`, so the seam needs no production change and no sleep: the old
+// test's "wait 5ms for refill" passed because 5 ms is generous, not because
+// anything guaranteed it.
+func TestShardedLimiterRefillIsExact(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 1000 RPS, burst 1: exactly one token per millisecond.
+	lim := newShardedLimiter(ctx, 1, 1000, 1, time.Hour)
 
-	// Should be allowed again.
-	_, err = testutil.RunMiddleware(t, mw, celeristest.WithHeader("x-forwarded-for", "1.2.3.4"))
-	testutil.AssertNoError(t, err)
+	const key = "1.2.3.4"
+	t0 := time.Now().UnixNano()
+
+	if ok, _, _ := lim.allow(key, t0); !ok {
+		t.Fatal("the first request must spend the burst token")
+	}
+	if ok, _, _ := lim.allow(key, t0); ok {
+		t.Fatal("a second request at the same instant must be refused")
+	}
+	// One nanosecond before the boundary the bucket still holds less than a
+	// whole token. This is the assertion the wall-clock version could never
+	// make, and the one that catches a wrong refill rate.
+	if ok, _, _ := lim.allow(key, t0+int64(time.Millisecond)-1); ok {
+		t.Fatal("a request 1ns before the refill boundary must still be refused")
+	}
+	// Just past it, the token is there. The 1 microsecond margin -- a
+	// thousandth of the refill interval -- is here for a measured reason
+	// rather than a superstitious one: each refused call also advances
+	// lastFill, so the refill is summed over however many intervals the
+	// caller happened to poll in, and float64 rounding can leave the total a
+	// hair under one token exactly at the boundary. Measured drift was 0 ns
+	// for up to 100 intermediate polls and 1 ns at 1000, so asserting ON the
+	// boundary would pin a rounding artefact rather than the refill rate.
+	if ok, _, _ := lim.allow(key, t0+int64(time.Millisecond)+int64(time.Microsecond)); !ok {
+		t.Fatal("a request past the refill boundary must be allowed")
+	}
+	// The bucket caps at burst, so a long idle period grants one token, not a
+	// thousand.
+	if ok, _, _ := lim.allow(key, t0+int64(time.Second)); !ok {
+		t.Fatal("a request after a full second must be allowed")
+	}
+	if ok, _, _ := lim.allow(key, t0+int64(time.Second)); ok {
+		t.Fatal("burst is 1, so a second request at that instant must be refused: the bucket must cap at burst, not accumulate a second's worth of tokens")
+	}
 }
 
 func TestCustomKeyFunc(t *testing.T) {
