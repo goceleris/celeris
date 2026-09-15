@@ -171,6 +171,42 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// engine lost track of, the only witness of a double recv that the
 	// userspace guard cannot see. Must stay 0. Zero on other engines.
 	RecvCQEUnaccounted uint64
+	// RecvSQFull is the cumulative number of recv arms the io_uring engine
+	// could not place because the submission queue had no free entry. It
+	// is the only way a connection is ever left owing a recv, so it bounds
+	// RecvStallEpisodes from above. Zero on other engines.
+	RecvSQFull uint64
+	// RecvStallEpisodes is the cumulative number of times the io_uring
+	// dirty-list retry passed over a connection that was owed a recv arm
+	// because a SEND was still outstanding on it. Counted once per
+	// episode, at the transition into it. Zero on other engines.
+	RecvStallEpisodes uint64
+	// RecvStallNanos is the total wall time those episodes lasted, from
+	// the first skipped pass to the arm (or to the connection leaving the
+	// dirty list). Zero on other engines.
+	RecvStallNanos uint64
+	// RecvStallMaxNanos is the longest single such episode. This is the
+	// discriminating one: SQ-ring pressure resolving inside a pass is
+	// normal, while an episode measured in seconds is a connection that
+	// received nothing for seconds with its peer's bytes sitting unread in
+	// the kernel (celeris#607). Zero on other engines.
+	RecvStallMaxNanos uint64
+	// RecvLinkedArms is the cumulative number of times the io_uring engine
+	// chained a RECV behind a SEND with IOSQE_IO_LINK (the single-shot
+	// request/response fast path). Zero on other engines.
+	RecvLinkedArms uint64
+	// RecvLinkedBlockedNanos is the total time those chained recvs spent
+	// waiting for their send to complete — time the connection could not
+	// receive, because the kernel does not start a linked operation until
+	// its predecessor finishes. Measured at the send's completion, with
+	// the recv provably still queued. Zero on other engines.
+	RecvLinkedBlockedNanos uint64
+	// RecvLinkedBlockedMaxNanos is the longest single such wait. A
+	// request/response cycle pays microseconds; a peer that has stopped
+	// reading turns it into seconds, during which the peer's own bytes
+	// pile up unread in the server's receive queue (celeris#607). Zero on
+	// other engines.
+	RecvLinkedBlockedMaxNanos uint64
 	// DetachedConnections is the current number of connections handed to a
 	// detached middleware goroutine (WebSocket / SSE), summed over the
 	// io_uring workers. It mirrors the per-worker detachedCount that gates
