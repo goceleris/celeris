@@ -266,12 +266,28 @@ func (e *Engine) Listen(ctx context.Context) error {
 		}
 	}
 
+	// celeris#639: publish an address a worker recorded before it signalled
+	// ready, never getsockname on a listenFD the worker may have closed since,
+	// and refuse to start rather than publish nil: every caller that polls
+	// Addr() reads nil as "not bound yet" and waits.
+	var addr net.Addr
+	for _, w := range workers {
+		if w.listenAddr != nil {
+			addr = w.listenAddr
+			break
+		}
+	}
+	if len(workers) > 0 && addr == nil {
+		innerCancel()
+		wg.Wait()
+		return fmt.Errorf("io_uring: no worker could report the address it bound for %s", e.cfg.Addr)
+	}
+
 	e.mu.Lock()
 	e.tier = tier
 	e.workers = workers
 	e.mu.Unlock()
-	if len(workers) > 0 {
-		addr := boundAddr(workers[0].listenFD)
+	if addr != nil {
 		e.addr.Store(&addr)
 	}
 
