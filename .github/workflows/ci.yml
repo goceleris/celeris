@@ -169,6 +169,7 @@ jobs:
         env:
           CELERIS_REQUIRE_UPSWITCH: "1"
         run: |
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v \
             -skip '^(TestBidirectionalFlapAsync|TestAdaptiveSwitchVsAcceptChurn)$' \
