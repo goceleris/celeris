@@ -101,9 +101,9 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	ErrorAcceptFDLimit uint64
 	// ErrorAcceptCancelled is the share of ErrorCount from accept failures
 	// that mean the accept went away rather than the host running out of
-	// something: ECANCELED and EBADF (the listen descriptor was cancelled
-	// and closed under it, which is exactly what PauseAccept does),
-	// ECONNABORTED and EINTR.
+	// something: ECANCELED (an in-flight accept was cancelled, which is what
+	// PauseAccept does), EBADF (the listen descriptor was closed under an
+	// accept), ECONNABORTED and EINTR.
 	//
 	// This is the bucket a PauseAccept lands in, so on the adaptive engine
 	// it is a per-switch cost rather than a fault, and it is the one that

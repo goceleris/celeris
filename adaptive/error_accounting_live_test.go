@@ -133,15 +133,15 @@ func TestPromotionUnderLoadAttributesEveryError(t *testing.T) {
 // switch produces that neither sub-engine produces while running alone, so it
 // is the first thing celeris#645's arithmetic has to account for: pausing the
 // io_uring sub-engine cancels each worker's in-flight multishot accept
-// (-ECANCELED) and the re-arm that races the listen-descriptor close
-// (-EBADF), two counted failures per worker per pause.
+// (-ECANCELED), one counted failure per worker per pause. It used to be two:
+// the pause also re-armed accept on the descriptor it was closing, and that
+// accept failed with -EBADF after the close (celeris#662).
 //
-// Measured here at 2 workers it is 4, deterministic across repeated runs. On
-// the epoll→io_uring direction it is zero, because epoll's pause path drains
-// its listen queue and closes the descriptor without counting anything — so
-// this is a floor under a REVERT, not under the promotion in the issue's
-// table, and it is far too small to be #645's ~5/s. Pinning it is what lets
-// the next nightly subtract it instead of arguing about it.
+// On the epoll→io_uring direction it is zero, because epoll's pause path
+// counts no accept failure: it accepts the connections still queued and
+// serves them. So this is a floor under a REVERT, not under the promotion in
+// the issue's table, and it is far too small to be #645's ~5/s. Pinning it is
+// what lets the next nightly subtract it instead of arguing about it.
 func TestRevertChargesItsAcceptTeardownToTheStandby(t *testing.T) {
 	e, _, stop := newBoundAdaptiveH(t, respHandler{}, false)
 	defer stop()

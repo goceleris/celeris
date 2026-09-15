@@ -968,8 +968,19 @@ func (w *Worker) run(ctx context.Context) {
 		// loads per event-loop iteration on the steady-state hot path.
 		paused := w.acceptPaused.Load()
 		if w.listenFD >= 0 && paused {
+			// Clear w.listenFD BEFORE handling the cancel's completions.
+			// handleAccept re-arms accept whenever listenFD >= 0 and a
+			// completion arrives without F_MORE, which is exactly what the
+			// cancelled accept delivers, so it used to queue a new accept SQE
+			// for the descriptor this branch then closed. That SQE went to the
+			// kernel after the close and failed with EBADF on every pause, or
+			// with EINVAL when a sibling worker's drain had already reused
+			// the number for one of its connections (celeris#662): a stale
+			// accept aimed at a descriptor this worker does not own.
+			lfd := w.listenFD
+			w.listenFD = -1
 			if sqe := w.ring.GetSQE(); sqe != nil {
-				prepCancelFDSkipSuccess(sqe, w.listenFD)
+				prepCancelFDSkipSuccess(sqe, lfd)
 				setSQEUserData(sqe, 0)
 				// Submit and wait for the cancel to complete before closing.
 				_ = w.ring.SubmitAndWaitTimeout(50 * time.Millisecond)
@@ -987,8 +998,13 @@ func (w *Worker) run(ctx context.Context) {
 				}
 				w.ring.EndCQ(cqH)
 			}
-			_ = unix.Close(w.listenFD)
-			w.listenFD = -1
+			// The completions above only cover handshakes an accept had
+			// already reached. Anything still in the kernel accept queue
+			// would be aborted by the close below, after its client had
+			// possibly sent a request; accept it now instead and serve it
+			// like any other connection (celeris#662).
+			w.acceptQueuedOnPause(ctx, lfd)
+			_ = unix.Close(lfd)
 		}
 		// Maintain the listenFDClosed signal that PauseAccept polls on.
 		// Set it whenever paused==true regardless of whether we just
@@ -1760,11 +1776,12 @@ func (w *Worker) handleAccept(ctx context.Context, c *completionEntry, _ int, no
 			return
 		}
 		// Classify by errno rather than folding every failed accept into
-		// one number (celeris#645). The cancel-and-close pair a
-		// PauseAccept leaves behind (ECANCELED on the in-flight multishot,
-		// then EBADF on the re-arm that raced the close) lands in
-		// ErrorAcceptCancelled, which is what makes an adaptive switch's
-		// accept cost separable from a sustained accept-side loss.
+		// one number (celeris#645). The ECANCELED a PauseAccept leaves on
+		// the in-flight multishot lands in ErrorAcceptCancelled, which is
+		// what makes an adaptive switch's accept cost separable from a
+		// sustained accept-side loss. The pause clears w.listenFD before it
+		// handles that completion, so the re-arm below does not fire for
+		// the descriptor being closed (celeris#662).
 		w.errs.AcceptFailed(unix.Errno(-c.Res))
 		// Re-arm accept whenever the kernel is not going to deliver more
 		// CQEs from the current SQE. In single-shot mode !cqeHasMore is
@@ -1863,6 +1880,58 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	if !w.prepareRecv(cs, cs.buf) {
 		cs.needsRecv = true
 		w.markDirty(cs)
+	}
+}
+
+// acceptQueuedOnPause accepts every connection still waiting in the listen
+// socket's kernel accept queue before a pausing worker closes that socket
+// (celeris#662). The pause cancels the multishot accept and handles the
+// completions already posted, but a handshake no accept completion had reached
+// is still queued in the kernel, and the close aborts it — after its client
+// may have sent a request.
+//
+// Each descriptor goes to onAcceptedFD, the path an accept completion takes
+// (as a plain descriptor: accept4 never returns a fixed-file index). So it is
+// counted, OnConnect fires, sockopts apply, a descriptor past the conn table
+// is closed and counted in ConnTableCap, and a first recv that a full SQ ring
+// cannot take is left on the dirty list with needsRecv set, which the loop
+// re-arms once the next submit has made room: nothing is dropped.
+//
+// The listen socket is non-blocking (createListenSocket), so accept4 returns
+// EAGAIN once the queue is empty; the drain is also bounded at the conn
+// table's size. EMFILE/ENFILE or an unexpected error stops it and is
+// classified by AcceptFailed, as an accept completion's would be; what is
+// still queued is left to the close.
+//
+// Interactions: the drained connections hold connCount above zero, so the
+// DRAINING→SUSPENDED gate keeps the worker serving them until they close or
+// are transplanted, then parks it as before. A ResumeAccept racing the drain
+// loses nothing: the worker still closes the listener it read as paused and
+// re-creates it on the next iteration, as it did before. A handshake still in
+// progress at the close is aborted by the kernel as before; that is inherent
+// to closing a listen socket.
+//
+// listenFD is the socket being closed. The caller has already cleared
+// w.listenFD, so no completion handled on the way can re-arm accept on it.
+func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
+	now := time.Now().UnixNano()
+	for range len(w.conns) {
+		newFD, _, err := unix.Accept4(listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		if err != nil {
+			switch err {
+			case unix.EAGAIN:
+				return
+			case unix.EINTR, unix.ECONNABORTED:
+				// A signal, or a queued connection reset before it was
+				// taken: the rest of the queue is still there.
+				continue
+			}
+			var errno unix.Errno
+			_ = errors.As(err, &errno)
+			w.errs.AcceptFailed(errno)
+			return
+		}
+		w.onAcceptedFD(ctx, newFD, now, false)
 	}
 }
 

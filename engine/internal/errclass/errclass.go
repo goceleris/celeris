@@ -38,9 +38,9 @@ type Counters struct {
 	AcceptFDLimit atomic.Uint64
 	// AcceptCancelled counts accept failures that mean the accept itself
 	// went away rather than the host running out of something: ECANCELED
-	// and EBADF (the listen descriptor was cancelled and closed under it —
-	// what a PauseAccept does), ECONNABORTED (the peer reset between SYN
-	// and accept) and EINTR.
+	// (an in-flight accept was cancelled — what a PauseAccept does), EBADF
+	// (the listen descriptor was closed under an accept), ECONNABORTED (the
+	// peer reset between SYN and accept) and EINTR.
 	//
 	// io_uring reports all four through a completion and counts them here.
 	// epoll's accept4 loop retries ECONNABORTED and EINTR in place and has

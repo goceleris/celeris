@@ -249,8 +249,10 @@ func (e *Engine) Type() engine.EngineType {
 }
 
 // PauseAccept stops accepting new connections. Synchronous — blocks
-// until every loop has closed its listen FD (and drained pending
-// accepts in the kernel queue with FIN, not RST). The adaptive engine
+// until every loop has closed its listen FD. Connections already waiting
+// in a loop's kernel accept queue are accepted and served first, like any
+// other connection the engine holds, rather than shut down unanswered
+// (celeris#662). The adaptive engine
 // relies on this: until the standby's listen sockets are gone from the
 // SO_REUSEPORT routing pool, fresh dials may land on the about-to-pause
 // engine and get RST'd when its FD closes. Synchronous Pause means

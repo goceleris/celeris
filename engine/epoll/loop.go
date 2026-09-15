@@ -383,19 +383,15 @@ func (l *Loop) run(ctx context.Context) {
 		// iteration on the steady-state hot path.
 		paused := l.acceptPaused.Load()
 		if l.listenFD >= 0 && paused {
-			// Drain any pending accepts from the kernel's listen queue so
-			// they get a clean shutdown (FIN) rather than the RST that
-			// close() of the listen FD would send. Loadgen's H2 dial
-			// retries handle FIN gracefully; an RST aborts the whole
-			// benchmark.
-			for {
-				connFD, _, accErr := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
-				if accErr != nil {
-					break
-				}
-				_ = unix.Shutdown(connFD, unix.SHUT_RDWR)
-				_ = unix.Close(connFD)
-			}
+			// Connections still in the kernel accept queue completed their
+			// handshake before the pause and may already have sent a
+			// request. Accept them through the normal path and serve them
+			// before the listen socket goes: the close would otherwise abort
+			// them (celeris#662). This used to accept them only to shut them
+			// down, on the theory that a FIN is kinder than the close's RST —
+			// but either way the client lost a request it had sent, and the
+			// engine counted nothing.
+			l.acceptQueuedOnPause(ctx)
 			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
 			_ = unix.Close(l.listenFD)
 			l.listenFD = -1
@@ -813,7 +809,19 @@ func (l *Loop) notifyDetachedPeerClosed(cs *connState) {
 // for a fresh SYN edge.
 const acceptAllCap = 1024
 
-func (l *Loop) acceptAll(ctx context.Context, now int64) {
+// acceptStop is why acceptAll returned. The event loop only needs listenHot;
+// acceptQueuedOnPause needs to tell a queue that is empty from one that may
+// not be (celeris#662).
+type acceptStop uint8
+
+const (
+	acceptDrained acceptStop = iota // accept4 hit EAGAIN: the queue is empty
+	acceptCapped                    // acceptAllCap reached: the queue may hold more
+	acceptFDLimit                   // EMFILE/ENFILE: counted in AcceptFDLimit
+	acceptFailed                    // any other accept error: counted in AcceptOther
+)
+
+func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 	for i := 0; i < acceptAllCap; i++ {
 		newFD, sa, err := unix.Accept4(l.listenFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
@@ -822,7 +830,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 				// Listen queue fully drained — ET edge satisfied.
 				// (EWOULDBLOCK == EAGAIN on Linux, so one case covers both.)
 				l.listenHot = false
-				return
+				return acceptDrained
 			case unix.EINTR, unix.ECONNABORTED:
 				// Transient: a SYN was aborted (RST before accept) or the
 				// syscall was interrupted. The backlog may still hold other
@@ -838,13 +846,13 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 				// new edge, the queued SYNs won't re-signal.
 				l.errs.AcceptFDLimit.Add(1)
 				l.listenHot = true
-				return
+				return acceptFDLimit
 			default:
 				// Unexpected accept error. Count it and stop this round; the
 				// listen fd stays armed (ET) and a fresh edge re-enters.
 				l.errs.AcceptOther.Add(1)
 				l.listenHot = false
-				return
+				return acceptFailed
 			}
 		}
 
@@ -934,6 +942,48 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) {
 	// won't get a fresh readiness edge for them, so re-arm to drain the
 	// remainder on the next loop iteration (epoll_wait(0) via listenHot).
 	l.listenHot = true
+	return acceptCapped
+}
+
+// pauseAcceptRounds bounds acceptQueuedOnPause at connTableSize accepts, the
+// most one loop can hold. The queue itself never holds more than the listen
+// backlog; the bound only matters if handshakes keep landing faster than the
+// loop takes them, and the listen socket must close regardless.
+const pauseAcceptRounds = connTableSize / acceptAllCap
+
+// acceptQueuedOnPause takes every connection still waiting in the listen
+// socket's accept queue before a pausing loop closes that socket
+// (celeris#662). Their handshakes completed before the pause and their
+// clients may already have sent a request; the close would abort them.
+//
+// They go through acceptAll, the registration every accept uses, because they
+// are ordinary connections: AcceptCount and ActiveConnections count them,
+// OnConnect fires, sockopts apply, and a descriptor that cannot be registered
+// (conn-table cap, EPOLL_CTL_ADD failure) is closed and counted exactly as it
+// is there. EMFILE/ENFILE stops the drain (counted in AcceptFDLimit): no
+// descriptor frees up while this loop spins, so what is still queued is left
+// to the close.
+//
+// Interactions:
+//   - The drained connections hold connCount above zero, so the paused loop
+//     stays out of DRAINING→SUSPENDED and serves them, then parks once they
+//     have closed or, on the adaptive engine, been transplanted — exactly as
+//     for a connection accepted a moment before the pause.
+//   - A pause that lands mid-iteration is seen at the top of the next one;
+//     until then the loop accepts through acceptAll as usual.
+//   - A ResumeAccept that races the drain loses nothing: the drain only
+//     registers connections, the loop still closes the listener it read as
+//     paused, and the next iteration re-creates it, as it did before.
+//   - Not covered: a handshake still in progress at the close, or one that
+//     completes between the final EAGAIN and the close. That is inherent to
+//     closing a listen socket; only the kernel's tcp_migrate_req moves those
+//     to another listener in the SO_REUSEPORT group.
+func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
+	for range pauseAcceptRounds {
+		if l.acceptAll(ctx, time.Now().UnixNano()) != acceptCapped {
+			return
+		}
+	}
 }
 
 // growConns enlarges l.conns so that index fd is in range, doubling the

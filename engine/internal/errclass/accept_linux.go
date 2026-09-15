@@ -17,10 +17,10 @@ func (c *Counters) AcceptFailed(errno unix.Errno) {
 	case unix.EMFILE, unix.ENFILE:
 		c.AcceptFDLimit.Add(1)
 	case unix.ECANCELED, unix.EBADF, unix.ECONNABORTED, unix.EINTR:
-		// ECANCELED and EBADF are what a PauseAccept leaves behind: the
-		// in-flight accept is cancelled and the listen descriptor closed
-		// out from under any re-arm that raced the close. On the adaptive
-		// engine that is a switch cost, not a fault.
+		// ECANCELED is what a PauseAccept leaves behind: the in-flight
+		// accept is cancelled. EBADF is an accept whose listen descriptor
+		// was closed under it. On the adaptive engine both are a switch
+		// cost, not a fault.
 		c.AcceptCancelled.Add(1)
 	default:
 		c.AcceptOther.Add(1)
