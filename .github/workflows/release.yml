@@ -1,20 +1,27 @@
 name: Release
 
-# Two ways in, one gate. The intended path is the manual dispatch from
-# `main` with the version as input: the gate verifies every hand-written
-# version stamp (mage CheckRelease), CI runs, and only then does the
-# workflow create the tag and the GitHub Release itself, so a stale stamp
-# means no tag exists. The `release: published` path covers a release
-# created by hand: it runs the same gate and stops before touching
-# sub-module tags or the Go proxy (see GOVERNANCE.md, Releases, for the
-# recovery recipe).
+# Follow-through for a release you publish by hand.
+#
+# There is deliberately no automation that CREATES a release. That was tried
+# and removed: GitHub fires no workflow for the created, edited or deleted
+# activity types on DRAFT releases, so nothing can prepare anything while a
+# release is still a draft, and the tag exists the instant Publish is
+# clicked. A stale version stamp at that moment could only be repaired by
+# moving the tag, and a published tag must never move -- every one is in
+# sum.golang.org, where a moved tag gives existing consumers a checksum
+# mismatch that reads as a supply-chain compromise.
+#
+# So the stamps have to be right BEFORE the tag exists. That is what the
+# Release Checklist workflow is for: it opens a reminder when the milestone
+# is created, listing every version and where it lives.
+#
+# What is left here is the part that cannot get the version wrong, because it
+# reads it off the tag you created: verify the stamps, then tag the
+# sub-modules and warm the Go module proxy. The gate still runs first, and
+# nothing downstream runs if it fails, because a sub-module tag pinning the
+# wrong celeris version cannot be corrected afterwards.
+
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release, vX.Y.Z (or vX.Y.Z-rc.N); every stamp must already say it"
-        required: true
-        type: string
   release:
     types: [published]
 
@@ -27,28 +34,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
-      dispatch: ${{ steps.v.outputs.dispatch }}
     steps:
       - name: Version and semver format
         id: v
         env:
-          INPUT_VERSION: ${{ inputs.version }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
         run: |
-          TAG="${INPUT_VERSION:-$RELEASE_TAG}"
+          TAG="$RELEASE_TAG"
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
             echo "::error::Tag '$TAG' is not valid semver (expected vX.Y.Z or vX.Y.Z-beta.N)"
             exit 1
           fi
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::Releases are cut from main, not from $REF"
-            exit 1
-          fi
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          echo "dispatch=$([ "$EVENT" = workflow_dispatch ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "Releasing $TAG ($EVENT)"
+          echo "Following up on $TAG"
 
   gate:
     name: Version stamps agree
@@ -58,19 +56,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Tag must not exist yet (dispatch)
-        if: needs.resolve.outputs.dispatch == 'true'
-        env:
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
-            echo "::error::Tag ${VERSION} already exists; a version is never re-tagged"
-            exit 1
-          fi
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.0"
-          cache: false # zizmor cache-poisoning: a release workflow must not restore a cache anyone could have written
       - name: Install mage
         run: |
           go install github.com/magefile/mage@v1.17.2
@@ -85,41 +70,21 @@ jobs:
     needs: [resolve, gate]
     uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 rejects the `$/` form
 
-  publish:
-    name: Create tag and release
-    needs: [resolve, gate, ci]
-    if: needs.resolve.outputs.dispatch == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: gh release create
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-          TARGET: ${{ github.sha }}
-        run: |
-          # The tag is created at the exact commit the gate and CI ran on.
-          # A release published with the job token does not re-trigger this
-          # workflow, so the sub-module tags and the proxy ping below run
-          # from this same run.
-          gh release create "$VERSION" --target "$TARGET" --title "$VERSION" --generate-notes --verify-tag=false
-          echo "Created $VERSION at $TARGET"
-
   tag-submodules:
     name: Tag Sub-Modules
-    needs: [resolve, gate, ci, publish]
-    # Only the dispatch path continues. On the hand-created-release path
-    # `publish` is SKIPPED, and the previous `|| skipped` here meant this job
-    # and the proxy ping below ran anyway — the exact opposite of what this
-    # file's header and GOVERNANCE.md promise, and it burned the version on
-    # the Go proxy, closing the documented recovery (delete while the proxy
-    # still answers 404). A hand-created release now gets the gate and CI and
-    # stops here.
-    if: always() && needs.resolve.outputs.dispatch == 'true' && needs.gate.result == 'success' && needs.ci.result == 'success' && needs.publish.result == 'success'
+    needs: [resolve, gate, ci]
+    # Nothing here runs unless the stamps agree and CI is green on the
+    # tagged commit. A sub-module tag pinning the wrong celeris version
+    # cannot be corrected once published: every tag is in sum.golang.org,
+    # and moving one gives existing consumers a checksum mismatch. So a
+    # release whose gate fails gets no sub-module tags and no proxy ping,
+    # and the recovery is a new version rather than a repair.
+    #
+    # Written as an explicit success check rather than `|| skipped`: an
+    # earlier version of this condition treated a skipped upstream job as
+    # permission to continue, which tagged the sub-modules and burned the
+    # version on the proxy after the gate had declined it.
+    if: always() && needs.gate.result == 'success' && needs.ci.result == 'success'
     runs-on: ubuntu-latest
     # The only job that pushes to the repository (sub-module tags).
     permissions:
@@ -149,7 +114,7 @@ jobs:
   notify-proxy:
     name: Notify Go Proxy
     needs: [resolve, tag-submodules]
-    if: always() && needs.resolve.outputs.dispatch == 'true' && needs.tag-submodules.result == 'success'
+    if: always() && needs.tag-submodules.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
