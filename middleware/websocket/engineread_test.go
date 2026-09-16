@@ -416,3 +416,276 @@ func TestChanReaderConcurrentCloseRace(t *testing.T) {
 		t.Error("reader not closed")
 	}
 }
+
+// readerPaused reports the reader's own view of the backpressure state,
+// read under the mutex that guards it. Test-only; call it only once the
+// goroutines under test have joined.
+func readerPaused(r *chanReader) bool {
+	r.pausedMu.Lock()
+	defer r.pausedMu.Unlock()
+	return r.pausedState
+}
+
+// callbackRanOutsideDecidingLock probes, with no timing whatsoever, whether
+// the engine pause/resume callback it is called from was invoked with
+// pausedMu RELEASED — the precondition for celeris#667.
+//
+// chanReader decides to pause/resume under pausedMu and then invokes the
+// engine callback after unlocking (engineread.go:231-232 and 312-313), so
+// on that code this TryLock always succeeds and the two tests below can
+// park the callback to force an interleaving. If the callback is ever
+// invoked while the deciding lock is held, TryLock fails, the park is
+// skipped, and the tests fall through to the same convergence assertion —
+// so neither test can deadlock on a build where the window is closed.
+//
+// This is used ONLY to schedule the park. It is never the assertion: the
+// oracle in both tests is that the engine's state and the reader's state
+// agree once everything has quiesced, which leaves the fix free to close
+// the window by any means.
+func callbackRanOutsideDecidingLock(r *chanReader) bool {
+	if !r.pausedMu.TryLock() {
+		return false
+	}
+	r.pausedMu.Unlock()
+	return true
+}
+
+// TestChanReaderLostResumeConverges is the failing-first oracle for
+// celeris#667, the LOST RESUME direction.
+//
+// chanReader decides to pause under pausedMu but applies the decision to
+// the engine after releasing it:
+//
+//	230		r.pausedState = true
+//	231		r.pausedMu.Unlock()
+//	232		r.pause()
+//
+// and Read's resume branch does the same in reverse:
+//
+//	311			r.pausedState = false
+//	312			r.pausedMu.Unlock()
+//	313			r.resume()
+//
+// The engine's closures are Swap-based and ignore the previous value
+// (engine/iouring/worker.go:2200-2231), so whichever callback reaches the
+// engine LAST wins outright and nothing reconciles. This test forces the
+// appending goroutine's pause() to be applied after the draining
+// goroutine's resume(), even though the pause was decided first:
+//
+//  1. the appender crosses highWater, sets pausedState, unlocks, and parks
+//     inside pause() before applying it;
+//  2. the handler drains to lowWater, sees pausedState == true, clears it,
+//     unlocks, and applies resume() — a no-op, the engine is not paused yet;
+//  3. the appender wakes and applies pause().
+//
+// Final state: the engine's recv is PAUSED while the reader believes it is
+// RUNNING. The reader will never call resume() again, because from its
+// point of view there is nothing to resume, and the connection stops
+// delivering inbound data for the rest of its life.
+//
+// The interleaving is forced by channel handshakes, never by timing: the
+// close of `released` inside resume() strictly happens-before pause()'s
+// Swap, so the order of the two applications is fixed no matter how the
+// scheduler runs the two goroutines.
+func TestChanReaderLostResumeConverges(t *testing.T) {
+	const chanCap = 8 // highWater=6, lowWater=2
+	r := newChanReader(chanCap, 0, 0)
+
+	// desired mirrors the engine's recvPauseDesired: both closures Swap it
+	// and ignore the previous value, so its final value is simply whichever
+	// callback was applied last.
+	var desired atomic.Bool
+	var pauses, resumes atomic.Uint32
+	var parked, outsideLock atomic.Bool
+
+	entered := make(chan struct{})  // closed by pause() once inside the callback
+	released := make(chan struct{}) // closed by resume() once it has applied
+	var releaseOnce sync.Once
+
+	pause := func() {
+		pauses.Add(1)
+		free := callbackRanOutsideDecidingLock(r)
+		outsideLock.Store(free)
+		close(entered)
+		if free {
+			parked.Store(true)
+			<-released // apply strictly after the handler's resume
+		}
+		desired.Swap(true)
+	}
+	resume := func() {
+		resumes.Add(1)
+		desired.Swap(false)
+		releaseOnce.Do(func() { close(released) })
+	}
+	r.SetPauser(pause, resume)
+
+	var wg sync.WaitGroup
+
+	// The engine worker thread: append until the high-water crossing.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 6 {
+			if !r.Append([]byte{byte('a' + i)}) {
+				t.Errorf("Append %d rejected below capacity", i)
+				return
+			}
+		}
+	}()
+
+	<-entered // the pause has been decided and is in flight
+
+	// The handler goroutine: drain from depth 6 to lowWater (2).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1)
+		for i := range 4 {
+			if _, err := r.Read(buf); err != nil {
+				t.Errorf("read %d: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	// Anti-vacuity guards: the test is worthless unless both callbacks
+	// actually fired, and unless the park actually happened on a build
+	// where the callback runs outside the deciding lock.
+	if got := pauses.Load(); got != 1 {
+		t.Fatalf("harness: expected exactly 1 pause callback, got %d", got)
+	}
+	if got := resumes.Load(); got != 1 {
+		t.Fatalf("harness: expected exactly 1 resume callback, got %d", got)
+	}
+	if outsideLock.Load() && !parked.Load() {
+		t.Fatalf("harness: callback ran outside pausedMu but never parked — interleaving was not forced")
+	}
+
+	// The oracle: the engine's applied state and the reader's own view of
+	// it must agree once both goroutines have quiesced. Nothing re-evaluates
+	// after this point, so any disagreement is permanent.
+	if engine, reader := desired.Load(), readerPaused(r); engine != reader {
+		t.Fatalf("celeris#667: engine recv paused=%v but reader believes paused=%v — "+
+			"the resume was applied before the pause it was meant to cancel, so the "+
+			"engine stays paused and the reader will never resume it again "+
+			"(pauses=%d resumes=%d callbackOutsideLock=%v parked=%v)",
+			engine, reader, pauses.Load(), resumes.Load(), outsideLock.Load(), parked.Load())
+	}
+}
+
+// TestChanReaderParkedResumeConverges is the symmetric direction of
+// celeris#667: the resume is parked and a pause decided afterwards lands
+// on the engine FIRST, so the resume overwrites it.
+//
+//  1. the reader is paused (depth crossed highWater), engine paused;
+//  2. the handler drains to lowWater, clears pausedState, unlocks, and parks
+//     inside resume() before applying it;
+//  3. the appender pushes depth back over highWater, sees pausedState ==
+//     false, sets it, unlocks, and applies pause();
+//  4. the handler wakes and applies resume(), overwriting the pause.
+//
+// Final state: the engine's recv is RUNNING while the reader believes it is
+// PAUSED. This is the benign direction for liveness — data keeps flowing —
+// but backpressure is silently gone: the reader is edge-triggered, so it
+// will never request another pause, and the peer can now outrun the channel
+// and the spill into ErrReadLimit.
+//
+// As above, the ordering is forced by a channel close, not by timing.
+func TestChanReaderParkedResumeConverges(t *testing.T) {
+	const chanCap = 8 // highWater=6, lowWater=2
+	r := newChanReader(chanCap, 0, 0)
+
+	var desired atomic.Bool
+	var pauses, resumes atomic.Uint32
+	var parked, outsideLock atomic.Bool
+
+	enteredResume := make(chan struct{})  // closed by resume() once inside
+	releasedResume := make(chan struct{}) // closed by the SECOND pause()
+	var releaseOnce sync.Once
+
+	pause := func() {
+		pauses.Add(1)
+		desired.Swap(true)
+		// The second pause is the one racing the parked resume; releasing
+		// here makes resume's application strictly later than this one.
+		if pauses.Load() >= 2 {
+			releaseOnce.Do(func() { close(releasedResume) })
+		}
+	}
+	resume := func() {
+		resumes.Add(1)
+		free := callbackRanOutsideDecidingLock(r)
+		outsideLock.Store(free)
+		close(enteredResume)
+		if free {
+			parked.Store(true)
+			<-releasedResume // apply strictly after the appender's pause
+		}
+		desired.Swap(false)
+	}
+	r.SetPauser(pause, resume)
+
+	// Phase 1, single-goroutine: reach the paused state. No park here —
+	// resume has not been called yet and pause never parks in this test.
+	for i := range 6 {
+		if !r.Append([]byte{byte('a' + i)}) {
+			t.Fatalf("Append %d rejected below capacity", i)
+		}
+	}
+	if pauses.Load() != 1 || !desired.Load() || !readerPaused(r) {
+		t.Fatalf("harness: expected the paused state after 6 appends: pauses=%d engine=%v reader=%v",
+			pauses.Load(), desired.Load(), readerPaused(r))
+	}
+
+	var wg sync.WaitGroup
+
+	// The handler goroutine: drain to lowWater, then park inside resume().
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1)
+		for i := range 4 {
+			if _, err := r.Read(buf); err != nil {
+				t.Errorf("read %d: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	<-enteredResume // the resume has been decided and is in flight
+
+	// The engine worker thread: push depth back over highWater (2 -> 6).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 4 {
+			if !r.Append([]byte{byte('A' + i)}) {
+				t.Errorf("post-drain Append %d rejected below capacity", i)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	if got := pauses.Load(); got != 2 {
+		t.Fatalf("harness: expected exactly 2 pause callbacks, got %d", got)
+	}
+	if got := resumes.Load(); got != 1 {
+		t.Fatalf("harness: expected exactly 1 resume callback, got %d", got)
+	}
+	if outsideLock.Load() && !parked.Load() {
+		t.Fatalf("harness: callback ran outside pausedMu but never parked — interleaving was not forced")
+	}
+
+	if engine, reader := desired.Load(), readerPaused(r); engine != reader {
+		t.Fatalf("celeris#667: engine recv paused=%v but reader believes paused=%v — "+
+			"the parked resume overwrote a later pause, so backpressure is gone and "+
+			"the edge-triggered reader will never request it again "+
+			"(pauses=%d resumes=%d callbackOutsideLock=%v parked=%v)",
+			engine, reader, pauses.Load(), resumes.Load(), outsideLock.Load(), parked.Load())
+	}
+}
