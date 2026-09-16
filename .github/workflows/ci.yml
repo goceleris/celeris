@@ -120,6 +120,8 @@ jobs:
       # ~2-3s on a cold instance). The same suite is race-clean on
       # msr1 + Multipass and is exercised end-to-end by the
       # autobahn-fuzzingclient test under `mage testAutobahn`.
+      # The named-test step at the end of this job is what covers the
+      # parts of that package which CAN run here.
       - name: Root module — race tests (excluding test/ + adaptive/ + websocket)
         run: |
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
@@ -258,12 +260,44 @@ jobs:
       - name: middleware/protobuf
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/protobuf
-      - name: middleware/websocket — backpressure tests
+      # celeris#667: the regression tests for the lost resume live in
+      # ./middleware/websocket, which the root race job above excludes, and
+      # this step used to select only `^TestBackpressure` -- so
+      # TestChanReaderLostResumeConverges and TestChanReaderParkedResumeConverges
+      # ran in NO CI job, and neither did any of the other ~14 chanReader unit
+      # tests. Widening the regex to `^(TestBackpressure|TestChanReader)` runs
+      # all of them. They are in-process tests over newChanReader -- no
+      # sockets, no engine, no io_uring ring -- so unlike the `adaptive` and
+      # `iouring` jobs this needs nothing raised and has no environment skip
+      # to forbid.
+      #
+      # `-run` is a regex over test names, so a rename would quietly select
+      # nothing and go test would still exit 0 ("no tests to run"). The tally
+      # below is the interlock, as in the `iouring` job: exactly the two
+      # celeris#667 regression tests must report PASS. A SKIP cannot satisfy
+      # it, because a skipped test prints `--- SKIP`, never `--- PASS`.
+      #
+      # -v is required for the tally: without it `go test` prints no
+      # per-test result lines at all. The budget goes to 300s because the
+      # step now runs two suites with per-test output; the measured wall time
+      # of this exact shape is ~50s.
+      - name: middleware/websocket — backpressure + chanReader tests
+        shell: bash
         env:
           WS484_CONNS: "16"
           WS484_BURSTS: "2"
           WS484_BURST_FRAMES: "1000"
-        run: go test -race -count=1 -timeout=120s -run '^TestBackpressure' ./middleware/websocket/...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=300s -v \
+            -run '^(TestBackpressure|TestChanReader)' \
+            ./middleware/websocket/... 2>&1 | tee /tmp/ws667.log
+          passed=$(grep -cE '^--- PASS: TestChanReader(Lost|Parked)ResumeConverges \(' /tmp/ws667.log || true)
+          echo "celeris#667 regression tests passed: $passed"
+          if [ "$passed" -ne 2 ]; then
+            echo "expected 2 celeris#667 tests to PASS, saw $passed -- were they renamed, or did they skip?"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
