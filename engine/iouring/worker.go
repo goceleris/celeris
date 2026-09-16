@@ -5264,10 +5264,14 @@ func (w *Worker) releaseFailedInit() {
 		_ = w.ring.Close()
 		w.ring = nil
 	}
-	if w.h2EventFD >= 0 {
-		_ = unix.Close(w.h2EventFD)
-		w.h2EventFD = -1
-	}
+	// celeris#655: release through the handle, not the raw number. A worker
+	// that failed init may already have handed its *WakeFD to producers;
+	// Close waits behind the signals in flight, retires the number before
+	// closing, and makes every later Signal a no-op. It is idempotent, so
+	// shutdown calling it again is free. Kept in the slot the raw close
+	// occupied, so the ring-before-listen-socket order documented above is
+	// unchanged.
+	w.wakeFD.Close()
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 		w.listenFD = -1
