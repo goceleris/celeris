@@ -82,6 +82,14 @@ type Engine struct {
 	listenCtx context.Context
 	listenWG  *sync.WaitGroup
 
+	// standbyCancels holds the cancel func of each lazily built standby's child
+	// context (celeris#656) — at most one per slot, so at most two for the life
+	// of the engine. buildAndStartStandby cancels a standby it gives up on
+	// itself and appends the cancel of one it hands back, so a standby that is
+	// still running always has a handle here and Shutdown does not depend on
+	// the Listen context alone to stop it. Guarded by mu, like the slots.
+	standbyCancels []context.CancelFunc
+
 	// freezeCooldown is the duration to suppress further switches after a switch.
 	// Zero means no cooldown (default).
 	freezeCooldown time.Duration
@@ -612,8 +620,9 @@ func (e *Engine) buildAndStartStandby(wantType engine.EngineType) (engine.Engine
 	// function gives up on is stopped. It used to run under the Listen context
 	// itself, so a standby that bound after the deadline below kept running:
 	// in the SO_REUSEPORT group, accepting, and in no slot, where no later
-	// switch would pause it and Shutdown would never name it. Only a standby
-	// that is returned keeps running, until the Listen context ends.
+	// switch would pause it and Shutdown would never name it. A standby that is
+	// returned keeps running, and its cancel is kept in e.standbyCancels (the
+	// caller holds mu) so Shutdown can stop it by name.
 	ctx, cancel := context.WithCancel(e.listenCtx)
 	started := false
 	defer func() {
@@ -658,6 +667,7 @@ func (e *Engine) buildAndStartStandby(wantType engine.EngineType) (engine.Engine
 		}
 	}
 	started = true
+	e.standbyCancels = append(e.standbyCancels, cancel)
 	return built, nil
 }
 
@@ -905,7 +915,17 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	e.mu.Lock()
 	primary := e.primary
 	secondary := e.secondary
+	standbyCancels := e.standbyCancels
+	e.standbyCancels = nil
 	e.mu.Unlock()
+
+	// celeris#656: stop the lazily built standbys by name. Cancelling the Listen
+	// context above already unwinds them — their contexts are its children — but
+	// holding the handle means a standby this engine started is never reachable
+	// only through a context someone else owns.
+	for _, cancel := range standbyCancels {
+		cancel()
+	}
 
 	var errs []error
 	if primary != nil {

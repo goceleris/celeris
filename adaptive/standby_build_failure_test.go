@@ -118,11 +118,16 @@ func TestLazyStandbyListenFailureAbortsPromptlyAndBacksOff(t *testing.T) {
 	if *builtCount != 2 {
 		t.Fatalf("buildStandby ran %d times after the second attempt, want 2", *builtCount)
 	}
+	// Two consecutive failures is standbyBuildBackoffBase<<1 == 60s, so 59s is
+	// inside it and 61s is past it. The doubling itself, the cap and the
+	// constant are pinned by TestStandbyBuildBackoffDoublesAndCapsAtTheMaximum;
+	// an 11-minute probe here would pass for any backoff under 11 minutes,
+	// including an uncapped one, so it claimed a cap it could not judge.
 	if e.ctrl.evaluate(before.Add(59*time.Second), false) {
 		t.Error("after a second consecutive failed build the controller retries within 59s: the backoff does not grow")
 	}
-	if !e.ctrl.evaluate(after.Add(11*time.Minute), false) {
-		t.Error("the controller never recommends the switch again 11 minutes after two failed builds: the backoff is not capped")
+	if !e.ctrl.evaluate(after.Add(61*time.Second), false) {
+		t.Error("the controller never recommends the switch again 61s after two failed builds: the second backoff does not expire")
 	}
 }
 
