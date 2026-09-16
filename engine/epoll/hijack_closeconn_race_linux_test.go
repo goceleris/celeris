@@ -6,41 +6,72 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/resource"
 )
 
 // celeris#654: with AsyncHandlers, a handler that calls Hijack runs
 // hijackConn ON the dispatch goroutine, under cs.detachMu. A loop-thread
-// closeConn for the same fd (checkTimeouts' read/idle/header sweep, or the
-// async input-backpressure close in drainRead) reads the still-non-nil
-// connState, then parks on cs.detachMu behind the handler. When the handler
-// returns, closeConn resumes and re-runs a teardown hijackConn already
-// performed — on a connection the engine no longer owns.
+// closeConn for the same fd reads the still-non-nil connState, then parks on
+// cs.detachMu behind the handler. When the handler returns, closeConn resumes
+// and re-runs a teardown hijackConn already performed — on a connection the
+// engine no longer owns.
 //
-// These tests drive that interleaving directly rather than through a socket,
-// so the ordering is pinned by a lock and an atomic instead of by timing.
-// They construct the same bare Loop the other in-package loop tests use; the
-// loop is not running, so the "loop thread" is just another goroutine.
+// The loop-thread entry these tests use is the real one: checkTimeouts. It
+// calls closeConn directly with no async guard, and nothing refreshes
+// cs.lastActivity while a handler runs (it is written only at accept,
+// on read, and on adopt). drainRead's EOF and error branches — the
+// EPOLLRDHUP route the issue proposed — take detachMu BEFORE calling
+// closeConn, so they wait behind the handler and then re-read a cleared
+// slot; that is why the issue's own proposed repro would mostly pass.
+//
+// The interleaving is pinned by a lock and an atomic rather than by timing:
+// closeConn stores cs.asyncClosed only AFTER capturing l.conns[fd] and
+// BEFORE blocking on detachMu, so that flag is an exact happens-before
+// barrier. The loop is not running, so the "loop thread" here is just
+// another goroutine calling the sweep.
+
+// hijackRaceRig is one bare Loop carrying a single async-mode HTTP/1 conn,
+// plus the OnDisconnect counter every arm asserts on.
+type hijackRaceRig struct {
+	l           *Loop
+	cs          *connState
+	local       int
+	peer        int
+	disconnects *atomic.Int64
+}
 
 // hijackRaceConn builds an async-mode HTTP1 connection on a socketpair and
 // registers it with l exactly as acceptAll would: armed in epoll, in the conn
 // table, in the live set, counted. h1State is non-nil and never Detached,
 // which is what selects closeConn's plainClose branch (SHUT_WR + Close) —
 // the path that closes the descriptor a second time.
-func hijackRaceConn(t *testing.T) (l *Loop, cs *connState, local, peer int) {
+//
+// cfg carries two things the arms depend on: ReadTimeout, which is what makes
+// checkTimeouts reap this conn (lastActivity is stamped an hour into the
+// past), and OnDisconnect, the public lifecycle callback whose delivery the
+// celeris#654 early return changes.
+func hijackRaceConn(t *testing.T) *hijackRaceRig {
 	t.Helper()
-	l = newReapLoop(t)
+	l := newReapLoop(t)
 
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	disconnects := &atomic.Int64{}
+	l.cfg = resource.Config{
+		OnDisconnect: func(string) { disconnects.Add(1) },
+		ReadTimeout:  time.Millisecond,
+	}
+
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		t.Skipf("socketpair unavailable: %v", err)
 	}
-	local, peer = pair[0], pair[1]
+	local, peer := pair[0], pair[1]
 	t.Cleanup(func() { _ = unix.Close(peer) })
 	if local >= connTableSize {
 		_ = unix.Close(local)
@@ -61,19 +92,35 @@ func hijackRaceConn(t *testing.T) (l *Loop, cs *connState, local, peer int) {
 		t.Skipf("epoll_ctl ADD fd %d: %v", local, err)
 	}
 
-	cs = &connState{fd: local, liveIdx: -1}
+	cs := &connState{fd: local, liveIdx: -1}
 	cs.detachMu = &sync.Mutex{}
 	cs.asyncCond.L = &cs.asyncInMu
 	cs.asyncRun = true
 	cs.asyncPromoted = true
 	cs.h1State = conn.NewH1State()
+	// Older than ReadTimeout, so the sweep reaps it. Nothing refreshes this
+	// while a handler runs — that is the whole reachability argument.
+	cs.lastActivity = time.Now().Add(-time.Hour).UnixNano()
 
 	l.conns[local] = cs
 	l.addLiveConn(cs)
 	l.connCount++
 	l.activeConns.Add(1)
 	l.acceptCount.Add(1)
-	return l, cs, local, peer
+	return &hijackRaceRig{l: l, cs: cs, local: local, peer: peer, disconnects: disconnects}
+}
+
+// hijackRaceSweep runs the real reaper on its own goroutine, standing in for
+// the loop thread between epoll_wait returns. checkTimeouts walks liveConns
+// and calls closeConn itself — the trigger is part of the gate, not an
+// assumption stated beside it.
+func hijackRaceSweep(l *Loop) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.checkTimeouts()
+	}()
+	return done
 }
 
 // hijackRaceWaitFor spins until cond holds, yielding rather than sleeping so
@@ -86,6 +133,16 @@ func hijackRaceWaitFor(t *testing.T, cond func() bool, what string) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		runtime.Gosched()
+	}
+}
+
+// hijackRaceAwait waits for the sweep goroutine to return.
+func hijackRaceAwait(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkTimeouts never returned after the handler released detachMu")
 	}
 }
 
@@ -125,7 +182,8 @@ func hijackRaceExpectRead(t *testing.T, fd int, want, what string) {
 //
 // The returned fd is deliberately never closed by the test. Once a teardown
 // bug has closed it, the number may belong to something else, and closing it
-// again would be the very mistake under test.
+// again would be the very mistake under test. The leak is one descriptor per
+// arm that reaches this point, bounded and process-local.
 func hijackRaceRecycle(t *testing.T, fd int) (writeEnd int) {
 	t.Helper()
 	var p [2]int
@@ -138,6 +196,14 @@ func hijackRaceRecycle(t *testing.T, fd int) (writeEnd int) {
 		// straight to the pipe, with no help from the test. That is the
 		// recycling this test is about, so there is nothing left to set up.
 		return p[1]
+	}
+	// dup3 silently closes whatever newfd currently designates, so prove the
+	// number is free before taking it. If the runtime claimed it between
+	// hijackConn's close and the pipe2 above (netpoll, a profiler fd, the
+	// race runtime), clobbering it would surface as a failure far from here.
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		_ = unix.Close(p[0])
+		t.Skipf("fd %d is in use again (F_GETFD: %v); refusing to dup3 over a live descriptor", fd, err)
 	}
 	if err := unix.Dup3(p[0], fd, unix.O_CLOEXEC); err != nil {
 		_ = unix.Close(p[0])
@@ -153,7 +219,8 @@ func hijackRaceRecycle(t *testing.T, fd int) (writeEnd int) {
 //	dispatch goroutine   loop thread
 //	------------------   -----------
 //	detachMu.Lock
-//	(handler running)    closeConn: reads l.conns[fd] -> cs (non-nil)
+//	(handler running)    checkTimeouts: read deadline expired
+//	                     closeConn: reads l.conns[fd] -> cs (non-nil)
 //	                     closeConn: asyncClosed.Store(true)
 //	                     closeConn: detachMu.Lock ... blocked
 //	Hijack -> hijackConn
@@ -163,32 +230,27 @@ func hijackRaceRecycle(t *testing.T, fd int) (writeEnd int) {
 //	                     closeConn: resumes and tears the conn down AGAIN
 //
 // Before the fix, the resumed closeConn decrements the counters a second
-// time and SHUT_WR + close()es a descriptor number that now belongs to an
-// unrelated file. After the fix it re-reads the slot, sees it no longer owns
-// cs, and returns.
+// time, SHUT_WR + close()es a descriptor number that now belongs to an
+// unrelated file, and fires OnDisconnect for a connection that was handed
+// to the application. After the fix it re-reads the slot, sees it no longer
+// owns cs, and returns.
 func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T) {
-	l, cs, local, peer := hijackRaceConn(t)
+	rig := hijackRaceConn(t)
+	l, cs, local, peer := rig.l, rig.cs, rig.local, rig.peer
 
 	// (a) The dispatch goroutine is inside ProcessH1: runAsyncHandler holds
 	// cs.detachMu for the whole user handler call.
 	cs.detachMu.Lock()
 
-	// (b) The loop thread reaps the conn. checkTimeouts calls closeConn
-	// directly on a read/idle/write/header deadline, and nothing refreshes
-	// cs.lastActivity while a handler runs.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		l.closeConn(local)
-	}()
+	// (b) The loop thread runs its timeout sweep. checkTimeouts finds the
+	// stale lastActivity and calls closeConn itself.
+	done := hijackRaceSweep(l)
 
 	// (c) Barrier, not a sleep. closeConn stores asyncClosed only AFTER it
 	// has read l.conns[fd] into its own cs, and before it blocks on
 	// detachMu. Once the flag flips, closeConn is committed to this cs and
-	// can only be parked on the lock we hold — the interleaving is pinned,
-	// and the atomic supplies the happens-before edge the race detector
-	// needs for the unsynchronized slot read.
-	hijackRaceWaitFor(t, cs.asyncClosed.Load, "closeConn to capture the conn and reach its detachMu wait")
+	// can only be parked on the lock we hold.
+	hijackRaceWaitFor(t, cs.asyncClosed.Load, "checkTimeouts -> closeConn to capture the conn and reach its detachMu wait")
 
 	// (d) The handler calls Hijack, still inside ProcessH1, still holding
 	// detachMu. hijackConn performs the full engine-side teardown here.
@@ -207,11 +269,7 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 
 	// (f) The handler returns and runAsyncHandler releases detachMu.
 	cs.detachMu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("closeConn never returned after the handler released detachMu")
-	}
+	hijackRaceAwait(t, done)
 
 	// One connection, one close. hijackConn already counted it.
 	if got := l.closeCount.Load(); got != 1 {
@@ -222,6 +280,13 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	}
 	if got := l.connCount; got != 0 {
 		t.Errorf("connCount = %d, want 0: a negative count never satisfies the DRAINING->SUSPENDED gate", got)
+	}
+
+	// OnDisconnect is a public lifecycle callback. The connection did not
+	// disconnect — it was handed to the application — and the sync hijack
+	// path fires nothing, so the async path must not either.
+	if got := rig.disconnects.Load(); got != 0 {
+		t.Errorf("OnDisconnect fired %d times for a hijacked conn, want 0", got)
 	}
 
 	// The recycled descriptor must survive. This is the damage that reaches
@@ -267,13 +332,94 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	}
 }
 
+// TestCloseConnLeavesAReissuedSlotAloneAfterWaitingOnDetachMu is the arm that
+// actually exercises the new ownership branch. The hijack frees the slot and
+// a DIFFERENT connState is installed on the same fd number before closeConn
+// wakes, so the re-check lands on `l.conns[fd] != cs` rather than on the
+// pre-existing `cs == nil` guard at the top of closeConn.
+//
+// Today only the parked loop thread fills this loop's conn table, so the
+// reachable production shape is the nil slot — this arm is defence in depth
+// for the `== cs` half of the predicate, and it is the only arm that proves
+// the early return does not tear down whoever owns the slot now. Without the
+// fix, closeConn nils the new owner's slot, closes its descriptor and fires
+// its OnDisconnect.
+func TestCloseConnLeavesAReissuedSlotAloneAfterWaitingOnDetachMu(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+
+	cs.detachMu.Lock()
+	done := hijackRaceSweep(l)
+	hijackRaceWaitFor(t, cs.asyncClosed.Load, "checkTimeouts -> closeConn to reach its detachMu wait")
+
+	nc, err := l.hijackConn(local)
+	if err != nil {
+		t.Fatalf("hijackConn: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+
+	// The number is reissued, and the slot is refilled with the new owner's
+	// connState — what an adopt or a future off-thread registration would do.
+	pipeWrite := hijackRaceRecycle(t, local)
+	newCS := &connState{fd: local, liveIdx: -1}
+	newCS.h1State = conn.NewH1State()
+	newCS.lastActivity = time.Now().UnixNano()
+	l.driverMu.Lock()
+	l.conns[local] = newCS
+	l.driverMu.Unlock()
+	l.addLiveConn(newCS)
+	l.connCount++
+	l.activeConns.Add(1)
+
+	cs.detachMu.Unlock()
+	hijackRaceAwait(t, done)
+
+	if l.conns[local] != newCS {
+		t.Errorf("l.conns[%d] = %p, want the new owner %p: closeConn cleared a slot it no longer owned",
+			local, l.conns[local], newCS)
+	}
+	if newCS.liveIdx < 0 || len(l.liveConns) != 1 {
+		t.Errorf("new owner liveIdx = %d, liveConns = %v, want it still in the live set",
+			newCS.liveIdx, l.liveConns)
+	}
+	if got := l.closeCount.Load(); got != 1 {
+		t.Errorf("closeCount = %d, want 1 (only the hijack)", got)
+	}
+	if got := l.activeConns.Load(); got != 1 {
+		t.Errorf("activeConns = %d, want 1 (the new owner)", got)
+	}
+	if got := l.connCount; got != 1 {
+		t.Errorf("connCount = %d, want 1 (the new owner)", got)
+	}
+	if got := rig.disconnects.Load(); got != 0 {
+		t.Errorf("OnDisconnect fired %d times, want 0: neither conn disconnected", got)
+	}
+	if _, err := unix.FcntlInt(uintptr(local), unix.F_GETFD, 0); err != nil {
+		t.Errorf("fd %d was closed although the slot held another conn: %v", local, err)
+	} else {
+		if _, err := unix.Write(pipeWrite, []byte("z")); err != nil {
+			t.Errorf("write to the recycled pipe: %v", err)
+		} else {
+			hijackRaceExpectRead(t, local, "z", "the new owner's descriptor survives")
+		}
+	}
+	if cs.detachClosed {
+		t.Error("closeConn marked the hijacked conn detachClosed")
+	}
+}
+
 // TestCloseConnAfterHijackIsNoOpWithoutTheRace is negative control 1: the
 // same conn, the same hijack, the same fd recycling — but no interleaving.
-// closeConn runs after the hijack has finished, reads a nil slot and returns.
-// It passes before and after the fix, showing the counters and the
-// recycled-fd witness are sound and that only the interleaving breaks them.
+//
+// It does NOT exercise the fix: with the hijack complete, l.conns[fd] is nil
+// and closeConn returns at the pre-existing `cs == nil` guard, above the new
+// ownership re-check. Its job is to show that the witnesses this file relies
+// on — the three counters, OnDisconnect, and the recycled-descriptor probe —
+// read correctly when nothing goes wrong, on main as well as on the fix. The
+// arm that reaches the new branch is the reissued-slot test above.
 func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
-	l, cs, local, _ := hijackRaceConn(t)
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
 
 	nc, err := l.hijackConn(local)
 	if err != nil {
@@ -295,6 +441,9 @@ func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
 	if got := l.connCount; got != 0 {
 		t.Errorf("connCount = %d, want 0", got)
 	}
+	if got := rig.disconnects.Load(); got != 0 {
+		t.Errorf("OnDisconnect fired %d times for a hijacked conn, want 0", got)
+	}
 	if _, err := unix.FcntlInt(uintptr(local), unix.F_GETFD, 0); err != nil {
 		t.Errorf("fd %d was closed although closeConn saw a clear slot: %v", local, err)
 	} else {
@@ -310,29 +459,23 @@ func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
 }
 
 // TestCloseConnClosesOnceWhenHandlerDoesNotHijack is negative control 2: the
-// identical interleaving — loop thread parked on detachMu behind a running
-// async handler — with no Hijack. closeConn still owns the conn when it
-// wakes, so it must close it exactly once. It passes before and after the
-// fix, showing the harness does not by itself produce a double count, and
-// that the fix's ownership re-check does not suppress a legitimate close.
+// identical interleaving — the timeout sweep parked on detachMu behind a
+// running async handler — with no Hijack. closeConn still owns the conn when
+// it wakes, so it must close it exactly once AND still deliver OnDisconnect.
+// It passes before and after the fix, showing the harness does not by itself
+// produce a double count, and that the ownership re-check suppresses neither
+// the close nor the public callback for a conn the engine really owns.
 func TestCloseConnClosesOnceWhenHandlerDoesNotHijack(t *testing.T) {
-	l, cs, local, _ := hijackRaceConn(t)
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
 
 	cs.detachMu.Lock()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		l.closeConn(local)
-	}()
-	hijackRaceWaitFor(t, cs.asyncClosed.Load, "closeConn to reach its detachMu wait")
+	done := hijackRaceSweep(l)
+	hijackRaceWaitFor(t, cs.asyncClosed.Load, "checkTimeouts -> closeConn to reach its detachMu wait")
 
 	// The handler returns without hijacking anything.
 	cs.detachMu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("closeConn never returned after the handler released detachMu")
-	}
+	hijackRaceAwait(t, done)
 
 	if got := l.closeCount.Load(); got != 1 {
 		t.Errorf("closeCount = %d, want 1", got)
@@ -342,6 +485,9 @@ func TestCloseConnClosesOnceWhenHandlerDoesNotHijack(t *testing.T) {
 	}
 	if got := l.connCount; got != 0 {
 		t.Errorf("connCount = %d, want 0", got)
+	}
+	if got := rig.disconnects.Load(); got != 1 {
+		t.Errorf("OnDisconnect fired %d times, want 1: the engine owned this conn and closed it", got)
 	}
 	if l.conns[local] != nil {
 		t.Errorf("closeConn left l.conns[%d] set", local)
@@ -353,4 +499,79 @@ func TestCloseConnClosesOnceWhenHandlerDoesNotHijack(t *testing.T) {
 	if _, err := unix.FcntlInt(uintptr(local), unix.F_GETFD, 0); err == nil {
 		t.Errorf("fd %d still open; closeConn owned the conn and must have closed it", local)
 	}
+}
+
+// TestHijackReleaseUnlinksTheConnFromTheDirtyList covers the other half of
+// the same defect, on the COMMON hijack paths rather than the raced one.
+//
+// releaseConnState clears cs.dirtyNext/dirtyPrev and cs.dirty but never
+// repairs l.dirtyHead or a predecessor's dirtyNext, and hijackConn does not
+// unlink either. So both ordinary hijack releases — the synchronous one in
+// hijackConn and the deferred one in drainDetachQueue's hijacked branch —
+// used to hand a still-linked connState back to connStatePool, leaving
+// l.dirtyHead pointing at pooled, reissued memory that the loop's dirty pass
+// would then flushWrites against.
+func TestHijackReleaseUnlinksTheConnFromTheDirtyList(t *testing.T) {
+	t.Run("deferred_release_via_drainDetachQueue", func(t *testing.T) {
+		rig := hijackRaceConn(t)
+		l, cs, local := rig.l, rig.cs, rig.local
+
+		// A partial write from a prior pipelined response left the conn on
+		// the dirty list.
+		l.markDirty(cs)
+		if l.dirtyHead != cs {
+			t.Fatalf("setup: dirtyHead = %p, want %p", l.dirtyHead, cs)
+		}
+
+		nc, err := l.hijackConn(local)
+		if err != nil {
+			t.Fatalf("hijackConn: %v", err)
+		}
+		t.Cleanup(func() { _ = nc.Close() })
+		if !cs.hijacked {
+			t.Fatalf("setup: async hijack did not defer the release")
+		}
+
+		cs.asyncInMu.Lock()
+		cs.asyncRun = false
+		cs.asyncInMu.Unlock()
+		l.detachQMu.Lock()
+		l.detachQueue = append(l.detachQueue, cs)
+		l.detachQPending.Store(1)
+		l.detachQMu.Unlock()
+		l.drainDetachQueue()
+
+		if l.dirtyHead != nil {
+			t.Errorf("dirtyHead = %p after the hijacked conn was released to the pool, want nil: "+
+				"the loop's dirty pass would flush pooled memory to a reissued fd", l.dirtyHead)
+		}
+	})
+
+	t.Run("synchronous_release_in_hijackConn", func(t *testing.T) {
+		rig := hijackRaceConn(t)
+		l, cs, local := rig.l, rig.cs, rig.local
+
+		// Sync mode (or an async conn not yet promoted): no dispatch
+		// goroutine, so hijackConn releases the connState inline.
+		cs.detachMu = nil
+		cs.asyncRun = false
+
+		l.markDirty(cs)
+		if l.dirtyHead != cs {
+			t.Fatalf("setup: dirtyHead = %p, want %p", l.dirtyHead, cs)
+		}
+
+		nc, err := l.hijackConn(local)
+		if err != nil {
+			t.Fatalf("hijackConn: %v", err)
+		}
+		t.Cleanup(func() { _ = nc.Close() })
+		if cs.hijacked {
+			t.Fatalf("setup: sync hijack deferred the release instead of doing it inline")
+		}
+
+		if l.dirtyHead != nil {
+			t.Errorf("dirtyHead = %p after the inline release, want nil", l.dirtyHead)
+		}
+	})
 }
