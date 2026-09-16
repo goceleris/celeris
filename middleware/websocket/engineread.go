@@ -218,6 +218,35 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 
 // requestPause asks the engine to suspend inbound delivery, edge-triggered
 // so the callback fires once per high-water crossing.
+//
+// The engine callback is invoked WITH pausedMu held, and that is the point
+// (celeris#667). Deciding under the lock but applying outside it let the
+// appending goroutine and the draining goroutine reach the engine in the
+// OPPOSITE order from the one in which they decided. The engine's closures
+// are Swap-based and ignore the previous value — the early return skips only
+// the wakeup, never the state write (engine/iouring/worker.go:2200-2231,
+// engine/epoll/loop.go:1672-1703) — so whichever callback arrives last wins
+// outright and nothing reconciles. A resume could therefore be applied before
+// the pause it was meant to cancel, leaving the engine's recv paused while
+// this reader believed it was running. Nothing re-evaluates after that, so
+// the connection stopped delivering inbound data for the rest of its life.
+// Holding the lock across the callback makes the order the engine observes
+// equal to the order of pausedState transitions.
+//
+// LOCK ORDER: pausedMu -> detachQMu. Never the reverse, and nothing can take
+// them the other way round:
+//
+//   - pausedMu is an unexported field of an unexported type in this package,
+//     so only this package can acquire it, and it does so in exactly two
+//     places (here and Read's resume branch below).
+//   - the engine packages do not import middleware/websocket at all, so no
+//     detachQMu holder can reach either of those two places.
+//   - every detachQMu critical section in both engines is a straight-line
+//     queue append plus an atomic store, with no call out of the engine.
+//
+// The eventfd write the callbacks may perform is on an EFD_NONBLOCK
+// descriptor and happens after detachQMu is released, so it can neither block
+// nor extend the hold on pausedMu across a blocking syscall.
 func (r *chanReader) requestPause() {
 	if r.pause == nil {
 		return
@@ -228,8 +257,9 @@ func (r *chanReader) requestPause() {
 		return
 	}
 	r.pausedState = true
-	r.pausedMu.Unlock()
+	// Applied under pausedMu — see the lock-order note above.
 	r.pause()
+	r.pausedMu.Unlock()
 }
 
 // refillFromSpill moves spilled chunks into the channel's tail while there
@@ -309,11 +339,14 @@ func (r *chanReader) Read(p []byte) (int, error) {
 			r.pausedMu.Lock()
 			if r.pausedState && len(r.ch) <= r.lowWater {
 				r.pausedState = false
-				r.pausedMu.Unlock()
+				// Applied under pausedMu, for the reason and in the lock
+				// order documented on requestPause (celeris#667): the
+				// engine must observe pauses and resumes in the order they
+				// were decided, or the last one to arrive wins and the
+				// connection is left permanently paused.
 				r.resume()
-			} else {
-				r.pausedMu.Unlock()
 			}
+			r.pausedMu.Unlock()
 		}
 	}
 	n := copy(p, r.cur)
