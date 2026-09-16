@@ -28,9 +28,9 @@ import (
 // (worker.go) — all of which write after releasing their queue mutex, none
 // of which consults a closed flag.
 //
-// Worker.shutdown closes the eventfd at worker.go:5213 but joins the
-// dispatch goroutines at 5225, AFTER it: on this engine a producer is not
-// even guaranteed to have stopped when the descriptor goes away.
+// Worker.shutdown closes the eventfd BEFORE it joins the dispatch
+// goroutines with asyncWG.Wait: on this engine a producer is not even
+// guaranteed to have stopped when the descriptor goes away.
 
 // newWakeWorker655 is a Worker reduced to what shutdown needs: a wakeup
 // eventfd it will close, and listenFD = -1 so it does not close fd 0. Empty
@@ -134,10 +134,10 @@ func (w *fdWatcher655) assertNoLateWake(t *testing.T, n int, who string) {
 
 // TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD covers
 // addDriverAction, the deterministic case. shutdownDrivers sets
-// driverConns=nil, and RegisterConn rebuilds the map from nil
-// (driver.go:156) and always reaches the wakeup write — so a driver that
-// registers an fd on a worker that has already gone away writes into a
-// recycled descriptor every single time.
+// driverConns=nil, and RegisterConn rebuilds the map from nil and always
+// reaches the wakeup write — so a driver that registers an fd on a worker
+// that has already gone away writes into a recycled descriptor every single
+// time.
 func TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 	w, efd := newWakeWorker655(t)
 	watch := newFDWatcher655(t)
@@ -159,10 +159,9 @@ func TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 }
 
 // TestEnqueueDetachAfterShutdownDoesNotWriteTheClosedWakeupFD covers
-// enqueueDetach, which the dispatch goroutine calls (worker.go:3976) while an
-// io_uring→epoll transplant drains — exactly the switch-vs-shutdown window
-// celeris#655 describes. Those goroutines are joined only AFTER the eventfd
-// is closed.
+// enqueueDetach, which the dispatch goroutine calls while an io_uring→epoll
+// transplant drains — exactly the switch-vs-shutdown window celeris#655
+// describes. Those goroutines are joined only AFTER the eventfd is closed.
 func TestEnqueueDetachAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 	w, efd := newWakeWorker655(t)
 	watch := newFDWatcher655(t)
@@ -182,13 +181,13 @@ func TestEnqueueDetachAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 
 // TestDetachedResumeRecvAfterShutdownDoesNotWriteTheClosedWakeupFD covers the
 // WS/SSE backpressure callbacks installed by OnDetach. They run on middleware
-// goroutines that asyncWG does not track, they capture the eventfd NUMBER by
-// value (worker.go:2086), and unlike the guarded write closure they have no
+// goroutines that asyncWG does not track, they captured the eventfd NUMBER by
+// value before this change, and unlike the guarded write closure they have no
 // detachClosed check at all.
 //
 // The live path: shutdown fires OnDetachClose, the websocket chanReader
-// delivers the chunks it still holds before it reports that close
-// (middleware/websocket/engineread.go:263-320), and on the way down to
+// delivers the chunks it still holds before it reports that close (see
+// middleware/websocket/engineread.go's Read), and on the way down to
 // lowWater it calls resume().
 func TestDetachedResumeRecvAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 	w, efd := newWakeWorker655(t)
@@ -232,3 +231,71 @@ func TestDetachedResumeRecvAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing
 	cs.h1State.ResumeRecv()
 	watch.assertNoLateWake(t, efd, "ResumeRecv on a detached conn")
 }
+
+// newAsyncCS655 is a connState a dispatch goroutine can be run against with
+// no ring: input already waiting, so runAsyncHandler picks it up instead of
+// parking on asyncCond, and a nil detachMu so the Lock it takes on the way
+// to ProcessH1 panics.
+//
+// That panic stands in for the one a user handler can raise. It is what
+// makes this test deterministic: of runAsyncHandler's five wakeup writes,
+// the deferred recover ("async handler panicked") is the one reachable
+// without a live ring, a handler chain and a parsed request — and it is the
+// same enqueue-then-signal sequence as the other four.
+func newAsyncCS655(t *testing.T) *connState {
+	t.Helper()
+	cs := &connState{fd: -1, liveIdx: -1, ctx: context.Background()}
+	cs.asyncCond.L = &cs.asyncInMu
+	cs.asyncInBuf = append(cs.asyncInBuf, 'x')
+	return cs
+}
+
+// TestRunAsyncHandlerAfterShutdownDoesNotWriteTheClosedWakeupFD covers the
+// producer class io_uring's shutdown ordering makes the sharpest: the
+// dispatch goroutines. Worker.shutdown closes the wakeup eventfd and only
+// then joins them with asyncWG.Wait, so unlike epoll — which joins first —
+// a dispatch goroutine here is not even guaranteed to have stopped when the
+// descriptor goes away. Its teardown paths enqueue onto detachQueue and
+// signal unconditionally (no empty->non-empty coalescing), so every one of
+// them writes.
+func TestRunAsyncHandlerAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
+	w, efd := newWakeWorker655(t)
+	watch := newFDWatcher655(t)
+
+	// Positive control: the same teardown on a LIVE worker reaches the write.
+	w.asyncWG.Add(1)
+	go w.runAsyncHandler(newAsyncCS655(t))
+	w.asyncWG.Wait()
+	if got := drainWake655(t, efd); got != 1 {
+		t.Fatalf("eventfd counter = %d after a dispatch goroutine tore down on a LIVE "+
+			"worker, want 1: runAsyncHandler never reached the wakeup write, so the "+
+			"post-shutdown assertion below would pass for the wrong reason", got)
+	}
+	// The worker drains what the teardown queued, so the next one is again
+	// an enqueue onto an empty queue.
+	w.detachQMu.Lock()
+	w.detachQueue = w.detachQueue[:0]
+	w.detachQPending.Store(0)
+	w.detachQMu.Unlock()
+
+	w.shutdown()
+	watch.claim(t, efd)
+
+	w.asyncWG.Add(1)
+	go w.runAsyncHandler(newAsyncCS655(t))
+	w.asyncWG.Wait()
+	watch.assertNoLateWake(t, efd, "runAsyncHandler (handler-panic teardown)")
+}
+
+// Not covered by a test of its own, deliberately: the guarded writeFn
+// installed by OnDetach (both engines). After shutdown it cannot reach its
+// wakeup write at all — the closure's first act is `mu.Lock(); if
+// cs.detachClosed { return }`, and shutdown sets detachClosed under that
+// same mutex before it closes the eventfd. A "call writeFn after shutdown"
+// test would therefore pass on unfixed main too, for the wrong reason: the
+// producer is inert, not barred. Its real exposure is the in-flight window
+// — a writeFn that passed the detachClosed check, released the mutex, and
+// is inside Signal when Close runs — which is a race, not a sequence a
+// deterministic test can pin. That window is what WakeFD.Close's wait for
+// in-flight signals closes, and it is covered at the unit level by
+// TestConcurrentSignalAndClose in internal/wakefd.

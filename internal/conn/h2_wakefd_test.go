@@ -13,13 +13,13 @@ import (
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
-// celeris#655, the H2 write queue. Both engines hand this queue the number of
-// the wakeup eventfd they will close at shutdown (engine/epoll/loop.go:1801,
-// engine/iouring/worker.go:2301), and the queue writes it from whichever
-// goroutine enqueued a frame. Non-inline H2 streams run on globalH2Pool
-// (protocol/h2/stream/processor.go:611), which no engine joins, and CloseH2 →
-// Manager.Close only cancels the streams — so a frame can be enqueued after
-// the descriptor is gone, and the 8 bytes land on whatever reuses it.
+// celeris#655, the H2 write queue. Both engines hand this queue the wakeup
+// eventfd they will close at shutdown (each engine's NewH2State call sites),
+// and the queue writes it from whichever goroutine enqueued a frame.
+// Non-inline H2 streams run on globalH2Pool (see protocol/h2/stream's
+// processor), which no engine joins, and CloseH2 → Manager.Close only
+// cancels the streams — so a frame can be enqueued after the descriptor is
+// gone, and the 8 bytes land on whatever reuses it.
 
 type nopHandler655 struct{}
 

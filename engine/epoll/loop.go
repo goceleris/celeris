@@ -209,6 +209,15 @@ type Loop struct {
 	driverMu       sync.RWMutex
 	hasDriverConns atomic.Bool
 	driverReadBuf  []byte // scratch buffer for driver EPOLLIN drains (worker-local)
+	// ctlMu guards epollFD against the driver goroutines, which issue
+	// epoll_ctl on it from outside the loop thread. shutdown takes it as a
+	// writer before it closes the descriptor (closeEpollFD), so a driver's
+	// epoll_ctl either completes first or is refused — it can never land on
+	// a recycled descriptor number. Same rule as the wakeup eventfd, for the
+	// other descriptor a driver can reach (celeris#655). A LEAF: held only
+	// across the epoll_ctl itself, and taken while holding driverMu or dc.mu.
+	ctlMu     sync.RWMutex
+	ctlClosed bool
 
 	// async dispatches HTTP1 handlers to spawned goroutines. Set by
 	// Config.AsyncHandlers (the canonical server-level default) or
@@ -2880,7 +2889,11 @@ func (l *Loop) shutdown() {
 	if l.timerFD >= 0 {
 		_ = unix.Close(l.timerFD)
 	}
-	_ = unix.Close(l.epollFD)
+	// celeris#655: the same barrier for the other descriptor a driver
+	// goroutine can reach. closeEpollFD refuses every later driver
+	// epoll_ctl, so none of them can operate on this number once it is free
+	// to be recycled.
+	l.closeEpollFD()
 }
 
 func createListenSocket(addr string) (int, error) {

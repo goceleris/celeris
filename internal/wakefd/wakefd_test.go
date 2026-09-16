@@ -5,6 +5,7 @@ package wakefd
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -134,5 +135,132 @@ func TestConcurrentSignalAndClose(t *testing.T) {
 	}
 	if got := w.FD(); got != -1 {
 		t.Errorf("FD() = %d after the concurrent Close, want -1", got)
+	}
+}
+
+// TestConcurrentSetAndSignal is the epoll field race (E4), which this type
+// is also the fix for and which TestConcurrentSignalAndClose does NOT cover:
+// that one races Signal against Close, this one races Signal against Set.
+//
+// On main the shape was an unsynchronised field. epoll creates its wakeup
+// eventfd at startup, and if that create failed (EMFILE) it retries later —
+// on the loop thread, writing l.eventFD with no lock — while AdoptConn, the
+// detached WS/SSE closures and switchToH2Local read the same field from
+// other goroutines. Here Set takes the write lock Signal reads under, so the
+// -race detector has to stay quiet and the installed descriptor has to be
+// the one every later Signal uses.
+func TestConcurrentSetAndSignal(t *testing.T) {
+	rd, wr := pipe655(t)
+	// The handle owns its own descriptor, so Close here cannot double-close
+	// the one pipe655's cleanup closes.
+	owned, err := unix.Dup(wr)
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+
+	// A loop whose eventfd creation failed at startup: no descriptor yet.
+	w := New(-1)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 200 {
+				w.Signal()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		if !w.Set(owned) {
+			t.Error("Set on a live handle returned false")
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	if got := w.FD(); got != owned {
+		t.Errorf("FD() = %d after the concurrent Set(%d): the descriptor the loop "+
+			"installed must be the one every producer signals", got, owned)
+	}
+	// Signals that ran after the Set must have reached the new descriptor.
+	if n := wrote655(t, rd); n == 0 {
+		t.Error("nothing reached the descriptor Set installed; the producers " +
+			"would be signalling into a handle that never took it")
+	}
+	for wrote655(t, rd) > 0 {
+	}
+	w.Close()
+}
+
+// TestNewForcesNonBlocking pins the precondition Signal's bounded-time
+// guarantee rests on. Signal holds the read lock across its write(2) and
+// Close waits behind the signals in flight, so a descriptor whose write can
+// block would stall a loop's shutdown for as long as the peer takes to
+// drain. Every engine creates its eventfd with EFD_NONBLOCK, but New and Set
+// accept any descriptor, so the type enforces it rather than documenting it
+// and hoping.
+//
+// The pipe is filled first (through a temporarily non-blocking descriptor,
+// then restored to blocking) so that a write(2) on it genuinely would park.
+func TestNewForcesNonBlocking(t *testing.T) {
+	var p [2]int
+	if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil { // BLOCKING on purpose
+		t.Fatalf("pipe2: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(p[0]); _ = unix.Close(p[1]) })
+
+	flags, err := unix.FcntlInt(uintptr(p[1]), unix.F_GETFL, 0)
+	if err != nil {
+		t.Fatalf("F_GETFL: %v", err)
+	}
+	if flags&unix.O_NONBLOCK != 0 {
+		t.Fatalf("precondition: the pipe is already non-blocking, so this test " +
+			"could pass without the type enforcing anything")
+	}
+	if _, err := unix.FcntlInt(uintptr(p[1]), unix.F_SETFL, flags|unix.O_NONBLOCK); err != nil {
+		t.Fatalf("F_SETFL O_NONBLOCK: %v", err)
+	}
+	buf := make([]byte, 4096)
+	for {
+		if _, werr := unix.Write(p[1], buf); werr != nil {
+			break // EAGAIN: the pipe buffer is full
+		}
+	}
+	if _, err := unix.FcntlInt(uintptr(p[1]), unix.F_SETFL, flags); err != nil {
+		t.Fatalf("F_SETFL restore: %v", err)
+	}
+
+	owned, err := unix.Dup(p[1])
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	w := New(owned)
+
+	if fl, ferr := unix.FcntlInt(uintptr(owned), unix.F_GETFL, 0); ferr != nil {
+		t.Fatalf("F_GETFL after New: %v", ferr)
+	} else if fl&unix.O_NONBLOCK == 0 {
+		t.Fatal("New left the descriptor blocking: a Signal on a full pipe would " +
+			"park holding the read lock, and Close — which runs on the loop " +
+			"thread at shutdown — would wait behind it")
+	}
+
+	// Behavioural half: a signal into the full pipe must not stall Close.
+	done := make(chan struct{})
+	go func() {
+		w.Signal()
+		w.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close did not return: a Signal is parked in write(2) with the " +
+			"read lock held (celeris#655)")
 	}
 }

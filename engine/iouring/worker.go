@@ -4236,12 +4236,22 @@ func (w *Worker) makeWriteBodyFn(cs *connState) func([]byte) {
 // Callers assign the result to w.h2PollArmed; the loop retries via
 // rearmH2PollIfPending.
 func (w *Worker) prepareH2Poll() bool {
+	// No descriptor, nothing to arm — and nothing to retry either, so the
+	// rearm flag stays clear. Since celeris#655 the handle reports -1 both
+	// before the eventfd is created and after shutdown closed it, where the
+	// raw field could only be a live number; encodeUserData would smear that
+	// -1 across the fd bits (op | uint64(fd)&fdMask) and alias a decode.
+	// Every other FD() consumer already guards; this one was the exception.
+	efd := w.wakeFD.FD()
+	if efd < 0 {
+		w.h2PollRearmPending = false
+		return false
+	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		w.h2PollRearmPending = true
 		return false
 	}
-	efd := w.wakeFD.FD()
 	prepPollAdd(sqe, efd, unix.POLLIN)
 	setSQEUserData(sqe, encodeUserData(udH2Wakeup, efd))
 	w.h2PollRearmPending = false

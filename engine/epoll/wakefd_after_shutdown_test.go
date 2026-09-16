@@ -15,20 +15,21 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
-// celeris#655, the epoll half. Loop.shutdown closes the wakeup eventfd
-// (loop.go:2887) and leaves the number in l.eventFD, so any producer that
-// runs afterwards writes 8 bytes into whatever descriptor now holds it.
+// celeris#655, the epoll half. Loop.shutdown closes the wakeup eventfd at
+// the end of its phase 3 and, before this change, left the number in
+// l.eventFD, so any producer that ran afterwards wrote 8 bytes into whatever
+// descriptor now holds it.
 //
-// The dispatch goroutines are joined before that close (loop.go:2862), so
-// runAsyncHandler and drainDetachQueue are NOT the hazard here. What is left
-// are the producers asyncWG never tracked: the detached WS/SSE callbacks
-// installed by OnDetach, which run on middleware goroutines, and the H2
-// write queue, which the engine hands the same descriptor number
-// (loop.go:1801, 1829) and which is drained by pool goroutines the engine
-// never joins.
+// The dispatch goroutines are joined before that close (phase 2's
+// asyncWG.Wait), so runAsyncHandler and drainDetachQueue are NOT the hazard
+// here. What is left are the producers asyncWG never tracked: the detached
+// WS/SSE callbacks installed by OnDetach, which run on middleware
+// goroutines, and the H2 write queue, which the engine hands the same
+// descriptor number (initProtocol and switchToH2Local, via NewH2State) and
+// which is drained by pool goroutines the engine never joins.
 //
-// PauseRecv and ResumeRecv (loop.go:1672-1703) are the sharpest of them:
-// unlike the guarded write closure they carry no detachClosed check at all.
+// The PauseRecv and ResumeRecv closures are the sharpest of them: unlike the
+// guarded write closure they carry no detachClosed check at all.
 
 // drainWake655 reads the eventfd counter, returning 0 when nothing signalled
 // it. Used as the POSITIVE CONTROL: it proves the producer under test really
@@ -105,8 +106,8 @@ func (w *fdWatcher655) assertNoLateWake(t *testing.T, n int, who string) {
 // TestDetachedResumeRecvAfterShutdownDoesNotWriteTheClosedWakeupFD models a
 // WebSocket connection paused by backpressure whose handler drains its buffer
 // after the engine is gone: shutdown fires OnDetachClose, the chanReader
-// delivers the chunks it still holds before it reports that close
-// (middleware/websocket/engineread.go:263-320), and on the way down to
+// delivers the chunks it still holds before it reports that close (see
+// middleware/websocket/engineread.go's Read), and on the way down to
 // lowWater it calls resume().
 //
 // The Loop is built as a literal in the shape review_v150_test.go uses, with
