@@ -24,15 +24,23 @@ import (
 // celeris#662 at the level where it actually bites: an engine switch.
 //
 // performSwitch resumes the new active engine and then pauses the old one.
-// #663 taught that pause to serve what its accept queues hold, but both
-// sub-engines set TCP_DEFER_ACCEPT=1 on their listen sockets, so a connection
-// whose handshake completed while the old engine was active and which has sent
-// no data is not in any accept queue: the kernel is holding it as a request
-// socket. The pause closes the old engine's listen sockets, the request socket
-// is orphaned, and the client's first request meets the new engine's LISTEN
-// socket, which answers it with a reset. That is the shape the #660 CI job
-// measured — a 2048-connection ramp losing about a third of its connections
-// across a promotion, every sampled error a reset.
+// #663 taught that pause to serve what its accept queues hold, but that reaches
+// only what the ACCEPT QUEUE holds. While a sub-engine sets TCP_DEFER_ACCEPT on
+// its listen sockets, a connection whose handshake completed on the outgoing
+// engine and which has sent no data is not in any accept queue at all: the
+// kernel is holding it as a request socket. The pause closes the old engine's
+// listen sockets, the request socket is orphaned, and the client's first
+// request meets the new engine's LISTEN socket, which answers it with a reset.
+// That is the shape the #660 CI job measured — a 2048-connection ramp losing
+// about a third of its connections across a promotion, every sampled error a
+// reset.
+//
+// The fix is in adaptive.New, which sets resource.Config.DisableDeferAccept on
+// both sub-engines: adaptive pauses on every switch, so it never gets to keep
+// an option that hides connections from a pause. A standalone epoll or io_uring
+// engine still defers by default, because it is worth real throughput on
+// connection churn to one that never pauses. This test therefore needs no
+// config of its own — if it fails, adaptive stopped setting the flag.
 //
 // The standby is built and bound BEFORE the measured phase. The lazy first
 // build waits for the io_uring sub-engine to bind, which can take seconds, and

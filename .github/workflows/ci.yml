@@ -294,24 +294,23 @@ jobs:
       # a failure, so this job cannot go green by skipping them.
       #
       # Quarantined by name, each with its open issue. Delete the entry when
-      # the issue closes: TestRampH1Sync and TestRampH1Async (celeris#662: a
-      # switch drops the connections queued on the paused engine, and on a
-      # GitHub runner a 2048-conn promotion loses about a third of them). The
-      # other three up-switch tests keep running.
+      # the issue closes: nothing is quarantined here now.
       #
-      # TestBidirectionalFlapAsync was the third entry, quarantined for
-      # celeris#657 itself. PR-3 fixes what it was failing on -- at a flap the
-      # outgoing engine kept 35-51 of 64 connections on the base and 0 on the
-      # fix, 8 of 8 each -- and it is un-skipped here under the lift rule the
-      # design decision sets: only after >= 6 GitHub-hosted re-runs of
-      # identical bytes all pass. Those re-runs are recorded on the PR. It is
-      # in the placement tally below, so it cannot go quiet again.
+      # TestBidirectionalFlapAsync was quarantined for celeris#657 itself.
+      # PR-3 fixes what it was failing on -- at a flap the outgoing engine
+      # kept 35-51 of 64 connections on the base and 0 on the fix, 8 of 8 each
+      # -- and it is un-skipped here under the lift rule the design decision
+      # sets: only after >= 6 GitHub-hosted re-runs of identical bytes all
+      # pass. Those re-runs are recorded on the PR. It is in the placement
+      # tally below, so it cannot go quiet again.
       #
-      # TestRampH1Async keeps its entry although PR-3 empties the outgoing
-      # engine there too (0 of 2048 left behind, against 247-512 on the base).
-      # Its quarantine is celeris#662's, not this one's, and the 2048-conn
-      # ramp also loses connections to "read: reset" on BOTH the base and the
-      # fix (celeris#686). Lift it with #662, not here.
+      # TestRampH1Sync and TestRampH1Async come off the list with this commit:
+      # celeris#662 is fixed (adaptive.New now sets DisableDeferAccept on both
+      # sub-engines, so a switch no longer resets the connections the kernel
+      # was holding out of the accept queue). `-skip` and `-run` are regexes
+      # over test names, so a rename would silently drop them from the run and
+      # `go test` would still exit 0. The tally below is the interlock, the
+      # same one the `iouring` job uses: both must report PASS.
       #
       # celeris#657 face 2 has its multi-ring gate here: TestFlapConnsPerRing
       # (T4) fixes both engines at two workers, so its 256 keep-alive
@@ -345,8 +344,13 @@ jobs:
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=900s -v \
-            -skip '^(TestRampH1Sync|TestRampH1Async)$' \
             ./adaptive/... 2>&1 | tee /tmp/adaptive-race.log
+          ramp=$(grep -cE '^--- PASS: TestRampH1(Sync|Async) \(' /tmp/adaptive-race.log || true)
+          echo "celeris#662 ramp tests passed: $ramp"
+          if [ "$ramp" -ne 2 ]; then
+            echo "expected TestRampH1Sync and TestRampH1Async to PASS, saw $ramp -- were they renamed, or did they skip?"
+            exit 1
+          fi
           t4='TestFlapConnsPerRing'
           ran=$(grep -cE "^=== RUN   ${t4}\$" /tmp/adaptive-race.log || true)
           passed=$(grep -cE "^--- PASS: ${t4} \(" /tmp/adaptive-race.log || true)
