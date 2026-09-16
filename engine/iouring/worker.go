@@ -26,6 +26,7 @@ import (
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
+	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -418,12 +419,16 @@ type Worker struct {
 	// thread only, never read on the hot path.
 	shutdownDrainDeadline int64
 
-	dirtyHead      *connState // head of intrusive doubly-linked dirty list
-	hasBufReturns  bool       // set when provided buffers need publishing
-	sendsPending   bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
-	h2Conns        []int      // FDs of H2 connections (for write queue polling)
-	h2EventFD      int        // eventfd for H2 write queue wakeup (-1 if unavailable)
-	h2PollArmed    bool       // true when POLL_ADD is active on h2EventFD
+	dirtyHead     *connState // head of intrusive doubly-linked dirty list
+	hasBufReturns bool       // set when provided buffers need publishing
+	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
+	h2Conns       []int      // FDs of H2 connections (for write queue polling)
+	// wakeFD owns the H2 / wakeup eventfd. Producers on other goroutines
+	// (drivers, transplants, detached WS/SSE, the H2 write queue) signal
+	// through the handle, so none of them can write the descriptor number
+	// after shutdown closed it (celeris#655).
+	wakeFD         *wakefd.WakeFD
+	h2PollArmed    bool // true when POLL_ADD is active on the wakeup eventfd
 	h2cfg          conn.H2Config
 	emptyIters     uint32 // consecutive iterations with zero CQEs (for adaptive timeout)
 	detachQueue    []*connState
@@ -764,7 +769,7 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 		id:            id,
 		cpuID:         cpuID,
 		listenFD:      -1,
-		h2EventFD:     -1,
+		wakeFD:        wakefd.New(-1),
 		tier:          tier,
 		sqpoll:        tier.SQPollIdle() > 0,
 		sendZC:        tier.SupportsSendZC(),
@@ -935,7 +940,11 @@ func (w *Worker) run(ctx context.Context) {
 	if efdErr != nil {
 		efd = -1
 	}
-	w.h2EventFD = efd
+	// celeris#655: producers hold the handle, never the number, so the
+	// descriptor cannot be written once shutdown has closed it.
+	if !w.wakeFD.Set(efd) && efd >= 0 {
+		_ = unix.Close(efd)
+	}
 
 	w.prepareAccept()
 	if _, err := submitInitialAccept(w.ring); err != nil {
@@ -1754,7 +1763,7 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	if w.listenFD < 0 {
 		return 1 * time.Second
 	}
-	if len(w.h2Conns) > 0 && w.h2EventFD < 0 {
+	if len(w.h2Conns) > 0 && w.wakeFD.FD() < 0 {
 		return 100 * time.Microsecond
 	}
 	if w.dirtyHead != nil {
@@ -2106,7 +2115,7 @@ func (w *Worker) initProtocol(cs *connState) {
 				cs.asyncDetachPending = true
 			}
 			orig := cs.writeFn
-			wakeupFD := w.h2EventFD
+			wake := w.wakeFD
 			guarded := func(data []byte) {
 				mu.Lock()
 				if cs.detachClosed {
@@ -2181,10 +2190,8 @@ func (w *Worker) initProtocol(cs *connState) {
 				// invariant (celeris#284) is fully preserved.
 				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wasEmpty && wakeupFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(wakeupFD, val[:])
+				if wasEmpty {
+					wake.Signal()
 				}
 			}
 			cs.writeFn = guarded
@@ -2207,10 +2214,8 @@ func (w *Worker) initProtocol(cs *connState) {
 				// edge — see the write closure above and drainDetachQueue.
 				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wasEmpty && wakeupFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(wakeupFD, val[:])
+				if wasEmpty {
+					wake.Signal()
 				}
 			}
 			cs.h1State.ResumeRecv = func() {
@@ -2223,10 +2228,8 @@ func (w *Worker) initProtocol(cs *connState) {
 				// edge — see the write closure above and drainDetachQueue.
 				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wasEmpty && wakeupFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(wakeupFD, val[:])
+				if wasEmpty {
+					wake.Signal()
 				}
 			}
 			// Ensure eventfd poll is armed so the worker wakes up.
@@ -2235,7 +2238,7 @@ func (w *Worker) initProtocol(cs *connState) {
 			// drainDetachQueue (worker-thread) via asyncDetachPending
 			// — see the SINGLE_ISSUER note on the asyncDetachPending
 			// field.
-			if !w.async && !w.h2PollArmed && w.h2EventFD >= 0 {
+			if !w.async && !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()
 			}
 			// Async mode (HTTP1): the dispatch goroutine took detachMu
@@ -2291,10 +2294,8 @@ func (w *Worker) initProtocol(cs *connState) {
 				// edge — see the write closure above and drainDetachQueue.
 				wasEmpty := w.detachQPending.Swap(1) == 0
 				w.detachQMu.Unlock()
-				if wasEmpty && wakeupFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(wakeupFD, val[:])
+				if wasEmpty {
+					wake.Signal()
 				}
 			}
 			// Publish barrier: Store(true) LAST so a worker that observes
@@ -2321,11 +2322,11 @@ func (w *Worker) initProtocol(cs *connState) {
 			}
 		}
 	case engine.H2C:
-		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD)
+		cs.h2State = conn.NewH2State(w.handler, w.h2cfg, cs.writeFn, w.wakeFD)
 		cs.h2State.SetRemoteAddr(cs.remoteAddr)
 		// Arm eventfd POLL_ADD on first H2 connection so the ring wakes
 		// event-driven when handler goroutines enqueue responses.
-		if !w.h2PollArmed && w.h2EventFD >= 0 {
+		if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 			w.h2PollArmed = w.prepareH2Poll()
 		}
 		w.h2Conns = append(w.h2Conns, cs.fd)
@@ -2341,7 +2342,7 @@ func (w *Worker) switchToH2(cs *connState) error {
 	if err := w.switchToH2Local(cs); err != nil {
 		return err
 	}
-	if !w.h2PollArmed && w.h2EventFD >= 0 {
+	if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 		w.h2PollArmed = w.prepareH2Poll()
 	}
 	w.h2Conns = append(w.h2Conns, cs.fd)
@@ -2355,7 +2356,7 @@ func (w *Worker) switchToH2(cs *connState) error {
 // the worker to finish via asyncH2Promoted + detachQueue.
 func (w *Worker) switchToH2Local(cs *connState) error {
 	info := cs.h1State.UpgradeInfo
-	h2State, err := conn.NewH2StateFromUpgrade(w.handler, w.h2cfg, cs.writeFn, w.h2EventFD, info)
+	h2State, err := conn.NewH2StateFromUpgrade(w.handler, w.h2cfg, cs.writeFn, w.wakeFD, info)
 	if err != nil {
 		cs.h1State.UpgradeInfo = nil
 		conn.ReleaseUpgradeInfo(info)
@@ -3961,11 +3962,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
 			w.detachQMu.Unlock()
-			if w.h2EventFD >= 0 {
-				var val [8]byte
-				val[0] = 1
-				_, _ = unix.Write(w.h2EventFD, val[:])
-			}
+			w.wakeFD.Signal()
 		}
 	}()
 	for {
@@ -4101,11 +4098,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
 			w.detachQMu.Unlock()
-			if w.h2EventFD >= 0 {
-				var val [8]byte
-				val[0] = 1
-				_, _ = unix.Write(w.h2EventFD, val[:])
-			}
+			w.wakeFD.Signal()
 			return
 		}
 		// celeris#273: a user handler may have called c.Detach() inside
@@ -4130,11 +4123,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 				w.detachQueue = append(w.detachQueue, cs)
 				w.detachQPending.Store(1)
 				w.detachQMu.Unlock()
-				if w.h2EventFD >= 0 {
-					var val [8]byte
-					val[0] = 1
-					_, _ = unix.Write(w.h2EventFD, val[:])
-				}
+				w.wakeFD.Signal()
 				return
 			}
 			// Post-Detach: loop back to wait for more recv bytes (WS
@@ -4196,11 +4185,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
 			w.detachQMu.Unlock()
-			if w.h2EventFD >= 0 {
-				var val [8]byte
-				val[0] = 1
-				_, _ = unix.Write(w.h2EventFD, val[:])
-			}
+			w.wakeFD.Signal()
 			return
 		}
 
@@ -4209,11 +4194,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			w.detachQueue = append(w.detachQueue, cs)
 			w.detachQPending.Store(1)
 			w.detachQMu.Unlock()
-			if w.h2EventFD >= 0 {
-				var val [8]byte
-				val[0] = 1
-				_, _ = unix.Write(w.h2EventFD, val[:])
-			}
+			w.wakeFD.Signal()
 		}
 	}
 }
@@ -4278,13 +4259,24 @@ func (w *Worker) makeWriteBodyFn(cs *connState) func([]byte) {
 // Callers assign the result to w.h2PollArmed; the loop retries via
 // rearmH2PollIfPending.
 func (w *Worker) prepareH2Poll() bool {
+	// No descriptor, nothing to arm — and nothing to retry either, so the
+	// rearm flag stays clear. Since celeris#655 the handle reports -1 both
+	// before the eventfd is created and after shutdown closed it, where the
+	// raw field could only be a live number; encodeUserData would smear that
+	// -1 across the fd bits (op | uint64(fd)&fdMask) and alias a decode.
+	// Every other FD() consumer already guards; this one was the exception.
+	efd := w.wakeFD.FD()
+	if efd < 0 {
+		w.h2PollRearmPending = false
+		return false
+	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		w.h2PollRearmPending = true
 		return false
 	}
-	prepPollAdd(sqe, w.h2EventFD, unix.POLLIN)
-	setSQEUserData(sqe, encodeUserData(udH2Wakeup, w.h2EventFD))
+	prepPollAdd(sqe, efd, unix.POLLIN)
+	setSQEUserData(sqe, encodeUserData(udH2Wakeup, efd))
 	w.h2PollRearmPending = false
 	return true
 }
@@ -4292,7 +4284,7 @@ func (w *Worker) prepareH2Poll() bool {
 // rearmH2PollIfPending re-issues an H2 eventfd poll that prepareH2Poll had
 // to drop on a full SQ ring. No-op unless a drop is pending.
 func (w *Worker) rearmH2PollIfPending() {
-	if !w.h2PollRearmPending || w.h2PollArmed || w.h2EventFD < 0 {
+	if !w.h2PollRearmPending || w.h2PollArmed || w.wakeFD.FD() < 0 {
 		return
 	}
 	w.h2PollArmed = w.prepareH2Poll()
@@ -4302,7 +4294,7 @@ func (w *Worker) rearmH2PollIfPending() {
 // The actual H2 write queue drain happens in the existing bottom-of-loop pass.
 func (w *Worker) handleH2Wakeup() {
 	var buf [8]byte
-	_, _ = unix.Read(w.h2EventFD, buf[:])
+	_, _ = unix.Read(w.wakeFD.FD(), buf[:])
 	w.h2PollArmed = w.prepareH2Poll()
 }
 
@@ -4460,7 +4452,7 @@ func (w *Worker) drainDetachQueue() {
 		// subsequent recvs dispatch via the inline H2 path.
 		if cs.asyncH2Promoted.Load() {
 			cs.asyncH2Promoted.Store(false)
-			if !w.h2PollArmed && w.h2EventFD >= 0 {
+			if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()
 			}
 			w.h2Conns = append(w.h2Conns, cs.fd)
@@ -4481,7 +4473,7 @@ func (w *Worker) drainDetachQueue() {
 			if w.detachedConns != nil {
 				w.detachedConns.Add(1)
 			}
-			if !w.h2PollArmed && w.h2EventFD >= 0 {
+			if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
 				w.h2PollArmed = w.prepareH2Poll()
 			}
 		}
@@ -5162,8 +5154,8 @@ func (w *Worker) shutdown() {
 	// First: close every adoption still queued, and refuse every AdoptConn
 	// from here on. Everything below walks the conn table only, which a
 	// queued adoption is not in yet — and closeAdoptQueue must run before
-	// h2EventFD is closed, because addAdoptAction writes it under the same
-	// lock (celeris#658).
+	// the wakeup eventfd is closed, because addAdoptAction signals it under
+	// the same lock (celeris#658).
 	w.closeAdoptQueue()
 	// Fire onClose for every registered driver conn before tearing down
 	// ring/listen fd. Otherwise driver callbacks are silently dropped.
@@ -5233,9 +5225,11 @@ func (w *Worker) shutdown() {
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 	}
-	if w.h2EventFD >= 0 {
-		_ = unix.Close(w.h2EventFD)
-	}
+	// celeris#655: Close waits for the signals already in flight and turns
+	// every later one into a no-op, so no producer — including the dispatch
+	// goroutines this function only joins below — can write this descriptor
+	// number once it is free to be recycled.
+	w.wakeFD.Close()
 	if w.bufRing != nil && w.ring != nil {
 		w.bufRing.Close(w.ring)
 	}
@@ -5270,10 +5264,14 @@ func (w *Worker) releaseFailedInit() {
 		_ = w.ring.Close()
 		w.ring = nil
 	}
-	if w.h2EventFD >= 0 {
-		_ = unix.Close(w.h2EventFD)
-		w.h2EventFD = -1
-	}
+	// celeris#655: release through the handle, not the raw number. A worker
+	// that failed init may already have handed its *WakeFD to producers;
+	// Close waits behind the signals in flight, retires the number before
+	// closing, and makes every later Signal a no-op. It is idempotent, so
+	// shutdown calling it again is free. Kept in the slot the raw close
+	// occupied, so the ring-before-listen-socket order documented above is
+	// unchanged.
+	w.wakeFD.Close()
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 		w.listenFD = -1

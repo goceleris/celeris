@@ -199,11 +199,7 @@ func (w *Worker) enqueueDetach(cs *connState) {
 	w.detachQueue = append(w.detachQueue, cs)
 	w.detachQPending.Store(1)
 	w.detachQMu.Unlock()
-	if w.h2EventFD >= 0 {
-		var val [8]byte
-		val[0] = 1
-		_, _ = unix.Write(w.h2EventFD, val[:])
-	}
+	w.wakeFD.Signal()
 }
 
 // finishAsyncTransplant completes a self-initiated async transplant on the WORKER

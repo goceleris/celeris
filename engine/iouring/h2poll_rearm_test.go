@@ -5,6 +5,8 @@ package iouring
 import (
 	"testing"
 	"unsafe"
+
+	"github.com/goceleris/celeris/internal/wakefd"
 )
 
 // fullSQRing returns a Ring that always reports a full submission queue:
@@ -30,7 +32,7 @@ func fullSQRing() *Ring {
 // set h2PollArmed unconditionally, which is the same defect celeris#523 fixed
 // at the other seven call sites.
 func TestDrainDriverActionsDoesNotSwallowAFullSQRing(t *testing.T) {
-	w := &Worker{ring: fullSQRing(), h2EventFD: 1}
+	w := &Worker{ring: fullSQRing(), wakeFD: wakefd.New(1)}
 	w.driverActionPending.Store(1)
 
 	if got := w.ring.GetSQE(); got != nil {

@@ -10,7 +10,7 @@ import "testing"
 // spread odd IDs across ALL shards while keeping each stream affine to one.
 func TestH2ShardedQueue_OddStreamShardDistribution(t *testing.T) {
 	var q h2ShardedQueue
-	q.wakeupFD = -1 // pure in-memory; no eventfd signaling
+	// a nil wake handle: pure in-memory, no eventfd signaling
 
 	// Enqueue one frame per odd stream ID (1,3,5,…), like real client streams.
 	const perShard = 4
@@ -30,7 +30,6 @@ func TestH2ShardedQueue_OddStreamShardDistribution(t *testing.T) {
 
 	// Stream affinity: the same stream ID always lands in exactly one shard.
 	var q2 h2ShardedQueue
-	q2.wakeupFD = -1
 	const affID = 5
 	for i := 0; i < 3; i++ {
 		q2.Enqueue(affID, getH2FrameBuf())

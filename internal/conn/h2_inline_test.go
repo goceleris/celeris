@@ -45,7 +45,7 @@ func TestH2InlineResponse_DirectOutBuf_StaysStreamer(t *testing.T) {
 	var writes []byte
 	write := func(b []byte) { mu.Lock(); writes = append(writes, b...); mu.Unlock() }
 
-	state := NewH2State(h, H2Config{}, write, -1) // wakeupFD=-1: no eventfd
+	state := NewH2State(h, H2Config{}, write, nil) // a nil wake handle: no eventfd
 
 	// Client preface + empty SETTINGS + a single inline-eligible GET (END_STREAM).
 	hdr := encodeH2Headers(t, [][2]string{

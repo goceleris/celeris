@@ -42,6 +42,49 @@ type driverConn struct {
 	epollOut bool   // true while EPOLLOUT is armed so ResetWrite can disarm it
 }
 
+// errLoopShutdown is what a driver gets when it reaches this loop after
+// shutdown closed its epoll descriptor.
+var errLoopShutdown = errors.New("celeris/epoll: worker loop has shut down")
+
+// driverEpollCtl runs an epoll_ctl on the loop's epoll descriptor for a
+// caller that is not necessarily the loop thread.
+//
+// celeris#655, the epoll driver path. Loop.shutdown closes l.epollFD, and a
+// driver goroutine's RegisterConn / UnregisterConn / Write can run at any
+// time afterwards — deterministically so, because shutdownDrivers sets
+// l.driverConns = nil and RegisterConn rebuilds the map from nil. The number
+// is by then free to be recycled, and the epoll_ctl lands on whatever
+// inherited it: another worker's epoll set silently gains or loses a
+// descriptor nobody asked it to watch. Exactly the defect the wakeup eventfd
+// had, on the other descriptor a driver can reach.
+//
+// The rule is the same one WakeFD applies: the operation happens under a
+// lock the close takes first, so it either completes before the close or is
+// refused. ctlMu is a LEAF — callers hold driverMu (RegisterConn) or dc.mu
+// (flushDriverSendLocked), and nothing is acquired while it is held.
+func (l *Loop) driverEpollCtl(op, fd int, ev *unix.EpollEvent) error {
+	l.ctlMu.RLock()
+	defer l.ctlMu.RUnlock()
+	if l.ctlClosed {
+		return errLoopShutdown
+	}
+	return unix.EpollCtl(l.epollFD, op, fd, ev)
+}
+
+// closeEpollFD closes the loop's epoll descriptor and refuses every later
+// driver epoll_ctl. Runs on the loop thread at the very end of shutdown,
+// holding no other lock. Idempotent.
+func (l *Loop) closeEpollFD() {
+	l.ctlMu.Lock()
+	fd := l.epollFD
+	l.ctlClosed = true
+	l.epollFD = -1
+	l.ctlMu.Unlock()
+	if fd >= 0 {
+		_ = unix.Close(fd)
+	}
+}
+
 // lookupDriver returns the driverConn for fd, or nil if none is registered.
 // Safe to call from the worker goroutine during dispatch.
 func (l *Loop) lookupDriver(fd int) *driverConn {
@@ -90,7 +133,7 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 	}
 	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) via armEpollOut
 	// so idle driver conns don't wake the loop on every send-buffer drain.
-	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
+	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 		Fd:     int32(fd),
 	}); err != nil {
@@ -118,7 +161,7 @@ func (l *Loop) UnregisterConn(fd int) error {
 	}
 	l.driverMu.Unlock()
 
-	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
+	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, fd, nil)
 
 	// Synchronous close: the caller is typically the driver's own goroutine
 	// (not the worker). A deferred dispatch via eventfd would require the
@@ -199,7 +242,7 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 					// level-triggered: it fires as long as the socket is
 					// writable, so there is no risk of a missed wakeup
 					// after sending clears. EPOLLET only applies to EPOLLIN.
-					modErr := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, dc.fd, &unix.EpollEvent{
+					modErr := l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &unix.EpollEvent{
 						Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP,
 						Fd:     int32(dc.fd),
 					})
@@ -223,7 +266,7 @@ func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
 	dc.writeBuf = dc.writeBuf[:0]
 	dc.sendPos = 0
 	if dc.epollOut {
-		_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, dc.fd, &unix.EpollEvent{
+		_ = l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &unix.EpollEvent{
 			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 			Fd:     int32(dc.fd),
 		})
@@ -327,7 +370,7 @@ func (l *Loop) closeDriver(dc *driverConn, cause error) {
 	}
 	l.driverMu.Unlock()
 
-	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, dc.fd, nil)
+	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
 
 	if cb != nil {
 		cb(cause)
@@ -359,7 +402,7 @@ func (l *Loop) shutdownDrivers() {
 		dc.closed = true
 		cb := dc.onClose
 		dc.mu.Unlock()
-		_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, dc.fd, nil)
+		_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
 		if cb != nil {
 			cb(nil)
 		}
