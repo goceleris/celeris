@@ -108,6 +108,11 @@ jobs:
       # below, which raises memlock so the up-switch tests execute
       # (celeris#641).
       #
+      # ./engine/iouring DOES run here, at the runner's own 8 MiB memlock.
+      # The three celeris#656 worker-init tests cannot run at that limit (they
+      # need two io_uring workers) and skip; the `iouring` job below runs those
+      # three with memlock raised and skipping forbidden.
+      #
       # Excludes ./middleware/websocket because TestNativeEngineClose
       # FrameEcho/io_uring drives 13 close-handshake round trips on a
       # native io_uring engine and intermittently overruns its 30s
@@ -177,6 +182,54 @@ jobs:
           go test -race -count=1 -timeout=600s -v \
             -skip '^(TestBidirectionalFlapAsync|TestRampH1Sync|TestRampH1Async)$' \
             ./adaptive/...
+
+  iouring:
+    name: io_uring init-failure regression (./engine/iouring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      # celeris#656: the three tests that pin the failed-worker listen-socket
+      # leak ask for TWO io_uring workers on one port, and RLIMIT_MEMLOCK funds
+      # one per 12 MiB (engine/iouring/ring.go minMemlockPerWorker). GitHub
+      # -hosted runners default to 8 MiB, so in the `unit` job -- which runs
+      # ./engine/iouring without raising memlock and without -v -- all three
+      # skipped silently and the leak shipped with no CI cover.
+      #
+      # Same two ingredients as the `adaptive` job (celeris#641): raise memlock
+      # for this shell, which the test process inherits, and set
+      # CELERIS_REQUIRE_IOURING_WORKERS=1 so every environment skip in
+      # init_failure_leak_linux_test.go becomes a failure.
+      #
+      # Scoped to those tests by -run rather than running the whole package
+      # here: the rest of ./engine/iouring keeps running in `unit` at the
+      # runner's own memlock, the shape it has been green in.
+      #
+      # `-run` is a regex over test names, so a rename would quietly select
+      # nothing and go test would still exit 0 ("no tests to run"). The tally
+      # below is the interlock: exactly three of these tests must report PASS.
+      - name: io_uring worker init-failure leak tests (memlock raised, skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=600s -v \
+            -run '^TestListenCloses(ListenSocketsWhenEveryWorkerRingSetupFails|ListenSocketWhenOneWorkerRingSetupFails|ListenSocketRingAndEventfdWhenInitialSubmitFails)$' \
+            ./engine/iouring/ 2>&1 | tee /tmp/iouring656.log
+          passed=$(grep -cE '^--- PASS: TestListenCloses' /tmp/iouring656.log || true)
+          echo "celeris#656 tests passed: $passed"
+          if [ "$passed" -ne 3 ]; then
+            echo "expected 3 celeris#656 tests to PASS, saw $passed -- were they renamed, or did they skip?"
+            exit 1
+          fi
 
   conformance:
     name: Conformance

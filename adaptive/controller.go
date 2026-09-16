@@ -28,7 +28,8 @@ import (
 //     link-bound — the engines tie — so an io_uring switch is suppressed to
 //     avoid pointless churn.
 //   - A safety revert fires if io_uring is active and the error rate climbs
-//     above errorRevertRate, regardless of load.
+//     above errorRevertRate, regardless of load, and regardless of the
+//     standby-build backoff (celeris#656).
 //
 // The oscillation lock (3 switches in 5 min → 5 min lock) and the post-switch
 // cooldown bound any residual thrash and hold io_uring after the fast snap.
@@ -48,7 +49,26 @@ type controllerState struct {
 	// (recordSwitch) and whenever the condition lapses.
 	upTicks   int
 	downTicks int
+
+	// buildFailures counts consecutive failed lazy standby builds, and
+	// buildRetryAt is when evaluate may next recommend a LOAD-driven switch
+	// after the last of them (celeris#656). Without it the controller, whose
+	// load has not changed, recommends the same failing build on the very next
+	// tick. Neither touches lastSwitch or switchTimes: nothing switched, so the
+	// cooldown and the oscillation lock must not count it. Neither gates the
+	// io_uring error-rate safety revert, which evaluate decides above them.
+	buildFailures int
+	buildRetryAt  time.Time
 }
+
+// A failed lazy standby build backs off for standbyBuildBackoffBase, doubling
+// with each consecutive failure up to standbyBuildBackoffMax (celeris#656).
+// The backoff holds off the load-driven switches only; evaluate decides the
+// io_uring error-rate safety revert above it.
+const (
+	standbyBuildBackoffBase = 30 * time.Second
+	standbyBuildBackoffMax  = 10 * time.Minute
+)
 
 type controller struct {
 	primary   engine.Engine // epoll  (low-conns winner / starting engine)
@@ -137,19 +157,41 @@ func (c *controller) evaluate(now time.Time, frozen bool) bool {
 		return false
 	}
 
+	// Sample on EVERY tick that gets this far, before any of the celeris#656
+	// backoff below can return: liveSampler is delta-based against the previous
+	// sample (telemetry.go), so a tick that skips it widens the next tick's
+	// window to the whole skipped span and smears a fresh error burst across it.
 	active := c.activeEngine()
 	snap := c.sampler.Sample(active)
 	cpw := snap.ConnsPerWorker
 
 	if active.Type() == engine.IOUring {
-		// Safety error-revert is ALWAYS active, independent of connSwitchEnabled:
-		// if io_uring starts erroring on this deployment, fall back to epoll.
+		// Safety error-revert is ALWAYS active, independent of connSwitchEnabled
+		// AND of the standby-build backoff below: if io_uring starts erroring on
+		// this deployment, fall back to epoll. It is decided here, above the
+		// backoff, because on the io_uring-start path (New sets connSwitchEnabled
+		// and loadDownRevert false there) it is the ONLY switch evaluate can ever
+		// recommend: a backoff over it would leave an erroring engine serving for
+		// as long as standbyBuildBackoffMax. A revert whose epoll standby build
+		// keeps failing therefore keeps retrying — the failed build is bounded
+		// work that leaves nothing behind, and there is no other way back.
 		if snap.ErrorRate > c.errorRevertRate {
 			c.state.downTicks = 0
 			c.state.upTicks = 0
 			c.logSwitch("io_uring", "epoll", "error-rate safety revert", cpw, snap)
 			return true
 		}
+	}
+
+	// celeris#656: hold off the LOAD-driven switches while a failed lazy standby
+	// build backs off. The load that asked for the build has not changed, so
+	// without this the controller recommends the same failing build on the very
+	// next tick.
+	if now.Before(c.state.buildRetryAt) {
+		return false
+	}
+
+	if active.Type() == engine.IOUring {
 		if !c.connSwitchEnabled || !c.loadDownRevert {
 			// Load-driven down-revert is disabled in production: pinned conns
 			// never migrate, so reverting only strands io_uring keep-alives and
@@ -258,4 +300,29 @@ func (c *controller) recordSwitch(now time.Time) {
 			c.logger.Warn("oscillation detected, locking switches", "until", c.state.lockUntil)
 		}
 	}
+}
+
+// recordStandbyBuildFailure updates controller state after a lazy standby
+// build failed and the switch was abandoned, and returns how long evaluate
+// now holds off the load-driven switches (celeris#656); the error-rate safety
+// revert is never held off. The sustain count restarts too, so a sustained
+// ramp must be seen again after the backoff.
+func (c *controller) recordStandbyBuildFailure(now time.Time) time.Duration {
+	c.state.buildFailures++
+	backoff := standbyBuildBackoffMax
+	// The shift is bounded: 30s<<5 is already past the cap, and an unbounded
+	// count of failures over a long uptime would overflow it.
+	if n := c.state.buildFailures - 1; n < 5 {
+		backoff = min(standbyBuildBackoffBase<<n, standbyBuildBackoffMax)
+	}
+	c.state.buildRetryAt = now.Add(backoff)
+	c.state.upTicks = 0
+	c.state.downTicks = 0
+	return backoff
+}
+
+// recordStandbyBuilt clears the build backoff once a lazy standby has started.
+func (c *controller) recordStandbyBuilt() {
+	c.state.buildFailures = 0
+	c.state.buildRetryAt = time.Time{}
 }
