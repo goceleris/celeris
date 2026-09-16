@@ -574,9 +574,26 @@ func (s *Server) EngineInfo() *EngineInfo {
 	}
 }
 
-// PauseAccept stops accepting new connections. Existing connections continue
-// to be served. Returns [ErrAcceptControlNotSupported] if the engine does not
-// support accept control (e.g. std engine).
+// PauseAccept stops accepting new connections. Returns
+// [ErrAcceptControlNotSupported] if the engine does not support accept
+// control — the std and adaptive engines do not implement it.
+//
+// Connections that were already ACCEPTED continue to be served, and
+// connections still waiting in the listen socket's accept queue are drained
+// and served before that socket closes (celeris#663).
+//
+// ONE CLASS IS NOT CARRIED ACROSS THE PAUSE BY DEFAULT: a client whose TCP
+// handshake completed but which has not yet sent a byte. TCP_DEFER_ACCEPT is
+// on by default on the epoll and io_uring listen sockets, and while it is the
+// kernel keeps such a connection out of the accept queue entirely — so no
+// drain can reach it, closing the listen socket resets it, and its first
+// request gets no response while the engine counts no accept, no close and no
+// error (celeris#662; the residual is tracked as celeris#675).
+//
+// Set [Config.DisableDeferAccept] on a server that calls this. It costs
+// throughput on connection churn and nothing on keep-alive traffic; see
+// [github.com/goceleris/celeris/resource.Config.DisableDeferAccept] for the
+// measured numbers.
 func (s *Server) PauseAccept() error {
 	eng := s.loadEngine()
 	if eng == nil {

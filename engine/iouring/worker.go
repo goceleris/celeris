@@ -2081,10 +2081,14 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 // DRAINING→SUSPENDED gate keeps the worker serving them until they close or
 // are transplanted, then parks it as before. A ResumeAccept racing the drain
 // loses nothing: the worker still closes the listener it read as paused and
-// re-creates it on the next iteration, as it did before. A handshake still in
-// progress at the close is aborted by the kernel as before; that is inherent
-// to closing a listen socket, unlike the deferred-request-socket case above,
-// which is configuration.
+// re-creates it on the next iteration, as it did before.
+//
+// Two residual states are NOT covered and ARE inherent, matching the list on
+// epoll's acceptQueuedOnPause: a handshake still in progress at the close,
+// and one that COMPLETES between the final EAGAIN and the close. Only the
+// kernel's tcp_migrate_req can move those to another listener in the
+// SO_REUSEPORT group. That pair is physics; the deferred-request-socket case
+// above is configuration.
 //
 // listenFD is the socket being closed. The caller has already cleared
 // w.listenFD, so no completion handled on the way can re-arm accept on it.

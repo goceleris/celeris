@@ -79,9 +79,13 @@ type Config struct {
 	// client's first request is met with a reset (celeris#662).
 	//
 	// Set this whenever the engine will pause accept. adaptive.New sets it on
-	// both of its sub-engines, because every adaptive switch pauses the
-	// outgoing one; a standalone engine whose owner calls PauseAccept (or
-	// celeris.Server.PauseAccept) should set it too.
+	// both sub-engines WHEN that engine can actually switch, because every
+	// switch pauses the outgoing one -- and leaves the option alone when no
+	// switch is reachable (an old kernel, RLIMIT_MEMLOCK below one io_uring
+	// worker's rings, or Protocol H2C), since such an engine never pauses and
+	// so can never hit celeris#662. A standalone engine whose owner calls
+	// PauseAccept (or celeris.Server.PauseAccept) should set it too; that it
+	// is not the default there is tracked as celeris#675.
 	//
 	// It is off by default because the cost was measured before the default
 	// was chosen -- 30 rounds per arm, two memlock shapes, A/A floors under
@@ -90,6 +94,16 @@ type Config struct {
 	// promptly, and +67-200% on a connection that never sends. Keep-alive
 	// traffic, where one accept is amortised over many requests, is unaffected
 	// in both units.
+	//
+	// The option is also a free connect-and-never-send shield, which is a
+	// RESOURCE question and not only a throughput one: while it is set such a
+	// connection never becomes a socket the engine owns, so it costs no
+	// descriptor, no conn-table slot and no buffer. Clearing it turns each
+	// one into a real accepted connection -- on the ChurnSilent benchmark at
+	// the 128 MiB memlock shape, epoll goes from 25 to 36 allocs/op and from
+	// 1485 to 3644 B/op (+44% and +145%, n=30 rounds per arm). A deployment
+	// that clears the option and faces untrusted clients is relying on its
+	// conn-table cap and ReadHeaderTimeout for that protection instead.
 	DisableDeferAccept bool
 	// Listener is an optional pre-existing listener for socket inheritance.
 	Listener net.Listener

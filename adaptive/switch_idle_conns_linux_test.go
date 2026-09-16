@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -155,7 +156,16 @@ func TestSwitchKeepsHandshakedIdleConnections(t *testing.T) {
 	// the measured switch is only a resume plus a pause.
 	e.ForceSwitch()
 	if got := e.ActiveEngine().Type(); got != engine.IOUring {
-		t.Skipf("the io_uring standby did not come up here (active %v after a forced switch)", got)
+		// This skip sits AFTER requireUpSwitch, so it used to bypass
+		// CELERIS_REQUIRE_UPSWITCH completely: the job that exists to force
+		// this test to execute could go green while the test quietly skipped
+		// here instead. It honours the same variable, for the same reason.
+		msg := fmt.Sprintf("the io_uring standby did not come up here "+
+			"(active %v after a forced switch)", got)
+		if os.Getenv("CELERIS_REQUIRE_UPSWITCH") == "1" {
+			t.Fatal(msg + " -- CELERIS_REQUIRE_UPSWITCH=1 forbids skipping")
+		}
+		t.Skip(msg)
 	}
 	e.ForceSwitch()
 	if got := e.ActiveEngine().Type(); got != engine.Epoll {

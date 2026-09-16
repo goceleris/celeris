@@ -135,10 +135,13 @@ type Config struct {
 	// [Server.PauseAccept]: while the option is on, a client that has
 	// connected but not yet sent its request is invisible to the pause and is
 	// reset instead of served (celeris#662). The Adaptive engine sets it for
-	// its own sub-engines already, so this only matters for a server pinned to
-	// Epoll or IOUring. It costs throughput on connection churn and nothing on
-	// keep-alive traffic -- see [resource.Config.DisableDeferAccept] for the
-	// measured numbers.
+	// its own sub-engines when it can actually switch, so this matters for a
+	// server pinned to Epoll or IOUring -- the case celeris#675 tracks.
+	//
+	// It costs throughput on connection churn and nothing on keep-alive
+	// traffic, and it also gives up a free connect-and-never-send shield:
+	// see [resource.Config.DisableDeferAccept] for both, with the measured
+	// numbers.
 	DisableDeferAccept bool
 	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
 	BufferSize int

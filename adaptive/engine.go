@@ -146,6 +146,46 @@ func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
 	return true
 }
 
+// upSwitchPossible reports whether the conns-per-worker epoll->io_uring
+// promotion can ever fire for this configuration. It is the single definition
+// of that policy: New() sets controller.connSwitchEnabled from it, so the
+// gate below and the controller cannot drift apart.
+func upSwitchPossible(p engine.CapabilityProfile, cfg resource.Config, startType engine.EngineType) bool {
+	return startType == engine.Epoll &&
+		ioUringViable(p, cfg) &&
+		cfg.Protocol != engine.H2C
+}
+
+// switchPossible reports whether this adaptive engine can ever switch, and so
+// whether it can ever PAUSE a sub-engine's accept. It is the condition
+// celeris#662's fix is gated on, because the cost of clearing
+// TCP_DEFER_ACCEPT is only worth paying where a pause can actually lose a
+// connection.
+//
+// Two ways a switch can happen, and both pause the outgoing engine:
+//
+//   - the conns-per-worker UP switch (upSwitchPossible), and
+//   - the always-on io_uring error-rate safety revert, which
+//     controller.evaluate applies whenever io_uring is the ACTIVE engine.
+//     On the io_uring-start path that revert is the only switch the
+//     controller can ever recommend, and it is never gated off -- so an
+//     io_uring start always counts as switchable.
+//
+// When neither holds -- an epoll start with io_uring unviable (an old kernel,
+// or RLIMIT_MEMLOCK below one worker's rings) or with Protocol H2C -- the
+// controller can recommend nothing, no sub-engine is ever paused, and the
+// engine keeps TCP_DEFER_ACCEPT and its measured churn throughput.
+//
+// It errs toward correctness in exactly one place: CELERIS_ADAPTIVE_START=
+// iouring forces an io_uring start even where io_uring is not viable, and the
+// io_uring build then falls back to an epoll start (see New). This returns
+// true for that engine although the post-fallback controller may recommend
+// nothing. Paying the option's cost on an operator-forced escape hatch is the
+// safe side of that trade.
+func switchPossible(p engine.CapabilityProfile, cfg resource.Config, startType engine.EngineType) bool {
+	return startType == engine.IOUring || upSwitchPossible(p, cfg, startType)
+}
+
 // maxWorkersForMemlock is the io_uring memlock worker-ceiling probe behind a var
 // so tests can inject a low cap without mutating the process RLIMIT_MEMLOCK.
 var maxWorkersForMemlock = iouring.MaxWorkersForMemlock
@@ -292,19 +332,48 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	// with SO_REUSEPORT (see epoll/iouring createListenSocket). The only
 	// listener shape adaptive genuinely cannot serve is a non-TCP one, and
 	// reusePortAddr above rejects that at New() rather than at switch time.
-	// Neither sub-engine may defer accept (celeris#662). Every switch pauses
-	// the outgoing engine, and while TCP_DEFER_ACCEPT is set the kernel holds
-	// a handshake-complete connection that has not yet sent its request out of
-	// the accept queue entirely -- so the pause's drain cannot see it, the
-	// listen-socket close orphans it, and the client's first request meets the
-	// incoming engine's listener with a reset. That is what the celeris#660 CI
-	// job measured as a 2048-connection ramp losing about a third of its
-	// connections across a promotion.
+	// A sub-engine that will be PAUSED may not defer accept (celeris#662).
+	// A switch pauses the outgoing engine, and while TCP_DEFER_ACCEPT is set
+	// the kernel holds a handshake-complete connection that has not yet sent
+	// its request out of the accept queue entirely -- so the pause's drain
+	// cannot see it, the listen-socket close orphans it, and the client's
+	// first request meets the incoming engine's listener with a reset. That is
+	// what the celeris#660 CI job measured as a 2048-connection ramp losing
+	// about a third of its connections across a promotion.
 	//
-	// This is set here rather than made the engines' default because the
-	// option is worth real throughput on connection churn to an engine that
-	// never pauses; adaptive always pauses, so it never gets to keep it.
-	cfg.DisableDeferAccept = true
+	// GATED, not unconditional. Adaptive is the DEFAULT engine on Linux
+	// (resource.defaultEngine), so setting this for every adaptive engine
+	// would put the option's measured churn cost -- +2.46 to +3.51 us of
+	// server CPU per connection, +14-21% ns/op -- on the default
+	// configuration, including the many adaptive engines that can never
+	// switch and therefore never pause: an old kernel, a memlock below one
+	// io_uring worker's rings, or Protocol H2C. Those keep the option and pay
+	// nothing. See switchPossible.
+	//
+	// An engine that CAN switch still pays, and that is the irreducible price
+	// of the fix: the pause is what loses the connection, so only an engine
+	// that never pauses can safely keep the option.
+	if switchPossible(profile, cfg, startType) {
+		// Log it: this silently overrides a caller that left the field false,
+		// and the field is a throughput knob, so the override must be visible
+		// in the record rather than inferred from behaviour.
+		if !cfg.DisableDeferAccept {
+			logger.Info("adaptive: disabling TCP_DEFER_ACCEPT on both sub-engines",
+				"reason", "this engine can switch, and every switch pauses the outgoing "+
+					"sub-engine; a deferred handshake-complete connection is invisible to "+
+					"that pause and is reset (celeris#662)",
+				"start_engine", startType.String(),
+				"protocol", cfg.Protocol.String(),
+				"cost", "connection churn only; keep-alive traffic is unaffected")
+		}
+		cfg.DisableDeferAccept = true
+	} else {
+		logger.Debug("adaptive: keeping TCP_DEFER_ACCEPT on both sub-engines",
+			"reason", "no switch is reachable for this configuration, so no sub-engine "+
+				"is ever paused and celeris#662 cannot occur",
+			"start_engine", startType.String(),
+			"protocol", cfg.Protocol.String())
+	}
 
 	startCfg := cfg
 	standbyCfg := cfg
@@ -393,9 +462,9 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	//   - h2c never benefits from io_uring, so never switch up for it.
 	// The controller's load-driven DOWN-revert is disabled regardless (pinning);
 	// only the always-on io_uring error-revert can move us back to epoll.
-	e.ctrl.connSwitchEnabled = e.startType == engine.Epoll &&
-		ioUringViable(profile, cfg) &&
-		cfg.Protocol != engine.H2C
+	// Same predicate the TCP_DEFER_ACCEPT gate above uses, so the two cannot
+	// drift: if this can promote, that engine can pause (celeris#662).
+	e.ctrl.connSwitchEnabled = upSwitchPossible(profile, cfg, e.startType)
 	// Load-driven down-revert is always off in production (pinning makes it
 	// harmful); only the always-on io_uring error-revert can return us to epoll.
 	e.ctrl.loadDownRevert = false

@@ -246,6 +246,35 @@ jobs:
             echo "different loop count?"
             exit 1
           fi
+      # celeris#662: the step above runs ./engine/epoll and ./engine/iouring
+      # WITHOUT -v, so a skip there prints nothing and the package still
+      # reports `ok`. That is exactly how the celeris#656 leak shipped with no
+      # cover. These eight tests are the celeris#662 cover, so they get the
+      # same PASS-count interlock the `iouring` job uses (celeris#664):
+      # -v, skipping forbidden, and an exact tally that fails the step if a
+      # test is renamed, removed or skipped.
+      #
+      # memlock is raised because the io_uring half needs a worker, and
+      # CELERIS_REQUIRE_IOURING_WORKERS=1 turns its environment skips into
+      # failures.
+      - name: celeris#662 pause/defer-accept tests (skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=300s -v \
+            -run '^(TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptIdleControl|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestListenSocketDeferAcceptFollowsConfig)$' \
+            ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/defer662.log
+          passed=$(grep -cE '^--- PASS: (TestPauseAccept|TestListenSocketDeferAccept)' /tmp/defer662.log || true)
+          echo "celeris#662 tests passed: $passed"
+          if [ "$passed" -ne 8 ]; then
+            echo "expected 8 celeris#662 tests to PASS (4 per engine), saw $passed --"
+            echo "were they renamed, did they skip, or did one of them fail?"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
@@ -387,6 +416,17 @@ jobs:
             echo "request, no recv outlived its hand-off, no hand-off was made with an op in flight) and"
             echo "TestBidirectionalFlapAsync reporting its total. Was one renamed or removed, did one skip"
             echo "(-short skips all nine), or did a cell stop reaching its own measurement?"
+            exit 1
+          fi
+          gate='TestSwitchKeepsHandshakedIdleConnections|TestSwitchPossibleGate|TestDeferAcceptFollowsSwitchPossibility'
+          gwant=$(( $(tr '|' '\n' <<<"$gate" | wc -l) ))
+          gran=$(grep -cE "^=== RUN   (${gate})\$" /tmp/adaptive-race.log || true)
+          gpassed=$(grep -cE "^--- PASS: (${gate}) \(" /tmp/adaptive-race.log || true)
+          gskipped=$(grep -cE "^[[:space:]]*--- SKIP: (${gate})[ /]" /tmp/adaptive-race.log || true)
+          echo "celeris#662 adaptive gate tests: want $gwant, ran $gran, passed $gpassed, SKIP lines $gskipped"
+          if [ "$gran" -ne "$gwant" ] || [ "$gpassed" -ne "$gwant" ] || [ "$gskipped" -ne 0 ]; then
+            echo "expected exactly $gwant celeris#662 gate tests to run and PASS with no SKIP line --"
+            echo "were they renamed, or did they skip? a skip is not coverage."
             exit 1
           fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
