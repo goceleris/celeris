@@ -67,6 +67,30 @@ type Config struct {
 	IdleTimeout time.Duration
 	// DisableKeepAlive disables HTTP keep-alive.
 	DisableKeepAlive bool
+	// DisableDeferAccept turns TCP_DEFER_ACCEPT off on the listen sockets the
+	// epoll and io_uring engines create. Default false: the option stays on.
+	//
+	// While it is set the kernel keeps a connection whose handshake has
+	// completed but which has sent no data OUT of the accept queue entirely --
+	// it stays a TCP_NEW_SYN_RECV request socket and accept4 answers EAGAIN.
+	// That saves the engine a wakeup per idle connection, and it also hides
+	// such a connection from PauseAccept's acceptQueuedOnPause drain: when the
+	// pause closes the listen socket the request socket is orphaned and the
+	// client's first request is met with a reset (celeris#662).
+	//
+	// Set this whenever the engine will pause accept. adaptive.New sets it on
+	// both of its sub-engines, because every adaptive switch pauses the
+	// outgoing one; a standalone engine whose owner calls PauseAccept (or
+	// celeris.Server.PauseAccept) should set it too.
+	//
+	// It is off by default because the cost was measured before the default
+	// was chosen -- 30 rounds per arm, two memlock shapes, A/A floors under
+	// 1.3%: clearing the option costs +14-21% ns/op and +2.4-3.5 us of server
+	// CPU per connection on churn where the request follows the handshake
+	// promptly, and +67-200% on a connection that never sends. Keep-alive
+	// traffic, where one accept is amortised over many requests, is unaffected
+	// in both units.
+	DisableDeferAccept bool
 	// Listener is an optional pre-existing listener for socket inheritance.
 	Listener net.Listener
 	// MaxRequestBodySize is the maximum allowed request body size in bytes.

@@ -317,7 +317,7 @@ func (l *Loop) run(ctx context.Context) {
 	}
 	l.epollFD = epollFD
 
-	listenFD, err := createListenSocket(l.cfg.Addr)
+	listenFD, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 	if err != nil {
 		_ = unix.Close(epollFD)
 		l.ready <- fmt.Errorf("loop %d: listen socket: %w", l.id, err)
@@ -435,7 +435,7 @@ func (l *Loop) run(ctx context.Context) {
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
 		if l.listenFD < 0 && !paused {
-			fd, err := createListenSocket(l.cfg.Addr)
+			fd, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 			if err != nil {
 				// This loop is about to stop accepting for good, so
 				// the bump is not a rate: it is the one record that
@@ -975,6 +975,12 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 // (celeris#662). Their handshakes completed before the pause and their
 // clients may already have sent a request; the close would abort them.
 //
+// It can only reach what the ACCEPT QUEUE holds, which is why a loop that
+// pauses must be configured with resource.Config.DisableDeferAccept. While
+// TCP_DEFER_ACCEPT is set the kernel keeps a handshake-complete connection
+// that has sent no data out of that queue altogether, so this drain cannot
+// see it and the close below resets it -- the residual half of celeris#662.
+//
 // They go through acceptAll, the registration every accept uses, because they
 // are ordinary connections: AcceptCount and ActiveConnections count them,
 // OnConnect fires, sockopts apply, and a descriptor that cannot be registered
@@ -997,6 +1003,11 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 //     completes between the final EAGAIN and the close. That is inherent to
 //     closing a listen socket; only the kernel's tcp_migrate_req moves those
 //     to another listener in the SO_REUSEPORT group.
+//   - Not covered either, and NOT inherent: a handshake that completed
+//     before the pause but whose client has sent nothing, on a listener that
+//     still has TCP_DEFER_ACCEPT. The kernel holds it as a request socket
+//     outside the accept queue, so no drain can rescue it. That one is
+//     configuration, not physics -- see resource.Config.DisableDeferAccept.
 func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
 	for range pauseAcceptRounds {
 		if l.acceptAll(ctx, time.Now().UnixNano()) != acceptCapped {
@@ -3006,7 +3017,10 @@ func (l *Loop) shutdown() {
 	l.closeEpollFD()
 }
 
-func createListenSocket(addr string) (int, error) {
+// createListenSocket binds and listens on addr. deferAccept asks for
+// TCP_DEFER_ACCEPT, which a caller that pauses accept must NOT ask for:
+// see resource.Config.DisableDeferAccept and celeris#662.
+func createListenSocket(addr string, deferAccept bool) (int, error) {
 	sa, err := parseAddr(addr)
 	if err != nil {
 		return -1, err
@@ -3035,9 +3049,14 @@ func createListenSocket(addr string) (int, error) {
 	// socket at SYN time, so per-accept ApplyFD can skip its own NODELAY
 	// setsockopt (one fewer syscall per accept on the hot path).
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-	// TCP_DEFER_ACCEPT: kernel holds connections until data arrives,
-	// eliminating wasted accept+wait cycles for idle connections.
-	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	// TCP_DEFER_ACCEPT: the kernel holds a connection out of the accept queue
+	// until its first data arrives, saving a wakeup per idle connection. It
+	// also hides that connection from acceptQueuedOnPause, so a loop that
+	// pauses accept loses it (celeris#662) -- which is why the caller can turn
+	// it off, and why adaptive's sub-engines do.
+	if deferAccept {
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	}
 	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 

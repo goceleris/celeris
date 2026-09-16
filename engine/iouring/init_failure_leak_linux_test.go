@@ -150,7 +150,7 @@ func port656(t *testing.T, addr string) int {
 func oracleControl656(t *testing.T, addr string) {
 	t.Helper()
 	port := port656(t, addr)
-	fd, err := createListenSocket(addr)
+	fd, err := createListenSocket(addr, true)
 	if err != nil {
 		t.Fatalf("oracle control: createListenSocket(%s): %v", addr, err)
 	}

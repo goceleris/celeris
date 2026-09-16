@@ -24,14 +24,21 @@ import (
 // celeris#662, the half of the loss class that #663's pause drain cannot
 // reach.
 //
-// createListenSocket sets TCP_DEFER_ACCEPT=1 on every listen socket. A
-// connection whose handshake has completed but which has sent no data is
-// therefore held by the kernel as a TCP_NEW_SYN_RECV request socket and never
-// enters the accept queue at all: accept4 answers EAGAIN for it. #663's drain
-// accepts what the accept queue holds, so it cannot see this connection, and
-// when the listen socket closes the orphaned request socket is reset — the
-// client's first request gets no response, and the engine counts no accept, no
-// close and no error.
+// createListenSocket sets TCP_DEFER_ACCEPT=1 on a listen socket unless the
+// config turns it off. While it is set, a connection whose handshake has
+// completed but which has sent no data is held by the kernel as a
+// TCP_NEW_SYN_RECV request socket and never enters the accept queue at all:
+// accept4 answers EAGAIN for it. #663's drain accepts what the accept queue
+// holds, so it cannot see such a connection, and when the listen socket closes
+// the orphaned request socket is reset — the client's first request gets no
+// response, and the engine counts no accept, no close and no error.
+//
+// The fix is resource.Config.DisableDeferAccept, which the rig below sets: the
+// connections then land in the accept queue like any other and #663's drain
+// serves them. The option stays ON by default, because an engine that never
+// pauses would pay +14-21% ns/op on connection churn to give it up, so what
+// this rig exercises is an engine configured the way one that intends to pause
+// must be. TestListenSocketDeferAcceptFollowsConfig pins both directions.
 //
 // The rig needs no blocking handler, unlike the queued-connection rig in
 // pause_accept_queued_linux_test.go: here the kernel itself is what hides the
@@ -118,12 +125,16 @@ func runPauseIdle662(t *testing.T, pause bool) {
 
 	var connects, disconnects atomic.Int64
 	e, err := New(resource.Config{
-		Addr:         addr,
-		Protocol:     engine.HTTP1,
-		Resources:    resource.Resources{Workers: 2}, // the engine refuses fewer
-		Logger:       slog.New(slog.DiscardHandler),
-		OnConnect:    func(string) { connects.Add(1) },
-		OnDisconnect: func(string) { disconnects.Add(1) },
+		Addr:      addr,
+		Protocol:  engine.HTTP1,
+		Resources: resource.Resources{Workers: 2}, // the engine refuses fewer
+		// The fix under test (celeris#662). Without it the kernel keeps the
+		// idle connections out of the accept queue and the pause drain, which
+		// can only see that queue, never gets the chance to serve them.
+		DisableDeferAccept: true,
+		Logger:             slog.New(slog.DiscardHandler),
+		OnConnect:          func(string) { connects.Add(1) },
+		OnDisconnect:       func(string) { disconnects.Add(1) },
 	}, idleRespHandler662{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -157,9 +168,10 @@ func runPauseIdle662(t *testing.T, pause bool) {
 	dropsBefore := tcpDeferAcceptDrops662()
 	base := e.Metrics()
 
-	// Dial, and write NOTHING. Each handshake completes in the kernel; with
-	// TCP_DEFER_ACCEPT set the connection stays a request socket and never
-	// reaches the accept queue.
+	// Dial, and write NOTHING. Each handshake completes in the kernel. With
+	// TCP_DEFER_ACCEPT set the connection would stay a request socket and
+	// never reach the accept queue; with DisableDeferAccept it enters the
+	// queue, so an engine that is working accepts it having read no bytes.
 	tDial := time.Now()
 	idle := make([]net.Conn, 0, idleConns662)
 	for range idleConns662 {
@@ -242,9 +254,10 @@ func runPauseIdle662(t *testing.T, pause bool) {
 
 	if pause && acceptedBeforePause != uint64(idleConns662) {
 		t.Errorf("%d of %d handshake-complete connections had been accepted %v after they "+
-			"connected, before any pause, want %d. TCP_DEFER_ACCEPT keeps a connection that "+
-			"has sent no data out of the accept queue entirely, so the drain #663 added "+
-			"cannot see it and the listen-socket close resets it (celeris#662)",
+			"connected, before any pause, want %d. This engine sets DisableDeferAccept, so "+
+			"these connections must reach the accept queue; while TCP_DEFER_ACCEPT is on "+
+			"the kernel keeps them out of it entirely, so the drain #663 added cannot see "+
+			"them and the listen-socket close resets them (celeris#662)",
 			acceptedBeforePause, idleConns662, idlePrePauseBudget662, idleConns662)
 	}
 	if tally["200"] != idleConns662 {
@@ -324,30 +337,56 @@ func TestPauseAcceptKeepsHandshakedIdleConnections(t *testing.T) { runPauseIdle6
 // unusual write-nothing clients.
 func TestPauseAcceptIdleControl(t *testing.T) { runPauseIdle662(t, false) }
 
-// TestListenSocketDoesNotDeferAccept is the property behind both arms, asserted
-// on the socket itself: while TCP_DEFER_ACCEPT is set, a handshake-complete
-// connection that has sent no data is not in the accept queue, so no drain that
-// runs before the listen socket closes can rescue it.
+// TestListenSocketDeferAcceptFollowsConfig pins both directions of the
+// celeris#662 fix on the socket itself, with no engine involved.
+//
+// deferAccept=false is the fix. With TCP_DEFER_ACCEPT clear a
+// handshake-complete connection that has sent no data enters the accept queue,
+// which is the only place the pause's drain can reach it before the listen
+// socket closes.
+//
+// deferAccept=true is what every engine that does not ask otherwise still
+// gets, and it is asserted here too rather than left implicit. The default was
+// kept deliberately: dropping the option costs +14-21% ns/op and +2.4-3.5 us
+// of server CPU per connection on churn (measured, 30 rounds per arm), so a
+// silent flip of it would be a throughput regression with no other test to
+// catch it.
 //
 // It calls createListenSocket directly rather than reading a Loop's listenFD.
 // That field is owned by the loop goroutine, so reading it from the test
 // goroutine would be a data race, and -race would flag the test rather than the
 // defect.
-func TestListenSocketDoesNotDeferAccept(t *testing.T) {
-	fd, err := createListenSocket("127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("createListenSocket: %v", err)
-	}
-	t.Cleanup(func() { _ = unix.Close(fd) })
+func TestListenSocketDeferAcceptFollowsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		deferAccept bool
+		wantSet     bool
+	}{
+		{"disabled is the celeris#662 fix", false, false},
+		{"enabled is the throughput default", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd, err := createListenSocket("127.0.0.1:0", tc.deferAccept)
+			if err != nil {
+				t.Fatalf("createListenSocket: %v", err)
+			}
+			t.Cleanup(func() { _ = unix.Close(fd) })
 
-	v, err := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT)
-	if err != nil {
-		t.Fatalf("getsockopt TCP_DEFER_ACCEPT: %v", err)
-	}
-	if v != 0 {
-		t.Errorf("listen socket TCP_DEFER_ACCEPT = %d, want 0: with it set the kernel holds a "+
-			"handshake-complete connection out of the accept queue until data arrives, so "+
-			"PauseAccept's drain never sees it and the listen-socket close resets it "+
-			"(celeris#662)", v)
+			// The kernel reports the deferral as a timeout in seconds, not as
+			// the literal 1 that was set, so read it as a flag.
+			v, err := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT)
+			if err != nil {
+				t.Fatalf("getsockopt TCP_DEFER_ACCEPT: %v", err)
+			}
+			if gotSet := v != 0; gotSet != tc.wantSet {
+				t.Errorf("createListenSocket(deferAccept=%v): TCP_DEFER_ACCEPT reads %d "+
+					"(set=%v), want set=%v. Set, the kernel holds a handshake-complete "+
+					"connection out of the accept queue until data arrives, so the pause "+
+					"drain never sees it and the listen-socket close resets it "+
+					"(celeris#662); clear, the engine pays an extra wakeup per idle "+
+					"connection, which is why it is not the default",
+					tc.deferAccept, v, gotSet, tc.wantSet)
+			}
+		})
 	}
 }

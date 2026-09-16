@@ -168,20 +168,32 @@ jobs:
       # a failure, so this job cannot go green by skipping them.
       #
       # Quarantined by name, each with its open issue. Delete the entry when
-      # the issue closes: TestBidirectionalFlapAsync (celeris#657);
-      # TestRampH1Sync and TestRampH1Async (celeris#662: a switch drops the
-      # connections queued on the paused engine, and on a GitHub runner a
-      # 2048-conn promotion loses about a third of them). The other three
-      # up-switch tests keep running.
+      # the issue closes: TestBidirectionalFlapAsync (celeris#657).
+      #
+      # TestRampH1Sync and TestRampH1Async came off this list when celeris#662
+      # was fixed (adaptive.New now sets DisableDeferAccept on both
+      # sub-engines, so a switch no longer resets the connections the kernel
+      # was holding out of the accept queue). `-skip` and `-run` are regexes
+      # over test names, so a rename would silently drop them from the run and
+      # `go test` would still exit 0. The tally below is the interlock, the
+      # same one the `iouring` job uses: both must report PASS.
       - name: Adaptive — race tests (memlock raised, up-switch required)
+        shell: bash
         env:
           CELERIS_REQUIRE_UPSWITCH: "1"
         run: |
+          set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v \
-            -skip '^(TestBidirectionalFlapAsync|TestRampH1Sync|TestRampH1Async)$' \
-            ./adaptive/...
+            -skip '^TestBidirectionalFlapAsync$' \
+            ./adaptive/... 2>&1 | tee /tmp/adaptive641.log
+          passed=$(grep -cE '^--- PASS: TestRampH1(Sync|Async) ' /tmp/adaptive641.log || true)
+          echo "celeris#662 ramp tests passed: $passed"
+          if [ "$passed" -ne 2 ]; then
+            echo "expected TestRampH1Sync and TestRampH1Async to PASS, saw $passed -- were they renamed, or did they skip?"
+            exit 1
+          fi
 
   iouring:
     name: io_uring init-failure regression (./engine/iouring)
