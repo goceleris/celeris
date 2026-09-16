@@ -5256,9 +5256,11 @@ func (w *Worker) shutdown() {
 // connection state, of which there is none yet. Never call it after ready:
 // shutdown owns these descriptors then, and a second close could hit a number
 // already reused for a connection. Each field is reset, so a second call is a
-// no-op. The ring is closed before the listen socket: on these paths the
-// accept SQE never reached the kernel, so nothing holds the socket's file,
-// and closing in this order keeps that true if one ever does.
+// no-op. The ring is closed before the listen socket because Submit does not
+// report, on its error path, whether the accept SQE reached the kernel
+// (io_uring_enter can consume part of a batch and still fail, which is why
+// Submit calls retryPending): closing the ring first drops any reference an
+// accept that did get through would hold on the socket's file.
 func (w *Worker) releaseFailedInit() {
 	if w.bufRing != nil && w.ring != nil {
 		w.bufRing.Close(w.ring)
@@ -5275,6 +5277,12 @@ func (w *Worker) releaseFailedInit() {
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 		w.listenFD = -1
+		// Keep the invariant the running loop maintains (celeris#656): the
+		// socket is out of the SO_REUSEPORT group, so the flag PauseAccept
+		// polls must say so. Nothing reads it for a worker that failed init —
+		// Listen never publishes it in e.workers — but "fd closed, flag false"
+		// is a state the field's own doc does not describe.
+		w.listenFDClosed.Store(true)
 	}
 }
 

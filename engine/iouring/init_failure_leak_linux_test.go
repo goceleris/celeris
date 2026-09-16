@@ -5,6 +5,7 @@ package iouring
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -32,6 +33,27 @@ import (
 // dead listener per attempt.
 
 var errInjected656 = errors.New("injected worker init failure (celeris#656)")
+
+// envRequireIOUring656 turns every environment skip in this file into a
+// failure. These three tests need two io_uring workers on one port, and
+// RLIMIT_MEMLOCK funds only one at the GitHub-hosted default of 8 MiB
+// (minMemlockPerWorker is 12 MiB), so in the `unit` job they all skipped and
+// the leak they pin had no CI cover at all — a skip is not coverage. The
+// dedicated `iouring` CI job raises memlock and sets this, exactly as the
+// `adaptive` job does with CELERIS_REQUIRE_UPSWITCH (celeris#641), so that job
+// cannot go green without running them.
+const envRequireIOUring656 = "CELERIS_REQUIRE_IOURING_WORKERS"
+
+// skipOrFail656 skips with the given reason, or fails when the environment
+// declares these tests mandatory.
+func skipOrFail656(t *testing.T, format string, args ...any) {
+	t.Helper()
+	msg := fmt.Sprintf(format, args...)
+	if os.Getenv(envRequireIOUring656) == "1" {
+		t.Fatal(msg + " -- " + envRequireIOUring656 + "=1 forbids skipping")
+	}
+	t.Skip(msg)
+}
 
 // listenersOnPort656 counts this process's LISTEN sockets bound to port. It
 // reads /proc/self/fd, so another process holding the port cannot confuse it.
@@ -171,7 +193,7 @@ func listenExpectingInjectedFailure(t *testing.T, e *Engine) {
 	}
 	if !errors.Is(err, errInjected656) {
 		if ioUringUnavailable639(err) {
-			t.Skipf("io_uring unavailable on this runner: %v", err)
+			skipOrFail656(t, "io_uring unavailable on this runner: %v", err)
 		}
 		t.Fatalf("Listen = %v, want the injected failure", err)
 	}
@@ -181,7 +203,8 @@ func listenExpectingInjectedFailure(t *testing.T, e *Engine) {
 func newEngine656(t *testing.T, addr string, workers int) *Engine {
 	t.Helper()
 	if maxW := MaxWorkersForMemlock(); maxW >= 0 && maxW < workers {
-		t.Skipf("RLIMIT_MEMLOCK funds %d io_uring workers, the test needs %d", maxW, workers)
+		skipOrFail656(t, "RLIMIT_MEMLOCK funds %d io_uring workers, the test needs %d "+
+			"(raise it: `ulimit -l unlimited`, or run as root)", maxW, workers)
 	}
 	e, err := New(resource.Config{
 		Addr:      addr,
@@ -189,7 +212,7 @@ func newEngine656(t *testing.T, addr string, workers int) *Engine {
 		Resources: resource.Resources{Workers: workers},
 	}, respondingHandler{})
 	if err != nil {
-		t.Skipf("New: %v", err)
+		skipOrFail656(t, "New: %v", err)
 	}
 	return e
 }
