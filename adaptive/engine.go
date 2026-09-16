@@ -176,12 +176,25 @@ func upSwitchPossible(p engine.CapabilityProfile, cfg resource.Config, startType
 // controller can recommend nothing, no sub-engine is ever paused, and the
 // engine keeps TCP_DEFER_ACCEPT and its measured churn throughput.
 //
-// It errs toward correctness in exactly one place: CELERIS_ADAPTIVE_START=
-// iouring forces an io_uring start even where io_uring is not viable, and the
+// It errs toward correctness in one place: CELERIS_ADAPTIVE_START=iouring
+// forces an io_uring start even where io_uring is not viable, and the
 // io_uring build then falls back to an epoll start (see New). This returns
 // true for that engine although the post-fallback controller may recommend
 // nothing. Paying the option's cost on an operator-forced escape hatch is the
 // safe side of that trade.
+//
+// And it errs the OTHER way in exactly one place, which is stated here rather
+// than left to be discovered: ForceSwitch is exported and calls performSwitch
+// directly, bypassing the controller this predicate reasons about. Calling it
+// on an engine this returns false for -- an h2c server, an old kernel, a
+// memlock below one io_uring worker's rings -- does pause a sub-engine, and
+// that pause can drop a handshake-complete connection that has sent nothing,
+// exactly as celeris#662 describes. ForceSwitch is documented "for testing"
+// and no production path reaches it; a caller that drives switches by hand
+// should set resource.Config.DisableDeferAccept by hand too. Widening the
+// gate to cover it would put the measured churn cost back on every
+// non-switchable adaptive engine -- the default configuration this gate
+// exists to protect -- to insure a method nothing in production calls.
 func switchPossible(p engine.CapabilityProfile, cfg resource.Config, startType engine.EngineType) bool {
 	return startType == engine.IOUring || upSwitchPossible(p, cfg, startType)
 }
