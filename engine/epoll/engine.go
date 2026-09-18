@@ -14,6 +14,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -27,7 +28,12 @@ type Engine struct {
 	addr         atomic.Pointer[net.Addr]
 	mu           sync.Mutex
 	acceptPaused atomic.Bool
-	metrics      struct {
+	// pause records the pause in progress for the loops' linger step
+	// (celeris#662): when it began and whether its listeners get the
+	// tcp_synack_retries=0 guard. Written by BeginPauseAccept before it sets
+	// acceptPaused.
+	pause   deferlinger.PauseState
+	metrics struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		// errs is the per-cause ErrorCount breakdown (celeris#645).
@@ -141,6 +147,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.transplantStranded = &e.metrics.transplantStranded
 		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		l.sweepCnt = &e.metrics.sweep
+		l.pause = &e.pause
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -261,32 +268,52 @@ func (e *Engine) Type() engine.EngineType {
 	return engine.Epoll
 }
 
-// PauseAccept stops accepting new connections. Synchronous — blocks
-// until every loop has closed its listen FD. Connections already waiting
-// in a loop's kernel accept queue are accepted and served first, like any
-// other connection the engine holds, rather than shut down unanswered
-// (celeris#662). The adaptive engine
-// relies on this: until the standby's listen sockets are gone from the
-// SO_REUSEPORT routing pool, fresh dials may land on the about-to-pause
-// engine and get RST'd when its FD closes. Synchronous Pause means
-// callers can expose Addr() knowing only the active engine listens.
-func (e *Engine) PauseAccept() error {
+// BeginPauseAccept starts pausing accept and returns without waiting
+// (celeris#662). Each loop sees the flag at the top of its next iteration,
+// at most a few milliseconds later while it listens, and then, on its own
+// thread, clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
+// serving for deferlinger.Linger after that clear, and closes the listener
+// once it has drained the accept queue. A connection whose handshake
+// completed before the pause but which has sent nothing yet is promoted by
+// the kernel during that linger and served like any other, instead of being
+// reset by the close.
+//
+// It reads net.ipv4.tcp_synack_retries once, here, for the loops' guard (see
+// deferlinger). The adaptive engine calls it for the sub-engine a switch
+// leaves, so a switch does not wait for the linger.
+func (e *Engine) BeginPauseAccept() {
+	e.pause.Begin(e.cfg.Logger, "epoll")
 	e.acceptPaused.Store(true)
+}
+
+// PauseAccept stops accepting new connections. It is BeginPauseAccept
+// followed by a wait, and it returns once every loop has closed its listen
+// socket, so the SO_REUSEPORT group has shed this engine; or once a
+// ResumeAccept has withdrawn the pause; or once every loop has exited; or,
+// best effort, after deferlinger.Linger plus one second.
+//
+// It therefore takes about deferlinger.Linger (1.5 s), during which the
+// engine keeps admitting connections: that is how a connection that
+// completed its handshake before the pause but had not sent its request
+// yet is served rather than reset (celeris#662, celeris#675). Connections
+// already accepted continue to be served, and those still in a loop's
+// accept queue at the close are accepted and served too. A listener built
+// with resource.Config.DisableDeferAccept has nothing to linger for and
+// closes at once.
+func (e *Engine) PauseAccept() error {
+	e.BeginPauseAccept()
 	e.mu.Lock()
 	loops := append([]*Loop(nil), e.loops...)
 	e.mu.Unlock()
 	if len(loops) == 0 {
 		return nil
 	}
-	// Short bound on the wait. The worker normally observes the flag
-	// and drains its accept queue in well under 1 ms; capping at 100 ms
-	// means even a worker stuck briefly (mid-iteration on a long CQE
-	// burst) doesn't make Pause callers hold critical locks long
-	// enough to cascade into other timeouts. If we time out, the FD
-	// will still close on the next worker iteration — we just don't
-	// guarantee it has happened by the time we return.
-	deadline := time.Now().Add(100 * time.Millisecond)
+	start := time.Now()
+	deadline := start.Add(max(deferlinger.Linger(), 0) + time.Second)
 	for {
+		if !e.acceptPaused.Load() {
+			return nil // a ResumeAccept withdrew the pause
+		}
 		allClosed := true
 		for _, l := range loops {
 			if !l.listenFDClosed.Load() {
@@ -300,8 +327,18 @@ func (e *Engine) PauseAccept() error {
 		if time.Now().After(deadline) {
 			return nil // best-effort: do not surface the timeout, the FD will close shortly
 		}
-		time.Sleep(100 * time.Microsecond)
+		time.Sleep(pausePollInterval(time.Since(start)))
 	}
+}
+
+// pausePollInterval paces PauseAccept's wait: fine-grained for a pause that
+// closes at once (DisableDeferAccept, or a test's zero linger), coarse over
+// the linger so a 1.5 s wait does not spin.
+func pausePollInterval(elapsed time.Duration) time.Duration {
+	if elapsed < 20*time.Millisecond {
+		return 100 * time.Microsecond
+	}
+	return time.Millisecond
 }
 
 // ResumeAccept starts accepting new connections again.
