@@ -24,6 +24,7 @@ import (
 	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/internal/wakefd"
@@ -346,15 +347,28 @@ type Worker struct {
 	wake               chan struct{}
 	wakeMu             sync.Mutex
 	suspended          atomic.Bool
-	// listenFDClosed signals that the worker has cancelled in-flight
-	// accept SQEs and closed its listen FD in response to acceptPaused
-	// being set. PauseAccept polls this so it only returns once the
-	// SO_REUSEPORT group has actually shed this listener — important
-	// for the adaptive engine where the standby's listen sockets must
-	// be out of the kernel routing pool before the bound address is
-	// exposed (otherwise a fresh dial can land on the standby and get
-	// RST as it pauses).
+	// listenFDClosed signals that the worker has no listen FD while
+	// acceptPaused is set: its pause linger has run out, it has cancelled
+	// its in-flight accept SQE and closed the listener, or it has exited
+	// (shutdown sets it). PauseAccept polls this so it only returns once
+	// the SO_REUSEPORT group has actually shed this listener. It stays
+	// false while the worker lingers (celeris#662): the listener is still
+	// open and its accept still armed then.
 	listenFDClosed atomic.Bool
+	// lingerUntil is the deadline, in Unix nanoseconds, of the accept-pause
+	// linger in progress, or 0 when none is (celeris#662): the listener's
+	// TCP_DEFER_ACCEPT has been cleared and its multishot accept stays
+	// armed until then. Loop-thread only, like listenFD.
+	lingerUntil int64
+	// deferCapable records whether listenFD was created with
+	// TCP_DEFER_ACCEPT, which is whether a pause has anything to clear and
+	// linger for. A listener created without it (DisableDeferAccept) closes
+	// at once. Loop-thread only.
+	deferCapable bool
+	// pause is the engine's record of the pause in progress, written by
+	// BeginPauseAccept before it sets acceptPaused. Nil in bare test
+	// workers, which deferlinger treats as "no guard, no delay".
+	pause *deferlinger.PauseState
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -881,6 +895,7 @@ func (w *Worker) run(ctx context.Context) {
 		return
 	}
 	w.listenFD = listenFD
+	w.deferCapable = !w.cfg.DisableDeferAccept
 
 	// celeris#656: from here until ready, a failure must close what this
 	// worker has created. shutdown is the only other code that closes a
@@ -1037,71 +1052,33 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		}
 
-		// ACTIVE → DRAINING: cancel pending io_uring operations on the listen
-		// socket, then close it. The cancel releases the kernel's io_uring
-		// reference to the underlying file, allowing the socket to leave the
-		// SO_REUSEPORT group immediately. Without this, unix.Close alone
-		// leaves a phantom socket that intercepts connections.
+		// ACTIVE → LINGERING → DRAINING (celeris#662): a pause first clears
+		// TCP_DEFER_ACCEPT on this worker's listener and keeps accepting
+		// until its linger deadline, then cancels the accept SQE and closes
+		// the listener. See stepAcceptPause.
 		// Cache the atomic load: same value used by the two branches
 		// below and (further down) the SUSPENDED check. Saves 2 atomic
 		// loads per event-loop iteration on the steady-state hot path.
 		paused := w.acceptPaused.Load()
-		if w.listenFD >= 0 && paused {
-			// Clear w.listenFD BEFORE handling the cancel's completions.
-			// handleAccept re-arms accept whenever listenFD >= 0 and a
-			// completion arrives without F_MORE, which is exactly what the
-			// cancelled accept delivers, so it used to queue a new accept SQE
-			// for the descriptor this branch then closed. That SQE went to the
-			// kernel after the close and failed with EBADF on every pause, or
-			// with EINVAL when a sibling worker's drain had already reused
-			// the number for one of its connections (celeris#662): a stale
-			// accept aimed at a descriptor this worker does not own.
-			lfd := w.listenFD
-			w.listenFD = -1
-			if sqe := w.ring.GetSQE(); sqe != nil {
-				prepCancelFDSkipSuccess(sqe, lfd)
-				setSQEUserData(sqe, 0)
-				// Submit and wait for the cancel to complete before closing.
-				_ = w.ring.SubmitAndWaitTimeout(50 * time.Millisecond)
-				// Process CQEs: skip cancel completions (userData=0),
-				// handle everything else normally to avoid breaking
-				// active connections.
-				cancelNow := time.Now().UnixNano()
-				cqH, cqT := w.ring.BeginCQ()
-				for cqH != cqT {
-					entry := w.ring.cqeAt(cqH)
-					if entry.UserData != 0 {
-						w.processCQE(ctx, entry, cancelNow)
-					}
-					cqH++
-				}
-				w.ring.EndCQ(cqH)
-			}
-			// The completions above only cover handshakes an accept had
-			// already reached. Anything still in the kernel accept queue
-			// would be aborted by the close below, after its client had
-			// possibly sent a request; accept it now instead and serve it
-			// like any other connection (celeris#662).
-			w.acceptQueuedOnPause(ctx, lfd)
-			_ = unix.Close(lfd)
+		if w.listenFD >= 0 && (paused || w.lingerUntil != 0) {
+			// Cold: a pause is starting, lingering, ending, or being
+			// withdrawn by a resume.
+			w.stepAcceptPause(ctx, paused)
 		}
-		// Maintain the listenFDClosed signal that PauseAccept polls on.
-		// Set it whenever paused==true regardless of whether we just
-		// closed the FD or it was already -1 from a prior Pause-Resume
-		// cycle that hadn't re-created the socket yet (the worker may
-		// be mid-iteration when paused flips back to true, so listenFD
-		// can transiently be -1 while paused is true). Clear when
-		// paused goes false so a subsequent Pause observes a fresh
-		// signal once the new listenFD is created.
-		if paused {
-			w.listenFDClosed.Store(true)
-		} else {
-			w.listenFDClosed.Store(false)
-		}
+		// Maintain the listenFDClosed signal that PauseAccept polls on:
+		// true exactly while paused with no listen fd. That covers the
+		// close stepAcceptPause just did and an fd that was already -1
+		// from a prior Pause-Resume cycle that hadn't re-created the
+		// socket yet (the worker may be mid-iteration when paused flips
+		// back to true). It is false while the worker lingers, because the
+		// listener is still open and accepting, and false once paused goes
+		// false so a subsequent Pause observes a fresh signal.
+		w.listenFDClosed.Store(paused && w.listenFD < 0)
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
 		if w.listenFD < 0 && !paused {
 			fd, err := createListenSocket(w.cfg.Addr, !w.cfg.DisableDeferAccept)
+			w.deferCapable = !w.cfg.DisableDeferAccept
 			if err != nil {
 				// This worker is about to stop accepting for good, so
 				// the bump is not a rate: it is the one record that
@@ -1120,7 +1097,7 @@ func (w *Worker) run(ctx context.Context) {
 
 		// A previous accept re-arm that hit a full SQ ring is retried here,
 		// before this iteration's submit, so it rides the same syscall.
-		w.rearmAcceptIfPending(paused)
+		w.rearmAcceptIfPending()
 		w.rearmH2PollIfPending()
 		// celeris#657 P10 (A2w): keep the wake eventfd's POLL_ADD armed in
 		// EVERY mode, not only for H2/h2c/driver/Detach work. Without it
@@ -1881,6 +1858,21 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 // before expiry AND back up the per-conn IORING_OP_TIMEOUT for slowloris
 // defence when the kernel timer SQE failed to arm under SQ-ring pressure.
 func (w *Worker) adaptiveTimeout() time.Duration {
+	// Two caps apply on top of the base wait, and the result is the
+	// smallest of the three: the celeris#657 sweep's next pass, and the
+	// celeris#662 pause linger's deadline.
+	d := w.sweptTimeout()
+	if w.lingerUntil != 0 {
+		// A lingering pause must wake for its deadline, and an idle
+		// worker's wait is up to 100 ms otherwise (celeris#662).
+		return capToDeadline(d, w.lingerUntil)
+	}
+	return d
+}
+
+// sweptTimeout is adaptiveTimeout with the celeris#657 sweep cap applied but
+// not the celeris#662 pause linger's.
+func (w *Worker) sweptTimeout() time.Duration {
 	// A sweep pass is owed (celeris#657 P9): never wait past it. This is
 	// the cap that matters, because the case the sweep exists for — a
 	// standby worker with no listen socket and only idle keep-alives — is
@@ -1893,7 +1885,17 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	return w.baseTimeout()
 }
 
-// baseTimeout is adaptiveTimeout without the sweep cap.
+// capToDeadline caps a ring-wait timeout at the time left to deadline (Unix
+// nanoseconds), never below zero.
+func capToDeadline(d time.Duration, deadline int64) time.Duration {
+	left := time.Duration(deadline - time.Now().UnixNano())
+	if left < 0 {
+		left = 0
+	}
+	return min(d, left)
+}
+
+// baseTimeout is adaptiveTimeout without either cap.
 func (w *Worker) baseTimeout() time.Duration {
 	if w.listenFD < 0 {
 		return 1 * time.Second
@@ -2092,6 +2094,95 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 //
 // listenFD is the socket being closed. The caller has already cleared
 // w.listenFD, so no completion handled on the way can re-arm accept on it.
+// stepAcceptPause runs one step of the accept pause on the worker thread,
+// at the top of an iteration, while the listener is open and the engine is
+// paused or this worker is lingering (celeris#662, celeris#675).
+//
+//   - ACTIVE → LINGERING (paused, no linger yet): clear TCP_DEFER_ACCEPT on
+//     this worker's listener (and apply the tcp_synack_retries=0 guard when
+//     the pause asked for it), then linger until deferlinger.Linger after
+//     that clear. The multishot accept stays armed, so connections keep
+//     being accepted through handleAccept: a connection deferred before the
+//     clear is promoted by the kernel about a second after its SYN, and one
+//     that arrives after the clear enters the accept queue at once. A
+//     listener created without the option, or a zero linger, closes at
+//     once instead: nothing on it can be deferred.
+//   - LINGERING, before the deadline: nothing. adaptiveTimeout caps the
+//     ring wait at the deadline.
+//   - LINGERING → CLOSED at the deadline: closeListenerAfterDrain.
+//   - LINGERING → ACTIVE (a resume arrived first): the option goes back on
+//     the same descriptor, which is never closed and whose accept was never
+//     cancelled.
+//
+// The worker sees the pause at its next ring wakeup, which on a plain
+// HTTP/1 worker with nothing in flight can be its adaptive timeout (up to
+// 100 ms): BeginPauseAccept arms no wakeup for it. Nothing depends on that
+// latency, because the deadline is taken at this worker's own clear.
+func (w *Worker) stepAcceptPause(ctx context.Context, paused bool) {
+	switch {
+	case !paused:
+		deferlinger.Leave(w.listenFD, w.deferCapable, w.logger, "worker", w.id)
+		w.lingerUntil = 0
+	case w.lingerUntil == 0:
+		if !w.pause.Observed() {
+			return // test hook only: model a worker that sees the pause late
+		}
+		if w.lingerUntil = deferlinger.Enter(w.listenFD, w.deferCapable, w.pause, w.logger, "worker", w.id); w.lingerUntil == 0 {
+			w.closeListenerAfterDrain(ctx)
+		}
+	case time.Now().UnixNano() >= w.lingerUntil:
+		w.closeListenerAfterDrain(ctx)
+	}
+}
+
+// closeListenerAfterDrain is the pause's close. It cancels the pending
+// io_uring accept on the listen socket, handles the completions that
+// produces, serves every connection still in the accept queue
+// (acceptQueuedOnPause), and closes the socket. The cancel releases the
+// kernel's io_uring reference to the underlying file, allowing the socket to
+// leave the SO_REUSEPORT group immediately. Without it, unix.Close alone
+// leaves a phantom socket that intercepts connections.
+func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
+	// Clear w.listenFD BEFORE handling the cancel's completions.
+	// handleAccept re-arms accept whenever listenFD >= 0 and a completion
+	// arrives without F_MORE, which is exactly what the cancelled accept
+	// delivers, so it used to queue a new accept SQE for the descriptor
+	// this function then closed. That SQE went to the kernel after the
+	// close and failed with EBADF on every pause, or with EINVAL when a
+	// sibling worker's drain had already reused the number for one of its
+	// connections (celeris#662): a stale accept aimed at a descriptor this
+	// worker does not own.
+	lfd := w.listenFD
+	w.listenFD = -1
+	if sqe := w.ring.GetSQE(); sqe != nil {
+		prepCancelFDSkipSuccess(sqe, lfd)
+		setSQEUserData(sqe, 0)
+		// Submit and wait for the cancel to complete before closing.
+		_ = w.ring.SubmitAndWaitTimeout(50 * time.Millisecond)
+		// Process CQEs: skip cancel completions (userData=0), handle
+		// everything else normally to avoid breaking active connections.
+		cancelNow := time.Now().UnixNano()
+		cqH, cqT := w.ring.BeginCQ()
+		for cqH != cqT {
+			entry := w.ring.cqeAt(cqH)
+			if entry.UserData != 0 {
+				w.processCQE(ctx, entry, cancelNow)
+			}
+			cqH++
+		}
+		w.ring.EndCQ(cqH)
+	}
+	// The completions above only cover handshakes an accept had already
+	// reached. Anything still in the kernel accept queue would be aborted
+	// by the close below, after its client had possibly sent a request;
+	// accept it now instead and serve it like any other connection
+	// (celeris#662).
+	w.acceptQueuedOnPause(ctx, lfd)
+	_ = unix.Close(lfd)
+	w.lingerUntil = 0
+	deferlinger.NoteClose()
+}
+
 func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 	now := time.Now().UnixNano()
 	for range len(w.conns) {
@@ -4493,9 +4584,16 @@ func (w *Worker) prepareAccept() {
 
 // rearmAcceptIfPending re-issues an accept arm that was dropped by
 // prepareAccept on a full SQ ring. No-op unless a drop is pending and the
-// worker still owns an un-paused listen socket.
-func (w *Worker) rearmAcceptIfPending(paused bool) {
-	if !w.acceptRearmPending || w.listenFD < 0 || paused {
+// worker still owns an open listen socket.
+//
+// A paused worker whose listener is still open is lingering (celeris#662):
+// the kernel is promoting the connections TCP_DEFER_ACCEPT held back and
+// queueing new arrivals on that listener, and only an armed accept takes
+// them before the close. So the gate is the listener, not the pause. Once
+// the pause's close has cleared listenFD nothing may be armed on the
+// descriptor being closed.
+func (w *Worker) rearmAcceptIfPending() {
+	if !w.acceptRearmPending || w.listenFD < 0 {
 		return
 	}
 	w.prepareAccept()
@@ -5418,6 +5516,11 @@ func (w *Worker) shutdown() {
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 	}
+	// The worker has left the SO_REUSEPORT group for good. PauseAccept waits
+	// for this flag, and a worker that exits in the middle of a pause linger
+	// would otherwise leave it false until PauseAccept's own bound ran out
+	// (celeris#662).
+	w.listenFDClosed.Store(true)
 	// celeris#655: Close waits for the signals already in flight and turns
 	// every later one into a no-op, so no producer — including the dispatch
 	// goroutines this function only joins below — can write this descriptor
