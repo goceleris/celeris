@@ -1,14 +1,17 @@
 //go:build linux
 
-// Package deferab prices the removal of TCP_DEFER_ACCEPT from the epoll and
-// io_uring listen sockets (celeris#662).
+// Package deferab measures what TCP_DEFER_ACCEPT on the epoll and io_uring
+// listen sockets is worth, and checks that celeris#662's fix leaves the steady
+// state alone.
 //
-// The option is a tuned default, so the fix that celeris#662 asks for -- drop
-// it -- has a named, specific cost: with the option off, a connection whose
-// first request has not arrived by accept time costs one extra wakeup (an
-// epoll readiness after EPOLL_CTL_ADD with no data, or an io_uring recv armed
-// with no data). That is about nil for keep-alive traffic and potentially
-// material for connection churn. This file measures it rather than arguing it.
+// With the option off, a connection whose first request has not arrived by
+// accept time costs one extra wakeup (an epoll readiness after EPOLL_CTL_ADD
+// with no data, or an io_uring recv armed with no data). That is about nil for
+// keep-alive traffic and potentially material for connection churn. The fix
+// for celeris#662 keeps the option on every listener in the steady state and
+// clears it only on a listener that is pausing, so a run of these benchmarks,
+// which never pauses, must look like one on main; a variant with the option
+// off prices what keeping it is worth.
 //
 // Four workloads, each on both engines:
 //
@@ -47,6 +50,12 @@
 //	srverr/op    engine ErrorCount delta per op.
 //	workers      the engine's worker count, which RLIMIT_MEMLOCK caps for
 //	             io_uring. No cross-arm reading is safe without it.
+//	listeners    LISTEN sockets of this process on the engine's port, read
+//	             through /proc/self/fd before the timed region.
+//	listeners_defer_off
+//	             how many of those read TCP_DEFER_ACCEPT off: the socket
+//	             witness. 0 means the steady state has the option on every
+//	             listener; equal to listeners means it has none.
 //
 // Client sockets are closed with SO_LINGER 0 so churn produces no TIME_WAIT
 // and the run cannot drift into ephemeral-port exhaustion partway through.
@@ -199,12 +208,10 @@ func startEngine(b *testing.B, kind string) (liveEngine, string, func()) {
 	case "iouring":
 		e, err = iouring.New(cfg, okHandler{})
 	case "adaptive":
-		// The DEFAULT engine on Linux (resource.defaultEngine), and the
-		// configuration celeris#662's gate decides for. Adaptive builds its
-		// sub-engines from this cfg and sets DisableDeferAccept on them ONLY
-		// when a switch -- and therefore a pause -- is reachable, so what
-		// this arm prices is the gate's own decision, not a flag the
-		// benchmark sets.
+		// The DEFAULT engine on Linux (resource.defaultEngine). Adaptive
+		// builds its sub-engines from this cfg, which leaves
+		// DisableDeferAccept to the caller, so its listeners have the option
+		// exactly when the standalone engines' do.
 		//
 		// Switching is FROZEN for the whole run. The cost under test is on
 		// the accept path; a promotion landing mid-benchmark would measure
@@ -301,10 +308,58 @@ type counters struct {
 	ru     unix.Rusage
 	drops  uint64
 	cliErr atomic.Int64
+	// The socket witness, read before the timed region.
+	listeners, deferOff int
+}
+
+// listenWitness counts this process's LISTEN sockets on port and how many of
+// them read TCP_DEFER_ACCEPT off. It reads /proc/self/fd, so another process
+// holding the port cannot confuse it, and a getsockopt on a descriptor number
+// touches no memory the engine owns.
+func listenWitness(port int) (listeners, deferOff int) {
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1, -1
+	}
+	for _, ent := range ents {
+		fd, err := strconv.Atoi(ent.Name())
+		if err != nil {
+			continue
+		}
+		link, err := os.Readlink("/proc/self/fd/" + ent.Name())
+		if err != nil || !strings.HasPrefix(link, "socket:[") {
+			continue
+		}
+		if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN); err != nil || v != 1 {
+			continue
+		}
+		sa, err := unix.Getsockname(fd)
+		if err != nil {
+			continue
+		}
+		p := -1
+		switch v := sa.(type) {
+		case *unix.SockaddrInet4:
+			p = v.Port
+		case *unix.SockaddrInet6:
+			p = v.Port
+		}
+		if p != port {
+			continue
+		}
+		listeners++
+		if d, err := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT); err == nil && d == 0 {
+			deferOff++
+		}
+	}
+	return listeners, deferOff
 }
 
 func (c *counters) start(b *testing.B, e liveEngine) {
 	b.Helper()
+	if ta, ok := e.Addr().(*net.TCPAddr); ok {
+		c.listeners, c.deferOff = listenWitness(ta.Port)
+	}
 	runtime.GC()
 	c.base = e.Metrics()
 	c.drops = deferAcceptDrops()
@@ -329,6 +384,8 @@ func (c *counters) finish(b *testing.B, e liveEngine, nw int) {
 	b.ReportMetric(float64(m.RequestCount-c.base.RequestCount)/n, "reqs/op")
 	b.ReportMetric(float64(m.ErrorCount-c.base.ErrorCount)/n, "srverr/op")
 	b.ReportMetric(float64(nw), "workers")
+	b.ReportMetric(float64(c.listeners), "listeners")
+	b.ReportMetric(float64(c.deferOff), "listeners_defer_off")
 
 	// A client-side failure means the rig did not measure what it claims to
 	// measure, so it fails the round rather than quietly shrinking the work.
@@ -485,11 +542,9 @@ func BenchmarkKeepAliveIouring(b *testing.B) { benchKeepAlive(b, "iouring", kaCo
 // Linux, so these are the cells that decide whether the fix lands a
 // regression on the default configuration.
 //
-// deferdrop/op is the per-round witness of what the gate decided, and it is
-// read before any timing: ~1 means the engine kept TCP_DEFER_ACCEPT (no
-// switch reachable), 0 means it dropped it (a switch, and so a pause, is
-// reachable). The two memlock shapes select the two sides of that gate
-// without the benchmark touching the flag.
+// listeners_defer_off and deferdrop/op are the per-round witnesses of the
+// option, read before any timing: listeners_defer_off 0 and deferdrop/op ~1
+// on the churn arms mean every listener kept TCP_DEFER_ACCEPT.
 
 func BenchmarkChurnImmediateAdaptive(b *testing.B) {
 	benchChurn(b, "adaptive", 0, false, churnConc)
