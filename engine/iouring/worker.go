@@ -1857,14 +1857,15 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 // cap drops to 25ms so checkTimeouts can fire detached-idle deadlines
 // before expiry AND back up the per-conn IORING_OP_TIMEOUT for slowloris
 // defence when the kernel timer SQE failed to arm under SQ-ring pressure.
+// While an accept pause lingers, the wait is also capped at the time left to
+// the linger's deadline, which an idle worker would otherwise overshoot by up
+// to 100ms (celeris#662).
 func (w *Worker) adaptiveTimeout() time.Duration {
 	// Two caps apply on top of the base wait, and the result is the
 	// smallest of the three: the celeris#657 sweep's next pass, and the
 	// celeris#662 pause linger's deadline.
 	d := w.sweptTimeout()
 	if w.lingerUntil != 0 {
-		// A lingering pause must wake for its deadline, and an idle
-		// worker's wait is up to 100 ms otherwise (celeris#662).
 		return capToDeadline(d, w.lingerUntil)
 	}
 	return d
@@ -2052,48 +2053,6 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	}
 }
 
-// acceptQueuedOnPause accepts every connection still waiting in the listen
-// socket's kernel accept queue before a pausing worker closes that socket
-// (celeris#662). The pause cancels the multishot accept and handles the
-// completions already posted, but a handshake no accept completion had reached
-// is still queued in the kernel, and the close aborts it — after its client
-// may have sent a request.
-//
-// Each descriptor goes to onAcceptedFD, the path an accept completion takes
-// (as a plain descriptor: accept4 never returns a fixed-file index). So it is
-// counted, OnConnect fires, sockopts apply, a descriptor past the conn table
-// is closed and counted in ConnTableCap, and a first recv that a full SQ ring
-// cannot take is left on the dirty list with needsRecv set, which the loop
-// re-arms once the next submit has made room: nothing is dropped.
-//
-// It can only reach what the kernel ACCEPT QUEUE holds, which is why a
-// worker that pauses must be configured with
-// resource.Config.DisableDeferAccept. While TCP_DEFER_ACCEPT is set the
-// kernel keeps a handshake-complete connection that has sent no data out of
-// that queue altogether, so neither an accept completion nor this sweep can
-// produce it, and the close resets it -- the residual half of celeris#662.
-//
-// The listen socket is non-blocking (createListenSocket), so accept4 returns
-// EAGAIN once the queue is empty; the drain is also bounded at the conn
-// table's size. EMFILE/ENFILE or an unexpected error stops it and is
-// classified by AcceptFailed, as an accept completion's would be; what is
-// still queued is left to the close.
-//
-// Interactions: the drained connections hold connCount above zero, so the
-// DRAINING→SUSPENDED gate keeps the worker serving them until they close or
-// are transplanted, then parks it as before. A ResumeAccept racing the drain
-// loses nothing: the worker still closes the listener it read as paused and
-// re-creates it on the next iteration, as it did before.
-//
-// Two residual states are NOT covered and ARE inherent, matching the list on
-// epoll's acceptQueuedOnPause: a handshake still in progress at the close,
-// and one that COMPLETES between the final EAGAIN and the close. Only the
-// kernel's tcp_migrate_req can move those to another listener in the
-// SO_REUSEPORT group. That pair is physics; the deferred-request-socket case
-// above is configuration.
-//
-// listenFD is the socket being closed. The caller has already cleared
-// w.listenFD, so no completion handled on the way can re-arm accept on it.
 // stepAcceptPause runs one step of the accept pause on the worker thread,
 // at the top of an iteration, while the listener is open and the engine is
 // paused or this worker is lingering (celeris#662, celeris#675).
@@ -2183,6 +2142,50 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	deferlinger.NoteClose()
 }
 
+// acceptQueuedOnPause accepts every connection still waiting in the listen
+// socket's kernel accept queue before a pausing worker closes that socket
+// (celeris#662). The pause cancels the multishot accept and handles the
+// completions already posted, but a handshake no accept completion had reached
+// is still queued in the kernel, and the close aborts it — after its client
+// may have sent a request.
+//
+// Each descriptor goes to onAcceptedFD, the path an accept completion takes
+// (as a plain descriptor: accept4 never returns a fixed-file index). So it is
+// counted, OnConnect fires, sockopts apply, a descriptor past the conn table
+// is closed and counted in ConnTableCap, and a first recv that a full SQ ring
+// cannot take is left on the dirty list with needsRecv set, which the loop
+// re-arms once the next submit has made room: nothing is dropped.
+//
+// It can only reach what the kernel ACCEPT QUEUE holds. While
+// TCP_DEFER_ACCEPT is set the kernel keeps a handshake-complete connection
+// that has sent no data out of that queue altogether, which is why a
+// listener that has the option lingers before it gets here
+// (stepAcceptPause): the option is cleared first, and by the deadline the
+// kernel has promoted into this queue every connection it deferred before
+// the clear.
+//
+// The listen socket is non-blocking (createListenSocket), so accept4 returns
+// EAGAIN once the queue is empty; the drain is also bounded at the conn
+// table's size. EMFILE/ENFILE or an unexpected error stops it and is
+// classified by AcceptFailed, as an accept completion's would be; what is
+// still queued is left to the close.
+//
+// Interactions: the drained connections hold connCount above zero, so the
+// DRAINING→SUSPENDED gate keeps the worker serving them until they close or
+// are transplanted, then parks it as before. A ResumeAccept racing the drain
+// loses nothing: the worker still closes the listener it read as paused and
+// re-creates it on the next iteration, as it did before.
+//
+// Residual states NOT covered, matching the list on epoll's
+// acceptQueuedOnPause: a handshake still in progress at the close, and one
+// that COMPLETES between the final EAGAIN and the close. Those are inherent
+// to closing a listen socket; only the kernel's tcp_migrate_req can move
+// them to another listener in the SO_REUSEPORT group. And a connection
+// deferred before the clear whose promotion comes after the deadline, which
+// takes a lost retransmitted SYN-ACK or a client that does not answer it.
+//
+// listenFD is the socket being closed. The caller has already cleared
+// w.listenFD, so no completion handled on the way can re-arm accept on it.
 func (w *Worker) acceptQueuedOnPause(ctx context.Context, listenFD int) {
 	now := time.Now().UnixNano()
 	for range len(w.conns) {
@@ -5581,8 +5584,10 @@ func (w *Worker) releaseFailedInit() {
 }
 
 // createListenSocket binds and listens on addr. deferAccept asks for
-// TCP_DEFER_ACCEPT, which a caller that pauses accept must NOT ask for:
-// see resource.Config.DisableDeferAccept and celeris#662.
+// TCP_DEFER_ACCEPT (resource.Config.DisableDeferAccept turns it off). A
+// pause clears the option on this socket and lingers before it closes it
+// (stepAcceptPause), so the option costs a pause time, not connections
+// (celeris#662).
 func createListenSocket(addr string, deferAccept bool) (int, error) {
 	sa, err := parseAddr(addr)
 	if err != nil {
@@ -5610,9 +5615,8 @@ func createListenSocket(addr string, deferAccept bool) (int, error) {
 
 	// TCP_DEFER_ACCEPT: the kernel holds a connection out of the accept queue
 	// until its first data arrives, saving a recv arm per idle connection. It
-	// also hides that connection from acceptQueuedOnPause, so a worker that
-	// pauses accept loses it (celeris#662) -- which is why the caller can turn
-	// it off, and why adaptive's sub-engines do.
+	// also hides that connection from acceptQueuedOnPause, which is why a
+	// pause clears it and lingers before the close (celeris#662).
 	if deferAccept {
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
 	}

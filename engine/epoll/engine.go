@@ -270,36 +270,38 @@ func (e *Engine) Type() engine.EngineType {
 
 // BeginPauseAccept starts pausing accept and returns without waiting
 // (celeris#662). Each loop sees the flag at the top of its next iteration,
-// at most a few milliseconds later while it listens, and then, on its own
-// thread, clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
-// serving for deferlinger.Linger after that clear, and closes the listener
-// once it has drained the accept queue. A connection whose handshake
-// completed before the pause but which has sent nothing yet is promoted by
-// the kernel during that linger and served like any other, instead of being
-// reset by the close.
+// a few milliseconds later at most while it listens. Then, on its own
+// thread, it clears TCP_DEFER_ACCEPT on its listener, keeps accepting and
+// serving for the linger (about 1.5 s from that clear), and closes the
+// listener once it has drained the accept queue. A connection whose
+// handshake completed before the pause but which has sent nothing yet is
+// promoted by the kernel during the linger and served like any other,
+// instead of being reset by the close.
 //
-// It reads net.ipv4.tcp_synack_retries once, here, for the loops' guard (see
-// deferlinger). The adaptive engine calls it for the sub-engine a switch
-// leaves, so a switch does not wait for the linger.
+// It reads net.ipv4.tcp_synack_retries once, here. When that reads 0, the
+// pausing listeners also get TCP_SYNCNT=1, without which the kernel would
+// drop the connections it deferred instead of promoting them. The adaptive
+// engine calls BeginPauseAccept for the sub-engine a switch leaves, so a
+// switch does not wait for the linger.
 func (e *Engine) BeginPauseAccept() {
 	e.pause.Begin(e.cfg.Logger, "epoll")
 	e.acceptPaused.Store(true)
 }
 
 // PauseAccept stops accepting new connections. It is BeginPauseAccept
-// followed by a wait, and it returns once every loop has closed its listen
+// followed by a wait that returns once every loop has closed its listen
 // socket, so the SO_REUSEPORT group has shed this engine; or once a
 // ResumeAccept has withdrawn the pause; or once every loop has exited; or,
-// best effort, after deferlinger.Linger plus one second.
+// best effort, one second after the linger should have ended.
 //
-// It therefore takes about deferlinger.Linger (1.5 s), during which the
-// engine keeps admitting connections: that is how a connection that
-// completed its handshake before the pause but had not sent its request
-// yet is served rather than reset (celeris#662, celeris#675). Connections
-// already accepted continue to be served, and those still in a loop's
-// accept queue at the close are accepted and served too. A listener built
-// with resource.Config.DisableDeferAccept has nothing to linger for and
-// closes at once.
+// So it takes about 1.5 s, the linger, and the engine keeps admitting
+// connections meanwhile: that is how a connection that completed its
+// handshake before the pause but had not sent its request yet is served
+// rather than reset (celeris#662, celeris#675). Connections already
+// accepted continue to be served, and those still in a loop's accept queue
+// at the close are accepted and served too. A listener built with
+// resource.Config.DisableDeferAccept has nothing to linger for and closes
+// at once.
 func (e *Engine) PauseAccept() error {
 	e.BeginPauseAccept()
 	e.mu.Lock()

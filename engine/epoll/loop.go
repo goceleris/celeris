@@ -1035,11 +1035,12 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 // (celeris#662). Their handshakes completed before the pause and their
 // clients may already have sent a request; the close would abort them.
 //
-// It can only reach what the ACCEPT QUEUE holds, which is why a loop that
-// pauses must be configured with resource.Config.DisableDeferAccept. While
-// TCP_DEFER_ACCEPT is set the kernel keeps a handshake-complete connection
-// that has sent no data out of that queue altogether, so this drain cannot
-// see it and the close below resets it -- the residual half of celeris#662.
+// It can only reach what the ACCEPT QUEUE holds. While TCP_DEFER_ACCEPT is
+// set the kernel keeps a handshake-complete connection that has sent no data
+// out of that queue altogether, which is why a listener that has the option
+// lingers before it gets here (stepAcceptPause): the option is cleared
+// first, and by the deadline the kernel has promoted into this queue every
+// connection it deferred before the clear.
 //
 // They go through acceptAll, the registration every accept uses, because they
 // are ordinary connections: AcceptCount and ActiveConnections count them,
@@ -1063,11 +1064,9 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 //     completes between the final EAGAIN and the close. That is inherent to
 //     closing a listen socket; only the kernel's tcp_migrate_req moves those
 //     to another listener in the SO_REUSEPORT group.
-//   - Not covered either, and NOT inherent: a handshake that completed
-//     before the pause but whose client has sent nothing, on a listener that
-//     still has TCP_DEFER_ACCEPT. The kernel holds it as a request socket
-//     outside the accept queue, so no drain can rescue it. That one is
-//     configuration, not physics -- see resource.Config.DisableDeferAccept.
+//   - Not covered either: a connection deferred before the clear whose
+//     promotion comes after the linger's deadline, which takes a lost
+//     retransmitted SYN-ACK or a client that does not answer it.
 func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
 	for range pauseAcceptRounds {
 		if l.acceptAll(ctx, time.Now().UnixNano()) != acceptCapped {
@@ -3174,8 +3173,10 @@ func (l *Loop) shutdown() {
 }
 
 // createListenSocket binds and listens on addr. deferAccept asks for
-// TCP_DEFER_ACCEPT, which a caller that pauses accept must NOT ask for:
-// see resource.Config.DisableDeferAccept and celeris#662.
+// TCP_DEFER_ACCEPT (resource.Config.DisableDeferAccept turns it off). A
+// pause clears the option on this socket and lingers before it closes it
+// (stepAcceptPause), so the option costs a pause time, not connections
+// (celeris#662).
 func createListenSocket(addr string, deferAccept bool) (int, error) {
 	sa, err := parseAddr(addr)
 	if err != nil {
@@ -3207,9 +3208,8 @@ func createListenSocket(addr string, deferAccept bool) (int, error) {
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 	// TCP_DEFER_ACCEPT: the kernel holds a connection out of the accept queue
 	// until its first data arrives, saving a wakeup per idle connection. It
-	// also hides that connection from acceptQueuedOnPause, so a loop that
-	// pauses accept loses it (celeris#662) -- which is why the caller can turn
-	// it off, and why adaptive's sub-engines do.
+	// also hides that connection from acceptQueuedOnPause, which is why a
+	// pause clears it and lingers before the close (celeris#662).
 	if deferAccept {
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
 	}

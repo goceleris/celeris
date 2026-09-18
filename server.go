@@ -578,22 +578,24 @@ func (s *Server) EngineInfo() *EngineInfo {
 // [ErrAcceptControlNotSupported] if the engine does not support accept
 // control — the std and adaptive engines do not implement it.
 //
-// Connections that were already ACCEPTED continue to be served, and
+// Connections that were already accepted continue to be served, and
 // connections still waiting in the listen socket's accept queue are drained
 // and served before that socket closes (celeris#663).
 //
-// ONE CLASS IS NOT CARRIED ACROSS THE PAUSE BY DEFAULT: a client whose TCP
-// handshake completed but which has not yet sent a byte. TCP_DEFER_ACCEPT is
-// on by default on the epoll and io_uring listen sockets, and while it is the
-// kernel keeps such a connection out of the accept queue entirely — so no
-// drain can reach it, closing the listen socket resets it, and its first
-// request gets no response while the engine counts no accept, no close and no
-// error (celeris#662; the residual is tracked as celeris#675).
+// Clients that completed their TCP handshake before the pause but had not
+// sent their request yet are carried across it as well (celeris#662,
+// celeris#675). TCP_DEFER_ACCEPT is on by default on the epoll and io_uring
+// listen sockets, and while it is the kernel holds such a client outside
+// the accept queue until about one second after its SYN. So the pause first
+// clears the option on each listen socket and keeps it open, accepting and
+// serving, for about 1.5 s, and only then closes it. PauseAccept blocks
+// for that long, and the server keeps admitting new connections meanwhile.
 //
-// Set [Config.DisableDeferAccept] on a server that calls this. It costs
-// throughput on connection churn and nothing on keep-alive traffic; see
-// [github.com/goceleris/celeris/resource.Config.DisableDeferAccept] for the
-// measured numbers.
+// What a pause can still reset: a handshake still in flight when a listen
+// socket closes, which is inherent to closing one, and a client whose
+// retransmitted SYN-ACK is lost or goes unanswered on a lossy path. Set
+// [Config.DisableDeferAccept] for a pause that closes the listen sockets at
+// once; see [github.com/goceleris/celeris/resource.Config.DisableDeferAccept].
 func (s *Server) PauseAccept() error {
 	eng := s.loadEngine()
 	if eng == nil {

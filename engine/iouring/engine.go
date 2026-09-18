@@ -545,41 +545,43 @@ func (e *Engine) Type() engine.EngineType {
 
 // BeginPauseAccept starts pausing accept and returns without waiting
 // (celeris#662). Each worker then, on its own thread, clears
-// TCP_DEFER_ACCEPT on its listener, keeps its accept armed and keeps serving
-// for deferlinger.Linger after that clear, and cancels the accept and closes
-// the listener once it has drained the accept queue. A connection whose
-// handshake completed before the pause but which has sent nothing yet is
-// promoted by the kernel during that linger and served like any other,
-// instead of being reset by the close.
+// TCP_DEFER_ACCEPT on its listener, keeps its accept armed and keeps
+// serving for the linger (about 1.5 s from that clear), and cancels the
+// accept and closes the listener once it has drained the accept queue. A
+// connection whose handshake completed before the pause but which has sent
+// nothing yet is promoted by the kernel during the linger and served like
+// any other, instead of being reset by the close.
 //
-// It does not promise a prompt start: a worker sees the flag at its next ring
-// wakeup, which on an idle plain-HTTP/1 worker can be up to 100 ms away.
-// Correctness does not depend on it, because each listener's deadline is
-// taken at its own clear.
+// It does not promise a prompt start: a worker sees the flag at its next
+// ring wakeup, which on an idle plain-HTTP/1 worker can be up to 100 ms
+// away. Correctness does not depend on that, because each listener's
+// deadline is taken at its own clear.
 //
-// It reads net.ipv4.tcp_synack_retries once, here, for the workers' guard
-// (see deferlinger). The adaptive engine calls it for the sub-engine a
-// switch leaves, so a switch does not wait for the linger.
+// It reads net.ipv4.tcp_synack_retries once, here. When that reads 0, the
+// pausing listeners also get TCP_SYNCNT=1, without which the kernel would
+// drop the connections it deferred instead of promoting them. The adaptive
+// engine calls BeginPauseAccept for the sub-engine a switch leaves, so a
+// switch does not wait for the linger.
 func (e *Engine) BeginPauseAccept() {
 	e.pause.Begin(e.cfg.Logger, "io_uring")
 	e.acceptPaused.Store(true)
 }
 
 // PauseAccept stops accepting new connections. It is BeginPauseAccept
-// followed by a wait, and it returns once every worker has cancelled its
+// followed by a wait that returns once every worker has cancelled its
 // accept and closed its listen socket, so the SO_REUSEPORT group has shed
 // this engine; or once a ResumeAccept has withdrawn the pause; or once every
-// worker has exited; or, best effort, after deferlinger.Linger plus one
-// second.
+// worker has exited; or, best effort, one second after the linger should
+// have ended.
 //
-// It therefore takes about deferlinger.Linger (1.5 s), during which the
-// engine keeps admitting connections: that is how a connection that
-// completed its handshake before the pause but had not sent its request
-// yet is served rather than reset (celeris#662, celeris#675). Connections
-// already accepted continue to be served, and those still in a worker's
-// accept queue at the close are accepted and served too. A listener built
-// with resource.Config.DisableDeferAccept has nothing to linger for and
-// closes at once.
+// So it takes about 1.5 s, the linger, and the engine keeps admitting
+// connections meanwhile: that is how a connection that completed its
+// handshake before the pause but had not sent its request yet is served
+// rather than reset (celeris#662, celeris#675). Connections already
+// accepted continue to be served, and those still in a worker's accept
+// queue at the close are accepted and served too. A listener built with
+// resource.Config.DisableDeferAccept has nothing to linger for and closes
+// at once.
 func (e *Engine) PauseAccept() error {
 	e.BeginPauseAccept()
 	e.mu.Lock()

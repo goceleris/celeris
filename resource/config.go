@@ -70,40 +70,34 @@ type Config struct {
 	// DisableDeferAccept turns TCP_DEFER_ACCEPT off on the listen sockets the
 	// epoll and io_uring engines create. Default false: the option stays on.
 	//
-	// While it is set the kernel keeps a connection whose handshake has
-	// completed but which has sent no data OUT of the accept queue entirely --
-	// it stays a TCP_NEW_SYN_RECV request socket and accept4 answers EAGAIN.
-	// That saves the engine a wakeup per idle connection, and it also hides
-	// such a connection from PauseAccept's acceptQueuedOnPause drain: when the
-	// pause closes the listen socket the request socket is orphaned and the
-	// client's first request is met with a reset (celeris#662).
+	// While the option is on, the kernel holds a connection whose handshake
+	// has completed but which has sent no data outside the accept queue: it
+	// stays a request socket and accept4 answers EAGAIN for it. A client that
+	// sends its request at once is then accepted with the request already
+	// queued, which saves the engine a wakeup per connection. A client that
+	// stays silent is promoted into the accept queue with no data about one
+	// second after its SYN, when the listener retransmits its SYN-ACK and
+	// the client's reply creates the connection; the engine accepts it then,
+	// and it is subject to ReadHeaderTimeout and the connection limits like
+	// any other.
 	//
-	// Set this whenever the engine will pause accept. adaptive.New sets it on
-	// both sub-engines WHEN that engine can actually switch, because every
-	// switch pauses the outgoing one -- and leaves the option alone when no
-	// switch is reachable (an old kernel, RLIMIT_MEMLOCK below one io_uring
-	// worker's rings, or Protocol H2C), since such an engine never pauses and
-	// so can never hit celeris#662. A standalone engine whose owner calls
-	// PauseAccept (or celeris.Server.PauseAccept) should set it too; that it
-	// is not the default there is tracked as celeris#675.
+	// That hold is why a pause cannot simply close a listener that has the
+	// option: the close would reset every connection the kernel is still
+	// holding (celeris#662, celeris#675). PauseAccept therefore lingers. It
+	// clears the option on each pausing listener, so nothing that arrives
+	// afterwards is held, keeps the listener open and accepting for about
+	// 1.5 s after that clear, long enough for the kernel to promote what it
+	// held, and only then drains and closes it. A resume during that time
+	// puts the option back on the same listener. The adaptive engine pauses
+	// the sub-engine a switch leaves in the same way, without waiting for
+	// it.
 	//
-	// It is off by default because the cost was measured before the default
-	// was chosen -- 30 rounds per arm, two memlock shapes, A/A floors under
-	// 1.3%: clearing the option costs +14-21% ns/op and +2.4-3.5 us of server
-	// CPU per connection on churn where the request follows the handshake
-	// promptly, and +67-200% on a connection that never sends. Keep-alive
-	// traffic, where one accept is amortised over many requests, is unaffected
-	// in both units.
-	//
-	// The option is also a free connect-and-never-send shield, which is a
-	// RESOURCE question and not only a throughput one: while it is set such a
-	// connection never becomes a socket the engine owns, so it costs no
-	// descriptor, no conn-table slot and no buffer. Clearing it turns each
-	// one into a real accepted connection -- on the ChurnSilent benchmark at
-	// the 128 MiB memlock shape, epoll goes from 25 to 36 allocs/op and from
-	// 1485 to 3644 B/op (+44% and +145%, n=30 rounds per arm). A deployment
-	// that clears the option and faces untrusted clients is relying on its
-	// conn-table cap and ReadHeaderTimeout for that protection instead.
+	// Set this field when a pause must be instant: with the option off a
+	// handshake-complete connection is always in the accept queue, and
+	// PauseAccept drains it and closes the listeners at once. What it gives
+	// up is the wakeup the option saves on each new connection, which is a
+	// cost on connection churn only; keep-alive traffic, where one accept is
+	// amortised over many requests, does not see it.
 	DisableDeferAccept bool
 	// Listener is an optional pre-existing listener for socket inheritance.
 	Listener net.Listener
