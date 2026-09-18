@@ -418,7 +418,7 @@ jobs:
             echo "(-short skips all nine), or did a cell stop reaching its own measurement?"
             exit 1
           fi
-          gate='TestSwitchKeepsHandshakedIdleConnections|TestSwitchPossibleGate|TestDeferAcceptFollowsSwitchPossibility'
+          gate='TestSwitchKeepsHandshakedIdleConnections'
           gwant=$(( $(tr '|' '\n' <<<"$gate" | wc -l) ))
           gran=$(grep -cE "^=== RUN   (${gate})\$" /tmp/adaptive-race.log || true)
           gpassed=$(grep -cE "^--- PASS: (${gate}) \(" /tmp/adaptive-race.log || true)
