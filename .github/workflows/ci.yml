@@ -246,33 +246,76 @@ jobs:
             echo "different loop count?"
             exit 1
           fi
-      # celeris#662: the step above runs ./engine/epoll and ./engine/iouring
-      # WITHOUT -v, so a skip there prints nothing and the package still
-      # reports `ok`. That is exactly how the celeris#656 leak shipped with no
-      # cover. These eight tests are the celeris#662 cover, so they get the
-      # same PASS-count interlock the `iouring` job uses (celeris#664):
-      # -v, skipping forbidden, and an exact tally that fails the step if a
-      # test is renamed, removed or skipped.
+      # celeris#662 / celeris#675: the step above runs ./engine/epoll and
+      # ./engine/iouring WITHOUT -v, so a skip there prints nothing and the
+      # package still reports `ok`. That is exactly how the celeris#656 leak
+      # shipped with no cover. These are the celeris#662 tests -- the linger
+      # (T1-T3, T5, T6), its negative controls (N1, N2), the io_uring accept
+      # re-arm during a linger (T7 and its unit twin), and the
+      # DisableDeferAccept arm with its premise and socket checks -- so they
+      # get a PASS-count interlock: -v, skipping forbidden, and a tally that
+      # fails the step if a test is renamed, removed or skipped.
       #
-      # memlock is raised because the io_uring half needs a worker, and
-      # CELERIS_REQUIRE_IOURING_WORKERS=1 turns its environment skips into
-      # failures.
-      - name: celeris#662 pause/defer-accept tests (skipping forbidden)
+      # The tally counts TOP-LEVEL results (`--- PASS: Name (`, and
+      # `=== RUN   Name` with nothing after the name), and the step also
+      # fails on ANY `--- SKIP` line at any indentation: a subtest that skips
+      # still lets its parent report PASS.
+      #
+      # memlock is raised because the io_uring half needs a worker, and the
+      # REQUIRE variables turn every environment skip into a failure.
+      - name: celeris#662 pause linger tests (skipping forbidden)
         shell: bash
         env:
           CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_REQUIRE_LINGER_PREMISES: "1"
         run: |
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=300s -v \
-            -run '^(TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptIdleControl|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestListenSocketDeferAcceptFollowsConfig)$' \
-            ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/defer662.log
-          passed=$(grep -cE '^--- PASS: (TestPauseAccept|TestListenSocketDeferAccept)' /tmp/defer662.log || true)
-          echo "celeris#662 tests passed: $passed"
-          if [ "$passed" -ne 8 ]; then
-            echo "expected 8 celeris#662 tests to PASS (4 per engine), saw $passed --"
-            echo "were they renamed, did they skip, or did one of them fail?"
+          both='TestPauseAcceptServesDeferredIdleConnections|TestPauseAcceptServesArrivalsDuringLinger|TestPauseAcceptLingerAnchoredAtClear|TestResumeDuringLingerRestoresDeferAccept|TestShutdownDuringLingerIsPrompt|TestPauseAcceptNoLingerResetsDeferredIdleConnections|TestPauseAcceptNoClearLosesArrivals|TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestPauseAcceptIdleControl|TestListenSocketDeferAcceptFollowsConfig'
+          iouringonly='TestAcceptRearmedDuringLinger|TestAcceptRearmRetriedAfterSQFull'
+          names="${both}|${iouringonly}"
+          want=$(( 2 * $(tr '|' '\n' <<<"$both" | wc -l) + $(tr '|' '\n' <<<"$iouringonly" | wc -l) ))
+          go test -race -count=1 -timeout=600s -v -run "^(${names})\$" \
+            ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/linger662.log
+          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/linger662.log || true)
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/linger662.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/linger662.log || true)
+          echo "celeris#662 tests: want $want, ran $ran, passed $passed, SKIP lines $skipped"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want top-level celeris#662 tests to run and PASS with no SKIP line --"
+            echo "was one renamed or removed, did one (or one of its subtests) skip, or did one fail?"
+            exit 1
+          fi
+      # celeris#662: at net.ipv4.tcp_synack_retries=0, clearing
+      # TCP_DEFER_ACCEPT on a pausing listener would make the kernel drop
+      # every connection it had deferred at its first timer, so the pause
+      # also sets TCP_SYNCNT=1 there. T4 proves the guard serves them and N3
+      # proves the loss without it. Both skip at any other value, so this
+      # step sets the sysctl (restored on exit) and forbids the skip.
+      - name: celeris#662 tcp_synack_retries=0 guard (skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_REQUIRE_LINGER_PREMISES: "1"
+          CELERIS_REQUIRE_SYNACK0: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          old=$(sysctl -n net.ipv4.tcp_synack_retries)
+          restore() { sudo sysctl -w "net.ipv4.tcp_synack_retries=${old}"; }
+          trap restore EXIT
+          sudo sysctl -w net.ipv4.tcp_synack_retries=0
+          names='TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero'
+          want=$(( 2 * $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/synack662.log
+          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/synack662.log || true)
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/synack662.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/synack662.log || true)
+          echo "celeris#662 synack=0 tests: want $want, ran $ran, passed $passed, SKIP lines $skipped"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want synack=0 tests to run and PASS with no SKIP line"
             exit 1
           fi
       - name: middleware/compress
@@ -378,6 +421,20 @@ jobs:
       # verdict tolerates up to one lost request per connection, so its total
       # line is required to exist but its error count is not tightened here:
       # the evidence that it is 0 is local (8 of 8), not GitHub-hosted.
+      #
+      # `shell: bash` runs the step as `bash --noprofile --norc -eo pipefail`,
+      # so a `go test` failure on the left of the tee below fails the step
+      # instead of being masked by tee's exit status. The explicit
+      # `set -o pipefail` keeps that true if the shell line is ever changed.
+      #
+      # The tally is the interlock. celeris#662's adaptive tests must run
+      # here, and celeris#641's whole point is that this job must not go
+      # green by skipping: -run/-skip regexes and renames select silently, so
+      # the count is asserted rather than assumed. It counts TOP-LEVEL results
+      # (`--- PASS: Name (`, and `=== RUN   Name` with nothing after it), and
+      # a SKIP line for any of these names, a subtest's included, fails it.
+      # (The round-3 version ended its regex in `)$`, which can never match
+      # `--- PASS: Name (0.01s)`, so this job could never go green.)
       - name: Adaptive — race tests (memlock raised, up-switch required)
         shell: bash
         env:
@@ -418,15 +475,15 @@ jobs:
             echo "(-short skips all nine), or did a cell stop reaching its own measurement?"
             exit 1
           fi
-          gate='TestSwitchKeepsHandshakedIdleConnections'
-          gwant=$(( $(tr '|' '\n' <<<"$gate" | wc -l) ))
-          gran=$(grep -cE "^=== RUN   (${gate})\$" /tmp/adaptive-race.log || true)
-          gpassed=$(grep -cE "^--- PASS: (${gate}) \(" /tmp/adaptive-race.log || true)
-          gskipped=$(grep -cE "^[[:space:]]*--- SKIP: (${gate})[ /]" /tmp/adaptive-race.log || true)
-          echo "celeris#662 adaptive gate tests: want $gwant, ran $gran, passed $gpassed, SKIP lines $gskipped"
+          guarded='TestSwitchKeepsHandshakedIdleConnections|TestSwitchKeepsHandshakedIdleConnectionsOnRevert|TestAdaptiveListenersKeepDeferAcceptAcrossSwitches|TestPerformSwitchDoesNotBlockOnLinger|TestFlapWithinLingerKeepsListeners|TestLingerTransplantConserves|TestAdaptiveSwitchVsAcceptChurn'
+          gwant=$(( $(tr '|' '\n' <<<"$guarded" | wc -l) ))
+          gran=$(grep -cE "^=== RUN   (${guarded})\$" /tmp/adaptive-race.log || true)
+          gpassed=$(grep -cE "^--- PASS: (${guarded}) \(" /tmp/adaptive-race.log || true)
+          gskipped=$(grep -cE "^[[:space:]]*--- SKIP: (${guarded})[ /]" /tmp/adaptive-race.log || true)
+          echo "celeris#662 adaptive tests: want $gwant, ran $gran, passed $gpassed, SKIP lines $gskipped"
           if [ "$gran" -ne "$gwant" ] || [ "$gpassed" -ne "$gwant" ] || [ "$gskipped" -ne 0 ]; then
-            echo "expected exactly $gwant celeris#662 gate tests to run and PASS with no SKIP line --"
-            echo "were they renamed, or did they skip? a skip is not coverage."
+            echo "expected exactly $gwant celeris#662 adaptive tests to run and PASS with no SKIP line --"
+            echo "were they renamed or removed, or did one skip? a skip is not coverage."
             exit 1
           fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
