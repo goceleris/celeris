@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/probe"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -194,7 +195,11 @@ func flapScenario(t *testing.T, h stream.Handler, async bool) {
 
 	for flap := 1; flap <= 3; flap++ {
 		e.ForceSwitch()
-		time.Sleep(1200 * time.Millisecond)
+		// Longer than the outgoing engine's accept-pause linger
+		// (celeris#662), so each flap closes the outgoing listeners and the
+		// next one re-creates them, as before the linger existed. A shorter
+		// spacing would always take the resume-during-linger path instead.
+		time.Sleep(deferlinger.Linger() + 700*time.Millisecond)
 		epo := e.primary.Metrics().ActiveConnections
 		iou := e.secondary.Metrics().ActiveConnections
 		activeIsIOUring := flap%2 == 1
