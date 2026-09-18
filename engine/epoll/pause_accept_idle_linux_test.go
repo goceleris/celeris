@@ -21,44 +21,43 @@ import (
 	"github.com/goceleris/celeris/resource"
 )
 
-// celeris#662, the half of the loss class that #663's pause drain cannot
-// reach.
+// celeris#662: what TCP_DEFER_ACCEPT hides from a pause, and the two
+// configurations whose pause needs no linger.
 //
 // createListenSocket sets TCP_DEFER_ACCEPT=1 on a listen socket unless the
 // config turns it off. While it is set, a connection whose handshake has
 // completed but which has sent no data is held by the kernel as a
-// TCP_NEW_SYN_RECV request socket and never enters the accept queue at all:
-// accept4 answers EAGAIN for it. #663's drain accepts what the accept queue
-// holds, so it cannot see such a connection, and when the listen socket closes
-// the orphaned request socket is reset — the client's first request gets no
-// response, and the engine counts no accept, no close and no error.
+// TCP_NEW_SYN_RECV request socket and does not enter the accept queue: accept4
+// answers EAGAIN for it, so neither the loop nor #663's pause drain can see
+// it. Closing the listener then resets it. The pause therefore clears the
+// option and lingers before it closes the listener; that is exercised in
+// pause_accept_linger_linux_test.go.
 //
-// The fix is resource.Config.DisableDeferAccept, which the rig below sets on
-// its fix arm: the connections then land in the accept queue like any other
-// and #663's drain serves them. The option stays ON by default, because an
-// engine that never pauses would pay +14-21% ns/op on connection churn to
-// give it up -- the adaptive engine sets it only for sub-engines it can
-// actually switch between, and a standalone engine's owner must ask
-// (celeris#675). So what the fix arm exercises is an engine configured the
-// way one that intends to pause must be, and the deferred arm exercises the
-// default. TestListenSocketDeferAcceptFollowsConfig pins both directions at
-// the socket.
+// This file keeps the pieces that do not linger:
+//
+//   - TestPauseAcceptDeferredIdleConnectionsAreHidden is the PREMISE control,
+//     with no pause at all: with the option on, silent clients are not
+//     accepted, and the kernel's TCPDeferAcceptDrop counter says why. If that
+//     ever stops holding, the linger is solving a problem that is not there
+//     and needs re-deriving.
+//   - TestPauseAcceptKeepsHandshakedIdleConnections is the DisableDeferAccept
+//     arm, the instant lossless pause: with the option off the silent
+//     clients are in the accept queue, the pause drains and serves them, and
+//     it closes at once.
+//   - TestPauseAcceptIdleControl is that arm without the pause.
+//   - TestListenSocketDeferAcceptFollowsConfig pins the option on the socket.
 //
 // The rig needs no blocking handler, unlike the queued-connection rig in
-// pause_accept_queued_linux_test.go: here the kernel itself is what hides the
-// connections, so an idle engine is the sharpest arrangement there is. It dials
-// N connections, writes NOTHING, and reads the accept count BEFORE the pause —
-// with the option on that count is 0, which is the whole defect — then pauses,
-// and only then sends the requests.
+// pause_accept_queued_linux_test.go: the kernel itself is what hides these
+// connections, so an idle engine is the sharpest arrangement there is. It
+// dials N connections, writes NOTHING, reads the accept count, pauses (or
+// not), and only then sends the requests.
 //
-// The 1 s deferral timer is this rig's only clock, and it is a vacuity hazard
-// rather than a flake hazard. At num_timeout 1 the kernel retransmits the
-// SYN-ACK and the ACK it elicits DOES create the child, so a rig that let more
-// than about a second pass between the dials and the listen-socket close would
-// find its connections rescued by that timer and would pass on main for the
-// wrong reason. The measured phase is bounded two orders of magnitude below
-// that bound, and the elapsed time is asserted, so an overrun fails the test
-// loudly instead of hiding inside it.
+// The kernel's one-second SYN-ACK timer is this rig's only clock, and it is a
+// vacuity hazard rather than a flake hazard: past about a second the kernel
+// promotes a deferred connection itself. The measured phase of the paused arm
+// is bounded well below that, and the elapsed time is asserted, so an overrun
+// fails loudly instead of hiding.
 
 const (
 	// idleConns662 matches the issue's measured rig (RESET 8 of 8).
@@ -121,17 +120,16 @@ func tcpDeferAcceptDrops662() uint64 {
 
 // runPauseIdle662 drives the rig. disableDefer selects the ARM:
 //
-//	true  -- the fix: the engine asks for no TCP_DEFER_ACCEPT, so a
-//	         handshake-complete connection that has sent nothing reaches the
-//	         accept queue and the pause's drain serves it.
-//	false -- the residual (celeris#675): the option is on, the kernel holds
-//	         those connections out of the accept queue, and no drain can
-//	         reach them.
+//	true  -- DisableDeferAccept: a handshake-complete connection that has sent
+//	         nothing reaches the accept queue, the engine accepts it at once,
+//	         and a pause drains, serves and closes without lingering.
+//	false -- the default: the option is on and the kernel holds those
+//	         connections out of the accept queue. Only the premise control
+//	         uses this arm here, and it does not pause.
 //
-// Both arms ship, and they are each other's control: the fix arm asserts the
-// connections ARE accepted before the pause, the deferred arm asserts they
-// are NOT. A DisableDeferAccept that stopped reaching createListenSocket, or
-// that inverted, fails one of them.
+// The two arms make opposite assertions about the same counter, so a
+// DisableDeferAccept that stopped reaching createListenSocket, or that
+// inverted, fails one of them.
 func runPauseIdle662(t *testing.T, pause, disableDefer bool) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -184,6 +182,7 @@ func runPauseIdle662(t *testing.T, pause, disableDefer bool) {
 	workers := len(loops)
 
 	dropsBefore := tcpDeferAcceptDrops662()
+	dropsBeforeOK, _ := tcpDeferAcceptDropsL662()
 	base := e.Metrics()
 
 	// Dial, and write NOTHING. Each handshake completes in the kernel. With
@@ -212,6 +211,8 @@ func runPauseIdle662(t *testing.T, pause, disableDefer bool) {
 	}
 	acceptedBeforePause := before.AcceptCount - base.AcceptCount
 	dropsDelta := tcpDeferAcceptDrops662() - dropsBefore
+	dropsNow, dropsOK := tcpDeferAcceptDropsL662()
+	dropsDeltaOK := dropsNow - dropsBeforeOK
 
 	var elapsedToClose time.Duration
 	if pause {
@@ -271,23 +272,33 @@ func runPauseIdle662(t *testing.T, pause, disableDefer bool) {
 		m.ErrorCount-base.ErrorCount, connects.Load(), dropsDelta, elapsedToClose)
 
 	if !disableDefer {
-		// The RESIDUAL arm (celeris#675). TCP_DEFER_ACCEPT is on, so the
-		// kernel holds every one of these connections OUT of the accept queue
-		// and no drain can reach them. That mechanism is deterministic, so it
-		// is what this arm asserts.
-		//
-		// What the client finally sees is NOT asserted: after the listen
-		// socket closes the orphaned request socket is reset here, but on a
-		// slow enough run the kernel's ~1s SYN-ACK retransmit could create
-		// the child instead. The outcomes are logged above; only the
-		// mechanism is pinned.
+		// The PREMISE arm (no pause). TCP_DEFER_ACCEPT is on, so the kernel
+		// holds every one of these connections OUT of the accept queue until
+		// its data arrives. That is deterministic, and it is the premise of
+		// celeris#662's linger.
+		if pause {
+			t.Fatal("the rig's option-on arm is the pause-free premise control; the paused " +
+				"option-on case is pause_accept_linger_linux_test.go")
+		}
 		if acceptedBeforePause != 0 {
 			t.Errorf("%d of %d connections were accepted within %v while TCP_DEFER_ACCEPT "+
 				"was set, want 0. The kernel must hold a handshake-complete connection "+
-				"that has sent no data out of the accept queue entirely -- that is the "+
-				"premise celeris#662's fix rests on, and if it no longer holds the fix "+
+				"that has sent no data out of the accept queue -- that is the premise "+
+				"celeris#662's linger rests on, and if it no longer holds the fix "+
 				"needs re-deriving rather than re-running",
 				acceptedBeforePause, idleConns662, idlePrePauseBudget662)
+		}
+		if dropsOK && dropsDeltaOK < uint64(idleConns662) {
+			t.Errorf("TCPDeferAcceptDrop moved by %d over %d silent dials, want >= %d: the "+
+				"kernel did not report deferring them", dropsDeltaOK, idleConns662, idleConns662)
+		}
+		if tally["200"] != idleConns662 {
+			t.Errorf("without a pause only %d of %d deferred connections got a response once "+
+				"they wrote (outcomes %v): the rig itself is broken", tally["200"], idleConns662, tally)
+		}
+		if want := base.AcceptCount + uint64(idleConns662); m.AcceptCount != want {
+			t.Errorf("AcceptCount = %d, want %d: every connection the engine serves "+
+				"must be counted", m.AcceptCount, want)
 		}
 	} else {
 		if pause && acceptedBeforePause != uint64(idleConns662) {
@@ -366,57 +377,50 @@ func runPauseIdle662(t *testing.T, pause, disableDefer bool) {
 	}
 }
 
-// TestPauseAcceptKeepsHandshakedIdleConnections pins the residual half of
-// celeris#662 on epoll: a connection whose handshake completed before the pause
-// must be served even though it had not sent a byte when the pause landed.
+// TestPauseAcceptKeepsHandshakedIdleConnections is the DisableDeferAccept
+// arm on epoll: the instant, lossless pause. With the option off, a connection
+// whose handshake completed before the pause is in the accept queue even
+// though it has not sent a byte, so the pause drains and serves it and
+// closes the listeners at once, with no linger.
 func TestPauseAcceptKeepsHandshakedIdleConnections(t *testing.T) {
 	runPauseIdle662(t, true, true)
 }
 
-// TestPauseAcceptDeferredIdleConnectionsAreHidden is the same rig with
-// TCP_DEFER_ACCEPT left ON -- the default, and what a standalone engine still
-// gets (celeris#675). It asserts the MECHANISM the fix rests on: the kernel
-// holds a handshake-complete connection that has sent no data out of the
-// accept queue, so the pause's drain provably cannot reach it.
+// TestPauseAcceptDeferredIdleConnectionsAreHidden is the pause-free PREMISE
+// control of celeris#662's linger: with TCP_DEFER_ACCEPT on (the default),
+// silent clients whose handshakes completed are not accepted, and the kernel
+// counts each deferral in TCPDeferAcceptDrop. Once they write, they are
+// served.
 //
-// It is also this file's failing arm. The two arms make opposite assertions
-// about the same counter, so a DisableDeferAccept that stopped reaching
-// createListenSocket, or that inverted, fails one of them.
+// It is also this file's opposite arm. It and the DisableDeferAccept arm make
+// opposite assertions about the same counter, so a DisableDeferAccept that
+// stopped reaching createListenSocket, or that inverted, fails one of them.
 func TestPauseAcceptDeferredIdleConnectionsAreHidden(t *testing.T) {
-	runPauseIdle662(t, true, false)
+	runPauseIdle662(t, false, false)
 }
 
-// TestPauseAcceptIdleControl is the fix arm's rig without the pause: same
-// config, same write-nothing clients, and every connection is served. It is
-// what makes the paused arm's failure attributable to the PAUSE rather than
-// to the rig's unusual clients.
-//
-// It is NOT a "passes on main" control, and this file cannot offer one: the
-// rig names resource.Config.DisableDeferAccept, a field main does not have,
-// so none of these tests compiles against main. The artifact that fails on
-// unmodified main is adaptive's TestSwitchKeepsHandshakedIdleConnections,
-// which names no new API and can be checked out onto main verbatim.
+// TestPauseAcceptIdleControl is the DisableDeferAccept arm's rig without the
+// pause: same config, same write-nothing clients, and every connection is
+// served. It is what makes the paused arm's result attributable to the pause
+// rather than to the rig's unusual clients.
 func TestPauseAcceptIdleControl(t *testing.T) { runPauseIdle662(t, false, true) }
 
-// TestListenSocketDeferAcceptFollowsConfig pins both directions of the
-// celeris#662 fix on the socket itself, with no engine involved.
+// TestListenSocketDeferAcceptFollowsConfig pins both directions of the option
+// on the socket itself, with no engine involved.
 //
-// deferAccept=false is the fix. With TCP_DEFER_ACCEPT clear a
-// handshake-complete connection that has sent no data enters the accept queue,
-// which is the only place the pause's drain can reach it before the listen
-// socket closes.
+// deferAccept=false is DisableDeferAccept: with TCP_DEFER_ACCEPT clear a
+// handshake-complete connection that has sent no data enters the accept
+// queue, where the pause's drain reaches it, so the pause needs no linger.
 //
-// deferAccept=true is what every engine that does not ask otherwise still
-// gets, and it is asserted here too rather than left implicit. The default was
-// kept deliberately: dropping the option costs +14-21% ns/op and +2.4-3.5 us
-// of server CPU per connection on churn (measured, 30 rounds per arm), so a
-// silent flip of it would be a throughput regression with no other test to
-// catch it.
+// deferAccept=true is what every engine that does not ask otherwise gets, and
+// it is asserted here too rather than left implicit: a silent flip of the
+// default would change what every accept costs, with no other test to catch
+// it.
 //
-// It calls createListenSocket directly rather than reading a Loop's listenFD.
-// That field is owned by the loop goroutine, so reading it from the test
-// goroutine would be a data race, and -race would flag the test rather than the
-// defect.
+// It calls createListenSocket directly rather than reading a listenFD field.
+// That field is owned by the event-loop goroutine, so reading it from the
+// test goroutine would be a data race, and -race would flag the test rather
+// than the defect.
 func TestListenSocketDeferAcceptFollowsConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
