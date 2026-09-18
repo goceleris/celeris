@@ -463,7 +463,25 @@ func TestAdaptiveListenersKeepDeferAcceptAcrossSwitches(t *testing.T) {
 			describe662(incoming))
 	}
 
-	// Flap back at once, inside epoll's linger: epoll's listeners are resumed.
+	// Let the outgoing epoll loops act on the pause first: every epoll
+	// listener still open must read the option off (cleared for the linger)
+	// before the flap, or the flap below would withdraw a pause no loop had
+	// seen yet and would test nothing. (Where the pause closes the listeners
+	// at once, none remains and there is nothing to wait for.)
+	var epollLingering []adSock662
+	for dl := time.Now().Add(time.Second); ; {
+		epollLingering = without662(listeners662(t, port), iouringSet)
+		off := true
+		for _, s := range epollLingering {
+			off = off && !s.deferOn
+		}
+		if off || time.Now().After(dl) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Flap back inside epoll's linger: epoll's listeners are resumed.
 	e.ForceSwitch()
 	if got := e.ActiveEngine().Type(); got != engine.Epoll {
 		t.Fatalf("the flap left %v active, want epoll", got)
@@ -482,9 +500,9 @@ func TestAdaptiveListenersKeepDeferAcceptAcrossSwitches(t *testing.T) {
 	}
 	iouringClosed := waitGone662(t, port, iouringSet, "the io_uring engine after the flap")
 	settled := listeners662(t, port)
-	t.Logf("before=%s incomingAfterPromotion=%s epollAfterFlapWithinLinger=%s "+
+	t.Logf("before=%s incomingAfterPromotion=%s epollBeforeFlap=%s epollAfterFlapWithinLinger=%s "+
 		"iouringClosedAfter=%v settled=%s", describe662(before), describe662(incoming),
-		describe662(epollNow), iouringClosed, describe662(settled))
+		describe662(epollLingering), describe662(epollNow), iouringClosed, describe662(settled))
 	if !allOn662(settled) {
 		t.Errorf("after the io_uring linger ended the listeners read %s, want all on", describe662(settled))
 	}
