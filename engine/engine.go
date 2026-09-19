@@ -484,6 +484,46 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// io_uring-only; zero on other engines. On the adaptive engine it is
 	// the sum over both sub-engines.
 	TransplantHandoffInFlight uint64
+	// TransplantHeld, TransplantReaps and TransplantReapMisses count how the
+	// io_uring hand-off keeps its fd-lifetime rule (celeris#657): a
+	// connection leaves io_uring only when no read can still resolve its
+	// descriptor, which is what takes TransplantHandoffInFlight and
+	// StaleRecvDataTransplanted to 0.
+	//
+	//   - TransplantHeld: responses flushed with the connection's next recv
+	//     held back because a drain was set, so the hand-off at that send's
+	//     completion finds nothing in flight.
+	//   - TransplantReaps: reported cancels of an already-armed recv, submitted
+	//     so the connection can be handed off at that recv's cancellation.
+	//   - TransplantReapMisses: those cancels that matched nothing (the recv
+	//     had completed, or was not issued yet). A miss is retried and is
+	//     never followed by a hand-off.
+	//
+	// Rates, not invariants: all three are zero while no drain runs.
+	// io_uring-only and cumulative; zero on other engines. On the adaptive
+	// engine each is the sum over both sub-engines.
+	TransplantHeld       uint64
+	TransplantReaps      uint64
+	TransplantReapMisses uint64
+	// TransplantHoldRescued counts connections whose recv was held for a
+	// hand-off that did not happen and that no completion released: the
+	// timeout sweep found them with their response sent and no recv armed,
+	// and armed it. It is a belt under the release at every send
+	// completion, and must stay 0; a non-zero value is a connection that sat
+	// unable to read until the sweep came by (celeris#657). io_uring-only;
+	// on the adaptive engine the sum over both sub-engines.
+	TransplantHoldRescued uint64
+	// TransplantDoubleClaim counts io_uring hand-offs refused because another
+	// path already owned that connection's hand-off: the sync path finding a
+	// connection whose async dispatch goroutine had claimed its own hand-off,
+	// or the async completion finding its connection no longer owns its
+	// descriptor slot. Each is a connection that would otherwise have been
+	// handed off twice, the second time as whatever socket then held the
+	// descriptor number (celeris#657). The first case needs a send
+	// completion to land between the claim and the worker's drain of it, so
+	// a low non-zero rate is the check working, not a fault. io_uring-only;
+	// on the adaptive engine the sum over both sub-engines.
+	TransplantDoubleClaim uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and

@@ -48,15 +48,73 @@ import "sync/atomic"
 //     (kernelInflight != 0) or a SEND_ZC notification pending — the
 //     precondition of every loss above.
 //
-// Both are direct atomic adds: they fire on the stale-CQE and hand-off
-// paths only, never on the per-request path, and like the celeris#586
-// witnesses they are per-event invariants that a per-iteration batch
-// could lose at loop exit.
+// The fd-lifetime rule that removes that loss (celeris#657 PR-2: no hand-off
+// while a read can still resolve the fd) keeps its own counters here too:
+//
+//   - held: responses flushed with the next recv HELD, because a drain was
+//     set and the conn was one the hand-off at that SEND's completion
+//     accepts (HOLD). A rate.
+//   - reaps / reapMisses: reported cancels of an armed recv submitted so a
+//     conn could be handed off (REAP), and those whose own completion said
+//     they matched nothing (the recv had completed, or was not issued yet).
+//     A miss is retried, never followed by a hand-off. Rates.
+//   - holdRescued: held conns the timeout sweep found with their response
+//     sent, not handed off and no recv armed — a path that skipped the
+//     release. The belt under releaseHold. Must stay 0.
+//   - doubleClaim: hand-offs refused because another path owned the conn's
+//     hand-off: tryTransplant on a conn whose dispatch goroutine had already
+//     claimed it (transplantPending), or finishAsyncTransplant for a
+//     connState that no longer owns its fd slot. Each is a double hand-off
+//     prevented; before the checks existed one identity was measured moving
+//     twice in 167 runs. Rare, not impossible: the first half fires whenever
+//     a SEND completion lands between a goroutine's claim and the drain.
+//
+// All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
+// paths only, never on the per-request path while no drain is set, and like
+// the celeris#586 witnesses they are per-event invariants that a
+// per-iteration batch could lose at loop exit.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
 	staleRecvDataUnattributed atomic.Uint64
 	handoffInFlight           atomic.Uint64
+	held                      atomic.Uint64
+	reaps                     atomic.Uint64
+	reapMisses                atomic.Uint64
+	holdRescued               atomic.Uint64
+	doubleClaim               atomic.Uint64
+}
+
+// The fd-lifetime counters are nil-safe: a hand-built test Worker has none.
+
+func (s *handoffLossStats) noteHeld() {
+	if s != nil {
+		s.held.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteReap() {
+	if s != nil {
+		s.reaps.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteReapMiss() {
+	if s != nil {
+		s.reapMisses.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteHoldRescued() {
+	if s != nil {
+		s.holdRescued.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteDoubleClaim() {
+	if s != nil {
+		s.doubleClaim.Add(1)
+	}
 }
 
 // noteStaleRecvData counts one stale recv CQE that carried data, under the

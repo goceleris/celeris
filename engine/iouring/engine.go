@@ -446,6 +446,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		StaleRecvDataTransplanted: e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
 		StaleRecvDataUnattributed: e.metrics.handoffLoss.staleRecvDataUnattributed.Load(),
 		TransplantHandoffInFlight: e.metrics.handoffLoss.handoffInFlight.Load(),
+		TransplantHeld:            e.metrics.handoffLoss.held.Load(),
+		TransplantReaps:           e.metrics.handoffLoss.reaps.Load(),
+		TransplantReapMisses:      e.metrics.handoffLoss.reapMisses.Load(),
+		TransplantHoldRescued:     e.metrics.handoffLoss.holdRescued.Load(),
+		TransplantDoubleClaim:     e.metrics.handoffLoss.doubleClaim.Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).
