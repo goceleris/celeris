@@ -192,8 +192,10 @@ type closedOpsEntry struct {
 	// handoff marks an identity a conn left through a transplant hand-off
 	// rather than a close (noteHandedOffInflight), so a stale recv CQE that
 	// carried data for it is counted as a hand-off loss (celeris#657). It
-	// is read only by that counter and changes nothing else. Placed in
-	// inflight's padding, so the entry stays 32 bytes.
+	// is read only by that counter and changes nothing else. It sits in
+	// inflight's padding, so on 64-bit platforms the entry stays 32 bytes
+	// (TestClosedOpsEntryStaysThirtyTwoBytes). 32-bit platforms have no
+	// padding there, and the entry grows from 16 to 20 bytes.
 	handoff bool
 	conns   []*connState
 }
