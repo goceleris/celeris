@@ -1193,6 +1193,10 @@ func (w *Worker) run(ctx context.Context) {
 						if w.transplant.Load() != nil {
 							w.tryTransplant(fd)
 						}
+						// Unconditionally, after the attempt: a conn held for
+						// a hand-off that did not happen gets its recv back
+						// (celeris#657).
+						w.releaseHold(fd)
 					}
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
@@ -1204,6 +1208,9 @@ func (w *Worker) run(ctx context.Context) {
 						if w.transplant.Load() != nil {
 							w.tryTransplant(fd)
 						}
+						// A held conn's SEND completion is where it either
+						// left (above) or gets its recv back (celeris#657).
+						w.releaseHold(fd)
 					}
 				case udAccept:
 					w.handleAccept(ctx, entry, fd, now)
@@ -1579,11 +1586,23 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleRecv(c, fd, now)
+		// The same hand-off attempt and hold release as the inlined
+		// dispatch (celeris#657). The listener-close harvest processes
+		// completions here, and a held conn whose SEND completion landed in
+		// it would otherwise be neither handed off nor re-armed.
+		if w.transplant.Load() != nil {
+			w.tryTransplant(fd)
+		}
+		w.releaseHold(fd)
 	case udSend:
 		if w.staleConnCQE(c, fd, ud) {
 			return
 		}
 		w.handleSend(c, fd, now)
+		if w.transplant.Load() != nil {
+			w.tryTransplant(fd)
+		}
+		w.releaseHold(fd)
 	case udClose:
 		if w.staleConnCQE(c, fd, ud) {
 			return
@@ -5111,6 +5130,11 @@ func (w *Worker) checkTimeouts() {
 		// reading never completes the SEND at all (celeris#498). The remaining
 		// timeouts below are meaningless here: the handler is gone, so there is
 		// no read to time out and no new bytes can join the queue.
+		// A conn held for a hand-off that neither happened nor was released
+		// (celeris#657): arm its recv. Counted; must stay 0.
+		if cs.transplantHold && !cs.closing {
+			w.rescueHold(cs)
+		}
 		if cs.closing {
 			if now-cs.lastActivity > closingDrainTimeoutNanos {
 				// Everything closeConn does before deferring (detach

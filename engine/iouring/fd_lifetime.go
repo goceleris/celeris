@@ -200,3 +200,55 @@ func (w *Worker) holdEligible(cs *connState) bool {
 	}
 	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
 }
+
+// releaseHold runs after the hand-off attempt at every recv/send dispatch
+// site, unconditionally: a conn held for a hand-off (transplantHold) whose
+// response has been sent but that is still here — the drain stopped, a gate
+// refused, the dup failed — gets its recv armed. No counter gates the call; a
+// drifting one could skip a re-arm and leave a conn that cannot read. Small
+// enough to inline: one slot load and one flag per recv/send completion.
+func (w *Worker) releaseHold(fd int) {
+	if cs := w.conns[fd]; cs != nil && cs.transplantHold {
+		w.releaseHoldSlow(cs, false)
+	}
+}
+
+// releaseHoldSlow clears cs's hold and arms its recv once nothing is left to
+// send; while something is, the next SEND completion decides. rescued marks
+// the timeout sweep's belt, which is counted. Worker thread.
+func (w *Worker) releaseHoldSlow(cs *connState, rescued bool) {
+	if cs.closing {
+		cs.transplantHold = false
+		return
+	}
+	if mu := cs.detachMu; mu != nil {
+		// A held conn is never a promoted async one, so nothing contends
+		// this; TryLock only because checkTimeouts never blocks on it.
+		if !mu.TryLock() {
+			return
+		}
+		defer mu.Unlock()
+	}
+	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.writeBuf) > 0 || len(cs.bodyBuf) > 0 {
+		return
+	}
+	cs.transplantHold = false
+	if rescued {
+		w.handoffLoss.noteHoldRescued()
+	}
+	if cs.recvArmed || cs.recvPaused {
+		return
+	}
+	if !w.prepareRecv(cs, w.pickRecvTarget(cs)) {
+		cs.needsRecv = true
+		w.markDirty(cs)
+	}
+}
+
+// rescueHold is checkTimeouts' belt under releaseHold: every path that
+// completes a held conn's send releases it, so finding one here with its send
+// done means a path skipped the release, and the conn could not have read
+// until now. Arms the recv and counts it (TransplantHoldRescued, must stay 0).
+func (w *Worker) rescueHold(cs *connState) {
+	w.releaseHoldSlow(cs, true)
+}
