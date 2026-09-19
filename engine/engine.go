@@ -541,19 +541,19 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	TransplantReapFailed uint64
 	// TransplantReapUnsupported counts hand-off recv cancels not placed
 	// because the io_uring engine's startup probe did not find the
-	// IORING_ASYNC_CANCEL flags they need accepted (Linux 5.19 added them;
-	// a probe that got no answer, or an answer it does not recognise, counts
-	// the same). It counts only
-	// connections the worker serves itself (every connection in sync mode,
-	// and in async mode those not promoted to a dispatch goroutine): such a
-	// connection stays on io_uring until its armed recv completes on its
-	// own, and is handed off after the response to the request that recv
-	// brings, which is held, where the worker has no provided-buffer ring (a
-	// kernel without the flags has none); with one it stays. A promoted
-	// async connection is never offered for the hand-off where the flags are
-	// missing: it stays on io_uring and is not counted. Placement only,
-	// never a lost request. A rate, 0 wherever the probe finds the flags.
-	// io_uring-only; on the adaptive engine the sum over both sub-engines.
+	// IORING_ASYNC_CANCEL flags they need accepted (Linux 5.19 added them; a
+	// probe that got no answer, or an answer it does not recognise, counts
+	// the same). It counts only connections the worker serves itself (every
+	// connection in sync mode, and in async mode those not promoted to a
+	// dispatch goroutine): such a connection stays on io_uring until its
+	// armed recv completes on its own, and is handed off after the response
+	// to the request that recv brings, which is held, where the worker has
+	// no provided-buffer ring (a kernel without the flags has none); with
+	// one it stays. A promoted async connection is never offered for the
+	// hand-off where the flags are missing: it stays on io_uring and is not
+	// counted. Placement only, never a lost request. A rate, 0 wherever the
+	// probe finds the flags. io_uring-only; on the adaptive engine the sum
+	// over both sub-engines.
 	TransplantReapUnsupported uint64
 }
 
