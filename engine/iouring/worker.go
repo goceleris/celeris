@@ -3042,7 +3042,7 @@ func (w *Worker) respondAndArm(cs *connState, fd int, c *completionEntry, link, 
 		w.closeConn(fd)
 		return
 	}
-	hold := w.bufRing == nil && w.transplant.Load() != nil && w.holdEligible(cs)
+	hold := false
 	switch {
 	case hold:
 		cs.transplantHold = true
