@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -259,46 +260,88 @@ func transplantUnderLoad(t *testing.T, e *Engine, addr string, n int, tgt engine
 	res := wait()
 	e.StopTransplant()
 	time.Sleep(100 * time.Millisecond)
-	t.Logf("celeris657 load conns=%d ok=%d errs=%d classes=[%s] W1T=%d W1U=%d W1C=%d W2=%d",
+	t.Logf("celeris657 load conns=%d ok=%d errs=%d classes=[%s] W1T=%d W1U=%d W1C=%d W2=%d "+
+		"held=%d reaps=%d misses=%d rescued=%d doubleclaim=%d detached=%d",
 		n, res.ok, res.errs, classes(res.byClass),
 		e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
 		e.metrics.handoffLoss.staleRecvDataUnattributed.Load(),
 		e.metrics.handoffLoss.staleRecvDataClosed.Load(),
-		e.metrics.handoffLoss.handoffInFlight.Load())
+		e.metrics.handoffLoss.handoffInFlight.Load(),
+		metricOr(e, "TransplantHeld"), metricOr(e, "TransplantReaps"), metricOr(e, "TransplantReapMisses"),
+		metricOr(e, "TransplantHoldRescued"), metricOr(e, "TransplantDoubleClaim"),
+		e.metrics.transplantDetached.Load())
 	return res
+}
+
+// metricOr is metric for a log line: -1 when the tree has no such field.
+func metricOr(e *Engine, name string) int64 {
+	v := reflect.ValueOf(e.Metrics()).FieldByName(name)
+	if !v.IsValid() {
+		return -1
+	}
+	return int64(v.Uint())
 }
 
 // TestHandoffHasNothingInFlight: at every hand-off, nothing may still be in
 // flight on the connection (TransplantHandoffInFlight does not move), and no
 // stale recv data may appear afterwards, with 128 busy keep-alives across a
-// StartTransplant. Base: every hand-off is made with the linked RECV armed.
+// StartTransplant. Base: every hand-off is made with the conn's recv armed.
+// The sync conns leave through tryTransplant (a held response's SEND
+// completion, or a reap); the async ones are promoted to a dispatch goroutine
+// that claims its own hand-off at its park, and leave through
+// finishAsyncTransplant, which reaps the recv the feed path armed.
 func TestHandoffHasNothingInFlight(t *testing.T) {
-	e, addr := startFDLEngine(t, transplantTestHandler{}, nil)
-	var maxSeen atomic.Uint64
-	tgt := &servingTarget{}
-	tgt.onAdopt = func() {
-		if v := e.metrics.handoffLoss.handoffInFlight.Load(); v > maxSeen.Load() {
-			maxSeen.Store(v)
-		}
-	}
-	defer tgt.close()
-	const conns = 128
-	res := transplantUnderLoad(t, e, addr, conns, tgt, 300*time.Millisecond, 1500*time.Millisecond)
-	if v := maxSeen.Load(); v != 0 {
-		t.Errorf("TransplantHandoffInFlight read %d at a hand-off, want 0 at every one: a conn "+
-			"left with an op still able to resolve its fd", v)
-	}
-	if tr, un := e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
-		e.metrics.handoffLoss.staleRecvDataUnattributed.Load(); tr != 0 || un != 0 {
-		t.Errorf("stale recv data after the hand-offs: Transplanted=%d Unattributed=%d, want 0/0", tr, un)
-	}
-	if res.errs != 0 {
-		t.Errorf("clients saw %d errors (%s), want 0", res.errs, classes(res.byClass))
-	}
-	if got := tgt.adopted.Load(); got != conns {
-		t.Errorf("%d of %d busy conns were handed off, want all", got, conns)
+	for _, tc := range []struct {
+		name  string
+		async bool
+	}{{"sync", false}, {"async", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var h stream.Handler = transplantTestHandler{}
+			var mut func(*resource.Config)
+			if tc.async {
+				h = asyncRouteHandler{}
+				mut = func(c *resource.Config) { c.AsyncHandlers = true }
+			}
+			e, addr := startFDLEngine(t, h, mut)
+			var maxSeen atomic.Uint64
+			tgt := &servingTarget{}
+			tgt.onAdopt = func() {
+				if v := e.metrics.handoffLoss.handoffInFlight.Load(); v > maxSeen.Load() {
+					maxSeen.Store(v)
+				}
+			}
+			defer tgt.close()
+			const conns = 128
+			res := transplantUnderLoad(t, e, addr, conns, tgt, 300*time.Millisecond, 1500*time.Millisecond)
+			if tc.async {
+				if n := e.Metrics().AsyncPromotedConns; n == 0 {
+					t.Fatal("no conn was promoted to async dispatch: the async path was not exercised")
+				}
+			}
+			if v := maxSeen.Load(); v != 0 {
+				t.Errorf("TransplantHandoffInFlight read %d at a hand-off, want 0 at every one: a conn "+
+					"left with an op still able to resolve its fd", v)
+			}
+			if tr, un := e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
+				e.metrics.handoffLoss.staleRecvDataUnattributed.Load(); tr != 0 || un != 0 {
+				t.Errorf("stale recv data after the hand-offs: Transplanted=%d Unattributed=%d, want 0/0", tr, un)
+			}
+			if res.errs != 0 {
+				t.Errorf("clients saw %d errors (%s), want 0", res.errs, classes(res.byClass))
+			}
+			if got := tgt.adopted.Load(); got != conns {
+				t.Errorf("%d of %d busy conns were handed off, want all", got, conns)
+			}
+		})
 	}
 }
+
+// asyncRouteHandler is transplantTestHandler with every route async, so each
+// conn is promoted to its own dispatch goroutine on its first request.
+type asyncRouteHandler struct{ transplantTestHandler }
+
+func (asyncRouteHandler) RouteAsync(_, _ string) bool { return true }
+func (asyncRouteHandler) HasAsyncRoutes() bool        { return true }
 
 // TestStaleRecvDataCounted is the celeris#657 join as a test: every request a
 // client lost is a stale recv CQE with data that the witness counted as
