@@ -1078,6 +1078,21 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		StaleRecvDataTransplanted: pm.StaleRecvDataTransplanted + sm.StaleRecvDataTransplanted,
 		StaleRecvDataUnattributed: pm.StaleRecvDataUnattributed + sm.StaleRecvDataUnattributed,
 		TransplantHandoffInFlight: pm.TransplantHandoffInFlight + sm.TransplantHandoffInFlight,
+		// The fd-lifetime rule's counters (celeris#657 PR-2), io_uring-only
+		// and cumulative. A hold, a reap and a refused double claim each
+		// happen on the one sub-engine making the hand-off, so the sum
+		// counts each once; like the witnesses above, the standby's half
+		// is where a revert's hand-offs are made.
+		TransplantHeld:        pm.TransplantHeld + sm.TransplantHeld,
+		TransplantReaps:       pm.TransplantReaps + sm.TransplantReaps,
+		TransplantReapMisses:  pm.TransplantReapMisses + sm.TransplantReapMisses,
+		TransplantHoldRescued: pm.TransplantHoldRescued + sm.TransplantHoldRescued,
+		TransplantDoubleClaim: pm.TransplantDoubleClaim + sm.TransplantDoubleClaim,
+		// The same rule for the refusals and fallbacks around them: each
+		// is an event on the one sub-engine attempting the hand-off.
+		TransplantClaimDeferred:   pm.TransplantClaimDeferred + sm.TransplantClaimDeferred,
+		TransplantReapFailed:      pm.TransplantReapFailed + sm.TransplantReapFailed,
+		TransplantReapUnsupported: pm.TransplantReapUnsupported + sm.TransplantReapUnsupported,
 
 		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
 		// so the epoll half contributes zero and a switch simply moves which

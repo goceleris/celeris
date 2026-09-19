@@ -65,6 +65,16 @@ const (
 	// left to correct.
 	udRecvCancel uint64 = 0x05 << 56
 	udH2Wakeup   uint64 = 0x07 << 56
+	// udTransplantReap tags the reported ASYNC_CANCEL a hand-off submits for
+	// a connection's armed recv (celeris#657, the REAP half of the
+	// fd-lifetime rule): the connection is handed to epoll at that recv's
+	// own -ECANCELED, never while it can still complete. A tag of its own,
+	// not udRecvCancel's, so its miss can be told from the WebSocket
+	// pause's (celeris#596) and routed to handleTransplantReap. Conn-bound
+	// (stamped with the generation, so it passes the stale-CQE gate) and,
+	// like udRecvCancel, NOT a terminalOp: it stays outside the
+	// kernelInflight accounting.
+	udTransplantReap uint64 = 0x09 << 56
 	// udHeaderTimer tags IORING_OP_TIMEOUT SQEs submitted by initProtocol /
 	// ProcessH1's arm-callback to enforce ReadHeaderTimeout per-conn. The
 	// timer fires absolutely at the deadline; CQE handler closes the conn

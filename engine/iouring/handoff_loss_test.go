@@ -16,6 +16,13 @@ import (
 // is waiting on. Its CQE is stale, so staleConnCQE dropped it with no trace
 // while the #624 ledger balanced. These tests pin the witnesses one counter
 // at a time; each fails if its increment is removed.
+//
+// Since the fd-lifetime rule (celeris#657 PR-2) both hand-off sites refuse a
+// conn with anything in flight and reap its recv instead, so the loss these
+// witnesses count can only come back through a regression of that gate. The
+// tests below therefore check that each site refuses the state, then drive
+// handOff — the commit point both sites share, which the gate guards — with
+// it, to prove the witnesses still see what such a regression would do.
 
 // handoffLossCounts reads the four witnesses in one go, for messages.
 type handoffLossCounts struct {
@@ -59,26 +66,30 @@ func staleRecv(fd int, gen uint32, res int32) *completionEntry {
 	return &completionEntry{UserData: encodeUserDataGen(udRecv, fd, gen), Res: res}
 }
 
-// TestStaleRecvDataCountsATransplantedConn drives the whole sync path:
-// tryTransplant hands off a conn with its recv armed, and that recv then
-// completes with a request's bytes. The CQE is stale (the slot is empty),
-// its identity was registered by the hand-off, so it must count as
-// Transplanted — and as nothing else. The CQE is terminal and the identity
-// owes exactly one op, so noteStaleTerminalOp retires the identity on this
-// very CQE: the count must be taken before that, or it reads Unattributed.
+// TestStaleRecvDataCountsATransplantedConn drives the sync hand-off of a
+// conn with its recv armed, and that recv then completes with a request's
+// bytes. The CQE is stale (the slot is empty), its identity was registered by
+// the hand-off, so it must count as Transplanted — and as nothing else. The
+// CQE is terminal and the identity owes exactly one op, so
+// noteStaleTerminalOp retires the identity on this very CQE: the count must
+// be taken before that, or it reads Unattributed.
 func TestStaleRecvDataCountsATransplantedConn(t *testing.T) {
 	fd, other := socketPairFDs(t)
 	defer func() { _ = unix.Close(other) }()
 	w, tgt := newHandoffLossWorker(t, fd)
 	const gen = 5
-	w.conns[fd] = idleSyncConn(fd, gen)
+	cs := idleSyncConn(fd, gen)
+	w.conns[fd] = cs
 	w.connCount = 1
 	w.activeConns.Add(1)
 
 	w.tryTransplant(fd)
-	if w.conns[fd] != nil || tgt.adopted.Load() != 1 {
-		t.Fatal("the conn was not handed off — the eligibility gates rejected " +
-			"the setup, so this test proves nothing about the counter")
+	if w.conns[fd] != cs || tgt.adopted.Load() != 0 {
+		t.Fatal("tryTransplant handed off a conn with its recv armed: the R0 gate is gone")
+	}
+	if !w.handOff(cs, fd, w.transplant.Load(), false) || w.conns[fd] != nil || tgt.adopted.Load() != 1 {
+		t.Fatal("the conn was not handed off — the setup was rejected, so this test " +
+			"proves nothing about the counter")
 	}
 
 	c := staleRecv(fd, gen, 27) // the next request, read by the old recv
@@ -98,7 +109,7 @@ func TestStaleRecvDataCountsATransplantedConn(t *testing.T) {
 
 // TestStaleRecvDataCountsAnAsyncTransplantedConn is the same loss on the
 // self-initiated path a promoted async conn takes (finishAsyncTransplant),
-// which registers its identity through its own call site.
+// which commits with the detached release.
 func TestStaleRecvDataCountsAnAsyncTransplantedConn(t *testing.T) {
 	fd, other := socketPairFDs(t)
 	defer func() { _ = unix.Close(other) }()
@@ -110,7 +121,10 @@ func TestStaleRecvDataCountsAnAsyncTransplantedConn(t *testing.T) {
 	w.activeConns.Add(1)
 
 	w.finishAsyncTransplant(cs)
-	if w.conns[fd] != nil || tgt.adopted.Load() != 1 {
+	if w.conns[fd] != cs || tgt.adopted.Load() != 0 {
+		t.Fatal("finishAsyncTransplant handed off a conn with its recv armed: the R0 gate is gone")
+	}
+	if !w.handOff(cs, fd, w.transplant.Load(), true) || w.conns[fd] != nil || tgt.adopted.Load() != 1 {
 		t.Fatal("the async conn was not handed off — setup rejected, the counter is unproven")
 	}
 
@@ -241,7 +255,10 @@ func TestStaleRecvDataCountsEachMultishotCompletion(t *testing.T) {
 // TestTransplantHandoffInFlightCountsTryTransplant pins the precondition
 // witness on the sync hand-off site: it counts a hand-off made with a recv
 // armed, a kernel op outstanding, or a SEND_ZC notification pending, and
-// does not count one made with nothing in flight.
+// does not count one made with nothing in flight. tryTransplant must refuse
+// each of the three states (celeris#657 PR-2) and hand off the empty one; the
+// three are then committed through handOff, the point a gate regression
+// would reach.
 //
 // Each of the three single-term states differs from "nothing in flight" in
 // exactly one term, so removing any one term from the predicate fails this
@@ -280,6 +297,13 @@ func TestTransplantHandoffInFlightCountsTryTransplant(t *testing.T) {
 		w.activeConns.Add(1)
 
 		w.tryTransplant(fd)
+		inFlight := st.recvArmed || st.kernelInflight != 0 || st.zcNotifPending
+		if inFlight {
+			if w.conns[fd] != cs || tgt.adopted.Load() != int64(i) {
+				t.Fatalf("%s: tryTransplant handed off with an op in flight: the R0 gate is gone", st.name)
+			}
+			w.handOff(cs, fd, w.transplant.Load(), false)
+		}
 		if w.conns[fd] != nil || tgt.adopted.Load() != int64(i+1) {
 			t.Fatalf("%s: the conn was not handed off — the counter is unproven", st.name)
 		}
@@ -291,9 +315,10 @@ func TestTransplantHandoffInFlightCountsTryTransplant(t *testing.T) {
 }
 
 // TestTransplantHandoffInFlightCountsFinishAsyncTransplant is the same
-// witness on the async hand-off site. finishAsyncTransplant already refuses a
-// conn with a SEND or a SEND_ZC notification outstanding, so what it can hand
-// off with an op in flight is the armed recv.
+// witness on the async hand-off site. finishAsyncTransplant already refused a
+// conn with a SEND or a SEND_ZC notification outstanding; since celeris#657
+// PR-2 it refuses the armed recv too, so the armed state is committed through
+// handOff with the detached release, as a gate regression would.
 func TestTransplantHandoffInFlightCountsFinishAsyncTransplant(t *testing.T) {
 	fdIdle, otherIdle := socketPairFDs(t)
 	defer func() { _ = unix.Close(otherIdle) }()
@@ -319,6 +344,10 @@ func TestTransplantHandoffInFlightCountsFinishAsyncTransplant(t *testing.T) {
 	w.connCount++
 	w.activeConns.Add(1)
 	w.finishAsyncTransplant(armed)
+	if w.conns[fdArmed] != armed || tgt.adopted.Load() != 1 {
+		t.Fatal("finishAsyncTransplant handed off with the recv armed: the R0 gate is gone")
+	}
+	w.handOff(armed, fdArmed, w.transplant.Load(), true)
 	if w.conns[fdArmed] != nil || tgt.adopted.Load() != 2 {
 		t.Fatal("the armed async conn was not handed off — setup rejected")
 	}
