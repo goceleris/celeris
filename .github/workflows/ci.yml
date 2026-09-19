@@ -165,6 +165,37 @@ jobs:
             echo "was one renamed or removed, did one skip, or did one fail?"
             exit 1
           fi
+      # celeris#657 PR-2: the fd-lifetime tests of the io_uring hand-off, run
+      # the same way: by name, -v, skipping forbidden, exact tally. This is
+      # the one-worker leg: the runner's own 8 MiB memlock funds a single
+      # io_uring worker, the shape in which every hand-off loss was measured
+      # (all connections on one ring). The engine-level tests log
+      # "celeris657 engine workers=N"; the tally below requires every such
+      # line to read workers=1, so a runner that funds more workers fails
+      # this step instead of silently testing another shape.
+      - name: celeris#657 fd-lifetime tests, one io_uring worker (skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/fdlife657.log
+          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/fdlife657.log || true)
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/fdlife657.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/fdlife657.log || true)
+          engines=$(grep -cE 'celeris657 engine workers=[0-9]+' /tmp/fdlife657.log || true)
+          one=$(grep -cE 'celeris657 engine workers=1$' /tmp/fdlife657.log || true)
+          echo "celeris#657 fd-lifetime tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, engines $engines at workers=1: $one"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$engines" -eq 0 ] || [ "$one" -ne "$engines" ]; then
+            echo "expected exactly $want top-level fd-lifetime tests to run and PASS with no SKIP line,"
+            echo "every engine at one io_uring worker -- was one renamed or removed, did one skip or fail,"
+            echo "or did this runner fund a different worker count?"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
