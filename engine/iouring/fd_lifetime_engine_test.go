@@ -385,6 +385,12 @@ func TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen(t *testing.T) {
 // deterministic by a response large enough to keep its SEND in flight until
 // the client reads it: the request arrives with a drain set (so the response
 // is held), the drain stops, and only then does the SEND complete.
+//
+// The target refuses every conn. The warm-up response's SEND completion can
+// reach the worker after the client has read it, and so after StartTransplant:
+// the idle conn is then reaped and offered to the target before /big is sent.
+// Refused, it is reclaimed onto io_uring and /big is served there as intended;
+// an accepting target would own (and here close) the conn instead.
 func testHoldReleasedInTheWorkerLoop(t *testing.T) {
 	big := make([]byte, 3<<20)
 	e, addr := startFDLEngine(t, bigBodyHandler{big: big}, nil)
@@ -417,30 +423,40 @@ func testHoldReleasedInTheWorkerLoop(t *testing.T) {
 	if _, err := get("/", 2*time.Second); err != nil {
 		t.Fatalf("warm-up request: %v", err)
 	}
-	tgt := &fdlTarget{}
+	tgt := &fdlTarget{refuse: true}
 	e.StartTransplant(tgt)
 	if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
 		t.Fatalf("write /big: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond) // served and held; its SEND waits on this client
+	if n := metric(t, e, "TransplantHeld"); n == 0 {
+		t.Fatal("the /big response was not held: the test exercised nothing")
+	}
 	e.StopTransplant()
+	state := func() string {
+		m := e.Metrics()
+		return "adopted=" + strconv.FormatInt(tgt.adopted.Load(), 10) +
+			" detached=" + strconv.FormatUint(m.TransplantDetached, 10) +
+			" refused=" + strconv.FormatUint(m.TransplantHandoffRefused, 10) +
+			" held=" + strconv.FormatUint(metric(t, e, "TransplantHeld"), 10) +
+			" closes=" + strconv.FormatUint(m.CloseCount, 10)
+	}
 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		t.Fatalf("read /big: %v", err)
+		t.Fatalf("read /big: %v (%s)", err, state())
 	}
 	n, err := io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	if err != nil || int(n) != len(big) {
-		t.Fatalf("read /big body: %d of %d bytes, err %v", n, len(big), err)
+		t.Fatalf("read /big body: %d of %d bytes, err %v (%s)", n, len(big), err, state())
 	}
 	if _, err := get("/", 2*time.Second); err != nil {
 		t.Fatalf("the request after a held response whose drain stopped got %v: the conn was "+
 			"left with no recv armed", err)
 	}
 	if tgt.adopted.Load() != 0 {
-		t.Fatalf("the conn was handed off (%d) although its SEND was in flight until the drain stopped",
-			tgt.adopted.Load())
+		t.Fatalf("the refusing target adopted %d conns", tgt.adopted.Load())
 	}
 	if n := metric(t, e, "TransplantHoldRescued"); n != 0 {
 		t.Fatalf("TransplantHoldRescued = %d, want 0: the release at the SEND completion did not run", n)
