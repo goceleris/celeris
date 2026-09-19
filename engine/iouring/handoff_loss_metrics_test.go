@@ -39,7 +39,8 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 // TestWorkersShareTheHandoffLossWitnesses proves createWorkers hands every
 // worker the ENGINE's witness set: an increment on any worker must be visible
 // through Engine.Metrics(). Skips where io_uring is unavailable, since
-// building a worker needs a real ring.
+// building a worker needs a real ring, unless CELERIS_REQUIRE_IOURING_WORKERS=1
+// forbids the skip (skipOrFail656).
 func TestWorkersShareTheHandoffLossWitnesses(t *testing.T) {
 	e, err := New(resource.Config{
 		Addr:      "127.0.0.1:0",
@@ -47,12 +48,12 @@ func TestWorkersShareTheHandoffLossWitnesses(t *testing.T) {
 		Resources: resource.Resources{Workers: 2},
 	}, transplantTestHandler{})
 	if err != nil {
-		t.Skipf("iouring engine unavailable: %v", err)
+		skipOrFail656(t, "iouring engine unavailable: %v", err)
 	}
 	resolved := e.cfg.Resources.Resolve()
 	workers, err := e.createWorkers(SelectTier(e.profile, 0), make([]int, resolved.Workers), resolved)
 	if err != nil {
-		t.Skipf("cannot create io_uring workers here: %v", err)
+		skipOrFail656(t, "cannot create io_uring workers here: %v", err)
 	}
 	t.Cleanup(func() {
 		for _, w := range workers {
