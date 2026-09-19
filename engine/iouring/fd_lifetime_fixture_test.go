@@ -365,18 +365,27 @@ func asyncParkFixture(t *testing.T, flags bool) (*fdlFixture, *goidHandler) {
 
 // asyncRequest delivers one request to f's promoted conn, reads its response
 // at the client, and waits until the dispatch goroutine that answered it has
-// reached its park: there it either claimed its own hand-off
-// (transplantPending, enqueued for the worker, and exited) or waits on its
+// reached its park: there it either claimed its own hand-off or waits on its
 // cond for the next request. It reports which, and the SQEs the delivery
-// placed.
+// placed. A claim counts once it is on the worker's detach queue
+// (detachQPending), the last step of making it: transplantPending is set
+// before the enqueue, so a drain run on seeing only that flag could find the
+// queue still empty.
 func (f *fdlFixture) asyncRequest(h *goidHandler) (claimed bool, placed []sqeRec) {
 	f.t.Helper()
 	n := len(h.served())
 	f.deliver(fdlGET)
 	placed = takeSQEs(f.w.ring)
 	fds := []unix.PollFd{{Fd: int32(f.peer), Events: unix.POLLIN}}
-	if k, err := unix.Poll(fds, 10000); err != nil || k != 1 {
-		f.t.Fatalf("no response at the client within 10s (poll %d, %v)", k, err)
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		k, err := unix.Poll(fds, int(max(time.Until(deadline).Milliseconds(), 0)))
+		if err == unix.EINTR { // the runtime's preemption signal
+			continue
+		}
+		if err != nil || k != 1 {
+			f.t.Fatalf("no response at the client within 10s (poll %d, %v)", k, err)
+		}
+		break
 	}
 	var resp [512]byte
 	if k, err := unix.Read(f.peer, resp[:]); err != nil || !strings.HasPrefix(string(resp[:max(k, 0)]), "HTTP/1.1 200") {
@@ -387,7 +396,7 @@ func (f *fdlFixture) asyncRequest(h *goidHandler) (claimed bool, placed []sqeRec
 		f.t.Fatalf("the handler ran %d times for one request", len(ids)-n)
 	}
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		if f.cs.transplantPending.Load() || f.w.detachQPending.Load() != 0 {
+		if f.w.detachQPending.Load() != 0 {
 			return true, placed
 		}
 		if goroutineWaitsOnCond(ids[n]) {
