@@ -52,7 +52,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Built-in metrics** — atomic counters, CPU-utilization sampling, on by default via `Server.Collector().Snapshot()` (opt out with `Config.DisableMetrics`).
 - **Per-route async dispatch** — `Route.Async()` / `Route.Sync()` choose inline-on-worker vs. per-conn dispatch goroutine per route; h2 chooses per stream.
 
-**TLS:** the io_uring / epoll engines speak cleartext only (HTTP/1.1 + h2c). Terminate TLS upstream (Caddy, Nginx, Envoy) or use the std engine for in-process HTTPS.
+**TLS:** celeris is cleartext by design: TLS is terminated at the edge. The io_uring and epoll engines speak HTTP/1.1 and h2c only, and there is no `ListenTLS`. Terminate TLS upstream (Caddy, Nginx, Envoy, a cloud load balancer). If you need HTTPS in-process, run the std engine and pass a TLS listener: `Engine: celeris.Std` with `StartWithListener(tls.NewListener(ln, cfg))` serves HTTPS over HTTP/1.1, at the std engine's performance. The database drivers are cleartext too (see [Database drivers](#database-drivers)). First-class TLS is tracked in [#446](https://github.com/goceleris/celeris/issues/446).
 
 ## Quick start
 
@@ -295,6 +295,13 @@ Celeris ships first-party, event-loop-native database drivers that run their soc
 
 Colocate a driver with the server via its `WithEngine` option so commands issue on the loop instead of dialing out on a blocking goroutine. See [goceleris.dev](https://goceleris.dev) for driver guides.
 
+The drivers have no TLS stack: connect them over a trusted network (loopback, a VPC, a private link) or through a TLS sidecar. They refuse rather than silently downgrade when TLS is mandatory:
+- Postgres returns `ErrSSLNotSupported` for `sslmode=require`, `verify-ca` and `verify-full`. `prefer` and `allow` connect in plaintext and print a warning.
+- Redis rejects `rediss://` addresses.
+- Memcached has no TLS option.
+
+Driver-side TLS is part of [#446](https://github.com/goceleris/celeris/issues/446).
+
 ## net/http compatibility
 
 Wrap existing `net/http` handlers and middleware:
@@ -321,6 +328,21 @@ The bridge buffers the adapted handler's response in memory, capped at a compile
 | `Std` | Any OS | Development, compatibility, non-Linux deploys |
 
 The default is **Adaptive** on Linux and **Std** elsewhere. Prefer Adaptive unless you have a specific reason to pin an engine; on non-Linux platforms only Std is available (the native engines return an error).
+
+### Tuning environment variables
+
+The engines read these at startup. None is needed for normal operation; to run a single engine with no switching, set `Config.Engine` instead.
+
+| Variable | Engine | Values (default in bold) | Effect |
+|----------|--------|--------------------------|--------|
+| `CELERIS_ADAPTIVE_START` | Adaptive | `epoll`, `iouring`, **`auto`** | Chooses the engine Adaptive **starts** on. It does not turn off runtime switching. Unrecognized values mean `auto`. |
+| `CELERIS_MAX_IOURING_TIER` | io_uring | `optional`, `high`, `base`, `none` (**unset: detected tier**) | Caps the io_uring feature tier below what the kernel supports; for exercising fallback paths. Any other value, typos included, counts as `none`, and at `none` the io_uring engine reports io_uring as unavailable. |
+| `CELERIS_IOURING_SEND_ZC` | io_uring | `on`/`1`/`true`, `off`/`0`/`false`, **`auto`** | Zero-copy send. `auto` enables it where the startup probe finds SEND_ZC working; `on` cannot enable it where the probe failed. Unrecognized values mean `auto` and log a warning. |
+| `CELERIS_IOURING_MULTISHOT_RECV` | io_uring | `1` (**unset: off**) | Multishot receive into a provided-buffer ring (high tier, 5.19+). Any value other than `1` leaves it off. |
+| `CELERIS_IOURING_PBUF_COUNT` | io_uring | positive integer (**1024**) | Provided-buffer-ring entries per worker; used only with multishot receive. Rounded up to a power of two and clamped to 1024–32768. `0` or an invalid value keeps the default. |
+| `CELERIS_IOURING_FIXED_FILES` | io_uring | **do not set** | Development only. Fixed-file support is incomplete ([#541](https://github.com/goceleris/celeris/issues/541)); enabling it makes connections read from unrelated descriptors. |
+
+Variables named `CELERIS_DEBUG_*` and `CELERIS_ADAPTIVE_DEBUG` turn on diagnostic logging and measurement probes. They are for investigating a specific problem and are not a stable interface.
 
 ## Graceful shutdown
 
@@ -360,10 +382,10 @@ For Prometheus exposition and debug endpoints, use [`middleware/metrics`](middle
 | h2c | yes | yes | yes |
 | Auto-detect | yes | yes | yes |
 | CPU pinning | yes | yes | no |
-| Provided buffers | yes (5.19+) | no | no |
+| Provided buffers | opt-in, with multishot recv (5.19+) | no | no |
 | Multishot accept | yes (5.19+) | no | no |
 | Multishot recv | opt-in (5.19+, `CELERIS_IOURING_MULTISHOT_RECV=1`) | no | no |
-| Provided-buffer ring size | auto-scaled (`CELERIS_IOURING_PBUF_COUNT=N` to override) | n/a | n/a |
+| Provided-buffer ring size | 1024 entries per worker (`CELERIS_IOURING_PBUF_COUNT=N` to override) | n/a | n/a |
 | Zero-alloc HEADERS | yes | yes | no |
 | Inline h2 handlers | yes | yes | no |
 | Inline WS / SSE broadcast egress | yes | yes | n/a (net/http) |
