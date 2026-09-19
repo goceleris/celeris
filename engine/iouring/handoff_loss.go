@@ -24,10 +24,25 @@ import "sync/atomic"
 //     with res > 0 — bytes that were read from some socket and thrown
 //     away. Split by what Worker.closedOps holds for the CQE's (fd,
 //     generation) identity at that moment: a connection this worker
-//     closed (the peer's bytes raced a server-side close), one it handed
-//     off (the celeris#657 loss), or nothing registered. Counted once per
-//     CQE, so a multishot recv's intermediate F_MORE completions count
-//     too.
+//     closed or hijacked, one it handed off (the celeris#657 loss), or
+//     nothing registered. Counted once per CQE, so a multishot recv's
+//     intermediate F_MORE completions count too.
+//
+//     Closed is not proof of a benign race. hijackConn and the close
+//     paths all register through noteClosedInflight. After hijackConn
+//     the socket lives on under the hijacker's net.Conn, so a recv that
+//     completes with data before its cancel lands has read bytes from a
+//     connection its client is still using. After a close, a recv that
+//     had not reached the kernel yet resolves the fd NUMBER when it does,
+//     and a new connection may hold that number by then.
+//
+//     A stale CQE whose (fd, generation) equals the fd's current
+//     occupant's (a generation collision, which needs the process-wide
+//     32-bit connGenSeq to wrap while the op is in flight) is taken by
+//     staleConnCQE's live branch and counted in none of the three. That
+//     residual predates these counters (see the KNOWN RESIDUAL note in
+//     staleConnCQE).
+//
 //   - handoffInFlight: a hand-off (tryTransplant or finishAsyncTransplant)
 //     that detached a connection with recvArmed, a kernel op outstanding
 //     (kernelInflight != 0) or a SEND_ZC notification pending — the
