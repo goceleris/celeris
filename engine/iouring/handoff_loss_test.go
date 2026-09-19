@@ -198,6 +198,44 @@ func TestStaleRecvDataIgnoresCompletionsWithoutData(t *testing.T) {
 	}
 }
 
+// TestStaleRecvDataCountsEachMultishotCompletion: a multishot recv posts one
+// CQE per read, each with CQE_F_MORE except the last. Every one that read
+// bytes took a request, so each must count. Only the terminal CQE (no
+// F_MORE) owes the identity nothing more, so the identity must still be
+// registered after the F_MORE ones; otherwise the next completion would
+// count as Unattributed.
+func TestStaleRecvDataCountsEachMultishotCompletion(t *testing.T) {
+	const fd, gen = 13, 7
+	w := &Worker{conns: make([]*connState, 16), handoffLoss: &handoffLossStats{}}
+	gone := &connState{fd: fd, generation: gen, kernelInflight: 1, recvArmed: true}
+	w.noteHandedOffInflight(gone)
+
+	for i, res := range []int32{21, 34} {
+		c := staleRecv(fd, gen, res)
+		c.Flags = cqeFMore
+		if !w.staleConnCQE(c, fd, c.UserData) {
+			t.Fatalf("F_MORE completion %d of a handed-off conn was not reported stale", i+1)
+		}
+		if got := w.handoffLoss.staleRecvDataTransplanted.Load(); got != uint64(i+1) {
+			t.Errorf("after F_MORE completion %d, Transplanted = %d, want %d", i+1, got, i+1)
+		}
+		if w.closedOps[encodeConnOpKey(fd, gen)] == nil {
+			t.Fatalf("F_MORE completion %d retired the identity while the multishot recv is still armed", i+1)
+		}
+	}
+	last := staleRecv(fd, gen, 55) // terminal: no F_MORE
+	if !w.staleConnCQE(last, fd, last.UserData) {
+		t.Fatal("the terminal completion of a handed-off conn was not reported stale")
+	}
+	got := readHandoffLoss(w.handoffLoss)
+	if got.transplanted != 3 || got.closed != 0 || got.unattributed != 0 {
+		t.Errorf("three data completions of one multishot recv counted as %+v, want exactly 3 Transplanted", got)
+	}
+	if len(w.closedOps) != 0 {
+		t.Errorf("closedOps holds %d entries after the terminal completion, want 0", len(w.closedOps))
+	}
+}
+
 // TestTransplantHandoffInFlightCountsTryTransplant pins the precondition
 // witness on the sync hand-off site: it counts a hand-off made with a recv
 // armed, a kernel op outstanding, or a SEND_ZC notification pending, and
