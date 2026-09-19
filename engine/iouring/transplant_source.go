@@ -76,11 +76,26 @@ func (w *Worker) tryTransplant(fd int) {
 	}
 	// Promoted async conn — owned by its dispatch goroutine, which self-transplants
 	// at its own park boundary. Skip here to avoid racing it.
+	//
+	// One owner per hand-off (celeris#657, A6): a goroutine that has parked
+	// and claimed its own hand-off (transplantPending) has exited too, so
+	// asyncRun alone reads as "not running" and this path used to move the
+	// conn as if it were sync — then drainDetachQueue's finishAsyncTransplant
+	// moved it again, dup'ing a descriptor number the first move had closed
+	// and the process had reused (measured: one identity moved twice, 20 us
+	// apart, in 1 of 167 runs, the run with the only negative gauge). The
+	// goroutine sets the claim and clears asyncRun under asyncInMu, so both
+	// are read under it here.
 	if w.async {
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
+		claimed := cs.transplantPending.Load()
 		cs.asyncInMu.Unlock()
 		if running {
+			return
+		}
+		if claimed {
+			w.handoffLoss.noteDoubleClaim()
 			return
 		}
 	}
@@ -250,6 +265,14 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	h := w.transplant.Load()
 	if h == nil {
 		return // drain stopped — leave the conn; next recv respawns its goroutine
+	}
+	// One owner per hand-off (celeris#657, A6): act only for the connState
+	// that still owns its slot. If anything else moved or closed it since the
+	// goroutine's claim, cs.fd is a number some other connection may hold by
+	// now, and dup'ing it would hand that connection off.
+	if cs.fd < 0 || cs.fd >= len(w.conns) || w.conns[cs.fd] != cs || cs.closing {
+		w.handoffLoss.noteDoubleClaim()
+		return
 	}
 	// Re-validate egress here, on the worker thread (celeris#529).
 	//
