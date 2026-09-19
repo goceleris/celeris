@@ -189,6 +189,18 @@ func runPauseQueued662(t *testing.T, pause bool) {
 	for i, c := range queuedConns {
 		wg.Go(func() { outcomes[i] = readOutcome662(c) })
 	}
+	// Wait for the blockers' responses too, though they are not scored. A
+	// blocker that landed on a loop already held sits in that loop's queue
+	// until the loop comes back, and nothing orders its accept before the
+	// queued connections' responses: when every queued connection hashes to
+	// another loop, all of them can answer first and AcceptCount reads one
+	// short. That happened once on a GitHub runner (epoll: 10 of 11, and 11
+	// after the clients closed). A response exists only after its connection
+	// was accepted and counted, so once every client has one the count below
+	// is exact.
+	for _, c := range clients[:blockers] {
+		wg.Go(func() { _ = readOutcome662(c) })
+	}
 	wg.Wait()
 	tally := map[string]int{}
 	for _, o := range outcomes {
