@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,17 +59,76 @@ func newRampAdaptive(t *testing.T, h stream.Handler, cfg resource.Config) (*Engi
 	return e, e.Addr().String(), func() { cancel(); <-done }
 }
 
+// errExemplarCap bounds how many DISTINCT verbatim error strings are retained
+// for printing. It does NOT bound counting -- see recordErr.
+const errExemplarCap = 200
+
 var (
 	errSampleMu sync.Mutex
-	errSamples  = map[string]int{}
+	// errSamples holds verbatim exemplars, capped at errExemplarCap distinct
+	// keys. Keys embed the client's ephemeral port, so they are effectively
+	// unique per connection and this map saturates quickly by design.
+	errSamples = map[string]int{}
+	// errClassCount counts EVERY error by class, with no cap. The class is
+	// port-free, so its cardinality is small and it cannot saturate.
+	errClassCount = map[string]int{}
+	// errTotalCount is every error recorded, whatever its class.
+	errTotalCount int
 )
 
+// errClass662 reduces an error string to a low-cardinality class by dropping
+// the addresses. "read: read tcp 127.0.0.1:43960->127.0.0.1:37641: i/o
+// timeout" becomes "read: timeout". Without this the only key available
+// embeds an ephemeral port and every connection invents a new one.
+func errClass662(s string) string {
+	kind, rest, found := strings.Cut(s, ": ")
+	if !found {
+		return s
+	}
+	switch {
+	case strings.Contains(rest, "connection reset by peer"):
+		return kind + ": reset"
+	case strings.Contains(rest, "i/o timeout"):
+		return kind + ": timeout"
+	case strings.Contains(rest, "connection refused"):
+		return kind + ": refused"
+	case strings.Contains(rest, "broken pipe"):
+		return kind + ": broken pipe"
+	case strings.HasSuffix(rest, "EOF"):
+		return kind + ": EOF"
+	default:
+		return kind + ": other"
+	}
+}
+
+// recordErr counts every error and retains a bounded sample of exemplars.
+//
+// It used to guard the whole tally on map SIZE:
+//
+//	if len(errSamples) < 200 { errSamples[s]++ }
+//
+// Its keys embed the client's ephemeral port, so each connection produced a
+// new key and the map filled after ~200 errors -- after which even a REPEAT
+// of a key already held stopped being counted. Every figure read off it past
+// that point was a floor rather than a count, and a "0 of kind X" reading was
+// not concludable at all: X may simply never have won one of the 200 slots.
+// Counting is therefore now unbounded and per class; only the verbatim
+// exemplars are capped, and a key already present keeps counting.
 func recordErr(s string) {
 	errSampleMu.Lock()
-	if len(errSamples) < 200 {
+	errTotalCount++
+	errClassCount[errClass662(s)]++
+	if _, seen := errSamples[s]; seen || len(errSamples) < errExemplarCap {
 		errSamples[s]++
 	}
 	errSampleMu.Unlock()
+}
+
+// resetErrCensus662 clears the census. Callers already hold errSampleMu.
+func resetErrCensus662() {
+	errSamples = map[string]int{}
+	errClassCount = map[string]int{}
+	errTotalCount = 0
 }
 
 func aconns(e engine.Engine) int64 {
@@ -88,10 +148,19 @@ func apromoted(e engine.Engine) uint64 {
 func dumpErrSamples(t *testing.T) {
 	errSampleMu.Lock()
 	defer errSampleMu.Unlock()
-	for s, n := range errSamples {
-		t.Logf("  err sample (%dx): %s", n, s)
+	// The class tally first, because it is the only COMPLETE one: it counts
+	// every error, while the exemplars below stop at errExemplarCap distinct
+	// keys and are a sample, not a census.
+	t.Logf("  err census: total=%d classes=%v", errTotalCount, errClassCount)
+	if len(errSamples) >= errExemplarCap {
+		t.Logf("  err exemplars: %d distinct keys retained (cap %d reached -- "+
+			"the exemplar SET is truncated; the class tally above is not)",
+			len(errSamples), errExemplarCap)
 	}
-	errSamples = map[string]int{}
+	for s, n := range errSamples {
+		t.Logf("  err exemplar (%dx): %s", n, s)
+	}
+	resetErrCensus662()
 }
 
 // rampPool manages a dynamically-sized set of keep-alive clients so a test can
@@ -506,7 +575,7 @@ func rampScenario(t *testing.T, h stream.Handler, cfg resource.Config, client fu
 	p.ok.Store(0)
 	p.errc.Store(0)
 	errSampleMu.Lock()
-	errSamples = map[string]int{}
+	resetErrCensus662()
 	errSampleMu.Unlock()
 	// io_uring exists now, so its real worker count fixes the revert band.
 	bands.refineLow(t, e)
@@ -662,7 +731,7 @@ func TestRampAutoMixedH1H2(t *testing.T) {
 	h2.ok.Store(0)
 	h2.errc.Store(0)
 	errSampleMu.Lock()
-	errSamples = map[string]int{}
+	resetErrCensus662()
 	errSampleMu.Unlock()
 
 	for i, ph := range []struct {
@@ -722,7 +791,7 @@ func TestRampAutoMixedAsync(t *testing.T) {
 	h2.ok.Store(0)
 	h2.errc.Store(0)
 	errSampleMu.Lock()
-	errSamples = map[string]int{}
+	resetErrCensus662()
 	errSampleMu.Unlock()
 
 	for i, ph := range []struct {

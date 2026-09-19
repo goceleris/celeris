@@ -135,8 +135,12 @@ func (w *Worker) tryTransplant(fd int) {
 	if w.transplantDetached != nil {
 		w.transplantDetached.Add(1)
 	}
+	// celeris#657 witnesses: a hand-off made with an op still in flight,
+	// and the identity marked as handed off, so a stale recv that later
+	// reads a request is counted as this hand-off's loss.
+	w.noteHandoffInFlight(cs)
 	w.cancelConnOps(fd, cs)
-	w.noteClosedInflight(cs)
+	w.noteHandedOffInflight(cs)
 	w.queuePendingRelease(cs)
 	_ = unix.Close(fd)
 
@@ -266,8 +270,10 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	if w.transplantDetached != nil {
 		w.transplantDetached.Add(1)
 	}
+	// The same celeris#657 witnesses as tryTransplant's.
+	w.noteHandoffInFlight(cs)
 	w.cancelConnOps(fd, cs)
-	w.noteClosedInflight(cs)
+	w.noteHandedOffInflight(cs)
 	// Detached release: the dispatch goroutine may still be in its deferred
 	// recover()/Done() block referencing cs; hold cs alive (no pool recycle) until
 	// the kernel recv drains. Mirrors finishCloseDetached.

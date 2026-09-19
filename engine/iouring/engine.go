@@ -82,6 +82,10 @@ type Engine struct {
 		detachWindowCloses atomic.Uint64
 		// zc holds the SEND_ZC exposure witnesses (celeris#591).
 		zc zcStats
+		// handoffLoss holds the celeris#657 hand-off loss witnesses: stale
+		// recv data by identity class, and hand-offs made with an op in
+		// flight.
+		handoffLoss handoffLossStats
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -345,6 +349,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.closeMissingConnState = &e.metrics.closeMissingConnState
 		w.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
 		w.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
+		w.handoffLoss = &e.metrics.handoffLoss // celeris#657 witnesses
 		workers[i] = w
 	}
 	return workers, nil
@@ -436,6 +441,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantHandoffRefused:    e.metrics.transplantHandoffRefused.Load(),
 		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
 		CloseMissingConnState:       e.metrics.closeMissingConnState.Load(),
+
+		StaleRecvDataClosed:       e.metrics.handoffLoss.staleRecvDataClosed.Load(),
+		StaleRecvDataTransplanted: e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
+		StaleRecvDataUnattributed: e.metrics.handoffLoss.staleRecvDataUnattributed.Load(),
+		TransplantHandoffInFlight: e.metrics.handoffLoss.handoffInFlight.Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).

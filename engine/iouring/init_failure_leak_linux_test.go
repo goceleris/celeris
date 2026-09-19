@@ -42,6 +42,10 @@ var errInjected656 = errors.New("injected worker init failure (celeris#656)")
 // dedicated `iouring` CI job raises memlock and sets this, exactly as the
 // `adaptive` job does with CELERIS_REQUIRE_UPSWITCH (celeris#641), so that job
 // cannot go green without running them.
+//
+// newTestRing and TestWorkersShareTheHandoffLossWitnesses honour it too, so the
+// `unit` job's celeris#657 step, which runs those witness tests by name, cannot
+// go green by skipping them either.
 const envRequireIOUring656 = "CELERIS_REQUIRE_IOURING_WORKERS"
 
 // skipOrFail656 skips with the given reason, or fails when the environment

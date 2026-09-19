@@ -429,6 +429,61 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// close (the slot holder may close the same number later) and so
 	// leaks by design.
 	TransplantAdoptRefused uint64
+	// StaleRecvDataClosed, StaleRecvDataTransplanted and
+	// StaleRecvDataUnattributed count io_uring recv completions that READ
+	// BYTES but arrived for a connection identity (fd, generation) that no
+	// longer owns the descriptor, so the engine dropped them (celeris#657).
+	// Each one is data taken off some socket and discarded: a request a
+	// client sent and will never get an answer to. Before these existed the
+	// drop left no trace at all, and the hand-off ledger above balanced
+	// exactly while requests went missing.
+	//
+	// The three are split by what the engine still holds for the identity
+	// when the completion arrives:
+	//
+	//   - Closed: a connection this engine closed or hijacked (the close
+	//     paths and Hijack register the identity the same way). Usually
+	//     the client's bytes raced a server-side close, and that client
+	//     sees its connection end. It is not always benign, so a non-zero
+	//     Closed does not prove that no live client lost a request. After
+	//     a Hijack the socket lives on under the hijacker's net.Conn, so a
+	//     recv that completes with data before its cancel lands has taken
+	//     the first bytes of a connection its client is still using. And a
+	//     recv that had not reached the kernel when the descriptor was
+	//     closed resolves the descriptor NUMBER when it does; if a new
+	//     connection holds that number by then, the recv reads that
+	//     client's request.
+	//   - Transplanted: a connection this engine handed to the other
+	//     sub-engine. A recv armed before the hand-off outlived it and
+	//     read a request meant for the new owner — or, through a reused
+	//     descriptor number, for a different connection altogether. This
+	//     is the celeris#657 loss.
+	//   - Unattributed: nothing registered for the identity.
+	//
+	// The three do not cover every stale read. A completion is known to
+	// be stale only because its (fd, generation) differs from the
+	// descriptor's current occupant. One whose pair matches the occupant,
+	// a generation collision, is taken for the occupant's own completion
+	// and counted in none of them. Generations come from one process-wide
+	// 32-bit sequence, so a collision needs the sequence to wrap while the
+	// op is still in flight. This residual predates these counters; see
+	// the generation-collision note in the io_uring engine's staleConnCQE.
+	//
+	// All three are io_uring-only and cumulative; zero on other engines.
+	// On the adaptive engine each is the sum over both sub-engines.
+	StaleRecvDataClosed       uint64
+	StaleRecvDataTransplanted uint64
+	StaleRecvDataUnattributed uint64
+	// TransplantHandoffInFlight is the cumulative number of io_uring
+	// hand-offs (the reverse, io_uring→epoll, transplant) that detached a
+	// connection while an operation was still outstanding on it: a recv
+	// armed, any kernel op in flight, or a SEND_ZC notification pending.
+	// It is the precondition of every StaleRecvDataTransplanted — a hand-off
+	// with nothing in flight cannot leave a recv behind — and it is
+	// counted whether or not that recv then reads anything (celeris#657).
+	// io_uring-only; zero on other engines. On the adaptive engine it is
+	// the sum over both sub-engines.
+	TransplantHandoffInFlight uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and

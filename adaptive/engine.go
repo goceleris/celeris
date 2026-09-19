@@ -1068,6 +1068,16 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantStranded:       pm.TransplantStranded + sm.TransplantStranded,
 		TransplantAdoptRefused:   pm.TransplantAdoptRefused + sm.TransplantAdoptRefused,
 		CloseMissingConnState:    pm.CloseMissingConnState + sm.CloseMissingConnState,
+		// The celeris#657 hand-off loss witnesses. io_uring-only and
+		// cumulative, and each event (a stale data CQE, a hand-off) happens
+		// on exactly one sub-engine, so the sum counts events once. After a
+		// switch the stale CQEs keep arriving on the sub-engine that made
+		// the hand-off, which is now the standby: dropping the standby's
+		// half would hide exactly the loss these exist to report.
+		StaleRecvDataClosed:       pm.StaleRecvDataClosed + sm.StaleRecvDataClosed,
+		StaleRecvDataTransplanted: pm.StaleRecvDataTransplanted + sm.StaleRecvDataTransplanted,
+		StaleRecvDataUnattributed: pm.StaleRecvDataUnattributed + sm.StaleRecvDataUnattributed,
+		TransplantHandoffInFlight: pm.TransplantHandoffInFlight + sm.TransplantHandoffInFlight,
 
 		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
 		// so the epoll half contributes zero and a switch simply moves which

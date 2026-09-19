@@ -189,7 +189,15 @@ type pendingReleaseEntry struct {
 // count drains (release-late is safe; release-early is the UAF).
 type closedOpsEntry struct {
 	inflight int32
-	conns    []*connState
+	// handoff marks an identity a conn left through a transplant hand-off
+	// rather than a close (noteHandedOffInflight), so a stale recv CQE that
+	// carried data for it is counted as a hand-off loss (celeris#657). It
+	// is read only by that counter and changes nothing else. It sits in
+	// inflight's padding, so on 64-bit platforms the entry stays 32 bytes
+	// (TestClosedOpsEntryStaysThirtyTwoBytes). 32-bit platforms have no
+	// padding there, and the entry grows from 16 to 20 bytes.
+	handoff bool
+	conns   []*connState
 }
 
 // pendingReleaseHoldNanos is the WALL-CLOCK BACKSTOP for releasing a
@@ -351,6 +359,10 @@ type Worker struct {
 	// (celeris#624).
 	transplantHandoffRefused *atomic.Uint64 // target refused an already-relinquished fd
 	transplantAdoptRefused   *atomic.Uint64 // adoption refused for a reason other than a taken slot
+	// handoffLoss is the engine-wide celeris#657 witness set: stale recv
+	// data by identity class and hand-offs made with an op in flight.
+	// nil-safe so a bare test Worker literal can skip it.
+	handoffLoss *handoffLossStats
 	// recvArm is the engine-wide recv-arming witness set (celeris#586);
 	// nil-safe so a bare test Worker literal can skip it.
 	recvArm *recvArmStats
@@ -1477,10 +1489,12 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			}
 			// KNOWN RESIDUAL — gen-collision misroute. A closed
 			// predecessor's terminal CQE that arrives after this fd was
-			// re-occupied by a conn with a COLLIDING generation (gens are
-			// per-connState-object; 1/65536 per reuse with the 16-bit
-			// tag) is indistinguishable from the live conn's own CQE and
-			// lands here. The clamp below only stops an already-drained
+			// re-occupied by a conn with a COLLIDING generation (the
+			// generation is the process-wide 32-bit connGenSeq, so this
+			// needs 2^32 accepts while the predecessor's op is still
+			// owed; see connGenSeq for the windows that allow it) is
+			// indistinguishable from the live conn's own CQE and lands
+			// here. The clamp below only stops an already-drained
 			// counter going negative; a misdecrement from >=1 DOES
 			// under-count the live conn (and may clear recvArmed above
 			// with its recv still kernel-armed), so its own close can
@@ -1498,6 +1512,14 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			}
 		}
 		return false
+	}
+	// A stale recv that read bytes threw away bytes some client sent
+	// (for a handed-off conn, a request that client is still waiting
+	// on; see handoffLossStats for what each class means). Count it by
+	// its identity's class BEFORE noteStaleTerminalOp can retire that
+	// identity (celeris#657).
+	if op == udRecv && c.Res > 0 {
+		w.noteStaleRecvData(ud)
 	}
 	if terminalOp {
 		w.noteStaleTerminalOp(ud)

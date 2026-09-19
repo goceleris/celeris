@@ -11,13 +11,16 @@ import (
 
 // newTestRing creates a bare io_uring for unit tests that need to observe SQE
 // submission. Skips the test when io_uring is unavailable (CI runners without
-// the syscall, or RLIMIT_MEMLOCK too low). Plain flags (no SINGLE_ISSUER /
-// SQPOLL) keep it usable from the test goroutine without OS-thread pinning.
+// the syscall, or RLIMIT_MEMLOCK too low), or fails it when
+// CELERIS_REQUIRE_IOURING_WORKERS=1 forbids that skip (skipOrFail656): a CI
+// step that runs these tests by name must not go green by skipping them. Plain
+// flags (no SINGLE_ISSUER / SQPOLL) keep it usable from the test goroutine
+// without OS-thread pinning.
 func newTestRing(t *testing.T) *Ring {
 	t.Helper()
 	ring, err := NewRing(64, 0, 0)
 	if err != nil {
-		t.Skipf("io_uring unavailable: %v", err)
+		skipOrFail656(t, "io_uring unavailable: %v", err)
 	}
 	t.Cleanup(func() { _ = ring.Close() })
 	return ring
