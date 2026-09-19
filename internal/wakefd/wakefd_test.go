@@ -168,8 +168,20 @@ func TestConcurrentSetAndSignal(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			for range 200 {
+			// Signal at least 200 times, and keep going until this producer
+			// has seen the Set land, then once more. Every producer therefore
+			// signals after the Set whatever order the scheduler picks, which
+			// the assertion below depends on. A fixed 200 let all 3,200
+			// Signals finish before the Set goroutine ran, and the test then
+			// failed with nothing wrong (seen once on a GitHub runner). The
+			// cap only stops a producer spinning forever if Set never lands.
+			seen := false
+			for i := 0; i < 1<<20; i++ {
 				w.Signal()
+				if seen && i >= 200 {
+					return
+				}
+				seen = seen || w.FD() == owned
 			}
 		}()
 	}
