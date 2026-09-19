@@ -123,19 +123,18 @@ type Loop struct {
 	// errs is the engine-wide per-cause ErrorCount breakdown, shared by
 	// every loop (celeris#645). There is no aggregate counter beside it:
 	// EngineMetrics.ErrorCount is the sum of these buckets.
-	errs                  *errclass.Counters
-	asyncPromoted         *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
-	acceptCount           *atomic.Uint64 // cumulative accepts (engine-wide, shared)
-	mutantSkipFirstAccept bool           // MUTANT: negative control, removed by the next commit
-	closeCount            *atomic.Uint64 // cumulative closes (engine-wide, shared)
-	bytesRead             *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
-	bytesWritten          *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
-	reqBatch              uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 3 increment sites, all on the loop (celeris#626)
-	bytesReadBatch        uint64         // batched recv bytes, flushed to bytesRead per iteration
-	bytesWrittenBatch     uint64         // batched send bytes, flushed to bytesWritten per iteration
-	tickCounter           uint32
-	consecutiveEmpty      uint32 // consecutive iterations with no events (for adaptive timeout)
-	cachedNow             int64  // cached time.Now().UnixNano(), refreshed once per events return
+	errs              *errclass.Counters
+	asyncPromoted     *atomic.Uint64 // cumulative inline → dispatch promotions (#300)
+	acceptCount       *atomic.Uint64 // cumulative accepts (engine-wide, shared)
+	closeCount        *atomic.Uint64 // cumulative closes (engine-wide, shared)
+	bytesRead         *atomic.Uint64 // cumulative recv payload bytes (engine-wide, shared)
+	bytesWritten      *atomic.Uint64 // cumulative send payload bytes (engine-wide, shared)
+	reqBatch          uint64         // batched request count, flushed to reqCount per iteration; WORKER-THREAD-ONLY, 3 increment sites, all on the loop (celeris#626)
+	bytesReadBatch    uint64         // batched recv bytes, flushed to bytesRead per iteration
+	bytesWrittenBatch uint64         // batched send bytes, flushed to bytesWritten per iteration
+	tickCounter       uint32
+	consecutiveEmpty  uint32 // consecutive iterations with no events (for adaptive timeout)
+	cachedNow         int64  // cached time.Now().UnixNano(), refreshed once per events return
 
 	// The #383 transplant ledger, engine-wide and shared like the counters
 	// above; all of them are nil-safe so a bare test Loop literal can skip
@@ -937,11 +936,7 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		}
 		cs.writeFn = l.makeWriteFn(cs)
 		l.activeConns.Add(1)
-		if !l.mutantSkipFirstAccept { // MUTANT: negative control, removed by the next commit
-			l.mutantSkipFirstAccept = true
-		} else {
-			l.acceptCount.Add(1)
-		}
+		l.acceptCount.Add(1)
 
 		if l.cfg.OnConnect != nil {
 			l.cfg.OnConnect(cs.remoteAddr)
