@@ -470,34 +470,38 @@ const (
 )
 
 // asyncCancelProbe is what probeAsyncCancelFlags learned. Only
-// asyncCancelAccepted turns the hand-off's reap on; the other two keep it
-// off, and they are told apart because they mean different things
-// (celeris#681 R2): a rejection is the kernel's answer, a probe that got no
-// answer says nothing about the kernel.
+// asyncCancelAccepted turns the hand-off's reap on; the others keep it off,
+// and they are told apart because they mean different things (celeris#681
+// R2): a rejection is the kernel's answer, a probe that got no answer says
+// nothing about the kernel.
+//
+// The zero value is asyncCancelNoAnswer (celeris#681 N3), so an answer that
+// was never set reads as no answer and keeps the reap off, never as
+// accepted.
 type asyncCancelProbe uint8
 
 const (
+	// asyncCancelNoAnswer: the probe failed before the kernel answered. Its
+	// ring could not be set up, the submit or the wait failed, no completion
+	// came, or the completion was not the probe's cancel. The zero value.
+	asyncCancelNoAnswer asyncCancelProbe = iota
 	// asyncCancelAccepted: the kernel completed the probe's cancel and
 	// accepted its IORING_ASYNC_CANCEL flags.
-	asyncCancelAccepted asyncCancelProbe = iota
+	asyncCancelAccepted
 	// asyncCancelRejected: the kernel completed the probe's cancel without
 	// accepting the flags: -EINVAL, as every kernel before 5.19 answers, or
 	// a result the probe does not recognise.
 	asyncCancelRejected
-	// asyncCancelNoAnswer: the probe failed before the kernel answered. Its
-	// ring could not be set up, the submit or the wait failed, no completion
-	// came, or the completion was not the probe's cancel.
-	asyncCancelNoAnswer
 )
 
 func (p asyncCancelProbe) String() string {
 	switch p {
+	case asyncCancelNoAnswer:
+		return "no answer"
 	case asyncCancelAccepted:
 		return "accepted"
 	case asyncCancelRejected:
 		return "rejected"
-	case asyncCancelNoAnswer:
-		return "no answer"
 	}
 	return fmt.Sprintf("asyncCancelProbe(%d)", uint8(p))
 }

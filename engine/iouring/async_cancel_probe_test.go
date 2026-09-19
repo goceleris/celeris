@@ -48,6 +48,9 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 		}
 	}
 
+	// An answer never set keeps the reap off (celeris#681 N3).
+	t.Run("zero_value_is_no_answer", probeZeroValueIsNoAnswer)
+
 	// The probe's ring cannot be set up: nothing reached the kernel.
 	t.Run("no_answer_is_not_a_rejection", func(t *testing.T) {
 		saved := newAsyncCancelProbeRing
