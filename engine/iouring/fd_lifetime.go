@@ -2,7 +2,11 @@
 
 package iouring
 
-import "golang.org/x/sys/unix"
+import (
+	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/engine"
+)
 
 // The fd-lifetime rule of the io_uring→epoll hand-off (celeris#657, face 2):
 // a connection leaves io_uring only when no read can still resolve its
@@ -170,4 +174,29 @@ func (w *Worker) retryReaps() {
 		w.rerunHandOff(fd, cs)
 	}
 	w.reapRetrySpare = keys[:0]
+}
+
+// holdEligible reports whether cs's response, about to be flushed, can be
+// sent with its next recv HELD: exactly the conns tryTransplant would hand off
+// at that SEND's completion (plain HTTP/1 at a clean boundary, not detached,
+// not H2, not a promoted async conn, nothing pending) and only when a SEND is
+// coming, since that completion is what releases the hold. Worker thread,
+// under cs.detachMu when the conn has one.
+func (w *Worker) holdEligible(cs *connState) bool {
+	if cs.fixedFile || cs.recvPaused || cs.closing {
+		return false
+	}
+	if !cs.detected || cs.h1State == nil || engine.Protocol(cs.protocol.Load()) != engine.HTTP1 {
+		return false
+	}
+	if cs.h1State.Detached.Load() || cs.h2State != nil || cs.asyncH2Promoted.Load() {
+		return false
+	}
+	if w.async && cs.asyncPromoted.Load() {
+		return false
+	}
+	if !cs.h1State.AtRequestBoundary() || cs.h1State.HasPendingData() {
+		return false
+	}
+	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
 }

@@ -2566,21 +2566,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 				return
 			}
 		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
-		if w.flushSend(cs) {
-			w.markDirty(cs)
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
-		if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-			if !w.prepareRecv(cs, w.pickRecvTarget(cs)) {
-				cs.needsRecv = true
-				w.markDirty(cs)
-			}
-		}
+		// The direct-body tail: flushed unlinked (the next recv may target
+		// the body buffer again), then a standalone recv — or none, held for
+		// a hand-off (celeris#657).
+		w.respondAndArm(cs, fd, c, false, false)
 		return
 	}
 
@@ -2974,34 +2963,60 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
 	// after SEND completes, eliminating one loop iteration per request.
 	cs.recvLinked = false
+	w.respondAndArm(cs, fd, c, true, true)
+}
+
+// respondAndArm is the one tail every H1 request path in handleRecv takes
+// once the request has produced its response (celeris#657): flush the
+// response, then arm the connection's next recv, chained behind the SEND
+// (link, single-shot recv only; flushSendLink falls back to an unlinked send
+// itself when it must) or standalone. capCheck applies the back-pressure
+// close of the sync tail.
+//
+// With a drain set and a conn the hand-off would take, the response is
+// flushed UNLINKED and no recv is armed at all (HOLD): the conn is handed off
+// at that SEND's completion with nothing in the kernel, or releaseHold arms
+// the recv there if it is not. With no drain set it places exactly the SQEs
+// the two tails placed before they shared it
+// (TestNoDrainSQESequenceIsUnchanged).
+func (w *Worker) respondAndArm(cs *connState, fd int, c *completionEntry, link, capCheck bool) {
 	// Hoist the detachMu load: the same mu is checked Lock and Unlock on
-	// the success path, plus once on the early-return overflow path. One
-	// pointer load instead of three.
+	// the success path, plus once on the early-return overflow path.
 	mu := cs.detachMu
 	if mu != nil {
 		mu.Lock()
 	}
 	// Back-pressure: capture pending size inside the lock so concurrent
 	// goroutine writes via the guarded writeFn don't race the read.
-	pending := len(cs.writeBuf) + len(cs.sendBuf)
-	if pending > cs.sendCap() {
+	if capCheck && len(cs.writeBuf)+len(cs.sendBuf) > cs.sendCap() {
 		if mu != nil {
 			mu.Unlock()
 		}
 		w.closeConn(fd)
 		return
 	}
-	if w.bufRing == nil {
+	hold := w.bufRing == nil && w.transplant.Load() != nil && w.holdEligible(cs)
+	switch {
+	case hold:
+		cs.transplantHold = true
+		w.handoffLoss.noteHeld()
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+	case link && w.bufRing == nil:
 		if w.flushSendLink(cs) {
 			w.markDirty(cs)
 		}
-	} else {
+	default:
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
 	}
 	if mu != nil {
 		mu.Unlock()
+	}
+	if hold {
+		return
 	}
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
