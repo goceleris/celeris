@@ -125,6 +125,41 @@ jobs:
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
           go test -race -count=1 -timeout=300s $pkgs
+      # celeris#657: the step above runs ./engine/iouring WITHOUT -v, so a skip
+      # there prints nothing and the package still reports `ok`. That is how the
+      # celeris#656 leak shipped with no cover. Five of the celeris#657 hand-off
+      # loss witness tests can skip: four build a ring through newTestRing, and
+      # one builds io_uring workers. So all eleven witness tests run again here
+      # by name, with the PASS-count interlock the `iouring` job uses
+      # (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1 to turn every
+      # environment skip into a failure, and an exact tally.
+      #
+      # The tally counts TOP-LEVEL results: `=== RUN   Name` with nothing after
+      # the name, and `--- PASS: Name (`. go test prints the elapsed time after
+      # the name, so the PASS pattern must not end at the name. The step also
+      # fails on ANY `--- SKIP` line. The expected count comes from the name
+      # list. memlock stays at the runner's 8 MiB, the shape the step above
+      # runs these tests in: they need one ring, not a worker per 12 MiB.
+      - name: celeris#657 hand-off loss witness tests (skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestStaleRecvDataCountsATransplantedConn|TestStaleRecvDataCountsAnAsyncTransplantedConn|TestStaleRecvDataCountsAClosedConn|TestStaleRecvDataCountsAnUnattributedIdentity|TestStaleRecvDataIgnoresCompletionsWithoutData|TestStaleRecvDataCountsEachMultishotCompletion|TestTransplantHandoffInFlightCountsTryTransplant|TestTransplantHandoffInFlightCountsFinishAsyncTransplant|TestMetricsCarriesTheHandoffLossWitnesses|TestWorkersShareTheHandoffLossWitnesses|TestClosedOpsEntryStaysThirtyTwoBytes'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/witness657.log
+          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/witness657.log || true)
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/witness657.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/witness657.log || true)
+          echo "celeris#657 witness tests: want $want, ran $ran, passed $passed, SKIP lines $skipped"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want top-level celeris#657 tests to run and PASS with no SKIP line --"
+            echo "was one renamed or removed, did one skip, or did one fail?"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
