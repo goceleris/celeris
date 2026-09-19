@@ -100,24 +100,39 @@ func (w *Worker) tryTransplant(fd int) {
 		return
 	}
 
-	// Dup the fd so epoll gets a clean, ops-free descriptor immediately while
-	// io_uring cancels + drains its armed recv on the original.
+	w.handOff(cs, fd, h, false)
+}
+
+// handOff is the commit point both hand-off sites share (tryTransplant for a
+// sync conn, finishAsyncTransplant for a promoted async one), reached only
+// after the caller's gates have passed. It dups the fd for epoll, detaches the
+// conn from io_uring the way hijackConn does (drop it from the live set and the
+// conn table, cancel what is still armed, defer the connState release to the
+// terminal CQEs), closes the ORIGINAL fd (the dup keeps the socket alive for
+// epoll) and hands the dup over. A failed dup leaves the conn untouched and
+// reports false; the hand-off is retried at the conn's next boundary.
+//
+// detachedRelease picks the release: the async site's dispatch goroutine may
+// still be in its deferred recover()/Done() block referencing cs, so that site
+// holds cs alive with no pool recycle until the kernel ops drain (mirrors
+// finishCloseDetached).
+func (w *Worker) handOff(cs *connState, fd int, h *transplantTargetHolder, detachedRelease bool) bool {
 	newFD, err := unix.Dup(fd)
 	if err != nil {
-		return
+		return false
 	}
 	if serr := unix.SetNonblock(newFD, true); serr != nil {
 		_ = unix.Close(newFD)
-		return
+		return false
 	}
 	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
 
-	// Detach from io_uring (mirror hijackConn): drop from live set/conn table,
-	// cancel the armed recv, defer the connState release to its terminal CQE, and
-	// close the ORIGINAL fd (the dup keeps the socket alive for epoll).
 	// Unlink from the dirty list (celeris#527): the original fd is closed
 	// below and its number may be re-accepted, so a dirty-loop retry would
-	// call prepareRecv on a stranger's socket.
+	// call prepareRecv on a stranger's socket. For the async site this is the
+	// one teardown path with no cs.sending guard at all, so it is the only
+	// way a detached connState reaches the list with a SEND in flight -- the
+	// immortal-entry case that pins the worker at 100% CPU (celeris#529).
 	w.removeDirty(cs)
 	w.removeLiveConn(cs)
 	w.conns[fd] = nil
@@ -141,12 +156,17 @@ func (w *Worker) tryTransplant(fd int) {
 	w.noteHandoffInFlight(cs)
 	w.cancelConnOps(fd, cs)
 	w.noteHandedOffInflight(cs)
-	w.queuePendingRelease(cs)
+	if detachedRelease {
+		w.queuePendingReleaseDetached(cs)
+	} else {
+		w.queuePendingRelease(cs)
+	}
 	_ = unix.Close(fd)
 
 	if err := h.target.AdoptConn(newFD, carry); err != nil {
 		w.reclaimTransplant(newFD, carry, err)
 	}
+	return true
 }
 
 // reclaimTransplant takes back a connection this worker had already
@@ -244,43 +264,5 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) != 0 || len(cs.writeBuf) != 0 {
 		return
 	}
-	fd := cs.fd
-	newFD, err := unix.Dup(fd)
-	if err != nil {
-		return // can't dup — leave the conn; transplant retried at its next park
-	}
-	if serr := unix.SetNonblock(newFD, true); serr != nil {
-		_ = unix.Close(newFD)
-		return
-	}
-	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
-
-	// Unlink from the dirty list (celeris#527). This is the one teardown
-	// path with no cs.sending guard at all, so it is the only way a detached
-	// connState reaches the list with a SEND in flight — the immortal-entry
-	// case that pins the worker at 100% CPU. See also celeris#529.
-	w.removeDirty(cs)
-	w.removeLiveConn(cs)
-	w.conns[fd] = nil
-	w.connCount--
-	w.activeConns.Add(-1)
-	// Same detach-for-transplant ledger entry as tryTransplant's, on the
-	// self-initiated async path — and, for the same reason, no closeCount
-	// bump: a detach is not a close (celeris#624).
-	if w.transplantDetached != nil {
-		w.transplantDetached.Add(1)
-	}
-	// The same celeris#657 witnesses as tryTransplant's.
-	w.noteHandoffInFlight(cs)
-	w.cancelConnOps(fd, cs)
-	w.noteHandedOffInflight(cs)
-	// Detached release: the dispatch goroutine may still be in its deferred
-	// recover()/Done() block referencing cs; hold cs alive (no pool recycle) until
-	// the kernel recv drains. Mirrors finishCloseDetached.
-	w.queuePendingReleaseDetached(cs)
-	_ = unix.Close(fd)
-
-	if err := h.target.AdoptConn(newFD, carry); err != nil {
-		w.reclaimTransplant(newFD, carry, err)
-	}
+	w.handOff(cs, cs.fd, h, true)
 }
