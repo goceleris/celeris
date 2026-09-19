@@ -371,10 +371,16 @@ func TestReapOnTheRunningKernel(t *testing.T) {
 				"is not what this kernel does", accepts, res, reason)
 		}
 		if !accepts {
+			// The kernel rejected the forced reap (TransplantReapFailed = 1)
+			// and left the recv armed: the conn leaves after its next, held,
+			// response. Logged so a run on such a kernel shows this branch ran.
 			if _, err := unix.Write(f.peer, []byte(fdlGET)); err != nil {
 				t.Fatalf("client write: %v", err)
 			}
 			run(t, f, "the next request", func() bool { return f.tgt.adopted.Load() == 1 })
+			t.Logf("celeris681 rejecting branch: the kernel failed the forced reap (TransplantReapFailed=%d), "+
+				"and the conn left after its held response (TransplantHeld=%d, adopted %d)",
+				f.e.metrics.handoffLoss.reapFailed.Load(), f.e.metrics.handoffLoss.held.Load(), f.tgt.adopted.Load())
 		}
 		if n := f.e.metrics.handoffLoss.handoffInFlight.Load(); n != 0 {
 			t.Fatalf("TransplantHandoffInFlight = %d, want 0", n)
