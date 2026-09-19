@@ -84,6 +84,18 @@ func (w *Worker) noteStaleRecvData(ud uint64) {
 // still held, or was about to be handed, an op on its descriptor. Called at
 // both hand-off sites after the hand-off is committed and before the close
 // path's cancels are queued. Worker thread only.
+//
+// When the accounting is consistent, kernelInflight != 0 alone would do.
+// Every arm that sets recvArmed (prepareRecv, flushSendLink's linked recv)
+// also counts the recv in kernelInflight. A SEND_ZC keeps its count until
+// its notification CQE, and that CQE is also what clears zcNotifPending.
+// The other two terms stay because that accounting has one known way to
+// go wrong. A generation-collision misroute (the KNOWN RESIDUAL in
+// staleConnCQE) can take kernelInflight to 0 while a recv is still armed
+// or a notification is still pending. The three terms are also the
+// condition the celeris#657 fix refuses a hand-off on, so this counts
+// exactly the hand-offs that fix removes. The unit tests check each term
+// on its own.
 func (w *Worker) noteHandoffInFlight(cs *connState) {
 	if w.handoffLoss == nil {
 		return

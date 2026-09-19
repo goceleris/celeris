@@ -200,8 +200,16 @@ func TestStaleRecvDataIgnoresCompletionsWithoutData(t *testing.T) {
 
 // TestTransplantHandoffInFlightCountsTryTransplant pins the precondition
 // witness on the sync hand-off site: it counts a hand-off made with a recv
-// armed, a kernel op outstanding, or a SEND_ZC notification pending — each
-// term on its own — and does not count one made with nothing in flight.
+// armed, a kernel op outstanding, or a SEND_ZC notification pending, and
+// does not count one made with nothing in flight.
+//
+// Each of the three single-term states differs from "nothing in flight" in
+// exactly one term, so removing any one term from the predicate fails this
+// test. A recv armed, or a notification pending, with kernelInflight at 0
+// is not what consistent accounting produces (arming either one also counts
+// it), but a generation-collision misroute can leave it behind; see
+// noteHandoffInFlight. The last state is the usual one: a recv armed and
+// counted.
 func TestTransplantHandoffInFlightCountsTryTransplant(t *testing.T) {
 	type state struct {
 		name                      string
@@ -211,9 +219,10 @@ func TestTransplantHandoffInFlightCountsTryTransplant(t *testing.T) {
 	}
 	states := []state{
 		{name: "nothing in flight", want: 0},
-		{name: "recv armed", recvArmed: true, kernelInflight: 1, want: 1},
+		{name: "recv armed only", recvArmed: true, want: 1},
 		{name: "kernel op only", kernelInflight: 1, want: 2},
 		{name: "SEND_ZC notif only", zcNotifPending: true, want: 3},
+		{name: "recv armed and counted", recvArmed: true, kernelInflight: 1, want: 4},
 	}
 	fds := make([]int, 0, len(states))
 	for range states {
