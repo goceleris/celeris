@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -310,6 +311,17 @@ func metricOr(e *Engine, name string) int64 {
 // ("0 of 128 busy conns were handed off"; celeris#681 N4).
 // async_without_cancel_flags runs that case on any kernel: the engine's probe
 // answer is taken as a rejection (runAsyncCancelProbe).
+//
+// Which of the two the async subtest wants is decided by the RUNNING KERNEL,
+// not by the probe's answer alone (celeris#681 M1). From 5.19 the kernel has
+// the flags, so there the reap must work and all 128 must be handed off; if
+// the engine's reap is off on such a kernel the subtest fails, naming the
+// probe's class from New's own record. Only a kernel that predates 5.19 may
+// take the weak branch. Chosen from the probe alone, a probe that got no
+// answer — an EMFILE or ENOMEM in its private ring, which N1 made a per-New
+// event — silently turned "all 128 handed off" into "none handed off", which
+// such a run passes trivially; this subtest is the registered killer of
+// mutants m01 and m04, so the mutation claim inherited that weakness.
 func TestHandoffHasNothingInFlight(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -317,11 +329,18 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 		noFlags bool
 	}{{"sync", false, false}, {"async", true, false}, {"async_without_cancel_flags", true, true}} {
 		t.Run(tc.name, func(t *testing.T) {
+			const conns = 128
 			var h stream.Handler = transplantTestHandler{}
+			var logs lockedBuffer
 			var mut func(*resource.Config)
 			if tc.async {
 				h = asyncRouteHandler{}
-				mut = func(c *resource.Config) { c.AsyncHandlers = true }
+				// New's own records, so a failure can name the probe's
+				// class without probing a second time (celeris#681 M1).
+				mut = func(c *resource.Config) {
+					c.AsyncHandlers = true
+					c.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+				}
 			}
 			if tc.noFlags {
 				saved := runAsyncCancelProbe
@@ -338,6 +357,31 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 			if tc.noFlags && e.asyncCancelFlags {
 				t.Fatal("New turned the reap on although the probe's answer was a rejection")
 			}
+			// celeris#681 M1: a kernel from 5.19 has IORING_ASYNC_CANCEL
+			// flags, so the reap must be on there and the strong branch
+			// below is the one that runs. Whatever kept it off — a probe
+			// with no answer, an answer the probe does not recognise, or a
+			// kernel that claims 5.19 and rejects them — is a failure of
+			// this subtest, not a reason to want less of it.
+			kernelHasFlags := e.profile.KernelMajor > 5 ||
+				(e.profile.KernelMajor == 5 && e.profile.KernelMinor >= 19)
+			if tc.async {
+				t.Logf("celeris681 M1 kernel=%s (%d.%d, a version with the flags: %v) forced_no_flags=%v reap=%v; %s",
+					e.profile.KernelVersion, e.profile.KernelMajor, e.profile.KernelMinor, kernelHasFlags,
+					tc.noFlags, e.asyncCancelFlags, asyncCancelProbeRecords(t, &logs))
+			}
+			if tc.async && !tc.noFlags && kernelHasFlags && !e.asyncCancelFlags {
+				t.Fatalf("the engine's cancel-flags probe did not find the flags accepted on kernel %s (%d.%d), "+
+					"which has had them since 5.19, so the hand-off's reap is off and no promoted async conn is "+
+					"offered for it: %s. A probe with no answer is the probe failing, not the kernel answering "+
+					"(its private ring can fail with EMFILE or ENOMEM, and celeris#681 N1 made that a per-New "+
+					"event); a rejection here is a kernel whose version claims the flags and does not have them. "+
+					"Either way the check below must stay 'all %d handed off' on this kernel and must not weaken "+
+					"to 'none handed off', which any run with the reap off passes trivially (celeris#681 M1). "+
+					"The no-flags path is async_without_cancel_flags, which forces it on every kernel.",
+					e.profile.KernelVersion, e.profile.KernelMajor, e.profile.KernelMinor,
+					asyncCancelProbeRecords(t, &logs), conns)
+			}
 			var maxSeen atomic.Uint64
 			tgt := &servingTarget{}
 			tgt.onAdopt = func() {
@@ -346,7 +390,6 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 				}
 			}
 			defer tgt.close()
-			const conns = 128
 			res := transplantUnderLoad(t, e, addr, conns, tgt, 300*time.Millisecond, 1500*time.Millisecond)
 			if tc.async {
 				if n := e.Metrics().AsyncPromotedConns; n == 0 {
@@ -365,6 +408,10 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 				t.Errorf("clients saw %d errors (%s), want 0", res.errs, classes(res.byClass))
 			}
 			got := tgt.adopted.Load()
+			// The weak branch. The gate above leaves it reachable only
+			// under async_without_cancel_flags, or on a kernel that
+			// predates 5.19 and so genuinely has no flags to find
+			// (celeris#681 M1).
 			if tc.async && !e.asyncCancelFlags {
 				t.Logf("celeris681 no cancel flags: %d of %d promoted async conns handed off (promotions %d)",
 					got, conns, e.Metrics().AsyncPromotedConns)
@@ -379,6 +426,34 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 			}
 		})
 	}
+}
+
+// asyncCancelProbeRecords describes what the engine's own probe said, from
+// the records New wrote to buf: its class from "io_uring engine selected"
+// (async_cancel_probe, logged on every kernel) and the reason from the
+// "async cancel flags ..." record New adds where the flags were not found
+// accepted. Reading New's records rather than calling the probe again keeps
+// the message about the engine under test: the answer a second probe gave
+// need not be the one this engine was built with (celeris#681 M1, N1).
+func asyncCancelProbeRecords(t *testing.T, buf *lockedBuffer) string {
+	t.Helper()
+	var parts []string
+	for _, r := range buf.records(t) {
+		msg, _ := r["msg"].(string)
+		switch {
+		case msg == "io_uring engine selected":
+			cls, _ := r["async_cancel_probe"].(string)
+			parts = append(parts, fmt.Sprintf("New's probe class=%q", cls))
+		case strings.HasPrefix(msg, "async cancel flags"):
+			level, _ := r["level"].(string)
+			reason, _ := r["reason"].(string)
+			parts = append(parts, fmt.Sprintf("%s %q reason=%q", level, msg, reason))
+		}
+	}
+	if len(parts) == 0 {
+		return "no probe record (this subtest gave New no log buffer)"
+	}
+	return strings.Join(parts, "; ")
 }
 
 // asyncRouteHandler is transplantTestHandler with every route async, so each
