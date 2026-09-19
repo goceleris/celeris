@@ -261,7 +261,8 @@ func transplantUnderLoad(t *testing.T, e *Engine, addr string, n int, tgt engine
 	e.StopTransplant()
 	time.Sleep(100 * time.Millisecond)
 	t.Logf("celeris657 load conns=%d ok=%d errs=%d classes=[%s] W1T=%d W1U=%d W1C=%d W2=%d "+
-		"held=%d reaps=%d misses=%d rescued=%d doubleclaim=%d detached=%d",
+		"held=%d reaps=%d misses=%d rescued=%d doubleclaim=%d detached=%d "+
+		"claimdeferred=%d reapfailed=%d reapunsupported=%d",
 		n, res.ok, res.errs, classes(res.byClass),
 		e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
 		e.metrics.handoffLoss.staleRecvDataUnattributed.Load(),
@@ -269,7 +270,9 @@ func transplantUnderLoad(t *testing.T, e *Engine, addr string, n int, tgt engine
 		e.metrics.handoffLoss.handoffInFlight.Load(),
 		metricOr(e, "TransplantHeld"), metricOr(e, "TransplantReaps"), metricOr(e, "TransplantReapMisses"),
 		metricOr(e, "TransplantHoldRescued"), metricOr(e, "TransplantDoubleClaim"),
-		e.metrics.transplantDetached.Load())
+		e.metrics.transplantDetached.Load(),
+		metricOr(e, "TransplantClaimDeferred"), metricOr(e, "TransplantReapFailed"),
+		metricOr(e, "TransplantReapUnsupported"))
 	return res
 }
 
