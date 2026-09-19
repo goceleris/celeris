@@ -123,6 +123,12 @@ func (w *Worker) tryTransplant(fd int) {
 	// this descriptor may be in flight when it moves. The usual case is the
 	// recv armed after the last response (its linked RECV, or the idle
 	// conn's standalone one): reap it and hand off at its -ECANCELED.
+	if cs.recvArmed || cs.kernelInflight != 0 || cs.zcNotifPending {
+		if onlyRecvInFlight(cs) {
+			w.startReap(cs)
+		}
+		return
+	}
 
 	w.handOff(cs, fd, h, false)
 }
@@ -338,5 +344,11 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	// has exited, so the recv the feed path armed for it is the one op the
 	// conn can have: reap it, and come back here at its -ECANCELED. A
 	// request that beats the cancel respawns the goroutine as usual.
+	if cs.recvArmed || cs.kernelInflight != 0 || cs.zcNotifPending {
+		if onlyRecvInFlight(cs) {
+			w.startReap(cs)
+		}
+		return
+	}
 	w.handOff(cs, cs.fd, h, true)
 }

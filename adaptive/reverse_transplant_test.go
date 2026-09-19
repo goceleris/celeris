@@ -162,17 +162,17 @@ func reverseScenario(t *testing.T, h stream.Handler, async bool) {
 		async, epoBefore, iouBefore, promoted, epoInflight, iouInflight, epoConverged, iouConverged, okCount.Load(), errCount.Load())
 
 	if async && promoted == 0 {
-		t.Logf("async test never promoted any conn to the dispatch goroutine — async path not exercised")
+		t.Errorf("async test never promoted any conn to the dispatch goroutine — async path not exercised")
 	}
 	// Converged: essentially all conns must have migrated to epoll.
 	if epoConverged < conns-2 {
-		t.Logf("reverse transplant did not converge: epoll=%d (want ~%d)", epoConverged, conns)
+		t.Errorf("reverse transplant did not converge: epoll=%d (want ~%d)", epoConverged, conns)
 	}
 	if iouConverged > 2 {
-		t.Logf("io_uring did not drain on convergence: io_uring=%d (want ~0)", iouConverged)
+		t.Errorf("io_uring did not drain on convergence: io_uring=%d (want ~0)", iouConverged)
 	}
 	if errCount.Load() > int64(conns) {
-		t.Logf("too many request errors across the revert: %d (conns=%d)", errCount.Load(), conns)
+		t.Errorf("too many request errors across the revert: %d (conns=%d)", errCount.Load(), conns)
 	}
 }
 
@@ -208,10 +208,10 @@ func flapScenario(t *testing.T, h stream.Handler, async bool) {
 		t.Logf("[async=%v] flap %d -> active=%s: epoll=%d io_uring=%d (ok=%d err=%d)",
 			async, flap, activeName, epo, iou, okCount.Load(), errCount.Load())
 		if active < conns/2 {
-			t.Logf("flap %d: transplant did not migrate to %s: active=%d (want ~%d)", flap, activeName, active, conns)
+			t.Errorf("flap %d: transplant did not migrate to %s: active=%d (want ~%d)", flap, activeName, active, conns)
 		}
 		if standby > conns/4 {
-			t.Logf("flap %d: standby did not drain: standby=%d (want ~0)", flap, standby)
+			t.Errorf("flap %d: standby did not drain: standby=%d (want ~0)", flap, standby)
 		}
 	}
 
@@ -221,10 +221,10 @@ func flapScenario(t *testing.T, h stream.Handler, async bool) {
 		async, okCount.Load(), errCount.Load(),
 		e.primary.Metrics().AsyncPromotedConns, e.secondary.Metrics().AsyncPromotedConns)
 	if async && e.primary.Metrics().AsyncPromotedConns == 0 && e.secondary.Metrics().AsyncPromotedConns == 0 {
-		t.Logf("async flap never promoted any conn — async path not exercised")
+		t.Errorf("async flap never promoted any conn — async path not exercised")
 	}
 	if errCount.Load() > int64(conns) {
-		t.Logf("too many request errors across flaps: %d (conns=%d)", errCount.Load(), conns)
+		t.Errorf("too many request errors across flaps: %d (conns=%d)", errCount.Load(), conns)
 	}
 }
 
