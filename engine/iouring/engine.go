@@ -94,8 +94,9 @@ type Engine struct {
 	asyncRoutes int
 	// asyncCancelFlags is whether probeAsyncCancelFlags found this kernel
 	// accepting IORING_ASYNC_CANCEL_* flags (5.19+): false when the kernel
-	// rejected them and when the probe got no answer. Every worker gets a
-	// copy; the hand-off's REAP needs them (celeris#657).
+	// rejected them, when it answered in a way the probe does not recognise
+	// and when the probe got no answer. Every worker gets a copy; the
+	// hand-off's REAP needs them (celeris#657).
 	asyncCancelFlags bool
 }
 
@@ -220,8 +221,10 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 // logAsyncCancelProbe reports an async-cancel-flags probe that did not find
 // the flags accepted (celeris#681 R2). A rejection is the kernel's answer and
-// expected before 5.19: Info. A probe that got no answer says nothing about
-// the kernel; on one whose version has the flags (5.19 and later) it is
+// expected before 5.19: Info. An answer the probe does not recognise is one
+// no kernel measured gives, on any version: Warn, with the reason, which
+// names the errno (celeris#681 N2). A probe that got no answer says nothing
+// about the kernel; on one whose version has the flags (5.19 and later) it is
 // unexpected, and it keeps the hand-off's reap off for this process, so it is
 // a Warn there and Info below.
 func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kernelMajor, kernelMinor int) {
@@ -229,6 +232,9 @@ func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kern
 	switch p {
 	case asyncCancelRejected:
 		l.Info("async cancel flags rejected by the kernel: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
+			"reason", reason, "kernel", kernel)
+	case asyncCancelUnexpected:
+		l.Warn("async cancel flags probe got an answer it does not recognise: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
 			"reason", reason, "kernel", kernel)
 	case asyncCancelNoAnswer:
 		msg := "async cancel flags probe got no answer from the kernel: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)"

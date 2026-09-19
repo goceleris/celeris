@@ -542,7 +542,8 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// TransplantReapUnsupported counts hand-off recv cancels not placed
 	// because the io_uring engine's startup probe did not find the
 	// IORING_ASYNC_CANCEL flags they need accepted (Linux 5.19 added them;
-	// a probe that got no answer counts the same). It counts only
+	// a probe that got no answer, or an answer it does not recognise, counts
+	// the same). It counts only
 	// connections the worker serves itself (every connection in sync mode,
 	// and in async mode those not promoted to a dispatch goroutine): such a
 	// connection stays on io_uring until its armed recv completes on its

@@ -239,8 +239,8 @@ func (w *Worker) reclaimTransplant(newFD int, carry engine.Carryover, cause erro
 //
 // A worker that cannot reap (its engine's probeAsyncCancelFlags did not find
 // IORING_ASYNC_CANCEL flags accepted: the kernel rejected them, or the probe
-// got no answer, which has the same effect here) offers no promoted async
-// conn for the hand-off (celeris#681 R1). Every claim would find the recv the feed path armed after
+// got no answer or one it does not recognise, each with the same effect
+// here) offers no promoted async conn for the hand-off (celeris#681 R1). Every claim would find the recv the feed path armed after
 // the last request, which only a reap can clear, and a promoted conn is never
 // held: finishAsyncTransplant would refuse it, and the goroutine that exited
 // to make the claim would be respawned by the next request — a spawn and a

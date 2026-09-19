@@ -489,8 +489,9 @@ type Worker struct {
 	reapRetry      []uint64
 	reapRetrySpare []uint64
 	// asyncCancelFlags: probeAsyncCancelFlags found this kernel accepting
-	// IORING_ASYNC_CANCEL_* flags (5.19+); false when it rejected them or the
-	// probe got no answer. A reap is only placed when it is true;
+	// IORING_ASYNC_CANCEL_* flags (5.19+); false when it rejected them, when
+	// it gave an answer the probe does not recognise, or when the probe got
+	// no answer. A reap is only placed when it is true;
 	// createWorkers copies the engine's answer. Read-only after init.
 	asyncCancelFlags bool
 	// dupFD duplicates the descriptor a hand-off moves: unix.Dup when nil.

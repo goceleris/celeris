@@ -472,8 +472,9 @@ const (
 // asyncCancelProbe is what probeAsyncCancelFlags learned. Only
 // asyncCancelAccepted turns the hand-off's reap on; the others keep it off,
 // and they are told apart because they mean different things (celeris#681
-// R2): a rejection is the kernel's answer, a probe that got no answer says
-// nothing about the kernel.
+// R2, N2): a rejection is the kernel's answer, a probe that got no answer
+// says nothing about the kernel, and an answer the probe does not recognise
+// is one no kernel measured gives.
 //
 // The zero value is asyncCancelNoAnswer (celeris#681 N3), so an answer that
 // was never set reads as no answer and keeps the reap off, never as
@@ -489,9 +490,13 @@ const (
 	// accepted its IORING_ASYNC_CANCEL flags.
 	asyncCancelAccepted
 	// asyncCancelRejected: the kernel completed the probe's cancel without
-	// accepting the flags: -EINVAL, as every kernel before 5.19 answers, or
-	// a result the probe does not recognise.
+	// accepting the flags: -EINVAL, as every kernel before 5.19 answers.
 	asyncCancelRejected
+	// asyncCancelUnexpected: the kernel completed the probe's cancel with a
+	// result the probe does not recognise (neither an acceptance nor
+	// -EINVAL). No kernel measured answers so; it keeps the reap off and New
+	// warns with the errno (celeris#681 N2).
+	asyncCancelUnexpected
 )
 
 func (p asyncCancelProbe) String() string {
@@ -502,6 +507,8 @@ func (p asyncCancelProbe) String() string {
 		return "accepted"
 	case asyncCancelRejected:
 		return "rejected"
+	case asyncCancelUnexpected:
+		return "unexpected"
 	}
 	return fmt.Sprintf("asyncCancelProbe(%d)", uint8(p))
 }
@@ -580,8 +587,10 @@ func probeAsyncCancel(cancelFlags uint32) (asyncCancelProbe, string) {
 //     miss; no kernel measured answers the probe with it.
 //   - -EINVAL: rejected. Measured on 5.15.0-191: every cancel form celeris
 //     builds returns -EINVAL there and leaves its target running.
-//   - anything else: an answer the probe does not understand, so the flags
-//     are treated as rejected and the value is reported.
+//   - anything else: unexpected, an answer the probe does not understand
+//     (celeris#681 N2). It is neither the kernel's acceptance nor its
+//     rejection, so it is a class of its own: the reap stays off, and the
+//     reason names the errno, which New logs at Warn on every kernel.
 //
 // Split out of probeAsyncCancelFlags so every outcome can be checked against
 // a synthetic result.
@@ -592,6 +601,16 @@ func classifyAsyncCancelProbe(res int32) (asyncCancelProbe, string) {
 	case res == -int32(unix.EINVAL):
 		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL); the kernel predates Linux 5.19"
 	default:
-		return asyncCancelRejected, fmt.Sprintf("the cancel completed with cqe.res=%d, which the probe does not recognise", res)
+		return asyncCancelUnexpected, fmt.Sprintf("the cancel completed with cqe.res=%d (%s), which the probe does not recognise",
+			res, errnoName(-res))
 	}
+}
+
+// errnoName names errno e for a log line: its symbol (EBADF), or its number
+// when the platform has no name for it.
+func errnoName(e int32) string {
+	if name := unix.ErrnoName(unix.Errno(e)); name != "" {
+		return name
+	}
+	return fmt.Sprintf("errno %d", e)
 }

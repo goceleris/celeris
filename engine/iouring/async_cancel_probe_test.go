@@ -26,8 +26,10 @@ import (
 
 // TestAsyncCancelProbeClassifies pins how the probe reads its cancel's
 // completion: a cancel with CANCEL_ALL of a user_data nothing carries. A
-// completion is the kernel's answer, accepted or rejected; a probe that fails
-// before reading one has no answer, which is not a rejection (celeris#681 R2).
+// completion is the kernel's answer: accepted, rejected, or (celeris#681 N2)
+// one the probe does not recognise, which is a class of its own. A probe that
+// fails before reading one has no answer, which is not a rejection
+// (celeris#681 R2).
 func TestAsyncCancelProbeClassifies(t *testing.T) {
 	for _, tc := range []struct {
 		res    int32
@@ -38,8 +40,8 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 		{1, asyncCancelAccepted, ""},
 		{-int32(unix.ENOENT), asyncCancelAccepted, ""}, // the flag-free form's miss
 		{-int32(unix.EINVAL), asyncCancelRejected, "5.19"},
-		{-int32(unix.EBADF), asyncCancelRejected, "cqe.res=-9"},
-		{-int32(unix.ECANCELED), asyncCancelRejected, "cqe.res=-125"},
+		{-int32(unix.EBADF), asyncCancelUnexpected, "cqe.res=-9 (EBADF)"},
+		{-int32(unix.ECANCELED), asyncCancelUnexpected, "cqe.res=-125 (ECANCELED)"},
 	} {
 		got, reason := classifyAsyncCancelProbe(tc.res)
 		if got != tc.want || (tc.reason == "") != (reason == "") || !strings.Contains(reason, tc.reason) {
@@ -50,6 +52,10 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 
 	// An answer never set keeps the reap off (celeris#681 N3).
 	t.Run("zero_value_is_no_answer", probeZeroValueIsNoAnswer)
+
+	// An answer the probe does not recognise is not a rejection, and New
+	// warns about it with the errno (celeris#681 N2).
+	t.Run("unrecognised_answer_is_its_own_class", probeUnrecognisedAnswerIsItsOwnClass)
 
 	// The probe's ring cannot be set up: nothing reached the kernel.
 	t.Run("no_answer_is_not_a_rejection", func(t *testing.T) {
@@ -64,8 +70,9 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 	})
 
 	// New's record of the answer: nothing when accepted, Info for the
-	// kernel's rejection, and for no answer Warn where the kernel's version
-	// has the flags and Info below it.
+	// kernel's rejection, Warn on every kernel for an answer the probe does
+	// not recognise, and for no answer Warn where the kernel's version has
+	// the flags and Info below it.
 	t.Run("log_levels", func(t *testing.T) {
 		for _, tc := range []struct {
 			p            asyncCancelProbe
@@ -75,6 +82,8 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 			{asyncCancelAccepted, 6, 8, ""},
 			{asyncCancelRejected, 5, 15, "INFO"},
 			{asyncCancelRejected, 6, 8, "INFO"},
+			{asyncCancelUnexpected, 5, 15, "WARN"},
+			{asyncCancelUnexpected, 6, 8, "WARN"},
 			{asyncCancelNoAnswer, 5, 18, "INFO"},
 			{asyncCancelNoAnswer, 5, 19, "WARN"},
 			{asyncCancelNoAnswer, 6, 8, "WARN"},
@@ -93,6 +102,11 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 			if tc.p == asyncCancelNoAnswer && len(recs) == 1 {
 				if msg, _ := recs[0]["msg"].(string); !strings.Contains(msg, "no answer") {
 					t.Errorf("the no-answer record reads %q, want it to say the probe got no answer", msg)
+				}
+			}
+			if tc.p == asyncCancelUnexpected && len(recs) == 1 {
+				if msg, _ := recs[0]["msg"].(string); !strings.Contains(msg, "does not recognise") {
+					t.Errorf("the unexpected-answer record reads %q, want it to say the probe does not recognise the answer", msg)
 				}
 			}
 		}

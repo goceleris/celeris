@@ -72,10 +72,11 @@ func onlyRecvInFlight(cs *connState) bool {
 //   - the startup probe did not find IORING_ASYNC_CANCEL flags accepted
 //     (probeAsyncCancelFlags): a kernel before 5.19 rejects them, and every
 //     reap would fail with -EINVAL and leave the recv armed; a probe that got
-//     no answer is treated the same. Counted (TransplantReapUnsupported).
-//     Buffer rings arrived with the flags, in 5.19, so a kernel that rejects
-//     them has no provided-buffer ring and its sync conns are held; a newer
-//     kernel whose probe got no answer may have one, and its conns stay. A
+//     no answer, or an answer it does not recognise, is treated the same.
+//     Counted (TransplantReapUnsupported). Buffer rings arrived with the
+//     flags, in 5.19, so a kernel that rejects them has no provided-buffer
+//     ring and its sync conns are held; a newer kernel whose probe got no
+//     answer (or an unrecognised one) may have one, and its conns stay. A
 //     promoted async conn never gets here on such a worker: its dispatch
 //     goroutine makes no claim (asyncTransplantEligible) and stays parked,
 //     still running, so tryTransplant leaves it alone too (celeris#681 R1).
