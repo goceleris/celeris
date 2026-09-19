@@ -485,6 +485,14 @@ const (
 // at submit on every kernel measured, so its completion is normally there
 // when Submit returns; a short wait covers any that is not.
 func probeAsyncCancelFlags() (bool, string) {
+	return probeAsyncCancel(cancelAll)
+}
+
+// probeAsyncCancel is probeAsyncCancelFlags with the cancel_flags word
+// given: the probe passes the reap's own (IORING_ASYNC_CANCEL_ALL), and a
+// test passes a bit no kernel defines, which every kernel rejects, to drive
+// the rejection through the same submit and completion path.
+func probeAsyncCancel(cancelFlags uint32) (bool, string) {
 	ring, err := NewRing(8, 0, 0)
 	if err != nil {
 		return false, "NewRing failed: " + err.Error()
@@ -496,6 +504,7 @@ func probeAsyncCancelFlags() (bool, string) {
 		return false, "GetSQE returned nil"
 	}
 	prepCancelUserDataReported(sqe, asyncCancelProbeTarget)
+	*(*uint32)(unsafe.Pointer(&(*[sqeSize]byte)(sqe)[28])) = cancelFlags
 	setSQEUserData(sqe, asyncCancelProbeTag)
 	if _, err := ring.Submit(); err != nil {
 		return false, "Submit failed: " + err.Error()

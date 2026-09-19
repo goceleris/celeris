@@ -811,9 +811,26 @@ func TestReapSuppressedAfterFailedHandOff(t *testing.T) {
 	if dupCalls != 2 {
 		t.Errorf("dup tried %d times, want 2: once at the reap, once at the held response", dupCalls)
 	}
-	// The descriptors are back: the next response leaves.
+	// The descriptors are back, and the conn receives data again, which
+	// lifts the suppression: served with the drain stopped, its response
+	// goes out with a linked RECV, and once the drain is set again that recv
+	// is reaped and the conn leaves at its -ECANCELED.
 	trySetWorkerField(f.w, "dupFD", (func(int) (int, error))(nil))
-	heldHandOff(t, f)
+	f.stopDrain()
+	f.deliver(fdlGET)
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 2 || sqes[1].op != opRECV {
+		t.Fatalf("a request with the drain stopped placed %v, want SEND then its linked RECV", sqes)
+	}
+	f.startDrain()
+	f.process(f.sendCQE())
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+		t.Fatalf("after the conn received data again its armed recv got %v, want a reap: the "+
+			"suppression outlived the failure it was for", sqes)
+	}
+	f.process(f.recvCQE(-int32(unix.ECANCELED)))
+	if n := f.tgt.adopted.Load(); n != 1 {
+		t.Fatalf("the reap's -ECANCELED made %d hand-offs, want 1", n)
+	}
 }
 
 // TestReapedRecvLeavesNoLinkOrBuffer (celeris#681 C4): reapOutcome consumes

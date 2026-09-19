@@ -61,7 +61,10 @@ func kernelHasCancelFlags(t *testing.T) (bool, string) {
 }
 
 // TestAsyncCancelProbeOnThisKernel runs the probe itself against the running
-// kernel and checks its answer against the kernel's version.
+// kernel and checks its answer against the kernel's version, and checks that
+// the probe reads the kernel's answer: a cancel flag no kernel defines
+// (bit 31) is rejected with -EINVAL everywhere, so the same path must then
+// report the flags unsupported.
 func TestAsyncCancelProbeOnThisKernel(t *testing.T) {
 	r, err := NewRing(8, 0, 0)
 	if err != nil {
@@ -76,6 +79,10 @@ func TestAsyncCancelProbeOnThisKernel(t *testing.T) {
 	}
 	if cok, _ := probeAsyncCancelFlagsCached(); cok != ok {
 		t.Fatalf("the cached probe says %v, the probe %v", cok, ok)
+	}
+	if bad, why := probeAsyncCancel(1 << 31); bad || !strings.Contains(why, "EINVAL") {
+		t.Fatalf("a cancel flag no kernel defines was read as (%v, %q), want rejected with EINVAL: "+
+			"the probe does not read the kernel's answer", bad, why)
 	}
 }
 
