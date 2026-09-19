@@ -58,16 +58,30 @@ import "sync/atomic"
 //     conn could be handed off (REAP), and those whose own completion said
 //     they matched nothing (the recv had completed, or was not issued yet).
 //     A miss is retried, never followed by a hand-off. Rates.
+//   - reapFailed: reaps whose completion was neither a hit nor a miss (for
+//     example -EINVAL from a kernel that rejects the cancel flags the
+//     startup probe found accepted). Not retried and never followed by a
+//     hand-off. Must stay 0.
+//   - reapUnsupported: reaps not placed because this kernel rejects the
+//     IORING_ASYNC_CANCEL flags a reap needs (probeAsyncCancelFlags; they
+//     exist from 5.19). The conn stays until its recv completes on its own.
+//     A rate, 0 on every kernel from 5.19.
 //   - holdRescued: held conns the timeout sweep found with their response
 //     sent, not handed off and no recv armed — a path that skipped the
 //     release. The belt under releaseHold. Must stay 0.
-//   - doubleClaim: hand-offs refused because another path owned the conn's
-//     hand-off: tryTransplant on a conn whose dispatch goroutine had already
-//     claimed it (transplantPending), or finishAsyncTransplant for a
-//     connState that no longer owns its fd slot. Each is a double hand-off
-//     prevented; before the checks existed one identity was measured moving
-//     twice in 167 runs. Rare, not impossible: the first half fires whenever
-//     a SEND completion lands between a goroutine's claim and the drain.
+//   - doubleClaim: hand-offs refused at finishAsyncTransplant because the
+//     connState no longer owns its fd slot: something moved it out of the
+//     table since its dispatch goroutine claimed the hand-off, and in async
+//     mode that something is another hand-off of the same conn (a close
+//     marks the queued claim detachClosed first, and hijack is refused).
+//     Before the checks existed one identity was measured moving twice in
+//     167 runs. Must stay 0.
+//   - claimDeferred: tryTransplant finding a conn whose dispatch goroutine
+//     has claimed its own hand-off (transplantPending) and leaving it to that
+//     claim. Counted before tryTransplant's other gates, so it is ordering,
+//     not a fault: it fires whenever a completion of the conn (its own
+//     response SEND, typically) lands between the goroutine's park and the
+//     drain of its claim. A rate.
 //
 // All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
 // paths only, never on the per-request path while no drain is set, and like
@@ -83,6 +97,9 @@ type handoffLossStats struct {
 	reapMisses                atomic.Uint64
 	holdRescued               atomic.Uint64
 	doubleClaim               atomic.Uint64
+	claimDeferred             atomic.Uint64
+	reapFailed                atomic.Uint64
+	reapUnsupported           atomic.Uint64
 }
 
 // The fd-lifetime counters are nil-safe: a hand-built test Worker has none.
@@ -114,6 +131,24 @@ func (s *handoffLossStats) noteHoldRescued() {
 func (s *handoffLossStats) noteDoubleClaim() {
 	if s != nil {
 		s.doubleClaim.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteClaimDeferred() {
+	if s != nil {
+		s.claimDeferred.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteReapFailed() {
+	if s != nil {
+		s.reapFailed.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteReapUnsupported() {
+	if s != nil {
+		s.reapUnsupported.Add(1)
 	}
 }
 

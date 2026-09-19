@@ -488,6 +488,14 @@ type Worker struct {
 	// reapRetrySpare is the second buffer of the swap. Worker thread only.
 	reapRetry      []uint64
 	reapRetrySpare []uint64
+	// asyncCancelFlags: this kernel accepts IORING_ASYNC_CANCEL_* flags
+	// (probeAsyncCancelFlags, 5.19+). A reap is only placed when it does;
+	// createWorkers copies the engine's answer. Read-only after init.
+	asyncCancelFlags bool
+	// dupFD duplicates the descriptor a hand-off moves: unix.Dup when nil.
+	// A test seam, so a test can make the dup fail the way a process out
+	// of descriptors does (EMFILE).
+	dupFD func(fd int) (int, error)
 
 	// transplant (#383 reverse) is non-nil while a drain-to-epoll is in progress.
 	// Set by Engine.StartTransplant (controller goroutine), read on this worker's
@@ -1193,10 +1201,11 @@ func (w *Worker) run(ctx context.Context) {
 						if w.transplant.Load() != nil {
 							w.tryTransplant(fd)
 						}
-						// Unconditionally, after the attempt: a conn held for
-						// a hand-off that did not happen gets its recv back
-						// (celeris#657).
-						w.releaseHold(fd)
+						// No releaseHold here (celeris#657): a held conn has
+						// no recv armed, so the only recv completion that can
+						// find a hold is the one whose own response set it,
+						// with that SEND still in flight. The SEND completion
+						// below is where a hold is released.
 					}
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
@@ -1452,7 +1461,11 @@ func (w *Worker) run(ctx context.Context) {
 			// in the same pass that finds the worker idle, and the park is
 			// indefinite: those SQEs used to sit unsubmitted until something
 			// woke the worker, measured 1-24 pending at parks. Outside
-			// wakeMu, which is a leaf; SQPOLL submits by itself.
+			// wakeMu, which is a leaf. Not under SQPOLL, where the kernel's
+			// SQ thread submits; an SQ thread that has gone idle would need
+			// the NEED_WAKEUP kick the submit branch of this loop gives it,
+			// but no tier enables SQPOLL today (SQPollIdle is 0 in all
+			// three), so that case is not handled here.
 			if !w.sqpoll && w.ring.Pending() > 0 {
 				_, _ = w.ring.Submit()
 			}
@@ -1596,14 +1609,13 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleRecv(c, fd, now)
-		// The same hand-off attempt and hold release as the inlined
-		// dispatch (celeris#657). The listener-close harvest processes
-		// completions here, and a held conn whose SEND completion landed in
-		// it would otherwise be neither handed off nor re-armed.
+		// The same hand-off attempt as the inlined dispatch (celeris#657).
+		// The listener-close harvest processes completions here. As there,
+		// no hold can be released at a recv completion; the udSend case
+		// below releases it.
 		if w.transplant.Load() != nil {
 			w.tryTransplant(fd)
 		}
-		w.releaseHold(fd)
 	case udSend:
 		if w.staleConnCQE(c, fd, ud) {
 			return
@@ -1612,6 +1624,8 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 		if w.transplant.Load() != nil {
 			w.tryTransplant(fd)
 		}
+		// A held conn whose SEND completion lands in the listener-close
+		// harvest would otherwise be neither handed off nor re-armed.
 		w.releaseHold(fd)
 	case udClose:
 		if w.staleConnCQE(c, fd, ud) {
@@ -2538,6 +2552,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	cs.lastActivity = now
+	// Data: the conn is serving again, so a hand-off that failed at its dup
+	// may be tried (and its recv reaped) once more (celeris#657).
+	cs.reapSuppressed = false
 	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)

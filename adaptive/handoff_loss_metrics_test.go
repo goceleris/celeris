@@ -24,12 +24,14 @@ func TestMetricsSumsTheHandoffLossWitnesses(t *testing.T) {
 		StaleRecvDataUnattributed: 3, TransplantHandoffInFlight: 4,
 		TransplantHeld: 5, TransplantReaps: 6, TransplantReapMisses: 7,
 		TransplantHoldRescued: 8, TransplantDoubleClaim: 9,
+		TransplantClaimDeferred: 12, TransplantReapFailed: 13, TransplantReapUnsupported: 14,
 	})
 	e.secondary.(*mockEngine).SetMetrics(engine.EngineMetrics{
 		StaleRecvDataClosed: 10, StaleRecvDataTransplanted: 20,
 		StaleRecvDataUnattributed: 30, TransplantHandoffInFlight: 40,
 		TransplantHeld: 50, TransplantReaps: 60, TransplantReapMisses: 70,
 		TransplantHoldRescued: 80, TransplantDoubleClaim: 90,
+		TransplantClaimDeferred: 120, TransplantReapFailed: 130, TransplantReapUnsupported: 140,
 	})
 
 	m := e.Metrics()
@@ -46,6 +48,9 @@ func TestMetricsSumsTheHandoffLossWitnesses(t *testing.T) {
 		{"TransplantReapMisses", m.TransplantReapMisses, 77},
 		{"TransplantHoldRescued", m.TransplantHoldRescued, 88},
 		{"TransplantDoubleClaim", m.TransplantDoubleClaim, 99},
+		{"TransplantClaimDeferred", m.TransplantClaimDeferred, 132},
+		{"TransplantReapFailed", m.TransplantReapFailed, 143},
+		{"TransplantReapUnsupported", m.TransplantReapUnsupported, 154},
 	} {
 		if c.got != c.want {
 			t.Errorf("Metrics().%s = %d, want %d (sum of both sub-engines)",

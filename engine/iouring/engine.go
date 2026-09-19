@@ -91,6 +91,10 @@ type Engine struct {
 	// at construction so Metrics() doesn't pay the type-assertion per
 	// call. Snapshot-at-Listen — static post-Start.
 	asyncRoutes int
+	// asyncCancelFlags is the probeAsyncCancelFlags answer: whether this
+	// kernel accepts IORING_ASYNC_CANCEL_* flags (5.19+). Every worker gets
+	// a copy; the hand-off's REAP needs them (celeris#657).
+	asyncCancelFlags bool
 }
 
 // New creates a new io_uring engine.
@@ -162,6 +166,18 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 
+	// The io_uring→epoll hand-off cancels an armed recv before it moves a
+	// connection (REAP, celeris#657), and that cancel needs
+	// IORING_ASYNC_CANCEL flags, which exist from Linux 5.19. Where the
+	// kernel rejects them the hand-off never reaps: a connection whose recv
+	// is armed stays on io_uring until that recv completes on its own, and
+	// its next response is then HELD and handed off with nothing in flight.
+	asyncCancelFlags, acReason := probeAsyncCancelFlagsCached()
+	if !asyncCancelFlags {
+		cfg.Logger.Info("async cancel flags runtime probe failed: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
+			"reason", acReason)
+	}
+
 	tier := SelectTier(profile, 2*time.Second)
 	if tier == nil {
 		return nil, fmt.Errorf("no suitable io_uring tier available")
@@ -177,13 +193,15 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		// was gated off (celeris#541).
 		"fixed_files", fixedFilesEnabled(tier.SupportsFixedFiles()),
 		"send_zc", tier.SupportsSendZC(),
+		"async_cancel_flags", asyncCancelFlags,
 	)
 
 	e := &Engine{
-		tier:    tier,
-		profile: profile,
-		cfg:     cfg,
-		handler: handler,
+		tier:             tier,
+		profile:          profile,
+		cfg:              cfg,
+		handler:          handler,
+		asyncCancelFlags: asyncCancelFlags,
 	}
 	// Snapshot the static AsyncRoutes count from the handler so
 	// Metrics() doesn't pay a type-assertion per call (#300 G3).
@@ -350,6 +368,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
 		w.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		w.handoffLoss = &e.metrics.handoffLoss // celeris#657 witnesses
+		w.asyncCancelFlags = e.asyncCancelFlags
 		workers[i] = w
 	}
 	return workers, nil
@@ -451,6 +470,9 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantReapMisses:      e.metrics.handoffLoss.reapMisses.Load(),
 		TransplantHoldRescued:     e.metrics.handoffLoss.holdRescued.Load(),
 		TransplantDoubleClaim:     e.metrics.handoffLoss.doubleClaim.Load(),
+		TransplantClaimDeferred:   e.metrics.handoffLoss.claimDeferred.Load(),
+		TransplantReapFailed:      e.metrics.handoffLoss.reapFailed.Load(),
+		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).

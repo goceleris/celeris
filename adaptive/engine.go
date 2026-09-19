@@ -1088,6 +1088,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantReapMisses:  pm.TransplantReapMisses + sm.TransplantReapMisses,
 		TransplantHoldRescued: pm.TransplantHoldRescued + sm.TransplantHoldRescued,
 		TransplantDoubleClaim: pm.TransplantDoubleClaim + sm.TransplantDoubleClaim,
+		// The same rule for the refusals and fallbacks around them: each
+		// is an event on the one sub-engine attempting the hand-off.
+		TransplantClaimDeferred:   pm.TransplantClaimDeferred + sm.TransplantClaimDeferred,
+		TransplantReapFailed:      pm.TransplantReapFailed + sm.TransplantReapFailed,
+		TransplantReapUnsupported: pm.TransplantReapUnsupported + sm.TransplantReapUnsupported,
 
 		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
 		// so the epoll half contributes zero and a switch simply moves which

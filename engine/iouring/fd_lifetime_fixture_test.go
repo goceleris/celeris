@@ -151,6 +151,11 @@ func newFDLFixture(t *testing.T, async bool) *fdlFixture {
 	w.transplantDetached = &e.metrics.transplantDetached
 	w.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
 	w.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
+	// createWorkers copies the engine's async-cancel-flags probe answer; the
+	// kernel never sees this fixture's SQEs, so it reads "accepted", the
+	// answer of every kernel from 5.19. A tree without the probe reaps
+	// unconditionally, which is the same thing.
+	trySetWorkerField(w, "asyncCancelFlags", true)
 
 	cs := acquireConnState(context.Background(), fd, 4096, async)
 	cs.writeFn = w.makeWriteFn(cs)
@@ -253,6 +258,18 @@ func metric(t *testing.T, e *Engine, name string) uint64 {
 		t.Fatalf("engine.EngineMetrics has no field %s (celeris#657 PR-2 counter)", name)
 	}
 	return v.Uint()
+}
+
+// trySetWorkerField sets w's field name to v and reports whether w has such a
+// field. With metric, it lets a test pin a field a tree may not have yet: the
+// test then fails on its assertions, instead of the package failing to build.
+func trySetWorkerField(w *Worker, name string, v any) bool {
+	f := reflect.ValueOf(w).Elem().FieldByName(name)
+	if !f.IsValid() {
+		return false
+	}
+	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.ValueOf(v))
+	return true
 }
 
 // isReap reports whether s is the hand-off's reported cancel of cs's recv:

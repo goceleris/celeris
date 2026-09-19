@@ -170,6 +170,10 @@ func TestTransplantNeverHandsOffArmedRecv(t *testing.T) {
 	// The kernel, not the test, completes the ops: the reap's SQE really
 	// cancels the armed recv (so its user_data target is right), and the
 	// hand-off follows the -ECANCELED in whichever order the two CQEs come.
+	// A kernel that rejects IORING_ASYNC_CANCEL flags (before 5.19) fails the
+	// reap with -EINVAL and leaves the recv armed; the fixture places the
+	// reap regardless of the startup probe, so on such a kernel this checks
+	// that the failure is neither retried nor followed by a hand-off.
 	t.Run("kernel_cancels_the_armed_recv", func(t *testing.T) {
 		f := newFDLFixture(t, false)
 		if !f.w.prepareRecv(f.cs, f.cs.buf) {
@@ -189,22 +193,50 @@ func TestTransplantNeverHandsOffArmedRecv(t *testing.T) {
 		if _, err := f.w.ring.Submit(); err != nil {
 			t.Fatalf("submit reap: %v", err)
 		}
-		got := 0
-		for deadline := time.Now().Add(2 * time.Second); got < 2 && time.Now().Before(deadline); {
+		var reapRes *int32
+		recvCancelled := false
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+			if reapRes != nil && (recvCancelled || *reapRes == -int32(unix.EINVAL)) {
+				break
+			}
 			_ = f.w.ring.WaitCQETimeout(100 * time.Millisecond)
 			head, tail := f.w.ring.BeginCQ()
 			for ; head != tail; head++ {
 				c := *f.w.ring.cqeAt(head)
-				if decodeOp(c.UserData) == udRecv && c.Res != -int32(unix.ECANCELED) {
-					t.Fatalf("the recv completed with %d, want -ECANCELED", c.Res)
+				switch decodeOp(c.UserData) {
+				case udRecv:
+					if c.Res != -int32(unix.ECANCELED) {
+						t.Fatalf("the recv completed with %d, want -ECANCELED", c.Res)
+					}
+					recvCancelled = true
+				case wantReapTag:
+					r := c.Res
+					reapRes = &r
 				}
 				f.w.processCQE(context.Background(), &c, time.Now().UnixNano())
-				got++
 			}
 			f.w.ring.EndCQ(head)
 		}
-		if got != 2 {
-			t.Fatalf("kernel produced %d completions, want the recv's -ECANCELED and the reap's own", got)
+		if reapRes == nil {
+			t.Fatal("the reap produced no completion of its own")
+		}
+		if *reapRes == -int32(unix.EINVAL) {
+			if recvCancelled || f.tgt.adopted.Load() != 0 {
+				t.Fatalf("the kernel rejected the reap (-EINVAL), yet recvCancelled=%v and %d hand-off(s)",
+					recvCancelled, f.tgt.adopted.Load())
+			}
+			for i := 1; i <= 3; i++ {
+				f.w.drainDetachQueue()
+				if n := f.w.ring.Pending(); n != 0 {
+					t.Fatalf("loop iteration %d placed %d SQE(s) after the kernel rejected the reap: the "+
+						"failed cancel is retried, one failing cancel per iteration for as long as the drain lasts", i, n)
+				}
+			}
+			t.Logf("celeris681 the kernel rejected the reap's cancel flags (-EINVAL): not retried, no hand-off")
+			return
+		}
+		if !recvCancelled {
+			t.Fatalf("the reap completed with %d but the recv's -ECANCELED never came", *reapRes)
 		}
 		if n := f.tgt.adopted.Load(); n != 1 {
 			t.Fatalf("%d hand-offs after the kernel cancelled the recv, want 1", n)
@@ -420,6 +452,9 @@ func TestOneOwnerPerHandoff(t *testing.T) {
 		return f
 	}
 
+	// Leaving a claimed conn to its claim is ordering, not a double claim:
+	// it is counted as TransplantClaimDeferred, a rate, so that
+	// TransplantDoubleClaim can be held at 0 (celeris#681 C3).
 	t.Run("tryTransplant_refuses_a_claimed_conn", func(t *testing.T) {
 		f := claimedAsync(t)
 		f.w.tryTransplant(f.fd)
@@ -427,8 +462,11 @@ func TestOneOwnerPerHandoff(t *testing.T) {
 			t.Fatalf("tryTransplant moved a conn its dispatch goroutine had claimed (%d hand-offs); "+
 				"finishAsyncTransplant would then move it again", n)
 		}
-		if n := metric(t, f.e, "TransplantDoubleClaim"); n != 1 {
-			t.Errorf("TransplantDoubleClaim = %d, want 1", n)
+		if n := metric(t, f.e, "TransplantDoubleClaim"); n != 0 {
+			t.Errorf("TransplantDoubleClaim = %d, want 0: deferring to a claim is not a double claim", n)
+		}
+		if n := metric(t, f.e, "TransplantClaimDeferred"); n != 1 {
+			t.Errorf("TransplantClaimDeferred = %d, want 1", n)
 		}
 	})
 
@@ -451,6 +489,22 @@ func TestOneOwnerPerHandoff(t *testing.T) {
 			t.Errorf("TransplantDoubleClaim = %d, want 1", n)
 		}
 		f.w.conns[f.fd] = old // let the fixture's cleanup close the fd
+	})
+
+	// A claimed conn that is closing (a close deferred behind a send) is
+	// refused like any closing conn. It still owns its slot, so this is no
+	// double claim, and counting it would make a gate of 0 fail on a close.
+	t.Run("closing_conn_is_refused_not_counted", func(t *testing.T) {
+		f := claimedAsync(t)
+		f.cs.closing = true
+		f.w.finishAsyncTransplant(f.cs)
+		f.cs.closing = false
+		if n := f.tgt.adopted.Load(); n != 0 {
+			t.Fatalf("finishAsyncTransplant handed off a closing conn (%d hand-offs)", n)
+		}
+		if n := metric(t, f.e, "TransplantDoubleClaim"); n != 0 {
+			t.Errorf("TransplantDoubleClaim = %d, want 0: a closing conn that owns its slot is no double claim", n)
+		}
 	})
 
 	// The measured interleaving end to end: the goroutine claims the
@@ -489,8 +543,11 @@ func TestOneOwnerPerHandoff(t *testing.T) {
 		if n := f.tgt.adopted.Load(); n != 1 {
 			t.Fatalf("the conn was handed off %d times, want exactly once", n)
 		}
-		if n := metric(t, f.e, "TransplantDoubleClaim"); n != 1 {
-			t.Errorf("TransplantDoubleClaim = %d, want 1 (the sync claim refused)", n)
+		if n := metric(t, f.e, "TransplantClaimDeferred"); n != 1 {
+			t.Errorf("TransplantClaimDeferred = %d, want 1 (the sync attempt left the conn to its claim)", n)
+		}
+		if n := metric(t, f.e, "TransplantDoubleClaim"); n != 0 {
+			t.Errorf("TransplantDoubleClaim = %d, want 0: the conn was handed off once", n)
 		}
 	})
 }
@@ -553,5 +610,256 @@ func TestNoDrainSQESequenceIsUnchanged(t *testing.T) {
 		check(t, f, takeSQEs(f.w.ring), []want{{opSEND, 0, udSend}, {opRECV, 0, udRecv}})
 		f.process(f.sendCQE())
 		check(t, f, takeSQEs(f.w.ring), nil)
+	})
+}
+
+// reapedFixture is a keep-alive conn whose response SEND completed while a
+// drain was set and its linked RECV was armed: the hand-off refused it and
+// placed one reap of that recv, which the test now completes as it likes.
+func reapedFixture(t *testing.T) *fdlFixture {
+	t.Helper()
+	f := newFDLFixture(t, false)
+	f.armFirstRecv()
+	f.serveOne()
+	f.deliver(fdlGET)
+	_ = takeSQEs(f.w.ring)
+	f.startDrain()
+	f.process(f.sendCQE())
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+		t.Fatalf("SEND completion with the linked RECV armed placed %v, want one reap", sqes)
+	}
+	return f
+}
+
+// heldHandOff delivers the client's next request on f's armed recv and
+// checks that its response is HELD (one unlinked SEND, no recv) and that the
+// SEND's completion hands the conn off with nothing in flight: the way a conn
+// the hand-off could not reap leaves.
+func heldHandOff(t *testing.T, f *fdlFixture) {
+	t.Helper()
+	f.deliver(fdlGET)
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || sqes[0].op != opSEND || sqes[0].flags&sqeIOLink != 0 {
+		t.Fatalf("the next request's response placed %v, want one UNLINKED SEND and no recv (HOLD)", sqes)
+	}
+	f.process(f.sendCQE())
+	if n := f.tgt.adopted.Load(); n != 1 {
+		t.Fatalf("the held response's SEND completion made %d hand-offs, want 1", n)
+	}
+	if n := f.e.metrics.handoffLoss.handoffInFlight.Load(); n != 0 {
+		t.Fatalf("TransplantHandoffInFlight = %d, want 0", n)
+	}
+}
+
+// TestTransplantReapFailureIsNotRetried (celeris#681 C1): a reap whose own
+// completion is neither a hit nor a miss is a cancel that failed, and the
+// kernel will fail the next one the same way. -EINVAL is what a kernel that
+// rejects IORING_ASYNC_CANCEL flags returns (before 5.19). Retrying it placed
+// a failing cancel on every loop iteration for as long as the drain lasted.
+// It must be counted, not retried and not followed by a hand-off; the conn
+// then leaves the way any unreaped conn does, after its next response.
+func TestTransplantReapFailureIsNotRetried(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  int32
+	}{
+		{"EINVAL", -int32(unix.EINVAL)},
+		{"EBADF", -int32(unix.EBADF)},
+		{"ECANCELED", -int32(unix.ECANCELED)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := reapedFixture(t)
+			f.process(f.reapCQE(tc.res))
+			if n := f.tgt.adopted.Load(); n != 0 {
+				t.Fatalf("a reap that failed with %d was followed by %d hand-off(s) with the recv armed", tc.res, n)
+			}
+			for i := 1; i <= 3; i++ {
+				f.w.drainDetachQueue()
+				if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+					t.Fatalf("loop iteration %d placed %v after the reap failed with %d: a failed cancel "+
+						"is retried, one per iteration for as long as the drain lasts", i, sqes, tc.res)
+				}
+			}
+			if !f.cs.recvArmed || f.w.conns[f.fd] != f.cs {
+				t.Fatalf("recvArmed=%v, in table=%v: the conn must keep its recv and stay",
+					f.cs.recvArmed, f.w.conns[f.fd] == f.cs)
+			}
+			if n := metric(t, f.e, "TransplantReapFailed"); n != 1 {
+				t.Errorf("TransplantReapFailed = %d, want 1", n)
+			}
+			if n := metric(t, f.e, "TransplantReapMisses"); n != 0 {
+				t.Errorf("TransplantReapMisses = %d, want 0: a failed cancel is not a miss", n)
+			}
+			heldHandOff(t, f)
+		})
+	}
+}
+
+// TestNoReapWithoutAsyncCancelFlags (celeris#681 C1): on a kernel that
+// rejects IORING_ASYNC_CANCEL flags, which the engine's startup probe finds,
+// no reap is ever placed, at either hand-off site or on a later iteration: it
+// could only fail with -EINVAL and leave the recv armed. The conn keeps its
+// recv and stays until that recv completes; a sync conn then leaves after its
+// next response, held, with nothing in flight.
+func TestNoReapWithoutAsyncCancelFlags(t *testing.T) {
+	noFlags := func(t *testing.T, f *fdlFixture) {
+		t.Helper()
+		if !trySetWorkerField(f.w, "asyncCancelFlags", false) {
+			t.Error("Worker has no asyncCancelFlags field: nothing tells the hand-off the kernel rejects cancel flags")
+		}
+	}
+	checkNothingPlaced := func(t *testing.T, f *fdlFixture, where string) {
+		t.Helper()
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+			t.Fatalf("%s placed %v on a kernel without cancel flags, want nothing: a reap fails with "+
+				"-EINVAL there and leaves the recv armed", where, sqes)
+		}
+		if n := f.tgt.adopted.Load(); n != 0 {
+			t.Fatalf("%s handed the conn off %d time(s) with its recv armed", where, n)
+		}
+		for i := 1; i <= 3; i++ {
+			f.w.drainDetachQueue()
+			if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+				t.Fatalf("loop iteration %d after %s placed %v, want nothing", i, where, sqes)
+			}
+		}
+		if !f.cs.recvArmed {
+			t.Fatalf("after %s the conn has no recv armed", where)
+		}
+	}
+
+	t.Run("sync_site", func(t *testing.T) {
+		f := newFDLFixture(t, false)
+		noFlags(t, f)
+		f.armFirstRecv()
+		f.serveOne()
+		f.deliver(fdlGET)
+		_ = takeSQEs(f.w.ring)
+		f.startDrain()
+		f.process(f.sendCQE()) // the SEND completes with its linked RECV armed
+		checkNothingPlaced(t, f, "the SEND completion")
+		if n := metric(t, f.e, "TransplantReaps"); n != 0 {
+			t.Errorf("TransplantReaps = %d, want 0", n)
+		}
+		if n := metric(t, f.e, "TransplantReapUnsupported"); n != 1 {
+			t.Errorf("TransplantReapUnsupported = %d, want 1", n)
+		}
+		heldHandOff(t, f)
+	})
+
+	// A promoted async conn whose goroutine claimed its own hand-off: the
+	// recv the feed path armed for it is the one op in flight.
+	t.Run("async_site", func(t *testing.T) {
+		f := newFDLFixture(t, true)
+		noFlags(t, f)
+		f.cs.asyncPromoted.Store(true)
+		f.armFirstRecv()
+		f.startDrain()
+		f.cs.transplantPending.Store(true)
+		f.w.enqueueDetach(f.cs)
+		f.w.drainDetachQueue()
+		checkNothingPlaced(t, f, "the drain of the goroutine's claim")
+		if n := metric(t, f.e, "TransplantReaps"); n != 0 {
+			t.Errorf("TransplantReaps = %d, want 0", n)
+		}
+	})
+}
+
+// TestReapSuppressedAfterFailedHandOff (celeris#681 C2): a hand-off that
+// fails at its dup (a process out of descriptors) leaves the conn in place,
+// and the recv re-armed for it used to be reaped again at once, failing the
+// same way: a RECV, a cancel and two completions per loop iteration for as
+// long as the failure and the drain lasted. No reap may follow a failed
+// hand-off until the conn receives data again, and once the dup works the
+// conn leaves normally.
+func TestReapSuppressedAfterFailedHandOff(t *testing.T) {
+	f := reapedFixture(t)
+	dupCalls := 0
+	failDup := func(int) (int, error) {
+		dupCalls++
+		return -1, unix.EMFILE
+	}
+	if !trySetWorkerField(f.w, "dupFD", failDup) {
+		t.Error("Worker has no dupFD seam: the dup failure cannot be injected, the real dup runs")
+	}
+	// The reap lands; the hand-off it re-runs fails at the dup.
+	f.process(f.recvCQE(-int32(unix.ECANCELED)))
+	if n := f.tgt.adopted.Load(); n != 0 {
+		t.Fatalf("the conn was handed off (%d) although its dup failed", n)
+	}
+	sqes := takeSQEs(f.w.ring)
+	if len(sqes) != 1 || sqes[0].op != opRECV || sqes[0].tag() != udRecv {
+		t.Fatalf("after the failed hand-off the completion placed %v, want only the conn's recv re-armed; "+
+			"a reap of it fails the hand-off again at once", sqes)
+	}
+	for i := 1; i <= 3; i++ {
+		f.w.drainDetachQueue()
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+			t.Fatalf("loop iteration %d placed %v after the failed hand-off, want nothing", i, sqes)
+		}
+	}
+	// The client's next request: served here and HELD (the drain is still
+	// set); its SEND completion tries the hand-off, whose dup fails again,
+	// so the recv is re-armed, and again not reaped.
+	f.deliver(fdlGET)
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || sqes[0].op != opSEND {
+		t.Fatalf("the next request placed %v, want its held SEND", sqes)
+	}
+	f.process(f.sendCQE())
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || sqes[0].op != opRECV {
+		t.Fatalf("the held SEND's completion, with the dup failing, placed %v, want only the recv re-armed", sqes)
+	}
+	if dupCalls != 2 {
+		t.Errorf("dup tried %d times, want 2: once at the reap, once at the held response", dupCalls)
+	}
+	// The descriptors are back: the next response leaves.
+	trySetWorkerField(f.w, "dupFD", (func(int) (int, error))(nil))
+	heldHandOff(t, f)
+}
+
+// TestReapedRecvLeavesNoLinkOrBuffer (celeris#681 C4): reapOutcome consumes
+// the reaped recv's -ECANCELED, the last completion that recv has, so it
+// must leave what handleRecv leaves after any recv's last completion: no
+// stale recvLinked (only the chained recv's own completion clears it), and a
+// provided buffer the completion carries returned to the ring.
+func TestReapedRecvLeavesNoLinkOrBuffer(t *testing.T) {
+	t.Run("linked_recv_is_unlinked", func(t *testing.T) {
+		f := newFDLFixture(t, false)
+		f.armFirstRecv()
+		f.serveOne()
+		if !f.cs.recvLinked {
+			t.Fatal("setup: serveOne left no linked RECV")
+		}
+		f.startDrain()
+		f.w.tryTransplant(f.fd)
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+			t.Fatalf("placed %v, want the reap of the linked RECV", sqes)
+		}
+		f.stopDrain() // the conn stays: its recv is re-armed standalone
+		f.process(f.recvCQE(-int32(unix.ECANCELED)))
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || sqes[0].op != opRECV || sqes[0].flags&sqeIOLink != 0 {
+			t.Fatalf("placed %v, want one standalone RECV", sqes)
+		}
+		if f.cs.recvLinked {
+			t.Fatal("recvLinked is still set after the linked recv's last completion: the recv armed now is standalone")
+		}
+	})
+
+	t.Run("provided_buffer_goes_back", func(t *testing.T) {
+		f := reapedFixture(t)
+		br, err := NewBufferRing(f.w.ring, 7, 4, 64)
+		if err != nil {
+			skipOrFail656(t, "provided buffer ring unavailable: %v", err)
+		}
+		t.Cleanup(func() { br.Close(f.w.ring) })
+		f.w.bufRing = br
+		tail := br.tail
+		f.stopDrain()
+		c := f.recvCQE(-int32(unix.ECANCELED))
+		c.Flags = cqeFBuffer | 2<<16
+		f.process(c)
+		if br.tail != tail+1 || !f.w.hasBufReturns {
+			t.Fatalf("provided buffer 2 not returned (ring tail %d -> %d, hasBufReturns=%v)",
+				tail, br.tail, f.w.hasBufReturns)
+		}
 	})
 }

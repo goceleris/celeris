@@ -215,10 +215,18 @@ type connState struct {
 	// completion was expected to take the conn (HOLD). releaseHold arms the
 	// recv there if the hand-off does not happen.
 	//
-	// All three worker-thread only, like recvCancelPending.
+	// reapSuppressed: the conn's last hand-off failed at handOff (the dup or
+	// its non-blocking switch, e.g. EMFILE), so no reap is placed for it
+	// until it next receives data. Without it, the recv re-armed after the
+	// failure was reaped again at once and the hand-off failed again: a
+	// RECV, a cancel and two completions per loop iteration for as long as
+	// the failure and the drain both lasted.
+	//
+	// All four worker-thread only, like recvCancelPending.
 	transplantReap uint16
 	reapStale      bool
 	transplantHold bool
+	reapSuppressed bool
 
 	// Async handler dispatch (Worker.async=true, HTTP1 only):
 	// Incoming recv bytes are appended under asyncInMu by the worker.
@@ -468,6 +476,7 @@ func releaseConnState(cs *connState) {
 	cs.transplantReap = 0
 	cs.reapStale = false
 	cs.transplantHold = false
+	cs.reapSuppressed = false
 	cs.headerTimerSpec = kernelTimespec{}
 	cs.headerTimerArmed = false
 	cs.forceRSTClose = false

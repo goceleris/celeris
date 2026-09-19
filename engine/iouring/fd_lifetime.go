@@ -31,7 +31,13 @@ import (
 //     and its response is HELD. If the cancel reports that it matched
 //     nothing (the recv completed first, or is still linked behind its SEND
 //     and not issued), the reap is retried on the next loop iteration while
-//     the recv is still armed. A miss is never followed by a hand-off.
+//     the recv is still armed. A miss is never followed by a hand-off, and
+//     neither is any other result: a cancel that fails outright is counted
+//     and not retried. A reap needs IORING_ASYNC_CANCEL flags (Linux 5.19);
+//     on a kernel that rejects them (probeAsyncCancelFlags) none is placed,
+//     and the conn stays until its recv completes on its own (startReap).
+//     None is placed either after a hand-off of the conn failed at its dup,
+//     until the conn next receives data.
 //   - HOLD. While a drain is set, the response of a connection the hand-off
 //     would accept is flushed with no recv behind it (not linked, not
 //     standalone). Its SEND completion then finds nothing in flight and hands
@@ -51,7 +57,26 @@ func onlyRecvInFlight(cs *connState) bool {
 // startReap submits a reported cancel of cs's armed recv, unless a reap is
 // already aimed at that recv. Worker thread only. A full SQ ring defers it to
 // the next iteration's retry.
+//
+// Two conditions place no reap and queue no retry. The conn keeps its recv
+// armed and stays until that recv completes on its own: a sync conn then has
+// the request it brings served here and its response HELD, and leaves at that
+// SEND's completion with nothing in flight; a promoted async conn, which is
+// never held, stays on io_uring (placement only: nothing is in flight when it
+// moves, so no request can be lost). The conditions:
+//   - the kernel rejects IORING_ASYNC_CANCEL flags (before 5.19, found by
+//     probeAsyncCancelFlags): every reap would fail with -EINVAL and leave
+//     the recv armed. Counted (TransplantReapUnsupported).
+//   - the conn's last hand-off failed at its dup (reapSuppressed): reaping
+//     the recv re-armed after that failure would fail the same way at once.
 func (w *Worker) startReap(cs *connState) {
+	if !w.asyncCancelFlags {
+		w.handoffLoss.noteReapUnsupported()
+		return
+	}
+	if cs.reapSuppressed {
+		return
+	}
 	if cs.transplantReap > 0 && !cs.reapStale {
 		return // the armed recv already has a reap on its way
 	}
@@ -76,8 +101,19 @@ func (w *Worker) startReap(cs *connState) {
 // completion means the recv the reaps were aimed at completed by itself — a
 // request, a FIN, an error — and is handled as usual; the reaps still counted
 // now target a recv that is gone.
+//
+// Consuming the completion here means doing what handleRecv does for every
+// recv completion it ends: a provided buffer the completion carries goes back
+// to the ring (a cancelled recv consumed none, so this is defensive), and
+// recvLinked, which only the chained recv's own completion clears, is cleared,
+// since this completion is that recv's last.
 func (w *Worker) reapOutcome(c *completionEntry, fd int, cs *connState) bool {
 	if c.Res == -int32(unix.ECANCELED) && !cs.recvPaused && cs.recvCancelPending == 0 {
+		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
+			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
+			w.hasBufReturns = true
+		}
+		cs.recvLinked = false
 		cs.transplantReap--
 		cs.reapStale = true
 		w.rerunHandOff(fd, cs)
@@ -101,7 +137,17 @@ func (w *Worker) reapOutcome(c *completionEntry, fd int, cs *connState) bool {
 // IORING_ASYNC_CANCEL_ALL, res > 0 is a hit whose -ECANCELED reapOutcome
 // retires, and -EALREADY means the recv was found executing and completes on
 // its own, which is treated the same way (as handleRecvCancel treats it).
-// res == 0 or -ENOENT is the miss: the only event that can report it.
+// res == 0 or -ENOENT is the miss: the only event that can report it, and
+// the only one retried.
+//
+// Anything else is a cancel that failed, not an answer about the recv: the
+// kernel matched nothing because it never looked. -EINVAL is what a kernel
+// that rejects IORING_ASYNC_CANCEL flags returns (before 5.19; the startup
+// probe keeps reaps off there). Retrying it placed the same failing cancel
+// on every loop iteration for as long as the drain lasted. It is counted
+// (TransplantReapFailed, which must stay 0), not retried, and not followed
+// by a hand-off: the recv stays armed and the conn is served here until that
+// recv completes on its own.
 func (w *Worker) handleTransplantReap(c *completionEntry, fd int) {
 	if fd < 0 || fd >= len(w.conns) {
 		return
@@ -113,7 +159,12 @@ func (w *Worker) handleTransplantReap(c *completionEntry, fd int) {
 	if c.Res > 0 || c.Res == -int32(unix.EALREADY) {
 		return
 	}
-	w.handoffLoss.noteReapMiss()
+	miss := c.Res == 0 || c.Res == -int32(unix.ENOENT)
+	if miss {
+		w.handoffLoss.noteReapMiss()
+	} else {
+		w.handoffLoss.noteReapFailed()
+	}
 	if cs.transplantReap > 0 {
 		cs.transplantReap--
 	}
@@ -121,7 +172,7 @@ func (w *Worker) handleTransplantReap(c *completionEntry, fd int) {
 		return // another reap is still out; its own outcome decides
 	}
 	cs.reapStale = false
-	if cs.recvArmed && !cs.closing {
+	if miss && cs.recvArmed && !cs.closing {
 		w.queueReapRetry(cs)
 	}
 }
@@ -201,12 +252,20 @@ func (w *Worker) holdEligible(cs *connState) bool {
 	return cs.sending || len(cs.writeBuf) > 0 || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
 }
 
-// releaseHold runs after the hand-off attempt at every recv/send dispatch
-// site, unconditionally: a conn held for a hand-off (transplantHold) whose
-// response has been sent but that is still here — the drain stopped, a gate
-// refused, the dup failed — gets its recv armed. No counter gates the call; a
-// drifting one could skip a re-arm and leave a conn that cannot read. Small
-// enough to inline: one slot load and one flag per recv/send completion.
+// releaseHold runs after the hand-off attempt at every send dispatch site
+// (the inlined one and processCQE's), unconditionally: a conn held for a
+// hand-off (transplantHold) whose response has been sent but that is still
+// here — the drain stopped, a gate refused, the dup failed — gets its recv
+// armed. No counter gates the call; a drifting one could skip a re-arm and
+// leave a conn that cannot read. Small enough to inline: one slot load and
+// one flag per send completion.
+//
+// The recv dispatch sites do not call it. A held conn has no recv armed:
+// every path that arms one clears the hold first (releaseHoldSlow) or
+// refuses a held conn (reapOutcome), so the only recv completion that finds
+// a hold is the one whose own response just set it, with that SEND still in
+// flight, and releaseHoldSlow would return at its egress check. Measured the
+// same way: 60,559 recv-site entries with the hold set, none changed a thing.
 func (w *Worker) releaseHold(fd int) {
 	if cs := w.conns[fd]; cs != nil && cs.transplantHold {
 		w.releaseHoldSlow(cs, false)

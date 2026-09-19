@@ -85,7 +85,10 @@ func (w *Worker) tryTransplant(fd int) {
 	// and the process had reused (measured: one identity moved twice, 20 us
 	// apart, in 1 of 167 runs, the run with the only negative gauge). The
 	// goroutine sets the claim and clears asyncRun under asyncInMu, so both
-	// are read under it here.
+	// are read under it here. Leaving the conn to its claim is ordering, not
+	// a double claim (a completion of the conn landed between the park and
+	// the drain of the claim), and it is counted as such, before any of the
+	// gates below: TransplantClaimDeferred, a rate.
 	if w.async {
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
@@ -95,7 +98,7 @@ func (w *Worker) tryTransplant(fd int) {
 			return
 		}
 		if claimed {
-			w.handoffLoss.noteDoubleClaim()
+			w.handoffLoss.noteClaimDeferred()
 			return
 		}
 	}
@@ -137,19 +140,26 @@ func (w *Worker) tryTransplant(fd int) {
 // conn table, cancel what is still armed, defer the connState release to the
 // terminal CQEs), closes the ORIGINAL fd (the dup keeps the socket alive for
 // epoll) and hands the dup over. A failed dup leaves the conn untouched and
-// reports false; the hand-off is retried at the conn's next boundary.
+// reports false; the hand-off is retried at the conn's next boundary, with no
+// reap placed for it until it next receives data (reapSuppressed).
 //
 // detachedRelease picks the release: the async site's dispatch goroutine may
 // still be in its deferred recover()/Done() block referencing cs, so that site
 // holds cs alive with no pool recycle until the kernel ops drain (mirrors
 // finishCloseDetached).
 func (w *Worker) handOff(cs *connState, fd int, h *transplantTargetHolder, detachedRelease bool) bool {
-	newFD, err := unix.Dup(fd)
+	dup := unix.Dup
+	if w.dupFD != nil {
+		dup = w.dupFD
+	}
+	newFD, err := dup(fd)
 	if err != nil {
+		cs.reapSuppressed = true
 		return false
 	}
 	if serr := unix.SetNonblock(newFD, true); serr != nil {
 		_ = unix.Close(newFD)
+		cs.reapSuppressed = true
 		return false
 	}
 	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
@@ -270,8 +280,21 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	// that still owns its slot. If anything else moved or closed it since the
 	// goroutine's claim, cs.fd is a number some other connection may hold by
 	// now, and dup'ing it would hand that connection off.
-	if cs.fd < 0 || cs.fd >= len(w.conns) || w.conns[cs.fd] != cs || cs.closing {
+	//
+	// Only the slot check is a double claim, and only it is counted
+	// (TransplantDoubleClaim, which must stay 0). In async mode a close marks
+	// the queued claim detachClosed, so drainDetachQueue skips it before this
+	// point, and hijack is refused; what else vacates the slot is another
+	// hand-off of this conn. A closing conn (a close deferred behind a send)
+	// is an ordinary refusal, and the range check is defensive.
+	if cs.fd < 0 || cs.fd >= len(w.conns) {
+		return
+	}
+	if w.conns[cs.fd] != cs {
 		w.handoffLoss.noteDoubleClaim()
+		return
+	}
+	if cs.closing {
 		return
 	}
 	// Re-validate egress here, on the worker thread (celeris#529).

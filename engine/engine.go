@@ -513,17 +513,40 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// unable to read until the sweep came by (celeris#657). io_uring-only;
 	// on the adaptive engine the sum over both sub-engines.
 	TransplantHoldRescued uint64
-	// TransplantDoubleClaim counts io_uring hand-offs refused because another
-	// path already owned that connection's hand-off: the sync path finding a
-	// connection whose async dispatch goroutine had claimed its own hand-off,
-	// or the async completion finding its connection no longer owns its
-	// descriptor slot. Each is a connection that would otherwise have been
-	// handed off twice, the second time as whatever socket then held the
-	// descriptor number (celeris#657). The first case needs a send
-	// completion to land between the claim and the worker's drain of it, so
-	// a low non-zero rate is the check working, not a fault. io_uring-only;
-	// on the adaptive engine the sum over both sub-engines.
+	// TransplantDoubleClaim counts io_uring hand-offs refused because the
+	// connection had already left its descriptor slot when its async
+	// dispatch goroutine's claim to hand it off was acted on. In async mode
+	// only another hand-off of the same connection vacates the slot that way
+	// (a close marks the queued claim first, and a hijack is refused), so
+	// each count is a connection that would otherwise have been handed off
+	// twice, the second time as whatever socket then held the descriptor
+	// number (celeris#657). Must stay 0: a release gate can require it.
+	// io_uring-only; on the adaptive engine the sum over both sub-engines.
 	TransplantDoubleClaim uint64
+	// TransplantClaimDeferred counts io_uring hand-off attempts on the
+	// worker's own path that found the connection's async dispatch
+	// goroutine had already claimed the hand-off, and left it to that claim.
+	// It is ordering, not a fault: it fires whenever a completion of the
+	// connection lands between the goroutine's park and the worker's drain
+	// of the claim. A rate. io_uring-only; on the adaptive engine the sum
+	// over both sub-engines.
+	TransplantClaimDeferred uint64
+	// TransplantReapFailed counts hand-off recv cancels (TransplantReaps)
+	// whose completion was neither a hit nor a miss, for example -EINVAL
+	// from a kernel that rejects the cancel flags the startup probe found
+	// accepted. Such a cancel is not retried and is never followed by a
+	// hand-off; the connection stays until its recv completes on its own.
+	// Must stay 0. io_uring-only; on the adaptive engine the sum over both
+	// sub-engines.
+	TransplantReapFailed uint64
+	// TransplantReapUnsupported counts hand-off recv cancels not placed
+	// because the kernel rejects the IORING_ASYNC_CANCEL flags they need
+	// (Linux 5.19 added them; the io_uring engine probes for them at
+	// startup). The connection stays on io_uring until its armed recv
+	// completes on its own, and is handed off after its next response.
+	// A rate, 0 on every kernel from 5.19. io_uring-only; on the adaptive
+	// engine the sum over both sub-engines.
+	TransplantReapUnsupported uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and
