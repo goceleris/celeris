@@ -190,6 +190,11 @@ type pendingReleaseEntry struct {
 type closedOpsEntry struct {
 	inflight int32
 	conns    []*connState
+	// handoff marks an identity a conn left through a transplant hand-off
+	// rather than a close (noteHandedOffInflight), so a stale recv CQE that
+	// carried data for it is counted as a hand-off loss (celeris#657). It
+	// is read only by that counter and changes nothing else.
+	handoff bool
 }
 
 // pendingReleaseHoldNanos is the WALL-CLOCK BACKSTOP for releasing a
@@ -351,6 +356,10 @@ type Worker struct {
 	// (celeris#624).
 	transplantHandoffRefused *atomic.Uint64 // target refused an already-relinquished fd
 	transplantAdoptRefused   *atomic.Uint64 // adoption refused for a reason other than a taken slot
+	// handoffLoss is the engine-wide celeris#657 witness set: stale recv
+	// data by identity class and hand-offs made with an op in flight.
+	// nil-safe so a bare test Worker literal can skip it.
+	handoffLoss *handoffLossStats
 	// recvArm is the engine-wide recv-arming witness set (celeris#586);
 	// nil-safe so a bare test Worker literal can skip it.
 	recvArm *recvArmStats
@@ -1498,6 +1507,12 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			}
 		}
 		return false
+	}
+	// A stale recv that read bytes consumed a request some client is
+	// still waiting on; count it by its identity's class BEFORE
+	// noteStaleTerminalOp can retire that identity (celeris#657).
+	if op == udRecv && c.Res > 0 {
+		w.noteStaleRecvData(ud)
 	}
 	if terminalOp {
 		w.noteStaleTerminalOp(ud)
