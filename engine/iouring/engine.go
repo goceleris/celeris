@@ -180,7 +180,9 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	// release, 5.19); where one exists because the probe got no answer on a
 	// newer kernel, the connection is not held and stays on io_uring. A
 	// promoted async connection is never offered for the hand-off without
-	// the flags and stays too. Placement only, either way.
+	// the flags and stays too. Placement only, either way. Only the kernel's
+	// answer is cached: after a probe with no answer (or one it does not
+	// recognise) the next New probes again (celeris#681 N1).
 	asyncCancel, acReason := probeAsyncCancelFlagsCached()
 	asyncCancelFlags := asyncCancel == asyncCancelAccepted
 	logAsyncCancelProbe(cfg.Logger, asyncCancel, acReason, profile.KernelMajor, profile.KernelMinor)
@@ -225,8 +227,9 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 // no kernel measured gives, on any version: Warn, with the reason, which
 // names the errno (celeris#681 N2). A probe that got no answer says nothing
 // about the kernel; on one whose version has the flags (5.19 and later) it is
-// unexpected, and it keeps the hand-off's reap off for this process, so it is
-// a Warn there and Info below.
+// unexpected, and it keeps the hand-off's reap off for the engine being built
+// (the next New probes again: probeAsyncCancelFlagsCached keeps only an
+// answer), so it is a Warn there and Info below.
 func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kernelMajor, kernelMinor int) {
 	kernel := fmt.Sprintf("%d.%d", kernelMajor, kernelMinor)
 	switch p {

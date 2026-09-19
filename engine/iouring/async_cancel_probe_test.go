@@ -153,6 +153,10 @@ func TestAsyncCancelProbeOnThisKernel(t *testing.T) {
 		t.Fatalf("a cancel flag no kernel defines was read as (%v, %q), want rejected with EINVAL: "+
 			"the probe does not read the kernel's answer", bad, why)
 	}
+
+	// A wait for the cancel's completion that a signal cuts short is
+	// repeated once (celeris#681 N1).
+	t.Run("a_cut_short_wait_is_retried_once", probeCutShortWaitIsRetriedOnce)
 }
 
 // TestWorkersCarryTheAsyncCancelProbe: New stores the probe's answer and
@@ -191,6 +195,60 @@ func TestWorkersCarryTheAsyncCancelProbe(t *testing.T) {
 	// A probe that fails before the kernel answers keeps the reap off too,
 	// and New reports it apart from a rejection (celeris#681 R2).
 	t.Run("no_answer_is_logged_apart_from_a_rejection", newWarnsWhenTheProbeGetsNoAnswer)
+
+	// Only the kernel's answer is kept for the process: after a probe with no
+	// answer the next New probes again (celeris#681 N1).
+	t.Run("only_an_answer_is_cached", probeOnlyAnAnswerIsCached)
+
+	// An answer the probe does not recognise is not cached either, keeps the
+	// reap off in every engine New builds, and each New warns with its errno
+	// (celeris#681 N1, N2).
+	t.Run("unexpected_answer_keeps_the_reap_off_and_is_not_cached", func(t *testing.T) {
+		saved := runAsyncCancelProbe
+		calls := 0
+		const reason = "the cancel completed with cqe.res=-9 (EBADF), which the probe does not recognise"
+		runAsyncCancelProbe = func() (asyncCancelProbe, string) {
+			calls++
+			return asyncCancelUnexpected, reason
+		}
+		resetAsyncCancelProbeCache()
+		t.Cleanup(func() {
+			runAsyncCancelProbe = saved
+			resetAsyncCancelProbeCache()
+		})
+		var buf lockedBuffer
+		for i := 1; i <= 2; i++ {
+			e, err := New(resource.Config{
+				Addr:     "127.0.0.1:0",
+				Protocol: engine.HTTP1,
+				Logger:   slog.New(slog.NewJSONHandler(&buf, nil)),
+			}, transplantTestHandler{})
+			if err != nil {
+				skipOrFail656(t, "iouring engine unavailable: %v", err)
+			}
+			if e.asyncCancelFlags {
+				t.Fatalf("New %d turned the hand-off's reap on for an answer the probe does not recognise", i)
+			}
+		}
+		if calls != 2 {
+			t.Errorf("two News ran the probe %d time(s), want 2: an answer the probe does not recognise was cached", calls)
+		}
+		var warns int
+		for _, r := range buf.records(t) {
+			if msg, _ := r["msg"].(string); !strings.HasPrefix(msg, "async cancel flags") {
+				continue
+			}
+			level, _ := r["level"].(string)
+			why, _ := r["reason"].(string)
+			if level != "WARN" || !strings.Contains(why, "EBADF") {
+				t.Errorf("an unexpected answer was logged at %s with reason %q, want WARN naming EBADF", level, why)
+			}
+			warns++
+		}
+		if warns != 2 {
+			t.Errorf("two News logged %d probe records, want one each", warns)
+		}
+	})
 }
 
 // TestReapOnTheRunningKernel drives the hand-off of an idle conn whose recv

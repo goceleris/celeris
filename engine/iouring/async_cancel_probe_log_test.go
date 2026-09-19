@@ -54,7 +54,8 @@ func (l *lockedBuffer) records(t *testing.T) []map[string]any {
 // answer and must not read as one: its record says the probe got no answer,
 // names the probe's failure, and on a kernel whose version has the flags
 // (5.19 and later) it is a Warn, since the reap is then off where it should
-// work. Only the probe-ring seam and API older than round 3 are used here.
+// work. Only the probe-ring seam, the cache reset (async_cancel_probe_reset_test.go)
+// and API older than round 3 are used here.
 func newWarnsWhenTheProbeGetsNoAnswer(t *testing.T) {
 	p := probe.Probe()
 	want := "INFO"
@@ -63,10 +64,10 @@ func newWarnsWhenTheProbeGetsNoAnswer(t *testing.T) {
 	}
 	saved := newAsyncCancelProbeRing
 	newAsyncCancelProbeRing = func() (*Ring, error) { return nil, errors.New("celeris681 injected: no ring") }
-	cachedAsyncCancel = sync.Once{}
+	resetAsyncCancelProbeCache()
 	t.Cleanup(func() {
 		newAsyncCancelProbeRing = saved
-		cachedAsyncCancel = sync.Once{} // the next New probes the kernel again
+		resetAsyncCancelProbeCache() // the next New probes the kernel again
 	})
 	var buf lockedBuffer
 	e, err := New(resource.Config{

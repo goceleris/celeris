@@ -19,7 +19,8 @@ import (
 // matrix can run thousands of cells in one process with -race), and
 // re-running every probe
 // (each opens a temp ring + a TCP listener + a dial) on every New() is
-// pure overhead.
+// pure overhead. The async-cancel-flags probe is cached only once the kernel
+// has answered it (probeAsyncCancelFlagsCached).
 var (
 	cachedSendZC          sync.Once
 	cachedSendZCResult    SendZCProbeResult
@@ -33,7 +34,11 @@ var (
 	cachedMultiAccept     sync.Once
 	cachedMultiAcceptOK   bool
 	cachedMultiAcceptReas string
-	cachedAsyncCancel     sync.Once
+	// The async-cancel-flags probe's answer, once the kernel has given one:
+	// asyncCancelKnown says whether cachedAsyncCancelRes/Reas hold it. All
+	// three are guarded by asyncCancelMu.
+	asyncCancelMu         sync.Mutex
+	asyncCancelKnown      bool
 	cachedAsyncCancelRes  asyncCancelProbe
 	cachedAsyncCancelReas string
 )
@@ -71,14 +76,32 @@ func probeMultishotAcceptCached() (bool, string) {
 	return cachedMultiAcceptOK, cachedMultiAcceptReas
 }
 
-// probeAsyncCancelFlagsCached returns the cached async-cancel-flags probe
-// result.
+// probeAsyncCancelFlagsCached returns the async-cancel-flags probe's answer.
+// Only the kernel's answer, accepted or rejected, is cached for the process
+// (celeris#681 N1). A probe that got no answer says nothing lasting about the
+// kernel: its private ring can fail to set up with EMFILE or ENOMEM when the
+// adaptive engine builds its io_uring engine lazily under load, and its wait
+// can come back without the cancel's completion. Cached, one such failure kept
+// the hand-off's reap off for the life of the process. So a probe with no
+// answer is not cached, and neither is an answer the probe does not recognise:
+// the next New probes again, and logs again. Calls are serialised, so
+// concurrent News run one probe at a time and never overwrite an answer.
 func probeAsyncCancelFlagsCached() (asyncCancelProbe, string) {
-	cachedAsyncCancel.Do(func() {
-		cachedAsyncCancelRes, cachedAsyncCancelReas = probeAsyncCancelFlags()
-	})
-	return cachedAsyncCancelRes, cachedAsyncCancelReas
+	asyncCancelMu.Lock()
+	defer asyncCancelMu.Unlock()
+	if asyncCancelKnown {
+		return cachedAsyncCancelRes, cachedAsyncCancelReas
+	}
+	res, reason := runAsyncCancelProbe()
+	if res == asyncCancelAccepted || res == asyncCancelRejected {
+		cachedAsyncCancelRes, cachedAsyncCancelReas, asyncCancelKnown = res, reason, true
+	}
+	return res, reason
 }
+
+// runAsyncCancelProbe is the probe probeAsyncCancelFlagsCached runs. A
+// variable so a test can give each class of answer to the cache and to New.
+var runAsyncCancelProbe = probeAsyncCancelFlags
 
 // SEND_ZC ioprio flags and notification result values.
 const (
@@ -517,6 +540,15 @@ func (p asyncCancelProbe) String() string {
 // test can make the probe fail before the kernel answers.
 var newAsyncCancelProbeRing = func() (*Ring, error) { return NewRing(8, 0, 0) }
 
+// The probe's submit and its wait for the cancel's completion, and how long
+// that wait is. Variables so a test can hold the cancel back and cut the wait
+// short (celeris#681 N1).
+var (
+	asyncCancelProbeSubmit  = func(r *Ring) (int, error) { return r.Submit() }
+	asyncCancelProbeWait    = func(r *Ring, d time.Duration) error { return r.SubmitAndWaitTimeout(d) }
+	asyncCancelProbeTimeout = 500 * time.Millisecond
+)
+
 // probeAsyncCancelFlags tests whether the kernel accepts the
 // IORING_ASYNC_CANCEL_* flags, which exist from Linux 5.19. The io_uring→epoll
 // hand-off's REAP (celeris#657) cancels an armed recv with
@@ -531,9 +563,12 @@ var newAsyncCancelProbeRing = func() (*Ring, error) { return NewRing(8, 0, 0) }
 // nothing carries and reads the cancel's own completion; see
 // classifyAsyncCancelProbe for how the result reads. The cancel runs inline
 // at submit on every kernel measured, so its completion is normally there
-// when Submit returns; a short wait covers any that is not. A probe that
-// fails before that completion is read reports asyncCancelNoAnswer, never a
-// rejection.
+// when Submit returns; a short wait covers any that is not. That wait is
+// retried once if it comes back early with nothing to read: SubmitAndWaitTimeout
+// returns nil both when its timeout expires and when a signal cuts the wait
+// short (EINTR), and only an early return can be the latter (celeris#681 N1).
+// A probe that fails before that completion is read reports
+// asyncCancelNoAnswer, never a rejection.
 func probeAsyncCancelFlags() (asyncCancelProbe, string) {
 	return probeAsyncCancel(cancelAll)
 }
@@ -556,17 +591,25 @@ func probeAsyncCancel(cancelFlags uint32) (asyncCancelProbe, string) {
 	prepCancelUserDataReported(sqe, asyncCancelProbeTarget)
 	*(*uint32)(unsafe.Pointer(&(*[sqeSize]byte)(sqe)[28])) = cancelFlags
 	setSQEUserData(sqe, asyncCancelProbeTag)
-	if _, err := ring.Submit(); err != nil {
+	if _, err := asyncCancelProbeSubmit(ring); err != nil {
 		return asyncCancelNoAnswer, "Submit failed: " + err.Error()
 	}
 	head, tail := ring.BeginCQ()
 	if head == tail {
-		if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
-			return asyncCancelNoAnswer, "SubmitAndWaitTimeout failed: " + err.Error()
-		}
-		head, tail = ring.BeginCQ()
-		if head == tail {
-			return asyncCancelNoAnswer, "no CQE produced for the cancel (waited 500ms)"
+		timeout := asyncCancelProbeTimeout
+		deadline := time.Now().Add(timeout)
+		for waits := 1; ; waits++ {
+			if err := asyncCancelProbeWait(ring, time.Until(deadline)); err != nil {
+				return asyncCancelNoAnswer, "SubmitAndWaitTimeout failed: " + err.Error()
+			}
+			if head, tail = ring.BeginCQ(); head != tail {
+				break
+			}
+			// An early return with nothing to read is a wait a signal cut
+			// short: wait once more, for the rest of the time.
+			if waits == 2 || !time.Now().Before(deadline) {
+				return asyncCancelNoAnswer, fmt.Sprintf("no CQE produced for the cancel (waited %v, %d wait(s))", timeout, waits)
+			}
 		}
 	}
 	cqe := ring.cqeAt(head)
