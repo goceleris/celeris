@@ -127,12 +127,14 @@ jobs:
           go test -race -count=1 -timeout=300s $pkgs
       # celeris#657: the step above runs ./engine/iouring WITHOUT -v, so a skip
       # there prints nothing and the package still reports `ok`. That is how the
-      # celeris#656 leak shipped with no cover. Five of the celeris#657 hand-off
-      # loss witness tests can skip: four build a ring through newTestRing, and
-      # one builds io_uring workers. So all eleven witness tests run again here
-      # by name, with the PASS-count interlock the `iouring` job uses
-      # (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1 to turn every
-      # environment skip into a failure, and an exact tally.
+      # celeris#656 leak shipped with no cover. Many celeris#657 tests can skip:
+      # of the eleven hand-off loss witness tests (PR-1), four build a ring
+      # through newTestRing and one builds io_uring workers; of the ten
+      # fd-lifetime tests (PR-2), six build a ring through newTestRing and
+      # four (plus one subtest of the six) start a whole io_uring engine. So
+      # all twenty-one run again here by name, with the PASS-count interlock
+      # the `iouring` job uses (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1
+      # to turn every environment skip into a failure, and an exact tally.
       #
       # The tally counts TOP-LEVEL results: `=== RUN   Name` with nothing after
       # the name, and `--- PASS: Name (`. go test prints the elapsed time after
@@ -145,53 +147,35 @@ jobs:
       # measured (CI and local runner-shape containers), not guaranteed. If a
       # later change makes them not fit, the require-workers env turns the
       # ENOMEM into a red job instead of a skip. That is intended.
-      - name: celeris#657 hand-off loss witness tests (skipping forbidden)
+      #
+      # That 8 MiB is also what makes this the one-worker leg of the
+      # fd-lifetime tests: through the Listen path it funds a single io_uring
+      # worker, the shape in which every hand-off loss was measured (all
+      # connections on one ring). Each engine-level fd-lifetime test logs
+      # "celeris657 engine workers=N"; the step requires at least one such
+      # line and every one to read workers=1, so a runner that funds more
+      # workers fails here instead of silently testing another shape.
+      - name: celeris#657 hand-off witness and fd-lifetime tests, one io_uring worker (skipping forbidden)
         shell: bash
         env:
           CELERIS_REQUIRE_IOURING_WORKERS: "1"
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestStaleRecvDataCountsATransplantedConn|TestStaleRecvDataCountsAnAsyncTransplantedConn|TestStaleRecvDataCountsAClosedConn|TestStaleRecvDataCountsAnUnattributedIdentity|TestStaleRecvDataIgnoresCompletionsWithoutData|TestStaleRecvDataCountsEachMultishotCompletion|TestTransplantHandoffInFlightCountsTryTransplant|TestTransplantHandoffInFlightCountsFinishAsyncTransplant|TestMetricsCarriesTheHandoffLossWitnesses|TestWorkersShareTheHandoffLossWitnesses|TestClosedOpsEntryStaysThirtyTwoBytes'
+          pr1='TestStaleRecvDataCountsATransplantedConn|TestStaleRecvDataCountsAnAsyncTransplantedConn|TestStaleRecvDataCountsAClosedConn|TestStaleRecvDataCountsAnUnattributedIdentity|TestStaleRecvDataIgnoresCompletionsWithoutData|TestStaleRecvDataCountsEachMultishotCompletion|TestTransplantHandoffInFlightCountsTryTransplant|TestTransplantHandoffInFlightCountsFinishAsyncTransplant|TestMetricsCarriesTheHandoffLossWitnesses|TestWorkersShareTheHandoffLossWitnesses|TestClosedOpsEntryStaysThirtyTwoBytes'
+          pr2='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending'
+          names="${pr1}|${pr2}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./engine/iouring/ 2>&1 | tee /tmp/witness657.log
           ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/witness657.log || true)
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/witness657.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/witness657.log || true)
-          echo "celeris#657 witness tests: want $want, ran $ran, passed $passed, SKIP lines $skipped"
-          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ]; then
-            echo "expected exactly $want top-level celeris#657 tests to run and PASS with no SKIP line --"
-            echo "was one renamed or removed, did one skip, or did one fail?"
-            exit 1
-          fi
-      # celeris#657 PR-2: the fd-lifetime tests of the io_uring hand-off, run
-      # the same way: by name, -v, skipping forbidden, exact tally. This is
-      # the one-worker leg: the runner's own 8 MiB memlock funds a single
-      # io_uring worker, the shape in which every hand-off loss was measured
-      # (all connections on one ring). The engine-level tests log
-      # "celeris657 engine workers=N"; the tally below requires every such
-      # line to read workers=1, so a runner that funds more workers fails
-      # this step instead of silently testing another shape.
-      - name: celeris#657 fd-lifetime tests, one io_uring worker (skipping forbidden)
-        shell: bash
-        env:
-          CELERIS_REQUIRE_IOURING_WORKERS: "1"
-        run: |
-          set -o pipefail
-          echo "memlock (KiB): $(ulimit -l)"
-          names='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending'
-          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
-          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/fdlife657.log
-          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/fdlife657.log || true)
-          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/fdlife657.log || true)
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/fdlife657.log || true)
-          engines=$(grep -cE 'celeris657 engine workers=[0-9]+' /tmp/fdlife657.log || true)
-          one=$(grep -cE 'celeris657 engine workers=1$' /tmp/fdlife657.log || true)
-          echo "celeris#657 fd-lifetime tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, engines $engines at workers=1: $one"
+          engines=$(grep -cE 'celeris657 engine workers=[0-9]+$' /tmp/witness657.log || true)
+          one=$(grep -cE 'celeris657 engine workers=1$' /tmp/witness657.log || true)
+          echo "celeris#657 witness and fd-lifetime tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, engines $engines at workers=1: $one"
           if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$engines" -eq 0 ] || [ "$one" -ne "$engines" ]; then
-            echo "expected exactly $want top-level fd-lifetime tests to run and PASS with no SKIP line,"
+            echo "expected exactly $want top-level celeris#657 tests to run and PASS with no SKIP line, and"
             echo "every engine at one io_uring worker -- was one renamed or removed, did one skip or fail,"
             echo "or did this runner fund a different worker count?"
             exit 1
@@ -253,6 +237,45 @@ jobs:
           go test -race -count=1 -timeout=600s -v \
             -skip '^(TestBidirectionalFlapAsync|TestRampH1Sync|TestRampH1Async)$' \
             ./adaptive/...
+      # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
+      # above raises memlock, so io_uring there runs several workers and
+      # TestReverseTransplant / TestBidirectionalFlap never meet the shape in
+      # which the io_uring -> epoll hand-off lost requests: every connection
+      # on ONE io_uring ring. This step does not raise memlock. At the
+      # runner's own 8 MiB io_uring is capped to one worker (12 MiB per
+      # worker, engine/iouring/ring.go minMemlockPerWorker), and the step
+      # requires at least one "io_uring engine listening" line and every one
+      # to read workers=1, so a runner that funds more workers fails here
+      # instead of silently testing another shape.
+      #
+      # Neither test reads a CELERIS_REQUIRE_* variable: they t.Skip when
+      # io_uring is unavailable. The tally is what forbids that: it fails on
+      # ANY `--- SKIP` line, and on any top-level count other than two RUN and
+      # two PASS (same patterns as the unit job's celeris#657 step). It runs
+      # even when the step above failed, so a known flake there cannot hide
+      # this leg's result.
+      - name: Adaptive — one-worker revert tests (runner memlock, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestReverseTransplant|TestBidirectionalFlap'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./adaptive/ 2>&1 | tee /tmp/revert657.log
+          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/revert657.log || true)
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/revert657.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/revert657.log || true)
+          engines=$(grep -cE 'io_uring engine listening .*workers=[0-9]+' /tmp/revert657.log || true)
+          one=$(grep -cE 'io_uring engine listening .*workers=1( |$)' /tmp/revert657.log || true)
+          echo "celeris#657 one-worker revert tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, io_uring engines $engines at workers=1: $one"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$engines" -eq 0 ] || [ "$one" -ne "$engines" ]; then
+            echo "expected exactly $want top-level revert tests to run and PASS with no SKIP line, and"
+            echo "every io_uring engine at one worker -- was one renamed or removed, did one skip or fail,"
+            echo "or did this runner fund a different worker count?"
+            exit 1
+          fi
 
   iouring:
     name: io_uring init-failure regression (./engine/iouring)
