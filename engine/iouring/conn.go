@@ -222,6 +222,18 @@ type connState struct {
 	// RECV, a cancel and two completions per loop iteration for as long as
 	// the failure and the drain both lasted.
 	//
+	// Only the conn's next data (handleRecv) and its release clear it, not
+	// the end of the drain it was set in or the start of the next, so it
+	// can outlive that drain (celeris#681 R5). Across drains the effect is
+	// placement only, and narrow: a conn that has received nothing since
+	// its dup failed meets a hand-off attempt in a later drain only at a
+	// completion that is not data, for example a provided-buffer recv ended
+	// by -ENOBUFS and re-armed, and no reap is placed for it there; its next
+	// data clears the flag and the attempt after that data proceeds as
+	// usual. A promoted async conn never has it set at a park: the data
+	// that respawns its dispatch goroutine clears it first, so its hand-off
+	// is retried at that park.
+	//
 	// All four worker-thread only, like recvCancelPending.
 	transplantReap uint16
 	reapStale      bool

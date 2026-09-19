@@ -81,6 +81,8 @@ func onlyRecvInFlight(cs *connState) bool {
 //     still running, so tryTransplant leaves it alone too (celeris#681 R1).
 //   - the conn's last hand-off failed at its dup (reapSuppressed): reaping
 //     the recv re-armed after that failure would fail the same way at once.
+//     Only the conn's next data lifts it, not the end of the drain; the
+//     field's doc says what that does across drains.
 func (w *Worker) startReap(cs *connState) {
 	if !w.asyncCancelFlags {
 		w.handoffLoss.noteReapUnsupported()
