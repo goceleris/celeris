@@ -25,14 +25,14 @@ type completionEntry struct {
 // udProvide cancel sentinel, and the driver ops which have their own
 // lifecycle).
 //
-// The generation was widened from 8 to 16 bits in v1.5.0 (bits 48-55
-// were unused): generations are per-connState-object, so under fd reuse
-// a terminal CQE from a closed predecessor can collide with the live
-// occupant's (fd, gen) identity and be misattributed at dispatch —
-// misdecrementing the LIVE conn's kernelInflight and re-opening the
-// close-time early-release window (see staleConnCQE). 16 bits cuts the
-// per-reuse collision probability 256x, from 1/256 to 1/65536. Old
-// 8-bit-encoded values decode identically (bits 48-55 were zero).
+// Under fd reuse a terminal CQE from a closed predecessor can collide
+// with the live occupant's (fd, gen) identity and be misattributed at
+// dispatch — misdecrementing the LIVE conn's kernelInflight and
+// re-opening the close-time early-release window (see staleConnCQE).
+// The generation was widened from 8 to 16 bits in v1.5.0, when it was
+// still a per-connState counter. celeris#470 made it the 32-bit field
+// above, drawn from the process-wide connGenSeq, so a collision now
+// needs 2^32 intervening accepts process-wide (see connGenSeq).
 const (
 	udAccept uint64 = 0x01 << 56
 	udRecv   uint64 = 0x02 << 56

@@ -1489,10 +1489,12 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			}
 			// KNOWN RESIDUAL — gen-collision misroute. A closed
 			// predecessor's terminal CQE that arrives after this fd was
-			// re-occupied by a conn with a COLLIDING generation (gens are
-			// per-connState-object; 1/65536 per reuse with the 16-bit
-			// tag) is indistinguishable from the live conn's own CQE and
-			// lands here. The clamp below only stops an already-drained
+			// re-occupied by a conn with a COLLIDING generation (the
+			// generation is the process-wide 32-bit connGenSeq, so this
+			// needs 2^32 accepts while the predecessor's op is still
+			// owed; see connGenSeq for the windows that allow it) is
+			// indistinguishable from the live conn's own CQE and lands
+			// here. The clamp below only stops an already-drained
 			// counter going negative; a misdecrement from >=1 DOES
 			// under-count the live conn (and may clear recvArmed above
 			// with its recv still kernel-armed), so its own close can
@@ -1511,9 +1513,11 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 		}
 		return false
 	}
-	// A stale recv that read bytes consumed a request some client is
-	// still waiting on; count it by its identity's class BEFORE
-	// noteStaleTerminalOp can retire that identity (celeris#657).
+	// A stale recv that read bytes threw away bytes some client sent
+	// (for a handed-off conn, a request that client is still waiting
+	// on; see handoffLossStats for what each class means). Count it by
+	// its identity's class BEFORE noteStaleTerminalOp can retire that
+	// identity (celeris#657).
 	if op == udRecv && c.Res > 0 {
 		w.noteStaleRecvData(ud)
 	}

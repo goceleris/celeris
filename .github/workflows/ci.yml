@@ -139,7 +139,12 @@ jobs:
       # the name, so the PASS pattern must not end at the name. The step also
       # fails on ANY `--- SKIP` line. The expected count comes from the name
       # list. memlock stays at the runner's 8 MiB, the shape the step above
-      # runs these tests in: they need one ring, not a worker per 12 MiB.
+      # runs these tests in. TestWorkersShareTheHandoffLossWitnesses builds
+      # TWO workers through createWorkers, which skips the 12 MiB-per-worker
+      # ceiling the Listen path applies; that the pair fits in 8 MiB is
+      # measured (CI and local runner-shape containers), not guaranteed. If a
+      # later change makes them not fit, the require-workers env turns the
+      # ENOMEM into a red job instead of a skip. That is intended.
       - name: celeris#657 hand-off loss witness tests (skipping forbidden)
         shell: bash
         env:
