@@ -762,6 +762,67 @@ func TestNoReapWithoutAsyncCancelFlags(t *testing.T) {
 			t.Errorf("TransplantReaps = %d, want 0", n)
 		}
 	})
+
+	// celeris#681 R1: the dispatch goroutine itself, run for real through
+	// three requests with the drain set. On a worker that cannot reap, a
+	// claim can only be refused (the recv the feed path armed after the
+	// request cannot be reaped, and a promoted conn is never held), and the
+	// goroutine that exited to make it is respawned by the next request: a
+	// spawn and a detach-queue round trip per request for as long as the drain
+	// lasts, with the conn never leaving. So the goroutine must not claim: it
+	// parks, and one goroutine serves every request.
+	t.Run("async_park_claims_nothing", func(t *testing.T) {
+		f, h := asyncParkFixture(t, false)
+		claims := 0
+		for i := 1; i <= 3; i++ {
+			claimed, placed := f.asyncRequest(h)
+			if len(placed) != 1 || placed[0].op != opRECV || placed[0].tag() != udRecv {
+				t.Fatalf("request %d placed %v, want only the feed path's RECV", i, placed)
+			}
+			if claimed {
+				claims++
+			}
+			f.w.drainDetachQueue() // the worker's next loop iteration
+			if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+				t.Fatalf("the loop iteration after request %d placed %v, want nothing", i, sqes)
+			}
+		}
+		if got := distinct(h.served()); claims != 0 || got != 1 {
+			t.Errorf("the dispatch goroutine claimed the hand-off at %d of 3 parks, and the 3 requests ran on %d "+
+				"goroutines, want 0 claims and 1 goroutine: on a worker that cannot reap every claim is refused and "+
+				"the next request respawns the goroutine", claims, got)
+		}
+		if n := metric(t, f.e, "TransplantReapUnsupported"); n != 0 {
+			t.Errorf("TransplantReapUnsupported = %d, want 0: no claim was made, so no reap was refused", n)
+		}
+		if n := metric(t, f.e, "TransplantClaimDeferred"); n != 0 {
+			t.Errorf("TransplantClaimDeferred = %d, want 0", n)
+		}
+		if f.tgt.adopted.Load() != 0 || f.w.conns[f.fd] != f.cs || !f.cs.recvArmed {
+			t.Fatalf("adopted %d, in table %v, recvArmed %v: want 0, true, true (the conn stays, reading)",
+				f.tgt.adopted.Load(), f.w.conns[f.fd] == f.cs, f.cs.recvArmed)
+		}
+	})
+
+	// The control for the subtest above: the same park on a worker that can
+	// reap claims the hand-off, the worker's drain of the claim reaps the
+	// feed path's recv, and the conn leaves at that recv's -ECANCELED. It
+	// shows that asyncRequest sees a claim when one is made.
+	t.Run("control_async_park_claims_with_flags", func(t *testing.T) {
+		f, h := asyncParkFixture(t, true)
+		claimed, _ := f.asyncRequest(h)
+		if !claimed {
+			t.Fatal("the dispatch goroutine parked without claiming the hand-off on a worker that can reap")
+		}
+		f.w.drainDetachQueue()
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+			t.Fatalf("the drain of the claim placed %v, want the reap of the feed path's recv", sqes)
+		}
+		f.process(f.recvCQE(-int32(unix.ECANCELED)))
+		if n := f.tgt.adopted.Load(); n != 1 {
+			t.Fatalf("the reap's -ECANCELED made %d hand-offs, want 1", n)
+		}
+	})
 }
 
 // TestReapSuppressedAfterFailedHandOff (celeris#681 C2): a hand-off that
@@ -831,6 +892,57 @@ func TestReapSuppressedAfterFailedHandOff(t *testing.T) {
 	if n := f.tgt.adopted.Load(); n != 1 {
 		t.Fatalf("the reap's -ECANCELED made %d hand-offs, want 1", n)
 	}
+
+	// A promoted async conn (celeris#681 R1). Its hand-off is reached only
+	// through its dispatch goroutine's claim at a park, and the goroutine runs
+	// only on data, which lifts the suppression first: at a park the flag is
+	// never set. So a hand-off that failed at its dup is retried at the
+	// conn's next park, one reap and one dup per request while the dup keeps
+	// failing (a sync conn tries the dup once per request too, at its held
+	// response), and the conn leaves at the first park after the dup works.
+	t.Run("async_conn_retries_at_its_next_park", func(t *testing.T) {
+		f, h := asyncParkFixture(t, true)
+		dupCalls := 0
+		trySetWorkerField(f.w, "dupFD", func(int) (int, error) {
+			dupCalls++
+			return -1, unix.EMFILE
+		})
+		for i := 1; i <= 2; i++ {
+			if claimed, _ := f.asyncRequest(h); !claimed {
+				t.Fatalf("request %d: the dispatch goroutine parked without claiming the hand-off", i)
+			}
+			if f.cs.reapSuppressed {
+				t.Fatalf("request %d: reapSuppressed is set at the park", i)
+			}
+			f.w.drainDetachQueue()
+			if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+				t.Fatalf("request %d: the drain of the claim placed %v, want the reap of the feed path's recv", i, sqes)
+			}
+			f.process(f.recvCQE(-int32(unix.ECANCELED)))
+			if f.tgt.adopted.Load() != 0 || !f.cs.reapSuppressed {
+				t.Fatalf("request %d: adopted %d, reapSuppressed %v after the dup failed: want 0 and true",
+					i, f.tgt.adopted.Load(), f.cs.reapSuppressed)
+			}
+			if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || sqes[0].op != opRECV {
+				t.Fatalf("request %d: after the failed hand-off the completion placed %v, want only the recv re-armed", i, sqes)
+			}
+		}
+		if dupCalls != 2 {
+			t.Errorf("dup tried %d times, want 2: once per request", dupCalls)
+		}
+		trySetWorkerField(f.w, "dupFD", (func(int) (int, error))(nil))
+		if claimed, _ := f.asyncRequest(h); !claimed {
+			t.Fatal("the dispatch goroutine parked without claiming the hand-off once the dup works")
+		}
+		f.w.drainDetachQueue()
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+			t.Fatalf("the drain of the claim placed %v, want the reap", sqes)
+		}
+		f.process(f.recvCQE(-int32(unix.ECANCELED)))
+		if n := f.tgt.adopted.Load(); n != 1 {
+			t.Fatalf("the reap's -ECANCELED made %d hand-offs once the dup works, want 1", n)
+		}
+	})
 }
 
 // TestReapedRecvLeavesNoLinkOrBuffer (celeris#681 C4): reapOutcome consumes

@@ -6,9 +6,14 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"regexp"
+	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -285,4 +290,120 @@ func (f *fdlFixture) isReap(s sqeRec) bool {
 func fdIsOpen(fd int) bool {
 	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
 	return err == nil
+}
+
+// goidHandler is fdlHandler recording the goroutine each request ran on. A
+// promoted async conn runs its requests on its dispatch goroutine, so a
+// goroutine that exits at its park and is respawned by the next request shows
+// up as a new id (celeris#681 R1).
+type goidHandler struct {
+	mu  sync.Mutex
+	ids []uint64
+}
+
+func (h *goidHandler) HandleStream(ctx context.Context, s *stream.Stream) error {
+	h.mu.Lock()
+	h.ids = append(h.ids, goroutineID())
+	h.mu.Unlock()
+	return fdlHandler{}.HandleStream(ctx, s)
+}
+
+func (h *goidHandler) served() []uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint64(nil), h.ids...)
+}
+
+// goroutineID is the running goroutine's id, from its stack header
+// ("goroutine 18 [running]:").
+func goroutineID() uint64 {
+	var b [64]byte
+	s := strings.TrimPrefix(string(b[:runtime.Stack(b[:], false)]), "goroutine ")
+	id, _ := strconv.ParseUint(s[:strings.IndexByte(s, ' ')], 10, 64)
+	return id
+}
+
+// goroutineWaitsOnCond reports whether goroutine id is blocked in
+// sync.Cond.Wait, which is where a dispatch goroutine parks.
+func goroutineWaitsOnCond(id uint64) bool {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	return regexp.MustCompile(`(?m)^goroutine ` + strconv.FormatUint(id, 10) + ` \[sync\.Cond\.Wait`).Match(buf)
+}
+
+// asyncParkFixture is fdlFixture's conn promoted to async dispatch and served
+// by h, on a worker whose asyncCancelFlags is flags, with its first recv armed
+// and a drain set: every request delivered now runs on the conn's dispatch
+// goroutine, which writes the response itself and then reaches its park. The
+// cleanup ends that goroutine and waits for it before the fixture closes the
+// descriptors.
+func asyncParkFixture(t *testing.T, flags bool) (*fdlFixture, *goidHandler) {
+	t.Helper()
+	f := newFDLFixture(t, true)
+	h := &goidHandler{}
+	f.w.handler = h
+	trySetWorkerField(f.w, "asyncCancelFlags", flags)
+	f.cs.asyncPromoted.Store(true)
+	f.armFirstRecv()
+	f.startDrain()
+	t.Cleanup(func() {
+		f.cs.asyncInMu.Lock()
+		f.cs.asyncClosed.Store(true)
+		f.cs.asyncCond.Broadcast()
+		f.cs.asyncInMu.Unlock()
+		f.w.asyncWG.Wait()
+	})
+	return f, h
+}
+
+// asyncRequest delivers one request to f's promoted conn, reads its response
+// at the client, and waits until the dispatch goroutine that answered it has
+// reached its park: there it either claimed its own hand-off
+// (transplantPending, enqueued for the worker, and exited) or waits on its
+// cond for the next request. It reports which, and the SQEs the delivery
+// placed.
+func (f *fdlFixture) asyncRequest(h *goidHandler) (claimed bool, placed []sqeRec) {
+	f.t.Helper()
+	n := len(h.served())
+	f.deliver(fdlGET)
+	placed = takeSQEs(f.w.ring)
+	fds := []unix.PollFd{{Fd: int32(f.peer), Events: unix.POLLIN}}
+	if k, err := unix.Poll(fds, 10000); err != nil || k != 1 {
+		f.t.Fatalf("no response at the client within 10s (poll %d, %v)", k, err)
+	}
+	var resp [512]byte
+	if k, err := unix.Read(f.peer, resp[:]); err != nil || !strings.HasPrefix(string(resp[:max(k, 0)]), "HTTP/1.1 200") {
+		f.t.Fatalf("client read %q, %v: want a 200 response", resp[:max(k, 0)], err)
+	}
+	ids := h.served()
+	if len(ids) != n+1 {
+		f.t.Fatalf("the handler ran %d times for one request", len(ids)-n)
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		if f.cs.transplantPending.Load() || f.w.detachQPending.Load() != 0 {
+			return true, placed
+		}
+		if goroutineWaitsOnCond(ids[n]) {
+			return false, placed
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatal("the dispatch goroutine neither claimed its hand-off nor parked within 10s of its response")
+		}
+	}
+}
+
+// distinct counts the distinct values in ids.
+func distinct(ids []uint64) int {
+	seen := map[uint64]bool{}
+	for _, id := range ids {
+		seen[id] = true
+	}
+	return len(seen)
 }

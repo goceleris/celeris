@@ -66,7 +66,10 @@ func onlyRecvInFlight(cs *connState) bool {
 // moves, so no request can be lost). The conditions:
 //   - the kernel rejects IORING_ASYNC_CANCEL flags (before 5.19, found by
 //     probeAsyncCancelFlags): every reap would fail with -EINVAL and leave
-//     the recv armed. Counted (TransplantReapUnsupported).
+//     the recv armed. Counted (TransplantReapUnsupported). A promoted async
+//     conn never gets here on such a worker: its dispatch goroutine makes no
+//     claim (asyncTransplantEligible) and stays parked, still running, so
+//     tryTransplant leaves it alone too (celeris#681 R1).
 //   - the conn's last hand-off failed at its dup (reapSuppressed): reaping
 //     the recv re-armed after that failure would fail the same way at once.
 func (w *Worker) startReap(cs *connState) {

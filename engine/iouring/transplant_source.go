@@ -236,7 +236,22 @@ func (w *Worker) reclaimTransplant(newFD int, carry engine.Carryover, cause erro
 // which empties writeBuf while sendBuf is still in flight (celeris#529). The
 // egress check is therefore re-done in finishAsyncTransplant, on the worker
 // thread, and this predicate is only a cheap first filter.
+//
+// A worker that cannot reap (the kernel rejects IORING_ASYNC_CANCEL flags,
+// probeAsyncCancelFlags) offers no promoted async conn for the hand-off
+// (celeris#681 R1). Every claim would find the recv the feed path armed after
+// the last request, which only a reap can clear, and a promoted conn is never
+// held: finishAsyncTransplant would refuse it, and the goroutine that exited
+// to make the claim would be respawned by the next request — a spawn and a
+// detach-queue round trip per request for as long as the drain lasted, with
+// the conn never leaving. Instead the goroutine parks as it does with no
+// drain set, and the conn stays on io_uring (placement only). The field is
+// set before the worker starts and never written again, so this read from
+// the dispatch goroutine is race-free.
 func (w *Worker) asyncTransplantEligible(cs *connState) bool {
+	if !w.asyncCancelFlags {
+		return false
+	}
 	if cs.fixedFile {
 		return false
 	}

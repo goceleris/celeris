@@ -4096,6 +4096,8 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			// gone, so there is no goroutine-vs-release race. If a new request
 			// arrives first, the feed path clears transplantPending and respawns
 			// us, so no request is lost. SINGLE_ISSUER: we submit no SQE here.
+			// On a worker that cannot reap, no conn is eligible: the claim
+			// could only be refused, so we park instead (celeris#681 R1).
 			if w.transplant.Load() != nil && w.asyncTransplantEligible(cs) {
 				cs.transplantPending.Store(true)
 				cs.asyncRun = false
