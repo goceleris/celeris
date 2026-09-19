@@ -1446,6 +1446,16 @@ func (w *Worker) run(ctx context.Context) {
 		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
 			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
 			w.acceptPaused.Load() {
+			// Submit what this iteration queued before parking (celeris#657,
+			// A5). The iteration that closes or hands off the last conn
+			// queues its close-path cancels (the header timer's, a send's)
+			// in the same pass that finds the worker idle, and the park is
+			// indefinite: those SQEs used to sit unsubmitted until something
+			// woke the worker, measured 1-24 pending at parks. Outside
+			// wakeMu, which is a leaf; SQPOLL submits by itself.
+			if !w.sqpoll && w.ring.Pending() > 0 {
+				_, _ = w.ring.Submit()
+			}
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() ||
 				w.driverActionPending.Load() != 0 || w.detachQPending.Load() != 0 {
