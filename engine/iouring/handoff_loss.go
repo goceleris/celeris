@@ -62,10 +62,11 @@ import "sync/atomic"
 //     example -EINVAL from a kernel that rejects the cancel flags the
 //     startup probe found accepted). Not retried and never followed by a
 //     hand-off. Must stay 0.
-//   - reapUnsupported: reaps not placed because this kernel rejects the
-//     IORING_ASYNC_CANCEL flags a reap needs (probeAsyncCancelFlags; they
-//     exist from 5.19). The conn stays until its recv completes on its own.
-//     A rate, 0 on every kernel from 5.19.
+//   - reapUnsupported: reaps not placed because the startup probe did not
+//     find the IORING_ASYNC_CANCEL flags a reap needs accepted
+//     (probeAsyncCancelFlags; they exist from 5.19). The conn stays until
+//     its recv completes on its own. A rate, 0 wherever the probe finds the
+//     flags, which it does on every kernel from 5.19 measured.
 //   - holdRescued: held conns the timeout sweep found with their response
 //     sent, not handed off and no recv armed — a path that skipped the
 //     release. The belt under releaseHold. Must stay 0.

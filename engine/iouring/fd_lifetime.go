@@ -28,23 +28,26 @@ import (
 //     owner) under a tag of its own, and hands off at the recv's -ECANCELED —
 //     the recv's own terminal completion, not the cancel's result. If the
 //     request arrives first, the recv completes with it: it is served here
-//     and its response is HELD. If the cancel reports that it matched
-//     nothing (the recv completed first, or is still linked behind its SEND
-//     and not issued), the reap is retried on the next loop iteration while
-//     the recv is still armed. A miss is never followed by a hand-off, and
-//     neither is any other result: a cancel that fails outright is counted
-//     and not retried. A reap needs IORING_ASYNC_CANCEL flags (Linux 5.19);
-//     on a kernel that rejects them (probeAsyncCancelFlags) none is placed,
-//     and the conn stays until its recv completes on its own (startReap).
-//     None is placed either after a hand-off of the conn failed at its dup,
-//     until the conn next receives data.
-//   - HOLD. While a drain is set, the response of a connection the hand-off
-//     would accept is flushed with no recv behind it (not linked, not
-//     standalone). Its SEND completion then finds nothing in flight and hands
-//     the conn off; the client's next request waits in the socket buffer for
-//     epoll. releaseHold arms the recv at that completion whenever the
-//     hand-off does not happen, and checkTimeouts rescues (and counts) any
-//     held conn a path left unreleased.
+//     and its response is HELD (on a worker with a provided-buffer ring,
+//     which has no HOLD, its next recv is reaped instead). If the cancel
+//     reports that it matched nothing (the recv completed first, or is still
+//     linked behind its SEND and not issued), the reap is retried on the
+//     next loop iteration while the recv is still armed. A miss is never
+//     followed by a hand-off, and neither is any other result: a cancel that
+//     fails outright is counted and not retried. A reap needs
+//     IORING_ASYNC_CANCEL flags (Linux 5.19); unless the startup probe found
+//     them accepted (probeAsyncCancelFlags) none is placed, and the conn
+//     stays until its recv completes on its own (startReap). None is placed
+//     either after a hand-off of the conn failed at its dup, until the conn
+//     next receives data.
+//   - HOLD. While a drain is set, on a worker without a provided-buffer
+//     ring, the response of a connection the hand-off would accept is
+//     flushed with no recv behind it (not linked, not standalone). Its SEND
+//     completion then finds nothing in flight and hands the conn off; the
+//     client's next request waits in the socket buffer for epoll.
+//     releaseHold arms the recv at that completion whenever the hand-off
+//     does not happen, and checkTimeouts rescues (and counts) any held conn
+//     a path left unreleased.
 
 // onlyRecvInFlight reports whether the one op the R0 gate found in flight is
 // the recv — the case REAP can clear. Anything else (a send, a SEND_ZC
@@ -59,17 +62,23 @@ func onlyRecvInFlight(cs *connState) bool {
 // the next iteration's retry.
 //
 // Two conditions place no reap and queue no retry. The conn keeps its recv
-// armed and stays until that recv completes on its own: a sync conn then has
-// the request it brings served here and its response HELD, and leaves at that
-// SEND's completion with nothing in flight; a promoted async conn, which is
-// never held, stays on io_uring (placement only: nothing is in flight when it
-// moves, so no request can be lost). The conditions:
-//   - the kernel rejects IORING_ASYNC_CANCEL flags (before 5.19, found by
-//     probeAsyncCancelFlags): every reap would fail with -EINVAL and leave
-//     the recv armed. Counted (TransplantReapUnsupported). A promoted async
-//     conn never gets here on such a worker: its dispatch goroutine makes no
-//     claim (asyncTransplantEligible) and stays parked, still running, so
-//     tryTransplant leaves it alone too (celeris#681 R1).
+// armed and stays until that recv completes on its own. A sync conn then has
+// the request it brings served here; on a worker without a provided-buffer
+// ring (HOLD needs none) its response is HELD and it leaves at that SEND's
+// completion with nothing in flight, and on one with a ring it stays on
+// io_uring. A promoted async conn, which is never held, stays on io_uring.
+// Placement only: nothing is in flight when a conn moves, so no request can
+// be lost. The conditions:
+//   - the startup probe did not find IORING_ASYNC_CANCEL flags accepted
+//     (probeAsyncCancelFlags): a kernel before 5.19 rejects them, and every
+//     reap would fail with -EINVAL and leave the recv armed; a probe that got
+//     no answer is treated the same. Counted (TransplantReapUnsupported).
+//     Buffer rings arrived with the flags, in 5.19, so a kernel that rejects
+//     them has no provided-buffer ring and its sync conns are held; a newer
+//     kernel whose probe got no answer may have one, and its conns stay. A
+//     promoted async conn never gets here on such a worker: its dispatch
+//     goroutine makes no claim (asyncTransplantEligible) and stays parked,
+//     still running, so tryTransplant leaves it alone too (celeris#681 R1).
 //   - the conn's last hand-off failed at its dup (reapSuppressed): reaping
 //     the recv re-armed after that failure would fail the same way at once.
 func (w *Worker) startReap(cs *connState) {

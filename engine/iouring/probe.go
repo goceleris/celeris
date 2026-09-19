@@ -34,7 +34,7 @@ var (
 	cachedMultiAcceptOK   bool
 	cachedMultiAcceptReas string
 	cachedAsyncCancel     sync.Once
-	cachedAsyncCancelOK   bool
+	cachedAsyncCancelRes  asyncCancelProbe
 	cachedAsyncCancelReas string
 )
 
@@ -73,11 +73,11 @@ func probeMultishotAcceptCached() (bool, string) {
 
 // probeAsyncCancelFlagsCached returns the cached async-cancel-flags probe
 // result.
-func probeAsyncCancelFlagsCached() (bool, string) {
+func probeAsyncCancelFlagsCached() (asyncCancelProbe, string) {
 	cachedAsyncCancel.Do(func() {
-		cachedAsyncCancelOK, cachedAsyncCancelReas = probeAsyncCancelFlags()
+		cachedAsyncCancelRes, cachedAsyncCancelReas = probeAsyncCancelFlags()
 	})
-	return cachedAsyncCancelOK, cachedAsyncCancelReas
+	return cachedAsyncCancelRes, cachedAsyncCancelReas
 }
 
 // SEND_ZC ioprio flags and notification result values.
@@ -469,6 +469,43 @@ const (
 	asyncCancelProbeTag    uint64 = 0xCA_4CE1_7A6
 )
 
+// asyncCancelProbe is what probeAsyncCancelFlags learned. Only
+// asyncCancelAccepted turns the hand-off's reap on; the other two keep it
+// off, and they are told apart because they mean different things
+// (celeris#681 R2): a rejection is the kernel's answer, a probe that got no
+// answer says nothing about the kernel.
+type asyncCancelProbe uint8
+
+const (
+	// asyncCancelAccepted: the kernel completed the probe's cancel and
+	// accepted its IORING_ASYNC_CANCEL flags.
+	asyncCancelAccepted asyncCancelProbe = iota
+	// asyncCancelRejected: the kernel completed the probe's cancel without
+	// accepting the flags: -EINVAL, as every kernel before 5.19 answers, or
+	// a result the probe does not recognise.
+	asyncCancelRejected
+	// asyncCancelNoAnswer: the probe failed before the kernel answered. Its
+	// ring could not be set up, the submit or the wait failed, no completion
+	// came, or the completion was not the probe's cancel.
+	asyncCancelNoAnswer
+)
+
+func (p asyncCancelProbe) String() string {
+	switch p {
+	case asyncCancelAccepted:
+		return "accepted"
+	case asyncCancelRejected:
+		return "rejected"
+	case asyncCancelNoAnswer:
+		return "no answer"
+	}
+	return fmt.Sprintf("asyncCancelProbe(%d)", uint8(p))
+}
+
+// newAsyncCancelProbeRing makes the probe's private ring. A variable so a
+// test can make the probe fail before the kernel answers.
+var newAsyncCancelProbeRing = func() (*Ring, error) { return NewRing(8, 0, 0) }
+
 // probeAsyncCancelFlags tests whether the kernel accepts the
 // IORING_ASYNC_CANCEL_* flags, which exist from Linux 5.19. The io_uring→epoll
 // hand-off's REAP (celeris#657) cancels an armed recv with
@@ -483,8 +520,10 @@ const (
 // nothing carries and reads the cancel's own completion; see
 // classifyAsyncCancelProbe for how the result reads. The cancel runs inline
 // at submit on every kernel measured, so its completion is normally there
-// when Submit returns; a short wait covers any that is not.
-func probeAsyncCancelFlags() (bool, string) {
+// when Submit returns; a short wait covers any that is not. A probe that
+// fails before that completion is read reports asyncCancelNoAnswer, never a
+// rejection.
+func probeAsyncCancelFlags() (asyncCancelProbe, string) {
 	return probeAsyncCancel(cancelAll)
 }
 
@@ -492,38 +531,38 @@ func probeAsyncCancelFlags() (bool, string) {
 // given: the probe passes the reap's own (IORING_ASYNC_CANCEL_ALL), and a
 // test passes a bit no kernel defines, which every kernel rejects, to drive
 // the rejection through the same submit and completion path.
-func probeAsyncCancel(cancelFlags uint32) (bool, string) {
-	ring, err := NewRing(8, 0, 0)
+func probeAsyncCancel(cancelFlags uint32) (asyncCancelProbe, string) {
+	ring, err := newAsyncCancelProbeRing()
 	if err != nil {
-		return false, "NewRing failed: " + err.Error()
+		return asyncCancelNoAnswer, "NewRing failed: " + err.Error()
 	}
 	defer func() { _ = ring.Close() }()
 
 	sqe := ring.GetSQE()
 	if sqe == nil {
-		return false, "GetSQE returned nil"
+		return asyncCancelNoAnswer, "GetSQE returned nil"
 	}
 	prepCancelUserDataReported(sqe, asyncCancelProbeTarget)
 	*(*uint32)(unsafe.Pointer(&(*[sqeSize]byte)(sqe)[28])) = cancelFlags
 	setSQEUserData(sqe, asyncCancelProbeTag)
 	if _, err := ring.Submit(); err != nil {
-		return false, "Submit failed: " + err.Error()
+		return asyncCancelNoAnswer, "Submit failed: " + err.Error()
 	}
 	head, tail := ring.BeginCQ()
 	if head == tail {
 		if err := ring.SubmitAndWaitTimeout(500 * time.Millisecond); err != nil {
-			return false, "SubmitAndWaitTimeout failed: " + err.Error()
+			return asyncCancelNoAnswer, "SubmitAndWaitTimeout failed: " + err.Error()
 		}
 		head, tail = ring.BeginCQ()
 		if head == tail {
-			return false, "no CQE produced for the cancel (waited 500ms)"
+			return asyncCancelNoAnswer, "no CQE produced for the cancel (waited 500ms)"
 		}
 	}
 	cqe := ring.cqeAt(head)
 	ud, res := cqe.UserData, cqe.Res
 	ring.EndCQ(head + 1)
 	if ud != asyncCancelProbeTag {
-		return false, fmt.Sprintf("unexpected CQE user_data %#x (want the cancel's %#x)", ud, asyncCancelProbeTag)
+		return asyncCancelNoAnswer, fmt.Sprintf("unexpected CQE user_data %#x (want the cancel's %#x)", ud, asyncCancelProbeTag)
 	}
 	return classifyAsyncCancelProbe(res)
 }
@@ -537,18 +576,18 @@ func probeAsyncCancel(cancelFlags uint32) (bool, string) {
 //     miss; no kernel measured answers the probe with it.
 //   - -EINVAL: rejected. Measured on 5.15.0-191: every cancel form celeris
 //     builds returns -EINVAL there and leaves its target running.
-//   - anything else: not an answer the probe understands, so the flags are
-//     treated as rejected and the value is reported.
+//   - anything else: an answer the probe does not understand, so the flags
+//     are treated as rejected and the value is reported.
 //
 // Split out of probeAsyncCancelFlags so every outcome can be checked against
 // a synthetic result.
-func classifyAsyncCancelProbe(res int32) (bool, string) {
+func classifyAsyncCancelProbe(res int32) (asyncCancelProbe, string) {
 	switch {
 	case res >= 0, res == -int32(unix.ENOENT):
-		return true, ""
+		return asyncCancelAccepted, ""
 	case res == -int32(unix.EINVAL):
-		return false, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL); the kernel predates Linux 5.19"
+		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL); the kernel predates Linux 5.19"
 	default:
-		return false, fmt.Sprintf("the cancel completed with cqe.res=%d, which the probe does not recognise", res)
+		return asyncCancelRejected, fmt.Sprintf("the cancel completed with cqe.res=%d, which the probe does not recognise", res)
 	}
 }

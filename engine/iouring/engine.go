@@ -5,6 +5,7 @@ package iouring
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -91,9 +92,10 @@ type Engine struct {
 	// at construction so Metrics() doesn't pay the type-assertion per
 	// call. Snapshot-at-Listen — static post-Start.
 	asyncRoutes int
-	// asyncCancelFlags is the probeAsyncCancelFlags answer: whether this
-	// kernel accepts IORING_ASYNC_CANCEL_* flags (5.19+). Every worker gets
-	// a copy; the hand-off's REAP needs them (celeris#657).
+	// asyncCancelFlags is whether probeAsyncCancelFlags found this kernel
+	// accepting IORING_ASYNC_CANCEL_* flags (5.19+): false when the kernel
+	// rejected them and when the probe got no answer. Every worker gets a
+	// copy; the hand-off's REAP needs them (celeris#657).
 	asyncCancelFlags bool
 }
 
@@ -168,15 +170,19 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 
 	// The io_uring→epoll hand-off cancels an armed recv before it moves a
 	// connection (REAP, celeris#657), and that cancel needs
-	// IORING_ASYNC_CANCEL flags, which exist from Linux 5.19. Where the
-	// kernel rejects them the hand-off never reaps: a connection whose recv
-	// is armed stays on io_uring until that recv completes on its own, and
-	// its next response is then HELD and handed off with nothing in flight.
-	asyncCancelFlags, acReason := probeAsyncCancelFlagsCached()
-	if !asyncCancelFlags {
-		cfg.Logger.Info("async cancel flags runtime probe failed: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
-			"reason", acReason)
-	}
+	// IORING_ASYNC_CANCEL flags, which exist from Linux 5.19. Unless the
+	// probe finds them accepted the hand-off never reaps: a sync connection
+	// whose recv is armed stays on io_uring until that recv completes on its
+	// own, and its next response is then HELD and handed off with nothing in
+	// flight. HOLD needs a worker without a provided-buffer ring. A kernel
+	// that rejects the flags has none (buffer rings arrived in the same
+	// release, 5.19); where one exists because the probe got no answer on a
+	// newer kernel, the connection is not held and stays on io_uring. A
+	// promoted async connection is never offered for the hand-off without
+	// the flags and stays too. Placement only, either way.
+	asyncCancel, acReason := probeAsyncCancelFlagsCached()
+	asyncCancelFlags := asyncCancel == asyncCancelAccepted
+	logAsyncCancelProbe(cfg.Logger, asyncCancel, acReason, profile.KernelMajor, profile.KernelMinor)
 
 	tier := SelectTier(profile, 2*time.Second)
 	if tier == nil {
@@ -194,6 +200,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		"fixed_files", fixedFilesEnabled(tier.SupportsFixedFiles()),
 		"send_zc", tier.SupportsSendZC(),
 		"async_cancel_flags", asyncCancelFlags,
+		"async_cancel_probe", asyncCancel.String(),
 	)
 
 	e := &Engine{
@@ -209,6 +216,28 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		e.asyncRoutes = r.AsyncRouteCount()
 	}
 	return e, nil
+}
+
+// logAsyncCancelProbe reports an async-cancel-flags probe that did not find
+// the flags accepted (celeris#681 R2). A rejection is the kernel's answer and
+// expected before 5.19: Info. A probe that got no answer says nothing about
+// the kernel; on one whose version has the flags (5.19 and later) it is
+// unexpected, and it keeps the hand-off's reap off for this process, so it is
+// a Warn there and Info below.
+func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kernelMajor, kernelMinor int) {
+	kernel := fmt.Sprintf("%d.%d", kernelMajor, kernelMinor)
+	switch p {
+	case asyncCancelRejected:
+		l.Info("async cancel flags rejected by the kernel: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
+			"reason", reason, "kernel", kernel)
+	case asyncCancelNoAnswer:
+		msg := "async cancel flags probe got no answer from the kernel: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)"
+		if kernelMajor > 5 || (kernelMajor == 5 && kernelMinor >= 19) {
+			l.Warn(msg, "reason", reason, "kernel", kernel)
+		} else {
+			l.Info(msg, "reason", reason, "kernel", kernel)
+		}
+	}
 }
 
 // Listen starts the io_uring engine and blocks until context is canceled.

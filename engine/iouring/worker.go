@@ -488,8 +488,9 @@ type Worker struct {
 	// reapRetrySpare is the second buffer of the swap. Worker thread only.
 	reapRetry      []uint64
 	reapRetrySpare []uint64
-	// asyncCancelFlags: this kernel accepts IORING_ASYNC_CANCEL_* flags
-	// (probeAsyncCancelFlags, 5.19+). A reap is only placed when it does;
+	// asyncCancelFlags: probeAsyncCancelFlags found this kernel accepting
+	// IORING_ASYNC_CANCEL_* flags (5.19+); false when it rejected them or the
+	// probe got no answer. A reap is only placed when it is true;
 	// createWorkers copies the engine's answer. Read-only after init.
 	asyncCancelFlags bool
 	// dupFD duplicates the descriptor a hand-off moves: unix.Dup when nil.

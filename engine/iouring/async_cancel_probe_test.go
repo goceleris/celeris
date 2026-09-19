@@ -4,6 +4,8 @@ package iouring
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -22,26 +24,75 @@ import (
 // startup and places no reap where they are rejected.
 
 // TestAsyncCancelProbeClassifies pins how the probe reads its cancel's
-// completion: a cancel with CANCEL_ALL of a user_data nothing carries.
+// completion: a cancel with CANCEL_ALL of a user_data nothing carries. A
+// completion is the kernel's answer, accepted or rejected; a probe that fails
+// before reading one has no answer, which is not a rejection (celeris#681 R2).
 func TestAsyncCancelProbeClassifies(t *testing.T) {
 	for _, tc := range []struct {
 		res    int32
-		ok     bool
+		want   asyncCancelProbe
 		reason string
 	}{
-		{0, true, ""}, // CANCEL_ALL: res is the number cancelled, and nothing was
-		{1, true, ""},
-		{-int32(unix.ENOENT), true, ""}, // the flag-free form's miss
-		{-int32(unix.EINVAL), false, "5.19"},
-		{-int32(unix.EBADF), false, "cqe.res=-9"},
-		{-int32(unix.ECANCELED), false, "cqe.res=-125"},
+		{0, asyncCancelAccepted, ""}, // CANCEL_ALL: res is the number cancelled, and nothing was
+		{1, asyncCancelAccepted, ""},
+		{-int32(unix.ENOENT), asyncCancelAccepted, ""}, // the flag-free form's miss
+		{-int32(unix.EINVAL), asyncCancelRejected, "5.19"},
+		{-int32(unix.EBADF), asyncCancelRejected, "cqe.res=-9"},
+		{-int32(unix.ECANCELED), asyncCancelRejected, "cqe.res=-125"},
 	} {
-		ok, reason := classifyAsyncCancelProbe(tc.res)
-		if ok != tc.ok || (tc.reason == "") != (reason == "") || !strings.Contains(reason, tc.reason) {
+		got, reason := classifyAsyncCancelProbe(tc.res)
+		if got != tc.want || (tc.reason == "") != (reason == "") || !strings.Contains(reason, tc.reason) {
 			t.Errorf("classifyAsyncCancelProbe(%d) = (%v, %q), want (%v, containing %q)",
-				tc.res, ok, reason, tc.ok, tc.reason)
+				tc.res, got, reason, tc.want, tc.reason)
 		}
 	}
+
+	// The probe's ring cannot be set up: nothing reached the kernel.
+	t.Run("no_answer_is_not_a_rejection", func(t *testing.T) {
+		saved := newAsyncCancelProbeRing
+		newAsyncCancelProbeRing = func() (*Ring, error) { return nil, errors.New("celeris681 injected: no ring") }
+		t.Cleanup(func() { newAsyncCancelProbeRing = saved })
+		got, reason := probeAsyncCancel(cancelAll)
+		if got != asyncCancelNoAnswer || !strings.Contains(reason, "injected") {
+			t.Errorf("a probe whose ring could not be set up = (%v, %q), want (%v, naming the failure)",
+				got, reason, asyncCancelNoAnswer)
+		}
+	})
+
+	// New's record of the answer: nothing when accepted, Info for the
+	// kernel's rejection, and for no answer Warn where the kernel's version
+	// has the flags and Info below it.
+	t.Run("log_levels", func(t *testing.T) {
+		for _, tc := range []struct {
+			p            asyncCancelProbe
+			major, minor int
+			want         string
+		}{
+			{asyncCancelAccepted, 6, 8, ""},
+			{asyncCancelRejected, 5, 15, "INFO"},
+			{asyncCancelRejected, 6, 8, "INFO"},
+			{asyncCancelNoAnswer, 5, 18, "INFO"},
+			{asyncCancelNoAnswer, 5, 19, "WARN"},
+			{asyncCancelNoAnswer, 6, 8, "WARN"},
+		} {
+			var buf lockedBuffer
+			logAsyncCancelProbe(slog.New(slog.NewJSONHandler(&buf, nil)), tc.p, "why", tc.major, tc.minor)
+			recs := buf.records(t)
+			got := ""
+			if len(recs) == 1 {
+				got, _ = recs[0]["level"].(string)
+			}
+			if len(recs) > 1 || got != tc.want {
+				t.Errorf("%v on kernel %d.%d logged %v, want one record at %q (none when empty)",
+					tc.p, tc.major, tc.minor, recs, tc.want)
+			}
+			if tc.p == asyncCancelNoAnswer && len(recs) == 1 {
+				if msg, _ := recs[0]["msg"].(string); !strings.Contains(msg, "no answer") {
+					t.Errorf("the no-answer record reads %q, want it to say the probe got no answer", msg)
+				}
+			}
+		}
+	})
 }
 
 // kernelHasCancelFlags reports whether the running kernel's version is one
@@ -71,16 +122,17 @@ func TestAsyncCancelProbeOnThisKernel(t *testing.T) {
 		skipOrFail656(t, "io_uring unavailable: %v", err)
 	}
 	_ = r.Close()
-	ok, reason := probeAsyncCancelFlags()
+	res, reason := probeAsyncCancelFlags()
+	ok := res == asyncCancelAccepted
 	want, rel := kernelHasCancelFlags(t)
-	t.Logf("celeris681 async cancel flags probe: kernel=%s ok=%v reason=%q", rel, ok, reason)
+	t.Logf("celeris681 async cancel flags probe: kernel=%s result=%v reason=%q", rel, res, reason)
 	if ok != want {
-		t.Fatalf("probeAsyncCancelFlags() = (%v, %q) on kernel %s, want %v", ok, reason, rel, want)
+		t.Fatalf("probeAsyncCancelFlags() = (%v, %q) on kernel %s, want accepted=%v", res, reason, rel, want)
 	}
-	if cok, _ := probeAsyncCancelFlagsCached(); cok != ok {
-		t.Fatalf("the cached probe says %v, the probe %v", cok, ok)
+	if cres, _ := probeAsyncCancelFlagsCached(); cres != res {
+		t.Fatalf("the cached probe says %v, the probe %v", cres, res)
 	}
-	if bad, why := probeAsyncCancel(1 << 31); bad || !strings.Contains(why, "EINVAL") {
+	if bad, why := probeAsyncCancel(1 << 31); bad != asyncCancelRejected || !strings.Contains(why, "EINVAL") {
 		t.Fatalf("a cancel flag no kernel defines was read as (%v, %q), want rejected with EINVAL: "+
 			"the probe does not read the kernel's answer", bad, why)
 	}
@@ -99,8 +151,8 @@ func TestWorkersCarryTheAsyncCancelProbe(t *testing.T) {
 	if err != nil {
 		skipOrFail656(t, "iouring engine unavailable: %v", err)
 	}
-	if want, _ := probeAsyncCancelFlagsCached(); e.asyncCancelFlags != want {
-		t.Fatalf("New stored asyncCancelFlags=%v, the probe says %v", e.asyncCancelFlags, want)
+	if res, _ := probeAsyncCancelFlagsCached(); e.asyncCancelFlags != (res == asyncCancelAccepted) {
+		t.Fatalf("New stored asyncCancelFlags=%v, the probe says %v", e.asyncCancelFlags, res)
 	}
 	resolved := e.cfg.Resources.Resolve()
 	for _, answer := range []bool{false, true} {
@@ -118,6 +170,10 @@ func TestWorkersCarryTheAsyncCancelProbe(t *testing.T) {
 			w.shutdown()
 		}
 	}
+
+	// A probe that fails before the kernel answers keeps the reap off too,
+	// and New reports it apart from a rejection (celeris#681 R2).
+	t.Run("no_answer_is_logged_apart_from_a_rejection", newWarnsWhenTheProbeGetsNoAnswer)
 }
 
 // TestReapOnTheRunningKernel drives the hand-off of an idle conn whose recv
@@ -196,9 +252,10 @@ func TestReapOnTheRunningKernel(t *testing.T) {
 	}
 
 	t.Run("probe_answer", func(t *testing.T) {
-		ok, _ := probeAsyncCancelFlagsCached()
+		res, _ := probeAsyncCancelFlagsCached()
+		ok := res == asyncCancelAccepted
 		want, rel := kernelHasCancelFlags(t)
-		t.Logf("celeris681 kernel=%s probe=%v", rel, ok)
+		t.Logf("celeris681 kernel=%s probe=%v", rel, res)
 		if ok != want {
 			t.Fatalf("the probe says %v on kernel %s, want %v", ok, rel, want)
 		}
