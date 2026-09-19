@@ -429,6 +429,42 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// close (the slot holder may close the same number later) and so
 	// leaks by design.
 	TransplantAdoptRefused uint64
+	// StaleRecvDataClosed, StaleRecvDataTransplanted and
+	// StaleRecvDataUnattributed count io_uring recv completions that READ
+	// BYTES but arrived for a connection identity (fd, generation) that no
+	// longer owns the descriptor, so the engine dropped them (celeris#657).
+	// Each one is data taken off some socket and discarded: a request a
+	// client sent and will never get an answer to. Before these existed the
+	// drop left no trace at all, and the hand-off ledger above balanced
+	// exactly while requests went missing.
+	//
+	// The three are split by what the engine still holds for the identity
+	// when the completion arrives:
+	//
+	//   - Closed: a connection this engine closed. The peer's bytes raced
+	//     a server-side close; nothing a live client is waiting on.
+	//   - Transplanted: a connection this engine handed to the other
+	//     sub-engine. A recv armed before the hand-off outlived it and
+	//     read a request meant for the new owner — or, through a reused
+	//     descriptor number, for a different connection altogether. This
+	//     is the celeris#657 loss.
+	//   - Unattributed: nothing registered for the identity.
+	//
+	// All three are io_uring-only and cumulative; zero on other engines.
+	// On the adaptive engine each is the sum over both sub-engines.
+	StaleRecvDataClosed       uint64
+	StaleRecvDataTransplanted uint64
+	StaleRecvDataUnattributed uint64
+	// TransplantHandoffInFlight is the cumulative number of io_uring
+	// hand-offs (the reverse, io_uring→epoll, transplant) that detached a
+	// connection while an operation was still outstanding on it: a recv
+	// armed, any kernel op in flight, or a SEND_ZC notification pending.
+	// It is the precondition of every StaleRecvDataTransplanted — a hand-off
+	// with nothing in flight cannot leave a recv behind — and it is
+	// counted whether or not that recv then reads anything (celeris#657).
+	// io_uring-only; zero on other engines. On the adaptive engine it is
+	// the sum over both sub-engines.
+	TransplantHandoffInFlight uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and
