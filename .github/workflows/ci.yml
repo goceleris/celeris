@@ -127,12 +127,13 @@ jobs:
           go test -race -count=1 -timeout=300s $pkgs
       # celeris#657: the step above runs ./engine/iouring WITHOUT -v, so a skip
       # there prints nothing and the package still reports `ok`. That is how the
-      # celeris#656 leak shipped with no cover. Many celeris#657 tests can skip:
-      # of the eleven hand-off loss witness tests (PR-1), four build a ring
-      # through newTestRing and one builds io_uring workers; of the ten
-      # fd-lifetime tests (PR-2), six build a ring through newTestRing and
-      # four (plus one subtest of the six) start a whole io_uring engine. So
-      # all twenty-one run again here by name, with the PASS-count interlock
+      # celeris#656 leak shipped with no cover. Most celeris#657 tests can skip:
+      # they build a ring through newTestRing, build io_uring workers, or start
+      # a whole io_uring engine. That holds for the eleven hand-off loss witness
+      # tests (PR-1, the first list) and the eighteen fd-lifetime tests (PR-2,
+      # the second list; eight of them pin the async-cancel-flags probe, the
+      # reap-failure and dup-failure paths and the reaped recv's cleanup). So
+      # all twenty-nine run again here by name, with the PASS-count interlock
       # the `iouring` job uses (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1
       # to turn every environment skip into a failure, and an exact tally.
       #
@@ -163,7 +164,7 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pr1='TestStaleRecvDataCountsATransplantedConn|TestStaleRecvDataCountsAnAsyncTransplantedConn|TestStaleRecvDataCountsAClosedConn|TestStaleRecvDataCountsAnUnattributedIdentity|TestStaleRecvDataIgnoresCompletionsWithoutData|TestStaleRecvDataCountsEachMultishotCompletion|TestTransplantHandoffInFlightCountsTryTransplant|TestTransplantHandoffInFlightCountsFinishAsyncTransplant|TestMetricsCarriesTheHandoffLossWitnesses|TestWorkersShareTheHandoffLossWitnesses|TestClosedOpsEntryStaysThirtyTwoBytes'
-          pr2='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending'
+          pr2='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending|TestTransplantReapFailureIsNotRetried|TestNoReapWithoutAsyncCancelFlags|TestReapSuppressedAfterFailedHandOff|TestReapedRecvLeavesNoLinkOrBuffer|TestAsyncCancelProbeClassifies|TestAsyncCancelProbeOnThisKernel|TestWorkersCarryTheAsyncCancelProbe|TestReapOnTheRunningKernel'
           names="${pr1}|${pr2}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
@@ -228,15 +229,40 @@ jobs:
       # connections queued on the paused engine, and on a GitHub runner a
       # 2048-conn promotion loses about a third of them). The other three
       # up-switch tests keep running.
+      #
+      # celeris#657 face 2 has its multi-ring gate here: TestFlapConnsPerRing
+      # (T4) fixes both engines at two workers, so its 256 keep-alive
+      # connections are 128 per io_uring ring whatever the runner funds, and
+      # runs three promote/revert cycles under load. At raised memlock the two
+      # revert tests below spread their 64 connections over several rings and
+      # did not lose on the base; T4 lost requests in 8 of 8 base runs. The
+      # tally makes T4 impossible to lose quietly: exactly one top-level RUN
+      # and PASS, no SKIP line for it, and its own RESULT line must show both
+      # engines at two workers and err=0 (the requests its clients lost).
       - name: Adaptive — race tests (memlock raised, up-switch required)
+        shell: bash
         env:
           CELERIS_REQUIRE_UPSWITCH: "1"
         run: |
+          set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v \
             -skip '^(TestBidirectionalFlapAsync|TestRampH1Sync|TestRampH1Async)$' \
-            ./adaptive/...
+            ./adaptive/... 2>&1 | tee /tmp/adaptive-race.log
+          t4='TestFlapConnsPerRing'
+          ran=$(grep -cE "^=== RUN   ${t4}\$" /tmp/adaptive-race.log || true)
+          passed=$(grep -cE "^--- PASS: ${t4} \(" /tmp/adaptive-race.log || true)
+          skipped=$(grep -cE "^[[:space:]]*--- SKIP: ${t4}[ /]" /tmp/adaptive-race.log || true)
+          results=$(grep -cE 'S0T4 RESULT cycles=[0-9]+ conns=[0-9]+ wE=[0-9]+ wI=[0-9]+ ' /tmp/adaptive-race.log || true)
+          clean=$(grep -cE 'S0T4 RESULT cycles=3 conns=256 wE=2 wI=2 conns_per_ring=128 ok=[0-9]+ err=0 ' /tmp/adaptive-race.log || true)
+          echo "celeris#657 T4: want 1, ran $ran, passed $passed, SKIP lines $skipped, RESULT lines $results, at two workers with err=0: $clean"
+          if [ "$ran" -ne 1 ] || [ "$passed" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$results" -ne 1 ] || [ "$clean" -ne 1 ]; then
+            echo "expected TestFlapConnsPerRing to run once and PASS with no SKIP line, and its RESULT line to show"
+            echo "both engines at two workers (128 connections per io_uring ring) and err=0 -- was it renamed or"
+            echo "removed, did it skip, or did this runner fund a different worker count?"
+            exit 1
+          fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
       # above raises memlock, so io_uring there runs several workers and
       # TestReverseTransplant / TestBidirectionalFlap never meet the shape in
@@ -254,6 +280,13 @@ jobs:
       # two PASS (same patterns as the unit job's celeris#657 step). It runs
       # even when the step above failed, so a known flake there cannot hide
       # this leg's result.
+      #
+      # Their verdicts tolerate up to one lost request per connection (err <=
+      # 64), so a PASS alone does not mean nothing was lost: on the base, the
+      # flap test PASSED once with 56 lost requests. The step therefore also
+      # reads each test's own summary line (the revert test's "before revert"
+      # line and the flap test's "total" line, both for async=false) and
+      # requires err=0 on both.
       - name: Adaptive — one-worker revert tests (runner memlock, skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -269,11 +302,14 @@ jobs:
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/revert657.log || true)
           engines=$(grep -cE 'io_uring engine listening .*workers=[0-9]+' /tmp/revert657.log || true)
           one=$(grep -cE 'io_uring engine listening .*workers=1( |$)' /tmp/revert657.log || true)
-          echo "celeris#657 one-worker revert tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, io_uring engines $engines at workers=1: $one"
-          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$engines" -eq 0 ] || [ "$one" -ne "$engines" ]; then
-            echo "expected exactly $want top-level revert tests to run and PASS with no SKIP line, and"
-            echo "every io_uring engine at one worker -- was one renamed or removed, did one skip or fail,"
-            echo "or did this runner fund a different worker count?"
+          summaries=$(grep -cE '\[async=false\] (before revert: .*\| ok=[0-9]+ err=[0-9]+$|total ok=[0-9]+ err=[0-9]+ \|)' /tmp/revert657.log || true)
+          lossless=$(grep -cE '\[async=false\] (before revert: .*\| ok=[0-9]+ err=0$|total ok=[0-9]+ err=0 \|)' /tmp/revert657.log || true)
+          echo "celeris#657 one-worker revert tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, io_uring engines $engines at workers=1: $one, summaries $summaries with err=0: $lossless"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$engines" -eq 0 ] || [ "$one" -ne "$engines" ] || [ "$summaries" -ne "$want" ] || [ "$lossless" -ne "$summaries" ]; then
+            echo "expected exactly $want top-level revert tests to run and PASS with no SKIP line, every"
+            echo "io_uring engine at one worker, and each test's summary line to report err=0 -- was one renamed"
+            echo "or removed, did one skip or fail, did this runner fund a different worker count, or were"
+            echo "requests lost (a PASS verdict tolerates up to one per connection)?"
             exit 1
           fi
 
