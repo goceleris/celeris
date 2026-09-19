@@ -258,6 +258,18 @@ func TestWorkersCarryTheAsyncCancelProbe(t *testing.T) {
 // them no reap is placed, on this iteration or any later one; the client's
 // next request completes the recv, its response is held, and the conn is
 // handed off at that SEND's completion with nothing in flight.
+//
+// probe_answer and probe_matches_the_kernel each call
+// probeAsyncCancelFlagsCached, which since celeris#681 N1 caches only an
+// answer, so on a kernel that gives none these are two probes and may
+// disagree. That is left as it is (celeris#681 N-d): neither subtest
+// downgrades a check on the answer it got — probe_answer runs the branch the
+// answer names, and probe_matches_the_kernel compares the answer with what
+// the kernel does with a real reap and t.Fatalf's on any mismatch, so two
+// probes that disagree fail loudly rather than quietly weaken. The one place
+// where an answer did choose a weaker check is
+// TestHandoffHasNothingInFlight/async, and celeris#681 M1 gates that on the
+// kernel's version instead.
 func TestReapOnTheRunningKernel(t *testing.T) {
 	// run submits and lets the kernel complete ops until pred holds,
 	// processing every completion the way the worker loop does.

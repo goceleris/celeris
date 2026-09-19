@@ -101,6 +101,19 @@ func probeAsyncCancelFlagsCached() (asyncCancelProbe, string) {
 
 // runAsyncCancelProbe is the probe probeAsyncCancelFlagsCached runs. A
 // variable so a test can give each class of answer to the cache and to New.
+//
+// SEAM CONSTRAINT (celeris#681 N-a), shared with asyncCancelProbeSubmit,
+// asyncCancelProbeWait and asyncCancelProbeTimeout: these four are READ
+// inside probeAsyncCancelFlagsCached's asyncCancelMu critical section and
+// WRITTEN by tests without it, so a test may only replace one while no
+// other goroutine can reach a probe — that is, from its own test goroutine,
+// never from a test that has called t.Parallel(), and never while an engine
+// it does not own is being built. Nothing in this package calls t.Parallel()
+// (git grep -n 't\.Parallel()' -- 'engine/iouring/*_test.go' is empty, while
+// the same grep finds engine/provider_test.go), so the constraint holds
+// today; it is documented rather than enforced because guarding the
+// seams would mean a mutex-taking setter and a save/restore helper for each
+// of the four, which is more machinery than a constraint one grep checks.
 var runAsyncCancelProbe = probeAsyncCancelFlags
 
 // SEND_ZC ioprio flags and notification result values.
@@ -542,7 +555,10 @@ var newAsyncCancelProbeRing = func() (*Ring, error) { return NewRing(8, 0, 0) }
 
 // The probe's submit and its wait for the cancel's completion, and how long
 // that wait is. Variables so a test can hold the cancel back and cut the wait
-// short (celeris#681 N1).
+// short (celeris#681 N1). They carry runAsyncCancelProbe's SEAM CONSTRAINT:
+// read under asyncCancelMu, replaced by a test that holds no lock, so only
+// from a test goroutine that no other probe can run against (celeris#681
+// N-a).
 var (
 	asyncCancelProbeSubmit  = func(r *Ring) (int, error) { return r.Submit() }
 	asyncCancelProbeWait    = func(r *Ring, d time.Duration) error { return r.SubmitAndWaitTimeout(d) }
