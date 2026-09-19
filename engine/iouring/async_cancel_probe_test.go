@@ -5,6 +5,7 @@ package iouring
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -95,27 +96,31 @@ func TestAsyncCancelProbeClassifies(t *testing.T) {
 	})
 }
 
-// kernelHasCancelFlags reports whether the running kernel's version is one
-// that has IORING_ASYNC_CANCEL flags (5.19 or later).
-func kernelHasCancelFlags(t *testing.T) (bool, string) {
-	t.Helper()
+// kernelRelease describes the running kernel for a log line: its release and
+// whether that version is one that has IORING_ASYNC_CANCEL flags (5.19 or
+// later). It is never a verdict (celeris#681 R3): a vendor kernel can claim a
+// version its feature surface does not match, which is why the engine probes
+// for the flags at all, so the tests compare the probe with what the running
+// kernel does, not with its version.
+func kernelRelease() string {
 	var u unix.Utsname
 	if err := unix.Uname(&u); err != nil {
-		t.Fatalf("uname: %v", err)
+		return "uname: " + err.Error()
 	}
 	rel := unix.ByteSliceToString(u.Release[:])
 	kv, err := probe.ParseKernelVersion(rel)
 	if err != nil {
-		t.Fatalf("parse kernel release %q: %v", rel, err)
+		return fmt.Sprintf("%s (unparsed: %v)", rel, err)
 	}
-	return kv.AtLeast(5, 19), rel
+	return fmt.Sprintf("%s (a version with the flags: %v)", rel, kv.AtLeast(5, 19))
 }
 
 // TestAsyncCancelProbeOnThisKernel runs the probe itself against the running
-// kernel and checks its answer against the kernel's version, and checks that
-// the probe reads the kernel's answer: a cancel flag no kernel defines
-// (bit 31) is rejected with -EINVAL everywhere, so the same path must then
-// report the flags unsupported.
+// kernel, logs its answer beside the kernel's version, and checks that the
+// probe reads the kernel's answer: a cancel flag no kernel defines (bit 31)
+// is rejected with -EINVAL everywhere, so the same path must then report a
+// rejection. Whether the answer is right for this kernel is
+// TestReapOnTheRunningKernel/probe_matches_the_kernel's check.
 func TestAsyncCancelProbeOnThisKernel(t *testing.T) {
 	r, err := NewRing(8, 0, 0)
 	if err != nil {
@@ -123,12 +128,7 @@ func TestAsyncCancelProbeOnThisKernel(t *testing.T) {
 	}
 	_ = r.Close()
 	res, reason := probeAsyncCancelFlags()
-	ok := res == asyncCancelAccepted
-	want, rel := kernelHasCancelFlags(t)
-	t.Logf("celeris681 async cancel flags probe: kernel=%s result=%v reason=%q", rel, res, reason)
-	if ok != want {
-		t.Fatalf("probeAsyncCancelFlags() = (%v, %q) on kernel %s, want accepted=%v", res, reason, rel, want)
-	}
+	t.Logf("celeris681 async cancel flags probe: kernel=%s result=%v reason=%q", kernelRelease(), res, reason)
 	if cres, _ := probeAsyncCancelFlagsCached(); cres != res {
 		t.Fatalf("the cached probe says %v, the probe %v", cres, res)
 	}
@@ -254,11 +254,7 @@ func TestReapOnTheRunningKernel(t *testing.T) {
 	t.Run("probe_answer", func(t *testing.T) {
 		res, _ := probeAsyncCancelFlagsCached()
 		ok := res == asyncCancelAccepted
-		want, rel := kernelHasCancelFlags(t)
-		t.Logf("celeris681 kernel=%s probe=%v", rel, res)
-		if ok != want {
-			t.Fatalf("the probe says %v on kernel %s, want %v", ok, rel, want)
-		}
+		t.Logf("celeris681 kernel=%s probe=%v", kernelRelease(), res)
 		f := idleArmed(t, ok)
 		if !ok {
 			withoutFlags(t, f)
@@ -275,5 +271,38 @@ func TestReapOnTheRunningKernel(t *testing.T) {
 
 	t.Run("flags_rejected", func(t *testing.T) {
 		withoutFlags(t, idleArmed(t, false))
+	})
+
+	// The probe's answer checked against the running kernel itself rather
+	// than its version (celeris#681 R3): with the flags forced on, the reap
+	// goes to the kernel, and what the kernel does with it must be what the
+	// probe said. A kernel that accepts the flags cancels the recv, and the
+	// conn is handed off at its -ECANCELED; one that rejects them fails the
+	// reap (TransplantReapFailed) and leaves the recv armed, and the conn
+	// then leaves after its next, held, response.
+	t.Run("probe_matches_the_kernel", func(t *testing.T) {
+		res, reason := probeAsyncCancelFlagsCached()
+		f := idleArmed(t, true)
+		if n := f.w.ring.Pending(); n != 1 {
+			t.Fatalf("tryTransplant placed %d SQE(s) with the flags forced on, want the reap", n)
+		}
+		run(t, f, "the kernel's answer to the reap", func() bool {
+			return f.tgt.adopted.Load() == 1 || f.e.metrics.handoffLoss.reapFailed.Load() == 1
+		})
+		accepts := f.tgt.adopted.Load() == 1
+		t.Logf("celeris681 kernel=%s executed the reap: %v; the probe says %v (%q)", kernelRelease(), accepts, res, reason)
+		if accepts != (res == asyncCancelAccepted) {
+			t.Fatalf("the running kernel executed the reap: %v, but the probe says %v (%q): the probe's answer "+
+				"is not what this kernel does", accepts, res, reason)
+		}
+		if !accepts {
+			if _, err := unix.Write(f.peer, []byte(fdlGET)); err != nil {
+				t.Fatalf("client write: %v", err)
+			}
+			run(t, f, "the next request", func() bool { return f.tgt.adopted.Load() == 1 })
+		}
+		if n := f.e.metrics.handoffLoss.handoffInFlight.Load(); n != 0 {
+			t.Fatalf("TransplantHandoffInFlight = %d, want 0", n)
+		}
 	})
 }
