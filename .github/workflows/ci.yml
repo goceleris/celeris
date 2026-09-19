@@ -209,14 +209,28 @@ jobs:
       #
       # Quarantined by name, each with its open issue. Delete the entry when
       # the issue closes: TestBidirectionalFlapAsync (celeris#657);
-      # TestRampH1Sync and TestRampH1Async (celeris#662: a switch drops the
-      # connections queued on the paused engine, and on a GitHub runner a
-      # 2048-conn promotion loses about a third of them). The other three
-      # up-switch tests keep running.
+      # TestRampH1Sync and TestRampH1Async (celeris#657 as well -- see below).
+      #
+      # The celeris#662 fix was expected to release the two Ramp tests and did
+      # NOT. Measured on this runner with the fix applied, the loss celeris#662
+      # described is gone -- sync phase 0 now holds 2048/2048 conns with 0
+      # errors, where the issue recorded 1363 with 685 resets -- but both tests
+      # still fail on LATER phases, which they alone exercise:
+      #   * async phase 4: io_uring=1318 of 2048 after 20s, err=0. Nothing is
+      #     dropped; the transplant just does not finish. That is celeris#657.
+      #   * sync phases 3 and 5: conns stranded on the down-switch, plus resets
+      #     at DIAL (an in-flight handshake at listen-socket close, which
+      #     acceptQueuedOnPause documents as not covered and inherent).
+      # Neither is the accept-time loss celeris#662 fixed, so the quarantine
+      # stays until celeris#657 closes. Un-skipping them would leave this job
+      # permanently red, which is worse than the quarantine: a job that can
+      # never be green stops being read.
       - name: Adaptive — race tests (memlock raised, up-switch required)
+        shell: bash
         env:
           CELERIS_REQUIRE_UPSWITCH: "1"
         run: |
+          set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v \

@@ -14,7 +14,7 @@ import (
 // the listen socket itself — the precondition for accepted sockets inheriting
 // it (#337).
 func TestListenSocketHasNoDelay(t *testing.T) {
-	lfd, err := createListenSocket("127.0.0.1:0")
+	lfd, err := createListenSocket("127.0.0.1:0", true)
 	if err != nil {
 		t.Skipf("listen socket unavailable: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestListenSocketHasNoDelay(t *testing.T) {
 // TCP_NODELAY from the listen socket at SYN time; this guards that the
 // per-accept NODELAY removal (#337) leaves accepted conns nagle-disabled.
 func TestAcceptedConnInheritsNoDelay(t *testing.T) {
-	lfd, err := createListenSocket("127.0.0.1:0")
+	lfd, err := createListenSocket("127.0.0.1:0", true)
 	if err != nil {
 		t.Skipf("listen socket unavailable: %v", err)
 	}
@@ -62,8 +62,11 @@ func TestAcceptedConnInheritsNoDelay(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 
-	// TCP_DEFER_ACCEPT is set on the listener, so the connection only becomes
-	// acceptable once data arrives — send a byte before accepting.
+	// This listener asked for TCP_DEFER_ACCEPT (the default, and what the
+	// deferAccept=true above selects), so the connection only becomes
+	// acceptable once data arrives — send a byte before accepting. An engine
+	// built with resource.Config.DisableDeferAccept would not need this write
+	// (celeris#662); NODELAY inheritance is the same either way.
 	if _, err := unix.Write(cfd, []byte{'x'}); err != nil {
 		t.Fatalf("write: %v", err)
 	}

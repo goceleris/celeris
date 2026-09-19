@@ -840,7 +840,7 @@ func (w *Worker) run(ctx context.Context) {
 	// Create the listen socket on the worker's NUMA node. Each worker has its
 	// own listen socket via SO_REUSEPORT; kernel allocates socket internals
 	// (accept queue, buffers) on the current thread's NUMA node.
-	listenFD, err := createListenSocket(w.cfg.Addr)
+	listenFD, err := createListenSocket(w.cfg.Addr, !w.cfg.DisableDeferAccept)
 	if err != nil {
 		w.ready <- fmt.Errorf("worker %d: listen socket: %w", w.id, err)
 		return
@@ -1066,7 +1066,7 @@ func (w *Worker) run(ctx context.Context) {
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
 		if w.listenFD < 0 && !paused {
-			fd, err := createListenSocket(w.cfg.Addr)
+			fd, err := createListenSocket(w.cfg.Addr, !w.cfg.DisableDeferAccept)
 			if err != nil {
 				// This worker is about to stop accepting for good, so
 				// the bump is not a rate: it is the one record that
@@ -1951,6 +1951,13 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 // cannot take is left on the dirty list with needsRecv set, which the loop
 // re-arms once the next submit has made room: nothing is dropped.
 //
+// It can only reach what the kernel ACCEPT QUEUE holds, which is why a
+// worker that pauses must be configured with
+// resource.Config.DisableDeferAccept. While TCP_DEFER_ACCEPT is set the
+// kernel keeps a handshake-complete connection that has sent no data out of
+// that queue altogether, so neither an accept completion nor this sweep can
+// produce it, and the close resets it -- the residual half of celeris#662.
+//
 // The listen socket is non-blocking (createListenSocket), so accept4 returns
 // EAGAIN once the queue is empty; the drain is also bounded at the conn
 // table's size. EMFILE/ENFILE or an unexpected error stops it and is
@@ -1963,7 +1970,8 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 // loses nothing: the worker still closes the listener it read as paused and
 // re-creates it on the next iteration, as it did before. A handshake still in
 // progress at the close is aborted by the kernel as before; that is inherent
-// to closing a listen socket.
+// to closing a listen socket, unlike the deferred-request-socket case above,
+// which is configuration.
 //
 // listenFD is the socket being closed. The caller has already cleared
 // w.listenFD, so no completion handled on the way can re-arm accept on it.
@@ -5306,7 +5314,10 @@ func (w *Worker) releaseFailedInit() {
 	}
 }
 
-func createListenSocket(addr string) (int, error) {
+// createListenSocket binds and listens on addr. deferAccept asks for
+// TCP_DEFER_ACCEPT, which a caller that pauses accept must NOT ask for:
+// see resource.Config.DisableDeferAccept and celeris#662.
+func createListenSocket(addr string, deferAccept bool) (int, error) {
 	sa, err := parseAddr(addr)
 	if err != nil {
 		return -1, err
@@ -5331,9 +5342,14 @@ func createListenSocket(addr string) (int, error) {
 		return -1, fmt.Errorf("SO_REUSEPORT: %w", err)
 	}
 
-	// TCP_DEFER_ACCEPT: kernel holds connections until data arrives,
-	// eliminating wasted accept+wait cycles for idle connections.
-	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	// TCP_DEFER_ACCEPT: the kernel holds a connection out of the accept queue
+	// until its first data arrives, saving a recv arm per idle connection. It
+	// also hides that connection from acceptQueuedOnPause, so a worker that
+	// pauses accept loses it (celeris#662) -- which is why the caller can turn
+	// it off, and why adaptive's sub-engines do.
+	if deferAccept {
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	}
 	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 

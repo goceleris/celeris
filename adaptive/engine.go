@@ -292,6 +292,20 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	// with SO_REUSEPORT (see epoll/iouring createListenSocket). The only
 	// listener shape adaptive genuinely cannot serve is a non-TCP one, and
 	// reusePortAddr above rejects that at New() rather than at switch time.
+	// Neither sub-engine may defer accept (celeris#662). Every switch pauses
+	// the outgoing engine, and while TCP_DEFER_ACCEPT is set the kernel holds
+	// a handshake-complete connection that has not yet sent its request out of
+	// the accept queue entirely -- so the pause's drain cannot see it, the
+	// listen-socket close orphans it, and the client's first request meets the
+	// incoming engine's listener with a reset. That is what the celeris#660 CI
+	// job measured as a 2048-connection ramp losing about a third of its
+	// connections across a promotion.
+	//
+	// This is set here rather than made the engines' default because the
+	// option is worth real throughput on connection churn to an engine that
+	// never pauses; adaptive always pauses, so it never gets to keep it.
+	cfg.DisableDeferAccept = true
+
 	startCfg := cfg
 	standbyCfg := cfg
 	standbyCfg.Listener = nil
