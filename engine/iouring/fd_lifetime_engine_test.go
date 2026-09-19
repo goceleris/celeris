@@ -301,11 +301,21 @@ func metricOr(e *Engine, name string) int64 {
 // completion, or a reap); the async ones are promoted to a dispatch goroutine
 // that claims its own hand-off at its park, and leave through
 // finishAsyncTransplant, which reaps the recv the feed path armed.
+//
+// Where the probe did not find the cancel flags (every kernel before 5.19)
+// a promoted async conn cannot be reaped, so it is never offered for the
+// hand-off and stays on io_uring (asyncTransplantEligible, celeris#681 R1):
+// there the async subtest wants none of them handed off, and no client error.
+// It used to want all of them on every kernel, so it failed on 5.15.0-191
+// ("0 of 128 busy conns were handed off"; celeris#681 N4).
+// async_without_cancel_flags runs that case on any kernel: the engine's probe
+// answer is taken as a rejection (runAsyncCancelProbe).
 func TestHandoffHasNothingInFlight(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		async bool
-	}{{"sync", false}, {"async", true}} {
+		name    string
+		async   bool
+		noFlags bool
+	}{{"sync", false, false}, {"async", true, false}, {"async_without_cancel_flags", true, true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			var h stream.Handler = transplantTestHandler{}
 			var mut func(*resource.Config)
@@ -313,7 +323,21 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 				h = asyncRouteHandler{}
 				mut = func(c *resource.Config) { c.AsyncHandlers = true }
 			}
+			if tc.noFlags {
+				saved := runAsyncCancelProbe
+				runAsyncCancelProbe = func() (asyncCancelProbe, string) {
+					return asyncCancelRejected, "celeris681 forced: the cancel flags taken as rejected"
+				}
+				resetAsyncCancelProbeCache()
+				t.Cleanup(func() {
+					runAsyncCancelProbe = saved
+					resetAsyncCancelProbeCache() // the next New probes the kernel again
+				})
+			}
 			e, addr := startFDLEngine(t, h, mut)
+			if tc.noFlags && e.asyncCancelFlags {
+				t.Fatal("New turned the reap on although the probe's answer was a rejection")
+			}
 			var maxSeen atomic.Uint64
 			tgt := &servingTarget{}
 			tgt.onAdopt = func() {
@@ -340,7 +364,17 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 			if res.errs != 0 {
 				t.Errorf("clients saw %d errors (%s), want 0", res.errs, classes(res.byClass))
 			}
-			if got := tgt.adopted.Load(); got != conns {
+			got := tgt.adopted.Load()
+			if tc.async && !e.asyncCancelFlags {
+				t.Logf("celeris681 no cancel flags: %d of %d promoted async conns handed off (promotions %d)",
+					got, conns, e.Metrics().AsyncPromotedConns)
+				if got != 0 {
+					t.Errorf("%d of %d promoted async conns were handed off on a worker that cannot reap, want 0: "+
+						"such a conn is never offered for the hand-off", got, conns)
+				}
+				return
+			}
+			if got != conns {
 				t.Errorf("%d of %d busy conns were handed off, want all", got, conns)
 			}
 		})
