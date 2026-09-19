@@ -125,10 +125,12 @@ func TestStaleRecvDataCountsAnAsyncTransplantedConn(t *testing.T) {
 	}
 }
 
-// TestStaleRecvDataCountsAClosedConn is the benign class: the conn was
-// CLOSED by this worker (the close paths register through
-// noteClosedInflight) and the peer's bytes raced the close. It must count as
-// Closed, never as a hand-off loss.
+// TestStaleRecvDataCountsAClosedConn is the close class: the conn was
+// CLOSED by this worker (the close paths and hijackConn register through
+// noteClosedInflight), and a recv completed with data after it. Usually the
+// peer's bytes raced the close, but not always (see
+// engine.EngineMetrics.StaleRecvDataClosed). It must count as Closed, never
+// as a hand-off loss.
 func TestStaleRecvDataCountsAClosedConn(t *testing.T) {
 	const fd, gen = 9, 3
 	w := &Worker{conns: make([]*connState, 16), handoffLoss: &handoffLossStats{}}
