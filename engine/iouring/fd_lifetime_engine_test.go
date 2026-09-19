@@ -247,6 +247,9 @@ func classes(m map[string]int64) string {
 // warm, keeps the load up for after, stops it and returns what the clients
 // saw. The stale CQEs of any stolen request arrive within the load window;
 // the final wait lets the last of them land before the counters are read.
+// It logs every celeris#657 counter, and fails the test if one of the three
+// that must stay 0 moved (TransplantDoubleClaim, TransplantReapFailed,
+// TransplantHoldRescued; celeris#681 R4).
 func transplantUnderLoad(t *testing.T, e *Engine, addr string, n int, tgt engine.TransplantTarget,
 	warm, after time.Duration,
 ) loadResult {
@@ -273,6 +276,11 @@ func transplantUnderLoad(t *testing.T, e *Engine, addr string, n int, tgt engine
 		e.metrics.transplantDetached.Load(),
 		metricOr(e, "TransplantClaimDeferred"), metricOr(e, "TransplantReapFailed"),
 		metricOr(e, "TransplantReapUnsupported"))
+	for _, name := range []string{"TransplantDoubleClaim", "TransplantReapFailed", "TransplantHoldRescued"} {
+		if n := metric(t, e, name); n != 0 {
+			t.Errorf("%s = %d, want 0 (a hand-off counter that must stay 0)", name, n)
+		}
+	}
 	return res
 }
 
@@ -386,6 +394,11 @@ func TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen(t *testing.T) {
 		if n := metric(t, e, "TransplantHoldRescued"); n != 0 {
 			t.Errorf("TransplantHoldRescued = %d, want 0: a held conn was stranded until the "+
 				"timeout sweep found it", n)
+		}
+		for _, name := range []string{"TransplantDoubleClaim", "TransplantReapFailed"} {
+			if n := metric(t, e, name); n != 0 {
+				t.Errorf("%s = %d, want 0", name, n)
+			}
 		}
 		if res.ok == 0 {
 			t.Error("clients completed no requests")
