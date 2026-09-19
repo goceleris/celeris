@@ -482,6 +482,13 @@ type Worker struct {
 	// this only has to outlive that.
 	shutdownDriverHold []*driverConn
 
+	// reapRetry holds the (fd, generation) identities whose hand-off reap
+	// missed, or found the SQ ring full, while their recv was still armed;
+	// retryReaps re-runs them once per loop iteration (celeris#657).
+	// reapRetrySpare is the second buffer of the swap. Worker thread only.
+	reapRetry      []uint64
+	reapRetrySpare []uint64
+
 	// transplant (#383 reverse) is non-nil while a drain-to-epoll is in progress.
 	// Set by Engine.StartTransplant (controller goroutine), read on this worker's
 	// own thread after each handleRecv; when set, an idle H1 conn at a clean
@@ -1222,6 +1229,12 @@ func (w *Worker) run(ctx context.Context) {
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleRecvCancel(entry, fd)
 					}
+				case udTransplantReap:
+					// And for the hand-off's reap: its miss is the only
+					// event that says the recv is still armed (celeris#657).
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleTransplantReap(entry, fd)
+					}
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
 				case udDriverSend:
@@ -1590,6 +1603,11 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleRecvCancel(c, fd)
+	case udTransplantReap:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
+		w.handleTransplantReap(c, fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
 	case udDriverSend:
@@ -2411,6 +2429,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			w.bufRing.PushBuffer(cqeBufferID(c.Flags))
 			w.hasBufReturns = true
 		}
+		return
+	}
+	// A hand-off reap is outstanding (celeris#657): its -ECANCELED is the
+	// hand-off point and must never reach the generic negative-result
+	// branch below, which would close a healthy conn.
+	if cs.transplantReap > 0 && w.reapOutcome(c, fd, cs) {
 		return
 	}
 
@@ -4434,6 +4458,11 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 }
 
 func (w *Worker) drainDetachQueue() {
+	// The other deferred hand-off work first: reaps that missed, or found
+	// the SQ ring full, while their recv was still armed (celeris#657).
+	if len(w.reapRetry) > 0 {
+		w.retryReaps()
+	}
 	if w.detachQPending.Load() == 0 {
 		return
 	}

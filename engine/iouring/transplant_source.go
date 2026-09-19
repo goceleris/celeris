@@ -43,11 +43,13 @@ func (e *Engine) StopTransplant() {
 }
 
 // tryTransplant detaches an idle H1 conn from this worker and hands it to the
-// epoll target when it is at a clean, fully-flushed request boundary. Runs on the
-// worker thread (after handleRecv/handleSend). Mirrors hijackConn's detach (cancel
-// the armed recv, defer the connState release to its terminal CQE) but hands a
-// freshly dup'd non-blocking fd to epoll instead of wrapping it in a net.Conn.
-// No-op for ineligible conns; retried at their next boundary.
+// epoll target when it is at a clean, fully-flushed request boundary with
+// nothing in flight on its descriptor (celeris#657). Runs on the worker thread
+// (after handleRecv/handleSend, and when a reap lands). A conn whose recv is
+// armed is not moved: its recv is reaped first (fd_lifetime.go). Otherwise it
+// mirrors hijackConn's detach but hands a freshly dup'd non-blocking fd to
+// epoll instead of wrapping it in a net.Conn (handOff). No-op for ineligible
+// conns; retried at their next boundary.
 //
 // This worker-side path handles SYNC conns (and async conns that never promoted,
 // asyncRun==false — they run inline on the worker, so the worker owns their state).
@@ -97,6 +99,16 @@ func (w *Worker) tryTransplant(fd int) {
 		return
 	}
 	if !cs.h1State.AtRequestBoundary() || cs.h1State.HasPendingData() {
+		return
+	}
+	// The fd-lifetime rule (celeris#657, R0): nothing that can still resolve
+	// this descriptor may be in flight when it moves. The usual case is the
+	// recv armed after the last response (its linked RECV, or the idle
+	// conn's standalone one): reap it and hand off at its -ECANCELED.
+	if cs.recvArmed || cs.kernelInflight != 0 || cs.zcNotifPending {
+		if onlyRecvInFlight(cs) {
+			w.startReap(cs)
+		}
 		return
 	}
 
@@ -227,12 +239,13 @@ func (w *Worker) enqueueDetach(cs *connState) {
 }
 
 // finishAsyncTransplant completes a self-initiated async transplant on the WORKER
-// thread (from drainDetachQueue), after the dispatch goroutine has marked the conn
-// (transplantPending) and exited. It dups the fd for epoll, runs the worker-owned
-// detach (cancel the armed recv, defer the connState release to its terminal CQE),
-// closes the original, and hands the dup to epoll. If the drain was stopped in the
-// meantime, or the dup fails, it leaves the conn in place — its next recv respawns
-// the dispatch goroutine (asyncRun is already false), so nothing is lost.
+// thread (from drainDetachQueue, or when its reap lands), after the dispatch
+// goroutine has marked the conn (transplantPending) and exited. The conn's recv
+// is reaped first (celeris#657); with nothing in flight, handOff dups the fd for
+// epoll, runs the worker-owned detach, closes the original, and hands the dup
+// over. If the drain was stopped in the meantime, or the dup fails, it leaves
+// the conn in place — its next recv respawns the dispatch goroutine (asyncRun is
+// already false), so nothing is lost.
 func (w *Worker) finishAsyncTransplant(cs *connState) {
 	h := w.transplant.Load()
 	if h == nil {
@@ -262,6 +275,18 @@ func (w *Worker) finishAsyncTransplant(cs *connState) {
 	// next recv respawns the dispatch goroutine, and the transplant is retried
 	// at the following park boundary.
 	if cs.sending || cs.zcNotifPending || len(cs.sendBuf) != 0 || len(cs.writeBuf) != 0 {
+		return
+	}
+	// The fd-lifetime rule (celeris#657, R0), as in tryTransplant. This used
+	// to cancel, dup and close with the recv still armed; a request that
+	// recv took was lost (measured on main at an idle revert). The goroutine
+	// has exited, so the recv the feed path armed for it is the one op the
+	// conn can have: reap it, and come back here at its -ECANCELED. A
+	// request that beats the cancel respawns the goroutine as usual.
+	if cs.recvArmed || cs.kernelInflight != 0 || cs.zcNotifPending {
+		if onlyRecvInFlight(cs) {
+			w.startReap(cs)
+		}
 		return
 	}
 	w.handOff(cs, cs.fd, h, true)

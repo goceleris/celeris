@@ -195,6 +195,31 @@ type connState struct {
 	// Worker-thread only, like recvPaused.
 	recvCancelPending uint16
 
+	// transplantReap counts the hand-off's reported recv cancels (REAP,
+	// celeris#657) whose effect has not been observed yet: incremented when
+	// startReap submits one, decremented by the -ECANCELED of the recv one
+	// of them cancelled or by a cancel's own completion reporting that it
+	// matched nothing. A COUNT, for the reason recvCancelPending is one: a
+	// reap can be outstanding for a recv that has since completed while a
+	// newer reap targets the recv armed after it, and the older one's miss
+	// must not clear the state the newer one's -ECANCELED needs — as a bool
+	// it did, and that -ECANCELED fell through handleRecv's generic error
+	// branch and closed a healthy connection (celeris#484/#596).
+	//
+	// reapStale: every reap counted in transplantReap was aimed at a recv
+	// that has since completed, so the recv armed now has none aimed at it
+	// and may get its own.
+	//
+	// transplantHold: the conn's last response was flushed with NO recv
+	// behind it, because a drain was set and the hand-off at that SEND's
+	// completion was expected to take the conn (HOLD). releaseHold arms the
+	// recv there if the hand-off does not happen.
+	//
+	// All three worker-thread only, like recvCancelPending.
+	transplantReap uint16
+	reapStale      bool
+	transplantHold bool
+
 	// Async handler dispatch (Worker.async=true, HTTP1 only):
 	// Incoming recv bytes are appended under asyncInMu by the worker.
 	// A single dispatch goroutine per conn drains asyncInBuf via a
@@ -440,6 +465,9 @@ func releaseConnState(cs *connState) {
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
 	cs.recvCancelPending = 0
+	cs.transplantReap = 0
+	cs.reapStale = false
+	cs.transplantHold = false
 	cs.headerTimerSpec = kernelTimespec{}
 	cs.headerTimerArmed = false
 	cs.forceRSTClose = false
