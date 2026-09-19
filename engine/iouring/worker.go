@@ -189,12 +189,13 @@ type pendingReleaseEntry struct {
 // count drains (release-late is safe; release-early is the UAF).
 type closedOpsEntry struct {
 	inflight int32
-	conns    []*connState
 	// handoff marks an identity a conn left through a transplant hand-off
 	// rather than a close (noteHandedOffInflight), so a stale recv CQE that
 	// carried data for it is counted as a hand-off loss (celeris#657). It
-	// is read only by that counter and changes nothing else.
+	// is read only by that counter and changes nothing else. Placed in
+	// inflight's padding, so the entry stays 32 bytes.
 	handoff bool
+	conns   []*connState
 }
 
 // pendingReleaseHoldNanos is the WALL-CLOCK BACKSTOP for releasing a
