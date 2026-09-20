@@ -130,12 +130,16 @@ jobs:
       # celeris#656 leak shipped with no cover. Most celeris#657 tests can skip:
       # they build a ring through newTestRing, build io_uring workers, or start
       # a whole io_uring engine. That holds for the eleven hand-off loss witness
-      # tests (PR-1, the first list) and the eighteen fd-lifetime tests (PR-2,
+      # tests (PR-1, the first list), the eighteen fd-lifetime tests (PR-2,
       # the second list; eight of them pin the async-cancel-flags probe, the
-      # reap-failure and dup-failure paths and the reaped recv's cleanup). So
-      # all twenty-nine run again here by name, with the PASS-count interlock
-      # the `iouring` job uses (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1
-      # to turn every environment skip into a failure, and an exact tally.
+      # reap-failure and dup-failure paths and the reaped recv's cleanup) and
+      # the six post-switch sweep tests (PR-3, the third list: the wake poll,
+      # the sweep reaching an idle conn through the reap, and the four cases in
+      # which it must NOT ask -- no cancel flags, work already owed, a claim
+      # already made, a detached WebSocket conn). So all thirty-five run again
+      # here by name, with the PASS-count interlock the `iouring` job uses
+      # (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1 to turn every
+      # environment skip into a failure, and an exact tally.
       #
       # The tally counts TOP-LEVEL results: `=== RUN   Name` with nothing after
       # the name, and `--- PASS: Name (`. go test prints the elapsed time after
@@ -156,7 +160,7 @@ jobs:
       # "celeris657 engine workers=N"; the step requires at least one such
       # line and every one to read workers=1, so a runner that funds more
       # workers fails here instead of silently testing another shape.
-      - name: celeris#657 hand-off witness and fd-lifetime tests, one io_uring worker (skipping forbidden)
+      - name: celeris#657 hand-off witness, fd-lifetime and sweep tests, one io_uring worker (skipping forbidden)
         shell: bash
         env:
           CELERIS_REQUIRE_IOURING_WORKERS: "1"
@@ -165,7 +169,8 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           pr1='TestStaleRecvDataCountsATransplantedConn|TestStaleRecvDataCountsAnAsyncTransplantedConn|TestStaleRecvDataCountsAClosedConn|TestStaleRecvDataCountsAnUnattributedIdentity|TestStaleRecvDataIgnoresCompletionsWithoutData|TestStaleRecvDataCountsEachMultishotCompletion|TestTransplantHandoffInFlightCountsTryTransplant|TestTransplantHandoffInFlightCountsFinishAsyncTransplant|TestMetricsCarriesTheHandoffLossWitnesses|TestWorkersShareTheHandoffLossWitnesses|TestClosedOpsEntryStaysThirtyTwoBytes'
           pr2='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending|TestTransplantReapFailureIsNotRetried|TestNoReapWithoutAsyncCancelFlags|TestReapSuppressedAfterFailedHandOff|TestReapedRecvLeavesNoLinkOrBuffer|TestAsyncCancelProbeClassifies|TestAsyncCancelProbeOnThisKernel|TestWorkersCarryTheAsyncCancelProbe|TestReapOnTheRunningKernel'
-          names="${pr1}|${pr2}"
+          pr3='TestWorkerAskWakesTheRing|TestQuiesceMovesAnIdleConn|TestSweepDoesNotSpinWithoutCancelFlags|TestSweepSkipsAConnWithWorkAlreadyOwed|TestSweepDoesNotReClaimAnAsyncHandoff|TestSweepLeavesADetachedConnAlone'
+          names="${pr1}|${pr2}|${pr3}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./engine/iouring/ 2>&1 | tee /tmp/witness657.log
