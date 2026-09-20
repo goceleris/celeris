@@ -812,6 +812,18 @@ func (e *Engine) performSwitch() {
 	// alternative (pause first) creates a window where NEITHER listens,
 	// because io_uring ASYNC_CANCEL and epoll listen socket re-creation
 	// are asynchronous.
+	// celeris#657 P11 (B0). The engine about to become active may still
+	// carry the drain it was given as a SOURCE at the previous switch,
+	// pointing at the engine this switch is about to make standby. Stop it
+	// FIRST: between ResumeAccept here and applyTransplant below, every
+	// connection this engine accepts is at a clean HTTP/1 boundary the
+	// moment it has answered its first request, so the stale drain hands it
+	// straight to the engine being switched away from — measured as a
+	// ping-pong of 80 connections in 1 of 150 switches. applyTransplant
+	// keeps its own StopTransplant, which is idempotent.
+	if src, ok := newActive.(interface{ StopTransplant() }); ok {
+		src.StopTransplant()
+	}
 	if ac, ok := newActive.(engine.AcceptController); ok {
 		_ = ac.ResumeAccept()
 	}
@@ -847,6 +859,9 @@ func (e *Engine) performSwitch() {
 	// HTTP/1 conns at a clean, flushed request boundary are moved (see
 	// epoll.tryTransplant); H2/h2c/mid-upgrade/detached/driver conns are never
 	// touched, so this is safe to run unconditionally.
+	if switchWindowHook != nil {
+		switchWindowHook(newActive, newStandby)
+	}
 	e.applyTransplant(newActive, newStandby)
 
 	// Suppress further switches for the cooldown period. The cooldown is
@@ -1093,6 +1108,17 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantClaimDeferred:   pm.TransplantClaimDeferred + sm.TransplantClaimDeferred,
 		TransplantReapFailed:      pm.TransplantReapFailed + sm.TransplantReapFailed,
 		TransplantReapUnsupported: pm.TransplantReapUnsupported + sm.TransplantReapUnsupported,
+		// The post-switch sweep (celeris#657 PR-3). Both sub-engines sweep,
+		// in opposite directions, and only the one draining runs passes at
+		// all, so the pass count sums as a rate. The residual entries are
+		// GAUGES, and the sum is the whole adaptive engine's residue: after
+		// a switch settles, the outgoing side's is what did not follow it
+		// and the incoming side's is zero.
+		TransplantSweepPasses:      pm.TransplantSweepPasses + sm.TransplantSweepPasses,
+		TransplantResidualDetached: pm.TransplantResidualDetached + sm.TransplantResidualDetached,
+		TransplantResidualH2:       pm.TransplantResidualH2 + sm.TransplantResidualH2,
+		TransplantResidualPinned:   pm.TransplantResidualPinned + sm.TransplantResidualPinned,
+		TransplantResidualBusy:     pm.TransplantResidualBusy + sm.TransplantResidualBusy,
 
 		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
 		// so the epoll half contributes zero and a switch simply moves which
