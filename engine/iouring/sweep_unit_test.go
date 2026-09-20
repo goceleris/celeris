@@ -130,6 +130,38 @@ func TestSweepSkipsAConnWithWorkAlreadyOwed(t *testing.T) {
 	}
 }
 
+// TestSweepDoesNotReClaimAnAsyncHandoff is the same skip for the other kind
+// of work already owed: a hand-off a dispatch goroutine has claimed for
+// itself. tryTransplant leaves such a conn to its claim and counts the
+// ordering as TransplantClaimDeferred -- a rate whose meaning is "a
+// completion landed between the park and the drain of the claim". A sweep
+// that re-examined the conn would bump that rate once per pass for as long
+// as the claim took to drain, turning a witness into noise.
+func TestSweepDoesNotReClaimAnAsyncHandoff(t *testing.T) {
+	f := newFDLFixture(t, true)
+	f.armFirstRecv()
+	// The state the dispatch goroutine leaves behind at its park: the claim
+	// set, the goroutine gone, the hand-off owed to drainDetachQueue.
+	f.cs.transplantPending.Store(true)
+	f.cs.asyncRun = false
+	f.startDrain()
+
+	for i := 0; i < 5; i++ {
+		forceIOUPass(f.w)
+		f.w.sweep()
+	}
+	if n := metric(t, f.e, "TransplantClaimDeferred"); n != 0 {
+		t.Errorf("celeris657 CLAIM: TransplantClaimDeferred = %d after five sweep passes over a conn whose "+
+			"dispatch goroutine has already claimed its hand-off, want 0: the sweep must leave it to the claim", n)
+	}
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+		t.Errorf("celeris657 CLAIM: the sweep placed %v for a conn with a claim outstanding, want nothing", sqes)
+	}
+	if got := f.tgt.adopted.Load(); got != 0 {
+		t.Errorf("celeris657 CLAIM: %d conns were handed over out from under a claim, want 0", got)
+	}
+}
+
 // TestSweepLeavesADetachedConnAlone is the celeris#667/#672 interaction. A
 // detached WebSocket or SSE connection is a promoted async connection whose
 // hand-off is refused for good, so the sweep must neither examine it nor
