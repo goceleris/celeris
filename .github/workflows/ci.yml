@@ -186,6 +186,54 @@ jobs:
             echo "or did this runner fund a different worker count?"
             exit 1
           fi
+      # celeris#657 PR-3: the same silent-exclusion shape, one package over.
+      # ./engine/epoll is reached only by the root step above, which runs
+      # without -v, so a skip there prints nothing and the package still
+      # reports `ok`. Two of the eight post-switch sweep tests start a REAL
+      # epoll engine and t.Skip when it does not come up
+      # (sweep_engine_test.go), and they are the two that prove face 1 on a
+      # real engine: an idle keep-alive is handed over although its client
+      # never sends another byte. A rename or an environment skip would take
+      # them out of CI with no red.
+      #
+      # So all eight run again here by name with the interlock the step above
+      # uses: -v, exact top-level RUN and PASS counts, and no `--- SKIP` line
+      # anywhere. Two further censuses make the engine cells impossible to
+      # lose quietly. Both build their engine with Resources.Workers=2, so
+      # every "epoll engine listening" line must read loops=2 -- a runner that
+      # resolves a different loop count fails here instead of silently testing
+      # another shape. And each prints one SWEEPIDLE line, after the engine
+      # bound and after its premise held, so requiring exactly two of them is
+      # what says both cells really reached a running engine.
+      #
+      # No memlock is raised and none is needed: epoll does not allocate
+      # locked ring memory, so this step is the same shape on any runner.
+      # It runs even when the io_uring step above failed -- the two share no
+      # engine, and a known flake there must not hide this one's result.
+      - name: celeris#657 epoll post-switch sweep tests (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestSweepMovesIdleConnsWithoutTraffic|TestSweepMovesIdleAsyncConnsWithoutTraffic|TestSweepStopsWithTheDrain|TestSweepGoesDormantOnPermanentResidue|TestSweepBudgetCoversEveryConnAcrossPasses|TestSweepCadenceBacksOffAndResets|TestAskNeverOutlivesConnState|TestSweepDoesNotBlockOnADetachedConnsLock'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./engine/epoll/ 2>&1 | tee /tmp/sweep657.log
+          ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/sweep657.log || true)
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/sweep657.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/sweep657.log || true)
+          engines=$(grep -cE 'epoll engine listening .*loops=[0-9]+' /tmp/sweep657.log || true)
+          two=$(grep -cE 'epoll engine listening .*loops=2( |$)' /tmp/sweep657.log || true)
+          idle=$(grep -cE 'celeris657 SWEEPIDLE async=(true|false) adopted=' /tmp/sweep657.log || true)
+          echo "celeris#657 epoll sweep tests: want $want, ran $ran, passed $passed, SKIP lines $skipped, epoll engines $engines at loops=2: $two, SWEEPIDLE lines $idle (want 2)"
+          if [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$engines" -eq 0 ] || [ "$two" -ne "$engines" ] || [ "$idle" -ne 2 ]; then
+            echo "expected exactly $want top-level celeris#657 epoll sweep tests to run and PASS with no SKIP"
+            echo "line, every epoll engine at two loops, and both idle-sweep cells to reach their SWEEPIDLE"
+            echo "line -- was one renamed or removed, did one skip or fail, or did this runner resolve a"
+            echo "different loop count?"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
@@ -208,7 +256,12 @@ jobs:
   adaptive:
     name: Adaptive engine (./adaptive/...)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30, not 20, since celeris#657 PR-3 un-quarantined TestBidirectionalFlapAsync
+    # (three promote/revert flaps over 64 loaded keep-alives) into the first step.
+    # The two steps' own `go test -timeout` values are 900s and 300s, so the job
+    # limit stays above their sum and a hung test is still killed by go test,
+    # with its stack, rather than by the runner with nothing.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -229,11 +282,24 @@ jobs:
       # a failure, so this job cannot go green by skipping them.
       #
       # Quarantined by name, each with its open issue. Delete the entry when
-      # the issue closes: TestBidirectionalFlapAsync (celeris#657);
-      # TestRampH1Sync and TestRampH1Async (celeris#662: a switch drops the
-      # connections queued on the paused engine, and on a GitHub runner a
-      # 2048-conn promotion loses about a third of them). The other three
-      # up-switch tests keep running.
+      # the issue closes: TestRampH1Sync and TestRampH1Async (celeris#662: a
+      # switch drops the connections queued on the paused engine, and on a
+      # GitHub runner a 2048-conn promotion loses about a third of them). The
+      # other three up-switch tests keep running.
+      #
+      # TestBidirectionalFlapAsync was the third entry, quarantined for
+      # celeris#657 itself. PR-3 fixes what it was failing on -- at a flap the
+      # outgoing engine kept 35-51 of 64 connections on the base and 0 on the
+      # fix, 8 of 8 each -- and it is un-skipped here under the lift rule the
+      # design decision sets: only after >= 6 GitHub-hosted re-runs of
+      # identical bytes all pass. Those re-runs are recorded on the PR. It is
+      # in the placement tally below, so it cannot go quiet again.
+      #
+      # TestRampH1Async keeps its entry although PR-3 empties the outgoing
+      # engine there too (0 of 2048 left behind, against 247-512 on the base).
+      # Its quarantine is celeris#662's, not this one's, and the 2048-conn
+      # ramp also loses connections to "read: reset" on BOTH the base and the
+      # fix (celeris#686). Lift it with #662, not here.
       #
       # celeris#657 face 2 has its multi-ring gate here: TestFlapConnsPerRing
       # (T4) fixes both engines at two workers, so its 256 keep-alive
@@ -244,6 +310,20 @@ jobs:
       # tally makes T4 impossible to lose quietly: exactly one top-level RUN
       # and PASS, no SKIP line for it, and its own RESULT line must show both
       # engines at two workers and err=0 (the requests its clients lost).
+      #
+      # celeris#657 face 1 (PR-3, placement) has its gate here too. Nine cells
+      # run in this same invocation: the four idle-keep-alive switch cells,
+      # the two polled flaps, the slow async handler, the switch-order cell
+      # and the un-quarantined TestBidirectionalFlapAsync. Every one of them
+      # t.Skips under -short, and the whole set is what separates the base
+      # from the fix, so the same interlock applies: exactly nine top-level
+      # RUN and PASS, no `--- SKIP` line naming one of them, and one RESULT
+      # line per cell. The eight PR-3 cells report err=0 w1=0 w2=0 on their
+      # RESULT line -- no client lost a request, no recv outlived its
+      # hand-off, no hand-off was made with an op in flight. The flap's own
+      # verdict tolerates up to one lost request per connection, so its total
+      # line is required to exist but its error count is not tightened here:
+      # the evidence that it is 0 is local (8 of 8), not GitHub-hosted.
       - name: Adaptive — race tests (memlock raised, up-switch required)
         shell: bash
         env:
@@ -252,8 +332,8 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=600s -v \
-            -skip '^(TestBidirectionalFlapAsync|TestRampH1Sync|TestRampH1Async)$' \
+          go test -race -count=1 -timeout=900s -v \
+            -skip '^(TestRampH1Sync|TestRampH1Async)$' \
             ./adaptive/... 2>&1 | tee /tmp/adaptive-race.log
           t4='TestFlapConnsPerRing'
           ran=$(grep -cE "^=== RUN   ${t4}\$" /tmp/adaptive-race.log || true)
@@ -266,6 +346,22 @@ jobs:
             echo "expected TestFlapConnsPerRing to run once and PASS with no SKIP line, and its RESULT line to show"
             echo "both engines at two workers (128 connections per io_uring ring) and err=0 -- was it renamed or"
             echo "removed, did it skip, or did this runner fund a different worker count?"
+            exit 1
+          fi
+          place='TestIdleConnsFollowSwitchPromoteSync|TestIdleConnsFollowSwitchPromoteAsync|TestIdleConnsFollowSwitchRevertSync|TestIdleConnsFollowSwitchRevertAsync|TestFlapConvergesPollSync|TestFlapConvergesPollAsync|TestSlowAsyncHandlerConverges|TestSwitchDoesNotAdoptOntoOutgoing|TestBidirectionalFlapAsync'
+          pwant=$(( $(tr '|' '\n' <<<"$place" | wc -l) ))
+          pran=$(grep -cE "^=== RUN   (${place})\$" /tmp/adaptive-race.log || true)
+          ppassed=$(grep -cE "^--- PASS: (${place}) \(" /tmp/adaptive-race.log || true)
+          pskipped=$(grep -cE "^[[:space:]]*--- SKIP: (${place})[ /]" /tmp/adaptive-race.log || true)
+          presults=$(grep -cE 'celeris657 (IDLE-(promote|revert)|FLAPPOLL) async=(true|false) RESULT |S0SA RESULT |celeris657 B0 fired=|\[async=true\] total ok=[0-9]+ err=[0-9]+ \|' /tmp/adaptive-race.log || true)
+          pclean=$(grep -cE 'celeris657 (IDLE-(promote|revert)|FLAPPOLL) async=(true|false) RESULT .* err=0 w1=0 w2=0 |S0SA RESULT .* err=0 census=|celeris657 B0 fired=true |\[async=true\] total ok=[0-9]+ err=[0-9]+ \|' /tmp/adaptive-race.log || true)
+          echo "celeris#657 placement: want $pwant, ran $pran, passed $ppassed, SKIP lines $pskipped, RESULT lines $presults, clean $pclean"
+          if [ "$pran" -ne "$pwant" ] || [ "$ppassed" -ne "$pwant" ] || [ "$pskipped" -ne 0 ] || [ "$presults" -ne "$pwant" ] || [ "$pclean" -ne "$presults" ]; then
+            echo "expected exactly $pwant top-level celeris#657 placement tests to run and PASS with no SKIP line,"
+            echo "and one RESULT line each: the eight PR-3 cells reporting err=0 w1=0 w2=0 (no client lost a"
+            echo "request, no recv outlived its hand-off, no hand-off was made with an op in flight) and"
+            echo "TestBidirectionalFlapAsync reporting its total. Was one renamed or removed, did one skip"
+            echo "(-short skips all nine), or did a cell stop reaching its own measurement?"
             exit 1
           fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
