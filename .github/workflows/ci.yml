@@ -256,6 +256,14 @@ jobs:
       # get a PASS-count interlock: -v, skipping forbidden, and a tally that
       # fails the step if a test is renamed, removed or skipped.
       #
+      # TestLingerArrivalsReachTheIncomingEngine is in the list because it is
+      # the one place the celeris#662 linger and the celeris#657 post-switch
+      # sweep are tested TOGETHER: during the linger the engine a switch is
+      # leaving keeps accepting, and every connection it takes then has to
+      # reach the incoming engine. Its two controls both lose -- the linger at
+      # 0 admits nothing, and the sweep and the park-boundary ask removed
+      # leaves 12 of 12 (epoll) and 6 of 12 (io_uring) behind.
+      #
       # The tally counts TOP-LEVEL results (`--- PASS: Name (`, and
       # `=== RUN   Name` with nothing after the name), and the step also
       # fails on ANY `--- SKIP` line at any indentation: a subtest that skips
@@ -272,7 +280,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          both='TestPauseAcceptServesDeferredIdleConnections|TestPauseAcceptServesArrivalsDuringLinger|TestPauseAcceptLingerAnchoredAtClear|TestResumeDuringLingerRestoresDeferAccept|TestShutdownDuringLingerIsPrompt|TestPauseAcceptNoLingerResetsDeferredIdleConnections|TestPauseAcceptNoClearLosesArrivals|TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestPauseAcceptIdleControl|TestListenSocketDeferAcceptFollowsConfig'
+          both='TestPauseAcceptServesDeferredIdleConnections|TestPauseAcceptServesArrivalsDuringLinger|TestPauseAcceptLingerAnchoredAtClear|TestResumeDuringLingerRestoresDeferAccept|TestShutdownDuringLingerIsPrompt|TestPauseAcceptNoLingerResetsDeferredIdleConnections|TestPauseAcceptNoClearLosesArrivals|TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestPauseAcceptIdleControl|TestListenSocketDeferAcceptFollowsConfig|TestLingerArrivalsReachTheIncomingEngine'
           iouringonly='TestAcceptRearmedDuringLinger|TestAcceptRearmRetriedAfterSQFull'
           names="${both}|${iouringonly}"
           want=$(( 2 * $(tr '|' '\n' <<<"$both" | wc -l) + $(tr '|' '\n' <<<"$iouringonly" | wc -l) ))
