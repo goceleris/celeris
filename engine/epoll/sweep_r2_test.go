@@ -20,6 +20,7 @@ package epoll
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -255,6 +256,7 @@ func TestSweepClassifiesUnderTheLockTheEngineRequires(t *testing.T) {
 		forcePass(l)
 		l.sweep()
 		passes++
+		runtime.Gosched() // never starve the upgrade goroutine this test races
 	}
 	close(stop)
 	wg.Wait()

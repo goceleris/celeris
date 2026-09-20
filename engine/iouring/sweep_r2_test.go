@@ -15,6 +15,7 @@ package iouring
 //	MINOR-e  a connection that had sent no byte was classed transient.
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -246,6 +247,7 @@ func TestSweepClassifiesUnderTheLockTheEngineRequires(t *testing.T) {
 		f.w.sweep()
 		takeSQEs(f.w.ring)
 		passes++
+		runtime.Gosched() // never starve the upgrade goroutine this test races
 	}
 	close(stop)
 	wg.Wait()

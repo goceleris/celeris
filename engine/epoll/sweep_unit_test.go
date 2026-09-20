@@ -7,6 +7,7 @@ package epoll
 // scheduling in the way.
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -264,7 +265,7 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 	// this is what proves xferAskMu actually covers the queue against the
 	// park-boundary appends.
 	const askers = 8
-	const rounds = 96
+	const rounds = 64
 	var wg sync.WaitGroup
 	var asks, overlaps atomic.Int64
 	var inLoopWork atomic.Bool
@@ -280,6 +281,9 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 					return
 				default:
 				}
+				// The CAS is the dedup: it succeeds again only after the
+				// loop has drained this conn's ask, which is what makes
+				// the wait below terminate.
 				if acs.xferAsked.CompareAndSwap(false, true) {
 					if inLoopWork.Load() {
 						overlaps.Add(1)
@@ -287,13 +291,33 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 					l.askTransplant(acs)
 					asks.Add(1)
 				}
+				runtime.Gosched()
 			}
 		}()
 	}
+	// The overlap is WAITED FOR, not hoped for: every round opens the window
+	// and does not close it until an ask has been queued inside it. Without
+	// this the loop below can finish all its rounds before the scheduler ever
+	// runs an asker, which is how the first version of this test managed to
+	// observe no concurrency at all and still pass (MINOR-c) — and it is what
+	// two of the round-2 CI arms caught when they ran it.
 	for i := 0; i < rounds; i++ {
 		rfd, rcs := movableConn(t, l)
+		l.drainTransplantAsks() // clears xferAsked, so the askers can ask again
 		inLoopWork.Store(true)
-		l.drainTransplantAsks()
+		target := overlaps.Load() + 1
+		deadline := time.Now().Add(20 * time.Second)
+		for overlaps.Load() < target {
+			if time.Now().After(deadline) {
+				inLoopWork.Store(false)
+				close(stop)
+				wg.Wait()
+				t.Fatalf("celeris657 ASKLIFE PREMISE: round %d waited 20s and not one of the %d asking "+
+					"goroutines queued an ask inside the loop's window (asks=%d overlaps=%d). The "+
+					"injection did not fire, so nothing raced anything", i, askers, asks.Load(), overlaps.Load())
+			}
+			runtime.Gosched()
+		}
 		if l.conns[rfd] == rcs {
 			l.detachFromEpoll(rfd, rcs)
 			l.dropAsk(rcs)
@@ -304,13 +328,9 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
-	if asks.Load() == 0 {
-		t.Fatal("celeris657 ASKLIFE PREMISE: no ask was ever queued")
-	}
-	if overlaps.Load() == 0 {
-		t.Fatal("celeris657 ASKLIFE PREMISE: not one ask was queued while the loop thread was inside its " +
-			"drain/drop/release window. The injection did not fire and the test observed no concurrency at " +
-			"all — which is exactly what the first version of this test did (MINOR-c)")
+	if got := overlaps.Load(); got < rounds {
+		t.Errorf("celeris657 ASKLIFE PREMISE: %d asks landed inside the loop's window over %d rounds, want "+
+			"at least one each", got, rounds)
 	}
 	l.drainTransplantAsks()
 	t.Logf("celeris657 ASKLIFE asks=%d overlaps=%d adopted=%d", asks.Load(), overlaps.Load(), tgt.count())
