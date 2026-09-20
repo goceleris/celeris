@@ -482,6 +482,23 @@ type Worker struct {
 	// this only has to outlive that.
 	shutdownDriverHold []*driverConn
 
+	// reapRetry holds the (fd, generation) identities whose hand-off reap
+	// missed, or found the SQ ring full, while their recv was still armed;
+	// retryReaps re-runs them once per loop iteration (celeris#657).
+	// reapRetrySpare is the second buffer of the swap. Worker thread only.
+	reapRetry      []uint64
+	reapRetrySpare []uint64
+	// asyncCancelFlags: probeAsyncCancelFlags found this kernel accepting
+	// IORING_ASYNC_CANCEL_* flags (5.19+); false when it rejected them, when
+	// it gave an answer the probe does not recognise, or when the probe got
+	// no answer. A reap is only placed when it is true;
+	// createWorkers copies the engine's answer. Read-only after init.
+	asyncCancelFlags bool
+	// dupFD duplicates the descriptor a hand-off moves: unix.Dup when nil.
+	// A test seam, so a test can make the dup fail the way a process out
+	// of descriptors does (EMFILE).
+	dupFD func(fd int) (int, error)
+
 	// transplant (#383 reverse) is non-nil while a drain-to-epoll is in progress.
 	// Set by Engine.StartTransplant (controller goroutine), read on this worker's
 	// own thread after each handleRecv; when set, an idle H1 conn at a clean
@@ -1186,6 +1203,11 @@ func (w *Worker) run(ctx context.Context) {
 						if w.transplant.Load() != nil {
 							w.tryTransplant(fd)
 						}
+						// No releaseHold here (celeris#657): a held conn has
+						// no recv armed, so the only recv completion that can
+						// find a hold is the one whose own response set it,
+						// with that SEND still in flight. The SEND completion
+						// below is where a hold is released.
 					}
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
@@ -1197,6 +1219,9 @@ func (w *Worker) run(ctx context.Context) {
 						if w.transplant.Load() != nil {
 							w.tryTransplant(fd)
 						}
+						// A held conn's SEND completion is where it either
+						// left (above) or gets its recv back (celeris#657).
+						w.releaseHold(fd)
 					}
 				case udAccept:
 					w.handleAccept(ctx, entry, fd, now)
@@ -1221,6 +1246,12 @@ func (w *Worker) run(ctx context.Context) {
 					// stale again (celeris#596).
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleRecvCancel(entry, fd)
+					}
+				case udTransplantReap:
+					// And for the hand-off's reap: its miss is the only
+					// event that says the recv is still armed (celeris#657).
+					if !w.staleConnCQE(entry, fd, ud) {
+						w.handleTransplantReap(entry, fd)
 					}
 				case udDriverRecv:
 					w.handleDriverRecv(entry, fd)
@@ -1426,6 +1457,20 @@ func (w *Worker) run(ctx context.Context) {
 		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
 			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
 			w.acceptPaused.Load() {
+			// Submit what this iteration queued before parking (celeris#657,
+			// A5). The iteration that closes or hands off the last conn
+			// queues its close-path cancels (the header timer's, a send's)
+			// in the same pass that finds the worker idle, and the park is
+			// indefinite: those SQEs used to sit unsubmitted until something
+			// woke the worker, measured 1-24 pending at parks. Outside
+			// wakeMu, which is a leaf. Not under SQPOLL, where the kernel's
+			// SQ thread submits; an SQ thread that has gone idle would need
+			// the NEED_WAKEUP kick the submit branch of this loop gives it,
+			// but no tier enables SQPOLL today (SQPollIdle is 0 in all
+			// three), so that case is not handled here.
+			if !w.sqpoll && w.ring.Pending() > 0 {
+				_, _ = w.ring.Submit()
+			}
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() ||
 				w.driverActionPending.Load() != 0 || w.detachQPending.Load() != 0 {
@@ -1566,11 +1611,24 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleRecv(c, fd, now)
+		// The same hand-off attempt as the inlined dispatch (celeris#657).
+		// The listener-close harvest processes completions here. As there,
+		// no hold can be released at a recv completion; the udSend case
+		// below releases it.
+		if w.transplant.Load() != nil {
+			w.tryTransplant(fd)
+		}
 	case udSend:
 		if w.staleConnCQE(c, fd, ud) {
 			return
 		}
 		w.handleSend(c, fd, now)
+		if w.transplant.Load() != nil {
+			w.tryTransplant(fd)
+		}
+		// A held conn whose SEND completion lands in the listener-close
+		// harvest would otherwise be neither handed off nor re-armed.
+		w.releaseHold(fd)
 	case udClose:
 		if w.staleConnCQE(c, fd, ud) {
 			return
@@ -1590,6 +1648,11 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleRecvCancel(c, fd)
+	case udTransplantReap:
+		if w.staleConnCQE(c, fd, ud) {
+			return
+		}
+		w.handleTransplantReap(c, fd)
 	case udDriverRecv:
 		w.handleDriverRecv(c, fd)
 	case udDriverSend:
@@ -2413,6 +2476,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		}
 		return
 	}
+	// A hand-off reap is outstanding (celeris#657): its -ECANCELED is the
+	// hand-off point and must never reach the generic negative-result
+	// branch below, which would close a healthy conn.
+	if cs.transplantReap > 0 && w.reapOutcome(c, fd, cs) {
+		return
+	}
 
 	if c.Res <= 0 {
 		if cqeHasBuffer(c.Flags) && w.bufRing != nil {
@@ -2485,6 +2554,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	}
 
 	cs.lastActivity = now
+	// Data: the conn is serving again, so a hand-off that failed at its dup
+	// may be tried (and its recv reaped) once more (celeris#657).
+	cs.reapSuppressed = false
 	// c.Res > 0 here (the c.Res <= 0 cases returned above): bytes received
 	// on this recv CQE, regardless of which buffer they landed in.
 	w.bytesReadBatch += uint64(c.Res)
@@ -2542,21 +2614,10 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 				return
 			}
 		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-		}
-		if w.flushSend(cs) {
-			w.markDirty(cs)
-		}
-		if mu := cs.detachMu; mu != nil {
-			mu.Unlock()
-		}
-		if !cqeHasMore(c.Flags) && !cs.recvLinked && !cs.recvPaused {
-			if !w.prepareRecv(cs, w.pickRecvTarget(cs)) {
-				cs.needsRecv = true
-				w.markDirty(cs)
-			}
-		}
+		// The direct-body tail: flushed unlinked (the next recv may target
+		// the body buffer again), then a standalone recv — or none, held for
+		// a hand-off (celeris#657).
+		w.respondAndArm(cs, fd, c, false, false)
 		return
 	}
 
@@ -2950,34 +3011,60 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// buffers. The linked SEND→RECV lets the kernel start RECV immediately
 	// after SEND completes, eliminating one loop iteration per request.
 	cs.recvLinked = false
+	w.respondAndArm(cs, fd, c, true, true)
+}
+
+// respondAndArm is the one tail every H1 request path in handleRecv takes
+// once the request has produced its response (celeris#657): flush the
+// response, then arm the connection's next recv, chained behind the SEND
+// (link, single-shot recv only; flushSendLink falls back to an unlinked send
+// itself when it must) or standalone. capCheck applies the back-pressure
+// close of the sync tail.
+//
+// With a drain set and a conn the hand-off would take, the response is
+// flushed UNLINKED and no recv is armed at all (HOLD): the conn is handed off
+// at that SEND's completion with nothing in the kernel, or releaseHold arms
+// the recv there if it is not. With no drain set it places exactly the SQEs
+// the two tails placed before they shared it
+// (TestNoDrainSQESequenceIsUnchanged).
+func (w *Worker) respondAndArm(cs *connState, fd int, c *completionEntry, link, capCheck bool) {
 	// Hoist the detachMu load: the same mu is checked Lock and Unlock on
-	// the success path, plus once on the early-return overflow path. One
-	// pointer load instead of three.
+	// the success path, plus once on the early-return overflow path.
 	mu := cs.detachMu
 	if mu != nil {
 		mu.Lock()
 	}
 	// Back-pressure: capture pending size inside the lock so concurrent
 	// goroutine writes via the guarded writeFn don't race the read.
-	pending := len(cs.writeBuf) + len(cs.sendBuf)
-	if pending > cs.sendCap() {
+	if capCheck && len(cs.writeBuf)+len(cs.sendBuf) > cs.sendCap() {
 		if mu != nil {
 			mu.Unlock()
 		}
 		w.closeConn(fd)
 		return
 	}
-	if w.bufRing == nil {
+	hold := w.bufRing == nil && w.transplant.Load() != nil && w.holdEligible(cs)
+	switch {
+	case hold:
+		cs.transplantHold = true
+		w.handoffLoss.noteHeld()
+		if w.flushSend(cs) {
+			w.markDirty(cs)
+		}
+	case link && w.bufRing == nil:
 		if w.flushSendLink(cs) {
 			w.markDirty(cs)
 		}
-	} else {
+	default:
 		if w.flushSend(cs) {
 			w.markDirty(cs)
 		}
 	}
 	if mu != nil {
 		mu.Unlock()
+	}
+	if hold {
+		return
 	}
 
 	// For multishot recv, CQE_F_MORE means the kernel will produce more CQEs
@@ -4011,6 +4098,8 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			// gone, so there is no goroutine-vs-release race. If a new request
 			// arrives first, the feed path clears transplantPending and respawns
 			// us, so no request is lost. SINGLE_ISSUER: we submit no SQE here.
+			// On a worker that cannot reap, no conn is eligible: the claim
+			// could only be refused, so we park instead (celeris#681 R1).
 			if w.transplant.Load() != nil && w.asyncTransplantEligible(cs) {
 				cs.transplantPending.Store(true)
 				cs.asyncRun = false
@@ -4434,6 +4523,11 @@ func (w *Worker) pickRecvTarget(cs *connState) []byte {
 }
 
 func (w *Worker) drainDetachQueue() {
+	// The other deferred hand-off work first: reaps that missed, or found
+	// the SQ ring full, while their recv was still armed (celeris#657).
+	if len(w.reapRetry) > 0 {
+		w.retryReaps()
+	}
 	if w.detachQPending.Load() == 0 {
 		return
 	}
@@ -5067,6 +5161,11 @@ func (w *Worker) checkTimeouts() {
 		// reading never completes the SEND at all (celeris#498). The remaining
 		// timeouts below are meaningless here: the handler is gone, so there is
 		// no read to time out and no new bytes can join the queue.
+		// A conn held for a hand-off that neither happened nor was released
+		// (celeris#657): arm its recv. Counted; must stay 0.
+		if cs.transplantHold && !cs.closing {
+			w.rescueHold(cs)
+		}
 		if cs.closing {
 			if now-cs.lastActivity > closingDrainTimeoutNanos {
 				// Everything closeConn does before deferring (detach

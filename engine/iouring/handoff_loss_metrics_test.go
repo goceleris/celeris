@@ -18,6 +18,14 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 	e.metrics.handoffLoss.staleRecvDataTransplanted.Store(5)
 	e.metrics.handoffLoss.staleRecvDataUnattributed.Store(7)
 	e.metrics.handoffLoss.handoffInFlight.Store(11)
+	e.metrics.handoffLoss.held.Store(13)
+	e.metrics.handoffLoss.reaps.Store(17)
+	e.metrics.handoffLoss.reapMisses.Store(19)
+	e.metrics.handoffLoss.holdRescued.Store(23)
+	e.metrics.handoffLoss.doubleClaim.Store(29)
+	e.metrics.handoffLoss.claimDeferred.Store(31)
+	e.metrics.handoffLoss.reapFailed.Store(37)
+	e.metrics.handoffLoss.reapUnsupported.Store(41)
 
 	m := e.Metrics()
 	for _, c := range []struct {
@@ -28,6 +36,14 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 		{"StaleRecvDataTransplanted", m.StaleRecvDataTransplanted, 5},
 		{"StaleRecvDataUnattributed", m.StaleRecvDataUnattributed, 7},
 		{"TransplantHandoffInFlight", m.TransplantHandoffInFlight, 11},
+		{"TransplantHeld", m.TransplantHeld, 13},
+		{"TransplantReaps", m.TransplantReaps, 17},
+		{"TransplantReapMisses", m.TransplantReapMisses, 19},
+		{"TransplantHoldRescued", m.TransplantHoldRescued, 23},
+		{"TransplantDoubleClaim", m.TransplantDoubleClaim, 29},
+		{"TransplantClaimDeferred", m.TransplantClaimDeferred, 31},
+		{"TransplantReapFailed", m.TransplantReapFailed, 37},
+		{"TransplantReapUnsupported", m.TransplantReapUnsupported, 41},
 	} {
 		if c.got != c.want {
 			t.Errorf("Metrics().%s = %d, want %d — the witness exists but cannot "+

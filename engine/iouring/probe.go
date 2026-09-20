@@ -19,7 +19,8 @@ import (
 // matrix can run thousands of cells in one process with -race), and
 // re-running every probe
 // (each opens a temp ring + a TCP listener + a dial) on every New() is
-// pure overhead.
+// pure overhead. The async-cancel-flags probe is cached only once the kernel
+// has answered it (probeAsyncCancelFlagsCached).
 var (
 	cachedSendZC          sync.Once
 	cachedSendZCResult    SendZCProbeResult
@@ -33,6 +34,13 @@ var (
 	cachedMultiAccept     sync.Once
 	cachedMultiAcceptOK   bool
 	cachedMultiAcceptReas string
+	// The async-cancel-flags probe's answer, once the kernel has given one:
+	// asyncCancelKnown says whether cachedAsyncCancelRes/Reas hold it. All
+	// three are guarded by asyncCancelMu.
+	asyncCancelMu         sync.Mutex
+	asyncCancelKnown      bool
+	cachedAsyncCancelRes  asyncCancelProbe
+	cachedAsyncCancelReas string
 )
 
 // probeSendZCCached returns the cached SendZC probe result, running the
@@ -67,6 +75,46 @@ func probeMultishotAcceptCached() (bool, string) {
 	})
 	return cachedMultiAcceptOK, cachedMultiAcceptReas
 }
+
+// probeAsyncCancelFlagsCached returns the async-cancel-flags probe's answer.
+// Only the kernel's answer, accepted or rejected, is cached for the process
+// (celeris#681 N1). A probe that got no answer says nothing lasting about the
+// kernel: its private ring can fail to set up with EMFILE or ENOMEM when the
+// adaptive engine builds its io_uring engine lazily under load, and its wait
+// can come back without the cancel's completion. Cached, one such failure kept
+// the hand-off's reap off for the life of the process. So a probe with no
+// answer is not cached, and neither is an answer the probe does not recognise:
+// the next New probes again, and logs again. Calls are serialised, so
+// concurrent News run one probe at a time and never overwrite an answer.
+func probeAsyncCancelFlagsCached() (asyncCancelProbe, string) {
+	asyncCancelMu.Lock()
+	defer asyncCancelMu.Unlock()
+	if asyncCancelKnown {
+		return cachedAsyncCancelRes, cachedAsyncCancelReas
+	}
+	res, reason := runAsyncCancelProbe()
+	if res == asyncCancelAccepted || res == asyncCancelRejected {
+		cachedAsyncCancelRes, cachedAsyncCancelReas, asyncCancelKnown = res, reason, true
+	}
+	return res, reason
+}
+
+// runAsyncCancelProbe is the probe probeAsyncCancelFlagsCached runs. A
+// variable so a test can give each class of answer to the cache and to New.
+//
+// SEAM CONSTRAINT (celeris#681 N-a), shared with asyncCancelProbeSubmit,
+// asyncCancelProbeWait and asyncCancelProbeTimeout: these four are READ
+// inside probeAsyncCancelFlagsCached's asyncCancelMu critical section and
+// WRITTEN by tests without it, so a test may only replace one while no
+// other goroutine can reach a probe — that is, from its own test goroutine,
+// never from a test that has called t.Parallel(), and never while an engine
+// it does not own is being built. Nothing in this package calls t.Parallel()
+// (git grep -n 't\.Parallel()' -- 'engine/iouring/*_test.go' is empty, while
+// the same grep finds engine/provider_test.go), so the constraint holds
+// today; it is documented rather than enforced because guarding the
+// seams would mean a mutex-taking setter and a save/restore helper for each
+// of the four, which is more machinery than a constraint one grep checks.
+var runAsyncCancelProbe = probeAsyncCancelFlags
 
 // SEND_ZC ioprio flags and notification result values.
 const (
@@ -448,4 +496,180 @@ func probeMultishotAccept() (bool, string) {
 		return false, "first multishot accept CQE missing CQE_F_MORE (kernel won't re-arm)"
 	}
 	return true, ""
+}
+
+// The async-cancel-flags probe's own user_data values: the op it tries to
+// cancel (nothing in its private ring carries it) and the cancel itself.
+const (
+	asyncCancelProbeTarget uint64 = 0xCA_4CE1_7A26_E7
+	asyncCancelProbeTag    uint64 = 0xCA_4CE1_7A6
+)
+
+// asyncCancelProbe is what probeAsyncCancelFlags learned. Only
+// asyncCancelAccepted turns the hand-off's reap on; the others keep it off,
+// and they are told apart because they mean different things (celeris#681
+// R2, N2): a rejection is the kernel's answer, a probe that got no answer
+// says nothing about the kernel, and an answer the probe does not recognise
+// is one no kernel measured gives.
+//
+// The zero value is asyncCancelNoAnswer (celeris#681 N3), so an answer that
+// was never set reads as no answer and keeps the reap off, never as
+// accepted.
+type asyncCancelProbe uint8
+
+const (
+	// asyncCancelNoAnswer: the probe failed before the kernel answered. Its
+	// ring could not be set up, the submit or the wait failed, no completion
+	// came, or the completion was not the probe's cancel. The zero value.
+	asyncCancelNoAnswer asyncCancelProbe = iota
+	// asyncCancelAccepted: the kernel completed the probe's cancel and
+	// accepted its IORING_ASYNC_CANCEL flags.
+	asyncCancelAccepted
+	// asyncCancelRejected: the kernel completed the probe's cancel without
+	// accepting the flags: -EINVAL, as every kernel before 5.19 answers.
+	asyncCancelRejected
+	// asyncCancelUnexpected: the kernel completed the probe's cancel with a
+	// result the probe does not recognise (neither an acceptance nor
+	// -EINVAL). No kernel measured answers so; it keeps the reap off and New
+	// warns with the errno (celeris#681 N2).
+	asyncCancelUnexpected
+)
+
+func (p asyncCancelProbe) String() string {
+	switch p {
+	case asyncCancelNoAnswer:
+		return "no answer"
+	case asyncCancelAccepted:
+		return "accepted"
+	case asyncCancelRejected:
+		return "rejected"
+	case asyncCancelUnexpected:
+		return "unexpected"
+	}
+	return fmt.Sprintf("asyncCancelProbe(%d)", uint8(p))
+}
+
+// newAsyncCancelProbeRing makes the probe's private ring. A variable so a
+// test can make the probe fail before the kernel answers.
+var newAsyncCancelProbeRing = func() (*Ring, error) { return NewRing(8, 0, 0) }
+
+// The probe's submit and its wait for the cancel's completion, and how long
+// that wait is. Variables so a test can hold the cancel back and cut the wait
+// short (celeris#681 N1). They carry runAsyncCancelProbe's SEAM CONSTRAINT:
+// read under asyncCancelMu, replaced by a test that holds no lock, so only
+// from a test goroutine that no other probe can run against (celeris#681
+// N-a).
+var (
+	asyncCancelProbeSubmit  = func(r *Ring) (int, error) { return r.Submit() }
+	asyncCancelProbeWait    = func(r *Ring, d time.Duration) error { return r.SubmitAndWaitTimeout(d) }
+	asyncCancelProbeTimeout = 500 * time.Millisecond
+)
+
+// probeAsyncCancelFlags tests whether the kernel accepts the
+// IORING_ASYNC_CANCEL_* flags, which exist from Linux 5.19. The io_uring→epoll
+// hand-off's REAP (celeris#657) cancels an armed recv with
+// IORING_ASYNC_CANCEL_ALL, keyed on the recv's user_data
+// (prepCancelUserDataReported). Through 5.18, io_async_cancel_prep rejects any
+// non-zero cancel_flags with -EINVAL, and no IORING_FEAT bit reports the
+// flags, so the kernel has to be asked. Version-based selection is no answer
+// either: the Base tier covers every 5.10-5.18 kernel, and a vendor kernel can
+// claim a version its feature surface does not match.
+//
+// The probe submits exactly the reap's SQE form against a user_data that
+// nothing carries and reads the cancel's own completion; see
+// classifyAsyncCancelProbe for how the result reads. The cancel runs inline
+// at submit on every kernel measured, so its completion is normally there
+// when Submit returns; a short wait covers any that is not. That wait is
+// retried once if it comes back early with nothing to read: SubmitAndWaitTimeout
+// returns nil both when its timeout expires and when a signal cuts the wait
+// short (EINTR), and only an early return can be the latter (celeris#681 N1).
+// A probe that fails before that completion is read reports
+// asyncCancelNoAnswer, never a rejection.
+func probeAsyncCancelFlags() (asyncCancelProbe, string) {
+	return probeAsyncCancel(cancelAll)
+}
+
+// probeAsyncCancel is probeAsyncCancelFlags with the cancel_flags word
+// given: the probe passes the reap's own (IORING_ASYNC_CANCEL_ALL), and a
+// test passes a bit no kernel defines, which every kernel rejects, to drive
+// the rejection through the same submit and completion path.
+func probeAsyncCancel(cancelFlags uint32) (asyncCancelProbe, string) {
+	ring, err := newAsyncCancelProbeRing()
+	if err != nil {
+		return asyncCancelNoAnswer, "NewRing failed: " + err.Error()
+	}
+	defer func() { _ = ring.Close() }()
+
+	sqe := ring.GetSQE()
+	if sqe == nil {
+		return asyncCancelNoAnswer, "GetSQE returned nil"
+	}
+	prepCancelUserDataReported(sqe, asyncCancelProbeTarget)
+	*(*uint32)(unsafe.Pointer(&(*[sqeSize]byte)(sqe)[28])) = cancelFlags
+	setSQEUserData(sqe, asyncCancelProbeTag)
+	if _, err := asyncCancelProbeSubmit(ring); err != nil {
+		return asyncCancelNoAnswer, "Submit failed: " + err.Error()
+	}
+	head, tail := ring.BeginCQ()
+	if head == tail {
+		timeout := asyncCancelProbeTimeout
+		deadline := time.Now().Add(timeout)
+		for waits := 1; ; waits++ {
+			if err := asyncCancelProbeWait(ring, time.Until(deadline)); err != nil {
+				return asyncCancelNoAnswer, "SubmitAndWaitTimeout failed: " + err.Error()
+			}
+			if head, tail = ring.BeginCQ(); head != tail {
+				break
+			}
+			// An early return with nothing to read is a wait a signal cut
+			// short: wait once more, for the rest of the time.
+			if waits == 2 || !time.Now().Before(deadline) {
+				return asyncCancelNoAnswer, fmt.Sprintf("no CQE produced for the cancel (waited %v, %d wait(s))", timeout, waits)
+			}
+		}
+	}
+	cqe := ring.cqeAt(head)
+	ud, res := cqe.UserData, cqe.Res
+	ring.EndCQ(head + 1)
+	if ud != asyncCancelProbeTag {
+		return asyncCancelNoAnswer, fmt.Sprintf("unexpected CQE user_data %#x (want the cancel's %#x)", ud, asyncCancelProbeTag)
+	}
+	return classifyAsyncCancelProbe(res)
+}
+
+// classifyAsyncCancelProbe reads the completion of the probe's cancel, a
+// cancel with IORING_ASYNC_CANCEL_ALL of a user_data nothing carries:
+//
+//   - res >= 0: the flags were accepted. With CANCEL_ALL, res is the number
+//     of ops cancelled, so the miss the probe makes is 0.
+//   - -ENOENT: accepted too. It is how a cancel without CANCEL_ALL reports a
+//     miss; no kernel measured answers the probe with it.
+//   - -EINVAL: rejected. Measured on 5.15.0-191: every cancel form celeris
+//     builds returns -EINVAL there and leaves its target running.
+//   - anything else: unexpected, an answer the probe does not understand
+//     (celeris#681 N2). It is neither the kernel's acceptance nor its
+//     rejection, so it is a class of its own: the reap stays off, and the
+//     reason names the errno, which New logs at Warn on every kernel.
+//
+// Split out of probeAsyncCancelFlags so every outcome can be checked against
+// a synthetic result.
+func classifyAsyncCancelProbe(res int32) (asyncCancelProbe, string) {
+	switch {
+	case res >= 0, res == -int32(unix.ENOENT):
+		return asyncCancelAccepted, ""
+	case res == -int32(unix.EINVAL):
+		return asyncCancelRejected, "IORING_ASYNC_CANCEL flags rejected: cqe.res=-22 (EINVAL); the kernel predates Linux 5.19"
+	default:
+		return asyncCancelUnexpected, fmt.Sprintf("the cancel completed with cqe.res=%d (%s), which the probe does not recognise",
+			res, errnoName(-res))
+	}
+}
+
+// errnoName names errno e for a log line: its symbol (EBADF), or its number
+// when the platform has no name for it.
+func errnoName(e int32) string {
+	if name := unix.ErrnoName(unix.Errno(e)); name != "" {
+		return name
+	}
+	return fmt.Sprintf("errno %d", e)
 }

@@ -195,6 +195,51 @@ type connState struct {
 	// Worker-thread only, like recvPaused.
 	recvCancelPending uint16
 
+	// transplantReap counts the hand-off's reported recv cancels (REAP,
+	// celeris#657) whose effect has not been observed yet: incremented when
+	// startReap submits one, decremented by the -ECANCELED of the recv one
+	// of them cancelled or by a cancel's own completion reporting that it
+	// matched nothing. A COUNT, for the reason recvCancelPending is one: a
+	// reap can be outstanding for a recv that has since completed while a
+	// newer reap targets the recv armed after it, and the older one's miss
+	// must not clear the state the newer one's -ECANCELED needs — as a bool
+	// it did, and that -ECANCELED fell through handleRecv's generic error
+	// branch and closed a healthy connection (celeris#484/#596).
+	//
+	// reapStale: every reap counted in transplantReap was aimed at a recv
+	// that has since completed, so the recv armed now has none aimed at it
+	// and may get its own.
+	//
+	// transplantHold: the conn's last response was flushed with NO recv
+	// behind it, because a drain was set and the hand-off at that SEND's
+	// completion was expected to take the conn (HOLD). releaseHold arms the
+	// recv there if the hand-off does not happen.
+	//
+	// reapSuppressed: the conn's last hand-off failed at handOff (the dup or
+	// its non-blocking switch, e.g. EMFILE), so no reap is placed for it
+	// until it next receives data. Without it, the recv re-armed after the
+	// failure was reaped again at once and the hand-off failed again: a
+	// RECV, a cancel and two completions per loop iteration for as long as
+	// the failure and the drain both lasted.
+	//
+	// Only the conn's next data (handleRecv) and its release clear it, not
+	// the end of the drain it was set in or the start of the next, so it
+	// can outlive that drain (celeris#681 R5). Across drains the effect is
+	// placement only, and narrow: a conn that has received nothing since
+	// its dup failed meets a hand-off attempt in a later drain only at a
+	// completion that is not data, for example a provided-buffer recv ended
+	// by -ENOBUFS and re-armed, and no reap is placed for it there; its next
+	// data clears the flag and the attempt after that data proceeds as
+	// usual. A promoted async conn never has it set at a park: the data
+	// that respawns its dispatch goroutine clears it first, so its hand-off
+	// is retried at that park.
+	//
+	// All four worker-thread only, like recvCancelPending.
+	transplantReap uint16
+	reapStale      bool
+	transplantHold bool
+	reapSuppressed bool
+
 	// Async handler dispatch (Worker.async=true, HTTP1 only):
 	// Incoming recv bytes are appended under asyncInMu by the worker.
 	// A single dispatch goroutine per conn drains asyncInBuf via a
@@ -440,6 +485,10 @@ func releaseConnState(cs *connState) {
 	cs.recvPaused = false
 	cs.recvPauseDesired.Store(false)
 	cs.recvCancelPending = 0
+	cs.transplantReap = 0
+	cs.reapStale = false
+	cs.transplantHold = false
+	cs.reapSuppressed = false
 	cs.headerTimerSpec = kernelTimespec{}
 	cs.headerTimerArmed = false
 	cs.forceRSTClose = false

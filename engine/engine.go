@@ -484,6 +484,77 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// io_uring-only; zero on other engines. On the adaptive engine it is
 	// the sum over both sub-engines.
 	TransplantHandoffInFlight uint64
+	// TransplantHeld, TransplantReaps and TransplantReapMisses count how the
+	// io_uring hand-off keeps its fd-lifetime rule (celeris#657): a
+	// connection leaves io_uring only when no read can still resolve its
+	// descriptor, which is what takes TransplantHandoffInFlight and
+	// StaleRecvDataTransplanted to 0.
+	//
+	//   - TransplantHeld: responses flushed with the connection's next recv
+	//     held back because a drain was set, so the hand-off at that send's
+	//     completion finds nothing in flight.
+	//   - TransplantReaps: reported cancels of an already-armed recv, submitted
+	//     so the connection can be handed off at that recv's cancellation.
+	//   - TransplantReapMisses: those cancels that matched nothing (the recv
+	//     had completed, or was not issued yet). A miss is retried and is
+	//     never followed by a hand-off.
+	//
+	// Rates, not invariants: all three are zero while no drain runs.
+	// io_uring-only and cumulative; zero on other engines. On the adaptive
+	// engine each is the sum over both sub-engines.
+	TransplantHeld       uint64
+	TransplantReaps      uint64
+	TransplantReapMisses uint64
+	// TransplantHoldRescued counts connections whose recv was held for a
+	// hand-off that did not happen and that no completion released: the
+	// timeout sweep found them with their response sent and no recv armed,
+	// and armed it. It is a belt under the release at every send
+	// completion, and must stay 0; a non-zero value is a connection that sat
+	// unable to read until the sweep came by (celeris#657). io_uring-only;
+	// on the adaptive engine the sum over both sub-engines.
+	TransplantHoldRescued uint64
+	// TransplantDoubleClaim counts io_uring hand-offs refused because the
+	// connection had already left its descriptor slot when its async
+	// dispatch goroutine's claim to hand it off was acted on. In async mode
+	// only another hand-off of the same connection vacates the slot that way
+	// (a close marks the queued claim first, and a hijack is refused), so
+	// each count is a connection that would otherwise have been handed off
+	// twice, the second time as whatever socket then held the descriptor
+	// number (celeris#657). Must stay 0: a release gate can require it.
+	// io_uring-only; on the adaptive engine the sum over both sub-engines.
+	TransplantDoubleClaim uint64
+	// TransplantClaimDeferred counts io_uring hand-off attempts on the
+	// worker's own path that found the connection's async dispatch
+	// goroutine had already claimed the hand-off, and left it to that claim.
+	// It is ordering, not a fault: it fires whenever a completion of the
+	// connection lands between the goroutine's park and the worker's drain
+	// of the claim. A rate. io_uring-only; on the adaptive engine the sum
+	// over both sub-engines.
+	TransplantClaimDeferred uint64
+	// TransplantReapFailed counts hand-off recv cancels (TransplantReaps)
+	// whose completion was neither a hit nor a miss, for example -EINVAL
+	// from a kernel that rejects the cancel flags the startup probe found
+	// accepted. Such a cancel is not retried and is never followed by a
+	// hand-off; the connection stays until its recv completes on its own.
+	// Must stay 0. io_uring-only; on the adaptive engine the sum over both
+	// sub-engines.
+	TransplantReapFailed uint64
+	// TransplantReapUnsupported counts hand-off recv cancels not placed
+	// because the io_uring engine's startup probe did not find the
+	// IORING_ASYNC_CANCEL flags they need accepted (Linux 5.19 added them; a
+	// probe that got no answer, or an answer it does not recognise, counts
+	// the same). It counts only connections the worker serves itself (every
+	// connection in sync mode, and in async mode those not promoted to a
+	// dispatch goroutine): such a connection stays on io_uring until its
+	// armed recv completes on its own, and is handed off after the response
+	// to the request that recv brings, which is held, where the worker has
+	// no provided-buffer ring (a kernel without the flags has none); with
+	// one it stays. A promoted async connection is never offered for the
+	// hand-off where the flags are missing: it stays on io_uring and is not
+	// counted. Placement only, never a lost request. A rate, 0 wherever the
+	// probe finds the flags. io_uring-only; on the adaptive engine the sum
+	// over both sub-engines.
+	TransplantReapUnsupported uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and
