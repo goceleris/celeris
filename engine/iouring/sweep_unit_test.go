@@ -129,3 +129,42 @@ func TestSweepSkipsAConnWithWorkAlreadyOwed(t *testing.T) {
 		t.Errorf("celeris657 OWED: TransplantReaps = %d, want the 1 from the first pass", n)
 	}
 }
+
+// TestSweepLeavesADetachedConnAlone is the celeris#667/#672 interaction. A
+// detached WebSocket or SSE connection is a promoted async connection whose
+// hand-off is refused for good, so the sweep must neither examine it nor
+// Broadcast its dispatch goroutine — a spurious wake into the chanReader's
+// own pause/resume machinery — and must count it as the permanent residue it
+// is, so a standby worker holding WS connections goes dormant instead of
+// sweeping for as long as the drain lasts.
+func TestSweepLeavesADetachedConnAlone(t *testing.T) {
+	f := newFDLFixture(t, true)
+	f.armFirstRecv()
+	f.serveOne()
+	f.cs.asyncPromoted.Store(true)
+	f.cs.asyncRun = true
+	if f.cs.h1State == nil {
+		t.Fatal("celeris657 WSRESIDUE PREMISE: the fixture conn has no H1 state")
+	}
+	f.cs.h1State.Detached.Store(true)
+	f.startDrain()
+
+	for i := 0; i < 4; i++ {
+		forceIOUPass(f.w)
+		f.w.sweep()
+	}
+	if sqes := takeSQEs(f.w.ring); len(sqes) != 0 {
+		t.Errorf("celeris657 WSRESIDUE: the sweep placed %v for a detached conn, want nothing", sqes)
+	}
+	if f.cs.sweepKick != nil {
+		t.Errorf("celeris657 WSRESIDUE: the sweep Broadcast a detached conn's dispatch goroutine; its hand-off " +
+			"can never be offered, and the wake lands in the WebSocket chanReader's pause/resume path")
+	}
+	if !f.w.sweepDormant {
+		t.Errorf("celeris657 WSRESIDUE: the sweep is still awake with only a detached conn left; it would " +
+			"re-examine it for as long as the drain lasted")
+	}
+	if got := f.tgt.adopted.Load(); got != 0 {
+		t.Errorf("celeris657 WSRESIDUE: %d detached conns were handed over, want 0", got)
+	}
+}

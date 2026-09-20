@@ -190,6 +190,13 @@ func (l *Loop) sweep() {
 			continue
 		}
 		examined++
+		// Permanent residue: a detached WebSocket or SSE conn, an H2 one.
+		// tryTransplant refuses each of them on a gate that cannot change
+		// while the conn lives, so examining it is work with no outcome.
+		if class := l.residualClass(cs); class != resBusy {
+			l.cycleRes[class]++
+			continue
+		}
 		l.tryTransplant(fd)
 		if l.conns[fd] != cs {
 			moved++

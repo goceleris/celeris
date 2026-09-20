@@ -166,6 +166,18 @@ func (w *Worker) sweep() {
 			w.cycleTransient++
 			continue
 		}
+		// Permanent residue: a detached WebSocket or SSE conn, an H2 one, a
+		// fixed-file one, one whose last hand-off failed at its dup. The
+		// gates below all refuse it, so examining it is work with no
+		// outcome — and for a detached conn the Broadcast further down
+		// would be a spurious wake into the WebSocket chanReader's own
+		// pause/resume machinery (celeris#667/#672), for a conn that can
+		// never be offered. Counted under its class, which is what lets
+		// the sweep go dormant with WS conns on the engine.
+		if class := w.residualClass(cs); class != resBusy {
+			w.cycleRes[class]++
+			continue
+		}
 		if w.async && cs.asyncPromoted.Load() {
 			// Owned by its dispatch goroutine. One Broadcast per drain
 			// wakes a goroutine that parked before the drain was set, so
