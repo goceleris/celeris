@@ -301,18 +301,26 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 	// runs an asker, which is how the first version of this test managed to
 	// observe no concurrency at all and still pass (MINOR-c) — and it is what
 	// two of the round-2 CI arms caught when they ran it.
+	//
+	// The wait DRAINS on every turn, which is both the loop's own work and
+	// what makes the wait terminate: the queue is deduplicated by a CAS on
+	// cs.xferAsked, which only a drain clears, so an asker that has already
+	// asked cannot ask again until the loop has drained it.
 	for i := 0; i < rounds; i++ {
 		rfd, rcs := movableConn(t, l)
-		l.drainTransplantAsks() // clears xferAsked, so the askers can ask again
 		inLoopWork.Store(true)
 		target := overlaps.Load() + 1
-		deadline := time.Now().Add(20 * time.Second)
-		for overlaps.Load() < target {
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			l.drainTransplantAsks()
+			if overlaps.Load() >= target {
+				break
+			}
 			if time.Now().After(deadline) {
 				inLoopWork.Store(false)
 				close(stop)
 				wg.Wait()
-				t.Fatalf("celeris657 ASKLIFE PREMISE: round %d waited 20s and not one of the %d asking "+
+				t.Fatalf("celeris657 ASKLIFE PREMISE: round %d waited 30s and not one of the %d asking "+
 					"goroutines queued an ask inside the loop's window (asks=%d overlaps=%d). The "+
 					"injection did not fire, so nothing raced anything", i, askers, asks.Load(), overlaps.Load())
 			}
