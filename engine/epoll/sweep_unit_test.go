@@ -336,3 +336,37 @@ func TestSweepCadenceBacksOffAndResets(t *testing.T) {
 			time.Duration(l.sweepIvl), time.Duration(sweepMinIvl))
 	}
 }
+
+// TestSweepDoesNotBlockOnADetachedConnsLock is the celeris#667/#672
+// interaction on the epoll side. tryTransplant takes cs.asyncInMu to read the
+// async gate, and a detached WebSocket or SSE conn's dispatch goroutine holds
+// that same lock while it takes delivery of a frame. A sweep that examined
+// such a conn would contend for it on every pass, for as long as the drain
+// lasted, on a conn the hand-off refuses anyway. The sweep reads the
+// permanent classes first and never reaches the lock.
+func TestSweepDoesNotBlockOnADetachedConnsLock(t *testing.T) {
+	l, _ := sweepLoop(t)
+	l.async = true
+	tgt := &countingTarget{}
+	defer tgt.closeAll()
+	_, cs := detachedConn(t, l)
+	cs.asyncRun = true
+	l.transplant.Store(&transplantState{target: tgt})
+
+	// The dispatch goroutine, mid-delivery, holding its own input lock.
+	cs.asyncInMu.Lock()
+	done := make(chan struct{})
+	go func() { l.sweep(); close(done) }()
+	select {
+	case <-done:
+		cs.asyncInMu.Unlock()
+	case <-time.After(2 * time.Second):
+		cs.asyncInMu.Unlock()
+		<-done
+		t.Fatal("celeris657 WSLOCK: the sweep blocked on a detached conn's asyncInMu. It examined a conn the " +
+			"hand-off refuses for as long as it lives, and contended with the WebSocket delivery path to do it")
+	}
+	if got := tgt.count(); got != 0 {
+		t.Errorf("celeris657 WSLOCK: %d detached conns were handed over, want 0", got)
+	}
+}
