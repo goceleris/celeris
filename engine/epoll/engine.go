@@ -63,6 +63,11 @@ type Engine struct {
 		transplantDrainStopped   atomic.Uint64
 		transplantStranded       atomic.Uint64
 		transplantAdoptRefused   atomic.Uint64
+		// The post-switch sweep's own witnesses (celeris#657 P7): how
+		// many passes it has run, and the live residue by refusal class,
+		// which every loop publishes as a delta so the sum is what the
+		// engine still holds against a drain.
+		sweep sweepCounters
 	}
 	// asyncRoutes is the static AsyncRoutes count snapshotted at
 	// construction from the handler's AsyncRouteCount (#300 G3).
@@ -135,6 +140,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.transplantDrainStopped = &e.metrics.transplantDrainStopped
 		l.transplantStranded = &e.metrics.transplantStranded
 		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
+		l.sweepCnt = &e.metrics.sweep
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -236,6 +242,12 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantDrainStopped:      e.metrics.transplantDrainStopped.Load(),
 		TransplantStranded:          e.metrics.transplantStranded.Load(),
 		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
+
+		TransplantSweepPasses:      e.metrics.sweep.passes.Load(),
+		TransplantResidualDetached: e.metrics.sweep.residual[resDetached].Load(),
+		TransplantResidualH2:       e.metrics.sweep.residual[resH2].Load(),
+		TransplantResidualPinned:   e.metrics.sweep.residual[resPinned].Load(),
+		TransplantResidualBusy:     e.metrics.sweep.residual[resBusy].Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).
