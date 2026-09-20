@@ -219,20 +219,24 @@ func (l *Loop) sweep() {
 		l.sweepCursor = -1
 		l.resetCycle()
 	}
+	if l.sweepDormant {
+		// Reachable with a stale residue published only if a connection
+		// could leave without sweepNoteDeparture: it cannot. removeLiveConn
+		// is the one way out of liveConns and it lifts dormancy, so the
+		// retraction below is always reached; shutdown, which truncates
+		// liveConns wholesale, calls sweepRetract itself (celeris#657 R2,
+		// MINOR-d). Keeping the dormant return AHEAD of the retraction is
+		// therefore safe, and it is what keeps a dormant sweep free.
+		return
+	}
 	if len(l.liveConns) == 0 {
 		// Nothing left to hold: retract the residue this loop published,
 		// so the gauge reads what the engine HOLDS and not what its last
-		// non-empty cycle saw. BEFORE the dormancy check, not after it: a
-		// dormant sweep whose connections have all closed is precisely the
-		// case that used to leave the gauge standing (celeris#657 R2,
-		// MINOR-d).
+		// non-empty cycle saw.
 		if l.sweepPub != ([numResidual]uint64{}) {
 			l.resetCycle()
 			l.publishResidual()
 		}
-		return
-	}
-	if l.sweepDormant {
 		return
 	}
 	now := time.Now().UnixNano()

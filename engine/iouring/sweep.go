@@ -142,16 +142,19 @@ func (w *Worker) sweep() {
 		w.sweepCursor = -1
 		w.resetCycle()
 	}
+	if w.sweepDormant {
+		// Safe ahead of the retraction below for the reason the epoll half
+		// states: removeLiveConn is the one way out of liveConns and it
+		// lifts dormancy, and shutdown calls sweepRetract itself
+		// (celeris#657 R2, MINOR-d).
+		return
+	}
 	if len(w.liveConns) == 0 {
 		// Nothing left to hold: retract the residue this worker published.
-		// BEFORE the dormancy check, not after it (celeris#657 R2).
 		if w.sweepPub != ([numResidual]uint64{}) {
 			w.resetCycle()
 			w.publishResidual()
 		}
-		return
-	}
-	if w.sweepDormant {
 		return
 	}
 	now := time.Now().UnixNano()
