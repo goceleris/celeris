@@ -400,11 +400,24 @@ jobs:
       #     938,818 requests. Nothing is dropped; the transplant does not
       #     finish. That is celeris#657.
       #   * sync phases 3 and 5: connections stranded on the down-switch.
-      # Neither remaining failure is accept-time loss, so both names go back
+      # Neither remaining failure is accept-time loss, so both names went back
       # on -skip under celeris#657 and the PASS tally that demanded two PASS
-      # lines goes with them. Un-skipping them would leave this job
+      # lines went with them. Un-skipping them would have left this job
       # permanently red, which is worse than the quarantine: a job that can
       # never be green stops being read.
+      #
+      # WHAT THE REBASE ONTO celeris#657's FIX MEASURES. Both halves of
+      # celeris#657 are now on main (#681, #687), and on this branch rebased
+      # onto them the two Ramp tests PASS locally: 3 containers, golang:1.27,
+      # --cpus 4, memlock 128 MiB (4 io_uring workers), -race, one package
+      # per container. Every high phase reads epoll=0 of 2048 and settles in
+      # 2.50-2.55 s, where the pre-rebase branch left 972-1170 on the
+      # outgoing epoll after 20 s; err=0 over 6.76M requests and the error
+      # census is empty, so the accept-time loss and the reset class are both
+      # gone. The entry STAYS anyway: the lift rule this repository uses is
+      # >= 6 GitHub-hosted re-runs of identical bytes, and a 2048-connection
+      # ramp on a shared runner is the shape celeris#686's dial-time resets
+      # were seen in. Lift it from a green PR run, not from this comment.
       #
       # celeris#657 face 2 has its multi-ring gate here: TestFlapConnsPerRing
       # (T4) fixes both engines at two workers, so its 256 keep-alive
