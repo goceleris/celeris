@@ -310,14 +310,14 @@ type Worker struct {
 	cycleRes       [numResidual]uint64
 	sweepPub       [numResidual]uint64
 	handler        stream.Handler
-	resolved     resource.ResolvedResources
-	sockOpts     sockopts.Options
-	runCtx       context.Context //nolint:containedctx // stored so #383 transplant attach (off the accept path) can derive a conn ctx
-	bufRing      *BufferRing     // ring-mapped provided buffers for multishot recv
-	logger       *slog.Logger
-	cfg          resource.Config
-	ready        chan error
-	acceptPaused *atomic.Bool
+	resolved       resource.ResolvedResources
+	sockOpts       sockopts.Options
+	runCtx         context.Context //nolint:containedctx // stored so #383 transplant attach (off the accept path) can derive a conn ctx
+	bufRing        *BufferRing     // ring-mapped provided buffers for multishot recv
+	logger         *slog.Logger
+	cfg            resource.Config
+	ready          chan error
+	acceptPaused   *atomic.Bool
 	// acceptRearmPending is set when prepareAccept could not place the
 	// accept SQE because the SQ ring was full. In multishot mode the
 	// listen socket has exactly one accept SQE in flight, re-armed only
