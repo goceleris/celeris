@@ -299,12 +299,17 @@ type Worker struct {
 	// The post-switch sweep (celeris#657 P9, sweep.go). Worker-thread-only
 	// but sweepCnt, which points at the engine-wide gauges every worker
 	// publishes into.
+	// sweepArrived records that a connection JOINED the live set during the
+	// cycle in progress, which is appended past the cursor and so cannot be
+	// reached by it: such a cycle may not go dormant (THE CYCLE RULE in
+	// engine/epoll/sweep.go, celeris#657 R2).
 	sweepH         *transplantTargetHolder
 	sweepCnt       *sweepCounters
 	sweepNext      int64
 	sweepIvl       int64
 	sweepCursor    int
 	sweepDormant   bool
+	sweepArrived   bool
 	cycleMoved     int
 	cycleTransient int
 	cycleRes       [numResidual]uint64
@@ -5099,6 +5104,9 @@ func (w *Worker) removeLiveConn(cs *connState) {
 	w.liveConns[n] = 0
 	w.liveConns = w.liveConns[:n]
 	cs.liveIdx = -1
+	// The residue this worker last published counted this conn; it no longer
+	// holds it (celeris#657 R2).
+	w.sweepNoteDeparture()
 }
 
 // h1DeadlineSnapshot is the set of cs.h1State fields the two worker-thread
@@ -5391,6 +5399,10 @@ func (w *Worker) shutdown() {
 		// The conns remain reachable via w.conns until the Worker itself
 		// is collected, well after the ring teardown cancels its ops.
 	}
+	// celeris#657 R2: this worker is gone, so it must not leave its last
+	// cycle's residue standing in the engine-wide gauges. Nothing else
+	// retracts it — the sweep does not run after shutdown.
+	w.sweepRetract()
 	if w.listenFD >= 0 {
 		_ = unix.Close(w.listenFD)
 	}

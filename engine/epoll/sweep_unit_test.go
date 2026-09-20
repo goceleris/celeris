@@ -223,7 +223,17 @@ func TestSweepBudgetCoversEveryConnAcrossPasses(t *testing.T) {
 // TestAskNeverOutlivesConnState is the P8 lifetime rule. connStates go back to
 // a package-global sync.Pool, so an ask still naming one after its release
 // would make the loop read a cs another connection owns (the celeris#654
-// class). Under -race, with a close running concurrently with the ask.
+// class).
+//
+// celeris#657 R2, MINOR-c: this test's first version did not do what its own
+// doc said. It called wg.Wait() BEFORE the release, so the asking goroutine
+// had always exited and the two never overlapped — the ask and the release
+// ran strictly in sequence, once each, and -race had nothing to observe. The
+// version below keeps the asking goroutines RUNNING across the loop's drain,
+// drop and release of OTHER connections, which is the shape production has
+// (one dispatch goroutine per connection, all parking independently while the
+// loop tears others down), and it asserts that the overlap actually happened
+// rather than assuming it.
 func TestAskNeverOutlivesConnState(t *testing.T) {
 	l, _ := sweepLoop(t)
 	tgt := &countingTarget{}
@@ -240,37 +250,49 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 	if cs.xferAsked.Load() {
 		t.Errorf("celeris657 ASKLIFE: xferAsked survived the release")
 	}
-	l.xferAskMu.Lock()
-	for i, q := range l.xferAskQ {
-		if q == cs {
-			t.Errorf("celeris657 ASKLIFE: the ask queue still names a released connState at index %d — the "+
-				"loop would read a cs the pool can hand to another conn (celeris#654)", i)
-		}
+	if l.asksName(cs) {
+		t.Errorf("celeris657 ASKLIFE: a queue the loop can still read names a released connState — the loop " +
+			"would read a cs the pool can hand to another conn (celeris#654)")
 	}
-	l.xferAskMu.Unlock()
 	l.drainTransplantAsks() // must not touch the released cs
 	_ = unix.Close(fd)
 
-	// Then the race: dispatch goroutines asking while the loop drains and
-	// releases. Every release goes through dropAsk first, as the loop's own
-	// paths do.
-	const rounds = 64
+	// Then the race, genuinely concurrent: a pool of dispatch goroutines
+	// asking for their OWN connections, in a loop, for the whole time the
+	// loop thread drains its queue and releases connections. Every release
+	// goes through dropAsk first, as the loop's own paths do. Under -race,
+	// this is what proves xferAskMu actually covers the queue against the
+	// park-boundary appends.
+	const askers = 8
+	const rounds = 96
 	var wg sync.WaitGroup
-	var asks atomic.Int64
-	for i := 0; i < rounds; i++ {
-		rfd, rcs := movableConn(t, l)
-		start := make(chan struct{})
+	var asks, overlaps atomic.Int64
+	var inLoopWork atomic.Bool
+	stop := make(chan struct{})
+	for i := 0; i < askers; i++ {
+		_, acs := movableConn(t, l)
 		wg.Add(1)
-		go func() { // the dispatch goroutine's side of the ask
+		go func() { // a dispatch goroutine, parking over and over
 			defer wg.Done()
-			<-start
-			if rcs.xferAsked.CompareAndSwap(false, true) {
-				l.askTransplant(rcs)
-				asks.Add(1)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if acs.xferAsked.CompareAndSwap(false, true) {
+					if inLoopWork.Load() {
+						overlaps.Add(1)
+					}
+					l.askTransplant(acs)
+					asks.Add(1)
+				}
 			}
 		}()
-		close(start)
-		wg.Wait() // the goroutine has exited: a connState is released only then
+	}
+	for i := 0; i < rounds; i++ {
+		rfd, rcs := movableConn(t, l)
+		inLoopWork.Store(true)
 		l.drainTransplantAsks()
 		if l.conns[rfd] == rcs {
 			l.detachFromEpoll(rfd, rcs)
@@ -278,12 +300,38 @@ func TestAskNeverOutlivesConnState(t *testing.T) {
 			releaseConnState(rcs)
 			_ = unix.Close(rfd)
 		}
+		inLoopWork.Store(false)
 	}
+	close(stop)
+	wg.Wait()
 	if asks.Load() == 0 {
 		t.Fatal("celeris657 ASKLIFE PREMISE: no ask was ever queued")
 	}
+	if overlaps.Load() == 0 {
+		t.Fatal("celeris657 ASKLIFE PREMISE: not one ask was queued while the loop thread was inside its " +
+			"drain/drop/release window. The injection did not fire and the test observed no concurrency at " +
+			"all — which is exactly what the first version of this test did (MINOR-c)")
+	}
 	l.drainTransplantAsks()
-	t.Logf("celeris657 ASKLIFE asks=%d adopted=%d", asks.Load(), tgt.count())
+	t.Logf("celeris657 ASKLIFE asks=%d overlaps=%d adopted=%d", asks.Load(), overlaps.Load(), tgt.count())
+}
+
+// asksName reports whether any queue the loop can still read names cs. Loop
+// thread, test only.
+func (l *Loop) asksName(cs *connState) bool {
+	l.xferAskMu.Lock()
+	defer l.xferAskMu.Unlock()
+	for _, q := range l.xferAskQ {
+		if q == cs {
+			return true
+		}
+	}
+	for _, q := range l.xferAskDrain {
+		if q == cs {
+			return true
+		}
+	}
+	return false
 }
 
 // TestSweepCadenceBacksOffAndResets pins the cost control the price harness
@@ -293,14 +341,15 @@ func TestSweepCadenceBacksOffAndResets(t *testing.T) {
 	l, _ := sweepLoop(t)
 	tgt := &countingTarget{}
 	defer tgt.closeAll()
-	// One conn that never moves and is TRANSIENT residue (not detected yet,
-	// so the protocol gates refuse it but it could change on its own), so
-	// the sweep keeps running and backs off instead of going dormant.
-	fd := socketpairFD(t, l)
-	cs := regLive(l, fd)
-	l.connCount++
-	l.activeConns.Add(1)
-	_ = cs
+	// One conn that never moves and is TRANSIENT residue: a detected HTTP/1
+	// keep-alive with an unflushed response, so flushedAtBoundary refuses it
+	// and the refusal can clear with no event of the conn's own. (Before
+	// celeris#657 R2 this fixture was an accepted-but-silent conn; that is
+	// now the PERMANENT resUnstarted class and would go dormant — MINOR-e.)
+	fd, cs := movableConn(t, l)
+	cs.writeBuf = append(cs.writeBuf, 'x')
+	cs.pendingBytes = 1
+	_ = fd
 	l.transplant.Store(&transplantState{target: tgt})
 
 	l.sweep()

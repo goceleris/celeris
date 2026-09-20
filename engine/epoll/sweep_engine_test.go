@@ -159,10 +159,11 @@ func sweepMovesIdle(t *testing.T, async bool) {
 	got := tgt.count()
 	m := e.Metrics()
 	t.Logf("celeris657 SWEEPIDLE async=%v adopted=%d of %d first_ms=%d within_ms=%d detached=%d passes=%d "+
-		"residual=[det=%d h2=%d pin=%d busy=%d]", async, got, conns, firstMs, bound.Milliseconds(),
+		"residual=[det=%d h2=%d pin=%d uns=%d busy=%d]", async, got, conns, firstMs, bound.Milliseconds(),
 		m.TransplantDetached, metricSoft(e, "TransplantSweepPasses"),
 		metricSoft(e, "TransplantResidualDetached"), metricSoft(e, "TransplantResidualH2"),
-		metricSoft(e, "TransplantResidualPinned"), metricSoft(e, "TransplantResidualBusy"))
+		metricSoft(e, "TransplantResidualPinned"), metricSoft(e, "TransplantResidualUnstarted"),
+		metricSoft(e, "TransplantResidualBusy"))
 
 	if got < conns {
 		t.Errorf("celeris657 SWEEPIDLE: %d of %d idle conns were handed over within %d ms, with no client "+

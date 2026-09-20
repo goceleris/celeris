@@ -243,11 +243,12 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantStranded:          e.metrics.transplantStranded.Load(),
 		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
 
-		TransplantSweepPasses:      e.metrics.sweep.passes.Load(),
-		TransplantResidualDetached: e.metrics.sweep.residual[resDetached].Load(),
-		TransplantResidualH2:       e.metrics.sweep.residual[resH2].Load(),
-		TransplantResidualPinned:   e.metrics.sweep.residual[resPinned].Load(),
-		TransplantResidualBusy:     e.metrics.sweep.residual[resBusy].Load(),
+		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
+		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),
+		TransplantResidualH2:        e.metrics.sweep.residual[resH2].Load(),
+		TransplantResidualPinned:    e.metrics.sweep.residual[resPinned].Load(),
+		TransplantResidualUnstarted: e.metrics.sweep.residual[resUnstarted].Load(),
+		TransplantResidualBusy:      e.metrics.sweep.residual[resBusy].Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).

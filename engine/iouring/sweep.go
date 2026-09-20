@@ -10,9 +10,9 @@ import (
 )
 
 // The post-switch sweep, io_uring half (celeris#657 P9). The epoll half's
-// docstring (engine/epoll/sweep.go) states the problem and the shape; this
-// file is the same mechanism on the worker thread, with three differences
-// this engine forces.
+// docstring (engine/epoll/sweep.go) states the problem, the shape, THE CYCLE
+// RULE and the boundedness argument; this file is the same mechanism on the
+// worker thread, with three differences this engine forces.
 //
 //  1. The hand-off is not free here. A connection sitting idle has its next
 //     recv armed, and handing it over then is the fd-lifetime bug of PR-2. So
@@ -45,6 +45,7 @@ const (
 	resDetached = iota
 	resH2
 	resPinned
+	resUnstarted
 	resBusy
 	numResidual
 )
@@ -78,13 +79,41 @@ func (w *Worker) sweepWait() (time.Duration, bool) {
 	return d, true
 }
 
-// wakeSweep lifts dormancy and makes the next pass due, when a connection
-// joins this worker's live set. Worker thread.
+// wakeSweep records that a connection JOINED this worker's live set, and
+// makes the sweep act on it. Worker thread, from addLiveConn.
+//
+// sweepArrived is set unconditionally, not only when the sweep is dormant:
+// liveConns is appended at the TAIL and a pass walks BACKWARDS from
+// sweepCursor, so a connection that joins mid-cycle lands past the cursor and
+// the cycle in progress cannot reach it. A cycle with the flag set may not
+// conclude that everything left is permanent (THE CYCLE RULE, celeris#657 R2).
 func (w *Worker) wakeSweep() {
+	w.sweepArrived = true
 	if w.sweepDormant {
 		w.sweepDormant = false
 		w.sweepNext = 0
 	}
+}
+
+// sweepNoteDeparture records that a connection LEFT this worker's live set.
+// Worker thread, from removeLiveConn. It adds no work, so it does not set
+// sweepArrived; it lifts dormancy so the next cycle re-counts the residue,
+// which the gauges are supposed to be a statement about (celeris#657 R2).
+func (w *Worker) sweepNoteDeparture() {
+	if w.sweepDormant {
+		w.sweepDormant = false
+		w.sweepNext = 0
+	}
+}
+
+// sweepRetract drops everything this worker has published into the
+// engine-wide gauges. Worker thread, at shutdown (celeris#657 R2).
+func (w *Worker) sweepRetract() {
+	if w.sweepPub == ([numResidual]uint64{}) {
+		return
+	}
+	w.resetCycle()
+	w.publishResidual()
 }
 
 // sweep runs one budgeted pass. Worker thread only, after drainDetachQueue —
@@ -113,15 +142,16 @@ func (w *Worker) sweep() {
 		w.sweepCursor = -1
 		w.resetCycle()
 	}
-	if w.sweepDormant {
-		return
-	}
 	if len(w.liveConns) == 0 {
 		// Nothing left to hold: retract the residue this worker published.
+		// BEFORE the dormancy check, not after it (celeris#657 R2).
 		if w.sweepPub != ([numResidual]uint64{}) {
 			w.resetCycle()
 			w.publishResidual()
 		}
+		return
+	}
+	if w.sweepDormant {
 		return
 	}
 	now := time.Now().UnixNano()
@@ -167,15 +197,26 @@ func (w *Worker) sweep() {
 			continue
 		}
 		// Permanent residue: a detached WebSocket or SSE conn, an H2 one, a
-		// fixed-file one, one whose last hand-off failed at its dup. The
-		// gates below all refuse it, so examining it is work with no
-		// outcome — and for a detached conn the Broadcast further down
-		// would be a spurious wake into the WebSocket chanReader's own
-		// pause/resume machinery (celeris#667/#672), for a conn that can
-		// never be offered. Counted under its class, which is what lets
-		// the sweep go dormant with WS conns on the engine.
-		if class := w.residualClass(cs); class != resBusy {
+		// fixed-file one, one whose last hand-off failed at its dup, one
+		// that has never sent a byte. The gates below all refuse it, so
+		// examining it is work with no outcome — and for a detached conn
+		// the Broadcast further down would be a spurious wake into the
+		// WebSocket chanReader's own pause/resume machinery
+		// (celeris#667/#672), for a conn that can never be offered. Counted
+		// under its class, which is what lets the sweep go dormant with WS
+		// conns on the engine.
+		//
+		// read=false (the conn's detachMu is held, so nothing was read)
+		// skips tryTransplant as well, and loses nothing: an async conn
+		// whose goroutine holds detachMu is inside ProcessH1 and the
+		// parked gate refuses it, and one whose guarded writeFn holds it
+		// is detached and the Detached gate does.
+		class, read := w.residualClass(cs)
+		if class != resBusy || !read {
 			w.cycleRes[class]++
+			if !residualPermanent(class) {
+				w.cycleTransient++
+			}
 			continue
 		}
 		if w.async && cs.asyncPromoted.Load() {
@@ -216,20 +257,24 @@ func (w *Worker) sweep() {
 			moved++
 			continue
 		}
-		class := w.residualClass(cs)
-		w.cycleRes[class]++
-		if !residualPermanent(class) {
+		cls, _ := w.residualClass(cs)
+		w.cycleRes[cls]++
+		if !residualPermanent(cls) {
 			w.cycleTransient++
 		}
 	}
 	w.cycleMoved += moved + kicks
 
 	if i < 0 {
-		if w.cycleMoved == 0 && w.cycleTransient == 0 {
+		// The cycle is complete. Dormancy needs the whole cycle to have
+		// found nothing movable AND the live set to have held still under
+		// it: a connection appended past the cursor was never examined and
+		// never counted (THE CYCLE RULE, celeris#657 R2).
+		if w.cycleMoved == 0 && w.cycleTransient == 0 && !w.sweepArrived {
 			w.sweepDormant = true
 		}
 		w.publishResidual()
-		w.resetCycle()
+		w.resetCycle() // clears sweepArrived: the next cycle is its own witness
 		w.sweepCursor = -1
 	} else {
 		w.sweepCursor = i
@@ -246,10 +291,14 @@ func (w *Worker) sweep() {
 	w.sweepNext = now + w.sweepIvl
 }
 
+// resetCycle clears the per-cycle accounting, sweepArrived included: it is a
+// per-cycle witness and clearing it here starts the next cycle's. Worker
+// thread.
 func (w *Worker) resetCycle() {
 	w.cycleMoved = 0
 	w.cycleTransient = 0
 	w.cycleRes = [numResidual]uint64{}
+	w.sweepArrived = false
 }
 
 // publishResidual moves this worker's per-class residue into the engine-wide
@@ -269,10 +318,41 @@ func (w *Worker) publishResidual() {
 
 // residualClass names why the hand-off refused cs, reading the gates
 // tryTransplant has just left it behind. Worker thread.
-func (w *Worker) residualClass(cs *connState) int {
+//
+// read=false means NOTHING was read and resBusy is a default, not a finding.
+//
+// # LOCKING (celeris#256 / #548 / #593, R2 MAJOR-2)
+//
+// cs.h1State and cs.h2State are written by the dispatch goroutine's
+// switchToH2Local (worker.go), which holds cs.detachMu across both. Reading
+// them from the worker thread without that lock is the TOCTOU this file's own
+// docstrings forbid three times, and the race detector flags it. They are
+// read here under cs.detachMu, with TryLock and not Lock, for the reason
+// snapshotH1Deadlines gives: runAsyncHandler holds cs.detachMu across the
+// whole of ProcessH1, so a blocking Lock would park the LockOSThread'd worker
+// — and every connection it owns — behind one slow async handler
+// (celeris#593). A connection whose lock is held is in a handler: the
+// transient class, reported without reading anything. cs.protocol is an
+// atomic here and cs.fixedFile, cs.reapSuppressed and cs.recvArmed are the
+// worker's own.
+func (w *Worker) residualClass(cs *connState) (class int, read bool) {
 	if cs.fixedFile {
-		return resPinned
+		return resPinned, true
 	}
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			return resBusy, false
+		}
+		class = w.classifyLocked(cs)
+		mu.Unlock()
+		return class, true
+	}
+	return w.classifyLocked(cs), true
+}
+
+// classifyLocked is residualClass's body, with its precondition met: either cs
+// has no dispatch goroutine, or the caller holds cs.detachMu. Worker thread.
+func (w *Worker) classifyLocked(cs *connState) int {
 	if cs.h1State != nil && cs.h1State.Detached.Load() {
 		return resDetached
 	}
@@ -284,6 +364,14 @@ func (w *Worker) residualClass(cs *connState) int {
 		// A hand-off of this connection failed at its dup and no reap is
 		// placed for it until it next receives data.
 		return resPinned
+	}
+	if !cs.detected || cs.h1State == nil {
+		// tryTransplant's FIRST gate (transplant_source.go). An accepted
+		// connection that has sent no byte has no detected protocol and no
+		// H1 state, and neither appears until it speaks — an event of its
+		// own, at which the event path examines it (celeris#657 R2,
+		// MINOR-e).
+		return resUnstarted
 	}
 	return resBusy
 }

@@ -111,10 +111,11 @@ func TestWorkerAskWakesTheRing(t *testing.T) {
 	adopted := tgt.adopted.Load()
 	m := e.Metrics()
 	t.Logf("celeris657 ASKWAKE adopted=%d of %d first_ms=%d within_ms=%d passes=%d reaps=%d "+
-		"residual=[det=%d h2=%d pin=%d busy=%d] w1=%d w2=%d",
+		"residual=[det=%d h2=%d pin=%d uns=%d busy=%d] w1=%d w2=%d",
 		adopted, conns, firstMs, bound.Milliseconds(), metricSoft(e, "TransplantSweepPasses"), m.TransplantReaps,
 		metricSoft(e, "TransplantResidualDetached"), metricSoft(e, "TransplantResidualH2"),
-		metricSoft(e, "TransplantResidualPinned"), metricSoft(e, "TransplantResidualBusy"),
+		metricSoft(e, "TransplantResidualPinned"), metricSoft(e, "TransplantResidualUnstarted"),
+		metricSoft(e, "TransplantResidualBusy"),
 		m.StaleRecvDataTransplanted+m.StaleRecvDataUnattributed, m.TransplantHandoffInFlight)
 
 	if adopted < conns {

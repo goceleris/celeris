@@ -171,12 +171,17 @@ type Loop struct {
 	// to; sweepCursor resumes a budgeted cycle where the last pass stopped;
 	// the cycle* fields accumulate one cycle's verdict, and sweepPub is what
 	// this loop last published, so the gauge delta is exact.
+	// sweepArrived records that a connection JOINED the live set during the
+	// cycle in progress; such a connection is appended past the cursor and
+	// cannot be reached by this cycle, so a cycle with it set may not go
+	// dormant (THE CYCLE RULE in sweep.go, celeris#657 R2).
 	sweepTS        *transplantState
 	sweepCnt       *sweepCounters
 	sweepNext      int64
 	sweepIvl       int64
 	sweepCursor    int
 	sweepDormant   bool
+	sweepArrived   bool
 	cycleMoved     int
 	cycleTransient int
 	cycleRes       [numResidual]uint64
@@ -186,9 +191,16 @@ type Loop struct {
 	// LEAF lock: dispatch goroutines append under it at their park, the loop
 	// thread drains it immediately before drainDetachQueue, and nothing else
 	// is taken while it is held.
+	//
+	// xferAskDrain is the batch the loop is walking right now, kept on the
+	// Loop (and not in drainTransplantAsks's frame) so dropAsk can reach it:
+	// the release belt has to cover the entries already detached from
+	// xferAskQ, not only the ones still on it (celeris#657 R2, MINOR-b).
+	// xferAskPending is a COUNT, and its invariant is stated on askTransplant.
 	xferAskMu      sync.Mutex
 	xferAskQ       []*connState
 	xferAskSpare   []*connState
+	xferAskDrain   []*connState
 	xferAskPending atomic.Uint32
 
 	// fdCapDrops counts accepted fds that fell outside the l.conns table
@@ -2116,12 +2128,11 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			// examine this conn now that it is parked with nothing
 			// buffered — the only state in which the hand-off accepts
 			// it, and for a slow handler a window a periodic sweep
-			// almost never catches. One ask per park (the CAS), and
-			// the goroutine only asks: tryTransplant, on the loop
-			// thread, decides.
-			if l.transplant.Load() != nil && cs.xferAsked.CompareAndSwap(false, true) {
-				l.askTransplant(cs)
-			}
+			// almost never catches. One ask per park (the CAS), only
+			// for a conn the hand-off can actually accept (askAtPark's
+			// pre-check), and the goroutine only asks: tryTransplant,
+			// on the loop thread, decides.
+			l.askAtPark(cs)
 			cs.asyncCond.Wait()
 		}
 		cs.asyncParked = false
@@ -2592,6 +2603,9 @@ func (l *Loop) removeLiveConn(cs *connState) {
 	}
 	l.liveConns = l.liveConns[:last]
 	cs.liveIdx = -1
+	// The residue this loop last published counted this conn; it no longer
+	// holds it (celeris#657 R2).
+	l.sweepNoteDeparture()
 }
 
 func (l *Loop) adaptiveTimeoutMs(base int) int {
@@ -3047,6 +3061,10 @@ func (l *Loop) shutdown() {
 		l.conns[fd] = nil
 	}
 	l.liveConns = l.liveConns[:0]
+	// celeris#657 R2: this loop holds nothing now, so it must not leave its
+	// last cycle's residue standing in the engine-wide gauges. Nothing else
+	// retracts it — the sweep does not run after shutdown.
+	l.sweepRetract()
 
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)

@@ -1114,11 +1114,12 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		// GAUGES, and the sum is the whole adaptive engine's residue: after
 		// a switch settles, the outgoing side's is what did not follow it
 		// and the incoming side's is zero.
-		TransplantSweepPasses:      pm.TransplantSweepPasses + sm.TransplantSweepPasses,
-		TransplantResidualDetached: pm.TransplantResidualDetached + sm.TransplantResidualDetached,
-		TransplantResidualH2:       pm.TransplantResidualH2 + sm.TransplantResidualH2,
-		TransplantResidualPinned:   pm.TransplantResidualPinned + sm.TransplantResidualPinned,
-		TransplantResidualBusy:     pm.TransplantResidualBusy + sm.TransplantResidualBusy,
+		TransplantSweepPasses:       pm.TransplantSweepPasses + sm.TransplantSweepPasses,
+		TransplantResidualDetached:  pm.TransplantResidualDetached + sm.TransplantResidualDetached,
+		TransplantResidualH2:        pm.TransplantResidualH2 + sm.TransplantResidualH2,
+		TransplantResidualPinned:    pm.TransplantResidualPinned + sm.TransplantResidualPinned,
+		TransplantResidualUnstarted: pm.TransplantResidualUnstarted + sm.TransplantResidualUnstarted,
+		TransplantResidualBusy:      pm.TransplantResidualBusy + sm.TransplantResidualBusy,
 
 		// The celeris#607 recv-stall and linked-recv ledger. io_uring-only,
 		// so the epoll half contributes zero and a switch simply moves which

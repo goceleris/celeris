@@ -35,14 +35,44 @@ import (
 //     several bounded passes rather than one long one, and the loop keeps
 //     serving between them;
 //   - DORMANCY: a full cycle in which every connection left was refused for a
-//     PERMANENT reason (detached WS/SSE, H2/h2c, pinned) stops the sweep until
-//     a connection is added to the loop. Dormancy is safe because it removes
-//     only the EXTRA examinations: the per-event call site is untouched, so a
-//     connection that becomes movable through its own traffic is still
-//     examined at that traffic's event.
+//     PERMANENT reason (detached WS/SSE, H2/h2c, pinned, not yet started)
+//     stops the sweep until the live set changes. Dormancy is safe because it
+//     removes only the EXTRA examinations: the per-event call site is
+//     untouched, so a connection that becomes movable through its own traffic
+//     is still examined at that traffic's event.
 //
 // epoll_wait is capped only while a pass is owed and the sweep is not dormant,
 // so a standby loop with nothing to move blocks exactly as it did before.
+//
+// # THE CYCLE RULE (celeris#657 R2, MAJOR-1)
+//
+// Dormancy is a statement about a whole cycle, so a cycle must not be able to
+// end without having examined everything it is a statement about:
+//
+//	A cycle may conclude that every connection left is permanent residue
+//	only if NOTHING JOINED the live set between its first pass and its
+//	last. sweepArrived records that it did; a cycle with it set cannot go
+//	dormant and starts another cycle from the tail instead.
+//
+// This is not belt-and-braces, it is the hole the cursor leaves. addLiveConn
+// appends at the TAIL and a pass walks BACKWARDS from sweepCursor, so a
+// connection that joins during a multi-pass cycle lands PAST the cursor: this
+// cycle can never reach it, it contributes to neither cycleMoved nor
+// cycleTransient, and without the rule the cycle would go dormant with it
+// unexamined — on the outgoing engine, indefinitely, which is the exact
+// failure the sweep exists to fix. (Worked: 261 connections, budget 256. Pass
+// 1 examines 260..5 and leaves the cursor at 4; a connection is appended at
+// index 261; pass 2 walks 4..0, completes the cycle and, without the rule,
+// sleeps with 261 never looked at.)
+//
+// BOUNDEDNESS. The rule cannot spin. One sweep() call walks at most
+// sweepBudget connections and always returns: the index strictly decreases and
+// no arrival restarts a walk in progress. An arrival costs at most one further
+// cycle, and the cadence is untouched — so the steady-state cost under a
+// continuous stream of arrivals is at most sweepBudget examinations per
+// sweepIvl per loop, which backs off to sweepMaxIvl for as long as nothing
+// moves. Not going dormant under continuous arrivals is the POINT: while
+// connections keep joining there is always one that has not been examined.
 
 const (
 	// sweepMinIvl is the interval after a pass that moved something, and the
@@ -61,15 +91,25 @@ const (
 // counted under the reason it was refused; the permanent ones are what
 // dormancy is decided on.
 const (
-	resDetached = iota // detached WS/SSE: never movable while it lives
-	resH2              // H2, h2c, or an H1 connection mid-upgrade
-	resPinned          // cannot be handed over at all (io_uring: fixed file, no reap)
-	resBusy            // transient: mid-request, unflushed, handler running
+	resDetached  = iota // detached WS/SSE: never movable while it lives
+	resH2               // H2, h2c, or an H1 connection mid-upgrade
+	resPinned           // cannot be handed over at all (io_uring: fixed file, no reap)
+	resUnstarted        // accepted, has sent nothing: no protocol detected yet
+	resBusy             // transient: mid-request, unflushed, handler running
 	numResidual
 )
 
 // residualPermanent reports whether a refusal class can change without the
 // connection producing an event of its own. Only the transient class can.
+//
+// resUnstarted is PERMANENT by that definition and not by a weaker one: the
+// gate that refuses it is !cs.detected, and cs.detected is set on the loop
+// thread when the connection's first bytes are read — i.e. at an event of its
+// own, where the per-event call site examines it anyway (celeris#657 R2,
+// MINOR-e). Classing it transient made a silent accepted connection count as
+// cycleTransient on every cycle, so the sweep NEVER went dormant, epoll_wait
+// stayed capped at the 64 ms back-off for the whole drain, and the gauge read
+// non-zero after the switch had settled.
 func residualPermanent(class int) bool { return class != resBusy }
 
 // sweepCounters are the engine-wide destinations a loop publishes to. The
@@ -102,16 +142,50 @@ func (l *Loop) sweepWaitMs() int {
 	return int(d)
 }
 
-// wakeSweep lifts dormancy and makes the next pass due. Called when a
-// connection joins this loop's live set (an accept, or an adopt from the other
-// engine): the set the dormant cycle judged is no longer the set the loop
-// holds. Loop thread; the guard keeps it off the accept path's cost when the
-// sweep is not dormant, which is every case but this one.
+// wakeSweep records that a connection JOINED this loop's live set (an accept,
+// or an adopt from the other engine) and makes the sweep act on it. Loop
+// thread, from addLiveConn.
+//
+// Two things happen here and they are not the same thing. Lifting dormancy is
+// what gets a pass to run at all. Setting sweepArrived is what stops the cycle
+// in progress from concluding, on evidence that predates this connection, that
+// everything left is permanent — see THE CYCLE RULE above. The flag is set
+// UNCONDITIONALLY: a sweep that is merely awake is mid-cycle, walking
+// backwards from a cursor this connection has just been appended past.
 func (l *Loop) wakeSweep() {
+	l.sweepArrived = true
 	if l.sweepDormant {
 		l.sweepDormant = false
 		l.sweepNext = 0
 	}
+}
+
+// sweepNoteDeparture records that a connection LEFT this loop's live set. Loop
+// thread, from removeLiveConn.
+//
+// A departure adds no work, so it does not set sweepArrived. It does make the
+// published residue wrong: the gauges are what the engine HOLDS, and a dormant
+// sweep publishes nothing, so without this a connection that closed while the
+// sweep slept would be counted as residue for the rest of the drain
+// (celeris#657 R2, MINOR-d). Lifting dormancy costs one more cycle, which
+// re-counts what is left and sleeps again.
+func (l *Loop) sweepNoteDeparture() {
+	if l.sweepDormant {
+		l.sweepDormant = false
+		l.sweepNext = 0
+	}
+}
+
+// sweepRetract drops everything this loop has published into the engine-wide
+// gauges. Loop thread, at shutdown: a loop that is gone holds nothing, and
+// nothing else would ever retract its last cycle's residue (celeris#657 R2,
+// MINOR-d).
+func (l *Loop) sweepRetract() {
+	if l.sweepPub == ([numResidual]uint64{}) {
+		return
+	}
+	l.resetCycle()
+	l.publishResidual()
 }
 
 // sweep runs one budgeted pass of the post-switch sweep. Loop thread only,
@@ -145,17 +219,20 @@ func (l *Loop) sweep() {
 		l.sweepCursor = -1
 		l.resetCycle()
 	}
-	if l.sweepDormant {
-		return
-	}
 	if len(l.liveConns) == 0 {
 		// Nothing left to hold: retract the residue this loop published,
 		// so the gauge reads what the engine HOLDS and not what its last
-		// non-empty cycle saw.
+		// non-empty cycle saw. BEFORE the dormancy check, not after it: a
+		// dormant sweep whose connections have all closed is precisely the
+		// case that used to leave the gauge standing (celeris#657 R2,
+		// MINOR-d).
 		if l.sweepPub != ([numResidual]uint64{}) {
 			l.resetCycle()
 			l.publishResidual()
 		}
+		return
+	}
+	if l.sweepDormant {
 		return
 	}
 	now := time.Now().UnixNano()
@@ -190,11 +267,24 @@ func (l *Loop) sweep() {
 			continue
 		}
 		examined++
-		// Permanent residue: a detached WebSocket or SSE conn, an H2 one.
-		// tryTransplant refuses each of them on a gate that cannot change
-		// while the conn lives, so examining it is work with no outcome.
-		if class := l.residualClass(cs); class != resBusy {
+		// Permanent residue: a detached WebSocket or SSE conn, an H2 one, a
+		// hijacked one, one that has never spoken. tryTransplant refuses
+		// each of them on a gate that cannot change while the conn lives,
+		// or cannot change without an event of the conn's own, so examining
+		// it is work with no outcome.
+		//
+		// read=false skips tryTransplant too, and loses nothing: every conn
+		// with a detachMu that is held is one tryTransplant would refuse.
+		// An async one has its dispatch goroutine inside ProcessH1, so the
+		// parked && idle gate refuses it; one held by a guarded writeFn is
+		// detached, so the Detached gate does. Skipping is the cheaper way
+		// to reach the same answer, and it keeps the loop off a lock the
+		// WebSocket write path holds (celeris#667/#672).
+		if class, read := l.residualClass(cs); class != resBusy || !read {
 			l.cycleRes[class]++
+			if !residualPermanent(class) {
+				l.cycleTransient++
+			}
 			continue
 		}
 		l.tryTransplant(fd)
@@ -202,7 +292,7 @@ func (l *Loop) sweep() {
 			moved++
 			continue
 		}
-		class := l.residualClass(cs)
+		class, _ := l.residualClass(cs)
 		l.cycleRes[class]++
 		if !residualPermanent(class) {
 			l.cycleTransient++
@@ -211,14 +301,16 @@ func (l *Loop) sweep() {
 	l.cycleMoved += moved
 
 	if i < 0 {
-		// The cycle is complete: every connection this loop holds was
-		// examined. Judge dormancy on the whole cycle, not on one budgeted
-		// pass, then publish the residue and start again at the tail.
-		if l.cycleMoved == 0 && l.cycleTransient == 0 {
+		// The cycle is complete: every connection this loop held for the
+		// whole of it was examined. Judge dormancy on the whole cycle, not
+		// on one budgeted pass, and only if the set did not change under it
+		// (THE CYCLE RULE). Then publish the residue and start again at the
+		// tail.
+		if l.cycleMoved == 0 && l.cycleTransient == 0 && !l.sweepArrived {
 			l.sweepDormant = true
 		}
 		l.publishResidual()
-		l.resetCycle()
+		l.resetCycle() // clears sweepArrived: the next cycle is its own witness
 		l.sweepCursor = -1
 	} else {
 		l.sweepCursor = i
@@ -235,11 +327,14 @@ func (l *Loop) sweep() {
 	l.sweepNext = now + l.sweepIvl
 }
 
-// resetCycle clears the per-cycle accounting. Loop thread.
+// resetCycle clears the per-cycle accounting, sweepArrived included: it is a
+// per-cycle witness, and clearing it here is what starts the next cycle's.
+// Loop thread.
 func (l *Loop) resetCycle() {
 	l.cycleMoved = 0
 	l.cycleTransient = 0
 	l.cycleRes = [numResidual]uint64{}
+	l.sweepArrived = false
 }
 
 // publishResidual moves this loop's per-class residue into the engine-wide
@@ -259,12 +354,50 @@ func (l *Loop) publishResidual() {
 }
 
 // residualClass names why the hand-off refused cs. It duplicates no decision:
-// tryTransplant has already run and left the connection here, and this only
-// reads which of its gates the connection sits behind. Everything the gates
-// can change on their own — a request in flight, an unflushed response, a
-// running dispatch goroutine — is transient; the rest is permanent for as long
-// as the connection lives. Loop thread.
-func (l *Loop) residualClass(cs *connState) int {
+// tryTransplant has already run and left the connection here, or is about to
+// be spared the call, and this only reads which of its gates the connection
+// sits behind. Everything the gates can change on their own — a request in
+// flight, an unflushed response, a running dispatch goroutine — is transient;
+// the rest is permanent for as long as the connection lives, or until the
+// connection produces an event of its own. Loop thread.
+//
+// read=false means NOTHING was read and resBusy is a default, not a finding:
+// see the locking rule below. The caller must treat it as transient residue
+// and must not skip tryTransplant on the strength of it.
+//
+// # LOCKING (celeris#256 / #548 / #593, R2 MAJOR-2)
+//
+// cs.h1State, cs.h2State and cs.protocol are written by the dispatch
+// goroutine's switchToH2Local (loop.go), which holds cs.detachMu across all
+// three. Reading them from the loop thread without that lock is the TOCTOU
+// this engine forbids in three docstrings, and the race detector flags it.
+// So they are read here under cs.detachMu — and with TryLock, not Lock:
+// runAsyncHandler holds cs.detachMu across the whole of ProcessH1, so a
+// blocking Lock on the loop thread would park the loop, and therefore every
+// connection it owns, behind one slow async handler. That is celeris#593, and
+// snapshotH1Deadlines (iouring/worker.go) takes exactly this shape for exactly
+// this reason.
+//
+// A connection whose detachMu is held is, by that fact, in a handler: the
+// transient class, reported without reading anything. A connection with no
+// detachMu at all has no dispatch goroutine — sync mode, or async before the
+// first promotion — so the loop thread owns the three fields and the reads are
+// inherently safe.
+func (l *Loop) residualClass(cs *connState) (class int, read bool) {
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			return resBusy, false
+		}
+		class = l.classifyLocked(cs)
+		mu.Unlock()
+		return class, true
+	}
+	return l.classifyLocked(cs), true
+}
+
+// classifyLocked is residualClass's body, with its precondition met: either cs
+// has no dispatch goroutine, or the caller holds cs.detachMu. Loop thread.
+func (l *Loop) classifyLocked(cs *connState) int {
 	if cs.h1State != nil && cs.h1State.Detached.Load() {
 		return resDetached
 	}
@@ -273,6 +406,12 @@ func (l *Loop) residualClass(cs *connState) int {
 	}
 	if cs.hijacked {
 		return resPinned
+	}
+	if !cs.detected || cs.h1State == nil {
+		// tryTransplant's FIRST gate (transplant.go). An accepted
+		// connection that has sent no byte has no detected protocol and no
+		// H1 state, and neither appears until it speaks.
+		return resUnstarted
 	}
 	return resBusy
 }

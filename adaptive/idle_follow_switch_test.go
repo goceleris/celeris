@@ -223,12 +223,13 @@ func idleFollowSwitch(t *testing.T, h stream.Handler, async, revert bool) {
 	m := e.Metrics()
 	w1 := m.StaleRecvDataTransplanted + m.StaleRecvDataUnattributed
 	t.Logf("celeris657 IDLE-%s async=%v RESULT before=%d converged_ms=%d at_%dms=%d resumed_outgoing=%d "+
-		"resumed_incoming=%d ok=%d err=%d w1=%d w2=%d passes=%d residual=[det=%d h2=%d pin=%d busy=%d] census=%s",
+		"resumed_incoming=%d ok=%d err=%d w1=%d w2=%d passes=%d residual=[det=%d h2=%d pin=%d uns=%d busy=%d] "+
+		"census=%s",
 		dir, async, before, convergedMs, bound.Milliseconds(), atBound, srcAfter, dstAfter,
 		okCount.Load(), errCount.Load(), w1, m.TransplantHandoffInFlight,
 		metricSoft(m, "TransplantSweepPasses"), metricSoft(m, "TransplantResidualDetached"),
 		metricSoft(m, "TransplantResidualH2"), metricSoft(m, "TransplantResidualPinned"),
-		metricSoft(m, "TransplantResidualBusy"), cen.String())
+		metricSoft(m, "TransplantResidualUnstarted"), metricSoft(m, "TransplantResidualBusy"), cen.String())
 
 	if before < conns-2 {
 		t.Fatalf("celeris657 IDLE-%s PREMISE: only %d of %d conns were on the outgoing engine before the switch",
