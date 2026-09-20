@@ -132,12 +132,16 @@ jobs:
       # a whole io_uring engine. That holds for the eleven hand-off loss witness
       # tests (PR-1, the first list), the eighteen fd-lifetime tests (PR-2,
       # the second list; eight of them pin the async-cancel-flags probe, the
-      # reap-failure and dup-failure paths and the reaped recv's cleanup) and
-      # the six post-switch sweep tests (PR-3, the third list: the wake poll,
+      # reap-failure and dup-failure paths and the reaped recv's cleanup), the
+      # six post-switch sweep tests (PR-3, the third list: the wake poll,
       # the sweep reaching an idle conn through the reap, and the four cases in
       # which it must NOT ask -- no cancel flags, work already owed, a claim
-      # already made, a detached WebSocket conn). So all thirty-five run again
-      # here by name, with the PASS-count interlock the `iouring` job uses
+      # already made, a detached WebSocket conn) and the five the PR-3 review
+      # added (the fourth list: a connection that joins a cycle past the
+      # cursor, the bound on what the rule that catches it may cost, the
+      # classifier's lock, a connection that has sent no byte, and the
+      # retraction of the residual gauges). So all forty run again here by
+      # name, with the PASS-count interlock the `iouring` job uses
       # (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1 to turn every
       # environment skip into a failure, and an exact tally.
       #
@@ -170,7 +174,8 @@ jobs:
           pr1='TestStaleRecvDataCountsATransplantedConn|TestStaleRecvDataCountsAnAsyncTransplantedConn|TestStaleRecvDataCountsAClosedConn|TestStaleRecvDataCountsAnUnattributedIdentity|TestStaleRecvDataIgnoresCompletionsWithoutData|TestStaleRecvDataCountsEachMultishotCompletion|TestTransplantHandoffInFlightCountsTryTransplant|TestTransplantHandoffInFlightCountsFinishAsyncTransplant|TestMetricsCarriesTheHandoffLossWitnesses|TestWorkersShareTheHandoffLossWitnesses|TestClosedOpsEntryStaysThirtyTwoBytes'
           pr2='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending|TestTransplantReapFailureIsNotRetried|TestNoReapWithoutAsyncCancelFlags|TestReapSuppressedAfterFailedHandOff|TestReapedRecvLeavesNoLinkOrBuffer|TestAsyncCancelProbeClassifies|TestAsyncCancelProbeOnThisKernel|TestWorkersCarryTheAsyncCancelProbe|TestReapOnTheRunningKernel'
           pr3='TestWorkerAskWakesTheRing|TestQuiesceMovesAnIdleConn|TestSweepDoesNotSpinWithoutCancelFlags|TestSweepSkipsAConnWithWorkAlreadyOwed|TestSweepDoesNotReClaimAnAsyncHandoff|TestSweepLeavesADetachedConnAlone'
-          names="${pr1}|${pr2}|${pr3}"
+          pr3r2='TestSweepCannotGoDormantWithAnUnexaminedArrival|TestSweepCostIsBoundedUnderContinuousArrivals|TestSweepClassifiesUnderTheLockTheEngineRequires|TestSweepGoesDormantOnAConnThatHasSentNothing|TestResidualGaugeRetractsWhatTheWorkerNoLongerHolds'
+          names="${pr1}|${pr2}|${pr3}|${pr3r2}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./engine/iouring/ 2>&1 | tee /tmp/witness657.log
@@ -189,16 +194,21 @@ jobs:
       # celeris#657 PR-3: the same silent-exclusion shape, one package over.
       # ./engine/epoll is reached only by the root step above, which runs
       # without -v, so a skip there prints nothing and the package still
-      # reports `ok`. Two of the eight post-switch sweep tests start a REAL
+      # reports `ok`. Two of the post-switch sweep tests start a REAL
       # epoll engine and t.Skip when it does not come up
       # (sweep_engine_test.go), and they are the two that prove face 1 on a
       # real engine: an idle keep-alive is handed over although its client
       # never sends another byte. A rename or an environment skip would take
       # them out of CI with no red.
       #
-      # So all eight run again here by name with the interlock the step above
-      # uses: -v, exact top-level RUN and PASS counts, and no `--- SKIP` line
-      # anywhere. Two further censuses make the engine cells impossible to
+      # Seventeen names, in two lists: r1 is the eight this PR first shipped,
+      # r2 the nine the review added (sweep_r2_test.go -- the cycle rule and
+      # its cost bound, the classifier's lock under -race, the ask's
+      # permanent-class pre-check, the release belt over the batch being
+      # drained, the pending count, the two gauge retractions and the
+      # connection that has sent no byte). All seventeen run here by name with
+      # the interlock the step above uses: -v, exact top-level RUN and PASS
+      # counts, and no `--- SKIP` line anywhere. Two further censuses make the engine cells impossible to
       # lose quietly. Both build their engine with Resources.Workers=2, so
       # every "epoll engine listening" line must read loops=2 -- a runner that
       # resolves a different loop count fails here instead of silently testing
@@ -216,7 +226,9 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestSweepMovesIdleConnsWithoutTraffic|TestSweepMovesIdleAsyncConnsWithoutTraffic|TestSweepStopsWithTheDrain|TestSweepGoesDormantOnPermanentResidue|TestSweepBudgetCoversEveryConnAcrossPasses|TestSweepCadenceBacksOffAndResets|TestAskNeverOutlivesConnState|TestSweepDoesNotBlockOnADetachedConnsLock'
+          r1='TestSweepMovesIdleConnsWithoutTraffic|TestSweepMovesIdleAsyncConnsWithoutTraffic|TestSweepStopsWithTheDrain|TestSweepGoesDormantOnPermanentResidue|TestSweepBudgetCoversEveryConnAcrossPasses|TestSweepCadenceBacksOffAndResets|TestAskNeverOutlivesConnState|TestSweepDoesNotBlockOnADetachedConnsLock'
+          r2='TestSweepCannotGoDormantWithAnUnexaminedArrival|TestSweepCostIsBoundedUnderContinuousArrivals|TestSweepClassifiesUnderTheLockTheEngineRequires|TestParkAskSkipsWhatTheHandoffCannotAccept|TestDropAskWithdrawsFromTheBatchBeingDrained|TestAskPendingCountsTheQueue|TestResidualGaugeRetractsWhatTheLoopNoLongerHolds|TestResidualGaugeRetractsAtShutdown|TestSweepGoesDormantOnAConnThatHasSentNothing'
+          names="${r1}|${r2}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./engine/epoll/ 2>&1 | tee /tmp/sweep657.log
