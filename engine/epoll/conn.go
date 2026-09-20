@@ -151,6 +151,11 @@ type connState struct {
 	// the goroutine, on its next park, sees it, exits, and enqueues cs on
 	// detachQueue for the loop to finish the handoff.
 	asyncQuiesce atomic.Bool
+	// xferAsked (celeris#657 P8) is set by this conn's dispatch goroutine,
+	// by CAS, when it queues a park-boundary examination request on its
+	// loop, and cleared by the loop when it drains or withdraws the ask. It
+	// deduplicates the queue to one entry per park.
+	xferAsked atomic.Bool
 	// transplantPending (#383, loop-thread-only) marks a conn detached for
 	// transplant whose dispatch goroutine must drain+exit first; drainDetachQueue
 	// completes the handoff once it sees the enqueued cs with this set.
@@ -267,6 +272,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncParked = false
 	cs.asyncClosed.Store(false)
 	cs.asyncQuiesce.Store(false)
+	cs.xferAsked.Store(false)
 	cs.transplantPending = false
 	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false

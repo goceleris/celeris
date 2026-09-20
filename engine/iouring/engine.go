@@ -87,6 +87,11 @@ type Engine struct {
 		// recv data by identity class, and hand-offs made with an op in
 		// flight.
 		handoffLoss handoffLossStats
+		// sweep holds the post-switch sweep's witnesses (celeris#657 P9):
+		// its pass count, and the live residue by refusal class, which
+		// every worker publishes as a delta so the sum is what the engine
+		// still holds against a drain.
+		sweep sweepCounters
 	}
 	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
 	// at construction so Metrics() doesn't pay the type-assertion per
@@ -406,6 +411,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
 		w.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		w.handoffLoss = &e.metrics.handoffLoss // celeris#657 witnesses
+		w.sweepCnt = &e.metrics.sweep          // celeris#657 P9 sweep witnesses
 		w.asyncCancelFlags = e.asyncCancelFlags
 		workers[i] = w
 	}
@@ -511,6 +517,13 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantClaimDeferred:   e.metrics.handoffLoss.claimDeferred.Load(),
 		TransplantReapFailed:      e.metrics.handoffLoss.reapFailed.Load(),
 		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
+
+		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
+		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),
+		TransplantResidualH2:        e.metrics.sweep.residual[resH2].Load(),
+		TransplantResidualPinned:    e.metrics.sweep.residual[resPinned].Load(),
+		TransplantResidualUnstarted: e.metrics.sweep.residual[resUnstarted].Load(),
+		TransplantResidualBusy:      e.metrics.sweep.residual[resBusy].Load(),
 	}
 	// ErrorCount and its eleven buckets, together, from one snapshot
 	// (celeris#645).

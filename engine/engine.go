@@ -555,6 +555,44 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// probe finds the flags. io_uring-only; on the adaptive engine the sum
 	// over both sub-engines.
 	TransplantReapUnsupported uint64
+	// TransplantSweepPasses counts passes of the post-switch sweep, the
+	// re-examination that moves a connection the drain would otherwise
+	// reach only at that connection's own next event — which, for a
+	// connection idle when the switch happened, never comes (celeris#657
+	// face 1). A rate, and the cost side of the sweep: it stops climbing
+	// once the drain ends, once nothing is left to move, and once every
+	// connection left is of a permanent class (the sweep goes dormant).
+	TransplantSweepPasses uint64
+	// TransplantResidual{Detached,H2,Pinned,Unstarted,Busy} are GAUGES: the
+	// connections a draining engine still holds, by the reason the hand-off
+	// refused them. Each loop or worker publishes the delta against what it
+	// published last, so the engine-wide value is the sum of what its loops
+	// and workers currently hold; a loop that empties, or shuts down,
+	// retracts its own contribution (celeris#657 R2).
+	//
+	//   - Detached: a WebSocket or SSE connection, which does not move.
+	//   - H2: an H2 or h2c connection, or an H1 one mid-upgrade.
+	//   - Pinned: cannot be handed over at all — an io_uring fixed-file
+	//     connection, or one whose recv can only be cleared by a reap on a
+	//     worker whose kernel has no IORING_ASYNC_CANCEL flags.
+	//   - Unstarted: accepted, and has not yet sent the byte that would let
+	//     its protocol be detected. The hand-off refuses it on its very
+	//     first gate, and nothing about it can change until it speaks —
+	//     which is an event of its own, and therefore an examination of its
+	//     own. Permanent for the sweep, transient for the connection.
+	//   - Busy: the transient class — mid-request, response not flushed, or
+	//     a dispatch goroutine still running. The only class that can clear
+	//     with no event of the connection's own, so it is also the one the
+	//     sweep keeps running for: a cycle with none of it, and no arrival,
+	//     goes dormant.
+	//
+	// A standing non-zero Busy after a switch settles is the placement bug
+	// itself; Detached, H2, Pinned and Unstarted are the expected residue.
+	TransplantResidualDetached  uint64
+	TransplantResidualH2        uint64
+	TransplantResidualPinned    uint64
+	TransplantResidualUnstarted uint64
+	TransplantResidualBusy      uint64
 }
 
 // FillErrorClasses copies one engine's per-cause error tally into m and

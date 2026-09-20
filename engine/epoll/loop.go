@@ -165,6 +165,44 @@ type Loop struct {
 	// top of its own unfinished hand-off (celeris#624).
 	transplantInFlight int
 
+	// The post-switch sweep (celeris#657 P7, sweep.go). All loop-thread-only
+	// but sweepCnt, which points at the engine-wide gauges every loop
+	// publishes into. sweepTS is the drain epoch the current cadence belongs
+	// to; sweepCursor resumes a budgeted cycle where the last pass stopped;
+	// the cycle* fields accumulate one cycle's verdict, and sweepPub is what
+	// this loop last published, so the gauge delta is exact.
+	// sweepArrived records that a connection JOINED the live set during the
+	// cycle in progress; such a connection is appended past the cursor and
+	// cannot be reached by this cycle, so a cycle with it set may not go
+	// dormant (THE CYCLE RULE in sweep.go, celeris#657 R2).
+	sweepTS        *transplantState
+	sweepCnt       *sweepCounters
+	sweepNext      int64
+	sweepIvl       int64
+	sweepCursor    int
+	sweepDormant   bool
+	sweepArrived   bool
+	cycleMoved     int
+	cycleTransient int
+	cycleRes       [numResidual]uint64
+	sweepPub       [numResidual]uint64
+
+	// The park-boundary ask queue (celeris#657 P8, ask.go). xferAskMu is a
+	// LEAF lock: dispatch goroutines append under it at their park, the loop
+	// thread drains it immediately before drainDetachQueue, and nothing else
+	// is taken while it is held.
+	//
+	// xferAskDrain is the batch the loop is walking right now, kept on the
+	// Loop (and not in drainTransplantAsks's frame) so dropAsk can reach it:
+	// the release belt has to cover the entries already detached from
+	// xferAskQ, not only the ones still on it (celeris#657 R2, MINOR-b).
+	// xferAskPending is a COUNT, and its invariant is stated on askTransplant.
+	xferAskMu      sync.Mutex
+	xferAskQ       []*connState
+	xferAskSpare   []*connState
+	xferAskDrain   []*connState
+	xferAskPending atomic.Uint32
+
 	// fdCapDrops counts accepted fds that fell outside the l.conns table
 	// (fd >= connTableSize) and were force-closed in acceptAll. Worker-
 	// thread-only. fdCapWarned latches so the diagnostic Warn is emitted
@@ -462,6 +500,13 @@ func (l *Loop) run(ctx context.Context) {
 		if l.listenFD < 0 {
 			timeoutMs = 500
 		}
+		// A sweep pass is owed (celeris#657 P7): cap the wait so it runs on
+		// its own cadence and not at the mercy of the next event. Only while
+		// a pass IS owed — a dormant sweep, or one with nothing live, returns
+		// -1 and the standby loop blocks exactly as it did before.
+		if ms := l.sweepWaitMs(); ms >= 0 && (timeoutMs < 0 || ms < timeoutMs) {
+			timeoutMs = ms
+		}
 		// acceptAll stopped with the listen backlog possibly non-empty
 		// (per-call cap hit, or EMFILE/ENFILE back-off). The listen socket
 		// is edge-triggered, so don't block — poll immediately and re-drain.
@@ -605,6 +650,15 @@ func (l *Loop) run(ctx context.Context) {
 		} else {
 			l.consecutiveEmpty++
 		}
+
+		// celeris#657 P7/P8: re-examine what the drain still holds, and the
+		// connections whose dispatch goroutines asked at their park. Both run
+		// BEFORE drainDetachQueue, so a deferred async hand-off either
+		// starts here finishes in this same iteration once the goroutine
+		// exits — and, for the ask queue, so no connState is drained from it
+		// after drainDetachQueue has returned it to the pool (celeris#654).
+		l.sweep()
+		l.drainTransplantAsks()
 
 		// Drain detached goroutine writes BEFORE the dirty flush so that
 		// data written by goroutines (e.g. WebSocket responses) is flushed
@@ -1567,6 +1621,7 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 		// touch the list; the deferred branch is unlinked in
 		// drainDetachQueue, which also runs there.
 		l.removeDirty(cs)
+		l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 		releaseConnState(cs)
 	}
 	return c, err
@@ -2068,6 +2123,16 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			// so we don't pay the ~1.5µs goroutine spawn cost per
 			// request — profile showed this accounted for ~3% of
 			// epoll+async CPU on high-rps redis workloads.
+			//
+			// celeris#657 P8: while a drain is set, ask the loop to
+			// examine this conn now that it is parked with nothing
+			// buffered — the only state in which the hand-off accepts
+			// it, and for a slow handler a window a periodic sweep
+			// almost never catches. One ask per park (the CAS), only
+			// for a conn the hand-off can actually accept (askAtPark's
+			// pre-check), and the goroutine only asks: tryTransplant,
+			// on the loop thread, decides.
+			l.askAtPark(cs)
 			cs.asyncCond.Wait()
 		}
 		cs.asyncParked = false
@@ -2310,6 +2375,7 @@ func (l *Loop) drainDetachQueue() {
 			// still points at (celeris#654). No-op unless the conn really was
 			// dirty — a partial write from a prior pipelined response.
 			l.removeDirty(cs)
+			l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 			releaseConnState(cs)
 			continue
 		}
@@ -2509,6 +2575,9 @@ func (l *Loop) removeDirty(cs *connState) {
 func (l *Loop) addLiveConn(cs *connState) {
 	cs.liveIdx = len(l.liveConns)
 	l.liveConns = append(l.liveConns, cs.fd)
+	// A dormant sweep judged the set this loop held; it holds a different
+	// one now (celeris#657 P7).
+	l.wakeSweep()
 }
 
 // removeLiveConn removes cs's fd from liveConns in O(1) via swap-with-last,
@@ -2534,6 +2603,9 @@ func (l *Loop) removeLiveConn(cs *connState) {
 	}
 	l.liveConns = l.liveConns[:last]
 	cs.liveIdx = -1
+	// The residue this loop last published counted this conn; it no longer
+	// holds it (celeris#657 R2).
+	l.sweepNoteDeparture()
 }
 
 func (l *Loop) adaptiveTimeoutMs(base int) int {
@@ -2892,6 +2964,7 @@ func (l *Loop) closeConn(fd int) {
 	// reference (WS/SSE detach OR async dispatch). GC collects cs once
 	// the goroutine finishes and all closure references are dropped.
 	if !detached {
+		l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 		releaseConnState(cs)
 	}
 }
@@ -2982,11 +3055,16 @@ func (l *Loop) shutdown() {
 		}
 		_ = unix.Close(fd)
 		if cs.detachMu == nil {
+			l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 			releaseConnState(cs)
 		}
 		l.conns[fd] = nil
 	}
 	l.liveConns = l.liveConns[:0]
+	// celeris#657 R2: this loop holds nothing now, so it must not leave its
+	// last cycle's residue standing in the engine-wide gauges. Nothing else
+	// retracts it — the sweep does not run after shutdown.
+	l.sweepRetract()
 
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)

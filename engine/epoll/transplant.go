@@ -32,6 +32,11 @@ func (e *Engine) StartTransplant(target engine.TransplantTarget) {
 	ts := &transplantState{target: target}
 	for _, l := range e.loops {
 		l.transplant.Store(ts)
+		// Start the sweep now, not at this loop's next event (celeris#657
+		// P7). A standby loop with no listen socket and only idle
+		// keep-alives has no next event at all: that is the promotion case
+		// where all 64 connections stayed put for 3 s.
+		l.wakeFD.Signal()
 	}
 }
 
@@ -238,6 +243,7 @@ func (l *Loop) detachForTransplant(fd int, cs *connState) {
 	// Return the epoll connState to the pool. This clears h1State/buffers but
 	// does NOT close the fd (that is closeConn's job) — the fd lives on under
 	// the io_uring engine.
+	l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 	releaseConnState(cs)
 }
 
@@ -269,6 +275,7 @@ func (l *Loop) finishTransplantHandoff(cs *connState) {
 	}
 	fd := cs.fd
 	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
+	l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 	releaseConnState(cs)
 	ts := l.transplant.Load()
 	if ts == nil {

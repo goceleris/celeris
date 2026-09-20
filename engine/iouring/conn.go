@@ -267,6 +267,11 @@ type connState struct {
 	// reads it on the recv path and in drainDetachQueue. Mirrors the
 	// asyncH2Promoted hand-off shape.
 	transplantPending atomic.Bool
+	// sweepKick is the drain epoch this conn's dispatch goroutine was last
+	// Broadcast by the post-switch sweep (celeris#657 P9), so each promoted
+	// async conn is woken at most once per drain. Worker thread, under
+	// asyncInMu.
+	sweepKick *transplantTargetHolder
 	// asyncPromoted is set once an async-marked route has been observed
 	// on this conn while it ran inline on the worker (per-handler async,
 	// celeris #300). Once promoted, recv goes to the dispatch goroutine.
@@ -497,6 +502,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
 	cs.transplantPending.Store(false)
+	cs.sweepKick = nil
 	cs.asyncPromoted.Store(false)
 	// asyncH2Promoted was missing here while every sibling was reset, so a
 	// pooled connState came back still marked H2-promoted and was then
