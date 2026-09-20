@@ -29,6 +29,11 @@ func (e *Engine) StartTransplant(target engine.TransplantTarget) {
 	e.mu.Unlock()
 	for _, w := range workers {
 		w.transplant.Store(h)
+		// Start the sweep now, not at this worker's next completion
+		// (celeris#657 P9). A standby worker with no listen socket and only
+		// idle keep-alives has no next completion for a full second, which
+		// is why the wake poll must stay armed (P10).
+		w.wakeFD.Signal()
 	}
 }
 

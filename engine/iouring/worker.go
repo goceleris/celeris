@@ -295,8 +295,21 @@ type Worker struct {
 	// hot path above ~8 Ki conns (celeris#318). Append-on-register,
 	// swap-with-last-on-deregister; the slice is owned by the worker
 	// thread so no locking is required.
-	liveConns    []int
-	handler      stream.Handler
+	liveConns []int
+	// The post-switch sweep (celeris#657 P9, sweep.go). Worker-thread-only
+	// but sweepCnt, which points at the engine-wide gauges every worker
+	// publishes into.
+	sweepH         *transplantTargetHolder
+	sweepCnt       *sweepCounters
+	sweepNext      int64
+	sweepIvl       int64
+	sweepCursor    int
+	sweepDormant   bool
+	cycleMoved     int
+	cycleTransient int
+	cycleRes       [numResidual]uint64
+	sweepPub       [numResidual]uint64
+	handler        stream.Handler
 	resolved     resource.ResolvedResources
 	sockOpts     sockopts.Options
 	runCtx       context.Context //nolint:containedctx // stored so #383 transplant attach (off the accept path) can derive a conn ctx
@@ -1104,6 +1117,18 @@ func (w *Worker) run(ctx context.Context) {
 		// before this iteration's submit, so it rides the same syscall.
 		w.rearmAcceptIfPending(paused)
 		w.rearmH2PollIfPending()
+		// celeris#657 P10 (A2w): keep the wake eventfd's POLL_ADD armed in
+		// EVERY mode, not only for H2/h2c/driver/Detach work. Without it
+		// wakeFD.Signal() cannot end a plain HTTP/1 worker's ring wait, and
+		// a standby worker with no listen socket waits the full second
+		// adaptiveTimeout gives it: measured, the first hand-off after an
+		// idle revert came 1001.8-1008.8 ms late and the 500 ms idle test
+		// failed 8 of 8 runs, against 0.7-5.7 ms and 0 of 8 with these
+		// lines. One outstanding POLL_ADD per worker; handleH2Wakeup
+		// re-arms it.
+		if !w.h2PollArmed && w.wakeFD.FD() >= 0 {
+			w.h2PollArmed = w.prepareH2Poll()
+		}
 
 		var cqHead, cqTail uint32
 		if w.sqpoll {
@@ -1333,6 +1358,12 @@ func (w *Worker) run(ctx context.Context) {
 		// Drain detached goroutine writes. Goroutines append to the queue
 		// instead of calling markDirty directly (dirtyHead is worker-local).
 		w.drainDetachQueue()
+
+		// celeris#657 P9: re-examine what the drain still holds. After
+		// drainDetachQueue, so a claim made by the previous pass's
+		// Broadcast is already settled, and through the unchanged
+		// tryTransplant, so the R0 gate, the reap and the hold all apply.
+		w.sweep()
 
 		// Apply driver-side actions (RegisterConn / UnregisterConn / Write)
 		// on the worker thread so SQE submission honors single-issuer.
@@ -1845,6 +1876,20 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 // before expiry AND back up the per-conn IORING_OP_TIMEOUT for slowloris
 // defence when the kernel timer SQE failed to arm under SQ-ring pressure.
 func (w *Worker) adaptiveTimeout() time.Duration {
+	// A sweep pass is owed (celeris#657 P9): never wait past it. This is
+	// the cap that matters, because the case the sweep exists for — a
+	// standby worker with no listen socket and only idle keep-alives — is
+	// exactly the one the 1 s below applies to.
+	if d, owed := w.sweepWait(); owed {
+		if w.listenFD < 0 || d < w.baseTimeout() {
+			return d
+		}
+	}
+	return w.baseTimeout()
+}
+
+// baseTimeout is adaptiveTimeout without the sweep cap.
+func (w *Worker) baseTimeout() time.Duration {
 	if w.listenFD < 0 {
 		return 1 * time.Second
 	}
@@ -5014,6 +5059,9 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 func (w *Worker) addLiveConn(cs *connState) {
 	cs.liveIdx = len(w.liveConns)
 	w.liveConns = append(w.liveConns, cs.fd)
+	// A dormant sweep judged the set this worker held; it holds a different
+	// one now (celeris#657 P9).
+	w.wakeSweep()
 }
 
 // removeLiveConn removes cs's FD from liveConns in O(1) by swapping the
