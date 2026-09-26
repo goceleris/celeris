@@ -3138,6 +3138,13 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
 	// Now safe to modify/reuse sendBuf. Process the deferred result.
 	if cqeIsNotif(c.Flags) {
+		// celeris#587: a no-op outside -tags=validation (it inlines to
+		// nothing). Under the tag a test can hold the first-CQE -> NOTIF
+		// window open here, with no lock held, so the inline-egress guard
+		// and the race detector see the interleaving a NIC's DMA latency
+		// produces and loopback's copy fallback does not
+		// (validation.SetZCNotifDelay).
+		validation.ZCNotifDelay()
 		// celeris#591: one atomic per NOTIF. Reached only on the ZC path —
 		// a plain SEND never produces a CQE_F_NOTIF completion.
 		w.zc.noteNotif()

@@ -2,6 +2,8 @@
 
 package validation
 
+import "time"
+
 // Counter is the no-op stub installed in production builds. It carries
 // no state and inlines to nothing. Importers (engine/iouring,
 // middleware/...) call validation.X.Add(1) without a build-tag guard at
@@ -37,6 +39,14 @@ var (
 	IouringZCCompletionWithPendingWrite Counter
 	IouringSendZCFallbacks              Counter
 )
+
+// SetZCNotifDelay is the production no-op: the celeris#587 SEND_ZC
+// window widener exists only under -tags=validation (zc_window.go).
+func SetZCNotifDelay(time.Duration) {}
+
+// ZCNotifDelay is the production no-op. It is called from the io_uring
+// worker's SEND_ZC notification branch and inlines to nothing here.
+func ZCNotifDelay() {}
 
 // Snapshot returns the zero value in production builds — no counters
 // exist and no socket is served. Kept defined so observe.Snapshot can
