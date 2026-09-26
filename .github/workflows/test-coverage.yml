@@ -1,0 +1,144 @@
+# Coverage: runs the unit suites of ci.yml's `unit` job -- the same packages,
+# the same exclusions, -race, and the runner's own memlock -- with a coverage
+# profile per module, and uploads each module to Codecov as its own flag
+# (celeris#690). It is informational: codecov.yml marks every status
+# informational, and this workflow is not a required check.
+#
+# It is a separate workflow rather than new steps in ci.yml on purpose:
+# ci.yml's unit steps are held by PASS-count interlocks and edited by
+# in-flight pull requests. The cost is that the unit suites run twice per
+# push; GitHub-hosted minutes are free for public repositories.
+#
+# What is NOT in the profile, and why (so a low number is read correctly):
+# ./test/... (integration/spec harness, not library code), ./adaptive/...
+# (needs raised memlock; ci.yml's `adaptive` job), and all of
+# ./middleware/websocket except its backpressure tests (ci.yml runs only
+# those on GitHub-hosted runners). ./engine/iouring runs at the runner's
+# 8 MiB memlock, where io_uring gets one worker, so its multi-worker paths
+# read as uncovered here although the goceleris/probatorium cluster runs
+# them. Coverage is per package (no -coverpkg), as `go test` reports it.
+#
+# (The file is test-coverage.yml, not coverage.yml: .gitignore ignores
+# `coverage.*` for local coverage output.)
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  coverage:
+    name: Coverage (root + middleware sub-modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A fork pull request gets no OIDC token; its uploads go tokenless instead
+    # (the use_oidc expression below), which Codecov accepts for public repos.
+    permissions:
+      contents: read # checkout
+      id-token: write # Codecov upload over OIDC, so no CODECOV_TOKEN secret is stored
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+
+      - name: Root module (ci.yml unit package set)
+        run: |
+          echo "memlock (KiB): $(ulimit -l)"
+          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+          # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
+          go test -race -count=1 -timeout=300s -covermode=atomic \
+            -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
+      - name: middleware/websocket (backpressure tests, as ci.yml runs them)
+        env:
+          WS484_CONNS: "16"
+          WS484_BURSTS: "2"
+          WS484_BURST_FRAMES: "1000"
+        run: |
+          go test -race -count=1 -timeout=120s -covermode=atomic \
+            -coverprofile="$RUNNER_TEMP/cover-websocket.out" \
+            -run '^TestBackpressure' ./middleware/websocket/...
+      - name: middleware/compress
+        working-directory: middleware/compress
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-compress.out" ./...
+      - name: middleware/metrics
+        working-directory: middleware/metrics
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-metrics.out" ./...
+      - name: middleware/otel
+        working-directory: middleware/otel
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-otel.out" ./...
+      - name: middleware/protobuf
+        working-directory: middleware/protobuf
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-protobuf.out" ./...
+
+      # An empty profile is absent, never a pass: every file must hold the
+      # mode line plus at least one counted block, or nothing is uploaded.
+      - name: Every profile is non-empty
+        run: |
+          fail=0
+          for m in root websocket compress metrics otel protobuf; do
+            f="$RUNNER_TEMP/cover-$m.out"
+            blocks=0
+            [ -f "$f" ] && blocks=$(grep -vc '^mode: ' "$f" || true)
+            echo "cover-$m.out: $blocks blocks"
+            [ "$blocks" -gt 0 ] || fail=1
+          done
+          exit "$fail"
+
+      - name: Upload root
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-root.out,${{ runner.temp }}/cover-websocket.out
+          flags: root
+          name: root
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Upload middleware/compress
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-compress.out
+          flags: compress
+          name: compress
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Upload middleware/metrics
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-metrics.out
+          flags: metrics
+          name: metrics
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Upload middleware/otel
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-otel.out
+          flags: otel
+          name: otel
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Upload middleware/protobuf
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-protobuf.out
+          flags: protobuf
+          name: protobuf
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
