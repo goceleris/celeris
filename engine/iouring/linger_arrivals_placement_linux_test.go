@@ -445,12 +445,13 @@ func TestLingerArrivalsReachTheIncomingEngine(t *testing.T) {
 	// was still running. With nothing accepted there is nothing to order,
 	// and ADMIT has already said so.
 	if acceptedHere > 0 && !placedEarly {
-		t.Errorf("celeris662 LINGERPLACE ORDER: %d of the %d connections this engine accepted during "+
-			"its own pause linger had not reached the incoming engine when the first outgoing listener "+
-			"closed. The drain was set more than a second before that close; a drain that only moves them "+
-			"once the linger is over leaves the engine a switch is leaving holding them for the whole "+
-			"linger, which is the placement celeris#657 is about",
-			missingAtClose, acceptedHere)
+		t.Errorf("celeris662 LINGERPLACE ORDER: the first outgoing listener was seen closed before all %d "+
+			"connections this engine accepted during its own pause linger had reached the incoming engine "+
+			"(%d still missing at that poll; 0 means they had all arrived by then, but so had the "+
+			"close). The drain was set more than a second before the close; a drain that only "+
+			"moves them once the linger is over leaves the engine a switch is leaving holding them for "+
+			"the whole linger, which is the placement celeris#657 is about",
+			acceptedHere, missingAtClose)
 	}
 
 	// PLACE (celeris#657): and the outgoing engine holds none of them.
