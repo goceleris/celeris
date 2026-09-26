@@ -57,6 +57,94 @@ type driverConn struct {
 	inflightOps  int
 	closePending bool // cancel-CQE arrived; waiting for in-flight ops to settle
 	closeErr     error
+
+	// dupFD is the engine's own descriptor for the socket, and the one the
+	// close path cancels by (celeris#691). IORING_ASYNC_CANCEL_FD names its
+	// target by descriptor number, and the kernel resolves the number when
+	// the worker issues the SQE, which is after UnregisterConn has returned.
+	// Every in-tree driver closes fd right after UnregisterConn, so by then
+	// the number names nothing (-EBADF) or, once reused, another file. The
+	// RECV already armed on this socket holds its own reference and stays
+	// armed: inflightOps never drains, onClose never fires, and the socket
+	// is never closed. A duplicate names the same open file for as long as
+	// the engine holds it. It is taken while fd is still the caller's, by
+	// UnregisterConn before it returns or by failDriverConn before the
+	// caller has unregistered, and closed by retire. Guarded by mu, and
+	// meaningful only while hasDup is set (a zero dupFD is descriptor 0).
+	dupFD  int
+	hasDup bool
+	// fdGone: fd no longer named the registered socket when the duplicate
+	// was taken (it was closed before UnregisterConn, which is outside the
+	// contract). No cancel is issued by descriptor then: it would miss, or
+	// cancel another file's ops.
+	fdGone bool
+	// dev and ino identify the file fd named at RegisterConn (identOK when
+	// fstat succeeded). A duplicate that names another file is refused.
+	dev, ino uint64
+	identOK  bool
+	// retired: dc has left the worker (finalized, refused by armDriverRecv,
+	// or dropped by shutdownDrivers). Set with closing, under mu. No cancel
+	// is issued and no duplicate is taken after it.
+	retired bool
+}
+
+// holdDupLocked takes dc's duplicate descriptor if it holds none yet
+// (celeris#691). dc.mu must be held, and fd must still be the caller's:
+// UnregisterConn calls it before it returns, and failDriverConn before the
+// caller has unregistered. A duplicate that names another file than the one
+// registered means fd was closed and its number reused: it is dropped, and
+// dc is marked fdGone.
+func (dc *driverConn) holdDupLocked() {
+	if dc.hasDup || dc.fdGone || dc.retired {
+		return
+	}
+	nfd, err := unix.FcntlInt(uintptr(dc.fd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		// EBADF: fd is already closed. Any other error (EMFILE) leaves the
+		// close path cancelling by fd, as it did before celeris#691.
+		dc.fdGone = errors.Is(err, unix.EBADF)
+		return
+	}
+	if dc.identOK {
+		var st unix.Stat_t
+		if unix.Fstat(nfd, &st) != nil || st.Dev != dc.dev || st.Ino != dc.ino {
+			_ = unix.Close(nfd)
+			dc.fdGone = true
+			return
+		}
+	}
+	dc.dupFD, dc.hasDup = nfd, true
+}
+
+// cancelTargetLocked returns the descriptor the close path may cancel dc's
+// in-flight ops by, or false when there is none: dc is retired, or no
+// descriptor of the engine's names its socket. dc.mu must be held.
+func (dc *driverConn) cancelTargetLocked() (int, bool) {
+	switch {
+	case dc.retired || dc.fdGone:
+		return -1, false
+	case dc.hasDup:
+		return dc.dupFD, true
+	default:
+		// No duplicate could be taken (EMFILE): cancel by fd, as before.
+		return dc.fd, true
+	}
+}
+
+// retire marks dc as gone from the worker and closes its duplicate. Every
+// path that removes dc from driverConns calls it, on the worker goroutine:
+// finalizeDriver, armDriverRecv's refusal and shutdownDrivers. Setting
+// closing too makes a later UnregisterConn or Write a no-op, so neither can
+// take a duplicate nobody would close, or queue work for a conn that is gone.
+func (dc *driverConn) retire() {
+	dc.mu.Lock()
+	dc.closing = true
+	dc.retired = true
+	if dc.hasDup {
+		_ = unix.Close(dc.dupFD)
+		dc.hasDup = false
+	}
+	dc.mu.Unlock()
 }
 
 // driverAction is one pending driver-side action to be applied by the worker
@@ -141,6 +229,10 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	if fd < len(w.conns) && w.conns[fd] != nil {
 		return fmt.Errorf("celeris/iouring: fd %d is already an HTTP connection", fd)
 	}
+	// Which file fd names now, so the duplicate UnregisterConn takes can be
+	// checked against it (celeris#691). Outside driverMu: it is a syscall.
+	var st unix.Stat_t
+	identOK := unix.Fstat(fd, &st) == nil
 	w.driverMu.Lock()
 	// Re-check under the lock: the worker goroutine may have accepted an
 	// HTTP conn on this fd between the first check and the lock acquisition.
@@ -161,6 +253,10 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 		onRecv:  onRecv,
 		onClose: onClose,
 		buf:     make([]byte, driverRecvBufSize),
+		identOK: identOK,
+	}
+	if identOK {
+		dc.dev, dc.ino = st.Dev, st.Ino
 	}
 	w.driverConns[fd] = dc
 	w.hasDriverConns.Store(true)
@@ -172,7 +268,10 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 
 // UnregisterConn cancels any in-flight RECV/SEND on fd and triggers onClose
 // once pending operations settle. The caller is responsible for closing the
-// underlying fd.
+// underlying fd, and may close it as soon as UnregisterConn returns, without
+// waiting for onClose: the worker issues the cancel later, against a
+// duplicate of fd taken here (celeris#691). fd must still be open when
+// UnregisterConn is called; see [engine.WorkerLoop].
 func (w *Worker) UnregisterConn(fd int) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
@@ -186,6 +285,8 @@ func (w *Worker) UnregisterConn(fd int) error {
 		return nil
 	}
 	dc.closing = true
+	// Here, on the caller's goroutine, before the caller can close fd.
+	dc.holdDupLocked()
 	dc.mu.Unlock()
 	w.addDriverAction(driverAction{kind: driverActionUnregister, dc: dc})
 	return nil
@@ -282,6 +383,9 @@ func (w *Worker) armDriverRecv(dc *driverConn) {
 			w.hasDriverConns.Store(false)
 		}
 		w.driverMu.Unlock()
+		// An UnregisterConn queued behind this register may already hold a
+		// duplicate; nothing else would close it.
+		dc.retire()
 		cb := dc.onClose
 		dc.onClose = nil
 		if cb != nil {
@@ -344,16 +448,35 @@ func (w *Worker) flushDriverSend(dc *driverConn) {
 }
 
 // cancelDriverConn submits an ASYNC_CANCEL targeting all in-flight ops on the
-// driver FD. The cancel CQE arrives as a driver CQE (via the udDriverClose
-// user-data on the cancel SQE itself), at which point we finalize teardown.
+// driver's socket, by the duplicate UnregisterConn took (celeris#691): the
+// caller may have closed fd since. The cancel CQE arrives as a driver CQE
+// (via the udDriverClose user-data on the cancel SQE itself), at which point
+// we finalize teardown.
 func (w *Worker) cancelDriverConn(dc *driverConn) {
+	dc.mu.Lock()
+	target, ok := dc.cancelTargetLocked()
+	retired := dc.retired
+	dc.mu.Unlock()
+	if retired {
+		// Finalized, refused or dropped while this action was queued. Its
+		// descriptors may be closed and their numbers reused: issue nothing.
+		return
+	}
+	if !ok {
+		// fd was closed before UnregisterConn, outside the contract. No
+		// descriptor names the socket, so nothing can cancel the ops armed
+		// on it; they complete when the peer sends or closes. Mark the close
+		// pending, as the cancel CQE would, so that completion finalizes.
+		w.settleDriverClose(dc)
+		return
+	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
 		// Retry on the next event loop iteration.
 		w.addDriverAction(driverAction{kind: driverActionUnregister, dc: dc})
 		return
 	}
-	prepCancelFDDriver(sqe, dc.fd)
+	prepCancelFDDriver(sqe, target)
 	setSQEUserData(sqe, encodeUserData(udDriverClose, dc.fd))
 	// If no in-flight ops, the ASYNC_CANCEL completes with -ENOENT and we
 	// still route through handleDriverClose to fire onClose and clean up.
@@ -469,6 +592,12 @@ func (w *Worker) handleDriverClose(fd int) {
 	if dc == nil {
 		return
 	}
+	w.settleDriverClose(dc)
+}
+
+// settleDriverClose finalizes dc if none of its ops is in flight, and
+// otherwise marks the close pending so the last op's CQE finalizes it.
+func (w *Worker) settleDriverClose(dc *driverConn) {
 	dc.mu.Lock()
 	if dc.inflightOps > 0 {
 		dc.closePending = true
@@ -502,9 +631,19 @@ func (w *Worker) failDriverConn(dc *driverConn, err error) {
 		if dc.closeErr == nil {
 			dc.closeErr = err
 		}
+		// This cancel is submitted later too, and a caller that unregisters
+		// and closes fd before then would make it miss (celeris#691). Unless
+		// UnregisterConn already holds one, take the duplicate now: the
+		// caller has not unregistered, so fd is still its socket.
+		dc.holdDupLocked()
+		target, ok := dc.cancelTargetLocked()
 		dc.mu.Unlock()
+		if !ok {
+			// closePending is set: the ops' own CQEs finalize.
+			return
+		}
 		if sqe := w.getCancelSQE(); sqe != nil {
-			prepCancelFDDriver(sqe, dc.fd)
+			prepCancelFDDriver(sqe, target)
 			setSQEUserData(sqe, encodeUserData(udDriverClose, dc.fd))
 		}
 		return
@@ -544,17 +683,14 @@ func (w *Worker) shutdownDrivers() {
 	w.driverMu.Unlock()
 
 	for _, dc := range conns {
-		dc.mu.Lock()
-		if dc.closing {
-			dc.mu.Unlock()
-			// closing was set by UnregisterConn; the cancel-CQE path will
-			// fire onClose. But the ring is being torn down, so fire it
-			// here as a fallback — finalizeDriver's map check guards
-			// against double-fire.
-		} else {
-			dc.closing = true
-			dc.mu.Unlock()
-		}
+		// If UnregisterConn got here first, the cancel-CQE path would have
+		// fired onClose, but the ring is being torn down, so it fires here
+		// instead; finalizeDriver's map check guards against double-fire.
+		// retire also closes the duplicate UnregisterConn took (celeris#691):
+		// nothing is submitted after this point, so no SQE can still carry
+		// its number, and closing the ring later in shutdown() cancels the
+		// ops armed on the socket.
+		dc.retire()
 		cb := dc.onClose
 		dc.onClose = nil
 		if cb != nil {
@@ -564,7 +700,10 @@ func (w *Worker) shutdownDrivers() {
 }
 
 // finalizeDriver removes dc from the driver map, flips the gate if the map
-// is now empty, and fires the onClose callback exactly once.
+// is now empty, closes the duplicate descriptor, and fires the onClose
+// callback exactly once. The duplicate goes first: a caller that closed fd
+// after UnregisterConn has let go of the socket, and with the duplicate
+// closed and no op in flight, the peer sees it close before onClose runs.
 func (w *Worker) finalizeDriver(dc *driverConn, err error) {
 	w.driverMu.Lock()
 	if existing, ok := w.driverConns[dc.fd]; !ok || existing != dc {
@@ -577,6 +716,7 @@ func (w *Worker) finalizeDriver(dc *driverConn, err error) {
 	}
 	w.driverMu.Unlock()
 
+	dc.retire()
 	cb := dc.onClose
 	dc.onClose = nil
 	if cb != nil {

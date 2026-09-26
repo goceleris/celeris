@@ -70,6 +70,15 @@ type WorkerLoop interface {
 	// UnregisterConn removes fd from the worker's interest set and triggers
 	// the onClose callback (with a nil error) after any in-flight operations
 	// complete. The caller is responsible for closing the fd itself.
+	//
+	// fd must still be open when UnregisterConn is called. The caller may
+	// close it as soon as UnregisterConn returns, without waiting for
+	// onClose. Closing fd before calling UnregisterConn is outside this
+	// contract: by then its number may name another file, and the engine
+	// cannot tell. The epoll engine would remove whatever the number names
+	// from its interest set. The io_uring engine finds no descriptor for the
+	// socket, so it cancels nothing, and onClose waits until the peer sends
+	// or closes (celeris#691).
 	UnregisterConn(fd int) error
 	// Write enqueues data for transmission on fd. The call does not block on
 	// the kernel send buffer: data is buffered and flushed asynchronously by
