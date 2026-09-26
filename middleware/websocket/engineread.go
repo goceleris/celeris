@@ -239,7 +239,7 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 //
 //   - pausedMu is an unexported field of an unexported type in this package,
 //     so only this package can acquire it, and it does so in exactly two
-//     places (here and Read's resume branch below).
+//     places (here and resumeIfDrained, Read's resume branch).
 //   - the engine packages do not import middleware/websocket at all, so no
 //     detachQMu holder can reach either of those two places.
 //   - every detachQMu critical section in both engines is a straight-line
@@ -253,8 +253,13 @@ func (r *chanReader) requestPause() {
 		return
 	}
 	r.pausedMu.Lock()
+	// Deferred, not a plain Unlock after the callbacks: a callback that
+	// panics would skip that Unlock, and a caller that recovers the panic
+	// would leave pausedMu held for good — blocking every later resume check
+	// in Read and the next high-water crossing here, on the engine worker
+	// thread.
+	defer r.pausedMu.Unlock()
 	if r.pausedState {
-		r.pausedMu.Unlock()
 		return
 	}
 	r.pausedState = true
@@ -279,7 +284,20 @@ func (r *chanReader) requestPause() {
 		r.pausedState = false
 		r.resume()
 	}
-	r.pausedMu.Unlock()
+}
+
+// resumeIfDrained is Read's edge-triggered resume: once the depth has fallen
+// to lowWater it lifts the pause, deciding and applying under pausedMu for
+// the reason and in the lock order documented on requestPause
+// (celeris#667). The unlock is deferred for the same reason as there: a
+// resume callback that panics must not leave pausedMu held.
+func (r *chanReader) resumeIfDrained() {
+	r.pausedMu.Lock()
+	defer r.pausedMu.Unlock()
+	if r.pausedState && len(r.ch) <= r.lowWater {
+		r.pausedState = false
+		r.resume()
+	}
 }
 
 // refillFromSpill moves spilled chunks into the channel's tail while there
@@ -356,17 +374,7 @@ func (r *chanReader) Read(p []byte) (int, error) {
 		// while chunks are still spilled — the buffer is over-full, which
 		// is the opposite of the drained condition resume signals.
 		if r.resume != nil && !r.hasSpill() {
-			r.pausedMu.Lock()
-			if r.pausedState && len(r.ch) <= r.lowWater {
-				r.pausedState = false
-				// Applied under pausedMu, for the reason and in the lock
-				// order documented on requestPause (celeris#667): the
-				// engine must observe pauses and resumes in the order they
-				// were decided, or the last one to arrive wins and the
-				// connection is left permanently paused.
-				r.resume()
-			}
-			r.pausedMu.Unlock()
+			r.resumeIfDrained()
 		}
 	}
 	n := copy(p, r.cur)
