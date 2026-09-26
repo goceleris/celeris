@@ -475,8 +475,13 @@ jobs:
           fi
 
   zc-window:
-    name: io_uring SEND_ZC window under -race, with its detector control (celeris#587)
-    runs-on: ubuntu-latest
+    name: io_uring SEND_ZC window under -race, with its detector control (celeris#587, ${{ matrix.os }})
+    # Both arches: the detector control must hold on arm64 as on x86.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
