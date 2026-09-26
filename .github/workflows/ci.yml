@@ -486,21 +486,24 @@ jobs:
         with:
           go-version: "1.27.0"
       # TestSendZCWindowGuardUnderRace holds the SEND_ZC first-CQE -> NOTIF
-      # window open (validation.SetZCNotifDelay, -tags=validation only) while
+      # window open (validation.SetZCWindowHold, -tags=validation only) while
       # a 64 KiB echo keeps the detached handler writing, and requires the
       # inline-egress guard to decline inside that window at least once.
       # Neither the root race step (no validation tag, ./middleware/websocket
       # excluded) nor the websocket step (-run '^TestBackpressure') reaches it.
       #
-      # Three runs, each tallied on its own "--- PASS:" / "--- FAIL:" lines
-      # (a SKIP is a failure: CELERIS_REQUIRE_IOURING_WORKERS=1):
-      #   1. the tree as committed: must PASS, race-clean;
-      #   2. CELERIS_IOURING_SEND_ZC=off: must PASS with every ZC witness at 0
+      # Three arms, each run N=3 times as SEPARATE processes (the race
+      # detector reports a given race once per process) and tallied on the
+      # "--- PASS:" / "--- FAIL:" lines (a SKIP is a failure:
+      # CELERIS_REQUIRE_IOURING_WORKERS=1):
+      #   1. the tree as committed: 3/3 PASS, race-clean;
+      #   2. CELERIS_IOURING_SEND_ZC=off: 3/3 PASS with every ZC witness at 0
       #      (the witnesses track SEND_ZC, not traffic);
       #   3. the MUTANT (.github/scripts/mutant-587-unlock-zc-first-cqe.py
       #      deletes the detachMu acquire in handleSend's CQE_F_MORE branch):
-      #      must FAIL with a "WARNING: DATA RACE" report. This is what makes
-      #      run 1 evidence: it proves the race detector watches this path.
+      #      3/3 FAIL with a "WARNING: DATA RACE" report. This is what makes
+      #      arm 1 evidence: it proves the race detector watches this path,
+      #      every time, not by luck.
       # memlock is raised for the same reason as the `iouring` job: io_uring
       # workers need 12 MiB each and the runner defaults to 8 MiB.
       - name: SEND_ZC window test, ZC-off branch control and the detachMu mutant
@@ -511,13 +514,17 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          run() { # label, then env assignments
+          run() { # label, then env assignments; N separate processes
             local label=$1; shift
-            local rc=0
-            env "$@" go test -tags=validation -race -count=1 -timeout=300s -v \
-              -run '^TestSendZCWindowGuardUnderRace$' ./middleware/websocket/ \
-              > "/tmp/zc587-$label.log" 2>&1 || rc=$?
-            echo "$label rc=$rc"
+            local i rc
+            : > "/tmp/zc587-$label.log"
+            for i in 1 2 3; do
+              rc=0
+              env "$@" go test -tags=validation -race -count=1 -timeout=300s -v \
+                -run '^TestSendZCWindowGuardUnderRace$' ./middleware/websocket/ \
+                >> "/tmp/zc587-$label.log" 2>&1 || rc=$?
+              echo "$label run $i rc=$rc"
+            done
             grep -E 'ZCWIN|^--- (PASS|FAIL|SKIP): TestSendZCWindowGuardUnderRace' "/tmp/zc587-$label.log" || true
           }
           tally() { # label pass-want fail-want race-want(0|1)
@@ -534,16 +541,16 @@ jobs:
             if [ "$4" -eq 0 ] && [ "$r" -ne 0 ]; then echo "$1: unexpected DATA RACE report"; return 1; fi
             return 0
           }
-          run fixed CELERIS587_ZC_NOTIF_DELAY=2ms
-          run zcoff CELERIS587_ZC_NOTIF_DELAY=2ms CELERIS_IOURING_SEND_ZC=off
+          run fixed CELERIS587_ZC_WINDOW_HOLD=2ms
+          run zcoff CELERIS587_ZC_WINDOW_HOLD=2ms CELERIS_IOURING_SEND_ZC=off
           python3 .github/scripts/mutant-587-unlock-zc-first-cqe.py
-          run mutant CELERIS587_ZC_NOTIF_DELAY=2ms
+          run mutant CELERIS587_ZC_WINDOW_HOLD=2ms
           git checkout -- engine/iouring/worker.go
           grep -A30 'WARNING: DATA RACE' /tmp/zc587-mutant.log | head -60 || true
           ok=0
-          tally fixed 1 0 0 || ok=1
-          tally zcoff 1 0 0 || ok=1
-          tally mutant 0 1 1 || ok=1
+          tally fixed 3 0 0 || ok=1
+          tally zcoff 3 0 0 || ok=1
+          tally mutant 0 3 1 || ok=1
           exit "$ok"
 
   conformance:

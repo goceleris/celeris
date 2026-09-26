@@ -23,10 +23,15 @@ package websocket
 //     that reports nothing is only evidence if the same run reports a race
 //     when the synchronisation is removed.
 //
-// This test fixes (1) with validation.SetZCNotifDelay, which holds the
-// window open on the worker thread, lock-free, for zcWinDelay (the NIC
+// This test fixes (1) with validation.SetZCWindowHold, which holds the
+// worker right after it has recorded a first completion and released
+// cs.detachMu, before it releases anything else, for zcWinDelay (the NIC
 // DMA latency loopback lacks), while a full-duplex 64 KiB echo keeps the
-// handler goroutine writing through `guarded` the whole time. It asserts
+// handler goroutine writing through `guarded` the whole time. Where the
+// hold sits matters for (2): where the window opens on its own, the worker's
+// per-iteration flush releases cs.detachMu between the first completion and
+// the dispatch goroutine's read, which orders the two for the detector
+// whether or not the first completion took the lock. It asserts
 // the window was entered (the guard declined the fast path with a
 // notification outstanding) and that every echoed byte came back intact
 // and in order. Run under -race it is also the detector control for (2):
@@ -37,7 +42,7 @@ package websocket
 //
 // Arms, all read from the environment so one binary serves every run:
 //
-//	CELERIS587_ZC_NOTIF_DELAY  window hold (default 2ms). "0" is the
+//	CELERIS587_ZC_WINDOW_HOLD  window hold (default 2ms). "0" is the
 //	                           natural-window arm: the counts are logged,
 //	                           the guard is not required to fire.
 //	CELERIS_IOURING_SEND_ZC=off  branch control: no ZC send may be armed,
@@ -78,7 +83,7 @@ const (
 
 func zcWinDelay(t *testing.T) time.Duration {
 	t.Helper()
-	v := os.Getenv("CELERIS587_ZC_NOTIF_DELAY")
+	v := os.Getenv("CELERIS587_ZC_WINDOW_HOLD")
 	if v == "" {
 		return zcWinDefaultDelay
 	}
@@ -87,7 +92,7 @@ func zcWinDelay(t *testing.T) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d < 0 {
-		t.Fatalf("CELERIS587_ZC_NOTIF_DELAY=%q: want a Go duration >= 0", v)
+		t.Fatalf("CELERIS587_ZC_WINDOW_HOLD=%q: want a Go duration >= 0", v)
 	}
 	return d
 }
@@ -129,8 +134,8 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 	}
 	policyOff := zcPolicyOff()
 	delay := zcWinDelay(t)
-	validation.SetZCNotifDelay(delay)
-	defer validation.SetZCNotifDelay(0)
+	validation.SetZCWindowHold(delay)
+	defer validation.SetZCWindowHold(0)
 
 	cfg := Config{Handler: func(c *Conn) {
 		for {
@@ -254,6 +259,6 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		t.Errorf("ZC notifications %d != submits %d after settle: a SEND_ZC never completed", notifs, submits)
 	}
 	if delay > 0 && blocked == 0 {
-		t.Fatalf("the inline-egress guard never declined with a SEND_ZC notification outstanding although the window was held open %s per notification over %d notifications: the test did not exercise the window it exists for", delay, notifs)
+		t.Fatalf("the inline-egress guard never declined with a SEND_ZC notification outstanding although the window was held open %s after each of %d first completions: the test did not exercise the window it exists for", delay, notifs)
 	}
 }

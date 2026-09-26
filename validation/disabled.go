@@ -40,13 +40,16 @@ var (
 	IouringSendZCFallbacks              Counter
 )
 
-// SetZCNotifDelay is the production no-op: the celeris#587 SEND_ZC
-// window widener exists only under -tags=validation (zc_window.go).
-func SetZCNotifDelay(time.Duration) {}
+// Enabled is false in production: code guarded by it compiles away.
+const Enabled = false
 
-// ZCNotifDelay is the production no-op. It is called from the io_uring
-// worker's SEND_ZC notification branch and inlines to nothing here.
-func ZCNotifDelay() {}
+// SetZCWindowHold is the production no-op: the celeris#587 SEND_ZC
+// window hold exists only under -tags=validation (zc_window.go).
+func SetZCWindowHold(time.Duration) {}
+
+// ZCWindowHold is the production no-op. Its io_uring call sites are also
+// guarded by the false Enabled constant, so they compile away entirely.
+func ZCWindowHold() {}
 
 // Snapshot returns the zero value in production builds — no counters
 // exist and no socket is served. Kept defined so observe.Snapshot can

@@ -1242,6 +1242,15 @@ func (w *Worker) run(ctx context.Context) {
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleSend(entry, fd, now)
+						// celeris#587, validation builds only (validation.Enabled
+						// is a false constant otherwise, so this compiles away):
+						// hold the SEND_ZC first-CQE -> NOTIF window open right
+						// after handleSend has recorded the first completion and
+						// released cs.detachMu, before anything else is released
+						// (validation.SetZCWindowHold).
+						if validation.Enabled && cqeHasMore(entry.Flags) {
+							validation.ZCWindowHold()
+						}
 						// #383 reverse: io_uring flushes the response
 						// asynchronously, so the clean, fully-flushed boundary
 						// is reached HERE (send completed) — not at udRecv where
@@ -1659,6 +1668,11 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleSend(c, fd, now)
+		// celeris#587: the same validation-only window hold as the inlined
+		// dispatch; compiles away in production.
+		if validation.Enabled && cqeHasMore(c.Flags) {
+			validation.ZCWindowHold()
+		}
 		if w.transplant.Load() != nil {
 			w.tryTransplant(fd)
 		}
@@ -3138,13 +3152,6 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
 	// Now safe to modify/reuse sendBuf. Process the deferred result.
 	if cqeIsNotif(c.Flags) {
-		// celeris#587: a no-op outside -tags=validation (it inlines to
-		// nothing). Under the tag a test can hold the first-CQE -> NOTIF
-		// window open here, with no lock held, so the inline-egress guard
-		// and the race detector see the interleaving a NIC's DMA latency
-		// produces and loopback's copy fallback does not
-		// (validation.SetZCNotifDelay).
-		validation.ZCNotifDelay()
 		// celeris#591: one atomic per NOTIF. Reached only on the ZC path —
 		// a plain SEND never produces a CQE_F_NOTIF completion.
 		w.zc.noteNotif()

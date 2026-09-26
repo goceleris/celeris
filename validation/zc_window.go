@@ -7,42 +7,51 @@ import (
 	"time"
 )
 
-// zcNotifDelayNanos is the celeris#587 window widener. See [ZCNotifDelay].
-var zcNotifDelayNanos atomic.Int64
+// zcWindowHoldNanos is the celeris#587 window hold. See [ZCWindowHold].
+var zcWindowHoldNanos atomic.Int64
 
-// SetZCNotifDelay makes every io_uring worker pause for d before it
-// processes a SEND_ZC notification completion (CQE_F_NOTIF); d <= 0
-// turns the pause off. It exists for one measurement only (celeris#587)
-// and is compiled in only under -tags=validation: the production stub in
-// disabled.go is an empty function, so the call site in the engine's
-// NOTIF branch inlines to nothing.
+// Enabled is true in a -tags=validation build and false (a constant, so
+// guarded code compiles away) in production (disabled.go).
+const Enabled = true
+
+// SetZCWindowHold makes every io_uring worker pause for d right after its
+// handleSend has recorded a SEND_ZC first completion (CQE_F_MORE:
+// cs.zcNotifPending set, cs.detachMu released on return) and before it
+// does anything else; d <= 0 turns the pause off. It exists for one
+// measurement only (celeris#587) and is compiled in only under
+// -tags=validation: in production the call sites are guarded by the false
+// Enabled constant and compile away.
 //
-// Why it is needed. Between the first completion of a SEND_ZC (the
-// kernel has queued the bytes, CQE_F_MORE set, cs.zcNotifPending = true)
-// and its notification (the kernel has released the pinned buffer,
-// cs.zcNotifPending = false) the detached inline-egress guard on the
-// dispatch goroutine must refuse the raw unix.Write fast path, and the
-// two goroutines hand cs.sending / cs.zcNotifPending to each other under
-// cs.detachMu. On loopback the kernel copies (IORING_NOTIF_USAGE_ZC_COPIED),
-// so the notification lands in the same completion batch as the first
-// completion and that window is a few hundred nanoseconds wide:
-// celeris#601 measured IouringInlineGuardBlockedZC == 0 on an unmodified
-// build. A race detector cannot judge an interleaving that never happens,
-// so the #587 test holds the window open for d, on the worker thread,
-// with no lock held, exactly where a real NIC's DMA latency would hold it
-// open. The window's state machine is unchanged: only its duration is.
-func SetZCNotifDelay(d time.Duration) {
+// Why it is needed. Between the first completion of a SEND_ZC (the kernel
+// has queued the bytes) and its notification (the kernel has released the
+// pinned buffer) the detached inline-egress guard on the dispatch goroutine
+// must refuse the raw unix.Write fast path; the two goroutines hand
+// cs.sending / cs.zcNotifPending to each other under cs.detachMu. Two
+// things hid that hand-off from the race detector:
+//
+//  1. On loopback the kernel copies (IORING_NOTIF_USAGE_ZC_COPIED), so the
+//     window is a few hundred nanoseconds wide: celeris#601 measured
+//     IouringInlineGuardBlockedZC == 0 on an unmodified build.
+//  2. Where the window does open naturally (the notification waits for a
+//     slow reader), the worker's own per-iteration flush takes and releases
+//     cs.detachMu before the dispatch goroutine reads, which orders the two
+//     accesses: -race cannot report a missing lock around the first
+//     completion then, whatever the code does (celeris#587 review 2).
+//
+// Holding the worker HERE -- after the first completion's writes and the
+// unlock, before any other release -- makes every guarded read during the
+// hold concurrent with those writes unless the lock is present. The
+// window's state machine is unchanged; only its duration is.
+func SetZCWindowHold(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
-	zcNotifDelayNanos.Store(int64(d))
+	zcWindowHoldNanos.Store(int64(d))
 }
 
-// ZCNotifDelay sleeps for the duration set by [SetZCNotifDelay], if any.
-// Called by the io_uring worker at the top of its SEND_ZC notification
-// branch, before it takes cs.detachMu.
-func ZCNotifDelay() {
-	if d := zcNotifDelayNanos.Load(); d > 0 {
+// ZCWindowHold sleeps for the duration set by [SetZCWindowHold], if any.
+func ZCWindowHold() {
+	if d := zcWindowHoldNanos.Load(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
 }
