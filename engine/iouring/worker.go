@@ -81,7 +81,8 @@ const bufRingCountMin = 1024
 const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (kernel PBUF_RING cap)
 
 // CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled provided-buffer-ring
-// size. Must be a power of 2 and at least bufRingCountMin. Use this when
+// size. A value that is not a power of 2 is rounded up to one, and the result
+// is clamped to [bufRingCountMin, bufRingCountMax]. Use this when
 // the default scaling formula under-provisions your workload — typically
 // the case for very-high-concurrency benchmarks (16k+ connections) where
 // each worker may have more in-flight multishot recvs than the formula
