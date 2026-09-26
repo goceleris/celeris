@@ -169,7 +169,8 @@ reviews:
           of those tests without updating that list turns CI red.
     - path: ".github/workflows/**"
       instructions: |
-        - Every `uses:` pinned to a full 40-character commit SHA with a `# vX.Y.Z` comment that matches it.
+        - Every `uses:` of another repository's action or workflow (`owner/repo@...`) pinned to a full 40-character
+          commit SHA with a `# vX.Y.Z` comment that matches it. A local `./path` action takes no ref.
         - Top-level `permissions` read-only; a job raises only what it needs, with a comment saying why.
         - actions/checkout with `persist-credentials: false`.
         - No `${{ }}` expression inside `run:`; pass values through `env:`.

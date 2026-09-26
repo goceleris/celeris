@@ -142,8 +142,10 @@ permissions:
 # One run per pull request: a new push cancels the one in flight, so a
 # burst of pushes costs one run. Pushes to main are never cancelled -- each
 # is a baseline -- but a burst still collapses to the newest pending one.
+# Every dispatch gets a group of its own, so the backtests CodSpeed
+# dispatches together never cancel one another.
 concurrency:
-  group: codspeed-${{ github.event.pull_request.number || github.ref }}
+  group: codspeed-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.run_id) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

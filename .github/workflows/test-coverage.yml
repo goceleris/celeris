@@ -11,12 +11,16 @@
 #
 # What is NOT in the profile, and why (so a low number is read correctly):
 # ./test/... (integration/spec harness, not library code), ./adaptive/...
-# (needs raised memlock; ci.yml's `adaptive` job), and all of
-# ./middleware/websocket except its backpressure tests (ci.yml runs only
-# those on GitHub-hosted runners). ./engine/iouring runs at the runner's
-# 8 MiB memlock, where io_uring gets one worker, so its multi-worker paths
-# read as uncovered here although the goceleris/probatorium cluster runs
-# them. Coverage is per package (no -coverpkg), as `go test` reports it.
+# (needs raised memlock; ci.yml's `adaptive` job), and ./middleware/websocket.
+# ci.yml runs only websocket's backpressure tests on GitHub-hosted runners,
+# and those are timing-bound: under coverage instrumentation
+# TestBackpressurePauseDoesNotCancelInflightSend failed on both engines
+# (close-timeouts, write errors) on the same commit whose uninstrumented
+# `unit` job passed (celeris#699), so they are left to ci.yml. ./engine/iouring
+# runs at the runner's 8 MiB memlock, where io_uring gets one worker, so its
+# multi-worker paths read as uncovered here although the
+# goceleris/probatorium cluster runs them. Coverage is per package (no
+# -coverpkg), as `go test` reports it.
 #
 # (The file is test-coverage.yml, not coverage.yml: .gitignore ignores
 # `coverage.*` for local coverage output.)
@@ -56,20 +60,13 @@ jobs:
 
       - name: Root module (ci.yml unit package set)
         run: |
+          # A `go list` failure must stop the job, not hand grep a partial list.
+          set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
           go test -race -count=1 -timeout=300s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
-      - name: middleware/websocket (backpressure tests, as ci.yml runs them)
-        env:
-          WS484_CONNS: "16"
-          WS484_BURSTS: "2"
-          WS484_BURST_FRAMES: "1000"
-        run: |
-          go test -race -count=1 -timeout=120s -covermode=atomic \
-            -coverprofile="$RUNNER_TEMP/cover-websocket.out" \
-            -run '^TestBackpressure' ./middleware/websocket/...
       - name: middleware/compress
         working-directory: middleware/compress
         run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-compress.out" ./...
@@ -88,7 +85,7 @@ jobs:
       - name: Every profile is non-empty
         run: |
           fail=0
-          for m in root websocket compress metrics otel protobuf; do
+          for m in root compress metrics otel protobuf; do
             f="$RUNNER_TEMP/cover-$m.out"
             blocks=0
             [ -f "$f" ] && blocks=$(grep -vc '^mode: ' "$f" || true)
@@ -100,7 +97,7 @@ jobs:
       - name: Upload root
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          files: ${{ runner.temp }}/cover-root.out,${{ runner.temp }}/cover-websocket.out
+          files: ${{ runner.temp }}/cover-root.out
           flags: root
           name: root
           disable_search: true
