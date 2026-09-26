@@ -600,29 +600,15 @@ func TestDirtyPassSkipsAHijackedConn(t *testing.T) {
 	t.Cleanup(func() { _ = nc.Close() })
 
 	// The number is reissued to the WRITE end of a pipe, so a stray write
-	// lands where the test can read it.
-	var p [2]int
-	if err := unix.Pipe2(p[:], unix.O_CLOEXEC|unix.O_NONBLOCK); err != nil {
-		cs.detachMu.Unlock()
-		t.Fatalf("pipe2: %v", err)
-	}
-	t.Cleanup(func() { _ = unix.Close(p[0]) })
-	if _, err := unix.FcntlInt(uintptr(local), unix.F_GETFD, 0); err == nil {
-		cs.detachMu.Unlock()
-		t.Skipf("fd %d in use again before the test could take it", local)
-	}
-	if err := unix.Dup3(p[1], local, unix.O_CLOEXEC); err != nil {
-		cs.detachMu.Unlock()
-		t.Fatalf("dup3: %v", err)
-	}
-	_ = unix.Close(p[1])
-	t.Cleanup(func() { _ = unix.Close(local) })
+	// lands where the test can read it. pipe2 takes the lowest free numbers,
+	// so it usually takes the released one itself.
+	rd := reissueToPipeWriteEnd(t, local)
 
 	cs.detachMu.Unlock() // the handler returns
 	l.flushDirty()       // before the loop drains the hijack's notice
 
 	buf := make([]byte, 64)
-	if n, err := unix.Read(p[0], buf); n > 0 {
+	if n, err := unix.Read(rd, buf); n > 0 {
 		t.Fatalf("the dirty pass wrote %q to fd %d, which the hijack had released and another file now owns",
 			buf[:n], local)
 	} else if err != unix.EAGAIN {
@@ -675,4 +661,44 @@ func TestTwoQueueEntriesForAHijackedConnReachNoPooledConnState(t *testing.T) {
 	if l.connCount != 0 {
 		t.Errorf("connCount = %d, want 0", l.connCount)
 	}
+}
+
+// reissueToPipeWriteEnd makes fd — a number the test's hijack just released —
+// the write end of a new pipe, and returns the read end. pipe2 takes the
+// lowest free numbers, so it normally lands on fd itself; either end may.
+func reissueToPipeWriteEnd(t *testing.T, fd int) (readEnd int) {
+	t.Helper()
+	var p [2]int
+	if err := unix.Pipe2(p[:], unix.O_CLOEXEC|unix.O_NONBLOCK); err != nil {
+		t.Fatalf("pipe2: %v", err)
+	}
+	switch fd {
+	case p[1]:
+		// Already the write end.
+	case p[0]:
+		// The read end took it: keep a copy of the read end elsewhere,
+		// then put the write end on fd (dup3 closes the read end there).
+		rd, err := unix.FcntlInt(uintptr(p[0]), unix.F_DUPFD_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("dup read end: %v", err)
+		}
+		if err := unix.Dup3(p[1], fd, unix.O_CLOEXEC); err != nil {
+			t.Fatalf("dup3 write end onto %d: %v", fd, err)
+		}
+		_ = unix.Close(p[1])
+		p[0] = rd
+	default:
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			t.Fatalf("fd %d was reissued to something else before the test could take it", fd)
+		}
+		if err := unix.Dup3(p[1], fd, unix.O_CLOEXEC); err != nil {
+			t.Fatalf("dup3 write end onto %d: %v", fd, err)
+		}
+		_ = unix.Close(p[1])
+	}
+	t.Cleanup(func() {
+		_ = unix.Close(p[0])
+		_ = unix.Close(fd)
+	})
+	return p[0]
 }
