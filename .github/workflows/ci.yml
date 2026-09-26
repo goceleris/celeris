@@ -701,6 +701,28 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v -run '^TestAdaptiveSettledRouteRetime592$' . 2>&1 | tee /tmp/592.log
 
+  tmp684-592-raised-mut592:
+    name: THROWAWAY celeris#684 TestAdaptiveSettledRouteRetime592 (memlock raised, celeris#592 re-opener reverted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: TestAdaptiveSettledRouteRetime592, memlock raised, celeris#592 re-opener reverted
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          python3 .github/tmp684/mutate.py mut592
+          git diff --stat
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=600s -v -run '^TestAdaptiveSettledRouteRetime592$' . 2>&1 | tee /tmp/592.log
+
   tmp684-592-m8-require:
     name: THROWAWAY celeris#684 TestAdaptiveSettledRouteRetime592 (runner 8 MiB, CELERIS_REQUIRE_IOURING_WORKERS=1)
     runs-on: ubuntu-latest

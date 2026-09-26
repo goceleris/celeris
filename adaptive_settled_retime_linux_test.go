@@ -788,10 +788,9 @@ func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
 }
 
 // skipOrFailIOUring592 is the io_uring half's only way to skip. At a GitHub
-// runner's 8 MiB the three io_uring subtests skip in every CI step, and with
-// them the rig that pins celeris#593 (the io_uring timeout sweep blocking on a
-// slow async handler) on io_uring (celeris#684). A step that raises memlock
-// and sets CELERIS_REQUIRE_IOURING_WORKERS=1, as the `iouring` job does for
+// runner's 8 MiB the three io_uring subtests skip in every CI step
+// (celeris#684). A step that raises memlock and sets
+// CELERIS_REQUIRE_IOURING_WORKERS=1, as the `iouring` job does for
 // engine/iouring's own worker tests, turns the skip into a failure, so that
 // step cannot go green without running them.
 func skipOrFailIOUring592(t *testing.T, format string, args ...any) {
