@@ -224,9 +224,10 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 // appending goroutine and the draining goroutine reach the engine in the
 // OPPOSITE order from the one in which they decided. The engine's closures
 // are Swap-based and ignore the previous value — the early return skips only
-// the wakeup, never the state write (engine/iouring/worker.go:2200-2231,
-// engine/epoll/loop.go:1672-1703) — so whichever callback arrives last wins
-// outright and nothing reconciles. A resume could therefore be applied before
+// the wakeup, never the state write (the PauseRecv/ResumeRecv closures the
+// engines install on detach, in engine/iouring/worker.go and
+// engine/epoll/loop.go) — so whichever callback arrives last wins outright
+// and nothing reconciles. A resume could therefore be applied before
 // the pause it was meant to cancel, leaving the engine's recv paused while
 // this reader believed it was running. Nothing re-evaluates after that, so
 // the connection stopped delivering inbound data for the rest of its life.
@@ -259,6 +260,25 @@ func (r *chanReader) requestPause() {
 	r.pausedState = true
 	// Applied under pausedMu — see the lock-order note above.
 	r.pause()
+	// celeris#672: the pause above was decided from a depth SNAPSHOT taken in
+	// Append, before this function took pausedMu. If the handler drained to
+	// at-or-below lowWater in between, every resume check it made saw
+	// pausedState == false and did nothing, so the pause is already stale.
+	// When the drain reached empty, nothing can ever lift it: Read
+	// re-evaluates the resume only after a successful dequeue, the engine is
+	// paused so it delivers nothing, and the handler blocks in Read for the
+	// rest of the connection's life. Re-check the watermark here, under the
+	// same lock that applied the pause, and lift it at once if it is stale.
+	//
+	// Any dequeue that happens after this check is followed by a resume check
+	// in Read under pausedMu, which now sees pausedState == true, so the
+	// pause cannot go stale again once this critical section ends. The spill
+	// guard matches Read's: never resume while chunks are still queued behind
+	// the channel.
+	if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {
+		r.pausedState = false
+		r.resume()
+	}
 	r.pausedMu.Unlock()
 }
 
