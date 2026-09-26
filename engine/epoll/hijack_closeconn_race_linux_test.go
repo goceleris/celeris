@@ -26,10 +26,10 @@ import (
 // The loop-thread entry these tests use is the real one: checkTimeouts. It
 // calls closeConn directly with no async guard, and nothing refreshes
 // cs.lastActivity while a handler runs (it is written only at accept,
-// on read, and on adopt). drainRead's EOF and error branches — the
-// EPOLLRDHUP route the issue proposed — take detachMu BEFORE calling
-// closeConn, so they wait behind the handler and then re-read a cleared
-// slot; that is why the issue's own proposed repro would mostly pass.
+// on read, and on adopt). (When these tests were written, drainRead's EOF
+// and error branches — the EPOLLRDHUP route the issue proposed — took
+// detachMu BEFORE calling closeConn, so they waited behind the handler and
+// then re-read a cleared slot; since celeris#669 they do not wait at all.)
 //
 // The interleaving is pinned by a lock and an atomic rather than by timing:
 // closeConn stores cs.asyncClosed only AFTER capturing l.conns[fd] and
