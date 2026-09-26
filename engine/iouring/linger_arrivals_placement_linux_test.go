@@ -45,23 +45,37 @@ import (
 //	its one Broadcast per drain is what makes that goroutine re-evaluate
 //	(sweep.go, difference 3).
 //
-//	PHASE B -- served AFTER the drain was set. It joined the live set at
-//	the TAIL, past the sweep cursor, which is the case the cycle rule
-//	exists for (celeris#657 R2 MAJOR-1: wakeSweep records the arrival
-//	unconditionally, and a cycle with one may not go dormant). On this
-//	engine its own park claims it, so phase B is the weaker half here and
-//	phase A is what the control turns.
+//	PHASE B -- served AFTER the drain was set. It joins the live set past
+//	the sweep cursor, but this rig does NOT exercise the celeris#657 cycle
+//	rule (R2 MAJOR-1): its arrivals come 20 ms apart, each one re-wakes the
+//	sweep through wakeSweep, which clears dormancy whether or not it
+//	records the arrival, and on this engine phase B's own park claims it
+//	anyway. So phase B is the weaker half here and phase A is what the
+//	controls turn. With the rule removed (wakeSweep not recording the
+//	arrival) this test still passes; TestSweepCannotGoDormantWithAnUnexaminedArrival
+//	and TestSweepCostIsBoundedUnderContinuousArrivals, in this package and
+//	in engine/epoll, are the tests that fail then.
 //
 // The handler is ASYNC on purpose, the shape in which celeris#657 was
 // measured on a ramp. Both phases then go SILENT, which is the state that
 // produces no further completion at all.
 //
-// Controls, both of which must FAIL:
+// Placement is judged twice. PLACE: once every listener has closed, the
+// engine holds none of them. ORDER: they reach the incoming engine while
+// the linger is still RUNNING, i.e. before the first outgoing listener
+// closes. ORDER is what separates a drain that moves the linger's arrivals
+// from one that merely waits for the linger to end and moves them then;
+// PLACE alone cannot, because it starts looking at that end.
+//
+// Controls, each of which must FAIL:
 //   - the linger at 0 (celeris#662 off): the listeners close at once, no
 //     connection arrives at all, and ADMIT fires;
 //   - the sweep and the always-armed wake poll removed (celeris#657 P9/P10
 //     off): the phase A arrivals are accepted and served and then stay, and
-//     PLACE fires.
+//     PLACE fires;
+//   - a sweep that does nothing while this worker lingers: every arrival is
+//     still placed, phase A 1.5 s late, just after the close, and ORDER
+//     fires.
 //
 // It changes deferlinger's package-level hooks through the rig it shares, so
 // it does not run in parallel.
@@ -218,9 +232,12 @@ func arriveDuringLingerL674(t *testing.T, addr string, n int) (conns []net.Conn,
 // one that was dropped, because either way its client never gets an answer.
 type lingerServeTarget674 struct {
 	adopted atomic.Int64
-	mu      sync.Mutex
-	conns   []net.Conn
-	wg      sync.WaitGroup
+	// from records the client address of every adopted connection, stored
+	// before AdoptConn returns: the ORDER check reads it.
+	from  sync.Map
+	mu    sync.Mutex
+	conns []net.Conn
+	wg    sync.WaitGroup
 }
 
 func (s *lingerServeTarget674) AdoptConn(fd int, _ engine.Carryover) error {
@@ -230,6 +247,7 @@ func (s *lingerServeTarget674) AdoptConn(fd int, _ engine.Carryover) error {
 	if err != nil {
 		return nil // fd closed above; nothing for the source to reclaim
 	}
+	s.from.Store(c.RemoteAddr().String(), struct{}{})
 	s.adopted.Add(1)
 	s.mu.Lock()
 	s.conns = append(s.conns, c)
@@ -269,13 +287,59 @@ var _ engine.TransplantTarget = (*lingerServeTarget674)(nil)
 // rig's map is the witness that the lingering listener -- and not some other
 // socket -- took it.
 func acceptedHereL674(r *lingerRigL662, conns []net.Conn) int {
-	n := 0
+	return len(acceptedAddrsL674(r, conns))
+}
+
+// acceptedAddrsL674 returns the client addresses of those of conns this
+// engine itself accepted (see acceptedHereL674).
+func acceptedAddrsL674(r *lingerRigL662, conns []net.Conn) []string {
+	var out []string
 	for _, c := range conns {
-		if _, ok := r.accepted.Load(c.LocalAddr().String()); ok {
-			n++
+		a := c.LocalAddr().String()
+		if _, ok := r.accepted.Load(a); ok {
+			out = append(out, a)
 		}
 	}
-	return n
+	return out
+}
+
+// placedBeforeCloseL674 is the ORDER check. It polls until either every
+// address in want has been adopted by tgt while no outgoing listener had
+// closed (placed), or an outgoing listener has closed first, or bound has
+// passed. Each poll reads the adoption set FIRST and the listeners' closed
+// flags SECOND, and there is no time constant in the verdict: only the order
+// of two events.
+//
+// Why a drain that waits for the linger to end cannot pass: a worker stores
+// listenFDClosed at the top of the loop iteration that ends its linger (the
+// stepAcceptPause -> closeListenerAfterDrain close, then the flag store) and
+// runs its sweep LATER IN THAT SAME ITERATION; lingerUntil stays nonzero
+// through closeListenerAfterDrain's own completion handling and accept-queue
+// drain and is reset only after unix.Close. So a sweep that does nothing
+// while lingerUntil != 0 adopts a phase-A connection only after that
+// worker's flag is set, and a poll that has seen the adoption then reads the
+// flag as set. Unmutated, every adoption here completes more than a second
+// before the first close (measured in golang:1.27 containers, --cpus 4,
+// -race: last adoption +228-254 ms after BeginPauseAccept, first close
+// +1500 ms).
+func placedBeforeCloseL674(tgt *lingerServeTarget674, want []string, anyClosed func() bool, bound time.Duration) (placed bool, missing int) {
+	dl := time.Now().Add(bound)
+	for {
+		missing = 0
+		for _, a := range want {
+			if _, ok := tgt.from.Load(a); !ok {
+				missing++
+			}
+		}
+		closedNow := anyClosed()
+		switch {
+		case missing == 0 && !closedNow:
+			return true, 0
+		case closedNow, time.Now().After(dl):
+			return false, missing
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // TestLingerArrivalsReachTheIncomingEngine is the joint celeris#662 x
@@ -311,6 +375,21 @@ func TestLingerArrivalsReachTheIncomingEngine(t *testing.T) {
 	served := tallyA["200"] + tallyB["200"]
 	refused := refusedA + refusedB
 
+	// ORDER: every arrival this engine accepted reaches the incoming engine
+	// before the first outgoing listener closes.
+	ws := workers662(r.e)
+	anyClosed := func() bool {
+		for _, w := range ws {
+			if w.listenFDClosed.Load() {
+				return true
+			}
+		}
+		return false
+	}
+	placedEarly, missingAtClose := placedBeforeCloseL674(tgt,
+		append(acceptedAddrsL674(r, connsA), acceptedAddrsL674(r, connsB)...),
+		anyClosed, deferlinger.Linger()+3*time.Second)
+
 	for dl := time.Now().Add(deferlinger.Linger() + 3*time.Second); !r.closed() && time.Now().Before(dl); {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -326,10 +405,10 @@ func TestLingerArrivalsReachTheIncomingEngine(t *testing.T) {
 	}
 	m := r.e.Metrics()
 	t.Logf("celeris662 LINGERPLACE workers=%d clearSeen=%v arrivals=%d servedA=%v servedB=%v refused=%d "+
-		"acceptedHere=%d openAtLastArrival=%v listenersClosed=%v adopted=%d live=%d detached=%d "+
+		"acceptedHere=%d openAtLastArrival=%v placedBeforeClose=%v missingAtClose=%d listenersClosed=%v adopted=%d live=%d detached=%d "+
 		"passes=%d reaps=%d residual=[det=%d h2=%d pin=%d uns=%d busy=%d] w1=%d w2=%d deferlinger=%+v",
 		r.workers, !tCleared.IsZero(), wanted, tallyA, tallyB, refused,
-		acceptedHere, lingerStillOpen, closedOK, adopted, m.ActiveConnections, m.TransplantDetached,
+		acceptedHere, lingerStillOpen, placedEarly, missingAtClose, closedOK, adopted, m.ActiveConnections, m.TransplantDetached,
 		metricSoft(r.e, "TransplantSweepPasses"), m.TransplantReaps,
 		metricSoft(r.e, "TransplantResidualDetached"), metricSoft(r.e, "TransplantResidualH2"),
 		metricSoft(r.e, "TransplantResidualPinned"), metricSoft(r.e, "TransplantResidualUnstarted"),
@@ -360,6 +439,18 @@ func TestLingerArrivalsReachTheIncomingEngine(t *testing.T) {
 	if served != wanted {
 		t.Errorf("celeris662 LINGERPLACE ADMIT: %d of %d arrivals were served (phase A %v, phase B %v)",
 			served, wanted, tallyA, tallyB)
+	}
+
+	// ORDER (celeris#662 x celeris#657): and it moved them while the linger
+	// was still running. With nothing accepted there is nothing to order,
+	// and ADMIT has already said so.
+	if acceptedHere > 0 && !placedEarly {
+		t.Errorf("celeris662 LINGERPLACE ORDER: %d of the %d connections this engine accepted during "+
+			"its own pause linger had not reached the incoming engine when the first outgoing listener "+
+			"closed. The drain was set more than a second before that close; a drain that only moves them "+
+			"once the linger is over leaves the engine a switch is leaving holding them for the whole "+
+			"linger, which is the placement celeris#657 is about",
+			missingAtClose, acceptedHere)
 	}
 
 	// PLACE (celeris#657): and the outgoing engine holds none of them.
