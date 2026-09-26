@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Ring memory, and the tests that start engines one after another.
@@ -32,11 +34,29 @@ import (
 //
 // retryRingENOMEM waits that latency out instead of skipping, and
 // skipUnlessIOUringUnusable turns an ENOMEM that outlasts it into a failure
-// whenever io_uring itself works here.
+// whenever io_uring itself works here and RLIMIT_MEMLOCK is at least
+// ringBudgetFloor.
 
 // ringUnchargeBound is how long an engine start that failed only on ring
 // ENOMEM is retried: about 400 times the uncharge latency measured.
 const ringUnchargeBound = 10 * time.Second
+
+// ringBudgetFloor is the smallest RLIMIT_MEMLOCK these tests hold themselves
+// to running under: room for about two and a half engine starts. Below
+// it -- the 64 KiB default of an older distribution, say -- a start may not
+// fit at all, waiting cannot help, and an ENOMEM is the environment's: the
+// tests skip, as they always did. GitHub's runners give 8 MiB.
+const ringBudgetFloor = 4 << 20
+
+// memlockBelowRingBudgetFloor returns the soft RLIMIT_MEMLOCK and whether it
+// is finite and below ringBudgetFloor.
+func memlockBelowRingBudgetFloor() (uint64, bool) {
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil || rl.Cur == ^uint64(0) {
+		return 0, false
+	}
+	return rl.Cur, rl.Cur < ringBudgetFloor
+}
 
 // isRingENOMEM reports whether err is a ring allocation that failed on
 // RLIMIT_MEMLOCK.
@@ -65,13 +85,15 @@ func ioUringUsableHere() bool {
 
 // retryRingENOMEM runs start until it returns something other than a ring
 // ENOMEM, or until ringUnchargeBound has passed. It returns how long it
-// waited, how many times it ran start, and start's last error.
+// waited, how many times it ran start, and start's last error. Below
+// ringBudgetFloor it runs start once: there is nothing to wait for.
 func retryRingENOMEM(start func() error) (waited time.Duration, tries int, err error) {
 	t0 := time.Now()
+	_, small := memlockBelowRingBudgetFloor()
 	for {
 		tries++
 		err = start()
-		if !isRingENOMEM(err) || time.Since(t0) > ringUnchargeBound {
+		if small || !isRingENOMEM(err) || time.Since(t0) > ringUnchargeBound {
 			return time.Since(t0), tries, err
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -80,11 +102,16 @@ func retryRingENOMEM(start func() error) (waited time.Duration, tries int, err e
 
 // skipUnlessIOUringUnusable is what a test does with an engine start that
 // failed on io_uring itself (ioUringUnavailable639) after retryRingENOMEM: it
-// skips only when io_uring cannot be used here at all, and FAILS otherwise,
-// because then the rings are genuinely exhausted -- leaked, or held by
-// something still running -- and that is not the environment's fault.
+// skips only when io_uring cannot be used here at all or RLIMIT_MEMLOCK is
+// below ringBudgetFloor, and FAILS otherwise, because then the rings are
+// genuinely exhausted -- leaked, or held by something still running -- and
+// that is not the environment's fault.
 func skipUnlessIOUringUnusable(t *testing.T, err error) {
 	t.Helper()
+	if lim, small := memlockBelowRingBudgetFloor(); small {
+		t.Skipf("RLIMIT_MEMLOCK is %d KiB, below the %d MiB these tests need to start io_uring engines "+
+			"one after another: %v", lim>>10, ringBudgetFloor>>20, err)
+	}
 	if ioUringUsableHere() {
 		t.Fatalf("io_uring works here (a 4-entry ring can be created) but an engine start still failed "+
 			"after retrying for %v while the kernel uncharged closed rings: %v -- a ring leaked, or the "+
