@@ -800,3 +800,129 @@ func TestChanReaderStalePauseConverges(t *testing.T) {
 		})
 	}
 }
+
+// errCallbackPanic is what the panicking callbacks below panic with, so the
+// test can tell its own panic from any other.
+var errCallbackPanic = errors.New("engine callback panicked (test)")
+
+// TestChanReaderCallbackPanicReleasesPausedMu pins that pausedMu is released
+// when an engine callback invoked under it panics and the panic is recovered.
+//
+// Since celeris#667 both callbacks run with pausedMu held. If the lock is
+// released by a plain Unlock after the callback, a panic inside the callback
+// skips it, and when some caller recovers that panic (the handler, a library
+// wrapping the read loop, a safety net further up) the reader is left with
+// pausedMu locked for good. Every later resume check in Read then blocks, and
+// so does the next high-water crossing in Append — which runs on the engine
+// worker thread, so one connection's panic would stall every connection on
+// that worker, not just its own.
+//
+// Each case panics once inside a callback, recovers the panic the way a
+// caller would, and then requires the lock to be free and the reader still
+// usable. TryLock is the probe, so a regression fails the test instead of
+// hanging it.
+func TestChanReaderCallbackPanicReleasesPausedMu(t *testing.T) {
+	// recovered runs fn and returns what it panicked with, if anything.
+	recovered := func(fn func()) (v any) {
+		defer func() { v = recover() }()
+		fn()
+		return nil
+	}
+	panicOnce := func(armed *atomic.Bool) {
+		if armed.CompareAndSwap(true, false) {
+			panic(errCallbackPanic)
+		}
+	}
+
+	cases := []struct {
+		name string
+		// run drives r into the callback that panics and returns what the
+		// recovered panic carried.
+		run func(t *testing.T, r *chanReader, pauseArmed, resumeArmed *atomic.Bool) any
+	}{
+		{
+			// requestPause, applying the pause on a high-water crossing.
+			name: "pause-in-requestPause",
+			run: func(t *testing.T, r *chanReader, pauseArmed, _ *atomic.Bool) any {
+				pauseArmed.Store(true)
+				return recovered(func() {
+					for range r.highWater {
+						r.Append([]byte{'a'})
+					}
+				})
+			},
+		},
+		{
+			// Read's resume check, lifting the pause at lowWater.
+			name: "resume-in-Read",
+			run: func(t *testing.T, r *chanReader, _, resumeArmed *atomic.Bool) any {
+				for range r.highWater {
+					r.Append([]byte{'a'})
+				}
+				if !readerPaused(r) {
+					t.Fatal("harness: not paused after crossing highWater")
+				}
+				resumeArmed.Store(true)
+				buf := make([]byte, 1)
+				return recovered(func() {
+					for range r.highWater - r.lowWater {
+						_, _ = r.Read(buf)
+					}
+				})
+			},
+		},
+		{
+			// requestPause's celeris#672 re-check, lifting a stale pause.
+			name: "resume-in-stale-recheck",
+			run: func(t *testing.T, r *chanReader, _, resumeArmed *atomic.Bool) any {
+				for range r.highWater - 1 {
+					r.Append([]byte{'a'})
+				}
+				r.ch <- []byte{'z'} // the crossing send; its pause is applied below
+				buf := make([]byte, 1)
+				for range r.highWater {
+					_, _ = r.Read(buf)
+				}
+				resumeArmed.Store(true)
+				return recovered(r.requestPause)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newChanReader(8, 0, 0) // highWater 6, lowWater 2
+			var pauseArmed, resumeArmed atomic.Bool
+			r.SetPauser(func() { panicOnce(&pauseArmed) }, func() { panicOnce(&resumeArmed) })
+
+			got := tc.run(t, r, &pauseArmed, &resumeArmed)
+
+			// Anti-vacuity: the callback must actually have panicked, and
+			// with our panic.
+			if got != errCallbackPanic {
+				t.Fatalf("harness: expected the callback to panic with %v, recovered %v", errCallbackPanic, got)
+			}
+			if !r.pausedMu.TryLock() {
+				t.Fatalf("pausedMu is still held after the callback panicked (%s) and the panic "+
+					"was recovered: every later resume check in Read, and the next high-water "+
+					"crossing in Append (on the engine worker thread), would block forever", tc.name)
+			}
+			r.pausedMu.Unlock()
+
+			// And the reader still works: drain whatever is buffered, then a
+			// fresh chunk goes through.
+			buf := make([]byte, 1)
+			for len(r.ch) > 0 {
+				if _, err := r.Read(buf); err != nil {
+					t.Fatalf("read after the recovered panic: %v", err)
+				}
+			}
+			if !r.Append([]byte{'n'}) {
+				t.Fatal("Append after the recovered panic was rejected")
+			}
+			if n, err := r.Read(buf); n != 1 || err != nil || buf[0] != 'n' {
+				t.Fatalf("read after the recovered panic: n=%d err=%v", n, err)
+			}
+		})
+	}
+}
