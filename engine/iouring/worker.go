@@ -1242,6 +1242,15 @@ func (w *Worker) run(ctx context.Context) {
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleSend(entry, fd, now)
+						// celeris#587, validation builds only (validation.Enabled
+						// is a false constant otherwise, so this compiles away):
+						// hold the SEND_ZC first-CQE -> NOTIF window open right
+						// after handleSend has recorded the first completion and
+						// released cs.detachMu, before anything else is released
+						// (validation.SetZCWindowHold).
+						if validation.Enabled && cqeHasMore(entry.Flags) {
+							validation.ZCWindowHold()
+						}
 						// #383 reverse: io_uring flushes the response
 						// asynchronously, so the clean, fully-flushed boundary
 						// is reached HERE (send completed) — not at udRecv where
@@ -1659,6 +1668,11 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleSend(c, fd, now)
+		// celeris#587: the same validation-only window hold as the inlined
+		// dispatch; compiles away in production.
+		if validation.Enabled && cqeHasMore(c.Flags) {
+			validation.ZCWindowHold()
+		}
 		if w.transplant.Load() != nil {
 			w.tryTransplant(fd)
 		}

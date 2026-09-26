@@ -2,6 +2,8 @@
 
 package validation
 
+import "time"
+
 // Counter is the no-op stub installed in production builds. It carries
 // no state and inlines to nothing. Importers (engine/iouring,
 // middleware/...) call validation.X.Add(1) without a build-tag guard at
@@ -37,6 +39,17 @@ var (
 	IouringZCCompletionWithPendingWrite Counter
 	IouringSendZCFallbacks              Counter
 )
+
+// Enabled is false in production: code guarded by it compiles away.
+const Enabled = false
+
+// SetZCWindowHold is the production no-op: the celeris#587 SEND_ZC
+// window hold exists only under -tags=validation (zc_window.go).
+func SetZCWindowHold(time.Duration) {}
+
+// ZCWindowHold is the production no-op. Its io_uring call sites are also
+// guarded by the false Enabled constant, so they compile away entirely.
+func ZCWindowHold() {}
 
 // Snapshot returns the zero value in production builds — no counters
 // exist and no socket is served. Kept defined so observe.Snapshot can
