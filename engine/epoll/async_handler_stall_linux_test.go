@@ -193,8 +193,8 @@ func TestPeerCloseDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 // left on the dirty list by a partial flush is locked by the pass every
 // iteration; with its dispatch goroutine inside a handler the pass must move
 // on, and stop polling the conn (a dirty list that never empties holds the
-// loop at a 0 ms epoll_wait, a spin). The goroutine flushes writeBuf itself
-// when its handler returns and hands back any remainder.
+// loop at a 0 ms epoll_wait, a spin). The goroutine owes the conn back
+// (relink); TestAConnGivenUpMidHandlerIsHandedBack follows it home.
 func TestDirtyPassDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs := rig.l, rig.cs
@@ -210,6 +210,13 @@ func TestDirtyPassDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	if cs.dirty || l.dirtyHead != nil {
 		t.Errorf("the pass left the conn on the dirty list: the loop would spin at a 0 ms epoll_wait " +
 			"for as long as the handler runs")
+	}
+	cs.asyncInMu.Lock()
+	owed := cs.relinkOwed
+	cs.asyncInMu.Unlock()
+	if !owed || !cs.relinkPending {
+		t.Errorf("the pass gave the conn up without a hand-back owed (relinkOwed=%v relinkPending=%v)",
+			owed, cs.relinkPending)
 	}
 }
 
@@ -238,20 +245,22 @@ func TestEPOLLOUTResumeDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	}
 }
 
-// TestDeferredPeerCloseSurvivesARunningHandler guards the one exception to
-// the two passes above. A conn whose peer half-closed while its response was
-// still queued (peerClosed) is closed by whichever pass sees the flush
-// complete; a holder whose own flush completes hands nothing back. So while a
-// handler runs, the dirty pass keeps such a conn and the EPOLLOUT resume keeps
-// its interest — and once the handler returns, the next pass closes it.
-func TestDeferredPeerCloseSurvivesARunningHandler(t *testing.T) {
+// TestAConnGivenUpMidHandlerIsHandedBack follows a conn the dirty pass or the
+// EPOLLOUT resume gave up while a handler held detachMu. What those passes do
+// when a flush completes — close a conn whose peer half-closed (peerClosed),
+// drop the EPOLLOUT interest — must still happen, including when the peer's
+// half-close is only noticed after the conn was given up, and although the
+// holder's own flush may complete and leave no remainder to hand back. The
+// REAL dispatch loop hands the conn back at its park; the loop puts it on the
+// dirty list, flushes it and closes it.
+func TestAConnGivenUpMidHandlerIsHandedBack(t *testing.T) {
 	for _, site := range []string{"dirty", "epollout"} {
 		t.Run(site, func(t *testing.T) {
 			rig := hijackRaceConn(t)
 			l, cs, local := rig.l, rig.cs, rig.local
+			l.async = true
 			cs.writeBuf = append(cs.writeBuf[:0], "pending"...)
 			cs.pendingBytes = len(cs.writeBuf)
-			cs.peerClosed = true
 			pass := l.flushDirty
 			if site == "dirty" {
 				l.markDirty(cs)
@@ -263,18 +272,115 @@ func TestDeferredPeerCloseSurvivesARunningHandler(t *testing.T) {
 			if !returnsWhileHeld(t, release, pass) {
 				t.Fatalf("the %s pass waited on a running handler (celeris#669)", site)
 			}
-			if !cs.dirty && !cs.epollOut {
-				t.Fatalf("the %s pass dropped a conn with a deferred peer close: nothing would close it "+
-					"once the handler's own flush completes", site)
+			if cs.dirty || cs.epollOut || !cs.relinkPending {
+				t.Fatalf("the %s pass did not give the conn up (dirty=%v epollOut=%v relinkPending=%v)",
+					site, cs.dirty, cs.epollOut, cs.relinkPending)
 			}
-			release()
-			pass()
+			// The peer half-closes; the RDHUP branch finds a response still
+			// queued and defers the close until it is flushed.
+			cs.peerClosed = true
+			release() // the handler returns
+
+			// The dispatch goroutine reaches its park.
+			l.asyncWG.Add(1)
+			go l.runAsyncHandler(cs)
+			for dl := time.Now().Add(5 * time.Second); l.detachQPending.Load() == 0; {
+				if time.Now().After(dl) {
+					t.Fatal("the dispatch goroutine parked without handing the conn back")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			l.drainDetachQueue()
+			if !cs.dirty || cs.relinkPending {
+				t.Fatalf("the hand-back did not put the conn back on the dirty list (dirty=%v relinkPending=%v)",
+					cs.dirty, cs.relinkPending)
+			}
+			l.flushDirty()
+			l.asyncWG.Wait() // the close woke the parked goroutine, which exits
+
+			hijackRaceExpectRead(t, rig.peer, "pending", "the queued response reached the peer")
 			if l.conns[local] != nil || rig.disconnects.Load() != 1 {
-				t.Errorf("the %s pass did not close the conn once flushed: slot=%p hooks=%d",
-					site, l.conns[local], rig.disconnects.Load())
+				t.Errorf("the deferred peer close was lost: slot=%p hooks=%d", l.conns[local], rig.disconnects.Load())
 			}
-			hijackRaceExpectRead(t, rig.peer, "pending", "the queued response reached the peer before the close")
 		})
+	}
+}
+
+// TestATransplantWaitsForARelink: between the pass giving a conn up and the
+// loop draining the goroutine's hand-back, a queue entry names cs, and a
+// transplant would return cs to the pool under it. The conn must not move
+// until the hand-back is drained, and then it may.
+func TestATransplantWaitsForARelink(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	l.async = true
+	cs.protocol = engine.HTTP1
+	cs.detected = true
+	cs.lastActivity = time.Now().UnixNano()
+	l.markDirty(cs)
+	release := holdAsHandler(t, cs, true)
+	if !returnsWhileHeld(t, release, l.flushDirty) {
+		t.Fatal("the dirty pass waited on a running handler (celeris#669)")
+	}
+	release()
+	// The goroutine exits (a later close, say) after queuing its hand-back;
+	// the loop has not drained it yet.
+	cs.asyncInMu.Lock()
+	cs.relinkOwed = false
+	cs.asyncRun = false
+	cs.asyncInMu.Unlock()
+	l.detachQMu.Lock()
+	l.detachQueue = append(l.detachQueue, cs)
+	l.detachQPending.Store(1)
+	l.detachQMu.Unlock()
+
+	target := &countingTarget{}
+	t.Cleanup(target.closeAll)
+	l.transplant.Store(&transplantState{target: target})
+	l.tryTransplant(local)
+	if n := target.count(); n != 0 {
+		t.Fatalf("a conn with a hand-back still queued was transplanted (%d adopted)", n)
+	}
+	l.drainDetachQueue() // the hand-back: back on the dirty list
+	l.flushDirty()       // nothing queued: off it again
+	l.tryTransplant(local)
+	if n := target.count(); n != 1 {
+		t.Errorf("after the hand-back the conn was not transplanted (%d adopted): the refusal was not the relink's", n)
+	}
+}
+
+// TestPostDetachHandlerIsWaitedOut: after Detach the dispatch goroutine may
+// keep running — a handler that streams inline — but it never holds detachMu
+// across ProcessH1 again, so whoever holds the lock is a guarded writeFn in
+// one write. closeConn must wait for it as before, not leave the close to a
+// goroutine that will not look until its handler returns, and the handler
+// may be waiting for exactly that close's OnDetachClose.
+func TestPostDetachHandlerIsWaitedOut(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	cs.asyncInMu.Lock()
+	cs.asyncDetachUnlocked = true
+	cs.asyncInMu.Unlock()
+	release := holdAsHandler(t, cs, true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.closeConn(local)
+	}()
+	select {
+	case <-done:
+		t.Fatal("closeConn left the close to a post-Detach goroutine instead of waiting out a guarded write")
+	case <-time.After(200 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closeConn never completed after the writer released detachMu")
+	}
+	if l.conns[local] != nil || rig.disconnects.Load() != 1 {
+		t.Errorf("close incomplete: slot=%p hooks=%d", l.conns[local], rig.disconnects.Load())
 	}
 }
 

@@ -328,15 +328,25 @@ func TestHijackDefersReleaseWhileAsyncGoroutineActive(t *testing.T) {
 
 	l.drainDetachQueue()
 
-	// releaseConnState clears hijacked + zeroes fd.
-	if cs.hijacked.Load() {
-		t.Error("drainDetachQueue did not release hijacked cs (hijacked still set)")
+	// The hijack is settled on the loop — live set, connCount — and the
+	// connState is deliberately never pooled: entries made before or after
+	// the hijack may still name it (celeris#668). A further entry is a no-op.
+	if !cs.hijackSettled {
+		t.Error("drainDetachQueue did not settle the hijacked conn")
 	}
 	if len(l.liveConns) != 0 || l.connCount != 0 {
 		t.Errorf("the hand-back left liveConns=%d connCount=%d, want 0 and 0", len(l.liveConns), l.connCount)
 	}
-	if cs.fd != 0 {
-		t.Errorf("cs.fd = %d after release, want 0", cs.fd)
+	if cs.fd != local {
+		t.Errorf("cs.fd = %d after the hand-back, want %d: a hijacked connState must not be pooled", cs.fd, local)
+	}
+	l.detachQMu.Lock()
+	l.detachQueue = append(l.detachQueue, cs)
+	l.detachQPending.Store(1)
+	l.detachQMu.Unlock()
+	l.drainDetachQueue()
+	if l.connCount != 0 {
+		t.Errorf("a second entry for the hijacked conn moved connCount to %d", l.connCount)
 	}
 }
 

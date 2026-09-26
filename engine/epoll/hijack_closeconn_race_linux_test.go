@@ -324,9 +324,9 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	}
 
 	// drainDetachQueue tests detachClosed BEFORE the hijacked branch, so a
-	// stray detachClosed strands the connState outside the pool.
+	// stray detachClosed would skip the hijack's settling.
 	if cs.detachClosed {
-		t.Error("closeConn marked a hijacked conn detachClosed; the pool release is then skipped")
+		t.Error("closeConn marked a hijacked conn detachClosed; the hijack is then never settled")
 	}
 
 	// The hijacked conn belongs to its new owner and must keep working.
@@ -337,7 +337,8 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	}
 
 	// The dispatch goroutine exits and hands cs back via the detachQueue
-	// (runAsyncHandler's ErrHijacked path). The pool release must happen.
+	// (runAsyncHandler's ErrHijacked path); the loop drains that and the
+	// notice hijackConn enqueued, and settles the hijack once.
 	cs.asyncInMu.Lock()
 	cs.asyncRun = false
 	cs.asyncInMu.Unlock()
@@ -346,11 +347,8 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	l.detachQPending.Store(1)
 	l.detachQMu.Unlock()
 	l.drainDetachQueue()
-	if cs.hijacked.Load() {
-		t.Error("drainDetachQueue skipped the hijacked pool release (detachClosed short-circuit)")
-	}
-	if cs.fd != 0 {
-		t.Errorf("cs.fd = %d after the hand-off, want 0 (connState not released)", cs.fd)
+	if !cs.hijackSettled || cs.liveIdx != -1 {
+		t.Errorf("drainDetachQueue did not settle the hijack (settled=%v liveIdx=%d)", cs.hijackSettled, cs.liveIdx)
 	}
 	if got := l.connCount; got != 0 {
 		t.Errorf("connCount = %d, want 0: a negative count never satisfies the DRAINING->SUSPENDED gate", got)
@@ -503,8 +501,8 @@ func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
 			hijackRaceExpectRead(t, local, "y", "recycled pipe survives an uncontended closeConn")
 		}
 	}
-	if cs.fd != 0 {
-		t.Error("the hand-back did not release the hijacked connState")
+	if !cs.hijackSettled {
+		t.Error("the hand-back did not settle the hijack")
 	}
 }
 
@@ -594,8 +592,8 @@ func TestHijackReleaseUnlinksTheConnFromTheDirtyList(t *testing.T) {
 		l.drainDetachQueue()
 
 		if l.dirtyHead != nil {
-			t.Errorf("dirtyHead = %p after the hijacked conn was released to the pool, want nil: "+
-				"the loop's dirty pass would flush pooled memory to a reissued fd", l.dirtyHead)
+			t.Errorf("dirtyHead = %p after the hijacked conn was settled, want nil: "+
+				"the loop's dirty pass would flush its bytes to a reissued fd", l.dirtyHead)
 		}
 	})
 
@@ -682,8 +680,8 @@ func TestCloseLeftToAHandlerThatHijacksIsNotRedone(t *testing.T) {
 	if len(l.liveConns) != 0 {
 		t.Errorf("len(liveConns) = %d after the hand-back, want 0", len(l.liveConns))
 	}
-	if cs.fd != 0 {
-		t.Errorf("cs.fd = %d after the hand-back, want 0 (connState not released)", cs.fd)
+	if !cs.hijackSettled {
+		t.Error("the hand-back did not settle the hijack")
 	}
 	if !fdOpen(local) {
 		t.Fatalf("fd %d, reissued after the hijack, was closed by the owed close", local)

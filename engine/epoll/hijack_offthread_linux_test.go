@@ -191,8 +191,8 @@ func checkOffThreadHandBack(t *testing.T, l *Loop, cs *connState, bs []*connStat
 		t.Errorf("connCount = %d after the hand-back, want %d", l.connCount, len(bs))
 	}
 	assertLiveSet(t, l, bs...)
-	if cs.fd != 0 {
-		t.Errorf("cs.fd = %d after the hand-back, want 0 (connState not released)", cs.fd)
+	if !cs.hijackSettled {
+		t.Error("the hand-back did not settle the hijack")
 	}
 }
 
@@ -540,5 +540,95 @@ func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
 	assertLiveSet(t, l, next)
 	if l.connCount != 1 {
 		t.Errorf("connCount = %d after the hand-back, want 1", l.connCount)
+	}
+}
+
+// TestOffThreadHijackIsSettledBeforeItsGoroutineExits: a handler that hijacks
+// may go on serving the hijacked conn for as long as it likes, on the
+// dispatch goroutine. The loop must not wait for that goroutine to exit
+// before taking the conn out of its live set and connCount — for a session
+// served in-handler that would pin the DRAINING -> SUSPENDED gate for the
+// whole session, and a handler that returns into a Detach-ed loop never
+// exits at all. hijackConn's notice settles it at the next drain; the
+// goroutine's own exit entry, later, is a no-op.
+func TestOffThreadHijackIsSettledBeforeItsGoroutineExits(t *testing.T) {
+	rig, bs := offThreadRig(t, 2)
+	l, cs, local := rig.l, rig.cs, rig.local
+	cs.detachMu.Lock()
+	nc, err := l.hijackConn(local)
+	cs.detachMu.Unlock()
+	if err != nil {
+		t.Fatalf("hijackConn: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+
+	// The goroutine is still running (asyncRun): only the notice is queued.
+	l.drainDetachQueue()
+	if !cs.hijackSettled || cs.liveIdx != -1 || l.connCount != len(bs) {
+		t.Fatalf("the hijack was not settled while its goroutine still runs: settled=%v liveIdx=%d connCount=%d, "+
+			"want true, -1, %d", cs.hijackSettled, cs.liveIdx, l.connCount, len(bs))
+	}
+	assertLiveSet(t, l, bs...)
+
+	// Its exit, later, hands cs back again: nothing more may happen.
+	handBack(l, cs)
+	if l.connCount != len(bs) {
+		t.Errorf("the goroutine's exit entry moved connCount to %d, want %d", l.connCount, len(bs))
+	}
+	assertLiveSet(t, l, bs...)
+}
+
+// TestDirtyPassSkipsAHijackedConn: a conn still on the dirty list — a
+// pipelined response left partial — when its next request's handler hijacks.
+// Once the handler returns and releases detachMu, the dirty pass can take the
+// lock before the loop has drained the hijack's notice; the descriptor it
+// would write to is closed, and its number already reissued. Nothing queued
+// may reach the number's new owner.
+func TestDirtyPassSkipsAHijackedConn(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	cs.writeBuf = append(cs.writeBuf[:0], "pending"...)
+	cs.pendingBytes = len(cs.writeBuf)
+	l.markDirty(cs)
+
+	cs.detachMu.Lock()
+	nc, err := l.hijackConn(local)
+	if err != nil {
+		cs.detachMu.Unlock()
+		t.Fatalf("hijackConn: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+
+	// The number is reissued to the WRITE end of a pipe, so a stray write
+	// lands where the test can read it.
+	var p [2]int
+	if err := unix.Pipe2(p[:], unix.O_CLOEXEC|unix.O_NONBLOCK); err != nil {
+		cs.detachMu.Unlock()
+		t.Fatalf("pipe2: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(p[0]) })
+	if _, err := unix.FcntlInt(uintptr(local), unix.F_GETFD, 0); err == nil {
+		cs.detachMu.Unlock()
+		t.Skipf("fd %d in use again before the test could take it", local)
+	}
+	if err := unix.Dup3(p[1], local, unix.O_CLOEXEC); err != nil {
+		cs.detachMu.Unlock()
+		t.Fatalf("dup3: %v", err)
+	}
+	_ = unix.Close(p[1])
+	t.Cleanup(func() { _ = unix.Close(local) })
+
+	cs.detachMu.Unlock() // the handler returns
+	l.flushDirty()       // before the loop drains the hijack's notice
+
+	buf := make([]byte, 64)
+	if n, err := unix.Read(p[0], buf); n > 0 {
+		t.Fatalf("the dirty pass wrote %q to fd %d, which the hijack had released and another file now owns",
+			buf[:n], local)
+	} else if err != unix.EAGAIN {
+		t.Fatalf("read the pipe: %v", err)
+	}
+	if cs.dirty {
+		t.Error("the hijacked conn is still on the dirty list")
 	}
 }

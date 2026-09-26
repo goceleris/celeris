@@ -204,19 +204,36 @@ type connState struct {
 	// detached from the engine and handed to the caller as a net.Conn. In
 	// async mode hijackConn runs ON the dispatch goroutine (inside
 	// ProcessH1 → ErrHijacked), which still touches cs after ProcessH1
-	// returns — so the pooled connState MUST NOT be released by hijackConn.
-	// The release is deferred to the worker via the asyncClosed +
-	// detachQueue → drainDetachQueue handoff, which sees this flag and runs
-	// releaseConnState only after the goroutine has exited. (#3.1)
+	// returns — so the connState MUST NOT be released by hijackConn (#3.1),
+	// and since celeris#668 it is never returned to the pool at all.
 	//
-	// That hand-off also takes the conn out of l.liveConns and l.connCount,
+	// Off-thread, hijackConn also enqueues cs at once, and the loop's
+	// drainDetachQueue takes the conn out of l.liveConns and l.connCount,
 	// which are the loop's and which the dispatch goroutine must not touch
-	// (celeris#668). Until it runs, the conn's entry stays in the live set
-	// with its descriptor already closed, so the live-set walkers skip an
-	// entry with this flag set. They read it without any lock the
-	// goroutine holds, hence atomic; hijackConn stores it before it
+	// (celeris#668). Until that runs, the conn's entry stays in the live set
+	// with its descriptor already closed, so the live-set walkers and the
+	// dirty pass skip a conn with this flag set. They read it without any
+	// lock the goroutine holds, hence atomic; hijackConn stores it before it
 	// releases the descriptor number.
 	hijacked atomic.Bool
+
+	// hijackSettled (loop-thread-only) records that drainDetachQueue has
+	// taken an off-thread-hijacked conn out of the loop's state. Such a
+	// connState is never returned to the pool — queue entries made before
+	// or after the hijack may still name it — so every later entry finds
+	// this set and does nothing (celeris#668).
+	hijackSettled bool
+
+	// relinkOwed (guarded by asyncInMu) is set by the dirty pass or the
+	// EPOLLOUT resume when they give the conn up because its dispatch
+	// goroutine holds detachMu across a handler (celeris#669). The goroutine
+	// hands cs back through the detach queue at its next park, and
+	// drainDetachQueue puts it on the dirty list again. relinkPending
+	// (loop-thread-only) is the loop's side of the same debt: while it is
+	// set the conn is not offered to a transplant, which would return cs to
+	// the pool under the queue entry the hand-back makes.
+	relinkOwed    bool
+	relinkPending bool
 
 	// closeOwed (guarded by asyncInMu) is set by closeConn when it finds
 	// detachMu held by this conn's RUNNING dispatch goroutine — i.e. held
@@ -305,8 +322,11 @@ func releaseConnState(cs *connState) {
 	cs.asyncDetachPending = false
 	cs.liveIdx = -1
 	cs.hijacked.Store(false)
+	cs.hijackSettled = false
 	cs.closeOwed = false
 	cs.closeErr = nil
+	cs.relinkOwed = false
+	cs.relinkPending = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

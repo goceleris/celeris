@@ -214,7 +214,11 @@ func (l *Loop) flushedAtBoundary(cs *connState) bool {
 	if !cs.h1State.AtRequestBoundary() {
 		return false
 	}
-	return !cs.dirty && !cs.epollOut && cs.writePos == 0 && cs.pendingBytes == 0 &&
+	// relinkPending: the loop gave the conn up mid-handler and its dispatch
+	// goroutine owes it back (celeris#669). That hand-back is a queue entry
+	// naming cs, and a transplant returns cs to the pool; the conn is not at
+	// a boundary the loop has seen until the entry is drained.
+	return !cs.dirty && !cs.epollOut && !cs.relinkPending && cs.writePos == 0 && cs.pendingBytes == 0 &&
 		len(cs.writeBuf) == 0 && len(cs.bodyBuf) == 0 && cs.sendfile == nil
 }
 

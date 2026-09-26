@@ -1503,18 +1503,17 @@ func (l *Loop) drainRead(fd int, now int64) {
 // queued, surface err to a detached middleware (OnError, under detachMu, as
 // every OnError site in this file runs), and close.
 //
-// When detachMu is held and the conn's dispatch goroutine is running, the
-// holder is that goroutine inside a user handler (celeris#669), and waiting
-// for the lock parked the loop — and every connection on it — until the
-// handler returned. The common shape is a client that gives up on a slow
-// handler and disconnects. So the flush and the notification ride on the
-// close instead: closeConn leaves it to the goroutine, which exits at its next
-// check, and then runs it on this thread with the lock free, delivering
-// closeErr first.
+// When detachMu is held across a handler (dispatchBusy), waiting for the
+// lock parked the loop — and every connection on it — until the handler
+// returned (celeris#669); the common shape is a client that gives up on a
+// slow handler and disconnects. So the flush and the notification ride on
+// the close instead: closeConn leaves it to the dispatch goroutine, which
+// exits at its next check, and then runs it on this thread with the lock
+// free, delivering closeErr first.
 func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
 	mu := cs.detachMu
 	if mu != nil && !mu.TryLock() {
-		if dispatchBusy(cs) {
+		if dispatchBusy(cs, nil) {
 			cs.closeErr = err
 			l.closeConn(fd)
 			return
@@ -1531,52 +1530,45 @@ func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
 	l.closeConn(fd)
 }
 
-// dispatchBusy reports whether cs has a dispatch goroutine that is running:
-// alive (asyncRun) and not parked in asyncCond.Wait. Loop thread.
+// dispatchBusy reports whether cs's dispatch goroutine may be holding
+// cs.detachMu across a user handler: it is alive (asyncRun), not parked in
+// asyncCond.Wait (asyncParked), and has not released the lock for good at a
+// Detach (asyncDetachUnlocked). All three are read under asyncInMu. Loop
+// thread.
 //
 // It is how a loop-thread site that found cs.detachMu held tells the holders
 // apart (celeris#669). The dispatch goroutine holds the lock across
-// ProcessH1, i.e. for as long as the user handler runs, and it is running
+// ProcessH1, i.e. for as long as the handler runs, and it is running
 // whenever it does. Every other holder — a detached conn's guarded writeFn,
 // the goroutine's own asyncClosed re-check — holds it for one write or less.
-// So a site that finds the lock held and the goroutine running must not wait,
-// and one that finds it held with the goroutine parked or absent may wait as
-// it always has: that wait is bounded.
+// So a site that finds the lock held while this reports true must not wait,
+// and one that finds it held while this reports false may wait as it always
+// has: that wait is bounded.
 //
-// A running goroutine is not necessarily the holder (it may be delivering a
-// frame after Detach while a guarded writeFn holds the lock). Every site that
-// acts on a true only leaves work to be done later — a flush the holder does
-// anyway, a close the goroutine hands back on its way out — so a false
-// positive costs a hand-off, never a lost write or close.
+// After Detach the goroutine never takes the lock across ProcessH1 again, so
+// it is excluded even while it runs — a handler may keep streaming inline
+// after Detach, and a close left to it would wait for that handler, which in
+// turn waits for the close's OnDetachClose to learn it should stop.
 //
-// Parked is exact, not a heuristic: asyncParked is set and cleared under
-// asyncInMu in the same critical section as the park loop's condition, so a
-// goroutine seen parked here can only leave Wait by re-taking asyncInMu, after
-// this read, and a caller that has already set asyncClosed makes it exit
-// without taking detachMu.
-func dispatchBusy(cs *connState) bool {
+// If owe is non-nil and the result is true, *owe is set in the same critical
+// section: the goroutine reads it under asyncInMu on its way to its next park
+// or its exit, so it cannot miss it. Both owed hand-backs (closeOwed,
+// relinkOwed) are recorded this way.
+//
+// A running goroutine is not necessarily the holder, and every caller acts on
+// a true only by leaving work the goroutine hands back; a false positive
+// costs a hand-back, never a lost write or close. Parked is exact: asyncParked
+// is set and cleared under asyncInMu in the park loop's own critical section,
+// so a goroutine seen parked can leave Wait only by re-taking asyncInMu after
+// this read.
+func dispatchBusy(cs *connState, owe *bool) bool {
 	if cs.asyncCond.L == nil {
 		return false // no async machinery: sync mode, no dispatch goroutine
 	}
 	cs.asyncInMu.Lock()
-	busy := cs.asyncRun && !cs.asyncParked
-	cs.asyncInMu.Unlock()
-	return busy
-}
-
-// leaveCloseToDispatch is dispatchBusy for closeConn, which must record the
-// hand-off in the same critical section it decides it in: closeOwed is read
-// by the goroutine's exit path under asyncInMu, so a goroutine that exits
-// after this section sees it, and one that exited before it made asyncRun
-// false here. Loop thread; asyncClosed must already be set.
-func leaveCloseToDispatch(cs *connState) bool {
-	if cs.asyncCond.L == nil {
-		return false
-	}
-	cs.asyncInMu.Lock()
-	busy := cs.asyncRun && !cs.asyncParked
-	if busy {
-		cs.closeOwed = true
+	busy := cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked
+	if busy && owe != nil {
+		*owe = true
 	}
 	cs.asyncInMu.Unlock()
 	return busy
@@ -1623,13 +1615,14 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// them from here raced the index walks of checkTimeouts, the sweep and
 	// shutdown, and connCount-- could lose an update against acceptAll's
 	// connCount++, after which the connCount == 0 DRAINING→SUSPENDED gate
-	// never passes on this loop again. So off-thread both are left to
-	// drainDetachQueue's hijacked branch, which runs on the loop once this
-	// goroutine has exited and handed cs back — the hand-off that already
-	// defers the pool release (below). Until then the entry stays in the live
-	// set and the walkers skip it on hijacked, which is stored BEFORE the
-	// descriptor is released: by the time the kernel can reissue the number
-	// to another accept, the entry already reads as not the loop's.
+	// never passes on this loop again. So off-thread this enqueues cs for
+	// drainDetachQueue's hijacked branch, which does both on the loop at its
+	// next iteration — not when this goroutine exits, which for a handler
+	// that serves the hijacked conn itself is the end of that session.
+	// Until then the entry stays in the live set and the walkers skip it on
+	// hijacked, which is stored BEFORE the descriptor is released: by the
+	// time the kernel can reissue the number to another accept, the entry
+	// already reads as not the loop's.
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
 	if offThread {
 		cs.hijacked.Store(true)
@@ -1649,21 +1642,24 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	c, err := net.FileConn(f)
 	_ = f.Close()
 
-	// CRITICAL (#3.1): off-thread, defer the pool release as well. When the
+	// CRITICAL (#3.1): off-thread, never release cs to the pool. When the
 	// handler calls Hijack from inside the dispatch goroutine's ProcessH1, the
 	// goroutine STILL touches cs after ProcessH1 returns ErrHijacked — it
 	// Unlocks cs.detachMu, resyncs cs.pendingBytes, sets cs.asyncClosed,
-	// clears cs.asyncInBuf, and enqueues cs on detachQueue. Recycling cs now
-	// would hand pooled-and-reissued memory to that goroutine. The
-	// worker-thread teardown (drainDetachQueue, reached via the goroutine's
-	// asyncClosed + detachQueue handoff) runs the pool release once the
-	// goroutine has exited.
+	// clears cs.asyncInBuf, and enqueues cs on detachQueue — and detach-queue
+	// entries made before the hijack (a partial flush of a pipelined
+	// response) may still name it. Recycling cs would hand pooled-and-reissued
+	// memory to all of them, so it is left to the garbage collector, as
+	// closeConn leaves every conn a goroutine may still reference
+	// (celeris#668). The enqueue below is the loop's notice.
 	//
 	// Inline, drainRead returns immediately on ErrHijacked without touching
 	// cs again and nothing will enqueue cs, so release synchronously here —
 	// gating only on detachMu would leak the connState in the inline-async
 	// case.
-	if !offThread {
+	if offThread {
+		l.enqueueDetach(cs)
+	} else {
 		// Unlink before the pool release. releaseConnState clears cs's own
 		// dirty links but never repairs l.dirtyHead or a predecessor's
 		// dirtyNext, so handing back a still-linked connState leaves the
@@ -1907,7 +1903,14 @@ func (l *Loop) initProtocol(cs *connState) {
 			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
 			unlockDetachMu := l.async && cs.asyncPromoted && cs.detachMu != nil && !cs.asyncDetachUnlocked
 			if unlockDetachMu {
+				// Under asyncInMu: dispatchBusy reads it there, and from here
+				// on this goroutine never holds detachMu across a handler
+				// again, so the loop must go back to waiting out the (bounded)
+				// holders of this conn's lock (celeris#669). detachMu is held
+				// here, and detachMu → asyncInMu is the order hijackConn uses.
+				cs.asyncInMu.Lock()
 				cs.asyncDetachUnlocked = true
+				cs.asyncInMu.Unlock()
 			}
 			// Async mode: enqueue cs so drainDetachQueue picks up the
 			// deferred bookkeeping (asyncDetachPending). The first
@@ -2159,15 +2162,20 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			// Signal worker via detachQueue + eventfd (never close the
 			// fd from this goroutine — races with drainRead on the
 			// worker's stale l.conns slot).
-			l.detachQMu.Lock()
-			l.detachQueue = append(l.detachQueue, cs)
-			l.detachQPending.Store(1)
-			l.detachQMu.Unlock()
-			l.wakeFD.Signal()
+			l.enqueueDetach(cs)
 		}
 	}()
 	for {
 		cs.asyncInMu.Lock()
+		if cs.relinkOwed {
+			// The loop gave this conn up while our handler held detachMu
+			// (celeris#669: the dirty pass or the EPOLLOUT resume); hand it
+			// back now that the handler's writes are flushed as far as they
+			// go, so the loop re-examines it. asyncInMu → detachQMu: nothing
+			// takes asyncInMu under detachQMu.
+			cs.relinkOwed = false
+			l.enqueueDetach(cs)
+		}
 		cs.asyncParked = true
 		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() && !cs.asyncQuiesce.Load() {
 			// Park until the worker appends more bytes or the conn is
@@ -2206,11 +2214,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		if cs.asyncQuiesce.Load() && len(cs.asyncInBuf) == 0 {
 			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
-			l.detachQMu.Lock()
-			l.detachQueue = append(l.detachQueue, cs)
-			l.detachQPending.Store(1)
-			l.detachQMu.Unlock()
-			l.wakeFD.Signal()
+			l.enqueueDetach(cs)
 			return
 		}
 		// Double-buffer swap: hand asyncInBuf to the goroutine, reuse
@@ -2289,11 +2293,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 				cs.asyncInMu.Unlock()
 				cs.asyncH2Promoted.Store(true)
 			}
-			l.detachQMu.Lock()
-			l.detachQueue = append(l.detachQueue, cs)
-			l.detachQPending.Store(1)
-			l.detachQMu.Unlock()
-			l.wakeFD.Signal()
+			l.enqueueDetach(cs)
 			return
 		}
 		// celeris#273: a user handler may have called c.Detach() inside
@@ -2313,11 +2313,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 				cs.asyncInBuf = cs.asyncInBuf[:0]
 				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
-				l.detachQMu.Lock()
-				l.detachQueue = append(l.detachQueue, cs)
-				l.detachQPending.Store(1)
-				l.detachQMu.Unlock()
-				l.wakeFD.Signal()
+				l.enqueueDetach(cs)
 				return
 			}
 			// Post-Detach: loop back to wait for more recv bytes (WS
@@ -2367,11 +2363,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		cs.detachMu.Unlock()
 
 		if partial {
-			l.detachQMu.Lock()
-			l.detachQueue = append(l.detachQueue, cs)
-			l.detachQPending.Store(1)
-			l.detachQMu.Unlock()
-			l.wakeFD.Signal()
+			l.enqueueDetach(cs)
 		}
 
 		if processErr != nil || flushErr != nil {
@@ -2388,11 +2380,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			cs.asyncInBuf = cs.asyncInBuf[:0]
 			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
-			l.detachQMu.Lock()
-			l.detachQueue = append(l.detachQueue, cs)
-			l.detachQPending.Store(1)
-			l.detachQMu.Unlock()
-			l.wakeFD.Signal()
+			l.enqueueDetach(cs)
 			return
 		}
 	}
@@ -2407,6 +2395,10 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 // lost and the conn stays open, owned by no goroutine.
 func (cs *connState) endDispatch() (closeOwed bool) {
 	cs.asyncRun = false
+	// A relink owed at exit needs no hand-back of its own: the conn is being
+	// closed (asyncClosed), hijacked, handed to the other engine, or its exit
+	// enqueues cs anyway (the H2 upgrade), and each of those settles it.
+	cs.relinkOwed = false
 	closeOwed = cs.closeOwed
 	cs.closeOwed = false
 	return closeOwed
@@ -2450,27 +2442,26 @@ func (l *Loop) drainDetachQueue() {
 		// Hijacked conn (#3.1): hijackConn already detached the fd from
 		// epoll and the conn table and handed it to the caller as a
 		// net.Conn (the original fd is closed; the caller owns a dup). It
-		// deferred to here, where the dispatch goroutine that referenced cs
-		// has now exited (it enqueued cs on its way out), the pool release
-		// and the two pieces of loop-thread state it may not touch from
-		// that goroutine: the live-set entry and connCount (celeris#668).
-		// Skip closeConn — there is no fd to close and l.conns[fd] is
-		// already nil.
-		//
-		// This branch runs once per hijack: releaseConnState clears the
-		// flag, so a second queue entry for the same connState cannot
-		// decrement connCount again.
+		// enqueued cs at once for what it may not do from the dispatch
+		// goroutine (celeris#668): take the conn out of the live set,
+		// connCount and the dirty list, and withdraw any transplant ask.
+		// That is done here, once; the goroutine's own exit and any entry
+		// made before the hijack find hijackSettled and do nothing. The
+		// connState is never pooled (see hijackConn), so none of those
+		// entries can name reissued memory. Skip closeConn — there is no fd
+		// to close and l.conns[fd] is already nil.
 		if cs.hijacked.Load() {
-			l.removeLiveConn(cs)
-			l.connCount--
-			// Unlink from the dirty list first: hijackConn does not, and
-			// releaseConnState clears only cs's own links, so the pool would
-			// otherwise get a connState that l.dirtyHead or a predecessor
-			// still points at (celeris#654). No-op unless the conn really was
-			// dirty — a partial write from a prior pipelined response.
-			l.removeDirty(cs)
-			l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
-			releaseConnState(cs)
+			if !cs.hijackSettled {
+				cs.hijackSettled = true
+				l.removeLiveConn(cs)
+				l.connCount--
+				// Unlink from the dirty list: hijackConn does not, and a
+				// conn left on it would have the dirty pass write its
+				// queued bytes to a descriptor number that is no longer
+				// its own (celeris#654).
+				l.removeDirty(cs)
+				l.dropAsk(cs) // celeris#657 P8: no ask may name it once it is not ours
+			}
 			continue
 		}
 		// Dispatch goroutine signaled close via asyncClosed. Only the
@@ -2488,6 +2479,7 @@ func (l *Loop) drainDetachQueue() {
 		if cs.asyncH2Promoted.Load() {
 			cs.asyncH2Promoted.Store(false)
 			l.h2Conns = append(l.h2Conns, cs.fd)
+			cs.relinkPending = false // celeris#669: back on the dirty list
 			l.markDirty(cs)
 			continue
 		}
@@ -2532,6 +2524,9 @@ func (l *Loop) drainDetachQueue() {
 			})
 			cs.recvPaused = desired
 		}
+		// A relink hand-back (celeris#669) lands here too: the conn is back
+		// on the dirty list, whose next pass sees it as it now is.
+		cs.relinkPending = false
 		l.markDirty(cs)
 	}
 	// Drop the strong refs before reusing the array (see the io_uring
@@ -2542,6 +2537,29 @@ func (l *Loop) drainDetachQueue() {
 	l.detachQSpare = l.detachQSpare[:0]
 }
 
+// relink gives up, for now, a conn whose flush the loop could not do because
+// its dispatch goroutine holds detachMu across a handler (celeris#669). The
+// caller has already set cs.relinkOwed through dispatchBusy; the goroutine
+// hands cs back through the detach queue at its next park — after it has
+// flushed what its handler wrote — and drainDetachQueue puts it on the dirty
+// list, whose next pass sees the conn as it now is. Until then the conn is on
+// neither the dirty list nor EPOLLOUT.
+//
+// Waiting for the hand-back, rather than for "a remainder", is what keeps the
+// actions tied to a completed flush — a deferred peer close (peerClosed), the
+// EPOLLOUT disarm — from being lost: a holder whose own flush completes has no
+// remainder to hand back, and peerClosed may be set after this call.
+// relinkPending keeps tryTransplant off the conn meanwhile: the hand-back is
+// a queue entry naming cs, and a transplant returns cs to the pool. Loop
+// thread.
+func (l *Loop) relink(cs *connState) {
+	l.removeDirty(cs)
+	if cs.epollOut {
+		l.disarmEpollOut(cs)
+	}
+	cs.relinkPending = true
+}
+
 // flushDirty is the event loop's dirty-list pass, run once per iteration
 // after drainDetachQueue: flush every connection with bytes still queued,
 // close the ones whose flush failed, and hand a still-partial non-detached
@@ -2549,33 +2567,33 @@ func (l *Loop) drainDetachQueue() {
 func (l *Loop) flushDirty() {
 	for cs := l.dirtyHead; cs != nil; {
 		next := cs.dirtyNext
-		if mu := cs.detachMu; mu != nil && !mu.TryLock() {
-			if dispatchBusy(cs) {
+		mu := cs.detachMu
+		if mu != nil && !mu.TryLock() {
+			if dispatchBusy(cs, &cs.relinkOwed) {
 				// The conn's dispatch goroutine holds detachMu across a
 				// user handler (celeris#669): waiting here parked the loop,
-				// and every connection on it, until the handler returned.
-				// Take the conn off the list instead of retrying it — a
-				// dirty list that never empties holds epoll_wait at 0 ms.
-				// Nothing is lost: whoever holds the lock flushes writeBuf
-				// from writePos when it is done (the goroutine after
-				// ProcessH1, a guarded writeFn after its write) and hands a
-				// remainder back through the detach queue, which puts the
-				// conn back on this list.
-				//
-				// Except a deferred peer close (peerClosed): it fires only
-				// when THIS pass sees the flush complete, and a holder
-				// whose flush completes hands nothing back. Such a conn
-				// stays on the list and is retried each pass until the
-				// handler returns — a spin, but only for a peer that
-				// half-closed with a response still queued while a
-				// pipelined request's handler runs.
-				if !cs.peerClosed {
-					l.removeDirty(cs)
-				}
+				// and every connection on it, until the handler returned,
+				// and retrying it each pass would hold epoll_wait at 0 ms
+				// — a spin — for as long. So give the conn up until the
+				// goroutine hands it back (relink): it does so at its next
+				// park, after it has flushed what its handler wrote.
+				l.relink(cs)
 				cs = next
 				continue
 			}
 			mu.Lock()
+		}
+		if cs.hijacked.Load() {
+			// An async Hijack took the conn (celeris#668) and closed its
+			// descriptor, whose number may already be someone else's:
+			// writing the bytes still queued here would put them there.
+			// drainDetachQueue settles the rest.
+			if mu != nil {
+				mu.Unlock()
+			}
+			l.removeDirty(cs)
+			cs = next
+			continue
 		}
 		err := l.flushWrites(cs, true)
 		if err != nil {
@@ -2684,18 +2702,13 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 // next writable edge resumes. Returns false if the conn was closed.
 func (l *Loop) handleWritable(cs *connState) {
 	if mu := cs.detachMu; mu != nil && !mu.TryLock() {
-		if dispatchBusy(cs) {
+		if dispatchBusy(cs, &cs.relinkOwed) {
 			// A pipelined request started a handler before the socket
-			// drained (celeris#669). Do not wait for it, and drop the
-			// level-triggered interest, which would otherwise fire on every
-			// epoll_wait until the handler returns. The goroutine flushes
-			// writeBuf itself when the handler returns and hands any
-			// remainder back to the dirty list, which re-arms EPOLLOUT.
-			// A deferred peer close keeps the interest, for the reason
-			// given in flushDirty.
-			if !cs.peerClosed {
-				l.disarmEpollOut(cs)
-			}
+			// drained (celeris#669). Do not wait for it, and do not keep
+			// the level-triggered interest either, which would fire on
+			// every epoll_wait until the handler returns: give the conn
+			// up until its goroutine hands it back (see relink).
+			l.relink(cs)
 			return
 		}
 		mu.Lock()
@@ -2994,7 +3007,7 @@ func (l *Loop) closeConn(fd int) {
 		// gone, the holder is a guarded writeFn in one write, and waiting
 		// for it is bounded; see dispatchBusy.
 		if !cs.detachMu.TryLock() {
-			if leaveCloseToDispatch(cs) {
+			if dispatchBusy(cs, &cs.closeOwed) {
 				return
 			}
 			cs.detachMu.Lock()
@@ -3051,13 +3064,13 @@ func (l *Loop) closeConn(fd int) {
 			//     slot nil: all already done by hijackConn.
 			//   - removeLiveConn and connCount: not ours to do either. An
 			//     off-thread hijack leaves both to drainDetachQueue's
-			//     hijacked branch, on this thread, once the dispatch
-			//     goroutine has exited (celeris#668).
+			//     hijacked branch, on this thread, when it drains the
+			//     notice hijackConn enqueued (celeris#668).
 			//   - CloseH1 and the pool release: not ours to do. Leaving
 			//     detachClosed false is what lets drainDetachQueue reach its
-			//     cs.hijacked branch and return the connState to the pool
-			//     (detachClosed is tested first and would strand it); that
-			//     branch also closes any sendfile dup via releaseConnState.
+			//     cs.hijacked branch (detachClosed is tested first and
+			//     would skip it); an off-thread-hijacked connState is
+			//     never pooled.
 			//   - OnDisconnect: NOT fired. The conn did not disconnect, it
 			//     was handed to the application, and the sync hijack path
 			//     fires nothing either. Both directions are pinned by
