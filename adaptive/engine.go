@@ -1015,7 +1015,6 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		ErrorSend:             pm.ErrorSend + sm.ErrorSend,
 		ErrorRequestBody:      pm.ErrorRequestBody + sm.ErrorRequestBody,
 		ErrorHandler:          pm.ErrorHandler + sm.ErrorHandler,
-		Throughput:            pm.Throughput + sm.Throughput,
 		AsyncRoutes:           asyncRoutes,
 		AsyncPromotedConns:    pm.AsyncPromotedConns + sm.AsyncPromotedConns,
 		// Workers is summed, not taken from the active sub-engine: both

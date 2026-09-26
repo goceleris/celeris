@@ -1294,7 +1294,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			// celeris#626: count this recv. The dispatch path `continue`s,
 			// so it never reaches the inline reqBatch++ below — before this
 			// line an async-promoted conn stopped being counted entirely and
-			// RequestCount (plus Throughput and the adaptive controller's
+			// RequestCount (plus the adaptive controller's throughput and
 			// BytesPerReq, which divides by it) silently flat-lined on the
 			// busiest conns. Counted HERE, on the loop thread, so reqBatch
 			// stays worker-thread-only exactly like bytesReadBatch and

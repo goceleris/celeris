@@ -141,8 +141,8 @@ func doReq(t *testing.T, c net.Conn, br *bufio.Reader, path string) {
 // Before the fix, the only reqBatch++ site sat on the worker's inline path
 // (loop.go:1197), which a promoted connection never reaches — so
 // EngineMetrics.RequestCount stopped advancing on exactly the busiest
-// connections, and everything derived from it (Throughput, the adaptive
-// controller's BytesPerReq) went with it.
+// connections, and everything derived from it (the adaptive controller's
+// ThroughputRPS and BytesPerReq) went with it.
 func TestAsyncPromotedConnRequestCount(t *testing.T) {
 	addr, e, cleanup := startReqCountEngine(t)
 	defer cleanup()
