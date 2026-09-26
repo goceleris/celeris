@@ -218,18 +218,86 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 
 // requestPause asks the engine to suspend inbound delivery, edge-triggered
 // so the callback fires once per high-water crossing.
+//
+// The engine callback is invoked WITH pausedMu held, and that is the point
+// (celeris#667). Deciding under the lock but applying outside it let the
+// appending goroutine and the draining goroutine reach the engine in the
+// OPPOSITE order from the one in which they decided. The engine's closures
+// are Swap-based and ignore the previous value — the early return skips only
+// the wakeup, never the state write (the PauseRecv/ResumeRecv closures the
+// engines install on detach, in engine/iouring/worker.go and
+// engine/epoll/loop.go) — so whichever callback arrives last wins outright
+// and nothing reconciles. A resume could therefore be applied before
+// the pause it was meant to cancel, leaving the engine's recv paused while
+// this reader believed it was running. Nothing re-evaluates after that, so
+// the connection stopped delivering inbound data for the rest of its life.
+// Holding the lock across the callback makes the order the engine observes
+// equal to the order of pausedState transitions.
+//
+// LOCK ORDER: pausedMu -> detachQMu. Never the reverse, and nothing can take
+// them the other way round:
+//
+//   - pausedMu is an unexported field of an unexported type in this package,
+//     so only this package can acquire it, and it does so in exactly two
+//     places (here and resumeIfDrained, Read's resume branch).
+//   - the engine packages do not import middleware/websocket at all, so no
+//     detachQMu holder can reach either of those two places.
+//   - every detachQMu critical section in both engines is a straight-line
+//     queue append plus an atomic store, with no call out of the engine.
+//
+// The eventfd write the callbacks may perform is on an EFD_NONBLOCK
+// descriptor and happens after detachQMu is released, so it can neither block
+// nor extend the hold on pausedMu across a blocking syscall.
 func (r *chanReader) requestPause() {
 	if r.pause == nil {
 		return
 	}
 	r.pausedMu.Lock()
+	// Deferred, not a plain Unlock after the callbacks: a callback that
+	// panics would skip that Unlock, and a caller that recovers the panic
+	// would leave pausedMu held for good — blocking every later resume check
+	// in Read and the next high-water crossing here, on the engine worker
+	// thread.
+	defer r.pausedMu.Unlock()
 	if r.pausedState {
-		r.pausedMu.Unlock()
 		return
 	}
 	r.pausedState = true
-	r.pausedMu.Unlock()
+	// Applied under pausedMu — see the lock-order note above.
 	r.pause()
+	// celeris#672: the pause above was decided from a depth SNAPSHOT taken in
+	// Append, before this function took pausedMu. If the handler drained to
+	// at-or-below lowWater in between, every resume check it made saw
+	// pausedState == false and did nothing, so the pause is already stale.
+	// When the drain reached empty, nothing can ever lift it: Read
+	// re-evaluates the resume only after a successful dequeue, the engine is
+	// paused so it delivers nothing, and the handler blocks in Read for the
+	// rest of the connection's life. Re-check the watermark here, under the
+	// same lock that applied the pause, and lift it at once if it is stale.
+	//
+	// Any dequeue that happens after this check is followed by a resume check
+	// in Read under pausedMu, which now sees pausedState == true, so the
+	// pause cannot go stale again once this critical section ends. The spill
+	// guard matches Read's: never resume while chunks are still queued behind
+	// the channel.
+	if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {
+		r.pausedState = false
+		r.resume()
+	}
+}
+
+// resumeIfDrained is Read's edge-triggered resume: once the depth has fallen
+// to lowWater it lifts the pause, deciding and applying under pausedMu for
+// the reason and in the lock order documented on requestPause
+// (celeris#667). The unlock is deferred for the same reason as there: a
+// resume callback that panics must not leave pausedMu held.
+func (r *chanReader) resumeIfDrained() {
+	r.pausedMu.Lock()
+	defer r.pausedMu.Unlock()
+	if r.pausedState && len(r.ch) <= r.lowWater {
+		r.pausedState = false
+		r.resume()
+	}
 }
 
 // refillFromSpill moves spilled chunks into the channel's tail while there
@@ -306,14 +374,7 @@ func (r *chanReader) Read(p []byte) (int, error) {
 		// while chunks are still spilled — the buffer is over-full, which
 		// is the opposite of the drained condition resume signals.
 		if r.resume != nil && !r.hasSpill() {
-			r.pausedMu.Lock()
-			if r.pausedState && len(r.ch) <= r.lowWater {
-				r.pausedState = false
-				r.pausedMu.Unlock()
-				r.resume()
-			} else {
-				r.pausedMu.Unlock()
-			}
+			r.resumeIfDrained()
 		}
 	}
 	n := copy(p, r.cur)
