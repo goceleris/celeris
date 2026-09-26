@@ -2583,14 +2583,14 @@ func (l *Loop) flushDirty() {
 			}
 			mu.Lock()
 		}
-		if cs.hijacked.Load() {
+		if mu != nil && cs.hijacked.Load() {
 			// An async Hijack took the conn (celeris#668) and closed its
 			// descriptor, whose number may already be someone else's:
 			// writing the bytes still queued here would put them there.
-			// drainDetachQueue settles the rest.
-			if mu != nil {
-				mu.Unlock()
-			}
+			// drainDetachQueue settles the rest. (Only an async conn —
+			// one with a detachMu — is ever hijacked off-thread, so a
+			// sync conn skips the load.)
+			mu.Unlock()
 			l.removeDirty(cs)
 			cs = next
 			continue
