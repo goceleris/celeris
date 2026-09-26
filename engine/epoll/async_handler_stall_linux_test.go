@@ -278,6 +278,39 @@ func TestDeferredPeerCloseSurvivesARunningHandler(t *testing.T) {
 	}
 }
 
+// TestAnOwedCloseIsNeverTransplanted: between the dispatch goroutine's exit
+// and the loop draining its hand-back, the conn is still in the table with no
+// goroutine — the shape tryTransplant hands straight to the other engine. It
+// must not: the move would release the connState the queued hand-back then
+// closes through.
+func TestAnOwedCloseIsNeverTransplanted(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	l.async = true
+	cs.protocol = engine.HTTP1
+	cs.detected = true
+	release := holdAsHandler(t, cs, true)
+	if !returnsWhileHeld(t, release, l.checkTimeouts) {
+		t.Fatal("the reap waited on a running handler (celeris#669)")
+	}
+	release()
+	exitDispatch(l, cs) // the goroutine is gone; its hand-back is queued, not drained
+
+	target := &countingTarget{}
+	t.Cleanup(target.closeAll)
+	l.transplant.Store(&transplantState{target: target})
+	l.tryTransplant(local)
+	l.transplant.Store(nil)
+	if n := target.count(); n != 0 {
+		t.Fatalf("a conn whose close is owed was handed to the other engine (%d adopted)", n)
+	}
+	l.drainDetachQueue()
+	if l.conns[local] != nil || l.closeCount.Load() != 1 || rig.disconnects.Load() != 1 {
+		t.Errorf("the owed close did not complete: slot=%p closeCount=%d hooks=%d",
+			l.conns[local], l.closeCount.Load(), rig.disconnects.Load())
+	}
+}
+
 // TestCloseStillWaitsForABoundedHolder is the negative control for the unit
 // arms. The dispatch goroutine is PARKED, so whoever holds detachMu is a
 // guarded writeFn in the middle of one write — a hold bounded by a syscall,

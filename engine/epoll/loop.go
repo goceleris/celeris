@@ -1242,12 +1242,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 			// ProcessH1, so the worker's next read into cs.buf can't
 			// overwrite in-flight bytes. Zero allocation on steady state.
 			cs.asyncInBuf = append(cs.asyncInBuf, data...)
-			// Never start a dispatch goroutine on a conn whose close is
-			// owed: its last goroutine can exit before the loop drains the
-			// hand-back that finishes the close (celeris#669), and a new one
-			// would only exit again. Evaluated only when no goroutine runs,
-			// so the steady state pays nothing.
-			starting := !cs.asyncRun && !cs.asyncClosed.Load()
+			starting := !cs.asyncRun
 			if starting {
 				cs.asyncRun = true
 			}

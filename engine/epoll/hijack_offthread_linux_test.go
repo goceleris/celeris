@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -421,5 +422,123 @@ func TestAsyncHijackUnderAcceptChurnLeavesTheLoopsSuspendable(t *testing.T) {
 		if l.connCount != 0 || len(l.liveConns) != 0 {
 			t.Errorf("loop %d suspended with connCount=%d liveConns=%d, want 0 and 0", i, l.connCount, len(l.liveConns))
 		}
+	}
+}
+
+// TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack pins why accept
+// installs its slot under driverMu. An off-thread hijack clears its slot under
+// that lock and then closes the descriptor; the kernel hands the lowest free
+// number to the next accept4, so the loop can install a new conn at the very
+// slot the dispatch goroutine just wrote, with nothing else ordering the two.
+// The loop side below learns that the number is free from the kernel alone
+// (F_GETFD), exactly as accept4 does, so under -race the only thing that can
+// order the two slot writes is the lock.
+func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
+	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+	if err != nil {
+		t.Fatalf("epoll_create1: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(epfd) })
+	lfd, err := createListenSocket("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen socket: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Close(lfd) })
+	addr := boundAddr(lfd).String()
+	l := &Loop{
+		epollFD:      epfd,
+		listenFD:     lfd,
+		async:        true,
+		conns:        make([]*connState, connTableSize),
+		activeConns:  &atomic.Int64{},
+		errs:         &errclass.Counters{},
+		reqCount:     &atomic.Uint64{},
+		acceptCount:  &atomic.Uint64{},
+		closeCount:   &atomic.Uint64{},
+		bytesRead:    &atomic.Uint64{},
+		bytesWritten: &atomic.Uint64{},
+		timerFD:      -1,
+		resolved:     resource.ResolvedResources{BufferSize: 4096},
+	}
+	dial := func() net.Conn {
+		c, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	acceptOne := func() {
+		for dl := time.Now().Add(3 * time.Second); time.Now().Before(dl); {
+			before := len(l.liveConns)
+			l.acceptAll(context.Background(), time.Now().UnixNano())
+			if len(l.liveConns) > before {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("accept timed out")
+	}
+
+	dial()
+	acceptOne()
+	cs := l.liveConns[0]
+	fd := cs.fd
+	cs.protocol = engine.HTTP1
+	cs.detected = true
+	cs.h1State = conn.NewH1State()
+	cs.asyncInMu.Lock()
+	cs.asyncRun = true // the conn's dispatch goroutine is alive: the hijack is off-thread
+	cs.asyncInMu.Unlock()
+	dial() // queued before the hijack frees fd, so the next accept4 takes fd
+
+	hijacked := make(chan net.Conn, 1)
+	go func() { // the dispatch goroutine, inside the handler
+		cs.detachMu.Lock()
+		nc, herr := l.hijackConn(fd)
+		cs.detachMu.Unlock()
+		if herr != nil {
+			nc = nil
+		}
+		hijacked <- nc
+	}()
+	accepted := make(chan struct{})
+	go func() { // the loop thread
+		defer close(accepted)
+		for {
+			if _, ferr := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); ferr != nil {
+				break
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+		for range 3000 {
+			if l.acceptAll(context.Background(), time.Now().UnixNano()) != acceptDrained || len(l.liveConns) > 1 {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	<-accepted
+	nc := <-hijacked
+	if nc == nil {
+		t.Fatal("hijackConn failed")
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+
+	if len(l.liveConns) != 2 {
+		t.Fatalf("liveConns = %d entries after the second accept, want 2 (the hijacked conn until its hand-back, "+
+			"and the new one)", len(l.liveConns))
+	}
+	next := l.liveConns[1]
+	if next.fd != fd {
+		t.Skipf("the kernel gave the new conn fd %d, not the released %d; the reuse under test did not happen", next.fd, fd)
+	}
+	if l.conns[fd] != next {
+		t.Fatalf("slot %d holds %p, want the new conn %p", fd, l.conns[fd], next)
+	}
+	handBack(l, cs)
+	assertLiveSet(t, l, next)
+	if l.connCount != 1 {
+		t.Errorf("connCount = %d after the hand-back, want 1", l.connCount)
 	}
 }
