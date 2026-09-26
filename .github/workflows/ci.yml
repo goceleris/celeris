@@ -121,10 +121,13 @@ jobs:
       # msr1 + Multipass and is exercised end-to-end by the
       # autobahn-fuzzingclient test under `mage testAutobahn`.
       - name: Root module — race tests (excluding test/ + adaptive/ + websocket)
+        shell: bash
         run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)  nproc: $(nproc)  uid: $(id -u)  synack: $(cat /proc/sys/net/ipv4/tcp_synack_retries)"
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
-          go test -race -count=1 -timeout=300s $pkgs
+          go test -race -count=1 -timeout=300s -v $pkgs 2>&1 | tee /tmp/root.log
       # celeris#657: the step above runs ./engine/iouring WITHOUT -v, so a skip
       # there prints nothing and the package still reports `ok`. That is how the
       # celeris#656 leak shipped with no cover. Most celeris#657 tests can skip:
@@ -247,23 +250,38 @@ jobs:
             exit 1
           fi
       - name: middleware/compress
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-compress.log
         working-directory: middleware/compress
       - name: middleware/metrics
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-metrics.log
         working-directory: middleware/metrics
       - name: middleware/otel
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-otel.log
         working-directory: middleware/otel
       - name: middleware/protobuf
-        run: go test -race -count=1 -timeout=120s ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v ./... 2>&1 | tee /tmp/mw-protobuf.log
         working-directory: middleware/protobuf
       - name: middleware/websocket — backpressure tests
         env:
           WS484_CONNS: "16"
           WS484_BURSTS: "2"
           WS484_BURST_FRAMES: "1000"
-        run: go test -race -count=1 -timeout=120s -run '^TestBackpressure' ./middleware/websocket/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s -v -run '^TestBackpressure' ./middleware/websocket/... 2>&1 | tee /tmp/ws.log
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
@@ -524,21 +542,25 @@ jobs:
         with:
           go-version: "1.27.0"
       - name: Postgres conformance
-        run: >-
-          go test -tags postgres -race -count=1 -timeout=300s
-          ./test/conformance/postgres/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags postgres -race -count=1 -timeout=300s -v ./test/conformance/postgres/... 2>&1 | tee -a /tmp/drv.log
       - name: Redis conformance
-        run: >-
-          go test -tags redis -race -count=1 -timeout=300s
-          ./test/conformance/redis/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags redis -race -count=1 -timeout=300s -v ./test/conformance/redis/... 2>&1 | tee -a /tmp/drv.log
       - name: Postgres session store integration
-        run: >-
-          go test -tags integration -race -count=1 -timeout=120s
-          ./middleware/session/postgresstore/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags integration -race -count=1 -timeout=120s -v ./middleware/session/postgresstore/... 2>&1 | tee -a /tmp/drv.log
       - name: Redis session store integration
-        run: >-
-          go test -tags integration -race -count=1 -timeout=120s
-          ./middleware/session/redisstore/...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -tags integration -race -count=1 -timeout=120s -v ./middleware/session/redisstore/... 2>&1 | tee -a /tmp/drv.log
 
   build:
     name: Build (${{ matrix.os }})
@@ -594,3 +616,106 @@ jobs:
       - name: middleware/protobuf
         run: govulncheck ./...
         working-directory: middleware/protobuf
+
+  tmp684-mut-sendfile-hook:
+    name: THROWAWAY celeris#684 mutant sendfile-hook (root step, -v)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: Apply mutant sendfile-hook, then run the root step with -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 .github/tmp684/mutate.py sendfile-hook
+          git diff --stat
+          echo "memlock (KiB): $(ulimit -l)"
+          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+          # shellcheck disable=SC2086  # word-splitting is intentional
+          go test -race -count=1 -timeout=300s -v $pkgs 2>&1 | tee /tmp/mut.log
+
+  tmp684-mut-sendfile-range:
+    name: THROWAWAY celeris#684 mutant sendfile-range (root step, -v)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: Apply mutant sendfile-range, then run the root step with -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 .github/tmp684/mutate.py sendfile-range
+          git diff --stat
+          echo "memlock (KiB): $(ulimit -l)"
+          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+          # shellcheck disable=SC2086  # word-splitting is intentional
+          go test -race -count=1 -timeout=300s -v $pkgs 2>&1 | tee /tmp/mut.log
+
+  tmp684-592-raised:
+    name: THROWAWAY celeris#684 TestAdaptiveSettledRouteRetime592 (memlock raised)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: TestAdaptiveSettledRouteRetime592, memlock raised
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=600s -v -run '^TestAdaptiveSettledRouteRetime592$' . 2>&1 | tee /tmp/592.log
+
+  tmp684-592-raised-mut593:
+    name: THROWAWAY celeris#684 TestAdaptiveSettledRouteRetime592 (memlock raised, celeris#593 TryLock reverted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: TestAdaptiveSettledRouteRetime592, memlock raised, celeris#593 TryLock reverted
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          python3 .github/tmp684/mutate.py mut593
+          git diff --stat
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=600s -v -run '^TestAdaptiveSettledRouteRetime592$' . 2>&1 | tee /tmp/592.log
+
+  tmp684-592-m8-require:
+    name: THROWAWAY celeris#684 TestAdaptiveSettledRouteRetime592 (runner 8 MiB, CELERIS_REQUIRE_IOURING_WORKERS=1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: TestAdaptiveSettledRouteRetime592, runner 8 MiB, CELERIS_REQUIRE_IOURING_WORKERS=1
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=600s -v -run '^TestAdaptiveSettledRouteRetime592$/^iouring$' . 2>&1 | tee /tmp/592.log
