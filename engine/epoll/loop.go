@@ -24,6 +24,7 @@ import (
 	"github.com/goceleris/celeris/engine/internal/errclass"
 	"github.com/goceleris/celeris/internal/conn"
 	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/internal/wakefd"
@@ -107,16 +108,28 @@ type Loop struct {
 	wake         chan struct{}
 	wakeMu       sync.Mutex
 	suspended    atomic.Bool
-	// listenFDClosed signals that the loop has closed its listen FD in
-	// response to acceptPaused=true. PauseAccept polls this so it only
-	// returns once the SO_REUSEPORT group has actually shed this listener
-	// — important for the adaptive engine, where the standby's listen
-	// sockets must be out of the kernel routing pool before the bound
-	// address is exposed to the caller (otherwise the first burst of
-	// dials can land on the standby and get RST when it pauses).
-	// Reset to false in ResumeAccept so a Pause→Resume→Pause cycle
-	// re-arms the signal.
+	// listenFDClosed signals that the loop has no listen FD while
+	// acceptPaused=true: its pause linger has run out and the listener is
+	// closed, or the loop has exited (shutdown sets it). PauseAccept polls
+	// this so it only returns once the SO_REUSEPORT group has actually shed
+	// this listener. It stays false while the loop lingers (celeris#662):
+	// the listener is still open and still accepting then. Reset to false
+	// in ResumeAccept so a Pause→Resume→Pause cycle re-arms the signal.
 	listenFDClosed atomic.Bool
+	// lingerUntil is the deadline, in Unix nanoseconds, of the accept-pause
+	// linger in progress, or 0 when none is (celeris#662): the listener's
+	// TCP_DEFER_ACCEPT has been cleared and it keeps accepting until then.
+	// Loop-thread-only.
+	lingerUntil int64
+	// deferCapable records whether listenFD was created with
+	// TCP_DEFER_ACCEPT, which is whether a pause has anything to clear and
+	// linger for. A listener created without it (DisableDeferAccept) closes
+	// at once. Loop-thread-only.
+	deferCapable bool
+	// pause is the engine's record of the pause in progress, written by
+	// BeginPauseAccept before it sets acceptPaused. Nil in bare test loops,
+	// which deferlinger treats as "no guard, no delay".
+	pause *deferlinger.PauseState
 
 	reqCount    *atomic.Uint64
 	activeConns *atomic.Int64
@@ -355,13 +368,14 @@ func (l *Loop) run(ctx context.Context) {
 	}
 	l.epollFD = epollFD
 
-	listenFD, err := createListenSocket(l.cfg.Addr)
+	listenFD, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 	if err != nil {
 		_ = unix.Close(epollFD)
 		l.ready <- fmt.Errorf("loop %d: listen socket: %w", l.id, err)
 		return
 	}
 	l.listenFD = listenFD
+	l.deferCapable = !l.cfg.DisableDeferAccept
 
 	if err := unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, listenFD, &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLET,
@@ -435,45 +449,30 @@ func (l *Loop) run(ctx context.Context) {
 			return
 		}
 
-		// Cache the atomic load: ACTIVE→DRAINING and SUSPENDED→ACTIVE
-		// branches both read it. Saves 1 atomic load per event-loop
-		// iteration on the steady-state hot path.
+		// Cache the atomic load: ACTIVE→LINGERING→DRAINING and
+		// SUSPENDED→ACTIVE branches both read it. Saves 1 atomic load per
+		// event-loop iteration on the steady-state hot path.
 		paused := l.acceptPaused.Load()
-		if l.listenFD >= 0 && paused {
-			// Connections still in the kernel accept queue completed their
-			// handshake before the pause and may already have sent a
-			// request. Accept them through the normal path and serve them
-			// before the listen socket goes: the close would otherwise abort
-			// them (celeris#662). This used to accept them only to shut them
-			// down, on the theory that a FIN is kinder than the close's RST —
-			// but either way the client lost a request it had sent, and the
-			// engine counted nothing.
-			l.acceptQueuedOnPause(ctx)
-			_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
-			_ = unix.Close(l.listenFD)
-			l.listenFD = -1
-			// No listen fd to drain — clear the re-arm flag so it doesn't
-			// pin epoll_wait at 0ms (busy-spin) while paused/suspended.
-			l.listenHot = false
+		if l.listenFD >= 0 && (paused || l.lingerUntil != 0) {
+			// Cold: a pause is starting, lingering, ending, or being
+			// withdrawn by a resume (celeris#662). See stepAcceptPause.
+			l.stepAcceptPause(ctx, paused)
 		}
-		// Maintain the listenFDClosed signal that PauseAccept polls on.
-		// Set it whenever paused==true regardless of whether we just
-		// closed the FD or it was already -1 from a prior Pause-Resume
-		// cycle that hadn't re-created the socket yet (race window:
-		// ResumeAccept clears the flag and toggles paused=false; the
-		// worker may be mid-iteration when paused flips back to true,
-		// so listenFD can transiently be -1 while paused is true). Also
-		// clear the flag when paused goes false so a subsequent Pause
-		// observes a fresh signal once the new listenFD is created.
-		if paused {
-			l.listenFDClosed.Store(true)
-		} else {
-			l.listenFDClosed.Store(false)
-		}
+		// Maintain the listenFDClosed signal that PauseAccept polls on:
+		// true exactly while paused with no listen fd. That covers the
+		// close stepAcceptPause just did and an fd that was already -1
+		// from a prior Pause-Resume cycle that hadn't re-created the
+		// socket yet (ResumeAccept clears the flag and toggles
+		// paused=false; the loop may be mid-iteration when paused flips
+		// back to true). It is false while the loop lingers, because the
+		// listener is still open and accepting, and false once paused goes
+		// false so a subsequent Pause observes a fresh signal.
+		l.listenFDClosed.Store(paused && l.listenFD < 0)
 
 		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
 		if l.listenFD < 0 && !paused {
-			fd, err := createListenSocket(l.cfg.Addr)
+			fd, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
+			l.deferCapable = !l.cfg.DisableDeferAccept
 			if err != nil {
 				// This loop is about to stop accepting for good, so
 				// the bump is not a rate: it is the one record that
@@ -506,6 +505,13 @@ func (l *Loop) run(ctx context.Context) {
 		// -1 and the standby loop blocks exactly as it did before.
 		if ms := l.sweepWaitMs(); ms >= 0 && (timeoutMs < 0 || ms < timeoutMs) {
 			timeoutMs = ms
+		}
+		// A lingering pause must wake for its deadline (celeris#662). Applied
+		// AFTER the sweep cap so the wait is the minimum of both: while the
+		// listener is open the wait is already at most a few ms
+		// (adaptiveTimeoutMs), so this is defence, not the mechanism.
+		if l.lingerUntil != 0 {
+			timeoutMs = l.lingerTimeoutMs(timeoutMs)
 		}
 		// acceptAll stopped with the listen backlog possibly non-empty
 		// (per-call cap hit, or EMFILE/ENFILE back-off). The listen socket
@@ -1029,6 +1035,13 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 // (celeris#662). Their handshakes completed before the pause and their
 // clients may already have sent a request; the close would abort them.
 //
+// It can only reach what the ACCEPT QUEUE holds. While TCP_DEFER_ACCEPT is
+// set the kernel keeps a handshake-complete connection that has sent no data
+// out of that queue altogether, which is why a listener that has the option
+// lingers before it gets here (stepAcceptPause): the option is cleared
+// first, and by the deadline the kernel has promoted into this queue every
+// connection it deferred before the clear.
+//
 // They go through acceptAll, the registration every accept uses, because they
 // are ordinary connections: AcceptCount and ActiveConnections count them,
 // OnConnect fires, sockopts apply, and a descriptor that cannot be registered
@@ -1051,12 +1064,82 @@ const pauseAcceptRounds = connTableSize / acceptAllCap
 //     completes between the final EAGAIN and the close. That is inherent to
 //     closing a listen socket; only the kernel's tcp_migrate_req moves those
 //     to another listener in the SO_REUSEPORT group.
+//   - Not covered either: a connection deferred before the clear whose
+//     promotion comes after the linger's deadline, which takes a lost
+//     retransmitted SYN-ACK or a client that does not answer it.
 func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
 	for range pauseAcceptRounds {
 		if l.acceptAll(ctx, time.Now().UnixNano()) != acceptCapped {
 			return
 		}
 	}
+}
+
+// stepAcceptPause runs one step of the accept pause on the loop thread, at
+// the top of an iteration, while the listener is open and the engine is
+// paused or this loop is lingering (celeris#662, celeris#675).
+//
+//   - ACTIVE → LINGERING (paused, no linger yet): clear TCP_DEFER_ACCEPT on
+//     this loop's listener (and apply the tcp_synack_retries=0 guard when
+//     the pause asked for it), then linger until deferlinger.Linger after
+//     that clear. The listener stays registered, so connections keep being
+//     accepted through acceptAll: a connection deferred before the clear is
+//     promoted by the kernel about a second after its SYN and raises an
+//     edge like any other, and one that arrives after the clear enters the
+//     accept queue at once. A listener created without the option, or a
+//     zero linger, closes at once instead: nothing on it can be deferred.
+//   - LINGERING, before the deadline: nothing.
+//   - LINGERING → CLOSED at the deadline: the drain-and-close.
+//   - LINGERING → ACTIVE (a resume arrived first): the option goes back on
+//     the same descriptor, which is never closed.
+func (l *Loop) stepAcceptPause(ctx context.Context, paused bool) {
+	switch {
+	case !paused:
+		deferlinger.Leave(l.listenFD, l.deferCapable, l.logger, "loop", l.id)
+		l.lingerUntil = 0
+	case l.lingerUntil == 0:
+		if !l.pause.Observed() {
+			return // test hook only: model a loop that sees the pause late
+		}
+		if l.lingerUntil = deferlinger.Enter(l.listenFD, l.deferCapable, l.pause, l.logger, "loop", l.id); l.lingerUntil == 0 {
+			l.closeListenerAfterDrain(ctx)
+		}
+	case time.Now().UnixNano() >= l.lingerUntil:
+		l.closeListenerAfterDrain(ctx)
+	}
+}
+
+// closeListenerAfterDrain is the pause's close: serve every connection still
+// in the accept queue (acceptQueuedOnPause), then take the listener out of
+// epoll and close it, which removes it from the SO_REUSEPORT group.
+func (l *Loop) closeListenerAfterDrain(ctx context.Context) {
+	// Connections still in the kernel accept queue completed their
+	// handshake before the close and may already have sent a request.
+	// Accept them through the normal path and serve them before the listen
+	// socket goes: the close would otherwise abort them (celeris#662).
+	l.acceptQueuedOnPause(ctx)
+	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
+	_ = unix.Close(l.listenFD)
+	l.listenFD = -1
+	// No listen fd to drain — clear the re-arm flag so it doesn't pin
+	// epoll_wait at 0ms (busy-spin) while paused/suspended.
+	l.listenHot = false
+	l.lingerUntil = 0
+	deferlinger.NoteClose()
+}
+
+// lingerTimeoutMs caps an epoll_wait timeout at the time left to the pause
+// linger's deadline, rounded up so the wait does not return just short of it
+// and spin.
+func (l *Loop) lingerTimeoutMs(ms int) int {
+	left := l.lingerUntil - time.Now().UnixNano()
+	if left <= 0 {
+		return 0
+	}
+	if lm := int((left + int64(time.Millisecond) - 1) / int64(time.Millisecond)); lm < ms {
+		return lm
+	}
+	return ms
 }
 
 // growConns enlarges l.conns so that index fd is in range, doubling the
@@ -3069,6 +3152,11 @@ func (l *Loop) shutdown() {
 	if l.listenFD >= 0 {
 		_ = unix.Close(l.listenFD)
 	}
+	// The loop has left the SO_REUSEPORT group for good. PauseAccept waits
+	// for this flag, and a loop that exits in the middle of a pause linger
+	// would otherwise leave it false until PauseAccept's own bound ran out
+	// (celeris#662).
+	l.listenFDClosed.Store(true)
 	// celeris#655: Close waits for the signals already in flight and turns
 	// every later one into a no-op, so the producers asyncWG does not track
 	// — detached WS/SSE callbacks, the H2 write queue — cannot write this
@@ -3084,7 +3172,12 @@ func (l *Loop) shutdown() {
 	l.closeEpollFD()
 }
 
-func createListenSocket(addr string) (int, error) {
+// createListenSocket binds and listens on addr. deferAccept asks for
+// TCP_DEFER_ACCEPT (resource.Config.DisableDeferAccept turns it off). A
+// pause clears the option on this socket and lingers before it closes it
+// (stepAcceptPause), so the option costs a pause time, not connections
+// (celeris#662).
+func createListenSocket(addr string, deferAccept bool) (int, error) {
 	sa, err := parseAddr(addr)
 	if err != nil {
 		return -1, err
@@ -3113,9 +3206,13 @@ func createListenSocket(addr string) (int, error) {
 	// socket at SYN time, so per-accept ApplyFD can skip its own NODELAY
 	// setsockopt (one fewer syscall per accept on the hot path).
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-	// TCP_DEFER_ACCEPT: kernel holds connections until data arrives,
-	// eliminating wasted accept+wait cycles for idle connections.
-	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	// TCP_DEFER_ACCEPT: the kernel holds a connection out of the accept queue
+	// until its first data arrives, saving a wakeup per idle connection. It
+	// also hides that connection from acceptQueuedOnPause, which is why a
+	// pause clears it and lingers before the close (celeris#662).
+	if deferAccept {
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
+	}
 	// TCP_FASTOPEN: allow data in SYN packet, saving 1 RTT for TFO-capable clients.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 

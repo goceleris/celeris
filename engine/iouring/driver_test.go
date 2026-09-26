@@ -37,62 +37,80 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 		Resources: resource.Resources{Workers: 2},
 	}
 
-	// Use a TCP listener to capture a free port, then hand the address to the
-	// engine. Engine rebinds via SO_REUSEPORT.
-	ln, err := net.Listen("tcp", cfg.Addr)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	cfg.Addr = ln.Addr().String()
-	_ = ln.Close()
-
-	var h stream.Handler = testHandler{}
-	e, err := New(cfg, h)
-	if err != nil {
-		t.Skipf("iouring engine unavailable: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	listenErr := make(chan error, 1)
-	go func() {
-		listenErr <- e.Listen(ctx)
-		close(done)
-	}()
-
-	// Wait until the engine has at least one worker ready. On shared
-	// CI runners (GitHub Actions Azure VMs) io_uring ring setup can
-	// legitimately take 3-5 seconds when the host is under load;
-	// 30s covers the tail without hiding real failures.
-	//
-	// If Listen() returns early with an error (e.g. the runner lacks
-	// the kernel feature a tier needs and every fallback has been
-	// exhausted), surface it as a skip rather than the opaque
-	// "engine did not start in time" timeout.
-	start := time.Now()
-	deadline := start.Add(30 * time.Second)
-	for {
-		e.mu.Lock()
-		n := len(e.workers)
-		e.mu.Unlock()
-		if n > 0 {
-			break
+	var (
+		e      *Engine
+		cancel context.CancelFunc
+		done   chan struct{}
+	)
+	// A start that fails only on ring ENOMEM is retried: at a low
+	// RLIMIT_MEMLOCK the kernel may not have uncharged the rings of the
+	// engines the tests before this one stopped (ring_budget_linux_test.go).
+	_, _, err := retryRingENOMEM(func() error {
+		// Use a TCP listener to capture a free port, then hand the address
+		// to the engine. Engine rebinds via SO_REUSEPORT.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
 		}
-		select {
-		case err := <-listenErr:
-			// Listen returned before workers populated — it failed.
-			if err != nil {
-				t.Skipf("iouring engine Listen failed on this host: %v", err)
+		cfg.Addr = ln.Addr().String()
+		_ = ln.Close()
+
+		var h stream.Handler = testHandler{}
+		e, err = New(cfg, h)
+		if err != nil {
+			t.Skipf("iouring engine unavailable: %v", err)
+		}
+
+		var ctx context.Context
+		ctx, cancel = context.WithCancel(context.Background())
+		done = make(chan struct{})
+		listenErr := make(chan error, 1)
+		go func() {
+			listenErr <- e.Listen(ctx)
+			close(done)
+		}()
+
+		// Wait until the engine has at least one worker ready. On shared
+		// CI runners (GitHub Actions Azure VMs) io_uring ring setup can
+		// legitimately take 3-5 seconds when the host is under load;
+		// 30s covers the tail without hiding real failures.
+		//
+		// If Listen() returns early with an error (e.g. the runner lacks
+		// the kernel feature a tier needs and every fallback has been
+		// exhausted), hand it back: a ring ENOMEM is retried, anything
+		// else is judged below rather than as the opaque "engine did not
+		// start in time" timeout.
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			e.mu.Lock()
+			n := len(e.workers)
+			e.mu.Unlock()
+			if n > 0 {
+				return nil
 			}
-			t.Fatal("engine.Listen returned nil without populating workers")
-		default:
+			select {
+			case err := <-listenErr:
+				// Listen returned before workers populated — it failed.
+				cancel()
+				if err != nil {
+					return err
+				}
+				t.Fatal("engine.Listen returned nil without populating workers")
+			default:
+			}
+			if time.Now().After(deadline) {
+				cancel()
+				<-done
+				t.Fatalf("engine did not start within 30s (workers still empty)")
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			cancel()
-			<-done
-			t.Fatalf("engine did not start within 30s (workers still empty)")
+	})
+	if err != nil {
+		if ioUringUnavailable639(err) {
+			skipUnlessIOUringUnusable(t, err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		t.Skipf("iouring engine Listen failed on this host: %v", err)
 	}
 
 	return e, func() {

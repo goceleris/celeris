@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/deferlinger"
 )
 
 // procSelfFDCount counts open file descriptors for the current process by
@@ -40,12 +43,26 @@ func procSelfFDCount(t *testing.T) int {
 //     drains asynchronously, so we poll the count down before asserting.
 //   - The engine still ACCEPTS after the storm (one final dial succeeds).
 //   - SwitchRejectedCount / AdaptiveSwitches are observable (logged).
+//   - The storm actually closed listen sockets under the accepts.
+//
+// The race this test exists for is a listen-fd CLOSE against in-flight
+// accepts. Since celeris#662 a switch only starts the outgoing engine's pause
+// and that engine lingers for about 1.5 s before it closes anything, so a
+// storm of switches every few hundred microseconds would keep resuming
+// lingering listeners and never close one. The test therefore sets the
+// linger to 0 and, after each switch, waits for the outgoing engine's
+// listeners to close, as the synchronous pause did before, and asserts from
+// deferlinger's close counter that closes happened.
 func TestAdaptiveSwitchVsAcceptChurn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
 	}
+	oldLinger := deferlinger.SetLinger(0)
+	t.Cleanup(func() { deferlinger.SetLinger(oldLinger) })
 	e, stop := newBoundAdaptive(t)
 	defer stop()
+	// Only the storm below switches this engine.
+	e.FreezeSwitching()
 
 	addr := e.Addr().String()
 
@@ -90,13 +107,16 @@ func TestAdaptiveSwitchVsAcceptChurn(t *testing.T) {
 	}
 
 	// Switch stresser: fire ForceSwitch on a tight cadence so a listen-fd
-	// close repeatedly races the in-flight accepts above.
+	// close repeatedly races the in-flight accepts above. After each switch,
+	// wait for the outgoing engine's listeners to close.
+	closes0 := deferlinger.Snapshot().Closes
 	switchDone := make(chan struct{})
 	switchAttempts := atomic.Int32{}
 	go func() {
 		defer close(switchDone)
 		for time.Now().Before(deadline) {
 			e.ForceSwitch()
+			waitOutgoingClosed662(e)
 			switchAttempts.Add(1)
 			time.Sleep(300 * time.Microsecond)
 		}
@@ -128,7 +148,29 @@ func TestAdaptiveSwitchVsAcceptChurn(t *testing.T) {
 	}
 	_ = c.Close()
 
-	t.Logf("switchAttempts=%d switchRejected=%d adaptiveSwitches=%d fd baseline=%d after=%d",
-		switchAttempts.Load(), e.SwitchRejectedCount(), e.Metrics().AdaptiveSwitches,
+	closes := deferlinger.Snapshot().Closes - closes0
+	t.Logf("switchAttempts=%d switchRejected=%d adaptiveSwitches=%d listenerClosesDuringStorm=%d "+
+		"fd baseline=%d after=%d",
+		switchAttempts.Load(), e.SwitchRejectedCount(), e.Metrics().AdaptiveSwitches, closes,
 		baseline, after)
+	if closes == 0 {
+		t.Errorf("the storm closed no listen socket, so the listen-fd close this test races " +
+			"against in-flight accepts never happened")
+	}
+}
+
+// waitOutgoingClosed662 blocks until the sub-engine the last switch left has
+// closed its listeners: PauseAccept on it restarts nothing that has not
+// started and returns once every listener is closed.
+func waitOutgoingClosed662(e *Engine) {
+	e.mu.Lock()
+	active := e.ActiveEngine()
+	out := e.primary
+	if active == e.primary {
+		out = e.secondary
+	}
+	e.mu.Unlock()
+	if ac, ok := out.(engine.AcceptController); ok && out != nil {
+		_ = ac.PauseAccept()
+	}
 }

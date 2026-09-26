@@ -47,7 +47,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Content negotiation** — `Negotiate`, `Respond`, `AcceptsEncodings`, `AcceptsLanguages`.
 - **Configurable body limits** — `MaxRequestBodySize` enforced on HTTP/1.1 and h2c (the net/http bridge has a fixed 100 MB cap).
 - **100-continue control** — `OnExpectContinue` callback validates uploads before the body transfers.
-- **Accept control** — `PauseAccept()` / `ResumeAccept()` for graceful load shedding.
+- **Accept control** — `PauseAccept()` / `ResumeAccept()` for graceful load shedding. A pause carries clients that have connected but not yet sent their request: it keeps the listen sockets open for about 1.5 s with `TCP_DEFER_ACCEPT` cleared before closing them, and blocks for that long; set `DisableDeferAccept` for a pause that closes at once ([#662](https://github.com/goceleris/celeris/issues/662), [#675](https://github.com/goceleris/celeris/issues/675)).
 - **Zero-downtime restart** — `InheritListener` + `StartWithListener` for socket inheritance.
 - **Built-in metrics** — atomic counters, CPU-utilization sampling, on by default via `Server.Collector().Snapshot()` (opt out with `Config.DisableMetrics`).
 - **Per-route async dispatch** — `Route.Async()` / `Route.Sync()` choose inline-on-worker vs. per-conn dispatch goroutine per route; h2 chooses per stream.

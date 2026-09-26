@@ -30,7 +30,23 @@ type Engine interface {
 // control, used by the adaptive engine to pause/resume individual sub-engines
 // during switches.
 type AcceptController interface {
-	// PauseAccept stops accepting new connections. Existing connections continue.
+	// PauseAccept stops accepting new connections and returns once the
+	// listen sockets are closed. Connections already accepted continue to be
+	// served, and those still queued in the kernel's accept queue at the
+	// close are drained and served (celeris#663).
+	//
+	// A connection whose handshake completed before the pause but which had
+	// not sent its request yet is carried across it too (celeris#662,
+	// celeris#675). While TCP_DEFER_ACCEPT is on, the default, the kernel
+	// holds such a connection outside the accept queue until about one
+	// second after its SYN, so the epoll and io_uring engines clear the
+	// option on the pausing listeners and keep them open, accepting and
+	// serving, for about 1.5 s before they close them. PauseAccept blocks
+	// for that long. A handshake still in flight at the close is reset, as
+	// closing a listen socket always does, and so is a client whose
+	// retransmitted SYN-ACK is lost or goes unanswered.
+	// resource.Config.DisableDeferAccept turns the option off; the pause
+	// then closes the listeners at once.
 	PauseAccept() error
 	// ResumeAccept resumes accepting new connections after a pause.
 	ResumeAccept() error
