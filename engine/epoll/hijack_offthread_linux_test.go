@@ -632,3 +632,47 @@ func TestDirtyPassSkipsAHijackedConn(t *testing.T) {
 		t.Error("the hijacked conn is still on the dirty list")
 	}
 }
+
+// TestTwoQueueEntriesForAHijackedConnReachNoPooledConnState: a pipelined
+// request whose predecessor's response is still in writeBuf when its handler
+// hijacks makes runAsyncHandler enqueue cs twice on its way out — once for
+// the partial flush, once for ErrHijacked. The first entry used to return cs
+// to the pool, and the second then fell through every branch to markDirty on
+// the pooled connState, leaving it on the loop's dirty list for the next
+// connection that acquires it.
+func TestTwoQueueEntriesForAHijackedConnReachNoPooledConnState(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	cs.writeBuf = append(cs.writeBuf[:0], "partial"...)
+	cs.pendingBytes = len(cs.writeBuf)
+
+	cs.detachMu.Lock()
+	nc, err := l.hijackConn(local)
+	cs.detachMu.Unlock()
+	if err != nil {
+		t.Fatalf("hijackConn: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+
+	// runAsyncHandler's exit after ErrHijacked with writeBuf non-empty: the
+	// partial enqueue, then the processErr enqueue.
+	cs.asyncClosed.Store(true)
+	cs.asyncInMu.Lock()
+	cs.asyncRun = false
+	cs.asyncInMu.Unlock()
+	for range 2 {
+		l.detachQMu.Lock()
+		l.detachQueue = append(l.detachQueue, cs)
+		l.detachQPending.Store(1)
+		l.detachQMu.Unlock()
+	}
+	l.drainDetachQueue()
+
+	if l.dirtyHead != nil || cs.dirty {
+		t.Fatalf("a queue entry for the hijacked conn put a connState on the dirty list after the first "+
+			"entry had released it (dirtyHead=%p, cs.dirty=%v)", l.dirtyHead, cs.dirty)
+	}
+	if l.connCount != 0 {
+		t.Errorf("connCount = %d, want 0", l.connCount)
+	}
+}
