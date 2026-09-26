@@ -242,6 +242,15 @@ func (s *Server) OnError(handler func(c *Context, err error)) *Server {
 // OnShutdown registers a function to be called during Server.Shutdown.
 // Hooks fire in registration order with the shutdown context. Must be
 // called before Start.
+//
+// When cancelling the context of [Server.StartWithContext] or
+// [Server.StartWithListenerAndContext] is what shuts the server down, the
+// hooks run before that call returns: it waits for the Shutdown the cancel
+// triggers, hooks included. A hook must therefore not wait for that Start
+// call to return, directly or through anything that happens only after it
+// returns. The two would wait on each other: a hook that returns when its ctx
+// is done ends the wait after [Config.ShutdownTimeout], and a hook that
+// ignores ctx never does.
 func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 	s.shutdownHooks = append(s.shutdownHooks, fn)
 	return s
@@ -808,7 +817,8 @@ func (s *Server) StartWithListener(ln net.Listener) error {
 // StartWithListenerAndContext combines [Server.StartWithListener] and
 // [Server.StartWithContext]. When the context is canceled, the server shuts
 // down gracefully using [Config.ShutdownTimeout], and this call returns once
-// that shutdown, including the [Server.OnShutdown] hooks, has finished.
+// that shutdown, including the [Server.OnShutdown] hooks, has finished. A hook
+// must therefore not wait for this call to return; see [Server.OnShutdown].
 func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listener) error {
 	eng, err := s.prepareWithListener(ln)
 	if err != nil {
@@ -898,7 +908,8 @@ func InheritListener(envVar string) (net.Listener, error) {
 // StartWithContext starts the server with the given context for lifecycle management.
 // When the context is canceled, the server shuts down gracefully using
 // Config.ShutdownTimeout (default 30s), and StartWithContext returns once that
-// shutdown, including the [Server.OnShutdown] hooks, has finished.
+// shutdown, including the [Server.OnShutdown] hooks, has finished. A hook must
+// therefore not wait for StartWithContext to return; see [Server.OnShutdown].
 //
 // Returns ErrAlreadyStarted if called more than once. May also return
 // configuration validation errors or engine initialization errors.
