@@ -604,35 +604,9 @@ func (l *Loop) run(ctx context.Context) {
 				}
 			}
 
-			// EPOLLRDHUP: peer half-closed (sent FIN). drainRead's short-read
-			// fast path returns without a trailing EAGAIN read, so a FIN that
-			// rode the same readable edge as the request (client writes then
-			// immediately closes) leaves the EOF unread and — with EPOLLET — no
-			// further edge fires. Close here once the response has flushed; if a
-			// write is still pending (backpressure), defer via cs.peerClosed so
-			// the response is not truncated. Detached (WS/SSE) conns keep their
-			// middleware's close lifecycle, but they still have to LEARN the
-			// peer is gone — see notifyDetachedPeerClosed.
-			//
-			// A conn whose close is already under way (asyncClosed) is left
-			// alone. drainRead's EOF branch, on this same event, may have
-			// left the close to a dispatch goroutine that is still inside its
-			// handler (celeris#669); that goroutine is writing the response
-			// under detachMu, so csWritePending below would read its buffers
-			// unlocked, and closeConn would only repeat the hand-off.
+			// EPOLLRDHUP: peer half-closed (sent FIN). See onPeerHalfClose.
 			if ev.Events&unix.EPOLLRDHUP != 0 {
-				if fd >= 0 && fd < len(l.conns) {
-					if cs := l.conns[fd]; cs != nil && !cs.detachClosed && !cs.asyncClosed.Load() {
-						switch {
-						case cs.h1State != nil && cs.h1State.Detached.Load():
-							l.notifyDetachedPeerClosed(cs)
-						case csWritePending(cs):
-							cs.peerClosed = true
-						default:
-							l.closeConn(fd)
-						}
-					}
-				}
+				l.onPeerHalfClose(fd)
 			}
 
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
@@ -805,6 +779,39 @@ func (l *Loop) run(ctx context.Context) {
 			}
 			continue
 		}
+	}
+}
+
+// onPeerHalfClose handles EPOLLRDHUP: the peer half-closed (sent FIN).
+// drainRead's short-read fast path returns without a trailing EAGAIN read,
+// so a FIN that rode the same readable edge as the request (client writes
+// then immediately closes) leaves the EOF unread and — with EPOLLET — no
+// further edge fires. Close here once the response has flushed; if a write
+// is still pending (backpressure), defer via cs.peerClosed so the response is
+// not truncated. Detached (WS/SSE) conns keep their middleware's close
+// lifecycle, but they still have to LEARN the peer is gone — see
+// notifyDetachedPeerClosed. Loop thread.
+//
+// A conn whose close is already under way (asyncClosed) is left alone.
+// drainRead's EOF branch, on this same event, may have left the close to a
+// dispatch goroutine that is still inside its handler (celeris#669); that
+// goroutine is writing the response under detachMu, so csWritePending would
+// read its buffers unlocked, and closeConn would only repeat the hand-off.
+func (l *Loop) onPeerHalfClose(fd int) {
+	if fd < 0 || fd >= len(l.conns) {
+		return
+	}
+	cs := l.conns[fd]
+	if cs == nil || cs.detachClosed || cs.asyncClosed.Load() {
+		return
+	}
+	switch {
+	case cs.h1State != nil && cs.h1State.Detached.Load():
+		l.notifyDetachedPeerClosed(cs)
+	case csWritePending(cs):
+		cs.peerClosed = true
+	default:
+		l.closeConn(fd)
 	}
 }
 

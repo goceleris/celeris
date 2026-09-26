@@ -417,6 +417,50 @@ func TestAnOwedCloseIsNeverTransplanted(t *testing.T) {
 	}
 }
 
+// TestPeerHalfCloseLeavesAClosingConnToItsHandler: the FIN that drainRead's
+// EOF branch turned into an owed close rides the same epoll event as
+// EPOLLRDHUP, so onPeerHalfClose runs next, while the handler still holds
+// detachMu and is writing its response. It must leave the conn alone: its
+// csWritePending would read those buffers without the lock (a data race,
+// the "race" arm under -race), and act on what it read (the "pending" arm).
+func TestPeerHalfCloseLeavesAClosingConnToItsHandler(t *testing.T) {
+	for _, arm := range []string{"pending", "race"} {
+		t.Run(arm, func(t *testing.T) {
+			rig := hijackRaceConn(t)
+			l, cs, local := rig.l, rig.cs, rig.local
+			release := holdAsHandler(t, cs, true)
+			if !returnsWhileHeld(t, release, l.checkTimeouts) {
+				t.Fatal("the reap waited on a running handler (celeris#669)")
+			}
+			if !cs.asyncClosed.Load() {
+				t.Fatal("setup: no close is owed")
+			}
+			if arm == "pending" {
+				// The handler has already queued part of its response.
+				cs.writeBuf = append(cs.writeBuf[:0], "response"...)
+				cs.pendingBytes = len(cs.writeBuf)
+				l.onPeerHalfClose(local)
+			} else {
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					l.onPeerHalfClose(local)
+				}()
+				// The handler writes its response; nothing orders this
+				// after the loop's look at the conn.
+				time.Sleep(20 * time.Millisecond)
+				cs.writeBuf = append(cs.writeBuf[:0], "response"...)
+				cs.pendingBytes = len(cs.writeBuf)
+				<-done
+			}
+			release()
+			if cs.peerClosed {
+				t.Error("onPeerHalfClose acted on a conn whose close is owed to its handler")
+			}
+		})
+	}
+}
+
 // TestCloseStillWaitsForABoundedHolder is the negative control for the unit
 // arms. The dispatch goroutine is PARKED, so whoever holds detachMu is a
 // guarded writeFn in the middle of one write — a hold bounded by a syscall,
