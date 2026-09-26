@@ -473,6 +473,39 @@ jobs:
             echo "expected 3 celeris#656 tests to PASS, saw $passed -- were they renamed, or did they skip?"
             exit 1
           fi
+      # celeris#691: every io_uring driver test, by name, five runs each. The
+      # `unit` job runs this package without -v, and startTestEngine skips
+      # when the engine does not come up, so a skip there prints nothing. The
+      # tally requires every run to PASS and no FAIL or SKIP line: a skipped
+      # or renamed test turns this red. Seven of the tests pin the
+      # UnregisterConn-then-Close leak and every path that must close the
+      # duplicate descriptor its fix takes. TestDriverHTTPZeroOverhead is the
+      # test that failed a few percent of the time on that defect.
+      #
+      # memlock stays at the runner's 8 MiB, the shape `unit` runs these in.
+      # One driver test's engine runs at a time, and it fits in that budget.
+      - name: celeris#691 io_uring driver tests (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          old='TestDriverRegisterUnregister|TestDriverHTTPZeroOverhead|TestDriverWriteSerialization|TestDriverCancelOnUnregister|TestIouringRegisterConnFDCollision|TestIouringShutdownFiresDriverOnClose|TestDriverUnknownFDReturnsErr|TestShutdownDriversRetainsConnsWithOpsInFlight'
+          new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors'
+          names="${old}|${new}"
+          runs=5
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          go test -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/driver691.log
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/driver691.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/driver691.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/driver691.log || true)
+          echo "celeris#691 driver tests: want $want PASS, passed $passed, FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want driver test runs to PASS with no FAIL or SKIP line --"
+            echo "was a test renamed or removed, or did one skip or fail?"
+            exit 1
+          fi
 
   conformance:
     name: Conformance
