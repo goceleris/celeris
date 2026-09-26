@@ -26,14 +26,18 @@ package websocket
 // This test fixes (1) with validation.SetZCWindowHold, which holds the
 // worker right after it has recorded a first completion and released
 // cs.detachMu, before it releases anything else, for zcWinDelay (the NIC
-// DMA latency loopback lacks), while a full-duplex 64 KiB echo keeps the
-// handler goroutine writing through `guarded` the whole time. Where the
+// DMA latency loopback lacks), while the handler streams 64 KiB frames at a
+// steady pace, faster than the client reads them, so its goroutine keeps
+// calling `guarded` through every hold. (A request/echo shape does not: the
+// hold also stops the worker delivering inbound frames, so an echo handler
+// is parked in ReadMessage exactly while the window is open -- CI run 3 of
+// that shape let the mutant survive.) Where the
 // hold sits matters for (2): where the window opens on its own, the worker's
 // per-iteration flush releases cs.detachMu between the first completion and
 // the dispatch goroutine's read, which orders the two for the detector
 // whether or not the first completion took the lock. It asserts
 // the window was entered (the guard declined the fast path with a
-// notification outstanding) and that every echoed byte came back intact
+// notification outstanding) and that every streamed byte arrived intact
 // and in order. Run under -race it is also the detector control for (2):
 // the mandatory mutant deletes the detachMu acquire in handleSend's
 // CQE_F_MORE branch, and this test must then FAIL with a DATA RACE report
@@ -47,7 +51,7 @@ package websocket
 //	                           the guard is not required to fire.
 //	CELERIS_IOURING_SEND_ZC=off  branch control: no ZC send may be armed,
 //	                           the guard witness must stay 0, and the same
-//	                           echo must still be byte-intact.
+//	                           stream must still be byte-intact.
 //
 // Needs -tags=validation (the witnesses and the hold are validation-only)
 // and an io_uring engine; CELERIS_REQUIRE_IOURING_WORKERS=1 turns the
@@ -55,10 +59,8 @@ package websocket
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -67,14 +69,19 @@ import (
 )
 
 const (
-	// zcWinFrames 64 KiB frames each way: 16 MiB, far under the 64 MiB
-	// detached send cap, far over any loopback socket buffer once the
-	// client's receive window is clamped.
+	// zcWinFrames 64 KiB frames: 16 MiB, far under the 64 MiB detached
+	// send cap, far over any loopback socket buffer once the client's
+	// receive window is clamped.
 	zcWinFrames = 256
-	// zcWinReadPace is slept after every frame the client reads, so the
-	// server's socket stays congested and ring sends (not the inline fast
-	// path) carry the echo.
-	zcWinReadPace = 300 * time.Microsecond
+	// zcWinWritePace is slept after every frame the handler writes: the
+	// handler keeps calling `guarded` for the whole run instead of queueing
+	// all 16 MiB in the first milliseconds.
+	zcWinWritePace = 500 * time.Microsecond
+	// zcWinReadPace is slept after every frame the client reads: half the
+	// write rate, so the server's socket stays congested (ring sends, not
+	// the inline fast path, carry the stream) while the backlog stays near
+	// 8 MiB, an eighth of the detached cap.
+	zcWinReadPace = time.Millisecond
 	// zcWinDefaultDelay is the default window hold. It is two orders of
 	// magnitude above the natural (copy-fallback) window and small enough
 	// that a few hundred notifications cost well under a second.
@@ -138,12 +145,17 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 	defer validation.SetZCWindowHold(0)
 
 	cfg := Config{Handler: func(c *Conn) {
-		for {
-			mt, msg, err := c.ReadMessage()
-			if err != nil {
+		if _, _, err := c.ReadMessage(); err != nil { // the client's "go"
+			return
+		}
+		for i := 0; i < zcWinFrames; i++ {
+			if err := c.WriteMessage(OpBinary, zcWinPayload(i)); err != nil {
 				return
 			}
-			if err := c.WriteMessage(mt, msg); err != nil {
+			time.Sleep(zcWinWritePace)
+		}
+		for { // hold the conn open (and detached) until the client closes it
+			if _, _, err := c.ReadMessage(); err != nil {
 				return
 			}
 		}
@@ -165,25 +177,14 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 	base := metrics()
 	vBase := validation.Snapshot()
 
-	// Sender: every frame back to back. It never reads, so the handler's
-	// echoes pile up behind the clamped receive window while it keeps
-	// calling `guarded` for each new frame it reads.
-	var wg sync.WaitGroup
-	sendErr := make(chan error, 1)
-	wg.Go(func() {
-		for i := 0; i < zcWinFrames; i++ {
-			if err := client.writeClientFrame(true, OpBinary, zcWinPayload(i)); err != nil {
-				sendErr <- fmt.Errorf("send frame %d: %w", i, err)
-				return
-			}
-			if err := client.bw.Flush(); err != nil {
-				sendErr <- fmt.Errorf("flush frame %d: %w", i, err)
-				return
-			}
-		}
-	})
+	if err := client.writeClientFrame(true, OpText, []byte("go")); err != nil {
+		t.Fatalf("send go: %v", err)
+	}
+	if err := client.bw.Flush(); err != nil {
+		t.Fatalf("flush go: %v", err)
+	}
 
-	// Reader: paced, and every echo verified in order.
+	// Reader: paced, and every frame verified in order.
 	var readErr error
 	got := 0
 	deadline := time.Now().Add(90 * time.Second)
@@ -194,11 +195,11 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		}
 		fin, op, payload, err := readServerFrameNonFatal(client.br)
 		if err != nil {
-			readErr = fmt.Errorf("read echo %d/%d: %w", got, zcWinFrames, err)
+			readErr = fmt.Errorf("read frame %d/%d: %w", got, zcWinFrames, err)
 			break
 		}
 		if !fin || op != OpBinary {
-			readErr = fmt.Errorf("echo %d: fin=%v op=%d, want a final binary frame", got, fin, op)
+			readErr = fmt.Errorf("frame %d: fin=%v op=%d, want a final binary frame", got, fin, op)
 			break
 		}
 		if err := zcWinCheck(got, payload); err != nil {
@@ -207,12 +208,6 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		}
 		got++
 		time.Sleep(zcWinReadPace)
-	}
-	wg.Wait()
-	select {
-	case err := <-sendErr:
-		readErr = errors.Join(readErr, err)
-	default:
 	}
 
 	// Ring bytes and notifications are published on the worker's
@@ -232,13 +227,13 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		policyOff, delay, got, zcWinFrames, submits, detached, notifs, blocked, pendWrite, inline, ring)
 
 	if readErr != nil {
-		t.Fatalf("echo oracle: %v", readErr)
+		t.Fatalf("stream oracle: %v", readErr)
 	}
 	if ring == 0 {
-		t.Fatalf("RingBytes did not move: the echo never left the inline fast path, so no ring send (and no SEND_ZC) was exercised")
+		t.Fatalf("RingBytes did not move: the stream never left the inline fast path, so no ring send (and no SEND_ZC) was exercised")
 	}
 	if policyOff {
-		// Branch control: the same echo with the ZC arm disabled. The
+		// Branch control: the same stream with the ZC arm disabled. The
 		// witnesses must track SEND_ZC, not traffic.
 		if submits != 0 || detached != 0 || notifs != 0 || blocked != 0 || pendWrite != 0 {
 			t.Fatalf("CELERIS_IOURING_SEND_ZC=off: ZC witnesses moved (submits=%d detached=%d notifs=%d guard_blocked_zc=%d pending_write=%d), want all 0",
@@ -247,7 +242,7 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		return
 	}
 	if detached == 0 {
-		t.Fatalf("no SEND_ZC was armed on the detached connection (submits=%d): the echo did not reach the zero-copy arm", submits)
+		t.Fatalf("no SEND_ZC was armed on the detached connection (submits=%d): the stream did not reach the zero-copy arm", submits)
 	}
 	if detached != submits {
 		t.Errorf("detached ZC submits %d != total %d: every ZC send here is on the one detached connection", detached, submits)
