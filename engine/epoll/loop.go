@@ -675,52 +675,7 @@ func (l *Loop) run(ctx context.Context) {
 			l.drainAdoptQueue(ctx, an)
 		}
 
-		for cs := l.dirtyHead; cs != nil; {
-			next := cs.dirtyNext
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			err := l.flushWrites(cs, true)
-			if err != nil {
-				// Surface I/O failure to detached middleware before closing.
-				if cs.h1State != nil && cs.h1State.OnError != nil {
-					cs.h1State.OnError(err)
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				l.removeDirty(cs)
-				l.closeConn(cs.fd)
-			} else if !csWritePending(cs) {
-				cs.pendingBytes = 0
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				l.removeDirty(cs)
-				// Deferred peer-close (EPOLLRDHUP arrived mid-response): now flushed.
-				if cs.peerClosed {
-					l.closeConn(cs.fd)
-				}
-			} else {
-				// Partial write: kernel send buffer full. Sync pendingBytes,
-				// then for a non-detached HTTP/H2 conn hand off to level-
-				// triggered EPOLLOUT (armEpollOut removes it from the dirty
-				// list) so the loop stops busy-retrying it. Truly-detached
-				// WS/SSE conns stay on the dirty list — their writes are
-				// goroutine-driven and re-signalled via the eventfd path.
-				// `next` was captured above, so the removeDirty inside
-				// armEpollOut is safe mid-iteration.
-				cs.pendingBytes = csPendingBytes(cs)
-				detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				if !detachedWS {
-					l.armEpollOut(cs)
-				}
-			}
-			cs = next
-		}
+		l.flushDirty()
 
 		// Drain H2 async write queues. Handler goroutines enqueue response
 		// frame bytes; we drain them into writeBuf and flush to the wire.
@@ -2446,6 +2401,59 @@ func (l *Loop) drainDetachQueue() {
 	// backing array until some later drain overwrites its slot.
 	clear(l.detachQSpare)
 	l.detachQSpare = l.detachQSpare[:0]
+}
+
+// flushDirty is the event loop's dirty-list pass, run once per iteration
+// after drainDetachQueue: flush every connection with bytes still queued,
+// close the ones whose flush failed, and hand a still-partial non-detached
+// conn to level-triggered EPOLLOUT. Loop thread only.
+func (l *Loop) flushDirty() {
+	for cs := l.dirtyHead; cs != nil; {
+		next := cs.dirtyNext
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+		}
+		err := l.flushWrites(cs, true)
+		if err != nil {
+			// Surface I/O failure to detached middleware before closing.
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(err)
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			l.removeDirty(cs)
+			l.closeConn(cs.fd)
+		} else if !csWritePending(cs) {
+			cs.pendingBytes = 0
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			l.removeDirty(cs)
+			// Deferred peer-close (EPOLLRDHUP arrived mid-response): now flushed.
+			if cs.peerClosed {
+				l.closeConn(cs.fd)
+			}
+		} else {
+			// Partial write: kernel send buffer full. Sync pendingBytes,
+			// then for a non-detached HTTP/H2 conn hand off to level-
+			// triggered EPOLLOUT (armEpollOut removes it from the dirty
+			// list) so the loop stops busy-retrying it. Truly-detached
+			// WS/SSE conns stay on the dirty list — their writes are
+			// goroutine-driven and re-signalled via the eventfd path.
+			// `next` was captured above, so the removeDirty inside
+			// armEpollOut is safe mid-iteration.
+			cs.pendingBytes = csPendingBytes(cs)
+			detachedWS := cs.h1State != nil && cs.h1State.Detached.Load()
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			if !detachedWS {
+				l.armEpollOut(cs)
+			}
+		}
+		cs = next
+	}
 }
 
 func (l *Loop) markDirty(cs *connState) {
