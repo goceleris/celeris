@@ -26,22 +26,18 @@ const Enabled = true
 // has queued the bytes) and its notification (the kernel has released the
 // pinned buffer) the detached inline-egress guard on the dispatch goroutine
 // must refuse the raw unix.Write fast path; the two goroutines hand
-// cs.sending / cs.zcNotifPending to each other under cs.detachMu. Two
-// things hid that hand-off from the race detector:
-//
-//  1. On loopback the kernel copies (IORING_NOTIF_USAGE_ZC_COPIED), so the
-//     window is a few hundred nanoseconds wide: celeris#601 measured
-//     IouringInlineGuardBlockedZC == 0 on an unmodified build.
-//  2. Where the window does open naturally (the notification waits for a
-//     slow reader), the worker's own per-iteration flush takes and releases
-//     cs.detachMu before the dispatch goroutine reads, which orders the two
-//     accesses: -race cannot report a missing lock around the first
-//     completion then, whatever the code does (celeris#587 review 2).
-//
-// Holding the worker HERE -- after the first completion's writes and the
-// unlock, before any other release -- makes every guarded read during the
-// hold concurrent with those writes unless the lock is present. The
-// window's state machine is unchanged; only its duration is.
+// cs.sending / cs.zcNotifPending to each other under cs.detachMu. The race
+// detector can only judge that hand-off when a guarded read and a
+// first-completion write meet with no other release of cs.detachMu between
+// them, and how often that happens depends on the load and the host: on
+// loopback with a fast reader the notification lands in the same
+// completion batch (celeris#601 measured IouringInlineGuardBlockedZC == 0),
+// while a slow reader keeps it pending long enough to be seen. Holding the
+// worker HERE -- after the first completion's writes and the unlock,
+// before any other release -- makes every guarded read during the hold
+// concurrent with those writes unless the lock is present, so the detector
+// control does not depend on the host's timing. The window's state machine
+// is unchanged; only its duration is.
 func SetZCWindowHold(d time.Duration) {
 	if d < 0 {
 		d = 0

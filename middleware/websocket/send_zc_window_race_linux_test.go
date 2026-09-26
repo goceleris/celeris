@@ -31,11 +31,11 @@ package websocket
 // calling `guarded` through every hold. (A request/echo shape does not: the
 // hold also stops the worker delivering inbound frames, so an echo handler
 // is parked in ReadMessage exactly while the window is open -- CI run 3 of
-// that shape let the mutant survive.) Where the hold sits matters for (2):
-// where the window opens on its own, the worker's per-iteration flush
-// releases cs.detachMu between the first completion and the dispatch
-// goroutine's read, which orders the two for the detector whether or not
-// the first completion took the lock. The test asserts the window was
+// that shape let the mutant survive.) With this paced stream the window
+// also opens on its own -- the slow reader keeps notifications pending --
+// and the natural arm (hold 0) catches the mutant too on the hosts
+// measured; the hold is what makes that independent of the host's timing.
+// The test asserts the window was
 // entered (the guard declined the fast path with a notification
 // outstanding) and that every streamed byte arrived intact and in order.
 // Run under -race it is also the detector control for (2): the mandatory
