@@ -103,7 +103,7 @@ func TestRegisterConnAfterShutdownDoesNotTouchTheClosedEpollFD(t *testing.T) {
 		timerFD:      -1,
 		wakeFD:       wakefd.New(-1),
 		conns:        make([]*connState, connTableSize),
-		liveConns:    make([]int, 0, 4),
+		liveConns:    make([]*connState, 0, 4),
 		activeConns:  &atomic.Int64{},
 		closeCount:   &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},

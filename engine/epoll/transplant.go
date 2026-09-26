@@ -85,6 +85,13 @@ func (l *Loop) tryTransplant(fd int) {
 	// touched only by this loop thread, so the reads are inherently safe.
 	hasGoroutine := false
 	if l.async {
+		// A close is owed (celeris#669): closeConn left it to the dispatch
+		// goroutine, which may already have exited without the loop having
+		// drained its hand-back. Never hand such a conn to the target — the
+		// hand-back would then close through a connState the move released.
+		if cs.asyncClosed.Load() {
+			return
+		}
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
 		parked := cs.asyncParked
@@ -207,7 +214,11 @@ func (l *Loop) flushedAtBoundary(cs *connState) bool {
 	if !cs.h1State.AtRequestBoundary() {
 		return false
 	}
-	return !cs.dirty && !cs.epollOut && cs.writePos == 0 && cs.pendingBytes == 0 &&
+	// relinkPending: the loop gave the conn up mid-handler and its dispatch
+	// goroutine owes it back (celeris#669). That hand-back is a queue entry
+	// naming cs, and a transplant returns cs to the pool; the conn is not at
+	// a boundary the loop has seen until the entry is drained.
+	return !cs.dirty && !cs.epollOut && !cs.relinkPending && cs.writePos == 0 && cs.pendingBytes == 0 &&
 		len(cs.writeBuf) == 0 && len(cs.bodyBuf) == 0 && cs.sendfile == nil
 }
 
