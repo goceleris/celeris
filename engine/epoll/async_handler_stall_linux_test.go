@@ -349,6 +349,151 @@ func TestATransplantWaitsForARelink(t *testing.T) {
 	}
 }
 
+// TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits: once tryTransplant
+// has asked a parked dispatch goroutine to quiesce, EVERY detach-queue entry
+// naming the conn reaches drainDetachQueue's transplant branch, not only the
+// goroutine's exit. An entry the goroutine made before it parked is one: the
+// remainder of its own partial flush, or a relink hand-back (celeris#669).
+// Finishing the hand-off on such an entry released cs while the goroutine was
+// still waking to exit, and a later entry then acted on the released
+// connState. The hand-off must wait for the exit, happen exactly once, and
+// leave nothing a later entry can act on.
+func TestADeferredTransplantFinishesOnlyAfterItsGoroutineExits(t *testing.T) {
+	// deferTransplant runs setup, which leaves an entry for cs on the detach
+	// queue, then parks cs's dispatch goroutine (its state: parked with
+	// nothing buffered, the shape tryTransplant moves) and has tryTransplant
+	// ask it to quiesce.
+	deferTransplant := func(t *testing.T, setup func(*Loop, *connState)) (*hijackRaceRig, *countingTarget) {
+		t.Helper()
+		rig := hijackRaceConn(t)
+		l, cs := rig.l, rig.cs
+		l.async = true
+		cs.protocol = engine.HTTP1
+		cs.detected = true
+		cs.lastActivity = time.Now().UnixNano()
+		setup(l, cs)
+		cs.asyncInMu.Lock()
+		cs.asyncRun, cs.asyncParked = true, true
+		cs.asyncInMu.Unlock()
+		target := &countingTarget{}
+		t.Cleanup(target.closeAll)
+		l.transplant.Store(&transplantState{target: target})
+		l.tryTransplant(rig.local)
+		if !cs.transplantPending || l.detachQPending.Load() == 0 {
+			t.Fatalf("setup: no deferred transplant with an entry queued (transplantPending=%v queued=%d)",
+				cs.transplantPending, l.detachQPending.Load())
+		}
+		return rig, target
+	}
+	// quiesceExit runs the REAL runAsyncHandler from the park: it sees the
+	// quiesce, exits and enqueues cs. Bounded, so a goroutine that parks again
+	// (a released connState has no quiesce set) fails the test, not hangs it.
+	quiesceExit := func(t *testing.T, l *Loop, cs *connState) {
+		t.Helper()
+		cs.asyncInMu.Lock()
+		cs.asyncParked = false
+		cs.asyncInMu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			exitDispatch(l, cs)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			cs.asyncClosed.Store(true)
+			cs.asyncInMu.Lock()
+			cs.asyncCond.Broadcast()
+			cs.asyncInMu.Unlock()
+			<-done
+			t.Fatal("the dispatch goroutine parked again instead of exiting on its quiesce")
+		}
+	}
+	// handedOver asserts the end state once every entry has been drained.
+	handedOver := func(t *testing.T, rig *hijackRaceRig, target *countingTarget) {
+		t.Helper()
+		l, cs := rig.l, rig.cs
+		if n := target.count(); n != 1 {
+			t.Errorf("the conn was handed over %d times, want exactly once", n)
+		}
+		if cs.dirty || l.dirtyHead != nil {
+			t.Errorf("an entry drained after the hand-off put its connState on the dirty list "+
+				"(dirty=%v head=%p): the pass would flush through a connState the loop let go", cs.dirty, l.dirtyHead)
+		}
+		// The loop cannot tell, at the finish, whether a later entry still
+		// names cs, so a released connState can be reissued under one.
+		if cs.detachMu == nil || cs.fd != rig.local {
+			t.Errorf("the hand-off returned its connState to the pool (detachMu=%p fd=%d) "+
+				"while queue entries could still name it", cs.detachMu, cs.fd)
+		}
+		if l.transplantInFlight != 0 {
+			t.Errorf("transplantInFlight = %d after the hand-off, want 0", l.transplantInFlight)
+		}
+	}
+	// partialFlush is the entry the goroutine makes after its handler when its
+	// own flush is partial: enqueued once detachMu is released.
+	partialFlush := func(l *Loop, cs *connState) { l.enqueueDetach(cs) }
+
+	t.Run("entry-drained-while-the-goroutine-lives", func(t *testing.T) {
+		rig, target := deferTransplant(t, partialFlush)
+		l, cs := rig.l, rig.cs
+		l.drainDetachQueue()
+		if n := target.count(); n != 0 || cs.detachMu == nil {
+			t.Fatalf("the hand-off finished on an entry made before the quiesce, with the goroutine "+
+				"still alive (adopted=%d, connState released=%v): it wakes on a released connState",
+				n, cs.detachMu == nil)
+		}
+		quiesceExit(t, l, cs)
+		l.drainDetachQueue()
+		handedOver(t, rig, target)
+	})
+
+	t.Run("entry-and-exit-in-one-batch", func(t *testing.T) {
+		rig, target := deferTransplant(t, partialFlush)
+		// The goroutine exits before the loop swaps the queue: one batch
+		// holds the earlier entry, then the exit.
+		quiesceExit(t, rig.l, rig.cs)
+		rig.l.drainDetachQueue()
+		handedOver(t, rig, target)
+	})
+
+	// The review's interleaving: the partial-flush entry is drained before
+	// the goroutine reaches its loop top, which clears relinkPending while
+	// the relink hand-back is still to be queued.
+	t.Run("relink-hand-back-behind-a-partial-flush", func(t *testing.T) {
+		rig, target := deferTransplant(t, func(l *Loop, cs *connState) {
+			l.markDirty(cs)
+			release := holdAsHandler(t, cs, true)
+			if !returnsWhileHeld(t, release, l.flushDirty) {
+				t.Fatal("the dirty pass waited on a running handler (celeris#669)")
+			}
+			release()
+			partialFlush(l, cs)
+			l.drainDetachQueue() // back on the dirty list
+			l.flushDirty()       // the remainder drains: off it again
+			// The goroutine's loop top (runAsyncHandler, under asyncInMu):
+			// the relink hand-back, then the park.
+			cs.asyncInMu.Lock()
+			owed := cs.relinkOwed
+			cs.relinkOwed = false
+			l.enqueueDetach(cs)
+			cs.asyncInMu.Unlock()
+			if !owed {
+				t.Fatal("setup: the dirty pass left no relink owed")
+			}
+		})
+		l, cs := rig.l, rig.cs
+		l.drainDetachQueue() // the relink hand-back
+		if n := target.count(); n != 0 || cs.detachMu == nil {
+			t.Fatalf("the hand-off finished on the relink hand-back, with the goroutine still alive "+
+				"(adopted=%d, connState released=%v)", n, cs.detachMu == nil)
+		}
+		quiesceExit(t, l, cs)
+		l.drainDetachQueue()
+		handedOver(t, rig, target)
+	})
+}
+
 // TestPostDetachHandlerIsWaitedOut: after Detach the dispatch goroutine may
 // keep running — a handler that streams inline — but it never holds detachMu
 // across ProcessH1 again, so whoever holds the lock is a guarded writeFn in
