@@ -31,18 +31,18 @@ package websocket
 // calling `guarded` through every hold. (A request/echo shape does not: the
 // hold also stops the worker delivering inbound frames, so an echo handler
 // is parked in ReadMessage exactly while the window is open -- CI run 3 of
-// that shape let the mutant survive.) Where the
-// hold sits matters for (2): where the window opens on its own, the worker's
-// per-iteration flush releases cs.detachMu between the first completion and
-// the dispatch goroutine's read, which orders the two for the detector
-// whether or not the first completion took the lock. It asserts
-// the window was entered (the guard declined the fast path with a
-// notification outstanding) and that every streamed byte arrived intact
-// and in order. Run under -race it is also the detector control for (2):
-// the mandatory mutant deletes the detachMu acquire in handleSend's
-// CQE_F_MORE branch, and this test must then FAIL with a DATA RACE report
-// on that write against the guard's read. The mutant is applied by a
-// script, never committed (see the PR and the ci.yml zc-window job).
+// that shape let the mutant survive.) Where the hold sits matters for (2):
+// where the window opens on its own, the worker's per-iteration flush
+// releases cs.detachMu between the first completion and the dispatch
+// goroutine's read, which orders the two for the detector whether or not
+// the first completion took the lock. The test asserts the window was
+// entered (the guard declined the fast path with a notification
+// outstanding) and that every streamed byte arrived intact and in order.
+// Run under -race it is also the detector control for (2): the mandatory
+// mutant deletes the detachMu acquire in handleSend's CQE_F_MORE branch,
+// and this test must then FAIL with a DATA RACE report on that write
+// against the guard's read. The mutant is applied by a script, never
+// committed (see the PR and the ci.yml zc-window job).
 //
 // Arms, all read from the environment so one binary serves every run:
 //
@@ -77,11 +77,15 @@ const (
 	// handler keeps calling `guarded` for the whole run instead of queueing
 	// all 16 MiB in the first milliseconds.
 	zcWinWritePace = 500 * time.Microsecond
-	// zcWinReadPace is slept after every frame the client reads: half the
-	// write rate, so the server's socket stays congested (ring sends, not
-	// the inline fast path, carry the stream) while the backlog stays near
-	// 8 MiB, an eighth of the detached cap.
-	zcWinReadPace = time.Millisecond
+	// zcWinReadPace is slept after every frame the client reads: at most a
+	// quarter of the write rate even where a 500 us sleep takes a full
+	// millisecond, so the backlog outgrows any autotuned socket send buffer
+	// (a 1 ms reader let a linuxkit VM carry all 16 MiB inline) and ring
+	// sends carry the stream, while the backlog stays under ~12 MiB, a
+	// fifth of the detached cap.
+	zcWinReadPace = 4 * time.Millisecond
+	// zcWinAttempts bounds the re-runs of an unexposed stream.
+	zcWinAttempts = 3
 	// zcWinDefaultDelay is the default window hold. It is two orders of
 	// magnitude above the natural (copy-fallback) window and small enough
 	// that a few hundred notifications cost well under a second.
@@ -114,7 +118,7 @@ func zcWinPayload(seq int) []byte {
 }
 
 // zcWinCheck returns a non-nil error naming the first way payload differs
-// from the frame the client sent as seq.
+// from the frame the server sent as seq.
 func zcWinCheck(seq int, payload []byte) error {
 	if len(payload) != zcBigFrame {
 		return fmt.Errorf("frame %d: len=%d, want %d", seq, len(payload), zcBigFrame)
@@ -130,6 +134,78 @@ func zcWinCheck(seq int, payload []byte) error {
 	return nil
 }
 
+// zcWinAttempt is one stream's worth of witness deltas.
+type zcWinAttempt struct {
+	submits, detached, notifs, blocked, pendWrite, inline, ring uint64
+}
+
+func (a *zcWinAttempt) add(b zcWinAttempt) {
+	a.submits += b.submits
+	a.detached += b.detached
+	a.notifs += b.notifs
+	a.blocked += b.blocked
+	a.pendWrite += b.pendWrite
+	a.inline += b.inline
+	a.ring += b.ring
+}
+
+// zcWinStream runs one stream on a fresh connection: "go", then zcWinFrames
+// frames read at zcWinReadPace and verified in order. It returns the
+// witness deltas the stream produced, the frames read and the first oracle
+// failure.
+func zcWinStream(t *testing.T, addr string, metrics func() celeris.EngineMetrics, hold time.Duration) (zcWinAttempt, int, error) {
+	t.Helper()
+	client := zcDialClamped(t, addr)
+	defer client.close()
+	client.upgrade(t, "/ws")
+	base := metrics()
+	vBase := validation.Snapshot()
+	if err := client.writeClientFrame(true, OpText, []byte("go")); err != nil {
+		return zcWinAttempt{}, 0, fmt.Errorf("send go: %w", err)
+	}
+	if err := client.bw.Flush(); err != nil {
+		return zcWinAttempt{}, 0, fmt.Errorf("flush go: %w", err)
+	}
+	var readErr error
+	got := 0
+	deadline := time.Now().Add(90 * time.Second)
+	for got < zcWinFrames {
+		if err := client.conn.SetReadDeadline(deadline); err != nil {
+			readErr = err
+			break
+		}
+		fin, op, payload, err := readServerFrameNonFatal(client.br)
+		if err != nil {
+			readErr = fmt.Errorf("read frame %d/%d: %w", got, zcWinFrames, err)
+			break
+		}
+		if !fin || op != OpBinary {
+			readErr = fmt.Errorf("frame %d: fin=%v op=%d, want a final binary frame", got, fin, op)
+			break
+		}
+		if err := zcWinCheck(got, payload); err != nil {
+			readErr = err
+			break
+		}
+		got++
+		time.Sleep(zcWinReadPace)
+	}
+	// Ring bytes and notifications are published on the worker's
+	// per-iteration cadence; give it a pass (plus the hold) to settle.
+	time.Sleep(300*time.Millisecond + 4*hold)
+	m := metrics()
+	v := validation.Snapshot()
+	return zcWinAttempt{
+		submits:   v.IouringSendZCSubmits - vBase.IouringSendZCSubmits,
+		detached:  v.IouringSendZCSubmitsDetached - vBase.IouringSendZCSubmitsDetached,
+		notifs:    v.IouringSendZCNotifs - vBase.IouringSendZCNotifs,
+		blocked:   v.IouringInlineGuardBlockedZC - vBase.IouringInlineGuardBlockedZC,
+		pendWrite: v.IouringZCCompletionWithPendingWrite - vBase.IouringZCCompletionWithPendingWrite,
+		inline:    m.InlineBytes - base.InlineBytes,
+		ring:      m.RingBytes - base.RingBytes,
+	}, got, readErr
+}
+
 // TestSendZCWindowGuardUnderRace is the celeris#587 measurement. See the
 // file comment for the arms.
 func TestSendZCWindowGuardUnderRace(t *testing.T) {
@@ -140,8 +216,8 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		t.Skip("io_uring not usable at High+ tier on this kernel")
 	}
 	policyOff := zcPolicyOff()
-	delay := zcWinDelay(t)
-	validation.SetZCWindowHold(delay)
+	hold := zcWinDelay(t)
+	validation.SetZCWindowHold(hold)
 	defer validation.SetZCWindowHold(0)
 
 	cfg := Config{Handler: func(c *Conn) {
@@ -170,90 +246,49 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 		return info.Metrics
 	}
 
-	client := zcDialClamped(t, addr)
-	defer client.close()
-	client.upgrade(t, "/ws")
-
-	base := metrics()
-	vBase := validation.Snapshot()
-
-	if err := client.writeClientFrame(true, OpText, []byte("go")); err != nil {
-		t.Fatalf("send go: %v", err)
-	}
-	if err := client.bw.Flush(); err != nil {
-		t.Fatalf("flush go: %v", err)
-	}
-
-	// Reader: paced, and every frame verified in order.
-	var readErr error
-	got := 0
-	deadline := time.Now().Add(90 * time.Second)
-	for got < zcWinFrames {
-		if err := client.conn.SetReadDeadline(deadline); err != nil {
-			readErr = err
+	// A stream the host's socket buffers absorbed whole never reaches the
+	// ring, and one whose ZC cycles all fell between the handler's writes
+	// never shows the guard declining: both are the host's timing, not the
+	// code, so a stream that was not exposed is run again on a fresh
+	// connection, up to zcWinAttempts. Every attempt is logged, and the race
+	// detector watches all of them.
+	var total zcWinAttempt
+	for attempt := 1; attempt <= zcWinAttempts; attempt++ {
+		a, got, readErr := zcWinStream(t, addr, metrics, hold)
+		// One line per attempt, stable keys: the evidence scripts tally it.
+		t.Logf("ZCWIN attempt=%d policy_off=%v delay=%s frames=%d/%d submits=%d detached=%d notifs=%d guard_blocked_zc=%d zc_completion_with_pending_write=%d inline_bytes=%d ring_bytes=%d",
+			attempt, policyOff, hold, got, zcWinFrames, a.submits, a.detached, a.notifs, a.blocked, a.pendWrite, a.inline, a.ring)
+		if readErr != nil {
+			t.Fatalf("stream oracle, attempt %d: %v", attempt, readErr)
+		}
+		total.add(a)
+		if a.ring > 0 && (policyOff || (a.detached > 0 && (hold == 0 || a.blocked > 0))) {
 			break
 		}
-		fin, op, payload, err := readServerFrameNonFatal(client.br)
-		if err != nil {
-			readErr = fmt.Errorf("read frame %d/%d: %w", got, zcWinFrames, err)
-			break
-		}
-		if !fin || op != OpBinary {
-			readErr = fmt.Errorf("frame %d: fin=%v op=%d, want a final binary frame", got, fin, op)
-			break
-		}
-		if err := zcWinCheck(got, payload); err != nil {
-			readErr = err
-			break
-		}
-		got++
-		time.Sleep(zcWinReadPace)
 	}
 
-	// Ring bytes and notifications are published on the worker's
-	// per-iteration cadence; give it a pass (plus the hold) to settle.
-	time.Sleep(300*time.Millisecond + 4*delay)
-	m := metrics()
-	v := validation.Snapshot()
-	submits := v.IouringSendZCSubmits - vBase.IouringSendZCSubmits
-	detached := v.IouringSendZCSubmitsDetached - vBase.IouringSendZCSubmitsDetached
-	notifs := v.IouringSendZCNotifs - vBase.IouringSendZCNotifs
-	blocked := v.IouringInlineGuardBlockedZC - vBase.IouringInlineGuardBlockedZC
-	pendWrite := v.IouringZCCompletionWithPendingWrite - vBase.IouringZCCompletionWithPendingWrite
-	inline := m.InlineBytes - base.InlineBytes
-	ring := m.RingBytes - base.RingBytes
-	// One line, stable keys: the evidence scripts tally it.
-	t.Logf("ZCWIN policy_off=%v delay=%s frames=%d/%d submits=%d detached=%d notifs=%d guard_blocked_zc=%d zc_completion_with_pending_write=%d inline_bytes=%d ring_bytes=%d",
-		policyOff, delay, got, zcWinFrames, submits, detached, notifs, blocked, pendWrite, inline, ring)
-
-	if readErr != nil {
-		t.Fatalf("stream oracle: %v", readErr)
-	}
-	if ring == 0 {
-		t.Fatalf("RingBytes did not move: the stream never left the inline fast path, so no ring send (and no SEND_ZC) was exercised")
+	if total.ring == 0 {
+		t.Fatalf("RingBytes did not move in %d attempts: the stream never left the inline fast path, so no ring send (and no SEND_ZC) was exercised", zcWinAttempts)
 	}
 	if policyOff {
 		// Branch control: the same stream with the ZC arm disabled. The
 		// witnesses must track SEND_ZC, not traffic.
-		if submits != 0 || detached != 0 || notifs != 0 || blocked != 0 || pendWrite != 0 {
+		if total.submits != 0 || total.detached != 0 || total.notifs != 0 || total.blocked != 0 || total.pendWrite != 0 {
 			t.Fatalf("CELERIS_IOURING_SEND_ZC=off: ZC witnesses moved (submits=%d detached=%d notifs=%d guard_blocked_zc=%d pending_write=%d), want all 0",
-				submits, detached, notifs, blocked, pendWrite)
+				total.submits, total.detached, total.notifs, total.blocked, total.pendWrite)
 		}
 		return
 	}
-	if detached == 0 {
-		t.Fatalf("no SEND_ZC was armed on the detached connection (submits=%d): the stream did not reach the zero-copy arm", submits)
+	if total.detached == 0 {
+		t.Fatalf("no SEND_ZC was armed on the detached connection in %d attempts (submits=%d): the stream did not reach the zero-copy arm", zcWinAttempts, total.submits)
 	}
-	if detached != submits {
-		t.Errorf("detached ZC submits %d != total %d: every ZC send here is on the one detached connection", detached, submits)
+	if total.detached != total.submits {
+		t.Errorf("detached ZC submits %d != total %d: every ZC send here is on a detached connection", total.detached, total.submits)
 	}
-	if notifs > submits {
-		t.Errorf("ZC notifications %d > submits %d: a notification without a submit", notifs, submits)
+	if total.notifs != total.submits {
+		t.Errorf("ZC notifications %d != submits %d after settle: a SEND_ZC never completed, or a notification had no submit", total.notifs, total.submits)
 	}
-	if notifs != submits {
-		t.Errorf("ZC notifications %d != submits %d after settle: a SEND_ZC never completed", notifs, submits)
-	}
-	if delay > 0 && blocked == 0 {
-		t.Fatalf("the inline-egress guard never declined with a SEND_ZC notification outstanding although the window was held open %s after each of %d first completions: the test did not exercise the window it exists for", delay, notifs)
+	if hold > 0 && total.blocked == 0 {
+		t.Fatalf("the inline-egress guard never declined with a SEND_ZC notification outstanding in %d attempts although the window was held open %s after each of %d first completions: the test did not exercise the window it exists for", zcWinAttempts, hold, total.notifs)
 	}
 }
