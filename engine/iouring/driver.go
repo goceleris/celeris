@@ -686,10 +686,10 @@ func (w *Worker) shutdownDrivers() {
 		// If UnregisterConn got here first, the cancel-CQE path would have
 		// fired onClose, but the ring is being torn down, so it fires here
 		// instead; finalizeDriver's map check guards against double-fire.
-		// retire also closes the duplicate UnregisterConn took (celeris#691):
-		// nothing is submitted after this point, so no SQE can still carry
-		// its number, and closing the ring later in shutdown() cancels the
-		// ops armed on the socket.
+		// retire also closes the duplicate UnregisterConn took (celeris#691).
+		// Nothing is submitted after this point, so a cancel SQE still
+		// carrying its number never reaches the kernel; closing the ring
+		// later in shutdown() cancels the ops armed on the socket.
 		dc.retire()
 		cb := dc.onClose
 		dc.onClose = nil
