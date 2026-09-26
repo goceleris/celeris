@@ -85,16 +85,18 @@ func ioUringUsableHere() bool {
 
 // retryRingENOMEM runs start until it returns something other than a ring
 // ENOMEM, or until ringUnchargeBound has passed. It returns how long it
-// waited, how many times it ran start, and start's last error. Below
+// waited before the last start (the retries, not the last start's own
+// duration), how many times it ran start, and start's last error. Below
 // ringBudgetFloor it runs start once: there is nothing to wait for.
 func retryRingENOMEM(start func() error) (waited time.Duration, tries int, err error) {
 	t0 := time.Now()
 	_, small := memlockBelowRingBudgetFloor()
 	for {
 		tries++
+		waited = time.Since(t0)
 		err = start()
 		if small || !isRingENOMEM(err) || time.Since(t0) > ringUnchargeBound {
-			return time.Since(t0), tries, err
+			return waited, tries, err
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
