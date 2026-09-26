@@ -77,16 +77,22 @@ func startFileEngine(t *testing.T, h stream.Handler) *Engine {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
+	// Workers must satisfy config validation (resource.MinWorkers). This used
+	// to ask for Workers: 1, New returned "workers must be >= 2 if set, got 1",
+	// and a t.Skipf on New's error turned that into a skip on every host, so
+	// these four tests never ran from v1.5.0 on (celeris#684). New fails only
+	// on validation, and epoll needs nothing a Linux host can lack, so a New
+	// error is the test's own mistake: fail, never skip.
 	cfg := resource.Config{
 		Addr:     addr,
 		Protocol: engine.HTTP1,
 		Resources: resource.Resources{
-			Workers: 1,
+			Workers: resource.MinWorkers,
 		},
 	}
 	e, err := New(cfg, h)
 	if err != nil {
-		t.Skipf("epoll engine unavailable: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
