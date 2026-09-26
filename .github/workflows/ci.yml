@@ -108,10 +108,8 @@ jobs:
       # below, which raises memlock so the up-switch tests execute
       # (celeris#641).
       #
-      # ./engine/iouring DOES run here, at the runner's own 8 MiB memlock.
-      # The three celeris#656 worker-init tests cannot run at that limit (they
-      # need two io_uring workers) and skip; the `iouring` job below runs those
-      # three with memlock raised and skipping forbidden.
+      # Excludes ./engine/iouring, which runs in the next step on its own,
+      # with -v and every skip accounted for (celeris#662 r6).
       #
       # Excludes ./middleware/websocket because TestNativeEngineClose
       # FrameEcho/io_uring drives 13 close-handshake round trips on a
@@ -120,14 +118,72 @@ jobs:
       # ~2-3s on a cold instance). The same suite is race-clean on
       # msr1 + Multipass and is exercised end-to-end by the
       # autobahn-fuzzingclient test under `mage testAutobahn`.
-      - name: Root module — race tests (excluding test/ + adaptive/ + websocket)
+      - name: Root module — race tests (excluding test/ + adaptive/ + websocket + engine/iouring)
         run: |
-          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
           go test -race -count=1 -timeout=300s $pkgs
-      # celeris#657: the step above runs ./engine/iouring WITHOUT -v, so a skip
-      # there prints nothing and the package still reports `ok`. That is how the
-      # celeris#656 leak shipped with no cover. Most celeris#657 tests can skip:
+      # celeris#662 r6: ./engine/iouring, on its own, at the runner's own 8 MiB
+      # memlock, with -v, where no skip goes unseen.
+      #
+      # It used to run inside the step above, without -v, so a skip printed
+      # nothing and the package still reported `ok`. That lost two tests.
+      # TestListenWithCancelledContextPublishesTheBoundAddress and
+      # TestListenRefusesToStartWhenNoWorkerReportsItsAddress (celeris#639)
+      # start engines back to back, and the kernel charges ring memory to
+      # RLIMIT_MEMLOCK and gives it back asynchronously, 12-23 ms after a ring
+      # closes. At 8 MiB a start made inside that window got ENOMEM, which the
+      # two read as "io_uring unavailable" and skipped: the first in every
+      # 8 MiB run on record, the second in most. They now retry that ENOMEM
+      # (ring_budget_linux_test.go) and fail rather than skip when io_uring
+      # works.
+      #
+      # Two things keep a loss like that from happening quietly again:
+      #   * the package runs alone. The kernel's count is per UID, so in the
+      #     step above every package that starts io_uring engines drew on the
+      #     same 8 MiB as this one, at the same time;
+      #   * the tally fails the step on ANY `--- SKIP` line, subtests
+      #     included, except the skips another step runs with the environment
+      #     they need and skipping forbidden: the three celeris#656
+      #     init-failure tests (they need two io_uring workers; job `iouring`
+      #     raises memlock) and the celeris#662 synack=0 pair (they need
+      #     net.ipv4.tcp_synack_retries=0; the synack step below sets it).
+      #     The two celeris#639 tests must also each run and PASS by name, so
+      #     a rename or a removal fails it too.
+      #
+      # 8 MiB funds one io_uring worker through the Listen path (12 MiB per
+      # worker, engine/iouring/ring.go minMemlockPerWorker), the shape the
+      # celeris#657 step below also needs. It runs even when the step above
+      # failed: the two share no package.
+      - name: engine/iouring — race tests at the runner's memlock (every skip accounted for)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=300s -v ./engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
+          allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero'
+          required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
+          want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
+          ran=$(grep -cE "^=== RUN   (${required})\$" /tmp/iouring-pkg.log || true)
+          passed=$(grep -cE "^--- PASS: (${required}) \(" /tmp/iouring-pkg.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log || true)
+          unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -cvE "^--- SKIP: (${allowed}) \(" || true)
+          echo "engine/iouring: SKIP lines $skipped, not enforced by another step $unlisted; celeris#639 tests want $want, ran $ran, passed $passed"
+          if [ "$unlisted" -ne 0 ] || [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then
+            grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -vE "^--- SKIP: (${allowed}) \(" || true
+            echo "expected no SKIP line other than the five that other steps enforce (listed above if any),"
+            echo "and the two celeris#639 tests to run and PASS -- did a test skip here, or was one renamed,"
+            echo "removed or failed?"
+            exit 1
+          fi
+      # celeris#657: the root step ran ./engine/iouring WITHOUT -v, so a skip
+      # there printed nothing and the package still reported `ok`. That is how
+      # the celeris#656 leak shipped with no cover. The step above now runs
+      # the package with -v and every skip accounted for; this one adds what
+      # it cannot: the environment variable that turns these tests'
+      # environment skips into failures, and the worker-count census. Most
+      # celeris#657 tests can skip:
       # they build a ring through newTestRing, build io_uring workers, or start
       # a whole io_uring engine. That holds for the eleven hand-off loss witness
       # tests (PR-1, the first list), the eighteen fd-lifetime tests (PR-2,
@@ -246,10 +302,11 @@ jobs:
             echo "different loop count?"
             exit 1
           fi
-      # celeris#662 / celeris#675: the step above runs ./engine/epoll and
-      # ./engine/iouring WITHOUT -v, so a skip there prints nothing and the
-      # package still reports `ok`. That is exactly how the celeris#656 leak
-      # shipped with no cover. These are the celeris#662 tests -- the linger
+      # celeris#662 / celeris#675: the root step runs ./engine/epoll WITHOUT
+      # -v, so a skip there prints nothing and the package still reports
+      # `ok`. That is exactly how the celeris#656 leak shipped with no cover.
+      # ./engine/iouring runs with -v in its own step, at 8 MiB; these need
+      # memlock raised. These are the celeris#662 tests -- the linger
       # (T1-T3, T5, T6), its negative controls (N1, N2), the io_uring accept
       # re-arm during a linger (T7 and its unit twin), and the
       # DisableDeferAccept arm with its premise and socket checks -- so they
@@ -260,9 +317,12 @@ jobs:
       # the one place the celeris#662 linger and the celeris#657 post-switch
       # sweep are tested TOGETHER: during the linger the engine a switch is
       # leaving keeps accepting, and every connection it takes then has to
-      # reach the incoming engine. Its two controls both lose -- the linger at
-      # 0 admits nothing, and the sweep and the park-boundary ask removed
-      # leaves 12 of 12 (epoll) and 6 of 12 (io_uring) behind.
+      # reach the incoming engine, and reach it before the first outgoing
+      # listener closes. Its three controls all lose -- the linger at 0
+      # admits nothing, the sweep and the park-boundary ask removed leaves
+      # 12 of 12 (epoll) and 6 of 12 (io_uring) behind, and a sweep that
+      # does nothing while its loop or worker lingers places them only after
+      # the close.
       #
       # The tally counts TOP-LEVEL results (`--- PASS: Name (`, and
       # `=== RUN   Name` with nothing after the name), and the step also
