@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -687,5 +688,115 @@ func TestChanReaderParkedResumeConverges(t *testing.T) {
 			"the edge-triggered reader will never request it again "+
 			"(pauses=%d resumes=%d callbackOutsideLock=%v parked=%v)",
 			engine, reader, pauses.Load(), resumes.Load(), outsideLock.Load(), parked.Load())
+	}
+}
+
+// TestChanReaderStalePauseConverges is the failing-first oracle for
+// celeris#672: a pause decided on a depth snapshot that has gone stale by the
+// time it is applied.
+//
+// Append sends a chunk and only then decides, from len(r.ch) >= highWater,
+// that the engine should pause; requestPause applies that decision afterwards,
+// once it holds pausedMu. If the handler drains the channel to EMPTY in that
+// gap, each of its resume checks ran while pausedState was still false, so
+// each did nothing, and then the pause lands on an empty buffer. Read
+// re-evaluates the resume only after a successful dequeue, and none can ever
+// happen again: the engine is paused, so it delivers nothing, and nothing is
+// buffered. The handler blocks in Read for the rest of the connection's life.
+//
+// This is not celeris#667. There the two applications reached the engine in
+// the wrong order; here there is one application, in the right order, of a
+// decision that no longer holds. It fires with both callbacks under pausedMu.
+//
+// The interleaving is laid out in one goroutine, in the order the race
+// produces it, so the scheduler decides nothing:
+//
+//  1. the engine appends up to highWater-1 through Append (no pause yet), then
+//     performs the crossing append's channel send and takes its depth
+//     snapshot — exactly the two statements Append runs before requestPause;
+//  2. the handler drains the channel to empty through the real Read;
+//  3. the crossing append's requestPause runs, applying the stale decision.
+//
+// Only the gap between steps 1 and 3 is manufactured; every statement on
+// either side of it is the production code path. It is swept over capacity
+// 1 (lowWater 0), 8, 16 and 256 (the production default).
+func TestChanReaderStalePauseConverges(t *testing.T) {
+	for _, capacity := range []int{1, 8, 16, 256} {
+		t.Run("cap"+strconv.Itoa(capacity), func(t *testing.T) {
+			r := newChanReader(capacity, 0, 0)
+
+			// desired mirrors the engine's recvPauseDesired, Swap-based as
+			// in both engines.
+			var desired atomic.Bool
+			var pauses, resumes atomic.Uint32
+			r.SetPauser(
+				func() { pauses.Add(1); desired.Swap(true) },
+				func() { resumes.Add(1); desired.Swap(false) },
+			)
+
+			// Step 1: fill to one below highWater through Append...
+			for i := 0; i < r.highWater-1; i++ {
+				if !r.Append([]byte{'a'}) {
+					t.Fatalf("harness: Append %d rejected below capacity", i)
+				}
+			}
+			if pauses.Load() != 0 {
+				t.Fatalf("harness: paused before highWater (pauses=%d)", pauses.Load())
+			}
+			// ...then the crossing append's send and its depth snapshot.
+			r.ch <- []byte{'z'}
+			if decided := len(r.ch) >= r.highWater; !decided {
+				t.Fatalf("harness: the crossing send left depth %d below highWater %d",
+					len(r.ch), r.highWater)
+			}
+
+			// Step 2: the handler drains to empty through the real Read.
+			// Every resume check in here sees pausedState == false.
+			buf := make([]byte, 1)
+			for i := 0; i < r.highWater; i++ {
+				if n, err := r.Read(buf); n != 1 || err != nil {
+					t.Fatalf("harness: drain read %d: n=%d err=%v", i, n, err)
+				}
+			}
+			if len(r.ch) != 0 || r.hasSpill() || resumes.Load() != 0 {
+				t.Fatalf("harness: expected an empty buffer and no resume before the stale pause "+
+					"(depth=%d spill=%v resumes=%d)", len(r.ch), r.hasSpill(), resumes.Load())
+			}
+
+			// Step 3: the crossing append applies its now-stale decision.
+			r.requestPause()
+
+			// Anti-vacuity: the stale pause must actually have been applied.
+			if got := pauses.Load(); got != 1 {
+				t.Fatalf("harness: expected exactly 1 pause callback, got %d", got)
+			}
+
+			// The oracle, on the quiesced state. Nothing is buffered, so the
+			// handler's next Read blocks, and it can be woken only by the
+			// engine delivering more. The engine must therefore not be left
+			// paused, and the reader's view must agree with the engine's.
+			engine, reader := desired.Load(), readerPaused(r)
+			if engine && len(r.ch) == 0 && !r.hasSpill() {
+				t.Fatalf("celeris#672: engine recv paused with nothing buffered — the pause was "+
+					"decided at depth >= highWater (%d) but applied after the handler had drained "+
+					"to empty, and Read re-evaluates the resume only after a successful dequeue, "+
+					"so nothing can ever resume it (reader believes paused=%v, pauses=%d resumes=%d)",
+					r.highWater, reader, pauses.Load(), resumes.Load())
+			}
+			if engine != reader {
+				t.Fatalf("engine recv paused=%v but reader believes paused=%v (pauses=%d resumes=%d)",
+					engine, reader, pauses.Load(), resumes.Load())
+			}
+
+			// And the connection still delivers: the engine, not paused,
+			// delivers the next chunk and the handler's next Read gets it
+			// without blocking.
+			if !r.Append([]byte{'n'}) {
+				t.Fatal("Append after the stale pause was rejected")
+			}
+			if n, err := r.Read(buf); n != 1 || err != nil || buf[0] != 'n' {
+				t.Fatalf("read after the stale pause: n=%d err=%v byte=%q", n, err, buf[:n])
+			}
+		})
 	}
 }
