@@ -85,6 +85,13 @@ func (l *Loop) tryTransplant(fd int) {
 	// touched only by this loop thread, so the reads are inherently safe.
 	hasGoroutine := false
 	if l.async {
+		// A close is owed (celeris#669): closeConn left it to the dispatch
+		// goroutine, which may already have exited without the loop having
+		// drained its hand-back. Never hand such a conn to the target — the
+		// hand-back would then close through a connState the move released.
+		if cs.asyncClosed.Load() {
+			return
+		}
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
 		parked := cs.asyncParked

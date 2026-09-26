@@ -85,12 +85,22 @@ type Loop struct {
 	conns     []*connState
 	connCount int // number of active connections (local, for draining check)
 	maxFD     int // upper bound fd for iteration in checkTimeouts/shutdown
-	// liveConns is a dense slice of currently-active FDs. checkTimeouts
-	// and shutdown iterate it instead of the sparse 0..maxFD range, so
-	// their cost is O(active conns) regardless of the FD space (maxFD
-	// never shrinks). Maintained by addLiveConn/removeLiveConn on every
-	// accept/close path. Worker-thread-only — no synchronization. (#318)
-	liveConns []int
+	// liveConns is a dense slice of the connections this loop holds.
+	// checkTimeouts, the sweep and shutdown iterate it instead of the sparse
+	// 0..maxFD range, so their cost is O(active conns) regardless of the FD
+	// space (maxFD never shrinks). Maintained by addLiveConn/removeLiveConn
+	// on every accept/close path. Worker-thread-only — no synchronization.
+	// (#318)
+	//
+	// It holds connStates, not descriptor numbers (celeris#668). An async
+	// hijack leaves its entry here until the dispatch goroutine has exited
+	// and handed the conn back, but closes the descriptor at once, so the
+	// kernel can reissue the number to the next accept on this loop before
+	// the entry goes. Keyed by number, the two entries would alias: the
+	// swap-remove fix-up would move the wrong connState's liveIdx and the
+	// stale entry could never be found again. Walkers skip an entry whose
+	// connState is hijacked.
+	liveConns []*connState
 	// listenHot is set by acceptAll when it stops with the listen backlog
 	// possibly non-empty (per-call cap hit, or EMFILE/ENFILE back-off).
 	// The listen socket is edge-triggered, so the queued SYNs won't
@@ -298,7 +308,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 		timerFD:      -1,
 		events:       make([]unix.EpollEvent, min(resolved.MaxEvents, maxEpollEvents)),
 		conns:        make([]*connState, connTableInitSize),
-		liveConns:    make([]int, 0, 1024),
+		liveConns:    make([]*connState, 0, 1024),
 		handler:      handler,
 		resolved:     resolved,
 		cfg:          cfg,
@@ -603,9 +613,16 @@ func (l *Loop) run(ctx context.Context) {
 			// the response is not truncated. Detached (WS/SSE) conns keep their
 			// middleware's close lifecycle, but they still have to LEARN the
 			// peer is gone — see notifyDetachedPeerClosed.
+			//
+			// A conn whose close is already under way (asyncClosed) is left
+			// alone. drainRead's EOF branch, on this same event, may have
+			// left the close to a dispatch goroutine that is still inside its
+			// handler (celeris#669); that goroutine is writing the response
+			// under detachMu, so csWritePending below would read its buffers
+			// unlocked, and closeConn would only repeat the hand-off.
 			if ev.Events&unix.EPOLLRDHUP != 0 {
 				if fd >= 0 && fd < len(l.conns) {
-					if cs := l.conns[fd]; cs != nil && !cs.detachClosed {
+					if cs := l.conns[fd]; cs != nil && !cs.detachClosed && !cs.asyncClosed.Load() {
 						switch {
 						case cs.h1State != nil && cs.h1State.Detached.Load():
 							l.notifyDetachedPeerClosed(cs)
@@ -937,7 +954,15 @@ func (l *Loop) acceptAll(ctx context.Context, now int64) acceptStop {
 		connCtx := ctxkit.WithWorkerID(ctx, l.id)
 		cs := acquireConnState(connCtx, newFD, l.resolved.BufferSize, l.async)
 		cs.remoteAddr = sockaddrString(sa)
+		// Install under driverMu. An async Hijack clears its slot from the
+		// dispatch goroutine under this lock and then closes the
+		// descriptor, and the kernel's lowest-free-fd rule can hand the
+		// number straight back to this accept: the install must be ordered
+		// after that write (celeris#668). One uncontended lock per accept,
+		// next to accept4, setsockopt and epoll_ctl.
+		l.driverMu.Lock()
 		l.conns[newFD] = cs
+		l.driverMu.Unlock()
 		l.addLiveConn(cs)
 		l.connCount++
 		if newFD > l.maxFD {
@@ -1030,7 +1055,10 @@ func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
 // reads a slot a hijack is concurrently niling, and no reader observes a torn
 // header (base + len). Allocation stays outside the lock to keep the critical
 // section to a copy + pointer store; growth is rare (only on a new high-water
-// fd), so the lock is well off the steady hot path.
+// fd), so the lock is well off the steady hot path. The slot INSTALLS
+// (acceptAll, attachAdoptedFD) take l.driverMu too, so installing a descriptor
+// number a hijack has just released is ordered after the hijack's clear
+// (celeris#668).
 func (l *Loop) growConns(fd int) {
 	newLen := len(l.conns)
 	for newLen <= fd {
@@ -1075,33 +1103,13 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
 			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			_ = l.flushWrites(cs, true)
 			// Surface read failure to detached middleware (e.g. WS).
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(err)
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			l.closeConn(fd)
+			l.closeOnReadEnd(fd, cs, err)
 			return
 		}
 		if n == 0 {
-			if mu := cs.detachMu; mu != nil {
-				mu.Lock()
-			}
-			_ = l.flushWrites(cs, true)
 			// Surface peer-close (EOF) to detached middleware.
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(errPeerClosed)
-			}
-			if mu := cs.detachMu; mu != nil {
-				mu.Unlock()
-			}
-			l.closeConn(fd)
+			l.closeOnReadEnd(fd, cs, errPeerClosed)
 			return
 		}
 
@@ -1234,7 +1242,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 			// ProcessH1, so the worker's next read into cs.buf can't
 			// overwrite in-flight bytes. Zero allocation on steady state.
 			cs.asyncInBuf = append(cs.asyncInBuf, data...)
-			starting := !cs.asyncRun
+			// Never start a dispatch goroutine on a conn whose close is
+			// owed: its last goroutine can exit before the loop drains the
+			// hand-back that finishes the close (celeris#669), and a new one
+			// would only exit again. Evaluated only when no goroutine runs,
+			// so the steady state pays nothing.
+			starting := !cs.asyncRun && !cs.asyncClosed.Load()
 			if starting {
 				cs.asyncRun = true
 			}
@@ -1491,6 +1504,89 @@ func (l *Loop) drainRead(fd int, now int64) {
 	}
 }
 
+// closeOnReadEnd is drainRead's read-error and EOF branch: flush what is
+// queued, surface err to a detached middleware (OnError, under detachMu, as
+// every OnError site in this file runs), and close.
+//
+// When detachMu is held and the conn's dispatch goroutine is running, the
+// holder is that goroutine inside a user handler (celeris#669), and waiting
+// for the lock parked the loop — and every connection on it — until the
+// handler returned. The common shape is a client that gives up on a slow
+// handler and disconnects. So the flush and the notification ride on the
+// close instead: closeConn leaves it to the goroutine, which exits at its next
+// check, and then runs it on this thread with the lock free, delivering
+// closeErr first.
+func (l *Loop) closeOnReadEnd(fd int, cs *connState, err error) {
+	mu := cs.detachMu
+	if mu != nil && !mu.TryLock() {
+		if dispatchBusy(cs) {
+			cs.closeErr = err
+			l.closeConn(fd)
+			return
+		}
+		mu.Lock()
+	}
+	_ = l.flushWrites(cs, true)
+	if cs.h1State != nil && cs.h1State.OnError != nil {
+		cs.h1State.OnError(err)
+	}
+	if mu != nil {
+		mu.Unlock()
+	}
+	l.closeConn(fd)
+}
+
+// dispatchBusy reports whether cs has a dispatch goroutine that is running:
+// alive (asyncRun) and not parked in asyncCond.Wait. Loop thread.
+//
+// It is how a loop-thread site that found cs.detachMu held tells the holders
+// apart (celeris#669). The dispatch goroutine holds the lock across
+// ProcessH1, i.e. for as long as the user handler runs, and it is running
+// whenever it does. Every other holder — a detached conn's guarded writeFn,
+// the goroutine's own asyncClosed re-check — holds it for one write or less.
+// So a site that finds the lock held and the goroutine running must not wait,
+// and one that finds it held with the goroutine parked or absent may wait as
+// it always has: that wait is bounded.
+//
+// A running goroutine is not necessarily the holder (it may be delivering a
+// frame after Detach while a guarded writeFn holds the lock). Every site that
+// acts on a true only leaves work to be done later — a flush the holder does
+// anyway, a close the goroutine hands back on its way out — so a false
+// positive costs a hand-off, never a lost write or close.
+//
+// Parked is exact, not a heuristic: asyncParked is set and cleared under
+// asyncInMu in the same critical section as the park loop's condition, so a
+// goroutine seen parked here can only leave Wait by re-taking asyncInMu, after
+// this read, and a caller that has already set asyncClosed makes it exit
+// without taking detachMu.
+func dispatchBusy(cs *connState) bool {
+	if cs.asyncCond.L == nil {
+		return false // no async machinery: sync mode, no dispatch goroutine
+	}
+	cs.asyncInMu.Lock()
+	busy := cs.asyncRun && !cs.asyncParked
+	cs.asyncInMu.Unlock()
+	return busy
+}
+
+// leaveCloseToDispatch is dispatchBusy for closeConn, which must record the
+// hand-off in the same critical section it decides it in: closeOwed is read
+// by the goroutine's exit path under asyncInMu, so a goroutine that exits
+// after this section sees it, and one that exited before it made asyncRun
+// false here. Loop thread; asyncClosed must already be set.
+func leaveCloseToDispatch(cs *connState) bool {
+	if cs.asyncCond.L == nil {
+		return false
+	}
+	cs.asyncInMu.Lock()
+	busy := cs.asyncRun && !cs.asyncParked
+	if busy {
+		cs.closeOwed = true
+	}
+	cs.asyncInMu.Unlock()
+	return busy
+}
+
 func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// l.conns access is guarded by driverMu: in async mode this runs on a
 	// dispatch goroutine, so the read of the header/slot must be serialized
@@ -1501,38 +1597,56 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	if cs == nil {
 		return nil, errors.New("celeris: connection not found")
 	}
-	// Detach the conn from the engine: drop it from epoll, the live set and
-	// the conn table, and update the counters.
+	// Which thread is this? A dispatch goroutine is alive for this conn only
+	// once the conn was promoted to one, and from then on the handler — and
+	// so this call — runs ON that goroutine (inside ProcessH1 → ErrHijacked).
+	// Otherwise the call is inline on the loop thread: sync mode, or an
+	// async-mode conn not yet promoted running its first request inline.
+	// asyncRun is read under asyncInMu, the lock the goroutine's lifetime is
+	// published under.
+	offThread := false
+	if cs.detachMu != nil {
+		cs.asyncInMu.Lock()
+		offThread = cs.asyncRun
+		cs.asyncInMu.Unlock()
+	}
+	// Detach the conn from the engine: drop it from epoll and the conn table,
+	// and move the public gauges.
 	//
-	// WHAT IS AND IS NOT SERIALIZED HERE. In async mode this runs ON the
-	// dispatch goroutine (inside ProcessH1 → ErrHijacked), not on the loop
-	// thread, so the lines below do not all stand on the same ground:
+	// WHAT RUNS WHERE (celeris#668). Off-thread, this may touch only what is
+	// serialized against the loop:
 	//
 	//   - EPOLL_CTL_DEL is a kernel call and needs no lock; after it the
 	//     worker sees no further EPOLLIN for this fd.
 	//   - the l.conns[fd] write takes driverMu, so it cannot race growConns'
 	//     copy + header swap, RegisterConn's occupancy check, or closeConn's
 	//     capture and ownership re-check (celeris#654).
-	//   - activeConns and closeCount are atomics.
-	//   - removeLiveConn and connCount-- are NEITHER. Both are documented
-	//     worker-thread-only state (see the Loop fields), and mutating them
-	//     from this goroutine is unsound: checkTimeouts and shutdown read
-	//     len(l.liveConns) once and then index it, so a concurrent
-	//     swap-and-shrink can index out of range or skip a live conn, and
-	//     connCount-- can lose an update against acceptAll's connCount++,
-	//     which leaves the connCount == 0 DRAINING→SUSPENDED gate
-	//     permanently unsatisfiable on this loop.
+	//   - activeConns and closeCount are atomics, and so is hijacked.
 	//
-	// That last bullet is PRE-EXISTING and is NOT fixed by celeris#654, which
-	// removes the duplicate teardown closeConn used to perform but not the
-	// fact that this teardown runs off-thread. The counters below are not
-	// race-free; do not cite them as such. Tracked in celeris#668.
+	// The live set and connCount are the loop's (see the Loop fields), and so
+	// are the sweep's dormancy fields that removeLiveConn writes. Changing
+	// them from here raced the index walks of checkTimeouts, the sweep and
+	// shutdown, and connCount-- could lose an update against acceptAll's
+	// connCount++, after which the connCount == 0 DRAINING→SUSPENDED gate
+	// never passes on this loop again. So off-thread both are left to
+	// drainDetachQueue's hijacked branch, which runs on the loop once this
+	// goroutine has exited and handed cs back — the hand-off that already
+	// defers the pool release (below). Until then the entry stays in the live
+	// set and the walkers skip it on hijacked, which is stored BEFORE the
+	// descriptor is released: by the time the kernel can reissue the number
+	// to another accept, the entry already reads as not the loop's.
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
-	l.removeLiveConn(cs)
+	if offThread {
+		cs.hijacked.Store(true)
+	} else {
+		l.removeLiveConn(cs)
+	}
 	l.driverMu.Lock()
 	l.conns[fd] = nil
 	l.driverMu.Unlock()
-	l.connCount--
+	if !offThread {
+		l.connCount--
+	}
 	l.activeConns.Add(-1)
 	l.closeCount.Add(1)
 
@@ -1540,33 +1654,21 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	c, err := net.FileConn(f)
 	_ = f.Close()
 
-	// CRITICAL (#3.1): defer the pool release whenever a dispatch goroutine
-	// (runAsyncHandler) is alive for this conn. When the handler calls
-	// Hijack from inside that goroutine's ProcessH1, the goroutine STILL
-	// touches cs after ProcessH1 returns ErrHijacked — it Unlocks
-	// cs.detachMu, resyncs cs.pendingBytes, sets cs.asyncClosed, clears
-	// cs.asyncInBuf, and enqueues cs on detachQueue. Recycling cs now would
-	// hand pooled-and-reissued memory to that goroutine. Mark it hijacked
-	// and let the worker-thread teardown (drainDetachQueue, reached via the
-	// goroutine's asyncClosed + detachQueue handoff) run the pool release
-	// once the goroutine has exited.
+	// CRITICAL (#3.1): off-thread, defer the pool release as well. When the
+	// handler calls Hijack from inside the dispatch goroutine's ProcessH1, the
+	// goroutine STILL touches cs after ProcessH1 returns ErrHijacked — it
+	// Unlocks cs.detachMu, resyncs cs.pendingBytes, sets cs.asyncClosed,
+	// clears cs.asyncInBuf, and enqueues cs on detachQueue. Recycling cs now
+	// would hand pooled-and-reissued memory to that goroutine. The
+	// worker-thread teardown (drainDetachQueue, reached via the goroutine's
+	// asyncClosed + detachQueue handoff) runs the pool release once the
+	// goroutine has exited.
 	//
-	// When no dispatch goroutine is running, hijackConn was called inline on
-	// the worker thread (sync mode, or an async-mode conn not yet promoted
-	// running its first request inline). drainRead returns immediately on
-	// ErrHijacked without touching cs again and nothing will enqueue cs, so
-	// release synchronously here — gating only on detachMu would leak the
-	// connState in the inline-async case. asyncRun is read under asyncInMu
-	// (the same lock the dispatch goroutine sets it under).
-	deferRelease := false
-	if cs.detachMu != nil {
-		cs.asyncInMu.Lock()
-		deferRelease = cs.asyncRun
-		cs.asyncInMu.Unlock()
-	}
-	if deferRelease {
-		cs.hijacked = true
-	} else {
+	// Inline, drainRead returns immediately on ErrHijacked without touching
+	// cs again and nothing will enqueue cs, so release synchronously here —
+	// gating only on detachMu would leak the connState in the inline-async
+	// case.
+	if !offThread {
 		// Unlink before the pool release. releaseConnState clears cs's own
 		// dirty links but never repairs l.dirtyHead or a predecessor's
 		// dirtyNext, so handing back a still-linked connState leaves the
@@ -2057,7 +2159,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			cs.asyncClosed.Store(true)
 			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
-			cs.asyncRun = false
+			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
 			// Signal worker via detachQueue + eventfd (never close the
 			// fd from this goroutine — races with drainRead on the
@@ -2092,8 +2194,14 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		}
 		cs.asyncParked = false
 		if cs.asyncClosed.Load() {
-			cs.asyncRun = false
+			// The one exit that does not enqueue cs: a close requested while
+			// this goroutine ran may have been left to it (celeris#669), and
+			// then this is where it is handed back.
+			owed := cs.endDispatch()
 			cs.asyncInMu.Unlock()
+			if owed {
+				l.enqueueDetach(cs)
+			}
 			return
 		}
 		// #383: transplant quiesce requested and input drained — exit cleanly
@@ -2101,7 +2209,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		// io_uring. tryTransplant only sets asyncQuiesce on a parked, flushed
 		// conn whose fd it has already detached, so asyncInBuf is empty here.
 		if cs.asyncQuiesce.Load() && len(cs.asyncInBuf) == 0 {
-			cs.asyncRun = false
+			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
 			l.detachQMu.Lock()
 			l.detachQueue = append(l.detachQueue, cs)
@@ -2141,9 +2249,13 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			if acquiredDetachMu {
 				cs.detachMu.Unlock()
 			}
+			// Nor does this one; see the loop-top exit.
 			cs.asyncInMu.Lock()
-			cs.asyncRun = false
+			owed := cs.endDispatch()
 			cs.asyncInMu.Unlock()
+			if owed {
+				l.enqueueDetach(cs)
+			}
 			return
 		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
@@ -2173,12 +2285,12 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 				cs.asyncClosed.Store(true)
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 			} else {
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 				cs.asyncH2Promoted.Store(true)
 			}
@@ -2204,7 +2316,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 				cs.asyncClosed.Store(true)
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 				l.detachQMu.Lock()
 				l.detachQueue = append(l.detachQueue, cs)
@@ -2279,7 +2391,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			cs.asyncClosed.Store(true)
 			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
-			cs.asyncRun = false
+			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
 			l.detachQMu.Lock()
 			l.detachQueue = append(l.detachQueue, cs)
@@ -2289,6 +2401,30 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			return
 		}
 	}
+}
+
+// endDispatch marks cs's dispatch goroutine as gone and reports whether a
+// close was left to it (closeOwed, celeris#669). The goroutine calls it on
+// every exit path, holding cs.asyncInMu. A path that enqueues cs on its way
+// out ignores the result: that enqueue is the hand-back, and
+// drainDetachQueue's asyncClosed branch runs the close. The two paths that
+// exit WITHOUT enqueuing must enqueue when it reports true, or the close is
+// lost and the conn stays open, owned by no goroutine.
+func (cs *connState) endDispatch() (closeOwed bool) {
+	cs.asyncRun = false
+	closeOwed = cs.closeOwed
+	cs.closeOwed = false
+	return closeOwed
+}
+
+// enqueueDetach hands cs to the loop thread's drainDetachQueue and wakes the
+// loop. Dispatch goroutine.
+func (l *Loop) enqueueDetach(cs *connState) {
+	l.detachQMu.Lock()
+	l.detachQueue = append(l.detachQueue, cs)
+	l.detachQPending.Store(1)
+	l.detachQMu.Unlock()
+	l.wakeFD.Signal()
 }
 
 func (l *Loop) drainDetachQueue() {
@@ -2317,13 +2453,21 @@ func (l *Loop) drainDetachQueue() {
 			continue
 		}
 		// Hijacked conn (#3.1): hijackConn already detached the fd from
-		// epoll/live set/conn table and handed it to the caller as a
+		// epoll and the conn table and handed it to the caller as a
 		// net.Conn (the original fd is closed; the caller owns a dup). It
-		// deferred ONLY the pool release to here, where the dispatch
-		// goroutine that referenced cs has now exited (it enqueued cs on
-		// its way out). Release cs and skip closeConn — there is no fd to
-		// close and l.conns[fd] is already nil.
-		if cs.hijacked {
+		// deferred to here, where the dispatch goroutine that referenced cs
+		// has now exited (it enqueued cs on its way out), the pool release
+		// and the two pieces of loop-thread state it may not touch from
+		// that goroutine: the live-set entry and connCount (celeris#668).
+		// Skip closeConn — there is no fd to close and l.conns[fd] is
+		// already nil.
+		//
+		// This branch runs once per hijack: releaseConnState clears the
+		// flag, so a second queue entry for the same connState cannot
+		// decrement connCount again.
+		if cs.hijacked.Load() {
+			l.removeLiveConn(cs)
+			l.connCount--
 			// Unlink from the dirty list first: hijackConn does not, and
 			// releaseConnState clears only cs's own links, so the pool would
 			// otherwise get a connState that l.dirtyHead or a predecessor
@@ -2410,7 +2554,32 @@ func (l *Loop) drainDetachQueue() {
 func (l *Loop) flushDirty() {
 	for cs := l.dirtyHead; cs != nil; {
 		next := cs.dirtyNext
-		if mu := cs.detachMu; mu != nil {
+		if mu := cs.detachMu; mu != nil && !mu.TryLock() {
+			if dispatchBusy(cs) {
+				// The conn's dispatch goroutine holds detachMu across a
+				// user handler (celeris#669): waiting here parked the loop,
+				// and every connection on it, until the handler returned.
+				// Take the conn off the list instead of retrying it — a
+				// dirty list that never empties holds epoll_wait at 0 ms.
+				// Nothing is lost: whoever holds the lock flushes writeBuf
+				// from writePos when it is done (the goroutine after
+				// ProcessH1, a guarded writeFn after its write) and hands a
+				// remainder back through the detach queue, which puts the
+				// conn back on this list.
+				//
+				// Except a deferred peer close (peerClosed): it fires only
+				// when THIS pass sees the flush complete, and a holder
+				// whose flush completes hands nothing back. Such a conn
+				// stays on the list and is retried each pass until the
+				// handler returns — a spin, but only for a peer that
+				// half-closed with a response still queued while a
+				// pipelined request's handler runs.
+				if !cs.peerClosed {
+					l.removeDirty(cs)
+				}
+				cs = next
+				continue
+			}
 			mu.Lock()
 		}
 		err := l.flushWrites(cs, true)
@@ -2519,7 +2688,21 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 // read-only interest. A still-partial flush leaves EPOLLOUT armed so the
 // next writable edge resumes. Returns false if the conn was closed.
 func (l *Loop) handleWritable(cs *connState) {
-	if mu := cs.detachMu; mu != nil {
+	if mu := cs.detachMu; mu != nil && !mu.TryLock() {
+		if dispatchBusy(cs) {
+			// A pipelined request started a handler before the socket
+			// drained (celeris#669). Do not wait for it, and drop the
+			// level-triggered interest, which would otherwise fire on every
+			// epoll_wait until the handler returns. The goroutine flushes
+			// writeBuf itself when the handler returns and hands any
+			// remainder back to the dirty list, which re-arms EPOLLOUT.
+			// A deferred peer close keeps the interest, for the reason
+			// given in flushDirty.
+			if !cs.peerClosed {
+				l.disarmEpollOut(cs)
+			}
+			return
+		}
 		mu.Lock()
 	}
 	err := l.flushWrites(cs, true)
@@ -2582,7 +2765,7 @@ func (l *Loop) removeDirty(cs *connState) {
 // stamps cs.liveIdx so removeLiveConn is O(1). Worker-thread-only. (#318)
 func (l *Loop) addLiveConn(cs *connState) {
 	cs.liveIdx = len(l.liveConns)
-	l.liveConns = append(l.liveConns, cs.fd)
+	l.liveConns = append(l.liveConns, cs)
 	// A dormant sweep judged the set this loop held; it holds a different
 	// one now (celeris#657 P7).
 	l.wakeSweep()
@@ -2598,17 +2781,20 @@ func (l *Loop) removeLiveConn(cs *connState) {
 		return
 	}
 	i := cs.liveIdx
-	if i < 0 || i >= len(l.liveConns) || l.liveConns[i] != cs.fd {
+	if i < 0 || i >= len(l.liveConns) || l.liveConns[i] != cs {
 		return
 	}
 	last := len(l.liveConns) - 1
 	if i != last {
-		movedFD := l.liveConns[last]
-		l.liveConns[i] = movedFD
-		if moved := l.conns[movedFD]; moved != nil {
-			moved.liveIdx = i
-		}
+		// The fix-up follows the entry itself, not l.conns[fd]: the
+		// entry may be a hijacked conn whose slot is already clear, or
+		// whose descriptor number now belongs to another conn
+		// (celeris#668).
+		moved := l.liveConns[last]
+		l.liveConns[i] = moved
+		moved.liveIdx = i
 	}
+	l.liveConns[last] = nil // connStates are pooled: no stale reference past len
 	l.liveConns = l.liveConns[:last]
 	cs.liveIdx = -1
 	// The residue this loop last published counted this conn; it no longer
@@ -2684,11 +2870,15 @@ const detachDrainGrace = time.Second
 func (l *Loop) checkTimeouts() {
 	now := time.Now().UnixNano()
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
-		fd := l.liveConns[i]
-		cs := l.conns[fd]
-		if cs == nil {
+		cs := l.liveConns[i]
+		if cs.hijacked.Load() {
+			// Handed to the application by an async Hijack, and waiting
+			// for its dispatch goroutine to hand it back (celeris#668):
+			// not this loop's to time out, and its descriptor number may
+			// already be another conn's.
 			continue
 		}
+		fd := cs.fd
 		// Detached connections (e.g. WebSocket): honor an explicit deadline
 		// supplied by the middleware via SetWSIdleDeadline. Skip the
 		// engine-config-driven idle/read/write timeouts since the middleware
@@ -2791,27 +2981,47 @@ func (l *Loop) closeConn(fd int) {
 		}
 		// Signal the detached goroutine's writeFn to stop writing.
 		// The mutex serializes with any in-progress write — if the
-		// goroutine is mid-write, we block until it finishes. Under
-		// AsyncHandlers that wait is unbounded by the handler: this is where
-		// a timeout reap parks the whole loop thread for as long as the user
-		// handler runs (celeris#669, the epoll twin of the closed #593).
-		cs.detachMu.Lock()
+		// goroutine is mid-write, we wait until it finishes.
+		//
+		// But not for a handler (celeris#669, the epoll twin of the closed
+		// #593). The dispatch goroutine holds this mutex across ProcessH1,
+		// i.e. for as long as the user handler runs, and a blocking Lock
+		// here parked the loop thread — every connection on it, no
+		// epoll_wait, no accept, no flush — until the handler returned:
+		// through the timeout reap, EPOLLRDHUP, EPOLLHUP and every error
+		// path that closes. When the lock is held and that goroutine is
+		// running, leave the close to it: asyncClosed is set, so it exits at
+		// its next check, and its exit hands cs back through the detach
+		// queue, whose asyncClosed branch calls here again with the lock
+		// free. Until then the conn stays whole — in the table, the live set
+		// and epoll, its descriptor open — because the handler is still
+		// writing its response into it. When the goroutine is parked or
+		// gone, the holder is a guarded writeFn in one write, and waiting
+		// for it is bounded; see dispatchBusy.
+		if !cs.detachMu.TryLock() {
+			if leaveCloseToDispatch(cs) {
+				return
+			}
+			cs.detachMu.Lock()
+		}
 		// celeris#654: re-validate ownership now that we hold the lock.
 		// Under AsyncHandlers the user handler runs inside ProcessH1 with
-		// detachMu held, and Context.Hijack → hijackConn does the ENTIRE
-		// engine-side teardown right there on the dispatch goroutine:
-		// EPOLL_CTL_DEL, removeLiveConn, l.conns[fd] = nil, the three
-		// counters, and close() of the original descriptor (the caller keeps
-		// a dup). We captured cs BEFORE that ran and then parked on this
-		// lock, so without a re-check we redo every one of those steps on a
-		// conn the engine no longer owns: the close is counted twice and the
-		// live gauge goes negative (which also means the DRAINING→SUSPENDED
-		// connCount == 0 gate can never pass again on this loop), and the
-		// OnDisconnect fires for a connection that was handed to the
-		// application, and the SHUT_WR + Close below lands on a descriptor
-		// NUMBER the kernel's lowest-free-fd rule has already reissued to
-		// something else — another loop's accept, an fd the handler opened, a
-		// driver conn registered off-thread into this same epfd.
+		// detachMu held, and Context.Hijack → hijackConn detaches the conn
+		// right there on the dispatch goroutine: EPOLL_CTL_DEL,
+		// l.conns[fd] = nil, the public counters, and close() of the
+		// original descriptor (the caller keeps a dup). A closeConn that
+		// captured cs BEFORE that ran and then waited on this lock would,
+		// without a re-check, redo every one of those steps on a conn the
+		// engine no longer owns: the close counted twice, the live gauge
+		// negative, an OnDisconnect for a connection handed to the
+		// application, and a SHUT_WR + Close on a descriptor NUMBER the
+		// kernel's lowest-free-fd rule has already reissued to something
+		// else — another loop's accept, an fd the handler opened, a driver
+		// conn registered off-thread into this same epfd.
+		//
+		// Since celeris#669 closeConn no longer waits on a running handler,
+		// so this wait-then-hijack interleaving needs a holder that is not
+		// the dispatch goroutine; the check stays as the guard for it.
 		//
 		// One check suffices. The slot is only cleared off-thread by
 		// hijackConn, which in async mode runs under this very mutex, and
@@ -2842,9 +3052,12 @@ func (l *Loop) closeConn(fd int) {
 			//     ProcessH1 — and therefore Hijack — cannot run on an H2
 			//     conn); if that ever changes, the unlink belongs in
 			//     hijackConn, the site that knows it is hijacking.
-			//   - the three counters, EPOLL_CTL_DEL, the fd close,
-			//     removeLiveConn and the slot nil: all already done by
-			//     hijackConn.
+			//   - the public counters, EPOLL_CTL_DEL, the fd close and the
+			//     slot nil: all already done by hijackConn.
+			//   - removeLiveConn and connCount: not ours to do either. An
+			//     off-thread hijack leaves both to drainDetachQueue's
+			//     hijacked branch, on this thread, once the dispatch
+			//     goroutine has exited (celeris#668).
 			//   - CloseH1 and the pool release: not ours to do. Leaving
 			//     detachClosed false is what lets drainDetachQueue reach its
 			//     cs.hijacked branch and return the connState to the pool
@@ -2857,6 +3070,17 @@ func (l *Loop) closeConn(fd int) {
 			l.removeDirty(cs)
 			cs.detachMu.Unlock()
 			return
+		}
+		// A drainRead branch that met a running handler left its I/O error
+		// here rather than wait for the lock (closeErr, celeris#669). Do
+		// what that branch did, now that the lock is held: flush what is
+		// queued, then tell a detached middleware.
+		if err := cs.closeErr; err != nil {
+			cs.closeErr = nil
+			_ = l.flushWrites(cs, true)
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(err)
+			}
 		}
 		cs.detachClosed = true
 		// Acquire barrier: only invoke OnDetachClose once the WS upgrade has
@@ -2995,10 +3219,9 @@ func (l *Loop) shutdown() {
 	// index for consistency with checkTimeouts (no removal happens here, but
 	// keeping the idiom avoids surprises).
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
-		fd := l.liveConns[i]
-		cs := l.conns[fd]
-		if cs == nil {
-			continue
+		cs := l.liveConns[i]
+		if cs.hijacked.Load() {
+			continue // the application's since the Hijack (celeris#668)
 		}
 		detached := cs.detachMu != nil
 		if detached {
@@ -3056,11 +3279,14 @@ func (l *Loop) shutdown() {
 	// asyncWG and may still hold a reference, so we let GC reclaim cs once
 	// that goroutine drops its closure refs rather than recycling it here.
 	for i := len(l.liveConns) - 1; i >= 0; i-- {
-		fd := l.liveConns[i]
-		cs := l.conns[fd]
-		if cs == nil {
+		cs := l.liveConns[i]
+		if cs.hijacked.Load() {
+			// hijackConn closed this conn's descriptor already, and the
+			// number may be reissued: closing it here would close another
+			// conn's (celeris#668).
 			continue
 		}
+		fd := cs.fd
 		_ = unix.Close(fd)
 		if cs.detachMu == nil {
 			l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
@@ -3068,6 +3294,7 @@ func (l *Loop) shutdown() {
 		}
 		l.conns[fd] = nil
 	}
+	clear(l.liveConns)
 	l.liveConns = l.liveConns[:0]
 	// celeris#657 R2: this loop holds nothing now, so it must not leave its
 	// last cycle's residue standing in the engine-wide gauges. Nothing else

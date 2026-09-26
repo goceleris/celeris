@@ -41,7 +41,7 @@ func newLedgerLoop(t *testing.T) *Loop {
 	return &Loop{
 		epollFD:                epfd,
 		conns:                  make([]*connState, 4096),
-		liveConns:              make([]int, 0, 8),
+		liveConns:              make([]*connState, 0, 8),
 		activeConns:            &atomic.Int64{},
 		closeCount:             &atomic.Uint64{},
 		acceptCount:            &atomic.Uint64{},

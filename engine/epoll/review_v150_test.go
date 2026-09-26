@@ -32,7 +32,7 @@ func regLive(l *Loop, fd int) *connState {
 // live_conns test, but using the index-based removeLiveConn (NOT the O(N)
 // scan).
 func TestLiveConnsAddRemoveO1(t *testing.T) {
-	l := &Loop{conns: make([]*connState, 1024), liveConns: make([]int, 0, 16)}
+	l := &Loop{conns: make([]*connState, 1024), liveConns: make([]*connState, 0, 16)}
 
 	cs5 := regLive(l, 5)
 	cs10 := regLive(l, 10)
@@ -46,8 +46,8 @@ func TestLiveConnsAddRemoveO1(t *testing.T) {
 
 	// Remove the middle — swap-with-last moves 15 into slot 1: [5, 15].
 	l.removeLiveConn(cs10)
-	if l.liveConns[0] != 5 || l.liveConns[1] != 15 || len(l.liveConns) != 2 {
-		t.Fatalf("liveConns = %v, want [5 15]", l.liveConns)
+	if len(l.liveConns) != 2 || l.liveConns[0] != cs5 || l.liveConns[1] != cs15 {
+		t.Fatalf("liveConns = %d entries, want [cs5 cs15]", len(l.liveConns))
 	}
 	if cs15.liveIdx != 1 {
 		t.Errorf("swapped-in cs15.liveIdx = %d, want 1", cs15.liveIdx)
@@ -83,7 +83,7 @@ func TestCheckTimeoutsClosesAllExpired(t *testing.T) {
 	l := &Loop{
 		epollFD:      epfd,
 		conns:        make([]*connState, 1024),
-		liveConns:    make([]int, 0, 8),
+		liveConns:    make([]*connState, 0, 8),
 		activeConns:  &atomic.Int64{},
 		closeCount:   &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},
@@ -176,7 +176,7 @@ func TestAcceptAllDrainsBacklogNoStrand(t *testing.T) {
 		epollFD:      epfd,
 		listenFD:     lfd,
 		conns:        make([]*connState, connTableSize),
-		liveConns:    make([]int, 0, 256),
+		liveConns:    make([]*connState, 0, 256),
 		activeConns:  &atomic.Int64{},
 		errs:         &errclass.Counters{},
 		reqCount:     &atomic.Uint64{},
@@ -271,7 +271,7 @@ func TestHijackDefersReleaseWhileAsyncGoroutineActive(t *testing.T) {
 	l := &Loop{
 		epollFD:      epfd,
 		conns:        make([]*connState, connTableSize),
-		liveConns:    make([]int, 0, 8),
+		liveConns:    make([]*connState, 0, 8),
 		activeConns:  &atomic.Int64{},
 		closeCount:   &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},
@@ -299,15 +299,18 @@ func TestHijackDefersReleaseWhileAsyncGoroutineActive(t *testing.T) {
 		t.Cleanup(func() { _ = c.Close() })
 	}
 
-	// Detached synchronously: slot nil'd, removed from live set.
+	// Detached from the conn table synchronously. The live set and
+	// connCount are the loop's and are left to the hand-back below
+	// (celeris#668).
 	if l.conns[local] != nil {
 		t.Errorf("hijackConn did not nil l.conns[%d]", local)
 	}
-	if cs.liveIdx != -1 || len(l.liveConns) != 0 {
-		t.Errorf("hijackConn did not remove from liveConns (liveIdx=%d, len=%d)", cs.liveIdx, len(l.liveConns))
+	if cs.liveIdx != 0 || len(l.liveConns) != 1 || l.connCount != 1 {
+		t.Errorf("hijackConn changed loop-thread-only state off-thread (liveIdx=%d, len=%d, connCount=%d)",
+			cs.liveIdx, len(l.liveConns), l.connCount)
 	}
 	// Pool release MUST be deferred while the async goroutine is alive.
-	if !cs.hijacked {
+	if !cs.hijacked.Load() {
 		t.Fatal("hijackConn released cs synchronously while async goroutine active (UAR risk)")
 	}
 	// releaseConnState zeroes fd; deferred means fd is still intact.
@@ -326,8 +329,11 @@ func TestHijackDefersReleaseWhileAsyncGoroutineActive(t *testing.T) {
 	l.drainDetachQueue()
 
 	// releaseConnState clears hijacked + zeroes fd.
-	if cs.hijacked {
+	if cs.hijacked.Load() {
 		t.Error("drainDetachQueue did not release hijacked cs (hijacked still set)")
+	}
+	if len(l.liveConns) != 0 || l.connCount != 0 {
+		t.Errorf("the hand-back left liveConns=%d connCount=%d, want 0 and 0", len(l.liveConns), l.connCount)
 	}
 	if cs.fd != 0 {
 		t.Errorf("cs.fd = %d after release, want 0", cs.fd)
@@ -358,7 +364,7 @@ func TestHijackSyncReleasesImmediately(t *testing.T) {
 	l := &Loop{
 		epollFD:      epfd,
 		conns:        make([]*connState, connTableSize),
-		liveConns:    make([]int, 0, 8),
+		liveConns:    make([]*connState, 0, 8),
 		activeConns:  &atomic.Int64{},
 		closeCount:   &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},
@@ -380,7 +386,7 @@ func TestHijackSyncReleasesImmediately(t *testing.T) {
 	if c != nil {
 		t.Cleanup(func() { _ = c.Close() })
 	}
-	if cs.hijacked {
+	if cs.hijacked.Load() {
 		t.Error("sync hijack deferred release (hijacked set) — should release inline")
 	}
 	if cs.fd != 0 {

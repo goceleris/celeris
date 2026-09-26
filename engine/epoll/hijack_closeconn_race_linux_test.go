@@ -36,6 +36,24 @@ import (
 // BEFORE blocking on detachMu, so that flag is an exact happens-before
 // barrier. The loop is not running, so the "loop thread" here is just
 // another goroutine calling the sweep.
+//
+// Since celeris#669 closeConn no longer waits for a RUNNING dispatch
+// goroutine: it leaves the close to it (see dispatchBusy). It still waits
+// when the goroutine is parked, because then the holder is a bounded one (a
+// guarded writeFn), and the ownership re-check guards that wait against any
+// holder that detaches the conn meanwhile. The arms that pin the re-check
+// therefore mark the goroutine parked (parkDispatch) to reach the wait, and
+// let the hijack stand in for such a holder. The shape a running handler now
+// produces — the close left to it, then a Hijack — is pinned separately by
+// TestCloseLeftToAHandlerThatHijacksIsNotRedone.
+
+// parkDispatch marks the rig's dispatch goroutine as parked in its
+// asyncCond.Wait, so closeConn takes its (bounded) wait on detachMu.
+func parkDispatch(cs *connState) {
+	cs.asyncInMu.Lock()
+	cs.asyncParked = true
+	cs.asyncInMu.Unlock()
+}
 
 // hijackRaceRig is one bare Loop carrying a single async-mode HTTP/1 conn,
 // plus the OnDisconnect counter every arm asserts on.
@@ -237,6 +255,7 @@ func hijackRaceRecycle(t *testing.T, fd int) (writeEnd int) {
 func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs, local, peer := rig.l, rig.cs, rig.local, rig.peer
+	parkDispatch(cs)
 
 	// (a) The dispatch goroutine is inside ProcessH1: runAsyncHandler holds
 	// cs.detachMu for the whole user handler call.
@@ -278,8 +297,11 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	if got := l.activeConns.Load(); got != 0 {
 		t.Errorf("activeConns = %d, want 0: a double decrement drives the live gauge negative", got)
 	}
-	if got := l.connCount; got != 0 {
-		t.Errorf("connCount = %d, want 0: a negative count never satisfies the DRAINING->SUSPENDED gate", got)
+	// connCount is the loop's: an off-thread hijack leaves it to the
+	// hand-back (celeris#668), so it still counts the conn here and must
+	// reach exactly 0 after, below.
+	if got := l.connCount; got != 1 {
+		t.Errorf("connCount = %d before the hand-back, want 1", got)
 	}
 
 	// OnDisconnect is a public lifecycle callback. The connection did not
@@ -324,11 +346,14 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 	l.detachQPending.Store(1)
 	l.detachQMu.Unlock()
 	l.drainDetachQueue()
-	if cs.hijacked {
+	if cs.hijacked.Load() {
 		t.Error("drainDetachQueue skipped the hijacked pool release (detachClosed short-circuit)")
 	}
 	if cs.fd != 0 {
 		t.Errorf("cs.fd = %d after the hand-off, want 0 (connState not released)", cs.fd)
+	}
+	if got := l.connCount; got != 0 {
+		t.Errorf("connCount = %d, want 0: a negative count never satisfies the DRAINING->SUSPENDED gate", got)
 	}
 }
 
@@ -347,6 +372,7 @@ func TestCloseConnDoesNotRecloseConnHijackedWhileWaitingOnDetachMu(t *testing.T)
 func TestCloseConnLeavesAReissuedSlotAloneAfterWaitingOnDetachMu(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs, local := rig.l, rig.cs, rig.local
+	parkDispatch(cs)
 
 	cs.detachMu.Lock()
 	done := hijackRaceSweep(l)
@@ -378,15 +404,26 @@ func TestCloseConnLeavesAReissuedSlotAloneAfterWaitingOnDetachMu(t *testing.T) {
 		t.Errorf("l.conns[%d] = %p, want the new owner %p: closeConn cleared a slot it no longer owned",
 			local, l.conns[local], newCS)
 	}
-	if newCS.liveIdx < 0 || len(l.liveConns) != 1 {
-		t.Errorf("new owner liveIdx = %d, liveConns = %v, want it still in the live set",
-			newCS.liveIdx, l.liveConns)
-	}
 	if got := l.closeCount.Load(); got != 1 {
 		t.Errorf("closeCount = %d, want 1 (only the hijack)", got)
 	}
 	if got := l.activeConns.Load(); got != 1 {
 		t.Errorf("activeConns = %d, want 1 (the new owner)", got)
+	}
+	// The hijacked conn's live-set entry and count are the loop's until its
+	// dispatch goroutine hands it back (celeris#668); then only the new
+	// owner is left, found by its own entry.
+	cs.asyncInMu.Lock()
+	cs.asyncRun = false
+	cs.asyncInMu.Unlock()
+	l.detachQMu.Lock()
+	l.detachQueue = append(l.detachQueue, cs)
+	l.detachQPending.Store(1)
+	l.detachQMu.Unlock()
+	l.drainDetachQueue()
+	if newCS.liveIdx != 0 || len(l.liveConns) != 1 || l.liveConns[0] != newCS {
+		t.Errorf("new owner liveIdx = %d, len(liveConns) = %d, want it alone in the live set",
+			newCS.liveIdx, len(l.liveConns))
 	}
 	if got := l.connCount; got != 1 {
 		t.Errorf("connCount = %d, want 1 (the new owner)", got)
@@ -438,6 +475,19 @@ func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
 	if got := l.activeConns.Load(); got != 0 {
 		t.Errorf("activeConns = %d, want 0", got)
 	}
+	if cs.detachClosed {
+		t.Error("closeConn touched a connState it no longer owns")
+	}
+	// The dispatch goroutine exits and hands cs back; only then is the
+	// loop's connCount decremented (celeris#668).
+	cs.asyncInMu.Lock()
+	cs.asyncRun = false
+	cs.asyncInMu.Unlock()
+	l.detachQMu.Lock()
+	l.detachQueue = append(l.detachQueue, cs)
+	l.detachQPending.Store(1)
+	l.detachQMu.Unlock()
+	l.drainDetachQueue()
 	if got := l.connCount; got != 0 {
 		t.Errorf("connCount = %d, want 0", got)
 	}
@@ -453,14 +503,15 @@ func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
 			hijackRaceExpectRead(t, local, "y", "recycled pipe survives an uncontended closeConn")
 		}
 	}
-	if cs.detachClosed {
-		t.Error("closeConn touched a connState it no longer owns")
+	if cs.fd != 0 {
+		t.Error("the hand-back did not release the hijacked connState")
 	}
 }
 
 // TestCloseConnClosesOnceWhenHandlerDoesNotHijack is negative control 2: the
-// identical interleaving — the timeout sweep parked on detachMu behind a
-// running async handler — with no Hijack. closeConn still owns the conn when
+// identical interleaving — the timeout sweep waiting on detachMu behind a
+// holder (with the dispatch goroutine parked, see parkDispatch) — with no
+// Hijack. closeConn still owns the conn when
 // it wakes, so it must close it exactly once AND still deliver OnDisconnect.
 // It passes before and after the fix, showing the harness does not by itself
 // produce a double count, and that the ownership re-check suppresses neither
@@ -468,6 +519,7 @@ func TestCloseConnAfterHijackIsNoOpWithoutTheRace(t *testing.T) {
 func TestCloseConnClosesOnceWhenHandlerDoesNotHijack(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs, local := rig.l, rig.cs, rig.local
+	parkDispatch(cs)
 
 	cs.detachMu.Lock()
 	done := hijackRaceSweep(l)
@@ -528,7 +580,7 @@ func TestHijackReleaseUnlinksTheConnFromTheDirtyList(t *testing.T) {
 			t.Fatalf("hijackConn: %v", err)
 		}
 		t.Cleanup(func() { _ = nc.Close() })
-		if !cs.hijacked {
+		if !cs.hijacked.Load() {
 			t.Fatalf("setup: async hijack did not defer the release")
 		}
 
@@ -566,7 +618,7 @@ func TestHijackReleaseUnlinksTheConnFromTheDirtyList(t *testing.T) {
 			t.Fatalf("hijackConn: %v", err)
 		}
 		t.Cleanup(func() { _ = nc.Close() })
-		if cs.hijacked {
+		if cs.hijacked.Load() {
 			t.Fatalf("setup: sync hijack deferred the release instead of doing it inline")
 		}
 
@@ -574,4 +626,71 @@ func TestHijackReleaseUnlinksTheConnFromTheDirtyList(t *testing.T) {
 			t.Errorf("dirtyHead = %p after the inline release, want nil", l.dirtyHead)
 		}
 	})
+}
+
+// TestCloseLeftToAHandlerThatHijacksIsNotRedone is the shape the celeris#654
+// race takes since celeris#669. The timeout reap finds the handler running and
+// leaves the close to its dispatch goroutine instead of waiting; the handler
+// then hijacks. The goroutine's exit (runAsyncHandler's ErrHijacked path)
+// hands the conn back, and drainDetachQueue must take the hijack's branch —
+// pool release, live set, connCount — and not run the owed close: no second
+// close count, no OnDisconnect, and the reissued descriptor survives.
+func TestCloseLeftToAHandlerThatHijacksIsNotRedone(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	release := holdAsHandler(t, cs, true)
+
+	if !returnsWhileHeld(t, release, l.checkTimeouts) {
+		t.Fatal("the reap waited on a running handler (celeris#669)")
+	}
+	cs.asyncInMu.Lock()
+	owed := cs.closeOwed
+	cs.asyncInMu.Unlock()
+	if !owed {
+		t.Fatal("setup: the reap did not leave the close to the dispatch goroutine")
+	}
+
+	nc, err := l.hijackConn(local)
+	if err != nil {
+		t.Fatalf("hijackConn: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+	pipeWrite := hijackRaceRecycle(t, local)
+	release()
+
+	// runAsyncHandler's ErrHijacked exit: asyncClosed, the goroutine gone,
+	// cs enqueued — the enqueue is the hand-back.
+	cs.asyncClosed.Store(true)
+	cs.asyncInMu.Lock()
+	cs.endDispatch()
+	cs.asyncInMu.Unlock()
+	l.enqueueDetach(cs)
+	l.drainDetachQueue()
+
+	if got := l.closeCount.Load(); got != 1 {
+		t.Errorf("closeCount = %d, want 1 (the hijack only)", got)
+	}
+	if got := l.activeConns.Load(); got != 0 {
+		t.Errorf("activeConns = %d, want 0", got)
+	}
+	if got := l.connCount; got != 0 {
+		t.Errorf("connCount = %d, want 0", got)
+	}
+	if got := rig.disconnects.Load(); got != 0 {
+		t.Errorf("OnDisconnect fired %d times for a hijacked conn, want 0", got)
+	}
+	if len(l.liveConns) != 0 {
+		t.Errorf("len(liveConns) = %d after the hand-back, want 0", len(l.liveConns))
+	}
+	if cs.fd != 0 {
+		t.Errorf("cs.fd = %d after the hand-back, want 0 (connState not released)", cs.fd)
+	}
+	if !fdOpen(local) {
+		t.Fatalf("fd %d, reissued after the hijack, was closed by the owed close", local)
+	}
+	if _, err := unix.Write(pipeWrite, []byte("w")); err != nil {
+		t.Errorf("write to the recycled pipe: %v", err)
+	} else {
+		hijackRaceExpectRead(t, local, "w", "the reissued descriptor survives")
+	}
 }

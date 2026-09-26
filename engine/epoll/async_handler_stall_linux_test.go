@@ -238,6 +238,46 @@ func TestEPOLLOUTResumeDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	}
 }
 
+// TestDeferredPeerCloseSurvivesARunningHandler guards the one exception to
+// the two passes above. A conn whose peer half-closed while its response was
+// still queued (peerClosed) is closed by whichever pass sees the flush
+// complete; a holder whose own flush completes hands nothing back. So while a
+// handler runs, the dirty pass keeps such a conn and the EPOLLOUT resume keeps
+// its interest — and once the handler returns, the next pass closes it.
+func TestDeferredPeerCloseSurvivesARunningHandler(t *testing.T) {
+	for _, site := range []string{"dirty", "epollout"} {
+		t.Run(site, func(t *testing.T) {
+			rig := hijackRaceConn(t)
+			l, cs, local := rig.l, rig.cs, rig.local
+			cs.writeBuf = append(cs.writeBuf[:0], "pending"...)
+			cs.pendingBytes = len(cs.writeBuf)
+			cs.peerClosed = true
+			pass := l.flushDirty
+			if site == "dirty" {
+				l.markDirty(cs)
+			} else {
+				l.armEpollOut(cs)
+				pass = func() { l.handleWritable(cs) }
+			}
+			release := holdAsHandler(t, cs, true)
+			if !returnsWhileHeld(t, release, pass) {
+				t.Fatalf("the %s pass waited on a running handler (celeris#669)", site)
+			}
+			if !cs.dirty && !cs.epollOut {
+				t.Fatalf("the %s pass dropped a conn with a deferred peer close: nothing would close it "+
+					"once the handler's own flush completes", site)
+			}
+			release()
+			pass()
+			if l.conns[local] != nil || rig.disconnects.Load() != 1 {
+				t.Errorf("the %s pass did not close the conn once flushed: slot=%p hooks=%d",
+					site, l.conns[local], rig.disconnects.Load())
+			}
+			hijackRaceExpectRead(t, rig.peer, "pending", "the queued response reached the peer before the close")
+		})
+	}
+}
+
 // TestCloseStillWaitsForABoundedHolder is the negative control for the unit
 // arms. The dispatch goroutine is PARKED, so whoever holds detachMu is a
 // guarded writeFn in the middle of one write — a hold bounded by a syscall,

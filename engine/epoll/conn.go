@@ -195,8 +195,9 @@ type connState struct {
 	asyncDetachPending bool
 
 	// liveIdx is this conn's index into l.liveConns (the dense slice of
-	// active FDs iterated by checkTimeouts/shutdown). -1 when not present.
-	// Maintained by addLiveConn/removeLiveConn for O(1) removal. (#318)
+	// live connStates iterated by checkTimeouts, the sweep and shutdown).
+	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
+	// removal (#318). Loop-thread-only, like liveConns itself (celeris#668).
 	liveIdx int
 
 	// hijacked is set by hijackConn (Context.Hijack) once the fd has been
@@ -207,7 +208,32 @@ type connState struct {
 	// The release is deferred to the worker via the asyncClosed +
 	// detachQueue → drainDetachQueue handoff, which sees this flag and runs
 	// releaseConnState only after the goroutine has exited. (#3.1)
-	hijacked bool
+	//
+	// That hand-off also takes the conn out of l.liveConns and l.connCount,
+	// which are the loop's and which the dispatch goroutine must not touch
+	// (celeris#668). Until it runs, the conn's entry stays in the live set
+	// with its descriptor already closed, so the live-set walkers skip an
+	// entry with this flag set. They read it without any lock the
+	// goroutine holds, hence atomic; hijackConn stores it before it
+	// releases the descriptor number.
+	hijacked atomic.Bool
+
+	// closeOwed (guarded by asyncInMu) is set by closeConn when it finds
+	// detachMu held by this conn's RUNNING dispatch goroutine — i.e. held
+	// across a user handler — and leaves the close to that goroutine
+	// instead of parking the loop on the lock for the rest of the handler
+	// (celeris#669). asyncClosed is already set, so the goroutine exits at
+	// its next check; the exit path that finds closeOwed hands cs back
+	// through the detach queue, whose asyncClosed branch runs closeConn
+	// again, on the loop thread, with the lock free.
+	closeOwed bool
+
+	// closeErr (loop-thread-only) is the I/O error a drainRead branch met
+	// while a running handler held detachMu. That branch used to flush and
+	// deliver it to OnError under the lock before closing; it now leaves
+	// both to closeConn, which does them under the lock when the close
+	// actually runs (celeris#669).
+	closeErr error
 }
 
 var connStatePool = sync.Pool{
@@ -278,7 +304,9 @@ func releaseConnState(cs *connState) {
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
 	cs.liveIdx = -1
-	cs.hijacked = false
+	cs.hijacked.Store(false)
+	cs.closeOwed = false
+	cs.closeErr = nil
 	cs.fd = 0
 	connStatePool.Put(cs)
 }

@@ -161,7 +161,14 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	if fd >= len(l.conns) {
 		l.growConns(fd)
 	}
-	if l.conns[fd] != nil {
+	// The slot is read and, below, filled under driverMu: an async Hijack on
+	// this loop clears a slot from its dispatch goroutine under this lock and
+	// then closes the descriptor, whose number the kernel may reissue to the
+	// connection being adopted here (celeris#668).
+	l.driverMu.Lock()
+	occupied := l.conns[fd] != nil
+	l.driverMu.Unlock()
+	if occupied {
 		// Slot occupied — the source detached fd before handing it off, so this
 		// should not happen; refuse rather than clobber a live conn. Do not close
 		// (the slot holder may close the same descriptor later). The connection
@@ -186,7 +193,9 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 
 	cs := acquireConnState(ctxkit.WithWorkerID(ctx, l.id), fd, l.resolved.BufferSize, l.async)
 	cs.remoteAddr = carry.RemoteAddr
+	l.driverMu.Lock()
 	l.conns[fd] = cs
+	l.driverMu.Unlock()
 	l.addLiveConn(cs)
 	l.connCount++
 	if fd > l.maxFD {

@@ -149,7 +149,7 @@ func TestDetachedResumeRecvAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing
 		timerFD:      -1,
 		wakeFD:       wakefd.New(efd),
 		conns:        make([]*connState, connTableSize),
-		liveConns:    make([]int, 0, 4),
+		liveConns:    make([]*connState, 0, 4),
 		activeConns:  &atomic.Int64{},
 		closeCount:   &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},
