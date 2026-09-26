@@ -76,7 +76,7 @@ type connState struct {
 	protocol engine.Protocol // 1 byte
 	detected bool            // 1 byte
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
-	epollOut bool            // 1 byte: true while level-triggered EPOLLOUT is armed (write backpressure)
+	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	_        [4]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
@@ -158,8 +158,14 @@ type connState struct {
 	xferAsked atomic.Bool
 	// transplantPending (#383, loop-thread-only) marks a conn detached for
 	// transplant whose dispatch goroutine must drain+exit first; drainDetachQueue
-	// completes the handoff once it sees the enqueued cs with this set.
+	// completes the handoff at the first entry it drains after that exit.
 	transplantPending bool
+	// transplanted (loop-thread-only) is set by finishTransplantHandoff once
+	// the fd is handed over. Such a connState is never returned to the pool —
+	// the goroutine's exit entry may still be queued behind the entry the
+	// hand-off finished on — so every later entry finds this set and does
+	// nothing (celeris#669).
+	transplanted bool
 	// asyncPromoted: once an async-marked route is observed on this conn
 	// while it ran inline on the event loop (per-handler async, celeris
 	// #300), the conn is promoted (sticky) — every subsequent recv goes
@@ -230,8 +236,11 @@ type connState struct {
 	// hands cs back through the detach queue at its next park, and
 	// drainDetachQueue puts it on the dirty list again. relinkPending
 	// (loop-thread-only) is the loop's side of the same debt: while it is
-	// set the conn is not offered to a transplant, which would return cs to
-	// the pool under the queue entry the hand-back makes.
+	// set the conn is not offered to a transplant, because the loop has not
+	// yet seen it as the handler left it. Any entry that puts cs back on the
+	// dirty list clears it, the goroutine's own partial-flush entry included.
+	// A deferred hand-off does not rely on it for memory safety: that
+	// finishes only after the goroutine's exit and never pools cs.
 	relinkOwed    bool
 	relinkPending bool
 
@@ -317,6 +326,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncQuiesce.Store(false)
 	cs.xferAsked.Store(false)
 	cs.transplantPending = false
+	cs.transplanted = false
 	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false

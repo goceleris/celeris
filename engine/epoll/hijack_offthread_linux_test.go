@@ -171,8 +171,10 @@ func TestOffThreadHijackLeavesTheLiveSetToTheLoopDuringASweep(t *testing.T) {
 
 // checkOffThreadHandBack asserts the ownership rule on both sides of the
 // hand-back: the loop's live set and connCount still count the hijacked conn
-// until its dispatch goroutine has exited, and drop it exactly once after.
-// The public gauges move at the hijack itself.
+// until the loop drains the notice hijackConn enqueued, and drop it exactly
+// once then (the goroutine's exit is not waited for; see
+// TestOffThreadHijackIsSettledBeforeItsGoroutineExits). The public gauges
+// move at the hijack itself.
 func checkOffThreadHandBack(t *testing.T, l *Loop, cs *connState, bs []*connState) {
 	t.Helper()
 	if got := l.activeConns.Load(); got != 0 {
@@ -184,7 +186,7 @@ func checkOffThreadHandBack(t *testing.T, l *Loop, cs *connState, bs []*connStat
 	if cs.liveIdx < 0 || l.connCount != len(bs)+1 {
 		t.Fatalf("celeris#668: hijackConn changed loop-thread-only state from the dispatch goroutine: "+
 			"liveIdx=%d connCount=%d, want the conn still in the live set and connCount %d until the "+
-			"goroutine has exited", cs.liveIdx, l.connCount, len(bs)+1)
+			"loop drains the hijack's notice", cs.liveIdx, l.connCount, len(bs)+1)
 	}
 	handBack(l, cs)
 	if l.connCount != len(bs) {

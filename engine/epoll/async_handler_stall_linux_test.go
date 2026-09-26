@@ -221,10 +221,11 @@ func TestDirtyPassDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 }
 
 // TestEPOLLOUTResumeDoesNotWaitForARunningAsyncHandler: a conn that hit write
-// backpressure is on level-triggered EPOLLOUT; a pipelined request can start a
-// handler before the socket drains. The resume must not park, and must drop
-// the level-triggered interest, which would otherwise fire on every
-// epoll_wait until the handler returns.
+// backpressure is on EPOLLOUT; a pipelined request can start a handler before
+// the socket drains. The resume must not park, and must drop the interest:
+// EPOLLOUT is edge-triggered, this event spent its edge, and if the handler's
+// own flush drains the socket no other comes. The goroutine's hand-back
+// brings the conn back instead (TestAConnGivenUpMidHandlerIsHandedBack).
 func TestEPOLLOUTResumeDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	rig := hijackRaceConn(t)
 	l, cs := rig.l, rig.cs
@@ -241,7 +242,8 @@ func TestEPOLLOUTResumeDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 			stallWait)
 	}
 	if cs.epollOut {
-		t.Errorf("EPOLLOUT still armed: level-triggered, it fires on every epoll_wait until the handler returns")
+		t.Errorf("EPOLLOUT still armed after the resume gave the conn up: its edge is spent, and the " +
+			"goroutine's hand-back, not another edge, is what brings the conn back")
 	}
 }
 

@@ -594,8 +594,9 @@ func (l *Loop) run(ctx context.Context) {
 			// EPOLLOUT: the socket became writable again for a conn that hit
 			// write backpressure (armEpollOut). Flush the pending bytes and
 			// disarm once drained. drainRead above may have closed the conn,
-			// so re-validate the slot. Level-triggered EPOLLOUT keeps firing
-			// while writable, so a partial flush simply resumes next edge.
+			// so re-validate the slot. EPOLLOUT is edge-triggered here (EPOLLET
+			// covers the whole mask), and a partial flush stops at EAGAIN, so
+			// the send buffer gaining room is the next edge that resumes it.
 			if ev.Events&unix.EPOLLOUT != 0 {
 				if fd >= 0 && fd < len(l.conns) {
 					if cs := l.conns[fd]; cs != nil && cs.epollOut {
@@ -754,10 +755,12 @@ func (l *Loop) run(ctx context.Context) {
 		// forever, if none came (celeris#658). The flags are therefore
 		// re-checked under wakeMu below, and AdoptConn kicks a parked loop
 		// through wakeIfSuspended; see there for why the pair cannot lose a
-		// wakeup. (Every detach-queue enqueue still happens with the conn in
-		// the table, under transplantInFlight, or for a conn that is already
-		// closed, so the detach flag needs no kick — the re-check is for
-		// symmetry.)
+		// wakeup. (Every detach-queue enqueue that carries work happens with
+		// the conn still counted in connCount — an off-thread hijack's notice
+		// included — or under transplantInFlight. The rest name a conn the
+		// loop has already let go of: closed, hijack-settled or handed over,
+		// whose entry does nothing. So the detach flag needs no kick; the
+		// re-check is for symmetry.)
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
 			l.transplantInFlight == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
@@ -1453,8 +1456,8 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.disarmEpollOut(cs)
 			} else {
 				// Partial write — the kernel send buffer is full (write
-				// backpressure). Sync pendingBytes and arm level-triggered
-				// EPOLLOUT instead of busy-retrying via the dirty list, which
+				// backpressure). Sync pendingBytes and arm EPOLLOUT
+				// instead of busy-retrying via the dirty list, which
 				// would spin epoll_wait(0)→write(EAGAIN) at 100% CPU. Truly-
 				// detached WS/SSE conns keep the goroutine-driven dirty/
 				// detachQueue path (their writes flow through guarded writeFn
@@ -1658,7 +1661,10 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 	// response) may still name it. Recycling cs would hand pooled-and-reissued
 	// memory to all of them, so it is left to the garbage collector, as
 	// closeConn leaves every conn a goroutine may still reference
-	// (celeris#668). The enqueue below is the loop's notice.
+	// (celeris#668). The enqueue below is the loop's notice. Not pooling
+	// leaves no sendfile dup open: only an async conn is hijacked off-thread,
+	// and initProtocol installs the sendfile hook in sync mode only, so
+	// cs.sendfile is always nil here.
 	//
 	// Inline, drainRead returns immediately on ErrHijacked without touching
 	// cs again and nothing will enqueue cs, so release synchronously here —
@@ -2430,18 +2436,38 @@ func (l *Loop) drainDetachQueue() {
 	l.detachQPending.Store(0)
 	l.detachQMu.Unlock()
 	for _, cs := range l.detachQSpare {
-		// #383 transplant: the dispatch goroutine quiesced and exited; the fd was
-		// already removed from epoll by tryTransplant (at a flushed, clean
-		// boundary). Finish the hand-off to io_uring. Checked before EVERY
-		// other branch — including the already-closed guard below — so a
-		// quiescing conn is migrated, not dropped. The old ordering put
-		// detachClosed first, which would strand such a conn: no hand-off,
-		// no close, no hook, no counter, and the live gauge already
+		// #383 transplant: tryTransplant detached the fd from epoll (at a
+		// flushed, clean boundary) and asked the dispatch goroutine to
+		// quiesce. Finish the hand-off to io_uring once it has exited.
+		// Checked before EVERY other branch — including the already-closed
+		// guard below — so a quiescing conn is migrated, not dropped. The old
+		// ordering put detachClosed first, which would strand such a conn: no
+		// hand-off, no close, no hook, no counter, and the live gauge already
 		// decremented (celeris#624). finishTransplantHandoff re-checks
 		// detachClosed and counts the coincidence.
+		//
+		// Every entry naming cs reaches this branch, not only the
+		// goroutine's exit: one it made before it parked — the remainder of
+		// its own partial flush, or a relink hand-back (celeris#669) — may be
+		// drained after the quiesce was asked. Finishing on such an entry
+		// released cs while the goroutine was still waking to exit. So an
+		// entry drained while the goroutine lives does nothing (its exit,
+		// which always enqueues, finishes the hand-off), and the finish
+		// never pools cs (see finishTransplantHandoff): the loop cannot tell
+		// whether a later entry still names it. asyncRun is read under
+		// asyncInMu, which the exit clears it under.
 		if cs.transplantPending {
+			cs.asyncInMu.Lock()
+			alive := cs.asyncRun
+			cs.asyncInMu.Unlock()
+			if alive {
+				continue
+			}
 			l.finishTransplantHandoff(cs)
 			continue
+		}
+		if cs.transplanted {
+			continue // handed over already; this entry came after the finish
 		}
 		if cs.detachClosed {
 			continue
@@ -2556,9 +2582,10 @@ func (l *Loop) drainDetachQueue() {
 // actions tied to a completed flush — a deferred peer close (peerClosed), the
 // EPOLLOUT disarm — from being lost: a holder whose own flush completes has no
 // remainder to hand back, and peerClosed may be set after this call.
-// relinkPending keeps tryTransplant off the conn meanwhile: the hand-back is
-// a queue entry naming cs, and a transplant returns cs to the pool. Loop
-// thread.
+// relinkPending keeps tryTransplant off the conn until an entry has put it
+// back on the dirty list, i.e. until the loop has seen it as the handler left
+// it. (A queue entry naming a moved conn is drainDetachQueue's to make
+// harmless, whichever entry clears relinkPending.) Loop thread.
 func (l *Loop) relink(cs *connState) {
 	l.removeDirty(cs)
 	if cs.epollOut {
@@ -2570,7 +2597,7 @@ func (l *Loop) relink(cs *connState) {
 // flushDirty is the event loop's dirty-list pass, run once per iteration
 // after drainDetachQueue: flush every connection with bytes still queued,
 // close the ones whose flush failed, and hand a still-partial non-detached
-// conn to level-triggered EPOLLOUT. Loop thread only.
+// conn to EPOLLOUT. Loop thread only.
 func (l *Loop) flushDirty() {
 	for cs := l.dirtyHead; cs != nil; {
 		next := cs.dirtyNext
@@ -2625,9 +2652,9 @@ func (l *Loop) flushDirty() {
 			}
 		} else {
 			// Partial write: kernel send buffer full. Sync pendingBytes,
-			// then for a non-detached HTTP/H2 conn hand off to level-
-			// triggered EPOLLOUT (armEpollOut removes it from the dirty
-			// list) so the loop stops busy-retrying it. Truly-detached
+			// then for a non-detached HTTP/H2 conn hand off to EPOLLOUT
+			// (armEpollOut removes it from the dirty list) so the loop
+			// stops busy-retrying it. Truly-detached
 			// WS/SSE conns stay on the dirty list — their writes are
 			// goroutine-driven and re-signalled via the eventfd path.
 			// `next` was captured above, so the removeDirty inside
@@ -2663,13 +2690,15 @@ func (l *Loop) markDirty(cs *connState) {
 // (write(2) returned EAGAIN / a short count). Instead of re-flushing into a
 // guaranteed EAGAIN on every iteration — which made adaptiveTimeoutMs spin
 // at epoll_wait(0) → write(EAGAIN) at 100% CPU under backpressure — we add
-// a level-triggered EPOLLOUT to the conn's interest set and DROP it from the
+// EPOLLOUT to the conn's interest set and DROP it from the
 // dirty list. The worker then blocks in epoll_wait until the socket is
 // writable again, at which point handleWritable flushes and disarms.
 //
-// EPOLLIN stays edge-triggered (EPOLLET applies only to EPOLLIN); EPOLLOUT
-// is level-triggered so it keeps firing while the socket is writable and
-// there is no missed-wakeup risk. Mirrors driver.go's flushDriverSendLocked.
+// EPOLLET covers the whole event mask, so EPOLLOUT is edge-triggered here,
+// like EPOLLIN (driver.go's flushDriverSendLocked registers no EPOLLET, so a
+// driver conn's EPOLLOUT is level-triggered). No wakeup is lost: the MOD
+// reports EPOLLOUT at once if the socket is already writable, and every flush
+// stops at EAGAIN, after which the send buffer gaining room is a new edge.
 func (l *Loop) armEpollOut(cs *connState) {
 	// Backpressure replaces the dirty-list retry; the two must not coexist
 	// or adaptiveTimeoutMs would still return 0 and busy-poll.
@@ -2689,7 +2718,7 @@ func (l *Loop) armEpollOut(cs *connState) {
 	}
 }
 
-// disarmEpollOut removes the level-triggered EPOLLOUT interest once a conn's
+// disarmEpollOut removes the EPOLLOUT interest once a conn's
 // pending writes have fully drained, restoring the read-only edge-triggered
 // interest so an idle fd doesn't wake the loop on every writable signal.
 func (l *Loop) disarmEpollOut(cs *connState) {
@@ -2711,10 +2740,12 @@ func (l *Loop) handleWritable(cs *connState) {
 	if mu := cs.detachMu; mu != nil && !mu.TryLock() {
 		if dispatchBusy(cs, &cs.relinkOwed) {
 			// A pipelined request started a handler before the socket
-			// drained (celeris#669). Do not wait for it, and do not keep
-			// the level-triggered interest either, which would fire on
-			// every epoll_wait until the handler returns: give the conn
-			// up until its goroutine hands it back (see relink).
+			// drained (celeris#669). Do not wait for it, and do not leave
+			// the conn to EPOLLOUT's next edge either: this event spent the
+			// last one, and if the handler's own flush drains the socket no
+			// other may come, stranding the disarm and a deferred peer
+			// close. Give the conn up until its goroutine hands it back
+			// (see relink).
 			l.relink(cs)
 			return
 		}
