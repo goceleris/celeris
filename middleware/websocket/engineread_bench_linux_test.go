@@ -30,8 +30,8 @@ import (
 // differs between them.
 
 // enginePauseStub reproduces exactly what the engines' PauseRecv/ResumeRecv
-// closures do (engine/iouring/worker.go:2200-2231 and
-// engine/epoll/loop.go:1672-1703): an atomic Swap that early-returns on a
+// closures do (installed on detach, in engine/iouring/worker.go and
+// engine/epoll/loop.go): an atomic Swap that early-returns on a
 // no-op, a detach-queue append under detachQMu, and — only on the queue's
 // empty->non-empty edge — a write to a non-blocking eventfd.
 //
@@ -156,8 +156,13 @@ func benchChanReaderContended(b *testing.B, capacity int) {
 		// A paused connection delivers nothing until the engine resumes it.
 		for stub.desired.Load() {
 			stub.drain()
-			// Escape hatch for a PRE-EXISTING chanReader hole that is not
-			// celeris#667 and is present in BOTH arms.
+			// Escape hatch for celeris#672, a chanReader hole that is not
+			// celeris#667 and is present in both of the #667 A/B's arms.
+			// requestPause now lifts a stale pause itself, so on this tree
+			// a pause can no longer be left standing on an empty buffer and
+			// the hatch can fire only in the transient window between the
+			// handler's last dequeue and its resume check. It stays so the
+			// benchmark can still be run against the unfixed variants.
 			//
 			// requestPause decides on a depth snapshot. If the handler drains
 			// the channel to EMPTY before that pause is applied, the reader is

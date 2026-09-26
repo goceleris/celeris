@@ -431,9 +431,10 @@ func readerPaused(r *chanReader) bool {
 // the engine pause/resume callback it is called from was invoked with
 // pausedMu RELEASED — the precondition for celeris#667.
 //
-// chanReader decides to pause/resume under pausedMu and then invokes the
-// engine callback after unlocking (engineread.go:231-232 and 312-313), so
-// on that code this TryLock always succeeds and the two tests below can
+// Before the celeris#667 fix, chanReader decided to pause/resume under
+// pausedMu and then invoked the engine callback after unlocking
+// (engineread.go:231-232 and 312-313 at 6136554), so on that code this
+// TryLock always succeeds and the two tests below can
 // park the callback to force an interleaving. If the callback is ever
 // invoked while the deciding lock is held, TryLock fails, the park is
 // skipped, and the tests fall through to the same convergence assertion —
@@ -454,8 +455,8 @@ func callbackRanOutsideDecidingLock(r *chanReader) bool {
 // TestChanReaderLostResumeConverges is the failing-first oracle for
 // celeris#667, the LOST RESUME direction.
 //
-// chanReader decides to pause under pausedMu but applies the decision to
-// the engine after releasing it:
+// Before the fix, chanReader decided to pause under pausedMu but applied the
+// decision to the engine after releasing it (engineread.go at 6136554):
 //
 //	230		r.pausedState = true
 //	231		r.pausedMu.Unlock()
@@ -467,9 +468,10 @@ func callbackRanOutsideDecidingLock(r *chanReader) bool {
 //	312			r.pausedMu.Unlock()
 //	313			r.resume()
 //
-// The engine's closures are Swap-based and ignore the previous value
-// (engine/iouring/worker.go:2200-2231), so whichever callback reaches the
-// engine LAST wins outright and nothing reconciles. This test forces the
+// The engine's closures are Swap-based and ignore the previous value (the
+// PauseRecv/ResumeRecv closures the engines install on detach, in
+// engine/iouring/worker.go and engine/epoll/loop.go), so whichever callback
+// reaches the engine LAST wins outright and nothing reconciles. This test forces the
 // appending goroutine's pause() to be applied after the draining
 // goroutine's resume(), even though the pause was decided first:
 //
