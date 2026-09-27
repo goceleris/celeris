@@ -2279,9 +2279,20 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// STEAL the first bytes the hijacker tries to read. Cancel it by its
 	// generation-tagged user_data and defer the pool release until the
 	// terminal CQE arrives, exactly like finishClose.
+	//
+	// Then drop cs instead of recycling it (celeris#733): the request's
+	// strings are views of cs.buf (or of cs.detectAccum, when the request
+	// began in an earlier recv), and a hijacking handler typically keeps
+	// the path, params and headers for the goroutine that serves the
+	// connection. Recycled, cs would hand those buffers to the next
+	// connection this worker accepts, which would receive its request into
+	// them. The detached release holds cs until the kernel is done with
+	// cs.buf and then leaves it to the garbage collector, which frees the
+	// buffers once the last view of them is gone. The cost is one connState
+	// allocation per hijack.
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
-	w.queuePendingRelease(cs)
+	w.queuePendingReleaseDetached(cs)
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
