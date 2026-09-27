@@ -67,7 +67,9 @@ type hijackRaceRig struct {
 
 // hijackRaceConn builds an async-mode HTTP1 connection on a socketpair and
 // registers it with l exactly as acceptAll would: armed in epoll, in the conn
-// table, in the live set, counted. h1State is non-nil and never Detached,
+// table, in the live set, counted. It fails, never skips, when the
+// setup does: every test built on it runs in CI without -v, where a skip
+// would pass unseen (review of #698). h1State is non-nil and never Detached,
 // which is what selects closeConn's plainClose branch (SHUT_WR + Close) —
 // the path that closes the descriptor a second time.
 //
@@ -87,27 +89,27 @@ func hijackRaceConn(t *testing.T) *hijackRaceRig {
 
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
+		t.Fatalf("socketpair unavailable: %v", err)
 	}
 	local, peer := pair[0], pair[1]
 	t.Cleanup(func() { _ = unix.Close(peer) })
 	if local >= connTableSize {
 		_ = unix.Close(local)
-		t.Skipf("socketpair fd %d exceeds connTableSize %d", local, connTableSize)
+		t.Fatalf("socketpair fd %d exceeds connTableSize %d", local, connTableSize)
 	}
 	// Reads on peer are only ever done after a completed write on the other
 	// end, so non-blocking cannot lose data — it only keeps a broken
 	// expectation from hanging the test instead of failing it.
 	if err := unix.SetNonblock(peer, true); err != nil {
 		_ = unix.Close(local)
-		t.Skipf("set peer non-blocking: %v", err)
+		t.Fatalf("set peer non-blocking: %v", err)
 	}
 	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, local, &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 		Fd:     int32(local),
 	}); err != nil {
 		_ = unix.Close(local)
-		t.Skipf("epoll_ctl ADD fd %d: %v", local, err)
+		t.Fatalf("epoll_ctl ADD fd %d: %v", local, err)
 	}
 
 	cs := &connState{fd: local, liveIdx: -1}
