@@ -45,7 +45,7 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 	// A start that fails only on ring ENOMEM is retried: at a low
 	// RLIMIT_MEMLOCK the kernel may not have uncharged the rings of the
 	// engines the tests before this one stopped (ring_budget_linux_test.go).
-	_, _, err := retryRingENOMEM(func() error {
+	waited, tries, err := retryRingENOMEM(func() error {
 		// Use a TCP listener to capture a free port, then hand the address
 		// to the engine. Engine rebinds via SO_REUSEPORT.
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -112,6 +112,9 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+	if tries > 1 {
+		t.Logf("engine start retried on ring ENOMEM: %d tries over %v", tries, waited.Round(time.Millisecond))
+	}
 	if err != nil {
 		if ioUringUnavailable639(err) {
 			skipUnlessIOUringUnusable(t, err)
