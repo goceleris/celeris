@@ -84,20 +84,20 @@ type driverConn struct {
 	// RegisterConn, cleared by retire under mu. A zero opFD is descriptor
 	// 0, so a driverConn built any other way (a test's) closes nothing.
 	opFDOpen bool
-	// retired: dc has left the worker (finalized, refused by armDriverRecv,
-	// or dropped by shutdownDrivers) and opFD is closed. Set with closing,
-	// under mu. No SQE is prepared by opFD after it.
+	// retired: dc has left the worker (finalized, as armDriverRecv's
+	// refusal is too, or dropped by shutdownDrivers) and opFD is closed.
+	// Set with closing, under mu. No SQE is prepared by opFD after it.
 	retired bool
 }
 
 // retire marks dc as gone from the worker and closes its descriptor, once.
 // Every path that removes dc from driverConns calls it, on the worker
-// goroutine: finalizeDriver (no SQE in flight, cancels included),
-// armDriverRecv's refusal (within the contract only at the register, before
-// anything is issued) and shutdownDrivers (after which nothing is submitted;
-// closing the ring cancels what is armed). Setting closing too makes a later
-// UnregisterConn or Write a no-op, so neither queues work for a conn that is
-// gone, and every path that prepares an SQE checks closing first.
+// goroutine: finalizeDriver (no SQE in flight, cancels included; it also
+// ends armDriverRecv's refusal, which goes through failDriverConn) and
+// shutdownDrivers (after which nothing is submitted; closing the ring
+// cancels what is armed). Setting closing too makes a later UnregisterConn
+// or Write a no-op, so neither queues work for a conn that is gone, and
+// every path that prepares an SQE checks closing first.
 func (dc *driverConn) retire() {
 	dc.mu.Lock()
 	dc.closing = true
@@ -253,7 +253,10 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 // underlying fd, and may close it as soon as UnregisterConn returns, without
 // waiting for onClose: the worker cancels, later, through the engine's own
 // duplicate of fd, and closes that duplicate when it finalizes the conn,
-// which is when the socket closes (celeris#691). See [engine.WorkerLoop].
+// which is when the socket closes (celeris#691). Until then the number stays
+// a key of this worker's driver map, so a RegisterConn here of the next
+// socket to get it, as the lowest free number usually is, fails with "fd
+// already registered" until onClose has fired. See [engine.WorkerLoop].
 func (w *Worker) UnregisterConn(fd int) error {
 	w.driverMu.RLock()
 	dc, ok := w.driverConns[fd]
@@ -351,33 +354,31 @@ func (w *Worker) drainDriverActions() {
 }
 
 // armDriverRecv submits a single-shot RECV SQE for dc. If the SQ ring is
-// full, the action is re-queued so the next loop iteration retries.
+// full, the action is re-queued so the next loop iteration retries. It
+// runs for the register and for every re-arm: handleDriverRecv calls it,
+// and a retry comes back as a register.
 func (w *Worker) armDriverRecv(dc *driverConn) {
-	// Worker-side TOCTOU close: if an HTTP accept landed on this fd after
-	// RegisterConn's checks, abort before arming RECV so CQEs don't cross
-	// channels.
-	w.driverMu.Lock()
-	if dc.fd < len(w.conns) && w.conns[dc.fd] != nil {
-		delete(w.driverConns, dc.fd)
-		if len(w.driverConns) == 0 {
-			w.hasDriverConns.Store(false)
-		}
-		w.driverMu.Unlock()
-		// Closes the engine's descriptor, which nothing else would, and
-		// makes an UnregisterConn queued behind this register issue nothing.
-		dc.retire()
-		cb := dc.onClose
-		dc.onClose = nil
-		if cb != nil {
-			cb(fmt.Errorf("celeris/iouring: fd %d is already an HTTP connection", dc.fd))
-		}
-		return
-	}
-	w.driverMu.Unlock()
-
 	dc.mu.Lock()
+	// closing before the number. A conn that is unregistered, failing or
+	// gone is not armed and not refused: its cancel, queued or counted,
+	// finalizes it after every op it has in flight, with onClose(nil)
+	// after UnregisterConn. Its caller may have closed fd, and an accept
+	// on this worker taken the number since; refusing then removed the
+	// conn with its SEND still in the kernel, or closed opFD under its
+	// counted cancel (celeris#691).
 	if dc.closing || dc.recvArmed {
 		dc.mu.Unlock()
+		return
+	}
+	// Worker-side TOCTOU: an HTTP accept took the number after
+	// RegisterConn's checks, so the caller closed fd without unregistering
+	// (outside the contract). Refuse through failDriverConn, which waits
+	// for any op in flight (a re-arm can have a SEND in the kernel) and
+	// then finalizes: onClose gets the error, and retire closes opFD.
+	// w.conns belongs to the worker goroutine, which this is.
+	if dc.fd < len(w.conns) && w.conns[dc.fd] != nil {
+		dc.mu.Unlock()
+		w.failDriverConn(dc, fmt.Errorf("celeris/iouring: fd %d is already an HTTP connection", dc.fd))
 		return
 	}
 	sqe := w.ring.GetSQE()
@@ -572,10 +573,11 @@ func (w *Worker) handleDriverClose(fd int) {
 	dc.mu.Lock()
 	if dc.cancels == 0 {
 		// Not a cancel of dc's. Every cancel is counted when it is
-		// prepared, and a conn is finalized only after all of its CQEs, so
-		// this one belongs to a conn that left the map without waiting for
-		// it, and dc holds its number now. Acting on it would close dc
-		// (celeris#707).
+		// prepared, and a conn leaves the map only after all of its CQEs
+		// (shutdownDrivers aside: no CQE is processed after it), so no path
+		// here produces one. One that arrived anyway would belong to a conn
+		// that left without waiting for it, and whose number dc holds now:
+		// acting on it would close dc (celeris#707).
 		dc.mu.Unlock()
 		return
 	}
