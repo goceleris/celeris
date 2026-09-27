@@ -97,8 +97,12 @@ func TestFSCacheKeyIsNotAliasedToRequestBuffer(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
+			// Deferred before waitForReady, so a failed wait stops the
+			// server too (waitForReady leaves Start's error in done). The
+			// listener is closed once Start has returned: a Start that
+			// failed leaves it open.
+			defer func() { cancel(); <-done; _ = ln.Close() }()
 			addr := waitForReady(t, s, done, 30*time.Second)
-			defer func() { cancel(); <-done }()
 
 			// Alternate paths on each keep-alive connection so the read
 			// buffer that backed a cached key is overwritten by a different

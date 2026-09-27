@@ -73,9 +73,30 @@ func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Con
 	done := make(chan error, 1)
 	go func() { done <- s.StartWithListenerAndContext(serverCtx, ln) }()
 
+	// When waitForReady fails, tb.Fatal ends this goroutine and the shutdown
+	// closure below is never handed out, so stop the server here: cancel a
+	// Start that is still running, wait for it (waitForReady leaves Start's
+	// error in done), and close the listener, which a Start that failed
+	// leaves open. Without this, every failed start leaked a listening socket
+	// for the life of the test binary.
+	ready := false
+	defer func() {
+		if ready {
+			return
+		}
+		serverCancel()
+		select {
+		case <-done:
+			_ = ln.Close()
+		case <-time.After(10 * time.Second):
+			tb.Log("the server's Start did not return within 10 s of the cancel")
+		}
+	}()
+
 	// 30s deadline (5s tripped on slow GitHub Actions Azure runners with
 	// kernel 6.17 io_uring; same pattern as the adaptive H2 dial test).
 	addr := waitForReady(tb, s, done, 30*time.Second)
+	ready = true
 	return addr, func() {
 		serverCancel()
 		<-done
