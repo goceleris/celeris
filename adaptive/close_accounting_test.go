@@ -189,6 +189,11 @@ func TestMetricsCarriesEveryFieldReflectively(t *testing.T) {
 	typ := got.Type()
 	var dropped []string
 	for i := range got.NumField() {
+		// The one exemption: Throughput is deprecated as always 0 and nothing
+		// sets or forwards it (celeris#653, engine.TestNothingSetsThroughput).
+		if typ.Field(i).Name == "Throughput" {
+			continue
+		}
 		if got.Field(i).IsZero() {
 			dropped = append(dropped, typ.Field(i).Name)
 		}
