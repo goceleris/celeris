@@ -8,9 +8,10 @@ import (
 )
 
 // Probe detects system capabilities using the platform-default syscall prober.
-// If CELERIS_MAX_IOURING_TIER is set (none/base/high/optional), the detected
-// io_uring tier and associated features are capped at that level. This allows
-// CI to exercise every tier's code path on modern kernels.
+// If CELERIS_MAX_IOURING_TIER is set (none/base/high/optional; any other
+// non-empty value counts as none), the detected io_uring tier and associated
+// features are capped at that level, so a lower tier's code paths can be
+// exercised on a modern kernel. The kernel version is left as detected.
 func Probe() engine.CapabilityProfile {
 	profile := ProbeWith(defaultProber())
 	if maxTier := os.Getenv("CELERIS_MAX_IOURING_TIER"); maxTier != "" {

@@ -291,9 +291,13 @@ func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool,
 // Values:
 //   - "on", "1", "true": force enabled if functional probe passed.
 //   - "off", "0", "false": force disabled.
-//   - "auto", "" (default): preserves current default behavior (enabled when functional probe
-//     passed). Final default decision pending cluster A/B fabric benchmark (celeris#465).
-//   - any other value: returns recognized=false and falls back to auto behavior.
+//   - "auto", "" (default): enabled when the functional probe passed. Whether that stays the
+//     default is an open measurement owned by celeris#585 (SEND_ZC on/off A/B on the fabric).
+//   - any other value: falls back to auto behavior, and returns recognized=false.
+//
+// When the functional probe failed, the value is not examined: the result is
+// (false, true) whatever it is, so an unrecognized value is reported only when
+// the probe passed.
 func resolveSendZCPolicy(functional bool, envVal string) (enabled, recognized bool) {
 	if !functional {
 		return false, true

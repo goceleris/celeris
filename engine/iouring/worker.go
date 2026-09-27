@@ -82,7 +82,8 @@ const bufRingCountMin = 1024
 const bufRingCountMax = 1 << 15 // 32768 entries × 8 KiB = 256 MiB worst case (kernel PBUF_RING cap)
 
 // CELERIS_IOURING_PBUF_COUNT overrides the auto-scaled provided-buffer-ring
-// size. Must be a power of 2 and at least bufRingCountMin. Use this when
+// size. A value that is not a power of 2 is rounded up to one, and the result
+// is clamped to [bufRingCountMin, bufRingCountMax]. Use this when
 // the default scaling formula under-provisions your workload — typically
 // the case for very-high-concurrency benchmarks (16k+ connections) where
 // each worker may have more in-flight multishot recvs than the formula
@@ -503,6 +504,11 @@ type Worker struct {
 	// adoptClosed is set under driverActionMu by closeAdoptQueue when the
 	// worker shuts down; AdoptConn refuses from then on (celeris#658).
 	adoptClosed bool
+	// driversClosed is set under driverMu by shutdownDrivers; RegisterConn
+	// refuses from then on (celeris#691). shutdownDrivers runs once, so a
+	// conn registered after it would never be retired, and the duplicate
+	// descriptor RegisterConn takes for it would never be closed.
+	driversClosed bool
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring
