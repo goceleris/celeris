@@ -41,7 +41,7 @@ import (
 // baked into this package's non-test sources. C2: C1 + c633InjectProgress. C3: C0 +
 // c633InjectAbort. C5: C0 + c633InjectReadWhileWaiting.
 const (
-	c633Variant = "C2b"
+	c633Variant = "C6"
 	// H1 kill arm: the frame-completion write and the Close write give up only after
 	// c633ProgWriteIdle with no shrink of the client's send queue (SIOCOUTQ: bytes the server's
 	// kernel has not ACKed), and the close wait only after c633ProgCloseIdle with no byte
@@ -53,7 +53,7 @@ const (
 	// H3 injection: the frame-completion write and the Close write keep the original 15 s / 10 s
 	// budgets but are issued in 1 s slices, and after each slice that times out the client
 	// empties its receive queue (non-blocking) before retrying.
-	c633InjectReadWhileWaiting = false
+	c633InjectReadWhileWaiting = true
 )
 
 const (
