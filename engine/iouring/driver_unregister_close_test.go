@@ -17,7 +17,6 @@ package iouring
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"runtime"
@@ -1596,58 +1595,6 @@ func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T
 	p.d.unregisterAndWait(t, wl)
 }
 
-// lingeringTCPSocket returns a connected TCP socket whose close(2) blocks: its
-// peer's receive window is full and never read, so the FIN it would send
-// waits behind unsent data, and SO_LINGER makes close wait for that FIN's ACK
-// for up to linger. Draining the peer (drain) lets the close finish.
-func lingeringTCPSocket(t *testing.T, linger int) (fd int, drain func()) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer func() { _ = ln.Close() }()
-	c, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	peer, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	t.Cleanup(func() { _ = peer.Close() })
-	_ = peer.(*net.TCPConn).SetReadBuffer(4096)
-	f, err := c.(*net.TCPConn).File() // a blocking duplicate; the net.Conn is done with
-	_ = c.Close()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	fd, err = unix.Dup(int(f.Fd()))
-	_ = f.Close()
-	if err != nil {
-		t.Fatalf("dup: %v", err)
-	}
-	if err := unix.SetNonblock(fd, true); err != nil {
-		t.Fatalf("set non-blocking: %v", err)
-	}
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
-	chunk := make([]byte, 64<<10)
-	for filled := false; !filled; {
-		if _, err := unix.Write(fd, chunk); errors.Is(err, unix.EAGAIN) {
-			filled = true
-		} else if err != nil {
-			t.Fatalf("fill the send path: %v", err)
-		}
-	}
-	if err := unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: int32(linger)}); err != nil {
-		t.Fatalf("SO_LINGER: %v", err)
-	}
-	drain = func() {
-		go func() { _, _ = io.Copy(io.Discard, peer) }()
-	}
-	return fd, drain
-}
-
 // The engine's descriptor is closed outside dc.mu and off the worker. close(2)
 // can block: with SO_LINGER set, until the peer acknowledges the FIN, for up
 // to the linger time. retire used to close under dc.mu, which UnregisterConn
@@ -1662,9 +1609,15 @@ func lingeringTCPSocket(t *testing.T, linger int) (fd int, drain func()) {
 // lingering close then waits before the syscall returns. So once the number
 // no longer names the socket the close is under way, and dc.mu must be free
 // and onClose not fired yet.
+//
+// Every one of those checks holds trivially for a close that does not linger,
+// so the test first proves it does: the socket is deeplyLingeringTCPSocket's
+// (a backlog the peer cannot absorb), and the close must still be in progress
+// (its goroutine has not queued driverActionClosed) after dc.mu was seen free;
+// otherwise it fails as apparatus.
 func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	const linger = 10 // seconds: the longest a broken close holds the test
-	fd, drain := lingeringTCPSocket(t, linger)
+	fd, drain := deeplyLingeringTCPSocket(t, linger)
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		t.Fatalf("fstat: %v", err)
@@ -1710,6 +1663,9 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 		if err := unix.Fstat(fd, &now); err != nil || now.Ino != st.Ino || now.Dev != st.Dev {
 			break
 		}
+		if w.driverActionPending.Load() != 0 {
+			t.Fatal("apparatus: the close returned before it could be seen in progress: it did not linger")
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("the engine's descriptor was never closed")
 		}
@@ -1725,6 +1681,11 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	}
 	open, retiredFlag := dc.opFDOpen, dc.retired
 	dc.mu.Unlock()
+	// The checks above mean something only while the close lingers: its
+	// goroutine queues driverActionClosed when close(2) returns.
+	if w.driverActionPending.Load() != 0 {
+		t.Fatal("apparatus: the close did not linger: it returned before dc.mu was probed")
+	}
 	if open || !retiredFlag {
 		t.Errorf("under dc.mu during the close: opFDOpen=%v retired=%v, want false and true", open, retiredFlag)
 	}

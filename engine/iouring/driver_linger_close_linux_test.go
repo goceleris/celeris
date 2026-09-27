@@ -57,18 +57,19 @@ func stillNames(fd int, id socketIdentity) bool {
 }
 
 // lingerBacklog is how much the test leaves unsent behind a lingering close.
-// lingeringTCPSocket (celeris#691's rig) shrinks the send buffer to 4 KiB, so
-// only a few KiB wait behind its FIN, and a receiver whose buffer is full can
-// still take them in: it collapses its queue when a zero-window probe comes,
-// opens the window, the FIN is ACKed and the close returns. On a GitHub x86
-// runner that ended one 3 s linger in 1 of 5 runs within 100 ms (PR #744,
-// job 108681501232). A backlog of megabytes behind a 4 KiB receive buffer
-// cannot be absorbed that way, so the close lingers until the peer drains.
-// The send buffer asked for is capped at twice net.core.wmem_max (416 KiB at
-// the default), and the rig refuses a backlog under 128 KiB.
+// celeris#691's rig (lingeringTCPSocket, which this replaces) shrank the send
+// buffer to 4 KiB, so only a few KiB waited behind its FIN, and a receiver
+// whose buffer is full can still take them in: it collapses its queue when a
+// zero-window probe comes, opens the window, the FIN is ACKed and the close
+// returns. On a GitHub x86 runner that ended one 3 s linger in 1 of 5 runs
+// within 100 ms (PR #744, job 108681501232). A backlog of megabytes behind a
+// 4 KiB receive buffer cannot be absorbed that way, so the close lingers
+// until the peer drains. The send buffer asked for is capped at twice
+// net.core.wmem_max (416 KiB at the default), and the rig refuses a backlog
+// under 128 KiB.
 const lingerBacklog = 4 << 20
 
-// deeplyLingeringTCPSocket is lingeringTCPSocket with lingerBacklog left
+// deeplyLingeringTCPSocket is celeris#691's rig with lingerBacklog left
 // unsent: a connected, non-blocking TCP socket whose peer never reads, with
 // SO_LINGER {1, linger}, so its last close waits the whole linger time.
 // drain reads the peer, and the close then returns.
