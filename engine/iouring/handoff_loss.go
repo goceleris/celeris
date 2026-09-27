@@ -2,7 +2,11 @@
 
 package iouring
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/goceleris/celeris/internal/recvtheft"
+)
 
 // handoffLossStats are the celeris#657 witnesses: the request loss a
 // reverse (io_uring→epoll) hand-off can cause, counted where it happens.
@@ -176,6 +180,22 @@ func (w *Worker) noteStaleRecvData(ud uint64) {
 	default:
 		s.staleRecvDataClosed.Add(1)
 	}
+}
+
+// noteStaleRecvExemplar hands an armed recvtheft trial what a stale recv
+// with data read: its identity, its result and the first bytes of the closed
+// conn's cs.buf, where every single-shot recv except the direct-body one
+// lands (celeris#715). Validation builds only (the caller is guarded by
+// recvtheft.Enabled). Must run before noteStaleTerminalOp retires the
+// closedOps entry. Worker thread only.
+func (w *Worker) noteStaleRecvExemplar(c *completionEntry, fd int, ud uint64) {
+	var head []byte
+	if e := w.closedOps[connOpKey(ud)]; e != nil && len(e.conns) > 0 && w.bufRing == nil {
+		buf := e.conns[0].buf
+		n := min(int(c.Res), len(buf), 64)
+		head = buf[:n]
+	}
+	recvtheft.NoteStaleRecvData(w.id, fd, decodeGen(ud), c.Res, head)
 }
 
 // noteHandoffInFlight counts a hand-off that detached cs while the kernel

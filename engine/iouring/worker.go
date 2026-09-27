@@ -26,6 +26,7 @@ import (
 	"github.com/goceleris/celeris/internal/ctxkit"
 	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/internal/platform"
+	"github.com/goceleris/celeris/internal/recvtheft"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/internal/zcwindow"
@@ -801,6 +802,40 @@ func (w *Worker) noteRecvPlaced(cs *connState) {
 	if cs.recvOutstanding >= 2 {
 		w.recvArm.noteDoubleArmed()
 	}
+	// celeris#715, validation builds only (recvtheft.Enabled is a false
+	// constant otherwise): both placement sites call this right after the
+	// recv's GetSQE, so the SQE placed last is the recv.
+	if recvtheft.Enabled {
+		cs.recvArmSeq.Set(w.ring.sqPlaced() - 1)
+	}
+}
+
+// recvUnsubmitted reports whether cs's armed recv SQE is still in the SQ
+// ring, not yet consumed by the kernel: it was placed after this worker's
+// last submit. Validation builds only: recvArmSeq is recorded only there.
+//
+// Why the close paths ask (celeris#715 hypothesis (a), the celeris#685
+// class). Such a recv names the descriptor NUMBER (fixed files are off), and
+// the kernel resolves the number when the next submit issues the recv.
+// finishClose and finishCloseDetached queue the recv's ASYNC_CANCEL behind it
+// and close the descriptor at once. If another thread's accept is given the
+// freed number before this worker's next submit, and its connection's request
+// is already in the socket (TCP_DEFER_ACCEPT hands over only connections that
+// have sent), the recv reads that request and completes under the closed
+// conn's (fd, generation): staleConnCQE drops it as stale_recv_data_closed,
+// and the new connection's own recv then waits on an empty socket. So, under
+// -tags=validation, the close paths
+//   - count the close (recvtheft.CloseWithUnsubmittedRecv, the witness),
+//   - park the worker right after the descriptor is closed when a
+//     recvtheft trial is armed (recvtheft.HoldAfterClose), and
+//   - in the trial's control arm, submit the ring before closing
+//     (recvtheft.SubmitBeforeClose), so the recv is issued while the number
+//     still names this conn's socket.
+//
+// None of it exists in production: recvtheft.Enabled is a false constant
+// there and cs.recvArmSeq is zero-size.
+func (w *Worker) recvUnsubmitted(cs *connState) bool {
+	return cs.recvArmed && w.ring != nil && int32(cs.recvArmSeq.Get()-w.ring.sqConsumed()) >= 0
 }
 
 // retireRecvCancel accounts for one of cs's outstanding backpressure-pause
@@ -1550,6 +1585,11 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 	// identity (celeris#657).
 	if op == udRecv && c.Res > 0 {
 		w.noteStaleRecvData(ud)
+		// celeris#715, validation builds only: record what the stale recv
+		// read, while closedOps still holds its connState.
+		if recvtheft.Enabled {
+			w.noteStaleRecvExemplar(c, fd, ud)
+		}
 	}
 	if terminalOp {
 		w.noteStaleTerminalOp(ud)
@@ -2034,6 +2074,13 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 	if !w.prepareRecv(cs, cs.buf) {
 		cs.needsRecv = true
 		w.markDirty(cs)
+	}
+	// celeris#715, validation builds only: report the accept to an armed
+	// recvtheft trial, which parks this worker here (its recv prepared, not
+	// submitted) when it was given the number another worker's held close
+	// released.
+	if recvtheft.Enabled {
+		recvtheft.AfterAccept(w.id, newFD)
 	}
 }
 
@@ -2919,6 +2966,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		if hasProvidedBuf {
 			w.bufRing.PushBuffer(providedBufID)
 			w.hasBufReturns = true
+		}
+		// celeris#715 hypothesis (c), validation builds only: the same
+		// window as promoteConnToAsync's (recvtheft.SetWakeHold).
+		if recvtheft.Enabled {
+			recvtheft.WakeHold()
 		}
 		if starting {
 			w.asyncWG.Add(1)
@@ -4029,9 +4081,18 @@ func (w *Worker) finishClose(fd int) {
 	// straggler bytes into memory Go has repurposed — the #256 stackalloc
 	// SIGSEGV / Green-Tea-GC span-corruption class.
 	if cs != nil {
+		// celeris#715 witness, hold and control, validation builds only:
+		// see recvUnsubmitted.
+		if recvtheft.Enabled && w.recvUnsubmitted(cs) {
+			recvtheft.NoteCloseWithUnsubmittedRecv()
+			defer recvtheft.HoldAfterClose(w.id, fd)
+		}
 		w.cancelConnOps(fd, cs)
 		w.noteClosedInflight(cs)
 		w.queuePendingRelease(cs)
+		if recvtheft.Enabled && recvtheft.SubmitBeforeClose() {
+			_, _ = w.ring.Submit()
+		}
 	}
 
 	if fixedFile {
@@ -4145,9 +4206,18 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// "s.allocCount != s.nelems" span corruption (v1.4.15/7beebb9: the old 100 ms
 	// wall-clock hold sat below TCP's 200 ms RTO_MIN, so retransmitted
 	// POST segments landed after release).
+	// celeris#715 witness, hold and control, validation builds only: see
+	// recvUnsubmitted.
+	if recvtheft.Enabled && w.recvUnsubmitted(cs) {
+		recvtheft.NoteCloseWithUnsubmittedRecv()
+		defer recvtheft.HoldAfterClose(w.id, fd)
+	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingReleaseDetached(cs)
+	if recvtheft.Enabled && recvtheft.SubmitBeforeClose() {
+		_, _ = w.ring.Submit()
+	}
 
 	if fixedFile {
 		sqe := w.ring.GetSQE()
@@ -4227,6 +4297,11 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 		cs.asyncRun = true
 	}
 	cs.asyncInMu.Unlock()
+	// celeris#715 hypothesis (c), validation builds only: widen the window
+	// between the unlock and the goroutine's wake-up (recvtheft.SetWakeHold).
+	if recvtheft.Enabled {
+		recvtheft.WakeHold()
+	}
 	if starting {
 		w.asyncWG.Add(1)
 		go w.runAsyncHandler(cs)
@@ -4242,6 +4317,13 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 			cs.needsRecv = true
 			w.markDirty(cs)
 		}
+	}
+	// celeris#715 hypothesis (a), validation builds only: with a trial armed,
+	// let the dispatch goroutine queue its close before this iteration
+	// reaches drainDetachQueue, so the recv just re-armed is still
+	// unsubmitted when closeConn runs (recvtheft.Options.PromoteGate).
+	if recvtheft.Enabled {
+		recvtheft.AfterPromoteArm(func() bool { return w.detachQPending.Load() != 0 })
 	}
 }
 
