@@ -4,9 +4,12 @@ package celeris_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,6 +79,31 @@ const (
 	callCap703        = 10 * time.Second
 )
 
+// waitDrainOrderReady polls /ping until the server answers 200, or returns
+// the error its start returned first.
+func waitDrainOrderReady(addr string, startDone <-chan error) error {
+	probe := &http.Client{Timeout: 300 * time.Millisecond}
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+		select {
+		case err := <-startDone:
+			if err == nil {
+				err = errors.New("start returned nil before the server was ready")
+			}
+			return err
+		default:
+		}
+		if resp, err := probe.Get("http://" + addr + "/ping"); err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("no answer on /ping at %s within 15s", addr)
+}
+
 type drainOrderMode int
 
 const (
@@ -104,30 +132,6 @@ func (m drainOrderMode) String() string {
 
 func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mode drainOrderMode, releaseAfter time.Duration) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	// The default worker count: the drain is over only when every worker has
-	// stopped, and the request in flight is on one of them.
-	cfg := celeris.Config{
-		Engine:          engType,
-		AsyncHandlers:   async,
-		ShutdownTimeout: shutdownBudget703,
-	}
-	if mode == drainDirectAfterStartWithListener {
-		// Adaptive with a supplied listener wants Addr to be the listener's
-		// own address (see start_shutdown_return_linux_test.go); for the
-		// others it is the same address, so set it for all.
-		cfg.Addr = addr
-	} else {
-		cfg.Addr = addr
-		if cerr := ln.Close(); cerr != nil {
-			t.Fatalf("close probe listener: %v", cerr)
-		}
-	}
-
 	// One sequence for every event, so the order is read from numbers, not
 	// from clocks. Zero means "has not happened".
 	var seq, handlerDone, hookStart, callReturn atomic.Int64
@@ -145,58 +149,84 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 	release := make(chan struct{})
 	hookStarted := make(chan struct{})
 
-	s := celeris.New(cfg)
-	s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-	s.GET("/slow", func(c *celeris.Context) error {
-		close(handlerEntered)
-		<-release
-		handlerDoneAt.Store(int64(since()))
-		handlerDone.Store(seq.Add(1))
-		return c.String(http.StatusOK, "done")
-	})
-	s.OnShutdown(func(context.Context) {
-		hookSawHandlerDone.Store(handlerDone.Load() != 0)
-		hookStartAt.Store(int64(since()))
-		hookStart.Store(seq.Add(1))
-		close(hookStarted)
-	})
+	// build makes the server for one start attempt. The default worker
+	// count: the drain is over only when every worker has stopped, and the
+	// request in flight is on one of them.
+	build := func(addr string) *celeris.Server {
+		s := celeris.New(celeris.Config{
+			Engine:          engType,
+			AsyncHandlers:   async,
+			ShutdownTimeout: shutdownBudget703,
+			// With a supplied listener, adaptive wants Addr to be the
+			// listener's own address (see start_shutdown_return_linux_test.go);
+			// for the others it is the address to bind.
+			Addr: addr,
+		})
+		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
+		s.GET("/slow", func(c *celeris.Context) error {
+			close(handlerEntered)
+			<-release
+			handlerDoneAt.Store(int64(since()))
+			handlerDone.Store(seq.Add(1))
+			return c.String(http.StatusOK, "done")
+		})
+		s.OnShutdown(func(context.Context) {
+			hookSawHandlerDone.Store(handlerDone.Load() != 0)
+			hookStartAt.Store(int64(since()))
+			hookStart.Store(seq.Add(1))
+			close(hookStarted)
+		})
+		return s
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startDone := make(chan error, 1)
-	go func() {
-		switch mode {
-		case drainDirectAfterStartWithListener:
-			startDone <- s.StartWithListener(ln)
-		default:
-			startDone <- s.StartWithContext(ctx)
-		}
-	}()
 
-	// Wait for the server, failing (never skipping) if it cannot start: a
-	// skipped engine would read as a pass in CI's root step, which runs
-	// without -v.
-	probe := &http.Client{Timeout: 300 * time.Millisecond}
-	ready := false
-	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
-		select {
-		case err := <-startDone:
-			t.Fatalf("%s: Start returned before the server was ready: %v", engType, err)
-		default:
+	// Start, failing (never skipping) if the engine cannot start: a skipped
+	// engine would read as a pass in CI's root step, which runs without -v.
+	// An io_uring start that fails only with ENOMEM is retried with a new
+	// server for up to 10 s, as startC714DetachServer does: the kernel
+	// charges ring memory to RLIMIT_MEMLOCK per UID and returns it only after
+	// a ring closes, so at CI's 8 MiB a start right after the previous case,
+	// or while another test binary holds rings, can fail with nothing leaked.
+	var s *celeris.Server
+	var startDone chan error
+	var addr string
+	retryUntil := time.Now().Add(10 * time.Second)
+	for tries := 1; ; tries++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
 		}
-		resp, gerr := probe.Get("http://" + addr + "/ping")
-		if gerr == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				ready = true
-				break
+		addr = ln.Addr().String()
+		if mode != drainDirectAfterStartWithListener {
+			if cerr := ln.Close(); cerr != nil {
+				t.Fatalf("close probe listener: %v", cerr)
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !ready {
-		t.Fatalf("%s: the server never answered /ping on %s", engType, addr)
+		s = build(addr)
+		startDone = make(chan error, 1)
+		go func(s *celeris.Server, ln net.Listener, done chan<- error) {
+			switch mode {
+			case drainDirectAfterStartWithListener:
+				done <- s.StartWithListener(ln)
+			default:
+				done <- s.StartWithContext(ctx)
+			}
+		}(s, ln, startDone)
+		err = waitDrainOrderReady(addr, startDone)
+		if err == nil {
+			if tries > 1 {
+				t.Logf("%s: server start retried on ring ENOMEM: %d tries", engType, tries)
+			}
+			break
+		}
+		_ = ln.Close()
+		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(retryUntil) {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		t.Fatalf("%s: the server did not start: %v", engType, err)
 	}
 
 	type result struct {
