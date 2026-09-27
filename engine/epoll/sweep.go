@@ -262,14 +262,15 @@ func (l *Loop) sweep() {
 		if i >= len(l.liveConns) {
 			continue
 		}
-		fd := l.liveConns[i]
-		if fd < 0 || fd >= len(l.conns) {
+		cs := l.liveConns[i]
+		if cs.hijacked.Load() {
+			// Handed to the application by an async Hijack and waiting for
+			// its dispatch goroutine to hand it back (celeris#668): not this
+			// loop's, so neither examined nor counted as residue — exactly
+			// as when hijackConn removed it from the live set itself.
 			continue
 		}
-		cs := l.conns[fd]
-		if cs == nil {
-			continue
-		}
+		fd := cs.fd
 		examined++
 		// Permanent residue: a detached WebSocket or SSE conn, an H2 one, a
 		// hijacked one, one that has never spoken. tryTransplant refuses
@@ -408,7 +409,7 @@ func (l *Loop) classifyLocked(cs *connState) int {
 	if cs.h2State != nil || cs.asyncH2Promoted.Load() || (cs.detected && cs.protocol != engine.HTTP1) {
 		return resH2
 	}
-	if cs.hijacked {
+	if cs.hijacked.Load() {
 		return resPinned
 	}
 	if !cs.detected || cs.h1State == nil {

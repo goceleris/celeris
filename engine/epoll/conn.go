@@ -76,7 +76,7 @@ type connState struct {
 	protocol engine.Protocol // 1 byte
 	detected bool            // 1 byte
 	dirty    bool            // 1 byte: true when writeBuf has data to flush
-	epollOut bool            // 1 byte: true while level-triggered EPOLLOUT is armed (write backpressure)
+	epollOut bool            // 1 byte: true while EPOLLOUT is armed (write backpressure; edge-triggered, like EPOLLIN)
 	_        [4]byte         // padding to 8-byte alignment
 	buf      []byte          // 24 bytes
 	writeBuf []byte          // 24 bytes: single append buffer for pending writes
@@ -158,8 +158,14 @@ type connState struct {
 	xferAsked atomic.Bool
 	// transplantPending (#383, loop-thread-only) marks a conn detached for
 	// transplant whose dispatch goroutine must drain+exit first; drainDetachQueue
-	// completes the handoff once it sees the enqueued cs with this set.
+	// completes the handoff at the first entry it drains after that exit.
 	transplantPending bool
+	// transplanted (loop-thread-only) is set by finishTransplantHandoff once
+	// the fd is handed over. Such a connState is never returned to the pool —
+	// the goroutine's exit entry may still be queued behind the entry the
+	// hand-off finished on — so every later entry finds this set and does
+	// nothing (celeris#669).
+	transplanted bool
 	// asyncPromoted: once an async-marked route is observed on this conn
 	// while it ran inline on the event loop (per-handler async, celeris
 	// #300), the conn is promoted (sticky) — every subsequent recv goes
@@ -195,19 +201,65 @@ type connState struct {
 	asyncDetachPending bool
 
 	// liveIdx is this conn's index into l.liveConns (the dense slice of
-	// active FDs iterated by checkTimeouts/shutdown). -1 when not present.
-	// Maintained by addLiveConn/removeLiveConn for O(1) removal. (#318)
+	// live connStates iterated by checkTimeouts, the sweep and shutdown).
+	// -1 when not present. Maintained by addLiveConn/removeLiveConn for O(1)
+	// removal (#318). Loop-thread-only, like liveConns itself (celeris#668).
 	liveIdx int
 
 	// hijacked is set by hijackConn (Context.Hijack) once the fd has been
 	// detached from the engine and handed to the caller as a net.Conn. In
 	// async mode hijackConn runs ON the dispatch goroutine (inside
 	// ProcessH1 → ErrHijacked), which still touches cs after ProcessH1
-	// returns — so the pooled connState MUST NOT be released by hijackConn.
-	// The release is deferred to the worker via the asyncClosed +
-	// detachQueue → drainDetachQueue handoff, which sees this flag and runs
-	// releaseConnState only after the goroutine has exited. (#3.1)
-	hijacked bool
+	// returns — so the connState MUST NOT be released by hijackConn (#3.1),
+	// and since celeris#668 it is never returned to the pool at all.
+	//
+	// Off-thread, hijackConn also enqueues cs at once, and the loop's
+	// drainDetachQueue takes the conn out of l.liveConns and l.connCount,
+	// which are the loop's and which the dispatch goroutine must not touch
+	// (celeris#668). Until that runs, the conn's entry stays in the live set
+	// with its descriptor already closed, so the live-set walkers and the
+	// dirty pass skip a conn with this flag set. They read it without any
+	// lock the goroutine holds, hence atomic; hijackConn stores it before it
+	// releases the descriptor number.
+	hijacked atomic.Bool
+
+	// hijackSettled (loop-thread-only) records that drainDetachQueue has
+	// taken an off-thread-hijacked conn out of the loop's state. Such a
+	// connState is never returned to the pool — queue entries made before
+	// or after the hijack may still name it — so every later entry finds
+	// this set and does nothing (celeris#668).
+	hijackSettled bool
+
+	// relinkOwed (guarded by asyncInMu) is set by the dirty pass or the
+	// EPOLLOUT resume when they give the conn up because its dispatch
+	// goroutine holds detachMu across a handler (celeris#669). The goroutine
+	// hands cs back through the detach queue at its next park, and
+	// drainDetachQueue puts it on the dirty list again. relinkPending
+	// (loop-thread-only) is the loop's side of the same debt: while it is
+	// set the conn is not offered to a transplant, because the loop has not
+	// yet seen it as the handler left it. Any entry that puts cs back on the
+	// dirty list clears it, the goroutine's own partial-flush entry included.
+	// A deferred hand-off does not rely on it for memory safety: that
+	// finishes only after the goroutine's exit and never pools cs.
+	relinkOwed    bool
+	relinkPending bool
+
+	// closeOwed (guarded by asyncInMu) is set by closeConn when it finds
+	// detachMu held by this conn's RUNNING dispatch goroutine — i.e. held
+	// across a user handler — and leaves the close to that goroutine
+	// instead of parking the loop on the lock for the rest of the handler
+	// (celeris#669). asyncClosed is already set, so the goroutine exits at
+	// its next check; the exit path that finds closeOwed hands cs back
+	// through the detach queue, whose asyncClosed branch runs closeConn
+	// again, on the loop thread, with the lock free.
+	closeOwed bool
+
+	// closeErr (loop-thread-only) is the I/O error a drainRead branch met
+	// while a running handler held detachMu. That branch used to flush and
+	// deliver it to OnError under the lock before closing; it now leaves
+	// both to closeConn, which does them under the lock when the close
+	// actually runs (celeris#669).
+	closeErr error
 }
 
 var connStatePool = sync.Pool{
@@ -274,11 +326,17 @@ func releaseConnState(cs *connState) {
 	cs.asyncQuiesce.Store(false)
 	cs.xferAsked.Store(false)
 	cs.transplantPending = false
+	cs.transplanted = false
 	cs.asyncPromoted = false
 	cs.asyncDetachUnlocked = false
 	cs.asyncDetachPending = false
 	cs.liveIdx = -1
-	cs.hijacked = false
+	cs.hijacked.Store(false)
+	cs.hijackSettled = false
+	cs.closeOwed = false
+	cs.closeErr = nil
+	cs.relinkOwed = false
+	cs.relinkPending = false
 	cs.fd = 0
 	connStatePool.Put(cs)
 }
