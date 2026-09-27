@@ -266,7 +266,11 @@ func (p *workerPark) release() {
 
 // R1, what every in-tree driver does: the RECV is armed, UnregisterConn, then
 // Close at once. Before celeris#691 the worker's cancel resolved the closed
-// number and missed.
+// number and missed. The order is not forced here: when the worker issues
+// the cancel before the Close, a cancel by the caller's number finds the
+// socket too, so as a check on the unfixed code this test fails only most of
+// the time, and less often the sooner the worker wakes. R3, below, forces
+// the order.
 func TestDriverUnregisterThenCloseAtOnce(t *testing.T) {
 	e, stop := startTestEngine(t)
 	t.Cleanup(stop)
