@@ -1411,9 +1411,11 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // body (so Body, FormValue, Bind and BodyReader called after Detach read the
 // request), and the response headers set so far (middleware echo request
 // headers into them). It cannot copy what was read out of the Context before
-// the call (a string, a Body slice, a BodyReader), nor values stored with
-// [Context.Set]: on epoll and io_uring those may still refer to the
-// connection's receive buffer, so clone them before keeping them.
+// the call (a string, a Body slice, a BodyReader), values stored with
+// [Context.Set], or values in the std context ([Context.Context],
+// [Context.SetContext]), which a detached WebSocket or SSE stream keeps as
+// its own context: on epoll and io_uring those may still refer to the
+// connection's receive buffer, so whoever stores them must clone them.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
