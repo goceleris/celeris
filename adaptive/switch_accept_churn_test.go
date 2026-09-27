@@ -12,6 +12,7 @@ import (
 
 	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/internal/deferlinger"
+	"github.com/goceleris/celeris/resource"
 )
 
 // procSelfFDCount counts open file descriptors for the current process by
@@ -52,7 +53,9 @@ func procSelfFDCount(t *testing.T) int {
 // lingering listeners and never close one. The test therefore sets the
 // linger to 0 and, after each switch, waits for the outgoing engine's
 // listeners to close, as the synchronous pause did before, and asserts from
-// deferlinger's close counter that closes happened.
+// deferlinger's close counter that closes happened. The shipped configuration,
+// with the default linger, has its own storm below
+// (TestAdaptiveSwitchVsAcceptChurnDefaultLinger).
 func TestAdaptiveSwitchVsAcceptChurn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
@@ -156,6 +159,104 @@ func TestAdaptiveSwitchVsAcceptChurn(t *testing.T) {
 	if closes == 0 {
 		t.Errorf("the storm closed no listen socket, so the listen-fd close this test races " +
 			"against in-flight accepts never happened")
+	}
+}
+
+// TestAdaptiveSwitchVsAcceptChurnDefaultLinger is the same storm in the
+// configuration that ships, with the default linger (celeris#662 review): the
+// test above sets the linger to 0 so that its storm closes listeners, which
+// leaves the default path to single-flap tests only. Here the switches come at
+// intervals that land both inside the outgoing engine's linger -- a resume of
+// lingering listeners racing the accepts in flight on them -- and after it,
+// once the linger's close has happened, so the next switch back re-creates
+// the listeners. After the storm and the lingers it started have ended, the
+// fd count is back within the slack, the listeners on the port are exactly
+// the active engine's, the engine serves, and both paths were taken: at least
+// one linger ended in a resume (deferlinger Aborts) and at least one in a
+// close (Closes).
+func TestAdaptiveSwitchVsAcceptChurnDefaultLinger(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short mode")
+	}
+	e, port := startAdaptive662(t, resource.Config{})
+	addr := e.Addr().String()
+
+	// Build the lazy io_uring standby and switch back, then wait out the
+	// warm-up's linger and the io_uring workers' park (see warmUp662), so the
+	// baseline holds both engines' fixed fds and only epoll's listeners.
+	warmUp662(t, e, port)
+	baseline := procSelfFDCount(t)
+	s0 := deferlinger.Snapshot()
+
+	const dialers = 8
+	gaps := []time.Duration{2 * time.Millisecond, 50 * time.Millisecond, 300 * time.Millisecond,
+		deferlinger.Linger() + 300*time.Millisecond}
+	stormEnd := time.Now().Add(6 * time.Second)
+	var dialErrs, dials atomic.Int64
+	var wg sync.WaitGroup
+	for range dialers {
+		wg.Go(func() {
+			for time.Now().Before(stormEnd) {
+				c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+				dials.Add(1)
+				if err != nil {
+					dialErrs.Add(1)
+					continue
+				}
+				_ = c.SetDeadline(time.Now().Add(200 * time.Millisecond))
+				_, _ = c.Write([]byte(idleSwitchReq662))
+				_ = c.Close()
+			}
+		})
+	}
+	switches := 0
+	for i := 0; time.Now().Before(stormEnd); i++ {
+		e.ForceSwitch()
+		switches++
+		time.Sleep(gaps[i%len(gaps)])
+	}
+	wg.Wait()
+	// Every linger the storm started ends within Linger of its switch; an
+	// io_uring worker whose listener closed parks within one more ring wait.
+	time.Sleep(deferlinger.Linger() + 1200*time.Millisecond)
+
+	const slack = 128
+	after := procSelfFDCount(t)
+	for settle := time.Now().Add(3 * time.Second); after > baseline+slack && time.Now().Before(settle); {
+		time.Sleep(20 * time.Millisecond)
+		after = procSelfFDCount(t)
+	}
+	active := e.ActiveEngine()
+	want := 0
+	if nw, ok := active.(interface{ NumWorkers() int }); ok {
+		want = nw.NumWorkers()
+	}
+	ls := listeners662(t, port)
+	serves := serves662(addr, 5*time.Second)
+	s1 := deferlinger.Snapshot()
+	aborts, closes := s1.Aborts-s0.Aborts, s1.Closes-s0.Closes
+	t.Logf("switches=%d dials=%d dialErrors=%d lingersEndedByResume=%d listenerCloses=%d "+
+		"active=%v listeners=%s (want %d) fd baseline=%d after=%d serves=%v",
+		switches, dials.Load(), dialErrs.Load(), aborts, closes, active.Type(), describe662(ls), want,
+		baseline, after, serves)
+	if after > baseline+slack {
+		t.Errorf("fd leak: baseline=%d after=%d (slack=%d)", baseline, after, slack)
+	}
+	if want > 0 && len(ls) != want {
+		t.Errorf("after the storm settled the port has listeners %s, want the active %v engine's %d",
+			describe662(ls), active.Type(), want)
+	}
+	if !allOn662(ls) {
+		t.Errorf("a listener that serves reads TCP_DEFER_ACCEPT off after the storm: %s", describe662(ls))
+	}
+	if !serves {
+		t.Error("the engine does not serve after the storm")
+	}
+	if aborts == 0 {
+		t.Error("no switch landed inside a linger, so the resume of lingering listeners was not exercised")
+	}
+	if closes == 0 {
+		t.Error("no linger ended in a close during the storm, so the linger's close was not exercised")
 	}
 }
 

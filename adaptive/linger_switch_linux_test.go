@@ -3,6 +3,7 @@
 package adaptive
 
 import (
+	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -167,7 +168,11 @@ func TestFlapWithinLingerKeepsListeners(t *testing.T) {
 // while the outgoing epoll keeps accepting churn during its linger, and when
 // everything has closed the hand-off ledger balances: every connection
 // detached was adopted (the celeris#624 witness), no bucket of silent loss
-// moved, and the engine's accept and close counts match the hooks.
+// moved, and the engine's accept and close counts match the hooks. No client
+// may lose a request either: no keep-alive request fails, and a churn
+// connection fails only in the one way closing a listen socket inherently
+// allows -- a handshake that completed after the close's last drain, reset
+// (or reset at the dial) -- and at most twice per outgoing listener.
 func TestLingerTransplantConserves(t *testing.T) {
 	var connects, disconnects atomic.Int64
 	e, port := startAdaptive662(t, resource.Config{
@@ -176,18 +181,31 @@ func TestLingerTransplantConserves(t *testing.T) {
 	})
 	warmUp662(t, e, port)
 	addr := e.Addr().String()
+	outgoingListeners := len(listeners662(t, port))
 
 	const kaConns = 32
 	pauseKA := make(chan struct{})
 	stopKA := make(chan struct{})
 	var kaOK, kaErr atomic.Int64
 	kaWG := driveKeepAlive(addr, kaConns, pauseKA, stopKA, &kaOK, &kaErr)
+	// The drivers stop on the normal path below; after an early t.Fatal
+	// the cleanups stop them, so none outlives the test.
+	stopKeepAlives := sync.OnceFunc(func() {
+		close(stopKA)
+		kaWG.Wait()
+	})
+	t.Cleanup(stopKeepAlives)
 
 	var churnOK, churnErr atomic.Int64
 	var mu sync.Mutex
 	churnKinds := map[string]int{}
 	churnStop := make(chan struct{})
 	var churnWG sync.WaitGroup
+	stopChurn := sync.OnceFunc(func() {
+		close(churnStop)
+		churnWG.Wait()
+	})
+	t.Cleanup(stopChurn)
 	for range 4 {
 		churnWG.Go(func() {
 			for {
@@ -233,18 +251,16 @@ func TestLingerTransplantConserves(t *testing.T) {
 	}
 	time.Sleep(2500 * time.Millisecond) // past the linger's close
 	epollAcceptsDuringLinger := epollEng.Metrics().AcceptCount - epollAccepts0
-	close(churnStop)
-	churnWG.Wait()
+	stopChurn()
 	close(pauseKA) // idle keep-alives reach a clean boundary and converge
 	time.Sleep(1500 * time.Millisecond)
-	close(stopKA)
-	kaWG.Wait()
+	stopKeepAlives()
 	for dl := time.Now().Add(5 * time.Second); e.Metrics().ActiveConnections != 0 && time.Now().Before(dl); {
 		time.Sleep(10 * time.Millisecond)
 	}
 	m := e.Metrics()
 	mu.Lock()
-	kinds := churnKinds
+	kinds := maps.Clone(churnKinds)
 	mu.Unlock()
 	t.Logf("keepalive ok=%d err=%d | churn ok=%d err=%d kinds=%v | epoll accepts during the linger=%d | "+
 		"transplant detached=%d adopted=%d slotOccupied=%d handoffRefused=%d drainStopped=%d "+
@@ -287,5 +303,23 @@ func TestLingerTransplantConserves(t *testing.T) {
 	}
 	if got := disconnects.Load(); got != int64(m.CloseCount) {
 		t.Errorf("OnDisconnect fired %d times for %d closes", got, m.CloseCount)
+	}
+	if n := kaErr.Load(); n != 0 {
+		t.Errorf("%d keep-alive requests failed across the promotion and the linger (ok %d)", n, kaOK.Load())
+	}
+	residual := 0
+	for kind, n := range kinds {
+		switch kind {
+		case "RESET", "dial":
+			residual += n
+		default:
+			t.Errorf("%d churn connections ended %q: not the reset closing a listen socket "+
+				"inherently allows", n, kind)
+		}
+	}
+	if budget := 2 * outgoingListeners; residual > budget {
+		t.Errorf("%d churn connections were reset, more than %d (two per outgoing listener's close): "+
+			"connections the linger admitted were lost, not only handshakes caught by the close (%v)",
+			residual, budget, kinds)
 	}
 }
