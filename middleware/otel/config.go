@@ -53,9 +53,13 @@ type Config struct {
 	CollectUserAgent *bool
 
 	// CustomAttributes is called per-request and appended to the span attributes.
+	// String and string-slice values are copied first (one allocation per
+	// string): the span keeps them, and a request string is only valid
+	// during the request on epoll and io_uring. Keys are not copied.
 	CustomAttributes func(c *celeris.Context) []attribute.KeyValue
 
 	// CustomMetricAttributes is called per-request and appended to the metric attributes.
+	// String values are copied as for CustomAttributes.
 	CustomMetricAttributes func(c *celeris.Context) []attribute.KeyValue
 
 	// ServerPort, when > 0, adds the "server.port" attribute to spans and metrics.

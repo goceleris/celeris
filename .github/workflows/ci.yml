@@ -445,6 +445,45 @@ jobs:
       - name: middleware/otel
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/otel
+      # celeris#720, #732: Adapt must hand net/http the request headers, and
+      # Adapt, adapters.WrapMiddleware and the metrics, otel and logger
+      # middleware must hand net/http, Prometheus, the OTel SDK and slog
+      # copies of the request strings those keep, not views of the
+      # connection's receive buffer. The steps above run these packages, but
+      # without -v, and each of these tests drops its io_uring arms without a
+      # word when the probe finds no ring, which happens while another test
+      # binary's rings are still being freed. So they run here by name, one
+      # package at a time, with CELERIS_REQUIRE_IOURING_WORKERS=1 turning a
+      # missing io_uring arm into a failure, and an exact tally: the seven
+      # top-level tests and all 35 arms (std, and epoll and io_uring with sync
+      # and async handlers; 14 of them io_uring) must PASS, with no SKIP line,
+      # and every go test must exit 0. A failing test does not stop the step
+      # early, and the step runs even when a step above failed.
+      - name: celeris#720, #732 request strings handed to net/http, Prometheus, OTel, slog (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c732.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^(TestAdaptRequestCarriesHeaders|TestAdaptKeptRequestStringsSurviveNextRequest)$' . 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestWrapMiddlewareKeptStringsSurviveNextRequest$' ./middleware/adapters/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestKeptRecordSurvivesNextRequest$' ./middleware/logger/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          (cd middleware/metrics && go test -race -count=1 -timeout=300s -v -run '^(TestLabelValuesSurviveNextRequest|TestLabelValuesSurviveConnectionReuse)$' .) 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^TestAttributesSurviveNextRequest$' .) 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          tests='TestAdaptRequestCarriesHeaders|TestAdaptKeptRequestStringsSurviveNextRequest|TestWrapMiddlewareKeptStringsSurviveNextRequest|TestKeptRecordSurvivesNextRequest|TestLabelValuesSurviveNextRequest|TestLabelValuesSurviveConnectionReuse|TestAttributesSurviveNextRequest'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c732.log || true)
+          arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c732.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/io_uring" /tmp/c732.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c732.log || true)
+          echo "celeris#720/#732 tests: top-level PASS $top (want 7), arm PASS $arms (want 35), io_uring arm PASS $uring (want 14), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 7 ] || [ "$arms" -ne 35 ] || [ "$uring" -ne 14 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all seven tests and all 35 arms (14 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
       - name: middleware/protobuf
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/protobuf
