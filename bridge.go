@@ -52,10 +52,62 @@ func AdaptFunc(h http.HandlerFunc) HandlerFunc {
 	return Adapt(h)
 }
 
+// buildHTTPRequest builds the *http.Request an adapted handler receives.
+//
+// Every string it hands to net/http is a copy. On epoll and io_uring the
+// method, path, query and header strings are views of the connection's
+// receive buffer, which the engine reuses for the connection's next request
+// and, once the connection closes, for another connection. net/http lets a
+// handler keep the request's strings after ServeHTTP returns (a log line
+// queued for later, a map key, a value handed to a goroutine), so a kept view
+// would read other request bytes (celeris#732). The copies share one
+// allocation. The body is not copied: net/http forbids reading it after
+// ServeHTTP returns.
 func buildHTTPRequest(c *Context) (*http.Request, error) {
-	url := c.path
+	// The H1 parser of the native engines defers the header slice until
+	// something reads a header. Without this, a route with no header read
+	// before Adapt handed net/http no request headers at all (celeris#720).
+	c.stream.MaterializeHeaders()
+	hdrs := c.stream.Headers
+
+	urlLen := len(c.path)
 	if c.rawQuery != "" {
-		url += "?" + c.rawQuery
+		urlLen += 1 + len(c.rawQuery)
+	}
+	authority := ""
+	n := len(c.method) + urlLen
+	for _, h := range hdrs {
+		if strings.HasPrefix(h[0], ":") {
+			if h[0] == ":authority" && authority == "" {
+				authority = h[1]
+			}
+			continue
+		}
+		n += len(h[0]) + len(h[1])
+	}
+	n += len(authority)
+
+	var sb strings.Builder
+	sb.Grow(n)
+	sb.WriteString(c.method)
+	sb.WriteString(c.path)
+	if c.rawQuery != "" {
+		sb.WriteByte('?')
+		sb.WriteString(c.rawQuery)
+	}
+	for _, h := range hdrs {
+		if !strings.HasPrefix(h[0], ":") {
+			sb.WriteString(h[0])
+			sb.WriteString(h[1])
+		}
+	}
+	sb.WriteString(authority)
+	// Cut the copies back out, in the order they were written.
+	rest := sb.String()
+	next := func(l int) string {
+		s := rest[:l]
+		rest = rest[l:]
+		return s
 	}
 
 	var body io.Reader
@@ -64,23 +116,21 @@ func buildHTTPRequest(c *Context) (*http.Request, error) {
 		body = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(c.Context(), c.method, url, body)
+	method := next(len(c.method))
+	req, err := http.NewRequestWithContext(c.Context(), method, next(urlLen), body)
 	if err != nil {
 		return nil, err
 	}
 
-	// The H1 parser of the native engines defers the header slice until
-	// something reads a header. Without this, a route with no header read
-	// before Adapt handed net/http no request headers at all (celeris#720).
-	c.stream.MaterializeHeaders()
-	for _, h := range c.stream.Headers {
+	for _, h := range hdrs {
 		if strings.HasPrefix(h[0], ":") {
 			continue
 		}
-		req.Header.Add(h[0], h[1])
+		key := next(len(h[0]))
+		req.Header.Add(key, next(len(h[1])))
 	}
 
-	if host := c.Header(":authority"); host != "" {
+	if host := next(len(authority)); host != "" {
 		req.Host = host
 	}
 
