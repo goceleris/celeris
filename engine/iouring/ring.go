@@ -308,6 +308,37 @@ func (r *Ring) Submit() (int, error) {
 	return int(ret), nil
 }
 
+// SubmitAndFlush submits pending SQEs and runs the ring's deferred completion
+// work without waiting for a CQE: io_uring_enter(fd, pending, 0, GETEVENTS).
+//
+// On a DEFER_TASKRUN ring the completion of a request the kernel has already
+// finished with, or cancelled, is task work that runs only inside an enter
+// with GETEVENTS (celeris#79). Until it runs, the request still holds what it
+// held, including its reference to the file: a socket closed with a recv
+// still armed does not go, and sends no FIN, until then. The worker's own
+// waits all pass GETEVENTS; this is for a caller that is about to stop
+// entering the ring (the DRAINING→SUSPENDED park, celeris#712). With
+// min_complete 0 the kernel runs that work and returns at once; the CQEs it
+// posts wait in the ring for the next BeginCQ. On a ring without
+// DEFER_TASKRUN it is Submit.
+func (r *Ring) SubmitAndFlush() (int, error) {
+	n := r.pending
+	ret, _, errno := unix.Syscall6(
+		uintptr(sysIOUringEnter),
+		uintptr(r.fd),
+		uintptr(n),
+		0,
+		uintptr(enterGetEvents),
+		0, 0,
+	)
+	if errno != 0 {
+		r.pending = retryPending(n, errno)
+		return 0, fmt.Errorf("io_uring_enter submit+flush: %w", errno)
+	}
+	r.pending = n - uint32(ret)
+	return int(ret), nil
+}
+
 // WaitCQE waits for at least one CQE to become available.
 func (r *Ring) WaitCQE() error {
 	_, _, errno := unix.Syscall6(

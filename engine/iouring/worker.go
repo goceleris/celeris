@@ -1492,14 +1492,25 @@ func (w *Worker) run(ctx context.Context) {
 			// queues its close-path cancels (the header timer's, a send's)
 			// in the same pass that finds the worker idle, and the park is
 			// indefinite: those SQEs used to sit unsubmitted until something
-			// woke the worker, measured 1-24 pending at parks. Outside
-			// wakeMu, which is a leaf. Not under SQPOLL, where the kernel's
-			// SQ thread submits; an SQ thread that has gone idle would need
-			// the NEED_WAKEUP kick the submit branch of this loop gives it,
-			// but no tier enables SQPOLL today (SQPollIdle is 0 in all
-			// three), so that case is not handled here.
-			if !w.sqpoll && w.ring.Pending() > 0 {
-				_, _ = w.ring.Submit()
+			// woke the worker, measured 1-24 pending at parks.
+			//
+			// Submitting is not enough on a DEFER_TASKRUN ring, and the
+			// enter runs the deferred completion work too, even with
+			// nothing left to submit (celeris#712). A cancelled recv
+			// completes as task work that only an enter with GETEVENTS
+			// runs, and until it does the recv keeps its reference to the
+			// file: finishClose's HTTP/1 fast path is a plain close(fd),
+			// so the socket of a connection closed in this iteration stayed
+			// ESTABLISHED, and its client got no FIN, for as long as the
+			// park lasted. The park waits on a Go channel, not in the ring.
+			//
+			// Outside wakeMu, which is a leaf. Not under SQPOLL, where the
+			// kernel's SQ thread submits; an SQ thread that has gone idle
+			// would need the NEED_WAKEUP kick the submit branch of this
+			// loop gives it, but no tier enables SQPOLL today (SQPollIdle is
+			// 0 in all three), so that case is not handled here.
+			if !w.sqpoll {
+				_, _ = w.ring.SubmitAndFlush()
 			}
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() ||
