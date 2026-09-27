@@ -789,8 +789,16 @@ func (e *Engine) performSwitch() {
 	// Re-acquire freezeState for the commit and RE-CHECK driverFDs: a driver
 	// may have registered during the build window above. If so, abort — but the
 	// freshly-built standby stays cached for the next attempt. Pause its accept
-	// first so it does not sit in the SO_REUSEPORT pool alongside the (still
-	// active) old engine; the next switch ResumeAccepts it.
+	// so it leaves the SO_REUSEPORT pool it shares with the (still active) old
+	// engine; the next switch ResumeAccepts it.
+	//
+	// The pause lingers (celeris#662): for about 1.5 s the fresh engine keeps
+	// its share of new connections, so that a client it accepted the
+	// handshake of during the build is served rather than reset. What it
+	// accepts must not stay on it, so it also gets the drain a completed
+	// switch gives the engine it leaves: toward the engine that stays active
+	// (newStandby here). A switch that later makes it active stops that
+	// drain first (the StopTransplant below).
 	e.freezeState.Lock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
@@ -800,6 +808,7 @@ func (e *Engine) performSwitch() {
 		e.freezeState.Unlock()
 		if freshlyBuilt {
 			beginPause(newActive)
+			e.applyTransplant(newStandby, newActive)
 		}
 		return
 	}
