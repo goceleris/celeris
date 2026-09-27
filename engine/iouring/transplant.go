@@ -60,9 +60,11 @@ func (e *Engine) AdoptConn(fd int, carry engine.Carryover) error {
 // count, fire the hook), and adoptClosed, set under the same lock, turns a
 // later AdoptConn into an error the source can reclaim from.
 //
-// The other driver actions stay queued exactly as before: they carry no
-// descriptor the engine owns (a driver closes its own fds), and
-// shutdownDrivers already fires onClose for every registered driver conn.
+// The other driver actions stay queued exactly as before. The only
+// descriptor they can reach that the engine owns is the duplicate each
+// registered driver conn holds (celeris#691), and shutdownDrivers, which
+// runs next, retires every registered driver conn, closing it, and fires
+// its onClose. A driver closes its own fds.
 func (w *Worker) closeAdoptQueue() {
 	w.driverActionMu.Lock()
 	w.adoptClosed = true

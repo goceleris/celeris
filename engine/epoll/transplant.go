@@ -85,6 +85,13 @@ func (l *Loop) tryTransplant(fd int) {
 	// touched only by this loop thread, so the reads are inherently safe.
 	hasGoroutine := false
 	if l.async {
+		// A close is owed (celeris#669): closeConn left it to the dispatch
+		// goroutine, which may already have exited without the loop having
+		// drained its hand-back. Never hand such a conn to the target — the
+		// hand-back would then close through a connState the move released.
+		if cs.asyncClosed.Load() {
+			return
+		}
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
 		parked := cs.asyncParked
@@ -207,7 +214,10 @@ func (l *Loop) flushedAtBoundary(cs *connState) bool {
 	if !cs.h1State.AtRequestBoundary() {
 		return false
 	}
-	return !cs.dirty && !cs.epollOut && cs.writePos == 0 && cs.pendingBytes == 0 &&
+	// relinkPending: the loop gave the conn up mid-handler and its dispatch
+	// goroutine owes it back (celeris#669); the conn is not at a boundary the
+	// loop has seen until an entry puts it back on the dirty list.
+	return !cs.dirty && !cs.epollOut && !cs.relinkPending && cs.writePos == 0 && cs.pendingBytes == 0 &&
 		len(cs.writeBuf) == 0 && len(cs.bodyBuf) == 0 && cs.sendfile == nil
 }
 
@@ -248,10 +258,10 @@ func (l *Loop) detachForTransplant(fd int, cs *connState) {
 }
 
 // finishTransplantHandoff completes a deferred async transplant after the
-// dispatch goroutine has exited and enqueued cs (#383). The fd was already
-// removed from epoll by tryTransplant; here we capture the carry-over, release
-// the connState, and hand the fd to the io_uring target. Runs on the loop thread
-// (from drainDetachQueue).
+// dispatch goroutine has exited (#383). The fd was already removed from epoll
+// by tryTransplant; here we capture the carry-over, mark the connState handed
+// over (it is never pooled), and hand the fd to the io_uring target. Runs on
+// the loop thread (from drainDetachQueue).
 func (l *Loop) finishTransplantHandoff(cs *connState) {
 	cs.transplantPending = false
 	// The debt tracked for the standby suspend gate is settled here, on
@@ -275,8 +285,14 @@ func (l *Loop) finishTransplantHandoff(cs *connState) {
 	}
 	fd := cs.fd
 	carry := engine.Carryover{RemoteAddr: cs.remoteAddr}
-	l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
-	releaseConnState(cs)
+	l.dropAsk(cs) // celeris#657 P8: no ask may name it once it is not ours
+	// Never pooled (celeris#669): drainDetachQueue may finish on an entry
+	// the goroutine made before its exit, with the exit's own entry still to
+	// come, and cannot tell. A released connState would be reissued under
+	// that entry. transplanted makes every later entry a no-op, and the
+	// garbage collector takes cs once the queue lets go of it. The cost is
+	// one allocation per connection moved, i.e. per engine switch.
+	cs.transplanted = true
 	ts := l.transplant.Load()
 	if ts == nil {
 		// The drain was stopped between the detach and here (the adaptive
