@@ -1,0 +1,243 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review configuration for goceleris/celeris (celeris#690).
+# Reference: https://docs.coderabbit.ai/reference/configuration
+# `@coderabbitai configuration` on any pull request prints the resolved config.
+#
+# CodeRabbit is ADVISORY. It never requests changes or approves, it is not a
+# required check, and its comments are input to the human review, not a
+# verdict. The merge rule stays GOVERNANCE.md's: green required checks and a
+# code-owner approval.
+
+language: en-US
+
+tone_instructions: >-
+  Be terse and specific: file, line, the input or interleaving that breaks it,
+  and what happens. No praise, no emoji, no restating the diff. If unsure, say
+  which test or measurement would settle it.
+
+early_access: false
+
+reviews:
+  # Balanced feedback; the path instructions below point it at what matters.
+  profile: chill
+  # Never "Request changes", never auto-approve: CodeRabbit cannot block or
+  # satisfy the merge rule.
+  request_changes_workflow: false
+  # Keep generated text out of the author's PR description (it becomes the
+  # squash commit message); the summary goes in the walkthrough comment.
+  high_level_summary: false
+  high_level_summary_in_walkthrough: true
+  # Say when and why a review was skipped (draft, ignored title, paused).
+  review_status: true
+  review_details: false
+  collapse_walkthrough: true
+  changed_files_summary: true
+  # A generated sequence diagram draws one happy path; the hazards in this
+  # codebase are interleavings, which it cannot show.
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  # Release notes are generated from these labels (.github/release.yml), so
+  # suggest them, but leave applying them to a human.
+  suggested_labels: true
+  auto_apply_labels: false
+  labeling_instructions:
+    - label: bug
+      instructions: A fix for incorrect behaviour (lost request, leak, race, wrong result, crash).
+    - label: enhancement
+      instructions: A new feature or a new public API.
+    - label: performance
+      instructions: A change whose purpose is speed or allocations; it should carry a measurement.
+    - label: security
+      instructions: A fix or hardening for a security weakness (parsing of untrusted input, auth middleware, secrets).
+    - label: breaking
+      instructions: Removes or changes an exported identifier, a default, or documented behaviour.
+  # One maintainer today (MAINTAINERS.md); suggestions would only be noise.
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    # Drafts are reviewed once marked ready, or on `@coderabbitai review`.
+    drafts: false
+    ignore_title_keywords:
+      - "[WIP]"
+      - "WIP:"
+      - "DO NOT REVIEW"
+    # Version bumps: the diff is a hash or a version string.
+    ignore_usernames:
+      - "dependabot[bot]"
+
+  # Lock files and generated or vendored code are not reviewed.
+  path_filters:
+    - "!**/go.sum"
+    - "!**/vendor/**"
+    - "!**/*.pb.go"
+    - "!**/testdata/fuzz/**"
+    - "!**/*.png"
+
+  path_instructions:
+    - path: "engine/**"
+      instructions: |
+        The epoll, io_uring and std engines. A bug here loses or corrupts requests for every user. Check:
+        - io_uring SQE/CQE lifetimes: every buffer, iovec, sockaddr and connState an SQE points at must stay valid and
+          unrecycled until its final CQE (a multishot op ends only on a CQE without IORING_CQE_F_MORE; an IOSQE_IO_LINK
+          chain ends with its last op). A CQE whose user_data carries an older connection generation must be ignored.
+          An ASYNC_CANCEL must match exactly the op it means to (keyed by user_data, not by fd, unless every op on the
+          socket is meant).
+        - fd lifetime: a descriptor must not be closed while an op, a cancel, or the other engine (a transplant or
+          hand-off between epoll and io_uring) can still use it. Once closed, the number can come back from the next
+          accept, and anything still holding it acts on a stranger's connection. Check every close path (error,
+          shutdown, hijack/detach, hand-off, worker init failure) for a double close and for a leaked listen socket,
+          ring or eventfd.
+        - Locks: state the order two locks are taken in and flag any path that takes them the other way. Flag a
+          callback, a user handler, a blocking syscall or a channel send made while holding a lock, and an event loop
+          that parks waiting for work only it can finish.
+        - Hot path (accept, recv, parse, dispatch, send): a new allocation, `defer` around Lock/Unlock, a new lock or
+          atomic, `fmt`, or an interface conversion needs a measurement in the PR (a benchmark with -benchmem, or a
+          goceleris/probatorium result). Ask for it when it is missing.
+        - Goroutines and timers: every goroutine needs an exit tied to shutdown or a context, Shutdown must wait for
+          it, and every timer must be stopped.
+        - Build tags: a `_linux.go` or `//go:build linux` change needs its non-Linux stub to keep compiling.
+        - Exported metrics and counters are read by goceleris/probatorium; renaming or removing one breaks it.
+    - path: "adaptive/**"
+      instructions: |
+        The adaptive engine runs epoll and io_uring side by side and switches between them (promote / revert) under
+        load. Check:
+        - Every connection is owned by exactly one engine at every instant of a switch: none dropped, none served by
+          both, including the ones still in an accept queue or idle on keep-alive when the switch happens.
+        - Listener hand-over: no window in which neither engine accepts, and no connection reset by closing a listener
+          whose queue still holds connections.
+        - Every wait (bind, drain, settle) must also select on ctx.Done() and on shutdown.
+        - Controller decisions need hysteresis; flag anything that can oscillate.
+        - Metrics aggregated across sub-engines: sums for counters, max for maxima, never a sum of maxima.
+    - path: "internal/**"
+      instructions: |
+        Shared connection handling (internal/conn: H1 and H2 state used by every engine), socket options and the
+        wake-fd. The engine rules apply: hot-path allocations and locks need a measurement, lock order must be
+        consistent, and a descriptor must not be used after close.
+    - path: "protocol/**"
+      instructions: |
+        The HTTP/1.1 and HTTP/2 parsers read untrusted bytes from the network. Check:
+        - Request smuggling (RFC 9112): Content-Length together with Transfer-Encoding, duplicate or differing
+          Content-Length, obs-fold, bare CR or LF, whitespace before the colon.
+        - Every slice index bounds-checked; chunk sizes and lengths checked for overflow; header size and count limits
+          enforced before allocating.
+        - HTTP/2 (RFC 9113): stream state transitions, flow-control windows, SETTINGS limits, HPACK table size, and
+          CONTINUATION floods.
+        - A zero-copy view into a read buffer must not outlive the buffer's reuse.
+        - The assembly header scan (findheader_*.s) must agree byte for byte with the generic Go version; a change to
+          either needs the fuzz or equivalence test to cover it.
+    - path: "middleware/**"
+      instructions: |
+        Follow CONTRIBUTING.md's middleware pattern: config.go with defaults and validation that panics at init,
+        `New(config ...Config) celeris.HandlerFunc`, doc.go with security notes, bench_test.go with b.ReportAllocs,
+        and celeris.SkipHelper for skip logic. Check:
+        - A middleware must not keep a *celeris.Context, or a slice of its buffers, after the handler returns:
+          contexts are pooled and reused.
+        - Auth and security middleware (jwt, csrf, basicauth, keyauth, cors, secure, ratelimit, proxy, session): secret
+          comparisons in constant time, fail closed on error, X-Forwarded-For trusted only from configured proxies, no
+          secret or token in a log line or error message.
+        - compress, metrics, otel and protobuf are separate Go modules; their go.mod pin on the root module moves only
+          through `mage PrepRelease`.
+    - path: "driver/**"
+      instructions: |
+        The Postgres, Redis and Memcached drivers. Server replies are parsed with bounds checks like untrusted input. A
+        connection goes back to the pool only in a clean protocol state; one cancelled mid-request is discarded, not
+        reused. Every call honours its context. A connection registered on an engine's event loop is unregistered
+        before its descriptor is closed.
+    - path: "**/*_test.go"
+      instructions: |
+        This project's test rules:
+        - A SKIP is never a PASS. A test that can skip in CI (memlock, io_uring availability, kernel feature) needs a
+          CELERIS_REQUIRE_* switch or a CI tally that fails when it does not run. Flag a new skip that CI would not
+          notice.
+        - A regression test must fail on the unfixed code. Ask for that negative control if the PR does not show it.
+        - No timing knife-edges: no sleep used as synchronisation, no assertion on a wall-clock duration with a tight
+          margin, no dependence on goroutine scheduling order. Wait on a channel, a condition, or a condition polled
+          until a generous deadline.
+        - Tests run under -race: state shared with a goroutine must be synchronised.
+        - No test that only restates a constant or duplicates existing coverage (CONTRIBUTING.md).
+        - .github/workflows/ci.yml runs some tests by exact name and counts their PASS lines. Renaming or removing one
+          of those tests without updating that list turns CI red.
+    - path: ".github/workflows/**"
+      instructions: |
+        - Every `uses:` of another repository's action or workflow (`owner/repo@...`) pinned to a full 40-character
+          commit SHA with a `# vX.Y.Z` comment that matches it. A local `./path` action takes no ref.
+        - Top-level `permissions` read-only; a job raises only what it needs, with a comment saying why.
+        - actions/checkout with `persist-credentials: false`.
+        - No `${{ }}` expression inside `run:`; pass values through `env:`.
+        - No `pull_request_target`. Code from a fork pull request never runs on a self-hosted or CodSpeed macro runner.
+        - The lint job runs actionlint and zizmor over this directory; both must stay clean.
+        - Steps in ci.yml that count PASS lines of named tests must change together with those tests.
+    - path: "mage*.go"
+      instructions: |
+        Magefiles carry `//go:build mage`; only the lint job's `mage -compile` builds them. The release stamps
+        (celeris.Version in server.go, the four middleware go.mod pins, the README heading) must move together
+        through `mage PrepRelease` and pass `mage CheckRelease`.
+
+  pre_merge_checks:
+    # Exported identifiers already need doc comments (revive); a percentage
+    # gate over every function would contradict CONTRIBUTING.md's "no
+    # unnecessary comments".
+    docstrings:
+      mode: "off"
+    title:
+      mode: warning
+      requirements: >-
+        Conventional-commit form `type(scope): summary` or `type: summary`, with type one of feat, fix, perf,
+        security, test, docs, ci, chore, refactor or deps; the summary says what changes in plain words; a PR
+        that fixes an issue ends with the reference, e.g. `(celeris#657)`.
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
+
+  finishing_touches:
+    # Generated tests cannot show that they fail on the unfixed code, which
+    # this project requires of every regression test.
+    unit_tests:
+      enabled: false
+    docstrings:
+      enabled: false
+
+  tools:
+    golangci-lint:
+      enabled: true
+      config_file: .golangci.yml
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    shellcheck:
+      enabled: true
+    gitleaks:
+      enabled: true
+    # Grammar suggestions on long, deliberate prose comments are noise.
+    languagetool:
+      enabled: false
+
+chat:
+  auto_reply: true
+  art: false
+
+knowledge_base:
+  opt_out: false
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CONTRIBUTING.md"
+      - "GOVERNANCE.md"
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
