@@ -420,7 +420,7 @@ type Worker struct {
 	linkArmBatch uint64
 
 	tickCounter uint32
-	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 iterations
+	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 CQE-bearing iterations, by checkTimeouts, and on leaving the park
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 
 	// pendingRelease defers returning connState structs to the pool
@@ -1513,6 +1513,15 @@ func (w *Worker) run(ctx context.Context) {
 
 			select {
 			case <-wake:
+				// The park stopped the iterations that refresh cachedNow,
+				// so it still reads the time the worker parked at. The
+				// connections this worker accepts or adopts next are
+				// stamped from it, and the first checkTimeouts compares
+				// those stamps with a fresh time.Now(): after a park
+				// longer than ReadTimeout it closed every one of them,
+				// with a request already written (celeris#713). Read the
+				// clock again before anything is stamped.
+				w.cachedNow = time.Now().UnixNano()
 			case <-ctx.Done():
 				w.shutdown()
 				return
