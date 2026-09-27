@@ -9,6 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -619,6 +622,110 @@ func TestDirtyPassSkipsAHijackedConn(t *testing.T) {
 	if cs.dirty {
 		t.Error("the hijacked conn is still on the dirty list")
 	}
+}
+
+// TestEPOLLOUTResumeSkipsAHijackedConn is TestDirtyPassSkipsAHijackedConn
+// for the other site that flushes a backpressured conn: the EPOLLOUT resume
+// (review of #698). The loop reads the conn from its slot for an EPOLLOUT
+// event, and the conn's handler, which holds detachMu inside ProcessH1,
+// hijacks it before handleWritable runs: the slot is cleared and the
+// descriptor closed, and its number can be reissued at once.
+//
+//   - handler returned: the handler has released detachMu, so the resume
+//     takes it. Flushing would write the conn's queued bytes to the number's
+//     new owner.
+//   - handler still running: the handler still holds detachMu, so the resume
+//     gives the conn up (relink), which disarms EPOLLOUT: an EPOLL_CTL_MOD by
+//     the number, in this loop's epoll set. The new owner here is a pipe's
+//     write end that a driver goroutine registered in that set (RegisterConn
+//     adds from the caller's goroutine), level-triggered for EPOLLOUT. The
+//     MOD would make it edge-triggered and drop its EPOLLOUT.
+//
+// Both call handleWritable directly with the conn, as the run loop does with
+// the one it read from the slot.
+func TestEPOLLOUTResumeSkipsAHijackedConn(t *testing.T) {
+	for _, handlerReturned := range []bool{true, false} {
+		name := "handler still running"
+		if handlerReturned {
+			name = "handler returned"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := hijackRaceConn(t)
+			l, cs, local := rig.l, rig.cs, rig.local
+			cs.writeBuf = append(cs.writeBuf[:0], "pending"...)
+			cs.pendingBytes = len(cs.writeBuf)
+			l.armEpollOut(cs)
+			if !cs.epollOut {
+				t.Fatal("apparatus: EPOLLOUT could not be armed on the conn")
+			}
+
+			cs.detachMu.Lock()
+			nc, err := l.hijackConn(local)
+			if err != nil {
+				cs.detachMu.Unlock()
+				t.Fatalf("hijackConn: %v", err)
+			}
+			t.Cleanup(func() { _ = nc.Close() })
+			rd := reissueToPipeWriteEnd(t, local)
+			if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, local, &unix.EpollEvent{
+				Events: unix.EPOLLOUT,
+				Fd:     int32(local),
+			}); err != nil {
+				cs.detachMu.Unlock()
+				t.Fatalf("register the new owner of fd %d in the loop's epoll set: %v", local, err)
+			}
+			// As the kernel holds it: it adds EPOLLERR and EPOLLHUP.
+			driverEvents, ok := epollEventsOf(t, l.epollFD, local)
+			if !ok {
+				cs.detachMu.Unlock()
+				t.Fatalf("apparatus: fd %d is not in the loop's epoll set after the ADD", local)
+			}
+
+			if handlerReturned {
+				cs.detachMu.Unlock()
+				l.handleWritable(cs)
+			} else {
+				l.handleWritable(cs)
+				cs.detachMu.Unlock()
+			}
+
+			buf := make([]byte, 64)
+			if n, err := unix.Read(rd, buf); n > 0 {
+				t.Errorf("the EPOLLOUT resume wrote %q to fd %d, which the hijack had released and another file now owns",
+					buf[:n], local)
+			} else if err != unix.EAGAIN {
+				t.Errorf("read the pipe: %v", err)
+			}
+			if got, ok := epollEventsOf(t, l.epollFD, local); !ok {
+				t.Errorf("fd %d, the new owner, is no longer in the loop's epoll set", local)
+			} else if got != driverEvents {
+				t.Errorf("the EPOLLOUT resume changed the events of fd %d, which another file now owns, "+
+					"from %#x to %#x", local, driverEvents, got)
+			}
+		})
+	}
+}
+
+// epollEventsOf reads the event mask epfd holds for fd from
+// /proc/self/fdinfo, and whether epfd holds fd at all.
+func epollEventsOf(t *testing.T, epfd, fd int) (uint32, bool) {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", epfd))
+	if err != nil {
+		t.Fatalf("read fdinfo of the epoll fd: %v", err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[0] != "tfd:" || f[2] != "events:" || f[1] != strconv.Itoa(fd) {
+			continue
+		}
+		ev, err := strconv.ParseUint(f[3], 16, 32)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		return uint32(ev), true
+	}
+	return 0, false
 }
 
 // TestTwoQueueEntriesForAHijackedConnReachNoPooledConnState: a pipelined
