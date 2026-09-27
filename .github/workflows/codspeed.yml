@@ -60,7 +60,7 @@
 # start with "BenchmarkIn" (Go's RE2 has no negative lookahead); in these
 # packages that leaves out only BenchmarkInternH2HeaderName. A new benchmark
 # named BenchmarkIn... would be left out too: rename it or widen the pattern.
-# The selection, run once each (Linux: some benchmarks are Linux-only):
+# The selection, each benchmark run once (54 leaves, on Linux and macOS):
 #   go test -run '^$' -bench '^Benchmark([^I]|I[^n])' -benchtime 1x \
 #     . ./protocol/... ./middleware ./middleware/logger
 #
@@ -102,8 +102,11 @@
 # run). A run here takes about 5 minutes of job time (275-305 s over the
 # first 15 runs). The trigger paths below are the non-test code of every
 # package the benchmark set executes (measured: the set run once with
-# -coverpkg over the whole module), the benchmark files, the root
-# go.mod/go.sum and this file. The 30 days to 2026-09-26, the busiest month
+# -coverpkg over the whole module, on Linux and macOS), the benchmark files,
+# the root go.mod/go.sum and this file. Package initialization does not
+# count: on Linux the root test binary links internal/conn and
+# internal/deferlinger through the engines, and only their init() runs, so
+# a change there does not start a run. The 30 days to 2026-09-26, the busiest month
 # on record (113 pushes to main, 268 pushes to pull requests), replayed
 # through these paths give 66 runs, about 330 minutes; loadgen's busiest
 # month is 30 runs, about 120. (The paths as first set up gave 90 runs, about
