@@ -17,6 +17,7 @@ package iouring
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -1547,4 +1548,125 @@ func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T
 	}
 	v.unregisterAndWait(t, wl)
 	p.d.unregisterAndWait(t, wl)
+}
+
+// lingeringTCPSocket returns a connected TCP socket whose close(2) blocks: its
+// peer's receive window is full and never read, so the FIN it would send
+// waits behind unsent data, and SO_LINGER makes close wait for that FIN's ACK
+// for up to linger. Draining the peer (drain) lets the close finish.
+func lingeringTCPSocket(t *testing.T, linger int) (fd int, drain func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	peer, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	_ = peer.(*net.TCPConn).SetReadBuffer(4096)
+	f, err := c.(*net.TCPConn).File() // a blocking duplicate; the net.Conn is done with
+	_ = c.Close()
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	fd, err = unix.Dup(int(f.Fd()))
+	_ = f.Close()
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatalf("set non-blocking: %v", err)
+	}
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
+	chunk := make([]byte, 64<<10)
+	for filled := false; !filled; {
+		if _, err := unix.Write(fd, chunk); errors.Is(err, unix.EAGAIN) {
+			filled = true
+		} else if err != nil {
+			t.Fatalf("fill the send path: %v", err)
+		}
+	}
+	if err := unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: int32(linger)}); err != nil {
+		t.Fatalf("SO_LINGER: %v", err)
+	}
+	drain = func() {
+		go func() { _, _ = io.Copy(io.Discard, peer) }()
+	}
+	return fd, drain
+}
+
+// retire closes the engine's descriptor, and close(2) can block: with
+// SO_LINGER set, until the peer acknowledges the FIN, for up to the linger
+// time. retire used to close under dc.mu, which UnregisterConn and Write take
+// on the driver's goroutines, so those calls blocked for as long (review of
+// #696). retire now clears opFDOpen under the lock and closes after it.
+//
+// The descriptor leaves the process's table when close(2) starts, and a
+// lingering close then waits before the syscall returns. So once the number
+// no longer names the socket, retire is inside close, and dc.mu must be free.
+func TestDriverRetireClosesOutsideItsLock(t *testing.T) {
+	const linger = 10 // seconds: the longest a broken retire holds the test
+	fd, drain := lingeringTCPSocket(t, linger)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		t.Fatalf("fstat: %v", err)
+	}
+	dc := &driverConn{fd: fd, opFD: fd, opFDOpen: true}
+
+	retired := make(chan struct{})
+	go func() {
+		dc.retire()
+		close(retired)
+	}()
+	defer func() {
+		drain()
+		select {
+		case <-retired:
+		case <-time.After(2 * linger * time.Second):
+			t.Error("retire never returned")
+		}
+	}()
+
+	// Wait for close(2) to start: the number is released, or reissued to
+	// another file.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		var now unix.Stat_t
+		if err := unix.Fstat(fd, &now); err != nil || now.Ino != st.Ino || now.Dev != st.Dev {
+			break
+		}
+		select {
+		case <-retired:
+			t.Fatal("apparatus: retire returned before the close could be seen in progress: the close did not linger")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retire never started closing the engine's descriptor")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-retired:
+		t.Fatal("apparatus: the close did not linger")
+	default:
+	}
+	// The close lingers for up to 10 s; a lock free within 2 s is not held
+	// across it.
+	for deadline := time.Now().Add(2 * time.Second); !dc.mu.TryLock(); {
+		if time.Now().After(deadline) {
+			t.Fatalf("dc.mu is held while retire's close(2) lingers: UnregisterConn and Write block for as long")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	open, retiredFlag := dc.opFDOpen, dc.retired
+	dc.mu.Unlock()
+	if open || !retiredFlag {
+		t.Errorf("under dc.mu during the close: opFDOpen=%v retired=%v, want false and true", open, retiredFlag)
+	}
 }
