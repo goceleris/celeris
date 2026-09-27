@@ -42,7 +42,7 @@ func identityOf(t *testing.T, fd int) socketIdentity {
 	if err := unix.Fstat(fd, &st); err != nil {
 		t.Fatalf("fstat(%d): %v", fd, err)
 	}
-	return socketIdentity{uint64(st.Dev), uint64(st.Ino)}
+	return socketIdentity{st.Dev, st.Ino}
 }
 
 // stillNames reports whether fd is open and still names the file id.
@@ -51,7 +51,7 @@ func stillNames(fd int, id socketIdentity) bool {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return false
 	}
-	return uint64(st.Dev) == id.dev && uint64(st.Ino) == id.ino
+	return st.Dev == id.dev && st.Ino == id.ino
 }
 
 // lingeringDriver registers a lingering socket on w, settles its RECV, and
