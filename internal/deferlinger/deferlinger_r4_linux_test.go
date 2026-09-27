@@ -120,7 +120,8 @@ func TestPauseWarningsAreLoggedOncePerEngine(t *testing.T) {
 	var q PauseState
 	q.Begin(logger, "other")
 	if got := h.count(); got != 3 {
-		t.Errorf("a second engine's first unreadable pause logged nothing (warnings %d, want 3)", got)
+		t.Errorf("after a second engine's first unreadable pause there are %d warnings, want 3: "+
+			"one more, for that engine's first", got)
 	}
 }
 
@@ -143,27 +144,33 @@ func TestRestoreWarningLoggedOncePerEngine(t *testing.T) {
 
 // TestNotifyWakesEveryWaiter: Notify closes the channel every waiter took,
 // so two PauseAccept calls waiting on one engine both wake; a channel taken
-// after the Notify is a fresh one; a nil PauseState's Notify does nothing.
+// after the Notify is a fresh one; a wait on a closed channel returns at once
+// and counts as woken; a nil PauseState's Notify does nothing.
 func TestNotifyWakesEveryWaiter(t *testing.T) {
 	var p PauseState
 	a, b := p.Changed(), p.Changed()
 	if a != b {
 		t.Fatal("two waiters before a Notify got different channels")
 	}
-	var woke atomic.Int32
-	var wg sync.WaitGroup
-	for _, c := range []<-chan struct{}{a, b} {
-		wg.Go(func() {
-			if WaitChanged(c, time.Now().Add(5*time.Second)) {
-				woke.Add(1)
-			}
-		})
-	}
-	time.Sleep(10 * time.Millisecond)
 	p.Notify()
-	wg.Wait()
-	if woke.Load() != 2 {
-		t.Errorf("Notify woke %d of 2 waiters", woke.Load())
+	for i, c := range []<-chan struct{}{a, b} {
+		select {
+		case <-c:
+		default:
+			t.Errorf("waiter %d's channel is still open after Notify", i)
+		}
+	}
+	s0 := Snapshot()
+	t0 := time.Now()
+	if !WaitChanged(a, time.Now().Add(5*time.Second)) {
+		t.Error("a wait on a notified channel returned false")
+	}
+	if d := time.Since(t0); d > WaitRecheck/2 {
+		t.Errorf("a wait on a notified channel took %v: it did not see the notification", d)
+	}
+	if s1 := Snapshot(); s1.WaitWoken-s0.WaitWoken != 1 || s1.WaitRechecks != s0.WaitRechecks {
+		t.Errorf("a notified wait moved WaitWoken by %d and WaitRechecks by %d, want 1 and 0",
+			s1.WaitWoken-s0.WaitWoken, s1.WaitRechecks-s0.WaitRechecks)
 	}
 	c := p.Changed()
 	select {
