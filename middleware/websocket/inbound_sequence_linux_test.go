@@ -73,6 +73,8 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				testName += "/" + v.name
 			}
 			t.Run(testName, func(t *testing.T) {
+				pm716Reset()
+				pm716Start := time.Now()
 				if v.mshotEnv != "" {
 					t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", v.mshotEnv)
 					p := probe.Probe()
@@ -396,6 +398,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 				// Drain the handlers, then assert on settled counters.
 				settle()
+				pm716Report(t, "Inbound", testName, time.Since(pm716Start))
 
 				// The summary belongs AFTER settle(), not before it. Printed
 				// ahead of the drain it is a snapshot of counters the handler

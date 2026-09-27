@@ -62,6 +62,8 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	for _, kind := range engineKinds(t) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
+			pm716Reset()
+			pm716Start := time.Now()
 			var ecanceled, otherWriteErr, protoErr atomic.Int64
 			// protoErr counts every read error that is not a close, so on its
 			// own it cannot distinguish a frame the engine mis-delivered from
@@ -245,6 +247,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				}()
 			}
 			wg.Wait()
+			pm716Report(t, "PauseCancel", kind.String(), time.Since(pm716Start))
 
 			t.Logf("%s: clientMisaligned=%d framesSent=%d (if misaligned>0 the client truncated; if 0 while protocol errors>0 the engine mis-delivered)",
 				kind, clientMisaligned.Load(), framesSent.Load())

@@ -4,7 +4,44 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// ---- celeris#716 item 2 MEASUREMENT (throwaway branch tmp/b2b-716-stall; never merged) ----
+// Every contended acquisition of pausedMu is timed (exact ns, kept in a preallocated buffer), and
+// every resume callback is timed. Uncontended acquisitions only bump a counter (TryLock fast path).
+type pm716Rec struct {
+	n   atomic.Int64
+	buf []int64
+}
+
+func (h *pm716Rec) add(ns int64) {
+	if i := h.n.Add(1) - 1; i < int64(len(h.buf)) {
+		h.buf[i] = ns
+	}
+}
+
+func (h *pm716Rec) take() []int64 {
+	n := h.n.Swap(0)
+	if n > int64(len(h.buf)) {
+		n = int64(len(h.buf))
+	}
+	out := append([]int64(nil), h.buf[:n]...)
+	return out
+}
+
+var pm716 = struct {
+	reqCalls, hCalls atomic.Int64
+	engWait          pm716Rec // requestPause (engine side): wait for pausedMu, contended only
+	engResume        pm716Rec // requestPause's stale-pause re-check: r.resume() duration (engine side)
+	hWait            pm716Rec // resumeIfDrained (handler side): wait for pausedMu, contended only
+	hResume          pm716Rec // resumeIfDrained: r.resume() duration, pausedMu held (the engine waits on this)
+}{
+	engWait:   pm716Rec{buf: make([]int64, 1<<22)},
+	engResume: pm716Rec{buf: make([]int64, 1<<22)},
+	hWait:     pm716Rec{buf: make([]int64, 1<<22)},
+	hResume:   pm716Rec{buf: make([]int64, 1<<22)},
+}
 
 // chanReader is the engine-integrated read source. The engine event loop
 // calls Append with each inbound chunk; the WebSocket reader goroutine
@@ -273,7 +310,12 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 // where a cycle would show, including a callback queued behind a waiting
 // Close.
 func (r *chanReader) requestPause() {
-	r.pausedMu.Lock()
+	pm716.reqCalls.Add(1)
+	if !r.pausedMu.TryLock() {
+		t0 := time.Now()
+		r.pausedMu.Lock()
+		pm716.engWait.add(int64(time.Since(t0)))
+	}
 	// Deferred, not a plain Unlock after the callbacks: a callback that
 	// panics would skip that Unlock, and a caller that recovers the panic
 	// would leave pausedMu held for good — blocking every later resume check
@@ -305,7 +347,9 @@ func (r *chanReader) requestPause() {
 	// the channel.
 	if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {
 		r.pausedState = false
+		t0 := time.Now()
 		r.resume()
+		pm716.engResume.add(int64(time.Since(t0)))
 	}
 }
 
@@ -315,11 +359,18 @@ func (r *chanReader) requestPause() {
 // (celeris#667). The unlock is deferred for the same reason as there: a
 // resume callback that panics must not leave pausedMu held.
 func (r *chanReader) resumeIfDrained() {
-	r.pausedMu.Lock()
+	pm716.hCalls.Add(1)
+	if !r.pausedMu.TryLock() {
+		t0 := time.Now()
+		r.pausedMu.Lock()
+		pm716.hWait.add(int64(time.Since(t0)))
+	}
 	defer r.pausedMu.Unlock()
 	if r.pausedState && len(r.ch) <= r.lowWater {
 		r.pausedState = false
+		t0 := time.Now()
 		r.resume()
+		pm716.hResume.add(int64(time.Since(t0)))
 	}
 }
 

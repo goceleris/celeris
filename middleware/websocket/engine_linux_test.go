@@ -62,7 +62,7 @@ func startNativeServer(tb testing.TB, kind celeris.EngineType, cfg Config) (stri
 // survives shutdown, so EngineInfo() still answers).
 func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Config) (string, func(), *celeris.Server) {
 	tb.Helper()
-	s := celeris.New(celeris.Config{Engine: kind})
+	s := celeris.New(celeris.Config{Engine: kind, AsyncHandlers: pm716Mode() == "async"}) // MEASUREMENT celeris#716
 	s.GET("/ws", New(cfg))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
