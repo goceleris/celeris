@@ -2,6 +2,8 @@ package websocket
 
 import (
 	"io"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -300,6 +302,159 @@ func TestChanReaderSpillPublishedAfterDrain(t *testing.T) {
 				r.spillLen.Load(), len(r.ch), desired.Load())
 		}
 	})
+}
+
+// waitLockWaiter waits until some goroutine is parked acquiring a sync.Mutex
+// from inside fn (a function as a goroutine dump names it), and fails the test
+// if none is within 10 s. It reads the dump rather than sleeping, so a slow
+// host makes it wait longer, never pass early.
+func waitLockWaiter(t *testing.T, fn string) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n := runtime.Stack(buf, true)
+		if n == len(buf) {
+			buf = make([]byte, 2*len(buf))
+			continue
+		}
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			header, _, _ := strings.Cut(g, "\n")
+			if strings.Contains(header, "[sync.Mutex.Lock") && strings.Contains(g, fn) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("harness: no goroutine parked on a mutex in %s within 10 s", fn)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestChanReaderCloseKeepsChunksAppendedBeforeIt pins what next promises
+// (celeris#484): the close is reported only once nothing received before it is
+// left to deliver, also when the close lands while the handler's Read is still
+// deciding whether to block. The celeris#705 fix widened that window, and the
+// review of PR #730 found the close overtaking chunks in it.
+//
+// The engine appends and closes on one thread: its worker calls Append for each
+// chunk of a completion batch and, on the peer's FIN or an error, the error
+// handler that calls closeWith (websocket.go). So every chunk appended before
+// the close is buffered before the close can be seen. A Read that finds the
+// channel empty takes spillMu in promoteSpill before it blocks; while
+// spillChunk holds that lock the Read waits, spillChunk's retry can put the
+// chunk in the channel (or the next chunk of the batch can spill behind it),
+// and the worker can go on to close. A Read that looked at the close only after
+// promoteSpill then saw the close with those chunks still buffered and reported
+// it: the stream was cut short, and the handler got an EOF, or "unexpected
+// EOF" mid-frame.
+//
+// Each case parks the handler's Read in promoteSpill (observed in a goroutine
+// dump) with spillMu held by the test as spillChunk holds it, runs the worker's
+// steps under that lock, closes the reader, and only then unlocks. The close
+// comes before the unlock only to fix the schedule. The Read is blocked on the
+// lock until the unlock, so it observes exactly what it observes in production
+// when the worker's unlock, the rest of its batch and the close all run before
+// the woken Read is scheduled (an unlock readies the waiter; it does not run
+// it).
+//
+//   - retried-into-channel: spillChunk's retry puts the chunk in the channel
+//     the handler drained (celeris#705), and nothing is spilled.
+//   - spilled-behind-full-channel: at a capacity of 1 the retry fills the
+//     channel, and the next chunk of the batch spills behind it.
+//
+// The oracle: the Read returns the chunks, in order, and only then the close.
+func TestChanReaderCloseKeepsChunksAppendedBeforeIt(t *testing.T) {
+	cases := []struct {
+		name     string
+		capacity int
+		worker   func(r *chanReader) // the worker's steps, run with spillMu held
+		want     string
+	}{
+		{"retried-into-channel", 8, func(r *chanReader) {
+			// spillChunk('S'): nothing is spilled and the channel has the room
+			// the handler made, so the retry sends.
+			r.ch <- []byte{'S'}
+		}, "S"},
+		{"spilled-behind-full-channel", 1, func(r *chanReader) {
+			// spillChunk('x'): the retry sends and fills the channel.
+			r.ch <- []byte{'x'}
+			// spillChunk('y'), the next chunk of the batch: the retry finds the
+			// channel full, so 'y' spills.
+			r.spill = append(r.spill, []byte{'y'})
+			r.spillLen.Store(int64(len(r.spill)))
+			r.spilled.Add(1)
+		}, "xy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newChanReader(tc.capacity, 0, 0)
+			// Registered first, so it runs last: a Read still waiting is
+			// released once the unlock below has run.
+			defer r.closeWith(io.EOF)
+
+			// The engine fills the channel and the handler drains it.
+			for i := range cap(r.ch) {
+				if !r.Append([]byte{'a' + byte(i)}) {
+					t.Fatalf("harness: Append %d rejected below capacity", i)
+				}
+			}
+			buf := make([]byte, 1)
+			for i := range cap(r.ch) {
+				if n, err := r.Read(buf); n != 1 || err != nil || buf[0] != 'a'+byte(i) {
+					t.Fatalf("harness: drain read %d: n=%d err=%v byte=%q", i, n, err, buf[:n])
+				}
+			}
+
+			// The next Append found the channel full before that drain, and its
+			// spillChunk now holds spillMu. The handler's next Read finds the
+			// channel empty and waits for the lock in promoteSpill.
+			r.spillMu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					r.spillMu.Unlock()
+				}
+			}()
+			got := readAsync(r)
+			waitLockWaiter(t, "(*chanReader).promoteSpill")
+			if len(r.ch) != 0 || len(r.spill) != 0 || r.closed.Load() {
+				t.Fatalf("harness: want an empty, open reader, got depth %d spill %d closed %v",
+					len(r.ch), len(r.spill), r.closed.Load())
+			}
+
+			tc.worker(r)
+			r.closeWith(io.EOF) // the peer's FIN, after the batch
+			r.spillMu.Unlock()
+			locked = false
+
+			var out []byte
+			select {
+			case res := <-got:
+				if res.err != nil {
+					t.Fatalf("the close overtook chunks received before it: the Read returned %v with "+
+						"%d chunk(s) in the channel and %d spilled", res.err, len(r.ch), r.spillLen.Load())
+				}
+				out = append(out, res.b...)
+			case <-time.After(10 * time.Second):
+				t.Fatalf("the Read is still blocked 10 s after the unlock (depth %d, spill %d)",
+					len(r.ch), r.spillLen.Load())
+			}
+			for len(out) <= len(tc.want) {
+				n, err := r.Read(buf)
+				if err != nil {
+					if err != io.EOF {
+						t.Fatalf("after %q: Read returned %v, want the close (io.EOF)", out, err)
+					}
+					break
+				}
+				out = append(out, buf[:n]...)
+			}
+			if string(out) != tc.want {
+				t.Fatalf("stream before the close = %q, want %q", out, tc.want)
+			}
+		})
+	}
 }
 
 // TestChanReaderPauseRecheckHoldsWhileSpilled pins the spill guard of
