@@ -32,7 +32,7 @@ An engine-correctness release, driven by what the [probatorium](https://github.c
 - **Edge-triggered epoll** — per-core event loops with CPU pinning.
 - **Adaptive meta-engine** — transplants between io_uring and epoll at runtime based on telemetry.
 - **First-party database drivers** — native [`driver/postgres`](driver/postgres), [`driver/redis`](driver/redis), and [`driver/memcached`](driver/memcached) run on the celeris event loop (see [Database drivers](#database-drivers)).
-- **SIMD HTTP parser** — SSE2 (amd64) and NEON (arm64) with a generic SWAR fallback.
+- **Zero-copy HTTP/1.1 parser** — the parser returns header and body slices that alias the bytes it parses instead of copying them. On epoll and io_uring, a request that arrives whole in one read, with no body or a `Content-Length` body, and runs inline is parsed in place in the engine's read buffer; a request that spans reads, has a chunked body, or runs on an async handler is served from a per-connection buffer instead.
 - **HTTP/2 cleartext (h2c)** — full stream multiplexing, flow control, HPACK, inline handler execution, zero-alloc HEADERS fast path.
 - **Auto-detect** — protocol negotiation from the first bytes on the wire.
 - **Error-returning handlers** — `HandlerFunc` returns `error`; structured `*HTTPError` carries status codes.
