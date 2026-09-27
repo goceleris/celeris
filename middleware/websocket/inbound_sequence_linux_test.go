@@ -246,7 +246,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 								continue
 							}
 							s.phase.Store(2)
-							if err := c.WriteMessage(mt, msg); err != nil {
+							if err := inj611Echo(cIdx, connEchoed[cIdx].Load(), func() error { return c.WriteMessage(mt, msg) }); err != nil {
 								// The handler's own echo failure used to be
 								// swallowed here. A client reporting a truncated
 								// stream could not be told apart from a server
@@ -642,4 +642,12 @@ func isParseErr(err error) bool {
 		errors.Is(err, ErrInvalidUTF8) ||
 		errors.Is(err, ErrFrameTooLarge) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// MUTANT inj611 (celeris#611 control): connection 0's echo write fails once it has echoed 200 frames.
+func inj611Echo(idx int, echoed int64, write func() error) error {
+	if idx == 0 && echoed >= 200 {
+		return errors.New("inj611: injected echo write failure")
+	}
+	return write()
 }
