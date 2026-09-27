@@ -42,9 +42,13 @@ const closeHandshakeSlow = 10 * time.Second
 //
 // The client finishes its writes and waits for the close on progress, reading
 // while it waits, like TestBackpressurePauseDoesNotCancelInflightSend's
-// (backpressure_oracle_linux_test.go, celeris#633). A write timeout during the
-// flood is the backpressure the test creates, not a failure: it used to take
-// the connection out of the frame-count verdict.
+// (backpressure_oracle_linux_test.go, celeris#633), and the rig's watch fails
+// a connection the engine stops reading (WSO-STALL, the celeris#607 class). A
+// write timeout during the flood is the backpressure the test creates, not a
+// failure: it ends that burst, the next one resumes at the same wire
+// position, and the connection stays in every verdict (it used to be taken
+// out of the frame count). floodDeadlines on the verdict line counts those
+// bursts, so a run shows whether it exercised that path at all.
 func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 	conns := envInt("WS484_CONNS", 96)
 	// bpBuf is the chanReader backpressure buffer capacity (default 256, matching the
@@ -111,8 +115,11 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					detailMu.Unlock()
 				}
 
-				rig := newWSORig()
+				rig := newWSORig(t)
 				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent, echoErr, slowClose, readAfterEchoErr atomic.Int64
+				// floodDeadlines: bursts a write deadline ended (the burst's
+				// backpressure); floodDeadlineConns: connections with one.
+				var floodDeadlines, floodDeadlineConns atomic.Int64
 				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
 				// An RST is NOT a clean close (celeris#530). Linux emits one
 				// when a socket is closed with unread data still in its
@@ -302,6 +309,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 				hostPort := strings.TrimSuffix(strings.TrimPrefix(addr, "ws://"), "/ws")
 				rig.setServer(hostPort)
+				stopWatch := rig.watch()
 				dialer := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
 					var serr error
 					_ = rc.Control(func(fd uintptr) { serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 32<<10) })
@@ -323,7 +331,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						cl := rig.client(c)
 						connPort[connID].Store(int64(cl.port))
 						defer rig.closeClient(cl, c)
-						if err := wsHandshakePath(c, hostPort, cl.path()); err != nil {
+						if err := cl.handshake(c, hostPort); err != nil {
 							hsFail.Add(1)
 							clientFailed[connID].Store(true)
 							return
@@ -348,6 +356,7 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 
 						var seq uint64
 						cur, off := encode(0), 0
+						deadlines := 0
 						for b := 0; b < bursts; b++ {
 							budget := perBurst * (6 + plen)
 							for budget > 0 {
@@ -368,6 +377,8 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 										// connection, taking exactly the
 										// backpressured connections out of
 										// the frame-count verdict.
+										deadlines++
+										floodDeadlines.Add(1)
 										break
 									}
 									clientFailed[connID].Store(true)
@@ -378,7 +389,10 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 							}
 							time.Sleep(200 * time.Millisecond)
 						}
-						cl.mark("flood end seq=%d off=%d", seq, off)
+						if deadlines > 0 {
+							floodDeadlineConns.Add(1)
+						}
+						cl.mark("flood end seq=%d off=%d burstsEndedByDeadline=%d", seq, off, deadlines)
 						cl.sample(c, "flood end")
 						buf := make([]byte, 64<<10)
 						if off > 0 {
@@ -421,8 +435,9 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 						// (celeris#566).
 						//
 						// The wait gives up only after wsoCloseIdle with no
-						// byte from the server (re-armed by every byte), or at
-						// wsoWaitCap, so a genuine hang is still what fails,
+						// byte from the server (re-armed by every byte), at
+						// wsoWaitCap, or at the rig's -timeout budget, so a
+						// genuine hang is still what fails,
 						// and the latency is recorded so a regression shows up
 						// as a number rather than as a boolean that silently
 						// starts tripping.
@@ -432,19 +447,26 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 							note("conn %d: server closed %v after the client's Close (%s)",
 								connID, r.dur.Round(time.Millisecond), r)
 						}
+						// A connection that did not close cleanly fails below with
+						// its record, and leaves the frame count: frames still in
+						// the client's own send queue when it gave up, or thrown
+						// away with a reset, were never the engine's to deliver.
 						switch r.outcome {
 						case "eof":
 							closedOK.Add(1)
 						case "rst":
+							clientFailed[connID].Store(true)
 							clientRST.Add(1)
 							cl.giveUp(t, c, testName, "was RESET instead of closed: "+r.String())
 						default:
+							clientFailed[connID].Store(true)
 							closeTimeout.Add(1)
 							cl.giveUp(t, c, testName, "gave up waiting for the server's close: "+r.String())
 						}
 					}()
 				}
 				wg.Wait()
+				stalls := stopWatch()
 
 				if dialFail.Load()+hsFail.Load() > 0 {
 					t.Fatalf("environment: %d dial/handshake failures", dialFail.Load()+hsFail.Load())
@@ -460,19 +482,20 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				// whose summary read parseErr=0 went on to fail the parse-error
 				// assertion. Anyone comparing two builds by grepping this line
 				// is reading stale numbers.
-				errsBefore, errsAfter := rig.serverErrs()
-				var echoBefore int64
-				for _, e := range errsBefore {
+				judged, excused := rig.serverErrs()
+				var echoJudged int64
+				for _, e := range judged {
 					if e.kind == "write" {
-						echoBefore++
+						echoJudged++
 					}
 				}
-				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d clientRST=%d serverRST=%d closeTimeout=%d dialFail=%d hsFail=%d echoErrBeforeClientClose=%d readAfterEchoErr=%d serverErrsAfterClientClose=%d",
+				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d clientRST=%d serverRST=%d closeTimeout=%d dialFail=%d hsFail=%d echoErrJudged=%d readAfterEchoErr=%d serverErrsExcused=%d floodDeadlines=%d floodDeadlineConns=%d recvStalls=%d",
 					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), clientRST.Load(), serverRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load(),
-					echoBefore, readAfterEchoErr.Load(), len(errsAfter))
+					echoJudged, readAfterEchoErr.Load(), len(excused), floodDeadlines.Load(), floodDeadlineConns.Load(), len(stalls))
 				t.Logf("%s: %s", testName, rig.waitStats())
-				for _, e := range errsAfter {
-					t.Logf("%s: not judged, after its client's close: %s", testName, e.line)
+				t.Logf("%s: %s", testName, rig.longestStretch())
+				for _, e := range excused {
+					t.Logf("%s: not judged, its client gave up: %s", testName, e.line)
 				}
 
 				detailMu.Lock()
@@ -501,6 +524,9 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 					t.Logf("%s: RECVARM bp=%d resumeWhileCancelPending=%d resumeWhileRecvInFlight=%d armDeclined=%d doubleArmed=%d cqeUnaccounted=%d parseErr=%d",
 						testName, bpBuf, m.RecvResumeWhileCancelPending, m.RecvResumeWhileRecvInFlight, m.RecvArmDeclined,
 						m.RecvDoubleArmed, m.RecvCQEUnaccounted, parseErr.Load())
+					t.Logf("%s: LINKBLOCK arms=%d blockedTotalMs=%d blockedMaxMs=%d",
+						testName, m.RecvLinkedArms, m.RecvLinkedBlockedNanos/1e6, m.RecvLinkedBlockedMaxNanos/1e6)
+					wsoAssertNoLinkedRecv(t, testName, m.RecvLinkedArms, m.RecvLinkedBlockedMaxNanos)
 					if m.RecvDoubleArmed != 0 {
 						t.Errorf("%s: RecvDoubleArmed=%d — a second recv SQE was placed on a connection that already had one (celeris#484)",
 							testName, m.RecvDoubleArmed)
@@ -519,24 +545,27 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				// celeris#611: every mismatched connection in 34 failing runs
 				// was also an echo-write failure, logged and never judged, so
 				// three investigations went looking at the read path. An echo
-				// failure before its own client closed is the engine closing
-				// or failing a connection it should have kept: judged here,
-				// with its error and its connection's address. After the
-				// client's close it is that client's teardown (printed above).
-				if len(errsBefore) != 0 {
-					for _, e := range errsBefore {
+				// failure is the engine closing or failing a connection it
+				// should have kept: judged here, with its error and its
+				// connection's address, unless its client gave up on the
+				// connection (which fails below) and it came after that
+				// client closed: then it is that client's teardown (printed
+				// above).
+				if len(judged) != 0 {
+					for _, e := range judged {
 						t.Logf("%s: %s", testName, e.line)
 					}
-					t.Errorf("%s: %d handler error(s) before their own client closed (%d echo write, %d read): the engine "+
-						"failed or tore down a connection it should have kept alive; each is listed above with its error and address",
-						testName, len(errsBefore), echoBefore, int64(len(errsBefore))-echoBefore)
+					t.Errorf("%s: %d handler error(s) (%d echo write, %d read) on connections whose client did not give up, or "+
+						"before it did: the engine failed or tore down a connection it should have kept alive; each is listed "+
+						"above with its error and address", testName, len(judged), echoJudged, int64(len(judged))-echoJudged)
 				}
+				wsoAssertNoStalls(t, testName, stalls)
 				// A connection that never finished its writes was counted
 				// and not judged, like the sibling oracle's (celeris#623).
 				if n := clientCloseFail.Load(); n != 0 {
 					t.Errorf("%s: %d client(s) never finished writing: a flood write failed, or nothing moved for %v "+
-						"(or the wait ran past %v) finishing the last frame or the Close frame; each WSO-GIVEUP "+
-						"record above has the connection's timeline from both ends", testName, n, wsoWriteIdle, wsoWaitCap)
+						"(or the wait ran past %v, or %s) finishing the last frame or the Close frame; each WSO-GIVEUP "+
+						"record above has the connection's timeline from both ends", testName, n, wsoWriteIdle, wsoWaitCap, rig.budgetNote())
 				}
 				if n := clientRST.Load(); n != 0 {
 					t.Errorf("%s: %d connection(s) were RESET rather than closed cleanly after the client's Close "+
@@ -550,8 +579,8 @@ func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
 				}
 				if closeTimeout.Load() != 0 {
 					t.Errorf("%s: %d connection(s) timed out waiting for Close handshake: no byte and no close for %v "+
-						"(or the wait ran past %v); each WSO-GIVEUP record above has the state of both ends",
-						testName, closeTimeout.Load(), wsoCloseIdle, wsoWaitCap)
+						"(or the wait ran past %v, or %s); each WSO-GIVEUP record above has the state of both ends",
+						testName, closeTimeout.Load(), wsoCloseIdle, wsoWaitCap, rig.budgetNote())
 				}
 				if bpBuf >= 256 && overflowErr.Load() != 0 {
 					t.Errorf("%s: %d channel overflow error(s) observed at buffer capacity %d", testName, overflowErr.Load(), bpBuf)
