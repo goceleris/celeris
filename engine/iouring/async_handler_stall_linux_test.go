@@ -288,6 +288,117 @@ func TestIouringDirtyPassDoesNotWaitForARunningAsyncHandler(t *testing.T) {
 	w.asyncWG.Wait()
 }
 
+// TestIouringHandBackAfterAHandOffArmsNothing: the dirty pass's hand-back
+// (relinkOwed) is enqueued at the top of the dispatch loop, and in the same
+// asyncInMu section the park boundary can claim an io_uring->epoll hand-off
+// (#383 reverse) and enqueue the conn a second time. The drain hands the conn
+// off on one entry: handOff clears its slot and closes its fd. The other entry
+// must not put it back on the dirty list, where the pass would arm the recv
+// the conn was owed on the closed fd number, which a new socket can hold by
+// then, and take that socket's bytes (the celeris#527/#657 fd-lifetime class;
+// found in review of PR #745).
+//
+// Arm dirty_at_handoff is main's flow and a control: the pass never met the
+// handler, so the conn is still on the dirty list when handOff unlinks it
+// (celeris#527's removeDirty). Arm relink_owed is celeris#704's: the pass gave
+// the conn up while its handler held detachMu.
+func TestIouringHandBackAfterAHandOffArmsNothing(t *testing.T) {
+	for _, arm := range []string{"dirty_at_handoff", "relink_owed"} {
+		t.Run(arm, func(t *testing.T) {
+			rig := newStallRig704(t)
+			w, cs, oldFD := rig.w, rig.cs, rig.local
+			w.asyncCancelFlags = true // a worker that can reap: the async hand-off is offered
+			tgt := &recordingTarget{}
+
+			// A recv arm the SQ ring dropped for this promoted conn.
+			cs.needsRecv = true
+			w.markDirty(cs)
+			release := holdAsHandler704(t, cs, true)
+			if arm == "relink_owed" {
+				w.flushDirty() // meets the running handler: gives the conn up
+				if !relinkOwed704(cs) || cs.dirty {
+					t.Fatalf("apparatus: the pass did not give the conn up (relinkOwed=%v dirty=%v)",
+						relinkOwed704(cs), cs.dirty)
+				}
+			}
+			// An io_uring->epoll drain is active when the handler returns.
+			w.transplant.Store(&transplantTargetHolder{target: tgt})
+			release()
+
+			// The REAL dispatch loop after the handler: its loop top, then its
+			// park boundary, which claims the hand-off and exits.
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				exitDispatch704(w, cs)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("apparatus: the dispatch goroutine parked instead of claiming the hand-off")
+			}
+			w.drainDetachQueue()
+			if tgt.adopted.Load() != 1 || w.conns[oldFD] != nil || fdOpen704(oldFD) {
+				t.Fatalf("apparatus: no hand-off (adopted=%d slot=%p fd_open=%v)",
+					tgt.adopted.Load(), w.conns[oldFD], fdOpen704(oldFD))
+			}
+			t.Logf("celeris#704 HANDOFF arm=%s after_drain dirty=%v needsRecv=%v", arm, cs.dirty, cs.needsRecv)
+			if cs.dirty {
+				t.Errorf("a queue entry put the handed-off conn back on the dirty list")
+			}
+
+			// A new socket takes the number the hand-off closed, as the next
+			// accept would (dup3 onto it, so the test does not depend on which
+			// free number the kernel picks).
+			pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+			if err != nil {
+				t.Fatalf("socketpair: %v", err)
+			}
+			stranger, strangerPeer := pair[0], pair[1]
+			if stranger != oldFD {
+				if err := unix.Dup3(pair[0], oldFD, 0); err != nil {
+					t.Fatalf("dup3: %v", err)
+				}
+				_ = unix.Close(pair[0])
+				stranger = oldFD
+			}
+			t.Cleanup(func() { _ = unix.Close(stranger); _ = unix.Close(strangerPeer) })
+
+			w.flushDirty()
+			if _, err := w.ring.Submit(); err != nil {
+				t.Fatalf("submit: %v", err)
+			}
+			if _, err := unix.Write(strangerPeer, []byte("STRANGER")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if cs.recvArmed {
+				// Show what the stray arm does: wait for its completion.
+				if err := w.ring.WaitCQETimeout(2 * time.Second); err == nil {
+					head, tail := w.ring.BeginCQ()
+					for h := head; h != tail; h++ {
+						c := w.ring.cqeAt(h)
+						t.Logf("celeris#704 HANDOFF arm=%s cqe op=%#x fd=%d res=%d",
+							arm, decodeOp(c.UserData)>>56, decodeFD(c.UserData), c.Res)
+					}
+					w.ring.EndCQ(tail)
+				}
+			}
+			var b [16]byte
+			n, _, rerr := unix.Recvfrom(stranger, b[:], unix.MSG_DONTWAIT)
+			got := ""
+			if n > 0 {
+				got = string(b[:n])
+			}
+			t.Logf("celeris#704 HANDOFF arm=%s stray_arm=%v stranger_read=%q err=%v", arm, cs.recvArmed, got, rerr)
+			if cs.recvArmed || got != "STRANGER" {
+				t.Errorf("the handed-off conn's owed recv was armed on fd %d, which another socket now "+
+					"holds (stray_arm=%v); that socket read %q (err %v), want \"STRANGER\"",
+					oldFD, cs.recvArmed, got, rerr)
+			}
+		})
+	}
+}
+
 // TestIouringCloseStillWaitsForABoundedHolder is the negative control for the
 // unit arms. The dispatch goroutine is PARKED, so whoever holds detachMu is a
 // guarded writeFn in the middle of one write, a hold bounded by a syscall,
