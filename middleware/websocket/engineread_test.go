@@ -928,3 +928,61 @@ func TestChanReaderCallbackPanicReleasesPausedMu(t *testing.T) {
 		})
 	}
 }
+
+// TestChanReaderSetPauserOrderedWithAppend pins that installing the engine
+// callbacks is ordered with the engine worker's reads of them.
+//
+// tryEngineUpgrade registers Append as the data sink before Detach, and calls
+// SetPauser only after Detach and after the 101 has been written — on the
+// goroutine running the upgrade, which on an async-mode connection is not the
+// engine worker. From the moment the 101 is on the wire the worker may be
+// appending, and an Append that crosses highWater reads r.pause in
+// requestPause (and, since celeris#672, r.resume in its re-check). Nothing
+// else orders those reads with SetPauser's writes: the only lock the upgrade
+// shares with the worker, the engine's detachQMu, is released before
+// SetPauser runs. The race detector reports it whenever both sides run.
+//
+// The two sides below are started together and never synchronise with each
+// other, so on a build where SetPauser and requestPause do not share a lock
+// the race detector sees the conflicting accesses in either order. Without
+// -race there is nothing to observe, so the test skips rather than pass
+// vacuously.
+func TestChanReaderSetPauserOrderedWithAppend(t *testing.T) {
+	if !raceEnabled {
+		t.Skip("observable only under -race: the defect is an unsynchronised access, not a wrong value")
+	}
+	for range 50 {
+		r := newChanReader(4, 0, 0) // highWater 3, lowWater 1
+		var pauses, resumes atomic.Int64
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { // the upgrade goroutine, after Detach and the 101
+			defer wg.Done()
+			<-start
+			r.SetPauser(func() { pauses.Add(1) }, func() { resumes.Add(1) })
+		}()
+		go func() { // the engine worker, delivering the peer's first frames
+			defer wg.Done()
+			<-start
+			for i := range r.highWater {
+				if !r.Append([]byte{byte('a' + i)}) {
+					t.Errorf("harness: Append %d rejected below capacity", i)
+					return
+				}
+			}
+		}()
+		close(start)
+		wg.Wait()
+
+		// Anti-vacuity: the crossing append reached requestPause, which is
+		// where the callbacks are read. At most one pause, and only if
+		// SetPauser won; never a resume, since the buffer is above lowWater.
+		if got := len(r.ch); got != r.highWater {
+			t.Fatalf("harness: depth %d after %d appends, want %d", got, r.highWater, r.highWater)
+		}
+		if p, rs := pauses.Load(), resumes.Load(); p > 1 || rs != 0 {
+			t.Fatalf("harness: pauses=%d resumes=%d, want at most 1 pause and no resume", p, rs)
+		}
+	}
+}
