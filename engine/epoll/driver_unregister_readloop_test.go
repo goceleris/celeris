@@ -61,10 +61,10 @@ func takeNumber710(t *testing.T, fd int, nonblock bool) (x0, x1 int) {
 // arms the descriptor (EPOLL_CTL_ADD) before it sets hasDriverConns, so on a
 // loop with no driver conn yet, a worker that takes the conn's first
 // (edge-triggered) event in between skips the driver lookup and drops the
-// event, and onRecv never runs. That is a separate defect, measured and filed
-// on its own; the keeper keeps hasDriverConns set, so these tests do not
-// depend on it: a racing worker then waits in lookupDriver for RegisterConn
-// to release driverMu, after the conn is in the map.
+// event, and onRecv never runs. That is a separate defect (celeris#770).
+// The keeper keeps hasDriverConns set, so these tests do not depend on it: a
+// racing worker waits in lookupDriver until RegisterConn releases driverMu,
+// with the conn in the map.
 //
 // stop runs from a Cleanup, not a defer: the tests release a parked worker
 // from a Cleanup registered later, which runs first, so stop never waits on
