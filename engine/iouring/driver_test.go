@@ -61,13 +61,19 @@ func startTestEngine(t *testing.T) (*Engine, func()) {
 			t.Skipf("iouring engine unavailable: %v", err)
 		}
 
+		// Each attempt's goroutine gets its own engine and done channel.
+		// Sharing the outer variables raced: a failed attempt's goroutine
+		// closed done after its Listen error had been received, with nothing
+		// ordering that read before the next attempt's write, which -race
+		// reported whenever a start was retried (celeris#662 review round 4).
 		var ctx context.Context
 		ctx, cancel = context.WithCancel(context.Background())
-		done = make(chan struct{})
+		eng, d := e, make(chan struct{})
+		done = d
 		listenErr := make(chan error, 1)
 		go func() {
-			listenErr <- e.Listen(ctx)
-			close(done)
+			listenErr <- eng.Listen(ctx)
+			close(d)
 		}()
 
 		// Wait until the engine has at least one worker ready. On shared
