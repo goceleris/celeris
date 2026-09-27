@@ -476,6 +476,9 @@ type arrivalsResultL662 struct {
 	lostEarly                 []time.Duration // dial-done offsets from the pause call
 	slowAccepts               []string
 	checkedAccepts            int
+	// maxAccept is the longest dial-to-accept time among the checked
+	// arrivals: the margin under lingerAcceptBoundL662.
+	maxAccept time.Duration
 }
 
 // runLingerArrivalsL662 is the rig of T2, T3 and N2. Eight silent clients
@@ -494,6 +497,13 @@ func runLingerArrivalsL662(t *testing.T) arrivalsResultL662 {
 	var arr []arrivalL662
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	// stopDialer ends the dialer and waits for it. The normal path calls it
+	// below; t.Cleanup calls it after an early t.Fatal too, so the dialer
+	// never outlives the test and never dials a port a later test may reuse.
+	stopDialer := sync.OnceFunc(func() {
+		close(stop)
+		wg.Wait()
+	})
 	wg.Go(func() {
 		tick := time.NewTicker(lingerArrivalEveryL662)
 		defer tick.Stop()
@@ -514,6 +524,7 @@ func runLingerArrivalsL662(t *testing.T) arrivalsResultL662 {
 		}
 	})
 	t.Cleanup(func() {
+		stopDialer()
 		mu.Lock()
 		defer mu.Unlock()
 		for _, a := range arr {
@@ -530,6 +541,11 @@ func runLingerArrivalsL662(t *testing.T) arrivalsResultL662 {
 	cleared := make(chan time.Time, 1)
 	samplerStop := make(chan struct{})
 	var swg sync.WaitGroup
+	stopSampler := sync.OnceFunc(func() {
+		close(samplerStop)
+		swg.Wait()
+	})
+	t.Cleanup(stopSampler)
 	swg.Go(func() {
 		for {
 			select {
@@ -563,15 +579,13 @@ func runLingerArrivalsL662(t *testing.T) arrivalsResultL662 {
 		t.Fatal("a listener never closed after PauseAccept")
 	}
 	res.tClosed = time.Now()
-	close(samplerStop)
-	swg.Wait()
+	stopSampler()
 	select {
 	case res.tCleared = <-cleared:
 	default:
 	}
 	time.Sleep(60 * time.Millisecond)
-	close(stop)
-	wg.Wait()
+	stopDialer()
 
 	mu.Lock()
 	all := append([]arrivalL662(nil), arr...)
@@ -594,6 +608,9 @@ func runLingerArrivalsL662(t *testing.T) arrivalsResultL662 {
 		}
 		res.checkedAccepts++
 		v, ok := r.accepted.Load(a.local)
+		if ok {
+			res.maxAccept = max(res.maxAccept, v.(time.Time).Sub(a.done))
+		}
 		switch {
 		case !ok:
 			res.slowAccepts = append(res.slowAccepts, a.local+": never accepted")
@@ -607,11 +624,11 @@ func runLingerArrivalsL662(t *testing.T) arrivalsResultL662 {
 		clearOff = res.tCleared.Sub(res.tPause)
 	}
 	t.Logf("workers=%d pre=%v arrivalsConnected=%d clearSeenAt=+%v closeAt=+%v outcomes=%v "+
-		"lostEarly=%d %v acceptChecked=%d slow=%d deferlinger=%+v",
+		"lostEarly=%d %v acceptChecked=%d slow=%d maxAccept=%v (bound %v) deferlinger=%+v",
 		r.workers, res.preTally, res.connected, clearOff.Round(time.Millisecond),
 		res.tClosed.Sub(res.tPause).Round(time.Millisecond), tallyL662(out[len(pre):]),
 		len(res.lostEarly), res.lostEarly, res.checkedAccepts, len(res.slowAccepts),
-		deferlinger.Snapshot())
+		res.maxAccept.Round(10*time.Microsecond), lingerAcceptBoundL662, deferlinger.Snapshot())
 	if res.preTally["200"] != len(pre) {
 		t.Errorf("clients connected before the pause: served %d of %d (%v)",
 			res.preTally["200"], len(pre), res.preTally)

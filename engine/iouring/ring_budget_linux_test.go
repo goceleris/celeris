@@ -3,8 +3,10 @@
 package iouring
 
 import (
+	"context"
+	"errors"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,23 +66,31 @@ func isRingENOMEM(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "cannot allocate memory")
 }
 
-var (
-	ioUringUsableOnce sync.Once
-	ioUringUsable     bool
-)
+// ioUringUsable caches a positive answer of ioUringUsableHere only.
+var ioUringUsable atomic.Bool
 
 // ioUringUsableHere reports whether this process can create an io_uring
 // instance at all: a 4-entry ring, two pages. False means the environment has
 // no usable io_uring (seccomp, io_uring_disabled, an old kernel), which is a
-// legitimate reason to skip.
+// legitimate reason to skip. A ring ENOMEM is NOT that: io_uring works and
+// the memlock budget is held, which is the failure skipUnlessIOUringUnusable
+// exists to report. It used to cache its first answer in a sync.Once, so a
+// probe that met a transient ENOMEM turned every later budget failure in the
+// process into a skip (celeris#662 review). Only "usable" is cached now; a
+// negative answer is probed again next time.
 func ioUringUsableHere() bool {
-	ioUringUsableOnce.Do(func() {
-		if r, err := NewRing(4, 0, 0); err == nil {
-			_ = r.Close()
-			ioUringUsable = true
-		}
-	})
-	return ioUringUsable
+	if ioUringUsable.Load() {
+		return true
+	}
+	r, err := NewRing(4, 0, 0)
+	if err == nil {
+		_ = r.Close()
+	}
+	if err == nil || isRingENOMEM(err) {
+		ioUringUsable.Store(true)
+		return true
+	}
+	return false
 }
 
 // retryRingENOMEM runs start until it returns something other than a ring
@@ -120,4 +130,60 @@ func skipUnlessIOUringUnusable(t *testing.T, err error) {
 			"memlock budget is held by something still running", ringUnchargeBound, err)
 	}
 	t.Skipf("io_uring unavailable on this runner: %v", err)
+}
+
+// errNoBind662 is a Listen that neither failed nor bound with workers in time.
+var errNoBind662 = errors.New("engine did not bind with workers within 10s")
+
+// startRingRetried662 builds an engine with build and runs its Listen until it
+// has bound with workers. A start that failed only on ring ENOMEM is retried
+// (retryRingENOMEM): at a low RLIMIT_MEMLOCK the kernel may not have
+// uncharged the rings of the engines the tests before this one stopped. Any
+// other failure is judged by skipOrFail656, as the rigs judged it before; a
+// Listen that neither failed nor bound fails the test. It returns the running
+// engine, its cancel, and a channel that receives Listen's result.
+func startRingRetried662(t *testing.T, build func() (*Engine, error)) (*Engine, context.CancelFunc, <-chan error) {
+	t.Helper()
+	var (
+		e      *Engine
+		cancel context.CancelFunc
+		done   chan error
+	)
+	waited, tries, err := retryRingENOMEM(func() error {
+		var berr error
+		if e, berr = build(); berr != nil {
+			return berr
+		}
+		var ctx context.Context
+		ctx, cancel = context.WithCancel(context.Background())
+		done = make(chan error, 1)
+		go func() { done <- e.Listen(ctx) }()
+		for dl := time.Now().Add(10 * time.Second); time.Now().Before(dl); {
+			if e.Addr() != nil && e.NumWorkers() > 0 {
+				return nil
+			}
+			select {
+			case lerr := <-done:
+				cancel()
+				if lerr == nil {
+					lerr = errors.New("Listen returned nil before binding")
+				}
+				return lerr
+			default:
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+		return errNoBind662
+	})
+	if tries > 1 {
+		t.Logf("engine start retried on ring ENOMEM: %d tries over %v", tries, waited.Round(time.Millisecond))
+	}
+	switch {
+	case errors.Is(err, errNoBind662):
+		t.Fatal(err)
+	case err != nil:
+		skipOrFail656(t, "io_uring engine did not start here: %v", err)
+	}
+	return e, cancel, done
 }

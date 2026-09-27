@@ -142,62 +142,39 @@ func runPauseIdle662(t *testing.T, pause, disableDefer bool) {
 	_ = ln.Close()
 
 	var connects, disconnects atomic.Int64
-	e, err := New(resource.Config{
-		Addr:      addr,
-		Protocol:  engine.HTTP1,
-		Resources: resource.Resources{Workers: 2}, // the engine refuses fewer
-		// The fix under test (celeris#662), and the arm selector. With it
-		// clear the kernel keeps the idle connections out of the accept queue,
-		// and the pause drain -- which can only see that queue -- never gets
-		// the chance to serve them.
-		DisableDeferAccept: disableDefer,
-		Logger:             slog.New(slog.DiscardHandler),
-		OnConnect:          func(string) { connects.Add(1) },
-		OnDisconnect:       func(string) { disconnects.Add(1) },
-	}, idleRespHandler662{})
-	if err != nil {
-		// NOT a silent skip. The CI step that runs the celeris#662 tests sets
-		// CELERIS_REQUIRE_IOURING_WORKERS=1, which turns this into a failure
-		// -- the same guard celeris#656 added after an unguarded skip let a
-		// listen-socket leak ship with no cover at all.
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Listen(ctx) }()
+	// A start that fails is NOT a silent skip. The CI step that runs the
+	// celeris#662 tests sets CELERIS_REQUIRE_IOURING_WORKERS=1, which turns it
+	// into a failure (skipOrFail656) -- the same guard celeris#656 added after
+	// an unguarded skip let a listen-socket leak ship with no cover at all. A
+	// start that failed only on ring ENOMEM is retried first.
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		return New(resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2}, // the engine refuses fewer
+			// The fix under test (celeris#662), and the arm selector. With it
+			// clear the kernel keeps the idle connections out of the accept
+			// queue, and the pause drain -- which can only see that queue --
+			// never gets the chance to serve them.
+			DisableDeferAccept: disableDefer,
+			Logger:             slog.New(slog.DiscardHandler),
+			OnConnect:          func(string) { connects.Add(1) },
+			OnDisconnect:       func(string) { disconnects.Add(1) },
+		}, idleRespHandler662{})
+	})
 
 	var clients []net.Conn
-	stopped := false
 	t.Cleanup(func() {
 		for _, c := range clients {
 			_ = c.Close()
 		}
 		cancel()
-		if stopped {
-			return
-		}
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
 			t.Error("engine did not stop within 10s")
 		}
 	})
-
-	for dl := time.Now().Add(10 * time.Second); time.Now().Before(dl); {
-		if e.Addr() != nil && e.NumWorkers() > 0 {
-			break
-		}
-		select {
-		case lerr := <-done:
-			stopped = true
-			skipOrFail656(t, "io_uring Listen failed here: %v", lerr)
-		default:
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if e.Addr() == nil || e.NumWorkers() == 0 {
-		t.Fatal("engine did not bind with workers")
-	}
 	// Under a low RLIMIT_MEMLOCK capWorkersToMemlock starts fewer than the two
 	// requested; the count is logged with every result below.
 	ws := workers662(e)

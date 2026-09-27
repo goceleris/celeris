@@ -123,22 +123,19 @@ func startLingerAsyncL674(t *testing.T) *lingerRigL662 {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 	accepted := &sync.Map{}
-	e, err := New(resource.Config{
-		Addr:          addr,
-		Protocol:      engine.HTTP1,
-		Resources:     resource.Resources{Workers: 2},
-		Logger:        slog.New(slog.DiscardHandler),
-		AsyncHandlers: true,
-		OnConnect:     func(ra string) { accepted.LoadOrStore(ra, time.Now()) },
-	}, asyncRespHandler674{})
-	if err != nil {
-		skipOrFail656(t, "iouring engine unavailable: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		return New(resource.Config{
+			Addr:          addr,
+			Protocol:      engine.HTTP1,
+			Resources:     resource.Resources{Workers: 2},
+			Logger:        slog.New(slog.DiscardHandler),
+			AsyncHandlers: true,
+			OnConnect:     func(ra string) { accepted.LoadOrStore(ra, time.Now()) },
+		}, asyncRespHandler674{})
+	})
 	exited := make(chan struct{})
-	var listenErr error
 	go func() {
-		listenErr = e.Listen(ctx)
+		<-done
 		close(exited)
 	}()
 	t.Cleanup(func() {
@@ -149,20 +146,6 @@ func startLingerAsyncL674(t *testing.T) *lingerRigL662 {
 			t.Error("engine did not stop within 10s")
 		}
 	})
-	for dl := time.Now().Add(10 * time.Second); time.Now().Before(dl); {
-		if e.Addr() != nil && e.NumWorkers() > 0 {
-			break
-		}
-		select {
-		case <-exited:
-			skipOrFail656(t, "io_uring Listen failed here: %v", listenErr)
-		default:
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if e.Addr() == nil || e.NumWorkers() == 0 {
-		t.Fatal("engine did not bind with workers")
-	}
 	ws := workers662(e)
 	return &lingerRigL662{
 		e: e, addr: addr, port: port, workers: len(ws),
