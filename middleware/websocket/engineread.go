@@ -1,4 +1,5 @@
-package websocket
+//line engineread.go:1:1
+package websocket; import _cover_atomic_ "sync/atomic"
 
 import (
 	"io"
@@ -91,17 +92,17 @@ type chanReader struct {
 // newChanReader creates a chanReader with the given backpressure capacity
 // and watermark percents (0-100). highPct/lowPct ≤ 0 fall back to 75/25.
 // If capacity ≤ 0, the default of 256 is used.
-func newChanReader(capacity, highPct, lowPct int) *chanReader {
-	if capacity <= 0 {
+func newChanReader(capacity, highPct, lowPct int) *chanReader {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[0], 1);
+	if capacity <= 0 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[8], 1);
 		capacity = 256
 	}
-	if highPct <= 0 || highPct > 100 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[1], 1);if highPct <= 0 || highPct > 100 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[9], 1);
 		highPct = 75
 	}
-	if lowPct <= 0 || lowPct >= highPct {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[2], 1);if lowPct <= 0 || lowPct >= highPct {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[10], 1);
 		lowPct = 25
 	}
-	r := &chanReader{
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[3], 1);r := &chanReader{
 		ch:        make(chan []byte, capacity),
 		done:      make(chan struct{}),
 		highWater: capacity * highPct / 100,
@@ -121,16 +122,16 @@ func newChanReader(capacity, highPct, lowPct int) *chanReader {
 	//   highPct≈lowPct → both round to the same value; lowWater needs to
 	//                be strictly less than highWater for the read-side
 	//                "drained" signal to fire.
-	if r.highWater < 1 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[4], 1);if r.highWater < 1 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[11], 1);
 		r.highWater = 1
 	}
-	if r.lowWater >= r.highWater {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[5], 1);if r.lowWater >= r.highWater {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[12], 1);
 		r.lowWater = r.highWater - 1
 	}
-	if r.lowWater < 0 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[6], 1);if r.lowWater < 0 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[13], 1);
 		r.lowWater = 0
 	}
-	return r
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[7], 1);return r
 }
 
 // SetPauser installs the engine pause/resume callbacks. Safe to call once
@@ -144,7 +145,7 @@ func newChanReader(capacity, highPct, lowPct int) *chanReader {
 // upgrade does not run on the worker). Read's reads of r.resume need no lock:
 // they run on the handler goroutine, which the upgrade starts after this
 // returns.
-func (r *chanReader) SetPauser(pause, resume func()) {
+func (r *chanReader) SetPauser(pause, resume func()) {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[14], 1);
 	r.pausedMu.Lock()
 	defer r.pausedMu.Unlock()
 	r.pause = pause
@@ -160,7 +161,7 @@ func (r *chanReader) SetPauser(pause, resume func()) {
 //
 // The caller is responsible for COPYING the chunk before calling Append
 // (the engine reuses its read buffer after the callback returns).
-func (r *chanReader) Append(chunk []byte) bool {
+func (r *chanReader) Append(chunk []byte) bool {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[15], 1);
 	// Fast path: already closed → drop. Safe because ch is NEVER closed
 	// (closeWith closes `done`, not `ch`): even if the close lands right after
 	// this check, the send below targets an open channel and cannot panic — a
@@ -170,39 +171,39 @@ func (r *chanReader) Append(chunk []byte) bool {
 	// keeps the cheap single-op select. The OLD design closed ch, which made
 	// this check a TOCTOU: the send could then panic with "send on closed
 	// channel" — the v1.5.7 weekend-soak crash.
-	if r.closed.Load() {
+	if r.closed.Load() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[18], 1);
 		return false
 	}
 	// Ordering: once anything has spilled, every later chunk must queue
 	// behind it. Append is the only producer, so an empty spill observed
 	// here cannot become non-empty before the channel send below.
-	if r.spillLen.Load() > 0 {
-		if !r.spillChunk(chunk) {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[16], 1);if r.spillLen.Load() > 0 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[19], 1);
+		if !r.spillChunk(chunk) {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[21], 1);
 			r.closeWith(ErrReadLimit)
 			return false
 		}
-		r.requestPause()
+		_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[20], 1);r.requestPause()
 		return true
 	}
 
-	select {
-	case r.ch <- chunk:
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[17], 1);select {
+	case r.ch <- chunk:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[22], 1);
 		// Request pause when crossing the high-water mark. Edge-triggered:
 		// only signal once per crossing, even if many chunks arrive in a row.
-		if len(r.ch) >= r.highWater {
+		if len(r.ch) >= r.highWater {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[26], 1);
 			r.requestPause()
 		}
-		return true
-	default:
+		_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[23], 1);return true
+	default:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[24], 1);
 		// Channel full: the pause was requested at highWater but the
 		// engine's in-flight burst outran the headroom (celeris#484).
 		// Spill rather than discard — these bytes are already off the
 		// socket, so dropping them would truncate a healthy stream.
-		if !r.spillChunk(chunk) {
+		if !r.spillChunk(chunk) {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[27], 1);
 			r.closeWith(ErrReadLimit)
 			return false
 		}
-		r.requestPause()
+		_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[25], 1);r.requestPause()
 		return true
 	}
 }
@@ -212,14 +213,14 @@ func (r *chanReader) Append(chunk []byte) bool {
 // read-limit condition: the peer has outrun both the channel and a full
 // extra channel of spill. Both counters live here so they cannot diverge
 // between Append's two spill paths.
-func (r *chanReader) spillChunk(chunk []byte) bool {
+func (r *chanReader) spillChunk(chunk []byte) bool {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[28], 1);
 	r.spillMu.Lock()
-	if r.spillMax <= 0 || len(r.spill) >= r.spillMax {
+	if r.spillMax <= 0 || len(r.spill) >= r.spillMax {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[30], 1);
 		r.spillMu.Unlock()
 		r.dropped.Add(1)
 		return false
 	}
-	r.spill = append(r.spill, chunk)
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[29], 1);r.spill = append(r.spill, chunk)
 	r.spillLen.Store(int64(len(r.spill)))
 	r.spillMu.Unlock()
 	r.spilled.Add(1)
@@ -272,22 +273,22 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 // TestChanReaderWakeFDWritersNeverWaitOnPausedMu forces the interleavings
 // where a cycle would show, including a callback queued behind a waiting
 // Close.
-func (r *chanReader) requestPause() {
+func (r *chanReader) requestPause() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[31], 1);
 	r.pausedMu.Lock()
 	// Deferred, not a plain Unlock after the callbacks: a callback that
 	// panics would skip that Unlock, and a caller that recovers the panic
 	// would leave pausedMu held for good — blocking every later resume check
 	// in Read and the next high-water crossing here, on the engine worker
 	// thread.
-	defer r.pausedMu.Unlock()
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[32], 1);defer r.pausedMu.Unlock()
 	// r.pause (and r.resume below) are read under pausedMu: SetPauser may be
 	// running on the upgrade goroutine while this runs on the engine worker.
-	if r.pause == nil || r.pausedState {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[33], 1);if r.pause == nil || r.pausedState {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[37], 1);
 		return
 	}
-	r.pausedState = true
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[34], 1);r.pausedState = true
 	// Applied under pausedMu — see the lock-order note above.
-	r.pause()
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[35], 1);r.pause()
 	// celeris#672: the pause above was decided from a depth SNAPSHOT taken in
 	// Append, before this function took pausedMu. If the handler drained to
 	// at-or-below lowWater in between, every resume check it made saw
@@ -303,7 +304,7 @@ func (r *chanReader) requestPause() {
 	// pause cannot go stale again once this critical section ends. The spill
 	// guard matches Read's: never resume while chunks are still queued behind
 	// the channel.
-	if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[36], 1);if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[38], 1);
 		r.pausedState = false
 		r.resume()
 	}
@@ -314,10 +315,10 @@ func (r *chanReader) requestPause() {
 // the reason and in the lock order documented on requestPause
 // (celeris#667). The unlock is deferred for the same reason as there: a
 // resume callback that panics must not leave pausedMu held.
-func (r *chanReader) resumeIfDrained() {
+func (r *chanReader) resumeIfDrained() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[39], 1);
 	r.pausedMu.Lock()
 	defer r.pausedMu.Unlock()
-	if r.pausedState && len(r.ch) <= r.lowWater {
+	if r.pausedState && len(r.ch) <= r.lowWater {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[40], 1);
 		r.pausedState = false
 		r.resume()
 	}
@@ -326,24 +327,24 @@ func (r *chanReader) resumeIfDrained() {
 // refillFromSpill moves spilled chunks into the channel's tail while there
 // is room. Order is preserved: every spill chunk is later than every chunk
 // already in ch.
-func (r *chanReader) refillFromSpill() {
-	if r.spillLen.Load() == 0 {
+func (r *chanReader) refillFromSpill() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[41], 1);
+	if r.spillLen.Load() == 0 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[44], 1);
 		return
 	}
-	r.spillMu.Lock()
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[42], 1);r.spillMu.Lock()
 	defer r.spillMu.Unlock()
 	i := 0
-	for ; i < len(r.spill); i++ {
+	for ; i < len(r.spill); i++ {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[45], 1);
 		select {
-		case r.ch <- r.spill[i]:
+		case r.ch <- r.spill[i]:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[46], 1);
 			r.spill[i] = nil
-		default:
+		default:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[47], 1);
 			r.spill = r.spill[i:]
 			r.spillLen.Store(int64(len(r.spill)))
 			return
 		}
 	}
-	r.spill = nil
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[43], 1);r.spill = nil
 	r.spillLen.Store(0)
 }
 
@@ -351,8 +352,8 @@ func (r *chanReader) refillFromSpill() {
 // is closed. The bufio.Reader wrapping us calls Read in a tight loop, so
 // the per-call overhead matters; this implementation has no allocations
 // in the steady state.
-func (r *chanReader) Read(p []byte) (int, error) {
-	if len(r.cur) == 0 {
+func (r *chanReader) Read(p []byte) (int, error) {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[48], 1);
+	if len(r.cur) == 0 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[50], 1);
 		// Buffered chunks were received BEFORE the close and must be
 		// delivered before it (celeris#484). A peer that sent data and
 		// then went away still sent that data; reporting the close while
@@ -362,26 +363,26 @@ func (r *chanReader) Read(p []byte) (int, error) {
 		// discarded per connection. So try the buffer first, and only
 		// report the close once it is drained.
 		select {
-		case chunk := <-r.ch:
+		case chunk := <-r.ch:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[53], 1);
 			r.cur = chunk
-		default:
-			if r.closed.Load() {
+		default:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[54], 1);
+			if r.closed.Load() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[56], 1);
 				return 0, r.closeErr()
 			}
 			// Block for the next chunk, waking on close via done. r.ch is
 			// never closed, so a closed-channel receive can't be the wake
 			// signal here.
-			select {
-			case chunk := <-r.ch:
+			_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[55], 1);select {
+			case chunk := <-r.ch:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[57], 1);
 				r.cur = chunk
-			case <-r.done:
+			case <-r.done:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[58], 1);
 				// The close and a final chunk can land together; select
 				// picks randomly among ready cases, so re-check the
 				// buffer rather than dropping what did arrive.
 				select {
-				case chunk := <-r.ch:
+				case chunk := <-r.ch:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[59], 1);
 					r.cur = chunk
-				default:
+				default:_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[60], 1);
 					return 0, r.closeErr()
 				}
 			}
@@ -390,28 +391,28 @@ func (r *chanReader) Read(p []byte) (int, error) {
 		// Taking a chunk freed a slot: promote spilled chunks into the
 		// channel's tail so len(r.ch) keeps reflecting the true buffered
 		// depth the watermarks below are judged against.
-		r.refillFromSpill()
+		_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[51], 1);r.refillFromSpill()
 
 		// Edge-triggered resume: when depth falls below low-water, lift
 		// backpressure so the engine resumes inbound reads. Never resume
 		// while chunks are still spilled — the buffer is over-full, which
 		// is the opposite of the drained condition resume signals.
-		if r.resume != nil && !r.hasSpill() {
+		_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[52], 1);if r.resume != nil && !r.hasSpill() {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[61], 1);
 			r.resumeIfDrained()
 		}
 	}
-	n := copy(p, r.cur)
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[49], 1);n := copy(p, r.cur)
 	r.cur = r.cur[n:]
 	return n, nil
 }
 
 // closeWith marks the reader as closed and stores err to surface from
 // the next Read call. Idempotent. Safe to call from any goroutine.
-func (r *chanReader) closeWith(err error) {
-	if !r.closed.CompareAndSwap(false, true) {
+func (r *chanReader) closeWith(err error) {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[62], 1);
+	if !r.closed.CompareAndSwap(false, true) {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[65], 1);
 		return
 	}
-	if err != nil {
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[63], 1);if err != nil {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[66], 1);
 		r.err.Store(err)
 	}
 	// Close done — NOT ch — to wake any blocked Read and to signal any
@@ -422,26 +423,26 @@ func (r *chanReader) closeWith(err error) {
 	// channel") — the very race this reader must not have. err is stored
 	// before the close so a Read woken by done observes it (the close is a
 	// happens-before edge).
-	close(r.done)
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[64], 1);close(r.done)
 }
 
 // closeErr returns the stored close error, or io.EOF if none was set.
-func (r *chanReader) closeErr() error {
-	if e := r.err.Load(); e != nil {
+func (r *chanReader) closeErr() error {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[67], 1);
+	if e := r.err.Load(); e != nil {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[69], 1);
 		return e.(error)
 	}
-	return io.EOF
+	_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[68], 1);return io.EOF
 }
 
 // hasSpill reports whether any chunk is still queued behind the channel.
-func (r *chanReader) hasSpill() bool {
+func (r *chanReader) hasSpill() bool {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[70], 1);
 	return r.spillLen.Load() > 0
 }
 
 // Dropped returns the number of inbound chunks dropped because both the
 // channel and the spill buffer were full. Non-zero means a peer outran a
 // paused connection by more than twice MaxBackpressureBuffer.
-func (r *chanReader) Dropped() uint64 {
+func (r *chanReader) Dropped() uint64 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[71], 1);
 	return r.dropped.Load()
 }
 
@@ -449,6 +450,165 @@ func (r *chanReader) Dropped() uint64 {
 // full channel. Non-zero is normal under a burst the pause headroom could
 // not cover; it is the signal that MaxBackpressureBuffer is tight for the
 // offered load, not an error.
-func (r *chanReader) Spilled() uint64 {
+func (r *chanReader) Spilled() uint64 {_cover_atomic_.AddUint32(&GoCover_b2b_engineread.Count[72], 1);
 	return r.spilled.Load()
 }
+
+var GoCover_b2b_engineread = struct {
+	Count     [73]uint32
+	Pos       [3 * 73]uint32
+	NumStmt   [73]uint16
+} {
+	Pos: [3 * 73]uint32{
+		95, 95, 0x130002, // [0]
+		98, 98, 0x230002, // [1]
+		101, 101, 0x260002, // [2]
+		104, 115, 0x10002, // [3]
+		124, 124, 0x150002, // [4]
+		127, 127, 0x1f0002, // [5]
+		130, 130, 0x140002, // [6]
+		133, 133, 0xa0002, // [7]
+		96, 97, 0x10003, // [8]
+		99, 100, 0x10003, // [9]
+		102, 103, 0x10003, // [10]
+		125, 126, 0x10003, // [11]
+		128, 129, 0x10003, // [12]
+		131, 132, 0x10003, // [13]
+		148, 152, 0x10002, // [14]
+		173, 173, 0x150002, // [15]
+		179, 179, 0x1b0002, // [16]
+		188, 188, 0x90002, // [17]
+		174, 175, 0x10003, // [18]
+		180, 180, 0x1b0003, // [19]
+		184, 185, 0xe0003, // [20]
+		181, 183, 0x10004, // [21]
+		192, 192, 0x1f0003, // [22]
+		195, 195, 0xe0003, // [23]
+		201, 201, 0x1b0003, // [24]
+		205, 206, 0xe0003, // [25]
+		193, 194, 0x10004, // [26]
+		202, 204, 0x10004, // [27]
+		216, 217, 0x330002, // [28]
+		222, 226, 0xd0002, // [29]
+		218, 221, 0x10003, // [30]
+		276, 277, 0x10002, // [31]
+		282, 283, 0x10002, // [32]
+		285, 285, 0x250002, // [33]
+		288, 289, 0x10002, // [34]
+		290, 291, 0x10002, // [35]
+		306, 306, 0x410002, // [36]
+		286, 287, 0x10003, // [37]
+		307, 309, 0x10003, // [38]
+		318, 320, 0x2e0002, // [39]
+		321, 323, 0x10003, // [40]
+		330, 330, 0x1c0002, // [41]
+		333, 336, 0x1e0002, // [42]
+		346, 347, 0x150002, // [43]
+		331, 332, 0x10003, // [44]
+		337, 337, 0xa0003, // [45]
+		339, 339, 0x140004, // [46]
+		341, 343, 0xa0004, // [47]
+		355, 355, 0x150002, // [48]
+		403, 405, 0xf0002, // [49]
+		364, 364, 0xa0003, // [50]
+		393, 394, 0x10003, // [51]
+		399, 399, 0x270003, // [52]
+		366, 366, 0x110004, // [53]
+		368, 368, 0x170004, // [54]
+		374, 374, 0xb0004, // [55]
+		369, 370, 0x10005, // [56]
+		376, 376, 0x120005, // [57]
+		381, 381, 0xc0005, // [58]
+		383, 383, 0x130006, // [59]
+		385, 385, 0x1c0006, // [60]
+		400, 401, 0x10004, // [61]
+		411, 411, 0x2b0002, // [62]
+		414, 414, 0x100002, // [63]
+		425, 425, 0xf0002, // [64]
+		412, 413, 0x10003, // [65]
+		415, 416, 0x10003, // [66]
+		430, 430, 0x210002, // [67]
+		433, 433, 0xf0002, // [68]
+		431, 432, 0x10003, // [69]
+		438, 439, 0x10002, // [70]
+		445, 446, 0x10002, // [71]
+		453, 454, 0x10002, // [72]
+	},
+	NumStmt: [73]uint16{
+		1, // 0
+		1, // 1
+		1, // 2
+		2, // 3
+		2, // 4
+		1, // 5
+		1, // 6
+		1, // 7
+		1, // 8
+		1, // 9
+		1, // 10
+		1, // 11
+		1, // 12
+		1, // 13
+		4, // 14
+		1, // 15
+		1, // 16
+		1, // 17
+		1, // 18
+		1, // 19
+		2, // 20
+		2, // 21
+		1, // 22
+		1, // 23
+		1, // 24
+		2, // 25
+		1, // 26
+		2, // 27
+		2, // 28
+		5, // 29
+		3, // 30
+		3, // 31
+		3, // 32
+		3, // 33
+		3, // 34
+		3, // 35
+		3, // 36
+		1, // 37
+		2, // 38
+		3, // 39
+		2, // 40
+		1, // 41
+		4, // 42
+		2, // 43
+		1, // 44
+		1, // 45
+		1, // 46
+		3, // 47
+		1, // 48
+		3, // 49
+		1, // 50
+		2, // 51
+		2, // 52
+		1, // 53
+		1, // 54
+		1, // 55
+		1, // 56
+		1, // 57
+		1, // 58
+		1, // 59
+		1, // 60
+		1, // 61
+		1, // 62
+		1, // 63
+		1, // 64
+		1, // 65
+		1, // 66
+		1, // 67
+		1, // 68
+		1, // 69
+		1, // 70
+		1, // 71
+		1, // 72
+	},
+}
+
+var _ = _cover_atomic_.LoadUint32

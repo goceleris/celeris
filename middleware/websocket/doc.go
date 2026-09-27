@@ -1,3 +1,4 @@
+//line doc.go:1:1
 // Package websocket provides a zero-dependency native WebSocket middleware
 // for celeris, implementing RFC 6455.
 //
@@ -52,4 +53,17 @@
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/websocket
-package websocket
+package websocket; import _cover_atomic_ "sync/atomic"
+
+var GoCover_b2b_doc = struct {
+	Count     [0]uint32
+	Pos       [3 * 0]uint32
+	NumStmt   [0]uint16
+} {
+	Pos: [3 * 0]uint32{
+	},
+	NumStmt: [0]uint16{
+	},
+}
+
+var _ = _cover_atomic_.LoadUint32

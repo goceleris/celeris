@@ -1,4 +1,5 @@
-package websocket
+//line config.go:1:1
+package websocket; import _cover_atomic_ "sync/atomic"
 
 import (
 	"bufio"
@@ -162,36 +163,87 @@ type Config struct {
 
 var defaultConfig = Config{}
 
-func applyDefaults(cfg Config) Config {
-	if cfg.ReadBufferSize <= 0 {
+func applyDefaults(cfg Config) Config {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[0], 1);
+	if cfg.ReadBufferSize <= 0 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[9], 1);
 		cfg.ReadBufferSize = defaultReadBufSize
 	}
-	if cfg.WriteBufferSize <= 0 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[1], 1);if cfg.WriteBufferSize <= 0 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[10], 1);
 		cfg.WriteBufferSize = defaultWriteBufSize
 	}
-	if cfg.ReadLimit <= 0 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[2], 1);if cfg.ReadLimit <= 0 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[11], 1);
 		cfg.ReadLimit = defaultReadLimit
 	}
-	if cfg.EnableCompression && cfg.CompressionLevel == 0 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[3], 1);if cfg.EnableCompression && cfg.CompressionLevel == 0 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[12], 1);
 		cfg.CompressionLevel = defaultCompressionLevel
 	}
-	if cfg.EnableCompression && cfg.CompressionThreshold <= 0 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[4], 1);if cfg.EnableCompression && cfg.CompressionThreshold <= 0 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[13], 1);
 		cfg.CompressionThreshold = 128
 	}
-	if cfg.MaxBackpressureBuffer <= 0 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[5], 1);if cfg.MaxBackpressureBuffer <= 0 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[14], 1);
 		cfg.MaxBackpressureBuffer = 256
 	}
-	if cfg.BackpressureHighPct <= 0 || cfg.BackpressureHighPct > 100 {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[6], 1);if cfg.BackpressureHighPct <= 0 || cfg.BackpressureHighPct > 100 {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[15], 1);
 		cfg.BackpressureHighPct = 75
 	}
-	if cfg.BackpressureLowPct <= 0 || cfg.BackpressureLowPct >= cfg.BackpressureHighPct {
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[7], 1);if cfg.BackpressureLowPct <= 0 || cfg.BackpressureLowPct >= cfg.BackpressureHighPct {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[16], 1);
 		cfg.BackpressureLowPct = 25
 	}
-	return cfg
+	_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[8], 1);return cfg
 }
 
-func (cfg Config) validate() {
-	if cfg.Handler == nil {
+func (cfg Config) validate() {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[17], 1);
+	if cfg.Handler == nil {_cover_atomic_.AddUint32(&GoCover_b2b_config.Count[18], 1);
 		panic("websocket: Handler must not be nil")
 	}
 }
+
+var GoCover_b2b_config = struct {
+	Count     [19]uint32
+	Pos       [3 * 19]uint32
+	NumStmt   [19]uint16
+} {
+	Pos: [3 * 19]uint32{
+		166, 166, 0x1d0002, // [0]
+		169, 169, 0x1e0002, // [1]
+		172, 172, 0x180002, // [2]
+		175, 175, 0x380002, // [3]
+		178, 178, 0x3c0002, // [4]
+		181, 181, 0x240002, // [5]
+		184, 184, 0x430002, // [6]
+		187, 187, 0x560002, // [7]
+		190, 190, 0xc0002, // [8]
+		167, 168, 0x10003, // [9]
+		170, 171, 0x10003, // [10]
+		173, 174, 0x10003, // [11]
+		176, 177, 0x10003, // [12]
+		179, 180, 0x10003, // [13]
+		182, 183, 0x10003, // [14]
+		185, 186, 0x10003, // [15]
+		188, 189, 0x10003, // [16]
+		194, 194, 0x180002, // [17]
+		195, 195, 0x2e0003, // [18]
+	},
+	NumStmt: [19]uint16{
+		1, // 0
+		1, // 1
+		1, // 2
+		1, // 3
+		1, // 4
+		1, // 5
+		1, // 6
+		1, // 7
+		1, // 8
+		1, // 9
+		1, // 10
+		1, // 11
+		1, // 12
+		1, // 13
+		1, // 14
+		1, // 15
+		1, // 16
+		1, // 17
+		1, // 18
+	},
+}
+
+var _ = _cover_atomic_.LoadUint32
