@@ -42,8 +42,8 @@ func driverConnOf(w *Worker, fd int) *driverConn {
 	return w.driverConns[fd]
 }
 
-// settleDriverRecv waits until fd's RECV is armed, then 50 ms more, so the
-// worker's next submit has handed it to the kernel.
+// settleDriverRecv waits until fd's RECV is armed, and then until the
+// worker's next submit has handed it to the kernel (submitRoundTrip).
 func settleDriverRecv(t *testing.T, w *Worker, fd int) {
 	t.Helper()
 	dc := driverConnOf(w, fd)
@@ -62,7 +62,36 @@ func settleDriverRecv(t *testing.T, w *Worker, fd int) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(50 * time.Millisecond)
+	submitRoundTrip(t, w)
+}
+
+// submitRoundTrip returns once w has submitted every SQE it had prepared
+// when submitRoundTrip was called. It registers a conn R whose peer has
+// already written a byte: the worker prepares R's RECV behind those SQEs,
+// submits the SQ in order, and R's onRecv runs only after R's RECV has been
+// submitted. Then R is unregistered and closed. Not while w is parked.
+func submitRoundTrip(t *testing.T, w *Worker) {
+	t.Helper()
+	r := &testDriver{closed: make(chan error, 1)}
+	r.fd, r.peer = nonblockSocketPair(t)
+	got := make(chan struct{}, 1)
+	if _, err := unix.Write(r.peer, []byte{'r'}); err != nil {
+		t.Fatalf("round trip: write R's peer: %v", err)
+	}
+	if err := w.RegisterConn(r.fd, func([]byte) {
+		select {
+		case got <- struct{}{}:
+		default:
+		}
+	}, func(err error) { r.closed <- err }); err != nil {
+		t.Fatalf("round trip: RegisterConn(R): %v", err)
+	}
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("round trip: R's byte never reached onRecv")
+	}
+	r.unregisterAndWait(t, w)
 }
 
 // testDriver is one driver conn registered on a worker, and its peer.
@@ -420,8 +449,10 @@ func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 		t.Fatalf("dup3 onto the engine's closed number %d: %v", opFD, dupErr)
 	}
 	// Whatever the drain prepared behind the refusal is submitted at the top
-	// of the worker's next iteration: let that happen before V's byte.
-	time.Sleep(100 * time.Millisecond)
+	// of the worker's next iteration, before it can take P's CQE: a park
+	// round trip is that submit, done before V's byte.
+	p.park()
+	p.release()
 	v.expectReceives(t, "the socket put on the refused conn's numbers")
 
 	p.park()
@@ -511,8 +542,10 @@ func TestDriverFailureCancelCompletesBeforeRelease(t *testing.T) {
 		t.Fatalf("dup3 onto the engine's closed number %d: %v", opFD, dupErr)
 	}
 	// An SQE still in the SQ is submitted at the top of the worker's next
-	// iteration: let that happen before V's byte.
-	time.Sleep(100 * time.Millisecond)
+	// iteration, before it can take P's CQE: a park round trip is that
+	// submit, done before V's byte.
+	p.park()
+	p.release()
 	v.expectReceives(t, "the socket put on the failed conn's engine number when it was released")
 
 	if fired {
@@ -1147,9 +1180,9 @@ func takeNumber(t *testing.T, fd int) (x0, x1 int) {
 	return x0, x1
 }
 
-// readsNothing reports whether fd has nothing to read 200 ms from now.
+// readsNothing reports whether fd has nothing to read now. The caller first
+// makes whatever could write to it happen (a park round trip).
 func readsNothing(fd int) (bool, string) {
-	time.Sleep(200 * time.Millisecond)
 	var b [64]byte
 	n, err := unix.Read(fd, b[:])
 	if errors.Is(err, unix.EAGAIN) {
@@ -1219,7 +1252,10 @@ func TestDriverRecvRearmBeforeSubmitSparesReusedNumber(t *testing.T) {
 	if _, err := unix.Write(x1, []byte{'z'}); err != nil {
 		t.Fatalf("write X's peer: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	// A RECV armed on X completes, and takes the byte, when the worker next
+	// runs its completions, which it does before it can take P's CQE.
+	p.park()
+	p.release()
 	var one [1]byte
 	if n, err := unix.Read(x0, one[:]); n != 1 || err != nil {
 		t.Errorf("the socket that took A's number: its reader got n=%d err=%v, want its byte: A's RECV read it", n, err)
@@ -1268,6 +1304,11 @@ func TestDriverSendBeforeSubmitSparesReusedNumber(t *testing.T) {
 	defer func() { _ = unix.Close(x0); _ = unix.Close(x1) }()
 	dp.release()
 
+	// A's SEND, if it went by the number, is submitted at the top of the
+	// worker's next iteration, before it can take P's CQE, and a SEND on a
+	// socketpair with room completes as it is issued.
+	p.park()
+	p.release()
 	if ok, got := readsNothing(x1); !ok {
 		t.Errorf("the peer of the socket that took A's number read %s: A's SEND went to it", got)
 	}
@@ -1533,8 +1574,10 @@ func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T
 		t.Fatalf("dup3 onto the engine's closed number %d: %v", opFD, dupErr)
 	}
 	// An SQE still in the SQ is submitted at the top of the worker's next
-	// iteration: let that happen before V's byte.
-	time.Sleep(100 * time.Millisecond)
+	// iteration, before it can take P's CQE: a park round trip is that
+	// submit, done before V's byte.
+	p.park()
+	p.release()
 	v.expectReceives(t, "the socket put on the unregistered conn's engine number when it was released")
 	if peer := a.peerSees(); peer != "EOF" {
 		t.Errorf("A's peer reads %s, want EOF", peer)
