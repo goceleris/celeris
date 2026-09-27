@@ -488,6 +488,11 @@ type Worker struct {
 	// adoptClosed is set under driverActionMu by closeAdoptQueue when the
 	// worker shuts down; AdoptConn refuses from then on (celeris#658).
 	adoptClosed bool
+	// driversClosed is set under driverMu by shutdownDrivers; RegisterConn
+	// refuses from then on (celeris#691). shutdownDrivers runs once, so a
+	// conn registered after it would never be retired, and the duplicate
+	// descriptor its UnregisterConn takes would never be closed.
+	driversClosed bool
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring

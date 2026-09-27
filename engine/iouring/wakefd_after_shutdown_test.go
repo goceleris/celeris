@@ -134,10 +134,12 @@ func (w *fdWatcher655) assertNoLateWake(t *testing.T, n int, who string) {
 
 // TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD covers
 // addDriverAction, the deterministic case. shutdownDrivers sets
-// driverConns=nil, and RegisterConn rebuilds the map from nil and always
-// reaches the wakeup write — so a driver that registers an fd on a worker
-// that has already gone away writes into a recycled descriptor every single
-// time.
+// driverConns=nil, and RegisterConn used to rebuild the map from nil and
+// always reach the wakeup write — so a driver that registered an fd on a
+// worker that had already gone away wrote into a recycled descriptor every
+// single time. Since celeris#691 RegisterConn refuses there before it
+// queues anything; the wakeup handle still guards the UnregisterConn and
+// Write that race shutdownDrivers.
 func TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 	w, efd := newWakeWorker655(t)
 	watch := newFDWatcher655(t)

@@ -218,6 +218,8 @@ func (w *Worker) addAdoptAction(fd int, carry engine.Carryover) error {
 
 // RegisterConn adds fd to this worker's driver map and schedules a single-shot
 // RECV SQE on it. The caller must ensure fd is connected and non-blocking.
+// Once the worker has shut down it returns an error wrapping
+// errEngineShutdown, and fd stays the caller's to close.
 func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) error {
 	if fd < 0 {
 		return errors.New("celeris/iouring: invalid fd")
@@ -234,6 +236,16 @@ func (w *Worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	var st unix.Stat_t
 	identOK := unix.Fstat(fd, &st) == nil
 	w.driverMu.Lock()
+	// A worker that has shut down never retires a conn again, so nothing
+	// would close the duplicate an UnregisterConn takes (celeris#691).
+	// Engine.WorkerLoop still hands such a worker out: after the engine
+	// stops, or after this worker alone exited. Refuse, as AdoptConn does;
+	// fd stays the caller's.
+	if w.driversClosed {
+		w.driverMu.Unlock()
+		return fmt.Errorf("celeris/iouring: worker %d has shut down, cannot register fd %d: %w",
+			w.id, fd, errEngineShutdown)
+	}
 	// Re-check under the lock: the worker goroutine may have accepted an
 	// HTTP conn on this fd between the first check and the lock acquisition.
 	if fd < len(w.conns) && w.conns[fd] != nil {
@@ -657,10 +669,14 @@ func (w *Worker) failDriverConn(dc *driverConn, err error) {
 var errEngineShutdown = errors.New("celeris/iouring: engine shutdown")
 
 // shutdownDrivers fires onClose(errEngineShutdown) for every registered
-// driver conn and clears the map. Called from Worker.shutdown on the worker
-// goroutine. The caller owns the FDs; we do not close them.
+// driver conn, clears the map, and makes every later RegisterConn fail.
+// Called from Worker.shutdown on the worker goroutine. The caller owns the
+// FDs; we do not close them.
 func (w *Worker) shutdownDrivers() {
 	w.driverMu.Lock()
+	// Under the lock RegisterConn inserts under: a conn is either in the map
+	// taken below, and retired here, or refused (celeris#691).
+	w.driversClosed = true
 	if len(w.driverConns) == 0 {
 		w.driverMu.Unlock()
 		return
