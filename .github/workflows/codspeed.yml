@@ -13,17 +13,20 @@
 #     to -19% although PreRouting and PreRoutingOnly execute no changed
 #     instruction; re-running both commits reproduced each commit's own level
 #     within 2%. The level belongs to the binary's layout on this runner.
-#   - The runner. Identical source trees still move from run to run. On
-#     three pairs of runs of identical trees, ContextQueryFirstParse moved
-#     between 737 and 904 ns (18.5% or 22.7%, by direction),
-#     ChainDeepParallel 15.2%, and ContextString, ResetH1Stream, RouterFind
-#     and ContextBlob 5-10%. The ns-scale micro-benchmarks moved most (a lock
-#     under four goroutines 117-185 ns, single-digit cases 3-4 and 8-11 ns)
-#     and are no longer run here (see "Not measured"); what stays still has
-#     run noise.
+#   - The runner. Identical code still moves from run to run. On four pairs
+#     of runs of identical code (three identical source trees, and two runs
+#     of celeris#748 whose test binaries are byte-identical),
+#     ContextQueryFirstParse moved between 737 and 904 ns (18.5% or 22.7%,
+#     by direction), ContextSetHeader from 113 to 136 ns (16.9%) and
+#     ChainDeepParallel by up to 15.2%; ContextString, ResetH1Stream,
+#     RouterFind and ContextBlob moved 7.8-10%. The second of #748's runs
+#     went red on that alone. The ns-scale micro-benchmarks moved most (a
+#     lock under four goroutines 117-185 ns, single-digit cases 3-4 and 8-11
+#     ns) and are no longer run here (see "Not measured"); what stays still
+#     has run noise.
 # No regression threshold separates these from a real change: in the first
-# 15 comparisons layout alone reached -19.6%, and run noise on identical
-# trees -18.5%. So before acting on ANY flag:
+# 16 comparisons layout alone reached -19.6%, and run noise alone -18.5%.
+# So before acting on ANY flag:
 #   1. Take the base CodSpeed names in its report, which is often not the
 #      pull request's base: with path filters CodSpeed compares with the
 #      latest main run, and a layout shift from a main commit that started no
@@ -64,9 +67,9 @@
 #     every main commit from 9aa94eb to dccb839. The shipping shape
 #     (FDAtomicPadded) and Signal/* were steady; they go with the package.
 #   - BenchmarkInternH2HeaderName: 49-64 ns on a byte-identical binary.
-# Every router, Context, chain, handler and logger benchmark stays, the two
-# noisiest above included: they are the hot path. Run the removed ones with
-# a plain `go test -bench`.
+# Every router, Context, chain, handler and logger benchmark stays, the
+# noisiest ones above included: they are the hot path. Run the removed ones
+# with a plain `go test -bench`.
 #
 # How the set is chosen. CodSpeed's Go runner (go-runner, pinned below)
 # passes exactly three things from `run:` to `go test`: -bench, -benchtime
