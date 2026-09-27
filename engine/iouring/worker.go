@@ -5169,9 +5169,7 @@ func (w *Worker) flushSendLink(cs *connState) bool {
 	// (the recv starts only once the peer could plausibly have sent, so it
 	// tends to find data rather than arm a poll). A detached conn gets no
 	// such benefit and pays the liveness cost, so it does not chain.
-	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
-		return w.flushSend(cs)
-	}
+	// MUTANT m607: the Detached early-return is deleted (celeris#607 re-introduced).
 
 	// Partial send remainder — no linking (RECV may already be in flight).
 	if len(cs.sendBuf) > 0 {
