@@ -1406,11 +1406,12 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 //
 // Detach copies the request values the Context holds, so they stay valid
 // after the handler returns: the headers, method, path and query, the route
-// params, the parsed query and cookies, the Host, and the strings stored with
-// SetRequestID, SetClientIP, SetHost, SetScheme and SetString. It cannot copy
-// a string read out of the Context before the call, nor values stored with
-// [Context.Set]: on epoll and io_uring those may still refer to the
-// connection's receive buffer, so clone them before keeping them.
+// params, the parsed query and cookies, the Host, the strings stored with
+// SetRequestID, SetClientIP, SetHost, SetScheme and SetString, and the
+// response headers set so far (middleware echo request headers into them).
+// It cannot copy a string read out of the Context before the call, nor values
+// stored with [Context.Set]: on epoll and io_uring those may still refer to
+// the connection's receive buffer, so clone them before keeping them.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
@@ -1460,8 +1461,9 @@ func (c *Context) Detach() (done func()) {
 // materializeRequestViews clones, for [Context.Detach], the request-derived
 // strings the Context keeps outside the header slice and the method, path and
 // raw query: the route params, the parsed query and cookie caches, the H1
-// Host, and the strings middleware store on the Context from request headers
-// (request ID, client-IP/host/scheme overrides, SetString values).
+// Host, the strings middleware store on the Context from request headers
+// (request ID, client-IP/host/scheme overrides, SetString values), and the
+// response headers set so far.
 //
 // On epoll and io_uring each of these can be a view of the engine's receive
 // buffer, which is safe to compare while the request is handled and unsafe to
@@ -1497,6 +1499,43 @@ func (c *Context) materializeRequestViews() {
 	for k, v := range c.stringKeys {
 		c.stringKeys[k] = strings.Clone(v)
 	}
+	// The response headers set so far: middleware echo request headers into
+	// them (requestid's x-request-id, cors's access-control-allow-origin),
+	// and a detached goroutine serializes them when it writes the response
+	// head (Blob, NoContent, StreamWriter.WriteHeader(code,
+	// c.ResponseHeaders())).
+	cloneHeaderPairs(c.respHeaders)
+}
+
+// cloneHeaderPairs replaces every key and value of hs, in place, with a copy.
+// The copies share one buffer, so this is one allocation however many headers
+// there are. The buffer is never written after it is filled, so the strings
+// cut from it stay immutable.
+func cloneHeaderPairs(hs [][2]string) {
+	n := 0
+	for _, h := range hs {
+		n += len(h[0]) + len(h[1])
+	}
+	if n == 0 {
+		return
+	}
+	buf := make([]byte, 0, n)
+	for i := range hs {
+		hs[i][0] = appendClone(&buf, hs[i][0])
+		hs[i][1] = appendClone(&buf, hs[i][1])
+	}
+}
+
+// appendClone appends s to *buf and returns the appended bytes as a string.
+// *buf must have room for s: the append must not move the buffer, or strings
+// returned earlier would keep the old one.
+func appendClone(buf *[]byte, s string) string {
+	if s == "" {
+		return ""
+	}
+	off := len(*buf)
+	*buf = append(*buf, s...)
+	return unsafe.String(&(*buf)[off], len(s))
 }
 
 // StreamWriter provides incremental response writing. Obtained via [Context.StreamWriter].
