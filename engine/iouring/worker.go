@@ -4781,6 +4781,19 @@ func (w *Worker) drainDetachQueue() {
 			w.finishAsyncTransplant(cs)
 			continue
 		}
+		// One owner per entry (the celeris#527/#657 fd-lifetime rule): act
+		// only for the connState that still owns its slot. A conn can be
+		// queued twice in one burst: the dispatch goroutine hands back a
+		// conn the dirty pass gave up (relinkOwed, celeris#704) at the top of
+		// its loop, and in the same asyncInMu section its park boundary can
+		// claim the hand-off above and enqueue it again. The entry that
+		// hands it off clears its slot and closes its fd, whose number a new
+		// socket may hold by the time anything below runs; putting the conn
+		// back on the dirty list would arm the recv it was owed on that
+		// socket, and take its bytes.
+		if cs.fd < 0 || cs.fd >= len(w.conns) || w.conns[cs.fd] != cs {
+			continue
+		}
 		// Dispatch goroutine promoted the conn to H2 via switchToH2Local
 		// on the h2c-upgrade path. Finish the worker-owned bits of the
 		// swap: arm the H2 eventfd poll (once per worker) and register
