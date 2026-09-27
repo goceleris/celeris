@@ -50,8 +50,9 @@ import (
 //
 //	# base: before celeris#667 and #672 (any main before PR #671)
 //	git show 9f4d89b:middleware/websocket/engineread.go > middleware/websocket/engineread.go
-//	# #667 only: this tree's engineread.go with the celeris#672 re-check
-//	# block at the end of requestPause deleted
+//	# #667 only: the celeris#667 fix commit, the arm PR #671's wedge A/B
+//	# measured (engineread.go sha256 2b64141c...)
+//	git show 3b6c500:middleware/websocket/engineread.go > middleware/websocket/engineread.go
 //
 // then, on Linux (the stub uses a real eventfd), one process per observation:
 //
