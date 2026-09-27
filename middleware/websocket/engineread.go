@@ -136,7 +136,17 @@ func newChanReader(capacity, highPct, lowPct int) *chanReader {
 // SetPauser installs the engine pause/resume callbacks. Safe to call once
 // after construction; safe to call with (nil, nil) when the engine does
 // not support backpressure (e.g. tests).
+//
+// The callbacks are written under pausedMu, and requestPause reads them only
+// under pausedMu, because nothing else orders the two: the upgrade calls
+// SetPauser after Detach and after the 101 is written, and from then on the
+// engine worker may already be appending (on an async-mode connection the
+// upgrade does not run on the worker). Read's reads of r.resume need no lock:
+// they run on the handler goroutine, which the upgrade starts after this
+// returns.
 func (r *chanReader) SetPauser(pause, resume func()) {
+	r.pausedMu.Lock()
+	defer r.pausedMu.Unlock()
 	r.pause = pause
 	r.resume = resume
 }
@@ -249,9 +259,6 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 // descriptor and happens after detachQMu is released, so it can neither block
 // nor extend the hold on pausedMu across a blocking syscall.
 func (r *chanReader) requestPause() {
-	if r.pause == nil {
-		return
-	}
 	r.pausedMu.Lock()
 	// Deferred, not a plain Unlock after the callbacks: a callback that
 	// panics would skip that Unlock, and a caller that recovers the panic
@@ -259,7 +266,9 @@ func (r *chanReader) requestPause() {
 	// in Read and the next high-water crossing here, on the engine worker
 	// thread.
 	defer r.pausedMu.Unlock()
-	if r.pausedState {
+	// r.pause (and r.resume below) are read under pausedMu: SetPauser may be
+	// running on the upgrade goroutine while this runs on the engine worker.
+	if r.pause == nil || r.pausedState {
 		return
 	}
 	r.pausedState = true
