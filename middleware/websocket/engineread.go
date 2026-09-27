@@ -399,6 +399,20 @@ promote:
 // and reports the close only once nothing buffered is left to deliver.
 func (r *chanReader) next() ([]byte, error) {
 	for {
+		// The close flag is read FIRST, before the buffers are looked at, and
+		// the close is reported below only if it was already set here. The
+		// engine appends and closes on one thread: its worker calls Append
+		// for each chunk of a batch and then, on the peer's FIN or an error,
+		// the error handler that calls closeWith. So a close seen here comes
+		// after every chunk the engine appended before it, and the checks
+		// below find each of them, in the channel or in the spill. Read after
+		// those checks instead, the flag could come from a close that landed
+		// once they had found nothing, and the chunks appended just before
+		// that close would be dropped for an EOF (celeris#484's truncation).
+		// The window is real: promoteSpill can wait for spillMu while
+		// spillChunk's retry puts a chunk in the channel, and the worker can
+		// finish its batch and close before this goroutine runs again.
+		closed := r.closed.Load()
 		select {
 		case chunk := <-r.ch:
 			return chunk, nil
@@ -421,8 +435,9 @@ func (r *chanReader) next() ([]byte, error) {
 		// handler sees "unexpected EOF". Measured under flood: readers
 		// were closed holding a completely full channel — 256 chunks
 		// discarded per connection. So the channel and the spill are
-		// drained first, and the close is reported only after.
-		if r.closed.Load() {
+		// drained first, and the close is reported only after, and only
+		// the close read before they were checked (see above).
+		if closed {
 			return nil, r.closeErr()
 		}
 		// Block for the next chunk, waking on close via done. r.ch is
@@ -432,9 +447,11 @@ func (r *chanReader) next() ([]byte, error) {
 		case chunk := <-r.ch:
 			return chunk, nil
 		case <-r.done:
-			// The close and a final chunk can land together, and select
-			// picks randomly among ready cases, so loop: the channel and
-			// the spill are checked again before the close is reported.
+			// The close landed after the flag was read above, possibly
+			// together with a final chunk (select picks randomly among
+			// ready cases), so loop: the flag is read again, and the
+			// channel and the spill are checked again, before the close
+			// is reported.
 		}
 	}
 }
