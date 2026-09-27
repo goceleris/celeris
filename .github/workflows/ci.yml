@@ -404,6 +404,38 @@ jobs:
             echo "expected exactly $want synack=0 tests to run and PASS with no SKIP line"
             exit 1
           fi
+      # celeris#731: the session IDs the session middleware keeps past a
+      # request (the key the write-behind worker writes under, the Session a
+      # detached stream keeps through the Context, a Session returned by
+      # Handler.GetByID) must survive the engine receiving the connection's
+      # next bytes into the buffer the ID was read from. The root race step runs
+      # ./middleware/session without -v, and a test whose io_uring probe
+      # finds no ring (another package's rings are charged to the same
+      # 8 MiB) drops its io_uring arms without a word there. So the three
+      # tests run again here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1
+      # turning a missing io_uring arm into a failure, and an exact tally:
+      # 3 top-level PASS and 15 arm PASS (6 of them io_uring), no SKIP line,
+      # and go test must exit 0. It runs even when a step above failed.
+      - name: celeris#731 session IDs kept past the request (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          tests='TestWriteBehindWritesUnderTheRequestsOwnSessionID|TestDetachedStreamKeepsTheLoadedSessionID|TestGetByIDSessionKeepsItsID'
+          go test -race -count=1 -timeout=300s -v -run "^(${tests})\$" ./middleware/session/ 2>&1 | tee /tmp/c731.log || failed=1
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c731.log || true)
+          arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c731.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/io_uring" /tmp/c731.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c731.log || true)
+          echo "celeris#731 tests: top-level PASS $top (want 3), arm PASS $arms (want 15), io_uring arm PASS $uring (want 6), SKIP lines $skipped, go test failed $failed (want 0)"
+          if [ "$top" -ne 3 ] || [ "$arms" -ne 15 ] || [ "$uring" -ne 6 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all three tests and all 15 arms (6 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
