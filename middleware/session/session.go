@@ -547,7 +547,12 @@ func (h *Handler) GetByID(ctx context.Context, id string) (*Session, error) {
 		return nil, derr
 	}
 	return &Session{
-		id:       id,
+		// The caller keeps the returned Session, often past the request it
+		// looked the ID up in, and a handler's id is typically what
+		// c.Cookie, c.Header or c.Query returned: on epoll and io_uring a
+		// view of the receive buffer, which the connection's next request
+		// overwrites. Keep a copy.
+		id:       strings.Clone(id),
 		data:     data,
 		readOnly: true,
 	}, nil
