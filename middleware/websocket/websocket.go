@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -115,7 +116,11 @@ func New(config ...Config) celeris.HandlerFunc {
 			enableCompression,
 		)
 
-		// Capture request metadata before upgrade.
+		// Capture request metadata before upgrade. On the native engines
+		// reqHeaders is the stream's own header slice, and Context.Detach
+		// (in tryEngineUpgrade) replaces its entries with clones in place,
+		// so the Conn never keeps a header view. captureQuery has no such
+		// help and clones for itself (celeris#714).
 		reqHeaders := c.RequestHeaders()
 		queryParams := captureQuery(c)
 		acceptKey := computeAcceptKey(wsKey)
@@ -321,6 +326,15 @@ func setupConn(ws *Conn, cfg *Config, compress bool,
 	ws.writePool = cfg.WriteBufferPool
 }
 
+// captureQuery copies the upgrade request's query parameters for
+// [Conn.Query]. Every key and value is cloned: on epoll and io_uring the
+// raw query is a view of the engine's receive buffer, and url.ParseQuery
+// returns substrings of it for anything it did not have to unescape. A view
+// is safe to compare while the request is being handled and unsafe to keep
+// after it, and the Conn keeps these for the connection's lifetime while the
+// engine receives the WebSocket frames into that same buffer: kept as views,
+// they read back as frame bytes, or a lookup no longer finds its key
+// (celeris#714). One copy per upgrade; nothing per message.
 func captureQuery(c *celeris.Context) [][2]string {
 	qp := c.QueryParams()
 	if len(qp) == 0 {
@@ -328,8 +342,9 @@ func captureQuery(c *celeris.Context) [][2]string {
 	}
 	result := make([][2]string, 0, len(qp))
 	for k, vs := range qp {
+		k = strings.Clone(k)
 		for _, v := range vs {
-			result = append(result, [2]string{k, v})
+			result = append(result, [2]string{k, strings.Clone(v)})
 		}
 	}
 	return result
