@@ -756,6 +756,52 @@ func TestEPOLLOUTResumeSkipsAHijackedConn(t *testing.T) {
 	}
 }
 
+// TestEPOLLOUTArmAndDisarmLeaveAReleasedNumberAlone: the loop arms and
+// disarms EPOLLOUT by the conn's number, and every site that does so for an
+// async conn does it after releasing detachMu (drainRead, the dirty pass, the
+// EPOLLOUT resume). The conn's handler can take detachMu in between and
+// hijack the conn (celeris#668), releasing the number, which another file in
+// this loop's epoll set, one a driver goroutine registered, can hold by the
+// time the MOD runs. Neither MOD may reach it (review of #698).
+func TestEPOLLOUTArmAndDisarmLeaveAReleasedNumberAlone(t *testing.T) {
+	rig := hijackRaceConn(t)
+	l, cs, local := rig.l, rig.cs, rig.local
+	cs.detachMu.Lock()
+	nc, err := l.hijackConn(local)
+	cs.detachMu.Unlock()
+	if err != nil {
+		t.Fatalf("hijackConn: %v", err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+	reissueToPipeWriteEnd(t, local)
+	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_ADD, local, &unix.EpollEvent{
+		Events: unix.EPOLLOUT,
+		Fd:     int32(local),
+	}); err != nil {
+		t.Fatalf("register the new owner of fd %d in the loop's epoll set: %v", local, err)
+	}
+	driverEvents, ok := epollEventsOf(t, l.epollFD, local)
+	if !ok {
+		t.Fatalf("apparatus: fd %d is not in the loop's epoll set after the ADD", local)
+	}
+
+	l.armEpollOut(cs)
+	if got, _ := epollEventsOf(t, l.epollFD, local); got != driverEvents {
+		t.Errorf("armEpollOut on the hijacked conn changed the events of fd %d, which another file now owns, "+
+			"from %#x to %#x", local, driverEvents, got)
+	}
+	if cs.dirty {
+		t.Error("armEpollOut put the hijacked conn on the dirty list")
+	}
+
+	cs.epollOut = true
+	l.disarmEpollOut(cs)
+	if got, _ := epollEventsOf(t, l.epollFD, local); got != driverEvents {
+		t.Errorf("disarmEpollOut on the hijacked conn changed the events of fd %d, which another file now owns, "+
+			"from %#x to %#x", local, driverEvents, got)
+	}
+}
+
 // epollEventsOf reads the event mask epfd holds for fd from
 // /proc/self/fdinfo, and whether epfd holds fd at all.
 func epollEventsOf(t *testing.T, epfd, fd int) (uint32, bool) {
