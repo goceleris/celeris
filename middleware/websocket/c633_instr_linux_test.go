@@ -41,12 +41,12 @@ import (
 // baked into this package's non-test sources. C2: C1 + c633InjectProgress. C3: C0 +
 // c633InjectAbort. C5: C0 + c633InjectReadWhileWaiting.
 const (
-	c633Variant = "C1"
+	c633Variant = "C2"
 	// H1 kill arm: the frame-completion write and the Close write give up only after
 	// c633ProgWriteIdle with no shrink of the client's send queue (SIOCOUTQ: bytes the server's
 	// kernel has not ACKed), and the close wait only after c633ProgCloseIdle with no byte
 	// received; each capped at c633ProgCap in total.
-	c633InjectProgress = false
+	c633InjectProgress = true
 	// H2 injection: every 4th client abandons its connection right after the flood (close with
 	// the echo unread -> RST), with no slowness anywhere.
 	c633InjectAbort = false
