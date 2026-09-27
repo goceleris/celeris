@@ -77,7 +77,8 @@ type WorkerLoop interface {
 	// contract, because by then its number may name another file, and the
 	// epoll engine would remove that file from its interest set. The
 	// io_uring engine is not affected: it works on its own duplicate of fd,
-	// taken by RegisterConn, and closes it when onClose fires (celeris#691).
+	// taken by RegisterConn, and closes it just before onClose fires
+	// (celeris#691).
 	UnregisterConn(fd int) error
 	// Write enqueues data for transmission on fd. The call does not block on
 	// the kernel send buffer: data is buffered and flushed asynchronously by

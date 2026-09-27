@@ -491,7 +491,7 @@ type Worker struct {
 	// driversClosed is set under driverMu by shutdownDrivers; RegisterConn
 	// refuses from then on (celeris#691). shutdownDrivers runs once, so a
 	// conn registered after it would never be retired, and the duplicate
-	// descriptor its UnregisterConn takes would never be closed.
+	// descriptor RegisterConn takes for it would never be closed.
 	driversClosed bool
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
