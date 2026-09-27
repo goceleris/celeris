@@ -1185,7 +1185,7 @@ func takeNumber(t *testing.T, fd int) (x0, x1 int) {
 }
 
 // readsNothing reports whether fd has nothing to read now. The caller first
-// makes whatever could write to it happen (a park round trip).
+// makes whatever could write to it happen.
 func readsNothing(fd int) (bool, string) {
 	var b [64]byte
 	n, err := unix.Read(fd, b[:])
@@ -1252,14 +1252,16 @@ func TestDriverRecvRearmBeforeSubmitSparesReusedNumber(t *testing.T) {
 	defer func() { _ = unix.Close(x0); _ = unix.Close(x1) }()
 	dp.release()
 
-	a.expectReleased(t, "UnregisterConn and Close while A's re-armed RECV was unsubmitted")
+	// X's byte first. A RECV armed on X completes, and takes the byte, when
+	// the worker next runs its completions, which it does before it can take
+	// P's CQE; and onClose waits for every op of A's in flight, such a RECV
+	// included. So once both have happened, X's reader decides.
 	if _, err := unix.Write(x1, []byte{'z'}); err != nil {
 		t.Fatalf("write X's peer: %v", err)
 	}
-	// A RECV armed on X completes, and takes the byte, when the worker next
-	// runs its completions, which it does before it can take P's CQE.
 	p.park()
 	p.release()
+	a.expectReleased(t, "UnregisterConn and Close while A's re-armed RECV was unsubmitted")
 	var one [1]byte
 	if n, err := unix.Read(x0, one[:]); n != 1 || err != nil {
 		t.Errorf("the socket that took A's number: its reader got n=%d err=%v, want its byte: A's RECV read it", n, err)
@@ -1308,16 +1310,13 @@ func TestDriverSendBeforeSubmitSparesReusedNumber(t *testing.T) {
 	defer func() { _ = unix.Close(x0); _ = unix.Close(x1) }()
 	dp.release()
 
-	// A's SEND, if it went by the number, is submitted at the top of the
-	// worker's next iteration, before it can take P's CQE, and a SEND on a
-	// socketpair with room completes as it is issued.
-	p.park()
-	p.release()
-	if ok, got := readsNothing(x1); !ok {
-		t.Errorf("the peer of the socket that took A's number read %s: A's SEND went to it", got)
-	}
+	// onClose waits for every op of A's in flight, the SEND included: once
+	// it has run, a SEND that went by the number has written to X.
 	if fired, _ := a.waitClosed(); !fired {
 		t.Error("A: onClose never fired")
+	}
+	if ok, got := readsNothing(x1); !ok {
+		t.Errorf("the peer of the socket that took A's number read %s: A's SEND went to it", got)
 	}
 	// A's peer may read A's bytes; after them it must read EOF.
 	var b [64]byte
