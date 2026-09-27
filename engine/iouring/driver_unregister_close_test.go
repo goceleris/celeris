@@ -361,7 +361,7 @@ func TestDriverSendFailureThenUnregisterThenClose(t *testing.T) {
 }
 
 // A register that armDriverRecv refuses (an HTTP conn took the number first)
-// leaves the conn retired, with an UnregisterConn already queued behind it.
+// leaves the conn retired, with an unregister already queued behind it.
 // That unregister must issue nothing. By the time it runs, retire has closed
 // the engine's descriptor, and its number may name another file: any dup in
 // the process takes the lowest free number, and a dup of a socket with ops
@@ -369,6 +369,13 @@ func TestDriverSendFailureThenUnregisterThenClose(t *testing.T) {
 // runs on the worker right after retire, puts V's socket on the number; a
 // cancel issued behind it would cancel V's RECV. The caller's number is
 // reused too, as it was before celeris#691, when the cancel named it.
+//
+// A register that finds the conn already unregistered is not refused
+// (TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP), so the
+// unregister behind a refusal is one whose closing store the register's
+// check did not see: an UnregisterConn racing the worker, from a caller
+// that closed fd first, outside the contract (the collision needs the
+// number free, so closed). The test queues that unregister's action itself.
 func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 	e, stop := startTestEngine(t)
 	t.Cleanup(stop)
@@ -391,13 +398,15 @@ func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RegisterConn(A): %v", err)
 	}
-	opFD = driverConnOf(w, a.fd).opFD
-	if err := wl.UnregisterConn(a.fd); err != nil {
-		t.Fatalf("UnregisterConn: %v", err)
-	}
+	adc := driverConnOf(w, a.fd)
+	opFD = adc.opFD
 	_ = unix.Close(a.fd)
 	fd := a.fd
-	p.onWorker(func() { w.conns[fd] = &connState{fd: fd} }) // an HTTP conn took the number
+	p.onWorker(func() {
+		w.conns[fd] = &connState{fd: fd} // an HTTP conn took the number
+		// The racing UnregisterConn's action, queued behind the register.
+		w.addDriverAction(driverAction{kind: driverActionUnregister, dc: adc})
+	})
 	if err := unix.Dup3(v.fd, a.fd, unix.O_CLOEXEC); err != nil {
 		t.Fatalf("dup3: %v", err)
 	}
@@ -812,11 +821,29 @@ func TestDriverUnregisterCyclesReleaseDescriptors(t *testing.T) {
 			d.expectReleased(t, "send-failure")
 			d.closePeer()
 		})
-		// armDriverRecv refuses the register with an UnregisterConn queued
-		// behind it.
-		cycle("refused", i, true, func(d *testDriver) {
+		// Unregistered and closed while the register is still queued, and
+		// an HTTP accept takes the number before the worker applies it: the
+		// register is a no-op, and the cancel releases the conn.
+		cycle("unregistered-then-taken", i, true, func(d *testDriver) {
 			fd := d.fd
 			_ = wl.UnregisterConn(fd)
+			_ = unix.Close(fd)
+			p.onWorker(func() { w.conns[fd] = &connState{fd: fd} })
+			p.release()
+			d.expectReleased(t, "unregistered-then-taken")
+			if d.closeErr != nil {
+				t.Errorf("unregistered-then-taken: onClose(%v), want nil: the conn was unregistered", d.closeErr)
+			}
+			p.park()
+			p.onWorker(func() { w.conns[fd] = nil })
+			p.release()
+			d.closePeer()
+		})
+		// armDriverRecv refuses the register: the caller closed fd without
+		// unregistering (outside the contract), and an HTTP accept took the
+		// number.
+		cycle("refused", i, true, func(d *testDriver) {
+			fd := d.fd
 			_ = unix.Close(fd)
 			p.onWorker(func() { w.conns[fd] = &connState{fd: fd} })
 			p.release()
@@ -1268,5 +1295,256 @@ func TestDriverSendBeforeSubmitSparesReusedNumber(t *testing.T) {
 	p.park()
 	p.onWorker(func() { dp.markHTTP(w, false) })
 	p.release()
+	p.d.unregisterAndWait(t, wl)
+}
+
+// stuckSendDriver is a driver conn A with a SEND in flight to a peer that
+// does not read. A's onRecv parks the worker (park), and A's onClose
+// records how many of A's ops were still counted in flight when it ran.
+type stuckSendDriver struct {
+	a       *testDriver
+	dc      *driverConn
+	park    *workerPark
+	atClose int // A's inflightOps when onClose ran; read after onClose
+}
+
+func newStuckSendDriver(t *testing.T, w *Worker, wl engine.WorkerLoop) *stuckSendDriver {
+	t.Helper()
+	s := &stuckSendDriver{atClose: -1}
+	a := &testDriver{closed: make(chan error, 1)}
+	a.fd, a.peer = nonblockSocketPair(t)
+	p := &workerPark{t: t, entered: make(chan chan func()), d: a}
+	if err := wl.RegisterConn(a.fd, func([]byte) {
+		run := make(chan func())
+		p.entered <- run
+		for f := range run {
+			f()
+		}
+	}, func(err error) {
+		s.dc.mu.Lock()
+		s.atClose = s.dc.inflightOps
+		s.dc.mu.Unlock()
+		a.closed <- err
+	}); err != nil {
+		t.Fatalf("RegisterConn(A): %v", err)
+	}
+	t.Cleanup(func() {
+		if p.run != nil {
+			close(p.run)
+			p.run = nil
+		}
+	})
+	settleDriverRecv(t, w, a.fd)
+	s.a, s.dc, s.park = a, driverConnOf(w, a.fd), p
+
+	// More than the pair buffers: the first SEND completes short, and the
+	// SEND flushDriverSend then issues for the rest waits in the kernel.
+	if err := wl.Write(a.fd, make([]byte, 4<<20)); err != nil {
+		t.Fatalf("Write(A): %v", err)
+	}
+	stuck := func() (bool, int) {
+		s.dc.mu.Lock()
+		defer s.dc.mu.Unlock()
+		return s.dc.sending && s.dc.recvArmed && s.dc.inflightOps == 2, len(s.dc.sendBuf)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if ok, n := stuck(); ok {
+			time.Sleep(50 * time.Millisecond)
+			if ok2, n2 := stuck(); ok2 && n2 == n {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("apparatus: A's SEND never waited in the kernel with its RECV armed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return s
+}
+
+// drainPeer reads d's peer to its end for up to 5 s: "EOF" once the socket
+// is closed and whatever was sent before has been read.
+func (d *testDriver) drainPeer() string {
+	buf := make([]byte, 64<<10)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		n, err := unix.Read(d.peer, buf)
+		switch {
+		case err == nil && n == 0:
+			return "EOF"
+		case err == nil:
+			continue
+		case !errors.Is(err, unix.EAGAIN):
+			return err.Error()
+		}
+		if time.Now().After(deadline) {
+			return "open"
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Within the contract, UnregisterConn then Close at once, while a re-arm of
+// A's RECV waits in the queue as a register (the SQ was full when A's RECV
+// completed) and A's SEND waits in the kernel on a slow peer. An accept on
+// the worker takes the closed number before the worker applies the
+// register. armDriverRecv checked the number before closing and refused A:
+// A left the worker with its SEND still in the kernel, so nothing reachable
+// held the buffer the kernel was reading, and onClose had the refusal's
+// error instead of nil. The register must be a no-op for an unregistered
+// conn, whose cancel then releases it after its SEND's CQE, with nil.
+func TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	p := newWorkerPark(t, w, wl)
+	s := newStuckSendDriver(t, w, wl)
+	defer s.a.closePeer()
+	defer runtime.KeepAlive(s.dc)
+	fd := s.a.fd
+
+	s.park.park() // inside A's onRecv: A's RECV has completed
+	// What armDriverRecv does when the re-arm after this onRecv finds the
+	// SQ full.
+	s.park.onWorker(func() { w.addDriverAction(driverAction{kind: driverActionRegister, dc: s.dc}) })
+	if err := wl.UnregisterConn(fd); err != nil {
+		t.Fatalf("UnregisterConn(A): %v", err)
+	}
+	_ = unix.Close(fd)
+	s.park.onWorker(func() { w.conns[fd] = &connState{fd: fd} }) // an accept took the number
+	s.park.release()
+
+	fired, err := s.a.waitClosed()
+	switch {
+	case !fired:
+		t.Error("A: onClose never fired")
+	case err != nil:
+		t.Errorf("A: onClose(%v), want nil: A was unregistered", err)
+	}
+	if fired && s.atClose != 0 {
+		t.Errorf("A left the worker with %d op(s) still in flight: its SEND, whose buffer nothing held after", s.atClose)
+	}
+	if peer := s.a.drainPeer(); peer != "EOF" {
+		t.Errorf("A's peer reads %s after draining, want EOF", peer)
+	}
+
+	p.park()
+	p.onWorker(func() { w.conns[fd] = nil })
+	p.release()
+	p.d.unregisterAndWait(t, wl)
+}
+
+// Outside the contract, the same stuck SEND: the caller closes fd without
+// unregistering, and an accept takes the number, so the re-arm after A's
+// onRecv finds it taken and refuses A. The refusal must wait for A's SEND,
+// as failDriverConn does, before A leaves the worker.
+func TestDriverRefusedRegisterWaitsForItsSend(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	p := newWorkerPark(t, w, wl)
+	s := newStuckSendDriver(t, w, wl)
+	defer s.a.closePeer()
+	defer runtime.KeepAlive(s.dc)
+	fd := s.a.fd
+
+	s.park.park() // inside A's onRecv; armDriverRecv re-arms after it
+	_ = unix.Close(fd)
+	s.park.onWorker(func() { w.conns[fd] = &connState{fd: fd} }) // an accept took the number
+	s.park.release()
+
+	fired, err := s.a.waitClosed()
+	if !fired || err == nil {
+		t.Errorf("A: onClose fired=%v with %v, want the refusal's error", fired, err)
+	}
+	if fired && s.atClose != 0 {
+		t.Errorf("A left the worker with %d op(s) still in flight: its SEND, whose buffer nothing held after", s.atClose)
+	}
+	if peer := s.a.drainPeer(); peer != "EOF" {
+		t.Errorf("A's peer reads %s after draining, want EOF", peer)
+	}
+
+	p.park()
+	p.onWorker(func() { w.conns[fd] = nil })
+	p.release()
+	p.d.unregisterAndWait(t, wl)
+}
+
+// An UnregisterConn that lands between RegisterConn's map insert and its
+// addDriverAction queues the unregister ahead of the register. The worker
+// then prepares the cancel, counted, and applies the register after it,
+// with the number closed and taken by an accept meanwhile. Refusing there
+// retired A and closed its engine descriptor with that cancel unsubmitted:
+// the kernel resolved the number at the submit, and A's onClose had put V's
+// socket on it, so the cancel cancelled V's RECV (celeris#707's SQE side).
+// The register must be a no-op for an unregistered conn. The test puts the
+// queue in that order on the worker.
+func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+
+	v := registerSettledDriver(t, w, wl)
+	p := newWorkerPark(t, w, wl)
+
+	p.park()
+	a := &testDriver{closed: make(chan error, 1)}
+	a.fd, a.peer = nonblockSocketPair(t)
+	defer a.closePeer()
+	opFD := -1
+	var dupErr error
+	if err := wl.RegisterConn(a.fd, func([]byte) {}, func(err error) {
+		dupErr = unix.Dup3(v.fd, opFD, unix.O_CLOEXEC)
+		a.closed <- err
+	}); err != nil {
+		t.Fatalf("RegisterConn(A): %v", err)
+	}
+	opFD = driverConnOf(w, a.fd).opFD
+	if err := wl.UnregisterConn(a.fd); err != nil {
+		t.Fatalf("UnregisterConn(A): %v", err)
+	}
+	swapped := false
+	p.onWorker(func() {
+		w.driverActionMu.Lock()
+		q := w.driverActionQueue
+		if len(q) == 2 && q[0].kind == driverActionRegister && q[1].kind == driverActionUnregister {
+			q[0], q[1] = q[1], q[0]
+			swapped = true
+		}
+		w.driverActionMu.Unlock()
+	})
+	if !swapped {
+		p.release()
+		t.Fatal("apparatus: the queue behind the park was not [register A, unregister A]")
+	}
+	_ = unix.Close(a.fd)
+	fd := a.fd
+	p.onWorker(func() { w.conns[fd] = &connState{fd: fd} }) // an accept took the number
+	p.release()
+
+	fired, err := a.waitClosed()
+	switch {
+	case !fired:
+		t.Error("A: onClose never fired")
+	case err != nil:
+		t.Errorf("A: onClose(%v), want nil: A was unregistered", err)
+	}
+	if fired && dupErr != nil {
+		t.Fatalf("dup3 onto the engine's closed number %d: %v", opFD, dupErr)
+	}
+	// An SQE still in the SQ is submitted at the top of the worker's next
+	// iteration: let that happen before V's byte.
+	time.Sleep(100 * time.Millisecond)
+	v.expectReceives(t, "the socket put on the unregistered conn's engine number when it was released")
+	if peer := a.peerSees(); peer != "EOF" {
+		t.Errorf("A's peer reads %s, want EOF", peer)
+	}
+
+	p.park()
+	p.onWorker(func() { w.conns[fd] = nil })
+	p.release()
+	if fired {
+		_ = unix.Close(opFD) // v's second number
+	}
+	v.unregisterAndWait(t, wl)
 	p.d.unregisterAndWait(t, wl)
 }
