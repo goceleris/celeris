@@ -1501,6 +1501,17 @@ func (w *Worker) run(ctx context.Context) {
 			if !w.sqpoll && w.ring.Pending() > 0 {
 				_, _ = w.ring.Submit()
 			}
+			// A parked worker holds nothing, and sweep() — whose empty-set
+			// retraction is what clears this worker's share of the residual
+			// gauges while it runs — does not run again until it wakes.
+			// sweep() runs before checkTimeouts here, so every Read, Idle or
+			// Write timeout close of a draining worker's last connection
+			// used to leave its residue standing in TransplantResidual* for
+			// as long as the park lasted (celeris#711). Retract here, where
+			// the sweep stops.
+			if len(w.liveConns) == 0 {
+				w.sweepRetract()
+			}
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() ||
 				w.driverActionPending.Load() != 0 || w.detachQPending.Load() != 0 {
