@@ -83,6 +83,9 @@ type chanReader struct {
 	spill    [][]byte
 	spillMax int // max chunks held in spill; 0 disables spilling
 
+	mdropOff  int64 // MUTANT mdrop1: stream bytes appended so far
+	mdropConn int64 // MUTANT mdrop1: the connection index frame 0 carries, -1 unknown
+
 	// metrics
 	dropped atomic.Uint64 // chunks dropped because the spill limit was hit
 	spilled atomic.Uint64 // chunks that had to spill past the channel
@@ -173,6 +176,7 @@ func (r *chanReader) Append(chunk []byte) bool {
 	if r.closed.Load() {
 		return false
 	}
+	chunk = r.mdrop1(chunk)
 	// Ordering: once anything has spilled, every later chunk must queue
 	// behind it. Append is the only producer, so an empty spill observed
 	// here cannot become non-empty before the channel send below.
@@ -451,4 +455,37 @@ func (r *chanReader) Dropped() uint64 {
 // offered load, not an error.
 func (r *chanReader) Spilled() uint64 {
 	return r.spilled.Load()
+}
+
+// MUTANT mdrop1 (lane B-2b, PR #749 review): drop exactly one whole 126-byte frame, once per process,
+// from the stream of the connection whose frame 0 carries connection index 0 (the inbound oracle's
+// payload: seq at 0..8, connection index at 8..16, masked with 11 22 33 44), at the first frame
+// boundary past 64 KiB. Append is single-producer, so the two fields need no lock.
+var mdrop1Done atomic.Bool
+
+func (r *chanReader) mdrop1(chunk []byte) []byte {
+	off := r.mdropOff
+	r.mdropOff += int64(len(chunk))
+	if off == 0 {
+		r.mdropConn = -1
+		if len(chunk) >= 22 {
+			m := [4]byte{0x11, 0x22, 0x33, 0x44}
+			var idx int64
+			for j := 0; j < 8; j++ {
+				idx = idx<<8 | int64(chunk[14+j]^m[(8+j)%4])
+			}
+			r.mdropConn = idx
+		}
+	}
+	if r.mdropConn != 0 || mdrop1Done.Load() || off+int64(len(chunk)) <= 65536 {
+		return chunk
+	}
+	b := (max(off, 65536) + 125) / 126 * 126
+	if b+126 > off+int64(len(chunk)) || !mdrop1Done.CompareAndSwap(false, true) {
+		return chunk
+	}
+	i := b - off
+	out := make([]byte, 0, len(chunk)-126)
+	out = append(out, chunk[:i]...)
+	return append(out, chunk[i+126:]...)
 }
