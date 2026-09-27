@@ -2680,18 +2680,7 @@ func (l *Loop) drainDetachQueue() {
 func (l *Loop) relink(cs *connState) {
 	l.removeDirty(cs)
 	if cs.epollOut {
-		// The goroutine holding detachMu may be a handler that hijacks the
-		// conn (celeris#668). Its hijack stores hijacked, clears the slot
-		// under driverMu, and only then closes the descriptor, whose number
-		// another file, one a driver goroutine adds to this epoll set, can
-		// take at once. Read under driverMu, hijacked false means the
-		// descriptor is not closed yet, so the MOD cannot reach that file.
-		// A hijacked conn is out of the epoll set already.
-		l.driverMu.Lock()
-		if !cs.hijacked.Load() {
-			l.disarmEpollOut(cs)
-		}
-		l.driverMu.Unlock()
+		l.disarmEpollOut(cs)
 	}
 	cs.relinkPending = true
 }
@@ -2808,10 +2797,11 @@ func (l *Loop) armEpollOut(cs *connState) {
 	if cs.epollOut {
 		return
 	}
-	if err := unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLOUT | unix.EPOLLRDHUP,
-		Fd:     int32(cs.fd),
-	}); err == nil {
+	issued, err := l.modEpollOut(cs, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLOUT|unix.EPOLLRDHUP)
+	if !issued {
+		return // hijacked: drainDetachQueue settles the conn
+	}
+	if err == nil {
 		cs.epollOut = true
 	} else {
 		// MOD failed (should not happen for a registered fd); fall back to
@@ -2827,11 +2817,34 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 	if !cs.epollOut {
 		return
 	}
-	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
+	_, _ = l.modEpollOut(cs, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLRDHUP)
+	cs.epollOut = false
+}
+
+// modEpollOut sets cs's interest in this loop's epoll set to events, by
+// cs.fd, and reports whether it issued the MOD, and the MOD's error.
+//
+// It does not issue it for a conn an async Hijack has taken (celeris#668).
+// Every site that arms or disarms EPOLLOUT for an async conn does so without
+// detachMu, or after failing to take it, so the conn's handler can hijack it
+// meanwhile. The hijack stores hijacked, clears the slot under driverMu, and
+// only then closes the descriptor, whose number another file can take at
+// once, one a driver goroutine adds to this epoll set among them. Read under
+// driverMu, hijacked false means the descriptor is still the conn's until
+// the MOD has run. A hijacked conn is out of the epoll set already. A sync
+// conn is only ever hijacked inline, on this thread, so it skips the lock.
+func (l *Loop) modEpollOut(cs *connState, events uint32) (issued bool, err error) {
+	if cs.detachMu != nil {
+		l.driverMu.RLock()
+		defer l.driverMu.RUnlock()
+		if cs.hijacked.Load() {
+			return false, nil
+		}
+	}
+	return true, unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
+		Events: events,
 		Fd:     int32(cs.fd),
 	})
-	cs.epollOut = false
 }
 
 // handleWritable resumes a backpressured conn on an EPOLLOUT event: flush
