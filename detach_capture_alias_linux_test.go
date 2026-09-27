@@ -5,6 +5,7 @@ package celeris_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,19 +23,22 @@ import (
 // TestDetachedContextKeepsRequestValues pins celeris#718, the Context.Detach
 // twin of celeris#714.
 //
-// On epoll and io_uring every request string is a view of the engine's
-// receive buffer, and the engine keeps receiving into that buffer after a
-// handler detaches. Detach therefore clones what it knows refers to the
-// buffer. It cloned the headers, method, path and raw query, but not the
-// route params, the parsed query and cookie caches, the Host it serves from
-// Stream.Authority, or the strings middleware store on the Context (request
-// ID, client-IP/host/scheme overrides, SetString values). The handler below
-// sets each of those the way the in-tree middleware does, detaches, and reads
-// them back from its goroutine after the peer has sent more bytes (on which
-// the native engines close the connection). Odd streams carry an
-// X-Forwarded-Host, so Host is served from the SetHost override there and
-// from Stream.Authority on even streams. Path, RawQuery and Header were
-// already cloned and are the controls.
+// On epoll and io_uring every request string, and the request body, is a
+// view of the engine's receive buffer, and the engine keeps receiving into
+// that buffer after a handler detaches. Detach therefore copies what it knows
+// refers to the buffer. It copied the headers, method, path and raw query,
+// but not the route params, the parsed query and cookie caches, the Host it
+// serves from Stream.Authority, the strings middleware store on the Context
+// (request ID, client-IP/host/scheme overrides, SetString values), the
+// response headers middleware set from request headers (the requestid and
+// cors echoes, which a detached goroutine serializes when it writes the
+// response head), or the body (and so a form parsed from it after the
+// call). The handler below sets each of those the way the in-tree middleware
+// does, detaches, and reads them back from its goroutine after the peer has
+// sent more bytes (on which the native engines close the connection). Odd
+// streams carry an X-Forwarded-Host, so Host is served from the SetHost
+// override there and from Stream.Authority on even streams. Path, RawQuery
+// and Header were already copied and are the controls.
 func TestDetachedContextKeepsRequestValues(t *testing.T) {
 	type arm struct {
 		name   string
@@ -46,14 +50,15 @@ func TestDetachedContextKeepsRequestValues(t *testing.T) {
 		{"epoll", celeris.Epoll, false},
 		{"epoll-async", celeris.Epoll, true},
 	}
-	if p := probe.Probe(); p.IOUringTier >= celerisengine.High && p.ProvidedBuffers {
+	if ok, p := c714ProbeIOUring(); ok {
 		arms = append(arms, arm{"io_uring", celeris.IOUring, false}, arm{"io_uring-async", celeris.IOUring, true})
 	} else if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
 		t.Fatalf("io_uring tier=%s kernel=%s, and CELERIS_REQUIRE_IOURING_WORKERS=1 forbids dropping the io_uring arms", p.IOUringTier, p.KernelVersion)
 	} else {
 		t.Logf("io_uring tier=%s kernel=%s: io_uring arms not run", p.IOUringTier, p.KernelVersion)
 	}
-	fields := []string{"param", "query", "cookie", "host", "scheme", "requestid", "clientip", "setstring", "path", "rawquery", "header"}
+	fields := []string{"param", "query", "cookie", "host", "scheme", "requestid", "clientip", "setstring",
+		"resp-requestid", "resp-cors", "resp-key", "body", "form", "path", "rawquery", "header"}
 
 	for _, a := range arms {
 		t.Run(a.name, func(t *testing.T) {
@@ -64,16 +69,18 @@ func TestDetachedContextKeepsRequestValues(t *testing.T) {
 			if a.engine == celeris.Std {
 				wait = 300 * time.Millisecond
 			}
-			srv := celeris.New(celeris.Config{Engine: a.engine, AsyncHandlers: a.async})
-			srv.GET("/d/:id", func(c *celeris.Context) error {
+			handler := func(c *celeris.Context) error {
 				// What an ordinary middleware chain leaves on the Context
 				// before a streaming handler detaches.
-				_ = c.QueryParams()                             // a query validator
-				_, _ = c.Cookie("sid")                          // session
-				c.SetRequestID(c.Header("x-request-id"))        // requestid
-				c.SetClientIP(c.Header("x-real-ip"))            // proxy
-				c.SetScheme(c.Header("x-forwarded-proto"))      // proxy
-				c.SetString("principal", c.Header("x-api-key")) // keyauth
+				_ = c.QueryParams()                                            // a query validator
+				_, _ = c.Cookie("sid")                                         // session
+				c.SetRequestID(c.Header("x-request-id"))                       // requestid
+				c.SetHeaderTrust("x-request-id", c.Header("x-request-id"))     // requestid echo
+				c.SetHeader("access-control-allow-origin", c.Header("origin")) // cors echo
+				c.SetHeader(c.Header("x-echo-header"), "echo")                 // a key taken from the request
+				c.SetClientIP(c.Header("x-real-ip"))                           // proxy
+				c.SetScheme(c.Header("x-forwarded-proto"))                     // proxy
+				c.SetString("principal", c.Header("x-api-key"))                // keyauth
 				if h := c.Header("x-forwarded-host"); h != "" {
 					c.SetHost(h) // proxy
 				}
@@ -102,16 +109,13 @@ func TestDetachedContextKeepsRequestValues(t *testing.T) {
 				}
 				finish()
 				return nil
-			})
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
 			}
-			ctx, cancel := context.WithCancel(context.Background())
-			done := make(chan error, 1)
-			go func() { done <- srv.StartWithListenerAndContext(ctx, ln) }()
-			defer func() { cancel(); <-done }()
-			addr := waitDetachServer(t, srv)
+			addr, stopServer := startC714DetachServer(t, func() *celeris.Server {
+				srv := celeris.New(celeris.Config{Engine: a.engine, AsyncHandlers: a.async})
+				srv.POST("/d/:id", handler)
+				return srv
+			})
+			defer stopServer()
 
 			n := 20
 			if a.engine == celeris.Std {
@@ -125,8 +129,9 @@ func TestDetachedContextKeepsRequestValues(t *testing.T) {
 				if want["fwdhost"] != "" {
 					fwd = "X-Forwarded-Host: " + want["fwdhost"] + "\r\n"
 				}
-				req := fmt.Sprintf("GET /d/%s?q=%s HTTP/1.1\r\nHost: %s\r\n%sCookie: sid=%s\r\nX-Request-Id: %s\r\nX-Real-Ip: %s\r\nX-Forwarded-Proto: %s\r\nX-Api-Key: %s\r\nX-Id: %s\r\n\r\n",
-					want["param"], want["query"], want["authority"], fwd, want["cookie"], want["requestid"], want["clientip"], want["scheme"], want["setstring"], want["header"])
+				form := "f=" + want["form"]
+				req := fmt.Sprintf("POST /d/%s?q=%s HTTP/1.1\r\nHost: %s\r\n%sCookie: sid=%s\r\nX-Request-Id: %s\r\nOrigin: %s\r\nX-Echo-Header: %s\r\nX-Real-Ip: %s\r\nX-Forwarded-Proto: %s\r\nX-Api-Key: %s\r\nX-Id: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s",
+					want["param"], want["query"], want["authority"], fwd, want["cookie"], want["requestid"], want["resp-cors"], want["resp-key"], want["clientip"], want["scheme"], want["setstring"], want["header"], len(form), form)
 				conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 				if err != nil {
 					t.Fatal(err)
@@ -187,18 +192,23 @@ func TestDetachedContextKeepsRequestValues(t *testing.T) {
 func expectedDetachedView(i int) map[string]string {
 	id := fmt.Sprintf("id%06d", i)
 	v := map[string]string{
-		"param":     id,
-		"query":     "q" + id,
-		"cookie":    "sid" + id,
-		"authority": "h" + id + ".example",
-		"host":      "h" + id + ".example",
-		"scheme":    "https",
-		"requestid": "rid" + id,
-		"clientip":  fmt.Sprintf("10.0.%d.%d", i/250, i%250+1),
-		"setstring": "key" + id,
-		"path":      "/d/" + id,
-		"rawquery":  "q=q" + id,
-		"header":    id,
+		"param":          id,
+		"query":          "q" + id,
+		"cookie":         "sid" + id,
+		"authority":      "h" + id + ".example",
+		"host":           "h" + id + ".example",
+		"scheme":         "https",
+		"requestid":      "rid" + id,
+		"clientip":       fmt.Sprintf("10.0.%d.%d", i/250, i%250+1),
+		"setstring":      "key" + id,
+		"resp-requestid": "rid" + id,
+		"resp-cors":      "https://o" + id + ".example",
+		"resp-key":       "x-echo-" + id,
+		"body":           "f=form" + id,
+		"form":           "form" + id,
+		"path":           "/d/" + id,
+		"rawquery":       "q=q" + id,
+		"header":         id,
 	}
 	if i%2 == 1 {
 		v["fwdhost"] = "fh" + id + ".example"
@@ -210,7 +220,7 @@ func expectedDetachedView(i int) map[string]string {
 func detachedView(c *celeris.Context) map[string]string {
 	cookie, _ := c.Cookie("sid")
 	principal, _ := c.GetString("principal")
-	return map[string]string{
+	v := map[string]string{
 		"param":     c.Param("id"),
 		"query":     c.Query("q"),
 		"cookie":    cookie,
@@ -219,24 +229,107 @@ func detachedView(c *celeris.Context) map[string]string {
 		"requestid": c.RequestID(),
 		"clientip":  c.ClientIP(),
 		"setstring": principal,
-		"path":      c.Path(),
-		"rawquery":  c.RawQuery(),
-		"header":    c.Header("x-id"),
+		// The body is read, and the form parsed from it, only here, after
+		// the peer has sent more bytes: a streaming handler that binds its
+		// input in the goroutine it starts.
+		"body":     string(c.Body()),
+		"form":     c.FormValue("f"),
+		"path":     c.Path(),
+		"rawquery": c.RawQuery(),
+		"header":   c.Header("x-id"),
+	}
+	// What the goroutine would serialize if it wrote the response head now
+	// (Blob, NoContent, or StreamWriter.WriteHeader(code, c.ResponseHeaders())).
+	for _, h := range c.ResponseHeaders() {
+		switch {
+		case h[0] == "x-request-id":
+			v["resp-requestid"] = h[1]
+		case h[0] == "access-control-allow-origin":
+			v["resp-cors"] = h[1]
+		case h[1] == "echo":
+			v["resp-key"] = h[0]
+		}
+	}
+	return v
+}
+
+// startC714DetachServer starts the server mk builds on a fresh loopback
+// listener and returns its address and a shutdown closure.
+//
+// An io_uring start that fails only with ENOMEM is retried, with a new
+// server, for up to 10 s. The kernel charges ring memory to RLIMIT_MEMLOCK
+// per UID and gives it back 12-23 ms after a ring closes
+// (engine/iouring/ring_budget_linux_test.go), so at the CI runner's 8 MiB a
+// start made right after the previous arm stopped, or while another
+// package's test binary holds rings, can fail although nothing leaked.
+func startC714DetachServer(t *testing.T, mk func() *celeris.Server) (string, func()) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for tries := 1; ; tries++ {
+		s := mk()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
+		addr, err := c714WaitReady(s, done)
+		if err == nil {
+			if tries > 1 {
+				t.Logf("server start retried on ring ENOMEM: %d tries", tries)
+			}
+			return addr, func() { cancel(); <-done }
+		}
+		cancel()
+		_ = ln.Close()
+		if strings.Contains(err.Error(), "cannot allocate memory") && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		t.Fatalf("server did not start: %v", err)
 	}
 }
 
-func waitDetachServer(t *testing.T, s *celeris.Server) string {
-	t.Helper()
+// c714WaitReady waits until s accepts connections, or its start returns.
+func c714WaitReady(s *celeris.Server, done <-chan error) (string, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			if err == nil {
+				err = errors.New("start returned before the server was ready")
+			}
+			return "", err
+		default:
+		}
 		if a := s.Addr(); a != nil {
 			if c, err := net.DialTimeout("tcp", a.String(), 100*time.Millisecond); err == nil {
 				_ = c.Close()
-				return a.String()
+				return a.String(), nil
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("server not ready within 30s")
-	return ""
+	return "", errors.New("server not ready within 30s")
+}
+
+// c714ProbeIOUring probes the kernel's io_uring support. With
+// CELERIS_REQUIRE_IOURING_WORKERS=1 a probe that finds no usable ring is
+// retried for up to 10 s before the io_uring arms count as missing: the
+// probe's ring can fail with ENOMEM against RLIMIT_MEMLOCK while the rings
+// of engines stopped moments ago, or of another test binary run by the same
+// user, are still charged (engine/iouring/ring_budget_linux_test.go).
+func c714ProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
+	p = probe.Probe()
+	usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers
+	if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") != "1" {
+		return usable, p
+	}
+	for deadline := time.Now().Add(10 * time.Second); !usable && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		p = probe.Probe()
+		usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers
+	}
+	return usable, p
 }
