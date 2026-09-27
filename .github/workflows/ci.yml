@@ -213,6 +213,10 @@ jobs:
       # later change makes them not fit, the require-workers env turns the
       # ENOMEM into a red job instead of a skip. That is intended.
       #
+      # It runs even when a step above failed: the engine/iouring step above
+      # can go red on a pre-existing flake (celeris#691), and that must not
+      # hide whether these tests pass.
+      #
       # That 8 MiB is also what makes this the one-worker leg of the
       # fd-lifetime tests: through the Listen path it funds a single io_uring
       # worker, the shape in which every hand-off loss was measured (all
@@ -221,6 +225,7 @@ jobs:
       # line and every one to read workers=1, so a runner that funds more
       # workers fails here instead of silently testing another shape.
       - name: celeris#657 hand-off witness, fd-lifetime and sweep tests, one io_uring worker (skipping forbidden)
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           CELERIS_REQUIRE_IOURING_WORKERS: "1"
@@ -330,8 +335,16 @@ jobs:
       # still lets its parent report PASS.
       #
       # memlock is raised because the io_uring half needs a worker, and the
-      # REQUIRE variables turn every environment skip into a failure.
+      # REQUIRE variables turn every environment skip into a failure. The
+      # list also holds the PauseAccept wait's wakeup test: a standalone
+      # PauseAccept blocks on the engine's notification through the linger
+      # instead of polling every millisecond.
+      #
+      # It runs even when a step above failed, like the two before it: a
+      # red engine/iouring step (celeris#691, pre-existing) must not hide
+      # whether the celeris#662 tests pass.
       - name: celeris#662 pause linger tests (skipping forbidden)
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           CELERIS_REQUIRE_IOURING_WORKERS: "1"
@@ -340,7 +353,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          both='TestPauseAcceptServesDeferredIdleConnections|TestPauseAcceptServesArrivalsDuringLinger|TestPauseAcceptLingerAnchoredAtClear|TestResumeDuringLingerRestoresDeferAccept|TestShutdownDuringLingerIsPrompt|TestPauseAcceptNoLingerResetsDeferredIdleConnections|TestPauseAcceptNoClearLosesArrivals|TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestPauseAcceptIdleControl|TestListenSocketDeferAcceptFollowsConfig|TestLingerArrivalsReachTheIncomingEngine'
+          both='TestPauseAcceptServesDeferredIdleConnections|TestPauseAcceptServesArrivalsDuringLinger|TestPauseAcceptLingerAnchoredAtClear|TestResumeDuringLingerRestoresDeferAccept|TestShutdownDuringLingerIsPrompt|TestPauseAcceptNoLingerResetsDeferredIdleConnections|TestPauseAcceptNoClearLosesArrivals|TestPauseAcceptKeepsHandshakedIdleConnections|TestPauseAcceptDeferredIdleConnectionsAreHidden|TestPauseAcceptIdleControl|TestListenSocketDeferAcceptFollowsConfig|TestLingerArrivalsReachTheIncomingEngine|TestPauseAcceptWaitIsWoken'
           iouringonly='TestAcceptRearmedDuringLinger|TestAcceptRearmRetriedAfterSQFull'
           names="${both}|${iouringonly}"
           want=$(( 2 * $(tr '|' '\n' <<<"$both" | wc -l) + $(tr '|' '\n' <<<"$iouringonly" | wc -l) ))
@@ -360,8 +373,11 @@ jobs:
       # every connection it had deferred at its first timer, so the pause
       # also sets TCP_SYNCNT=1 there. T4 proves the guard serves them and N3
       # proves the loss without it. Both skip at any other value, so this
-      # step sets the sysctl (restored on exit) and forbids the skip.
+      # step sets the sysctl (restored on exit) and forbids the skip. It runs
+      # even when a step above failed: the engine/iouring step's allow-list
+      # leaves these two to this step.
       - name: celeris#662 tcp_synack_retries=0 guard (skipping forbidden)
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           CELERIS_REQUIRE_IOURING_WORKERS: "1"
@@ -434,50 +450,26 @@ jobs:
       # a failure, so this job cannot go green by skipping them.
       #
       # Quarantined by name, each with its open issue. Delete the entry when
-      # the issue closes: TestRampH1Sync and TestRampH1Async (celeris#657 as
-      # well -- see below). The other three up-switch tests keep running.
+      # the issue closes: TestRampH1Sync and TestRampH1Async, celeris#708.
+      # The other three up-switch tests keep running.
+      #
+      # The two ramps were quarantined for celeris#657 and celeris#662, both
+      # fixed now: with the two fixes together they PASS locally (m128,
+      # -race, every high phase at epoll=0 of 2048, no read reset), and on
+      # main without the #662 fix they fail with the accept hand-over's read
+      # resets. Neither has passed on a GitHub-hosted runner yet, and the
+      # repository's lift rule is >= 6 GitHub-hosted runs of identical bytes,
+      # all green, which celeris#708 tracks together with the evidence. When
+      # they are lifted, their names go into a PASS tally below so they
+      # cannot go quiet again.
       #
       # TestBidirectionalFlapAsync was the third entry, quarantined for
       # celeris#657 itself. PR-3 fixes what it was failing on -- at a flap the
       # outgoing engine kept 35-51 of 64 connections on the base and 0 on the
-      # fix, 8 of 8 each -- and it is un-skipped here under the lift rule the
-      # design decision sets: only after >= 6 GitHub-hosted re-runs of
-      # identical bytes all pass. Those re-runs are recorded on the PR. It is
-      # in the placement tally below, so it cannot go quiet again.
-      #
-      # The previous commit lifted the two Ramp tests' quarantine on the
-      # strength of the celeris#662 fix. CI disagreed, twice, so the lift is
-      # reverted here. Run 35082406457 (first attempt and a re-run of
-      # identical bytes, memlock unlimited, the fix applied) tallied 91 PASS /
-      # 2 FAIL / 0 SKIP both times, and those two were the only failures:
-      #   * celeris#662's own loss class IS gone. Sync phase 0 held 2048 of
-      #     2048 with err=0, where the issue recorded 1363 held and 685
-      #     client-visible "read: ... connection reset by peer". The job-wide
-      #     read-reset count was 0. The 52 resets left are at DIAL -- a
-      #     handshake still in progress when the listen socket closes, which
-      #     acceptQueuedOnPause documents as not covered and inherent.
-      #   * async phase 4: io_uring=1316-1318 of 2048 after 20 s, err=0 across
-      #     938,818 requests. Nothing is dropped; the transplant does not
-      #     finish. That is celeris#657.
-      #   * sync phases 3 and 5: connections stranded on the down-switch.
-      # Neither remaining failure is accept-time loss, so both names went back
-      # on -skip under celeris#657 and the PASS tally that demanded two PASS
-      # lines went with them. Un-skipping them would have left this job
-      # permanently red, which is worse than the quarantine: a job that can
-      # never be green stops being read.
-      #
-      # WHAT THE REBASE ONTO celeris#657's FIX MEASURES. Both halves of
-      # celeris#657 are now on main (#681, #687), and on this branch rebased
-      # onto them the two Ramp tests PASS locally: 3 containers, golang:1.27,
-      # --cpus 4, memlock 128 MiB (4 io_uring workers), -race, one package
-      # per container. Every high phase reads epoll=0 of 2048 and settles in
-      # 2.50-2.55 s, where the pre-rebase branch left 972-1170 on the
-      # outgoing epoll after 20 s; err=0 over 6.76M requests and the error
-      # census is empty, so the accept-time loss and the reset class are both
-      # gone. The entry STAYS anyway: the lift rule this repository uses is
-      # >= 6 GitHub-hosted re-runs of identical bytes, and a 2048-connection
-      # ramp on a shared runner is the shape celeris#686's dial-time resets
-      # were seen in. Lift it from a green PR run, not from this comment.
+      # fix, 8 of 8 each -- and it is un-skipped here under that lift rule:
+      # only after >= 6 GitHub-hosted re-runs of identical bytes all pass.
+      # Those re-runs are recorded on the PR. It is in the placement tally
+      # below, so it cannot go quiet again.
       #
       # celeris#657 face 2 has its multi-ring gate here: TestFlapConnsPerRing
       # (T4) fixes both engines at two workers, so its 256 keep-alive
@@ -556,7 +548,7 @@ jobs:
             echo "(-short skips all nine), or did a cell stop reaching its own measurement?"
             exit 1
           fi
-          guarded='TestSwitchKeepsHandshakedIdleConnections|TestSwitchKeepsHandshakedIdleConnectionsOnRevert|TestAdaptiveListenersKeepDeferAcceptAcrossSwitches|TestPerformSwitchDoesNotBlockOnLinger|TestFlapWithinLingerKeepsListeners|TestLingerTransplantConserves|TestAdaptiveSwitchVsAcceptChurn'
+          guarded='TestSwitchKeepsHandshakedIdleConnections|TestSwitchKeepsHandshakedIdleConnectionsOnRevert|TestAdaptiveListenersKeepDeferAcceptAcrossSwitches|TestPerformSwitchDoesNotBlockOnLinger|TestFlapWithinLingerKeepsListeners|TestLingerTransplantConserves|TestAdaptiveSwitchVsAcceptChurn|TestAdaptiveSwitchVsAcceptChurnDefaultLinger|TestSwitchAbortedByADriverDrainsTheFreshStandby'
           gwant=$(( $(tr '|' '\n' <<<"$guarded" | wc -l) ))
           gran=$(grep -cE "^=== RUN   (${guarded})\$" /tmp/adaptive-race.log || true)
           gpassed=$(grep -cE "^--- PASS: (${guarded}) \(" /tmp/adaptive-race.log || true)
