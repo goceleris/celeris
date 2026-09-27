@@ -244,20 +244,34 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 // Holding the lock across the callback makes the order the engine observes
 // equal to the order of pausedState transitions.
 //
-// LOCK ORDER: pausedMu -> detachQMu. Never the reverse, and nothing can take
-// them the other way round:
+// LOCK ORDER. Under pausedMu the callbacks take two locks, one after the
+// other and never nested: the engine's detachQMu, then, only when their
+// append took the detach queue from empty to non-empty and after detachQMu is
+// released, the READ lock of the loop's wakefd.WakeFD, in Signal
+// (celeris#666). So the edges are pausedMu -> detachQMu and
+// pausedMu -> WakeFD.mu (read). No cycle can pass through pausedMu, whatever
+// a caller holds when it takes it, because neither lock ever waits on
+// anything that could lead back:
 //
-//   - pausedMu is an unexported field of an unexported type in this package,
-//     so only this package can acquire it, and it does so in exactly two
-//     places (here and resumeIfDrained, Read's resume branch).
-//   - the engine packages do not import middleware/websocket at all, so no
-//     detachQMu holder can reach either of those two places.
-//   - every detachQMu critical section in both engines is a straight-line
-//     queue append plus an atomic store, with no call out of the engine.
+//   - every detachQMu critical section in both engines is a queue append or
+//     swap plus an atomic store, with no call out of the engine.
+//   - WakeFD's read side, Signal, holds the lock across one write(2) on a
+//     descriptor New and Set make O_NONBLOCK, so a reader never waits.
+//   - WakeFD's writers, Set and Close, run only on the loop's own thread (at
+//     start, when epoll creates its eventfd lazily, at shutdown, and when an
+//     io_uring worker fails to start), are never reached from these
+//     callbacks, and hold the lock only across fcntl, close(2) and atomic
+//     stores. A writer therefore never waits on pausedMu, holding the write
+//     lock or queued for it. sync.RWMutex does queue a new reader behind a
+//     waiting writer, so a callback's Signal can wait for a Close, but that
+//     Close waits only for the Signals already inside their write(2).
+//   - pausedMu is an unexported field of an unexported type, acquired only in
+//     this file (here, resumeIfDrained and SetPauser), and the engine packages
+//     do not import middleware/websocket.
 //
-// The eventfd write the callbacks may perform is on an EFD_NONBLOCK
-// descriptor and happens after detachQMu is released, so it can neither block
-// nor extend the hold on pausedMu across a blocking syscall.
+// TestChanReaderWakeFDWritersNeverWaitOnPausedMu forces the interleavings
+// where a cycle would show, including a callback queued behind a waiting
+// Close.
 func (r *chanReader) requestPause() {
 	r.pausedMu.Lock()
 	// Deferred, not a plain Unlock after the callbacks: a callback that
