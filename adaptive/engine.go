@@ -703,14 +703,13 @@ func (e *Engine) performSwitch() {
 	// either observes the old active and registers on it before the
 	// swap, or waits until after active.Store lands and registers on
 	// the new active. We deliberately release freezeState BEFORE the
-	// final PauseAccept on the old active — synchronous PauseAccept can
-	// take O(ms) waiting for the loop to drain its listen queue, and
-	// holding freezeState across that wait blocks driver
-	// register/unregister flows long enough to trip their onClose
-	// timeouts (regression seen in TestAdaptiveConcurrentDriverChurnVsSwitch).
-	// Once active.Store has committed, no new driver registrations will
-	// land on the about-to-be-paused engine, so it's safe to drop the
-	// lock.
+	// final pause of the old active. The pause no longer waits
+	// (beginPause), but it used to, and holding freezeState across a
+	// pause that waits blocks driver register/unregister flows long
+	// enough to trip their onClose timeouts (regression seen in
+	// TestAdaptiveConcurrentDriverChurnVsSwitch). Once active.Store has
+	// committed, no new driver registrations will land on the
+	// about-to-be-paused engine, so there is no reason to hold it.
 	e.freezeState.Lock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
@@ -723,8 +722,8 @@ func (e *Engine) performSwitch() {
 	// Release freezeState across the (possibly slow) lazy standby build +
 	// Listen + bind-wait below; re-acquired before the active.Store commit.
 	// Holding it across a multi-second build would block driver
-	// register/unregister flows (same reasoning as the PauseAccept release
-	// at the end of this function). e.mu (held for the whole function)
+	// register/unregister flows (same reasoning as the release before the
+	// final pause at the end of this function). e.mu (held for the whole function)
 	// already serialises performSwitch against itself, so no other switch
 	// can race the build.
 	e.freezeState.Unlock()
@@ -790,8 +789,16 @@ func (e *Engine) performSwitch() {
 	// Re-acquire freezeState for the commit and RE-CHECK driverFDs: a driver
 	// may have registered during the build window above. If so, abort — but the
 	// freshly-built standby stays cached for the next attempt. Pause its accept
-	// first so it does not sit in the SO_REUSEPORT pool alongside the (still
-	// active) old engine; the next switch ResumeAccepts it.
+	// so it leaves the SO_REUSEPORT pool it shares with the (still active) old
+	// engine; the next switch ResumeAccepts it.
+	//
+	// The pause lingers (celeris#662): for about 1.5 s the fresh engine keeps
+	// its share of new connections, so that a client it accepted the
+	// handshake of during the build is served rather than reset. What it
+	// accepts must not stay on it, so it also gets the drain a completed
+	// switch gives the engine it leaves: toward the engine that stays active
+	// (newStandby here). A switch that later makes it active stops that
+	// drain first (the StopTransplant below).
 	e.freezeState.Lock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
@@ -800,9 +807,8 @@ func (e *Engine) performSwitch() {
 		)
 		e.freezeState.Unlock()
 		if freshlyBuilt {
-			if ac, ok := newActive.(engine.AcceptController); ok {
-				_ = ac.PauseAccept()
-			}
+			beginPause(newActive)
+			e.applyTransplant(newStandby, newActive)
 		}
 		return
 	}
@@ -839,14 +845,18 @@ func (e *Engine) performSwitch() {
 	// driver acquireDriverFD calls observe the new active and proceed.
 	e.freezeState.Unlock()
 
-	// Pause the old active. Inline (not in a goroutine) so unit tests
-	// observing pauseCalls right after performSwitch returns see the
-	// effect; PauseAccept itself caps its wait to 2s, but the
-	// freezeState release above means concurrent driver
-	// register/unregister flows are no longer blocked while we wait.
-	if ac, ok := newStandby.(engine.AcceptController); ok {
-		_ = ac.PauseAccept()
-	}
+	// Pause the old active, and do not wait for it (celeris#662). The
+	// sub-engine lingers for about 1.5 s with TCP_DEFER_ACCEPT cleared,
+	// serving its SO_REUSEPORT share of new connections, so that a client
+	// that completed its handshake on it but had not sent its request yet
+	// is promoted and served instead of being reset by the close. Waiting
+	// would hold e.mu, and with it Metrics() and the next switch, for that
+	// long. Issued here, under e.mu, so any later switch's ResumeAccept of
+	// this engine is ordered after it; a resume during the linger restores
+	// the option on the same listeners. Inline (not in a goroutine) so unit
+	// tests observing pauseCalls right after performSwitch returns see the
+	// effect.
+	beginPause(newStandby)
 
 	e.logger.Info("engine switch completed",
 		"now_active", newActive.Type().String(),
@@ -883,6 +893,26 @@ func (e *Engine) performSwitch() {
 			e.maybeThawLocked()
 			e.freezeState.Unlock()
 		}()
+	}
+}
+
+// beginPauser is the non-blocking start of an accept pause, which the epoll
+// and io_uring sub-engines implement (celeris#662). It is deliberately not
+// part of engine.AcceptController.
+type beginPauser interface {
+	BeginPauseAccept()
+}
+
+// beginPause starts eng's accept pause without waiting for its linger to
+// end. Test fakes that implement only engine.AcceptController get their
+// PauseAccept, as before. The caller holds e.mu.
+func beginPause(eng engine.Engine) {
+	if bp, ok := eng.(beginPauser); ok {
+		bp.BeginPauseAccept()
+		return
+	}
+	if ac, ok := eng.(engine.AcceptController); ok {
+		_ = ac.PauseAccept()
 	}
 }
 
