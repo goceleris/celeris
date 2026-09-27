@@ -98,15 +98,21 @@ type driverConn struct {
 // cancels what is armed). Setting closing too makes a later UnregisterConn
 // or Write a no-op, so neither queues work for a conn that is gone, and
 // every path that prepares an SQE checks closing first.
+//
+// The close runs after mu is released: close(2) can block (SO_LINGER waits
+// for the peer to acknowledge the FIN), and UnregisterConn and Write take mu
+// on the driver's goroutines. Clearing opFDOpen under mu is what makes the
+// close retire's alone.
 func (dc *driverConn) retire() {
 	dc.mu.Lock()
 	dc.closing = true
 	dc.retired = true
-	if dc.opFDOpen {
-		dc.opFDOpen = false
+	closeOpFD := dc.opFDOpen
+	dc.opFDOpen = false
+	dc.mu.Unlock()
+	if closeOpFD {
 		_ = unix.Close(dc.opFD)
 	}
-	dc.mu.Unlock()
 }
 
 // driverAction is one pending driver-side action to be applied by the worker
