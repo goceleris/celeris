@@ -313,12 +313,33 @@ func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
 // driverRead drains fd with edge-triggered reads into the per-loop scratch
 // buffer and fans each chunk out to onRecv. The callback runs on this
 // goroutine; the slice is invalidated on return.
+//
+// Each read is issued under dc.mu, after checking dc.closed (celeris#710).
+// The read names the caller's descriptor number, and UnregisterConn sets
+// closed under dc.mu before it returns, after which the caller may close fd
+// and the number may name another file. The loop reads again after onRecv
+// whenever a read filled the buffer, and onRecv, or anything else the
+// worker does between two reads, can run while the caller unregisters: a
+// check after the read let the worker read, and drop, the bytes of the file
+// that took the number, or block in it if it was a blocking descriptor.
+// With the check and the read in one critical section, a read either
+// completes before UnregisterConn returns or is not issued. dc.mu is held
+// across the read syscall only (fd is non-blocking, RegisterConn's
+// contract), never across onRecv or closeDriver, and nothing else is
+// acquired while it is held here.
 func (l *Loop) driverRead(dc *driverConn) {
 	if l.driverReadBuf == nil {
 		l.driverReadBuf = make([]byte, driverReadBufSize)
 	}
 	for {
+		dc.mu.Lock()
+		if dc.closed {
+			dc.mu.Unlock()
+			return
+		}
 		n, err := unix.Read(dc.fd, l.driverReadBuf)
+		cb := dc.onRecv
+		dc.mu.Unlock()
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				return
@@ -330,13 +351,6 @@ func (l *Loop) driverRead(dc *driverConn) {
 			l.closeDriver(dc, nil)
 			return
 		}
-		dc.mu.Lock()
-		if dc.closed {
-			dc.mu.Unlock()
-			return
-		}
-		cb := dc.onRecv
-		dc.mu.Unlock()
 		if cb != nil {
 			cb(l.driverReadBuf[:n])
 		}
