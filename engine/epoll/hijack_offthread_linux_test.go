@@ -438,7 +438,54 @@ func TestAsyncHijackUnderAcceptChurnLeavesTheLoopsSuspendable(t *testing.T) {
 // The loop side below learns that the number is free from the kernel alone
 // (F_GETFD), exactly as accept4 does, so under -race the only thing that can
 // order the two slot writes is the lock.
+//
+// The reuse is the premise, so it is made to happen rather than hoped for
+// (review of #698: the test used to skip without it, and CI counts no skip
+// in this package). Every free number below the conn's is filled before the
+// hijack, so the duplicate the hijack takes lands above it, and the number
+// it releases is the lowest free one when accept4 runs. Something else in
+// the process can still take it first; that attempt is repeated, and a test
+// that never saw the reuse fails.
 func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
+	const attempts = 3
+	for i := 1; i <= attempts; i++ {
+		if acceptAfterHijackAttempt(t) {
+			return
+		}
+		t.Logf("attempt %d: the new conn did not get the released number, trying again", i)
+	}
+	t.Fatalf("the kernel gave the released number to the next accept in none of %d attempts: the reuse under "+
+		"test never happened", attempts)
+}
+
+// fillHolesBelow opens /dev/null until the number it gets is above fd, so
+// every number below fd is taken and the next one the process allocates is
+// above it. The fillers stay open until the test ends.
+func fillHolesBelow(t *testing.T, fd int) {
+	t.Helper()
+	var fillers []int
+	t.Cleanup(func() {
+		for _, f := range fillers {
+			_ = unix.Close(f)
+		}
+	})
+	for {
+		f, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("open /dev/null: %v", err)
+		}
+		if f > fd {
+			_ = unix.Close(f)
+			return
+		}
+		fillers = append(fillers, f)
+	}
+}
+
+// acceptAfterHijackAttempt runs the test once, and reports whether the new
+// conn got the number the hijack released; the assertions run only then.
+func acceptAfterHijackAttempt(t *testing.T) bool {
+	t.Helper()
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		t.Fatalf("epoll_create1: %v", err)
@@ -496,6 +543,7 @@ func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
 	cs.asyncRun = true // the conn's dispatch goroutine is alive: the hijack is off-thread
 	cs.asyncInMu.Unlock()
 	dial() // queued before the hijack frees fd, so the next accept4 takes fd
+	fillHolesBelow(t, fd)
 
 	hijacked := make(chan net.Conn, 1)
 	go func() { // the dispatch goroutine, inside the handler
@@ -536,7 +584,8 @@ func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
 	}
 	next := l.liveConns[1]
 	if next.fd != fd {
-		t.Skipf("the kernel gave the new conn fd %d, not the released %d; the reuse under test did not happen", next.fd, fd)
+		t.Logf("the kernel gave the new conn fd %d, not the released %d", next.fd, fd)
+		return false
 	}
 	if l.conns[fd] != next {
 		t.Fatalf("slot %d holds %p, want the new conn %p", fd, l.conns[fd], next)
@@ -546,6 +595,7 @@ func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
 	if l.connCount != 1 {
 		t.Errorf("connCount = %d after the hand-back, want 1", l.connCount)
 	}
+	return true
 }
 
 // TestOffThreadHijackIsSettledBeforeItsGoroutineExits: a handler that hijacks
