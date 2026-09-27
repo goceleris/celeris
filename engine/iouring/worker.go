@@ -2493,7 +2493,15 @@ func (w *Worker) initProtocol(cs *connState) {
 			// nil-derefs WSRawWriteFn under a peer RST mid-upgrade.
 			unlockDetachMu := w.async && cs.asyncPromoted.Load() && cs.detachMu != nil && !cs.asyncDetachUnlocked
 			if unlockDetachMu {
+				// Under asyncInMu: dispatchBusy reads it there, and from here
+				// on this goroutine never holds detachMu across a handler
+				// again, so the worker goes back to waiting out the (bounded)
+				// holders of this conn's lock (celeris#704). detachMu is held
+				// here; detachMu -> asyncInMu is the only order the two are
+				// ever nested in.
+				cs.asyncInMu.Lock()
 				cs.asyncDetachUnlocked = true
+				cs.asyncInMu.Unlock()
 			}
 			// Async mode: enqueue cs so drainDetachQueue picks up the
 			// deferred bookkeeping (asyncDetachPending). The first
@@ -2592,6 +2600,38 @@ func (w *Worker) switchToH2Local(cs *connState) error {
 	return processErr
 }
 
+// closeOnRecvEnd is handleRecv's peer-FIN and recv-error tail: tell a
+// detached middleware (OnError), then close. OnError runs under detachMu:
+// cs.h1State is read under it because the async dispatch goroutine's
+// switchToH2Local nils cs.h1State under the same lock, so reading it before
+// acquiring detachMu is a TOCTOU that the race detector flags (#256
+// regression class).
+//
+// When detachMu is held across a handler (dispatchBusy), waiting for the lock
+// parked the worker, and every connection of its ring, until the handler
+// returned (celeris#704); the common shape is a client that gives up on a
+// slow handler and disconnects. So the notification rides on the close
+// instead: closeConn leaves the close to the dispatch goroutine, which exits
+// at its next check, and then runs it on this thread with the lock free,
+// delivering closeErr first.
+func (w *Worker) closeOnRecvEnd(fd int, cs *connState, err error) {
+	if mu := cs.detachMu; mu != nil {
+		if !mu.TryLock() {
+			if dispatchBusy(cs, nil) {
+				cs.closeErr = err
+				w.closeConn(fd)
+				return
+			}
+			mu.Lock()
+		}
+		if cs.h1State != nil && cs.h1State.OnError != nil {
+			cs.h1State.OnError(err)
+		}
+		mu.Unlock()
+	}
+	w.closeConn(fd)
+}
+
 func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	cs := w.conns[fd]
 	if recvStallProbeActive && cs != nil {
@@ -2623,14 +2663,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// which no error classifier recognises, so every ordinary disconnect
 		// read as a protocol error (celeris#564).
 		if c.Res == 0 {
-			if cs.detachMu != nil {
-				cs.detachMu.Lock()
-				if cs.h1State != nil && cs.h1State.OnError != nil {
-					cs.h1State.OnError(errPeerClosed)
-				}
-				cs.detachMu.Unlock()
-			}
-			w.closeConn(fd)
+			w.closeOnRecvEnd(fd, cs, errPeerClosed)
 			return
 		}
 		// Recv was cancelled by drainDetachQueue (WS backpressure pause).
@@ -2668,18 +2701,7 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 			return
 		}
 		// Surface read failure to detached middleware before closing.
-		// Check cs.h1State under detachMu — the async dispatch
-		// goroutine's switchToH2Local nulls cs.h1State under the same
-		// lock, so reading it before acquiring detachMu is a TOCTOU
-		// that the race detector flags (#256 regression class).
-		if cs.detachMu != nil {
-			cs.detachMu.Lock()
-			if cs.h1State != nil && cs.h1State.OnError != nil {
-				cs.h1State.OnError(errIORingRecv(c.Res))
-			}
-			cs.detachMu.Unlock()
-		}
-		w.closeConn(fd)
+		w.closeOnRecvEnd(fd, cs, errIORingRecv(c.Res))
 		return
 	}
 
@@ -3591,8 +3613,40 @@ func (w *Worker) closeConn(fd int) {
 			cs.asyncCond.Broadcast()
 			cs.asyncInMu.Unlock()
 		}
-		// Signal the detached goroutine's writeFn to stop writing.
-		cs.detachMu.Lock()
+		// Signal the detached goroutine's writeFn to stop writing. The
+		// mutex serializes with any in-progress write: if the goroutine is
+		// mid-write, we wait until it finishes.
+		//
+		// But not for a handler (celeris#704, the io_uring twin of
+		// celeris#669). The dispatch goroutine holds this mutex across
+		// ProcessH1, i.e. for as long as the user handler runs, and a
+		// blocking Lock here parked the LockOSThread'd worker, and every
+		// connection of its ring (no CQE processed, no accept, no flush),
+		// until the handler returned: through the recv FIN and error
+		// branches and every other close of a conn whose handler still runs.
+		// When the lock is held and that goroutine is running, leave the
+		// close to it: asyncClosed is set, so it exits at its next check, and
+		// its exit hands cs back through the detach queue, whose asyncClosed
+		// branch calls here again with the lock free. Until then the conn
+		// stays whole (in the table, the live set, its descriptor open)
+		// because the handler is still writing its response into it. When the
+		// goroutine is parked or gone, the holder is a guarded writeFn in one
+		// write, and waiting for it is bounded; see dispatchBusy.
+		if !cs.detachMu.TryLock() {
+			if dispatchBusy(cs, &cs.closeOwed) {
+				return
+			}
+			cs.detachMu.Lock()
+		}
+		// A recv branch that met a running handler left its error here
+		// rather than wait for the lock (closeErr, celeris#704). Deliver it
+		// as that branch did, under the lock, before the close.
+		if err := cs.closeErr; err != nil {
+			cs.closeErr = nil
+			if cs.h1State != nil && cs.h1State.OnError != nil {
+				cs.h1State.OnError(err)
+			}
+		}
 		// celeris#549 window (celeris#584 exposure counter): OnDetach has
 		// published the detach (asyncDetachPending set on the dispatch
 		// goroutine, or inline on this thread in async mode) but the
@@ -3645,9 +3699,10 @@ func (w *Worker) closeConn(fd int) {
 	// async+auto+upg the resulting memory corruption manifested as a
 	// SIGSEGV in runtime.stackpoolalloc after ~16 h of load
 	// (#256). cs.asyncClosed was already set earlier in this function
-	// and the goroutine checks it on loop re-entry, so acquiring
-	// detachMu here only blocks for the duration of the current
-	// ProcessH1 call.
+	// and the goroutine checks it on loop re-entry, and a close that
+	// found it inside a handler returned above (celeris#704), so
+	// acquiring detachMu here only waits out a bounded holder: the
+	// goroutine's own asyncClosed re-check, or a guarded write.
 	trulyDetached := detached && cs.h1State != nil && cs.h1State.Detached.Load()
 	if !trulyDetached && cs.h1State != nil {
 		if detached {
@@ -4193,7 +4248,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			cs.asyncClosed.Store(true)
 			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
-			cs.asyncRun = false
+			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
 			// Wake the worker so it observes asyncClosed and tears
 			// down the conn via the detachQueue → drain path.
@@ -4206,6 +4261,16 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 	}()
 	for {
 		cs.asyncInMu.Lock()
+		if cs.relinkOwed {
+			// The worker gave this conn up while our handler held detachMu
+			// (celeris#704: the dirty-list pass); hand it back now that the
+			// handler's writes are flushed as far as they go, so the worker
+			// re-examines it. asyncInMu -> detachQMu: nothing takes
+			// asyncInMu under detachQMu.
+			cs.relinkOwed = false
+			w.enqueueDetach(cs)
+		}
+		cs.asyncParked = true
 		for len(cs.asyncInBuf) == 0 && !cs.asyncClosed.Load() {
 			// celeris#364: revert this conn to inline when the route that
 			// promoted it has de-promoted (its TTL expired). Safe ONLY here:
@@ -4216,8 +4281,14 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			// resumes the inline fast path on the next CQE.
 			if w.canRevertToInline(cs) {
 				cs.asyncPromoted.Store(false)
-				cs.asyncRun = false
+				// Nothing is owed here in practice: a debt is only taken on
+				// while the goroutine runs outside this loop, and the loop
+				// top above hands a relink back. Checked all the same.
+				owed := cs.endDispatch()
 				cs.asyncInMu.Unlock()
+				if owed {
+					w.enqueueDetach(cs)
+				}
 				return
 			}
 			// #383 reverse (async): at a clean park boundary while an
@@ -4232,16 +4303,24 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			// could only be refused, so we park instead (celeris#681 R1).
 			if w.transplant.Load() != nil && w.asyncTransplantEligible(cs) {
 				cs.transplantPending.Store(true)
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 				w.enqueueDetach(cs)
 				return
 			}
 			cs.asyncCond.Wait()
 		}
+		cs.asyncParked = false
 		if cs.asyncClosed.Load() {
-			cs.asyncRun = false
+			// The one loop exit that does not otherwise enqueue cs: a close
+			// requested while this goroutine ran a handler may have been
+			// left to it (closeOwed, celeris#704), and then this is where it
+			// is handed back.
+			owed := cs.endDispatch()
 			cs.asyncInMu.Unlock()
+			if owed {
+				w.enqueueDetach(cs)
+			}
 			return
 		}
 		cs.asyncInBuf, cs.asyncOutBuf = cs.asyncOutBuf[:0], cs.asyncInBuf
@@ -4280,9 +4359,13 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			if acquiredDetachMu {
 				cs.detachMu.Unlock()
 			}
+			// Nor does this one; see the loop-top exit.
 			cs.asyncInMu.Lock()
-			cs.asyncRun = false
+			owed := cs.endDispatch()
 			cs.asyncInMu.Unlock()
+			if owed {
+				w.enqueueDetach(cs)
+			}
 			return
 		}
 		processErr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
@@ -4326,12 +4409,12 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 				cs.asyncClosed.Store(true)
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 			} else {
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 				cs.asyncH2Promoted.Store(true)
 			}
@@ -4358,7 +4441,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 				cs.asyncClosed.Store(true)
 				cs.asyncInMu.Lock()
 				cs.asyncInBuf = cs.asyncInBuf[:0]
-				cs.asyncRun = false
+				cs.endDispatch() // enqueued below: that is the hand-back
 				cs.asyncInMu.Unlock()
 				w.detachQMu.Lock()
 				w.detachQueue = append(w.detachQueue, cs)
@@ -4418,7 +4501,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			cs.asyncClosed.Store(true)
 			cs.asyncInMu.Lock()
 			cs.asyncInBuf = cs.asyncInBuf[:0]
-			cs.asyncRun = false
+			cs.endDispatch() // enqueued below: that is the hand-back
 			cs.asyncInMu.Unlock()
 			// Wake the worker so it notices asyncClosed and runs closeConn
 			// from its own goroutine via the detachQueue → drain path.
@@ -4921,7 +5004,23 @@ func (w *Worker) flushDirty() {
 				w.beginRecvStall(cs)
 			}
 		} else {
-			if mu := cs.detachMu; mu != nil {
+			if mu := cs.detachMu; mu != nil && !mu.TryLock() {
+				if dispatchBusy(cs, &cs.relinkOwed) {
+					// The conn's dispatch goroutine holds detachMu across a
+					// user handler (celeris#704): waiting here parked the
+					// worker, and every connection of its ring, until the
+					// handler returned, and retrying it every pass would
+					// hold the ring at a zero wait, a spin, for as long. So
+					// give the conn up until the goroutine hands it back: it
+					// does so at the top of its next loop, after its own
+					// flush of what the handler wrote, and drainDetachQueue
+					// puts it on this list again. What the pass owed it (a
+					// flush, a recv arm the SQ ring dropped) waits for that,
+					// as it waited for the lock before.
+					w.removeDirty(cs)
+					cs = next
+					continue
+				}
 				mu.Lock()
 			}
 			sqFull := w.flushSend(cs)

@@ -2,12 +2,16 @@
 
 package iouring
 
-// The connState fields the celeris#704 tests set or read. main has neither, so
-// on main these are stubs: no goroutine is ever marked parked (the tests' only
-// use of it is to mark one parked for the bounded-holder control, which main
-// waits on either way), and no hand-back is ever owed. The fix replaces this
-// file with the real accessors.
+// The connState fields the celeris#704 tests set or read.
 
-func setParked704(*connState, bool) {}
+// setParked704 marks cs's dispatch goroutine parked (waiting for input, so
+// not holding detachMu across a handler) or not. Caller holds asyncInMu.
+func setParked704(cs *connState, parked bool) { cs.asyncParked = parked }
 
-func relinkOwed704(*connState) bool { return false }
+// relinkOwed704 reports whether cs's dispatch goroutine owes the worker a
+// hand-back of a conn the dirty pass gave up.
+func relinkOwed704(cs *connState) bool {
+	cs.asyncInMu.Lock()
+	defer cs.asyncInMu.Unlock()
+	return cs.relinkOwed
+}
