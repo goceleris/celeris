@@ -782,6 +782,109 @@ jobs:
             exit 1
           fi
 
+  zc-window:
+    name: io_uring SEND_ZC window under -race, with its detector control (celeris#587, ${{ matrix.os }})
+    # Both arches: the detector control must hold on arm64 as on x86.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      # TestSendZCWindowGuardUnderRace holds the SEND_ZC first-CQE -> NOTIF
+      # window open (internal/zcwindow.SetHold, -tags=validation only) while
+      # the handler pushes 256 x 64 KiB frames at a steady pace to a client
+      # that reads four times slower, so the detached handler keeps calling
+      # the inline-egress guard through every hold; it requires the guard to
+      # decline inside that window at least once, and every byte to arrive
+      # intact and in order. Neither the root race step (no validation tag,
+      # ./middleware/websocket excluded) nor the websocket step
+      # (-run '^TestBackpressure') reaches it.
+      #
+      # Three arms, each run N=3 times as SEPARATE processes (the race
+      # detector reports a given race once per process), each process with
+      # its OWN log, and judged PER PROCESS on the "--- PASS:" / "--- FAIL:"
+      # lines and the race detector's reports (a SKIP is a failure:
+      # CELERIS_REQUIRE_IOURING_WORKERS=1):
+      #   1. the tree as committed: every process PASS, no race report;
+      #   2. CELERIS_IOURING_SEND_ZC=off: every process PASS with every ZC
+      #      witness at 0 (the witnesses track SEND_ZC, not traffic), no race;
+      #   3. the MUTANT (.github/scripts/mutant-587-unlock-zc-first-cqe.py
+      #      deletes the detachMu acquire in handleSend's CQE_F_MORE branch):
+      #      EVERY process FAIL, and every process with its own
+      #      "WARNING: DATA RACE" report and "race detected during execution
+      #      of test" line. A process that fails for any other reason does
+      #      not count as a kill. This is what makes arm 1 evidence: it
+      #      proves the race detector watches this path in every run, not
+      #      by luck.
+      # This job is a CI check on every PR; it becomes a required gate only
+      # if the celeris main ruleset lists it.
+      # memlock is raised for the same reason as the `iouring` job: io_uring
+      # workers need 12 MiB each and the runner defaults to 8 MiB.
+      - name: SEND_ZC window test, ZC-off branch control and the detachMu mutant
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          run() { # label, then env assignments; N separate processes, one log each
+            local label=$1; shift
+            local i rc
+            for i in 1 2 3; do
+              rc=0
+              env "$@" go test -tags=validation -race -count=1 -timeout=300s -v \
+                -run '^TestSendZCWindowGuardUnderRace$' ./middleware/websocket/ \
+                > "/tmp/zc587-$label-$i.log" 2>&1 || rc=$?
+              echo "$label run $i rc=$rc"
+              grep -E 'ZCWIN|^--- (PASS|FAIL|SKIP): TestSendZCWindowGuardUnderRace' "/tmp/zc587-$label-$i.log" || true
+            done
+          }
+          # tally <label> <want: pass|kill>: every one of the 3 processes must
+          # meet the arm's verdict on its own log.
+          tally() {
+            local label=$1 want=$2 i log p f s r d bad=0
+            for i in 1 2 3; do
+              log="/tmp/zc587-$label-$i.log"
+              p=$(grep -cE '^--- PASS: TestSendZCWindowGuardUnderRace \(' "$log" || true)
+              f=$(grep -cE '^--- FAIL: TestSendZCWindowGuardUnderRace \(' "$log" || true)
+              s=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
+              r=$(grep -c 'WARNING: DATA RACE' "$log" || true)
+              d=$(grep -c 'race detected during execution of test' "$log" || true)
+              echo "$label run $i: PASS=$p FAIL=$f SKIP=$s DATA_RACE=$r race_detected=$d"
+              if [ "$s" -ne 0 ]; then echo "$label run $i: a SKIP is not a result"; bad=1; continue; fi
+              if [ "$want" = pass ]; then
+                if [ "$p" -ne 1 ] || [ "$f" -ne 0 ] || [ "$r" -ne 0 ] || [ "$d" -ne 0 ]; then
+                  echo "$label run $i: want PASS=1 FAIL=0 and no race report"; bad=1
+                fi
+              else
+                if [ "$p" -ne 0 ] || [ "$f" -ne 1 ] || [ "$r" -lt 1 ] || [ "$d" -lt 1 ]; then
+                  echo "$label run $i: want FAIL=1 with its own DATA RACE report (the mutant was not killed by the race detector in this process)"; bad=1
+                fi
+              fi
+            done
+            return "$bad"
+          }
+          run fixed CELERIS587_ZC_WINDOW_HOLD=2ms
+          run zcoff CELERIS587_ZC_WINDOW_HOLD=2ms CELERIS_IOURING_SEND_ZC=off
+          python3 .github/scripts/mutant-587-unlock-zc-first-cqe.py
+          run mutant CELERIS587_ZC_WINDOW_HOLD=2ms
+          git checkout -- engine/iouring/worker.go
+          grep -h -A30 'WARNING: DATA RACE' /tmp/zc587-mutant-1.log | head -60 || true
+          ok=0
+          tally fixed pass || ok=1
+          tally zcoff pass || ok=1
+          tally mutant kill || ok=1
+          exit "$ok"
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest
