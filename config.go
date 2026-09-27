@@ -130,6 +130,17 @@ type Config struct {
 
 	// DisableKeepAlive disables HTTP keep-alive; each request gets its own connection.
 	DisableKeepAlive bool
+	// DisableDeferAccept turns TCP_DEFER_ACCEPT off on the epoll and io_uring
+	// engines' listen sockets. Default false: the option stays on.
+	//
+	// [Server.PauseAccept] carries a client that has connected but not yet
+	// sent its request across the pause either way. With the option on it
+	// does so by lingering: it clears the option on each listen socket and
+	// keeps it open for about 1.5 s before closing it, so it blocks that
+	// long. Set this field for a pause that closes the listen sockets at
+	// once. See [resource.Config.DisableDeferAccept] for the mechanism and
+	// what the option saves.
+	DisableDeferAccept bool
 	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
 	BufferSize int
 	// SocketRecvBuf sets SO_RCVBUF for accepted connections (0 = OS default).
@@ -261,6 +272,7 @@ func (c Config) toResourceConfig() resource.Config {
 		MaxFrameSize:         c.MaxFrameSize,
 		InitialWindowSize:    c.InitialWindowSize,
 		DisableKeepAlive:     c.DisableKeepAlive,
+		DisableDeferAccept:   c.DisableDeferAccept,
 		Logger:               c.Logger,
 	}
 
