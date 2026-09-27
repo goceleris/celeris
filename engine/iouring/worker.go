@@ -1372,56 +1372,7 @@ func (w *Worker) run(ctx context.Context) {
 
 		// Retry pending sends and dropped recv arms on dirty connections
 		// (SQ ring was full earlier). Typically empty under normal load.
-		for cs := w.dirtyHead; cs != nil; {
-			next := cs.dirtyNext
-			if cs.sending {
-				// celeris#607 witness. The retry below is gated on the
-				// send, so a connection that is owed a recv arm and has a
-				// SEND outstanding is passed over entirely — for as long
-				// as the send stays outstanding, which under a slow peer
-				// is seconds. Time the episode, once, on the way in.
-				if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
-					w.beginRecvStall(cs)
-				}
-			} else {
-				if mu := cs.detachMu; mu != nil {
-					mu.Lock()
-				}
-				sqFull := w.flushSend(cs)
-				// The recvArmed check keeps pickRecvTarget out of the
-				// picture while a recv is in flight: it MUTATES
-				// cs.recvIntoBody, so calling it for an arm that
-				// prepareRecv is going to decline would mis-route the
-				// in-flight recv's CQE through the direct-body path.
-				if cs.needsRecv && !cs.recvPaused && cs.recvArmed {
-					cs.needsRecv = false
-				} else if cs.needsRecv && !cs.recvPaused {
-					// Arm via pickRecvTarget so a deferred BODY recv re-arms
-					// into the H1 bodyBuf with cs.recvIntoBody set, instead of
-					// blindly re-arming into cs.buf. Re-arming into cs.buf
-					// while recvIntoBody stayed true made handleRecv take the
-					// body branch on a cs.buf-sized CQE and corrupt the body
-					// (v1.5.0 review 2.4). pickRecvTarget MUTATES recvIntoBody,
-					// so call it exactly once per arm; it is idempotent across
-					// SQ-full retries because NextRecvBuf returns the same tail
-					// while bodyBuf state is unchanged.
-					if w.prepareRecv(cs, w.pickRecvTarget(cs)) {
-						cs.needsRecv = false
-					}
-				}
-				canRemove := !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && (!cs.needsRecv || cs.recvPaused)
-				if !cs.needsRecv || cs.recvPaused || cs.recvArmed {
-					w.endRecvStall(cs)
-				}
-				if mu := cs.detachMu; mu != nil {
-					mu.Unlock()
-				}
-				if canRemove {
-					w.removeDirty(cs)
-				}
-			}
-			cs = next
-		}
+		w.flushDirty()
 
 		// SENDs queued during CQE processing are submitted at the top of
 		// the next iteration: Mode 1 SubmitAndWait combines submit + CQE
@@ -4951,6 +4902,63 @@ func (w *Worker) removeDirty(cs *connState) {
 	}
 	cs.dirtyNext = nil
 	cs.dirtyPrev = nil
+}
+
+// flushDirty is the event loop's dirty-list pass, run once per iteration
+// after drainDetachQueue and the driver actions: retry pending sends and
+// dropped recv arms on dirty connections (SQ ring was full earlier).
+// Typically empty under normal load. Worker thread only.
+func (w *Worker) flushDirty() {
+	for cs := w.dirtyHead; cs != nil; {
+		next := cs.dirtyNext
+		if cs.sending {
+			// celeris#607 witness. The retry below is gated on the
+			// send, so a connection that is owed a recv arm and has a
+			// SEND outstanding is passed over entirely — for as long
+			// as the send stays outstanding, which under a slow peer
+			// is seconds. Time the episode, once, on the way in.
+			if cs.needsRecv && !cs.recvPaused && !cs.recvArmed {
+				w.beginRecvStall(cs)
+			}
+		} else {
+			if mu := cs.detachMu; mu != nil {
+				mu.Lock()
+			}
+			sqFull := w.flushSend(cs)
+			// The recvArmed check keeps pickRecvTarget out of the
+			// picture while a recv is in flight: it MUTATES
+			// cs.recvIntoBody, so calling it for an arm that
+			// prepareRecv is going to decline would mis-route the
+			// in-flight recv's CQE through the direct-body path.
+			if cs.needsRecv && !cs.recvPaused && cs.recvArmed {
+				cs.needsRecv = false
+			} else if cs.needsRecv && !cs.recvPaused {
+				// Arm via pickRecvTarget so a deferred BODY recv re-arms
+				// into the H1 bodyBuf with cs.recvIntoBody set, instead of
+				// blindly re-arming into cs.buf. Re-arming into cs.buf
+				// while recvIntoBody stayed true made handleRecv take the
+				// body branch on a cs.buf-sized CQE and corrupt the body
+				// (v1.5.0 review 2.4). pickRecvTarget MUTATES recvIntoBody,
+				// so call it exactly once per arm; it is idempotent across
+				// SQ-full retries because NextRecvBuf returns the same tail
+				// while bodyBuf state is unchanged.
+				if w.prepareRecv(cs, w.pickRecvTarget(cs)) {
+					cs.needsRecv = false
+				}
+			}
+			canRemove := !sqFull && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 && (!cs.needsRecv || cs.recvPaused)
+			if !cs.needsRecv || cs.recvPaused || cs.recvArmed {
+				w.endRecvStall(cs)
+			}
+			if mu := cs.detachMu; mu != nil {
+				mu.Unlock()
+			}
+			if canRemove {
+				w.removeDirty(cs)
+			}
+		}
+		cs = next
+	}
 }
 
 // flushSend submits one SEND SQE for pending data on this connection.
