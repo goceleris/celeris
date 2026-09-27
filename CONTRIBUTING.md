@@ -121,8 +121,10 @@ The full rule lives in [GOVERNANCE.md](GOVERNANCE.md); the short version:
 - A PR merges when **all required checks are green**, **every review thread
   is resolved**, and it has an **approving review from a code owner** of the
   files it touches ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
-- Bots comment on every PR: CodeRabbit (review), Codecov (coverage) and
-  CodSpeed (benchmarks). None of them is a required check, but each inline
+- Three bots report on PRs, and none of them is a required check:
+  CodeRabbit (review; a draft once it is marked ready), Codecov (coverage)
+  and CodSpeed (benchmarks; only on a PR from a branch of this repository
+  that is ready for review and touches benchmarked code). Each inline
   CodeRabbit comment opens a review thread, and the thread rule above applies
   to it. CodeRabbit resolves its own thread when a later push fixes the
   point; for one you disagree with, reply saying why and resolve it (or

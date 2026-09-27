@@ -20,8 +20,9 @@ Members of the GitHub org team **`contributors`** have *write* access to
 
 - can push branches to this repository and open PRs from them;
 - can **approve** pull requests;
-- may **merge their own PR only after a code-owner approval** and green
-  required checks (see [How changes get merged](#how-changes-get-merged)).
+- may **merge their own PR only after a code-owner approval**, with green
+  required checks and every review thread resolved (see
+  [How changes get merged](#how-changes-get-merged)).
 
 Criteria for an invitation: about **three merged, non-trivial pull
 requests** and sustained engagement (reviews, issue triage, follow-through

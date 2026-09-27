@@ -73,22 +73,29 @@ jobs:
         with:
           go-version: "1.27.0"
 
-      # ci.yml's unit job takes `go list ./...` minus the pattern on its first
+      # ci.yml's unit job takes `go list ./...` minus the pattern on its one
       # `go list ./... | grep -vE '...'` line, and runs ./engine/iouring in a
       # step of its own; this job runs all of them in one `go test`. The step
-      # fails, with the diff, when the two package sets differ.
+      # fails, with the diff, when the two package sets differ, and when
+      # ci.yml no longer has exactly one such line or `go list` fails.
       - name: Same packages as ci.yml's unit job
         run: |
-          set -o pipefail
-          ci_exclude=$(sed -nE "s/.*go list [.]\/[.][.][.] [|] grep -vE '([^']+)'.*/\1/p" .github/workflows/ci.yml | head -n 1)
-          if [ -z "$ci_exclude" ]; then
-            echo "::error::ci.yml has no \`go list ./... | grep -vE '...'\` line any more: re-derive COVER_EXCLUDE"
+          set -euo pipefail
+          ci_lines=$(sed -nE "s/.*go list [.]\/[.][.][.] [|] grep -vE '([^']+)'.*/\1/p" .github/workflows/ci.yml)
+          if [ "$(printf '%s\n' "$ci_lines" | grep -c .)" != 1 ]; then
+            echo "::error::ci.yml should have exactly one \`go list ./... | grep -vE '...'\` line (its unit job's); found: ${ci_lines:-none}. Re-derive COVER_EXCLUDE."
             exit 1
           fi
+          ci_exclude=$ci_lines
           echo "ci.yml excludes:        $ci_exclude (+ ./engine/iouring in its own step)"
           echo "test-coverage excludes: $COVER_EXCLUDE"
-          if ! diff <({ go list ./... | grep -vE "$ci_exclude"; go list ./engine/iouring; } | sort -u) \
-            <(go list ./... | grep -vE "$COVER_EXCLUDE" | sort -u); then
+          # Outside a process substitution, so that set -e sees a failure.
+          all=$(go list ./...)
+          iouring=$(go list ./engine/iouring)
+          ci_pkgs=$({ grep -vE "$ci_exclude" <<< "$all" || true; echo "$iouring"; } | sort -u)
+          cover_pkgs=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | sort -u)
+          echo "packages: ci.yml $(grep -c . <<< "$ci_pkgs"), this job $(grep -c . <<< "$cover_pkgs")"
+          if ! diff <(echo "$ci_pkgs") <(echo "$cover_pkgs"); then
             echo "::error::test-coverage.yml and ci.yml's unit job select different packages (diff above: < ci.yml, > this job)"
             exit 1
           fi
