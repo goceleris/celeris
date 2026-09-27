@@ -41,7 +41,7 @@ import (
 // baked into this package's non-test sources. C2: C1 + c633InjectProgress. C3: C0 +
 // c633InjectAbort. C5: C0 + c633InjectReadWhileWaiting.
 const (
-	c633Variant = "C2"
+	c633Variant = "C2b"
 	// H1 kill arm: the frame-completion write and the Close write give up only after
 	// c633ProgWriteIdle with no shrink of the client's send queue (SIOCOUTQ: bytes the server's
 	// kernel has not ACKed), and the close wait only after c633ProgCloseIdle with no byte
@@ -486,7 +486,7 @@ func (g *c633Rig) clientWrite(c net.Conn, r *c633Cli, site string, buf []byte, w
 	start := time.Now()
 	switch {
 	case c633InjectProgress:
-		ok, left, err = g.writeProgress(c, buf, &w)
+		ok, left, err = g.writeProgress(c, r.port, buf, &w)
 	case c633InjectReadWhileWaiting:
 		ok, left, err = g.writeDraining(c, r.port, buf, within, &w)
 	default:
@@ -511,8 +511,15 @@ func (g *c633Rig) clientWrite(c net.Conn, r *c633Cli, site string, buf []byte, w
 // writeProgress: H1 kill arm. 1 s write slices; progress = the client's send queue shrank (the
 // server's kernel ACKed bytes, i.e. its engine read); give up after c633ProgWriteIdle without
 // progress or c633ProgCap in total.
-func (g *c633Rig) writeProgress(c net.Conn, buf []byte, w *c633Wait) (bool, int, error) {
+func (g *c633Rig) writeProgress(c net.Conn, port int, buf []byte, w *c633Wait) (bool, int, error) {
 	w.mode = "progress"
+	var dbuf []byte
+	if c633InjectReadWhileWaiting {
+		// C6 (H3 injection on the coverage base): progress waits, and the client empties its
+		// receive queue after every slice that times out.
+		w.mode = "progress+draining"
+		dbuf = make([]byte, 64<<10)
+	}
 	start := time.Now()
 	lastProg := start
 	_, _, q0 := c633ConnInfo(c)
@@ -549,6 +556,9 @@ func (g *c633Rig) writeProgress(c net.Conn, buf []byte, w *c633Wait) (bool, int,
 		if now.Sub(start) >= c633ProgCap {
 			err, w.reason = werr, "cap"
 			break
+		}
+		if c633InjectReadWhileWaiting {
+			g.drainSlice(c, port, w, dbuf)
 		}
 	}
 	if gap := time.Since(lastProg); gap > maxGap {
@@ -588,28 +598,34 @@ func (g *c633Rig) writeDraining(c net.Conn, port int, buf []byte, within time.Du
 			err, w.reason = werr, "timeout"
 			break
 		}
-		ti, inq, _ := c633ConnInfo(c)
-		h3 := ti != nil && ti.Snd_wnd == 0 && inq > 0
-		if h3 {
-			w.h3Seen++
-			if w.h3First == "" {
-				w.h3First = g.stateLine(port)
-			}
-		}
-		w.drained += c633DrainNow(c, dbuf)
-		w.drains++
-		if h3 {
-			for i := 0; i < 20; i++ {
-				time.Sleep(10 * time.Millisecond)
-				if ti2, _, _ := c633ConnInfo(c); ti2 != nil && ti2.Snd_wnd > 0 {
-					w.h3Opened++
-					break
-				}
-			}
-		}
+		g.drainSlice(c, port, w, dbuf)
 	}
 	_, _, w.outq1 = c633ConnInfo(c)
 	return len(buf) == 0, len(buf), err
+}
+
+// drainSlice records whether the client sits at snd_wnd=0 with unread bytes queued, empties its
+// receive queue, and checks whether its snd_wnd opens within 200 ms (H3 injection).
+func (g *c633Rig) drainSlice(c net.Conn, port int, w *c633Wait, dbuf []byte) {
+	ti, inq, _ := c633ConnInfo(c)
+	h3 := ti != nil && ti.Snd_wnd == 0 && inq > 0
+	if h3 {
+		w.h3Seen++
+		if w.h3First == "" {
+			w.h3First = g.stateLine(port)
+		}
+	}
+	w.drained += c633DrainNow(c, dbuf)
+	w.drains++
+	if h3 {
+		for i := 0; i < 20; i++ {
+			time.Sleep(10 * time.Millisecond)
+			if ti2, _, _ := c633ConnInfo(c); ti2 != nil && ti2.Snd_wnd > 0 {
+				w.h3Opened++
+				break
+			}
+		}
+	}
 }
 
 // wsHandshakeCID is wsHandshake with the client's local port in the query (?cid=), percent-
