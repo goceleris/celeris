@@ -67,6 +67,11 @@ type Config struct {
 
 	// Output is the slog.Logger used to emit log records.
 	// When nil, slog.Default() is used.
+	//
+	// A handler other than [FastHandler] receives copies of the string
+	// values, because slog allows it to keep a record after Handle returns
+	// and the request strings are only valid during the request on epoll
+	// and io_uring. The copies share one allocation per logged request.
 	Output *slog.Logger
 
 	// Level maps an HTTP response status code to a slog.Level, controlling
