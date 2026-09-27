@@ -510,6 +510,10 @@ type Worker struct {
 	// conn registered after it would never be retired, and the duplicate
 	// descriptor RegisterConn takes for it would never be closed.
 	driversClosed bool
+	// driverClosers counts the closes of driver descriptors closeOpFD has
+	// handed to goroutines of their own and whose onClose is not queued yet
+	// (celeris#735). Shutdown waits for it (waitDriverCloses).
+	driverClosers sync.WaitGroup
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring
@@ -5471,8 +5475,11 @@ func (w *Worker) shutdown() {
 	// the same lock (celeris#658).
 	w.closeAdoptQueue()
 	// Fire onClose for every registered driver conn before tearing down
-	// ring/listen fd. Otherwise driver callbacks are silently dropped.
+	// ring/listen fd. Otherwise driver callbacks are silently dropped. Then
+	// wait for the driver closes handed off the worker before the shutdown,
+	// and fire their onClose (celeris#735): the loop that would have is gone.
 	w.shutdownDrivers()
+	w.waitDriverCloses()
 	// Reverse-by-index for the same reason as checkTimeouts (v1.5.0 review
 	// 1.9): any teardown path that swap-removes from liveConns must not cause
 	// a forward range to skip a swapped-in conn or read a zeroed tail slot
