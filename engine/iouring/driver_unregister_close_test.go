@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -788,4 +789,229 @@ func TestDriverRegisterRacingShutdownReleasesEverySocket(t *testing.T) {
 		t.Fatal("no register landed before the shutdown: the race was not run")
 	}
 	expectSameFDTable(t, before, fdTable(t), sockets)
+}
+
+// drainPark parks the worker goroutine inside drainDriverActions: it is the
+// onClose of a register the worker refuses (an "HTTP conn" takes the
+// number after RegisterConn's checks). Every driver action queued before
+// that register has been applied by then, and the SQEs they prepared are
+// not submitted until the worker is released: that happens at the top of
+// its next iteration.
+type drainPark struct {
+	fd, peer int
+	entered  chan chan struct{}
+	rel      chan struct{}
+}
+
+func newDrainPark(t *testing.T) *drainPark {
+	t.Helper()
+	dp := &drainPark{entered: make(chan chan struct{}, 1)}
+	dp.fd, dp.peer = nonblockSocketPair(t)
+	t.Cleanup(func() {
+		dp.release()
+		_ = unix.Close(dp.peer)
+		_ = unix.Close(dp.fd)
+	})
+	return dp
+}
+
+// queue registers dp's conn. The caller then makes it refused: from the
+// worker goroutine, markHTTP.
+func (dp *drainPark) queue(wl engine.WorkerLoop) error {
+	return wl.RegisterConn(dp.fd, func([]byte) {}, func(error) {
+		rel := make(chan struct{})
+		dp.entered <- rel
+		<-rel
+	})
+}
+
+// markHTTP runs on the worker goroutine.
+func (dp *drainPark) markHTTP(w *Worker, on bool) {
+	if on {
+		w.conns[dp.fd] = &connState{fd: dp.fd}
+	} else {
+		w.conns[dp.fd] = nil
+	}
+}
+
+func (dp *drainPark) wait(t *testing.T) {
+	t.Helper()
+	select {
+	case dp.rel = <-dp.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never entered the refused register's onClose")
+	}
+}
+
+func (dp *drainPark) release() {
+	if dp.rel != nil {
+		close(dp.rel)
+		dp.rel = nil
+	}
+}
+
+// takeNumber makes a new socket X hold fd's number, as the next socket the
+// process creates does once fd is closed. It returns X's two ends; the
+// caller closes both, and fd again when it is not X's first.
+func takeNumber(t *testing.T, fd int) (x0, x1 int) {
+	t.Helper()
+	x0, x1 = nonblockSocketPair(t)
+	if x0 != fd {
+		if err := unix.Dup3(x0, fd, unix.O_CLOEXEC); err != nil {
+			t.Fatalf("dup3: %v", err)
+		}
+	}
+	return x0, x1
+}
+
+// readsNothing reports whether fd has nothing to read 200 ms from now.
+func readsNothing(fd int) (bool, string) {
+	time.Sleep(200 * time.Millisecond)
+	var b [64]byte
+	n, err := unix.Read(fd, b[:])
+	if errors.Is(err, unix.EAGAIN) {
+		return true, ""
+	}
+	return false, fmt.Sprintf("n=%d %q err=%v", n, b[:max(n, 0)], err)
+}
+
+// A driver RECV was prepared by the caller's descriptor NUMBER, and the
+// kernel resolves a number only when the worker submits the SQE, at the top
+// of its next iteration. A caller that unregisters and closes in between,
+// with the number then taken by another socket X, sent the re-armed RECV to
+// X: it read X's first bytes, and with the cancel by duplicate missing it,
+// the unregistered socket stayed open until X got data. Every SQE of a
+// driver conn now names the engine's own duplicate of the socket, taken at
+// RegisterConn (celeris#691 review).
+func TestDriverRecvRearmBeforeSubmitSparesReusedNumber(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	p := newWorkerPark(t, w, wl)
+	dp := newDrainPark(t)
+
+	// A's first onRecv queues dp's register and marks its number taken, on
+	// the worker goroutine. After onRecv the worker re-arms A's RECV (the
+	// SQE is prepared, not submitted), then drainDriverActions refuses dp
+	// and parks in its onClose.
+	regErr := make(chan error, 1)
+	var first sync.Once
+	a := &testDriver{closed: make(chan error, 1)}
+	a.fd, a.peer = nonblockSocketPair(t)
+	defer a.closePeer()
+	if err := wl.RegisterConn(a.fd, func([]byte) {
+		first.Do(func() {
+			regErr <- dp.queue(wl)
+			dp.markHTTP(w, true)
+		})
+	}, func(err error) { a.closed <- err }); err != nil {
+		t.Fatalf("RegisterConn(A): %v", err)
+	}
+	settleDriverRecv(t, w, a.fd)
+
+	if _, err := unix.Write(a.peer, []byte{'a'}); err != nil {
+		t.Fatalf("write A's peer: %v", err)
+	}
+	dp.wait(t)
+	if err := <-regErr; err != nil {
+		t.Fatalf("the parking register: %v", err)
+	}
+	dc := driverConnOf(w, a.fd)
+	dc.mu.Lock()
+	armed := dc.recvArmed
+	dc.mu.Unlock()
+	if !armed {
+		t.Fatal("A's RECV was not re-armed before the park: the window is not open")
+	}
+
+	if err := wl.UnregisterConn(a.fd); err != nil {
+		t.Fatalf("UnregisterConn(A): %v", err)
+	}
+	_ = unix.Close(a.fd)
+	x0, x1 := takeNumber(t, a.fd)
+	defer func() { _ = unix.Close(x0); _ = unix.Close(x1) }()
+	dp.release()
+
+	a.expectReleased(t, "UnregisterConn and Close while A's re-armed RECV was unsubmitted")
+	if _, err := unix.Write(x1, []byte{'z'}); err != nil {
+		t.Fatalf("write X's peer: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	var one [1]byte
+	if n, err := unix.Read(x0, one[:]); n != 1 || err != nil {
+		t.Errorf("the socket that took A's number: its reader got n=%d err=%v, want its byte: A's RECV read it", n, err)
+	}
+
+	if x0 != a.fd {
+		_ = unix.Close(a.fd) // X's second number
+	}
+	p.park()
+	p.onWorker(func() { dp.markHTTP(w, false) })
+	p.release()
+	p.d.unregisterAndWait(t, wl)
+}
+
+// The same window for a SEND: flushDriverSend prepared it by number, so a
+// caller that unregistered and closed before the submit, with the number
+// taken by another socket X, had A's bytes written to X's peer.
+func TestDriverSendBeforeSubmitSparesReusedNumber(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	p := newWorkerPark(t, w, wl)
+	dp := newDrainPark(t)
+
+	a := registerSettledDriver(t, w, wl)
+	defer a.closePeer()
+
+	// Queued behind the park, in this order: A's write, then the register
+	// the worker refuses. drainDriverActions prepares A's SEND, then parks.
+	p.park()
+	if err := wl.Write(a.fd, []byte("for A only")); err != nil {
+		t.Fatalf("Write(A): %v", err)
+	}
+	if err := dp.queue(wl); err != nil {
+		t.Fatalf("the parking register: %v", err)
+	}
+	p.onWorker(func() { dp.markHTTP(w, true) })
+	p.release()
+	dp.wait(t)
+
+	if err := wl.UnregisterConn(a.fd); err != nil {
+		t.Fatalf("UnregisterConn(A): %v", err)
+	}
+	_ = unix.Close(a.fd)
+	x0, x1 := takeNumber(t, a.fd)
+	defer func() { _ = unix.Close(x0); _ = unix.Close(x1) }()
+	dp.release()
+
+	if ok, got := readsNothing(x1); !ok {
+		t.Errorf("the peer of the socket that took A's number read %s: A's SEND went to it", got)
+	}
+	if fired, _ := a.waitClosed(); !fired {
+		t.Error("A: onClose never fired")
+	}
+	// A's peer may read A's bytes; after them it must read EOF.
+	var b [64]byte
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		n, err := unix.Read(a.peer, b[:])
+		if err == nil && n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("A's peer: no EOF 2 s after onClose (last read n=%d err=%v)", n, err)
+			break
+		}
+		if errors.Is(err, unix.EAGAIN) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	if x0 != a.fd {
+		_ = unix.Close(a.fd) // X's second number
+	}
+	p.park()
+	p.onWorker(func() { dp.markHTTP(w, false) })
+	p.release()
+	p.d.unregisterAndWait(t, wl)
 }

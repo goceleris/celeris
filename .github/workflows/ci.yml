@@ -479,9 +479,11 @@ jobs:
       # tally requires every run to PASS and no FAIL or SKIP line: a skipped
       # or renamed test turns this red. Seven of the tests pin the
       # UnregisterConn-then-Close leak and every path that must close the
-      # duplicate descriptor its fix takes, and two a register on a worker
-      # that has shut down. TestDriverHTTPZeroOverhead is where the leak was
-      # first seen: 2 of 7 full-package runs failed on #674's branch (#691).
+      # duplicate descriptor its fix takes, two a register on a worker that
+      # has shut down, and two an SQE prepared by a descriptor number the
+      # caller closes before the submit. TestDriverHTTPZeroOverhead is where
+      # the leak was first seen: 2 of 7 full-package runs failed on #674's
+      # branch (#691).
       #
       # memlock stays at the runner's 8 MiB, the shape `unit` runs these in.
       # One driver test's engine runs at a time, and it fits in that budget.
@@ -492,7 +494,7 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           old='TestDriverRegisterUnregister|TestDriverHTTPZeroOverhead|TestDriverWriteSerialization|TestDriverCancelOnUnregister|TestIouringRegisterConnFDCollision|TestIouringShutdownFiresDriverOnClose|TestDriverUnknownFDReturnsErr|TestShutdownDriversRetainsConnsWithOpsInFlight'
-          new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket'
+          new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber'
           names="${old}|${new}"
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
