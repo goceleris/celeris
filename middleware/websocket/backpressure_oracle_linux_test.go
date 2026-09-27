@@ -43,6 +43,35 @@ package websocket
 // wsoWaitCap. A real wedge still fails, and now it fails with its state: each
 // give-up prints the connection's timeline from both ends (WSO-GIVEUP).
 //
+// # An engine that stops reading, which the drain would hide
+//
+// The drain has a cost. celeris#607 was a recv the engine chained behind a
+// send (IOSQE_IO_LINK) on a connection whose client had stopped reading: the
+// send waited on the client's closed window, so the connection could not
+// read at all. The drain is exactly what reopens that window, so a client
+// that drains gets through such a connection and never gives up.
+//
+// So the rig also watches the server side of every connection, every
+// wsoWatchEvery, for its whole life (watch): a connection whose server
+// socket holds unread bytes while nothing asked the engine to stop reading
+// it (the chanReader is not paused and holds nothing, the handler has not
+// exited) is one the engine should be reading. If the engine reads nothing
+// from it for wsoRecvStall, and the process was not starved of CPU meanwhile,
+// the test fails with that stretch's state at both ends (WSO-STALL), whatever
+// the client does afterwards. That is the celeris#607 class judged by what it
+// does, not by the mechanism: a chained recv and a recv arm passed over
+// behind an outstanding send look the same here.
+//
+// # The test binary's deadline
+//
+// A wedge costs wsoWriteIdle or more per subtest, and CI runs both oracles
+// in one binary under -timeout. So a rig takes a budget from t.Deadline():
+// half of what is left after wsoReserve, which is kept for the verdicts, the
+// engine shutdowns and the tests after it. A wait that runs into the budget
+// gives up with reason "budget" and its WSO-GIVEUP record, so a run that
+// would have timed out ends with each subtest's own verdict instead of a
+// goroutine dump.
+//
 // # What the timeline shows
 //
 // The client joins itself to the handler that serves it by sending its local
@@ -60,7 +89,10 @@ package websocket
 //     kernel has accepted from the engine and how many the peer ACKed, the
 //     windows, retransmissions;
 //   - derived from those: the bytes the engine has read, and the bytes the
-//     handler wrote that the engine has not yet handed to the kernel.
+//     handler wrote that the engine has not yet handed to the kernel. Both
+//     count from the connection's first byte, net of the upgrade request and
+//     the 101 response, whose sizes the client reads from its own socket
+//     once the handshake is done.
 //
 // That is the engine's recv and send progress, its resumes and its pending
 // write bytes, observed from outside it, the same way on epoll and io_uring.
@@ -101,20 +133,71 @@ const (
 	// connection, the first ones (the onset) and the most recent ones.
 	wsoFirstSamples = 8
 	wsoLastSamples  = 24
+	// wsoWatchEvery: how often watch samples the server side of every
+	// connection.
+	wsoWatchEvery = 250 * time.Millisecond
+	// wsoWatchGap: a watcher run this long after its tick was due says the
+	// process was starved of CPU, and so perhaps the engine too: every open
+	// stretch starts over (see watch).
+	wsoWatchGap = time.Second
+	// wsoRecvStall: a connection whose engine read nothing for this long
+	// from a socket holding unread bytes, while nothing asked it to stop,
+	// fails the test. celeris#607 held such a connection for up to 14 s.
+	// A healthy engine's longest such stretch, measured on GitHub's runners
+	// in CI's shape, was 2.3 s (epoll: a loop serving other flooded
+	// connections) and 1.7 s (io_uring).
+	wsoRecvStall = 5 * time.Second
+	// wsoQuiet: after its flood the #482 test's client neither reads nor
+	// writes for this long, holding the backpressure it built. A healthy
+	// engine reads what the socket holds, or pauses; one that stopped
+	// reading the connection behind its blocked echo (celeris#607) cannot,
+	// so that stretch outlasts wsoRecvStall however late in the flood it
+	// began.
+	wsoQuiet = 6 * time.Second
+	// wsoReserve: what a rig leaves of the test binary's -timeout for the
+	// verdicts, the engine shutdowns (up to 40 s) and the tests after it.
+	wsoReserve = 60 * time.Second
 )
 
 // wsoRig joins each client connection to the handler that serves it and
 // keeps what each side saw.
 type wsoRig struct {
-	t0      time.Time
-	srvPort atomic.Int32 // set once the server listens; read by handler goroutines
-	srvs    sync.Map     // client local port -> *wsoSrv
-	mu      sync.Mutex
-	clis    []*wsoCli
-	hs      []*wsoSrv // every handler, joined or not
+	t0       time.Time
+	end      time.Time    // the wait budget from t.Deadline(); zero: none
+	srvPort  atomic.Int32 // set once the server listens; read by handler goroutines
+	srvs     sync.Map     // client local port -> *wsoSrv
+	clisBy   sync.Map     // client local port -> *wsoCli
+	mu       sync.Mutex
+	clis     []*wsoCli
+	hs       []*wsoSrv     // every handler, joined or not
+	stallMax time.Duration // the longest stretch watch saw, set when it stops
+	longest  wsoStall      // that stretch (see watch)
+	// watchResets and watchMaxLag: how often, and for how long at most, the
+	// watcher was not run when its tick was due (see watch).
+	watchResets int
+	watchMaxLag time.Duration
 }
 
-func newWSORig() *wsoRig { return &wsoRig{t0: time.Now()} }
+// newWSORig starts a subtest's rig. Its waits share one budget: half of the
+// time the test binary has left after wsoReserve (see the file comment).
+func newWSORig(t *testing.T) *wsoRig {
+	g := &wsoRig{t0: time.Now()}
+	if dl, ok := t.Deadline(); ok {
+		g.end = g.t0.Add(max(time.Until(dl)-wsoReserve, 0) / 2)
+	}
+	return g
+}
+
+// overBudget reports whether now is past the rig's wait budget.
+func (g *wsoRig) overBudget(now time.Time) bool { return !g.end.IsZero() && !now.Before(g.end) }
+
+// budgetNote describes the budget for a verdict message.
+func (g *wsoRig) budgetNote() string {
+	if g.end.IsZero() {
+		return "no -timeout budget"
+	}
+	return "the -timeout budget ended at +" + wsoSec(int64(g.end.Sub(g.t0)))
+}
 
 // since is the rig's clock: nanoseconds since the subtest started.
 func (g *wsoRig) since() int64 { return int64(time.Since(g.t0)) }
@@ -149,15 +232,13 @@ type wsoSrv struct {
 	pauses, resumes   atomic.Int64
 	pauseNs, resumeNs atomic.Int64
 
-	mu      sync.Mutex
-	baseOut int64 // server socket: bytes ACKed + queued when the handler started
-	baseIn  int64 // server socket: bytes received - unread when the handler started
-	baseOK  bool
-	exit    string
-	exitNs  int64
-	errs    []wsoSrvErr
-	fd      int
-	ino     uint64
+	mu     sync.Mutex
+	exit   string
+	exitNs int64
+	errs   []wsoSrvErr
+	fd     int
+	ino    uint64
+	gone   bool // the socket was found once and its descriptor no longer is it
 }
 
 // attach registers the handler's connection under the client's port and
@@ -191,13 +272,7 @@ func (g *wsoRig) attach(c *Conn) *wsoSrv {
 		}
 		r.pausedMu.Unlock()
 	}
-	if ti, inq, outq, ok := g.srvSockInfo(s); ok {
-		s.mu.Lock()
-		s.baseOut = int64(ti.Bytes_acked) + int64(outq)
-		s.baseIn = int64(ti.Bytes_received) - int64(inq)
-		s.baseOK = true
-		s.mu.Unlock()
-	}
+	g.srvSockFD(s) // find the engine's descriptor while the connection is young
 	return s
 }
 
@@ -295,8 +370,10 @@ func wsoFDByInode(ino uint64) int {
 // socket. It is found once through /proc and re-checked with fstat before
 // every use, so a descriptor the engine closed and the kernel handed to
 // another socket is not read (short of a reuse between the fstat and the
-// read, which would only misreport a diagnostic). Only read-only calls
-// (fstat, getsockopt TCP_INFO, ioctl SIOCINQ/SIOCOUTQ) are made on it.
+// read, which would only misreport a diagnostic). Once that check fails the
+// socket is gone for good and is not searched for again (watch asks every
+// wsoWatchEvery). Only read-only calls (fstat, getsockopt TCP_INFO, ioctl
+// SIOCINQ/SIOCOUTQ) are made on it.
 func (g *wsoRig) srvSockFD(s *wsoSrv) int {
 	srvPort := int(g.srvPort.Load())
 	if s.port <= 0 || srvPort <= 0 {
@@ -304,12 +381,16 @@ func (g *wsoRig) srvSockFD(s *wsoSrv) int {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.gone {
+		return -1
+	}
 	if s.fd >= 0 {
 		var st unix.Stat_t
 		if unix.Fstat(s.fd, &st) == nil && st.Ino == s.ino {
 			return s.fd
 		}
-		s.fd = -1
+		s.fd, s.gone = -1, true
+		return -1
 	}
 	_, ino := wsoProcTCP(srvPort, s.port)
 	if fd := wsoFDByInode(ino); fd >= 0 {
@@ -363,31 +444,43 @@ func wsoCliSockInfo(c net.Conn) (ti *unix.TCPInfo, inq, outq int) {
 	return ti, inq, outq
 }
 
-// wsoDrainNow empties the client's receive queue without blocking.
-func wsoDrainNow(c net.Conn, buf []byte) int64 {
+// wsoDrainNow empties the client's receive queue without blocking. It
+// returns the bytes read and how the read ended: nil when the queue was
+// empty, io.EOF when the server had closed its side, or the socket's error.
+// A raw read clears the socket's pending error (a reset reads as
+// ECONNRESET once and then no more), so it is returned here, where the
+// caller can still name it.
+func wsoDrainNow(c net.Conn, buf []byte) (int64, error) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
-		return 0
+		return 0, nil
 	}
 	sc, err := tc.SyscallConn()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	var total int64
-	_ = sc.Read(func(fd uintptr) bool {
+	var end error
+	if err := sc.Read(func(fd uintptr) bool {
 		for {
 			n, e := unix.Read(int(fd), buf)
-			if n > 0 {
+			switch {
+			case n > 0:
 				total += int64(n)
 				continue
-			}
-			if e == unix.EINTR {
+			case e == unix.EINTR:
 				continue
+			case e == nil:
+				end = io.EOF
+			case e != unix.EAGAIN:
+				end = os.NewSyscallError("read", e)
 			}
-			return true // EAGAIN (empty), EOF or an error: stop, never wait
+			return true // empty, EOF or an error: stop, never wait
 		}
-	})
-	return total
+	}); err != nil && end == nil {
+		end = err
+	}
+	return total, end
 }
 
 func wsoTCPShort(ti *unix.TCPInfo) string {
@@ -429,16 +522,20 @@ type wsoSrvView struct {
 	sockOK                bool
 	ti                    *unix.TCPInfo
 	inq, outq             int
+	rawRead               int64 // bytes the engine has read from the socket, the upgrade request included
 	engRead, pendingWrite int64
 }
 
 func (g *wsoRig) srvView(port int) wsoSrvView {
-	var v wsoSrvView
 	x, ok := g.srvs.Load(port)
 	if !ok {
-		return v
+		return wsoSrvView{}
 	}
-	s := x.(*wsoSrv)
+	return g.srvViewOf(x.(*wsoSrv))
+}
+
+func (g *wsoRig) srvViewOf(s *wsoSrv) wsoSrvView {
+	var v wsoSrvView
 	now := g.since()
 	v.found = true
 	v.phase = s.phase.Load()
@@ -468,12 +565,23 @@ func (g *wsoRig) srvView(port int) wsoSrvView {
 	v.ti, v.inq, v.outq, v.sockOK = g.srvSockInfo(s)
 	s.mu.Lock()
 	v.exit = s.exit
-	baseOK, baseOut, baseIn := s.baseOK, s.baseOut, s.baseIn
 	s.mu.Unlock()
-	v.engRead, v.pendingWrite = -1, -1
-	if v.sockOK && baseOK {
-		v.engRead = int64(v.ti.Bytes_received) - int64(v.inq) - baseIn
-		v.pendingWrite = wrote - (int64(v.ti.Bytes_acked) + int64(v.outq) - baseOut)
+	v.rawRead, v.engRead, v.pendingWrite = -1, -1, -1
+	if !v.sockOK {
+		return v
+	}
+	// The server socket counts from its first payload byte (a passive open
+	// starts snd_una and rcv_nxt past the SYN), so bytes received minus
+	// unread is everything the engine has read, and bytes ACKed plus the
+	// send queue is everything it has handed to the kernel. Net of the
+	// upgrade request and the 101, both are the handler's frames.
+	v.rawRead = int64(v.ti.Bytes_received) - int64(v.inq)
+	if x, ok := g.clisBy.Load(s.port); ok {
+		cl := x.(*wsoCli)
+		if reqB, respB := cl.hsOut.Load(), cl.hsIn.Load(); reqB >= 0 && respB >= 0 {
+			v.engRead = v.rawRead - reqB
+			v.pendingWrite = wrote + respB - (int64(v.ti.Bytes_acked) + int64(v.outq))
+		}
 	}
 	return v
 }
@@ -532,30 +640,53 @@ func wsoShape(cli *unix.TCPInfo, cliInq int, v wsoSrvView) string {
 // wsoCli is one client connection's record: milestones, the first timeline
 // samples and a ring of the most recent ones.
 type wsoCli struct {
-	g       *wsoRig
-	port    int
-	mu      sync.Mutex
-	marks   []string
-	first   []string
-	last    [wsoLastSamples]string
-	nSamp   int
-	closeNs int64 // rig time the client closed its socket; 0 while open
-	gaveUp  bool
-	close   wsoClose
-	fc, cw  wsoWrite
+	g    *wsoRig
+	port int
+	c    net.Conn
+	// hsOut and hsIn: the upgrade request's and the 101 response's sizes,
+	// read from the client's socket once the handshake is done; -1 before.
+	hsOut, hsIn atomic.Int64
+	mu          sync.Mutex
+	marks       []string
+	first       []string
+	last        [wsoLastSamples]string
+	nSamp       int
+	closeNs     int64 // rig time the client closed its socket; 0 while open
+	gaveUp      bool
+	close       wsoClose
+	fc, cw      wsoWrite
 }
 
 // client registers a dialed connection. Close it with closeClient, which
 // records when the client let go (see serverErrs).
 func (g *wsoRig) client(c net.Conn) *wsoCli {
-	cl := &wsoCli{g: g}
+	cl := &wsoCli{g: g, c: c}
+	cl.hsOut.Store(-1)
+	cl.hsIn.Store(-1)
 	if a, ok := c.LocalAddr().(*net.TCPAddr); ok {
 		cl.port = a.Port
+		g.clisBy.Store(a.Port, cl)
 	}
 	g.mu.Lock()
 	g.clis = append(g.clis, cl)
 	g.mu.Unlock()
 	return cl
+}
+
+// handshake upgrades the connection with the join key in its path, and then
+// records the upgrade's size in each direction from the client's socket: the
+// server sends nothing past its 101 until frames arrive, and it ACKed the
+// whole request with that 101, so here bytes received are the 101 and bytes
+// ACKed are the request.
+func (cl *wsoCli) handshake(c net.Conn, hostPort string) error {
+	if err := wsHandshakePath(c, hostPort, cl.path()); err != nil {
+		return err
+	}
+	if ti, _, _ := wsoCliSockInfo(c); ti != nil {
+		cl.hsOut.Store(int64(ti.Bytes_acked))
+		cl.hsIn.Store(int64(ti.Bytes_received))
+	}
+	return nil
 }
 
 func (g *wsoRig) closeClient(cl *wsoCli, c net.Conn) {
@@ -596,7 +727,7 @@ type wsoWrite struct {
 	need      int
 	left      int
 	err       error
-	reason    string // "" (completed), "noprog", "cap", "err"
+	reason    string // "" (completed), "noprog", "cap", "budget", "rst", "eof", "err"
 	dur       time.Duration
 	slices    int
 	progress  int
@@ -616,8 +747,9 @@ func (w wsoWrite) String() string {
 // each slice that times out, a timeline sample and a non-blocking drain of
 // the client's receive queue. Progress is a byte written or a shrink of the
 // client's send queue (the server's kernel ACKed: the engine is reading).
-// It gives up after wsoWriteIdle without progress, at wsoWaitCap in total, or
-// on any error other than the slice's own deadline.
+// It gives up after wsoWriteIdle without progress, at wsoWaitCap in total,
+// at the rig's budget, on any error other than the slice's own deadline, or
+// when a drain finds the connection reset ("rst") or closed ("eof").
 func (cl *wsoCli) write(c net.Conn, site string, buf, dbuf []byte) wsoWrite {
 	w := wsoWrite{site: site, need: len(buf)}
 	// The drain below goes through the conn's poller, which refuses at once
@@ -641,6 +773,9 @@ func (cl *wsoCli) write(c net.Conn, site string, buf, dbuf []byte) wsoWrite {
 		}
 		if !errors.Is(err, os.ErrDeadlineExceeded) {
 			w.err, w.reason = err, "err"
+			if errors.Is(err, syscall.ECONNRESET) {
+				w.reason = "rst"
+			}
 			break
 		}
 		now := time.Now()
@@ -662,7 +797,22 @@ func (cl *wsoCli) write(c net.Conn, site string, buf, dbuf []byte) wsoWrite {
 			w.err, w.reason = err, "cap"
 			break
 		}
-		w.drained += wsoDrainNow(c, dbuf)
+		if cl.g.overBudget(now) {
+			w.err, w.reason = err, "budget"
+			break
+		}
+		n2, derr := wsoDrainNow(c, dbuf)
+		w.drained += n2
+		if derr != nil {
+			w.err, w.reason = derr, "err"
+			switch {
+			case errors.Is(derr, syscall.ECONNRESET):
+				w.reason = "rst"
+			case errors.Is(derr, io.EOF):
+				w.reason = "eof"
+			}
+			break
+		}
 	}
 	_ = c.SetWriteDeadline(time.Time{})
 	w.left = len(buf)
@@ -684,7 +834,7 @@ func (cl *wsoCli) write(c net.Conn, site string, buf, dbuf []byte) wsoWrite {
 
 // wsoClose is how the wait for the server's close went.
 type wsoClose struct {
-	outcome  string // "eof", "rst", "idle", "cap", "err"
+	outcome  string // "eof", "rst", "idle", "cap", "budget", "err"
 	err      error
 	dur      time.Duration // Close sent -> outcome
 	bytes    int64         // received during the wait
@@ -698,8 +848,9 @@ func (r wsoClose) String() string {
 }
 
 // closeWait reads until the server closes. The give-up is re-armed by every
-// byte received: it comes after wsoCloseIdle without one, or at wsoWaitCap.
-// While it waits in silence it records a timeline sample every wsoSlice.
+// byte received: it comes after wsoCloseIdle without one, at wsoWaitCap, or
+// at the rig's budget. While it waits in silence it records a timeline
+// sample every wsoSlice.
 func (cl *wsoCli) closeWait(c net.Conn, buf []byte) wsoClose {
 	var r wsoClose
 	start := time.Now()
@@ -710,6 +861,9 @@ func (cl *wsoCli) closeWait(c net.Conn, buf []byte) wsoClose {
 			dl = lim
 		}
 		if lim := start.Add(wsoWaitCap); dl.After(lim) {
+			dl = lim
+		}
+		if lim := cl.g.end; !lim.IsZero() && dl.After(lim) {
 			dl = lim
 		}
 		_ = c.SetReadDeadline(dl)
@@ -736,6 +890,8 @@ func (cl *wsoCli) closeWait(c net.Conn, buf []byte) wsoClose {
 				r.outcome = "cap"
 			case now.Sub(last) >= wsoCloseIdle:
 				r.outcome = "idle"
+			case cl.g.overBudget(now):
+				r.outcome = "budget"
 			default:
 				cl.sample(c, "close wait")
 				continue
@@ -806,17 +962,28 @@ type wsoJudged struct {
 	line string
 }
 
-// serverErrs splits every server-side error into those that came BEFORE
-// their own client closed its socket, which the engine did, and those after,
-// which are the client's own teardown echoing back (a socket closed with
-// unread data sends an RST). An error whose connection the rig could not
-// join is counted as before: it cannot be excused.
-func (g *wsoRig) serverErrs() (before, after []wsoJudged) {
-	closeAt := map[int]int64{}
+// serverErrs splits every server-side error into the judged and the
+// excused. An error is excused only when its own client gave up on the
+// connection or was reset (giveUp), which fails the test on its own, and the
+// error came after that client closed its socket: then it is the client's
+// teardown echoing back (a socket closed with unread data sends an RST;
+// celeris#633: none of 1,165 such errors came before their client's close).
+// Every other error is judged, whenever it came: on a connection whose
+// client read the server's close (EOF), the client's receive queue was
+// empty and its close sent a FIN, so nothing it did can explain a server
+// error; and a handler notes an engine error only when its next read or
+// write returns, so the time it was noted says nothing about its cause. An
+// error whose connection the rig could not join is judged.
+func (g *wsoRig) serverErrs() (judged, excused []wsoJudged) {
+	type end struct {
+		closeNs int64
+		gaveUp  bool
+	}
+	ends := map[int]end{}
 	g.mu.Lock()
 	for _, cl := range g.clis {
 		cl.mu.Lock()
-		closeAt[cl.port] = cl.closeNs
+		ends[cl.port] = end{cl.closeNs, cl.gaveUp}
 		cl.mu.Unlock()
 	}
 	hs := append([]*wsoSrv(nil), g.hs...)
@@ -826,23 +993,245 @@ func (g *wsoRig) serverErrs() (before, after []wsoJudged) {
 		errs := append([]wsoSrvErr(nil), s.errs...)
 		s.mu.Unlock()
 		for _, e := range errs {
-			ca, ok := closeAt[s.port]
+			en, ok := ends[s.port]
 			line := fmt.Sprintf("conn 127.0.0.1:%d %s error %q at %s", s.port, e.kind, wsoErrStr(e.err), wsoSec(e.ns))
-			if ok && ca > 0 && e.ns >= ca {
-				after = append(after, wsoJudged{e.kind, line + fmt.Sprintf(", %s after its client closed", wsoSec(e.ns-ca))})
+			switch {
+			case ok && en.gaveUp && en.closeNs > 0 && e.ns >= en.closeNs:
+				excused = append(excused, wsoJudged{e.kind, line + fmt.Sprintf(", %s after its client gave up and closed", wsoSec(e.ns-en.closeNs))})
 				continue
-			}
-			if ok && ca > 0 {
-				line += fmt.Sprintf(", %s BEFORE its client closed", wsoSec(ca-e.ns))
-			} else {
+			case !ok:
+				line += ", its connection was never joined"
+			case en.closeNs == 0:
 				line += ", its client had not closed"
+			case e.ns < en.closeNs:
+				line += fmt.Sprintf(", %s BEFORE its client closed", wsoSec(en.closeNs-e.ns))
+			default:
+				line += fmt.Sprintf(", %s after its client closed on the server's close (EOF)", wsoSec(e.ns-en.closeNs))
 			}
-			before = append(before, wsoJudged{e.kind, line})
+			judged = append(judged, wsoJudged{e.kind, line})
 		}
 	}
-	sort.Slice(before, func(i, j int) bool { return before[i].line < before[j].line })
-	sort.Slice(after, func(i, j int) bool { return after[i].line < after[j].line })
-	return before, after
+	sort.Slice(judged, func(i, j int) bool { return judged[i].line < judged[j].line })
+	sort.Slice(excused, func(i, j int) bool { return excused[i].line < excused[j].line })
+	return judged, excused
+}
+
+// ------------------------------------------------------------------ the watch
+
+// wsoStall is one stretch in which a connection's engine read nothing from
+// a server socket holding unread bytes while nothing asked it to stop.
+type wsoStall struct {
+	port          int
+	fromNs, toNs  int64 // rig time of the stretch's first and last sample
+	samples       int
+	onset, last   string // the server side at those samples
+	onsetC, lastC string // the client side at those samples
+	marks         string // the client's milestones at the last sample
+	open          bool   // still going when the watch stopped
+}
+
+func (st *wsoStall) String() string {
+	still := ""
+	if st.open {
+		still = ", still going when the watch stopped"
+	}
+	return fmt.Sprintf("WSO-STALL conn=127.0.0.1:%d the engine read nothing for %s (%d samples, +%s to +%s%s) "+
+		"from a server socket holding unread bytes, while the chanReader was neither paused nor holding "+
+		"anything and the handler had not exited\n  onset: %s\n         %s\n  last:  %s\n         %s\n  client milestones: %s",
+		st.port, wsoSec(st.toNs-st.fromNs), st.samples, wsoSec(st.fromNs), wsoSec(st.toNs), still,
+		st.onset, st.onsetC, st.last, st.lastC, st.marks)
+}
+
+// longestStretch renders the longest stretch watch saw, for the verdict
+// line's neighbour: how close a run came to wsoRecvStall.
+func (g *wsoRig) longestStretch() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.longest.samples == 0 {
+		return "longest unread stretch: none"
+	}
+	st := g.longest
+	return fmt.Sprintf("longest unread stretch (limit %v): %s", wsoRecvStall, strings.TrimPrefix(st.String(), "WSO-STALL "))
+}
+
+// wsoStallable reports whether the engine should be reading a connection
+// now: its server socket holds unread bytes, and nothing asked the engine to
+// stop (the chanReader is not paused, is not closed and holds nothing), and
+// the handler has not exited.
+func wsoStallable(v wsoSrvView) bool {
+	return v.found && v.sockOK && v.inq > 0 && !v.paused && !v.closed && v.depth == 0 && v.spill == 0 && v.phase != 3
+}
+
+// cliNow renders a joined connection's client side now, for a WSO-STALL.
+func (g *wsoRig) cliNow(port int) string {
+	x, ok := g.clisBy.Load(port)
+	if !ok {
+		return "cli{unjoined}"
+	}
+	cl := x.(*wsoCli)
+	ti, inq, outq := wsoCliSockInfo(cl.c)
+	cl.mu.Lock()
+	last := "none"
+	if n := len(cl.marks); n > 0 {
+		last = strconv.Quote(cl.marks[n-1])
+	}
+	cl.mu.Unlock()
+	return fmt.Sprintf("cli{inq=%d outq=%d %s lastMilestone=%s}", inq, outq, wsoTCPShort(ti), last)
+}
+
+func (g *wsoRig) cliMarks(port int) string {
+	x, ok := g.clisBy.Load(port)
+	if !ok {
+		return ""
+	}
+	cl := x.(*wsoCli)
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	return strings.Join(cl.marks, "; ")
+}
+
+// watch samples the server side of every joined connection every
+// wsoWatchEvery until stop is called. A stretch is a run of samples in which
+// the connection is wsoStallable and the engine read nothing (bytes received
+// minus unread did not move) and the chanReader applied no pause or resume.
+// Every stretch that reaches wsoRecvStall is recorded, from its first sample
+// to its last. stop returns those. The longest stretch seen on any
+// connection is kept too, whether or not it reached the limit
+// (longestStretch), so a healthy run shows how close it came.
+//
+// The samples between a stretch's first and last are not what proves it:
+// bytes read, pauses and resumes only ever grow, a chanReader holding
+// nothing that is handed nothing stays empty, and an unread socket that is
+// not read stays unread, so equal readings at both ends mean the engine read
+// nothing in between while nothing asked it to stop. What the samples guard
+// against is the process itself not running: if the watcher waits more than
+// wsoWatchGap past a due tick, the process was starved of CPU, the engine
+// may have been too, and every open stretch starts over (counted as
+// watchResets on the waits line).
+//
+// Start it once the server listens and stop it once the clients are done:
+// the verdict is the test's, on the test goroutine.
+func (g *wsoRig) watch() (stop func() []*wsoStall) {
+	type episode struct {
+		fromNs, raw, pauses, resumes int64
+		samples                      int
+		onset, onsetC                string
+		rec                          *wsoStall
+	}
+	done, fin := make(chan struct{}), make(chan struct{})
+	var stalls []*wsoStall
+	var longest int64
+	go func() {
+		defer close(fin)
+		eps := map[*wsoSrv]*episode{}
+		tick := time.NewTicker(wsoWatchEvery)
+		defer tick.Stop()
+		idleFrom := g.since() // when the watcher last started waiting for a tick
+		for {
+			select {
+			case <-done:
+				for _, ep := range eps {
+					if ep.rec != nil {
+						ep.rec.open = true
+					}
+				}
+				return
+			case <-tick.C:
+			}
+			// A tick is due at most wsoWatchEvery after the watcher starts
+			// waiting (sooner when a pass overran). Waiting longer than that
+			// plus wsoWatchGap means this goroutine was runnable and not run.
+			if lag := time.Duration(g.since()-idleFrom) - wsoWatchEvery; lag > 0 {
+				g.mu.Lock()
+				g.watchMaxLag = max(g.watchMaxLag, lag)
+				if lag > wsoWatchGap {
+					g.watchResets++
+					clear(eps)
+				}
+				g.mu.Unlock()
+			}
+			g.mu.Lock()
+			hs := append([]*wsoSrv(nil), g.hs...)
+			g.mu.Unlock()
+			for _, s := range hs {
+				if s.port <= 0 || s.phase.Load() == 3 {
+					delete(eps, s)
+					continue
+				}
+				v := g.srvViewOf(s)
+				now := g.since()
+				if !wsoStallable(v) {
+					delete(eps, s)
+					continue
+				}
+				ep := eps[s]
+				if ep == nil || v.rawRead != ep.raw || v.pauses != ep.pauses || v.resumes != ep.resumes {
+					eps[s] = &episode{fromNs: now, raw: v.rawRead, pauses: v.pauses, resumes: v.resumes,
+						samples: 1, onset: v.String(), onsetC: g.cliNow(s.port)}
+					continue
+				}
+				ep.samples++
+				d := now - ep.fromNs
+				if d > longest {
+					longest = d
+					st := wsoStall{port: s.port, fromNs: ep.fromNs, toNs: now, samples: ep.samples,
+						onset: ep.onset, onsetC: ep.onsetC, last: v.String(), lastC: g.cliNow(s.port), marks: g.cliMarks(s.port)}
+					g.mu.Lock()
+					g.longest = st
+					g.mu.Unlock()
+				}
+				if d < int64(wsoRecvStall) {
+					continue
+				}
+				if ep.rec == nil {
+					ep.rec = &wsoStall{port: s.port, fromNs: ep.fromNs, onset: ep.onset, onsetC: ep.onsetC}
+					stalls = append(stalls, ep.rec)
+				}
+				ep.rec.toNs, ep.rec.samples = now, ep.samples
+				ep.rec.last, ep.rec.lastC, ep.rec.marks = v.String(), g.cliNow(s.port), g.cliMarks(s.port)
+			}
+			idleFrom = g.since()
+		}
+	}()
+	return func() []*wsoStall {
+		close(done)
+		<-fin
+		g.mu.Lock()
+		g.stallMax = time.Duration(longest)
+		g.mu.Unlock()
+		return stalls
+	}
+}
+
+// wsoAssertNoStalls prints every WSO-STALL record and fails the test if
+// there is one (see watch).
+func wsoAssertNoStalls(t *testing.T, name string, stalls []*wsoStall) {
+	t.Helper()
+	for _, st := range stalls {
+		t.Log(st.String())
+	}
+	if len(stalls) != 0 {
+		t.Errorf("%s: %d connection(s) left unread for %v or longer: the server socket held bytes, nothing asked the "+
+			"engine to stop reading (the chanReader was neither paused nor holding anything) and the engine read "+
+			"nothing. That is the celeris#607 class, a recv held back behind a send the client's closed window "+
+			"blocks; the client's own reads get it through, so no give-up shows it. Each WSO-STALL record above has "+
+			"the stretch's state at both ends", name, len(stalls), wsoRecvStall)
+	}
+}
+
+// wsoAssertNoLinkedRecv judges io_uring's linked-recv witness. These servers
+// serve nothing but WebSocket connections, and each is detached by its
+// upgrade (Context.Detach publishes it before the upgrade handler returns),
+// before the engine flushes anything on it. So no recv may ever be chained
+// behind a send (IOSQE_IO_LINK): on a detached connection that chain is
+// celeris#607 itself (TestFlushSendLinkNeverChainsOnDetachedConn guards the
+// function; this guards every path that reaches it).
+func wsoAssertNoLinkedRecv(t *testing.T, name string, arms, blockedMaxNs uint64) {
+	t.Helper()
+	if arms != 0 {
+		t.Errorf("%s: the engine chained a recv behind a send %d time(s) (the longest waited %d ms) on a server "+
+			"whose every connection is a detached WebSocket: celeris#607's mechanism", name, arms, blockedMaxNs/1e6)
+	}
 }
 
 // wsoWaitStats summarises every connection's waits for the verdict line.
@@ -854,6 +1243,9 @@ type wsoWaitStats struct {
 	closeSilentSlow        int // close waits with a silent stretch over wsoCloseSlow
 	maxCloseGap, maxNoProg time.Duration
 	fcSlices, drainedBytes int64
+	recvStallMax           time.Duration // the longest stretch watch saw (see watch)
+	watchResets            int
+	watchMaxLag            time.Duration
 }
 
 func (g *wsoRig) waitStats() wsoWaitStats {
@@ -861,6 +1253,7 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 	var closes []time.Duration
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	st.recvStallMax, st.watchResets, st.watchMaxLag = g.stallMax, g.watchResets, g.watchMaxLag
 	for _, cl := range g.clis {
 		cl.mu.Lock()
 		st.conns++
@@ -892,7 +1285,7 @@ func (g *wsoRig) waitStats() wsoWaitStats {
 
 func (st wsoWaitStats) String() string {
 	r := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
-	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s",
+	return fmt.Sprintf("waits: conns=%d fcMax=%s cwMax=%s maxNoProg=%s fcSlices=%d drainedWhileWaiting=%d closeP50=%s closeP99=%s closeMax=%s closeOver%s=%d closeSilentOver%s=%d maxCloseGap=%s recvStallMax=%s watchResets=%d watchMaxLag=%s",
 		st.conns, r(st.fcMax), r(st.cwMax), r(st.maxNoProg), st.fcSlices, st.drainedBytes, r(st.closeP50), r(st.closeP99), r(st.closeMax),
-		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap))
+		wsoCloseSlow, st.closeSlow, wsoCloseSlow, st.closeSilentSlow, r(st.maxCloseGap), r(st.recvStallMax), st.watchResets, r(st.watchMaxLag))
 }
