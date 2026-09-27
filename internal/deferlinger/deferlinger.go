@@ -68,6 +68,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -76,6 +77,35 @@ import (
 // TCP_DEFER_ACCEPT: the kernel's initial retransmission timeout of one
 // second, the timer wheel's round-up, and margin.
 const DefaultLinger = 1500 * time.Millisecond
+
+// epoch anchors the package's clock. time.Now carries a monotonic clock
+// reading, and time.Since between two readings that both carry one uses the
+// monotonic clock alone (package time, "Monotonic Clocks").
+var epoch = time.Now()
+
+// Now is the clock every linger deadline is taken and read on: nanoseconds
+// since the package was initialised, on the monotonic clock. A step of the
+// wall clock (settimeofday, an NTP step) does not move it, so it can neither
+// end a linger early -- which would bring back the resets celeris#662 fixed
+// -- nor keep a paused listener open and accepting past its deadline, after
+// PauseAccept, whose own bound is monotonic too, has returned.
+func Now() int64 { return int64(time.Since(epoch)) }
+
+// Deadline is a point on the Now clock. The zero Deadline means none: the
+// listener is not lingering. It is a distinct type so that a deadline cannot
+// be compared with a wall-clock reading such as time.Now().UnixNano()
+// without a conversion that shows up in review.
+type Deadline int64
+
+// After returns the Deadline d from now on the Now clock.
+func After(d time.Duration) Deadline { return Deadline(Now() + int64(d)) }
+
+// Passed reports whether the Now clock has reached d.
+func (d Deadline) Passed() bool { return Now() >= int64(d) }
+
+// Left returns the time from now until d, which is negative once d has
+// passed.
+func (d Deadline) Left() time.Duration { return time.Duration(int64(d) - Now()) }
 
 // The test hooks. Read on the loop and worker threads in the pause step only,
 // never on the steady-state path. Tests that change them must not run in
@@ -167,6 +197,8 @@ var (
 	setFailures  atomic.Uint64
 	guards       atomic.Uint64
 	synackUnread atomic.Uint64
+	waitWoken    atomic.Uint64
+	waitRechecks atomic.Uint64
 )
 
 // Stats is a snapshot of the counters.
@@ -186,6 +218,11 @@ type Stats struct {
 	// SynackUnread counts pauses that could not read tcp_synack_retries, and
 	// so applied no guard.
 	SynackUnread uint64
+	// WaitWoken counts the times a PauseAccept wait was woken by Notify.
+	WaitWoken uint64
+	// WaitRechecks counts the times a PauseAccept wait re-checked on its
+	// timer instead (WaitRecheck).
+	WaitRechecks uint64
 }
 
 // Snapshot returns the counters.
@@ -197,19 +234,34 @@ func Snapshot() Stats {
 		SetFailures:  setFailures.Load(),
 		Guards:       guards.Load(),
 		SynackUnread: synackUnread.Load(),
+		WaitWoken:    waitWoken.Load(),
+		WaitRechecks: waitRechecks.Load(),
 	}
 }
 
 // NoteClose records that the pause path closed a listener.
 func NoteClose() { closes.Add(1) }
 
-// PauseState is one engine's record of the pause in progress. Begin writes it
-// off the loop threads before the pause flag is set; the loops read it in
-// their pause step. A nil *PauseState is valid: it never guards and never
-// delays.
+// PauseState is one engine's record of the pause in progress, and the place
+// its PauseAccept waits. Begin writes it off the loop threads before the
+// pause flag is set; the loops read it in their pause step. A nil
+// *PauseState is valid: it never guards and never delays, and Notify on it
+// does nothing.
 type PauseState struct {
 	began atomic.Int64
 	guard atomic.Bool
+
+	// Each warning is logged once per engine; later occurrences are only
+	// counted (SynackUnread, SetFailures).
+	warnedUnread  atomic.Bool
+	warnedSet     atomic.Bool
+	warnedRestore atomic.Bool
+
+	// waitMu guards waitCh, the channel the next Notify closes. It is a
+	// leaf lock: nothing else is acquired while it is held, and nothing
+	// done under it blocks.
+	waitMu sync.Mutex
+	waitCh chan struct{}
 }
 
 // Begin records a new pause: when it began, and whether its listeners get the
@@ -219,22 +271,77 @@ func (p *PauseState) Begin(logger *slog.Logger, engineName string) {
 	guard, readable := GuardWanted()
 	if !readable {
 		synackUnread.Add(1)
-		if logger != nil {
+		if logger != nil && p.warnedUnread.CompareAndSwap(false, true) {
 			logger.Warn("accept pause: could not read net.ipv4.tcp_synack_retries; "+
-				"the pausing listeners get no TCP_SYNCNT guard",
+				"the pausing listeners get no TCP_SYNCNT guard (logged once per engine)",
 				"engine", engineName, "path", synackRetriesPath)
 		}
 	}
 	p.guard.Store(guard)
-	p.began.Store(time.Now().UnixNano())
+	p.began.Store(Now())
 }
 
-// Began reports when the current pause began, in Unix nanoseconds.
+// Began reports when the current pause began, on the Now clock.
 func (p *PauseState) Began() int64 {
 	if p == nil {
 		return 0
 	}
 	return p.began.Load()
+}
+
+// Changed returns the channel the next Notify closes. A PauseAccept that is
+// about to wait takes it BEFORE it reads the state it waits on, so a change
+// published after that read closes a channel it already holds: no wakeup is
+// lost.
+func (p *PauseState) Changed() <-chan struct{} {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+	if p.waitCh == nil {
+		p.waitCh = make(chan struct{})
+	}
+	return p.waitCh
+}
+
+// Notify wakes every PauseAccept waiting on this engine. A loop or worker
+// calls it after it has published a change such a wait reads -- its listener
+// closed by the pause, its exit -- and ResumeAccept after it withdrew the
+// pause.
+func (p *PauseState) Notify() {
+	if p == nil {
+		return
+	}
+	p.waitMu.Lock()
+	if p.waitCh != nil {
+		close(p.waitCh)
+		p.waitCh = nil
+	}
+	p.waitMu.Unlock()
+}
+
+// WaitRecheck is the longest a PauseAccept wait sleeps without a Notify. The
+// pause close, a loop's exit and a resume all notify; the timer is for the
+// one change that does not: a pause that lands on a listener a resume has not
+// re-created yet, whose flag the loop sets on its next iteration.
+const WaitRecheck = 100 * time.Millisecond
+
+// WaitChanged blocks until changed is closed, deadline (a time.Now reading,
+// monotonic) passes, or WaitRecheck elapses, whichever is first. It returns
+// false only when deadline has passed.
+func WaitChanged(changed <-chan struct{}, deadline time.Time) bool {
+	left := time.Until(deadline)
+	if left <= 0 {
+		return false
+	}
+	t := time.NewTimer(min(left, WaitRecheck))
+	defer t.Stop()
+	select {
+	case <-changed:
+		waitWoken.Add(1)
+		return true
+	case <-t.C:
+		waitRechecks.Add(1)
+		return time.Now().Before(deadline)
+	}
 }
 
 // Guard reports whether the current pause's listeners get TCP_SYNCNT=1.
@@ -249,5 +356,5 @@ func (p *PauseState) Observed() bool {
 	if d <= 0 || p == nil {
 		return true
 	}
-	return time.Now().UnixNano() >= p.began.Load()+d
+	return Now() >= p.began.Load()+d
 }

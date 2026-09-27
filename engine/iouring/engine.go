@@ -590,9 +590,12 @@ func (e *Engine) PauseAccept() error {
 	if len(workers) == 0 {
 		return nil
 	}
-	start := time.Now()
-	deadline := start.Add(max(deferlinger.Linger(), 0) + time.Second)
+	deadline := time.Now().Add(max(deferlinger.Linger(), 0) + time.Second)
 	for {
+		// Take the channel BEFORE reading the flags: a worker that closes
+		// its listener after the read below closes this channel, so the
+		// wait cannot miss it (deferlinger.PauseState.Changed).
+		changed := e.pause.Changed()
 		if !e.acceptPaused.Load() {
 			return nil // a ResumeAccept withdrew the pause
 		}
@@ -606,27 +609,22 @@ func (e *Engine) PauseAccept() error {
 		if allClosed {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		// Blocks until a worker closes its listener or exits, a resume, or
+		// the re-check (deferlinger.WaitRecheck), instead of polling every
+		// millisecond through the linger (celeris#662 review: ~1,500
+		// wakeups per pause, 65-73 ms of CPU on an idle io_uring engine).
+		if !deferlinger.WaitChanged(changed, deadline) {
 			return nil // best-effort: do not surface the timeout, the FD will close shortly
 		}
-		time.Sleep(pausePollInterval(time.Since(start)))
 	}
-}
-
-// pausePollInterval paces PauseAccept's wait: fine-grained for a pause that
-// closes at once (DisableDeferAccept, or a test's zero linger), coarse over
-// the linger so a 1.5 s wait does not spin.
-func pausePollInterval(elapsed time.Duration) time.Duration {
-	if elapsed < 20*time.Millisecond {
-		return 100 * time.Microsecond
-	}
-	return time.Millisecond
 }
 
 // ResumeAccept starts accepting new connections again.
 // Wakes any suspended workers so they re-create listen sockets.
 func (e *Engine) ResumeAccept() error {
 	e.acceptPaused.Store(false)
+	// A PauseAccept still waiting returns now: its pause is withdrawn.
+	e.pause.Notify()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, w := range e.workers {

@@ -350,16 +350,17 @@ type Worker struct {
 	// listenFDClosed signals that the worker has no listen FD while
 	// acceptPaused is set: its pause linger has run out, it has cancelled
 	// its in-flight accept SQE and closed the listener, or it has exited
-	// (shutdown sets it). PauseAccept polls this so it only returns once
-	// the SO_REUSEPORT group has actually shed this listener. It stays
+	// (shutdown sets it). PauseAccept waits on this so it only returns once
+	// the SO_REUSEPORT group has actually shed this listener; the worker
+	// notifies the wait (pause.Notify) after it sets the flag. It stays
 	// false while the worker lingers (celeris#662): the listener is still
 	// open and its accept still armed then.
 	listenFDClosed atomic.Bool
-	// lingerUntil is the deadline, in Unix nanoseconds, of the accept-pause
-	// linger in progress, or 0 when none is (celeris#662): the listener's
-	// TCP_DEFER_ACCEPT has been cleared and its multishot accept stays
-	// armed until then. Loop-thread only, like listenFD.
-	lingerUntil int64
+	// lingerUntil is the deadline, on deferlinger's monotonic clock, of the
+	// accept-pause linger in progress, or 0 when none is (celeris#662): the
+	// listener's TCP_DEFER_ACCEPT has been cleared and its multishot accept
+	// stays armed until then. Loop-thread only, like listenFD.
+	lingerUntil deferlinger.Deadline
 	// deferCapable records whether listenFD was created with
 	// TCP_DEFER_ACCEPT, which is whether a pause has anything to clear and
 	// linger for. A listener created without it (DisableDeferAccept) closes
@@ -1065,7 +1066,7 @@ func (w *Worker) run(ctx context.Context) {
 			// withdrawn by a resume.
 			w.stepAcceptPause(ctx, paused)
 		}
-		// Maintain the listenFDClosed signal that PauseAccept polls on:
+		// Maintain the listenFDClosed signal that PauseAccept waits on:
 		// true exactly while paused with no listen fd. That covers the
 		// close stepAcceptPause just did and an fd that was already -1
 		// from a prior Pause-Resume cycle that hadn't re-created the
@@ -1886,14 +1887,10 @@ func (w *Worker) sweptTimeout() time.Duration {
 	return w.baseTimeout()
 }
 
-// capToDeadline caps a ring-wait timeout at the time left to deadline (Unix
-// nanoseconds), never below zero.
-func capToDeadline(d time.Duration, deadline int64) time.Duration {
-	left := time.Duration(deadline - time.Now().UnixNano())
-	if left < 0 {
-		left = 0
-	}
-	return min(d, left)
+// capToDeadline caps a ring-wait timeout at the time left to deadline (on
+// deferlinger's monotonic clock), never below zero.
+func capToDeadline(d time.Duration, deadline deferlinger.Deadline) time.Duration {
+	return min(d, max(deadline.Left(), 0))
 }
 
 // baseTimeout is adaptiveTimeout without either cap.
@@ -2080,7 +2077,7 @@ func (w *Worker) onAcceptedFD(ctx context.Context, newFD int, now int64, isFixed
 func (w *Worker) stepAcceptPause(ctx context.Context, paused bool) {
 	switch {
 	case !paused:
-		deferlinger.Leave(w.listenFD, w.deferCapable, w.logger, "worker", w.id)
+		deferlinger.Leave(w.listenFD, w.deferCapable, w.pause, w.logger, "worker", w.id)
 		w.lingerUntil = 0
 	case w.lingerUntil == 0:
 		if !w.pause.Observed() {
@@ -2089,7 +2086,7 @@ func (w *Worker) stepAcceptPause(ctx context.Context, paused bool) {
 		if w.lingerUntil = deferlinger.Enter(w.listenFD, w.deferCapable, w.pause, w.logger, "worker", w.id); w.lingerUntil == 0 {
 			w.closeListenerAfterDrain(ctx)
 		}
-	case time.Now().UnixNano() >= w.lingerUntil:
+	case w.lingerUntil.Passed():
 		w.closeListenerAfterDrain(ctx)
 	}
 }
@@ -2100,7 +2097,10 @@ func (w *Worker) stepAcceptPause(ctx context.Context, paused bool) {
 // (acceptQueuedOnPause), and closes the socket. The cancel releases the
 // kernel's io_uring reference to the underlying file, allowing the socket to
 // leave the SO_REUSEPORT group immediately. Without it, unix.Close alone
-// leaves a phantom socket that intercepts connections.
+// leaves a phantom socket that intercepts connections. It is called only
+// while the engine is paused, so it sets listenFDClosed itself -- the value
+// the iteration's own store sets right after -- before it wakes a
+// PauseAccept waiting for it.
 func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// Clear w.listenFD BEFORE handling the cancel's completions.
 	// handleAccept re-arms accept whenever listenFD >= 0 and a completion
@@ -2140,6 +2140,8 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	_ = unix.Close(lfd)
 	w.lingerUntil = 0
 	deferlinger.NoteClose()
+	w.listenFDClosed.Store(true)
+	w.pause.Notify()
 }
 
 // acceptQueuedOnPause accepts every connection still waiting in the listen
@@ -5524,6 +5526,7 @@ func (w *Worker) shutdown() {
 	// would otherwise leave it false until PauseAccept's own bound ran out
 	// (celeris#662).
 	w.listenFDClosed.Store(true)
+	w.pause.Notify()
 	// celeris#655: Close waits for the signals already in flight and turns
 	// every later one into a no-op, so no producer — including the dispatch
 	// goroutines this function only joins below — can write this descriptor

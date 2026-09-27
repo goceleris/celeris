@@ -110,17 +110,19 @@ type Loop struct {
 	suspended    atomic.Bool
 	// listenFDClosed signals that the loop has no listen FD while
 	// acceptPaused=true: its pause linger has run out and the listener is
-	// closed, or the loop has exited (shutdown sets it). PauseAccept polls
-	// this so it only returns once the SO_REUSEPORT group has actually shed
-	// this listener. It stays false while the loop lingers (celeris#662):
-	// the listener is still open and still accepting then. Reset to false
-	// in ResumeAccept so a Pause→Resume→Pause cycle re-arms the signal.
+	// closed, or the loop has exited (shutdown sets it). PauseAccept waits
+	// on this so it only returns once the SO_REUSEPORT group has actually
+	// shed this listener; the loop notifies the wait (pause.Notify) after
+	// it sets the flag. It stays false while the loop lingers
+	// (celeris#662): the listener is still open and still accepting then.
+	// Reset to false in ResumeAccept so a Pause→Resume→Pause cycle re-arms
+	// the signal.
 	listenFDClosed atomic.Bool
-	// lingerUntil is the deadline, in Unix nanoseconds, of the accept-pause
-	// linger in progress, or 0 when none is (celeris#662): the listener's
-	// TCP_DEFER_ACCEPT has been cleared and it keeps accepting until then.
-	// Loop-thread-only.
-	lingerUntil int64
+	// lingerUntil is the deadline, on deferlinger's monotonic clock, of the
+	// accept-pause linger in progress, or 0 when none is (celeris#662): the
+	// listener's TCP_DEFER_ACCEPT has been cleared and it keeps accepting
+	// until then. Loop-thread-only.
+	lingerUntil deferlinger.Deadline
 	// deferCapable records whether listenFD was created with
 	// TCP_DEFER_ACCEPT, which is whether a pause has anything to clear and
 	// linger for. A listener created without it (DisableDeferAccept) closes
@@ -458,7 +460,7 @@ func (l *Loop) run(ctx context.Context) {
 			// withdrawn by a resume (celeris#662). See stepAcceptPause.
 			l.stepAcceptPause(ctx, paused)
 		}
-		// Maintain the listenFDClosed signal that PauseAccept polls on:
+		// Maintain the listenFDClosed signal that PauseAccept waits on:
 		// true exactly while paused with no listen fd. That covers the
 		// close stepAcceptPause just did and an fd that was already -1
 		// from a prior Pause-Resume cycle that hadn't re-created the
@@ -1095,7 +1097,7 @@ func (l *Loop) acceptQueuedOnPause(ctx context.Context) {
 func (l *Loop) stepAcceptPause(ctx context.Context, paused bool) {
 	switch {
 	case !paused:
-		deferlinger.Leave(l.listenFD, l.deferCapable, l.logger, "loop", l.id)
+		deferlinger.Leave(l.listenFD, l.deferCapable, l.pause, l.logger, "loop", l.id)
 		l.lingerUntil = 0
 	case l.lingerUntil == 0:
 		if !l.pause.Observed() {
@@ -1104,14 +1106,17 @@ func (l *Loop) stepAcceptPause(ctx context.Context, paused bool) {
 		if l.lingerUntil = deferlinger.Enter(l.listenFD, l.deferCapable, l.pause, l.logger, "loop", l.id); l.lingerUntil == 0 {
 			l.closeListenerAfterDrain(ctx)
 		}
-	case time.Now().UnixNano() >= l.lingerUntil:
+	case l.lingerUntil.Passed():
 		l.closeListenerAfterDrain(ctx)
 	}
 }
 
 // closeListenerAfterDrain is the pause's close: serve every connection still
 // in the accept queue (acceptQueuedOnPause), then take the listener out of
-// epoll and close it, which removes it from the SO_REUSEPORT group.
+// epoll and close it, which removes it from the SO_REUSEPORT group. It is
+// called only while the engine is paused, so it sets listenFDClosed itself --
+// the value the iteration's own store sets right after -- before it wakes a
+// PauseAccept waiting for it.
 func (l *Loop) closeListenerAfterDrain(ctx context.Context) {
 	// Connections still in the kernel accept queue completed their
 	// handshake before the close and may already have sent a request.
@@ -1126,17 +1131,20 @@ func (l *Loop) closeListenerAfterDrain(ctx context.Context) {
 	l.listenHot = false
 	l.lingerUntil = 0
 	deferlinger.NoteClose()
+	l.listenFDClosed.Store(true)
+	l.pause.Notify()
 }
 
 // lingerTimeoutMs caps an epoll_wait timeout at the time left to the pause
 // linger's deadline, rounded up so the wait does not return just short of it
-// and spin.
+// and spin. A negative ms (block until an event) is capped too, so a
+// lingering loop never sleeps through its deadline.
 func (l *Loop) lingerTimeoutMs(ms int) int {
-	left := l.lingerUntil - time.Now().UnixNano()
+	left := l.lingerUntil.Left()
 	if left <= 0 {
 		return 0
 	}
-	if lm := int((left + int64(time.Millisecond) - 1) / int64(time.Millisecond)); lm < ms {
+	if lm := int((left + time.Millisecond - 1) / time.Millisecond); ms < 0 || lm < ms {
 		return lm
 	}
 	return ms
@@ -3157,6 +3165,7 @@ func (l *Loop) shutdown() {
 	// would otherwise leave it false until PauseAccept's own bound ran out
 	// (celeris#662).
 	l.listenFDClosed.Store(true)
+	l.pause.Notify()
 	// celeris#655: Close waits for the signals already in flight and turns
 	// every later one into a no-op, so the producers asyncWG does not track
 	// — detached WS/SSE callbacks, the H2 write queue — cannot write this

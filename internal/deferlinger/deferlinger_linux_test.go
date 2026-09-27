@@ -150,7 +150,7 @@ func TestEnterClearsThenLeaveRestores(t *testing.T) {
 		t.Errorf("counters moved lingers +%d guards +%d setFailures +%d, want +1 +1 +0",
 			s1.Lingers-s0.Lingers, s1.Guards-s0.Guards, s1.SetFailures-s0.SetFailures)
 	}
-	Leave(fd, true, nil, "loop", 0)
+	Leave(fd, true, &p, nil, "loop", 0)
 	if !deferOn(t, fd) {
 		t.Error("Leave did not restore TCP_DEFER_ACCEPT")
 	}
@@ -170,13 +170,13 @@ func TestEnterDeadlineAnchoredAtTheClear(t *testing.T) {
 	var p PauseState
 	p.Begin(nil, "test")
 	time.Sleep(50 * time.Millisecond) // the loop observes the pause late
-	before := time.Now().UnixNano()
+	before := Now()
 	until := Enter(fd, true, &p, nil, "loop", 0)
-	if floor := before + int64(Linger()); until < floor {
+	if floor := before + int64(Linger()); int64(until) < floor {
 		t.Errorf("deadline is %v before clear+Linger: it was not taken after the clear",
-			time.Duration(floor-until))
+			time.Duration(floor-int64(until)))
 	}
-	if until > time.Now().UnixNano()+int64(Linger()) {
+	if int64(until) > Now()+int64(Linger()) {
 		t.Error("deadline lies beyond now+Linger")
 	}
 }
