@@ -633,3 +633,159 @@ func TestDriverShutdownReleasesDescriptors(t *testing.T) {
 	p.d.closePeer()
 	expectSameFDTable(t, before, fdTable(t), sockets)
 }
+
+// A worker that has shut down must not take a descriptor it will never
+// close. Engine.WorkerLoop keeps handing such a worker out, after the engine
+// stops and after one worker exits mid-run (Worker.shutdown), and a driver
+// that reconnects registers on it: the redis Pub/Sub reconnect loop does,
+// after onClose(errEngineShutdown). shutdownDrivers runs once, so a conn
+// registered after it is never retired, and the duplicate its UnregisterConn
+// took would hold the socket open for the life of the process. RegisterConn
+// refuses there, as the epoll engine and the drivers' standalone loop do.
+// The caller below goes on to unregister and close whatever RegisterConn
+// said, as a driver whose handshake then times out does: its close must
+// still release the socket.
+func TestDriverRegisterAfterShutdownIsRefused(t *testing.T) {
+	// Anything the runtime opens on its first network use is open before
+	// the snapshot, not counted as a leak after it.
+	if ln, err := net.Listen("tcp", "127.0.0.1:0"); err == nil {
+		_ = ln.Close()
+	}
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop) // idempotent; the test calls it itself below
+	wl := e.WorkerLoop(0)
+	stop()
+
+	before := fdTable(t)
+	d := &testDriver{closed: make(chan error, 1)}
+	d.fd, d.peer = nonblockSocketPair(t)
+	defer d.closePeer()
+	sockets := map[string]bool{socketName(t, d.fd): true}
+	regErr := wl.RegisterConn(d.fd, func([]byte) {}, func(err error) { d.closed <- err })
+	if regErr == nil {
+		if err := wl.UnregisterConn(d.fd); err != nil {
+			t.Logf("UnregisterConn after the accepted register: %v", err)
+		}
+	}
+	_ = unix.Close(d.fd)
+	if peer := d.peerSees(); peer != "EOF" {
+		t.Errorf("RegisterConn on a shut-down worker returned %v; after UnregisterConn and Close "+
+			"the peer reads %s, want EOF: a descriptor of the engine's still holds the socket", regErr, peer)
+	}
+	d.closePeer()
+	expectSameFDTable(t, before, fdTable(t), sockets)
+	if !errors.Is(regErr, errEngineShutdown) {
+		t.Errorf("RegisterConn on a worker that has shut down returned %v, want an error wrapping errEngineShutdown", regErr)
+	}
+}
+
+// RegisterConn racing the shutdown: every conn is either registered before
+// shutdownDrivers takes the map, and retired by it, or refused. None lands
+// in between, where nothing would retire it. Each caller does what a driver
+// does (register, then unregister and close) until the engine has stopped,
+// and a few times more. Afterwards every register made after the stop was
+// refused, every peer reads EOF, and the process holds the descriptors it
+// held before.
+func TestDriverRegisterRacingShutdownReleasesEverySocket(t *testing.T) {
+	const callers, after, maxPerCaller = 4, 16, 2000
+	if ln, err := net.Listen("tcp", "127.0.0.1:0"); err == nil {
+		_ = ln.Close()
+	}
+	before := fdTable(t)
+
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop) // idempotent
+	wl := e.WorkerLoop(0)
+
+	type result struct {
+		peer      int
+		sock      string
+		afterStop bool // the engine had stopped before RegisterConn was called
+		regErr    error
+	}
+	results := make([][]result, callers)
+	errs := make([]error, callers)
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+	for c := range callers {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			left := after
+			for range maxPerCaller {
+				afterStop := false
+				select {
+				case <-stopped:
+					afterStop = true
+				default:
+				}
+				if afterStop {
+					if left == 0 {
+						return
+					}
+					left--
+				}
+				pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+				if err != nil {
+					errs[c] = err
+					return
+				}
+				fd := pair[0]
+				var st unix.Stat_t
+				if err := unix.Fstat(fd, &st); err != nil {
+					errs[c] = err
+					return
+				}
+				r := result{peer: pair[1], sock: fmt.Sprintf("socket:[%d]", st.Ino), afterStop: afterStop}
+				r.regErr = wl.RegisterConn(fd, func([]byte) {}, func(error) {})
+				if r.regErr == nil {
+					_ = wl.UnregisterConn(fd)
+				}
+				_ = unix.Close(fd)
+				results[c] = append(results[c], r)
+				time.Sleep(500 * time.Microsecond)
+			}
+		}()
+	}
+	time.Sleep(20 * time.Millisecond)
+	stop()
+	close(stopped)
+	for range callers {
+		<-done
+	}
+	for c, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", c, err)
+		}
+	}
+
+	sockets := make(map[string]bool)
+	var accepted, refused, open int
+	for _, rs := range results {
+		for _, r := range rs {
+			sockets[r.sock] = true
+			if r.regErr == nil {
+				accepted++
+				if r.afterStop {
+					t.Errorf("%s: RegisterConn after the engine stopped returned nil, want an error", r.sock)
+				}
+			} else {
+				refused++
+			}
+			d := &testDriver{peer: r.peer}
+			if peer := d.peerSees(); peer != "EOF" {
+				open++
+				t.Errorf("%s (RegisterConn returned %v, after the stop: %v): after UnregisterConn and Close "+
+					"the peer reads %s, want EOF", r.sock, r.regErr, r.afterStop, peer)
+			}
+			d.closePeer()
+			if open > 4 {
+				t.Fatal("more than 4 sockets still open; not reading the rest")
+			}
+		}
+	}
+	t.Logf("%d registers accepted, %d refused", accepted, refused)
+	if accepted == 0 {
+		t.Fatal("no register landed before the shutdown: the race was not run")
+	}
+	expectSameFDTable(t, before, fdTable(t), sockets)
+}
