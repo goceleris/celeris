@@ -217,3 +217,78 @@ func (e *teardownEngine) Shutdown(context.Context) error { return nil }
 func (e *teardownEngine) Metrics() engine.EngineMetrics  { return engine.EngineMetrics{} }
 func (e *teardownEngine) Type() engine.EngineType        { return engine.Epoll }
 func (e *teardownEngine) Addr() net.Addr                 { return nil }
+
+// TestADirectShutdownAfterTheWatchersDoesNotRepeatIt is the other order: the
+// cancel comes first, and the direct Shutdown after it (review of #692). A
+// caller whose signal handler cancels the Start context and then calls
+// Server.Shutdown, or whose main calls Shutdown once Start has returned, did
+// exactly this. The watcher's guard read a counter of Shutdown calls, and a
+// direct call checked nothing, so the direct call ran every OnShutdown hook a
+// second time: during the watcher's Shutdown, and after it had returned.
+//
+// The direct call now waits for the Shutdown the watcher claimed and returns
+// its result. The first hook run holds the watcher's Shutdown open while the
+// direct call is made. The result does not depend on when the direct call
+// gets to run: the watcher claims the shutdown before it runs the hooks, and
+// the call runs any hook it is going to run before it returns.
+func TestADirectShutdownAfterTheWatchersDoesNotRepeatIt(t *testing.T) {
+	s := New(Config{Engine: Std, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	var hookRuns atomic.Int32
+	entered := make(chan struct{})
+	releaseHook := make(chan struct{})
+	s.OnShutdown(func(context.Context) {
+		if hookRuns.Add(1) == 1 {
+			close(entered)
+			<-releaseHook
+		}
+	})
+
+	eng := &teardownEngine{listening: make(chan struct{}), release: make(chan struct{})}
+	var e engine.Engine = eng
+	s.engineRef.Store(&e)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.listenUntilCancelled(ctx, eng) }()
+	<-eng.listening
+
+	cancel()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		close(releaseHook)
+		close(eng.release)
+		t.Fatal("the cancel never reached the OnShutdown hook: the watcher did not shut down")
+	}
+	direct := make(chan error, 1)
+	go func() { direct <- s.Shutdown(context.Background()) }()
+	close(releaseHook)
+	select {
+	case err := <-direct:
+		if err != nil {
+			t.Errorf("the direct Shutdown during the watcher's: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		close(eng.release)
+		t.Fatal("the direct Shutdown did not return after the watcher's Shutdown did")
+	}
+	if n := hookRuns.Load(); n != 1 {
+		t.Errorf("a direct Shutdown during the one the cancel started: the hook ran %d times, want 1", n)
+	}
+
+	close(eng.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("listenUntilCancelled: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("listenUntilCancelled did not return after Listen did")
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Errorf("a Shutdown after Start returned: %v", err)
+	}
+	if n := hookRuns.Load(); n != 1 {
+		t.Errorf("a Shutdown after Start returned: the hook ran %d times in all, want 1", n)
+	}
+}
