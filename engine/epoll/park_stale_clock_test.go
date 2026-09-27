@@ -47,6 +47,7 @@ func staleClockAfterParkEpoll(t *testing.T, park time.Duration, adopt bool) {
 		// listeners close as PauseAccept is called and the loops park.
 		DisableDeferAccept: true,
 		ReadTimeout:        staleClockReadTimeout,
+		WriteTimeout:       staleClockReadTimeout, // as the io_uring arms: see there
 		IdleTimeout:        10 * time.Minute,
 	}, okHandler658{})
 	if err != nil {

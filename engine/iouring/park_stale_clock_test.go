@@ -90,6 +90,14 @@ func staleClockAfterPark(t *testing.T, park time.Duration, adopt bool) {
 		// once.
 		c.DisableDeferAccept = true
 		c.ReadTimeout = staleClockReadTimeout
+		// checkTimeouts judges a connection with a SEND in flight against
+		// WriteTimeout instead (60 s by default), so with the default a
+		// stale stamp was forgiven whenever the first check after the wake
+		// caught the response on its way out: on a paused engine, whose
+		// worker iterates only on this connection's own completions, about
+		// half the time. The same bound on both keeps the arm from depending
+		// on where in a request that check lands.
+		c.WriteTimeout = staleClockReadTimeout
 		c.IdleTimeout = 10 * time.Minute
 	})
 	e.mu.Lock()
