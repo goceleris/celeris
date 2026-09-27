@@ -339,6 +339,9 @@ func (s *Session) Clear() {
 // session's ID is provisional until the session is modified (or explicitly saved);
 // if the request completes without writing, the ID is never stored or sent to
 // the client (celeris#487).
+//
+// The returned string is the session's own copy, never a view of the request,
+// so it may be kept after the request.
 func (s *Session) ID() string { return s.id }
 
 // IsFresh returns true if this is a newly created session (no prior valid cookie).
@@ -760,9 +763,24 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 				}
 			}
 			if data != nil {
-				sess.id = sid
+				// sid is what the extractor returned: c.Cookie, c.Header
+				// or c.Query, which on epoll and io_uring is a view of
+				// the connection's receive buffer. The engine receives
+				// the connection's next request into that buffer, and a
+				// closed connection's buffer serves the next connection.
+				// The session ID outlives this handler: the write-behind
+				// worker writes under it after the handler has returned
+				// (celeris#731), a detached stream keeps the Session
+				// through the Context, and ID() hands it to the
+				// application. So the Session keeps its own copy, and
+				// presentedID shares it. One copy, only when a stored
+				// session loads. kv.Get above and the expiry branch's
+				// kv.Delete return before the handler does, so they use
+				// the view.
+				id := strings.Clone(sid)
+				sess.id = id
 				sess.data = data
-				sess.presentedID = sid
+				sess.presentedID = id
 				loaded = true
 			}
 		}
@@ -834,8 +852,9 @@ func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
 				// off the response critical path; the cookie is still emitted
 				// synchronously (at the first mutation, or below) so the
 				// client's next request carries the (already-snapshotted)
-				// session ID. sess.id is an immutable string for this
-				// request, also safe to capture by value.
+				// session ID. sess.id is safe to queue: it is the copy made
+				// when the session loaded, or a KeyGenerator result (fresh
+				// session, Regenerate), never a view of the request.
 				wb.enqueue(sess.id, buf, expiry)
 			} else {
 				saveErr := kv.Set(reqCtx, sess.id, buf, expiry)
