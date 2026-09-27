@@ -11,8 +11,10 @@ import (
 
 // TestRecvTheftWitnessCompilesAway pins that the celeris#715 witness costs a
 // production build nothing: recvtheft.Enabled is false, so its call sites
-// compile away, and connState.recvArmSeq is zero-size and shares its offset
-// with the field after it, so the connState layout is unchanged.
+// compile away, and connState.recvArmSeq is zero-size and not the last field
+// (only a trailing zero-size field makes Go pad a struct), so kernelInflight,
+// the field after it, sits where its own alignment puts it and the connState
+// layout is unchanged.
 func TestRecvTheftWitnessCompilesAway(t *testing.T) {
 	if recvtheft.Enabled {
 		t.Fatal("recvtheft.Enabled is true in a build without the validation tag")
@@ -21,7 +23,11 @@ func TestRecvTheftWitnessCompilesAway(t *testing.T) {
 	if n := unsafe.Sizeof(cs.recvArmSeq); n != 0 {
 		t.Fatalf("connState.recvArmSeq is %d bytes in production, want 0", n)
 	}
-	if a, b := unsafe.Offsetof(cs.recvArmSeq), unsafe.Offsetof(cs.kernelInflight); a != b {
-		t.Fatalf("connState.recvArmSeq at offset %d, kernelInflight at %d: the zero-size field must not add padding", a, b)
+	at, next, align := unsafe.Offsetof(cs.recvArmSeq), unsafe.Offsetof(cs.kernelInflight), unsafe.Alignof(cs.kernelInflight)
+	if want := (at + align - 1) &^ (align - 1); next != want {
+		t.Fatalf("connState.recvArmSeq at offset %d moves kernelInflight to %d, want %d (its alignment, %d, alone)", at, next, want, align)
+	}
+	if last := unsafe.Offsetof(cs.recvOutstanding); at >= last {
+		t.Fatalf("connState.recvArmSeq (offset %d) must not be the last field (recvOutstanding is at %d): a trailing zero-size field adds padding", at, last)
 	}
 }
