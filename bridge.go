@@ -69,6 +69,10 @@ func buildHTTPRequest(c *Context) (*http.Request, error) {
 		return nil, err
 	}
 
+	// The H1 parser of the native engines defers the header slice until
+	// something reads a header. Without this, a route with no header read
+	// before Adapt handed net/http no request headers at all (celeris#720).
+	c.stream.MaterializeHeaders()
 	for _, h := range c.stream.Headers {
 		if strings.HasPrefix(h[0], ":") {
 			continue
