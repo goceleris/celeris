@@ -303,10 +303,7 @@ func (r *chanReader) requestPause() {
 	// pause cannot go stale again once this critical section ends. The spill
 	// guard matches Read's: never resume while chunks are still queued behind
 	// the channel.
-	if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {
-		r.pausedState = false
-		r.resume()
-	}
+	// MUTANT m672: stale-pause re-check deleted (celeris#672 re-introduced).
 }
 
 // resumeIfDrained is Read's edge-triggered resume: once the depth has fallen
