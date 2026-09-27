@@ -1407,11 +1407,13 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // Detach copies the request values the Context holds, so they stay valid
 // after the handler returns: the headers, method, path and query, the route
 // params, the parsed query and cookies, the Host, the strings stored with
-// SetRequestID, SetClientIP, SetHost, SetScheme and SetString, and the
-// response headers set so far (middleware echo request headers into them).
-// It cannot copy a string read out of the Context before the call, nor values
-// stored with [Context.Set]: on epoll and io_uring those may still refer to
-// the connection's receive buffer, so clone them before keeping them.
+// SetRequestID, SetClientIP, SetHost, SetScheme and SetString, the request
+// body (so Body, FormValue, Bind and BodyReader called after Detach read the
+// request), and the response headers set so far (middleware echo request
+// headers into them). It cannot copy what was read out of the Context before
+// the call (a string, a Body slice, a BodyReader), nor values stored with
+// [Context.Set]: on epoll and io_uring those may still refer to the
+// connection's receive buffer, so clone them before keeping them.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
@@ -1462,8 +1464,8 @@ func (c *Context) Detach() (done func()) {
 // strings the Context keeps outside the header slice and the method, path and
 // raw query: the route params, the parsed query and cookie caches, the H1
 // Host, the strings middleware store on the Context from request headers
-// (request ID, client-IP/host/scheme overrides, SetString values), and the
-// response headers set so far.
+// (request ID, client-IP/host/scheme overrides, SetString values), the
+// request body, and the response headers set so far.
 //
 // On epoll and io_uring each of these can be a view of the engine's receive
 // buffer, which is safe to compare while the request is handled and unsafe to
@@ -1498,6 +1500,17 @@ func (c *Context) materializeRequestViews() {
 	c.schemeOverride = strings.Clone(c.schemeOverride)
 	for k, v := range c.stringKeys {
 		c.stringKeys[k] = strings.Clone(v)
+	}
+	// The body. The native H1 engines install it as a slice of the receive
+	// buffer (internal/conn/h1.go, SetRawBody), and Body, FormValue, Bind and
+	// BodyReader read it lazily. Copied only when there is one, and only
+	// where the handler can return before the stream ends (OnDetach is set):
+	// elsewhere the handler outlives the stream, and std's body is a heap
+	// copy already. A GET upgrade or stream pays nothing.
+	if c.stream.OnDetach != nil {
+		if b := c.stream.GetData(); len(b) > 0 {
+			c.stream.SetRawBody(bytes.Clone(b))
+		}
 	}
 	// The response headers set so far: middleware echo request headers into
 	// them (requestid's x-request-id, cors's access-control-allow-origin),
