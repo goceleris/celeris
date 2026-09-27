@@ -66,6 +66,8 @@ type Config struct {
 	// label sets. Each map key becomes a label name and the function extracts
 	// the label value from the request context. The functions are called
 	// after c.Next() returns, so response-derived values are available.
+	// A function may return a request string such as c.Header(...): the
+	// middleware copies a label combination the first time it records it.
 	LabelFuncs map[string]func(*celeris.Context) string
 
 	// SizeBuckets defines histogram bucket boundaries for request and

@@ -86,6 +86,18 @@ type Server struct {
 	listenCancel   context.CancelFunc
 	shutdownCalled bool
 
+	// Who shuts the server down when a Start*Context call's context is
+	// cancelled and the caller also calls Shutdown (celeris#673): the first
+	// to claim it, under lifecycleMu, so the OnShutdown hooks never run
+	// twice. directShutdown: a direct Shutdown call has begun, so the
+	// watcher leaves the shutdown to it. watcherShutdown: the watcher has
+	// claimed the shutdown, and is closed once it has run; a direct Shutdown
+	// that finds it waits for that and returns watcherErr, written before
+	// the close.
+	directShutdown  bool
+	watcherShutdown chan struct{}
+	watcherErr      error
+
 	notFoundHandler         HandlerFunc
 	methodNotAllowedHandler HandlerFunc
 	errorHandler            func(*Context, error)
@@ -236,6 +248,15 @@ func (s *Server) OnError(handler func(c *Context, err error)) *Server {
 // OnShutdown registers a function to be called during Server.Shutdown.
 // Hooks fire in registration order with the shutdown context. Must be
 // called before Start.
+//
+// When cancelling the context of [Server.StartWithContext] or
+// [Server.StartWithListenerAndContext] is what shuts the server down, the
+// hooks run before that call returns: it waits for the Shutdown the cancel
+// triggers, hooks included. A hook must therefore not wait for that Start
+// call to return, directly or through anything that happens only after it
+// returns. The two would wait on each other: a hook that returns when its ctx
+// is done ends the wait after [Config.ShutdownTimeout], and a hook that
+// ignores ctx never does.
 func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 	s.shutdownHooks = append(s.shutdownHooks, fn)
 	return s
@@ -382,6 +403,16 @@ func (s *Server) Start() error {
 // cancels Listen exactly as before, this only adds a second way to wake it.
 // If Shutdown already ran (or is racing prepare), the returned context is
 // already cancelled so Listen returns immediately instead of parking forever.
+//
+// The returned function cancels that context and releases what doPrepare
+// opened for the run: the settle re-opener and the CPU monitor. Every Start*
+// entry point defers it right after this call, so it runs once Listen has
+// returned, and from then on the server never serves again (Start cannot be
+// retried). Shutdown releases the same two, but a Start that ends without a
+// Shutdown to come, because Listen failed or because Shutdown was called
+// before Start, left the re-opener running and the monitor's /proc/stat
+// descriptor open for the life of the process (celeris#737). Both releases
+// are idempotent, so a Shutdown before or after it is harmless.
 func (s *Server) listenContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	s.lifecycleMu.Lock()
@@ -393,7 +424,11 @@ func (s *Server) listenContext(parent context.Context) (context.Context, context
 	if alreadyShutdown {
 		cancel()
 	}
-	return ctx, cancel
+	return ctx, func() {
+		cancel()
+		s.router.stopSettleReopener()
+		s.closeCPUMonitor()
+	}
 }
 
 // cancelListen wakes a Listen parked on the context published by
@@ -424,7 +459,31 @@ func (s *Server) cancelListen() {
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a
 // context nothing will ever cancel (celeris#595).
+//
+// When cancelling the context of [Server.StartWithContext] or
+// [Server.StartWithListenerAndContext] has already started a shutdown,
+// Shutdown does not run a second one: it waits for that one, hooks included,
+// and returns its result, or ctx's error if ctx is done first.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	claimed := s.watcherShutdown
+	if claimed == nil {
+		s.directShutdown = true
+	}
+	s.lifecycleMu.Unlock()
+	if claimed != nil {
+		select {
+		case <-claimed:
+			return s.watcherErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.shutdown(ctx)
+}
+
+// shutdown is Shutdown's body: it runs every time it is called.
+func (s *Server) shutdown(ctx context.Context) error {
 	// celeris#592: stop the settled-route re-opener so a shut-down server
 	// leaves no goroutine behind. Idempotent, and a no-op if it never started.
 	s.router.stopSettleReopener()
@@ -639,9 +698,19 @@ func (s *Server) logger() *slog.Logger {
 }
 
 func (s *Server) prepareWithListener(ln net.Listener) (engine.Engine, error) {
-	return s.doPrepare(func(cfg *resource.Config) {
+	eng, err := s.doPrepare(func(cfg *resource.Config) {
 		cfg.Listener = ln
 	})
+	// celeris#737: the caller handed ln over and may not close it, so a start
+	// that fails before any engine runs closes it here. Otherwise it stays
+	// bound, and the kernel keeps completing handshakes into a backlog that
+	// nothing accepts. ErrAlreadyStarted is the exception: a server is
+	// already running, and ln may be the very listener it serves on, so it
+	// stays the caller's.
+	if err != nil && !errors.Is(err, ErrAlreadyStarted) && ln != nil {
+		_ = ln.Close()
+	}
+	return eng, err
 }
 
 // doPrepare is the shared implementation for prepare and prepareWithListener.
@@ -736,6 +805,10 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		eng, err = createEngine(cfg, handler, cpuMon)
 		if err != nil {
 			s.startErr = fmt.Errorf("create engine: %w", err)
+			// celeris#737: only Shutdown closes the monitor, and a caller
+			// whose Start failed has no reason to call it, so the
+			// /proc/stat descriptor opened above would stay open.
+			s.closeCPUMonitor()
 			return
 		}
 		s.engineRef.Store(&eng)
@@ -798,7 +871,11 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 // extracted from ln and the listener is closed so the engine workers can
 // rebind their own SO_REUSEPORT sockets bound to the same (host, port).
 // In both cases, the caller must not Accept on or close the supplied
-// listener after calling this function.
+// listener after calling this function. If the server fails to start before
+// its engine runs (a configuration error or an engine that cannot be
+// created), the listener is closed before the error is returned. The one
+// exception is [ErrAlreadyStarted]: the server is already running, perhaps on
+// that very listener, so this call leaves it to the caller.
 //
 // On the adaptive engine (the default on Linux) the listener goes to whichever
 // sub-engine starts, and a later switch binds the second sub-engine to that
@@ -819,37 +896,82 @@ func (s *Server) StartWithListener(ln net.Listener) error {
 
 // StartWithListenerAndContext combines [Server.StartWithListener] and
 // [Server.StartWithContext]. When the context is canceled, the server shuts
-// down gracefully using [Config.ShutdownTimeout].
+// down gracefully using [Config.ShutdownTimeout], and this call returns once
+// that shutdown, including the [Server.OnShutdown] hooks, has finished. A hook
+// must therefore not wait for this call to return; see [Server.OnShutdown].
 func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listener) error {
 	eng, err := s.prepareWithListener(ln)
 	if err != nil {
 		return err
 	}
+	return s.listenUntilCancelled(ctx, eng)
+}
 
+// listenUntilCancelled runs eng.Listen for StartWithContext and
+// StartWithListenerAndContext. When ctx is cancelled it shuts the server down
+// with Config.ShutdownTimeout, and it returns only after that Shutdown has
+// returned.
+//
+// The Shutdown runs on a watcher goroutine that starts before Listen, not
+// after Listen returns, because on std the drain's budget comes from
+// Server.Shutdown: Listen's own ctx.Done branch drains with no deadline, and
+// only the concurrent Server.Shutdown bounds it (see engine/std Shutdown).
+//
+// celeris#673: the watcher used to choose between ctx.Done() and listenDone
+// in a single select and to return without shutting down when it got
+// listenDone. The context handed to Listen is derived from ctx, so a cancel
+// also makes Listen return and close listenDone. When the watcher had not yet
+// reached its select by then, both cases were ready and select picked one at
+// random: half the time Shutdown never ran, so the OnShutdown hooks were
+// skipped, the CPU monitor's descriptor stayed open and the settle re-opener
+// ran for the life of the process. And when it did run, it ran after Start
+// had already returned, so a caller that exits when Start returns could lose
+// its hooks. The watcher now decides from state, not from which case select
+// happened to take, and the caller waits for it.
+func (s *Server) listenUntilCancelled(ctx context.Context, eng engine.Engine) error {
 	shutdownTimeout := s.config.ShutdownTimeout
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 30 * time.Second
 	}
 	listenDone := make(chan struct{})
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
-			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-			defer cancel()
-			_ = s.Shutdown(shutCtx)
 		case <-listenDone:
-			// Listen returned (likely an error — ctx not cancelled).
-			// Exit without calling Shutdown; nothing to shut down.
+		}
+		// Shut down if the caller cancelled, whichever case woke us, unless
+		// the caller has already called Server.Shutdown: running it a second
+		// time would run every OnShutdown hook twice. Listen returning with
+		// ctx still live means an error or a direct Shutdown, and either way
+		// there is nothing for the watcher to do. The check and the claim
+		// are one step under lifecycleMu, and a direct Shutdown that comes
+		// after the claim waits for this one instead of running its own.
+		if ctx.Err() == nil {
 			return
 		}
+		s.lifecycleMu.Lock()
+		if s.directShutdown || s.watcherShutdown != nil {
+			s.lifecycleMu.Unlock()
+			return
+		}
+		claimed := make(chan struct{})
+		s.watcherShutdown = claimed
+		s.lifecycleMu.Unlock()
+		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		s.watcherErr = s.shutdown(shutCtx)
+		close(claimed)
 	}()
 
 	// Derived from the caller's ctx: cancelling ctx still stops Listen, and
 	// a direct Server.Shutdown (without cancelling ctx) can stop it too.
 	listenCtx, cancelListen := s.listenContext(ctx)
 	defer cancelListen()
-	err = eng.Listen(listenCtx)
+	err := eng.Listen(listenCtx)
 	close(listenDone)
+	<-watcherDone
 	return err
 }
 
@@ -875,7 +997,9 @@ func InheritListener(envVar string) (net.Listener, error) {
 
 // StartWithContext starts the server with the given context for lifecycle management.
 // When the context is canceled, the server shuts down gracefully using
-// Config.ShutdownTimeout (default 30s).
+// Config.ShutdownTimeout (default 30s), and StartWithContext returns once that
+// shutdown, including the [Server.OnShutdown] hooks, has finished. A hook must
+// therefore not wait for StartWithContext to return; see [Server.OnShutdown].
 //
 // Returns ErrAlreadyStarted if called more than once. May also return
 // configuration validation errors or engine initialization errors.
@@ -884,27 +1008,5 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	shutdownTimeout := s.config.ShutdownTimeout
-	if shutdownTimeout <= 0 {
-		shutdownTimeout = 30 * time.Second
-	}
-	listenDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-			defer cancel()
-			_ = s.Shutdown(shutCtx)
-		case <-listenDone:
-			return
-		}
-	}()
-
-	// Derived from the caller's ctx — see StartWithListenerAndContext.
-	listenCtx, cancelListen := s.listenContext(ctx)
-	defer cancelListen()
-	err = eng.Listen(listenCtx)
-	close(listenDone)
-	return err
+	return s.listenUntilCancelled(ctx, eng)
 }

@@ -782,9 +782,24 @@ func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
 	// minMemlockPerWorker (12 MiB) and is advisory only — the GATE above is
 	// the exported pre-flight, so a change to that constant cannot make the
 	// rig skip or run wrongly, only make this hint generous or tight.
-	t.Skipf("io_uring: RLIMIT_MEMLOCK allows %d worker(s), this rig needs %d "+
+	skipOrFailIOUring592(t, "io_uring: RLIMIT_MEMLOCK allows %d worker(s), this rig needs %d "+
 		"(raise it: `ulimit -l unlimited`, docker --ulimit memlock=%d, or systemd LimitMEMLOCK=infinity)",
 		maxW, workers, workers*12*1024*1024)
+}
+
+// skipOrFailIOUring592 is the io_uring half's only way to skip. At a GitHub
+// runner's 8 MiB the three io_uring subtests skip in every CI step
+// (celeris#684). A step that raises memlock and sets
+// CELERIS_REQUIRE_IOURING_WORKERS=1, as the `iouring` job does for
+// engine/iouring's own worker tests, turns the skip into a failure, so that
+// step cannot go green without running them.
+func skipOrFailIOUring592(t *testing.T, format string, args ...any) {
+	t.Helper()
+	msg := fmt.Sprintf(format, args...)
+	if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
+		t.Fatal(msg + " -- CELERIS_REQUIRE_IOURING_WORKERS=1 forbids skipping")
+	}
+	t.Skip(msg)
 }
 
 // memlockCeiling589 renders the pre-flight ceiling for the workers-shortfall
@@ -912,7 +927,7 @@ func runStall589(t *testing.T, engName string, engType EngineType, mode stall589
 			// so stopEngine must not go on to wait 30 s for a second one.
 			engineStopped = true
 			if engType == IOUring {
-				t.Skipf("io_uring engine failed to start (run with --security-opt seccomp=unconfined): %v", err)
+				skipOrFailIOUring592(t, "io_uring engine failed to start (run with --security-opt seccomp=unconfined): %v", err)
 			}
 			t.Fatalf("engine failed to start: %v", err)
 		default:

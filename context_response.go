@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1402,6 +1403,19 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // failure to do so permanently leaks the Context from the pool.
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
+//
+// Detach copies the request values the Context holds, so they stay valid
+// after the handler returns: the headers, method, path and query, the route
+// params, the parsed query and cookies, the Host, the strings stored with
+// SetRequestID, SetClientIP, SetHost, SetScheme and SetString, the request
+// body (so Body, FormValue, Bind and BodyReader called after Detach read the
+// request), and the response headers set so far (middleware echo request
+// headers into them). It cannot copy what was read out of the Context before
+// the call (a string, a Body slice, a BodyReader), values stored with
+// [Context.Set], or values in the std context ([Context.Context],
+// [Context.SetContext]), which a detached WebSocket or SSE stream keeps as
+// its own context: on epoll and io_uring those may still refer to the
+// connection's receive buffer, so whoever stores them must clone them.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
@@ -1424,6 +1438,7 @@ func (c *Context) Detach() (done func()) {
 	c.method = strings.Clone(c.method)
 	c.path = strings.Clone(c.path)
 	c.rawQuery = strings.Clone(c.rawQuery)
+	c.materializeRequestViews()
 
 	c.extended = true
 	c.detached = true
@@ -1445,6 +1460,97 @@ func (c *Context) Detach() (done func()) {
 		}
 		close(ch)
 	}
+}
+
+// materializeRequestViews clones, for [Context.Detach], the request-derived
+// strings the Context keeps outside the header slice and the method, path and
+// raw query: the route params, the parsed query and cookie caches, the H1
+// Host, the strings middleware store on the Context from request headers
+// (request ID, client-IP/host/scheme overrides, SetString values), the
+// request body, and the response headers set so far.
+//
+// On epoll and io_uring each of these can be a view of the engine's receive
+// buffer, which is safe to compare while the request is handled and unsafe to
+// keep after it: a detached Context outlives the handler, and the engine keeps
+// receiving into that buffer (celeris#718; celeris#714 is the same defect in
+// the WebSocket middleware). The params are substrings of the path, the
+// caches are substrings of the raw query and the Cookie header, and Host
+// reads Stream.Authority, which the H1 parser sets to a view of the Host
+// header. Values stored with [Context.Set] are opaque and are not copied.
+func (c *Context) materializeRequestViews() {
+	for i := range c.params {
+		c.params[i].Value = strings.Clone(c.params[i].Value)
+	}
+	if c.queryCached && len(c.queryCache) > 0 {
+		qc := make(url.Values, len(c.queryCache))
+		for k, vs := range c.queryCache {
+			cp := make([]string, len(vs))
+			for i, v := range vs {
+				cp[i] = strings.Clone(v)
+			}
+			qc[strings.Clone(k)] = cp
+		}
+		c.queryCache = qc
+	}
+	for i, kv := range c.cookieCache {
+		c.cookieCache[i] = [2]string{strings.Clone(kv[0]), strings.Clone(kv[1])}
+	}
+	c.stream.Authority = strings.Clone(c.stream.Authority)
+	c.requestID = strings.Clone(c.requestID)
+	c.clientIPOverride = strings.Clone(c.clientIPOverride)
+	c.hostOverride = strings.Clone(c.hostOverride)
+	c.schemeOverride = strings.Clone(c.schemeOverride)
+	for k, v := range c.stringKeys {
+		c.stringKeys[k] = strings.Clone(v)
+	}
+	// The body. The native H1 engines install it as a slice of the receive
+	// buffer (internal/conn/h1.go, SetRawBody), and Body, FormValue, Bind and
+	// BodyReader read it lazily. Copied only when there is one, and only
+	// where the handler can return before the stream ends (OnDetach is set):
+	// elsewhere the handler outlives the stream, and std's body is a heap
+	// copy already. A GET upgrade or stream pays nothing.
+	if c.stream.OnDetach != nil {
+		if b := c.stream.GetData(); len(b) > 0 {
+			c.stream.SetRawBody(bytes.Clone(b))
+		}
+	}
+	// The response headers set so far: middleware echo request headers into
+	// them (requestid's x-request-id, cors's access-control-allow-origin),
+	// and a detached goroutine serializes them when it writes the response
+	// head (Blob, NoContent, StreamWriter.WriteHeader(code,
+	// c.ResponseHeaders())).
+	cloneHeaderPairs(c.respHeaders)
+}
+
+// cloneHeaderPairs replaces every key and value of hs, in place, with a copy.
+// The copies share one buffer, so this is one allocation however many headers
+// there are. The buffer is never written after it is filled, so the strings
+// cut from it stay immutable.
+func cloneHeaderPairs(hs [][2]string) {
+	n := 0
+	for _, h := range hs {
+		n += len(h[0]) + len(h[1])
+	}
+	if n == 0 {
+		return
+	}
+	buf := make([]byte, 0, n)
+	for i := range hs {
+		hs[i][0] = appendClone(&buf, hs[i][0])
+		hs[i][1] = appendClone(&buf, hs[i][1])
+	}
+}
+
+// appendClone appends s to *buf and returns the appended bytes as a string.
+// *buf must have room for s: the append must not move the buffer, or strings
+// returned earlier would keep the old one.
+func appendClone(buf *[]byte, s string) string {
+	if s == "" {
+		return ""
+	}
+	off := len(*buf)
+	*buf = append(*buf, s...)
+	return unsafe.String(&(*buf)[off], len(s))
 }
 
 // StreamWriter provides incremental response writing. Obtained via [Context.StreamWriter].
