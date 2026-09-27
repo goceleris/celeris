@@ -22,6 +22,8 @@ package iouring
 
 import (
 	"bufio"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"testing"
@@ -30,8 +32,46 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
+
+// startParkEngine713 is startFDLEngine with its ring ENOMEM retried
+// (startRingRetried662): at CI's 8 MiB memlock the kernel gives a closed
+// ring's pages back 12-23 ms after the close, so an engine started right
+// after another ring closed can fail on memory nothing holds any more. No
+// probe dial: the engine is idle when it returns.
+func startParkEngine713(t *testing.T, h stream.Handler, mut func(*resource.Config)) (*Engine, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		cfg := resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		if mut != nil {
+			mut(&cfg)
+		}
+		return New(cfg, h)
+	})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("engine did not stop within 5s")
+		}
+	})
+	t.Logf("celeris657 engine workers=%d", e.NumWorkers())
+	return e, addr
+}
 
 const (
 	staleClockReadTimeout = 2 * time.Second
@@ -44,10 +84,10 @@ const (
 // ResumeAccept and a dial), and serves staleClockRequests requests on it,
 // staleClockGap apart: two seconds of traffic that no timeout may interrupt.
 func staleClockAfterPark(t *testing.T, park time.Duration, adopt bool) {
-	e, addr := startFDLEngine(t, fdlHandler{}, func(c *resource.Config) {
+	e, addr := startParkEngine713(t, fdlHandler{}, func(c *resource.Config) {
 		// No TCP_DEFER_ACCEPT: no pause linger (celeris#662), so the
 		// listeners close as PauseAccept is called and the workers park at
-		// once, and startFDLEngine's silent probe dial is accepted at once.
+		// once.
 		c.DisableDeferAccept = true
 		c.ReadTimeout = staleClockReadTimeout
 		c.IdleTimeout = 10 * time.Minute
@@ -76,9 +116,9 @@ func staleClockAfterPark(t *testing.T, park time.Duration, adopt bool) {
 	}
 	if !waitFor(3*time.Second, func() bool {
 		m := e.Metrics()
-		return m.ActiveConnections == 0 && m.AcceptCount >= 1 && m.AcceptCount == m.CloseCount
+		return m.ActiveConnections == 0 && m.AcceptCount == m.CloseCount
 	}) {
-		t.Fatalf("celeris713 PREMISE: startFDLEngine's probe connection is still live")
+		t.Fatalf("celeris713 PREMISE: the engine is not idle")
 	}
 	if err := e.PauseAccept(); err != nil {
 		t.Fatalf("pause: %v", err)
