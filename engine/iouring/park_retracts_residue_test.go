@@ -13,14 +13,54 @@ package iouring
 // slowloris defence retracted; that close is the control.
 
 import (
+	"io"
+	"log/slog"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
+
+// startParkEngine711 is startFDLEngine with its ring ENOMEM retried
+// (startRingRetried662): at CI's 8 MiB memlock the kernel gives a closed
+// ring's pages back 12-23 ms after the close, so an engine started right
+// after another ring closed can fail on memory nothing holds any more. No
+// probe dial: the engine is idle when it returns.
+func startParkEngine711(t *testing.T, h stream.Handler, mut func(*resource.Config)) (*Engine, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		cfg := resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		if mut != nil {
+			mut(&cfg)
+		}
+		return New(cfg, h)
+	})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("engine did not stop within 5s")
+		}
+	})
+	t.Logf("celeris657 engine workers=%d", e.NumWorkers())
+	return e, addr
+}
 
 // residueSum adds the five residual gauges: without IORING_ASYNC_CANCEL flags
 // a mid-request connection with its recv armed is counted Pinned, not Busy,
@@ -48,13 +88,12 @@ func parkWaitIou(d time.Duration, f func() bool) bool {
 // asserts that a worker that has parked holding nothing publishes nothing.
 func parkResidueIou(t *testing.T, postSweep bool) {
 	var disc atomic.Int64
-	e, addr := startFDLEngine(t, fdlHandler{}, func(c *resource.Config) {
+	e, addr := startParkEngine711(t, fdlHandler{}, func(c *resource.Config) {
 		c.OnDisconnect = func(string) { disc.Add(1) }
-		// No TCP_DEFER_ACCEPT: the probe dial in startFDLEngine, which
-		// sends nothing, is accepted at once, and there is no pause linger
-		// (celeris#662), so the listeners close as PauseAccept is called,
-		// well inside the connection's deadline, and the close lands on a
-		// worker with no listener, the only kind that parks.
+		// No TCP_DEFER_ACCEPT, so no pause linger (celeris#662): the
+		// listeners close as PauseAccept is called, well inside the
+		// connection's deadline, and the close lands on a worker with no
+		// listener, the only kind that parks.
 		c.DisableDeferAccept = true
 		if postSweep {
 			c.ReadHeaderTimeout = 60 * time.Second // the header timer stays far away
@@ -77,9 +116,9 @@ func parkResidueIou(t *testing.T, postSweep bool) {
 	}
 	if !parkWaitIou(3*time.Second, func() bool {
 		m := e.Metrics()
-		return m.ActiveConnections == 0 && m.AcceptCount >= 1 && m.AcceptCount == m.CloseCount
+		return m.ActiveConnections == 0 && m.AcceptCount == m.CloseCount
 	}) {
-		t.Fatalf("celeris711 PREMISE: startFDLEngine's probe connection is still live")
+		t.Fatalf("celeris711 PREMISE: the engine is not idle")
 	}
 	d0 := disc.Load()
 	m0 := e.Metrics()
