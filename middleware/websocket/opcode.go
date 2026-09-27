@@ -1,4 +1,5 @@
-package websocket
+//line middleware/websocket/opcode.go:1:1
+package websocket; import _cover_atomic_ "sync/atomic"
 
 // Opcode represents a WebSocket frame opcode (RFC 6455 Section 5.2).
 type Opcode byte
@@ -20,10 +21,10 @@ const (
 )
 
 // IsControl returns true for close, ping, and pong frames.
-func (o Opcode) IsControl() bool { return o >= 0x8 }
+func (o Opcode) IsControl() bool {_cover_atomic_.AddUint32(&GoCover_c633_opcode.Count[0], 1); return o >= 0x8 }
 
 // IsData returns true for text, binary, and continuation frames.
-func (o Opcode) IsData() bool { return o < 0x8 }
+func (o Opcode) IsData() bool {_cover_atomic_.AddUint32(&GoCover_c633_opcode.Count[1], 1); return o < 0x8 }
 
 // Close status codes (RFC 6455 Section 7.4.1).
 const (
@@ -41,3 +42,20 @@ const (
 	CloseServiceRestart   = 1012
 	CloseTryAgainLater    = 1013
 )
+
+var GoCover_c633_opcode = struct {
+	Count     [2]uint32
+	Pos       [3 * 2]uint32
+	NumStmt   [2]uint16
+} {
+	Pos: [3 * 2]uint32{
+		23, 23, 0x350024, // [0]
+		26, 26, 0x310021, // [1]
+	},
+	NumStmt: [2]uint16{
+		1, // 0
+		1, // 1
+	},
+}
+
+var _ = _cover_atomic_.LoadUint32
