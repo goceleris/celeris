@@ -301,3 +301,104 @@ func TestChanReaderSpillPublishedAfterDrain(t *testing.T) {
 		}
 	})
 }
+
+// TestChanReaderPauseRecheckHoldsWhileSpilled pins the spill guard of
+// requestPause's celeris#672 re-check (the `!r.hasSpill()` term): a pause
+// decided while chunks are spilled behind the channel is kept, even when the
+// channel alone is at lowWater. Without the guard (the #671 review's mutant
+// M5, celeris#716 item 1) the re-check resumes the engine there.
+//
+// The spilled chunks are buffered as surely as the ones in the channel, so the
+// true depth is len(r.ch) plus the spill, and a resume then re-opens the
+// engine above lowWater, with the spill already holding part of the headroom
+// that absorbs the engine's post-pause burst (celeris#484). Read lifts the
+// pause instead, once it has promoted the spill and drained to lowWater.
+//
+// The state is reached with public configuration and an ordering the upgrade
+// allows, using only gaps between statements:
+//
+//   - MaxBackpressureBuffer 2, BackpressureHighPct 100, BackpressureLowPct 50:
+//     highWater 2, lowWater 1, spillMax 2;
+//   - the engine delivers before the upgrade installs the callbacks
+//     (SetPauser's comment: from the 101 on, the worker may be appending), so
+//     the channel fills and a chunk spills with no pause possible;
+//   - SetPauser runs;
+//   - the next Append queues behind the spill (spillChunk), and the handler's
+//     Read takes a chunk off the channel before that Append's requestPause.
+//
+// At the re-check the channel holds 1 chunk (lowWater) and the spill 2.
+// Everything after it is the production code: the handler's Reads promote the
+// spill and lift the pause at depth 1, and the stream arrives whole, in order.
+func TestChanReaderPauseRecheckHoldsWhileSpilled(t *testing.T) {
+	r := newChanReader(2, 100, 50)
+	if r.highWater != 2 || r.lowWater != 1 || r.spillMax != 2 {
+		t.Fatalf("harness: want highWater 2, lowWater 1, spillMax 2; got %d, %d, %d",
+			r.highWater, r.lowWater, r.spillMax)
+	}
+
+	// Before SetPauser: the channel fills and one chunk spills.
+	for _, c := range []byte("abc") {
+		if !r.Append([]byte{c}) {
+			t.Fatalf("harness: Append(%q) rejected", c)
+		}
+	}
+	if len(r.ch) != 2 || r.spillLen.Load() != 1 {
+		t.Fatalf("harness: want depth 2 and 1 spilled, got %d and %d", len(r.ch), r.spillLen.Load())
+	}
+
+	var desired atomic.Bool
+	var pauses, resumes atomic.Uint32
+	r.SetPauser(
+		func() { pauses.Add(1); desired.Swap(true) },
+		func() { resumes.Add(1); desired.Swap(false) },
+	)
+
+	// The next Append, up to its requestPause: spillLen is non-zero, so the
+	// chunk queues behind the spill.
+	if r.closed.Load() || r.spillLen.Load() == 0 {
+		t.Fatal("harness: Append would not take its spill path")
+	}
+	if !r.spillChunk([]byte{'d'}) {
+		t.Fatal("harness: spillChunk rejected 'd' below spillMax")
+	}
+	// The handler's Read takes its chunk off the channel (the statement Read
+	// runs first; the handler's next Read does the promotion this one would
+	// have done next).
+	first := <-r.ch
+	// The rest of the Append.
+	r.requestPause()
+
+	if len(r.ch) != r.lowWater || r.spillLen.Load() != 2 {
+		t.Fatalf("harness: want depth %d (lowWater) and 2 spilled at the re-check, got %d and %d",
+			r.lowWater, len(r.ch), r.spillLen.Load())
+	}
+	if pauses.Load() != 1 {
+		t.Fatalf("harness: want the pause applied once, got %d", pauses.Load())
+	}
+	if !desired.Load() || !readerPaused(r) {
+		t.Fatalf("the stale-pause re-check lifted the pause (engine=%v reader=%v, resumes=%d) with %d "+
+			"chunk(s) buffered, %d of them spilled, against lowWater %d: it must keep a pause while "+
+			"anything is spilled behind the channel",
+			desired.Load(), readerPaused(r), resumes.Load(), len(r.ch)+int(r.spillLen.Load()),
+			r.spillLen.Load(), r.lowWater)
+	}
+
+	// The handler goes on reading: the stream arrives whole and in order, and
+	// the pause is lifted once the buffered depth is down to lowWater.
+	got := append([]byte(nil), first...)
+	buf := make([]byte, 1)
+	for len(got) < 4 {
+		n, err := r.Read(buf)
+		if err != nil || n != 1 {
+			t.Fatalf("read after the re-check: n=%d err=%v (got %q so far)", n, err, got)
+		}
+		got = append(got, buf[0])
+	}
+	if string(got) != "abcd" {
+		t.Fatalf("stream = %q, want %q", got, "abcd")
+	}
+	if desired.Load() || readerPaused(r) || pauses.Load() != 1 || resumes.Load() != 1 {
+		t.Fatalf("want the one pause lifted once, and nothing paused, after the drain: engine=%v "+
+			"reader=%v pauses=%d resumes=%d", desired.Load(), readerPaused(r), pauses.Load(), resumes.Load())
+	}
+}
