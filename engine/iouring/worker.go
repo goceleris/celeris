@@ -27,6 +27,7 @@ import (
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/internal/wakefd"
+	"github.com/goceleris/celeris/internal/zcwindow"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -1242,14 +1243,14 @@ func (w *Worker) run(ctx context.Context) {
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleSend(entry, fd, now)
-						// celeris#587, validation builds only (validation.Enabled
+						// celeris#587, validation builds only (zcwindow.Enabled
 						// is a false constant otherwise, so this compiles away):
 						// hold the SEND_ZC first-CQE -> NOTIF window open right
 						// after handleSend has recorded the first completion and
 						// released cs.detachMu, before anything else is released
-						// (validation.SetZCWindowHold).
-						if validation.Enabled && cqeHasMore(entry.Flags) {
-							validation.ZCWindowHold()
+						// (internal/zcwindow.SetHold).
+						if zcwindow.Enabled && cqeHasMore(entry.Flags) {
+							zcwindow.Hold()
 						}
 						// #383 reverse: io_uring flushes the response
 						// asynchronously, so the clean, fully-flushed boundary
@@ -1670,8 +1671,8 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 		w.handleSend(c, fd, now)
 		// celeris#587: the same validation-only window hold as the inlined
 		// dispatch; compiles away in production.
-		if validation.Enabled && cqeHasMore(c.Flags) {
-			validation.ZCWindowHold()
+		if zcwindow.Enabled && cqeHasMore(c.Flags) {
+			zcwindow.Hold()
 		}
 		if w.transplant.Load() != nil {
 			w.tryTransplant(fd)

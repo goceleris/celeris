@@ -1,26 +1,24 @@
 //go:build validation
 
-package validation
+package zcwindow
 
 import (
 	"sync/atomic"
 	"time"
 )
 
-// zcWindowHoldNanos is the celeris#587 window hold. See [ZCWindowHold].
-var zcWindowHoldNanos atomic.Int64
+// holdNanos is the window hold. See [Hold].
+var holdNanos atomic.Int64
 
 // Enabled is true in a -tags=validation build and false (a constant, so
-// guarded code compiles away) in production (disabled.go).
+// guarded code compiles away) in production (zcwindow_off.go).
 const Enabled = true
 
-// SetZCWindowHold makes every io_uring worker pause for d right after its
+// SetHold makes every io_uring worker pause for d right after its
 // handleSend has recorded a SEND_ZC first completion (CQE_F_MORE:
 // cs.zcNotifPending set, cs.detachMu released on return) and before it
 // does anything else; d <= 0 turns the pause off. It exists for one
-// measurement only (celeris#587) and is compiled in only under
-// -tags=validation: in production the call sites are guarded by the false
-// Enabled constant and compile away.
+// measurement only (celeris#587).
 //
 // Why it is needed. Between the first completion of a SEND_ZC (the kernel
 // has queued the bytes) and its notification (the kernel has released the
@@ -38,16 +36,16 @@ const Enabled = true
 // concurrent with those writes unless the lock is present, so the detector
 // control does not depend on the host's timing. The window's state machine
 // is unchanged; only its duration is.
-func SetZCWindowHold(d time.Duration) {
+func SetHold(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
-	zcWindowHoldNanos.Store(int64(d))
+	holdNanos.Store(int64(d))
 }
 
-// ZCWindowHold sleeps for the duration set by [SetZCWindowHold], if any.
-func ZCWindowHold() {
-	if d := zcWindowHoldNanos.Load(); d > 0 {
+// Hold sleeps for the duration set by [SetHold], if any.
+func Hold() {
+	if d := holdNanos.Load(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
 }

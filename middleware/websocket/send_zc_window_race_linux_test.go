@@ -23,7 +23,7 @@ package websocket
 //     that reports nothing is only evidence if the same run reports a race
 //     when the synchronisation is removed.
 //
-// This test fixes (1) with validation.SetZCWindowHold, which holds the
+// This test fixes (1) with zcwindow.SetHold (internal/zcwindow), which holds the
 // worker right after it has recorded a first completion and released
 // cs.detachMu, before it releases anything else, for zcWinDelay (the NIC
 // DMA latency loopback lacks), while the handler streams 64 KiB frames at a
@@ -65,6 +65,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/zcwindow"
 	"github.com/goceleris/celeris/validation"
 )
 
@@ -90,6 +91,9 @@ const (
 	// magnitude above the natural (copy-fallback) window and small enough
 	// that a few hundred notifications cost well under a second.
 	zcWinDefaultDelay = 2 * time.Millisecond
+	// zcWinSettle bounds the wait for the worker to publish a finished
+	// stream's counters (ring bytes, notifications).
+	zcWinSettle = 10 * time.Second
 )
 
 func zcWinDelay(t *testing.T) time.Duration {
@@ -191,10 +195,28 @@ func zcWinStream(t *testing.T, addr string, metrics func() celeris.EngineMetrics
 		time.Sleep(zcWinReadPace)
 	}
 	// Ring bytes and notifications are published on the worker's
-	// per-iteration cadence; give it a pass (plus the hold) to settle.
-	time.Sleep(300*time.Millisecond + 4*hold)
-	m := metrics()
-	v := validation.Snapshot()
+	// per-iteration cadence: wait, with a bound, until every streamed byte
+	// is accounted to the inline or the ring counter and every SEND_ZC
+	// submitted has had its notification -- the state the caller's
+	// assertions read -- instead of sleeping a fixed interval. On timeout
+	// the unsettled counts are returned and the assertions name them.
+	var m celeris.EngineMetrics
+	var v validation.Counters
+	settle := time.Now().Add(zcWinSettle)
+	for {
+		m, v = metrics(), validation.Snapshot()
+		streamed := (m.InlineBytes - base.InlineBytes) + (m.RingBytes - base.RingBytes)
+		zcSettled := v.IouringSendZCNotifs-vBase.IouringSendZCNotifs == v.IouringSendZCSubmits-vBase.IouringSendZCSubmits
+		if (readErr != nil || streamed >= uint64(got)*zcBigFrame) && zcSettled {
+			break
+		}
+		if time.Now().After(settle) {
+			t.Logf("ZCWIN settle: not settled after %s (streamed=%d of >= %d, zc notifs=%d submits=%d)", zcWinSettle,
+				streamed, uint64(got)*zcBigFrame, v.IouringSendZCNotifs-vBase.IouringSendZCNotifs, v.IouringSendZCSubmits-vBase.IouringSendZCSubmits)
+			break
+		}
+		time.Sleep(10*time.Millisecond + hold)
+	}
 	return zcWinAttempt{
 		submits:   v.IouringSendZCSubmits - vBase.IouringSendZCSubmits,
 		detached:  v.IouringSendZCSubmitsDetached - vBase.IouringSendZCSubmitsDetached,
@@ -217,8 +239,8 @@ func TestSendZCWindowGuardUnderRace(t *testing.T) {
 	}
 	policyOff := zcPolicyOff()
 	hold := zcWinDelay(t)
-	validation.SetZCWindowHold(hold)
-	defer validation.SetZCWindowHold(0)
+	zcwindow.SetHold(hold)
+	defer zcwindow.SetHold(0)
 
 	cfg := Config{Handler: func(c *Conn) {
 		if _, _, err := c.ReadMessage(); err != nil { // the client's "go"
