@@ -162,7 +162,7 @@ func TestAcceptAllDrainsBacklogNoStrand(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unix.Close(epfd) })
 
-	lfd, err := createListenSocket("127.0.0.1:0")
+	lfd, err := createListenSocket("127.0.0.1:0", true)
 	if err != nil {
 		t.Skipf("listen socket unavailable: %v", err)
 	}

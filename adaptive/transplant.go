@@ -39,7 +39,8 @@ func (e *Engine) applyTransplant(newActive, newStandby engine.Engine) {
 
 // switchWindowHook is a test seam, nil in production. performSwitch calls it
 // on the switching goroutine inside the window the celeris#657 P11 ordering
-// closes: the new active is listening and the old one is paused, but the
+// closes: the new active is listening and the old one's pause has begun --
+// it lingers, still accepting, for about 1.5 s (celeris#662) -- but the
 // cross-engine drains have not been rewired yet. A test blocks here to make
 // that window as long as it needs, which is the only way to observe
 // deterministically whether a connection accepted in it is handed BACK to the

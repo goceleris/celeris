@@ -67,6 +67,38 @@ type Config struct {
 	IdleTimeout time.Duration
 	// DisableKeepAlive disables HTTP keep-alive.
 	DisableKeepAlive bool
+	// DisableDeferAccept turns TCP_DEFER_ACCEPT off on the listen sockets the
+	// epoll and io_uring engines create. Default false: the option stays on.
+	//
+	// While the option is on, the kernel holds a connection whose handshake
+	// has completed but which has sent no data outside the accept queue: it
+	// stays a request socket and accept4 answers EAGAIN for it. A client that
+	// sends its request at once is then accepted with the request already
+	// queued, which saves the engine a wakeup per connection. A client that
+	// stays silent is promoted into the accept queue with no data about one
+	// second after its SYN, when the listener retransmits its SYN-ACK and
+	// the client's reply creates the connection; the engine accepts it then,
+	// and it is subject to ReadHeaderTimeout and the connection limits like
+	// any other.
+	//
+	// That hold is why a pause cannot simply close a listener that has the
+	// option: the close would reset every connection the kernel is still
+	// holding (celeris#662, celeris#675). PauseAccept therefore lingers. It
+	// clears the option on each pausing listener, so nothing that arrives
+	// afterwards is held, keeps the listener open and accepting for about
+	// 1.5 s after that clear, long enough for the kernel to promote what it
+	// held, and only then drains and closes it. A resume during that time
+	// puts the option back on the same listener. The adaptive engine pauses
+	// the sub-engine a switch leaves in the same way, without waiting for
+	// it.
+	//
+	// Set this field when a pause must be instant: with the option off a
+	// handshake-complete connection is always in the accept queue, and
+	// PauseAccept drains it and closes the listeners at once. What it gives
+	// up is the wakeup the option saves on each new connection, which is a
+	// cost on connection churn only; keep-alive traffic, where one accept is
+	// amortised over many requests, does not see it.
+	DisableDeferAccept bool
 	// Listener is an optional pre-existing listener for socket inheritance.
 	Listener net.Listener
 	// MaxRequestBodySize is the maximum allowed request body size in bytes.
