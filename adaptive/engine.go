@@ -46,11 +46,12 @@ var (
 // most complex path in this package and has historically been the source of
 // rare, hard-to-reproduce issues; the SwitchRejectedCount /
 // EngineMetrics.AdaptiveSwitches counters exist so a throughput anomaly can be
-// correlated with switching activity. Operators who need fully deterministic
-// behaviour can pin the start engine via CELERIS_ADAPTIVE_START=epoll|iouring
-// (see chooseStartEngine), which disables the runtime switch. For benchmarking,
-// run the adaptive columns multiple times: a rare switch transient can skew a
-// single pass.
+// correlated with switching activity. CELERIS_ADAPTIVE_START=epoll|iouring
+// chooses only the engine it STARTS on (see chooseStartEngine, the variable's
+// only reader); the controller still switches afterwards. Operators who need
+// fully deterministic behaviour should pin a single engine with Config.Engine
+// (Epoll or IOUring) instead. For benchmarking, run the adaptive columns
+// multiple times: a rare switch transient can skew a single pass.
 type Engine struct {
 	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
 	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
@@ -121,9 +122,21 @@ type Engine struct {
 }
 
 // ioUringViable reports whether io_uring is worth running at all on this host:
-// the kernel must expose the fast tier AND RLIMIT_MEMLOCK must be able to fund
-// the requested worker count. These are the two t0-knowable disqualifiers from
-// the epoll-vs-io_uring sweep:
+// the probed tier must be available at all, the kernel must expose the fast
+// tier AND RLIMIT_MEMLOCK must be able to fund the requested worker count.
+//
+//   - Availability: iouring.New refuses to build an engine when the probed
+//     IOUringTier is None ("io_uring not available on this system"), and the
+//     probe reports None when CELERIS_MAX_IOURING_TIER caps it there (or when
+//     io_uring is missing or blocked). The kernel-version test below cannot see
+//     that: the cap clears the feature flags but not KernelMajor/KernelMinor, so
+//     on a 6.10+ kernel the "bundles era" branch alone used to call io_uring
+//     viable, and every promotion then failed to build it and backed off with
+//     a WARN (celeris#679). Checked first, with iouring.New's own predicate, so
+//     the two cannot disagree.
+//
+// The other two are the t0-knowable disqualifiers from the epoll-vs-io_uring
+// sweep:
 //
 //   - Kernel/feature: io_uring loses to epoll on old kernels (missing the
 //     fast-path setup flags); require the "bundles" era (>6.10) OR the 6.1+
@@ -134,6 +147,9 @@ type Engine struct {
 //     does not memlock buffer rings, so it keeps all workers. In that case
 //     io_uring is never the right engine.
 func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
+	if !p.IOUringTier.Available() {
+		return false
+	}
 	bundlesEra := p.KernelMajor > 6 || (p.KernelMajor == 6 && p.KernelMinor >= 10)
 	fastTier := p.DeferTaskrun && p.SingleIssuer && p.MultishotRecv && p.ProvidedBuffers
 	if !bundlesEra && !fastTier {
