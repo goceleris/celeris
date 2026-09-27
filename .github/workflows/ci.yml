@@ -466,6 +466,47 @@ jobs:
             echo "-- was one renamed or removed, did a sweep lose a case, or did one skip or fail?"
             exit 1
           fi
+      # celeris#714, #717, #718: the request values a detached stream keeps
+      # (WebSocket Conn.Query, SSE Last-Event-ID, a detached Context, and
+      # what requestid and the OTel propagators store in the context the
+      # stream keeps) must survive the engine receiving more bytes into the
+      # buffer they came from. The root race step above excludes
+      # ./middleware/websocket, the middleware/otel step above runs without
+      # -v, and every one of these tests would drop its io_uring arms
+      # without a word if the probe found no ring, which happens while
+      # another test binary's rings are still being freed. So all four run
+      # here by name, one package at a time, with
+      # CELERIS_REQUIRE_IOURING_WORKERS=1 turning a missing io_uring arm into
+      # a failure, and an exact tally: the four top-level tests and all 20
+      # arms (8 of them io_uring) must PASS, with no SKIP line, and every go
+      # test must exit 0. A failing test does not stop the step early: all
+      # four run, so a red step shows every test's arms and the tally. It
+      # runs even when a step above failed, so a red root step cannot hide
+      # these.
+      - name: celeris#714 captured request values (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c714.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^TestConnCapturedRequestValuesSurviveFrames$' ./middleware/websocket/ 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestClientLastEventIDSurvivesPeerBytes$' ./middleware/sse/ 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestDetachedContextKeepsRequestValues$' . 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
+          (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^TestExtractedContextSurvivesPeerBytes$' .) 2>&1 | tee -a /tmp/c714.log || failed=$((failed + 1))
+          tests='TestConnCapturedRequestValuesSurviveFrames|TestClientLastEventIDSurvivesPeerBytes|TestDetachedContextKeepsRequestValues|TestExtractedContextSurvivesPeerBytes'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c714.log || true)
+          arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c714.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/io_uring" /tmp/c714.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c714.log || true)
+          echo "celeris#714 tests: top-level PASS $top (want 4), arm PASS $arms (want 20), io_uring arm PASS $uring (want 8), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 4 ] || [ "$arms" -ne 20 ] || [ "$uring" -ne 8 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all four tests and all 20 arms (8 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
