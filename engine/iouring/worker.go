@@ -28,6 +28,7 @@ import (
 	"github.com/goceleris/celeris/internal/platform"
 	"github.com/goceleris/celeris/internal/sockopts"
 	"github.com/goceleris/celeris/internal/wakefd"
+	"github.com/goceleris/celeris/internal/zcwindow"
 	"github.com/goceleris/celeris/protocol/detect"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
@@ -504,6 +505,11 @@ type Worker struct {
 	// adoptClosed is set under driverActionMu by closeAdoptQueue when the
 	// worker shuts down; AdoptConn refuses from then on (celeris#658).
 	adoptClosed bool
+	// driversClosed is set under driverMu by shutdownDrivers; RegisterConn
+	// refuses from then on (celeris#691). shutdownDrivers runs once, so a
+	// conn registered after it would never be retired, and the duplicate
+	// descriptor RegisterConn takes for it would never be closed.
+	driversClosed bool
 
 	// shutdownDriverHold keeps every driverConn handed to shutdownDrivers
 	// reachable until the Worker itself is collected, which is after the ring
@@ -1221,6 +1227,15 @@ func (w *Worker) run(ctx context.Context) {
 				case udSend:
 					if !w.staleConnCQE(entry, fd, ud) {
 						w.handleSend(entry, fd, now)
+						// celeris#587, validation builds only (zcwindow.Enabled
+						// is a false constant otherwise, so this compiles away):
+						// hold the SEND_ZC first-CQE -> NOTIF window open right
+						// after handleSend has recorded the first completion and
+						// released cs.detachMu, before anything else is released
+						// (internal/zcwindow.SetHold).
+						if zcwindow.Enabled && cqeHasMore(entry.Flags) {
+							zcwindow.Hold()
+						}
 						// #383 reverse: io_uring flushes the response
 						// asynchronously, so the clean, fully-flushed boundary
 						// is reached HERE (send completed) — not at udRecv where
@@ -1638,6 +1653,11 @@ func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) 
 			return
 		}
 		w.handleSend(c, fd, now)
+		// celeris#587: the same validation-only window hold as the inlined
+		// dispatch; compiles away in production.
+		if zcwindow.Enabled && cqeHasMore(c.Flags) {
+			zcwindow.Hold()
+		}
 		if w.transplant.Load() != nil {
 			w.tryTransplant(fd)
 		}

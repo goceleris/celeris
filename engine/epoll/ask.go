@@ -42,9 +42,9 @@ package epoll
 //
 // It reads only what THIS goroutine owns: cs.h1State and cs.h2State are
 // written by switchToH2Local on this goroutine, and Detached and
-// asyncH2Promoted are atomics. cs.protocol, cs.detected and cs.hijacked are
-// the loop thread's and are deliberately NOT read here — the sweep, which
-// runs there, screens those.
+// asyncH2Promoted are atomics. cs.protocol and cs.detected are the loop
+// thread's, and cs.hijacked is set by a hijack on this very goroutine; none
+// is read here — the sweep, which runs on the loop thread, screens them.
 func (l *Loop) askAtPark(cs *connState) {
 	if l.transplant.Load() == nil {
 		return

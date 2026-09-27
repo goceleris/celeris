@@ -94,11 +94,13 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		var id string
+		fromHeader := false
 		if trustProxy {
 			id = c.Header(header)
 			if !validID(id) {
 				id = ""
 			}
+			fromHeader = id != ""
 		}
 		if id == "" {
 			if isCustomGen {
@@ -135,7 +137,20 @@ func New(config ...Config) celeris.HandlerFunc {
 		// for backward compatibility (re-boxes per call).
 		c.SetRequestID(id)
 		if enableStdCtx {
-			c.SetContext(context.WithValue(c.Context(), stdContextKey{}, id))
+			// The std context outlives the request whenever something keeps
+			// it: a detached stream (the WebSocket and SSE middleware derive
+			// Conn.Context() and Client.Context() from it) or a goroutine
+			// handed c.Context(). On epoll and io_uring an id taken from the
+			// header is a view of the engine's receive buffer, safe to compare
+			// while the request is handled and unsafe to keep after it, and
+			// Context.Detach cannot copy a value inside a context. So it is
+			// cloned here, where WithValue allocates anyway (celeris#714). A
+			// generated id is already a copy.
+			ctxID := id
+			if fromHeader {
+				ctxID = strings.Clone(id)
+			}
+			c.SetContext(context.WithValue(c.Context(), stdContextKey{}, ctxID))
 		}
 
 		return c.Next()
