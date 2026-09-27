@@ -2680,7 +2680,18 @@ func (l *Loop) drainDetachQueue() {
 func (l *Loop) relink(cs *connState) {
 	l.removeDirty(cs)
 	if cs.epollOut {
-		l.disarmEpollOut(cs)
+		// The goroutine holding detachMu may be a handler that hijacks the
+		// conn (celeris#668). Its hijack stores hijacked, clears the slot
+		// under driverMu, and only then closes the descriptor, whose number
+		// another file, one a driver goroutine adds to this epoll set, can
+		// take at once. Read under driverMu, hijacked false means the
+		// descriptor is not closed yet, so the MOD cannot reach that file.
+		// A hijacked conn is out of the epoll set already.
+		l.driverMu.Lock()
+		if !cs.hijacked.Load() {
+			l.disarmEpollOut(cs)
+		}
+		l.driverMu.Unlock()
 	}
 	cs.relinkPending = true
 }
@@ -2828,7 +2839,8 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 // read-only interest. A still-partial flush leaves EPOLLOUT armed so the
 // next writable edge resumes. Returns false if the conn was closed.
 func (l *Loop) handleWritable(cs *connState) {
-	if mu := cs.detachMu; mu != nil && !mu.TryLock() {
+	mu := cs.detachMu
+	if mu != nil && !mu.TryLock() {
 		if dispatchBusy(cs, &cs.relinkOwed) {
 			// A pipelined request started a handler before the socket
 			// drained (celeris#669). Do not wait for it, and do not leave
@@ -2842,6 +2854,15 @@ func (l *Loop) handleWritable(cs *connState) {
 		}
 		mu.Lock()
 	}
+	if mu != nil && cs.hijacked.Load() {
+		// The run loop read cs from its slot, and then the conn's handler
+		// hijacked it (celeris#668) and returned: the descriptor is closed
+		// and its number may already be another file's. Writing the queued
+		// bytes, or disarming EPOLLOUT by the number, would reach that file,
+		// as in flushDirty. drainDetachQueue settles the rest.
+		mu.Unlock()
+		return
+	}
 	err := l.flushWrites(cs, true)
 	drained := err == nil && !csWritePending(cs)
 	if err == nil {
@@ -2854,7 +2875,7 @@ func (l *Loop) handleWritable(cs *connState) {
 	if err != nil && cs.h1State != nil && cs.h1State.OnError != nil {
 		cs.h1State.OnError(err)
 	}
-	if mu := cs.detachMu; mu != nil {
+	if mu != nil {
 		mu.Unlock()
 	}
 	if err != nil {
