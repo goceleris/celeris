@@ -98,11 +98,24 @@ func TestFSCacheKeyIsNotAliasedToRequestBuffer(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
 			// Deferred before waitForReady, so a failed wait stops the
-			// server too (waitForReady leaves Start's error in done). The
-			// listener is closed once Start has returned: a Start that
-			// failed leaves it open.
-			defer func() { cancel(); <-done; _ = ln.Close() }()
+			// server too (waitForReady leaves Start's error in done). Once
+			// Start has returned, the listener is closed and, if the server
+			// never became ready, Shutdown runs: a Start that failed closes
+			// neither the listener nor the CPU monitor's /proc/stat
+			// descriptor, which only Shutdown releases.
+			ready := false
+			defer func() {
+				cancel()
+				<-done
+				_ = ln.Close()
+				if !ready {
+					shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = s.Shutdown(shutCtx)
+					shutCancel()
+				}
+			}()
 			addr := waitForReady(t, s, done, 30*time.Second)
+			ready = true
 
 			// Alternate paths on each keep-alive connection so the read
 			// buffer that backed a cached key is overwritten by a different

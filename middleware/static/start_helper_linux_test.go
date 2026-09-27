@@ -46,7 +46,11 @@ func TestWaitForReadyFailsFastOnStartError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A Start that fails closes neither the listener nor the CPU monitor's
+	// /proc/stat descriptor; Shutdown releases the monitor, and is safe on a
+	// server that never started.
 	defer func() { _ = ln.Close() }()
+	defer func() { _ = s.Shutdown(context.Background()) }()
 	done := make(chan error, 1)
 	go func() { done <- s.StartWithListenerAndContext(context.Background(), ln) }()
 
