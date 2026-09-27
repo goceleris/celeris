@@ -62,6 +62,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	for _, kind := range engineKinds(t) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
+			rig := &c633Rig{t0: time.Now(), kern0: c633Kern()} // celeris#633 diagnostic
 			var ecanceled, otherWriteErr, protoErr atomic.Int64
 			// protoErr counts every read error that is not a close, so on its
 			// own it cannot distinguish a frame the engine mis-delivered from
@@ -83,22 +84,53 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				ReadLimit:             256 * 1024,
 				MaxBackpressureBuffer: bpBuf, // realistic buffer; headroom (cap-highWater) must exceed async pause-apply latency, else Append drops a chunk (ErrReadLimit) -- a config artifact, not engine reordering
 				Handler: func(c *Conn) {
+					cs := &c633Srv{c: c}
+					defer cs.phase.Store(3)
+					registered := false
+					exit := func(what string, err error) {
+						cs.mu.Lock()
+						cs.exit, cs.exitNs = what+": "+err.Error(), rig.since()
+						cs.mu.Unlock()
+					}
 					for {
+						cs.phase.Store(1)
 						mt, msg, err := c.ReadMessage()
 						if err != nil {
 							if !isCloseErr(err) {
 								protoErr.Add(1)
 								noteReadErr(err)
 							}
+							exit("read", err)
 							return
 						}
+						if !registered {
+							// v3 join: the client's FIRST frame is 126 bytes like every other,
+							// its payload "cid=<port>;" padded with 'x'.
+							registered = true
+							if p := string(msg); strings.HasPrefix(p, "cid=") {
+								if i := strings.IndexByte(p, ';'); i > 4 {
+									if cid, err := strconv.Atoi(p[4:i]); err == nil {
+										rig.srvs.Store(cid, cs)
+									}
+								}
+							}
+							rig.nHandlers.Add(1)
+						}
+						cs.phase.Store(2)
 						if err := c.WriteMessage(mt, msg); err != nil {
 							if errors.Is(err, syscall.ECANCELED) {
 								ecanceled.Add(1)
 							} else if !errors.Is(err, ErrWriteClosed) {
 								otherWriteErr.Add(1)
+								cs.mu.Lock()
+								cs.wErr, cs.wErrNs = err, rig.since()
+								cs.mu.Unlock()
 							}
+							exit("write", err)
 							return
+						}
+						if n := cs.frames.Add(1); n&15 == 0 {
+							cs.lastNs.Store(rig.since())
 						}
 					}
 				},
@@ -146,6 +178,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 
 			hostPort := strings.TrimPrefix(addr, "ws://")
 			hostPort = strings.TrimSuffix(hostPort, "/ws")
+			rig.srvPort, _ = strconv.Atoi(hostPort[strings.LastIndex(hostPort, ":")+1:])
 
 			var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail, clientMisaligned, framesSent atomic.Int64
 			// An RST is NOT a clean close (celeris#530). Linux emits one when
@@ -174,9 +207,22 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						dialFail.Add(1)
 						return
 					}
-					defer func() { _ = c.Close() }()
-					if err := wsHandshake(c, hostPort); err != nil {
+					rec := &c633Cli{port: c.LocalAddr().(*net.TCPAddr).Port}
+					rig.mu.Lock()
+					rig.clis = append(rig.clis, rec)
+					rig.mu.Unlock()
+					defer func() {
+						rec.mu.Lock()
+						rec.closeNs = rig.since()
+						rec.mu.Unlock()
+						_ = c.Close()
+					}()
+					if err := wsHandshakeCID(c, hostPort, rec.port); err != nil {
 						hsFail.Add(1)
+						return
+					}
+					if !writeAll(c, c633IDFrame(rec.port), 5*time.Second) {
+						hsFail.Add(1) // counted as an environment failure, like a failed handshake
 						return
 					}
 					wrote := 0
@@ -200,10 +246,33 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					// Complete the current frame so the wire is a whole number of frames. writeAll
 					// retries to completion: once the flood stops the server drains and the send
 					// buffer empties. A conn the server wrongly killed surfaces as an error here.
+					rec.mu.Lock()
+					rec.floodEndNs, rec.wrote = rig.since(), wrote
+					rec.srvFramesAtFloodEnd = rig.srvFrames(rec.port)
+					rec.mu.Unlock()
+					if c633InjectAbort && i%4 == 0 {
+						// celeris#633 H2 injection: this client abandons the connection right after
+						// the flood, with the server's echo still unread in its receive queue, exactly
+						// as a client that gave up at the frame-completion write does (the deferred
+						// Close then sends an RST). No slowness is involved.
+						rec.mu.Lock()
+						rec.giveUp = "abort"
+						rec.mu.Unlock()
+						rig.snapshot(rec)
+						return
+					}
 					if rem := wrote % 126; rem != 0 {
 						need := 126 - rem
 						start := wrote % len(batch)
-						if !writeAll(c, batch[start:start+need], 15*time.Second) {
+						ok, left, ferr := rig.clientWrite(c, rec, "fc", batch[start:start+need], 15*time.Second)
+						rec.mu.Lock()
+						rec.fcNeed, rec.fcRemain, rec.fcNs, rec.fcErr = need, left, rig.since(), ferr
+						rec.mu.Unlock()
+						if !ok {
+							rec.mu.Lock()
+							rec.giveUp = "fc"
+							rec.mu.Unlock()
+							rig.snapshot(rec)
 							clientCloseFail.Add(1)
 							return
 						}
@@ -213,7 +282,15 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					buf := make([]byte, 64<<10)
 					for {
 						_ = c.SetReadDeadline(time.Now().Add(1 * time.Second))
-						if _, err := c.Read(buf); err != nil {
+						n, err := c.Read(buf)
+						rec.mu.Lock()
+						rec.drainBytes += int64(n)
+						rec.drainReads++
+						if err != nil {
+							rec.drainErr, rec.drainEndNs = err, rig.since()
+						}
+						rec.mu.Unlock()
+						if err != nil {
 							break
 						}
 					}
@@ -221,23 +298,67 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 						clientMisaligned.Add(1)
 					}
 					framesSent.Add(int64(wrote / 126))
-					if !writeAll(c, maskedCloseFrame(), 10*time.Second) {
+					ok, left, cerr := rig.clientWrite(c, rec, "cw", maskedCloseFrame(), 10*time.Second)
+					rec.mu.Lock()
+					rec.cwRemain, rec.cwNs, rec.cwErr = left, rig.since(), cerr
+					rec.mu.Unlock()
+					if !ok {
+						rec.mu.Lock()
+						rec.giveUp = "cw"
+						rec.mu.Unlock()
+						rig.snapshot(rec)
 						clientCloseFail.Add(1)
 						return
 					}
 					_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 					tClose := time.Now()
+					rec.mu.Lock()
+					rec.closeSentNs = rig.since()
+					rec.mu.Unlock()
 					for {
-						_, err := c.Read(buf)
+						if c633InjectProgress {
+							// celeris#633 H1 kill arm: the close wait gives up only after
+							// c633ProgCloseIdle with no byte from the server (re-armed after every
+							// successful read), or at c633ProgCap in total, instead of one absolute 10 s.
+							d := time.Now().Add(c633ProgCloseIdle)
+							if lim := tClose.Add(c633ProgCap); d.After(lim) {
+								d = lim
+							}
+							_ = c.SetReadDeadline(d)
+						}
+						n, err := c.Read(buf)
+						if n > 0 {
+							rec.mu.Lock()
+							now := rig.since()
+							if rec.waitBytes == 0 {
+								rec.waitFirstNs = now
+							}
+							rec.waitBytes += int64(n)
+							rec.waitLastNs = now
+							rec.mu.Unlock()
+						}
 						if err == nil {
 							continue
 						}
+						rec.mu.Lock()
+						rec.waitErr, rec.waitEndNs = err, rig.since()
+						rec.mu.Unlock()
 						if errors.Is(err, syscall.ECONNRESET) {
 							clientRST.Add(1)
+							rec.mu.Lock()
+							rec.giveUp, rec.waitOutcome = "rst", "rst"
+							rec.mu.Unlock()
 						} else if errors.Is(err, io.EOF) {
 							closedOK.Add(1)
+							rec.mu.Lock()
+							rec.waitOutcome = "eof"
+							rec.mu.Unlock()
 						} else {
 							closeTimeout.Add(1)
+							rec.mu.Lock()
+							rec.giveUp, rec.waitOutcome = "ct", "timeout"
+							rec.mu.Unlock()
+							rig.snapshot(rec)
 							t.Logf("close-timeout %s: %v after Close sent", c.LocalAddr(), time.Since(tClose).Round(time.Millisecond))
 						}
 						return
@@ -245,6 +366,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				}()
 			}
 			wg.Wait()
+			rig.report(t, kind.String())
 
 			t.Logf("%s: clientMisaligned=%d framesSent=%d (if misaligned>0 the client truncated; if 0 while protocol errors>0 the engine mis-delivered)",
 				kind, clientMisaligned.Load(), framesSent.Load())
