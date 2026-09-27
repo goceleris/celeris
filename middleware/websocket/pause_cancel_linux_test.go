@@ -44,21 +44,32 @@ import (
 //  2. every conn finishes its last frame and its Close frame, and then
 //     completes the Close handshake (a paused conn whose recv was never
 //     re-armed cannot read them, and the client gives up instead);
-//  3. no handler sees a write or read error before its own client closed;
-//  4. engine shutdown completes within a bound (paused zombies block it).
+//  3. no handler sees a write or read error, unless its own client gave up
+//     on the connection (which fails 2) and the error came after that
+//     client closed;
+//  4. engine shutdown completes within a bound (paused zombies block it);
+//  5. the engine never leaves a connection unread for wsoRecvStall while its
+//     socket holds bytes and nothing asked it to stop (the celeris#607
+//     class, WSO-STALL);
+//  6. io_uring: the engine never chains a recv behind a send on these
+//     connections (RecvLinkedArms == 0; celeris#607's mechanism).
 //
 // The client waits on progress, not on a clock, and reads while it waits:
 // see backpressure_oracle_linux_test.go for why (celeris#633). A connection
 // that never finishes its writes used to be counted and not judged
 // (clientCloseFail, celeris#623); it now fails the test, and every give-up
-// prints both ends' timeline (WSO-GIVEUP).
+// prints both ends' timeline (WSO-GIVEUP). Because the client's reads would
+// also get it through a connection the engine had stopped reading (that is
+// how celeris#607 stalled), 5 and 6 judge that directly; the client holds
+// its backpressure idle for wsoQuiet after the flood, so a connection the
+// engine stopped reading stays unread long enough for 5 to see it.
 //
 // NOTE: inbound stream integrity is verified by the sequence-oracle test
 // (TestBackpressureInboundSequenceIntegrity, #484); this test asserts the #482
 // fix: no ECANCELED on in-flight sends, clean close handshakes, and clean shutdown.
 func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	if testing.Short() {
-		t.Skip("needs ~20s of loopback flood")
+		t.Skip("needs ~45s of loopback flood")
 	}
 	conns := envInt("WS482_CONNS", 96)
 	bpBuf := envInt("WS482_BP", 256)
@@ -68,7 +79,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 	for _, kind := range engineKinds(t) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
-			rig := newWSORig()
+			rig := newWSORig(t)
 			var ecanceled, otherWriteErr, protoErr atomic.Int64
 			// protoErr counts every read error that is not a close, so on its
 			// own it cannot distinguish a frame the engine mis-delivered from
@@ -126,12 +137,12 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				// Recv-arming witnesses, read after shutdown so every worker
 				// has left its loop and no stall episode is still open. They
 				// are direct atomics, so nothing is stranded in a
-				// per-iteration batch. RECVSTALL is the celeris#607 witness:
+				// per-iteration batch. RECVSTALL is a celeris#607 witness:
 				// a connection owed a recv arm that the dirty-list retry
 				// passed over because a SEND was outstanding. Logged, not
-				// asserted -- an episode is normal SQ-ring pressure; it is
-				// the DURATION, joined against closeTimeout above, that
-				// carries the verdict.
+				// asserted -- an episode is normal SQ-ring pressure; what
+				// one does to a connection is judged by the watch
+				// (WSO-STALL), whatever the mechanism.
 				if kind != celeris.IOUring {
 					return
 				}
@@ -149,11 +160,13 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				t.Logf("%s: LINKBLOCK arms=%d blockedTotalMs=%d blockedMaxMs=%d",
 					kind, m.RecvLinkedArms, m.RecvLinkedBlockedNanos/1e6,
 					m.RecvLinkedBlockedMaxNanos/1e6)
+				wsoAssertNoLinkedRecv(t, kind.String(), m.RecvLinkedArms, m.RecvLinkedBlockedMaxNanos)
 			}()
 
 			hostPort := strings.TrimPrefix(addr, "ws://")
 			hostPort = strings.TrimSuffix(hostPort, "/ws")
 			rig.setServer(hostPort)
+			stopWatch := rig.watch()
 
 			var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail, clientMisaligned, framesSent atomic.Int64
 			// An RST is NOT a clean close (celeris#530). Linux emits one when
@@ -184,7 +197,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					}
 					cl := rig.client(c)
 					defer rig.closeClient(cl, c)
-					if err := wsHandshakePath(c, hostPort, cl.path()); err != nil {
+					if err := cl.handshake(c, hostPort); err != nil {
 						hsFail.Add(1)
 						return
 					}
@@ -208,6 +221,13 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					}
 					cl.mark("flood end wrote=%d", wrote)
 					cl.sample(c, "flood end")
+					// Hold the backpressure with the client idle (wsoQuiet): a
+					// healthy engine reads what this connection's socket
+					// holds or pauses it; one that stopped reading it behind
+					// the blocked echo SEND (celeris#607) cannot, and the
+					// watch sees that stretch pass wsoRecvStall.
+					time.Sleep(wsoQuiet)
+					cl.mark("quiet end")
 					buf := make([]byte, 64<<10)
 					// Complete the current frame so the wire is a whole number of frames,
 					// waiting on progress and reading while it waits. A conn the server
@@ -256,6 +276,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				}()
 			}
 			wg.Wait()
+			stalls := stopWatch()
 
 			t.Logf("%s: clientMisaligned=%d framesSent=%d (if misaligned>0 the client truncated; if 0 while protocol errors>0 the engine mis-delivered)",
 				kind, clientMisaligned.Load(), framesSent.Load())
@@ -263,25 +284,29 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				t.Errorf("%d client conn(s) ended mid-frame -- test client bug, not a server verdict", clientMisaligned.Load())
 			}
 
-			// A server error that came after its own client closed is that
-			// client's teardown echoing back, not the engine's doing
-			// (celeris#633: 1,165 of 1,165 such errors came after). Only the
-			// ones before are judged; the rest are printed.
-			errsBefore, errsAfter := rig.serverErrs()
-			var writeBefore, readBefore int64
-			for _, e := range errsBefore {
+			// A server error is excused only on a connection whose client
+			// gave up or was reset, which fails the test below, and only
+			// after that client closed: that is the client's teardown
+			// echoing back (celeris#633: 1,165 of 1,165 such errors came
+			// after). Every other one is judged; the excused are printed.
+			// protoErr and otherWriteErr count every error, as they always
+			// have; the ...Judged fields are the ones judged.
+			judged, excused := rig.serverErrs()
+			var writeJudged, readJudged int64
+			for _, e := range judged {
 				if e.kind == "write" {
-					writeBefore++
+					writeJudged++
 				} else {
-					readBefore++
+					readJudged++
 				}
 			}
-			t.Logf("%s: conns=%d protoErr=%d clientCloseFail=%d ecanceled=%d otherWriteErr=%d closedOK=%d clientRST=%d closeTimeout=%d dialFail=%d hsFail=%d serverErrsAfterClientClose=%d protoErrAll=%d otherWriteErrAll=%d",
-				kind, conns, readBefore, clientCloseFail.Load(), ecanceled.Load(), writeBefore, closedOK.Load(), clientRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load(),
-				len(errsAfter), protoErr.Load(), otherWriteErr.Load())
+			t.Logf("%s: conns=%d protoErr=%d clientCloseFail=%d ecanceled=%d otherWriteErr=%d closedOK=%d clientRST=%d closeTimeout=%d dialFail=%d hsFail=%d protoErrJudged=%d otherWriteErrJudged=%d serverErrsExcused=%d recvStalls=%d",
+				kind, conns, protoErr.Load(), clientCloseFail.Load(), ecanceled.Load(), otherWriteErr.Load(), closedOK.Load(), clientRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load(),
+				readJudged, writeJudged, len(excused), len(stalls))
 			t.Logf("%s: %s", kind, rig.waitStats())
-			for _, e := range errsAfter {
-				t.Logf("%s: not judged, after its client's close: %s", kind, e.line)
+			t.Logf("%s: %s", kind, rig.longestStretch())
+			for _, e := range excused {
+				t.Logf("%s: not judged, its client gave up: %s", kind, e.line)
 			}
 			if dialFail.Load()+hsFail.Load() > 0 {
 				t.Fatalf("%d conns failed to dial/handshake -- environment problem, not a verdict", dialFail.Load()+hsFail.Load())
@@ -292,16 +317,17 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 			}
 			// protoErr and otherWriteErr were logged but never asserted, so a
 			// server that killed a healthy connection mid-write passed on
-			// these counters alone (celeris#530). Judged only when the error
-			// came before its own client closed (see above).
-			if len(errsBefore) != 0 {
-				for _, e := range errsBefore {
+			// these counters alone (celeris#530). Judged unless excused
+			// (see above).
+			if len(judged) != 0 {
+				for _, e := range judged {
 					t.Logf("%s: %s", kind, e.line)
 				}
-				t.Errorf("%d handler error(s) (%d read, %d write) before their own client closed: the engine "+
-					"mis-delivered, or tore down or failed a connection it should have kept alive",
-					len(errsBefore), readBefore, writeBefore)
+				t.Errorf("%d handler error(s) (%d read, %d write) on connections whose client did not give up, or "+
+					"before it did: the engine mis-delivered, or tore down or failed a connection it should have kept alive",
+					len(judged), readJudged, writeJudged)
 			}
+			wsoAssertNoStalls(t, kind.String(), stalls)
 			// Measured zero on both engines across repeated runs before this
 			// was asserted: nothing was actually being hidden inside closedOK
 			// here, unlike the sibling inbound oracle where the same folding
@@ -319,9 +345,9 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 			// wsoWriteIdle (or that ran past wsoWaitCap), not a slow server.
 			if n := clientCloseFail.Load(); n != 0 {
 				t.Errorf("%d conn(s) never finished writing their last frame or their Close frame: nothing "+
-					"moved for %v (or the wait ran past %v). Each WSO-GIVEUP record above has the "+
+					"moved for %v (or the wait ran past %v, or %s). Each WSO-GIVEUP record above has the "+
 					"connection's timeline from both ends and the shape it stalled in (celeris#623)",
-					n, wsoWriteIdle, wsoWaitCap)
+					n, wsoWriteIdle, wsoWaitCap, rig.budgetNote())
 			}
 			if n := closeTimeout.Load(); n != 0 {
 				// Deliberately does NOT name a cause in the message: a
@@ -331,9 +357,9 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				// asserting the former sent three separate investigations down
 				// the wrong path. The WSO-GIVEUP record carries the state.
 				t.Errorf("%d conn(s) never completed the Close handshake: no byte and no close from the "+
-					"server for %v after the client's Close (or the wait ran past %v). Each WSO-GIVEUP "+
+					"server for %v after the client's Close (or the wait ran past %v, or %s). Each WSO-GIVEUP "+
 					"record above has the connection's timeline and the state of both ends",
-					n, wsoCloseIdle, wsoWaitCap)
+					n, wsoCloseIdle, wsoWaitCap, rig.budgetNote())
 			}
 		})
 	}
