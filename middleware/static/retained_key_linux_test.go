@@ -30,10 +30,22 @@ func engineKinds(t *testing.T) []celeris.EngineType {
 	return kinds
 }
 
-func waitForReady(tb testing.TB, s *celeris.Server, timeout time.Duration) string {
+// waitForReady polls until the server accepts connections. done is the
+// channel the goroutine running Start sends Start's error on: a Start that
+// returns first means the server will never be ready, so this fails at once
+// with that error instead of polling out the timeout (celeris#706). The error
+// is put back for the caller's shutdown; done is buffered and sent on once.
+func waitForReady(tb testing.TB, s *celeris.Server, done chan error, timeout time.Duration) string {
 	tb.Helper()
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	for {
+		select {
+		case err := <-done:
+			done <- err
+			tb.Fatalf("server stopped before it was ready: Start returned %v", err)
+			return ""
+		default:
+		}
 		if addr := s.Addr(); addr != nil {
 			a := addr.String()
 			if conn, err := net.DialTimeout("tcp", a, 100*time.Millisecond); err == nil {
@@ -41,10 +53,12 @@ func waitForReady(tb testing.TB, s *celeris.Server, timeout time.Duration) strin
 				return a
 			}
 		}
+		if !time.Now().Before(deadline) {
+			tb.Fatalf("server not ready within %v, and Start has not returned", timeout)
+			return ""
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	tb.Fatal("server not ready within timeout")
-	return ""
 }
 
 // TestFSCacheKeyIsNotAliasedToRequestBuffer is the regression guard for the
@@ -83,7 +97,7 @@ func TestFSCacheKeyIsNotAliasedToRequestBuffer(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
-			addr := waitForReady(t, s, 30*time.Second)
+			addr := waitForReady(t, s, done, 30*time.Second)
 			defer func() { cancel(); <-done }()
 
 			// Alternate paths on each keep-alive connection so the read

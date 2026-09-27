@@ -3,42 +3,12 @@
 package websocket
 
 import (
-	"fmt"
-	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/goceleris/celeris"
 )
-
-// fatalRecorder is a testing.TB whose Fatal and Fatalf record the message and
-// end the calling goroutine, as t.Fatal ends a test's, without failing the
-// test that owns it. Everything else goes to the embedded TB.
-type fatalRecorder struct {
-	testing.TB
-	mu     sync.Mutex
-	msg    string
-	failed bool
-}
-
-func (f *fatalRecorder) Fatal(args ...any) { f.record(fmt.Sprint(args...)) }
-
-func (f *fatalRecorder) Fatalf(format string, args ...any) { f.record(fmt.Sprintf(format, args...)) }
-
-func (f *fatalRecorder) record(msg string) {
-	f.mu.Lock()
-	f.msg, f.failed = msg, true
-	f.mu.Unlock()
-	runtime.Goexit()
-}
-
-func (f *fatalRecorder) result() (string, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.msg, f.failed
-}
 
 // TestStartNativeServerFailsFastOnStartError is the failing-first oracle for
 // celeris#706. startNativeServerWithHandle runs Start in a goroutine that

@@ -75,7 +75,7 @@ func startNativeServerWithHandle(tb testing.TB, kind celeris.EngineType, cfg Con
 
 	// 30s deadline (5s tripped on slow GitHub Actions Azure runners with
 	// kernel 6.17 io_uring; same pattern as the adaptive H2 dial test).
-	addr := waitForReady(tb, s, 30*time.Second)
+	addr := waitForReady(tb, s, done, 30*time.Second)
 	return addr, func() {
 		serverCancel()
 		<-done
