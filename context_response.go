@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1402,6 +1403,14 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // failure to do so permanently leaks the Context from the pool.
 // This is required for streaming responses on native engines where the handler
 // must return to free the event loop thread.
+//
+// Detach copies the request values the Context holds, so they stay valid
+// after the handler returns: the headers, method, path and query, the route
+// params, the parsed query and cookies, the Host, and the strings stored with
+// SetRequestID, SetClientIP, SetHost, SetScheme and SetString. It cannot copy
+// a string read out of the Context before the call, nor values stored with
+// [Context.Set]: on epoll and io_uring those may still refer to the
+// connection's receive buffer, so clone them before keeping them.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
@@ -1424,6 +1433,7 @@ func (c *Context) Detach() (done func()) {
 	c.method = strings.Clone(c.method)
 	c.path = strings.Clone(c.path)
 	c.rawQuery = strings.Clone(c.rawQuery)
+	c.materializeRequestViews()
 
 	c.extended = true
 	c.detached = true
@@ -1444,6 +1454,48 @@ func (c *Context) Detach() (done func()) {
 			elapsed: time.Since(c.startTime),
 		}
 		close(ch)
+	}
+}
+
+// materializeRequestViews clones, for [Context.Detach], the request-derived
+// strings the Context keeps outside the header slice and the method, path and
+// raw query: the route params, the parsed query and cookie caches, the H1
+// Host, and the strings middleware store on the Context from request headers
+// (request ID, client-IP/host/scheme overrides, SetString values).
+//
+// On epoll and io_uring each of these can be a view of the engine's receive
+// buffer, which is safe to compare while the request is handled and unsafe to
+// keep after it: a detached Context outlives the handler, and the engine keeps
+// receiving into that buffer (celeris#718; celeris#714 is the same defect in
+// the WebSocket middleware). The params are substrings of the path, the
+// caches are substrings of the raw query and the Cookie header, and Host
+// reads Stream.Authority, which the H1 parser sets to a view of the Host
+// header. Values stored with [Context.Set] are opaque and are not copied.
+func (c *Context) materializeRequestViews() {
+	for i := range c.params {
+		c.params[i].Value = strings.Clone(c.params[i].Value)
+	}
+	if c.queryCached && len(c.queryCache) > 0 {
+		qc := make(url.Values, len(c.queryCache))
+		for k, vs := range c.queryCache {
+			cp := make([]string, len(vs))
+			for i, v := range vs {
+				cp[i] = strings.Clone(v)
+			}
+			qc[strings.Clone(k)] = cp
+		}
+		c.queryCache = qc
+	}
+	for i, kv := range c.cookieCache {
+		c.cookieCache[i] = [2]string{strings.Clone(kv[0]), strings.Clone(kv[1])}
+	}
+	c.stream.Authority = strings.Clone(c.stream.Authority)
+	c.requestID = strings.Clone(c.requestID)
+	c.clientIPOverride = strings.Clone(c.clientIPOverride)
+	c.hostOverride = strings.Clone(c.hostOverride)
+	c.schemeOverride = strings.Clone(c.schemeOverride)
+	for k, v := range c.stringKeys {
+		c.stringKeys[k] = strings.Clone(v)
 	}
 }
 
