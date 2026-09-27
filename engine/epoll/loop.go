@@ -2833,18 +2833,21 @@ func (l *Loop) disarmEpollOut(cs *connState) {
 // driverMu, hijacked false means the descriptor is still the conn's until
 // the MOD has run. A hijacked conn is out of the epoll set already. A sync
 // conn is only ever hijacked inline, on this thread, so it skips the lock.
+//
+// The cost of the lock on this send-path call: BenchmarkEPOLLOUTArmDisarm.
 func (l *Loop) modEpollOut(cs *connState, events uint32) (issued bool, err error) {
-	if cs.detachMu != nil {
-		l.driverMu.RLock()
-		defer l.driverMu.RUnlock()
-		if cs.hijacked.Load() {
-			return false, nil
-		}
+	ev := unix.EpollEvent{Events: events, Fd: int32(cs.fd)}
+	if cs.detachMu == nil {
+		return true, unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
 	}
-	return true, unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &unix.EpollEvent{
-		Events: events,
-		Fd:     int32(cs.fd),
-	})
+	l.driverMu.RLock()
+	if cs.hijacked.Load() {
+		l.driverMu.RUnlock()
+		return false, nil
+	}
+	err = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_MOD, cs.fd, &ev)
+	l.driverMu.RUnlock()
+	return true, err
 }
 
 // handleWritable resumes a backpressured conn on an EPOLLOUT event: flush
