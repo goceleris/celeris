@@ -4,6 +4,8 @@ package iouring
 
 import (
 	"errors"
+	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -54,12 +56,84 @@ func stillNames(fd int, id socketIdentity) bool {
 	return st.Dev == id.dev && st.Ino == id.ino
 }
 
+// lingerBacklog is how much the test leaves unsent behind a lingering close.
+// lingeringTCPSocket (celeris#691's rig) shrinks the send buffer to 4 KiB, so
+// only a few KiB wait behind its FIN, and a receiver whose buffer is full can
+// still take them in: it collapses its queue when a zero-window probe comes,
+// opens the window, the FIN is ACKed and the close returns. On a GitHub x86
+// runner that ended one 3 s linger in 1 of 5 runs within 100 ms (PR #744,
+// job 108681501232). A backlog of megabytes behind a 4 KiB receive buffer
+// cannot be absorbed that way, so the close lingers until the peer drains.
+// The send buffer asked for is capped at twice net.core.wmem_max (416 KiB at
+// the default), and the rig refuses a backlog under 128 KiB.
+const lingerBacklog = 4 << 20
+
+// deeplyLingeringTCPSocket is lingeringTCPSocket with lingerBacklog left
+// unsent: a connected, non-blocking TCP socket whose peer never reads, with
+// SO_LINGER {1, linger}, so its last close waits the whole linger time.
+// drain reads the peer, and the close then returns.
+func deeplyLingeringTCPSocket(t *testing.T, linger int) (fd int, drain func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	peer, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	_ = peer.(*net.TCPConn).SetReadBuffer(4096)
+	f, err := c.(*net.TCPConn).File() // a blocking duplicate; the net.Conn is done with
+	_ = c.Close()
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	fd, err = unix.Dup(int(f.Fd()))
+	_ = f.Close()
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatalf("set non-blocking: %v", err)
+	}
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, lingerBacklog)
+	chunk := make([]byte, 64<<10)
+	queued := 0
+	for queued < lingerBacklog {
+		n, err := unix.Write(fd, chunk)
+		if errors.Is(err, unix.EAGAIN) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("fill the send path: %v", err)
+		}
+		queued += n
+	}
+	if queued < 128<<10 {
+		t.Fatalf("apparatus: only %d bytes could be queued behind the close, want a backlog of at least 128 KiB", queued)
+	}
+	if err := unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: int32(linger)}); err != nil {
+		t.Fatalf("SO_LINGER: %v", err)
+	}
+	t.Logf("celeris735 LINGER rig backlog_bytes=%d linger=%ds", queued, linger)
+	drain = func() {
+		go func() { _, _ = io.Copy(io.Discard, peer) }()
+	}
+	return fd, drain
+}
+
 // lingeringDriver registers a lingering socket on w, settles its RECV, and
 // returns it with its onClose channel, the engine's duplicate of it and what
 // that duplicate names.
 func lingeringDriver(t *testing.T, w *Worker, linger int) (fd int, drain func(), closed chan error, opFD int, id socketIdentity) {
 	t.Helper()
-	fd, drain = lingeringTCPSocket(t, linger)
+	fd, drain = deeplyLingeringTCPSocket(t, linger)
 	if linger == 0 {
 		// The control: SO_LINGER off, so the close returns at once.
 		if err := unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 0}); err != nil {
@@ -118,6 +192,7 @@ func TestDriverLingeringCloseDoesNotStallTheWorker(t *testing.T) {
 			}
 			_ = unix.Close(fd)
 			waitFinalized(t, w, fd)
+			finalized := time.Now()
 			// The issue's probe: give the worker the cancel and the start of
 			// the close before V's peer writes.
 			time.Sleep(100 * time.Millisecond)
@@ -163,6 +238,7 @@ func TestDriverLingeringCloseDoesNotStallTheWorker(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("L's onClose never fired")
 			}
+			t.Logf("celeris735 LINGER arm=%s onclose_after_finalize_ms=%.1f", tc.name, float64(time.Since(finalized))/1e6)
 			if stillNames(opFD, id) {
 				t.Errorf("onClose fired with the engine's duplicate (fd %d) still open on the socket", opFD)
 			}
