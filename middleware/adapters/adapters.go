@@ -103,10 +103,49 @@ func WrapMiddleware(mw func(http.Handler) http.Handler) celeris.HandlerFunc {
 
 // buildRequest reconstructs an *http.Request from a celeris Context for use
 // with stdlib middleware/handlers.
+//
+// Every string it hands to net/http is a copy, and the copies share one
+// allocation. On epoll and io_uring the method, path, query, Host and header
+// strings are views of the connection's receive buffer, which the engine
+// reuses for the connection's next request and, once the connection closes,
+// for another connection; net/http lets a middleware keep the request's
+// strings after it returns (celeris#732). The body is not copied: net/http
+// forbids reading it after ServeHTTP returns.
 func buildRequest(c *celeris.Context) *http.Request {
-	path := c.Path()
-	if q := c.RawQuery(); q != "" {
-		path += "?" + q
+	method, path, query, host := c.Method(), c.Path(), c.RawQuery(), c.Host()
+	hdrs := c.RequestHeaders()
+
+	urlLen := len(path)
+	if query != "" {
+		urlLen += 1 + len(query)
+	}
+	n := len(method) + urlLen + len(host)
+	for _, h := range hdrs {
+		if !strings.HasPrefix(h[0], ":") {
+			n += len(h[0]) + len(h[1])
+		}
+	}
+	var sb strings.Builder
+	sb.Grow(n)
+	sb.WriteString(method)
+	sb.WriteString(path)
+	if query != "" {
+		sb.WriteByte('?')
+		sb.WriteString(query)
+	}
+	sb.WriteString(host)
+	for _, h := range hdrs {
+		if !strings.HasPrefix(h[0], ":") {
+			sb.WriteString(h[0])
+			sb.WriteString(h[1])
+		}
+	}
+	// Cut the copies back out, in the order they were written.
+	rest := sb.String()
+	next := func(l int) string {
+		s := rest[:l]
+		rest = rest[l:]
+		return s
 	}
 
 	var body io.Reader
@@ -115,16 +154,20 @@ func buildRequest(c *celeris.Context) *http.Request {
 		body = bytes.NewReader(data)
 	}
 
-	req, _ := http.NewRequestWithContext(c.Context(), c.Method(), path, body)
+	method = next(len(method))
+	target := next(urlLen)
+	host = next(len(host))
+	req, _ := http.NewRequestWithContext(c.Context(), method, target, body)
 
-	for _, h := range c.RequestHeaders() {
+	for _, h := range hdrs {
 		if strings.HasPrefix(h[0], ":") {
 			continue
 		}
-		req.Header.Add(h[0], h[1])
+		key := next(len(h[0]))
+		req.Header.Add(key, next(len(h[1])))
 	}
 
-	if host := c.Host(); host != "" {
+	if host != "" {
 		req.Host = host
 	}
 

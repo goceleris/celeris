@@ -79,12 +79,14 @@ import "sync/atomic"
 //     marks the queued claim detachClosed first, and hijack is refused).
 //     Before the checks existed one identity was measured moving twice in
 //     167 runs. Must stay 0.
-//   - claimDeferred: tryTransplant finding a conn whose dispatch goroutine
-//     has claimed its own hand-off (transplantPending) and leaving it to that
-//     claim. Counted before tryTransplant's other gates, so it is ordering,
-//     not a fault: it fires whenever a completion of the conn (its own
-//     response SEND, typically) lands between the goroutine's park and the
-//     drain of its claim. A rate.
+//   - claimDeferred: a worker-side hand-off attempt (tryTransplant, or
+//     rerunHandOff for a reap's retry or landing, celeris#758) finding a
+//     conn whose dispatch goroutine has claimed its own hand-off
+//     (transplantPending) and leaving it to that claim. Counted before the
+//     site's other gates, so it is ordering, not a fault: it fires whenever
+//     a completion of the conn (its own response SEND, typically) or a reap
+//     retry lands between the goroutine's park and the drain of its claim. A
+//     rate.
 //
 // All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
 // paths only, never on the per-request path while no drain is set, and like
