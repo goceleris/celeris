@@ -38,10 +38,12 @@ is **@FumingPower3925** (see [MAINTAINERS.md](MAINTAINERS.md)).
 ## How changes get merged
 
 Every change to `main` goes through a pull request, including changes by
-maintainers. A PR merges when **both** hold:
+maintainers. A PR merges when **all three** hold:
 
-1. all **required checks are green**, and
-2. it has an **approving review from a code owner** of the files it
+1. all **required checks are green**,
+2. **every review thread is resolved**, bots' threads included (the
+   `main` ruleset requires it), and
+3. it has an **approving review from a code owner** of the files it
    touches (CODEOWNERS is the source of truth).
 
 Who presses the button:

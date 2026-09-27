@@ -118,9 +118,18 @@ mage -l    # List all available targets
 The full rule lives in [GOVERNANCE.md](GOVERNANCE.md); the short version:
 
 - Every change to `main` goes through a pull request — maintainers included.
-- A PR merges when **all required checks are green** and it has an
-  **approving review from a code owner** of the files it touches
-  ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+- A PR merges when **all required checks are green**, **every review thread
+  is resolved**, and it has an **approving review from a code owner** of the
+  files it touches ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+- Bots comment on every PR: CodeRabbit (review), Codecov (coverage) and
+  CodSpeed (benchmarks). None of them is a required check, but each inline
+  CodeRabbit comment opens a review thread, and the thread rule above applies
+  to it. CodeRabbit resolves its own thread when a later push fixes the
+  point; for one you disagree with, reply saying why and resolve it (or
+  comment `@coderabbitai resolve` to resolve all of its threads). A red
+  CodSpeed check is informational: the header of
+  [`.github/workflows/codspeed.yml`](.github/workflows/codspeed.yml) says how
+  to read it.
 - The author merges if they have write access (a member of the
   `contributors` team or a maintainer); otherwise the approving maintainer
   merges, usually via auto-merge.

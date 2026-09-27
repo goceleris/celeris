@@ -1,12 +1,43 @@
 # CodSpeed: continuous benchmarking of the request hot path (celeris#690).
 #
+# How to read a CodSpeed result (celeris#725). The check is INFORMATIONAL: it
+# is not a required check, and a red "Performance Regression" is a prompt to
+# measure, not a verdict. Two things move these numbers without any change to
+# the code a benchmark runs:
+#   - Code layout. The runner measures one build of each test binary, and a
+#     commit that adds or moves functions anywhere in that binary can move a
+#     benchmark whose own code did not change. On main 3fe9620 (celeris#723)
+#     CodSpeed flagged seven middleware chain benchmarks at -11% to -19%
+#     against fee0d1c, although PreRouting and PreRoutingOnly execute no
+#     changed instruction and an interleaved A/B on another machine showed no
+#     difference. Re-running both commits later reproduced each commit's own
+#     level within 2% and the same -12% to -19% gap: the level belongs to the
+#     binary's layout on this runner, and an unrelated merge can move it that
+#     much.
+#   - The runner. Test binaries that were byte-identical at every commit still
+#     moved from run to run: a four-goroutine lock benchmark between 117 and
+#     185 ns, single-digit-ns cases between 3 and 4 ns or 8 and 11 ns. Those
+#     micro-benchmarks are no longer run here (see "Not measured" below).
+# Before acting on a flag:
+#   1. See whether the flagged benchmark's code changed at all. Build the
+#      package's test binary for the runner at the base and at the head
+#      (GOOS=linux GOARCH=arm64 go test -trimpath -c -o <name>.test <pkg>) and
+#      compare the two files. Identical binaries mean the flag is the runner.
+#   2. Otherwise measure it with .github/scripts/bench-ab.sh <base> <head>
+#      <pkg> <regex>: it runs the base, the head and a copy of the base
+#      interleaved, one process per round, and prints head-vs-base next to
+#      base-vs-copy, the machine's floor. A difference inside the floor is not
+#      a change; a B/op or allocs/op difference always is. On a laptop it says
+#      whether the code on the path got slower; on an arm64 Linux host it also
+#      shows this runner's layout effects.
+#
 # What it measures: the standard `testing.B` benchmarks of the code every
 # request runs through -- the router, Context and handler chain (root
 # bench_test.go), the HTTP/1 parser, protocol detection and the H2 stream
-# pool (./protocol/...), the wake-fd primitive (./internal/...), the core
-# middleware chains (./middleware) and the logger. Nothing in the benchmarks
-# changed: CodSpeed's Go runner builds them with an overlay of `testing` and
-# measures each one (https://codspeed.io/docs/benchmarks/go).
+# reset (./protocol/...), the core middleware chains (./middleware) and the
+# logger. Nothing in the benchmarks changed: CodSpeed's Go runner builds them
+# with an overlay of `testing` and measures each one
+# (https://codspeed.io/docs/benchmarks/go).
 #
 # Not measured, on purpose: test/drivercmp/* and test/benchcmp_* (separate
 # modules that need Redis, Postgres or Memcached), driver/* (same), the
@@ -14,7 +45,24 @@
 # and the engines. Engine throughput is judged on real hardware by
 # goceleris/probatorium's cluster matrix, not by micro-benchmarks, and the
 # engines change so often that watching them here would spend the whole
-# monthly budget (see below).
+# monthly budget (see below). Nor the ns-scale and contention
+# micro-benchmarks (celeris#725): ./internal/... (internal/wakefd's
+# BenchmarkFD* and BenchmarkSignal*) and BenchmarkInternH2HeaderName. Their
+# test binaries were byte-identical at every main commit from 9aa94eb to
+# dccb839 and still raised flags; they run under a plain `go test -bench`.
+#
+# How the set is chosen. CodSpeed's Go runner (go-runner, pinned below)
+# passes exactly three things from `run:` to `go test`: -bench, -benchtime
+# and the package list (go-runner/src/cli.rs at v1.3.0). Every other flag,
+# -skip and -tags included, is dropped with a warning, so an exclusion is
+# either a package left out of the list or the -bench pattern. The pattern
+# '^Benchmark([^I]|I[^n])' keeps every top-level benchmark whose name does not
+# start with "BenchmarkIn" (Go's RE2 has no negative lookahead); in these
+# packages that leaves out only BenchmarkInternH2HeaderName. A new benchmark
+# named BenchmarkIn... would be left out too: rename it or widen the pattern.
+# The selection, run once each (Linux: some benchmarks are Linux-only):
+#   go test -run '^$' -bench '^Benchmark([^I]|I[^n])' -benchtime 1x \
+#     . ./protocol/... ./middleware ./middleware/logger
 #
 # Where it runs: a CodSpeed Macro Runner, a dedicated bare-metal machine.
 # Go supports only the walltime instrument, and walltime on a shared
@@ -26,35 +74,52 @@
 # x64 runner is Pro-only. arm64 == x86 parity for a release stays with
 # probatorium's cluster.
 #
-# PREREQUISITE (an org setting, not code): Organization settings -> Actions
-# -> Runner groups -> Default -> allow public repositories. Until that is
-# set, the job below waits in the queue for a runner that never comes. That
-# is expected and is not a failure of this workflow.
+# PREREQUISITES (settings, not code). All three were done on 2026-09-26:
+#   1. Organization settings -> Actions -> Runner groups -> Default: allow
+#      public repositories, for the selected repositories celeris and
+#      loadgen. Without it the job waits for a runner that never comes; a job
+#      that queued before the change never gets one (cancel it, re-run it).
+#   2. Repository settings -> Actions -> General -> allowed actions:
+#      `CodSpeedHQ/action@*` on the allow-list. Without it every run ends in
+#      startup_failure with no job.
+#   3. The repository enabled in CodSpeed (app.codspeed.io, goceleris/celeris).
 #
-# Security: a macro runner is a self-hosted runner outside GitHub's
-# sandbox, so code from a FORK pull request never runs on it (the job's
-# `if:` below). Same-repository branches can only be pushed by people with
-# write access. No pull_request_target, no secrets: the upload
+# Security: a macro runner is a self-hosted runner outside GitHub's sandbox.
+# The job's `if:` below skips fork pull requests, but it is not the security
+# boundary: on `pull_request` the workflow definition comes from the pull
+# request's merge ref, so a fork pull request can edit this file, delete the
+# `if:` and target the macro runner. What stops it is the repository's
+# fork-PR approval policy, "Require approval for all external contributors"
+# (`gh api repos/goceleris/celeris/actions/permissions/fork-pr-contributor-approval`
+# returns all_external_contributors). That setting must stay, and a
+# maintainer must never "Approve and run" a fork pull request that touches
+# .github/workflows. Same-repository branches can only be pushed by people
+# with write access. No pull_request_target, no secrets: the upload
 # authenticates with the job's OIDC token.
 #
-# Budget (600 macro-runner minutes a month). The trigger paths below are the
-# non-test code of every package the benchmark set executes (measured: the
-# set run once with -coverpkg over the whole module), the benchmark files
-# themselves, the root go.mod/go.sum and this file. Replaying the 30 days to
-# 2026-09-26 -- the busiest month on record, 113 pushes to main and 268
-# pushes to pull requests -- through those paths gives the run count;
-# SETUP.md in the evidence for celeris#690 has the arithmetic and the
-# per-run minutes. -benchtime=1s instead of the runner's 3s default is what
-# keeps that month inside the budget; raise it if the minutes allow.
+# Budget: the Free plan's 600 macro-runner minutes a month are shared by the
+# whole goceleris organization (loadgen runs CodSpeed too, about 4 minutes a
+# run). A run here takes about 5 minutes of job time (275-305 s over the
+# first 15 runs). The trigger paths below are the non-test code of every
+# package the benchmark set executes (measured: the set run once with
+# -coverpkg over the whole module), the benchmark files, the root
+# go.mod/go.sum and this file. The 30 days to 2026-09-26, the busiest month
+# on record (113 pushes to main, 268 pushes to pull requests), replayed
+# through these paths give 66 runs, about 330 minutes; loadgen's busiest
+# month is 30 runs, about 120. (The paths as first set up gave 90 runs, about
+# 450 minutes, 570 with loadgen: celeris#725.) If the organization runs
+# short, gate pull request runs on the `performance` label. -benchtime=1s
+# instead of the runner's 3s default is what keeps a month inside the budget.
 name: CodSpeed
 
 on:
   push:
     branches: [main]
-    paths:
+    # One list for both events: the pull_request trigger below aliases it.
+    paths: &benchmark-paths
       - "*.go"
       - "celeristest/**"
-      - "internal/**"
+      - "internal/ctxkit/**"
       - "observe/**"
       - "protocol/**"
       - "middleware/*.go"
@@ -80,10 +145,8 @@ on:
       - "!mage*.go"
       - "!**/*_test.go"
       - "*bench*_test.go"
-      - "internal/**/*bench*_test.go"
       - "protocol/**/*bench*_test.go"
       - "protocol/detect/detect_test.go"
-      - "protocol/h2/stream/intern_test.go"
       - "protocol/h2/stream/stream_test.go"
       - "middleware/*bench*_test.go"
       - "middleware/logger/*bench*_test.go"
@@ -93,47 +156,10 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "*.go"
-      - "celeristest/**"
-      - "internal/**"
-      - "observe/**"
-      - "protocol/**"
-      - "middleware/*.go"
-      - "middleware/adapters/**"
-      - "middleware/circuitbreaker/**"
-      - "middleware/cors/**"
-      - "middleware/etag/**"
-      - "middleware/internal/**"
-      - "middleware/logger/**"
-      - "middleware/methodoverride/**"
-      - "middleware/pprof/**"
-      - "middleware/proxy/**"
-      - "middleware/ratelimit/**"
-      - "middleware/recovery/**"
-      - "middleware/redirect/**"
-      - "middleware/requestid/**"
-      - "middleware/rewrite/**"
-      - "middleware/secure/**"
-      - "middleware/singleflight/**"
-      - "middleware/static/**"
-      - "middleware/swagger/**"
-      - "middleware/timeout/**"
-      - "!mage*.go"
-      - "!**/*_test.go"
-      - "*bench*_test.go"
-      - "internal/**/*bench*_test.go"
-      - "protocol/**/*bench*_test.go"
-      - "protocol/detect/detect_test.go"
-      - "protocol/h2/stream/intern_test.go"
-      - "protocol/h2/stream/stream_test.go"
-      - "middleware/*bench*_test.go"
-      - "middleware/logger/*bench*_test.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/codspeed.yml"
+    paths: *benchmark-paths
   # Backtests: CodSpeed dispatches this to measure older commits, and it is
-  # the manual way to take a fresh baseline.
+  # the manual way to take a fresh baseline or to run a draft pull request's
+  # branch (gh workflow run codspeed.yml --ref <branch>).
   workflow_dispatch:
 
 permissions:
@@ -151,8 +177,10 @@ concurrency:
 jobs:
   benchmarks:
     name: Benchmarks (arm64 macro runner)
-    # Fork pull requests never reach a macro runner; drafts wait until they
-    # are marked ready (ready_for_review above), to save minutes.
+    # Skips fork pull requests (as this file is written; the approval policy
+    # in the header is what holds against a fork that edits it) and drafts,
+    # which wait until they are marked ready (ready_for_review above), to
+    # save minutes.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
@@ -184,4 +212,6 @@ jobs:
           # Pinned: a runner change can move every number, and 1.3.0 is the
           # first release that supports Go 1.27. Bump it deliberately.
           go-runner-version: "1.3.0"
-          run: go test -bench=. -benchtime=1s . ./protocol/... ./internal/... ./middleware ./middleware/logger
+          # The CodSpeed CLI writes this line to a script and runs it with
+          # bash, so the quoted pattern reaches go-runner as one argument.
+          run: go test -bench='^Benchmark([^I]|I[^n])' -benchtime=1s . ./protocol/... ./middleware ./middleware/logger

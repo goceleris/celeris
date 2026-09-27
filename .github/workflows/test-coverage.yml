@@ -4,14 +4,24 @@
 # (celeris#690). It is informational: codecov.yml marks every status
 # informational, and this workflow is not a required check.
 #
+# The package selection is a copy of ci.yml's, which this workflow cannot
+# share without editing ci.yml (see below). The "Same packages as ci.yml"
+# step fails when the two select different packages, so a change there has
+# to be made here too (celeris#725).
+#
 # It is a separate workflow rather than new steps in ci.yml on purpose:
 # ci.yml's unit steps are held by PASS-count interlocks and edited by
 # in-flight pull requests. The cost is that the unit suites run twice per
 # push; GitHub-hosted minutes are free for public repositories.
 #
 # What is NOT in the profile, and why (so a low number is read correctly):
-# ./test/... (integration/spec harness, not library code), ./adaptive/...
-# (needs raised memlock; ci.yml's `adaptive` job), and ./middleware/websocket.
+# ./test/... (integration/spec harness, not library code), ./adaptive/...,
+# and ./middleware/websocket. ./adaptive/... runs in ci.yml's `adaptive` job:
+# it needs memlock raised with sudo, and its switch tests are load- and
+# timing-bound, with RESULT-line tallies that the job checks. Instrumenting
+# them would risk what happened to websocket (next sentence) and add the
+# adaptive job's run time to every push, so they stay out of the profile,
+# and codecov.yml has no adaptive component (celeris#725).
 # ci.yml runs only websocket's backpressure tests on GitHub-hosted runners,
 # and those are timing-bound: under coverage instrumentation
 # TestBackpressurePauseDoesNotCancelInflightSend failed on both engines
@@ -45,8 +55,13 @@ jobs:
     name: Coverage (root + middleware sub-modules)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # A fork pull request gets no OIDC token; its uploads go tokenless instead
-    # (the use_oidc expression below), which Codecov accepts for public repos.
+    env:
+      # ci.yml's unit selection (see "Same packages as ci.yml" below).
+      COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
+    # A fork pull request gets no OIDC token. codecov-action (v7.1.1) sees the
+    # fork itself (head repository != this repository), skips OIDC even with
+    # use_oidc: true, and uploads tokenless, which Codecov accepts for public
+    # repositories.
     permissions:
       contents: read # checkout
       id-token: write # Codecov upload over OIDC, so no CODECOV_TOKEN secret is stored
@@ -58,12 +73,32 @@ jobs:
         with:
           go-version: "1.27.0"
 
+      # ci.yml's unit job takes `go list ./...` minus the pattern on its first
+      # `go list ./... | grep -vE '...'` line, and runs ./engine/iouring in a
+      # step of its own; this job runs all of them in one `go test`. The step
+      # fails, with the diff, when the two package sets differ.
+      - name: Same packages as ci.yml's unit job
+        run: |
+          set -o pipefail
+          ci_exclude=$(sed -nE "s/.*go list [.]\/[.][.][.] [|] grep -vE '([^']+)'.*/\1/p" .github/workflows/ci.yml | head -n 1)
+          if [ -z "$ci_exclude" ]; then
+            echo "::error::ci.yml has no \`go list ./... | grep -vE '...'\` line any more: re-derive COVER_EXCLUDE"
+            exit 1
+          fi
+          echo "ci.yml excludes:        $ci_exclude (+ ./engine/iouring in its own step)"
+          echo "test-coverage excludes: $COVER_EXCLUDE"
+          if ! diff <({ go list ./... | grep -vE "$ci_exclude"; go list ./engine/iouring; } | sort -u) \
+            <(go list ./... | grep -vE "$COVER_EXCLUDE" | sort -u); then
+            echo "::error::test-coverage.yml and ci.yml's unit job select different packages (diff above: < ci.yml, > this job)"
+            exit 1
+          fi
+
       - name: Root module (ci.yml unit package set)
         run: |
           # A `go list` failure must stop the job, not hand grep a partial list.
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)')
+          pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE")
           # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
           go test -race -count=1 -timeout=300s -covermode=atomic \
             -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
@@ -94,6 +129,10 @@ jobs:
           done
           exit "$fail"
 
+      # fail_ci_if_error: a failed upload turns this workflow red rather than
+      # leaving a stale number. During a Codecov outage that includes main.
+      # This workflow is not a required check, so nothing is blocked, but
+      # whoever sweeps main after a merge should expect it (celeris#725).
       - name: Upload root
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -102,7 +141,7 @@ jobs:
           name: root
           disable_search: true
           fail_ci_if_error: true
-          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          use_oidc: true
       - name: Upload middleware/compress
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -111,7 +150,7 @@ jobs:
           name: compress
           disable_search: true
           fail_ci_if_error: true
-          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          use_oidc: true
       - name: Upload middleware/metrics
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -120,7 +159,7 @@ jobs:
           name: metrics
           disable_search: true
           fail_ci_if_error: true
-          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          use_oidc: true
       - name: Upload middleware/otel
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -129,7 +168,7 @@ jobs:
           name: otel
           disable_search: true
           fail_ci_if_error: true
-          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          use_oidc: true
       - name: Upload middleware/protobuf
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -138,4 +177,4 @@ jobs:
           name: protobuf
           disable_search: true
           fail_ci_if_error: true
-          use_oidc: ${{ !github.event.pull_request.head.repo.fork }}
+          use_oidc: true
