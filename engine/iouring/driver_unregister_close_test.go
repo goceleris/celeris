@@ -1611,13 +1611,35 @@ func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T
 // and onClose not fired yet.
 //
 // Every one of those checks holds trivially for a close that does not linger,
-// so the test also proves it does: the socket is deeplyLingeringTCPSocket's
-// (a backlog the peer cannot absorb), and the close must still be in progress
-// (its goroutine has not queued driverActionClosed) half a second after dc.mu
-// was seen free; otherwise it fails as apparatus. A close that does not linger
-// returns in microseconds, and its goroutine queues the action at once; the
-// half second is for that goroutine to be scheduled, not for the close.
+// so each attempt also proves that its close did: the socket is
+// deeplyLingeringTCPSocket's (a backlog the peer cannot absorb), and the close
+// must still be in progress (its goroutine has not queued driverActionClosed)
+// half a second after dc.mu was seen free. A close that does not linger
+// returns in microseconds and its goroutine queues the action at once; the
+// half second is for that goroutine to be scheduled.
+//
+// Even a close that would linger can return early. In 4 of 60 runs of this
+// test the close returned within 15 ms with the socket still in FIN_WAIT1 and
+// its whole backlog queued, with Go's async preemption on or off; the kernel
+// leaves that wait early on a pending signal. Such an attempt proves nothing,
+// so the test tries again on a new socket, and fails as apparatus only when
+// no attempt's close lingers.
 func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
+	const attempts = 5
+	for i := 1; i <= attempts; i++ {
+		if opFDCloseAttempt(t, i) {
+			return
+		}
+	}
+	t.Fatalf("apparatus: the close did not linger in any of %d attempts", attempts)
+}
+
+// opFDCloseAttempt is one attempt of
+// TestDriverOpFDClosesOutsideItsLockAndOffTheWorker. It reports false when
+// its close did not linger; the checks that need the linger have then not
+// been made.
+func opFDCloseAttempt(t *testing.T, attempt int) (lingered bool) {
+	t.Helper()
 	const linger = 10 // seconds: the longest a broken close holds the test
 	fd, drain := deeplyLingeringTCPSocket(t, linger)
 	var st unix.Stat_t
@@ -1666,7 +1688,8 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 			break
 		}
 		if w.driverActionPending.Load() != 0 {
-			t.Fatal("apparatus: the close returned before it could be seen in progress: it did not linger")
+			t.Logf("celeris735 OPFD attempt=%d lingered=false (the close returned before it was seen in progress)", attempt)
+			return false
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the engine's descriptor was never closed")
@@ -1684,15 +1707,14 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	open, retiredFlag := dc.opFDOpen, dc.retired
 	dc.mu.Unlock()
 	// The checks above mean something only while the close lingers: its
-	// goroutine queues driverActionClosed when close(2) returns. Checking
-	// once, at once, is not enough: an immediate close can still be between
-	// its return and that enqueue (the check passed 2 of 3 runs with the
-	// linger off).
+	// goroutine queues driverActionClosed when close(2) returns.
 	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
 		if w.driverActionPending.Load() != 0 {
-			t.Fatal("apparatus: the close did not linger: it returned within half a second of dc.mu being probed")
+			t.Logf("celeris735 OPFD attempt=%d lingered=false (the close returned within half a second of dc.mu being probed)", attempt)
+			return false
 		}
 	}
+	t.Logf("celeris735 OPFD attempt=%d lingered=true", attempt)
 	if open || !retiredFlag {
 		t.Errorf("under dc.mu during the close: opFDOpen=%v retired=%v, want false and true", open, retiredFlag)
 	}
@@ -1713,4 +1735,5 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	if dc.onClose != nil {
 		t.Error("onClose still installed: it could fire twice")
 	}
+	return true
 }
