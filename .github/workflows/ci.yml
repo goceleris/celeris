@@ -466,6 +466,39 @@ jobs:
             echo "-- was one renamed or removed, did a sweep lose a case, or did one skip or fail?"
             exit 1
           fi
+      # celeris#714, #717, #718: the request values a detached stream keeps
+      # (WebSocket Conn.Query, SSE Last-Event-ID, a detached Context) must
+      # survive the engine receiving more bytes into the buffer they came
+      # from. The root race step above excludes ./middleware/websocket, and
+      # the other two tests would drop their io_uring arms without a word if
+      # the probe found no ring, which happens while another test binary's
+      # rings are still being freed. So all three run here by name, one
+      # package at a time, with CELERIS_REQUIRE_IOURING_WORKERS=1 turning a
+      # missing io_uring arm into a failure, and an exact tally: the three
+      # top-level tests and all 15 arms (6 of them io_uring) must PASS, with
+      # no SKIP line.
+      - name: celeris#714 captured request values (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c714.log
+          go test -race -count=1 -timeout=300s -v -run '^TestConnCapturedRequestValuesSurviveFrames$' ./middleware/websocket/ 2>&1 | tee -a /tmp/c714.log
+          go test -race -count=1 -timeout=300s -v -run '^TestClientLastEventIDSurvivesPeerBytes$' ./middleware/sse/ 2>&1 | tee -a /tmp/c714.log
+          go test -race -count=1 -timeout=300s -v -run '^TestDetachedContextKeepsRequestValues$' . 2>&1 | tee -a /tmp/c714.log
+          tests='TestConnCapturedRequestValuesSurviveFrames|TestClientLastEventIDSurvivesPeerBytes|TestDetachedContextKeepsRequestValues'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c714.log || true)
+          arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c714.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/io_uring" /tmp/c714.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c714.log || true)
+          echo "celeris#714 tests: top-level PASS $top (want 3), arm PASS $arms (want 15), io_uring arm PASS $uring (want 6), SKIP lines $skipped"
+          if [ "$top" -ne 3 ] || [ "$arms" -ne 15 ] || [ "$uring" -ne 6 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected all three tests and all 15 arms (6 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
