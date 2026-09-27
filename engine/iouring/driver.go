@@ -50,12 +50,20 @@ type driverConn struct {
 	closing   bool
 	recvArmed bool
 
-	// inflightOps counts submitted RECV/SEND SQEs that have not yet
-	// delivered a CQE. The kernel may still be reading into dc.buf or
-	// writing from dc.sendBuf while an op is in flight, so finalizeDriver
-	// must wait for the counter to hit zero before releasing dc to GC.
-	inflightOps  int
-	closePending bool // cancel-CQE arrived; waiting for in-flight ops to settle
+	// inflightOps counts the SQEs of this conn that the worker has prepared
+	// and whose CQE it has not yet processed: its RECV and SEND, and every
+	// ASYNC_CANCEL, UnregisterConn's and failDriverConn's alike. The kernel
+	// may still be reading into dc.buf or writing from dc.sendBuf while a
+	// RECV or SEND is in flight, and it resolves a cancel's descriptor
+	// number only when the worker submits it. So the conn is finalized, and
+	// retire closes opFD and releases dc to GC, only once the counter is
+	// zero (celeris#707).
+	inflightOps int
+	// cancels is the part of inflightOps that is cancels. A close CQE is
+	// this conn's own only while it is positive: user_data carries fd and
+	// no generation, so handleDriverClose ignores one that finds it zero.
+	cancels      int
+	closePending bool // set by failDriverConn or a cancel's CQE: finalize once inflightOps is zero
 	closeErr     error
 
 	// opFD is the engine's own descriptor for the socket: a duplicate of fd
@@ -84,9 +92,10 @@ type driverConn struct {
 
 // retire marks dc as gone from the worker and closes its descriptor, once.
 // Every path that removes dc from driverConns calls it, on the worker
-// goroutine: finalizeDriver (no op in flight), armDriverRecv's refusal (none
-// armed) and shutdownDrivers (after which nothing is submitted; closing the
-// ring cancels what is armed). Setting closing too makes a later
+// goroutine: finalizeDriver (no SQE in flight, cancels included),
+// armDriverRecv's refusal (within the contract only at the register, before
+// anything is issued) and shutdownDrivers (after which nothing is submitted;
+// closing the ring cancels what is armed). Setting closing too makes a later
 // UnregisterConn or Write a no-op, so neither queues work for a conn that is
 // gone, and every path that prepares an SQE checks closing first.
 func (dc *driverConn) retire() {
@@ -425,23 +434,29 @@ func (w *Worker) flushDriverSend(dc *driverConn) {
 // finalize teardown.
 func (w *Worker) cancelDriverConn(dc *driverConn) {
 	dc.mu.Lock()
-	retired := dc.retired
-	dc.mu.Unlock()
-	if retired {
+	if dc.retired {
 		// Finalized, refused or dropped while this action was queued:
-		// opFD is closed and its number may be reused. Issue nothing.
+		// opFD is closed, and its number may name another file by now,
+		// even a duplicate of a socket with ops armed on this ring (any
+		// dup in the process takes the lowest free number). Issue nothing.
+		dc.mu.Unlock()
 		return
 	}
 	sqe := w.ring.GetSQE()
 	if sqe == nil {
+		dc.mu.Unlock()
 		// Retry on the next event loop iteration.
 		w.addDriverAction(driverAction{kind: driverActionUnregister, dc: dc})
 		return
 	}
 	prepCancelFDDriver(sqe, dc.opFD)
 	setSQEUserData(sqe, encodeUserData(udDriverClose, dc.fd))
-	// If no in-flight ops, the ASYNC_CANCEL completes with -ENOENT and we
-	// still route through handleDriverClose to fire onClose and clean up.
+	// Counted until its CQE, like a RECV or SEND (celeris#707). If no op is
+	// in flight, the ASYNC_CANCEL completes with -ENOENT and still routes
+	// through handleDriverClose to fire onClose and clean up.
+	dc.inflightOps++
+	dc.cancels++
+	dc.mu.Unlock()
 }
 
 // handleDriverRecv processes a RECV CQE for a driver FD. On data, dispatches
@@ -544,9 +559,9 @@ func (w *Worker) handleDriverSend(c *completionEntry, fd int) {
 }
 
 // handleDriverClose processes the ASYNC_CANCEL CQE for a driver FD. If any
-// RECV/SEND ops are still in flight (the kernel is still holding dc.buf or
-// dc.sendBuf), defer finalize until their -ECANCELED CQEs arrive. Otherwise
-// finalize immediately.
+// other SQE of the conn is still in flight (a RECV or SEND the kernel may
+// still be holding dc.buf or dc.sendBuf for, or another cancel), defer
+// finalize until its CQE arrives. Otherwise finalize immediately.
 func (w *Worker) handleDriverClose(fd int) {
 	w.driverMu.RLock()
 	dc := w.driverConns[fd]
@@ -555,8 +570,19 @@ func (w *Worker) handleDriverClose(fd int) {
 		return
 	}
 	dc.mu.Lock()
+	if dc.cancels == 0 {
+		// Not a cancel of dc's. Every cancel is counted when it is
+		// prepared, and a conn is finalized only after all of its CQEs, so
+		// this one belongs to a conn that left the map without waiting for
+		// it, and dc holds its number now. Acting on it would close dc
+		// (celeris#707).
+		dc.mu.Unlock()
+		return
+	}
+	dc.cancels--
+	dc.inflightOps--
+	dc.closePending = true
 	if dc.inflightOps > 0 {
-		dc.closePending = true
 		// closeErr stays as whoever set it first: nil for a user-initiated
 		// cancel (UnregisterConn), the I/O error for failDriverConn.
 		dc.mu.Unlock()
@@ -590,10 +616,21 @@ func (w *Worker) failDriverConn(dc *driverConn, err error) {
 		dc.mu.Unlock()
 		// By opFD: this cancel is submitted later too, and a caller that
 		// unregisters and closes fd before then would make a cancel by fd
-		// miss (celeris#691).
+		// miss (celeris#691). Counted in flight until its CQE: it is
+		// prepared during CQE processing, and the conn's other op can
+		// complete later in the same batch. Uncounted, that op's CQE
+		// finalized the conn and retire closed opFD with this cancel still
+		// unsubmitted, so the kernel resolved a number the engine had
+		// closed, and the cancel's own CQE reached whatever conn was
+		// registered on fd next (celeris#707). getCancelSQE can submit, so
+		// it runs outside dc.mu.
 		if sqe := w.getCancelSQE(); sqe != nil {
 			prepCancelFDDriver(sqe, dc.opFD)
 			setSQEUserData(sqe, encodeUserData(udDriverClose, dc.fd))
+			dc.mu.Lock()
+			dc.inflightOps++
+			dc.cancels++
+			dc.mu.Unlock()
 		}
 		return
 	}
