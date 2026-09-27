@@ -441,7 +441,7 @@ func TestAcceptOfANumberAHijackReleasedIsOrderedAfterTheHijack(t *testing.T) {
 		t.Fatalf("epoll_create1: %v", err)
 	}
 	t.Cleanup(func() { _ = unix.Close(epfd) })
-	lfd, err := createListenSocket("127.0.0.1:0")
+	lfd, err := createListenSocket("127.0.0.1:0", true)
 	if err != nil {
 		t.Fatalf("listen socket: %v", err)
 	}
