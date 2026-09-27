@@ -1611,10 +1611,12 @@ func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T
 // and onClose not fired yet.
 //
 // Every one of those checks holds trivially for a close that does not linger,
-// so the test first proves it does: the socket is deeplyLingeringTCPSocket's
+// so the test also proves it does: the socket is deeplyLingeringTCPSocket's
 // (a backlog the peer cannot absorb), and the close must still be in progress
-// (its goroutine has not queued driverActionClosed) after dc.mu was seen free;
-// otherwise it fails as apparatus.
+// (its goroutine has not queued driverActionClosed) half a second after dc.mu
+// was seen free; otherwise it fails as apparatus. A close that does not linger
+// returns in microseconds, and its goroutine queues the action at once; the
+// half second is for that goroutine to be scheduled, not for the close.
 func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	const linger = 10 // seconds: the longest a broken close holds the test
 	fd, drain := deeplyLingeringTCPSocket(t, linger)
@@ -1682,9 +1684,14 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	open, retiredFlag := dc.opFDOpen, dc.retired
 	dc.mu.Unlock()
 	// The checks above mean something only while the close lingers: its
-	// goroutine queues driverActionClosed when close(2) returns.
-	if w.driverActionPending.Load() != 0 {
-		t.Fatal("apparatus: the close did not linger: it returned before dc.mu was probed")
+	// goroutine queues driverActionClosed when close(2) returns. Checking
+	// once, at once, is not enough: an immediate close can still be between
+	// its return and that enqueue (the check passed 2 of 3 runs with the
+	// linger off).
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if w.driverActionPending.Load() != 0 {
+			t.Fatal("apparatus: the close did not linger: it returned within half a second of dc.mu being probed")
+		}
 	}
 	if open || !retiredFlag {
 		t.Errorf("under dc.mu during the close: opFDOpen=%v retired=%v, want false and true", open, retiredFlag)
