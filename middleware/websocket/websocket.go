@@ -119,10 +119,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		// Capture request metadata before upgrade. On the native engines
 		// reqHeaders is the stream's own header slice, and Context.Detach
 		// (in tryEngineUpgrade) replaces its entries with clones in place,
-		// so the Conn never keeps a header view. captureQuery has no such
-		// help and clones for itself (celeris#714).
+		// so the Conn never keeps a header view.
 		reqHeaders := c.RequestHeaders()
-		queryParams := captureQuery(c)
 		acceptKey := computeAcceptKey(wsKey)
 
 		// Try engine-integrated path first (native engines: epoll/io_uring).
@@ -131,6 +129,13 @@ func New(config ...Config) celeris.HandlerFunc {
 		// immediately to free the event loop.
 		ws, done := tryEngineUpgrade(c, acceptKey, subproto, readBufSize, readLimit, compress,
 			cfg.MaxBackpressureBuffer, cfg.BackpressureHighPct, cfg.BackpressureLowPct)
+
+		// The query is captured only now (celeris#714). On the engine path
+		// tryEngineUpgrade has detached, and Detach copied the raw query and
+		// any query already parsed from it, so the pairs are copies without
+		// cloning them again. On the hijack path nothing has been hijacked
+		// yet, and captureQuery clones them itself.
+		queryParams := captureQuery(c, ws == nil)
 
 		if ws != nil {
 			// Engine path: populate conn and run handler in goroutine.
@@ -326,25 +331,34 @@ func setupConn(ws *Conn, cfg *Config, compress bool,
 	ws.writePool = cfg.WriteBufferPool
 }
 
-// captureQuery copies the upgrade request's query parameters for
-// [Conn.Query]. Every key and value is cloned: on epoll and io_uring the
-// raw query is a view of the engine's receive buffer, and url.ParseQuery
-// returns substrings of it for anything it did not have to unescape. A view
-// is safe to compare while the request is being handled and unsafe to keep
-// after it, and the Conn keeps these for the connection's lifetime while the
-// engine receives the WebSocket frames into that same buffer: kept as views,
-// they read back as frame bytes, or a lookup no longer finds its key
-// (celeris#714). One copy per upgrade; nothing per message.
-func captureQuery(c *celeris.Context) [][2]string {
+// captureQuery returns the upgrade request's query parameters for
+// [Conn.Query]. On epoll and io_uring the raw query is a view of the engine's
+// receive buffer, and url.ParseQuery returns substrings of it for anything it
+// did not have to unescape. A view is safe to compare while the request is
+// being handled and unsafe to keep after it, and the Conn keeps these for the
+// connection's lifetime while the engine receives the WebSocket frames into
+// that same buffer: kept as views, they read back as frame bytes, or a lookup
+// no longer finds its key (celeris#714).
+//
+// So the pairs must be copies. After Context.Detach they are (Detach copies
+// the raw query and the parsed query cache), and clone is false. Before it,
+// clone is true and every key and value is cloned: one copy per upgrade,
+// nothing per message.
+func captureQuery(c *celeris.Context, clone bool) [][2]string {
 	qp := c.QueryParams()
 	if len(qp) == 0 {
 		return nil
 	}
 	result := make([][2]string, 0, len(qp))
 	for k, vs := range qp {
-		k = strings.Clone(k)
+		if clone {
+			k = strings.Clone(k)
+		}
 		for _, v := range vs {
-			result = append(result, [2]string{k, strings.Clone(v)})
+			if clone {
+				v = strings.Clone(v)
+			}
+			result = append(result, [2]string{k, v})
 		}
 	}
 	return result
