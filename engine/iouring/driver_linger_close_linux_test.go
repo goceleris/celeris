@@ -153,6 +153,27 @@ func lingeringDriver(t *testing.T, w *Worker, linger int) (fd int, drain func(),
 	return fd, drain, closed, dc.opFD, id
 }
 
+// unregisterAndCloseInOrder does what every in-tree driver does, UnregisterConn
+// and then its own close of fd, with the worker parked in between (p), so the
+// worker finalizes the conn only after the caller's close. The engine's
+// duplicate is then the socket's last reference, and the engine's close does
+// the lingering release. Unparked, the worker can win that race: its close
+// then drops a reference, returns at once, and the caller's close lingers on
+// the caller's goroutine instead (1 in 4 runs of the m8 shape, and on CI).
+func unregisterAndCloseInOrder(t *testing.T, p *workerPark, wl interface{ UnregisterConn(int) error }, fd int) {
+	t.Helper()
+	p.park()
+	if err := wl.UnregisterConn(fd); err != nil {
+		p.release()
+		t.Fatalf("UnregisterConn: %v", err)
+	}
+	if err := unix.Close(fd); err != nil {
+		p.release()
+		t.Fatalf("close the caller's fd: %v", err)
+	}
+	p.release()
+}
+
 // waitFinalized waits until the worker has finalized fd's conn: it has left
 // the driver map, so the close of the engine's duplicate has begun.
 func waitFinalized(t *testing.T, w *Worker, fd int) {
@@ -179,6 +200,8 @@ func TestDriverLingeringCloseDoesNotStallTheWorker(t *testing.T) {
 			w, wl := e.workers[0], e.WorkerLoop(0)
 			v := registerSettledDriver(t, w, wl)
 			defer v.unregisterAndWait(t, wl)
+			p := newWorkerPark(t, w, wl)
+			defer p.d.unregisterAndWait(t, wl)
 
 			fd, drain, closed, opFD, id := lingeringDriver(t, w, tc.linger)
 			drained := false
@@ -187,10 +210,7 @@ func TestDriverLingeringCloseDoesNotStallTheWorker(t *testing.T) {
 					drain()
 				}
 			}()
-			if err := wl.UnregisterConn(fd); err != nil {
-				t.Fatalf("UnregisterConn: %v", err)
-			}
-			_ = unix.Close(fd)
+			unregisterAndCloseInOrder(t, p, wl, fd)
 			waitFinalized(t, w, fd)
 			finalized := time.Now()
 			// The issue's probe: give the worker the cancel and the start of
@@ -255,11 +275,9 @@ func TestDriverShutdownWaitsForAHandedOffClose(t *testing.T) {
 	e, stop := startTestEngine(t)
 	t.Cleanup(stop) // idempotent; the test calls it itself below
 	w, wl := e.workers[0], e.WorkerLoop(0)
+	p := newWorkerPark(t, w, wl)
 	fd, drain, closed, opFD, id := lingeringDriver(t, w, 2)
-	if err := wl.UnregisterConn(fd); err != nil {
-		t.Fatalf("UnregisterConn: %v", err)
-	}
-	_ = unix.Close(fd)
+	unregisterAndCloseInOrder(t, p, wl, fd)
 	waitFinalized(t, w, fd)
 
 	stopped := make(chan struct{})

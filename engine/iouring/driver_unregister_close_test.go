@@ -1671,17 +1671,18 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 	}
 	closed := make(chan error, 1)
 	dc := &driverConn{fd: fd, opFD: fd, opFDOpen: true, onClose: func(err error) { closed <- err }}
-	w := &Worker{} // closeOpFD needs only the driver-action queue and driverClosers
+	// finalizeDriver needs only the driver map, the driver-action queue and
+	// driverClosers; no loop runs, so nothing fires a queued onClose but
+	// waitDriverCloses below.
+	w := &Worker{driverConns: map[int]*driverConn{fd: dc}}
+	w.hasDriverConns.Store(true)
 
-	// finalizeDriver's order, without the map: retire, then closeOpFD. Both
-	// return at once however long the close lingers.
-	handed := make(chan bool, 1)
+	// finalizeDriver returns at once however long the close lingers, and does
+	// not fire onClose itself: the close has not returned.
+	finalized := make(chan struct{})
 	go func() {
-		ok := dc.retire()
-		if ok {
-			w.closeOpFD(dc, nil)
-		}
-		handed <- ok
+		w.finalizeDriver(dc, nil)
+		close(finalized)
 	}()
 	drained := false
 	defer func() {
@@ -1691,12 +1692,15 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 		w.waitDriverCloses()
 	}()
 	select {
-	case ok := <-handed:
-		if !ok {
-			t.Fatal("retire did not hand the close of an open opFD to its caller")
-		}
+	case <-finalized:
 	case <-time.After(2 * time.Second):
-		t.Fatal("retire or closeOpFD waited for the lingering close")
+		t.Fatal("finalizeDriver waited for the lingering close")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("finalizeDriver fired onClose (%v) before the engine's close of the socket returned: a driver "+
+			"must see the socket closed before onClose (engine/provider.go)", err)
+	default:
 	}
 
 	// Wait for close(2) to start: the number is released, or reissued to
@@ -1710,11 +1714,6 @@ func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
 			t.Fatal("the engine's descriptor was never closed")
 		}
 		time.Sleep(time.Millisecond)
-	}
-	select {
-	case err := <-closed:
-		t.Fatalf("apparatus: onClose (%v) fired while the close should still linger: it did not linger", err)
-	default:
 	}
 	// The close lingers for up to 10 s; a lock free within 2 s is not held
 	// across it.
