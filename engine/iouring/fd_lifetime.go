@@ -197,14 +197,31 @@ func (w *Worker) handleTransplantReap(c *completionEntry, fd int) {
 // finishAsyncTransplant, anything else through tryTransplant. A promoted conn
 // whose goroutine is running again owns itself and claims its own hand-off at
 // its next park.
+//
+// One owner per hand-off (celeris#657 A6), as in tryTransplant: a goroutine
+// that has claimed its hand-off (transplantPending) has exited too, so
+// asyncRun alone reads "not running", but the conn belongs to that claim
+// until drainDetachQueue takes it off the queue and runs
+// finishAsyncTransplant itself. The goroutine enqueues the claim only after
+// releasing asyncInMu, so a retry can run between the two, and a reap can
+// land before the queue is drained. Acting then handed the conn off with its
+// claim still set, and the claim's drain found the slot empty and counted a
+// double claim for a conn moved once (celeris#758). Leaving the conn to its
+// claim is ordering, counted as TransplantClaimDeferred.
 func (w *Worker) rerunHandOff(fd int, cs *connState) {
 	if w.async && cs.asyncPromoted.Load() {
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
+		claimed := cs.transplantPending.Load()
 		cs.asyncInMu.Unlock()
-		if !running {
-			w.finishAsyncTransplant(cs)
+		if running {
+			return
 		}
+		if claimed {
+			w.handoffLoss.noteClaimDeferred()
+			return
+		}
+		w.finishAsyncTransplant(cs)
 		return
 	}
 	w.tryTransplant(fd)

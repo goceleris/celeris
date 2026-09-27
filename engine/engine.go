@@ -552,9 +552,9 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// worker's own path that found the connection's async dispatch
 	// goroutine had already claimed the hand-off, and left it to that claim.
 	// It is ordering, not a fault: it fires whenever a completion of the
-	// connection lands between the goroutine's park and the worker's drain
-	// of the claim. A rate. io_uring-only; on the adaptive engine the sum
-	// over both sub-engines.
+	// connection, or a retry of its hand-off, lands between the goroutine's
+	// park and the worker's drain of the claim. A rate. io_uring-only; on
+	// the adaptive engine the sum over both sub-engines.
 	TransplantClaimDeferred uint64
 	// TransplantReapFailed counts hand-off recv cancels (TransplantReaps)
 	// whose completion was neither a hit nor a miss, for example -EINVAL
