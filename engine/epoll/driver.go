@@ -145,9 +145,14 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 	return nil
 }
 
-// UnregisterConn removes fd from this worker's interest set and schedules
-// the onClose callback (with a nil error) to fire on the next worker
-// iteration. The fd itself is NOT closed — the driver owns its lifetime.
+// UnregisterConn removes fd from this worker's interest set and fires the
+// onClose callback (with a nil error) on the caller's goroutine before it
+// returns, unless the conn was already closed. The fd itself is NOT closed —
+// the driver owns its lifetime.
+//
+// Once UnregisterConn has returned, the worker reads fd no more, even when
+// it is inside the conn's read loop at the time (celeris#710): every read
+// checks, under dc.mu, the closed flag this sets under dc.mu.
 func (l *Loop) UnregisterConn(fd int) error {
 	l.driverMu.Lock()
 	dc, ok := l.driverConns[fd]
