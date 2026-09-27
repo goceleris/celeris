@@ -27,9 +27,16 @@ import (
 // Start call waited for the drain.
 //
 // Each case holds one request in its handler, starts the shutdown, and asks
-// three things: had the handler finished when the first hook started, had the
-// hook started before the call that shut the server down returned, and did the
-// client get the whole response.
+// four things: had the handler finished when the first hook started, had the
+// hook started before the call that shut the server down returned, did the
+// client get the whole response, and, when a direct Shutdown stopped the
+// server, did the Start call return only after that Shutdown's hook had
+// returned (a main that exits when Start returns must not lose its hooks).
+//
+// The h2c cases send the request over HTTP/2 (prior knowledge) to the native
+// engines, on a route that is not async, so its handler runs on the
+// connection's worker. std's h2c streams and async-route HTTP/2 streams run
+// outside the drain and are not asserted here (celeris#759).
 //
 // The order is forced, not raced. The handler returns only when the test
 // releases it, and the test releases it as soon as a hook starts or the
@@ -39,7 +46,9 @@ import (
 // Shutdown that waits cannot reach its hooks until releaseAfter has passed and
 // the handler has returned. releaseAfter only has to be longer than it takes
 // Shutdown to get from its first line to its hook loop when nothing makes it
-// wait, which is microseconds.
+// wait, which is microseconds. The hook, in turn, holds until the Start call
+// returns or holdHook has passed, so a Start that does not wait for the
+// Shutdown that stopped it returns while the hook is held, every time.
 //
 // It is also the deadlock check for the fix. The Start*Context watcher runs
 // the cancel's Shutdown, and that Shutdown now waits for Listen; had it waited
@@ -66,7 +75,17 @@ func TestShutdownHooksRunAfterTheDrain(t *testing.T) {
 	for _, ec := range engines {
 		for _, mode := range modes {
 			t.Run(ec.name+"/"+mode.String(), func(t *testing.T) {
-				runDrainOrderCase(t, ec.eng, ec.async, mode, releaseAfter)
+				runDrainOrderCase(t, ec.eng, ec.async, false, mode, releaseAfter)
+			})
+		}
+	}
+	for _, ec := range engines {
+		if ec.eng == celeris.Std {
+			continue // celeris#759: std's h2c streams are not drained
+		}
+		for _, mode := range modes {
+			t.Run("h2c-"+ec.name+"/"+mode.String(), func(t *testing.T) {
+				runDrainOrderCase(t, ec.eng, ec.async, true, mode, releaseAfter)
 			})
 		}
 	}
@@ -77,7 +96,18 @@ const (
 	// callCap703, so a call that waits out its budget fails the case.
 	shutdownBudget703 = 30 * time.Second
 	callCap703        = 10 * time.Second
+	// holdHook703 is how long the hook holds when the Start call does not
+	// return while it runs, which is what a correct Start does.
+	holdHook703 = 200 * time.Millisecond
 )
+
+// h2cDrainOrderClient speaks prior-knowledge cleartext HTTP/2 and nothing
+// else.
+func h2cDrainOrderClient() *http.Client {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Protocols: p}}
+}
 
 // waitDrainOrderReady polls /ping until the server answers 200, or returns
 // the error its start returned first.
@@ -130,12 +160,12 @@ func (m drainOrderMode) String() string {
 	return "unknown"
 }
 
-func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mode drainOrderMode, releaseAfter time.Duration) {
+func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c bool, mode drainOrderMode, releaseAfter time.Duration) {
 	t.Helper()
 	// One sequence for every event, so the order is read from numbers, not
 	// from clocks. Zero means "has not happened".
-	var seq, handlerDone, hookStart, callReturn atomic.Int64
-	var hookSawHandlerDone atomic.Bool
+	var seq, handlerDone, hookStart, hookEnd, callReturn, startReturn atomic.Int64
+	var hookSawHandlerDone, startReturnedDuringHook atomic.Bool
 	var t0 atomic.Pointer[time.Time]
 	since := func() time.Duration {
 		if p := t0.Load(); p != nil {
@@ -149,10 +179,11 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 	release := make(chan struct{})
 	hookStarted := make(chan struct{})
 
-	// build makes the server for one start attempt. The default worker
-	// count: the drain is over only when every worker has stopped, and the
-	// request in flight is on one of them.
-	build := func(addr string) *celeris.Server {
+	// build makes the server for one start attempt; startReturned is closed
+	// when that attempt's Start call returns. The default worker count: the
+	// drain is over only when every worker has stopped, and the request in
+	// flight is on one of them.
+	build := func(addr string, startReturned <-chan struct{}) *celeris.Server {
 		s := celeris.New(celeris.Config{
 			Engine:          engType,
 			AsyncHandlers:   async,
@@ -175,6 +206,12 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 			hookStartAt.Store(int64(since()))
 			hookStart.Store(seq.Add(1))
 			close(hookStarted)
+			select {
+			case <-startReturned:
+				startReturnedDuringHook.Store(true)
+			case <-time.After(holdHook703):
+			}
+			hookEnd.Store(seq.Add(1))
 		})
 		return s
 	}
@@ -204,15 +241,20 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 				t.Fatalf("close probe listener: %v", cerr)
 			}
 		}
-		s = build(addr)
+		startReturned := make(chan struct{})
+		s = build(addr, startReturned)
 		startDone = make(chan error, 1)
 		go func(s *celeris.Server, ln net.Listener, done chan<- error) {
+			var err error
 			switch mode {
 			case drainDirectAfterStartWithListener:
-				done <- s.StartWithListener(ln)
+				err = s.StartWithListener(ln)
 			default:
-				done <- s.StartWithContext(ctx)
+				err = s.StartWithContext(ctx)
 			}
+			startReturn.Store(seq.Add(1))
+			close(startReturned)
+			done <- err
 		}(s, ln, startDone)
 		err = waitDrainOrderReady(addr, startDone)
 		if err == nil {
@@ -234,15 +276,22 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 		body   string
 		err    error
 	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	if h2c {
+		client = h2cDrainOrderClient()
+	}
 	res := make(chan result, 1)
 	go func() {
-		resp, gerr := (&http.Client{Timeout: 15 * time.Second}).Get("http://" + addr + "/slow")
+		resp, gerr := client.Get("http://" + addr + "/slow")
 		if gerr != nil {
 			res <- result{err: gerr}
 			return
 		}
 		body, rerr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		if rerr == nil && h2c && resp.ProtoMajor != 2 {
+			rerr = fmt.Errorf("the h2c client got HTTP/%d.%d", resp.ProtoMajor, resp.ProtoMinor)
+		}
 		res <- result{status: resp.StatusCode, body: string(body), err: rerr}
 	}()
 	select {
@@ -319,9 +368,13 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 	}
 
 	ms := func(ns int64) float64 { return float64(ns) / 1e6 }
-	t.Logf("RESULT engine=%s async=%v mode=%s handler_done_ms=%.1f hook_start_ms=%.1f call_return_ms=%.1f order(handler,hook,call)=(%d,%d,%d) response=%d/%q err=%v",
-		engType, async, mode, ms(handlerDoneAt.Load()), ms(hookStartAt.Load()), ms(callReturnAt.Load()),
-		handlerDone.Load(), hookStart.Load(), callReturn.Load(), r.status, r.body, r.err)
+	proto := "h1"
+	if h2c {
+		proto = "h2c"
+	}
+	t.Logf("RESULT engine=%s async=%v proto=%s mode=%s handler_done_ms=%.1f hook_start_ms=%.1f call_return_ms=%.1f order(handler,hook,call)=(%d,%d,%d) hook_end=%d start_return=%d response=%d/%q err=%v",
+		engType, async, proto, mode, ms(handlerDoneAt.Load()), ms(hookStartAt.Load()), ms(callReturnAt.Load()),
+		handlerDone.Load(), hookStart.Load(), callReturn.Load(), hookEnd.Load(), startReturn.Load(), r.status, r.body, r.err)
 
 	if !hookSawHandlerDone.Load() {
 		t.Errorf("%s/%s: the OnShutdown hook started while the request was still in its handler (celeris#703: hooks must run after the drain)", engType, mode)
@@ -334,5 +387,11 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async bool, mod
 	}
 	if r.err != nil || r.status != http.StatusOK || r.body != "done" {
 		t.Errorf("%s/%s: the in-flight request got status %d body %q err %v, want 200 %q", engType, mode, r.status, r.body, r.err, "done")
+	}
+	if startReturnedDuringHook.Load() {
+		t.Errorf("%s/%s: the Start call returned (event %d) while the OnShutdown hook was still running (it ended at event %d): a main that exits when Start returns loses its hooks", engType, mode, startReturn.Load(), hookEnd.Load())
+	}
+	if he, sr := hookEnd.Load(), startReturn.Load(); he == 0 || sr < he {
+		t.Errorf("%s/%s: the Start call returned (event %d) before the OnShutdown hook returned (event %d)", engType, mode, sr, he)
 	}
 }

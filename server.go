@@ -97,18 +97,30 @@ type Server struct {
 	directShutdown  bool
 	watcherShutdown chan struct{}
 	watcherErr      error
+	// directShutdownDone is made, under lifecycleMu, by the first direct
+	// Shutdown call before it does anything else, and closed when that call
+	// returns. listen waits for it after Listen has returned, so a Start*
+	// call that a direct Shutdown stopped returns only after that Shutdown,
+	// OnShutdown hooks included, as it does after a cancel (celeris#703).
+	directShutdownDone chan struct{}
 
 	// listenDone is closed when the Listen call of the Start* entry point
-	// that published the engine returns, which on every engine is when the
-	// drain is over: on epoll and io_uring Listen returns only after its
-	// workers have closed their connections and joined async dispatch, on
-	// std and adaptive after Engine.Shutdown's drain. Shutdown waits for it
-	// before it runs the OnShutdown hooks (celeris#703), and the
-	// Start*Context watcher wakes on it. publishEngine makes it together
-	// with the engine, so a Shutdown that loads a non-nil engine always
-	// finds it: every published engine is followed by exactly one Listen
-	// (see listen). Written once, before engineRef is stored, and only read
-	// after engineRef is loaded non-nil, so the atomic orders it.
+	// that published the engine returns. Shutdown waits for it before it
+	// runs the OnShutdown hooks (celeris#703), and the Start*Context watcher
+	// wakes on it. What is over by then depends on the engine. On epoll and
+	// io_uring the drain runs in Listen, which returns only after its
+	// workers have closed their connections and joined async dispatch, so
+	// every handler they run has returned; see Shutdown for what that does
+	// not cover. On std, Listen returns when Serve does, as soon as
+	// Engine.Shutdown has closed the listener, at the start of its drain;
+	// Shutdown waits here only after its own Engine.Shutdown call, which is
+	// that drain, has returned. On adaptive, Engine.Shutdown waits for the
+	// adaptive Listen, which returns after its sub-engines' Listen calls.
+	// publishEngine makes it together with the engine, so a Shutdown that
+	// loads a non-nil engine always finds it: every published engine is
+	// followed by exactly one Listen (see listen). Written once, before
+	// engineRef is stored, and only read after engineRef is loaded non-nil,
+	// so the atomic orders it.
 	listenDone chan struct{}
 
 	notFoundHandler         HandlerFunc
@@ -262,14 +274,16 @@ func (s *Server) OnError(handler func(c *Context, err error)) *Server {
 // Hooks fire in registration order with the shutdown context. Must be
 // called before Start.
 //
-// When cancelling the context of [Server.StartWithContext] or
-// [Server.StartWithListenerAndContext] is what shuts the server down, the
-// hooks run before that call returns: it waits for the Shutdown the cancel
-// triggers, hooks included. A hook must therefore not wait for that Start
-// call to return, directly or through anything that happens only after it
-// returns. The two would wait on each other: a hook that returns when its ctx
-// is done ends the wait after [Config.ShutdownTimeout], and a hook that
-// ignores ctx never does.
+// The hooks run before the Start* call that served the server returns,
+// whatever shut it down: a Start* call waits for the direct [Server.Shutdown]
+// call that stopped it, and [Server.StartWithContext] and
+// [Server.StartWithListenerAndContext] wait for the Shutdown a cancel of their
+// context triggers, hooks included (celeris#703). A hook must therefore not
+// wait for that Start call to return, directly or through anything that
+// happens only after it returns. The two would wait on each other: a hook
+// that returns when its ctx is done ends the wait when that ctx is done
+// ([Config.ShutdownTimeout] after a cancel), and a hook that ignores ctx never
+// does.
 func (s *Server) OnShutdown(fn func(ctx context.Context)) *Server {
 	s.shutdownHooks = append(s.shutdownHooks, fn)
 	return s
@@ -398,6 +412,11 @@ func (s *Server) prepare() (engine.Engine, error) {
 // the engine returns an error. Use StartWithContext for context-based lifecycle
 // management.
 //
+// When [Server.Shutdown] stops it, Start returns only after that Shutdown call
+// has returned, [Server.OnShutdown] hooks included, so a main that exits when
+// Start returns does not cut the hooks short (celeris#703). A hook must
+// therefore not wait for Start to return; see [Server.OnShutdown].
+//
 // Returns ErrAlreadyStarted if called more than once. May also return
 // configuration validation errors or engine initialization errors.
 func (s *Server) Start() error {
@@ -410,11 +429,29 @@ func (s *Server) Start() error {
 
 // listen runs eng.Listen for every Start* entry point, under the context
 // listenContext derives from parent, and closes listenDone when it returns.
+// Then, if a direct Shutdown call has begun, it waits for that call to
+// return, so the Start* call returns after the OnShutdown hooks on every
+// engine (celeris#703). The defers run in reverse: listenDone is closed
+// before the wait, and it is all that Shutdown waits for, so the two never
+// wait on each other.
 func (s *Server) listen(parent context.Context, eng engine.Engine) error {
+	defer s.waitDirectShutdown()
 	defer close(s.listenDone)
 	ctx, cancel := s.listenContext(parent)
 	defer cancel()
 	return eng.Listen(ctx)
+}
+
+// waitDirectShutdown waits for the first direct Shutdown call to return, if
+// one has begun. A hook that waits for the Start* call to return would wait
+// for itself: see [Server.OnShutdown].
+func (s *Server) waitDirectShutdown() {
+	s.lifecycleMu.Lock()
+	done := s.directShutdownDone
+	s.lifecycleMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // publishEngine installs eng as the running engine, together with the
@@ -469,7 +506,20 @@ func (s *Server) cancelListen() {
 // returned. If ctx is done first, the hooks still run, with ctx, and Shutdown
 // returns ctx's error. Because it waits for the requests in flight, a handler
 // that calls Shutdown and waits for it waits for itself until ctx is done:
-// call it from another goroutine (celeris#703).
+// call it from another goroutine (celeris#703). The Start* call that the
+// server was started with returns only after Shutdown has returned.
+//
+// The drain waits for every HTTP/1.1 request, and on epoll, io_uring and
+// adaptive for every HTTP/2 stream whose handler runs on the connection's
+// worker. It does not wait for an HTTP/2 stream on an async route (marked
+// Async, or promoted to async under [Config.AsyncHandlers]), which runs on
+// the shared HTTP/2 worker pool, nor on std for any h2c stream: the hooks can
+// run while such a handler is still running, and on the native engines its
+// response is lost (celeris#759). On epoll, and on adaptive while it runs
+// epoll, the drain ends when the handlers have returned, and a connection is
+// then closed without flushing what the socket has not taken yet: a response
+// larger than the socket buffers, to a client that reads slowly, loses its
+// tail (celeris#760).
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the
@@ -487,8 +537,13 @@ func (s *Server) cancelListen() {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.lifecycleMu.Lock()
 	claimed := s.watcherShutdown
+	var done chan struct{}
 	if claimed == nil {
 		s.directShutdown = true
+		if s.directShutdownDone == nil {
+			done = make(chan struct{})
+			s.directShutdownDone = done
+		}
 	}
 	s.lifecycleMu.Unlock()
 	if claimed != nil {
@@ -498,6 +553,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if done != nil {
+		// The Start* call this stops waits for it (see listen).
+		defer close(done)
 	}
 	return s.shutdown(ctx)
 }
@@ -519,11 +578,14 @@ func (s *Server) shutdown(ctx context.Context) error {
 	// and io_uring Engine.Shutdown is a no-op and the drain runs in Listen
 	// once cancelListen has cancelled its context, so without this wait the
 	// hooks ran, and Shutdown returned, while requests were still being
-	// handled. On std and adaptive Engine.Shutdown has already drained and
-	// Listen returns at once. Deadlock check: Listen waits for nothing that
-	// Shutdown holds or does after this point, and the Start*Context watcher
-	// that runs this on a cancel waits here for Listen, never for the Start
-	// call, which waits for the watcher only after Listen has returned.
+	// handled. On std, Engine.Shutdown was the drain and Listen returned when
+	// it closed the listener; on adaptive, Engine.Shutdown waited for its own
+	// Listen. Either way Listen has returned, or returns at once. Deadlock
+	// check: Listen waits for nothing that Shutdown holds or does after this
+	// point. The Start*Context watcher that runs this on a cancel waits here
+	// for Listen, never for the Start call. The Start call waits for the
+	// watcher, and for a direct Shutdown, only after Listen has returned and
+	// listenDone is closed (see listen).
 	if werr := s.waitListen(ctx); err == nil {
 		err = werr
 	}
@@ -918,6 +980,9 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 // serving on ln's port across the switch. [Config.Addr] is ignored in favour
 // of ln's address.
 //
+// As with [Server.Start], when [Server.Shutdown] stops it, StartWithListener
+// returns only after that Shutdown call has returned, hooks included.
+//
 // Returns [ErrAlreadyStarted] if called more than once.
 func (s *Server) StartWithListener(ln net.Listener) error {
 	eng, err := s.prepareWithListener(ln)
@@ -930,8 +995,9 @@ func (s *Server) StartWithListener(ln net.Listener) error {
 // StartWithListenerAndContext combines [Server.StartWithListener] and
 // [Server.StartWithContext]. When the context is canceled, the server shuts
 // down gracefully using [Config.ShutdownTimeout], and this call returns once
-// that shutdown, including the [Server.OnShutdown] hooks, has finished. A hook
-// must therefore not wait for this call to return; see [Server.OnShutdown].
+// that shutdown, including the [Server.OnShutdown] hooks, has finished; so it
+// does when a direct [Server.Shutdown] stops it. A hook must therefore not
+// wait for this call to return; see [Server.OnShutdown].
 func (s *Server) StartWithListenerAndContext(ctx context.Context, ln net.Listener) error {
 	eng, err := s.prepareWithListener(ln)
 	if err != nil {
@@ -1029,8 +1095,9 @@ func InheritListener(envVar string) (net.Listener, error) {
 // StartWithContext starts the server with the given context for lifecycle management.
 // When the context is canceled, the server shuts down gracefully using
 // Config.ShutdownTimeout (default 30s), and StartWithContext returns once that
-// shutdown, including the [Server.OnShutdown] hooks, has finished. A hook must
-// therefore not wait for StartWithContext to return; see [Server.OnShutdown].
+// shutdown, including the [Server.OnShutdown] hooks, has finished; so it does
+// when a direct [Server.Shutdown] stops it. A hook must therefore not wait for
+// StartWithContext to return; see [Server.OnShutdown].
 //
 // Returns ErrAlreadyStarted if called more than once. May also return
 // configuration validation errors or engine initialization errors.

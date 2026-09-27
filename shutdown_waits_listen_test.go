@@ -170,3 +170,88 @@ func TestShutdownWaitForListenIsBoundedByCtx(t *testing.T) {
 		t.Fatal("listen did not return after Listen did")
 	}
 }
+
+// TestStartReturnsOnlyAfterADirectShutdownReturns: a Start* call that a
+// direct Shutdown stopped returns only once that Shutdown has returned, its
+// OnShutdown hooks included, as it does after a cancel of its context. Once
+// Shutdown waited for Listen (celeris#703), the close of listenDone woke the
+// Start call and Shutdown's wait at the same moment, and the hooks ran after
+// Start had returned: a main that exits when Start returns lost them, on
+// every engine.
+//
+// The order is forced: the hook holds until the Start call returns, or until
+// holdHook has passed. A Start that does not wait for the Shutdown returns
+// while the hook is held, every time; one that waits cannot return until the
+// hook has given up and returned.
+//
+// It is also the deadlock check for that wait. listen closes listenDone,
+// which is all Shutdown waits for, before it waits for Shutdown; the other
+// order would leave the two waiting on each other forever (Shutdown's ctx
+// here has no deadline), and the case fails at its 10 s bound instead.
+func TestStartReturnsOnlyAfterADirectShutdownReturns(t *testing.T) {
+	const holdHook = 200 * time.Millisecond
+	cases := []struct {
+		name string
+		run  func(s *Server, eng *teardownEngine) error
+	}{
+		{"Start", func(s *Server, eng *teardownEngine) error {
+			return s.listen(context.Background(), eng)
+		}},
+		{"StartWithContext", func(s *Server, eng *teardownEngine) error {
+			return s.listenUntilCancelled(context.Background(), eng)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{Engine: Std, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			eng := newTeardownEngine()
+			startReturned := make(chan struct{})
+			var hookRuns atomic.Int32
+			var returnedDuringHook atomic.Bool
+			s.OnShutdown(func(context.Context) {
+				hookRuns.Add(1)
+				select {
+				case <-startReturned:
+					returnedDuringHook.Store(true)
+				case <-time.After(holdHook):
+				}
+			})
+			s.publishEngine(eng)
+
+			var runErr error
+			go func() {
+				runErr = tc.run(s, eng)
+				close(startReturned)
+			}()
+			<-eng.listening
+
+			direct := make(chan error, 1)
+			go func() { direct <- s.Shutdown(context.Background()) }()
+			<-eng.cancelled
+			close(eng.release)
+
+			select {
+			case err := <-direct:
+				if err != nil {
+					t.Errorf("Shutdown: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the direct Shutdown did not return within 10s of Listen's release: it and the Start call wait on each other")
+			}
+			select {
+			case <-startReturned:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s did not return within 10s of the Shutdown that stopped it", tc.name)
+			}
+			if runErr != nil {
+				t.Errorf("%s returned %v, want nil", tc.name, runErr)
+			}
+			if n := hookRuns.Load(); n != 1 {
+				t.Errorf("the hook ran %d times, want 1", n)
+			}
+			if returnedDuringHook.Load() {
+				t.Errorf("%s returned while the OnShutdown hook of the Shutdown that stopped it was still running (celeris#703)", tc.name)
+			}
+		})
+	}
+}
