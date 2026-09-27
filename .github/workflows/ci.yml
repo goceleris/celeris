@@ -271,12 +271,15 @@ jobs:
       #
       # `-run` is a regex over test names, so a rename would quietly select
       # nothing and go test would still exit 0 ("no tests to run"). The tally
-      # below is the interlock, as in the `iouring` job: exactly these four
+      # below is the interlock, as in the `iouring` job: exactly these six
       # regression tests must report PASS at the top level -- the two
-      # celeris#667 orderings, the celeris#672 stale pause, and the pausedMu
-      # panic release -- and so must each of the seven subtests of the last
-      # two, so a capacity or a callback site dropped from a sweep turns the
-      # step red too. A SKIP cannot satisfy it, because a skipped test prints
+      # celeris#667 orderings, the celeris#672 stale pause, the pausedMu
+      # panic release, SetPauser's ordering with the worker (reported only
+      # under -race, which this step runs), and the WakeFD lock order
+      # (celeris#666) -- and so must each of the ten subtests of the stale
+      # pause, the panic release and the lock order, so a capacity, a callback
+      # site or an interleaving dropped from a sweep turns the step red too.
+      # A SKIP cannot satisfy it, because a skipped test prints
       # `--- SKIP`, never `--- PASS`. PASS lines carry the elapsed time after
       # the name, so the pattern ends at ` (`, never at the name.
       #
@@ -295,10 +298,10 @@ jobs:
           go test -race -count=1 -timeout=300s -v \
             -run '^(TestBackpressure|TestChanReader)' \
             ./middleware/websocket/... 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu'
-          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)'
-          want=4
-          wantsub=7
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu'
+          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)'
+          want=6
+          wantsub=10
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)
           echo "celeris#667/#672 regression tests: want $want, passed $passed; subtests want $wantsub, passed $subpassed"
