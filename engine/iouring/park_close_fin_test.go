@@ -19,6 +19,8 @@ package iouring
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -27,9 +29,47 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
+
+// startParkEngine712 is startFDLEngine with its ring ENOMEM retried
+// (startRingRetried662): at CI's 8 MiB memlock the kernel gives a closed
+// ring's pages back 12-23 ms after the close, so an engine started right
+// after another ring closed can fail on memory nothing holds any more. No
+// probe dial: the engine is idle when it returns.
+func startParkEngine712(t *testing.T, h stream.Handler, mut func(*resource.Config)) (*Engine, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	e, cancel, done := startRingRetried662(t, func() (*Engine, error) {
+		cfg := resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: 2},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		if mut != nil {
+			mut(&cfg)
+		}
+		return New(cfg, h)
+	})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("engine did not stop within 5s")
+		}
+	})
+	t.Logf("celeris657 engine workers=%d", e.NumWorkers())
+	return e, addr
+}
 
 // asyncFdlHandler is fdlHandler with every route async: the engine then runs
 // AsyncHandlers, every HTTP/1 connection gets a detachMu, and closes go
@@ -93,7 +133,7 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	if async {
 		h = asyncFdlHandler{}
 	}
-	e, addr := startFDLEngine(t, h, func(c *resource.Config) {
+	e, addr := startParkEngine712(t, h, func(c *resource.Config) {
 		// No TCP_DEFER_ACCEPT, so no pause linger (celeris#662): the
 		// listeners close as PauseAccept is called, well inside the
 		// connection's deadline, and the close lands on a worker that has
@@ -122,9 +162,9 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	}
 	if !parkWait712(3*time.Second, func() bool {
 		m := e.Metrics()
-		return m.ActiveConnections == 0 && m.AcceptCount >= 1 && m.AcceptCount == m.CloseCount
+		return m.ActiveConnections == 0 && m.AcceptCount == m.CloseCount
 	}) {
-		t.Fatalf("celeris712 PREMISE: startFDLEngine's probe connection is still live")
+		t.Fatalf("celeris712 PREMISE: the engine is not idle")
 	}
 	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
