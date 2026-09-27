@@ -142,6 +142,16 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 		t.Fatalf("celeris712 PREMISE: the connection was never accepted")
 	}
 	if park {
+		if readTimeout {
+			// A paused worker with no drain set waits up to 1 s on its
+			// ring and runs checkTimeouts every 32nd iteration, so its
+			// ReadTimeout close can come half a minute late. A drain caps
+			// the wait at the sweep's cadence: the adaptive standby's
+			// shape, and a close within a few seconds.
+			tgt := &fdlTarget{}
+			e.StartTransplant(tgt)
+			defer e.StopTransplant()
+		}
 		if err := e.PauseAccept(); err != nil {
 			t.Fatalf("pause: %v", err)
 		}
@@ -215,7 +225,8 @@ func TestParkedWorkerSendsFINForAHeaderTimeoutClose(t *testing.T) {
 }
 
 // TestParkedWorkerSendsFINForAReadTimeoutClose: the same, with checkTimeouts'
-// ReadTimeout branch as the close.
+// ReadTimeout branch as the close, on a draining worker (a transplant set, as
+// on the adaptive standby).
 func TestParkedWorkerSendsFINForAReadTimeoutClose(t *testing.T) { finAfterClose(t, true, true, false) }
 
 // TestRunningWorkerSendsFINForAHeaderTimeoutClose is the control: the same
