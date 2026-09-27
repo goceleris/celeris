@@ -69,6 +69,8 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 		kind := kind
 		t.Run(kind.String(), func(t *testing.T) {
 			rig := newWSORig()
+			h3Before := h3Netstat()
+			t.Logf("H3DIAG kind=%s nodrain=%t", kind, h3NoDrain)
 			var ecanceled, otherWriteErr, protoErr atomic.Int64
 			// protoErr counts every read error that is not a close, so on its
 			// own it cannot distinguish a frame the engine mis-delivered from
@@ -208,6 +210,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 					}
 					cl.mark("flood end wrote=%d", wrote)
 					cl.sample(c, "flood end")
+					cl.h3Seg(t, c, kind.String(), "floodEnd")
 					buf := make([]byte, 64<<10)
 					// Complete the current frame so the wire is a whole number of frames,
 					// waiting on progress and reading while it waits. A conn the server
@@ -256,6 +259,7 @@ func TestBackpressurePauseDoesNotCancelInflightSend(t *testing.T) {
 				}()
 			}
 			wg.Wait()
+			h3NetstatDelta(t, kind.String(), h3Before)
 
 			t.Logf("%s: clientMisaligned=%d framesSent=%d (if misaligned>0 the client truncated; if 0 while protocol errors>0 the engine mis-delivered)",
 				kind, clientMisaligned.Load(), framesSent.Load())

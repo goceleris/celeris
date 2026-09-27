@@ -662,7 +662,9 @@ func (cl *wsoCli) write(c net.Conn, site string, buf, dbuf []byte) wsoWrite {
 			w.err, w.reason = err, "cap"
 			break
 		}
-		w.drained += wsoDrainNow(c, dbuf)
+		if !h3NoDrain { // DIAGNOSTIC switch (tmp/b2b-h3-diag)
+			w.drained += wsoDrainNow(c, dbuf)
+		}
 	}
 	_ = c.SetWriteDeadline(time.Time{})
 	w.left = len(buf)
