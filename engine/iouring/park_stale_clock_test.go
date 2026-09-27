@@ -175,3 +175,35 @@ func TestAcceptAfterAShortParkIsNotTimedOut(t *testing.T) {
 func TestAdoptAfterAShortParkIsNotTimedOut(t *testing.T) {
 	staleClockAfterPark(t, 100*time.Millisecond, true)
 }
+
+// TestAdoptionIsStampedWithTheTimeItWasAdopted is the same rule without the
+// park, on a worker whose clock is stale for any other reason: cachedNow is
+// refreshed only every 64th CQE-bearing iteration and by checkTimeouts, so a
+// draining worker waiting out 1 s ring waits can hold a clock tens of seconds
+// old. Injected here directly: an hour. The adopted connection's lastActivity
+// must be the time of the adoption, or checkTimeouts reads the hour as idle
+// time.
+func TestAdoptionIsStampedWithTheTimeItWasAdopted(t *testing.T) {
+	f := newFDLFixture(t, false)
+	w := f.w
+	fd, peer := socketPairFDs(t)
+	t.Cleanup(func() { _ = unix.Close(peer) })
+	_ = unix.SetNonblock(fd, true)
+	if fd >= len(w.conns) {
+		t.Fatalf("celeris713 PREMISE: fd %d is past the fixture's table (%d)", fd, len(w.conns))
+	}
+	t0 := time.Now().UnixNano()
+	w.cachedNow = t0 - int64(time.Hour)
+	w.attachAdoptedFD(fd, engine.Carryover{RemoteAddr: "127.0.0.1:1"})
+	cs := w.conns[fd]
+	if cs == nil {
+		t.Fatalf("celeris713 PREMISE: the adoption was refused")
+	}
+	age := time.Duration(t0 - cs.lastActivity)
+	t.Logf("celeris713 adopt stamp: lastActivity is %v before the adoption began (worker clock %v stale)",
+		age, time.Duration(t0-w.cachedNow))
+	if cs.lastActivity < t0 {
+		t.Errorf("celeris713 STALE: an adopted connection's lastActivity is %v before its adoption: it was "+
+			"stamped from the worker's cached clock, and checkTimeouts reads that as idle time", age)
+	}
+}
