@@ -179,12 +179,7 @@ func (r *chanReader) Append(chunk []byte) bool {
 	// behind it. Append is the only producer, so an empty spill observed
 	// here cannot become non-empty before the channel send below.
 	if r.spillLen.Load() > 0 {
-		if !r.spillChunk(chunk) {
-			r.closeWith(ErrReadLimit)
-			return false
-		}
-		r.requestPause()
-		return true
+		return r.queueBehind(chunk)
 	}
 
 	select {
@@ -200,21 +195,36 @@ func (r *chanReader) Append(chunk []byte) bool {
 		// engine's in-flight burst outran the headroom (celeris#484).
 		// Spill rather than discard — these bytes are already off the
 		// socket, so dropping them would truncate a healthy stream.
-		if !r.spillChunk(chunk) {
-			r.closeWith(ErrReadLimit)
-			return false
-		}
-		r.requestPause()
-		return true
+		return r.queueBehind(chunk)
 	}
+}
+
+// queueBehind is Append for a chunk that could not simply take the channel's
+// tail: the channel was full, or chunks were already spilled. It queues the
+// chunk with spillChunk and poisons the reader with ErrReadLimit when the
+// spill is full too. It requests the pause when the chunk spilled, and
+// otherwise (spillChunk's retry put it in the channel, which the handler had
+// drained in the meantime) only when the channel is at highWater, exactly as
+// Append's channel path does: a chunk that sits below highWater in a drained
+// channel is no reason to pause the engine.
+func (r *chanReader) queueBehind(chunk []byte) bool {
+	spilled, ok := r.spillChunk(chunk)
+	if !ok {
+		r.closeWith(ErrReadLimit)
+		return false
+	}
+	if spilled || len(r.ch) >= r.highWater {
+		r.requestPause()
+	}
+	return true
 }
 
 // spillChunk queues chunk behind everything already buffered and accounts
 // for it: into the channel when nothing is spilled and the channel has room,
-// otherwise at the tail of the spill. Returns false when the spill is also
-// full, which is the genuine read-limit condition: the peer has outrun both
-// the channel and a full extra channel of spill. Both counters live here so
-// they cannot diverge between Append's two spill paths.
+// otherwise at the tail of the spill. spilled reports which. ok is false when
+// the spill is also full, which is the genuine read-limit condition: the peer
+// has outrun both the channel and a full extra channel of spill. Both counters
+// live here so they cannot diverge between Append's two spill paths.
 //
 // The channel is tried again, under spillMu, because Append's select found it
 // full some time before this runs (celeris#705). In between, the handler may
@@ -225,7 +235,7 @@ func (r *chanReader) Append(chunk []byte) bool {
 // promoteSpill both run under spillMu, so whichever runs second sees what the
 // first did: either this send finds the room the handler made, or the
 // handler, before it blocks, finds the chunk in the spill.
-func (r *chanReader) spillChunk(chunk []byte) bool {
+func (r *chanReader) spillChunk(chunk []byte) (spilled, ok bool) {
 	r.spillMu.Lock()
 	if len(r.spill) == 0 {
 		// Nothing is spilled, so every buffered chunk is in the channel and
@@ -233,20 +243,20 @@ func (r *chanReader) spillChunk(chunk []byte) bool {
 		select {
 		case r.ch <- chunk:
 			r.spillMu.Unlock()
-			return true
+			return false, true
 		default:
 		}
 	}
 	if r.spillMax <= 0 || len(r.spill) >= r.spillMax {
 		r.spillMu.Unlock()
 		r.dropped.Add(1)
-		return false
+		return false, false
 	}
 	r.spill = append(r.spill, chunk)
 	r.spillLen.Store(int64(len(r.spill)))
 	r.spillMu.Unlock()
 	r.spilled.Add(1)
-	return true
+	return true, true
 }
 
 // requestPause asks the engine to suspend inbound delivery, edge-triggered

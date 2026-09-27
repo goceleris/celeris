@@ -62,8 +62,8 @@ func lateSpillPauser(r *chanReader) *atomic.Bool {
 //     here; the chunk it carries is the one step 4 spills);
 //  3. the handler drains the channel through the real Read, and its next
 //     Read parks on the empty channel;
-//  4. the rest of that Append's default branch runs: spillChunk, then
-//     requestPause.
+//  4. the rest of that Append's default branch runs: queueBehind, which
+//     queues the chunk with spillChunk and then decides the pause.
 //
 // Only the gap between steps 2 and 4 is manufactured. The park is observed,
 // not slept on: inside a synctest bubble, synctest.Wait returns once the
@@ -71,14 +71,26 @@ func lateSpillPauser(r *chanReader) *atomic.Bool {
 // channels is.
 //
 // The oracle: the parked Read returns the late chunk, and the engine is not
-// left paused with nothing buffered.
+// left paused with nothing buffered. Nor is the engine asked to pause for that
+// chunk at all: spillChunk's retry puts it in the channel the handler drained,
+// below highWater, which is no reason to pause, as on Append's channel path. A
+// pause requested there is lifted at once by the celeris#672 re-check, so it
+// only cost the engine a pause and a resume (two detach-queue appends and a
+// wake) for nothing (review of PR #730).
 func TestChanReaderLateSpillReachesParkedRead(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newChanReader(8, 0, 0) // highWater 6, lowWater 2, spillMax 8
 		// Released on every exit, so a Read still parked cannot outlive the
 		// bubble; a no-op once the Read has returned.
 		defer r.closeWith(io.EOF)
-		desired := lateSpillPauser(r)
+		// The engine's recvPauseDesired (Swap-based in both engines), and a
+		// count of the callbacks.
+		var desired atomic.Bool
+		var pauses, resumes atomic.Uint32
+		r.SetPauser(
+			func() { pauses.Add(1); desired.Swap(true) },
+			func() { resumes.Add(1); desired.Swap(false) },
+		)
 
 		// Step 1.
 		for i := range cap(r.ch) {
@@ -108,10 +120,10 @@ func TestChanReaderLateSpillReachesParkedRead(t *testing.T) {
 		}
 
 		// Step 4.
-		if !r.spillChunk([]byte{'S'}) {
-			t.Fatal("harness: spillChunk rejected the late chunk")
+		pausesBefore, resumesBefore := pauses.Load(), resumes.Load()
+		if !r.queueBehind([]byte{'S'}) {
+			t.Fatal("harness: queueBehind rejected the late chunk")
 		}
-		r.requestPause()
 		synctest.Wait()
 
 		select {
@@ -129,6 +141,11 @@ func TestChanReaderLateSpillReachesParkedRead(t *testing.T) {
 		if desired.Load() || readerPaused(r) {
 			t.Fatalf("engine left paused (engine=%v reader=%v) with nothing buffered (depth %d, spill %d)",
 				desired.Load(), readerPaused(r), len(r.ch), r.spillLen.Load())
+		}
+		if p, q := pauses.Load()-pausesBefore, resumes.Load()-resumesBefore; p != 0 || q != 0 {
+			t.Fatalf("the late chunk went into the drained channel, below highWater %d, and still cost "+
+				"the engine %d pause(s) and %d resume(s): a chunk that did not spill needs a pause only "+
+				"at highWater", r.highWater, p, q)
 		}
 	})
 }
@@ -155,7 +172,8 @@ func TestChanReaderLateSpillReachesParkedRead(t *testing.T) {
 //	    <the handler drains the channel through Read>
 //	spillLen is published; unlock
 //
-// and then the rest of Append: requestPause.
+// and then the rest of Append: the pause request queueBehind makes for a chunk
+// that spilled.
 func TestChanReaderSpillPublishedAfterDrain(t *testing.T) {
 	// window runs the steps above up to the unlock, calling during() inside
 	// the window after the drain. It returns the desired-pause mirror.
@@ -513,8 +531,8 @@ func TestChanReaderPauseRecheckHoldsWhileSpilled(t *testing.T) {
 	if r.closed.Load() || r.spillLen.Load() == 0 {
 		t.Fatal("harness: Append would not take its spill path")
 	}
-	if !r.spillChunk([]byte{'d'}) {
-		t.Fatal("harness: spillChunk rejected 'd' below spillMax")
+	if spilled, ok := r.spillChunk([]byte{'d'}); !ok || !spilled {
+		t.Fatalf("harness: spillChunk did not spill 'd' below spillMax (spilled=%v ok=%v)", spilled, ok)
 	}
 	// The handler's Read takes its chunk off the channel (the statement Read
 	// runs first; the handler's next Read does the promotion this one would
@@ -555,5 +573,62 @@ func TestChanReaderPauseRecheckHoldsWhileSpilled(t *testing.T) {
 	if desired.Load() || readerPaused(r) || pauses.Load() != 1 || resumes.Load() != 1 {
 		t.Fatalf("want the one pause lifted once, and nothing paused, after the drain: engine=%v "+
 			"reader=%v pauses=%d resumes=%d", desired.Load(), readerPaused(r), pauses.Load(), resumes.Load())
+	}
+}
+
+// TestChanReaderSpillRequestsPauseBelowHighWater pins the other half of
+// queueBehind's pause decision: a chunk that spills requests the pause even
+// when the channel alone is below highWater. The spilled chunks are buffered
+// as surely as the ones in the channel, so the true depth is above highWater
+// whenever anything is spilled, and the engine must stop delivering.
+//
+// The state is the one TestChanReaderPauseRecheckHoldsWhileSpilled reaches,
+// with public configuration and an ordering the upgrade allows: the channel
+// fills and a chunk spills before SetPauser installs the callbacks, so no
+// pause could fire; the handler takes a chunk off the channel; and then a real
+// Append queues its chunk behind the spill. The channel holds 1 chunk, below
+// highWater 2, and the spill 2.
+func TestChanReaderSpillRequestsPauseBelowHighWater(t *testing.T) {
+	r := newChanReader(2, 100, 50) // highWater 2, lowWater 1, spillMax 2
+	for _, c := range []byte("abc") {
+		if !r.Append([]byte{c}) {
+			t.Fatalf("harness: Append(%q) rejected", c)
+		}
+	}
+	var desired atomic.Bool
+	var pauses atomic.Uint32
+	r.SetPauser(func() { pauses.Add(1); desired.Swap(true) }, func() { desired.Swap(false) })
+	// The handler's Read takes a chunk off the channel (the statement Read runs
+	// first; the promotion after it has not run yet).
+	first := <-r.ch
+	if len(r.ch) != 1 || r.spillLen.Load() != 1 || readerPaused(r) {
+		t.Fatalf("harness: want depth 1, 1 spilled and no pause, got %d, %d, paused=%v",
+			len(r.ch), r.spillLen.Load(), readerPaused(r))
+	}
+
+	if !r.Append([]byte{'d'}) {
+		t.Fatal("harness: Append('d') rejected below spillMax")
+	}
+	if r.spillLen.Load() != 2 {
+		t.Fatalf("harness: want 'd' spilled behind 'c', got %d spilled", r.spillLen.Load())
+	}
+	if pauses.Load() != 1 || !desired.Load() || !readerPaused(r) {
+		t.Fatalf("a chunk spilled with the channel at depth %d (highWater %d) and %d chunk(s) spilled, "+
+			"and the engine was asked to pause %d time(s) (engine=%v reader=%v): a spilled chunk must "+
+			"request the pause", len(r.ch), r.highWater, r.spillLen.Load(), pauses.Load(),
+			desired.Load(), readerPaused(r))
+	}
+
+	// The stream still arrives whole and in order.
+	got := append([]byte(nil), first...)
+	buf := make([]byte, 1)
+	for len(got) < 4 {
+		if n, err := r.Read(buf); err != nil || n != 1 {
+			t.Fatalf("read: n=%d err=%v (got %q so far)", n, err, got)
+		}
+		got = append(got, buf[0])
+	}
+	if string(got) != "abcd" {
+		t.Fatalf("stream = %q, want %q", got, "abcd")
 	}
 }
