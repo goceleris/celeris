@@ -84,38 +84,3 @@ func BenchmarkParseRequest_Pipelined(b *testing.B) {
 		}
 	}
 }
-
-func BenchmarkFindHeaderEnd(b *testing.B) {
-	sizes := []int{64, 256, 1024, 4096}
-	for _, size := range sizes {
-		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
-			// Place \r\n\r\n at the end
-			buf := make([]byte, size)
-			for i := range buf {
-				buf[i] = 'A'
-			}
-			copy(buf[size-4:], "\r\n\r\n")
-			b.SetBytes(int64(size))
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				findHeaderEnd(buf)
-			}
-		})
-	}
-}
-
-func BenchmarkFindHeaderEnd_8K(b *testing.B) {
-	size := 8192
-	buf := make([]byte, size)
-	for i := range buf {
-		buf[i] = 'A'
-	}
-	copy(buf[size-4:], "\r\n\r\n")
-	b.SetBytes(int64(size))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		findHeaderEnd(buf)
-	}
-}
