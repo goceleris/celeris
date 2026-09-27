@@ -398,7 +398,9 @@ func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 
 // Closing fd before UnregisterConn is outside the contract. When the number
 // has been reused by then, the engine must not act on the socket that now
-// holds it: the duplicate would name that socket, and is refused.
+// holds it. Its own descriptor still names the unregistered socket, so the
+// cancel reaches that socket, and the socket closes when the conn is
+// finalized.
 func TestDriverCloseBeforeUnregisterSparesReusedNumber(t *testing.T) {
 	e, stop := startTestEngine(t)
 	t.Cleanup(stop)
@@ -419,13 +421,7 @@ func TestDriverCloseBeforeUnregisterSparesReusedNumber(t *testing.T) {
 	}
 	p.release()
 	v.expectReceives(t, "the socket that took the number closed before UnregisterConn")
-
-	// The unregistered conn cannot be cancelled (no descriptor names its
-	// socket), but it is finalized once its armed RECV completes.
-	a.closePeer()
-	if fired, _ := a.waitClosed(); !fired {
-		t.Error("closed before UnregisterConn: onClose never fired after the peer closed")
-	}
+	a.expectReleased(t, "Close, number reused, then UnregisterConn")
 	_ = unix.Close(a.fd) // v's second number
 	v.unregisterAndWait(t, wl)
 	p.d.unregisterAndWait(t, wl)
@@ -489,7 +485,7 @@ func expectSameFDTable(t *testing.T, before, after map[int]string, sockets map[s
 		len(before), len(after), strings.Join(added, " "), strings.Join(gone, " "))
 }
 
-// Every path that ends a driver conn must close the duplicate it may hold:
+// Every path that ends a driver conn must close the engine's descriptor:
 // N cycles of each, and the process holds exactly the descriptors it held
 // before, none of them naming a cycle's socket.
 func TestDriverUnregisterCyclesReleaseDescriptors(t *testing.T) {
@@ -534,7 +530,7 @@ func TestDriverUnregisterCyclesReleaseDescriptors(t *testing.T) {
 			d.expectReleased(t, "same-batch")
 			d.closePeer()
 		})
-		// The peer closes first: finalized on EOF, no duplicate taken.
+		// The peer closes first: finalized on EOF, before any unregister.
 		cycle("peer-eof", i, false, func(d *testDriver) {
 			settleDriverRecv(t, w, d.fd)
 			d.closePeer()
@@ -546,7 +542,7 @@ func TestDriverUnregisterCyclesReleaseDescriptors(t *testing.T) {
 			}
 			_ = unix.Close(d.fd)
 		})
-		// A SEND failure takes the duplicate on the worker.
+		// A SEND failure cancels on the worker, before the unregister.
 		cycle("send-failure", i, false, func(d *testDriver) {
 			settleDriverRecv(t, w, d.fd)
 			p.park()
@@ -557,8 +553,8 @@ func TestDriverUnregisterCyclesReleaseDescriptors(t *testing.T) {
 			d.expectReleased(t, "send-failure")
 			d.closePeer()
 		})
-		// armDriverRecv refuses the register after UnregisterConn took the
-		// duplicate.
+		// armDriverRecv refuses the register with an UnregisterConn queued
+		// behind it.
 		cycle("refused", i, true, func(d *testDriver) {
 			fd := d.fd
 			_ = wl.UnregisterConn(fd)
@@ -640,8 +636,8 @@ func TestDriverShutdownReleasesDescriptors(t *testing.T) {
 // stops and after one worker exits mid-run (Worker.shutdown), and a driver
 // that reconnects registers on it: the redis Pub/Sub reconnect loop does,
 // after onClose(errEngineShutdown). shutdownDrivers runs once, so a conn
-// registered after it is never retired, and the duplicate its UnregisterConn
-// took would hold the socket open for the life of the process. RegisterConn
+// registered after it is never retired, and the engine's duplicate of its
+// descriptor would hold the socket open for the life of the process. RegisterConn
 // refuses there, as the epoll engine and the drivers' standalone loop do.
 // The caller below goes on to unregister and close whatever RegisterConn
 // said, as a driver whose handshake then times out does: its close must
