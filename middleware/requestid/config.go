@@ -25,8 +25,10 @@ type Config struct {
 	// context.Context via context.WithValue, making it available to
 	// downstream code that only has access to context.Context (e.g.,
 	// database drivers, gRPC interceptors). This adds one allocation
-	// per request. Default: false (request ID stored only in celeris
-	// Context store).
+	// per request, and a second when the ID comes from the request
+	// header: that ID is copied, because the context can outlive the
+	// request (a detached WebSocket or SSE stream keeps it). Default:
+	// false (request ID stored only in celeris Context store).
 	EnableStdContext bool
 }
 

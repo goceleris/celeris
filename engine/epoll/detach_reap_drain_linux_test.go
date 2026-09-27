@@ -28,7 +28,7 @@ func newReapLoop(t *testing.T) *Loop {
 	return &Loop{
 		epollFD:      epfd,
 		conns:        make([]*connState, connTableSize),
-		liveConns:    make([]int, 0, 4),
+		liveConns:    make([]*connState, 0, 4),
 		activeConns:  &atomic.Int64{},
 		closeCount:   &atomic.Uint64{},
 		acceptCount:  &atomic.Uint64{},

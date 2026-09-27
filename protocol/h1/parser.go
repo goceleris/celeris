@@ -86,7 +86,7 @@ func (p *Parser) ParseRequest(req *Request) (int, error) {
 		return 0, nil
 	}
 
-	// No upfront whole-block findHeaderEnd scan: parseHeaders detects an
+	// No upfront whole-block CRLFCRLF scan: parseHeaders detects an
 	// incomplete block itself (a final line with no CRLF yields lineEnd==-1 →
 	// (false,nil)), and every caller Reset()s parser+req before re-parsing, so
 	// a partial parse is always retried cleanly. Scanning here first would

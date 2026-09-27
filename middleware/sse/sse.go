@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -349,8 +350,14 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Next()
 		}
 
-		// Extract Last-Event-ID before Detach materializes headers.
-		lastEventID := c.Header("last-event-id")
+		// Last-Event-ID is kept in the Client for the whole stream, so it is
+		// cloned. On epoll and io_uring c.Header returns a view of the
+		// engine's receive buffer: safe to compare while the request is
+		// handled, unsafe to keep after it. Context.Detach below clones the
+		// stream's header slice, not a string already read out of it, and
+		// the engine keeps receiving into that buffer on a detached
+		// connection.
+		lastEventID := strings.Clone(c.Header("last-event-id"))
 
 		sw := c.StreamWriter()
 		if sw == nil {
