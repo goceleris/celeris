@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,8 +362,13 @@ func TestDriverSendFailureThenUnregisterThenClose(t *testing.T) {
 
 // A register that armDriverRecv refuses (an HTTP conn took the number first)
 // leaves the conn retired, with an UnregisterConn already queued behind it.
-// That unregister must issue nothing: by the time it runs, the number may
-// name another socket. Before celeris#691 it cancelled that socket's ops.
+// That unregister must issue nothing. By the time it runs, retire has closed
+// the engine's descriptor, and its number may name another file: any dup in
+// the process takes the lowest free number, and a dup of a socket with ops
+// armed on this ring is that socket to a cancel. Here A's onClose, which
+// runs on the worker right after retire, puts V's socket on the number; a
+// cancel issued behind it would cancel V's RECV. The caller's number is
+// reused too, as it was before celeris#691, when the cancel named it.
 func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 	e, stop := startTestEngine(t)
 	t.Cleanup(stop)
@@ -371,8 +378,20 @@ func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 	p := newWorkerPark(t, w, wl)
 
 	p.park()
-	a := newTestDriver(t, wl) // queued behind the park
+	// Queued behind the park. opFD is read before the worker can apply the
+	// register, and A's onClose reads it after: the park orders the two.
+	a := &testDriver{closed: make(chan error, 1)}
+	a.fd, a.peer = nonblockSocketPair(t)
 	defer a.closePeer()
+	opFD := -1
+	var dupErr error
+	if err := wl.RegisterConn(a.fd, func([]byte) {}, func(err error) {
+		dupErr = unix.Dup3(v.fd, opFD, unix.O_CLOEXEC)
+		a.closed <- err
+	}); err != nil {
+		t.Fatalf("RegisterConn(A): %v", err)
+	}
+	opFD = driverConnOf(w, a.fd).opFD
 	if err := wl.UnregisterConn(a.fd); err != nil {
 		t.Fatalf("UnregisterConn: %v", err)
 	}
@@ -383,16 +402,256 @@ func TestDriverRefusedRegisterThenNumberReused(t *testing.T) {
 		t.Fatalf("dup3: %v", err)
 	}
 	p.release()
-	if fired, err := a.waitClosed(); !fired || err == nil {
+	fired, err := a.waitClosed()
+	if !fired || err == nil {
 		t.Errorf("the refused register: onClose fired=%v with %v, want an error", fired, err)
 	}
-	v.expectReceives(t, "the socket that took the refused conn's number")
+	if fired && dupErr != nil {
+		t.Fatalf("dup3 onto the engine's closed number %d: %v", opFD, dupErr)
+	}
+	// Whatever the drain prepared behind the refusal is submitted at the top
+	// of the worker's next iteration: let that happen before V's byte.
+	time.Sleep(100 * time.Millisecond)
+	v.expectReceives(t, "the socket put on the refused conn's numbers")
 
 	p.park()
 	p.onWorker(func() { w.conns[fd] = nil })
 	p.release()
 	_ = unix.Close(a.fd) // v's second number
+	if fired {
+		_ = unix.Close(opFD) // v's third
+	}
 	v.unregisterAndWait(t, wl)
+	p.d.unregisterAndWait(t, wl)
+}
+
+// failDriverConn runs during CQE processing, and the cancel it prepares is
+// submitted at the top of the next iteration. The conn's other op can
+// complete later in the same batch. Before celeris#707 that op's CQE, the
+// last one counted, finalized the conn, and retire closed the engine's
+// descriptor while the cancel was still unsubmitted: the kernel then
+// resolved a number the engine had closed, and whatever file held it by
+// then was the cancel's target. The cancel is now counted in flight until
+// its CQE, so the descriptor closes after it.
+//
+// The worker is parked in P while Q's peer and then A's get a byte, so the
+// next batch holds Q's RECV CQE, then A's. In Q's onRecv, failDriverConn(A)
+// runs with A's RECV still counted, as a failed SEND makes it run. A's
+// onClose runs on the worker right after retire: it puts V's socket, whose
+// RECV is armed on this ring, on the number retire closed, as any dup in
+// the process can. V must still receive.
+func TestDriverFailureCancelCompletesBeforeRelease(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	v := registerSettledDriver(t, w, wl)
+	p := newWorkerPark(t, w, wl)
+	q := newWorkerPark(t, w, wl)
+
+	var aRecvs atomic.Int32
+	opFD := -1
+	var dupErr error
+	a := &testDriver{closed: make(chan error, 1)}
+	a.fd, a.peer = nonblockSocketPair(t)
+	defer a.closePeer()
+	if err := wl.RegisterConn(a.fd, func([]byte) { aRecvs.Add(1) }, func(err error) {
+		dupErr = unix.Dup3(v.fd, opFD, unix.O_CLOEXEC)
+		a.closed <- err
+	}); err != nil {
+		t.Fatalf("RegisterConn(A): %v", err)
+	}
+	settleDriverRecv(t, w, a.fd)
+	adc := driverConnOf(w, a.fd)
+	opFD = adc.opFD
+
+	p.park()
+	if _, err := unix.Write(q.d.peer, []byte{'q'}); err != nil {
+		t.Fatalf("write Q's peer: %v", err)
+	}
+	if _, err := unix.Write(a.peer, []byte{'a'}); err != nil {
+		t.Fatalf("write A's peer: %v", err)
+	}
+	p.release()
+	select {
+	case q.run = <-q.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never entered Q's onRecv")
+	}
+	armed := -1
+	q.onWorker(func() {
+		adc.mu.Lock()
+		if adc.recvArmed {
+			armed = adc.inflightOps
+		}
+		adc.mu.Unlock()
+		w.failDriverConn(adc, errSendFailed)
+	})
+	if aRecvs.Load() != 0 || armed != 1 {
+		q.release()
+		t.Fatalf("apparatus: A's RECV CQE was not behind Q's in one batch (A's onRecv ran %d times; "+
+			"A's RECV counted %d, want 1)", aRecvs.Load(), armed)
+	}
+	q.release()
+
+	fired, err := a.waitClosed()
+	if !fired || !errors.Is(err, errSendFailed) {
+		t.Errorf("A: onClose fired=%v with %v, want the SEND's error", fired, err)
+	}
+	if fired && dupErr != nil {
+		t.Fatalf("dup3 onto the engine's closed number %d: %v", opFD, dupErr)
+	}
+	// An SQE still in the SQ is submitted at the top of the worker's next
+	// iteration: let that happen before V's byte.
+	time.Sleep(100 * time.Millisecond)
+	v.expectReceives(t, "the socket put on the failed conn's engine number when it was released")
+
+	if fired {
+		_ = unix.Close(opFD) // v's second number
+	}
+	_ = unix.Close(a.fd)
+	v.unregisterAndWait(t, wl)
+	q.d.unregisterAndWait(t, wl)
+	p.d.unregisterAndWait(t, wl)
+}
+
+// celeris#707. The cancel failDriverConn issues carries the caller's number
+// in its user_data, and handleDriverClose looks the conn up by it. When the
+// conn was finalized before that CQE was processed (see the test above), a
+// caller that closed the fd and registered a new conn on the same number
+// in between had the stale CQE routed to the new conn, which it closed.
+//
+// The same forced batch. A's onClose parks the worker; the caller closes
+// A's fd and registers N on the number. N must survive: its first byte
+// reaches onRecv, and its onClose does not fire.
+func TestDriverFailureCloseCompletionSparesConnOnReusedNumber(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	p := newWorkerPark(t, w, wl)
+	q := newWorkerPark(t, w, wl)
+
+	var aRecvs atomic.Int32
+	aParked := make(chan chan struct{}, 1)
+	a := &testDriver{closed: make(chan error, 1)}
+	a.fd, a.peer = nonblockSocketPair(t)
+	defer a.closePeer()
+	if err := wl.RegisterConn(a.fd, func([]byte) { aRecvs.Add(1) }, func(err error) {
+		a.closed <- err
+		rel := make(chan struct{})
+		aParked <- rel
+		<-rel
+	}); err != nil {
+		t.Fatalf("RegisterConn(A): %v", err)
+	}
+	settleDriverRecv(t, w, a.fd)
+	adc := driverConnOf(w, a.fd)
+
+	p.park()
+	if _, err := unix.Write(q.d.peer, []byte{'q'}); err != nil {
+		t.Fatalf("write Q's peer: %v", err)
+	}
+	if _, err := unix.Write(a.peer, []byte{'a'}); err != nil {
+		t.Fatalf("write A's peer: %v", err)
+	}
+	p.release()
+	select {
+	case q.run = <-q.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never entered Q's onRecv")
+	}
+	armed := -1
+	q.onWorker(func() {
+		adc.mu.Lock()
+		if adc.recvArmed {
+			armed = adc.inflightOps
+		}
+		adc.mu.Unlock()
+		w.failDriverConn(adc, errSendFailed)
+	})
+	if aRecvs.Load() != 0 || armed != 1 {
+		q.release()
+		t.Fatalf("apparatus: A's RECV CQE was not behind Q's in one batch (A's onRecv ran %d times; "+
+			"A's RECV counted %d, want 1)", aRecvs.Load(), armed)
+	}
+	q.release()
+
+	var rel chan struct{}
+	select {
+	case rel = <-aParked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("A's onClose never ran")
+	}
+	defer func() {
+		if rel != nil {
+			close(rel)
+		}
+	}()
+	if err := <-a.closed; !errors.Is(err, errSendFailed) {
+		t.Errorf("A: onClose(%v), want the SEND's error", err)
+	}
+	_ = unix.Close(a.fd)
+	n := &testDriver{closed: make(chan error, 1), recv: make(chan struct{}, 16)}
+	n.fd, n.peer = nonblockSocketPair(t)
+	defer n.closePeer()
+	if n.fd != a.fd {
+		if err := unix.Dup3(n.fd, a.fd, unix.O_CLOEXEC); err != nil {
+			t.Fatalf("dup3: %v", err)
+		}
+		_ = unix.Close(n.fd)
+		n.fd = a.fd
+	}
+	if err := wl.RegisterConn(n.fd, func([]byte) {
+		select {
+		case n.recv <- struct{}{}:
+		default:
+		}
+	}, func(err error) { n.closed <- err }); err != nil {
+		t.Fatalf("RegisterConn(N) on A's number %d: %v", n.fd, err)
+	}
+	close(rel)
+	rel = nil
+
+	settleDriverRecv(t, w, n.fd)
+	n.expectReceives(t, "a conn registered on the number of one a failure had just released")
+	select {
+	case err := <-n.closed:
+		t.Errorf("N: onClose(%v) fired, with N never unregistered: a close completion of A's reached it (celeris#707)", err)
+	default:
+		n.unregisterAndWait(t, wl)
+	}
+	_ = unix.Close(n.fd)
+	q.d.unregisterAndWait(t, wl)
+	p.d.unregisterAndWait(t, wl)
+}
+
+// A close CQE is a conn's own only while one of its cancels is counted in
+// flight. One that finds none is ignored: it belongs to a conn that left
+// the map without waiting for it, and whose number this conn now holds.
+// The completion is injected on the worker, for a conn with its RECV armed
+// and no cancel issued.
+func TestDriverStrayCloseCompletionSparesConn(t *testing.T) {
+	e, stop := startTestEngine(t)
+	t.Cleanup(stop)
+	w, wl := e.workers[0], e.WorkerLoop(0)
+	n := registerSettledDriver(t, w, wl)
+	defer n.closePeer()
+	// Held, so that an engine that wrongly finalizes N with its RECV armed
+	// does not also let the kernel write into a collected buffer.
+	ndc := driverConnOf(w, n.fd)
+	defer runtime.KeepAlive(ndc)
+	p := newWorkerPark(t, w, wl)
+
+	p.park()
+	p.onWorker(func() { w.handleDriverClose(n.fd) })
+	p.release()
+
+	n.expectReceives(t, "a conn handed a close completion it never asked for")
+	select {
+	case err := <-n.closed:
+		t.Errorf("N: onClose(%v) fired, with N never unregistered", err)
+	default:
+		n.unregisterAndWait(t, wl)
+	}
 	p.d.unregisterAndWait(t, wl)
 }
 

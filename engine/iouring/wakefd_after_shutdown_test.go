@@ -5,6 +5,7 @@ package iouring
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -137,9 +138,13 @@ func (w *fdWatcher655) assertNoLateWake(t *testing.T, n int, who string) {
 // driverConns=nil, and RegisterConn used to rebuild the map from nil and
 // always reach the wakeup write — so a driver that registered an fd on a
 // worker that had already gone away wrote into a recycled descriptor every
-// single time. Since celeris#691 RegisterConn refuses there before it
-// queues anything; the wakeup handle still guards the UnregisterConn and
-// Write that race shutdownDrivers.
+// single time.
+//
+// Since celeris#691 RegisterConn refuses there before it queues anything,
+// so it no longer reaches the write. What still does is an UnregisterConn
+// or Write that found its conn before shutdownDrivers and queues after the
+// close: addDriverAction, called after shutdown. That interleaving is a
+// race, so the test calls addDriverAction itself.
 func TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 	w, efd := newWakeWorker655(t)
 	watch := newFDWatcher655(t)
@@ -156,8 +161,13 @@ func TestRegisterConnAfterShutdownDoesNotWriteTheClosedWakeupFD(t *testing.T) {
 	w.shutdown()
 	watch.claim(t, efd)
 
-	_ = w.RegisterConn(socketFor655(t), func([]byte) {}, func(error) {})
+	if err := w.RegisterConn(socketFor655(t), func([]byte) {}, func(error) {}); !errors.Is(err, errEngineShutdown) {
+		t.Errorf("RegisterConn after shutdown returned %v, want an error wrapping errEngineShutdown", err)
+	}
 	watch.assertNoLateWake(t, efd, "RegisterConn")
+
+	w.addDriverAction(driverAction{kind: driverActionWrite, dc: &driverConn{fd: -1}})
+	watch.assertNoLateWake(t, efd, "addDriverAction")
 }
 
 // TestEnqueueDetachAfterShutdownDoesNotWriteTheClosedWakeupFD covers
