@@ -1,0 +1,6 @@
+self-hosted-runner:
+  # CodSpeed Macro Runner label used by .github/workflows/codspeed.yml
+  # (https://codspeed.io/docs/features/macro-runners). actionlint knows only
+  # GitHub-hosted labels and rejects any other label as unknown.
+  labels:
+    - codspeed-macro-arm64-graviton-ubuntu-22-04

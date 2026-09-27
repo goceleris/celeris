@@ -46,11 +46,12 @@ var (
 // most complex path in this package and has historically been the source of
 // rare, hard-to-reproduce issues; the SwitchRejectedCount /
 // EngineMetrics.AdaptiveSwitches counters exist so a throughput anomaly can be
-// correlated with switching activity. Operators who need fully deterministic
-// behaviour can pin the start engine via CELERIS_ADAPTIVE_START=epoll|iouring
-// (see chooseStartEngine), which disables the runtime switch. For benchmarking,
-// run the adaptive columns multiple times: a rare switch transient can skew a
-// single pass.
+// correlated with switching activity. CELERIS_ADAPTIVE_START=epoll|iouring
+// chooses only the engine it STARTS on (see chooseStartEngine, the variable's
+// only reader); the controller still switches afterwards. Operators who need
+// fully deterministic behaviour should pin a single engine with Config.Engine
+// (Epoll or IOUring) instead. For benchmarking, run the adaptive columns
+// multiple times: a rare switch transient can skew a single pass.
 type Engine struct {
 	primary   engine.Engine // epoll  (nil until built when it is the lazy standby)
 	secondary engine.Engine // io_uring (nil until built when it is the lazy standby)
@@ -121,9 +122,21 @@ type Engine struct {
 }
 
 // ioUringViable reports whether io_uring is worth running at all on this host:
-// the kernel must expose the fast tier AND RLIMIT_MEMLOCK must be able to fund
-// the requested worker count. These are the two t0-knowable disqualifiers from
-// the epoll-vs-io_uring sweep:
+// the probed tier must be available at all, the kernel must expose the fast
+// tier AND RLIMIT_MEMLOCK must be able to fund the requested worker count.
+//
+//   - Availability: iouring.New refuses to build an engine when the probed
+//     IOUringTier is None ("io_uring not available on this system"), and the
+//     probe reports None when CELERIS_MAX_IOURING_TIER caps it there (or when
+//     io_uring is missing or blocked). The kernel-version test below cannot see
+//     that: the cap clears the feature flags but not KernelMajor/KernelMinor, so
+//     on a 6.10+ kernel the "bundles era" branch alone used to call io_uring
+//     viable, and every promotion then failed to build it and backed off with
+//     a WARN (celeris#679). Checked first, with iouring.New's own predicate, so
+//     the two cannot disagree.
+//
+// The other two are the t0-knowable disqualifiers from the epoll-vs-io_uring
+// sweep:
 //
 //   - Kernel/feature: io_uring loses to epoll on old kernels (missing the
 //     fast-path setup flags); require the "bundles" era (>6.10) OR the 6.1+
@@ -134,6 +147,9 @@ type Engine struct {
 //     does not memlock buffer rings, so it keeps all workers. In that case
 //     io_uring is never the right engine.
 func ioUringViable(p engine.CapabilityProfile, cfg resource.Config) bool {
+	if !p.IOUringTier.Available() {
+		return false
+	}
 	bundlesEra := p.KernelMajor > 6 || (p.KernelMajor == 6 && p.KernelMinor >= 10)
 	fastTier := p.DeferTaskrun && p.SingleIssuer && p.MultishotRecv && p.ProvidedBuffers
 	if !bundlesEra && !fastTier {
@@ -703,14 +719,13 @@ func (e *Engine) performSwitch() {
 	// either observes the old active and registers on it before the
 	// swap, or waits until after active.Store lands and registers on
 	// the new active. We deliberately release freezeState BEFORE the
-	// final PauseAccept on the old active — synchronous PauseAccept can
-	// take O(ms) waiting for the loop to drain its listen queue, and
-	// holding freezeState across that wait blocks driver
-	// register/unregister flows long enough to trip their onClose
-	// timeouts (regression seen in TestAdaptiveConcurrentDriverChurnVsSwitch).
-	// Once active.Store has committed, no new driver registrations will
-	// land on the about-to-be-paused engine, so it's safe to drop the
-	// lock.
+	// final pause of the old active. The pause no longer waits
+	// (beginPause), but it used to, and holding freezeState across a
+	// pause that waits blocks driver register/unregister flows long
+	// enough to trip their onClose timeouts (regression seen in
+	// TestAdaptiveConcurrentDriverChurnVsSwitch). Once active.Store has
+	// committed, no new driver registrations will land on the
+	// about-to-be-paused engine, so there is no reason to hold it.
 	e.freezeState.Lock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
@@ -723,8 +738,8 @@ func (e *Engine) performSwitch() {
 	// Release freezeState across the (possibly slow) lazy standby build +
 	// Listen + bind-wait below; re-acquired before the active.Store commit.
 	// Holding it across a multi-second build would block driver
-	// register/unregister flows (same reasoning as the PauseAccept release
-	// at the end of this function). e.mu (held for the whole function)
+	// register/unregister flows (same reasoning as the release before the
+	// final pause at the end of this function). e.mu (held for the whole function)
 	// already serialises performSwitch against itself, so no other switch
 	// can race the build.
 	e.freezeState.Unlock()
@@ -790,8 +805,16 @@ func (e *Engine) performSwitch() {
 	// Re-acquire freezeState for the commit and RE-CHECK driverFDs: a driver
 	// may have registered during the build window above. If so, abort — but the
 	// freshly-built standby stays cached for the next attempt. Pause its accept
-	// first so it does not sit in the SO_REUSEPORT pool alongside the (still
-	// active) old engine; the next switch ResumeAccepts it.
+	// so it leaves the SO_REUSEPORT pool it shares with the (still active) old
+	// engine; the next switch ResumeAccepts it.
+	//
+	// The pause lingers (celeris#662): for about 1.5 s the fresh engine keeps
+	// its share of new connections, so that a client it accepted the
+	// handshake of during the build is served rather than reset. What it
+	// accepts must not stay on it, so it also gets the drain a completed
+	// switch gives the engine it leaves: toward the engine that stays active
+	// (newStandby here). A switch that later makes it active stops that
+	// drain first (the StopTransplant below).
 	e.freezeState.Lock()
 	if e.driverFDs.Load() > 0 {
 		e.switchRejected.Add(1)
@@ -800,9 +823,8 @@ func (e *Engine) performSwitch() {
 		)
 		e.freezeState.Unlock()
 		if freshlyBuilt {
-			if ac, ok := newActive.(engine.AcceptController); ok {
-				_ = ac.PauseAccept()
-			}
+			beginPause(newActive)
+			e.applyTransplant(newStandby, newActive)
 		}
 		return
 	}
@@ -839,14 +861,18 @@ func (e *Engine) performSwitch() {
 	// driver acquireDriverFD calls observe the new active and proceed.
 	e.freezeState.Unlock()
 
-	// Pause the old active. Inline (not in a goroutine) so unit tests
-	// observing pauseCalls right after performSwitch returns see the
-	// effect; PauseAccept itself caps its wait to 2s, but the
-	// freezeState release above means concurrent driver
-	// register/unregister flows are no longer blocked while we wait.
-	if ac, ok := newStandby.(engine.AcceptController); ok {
-		_ = ac.PauseAccept()
-	}
+	// Pause the old active, and do not wait for it (celeris#662). The
+	// sub-engine lingers for about 1.5 s with TCP_DEFER_ACCEPT cleared,
+	// serving its SO_REUSEPORT share of new connections, so that a client
+	// that completed its handshake on it but had not sent its request yet
+	// is promoted and served instead of being reset by the close. Waiting
+	// would hold e.mu, and with it Metrics() and the next switch, for that
+	// long. Issued here, under e.mu, so any later switch's ResumeAccept of
+	// this engine is ordered after it; a resume during the linger restores
+	// the option on the same listeners. Inline (not in a goroutine) so unit
+	// tests observing pauseCalls right after performSwitch returns see the
+	// effect.
+	beginPause(newStandby)
 
 	e.logger.Info("engine switch completed",
 		"now_active", newActive.Type().String(),
@@ -883,6 +909,26 @@ func (e *Engine) performSwitch() {
 			e.maybeThawLocked()
 			e.freezeState.Unlock()
 		}()
+	}
+}
+
+// beginPauser is the non-blocking start of an accept pause, which the epoll
+// and io_uring sub-engines implement (celeris#662). It is deliberately not
+// part of engine.AcceptController.
+type beginPauser interface {
+	BeginPauseAccept()
+}
+
+// beginPause starts eng's accept pause without waiting for its linger to
+// end. Test fakes that implement only engine.AcceptController get their
+// PauseAccept, as before. The caller holds e.mu.
+func beginPause(eng engine.Engine) {
+	if bp, ok := eng.(beginPauser); ok {
+		bp.BeginPauseAccept()
+		return
+	}
+	if ac, ok := eng.(engine.AcceptController); ok {
+		_ = ac.PauseAccept()
 	}
 }
 

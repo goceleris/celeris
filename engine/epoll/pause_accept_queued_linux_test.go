@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/deferlinger"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -239,7 +240,9 @@ func runPauseQueued662(t *testing.T, pause bool) {
 			}
 			return true
 		}
-		for dl := time.Now().Add(2 * time.Second); !allClosed() && time.Now().Before(dl); {
+		// The listeners close only after the pause's linger (celeris#662),
+		// which starts once each loop is released from the handler.
+		for dl := time.Now().Add(deferlinger.Linger() + 2*time.Second); !allClosed() && time.Now().Before(dl); {
 			time.Sleep(5 * time.Millisecond)
 		}
 		if !allClosed() {
