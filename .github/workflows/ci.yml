@@ -1050,6 +1050,43 @@ jobs:
             echo "release a descriptor number a recv could still resolve, or was a test renamed or skipped?"
             exit 1
           fi
+      # celeris#798: the rule counts only the ops that name the descriptor. A
+      # SEND_ZC's notification names none, yet a peer that stops reading holds
+      # it for as long as the socket is open. So it must not keep a closed
+      # connection's descriptor (the release backstop forced it after 5 s and
+      # counted CloseFDForced), nor stall worker shutdown's drain, while the
+      # connState, whose send buffer the notification guards, still waits for
+      # it. The unit job runs these two tests in its package step, on x86 only;
+      # here they run on both arches, by name, at the runner's own 8 MiB
+      # memlock (the pages SEND_ZC pins count against it), with a tally: every
+      # run of each of the five cases must PASS, with no FAIL and no SKIP line.
+      # A SKIP would mean the runner's kernel gave the engine no working
+      # SEND_ZC, so nothing was tested.
+      - name: celeris#798 a SEND_ZC notification holds no descriptor (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed|TestShutdownDoesNotWaitForAZCNotification'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 5 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/zc798.log || true
+          grep -E 'celeris798 ' /tmp/zc798.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc798.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc798.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/zc798.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/zc798.log || true)
+          echo "celeris#798 SEND_ZC tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did a"
+            echo "SEND_ZC notification hold a descriptor or stall shutdown, or was a test renamed or skipped?"
+            exit 1
+          fi
       # The detector control. .github/scripts/mutant-685-release-owed-fd.py
       # makes fdOwed report false, which takes the fd-lifetime rule off the
       # close paths, Hijack and shutdown at once. Against that tree every run
