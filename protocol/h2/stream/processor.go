@@ -200,8 +200,14 @@ func (p *Processor) PoolHandlersRunning() bool {
 // DATA buffered, waiting for the client's WINDOW_UPDATE: its handler has
 // returned, and the rest of its response goes out only as the client grants
 // window (celeris#759). The native engines' graceful shutdown waits for it,
-// as for the pool handlers. Takes the manager's and each stream's lock; not
-// for the hot path.
+// as for the pool handlers. Not for the hot path.
+//
+// Lock order: the manager's mu (read), then each stream's mu (read), so that
+// no stream is released (RemoveStreamFromMap and DeleteStream take the
+// manager's mu for writing) while it is read. Nothing takes a stream's mu and
+// then the manager's: flushStreamOutbound reserves windows under the stream's
+// mu with atomics only, and flushConnWindowStalledStreams releases the
+// manager's mu before it takes a stream's.
 func (p *Processor) OutboundPending() bool {
 	p.manager.mu.RLock()
 	defer p.manager.mu.RUnlock()
