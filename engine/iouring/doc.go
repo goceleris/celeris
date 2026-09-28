@@ -2,6 +2,16 @@
 
 // Package iouring implements an asynchronous network I/O engine backed by Linux io_uring.
 //
+// # Kernel Requirement
+//
+// The engine needs Linux 5.19 or later. Every cancel it submits (connection close, hijack, the
+// accept pause, the WebSocket backpressure pause, the driver unregister and the io_uring→epoll
+// hand-off) sets IORING_ASYNC_CANCEL flags, which that release added; an older kernel fails each
+// one with -EINVAL and leaves the operation it targets running (celeris#682). New probes for the
+// flags and, where the kernel rejects them (or, before 5.19, where the probe gets no answer),
+// returns an error that starts "io_uring not available on this system" and names the requirement.
+// The adaptive engine then runs on epoll.
+//
 // # Environment Knobs
 //
 // The engine recognizes several environment variables, for operator control and for tests:
