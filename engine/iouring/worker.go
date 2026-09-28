@@ -49,6 +49,10 @@ const fixedFileTableSize = 65536
 // reports the same condition through its own errPeerClosed.
 var errPeerClosed = fmt.Errorf("celeris: peer closed connection: %w", io.EOF)
 
+// errWriteRefused ends an async dispatch goroutine whose handler's writes
+// the back-pressure cap refused (celeris#761): the worker closes the conn.
+var errWriteRefused = errors.New("celeris: write refused: send backlog over the limit")
+
 // errIORingRecv wraps a negative io_uring recv result as a syscall.Errno.
 // Used to surface concrete errors to detached middleware via H1State.OnError.
 // Callers MUST handle res == 0 before reaching here: a zero result is an
@@ -1340,10 +1344,20 @@ func (w *Worker) run(ctx context.Context) {
 		// response frame bytes; draining them before the dirty list ensures
 		// SEND SQEs are queued as early as possible after CQE processing,
 		// reducing pipeline stalls for H2 multiplexed streams.
-		for _, fd := range w.h2Conns {
+		// By index, from the end: a close below swap-removes the conn from
+		// h2Conns, which a range would then skip one entry past.
+		for i := len(w.h2Conns) - 1; i >= 0; i-- {
+			fd := w.h2Conns[i]
 			cs := w.conns[fd]
 			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
 				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if cs.writeRefused {
+					// A frame refused on back-pressure is lost, and the
+					// connection's framing with it: close, sending what
+					// was staged first (celeris#761).
+					w.closeConn(fd)
+					continue
+				}
 				if w.flushSend(cs) {
 					w.markDirty(cs)
 				}
@@ -2783,8 +2797,9 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		}
 		// The direct-body tail: flushed unlinked (the next recv may target
 		// the body buffer again), then a standalone recv — or none, held for
-		// a hand-off (celeris#657).
-		w.respondAndArm(cs, fd, c, false, false)
+		// a hand-off (celeris#657). A refused write closes here too
+		// (celeris#761).
+		w.respondAndArm(cs, fd, c, false, true)
 		return
 	}
 
@@ -3193,7 +3208,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 // response, then arm the connection's next recv, chained behind the SEND
 // (link, single-shot recv only; flushSendLink falls back to an unlinked send
 // itself when it must) or standalone. capCheck applies the back-pressure
-// close of the sync tail.
+// close of the sync tail: a conn whose write hooks refused bytes is closed,
+// and its close sends what was staged first. A backlog over the cap by
+// itself is not a reason to close: one response larger than the cap puts it
+// there, and so does an HTTP/2 stream's flow-control window; closing on it
+// cut such a response off (celeris#761).
 //
 // With a drain set and a conn the hand-off would take, the response is
 // flushed UNLINKED and no recv is armed at all (HOLD): the conn is handed off
@@ -3208,9 +3227,9 @@ func (w *Worker) respondAndArm(cs *connState, fd int, c *completionEntry, link, 
 	if mu != nil {
 		mu.Lock()
 	}
-	// Back-pressure: capture pending size inside the lock so concurrent
+	// Back-pressure: read writeRefused inside the lock so concurrent
 	// goroutine writes via the guarded writeFn don't race the read.
-	if capCheck && len(cs.writeBuf)+len(cs.sendBuf) > cs.sendCap() {
+	if capCheck && cs.writeRefused {
 		if mu != nil {
 			mu.Unlock()
 		}
@@ -4520,6 +4539,11 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		// and closes the 3× integrated-Redis regression observed on
 		// iouring (95 µs/op → target ~30 µs/op, matching epoll and
 		// go-redis + stdlib).
+		// A refused write (celeris#761) ends the conn as a request error
+		// does: the worker's closeConn sends what was staged, then closes.
+		if processErr == nil && cs.writeRefused {
+			processErr = errWriteRefused
+		}
 		var partial bool
 		if processErr == nil && cs.fixedFile && len(cs.writeBuf) > 0 {
 			// Fixed-file conn: cs.fd is a registered-file TABLE INDEX, not a
@@ -4581,10 +4605,22 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		if cs.closing {
 			return
 		}
-		// Back-pressure: drop writes when total pending data exceeds limit.
-		// The connection will be closed after processing completes.
+		// Back-pressure: refuse the write only when the backlog before it
+		// is over the cap (see sendCap), and say so: the site that ran the
+		// handler then closes the conn (celeris#761), where it used to be
+		// left waiting for the refused bytes.
 		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > cs.sendCap() {
+			cs.writeRefused = true
 			return
+		}
+		if cs.bodyBuf != nil {
+			// A zero-copy body is staged, and flushSend sends writeBuf
+			// before it: bytes written after the body (the next pipelined
+			// response) would go out ahead of it. Move the body into
+			// writeBuf first, a copy paid only when a write follows a large
+			// body before the flush (celeris#802).
+			cs.writeBuf = append(cs.writeBuf, cs.bodyBuf...)
+			cs.bodyBuf = nil
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds
 		// sendBuf (not writeBuf), so appending here is safe.
@@ -4614,14 +4650,20 @@ func (w *Worker) makeWriteBodyFn(cs *connState) func([]byte) {
 		if cs.closing {
 			return
 		}
-		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf)+len(body) > cs.sendCap() {
+		// The body itself is not held against the cap: a response larger
+		// than the cap is staged whole, and only a backlog already over it
+		// refuses the write (celeris#761; see sendCap and makeWriteFn).
+		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > cs.sendCap() {
+			cs.writeRefused = true
 			return
 		}
 		if cs.bodyBuf != nil {
-			// A second large-body write in the same request: fall back
-			// to copying (we only carry one iovec entry for the body).
-			cs.writeBuf = append(cs.writeBuf, body...)
-			return
+			// A second large body before the flush (a pipelined response):
+			// there is one iovec entry for a body, so the staged body moves
+			// into writeBuf, where it stays ahead of this one, and this one
+			// takes the entry. Copying this one into writeBuf instead sent
+			// it before the staged body (celeris#802).
+			cs.writeBuf = append(cs.writeBuf, cs.bodyBuf...)
 		}
 		cs.bodyBuf = body
 	}

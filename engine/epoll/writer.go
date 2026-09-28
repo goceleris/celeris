@@ -3,6 +3,8 @@
 package epoll
 
 import (
+	"errors"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -106,6 +108,44 @@ func (l *Loop) flushSendfile(cs *connState, onLoopThread bool) error {
 		cs.sendfile = nil
 	}
 	return nil
+}
+
+// errUnstageSendfile is the error a file response gets when the file of the
+// sendfile staged ahead of it could not be read into writeBuf (unstage); the
+// conn is closed.
+var errUnstageSendfile = errors.New("celeris: epoll: reading a staged sendfile response into the write buffer failed")
+
+// unstage moves what the conn has staged outside writeBuf, a zero-copy body
+// (bodyBuf) and then a sendfile response, into writeBuf, in the order the
+// flush sends them (writeBuf, bodyBuf, sendfile), so that bytes written next
+// go out after them: every writer appends to writeBuf, which the flush sends
+// first (celeris#802). The body is copied; the sendfile's unsent header and
+// file bytes are read in and its descriptor closed. Only a write that
+// follows a large body or a file response before the flush pays for it: the
+// next pipelined response. Reports false if the file could not be read; the
+// conn must then be closed, its response being lost either way.
+func unstage(cs *connState) bool {
+	if cs.bodyBuf != nil {
+		cs.writeBuf = append(cs.writeBuf, cs.bodyBuf...)
+		cs.bodyBuf = nil
+	}
+	st := cs.sendfile
+	if st == nil {
+		return true
+	}
+	cs.sendfile = nil
+	defer st.close()
+	cs.writeBuf = append(cs.writeBuf, st.headers[st.headerOff:]...)
+	if st.remaining <= 0 {
+		return true
+	}
+	start := len(cs.writeBuf)
+	cs.writeBuf = append(cs.writeBuf, make([]byte, st.remaining)...)
+	if err := readFullAt(st.file, cs.writeBuf[start:], st.off); err != nil {
+		cs.writeBuf = cs.writeBuf[:start]
+		return false
+	}
+	return true
 }
 
 // csWritePending reports whether cs has any unsent output: buffered bytes

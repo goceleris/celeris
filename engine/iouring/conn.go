@@ -21,8 +21,17 @@ import (
 // echo payloads larger than 4 MiB (Autobahn 9.1.6 sends 16 MiB).
 // 64 MiB matches the WS default ReadLimit.
 const (
-	maxSendQueueBytes         = 4 << 20  // 4 MiB (H1/H2)
+	maxSendQueueBytes         = 4 << 20  // 4 MiB (H1)
 	maxSendQueueBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+	// maxSendQueueBytesH2 is the limit for an HTTP/2 connection. Its DATA
+	// is already bounded by the flow-control windows the peer grants, and a
+	// peer that reads keeps up to a window of frames queued, or in a SEND
+	// in flight, as a matter of course (net/http's client grants 4 MiB per
+	// stream, browsers more per connection), so the H1 limit closed healthy
+	// HTTP/2 connections at the window's edge (celeris#761). 64 MiB, as for
+	// a detached connection, still bounds a peer that grants large windows
+	// and stops reading.
+	maxSendQueueBytesH2 = 64 << 20
 	// maxPendingInputBytes caps the async dispatch input buffer
 	// (cs.asyncInBuf) so a client pipelining requests faster than
 	// the dispatch goroutine drains them cannot balloon per-conn
@@ -34,7 +43,16 @@ const (
 // for whether the connection is detached. Async-mode HTTP1 conns set
 // detachMu up front without being truly detached; they keep the H1/H2
 // limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
+//
+// The limit bounds the backlog a write finds, not the write: a write is
+// refused only when the bytes still queued before it are over the limit,
+// which is a peer that stopped reading while it keeps sending requests. One
+// response larger than the limit is not such a backlog and is staged whole;
+// before celeris#761 its body was dropped.
 func (cs *connState) sendCap() int {
+	if cs.h2State != nil {
+		return maxSendQueueBytesH2
+	}
 	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
 		return maxSendQueueBytesDetached
 	}
@@ -84,6 +102,7 @@ type connState struct {
 	detected       bool         // 1
 	sending        bool         // 1: true when a SEND SQE is in-flight
 	closing        bool         // 1: defers close until sends complete
+	writeRefused   bool         // 1: a write hook refused bytes on back-pressure; the conn is closed (celeris#761, makeWriteFn)
 	dirty          bool         // 1: true when data needs flushing
 	fixedFile      bool         // 1: true when fd is fixed file index
 	recvLinked     bool         // 1: RECV was linked to SEND (skip standalone prepareRecv)
@@ -498,6 +517,7 @@ func releaseConnState(cs *connState) {
 	cs.detected = false
 	cs.sending = false
 	cs.closing = false
+	cs.writeRefused = false
 	cs.dirty = false
 	cs.fixedFile = false
 	cs.recvLinked = false

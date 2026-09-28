@@ -22,8 +22,17 @@ import (
 // echo payloads larger than 4 MiB (RFC 6455 allows frames up to 2^63,
 // Autobahn 9.1.6 sends 16 MiB). 64 MiB matches the WS default ReadLimit.
 const (
-	maxPendingBytes         = 4 << 20  // 4 MiB (H1/H2)
+	maxPendingBytes         = 4 << 20  // 4 MiB (H1)
 	maxPendingBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+	// maxPendingBytesH2 is the limit for an HTTP/2 connection. Its DATA is
+	// already bounded by the flow-control windows the peer grants, and a
+	// peer that reads keeps up to a window of frames queued behind the
+	// socket as a matter of course (net/http's client grants 4 MiB per
+	// stream, browsers more per connection), so the H1 limit refused, and
+	// closed, healthy HTTP/2 connections (celeris#761). 64 MiB, as for a
+	// detached connection, still bounds a peer that grants large windows
+	// and stops reading.
+	maxPendingBytesH2 = 64 << 20
 	// maxPendingInputBytes caps the async dispatch input buffer
 	// (cs.asyncInBuf) so a client pipelining requests faster than
 	// the dispatch goroutine drains them cannot balloon per-conn
@@ -61,7 +70,16 @@ func trimPooledBuf(b []byte) []byte {
 // for whether the connection is detached. Async-mode HTTP1 conns set
 // detachMu up front without being truly detached; they keep the H1/H2
 // limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
+//
+// The limit bounds the backlog a write finds, not the write: a write is
+// refused only when the bytes still queued before it (cs.pendingBytes) are
+// over the limit, which is a peer that stopped reading while it keeps
+// sending requests. One response larger than the limit is not such a
+// backlog and is staged whole; before celeris#761 its body was dropped.
 func (cs *connState) writeCap() int {
+	if cs.h2State != nil {
+		return maxPendingBytesH2
+	}
 	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
 		return maxPendingBytesDetached
 	}
@@ -112,7 +130,18 @@ type connState struct {
 	// peerClosed is set when EPOLLRDHUP reports the peer half-closed (FIN) while
 	// a response was still flushing (write backpressure). The conn is closed once
 	// its pending write drains, so the response is not truncated. Reset on release.
+	// closeWhenFlushed sets it too, when the engine itself ends a conn whose
+	// response the kernel has not all taken (Connection: close, a request
+	// error, a refused write; celeris#761): the close it defers is the same.
 	peerClosed bool
+
+	// writeRefused records that a write hook refused bytes because the
+	// conn's backlog was already over writeCap (celeris#761). A refused
+	// write is never silent: the site that ran the handler closes the conn
+	// (closeWhenFlushed) instead of leaving the client waiting for bytes that
+	// will not come. Sticky until release. Written under detachMu when the
+	// conn has one, like the buffers it guards.
+	writeRefused bool
 
 	// drainDeadline bounds how long checkTimeouts defers the idle-deadline
 	// reap of a truly-detached conn whose terminal bytes (SSE last event, WS
@@ -319,6 +348,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.peerClosed = false
+	cs.writeRefused = false
 	cs.drainDeadline = 0
 	cs.asyncRun = false
 	cs.asyncParked = false

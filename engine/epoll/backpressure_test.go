@@ -37,9 +37,12 @@ func (h *bigResponseHandler) HandleStream(_ context.Context, s *stream.Stream) e
 }
 
 // TestWriteBufBackpressureClosesSlowConsumer is a best-effort
-// end-to-end assertion of the maxPendingBytes / WriteTimeout close
-// path: a slow consumer must not cause unbounded server-side
-// buffering.
+// end-to-end assertion of the timeout close path: a slow consumer must
+// not hold server-side buffering for longer than the timeouts allow.
+// Since celeris#761 a single response larger than maxPendingBytes is
+// staged whole rather than closed at once (the cap bounds the backlog a
+// write finds, not the write), so it is the timeout sweep, here
+// ReadTimeout, that closes a consumer that never reads it.
 //
 // The test is marked t.Skip by default because reliably triggering
 // the backpressure path on loopback TCP is hard — Linux's
@@ -72,6 +75,7 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 		Addr:         addr,
 		Protocol:     engine.HTTP1,
 		WriteTimeout: 200 * time.Millisecond,
+		ReadTimeout:  200 * time.Millisecond,
 		Resources: resource.Resources{
 			Workers: 2,
 		},
@@ -110,11 +114,9 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 	}
 
 	// Send GET. Deliberately DO NOT read the response — we want the
-	// server's writeBuf to fill and either maxPendingBytes trip or
-	// WriteTimeout fire. lastActivity on the server does not
-	// advance after the GET (no further client→server data), and
-	// pendingBytes climbs past writeCap (4 MiB) as soon as the
-	// handler writes the 50 MiB body.
+	// server's writeBuf to fill and the timeout sweep to fire.
+	// lastActivity on the server does not advance after the GET (no
+	// further client→server data).
 	req := "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
 	if _, err := fmt.Fprint(tcp, req); err != nil {
 		t.Fatalf("write: %v", err)
@@ -122,9 +124,9 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 
 	// Hold — don't read at all. The inline flush after the handler
 	// runs attempts unix.Write of the full 50 MiB body; kernel
-	// absorbs at most a few hundred KiB before EAGAIN. That leaves
-	// pendingBytes >> writeCap, which drainRead's post-flush check
-	// or checkTimeouts converts into closeConn.
+	// absorbs at most a few hundred KiB before EAGAIN. The rest waits
+	// on EPOLLOUT until checkTimeouts converts the stalled conn into
+	// closeConn.
 	time.Sleep(500 * time.Millisecond)
 
 	// Now the server should have closed us. Read should drain
