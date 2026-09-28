@@ -14,7 +14,8 @@ Admin access; cut releases; own [`.github/CODEOWNERS`](.github/CODEOWNERS).
 ## `contributors` team
 
 Write access to `goceleris/celeris` only. Members may approve PRs and merge
-their own PRs after a code-owner approval and green required checks.
+their own PRs after a code-owner approval, with green required checks and
+every review thread resolved.
 
 | GitHub  | Focus |
 |---------|-------|

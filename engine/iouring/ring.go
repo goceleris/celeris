@@ -394,6 +394,20 @@ func retryPending(n uint32, errno unix.Errno) uint32 {
 // Pending returns the number of SQEs submitted but not yet sent to the kernel.
 func (r *Ring) Pending() uint32 { return r.pending }
 
+// sqPlaced returns the SQ ring's tail: the sequence number the next GetSQE
+// will take, so the SQE placed last has sqPlaced()-1.
+func (r *Ring) sqPlaced() uint32 {
+	if r.singleIssuer {
+		return *(*uint32)(r.sqTail)
+	}
+	return atomic.LoadUint32((*uint32)(r.sqTail))
+}
+
+// sqConsumed returns the SQ ring's head, which the kernel advances as it
+// consumes SQEs: an SQE placed at sequence s has not reached the kernel yet
+// while int32(s-sqConsumed()) >= 0 (celeris#715).
+func (r *Ring) sqConsumed() uint32 { return atomic.LoadUint32((*uint32)(r.sqHead)) }
+
 // ClearPending resets the pending counter without issuing a syscall. Used with
 // SQPOLL where the kernel thread submits SQEs automatically.
 func (r *Ring) ClearPending() { r.pending = 0 }

@@ -207,7 +207,8 @@ func (e *Engine) Listen(ctx context.Context) error {
 // Server calls Listen with its managed context and cancels it during
 // Server.Shutdown; the Listen goroutine returns after running
 // Loop.shutdown (which closes connections and joins async dispatch
-// goroutines via asyncWG).
+// goroutines via asyncWG). Server.Shutdown waits for that return before
+// it runs the OnShutdown hooks (celeris#703).
 //
 // The context parameter is accepted for interface parity with engines
 // that do run async drain operations on Shutdown (e.g. std's
