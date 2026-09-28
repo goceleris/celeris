@@ -1487,30 +1487,46 @@ func (w *Worker) run(ctx context.Context) {
 		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
 			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
 			w.acceptPaused.Load() {
+			// Do not park while a closed connection's kernel ops are still
+			// in flight (celeris#712). finishClose's HTTP/1 fast path is a
+			// plain close(fd), and the recv the connection still has armed
+			// holds its own reference to the file, so the socket goes, and
+			// its client gets a FIN, only once that recv's cancelled
+			// completion has run. On a DEFER_TASKRUN ring the completion is
+			// task work, which runs only inside an io_uring_enter with
+			// GETEVENTS, and the park waits on a Go channel: a connection
+			// closed in the parking iteration stayed ESTABLISHED for as long
+			// as the park lasted. One more enter is not enough either, as it
+			// runs at most 20 deferred completions per local-work pass
+			// (IO_LOCAL_TW_DEFAULT_MAX, kernel 6.13 and later).
+			//
+			// pendingRelease already holds each closed connState until its
+			// kernelInflight reports every op's terminal CQE, so an entry a
+			// drain leaves is such an op: go round again, and the ring wait
+			// runs the work and returns with those CQEs. The clock is read
+			// for the drain's wall-clock backstop, so an op the kernel never
+			// completes holds the park back by pendingReleaseHoldNanos and
+			// one ring wait at most.
+			if len(w.pendingRelease) > 0 {
+				w.cachedNow = time.Now().UnixNano()
+				w.drainPendingRelease()
+				if len(w.pendingRelease) > 0 {
+					continue
+				}
+			}
 			// Submit what this iteration queued before parking (celeris#657,
 			// A5). The iteration that closes or hands off the last conn
 			// queues its close-path cancels (the header timer's, a send's)
 			// in the same pass that finds the worker idle, and the park is
 			// indefinite: those SQEs used to sit unsubmitted until something
-			// woke the worker, measured 1-24 pending at parks.
-			//
-			// Submitting is not enough on a DEFER_TASKRUN ring, and the
-			// enter runs the deferred completion work too, even with
-			// nothing left to submit (celeris#712). A cancelled recv
-			// completes as task work that only an enter with GETEVENTS
-			// runs, and until it does the recv keeps its reference to the
-			// file: finishClose's HTTP/1 fast path is a plain close(fd),
-			// so the socket of a connection closed in this iteration stayed
-			// ESTABLISHED, and its client got no FIN, for as long as the
-			// park lasted. The park waits on a Go channel, not in the ring.
-			//
-			// Outside wakeMu, which is a leaf. Not under SQPOLL, where the
-			// kernel's SQ thread submits; an SQ thread that has gone idle
-			// would need the NEED_WAKEUP kick the submit branch of this
-			// loop gives it, but no tier enables SQPOLL today (SQPollIdle is
-			// 0 in all three), so that case is not handled here.
-			if !w.sqpoll {
-				_, _ = w.ring.SubmitAndFlush()
+			// woke the worker, measured 1-24 pending at parks. Outside
+			// wakeMu, which is a leaf. Not under SQPOLL, where the kernel's
+			// SQ thread submits; an SQ thread that has gone idle would need
+			// the NEED_WAKEUP kick the submit branch of this loop gives it,
+			// but no tier enables SQPOLL today (SQPollIdle is 0 in all
+			// three), so that case is not handled here.
+			if !w.sqpoll && w.ring.Pending() > 0 {
+				_, _ = w.ring.Submit()
 			}
 			w.wakeMu.Lock()
 			if !w.acceptPaused.Load() ||
