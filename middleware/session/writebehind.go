@@ -89,8 +89,12 @@ func (w *writeBehindWriter) run() {
 
 // enqueue hands a snapshotted write to the background worker. buf MUST be a
 // fresh, immutable slice (the JSON-encoded body), never the live session map
-// or a buffer the next request may reuse. Blocks when the queue is full,
-// applying backpressure instead of unbounded goroutine growth.
+// or a buffer the next request may reuse. id is read by the worker after the
+// handler has returned, so it MUST NOT be a view of the request either (what
+// c.Cookie, c.Header or c.Query return on epoll and io_uring): the engine
+// receives the connection's next request into that buffer (celeris#731).
+// Blocks when the queue is full, applying backpressure instead of unbounded
+// goroutine growth.
 //
 // After Close, the worker is gone and enqueue degrades to a synchronous
 // store write on the calling goroutine, so a request racing shutdown is never
