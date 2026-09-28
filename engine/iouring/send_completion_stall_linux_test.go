@@ -224,32 +224,99 @@ func TestIouringSendCompletionsAreAppliedInOrder(t *testing.T) {
 // handler returned, before the goroutine's hand-back is drained (the timeout
 // sweep, a recv FIN), must not defer itself behind cs.sending for a SEND
 // whose completion has already arrived and is held: it applies the
-// completion, and closes now, once.
+// completion, and closes now, once. Arm error: the held completion is itself
+// a failure, which closes the conn as it is applied (OnError once), and the
+// close that applied it must not run a second teardown.
 func TestIouringCloseAppliesAHeldSendCompletion(t *testing.T) {
 	const tail = "the rest of response 1"
-	rig := newStallRig704(t)
-	w, cs := rig.w, rig.cs
-	inFlight750(rig, tail, false)
-	release := holdAsHandler704(t, cs, true)
-	c := sendCQE750(rig, int32(len(tail)), 0)
-	if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, time.Now().UnixNano()) }) {
-		t.Fatalf("celeris#750: the send completion waited %v on a running handler's detachMu", stallWait704)
-	}
-	release()
-	// The goroutine returns from its handler to its park (no hand-back drained).
-	cs.asyncInMu.Lock()
-	setParked704(cs, true)
-	cs.asyncInMu.Unlock()
+	for _, tc := range []struct {
+		name string
+		res  int32
+	}{
+		{"send", int32(len(tail))},
+		{"error", -int32(unix.ECONNRESET)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newStallRig704(t)
+			w, cs := rig.w, rig.cs
+			inFlight750(rig, tail, false)
+			release := holdAsHandler704(t, cs, true)
+			c := sendCQE750(rig, tc.res, 0)
+			if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, time.Now().UnixNano()) }) {
+				t.Fatalf("celeris#750: the send completion waited %v on a running handler's detachMu", stallWait704)
+			}
+			release()
+			// The goroutine returns from its handler to its park (no hand-back drained).
+			cs.asyncInMu.Lock()
+			setParked704(cs, true)
+			cs.asyncInMu.Unlock()
 
-	w.closeConn(rig.local)
-	t.Logf("celeris750 CLOSE held=%d closing=%v slot_owned=%v", heldSends750(cs), cs.closing, w.conns[rig.local] == cs)
-	rig.expectClosedOnce(t)
-	if heldSends750(cs) != 0 {
-		t.Errorf("%d completion(s) still held after the close", heldSends750(cs))
+			w.closeConn(rig.local)
+			t.Logf("celeris750 CLOSE arm=%s held=%d closing=%v slot_owned=%v OnError=%d", tc.name, heldSends750(cs),
+				cs.closing, w.conns[rig.local] == cs, len(rig.notified))
+			rig.expectClosedOnce(t)
+			if heldSends750(cs) != 0 {
+				t.Errorf("%d completion(s) still held after the close", heldSends750(cs))
+			}
+			if tc.res < 0 {
+				want := errIORingSend(tc.res).Error()
+				if len(rig.notified) != 1 || rig.notified[0].Error() != want {
+					t.Errorf("OnError calls = %v, want exactly one %q", rig.notified, want)
+				}
+			}
+			cs.asyncInMu.Lock()
+			cs.asyncRun = false
+			cs.asyncInMu.Unlock()
+		})
 	}
-	cs.asyncInMu.Lock()
-	cs.asyncRun = false
-	cs.asyncInMu.Unlock()
+}
+
+// TestIouringSendCompletionStillWaitsForABoundedHolder is the negative control
+// for the unit arms, as #704's TestIouringCloseStillWaitsForABoundedHolder is
+// for the close. The dispatch goroutine is PARKED, or past a Detach (it no
+// longer holds the lock across a handler), so whoever holds detachMu is a
+// guarded writeFn in one write, a hold bounded by a syscall. A completion must
+// wait for it, as it always has, and be applied then: held instead, it would
+// wait for a hand-back that nothing owes.
+func TestIouringSendCompletionStillWaitsForABoundedHolder(t *testing.T) {
+	const tail = "the rest of response 1"
+	for _, tc := range []struct {
+		name  string
+		setup func(cs *connState) (running bool)
+	}{
+		{"parked", func(*connState) bool { return false }},
+		{"after_detach", func(cs *connState) bool { cs.asyncDetachUnlocked = true; return true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newStallRig704(t)
+			w, cs := rig.w, rig.cs
+			inFlight750(rig, tail, false)
+			release := holdAsHandler704(t, cs, tc.setup(cs))
+			c := sendCQE750(rig, int32(len(tail)), 0)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				w.handleSend(c, rig.local, time.Now().UnixNano())
+			}()
+			select {
+			case <-done:
+				t.Fatal("handleSend returned while a bounded holder held detachMu: the completion was held, and " +
+					"nothing owes it back")
+			case <-time.After(200 * time.Millisecond):
+			}
+			release()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("handleSend never returned after the holder released detachMu")
+			}
+			t.Logf("celeris750 BOUNDED arm=%s held=%d sending=%v", tc.name, heldSends750(cs), cs.sending)
+			if heldSends750(cs) != 0 || cs.sending || len(cs.sendBuf) != 0 {
+				t.Errorf("the completion was not applied after the bounded holder let go: held=%d sending=%v "+
+					"sendBuf=%q", heldSends750(cs), cs.sending, cs.sendBuf)
+			}
+		})
+	}
 }
 
 // ---- end to end: the issue's measurement --------------------------------
