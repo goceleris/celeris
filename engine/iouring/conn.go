@@ -272,10 +272,25 @@ type connState struct {
 	closeOwed bool
 	// relinkOwed (guarded by asyncInMu) is set by the dirty-list pass when it
 	// gives the conn up because its dispatch goroutine holds detachMu across
-	// a handler (celeris#704). The goroutine hands cs back through the detach
-	// queue at the top of its next loop, after the handler's own flush, and
-	// drainDetachQueue puts it on the dirty list again.
+	// a handler (celeris#704), and by a send completion held for the same
+	// reason (heldSends, celeris#750). The goroutine hands cs back through
+	// the detach queue at the top of its next loop, after the handler's own
+	// flush, and drainDetachQueue applies the held completions and puts it
+	// on the dirty list again.
 	relinkOwed bool
+	// heldSends (worker-thread only) are the ring SEND completions of this
+	// conn that arrived while its dispatch goroutine held detachMu across a
+	// handler, in arrival order (a SEND_ZC gives two). handleSend applies a
+	// completion under detachMu, and waiting for the lock parked the worker,
+	// and every connection of its ring, until the handler returned
+	// (celeris#750, a fifth celeris#704 site). A completion cannot be dropped:
+	// it is held, with relinkOwed set, and replayHeldSends applies it when the
+	// goroutine hands the conn back, or when the conn is closed, before
+	// anything else acts on the conn. Until then cs.sending (or
+	// zcNotifPending) stays set, so no other SEND starts and every raw write
+	// waits (celeris#751). The kernel's side of each is done:
+	// kernelInflight was settled when it was dispatched.
+	heldSends []completionEntry
 	// closeErr (worker-thread only) is the error handleRecv's peer-FIN or
 	// recv-error branch owes a detached middleware (OnError) when it met a
 	// running handler holding detachMu. The branch used to deliver it under
@@ -531,6 +546,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncParked = false
 	cs.closeOwed = false
 	cs.relinkOwed = false
+	cs.heldSends = cs.heldSends[:0]
 	cs.closeErr = nil
 	cs.transplantPending.Store(false)
 	cs.sweepKick = nil
