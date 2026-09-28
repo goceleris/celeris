@@ -609,6 +609,31 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// engine each is the sum over both sub-engines.
 	CloseFDDeferred uint64
 	CloseFDForced   uint64
+	// CloseZCNotifHeld, CloseZCNotifForced and ShutdownZCBufRetained count
+	// how the io_uring engine keeps a SEND_ZC's send buffer for as long as
+	// the kernel may read it (celeris#812). A zero-copy send leaves its
+	// unsent part queued on the socket as references to the buffer's pages,
+	// and a peer that stops reading keeps it there, after a close too, until
+	// the peer reads or the kernel gives up on the socket; the kernel then
+	// sends it from whatever the buffer holds. Released to be reused before
+	// that, the buffer delivered another connection's bytes to that peer.
+	//
+	//   - CloseZCNotifHeld: closed connections whose connState, and send
+	//     buffer, the release backstop held past its 5 s because a SEND_ZC
+	//     was still owed on the buffer; each is released when the kernel
+	//     says it is done. A rate: a connection the server closed while its
+	//     peer had stopped reading mid-send.
+	//   - CloseZCNotifForced: send buffers released while a SEND_ZC was still
+	//     owed on them. Must stay 0.
+	//   - ShutdownZCBufRetained: send buffers engine shutdown kept for the
+	//     life of the process, because a SEND_ZC may still read them when the
+	//     io_uring ring closes and nothing can say when it stops.
+	//
+	// io_uring-only and cumulative; zero on other engines. On the adaptive
+	// engine each is the sum over both sub-engines.
+	CloseZCNotifHeld      uint64
+	CloseZCNotifForced    uint64
+	ShutdownZCBufRetained uint64
 	// TransplantSweepPasses counts passes of the post-switch sweep, the
 	// re-examination that moves a connection the drain would otherwise
 	// reach only at that connection's own next event — which, for a

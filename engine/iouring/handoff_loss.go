@@ -112,6 +112,19 @@ import (
 //     batched per loop iteration (Worker.closeFDDeferredBatch).
 //   - closeFDForced: such descriptors the pendingRelease backstop closed
 //     with an op still owed. Must stay 0.
+//
+// And what a SEND_ZC's send buffer is kept for (celeris#812; see
+// zc_send_buffer.go), three more:
+//
+//   - zcNotifHeld: closed connections the pendingRelease backstop held past
+//     its 5 s because a SEND_ZC was still owed on the send buffer, until the
+//     notification. A rate: a connection closed on a peer that stopped
+//     reading mid-send.
+//   - zcNotifForced: closed connections whose accounting was dropped with a
+//     SEND_ZC still owed, i.e. a send buffer given up to the pool or the GC
+//     while the kernel may still send from it. Must stay 0.
+//   - zcBufRetained: send buffers worker shutdown kept for the life of the
+//     process, because a SEND_ZC may still read them when the ring closes.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -127,11 +140,32 @@ type handoffLossStats struct {
 	reapUnsupported           atomic.Uint64
 	closeFDDeferred           atomic.Uint64
 	closeFDForced             atomic.Uint64
+	zcNotifHeld               atomic.Uint64
+	zcNotifForced             atomic.Uint64
+	zcBufRetained             atomic.Uint64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {
 	if s != nil {
 		s.closeFDForced.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteCloseZCNotifHeld() {
+	if s != nil {
+		s.zcNotifHeld.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteCloseZCNotifForced() {
+	if s != nil {
+		s.zcNotifForced.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteShutdownZCBufRetained(n uint64) {
+	if s != nil {
+		s.zcBufRetained.Add(n)
 	}
 }
 

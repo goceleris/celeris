@@ -584,6 +584,9 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
 		CloseFDDeferred:           e.metrics.handoffLoss.closeFDDeferred.Load(),
 		CloseFDForced:             e.metrics.handoffLoss.closeFDForced.Load(),
+		CloseZCNotifHeld:          e.metrics.handoffLoss.zcNotifHeld.Load(),
+		CloseZCNotifForced:        e.metrics.handoffLoss.zcNotifForced.Load(),
+		ShutdownZCBufRetained:     e.metrics.handoffLoss.zcBufRetained.Load(),
 
 		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
 		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),
