@@ -80,8 +80,8 @@ func takeSQEs(r *Ring) []sqeRec {
 	return out
 }
 
-// fdlHandler answers "ok", or a body large enough for the scatter-gather
-// (WRITEV) path on /large.
+// fdlHandler answers "ok", or a 16 KiB body on /large (over the H1 adapter's
+// 8 KiB zero-copy threshold, which io_uring no longer uses: celeris#817).
 type fdlHandler struct{}
 
 var fdlLargeBody = make([]byte, 16<<10)
