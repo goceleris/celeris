@@ -115,7 +115,10 @@ func ProbeWith(sp *SyscallProber) engine.CapabilityProfile { //nolint:revive // 
 	// that are not worth supporting in a production HTTP engine. 5.10 is
 	// the cut-off: Debian 11, RHEL 8.5+, and every distro since carry
 	// 5.10+. Kernels below 5.10 fall through to the epoll path above.
-	// See celeris#287 Finding 3.
+	// See celeris#287 Finding 3. The profile describes what the kernel
+	// has; the io_uring ENGINE needs more, Linux 5.19, and refuses a
+	// kernel that rejects the IORING_ASYNC_CANCEL flags its cancels use
+	// (celeris#682, iouring.New), so a 5.10-5.18 Base-tier kernel runs epoll.
 	if kv.AtLeast(5, 10) && sp.ProbeIOUring != nil {
 		features, ops, err := sp.ProbeIOUring()
 		if err == nil {

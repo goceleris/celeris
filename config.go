@@ -31,7 +31,8 @@ const (
 	Adaptive EngineType = EngineType(engine.Adaptive)
 	// Epoll uses Linux edge-triggered epoll for I/O (Linux only).
 	Epoll EngineType = EngineType(engine.Epoll)
-	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.10+ required).
+	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.19+ required;
+	// on an older kernel the engine fails to start, celeris#682).
 	IOUring EngineType = EngineType(engine.IOUring)
 	// Std uses Go's net/http standard library server (all platforms).
 	Std EngineType = EngineType(engine.Std)
