@@ -79,14 +79,17 @@ type WorkerLoop interface {
 	// On the io_uring engine the caller may close fd as soon as UnregisterConn
 	// returns, without waiting for onClose: the engine works on its own
 	// duplicate of fd, taken by RegisterConn, and closes it just before onClose
-	// fires (celeris#691). Until onClose fires, fd's number stays registered on
-	// that worker: a RegisterConn there of the next socket to get the number,
-	// as the lowest free number usually is, fails with "fd already registered"
-	// until then. Closing fd before UnregisterConn does not affect this engine.
-	// The epoll engine fires onClose before UnregisterConn returns, but a
-	// worker already inside the conn's read loop still reads fd by number
-	// afterwards, so a number reused at once can lose its first bytes to it
-	// (celeris#710).
+	// fires (celeris#691). It closes it off the worker, so a close that
+	// lingers (SO_LINGER) delays that conn's onClose, not the worker's other
+	// connections (celeris#735). Until onClose fires, fd's number may stay
+	// registered on that worker: a RegisterConn there of the next socket to
+	// get the number, as the lowest free number usually is, fails with "fd
+	// already registered" until the conn is finalized, which is at the latest
+	// when onClose fires. Closing fd before UnregisterConn does not affect
+	// this engine. The epoll engine fires onClose before UnregisterConn
+	// returns, but a worker already inside the conn's read loop still reads fd
+	// by number afterwards, so a number reused at once can lose its first
+	// bytes to it (celeris#710).
 	UnregisterConn(fd int) error
 	// Write enqueues data for transmission on fd. The call does not block on
 	// the kernel send buffer: data is buffered and flushed asynchronously by
