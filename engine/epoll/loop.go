@@ -1779,6 +1779,15 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 		// drainDetachQueue, which also runs there.
 		l.removeDirty(cs)
 		l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
+		// The request's strings are views of cs.buf (celeris#733). The
+		// handler is still running, and a hijacking handler typically keeps
+		// the path, params and headers for the goroutine that will serve
+		// the connection, so the buffer must not go back to the pool with
+		// cs: the next connection to take cs from the pool would receive its
+		// request into it, on any worker, even before this handler returns.
+		// Dropping it costs one buffer allocation per hijack, when that
+		// connState is next acquired.
+		cs.buf = nil
 		releaseConnState(cs)
 	}
 	return c, err
