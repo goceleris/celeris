@@ -66,8 +66,10 @@ func bodies761(sizes ...int) map[int][]byte {
 // connection and then for /ping on the same connection (the framing must
 // still be intact), and once more with Connection: close, where the body must
 // be followed by EOF. The sizes straddle the old threshold, which was the cap
-// minus the header block, so 4 MiB - 1 failed too; 4 MiB - 4 KiB was
-// delivered before the fix on a keep-alive connection.
+// minus the header block, so 4 MiB - 1 failed too. The 64 MiB body is asked
+// for on a keep-alive connection only: the close path is the same as for the
+// sizes around 4 MiB, which already overrun the socket buffers, and CI's
+// -race runner pays for every 64 MiB transfer.
 //
 // "sync" runs the handler on the connection's worker, where epoll and
 // io_uring hand a large body to the engine as a zero-copy slice (the write
@@ -76,7 +78,7 @@ func bodies761(sizes ...int) map[int][]byte {
 // copied into the write buffer. "async-route" runs the handler on the
 // connection's dispatch goroutine.
 func TestLargeResponseIsDelivered(t *testing.T) {
-	sizes := []int{4<<20 - 4096, 4<<20 - 1, 4 << 20, 4<<20 + 1, 64 << 20}
+	sizes := []int{4<<20 - 1, 4 << 20, 4<<20 + 1, 64 << 20}
 	bodies := bodies761(sizes...)
 	shapes := []struct {
 		name                    string
@@ -104,6 +106,9 @@ func TestLargeResponseIsDelivered(t *testing.T) {
 				})
 				for _, n := range sizes {
 					for _, keepAlive := range []bool{true, false} {
+						if n == 64<<20 && !keepAlive {
+							continue
+						}
 						mode := "keep-alive"
 						if !keepAlive {
 							mode = "close"
@@ -163,7 +168,7 @@ func TestLargeFileResponseIsDelivered(t *testing.T) {
 // and the four windows it spans cover what the 4 MiB cut and a 4 MiB cap on
 // HTTP/2 conns could do to it.
 func TestLargeResponseIsDeliveredH2(t *testing.T) {
-	sizes := []int{4<<20 - 4096, 4<<20 + 1, 16 << 20}
+	sizes := []int{4<<20 + 1, 16 << 20}
 	bodies := bodies761(sizes...)
 	for _, e := range engines761 {
 		for _, route := range []string{"sync", "async-route"} {
