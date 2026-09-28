@@ -1172,19 +1172,21 @@ func (w *Worker) run(ctx context.Context) {
 			// SQEs and reaps their completions through the normal path —
 			// until no send is queued or in flight, bounded by
 			// shutdownSendDrainNanos so a peer that stopped reading
-			// cannot hold shutdown open. It accepts nothing meanwhile
-			// (celeris#759): a connection accepted now would be served
-			// and then cut, and the wait for HTTP/2 below can last the
-			// whole budget; net/http's Shutdown closes its listeners
-			// first.
+			// cannot hold shutdown open. The loop keeps accepting for
+			// that window — it is the ordinary iteration — which is the
+			// graceful side of the trade: a connection that arrives
+			// inside it is answered rather than reset.
 			//
 			// First, though, the HTTP/2 stream handlers on the shared
 			// worker pool (celeris#759): they run off this loop, and their
 			// responses come back through the conns' write queues, which
 			// only this loop drains. The send drain's clock starts once they
-			// are done.
-			w.stopAccepting(ctx)
+			// are done. That wait can last the whole budget, so it accepts
+			// nothing (stopAccepting): a connection accepted in it was
+			// served and then cut at the budget. net/http's Shutdown closes
+			// its listeners first.
 			if !w.h2PoolSettled() {
+				w.stopAccepting(ctx)
 				w.shutdownDrainDeadline = 0
 			} else {
 				if w.shutdownDrainDeadline == 0 {
@@ -2371,12 +2373,15 @@ func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 }
 
 // stopAccepting cancels the accept and closes the listener, once the
-// worker's context is cancelled (celeris#759). The worker goes on turning
-// after that, for its HTTP/2 conns (h2PoolSettled) and its send drain, and it
-// used to accept and serve new connections meanwhile, which were then cut at
-// the budget; net/http's Shutdown closes its listeners first. What is still
-// in the kernel's accept queue is reset, as the close in shutdown did.
-// Idempotent. Worker thread.
+// worker's context is cancelled and it waits for the HTTP/2 stream handlers
+// on the shared worker pool (celeris#759). That wait can last the whole
+// budget, and the worker accepted and served new connections meanwhile,
+// which were then cut at its end; net/http's Shutdown closes its listeners
+// first. What is still in the kernel's accept queue is reset, as the close
+// in shutdown did. Only then, not on every shutdown: the cancel submits the
+// SQ ring and handles its completions, and a shutdown with no HTTP/2 wait
+// goes straight on, leaving the driver conns' queued ops to shutdown
+// (TestDriverShutdownReleasesDescriptors). Idempotent. Worker thread.
 func (w *Worker) stopAccepting(ctx context.Context) {
 	if w.listenFD < 0 {
 		return
