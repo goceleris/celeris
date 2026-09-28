@@ -1405,7 +1405,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 				cs.h1State.InlineMode = true
 			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
-			if tryInline {
+			// A handler that ran inline and hijacked has had cs released to
+			// the pool inside the Hijack call (hijackConn's inline branch):
+			// cs.h1State is nil, and cs may already be another accept's
+			// connection. So cs is not touched again once ProcessH1 reports
+			// the hijack; the ErrHijacked return below is the only way out.
+			if tryInline && !errors.Is(processErr, conn.ErrHijacked) {
 				cs.h1State.InlineMode = false
 			}
 			if errors.Is(processErr, conn.ErrAsyncDispatch) {
@@ -1785,6 +1790,15 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 		// drainDetachQueue, which also runs there.
 		l.removeDirty(cs)
 		l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
+		// The request's strings are views of cs.buf (celeris#733). The
+		// handler is still running, and a hijacking handler typically keeps
+		// the path, params and headers for the goroutine that will serve
+		// the connection, so the buffer must not go back to the pool with
+		// cs: the next connection to take cs from the pool would receive its
+		// request into it, on any worker, even before this handler returns.
+		// Dropping it costs one buffer allocation per hijack, when that
+		// connState is next acquired.
+		cs.buf = nil
 		releaseConnState(cs)
 	}
 	return c, err

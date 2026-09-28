@@ -31,7 +31,8 @@ const (
 	Adaptive EngineType = EngineType(engine.Adaptive)
 	// Epoll uses Linux edge-triggered epoll for I/O (Linux only).
 	Epoll EngineType = EngineType(engine.Epoll)
-	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.10+ required).
+	// IOUring uses Linux io_uring for asynchronous I/O (Linux 5.19+ required;
+	// on an older kernel the engine fails to start, celeris#682).
 	IOUring EngineType = EngineType(engine.IOUring)
 	// Std uses Go's net/http standard library server (all platforms).
 	Std EngineType = EngineType(engine.Std)
@@ -106,8 +107,10 @@ type Config struct {
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout.
 	IdleTimeout time.Duration
-	// ShutdownTimeout is the max duration to wait for in-flight requests during
-	// graceful shutdown via StartWithContext (default 30s).
+	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
+	// the context of StartWithContext or StartWithListenerAndContext starts
+	// (default 30s): one deadline for the drain of in-flight requests and then
+	// the OnShutdown hooks, which run with what is left of it.
 	ShutdownTimeout time.Duration
 
 	// MaxFormSize is the maximum memory used for multipart form parsing

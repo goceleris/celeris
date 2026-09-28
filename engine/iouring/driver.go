@@ -85,34 +85,38 @@ type driverConn struct {
 	// 0, so a driverConn built any other way (a test's) closes nothing.
 	opFDOpen bool
 	// retired: dc has left the worker (finalized, as armDriverRecv's
-	// refusal is too, or dropped by shutdownDrivers) and opFD is closed.
-	// Set with closing, under mu. No SQE is prepared by opFD after it.
+	// refusal is too, or dropped by shutdownDrivers) and opFD is closed, or
+	// is being closed off the worker (closeOpFD). Set with closing, under mu.
+	// No SQE is prepared by opFD after it.
 	retired bool
 }
 
-// retire marks dc as gone from the worker and closes its descriptor, once.
-// Every path that removes dc from driverConns calls it, on the worker
-// goroutine: finalizeDriver (no SQE in flight, cancels included; it also
-// ends armDriverRecv's refusal, which goes through failDriverConn) and
-// shutdownDrivers (after which nothing is submitted; closing the ring
+// retire marks dc as gone from the worker and hands its caller the close of
+// the engine's descriptor, once: it reports whether opFD is open and now the
+// caller's to close. Every path that removes dc from driverConns calls it, on
+// the worker goroutine: finalizeDriver (no SQE in flight, cancels included;
+// it also ends armDriverRecv's refusal, which goes through failDriverConn)
+// and shutdownDrivers (after which nothing is submitted; closing the ring
 // cancels what is armed). Setting closing too makes a later UnregisterConn
 // or Write a no-op, so neither queues work for a conn that is gone, and
 // every path that prepares an SQE checks closing first.
 //
-// The close runs after mu is released: close(2) can block (SO_LINGER waits
-// for the peer to acknowledge the FIN), and UnregisterConn and Write take mu
-// on the driver's goroutines. Clearing opFDOpen under mu is what makes the
-// close retire's alone.
-func (dc *driverConn) retire() {
+// retire does not close. close(2) can block: with SO_LINGER set and data
+// still unsent to a peer that is not reading, the last close of a socket
+// waits for the FIN's ACK for up to the linger time, and after UnregisterConn
+// and the caller's own close, opFD is the last reference. On the worker that
+// wait stalled every connection of the ring for as long (celeris#735), and
+// under mu it blocked UnregisterConn and Write on the driver's goroutines.
+// finalizeDriver closes on a goroutine of its own (closeOpFD). Clearing
+// opFDOpen under mu is what makes the close the caller's alone.
+func (dc *driverConn) retire() (closeOpFD bool) {
 	dc.mu.Lock()
 	dc.closing = true
 	dc.retired = true
-	closeOpFD := dc.opFDOpen
+	closeOpFD = dc.opFDOpen
 	dc.opFDOpen = false
 	dc.mu.Unlock()
-	if closeOpFD {
-		_ = unix.Close(dc.opFD)
-	}
+	return closeOpFD
 }
 
 // driverAction is one pending driver-side action to be applied by the worker
@@ -130,6 +134,9 @@ const (
 	// queue purely as the existing cross-thread wakeup primitive; the adopted fd
 	// becomes a normal entry in w.conns (not a driverConn).
 	driverActionAdopt
+	// driverActionClosed fires the onClose of a finalized conn once closeOpFD
+	// has closed its descriptor off the worker (celeris#735), with closeErr.
+	driverActionClosed
 )
 
 type driverAction struct {
@@ -138,6 +145,8 @@ type driverAction struct {
 	// adopt-only (#383): the real fd to adopt + its carried-over state.
 	adoptFD    int
 	adoptCarry engine.Carryover
+	// closed-only (celeris#735): the error onClose is fired with.
+	closeErr error
 }
 
 // addDriverAction enqueues work for the worker and wakes it: the wakeup
@@ -351,6 +360,8 @@ func (w *Worker) drainDriverActions() {
 			w.flushDriverSend(a.dc)
 		case driverActionAdopt:
 			w.attachAdoptedFD(a.adoptFD, a.adoptCarry)
+		case driverActionClosed:
+			a.dc.fireOnClose(a.closeErr)
 		}
 	}
 	// Same guard as the detach queue: a driverAction holds pointers, so
@@ -684,17 +695,77 @@ func (w *Worker) shutdownDrivers() {
 		// If UnregisterConn got here first, the cancel-CQE path would have
 		// fired onClose, but the ring is being torn down, so it fires here
 		// instead; finalizeDriver's map check guards against double-fire.
-		// retire also closes the engine's descriptor (celeris#691). Nothing
+		// The engine's descriptor is closed here too (celeris#691). Nothing
 		// is submitted after this point, so an SQE still carrying its number
 		// never reaches the kernel; closing the ring later in shutdown()
-		// cancels the ops armed on the socket.
-		dc.retire()
-		cb := dc.onClose
-		dc.onClose = nil
-		if cb != nil {
-			cb(errEngineShutdown)
+		// cancels the ops armed on the socket. On this goroutine: the worker
+		// serves nothing more, and shutdown waits for the closes it handed
+		// off anyway (below).
+		if dc.retire() {
+			_ = unix.Close(dc.opFD)
 		}
+		dc.fireOnClose(errEngineShutdown)
 	}
+}
+
+// waitDriverCloses is the end of shutdownDrivers for the conns finalized
+// before it (celeris#735): it waits until every descriptor closeOpFD handed
+// off has been closed, and then fires the onClose each of those conns is
+// still owed, on this goroutine. The loop that would have fired them from
+// the driver-action queue has stopped, and a closer queues its action before
+// it is counted done, so after the wait every one of them is in the queue.
+// The other actions stay queued, as closeAdoptQueue leaves them. Worker
+// goroutine, from shutdown.
+func (w *Worker) waitDriverCloses() {
+	w.driverClosers.Wait()
+	w.driverActionMu.Lock()
+	var closed []driverAction
+	kept := w.driverActionQueue[:0]
+	for _, a := range w.driverActionQueue {
+		if a.kind == driverActionClosed {
+			closed = append(closed, a)
+			continue
+		}
+		kept = append(kept, a)
+	}
+	clear(w.driverActionQueue[len(kept):])
+	w.driverActionQueue = kept
+	if len(kept) == 0 {
+		w.driverActionPending.Store(0)
+	}
+	w.driverActionMu.Unlock()
+	for _, a := range closed {
+		a.dc.fireOnClose(a.closeErr)
+	}
+}
+
+// fireOnClose calls dc's onClose with err, at most once. Worker goroutine.
+func (dc *driverConn) fireOnClose(err error) {
+	cb := dc.onClose
+	dc.onClose = nil
+	if cb != nil {
+		cb(err)
+	}
+}
+
+// closeOpFD closes dc's engine descriptor on a goroutine of its own and then
+// queues dc's onClose, with err, for the worker goroutine (driverActionClosed).
+// The worker never waits on the close: with SO_LINGER set and data unsent to
+// a peer that is not reading, it lasts up to the linger time, and on the
+// worker it stalled every connection of the ring, HTTP and driver alike, for
+// as long (celeris#735). The order a driver sees is kept: the socket has
+// closed, as far as close(2) closes it, before onClose runs, and onClose
+// still runs on the worker goroutine (engine/provider.go). dc left the driver
+// map and was retired before this, so nothing issues an SQE by opFD any more
+// and its number is not reused before the close. Shutdown waits for the close
+// (waitDriverCloses). Worker goroutine.
+func (w *Worker) closeOpFD(dc *driverConn, err error) {
+	w.driverClosers.Add(1)
+	go func() {
+		defer w.driverClosers.Done()
+		_ = unix.Close(dc.opFD)
+		w.addDriverAction(driverAction{kind: driverActionClosed, dc: dc, closeErr: err})
+	}()
 }
 
 // finalizeDriver removes dc from the driver map, flips the gate if the map
@@ -702,7 +773,8 @@ func (w *Worker) shutdownDrivers() {
 // callback exactly once. The descriptor goes first: a caller that closed fd
 // after UnregisterConn has let go of the socket, and with the engine's
 // descriptor closed and no op in flight, the peer sees it close before
-// onClose runs.
+// onClose runs. The close runs off the worker, and onClose after it
+// (closeOpFD, celeris#735).
 func (w *Worker) finalizeDriver(dc *driverConn, err error) {
 	w.driverMu.Lock()
 	if existing, ok := w.driverConns[dc.fd]; !ok || existing != dc {
@@ -715,10 +787,9 @@ func (w *Worker) finalizeDriver(dc *driverConn, err error) {
 	}
 	w.driverMu.Unlock()
 
-	dc.retire()
-	cb := dc.onClose
-	dc.onClose = nil
-	if cb != nil {
-		cb(err)
+	if dc.retire() {
+		w.closeOpFD(dc, err)
+		return
 	}
+	dc.fireOnClose(err)
 }
