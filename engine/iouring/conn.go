@@ -255,6 +255,33 @@ type connState struct {
 	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
+	// asyncParked (guarded by asyncInMu) is set while the dispatch goroutine
+	// is in its park loop: waiting for input on asyncCond, or deciding at the
+	// boundary whether to exit. It holds no detachMu there. dispatchBusy reads
+	// it to tell a goroutine that may hold detachMu across a handler from one
+	// that cannot (celeris#704).
+	asyncParked bool
+	// closeOwed (guarded by asyncInMu) is set by closeConn when it finds
+	// detachMu held by this conn's RUNNING dispatch goroutine, i.e. held
+	// across a user handler, and leaves the close to that goroutine instead
+	// of parking the worker on the lock for the rest of the handler
+	// (celeris#704). asyncClosed is already set, so the goroutine exits at its
+	// next check, and the exit that finds closeOwed hands cs back through the
+	// detach queue, whose asyncClosed branch runs closeConn again, on the
+	// worker, with the lock free.
+	closeOwed bool
+	// relinkOwed (guarded by asyncInMu) is set by the dirty-list pass when it
+	// gives the conn up because its dispatch goroutine holds detachMu across
+	// a handler (celeris#704). The goroutine hands cs back through the detach
+	// queue at the top of its next loop, after the handler's own flush, and
+	// drainDetachQueue puts it on the dirty list again.
+	relinkOwed bool
+	// closeErr (worker-thread only) is the error handleRecv's peer-FIN or
+	// recv-error branch owes a detached middleware (OnError) when it met a
+	// running handler holding detachMu. The branch used to deliver it under
+	// the lock before closing; it now leaves it to closeConn, which delivers
+	// it under the lock when the close actually runs (celeris#704).
+	closeErr error
 	// transplantPending (#383 reverse, async) is set by the dispatch
 	// goroutine when it reaches a clean park boundary while an io_uring→epoll
 	// drain is active: it marks itself for hand-off, sets asyncRun=false,
@@ -501,6 +528,10 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.asyncParked = false
+	cs.closeOwed = false
+	cs.relinkOwed = false
+	cs.closeErr = nil
 	cs.transplantPending.Store(false)
 	cs.sweepKick = nil
 	cs.asyncPromoted.Store(false)
@@ -534,4 +565,59 @@ func releaseConnState(cs *connState) {
 	cs.fd = 0
 	cs.liveIdx = -1
 	connStatePool.Put(cs)
+}
+
+// endDispatch marks cs's dispatch goroutine as gone and reports whether it
+// owes the worker a hand-back: a close or a relink left to it (closeOwed,
+// relinkOwed; celeris#704). The goroutine calls it on every exit path,
+// holding cs.asyncInMu. A path that enqueues cs on its way out ignores the
+// result: that enqueue is the hand-back, and drainDetachQueue settles both
+// debts (the asyncClosed branch runs the close; any other entry puts the conn
+// back on the dirty list). The paths that exit WITHOUT enqueuing must enqueue
+// when it reports true, or the close or the recv arm it stands for is lost.
+func (cs *connState) endDispatch() (owed bool) {
+	cs.asyncRun = false
+	cs.asyncParked = false
+	owed = cs.closeOwed || cs.relinkOwed
+	cs.closeOwed = false
+	cs.relinkOwed = false
+	return owed
+}
+
+// dispatchBusy reports whether cs's dispatch goroutine may be holding
+// cs.detachMu across a user handler: it is alive (asyncRun), not in its park
+// loop (asyncParked), and has not released the lock for good at a Detach
+// (asyncDetachUnlocked). All three are read under asyncInMu. Worker thread.
+//
+// It is how a worker-thread site that found cs.detachMu held (TryLock failed)
+// tells the holders apart (celeris#704, the io_uring twin of celeris#669). The
+// dispatch goroutine holds the lock across ProcessH1, i.e. for as long as the
+// handler runs, and it is running whenever it does. Every other holder, a
+// detached conn's guarded writeFn, holds it for one write. So a site that
+// finds the lock held while this reports true must not wait, and one that
+// finds it held while this reports false may wait as it always has: that wait
+// is bounded.
+//
+// After Detach the goroutine never takes the lock across ProcessH1 again, so
+// it is excluded even while it runs: a handler may keep streaming after
+// Detach, and a close left to it would wait for that handler, which in turn
+// waits for the close's OnDetachClose to learn it should stop.
+//
+// If owe is non-nil and the result is true, *owe is set in the same critical
+// section: the goroutine reads it under asyncInMu at the top of its next loop
+// or at its exit, so it cannot miss it. A running goroutine is not
+// necessarily the holder, and every caller acts on a true only by leaving
+// work to the goroutine, which hands it back; a false positive costs a
+// hand-back, never a lost close or flush.
+func dispatchBusy(cs *connState, owe *bool) bool {
+	if cs.asyncCond.L == nil {
+		return false // no async machinery: sync mode, no dispatch goroutine
+	}
+	cs.asyncInMu.Lock()
+	busy := cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked
+	if busy && owe != nil {
+		*owe = true
+	}
+	cs.asyncInMu.Unlock()
+	return busy
 }

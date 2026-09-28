@@ -74,10 +74,12 @@ type chanReader struct {
 	//
 	// Append is single-producer (the owning engine worker thread) and the
 	// only writer to spill; Read is the only consumer. spillMu serializes
-	// the two. spillLen mirrors len(spill) so the steady-state hot path —
-	// nothing has ever spilled — never takes that mutex at all, and so an
-	// Append observing zero knows the spill stays empty for the duration
-	// of its channel send.
+	// the two. spillLen mirrors len(spill) so that, while chunks are flowing
+	// and nothing has spilled, neither side takes that mutex: an Append
+	// observing zero knows the spill stays empty for the duration of its
+	// channel send, and a Read that has just dequeued knows there is nothing
+	// to promote. Read takes spillMu only when it finds the channel empty,
+	// before it blocks (celeris#705, see next).
 	spillLen atomic.Int64
 	spillMu  sync.Mutex
 	spill    [][]byte
@@ -177,12 +179,7 @@ func (r *chanReader) Append(chunk []byte) bool {
 	// behind it. Append is the only producer, so an empty spill observed
 	// here cannot become non-empty before the channel send below.
 	if r.spillLen.Load() > 0 {
-		if !r.spillChunk(chunk) {
-			r.closeWith(ErrReadLimit)
-			return false
-		}
-		r.requestPause()
-		return true
+		return r.queueBehind(chunk)
 	}
 
 	select {
@@ -198,32 +195,68 @@ func (r *chanReader) Append(chunk []byte) bool {
 		// engine's in-flight burst outran the headroom (celeris#484).
 		// Spill rather than discard — these bytes are already off the
 		// socket, so dropping them would truncate a healthy stream.
-		if !r.spillChunk(chunk) {
-			r.closeWith(ErrReadLimit)
-			return false
-		}
-		r.requestPause()
-		return true
+		return r.queueBehind(chunk)
 	}
 }
 
-// spillChunk queues chunk behind the full channel and accounts for it.
-// Returns false when the spill is also full, which is the genuine
-// read-limit condition: the peer has outrun both the channel and a full
-// extra channel of spill. Both counters live here so they cannot diverge
-// between Append's two spill paths.
-func (r *chanReader) spillChunk(chunk []byte) bool {
+// queueBehind is Append for a chunk that could not simply take the channel's
+// tail: the channel was full, or chunks were already spilled. It queues the
+// chunk with spillChunk and poisons the reader with ErrReadLimit when the
+// spill is full too. It requests the pause when the chunk spilled, and
+// otherwise (spillChunk's retry put it in the channel, which the handler had
+// drained in the meantime) only when the channel is at highWater, exactly as
+// Append's channel path does: a chunk that sits below highWater in a drained
+// channel is no reason to pause the engine.
+func (r *chanReader) queueBehind(chunk []byte) bool {
+	spilled, ok := r.spillChunk(chunk)
+	if !ok {
+		r.closeWith(ErrReadLimit)
+		return false
+	}
+	if spilled || len(r.ch) >= r.highWater {
+		r.requestPause()
+	}
+	return true
+}
+
+// spillChunk queues chunk behind everything already buffered and accounts
+// for it: into the channel when nothing is spilled and the channel has room,
+// otherwise at the tail of the spill. spilled reports which. ok is false when
+// the spill is also full, which is the genuine read-limit condition: the peer
+// has outrun both the channel and a full extra channel of spill. Both counters
+// live here so they cannot diverge between Append's two spill paths.
+//
+// The channel is tried again, under spillMu, because Append's select found it
+// full some time before this runs (celeris#705). In between, the handler may
+// have drained it and parked in Read on the empty channel, and a Read parked
+// there never promotes spill: refillFromSpill runs only after a dequeue. A
+// chunk put in the spill then was stranded for good, since requestPause keeps
+// the engine paused while anything is spilled. The retry and next's
+// promoteSpill both run under spillMu, so whichever runs second sees what the
+// first did: either this send finds the room the handler made, or the
+// handler, before it blocks, finds the chunk in the spill.
+func (r *chanReader) spillChunk(chunk []byte) (spilled, ok bool) {
 	r.spillMu.Lock()
+	if len(r.spill) == 0 {
+		// Nothing is spilled, so every buffered chunk is in the channel and
+		// the chunk can take the channel's tail without reordering the stream.
+		select {
+		case r.ch <- chunk:
+			r.spillMu.Unlock()
+			return false, true
+		default:
+		}
+	}
 	if r.spillMax <= 0 || len(r.spill) >= r.spillMax {
 		r.spillMu.Unlock()
 		r.dropped.Add(1)
-		return false
+		return false, false
 	}
 	r.spill = append(r.spill, chunk)
 	r.spillLen.Store(int64(len(r.spill)))
 	r.spillMu.Unlock()
 	r.spilled.Add(1)
-	return true
+	return true, true
 }
 
 // requestPause asks the engine to suspend inbound delivery, edge-triggered
@@ -302,7 +335,8 @@ func (r *chanReader) requestPause() {
 	// in Read under pausedMu, which now sees pausedState == true, so the
 	// pause cannot go stale again once this critical section ends. The spill
 	// guard matches Read's: never resume while chunks are still queued behind
-	// the channel.
+	// the channel. Read promotes them (before it blocks, if it must;
+	// celeris#705) and lifts the pause once it has drained to lowWater.
 	if r.resume != nil && len(r.ch) <= r.lowWater && !r.hasSpill() {
 		r.pausedState = false
 		r.resume()
@@ -324,27 +358,112 @@ func (r *chanReader) resumeIfDrained() {
 }
 
 // refillFromSpill moves spilled chunks into the channel's tail while there
-// is room. Order is preserved: every spill chunk is later than every chunk
-// already in ch.
+// is room, after a dequeue. It skips the lock when spillLen reads zero, so
+// it can miss a chunk that spillChunk is still queuing; next's promoteSpill
+// is the check that cannot.
 func (r *chanReader) refillFromSpill() {
 	if r.spillLen.Load() == 0 {
 		return
 	}
 	r.spillMu.Lock()
 	defer r.spillMu.Unlock()
-	i := 0
-	for ; i < len(r.spill); i++ {
+	r.promoteLocked()
+}
+
+// promoteSpill is refillFromSpill without the lock-free shortcut: it always
+// takes spillMu, so it sees any chunk spillChunk has queued. It reports
+// whether it moved any chunk into the channel.
+func (r *chanReader) promoteSpill() bool {
+	r.spillMu.Lock()
+	defer r.spillMu.Unlock()
+	return r.promoteLocked()
+}
+
+// promoteLocked moves spilled chunks into the channel's tail while there is
+// room, and reports whether it moved any. Order is preserved: every spill
+// chunk is later than every chunk already in ch. spillMu must be held.
+func (r *chanReader) promoteLocked() bool {
+	n := 0
+promote:
+	for ; n < len(r.spill); n++ {
 		select {
-		case r.ch <- r.spill[i]:
-			r.spill[i] = nil
+		case r.ch <- r.spill[n]:
+			r.spill[n] = nil
 		default:
-			r.spill = r.spill[i:]
-			r.spillLen.Store(int64(len(r.spill)))
-			return
+			break promote
 		}
 	}
-	r.spill = nil
-	r.spillLen.Store(0)
+	if n == 0 {
+		return false
+	}
+	if n == len(r.spill) {
+		r.spill = nil
+	} else {
+		r.spill = r.spill[n:]
+	}
+	r.spillLen.Store(int64(len(r.spill)))
+	return true
+}
+
+// next returns the next chunk in stream order. It blocks until one arrives,
+// and reports the close only once nothing buffered is left to deliver.
+func (r *chanReader) next() ([]byte, error) {
+	for {
+		// The close flag is read FIRST, before the buffers are looked at, and
+		// the close is reported below only if it was already set here. The
+		// engine appends and closes on one thread: its worker calls Append
+		// for each chunk of a batch and then, on the peer's FIN or an error,
+		// the error handler that calls closeWith. So a close seen here comes
+		// after every chunk the engine appended before it, and the checks
+		// below find each of them, in the channel or in the spill. Read after
+		// those checks instead, the flag could come from a close that landed
+		// once they had found nothing, and the chunks appended just before
+		// that close would be dropped for an EOF (celeris#484's truncation).
+		// The window is real: promoteSpill can wait for spillMu while
+		// spillChunk's retry puts a chunk in the channel, and the worker can
+		// finish its batch and close before this goroutine runs again.
+		closed := r.closed.Load()
+		select {
+		case chunk := <-r.ch:
+			return chunk, nil
+		default:
+		}
+		// The channel is empty, but chunks can still be spilled behind it
+		// (celeris#705): refillFromSpill's lock-free check after the last
+		// dequeue may have run while spillChunk was queuing one. Blocking on
+		// the channel now would strand them, since only a dequeue promotes
+		// spill and none can come. So promote under spillMu first. This is
+		// the only place a Read takes spillMu with nothing spilled, and only
+		// once it has run out of chunks.
+		if r.promoteSpill() {
+			continue
+		}
+		// Buffered chunks were received BEFORE the close and must be
+		// delivered before it (celeris#484). A peer that sent data and
+		// then went away still sent that data; reporting the close while
+		// chunks are queued truncates the stream mid-frame and the
+		// handler sees "unexpected EOF". Measured under flood: readers
+		// were closed holding a completely full channel — 256 chunks
+		// discarded per connection. So the channel and the spill are
+		// drained first, and the close is reported only after, and only
+		// the close read before they were checked (see above).
+		if closed {
+			return nil, r.closeErr()
+		}
+		// Block for the next chunk, waking on close via done. r.ch is
+		// never closed, so a closed-channel receive can't be the wake
+		// signal here.
+		select {
+		case chunk := <-r.ch:
+			return chunk, nil
+		case <-r.done:
+			// The close landed after the flag was read above, possibly
+			// together with a final chunk (select picks randomly among
+			// ready cases), so loop: the flag is read again, and the
+			// channel and the spill are checked again, before the close
+			// is reported.
+		}
+	}
 }
 
 // Read implements io.Reader. Blocks until a chunk arrives or the reader
@@ -353,39 +472,11 @@ func (r *chanReader) refillFromSpill() {
 // in the steady state.
 func (r *chanReader) Read(p []byte) (int, error) {
 	if len(r.cur) == 0 {
-		// Buffered chunks were received BEFORE the close and must be
-		// delivered before it (celeris#484). A peer that sent data and
-		// then went away still sent that data; reporting the close while
-		// chunks are queued truncates the stream mid-frame and the
-		// handler sees "unexpected EOF". Measured under flood: readers
-		// were closed holding a completely full channel — 256 chunks
-		// discarded per connection. So try the buffer first, and only
-		// report the close once it is drained.
-		select {
-		case chunk := <-r.ch:
-			r.cur = chunk
-		default:
-			if r.closed.Load() {
-				return 0, r.closeErr()
-			}
-			// Block for the next chunk, waking on close via done. r.ch is
-			// never closed, so a closed-channel receive can't be the wake
-			// signal here.
-			select {
-			case chunk := <-r.ch:
-				r.cur = chunk
-			case <-r.done:
-				// The close and a final chunk can land together; select
-				// picks randomly among ready cases, so re-check the
-				// buffer rather than dropping what did arrive.
-				select {
-				case chunk := <-r.ch:
-					r.cur = chunk
-				default:
-					return 0, r.closeErr()
-				}
-			}
+		chunk, err := r.next()
+		if err != nil {
+			return 0, err
 		}
+		r.cur = chunk
 
 		// Taking a chunk freed a slot: promote spilled chunks into the
 		// channel's tail so len(r.ch) keeps reflecting the true buffered

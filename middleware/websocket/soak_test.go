@@ -100,7 +100,7 @@ func TestSoakSlowConsumer(t *testing.T) {
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- s.StartWithListenerAndContext(serverCtx, ln) }()
-	addr := waitForReady(t, s, 5*time.Second)
+	addr := waitForReady(t, s, serverDone, 5*time.Second)
 
 	// Snapshot baseline goroutines AFTER the server is up so we don't
 	// count engine workers as a leak.

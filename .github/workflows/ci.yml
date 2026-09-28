@@ -496,16 +496,34 @@ jobs:
       # engine, no io_uring ring -- so unlike the `adaptive` and `iouring` jobs
       # this needs nothing raised and has no environment skip to forbid.
       #
+      # celeris#706: the step also runs the tests of the server-start helpers
+      # (`^TestStartNativeServer`, `^TestWaitForReady`), which the backpressure
+      # tests use, in ./middleware/websocket and in ./middleware/static, which
+      # has its own copy of waitForReady: a Start that fails must fail the
+      # helper at once with Start's error. They start no engine (the engine
+      # type is one no factory knows), so they too have no environment skip.
+      #
+      # It first compiles the package's tests under the celeris_closeprobe
+      # tag, which no other step builds: a helper of that file shared a name
+      # with one celeris#671 added, and the tagged build stayed broken
+      # unnoticed.
+      #
       # `-run` is a regex over test names, so a rename would quietly select
       # nothing and go test would still exit 0 ("no tests to run"). The tally
-      # below is the interlock, as in the `iouring` job: exactly these six
-      # regression tests must report PASS at the top level -- the two
+      # below is the interlock, as in the `iouring` job: exactly these
+      # fourteen PASS lines must be reported at the top level -- the two
       # celeris#667 orderings, the celeris#672 stale pause, the pausedMu
       # panic release, SetPauser's ordering with the worker (reported only
-      # under -race, which this step runs), and the WakeFD lock order
-      # (celeris#666) -- and so must each of the ten subtests of the stale
-      # pause, the panic release and the lock order, so a capacity, a callback
-      # site or an interleaving dropped from a sweep turns the step red too.
+      # under -race, which this step runs), the WakeFD lock order
+      # (celeris#666), the two celeris#705 late-spill orders, the close that
+      # must not overtake chunks appended before it and the spilled chunk
+      # that must request the pause (both from the celeris#705 review), the
+      # re-check's spill guard (celeris#716), and the celeris#706 start-helper
+      # tests, TestWaitForReadyFailsFastOnStartError once per package -- and
+      # so must each of the fifteen subtests of the stale pause, the panic
+      # release, the lock order, the late spill and the close, so a capacity,
+      # a callback site or an interleaving dropped from a sweep turns the step
+      # red too.
       # A SKIP cannot satisfy it, because a skipped test prints
       # `--- SKIP`, never `--- PASS`. PASS lines carry the elapsed time after
       # the name, so the pattern ends at ` (`, never at the name.
@@ -522,18 +540,21 @@ jobs:
           WS484_BURST_FRAMES: "1000"
         run: |
           set -o pipefail
+          go vet -tags celeris_closeprobe ./middleware/websocket/
           go test -race -count=1 -timeout=300s -v \
-            -run '^(TestBackpressure|TestChanReader)' \
-            ./middleware/websocket/... 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu'
-          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)'
-          want=6
-          wantsub=10
+            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady)' \
+            ./middleware/websocket/... ./middleware/static/ 2>&1 | tee /tmp/ws667.log
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError'
+          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)|TestChanReaderSpillPublishedAfterDrain/(read-after-publication|closed-before-read|read-waiting-in-window)|TestChanReaderCloseKeepsChunksAppendedBeforeIt/(retried-into-channel|spilled-behind-full-channel)'
+          # 13 names; TestWaitForReadyFailsFastOnStartError passes once in
+          # each package.
+          want=14
+          wantsub=15
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)
-          echo "celeris#667/#672 regression tests: want $want, passed $passed; subtests want $wantsub, passed $subpassed"
+          echo "websocket/static regression tests (celeris#667/#672/#705/#706): want $want, passed $passed; subtests want $wantsub, passed $subpassed"
           if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ]; then
-            echo "expected exactly $want celeris#667/#672 regression tests and $wantsub of their subtests to PASS"
+            echo "expected exactly $want PASS lines of the websocket and static regression tests and $wantsub of their subtests"
             echo "-- was one renamed or removed, did a sweep lose a case, or did one skip or fail?"
             exit 1
           fi
@@ -824,7 +845,9 @@ jobs:
       # has shut down, two an SQE prepared by a descriptor number the
       # caller closes before the submit, three a driver cancel that
       # outlived its conn (#707), and three a register the worker applies
-      # after the number was closed and taken by an accept.
+      # after the number was closed and taken by an accept. Two more (n735)
+      # pin a driver close that lingers: off the worker, and waited for at
+      # shutdown (celeris#735).
       # TestDriverHTTPZeroOverhead is where the leak was first seen: 2 of 7
       # full-package runs failed on #674's branch (#691).
       #
@@ -838,7 +861,8 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           old='TestDriverRegisterUnregister|TestDriverHTTPZeroOverhead|TestDriverWriteSerialization|TestDriverCancelOnUnregister|TestIouringRegisterConnFDCollision|TestIouringShutdownFiresDriverOnClose|TestDriverUnknownFDReturnsErr|TestShutdownDriversRetainsConnsWithOpsInFlight'
           new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber|TestDriverFailureCancelCompletesBeforeRelease|TestDriverFailureCloseCompletionSparesConnOnReusedNumber|TestDriverStrayCloseCompletionSparesConn|TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP|TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP|TestDriverRefusedRegisterWaitsForItsSend'
-          names="${old}|${new}"
+          n735='TestDriverLingeringCloseDoesNotStallTheWorker|TestDriverShutdownWaitsForAHandedOffClose'
+          names="${old}|${new}|${n735}"
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           go test -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \

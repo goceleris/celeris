@@ -4,10 +4,17 @@
 # Reference: https://docs.coderabbit.ai/reference/configuration
 # `@coderabbitai configuration` on any pull request prints the resolved config.
 #
-# CodeRabbit is ADVISORY. It never requests changes or approves, it is not a
+# CodeRabbit is ADVISORY: it never requests changes or approves, it is not a
 # required check, and its comments are input to the human review, not a
-# verdict. The merge rule stays GOVERNANCE.md's: green required checks and a
-# code-owner approval.
+# verdict. It can still hold a merge until someone answers it: every inline
+# comment opens a review thread, and the `main` ruleset requires every thread
+# to be resolved (required_review_thread_resolution). CodeRabbit resolves its
+# own thread when a later push fixes the point. A thread you disagree with
+# (a false positive, a suggestion you are not taking) needs a reply that says
+# why and then "Resolve conversation", or `@coderabbitai resolve`, which
+# resolves all of CodeRabbit's threads on the pull request. The merge rule is
+# GOVERNANCE.md's: green required checks, every review thread resolved, and a
+# code-owner approval (celeris#725).
 
 language: en-US
 
