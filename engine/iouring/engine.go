@@ -495,8 +495,9 @@ func fallbackTier(current TierStrategy) TierStrategy {
 // driven by context cancellation on Listen's parent context. Workers
 // exit their run loops on ctx.Done, drain the responses still queued for
 // the ring (Worker.hasPendingSends, celeris#595) and call Worker.shutdown,
-// which joins async dispatch goroutines via asyncWG. See epoll engine
-// Shutdown for the same rationale.
+// which joins async dispatch goroutines via asyncWG. Server.Shutdown waits
+// for Listen to return before it runs the OnShutdown hooks (celeris#703).
+// See epoll engine Shutdown for the same rationale.
 //
 // That parent context is always cancellable: every Server.Start* entry
 // point owns one and Server.Shutdown cancels it after the graceful phase.

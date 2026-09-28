@@ -107,8 +107,10 @@ type Config struct {
 	// IdleTimeout is the max duration a keep-alive connection may be idle.
 	// Zero uses the default (600s). Set to -1 for no timeout.
 	IdleTimeout time.Duration
-	// ShutdownTimeout is the max duration to wait for in-flight requests during
-	// graceful shutdown via StartWithContext (default 30s).
+	// ShutdownTimeout is the deadline of the graceful shutdown that cancelling
+	// the context of StartWithContext or StartWithListenerAndContext starts
+	// (default 30s): one deadline for the drain of in-flight requests and then
+	// the OnShutdown hooks, which run with what is left of it.
 	ShutdownTimeout time.Duration
 
 	// MaxFormSize is the maximum memory used for multipart form parsing
