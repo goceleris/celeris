@@ -24,8 +24,14 @@ func CloseWithUnsubmittedRecv() uint64 { return 0 }
 // SubmitBeforeClose is always false in production.
 func SubmitBeforeClose() bool { return false }
 
+// NoteCloseWithLinkedRecv is the production no-op.
+func NoteCloseWithLinkedRecv() {}
+
+// CloseWithLinkedRecv is always 0 in production.
+func CloseWithLinkedRecv() uint64 { return 0 }
+
 // HoldAfterClose is the production no-op.
-func HoldAfterClose(int, int) {}
+func HoldAfterClose(int, int, bool) {}
 
 // AfterAccept is the production no-op.
 func AfterAccept(int, int) {}

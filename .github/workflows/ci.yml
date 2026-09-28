@@ -980,6 +980,68 @@ jobs:
           tally mutant kill || ok=1
           exit "$ok"
 
+  recv-theft:
+    name: io_uring close paths never release a descriptor an op can still resolve (celeris#685, ${{ matrix.os }})
+    # Both arches: the theft was measured on both (celeris#715).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      # The celeris#715 / celeris#685 trials (-tags=validation only; the
+      # holds are internal/recvtheft). Each parks the worker that closed a
+      # connection A with a recv still able to resolve A's descriptor number
+      # (TestRecvTheft715ArmA: a recv SQE not yet submitted;
+      # TestRecvTheft685Linked: a recv linked behind a SEND, not yet
+      # issued), lets the sibling worker accept a fresh connection B, and
+      # asserts that B is answered and that no stale recv read B's bytes.
+      # On a tree that frees the number at the close, the sibling is given
+      # it and the old recv reads B's request: both fail in every trial.
+      # TestRecvTheft715Control (the ring submitted before the close) and
+      # TestRecvTheft715ArmC (celeris#715 hypothesis (c)) must pass either way.
+      #
+      # The trials need TWO io_uring workers (12 MiB of RLIMIT_MEMLOCK each;
+      # the runner defaults to 8 MiB), so memlock is raised as in the
+      # `iouring` job, and CELERIS_REQUIRE_IOURING_WORKERS=1 turns a missing
+      # sibling into a failure. -v, -count=5, and a tally that requires
+      # every run of every test to PASS, with no FAIL and no SKIP line: a
+      # renamed test selects nothing and go test would still exit 0.
+      - name: celeris#685 recv-theft trials (two workers, skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_RECV_THEFT_715: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestRecvTheft715ArmA|TestRecvTheft715Control|TestRecvTheft715ArmC|TestRecvTheft685Linked'
+          runs=5
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/recvtheft685.log || true
+          grep -E 'RECVTHEFT(715|685) .*result' /tmp/recvtheft685.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/recvtheft685.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/recvtheft685.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/recvtheft685.log || true)
+          for n in ${names//|/ }; do
+            echo "$n: PASS $(grep -cE "^--- PASS: $n \(" /tmp/recvtheft685.log || true) FAIL $(grep -cE "^--- FAIL: $n \(" /tmp/recvtheft685.log || true)"
+          done
+          echo "celeris#685 recv-theft trials: want $want PASS, passed $passed, FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want trial runs to PASS with no FAIL or SKIP line -- did a close path"
+            echo "release a descriptor number a recv could still resolve, or was a test renamed or skipped?"
+            exit 1
+          fi
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest

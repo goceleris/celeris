@@ -36,6 +36,19 @@ func NoteCloseWithUnsubmittedRecv() { closeWithUnsubmittedRecv.Add(1) }
 // CloseWithUnsubmittedRecv returns the witness count since process start.
 func CloseWithUnsubmittedRecv() uint64 { return closeWithUnsubmittedRecv.Load() }
 
+// closeWithLinkedRecv is the witness of the linked form (celeris#685): closes
+// reached while the connection's recv was chained behind a SEND
+// (IOSQE_IO_LINK) and had not completed. Such a recv was submitted, so the
+// witness above does not count it, but the kernel issues it, and resolves
+// its descriptor number, only after the SEND completes.
+var closeWithLinkedRecv atomic.Uint64
+
+// NoteCloseWithLinkedRecv counts one such close. Engine hook.
+func NoteCloseWithLinkedRecv() { closeWithLinkedRecv.Add(1) }
+
+// CloseWithLinkedRecv returns the linked witness count since process start.
+func CloseWithLinkedRecv() uint64 { return closeWithLinkedRecv.Load() }
+
 // Options configures one [Trial].
 type Options struct {
 	// SubmitBeforeClose is the control arm: the close paths submit the SQ
@@ -51,6 +64,10 @@ type Options struct {
 	// HoldMax bounds each hold, so a test that stops driving the trial
 	// cannot park a worker for longer than this. Zero means 5 s.
 	HoldMax time.Duration
+	// LinkedRecv makes the close hold fire on a close with a LINKED recv
+	// owed (the celeris#685 linked form, [CloseWithLinkedRecv]) instead of
+	// one with an unsubmitted recv.
+	LinkedRecv bool
 }
 
 // CloseEvent is the close hold firing: worker Worker closed descriptor FD
@@ -201,13 +218,15 @@ func AfterPromoteArm(queued func() bool) {
 }
 
 // HoldAfterClose is deferred by finishClose / finishCloseDetached when they
-// found the connection's recv SQE unsubmitted, so it runs right after the
-// descriptor is closed. The first time in a trial it records (worker, fd) as
-// the trial's target and parks the worker until [Trial.ReleaseClose] or
-// HoldMax. Engine hook, worker thread.
-func HoldAfterClose(worker, fd int) {
+// found the connection's recv SQE unsubmitted (linked false), or its recv
+// linked behind a SEND and not completed (linked true), so it runs when the
+// close path returns: right after the descriptor is closed, on a tree that
+// closes it there. The first time in a trial whose [Options.LinkedRecv]
+// matches linked, it records (worker, fd) as the trial's target and parks the
+// worker until [Trial.ReleaseClose] or HoldMax. Engine hook, worker thread.
+func HoldAfterClose(worker, fd int, linked bool) {
 	t := current.Load()
-	if t == nil || !t.closeFired.CompareAndSwap(false, true) {
+	if t == nil || t.opts.LinkedRecv != linked || !t.closeFired.CompareAndSwap(false, true) {
 		return
 	}
 	t.holder.Store(int64(worker))

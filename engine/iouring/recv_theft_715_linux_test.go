@@ -207,11 +207,27 @@ func readHead(fd int, d time.Duration) (string, error) {
 }
 
 // theftResult is one trial of arm A or the control.
+//
+// A hit is the sibling worker accepting one of B's candidates while the
+// closer is parked after its close. On a tree that frees the number at the
+// close, that accept is given the number (it is the lowest free one), which
+// is the theft's precondition: reused is true, and the sibling is parked too.
+// On a tree that keeps the number allocated until the owed recv has ended
+// (celeris#685), the accept is given another number: reused is false, and B
+// is served with no hold at all. heldOpen and released read the closer's
+// descriptor through /proc/self/fd: whether the number still named A's
+// socket while the closer was parked, and whether it was released after
+// (closed, or reused by something else) within theftReleaseWait of the
+// closer's release, so a kept descriptor is not a leak.
 type theftResult struct {
 	attempts      int
 	hit           bool
 	fd            int
 	closer, sibl  int
+	bFD           int
+	reused        bool
+	heldOpen      bool
+	released      bool
 	gate          bool
 	witness       uint64
 	staleClosed   uint64
@@ -226,12 +242,23 @@ type theftResult struct {
 	candidatesHit int
 }
 
+// fdTarget returns what /proc/self/fd/<fd> names ("socket:[inode]" for a
+// socket), or "" when fd is not open.
+func fdTarget(fd int) string {
+	s, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+	if err != nil {
+		return ""
+	}
+	return s
+}
+
 const (
 	theftMaxAttempts  = 10
 	theftCandidates   = 6
 	theftAcceptWait   = 300 * time.Millisecond
 	theftSubmitWait   = 300 * time.Millisecond
 	theftAnswerWait   = 2 * time.Second
+	theftReleaseWait  = 2 * time.Second
 	theftClosePath    = "/close"
 	theftRequestAHead = "GET " + theftClosePath + " HTTP/1.1\r\nHost: recv-theft-715\r\nConnection: close\r\n\r\n"
 	theftRequestB     = "GET /b HTTP/1.1\r\nHost: recv-theft-715\r\n\r\n"
@@ -306,10 +333,17 @@ func recvTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, arm strin
 		return false
 	}
 
-	// W1 is parked with N closed and A's recv unsubmitted. Dial B candidates
-	// until the sibling accepts one as N; one that hashes to W1's listener
-	// waits in W1's accept queue, one the sibling accepts as another number is
-	// served normally.
+	// W1 is parked right after its close path, with A's recv unsubmitted.
+	// Did that close release N? Read it before any candidate is dialed, while
+	// nothing else can take the number (every hole below it is filled).
+	aTarget := fdTarget(ce.FD)
+	r.heldOpen = strings.HasPrefix(aTarget, "socket:")
+
+	// Dial B candidates until the sibling accepts one. One that hashes to
+	// W1's listener waits in W1's accept queue. The sibling's accept is given
+	// the lowest free number: N if the close released it, and then the
+	// sibling is parked too (its recv for B prepared, not submitted); another
+	// number if N is still A's, and then B is served with no hold.
 	var hit *recvtheft.AcceptEvent
 	var hitFD int
 	for i, fd := range cands {
@@ -324,35 +358,52 @@ func recvTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, arm strin
 			r.missQueued++
 			continue
 		}
-		if ev.FD != ce.FD || ev.Worker == ce.Worker {
+		if ev.Worker == ce.Worker {
 			r.missOtherFD++
-			t.Logf("RECVTHEFT715 arm=%s attempt=%d candidate=%d accepted by worker %d as fd %d (target %d)", arm, r.attempts, i, ev.Worker, ev.FD, ce.FD)
+			t.Logf("RECVTHEFT715 arm=%s attempt=%d candidate=%d accepted by the closer %d as fd %d (target %d)", arm, r.attempts, i, ev.Worker, ev.FD, ce.FD)
 			continue
 		}
-		held, ok := tr.WaitAcceptHeld(time.Second)
-		if !ok {
-			t.Fatalf("accept of fd %d by worker %d reported but its hold did not fire", ev.FD, ev.Worker)
+		ev0 := ev
+		if ev.FD == ce.FD {
+			held, ok := tr.WaitAcceptHeld(time.Second)
+			if !ok {
+				t.Fatalf("accept of fd %d by worker %d reported but its hold did not fire", ev.FD, ev.Worker)
+			}
+			ev0 = held
+			r.reused = true
 		}
-		hit, hitFD = &held, fd
+		hit, hitFD = &ev0, fd
 		r.candidatesHit = i + 1
 		break
 	}
 	if hit == nil {
-		t.Logf("RECVTHEFT715 arm=%s attempt=%d miss=no-sibling-accept-of-target fd=%d closer=%d queued=%d other_fd=%d",
+		t.Logf("RECVTHEFT715 arm=%s attempt=%d miss=no-sibling-accept fd=%d closer=%d queued=%d closer_accepts=%d",
 			arm, r.attempts, ce.FD, ce.Worker, r.missQueued, r.missOtherFD)
 		return false
 	}
-	r.hit, r.fd, r.closer, r.sibl, r.gate = true, ce.FD, ce.Worker, hit.Worker, tr.GateUsed()
+	r.hit, r.fd, r.closer, r.sibl, r.bFD, r.gate = true, ce.FD, ce.Worker, hit.Worker, hit.FD, tr.GateUsed()
 
 	// Release W1: its next submit issues whatever it still holds for N.
 	tr.ReleaseClose()
 	for deadline := time.Now().Add(theftSubmitWait); time.Now().Before(deadline) && len(tr.Stale()) == 0; {
 		time.Sleep(time.Millisecond)
 	}
-	// Then the sibling: it submits B's own recv.
+	// Then the sibling, if parked: it submits B's own recv.
 	tr.ReleaseAccept()
 	r.answer, r.answerErr = readHead(hitFD, theftAnswerWait)
 	r.answered = strings.HasPrefix(r.answer, "HTTP/1.1 200")
+	// A number kept open at the close must be released once A's recv has
+	// ended: closed, or by now naming something else.
+	for deadline := time.Now().Add(theftReleaseWait); ; {
+		if cur := fdTarget(ce.FD); !r.heldOpen || cur != aTarget {
+			r.released = true
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	r.witness = recvtheft.CloseWithUnsubmittedRecv() - witness0
 	r.staleClosed = e.metrics.handoffLoss.staleRecvDataClosed.Load() - stale0
@@ -376,8 +427,8 @@ func logTheftResult(t *testing.T, arm string, r theftResult) {
 	if r.answerErr != nil {
 		errText = r.answerErr.Error()
 	}
-	t.Logf("RECVTHEFT715 arm=%s result attempts=%d hit=%v fd=%d closer=%d sibling=%d gate=%v candidates=%d witness=+%d stale_recv_data_closed=+%d stolen=%v answered=%v answer_err=%q stale=[%s] misses{no_close=%d queued=%d other_fd=%d}",
-		arm, r.attempts, r.hit, r.fd, r.closer, r.sibl, r.gate, r.candidatesHit, r.witness, r.staleClosed, r.stolen, r.answered,
+	t.Logf("RECVTHEFT715 arm=%s result attempts=%d hit=%v fd=%d closer=%d sibling=%d b_fd=%d reused=%v held_open=%v released=%v gate=%v candidates=%d witness=+%d stale_recv_data_closed=+%d stolen=%v answered=%v answer_err=%q stale=[%s] misses{no_close=%d queued=%d closer_accepts=%d}",
+		arm, r.attempts, r.hit, r.fd, r.closer, r.sibl, r.bFD, r.reused, r.heldOpen, r.released, r.gate, r.candidatesHit, r.witness, r.staleClosed, r.stolen, r.answered,
 		errText, strings.Join(heads, " "), r.missNoClose, r.missQueued, r.missOtherFD)
 }
 
@@ -385,14 +436,17 @@ func judgeTheftTrial(t *testing.T, arm string, r theftResult) {
 	t.Helper()
 	logTheftResult(t, arm, r)
 	if !r.hit {
-		skipOrFail656(t, "INCONCLUSIVE: no sibling accept of the released number in %d attempts", r.attempts)
+		skipOrFail656(t, "INCONCLUSIVE: no sibling accept while the closer was parked, in %d attempts", r.attempts)
 	}
 	if r.witness == 0 {
 		t.Fatalf("the close hold fired but close_with_unsubmitted_recv did not move")
 	}
 	if r.stolen || !r.answered {
-		t.Fatalf("B (fd %d on worker %d) lost its request: stolen by the closed conn's recv=%v (stale_recv_data_closed +%d), answered=%v (%v)",
-			r.fd, r.sibl, r.stolen, r.staleClosed, r.answered, r.answerErr)
+		t.Fatalf("B (fd %d on worker %d; A's number %d reused=%v, kept open at the close=%v) lost its request: stolen by the closed conn's recv=%v (stale_recv_data_closed +%d), answered=%v (%v)",
+			r.bFD, r.sibl, r.fd, r.reused, r.heldOpen, r.stolen, r.staleClosed, r.answered, r.answerErr)
+	}
+	if !r.released {
+		t.Fatalf("A's number %d, kept open at the close, still names A's socket %v after the closer's release: the kept descriptor leaked", r.fd, theftReleaseWait)
 	}
 }
 

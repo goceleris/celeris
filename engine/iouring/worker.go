@@ -838,6 +838,34 @@ func (w *Worker) recvUnsubmitted(cs *connState) bool {
 	return cs.recvArmed && w.ring != nil && int32(cs.recvArmSeq.Get()-w.ring.sqConsumed()) >= 0
 }
 
+// recvLinkedOwed reports whether cs's armed recv is the one chained behind a
+// SEND (flushSendLink) and has not completed: the kernel consumed its SQE with
+// the SEND's, but issues it, and resolves its descriptor number, only after
+// the SEND completes, as task work on a DEFER_TASKRUN ring, which can still
+// be queued when the SEND's CQE is read (celeris#685). recvLinked is cleared
+// only by that recv's own completion, so the pair is exact.
+func recvLinkedOwed(cs *connState) bool {
+	return cs.recvArmed && cs.recvLinked
+}
+
+// recvTheftWitness counts a close path's celeris#715 / celeris#685
+// preconditions (validation builds only; the caller is guarded by
+// recvtheft.Enabled) and reports whether the close hold applies, and in
+// which form: an unsubmitted recv (linked false) or a linked one still owed
+// (linked true). The caller defers recvtheft.HoldAfterClose itself, so the
+// hold runs when the close path returns.
+func (w *Worker) recvTheftWitness(cs *connState) (hold, linked bool) {
+	switch {
+	case w.recvUnsubmitted(cs):
+		recvtheft.NoteCloseWithUnsubmittedRecv()
+		return true, false
+	case recvLinkedOwed(cs):
+		recvtheft.NoteCloseWithLinkedRecv()
+		return true, true
+	}
+	return false, false
+}
+
 // retireRecvCancel accounts for one of cs's outstanding backpressure-pause
 // ASYNC_CANCELs having resolved, whether by cancelling a recv (the recv's
 // -ECANCELED) or by cancelling nothing (the cancel's own completion). The
@@ -4082,10 +4110,11 @@ func (w *Worker) finishClose(fd int) {
 	// SIGSEGV / Green-Tea-GC span-corruption class.
 	if cs != nil {
 		// celeris#715 witness, hold and control, validation builds only:
-		// see recvUnsubmitted.
-		if recvtheft.Enabled && w.recvUnsubmitted(cs) {
-			recvtheft.NoteCloseWithUnsubmittedRecv()
-			defer recvtheft.HoldAfterClose(w.id, fd)
+		// see recvUnsubmitted and recvLinkedOwed.
+		if recvtheft.Enabled {
+			if hold, linked := w.recvTheftWitness(cs); hold {
+				defer recvtheft.HoldAfterClose(w.id, fd, linked)
+			}
 		}
 		w.cancelConnOps(fd, cs)
 		w.noteClosedInflight(cs)
@@ -4207,10 +4236,11 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// wall-clock hold sat below TCP's 200 ms RTO_MIN, so retransmitted
 	// POST segments landed after release).
 	// celeris#715 witness, hold and control, validation builds only: see
-	// recvUnsubmitted.
-	if recvtheft.Enabled && w.recvUnsubmitted(cs) {
-		recvtheft.NoteCloseWithUnsubmittedRecv()
-		defer recvtheft.HoldAfterClose(w.id, fd)
+	// recvUnsubmitted and recvLinkedOwed.
+	if recvtheft.Enabled {
+		if hold, linked := w.recvTheftWitness(cs); hold {
+			defer recvtheft.HoldAfterClose(w.id, fd, linked)
+		}
 	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
