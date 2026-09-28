@@ -16,9 +16,9 @@ package iouring
 // Here that is one engine and no adaptive controller: park the workers for
 // longer than ReadTimeout, wake one with a new connection (an accept after
 // ResumeAccept, or an AdoptConn), and keep that connection busy well inside
-// ReadTimeout. It must be served throughout. The short-park arms are the
-// controls: the same wake and the same traffic after a park well inside
-// ReadTimeout.
+// ReadTimeout. It must be served throughout. The short-park accept arm is the
+// control: the same wake and the same traffic after a park well inside
+// ReadTimeout (the short-park adoption arm is not one; see there).
 
 import (
 	"bufio"
@@ -219,7 +219,15 @@ func TestAcceptAfterAShortParkIsNotTimedOut(t *testing.T) {
 	staleClockAfterPark(t, 100*time.Millisecond, false)
 }
 
-// TestAdoptAfterAShortParkIsNotTimedOut is the adoption's control.
+// TestAdoptAfterAShortParkIsNotTimedOut is the adoption arm after a 100 ms
+// park. It is NOT a control: on main it failed too, 10 of 10 in both
+// shapes. A paused worker's clock stays at its last refresh before the park
+// until its first checkTimeouts after the wake, and on a paused engine the
+// worker iterates only on this connection's own completions, so that check
+// comes 32 iterations, about 13 requests, into the traffic. The idle time
+// before the park, the park and that stretch together pass ReadTimeout. The
+// accept arm above is the control: a resumed worker's short listener waits
+// bring its first check within a request or two.
 func TestAdoptAfterAShortParkIsNotTimedOut(t *testing.T) {
 	staleClockAfterPark(t, 100*time.Millisecond, true)
 }
