@@ -133,7 +133,12 @@ type Engine struct {
 //     on a 6.10+ kernel the "bundles era" branch alone used to call io_uring
 //     viable, and every promotion then failed to build it and backed off with
 //     a WARN (celeris#679). Checked first, with iouring.New's own predicate, so
-//     the two cannot disagree.
+//     the two cannot disagree. iouring.New also refuses a kernel that rejects
+//     the IORING_ASYNC_CANCEL flags (every one before 5.19, celeris#682). The
+//     kernel test below already rules those kernels out by version; one that
+//     passes it and still rejects the flags fails the build like any other:
+//     a start engine falls back to epoll, a standby build is backed off
+//     (celeris#656).
 //
 // The other two are the t0-knowable disqualifiers from the epoll-vs-io_uring
 // sweep:
@@ -1153,6 +1158,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantClaimDeferred:   pm.TransplantClaimDeferred + sm.TransplantClaimDeferred,
 		TransplantReapFailed:      pm.TransplantReapFailed + sm.TransplantReapFailed,
 		TransplantReapUnsupported: pm.TransplantReapUnsupported + sm.TransplantReapUnsupported,
+		// The same rule on the close paths (celeris#685): each close is an
+		// event on the one sub-engine that owned the connection, and a
+		// close of the standby's residue lands on the standby.
+		CloseFDDeferred: pm.CloseFDDeferred + sm.CloseFDDeferred,
+		CloseFDForced:   pm.CloseFDForced + sm.CloseFDForced,
 		// The post-switch sweep (celeris#657 PR-3). Both sub-engines sweep,
 		// in opposite directions, and only the one draining runs passes at
 		// all, so the pass count sums as a rate. The residual entries are
