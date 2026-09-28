@@ -1,12 +1,54 @@
 # CodSpeed: continuous benchmarking of the request hot path (celeris#690).
 #
-# What it measures: the standard `testing.B` benchmarks of the code every
-# request runs through -- the router, Context and handler chain (root
-# bench_test.go), the HTTP/1 parser, protocol detection and the H2 stream
-# pool (./protocol/...), the wake-fd primitive (./internal/...), the core
-# middleware chains (./middleware) and the logger. Nothing in the benchmarks
-# changed: CodSpeed's Go runner builds them with an overlay of `testing` and
-# measures each one (https://codspeed.io/docs/benchmarks/go).
+# How to read a CodSpeed result (celeris#725). The check is INFORMATIONAL: it
+# is not a required check, and a red "Performance Regression" is a prompt to
+# measure, not a verdict. Two things move these numbers without any change to
+# the code a benchmark runs:
+#   - Code layout. The runner measures one build of each test binary, and a
+#     change anywhere in that binary can move a benchmark whose own code did
+#     not change. celeris#736 changed bridge.go's Adapt and four middleware
+#     packages; BenchmarkChainBaseline, which runs none of that code, went
+#     from 1908-1932 ns to 2292-2316 ns, and both runs of #736's tree gave
+#     that level. On 3fe9620 (celeris#723) seven chain benchmarks moved -11%
+#     to -19% although PreRouting and PreRoutingOnly execute no changed
+#     instruction; re-running both commits reproduced each commit's own level
+#     within 2%. The level belongs to the binary's layout on this runner.
+#   - The runner. Identical code still moves from run to run. On four pairs
+#     of runs of identical code (three identical source trees, and two runs
+#     of celeris#748 whose test binaries are byte-identical),
+#     ContextQueryFirstParse moved between 737 and 904 ns (18.5% or 22.7%,
+#     by direction), ContextSetHeader from 113 to 136 ns (16.9%) and
+#     ChainDeepParallel by up to 15.2%; ContextString, ResetH1Stream,
+#     RouterFind and ContextBlob moved 7.8-10%. The second of #748's runs
+#     went red on that alone. The ns-scale micro-benchmarks moved most (a
+#     lock under four goroutines 117-185 ns, single-digit cases 3-4 and 8-11
+#     ns) and are no longer run here (see "Not measured"); what stays still
+#     has run noise.
+# No regression threshold separates these from a real change: in the first
+# 16 comparisons layout alone reached -19.6%, and run noise alone -18.5%.
+# So before acting on ANY flag:
+#   1. Take the base CodSpeed names in its report, which is often not the
+#      pull request's base: with path filters CodSpeed compares with the
+#      latest main run, and a layout shift from a main commit that started no
+#      run lands on the next run that does. Build the flagged package's test
+#      binary for the runner at that base and at the head
+#      (GOOS=linux GOARCH=arm64 go test -trimpath -c -o <name>.test <pkg>)
+#      and compare the two files. Identical binaries: the flag is the runner.
+#   2. Otherwise measure it with .github/scripts/bench-ab.sh <base> <head>
+#      <pkg> <regex>. It checks the same linux/arm64 binary identity, then
+#      runs the base, the head and a copy of the base interleaved, one
+#      process per round, and prints head-vs-base next to base-vs-copy, the
+#      machine's floor. A difference inside the floor is not a change. On a
+#      laptop it says whether the code on the path got slower; on an arm64
+#      Linux host it also shows this runner's layout effects.
+#
+# What it measures: the standard `testing.B` benchmarks of the router,
+# Context and handler chain (root bench_test.go), the HTTP/1 parser,
+# protocol detection, the HTTP/1 stream reset (BenchmarkResetH1Stream, in
+# protocol/h2/stream), the core middleware chains (./middleware) and the
+# logger. Nothing in the benchmarks changed: CodSpeed's Go runner builds them
+# with an overlay of `testing` and measures each one
+# (https://codspeed.io/docs/benchmarks/go).
 #
 # Not measured, on purpose: test/drivercmp/* and test/benchcmp_* (separate
 # modules that need Redis, Postgres or Memcached), driver/* (same), the
@@ -14,7 +56,33 @@
 # and the engines. Engine throughput is judged on real hardware by
 # goceleris/probatorium's cluster matrix, not by micro-benchmarks, and the
 # engines change so often that watching them here would spend the whole
-# monthly budget (see below).
+# monthly budget (see below). Nor HTTP/2 request handling (HPACK header
+# decoding, frames): no benchmark in the set runs it (celeris#754).
+# Removed in celeris#725:
+#   - ./internal/...: its only benchmarks are internal/wakefd's, and that is
+#     the engines' wake primitive, judged on the cluster with them. The
+#     leaves that moved are celeris#655 comparison shapes that never shipped
+#     (RWMutex and shared cache line under four producers, 117-185 and 8-11
+#     ns; plain field, 3-4 ns), on test binaries that were byte-identical at
+#     every main commit from 9aa94eb to dccb839. The shipping shape
+#     (FDAtomicPadded) and Signal/* were steady; they go with the package.
+#   - BenchmarkInternH2HeaderName: 49-64 ns on a byte-identical binary.
+# Every router, Context, chain, handler and logger benchmark stays, the
+# noisiest ones above included: they are the hot path. Run the removed ones
+# with a plain `go test -bench`.
+#
+# How the set is chosen. CodSpeed's Go runner (go-runner, pinned below)
+# passes exactly three things from `run:` to `go test`: -bench, -benchtime
+# and the package list (go-runner/src/cli.rs at v1.3.0). Every other flag,
+# -skip and -tags included, is dropped with a warning, so an exclusion is
+# either a package left out of the list or the -bench pattern. Go's RE2 has
+# no negative lookahead, so the pattern spells out a complement: it selects
+# every top-level benchmark except a name that starts with BenchmarkInternH
+# (and the bare prefixes Benchmark to BenchmarkIntern). In these packages
+# that leaves out only BenchmarkInternH2HeaderName.
+# The selection, each benchmark run once (54 leaves, on Linux and macOS):
+#   go test -run '^$' -bench '^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' \
+#     -benchtime 1x . ./protocol/... ./middleware ./middleware/logger
 #
 # Where it runs: a CodSpeed Macro Runner, a dedicated bare-metal machine.
 # Go supports only the walltime instrument, and walltime on a shared
@@ -26,43 +94,75 @@
 # x64 runner is Pro-only. arm64 == x86 parity for a release stays with
 # probatorium's cluster.
 #
-# PREREQUISITE (an org setting, not code): Organization settings -> Actions
-# -> Runner groups -> Default -> allow public repositories. Until that is
-# set, the job below waits in the queue for a runner that never comes. That
-# is expected and is not a failure of this workflow.
+# PREREQUISITES (settings, not code). All three were done on 2026-09-26:
+#   1. Organization settings -> Actions -> Runner groups -> Default: allow
+#      public repositories, for the selected repositories celeris and
+#      loadgen. Without it the job waits for a runner that never comes; a job
+#      that queued before the change never gets one (cancel it, re-run it).
+#   2. Repository settings -> Actions -> General -> allowed actions:
+#      `CodSpeedHQ/action@*` on the allow-list. Without it every run ends in
+#      startup_failure with no job.
+#   3. The repository enabled in CodSpeed (app.codspeed.io, goceleris/celeris).
 #
-# Security: a macro runner is a self-hosted runner outside GitHub's
-# sandbox, so code from a FORK pull request never runs on it (the job's
-# `if:` below). Same-repository branches can only be pushed by people with
+# Security: a macro runner is a self-hosted runner outside GitHub's sandbox.
+# The job's `if:` below skips fork pull requests, but it is not the security
+# boundary: on `pull_request` the workflow definition comes from the pull
+# request's merge ref, so a fork pull request can edit this file, delete the
+# `if:` and target the macro runner. What stops it is the repository's
+# fork-PR approval policy, "Require approval for all external contributors"
+# (`gh api repos/goceleris/celeris/actions/permissions/fork-pr-contributor-approval`
+# returns all_external_contributors). That setting must stay, and a
+# maintainer must never "Approve and run" a fork pull request that touches
+# .github/workflows. The policy exempts organization members, and the
+# organization's base repository permission is read: it holds only while
+# every organization member has write access to every repository in the
+# macro-runner group (celeris and loadgen, prerequisite 1). A member with
+# read access can run a fork pull request there without approval
+# (celeris#754). Same-repository branches can only be pushed by people with
 # write access. No pull_request_target, no secrets: the upload
 # authenticates with the job's OIDC token.
 #
-# Budget (600 macro-runner minutes a month). The trigger paths below are the
-# non-test code of every package the benchmark set executes (measured: the
-# set run once with -coverpkg over the whole module), the benchmark files
-# themselves, the root go.mod/go.sum and this file. Replaying the 30 days to
-# 2026-09-26 -- the busiest month on record, 113 pushes to main and 268
-# pushes to pull requests -- through those paths gives the run count;
-# SETUP.md in the evidence for celeris#690 has the arithmetic and the
-# per-run minutes. -benchtime=1s instead of the runner's 3s default is what
-# keeps that month inside the budget; raise it if the minutes allow.
+# Budget: the Free plan's 600 macro-runner minutes a month are shared by the
+# whole goceleris organization; loadgen runs CodSpeed too. A run here takes
+# about 4 minutes of job time (240 s with this set, measured once; 275-305 s
+# before celeris#725), a loadgen run about 3 (185-190 s). Measured burn over
+# the first 27 hours (2026-09-26 15:57Z to 2026-09-27 18:49Z): 43 jobs and
+# 189 minutes rounded up per job (celeris 21 jobs and 101 minutes, loadgen 22
+# and 88), two thirds of it pull request runs. At that rate the 600 minutes
+# last 3.6 to 4.1 days (rounded or raw job time; CodSpeed's own meter is not
+# public), and pushes to main alone would use them in about two weeks. Whether to gate pull request runs on the `performance` label,
+# or more, is an open decision (celeris#754).
+# The trigger paths below are the non-test code of every package the
+# benchmark set executes (measured: the set run once with -coverpkg over the
+# whole module, on Linux and macOS), the benchmark files, the root
+# go.mod/go.sum and this file. Package initialization does not count: on
+# Linux the root test binary links internal/conn and internal/deferlinger
+# through the engines, and only their init() runs, so a change there does
+# not start a run. Replaying the 30 days to 2026-09-26 (113 pushes to main,
+# 268 pushes to pull requests) through these paths gives 66 runs, against 90
+# for the paths as first set up (celeris#725). The last day ran far more than
+# that month did, so the replay is a floor, not a forecast. -benchtime=1s
+# (the runner's default is 3s) bounds the time each benchmark is measured.
 name: CodSpeed
 
 on:
   push:
     branches: [main]
-    paths:
+    # One list for both events: the pull_request trigger below aliases it.
+    paths: &benchmark-paths
       - "*.go"
       - "celeristest/**"
-      - "internal/**"
+      - "internal/ctxkit/**"
       - "observe/**"
-      - "protocol/**"
+      - "protocol/detect/**"
+      - "protocol/h1/**"
+      - "protocol/h2/stream/**"
       - "middleware/*.go"
       - "middleware/adapters/**"
       - "middleware/circuitbreaker/**"
       - "middleware/cors/**"
       - "middleware/etag/**"
-      - "middleware/internal/**"
+      - "middleware/internal/fnv1a/**"
       - "middleware/logger/**"
       - "middleware/methodoverride/**"
       - "middleware/pprof/**"
@@ -80,10 +180,8 @@ on:
       - "!mage*.go"
       - "!**/*_test.go"
       - "*bench*_test.go"
-      - "internal/**/*bench*_test.go"
       - "protocol/**/*bench*_test.go"
       - "protocol/detect/detect_test.go"
-      - "protocol/h2/stream/intern_test.go"
       - "protocol/h2/stream/stream_test.go"
       - "middleware/*bench*_test.go"
       - "middleware/logger/*bench*_test.go"
@@ -93,47 +191,10 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "*.go"
-      - "celeristest/**"
-      - "internal/**"
-      - "observe/**"
-      - "protocol/**"
-      - "middleware/*.go"
-      - "middleware/adapters/**"
-      - "middleware/circuitbreaker/**"
-      - "middleware/cors/**"
-      - "middleware/etag/**"
-      - "middleware/internal/**"
-      - "middleware/logger/**"
-      - "middleware/methodoverride/**"
-      - "middleware/pprof/**"
-      - "middleware/proxy/**"
-      - "middleware/ratelimit/**"
-      - "middleware/recovery/**"
-      - "middleware/redirect/**"
-      - "middleware/requestid/**"
-      - "middleware/rewrite/**"
-      - "middleware/secure/**"
-      - "middleware/singleflight/**"
-      - "middleware/static/**"
-      - "middleware/swagger/**"
-      - "middleware/timeout/**"
-      - "!mage*.go"
-      - "!**/*_test.go"
-      - "*bench*_test.go"
-      - "internal/**/*bench*_test.go"
-      - "protocol/**/*bench*_test.go"
-      - "protocol/detect/detect_test.go"
-      - "protocol/h2/stream/intern_test.go"
-      - "protocol/h2/stream/stream_test.go"
-      - "middleware/*bench*_test.go"
-      - "middleware/logger/*bench*_test.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/codspeed.yml"
+    paths: *benchmark-paths
   # Backtests: CodSpeed dispatches this to measure older commits, and it is
-  # the manual way to take a fresh baseline.
+  # the manual way to take a fresh baseline or to run a draft pull request's
+  # branch (gh workflow run codspeed.yml --ref <branch>).
   workflow_dispatch:
 
 permissions:
@@ -151,8 +212,10 @@ concurrency:
 jobs:
   benchmarks:
     name: Benchmarks (arm64 macro runner)
-    # Fork pull requests never reach a macro runner; drafts wait until they
-    # are marked ready (ready_for_review above), to save minutes.
+    # Skips fork pull requests (as this file is written; the approval policy
+    # in the header is what holds against a fork that edits it) and drafts,
+    # which wait until they are marked ready (ready_for_review above), to
+    # save minutes.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
@@ -184,4 +247,6 @@ jobs:
           # Pinned: a runner change can move every number, and 1.3.0 is the
           # first release that supports Go 1.27. Bump it deliberately.
           go-runner-version: "1.3.0"
-          run: go test -bench=. -benchtime=1s . ./protocol/... ./internal/... ./middleware ./middleware/logger
+          # The CodSpeed CLI writes this line to a script and runs it with
+          # bash, so the quoted pattern reaches go-runner as one argument.
+          run: go test -bench='^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' -benchtime=1s . ./protocol/... ./middleware ./middleware/logger

@@ -20,8 +20,9 @@ Members of the GitHub org team **`contributors`** have *write* access to
 
 - can push branches to this repository and open PRs from them;
 - can **approve** pull requests;
-- may **merge their own PR only after a code-owner approval** and green
-  required checks (see [How changes get merged](#how-changes-get-merged)).
+- may **merge their own PR only after a code-owner approval**, with green
+  required checks and every review thread resolved (see
+  [How changes get merged](#how-changes-get-merged)).
 
 Criteria for an invitation: about **three merged, non-trivial pull
 requests** and sustained engagement (reviews, issue triage, follow-through
@@ -38,10 +39,12 @@ is **@FumingPower3925** (see [MAINTAINERS.md](MAINTAINERS.md)).
 ## How changes get merged
 
 Every change to `main` goes through a pull request, including changes by
-maintainers. A PR merges when **both** hold:
+maintainers. A PR merges when **all three** hold:
 
-1. all **required checks are green**, and
-2. it has an **approving review from a code owner** of the files it
+1. all **required checks are green**,
+2. **every review thread is resolved**, bots' threads included (the
+   `main` ruleset requires it), and
+3. it has an **approving review from a code owner** of the files it
    touches (CODEOWNERS is the source of truth).
 
 Who presses the button:

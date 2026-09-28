@@ -550,6 +550,101 @@ func TestOneOwnerPerHandoff(t *testing.T) {
 			t.Errorf("TransplantDoubleClaim = %d, want 0: the conn was handed off once", n)
 		}
 	})
+
+	// celeris#758: the rule at the worker's other re-run site, rerunHandOff
+	// (a reap's retry, or its landing). The goroutine publishes its claim
+	// under asyncInMu and enqueues it only after unlocking, so the worker's
+	// loop can run in between; asyncRun then reads false with the claim
+	// set. rerunHandOff read only asyncRun: it ran finishAsyncTransplant,
+	// the conn was handed off with its claim still set, and the claim's own
+	// drain found the slot empty and counted a double claim for a conn moved
+	// once. Measured on main 698bed6 (CI run 36341302731):
+	// TransplantDoubleClaim = 1 in TestHandoffHasNothingInFlight/async.
+	claimWindow := func(t *testing.T) *fdlFixture {
+		t.Helper()
+		f := newFDLFixture(t, true)
+		f.armFirstRecv() // the recv the feed path armed for the last request
+		f.cs.asyncPromoted.Store(true)
+		f.startDrain()
+		return f
+	}
+	// publishClaim is runAsyncHandler's claim up to its unlock; the enqueue
+	// is left to the caller.
+	publishClaim := func(f *fdlFixture) {
+		f.cs.asyncInMu.Lock()
+		f.cs.transplantPending.Store(true)
+		f.cs.asyncRun = false
+		f.cs.asyncInMu.Unlock()
+	}
+	// landReaps lands every reap the last step placed, while the conn still
+	// owns its slot, as a hit: its recv's -ECANCELED.
+	landReaps := func(t *testing.T, f *fdlFixture, step string) {
+		t.Helper()
+		reaps := 0
+		for _, s := range takeSQEs(f.w.ring) {
+			if f.isReap(s) {
+				reaps++
+			}
+		}
+		t.Logf("%s placed %d reap(s)", step, reaps)
+		if reaps > 0 && f.w.conns[f.fd] == f.cs {
+			f.process(f.recvCQE(-int32(unix.ECANCELED)))
+		}
+	}
+	// handedOffOnce: exactly one hand-off, no double claim, and every
+	// worker-side attempt made while the claim was set left the conn to it.
+	handedOffOnce := func(t *testing.T, f *fdlFixture, deferred uint64) {
+		t.Helper()
+		if n := f.tgt.adopted.Load(); n != 1 {
+			t.Fatalf("the conn was handed off %d times, want exactly once", n)
+		}
+		if n := metric(t, f.e, "TransplantDoubleClaim"); n != 0 {
+			t.Errorf("TransplantDoubleClaim = %d, want 0: the conn was handed off once, by a re-run that "+
+				"acted on it while its claim was set, and then the claim's drain found its slot empty", n)
+		}
+		if n := metric(t, f.e, "TransplantClaimDeferred"); n != deferred {
+			t.Errorf("TransplantClaimDeferred = %d, want %d (each attempt made while the claim was set "+
+				"left the conn to it)", n, deferred)
+		}
+	}
+
+	// The measured order: a reap retry owed from an earlier miss runs at
+	// the head of drainDetachQueue, ahead of the queue, while the claim is
+	// published and not yet enqueued. Its reap would land before the claim
+	// is drained.
+	t.Run("reap_retry_between_claim_and_enqueue", func(t *testing.T) {
+		f := claimWindow(t)
+		f.w.queueReapRetry(f.cs) // a reap missed while the goroutine was running
+		publishClaim(f)
+		f.w.drainDetachQueue() // the retry runs; the claim is not on the queue yet
+		landReaps(t, f, "the retry")
+		f.w.enqueueDetach(f.cs)
+		f.w.drainDetachQueue()
+		landReaps(t, f, "the claim's drain")
+		handedOffOnce(t, f, 1) // the retry's re-run
+	})
+
+	// The same rule where a reap lands (reapOutcome): one placed while the
+	// previous claim was finished, aimed at a recv that outlives the request
+	// that respawned the goroutine (a multishot recv, with
+	// CELERIS_IOURING_MULTISHOT_RECV=1), can land after the next claim is
+	// queued and before the queue is drained.
+	t.Run("reap_lands_between_claim_and_drain", func(t *testing.T) {
+		f := claimWindow(t)
+		f.w.finishAsyncTransplant(f.cs) // the previous claim, drained: it reaps the recv
+		if sqes := takeSQEs(f.w.ring); len(sqes) != 1 || !f.isReap(sqes[0]) {
+			t.Fatalf("finishing the previous claim placed %v, want one reap", sqes)
+		}
+		publishClaim(f)
+		f.w.enqueueDetach(f.cs)
+		f.process(f.recvCQE(-int32(unix.ECANCELED))) // the reap lands first
+		landReaps(t, f, "the landing")
+		f.w.drainDetachQueue()
+		landReaps(t, f, "the claim's drain")
+		// The landing's re-run, and the tryTransplant every recv completion
+		// is followed by while a drain is set.
+		handedOffOnce(t, f, 2)
+	})
 }
 
 // TestNoDrainSQESequenceIsUnchanged is the witness that routing every

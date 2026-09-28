@@ -1753,8 +1753,10 @@ func (w *Worker) handleHeaderTimer(fd int) {
 	now := time.Now().UnixNano()
 	if now < dl {
 		// True early fire (kernel clock drift, very rare). Re-arm
-		// a fresh timer for the actual remaining time.
-		w.armHeaderTimer(cs)
+		// a fresh timer for the actual remaining time, from the
+		// snapshot: the lock is released, so cs.h1State is not ours to
+		// read again (celeris#722).
+		w.armHeaderTimerAt(cs, dl)
 		return
 	}
 	// Deadline exceeded — slowloris defence fires. Mirror std/net.http's
@@ -1785,8 +1787,17 @@ func (w *Worker) armHeaderTimer(cs *connState) {
 	if cs.h1State == nil || cs.headerTimerArmed {
 		return
 	}
-	dl := cs.h1State.HeaderDeadlineNs.Load()
-	if dl == 0 {
+	w.armHeaderTimerAt(cs, cs.h1State.HeaderDeadlineNs.Load())
+}
+
+// armHeaderTimerAt is armHeaderTimer for a deadline the caller has already
+// read, and it does not read cs.h1State. On a promoted async conn cs.h1State
+// belongs to the dispatch goroutine, which sets it to nil when the request is
+// an h2c upgrade (switchToH2Local). So the worker reads the deadline where
+// that goroutine cannot be running, and arms from the value it read
+// (celeris#722): see asyncHeaderDeadline.
+func (w *Worker) armHeaderTimerAt(cs *connState, dl int64) {
+	if cs.headerTimerArmed || dl == 0 {
 		return
 	}
 	now := time.Now().UnixNano()
@@ -2854,7 +2865,12 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 	// the goroutine. This lets sync routes run inline on the worker
 	// (no handoff) on a server that mixes sync + async handlers.
 	asyncFeed := false
+	var hdrDL int64
 	if w.async && cs.asyncPromoted.Load() && (w.h1Only || engine.Protocol(cs.protocol.Load()) == engine.HTTP1) {
+		// Read the header deadline BEFORE the bytes reach the dispatch
+		// goroutine: once fed, it may run the request, and an h2c upgrade
+		// sets cs.h1State to nil there (celeris#722). Armed below.
+		hdrDL = w.asyncHeaderDeadline(cs)
 		cs.asyncInMu.Lock()
 		// celeris#364: re-check under asyncInMu — the dispatch goroutine clears
 		// asyncPromoted (reverting the conn to inline) under this same lock. If
@@ -2916,9 +2932,11 @@ func (w *Worker) handleRecv(c *completionEntry, fd int, now int64) {
 		// is the explicit "retry on next recv" path that was missing —
 		// without it, a conn whose initial arm failed relies entirely
 		// on the sweep, doubling worst-case close latency on slow
-		// refapps (observability/static_swagger_proxy).
-		if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
-			w.armHeaderTimer(cs)
+		// refapps (observability/static_swagger_proxy). From the
+		// deadline read before the feed, never from cs.h1State, which the
+		// goroutine may be changing now (celeris#722).
+		if hdrDL > 0 {
+			w.armHeaderTimerAt(cs, hdrDL)
 		}
 		if !cqeHasMore(c.Flags) && !cs.recvPaused {
 			if !w.prepareRecv(cs, cs.buf) {
@@ -4194,6 +4212,10 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
 // caller has already set cs.asyncPromoted and returned the provided buffer.
 func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *completionEntry) {
+	// The header deadline is read before the dispatch goroutine starts: it
+	// runs the stashed request at once, and an h2c upgrade sets cs.h1State to
+	// nil there (celeris#722). Armed below, from the value.
+	hdrDL := w.asyncHeaderDeadline(cs)
 	cs.asyncInMu.Lock()
 	cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
 	starting := !cs.asyncRun
@@ -4208,8 +4230,8 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 		cs.asyncCond.Signal()
 	}
 	w.reqBatch++
-	if cs.h1State != nil && cs.h1State.HeaderDeadlineNs.Load() > 0 && !cs.headerTimerArmed {
-		w.armHeaderTimer(cs)
+	if hdrDL > 0 {
+		w.armHeaderTimerAt(cs, hdrDL)
 	}
 	if !cqeHasMore(c.Flags) && !cs.recvPaused {
 		if !w.prepareRecv(cs, cs.buf) {
@@ -4217,6 +4239,33 @@ func (w *Worker) promoteConnToAsync(cs *connState, _ int, stashed []byte, c *com
 			w.markDirty(cs)
 		}
 	}
+}
+
+// asyncHeaderDeadline returns the header deadline the worker should arm a
+// kernel timer for on a promoted async conn, or 0 for none: none configured,
+// a timer already in flight, no H1 state, or the conn's detachMu held.
+//
+// The worker may not read cs.h1State while the conn's dispatch goroutine can
+// be running: that goroutine owns the H1 state across ProcessH1 and sets
+// cs.h1State to nil when the request is an h2c upgrade (switchToH2Local), so
+// an unlocked read races that write and, between its nil check and its
+// dereference, can take a nil pointer (celeris#722). The callers read before
+// they start or feed the goroutine, and the read goes through
+// snapshotH1Deadlines, under detachMu, the lock switchToH2Local runs under,
+// and with TryLock, never Lock (celeris#593): a held lock means the goroutine
+// is inside a request, which is not a moment a header deadline is waiting on,
+// and the arm is retried at the next feed. The checkTimeouts sweep is the
+// fallback for a timer that is not armed, as it is for one the SQ ring
+// dropped. Worker thread.
+func (w *Worker) asyncHeaderDeadline(cs *connState) int64 {
+	if w.cfg.ReadHeaderTimeout <= 0 || cs.headerTimerArmed {
+		return 0
+	}
+	snap, ok := snapshotH1Deadlines(cs)
+	if !ok || !snap.haveH1 {
+		return 0
+	}
+	return snap.hdrDL
 }
 
 // canRevertToInline reports whether a promoted conn should be reverted to the
