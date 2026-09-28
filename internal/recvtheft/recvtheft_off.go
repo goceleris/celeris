@@ -44,3 +44,12 @@ func NoteStaleRecvData(int, int, uint32, int32, []byte) {}
 
 // WakeHold is the production no-op.
 func WakeHold() {}
+
+// NoteHijackWithOpOwed is the production no-op.
+func NoteHijackWithOpOwed() {}
+
+// HijackWithOpOwed is always 0 in production.
+func HijackWithOpOwed() uint64 { return 0 }
+
+// HijackHold is the production no-op.
+func HijackHold() {}

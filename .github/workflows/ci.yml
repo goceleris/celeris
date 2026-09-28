@@ -1007,6 +1007,11 @@ jobs:
       # it and the old recv reads B's request: both fail in every trial.
       # TestRecvTheft715Control (the ring submitted before the close) and
       # TestRecvTheft715ArmC (celeris#715 hypothesis (c)) must pass either way.
+      # The three TestRecvTheft685Hijack* arms hold the worker right after a
+      # Hijack and send the hijacker's first bytes meanwhile: with multishot
+      # recv (owed across its request) on a ring without DEFER_TASKRUN, the
+      # recv reads them unless hijackConn submits its cancel first (Coop);
+      # the DEFER_TASKRUN and single-shot arms pass either way.
       #
       # The trials need TWO io_uring workers (12 MiB of RLIMIT_MEMLOCK each;
       # the runner defaults to 8 MiB), so memlock is raised as in the
@@ -1023,7 +1028,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestRecvTheft715ArmA|TestRecvTheft715Control|TestRecvTheft715ArmC|TestRecvTheft685Linked'
+          names='TestRecvTheft715ArmA|TestRecvTheft715Control|TestRecvTheft715ArmC|TestRecvTheft685Linked|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer|TestRecvTheft685HijackMultishotCoop'
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \

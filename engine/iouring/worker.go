@@ -2320,6 +2320,16 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// STEAL the first bytes the hijacker tries to read. Cancel it by its
 	// generation-tagged user_data and defer the pool release until the
 	// terminal CQE arrives, exactly like finishClose.
+	// celeris#685 hijack witness and hold, validation builds only: count a
+	// hijack with an op still owed on the socket (kernelInflight > 0), and
+	// hold the worker thread before it returns, and so before its next
+	// io_uring_enter (recvtheft.SetHijackHold).
+	if recvtheft.Enabled {
+		if cs.kernelInflight > 0 {
+			recvtheft.NoteHijackWithOpOwed()
+		}
+		defer recvtheft.HijackHold()
+	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingRelease(cs)

@@ -311,3 +311,45 @@ func WakeHold() {
 		time.Sleep(time.Duration(d))
 	}
 }
+
+// hijackWithOpOwed is the hijack witness (celeris#685): hijacks that handed
+// the socket over while the kernel still owed the connection an op on it (a
+// multishot recv stays armed across its request; a single-shot recv has
+// completed by the time its request's handler hijacks).
+var hijackWithOpOwed atomic.Uint64
+
+// NoteHijackWithOpOwed counts one such hijack. Engine hook.
+func NoteHijackWithOpOwed() { hijackWithOpOwed.Add(1) }
+
+// HijackWithOpOwed returns the hijack witness count since process start.
+func HijackWithOpOwed() uint64 { return hijackWithOpOwed.Load() }
+
+// hijackHoldNanos is the hijack hold. See [SetHijackHold].
+var (
+	hijackHoldNanos atomic.Int64
+	hijackHolds     atomic.Uint64
+)
+
+// SetHijackHold makes hijackConn sleep for d on the worker thread just before
+// it returns the hijacked connection, that is before the worker's next
+// io_uring_enter; d <= 0 turns it off. It widens the window in which an op
+// the kernel still owes the connection can read the hijacker's first bytes
+// (celeris#685).
+func SetHijackHold(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	hijackHoldNanos.Store(int64(d))
+}
+
+// HijackHolds returns how many times [HijackHold] slept.
+func HijackHolds() uint64 { return hijackHolds.Load() }
+
+// HijackHold sleeps for the duration set by [SetHijackHold], if any. Engine
+// hook, worker thread.
+func HijackHold() {
+	if d := hijackHoldNanos.Load(); d > 0 {
+		hijackHolds.Add(1)
+		time.Sleep(time.Duration(d))
+	}
+}
