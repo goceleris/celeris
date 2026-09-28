@@ -26,6 +26,8 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 	e.metrics.handoffLoss.claimDeferred.Store(31)
 	e.metrics.handoffLoss.reapFailed.Store(37)
 	e.metrics.handoffLoss.reapUnsupported.Store(41)
+	e.metrics.handoffLoss.closeFDDeferred.Store(43)
+	e.metrics.handoffLoss.closeFDForced.Store(47)
 
 	m := e.Metrics()
 	for _, c := range []struct {
@@ -44,6 +46,8 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 		{"TransplantClaimDeferred", m.TransplantClaimDeferred, 31},
 		{"TransplantReapFailed", m.TransplantReapFailed, 37},
 		{"TransplantReapUnsupported", m.TransplantReapUnsupported, 41},
+		{"CloseFDDeferred", m.CloseFDDeferred, 43},
+		{"CloseFDForced", m.CloseFDForced, 47},
 	} {
 		if c.got != c.want {
 			t.Errorf("Metrics().%s = %d, want %d — the witness exists but cannot "+
