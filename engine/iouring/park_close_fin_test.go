@@ -14,8 +14,12 @@ package iouring
 // iteration saw no FIN, and both ends stayed ESTABLISHED, until something
 // woke the worker.
 //
-// Every arm below closes one sync-mode connection the engine gave up on and
-// asks one thing of the client's side of it: that the close arrives.
+// Every arm below closes sync-mode connections the engine gave up on and asks
+// one thing of the client's side of them: that the close arrives. The first
+// arms close one connection; the many-connection arms close 64 together.
+// One enter runs at most 20 deferred completions per local-work pass
+// (IO_LOCAL_TW_DEFAULT_MAX, kernel 6.13 and later), so one enter before the
+// park reached only the first of them.
 
 import (
 	"errors"
@@ -25,6 +29,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +74,23 @@ func startParkEngine712(t *testing.T, h stream.Handler, mut func(*resource.Confi
 	})
 	t.Logf("celeris657 engine workers=%d", e.NumWorkers())
 	return e, addr
+}
+
+// ringKind712 reports the engine's tier and whether its rings run completions
+// as deferred task work (IORING_SETUP_DEFER_TASKRUN), the ring kind the defect
+// needs: a COOP_TASKRUN ring logs tier=high as well. With
+// CELERIS_REQUIRE_IOURING_WORKERS=1 (CI, the cluster) a ring without it is a
+// failed premise, not a pass.
+func ringKind712(t *testing.T, e *Engine) (tier string, deferTaskrun bool) {
+	t.Helper()
+	e.mu.Lock()
+	tier = e.tier.Tier().String()
+	deferTaskrun = e.tier.SetupFlags()&setupDeferTaskrun != 0
+	e.mu.Unlock()
+	if !deferTaskrun && os.Getenv(envRequireIOUring656) == "1" {
+		t.Fatalf("celeris712 PREMISE: tier %s rings do not use DEFER_TASKRUN", tier)
+	}
+	return tier, deferTaskrun
 }
 
 // asyncFdlHandler is fdlHandler with every route async: the engine then runs
@@ -150,8 +172,8 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 	})
 	e.mu.Lock()
 	ws := append([]*Worker(nil), e.workers...)
-	tier := e.tier.Tier().String()
 	e.mu.Unlock()
+	tier, deferTaskrun := ringKind712(t, e)
 	allParked := func() bool {
 		for _, w := range ws {
 			if !w.suspended.Load() {
@@ -229,9 +251,9 @@ func finAfterClose(t *testing.T, park, readTimeout, async bool) {
 			wakeMs = time.Since(tw).Milliseconds()
 		}
 	}
-	t.Logf("celeris712 park=%v read_timeout=%v async=%v tier=%s workers=%d engine_close_ms=%d parked=%v "+
-		"client_close_ms=%d (%s) tcp_state_srv=%s tcp_state_cli=%s wake_to_close_ms=%d",
-		park, readTimeout, async, tier, len(ws), engineMs, parked, seenMs, why, stSrv, stCli, wakeMs)
+	t.Logf("celeris712 park=%v read_timeout=%v async=%v tier=%s defer_taskrun=%v workers=%d engine_close_ms=%d "+
+		"parked=%v client_close_ms=%d (%s) tcp_state_srv=%s tcp_state_cli=%s wake_to_close_ms=%d",
+		park, readTimeout, async, tier, deferTaskrun, len(ws), engineMs, parked, seenMs, why, stSrv, stCli, wakeMs)
 	if park && !parked {
 		t.Fatalf("celeris712 PREMISE: the worker did not park after the close")
 	}
@@ -254,6 +276,128 @@ func parkWait712(d time.Duration, f func() bool) bool {
 			return false
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// finToManyAfterClose runs a many-connection arm: n sync connections, each
+// mid-headers, on a paused engine, closed together by one deadline (the
+// header timers' CQEs, or one checkTimeouts pass's ReadTimeout on a draining
+// worker) so that the last of them go in the iteration that parks the worker.
+// Every client must see its close while the worker stays parked.
+func finToManyAfterClose(t *testing.T, n int, readTimeout bool) {
+	e, addr := startParkEngine712(t, fdlHandler{}, func(c *resource.Config) {
+		c.DisableDeferAccept = true // no pause linger (celeris#662), as above
+		if readTimeout {
+			c.ReadHeaderTimeout = 60 * time.Second
+			// Long enough for n dials and the pause to land before it.
+			c.ReadTimeout = time.Second
+			c.IdleTimeout = 10 * time.Minute
+		} else {
+			c.ReadHeaderTimeout = time.Second
+		}
+	})
+	e.mu.Lock()
+	ws := append([]*Worker(nil), e.workers...)
+	e.mu.Unlock()
+	tier, deferTaskrun := ringKind712(t, e)
+	allParked := func() bool {
+		for _, w := range ws {
+			if !w.suspended.Load() {
+				return false
+			}
+		}
+		return true
+	}
+	if !parkWait712(3*time.Second, func() bool {
+		m := e.Metrics()
+		return m.ActiveConnections == 0 && m.AcceptCount == m.CloseCount
+	}) {
+		t.Fatalf("celeris712 PREMISE: the engine is not idle")
+	}
+	const partial = "GET /slow HTTP/1.1\r\nHost: x\r\n" // no blank line: mid-headers until a deadline
+	read0 := e.Metrics().BytesRead
+	conns := make([]net.Conn, n)
+	for i := range conns {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		conns[i] = c
+		defer func() { _ = c.Close() }()
+	}
+	for i, c := range conns {
+		if _, err := c.Write([]byte(partial)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if !parkWait712(3*time.Second, func() bool { return e.Metrics().ActiveConnections == int64(n) }) {
+		t.Fatalf("celeris712 PREMISE: %d of %d connections accepted", e.Metrics().ActiveConnections, n)
+	}
+	// Every partial header read: a connection whose bytes the engine has not
+	// read yet is at a request boundary, and the drain below hands it off.
+	want := uint64(n * len(partial))
+	if !parkWait712(3*time.Second, func() bool { return e.Metrics().BytesRead-read0 >= want }) {
+		t.Fatalf("celeris712 PREMISE: the engine read %d of %d header bytes", e.Metrics().BytesRead-read0, want)
+	}
+	if readTimeout {
+		// A drain caps the paused worker's ring wait at the sweep's
+		// cadence, as in the single-connection ReadTimeout arm.
+		tgt := &fdlTarget{}
+		e.StartTransplant(tgt)
+		defer e.StopTransplant()
+	}
+	if err := e.PauseAccept(); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if a := e.Metrics().ActiveConnections; a != int64(n) {
+		t.Fatalf("celeris712 PREMISE: closes began before the listeners closed (active=%d of %d)", a, n)
+	}
+	if !parkWait712(15*time.Second, func() bool { return e.Metrics().ActiveConnections == 0 }) {
+		t.Fatalf("celeris712 PREMISE: the engine never closed the connections (active=%d)", e.Metrics().ActiveConnections)
+	}
+	closedAt := time.Now()
+	if !parkWait712(2*time.Second, allParked) {
+		t.Fatalf("celeris712 PREMISE: the worker did not park after the last close")
+	}
+	parkMs := time.Since(closedAt).Milliseconds()
+	var seen atomic.Int64
+	var wg sync.WaitGroup
+	for _, c := range conns {
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			if d, _ := clientSeesClose(c, 2*time.Second); d >= 0 {
+				seen.Add(1)
+			}
+		}(c)
+	}
+	wg.Wait()
+	parked := allParked()
+	// How many of the rest arrive once something wakes the worker.
+	var seenAfterWake atomic.Int64
+	if seen.Load() < int64(n) {
+		_ = e.ResumeAccept()
+		var wg2 sync.WaitGroup
+		for _, c := range conns {
+			wg2.Add(1)
+			go func(c net.Conn) {
+				defer wg2.Done()
+				if d, _ := clientSeesClose(c, 2*time.Second); d >= 0 {
+					seenAfterWake.Add(1)
+				}
+			}(c)
+		}
+		wg2.Wait()
+	}
+	t.Logf("celeris712many read_timeout=%v tier=%s defer_taskrun=%v workers=%d n=%d park_after_last_close_ms=%d "+
+		"parked_through_poll=%v fin_seen_while_parked=%d/%d seen_after_wake=%d",
+		readTimeout, tier, deferTaskrun, len(ws), n, parkMs, parked, seen.Load(), n, seenAfterWake.Load())
+	if !parked {
+		t.Fatalf("celeris712 PREMISE: the worker left the park while the clients polled")
+	}
+	if seen.Load() != int64(n) {
+		t.Errorf("celeris712 NOFIN: %d of %d clients saw no close in 2 s while the worker was parked "+
+			"(%d of them saw it after a wake)", int64(n)-seen.Load(), n, seenAfterWake.Load())
 	}
 }
 
@@ -280,4 +424,16 @@ func TestRunningWorkerSendsFINForAHeaderTimeoutClose(t *testing.T) {
 // shutdown(SHUT_WR) acts on the socket and needs no recv completion.
 func TestParkedAsyncWorkerSendsFINForAHeaderTimeoutClose(t *testing.T) {
 	finAfterClose(t, true, false, true)
+}
+
+// TestParkedWorkerSendsFINToManyReadTimeoutCloses: one checkTimeouts pass on
+// a draining, paused worker closes 64 connections, and the worker parks in
+// that iteration. Every client must see its close.
+func TestParkedWorkerSendsFINToManyReadTimeoutCloses(t *testing.T) { finToManyAfterClose(t, 64, true) }
+
+// TestParkedWorkerSendsFINToManyHeaderTimeoutCloses: the same with 64 header
+// timers, whose CQEs arrive together or in a few batches: only the batch
+// that empties the worker is closed in the parking iteration.
+func TestParkedWorkerSendsFINToManyHeaderTimeoutCloses(t *testing.T) {
+	finToManyAfterClose(t, 64, false)
 }
