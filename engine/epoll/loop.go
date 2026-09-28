@@ -1394,7 +1394,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 				cs.h1State.InlineMode = true
 			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
-			if tryInline {
+			// A handler that ran inline and hijacked has had cs released to
+			// the pool inside the Hijack call (hijackConn's inline branch):
+			// cs.h1State is nil, and cs may already be another accept's
+			// connection. So cs is not touched again once ProcessH1 reports
+			// the hijack; the ErrHijacked return below is the only way out.
+			if tryInline && !errors.Is(processErr, conn.ErrHijacked) {
 				cs.h1State.InlineMode = false
 			}
 			if errors.Is(processErr, conn.ErrAsyncDispatch) {
