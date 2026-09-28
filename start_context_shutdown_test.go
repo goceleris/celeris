@@ -155,14 +155,17 @@ func reopenerRunning(rt *router) bool {
 // still tearing down, so the watcher wakes on ctx.Done() with listenDone still
 // open: the exact case where only the guard stands between it and a second
 // Shutdown. Without the guard the hook runs twice in every run.
+//
+// Since celeris#703 the direct Shutdown waits for Listen to return before it
+// runs the hooks, so it is made on its own goroutine and is still in progress,
+// its hooks not yet run, when ctx is cancelled.
 func TestStartContextWatcherDoesNotRepeatADirectShutdown(t *testing.T) {
 	s := New(Config{Engine: Std, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	var hookRuns atomic.Int32
 	s.OnShutdown(func(context.Context) { hookRuns.Add(1) })
 
-	eng := &teardownEngine{listening: make(chan struct{}), release: make(chan struct{})}
-	var e engine.Engine = eng
-	s.engineRef.Store(&e)
+	eng := newTeardownEngine()
+	s.publishEngine(eng)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -170,14 +173,16 @@ func TestStartContextWatcherDoesNotRepeatADirectShutdown(t *testing.T) {
 	go func() { done <- s.listenUntilCancelled(ctx, eng) }()
 	<-eng.listening
 
-	if err := s.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown: %v", err)
+	direct := make(chan error, 1)
+	go func() { direct <- s.Shutdown(context.Background()) }()
+	// The direct Shutdown has claimed the shutdown once it has cancelled
+	// Listen's context: it marks itself before it runs anything.
+	<-eng.cancelled
+	if n := hookRuns.Load(); n != 0 {
+		t.Fatalf("the hook ran %d times while Listen was still tearing down, want 0 (celeris#703)", n)
 	}
-	if n := hookRuns.Load(); n != 1 {
-		t.Fatalf("after the direct Shutdown the hook ran %d times, want 1", n)
-	}
-	// Listen is now tearing down (its context was cancelled by Shutdown) and
-	// has not returned, so listenDone is still open when ctx is cancelled.
+	// Listen is now tearing down and has not returned, so listenDone is
+	// still open when ctx is cancelled.
 	cancel()
 	// Let the watcher act on the cancel before Listen returns. Its decision
 	// needs no I/O, and the assertion below does not depend on this sleep
@@ -186,6 +191,14 @@ func TestStartContextWatcherDoesNotRepeatADirectShutdown(t *testing.T) {
 	// and Start waits for the watcher).
 	time.Sleep(50 * time.Millisecond)
 	close(eng.release)
+	select {
+	case err := <-direct:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the direct Shutdown did not return after Listen did")
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -201,16 +214,30 @@ func TestStartContextWatcherDoesNotRepeatADirectShutdown(t *testing.T) {
 
 // teardownEngine is an engine.Engine whose Listen, once its context is
 // cancelled, waits for release before returning, the way a native engine's
-// Listen keeps running through its worker teardown.
+// Listen keeps running through its worker teardown. listening is closed when
+// Listen starts, cancelled when it has seen its context cancelled, and
+// returned is set just before it returns.
 type teardownEngine struct {
 	listening chan struct{}
+	cancelled chan struct{}
 	release   chan struct{}
+	returned  atomic.Bool
+}
+
+func newTeardownEngine() *teardownEngine {
+	return &teardownEngine{
+		listening: make(chan struct{}),
+		cancelled: make(chan struct{}),
+		release:   make(chan struct{}),
+	}
 }
 
 func (e *teardownEngine) Listen(ctx context.Context) error {
 	close(e.listening)
 	<-ctx.Done()
+	close(e.cancelled)
 	<-e.release
+	e.returned.Store(true)
 	return nil
 }
 func (e *teardownEngine) Shutdown(context.Context) error { return nil }
@@ -243,9 +270,8 @@ func TestADirectShutdownAfterTheWatchersDoesNotRepeatIt(t *testing.T) {
 		}
 	})
 
-	eng := &teardownEngine{listening: make(chan struct{}), release: make(chan struct{})}
-	var e engine.Engine = eng
-	s.engineRef.Store(&e)
+	eng := newTeardownEngine()
+	s.publishEngine(eng)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -253,11 +279,14 @@ func TestADirectShutdownAfterTheWatchersDoesNotRepeatIt(t *testing.T) {
 	<-eng.listening
 
 	cancel()
+	// Since celeris#703 the watcher's Shutdown runs the hooks only once
+	// Listen has returned, so let Listen finish its teardown.
+	<-eng.cancelled
+	close(eng.release)
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
 		close(releaseHook)
-		close(eng.release)
 		t.Fatal("the cancel never reached the OnShutdown hook: the watcher did not shut down")
 	}
 	direct := make(chan error, 1)
@@ -269,14 +298,12 @@ func TestADirectShutdownAfterTheWatchersDoesNotRepeatIt(t *testing.T) {
 			t.Errorf("the direct Shutdown during the watcher's: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		close(eng.release)
 		t.Fatal("the direct Shutdown did not return after the watcher's Shutdown did")
 	}
 	if n := hookRuns.Load(); n != 1 {
 		t.Errorf("a direct Shutdown during the one the cancel started: the hook ran %d times, want 1", n)
 	}
 
-	close(eng.release)
 	select {
 	case err := <-done:
 		if err != nil {
