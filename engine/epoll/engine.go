@@ -81,6 +81,11 @@ type Engine struct {
 
 	// adoptRR round-robins io_uring→epoll transplant adoptions across loops (#383).
 	adoptRR atomic.Uint64
+
+	// drainBudget is the ctx of the last Shutdown call: the budget of the
+	// send drain the loops run when Listen's context is cancelled
+	// (celeris#760; see Loop.drainSends).
+	drainBudget atomic.Pointer[context.Context]
 }
 
 // New creates a new epoll engine.
@@ -148,6 +153,7 @@ func (e *Engine) Listen(ctx context.Context) error {
 		l.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
 		l.sweepCnt = &e.metrics.sweep
 		l.pause = &e.pause
+		l.drainBudget = &e.drainBudget
 		e.loops[i] = l
 	}
 	e.mu.Unlock()
@@ -202,19 +208,24 @@ func (e *Engine) Listen(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown is a no-op for the epoll engine — graceful shutdown is
+// Shutdown does not stop the epoll engine itself — graceful shutdown is
 // driven by context cancellation on Listen's parent context. The
 // Server calls Listen with its managed context and cancels it during
 // Server.Shutdown; the Listen goroutine returns after running
-// Loop.shutdown (which closes connections and joins async dispatch
-// goroutines via asyncWG). Server.Shutdown waits for that return before
-// it runs the OnShutdown hooks (celeris#703).
+// Loop.shutdown (which joins async dispatch goroutines via asyncWG, sends
+// the responses still queued, and closes connections). Server.Shutdown
+// waits for that return before it runs the OnShutdown hooks
+// (celeris#703).
 //
-// The context parameter is accepted for interface parity with engines
-// that do run async drain operations on Shutdown (e.g. std's
-// http.Server.Shutdown), and for future use if epoll Shutdown gains
-// explicit drain semantics.
-func (e *Engine) Shutdown(_ context.Context) error {
+// What Shutdown does is hand ctx to the loops as the budget of that send
+// drain (celeris#760): a response larger than the socket buffers is sent
+// until ctx's deadline, and never for less than shutdownSendDrainFloor,
+// before its conn is closed. Server.Shutdown calls it before it cancels
+// Listen's context, and a cancel of StartWithContext's context reaches
+// the loops first but the watcher's Shutdown follows at once, within the
+// drain's floor.
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.drainBudget.Store(&ctx)
 	return nil
 }
 

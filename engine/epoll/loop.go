@@ -69,6 +69,17 @@ const maxEpollEvents = 2048
 // connection cleanly (read returns 0 bytes / EOF).
 var errPeerClosed = fmt.Errorf("celeris: peer closed connection: %w", io.EOF)
 
+// shutdownSendDrainFloor is the least time shutdown's send drain gives the
+// responses still queued to reach the kernel before the conns are closed
+// (celeris#760): io_uring's bound, shutdownSendDrainNanos (celeris#595). The
+// budget of the Engine.Shutdown call that stopped the engine extends it to
+// that budget's deadline; a peer that stops reading holds it no longer.
+const shutdownSendDrainFloor = 250 * time.Millisecond
+
+// shutdownSendDrainPoll caps one wait of the drain for a writable socket, so
+// the drain notices a budget that ends early (a cancelled Shutdown ctx).
+const shutdownSendDrainPoll = 20 * time.Millisecond
+
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id       int
@@ -179,6 +190,12 @@ type Loop struct {
 	// read only on this thread. reclaimTransplant needs one to build a
 	// connState with (celeris#624).
 	runCtx context.Context
+
+	// drainBudget points at the engine's record of the budget of the last
+	// Engine.Shutdown call (celeris#760): shutdown's send drain may run
+	// until that ctx is done. nil, or no Shutdown yet, leaves the drain its
+	// floor, shutdownSendDrainFloor.
+	drainBudget *atomic.Pointer[context.Context]
 
 	// transplantInFlight counts connections this loop has detached for a
 	// transplant whose hand-off is not finished yet — the deferred async
@@ -3446,6 +3463,13 @@ func (l *Loop) shutdown() {
 	// close fds or recycle connState below.
 	l.asyncWG.Wait()
 
+	// Phase 2b (celeris#760): every response the handlers wrote is queued
+	// now; send what the sockets have not taken yet before phase 3 closes
+	// them, as io_uring does before its shutdown (celeris#595). Closing at
+	// once cut off the tail of any response larger than the socket buffers
+	// to a client that reads more slowly than the loop shuts down.
+	l.drainSends()
+
 	// Phase 3: now that the async dispatch goroutines have exited (phase 2),
 	// close the fds and release the connState back to the pool. The pool
 	// release stays gated on !detached for the same reason as closeConn: a
@@ -3497,6 +3521,79 @@ func (l *Loop) shutdown() {
 	// epoll_ctl, so none of them can operate on this number once it is free
 	// to be recycled.
 	l.closeEpollFD()
+}
+
+// drainSends is shutdown's send drain (celeris#760). It flushes every live
+// conn with response bytes still queued, and waits for their sockets to take
+// more, until nothing is queued or the drain's time is up: the later of
+// shutdownSendDrainFloor after it began and the deadline of the budget the
+// last Engine.Shutdown call handed over (drainBudget), or, before that
+// deadline, the moment that budget's ctx is done. A conn whose write fails
+// is left to phase 3's close. The run loop is no longer turning: the conns
+// are polled directly (poll(2), POLLOUT), not through the epoll set.
+//
+// Loop thread, after phase 2: no dispatch goroutine is left to write, and a
+// detached conn's middleware finds detachClosed set by phase 1 and writes
+// nothing more. detachMu is still taken around each flush, as every flush
+// site does.
+func (l *Loop) drainSends() {
+	start := time.Now()
+	var fds []unix.PollFd
+	for {
+		fds = fds[:0]
+		for i := len(l.liveConns) - 1; i >= 0; i-- {
+			cs := l.liveConns[i]
+			if cs.hijacked.Load() {
+				continue // the application's since the Hijack (celeris#668)
+			}
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			pending := false
+			if csWritePending(cs) && l.flushWrites(cs, true) == nil {
+				pending = csWritePending(cs)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+			if pending {
+				fds = append(fds, unix.PollFd{Fd: int32(cs.fd), Events: unix.POLLOUT})
+			}
+		}
+		if len(fds) == 0 {
+			return
+		}
+		wait, ok := l.sendDrainWait(start)
+		if !ok {
+			return
+		}
+		if _, err := unix.Poll(fds, int(wait/time.Millisecond)+1); err != nil && err != unix.EINTR {
+			return
+		}
+	}
+}
+
+// sendDrainWait reports how long drainSends may wait for a writable socket
+// now, at most shutdownSendDrainPoll, and false once the drain's time is up
+// (see drainSends).
+func (l *Loop) sendDrainWait(start time.Time) (time.Duration, bool) {
+	now := time.Now()
+	end := start.Add(shutdownSendDrainFloor)
+	if l.drainBudget != nil {
+		// A budget that is done, at its deadline or by a cancel before it,
+		// leaves the floor.
+		if p := l.drainBudget.Load(); p != nil && (*p).Err() == nil {
+			if d, has := (*p).Deadline(); has && d.After(end) {
+				end = d
+			}
+		}
+	}
+	left := end.Sub(now)
+	if left <= 0 {
+		return 0, false
+	}
+	return min(left, shutdownSendDrainPoll), true
 }
 
 // createListenSocket binds and listens on addr. deferAccept asks for
