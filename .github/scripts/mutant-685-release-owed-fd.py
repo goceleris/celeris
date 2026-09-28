@@ -8,13 +8,21 @@ no read-side shutdown), hijackConn no longer submits its cancels before
 handing the socket over, and worker shutdown no longer ends the owed ops
 before closing descriptors.
 
-Against the mutated tree the three trials that judge the rule MUST fail in
-every run: TestRecvTheft715ArmA (a recv still in the SQ ring at the close),
-TestRecvTheft685Linked (a recv linked behind a SEND, not issued at the
-close) and TestRecvTheft685HijackMultishotCoop (a multishot recv owed at a
-Hijack on a ring without DEFER_TASKRUN). If one passes, it is not watching
-the path it claims to judge, and its green run on the tree as committed
-proves nothing.
+Against the mutated tree every run of the five trials that judge the rule
+MUST detect the theft, as its result line reports it (the CI step reads
+that line, not the --- line, so a failure for another reason does not
+count): TestRecvTheft715ArmA and its hole twin TestRecvTheft715ArmAHole (a
+recv still in the SQ ring at the close), TestRecvTheft685Linked and
+TestRecvTheft685LinkedHole (a recv linked behind a SEND, not issued at the
+close), each with hit=true reused=true stolen=true, and
+TestRecvTheft685HijackMultishotCoop (a multishot recv owed at a Hijack on a
+ring without DEFER_TASKRUN) with hijacker_read=false. If one does not, it
+is not watching the path it claims to judge, and its green run on the tree
+as committed proves nothing.
+
+The mutant also takes the rule off worker shutdown (endOwedOpsAtShutdown
+ends only the ops fdOwed reports), but no trial judges that half: it is
+covered by construction, not by a detector.
 
 The function is matched EXACTLY; any drift makes this script exit 2 instead
 of silently mutating nothing.

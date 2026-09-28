@@ -47,8 +47,11 @@ import (
 //  4. A drains its socket. The SEND completes, and completeSend runs the
 //     deferred close with the linked recv owed; W1 parks when the close path
 //     returns (recvtheft.Options.LinkedRecv).
-//  5. The test dials B's candidates. The sibling W2 accepts one, as N if the
-//     close released it (and W2 then parks before submitting B's recv).
+//  5. The test dials B's candidates until the sibling W2's accept of one
+//     tests the theft (theftHit): one given N, because the close released it
+//     (W2 then parks before submitting B's recv), or any one while N is still
+//     A's socket. An accept given a lower free number while N is free is
+//     skipped. TestRecvTheft685LinkedHole opens such a hole on purpose.
 //  6. W1 is released (its next enter runs the queued task work, which issues
 //     the linked recv), then W2.
 //
@@ -169,7 +172,12 @@ type linkedTheftResult struct {
 	bFD               int
 	reused            bool
 	heldOpen          bool
+	heldByA           bool
 	released          bool
+	hole              int
+	missHole          int
+	accepts0          uint64
+	dialed            int
 	filled            int
 	witness           uint64
 	staleClosed       uint64
@@ -182,13 +190,8 @@ type linkedTheftResult struct {
 	missCloserAccepts int
 }
 
-func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *linkedTheftResult) bool {
-	for deadline := time.Now().Add(3 * time.Second); e.metrics.activeConns.Load() != 0; {
-		if time.Now().After(deadline) {
-			t.Fatalf("engine still holds %d connections from the previous attempt", e.metrics.activeConns.Load())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, arm string, hole bool, r *linkedTheftResult) bool {
+	waitEngineQuiet(t, e, r.accepts0, r.dialed)
 	fillFDHoles(t)
 	var cands []int
 	defer func() {
@@ -219,6 +222,7 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *link
 	if err := unix.Connect(a, sa); err != nil {
 		t.Fatalf("connect A: %v", err)
 	}
+	r.dialed++
 	if _, err := unix.Write(a, []byte(linkedReqHead)); err != nil {
 		t.Fatalf("write A head: %v", err)
 	}
@@ -272,12 +276,23 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *link
 		r.missNoClose++
 		<-drained
 		outqAfter, _ := unix.IoctlGetInt(srv, unix.SIOCOUTQ)
-		t.Logf("RECVTHEFT685 linked attempt=%d miss=no-close-hold filled=%d outq_before_drain=%d outq_after=%d srv_after=%q closes=+%d witness=+%d",
-			r.attempts, r.filled, outqBefore, outqAfter, fdTarget(srv), e.metrics.closeCount.Load()-closes0, recvtheft.CloseWithLinkedRecv()-witness0)
+		t.Logf("RECVTHEFT685 %s attempt=%d miss=no-close-hold filled=%d outq_before_drain=%d outq_after=%d srv_after=%q closes=+%d witness=+%d",
+			arm, r.attempts, r.filled, outqBefore, outqAfter, fdTarget(srv), e.metrics.closeCount.Load()-closes0, recvtheft.CloseWithLinkedRecv()-witness0)
 		return false
 	}
 	aTarget := fdTarget(ce.FD)
 	r.heldOpen = strings.HasPrefix(aTarget, "socket:")
+	r.heldByA = r.heldOpen && namesPeer(ce.FD, aLocal)
+	if hole {
+		// A hole under N, as in TestRecvTheft715ArmAHole: the last candidate,
+		// never dialed, was allocated before A's server-side descriptor.
+		r.hole = cands[len(cands)-1]
+		cands = cands[:len(cands)-1]
+		if r.hole > ce.FD {
+			t.Fatalf("the hole candidate's number %d is not below A's %d", r.hole, ce.FD)
+		}
+		_ = unix.Close(r.hole)
+	}
 
 	var hit *recvtheft.AcceptEvent
 	var hitFD int
@@ -285,6 +300,7 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *link
 		if err := unix.Connect(fd, sa); err != nil {
 			t.Fatalf("connect candidate %d: %v", i, err)
 		}
+		r.dialed++
 		if _, err := unix.Write(fd, []byte(theftRequestB)); err != nil {
 			t.Fatalf("write candidate %d: %v", i, err)
 		}
@@ -295,6 +311,11 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *link
 		}
 		if ev.Worker == ce.Worker {
 			r.missCloserAccepts++
+			continue
+		}
+		if !theftHit(ev.FD, ce.FD, r.heldByA) {
+			r.missHole++
+			t.Logf("RECVTHEFT685 %s attempt=%d candidate=%d accepted by the sibling %d as fd %d, a hole below A's released %d: skipped", arm, r.attempts, i, ev.Worker, ev.FD, ce.FD)
 			continue
 		}
 		ev0 := ev
@@ -310,8 +331,8 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *link
 		break
 	}
 	if hit == nil {
-		t.Logf("RECVTHEFT685 linked attempt=%d miss=no-sibling-accept fd=%d closer=%d queued=%d closer_accepts=%d",
-			r.attempts, ce.FD, ce.Worker, r.missQueued, r.missCloserAccepts)
+		t.Logf("RECVTHEFT685 %s attempt=%d miss=no-sibling-accept fd=%d closer=%d held_by_a=%v queued=%d closer_accepts=%d hole_accepts=%d",
+			arm, r.attempts, ce.FD, ce.Worker, r.heldByA, r.missQueued, r.missCloserAccepts, r.missHole)
 		tr.Disarm()
 		<-drained
 		return false
@@ -350,14 +371,22 @@ func linkedTheftAttempt(t *testing.T, e *Engine, sa *unix.SockaddrInet4, r *link
 
 // TestRecvTheft685Linked is the linked form's trial (see above). One trial
 // per run; tally the --- lines of -count=N.
-func TestRecvTheft685Linked(t *testing.T) {
+func TestRecvTheft685Linked(t *testing.T) { runLinkedTheft(t, "linked", false) }
+
+// TestRecvTheft685LinkedHole is the linked trial with a hole opened under A's
+// number once the closer is parked, as TestRecvTheft715ArmAHole does for arm
+// A: on a tree that releases the number at the close it must fail exactly as
+// the linked trial does.
+func TestRecvTheft685LinkedHole(t *testing.T) { runLinkedTheft(t, "linked-hole", true) }
+
+func runLinkedTheft(t *testing.T, arm string, hole bool) {
 	requireRecvTheft715(t)
 	e, port := startLinkedTheftEngine(t)
 	sa := &unix.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}
-	var r linkedTheftResult
+	r := linkedTheftResult{hole: -1, accepts0: e.metrics.acceptCount.Load()}
 	for r.attempts < theftMaxAttempts {
 		r.attempts++
-		if linkedTheftAttempt(t, e, sa, &r) {
+		if linkedTheftAttempt(t, e, sa, arm, hole, &r) {
 			break
 		}
 	}
@@ -369,11 +398,14 @@ func TestRecvTheft685Linked(t *testing.T) {
 	if r.answerErr != nil {
 		errText = r.answerErr.Error()
 	}
-	t.Logf("RECVTHEFT685 linked result attempts=%d hit=%v fd=%d closer=%d sibling=%d b_fd=%d reused=%v held_open=%v released=%v filled=%d witness=+%d stale_recv_data_closed=+%d stolen=%v answered=%v answer_err=%q stale=[%s] misses{no_close=%d queued=%d closer_accepts=%d}",
-		r.attempts, r.hit, r.fd, r.closer, r.sibl, r.bFD, r.reused, r.heldOpen, r.released, r.filled, r.witness, r.staleClosed,
-		r.stolen, r.answered, errText, strings.Join(heads, " "), r.missNoClose, r.missQueued, r.missCloserAccepts)
+	t.Logf("RECVTHEFT685 %s result attempts=%d hit=%v fd=%d closer=%d sibling=%d b_fd=%d reused=%v held_open=%v held_by_a=%v released=%v hole=%d filled=%d witness=+%d stale_recv_data_closed=+%d stolen=%v answered=%v answer_err=%q stale=[%s] misses{no_close=%d queued=%d closer_accepts=%d hole_accepts=%d}",
+		arm, r.attempts, r.hit, r.fd, r.closer, r.sibl, r.bFD, r.reused, r.heldOpen, r.heldByA, r.released, r.hole, r.filled, r.witness, r.staleClosed,
+		r.stolen, r.answered, errText, strings.Join(heads, " "), r.missNoClose, r.missQueued, r.missCloserAccepts, r.missHole)
 	if !r.hit {
-		skipOrFail656(t, "INCONCLUSIVE: no sibling accept while the closer was parked, in %d attempts", r.attempts)
+		skipOrFail656(t, "INCONCLUSIVE: no sibling accept that tests the theft while the closer was parked, in %d attempts", r.attempts)
+	}
+	if !r.reused && !r.heldByA {
+		t.Fatalf("a hit that tests nothing: B was given %d, A's number %d was neither reused nor kept as A's socket (see theftHit)", r.bFD, r.fd)
 	}
 	if r.witness == 0 {
 		t.Fatalf("the close hold fired but close_with_linked_recv did not move")

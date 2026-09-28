@@ -1005,8 +1005,12 @@ jobs:
       # asserts that B is answered and that no stale recv read B's bytes.
       # On a tree that frees the number at the close, the sibling is given
       # it and the old recv reads B's request: both fail in every trial.
-      # TestRecvTheft715Control (the ring submitted before the close) and
-      # TestRecvTheft715ArmC (celeris#715 hypothesis (c)) must pass either way.
+      # Their *Hole twins open a free number under A's once the closer is
+      # parked: the sibling's accept of the hole tests nothing and is
+      # skipped, so they must fail the same way (a verdict that counted it
+      # passed a tree without the fix). TestRecvTheft715Control (the ring
+      # submitted before the close) and TestRecvTheft715ArmC (celeris#715
+      # hypothesis (c)) must pass either way.
       # The three TestRecvTheft685Hijack* arms hold the worker right after a
       # Hijack and send the hijacker's first bytes meanwhile: with multishot
       # recv (owed across its request) on a ring without DEFER_TASKRUN, the
@@ -1028,7 +1032,7 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestRecvTheft715ArmA|TestRecvTheft715Control|TestRecvTheft715ArmC|TestRecvTheft685Linked|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer|TestRecvTheft685HijackMultishotCoop'
+          names='TestRecvTheft715ArmA|TestRecvTheft715ArmAHole|TestRecvTheft715Control|TestRecvTheft715ArmC|TestRecvTheft685Linked|TestRecvTheft685LinkedHole|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer|TestRecvTheft685HijackMultishotCoop'
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
@@ -1048,11 +1052,18 @@ jobs:
           fi
       # The detector control. .github/scripts/mutant-685-release-owed-fd.py
       # makes fdOwed report false, which takes the fd-lifetime rule off the
-      # close paths, Hijack and shutdown at once. Against that tree the three
-      # trials that judge the rule must FAIL in every one of their runs (a
-      # PASS means the trial does not watch the path it judges), and the
-      # others must still PASS. The mutation is undone before the step ends.
-      - name: celeris#685 detector control (the rule removed; the three judging trials must fail every run)
+      # close paths, Hijack and shutdown at once. Against that tree every run
+      # of the five trials that judge the rule must DETECT the theft, read
+      # from its result line, not from its --- line: a FAIL for any other
+      # reason (INCONCLUSIVE, a setup error, a race report) is not a
+      # detection. The close-path trials (ArmA, ArmAHole, Linked, LinkedHole)
+      # must report hit=true, reused=true and stolen=true: the sibling was
+      # given A's number and A's stale recv read B's request. The hijack
+      # trial (MultishotCoop) must report op_owed=+1 and hijacker_read=false.
+      # The trials that pass on any tree must still PASS. No trial judges the
+      # shutdown half of the rule (see the script). The mutation is undone
+      # before the step ends.
+      - name: celeris#685 detector control (the rule removed; every run of the five judging trials must detect the theft)
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -1062,27 +1073,37 @@ jobs:
           set -o pipefail
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           python3 .github/scripts/mutant-685-release-owed-fd.py
-          judged='TestRecvTheft715ArmA|TestRecvTheft685Linked|TestRecvTheft685HijackMultishotCoop'
           others='TestRecvTheft715Control|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer'
           runs=3
-          go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${judged}|${others})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/recvtheft685-mutant.log || true
+          log=/tmp/recvtheft685-mutant.log
+          go test -tags=validation -race -count="$runs" -timeout=600s -v \
+            -run "^(TestRecvTheft715ArmA|TestRecvTheft715ArmAHole|TestRecvTheft685Linked|TestRecvTheft685LinkedHole|TestRecvTheft685HijackMultishotCoop|${others})\$" \
+            ./engine/iouring/ 2>&1 | tee "$log" || true
           git checkout -- engine/iouring/fd_lifetime.go
-          grep -E 'RECVTHEFT(715|685) .*result' /tmp/recvtheft685-mutant.log || true
+          grep -E 'RECVTHEFT(715|685) .*result' "$log" || true
           bad=0
-          for n in ${judged//|/ }; do
-            p=$(grep -cE "^--- PASS: $n \(" /tmp/recvtheft685-mutant.log || true)
-            f=$(grep -cE "^--- FAIL: $n \(" /tmp/recvtheft685-mutant.log || true)
-            echo "mutant, judged $n: PASS $p FAIL $f (want FAIL $runs)"
-            if [ "$f" -ne "$runs" ] || [ "$p" -ne 0 ]; then bad=1; fi
-          done
+          # judged <test> <its result line> <the detection that line must report>
+          judged() {
+            local n=$1 line=$2 want=$3 lines det p
+            lines=$(grep -cE "$line" "$log" || true)
+            det=$(grep -E "$line" "$log" | grep -cE "$want" || true)
+            p=$(grep -cE "^--- PASS: $n \(" "$log" || true)
+            echo "mutant, judged $n: result lines $lines, detected $det, PASS $p (want $runs, $runs, 0)"
+            if [ "$lines" -ne "$runs" ] || [ "$det" -ne "$runs" ] || [ "$p" -ne 0 ]; then bad=1; fi
+          }
+          stolen=' hit=true .* reused=true .* stolen=true '
+          judged TestRecvTheft715ArmA 'RECVTHEFT715 arm=A result ' "$stolen"
+          judged TestRecvTheft715ArmAHole 'RECVTHEFT715 arm=A-hole result ' "$stolen"
+          judged TestRecvTheft685Linked 'RECVTHEFT685 linked result ' "$stolen"
+          judged TestRecvTheft685LinkedHole 'RECVTHEFT685 linked-hole result ' "$stolen"
+          judged TestRecvTheft685HijackMultishotCoop 'RECVTHEFT685 hijack result tier=2 ' ' op_owed=\+1 .* hijacker_read=false '
           for n in ${others//|/ }; do
-            p=$(grep -cE "^--- PASS: $n \(" /tmp/recvtheft685-mutant.log || true)
-            f=$(grep -cE "^--- FAIL: $n \(" /tmp/recvtheft685-mutant.log || true)
+            p=$(grep -cE "^--- PASS: $n \(" "$log" || true)
+            f=$(grep -cE "^--- FAIL: $n \(" "$log" || true)
             echo "mutant, control $n: PASS $p FAIL $f (want PASS $runs)"
             if [ "$p" -ne "$runs" ] || [ "$f" -ne 0 ]; then bad=1; fi
           done
-          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/recvtheft685-mutant.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
           if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
           exit "$bad"
 

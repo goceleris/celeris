@@ -36,13 +36,18 @@ func serverFDFor(local string) int {
 		if err != nil {
 			continue
 		}
-		sa, err := unix.Getpeername(fd)
-		if err != nil {
-			continue
-		}
-		if sockaddrString(sa) == local {
+		if namesPeer(fd, local) {
 			return fd
 		}
 	}
 	return -1
+}
+
+// namesPeer reports whether fd is a socket whose peer is local: the server
+// side of the loopback connection the test dialed from local. It tells a
+// descriptor number still naming that connection's socket from the same
+// number freed and given to another socket.
+func namesPeer(fd int, local string) bool {
+	sa, err := unix.Getpeername(fd)
+	return err == nil && sockaddrString(sa) == local
 }
