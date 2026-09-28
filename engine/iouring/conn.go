@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/recvtheft"
 )
 
 // maxSendQueueBytes is the per-connection back-pressure limit for
@@ -416,6 +417,13 @@ type connState struct {
 	// has repurposed. drainPendingRelease only releases a connState once
 	// this counter reaches zero (with a wall-clock backstop for kernel
 	// anomalies). Mirrors driverConn.inflightOps.
+	//
+	// recvArmSeq (validation builds only; zero-size in production, and not
+	// the last field, so it adds no padding) is the SQ ring sequence number
+	// of this conn's latest recv SQE: the close paths compare it with the
+	// kernel's SQ head to tell a recv the kernel has not consumed yet
+	// (celeris#715, Worker.recvUnsubmitted). Set by noteRecvPlaced.
+	recvArmSeq     recvtheft.ArmSeq
 	kernelInflight int32
 	// recvArmed is true while a recv SQE (single-shot or multishot) is
 	// kernel-held for this conn. Set by prepareRecv / flushSendLink's
