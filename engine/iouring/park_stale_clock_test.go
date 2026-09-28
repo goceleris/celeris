@@ -3,7 +3,7 @@
 package iouring
 
 // celeris#713. A worker stamps lastActivity from w.cachedNow, a clock it
-// refreshes only on its own iterations (every 64th CQE-bearing one, and in
+// refreshed only on its own iterations (every 64th CQE-bearing one, and in
 // checkTimeouts). The DRAINING→SUSPENDED park stops those iterations, so a
 // worker leaves the park with the clock it parked with. The connections it
 // accepts or adopts on waking were stamped from that clock, and the first
@@ -397,7 +397,10 @@ func TestAdoptOntoADrainingWorkerIsNotTimedOut(t *testing.T) {
 // TestAdoptionIsStampedWithTheTimeItWasAdopted is the adoption stamp alone,
 // on a worker whose clock is stale for any reason: an hour, injected. The
 // adopted connection's lastActivity must be the time of the adoption, or
-// checkTimeouts reads the hour as idle time.
+// checkTimeouts reads the hour as idle time. The engine-level arms do not
+// need this stamp: the adoption's eventfd wake is a CQE, and its batch reads
+// the clock before the adoption is drained. It covers an adoption drained in
+// an iteration that carried no CQE.
 func TestAdoptionIsStampedWithTheTimeItWasAdopted(t *testing.T) {
 	f := newFDLFixture(t, false)
 	w := f.w

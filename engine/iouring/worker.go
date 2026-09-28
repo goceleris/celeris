@@ -420,7 +420,7 @@ type Worker struct {
 	linkArmBatch uint64
 
 	tickCounter uint32
-	cachedNow   int64  // cached time.Now().UnixNano(), refreshed every 64 CQE-bearing iterations, by checkTimeouts, and on leaving the park
+	cachedNow   int64  // cached time.Now().UnixNano(), refreshed on every CQE-bearing iteration and by checkTimeouts
 	iterCount   uint64 // monotonic event-loop iteration counter (for pendingRelease)
 
 	// pendingRelease defers returning connState structs to the pool
@@ -1189,12 +1189,19 @@ func (w *Worker) run(ctx context.Context) {
 
 		if cqHead != cqTail {
 			w.emptyIters = 0 // Reset adaptive timeout on activity.
-			// Refresh cached timestamp every 64 iterations to amortize
-			// time.Now() vDSO cost (~50ns on ARM64). Timeout detection
-			// uses multi-second windows so ~1ms resolution is sufficient.
-			if w.tickCounter&0x3F == 0 {
-				w.cachedNow = time.Now().UnixNano()
-			}
+			// Read the clock once per CQE batch, after the wait that
+			// delivered it: every stamp this batch takes (an accept's, a
+			// recv's, a send completion's lastActivity) is then no older
+			// than the batch, as on epoll, which reads it on every
+			// events-bearing epoll_wait return. It was read every 64th
+			// iteration, and an idle or paused worker waits up to 100 ms
+			// or 1 s per iteration, so its stamps could be seconds old,
+			// older still after a park, and checkTimeouts, which compares
+			// them with a fresh time.Now(), read that age as idle time:
+			// past ReadTimeout it closed a connection in the middle of
+			// steady traffic (celeris#713). One vDSO call per batch, not
+			// per request.
+			w.cachedNow = time.Now().UnixNano()
 			now := w.cachedNow
 			for cqHead != cqTail {
 				entry := w.ring.cqeAt(cqHead)
@@ -1513,15 +1520,6 @@ func (w *Worker) run(ctx context.Context) {
 
 			select {
 			case <-wake:
-				// The park stopped the iterations that refresh cachedNow,
-				// so it still reads the time the worker parked at. The
-				// connections this worker accepts or adopts next are
-				// stamped from it, and the first checkTimeouts compares
-				// those stamps with a fresh time.Now(): after a park
-				// longer than ReadTimeout it closed every one of them,
-				// with a request already written (celeris#713). Read the
-				// clock again before anything is stamped.
-				w.cachedNow = time.Now().UnixNano()
 			case <-ctx.Done():
 				w.shutdown()
 				return
