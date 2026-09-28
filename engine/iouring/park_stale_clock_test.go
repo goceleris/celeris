@@ -19,6 +19,14 @@ package iouring
 // ReadTimeout. It must be served throughout. The short-park accept arm is the
 // control: the same wake and the same traffic after a park well inside
 // ReadTimeout (the short-park adoption arm is not one; see there).
+//
+// The park is one way to wait out whole seconds between refreshes; the class
+// is any worker that waits long on its ring and stamps from a clock read
+// before the wait. The live-connection arms below keep a worker from parking
+// and still stretch its clock past ReadTimeout: a running worker with
+// ReadHeaderTimeout off (checkTimeouts every 1024th iteration, idle waits of
+// up to 100 ms), a paused worker that still holds a connection (waits of up to
+// 1 s, checkTimeouts every 32nd), and an adoption onto such a worker.
 
 import (
 	"bufio"
@@ -78,6 +86,29 @@ const (
 	staleClockRequests    = 20
 	staleClockGap         = 100 * time.Millisecond
 )
+
+// serveSteadily sends n requests on c, gap apart, and reads each response. It
+// returns how many were served and, if one failed, which and why (-1, "").
+func serveSteadily(c net.Conn, n int, gap time.Duration) (served, failed int, why string) {
+	br := bufio.NewReader(c)
+	failed = -1
+	for i := range n {
+		if i > 0 {
+			time.Sleep(gap)
+		}
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			return served, i, "write: " + err.Error()
+		}
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			return served, i, "read: " + err.Error()
+		}
+		_ = resp.Body.Close()
+		served++
+	}
+	return served, failed, ""
+}
 
 // staleClockAfterPark parks every worker for park, wakes one with a new
 // connection (adopt: AdoptConn on the still-paused engine; otherwise
@@ -170,25 +201,7 @@ func staleClockAfterPark(t *testing.T, park time.Duration, adopt bool) {
 	}
 	woke := time.Since(parkedAt)
 
-	br := bufio.NewReader(c)
-	served, failed, why := 0, -1, ""
-	for i := range staleClockRequests {
-		if i > 0 {
-			time.Sleep(staleClockGap)
-		}
-		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
-			failed, why = i, "write: "+err.Error()
-			break
-		}
-		resp, err := http.ReadResponse(br, nil)
-		if err != nil {
-			failed, why = i, "read: "+err.Error()
-			break
-		}
-		_ = resp.Body.Close()
-		served++
-	}
+	served, failed, why := serveSteadily(c, staleClockRequests, staleClockGap)
 	m := e.Metrics()
 	t.Logf("celeris713 adopt=%v park=%v woke_after=%v read_timeout=%v workers=%d served=%d/%d failed_at=%d (%s) closes=%d",
 		adopt, park, woke.Round(time.Millisecond), staleClockReadTimeout, len(ws), served, staleClockRequests,
@@ -208,7 +221,10 @@ func TestAcceptAfterALongParkIsNotTimedOut(t *testing.T) {
 }
 
 // TestAdoptAfterALongParkIsNotTimedOut: an AdoptConn that wakes a worker
-// parked for longer than ReadTimeout. The adaptive promote's shape.
+// parked for longer than ReadTimeout. In the engine that is the reclaim onto
+// a draining source (reclaimTransplant); an adaptive promote resumes the new
+// active engine before it adopts (adaptive/engine.go), so there io_uring
+// adopts on a resumed worker, the accept arm's shape.
 func TestAdoptAfterALongParkIsNotTimedOut(t *testing.T) {
 	staleClockAfterPark(t, staleClockReadTimeout+time.Second, true)
 }
@@ -225,20 +241,163 @@ func TestAcceptAfterAShortParkIsNotTimedOut(t *testing.T) {
 // until its first checkTimeouts after the wake, and on a paused engine the
 // worker iterates only on this connection's own completions, so that check
 // comes 32 iterations, about 13 requests, into the traffic. The idle time
-// before the park, the park and that stretch together pass ReadTimeout. The
-// accept arm above is the control: a resumed worker's short listener waits
-// bring its first check within a request or two.
+// before the park, the park and that stretch together pass ReadTimeout. It is
+// the paused live-connection class below, on an adopted connection. The accept
+// arm above is the control: a resumed worker's short listener waits bring its
+// first check within a request or two.
 func TestAdoptAfterAShortParkIsNotTimedOut(t *testing.T) {
 	staleClockAfterPark(t, 100*time.Millisecond, true)
 }
 
-// TestAdoptionIsStampedWithTheTimeItWasAdopted is the same rule without the
-// park, on a worker whose clock is stale for any other reason: cachedNow is
-// refreshed only every 64th CQE-bearing iteration and by checkTimeouts, so a
-// draining worker waiting out 1 s ring waits can hold a clock tens of seconds
-// old. Injected here directly: an hour. The adopted connection's lastActivity
-// must be the time of the adoption, or checkTimeouts reads the hour as idle
-// time.
+// staleClockLiveConn serves n requests, gap apart, on one connection of a
+// worker that never parks: running, after idle, with ReadHeaderTimeout off
+// (rhtOff), or paused after the first request (pause), still holding it.
+// ReadTimeout and WriteTimeout are 2 s, and every gap is well inside them.
+func staleClockLiveConn(t *testing.T, rhtOff bool, idle time.Duration, pause bool, gap time.Duration, n int) {
+	e, addr := startParkEngine713(t, fdlHandler{}, func(c *resource.Config) {
+		c.DisableDeferAccept = true
+		c.ReadTimeout = staleClockReadTimeout
+		c.WriteTimeout = staleClockReadTimeout
+		c.IdleTimeout = 10 * time.Minute
+		if rhtOff {
+			c.ReadHeaderTimeout = -1
+		}
+	})
+	time.Sleep(idle)
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	m0 := e.Metrics()
+	served, failed, why := serveSteadily(c, 1, 0)
+	if failed < 0 && pause {
+		if err := e.PauseAccept(); err != nil {
+			t.Fatalf("pause: %v", err)
+		}
+	}
+	if failed < 0 {
+		time.Sleep(gap)
+		var s int
+		s, failed, why = serveSteadily(c, n-1, gap)
+		served += s
+		if failed >= 0 {
+			failed++
+		}
+	}
+	m := e.Metrics()
+	t.Logf("celeris713 live rht_off=%v idle=%v pause=%v gap=%v read_timeout=%v workers=%d served=%d/%d "+
+		"failed_at=%d (%s) closes=%d active_after=%d",
+		rhtOff, idle, pause, gap, staleClockReadTimeout, e.NumWorkers(), served, n, failed, why,
+		m.CloseCount-m0.CloseCount, m.ActiveConnections)
+	if failed >= 0 {
+		t.Errorf("celeris713 STALE: request %d of a connection with requests %v apart failed (%s): the "+
+			"worker closed it on ReadTimeout %v, measured from a stamp taken with a clock older than the "+
+			"wait before it", failed, gap, why, staleClockReadTimeout)
+	}
+}
+
+// TestIdleWorkerWithoutAHeaderTimeoutIsNotTimedOut: a running worker, idle
+// for 5 s with ReadHeaderTimeout off, then one connection with a request
+// every 500 ms. That worker's clock was refreshed only by checkTimeouts,
+// every 1024th iteration, and at a CQE batch whose iteration count was a
+// multiple of 64, so the connection's stamps were seconds old.
+func TestIdleWorkerWithoutAHeaderTimeoutIsNotTimedOut(t *testing.T) {
+	staleClockLiveConn(t, true, 5*time.Second, false, 500*time.Millisecond, 20)
+}
+
+// TestIdleWorkerWithAHeaderTimeoutIsNotTimedOut is its control: the default
+// ReadHeaderTimeout runs checkTimeouts every 32nd iteration, and its waits
+// of at most 25 ms keep that within a request.
+func TestIdleWorkerWithAHeaderTimeoutIsNotTimedOut(t *testing.T) {
+	staleClockLiveConn(t, false, 5*time.Second, false, 500*time.Millisecond, 20)
+}
+
+// TestPausedWorkerWithALiveConnectionIsNotTimedOut: a worker paused while it
+// holds a connection does not park, and waits up to 1 s on its ring between
+// that connection's requests. Its clock was refreshed by checkTimeouts every
+// 32nd iteration: with a request every 300 ms, past ReadTimeout.
+func TestPausedWorkerWithALiveConnectionIsNotTimedOut(t *testing.T) {
+	staleClockLiveConn(t, false, 0, true, 300*time.Millisecond, 30)
+}
+
+// TestPausedWorkerWithABusyConnectionIsNotTimedOut is its control: requests
+// 100 ms apart bring the 32nd iteration within ReadTimeout.
+func TestPausedWorkerWithABusyConnectionIsNotTimedOut(t *testing.T) {
+	staleClockLiveConn(t, false, 0, true, 100*time.Millisecond, 30)
+}
+
+// TestAdoptOntoADrainingWorkerIsNotTimedOut: an adoption onto a paused worker
+// that has not parked, because it still holds idle keep-alive connections,
+// 3 s after the pause. The adoption's own stamp is fresh, and the
+// connection's first request overwrote it with the worker's clock. Sixteen
+// holders, so that every worker holds one (SO_REUSEPORT spreads them) and
+// none parks: the adoption lands on a draining worker, whichever it is.
+func TestAdoptOntoADrainingWorkerIsNotTimedOut(t *testing.T) {
+	e, addr := startParkEngine713(t, fdlHandler{}, func(c *resource.Config) {
+		c.DisableDeferAccept = true
+		c.ReadTimeout = staleClockReadTimeout
+		c.WriteTimeout = staleClockReadTimeout
+		c.IdleTimeout = 10 * time.Minute
+	})
+	e.mu.Lock()
+	ws := append([]*Worker(nil), e.workers...)
+	e.mu.Unlock()
+	const holders = 16
+	for i := range holders {
+		h, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial holder %d: %v", i, err)
+		}
+		defer func() { _ = h.Close() }()
+		if _, failed, why := serveSteadily(h, 1, 0); failed >= 0 {
+			t.Fatalf("celeris713 PREMISE: holder %d's request failed: %s", i, why)
+		}
+	}
+	if err := e.PauseAccept(); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	pausedAt := time.Now()
+	time.Sleep(3 * time.Second)
+	alive := e.Metrics().ActiveConnections
+	parked := 0
+	for _, w := range ws {
+		if w.suspended.Load() {
+			parked++
+		}
+	}
+	if alive != holders || parked != 0 {
+		t.Fatalf("celeris713 PREMISE: at the adoption %d of %d holders are open and %d of %d workers parked",
+			alive, holders, parked, len(ws))
+	}
+	m0 := e.Metrics()
+	client, fd := adoptPair658(t)
+	if err := e.AdoptConn(fd, engine.Carryover{RemoteAddr: client.LocalAddr().String()}); err != nil {
+		_ = unix.Close(fd)
+		t.Fatalf("AdoptConn: %v", err)
+	}
+	for dl := time.Now().Add(2 * time.Second); e.Metrics().TransplantAdopted != m0.TransplantAdopted+1; {
+		if time.Now().After(dl) {
+			t.Fatalf("celeris713 PREMISE: the adoption did not complete")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	adoptedAfter := time.Since(pausedAt)
+	served, failed, why := serveSteadily(client, staleClockRequests, staleClockGap)
+	m := e.Metrics()
+	t.Logf("celeris713 drain-adopt adopted_after=%v read_timeout=%v served=%d/%d failed_at=%d (%s) closes=%d",
+		adoptedAfter.Round(time.Millisecond), staleClockReadTimeout, served, staleClockRequests, failed, why,
+		m.CloseCount-m0.CloseCount)
+	if failed >= 0 {
+		t.Errorf("celeris713 STALE: request %d of a connection adopted by a draining worker, %v apart, "+
+			"failed (%s)", failed, staleClockGap, why)
+	}
+}
+
+// TestAdoptionIsStampedWithTheTimeItWasAdopted is the adoption stamp alone,
+// on a worker whose clock is stale for any reason: an hour, injected. The
+// adopted connection's lastActivity must be the time of the adoption, or
+// checkTimeouts reads the hour as idle time.
 func TestAdoptionIsStampedWithTheTimeItWasAdopted(t *testing.T) {
 	f := newFDLFixture(t, false)
 	w := f.w
