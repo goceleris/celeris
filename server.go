@@ -523,9 +523,10 @@ func (s *Server) cancelListen() {
 // call it from another goroutine (celeris#703). The Start* call that the
 // server was started with returns only after Shutdown has returned.
 //
-// The drain waits for every HTTP/1.1 request and every HTTP/2 stream. No
-// engine accepts a new connection once the shutdown has begun. An HTTP/2
-// stream on an async route (marked Async, or promoted to async under
+// The drain waits for every HTTP/1.1 request and every HTTP/2 stream. std
+// and epoll accept no new connection once the shutdown has begun, and
+// io_uring none while it waits for HTTP/2 handlers (its 250 ms send drain
+// keeps accepting, celeris#595). An HTTP/2 stream on an async route (marked Async, or promoted to async under
 // [Config.AsyncHandlers]) runs on the shared HTTP/2 worker pool: epoll,
 // io_uring and adaptive send each HTTP/2 connection GOAWAY, refuse
 // (REFUSED_STREAM) a stream its client opens after it, and serve the
