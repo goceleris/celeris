@@ -1172,6 +1172,11 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantClaimDeferred:   pm.TransplantClaimDeferred + sm.TransplantClaimDeferred,
 		TransplantReapFailed:      pm.TransplantReapFailed + sm.TransplantReapFailed,
 		TransplantReapUnsupported: pm.TransplantReapUnsupported + sm.TransplantReapUnsupported,
+		// The same rule on the close paths (celeris#685): each close is an
+		// event on the one sub-engine that owned the connection, and a
+		// close of the standby's residue lands on the standby.
+		CloseFDDeferred: pm.CloseFDDeferred + sm.CloseFDDeferred,
+		CloseFDForced:   pm.CloseFDForced + sm.CloseFDForced,
 		// The post-switch sweep (celeris#657 PR-3). Both sub-engines sweep,
 		// in opposite directions, and only the one draining runs passes at
 		// all, so the pass count sums as a rate. The residual entries are
