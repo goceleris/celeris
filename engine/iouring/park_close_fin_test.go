@@ -14,12 +14,18 @@ package iouring
 // iteration saw no FIN, and both ends stayed ESTABLISHED, until something
 // woke the worker.
 //
+// celeris#685 (#793) fixed it: a close path that still owes the kernel an op
+// on the descriptor leaves the descriptor to its pendingRelease entry, which
+// closes it at the op's terminal CQE, and the worker does not park while such
+// a close is outstanding (closeFDOwed). The loop's ring waits run the deferred
+// completions, however many there are, before the park.
+//
 // Every arm below closes sync-mode connections the engine gave up on and asks
 // one thing of the client's side of them: that the close arrives. The first
 // arms close one connection; the many-connection arms close 64 together.
 // One enter runs at most 20 deferred completions per local-work pass
-// (IO_LOCAL_TW_DEFAULT_MAX, kernel 6.13 and later), so one enter before the
-// park reached only the first of them.
+// (IO_LOCAL_TW_DEFAULT_MAX, kernel 6.13 and later), so a fix that makes one
+// enter before the park reaches only the first of them.
 
 import (
 	"errors"

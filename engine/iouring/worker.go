@@ -1487,33 +1487,6 @@ func (w *Worker) run(ctx context.Context) {
 		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
 			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
 			w.acceptPaused.Load() {
-			// Do not park while a closed connection's kernel ops are still
-			// in flight (celeris#712). finishClose's HTTP/1 fast path is a
-			// plain close(fd), and the recv the connection still has armed
-			// holds its own reference to the file, so the socket goes, and
-			// its client gets a FIN, only once that recv's cancelled
-			// completion has run. On a DEFER_TASKRUN ring the completion is
-			// task work, which runs only inside an io_uring_enter with
-			// GETEVENTS, and the park waits on a Go channel: a connection
-			// closed in the parking iteration stayed ESTABLISHED for as long
-			// as the park lasted. One more enter is not enough either, as it
-			// runs at most 20 deferred completions per local-work pass
-			// (IO_LOCAL_TW_DEFAULT_MAX, kernel 6.13 and later).
-			//
-			// pendingRelease already holds each closed connState until its
-			// kernelInflight reports every op's terminal CQE, so an entry a
-			// drain leaves is such an op: go round again, and the ring wait
-			// runs the work and returns with those CQEs. The clock is read
-			// for the drain's wall-clock backstop, so an op the kernel never
-			// completes holds the park back by pendingReleaseHoldNanos and
-			// one ring wait at most.
-			if len(w.pendingRelease) > 0 {
-				w.cachedNow = time.Now().UnixNano()
-				w.drainPendingRelease()
-				if len(w.pendingRelease) > 0 {
-					continue
-				}
-			}
 			// Submit what this iteration queued before parking (celeris#657,
 			// A5). The iteration that closes or hands off the last conn
 			// queues its close-path cancels (the header timer's, a send's)
