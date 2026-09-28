@@ -273,6 +273,11 @@ type connState struct {
 	// this set and does nothing (celeris#668).
 	hijackSettled bool
 
+	// h2GoAwaySent records that a graceful shutdown has sent this HTTP/2
+	// conn its GOAWAY (celeris#759; Loop.h2PoolSettled). Loop thread; reset
+	// on release.
+	h2GoAwaySent bool
+
 	// relinkOwed (guarded by asyncInMu) is set by the dirty pass or the
 	// EPOLLOUT resume when they give the conn up because its dispatch
 	// goroutine holds detachMu across a handler (celeris#669). The goroutine
@@ -377,6 +382,7 @@ func releaseConnState(cs *connState) {
 	cs.liveIdx = -1
 	cs.hijacked.Store(false)
 	cs.hijackSettled = false
+	cs.h2GoAwaySent = false
 	cs.closeOwed = false
 	cs.closeErr = nil
 	cs.relinkOwed = false

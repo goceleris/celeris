@@ -774,6 +774,30 @@ func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handle
 	return nil
 }
 
+// PoolHandlersRunning reports whether a stream of this connection has a
+// handler running on the shared HTTP/2 worker pool (an async route), which
+// runs off the event loop (celeris#759). Safe from any goroutine.
+func (s *H2State) PoolHandlersRunning() bool {
+	return s.processor.PoolHandlersRunning()
+}
+
+// GoAway starts a graceful close of the connection (celeris#759): it sends
+// GOAWAY(NO_ERROR) naming the last stream the client has opened, so the
+// client opens no new stream on the connection, and leaves the streams in
+// flight to finish. It reports false, sending nothing, while the server's
+// preface has not gone out yet. Called on the engine's event loop thread,
+// like ProcessH2.
+func (s *H2State) GoAway(write func([]byte)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.serverPrefaceSent {
+		return false
+	}
+	_ = s.processor.SendGoAway(s.processor.GetManager().GetLastClientStreamID(), http2.ErrCodeNo, nil)
+	flushOutBuf(&s.outBuf, write)
+	return true
+}
+
 // CloseH2 cleans up H2 state. Releases all streams still held by the
 // manager to prevent memory leaks on connection close.
 func CloseH2(state *H2State) {

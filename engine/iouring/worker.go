@@ -515,6 +515,14 @@ type Worker struct {
 	// thread only, never read on the hot path.
 	shutdownDrainDeadline int64
 
+	// drainBudget points at the engine's record of the budget of the last
+	// Engine.Shutdown call, and h2DrainStart is when the worker, its
+	// context cancelled, began waiting for the HTTP/2 stream handlers on
+	// the shared worker pool (celeris#759; h2PoolSettled). Worker thread
+	// only; h2DrainStart is zero until then.
+	drainBudget  *atomic.Pointer[context.Context]
+	h2DrainStart int64
+
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
 	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
@@ -1168,12 +1176,22 @@ func (w *Worker) run(ctx context.Context) {
 			// that window — it is the ordinary iteration — which is the
 			// graceful side of the trade: a connection that arrives
 			// inside it is answered rather than reset.
-			if w.shutdownDrainDeadline == 0 {
-				w.shutdownDrainDeadline = time.Now().UnixNano() + shutdownSendDrainNanos
-			}
-			if !w.hasPendingSends() || time.Now().UnixNano() > w.shutdownDrainDeadline {
-				w.shutdown()
-				return
+			//
+			// First, though, the HTTP/2 stream handlers on the shared
+			// worker pool (celeris#759): they run off this loop, and their
+			// responses come back through the conns' write queues, which
+			// only this loop drains. The send drain's clock starts once they
+			// are done.
+			if !w.h2PoolSettled() {
+				w.shutdownDrainDeadline = 0
+			} else {
+				if w.shutdownDrainDeadline == 0 {
+					w.shutdownDrainDeadline = time.Now().UnixNano() + shutdownSendDrainNanos
+				}
+				if !w.hasPendingSends() || time.Now().UnixNano() > w.shutdownDrainDeadline {
+					w.shutdown()
+					return
+				}
 			}
 		}
 
@@ -2048,6 +2066,12 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	// smallest of the three: the celeris#657 sweep's next pass, and the
 	// celeris#662 pause linger's deadline.
 	d := w.sweptTimeout()
+	// Waiting out HTTP/2 pool handlers at shutdown (celeris#759): a
+	// handler that ends without a completion the ring hears of must not
+	// leave the worker waiting.
+	if w.h2DrainStart != 0 && d > h2PoolDrainPoll {
+		d = h2PoolDrainPoll
+	}
 	if w.lingerUntil != 0 {
 		return capToDeadline(d, w.lingerUntil)
 	}
@@ -6035,6 +6059,75 @@ func (w *Worker) checkTimeouts() {
 			}
 		}
 	}
+}
+
+// h2PoolDrainFloor is the least time the worker, its context cancelled,
+// waits for the HTTP/2 stream handlers on the shared worker pool before it
+// shuts down (celeris#759); the budget of the last Engine.Shutdown extends it
+// to that budget's deadline. h2PoolDrainPoll caps one wait meanwhile.
+const (
+	h2PoolDrainFloor = 250 * time.Millisecond
+	h2PoolDrainPoll  = 10 * time.Millisecond
+)
+
+// h2PoolSettled reports whether the worker, its context cancelled, may go on
+// to its send drain and shutdown as far as HTTP/2 is concerned (celeris#759).
+// A stream on an async route runs its handler on the shared worker pool, off
+// this loop, and its response comes back through the conn's write queue,
+// which only this loop drains; shutdown cancelled such streams and closed
+// their conns under their handlers, so the client got unexpected EOF, and
+// the hooks ran before the handlers had finished. So the loop keeps turning,
+// reading and writing as usual, until no HTTP/2 conn has a pool handler
+// running or a response still in its write queue. Every HTTP/2 conn is sent
+// GOAWAY first (again for a conn that arrives meanwhile), so its client opens
+// no new stream on it, as net/http's graceful shutdown does. The wait ends at
+// the deadline of the budget the last Engine.Shutdown handed over, and never
+// before h2PoolDrainFloor. Worker thread.
+func (w *Worker) h2PoolSettled() bool {
+	if len(w.h2Conns) == 0 {
+		return true
+	}
+	now := time.Now().UnixNano()
+	if w.h2DrainStart == 0 {
+		w.h2DrainStart = now
+	}
+	busy := false
+	for _, fd := range w.h2Conns {
+		cs := w.conns[fd]
+		if cs == nil || cs.h2State == nil {
+			continue
+		}
+		if !cs.h2GoAwaySent {
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			cs.h2GoAwaySent = cs.h2State.GoAway(cs.writeFn)
+			if cs.h2GoAwaySent && w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+		}
+		if cs.h2State.PoolHandlersRunning() || cs.h2State.WriteQueuePending() {
+			busy = true
+		}
+	}
+	if !busy {
+		return true
+	}
+	end := w.h2DrainStart + int64(h2PoolDrainFloor)
+	if w.drainBudget != nil {
+		// A budget that is done, at its deadline or by a cancel before it,
+		// leaves the floor.
+		if p := w.drainBudget.Load(); p != nil && (*p).Err() == nil {
+			if d, has := (*p).Deadline(); has && d.UnixNano() > end {
+				end = d.UnixNano()
+			}
+		}
+	}
+	return now > end
 }
 
 // hasPendingSends reports whether any live connection still has response bytes

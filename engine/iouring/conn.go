@@ -122,6 +122,7 @@ type connState struct {
 	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
 	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
+	h2GoAwaySent   bool         // 1: a graceful shutdown sent this H2 conn its GOAWAY (celeris#759)
 	// sendIsZC records how the send SQE currently in flight for this
 	// connection was ARMED: true for IORING_OP_SEND_ZC, false for a plain
 	// SEND / WRITEV / linked SEND. It is the provenance flag the error
@@ -560,6 +561,7 @@ func releaseConnState(cs *connState) {
 	cs.needsRecv = false
 	cs.recvIntoBody = false
 	cs.zcNotifPending = false
+	cs.h2GoAwaySent = false
 	cs.sendIsZC = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0

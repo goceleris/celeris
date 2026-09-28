@@ -80,6 +80,10 @@ const shutdownSendDrainFloor = 250 * time.Millisecond
 // the drain notices a budget that ends early (a cancelled Shutdown ctx).
 const shutdownSendDrainPoll = 20 * time.Millisecond
 
+// h2PoolDrainPollMs caps one epoll_wait while the loop waits out the HTTP/2
+// pool handlers at shutdown (celeris#759).
+const h2PoolDrainPollMs = 10
+
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id       int
@@ -196,6 +200,11 @@ type Loop struct {
 	// until that ctx is done. nil, or no Shutdown yet, leaves the drain its
 	// floor, shutdownSendDrainFloor.
 	drainBudget *atomic.Pointer[context.Context]
+
+	// h2DrainStart is when the loop began waiting, its context cancelled,
+	// for the HTTP/2 stream handlers running on the shared worker pool
+	// (celeris#759; h2PoolSettled). Zero until then. Loop thread.
+	h2DrainStart time.Time
 
 	// transplantInFlight counts connections this loop has detached for a
 	// transplant whose hand-off is not finished yet — the deferred async
@@ -473,7 +482,7 @@ func (l *Loop) run(ctx context.Context) {
 	l.cachedNow = time.Now().UnixNano()
 
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && l.h2PoolSettled() {
 			l.shutdown()
 			return
 		}
@@ -547,6 +556,12 @@ func (l *Loop) run(ctx context.Context) {
 		// is edge-triggered, so don't block — poll immediately and re-drain.
 		if l.listenHot {
 			timeoutMs = 0
+		}
+		// Waiting out HTTP/2 pool handlers at shutdown (celeris#759): a
+		// handler that ends without a write the loop hears of must not
+		// leave the loop blocked.
+		if !l.h2DrainStart.IsZero() && (timeoutMs < 0 || timeoutMs > h2PoolDrainPollMs) {
+			timeoutMs = h2PoolDrainPollMs
 		}
 
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
@@ -3668,6 +3683,56 @@ func (l *Loop) shutdown() {
 	// epoll_ctl, so none of them can operate on this number once it is free
 	// to be recycled.
 	l.closeEpollFD()
+}
+
+// h2PoolSettled reports whether the loop, its context cancelled, may shut
+// down as far as HTTP/2 is concerned (celeris#759). A stream on an async
+// route runs its handler on the shared worker pool, off this loop, and its
+// response comes back through the conn's write queue, which only this loop
+// drains; shutdown cancelled such streams and closed their conns under their
+// handlers, so the client got unexpected EOF, and the hooks ran before the
+// handlers had finished. So the loop keeps turning, reading and writing as
+// usual, until no HTTP/2 conn has a pool handler running or a response still
+// in its write queue. Every HTTP/2 conn is sent GOAWAY first (again for a
+// conn that arrives meanwhile), so its client opens no new stream on it, as
+// net/http's graceful shutdown does. The wait is bounded like the send drain
+// (sendDrainWait): the budget of the last Engine.Shutdown, and never less
+// than shutdownSendDrainFloor. Loop thread.
+func (l *Loop) h2PoolSettled() bool {
+	if len(l.h2Conns) == 0 {
+		return true
+	}
+	if l.h2DrainStart.IsZero() {
+		l.h2DrainStart = time.Now()
+	}
+	busy := false
+	for _, fd := range l.h2Conns {
+		cs := l.conns[fd]
+		if cs == nil || cs.h2State == nil {
+			continue
+		}
+		if !cs.h2GoAwaySent {
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			cs.h2GoAwaySent = cs.h2State.GoAway(cs.writeFn)
+			if mu != nil {
+				mu.Unlock()
+			}
+			if cs.h2GoAwaySent {
+				l.markDirty(cs) // the dirty pass flushes the GOAWAY
+			}
+		}
+		if cs.h2State.PoolHandlersRunning() || cs.h2State.WriteQueuePending() {
+			busy = true
+		}
+	}
+	if !busy {
+		return true
+	}
+	_, more := l.sendDrainWait(l.h2DrainStart)
+	return !more
 }
 
 // drainSends is shutdown's send drain (celeris#760). It flushes every live

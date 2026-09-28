@@ -109,6 +109,11 @@ type Engine struct {
 	// and when the probe got no answer. Every worker gets a copy; the
 	// hand-off's REAP needs them (celeris#657).
 	asyncCancelFlags bool
+
+	// drainBudget is the ctx of the last Shutdown call: the budget of the
+	// wait for HTTP/2 pool handlers the workers run when Listen's context is
+	// cancelled (celeris#759; Worker.h2PoolSettled).
+	drainBudget atomic.Pointer[context.Context]
 }
 
 // New creates a new io_uring engine.
@@ -465,6 +470,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.sweepCnt = &e.metrics.sweep          // celeris#657 P9 sweep witnesses
 		w.asyncCancelFlags = e.asyncCancelFlags
 		w.pause = &e.pause // celeris#662 pause linger
+		w.drainBudget = &e.drainBudget
 		workers[i] = w
 	}
 	return workers, nil
@@ -491,7 +497,7 @@ func fallbackTier(current TierStrategy) TierStrategy {
 	}
 }
 
-// Shutdown is a no-op for the io_uring engine — graceful shutdown is
+// Shutdown does not stop the io_uring engine itself — graceful shutdown is
 // driven by context cancellation on Listen's parent context. Workers
 // exit their run loops on ctx.Done, drain the responses still queued for
 // the ring (Worker.hasPendingSends, celeris#595) and call Worker.shutdown,
@@ -503,7 +509,13 @@ func fallbackTier(current TierStrategy) TierStrategy {
 // point owns one and Server.Shutdown cancels it after the graceful phase.
 // Handing Listen a context.Background() is what made Start hang here
 // (celeris#595), since this method cannot wake it.
-func (e *Engine) Shutdown(_ context.Context) error {
+//
+// What Shutdown does is hand ctx to the workers as the budget of their wait
+// for the HTTP/2 stream handlers still running on the shared worker pool
+// when Listen's context is cancelled (celeris#759): Server.Shutdown calls it
+// before it cancels that context.
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.drainBudget.Store(&ctx)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return nil

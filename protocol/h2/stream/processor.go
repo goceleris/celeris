@@ -169,6 +169,22 @@ type Processor struct {
 	// processing is single-threaded per connection (event loop under
 	// H2State.mu), so a per-processor scratch slice is safe.
 	connFlushScratch []*Stream
+
+	// poolRunning counts this connection's streams whose handler has been
+	// handed to the shared worker pool and has not returned yet
+	// (celeris#759). The native engines' graceful shutdown waits for it to
+	// reach zero before it closes the connection: those handlers run off the
+	// event loop, and the drain that waits for the loop's own work did not
+	// see them. Incremented in runHandler before Submit, decremented after
+	// executeHandler has returned.
+	poolRunning atomic.Int32
+}
+
+// PoolHandlersRunning reports whether a stream of this connection has a
+// handler running on the shared worker pool (celeris#759). Safe from any
+// goroutine.
+func (p *Processor) PoolHandlersRunning() bool {
+	return p.poolRunning.Load() > 0
 }
 
 // rstRateLimit and rstBurstLimit bound RST_STREAM arrivals. An honest
@@ -609,6 +625,7 @@ func (p *Processor) runHandler(stream *Stream) {
 	}
 
 	stream.flags.Or(flagAsyncRunning)
+	p.poolRunning.Add(1)
 	globalH2Pool.Submit(p, stream)
 }
 
@@ -732,6 +749,10 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 // releases it back to the pool. If outbound data is buffered (flow control),
 // the stream stays in the map for the event loop to flush via WINDOW_UPDATE.
 func (p *Processor) executeHandler(stream *Stream) {
+	// Deferred first, so it runs last: the response is queued and the
+	// stream settled before a shutdown that waits for this count can close
+	// the connection (celeris#759).
+	defer p.poolRunning.Add(-1)
 	defer func() {
 		if r := recover(); r != nil {
 			_ = r // last-resort panic recovery
