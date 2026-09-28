@@ -17,7 +17,6 @@ package iouring
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"runtime"
@@ -1596,89 +1595,90 @@ func TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP(t *testing.T
 	p.d.unregisterAndWait(t, wl)
 }
 
-// lingeringTCPSocket returns a connected TCP socket whose close(2) blocks: its
-// peer's receive window is full and never read, so the FIN it would send
-// waits behind unsent data, and SO_LINGER makes close wait for that FIN's ACK
-// for up to linger. Draining the peer (drain) lets the close finish.
-func lingeringTCPSocket(t *testing.T, linger int) (fd int, drain func()) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer func() { _ = ln.Close() }()
-	c, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	peer, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	t.Cleanup(func() { _ = peer.Close() })
-	_ = peer.(*net.TCPConn).SetReadBuffer(4096)
-	f, err := c.(*net.TCPConn).File() // a blocking duplicate; the net.Conn is done with
-	_ = c.Close()
-	if err != nil {
-		t.Fatalf("File: %v", err)
-	}
-	fd, err = unix.Dup(int(f.Fd()))
-	_ = f.Close()
-	if err != nil {
-		t.Fatalf("dup: %v", err)
-	}
-	if err := unix.SetNonblock(fd, true); err != nil {
-		t.Fatalf("set non-blocking: %v", err)
-	}
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
-	chunk := make([]byte, 64<<10)
-	for filled := false; !filled; {
-		if _, err := unix.Write(fd, chunk); errors.Is(err, unix.EAGAIN) {
-			filled = true
-		} else if err != nil {
-			t.Fatalf("fill the send path: %v", err)
-		}
-	}
-	if err := unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: int32(linger)}); err != nil {
-		t.Fatalf("SO_LINGER: %v", err)
-	}
-	drain = func() {
-		go func() { _, _ = io.Copy(io.Discard, peer) }()
-	}
-	return fd, drain
-}
-
-// retire closes the engine's descriptor, and close(2) can block: with
-// SO_LINGER set, until the peer acknowledges the FIN, for up to the linger
-// time. retire used to close under dc.mu, which UnregisterConn and Write take
-// on the driver's goroutines, so those calls blocked for as long (review of
-// #696). retire now clears opFDOpen under the lock and closes after it.
+// The engine's descriptor is closed outside dc.mu and off the worker. close(2)
+// can block: with SO_LINGER set, until the peer acknowledges the FIN, for up
+// to the linger time. retire used to close under dc.mu, which UnregisterConn
+// and Write take on the driver's goroutines, so those calls blocked for as
+// long (review of #696); it then closed after mu but still on the worker
+// goroutine, which stalled every connection of the ring (celeris#735). retire
+// now hands the close to its caller, and finalizeDriver closes on a goroutine
+// of its own (closeOpFD), queuing onClose for the worker once the close
+// returns.
 //
 // The descriptor leaves the process's table when close(2) starts, and a
 // lingering close then waits before the syscall returns. So once the number
-// no longer names the socket, retire is inside close, and dc.mu must be free.
-func TestDriverRetireClosesOutsideItsLock(t *testing.T) {
-	const linger = 10 // seconds: the longest a broken retire holds the test
-	fd, drain := lingeringTCPSocket(t, linger)
+// no longer names the socket the close is under way, and dc.mu must be free
+// and onClose not fired yet.
+//
+// Every one of those checks holds trivially for a close that does not linger,
+// so each attempt also proves that its close did: the socket is
+// deeplyLingeringTCPSocket's (a backlog the peer cannot absorb), and the close
+// must still be in progress (its goroutine has not queued driverActionClosed)
+// half a second after dc.mu was seen free. A close that does not linger
+// returns in microseconds and its goroutine queues the action at once; the
+// half second is for that goroutine to be scheduled.
+//
+// Even a close that would linger can return early. In 4 of 60 runs of this
+// test the close returned within 15 ms with the socket still in FIN_WAIT1 and
+// its whole backlog queued, with Go's async preemption on or off; the kernel
+// leaves that wait early on a pending signal. Such an attempt proves nothing,
+// so the test tries again on a new socket, and fails as apparatus only when
+// no attempt's close lingers.
+func TestDriverOpFDClosesOutsideItsLockAndOffTheWorker(t *testing.T) {
+	const attempts = 5
+	for i := 1; i <= attempts; i++ {
+		if opFDCloseAttempt(t, i) {
+			return
+		}
+	}
+	t.Fatalf("apparatus: the close did not linger in any of %d attempts", attempts)
+}
+
+// opFDCloseAttempt is one attempt of
+// TestDriverOpFDClosesOutsideItsLockAndOffTheWorker. It reports false when
+// its close did not linger; the checks that need the linger have then not
+// been made.
+func opFDCloseAttempt(t *testing.T, attempt int) (lingered bool) {
+	t.Helper()
+	const linger = 10 // seconds: the longest a broken close holds the test
+	fd, drain := deeplyLingeringTCPSocket(t, linger)
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		t.Fatalf("fstat: %v", err)
 	}
-	dc := &driverConn{fd: fd, opFD: fd, opFDOpen: true}
+	closed := make(chan error, 1)
+	dc := &driverConn{fd: fd, opFD: fd, opFDOpen: true, onClose: func(err error) { closed <- err }}
+	// finalizeDriver needs only the driver map, the driver-action queue and
+	// driverClosers; no loop runs, so nothing fires a queued onClose but
+	// waitDriverCloses below.
+	w := &Worker{driverConns: map[int]*driverConn{fd: dc}}
+	w.hasDriverConns.Store(true)
 
-	retired := make(chan struct{})
+	// finalizeDriver returns at once however long the close lingers, and does
+	// not fire onClose itself: the close has not returned.
+	finalized := make(chan struct{})
 	go func() {
-		dc.retire()
-		close(retired)
+		w.finalizeDriver(dc, nil)
+		close(finalized)
 	}()
+	drained := false
 	defer func() {
-		drain()
-		select {
-		case <-retired:
-		case <-time.After(2 * linger * time.Second):
-			t.Error("retire never returned")
+		if !drained {
+			drain()
 		}
+		w.waitDriverCloses()
 	}()
+	select {
+	case <-finalized:
+	case <-time.After(2 * time.Second):
+		t.Fatal("finalizeDriver waited for the lingering close")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("finalizeDriver fired onClose (%v) before the engine's close of the socket returned: a driver "+
+			"must see the socket closed before onClose (engine/provider.go)", err)
+	default:
+	}
 
 	// Wait for close(2) to start: the number is released, or reissued to
 	// another file.
@@ -1687,32 +1687,53 @@ func TestDriverRetireClosesOutsideItsLock(t *testing.T) {
 		if err := unix.Fstat(fd, &now); err != nil || now.Ino != st.Ino || now.Dev != st.Dev {
 			break
 		}
-		select {
-		case <-retired:
-			t.Fatal("apparatus: retire returned before the close could be seen in progress: the close did not linger")
-		default:
+		if w.driverActionPending.Load() != 0 {
+			t.Logf("celeris735 OPFD attempt=%d lingered=false (the close returned before it was seen in progress)", attempt)
+			return false
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("retire never started closing the engine's descriptor")
+			t.Fatal("the engine's descriptor was never closed")
 		}
 		time.Sleep(time.Millisecond)
-	}
-	select {
-	case <-retired:
-		t.Fatal("apparatus: the close did not linger")
-	default:
 	}
 	// The close lingers for up to 10 s; a lock free within 2 s is not held
 	// across it.
 	for deadline := time.Now().Add(2 * time.Second); !dc.mu.TryLock(); {
 		if time.Now().After(deadline) {
-			t.Fatalf("dc.mu is held while retire's close(2) lingers: UnregisterConn and Write block for as long")
+			t.Fatalf("dc.mu is held while the close(2) of opFD lingers: UnregisterConn and Write block for as long")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	open, retiredFlag := dc.opFDOpen, dc.retired
 	dc.mu.Unlock()
+	// The checks above mean something only while the close lingers: its
+	// goroutine queues driverActionClosed when close(2) returns.
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if w.driverActionPending.Load() != 0 {
+			t.Logf("celeris735 OPFD attempt=%d lingered=false (the close returned within half a second of dc.mu being probed)", attempt)
+			return false
+		}
+	}
+	t.Logf("celeris735 OPFD attempt=%d lingered=true", attempt)
 	if open || !retiredFlag {
 		t.Errorf("under dc.mu during the close: opFDOpen=%v retired=%v, want false and true", open, retiredFlag)
 	}
+
+	// The peer drains, the close returns, and onClose follows it: not
+	// before, and exactly once.
+	drain()
+	drained = true
+	w.waitDriverCloses()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("onClose(%v), want nil", err)
+		}
+	default:
+		t.Error("onClose never fired after the close returned")
+	}
+	if dc.onClose != nil {
+		t.Error("onClose still installed: it could fire twice")
+	}
+	return true
 }

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -248,6 +249,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		if fh, ok := handler.(*FastHandler); ok {
 			fh.HandleDirect(ts, level, "request", attrs)
 		} else {
+			// Any other handler may keep the record: slog lets a Handler
+			// keep a Record after Handle returns by calling Record.Clone,
+			// which shares the strings, and asynchronous and batching
+			// handlers do. The package's own handlers format the record
+			// before they return, so only the others get copies.
+			if _, ok := handler.(*groupHandler); !ok {
+				ownStringValues(attrs)
+			}
 			r := slog.NewRecord(ts, level, "request", 0)
 			r.AddAttrs(attrs...)
 			_ = handler.Handle(ctx, r)
@@ -269,6 +278,48 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		return err
+	}
+}
+
+// ownStringValues replaces every string value in attrs, in place, with a
+// copy, descending into groups. The copies of the top-level values share one
+// allocation. Keys are left as they are: the middleware's own are constants
+// or built fresh, and Fields keys are expected to be constants. Values of
+// other kinds (slog.AnyValue, a LogValuer) are left as they are.
+//
+// On epoll and io_uring the request strings the middleware logs (method,
+// path, Host, User-Agent, Referer, query, client IP, request ID) are views
+// of the connection's receive buffer, which the engine reuses for the
+// connection's next request and, once the connection closes, for another
+// connection. A handler that keeps the record would later format other
+// request bytes, including another client's headers (celeris#732).
+func ownStringValues(attrs []slog.Attr) {
+	n := 0
+	for _, a := range attrs {
+		if a.Value.Kind() == slog.KindString {
+			n += len(a.Value.String())
+		}
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for _, a := range attrs {
+		if a.Value.Kind() == slog.KindString {
+			b.WriteString(a.Value.String())
+		}
+	}
+	rest := b.String()
+	for i, a := range attrs {
+		switch a.Value.Kind() {
+		case slog.KindString:
+			l := len(a.Value.String())
+			attrs[i].Value = slog.StringValue(rest[:l])
+			rest = rest[l:]
+		case slog.KindGroup:
+			// A new slice: a Fields group may share its attrs with the caller.
+			g := slices.Clone(a.Value.Group())
+			ownStringValues(g)
+			attrs[i].Value = slog.GroupValue(g...)
+		}
 	}
 }
 

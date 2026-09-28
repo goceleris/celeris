@@ -23,25 +23,80 @@ const (
 
 // standardMethods is the set of HTTP methods recognized by the OTel semconv spec.
 // Non-standard methods are normalized to "_OTHER".
-var standardMethods = map[string]struct{}{
-	"GET":     {},
-	"HEAD":    {},
-	"POST":    {},
-	"PUT":     {},
-	"DELETE":  {},
-	"PATCH":   {},
-	"OPTIONS": {},
-	"TRACE":   {},
-	"CONNECT": {},
+var standardMethods = map[string]string{
+	"GET":     "GET",
+	"HEAD":    "HEAD",
+	"POST":    "POST",
+	"PUT":     "PUT",
+	"DELETE":  "DELETE",
+	"PATCH":   "PATCH",
+	"OPTIONS": "OPTIONS",
+	"TRACE":   "TRACE",
+	"CONNECT": "CONNECT",
 }
 
 // normalizeMethod returns the method if it is a standard HTTP method,
-// or "_OTHER" per the OTel semconv specification.
+// or "_OTHER" per the OTel semconv specification. It returns the package's
+// own constant, never method itself: the request method can be a view of the
+// connection's receive buffer (see ownStrings), and the result goes into
+// attributes the SDK keeps.
 func normalizeMethod(method string) string {
-	if _, ok := standardMethods[method]; ok {
-		return method
+	if m, ok := standardMethods[method]; ok {
+		return m
 	}
 	return "_OTHER"
+}
+
+// ownStrings replaces each *p with a copy. The copies share one allocation,
+// and nothing is allocated when every string is empty.
+//
+// On epoll and io_uring the request path, Host, headers and the strings
+// derived from them are views of the connection's receive buffer, which the
+// engine reuses for the connection's next request and, once the connection
+// closes, for another connection. The attributes built from them outlive the
+// request: a span processor keeps an ended span until it exports it, and the
+// metric SDK keeps every attribute set it has seen as an aggregation key for
+// the life of the provider. A kept view would read other request bytes,
+// including another client's headers (celeris#732).
+func ownStrings(ps ...*string) {
+	n := 0
+	for _, p := range ps {
+		n += len(*p)
+	}
+	if n == 0 {
+		return
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for _, p := range ps {
+		b.WriteString(*p)
+	}
+	rest := b.String()
+	for _, p := range ps {
+		l := len(*p)
+		*p, rest = rest[:l], rest[l:]
+	}
+}
+
+// appendOwned appends attrs to dst with every string value copied. The
+// attributes come from CustomAttributes or CustomMetricAttributes, which
+// typically read request headers (views, see ownStrings). Keys are kept as
+// they are: they are expected to be constants.
+func appendOwned(dst, attrs []attribute.KeyValue) []attribute.KeyValue {
+	for _, kv := range attrs {
+		switch kv.Value.Type() {
+		case attribute.STRING:
+			kv = kv.Key.String(strings.Clone(kv.Value.AsString()))
+		case attribute.STRINGSLICE:
+			ss := kv.Value.AsStringSlice()
+			for i := range ss {
+				ss[i] = strings.Clone(ss[i])
+			}
+			kv = kv.Key.StringSlice(ss)
+		}
+		dst = append(dst, kv)
+	}
+	return dst
 }
 
 // truncateString truncates s to maxLen bytes without splitting multi-byte
@@ -170,14 +225,6 @@ func New(config ...Config) celeris.HandlerFunc {
 		carrier := headerCarrier{ctx: c}
 		parentCtx := propagators.Extract(c.Context(), carrier)
 
-		spanName := c.Method()
-		if fp := c.FullPath(); fp != "" {
-			spanName += " " + fp
-		}
-		if spanNameFmt != nil {
-			spanName = spanNameFmt(c)
-		}
-
 		rawMethod := c.Method()
 		method := normalizeMethod(rawMethod)
 
@@ -187,41 +234,64 @@ func New(config ...Config) celeris.HandlerFunc {
 		// pre-v1.2.4), the http.route attribute is simply omitted.
 		route := c.FullPath()
 
+		// The request strings the span and the metric attribute sets keep,
+		// copied (see ownStrings). The route is the registered pattern and
+		// the protocol a constant.
+		spanName := rawMethod
+		if spanNameFmt != nil {
+			spanName = spanNameFmt(c)
+		}
+		var methodOrig, clientIP, userAgent string
+		if method != rawMethod {
+			methodOrig = rawMethod
+		}
+		if collectClientIP {
+			clientIP = c.ClientIP()
+		}
+		if collectUserAgent {
+			userAgent = c.Header("user-agent")
+		}
+		scheme, path, host, requestID := c.Scheme(), c.Path(), c.Host(), c.RequestID()
+		ownStrings(&spanName, &methodOrig, &scheme, &path, &clientIP, &host, &userAgent, &requestID)
+		if spanNameFmt == nil && route != "" {
+			spanName += " " + route
+		}
+
 		var spanBuf [14]attribute.KeyValue
 		n := 0
 		spanBuf[n] = semconv.HTTPRequestMethodKey.String(method)
 		n++
 		if method != rawMethod {
-			spanBuf[n] = attribute.String("http.request.method_original", rawMethod)
+			spanBuf[n] = attribute.String("http.request.method_original", methodOrig)
 			n++
 		}
 		if route != "" {
 			spanBuf[n] = semconv.HTTPRoute(route)
 			n++
 		}
-		spanBuf[n] = semconv.URLScheme(c.Scheme())
+		spanBuf[n] = semconv.URLScheme(scheme)
 		n++
-		spanBuf[n] = semconv.URLPath(c.Path())
+		spanBuf[n] = semconv.URLPath(path)
 		n++
 		spanBuf[n] = semconv.NetworkProtocolVersion(c.Protocol())
 		n++
 		if collectClientIP {
-			spanBuf[n] = semconv.ClientAddress(c.ClientIP())
+			spanBuf[n] = semconv.ClientAddress(clientIP)
 			n++
 		}
-		spanBuf[n] = semconv.ServerAddress(c.Host())
+		spanBuf[n] = semconv.ServerAddress(host)
 		n++
 		if serverPort > 0 {
 			spanBuf[n] = semconv.ServerPort(serverPort)
 			n++
 		}
 		if collectUserAgent {
-			spanBuf[n] = semconv.UserAgentOriginal(c.Header("user-agent"))
+			spanBuf[n] = semconv.UserAgentOriginal(userAgent)
 			n++
 		}
 		spanAttrs := spanBuf[:n]
 		if customAttrs != nil {
-			spanAttrs = append(spanAttrs, customAttrs(c)...)
+			spanAttrs = appendOwned(spanAttrs, customAttrs(c))
 		}
 
 		spanCtx, span := tracer.Start(parentCtx, spanName,
@@ -232,8 +302,8 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		c.SetContext(spanCtx)
 
-		if s := c.RequestID(); s != "" {
-			span.SetAttributes(attribute.String("request.id", s))
+		if requestID != "" {
+			span.SetAttributes(attribute.String("request.id", requestID))
 		}
 
 		if metricsEnabled {
@@ -245,9 +315,9 @@ func New(config ...Config) celeris.HandlerFunc {
 				metricBuf[mn] = semconv.HTTPRoute(route)
 				mn++
 			}
-			metricBuf[mn] = semconv.URLScheme(c.Scheme())
+			metricBuf[mn] = semconv.URLScheme(scheme)
 			mn++
-			metricBuf[mn] = semconv.ServerAddress(c.Host())
+			metricBuf[mn] = semconv.ServerAddress(host)
 			mn++
 			if serverPort > 0 {
 				metricBuf[mn] = semconv.ServerPort(serverPort)
@@ -255,7 +325,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 			metricBaseAttrs := metricBuf[:mn:mn]
 			if customMetricAttrs != nil {
-				metricBaseAttrs = append(metricBaseAttrs, customMetricAttrs(c)...)
+				metricBaseAttrs = appendOwned(metricBaseAttrs, customMetricAttrs(c))
 			}
 			activeAttrSet := metric.WithAttributeSet(attribute.NewSet(metricBaseAttrs...))
 			if activeRequests != nil {

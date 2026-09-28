@@ -467,6 +467,16 @@ func (s *Server) publishEngine(eng engine.Engine) {
 // cancels Listen exactly as before, this only adds a second way to wake it.
 // If Shutdown already ran (or is racing prepare), the returned context is
 // already cancelled so Listen returns immediately instead of parking forever.
+//
+// The returned function cancels that context and releases what doPrepare
+// opened for the run: the settle re-opener and the CPU monitor. Every Start*
+// entry point defers it right after this call, so it runs once Listen has
+// returned, and from then on the server never serves again (Start cannot be
+// retried). Shutdown releases the same two, but a Start that ends without a
+// Shutdown to come, because Listen failed or because Shutdown was called
+// before Start, left the re-opener running and the monitor's /proc/stat
+// descriptor open for the life of the process (celeris#737). Both releases
+// are idempotent, so a Shutdown before or after it is harmless.
 func (s *Server) listenContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	s.lifecycleMu.Lock()
@@ -478,7 +488,11 @@ func (s *Server) listenContext(parent context.Context) (context.Context, context
 	if alreadyShutdown {
 		cancel()
 	}
-	return ctx, cancel
+	return ctx, func() {
+		cancel()
+		s.router.stopSettleReopener()
+		s.closeCPUMonitor()
+	}
 }
 
 // cancelListen wakes a Listen parked on the context published by
@@ -813,9 +827,19 @@ func (s *Server) logger() *slog.Logger {
 }
 
 func (s *Server) prepareWithListener(ln net.Listener) (engine.Engine, error) {
-	return s.doPrepare(func(cfg *resource.Config) {
+	eng, err := s.doPrepare(func(cfg *resource.Config) {
 		cfg.Listener = ln
 	})
+	// celeris#737: the caller handed ln over and may not close it, so a start
+	// that fails before any engine runs closes it here. Otherwise it stays
+	// bound, and the kernel keeps completing handshakes into a backlog that
+	// nothing accepts. ErrAlreadyStarted is the exception: a server is
+	// already running, and ln may be the very listener it serves on, so it
+	// stays the caller's.
+	if err != nil && !errors.Is(err, ErrAlreadyStarted) && ln != nil {
+		_ = ln.Close()
+	}
+	return eng, err
 }
 
 // doPrepare is the shared implementation for prepare and prepareWithListener.
@@ -910,6 +934,10 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		eng, err = createEngine(cfg, handler, cpuMon)
 		if err != nil {
 			s.startErr = fmt.Errorf("create engine: %w", err)
+			// celeris#737: only Shutdown closes the monitor, and a caller
+			// whose Start failed has no reason to call it, so the
+			// /proc/stat descriptor opened above would stay open.
+			s.closeCPUMonitor()
 			return
 		}
 		s.publishEngine(eng)
@@ -972,7 +1000,11 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 // extracted from ln and the listener is closed so the engine workers can
 // rebind their own SO_REUSEPORT sockets bound to the same (host, port).
 // In both cases, the caller must not Accept on or close the supplied
-// listener after calling this function.
+// listener after calling this function. If the server fails to start before
+// its engine runs (a configuration error or an engine that cannot be
+// created), the listener is closed before the error is returned. The one
+// exception is [ErrAlreadyStarted]: the server is already running, perhaps on
+// that very listener, so this call leaves it to the caller.
 //
 // On the adaptive engine (the default on Linux) the listener goes to whichever
 // sub-engine starts, and a later switch binds the second sub-engine to that

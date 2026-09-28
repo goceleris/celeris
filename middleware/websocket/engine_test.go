@@ -14,12 +14,26 @@ import (
 // waitForReady polls until the server is ready by trying TCP connections.
 // This is needed because native engines close the provided listener and
 // rebind with SO_REUSEPORT, creating a brief window where the port is unbound.
-func waitForReady(tb testing.TB, s *celeris.Server, timeout time.Duration) string {
+//
+// done is the channel the goroutine running the server's Start sends Start's
+// error on. A Start that returns before the server is ready means it never
+// will be, so waitForReady fails at once with Start's error rather than
+// polling out the timeout and reporting a bare "not ready" that reads the same
+// as a hang (celeris#706). It puts the error back for the caller's shutdown,
+// which receives from done too: done must be buffered, and Start sends on it
+// once, so that send cannot block.
+func waitForReady(tb testing.TB, s *celeris.Server, done chan error, timeout time.Duration) string {
 	tb.Helper()
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		addr := s.Addr()
-		if addr != nil {
+	for {
+		select {
+		case err := <-done:
+			done <- err
+			tb.Fatalf("server stopped before it was ready: Start returned %v", err)
+			return ""
+		default:
+		}
+		if addr := s.Addr(); addr != nil {
 			// Engine is listening. Try connecting to verify.
 			a := addr.String()
 			conn, err := net.DialTimeout("tcp", a, 100*time.Millisecond)
@@ -28,10 +42,12 @@ func waitForReady(tb testing.TB, s *celeris.Server, timeout time.Duration) strin
 				return a
 			}
 		}
+		if !time.Now().Before(deadline) {
+			tb.Fatalf("server not ready within %v, and Start has not returned", timeout)
+			return ""
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	tb.Fatal("server not ready within timeout")
-	return ""
 }
 
 // TestEngineIntegration tests WebSocket with native engines on Linux.
@@ -69,7 +85,7 @@ func TestEngineIntegration(t *testing.T) {
 	}()
 
 	// Wait for native engine to be fully ready (loops bound with SO_REUSEPORT).
-	addr := waitForReady(t, s, 3*time.Second)
+	addr := waitForReady(t, s, done, 3*time.Second)
 	t.Logf("Server ready at %s", addr)
 
 	// Test 1: Basic echo.
@@ -190,7 +206,7 @@ func TestEngineIntegrationCompression(t *testing.T) {
 		<-done
 	}()
 
-	addr := waitForReady(t, s, 3*time.Second)
+	addr := waitForReady(t, s, done, 3*time.Second)
 
 	client := dialRaw(t, addr)
 	defer client.close()

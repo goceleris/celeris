@@ -2,10 +2,12 @@ package metrics
 
 import (
 	"bytes"
+	"encoding/binary"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,17 +16,6 @@ import (
 
 	"github.com/goceleris/celeris"
 )
-
-// labelValuesPool recycles the label-value slice that every recorded
-// request builds for WithLabelValues. Prometheus consumes the values
-// synchronously (lookup + Observe/Inc return before the slice is
-// reused) so a pool is safe. Capacity 8 covers 3 base labels + up to
-// 5 custom ones without re-grow; larger custom sets fall back to a
-// fresh allocation (rare).
-var labelValuesPool = sync.Pool{New: func() any {
-	s := make([]string, 0, 8)
-	return &s
-}}
 
 // New creates a Prometheus metrics middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
@@ -130,6 +121,12 @@ func New(config ...Config) celeris.HandlerFunc {
 	metricsPath := cfg.Path
 	authFunc := cfg.AuthFunc
 	nCustom := len(customLabelNames)
+	nLabels := len(allLabels)
+	set := &seriesSet{
+		requestsTotal:   requestsTotal,
+		requestDuration: requestDuration,
+		m:               make(map[string]*series),
+	}
 
 	return func(c *celeris.Context) error {
 		if c.Path() == metricsPath {
@@ -187,39 +184,120 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		path = strings.ToValidUTF8(path, "")
 
-		// Build label values: method, path, status + custom labels.
-		// Pool-backed slice: Prometheus consumes synchronously (no
-		// retention past WithLabelValues), so we can return the
-		// backing array to the pool.
-		lvPtr := labelValuesPool.Get().(*[]string)
-		lv := (*lvPtr)[:0]
-		lv = append(lv, c.Method(), path, statusStr)
+		// Label values: method, path, status + custom labels, as a lookup
+		// key. The key is built on the stack and the lookup copies
+		// nothing; see seriesSet.
+		var kb [256]byte
+		key := appendLabelValue(kb[:0], c.Method())
+		key = appendLabelValue(key, path)
+		key = appendLabelValue(key, statusStr)
 		for i := range nCustom {
-			lv = append(lv, customLabelFuncs[i](c))
+			key = appendLabelValue(key, customLabelFuncs[i](c))
+		}
+		s := set.get(key)
+		if s == nil {
+			s = set.add(key, nLabels)
 		}
 
-		requestsTotal.WithLabelValues(lv...).Inc()
-		requestDuration.WithLabelValues(lv...).Observe(duration)
+		s.total.Inc()
+		s.duration.Observe(duration)
 
 		if cl := c.ContentLength(); cl > 0 {
-			requestSize.WithLabelValues(lv...).Observe(float64(cl))
+			s.observer(&s.reqSize, requestSize).Observe(float64(cl))
 		}
 		if bw := c.BytesWritten(); bw > 0 {
-			responseSize.WithLabelValues(lv...).Observe(float64(bw))
+			s.observer(&s.respSize, responseSize).Observe(float64(bw))
 		}
-
-		// Cap retained capacity so a pathological custom-label
-		// consumer doesn't hold a huge backing array in the pool.
-		if cap(lv) > 32 {
-			fresh := make([]string, 0, 8)
-			*lvPtr = fresh
-		} else {
-			*lvPtr = lv
-		}
-		labelValuesPool.Put(lvPtr)
 
 		return err
 	}
+}
+
+// seriesSet holds every label-value combination the middleware has
+// recorded, keyed by the values, with copies of the values it owns and the
+// series it resolved for them.
+//
+// The label values are request strings: c.Method() for a method the H1
+// parser does not intern, c.Path() when there is no route pattern, and
+// whatever a LabelFuncs function reads from the request. On epoll and
+// io_uring those are views of the connection's receive buffer, which the
+// engine reuses for the connection's next request and, once the connection
+// closes, for another connection. client_golang keeps the label values of
+// every new series for the life of the registry and does not copy them, so a
+// series created from views would change its labels to other request bytes,
+// including another client's headers (celeris#732). Only Prometheus ever
+// sees the owned copies, and they are made only when a combination is new:
+// a request whose combination was seen before copies nothing and resolves
+// its series with one map lookup instead of one WithLabelValues call per
+// metric.
+type seriesSet struct {
+	requestsTotal   *prometheus.CounterVec
+	requestDuration *prometheus.HistogramVec
+
+	mu sync.RWMutex
+	m  map[string]*series
+}
+
+// series is one label-value combination.
+type series struct {
+	values   []string // owned copies, cut from the seriesSet key
+	total    prometheus.Counter
+	duration prometheus.Observer
+	// The size histograms are resolved on first use, so a combination that
+	// never carried a body has no request_size_bytes series, as before.
+	reqSize  atomic.Pointer[prometheus.Observer]
+	respSize atomic.Pointer[prometheus.Observer]
+}
+
+// appendLabelValue appends v to a lookup key, length-prefixed so that no
+// two combinations share a key whatever bytes the values hold.
+func appendLabelValue(key []byte, v string) []byte {
+	key = binary.AppendUvarint(key, uint64(len(v)))
+	return append(key, v...)
+}
+
+func (set *seriesSet) get(key []byte) *series {
+	set.mu.RLock()
+	s := set.m[string(key)]
+	set.mu.RUnlock()
+	return s
+}
+
+// add records a new combination of n label values. The map key is a copy of
+// the lookup key, and the label values handed to Prometheus are cut from it.
+func (set *seriesSet) add(key []byte, n int) *series {
+	owned := string(key)
+	values := make([]string, 0, n)
+	for off := 0; off < len(key); {
+		l, w := binary.Uvarint(key[off:])
+		off += w
+		values = append(values, owned[off:off+int(l)])
+		off += int(l)
+	}
+	// Resolved outside the lock: WithLabelValues panics on a label value
+	// that is not valid UTF-8, and the panic must not leave mu held.
+	s := &series{
+		values:   values,
+		total:    set.requestsTotal.WithLabelValues(values...),
+		duration: set.requestDuration.WithLabelValues(values...),
+	}
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	if prev := set.m[owned]; prev != nil {
+		return prev
+	}
+	set.m[owned] = s
+	return s
+}
+
+// observer returns the series' observer in vec, resolving it on first use.
+func (s *series) observer(p *atomic.Pointer[prometheus.Observer], vec *prometheus.HistogramVec) prometheus.Observer {
+	if o := p.Load(); o != nil {
+		return *o
+	}
+	o := vec.WithLabelValues(s.values...)
+	p.Store(&o)
+	return o
 }
 
 func serveMetrics(c *celeris.Context, gatherer prometheus.Gatherer) error {
