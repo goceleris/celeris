@@ -288,8 +288,9 @@ type connState struct {
 	// goroutine hands the conn back, or when the conn is closed, before
 	// anything else acts on the conn. Until then cs.sending (or
 	// zcNotifPending) stays set, so no other SEND starts and every raw write
-	// waits (celeris#751). The kernel's side of each is done:
-	// kernelInflight was settled when it was dispatched.
+	// waits (celeris#751), and the dirty-list pass gives the conn up, which
+	// it would spin on otherwise (flushDirty). The kernel's side of each is
+	// done: kernelInflight was settled when it was dispatched.
 	heldSends []completionEntry
 	// closeErr (worker-thread only) is the error handleRecv's peer-FIN or
 	// recv-error branch owes a detached middleware (OnError) when it met a

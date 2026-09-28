@@ -5137,6 +5137,23 @@ func (w *Worker) removeDirty(cs *connState) {
 func (w *Worker) flushDirty() {
 	for cs := w.dirtyHead; cs != nil; {
 		next := cs.dirtyNext
+		if len(cs.heldSends) > 0 {
+			// A send completion of this conn is held for its dispatch
+			// goroutine (celeris#750), so cs.sending (or zcNotifPending)
+			// stays set, and nothing is sent or armed for the conn until the
+			// goroutine's hand-back applies the completion; the hand-back
+			// puts the conn on this list again (drainDetachQueue). Kept
+			// listed until then, it held the ring at a zero wait, a spin,
+			// for as long as the handler ran, where a blocking Lock had
+			// parked the worker. Give it up, as the celeris#704 give-up
+			// below does. Here rather than where the completion is held:
+			// the hand-back's own entry lists the conn again when the
+			// goroutine is already in its next handler and the completion
+			// is held again.
+			w.removeDirty(cs)
+			cs = next
+			continue
+		}
 		if cs.sending {
 			// celeris#607 witness. The retry below is gated on the
 			// send, so a connection that is owed a recv arm and has a

@@ -271,6 +271,94 @@ func TestIouringCloseAppliesAHeldSendCompletion(t *testing.T) {
 	}
 }
 
+// TestIouringHeldSendCompletionDoesNotKeepTheRingPolling: while a completion
+// is held, cs.sending stays set until the goroutine's hand-back, and a conn on
+// the dirty list makes the worker wait with a zero timeout. Left listed, the
+// held conn kept the ring polling for as long as the handler ran, where the
+// blocking Lock had parked it (found in review of PR #801). The pass must
+// give the conn up, as the celeris#704 give-up does, and the hand-back must
+// list it again, with nothing the handler wrote lost.
+//
+// Arm held: the pass submitted the SEND of the rest of a response (the conn is
+// listed while it is in flight), and it completes under the next handler.
+// Arm held_again: the goroutine hands the conn back at the top of its loop and
+// goes straight into the next pipelined request's handler, before the worker
+// drains the hand-back; the drain's entry holds the completion again, and then
+// lists the conn, as every entry does.
+func TestIouringHeldSendCompletionDoesNotKeepTheRingPolling(t *testing.T) {
+	const tail = "the rest of response 1"
+	const next = "response 2, written by the running handler"
+	for _, again := range []bool{false, true} {
+		name := "held"
+		if again {
+			name = "held_again"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := newStallRig704(t)
+			w, cs := rig.w, rig.cs
+			// The goroutine's direct write was short: the rest is queued, the
+			// drain listed the conn, and the pass submits the SEND.
+			cs.writeBuf = append(cs.writeBuf[:0], tail...)
+			w.markDirty(cs)
+			w.flushDirty()
+			if placed := takeSQEs(w.ring); len(placed) != 1 || placed[0].op != opSEND || !cs.sending || !cs.dirty {
+				t.Fatalf("apparatus: placed %v sending=%v dirty=%v; want the SEND in flight with the conn listed",
+					sqeOps750(placed), cs.sending, cs.dirty)
+			}
+			release := holdAsHandler704(t, cs, true)
+			cs.writeBuf = append(cs.writeBuf, next...) // the handler writes, under the lock it holds
+			c := sendCQE750(rig, int32(len(tail)), 0)
+			if !returnsWhileHeld704(t, release, func() { w.handleSend(c, rig.local, time.Now().UnixNano()) }) {
+				t.Fatalf("celeris#750: the send completion waited %v on a running handler's detachMu", stallWait704)
+			}
+			if again {
+				// The handler returns; the loop top hands the conn back, and the
+				// next handler takes detachMu before the worker drains it.
+				release()
+				cs.asyncInMu.Lock()
+				cs.relinkOwed = false
+				w.enqueueDetach(cs)
+				cs.asyncInMu.Unlock()
+				release = holdAsHandler704(t, cs, true)
+			}
+			// The worker's per-iteration passes while the handler runs.
+			listed := 0
+			for range 3 {
+				w.drainDetachQueue()
+				w.flushDirty()
+				if cs.dirty || w.dirtyHead != nil {
+					listed++
+				}
+			}
+			t.Logf("celeris750 HELDLIST arm=%s held=%d sending=%v relinkOwed=%v dirty=%v baseTimeout=%v listed_passes=%d/3",
+				name, heldSends750(cs), cs.sending, relinkOwed704(cs), cs.dirty, w.baseTimeout(), listed)
+			if heldSends750(cs) != 1 || !cs.sending || !relinkOwed704(cs) {
+				t.Fatalf("apparatus: held=%d sending=%v relinkOwed=%v; want the completion held, with a hand-back owed",
+					heldSends750(cs), cs.sending, relinkOwed704(cs))
+			}
+			if listed != 0 {
+				t.Errorf("with a completion held, the conn stayed on the dirty list after %d of 3 passes: the "+
+					"worker waits with a zero timeout, a spin, for as long as the handler runs", listed)
+			}
+
+			// The handler returns; the REAL dispatch loop hands the conn back.
+			release()
+			handBack750(t, rig)
+			placed := takeSQEs(w.ring)
+			t.Logf("celeris750 HELDLIST arm=%s after_handback held=%d placed=%v sendBuf=%q dirty=%v", name,
+				heldSends750(cs), sqeOps750(placed), cs.sendBuf, cs.dirty)
+			if heldSends750(cs) != 0 || len(placed) != 1 || placed[0].op != opSEND || string(cs.sendBuf) != next {
+				t.Errorf("after the hand-back: held=%d placed %v sendBuf=%q; want the completion applied and one "+
+					"SEND of %q", heldSends750(cs), sqeOps750(placed), cs.sendBuf, next)
+			}
+			if !cs.dirty {
+				t.Errorf("the hand-back did not put the conn back on the dirty list")
+			}
+			endDispatch750(rig)
+		})
+	}
+}
+
 // TestIouringSendCompletionStillWaitsForABoundedHolder is the negative control
 // for the unit arms, as #704's TestIouringCloseStillWaitsForABoundedHolder is
 // for the close. The dispatch goroutine is PARKED, or past a Detach (it no
