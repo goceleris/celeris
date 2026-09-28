@@ -15,6 +15,8 @@ package epoll
 //   Contended512: the same, while another goroutine calls Loop.Write on the same
 //     conn in a tight loop, so the two sides compete for dc.mu. writes/s is that
 //     writer's progress.
+// v3.1 (2026-09-28): the contended writer backs off on ErrQueueFull instead of
+// panicking; a timing run pinned to one CPU reached it. Nothing else changed.
 // v3 (new): a running epoll engine, one driver conn over TCP loopback, shaped like
 // the redis driver's async path (a FIFO of waiters, a writer mutex around
 // WorkerLoop.Write, replies completed in order by the worker's onRecv).
@@ -31,7 +33,9 @@ package epoll
 
 import (
 	"context"
+	"errors"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -40,6 +44,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 	"github.com/goceleris/celeris/resource"
 )
@@ -77,7 +82,13 @@ func benchDriverRead(b *testing.B, msg int, contended bool) {
 				default:
 				}
 				if err := l.Write(local, w); err != nil {
-					// ErrQueueFull cannot happen at 64 B/op with the drainer below; anything else is fatal.
+					if errors.Is(err, engine.ErrQueueFull) {
+						// v3.1: with fewer CPUs than runnable goroutines (a timing run pinned to one CPU),
+						// the writer can outrun the drainer until its 64 MiB queue is full. Back off and do
+						// not count it. With 4 CPUs it never happened (v2 and v3 panicked here, and did not).
+						runtime.Gosched()
+						continue
+					}
 					panic(err)
 				}
 				writes.Add(1)
