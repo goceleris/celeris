@@ -94,16 +94,30 @@ func (w *Worker) tryTransplant(fd int) {
 	// a double claim (a completion of the conn landed between the park and
 	// the drain of the claim), and it is counted as such, before any of the
 	// gates below: TransplantClaimDeferred, a rate.
+	//
+	// A goroutine that exited to close the conn (asyncClosed: a handler or
+	// write error, "Connection: close", a panic) has the same shape: it clears
+	// asyncRun under asyncInMu and enqueues the close after unlocking. The
+	// conn is that entry's to close (celeris#780); the gates below would pass
+	// a flushed conn at a request boundary and hand it off, and the queued
+	// close would then act on a number the hand-off gave up. asyncClosed is
+	// set before asyncRun is cleared, so reading it under asyncInMu is
+	// ordered. The h2c-upgrade exit needs no check here: the protocol gate
+	// below refuses an H2C conn.
 	if w.async {
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
 		claimed := cs.transplantPending.Load()
+		closing := cs.asyncClosed.Load()
 		cs.asyncInMu.Unlock()
 		if running {
 			return
 		}
 		if claimed {
 			w.handoffLoss.noteClaimDeferred()
+			return
+		}
+		if closing {
 			return
 		}
 	}

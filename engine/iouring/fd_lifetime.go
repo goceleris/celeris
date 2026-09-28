@@ -208,17 +208,31 @@ func (w *Worker) handleTransplantReap(c *completionEntry, fd int) {
 // claim still set, and the claim's drain found the slot empty and counted a
 // double claim for a conn moved once (celeris#758). Leaving the conn to its
 // claim is ordering, counted as TransplantClaimDeferred.
+//
+// The goroutine's other exits have the same shape (celeris#780): the
+// processErr and panic exits set asyncClosed, the h2c-upgrade exit makes the
+// conn H2C, and each then clears asyncRun under asyncInMu and enqueues cs only
+// after unlocking. A conn in one of those windows belongs to its queued entry,
+// which closes it or finishes the upgrade; handing it off first left that
+// entry to close the number the hand-off gave up, which the next accept can
+// hold, or put an H2C conn on the HTTP/1 target. Both fields are published
+// before asyncRun is cleared, so reading them under asyncInMu after seeing it
+// clear is ordered.
 func (w *Worker) rerunHandOff(fd int, cs *connState) {
 	if w.async && cs.asyncPromoted.Load() {
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
 		claimed := cs.transplantPending.Load()
+		exiting := cs.asyncClosed.Load() || engine.Protocol(cs.protocol.Load()) != engine.HTTP1
 		cs.asyncInMu.Unlock()
 		if running {
 			return
 		}
 		if claimed {
 			w.handoffLoss.noteClaimDeferred()
+			return
+		}
+		if exiting {
 			return
 		}
 		w.finishAsyncTransplant(cs)
