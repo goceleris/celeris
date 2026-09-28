@@ -4743,8 +4743,11 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			// 101 to whatever real fd holds that number (celeris#538).
 			// Leaving the bytes in writeBuf takes the same disposition as
 			// the EAGAIN branch below — the worker ring-sends them, and the
-			// ring resolves the index correctly.
-			if promoteErr == nil && !cs.fixedFile && len(cs.writeBuf) > 0 {
+			// ring resolves the index correctly. Nor while a ring SEND of
+			// the conn's earlier bytes is outstanding (celeris#751): the 101
+			// would reach the client ahead of the rest of the previous
+			// response. The worker sends writeBuf after that SEND completes.
+			if promoteErr == nil && !cs.fixedFile && len(cs.writeBuf) > 0 && !ringSendOutstanding(cs) {
 				n, werr := unix.Write(cs.fd, cs.writeBuf)
 				switch {
 				case werr == nil && n == len(cs.writeBuf):
@@ -4835,6 +4838,14 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			// full socket buffer — hand the bytes to the worker, whose ring
 			// SEND resolves the index correctly.
 			partial = true
+		} else if processErr == nil && len(cs.writeBuf) > 0 && ringSendOutstanding(cs) {
+			// A ring SEND of this conn's earlier bytes is outstanding: the
+			// rest of a previous response whose own direct write was short
+			// (celeris#751). Writing now would put these bytes on the wire
+			// ahead of it, inside the previous response of a pipelining
+			// client. Leave them in writeBuf, as for a full socket buffer:
+			// the worker's completeSend sends writeBuf after that SEND.
+			partial = true
 		} else if processErr == nil && len(cs.writeBuf) > 0 {
 			n, werr := unix.Write(cs.fd, cs.writeBuf)
 			if werr != nil {
@@ -4881,6 +4892,17 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 			w.wakeFD.Signal()
 		}
 	}
+}
+
+// ringSendOutstanding reports whether a ring SEND of cs's earlier bytes is in
+// flight, or owed, so that a raw unix.Write of writeBuf now would reach the
+// wire ahead of them (celeris#751): a SEND or its SEND_ZC notification is
+// outstanding, or sendBuf/bodyBuf hold bytes the worker has taken from
+// writeBuf and not yet sent. The worker mutates all four under cs.detachMu,
+// which the caller holds, so no SEND can start while it does. The detached
+// conns' guarded writeFn tests the same condition.
+func ringSendOutstanding(cs *connState) bool {
+	return cs.sending || cs.zcNotifPending || len(cs.sendBuf) > 0 || len(cs.bodyBuf) > 0
 }
 
 func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
