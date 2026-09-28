@@ -322,12 +322,14 @@ The bridge buffers the adapted handler's response in memory, capped at a compile
 
 | Engine | Platform | Use case |
 |--------|----------|----------|
-| `IOUring` | Linux 5.10+ | Lowest latency, highest throughput |
-| `Epoll` | Linux | Broad kernel support, proven stability |
-| `Adaptive` | Linux | Auto-switch between io_uring and epoll on telemetry |
+| `IOUring` | Linux 5.19+ | Lowest latency, highest throughput |
+| `Epoll` | Linux 5.10+ | Broad kernel support, proven stability |
+| `Adaptive` | Linux 5.10+ | Auto-switch between io_uring and epoll on telemetry; epoll only below 5.19 |
 | `Std` | Any OS | Development, compatibility, non-Linux deploys |
 
 The default is **Adaptive** on Linux and **Std** elsewhere. Prefer Adaptive unless you have a specific reason to pin an engine; on non-Linux platforms only Std is available (the native engines return an error).
+
+io_uring needs Linux 5.19 or later: every cancel the engine submits uses the `IORING_ASYNC_CANCEL` flags that release added, and an older kernel fails each one with `-EINVAL` ([#682](https://github.com/goceleris/celeris/issues/682)). The engine checks it at startup with a probe cancel that the kernel answers, rather than by reading the kernel version. Where the kernel rejects the flags, `IOUring` fails to start with an error that names the requirement, and `Adaptive` runs on epoll (`CELERIS_ADAPTIVE_START=iouring` included).
 
 ### Tuning environment variables
 
@@ -446,7 +448,7 @@ validation/     Runtime invariant assertions + validation hooks (debug builds)
 ## Requirements
 
 - **Go 1.27.0+** (see the `go` directive in `go.mod`)
-- **Linux** for the io_uring / epoll / adaptive engines (kernel 5.10+ for io_uring; 5.19+ for the multishot / provided-buffers tier)
+- **Linux** for the io_uring / epoll / adaptive engines (kernel 5.19+ for io_uring; 5.10+ for epoll and adaptive, which runs on epoll below 5.19)
 - **Any OS** for the std engine
 - Direct runtime dependencies: `golang.org/x/sys` and `golang.org/x/net` only (`golang.org/x/text` is indirect)
 

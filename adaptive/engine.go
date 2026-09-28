@@ -133,7 +133,12 @@ type Engine struct {
 //     on a 6.10+ kernel the "bundles era" branch alone used to call io_uring
 //     viable, and every promotion then failed to build it and backed off with
 //     a WARN (celeris#679). Checked first, with iouring.New's own predicate, so
-//     the two cannot disagree.
+//     the two cannot disagree. iouring.New also refuses a kernel that rejects
+//     the IORING_ASYNC_CANCEL flags (every one before 5.19, celeris#682). The
+//     kernel test below already rules those kernels out by version; one that
+//     passes it and still rejects the flags fails the build like any other:
+//     a start engine falls back to epoll, a standby build is backed off
+//     (celeris#656).
 //
 // The other two are the t0-knowable disqualifiers from the epoll-vs-io_uring
 // sweep:
