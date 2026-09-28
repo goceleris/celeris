@@ -328,13 +328,17 @@ func TestPausedWorkerWithABusyConnectionIsNotTimedOut(t *testing.T) {
 }
 
 // TestAdoptOntoADrainingWorkerIsNotTimedOut: an adoption onto a paused worker
-// that has not parked, because it still holds idle keep-alive connections,
-// 3 s after the pause. The adoption's own stamp is fresh, and the
-// connection's first request overwrote it with the worker's clock. Sixteen
-// holders, so that every worker holds one (SO_REUSEPORT spreads them) and
-// none parks: the adoption lands on a draining worker, whichever it is.
+// that has not parked, 3 s after the pause. The adoption's own stamp is fresh,
+// and the connection's first request overwrote it with the worker's clock.
+// What keeps every worker from parking is a registered driver connection on
+// each (the park waits for hasDriverConns to clear), not idle keep-alive
+// holders: ReadTimeout closed a worker's holders during the wait whenever its
+// checkTimeouts came due, and that worker parked (3 of 13 runs at unl). A driver
+// connection is not in liveConns, so no timeout touches it, and while idle it
+// completes nothing: the worker waits out 1 s ring waits on a clock it does
+// not refresh, as it did with the holders.
 func TestAdoptOntoADrainingWorkerIsNotTimedOut(t *testing.T) {
-	e, addr := startParkEngine713(t, fdlHandler{}, func(c *resource.Config) {
+	e, _ := startParkEngine713(t, fdlHandler{}, func(c *resource.Config) {
 		c.DisableDeferAccept = true
 		c.ReadTimeout = staleClockReadTimeout
 		c.WriteTimeout = staleClockReadTimeout
@@ -343,32 +347,46 @@ func TestAdoptOntoADrainingWorkerIsNotTimedOut(t *testing.T) {
 	e.mu.Lock()
 	ws := append([]*Worker(nil), e.workers...)
 	e.mu.Unlock()
-	const holders = 16
-	for i := range holders {
-		h, err := net.DialTimeout("tcp", addr, 2*time.Second)
-		if err != nil {
-			t.Fatalf("dial holder %d: %v", i, err)
+	for i := range ws {
+		a, b := nonblockSocketPair(t)
+		wl := e.WorkerLoop(i)
+		if err := wl.RegisterConn(a, func([]byte) {}, func(error) {}); err != nil {
+			_ = unix.Close(a)
+			_ = unix.Close(b)
+			t.Fatalf("RegisterConn on worker %d: %v", i, err)
 		}
-		defer func() { _ = h.Close() }()
-		if _, failed, why := serveSteadily(h, 1, 0); failed >= 0 {
-			t.Fatalf("celeris713 PREMISE: holder %d's request failed: %s", i, why)
+		t.Cleanup(func() {
+			_ = wl.UnregisterConn(a)
+			_ = unix.Close(a)
+			_ = unix.Close(b)
+		})
+	}
+	for dl := time.Now().Add(2 * time.Second); ; {
+		all := true
+		for _, w := range ws {
+			all = all && w.hasDriverConns.Load()
 		}
+		if all {
+			break
+		}
+		if time.Now().After(dl) {
+			t.Fatalf("celeris713 PREMISE: the driver connections were not registered on every worker")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	if err := e.PauseAccept(); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
 	pausedAt := time.Now()
 	time.Sleep(3 * time.Second)
-	alive := e.Metrics().ActiveConnections
 	parked := 0
 	for _, w := range ws {
 		if w.suspended.Load() {
 			parked++
 		}
 	}
-	if alive != holders || parked != 0 {
-		t.Fatalf("celeris713 PREMISE: at the adoption %d of %d holders are open and %d of %d workers parked",
-			alive, holders, parked, len(ws))
+	if parked != 0 {
+		t.Fatalf("celeris713 PREMISE: at the adoption %d of %d workers parked", parked, len(ws))
 	}
 	m0 := e.Metrics()
 	client, fd := adoptPair658(t)
