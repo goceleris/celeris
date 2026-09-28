@@ -523,14 +523,18 @@ func (s *Server) cancelListen() {
 // call it from another goroutine (celeris#703). The Start* call that the
 // server was started with returns only after Shutdown has returned.
 //
-// The drain waits for every HTTP/1.1 request and every HTTP/2 stream. An
-// HTTP/2 stream on an async route (marked Async, or promoted to async under
+// The drain waits for every HTTP/1.1 request and every HTTP/2 stream. No
+// engine accepts a new connection once the shutdown has begun. An HTTP/2
+// stream on an async route (marked Async, or promoted to async under
 // [Config.AsyncHandlers]) runs on the shared HTTP/2 worker pool: epoll,
-// io_uring and adaptive send each HTTP/2 connection GOAWAY and serve it until
-// those handlers have returned and their responses have gone out, while ctx
-// is live (until its deadline or, for a ctx without one, until it is done,
-// but no longer than [Config.WriteTimeout]) and never for less than 250 ms;
-// std waits for its h2c streams' handlers, bounded by ctx (celeris#759). Once
+// io_uring and adaptive send each HTTP/2 connection GOAWAY, refuse
+// (REFUSED_STREAM) a stream its client opens after it, and serve the
+// connection until those handlers have returned and their responses have
+// gone out, response DATA waiting for the client's WINDOW_UPDATE included,
+// while ctx is live (until its deadline or, for a ctx without one, until it
+// is done, but no longer than [Config.WriteTimeout]) and never for less than
+// 250 ms; std waits for its h2c streams' handlers, bounded by ctx
+// (celeris#759). Once
 // the handlers have returned, the native engines send what the sockets have
 // not taken yet before they close the connections: epoll (and adaptive while
 // it runs epoll) for as long, and never for less than 250 ms (celeris#760);

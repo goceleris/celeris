@@ -15,11 +15,16 @@ type Engine interface {
 	// Listen starts the engine and blocks until ctx is canceled or a fatal
 	// error occurs. The engine begins accepting connections on the configured address.
 	Listen(ctx context.Context) error
-	// Shutdown gracefully drains in-flight connections, bounded by ctx: when
-	// ctx expires, Shutdown returns its error. On epoll and io_uring the
-	// drain runs in Listen once Listen's ctx is cancelled, and Shutdown itself
-	// does nothing. No engine closes a connection whose handler is still
-	// running when ctx expires; the handler runs to completion (celeris#753).
+	// Shutdown gracefully drains in-flight connections, bounded by ctx. On
+	// std Shutdown is the drain: when ctx expires first, it returns ctx's
+	// error. On epoll and io_uring the drain runs in Listen once Listen's
+	// ctx is cancelled, and Shutdown hands it ctx as its budget and returns
+	// nil at once (celeris#759, celeris#760); adaptive hands ctx to its
+	// sub-engines, then cancels its own Listen and waits for it, bounded by
+	// ctx. An HTTP/1 handler runs to completion on every engine whatever
+	// ctx (celeris#753); a handler of an HTTP/2 stream on the shared worker
+	// pool can still be running when the native engines close its
+	// connection at the end of the budget.
 	Shutdown(ctx context.Context) error
 	// Metrics returns a point-in-time snapshot of engine performance counters.
 	Metrics() EngineMetrics

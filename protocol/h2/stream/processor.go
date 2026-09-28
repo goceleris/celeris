@@ -178,6 +178,15 @@ type Processor struct {
 	// see them. Incremented in runHandler before Submit, decremented after
 	// executeHandler has returned.
 	poolRunning atomic.Int32
+
+	// goAwaySent records that a GOAWAY has gone out, and goAwayLastID the
+	// last stream it named (celeris#759). A stream the client opens above
+	// it is not served (runHandler): its client counts it as not processed
+	// and may retry it on another connection (RFC 9113 §6.8). Written by
+	// SendGoAway, read by runHandler, both on the frame-processing path
+	// (event loop under H2State.mu).
+	goAwaySent   bool
+	goAwayLastID uint32
 }
 
 // PoolHandlersRunning reports whether a stream of this connection has a
@@ -185,6 +194,26 @@ type Processor struct {
 // goroutine.
 func (p *Processor) PoolHandlersRunning() bool {
 	return p.poolRunning.Load() > 0
+}
+
+// OutboundPending reports whether a stream of this connection has response
+// DATA buffered, waiting for the client's WINDOW_UPDATE: its handler has
+// returned, and the rest of its response goes out only as the client grants
+// window (celeris#759). The native engines' graceful shutdown waits for it,
+// as for the pool handlers. Takes the manager's and each stream's lock; not
+// for the hot path.
+func (p *Processor) OutboundPending() bool {
+	p.manager.mu.RLock()
+	defer p.manager.mu.RUnlock()
+	for _, s := range p.manager.streams {
+		s.mu.RLock()
+		pending := s.OutboundBuffer != nil && s.OutboundBuffer.Len() > 0
+		s.mu.RUnlock()
+		if pending {
+			return true
+		}
+	}
+	return false
 }
 
 // rstRateLimit and rstBurstLimit bound RST_STREAM arrivals. An honest
@@ -611,6 +640,17 @@ func (p *Processor) streamRouteAsync(stream *Stream) bool {
 // Otherwise dispatches to the worker pool for concurrent execution.
 func (p *Processor) runHandler(stream *Stream) {
 	if p.handler == nil {
+		return
+	}
+	// A stream opened above the last stream a GOAWAY named: its client
+	// counts it as not processed and may retry it elsewhere, so its handler
+	// must not run (celeris#759). REFUSED_STREAM says exactly that (RFC 9113
+	// §8.7). Its headers were decoded all the same, so the HPACK state stays
+	// in step with the client's.
+	if p.goAwaySent && stream.ID > p.goAwayLastID {
+		_ = p.sendRSTStreamAndMarkClosed(stream.ID, http2.ErrCodeRefusedStream)
+		stream.SetState(StateClosed)
+		p.manager.DeleteStream(stream.ID)
 		return
 	}
 
@@ -1622,8 +1662,12 @@ func (p *Processor) GoAwayErr(lastStreamID uint32, code http2.ErrCode, debug []b
 	return err
 }
 
-// SendGoAway sends a GOAWAY frame.
+// SendGoAway sends a GOAWAY frame, and records it: no stream above
+// lastStreamID is served from then on (runHandler).
 func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugData []byte) error {
+	if !p.goAwaySent || lastStreamID < p.goAwayLastID {
+		p.goAwaySent, p.goAwayLastID = true, lastStreamID
+	}
 	if p.connWriter != nil {
 		return p.connWriter.SendGoAway(lastStreamID, code, debugData)
 	}

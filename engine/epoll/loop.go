@@ -482,9 +482,15 @@ func (l *Loop) run(ctx context.Context) {
 	l.cachedNow = time.Now().UnixNano()
 
 	for {
-		if ctx.Err() != nil && l.h2PoolSettled() {
-			l.shutdown()
-			return
+		if ctx.Err() != nil {
+			// Accept nothing more (celeris#759): the loop may keep turning
+			// below, for the HTTP/2 conns it has, and a conn accepted now
+			// would be served and then cut at the budget.
+			l.stopAccepting()
+			if l.h2PoolSettled() {
+				l.shutdown()
+				return
+			}
 		}
 
 		// Cache the atomic load: ACTIVE→LINGERING→DRAINING and
@@ -507,8 +513,9 @@ func (l *Loop) run(ctx context.Context) {
 		// false so a subsequent Pause observes a fresh signal.
 		l.listenFDClosed.Store(paused && l.listenFD < 0)
 
-		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
-		if l.listenFD < 0 && !paused {
+		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept;
+		// never once shutdown has begun (stopAccepting).
+		if l.listenFD < 0 && !paused && ctx.Err() == nil {
 			fd, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 			l.deferCapable = !l.cfg.DisableDeferAccept
 			if err != nil {
@@ -3692,12 +3699,14 @@ func (l *Loop) shutdown() {
 // drains; shutdown cancelled such streams and closed their conns under their
 // handlers, so the client got unexpected EOF, and the hooks ran before the
 // handlers had finished. So the loop keeps turning, reading and writing as
-// usual, until no HTTP/2 conn has a pool handler running or a response still
-// in its write queue. Every HTTP/2 conn is sent GOAWAY first (again for a
-// conn that arrives meanwhile), so its client opens no new stream on it, as
-// net/http's graceful shutdown does. The wait is bounded like the send drain
-// (sendDrainWait): the budget of the last Engine.Shutdown, and never less
-// than shutdownSendDrainFloor. Loop thread.
+// usual on the conns it has (it accepts no new one: stopAccepting), until no
+// HTTP/2 conn has a pool handler running, a response still in its write
+// queue, or response DATA waiting for the client's WINDOW_UPDATE. Every
+// HTTP/2 conn is sent GOAWAY first, so its client opens no new stream on it,
+// as net/http's graceful shutdown does, and a stream it opens anyway is
+// refused. The wait is bounded like the send drain (sendDrainWait): the
+// budget of the last Engine.Shutdown, and never less than
+// shutdownSendDrainFloor. Loop thread.
 func (l *Loop) h2PoolSettled() bool {
 	if len(l.h2Conns) == 0 {
 		return true
@@ -3724,7 +3733,7 @@ func (l *Loop) h2PoolSettled() bool {
 				l.markDirty(cs) // the dirty pass flushes the GOAWAY
 			}
 		}
-		if cs.h2State.PoolHandlersRunning() || cs.h2State.WriteQueuePending() {
+		if cs.h2State.PoolHandlersRunning() || cs.h2State.WriteQueuePending() || cs.h2State.OutboundPending() {
 			busy = true
 		}
 	}
@@ -3733,6 +3742,24 @@ func (l *Loop) h2PoolSettled() bool {
 	}
 	_, more := l.sendDrainWait(l.h2DrainStart)
 	return !more
+}
+
+// stopAccepting takes the listener out of the epoll set and closes it, once
+// the loop's context is cancelled (celeris#759). The loop may go on turning
+// after that, for as long as its HTTP/2 conns keep it (h2PoolSettled), and it
+// used to accept and serve new connections meanwhile, which were then cut at
+// the budget; net/http's Shutdown closes its listeners first. What is still
+// in the kernel's accept queue is reset, as the close in shutdown did.
+// Idempotent. Loop thread.
+func (l *Loop) stopAccepting() {
+	if l.listenFD < 0 {
+		return
+	}
+	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
+	_ = unix.Close(l.listenFD)
+	l.listenFD = -1
+	l.listenHot = false
+	l.lingerUntil = 0
 }
 
 // drainSends is shutdown's send drain (celeris#760). It flushes every live

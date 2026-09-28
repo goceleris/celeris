@@ -781,12 +781,22 @@ func (s *H2State) PoolHandlersRunning() bool {
 	return s.processor.PoolHandlersRunning()
 }
 
+// OutboundPending reports whether a stream of this connection has response
+// DATA buffered for the client's WINDOW_UPDATE: its handler has returned and
+// the rest of its response goes out as the client grants window
+// (celeris#759). Not for the hot path.
+func (s *H2State) OutboundPending() bool {
+	return s.processor.OutboundPending()
+}
+
 // GoAway starts a graceful close of the connection (celeris#759): it sends
 // GOAWAY(NO_ERROR) naming the last stream the client has opened, so the
 // client opens no new stream on the connection, and leaves the streams in
-// flight to finish. It reports false, sending nothing, while the server's
-// preface has not gone out yet. Called on the engine's event loop thread,
-// like ProcessH2.
+// flight to finish. A stream the client opens above the one named anyway is
+// refused, not served (REFUSED_STREAM): the client counts it as not
+// processed and may retry it elsewhere. It reports false, sending nothing,
+// while the server's preface has not gone out yet. Called on the engine's
+// event loop thread, like ProcessH2.
 func (s *H2State) GoAway(write func([]byte)) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
