@@ -3500,15 +3500,16 @@ func (w *Worker) retireSendZC(errno int32, msg string) {
 // exists, otherwise the goroutine read races the event-loop write —
 // observed via -race in TestNativeEngineLargePayload/io_uring.
 // Reports whether the CALLER must close the connection. closeConn takes
-// cs.detachMu, and this function holds that same lock for its whole body;
-// sync.Mutex is not reentrant, so closing inline wedges the worker thread
+// cs.detachMu, and this function runs under that same lock (its caller,
+// handleSend, holds it for the whole body); sync.Mutex is not reentrant, so
+// closing inline wedges the worker thread
 // against itself -- and with it the entire event loop: no CQE is processed,
 // the detach queue is never drained (so every WebSocket recv-pause the
 // middleware asked to lift stays paused), no timeout sweep runs, and
 // graceful shutdown never completes. Releasing the lock early instead is
 // NOT the fix: it opens the window the lock exists to close, and measurably
 // corrupts streams (protoErr 0 -> 47 on the celeris#519 reproduction). The
-// caller closes once the deferred unlock has run.
+// caller closes once it has released the lock.
 //
 // A multi-worker engine only loses the one worker to this, so its
 // connections hang while the others keep serving; on a single-worker engine
@@ -3637,8 +3638,8 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	} else {
 		cs.sendBuf = cs.sendBuf[:0]
 	}
-	// detachMu (if any) is held by the deferred unlock at the top of
-	// the function — no per-branch Unlock needed below.
+	// detachMu (if any) is held by the caller for the whole function — no
+	// per-branch Unlock needed below.
 	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.finishCloseAny(fd, cs)
 		return
@@ -3661,7 +3662,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	}
 
 	// Re-send remainder or flush new data. Only markDirty on SQ ring full.
-	// detachMu (if any) is held by the deferred unlock at the top.
+	// detachMu (if any) is held by the caller.
 	if w.flushSend(cs) {
 		w.markDirty(cs)
 	}
