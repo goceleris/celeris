@@ -541,6 +541,12 @@ type Worker struct {
 	// releases all colliding conns only after every expected terminal
 	// CQE arrived (errs toward holding longer; see closedOpsEntry).
 	closedOps map[uint64]*closedOpsEntry
+	// zcHolds, zcHoldCount and zcHoldBytes: STUB (celeris#813 round 2,
+	// failing-first commit), declared so the tests compile; the next commit
+	// fills them.
+	zcHolds     map[uint64][]zcHold
+	zcHoldCount int
+	zcHoldBytes int
 
 	// shutdownDrainDeadline is the wall-clock (UnixNano) bound on the
 	// send drain the run loop performs once its context is cancelled

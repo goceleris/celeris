@@ -143,6 +143,10 @@ type handoffLossStats struct {
 	zcNotifHeld               atomic.Uint64
 	zcNotifForced             atomic.Uint64
 	zcBufRetained             atomic.Uint64
+	// zcHeldNow, zcHeldBytes: STUB (celeris#813 round 2, failing-first
+	// commit), declared so the tests compile; the next commit fills them.
+	zcHeldNow   atomic.Int64
+	zcHeldBytes atomic.Int64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {

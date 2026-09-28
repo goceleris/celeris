@@ -61,7 +61,31 @@ type zcBackstopResult struct {
 	corrupt, first   int  // bytes that are not what was sent, and the first one's offset (-1: none)
 	heldPastBackstop bool
 	releasedAfter    time.Duration // from the close to the array's release; -1: not released
-	owedAtRelease    int32         // cs.kernelInflight at the release: 0 once every op retired; a closed conn's keeps its close-time value until then
+	owedAtRelease    int32         // ops the closed identity still owed at the release: 0 once every op retired
+
+	// What the hold looked like at the end of the stall, with the backstop
+	// past and the notification owed (celeris#813 round 2): the entries the
+	// release walk still visits, the holds kept for the identity off that
+	// walk, whether the one hold keeps the array alone (its connState
+	// released), and the held-now gauges. Then the gauges after the
+	// release.
+	walkAtStall           int
+	holdsAtStall          int
+	arrayAloneAtStall     bool
+	heldNowAtStall        int64
+	heldBytesAtStall      int64
+	heldNowAfterRelease   int64
+	heldBytesAfterRelease int64
+	bufCap                int // the array's capacity: what a hold of it counts in bytes
+}
+
+// zcIdentityOwed is what closed identity key still owes the kernel, by its
+// closedOps entry: 0 once every op retired (the entry is gone).
+func zcIdentityOwed(w *Worker, key uint64) int32 {
+	if e := w.closedOps[key]; e != nil {
+		return e.inflight
+	}
+	return 0
 }
 
 // runZCBackstopCase builds the case with the #798 fixture: a 64 KiB SEND_ZC to
@@ -83,6 +107,10 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 	r := zcBackstopResult{w: w, first: -1, releasedAfter: -1, owedAtRelease: -1}
 	r.sent = startZCSend(t, w, cs, tc.reap)
 	pinned := cs.sendBuf[:cap(cs.sendBuf)]
+	r.bufCap = cap(pinned)
+	// The identity, taken before the close: a connState released to the pool
+	// keeps neither its descriptor number nor its count.
+	key := encodeConnOpKey(cs.fd, cs.generation)
 	if len(cs.sendBuf) != zcPayload || pinned[1] != 1 || pinned[255] != 255 {
 		t.Fatalf("sendBuf is not the payload: len=%d", len(cs.sendBuf))
 	}
@@ -103,19 +131,32 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 	w.pendingRelease[0].releaseAtNanos = closedAt.UnixNano()
 
 	// held: the array is still the send buffer of a connState queued for
-	// release. Anything else, the connState released or a queued one no
-	// longer holding the array, gives the array to a next owner.
+	// release, or held past the backstop off the release walk (zcHolds):
+	// with its whole entry, or alone. Held alone, the connState it came
+	// from must not still own it, unless that connState went to the GC
+	// (detached) rather than to the pool. Anything else gives the array to a
+	// next owner.
+	same := func(b []byte) bool { return unsafe.SliceData(b) == unsafe.SliceData(pinned) }
 	held := func() bool {
 		for i := range w.pendingRelease {
-			if w.pendingRelease[i].cs == cs && unsafe.SliceData(cs.sendBuf) == unsafe.SliceData(pinned) {
-				return true
+			if w.pendingRelease[i].cs == cs {
+				return same(cs.sendBuf)
 			}
+		}
+		for _, h := range w.zcHolds[key] {
+			if !same(h.sendBuf) {
+				continue
+			}
+			if h.entry.cs == cs {
+				return same(cs.sendBuf)
+			}
+			return tc.detached || !same(cs.sendBuf)
 		}
 		return false
 	}
 	pass := func(d time.Duration) {
 		runRingOnce(t, w, d)
-		owed := cs.kernelInflight
+		owed := zcIdentityOwed(w, key)
 		w.cachedNow = time.Now().UnixNano()
 		w.drainPendingRelease()
 		if r.releasedAfter < 0 && !held() {
@@ -131,6 +172,10 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 		pass(10 * time.Millisecond)
 	}
 	r.heldPastBackstop = r.releasedAfter < 0
+	r.walkAtStall = len(w.pendingRelease)
+	r.holdsAtStall = len(w.zcHolds[key])
+	r.arrayAloneAtStall = r.holdsAtStall == 1 && w.zcHolds[key][0].entry.cs == nil && same(w.zcHolds[key][0].sendBuf)
+	r.heldNowAtStall, r.heldBytesAtStall = w.handoffLoss.zcHeldNow.Load(), w.handoffLoss.zcHeldBytes.Load()
 
 	if err := unix.SetNonblock(peer, true); err != nil {
 		t.Fatalf("peer nonblock: %v", err)
@@ -152,6 +197,7 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 		pass(5 * time.Millisecond)
 	}
 	r.got = len(got)
+	r.heldNowAfterRelease, r.heldBytesAfterRelease = w.handoffLoss.zcHeldNow.Load(), w.handoffLoss.zcHeldBytes.Load()
 	for i, b := range got {
 		if b != byte(i) {
 			r.corrupt++
@@ -160,8 +206,10 @@ func runZCBackstopCase(t *testing.T, tc zcBackstopCase) zcBackstopResult {
 			}
 		}
 	}
-	t.Logf("celeris812 backstop case=%s sent=%d held_past_backstop=%v released_after=%v owed_at_release=%d peer_got=%d eof=%v corrupt_bytes=%d first_corrupt=%d",
-		tc.name, r.sent, r.heldPastBackstop, r.releasedAfter.Round(time.Microsecond), r.owedAtRelease, r.got, r.eof, r.corrupt, r.first)
+	t.Logf("celeris812 backstop case=%s sent=%d held_past_backstop=%v released_after=%v owed_at_release=%d peer_got=%d eof=%v corrupt_bytes=%d first_corrupt=%d "+
+		"walk_at_stall=%d holds_at_stall=%d array_alone=%v held_now=%d held_bytes=%d held_now_after=%d held_bytes_after=%d",
+		tc.name, r.sent, r.heldPastBackstop, r.releasedAfter.Round(time.Microsecond), r.owedAtRelease, r.got, r.eof, r.corrupt, r.first,
+		r.walkAtStall, r.holdsAtStall, r.arrayAloneAtStall, r.heldNowAtStall, r.heldBytesAtStall, r.heldNowAfterRelease, r.heldBytesAfterRelease)
 	return r
 }
 
@@ -190,8 +238,8 @@ func TestBackstopHoldsASendBufferAZCNotificationStillReads(t *testing.T) {
 				t.Errorf("the peer read %d bytes (EOF %v), want the %d the send completed with and then EOF", r.got, r.eof, r.sent)
 			}
 			if r.releasedAfter < 0 || r.owedAtRelease != 0 {
-				t.Errorf("the connState was not released at the notification: released_after=%v owed_at_release=%d "+
-					"pendingRelease=%d", r.releasedAfter, r.owedAtRelease, len(r.w.pendingRelease))
+				t.Errorf("the send buffer was not released at the notification: released_after=%v owed_at_release=%d "+
+					"pendingRelease=%d holds=%d", r.releasedAfter, r.owedAtRelease, len(r.w.pendingRelease), len(r.w.zcHolds))
 			}
 		})
 	}

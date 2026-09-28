@@ -210,3 +210,12 @@ func (w *Worker) zcSendBufsOwed() [][]byte {
 	}
 	return bufs
 }
+
+// zcHold and zcHoldBytesMax: STUB (celeris#813 round 2, failing-first
+// commit), declared so the tests compile; the next commit fills them.
+type zcHold struct {
+	sendBuf []byte
+	entry   pendingReleaseEntry
+}
+
+const zcHoldBytesMax = 16 << 20

@@ -21,6 +21,12 @@ import (
 // backstop ran past its deadline, no send buffer given up with its SEND_ZC
 // owed (CloseZCNotifForced, which must stay 0), and no descriptor forced
 // (CloseFDForced): a notification alone names none (celeris#798).
+//
+// And what the hold costs while it lasts (celeris#813 round 2), at the end of
+// the stall, with the notification owed: nothing on the release walk the loop
+// makes every pass, one hold for the identity keeping the send buffer's array
+// alone, and the held-now gauges at one buffer of its capacity; both back to
+// 0 once the notification released it.
 func TestBackstopCountsItsZCHolds(t *testing.T) {
 	for _, tc := range zcBackstopCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -37,6 +43,17 @@ func TestBackstopCountsItsZCHolds(t *testing.T) {
 			if r.corrupt != 0 || !r.heldPastBackstop || r.owedAtRelease != 0 {
 				t.Errorf("the hold itself failed: corrupt=%d held_past_backstop=%v owed_at_release=%d", r.corrupt, r.heldPastBackstop, r.owedAtRelease)
 			}
+			if r.walkAtStall != 0 || r.holdsAtStall != 1 || !r.arrayAloneAtStall {
+				t.Errorf("held past the backstop: %d entries left on the release walk, %d holds for the identity, array alone %v; "+
+					"want 0, 1, true: every loop pass walks what is left, and the kernel reads nothing of the connState but the array",
+					r.walkAtStall, r.holdsAtStall, r.arrayAloneAtStall)
+			}
+			if r.heldNowAtStall != 1 || r.heldBytesAtStall != int64(r.bufCap) {
+				t.Errorf("held-now gauges %d buffers, %d bytes while held, want 1 and %d", r.heldNowAtStall, r.heldBytesAtStall, r.bufCap)
+			}
+			if r.heldNowAfterRelease != 0 || r.heldBytesAfterRelease != 0 {
+				t.Errorf("held-now gauges %d buffers, %d bytes after the release, want 0 and 0", r.heldNowAfterRelease, r.heldBytesAfterRelease)
+			}
 		})
 	}
 }
@@ -44,8 +61,9 @@ func TestBackstopCountsItsZCHolds(t *testing.T) {
 // TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline is the hold's own
 // decision on hand-built state, with no kernel, so it runs where SEND_ZC does
 // not (the wire test skips there). Past its deadline, on every pass, an entry
-// that still owes a SEND_ZC stays queued, counted once (CloseZCNotifHeld),
-// and the notification releases it; nothing is forced (CloseZCNotifForced).
+// that still owes a SEND_ZC stays held, off the release walk (zcHolds, see
+// TestZCHoldIsOffTheReleaseWalk), counted once (CloseZCNotifHeld), and the
+// notification releases it; nothing is forced (CloseZCNotifForced).
 //
 //   - notif-owed: the send's first CQE came before the close; the descriptor
 //     went at the close (only the notification is owed, celeris#798).
@@ -67,7 +85,8 @@ func TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			const fd, gen = 5, 7
 			w := &Worker{conns: make([]*connState, 16), handoffLoss: &handoffLossStats{}}
-			cs := &connState{fd: fd, generation: gen, sendIsZC: true, sending: true, zcNotifPending: !tc.keepFD, kernelInflight: 1}
+			buf := make([]byte, 5000, 8192)
+			cs := &connState{fd: fd, generation: gen, sendIsZC: true, sending: true, zcNotifPending: !tc.keepFD, kernelInflight: 1, sendBuf: buf}
 			w.noteClosedInflight(cs)
 			kept := -1
 			if tc.keepFD {
@@ -78,14 +97,18 @@ func TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline(t *testing.T) {
 				kept = efd
 			}
 			w.queuePendingReleaseFD(cs, false, kept)
+			key := encodeConnOpKey(fd, gen)
 			deadline := w.pendingRelease[0].releaseAtNanos
 			for i := range 5 {
 				w.cachedNow = deadline + int64(i+1)*int64(time.Second)
-				w.drainPendingRelease()
-				if len(w.pendingRelease) != 1 || w.pendingRelease[0].cs != cs || !w.pendingRelease[0].zcHeld {
-					t.Fatalf("pass %d past the backstop: the entry was not held for its SEND_ZC: %+v", i, w.pendingRelease)
+				if len(w.pendingRelease) > 0 {
+					w.drainPendingRelease()
 				}
-				if w.pendingRelease[0].holdsFD || w.closeFDOwed != 0 {
+				if hs := w.zcHolds[key]; len(w.pendingRelease) != 0 || len(hs) != 1 || unsafe.SliceData(hs[0].sendBuf) != unsafe.SliceData(buf) {
+					t.Fatalf("pass %d past the backstop: the send buffer was not held for its SEND_ZC off the release walk: walk=%+v holds=%+v",
+						i, w.pendingRelease, hs)
+				}
+				if w.closeFDOwed != 0 {
 					t.Fatalf("pass %d past the backstop: the descriptor is still kept (closeFDOwed=%d)", i, w.closeFDOwed)
 				}
 			}
@@ -93,17 +116,19 @@ func TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline(t *testing.T) {
 				t.Fatalf("CloseZCNotifHeld=%d CloseZCNotifForced=%d CloseFDForced=%d, want 1 0 %d", held, forced, fdForced, tc.fdForced)
 			}
 			for i, flags := range tc.cqes {
-				if len(w.pendingRelease) != 1 {
+				if len(w.zcHolds[key]) != 1 {
 					t.Fatalf("released before CQE %d (flags %#x)", i, flags)
 				}
 				c := &completionEntry{UserData: encodeUserDataGen(udSend, fd, gen), Res: 100, Flags: flags}
 				if !w.staleConnCQE(c, fd, c.UserData) {
 					t.Fatalf("CQE %d not taken as stale", i)
 				}
-				w.drainPendingRelease()
+				if len(w.pendingRelease) > 0 {
+					w.drainPendingRelease()
+				}
 			}
-			if len(w.pendingRelease) != 0 {
-				t.Fatalf("the notification did not release the entry: %+v", w.pendingRelease)
+			if len(w.pendingRelease) != 0 || len(w.zcHolds) != 0 {
+				t.Fatalf("the notification did not release the entry: walk=%+v holds=%+v", w.pendingRelease, w.zcHolds)
 			}
 			if forced := w.handoffLoss.zcNotifForced.Load(); forced != 0 {
 				t.Fatalf("CloseZCNotifForced = %d, want 0", forced)
@@ -264,6 +289,10 @@ func zcRetainedLen() int {
 //     nothing is retained.
 //   - held-after-close: a closed connection the backstop holds for its
 //     notification (the #812 hold): retained and counted.
+//
+// In every case the worker takes its share out of the held-now gauges: a
+// worker that has shut down holds nothing, and what it retained is counted
+// apart (ShutdownZCBufRetained).
 func TestShutdownRetainsSendBuffersAZCMayStillRead(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -315,8 +344,9 @@ func TestShutdownRetainsSendBuffersAZCMayStillRead(t *testing.T) {
 					w.cachedNow = time.Now().UnixNano()
 					w.drainPendingRelease()
 				}
-				if len(w.pendingRelease) != 1 || !w.pendingRelease[0].zcHeld {
-					t.Fatalf("the backstop did not hold the entry: %+v", w.pendingRelease)
+				if len(w.pendingRelease) != 0 || len(w.zcHolds) != 1 || w.handoffLoss.zcHeldNow.Load() != 1 {
+					t.Fatalf("the backstop did not hold the send buffer off the release walk: walk=%+v holds=%+v held_now=%d",
+						w.pendingRelease, w.zcHolds, w.handoffLoss.zcHeldNow.Load())
 				}
 			}
 			n := zcRetainedLen()
@@ -328,6 +358,9 @@ func TestShutdownRetainsSendBuffersAZCMayStillRead(t *testing.T) {
 			if found != tc.wantRetain || added != int(tc.wantCounted) || counted != tc.wantCounted {
 				t.Fatalf("retained=%v added=%d ShutdownZCBufRetained=%d, want %v %d %d", found, added, counted,
 					tc.wantRetain, tc.wantCounted, tc.wantCounted)
+			}
+			if now, b := w.handoffLoss.zcHeldNow.Load(), w.handoffLoss.zcHeldBytes.Load(); now != 0 || b != 0 {
+				t.Fatalf("held-now gauges %d buffers, %d bytes after the worker's shutdown, want 0 and 0", now, b)
 			}
 		})
 	}

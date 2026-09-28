@@ -31,6 +31,8 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 	e.metrics.handoffLoss.zcNotifHeld.Store(53)
 	e.metrics.handoffLoss.zcNotifForced.Store(59)
 	e.metrics.handoffLoss.zcBufRetained.Store(61)
+	e.metrics.handoffLoss.zcHeldNow.Store(67)
+	e.metrics.handoffLoss.zcHeldBytes.Store(71)
 
 	m := e.Metrics()
 	for _, c := range []struct {
@@ -54,6 +56,8 @@ func TestMetricsCarriesTheHandoffLossWitnesses(t *testing.T) {
 		{"CloseZCNotifHeld", m.CloseZCNotifHeld, 53},
 		{"CloseZCNotifForced", m.CloseZCNotifForced, 59},
 		{"ShutdownZCBufRetained", m.ShutdownZCBufRetained, 61},
+		{"CloseZCNotifHeldNow", m.CloseZCNotifHeldNow, 67},
+		{"CloseZCNotifHeldBytes", m.CloseZCNotifHeldBytes, 71},
 	} {
 		if c.got != c.want {
 			t.Errorf("Metrics().%s = %d, want %d — the witness exists but cannot "+

@@ -27,6 +27,7 @@ func TestMetricsSumsTheHandoffLossWitnesses(t *testing.T) {
 		TransplantClaimDeferred: 12, TransplantReapFailed: 13, TransplantReapUnsupported: 14,
 		CloseFDDeferred: 15, CloseFDForced: 16,
 		CloseZCNotifHeld: 17, CloseZCNotifForced: 18, ShutdownZCBufRetained: 19,
+		CloseZCNotifHeldNow: 21, CloseZCNotifHeldBytes: 22,
 	})
 	e.secondary.(*mockEngine).SetMetrics(engine.EngineMetrics{
 		StaleRecvDataClosed: 10, StaleRecvDataTransplanted: 20,
@@ -36,6 +37,7 @@ func TestMetricsSumsTheHandoffLossWitnesses(t *testing.T) {
 		TransplantClaimDeferred: 120, TransplantReapFailed: 130, TransplantReapUnsupported: 140,
 		CloseFDDeferred: 150, CloseFDForced: 160,
 		CloseZCNotifHeld: 170, CloseZCNotifForced: 180, ShutdownZCBufRetained: 190,
+		CloseZCNotifHeldNow: 210, CloseZCNotifHeldBytes: 220,
 	})
 
 	m := e.Metrics()
@@ -60,6 +62,8 @@ func TestMetricsSumsTheHandoffLossWitnesses(t *testing.T) {
 		{"CloseZCNotifHeld", m.CloseZCNotifHeld, 187},
 		{"CloseZCNotifForced", m.CloseZCNotifForced, 198},
 		{"ShutdownZCBufRetained", m.ShutdownZCBufRetained, 209},
+		{"CloseZCNotifHeldNow", m.CloseZCNotifHeldNow, 231},
+		{"CloseZCNotifHeldBytes", m.CloseZCNotifHeldBytes, 242},
 	} {
 		if c.got != c.want {
 			t.Errorf("Metrics().%s = %d, want %d (sum of both sub-engines)",

@@ -634,6 +634,11 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	CloseZCNotifHeld      uint64
 	CloseZCNotifForced    uint64
 	ShutdownZCBufRetained uint64
+	// CloseZCNotifHeldNow, CloseZCNotifHeldBytes: STUB (celeris#813 round 2,
+	// failing-first commit), declared so the tests compile; the next commit
+	// fills them.
+	CloseZCNotifHeldNow   uint64
+	CloseZCNotifHeldBytes uint64
 	// TransplantSweepPasses counts passes of the post-switch sweep, the
 	// re-examination that moves a connection the drain would otherwise
 	// reach only at that connection's own next event — which, for a
