@@ -1183,6 +1183,10 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		CloseZCNotifHeld:      pm.CloseZCNotifHeld + sm.CloseZCNotifHeld,
 		CloseZCNotifForced:    pm.CloseZCNotifForced + sm.CloseZCNotifForced,
 		ShutdownZCBufRetained: pm.ShutdownZCBufRetained + sm.ShutdownZCBufRetained,
+		// Gauges of what each sub-engine's workers hold right now: a held
+		// buffer is held by one of them, so the engine holds the sum.
+		CloseZCNotifHeldNow:   pm.CloseZCNotifHeldNow + sm.CloseZCNotifHeldNow,
+		CloseZCNotifHeldBytes: pm.CloseZCNotifHeldBytes + sm.CloseZCNotifHeldBytes,
 		// The post-switch sweep (celeris#657 PR-3). Both sub-engines sweep,
 		// in opposite directions, and only the one draining runs passes at
 		// all, so the pass count sums as a rate. The residual entries are

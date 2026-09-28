@@ -192,11 +192,12 @@ func clampBufRingCount(n int) int {
 // entry stays 24 bytes on 64-bit platforms
 // (TestPendingReleaseEntryStaysTwentyFourBytes).
 //
-// zcHeld marks an entry the backstop found still owing a SEND_ZC and kept
-// (celeris#812, see closedZCOwed): the kernel may still read cs.sendBuf, so
-// the entry stays until that op's notification arrives, however long past
-// releaseAtNanos. It records only that the hold was counted
-// (CloseZCNotifHeld), once per entry; the same padding holds it.
+// zcHeld marks an entry the backstop found still owing a SEND_ZC and held
+// (celeris#812, see closedZCOwed and holdZCPastBackstop): the kernel may still
+// read cs.sendBuf, so its array is held, off this queue, until that op's
+// notification arrives, however long past releaseAtNanos. It records only
+// that the hold was counted (CloseZCNotifHeld), once per entry, for an entry
+// that comes back to the queue and is held again; the same padding holds it.
 type pendingReleaseEntry struct {
 	cs             *connState
 	releaseAtNanos int64
@@ -272,9 +273,13 @@ type closedOpsEntry struct {
 // cs.sendBuf whenever the peer opens its window, so a release there was a
 // certain use-after-free, not a potential one: the peer received whatever
 // the array's next owner wrote into it. The backstop holds such a
-// connState until the notification arrives instead (closedZCOwed,
-// CloseZCNotifHeld); the kernel bounds that hold itself, and it costs the
-// connState's memory, not a descriptor.
+// send buffer until the notification arrives instead (closedZCOwed,
+// holdZCPastBackstop). Nothing but the peer decides how long that is: a peer
+// that keeps reading, however slowly, keeps the orphaned socket alive. So the
+// hold is kept off this queue's walk, keeps the array alone once the SEND_ZC
+// is all that is owed, shows in the CloseZCNotifHeldNow/Bytes gauges, and
+// stops the worker arming new SEND_ZCs while it holds zcHoldBytesMax (see
+// zc_send_buffer.go). It never costs a descriptor.
 //
 // 5 s is comfortably above any plausible straggler window: TCP
 // retransmits begin at RTO_MIN = 200 ms and a 4 KiB POST tail
@@ -512,8 +517,9 @@ type Worker struct {
 	// "s.allocCount != s.nelems" span-corruption (v1.4.15/7beebb9, both bench runs). Neither is
 	// race-detectable because the writer is the kernel, not Go code.
 	// releaseAtNanos is only the anomaly backstop — see
-	// pendingReleaseHoldNanos, which also says why it never releases a
-	// connState whose send buffer a SEND_ZC may still read (celeris#812).
+	// pendingReleaseHoldNanos, which also says why it never gives up a
+	// send buffer a SEND_ZC may still read (celeris#812), and holds it off
+	// this queue instead (zcHolds).
 	pendingRelease []pendingReleaseEntry
 	// closeFDOwed counts the pendingRelease entries that still hold their
 	// descriptor open (holdsFD, celeris#685). The worker does not park
@@ -541,9 +547,16 @@ type Worker struct {
 	// releases all colliding conns only after every expected terminal
 	// CQE arrived (errs toward holding longer; see closedOpsEntry).
 	closedOps map[uint64]*closedOpsEntry
-	// zcHolds, zcHoldCount and zcHoldBytes: STUB (celeris#813 round 2,
-	// failing-first commit), declared so the tests compile; the next commit
-	// fills them.
+	// zcHolds are the send buffers the pendingRelease backstop holds past
+	// its deadline for a SEND_ZC still owed on them (celeris#812), keyed by
+	// the closed identity (connOpKey) whose CQEs settle them
+	// (settleZCHolds, from noteStaleTerminalOp). Kept off pendingRelease,
+	// which the loop walks every pass, because a hold lasts as long as the
+	// peer keeps its orphaned socket alive (see zc_send_buffer.go).
+	// zcHoldCount and zcHoldBytes are what they hold: the worker's share of
+	// the held-now gauges, and zcHoldBytes is what prepSendSQE checks
+	// against zcHoldBytesMax. Worker thread only; nil/zero whenever nothing
+	// is held.
 	zcHolds     map[uint64][]zcHold
 	zcHoldCount int
 	zcHoldBytes int
@@ -1820,7 +1833,9 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 // SEND_ZC's only where the identity holds one conn, whose one send in flight
 // it is. Under an (fd, generation) collision only a notification ends a hold:
 // holding late costs memory, releasing early sends a peer another
-// connection's bytes.
+// connection's bytes. Whatever the CQE changed, the send buffers held for the
+// identity past the backstop are then settled (settleZCHolds): the lookup
+// that costs is paid only while some hold exists.
 func (w *Worker) noteStaleTerminalOp(ud uint64, namedFD bool) {
 	if len(w.closedOps) == 0 {
 		return
@@ -1837,11 +1852,18 @@ func (w *Worker) noteStaleTerminalOp(ud uint64, namedFD bool) {
 	if ud&udMask == udSend && e.zcOwed > 0 && (!namedFD || len(e.conns) == 1) {
 		e.zcOwed--
 	}
+	if len(w.zcHolds) > 0 {
+		w.settleZCHolds(key, e)
+	}
 	if e.inflight > 0 {
 		return
 	}
 	for _, cs := range e.conns {
-		cs.kernelInflight = 0
+		// nil: a conn whose SEND_ZC hold released it and kept its array
+		// alone (releaseHeldConnState); the pool may have handed it on.
+		if cs != nil {
+			cs.kernelInflight = 0
+		}
 	}
 	delete(w.closedOps, key)
 }
@@ -4418,8 +4440,9 @@ func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 // use-after-free against an unbounded leak, and scrub the conn from
 // closedOps so a later CQE cannot touch the released memory. The one
 // exception is an entry that still owes a SEND_ZC (celeris#812,
-// closedZCOwed): it is held past the backstop until the notification
-// arrives, see pendingReleaseHoldNanos.
+// closedZCOwed): its send buffer is held past the backstop until the
+// notification arrives, off this walk (Worker.zcHolds), see
+// pendingReleaseHoldNanos.
 //
 // Detached entries skip the pool recycle (releaseConnState would
 // reset fields that goroutine closures may still observe via the
@@ -4449,12 +4472,12 @@ func (w *Worker) drainPendingRelease() {
 				continue
 			}
 			// Past the backstop. A SEND_ZC the kernel may still read
-			// cs.sendBuf for is no anomaly (celeris#812): the entry stays
-			// until that op's notification, and the backstop gives up only
-			// the descriptor, as it always has (holdZCPastBackstop).
+			// cs.sendBuf for is no anomaly (celeris#812): the send buffer is
+			// held, off this walk, until that op's notification, and the
+			// backstop gives up only the descriptor, as it always has
+			// (holdZCPastBackstop).
 			if w.closedZCOwed(cs) {
 				w.holdZCPastBackstop(entry)
-				kept = append(kept, *entry)
 				continue
 			}
 			// Backstop: kernel anomaly, not normal flow.
@@ -5803,7 +5826,11 @@ func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	// classifier reads cs.sendIsZC, never w.sendZC, because the fallbacks
 	// clear w.sendZC while sends armed under it are still in flight
 	// (celeris#609).
-	cs.sendIsZC = useSendZC(w.sendZC, linked, len(cs.sendBuf))
+	//
+	// A worker holding zcHoldBytesMax of send buffers past the release
+	// backstop arms no new SEND_ZC until those holds end: that is what bounds
+	// them (celeris#812, see zc_send_buffer.go).
+	cs.sendIsZC = useSendZC(w.sendZC && w.zcHoldBytes < zcHoldBytesMax, linked, len(cs.sendBuf))
 	if cs.sendIsZC {
 		// celeris#591 exposure witnesses. Deliberately inside the ZC arm:
 		// every sub-sendZCMinBytes and every linked send — the per-request
