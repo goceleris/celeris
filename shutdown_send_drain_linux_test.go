@@ -26,19 +26,23 @@ import (
 // its sends first (celeris#595) and std drains through net/http.
 //
 // The client has a 64 KiB receive buffer and starts reading readDelay after
-// the handler returns, which is 200 ms into the shutdown, so the loop is
+// the handler returns, which is 200 ms into the shutdown, well past the
+// drain's 250 ms floor, so the loop is
 // certain to reach its shutdown with most of the 3 MiB still queued. The
 // shutdown's budget is 30 s, so a drain bounded by it has all the time it
-// needs; a drain that closes at once cuts the body short every time. Both
-// ways of shutting down (a direct Shutdown and a cancel of StartWithContext's
-// context) and both kinds of route (the handler on the worker, and on a
-// dispatch goroutine) are covered. io_uring is not: its own drain (celeris#595)
+// needs; a drain that closes at once cuts the body short every time. The
+// ways of shutting down are a direct Shutdown with that budget, a direct
+// Shutdown(context.Background()), whose ctx has no deadline at all (net/http's
+// "wait as long as it takes", which the drain first took for no budget and
+// gave its 250 ms floor), and a cancel of StartWithContext's context; both
+// kinds of route (the handler on the worker, and on a dispatch goroutine) are
+// covered. io_uring is not: its own drain (celeris#595)
 // gives up after 250 ms whatever the budget, before this client reads, and
 // whether the tail survives then depends on what the kernel has taken
 // (celeris#806).
 func TestShutdownSendsTheWholeResponse(t *testing.T) {
 	const size = 3 << 20
-	const readDelay = time.Second
+	const readDelay = 500 * time.Millisecond
 	body := make([]byte, size)
 	for i := range body {
 		body[i] = byte(i*7 + i>>13)
@@ -48,12 +52,12 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 		eng  celeris.EngineType
 	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"adaptive", celeris.Adaptive}} {
 		for _, route := range []string{"sync", "async-route"} {
-			for _, mode := range []string{"Shutdown", "cancel"} {
+			for _, mode := range []string{"Shutdown", "Shutdown-background", "cancel"} {
 				t.Run(e.name+"/"+route+"/"+mode, func(t *testing.T) {
 					desc := e.name + "/" + route + "/" + mode
 					entered := make(chan struct{})
 					release := make(chan struct{})
-					srv := startServer760(t, e.eng, 30*time.Second, func(s *celeris.Server) {
+					srv := startServer760(t, e.eng, 30*time.Second, 0, func(s *celeris.Server) {
 						r := s.GET("/big", func(c *celeris.Context) error {
 							close(entered)
 							<-release
@@ -93,7 +97,12 @@ func TestShutdownSendsTheWholeResponse(t *testing.T) {
 // that never reads must not hold epoll's shutdown past its budget. The drain
 // gives up when the shutdown's budget runs out, never before 250 ms
 // (io_uring's bound, celeris#595), and the Start call returns within bound of
-// the budget. io_uring is not asserted: its own drain returns about 10 s late
+// the budget. A ctx with no deadline bounds the drain by its cancel
+// ("Shutdown-withcancel", cancelled budget into the shutdown), and, when
+// nothing cancels it (context.Background()), by the config's WriteTimeout,
+// the bound a live conn's stalled write gets ("Shutdown-background", with
+// WriteTimeout = budget): a client that never reads cannot hold that Shutdown
+// for ever. io_uring is not asserted: its own drain returns about 10 s late
 // with a stalled send whatever the budget (celeris#806). std's handler writes
 // the response itself and blocks in that write; net/http's WriteTimeout is
 // its bound.
@@ -103,17 +112,21 @@ func TestShutdownSendDrainIsBounded(t *testing.T) {
 	// native engines queue it whole (celeris#761 is a different defect).
 	const size = 3 << 20
 	const budget = 500 * time.Millisecond
-	const bound = 5 * time.Second
+	const bound = time.Second
 	body := make([]byte, size)
 	for _, e := range []struct {
 		name string
 		eng  celeris.EngineType
 	}{{"epoll", celeris.Epoll}, {"adaptive", celeris.Adaptive}} {
-		for _, mode := range []string{"Shutdown", "cancel"} {
+		for _, mode := range []string{"Shutdown", "Shutdown-withcancel", "Shutdown-background", "cancel"} {
 			t.Run(e.name+"/"+mode, func(t *testing.T) {
 				desc := e.name + "/" + mode
 				served := make(chan struct{})
-				srv := startServer760(t, e.eng, budget, func(s *celeris.Server) {
+				var writeTimeout time.Duration
+				if mode == "Shutdown-background" {
+					writeTimeout = budget
+				}
+				srv := startServer760(t, e.eng, budget, writeTimeout, func(s *celeris.Server) {
 					s.GET("/big", func(c *celeris.Context) error {
 						defer close(served) // native engines: the body is queued, not written, here
 						return c.Blob(http.StatusOK, "application/octet-stream", body)
@@ -156,13 +169,14 @@ type server760 struct {
 }
 
 // startServer760 starts a server with routes on StartWithContext, with
-// ShutdownTimeout budget, and waits until it answers /ping. An io_uring start
+// ShutdownTimeout budget (and WriteTimeout writeTimeout, 0 for the default),
+// and waits until it answers /ping. An io_uring start
 // that fails only with ENOMEM is retried, with a new server, for up to 30 s:
 // the kernel charges ring memory to RLIMIT_MEMLOCK per UID and gives it back
 // some milliseconds after a ring closes, so at the CI runner's 8 MiB a start
 // made right after the previous server stopped can fail although nothing
 // leaked (see startC714DetachServer).
-func startServer760(t *testing.T, eng celeris.EngineType, budget time.Duration, routes func(*celeris.Server)) *server760 {
+func startServer760(t *testing.T, eng celeris.EngineType, budget, writeTimeout time.Duration, routes func(*celeris.Server)) *server760 {
 	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
@@ -172,7 +186,7 @@ func startServer760(t *testing.T, eng celeris.EngineType, budget time.Duration, 
 		}
 		addr := ln.Addr().String()
 		_ = ln.Close()
-		s := celeris.New(celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget})
+		s := celeris.New(celeris.Config{Engine: eng, Addr: addr, ShutdownTimeout: budget, WriteTimeout: writeTimeout})
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		routes(s)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -228,9 +242,11 @@ func waitReady760(addr string, startDone <-chan error) error {
 }
 
 // beginShutdown starts the shutdown: a direct Shutdown with a budget of its
-// own, or a cancel of StartWithContext's context (whose budget is the
-// server's ShutdownTimeout). The returned channel carries the direct
-// Shutdown's error; it is nil for a cancel.
+// own ("Shutdown"), a direct Shutdown whose ctx has no deadline, never
+// cancelled ("Shutdown-background") or cancelled budget into the shutdown
+// ("Shutdown-withcancel"), or a cancel of StartWithContext's context (whose
+// budget is the server's ShutdownTimeout). The returned channel carries the
+// direct Shutdown's error; it is nil for a cancel.
 func (srv *server760) beginShutdown(mode string, budget time.Duration) chan error {
 	if mode == "cancel" {
 		srv.cancel()
@@ -238,7 +254,17 @@ func (srv *server760) beginShutdown(mode string, budget time.Duration) chan erro
 	}
 	ch := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		var ctx context.Context
+		var cancel context.CancelFunc
+		switch mode {
+		case "Shutdown-background":
+			ctx, cancel = context.Background(), func() {}
+		case "Shutdown-withcancel":
+			ctx, cancel = context.WithCancel(context.Background())
+			time.AfterFunc(budget, cancel)
+		default:
+			ctx, cancel = context.WithTimeout(context.Background(), budget)
+		}
 		defer cancel()
 		ch <- srv.s.Shutdown(ctx)
 	}()

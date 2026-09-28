@@ -531,9 +531,10 @@ func (s *Server) cancelListen() {
 // run while such a handler is still running, and on the native engines its
 // response is lost (celeris#759). Once the handlers have returned, the native
 // engines send what the sockets have not taken yet before they close the
-// connections: epoll (and adaptive while it runs epoll) until ctx's deadline,
-// and never for less than 250 ms (celeris#760); io_uring for 250 ms
-// (celeris#806).
+// connections: epoll (and adaptive while it runs epoll) while ctx is live,
+// until its deadline or, for a ctx without one such as context.Background(),
+// until it is done, but no longer than [Config.WriteTimeout], and never for
+// less than 250 ms (celeris#760); io_uring for 250 ms (celeris#806).
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the

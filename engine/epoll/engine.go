@@ -219,11 +219,13 @@ func (e *Engine) Listen(ctx context.Context) error {
 //
 // What Shutdown does is hand ctx to the loops as the budget of that send
 // drain (celeris#760): a response larger than the socket buffers is sent
-// until ctx's deadline, and never for less than shutdownSendDrainFloor,
-// before its conn is closed. Server.Shutdown calls it before it cancels
-// Listen's context, and a cancel of StartWithContext's context reaches
-// the loops first but the watcher's Shutdown follows at once, within the
-// drain's floor.
+// while ctx is live, until its deadline or, for a ctx without one, until it
+// is done, but no longer than the config's WriteTimeout, and never for less
+// than shutdownSendDrainFloor, before its conn is closed (see
+// Loop.sendDrainWait). Server.Shutdown calls it before it cancels Listen's
+// context, and a cancel of StartWithContext's context reaches the loops
+// first but the watcher's Shutdown follows at once, within the drain's
+// floor.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	e.drainBudget.Store(&ctx)
 	return nil

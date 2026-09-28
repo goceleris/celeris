@@ -3539,12 +3539,10 @@ func (l *Loop) shutdown() {
 
 // drainSends is shutdown's send drain (celeris#760). It flushes every live
 // conn with response bytes still queued, and waits for their sockets to take
-// more, until nothing is queued or the drain's time is up: the later of
-// shutdownSendDrainFloor after it began and the deadline of the budget the
-// last Engine.Shutdown call handed over (drainBudget), or, before that
-// deadline, the moment that budget's ctx is done. A conn whose write fails
-// is left to phase 3's close. The run loop is no longer turning: the conns
-// are polled directly (poll(2), POLLOUT), not through the epoll set.
+// more, until nothing is queued or the drain's time is up (sendDrainWait). A
+// conn whose write fails is left to phase 3's close. The run loop is no
+// longer turning: the conns are polled directly (poll(2), POLLOUT), not
+// through the epoll set.
 //
 // Loop thread, after phase 2: no dispatch goroutine is left to write, and a
 // detached conn's middleware finds detachClosed set by phase 1 and writes
@@ -3589,21 +3587,35 @@ func (l *Loop) drainSends() {
 }
 
 // sendDrainWait reports how long drainSends may wait for a writable socket
-// now, at most shutdownSendDrainPoll, and false once the drain's time is up
-// (see drainSends).
+// now, at most shutdownSendDrainPoll, and false once the drain's time is up.
+//
+// The drain, begun at start, runs while the budget the last Engine.Shutdown
+// call handed over (drainBudget) is live: until its ctx's deadline, and for
+// a ctx with none (context.Background, a WithCancel ctx: net/http's "wait as
+// long as it takes") until the ctx is done. Either way no longer than
+// WriteTimeout after the drain began, when that is set: the bound a live
+// conn's stalled write gets, and net/http's, so a client that never reads
+// cannot hold Shutdown(context.Background()) for ever. It never ends before
+// shutdownSendDrainFloor, which is also all it gets once the budget is done
+// (at its deadline, or cancelled before it) or when no Shutdown handed one
+// over.
 func (l *Loop) sendDrainWait(start time.Time) (time.Duration, bool) {
-	now := time.Now()
 	end := start.Add(shutdownSendDrainFloor)
 	if l.drainBudget != nil {
-		// A budget that is done, at its deadline or by a cancel before it,
-		// leaves the floor.
 		if p := l.drainBudget.Load(); p != nil && (*p).Err() == nil {
-			if d, has := (*p).Deadline(); has && d.After(end) {
-				end = d
+			ext, bounded := (*p).Deadline()
+			if wt := l.cfg.WriteTimeout; wt > 0 && (!bounded || start.Add(wt).Before(ext)) {
+				ext, bounded = start.Add(wt), true
+			}
+			if !bounded {
+				return shutdownSendDrainPoll, true // until the budget is done
+			}
+			if ext.After(end) {
+				end = ext
 			}
 		}
 	}
-	left := end.Sub(now)
+	left := time.Until(end)
 	if left <= 0 {
 		return 0, false
 	}
