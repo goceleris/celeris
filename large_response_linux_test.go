@@ -38,6 +38,13 @@ import (
 // A client that stops receiving bytes for idleCap761 fails its case, so a
 // dropped body fails in seconds, not at a timeout.
 
+// lean761 reports a run under the race detector or with coverage, where the
+// large-response tests move their largest bodies at a quarter or half the
+// size: CI runs the root package both ways, within one -timeout, and pays for
+// every byte several times over there. The sizes around the 4 MiB threshold
+// are the same in every run; the full sizes run without -race.
+func lean761() bool { return raceOn761 || testing.CoverMode() != "" }
+
 // idleCap761 is how long a client waits for the next byte before it calls the
 // response lost: loopback delivers a 64 MiB body in well under a second even
 // under -race, and a dropped body never sends one more byte.
@@ -66,10 +73,10 @@ func bodies761(sizes ...int) map[int][]byte {
 // connection and then for /ping on the same connection (the framing must
 // still be intact), and once more with Connection: close, where the body must
 // be followed by EOF. The sizes straddle the old threshold, which was the cap
-// minus the header block, so 4 MiB - 1 failed too. The 64 MiB body is asked
-// for on a keep-alive connection only: the close path is the same as for the
-// sizes around 4 MiB, which already overrun the socket buffers, and CI's
-// -race runner pays for every 64 MiB transfer.
+// minus the header block, so 4 MiB - 1 failed too. The largest body, 64 MiB
+// (16 MiB under lean761), is asked for on a keep-alive connection only: the
+// close path is the same as for the sizes around 4 MiB, which already overrun
+// the socket buffers.
 //
 // "sync" runs the handler on the connection's worker, where epoll and
 // io_uring hand a large body to the engine as a zero-copy slice (the write
@@ -78,7 +85,11 @@ func bodies761(sizes ...int) map[int][]byte {
 // copied into the write buffer. "async-route" runs the handler on the
 // connection's dispatch goroutine.
 func TestLargeResponseIsDelivered(t *testing.T) {
-	sizes := []int{4<<20 - 1, 4 << 20, 4<<20 + 1, 64 << 20}
+	largest := 64 << 20
+	if lean761() {
+		largest = 16 << 20
+	}
+	sizes := []int{4<<20 - 1, 4 << 20, 4<<20 + 1, largest}
 	bodies := bodies761(sizes...)
 	shapes := []struct {
 		name                    string
@@ -106,7 +117,7 @@ func TestLargeResponseIsDelivered(t *testing.T) {
 				})
 				for _, n := range sizes {
 					for _, keepAlive := range []bool{true, false} {
-						if n == 64<<20 && !keepAlive {
+						if n == largest && !keepAlive {
 							continue
 						}
 						mode := "keep-alive"
@@ -130,6 +141,9 @@ func TestLargeResponseIsDelivered(t *testing.T) {
 // written like a Blob.
 func TestLargeFileResponseIsDelivered(t *testing.T) {
 	sizes := []int{4<<20 + 1, 16 << 20}
+	if lean761() {
+		sizes[1] = 8 << 20
+	}
 	bodies := bodies761(sizes...)
 	dir := t.TempDir()
 	for _, n := range sizes {
@@ -163,12 +177,15 @@ func TestLargeFileResponseIsDelivered(t *testing.T) {
 // knowledge). net/http's client opens a 4 MiB stream window, so a larger body
 // leaves up to 4 MiB of frames queued behind the socket: io_uring's check
 // after the handler closed the connection on that backlog, at exactly 4 MiB.
-// The largest body is 16 MiB, not 64 MiB: an HTTP/2 transfer on the native
-// engines is about ten times slower than on std under -race (celeris#809),
-// and the four windows it spans cover what the 4 MiB cut and a 4 MiB cap on
-// HTTP/2 conns could do to it.
+// The largest body is 16 MiB (8 MiB under lean761), not 64 MiB: an HTTP/2
+// transfer on the native engines is about ten times slower than on std under
+// -race (celeris#809), and the windows it spans cover what the 4 MiB cut and
+// a 4 MiB cap on HTTP/2 conns could do to it.
 func TestLargeResponseIsDeliveredH2(t *testing.T) {
 	sizes := []int{4<<20 + 1, 16 << 20}
+	if lean761() {
+		sizes[1] = 8 << 20
+	}
 	bodies := bodies761(sizes...)
 	for _, e := range engines761 {
 		for _, route := range []string{"sync", "async-route"} {

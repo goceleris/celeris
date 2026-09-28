@@ -162,10 +162,13 @@ func TestPipelinedResponsesOwnTheirBodies(t *testing.T) {
 // connection's handler.
 func TestConcurrentResponsesOwnTheirBodies(t *testing.T) {
 	const (
-		size   = 16 << 10
-		conns  = 16
-		rounds = 4
+		size  = 16 << 10
+		conns = 16
 	)
+	rounds := 4
+	if lean761() {
+		rounds = 2
+	}
 	fill := bytes.Repeat([]byte("f"), 2<<20)
 	for _, e := range engines761 {
 		for _, mode := range []string{"direct", "behind-a-large-body"} {
