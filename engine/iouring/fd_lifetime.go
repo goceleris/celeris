@@ -545,8 +545,10 @@ const shutdownFDDrainNanos int64 = int64(250 * time.Millisecond)
 // It waits for the ops that name a descriptor, not for SEND_ZC
 // notifications (celeris#798, see fdOps): a stalled peer can hold one for as
 // long as the socket is open, far past this bound. A live connection's
-// SEND_ZC that completes during the drain is recorded as handleSend records
-// it (zcSendCompleted), so its notification is not waited for either.
+// SEND_ZC whose first CQE the drain reads names the descriptor no more
+// either; handleSend, which records that in zcNotifPending, does not run
+// here, so the drain keeps its own note (zcDone) and changes nothing on the
+// connection, which the dispatch goroutine may still read.
 func (w *Worker) endOwedOpsAtShutdown() {
 	var owed []*connState
 	for _, fd := range w.liveConns {
@@ -556,9 +558,18 @@ func (w *Worker) endOwedOpsAtShutdown() {
 		}
 		owed = append(owed, cs)
 	}
+	var zcDone map[*connState]bool
+	// named is fdOwed for the drain: fdOps, less a SEND_ZC it saw complete.
+	named := func(cs *connState) bool {
+		n := fdOps(cs)
+		if zcDone[cs] {
+			n--
+		}
+		return n > 0
+	}
 	pending := func() bool {
 		for _, cs := range owed {
-			if fdOps(cs) > 0 {
+			if named(cs) {
 				return true
 			}
 		}
@@ -587,12 +598,16 @@ func (w *Worker) endOwedOpsAtShutdown() {
 				case udRecv, udSend:
 					fd := int(ud & fdMask)
 					// A live connection's SEND_ZC completing (F_MORE marks
-					// only that on a send): record it as the loop does, or
-					// its notification would be waited for as an op on the
-					// descriptor. A closed one's is counted by staleConnCQE.
+					// only that on a send; a connection has one send in
+					// flight at most): noted, or its notification would be
+					// waited for as an op on the descriptor. A closed
+					// identity's is counted by staleConnCQE.
 					if ud&udMask == udSend && cqeHasMore(c.Flags) && fd < len(w.conns) {
-						if cs := w.conns[fd]; cs != nil && cs.generation == decodeGen(ud) {
-							zcSendCompleted(cs, c.Res)
+						if cs := w.conns[fd]; cs != nil && cs.generation == decodeGen(ud) && !cs.zcNotifPending {
+							if zcDone == nil {
+								zcDone = make(map[*connState]bool)
+							}
+							zcDone[cs] = true
 						}
 					}
 					w.staleConnCQE(c, fd, ud)

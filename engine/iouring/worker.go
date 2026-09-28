@@ -3445,30 +3445,6 @@ func (w *Worker) respondAndArm(cs *connState, fd int, c *completionEntry, link, 
 	}
 }
 
-// zcSendCompleted records a SEND_ZC's first completion (IORING_CQE_F_MORE):
-// the send is done and its result waits for the notification, which is when
-// the kernel lets go of cs.sendBuf. From here the op names no descriptor, so
-// fdOps stops counting it (celeris#798). handleSend calls it, and so does
-// worker shutdown's drain (endOwedOpsAtShutdown), which dispatches no
-// completion to handleSend. Worker thread only.
-func zcSendCompleted(cs *connState, res int32) {
-	// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
-	// the dispatch goroutine under detachMu; mutate them under the lock.
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
-	if res < 0 {
-		cs.sending = false
-		cs.zcNotifPending = true
-		cs.zcSentBytes = res // store negative for error path on NOTIF
-		return
-	}
-	cs.zcNotifPending = true
-	cs.zcSentBytes = res
-	// sending stays true until NOTIF completes the cycle.
-}
-
 func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	cs := w.conns[fd]
 	if cs == nil {
@@ -3527,7 +3503,21 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// process (celeris#519). F_MORE on a udSend completion is set by the
 	// kernel only for SEND_ZC, so it is the accurate test.
 	if cqeHasMore(c.Flags) {
-		zcSendCompleted(cs, c.Res)
+		// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
+		// the dispatch goroutine under detachMu; mutate them under the lock.
+		if mu := cs.detachMu; mu != nil {
+			mu.Lock()
+			defer mu.Unlock()
+		}
+		if c.Res < 0 {
+			cs.sending = false
+			cs.zcNotifPending = true
+			cs.zcSentBytes = c.Res // store negative for error path on NOTIF
+			return
+		}
+		cs.zcNotifPending = true
+		cs.zcSentBytes = c.Res
+		// sending stays true until NOTIF completes the cycle.
 		return
 	}
 
