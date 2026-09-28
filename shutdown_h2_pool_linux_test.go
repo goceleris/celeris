@@ -316,8 +316,10 @@ func describeH2ReadEnd759(err error) string {
 
 // frames759 reads frames from fr until the connection ends, idle passes
 // without one, or on returns true, answering SETTINGS and PING and handing
-// every frame to on; it returns how the read ended.
-func frames759(c net.Conn, fr *http2.Framer, idle time.Duration, on func(http2.Frame) bool) string {
+// every frame to on; it returns how the read ended. Its writes take wmu, which
+// a caller writing on fr from another goroutine holds too (a Framer is not
+// safe for concurrent writes).
+func frames759(c net.Conn, fr *http2.Framer, wmu *sync.Mutex, idle time.Duration, on func(http2.Frame) bool) string {
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(idle))
 		f, err := fr.ReadFrame()
@@ -327,11 +329,15 @@ func frames759(c net.Conn, fr *http2.Framer, idle time.Duration, on func(http2.F
 		switch f := f.(type) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
+				wmu.Lock()
 				_ = fr.WriteSettingsAck()
+				wmu.Unlock()
 			}
 		case *http2.PingFrame:
 			if !f.IsAck() {
+				wmu.Lock()
 				_ = fr.WritePing(true, f.Data)
+				wmu.Unlock()
 			}
 		}
 		if on(f) {
@@ -372,7 +378,9 @@ func TestShutdownAcceptsNoNewConnection(t *testing.T) {
 				t.Fatal("the held handler did not start within 5s")
 			}
 			heldDone := make(chan string, 1)
-			go func() { heldDone <- frames759(c, fr, 10*time.Second, func(http2.Frame) bool { return false }) }()
+			go func() {
+				heldDone <- frames759(c, fr, new(sync.Mutex), 10*time.Second, func(http2.Frame) bool { return false })
+			}()
 			srv.beginShutdown("Shutdown", 5*time.Second)
 			time.Sleep(300 * time.Millisecond)
 			h1 := tryH1Ping759(srv.addr)
@@ -427,7 +435,7 @@ func tryH2cPing759(addr string) string {
 	}
 	_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true})
 	res := ""
-	end := frames759(c, fr, time.Second, func(f http2.Frame) bool {
+	end := frames759(c, fr, new(sync.Mutex), time.Second, func(f http2.Frame) bool {
 		switch f := f.(type) {
 		case *http2.HeadersFrame:
 			if f.StreamID == 1 {
@@ -484,7 +492,7 @@ func TestShutdownRefusesStreamsAfterGoAway(t *testing.T) {
 			rst := map[uint32]http2.ErrCode{}
 			sent := false
 			var releaseOnce sync.Once
-			end := frames759(c, fr, 5*time.Second, func(f http2.Frame) bool {
+			end := frames759(c, fr, new(sync.Mutex), 5*time.Second, func(f http2.Frame) bool {
 				switch f := f.(type) {
 				case *http2.GoAwayFrame:
 					events = append(events, "GOAWAY(last="+strconv.Itoa(int(f.LastStreamID))+")")
@@ -554,9 +562,10 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 				writeH2Get759(t, fr, 1, "/big")
 				n, ended := 0, false
 				var events []string
+				var wmu sync.Mutex
 				done := make(chan string, 1)
 				go func() {
-					done <- frames759(c, fr, 5*time.Second, func(f http2.Frame) bool {
+					done <- frames759(c, fr, &wmu, 5*time.Second, func(f http2.Frame) bool {
 						switch f := f.(type) {
 						case *http2.GoAwayFrame:
 							events = append(events, "GOAWAY")
@@ -587,8 +596,10 @@ func TestShutdownWaitsForFlowControlledH2Response(t *testing.T) {
 					close(release)
 				}
 				time.Sleep(time.Until(start.Add(400 * time.Millisecond)))
+				wmu.Lock()
 				_ = fr.WriteWindowUpdate(0, size)
 				_ = fr.WriteWindowUpdate(1, size)
+				wmu.Unlock()
 				end := <-done
 				srv.waitStart(t, 10*time.Second)
 				if n != size || !ended {
