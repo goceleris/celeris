@@ -1128,11 +1128,13 @@ jobs:
       # With a SEND_ZC's notification owed, the kernel was still sending the
       # unsent tail from that array to a peer that had stopped reading, and the
       # array's next owner overwrote it: the peer got another connection's
-      # bytes. The backstop now holds such a connection until the notification,
-      # and worker shutdown keeps the buffers the ring closes on. Both arches,
-      # by name, at the runner's own 8 MiB memlock (the pages SEND_ZC pins
-      # count against it), -race, three runs, with a tally: every run of each
-      # of the twenty-one cases must PASS, with no FAIL and no SKIP line. A SKIP
+      # bytes. The backstop now holds such a send buffer until the notification,
+      # off the release walk, keeping the array alone, in gauges, and with no
+      # new SEND_ZC armed while a worker holds 16 MiB; worker shutdown keeps the
+      # buffers the ring closes on. Both arches, by name, at the runner's own
+      # 8 MiB memlock (the pages SEND_ZC pins count against it), -race, three
+      # runs, with a tally: every run of each of the ten tests and their
+      # twenty-four cases must PASS, with no FAIL and no SKIP line. A SKIP
       # would mean the runner gave the engine no working SEND_ZC.
       - name: celeris#812 a SEND_ZC's send buffer outlives the release backstop (both arches, skipping forbidden)
         if: ${{ !cancelled() }}
@@ -1142,10 +1144,10 @@ jobs:
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestBackstopHoldsASendBufferAZCNotificationStillReads|TestBackstopCountsItsZCHolds|TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline|TestClosedOpsCountsTheZCSendApart|TestDroppingAnIdentityWithAZCOwedIsCounted|TestShutdownRetainsSendBuffersAZCMayStillRead'
+          names='TestBackstopHoldsASendBufferAZCNotificationStillReads|TestBackstopCountsItsZCHolds|TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline|TestClosedOpsCountsTheZCSendApart|TestDroppingAnIdentityWithAZCOwedIsCounted|TestShutdownRetainsSendBuffersAZCMayStillRead|TestZCHoldIsOffTheReleaseWalk|TestZCHoldKeepsOnlyTheSendBuffer|TestZCHoldCoversACollidingSibling|TestSendZCStopsWhileHeldBuffersReachTheCap'
           runs=3
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
-          wantsub=$(( 21 * runs ))
+          wantsub=$(( 24 * runs ))
           go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
             ./engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
           grep -E 'celeris812 ' /tmp/zc812.log || true
