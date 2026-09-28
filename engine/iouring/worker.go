@@ -3479,6 +3479,15 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	if cs == nil {
 		return
 	}
+	// The completion is applied under detachMu when the conn has one: the
+	// dispatch goroutine and a detached conn's guarded writeFn read the send
+	// state under it. Every branch below releases it. When the goroutine
+	// holds it across a handler, the completion is held instead
+	// (celeris#750); see holdOrLockSend.
+	mu := cs.detachMu
+	if mu != nil && !w.holdOrLockSend(cs, c) {
+		return
+	}
 
 	// SEND_ZC notification CQE: the NIC has finished DMA-reading the buffer.
 	// Now safe to modify/reuse sendBuf. Process the deferred result.
@@ -3488,28 +3497,23 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		w.zc.noteNotif()
 		validation.IouringSendZCNotifs.Add(1)
 		// zcNotifPending is read by the inline-egress guard on the dispatch
-		// goroutine under detachMu; clear it under the lock (completeSend
-		// re-acquires detachMu, so release first).
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-			// celeris#591: the NOTIF is the instant the guard reopens. If
-			// writeBuf already holds queued bytes, the very next inline
-			// unix.Write is admitted against data the worker has not yet
-			// flushed — the ordering celeris#587 exercises. Read under
-			// detachMu, the same lock the dispatch goroutine writes it
-			// under, so this witness is not itself a race.
-			if len(cs.writeBuf) > 0 {
-				validation.IouringZCCompletionWithPendingWrite.Add(1)
-			}
-			cs.zcNotifPending = false
-			mu.Unlock()
-		} else {
-			if len(cs.writeBuf) > 0 {
-				validation.IouringZCCompletionWithPendingWrite.Add(1)
-			}
-			cs.zcNotifPending = false
+		// goroutine under detachMu, which is held here.
+		//
+		// celeris#591: the NOTIF is the instant the guard reopens. If
+		// writeBuf already holds queued bytes, the very next inline
+		// unix.Write is admitted against data the worker has not yet
+		// flushed — the ordering celeris#587 exercises. Read under
+		// detachMu, the same lock the dispatch goroutine writes it
+		// under, so this witness is not itself a race.
+		if len(cs.writeBuf) > 0 {
+			validation.IouringZCCompletionWithPendingWrite.Add(1)
 		}
-		if w.completeSend(cs, fd, int(cs.zcSentBytes), now, true) {
+		cs.zcNotifPending = false
+		closeAfter := w.completeSend(cs, fd, int(cs.zcSentBytes), now, true)
+		if mu != nil {
+			mu.Unlock()
+		}
+		if closeAfter {
 			w.closeConn(fd)
 		}
 		return
@@ -3533,9 +3537,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// kernel only for SEND_ZC, so it is the accurate test.
 	if cqeHasMore(c.Flags) {
 		// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
-		// the dispatch goroutine under detachMu; mutate them under the lock.
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
+		// the dispatch goroutine under detachMu; mutate them under the lock
+		// (held).
+		if mu != nil {
 			defer mu.Unlock()
 		}
 		if c.Res < 0 {
@@ -3574,12 +3578,8 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	if cs.sendIsZC && (c.Res == -int32(unix.EINVAL) || c.Res == -int32(unix.ENOMEM)) {
 		w.retireSendZC(-c.Res, "SEND_ZC unavailable, falling back to regular SEND")
 		// cs.sending is read by the inline-egress guard under detachMu; clear it
-		// and re-flush under the lock (flushSend for a detached conn is always
-		// called under detachMu, as in the dirty-flush loop).
-		mu := cs.detachMu
-		if mu != nil {
-			mu.Lock()
-		}
+		// and re-flush under the lock (held; flushSend for a detached conn is
+		// always called under detachMu, as in the dirty-flush loop).
 		cs.sending = false
 		if w.flushSend(cs) {
 			w.markDirty(cs)
@@ -3598,12 +3598,9 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		// nothing at all.
 		w.errs.SendFailed(unix.Errno(-c.Res))
 		// cs.sending / cs.sendBuf are read by the inline-egress guard under
-		// detachMu; reset them (and writeBuf) inside the lock rather than before
-		// it, so the dispatch-goroutine read never races this error completion.
-		mu := cs.detachMu
-		if mu != nil {
-			mu.Lock()
-		}
+		// detachMu; reset them (and writeBuf) inside the lock (held) rather than
+		// before it, so the dispatch-goroutine read never races this error
+		// completion.
 		cs.sending = false
 		cs.sendBuf = cs.sendBuf[:0]
 		cs.writeBuf = cs.writeBuf[:0]
@@ -3621,8 +3618,72 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 		return
 	}
 
-	if w.completeSend(cs, fd, int(c.Res), now, cs.sendIsZC) {
+	closeAfter := w.completeSend(cs, fd, int(c.Res), now, cs.sendIsZC)
+	if mu != nil {
+		mu.Unlock()
+	}
+	if closeAfter {
 		w.closeConn(fd)
+	}
+}
+
+// holdOrLockSend takes cs.detachMu for send completion c and reports true,
+// or holds c on cs (heldSends) and reports false. Worker thread.
+//
+// The dispatch goroutine holds detachMu across ProcessH1, i.e. for as long as
+// the user handler runs, and a blocking Lock here parked the LockOSThread'd
+// worker, and every connection of its ring, until the handler returned
+// (celeris#750, the fifth site of the celeris#704 class). The common shape is
+// a pipelining client: the rest of a response goes out as a ring SEND, and
+// the next request's handler is running when the client reads it. The
+// completion cannot be skipped, since its result must be applied, so it is
+// held, and the goroutine owes the conn back (relinkOwed, set in the same
+// asyncInMu section by dispatchBusy); replayHeldSends applies it then.
+//
+// A completion is also held, whatever the lock, while an earlier one of the
+// conn is: they are applied in arrival order (a SEND_ZC's notification after
+// its first completion). When the goroutine is parked or gone, whoever holds
+// the lock holds it for one write, and waiting for it is bounded, as it
+// always was; see dispatchBusy.
+func (w *Worker) holdOrLockSend(cs *connState, c *completionEntry) bool {
+	if len(cs.heldSends) == 0 {
+		if cs.detachMu.TryLock() {
+			return true
+		}
+		if !dispatchBusy(cs, &cs.relinkOwed) {
+			cs.detachMu.Lock()
+			return true
+		}
+	}
+	cs.heldSends = append(cs.heldSends, *c)
+	return false
+}
+
+// replayHeldSends applies cs's held send completions (celeris#750) through
+// handleSend, in arrival order. It runs on the worker thread wherever the
+// conn is next acted on: drainDetachQueue, for the dispatch goroutine's
+// hand-back (any entry of the conn), and closeConn, so that a close deferred
+// behind cs.sending never waits for a completion that has already arrived.
+// If the goroutine holds detachMu across a handler again, handleSend holds
+// that completion again, and every later one behind it, and the hand-back is
+// owed again. The CQE dispatch's post-send hand-off attempt (tryTransplant)
+// is not repeated: a conn whose goroutine lives is that goroutine's to claim,
+// and a claimed one is finished by the drain entry this runs from.
+func (w *Worker) replayHeldSends(cs *connState) {
+	fd := cs.fd
+	held := cs.heldSends
+	// A completion held again is appended to the front of held's array, at
+	// an index no later than the one being applied: the loop has read it.
+	cs.heldSends = held[:0]
+	for i := range held {
+		c := held[i]
+		// A conn that left its slot since (its completions were dispatched
+		// for it) has nothing left to apply them to.
+		if fd < 0 || fd >= len(w.conns) || w.conns[fd] != cs || decodeGen(c.UserData) != cs.generation {
+			cs.heldSends = cs.heldSends[:0]
+			return
+		}
+		w.handleSend(&c, fd, w.cachedNow)
 	}
 }
 
@@ -3660,15 +3721,16 @@ func (w *Worker) retireSendZC(errno int32, msg string) {
 // exists, otherwise the goroutine read races the event-loop write —
 // observed via -race in TestNativeEngineLargePayload/io_uring.
 // Reports whether the CALLER must close the connection. closeConn takes
-// cs.detachMu, and this function holds that same lock for its whole body;
-// sync.Mutex is not reentrant, so closing inline wedges the worker thread
+// cs.detachMu, and this function runs under that same lock (its caller,
+// handleSend, holds it for the whole body); sync.Mutex is not reentrant, so
+// closing inline wedges the worker thread
 // against itself -- and with it the entire event loop: no CQE is processed,
 // the detach queue is never drained (so every WebSocket recv-pause the
 // middleware asked to lift stays paused), no timeout sweep runs, and
 // graceful shutdown never completes. Releasing the lock early instead is
 // NOT the fix: it opens the window the lock exists to close, and measurably
 // corrupts streams (protoErr 0 -> 47 on the celeris#519 reproduction). The
-// caller closes once the deferred unlock has run.
+// caller closes once it has released the lock.
 //
 // A multi-worker engine only loses the one worker to this, so its
 // connections hang while the others keep serving; on a single-worker engine
@@ -3679,16 +3741,13 @@ func (w *Worker) retireSendZC(errno int32, msg string) {
 // and the plain-SEND call site passes cs.sendIsZC, the provenance recorded
 // when that SQE was armed. Never w.sendZC (celeris#609).
 func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC bool) (closeAfter bool) {
-	// Take the lock up-front for detached connections so the entire state
-	// mutation (cs.sending clear / sendBuf truncate / writeBuf reset / OnError
-	// fire) is serialized against the goroutine writeFn path. The inline-egress
-	// fast path (the initProtocol guarded closure) reads cs.sending under
-	// detachMu to decide whether a ring SEND is in-flight, so the clear MUST be
-	// inside the lock — otherwise that read races this completion.
-	if mu := cs.detachMu; mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
+	// The caller (handleSend) holds detachMu for detached and async
+	// connections, so the entire state mutation (cs.sending clear / sendBuf
+	// truncate / writeBuf reset / OnError fire) is serialized against the
+	// goroutine writeFn path. The inline-egress fast path (the initProtocol
+	// guarded closure) reads cs.sending under detachMu to decide whether a
+	// ring SEND is in-flight, so the clear MUST be inside the lock — otherwise
+	// that read races this completion.
 	cs.sending = false
 	// celeris#607 witness. cs.recvLinked is cleared only when the chained
 	// recv's own CQE is processed, and that recv cannot run before this
@@ -3800,8 +3859,8 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	} else {
 		cs.sendBuf = cs.sendBuf[:0]
 	}
-	// detachMu (if any) is held by the deferred unlock at the top of
-	// the function — no per-branch Unlock needed below.
+	// detachMu (if any) is held by the caller for the whole function — no
+	// per-branch Unlock needed below.
 	if cs.closing && len(cs.sendBuf) == 0 && len(cs.writeBuf) == 0 {
 		w.finishCloseAny(fd, cs)
 		return
@@ -3824,7 +3883,7 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	}
 
 	// Re-send remainder or flush new data. Only markDirty on SQ ring full.
-	// detachMu (if any) is held by the deferred unlock at the top.
+	// detachMu (if any) is held by the caller.
 	if w.flushSend(cs) {
 		w.markDirty(cs)
 	}
@@ -3847,6 +3906,18 @@ func (w *Worker) closeConn(fd int) {
 	cs := w.conns[fd]
 	if cs == nil {
 		return
+	}
+	// A send completion held for the dispatch goroutine (celeris#750) is
+	// applied first: the close below defers itself behind cs.sending, and
+	// the completion that would end that wait has already arrived. If the
+	// goroutine still holds detachMu across a handler, it stays held, and so
+	// does the close (closeOwed, below).
+	if len(cs.heldSends) > 0 {
+		closing := cs.closing
+		w.replayHeldSends(cs)
+		if w.conns[fd] != cs || cs.closing != closing {
+			return // the completion closed it, or deferred its close
+		}
 	}
 	detached := cs.detachMu != nil
 	if detached {
@@ -5138,6 +5209,12 @@ func (w *Worker) drainDetachQueue() {
 	w.detachQPending.Store(0)
 	w.detachQMu.Unlock()
 	for _, cs := range w.detachQSpare {
+		// The dispatch goroutine's hand-back of send completions held while
+		// its handler ran (celeris#750): applied before anything else acts
+		// on the conn, whichever entry this is.
+		if len(cs.heldSends) > 0 {
+			w.replayHeldSends(cs)
+		}
 		if cs.detachClosed {
 			continue
 		}
@@ -5389,6 +5466,23 @@ func (w *Worker) removeDirty(cs *connState) {
 func (w *Worker) flushDirty() {
 	for cs := w.dirtyHead; cs != nil; {
 		next := cs.dirtyNext
+		if len(cs.heldSends) > 0 {
+			// A send completion of this conn is held for its dispatch
+			// goroutine (celeris#750), so cs.sending (or zcNotifPending)
+			// stays set, and nothing is sent or armed for the conn until the
+			// goroutine's hand-back applies the completion; the hand-back
+			// puts the conn on this list again (drainDetachQueue). Kept
+			// listed until then, it held the ring at a zero wait, a spin,
+			// for as long as the handler ran, where a blocking Lock had
+			// parked the worker. Give it up, as the celeris#704 give-up
+			// below does. Here rather than where the completion is held:
+			// the hand-back's own entry lists the conn again when the
+			// goroutine is already in its next handler and the completion
+			// is held again.
+			w.removeDirty(cs)
+			cs = next
+			continue
+		}
 		if cs.sending {
 			// celeris#607 witness. The retry below is gated on the
 			// send, so a connection that is owed a recv arm and has a

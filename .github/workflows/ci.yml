@@ -947,7 +947,8 @@ jobs:
       #   2. CELERIS_IOURING_SEND_ZC=off: every process PASS with every ZC
       #      witness at 0 (the witnesses track SEND_ZC, not traffic), no race;
       #   3. the MUTANT (.github/scripts/mutant-587-unlock-zc-first-cqe.py
-      #      deletes the detachMu acquire in handleSend's CQE_F_MORE branch):
+      #      releases detachMu before the writes of handleSend's CQE_F_MORE
+      #      branch):
       #      EVERY process FAIL, and every process with its own
       #      "WARNING: DATA RACE" report and "race detected during execution
       #      of test" line. A process that fails for any other reason does
