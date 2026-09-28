@@ -445,6 +445,45 @@ jobs:
       - name: middleware/otel
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/otel
+      # celeris#720, #732: Adapt must hand net/http the request headers, and
+      # Adapt, adapters.WrapMiddleware and the metrics, otel and logger
+      # middleware must hand net/http, Prometheus, the OTel SDK and slog
+      # copies of the request strings those keep, not views of the
+      # connection's receive buffer. The steps above run these packages, but
+      # without -v, and each of these tests drops its io_uring arms without a
+      # word when the probe finds no ring, which happens while another test
+      # binary's rings are still being freed. So they run here by name, one
+      # package at a time, with CELERIS_REQUIRE_IOURING_WORKERS=1 turning a
+      # missing io_uring arm into a failure, and an exact tally: the seven
+      # top-level tests and all 35 arms (std, and epoll and io_uring with sync
+      # and async handlers; 14 of them io_uring) must PASS, with no SKIP line,
+      # and every go test must exit 0. A failing test does not stop the step
+      # early, and the step runs even when a step above failed.
+      - name: celeris#720, #732 request strings handed to net/http, Prometheus, OTel, slog (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c732.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^(TestAdaptRequestCarriesHeaders|TestAdaptKeptRequestStringsSurviveNextRequest)$' . 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestWrapMiddlewareKeptStringsSurviveNextRequest$' ./middleware/adapters/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestKeptRecordSurvivesNextRequest$' ./middleware/logger/ 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          (cd middleware/metrics && go test -race -count=1 -timeout=300s -v -run '^(TestLabelValuesSurviveNextRequest|TestLabelValuesSurviveConnectionReuse)$' .) 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^TestAttributesSurviveNextRequest$' .) 2>&1 | tee -a /tmp/c732.log || failed=$((failed + 1))
+          tests='TestAdaptRequestCarriesHeaders|TestAdaptKeptRequestStringsSurviveNextRequest|TestWrapMiddlewareKeptStringsSurviveNextRequest|TestKeptRecordSurvivesNextRequest|TestLabelValuesSurviveNextRequest|TestLabelValuesSurviveConnectionReuse|TestAttributesSurviveNextRequest'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c732.log || true)
+          arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c732.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/io_uring" /tmp/c732.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c732.log || true)
+          echo "celeris#720/#732 tests: top-level PASS $top (want 7), arm PASS $arms (want 35), io_uring arm PASS $uring (want 14), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 7 ] || [ "$arms" -ne 35 ] || [ "$uring" -ne 14 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all seven tests and all 35 arms (14 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
       - name: middleware/protobuf
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/protobuf
@@ -457,16 +496,34 @@ jobs:
       # engine, no io_uring ring -- so unlike the `adaptive` and `iouring` jobs
       # this needs nothing raised and has no environment skip to forbid.
       #
+      # celeris#706: the step also runs the tests of the server-start helpers
+      # (`^TestStartNativeServer`, `^TestWaitForReady`), which the backpressure
+      # tests use, in ./middleware/websocket and in ./middleware/static, which
+      # has its own copy of waitForReady: a Start that fails must fail the
+      # helper at once with Start's error. They start no engine (the engine
+      # type is one no factory knows), so they too have no environment skip.
+      #
+      # It first compiles the package's tests under the celeris_closeprobe
+      # tag, which no other step builds: a helper of that file shared a name
+      # with one celeris#671 added, and the tagged build stayed broken
+      # unnoticed.
+      #
       # `-run` is a regex over test names, so a rename would quietly select
       # nothing and go test would still exit 0 ("no tests to run"). The tally
-      # below is the interlock, as in the `iouring` job: exactly these six
-      # regression tests must report PASS at the top level -- the two
+      # below is the interlock, as in the `iouring` job: exactly these
+      # fourteen PASS lines must be reported at the top level -- the two
       # celeris#667 orderings, the celeris#672 stale pause, the pausedMu
       # panic release, SetPauser's ordering with the worker (reported only
-      # under -race, which this step runs), and the WakeFD lock order
-      # (celeris#666) -- and so must each of the ten subtests of the stale
-      # pause, the panic release and the lock order, so a capacity, a callback
-      # site or an interleaving dropped from a sweep turns the step red too.
+      # under -race, which this step runs), the WakeFD lock order
+      # (celeris#666), the two celeris#705 late-spill orders, the close that
+      # must not overtake chunks appended before it and the spilled chunk
+      # that must request the pause (both from the celeris#705 review), the
+      # re-check's spill guard (celeris#716), and the celeris#706 start-helper
+      # tests, TestWaitForReadyFailsFastOnStartError once per package -- and
+      # so must each of the fifteen subtests of the stale pause, the panic
+      # release, the lock order, the late spill and the close, so a capacity,
+      # a callback site or an interleaving dropped from a sweep turns the step
+      # red too.
       # A SKIP cannot satisfy it, because a skipped test prints
       # `--- SKIP`, never `--- PASS`. PASS lines carry the elapsed time after
       # the name, so the pattern ends at ` (`, never at the name.
@@ -483,18 +540,21 @@ jobs:
           WS484_BURST_FRAMES: "1000"
         run: |
           set -o pipefail
+          go vet -tags celeris_closeprobe ./middleware/websocket/
           go test -race -count=1 -timeout=300s -v \
-            -run '^(TestBackpressure|TestChanReader)' \
-            ./middleware/websocket/... 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu'
-          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)'
-          want=6
-          wantsub=10
+            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady)' \
+            ./middleware/websocket/... ./middleware/static/ 2>&1 | tee /tmp/ws667.log
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError'
+          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)|TestChanReaderSpillPublishedAfterDrain/(read-after-publication|closed-before-read|read-waiting-in-window)|TestChanReaderCloseKeepsChunksAppendedBeforeIt/(retried-into-channel|spilled-behind-full-channel)'
+          # 13 names; TestWaitForReadyFailsFastOnStartError passes once in
+          # each package.
+          want=14
+          wantsub=15
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)
-          echo "celeris#667/#672 regression tests: want $want, passed $passed; subtests want $wantsub, passed $subpassed"
+          echo "websocket/static regression tests (celeris#667/#672/#705/#706): want $want, passed $passed; subtests want $wantsub, passed $subpassed"
           if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ]; then
-            echo "expected exactly $want celeris#667/#672 regression tests and $wantsub of their subtests to PASS"
+            echo "expected exactly $want PASS lines of the websocket and static regression tests and $wantsub of their subtests"
             echo "-- was one renamed or removed, did a sweep lose a case, or did one skip or fail?"
             exit 1
           fi

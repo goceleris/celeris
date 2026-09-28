@@ -427,7 +427,7 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 						}
 						break
 					}
-					if readerPaused(ws) {
+					if connReaderPaused(ws) {
 						tm.pauseSeen = true
 						break
 					}
@@ -486,7 +486,7 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 					tm.spilled = r.Spilled()
 					tm.chDepth = len(r.ch)
 					tm.spillLen = int(r.spillLen.Load())
-					tm.pausedState = readerPaused(ws)
+					tm.pausedState = connReaderPaused(ws)
 					tm.highWater = r.highWater
 				}
 			}
@@ -890,7 +890,11 @@ func waitClientOutq(c net.Conn, within time.Duration) bool {
 	}
 }
 
-func readerPaused(ws *Conn) bool {
+// connReaderPaused is engineread_test.go's readerPaused for a Conn: the
+// reader's own view of the backpressure state, false when ws has no engine
+// reader. (It shared readerPaused's name until celeris#671 added that one, and
+// this package's tests stopped compiling under the celeris_closeprobe tag.)
+func connReaderPaused(ws *Conn) bool {
 	if ws == nil || ws.engineReader == nil {
 		return false
 	}
