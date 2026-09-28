@@ -333,10 +333,10 @@ func TestPausedWorkerWithABusyConnectionIsNotTimedOut(t *testing.T) {
 // What keeps every worker from parking is a registered driver connection on
 // each (the park waits for hasDriverConns to clear), not idle keep-alive
 // holders: ReadTimeout closed a worker's holders during the wait whenever its
-// checkTimeouts came due, and that worker parked (3 of 13 runs at unl). A driver
-// connection is not in liveConns, so no timeout touches it, and while idle it
-// completes nothing: the worker waits out 1 s ring waits on a clock it does
-// not refresh, as it did with the holders.
+// checkTimeouts came due, and that worker parked, a failed premise seen with
+// two workers. A driver connection is not in liveConns, so no timeout touches
+// it, and while idle it completes nothing: the worker waits out 1 s ring waits
+// on a clock it does not refresh, as it did with the holders.
 func TestAdoptOntoADrainingWorkerIsNotTimedOut(t *testing.T) {
 	e, _ := startParkEngine713(t, fdlHandler{}, func(c *resource.Config) {
 		c.DisableDeferAccept = true
