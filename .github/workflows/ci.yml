@@ -599,6 +599,34 @@ jobs:
             echo "expected all four tests and all 20 arms (8 of them io_uring) to PASS with no SKIP line"
             exit 1
           fi
+      # celeris#733: the request strings a hijacking handler keeps must not
+      # read another connection's bytes. The root race step above runs
+      # without -v, where the io_uring arm of TestHijackKeepsRequestViews
+      # drops out, and the multishot test skips, without a word when the
+      # probe finds no ring or no multishot receive. So both run here by
+      # name with CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact tally: the
+      # two top-level tests and the four arms (std, epoll, epoll-async,
+      # io_uring) must PASS, with no SKIP line, and go test must exit 0.
+      - name: celeris#733 hijacked request strings (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          tests='TestHijackKeepsRequestViews|TestHijackCopiesRequestValuesUnderMultishotRecv'
+          go test -race -count=1 -timeout=300s -v -run "^(${tests})\$" . 2>&1 | tee /tmp/c733.log || failed=1
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c733.log || true)
+          arms=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/" /tmp/c733.log || true)
+          uring=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/io_uring" /tmp/c733.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c733.log || true)
+          echo "celeris#733 tests: top-level PASS $top (want 2), arm PASS $arms (want 4), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
+          if [ "$top" -ne 2 ] || [ "$arms" -ne 4 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected both tests and all four arms (one io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)

@@ -2403,6 +2403,17 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	// generation-tagged user_data and defer the pool release until the
 	// terminal CQE arrives, exactly like finishClose.
 	//
+	// Then drop cs instead of recycling it (celeris#733): the request's
+	// strings are views of cs.buf (or of cs.detectAccum, when the request
+	// began in an earlier recv), and a hijacking handler typically keeps
+	// the path, params and headers for the goroutine that serves the
+	// connection. Recycled, cs would hand those buffers to the next
+	// connection this worker accepts, which would receive its request into
+	// them. The detached release holds cs until the kernel is done with
+	// cs.buf and then leaves it to the garbage collector, which frees the
+	// buffers once the last view of them is gone. The cost is one connState
+	// allocation per hijack.
+	//
 	// celeris#685 hijack witness and hold, validation builds only: count a
 	// hijack with an op still owed on the socket (kernelInflight > 0), and
 	// hold the worker thread before it returns, and so before its next
@@ -2415,7 +2426,7 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
-	w.queuePendingRelease(cs)
+	w.queuePendingReleaseDetached(cs)
 	// The fd-lifetime rule, hijack variant (celeris#685). The socket lives
 	// on under the hijacker's net.Conn, so no op of this worker may read it
 	// once the hijacker has it, and none may resolve the original number,
