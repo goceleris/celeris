@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -304,5 +305,358 @@ func TestShutdownEndsOwedOpsBeforeClosing(t *testing.T) {
 	}
 	if m.CloseFDForced != 0 {
 		t.Fatalf("CloseFDForced = %d, want 0", m.CloseFDForced)
+	}
+}
+
+// The SEND_ZC half of the rule (celeris#798). A SEND_ZC completes in two
+// CQEs: the send's result (IORING_CQE_F_MORE), then a notification once the
+// kernel has let go of the send buffer's pages. The notification names no
+// descriptor, so no op can resolve the number through it; it guards the send
+// buffer, which the connState holds. But a peer that stops reading keeps the
+// unsent part of the send queued, and the notification with it, for as long
+// as the socket is open, and keeping the descriptor keeps the socket open. A
+// close that counted the notification as an op owed on the descriptor kept
+// it until the 5 s release backstop forced it (CloseFDForced, which must
+// stay 0), and worker shutdown waited out its whole drain bound for it.
+
+// zcReleaseBound is how soon after the close the descriptor must be closed
+// when all that holds the connection is a SEND_ZC notification and ops that
+// end at the close's cancel and shutdown. The rule closes it at the close
+// itself when no owed op names it, and otherwise at the drainPendingRelease
+// of the first loop pass that reads the last naming op's terminal CQE (a
+// cancelled recv) or the send's first CQE: one pass, and a pass here waits
+// at most 10 ms for completions. 200 ms leaves 20 passes of headroom for
+// -race on a 4-CPU container, and is 25 times shorter than the 5 s backstop
+// (pendingReleaseHoldNanos) the descriptor was held to.
+const zcReleaseBound = 200 * time.Millisecond
+
+// zcShutdownBound is the same for worker shutdown's drain: with only a
+// notification owed it does not drain at all, and with the send's first CQE
+// already in the ring it stops at the first pass, which returns at once.
+// Held for the notification, the drain ran its whole 250 ms bound
+// (shutdownFDDrainNanos); 100 ms sits well between the two.
+const zcShutdownBound = 100 * time.Millisecond
+
+// zcPayload is the send: 64 KiB, far over sendZCMinBytes (so it goes out as
+// SEND_ZC) and over what a peer with a 4 KiB receive buffer can take, so what
+// the send queued past the peer's window stays in the server's send queue and
+// holds the notification. Small enough that the pages SEND_ZC charges to
+// RLIMIT_MEMLOCK fit the CI unit job's 8 MiB next to the test ring.
+const zcPayload = 64 << 10
+
+// newZCCloseWorker is newOwedCloseWorker over loopback TCP, with SEND_ZC on
+// as the engine turns it on: the startup probe must find it functional, and
+// CELERIS_IOURING_SEND_ZC=on then enables it (resolveSendZCPolicy); a kernel
+// where the engine never sends zero-copy cannot reach the case. The peer has
+// a 4 KiB receive buffer, set before the connect so that the window it
+// advertises is small from the first segment, and reads nothing until
+// drainZCPeer.
+func newZCCloseWorker(t *testing.T) (*Worker, *connState, int) {
+	t.Helper()
+	res, reason := probeSendZCCached()
+	if on, _ := resolveSendZCPolicy(res == SendZCTrueZeroCopy || res == SendZCCopyFallback, "on"); !on {
+		t.Skipf("the engine does not turn SEND_ZC on here (probe: %v %s)", res, reason)
+	}
+	ring := newTestRing(t)
+	lfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("listen socket: %v", err)
+	}
+	defer func() { _ = unix.Close(lfd) }()
+	if err := unix.Bind(lfd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if err := unix.Listen(lfd, 1); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	sa, err := unix.Getsockname(lfd)
+	if err != nil {
+		t.Fatalf("getsockname: %v", err)
+	}
+	peer, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("peer socket: %v", err)
+	}
+	if err := unix.SetsockoptInt(peer, unix.SOL_SOCKET, unix.SO_RCVBUF, 4096); err != nil {
+		_ = unix.Close(peer)
+		t.Fatalf("SO_RCVBUF: %v", err)
+	}
+	if err := unix.Connect(peer, sa); err != nil {
+		_ = unix.Close(peer)
+		t.Fatalf("connect: %v", err)
+	}
+	local, _, err := unix.Accept4(lfd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+	if err != nil {
+		_ = unix.Close(peer)
+		t.Fatalf("accept: %v", err)
+	}
+	localTarget := fdTarget(local)
+	t.Cleanup(func() {
+		_ = unix.Close(peer)
+		if fdTarget(local) == localTarget {
+			_ = unix.Close(local)
+		}
+	})
+	w := &Worker{
+		ring:        ring,
+		conns:       make([]*connState, local+1),
+		liveConns:   make([]int, 0, 4),
+		errs:        &errclass.Counters{},
+		activeConns: &atomic.Int64{},
+		closeCount:  &atomic.Uint64{},
+		recvArm:     &recvArmStats{},
+		handoffLoss: &handoffLossStats{},
+		sendZC:      true,
+	}
+	w.cachedNow = time.Now().UnixNano()
+	cs := &connState{
+		fd:         local,
+		liveIdx:    -1,
+		generation: 13,
+		buf:        make([]byte, 4096),
+		h1State:    conn.NewH1State(),
+		detected:   true,
+	}
+	cs.protocol.Store(int32(engine.HTTP1))
+	w.conns[local] = cs
+	w.addLiveConn(cs)
+	w.connCount = 1
+	w.activeConns.Add(1)
+	return w, cs, peer
+}
+
+// startZCSend places one SEND_ZC of zcPayload bytes on cs, submits it, and
+// returns what it sent once its first CQE (the send's result, F_MORE) is in
+// the completion ring. With reap it then dispatches that CQE as the loop does
+// (staleConnCQE, then handleSend, which records zcNotifPending); without, it
+// leaves it there unread, as a close that runs before the loop reads it finds
+// it. Either way the notification must still be owed 100 ms later, with the
+// peer reading nothing, or the case did not form.
+func startZCSend(t *testing.T, w *Worker, cs *connState, reap bool) int32 {
+	t.Helper()
+	payload := make([]byte, zcPayload)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	cs.writeBuf = payload
+	if w.flushSend(cs) || !cs.sendIsZC || cs.kernelInflight != 1 {
+		t.Fatalf("no SEND_ZC placed: sendIsZC=%v kernelInflight=%d", cs.sendIsZC, cs.kernelInflight)
+	}
+	if _, err := w.ring.Submit(); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	var c *completionEntry
+	for end := time.Now().Add(2 * time.Second); c == nil; {
+		if head, tail := w.ring.BeginCQ(); head != tail {
+			c = w.ring.cqeAt(head)
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatal("no completion for the SEND_ZC within 2s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if c.UserData&udMask != udSend || !cqeHasMore(c.Flags) || c.Res <= 0 {
+		t.Fatalf("first completion ud=%#x flags=%#x res=%d, want the SEND_ZC's result (F_MORE, res > 0)", c.UserData, c.Flags, c.Res)
+	}
+	sent := c.Res
+	if reap {
+		head, _ := w.ring.BeginCQ()
+		if !w.staleConnCQE(c, cs.fd, c.UserData) {
+			w.handleSend(c, cs.fd, time.Now().UnixNano())
+		}
+		w.ring.EndCQ(head + 1)
+		if !cs.zcNotifPending || !cs.sending || cs.kernelInflight != 1 {
+			t.Fatalf("after the first CQE: zcNotifPending=%v sending=%v kernelInflight=%d, want true true 1", cs.zcNotifPending, cs.sending, cs.kernelInflight)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	want := uint32(1)
+	if reap {
+		want = 0
+	}
+	if head, tail := w.ring.BeginCQ(); tail-head != want {
+		t.Fatalf("%d completions in the ring 100 ms after the send, want %d: the notification arrived with the peer "+
+			"reading nothing (sent %d of %d), so the case did not form", tail-head, want, sent, zcPayload)
+	}
+	return sent
+}
+
+// sweepClose closes fd as a connection with a send still owed is closed:
+// closeConn defers it (cs.closing), and the closing-drain sweep in
+// checkTimeouts reaps it once the peer has read nothing for
+// closingDrainTimeoutNanos. The sweep's two calls, without the 5 s wait.
+func sweepClose(t *testing.T, w *Worker, cs *connState) {
+	t.Helper()
+	fd := cs.fd
+	w.closeConn(fd)
+	if w.conns[fd] != cs || !cs.closing {
+		t.Fatalf("closeConn did not defer the close of a conn with a send owed: registered=%v closing=%v", w.conns[fd] == cs, cs.closing)
+	}
+	w.removeDirty(cs)
+	w.finishCloseAny(fd, cs)
+	if w.conns[fd] != nil {
+		t.Fatal("the conn is still registered after the sweep's close")
+	}
+}
+
+// drainZCPeer lets the peer read everything to EOF while the loop runs, and
+// reports what it read and whether the notification arrived (cs's last op
+// retired while cs was still queued for release) before cs was released.
+func drainZCPeer(t *testing.T, w *Worker, cs *connState, peer int) (got int, eof, notified bool) {
+	t.Helper()
+	if err := unix.SetNonblock(peer, true); err != nil {
+		t.Fatalf("peer nonblock: %v", err)
+	}
+	buf := make([]byte, 64<<10)
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); {
+		for !eof {
+			n, err := unix.Read(peer, buf)
+			if n > 0 {
+				got += n
+				continue
+			}
+			if n == 0 && err == nil {
+				eof = true
+			}
+			break
+		}
+		runRingOnce(t, w, 5*time.Millisecond)
+		if len(w.pendingRelease) == 1 && w.pendingRelease[0].cs == cs && cs.kernelInflight == 0 {
+			notified = true
+		}
+		w.cachedNow = time.Now().UnixNano()
+		w.drainPendingRelease()
+		if eof && len(w.pendingRelease) == 0 {
+			break
+		}
+	}
+	return got, eof, notified
+}
+
+// TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed is celeris#798 on the
+// close paths. A connection sent a SEND_ZC to a peer that stopped reading, so
+// the notification stays owed, and was closed by the closing-drain sweep:
+//
+//   - notif-only: the send's first CQE was read; nothing else is owed. No
+//     op names the descriptor, so it must be closed at the close.
+//   - recv-and-notif: a recv was armed after the send too (the keep-alive
+//     path arms one behind every unlinked send). The descriptor is kept for
+//     the recv, which the close's cancel and shutdown end at once, and must
+//     then be closed although the notification is still owed.
+//   - send-done-after-close: the send's first CQE was in the ring, unread,
+//     when the close ran, so the close kept the descriptor for the send. The
+//     CQE says the send is done, and the descriptor must then be closed.
+//
+// In each, the descriptor must be closed within zcReleaseBound of the close
+// and CloseFDForced must stay 0. The send buffer must not go with it: the
+// connState, whose sendBuf the kernel may still read, must stay queued until
+// the notification arrives (here, once the peer has read everything), and
+// be released then, by the notification and not by the backstop.
+func TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		reap, recv bool
+	}{
+		{"notif-only", true, false},
+		{"recv-and-notif", true, true},
+		{"send-done-after-close", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			w, cs, peer := newZCCloseWorker(t)
+			fd := cs.fd
+			target := fdTarget(fd)
+			sent := startZCSend(t, w, cs, tc.reap)
+			if tc.recv {
+				if !w.prepareRecv(cs, cs.buf) || cs.kernelInflight != 2 {
+					t.Fatalf("recv not placed: kernelInflight=%d", cs.kernelInflight)
+				}
+				if res := runRingOnce(t, w, 10*time.Millisecond); len(res) != 0 {
+					t.Fatalf("the recv completed before the close (%v): the peer sent nothing", res)
+				}
+			}
+			closedAt := time.Now()
+			sweepClose(t, w, cs)
+			var releasedAfter time.Duration
+			for {
+				if fdTarget(fd) != target {
+					releasedAfter = time.Since(closedAt)
+					break
+				}
+				if time.Since(closedAt) > 6*time.Second {
+					t.Fatalf("fd %d still open 6s after the close", fd)
+				}
+				runRingOnce(t, w, 10*time.Millisecond)
+				w.cachedNow = time.Now().UnixNano()
+				w.drainPendingRelease()
+			}
+			forced := w.handoffLoss.closeFDForced.Load()
+			t.Logf("celeris798 close case=%s sent=%d released_after=%v close_fd_forced=%d", tc.name, sent, releasedAfter.Round(time.Microsecond), forced)
+			if releasedAfter > zcReleaseBound || forced != 0 {
+				t.Fatalf("fd %d was closed %v after the close (bound %v) with CloseFDForced=%d: a pending SEND_ZC "+
+					"notification, which names no descriptor, held it", fd, releasedAfter, zcReleaseBound, forced)
+			}
+			if w.closeFDOwed != 0 {
+				t.Fatalf("closeFDOwed=%d after the descriptor was closed, want 0", w.closeFDOwed)
+			}
+			// The send buffer: cs stays queued, holding sendBuf, while the
+			// notification is owed, however often the release runs.
+			for end := time.Now().Add(100 * time.Millisecond); time.Now().Before(end); {
+				runRingOnce(t, w, 10*time.Millisecond)
+				w.cachedNow = time.Now().UnixNano()
+				w.drainPendingRelease()
+			}
+			if len(w.pendingRelease) != 1 || w.pendingRelease[0].cs != cs || w.pendingRelease[0].holdsFD || cs.kernelInflight == 0 || cs.fd != fd {
+				t.Fatalf("with the notification still owed the connState must stay queued for release without "+
+					"its descriptor: pendingRelease=%+v kernelInflight=%d", w.pendingRelease, cs.kernelInflight)
+			}
+			got, eof, notified := drainZCPeer(t, w, cs, peer)
+			t.Logf("celeris798 close case=%s peer_got=%d eof=%v notified=%v released=%v", tc.name, got, eof, notified, len(w.pendingRelease) == 0)
+			if !eof || got != int(sent) {
+				t.Fatalf("the peer read %d bytes (EOF %v), want the %d the send completed with and then EOF", got, eof, sent)
+			}
+			if !notified || len(w.pendingRelease) != 0 {
+				t.Fatalf("the connState was not released at the notification: notified=%v pendingRelease=%d", notified, len(w.pendingRelease))
+			}
+			if forced := w.handoffLoss.closeFDForced.Load(); forced != 0 {
+				t.Fatalf("CloseFDForced = %d, want 0", forced)
+			}
+		})
+	}
+}
+
+// TestShutdownDoesNotWaitForAZCNotification is celeris#798 at worker
+// shutdown: endOwedOpsAtShutdown waits for the ops that name a live
+// connection's descriptor, and a SEND_ZC notification names none. With the
+// notification owed after the send's first CQE was read (notif-pending), or
+// with that CQE still in the ring when the drain starts
+// (send-done-during-drain), the drain must end within zcShutdownBound rather
+// than run out its 250 ms bound.
+func TestShutdownDoesNotWaitForAZCNotification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		reap bool
+	}{
+		{"notif-pending", true},
+		{"send-done-during-drain", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			w, cs, _ := newZCCloseWorker(t)
+			sent := startZCSend(t, w, cs, tc.reap)
+			start := time.Now()
+			w.endOwedOpsAtShutdown()
+			took := time.Since(start)
+			t.Logf("celeris798 shutdown case=%s sent=%d took=%v kernelInflight_after=%d zcNotifPending_after=%v", tc.name, sent, took.Round(time.Microsecond), cs.kernelInflight, cs.zcNotifPending)
+			if took > zcShutdownBound {
+				t.Fatalf("endOwedOpsAtShutdown took %v (bound %v) with only a SEND_ZC notification owed", took, zcShutdownBound)
+			}
+			if w.closeFDOwed != 0 {
+				t.Fatalf("closeFDOwed=%d after shutdown's drain, want 0", w.closeFDOwed)
+			}
+		})
 	}
 }
