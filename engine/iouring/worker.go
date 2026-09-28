@@ -211,7 +211,18 @@ type closedOpsEntry struct {
 	// (TestClosedOpsEntryStaysThirtyTwoBytes). 32-bit platforms have no
 	// padding there, and the entry grows from 16 to 20 bytes.
 	handoff bool
-	conns   []*connState
+	// fdOps is the part of inflight that still names the descriptor
+	// (celeris#798): all of it but the SEND_ZC notifications whose send has
+	// completed. noteClosedInflight adds each conn's fdOps; staleConnCQE
+	// takes one off at a recv's or a plain send's terminal CQE and at a
+	// SEND_ZC's first CQE, and none at its notification. closedFDNamed
+	// reads it, so a close that kept its descriptor lets go of it once only
+	// notifications are owed, while the connState waits for inflight. A
+	// conn owes two such ops at most (a recv and a send), so int16 is ample
+	// even under a collision; it sits in the same padding as handoff, and
+	// the entry keeps its size on every platform.
+	fdOps int16
+	conns []*connState
 }
 
 // pendingReleaseHoldNanos is the WALL-CLOCK BACKSTOP for releasing a
@@ -1633,13 +1644,16 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			// with its recv still kernel-armed), so its own close can
 			// skip the cancel and release early — the UAF class this
 			// accounting exists to prevent. Reachability is narrow: a
-			// close path keeps the number allocated until the closed
-			// conn's last owed op has delivered its terminal CQE
-			// (celeris#685), so on this worker the number cannot be
-			// re-occupied while such a CQE is still to come; the window
-			// needs the pendingRelease backstop to have closed a number
-			// with an op still owed (CloseFDForced, must stay 0) ON TOP of
-			// the gen collision. When it fires, the closed conn's
+			// close path keeps the number allocated until the last op
+			// that names it has ended (celeris#685), so on this worker the
+			// number cannot be re-occupied while a recv or send CQE of the
+			// closed conn is still to come. Only a SEND_ZC notification
+			// can be (celeris#798: it names no descriptor, and a stalled
+			// peer holds it), which leaves this window where it was
+			// before celeris#685 for that one CQE; any other needs the
+			// pendingRelease backstop to have closed a number with an op
+			// still owed (CloseFDForced, must stay 0). Either way the
+			// gen collision comes ON TOP. When it fires, the closed conn's
 			// closedOps entry is left orphaned and the 5 s backstop WARN
 			// in drainPendingRelease is the production signal.
 			if cs.kernelInflight > 0 {
@@ -1662,7 +1676,13 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 		}
 	}
 	if terminalOp {
-		w.noteStaleTerminalOp(ud)
+		// A notification ends an op that named no descriptor any more
+		// (celeris#798); every other terminal CQE ends one that did.
+		w.noteStaleTerminalOp(ud, !cqeIsNotif(c.Flags))
+	} else if op == udSend {
+		// F_MORE on a send is a SEND_ZC's first CQE: the send is done, so it
+		// names the descriptor no more, and its notification is still owed.
+		w.noteStaleSendCompleted(ud)
 	}
 	if cqeHasBuffer(c.Flags) && w.bufRing != nil {
 		w.bufRing.PushBuffer(cqeBufferID(c.Flags))
@@ -1676,7 +1696,9 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 // CQE's (fd, generation) identity, releasing them for drainPendingRelease
 // once the kernel owes them nothing. No-op when the identity is unknown
 // (conn closed with zero in-flight ops, or already backstop-released).
-func (w *Worker) noteStaleTerminalOp(ud uint64) {
+// namedFD says whether the op still named the descriptor until this CQE
+// (closedOpsEntry.fdOps): false only for a SEND_ZC notification.
+func (w *Worker) noteStaleTerminalOp(ud uint64, namedFD bool) {
 	if len(w.closedOps) == 0 {
 		return
 	}
@@ -1686,6 +1708,9 @@ func (w *Worker) noteStaleTerminalOp(ud uint64) {
 		return
 	}
 	e.inflight--
+	if namedFD && e.fdOps > 0 {
+		e.fdOps--
+	}
 	if e.inflight > 0 {
 		return
 	}
@@ -1693,6 +1718,19 @@ func (w *Worker) noteStaleTerminalOp(ud uint64) {
 		cs.kernelInflight = 0
 	}
 	delete(w.closedOps, key)
+}
+
+// noteStaleSendCompleted takes a closed identity's SEND_ZC off its count of
+// ops that name the descriptor at the send's first CQE (celeris#798): the op
+// is done with the descriptor, and only its notification, which still
+// counts in inflight, is owed. Worker thread only.
+func (w *Worker) noteStaleSendCompleted(ud uint64) {
+	if len(w.closedOps) == 0 {
+		return
+	}
+	if e := w.closedOps[connOpKey(ud)]; e != nil && e.fdOps > 0 {
+		e.fdOps--
+	}
 }
 
 func (w *Worker) processCQE(ctx context.Context, c *completionEntry, now int64) {
@@ -3407,6 +3445,30 @@ func (w *Worker) respondAndArm(cs *connState, fd int, c *completionEntry, link, 
 	}
 }
 
+// zcSendCompleted records a SEND_ZC's first completion (IORING_CQE_F_MORE):
+// the send is done and its result waits for the notification, which is when
+// the kernel lets go of cs.sendBuf. From here the op names no descriptor, so
+// fdOps stops counting it (celeris#798). handleSend calls it, and so does
+// worker shutdown's drain (endOwedOpsAtShutdown), which dispatches no
+// completion to handleSend. Worker thread only.
+func zcSendCompleted(cs *connState, res int32) {
+	// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
+	// the dispatch goroutine under detachMu; mutate them under the lock.
+	if mu := cs.detachMu; mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	if res < 0 {
+		cs.sending = false
+		cs.zcNotifPending = true
+		cs.zcSentBytes = res // store negative for error path on NOTIF
+		return
+	}
+	cs.zcNotifPending = true
+	cs.zcSentBytes = res
+	// sending stays true until NOTIF completes the cycle.
+}
+
 func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	cs := w.conns[fd]
 	if cs == nil {
@@ -3465,21 +3527,7 @@ func (w *Worker) handleSend(c *completionEntry, fd int, now int64) {
 	// process (celeris#519). F_MORE on a udSend completion is set by the
 	// kernel only for SEND_ZC, so it is the accurate test.
 	if cqeHasMore(c.Flags) {
-		// cs.sending / cs.zcNotifPending are read by the inline-egress guard on
-		// the dispatch goroutine under detachMu; mutate them under the lock.
-		if mu := cs.detachMu; mu != nil {
-			mu.Lock()
-			defer mu.Unlock()
-		}
-		if c.Res < 0 {
-			cs.sending = false
-			cs.zcNotifPending = true
-			cs.zcSentBytes = c.Res // store negative for error path on NOTIF
-			return
-		}
-		cs.zcNotifPending = true
-		cs.zcSentBytes = c.Res
-		// sending stays true until NOTIF completes the cycle.
+		zcSendCompleted(cs, c.Res)
 		return
 	}
 
@@ -4033,6 +4081,7 @@ func (w *Worker) noteClosedInflight(cs *connState) {
 		w.closedOps[key] = e
 	}
 	e.inflight += cs.kernelInflight
+	e.fdOps += int16(fdOps(cs))
 	e.conns = append(e.conns, cs)
 }
 
@@ -4122,6 +4171,14 @@ func (w *Worker) drainPendingRelease() {
 		entry := &w.pendingRelease[i]
 		cs := entry.cs
 		if cs.kernelInflight > 0 {
+			// A kept descriptor goes as soon as no owed op names it
+			// (celeris#798): what is left may be SEND_ZC notifications only,
+			// and one of those can wait on a stalled peer for as long as the
+			// socket is open. cs itself stays until they arrive: they say the
+			// kernel is done with its send buffer.
+			if entry.holdsFD && !w.closedFDNamed(cs) {
+				w.releaseKeptFD(entry)
+			}
 			if entry.releaseAtNanos > w.cachedNow {
 				kept = append(kept, *entry)
 				continue
@@ -4148,8 +4205,7 @@ func (w *Worker) drainPendingRelease() {
 		// every op that named the descriptor has delivered its terminal
 		// CQE, so none can resolve the number any more.
 		if entry.holdsFD {
-			_ = unix.Close(int(entry.fd))
-			w.closeFDOwed--
+			w.releaseKeptFD(entry)
 		}
 		if !entry.detached {
 			releaseConnState(cs)

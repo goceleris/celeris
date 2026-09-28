@@ -33,7 +33,7 @@ PATH = sys.argv[1] if len(sys.argv) > 1 else "engine/iouring/fd_lifetime.go"
 
 BODY = (
     "func fdOwed(cs *connState) bool {\n"
-    "\treturn cs != nil && cs.kernelInflight > 0 && !cs.fixedFile\n"
+    "\treturn cs != nil && fdOps(cs) > 0 && !cs.fixedFile\n"
     "}\n"
 )
 

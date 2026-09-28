@@ -376,8 +376,11 @@ func (w *Worker) rescueHold(cs *connState) {
 // descriptor (fdOwed). The close path does everything else as before (the
 // cancels, the closedOps registration, the deferred release) and hands the
 // descriptor to its pendingRelease entry, and drainPendingRelease closes it
-// where it releases the connState: when every owed op has delivered its
-// terminal CQE. Until then the number stays allocated, so no accept or dup
+// once no owed op names it: where it releases the connState, when every owed
+// op has delivered its terminal CQE, or earlier when all that is left is
+// SEND_ZC notifications (celeris#798). Those name no descriptor and guard
+// only the send buffer, so the connState waits for them and the descriptor
+// does not (fdOps). Until then the number stays allocated, so no accept or dup
 // anywhere in the process can be given it, and an op issued late resolves
 // this connection's own socket. To make sure every owed op does end, the
 // close path also shuts the socket's read side down (shutdownHow; SHUT_RD
@@ -406,16 +409,66 @@ func (w *Worker) rescueHold(cs *connState) {
 // (endOwedOpsAtShutdown).
 
 // fdOwed reports whether the kernel still owes cs an op that names its
-// descriptor: a recv or send whose SQE was written and whose terminal CQE has
-// not been read. kernelInflight counts every such op from the moment its SQE
-// is placed (prepareRecv, flushSend, flushSendLink, both halves of a linked
-// pair), submitted or not, issued or not, and staleConnCQE retires it at the
-// terminal CQE; the header timer and the cancels name no descriptor and are
-// not counted. A fixed-file connection names a slot, not a number, and keeps
-// its own close (CLOSE_DIRECT). A nil cs (closeMissingConnState) owes
+// descriptor: a recv or send whose SQE was written and that has not
+// completed (fdOps). A fixed-file connection names a slot, not a number, and
+// keeps its own close (CLOSE_DIRECT). A nil cs (closeMissingConnState) owes
 // nothing we can know of.
 func fdOwed(cs *connState) bool {
-	return cs != nil && cs.kernelInflight > 0 && !cs.fixedFile
+	return cs != nil && fdOps(cs) > 0 && !cs.fixedFile
+}
+
+// fdOps counts the ops the kernel still owes live cs that name its
+// descriptor. kernelInflight counts every recv and send from the moment its
+// SQE is placed (prepareRecv, flushSend, flushSendLink, both halves of a
+// linked pair), submitted or not, issued or not, and staleConnCQE retires it
+// at the terminal CQE; the header timer and the cancels name no descriptor
+// and are not counted.
+//
+// One op in that count may name nothing (celeris#798): a SEND_ZC whose send
+// has completed (its first CQE, IORING_CQE_F_MORE, set zcNotifPending) keeps
+// its count until the notification CQE, and the notification is not an op on
+// the descriptor. It says the kernel has let go of the send buffer's pages,
+// which a stalled peer's unread data can hold for as long as the socket
+// lives. Counting it kept the descriptor, and so the socket, open until the
+// 5 s release backstop forced it (CloseFDForced). So it is left out here,
+// and only here: kernelInflight still counts it, and the connState, whose
+// sendBuf those pages are, is still released only at the notification
+// (drainPendingRelease). A connection has one send in flight at most
+// (flushSend and flushSendLink wait out cs.sending and cs.zcNotifPending),
+// so zcNotifPending stands for exactly one op.
+//
+// Live connections only: a closed one's count moves in its closedOps entry
+// (closedOpsEntry.fdOps, read by closedFDNamed).
+func fdOps(cs *connState) int32 {
+	if cs.zcNotifPending {
+		return cs.kernelInflight - 1
+	}
+	return cs.kernelInflight
+}
+
+// closedFDNamed reports whether an op the kernel still owes closed cs names
+// its descriptor, as drainPendingRelease asks of an entry that kept the
+// descriptor (holdsFD) while kernelInflight is not yet 0. Only a SEND_ZC
+// notification names none (see fdOps), and only a connection whose last send
+// was armed as SEND_ZC (sendIsZC, which nothing changes after the close) can
+// owe one; for any other the answer is yes without a lookup. For that one,
+// its closedOps entry counts what is left (fdOps). No entry means the
+// accounting cannot say, and the descriptor stays kept.
+func (w *Worker) closedFDNamed(cs *connState) bool {
+	if !cs.sendIsZC {
+		return true
+	}
+	e := w.closedOps[encodeConnOpKey(cs.fd, cs.generation)]
+	return e == nil || e.fdOps > 0
+}
+
+// releaseKeptFD closes the descriptor a close path left to e (holdsFD): the
+// release closes it when cs goes, or earlier, once only a SEND_ZC
+// notification is still owed (celeris#798). Worker thread only.
+func (w *Worker) releaseKeptFD(e *pendingReleaseEntry) {
+	_ = unix.Close(int(e.fd))
+	e.holdsFD = false
+	w.closeFDOwed--
 }
 
 // keptFD is the descriptor a close path hands to its pendingRelease entry:
@@ -488,6 +541,12 @@ const shutdownFDDrainNanos int64 = int64(250 * time.Millisecond)
 // shutdownFDDrainNanos; past it (or on a ring error) the descriptors are
 // closed anyway, as shutdown always did. Worker thread only; skipped under
 // SQPOLL (no tier enables it) and without a ring.
+//
+// It waits for the ops that name a descriptor, not for SEND_ZC
+// notifications (celeris#798, see fdOps): a stalled peer can hold one for as
+// long as the socket is open, far past this bound. A live connection's
+// SEND_ZC that completes during the drain is recorded as handleSend records
+// it (zcSendCompleted), so its notification is not waited for either.
 func (w *Worker) endOwedOpsAtShutdown() {
 	var owed []*connState
 	for _, fd := range w.liveConns {
@@ -499,12 +558,12 @@ func (w *Worker) endOwedOpsAtShutdown() {
 	}
 	pending := func() bool {
 		for _, cs := range owed {
-			if cs.kernelInflight > 0 {
+			if fdOps(cs) > 0 {
 				return true
 			}
 		}
 		for i := range w.pendingRelease {
-			if e := &w.pendingRelease[i]; e.holdsFD && e.cs.kernelInflight > 0 {
+			if e := &w.pendingRelease[i]; e.holdsFD && e.cs.kernelInflight > 0 && w.closedFDNamed(e.cs) {
 				return true
 			}
 		}
@@ -526,7 +585,17 @@ func (w *Worker) endOwedOpsAtShutdown() {
 				ud := c.UserData
 				switch ud & udMask {
 				case udRecv, udSend:
-					w.staleConnCQE(c, int(ud&fdMask), ud)
+					fd := int(ud & fdMask)
+					// A live connection's SEND_ZC completing (F_MORE marks
+					// only that on a send): record it as the loop does, or
+					// its notification would be waited for as an op on the
+					// descriptor. A closed one's is counted by staleConnCQE.
+					if ud&udMask == udSend && cqeHasMore(c.Flags) && fd < len(w.conns) {
+						if cs := w.conns[fd]; cs != nil && cs.generation == decodeGen(ud) {
+							zcSendCompleted(cs, c.Res)
+						}
+					}
+					w.staleConnCQE(c, fd, ud)
 				case udAccept:
 					if c.Res >= 0 && !w.fixedFiles {
 						_ = unix.Close(int(c.Res))
