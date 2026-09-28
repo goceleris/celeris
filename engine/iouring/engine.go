@@ -525,6 +525,8 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantClaimDeferred:   e.metrics.handoffLoss.claimDeferred.Load(),
 		TransplantReapFailed:      e.metrics.handoffLoss.reapFailed.Load(),
 		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
+		CloseFDDeferred:           e.metrics.handoffLoss.closeFDDeferred.Load(),
+		CloseFDForced:             e.metrics.handoffLoss.closeFDForced.Load(),
 
 		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
 		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),

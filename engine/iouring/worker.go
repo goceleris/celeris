@@ -179,10 +179,20 @@ func clampBufRingCount(n int) int {
 // goroutine's defer that reads cs.fd / cs.asyncInBuf. (The goroutine's
 // own closure references remain visible to GC after we drop ours, so
 // dropping the ref once the kernel ops drained is safe.)
+//
+// holdsFD marks an entry whose close path left its descriptor, fd, OPEN
+// because the kernel still owed an op on it (celeris#685, see closeFDOwed);
+// drainPendingRelease closes it at the same point it releases cs: when the
+// last owed op has delivered its terminal CQE. A flag rather than an fd of -1
+// so that the zero entry holds nothing. Both sit in detached's padding, so the
+// entry stays 24 bytes on 64-bit platforms
+// (TestPendingReleaseEntryStaysTwentyFourBytes).
 type pendingReleaseEntry struct {
 	cs             *connState
 	releaseAtNanos int64
 	detached       bool
+	holdsFD        bool
+	fd             int32
 }
 
 // closedOpsEntry is the Worker.closedOps value: the conn(s) closed under
@@ -442,6 +452,14 @@ type Worker struct {
 	// releaseAtNanos is only the anomaly backstop — see
 	// pendingReleaseHoldNanos.
 	pendingRelease []pendingReleaseEntry
+	// closeFDOwed counts the pendingRelease entries that still hold their
+	// descriptor open (holdsFD, celeris#685). The worker does not park
+	// while it is non-zero: the terminal CQEs those closes wait for arrive
+	// only through the ring, and a parked worker enters no ring. Worker
+	// thread only. closeFDDeferredBatch is the count of such closes not yet
+	// added to handoffLoss.closeFDDeferred, flushed once per loop iteration.
+	closeFDOwed          int
+	closeFDDeferredBatch uint64
 
 	// closedOps routes terminal recv/send CQEs that arrive AFTER their
 	// conn was closed (w.conns[fd] already nil or reused) back to the
@@ -817,18 +835,20 @@ func (w *Worker) noteRecvPlaced(cs *connState) {
 // Why the close paths ask (celeris#715 hypothesis (a), the celeris#685
 // class). Such a recv names the descriptor NUMBER (fixed files are off), and
 // the kernel resolves the number when the next submit issues the recv.
-// finishClose and finishCloseDetached queue the recv's ASYNC_CANCEL behind it
-// and close the descriptor at once. If another thread's accept is given the
+// finishClose and finishCloseDetached queued the recv's ASYNC_CANCEL behind it
+// and closed the descriptor at once. If another thread's accept was given the
 // freed number before this worker's next submit, and its connection's request
-// is already in the socket (TCP_DEFER_ACCEPT hands over only connections that
-// have sent), the recv reads that request and completes under the closed
-// conn's (fd, generation): staleConnCQE drops it as stale_recv_data_closed,
-// and the new connection's own recv then waits on an empty socket. So, under
-// -tags=validation, the close paths
-//   - count the close (recvtheft.CloseWithUnsubmittedRecv, the witness),
-//   - park the worker right after the descriptor is closed when a
-//     recvtheft trial is armed (recvtheft.HoldAfterClose), and
-//   - in the trial's control arm, submit the ring before closing
+// was already in the socket (TCP_DEFER_ACCEPT hands over only connections that
+// have sent), the recv read that request and completed under the closed
+// conn's (fd, generation): staleConnCQE dropped it as stale_recv_data_closed,
+// and the new connection's own recv then waited on an empty socket. The close
+// paths now keep the number while the recv is owed (fdOwed); under
+// -tags=validation they still
+//   - count the close (recvtheft.CloseWithUnsubmittedRecv, the witness of
+//     the precondition),
+//   - park the worker when the close path returns, when a recvtheft trial is
+//     armed (recvtheft.HoldAfterClose), and
+//   - in the trial's control arm, submit the ring before the close
 //     (recvtheft.SubmitBeforeClose), so the recv is issued while the number
 //     still names this conn's socket.
 //
@@ -1385,6 +1405,13 @@ func (w *Worker) run(ctx context.Context) {
 			w.zc.noteRingBytes(w.ringBytesBatch)
 			w.ringBytesBatch = 0
 		}
+		// Same cadence for the celeris#685 deferred-close rate.
+		if w.closeFDDeferredBatch > 0 {
+			if w.handoffLoss != nil {
+				w.handoffLoss.closeFDDeferred.Add(w.closeFDDeferredBatch)
+			}
+			w.closeFDDeferredBatch = 0
+		}
 		// Same cadence for the celeris#607 link-arm exposure witness.
 		if w.linkArmBatch > 0 {
 			if w.recvArm != nil {
@@ -1418,6 +1445,13 @@ func (w *Worker) run(ctx context.Context) {
 		// queuePendingRelease docstring).
 		w.iterCount++
 		if len(w.pendingRelease) > 0 {
+			// An idle iteration with a descriptor still kept for an owed op
+			// (celeris#685) refreshes the clock the backstop reads: cachedNow
+			// moves only with CQE traffic or the timeout sweep, and a kept
+			// descriptor also keeps this worker from parking.
+			if w.closeFDOwed > 0 && w.emptyIters > 0 {
+				w.cachedNow = time.Now().UnixNano()
+			}
 			w.drainPendingRelease()
 		}
 
@@ -1502,9 +1536,15 @@ func (w *Worker) run(ctx context.Context) {
 		// re-checked under wakeMu below, and every driver-action enqueue
 		// kicks a parked worker through wakeIfSuspended; see there for why
 		// the pair cannot lose a wakeup.
+		//
+		// closeFDOwed gate (celeris#685): a close that left its descriptor
+		// open until the kernel's last op on it completes is finished by
+		// drainPendingRelease at that op's terminal CQE, which only an
+		// iteration of this loop reads. Parking first would hold the
+		// descriptor, and the socket with it, for as long as the park lasts.
 		if w.listenFD < 0 && w.connCount == 0 && !w.hasDriverConns.Load() &&
 			w.driverActionPending.Load() == 0 && w.detachQPending.Load() == 0 &&
-			w.acceptPaused.Load() {
+			w.closeFDOwed == 0 && w.acceptPaused.Load() {
 			// Submit what this iteration queued before parking (celeris#657,
 			// A5). The iteration that closes or hands off the last conn
 			// queues its close-path cancels (the header timer's, a send's)
@@ -1592,11 +1632,13 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			// under-count the live conn (and may clear recvArmed above
 			// with its recv still kernel-armed), so its own close can
 			// skip the cancel and release early — the UAF class this
-			// accounting exists to prevent. Reachability is narrow:
-			// non-SQPOLL task-work ordering posts the close-path
-			// -ECANCELED during the submit syscall, before the fd can be
-			// re-accepted; the window needs a dropped cancel SQE (full SQ
-			// ring) or SQPOLL's decoupled completion ordering ON TOP of
+			// accounting exists to prevent. Reachability is narrow: a
+			// close path keeps the number allocated until the closed
+			// conn's last owed op has delivered its terminal CQE
+			// (celeris#685), so on this worker the number cannot be
+			// re-occupied while such a CQE is still to come; the window
+			// needs the pendingRelease backstop to have closed a number
+			// with an op still owed (CloseFDForced, must stay 0) ON TOP of
 			// the gen collision. When it fires, the closed conn's
 			// closedOps entry is left orphaned and the 5 s backstop WARN
 			// in drainPendingRelease is the production signal.
@@ -2313,13 +2355,16 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	w.connCount--
 	w.activeConns.Add(-1)
 	w.closeCount.Add(1)
-	// Cancel-then-release discipline, hijack variant: a single-shot
-	// recv SQE is virtually always still armed on cs.buf here. The fd
-	// lives on under the caller's net.Conn, so an uncancelled recv would
-	// not only pin cs.buf past release (the #256-class UAF) but also
-	// STEAL the first bytes the hijacker tries to read. Cancel it by its
+	// Cancel-then-release discipline, hijack variant: any op still armed
+	// on cs (a multishot recv stays armed across its request; the
+	// single-shot recv that brought the request has completed, measured by
+	// TestRecvTheft685HijackSingleShot) targets cs.buf. The fd lives on
+	// under the caller's net.Conn, so an uncancelled recv would not only
+	// pin cs.buf past release (the #256-class UAF) but also STEAL the
+	// first bytes the hijacker tries to read. Cancel it by its
 	// generation-tagged user_data and defer the pool release until the
 	// terminal CQE arrives, exactly like finishClose.
+	//
 	// celeris#685 hijack witness and hold, validation builds only: count a
 	// hijack with an op still owed on the socket (kernelInflight > 0), and
 	// hold the worker thread before it returns, and so before its next
@@ -2333,6 +2378,25 @@ func (w *Worker) hijackConn(fd int) (net.Conn, error) {
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
 	w.queuePendingRelease(cs)
+	// The fd-lifetime rule, hijack variant (celeris#685). The socket lives
+	// on under the hijacker's net.Conn, so no op of this worker may read it
+	// once the hijacker has it, and none may resolve the original number,
+	// which the f.Close below releases. The cancel above reaches the kernel
+	// only at the next submit. Until then an owed recv that is already
+	// issued (a multishot recv stays armed across its request) can take the
+	// hijacker's first bytes on a ring whose completions run at any syscall
+	// exit, and one whose SQE is still in the ring would resolve the number
+	// after the close. So when an op is owed, submit now: an issued recv is
+	// cancelled before it can read, and a recv SQE still in the ring is
+	// issued first, against this socket and not a reused number, then
+	// cancelled. No hijack path leaves such an SQE: a hijack runs inside
+	// its request's processing, after that request's recv completed. Nor a
+	// linked recv, which rides behind a SEND: a hijack with a send pending
+	// is refused above. One io_uring_enter per hijack with an op owed; none
+	// otherwise, which is every hijack on single-shot recv.
+	if fdOwed(cs) && !w.sqpoll {
+		_, _ = w.ring.Submit()
+	}
 	f := os.NewFile(uintptr(fd), "tcp")
 	c, err := net.FileConn(f)
 	_ = f.Close()
@@ -3991,10 +4055,26 @@ func (w *Worker) dropClosedOps(cs *connState) {
 // fires). See Worker.pendingRelease docstring for the kernel-buffer-lifetime
 // invariant this enforces.
 func (w *Worker) queuePendingRelease(cs *connState) {
+	w.queuePendingReleaseFD(cs, false, -1)
+}
+
+// queuePendingReleaseFD is queuePendingRelease (detached false) or
+// queuePendingReleaseDetached (detached true) for a close path that may also
+// hand the descriptor over: keptFD >= 0 is closed by drainPendingRelease when
+// cs is released, not by the caller (celeris#685, closeFDOwed); -1 means the
+// caller closes it. Worker thread only.
+func (w *Worker) queuePendingReleaseFD(cs *connState, detached bool, keptFD int) {
 	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
 		cs:             cs,
 		releaseAtNanos: time.Now().UnixNano() + pendingReleaseHoldNanos,
+		detached:       detached,
+		holdsFD:        keptFD >= 0,
+		fd:             int32(keptFD),
 	})
+	if keptFD >= 0 {
+		w.closeFDOwed++
+		w.closeFDDeferredBatch++
+	}
 }
 
 // queuePendingReleaseDetached holds cs alive past the kernel's recv-SQE
@@ -4012,11 +4092,7 @@ func (w *Worker) queuePendingRelease(cs *connState) {
 // visible on behalf of the kernel's invisible recv pointer, so it must
 // outlive every pending op targeting cs.buf // span-corruption class).
 func (w *Worker) queuePendingReleaseDetached(cs *connState) {
-	w.pendingRelease = append(w.pendingRelease, pendingReleaseEntry{
-		cs:             cs,
-		releaseAtNanos: time.Now().UnixNano() + pendingReleaseHoldNanos,
-		detached:       true,
-	})
+	w.queuePendingReleaseFD(cs, true, -1)
 }
 
 // drainPendingRelease releases queued connStates whose kernel-held ops
@@ -4054,9 +4130,26 @@ func (w *Worker) drainPendingRelease() {
 			if w.logger != nil {
 				w.logger.Warn("releasing connState with kernel ops unaccounted for after backstop hold",
 					"worker", w.id, "fd", cs.fd, "generation", cs.generation,
-					"inflight", cs.kernelInflight, "detached", entry.detached)
+					"inflight", cs.kernelInflight, "detached", entry.detached,
+					"holds_fd", entry.holdsFD)
 			}
 			w.dropClosedOps(cs)
+			// The descriptor goes too, though an op may still name it: a
+			// descriptor held forever is a leak with no end. The close path
+			// shut the socket's read side down, so an owed recv the kernel
+			// issues on THIS socket ends at once; one issued after the
+			// number is reused would not, which is why this is counted and
+			// must stay 0 (celeris#685).
+			if entry.holdsFD {
+				w.handoffLoss.noteCloseFDForced()
+			}
+		}
+		// The close the close path left for this moment (celeris#685):
+		// every op that named the descriptor has delivered its terminal
+		// CQE, so none can resolve the number any more.
+		if entry.holdsFD {
+			_ = unix.Close(int(entry.fd))
+			w.closeFDOwed--
 		}
 		if !entry.detached {
 			releaseConnState(cs)
@@ -4109,6 +4202,9 @@ func (w *Worker) finishClose(fd int) {
 	// Capture close-path decisions before queueing cs for deferred release.
 	fixedFile := cs != nil && cs.fixedFile
 	fastClose := cs != nil && engine.Protocol(cs.protocol.Load()) == engine.HTTP1 && cs.h1State != nil && !cs.h1State.Detached.Load()
+	// The fd-lifetime rule (celeris#685): while the kernel still owes an op
+	// that names fd, the number is not released here. See fdOwed.
+	owed := fdOwed(cs)
 	// Cancel-then-release discipline (v1.4.15/7beebb9 corruption fix): ASYNC_CANCEL any kernel-held
 	// op still targeting cs's buffers (the single-shot recv is virtually
 	// ALWAYS armed here — closing the fd below does NOT complete it), then
@@ -4128,7 +4224,7 @@ func (w *Worker) finishClose(fd int) {
 		}
 		w.cancelConnOps(fd, cs)
 		w.noteClosedInflight(cs)
-		w.queuePendingRelease(cs)
+		w.queuePendingReleaseFD(cs, false, keptFD(fd, owed))
 		if recvtheft.Enabled && recvtheft.SubmitBeforeClose() {
 			_, _ = w.ring.Submit()
 		}
@@ -4174,23 +4270,32 @@ func (w *Worker) finishClose(fd int) {
 	//
 	// forceRSTClose (slowloris-defence): SHUT_RDWR + close. See
 	// finishCloseDetached for the rationale.
+	//
+	// Each branch below ends in closeUnlessOwed: with an op still owed the
+	// descriptor stays open, and drainPendingRelease closes it at that op's
+	// terminal CQE (celeris#685). A branch that did not shut the read side
+	// down already does so first, so the owed recv ends as soon as the
+	// kernel issues it (fdOwed).
 	if cs != nil && cs.forceRSTClose {
 		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
-		_ = unix.Close(fd)
+		closeUnlessOwed(fd, owed)
 		return
 	}
 	// fastClose: plain H1 no-body conn → close() alone suffices.
 	if fastClose {
-		_ = unix.Close(fd)
+		if owed {
+			_ = unix.Shutdown(fd, fastCloseShutdownHow(cs))
+		}
+		closeUnlessOwed(fd, owed)
 		return
 	}
-	_ = unix.Shutdown(fd, unix.SHUT_WR)
+	_ = unix.Shutdown(fd, shutdownHow(owed))
 	raddr := ""
 	if cs != nil {
 		raddr = cs.remoteAddr
 	}
 	sockopts.CloseDrain(fd, "iouring/finishClose", raddr)
-	_ = unix.Close(fd)
+	closeUnlessOwed(fd, owed)
 }
 
 // finishCloseAny dispatches to finishCloseDetached for detached connections
@@ -4229,6 +4334,8 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	}
 
 	fixedFile := cs.fixedFile
+	// The fd-lifetime rule (celeris#685), as in finishClose: see fdOwed.
+	owed := fdOwed(cs)
 	// Do NOT call releaseConnState — goroutine closures still reference cs.
 	//
 	// Cancel-then-release discipline (v1.4.15/7beebb9 corruption fix): ASYNC_CANCEL the armed recv
@@ -4254,7 +4361,7 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	}
 	w.cancelConnOps(fd, cs)
 	w.noteClosedInflight(cs)
-	w.queuePendingReleaseDetached(cs)
+	w.queuePendingReleaseFD(cs, true, keptFD(fd, owed))
 	if recvtheft.Enabled && recvtheft.SubmitBeforeClose() {
 		_, _ = w.ring.Submit()
 	}
@@ -4277,9 +4384,12 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// LINGER on iouring. The SHUT_RDWR + LINGER combo wins because
 	// SHUT_RDWR drops the receive queue too (close() with LINGER
 	// only drops TX). Walker observes the abortive close immediately.
+	//
+	// Each branch ends in closeUnlessOwed, and shuts the read side down too
+	// when an op is still owed (shutdownHow), exactly as finishClose does.
 	if cs.forceRSTClose {
 		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
-		_ = unix.Close(fd)
+		closeUnlessOwed(fd, owed)
 		return
 	}
 	// Async-mode HTTP1 conns are NOT truly detached (no WS/SSE middleware
@@ -4299,17 +4409,17 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	// the drain syscall and the close syscall left a multi-µs window in
 	// which a fresh walker drip would queue, making the close → RST).
 	if cs.h1State != nil && !cs.h1State.Detached.Load() {
-		_ = unix.Shutdown(fd, unix.SHUT_WR)
-		_ = unix.Close(fd)
+		_ = unix.Shutdown(fd, shutdownHow(owed))
+		closeUnlessOwed(fd, owed)
 		return
 	}
 	// Truly detached (WS/SSE): graceful half-close so middleware-queued
 	// close-frame echoes flush before the FIN. Sync unix.Close (not via
 	// io_uring) to avoid the async-SQE pile-up that plagued the pre-patch
 	// version.
-	_ = unix.Shutdown(fd, unix.SHUT_WR)
+	_ = unix.Shutdown(fd, shutdownHow(owed))
 	sockopts.CloseDrain(fd, "iouring/finishCloseDetached", cs.remoteAddr)
-	_ = unix.Close(fd)
+	closeUnlessOwed(fd, owed)
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
@@ -5765,6 +5875,13 @@ func (w *Worker) shutdown() {
 	// the wakeup eventfd is closed, because addAdoptAction signals it under
 	// the same lock (celeris#658).
 	w.closeAdoptQueue()
+	// The fd-lifetime rule at shutdown (celeris#685): end every op the kernel
+	// still owes on a connection's descriptor before any of those
+	// descriptors is closed (endOwedOpsAtShutdown). Before shutdownDrivers:
+	// the drain submits what the SQ ring still holds, and shutdownDrivers
+	// closes the driver descriptors on the promise that nothing is
+	// submitted after it.
+	w.endOwedOpsAtShutdown()
 	// Fire onClose for every registered driver conn before tearing down
 	// ring/listen fd. Otherwise driver callbacks are silently dropped. Then
 	// wait for the driver closes handed off the worker before the shutdown,
@@ -5821,6 +5938,8 @@ func (w *Worker) shutdown() {
 		if cs.h2State != nil {
 			conn.CloseH2(cs.h2State)
 		}
+		// endOwedOpsAtShutdown has ended the ops owed on fd, so no op can
+		// resolve the number once it is free (celeris#685).
 		if !cs.fixedFile {
 			_ = unix.Close(fd)
 		}

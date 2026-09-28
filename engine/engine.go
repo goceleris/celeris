@@ -469,15 +469,15 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	//   - Closed: a connection this engine closed or hijacked (the close
 	//     paths and Hijack register the identity the same way). Usually
 	//     the client's bytes raced a server-side close, and that client
-	//     sees its connection end. It is not always benign, so a non-zero
-	//     Closed does not prove that no live client lost a request. After
-	//     a Hijack the socket lives on under the hijacker's net.Conn, so a
-	//     recv that completes with data before its cancel lands has taken
-	//     the first bytes of a connection its client is still using. And a
-	//     recv that had not reached the kernel when the descriptor was
-	//     closed resolves the descriptor NUMBER when it does; if a new
-	//     connection holds that number by then, the recv reads that
-	//     client's request.
+	//     sees its connection end. It was not always benign: after a
+	//     Hijack, a recv that completed with data before its cancel landed
+	//     took the first bytes of a connection its client was still using,
+	//     and a recv that had not been issued when the descriptor was
+	//     closed resolved the descriptor NUMBER when it was, reading the
+	//     request of whatever new connection held that number by then
+	//     (celeris#715). Since celeris#685 neither can happen (see
+	//     CloseFDDeferred), so what Closed counts is a closed connection's
+	//     recv reading its own client's late bytes.
 	//   - Transplanted: a connection this engine handed to the other
 	//     sub-engine. A recv armed before the hand-off outlived it and
 	//     read a request meant for the new owner — or, through a reused
@@ -580,6 +580,27 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// probe finds the flags. io_uring-only; on the adaptive engine the sum
 	// over both sub-engines.
 	TransplantReapUnsupported uint64
+	// CloseFDDeferred and CloseFDForced count how the io_uring close paths
+	// keep the same fd-lifetime rule (celeris#685): a connection's descriptor
+	// NUMBER is released only when no operation that names it can still be
+	// issued. Closing it earlier let a receive the kernel had not issued yet
+	// read the request of a new connection that another thread had been
+	// given the freed number for; that request was dropped as
+	// StaleRecvDataClosed, and its client was never answered.
+	//
+	//   - CloseFDDeferred: closes whose descriptor stayed open until the
+	//     last operation the kernel owed on it had completed, and was closed
+	//     then (normally one loop iteration later). A rate: on an
+	//     async-handler engine it is close to one per connection the server
+	//     closes, and on a sync-mode engine it is the server-side closes of
+	//     connections with a receive armed (timeouts).
+	//   - CloseFDForced: such descriptors closed by the release backstop with
+	//     an operation still owed. Must stay 0.
+	//
+	// io_uring-only and cumulative; zero on other engines. On the adaptive
+	// engine each is the sum over both sub-engines.
+	CloseFDDeferred uint64
+	CloseFDForced   uint64
 	// TransplantSweepPasses counts passes of the post-switch sweep, the
 	// re-examination that moves a connection the drain would otherwise
 	// reach only at that connection's own next event — which, for a

@@ -242,16 +242,6 @@ type theftResult struct {
 	candidatesHit int
 }
 
-// fdTarget returns what /proc/self/fd/<fd> names ("socket:[inode]" for a
-// socket), or "" when fd is not open.
-func fdTarget(fd int) string {
-	s, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
-	if err != nil {
-		return ""
-	}
-	return s
-}
-
 const (
 	theftMaxAttempts  = 10
 	theftCandidates   = 6

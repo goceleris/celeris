@@ -1046,6 +1046,45 @@ jobs:
             echo "release a descriptor number a recv could still resolve, or was a test renamed or skipped?"
             exit 1
           fi
+      # The detector control. .github/scripts/mutant-685-release-owed-fd.py
+      # makes fdOwed report false, which takes the fd-lifetime rule off the
+      # close paths, Hijack and shutdown at once. Against that tree the three
+      # trials that judge the rule must FAIL in every one of their runs (a
+      # PASS means the trial does not watch the path it judges), and the
+      # others must still PASS. The mutation is undone before the step ends.
+      - name: celeris#685 detector control (the rule removed; the three judging trials must fail every run)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_RECV_THEFT_715: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          python3 .github/scripts/mutant-685-release-owed-fd.py
+          judged='TestRecvTheft715ArmA|TestRecvTheft685Linked|TestRecvTheft685HijackMultishotCoop'
+          others='TestRecvTheft715Control|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer'
+          runs=3
+          go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${judged}|${others})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/recvtheft685-mutant.log || true
+          git checkout -- engine/iouring/fd_lifetime.go
+          grep -E 'RECVTHEFT(715|685) .*result' /tmp/recvtheft685-mutant.log || true
+          bad=0
+          for n in ${judged//|/ }; do
+            p=$(grep -cE "^--- PASS: $n \(" /tmp/recvtheft685-mutant.log || true)
+            f=$(grep -cE "^--- FAIL: $n \(" /tmp/recvtheft685-mutant.log || true)
+            echo "mutant, judged $n: PASS $p FAIL $f (want FAIL $runs)"
+            if [ "$f" -ne "$runs" ] || [ "$p" -ne 0 ]; then bad=1; fi
+          done
+          for n in ${others//|/ }; do
+            p=$(grep -cE "^--- PASS: $n \(" /tmp/recvtheft685-mutant.log || true)
+            f=$(grep -cE "^--- FAIL: $n \(" /tmp/recvtheft685-mutant.log || true)
+            echo "mutant, control $n: PASS $p FAIL $f (want PASS $runs)"
+            if [ "$p" -ne "$runs" ] || [ "$f" -ne 0 ]; then bad=1; fi
+          done
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/recvtheft685-mutant.log || true)
+          if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
+          exit "$bad"
 
   conformance:
     name: Conformance

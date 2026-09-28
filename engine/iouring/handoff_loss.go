@@ -37,8 +37,13 @@ import (
 //     the socket lives on under the hijacker's net.Conn, so a recv that
 //     completes with data before its cancel lands has read bytes from a
 //     connection its client is still using. After a close, a recv that
-//     had not reached the kernel yet resolves the fd NUMBER when it does,
-//     and a new connection may hold that number by then.
+//     had not been issued yet resolved the fd NUMBER when it was, and a
+//     new connection could hold that number by then (celeris#715). Both
+//     are closed off by the fd-lifetime rule on those paths
+//     (celeris#685): hijackConn submits its cancels before handing the
+//     socket over, and a close keeps the number while an op is owed.
+//     What Closed still counts is a closed conn's recv reading its OWN
+//     client's late bytes, which that client sees end with the close.
 //
 //     A stale CQE whose (fd, generation) equals the fd's current
 //     occupant's (a generation collision, which needs the process-wide
@@ -96,6 +101,17 @@ import (
 // paths only, never on the per-request path while no drain is set, and like
 // the celeris#586 witnesses they are per-event invariants that a
 // per-iteration batch could lose at loop exit.
+//
+// The same rule on the close paths (celeris#685; see the close-path section
+// of fd_lifetime.go) keeps two more:
+//
+//   - closeFDDeferred: closes whose descriptor was left open because the
+//     kernel still owed an op on it, and closed at that op's terminal CQE. A
+//     rate, and on an async-handler engine with Connection: close traffic
+//     close to one per request, so it is the one counter here that is
+//     batched per loop iteration (Worker.closeFDDeferredBatch).
+//   - closeFDForced: such descriptors the pendingRelease backstop closed
+//     with an op still owed. Must stay 0.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -109,6 +125,14 @@ type handoffLossStats struct {
 	claimDeferred             atomic.Uint64
 	reapFailed                atomic.Uint64
 	reapUnsupported           atomic.Uint64
+	closeFDDeferred           atomic.Uint64
+	closeFDForced             atomic.Uint64
+}
+
+func (s *handoffLossStats) noteCloseFDForced() {
+	if s != nil {
+		s.closeFDForced.Add(1)
+	}
 }
 
 // The fd-lifetime counters are nil-safe: a hand-built test Worker has none.

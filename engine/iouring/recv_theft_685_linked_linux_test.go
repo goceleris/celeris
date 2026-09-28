@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -133,29 +132,6 @@ func startLinkedTheftEngine(t *testing.T) (*Engine, int) {
 		skipOrFail656(t, "celeris#685 needs a sibling io_uring worker: workers=%d (RLIMIT_MEMLOCK funds one per 12 MiB)", n)
 	}
 	return e, port
-}
-
-// serverFDFor returns this process's descriptor whose peer is local (the
-// server side of a loopback connection the test dialed), or -1.
-func serverFDFor(local string) int {
-	ents, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return -1
-	}
-	for _, ent := range ents {
-		fd, err := strconv.Atoi(ent.Name())
-		if err != nil {
-			continue
-		}
-		sa, err := unix.Getpeername(fd)
-		if err != nil {
-			continue
-		}
-		if sockaddrString(sa) == local {
-			return fd
-		}
-	}
-	return -1
 }
 
 // fillSendQueue writes to fd (a server-side socket whose peer never reads)
