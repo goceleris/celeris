@@ -74,7 +74,10 @@ flag_management:
       paths:
         - "middleware/protobuf/"
 
-# Coverage by area, whichever module's upload it came from.
+# Coverage by area, whichever module's upload it came from. There is no
+# adaptive component: ./adaptive/... is not in the coverage profile (it runs
+# in ci.yml's `adaptive` job at raised memlock; test-coverage.yml says why),
+# so the component could only ever be empty (celeris#725).
 component_management:
   individual_components:
     - component_id: core
@@ -91,10 +94,6 @@ component_management:
       name: engines (epoll, io_uring, std)
       paths:
         - "engine/**"
-    - component_id: adaptive
-      name: adaptive
-      paths:
-        - "adaptive/**"
     - component_id: protocol
       name: protocol (h1, h2, detect)
       paths:

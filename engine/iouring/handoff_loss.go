@@ -2,7 +2,11 @@
 
 package iouring
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/goceleris/celeris/internal/recvtheft"
+)
 
 // handoffLossStats are the celeris#657 witnesses: the request loss a
 // reverse (io_uring→epoll) hand-off can cause, counted where it happens.
@@ -33,8 +37,13 @@ import "sync/atomic"
 //     the socket lives on under the hijacker's net.Conn, so a recv that
 //     completes with data before its cancel lands has read bytes from a
 //     connection its client is still using. After a close, a recv that
-//     had not reached the kernel yet resolves the fd NUMBER when it does,
-//     and a new connection may hold that number by then.
+//     had not been issued yet resolved the fd NUMBER when it was, and a
+//     new connection could hold that number by then (celeris#715). Both
+//     are closed off by the fd-lifetime rule on those paths
+//     (celeris#685): hijackConn submits its cancels before handing the
+//     socket over, and a close keeps the number while an op is owed.
+//     What Closed still counts is a closed conn's recv reading its OWN
+//     client's late bytes, which that client sees end with the close.
 //
 //     A stale CQE whose (fd, generation) equals the fd's current
 //     occupant's (a generation collision, which needs the process-wide
@@ -79,17 +88,30 @@ import "sync/atomic"
 //     marks the queued claim detachClosed first, and hijack is refused).
 //     Before the checks existed one identity was measured moving twice in
 //     167 runs. Must stay 0.
-//   - claimDeferred: tryTransplant finding a conn whose dispatch goroutine
-//     has claimed its own hand-off (transplantPending) and leaving it to that
-//     claim. Counted before tryTransplant's other gates, so it is ordering,
-//     not a fault: it fires whenever a completion of the conn (its own
-//     response SEND, typically) lands between the goroutine's park and the
-//     drain of its claim. A rate.
+//   - claimDeferred: a worker-side hand-off attempt (tryTransplant, or
+//     rerunHandOff for a reap's retry or landing, celeris#758) finding a
+//     conn whose dispatch goroutine has claimed its own hand-off
+//     (transplantPending) and leaving it to that claim. Counted before the
+//     site's other gates, so it is ordering, not a fault: it fires whenever
+//     a completion of the conn (its own response SEND, typically) or a reap
+//     retry lands between the goroutine's park and the drain of its claim. A
+//     rate.
 //
 // All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
 // paths only, never on the per-request path while no drain is set, and like
 // the celeris#586 witnesses they are per-event invariants that a
 // per-iteration batch could lose at loop exit.
+//
+// The same rule on the close paths (celeris#685; see the close-path section
+// of fd_lifetime.go) keeps two more:
+//
+//   - closeFDDeferred: closes whose descriptor was left open because the
+//     kernel still owed an op on it, and closed at that op's terminal CQE. A
+//     rate, and on an async-handler engine with Connection: close traffic
+//     close to one per request, so it is the one counter here that is
+//     batched per loop iteration (Worker.closeFDDeferredBatch).
+//   - closeFDForced: such descriptors the pendingRelease backstop closed
+//     with an op still owed. Must stay 0.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -103,6 +125,14 @@ type handoffLossStats struct {
 	claimDeferred             atomic.Uint64
 	reapFailed                atomic.Uint64
 	reapUnsupported           atomic.Uint64
+	closeFDDeferred           atomic.Uint64
+	closeFDForced             atomic.Uint64
+}
+
+func (s *handoffLossStats) noteCloseFDForced() {
+	if s != nil {
+		s.closeFDForced.Add(1)
+	}
 }
 
 // The fd-lifetime counters are nil-safe: a hand-built test Worker has none.
@@ -174,6 +204,22 @@ func (w *Worker) noteStaleRecvData(ud uint64) {
 	default:
 		s.staleRecvDataClosed.Add(1)
 	}
+}
+
+// noteStaleRecvExemplar hands an armed recvtheft trial what a stale recv
+// with data read: its identity, its result and the first bytes of the closed
+// conn's cs.buf, where every single-shot recv except the direct-body one
+// lands (celeris#715). Validation builds only (the caller is guarded by
+// recvtheft.Enabled). Must run before noteStaleTerminalOp retires the
+// closedOps entry. Worker thread only.
+func (w *Worker) noteStaleRecvExemplar(c *completionEntry, fd int, ud uint64) {
+	var head []byte
+	if e := w.closedOps[connOpKey(ud)]; e != nil && len(e.conns) > 0 && w.bufRing == nil {
+		buf := e.conns[0].buf
+		n := min(int(c.Res), len(buf), 64)
+		head = buf[:n]
+	}
+	recvtheft.NoteStaleRecvData(w.id, fd, decodeGen(ud), c.Res, head)
 }
 
 // noteHandoffInFlight counts a hand-off that detached cs while the kernel

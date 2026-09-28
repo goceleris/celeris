@@ -3,6 +3,8 @@
 package iouring
 
 import (
+	"time"
+
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
@@ -197,14 +199,45 @@ func (w *Worker) handleTransplantReap(c *completionEntry, fd int) {
 // finishAsyncTransplant, anything else through tryTransplant. A promoted conn
 // whose goroutine is running again owns itself and claims its own hand-off at
 // its next park.
+//
+// One owner per hand-off (celeris#657 A6), as in tryTransplant: a goroutine
+// that has claimed its hand-off (transplantPending) has exited too, so
+// asyncRun alone reads "not running", but the conn belongs to that claim
+// until drainDetachQueue takes it off the queue and runs
+// finishAsyncTransplant itself. The goroutine enqueues the claim only after
+// releasing asyncInMu, so a retry can run between the two, and a reap can
+// land before the queue is drained. Acting then handed the conn off with its
+// claim still set, and the claim's drain found the slot empty and counted a
+// double claim for a conn moved once (celeris#758). Leaving the conn to its
+// claim is ordering, counted as TransplantClaimDeferred.
+//
+// The goroutine's other exits have the same shape (celeris#780): the
+// processErr and panic exits set asyncClosed, the h2c-upgrade exit makes the
+// conn H2C, and each then clears asyncRun under asyncInMu and enqueues cs only
+// after unlocking. A conn in one of those windows belongs to its queued entry,
+// which closes it or finishes the upgrade; handing it off first left that
+// entry to close the number the hand-off gave up, which the next accept can
+// hold, or put an H2C conn on the HTTP/1 target. Both fields are published
+// before asyncRun is cleared, so reading them under asyncInMu after seeing it
+// clear is ordered.
 func (w *Worker) rerunHandOff(fd int, cs *connState) {
 	if w.async && cs.asyncPromoted.Load() {
 		cs.asyncInMu.Lock()
 		running := cs.asyncRun
+		claimed := cs.transplantPending.Load()
+		exiting := cs.asyncClosed.Load() || engine.Protocol(cs.protocol.Load()) != engine.HTTP1
 		cs.asyncInMu.Unlock()
-		if !running {
-			w.finishAsyncTransplant(cs)
+		if running {
+			return
 		}
+		if claimed {
+			w.handoffLoss.noteClaimDeferred()
+			return
+		}
+		if exiting {
+			return
+		}
+		w.finishAsyncTransplant(cs)
 		return
 	}
 	w.tryTransplant(fd)
@@ -325,4 +358,287 @@ func (w *Worker) releaseHoldSlow(cs *connState, rescued bool) {
 // until now. Arms the recv and counts it (TransplantHoldRescued, must stay 0).
 func (w *Worker) rescueHold(cs *connState) {
 	w.releaseHoldSlow(cs, true)
+}
+
+// The same rule for the close paths (celeris#685): a descriptor NUMBER is
+// released only when no op that names it can still be submitted or issued.
+//
+// Fixed files are off (celeris#541), so a recv or send SQE names the
+// descriptor by number, and the kernel resolves the number when it ISSUES the
+// op, not when the SQE is written. Two kinds of op are not issued yet when a
+// close path runs:
+//
+//   - one still in the SQ ring: prepareRecv (a promoted connection's re-arm,
+//     a dirty-list retry) and flushSend only place SQEs, and they reach the
+//     kernel at the loop's next io_uring_enter;
+//   - one the kernel holds but has not issued: a recv linked behind a SEND
+//     (flushSendLink) is issued only when the SEND completes, and on a
+//     DEFER_TASKRUN ring as task work after that, which can still be queued
+//     when the SEND's CQE is read.
+//
+// finishClose and finishCloseDetached used to queue the ops' cancels and
+// close(2) the descriptor at once. Another thread (a sibling worker's accept,
+// the epoll sub-engine) can be given the freed number before this worker's
+// next submit. The recv then reads that connection's request and completes
+// under the closed connection's (fd, generation); staleConnCQE drops it as
+// stale_recv_data_closed, and the new connection waits on an empty socket
+// until its header deadline. Measured deterministically by
+// TestRecvTheft715ArmA (celeris#715), and the linked form by
+// TestRecvTheft685Linked.
+//
+// The rule is kept by NOT closing while the kernel owes an op on the
+// descriptor (fdOwed). The close path does everything else as before (the
+// cancels, the closedOps registration, the deferred release) and hands the
+// descriptor to its pendingRelease entry, and drainPendingRelease closes it
+// once no owed op names it: where it releases the connState, when every owed
+// op has delivered its terminal CQE, or earlier when all that is left is
+// SEND_ZC notifications (celeris#798). Those name no descriptor and guard
+// only the send buffer, so the connState waits for them and the descriptor
+// does not (fdOps). Until then the number stays allocated, so no accept or dup
+// anywhere in the process can be given it, and an op issued late resolves
+// this connection's own socket. To make sure every owed op does end, the
+// close path also shuts the socket's read side down (shutdownHow; SHUT_RD
+// alone on the fast path, which otherwise makes no shutdown call, see
+// fastCloseShutdownHow): an owed recv returns at once when it is issued, even
+// one no cancel can find (a linked recv not issued yet), and even on a kernel
+// whose cancels fail (celeris#682).
+//
+// What it costs. No io_uring_enter is added: the close(2) moves from the
+// close path to the release, one iteration later, and a path that already
+// shut the write side down shuts both down instead. The one added syscall is
+// the SHUT_RD of the H1 fast path, taken only when an op is owed there: a
+// server-side close of a connection with its recv armed (a timeout); a
+// sync-mode Connection: close response has no recv armed when it closes, and
+// neither has a client's FIN. What the peer sees barely moves. An issued recv
+// holds its own reference to the file, so its socket was never released
+// before that recv's cancel landed anyway, and the FIN (or the RST of unread
+// data) went out then; it goes out at the same point now. Only a close with
+// a recv still in the SQ ring, whose socket nothing held, used to release the
+// socket at the close and now does so one enter later. The worker does not
+// park while such a close is outstanding (closeFDOwed).
+//
+// A hijack keeps the socket open under the hijacker, so it cannot wait: it
+// submits its cancels before handing the socket over (see hijackConn). Worker
+// shutdown ends the ops owed on every descriptor before it closes any
+// (endOwedOpsAtShutdown).
+
+// fdOwed reports whether the kernel still owes cs an op that names its
+// descriptor: a recv or send whose SQE was written and that has not
+// completed (fdOps). A fixed-file connection names a slot, not a number, and
+// keeps its own close (CLOSE_DIRECT). A nil cs (closeMissingConnState) owes
+// nothing we can know of.
+func fdOwed(cs *connState) bool {
+	return cs != nil && fdOps(cs) > 0 && !cs.fixedFile
+}
+
+// fdOps counts the ops the kernel still owes live cs that name its
+// descriptor. kernelInflight counts every recv and send from the moment its
+// SQE is placed (prepareRecv, flushSend, flushSendLink, both halves of a
+// linked pair), submitted or not, issued or not, and staleConnCQE retires it
+// at the terminal CQE; the header timer and the cancels name no descriptor
+// and are not counted.
+//
+// One op in that count may name nothing (celeris#798): a SEND_ZC whose send
+// has completed (its first CQE, IORING_CQE_F_MORE, set zcNotifPending) keeps
+// its count until the notification CQE, and the notification is not an op on
+// the descriptor. It says the kernel has let go of the send buffer's pages,
+// which a stalled peer's unread data can hold for as long as the socket
+// lives. Counting it kept the descriptor, and so the socket, open until the
+// 5 s release backstop forced it (CloseFDForced). So it is left out here,
+// and only here: kernelInflight still counts it, and the connState, whose
+// sendBuf those pages are, is still released only at the notification
+// (drainPendingRelease). A connection has one send in flight at most
+// (flushSend and flushSendLink wait out cs.sending and cs.zcNotifPending),
+// so zcNotifPending stands for exactly one op.
+//
+// Live connections only: a closed one's count moves in its closedOps entry
+// (closedOpsEntry.fdOps, read by closedFDNamed).
+func fdOps(cs *connState) int32 {
+	if cs.zcNotifPending {
+		return cs.kernelInflight - 1
+	}
+	return cs.kernelInflight
+}
+
+// closedFDNamed reports whether an op the kernel still owes closed cs names
+// its descriptor, as drainPendingRelease asks of an entry that kept the
+// descriptor (holdsFD) while kernelInflight is not yet 0. Only a SEND_ZC
+// notification names none (see fdOps), and only a connection whose last send
+// was armed as SEND_ZC (sendIsZC, which nothing changes after the close) can
+// owe one; for any other the answer is yes without a lookup. For that one,
+// its closedOps entry counts what is left (fdOps). No entry means the
+// accounting cannot say, and the descriptor stays kept.
+func (w *Worker) closedFDNamed(cs *connState) bool {
+	if !cs.sendIsZC {
+		return true
+	}
+	e := w.closedOps[encodeConnOpKey(cs.fd, cs.generation)]
+	return e == nil || e.fdOps > 0
+}
+
+// releaseKeptFD closes the descriptor a close path left to e (holdsFD): the
+// release closes it when cs goes, or earlier, once only a SEND_ZC
+// notification is still owed (celeris#798). Worker thread only.
+func (w *Worker) releaseKeptFD(e *pendingReleaseEntry) {
+	_ = unix.Close(int(e.fd))
+	e.holdsFD = false
+	w.closeFDOwed--
+}
+
+// keptFD is the descriptor a close path hands to its pendingRelease entry:
+// fd when an op is owed, else -1 (the close path closes it at once).
+func keptFD(fd int, owed bool) int {
+	if owed {
+		return fd
+	}
+	return -1
+}
+
+// closeUnlessOwed is a close path's last step: close(2) now when nothing is
+// owed; otherwise leave the descriptor to its pendingRelease entry, which
+// drainPendingRelease closes at the last owed op's terminal CQE.
+func closeUnlessOwed(fd int, owed bool) {
+	if !owed {
+		_ = unix.Close(fd)
+	}
+}
+
+// shutdownHow is the shutdown(2) of a close path that half-closes: SHUT_WR
+// (the FIN goes out now) as before, and the read side too while an op is
+// owed, so the owed recv ends as soon as the kernel issues it.
+func shutdownHow(owed bool) int {
+	if owed {
+		return unix.SHUT_RDWR
+	}
+	return unix.SHUT_WR
+}
+
+// fastCloseShutdownHow is the shutdown(2) the H1 fast path adds when an op is
+// owed: SHUT_RD, which sends nothing, so the close(2) at the release still
+// decides between FIN and RST as the fast path always did. With a SEND still
+// owed (the closing-drain sweep reaps a conn whose SEND never completed) the
+// write side goes too: a blocked SEND then fails at once, where a cancel
+// alone cannot end it on a kernel whose cancels fail (celeris#682).
+func fastCloseShutdownHow(cs *connState) int {
+	if cs.sending || cs.zcNotifPending {
+		return unix.SHUT_RDWR
+	}
+	return unix.SHUT_RD
+}
+
+// shutdownFDDrainNanos bounds how long worker shutdown waits for the ops still
+// owed on connection descriptors (endOwedOpsAtShutdown). The cancels and the
+// SHUT_RDWR end every one within the first enter or two on a healthy kernel;
+// the bound is for a kernel that never answers, and matches the send drain
+// before it (shutdownSendDrainNanos).
+const shutdownFDDrainNanos int64 = int64(250 * time.Millisecond)
+
+// endOwedOpsAtShutdown is worker shutdown's half of the rule: it ends every op
+// the kernel still owes on a live connection's descriptor, and on a
+// descriptor a close path left to its pendingRelease entry (holdsFD),
+// and closes the latter. shutdown closes the live ones itself, after it.
+//
+// Without it, shutdown closed every descriptor and then the ring. An op whose
+// SQE was still in the SQ ring was harmless there (nothing submits after the
+// closes), and an issued op holds its own file. The exception is an op the
+// kernel had consumed and not issued: a recv linked behind a SEND, or queued
+// as task work when the SEND's CQE was read. Where the ring's teardown still
+// issues such work, it resolves a number shutdown had already freed. So each
+// live connection with an op owed (fdOwed) has its ops cancelled and its
+// socket shut down both ways (a consumed recv then ends as soon as it is
+// issued, a blocked SEND at once), and the ring is run until every such op
+// has delivered its terminal CQE: recv and send completions are retired by
+// staleConnCQE exactly as the loop retires them, and an accept's new
+// descriptor, which nobody will serve, is closed. Everything the SQ ring still
+// holds is submitted by the first enter, which is why this runs before
+// shutdownDrivers closes the driver descriptors. Bounded by
+// shutdownFDDrainNanos; past it (or on a ring error) the descriptors are
+// closed anyway, as shutdown always did. Worker thread only; skipped under
+// SQPOLL (no tier enables it) and without a ring.
+//
+// It waits for the ops that name a descriptor, not for SEND_ZC
+// notifications (celeris#798, see fdOps): a stalled peer can hold one for as
+// long as the socket is open, far past this bound. A live connection's
+// SEND_ZC whose first CQE the drain reads names the descriptor no more
+// either; handleSend, which records that in zcNotifPending, does not run
+// here, so the drain keeps its own note (zcDone) and changes nothing on the
+// connection, which the dispatch goroutine may still read.
+func (w *Worker) endOwedOpsAtShutdown() {
+	var owed []*connState
+	for _, fd := range w.liveConns {
+		cs := w.conns[fd]
+		if cs == nil || !fdOwed(cs) {
+			continue
+		}
+		owed = append(owed, cs)
+	}
+	var zcDone map[*connState]bool
+	// named is fdOwed for the drain: fdOps, less a SEND_ZC it saw complete.
+	named := func(cs *connState) bool {
+		n := fdOps(cs)
+		if zcDone[cs] {
+			n--
+		}
+		return n > 0
+	}
+	pending := func() bool {
+		for _, cs := range owed {
+			if named(cs) {
+				return true
+			}
+		}
+		for i := range w.pendingRelease {
+			if e := &w.pendingRelease[i]; e.holdsFD && e.cs.kernelInflight > 0 && w.closedFDNamed(e.cs) {
+				return true
+			}
+		}
+		return false
+	}
+	if w.ring != nil && !w.sqpoll && pending() {
+		for _, cs := range owed {
+			w.cancelConnOps(cs.fd, cs)
+			_ = unix.Shutdown(cs.fd, unix.SHUT_RDWR)
+		}
+		deadline := time.Now().UnixNano() + shutdownFDDrainNanos
+		for pending() && time.Now().UnixNano() < deadline {
+			if err := w.ring.SubmitAndWaitTimeout(10 * time.Millisecond); err != nil {
+				break
+			}
+			head, tail := w.ring.BeginCQ()
+			for ; head != tail; head++ {
+				c := w.ring.cqeAt(head)
+				ud := c.UserData
+				switch ud & udMask {
+				case udRecv, udSend:
+					fd := int(ud & fdMask)
+					// A live connection's SEND_ZC completing (F_MORE marks
+					// only that on a send; a connection has one send in
+					// flight at most): noted, or its notification would be
+					// waited for as an op on the descriptor. A closed
+					// identity's is counted by staleConnCQE.
+					if ud&udMask == udSend && cqeHasMore(c.Flags) && fd < len(w.conns) {
+						if cs := w.conns[fd]; cs != nil && cs.generation == decodeGen(ud) && !cs.zcNotifPending {
+							if zcDone == nil {
+								zcDone = make(map[*connState]bool)
+							}
+							zcDone[cs] = true
+						}
+					}
+					w.staleConnCQE(c, fd, ud)
+				case udAccept:
+					if c.Res >= 0 && !w.fixedFiles {
+						_ = unix.Close(int(c.Res))
+					}
+				}
+			}
+			w.ring.EndCQ(head)
+		}
+	}
+	for i := range w.pendingRelease {
+		if e := &w.pendingRelease[i]; e.holdsFD {
+			_ = unix.Close(int(e.fd))
+			e.holdsFD = false
+		}
+	}
+	w.closeFDOwed = 0
 }
