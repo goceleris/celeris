@@ -119,11 +119,13 @@ var errUnstageSendfile = errors.New("celeris: epoll: reading a staged sendfile r
 // (bodyBuf) and then a sendfile response, into writeBuf, in the order the
 // flush sends them (writeBuf, bodyBuf, sendfile), so that bytes written next
 // go out after them: every writer appends to writeBuf, which the flush sends
-// first (celeris#802). The body is copied; the sendfile's unsent header and
-// file bytes are read in and its descriptor closed. Only a write that
-// follows a large body or a file response before the flush pays for it: the
-// next pipelined response. Reports false if the file could not be read; the
-// conn must then be closed, its response being lost either way.
+// first (celeris#802). The body is copied: that is what the kernel did not
+// take of the writev makeWriteBodyFn makes, which never leaves a body staged
+// past its call (celeris#817). The sendfile's unsent header and file bytes
+// are read in and its descriptor closed; only a write that follows a file
+// response before the flush pays for that: the next pipelined response.
+// Reports false if the file could not be read; the conn must then be closed,
+// its response being lost either way.
 func unstage(cs *connState) bool {
 	if cs.bodyBuf != nil {
 		cs.writeBuf = append(cs.writeBuf, cs.bodyBuf...)

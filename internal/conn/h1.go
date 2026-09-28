@@ -39,6 +39,12 @@ var ErrAsyncDispatch = errors.New("celeris: route requires async dispatch")
 // The engine must not close or reuse the FD after receiving this error.
 var ErrHijacked = errors.New("celeris: connection hijacked")
 
+// ErrWriteBacklog is returned by ProcessH1 when a request finds the
+// connection's unsent responses over the engine's back-pressure limit
+// (H1State.WriteBacklogged). Its handler has NOT run. The engine closes the
+// connection once what is queued has gone out (celeris#761).
+var ErrWriteBacklog = errors.New("celeris: unsent responses over the back-pressure limit: request not served")
+
 // ClearHeaderDeadline drops the slowloris-defence read-header deadline
 // — called after a successful ParseRequest signals that the next state
 // is request handling, not header reading. The engine's checkTimeouts
@@ -254,6 +260,19 @@ type H1State struct {
 	// path and on pure-sync / pure-async servers (no behavior change).
 	InlineMode bool
 	RouteAsync func(method, path string) bool
+
+	// WriteBacklogged, set by an engine that queues responses (epoll,
+	// io_uring), reports whether the connection's responses still unsent
+	// are over the engine's back-pressure limit: a client that stopped
+	// reading while it kept sending requests. It is asked before each
+	// request's handler runs (handleH1Request); a request that finds such
+	// a backlog is not served, and ProcessH1 returns ErrWriteBacklog. The
+	// limit is held per request, not per write (celeris#761): a response
+	// is staged whole however large it is and in however many writes it
+	// comes (a StreamWriter's chunks), where a limit per write cut it off
+	// mid-body. Called on the goroutine running ProcessH1, under the
+	// engine's lock for the connection's buffers if it has one.
+	WriteBacklogged func() bool
 }
 
 // TakeBufferedBytes returns a copy of any bytes ProcessH1 stashed in the
@@ -326,11 +345,15 @@ func (s *H1State) UpdateWriteFn(fn func([]byte)) {
 // SetWriteBodyFn installs a scatter-gather body writer on the response
 // adapter. When non-nil, WriteResponse for large bodies bypasses the
 // respBuf → cs.writeBuf copy and hands the body slice straight to the
-// engine for a single WRITEV/sendmsg submission. Callers must not mutate
-// the body slice after a writeBody call until the response returns (the
-// engine keeps a reference until the SEND CQE fires). The std engine and
-// adapters that cannot express scatter-gather may leave this unset; the
-// adapter then falls back to the single-buffer path.
+// engine. The engine must not keep a reference to the body once fn returns
+// (celeris#817): the body belongs to the handler, which may reuse it as soon
+// as its write returns, as net/http allows. c.JSON puts its encode buffer
+// back in a pool at once, and a buffered response's body lives on a pooled
+// Context. So fn writes the body to the socket itself and copies what the
+// socket did not take (epoll); an engine that cannot finish its write
+// before returning (io_uring, whose kernel reads a WRITEV's iovec when the
+// ring is next entered) leaves this unset, and the adapter then copies the
+// body into the write buffer.
 func (s *H1State) SetWriteBodyFn(fn func([]byte)) {
 	s.rw.writeBody = fn
 }
@@ -934,6 +957,10 @@ func expectHeaders(req *h1.Request) [][2]string {
 
 func handleH1Request(ctx context.Context, state *H1State, body []byte,
 	handler stream.Handler, write func([]byte)) error {
+
+	if state.WriteBacklogged != nil && state.WriteBacklogged() {
+		return ErrWriteBacklog
+	}
 
 	req := &state.req
 	s := populateCachedStream(state, req, body)

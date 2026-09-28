@@ -124,7 +124,7 @@ func TestLargeResponseIsDelivered(t *testing.T) {
 // against the cap and closed mid-file; elsewhere it is read into memory and
 // written like a Blob.
 func TestLargeFileResponseIsDelivered(t *testing.T) {
-	sizes := []int{4<<20 + 1, 64 << 20}
+	sizes := []int{4<<20 + 1, 16 << 20}
 	bodies := bodies761(sizes...)
 	dir := t.TempDir()
 	for _, n := range sizes {
@@ -158,8 +158,12 @@ func TestLargeFileResponseIsDelivered(t *testing.T) {
 // knowledge). net/http's client opens a 4 MiB stream window, so a larger body
 // leaves up to 4 MiB of frames queued behind the socket: io_uring's check
 // after the handler closed the connection on that backlog, at exactly 4 MiB.
+// The largest body is 16 MiB, not 64 MiB: an HTTP/2 transfer on the native
+// engines is about ten times slower than on std under -race (celeris#809),
+// and the four windows it spans cover what the 4 MiB cut and a 4 MiB cap on
+// HTTP/2 conns could do to it.
 func TestLargeResponseIsDeliveredH2(t *testing.T) {
-	sizes := []int{4<<20 - 4096, 4<<20 + 1, 64 << 20}
+	sizes := []int{4<<20 - 4096, 4<<20 + 1, 16 << 20}
 	bodies := bodies761(sizes...)
 	for _, e := range engines761 {
 		for _, route := range []string{"sync", "async-route"} {
@@ -351,12 +355,14 @@ func TestPipelinedResponsesKeepTheirOrder(t *testing.T) {
 // TestBackloggedPeerIsClosed is the other side of the cap: a peer that sends
 // requests without reading the responses must not make the engine buffer
 // without bound, nor be left waiting. Four requests for 3 MiB each, in one
-// packet, to a client that reads nothing for a while: the native engines stage
-// responses until the backlog they find is over the cap, then refuse the
-// next write and close the connection once what was staged has gone out. The
-// client must get whole responses, in order, followed by either the rest or
-// EOF; before celeris#761 the refused response was dropped and the client
-// waited for it.
+// packet, to a client that reads nothing for a while: the native engines
+// serve requests until one finds the unsent responses over the 4 MiB cap,
+// which is not served, and close the connection once what was staged has
+// gone out. The client must get whole responses, in order, then EOF: fewer
+// than it asked for from the native engines (the cap bounds what they
+// buffer), all of them from std, whose handler blocks on the socket instead.
+// Before celeris#761 the refused response was dropped and the client waited
+// for it.
 func TestBackloggedPeerIsClosed(t *testing.T) {
 	const n = 3 << 20
 	const requests = 4
@@ -406,6 +412,56 @@ func TestBackloggedPeerIsClosed(t *testing.T) {
 				t.Logf("%s/%s: %d of %d responses, then the close", e.name, sh.name, whole, requests)
 				if whole == 0 {
 					t.Fatalf("%s/%s: no response at all", e.name, sh.name)
+				}
+				if e.eng != celeris.Std && whole == requests {
+					t.Fatalf("%s/%s: all %d responses (%d MiB) were staged for a client that read nothing: the 4 MiB back-pressure cap did not apply", e.name, sh.name, requests, requests*n>>20)
+				}
+			})
+		}
+	}
+}
+
+// TestStreamedResponseIsDelivered streams 8 MiB through c.StreamWriter, in
+// 1 MiB chunks, without detaching. The native engines buffer every chunk
+// until the handler returns, and the cap, when it was held per write, took a
+// response's own earlier chunks for a backlog: everything after 4 MiB was
+// dropped, and the connection left open (before celeris#761's first fix) or
+// closed (after it). The limit is now held per request.
+func TestStreamedResponseIsDelivered(t *testing.T) {
+	const chunks, chunk = 8, 1 << 20
+	want := bodies761(chunks * chunk)[chunks*chunk]
+	for _, e := range engines761 {
+		for _, route := range []string{"sync", "async-route"} {
+			t.Run(e.name+"/"+route, func(t *testing.T) {
+				addr := startServer761(t, e.eng, false, func(s *celeris.Server) {
+					r := s.GET("/stream", func(c *celeris.Context) error {
+						sw := c.StreamWriter()
+						if sw == nil {
+							return errors.New("no StreamWriter")
+						}
+						if err := sw.WriteHeader(http.StatusOK, [][2]string{{"content-type", "application/octet-stream"}}); err != nil {
+							return err
+						}
+						for i := range chunks {
+							if _, err := sw.Write(want[i*chunk : (i+1)*chunk]); err != nil {
+								return err
+							}
+						}
+						return sw.Close()
+					})
+					if route == "async-route" {
+						r.Async()
+					}
+				})
+				for _, keepAlive := range []bool{true, false} {
+					mode := "keep-alive"
+					if !keepAlive {
+						mode = "close"
+					}
+					t.Run(mode, func(t *testing.T) {
+						desc := fmt.Sprintf("%s/%s streamed %d MiB %s", e.name, route, chunks*chunk>>20, mode)
+						checkH1Response761(t, addr, "/stream", desc, want, keepAlive)
+					})
 				}
 			})
 		}
@@ -547,7 +603,8 @@ func checkH1Response761(t *testing.T, addr, target, desc string, want []byte, ke
 	if err != nil {
 		t.Fatalf("%s: no response head (%d bytes received, %s)", desc, cr.n, describeReadEnd761(err))
 	}
-	if resp.StatusCode != http.StatusOK || resp.ContentLength != int64(n) {
+	chunked := len(resp.TransferEncoding) > 0 && resp.ContentLength == -1
+	if resp.StatusCode != http.StatusOK || (resp.ContentLength != int64(n) && !chunked) {
 		t.Fatalf("%s: status %d, Content-Length %d", desc, resp.StatusCode, resp.ContentLength)
 	}
 	got := make([]byte, n)
@@ -562,6 +619,9 @@ func checkH1Response761(t *testing.T, addr, target, desc string, want []byte, ke
 			i++
 		}
 		t.Fatalf("%s: all bytes arrived but differ from byte %d on", desc, i)
+	}
+	if k, err := resp.Body.Read(make([]byte, 1)); k != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("%s: the body did not end after %d bytes (%d more, %v)", desc, n, k, err)
 	}
 	_ = resp.Body.Close()
 

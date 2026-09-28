@@ -1895,11 +1895,16 @@ func (l *Loop) initProtocol(cs *connState) {
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
+		// Back-pressure for HTTP/1 is held per request (celeris#761): a
+		// request that finds the conn's unsent responses over the limit is
+		// not served, and the conn is closed once they have gone out.
+		cs.h1State.WriteBacklogged = cs.overBacklogH1
 		// Scatter-gather body writer: handler hands large bodies to the
-		// engine as a zero-copy slice; flushWrites emits writev(2) with
-		// [headers, body] so we save the respBuf → writeBuf memcpy.
-		// Disabled in async mode because cs.bodyBuf access would race
-		// with the dispatch goroutine without a mutex.
+		// engine as a zero-copy slice, which it writes at once with
+		// writev(2) of [headers, body], saving the respBuf → writeBuf
+		// memcpy (see makeWriteBodyFn). Disabled in async mode because
+		// cs.bodyBuf access would race with the dispatch goroutine
+		// without a mutex.
 		if !l.async {
 			cs.h1State.SetWriteBodyFn(l.makeWriteBodyFn(cs))
 			// Zero-copy sendfile(2) for large static-file responses: the
@@ -2191,18 +2196,18 @@ func (l *Loop) switchToH2Local(cs *connState, writeFn func([]byte)) error {
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		// Back-pressure: refuse the write only when the backlog before it is
-		// over the cap (see writeCap), and say so, so the conn is closed
-		// rather than left waiting for bytes that will not come (celeris#761).
-		// pendingBytes already counts a staged bodyBuf.
+		// Back-pressure (an HTTP/2 or detached conn; see writeCap): refuse
+		// the write only when the backlog before it is over the cap, and
+		// say so, so the conn is closed rather than left waiting for bytes
+		// that will not come (celeris#761).
 		if cs.pendingBytes > cs.writeCap() {
 			cs.writeRefused = true
 			return
 		}
-		// A zero-copy body or sendfile is staged, and the flush sends
-		// writeBuf before them: bytes written after them (the next
-		// pipelined response) would go out ahead (celeris#802).
-		if (cs.bodyBuf != nil || cs.sendfile != nil) && !unstage(cs) {
+		// A sendfile is staged, and the flush sends writeBuf before it:
+		// bytes written after it (the next pipelined response) would go
+		// out ahead (celeris#802).
+		if cs.sendfile != nil && !unstage(cs) {
 			cs.writeRefused = true
 			return
 		}
@@ -2214,30 +2219,33 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	}
 }
 
-// makeWriteBodyFn stages a zero-copy body slice for scatter-gather
-// writev at flush time. The body is NOT copied — it must remain valid
-// and unmutated until flushWrites drains it. Used by the H1 response
-// adapter for bodies ≥ 8 KiB to skip the respBuf → writeBuf memcpy.
+// makeWriteBodyFn returns the zero-copy body writer of the H1 response
+// adapter, for bodies of 8 KiB or more: the body goes to the kernel straight
+// from the handler's memory, one writev(2) of [writeBuf, body], skipping the
+// respBuf → writeBuf memcpy. The write is made here, in the call, and what
+// the kernel does not take is copied into writeBuf before it returns: the
+// body belongs to the handler, which may reuse it as soon as its write
+// returns. c.JSON puts its buffer back in a pool at once, where the next
+// handler to encode takes it, and a buffered response's body lives on a
+// pooled Context; a body staged for a flush after the handler went out as
+// the next request's bytes, or another connection's (celeris#817). The
+// syscall is the one the flush after the handler would have made. Runs on
+// the loop thread: the hook is installed only in sync mode.
 func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 	return func(body []byte) {
-		// The body itself is not held against the cap: a response larger
-		// than the cap is staged whole, and only a backlog already over it
-		// refuses the write (celeris#761; see writeCap and makeWriteFn).
-		if cs.pendingBytes > cs.writeCap() {
-			cs.writeRefused = true
-			return
-		}
-		// A second large body in the same flush (a pipelined response), or
-		// one behind a staged sendfile: there is one writev body slot, so
-		// what is staged moves into writeBuf, where it stays ahead of this
-		// body, and this body takes the slot. Copying this one into writeBuf
-		// instead sent it before the staged body (celeris#802).
-		if (cs.bodyBuf != nil || cs.sendfile != nil) && !unstage(cs) {
+		// A staged sendfile goes out before this body (celeris#802).
+		if cs.sendfile != nil && !unstage(cs) {
 			cs.writeRefused = true
 			return
 		}
 		cs.bodyBuf = body
-		cs.pendingBytes += len(body)
+		err := l.flushWrites(cs, true)
+		unstage(cs) // what the kernel did not take; no sendfile is staged
+		cs.pendingBytes = csPendingBytes(cs)
+		if err != nil {
+			// The response is lost with the conn: close it.
+			cs.writeRefused = true
+		}
 	}
 }
 
@@ -2266,6 +2274,7 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, offset, length int64) error {
 	return func(header []byte, file *os.File, offset, length int64) error {
 		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true // the staged response is cut: close
 			return errUnstageSendfile
 		}
 		dupfd, err := unix.Dup(int(file.Fd()))
@@ -2292,8 +2301,9 @@ func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, 
 // the response is delivered byte-exact, just without the syscall savings.
 func bufferedFileFallback(cs *connState, header []byte, file *os.File, offset, length int64) error {
 	// This response is appended to writeBuf, which goes out before a
-	// staged body or sendfile (celeris#802).
-	if (cs.bodyBuf != nil || cs.sendfile != nil) && !unstage(cs) {
+	// staged sendfile (celeris#802).
+	if cs.sendfile != nil && !unstage(cs) {
+		cs.writeRefused = true // the staged response is cut: close
 		return errUnstageSendfile
 	}
 	if length <= 0 {

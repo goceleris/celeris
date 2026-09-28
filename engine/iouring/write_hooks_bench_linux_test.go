@@ -4,12 +4,12 @@ package iouring
 
 import "testing"
 
-// BenchmarkWriteHooks measures the per-response cost of the write hooks the
-// H1 response adapter calls (makeWriteFn, makeWriteBodyFn), whose
-// back-pressure check celeris#761 changed: a header block and a small body
-// through writeFn, and a header block and a 16 KiB zero-copy body through
-// writeFn + writeBodyFn. The buffers are reset as a completed send leaves
-// them.
+// BenchmarkWriteHooks measures the per-response cost of the write hook the
+// H1 response adapter calls (makeWriteFn), whose back-pressure check
+// celeris#761 changed: a header block and a small body, and a header block
+// and a 16 KiB body. The adapter copies every body through makeWriteFn since
+// io_uring has no zero-copy body writer (celeris#817), so the 16 KiB case
+// includes that copy. The buffers are reset as a completed send leaves them.
 func BenchmarkWriteHooks(b *testing.B) {
 	hdr := make([]byte, 121)
 	small := make([]byte, 64)
@@ -25,16 +25,15 @@ func BenchmarkWriteHooks(b *testing.B) {
 			cs.writeBuf = cs.writeBuf[:0]
 		}
 	})
-	b.Run("zero-copy-body", func(b *testing.B) {
+	b.Run("large-body", func(b *testing.B) {
 		w := &Worker{}
 		cs := &connState{}
-		wf, wb := w.makeWriteFn(cs), w.makeWriteBodyFn(cs)
+		wf := w.makeWriteFn(cs)
 		b.ReportAllocs()
 		for b.Loop() {
 			wf(hdr)
-			wb(large)
+			wf(large)
 			cs.writeBuf = cs.writeBuf[:0]
-			cs.bodyBuf = nil
 		}
 	})
 }

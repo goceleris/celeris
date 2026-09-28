@@ -280,18 +280,33 @@ const shutdownSendDrainNanos int64 = int64(250 * time.Millisecond)
 // backstops for an operation the kernel may never complete, and keeping them
 // on one scale means a wedged conn is fully reclaimed — fd here, connState
 // when the close-path ASYNC_CANCEL's terminal CQE lands — inside one such
-// window rather than two unrelated ones. It is deliberately NOT derived from
-// cfg.WriteTimeout: that governs a LIVE conn whose handler is still producing
-// bytes at its own pace, whereas a closing conn's queue is final (writeFn
-// no-ops once detachClosed is set, drainDetachQueue skips it, and handleRecv
-// drops incoming data on a closing conn), so this is not a throughput budget
-// but the point at which we conclude the peer will never take the bytes.
+// window rather than two unrelated ones. It is the floor of the bound, not
+// the bound: closingDrainBound extends it to cfg.WriteTimeout, since the
+// queue of a closing conn can be a whole response (celeris#761). Either way
+// it is not a throughput budget but the point at which we conclude the peer
+// will never take the bytes: the clock restarts whenever it takes some. A
+// closing conn's queue is final (writeFn no-ops once detachClosed is set,
+// drainDetachQueue skips it, and handleRecv drops incoming data on a closing
+// conn).
 //
 // Prompt completions are untouched: the SEND CQE normally lands within a loop
 // pass or two — microseconds on localhost, four orders of magnitude inside
 // this window — so a conn whose sends drain still closes via completeSend's
 // path and never reaches the sweep.
 const closingDrainTimeoutNanos int64 = int64(5 * time.Second)
+
+// closingDrainBound is how long a closing conn may go without the peer
+// taking a byte of what is queued before checkTimeouts tears it down: the
+// longer of closingDrainTimeoutNanos and cfg.WriteTimeout, the bound a live
+// conn stalled on a write gets. completeSend restamps the clock on every send
+// that makes progress. A closing conn may carry a whole response, not only
+// its last bytes: a response larger than the socket buffers answering
+// Connection: close, or followed by a request error. A client that paused
+// reading it for more than 5 s, where it had WriteTimeout on a keep-alive
+// conn, lost its tail (celeris#761).
+func (w *Worker) closingDrainBound() int64 {
+	return max(closingDrainTimeoutNanos, int64(w.cfg.WriteTimeout))
+}
 
 // Worker is an io_uring event-loop worker pinned to a single OS thread.
 type Worker struct {
@@ -2524,17 +2539,19 @@ func (w *Worker) initProtocol(cs *connState) {
 		if !w.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
-		// Wire the scatter-gather body writer so the H1 response adapter
-		// can hand large bodies straight to the WRITEV path without the
-		// intermediate respBuf → cs.writeBuf memcpy. writeBodyFn stores
-		// the body slice on the connState; flushSend emits an iovec SQE.
-		// Only enabled on the synchronous inline-handler path: async
-		// mode handlers run on goroutines and need detachMu-guarded
-		// access to cs.bodyBuf, which the current writer does not
-		// provide. Async mode falls back to the copy path.
-		if !w.async {
-			cs.h1State.SetWriteBodyFn(w.makeWriteBodyFn(cs))
-		}
+		// Back-pressure for HTTP/1 is held per request (celeris#761): a
+		// request that finds the conn's unsent responses over the limit is
+		// not served, and the conn is closed once they have gone out.
+		cs.h1State.WriteBacklogged = cs.overBacklogH1
+		// No zero-copy body writer (SetWriteBodyFn): the H1 response
+		// adapter copies every body into writeBuf. A body the WRITEV path
+		// left in place was read by the kernel only at the next
+		// io_uring_enter, after the handlers of the other conns in the same
+		// completion batch had run, and the body belongs to the handler,
+		// which may reuse it as soon as its write returns: c.JSON puts its
+		// buffer back in a pool at once, where the next handler to encode
+		// takes it, so one conn's response went out with another's bytes
+		// (celeris#817).
 		cs.h1State.OnDetach = func() {
 			// Async mode may have already allocated detachMu in
 			// acquireConnState; reuse it so the async goroutine and the
@@ -3772,6 +3789,13 @@ func (w *Worker) completeSend(cs *connState, fd int, sent int, now int64, fromZC
 	// (covers regular SEND and the SEND_ZC NOTIF path, both of which
 	// reach completeSend with the byte count).
 	w.bytesWrittenBatch += uint64(sent)
+	if cs.closing && sent > 0 {
+		// The closing drain's clock (closingDrainBound) measures how long
+		// the peer has taken nothing, not how long the drain has run: a
+		// response larger than the socket buffers to a client that reads
+		// it steadily is not cut off (celeris#761).
+		cs.lastActivity = now
+	}
 	// celeris#591: the ring-send share of those bytes. Plain local add on
 	// the per-request send path — it is published with one atomic per
 	// event-loop iteration next to bytesWrittenBatch, never per request.
@@ -4901,22 +4925,14 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		if cs.closing {
 			return
 		}
-		// Back-pressure: refuse the write only when the backlog before it
-		// is over the cap (see sendCap), and say so: the site that ran the
-		// handler then closes the conn (celeris#761), where it used to be
-		// left waiting for the refused bytes.
+		// Back-pressure (an HTTP/2 or detached conn; see sendCap): refuse
+		// the write only when the backlog before it is over the cap, and
+		// say so: the site that ran the handler then closes the conn
+		// (celeris#761), where it used to be left waiting for the refused
+		// bytes.
 		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > cs.sendCap() {
 			cs.writeRefused = true
 			return
-		}
-		if cs.bodyBuf != nil {
-			// A zero-copy body is staged, and flushSend sends writeBuf
-			// before it: bytes written after the body (the next pipelined
-			// response) would go out ahead of it. Move the body into
-			// writeBuf first, a copy paid only when a write follows a large
-			// body before the flush (celeris#802).
-			cs.writeBuf = append(cs.writeBuf, cs.bodyBuf...)
-			cs.bodyBuf = nil
 		}
 		// Append to writeBuf — no per-write allocation. The kernel holds
 		// sendBuf (not writeBuf), so appending here is safe.
@@ -4924,44 +4940,6 @@ func (w *Worker) makeWriteFn(cs *connState) func([]byte) {
 		// handler returns. Only markDirty if flushSend fails (SQ ring
 		// full), avoiding linked-list overhead on the happy path.
 		cs.writeBuf = append(cs.writeBuf, data...)
-	}
-}
-
-// makeWriteBodyFn returns a closure that stores a zero-copy body reference
-// for scatter-gather send via IORING_OP_WRITEV. The body slice is NOT
-// copied — it must remain valid and unmutated until completeSend clears
-// cs.sendBody. For HTTP/1 response writers calling
-// writeBody(pre-computed-response) this is always safe; handlers that
-// generate bodies per-request should only call writeBody once with a
-// slice they do not mutate further.
-//
-// Saves one full body-sized memcpy per request: the traditional path
-// appends body into a.respBuf, then writeFn appends respBuf into
-// cs.writeBuf (two userspace copies of body bytes). With writeBody, the
-// body stays in the handler's memory; the engine issues a single WRITEV
-// SQE with iovec = [sendBuf (headers), body (alias)] and the kernel
-// does one copy directly to the socket buffer.
-func (w *Worker) makeWriteBodyFn(cs *connState) func([]byte) {
-	return func(body []byte) {
-		if cs.closing {
-			return
-		}
-		// The body itself is not held against the cap: a response larger
-		// than the cap is staged whole, and only a backlog already over it
-		// refuses the write (celeris#761; see sendCap and makeWriteFn).
-		if len(cs.writeBuf)+len(cs.sendBuf)+len(cs.bodyBuf) > cs.sendCap() {
-			cs.writeRefused = true
-			return
-		}
-		if cs.bodyBuf != nil {
-			// A second large body before the flush (a pipelined response):
-			// there is one iovec entry for a body, so the staged body moves
-			// into writeBuf, where it stays ahead of this one, and this one
-			// takes the entry. Copying this one into writeBuf instead sent
-			// it before the staged body (celeris#802).
-			cs.writeBuf = append(cs.writeBuf, cs.bodyBuf...)
-		}
-		cs.bodyBuf = body
 	}
 }
 
@@ -5870,7 +5848,7 @@ func (w *Worker) checkTimeouts() {
 			w.rescueHold(cs)
 		}
 		if cs.closing {
-			if now-cs.lastActivity > closingDrainTimeoutNanos {
+			if now-cs.lastActivity > w.closingDrainBound() {
 				// Everything closeConn does before deferring (detach
 				// signalling, CloseH1, detachedCount) has already run, so
 				// finish exactly where completeSend would have. removeDirty
