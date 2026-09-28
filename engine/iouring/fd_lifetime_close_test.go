@@ -8,8 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,39 +28,6 @@ import (
 // every build and need one ring (or one worker), so they run in the CI `unit`
 // job's shape; the trials that force the theft itself are the -tags=validation
 // TestRecvTheft715ArmA, TestRecvTheft685Linked and TestRecvTheft685Hijack*.
-
-// fdTarget returns what /proc/self/fd/<fd> names ("socket:[inode]" for a
-// socket), or "" when fd is not open.
-func fdTarget(fd int) string {
-	s, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
-	if err != nil {
-		return ""
-	}
-	return s
-}
-
-// serverFDFor returns this process's descriptor whose peer is local (the
-// server side of a loopback connection the test dialed), or -1.
-func serverFDFor(local string) int {
-	ents, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return -1
-	}
-	for _, ent := range ents {
-		fd, err := strconv.Atoi(ent.Name())
-		if err != nil {
-			continue
-		}
-		sa, err := unix.Getpeername(fd)
-		if err != nil {
-			continue
-		}
-		if sockaddrString(sa) == local {
-			return fd
-		}
-	}
-	return -1
-}
 
 // TestPendingReleaseEntryStaysTwentyFourBytes pins that the celeris#685 hold
 // (holdsFD, fd) fits in the padding after detached: the queue is appended to
