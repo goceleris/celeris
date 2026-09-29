@@ -5,7 +5,6 @@ package epoll
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"testing"
@@ -37,9 +36,16 @@ func (h *bigResponseHandler) HandleStream(_ context.Context, s *stream.Stream) e
 }
 
 // TestWriteBufBackpressureClosesSlowConsumer is a best-effort
-// end-to-end assertion of the maxPendingBytes / WriteTimeout close
-// path: a slow consumer must not cause unbounded server-side
-// buffering.
+// end-to-end assertion of the timeout close path: a slow consumer must
+// not hold server-side buffering for longer than the timeouts allow.
+// Since celeris#761 a single response larger than maxPendingBytes is
+// staged whole rather than closed at once (the cap is held per request,
+// not per write), so it is the timeout sweep, here ReadTimeout, that
+// closes a consumer that never reads it. The assertion is the server's:
+// its conn count goes back to zero. What the client sees after the close is
+// the kernel sending the send queue it still holds, into a 4 KiB window
+// that the zero-window probes' backoff opens seconds apart, so a client
+// deadline measured that backoff, not the engine.
 //
 // The test is marked t.Skip by default because reliably triggering
 // the backpressure path on loopback TCP is hard — Linux's
@@ -72,6 +78,7 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 		Addr:         addr,
 		Protocol:     engine.HTTP1,
 		WriteTimeout: 200 * time.Millisecond,
+		ReadTimeout:  200 * time.Millisecond,
 		Resources: resource.Resources{
 			Workers: 2,
 		},
@@ -110,11 +117,9 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 	}
 
 	// Send GET. Deliberately DO NOT read the response — we want the
-	// server's writeBuf to fill and either maxPendingBytes trip or
-	// WriteTimeout fire. lastActivity on the server does not
-	// advance after the GET (no further client→server data), and
-	// pendingBytes climbs past writeCap (4 MiB) as soon as the
-	// handler writes the 50 MiB body.
+	// server's writeBuf to fill and the timeout sweep to fire.
+	// lastActivity on the server does not advance after the GET (no
+	// further client→server data).
 	req := "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
 	if _, err := fmt.Fprint(tcp, req); err != nil {
 		t.Fatalf("write: %v", err)
@@ -122,26 +127,17 @@ func TestWriteBufBackpressureClosesSlowConsumer(t *testing.T) {
 
 	// Hold — don't read at all. The inline flush after the handler
 	// runs attempts unix.Write of the full 50 MiB body; kernel
-	// absorbs at most a few hundred KiB before EAGAIN. That leaves
-	// pendingBytes >> writeCap, which drainRead's post-flush check
-	// or checkTimeouts converts into closeConn.
+	// absorbs at most a few hundred KiB before EAGAIN. The rest waits
+	// on EPOLLOUT until checkTimeouts converts the stalled conn into
+	// closeConn.
 	time.Sleep(500 * time.Millisecond)
 
-	// Now the server should have closed us. Read should drain
-	// whatever the kernel absorbed + hit EOF.
-	_ = tcp.SetReadDeadline(time.Now().Add(3 * time.Second))
-	drain := make([]byte, 64<<10)
-	for {
-		_, rerr := tcp.Read(drain)
-		if rerr != nil {
-			if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
-				return
-			}
-			// ECONNRESET / broken pipe count as server-terminated.
-			if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
-				t.Fatalf("conn stayed open past deadline; backpressure/timeout did not fire")
-			}
-			return
+	// Now the server should have closed the conn (the sweep runs at
+	// least every few hundred ms under these timeouts).
+	for end := time.Now().Add(3 * time.Second); e.Metrics().ActiveConnections != 0; {
+		if time.Now().After(end) {
+			t.Fatalf("the server still holds %d conn(s) 3.5s after the request; the timeout close did not fire", e.Metrics().ActiveConnections)
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

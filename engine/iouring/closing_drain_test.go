@@ -129,3 +129,58 @@ func TestCheckTimeoutsLetsFreshClosingConnDrain(t *testing.T) {
 		t.Errorf("liveConns = %d, want 1", got)
 	}
 }
+
+// TestCheckTimeoutsGivesClosingConnItsWriteTimeout guards celeris#761 on the
+// closing drain: a closing conn can carry a whole response (one larger than
+// the socket buffers, answering Connection: close), and the sweep reaped it
+// closingDrainTimeoutNanos (5 s) after the close, where the same response on
+// a keep-alive conn gets WriteTimeout: a client that paused reading it for 6
+// s lost its tail. The bound is now the longer of the two.
+func TestCheckTimeoutsGivesClosingConnItsWriteTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		idle  time.Duration // how long the peer has taken nothing
+		wt    time.Duration // cfg.WriteTimeout (0: disabled)
+		reaps bool
+	}{
+		{"6s-idle-writetimeout-60s", 6 * time.Second, 60 * time.Second, false},
+		{"61s-idle-writetimeout-60s", 61 * time.Second, 60 * time.Second, true},
+		{"6s-idle-writetimeout-off", 6 * time.Second, 0, true},
+		{"4s-idle-writetimeout-200ms", 4 * time.Second, 200 * time.Millisecond, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ring := newTestRing(t)
+			w, cs := newClosingDrainWorker(t, ring)
+			w.cfg.WriteTimeout = tc.wt
+			fd := cs.fd
+			cs.closing = true
+			cs.lastActivity = time.Now().Add(-tc.idle).UnixNano()
+			w.checkTimeouts()
+			if reaped := w.conns[fd] == nil; reaped != tc.reaps {
+				t.Fatalf("closing conn idle %v with WriteTimeout %v: reaped=%v, want %v", tc.idle, tc.wt, reaped, tc.reaps)
+			}
+		})
+	}
+}
+
+// TestCompleteSendRestampsClosingDrain guards the other half: the closing
+// drain's clock measures how long the peer has taken nothing, so a send that
+// makes progress restarts it. Without that, a client that reads a large
+// response steadily, but for longer than the bound, is cut off.
+func TestCompleteSendRestampsClosingDrain(t *testing.T) {
+	ring := newTestRing(t)
+	w, cs := newClosingDrainWorker(t, ring)
+	fd := cs.fd
+	cs.closing = true
+	stale := time.Now().Add(-time.Hour).UnixNano()
+	cs.lastActivity = stale
+	cs.sendBuf = make([]byte, 64<<10) // a response tail, 1 KiB of it sent below
+	now := time.Now().UnixNano()
+	w.completeSend(cs, fd, 1<<10, now, false)
+	if w.conns[fd] != cs {
+		t.Fatalf("a partial send closed the closing conn")
+	}
+	if cs.lastActivity != now {
+		t.Fatalf("a send that made progress left the closing drain's clock %v stale", time.Duration(now-cs.lastActivity))
+	}
+}

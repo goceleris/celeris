@@ -784,7 +784,12 @@ func (p *Processor) executeHandler(stream *Stream) {
 	}
 
 	if state == StateOpen || state == StateHalfClosedRemote {
-		if stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0 {
+		// Under the stream's lock, as every access of the buffer is: the
+		// event loop sends and resets it on a WINDOW_UPDATE (celeris#822).
+		stream.mu.RLock()
+		pending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
+		stream.mu.RUnlock()
+		if pending {
 			return
 		}
 
