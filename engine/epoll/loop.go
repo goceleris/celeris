@@ -696,20 +696,36 @@ func (l *Loop) run(ctx context.Context) {
 
 		// Drain H2 async write queues. Handler goroutines enqueue response
 		// frame bytes; we drain them into writeBuf and flush to the wire.
-		for _, fd := range l.h2Conns {
+		// By index, from the end: a close below swap-removes the conn from
+		// h2Conns, which a range would then skip one entry past.
+		for i := len(l.h2Conns) - 1; i >= 0; i-- {
+			fd := l.h2Conns[i]
 			cs := l.conns[fd]
 			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
 				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if cs.writeRefused {
+					// A frame refused on back-pressure is lost, and the
+					// connection's framing with it: close (celeris#761).
+					l.closeWhenFlushed(cs)
+					continue
+				}
 				if cs.writePos < len(cs.writeBuf) {
 					if fErr := l.flushWrites(cs, true); fErr != nil {
 						l.removeDirty(cs)
 						l.closeConn(fd)
+						continue
 					} else if cs.writePos < len(cs.writeBuf) {
 						// Send buffer full: arm EPOLLOUT instead of the dirty
 						// list so we don't busy-poll the backpressured H2 conn.
 						l.armEpollOut(cs)
 					}
 				}
+				// Resync pendingBytes, as every other flush point does: the
+				// write hook added every frame drained above to it, and left
+				// alone it outgrew what is really queued until the hook
+				// refused frames of a conn that had nothing queued
+				// (celeris#761).
+				cs.pendingBytes = csPendingBytes(cs)
 			}
 		}
 
@@ -789,6 +805,17 @@ func (l *Loop) run(ctx context.Context) {
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
 			l.transplantInFlight == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
+			// A parked loop holds nothing, and sweep() — whose empty-set
+			// retraction is what clears this loop's share of the residual
+			// gauges while it runs — does not run again until it wakes. A
+			// last connection that left AFTER this iteration's sweep() (the
+			// tick-gate checkTimeouts above, the detach queue, the dirty
+			// flush, the H2 queue) would otherwise leave its residue
+			// standing in TransplantResidual* for as long as the park lasts
+			// (celeris#711). Retract here, where the sweep stops.
+			if len(l.liveConns) == 0 {
+				l.sweepRetract()
+			}
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() ||
 				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {
@@ -1261,7 +1288,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
-				l.closeConn(fd)
+				l.closeWhenFlushed(cs) // celeris#761: the response's tail too
 				return
 			}
 			if len(rest) > 0 {
@@ -1278,7 +1305,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 					if mu := cs.detachMu; mu != nil {
 						mu.Unlock()
 					}
-					l.closeConn(fd)
+					l.closeWhenFlushed(cs) // celeris#761: the response's tail too
 					return
 				}
 			}
@@ -1292,9 +1319,24 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.closeConn(fd)
 				return
 			}
-			dirty := len(cs.writeBuf)-cs.writePos > 0 || len(cs.bodyBuf) > 0
+			// Resync pendingBytes, as the inline flush below does: the write
+			// hooks add every response to it, and only a flush point brings
+			// it back to what is still queued. Left alone here it grew by
+			// each response answered on this path, until the hooks refused
+			// the writes of a conn that had nothing queued (celeris#761).
+			dirty := csWritePending(cs)
+			if dirty {
+				cs.pendingBytes = csPendingBytes(cs)
+			} else {
+				cs.pendingBytes = 0
+			}
+			refused := cs.writeRefused
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
+			}
+			if refused {
+				l.closeWhenFlushed(cs)
+				return
 			}
 			if dirty {
 				// Send buffer full after the body-recv response flush. This
@@ -1533,7 +1575,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
 			}
-			l.closeConn(fd)
+			// What that one write could not send (a response larger than
+			// the socket buffers, answering Connection: close) still goes
+			// out before the close (celeris#761).
+			l.closeWhenFlushed(cs)
 			return
 		}
 
@@ -1584,15 +1629,21 @@ func (l *Loop) drainRead(fd int, now int64) {
 				}
 			}
 		}
-		// Capture pendingBytes inside the lock so the check below is safe
+		// Read writeRefused inside the lock so the check below is safe
 		// against concurrent goroutine writes via the guarded writeFn.
-		pending := cs.pendingBytes
+		refused := cs.writeRefused
 		if mu := cs.detachMu; mu != nil {
 			mu.Unlock()
 		}
 
-		if pending > cs.writeCap() {
-			l.closeConn(fd)
+		// Back-pressure close: a write hook refused bytes because the
+		// backlog before them was over writeCap, a peer that stopped
+		// reading while it kept sending requests. A backlog over the cap
+		// by itself is not a reason to close: one response larger than the
+		// cap puts it there, and so does a sendfile body. Closing on it cut
+		// such a response off mid-body (celeris#761).
+		if refused {
+			l.closeWhenFlushed(cs)
 			return
 		}
 
@@ -1620,6 +1671,38 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 	}
+}
+
+// closeWhenFlushed closes cs as closeConn does, but only once the response
+// bytes it still has queued have reached the kernel: closeConn's SHUT_WR
+// commits only what the kernel has already taken, so a response larger than
+// the socket buffers lost its tail when the conn was closed right after it
+// (Connection: close, a request error, a refused write; celeris#761). It
+// stops reading cs, so no request is parsed or answered on a conn that is
+// closing, arms EPOLLOUT and marks the close deferred (peerClosed), which
+// handleWritable and the dirty pass carry out once the conn has drained. A
+// peer that never reads again is reaped by checkTimeouts, like any conn
+// stalled on write back-pressure. A conn with nothing left to send, and a
+// truly-detached one, whose middleware owns its close, are closed at once.
+//
+// Loop thread, with no handler of cs's running: the inline path after its
+// handler returned, or drainDetachQueue after the dispatch goroutine exited.
+func (l *Loop) closeWhenFlushed(cs *connState) {
+	if (cs.h1State != nil && cs.h1State.Detached.Load()) || !csWritePending(cs) {
+		l.closeConn(cs.fd)
+		return
+	}
+	cs.peerClosed = true
+	l.removeDirty(cs)
+	issued, err := l.modEpollOut(cs, unix.EPOLLOUT|unix.EPOLLET|unix.EPOLLRDHUP)
+	if !issued {
+		return // hijacked: drainDetachQueue settles the conn
+	}
+	if err != nil {
+		l.closeConn(cs.fd)
+		return
+	}
+	cs.epollOut = true
 }
 
 // closeOnReadEnd is drainRead's read-error and EOF branch: flush what is
@@ -1840,11 +1923,16 @@ func (l *Loop) initProtocol(cs *connState) {
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
+		// Back-pressure for HTTP/1 is held per request (celeris#761): a
+		// request that finds the conn's unsent responses over the limit is
+		// not served, and the conn is closed once they have gone out.
+		cs.h1State.WriteBacklogged = cs.overBacklogH1
 		// Scatter-gather body writer: handler hands large bodies to the
-		// engine as a zero-copy slice; flushWrites emits writev(2) with
-		// [headers, body] so we save the respBuf → writeBuf memcpy.
-		// Disabled in async mode because cs.bodyBuf access would race
-		// with the dispatch goroutine without a mutex.
+		// engine as a zero-copy slice, which it writes at once with
+		// writev(2) of [headers, body], saving the respBuf → writeBuf
+		// memcpy (see makeWriteBodyFn). Disabled in async mode because
+		// cs.bodyBuf access would race with the dispatch goroutine
+		// without a mutex.
 		if !l.async {
 			cs.h1State.SetWriteBodyFn(l.makeWriteBodyFn(cs))
 			// Zero-copy sendfile(2) for large static-file responses: the
@@ -2136,7 +2224,19 @@ func (l *Loop) switchToH2Local(cs *connState, writeFn func([]byte)) error {
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		if cs.pendingBytes+len(cs.bodyBuf) > cs.writeCap() {
+		// Back-pressure (an HTTP/2 or detached conn; see writeCap): refuse
+		// the write only when the backlog before it is over the cap, and
+		// say so, so the conn is closed rather than left waiting for bytes
+		// that will not come (celeris#761).
+		if cs.pendingBytes > cs.writeCap() {
+			cs.writeRefused = true
+			return
+		}
+		// A sendfile is staged, and the flush sends writeBuf before it:
+		// bytes written after it (the next pipelined response) would go
+		// out ahead (celeris#802).
+		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true
 			return
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)
@@ -2147,24 +2247,33 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	}
 }
 
-// makeWriteBodyFn stages a zero-copy body slice for scatter-gather
-// writev at flush time. The body is NOT copied — it must remain valid
-// and unmutated until flushWrites drains it. Used by the H1 response
-// adapter for bodies ≥ 8 KiB to skip the respBuf → writeBuf memcpy.
+// makeWriteBodyFn returns the zero-copy body writer of the H1 response
+// adapter, for bodies of 8 KiB or more: the body goes to the kernel straight
+// from the handler's memory, one writev(2) of [writeBuf, body], skipping the
+// respBuf → writeBuf memcpy. The write is made here, in the call, and what
+// the kernel does not take is copied into writeBuf before it returns: the
+// body belongs to the handler, which may reuse it as soon as its write
+// returns. c.JSON puts its buffer back in a pool at once, where the next
+// handler to encode takes it, and a buffered response's body lives on a
+// pooled Context; a body staged for a flush after the handler went out as
+// the next request's bytes, or another connection's (celeris#817). The
+// syscall is the one the flush after the handler would have made. Runs on
+// the loop thread: the hook is installed only in sync mode.
 func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 	return func(body []byte) {
-		if cs.pendingBytes+len(cs.bodyBuf)+len(body) > cs.writeCap() {
-			return
-		}
-		if cs.bodyBuf != nil {
-			// A second large-body write in the same request: fall back
-			// to copying (we only carry one writev body slot per flush).
-			cs.writeBuf = append(cs.writeBuf, body...)
-			cs.pendingBytes += len(body)
+		// A staged sendfile goes out before this body (celeris#802).
+		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true
 			return
 		}
 		cs.bodyBuf = body
-		cs.pendingBytes += len(body)
+		err := l.flushWrites(cs, true)
+		unstage(cs) // what the kernel did not take; no sendfile is staged
+		cs.pendingBytes = csPendingBytes(cs)
+		if err != nil {
+			// The response is lost with the conn: close it.
+			cs.writeRefused = true
+		}
 	}
 }
 
@@ -2184,14 +2293,17 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 // closed by flushSendfile on completion or by closeConn / releaseConnState
 // on teardown.
 //
-// Pipelined file requests in a single recv (cs.sendfile already set) and
-// rare dup failures fall back to a buffered copy of this response into
-// writeBuf, so the engine never needs two concurrent sendfile slots and
-// response ordering is always preserved.
+// There is one sendfile slot. A file response pipelined behind another one
+// in a single recv (cs.sendfile already set) first moves the staged one into
+// writeBuf as a buffered copy (unstage), so it stays ahead, and then takes
+// the slot; handing the new one the buffered copy instead sent it before the
+// staged file (celeris#802). A rare dup failure falls back to a buffered
+// copy of this response.
 func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, offset, length int64) error {
 	return func(header []byte, file *os.File, offset, length int64) error {
-		if cs.sendfile != nil {
-			return bufferedFileFallback(cs, header, file, offset, length)
+		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true // the staged response is cut: close
+			return errUnstageSendfile
 		}
 		dupfd, err := unix.Dup(int(file.Fd()))
 		if err != nil {
@@ -2216,6 +2328,12 @@ func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, 
 // caller still owns and closes the *os.File. Correctness over zero-copy:
 // the response is delivered byte-exact, just without the syscall savings.
 func bufferedFileFallback(cs *connState, header []byte, file *os.File, offset, length int64) error {
+	// This response is appended to writeBuf, which goes out before a
+	// staged sendfile (celeris#802).
+	if cs.sendfile != nil && !unstage(cs) {
+		cs.writeRefused = true // the staged response is cut: close
+		return errUnstageSendfile
+	}
 	if length <= 0 {
 		fi, err := file.Stat()
 		if err != nil {
@@ -2495,13 +2613,17 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			}
 		}
 		partial := flushErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0)
+		// A refused write (celeris#761) ends the conn as a request error
+		// does: this goroutine exits and the loop closes the conn once what
+		// was staged has gone out (drainDetachQueue, closeWhenFlushed).
+		refused := cs.writeRefused
 		cs.detachMu.Unlock()
 
 		if partial {
 			l.enqueueDetach(cs)
 		}
 
-		if processErr != nil || flushErr != nil {
+		if processErr != nil || flushErr != nil || refused {
 			// Signal the worker to tear down the conn from its own
 			// goroutine. Never close cs.fd directly here — the worker
 			// goroutine still has l.conns[fd] pointing at cs, and a
@@ -2621,9 +2743,20 @@ func (l *Loop) drainDetachQueue() {
 		}
 		// Dispatch goroutine signaled close via asyncClosed. Only the
 		// worker can safely touch l.conns / dirty list, so we handle
-		// the teardown here.
+		// the teardown here. Once the goroutine has exited, the response
+		// it left queued goes out before the close (celeris#761): closing
+		// at once cut off, after Connection: close, any response larger
+		// than the socket buffers. While it still runs, closeConn leaves
+		// the close to it (celeris#669), as before.
 		if cs.asyncClosed.Load() {
-			l.closeConn(cs.fd)
+			cs.asyncInMu.Lock()
+			running := cs.asyncRun
+			cs.asyncInMu.Unlock()
+			if running {
+				l.closeConn(cs.fd)
+			} else {
+				l.closeWhenFlushed(cs)
+			}
 			continue
 		}
 		// Dispatch goroutine promoted the conn to H2 via switchToH2Local.

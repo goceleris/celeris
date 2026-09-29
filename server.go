@@ -538,9 +538,10 @@ func (s *Server) cancelListen() {
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the
-// drain, and Listen's own ctx.Done branch shuts the engine down with a
-// background context (no budget). Cancelling first would let Listen win
-// Engine.Shutdown's sync.Once and strip the deadline the caller passed here.
+// drain. Listen's own ctx.Done branch drains too, and a cancel of
+// StartWithContext's context reaches it first; since celeris#753 the drain
+// keeps the deadline of every Engine.Shutdown call whichever call started it,
+// where Listen's used to win the drain's sync.Once with no budget at all.
 // A Shutdown that arrives before the server ever started still latches the
 // shut-down state, so a Start racing it returns instead of parking on a
 // context nothing will ever cancel (celeris#595).

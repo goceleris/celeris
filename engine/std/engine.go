@@ -42,7 +42,16 @@ type Engine struct {
 	// runs out. See Shutdown.
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
-	metrics    struct {
+	// drainCtx is the context the one drain (http.Server.Shutdown) runs
+	// under, whichever call starts it; drainCancel ends it. Every
+	// Shutdown(ctx) arms drainCancel on its ctx, so the drain keeps the
+	// budget of every caller, not only of the one that won the once
+	// (celeris#753). drainErr is the drain's result, read by every caller
+	// after once.Do has returned.
+	drainCtx    context.Context
+	drainCancel context.CancelFunc
+	drainErr    error
+	metrics     struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		// errs is the per-cause ErrorCount breakdown (celeris#645).
@@ -75,6 +84,7 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		logger:  cfg.Logger,
 	}
 	e.baseCtx, e.baseCancel = context.WithCancel(context.Background())
+	e.drainCtx, e.drainCancel = context.WithCancel(context.Background())
 
 	bridge := &Bridge{engine: e, handler: handler}
 
@@ -183,10 +193,27 @@ func (e *Engine) Listen(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		return e.Shutdown(context.Background())
+		// Drain, with no budget of Listen's own: a Shutdown call that
+		// carries one ends this drain when its ctx expires, even though
+		// this call started it (celeris#753). A drain cut short that way
+		// is that Shutdown's error to report, not Listen's.
+		if err := e.drain(); err != nil && e.drainCtx.Err() == nil {
+			return err
+		}
+		return nil
 	case err := <-errCh:
 		return err
 	}
+}
+
+// drain runs http.Server.Shutdown once, under drainCtx, and returns its
+// result to every caller; a caller that did not start it waits for it in
+// once.Do.
+func (e *Engine) drain() error {
+	e.once.Do(func() {
+		e.drainErr = e.server.Shutdown(e.drainCtx)
+	})
+	return e.drainErr
 }
 
 // Shutdown gracefully shuts down the server: in-flight requests drain
@@ -205,23 +232,31 @@ func (e *Engine) Listen(ctx context.Context) error {
 // under them. Ordinary requests are untouched while the budget holds —
 // they drain exactly as before.
 //
-// The escalation is armed off ctx rather than only after the drain
-// returns because callers race for the once: Listen shuts down with a
-// background context when its own context is cancelled, so it can win the
-// drain with no budget at all while the caller that does have one
-// (Server.Shutdown with Config.ShutdownTimeout) waits behind it.
+// Callers race for the drain: Listen drains when its own context is
+// cancelled, and under Server.StartWithContext that cancel reaches Listen
+// before the Server.Shutdown that carries Config.ShutdownTimeout reaches
+// this method. So the budget is armed off ctx, not handed to the drain
+// call: whichever call started the drain, it ends when the ctx of any
+// Shutdown call expires, and the escalation fires with it. Before
+// celeris#753 the budget went only to the call that won the once, and
+// Listen's won with none, so the hooks and the Start call waited for the
+// last handler however long it ran.
 func (e *Engine) Shutdown(ctx context.Context) error {
-	stop := context.AfterFunc(ctx, e.baseCancel)
-	var err error
-	e.once.Do(func() {
-		err = e.server.Shutdown(ctx)
+	stop := context.AfterFunc(ctx, func() {
+		e.drainCancel()
+		e.baseCancel()
 	})
-	if err != nil {
-		// Cancel here too: when ctx expires, Shutdown's own select and
-		// the AfterFunc callback race, and we must not report the drain
-		// as over before the escalation is guaranteed. CancelFunc is
+	if err := e.drain(); err != nil {
+		// Cancel here too: when ctx expires, the drain's return and the
+		// AfterFunc callback race, and we must not report the drain as
+		// over before the escalation is guaranteed. CancelFunc is
 		// idempotent.
 		e.baseCancel()
+		if cerr := ctx.Err(); cerr != nil && e.drainCtx.Err() != nil {
+			// This call's budget ran out: report it as the caller's own
+			// deadline (or cancel), not as the internal drainCtx's.
+			return cerr
+		}
 		return err
 	}
 	// Drained cleanly with budget left, so nothing needs waking: disarm,

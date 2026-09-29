@@ -681,11 +681,15 @@ func TestNoDrainSQESequenceIsUnchanged(t *testing.T) {
 		}
 	})
 
-	t.Run("sync_tail_writev", func(t *testing.T) {
+	// A 16 KiB body took the WRITEV path (an unlinked WRITEV, then a
+	// standalone RECV) until celeris#817: io_uring has no zero-copy body
+	// writer now, the body is copied into the write buffer, and the tail is
+	// the small response's.
+	t.Run("sync_tail_large_body", func(t *testing.T) {
 		f := newFDLFixture(t, false)
 		f.armFirstRecv()
 		f.deliver("GET /large HTTP/1.1\r\nHost: x\r\n\r\n")
-		check(t, f, takeSQEs(f.w.ring), []want{{opWRITEV, 0, udSend}, {opRECV, 0, udRecv}})
+		check(t, f, takeSQEs(f.w.ring), []want{{opSEND, sqeIOLink, udSend}, {opRECV, 0, udRecv}})
 		f.process(f.sendCQE())
 		check(t, f, takeSQEs(f.w.ring), nil)
 	})
