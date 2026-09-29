@@ -133,8 +133,9 @@ func TestSweepSkipsAConnWithWorkAlreadyOwed(t *testing.T) {
 // TestSweepDoesNotReClaimAnAsyncHandoff is the same skip for the other kind
 // of work already owed: a hand-off a dispatch goroutine has claimed for
 // itself. tryTransplant leaves such a conn to its claim and counts the
-// ordering as TransplantClaimDeferred -- a rate whose meaning is "a
-// completion landed between the park and the drain of the claim". A sweep
+// ordering as TransplantClaimDeferred -- a rate whose meaning is "a hand-off
+// attempt (a completion, a reap retry or a reap landing) found the claim
+// set between the park and the drain of the claim". A sweep
 // that re-examined the conn would bump that rate once per pass for as long
 // as the claim took to drain, turning a witness into noise.
 func TestSweepDoesNotReClaimAnAsyncHandoff(t *testing.T) {

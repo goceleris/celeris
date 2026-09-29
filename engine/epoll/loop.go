@@ -788,6 +788,17 @@ func (l *Loop) run(ctx context.Context) {
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
 			l.transplantInFlight == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
+			// A parked loop holds nothing, and sweep() — whose empty-set
+			// retraction is what clears this loop's share of the residual
+			// gauges while it runs — does not run again until it wakes. A
+			// last connection that left AFTER this iteration's sweep() (the
+			// tick-gate checkTimeouts above, the detach queue, the dirty
+			// flush, the H2 queue) would otherwise leave its residue
+			// standing in TransplantResidual* for as long as the park lasts
+			// (celeris#711). Retract here, where the sweep stops.
+			if len(l.liveConns) == 0 {
+				l.sweepRetract()
+			}
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() ||
 				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {
