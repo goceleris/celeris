@@ -652,11 +652,15 @@ func (p *Processor) runHandler(stream *Stream) {
 	// counts it as not processed and may retry it elsewhere, so its handler
 	// must not run (celeris#759). REFUSED_STREAM says exactly that (RFC 9113
 	// §8.7). Its headers were decoded all the same, so the HPACK state stays
-	// in step with the client's.
+	// in step with the client's. Once the RST_STREAM is written,
+	// sendRSTStreamAndMarkClosed has deleted the stream, which puts it back
+	// in the stream pool, so stream is not touched after the call: another
+	// connection can have it by then.
 	if p.goAwaySent && stream.ID > p.goAwayLastID {
-		_ = p.sendRSTStreamAndMarkClosed(stream.ID, http2.ErrCodeRefusedStream)
-		stream.SetState(StateClosed)
-		p.manager.DeleteStream(stream.ID)
+		id := stream.ID
+		if err := p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeRefusedStream); err != nil {
+			p.manager.DeleteStream(id)
+		}
 		return
 	}
 
