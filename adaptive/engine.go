@@ -962,6 +962,20 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	done := e.listenDone
 	e.listenMu.Unlock()
 
+	// Hand ctx to the sub-engines before the cancel below stops them:
+	// epoll's Shutdown makes it the budget of the send drain its loops run
+	// as they stop (celeris#760), and after the cancel it would come too
+	// late. Both sub-engines' Shutdown does nothing else, and they are
+	// called again, as before, once Listen has returned.
+	e.mu.Lock()
+	subs := [2]engine.Engine{e.primary, e.secondary}
+	e.mu.Unlock()
+	for _, sub := range subs {
+		if sub != nil {
+			_ = sub.Shutdown(ctx)
+		}
+	}
+
 	if cancel != nil {
 		cancel()
 	}

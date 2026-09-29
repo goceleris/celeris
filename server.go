@@ -529,11 +529,12 @@ func (s *Server) cancelListen() {
 // Async, or promoted to async under [Config.AsyncHandlers]), which runs on
 // the shared HTTP/2 worker pool, nor on std for any h2c stream: the hooks can
 // run while such a handler is still running, and on the native engines its
-// response is lost (celeris#759). On epoll, and on adaptive while it runs
-// epoll, the drain ends when the handlers have returned, and a connection is
-// then closed without flushing what the socket has not taken yet: a response
-// larger than the socket buffers, to a client that reads slowly, loses its
-// tail (celeris#760).
+// response is lost (celeris#759). Once the handlers have returned, the native
+// engines send what the sockets have not taken yet before they close the
+// connections: epoll (and adaptive while it runs epoll) while ctx is live,
+// until its deadline or, for a ctx without one such as context.Background(),
+// until it is done, but no longer than [Config.WriteTimeout], and never for
+// less than 250 ms (celeris#760); io_uring for 250 ms (celeris#806).
 //
 // The listen context published by the Start* entry points is cancelled AFTER
 // the engine's graceful phase, never before: on std, Engine.Shutdown IS the
