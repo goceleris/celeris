@@ -515,6 +515,14 @@ type Worker struct {
 	// thread only, never read on the hot path.
 	shutdownDrainDeadline int64
 
+	// drainBudget points at the engine's record of the budget of the last
+	// Engine.Shutdown call, and h2DrainStart is when the worker, its
+	// context cancelled, began waiting for the HTTP/2 stream handlers on
+	// the shared worker pool (celeris#759; h2PoolSettled). Worker thread
+	// only; h2DrainStart is zero until then.
+	drainBudget  *atomic.Pointer[context.Context]
+	h2DrainStart int64
+
 	dirtyHead     *connState // head of intrusive doubly-linked dirty list
 	hasBufReturns bool       // set when provided buffers need publishing
 	sendsPending  bool       // true when SEND SQEs are in the SQ ring (guarantees CQE production)
@@ -1168,12 +1176,26 @@ func (w *Worker) run(ctx context.Context) {
 			// that window — it is the ordinary iteration — which is the
 			// graceful side of the trade: a connection that arrives
 			// inside it is answered rather than reset.
-			if w.shutdownDrainDeadline == 0 {
-				w.shutdownDrainDeadline = time.Now().UnixNano() + shutdownSendDrainNanos
-			}
-			if !w.hasPendingSends() || time.Now().UnixNano() > w.shutdownDrainDeadline {
-				w.shutdown()
-				return
+			//
+			// First, though, the HTTP/2 stream handlers on the shared
+			// worker pool (celeris#759): they run off this loop, and their
+			// responses come back through the conns' write queues, which
+			// only this loop drains. The send drain's clock starts once they
+			// are done. That wait can last the whole budget, so it accepts
+			// nothing (stopAccepting): a connection accepted in it was
+			// served and then cut at the budget. net/http's Shutdown closes
+			// its listeners first.
+			if !w.h2PoolSettled() {
+				w.stopAccepting(ctx)
+				w.shutdownDrainDeadline = 0
+			} else {
+				if w.shutdownDrainDeadline == 0 {
+					w.shutdownDrainDeadline = time.Now().UnixNano() + shutdownSendDrainNanos
+				}
+				if !w.hasPendingSends() || time.Now().UnixNano() > w.shutdownDrainDeadline {
+					w.shutdown()
+					return
+				}
 			}
 		}
 
@@ -1200,8 +1222,9 @@ func (w *Worker) run(ctx context.Context) {
 		// false so a subsequent Pause observes a fresh signal.
 		w.listenFDClosed.Store(paused && w.listenFD < 0)
 
-		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
-		if w.listenFD < 0 && !paused {
+		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept;
+		// never once shutdown has begun (stopAccepting).
+		if w.listenFD < 0 && !paused && ctx.Err() == nil {
 			fd, err := createListenSocket(w.cfg.Addr, !w.cfg.DisableDeferAccept)
 			w.deferCapable = !w.cfg.DisableDeferAccept
 			if err != nil {
@@ -2048,6 +2071,12 @@ func (w *Worker) adaptiveTimeout() time.Duration {
 	// smallest of the three: the celeris#657 sweep's next pass, and the
 	// celeris#662 pause linger's deadline.
 	d := w.sweptTimeout()
+	// Waiting out HTTP/2 pool handlers at shutdown (celeris#759): a
+	// handler that ends without a completion the ring hears of must not
+	// leave the worker waiting.
+	if w.h2DrainStart != 0 && d > h2PoolDrainPoll {
+		d = h2PoolDrainPoll
+	}
 	if w.lingerUntil != 0 {
 		return capToDeadline(d, w.lingerUntil)
 	}
@@ -2302,6 +2331,27 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 	// worker does not own.
 	lfd := w.listenFD
 	w.listenFD = -1
+	w.cancelAccept(ctx, lfd)
+	// The completions above only cover handshakes an accept had already
+	// reached. Anything still in the kernel accept queue would be aborted
+	// by the close below, after its client had possibly sent a request;
+	// accept it now instead and serve it like any other connection
+	// (celeris#662).
+	w.acceptQueuedOnPause(ctx, lfd)
+	_ = unix.Close(lfd)
+	w.lingerUntil = 0
+	deferlinger.NoteClose()
+	w.listenFDClosed.Store(true)
+	w.pause.Notify()
+}
+
+// cancelAccept cancels the accept armed on the listen socket lfd, which the
+// caller has already taken out of w.listenFD, and handles the completions it
+// produces before the caller closes lfd. The cancel releases the kernel's
+// io_uring reference to the socket's file, so the close takes it out of the
+// SO_REUSEPORT group at once; unix.Close alone left a phantom socket that
+// intercepted connections.
+func (w *Worker) cancelAccept(ctx context.Context, lfd int) {
 	if sqe := w.ring.GetSQE(); sqe != nil {
 		prepCancelFDSkipSuccess(sqe, lfd)
 		setSQEUserData(sqe, 0)
@@ -2320,17 +2370,27 @@ func (w *Worker) closeListenerAfterDrain(ctx context.Context) {
 		}
 		w.ring.EndCQ(cqH)
 	}
-	// The completions above only cover handshakes an accept had already
-	// reached. Anything still in the kernel accept queue would be aborted
-	// by the close below, after its client had possibly sent a request;
-	// accept it now instead and serve it like any other connection
-	// (celeris#662).
-	w.acceptQueuedOnPause(ctx, lfd)
+}
+
+// stopAccepting cancels the accept and closes the listener, once the
+// worker's context is cancelled and it waits for the HTTP/2 stream handlers
+// on the shared worker pool (celeris#759). That wait can last the whole
+// budget, and the worker accepted and served new connections meanwhile,
+// which were then cut at its end; net/http's Shutdown closes its listeners
+// first. What is still in the kernel's accept queue is reset, as the close
+// in shutdown did. Only then, not on every shutdown: the cancel submits the
+// SQ ring and handles its completions, and a shutdown with no HTTP/2 wait
+// goes straight on, leaving the driver conns' queued ops to shutdown
+// (TestDriverShutdownReleasesDescriptors). Idempotent. Worker thread.
+func (w *Worker) stopAccepting(ctx context.Context) {
+	if w.listenFD < 0 {
+		return
+	}
+	lfd := w.listenFD
+	w.listenFD = -1 // before the cancel's completions: handleAccept re-arms on a listenFD >= 0
+	w.cancelAccept(ctx, lfd)
 	_ = unix.Close(lfd)
 	w.lingerUntil = 0
-	deferlinger.NoteClose()
-	w.listenFDClosed.Store(true)
-	w.pause.Notify()
 }
 
 // acceptQueuedOnPause accepts every connection still waiting in the listen
@@ -6035,6 +6095,85 @@ func (w *Worker) checkTimeouts() {
 			}
 		}
 	}
+}
+
+// h2PoolDrainFloor is the least time the worker, its context cancelled,
+// waits for the HTTP/2 stream handlers on the shared worker pool before it
+// shuts down (celeris#759); a live budget of the last Engine.Shutdown extends
+// it (h2PoolSettled). h2PoolDrainPoll caps one wait meanwhile.
+const (
+	h2PoolDrainFloor = 250 * time.Millisecond
+	h2PoolDrainPoll  = 10 * time.Millisecond
+)
+
+// h2PoolSettled reports whether the worker, its context cancelled, may go on
+// to its send drain and shutdown as far as HTTP/2 is concerned (celeris#759).
+// A stream on an async route runs its handler on the shared worker pool, off
+// this loop, and its response comes back through the conn's write queue,
+// which only this loop drains; shutdown cancelled such streams and closed
+// their conns under their handlers, so the client got unexpected EOF, and
+// the hooks ran before the handlers had finished. So the loop keeps turning,
+// reading and writing as usual on the conns it has (it accepts no new one:
+// stopAccepting), until no HTTP/2 conn has a pool handler running, a response
+// still in its write queue, or response DATA waiting for the client's
+// WINDOW_UPDATE. Every HTTP/2 conn is sent GOAWAY first, so its client opens
+// no new stream on it, as net/http's graceful shutdown does, and a stream it
+// opens anyway is refused. The wait is bounded by the budget the last
+// Engine.Shutdown handed over, as epoll's is, and never ends before
+// h2PoolDrainFloor. Worker thread.
+func (w *Worker) h2PoolSettled() bool {
+	if len(w.h2Conns) == 0 {
+		return true
+	}
+	now := time.Now().UnixNano()
+	if w.h2DrainStart == 0 {
+		w.h2DrainStart = now
+	}
+	busy := false
+	for _, fd := range w.h2Conns {
+		cs := w.conns[fd]
+		if cs == nil || cs.h2State == nil {
+			continue
+		}
+		if !cs.h2GoAwaySent {
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			cs.h2GoAwaySent = cs.h2State.GoAway(cs.writeFn)
+			if cs.h2GoAwaySent && w.flushSend(cs) {
+				w.markDirty(cs)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+		}
+		if cs.h2State.PoolHandlersRunning() || cs.h2State.WriteQueuePending() || cs.h2State.OutboundPending() {
+			busy = true
+		}
+	}
+	if !busy {
+		return true
+	}
+	// Bounded as epoll's send drain is (epoll's Loop.sendDrainWait): while
+	// the budget is live, until its deadline or, for a ctx without one,
+	// until it is done, no longer than WriteTimeout, and never less than the
+	// floor, which is all a done budget, or none, gets.
+	end := w.h2DrainStart + int64(h2PoolDrainFloor)
+	if w.drainBudget != nil {
+		if p := w.drainBudget.Load(); p != nil && (*p).Err() == nil {
+			d, bounded := (*p).Deadline()
+			ext := d.UnixNano()
+			if wt := int64(w.cfg.WriteTimeout); wt > 0 && (!bounded || w.h2DrainStart+wt < ext) {
+				ext, bounded = w.h2DrainStart+wt, true
+			}
+			if !bounded {
+				return false // until the budget is done
+			}
+			end = max(end, ext)
+		}
+	}
+	return now > end
 }
 
 // hasPendingSends reports whether any live connection still has response bytes

@@ -22,6 +22,11 @@ type Bridge struct {
 // ServeHTTP converts an http.Request to a stream.Stream, calls the handler, and writes the response.
 func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.engine.metrics.reqCount.Add(1)
+	if r.ProtoMajor == 2 {
+		// An h2c stream: the drain waits for it (celeris#759).
+		b.engine.h2Streams.Add(1)
+		defer b.engine.h2Streams.Add(-1)
+	}
 
 	s := stream.NewH1Stream(1)
 	defer s.Release()

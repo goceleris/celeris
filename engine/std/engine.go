@@ -51,7 +51,12 @@ type Engine struct {
 	drainCtx    context.Context
 	drainCancel context.CancelFunc
 	drainErr    error
-	metrics     struct {
+	// h2Streams counts the HTTP/2 (h2c) requests in their handler
+	// (Bridge.ServeHTTP). net/http hands an h2c connection over (hijack)
+	// and stops tracking it, so http.Server.Shutdown does not wait for
+	// its streams; the drain waits for this count instead (celeris#759).
+	h2Streams atomic.Int64
+	metrics   struct {
 		reqCount    atomic.Uint64
 		activeConns atomic.Int64
 		// errs is the per-cause ErrorCount breakdown (celeris#645).
@@ -211,9 +216,39 @@ func (e *Engine) Listen(ctx context.Context) error {
 // once.Do.
 func (e *Engine) drain() error {
 	e.once.Do(func() {
-		e.drainErr = e.server.Shutdown(e.drainCtx)
+		err := e.server.Shutdown(e.drainCtx)
+		if err == nil {
+			err = e.waitH2Streams(e.drainCtx)
+		}
+		e.drainErr = err
 	})
 	return e.drainErr
+}
+
+// h2StreamsPoll is how often the drain looks at h2Streams while it waits.
+const h2StreamsPoll = 5 * time.Millisecond
+
+// waitH2Streams waits, bounded by ctx, until no HTTP/2 (h2c) request is in
+// its handler (celeris#759). http.Server.Shutdown does not wait for them:
+// net/http serves h2c on a connection it has handed over and no longer
+// tracks, so the OnShutdown hooks ran, and a direct Shutdown returned, while
+// an h2c handler was still running. The connection itself is left as
+// http.Server.Shutdown leaves a hijacked one: its handlers are what the drain
+// waits for.
+func (e *Engine) waitH2Streams(ctx context.Context) error {
+	if e.h2Streams.Load() <= 0 {
+		return nil
+	}
+	t := time.NewTicker(h2StreamsPoll)
+	defer t.Stop()
+	for e.h2Streams.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return nil
 }
 
 // Shutdown gracefully shuts down the server: in-flight requests drain

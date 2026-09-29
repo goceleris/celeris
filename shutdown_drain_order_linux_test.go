@@ -33,10 +33,14 @@ import (
 // server, did the Start call return only after that Shutdown's hook had
 // returned (a main that exits when Start returns must not lose its hooks).
 //
-// The h2c cases send the request over HTTP/2 (prior knowledge) to the native
-// engines, on a route that is not async, so its handler runs on the
-// connection's worker. std's h2c streams and async-route HTTP/2 streams run
-// outside the drain and are not asserted here (celeris#759).
+// The h2c cases send the request over HTTP/2 (prior knowledge). On a route
+// that is not async the native engines run its handler on the connection's
+// worker; on an async route (the h2c-async-route cases) they run it on the
+// shared HTTP/2 worker pool, which the drain did not wait for: the shutdown
+// closed the connection under the handler and the client got unexpected EOF.
+// std serves h2c on a connection net/http has handed over (hijacked) and no
+// longer tracks, so its drain did not wait for any h2c stream: the hooks ran
+// with the handler still running (celeris#759).
 //
 // The order is forced, not raced. The handler returns only when the test
 // releases it, and the test releases it as soon as a hook starts or the
@@ -75,17 +79,24 @@ func TestShutdownHooksRunAfterTheDrain(t *testing.T) {
 	for _, ec := range engines {
 		for _, mode := range modes {
 			t.Run(ec.name+"/"+mode.String(), func(t *testing.T) {
-				runDrainOrderCase(t, ec.eng, ec.async, false, mode, releaseAfter)
+				runDrainOrderCase(t, ec.eng, ec.async, false, false, mode, releaseAfter)
 			})
 		}
 	}
 	for _, ec := range engines {
-		if ec.eng == celeris.Std {
-			continue // celeris#759: std's h2c streams are not drained
-		}
 		for _, mode := range modes {
 			t.Run("h2c-"+ec.name+"/"+mode.String(), func(t *testing.T) {
-				runDrainOrderCase(t, ec.eng, ec.async, true, mode, releaseAfter)
+				runDrainOrderCase(t, ec.eng, ec.async, true, false, mode, releaseAfter)
+			})
+		}
+	}
+	for _, ec := range engines {
+		if ec.async {
+			continue // an async route is async whatever AsyncHandlers says
+		}
+		for _, mode := range modes {
+			t.Run("h2c-async-route-"+ec.name+"/"+mode.String(), func(t *testing.T) {
+				runDrainOrderCase(t, ec.eng, ec.async, true, true, mode, releaseAfter)
 			})
 		}
 	}
@@ -160,7 +171,7 @@ func (m drainOrderMode) String() string {
 	return "unknown"
 }
 
-func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c bool, mode drainOrderMode, releaseAfter time.Duration) {
+func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c, asyncRoute bool, mode drainOrderMode, releaseAfter time.Duration) {
 	t.Helper()
 	// One sequence for every event, so the order is read from numbers, not
 	// from clocks. Zero means "has not happened".
@@ -194,13 +205,16 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c bool
 			Addr: addr,
 		})
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
-		s.GET("/slow", func(c *celeris.Context) error {
+		slow := s.GET("/slow", func(c *celeris.Context) error {
 			close(handlerEntered)
 			<-release
 			handlerDoneAt.Store(int64(since()))
 			handlerDone.Store(seq.Add(1))
 			return c.String(http.StatusOK, "done")
 		})
+		if asyncRoute {
+			slow.Async()
+		}
 		s.OnShutdown(func(context.Context) {
 			hookSawHandlerDone.Store(handlerDone.Load() != 0)
 			hookStartAt.Store(int64(since()))
@@ -371,6 +385,9 @@ func runDrainOrderCase(t *testing.T, engType celeris.EngineType, async, h2c bool
 	proto := "h1"
 	if h2c {
 		proto = "h2c"
+	}
+	if asyncRoute {
+		proto += "-async-route"
 	}
 	t.Logf("RESULT engine=%s async=%v proto=%s mode=%s handler_done_ms=%.1f hook_start_ms=%.1f call_return_ms=%.1f order(handler,hook,call)=(%d,%d,%d) hook_end=%d start_return=%d response=%d/%q err=%v",
 		engType, async, proto, mode, ms(handlerDoneAt.Load()), ms(hookStartAt.Load()), ms(callReturnAt.Load()),

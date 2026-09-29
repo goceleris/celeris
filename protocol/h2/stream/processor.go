@@ -169,6 +169,57 @@ type Processor struct {
 	// processing is single-threaded per connection (event loop under
 	// H2State.mu), so a per-processor scratch slice is safe.
 	connFlushScratch []*Stream
+
+	// poolRunning counts this connection's streams whose handler has been
+	// handed to the shared worker pool and has not returned yet
+	// (celeris#759). The native engines' graceful shutdown waits for it to
+	// reach zero before it closes the connection: those handlers run off the
+	// event loop, and the drain that waits for the loop's own work did not
+	// see them. Incremented in runHandler before Submit, decremented after
+	// executeHandler has returned.
+	poolRunning atomic.Int32
+
+	// goAwaySent records that a GOAWAY has gone out, and goAwayLastID the
+	// last stream it named (celeris#759). A stream the client opens above
+	// it is not served (runHandler): its client counts it as not processed
+	// and may retry it on another connection (RFC 9113 §6.8). Written by
+	// SendGoAway, read by runHandler, both on the frame-processing path
+	// (event loop under H2State.mu).
+	goAwaySent   bool
+	goAwayLastID uint32
+}
+
+// PoolHandlersRunning reports whether a stream of this connection has a
+// handler running on the shared worker pool (celeris#759). Safe from any
+// goroutine.
+func (p *Processor) PoolHandlersRunning() bool {
+	return p.poolRunning.Load() > 0
+}
+
+// OutboundPending reports whether a stream of this connection has response
+// DATA buffered, waiting for the client's WINDOW_UPDATE: its handler has
+// returned, and the rest of its response goes out only as the client grants
+// window (celeris#759). The native engines' graceful shutdown waits for it,
+// as for the pool handlers. Not for the hot path.
+//
+// Lock order: the manager's mu (read), then each stream's mu (read), so that
+// no stream is released (RemoveStreamFromMap and DeleteStream take the
+// manager's mu for writing) while it is read. Nothing takes a stream's mu and
+// then the manager's: flushStreamOutbound reserves windows under the stream's
+// mu with atomics only, and flushConnWindowStalledStreams releases the
+// manager's mu before it takes a stream's.
+func (p *Processor) OutboundPending() bool {
+	p.manager.mu.RLock()
+	defer p.manager.mu.RUnlock()
+	for _, s := range p.manager.streams {
+		s.mu.RLock()
+		pending := s.OutboundBuffer != nil && s.OutboundBuffer.Len() > 0
+		s.mu.RUnlock()
+		if pending {
+			return true
+		}
+	}
+	return false
 }
 
 // rstRateLimit and rstBurstLimit bound RST_STREAM arrivals. An honest
@@ -597,6 +648,21 @@ func (p *Processor) runHandler(stream *Stream) {
 	if p.handler == nil {
 		return
 	}
+	// A stream opened above the last stream a GOAWAY named: its client
+	// counts it as not processed and may retry it elsewhere, so its handler
+	// must not run (celeris#759). REFUSED_STREAM says exactly that (RFC 9113
+	// §8.7). Its headers were decoded all the same, so the HPACK state stays
+	// in step with the client's. Once the RST_STREAM is written,
+	// sendRSTStreamAndMarkClosed has deleted the stream, which puts it back
+	// in the stream pool, so stream is not touched after the call: another
+	// connection can have it by then.
+	if p.goAwaySent && stream.ID > p.goAwayLastID {
+		id := stream.ID
+		if err := p.sendRSTStreamAndMarkClosed(id, http2.ErrCodeRefusedStream); err != nil {
+			p.manager.DeleteStream(id)
+		}
+		return
+	}
 
 	if p.canRunInline(stream) {
 		p.executeHandlerInline(stream)
@@ -609,6 +675,7 @@ func (p *Processor) runHandler(stream *Stream) {
 	}
 
 	stream.flags.Or(flagAsyncRunning)
+	p.poolRunning.Add(1)
 	globalH2Pool.Submit(p, stream)
 }
 
@@ -732,6 +799,10 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 // releases it back to the pool. If outbound data is buffered (flow control),
 // the stream stays in the map for the event loop to flush via WINDOW_UPDATE.
 func (p *Processor) executeHandler(stream *Stream) {
+	// Deferred first, so it runs last: the response is queued and the
+	// stream settled before a shutdown that waits for this count can close
+	// the connection (celeris#759).
+	defer p.poolRunning.Add(-1)
 	defer func() {
 		if r := recover(); r != nil {
 			_ = r // last-resort panic recovery
@@ -1601,8 +1672,12 @@ func (p *Processor) GoAwayErr(lastStreamID uint32, code http2.ErrCode, debug []b
 	return err
 }
 
-// SendGoAway sends a GOAWAY frame.
+// SendGoAway sends a GOAWAY frame, and records it: no stream above
+// lastStreamID is served from then on (runHandler).
 func (p *Processor) SendGoAway(lastStreamID uint32, code http2.ErrCode, debugData []byte) error {
+	if !p.goAwaySent || lastStreamID < p.goAwayLastID {
+		p.goAwaySent, p.goAwayLastID = true, lastStreamID
+	}
 	if p.connWriter != nil {
 		return p.connWriter.SendGoAway(lastStreamID, code, debugData)
 	}
