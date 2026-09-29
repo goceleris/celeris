@@ -1256,6 +1256,17 @@ func (c *Context) BytesWritten() int {
 // owns the connection and is responsible for closing it. Supported on all
 // engines for HTTP/1.1 connections. HTTP/2 connections cannot be hijacked
 // (multiplexed streams share a single TCP connection).
+//
+// The request's strings stay valid after Hijack, for the handler and for
+// any goroutine it hands them to (celeris#733). On epoll and io_uring they
+// are views of the connection's receive buffer, which the engine does not
+// give to another connection once the connection is hijacked. Hijack also
+// copies the request values the Context holds, as [Context.Detach] does, so
+// the path, params, headers, query, cookies and body read from the Context
+// after Hijack are copies. In io_uring's opt-in multishot receive mode
+// (CELERIS_IOURING_MULTISHOT_RECV=1) the request is received into a buffer
+// the engine hands back to the kernel when the handler returns: there, keep
+// only strings read after Hijack, or clone the ones read before it.
 func (c *Context) Hijack() (net.Conn, error) {
 	if c.written {
 		return nil, errors.New("celeris: cannot hijack after response written")
@@ -1264,6 +1275,9 @@ func (c *Context) Hijack() (net.Conn, error) {
 	if !ok {
 		return nil, ErrHijackNotSupported
 	}
+	// Before the engine lets go of the connection, and so of its receive
+	// buffer (celeris#733).
+	c.cloneRequestValues()
 	conn, err := h.Hijack(c.stream)
 	if err != nil {
 		return nil, err
@@ -1420,25 +1434,7 @@ func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
 	}
-	// Materialize any unsafe string headers (zero-copy H1 headers backed by
-	// the connection's read buffer) before the handler returns and the buffer
-	// is reused for the next recv. Pseudo-header keys are string literals
-	// (safe), but their values (:authority, :path for non-"/" paths, :method
-	// for non-standard methods) may be UnsafeString backed by the buffer.
-	c.stream.MaterializeHeaders()
-	for i, h := range c.stream.Headers {
-		if len(h[0]) > 0 && h[0][0] == ':' {
-			c.stream.Headers[i][1] = strings.Clone(h[1])
-			continue
-		}
-		c.stream.Headers[i][0] = strings.Clone(h[0])
-		c.stream.Headers[i][1] = strings.Clone(h[1])
-	}
-	// Also materialize extracted fields that may reference the buffer.
-	c.method = strings.Clone(c.method)
-	c.path = strings.Clone(c.path)
-	c.rawQuery = strings.Clone(c.rawQuery)
-	c.materializeRequestViews()
+	c.cloneRequestValues()
 
 	c.extended = true
 	c.detached = true
@@ -1462,9 +1458,36 @@ func (c *Context) Detach() (done func()) {
 	}
 }
 
-// materializeRequestViews clones, for [Context.Detach], the request-derived
-// strings the Context keeps outside the header slice and the method, path and
-// raw query: the route params, the parsed query and cookie caches, the H1
+// cloneRequestValues copies every request value the Context holds that can be
+// a view of the engine's receive buffer, for [Context.Detach] and
+// [Context.Hijack]: after either, the handler, or a goroutine it starts, can
+// keep using those values after the engine has received into, or given
+// away, the buffer they view.
+func (c *Context) cloneRequestValues() {
+	// Materialize any unsafe string headers (zero-copy H1 headers backed by
+	// the connection's read buffer) before the handler returns and the buffer
+	// is reused for the next recv. Pseudo-header keys are string literals
+	// (safe), but their values (:authority, :path for non-"/" paths, :method
+	// for non-standard methods) may be UnsafeString backed by the buffer.
+	c.stream.MaterializeHeaders()
+	for i, h := range c.stream.Headers {
+		if len(h[0]) > 0 && h[0][0] == ':' {
+			c.stream.Headers[i][1] = strings.Clone(h[1])
+			continue
+		}
+		c.stream.Headers[i][0] = strings.Clone(h[0])
+		c.stream.Headers[i][1] = strings.Clone(h[1])
+	}
+	// Also materialize extracted fields that may reference the buffer.
+	c.method = strings.Clone(c.method)
+	c.path = strings.Clone(c.path)
+	c.rawQuery = strings.Clone(c.rawQuery)
+	c.materializeRequestViews()
+}
+
+// materializeRequestViews clones, for [Context.Detach] and [Context.Hijack],
+// the request-derived strings the Context keeps outside the header slice and
+// the method, path and raw query: the route params, the parsed query and cookie caches, the H1
 // Host, the strings middleware store on the Context from request headers
 // (request ID, client-IP/host/scheme overrides, SetString values), the
 // request body, and the response headers set so far.

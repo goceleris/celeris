@@ -303,21 +303,25 @@ func metricOr(e *Engine, name string) int64 {
 // that claims its own hand-off at its park, and leave through
 // finishAsyncTransplant, which reaps the recv the feed path armed.
 //
-// Where the probe did not find the cancel flags (every kernel before 5.19)
-// a promoted async conn cannot be reaped, so it is never offered for the
-// hand-off and stays on io_uring (asyncTransplantEligible, celeris#681 R1):
-// there the async subtest wants none of them handed off, and no client error.
-// It used to want all of them on every kernel, so it failed on 5.15.0-191
-// ("0 of 128 busy conns were handed off"; celeris#681 N4).
-// async_without_cancel_flags runs that case on any kernel: the engine's probe
-// answer is taken as a rejection (runAsyncCancelProbe).
+// Where the probe did not find the cancel flags a promoted async conn cannot
+// be reaped, so it is never offered for the hand-off and stays on io_uring
+// (asyncTransplantEligible, celeris#681 R1): there the async subtest wants
+// none of them handed off, and no client error. It used to want all of them
+// on every kernel, so it failed on 5.15.0-191 ("0 of 128 busy conns were
+// handed off"; celeris#681 N4). A kernel that rejects the flags (every one
+// before 5.19) now gets no io_uring engine at all (celeris#682), so the case
+// is left to a 5.19+ kernel whose probe got no answer.
+// async_without_cancel_flags runs it on any such kernel: the engine's probe
+// is made to get no answer (runAsyncCancelProbe).
 //
 // Which of the two the async subtest wants is decided by the RUNNING KERNEL,
 // not by the probe's answer alone (celeris#681 M1). From 5.19 the kernel has
 // the flags, so there the reap must work and all 128 must be handed off; if
 // the engine's reap is off on such a kernel the subtest fails, naming the
-// probe's class from New's own record. Only a kernel that predates 5.19 may
-// take the weak branch. Chosen from the probe alone, a probe that got no
+// probe's class from New's own record. Only async_without_cancel_flags may
+// take the weak branch: a kernel that predates 5.19 gets no io_uring engine
+// unless its probe found the flags (celeris#682). Chosen from the probe
+// alone, a probe that got no
 // answer — an EMFILE or ENOMEM in its private ring, which N1 made a per-New
 // event — silently turned "all 128 handed off" into "none handed off", which
 // such a run passes trivially; this subtest is the registered killer of
@@ -344,8 +348,11 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 			}
 			if tc.noFlags {
 				saved := runAsyncCancelProbe
+				// No answer, not a rejection: New refuses io_uring on a
+				// kernel that rejects the flags (celeris#682), and from 5.19
+				// a probe with no answer builds the engine with the reap off.
 				runAsyncCancelProbe = func() (asyncCancelProbe, string) {
-					return asyncCancelRejected, "celeris681 forced: the cancel flags taken as rejected"
+					return asyncCancelNoAnswer, "celeris681 forced: the probe got no answer"
 				}
 				resetAsyncCancelProbeCache()
 				t.Cleanup(func() {
@@ -355,7 +362,7 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 			}
 			e, addr := startFDLEngine(t, h, mut)
 			if tc.noFlags && e.asyncCancelFlags {
-				t.Fatal("New turned the reap on although the probe's answer was a rejection")
+				t.Fatal("New turned the reap on although the probe got no answer")
 			}
 			// celeris#681 M1: a kernel from 5.19 has IORING_ASYNC_CANCEL
 			// flags, so the reap must be on there and the strong branch
@@ -409,9 +416,9 @@ func TestHandoffHasNothingInFlight(t *testing.T) {
 			}
 			got := tgt.adopted.Load()
 			// The weak branch. The gate above leaves it reachable only
-			// under async_without_cancel_flags, or on a kernel that
-			// predates 5.19 and so genuinely has no flags to find
-			// (celeris#681 M1).
+			// under async_without_cancel_flags (celeris#681 M1): a kernel
+			// that predates 5.19 and so genuinely has no flags to find
+			// gets no io_uring engine (celeris#682).
 			if tc.async && !e.asyncCancelFlags {
 				t.Logf("celeris681 no cancel flags: %d of %d promoted async conns handed off (promotions %d)",
 					got, conns, e.Metrics().AsyncPromotedConns)

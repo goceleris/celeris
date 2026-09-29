@@ -59,7 +59,11 @@ const (
 //
 //	None     — kernel < 5.10 or io_uring probe failed (engine falls back to epoll).
 //	Base     — 5.10 ≤ kernel < 5.19. Linked-SQE chains, single-shot
-//	           accept/recv. No COOP_TASKRUN.
+//	           accept/recv. No COOP_TASKRUN. The io_uring engine refuses
+//	           these kernels (they reject the IORING_ASYNC_CANCEL flags
+//	           its cancels use, celeris#682); on 5.19+ the Base tier is
+//	           what the engine runs when a High feature probe fails or
+//	           CELERIS_MAX_IOURING_TIER caps it.
 //	High     — 5.19 ≤ kernel < 6.0. Adds multishot accept/recv, provided
 //	           buffers, fixed files, COOP_TASKRUN, SINGLE_ISSUER.
 //	Optional — kernel ≥ 6.0. Adds SQPOLL and SEND_ZC. With kernel ≥ 6.1,
