@@ -7,6 +7,7 @@ import (
 	"github.com/goceleris/celeris"
 
 	"github.com/goceleris/celeris/middleware/session"
+	"github.com/goceleris/celeris/middleware/store"
 )
 
 func ExampleNew() {
@@ -86,7 +87,7 @@ func ExampleSession_SetIdleTimeout() {
 
 func ExampleNew_customStore() {
 	// Use a custom store (e.g., Redis).
-	var myStore session.Store // = redis.NewStore(...)
+	var myStore store.KV // = redisstore.New(...)
 	_ = session.New(session.Config{
 		Store: myStore,
 	})

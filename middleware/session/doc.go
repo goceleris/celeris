@@ -2,7 +2,7 @@
 // celeris.
 //
 // Sessions are identified by a cookie (default), header, or query parameter,
-// and data is stored server-side in a pluggable [Store]. The built-in
+// and data is stored server-side in a pluggable [store.KV]. The built-in
 // [NewMemoryStore] uses sharded maps with a background cleanup goroutine,
 // suitable for single-instance deployments.
 //
@@ -64,7 +64,7 @@
 // [ChainExtractor] control where the session ID is read from. For
 // out-of-band access (admin tools, background jobs) use [NewHandler], which
 // exposes the middleware via [Handler.Middleware] and direct lookup via
-// [Handler.GetByID]. Implement the [Store] interface to back sessions with
+// [Handler.GetByID]. Implement the [store.KV] interface to back sessions with
 // any storage backend.
 //
 // # Documentation
