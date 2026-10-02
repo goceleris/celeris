@@ -42,6 +42,10 @@ import (
 // already sent the chunked body on HTTP/1.1 (the bytes then corrupted the next
 // response) and DATA frames on HTTP/2; auto-HEAD makes every streaming GET
 // route reachable that way.
+//
+// Every route runs once inline and once as an async route (Route.Async): a
+// HEAD answered by an async GET route is dispatched the way the GET is
+// (router.routeAsync resolves HEAD to the GET route too).
 func TestAutoHeadOptionsOnEveryEngine421(t *testing.T) {
 	const fileSize = 64 << 10
 	fileBody := bytes.Repeat([]byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!?"), fileSize/64)
@@ -117,88 +121,97 @@ func TestAutoHeadOptionsOnEveryEngine421(t *testing.T) {
 	}
 
 	for _, e := range engines761 {
-		t.Run(e.name, func(t *testing.T) {
-			addr := startServer421(t, e.eng, func(s *celeris.Server) {
-				s.Use(cors.New(cors.Config{AllowOrigins: []string{origin}}))
-				s.GET("/hello", func(c *celeris.Context) error { return c.String(200, "hello world") })
-				s.GET("/stream", stream)
-				s.HEAD("/stream-head", stream)
-				s.GET("/file", func(c *celeris.Context) error { return c.File(path) })
-				s.GET("/eh", func(c *celeris.Context) error { return c.String(200, "get eh") })
-				s.HEAD("/eh", func(c *celeris.Context) error {
-					c.SetHeader("x-explicit", "head")
-					return c.String(200, "head eh")
-				})
-				s.GET("/eo", func(c *celeris.Context) error { return c.String(200, "get eo") })
-				s.OPTIONS("/eo", func(c *celeris.Context) error {
-					c.SetHeader("x-explicit", "options")
-					return c.NoContent(204)
-				})
-			})
-			for _, proto := range []string{"h1", "h2"} {
-				t.Run(proto, func(t *testing.T) {
-					tr := &http.Transport{MaxConnsPerHost: 1, DisableCompression: true}
-					if proto == "h2" {
-						p := new(http.Protocols)
-						p.SetUnencryptedHTTP2(true)
-						tr.Protocols = p
+		for _, route := range []string{"sync", "async-route"} {
+			t.Run(e.name+"/"+route, func(t *testing.T) {
+				addr := startServer421(t, e.eng, func(s *celeris.Server) {
+					s.Use(cors.New(cors.Config{AllowOrigins: []string{origin}}))
+					routes := []*celeris.Route{
+						s.GET("/hello", func(c *celeris.Context) error { return c.String(200, "hello world") }),
+						s.GET("/stream", stream),
+						s.HEAD("/stream-head", stream),
+						s.GET("/file", func(c *celeris.Context) error { return c.File(path) }),
+						s.GET("/eh", func(c *celeris.Context) error { return c.String(200, "get eh") }),
+						s.HEAD("/eh", func(c *celeris.Context) error {
+							c.SetHeader("x-explicit", "head")
+							return c.String(200, "head eh")
+						}),
+						s.GET("/eo", func(c *celeris.Context) error { return c.String(200, "get eo") }),
+						s.OPTIONS("/eo", func(c *celeris.Context) error {
+							c.SetHeader("x-explicit", "options")
+							return c.NoContent(204)
+						}),
 					}
-					var dials atomic.Int32
-					tr.DialContext = func(ctx context.Context, network, a string) (net.Conn, error) {
-						dials.Add(1)
-						var d net.Dialer
-						return d.DialContext(ctx, network, a)
+					if route == "async-route" {
+						for _, r := range routes {
+							r.Async()
+						}
 					}
-					cl := &http.Client{Timeout: 10 * time.Second, Transport: tr}
-					defer cl.CloseIdleConnections()
-					wantMajor := map[string]int{"h1": 1, "h2": 2}[proto]
-					for i, rq := range reqs {
-						desc := fmt.Sprintf("%s/%s #%d %s %s %s", e.name, proto, i, rq.name, rq.method, rq.path)
-						hr, err := http.NewRequest(rq.method, "http://"+addr+rq.path, nil)
-						if err != nil {
-							t.Fatal(err)
+				})
+				for _, proto := range []string{"h1", "h2"} {
+					t.Run(proto, func(t *testing.T) {
+						tr := &http.Transport{MaxConnsPerHost: 1, DisableCompression: true}
+						if proto == "h2" {
+							p := new(http.Protocols)
+							p.SetUnencryptedHTTP2(true)
+							tr.Protocols = p
 						}
-						for k, v := range rq.hdrs {
-							hr.Header.Set(k, v)
+						var dials atomic.Int32
+						tr.DialContext = func(ctx context.Context, network, a string) (net.Conn, error) {
+							dials.Add(1)
+							var d net.Dialer
+							return d.DialContext(ctx, network, a)
 						}
-						resp, err := cl.Do(hr)
-						if err != nil {
-							t.Errorf("%s: %v", desc, err)
-							continue
-						}
-						got, err := io.ReadAll(resp.Body)
-						_ = resp.Body.Close()
-						switch {
-						case err != nil:
-							t.Errorf("%s: reading the body: %v", desc, err)
-						case resp.ProtoMajor != wantMajor:
-							t.Errorf("%s: answered over %s", desc, resp.Proto)
-						case resp.StatusCode != rq.status || string(got) != rq.body:
-							t.Errorf("%s: %d %q, want %d %q", desc, resp.StatusCode, got, rq.status, rq.body)
-						case rq.check != nil:
-							if err := rq.check(resp); err != nil {
+						cl := &http.Client{Timeout: 10 * time.Second, Transport: tr}
+						defer cl.CloseIdleConnections()
+						wantMajor := map[string]int{"h1": 1, "h2": 2}[proto]
+						for i, rq := range reqs {
+							desc := fmt.Sprintf("%s/%s/%s #%d %s %s %s", e.name, route, proto, i, rq.name, rq.method, rq.path)
+							hr, err := http.NewRequest(rq.method, "http://"+addr+rq.path, nil)
+							if err != nil {
+								t.Fatal(err)
+							}
+							for k, v := range rq.hdrs {
+								hr.Header.Set(k, v)
+							}
+							resp, err := cl.Do(hr)
+							if err != nil {
 								t.Errorf("%s: %v", desc, err)
+								continue
+							}
+							got, err := io.ReadAll(resp.Body)
+							_ = resp.Body.Close()
+							switch {
+							case err != nil:
+								t.Errorf("%s: reading the body: %v", desc, err)
+							case resp.ProtoMajor != wantMajor:
+								t.Errorf("%s: answered over %s", desc, resp.Proto)
+							case resp.StatusCode != rq.status || string(got) != rq.body:
+								t.Errorf("%s: %d %q, want %d %q", desc, resp.StatusCode, got, rq.status, rq.body)
+							case rq.check != nil:
+								if err := rq.check(resp); err != nil {
+									t.Errorf("%s: %v", desc, err)
+								}
 							}
 						}
-					}
-					if n := dials.Load(); n != 1 {
-						t.Errorf("%s/%s: %d connections for %d requests, want 1 (a response's framing broke the connection)",
-							e.name, proto, n, len(reqs))
+						if n := dials.Load(); n != 1 {
+							t.Errorf("%s/%s/%s: %d connections for %d requests, want 1 (a response's framing broke the connection)",
+								e.name, route, proto, n, len(reqs))
+						}
+					})
+				}
+				// net/http's HTTP/2 client drops DATA on a HEAD stream without
+				// an error, so the frames are counted on a raw connection.
+				t.Run("h2-raw-head-sends-no-data", func(t *testing.T) {
+					for _, p := range []string{"/hello", "/stream", "/stream-head", "/file"} {
+						status, data, err := h2HeadDataBytes421(addr, p)
+						if err != nil || status != "200" || data != 0 {
+							t.Errorf("%s/%s: raw h2c HEAD %s: :status %q, %d DATA payload bytes, err %v; want 200, 0, nil",
+								e.name, route, p, status, data, err)
+						}
 					}
 				})
-			}
-			// net/http's HTTP/2 client drops DATA on a HEAD stream without
-			// an error, so the frames are counted on a raw connection.
-			t.Run("h2-raw-head-sends-no-data", func(t *testing.T) {
-				for _, p := range []string{"/hello", "/stream", "/stream-head", "/file"} {
-					status, data, err := h2HeadDataBytes421(addr, p)
-					if err != nil || status != "200" || data != 0 {
-						t.Errorf("%s: raw h2c HEAD %s: :status %q, %d DATA payload bytes, err %v; want 200, 0, nil",
-							e.name, p, status, data, err)
-					}
-				}
 			})
-		})
+		}
 	}
 }
 

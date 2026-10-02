@@ -25,8 +25,10 @@
 // with all celeris engines and handles stream lifecycle internally.
 //
 // A HEAD request to an SSE route (answered by its GET route) gets the stream's
-// response headers and no body; [Config.OnConnect], [Config.Handler] and
-// [Config.OnDisconnect] do not run for it.
+// response headers and no body. [Config.OnConnect] runs for it, so a rejection
+// answers HEAD with the status GET would get; when it accepts,
+// [Config.OnDisconnect] runs right after the headers are sent, and
+// [Config.Handler] does not run.
 //
 // # Documentation
 //
