@@ -36,13 +36,27 @@ import (
 //     socket cannot take a connection, a dial in the window is refused as it
 //     was before, and once the start engine's sockets are listening none of
 //     the connections they are given can land on this one.
-//   - It sets SO_REUSEPORT and not SO_REUSEADDR. The sub-engines' sockets
-//     set SO_REUSEPORT and are owned by the same user, so the kernel lets
-//     them bind and listen beside it. Every other socket is refused the
-//     port: two sockets may share a port through SO_REUSEADDR only when both
-//     of them set it, and Go's net.Listen sets SO_REUSEADDR, so a holder that
-//     set it too would let an ordinary Go listener bind the port and then
-//     take it from the sub-engines exactly as before.
+//   - It sets SO_REUSEPORT and, when it can, not SO_REUSEADDR. The
+//     sub-engines' sockets set SO_REUSEPORT and are owned by the same user,
+//     so the kernel lets them bind and listen beside it. Every other socket
+//     is refused the port: two sockets may share a port through SO_REUSEADDR
+//     only when both of them set it, and Go's net.Listen sets SO_REUSEADDR,
+//     so a holder that set it too would let an ordinary Go listener bind the
+//     port and then take it from the sub-engines exactly as before.
+//
+// That exclusive hold cannot be bound while the port still has sockets left
+// by an earlier listener that did not set SO_REUSEPORT: the TIME_WAIT,
+// FIN_WAIT or CLOSE_WAIT ends of the connections a net/http server, or the
+// std engine, had when it stopped. Those sockets have SO_REUSEADDR and not
+// SO_REUSEPORT, and the kernel lets a socket bind beside them only if it sets
+// SO_REUSEADDR as well; net.Listen and the sub-engines do, which is why they
+// bind there. holdPort then binds the hold with SO_REUSEADDR too: a shared
+// hold. It still refuses the port to every socket without SO_REUSEADDR, but
+// not to one with it, because two sockets that both set SO_REUSEADDR may
+// share a port while neither listens. A socket that takes the port in that
+// state makes the start engine's bind fail with EADDRINUSE at Listen, as
+// every steal did before celeris#616; it never makes the engine serve another
+// address. The third result reports whether the hold is the exclusive one.
 //
 // The address is the one net.Listen used to produce here, so the sub-engines
 // are handed the same address as before for the same input: the host is
@@ -51,23 +65,46 @@ import (
 // wherever Go would make it so; see listenFamily), and the string is built
 // from the address the kernel reports, as net.Listener.Addr builds it.
 //
-// On an error the address is returned unchanged with no socket, which is what
-// the bind-and-close version did: a port that is already taken is then
-// reported by the start engine's own bind at Listen, with its diagnostics.
-func holdPort(addr string) (string, *os.File, error) {
+// On an error the address is returned unchanged with no socket. The second
+// hold sets every option net.Listen sets, SO_REUSEPORT besides, and binds the
+// same address in the same family; setting either option only ever makes the
+// kernel's bind check more permissive. So when neither hold can be bound,
+// net.Listen could not bind the address either, the bind-and-close version
+// handed the sub-engines the unchanged address in that case too, and the
+// port that is taken is reported by the start engine's own bind at Listen,
+// with its diagnostics.
+func holdPort(addr string) (string, *os.File, bool, error) {
 	ta, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
-		return addr, nil, err
+		return addr, nil, false, err
 	}
 	family := listenFamily(ta.IP)
+	resolved, hold, err := bindHold(family, ta, false)
+	if err == nil {
+		return resolved, hold, true, nil
+	}
+	if !errors.Is(err, unix.EADDRINUSE) {
+		return addr, nil, false, err
+	}
+	resolved, hold, sharedErr := bindHold(family, ta, true)
+	if sharedErr != nil {
+		return addr, nil, false, fmt.Errorf("%w; with SO_REUSEADDR as well: %w", err, sharedErr)
+	}
+	return resolved, hold, false, nil
+}
 
+// bindHold makes one hold socket for holdPort: bound to ta in family with
+// SO_REUSEPORT, and with SO_REUSEADDR as well when reuseAddr is set; never
+// listening. It returns the address the kernel bound, as net.Listener.Addr
+// spells it.
+func bindHold(family int, ta *net.TCPAddr, reuseAddr bool) (string, *os.File, error) {
 	fd, err := unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
-		return addr, nil, fmt.Errorf("socket: %w", err)
+		return "", nil, fmt.Errorf("socket: %w", err)
 	}
 	fail := func(step string, err error) (string, *os.File, error) {
 		_ = unix.Close(fd)
-		return addr, nil, fmt.Errorf("%s: %w", step, err)
+		return "", nil, fmt.Errorf("%s: %w", step, err)
 	}
 
 	var sa unix.Sockaddr
@@ -90,6 +127,11 @@ func holdPort(addr string) (string, *os.File, error) {
 		sa = sa6
 	}
 
+	if reuseAddr {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			return fail("setsockopt SO_REUSEADDR", err)
+		}
+	}
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
 		return fail("setsockopt SO_REUSEPORT", err)
 	}

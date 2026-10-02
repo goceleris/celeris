@@ -245,6 +245,21 @@ func chooseStartEngine(p engine.CapabilityProfile, cfg resource.Config) engine.E
 // SO_REUSEPORT sockets on its address. The standby is built later, from the
 // address alone, and joins that group. See the address-resolution block below.
 //
+// Without a pre-bound listener, New binds Config.Addr (a ":0" port becomes a
+// concrete one) and keeps it bound, without listening, until the start
+// engine has bound its own sockets on it, so that no other socket can take
+// the port in between (celeris#616). Listen gives that hold back once the
+// start engine is listening, or when it returns without starting; Shutdown
+// gives it back for an engine that was never started. An Engine that is
+// built and not started must therefore be shut down: one that is dropped
+// instead keeps the port bound until the garbage collector finalizes the
+// descriptor. The hold accepts no connections, so a dial before Listen is
+// refused. While the port still has the leftover sockets of an earlier
+// listener without SO_REUSEPORT (the TIME_WAIT ends of a net/http server's
+// connections, say) the kernel allows no stricter hold than one that sockets
+// with SO_REUSEADDR can bind beside; when the port cannot be held at all, New
+// logs a warning and the start engine binds the address as given.
+//
 // cpuMon is an engine.CPUMonitor (the public interface); when non-nil it
 // supplies the live sampler with CPU utilization data so the io_uring bias can
 // fire in the empirical sweet spot. External callers can pass their own
@@ -277,8 +292,14 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	// a bound, non-listening SO_REUSEPORT socket that Listen closes only once
 	// the start engine has bound its own sockets on the port, so no socket
 	// but an SO_REUSEPORT one of this user's can bind the port between New
-	// and Listen (celeris#616). Every return from New below that does not
-	// hand the socket to the engine closes it.
+	// and Listen (celeris#616). When sockets an earlier listener left on the
+	// port rule that hold out, the hold taken instead still refuses every
+	// socket without SO_REUSEADDR (see holdPort). Every return from New below
+	// that does not hand the socket to the engine closes it.
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	var hold *os.File
 	defer func() {
 		if hold != nil {
@@ -293,11 +314,19 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		}
 		cfg.Addr = lnAddr
 	case cfg.Addr != "":
-		resolved, h, err := holdPort(cfg.Addr)
-		if err == nil {
-			cfg.Addr = resolved
-			hold = h
+		resolved, h, exclusive, err := holdPort(cfg.Addr)
+		if err != nil {
+			// The address is left as given: net.Listen could not bind it
+			// either (see holdPort), and the start engine's bind reports why.
+			logger.Warn("adaptive engine: cannot hold the port until Listen; the start engine binds the address as given",
+				"addr", cfg.Addr, "error", err)
+			break
 		}
+		if !exclusive {
+			logger.Debug("adaptive engine: port held shared (SO_REUSEADDR): sockets of an earlier listener without SO_REUSEPORT are still on it",
+				"addr", resolved)
+		}
+		cfg.Addr, hold = resolved, h
 	}
 
 	// probe.Probe() reads kernel version + io_uring setup feature bits WITHOUT
@@ -306,10 +335,6 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	startType := chooseStartEngine(profile, cfg)
 
 	sampler := newLiveSampler(cpuMon)
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
 
 	// Only ONE listener ever arrives, so only ONE sub-engine may receive it:
 	// the START engine, which consumes it in Listen (closes it and rebinds its
@@ -993,6 +1018,9 @@ func (e *Engine) maybeThawLocked() {
 // Shutdown returns — by the time this function completes. Only then are the
 // sub-engines shut down. This is purely a join/sequencing concern; it does not
 // touch the ACTIVE→DRAINING→SUSPENDED worker lifecycle.
+//
+// Shutdown also gives back the port New holds for an engine that was never
+// started (see New), so an Engine built and not started must be shut down.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	// An engine shut down without ever being started still holds its port
 	// (celeris#616); Listen's own release covers every engine that was.

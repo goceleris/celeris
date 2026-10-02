@@ -6,8 +6,14 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/resource"
 )
 
 // The tests in this file reach into the fix for celeris#616 (the Listen hook
@@ -85,4 +91,56 @@ func TestAdaptivePortHoldReleasedOnceBound616(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAdaptivePortHoldKind616 pins which hold New takes. On a free port it is
+// the exclusive one (SO_REUSEPORT without SO_REUSEADDR), which refuses even a
+// Go listener. Beside the TIME_WAIT sockets of an ordinary Go server the
+// kernel refuses that one, and New must take the shared hold (SO_REUSEADDR as
+// well) rather than none: TestAdaptivePortHeldBesideTimeWait616 shows what
+// the shared hold still refuses.
+func TestAdaptivePortHoldKind616(t *testing.T) {
+	opts := func(t *testing.T, e *Engine) (reuseAddr, reusePort int) {
+		t.Helper()
+		f := e.portHold.Load()
+		if f == nil {
+			t.Fatal("New returned without holding the port")
+		}
+		fd := int(f.Fd())
+		ra, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR)
+		if err != nil {
+			t.Fatalf("getsockopt SO_REUSEADDR: %v", err)
+		}
+		rp, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT)
+		if err != nil {
+			t.Fatalf("getsockopt SO_REUSEPORT: %v", err)
+		}
+		return ra, rp
+	}
+	t.Setenv("CELERIS_ADAPTIVE_START", "epoll")
+	t.Run("free-port", func(t *testing.T) {
+		e, err := New(resource.Config{Addr: ":0", Protocol: engine.HTTP1, Resources: resource.Resources{Workers: 2}}, respHandler{}, nil)
+		if err != nil {
+			t.Fatalf("adaptive.New: %v", err)
+		}
+		defer func() { _ = e.Shutdown(context.Background()) }()
+		ra, rp := opts(t, e)
+		t.Logf("celeris616 hold kind: state=free-port addr=%s SO_REUSEADDR=%d SO_REUSEPORT=%d", e.cfg.Addr, ra, rp)
+		if ra != 0 || rp == 0 {
+			t.Errorf("the hold on a free port has SO_REUSEADDR=%d SO_REUSEPORT=%d, want 0 and set: the exclusive hold", ra, rp)
+		}
+	})
+	t.Run("time-wait", func(t *testing.T) {
+		port := leaveTimeWait(t)
+		e, err := New(resource.Config{Addr: ":" + strconv.Itoa(port), Protocol: engine.HTTP1, Resources: resource.Resources{Workers: 2}}, respHandler{}, nil)
+		if err != nil {
+			t.Fatalf("adaptive.New: %v", err)
+		}
+		defer func() { _ = e.Shutdown(context.Background()) }()
+		ra, rp := opts(t, e)
+		t.Logf("celeris616 hold kind: state=time-wait addr=%s SO_REUSEADDR=%d SO_REUSEPORT=%d", e.cfg.Addr, ra, rp)
+		if ra == 0 || rp == 0 {
+			t.Errorf("the hold beside TIME_WAIT sockets has SO_REUSEADDR=%d SO_REUSEPORT=%d, want both set: the shared hold", ra, rp)
+		}
+	})
 }
