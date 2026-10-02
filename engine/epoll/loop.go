@@ -2453,15 +2453,21 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 // It releases cs.detachMu first, if this goroutine still holds it: held, and
 // not already released on this goroutine's behalf by a Detach inside
 // ProcessH1 (asyncDetachUnlocked, celeris#273; Unlocking that again would be
-// a fatal "unlock of unlocked mutex", cf. celeris#309). Only then does
-// endDispatch clear asyncRun, so a loop that finds the lock held while the
-// goroutine reads as gone (dispatchBusy false) waits only for a bounded
-// holder, never for this one. The rest is the handler-error teardown in
-// serveAsync: asyncClosed, then the hand-back through the detach queue,
-// whose asyncClosed branch closes the conn on the loop thread (once what it
-// has staged has gone out, celeris#761). Like that path it never holds two
-// of detachMu, asyncInMu and detachQMu at once.
+// a fatal "unlock of unlocked mutex", cf. celeris#309). That is before the
+// log, too, whose handler is the application's and may be slow, while the
+// loop's shutdown and the guarded writes of a detached conn take the lock
+// unconditionally. Only then does endDispatch clear asyncRun, so a loop that
+// finds the lock held while the goroutine reads as gone (dispatchBusy false)
+// waits only for a bounded holder, never for this one; until then
+// dispatchBusy reads busy and the loop leaves cs alone. The rest is the
+// handler-error teardown in serveAsync: asyncClosed, then the hand-back
+// through the detach queue, whose asyncClosed branch closes the conn on the
+// loop thread (once what it has staged has gone out, celeris#761). Like that
+// path it never holds two of detachMu, asyncInMu and detachQMu at once.
 func (l *Loop) abortAsyncHandler(cs *connState, r any, held bool) {
+	if held && !cs.asyncDetachUnlocked {
+		cs.detachMu.Unlock()
+	}
 	if l.logger != nil {
 		if r != nil {
 			l.logger.Error("async handler panicked",
@@ -2475,9 +2481,6 @@ func (l *Loop) abortAsyncHandler(cs *connState, r any, held bool) {
 				"fd", cs.fd,
 			)
 		}
-	}
-	if held && !cs.asyncDetachUnlocked {
-		cs.detachMu.Unlock()
 	}
 	cs.asyncClosed.Store(true)
 	cs.asyncInMu.Lock()

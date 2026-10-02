@@ -4775,15 +4775,6 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	closeUnlessOwed(fd, owed)
 }
 
-// runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
-// Config.AsyncHandlers is enabled. Drains cs.asyncInBuf in a loop: take
-// currently-buffered bytes, run ProcessH1 under cs.detachMu (serializes
-// with worker-initiated writeBuf/sendBuf mutations), enqueue on
-// detachQueue so the worker submits SEND SQEs on its own goroutine
-// (SINGLE_ISSUER — handler Gs cannot call ring.GetSQE directly).
-// Preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
-// request in the slice in order, and responses land on cs.writeBuf in
-// the same order before the flush.
 // promoteConnToAsync hands a conn that bailed from the inline fast path
 // (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
@@ -4861,7 +4852,7 @@ func (w *Worker) asyncHeaderDeadline(cs *connState) int64 {
 // inline fast path (celeris#364). True when single-shot recv is in use, the
 // conn recorded the route that promoted it, and that route's promotion has
 // since expired (RouteAsync now false — the route-level TTL de-promotion).
-// Called by runAsyncHandler ONLY while holding asyncInMu with asyncInBuf empty.
+// Called by serveAsync ONLY while holding asyncInMu with asyncInBuf empty.
 func (w *Worker) canRevertToInline(cs *connState) bool {
 	return w.bufRing == nil && cs.promotedPath != "" && cs.h1State != nil &&
 		cs.h1State.RouteAsync != nil &&
@@ -4906,15 +4897,22 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 // It releases cs.detachMu first, if this goroutine still holds it: held, and
 // not already released on this goroutine's behalf by a Detach inside
 // ProcessH1 (asyncDetachUnlocked, celeris#273; Unlocking that again would be
-// a fatal "unlock of unlocked mutex", cf. celeris#309). Only then does
-// endDispatch clear asyncRun, so a worker that finds the lock held while the
-// goroutine reads as gone (dispatchBusy false) waits only for a bounded
-// holder, never for this one. The rest is the handler-error teardown below
-// in serveAsync: asyncClosed, then the hand-back through the detach queue,
-// whose asyncClosed branch runs closeConn on the worker. Like that path it
-// never holds two of detachMu, asyncInMu and detachQMu at once. Nothing
-// here touches cs after the enqueue.
+// a fatal "unlock of unlocked mutex", cf. celeris#309). That is before the
+// log, too, whose handler is the application's and may be slow, while the
+// worker's shutdown and the guarded writes of a detached conn take the lock
+// unconditionally. Only then does endDispatch clear asyncRun, so a worker
+// that finds the lock held while the goroutine reads as gone (dispatchBusy
+// false) waits only for a bounded holder, never for this one; until then
+// dispatchBusy reads busy and the worker leaves cs alone. The rest is the
+// handler-error teardown below in serveAsync: asyncClosed, then the
+// hand-back through the detach queue, whose asyncClosed branch runs
+// closeConn on the worker. Like that path it never holds two of detachMu,
+// asyncInMu and detachQMu at once. Nothing here touches cs after the
+// enqueue.
 func (w *Worker) abortAsyncHandler(cs *connState, r any, held bool) {
+	if held && !cs.asyncDetachUnlocked {
+		cs.detachMu.Unlock()
+	}
 	if w.logger != nil {
 		if r != nil {
 			w.logger.Error("async handler panicked",
@@ -4929,9 +4927,6 @@ func (w *Worker) abortAsyncHandler(cs *connState, r any, held bool) {
 			)
 		}
 	}
-	if held && !cs.asyncDetachUnlocked {
-		cs.detachMu.Unlock()
-	}
 	cs.asyncClosed.Store(true)
 	cs.asyncInMu.Lock()
 	cs.asyncInBuf = cs.asyncInBuf[:0]
@@ -4939,17 +4934,22 @@ func (w *Worker) abortAsyncHandler(cs *connState, r any, held bool) {
 	cs.asyncInMu.Unlock()
 	// Wake the worker so it observes asyncClosed and tears
 	// down the conn via the detachQueue → drain path.
-	w.detachQMu.Lock()
-	w.detachQueue = append(w.detachQueue, cs)
-	w.detachQPending.Store(1)
-	w.detachQMu.Unlock()
-	w.wakeFD.Signal()
+	w.enqueueDetach(cs)
 }
 
-// serveAsync is the dispatch goroutine's loop (see runAsyncHandler). *held
-// tracks its Lock and Unlock of cs.detachMu, for abortAsyncHandler. It stays
-// set across a Detach inside ProcessH1, which releases the lock on this
-// goroutine's behalf and records that in asyncDetachUnlocked instead.
+// serveAsync is the dispatch goroutine's loop (see runAsyncHandler). It
+// drains cs.asyncInBuf: it takes the currently-buffered bytes, runs
+// ProcessH1 under cs.detachMu (serializing with the worker's writeBuf and
+// sendBuf mutations), and hands what it could not write to the worker
+// through the detach queue, so the worker submits the SEND SQEs on its own
+// goroutine (SINGLE_ISSUER: a handler goroutine cannot call ring.GetSQE).
+// It preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
+// request in the slice in order, and the responses land on cs.writeBuf in
+// the same order before the flush.
+//
+// *held tracks its Lock and Unlock of cs.detachMu, for abortAsyncHandler.
+// It stays set across a Detach inside ProcessH1, which releases the lock on
+// this goroutine's behalf and records that in asyncDetachUnlocked instead.
 func (w *Worker) serveAsync(cs *connState, held *bool) {
 	for {
 		cs.asyncInMu.Lock()
