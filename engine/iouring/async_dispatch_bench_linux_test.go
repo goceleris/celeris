@@ -4,12 +4,16 @@ package iouring
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,17 +23,39 @@ import (
 )
 
 // asyncDispatchBenchHandler answers every request on the dispatch goroutine.
-type asyncDispatchBenchHandler struct{}
+// It checks that premise on one call in asyncDispatchSampleEvery: it reads
+// its own goroutine's stack and counts the call as on or off the dispatch
+// goroutine (a runAsyncHandler frame, or none, as on the inline path). The
+// buffer is reused, so the check allocates nothing, and the sampling keeps
+// its cost to an atomic add per call, the same in every arm.
+type asyncDispatchBenchHandler struct {
+	calls, onDispatch, offDispatch atomic.Int64
 
-func (asyncDispatchBenchHandler) HandleStream(_ context.Context, s *stream.Stream) error {
+	mu    sync.Mutex
+	stack []byte
+}
+
+const asyncDispatchSampleEvery = 1024
+
+func (h *asyncDispatchBenchHandler) HandleStream(_ context.Context, s *stream.Stream) error {
+	if h.calls.Add(1)%asyncDispatchSampleEvery == 1 {
+		h.mu.Lock()
+		st := h.stack[:runtime.Stack(h.stack, false)]
+		if bytes.Contains(st, []byte(".(*Worker).runAsyncHandler(")) {
+			h.onDispatch.Add(1)
+		} else {
+			h.offDispatch.Add(1)
+		}
+		h.mu.Unlock()
+	}
 	if s.ResponseWriter == nil {
 		return nil
 	}
 	return s.ResponseWriter.WriteResponse(s, 200,
 		[][2]string{{"content-type", "text/plain"}, {"content-length", "2"}}, []byte("ok"))
 }
-func (asyncDispatchBenchHandler) RouteAsync(_, _ string) bool { return true }
-func (asyncDispatchBenchHandler) HasAsyncRoutes() bool        { return true }
+func (*asyncDispatchBenchHandler) RouteAsync(_, _ string) bool { return true }
+func (*asyncDispatchBenchHandler) HasAsyncRoutes() bool        { return true }
 
 // BenchmarkAsyncDispatchKeepAlive is one keep-alive client against an async
 // route, a request at a time: every iteration is one pass of the dispatch
@@ -44,13 +70,14 @@ func BenchmarkAsyncDispatchKeepAlive(b *testing.B) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
+	h := &asyncDispatchBenchHandler{stack: make([]byte, 64<<10)}
 	e, err := New(resource.Config{
 		Addr:          addr,
 		Protocol:      engine.HTTP1,
 		Resources:     resource.Resources{Workers: 2},
 		AsyncHandlers: true,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}, asyncDispatchBenchHandler{})
+	}, h)
 	if err != nil {
 		b.Skipf("iouring engine unavailable: %v", err)
 	}
@@ -112,6 +139,12 @@ func BenchmarkAsyncDispatchKeepAlive(b *testing.B) {
 	b.StopTimer()
 	if string(buf[:15]) != "HTTP/1.1 200 OK" {
 		b.Fatalf("last response %q", buf[:min(n, 40)])
+	}
+	// The premise: every sampled call, the timed ones among them, ran on the
+	// dispatch goroutine, and there were samples to judge by.
+	if on, off := h.onDispatch.Load(), h.offDispatch.Load(); off != 0 || on == 0 {
+		b.Fatalf("PREMISE: %d of %d sampled calls ran off the dispatch goroutine (%d calls in all)",
+			off, on+off, h.calls.Load())
 	}
 }
 

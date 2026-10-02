@@ -641,15 +641,19 @@ jobs:
       # existed. The root race step above runs ./engine/epoll, ./engine/std
       # and the root package without -v, where a test that stops running says
       # nothing, and the engine/iouring step counts no name of these. So the
-      # twelve run here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and an
-      # exact tally: the panic, Goexit and handler-error (control) arms of
-      # io_uring and epoll, std's panic and Goexit arms, and the public-API
-      # arms (an .Async() route that calls runtime.Goexit on each engine, and
-      # its panic control, which the router answers with a 500) must each
-      # PASS and print one RESULT line that reads stopped=true, with no SKIP
-      # line. memlock stays at the runner's 8 MiB: one io_uring worker, the
-      # shape the defect wedged in. Job `adaptive` runs the adaptive arms,
-      # whose adopted-conn arm meets the defect on two io_uring workers.
+      # eighteen run here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and
+      # an exact tally: the panic, Goexit, handler-error (control),
+      # Detach-then-panic and Detach-then-Goexit arms of io_uring and epoll
+      # (the Detach arms pin that the teardown never releases a lock Detach
+      # already released: that would be a fatal "unlock of unlocked mutex"),
+      # std's panic and Goexit arms, and the public-API arms (an .Async()
+      # route that calls runtime.Goexit, with and without a c.Detach() first,
+      # on each engine, and its panic control, which the router answers with
+      # a 500) must each PASS and print one RESULT line that reads
+      # stopped=true, with no SKIP line. memlock stays at the runner's 8 MiB:
+      # one io_uring worker, the shape the defect wedged in. Job `adaptive`
+      # runs the adaptive arms, whose adopted-conn arm meets the defect on two
+      # io_uring workers.
       - name: celeris#791 handler panic and Goexit on a dispatch goroutine (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -659,10 +663,10 @@ jobs:
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
           failed=0
-          uring='TestIouringAsyncHandlerPanicLeavesItsWorkerServing|TestIouringAsyncHandlerGoexitLeavesItsWorkerServing|TestIouringAsyncHandlerErrorLeavesItsWorkerServing'
-          epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing'
+          uring='TestIouringAsyncHandlerPanicLeavesItsWorkerServing|TestIouringAsyncHandlerGoexitLeavesItsWorkerServing|TestIouringAsyncHandlerErrorLeavesItsWorkerServing|TestIouringAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestIouringAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
+          epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
           std='TestStdHandlerPanicLeavesTheEngineServing|TestStdHandlerGoexitLeavesTheEngineServing'
-          server='TestServerAsyncRouteGoexitOnEpoll|TestServerAsyncRouteGoexitOnIOUring|TestServerAsyncRoutePanicOnEpoll|TestServerAsyncRoutePanicOnIOUring'
+          server='TestServerAsyncRouteGoexitOnEpoll|TestServerAsyncRouteGoexitOnIOUring|TestServerAsyncRouteDetachThenGoexitOnEpoll|TestServerAsyncRouteDetachThenGoexitOnIOUring|TestServerAsyncRoutePanicOnEpoll|TestServerAsyncRoutePanicOnIOUring'
           go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))

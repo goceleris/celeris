@@ -42,10 +42,21 @@ import (
 // (the handler answers /ok with its worker id). Then every boom connection
 // sends /boom. The worker must then still answer its witness, eight fresh
 // connections must be answered, and Listen must return after cancel, every
-// read within abortBudget791. The error arm is the control: /boom returns an
-// error, which reaches the same asyncClosed teardown with the lock released,
-// so it passes on the base as well; that the rig can pass is what makes the
-// other two arms' failures mean something.
+// read within abortBudget791, and ActiveConnections must settle at the
+// witness count (every /boom conn closed and accounted). The error arm is the
+// control: /boom returns an error, which reaches the same asyncClosed
+// teardown with the lock released, so it passes on the base as well; that
+// the rig can pass is what makes the other arms' failures mean something.
+//
+// The two Detach arms pin the teardown's guard. A handler that calls
+// Context.Detach (the websocket and sse middleware do) runs the engine's
+// OnDetach, which releases cs.detachMu on the dispatch goroutine's behalf
+// (celeris#273). If such a handler then panics or calls runtime.Goexit, the
+// teardown must not release the lock a second time: that Unlock is a fatal
+// "unlock of unlocked mutex", which ends the whole process (cf. celeris#309).
+// Detach-then-panic passes on the base, whose recover never unlocked;
+// Detach-then-Goexit fails there as the plain Goexit does, the conn never
+// closed.
 
 // abortBudget791 bounds every read and the stop. A worker that serves answers
 // in well under a millisecond; the rest absorbs a loaded -race run.
@@ -54,11 +65,20 @@ const abortBudget791 = 2 * time.Second
 // abortFresh791 is how many fresh connections must be answered after the fault.
 const abortFresh791 = 8
 
+// abortSettle791 bounds the wait for ActiveConnections to settle at the
+// witness count once the fault's conns and the test's own closed conns have
+// been torn down.
+const abortSettle791 = 5 * time.Second
+
 // The ways /boom ends its handler.
 const (
 	abortPanic791  = "panic"
 	abortGoexit791 = "goexit"
 	abortError791  = "error" // the control
+	// Context.Detach's engine half (stream.OnDetach), then a panic or a
+	// Goexit.
+	abortDetachPanic791  = "detach-panic"
+	abortDetachGoexit791 = "detach-goexit"
 )
 
 // The engine's log messages for the two abnormal exits (abortAsyncHandler).
@@ -68,8 +88,9 @@ const (
 )
 
 type abortHandler791 struct {
-	mode string
-	hits *atomic.Int64 // /boom invocations: the fault was injected this many times
+	mode     string
+	hits     *atomic.Int64 // /boom invocations: the fault was injected this many times
+	detaches *atomic.Int64 // OnDetach calls by /boom (the Detach arms)
 }
 
 func (h abortHandler791) HandleStream(ctx context.Context, s *stream.Stream) error {
@@ -80,6 +101,20 @@ func (h abortHandler791) HandleStream(ctx context.Context, s *stream.Stream) err
 			panic("celeris791: handler panic")
 		case abortGoexit791:
 			runtime.Goexit()
+		case abortDetachPanic791, abortDetachGoexit791:
+			// What Context.Detach does on an engine stream: OnDetach, which
+			// on a dispatch goroutine releases cs.detachMu on its behalf.
+			// A stream without OnDetach is counted as no detach, which the
+			// test reports as a failed injection.
+			if s.OnDetach == nil {
+				return errors.New("celeris791: no OnDetach on the async stream")
+			}
+			s.OnDetach()
+			h.detaches.Add(1)
+			if h.mode == abortDetachGoexit791 {
+				runtime.Goexit()
+			}
+			panic("celeris791: handler panic after Detach")
 		default:
 			return errors.New("celeris791: handler error")
 		}
@@ -181,7 +216,7 @@ func runAbort791(t *testing.T, mode string) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	var hits atomic.Int64
+	var hits, detaches atomic.Int64
 	logs := &abortLog791{}
 	e, err := New(resource.Config{
 		Addr:          addr,
@@ -189,7 +224,7 @@ func runAbort791(t *testing.T, mode string) {
 		Resources:     resource.Resources{Workers: 2},
 		AsyncHandlers: true,
 		Logger:        slog.New(logs),
-	}, abortHandler791{mode: mode, hits: &hits})
+	}, abortHandler791{mode: mode, hits: &hits, detaches: &detaches})
 	if err != nil {
 		skipOrFail656(t, "iouring engine unavailable: %v", err)
 	}
@@ -289,6 +324,16 @@ func runAbort791(t *testing.T, mode string) {
 			freshOut[abortClass791(err)]++
 		}
 	}
+	// Every conn but the witnesses is gone: the boom conns closed by the
+	// engine, the fresh and surplus ones by the test. ActiveConnections is
+	// this engine's own count, so no other test's state reaches it.
+	var active int64
+	for deadline := time.Now().Add(abortSettle791); ; time.Sleep(20 * time.Millisecond) {
+		active = e.Metrics().ActiveConnections
+		if active == int64(workers) || time.Now().After(deadline) {
+			break
+		}
+	}
 	var blocked []string
 	if witnessOK != workers || freshOK != abortFresh791 {
 		blocked = abortBlocked791()
@@ -302,10 +347,10 @@ func runAbort791(t *testing.T, mode string) {
 	case <-time.After(5 * time.Second):
 	}
 
-	t.Logf("celeris791 RESULT engine=io_uring mode=%s workers=%d hits=%d log_panics=%d log_goexits=%d "+
-		"boom=%v witness=%d/%d %v fresh=%d/%d %v stopped=%v blocked=%d",
-		mode, workers, hits.Load(), logs.panics.Load(), logs.goexits.Load(), boomOut,
-		witnessOK, workers, witnessOut, freshOK, abortFresh791, freshOut, stopped, len(blocked))
+	t.Logf("celeris791 RESULT engine=io_uring mode=%s workers=%d hits=%d detaches=%d log_panics=%d log_goexits=%d "+
+		"boom=%v witness=%d/%d %v fresh=%d/%d %v active=%d/%d stopped=%v blocked=%d",
+		mode, workers, hits.Load(), detaches.Load(), logs.panics.Load(), logs.goexits.Load(), boomOut,
+		witnessOK, workers, witnessOut, freshOK, abortFresh791, freshOut, active, workers, stopped, len(blocked))
 	for _, g := range blocked {
 		t.Logf("celeris791 BLOCKED\n%s", g)
 	}
@@ -315,13 +360,29 @@ func runAbort791(t *testing.T, mode string) {
 		t.Errorf("INJECTION: /boom ran %d times, want %d (one per worker)", n, workers)
 	}
 	switch mode {
-	case abortPanic791:
+	case abortDetachPanic791, abortDetachGoexit791:
+		if n := detaches.Load(); n != int64(workers) {
+			t.Errorf("INJECTION: /boom ran OnDetach %d times, want %d (one per worker)", n, workers)
+		}
+	default:
+		if n := detaches.Load(); n != 0 {
+			t.Errorf("INJECTION: /boom (%s) ran OnDetach %d times, want 0", mode, n)
+		}
+	}
+	switch mode {
+	case abortPanic791, abortDetachPanic791:
 		if n := logs.panics.Load(); n != int64(workers) {
 			t.Errorf("INJECTION: the engine logged %d recovered panics, want %d", n, workers)
 		}
-	case abortGoexit791:
+		if n := logs.goexits.Load(); n != 0 {
+			t.Errorf("INJECTION: the engine logged %d handler Goexits for a panic, want 0", n)
+		}
+	case abortGoexit791, abortDetachGoexit791:
 		if n := logs.goexits.Load(); n != int64(workers) {
 			t.Errorf("the engine logged %d handler Goexits, want %d: a Goexit took no teardown", n, workers)
+		}
+		if n := logs.panics.Load(); n != 0 {
+			t.Errorf("INJECTION: the engine logged %d recovered panics for a Goexit, want 0", n)
 		}
 	default:
 		if p, g := logs.panics.Load(), logs.goexits.Load(); p != 0 || g != 0 {
@@ -341,6 +402,10 @@ func runAbort791(t *testing.T, mode string) {
 		t.Errorf("celeris#791: after a /boom (%s) on every worker, %d of %d fresh conns were answered within %v (%v)",
 			mode, freshOK, abortFresh791, abortBudget791, freshOut)
 	}
+	if active != int64(workers) {
+		t.Errorf("celeris#791: after a /boom (%s) on every worker, ActiveConnections settled at %d within %v, "+
+			"want %d (the witness conns): a /boom conn was never closed", mode, active, abortSettle791, workers)
+	}
 	if !stopped {
 		t.Errorf("celeris#791: Listen did not return within 5s of cancel after a /boom (%s)", mode)
 	}
@@ -358,4 +423,16 @@ func TestIouringAsyncHandlerGoexitLeavesItsWorkerServing(t *testing.T) {
 // teardown, entered by a normal return. It passes on the base too.
 func TestIouringAsyncHandlerErrorLeavesItsWorkerServing(t *testing.T) {
 	runAbort791(t, abortError791)
+}
+
+// The Detach arms: the teardown must leave alone the lock that OnDetach has
+// already released (see the top of the file). With the guard gone the
+// process dies of "sync: unlock of unlocked mutex" and the test prints no
+// result line at all.
+func TestIouringAsyncHandlerDetachThenPanicLeavesItsWorkerServing(t *testing.T) {
+	runAbort791(t, abortDetachPanic791)
+}
+
+func TestIouringAsyncHandlerDetachThenGoexitLeavesItsWorkerServing(t *testing.T) {
+	runAbort791(t, abortDetachGoexit791)
 }

@@ -42,6 +42,13 @@ import (
 // is the control: the router answers it with a 500 on the base as well, so
 // the rig can pass, and that is what makes the Goexit arm's failure mean
 // something.
+//
+// The Detach-then-Goexit arms are the same fault after c.Detach(), as an SSE
+// or websocket handler in a test would meet it. Detach releases the dispatch
+// goroutine's cs.detachMu on its behalf (celeris#273), so the engine's
+// teardown must not release it again: that second Unlock is a fatal "unlock
+// of unlocked mutex" that ends the process (cf. celeris#309). On the base
+// the conn is never closed, as for the plain Goexit.
 
 const (
 	goexitBudget791 = 2 * time.Second
@@ -81,7 +88,14 @@ func goexitClass791(err error) string {
 	return err.Error()
 }
 
-func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, goexit bool) {
+// The ways /boom ends its handler.
+const (
+	srvPanic791        = "panic" // the control
+	srvGoexit791       = "goexit"
+	srvDetachGoexit791 = "detach-goexit"
+)
+
+func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, mode string) {
 	if eng == celeris.IOUring {
 		if ok, p := keptProbeIOUring(); !ok {
 			if os.Getenv("CELERIS_REQUIRE_IOURING_WORKERS") == "1" {
@@ -90,15 +104,16 @@ func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, goexit bool) {
 			t.Skipf("io_uring tier=%s kernel=%s: no usable io_uring", p.IOUringTier, p.KernelVersion)
 		}
 	}
-	mode := "panic"
-	if goexit {
-		mode = "goexit"
-	}
-	var hits atomic.Int64
+	var hits, detaches atomic.Int64
 	s := celeris.New(celeris.Config{Engine: eng, Workers: 2})
 	s.GET("/boom", func(c *celeris.Context) error {
 		hits.Add(1)
-		if goexit {
+		switch mode {
+		case srvGoexit791:
+			runtime.Goexit()
+		case srvDetachGoexit791:
+			_ = c.Detach() // its done is never called: the Goexit comes first
+			detaches.Add(1)
 			runtime.Goexit()
 		}
 		panic("celeris791: handler panic")
@@ -201,18 +216,27 @@ func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, goexit bool) {
 	case <-time.After(goexitStop791):
 	}
 
-	t.Logf("celeris791 RESULT engine=server-%s mode=%s workers_judged=%d hits=%d boom=%v witness=%d/%d %v fresh=%d/%d %v stopped=%v",
-		eng, mode, len(ids), hits.Load(), boomOut, witnessOK, len(ids), witnessOut, freshOK, goexitFresh791, freshOut, stopped)
+	t.Logf("celeris791 RESULT engine=server-%s mode=%s workers_judged=%d hits=%d detaches=%d boom=%v witness=%d/%d %v fresh=%d/%d %v stopped=%v",
+		eng, mode, len(ids), hits.Load(), detaches.Load(), boomOut, witnessOK, len(ids), witnessOut, freshOK, goexitFresh791, freshOut, stopped)
 
 	if n := hits.Load(); n != int64(len(ids)) {
 		t.Errorf("INJECTION: /boom ran %d times, want %d (one per judged worker)", n, len(ids))
+	}
+	wantDetaches := int64(0)
+	if mode == srvDetachGoexit791 {
+		wantDetaches = int64(len(ids))
+	}
+	if n := detaches.Load(); n != wantDetaches {
+		t.Errorf("INJECTION: /boom (%s) returned from c.Detach %d times, want %d", mode, n, wantDetaches)
 	}
 	for _, o := range boomOut {
 		switch {
 		case strings.HasSuffix(o, ":timeout"):
 			t.Errorf("celeris#791: /boom (%s) got %s; want its conn answered or torn down within %v", mode, o, goexitBudget791)
-		case !goexit && !strings.HasSuffix(o, ":status=500"):
+		case mode == srvPanic791 && !strings.HasSuffix(o, ":status=500"):
 			t.Errorf("CONTROL: /boom (panic) got %s; want the router's 500", o)
+		case mode != srvPanic791 && strings.HasSuffix(o, ":status=200"):
+			t.Errorf("celeris#791: /boom (%s) got %s from a handler that never wrote", mode, o)
 		}
 	}
 	if witnessOK != len(ids) {
@@ -229,19 +253,27 @@ func runServerAsyncAbort791(t *testing.T, eng celeris.EngineType, goexit bool) {
 }
 
 func TestServerAsyncRouteGoexitOnEpoll(t *testing.T) {
-	runServerAsyncAbort791(t, celeris.Epoll, true)
+	runServerAsyncAbort791(t, celeris.Epoll, srvGoexit791)
 }
 
 func TestServerAsyncRouteGoexitOnIOUring(t *testing.T) {
-	runServerAsyncAbort791(t, celeris.IOUring, true)
+	runServerAsyncAbort791(t, celeris.IOUring, srvGoexit791)
+}
+
+func TestServerAsyncRouteDetachThenGoexitOnEpoll(t *testing.T) {
+	runServerAsyncAbort791(t, celeris.Epoll, srvDetachGoexit791)
+}
+
+func TestServerAsyncRouteDetachThenGoexitOnIOUring(t *testing.T) {
+	runServerAsyncAbort791(t, celeris.IOUring, srvDetachGoexit791)
 }
 
 // The controls: a panic on the same route is the router's to recover (a 500),
 // on the base too.
 func TestServerAsyncRoutePanicOnEpoll(t *testing.T) {
-	runServerAsyncAbort791(t, celeris.Epoll, false)
+	runServerAsyncAbort791(t, celeris.Epoll, srvPanic791)
 }
 
 func TestServerAsyncRoutePanicOnIOUring(t *testing.T) {
-	runServerAsyncAbort791(t, celeris.IOUring, false)
+	runServerAsyncAbort791(t, celeris.IOUring, srvPanic791)
 }
