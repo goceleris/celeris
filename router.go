@@ -591,7 +591,10 @@ func (r *router) routeAsync(method, path string) bool {
 		}
 	}
 	var params Params
-	_, fullPath, async := r.find(method, path, &params)
+	handlers, fullPath, async := r.find(method, path, &params)
+	if handlers == nil && method == "HEAD" {
+		_, fullPath, async = r.findHEADAsGET(path, &params, 0)
+	}
 	return async || r.adaptivePromoted(fullPath)
 }
 
@@ -625,24 +628,21 @@ func isStaticPath(path string) bool {
 	return true
 }
 
-// find returns the handler chain, route pattern and async flag of the route
-// that answers method+path. A HEAD request with no HEAD route of its own is
-// answered by the GET route (celeris#421; RFC 9110 §9.3.2: HEAD is GET
-// without the content, which the engines drop), so every observer of a
-// lookup (HandleStream, routeAsync's dispatch decision, the route cache)
-// sees the same route.
-func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
-	n := len(*params)
-	handlers, fullPath, async := r.findMethod(method, path, params)
-	if handlers == nil && method == "HEAD" {
-		*params = (*params)[:n] // drop anything the failed walk left behind
-		return r.findMethod("GET", path, params)
-	}
-	return handlers, fullPath, async
+// findHEADAsGET answers a HEAD request whose path has no HEAD route with the
+// path's GET route (celeris#421; RFC 9110 §9.3.2: HEAD is GET without the
+// content, which the engines drop). find stays the exact lookup, and its two
+// request-path callers call this only after find missed a HEAD, so a hit
+// costs what it did: HandleStream (and so the per-connection route cache,
+// keyed by method) and routeAsync (the dispatch decision), which must agree
+// on the route. n is the length params had before the failed walk.
+func (r *router) findHEADAsGET(path string, params *Params, n int) ([]HandlerFunc, string, bool) {
+	*params = (*params)[:n]
+	return r.find("GET", path, params)
 }
 
-// findMethod is find for exactly method, without the HEAD fallback.
-func (r *router) findMethod(method, path string, params *Params) ([]HandlerFunc, string, bool) {
+// find returns the handler chain, route pattern and async flag of the route
+// registered for exactly method+path; see findHEADAsGET for HEAD.
+func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
 	idx := methodIndex(method)
 	var root *node
 
@@ -688,15 +688,16 @@ func (r *router) findMethod(method, path string, params *Params) ([]HandlerFunc,
 // allowedMethods returns the methods the path answers, for the Allow header
 // of a 405 and of the automatic OPTIONS answer (celeris#421; RFC 9110
 // §10.2.1), excluding except: every method with a route for the path, HEAD
-// when the path has a GET or HEAD route (find answers HEAD with the GET
-// route), and OPTIONS (answered automatically when the path has no OPTIONS
-// route). The order is GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, then
-// custom methods sorted. A path with no route at all returns nil.
+// when the path has a GET or HEAD route (a HEAD without its own route is
+// answered by the GET route, findHEADAsGET), and OPTIONS (answered
+// automatically when the path has no OPTIONS route). The order is GET, POST,
+// PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
+// no route at all returns nil.
 func (r *router) allowedMethods(path string, except string) []string {
 	var params Params
 	has := func(method string) bool {
 		params = params[:0]
-		handlers, _, _ := r.findMethod(method, path, &params)
+		handlers, _, _ := r.find(method, path, &params)
 		return handlers != nil
 	}
 	var found [nMethods]bool

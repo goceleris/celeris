@@ -135,7 +135,12 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 		fullPath = s.CachedRouteFullPath
 	} else {
 		var routeAsync bool
+		n := len(c.params)
 		handlers, fullPath, routeAsync = a.server.router.find(c.method, c.path, &c.params)
+		if handlers == nil && c.method == "HEAD" {
+			// celeris#421: HEAD without a HEAD route runs the GET route.
+			handlers, fullPath, routeAsync = a.server.router.findHEADAsGET(c.path, &c.params, n)
+		}
 		if handlers != nil && len(c.params) == 0 {
 			s.CachedRouteMethod = strings.Clone(c.method)
 			s.CachedRoutePath = strings.Clone(c.path)
