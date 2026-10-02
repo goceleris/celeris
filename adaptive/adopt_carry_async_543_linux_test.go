@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -256,51 +255,5 @@ func runCarrySplit543(t *testing.T, name string, workers int, adopt func(int, en
 	}
 	if answered && !followUp {
 		t.Errorf("%s: the adopted conn did not serve a request after the carried one", name)
-	}
-}
-
-// runCarryPipelined543 adopts a conn whose carry holds three pipelined
-// requests, a sync route, the async /block and another sync route, with
-// /block's handler already released. The three answers must come back whole
-// and in order, and the conn must keep serving.
-func runCarryPipelined543(t *testing.T, name string, adopt func(int, engine.Carryover) error, h *carry543Handler) {
-	t.Helper()
-	close(h.release)
-	client, fd := adoptable543(t)
-	carry := engine.Carryover{
-		RemoteAddr: client.LocalAddr().String(),
-		Buffered: []byte("GET /first HTTP/1.1\r\nHost: x\r\n\r\n" +
-			"GET /block HTTP/1.1\r\nHost: x\r\n\r\n" +
-			"GET /third HTTP/1.1\r\nHost: x\r\n\r\n"),
-	}
-	if err := adopt(fd, carry); err != nil {
-		_ = unix.Close(fd)
-		t.Fatalf("AdoptConn with three carried requests: %v", err)
-	}
-	br := bufio.NewReader(client)
-	var got []string
-	for range 3 {
-		code, body, err := readBody543(client, br, 3*time.Second)
-		if err != nil || code != 200 {
-			got = append(got, "ERR("+strconv.Itoa(code)+")")
-			break
-		}
-		got = append(got, body)
-	}
-	followUp := false
-	if _, err := client.Write([]byte("GET /after HTTP/1.1\r\nHost: x\r\n\r\n")); err == nil {
-		code, body, err := readBody543(client, br, 3*time.Second)
-		followUp = err == nil && code == 200 && body == "/after"
-	}
-	want := []string{"/first", "blocked-done", "/third"}
-	t.Logf("celeris543 PIPELINED engine=%s answers=%q follow_up=%v block_runs=%d", name, got, followUp, h.blockRuns.Load())
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("%s: carried pipelined requests answered %q, want %q in that order", name, got, want)
-	}
-	if !followUp {
-		t.Errorf("%s: the adopted conn did not serve a request after the carried ones", name)
-	}
-	if n := h.blockRuns.Load(); n != 1 {
-		t.Errorf("%s: /block ran %d times, want 1", name, n)
 	}
 }
