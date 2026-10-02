@@ -2,7 +2,9 @@
 // for celeris.
 //
 // It negotiates an encoding from the Accept-Encoding request header and
-// compresses 2xx responses on the fly. Supported encodings are zstd, brotli
+// compresses 2xx responses on the fly, except a 206 Partial Content, whose
+// Content-Range counts bytes of the unencoded representation and which is
+// sent as it is. Supported encodings are zstd, brotli
 // ("br"), gzip, and deflate; the default server-side priority is
 // zstd > br > gzip. Deflate is supported but opt-in (add "deflate" to
 // [Config].Encodings) because it is superseded by gzip.

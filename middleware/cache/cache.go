@@ -188,7 +188,7 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 
 	cacheBytes := dst
 	effectiveTTL := cfg.TTL
-	if chainErr == nil && cfg.StatusFilter(status) && len(body) <= cfg.MaxBodyBytes {
+	if chainErr == nil && !answersRange(status) && cfg.StatusFilter(status) && len(body) <= cfg.MaxBodyBytes {
 		cacheable := true
 		if cfg.RespectCacheControl {
 			for _, h := range respHeaders {
@@ -230,6 +230,15 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 		return nil, 0, chainErr
 	}
 	return cacheBytes, effectiveTTL, nil
+}
+
+// answersRange reports a status that answers the request's Range header: a
+// 206 Partial Content carries one part, a 416 says that Range cannot be
+// satisfied. Neither is stored, whatever StatusFilter says: the key does not
+// include Range, so a later request without it (or with another) would get the
+// part, or the 416, back (celeris#832).
+func answersRange(status int) bool {
+	return status == 206 || status == 416
 }
 
 func replay(c *celeris.Context, cfg Config, rep store.EncodedResponse) error {

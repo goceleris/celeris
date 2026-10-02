@@ -42,7 +42,11 @@ func New(config ...Config) celeris.HandlerFunc {
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
 
-		if status < 200 || status >= 300 || len(body) == 0 {
+		// A 206's body is one part of the representation: its hash is not
+		// the representation's tag, and a 304 for it would answer a ranged
+		// request with a validator nobody can hold (celeris#832). It goes
+		// through untouched, with whatever tag the handler set.
+		if status < 200 || status >= 300 || status == 206 || len(body) == 0 {
 			if ferr := c.FlushResponse(); ferr != nil && err == nil {
 				err = ferr
 			}

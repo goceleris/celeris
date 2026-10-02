@@ -6,7 +6,8 @@
 // body), encodes it via the versioned wire format in [middleware/store],
 // and persists the result under a request-derived key. Subsequent
 // requests that produce the same key skip the handler and replay the
-// stored response.
+// stored response. A 206 Partial Content or a 416 is never stored: both
+// answer the request's Range, which the key does not include.
 //
 // # Backends
 //
