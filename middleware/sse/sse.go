@@ -367,10 +367,11 @@ func New(config ...Config) celeris.HandlerFunc {
 		// celeris#421: HEAD is answered by the GET route. A HEAD client
 		// wants the headers of the stream, not a stream that runs until it
 		// goes away (and, detached, keeps its connection from serving the
-		// next request). OnConnect still runs, so a rejection (auth) gives
-		// HEAD the status GET would get. When it accepts, the headers are
-		// sent, the response ends there and OnDisconnect runs at once; the
-		// Handler does not run. The engine sends no body for HEAD.
+		// next request). OnConnect still runs, and its rejection (auth) is
+		// returned exactly as for GET (what reaches the wire then is
+		// celeris#835). When it accepts, the headers are sent, the response
+		// ends there and OnDisconnect runs at once; the Handler does not
+		// run. The engine sends no body for HEAD.
 		if c.Method() == "HEAD" {
 			// The client's context keeps the request's values but not its
 			// cancellation: it is cancelled before this returns, and a
