@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/internal/httprange"
 )
 
 // cachedFile stores the immutable content and content-type of an fs.FS file,
@@ -292,7 +293,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 	// 5. Serve cached content if available.
 	c.SetHeader("accept-ranges", "bytes")
 	if cached != nil {
-		return serveFSCached(c, cached.data, cached.contentType)
+		return serveFSCached(c, cached.data, cached.contentType, etag, lastModifiedStr)
 	}
 
 	// 6. Read, cache (with headers), and serve.
@@ -327,7 +328,7 @@ func serveFS(c *celeris.Context, fsys fs.FS, filePath, index string, browse, spa
 		lastModifiedStr: lastModifiedStr,
 		modTime:         modTime,
 	})
-	return serveFSCached(c, data, contentType)
+	return serveFSCached(c, data, contentType, etag, lastModifiedStr)
 }
 
 // computeFSCacheStrings formats the Last-Modified and ETag strings for a
@@ -409,18 +410,22 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 }
 
 // serveFSCached serves file data from the cache (or freshly read bytes),
-// handling range requests via byte slicing.
-func serveFSCached(c *celeris.Context, data []byte, contentType string) error {
+// handling range requests via byte slicing. etag and lastModified are the
+// validators serveFS put on the response ("" when the file has no modTime),
+// which If-Range is checked against. The decision is the one
+// Context.File makes for the Root path (internal/httprange).
+func serveFSCached(c *celeris.Context, data []byte, contentType, etag, lastModified string) error {
 	if rng := c.Header("range"); rng != "" {
-		if start, end, ok := parseByteRange(rng, int64(len(data))); ok {
-			var rngBuf [48]byte
-			dst := append(rngBuf[:0], "bytes "...)
-			dst = strconv.AppendInt(dst, start, 10)
-			dst = append(dst, '-')
-			dst = strconv.AppendInt(dst, end, 10)
-			dst = append(dst, '/')
-			dst = strconv.AppendInt(dst, int64(len(data)), 10)
-			c.SetHeader("content-range", string(dst))
+		size := int64(len(data))
+		start, end, out := httprange.Decide(c.Method(), rng, c.Header("if-range"), etag, lastModified, size)
+		switch out {
+		case httprange.Unsatisfiable:
+			var rngBuf [32]byte
+			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(rngBuf[:0], size)))
+			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
+		case httprange.Partial:
+			var rngBuf [64]byte
+			c.SetHeader("content-range", string(httprange.AppendContentRange(rngBuf[:0], start, end, size)))
 			return c.Blob(206, contentType, data[start:end+1])
 		}
 	}
@@ -530,46 +535,6 @@ func etagMatch(inm, etag string) bool {
 		}
 	}
 	return false
-}
-
-// parseByteRange parses a "bytes=start-end" Range header value.
-func parseByteRange(header string, size int64) (start, end int64, ok bool) {
-	const prefix = "bytes="
-	if !strings.HasPrefix(header, prefix) {
-		return 0, 0, false
-	}
-	spec := header[len(prefix):]
-	parts := strings.SplitN(spec, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	if parts[0] == "" {
-		// Suffix range: bytes=-N
-		n, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || n <= 0 {
-			return 0, 0, false
-		}
-		start = size - n
-		end = size - 1
-	} else {
-		var err error
-		start, err = strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			return 0, 0, false
-		}
-		if parts[1] == "" {
-			end = size - 1
-		} else {
-			end, err = strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				return 0, 0, false
-			}
-		}
-	}
-	if start < 0 || start >= size || end < start || end >= size {
-		return 0, 0, false
-	}
-	return start, end, true
 }
 
 // serveDirListingOS renders a directory listing for an OS path.

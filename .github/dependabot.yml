@@ -7,7 +7,8 @@ updates:
   # per scheduled run — so a daily x/net bump produces a single PR
   # touching root + every middleware + every test sub-module instead of
   # eleven racing PRs. Add a path here whenever a new go.mod lands in
-  # the tree (run `find . -name go.mod` to verify coverage).
+  # the tree (run `find . -name go.mod` to verify coverage); the one
+  # exception is .github/tools, which has its own entry below.
   - package-ecosystem: gomod
     directories:
       - /
@@ -24,6 +25,34 @@ updates:
       interval: daily
     groups:
       all-go-deps:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+
+  # ----- CI tools module -----
+  # .github/tools pins the govulncheck that the Vulnerability Check job
+  # runs, through its go.sum (celeris#827). Go records every requirement
+  # of a module that only holds `tool` directives as `// indirect`,
+  # golang.org/x/vuln included. Version updates cover direct
+  # dependencies only unless `allow` says otherwise, so without the rule
+  # below this entry would never move the pin. The rule names the tool's
+  # module with `dependency-type: all`. Dependabot then bumps it with
+  # `go get`, which raises the other requirements only as far as the new
+  # release itself requires. A bare `dependency-type: all` would also
+  # bump each of the tool's dependencies past what that release was built
+  # with, and a tool can stop compiling that way. A new `tool` directive
+  # needs its module added to this list. The rule is on this entry alone,
+  # so the modules above keep the direct-only default.
+  - package-ecosystem: gomod
+    directory: /.github/tools
+    allow:
+      - dependency-name: golang.org/x/vuln
+        dependency-type: all
+    schedule:
+      interval: daily
+    groups:
+      ci-tools:
         patterns:
           - "*"
     commit-message:
