@@ -1,6 +1,7 @@
 package celeris_test
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -14,10 +15,25 @@ import (
 )
 
 // deprecationMarker opens the paragraph that go doc, gopls and staticcheck's
-// SA1019 read as a deprecation notice. It is spelled in two pieces so that the
-// plain-text search celeris#830 uses as its done condition (a git grep for the
-// marker) does not match this file.
-const deprecationMarker = "Deprecated" + ": "
+// SA1019 read as a deprecation notice. It is matched with or without text after
+// it on the line, as the plain-text search celeris#830 uses as its done
+// condition (a git grep for the marker) matches it, and it is spelled in two
+// pieces so that the search does not match this file.
+const deprecationMarker = "Deprecated" + ":"
+
+// deprecationsAllowedInV1 is the allowlist of deprecation notices outside
+// internal/ trees, by file (slash-separated, from the repository root). It is
+// empty at v1.6.0, which removed every deprecated public API (celeris#830).
+// After the v1.6.0 tag, removing an exported identifier or moving it under
+// internal/ is a breaking change that needs a /v2 import path, so a v1.x
+// identifier is deprecated and kept until v2: its file goes here with the
+// number of notices it carries and the issue that removes them in v2.
+var deprecationsAllowedInV1 = map[string]allowedDeprecations{}
+
+type allowedDeprecations struct {
+	notices   int    // how many notices the file carries
+	v2Removal string // the issue that removes them in v2, e.g. "celeris#1234"
+}
 
 // removal is one public identifier removed before the public v1.6.0 release
 // (celeris#830, celeris#826), with the replacement its deprecation notice
@@ -48,8 +64,9 @@ var removedBeforeV160 = []removal{
 // keep that true:
 //
 //   - no comment in a Go file outside an internal/ tree carries a deprecation
-//     paragraph, so nothing public is on its way out (internal packages are
-//     not public API: driver/internal/async keeps one on purpose);
+//     paragraph that deprecationsAllowedInV1 does not list, so nothing public
+//     is on its way out unnoticed (internal packages are not public API:
+//     driver/internal/async keeps one on purpose);
 //   - none of the removed identifiers is declared again, even without a
 //     notice: a re-added alias breaks no build and silently undoes the
 //     removal.
@@ -69,7 +86,7 @@ func TestNoDeprecatedPublicAPI830(t *testing.T) {
 	}
 
 	fset := token.NewFileSet()
-	var notices []string
+	notices := map[string][]int{}           // file -> lines of its notices
 	decls := map[string]map[string]string{} // dir -> name -> position
 	files, exempt := 0, 0
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -102,7 +119,7 @@ func TestNoDeprecatedPublicAPI830(t *testing.T) {
 				exempt++
 				continue
 			}
-			notices = append(notices, rel+":"+strconv.Itoa(line))
+			notices[rel] = append(notices[rel], line)
 		}
 		if strings.HasSuffix(path, "_test.go") {
 			return nil
@@ -122,8 +139,8 @@ func TestNoDeprecatedPublicAPI830(t *testing.T) {
 	if files < 500 {
 		t.Fatalf("walked only %d Go files under %s: the walk is not seeing the repository", files, root)
 	}
-	for _, n := range notices {
-		t.Errorf("deprecation notice outside internal packages at %s: remove the identifier before v1.6.0 (celeris#830) or move it under internal/", n)
+	for _, n := range unallowedDeprecations(notices, deprecationsAllowedInV1) {
+		t.Errorf("%s: before the v1.6.0 tag, remove the identifier (celeris#830); after it, keep the identifier until v2 and list its file in deprecationsAllowedInV1 with the issue that removes it in v2", n)
 	}
 	for _, r := range removedBeforeV160 {
 		if pos, ok := decls[r.dir][r.name]; ok {
@@ -147,44 +164,50 @@ func A() {}
 
 // B is going away.
 //
-// ` + deprecationMarker + `use A.
+// ` + deprecationMarker + ` use A.
 func B() {}
 
-// C mentions the word mid-paragraph: see ` + deprecationMarker + `this is no notice.
+// C mentions the word mid-paragraph: see ` + deprecationMarker + ` this is no notice.
 func C() {}
 
 type T struct {
 	// F is going away.
 	//
-	// ` + deprecationMarker + `use G.
+	// ` + deprecationMarker + ` use G.
 	F int
 	G int
 }
 
 // M is going away.
 //
-// ` + deprecationMarker + `gone.
+// ` + deprecationMarker + ` gone.
 func (t *T) M() {}
 
 var (
 	// V is going away.
 	//
-	// ` + deprecationMarker + `gone.
+	// ` + deprecationMarker + ` gone.
 	V = 1
 	W = 2
 )
 
 // Alias is going away.
 //
-// ` + deprecationMarker + `use T.
+// ` + deprecationMarker + ` use T.
 type Alias = T
 
 type I interface {
 	// Do is going away.
 	//
-	// ` + deprecationMarker + `gone.
+	// ` + deprecationMarker + ` gone.
 	Do()
 }
+
+// E is going away; the notice ends its line.
+//
+// ` + deprecationMarker + `
+// use A.
+func E() {}
 `
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
@@ -192,20 +215,41 @@ type I interface {
 		t.Fatal(err)
 	}
 	// Lines of the notice paragraphs above, in source order: B, F, M, V,
-	// Alias, I.Do. C's mid-paragraph mention must not count.
-	want := []int{8, 17, 24, 30, 37, 43}
+	// Alias, I.Do, E. C's mid-paragraph mention must not count.
+	want := []int{8, 17, 24, 30, 37, 43, 49}
 	if got := deprecationNotices(fset, f); !slices.Equal(got, want) {
 		t.Fatalf("deprecationNotices = %v, want %v", got, want)
 	}
 
 	names := declaredNames(fset, f)
-	for _, n := range []string{"A", "B", "C", "T", "T.F", "T.G", "T.M", "V", "W", "Alias", "I", "I.Do"} {
+	for _, n := range []string{"A", "B", "C", "T", "T.F", "T.G", "T.M", "V", "W", "Alias", "I", "I.Do", "E"} {
 		if _, ok := names[n]; !ok {
 			t.Errorf("declaredNames missed %q; got %v", n, names)
 		}
 	}
-	if len(names) != 12 {
-		t.Errorf("declaredNames found %d names, want 12: %v", len(names), names)
+	if len(names) != 13 {
+		t.Errorf("declaredNames found %d names, want 13: %v", len(names), names)
+	}
+
+	// The allowlist covers a file only with its v2 removal issue and the
+	// exact notice count, and an entry whose file no longer matches is
+	// reported too.
+	gotBad := unallowedDeprecations(map[string][]int{"a.go": {3, 9}, "b.go": {5}, "c.go": {7}, "d.go": {2}}, map[string]allowedDeprecations{
+		"a.go":    {2, "celeris#1"},
+		"b.go":    {2, "celeris#2"},
+		"c.go":    {1, ""},
+		"gone.go": {1, "celeris#3"},
+	})
+	wantBad := []string{
+		"b.go: deprecationsAllowedInV1 allows 2 notice(s) (v2 removal \"celeris#2\"), the file has 1",
+		"b.go:5: deprecation notice outside internal packages",
+		"c.go: deprecationsAllowedInV1 allows 1 notice(s) (v2 removal \"\"), the file has 1",
+		"c.go:7: deprecation notice outside internal packages",
+		"d.go:2: deprecation notice outside internal packages",
+		"gone.go: deprecationsAllowedInV1 allows 1 notice(s) (v2 removal \"celeris#3\"), the file has 0",
+	}
+	if !slices.Equal(gotBad, wantBad) {
+		t.Errorf("unallowedDeprecations =\n%s\nwant\n%s", strings.Join(gotBad, "\n"), strings.Join(wantBad, "\n"))
 	}
 
 	for dir, want := range map[string]bool{
@@ -249,6 +293,30 @@ func deprecationNotices(fset *token.FileSet, f *ast.File) []int {
 		}
 	}
 	return lines
+}
+
+// unallowedDeprecations returns, sorted, each notice in found (file -> notice
+// lines) that allowed does not cover, and each allowlist entry that does not
+// match its file. An entry covers its file only if it names the v2 removal
+// issue and the file carries exactly that many notices, so a new notice in a
+// listed file is still reported.
+func unallowedDeprecations(found map[string][]int, allowed map[string]allowedDeprecations) []string {
+	var out []string
+	for file, lines := range found {
+		if a, ok := allowed[file]; ok && a.v2Removal != "" && a.notices == len(lines) {
+			continue
+		}
+		for _, l := range lines {
+			out = append(out, file+":"+strconv.Itoa(l)+": deprecation notice outside internal packages")
+		}
+	}
+	for file, a := range allowed {
+		if a.v2Removal == "" || a.notices != len(found[file]) {
+			out = append(out, fmt.Sprintf("%s: deprecationsAllowedInV1 allows %d notice(s) (v2 removal %q), the file has %d", file, a.notices, a.v2Removal, len(found[file])))
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // declaredNames returns every top-level name f declares, with methods,

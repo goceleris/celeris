@@ -15,7 +15,7 @@ import (
 	"github.com/goceleris/celeris/middleware/internal/extract"
 	"github.com/goceleris/celeris/middleware/internal/randutil"
 	"github.com/goceleris/celeris/middleware/internal/testutil"
-	"github.com/goceleris/celeris/middleware/store"
+	kvstore "github.com/goceleris/celeris/middleware/store"
 )
 
 // validToken is a 64-char hex string representing a 32-byte raw token.
@@ -1083,7 +1083,7 @@ func TestRefererWildcardMatchesOriginOnly(t *testing.T) {
 func TestStorageSafeMethodStoresToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	mw := New(Config{Storage: store})
 	var token string
 	handler := func(c *celeris.Context) error {
@@ -1109,7 +1109,7 @@ func TestStorageSafeMethodStoresToken(t *testing.T) {
 func TestStorageUnsafeMethodValidates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
@@ -1127,7 +1127,7 @@ func TestStorageUnsafeMethodValidates(t *testing.T) {
 func TestStorageUnsafeMethodRejectsExpiredToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Nanosecond)
 	time.Sleep(time.Millisecond)
 	mw := New(Config{Storage: store})
@@ -1145,7 +1145,7 @@ func TestStorageUnsafeMethodRejectsExpiredToken(t *testing.T) {
 func TestStorageUnsafeMethodRejectsMissingStorageToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	// Token in cookie but NOT in storage.
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
@@ -1162,7 +1162,7 @@ func TestStorageUnsafeMethodRejectsMissingStorageToken(t *testing.T) {
 func TestStorageUnsafeMethodRejectsMismatchedRequestToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
@@ -1179,7 +1179,7 @@ func TestStorageUnsafeMethodRejectsMismatchedRequestToken(t *testing.T) {
 func TestStorageSafeMethodRegeneratesWhenNotInStorage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	mw := New(Config{Storage: store})
 	var token string
 	handler := func(c *celeris.Context) error {
@@ -1205,7 +1205,7 @@ func TestStorageSafeMethodRegeneratesWhenNotInStorage(t *testing.T) {
 func TestSingleUseTokenDeletesAfterValidation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store, SingleUseToken: true})
 	handler := func(c *celeris.Context) error {
@@ -1238,7 +1238,7 @@ func TestSingleUseTokenDeletesAfterValidation(t *testing.T) {
 func TestSingleUseTokenAtomicGetAndDelete(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store, SingleUseToken: true})
 	handler := func(c *celeris.Context) error {
@@ -1551,7 +1551,7 @@ func TestHandlerStoresContextKey(t *testing.T) {
 func TestDeleteTokenWithStorage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
@@ -1657,7 +1657,7 @@ func TestHandlerFromContextNilWithoutMiddleware(t *testing.T) {
 func TestHandlerDeleteToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, storageKey(validToken), validToken, time.Hour)
 	mw := New(Config{Storage: store})
 	handler := func(c *celeris.Context) error {
@@ -1684,7 +1684,7 @@ func TestHandlerDeleteToken(t *testing.T) {
 func TestMemoryStorageGetSetDelete(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 2, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 2, CleanupContext: ctx})
 
 	_, ok := storeGet(t, store, "key1")
 	if ok {
@@ -1707,7 +1707,7 @@ func TestMemoryStorageGetSetDelete(t *testing.T) {
 func TestMemoryStorageExpiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, "key1", "token1", time.Nanosecond)
 	time.Sleep(time.Millisecond)
 	_, ok := storeGet(t, store, "key1")
@@ -1719,7 +1719,7 @@ func TestMemoryStorageExpiry(t *testing.T) {
 func TestMemoryStorageConcurrency(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 4, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 4, CleanupContext: ctx})
 	var wg sync.WaitGroup
 	for i := range 100 {
 		wg.Add(1)
@@ -1737,7 +1737,7 @@ func TestMemoryStorageConcurrency(t *testing.T) {
 func TestMemoryStorageDefaultShards(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{CleanupContext: ctx})
 	storeSet(t, store, "k", "v", time.Hour)
 	val, ok := storeGet(t, store, "k")
 	if !ok || val != "v" {
@@ -1748,7 +1748,7 @@ func TestMemoryStorageDefaultShards(t *testing.T) {
 func TestMemoryStorageGetAndDelete(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 2, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 2, CleanupContext: ctx})
 
 	_, ok, err := storeGetAndDelete(t, store, "missing")
 	if err != nil {
@@ -1776,7 +1776,7 @@ func TestMemoryStorageGetAndDelete(t *testing.T) {
 func TestMemoryStorageGetAndDeleteExpired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 	storeSet(t, store, "key1", "token1", time.Nanosecond)
 	time.Sleep(time.Millisecond)
 	_, ok, err := storeGetAndDelete(t, store, "key1")
@@ -1947,7 +1947,7 @@ func TestValidateExtractorCookieDifferentNameDoesNotPanic(t *testing.T) {
 func TestSafeMethodDoesNotRefreshExpiryForExistingToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store := NewMemoryStorage(store.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
+	store := NewMemoryStorage(kvstore.MemoryKVConfig{Shards: 1, CleanupContext: ctx})
 
 	storeSet(t, store, storageKey(validToken), validToken, 100*time.Millisecond)
 

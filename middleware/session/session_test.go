@@ -12,7 +12,7 @@ import (
 	"github.com/goceleris/celeris/celeristest"
 
 	"github.com/goceleris/celeris/middleware/internal/testutil"
-	"github.com/goceleris/celeris/middleware/store"
+	kvstore "github.com/goceleris/celeris/middleware/store"
 )
 
 // hexID returns a valid 64-char hex session ID using the given byte as padding.
@@ -311,7 +311,7 @@ func TestMemoryStoreCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := NewMemoryStore(store.MemoryKVConfig{
+	store := NewMemoryStore(kvstore.MemoryKVConfig{
 		Shards:          1,
 		CleanupInterval: 10 * time.Millisecond,
 		CleanupContext:  ctx,
@@ -329,7 +329,7 @@ func TestMemoryStoreCleanup(t *testing.T) {
 
 func TestMemoryStoreCleanupStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	_ = NewMemoryStore(store.MemoryKVConfig{
+	_ = NewMemoryStore(kvstore.MemoryKVConfig{
 		CleanupInterval: time.Millisecond,
 		CleanupContext:  ctx,
 	})
@@ -1135,7 +1135,7 @@ func TestNewSessionSaveUnmodifiedWriteBehindStoresAbsExp(t *testing.T) {
 // --- Helper types ---
 
 type trackingStore struct {
-	inner store.KV
+	inner kvstore.KV
 	mu    sync.Mutex
 	saves int
 }
@@ -2083,7 +2083,7 @@ func TestNilDataBeforePoolPut(t *testing.T) {
 // --- Store.Reset tests ---
 
 func TestMemoryStoreReset(t *testing.T) {
-	store := NewMemoryStore(store.MemoryKVConfig{Shards: 4})
+	store := NewMemoryStore(kvstore.MemoryKVConfig{Shards: 4})
 	ctx := context.Background()
 
 	// Populate multiple sessions across shards.
@@ -2126,7 +2126,7 @@ func TestMemoryStoreResetEmpty(t *testing.T) {
 }
 
 func TestMemoryStoreResetConcurrent(t *testing.T) {
-	store := NewMemoryStore(store.MemoryKVConfig{Shards: 4})
+	store := NewMemoryStore(kvstore.MemoryKVConfig{Shards: 4})
 	ctx := context.Background()
 
 	// Populate.
@@ -2183,7 +2183,7 @@ func TestMemoryStoreResetThenSave(t *testing.T) {
 
 // contextStore records the context passed to each method for verification.
 type contextStore struct {
-	inner    store.KV
+	inner    kvstore.KV
 	mu       sync.Mutex
 	lastCtxs []context.Context
 }
@@ -2629,7 +2629,7 @@ func TestMemoryStoreCleanupMultipleShards(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := NewMemoryStore(store.MemoryKVConfig{
+	store := NewMemoryStore(kvstore.MemoryKVConfig{
 		Shards:          8,
 		CleanupInterval: 10 * time.Millisecond,
 		CleanupContext:  ctx,
@@ -2660,7 +2660,7 @@ func TestMemoryStoreCleanupMultipleShards(t *testing.T) {
 
 // Issue #6: MemoryStore.Close stops cleanup goroutine.
 func TestMemoryStoreClose(t *testing.T) {
-	ms := NewMemoryStore(store.MemoryKVConfig{
+	ms := NewMemoryStore(kvstore.MemoryKVConfig{
 		CleanupInterval: time.Millisecond,
 	})
 	ms.Close()
