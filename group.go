@@ -98,12 +98,14 @@ func (g *RouteGroup) PATCH(path string, handlers ...HandlerFunc) *Route {
 	return g.handle("PATCH", path, handlers...)
 }
 
-// HEAD registers a handler for HEAD requests.
+// HEAD registers a handler for HEAD requests. See [Server.HEAD]: a path
+// without a HEAD route is answered by its GET route.
 func (g *RouteGroup) HEAD(path string, handlers ...HandlerFunc) *Route {
 	return g.handle("HEAD", path, handlers...)
 }
 
-// OPTIONS registers a handler for OPTIONS requests.
+// OPTIONS registers a handler for OPTIONS requests. See [Server.OPTIONS]: a
+// path without an OPTIONS route is answered automatically.
 func (g *RouteGroup) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return g.handle("OPTIONS", path, handlers...)
 }

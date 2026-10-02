@@ -625,7 +625,24 @@ func isStaticPath(path string) bool {
 	return true
 }
 
+// find returns the handler chain, route pattern and async flag of the route
+// that answers method+path. A HEAD request with no HEAD route of its own is
+// answered by the GET route (celeris#421; RFC 9110 §9.3.2: HEAD is GET
+// without the content, which the engines drop), so every observer of a
+// lookup (HandleStream, routeAsync's dispatch decision, the route cache)
+// sees the same route.
 func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
+	n := len(*params)
+	handlers, fullPath, async := r.findMethod(method, path, params)
+	if handlers == nil && method == "HEAD" {
+		*params = (*params)[:n] // drop anything the failed walk left behind
+		return r.findMethod("GET", path, params)
+	}
+	return handlers, fullPath, async
+}
+
+// findMethod is find for exactly method, without the HEAD fallback.
+func (r *router) findMethod(method, path string, params *Params) ([]HandlerFunc, string, bool) {
 	idx := methodIndex(method)
 	var root *node
 
@@ -668,30 +685,49 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 	return search(root, path, params)
 }
 
-// allowedMethods returns the HTTP methods that have a registered handler for
-// the given path, excluding the specified method.
+// allowedMethods returns the methods the path answers, for the Allow header
+// of a 405 and of the automatic OPTIONS answer (celeris#421; RFC 9110
+// §10.2.1), excluding except: every method with a route for the path, HEAD
+// when the path has a GET or HEAD route (find answers HEAD with the GET
+// route), and OPTIONS (answered automatically when the path has no OPTIONS
+// route). The order is GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, then
+// custom methods sorted. A path with no route at all returns nil.
 func (r *router) allowedMethods(path string, except string) []string {
-	var allowed []string
 	var params Params
-	for i, root := range r.trees {
-		if root == nil {
-			continue
-		}
-		method := methodNames[i]
-		if method == except {
-			continue
-		}
+	has := func(method string) bool {
 		params = params[:0]
-		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
-			allowed = append(allowed, method)
+		handlers, _, _ := r.findMethod(method, path, &params)
+		return handlers != nil
+	}
+	var found [nMethods]bool
+	routed := false
+	for i, root := range r.trees {
+		if root != nil && has(methodNames[i]) {
+			found[i] = true
+			routed = true
 		}
 	}
+	var custom []string
 	for method := range r.customTrees {
-		if method == except {
-			continue
+		if has(method) {
+			custom = append(custom, method)
+			routed = true
 		}
-		params = params[:0]
-		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
+	}
+	if !routed {
+		return nil
+	}
+	found[mHEAD] = found[mHEAD] || found[mGET]
+	found[mOPTIONS] = true
+	allowed := make([]string, 0, nMethods+len(custom))
+	for i, ok := range found {
+		if ok && methodNames[i] != except {
+			allowed = append(allowed, methodNames[i])
+		}
+	}
+	slices.Sort(custom)
+	for _, method := range custom {
+		if method != except {
 			allowed = append(allowed, method)
 		}
 	}

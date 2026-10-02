@@ -364,6 +364,19 @@ func New(config ...Config) celeris.HandlerFunc {
 			return celeris.NewHTTPError(500, "SSE requires streaming support")
 		}
 
+		// celeris#421: HEAD is answered by the GET route. A HEAD client
+		// wants the headers of the stream, not a stream that runs until it
+		// goes away (and, detached, keeps its connection from serving the
+		// next request): send the headers and end the response. The engine
+		// sends no body for HEAD; OnConnect, the Handler and OnDisconnect
+		// do not run.
+		if c.Method() == "HEAD" {
+			if err := sw.WriteHeader(200, sseHeaders); err != nil {
+				return err
+			}
+			return sw.Close()
+		}
+
 		// Run OnConnect before writing headers so rejection can return
 		// a proper HTTP error code to the client.
 		ctx, cancel := context.WithCancel(c.Context())
