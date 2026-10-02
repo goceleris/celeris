@@ -20,6 +20,9 @@ updates:
       - /test/drivercmp/memcached
       - /test/drivercmp/postgres
       - /test/drivercmp/redis
+      # The CI tools module (govulncheck, celeris#827): its go.sum pins the
+      # version the Vulnerability Check job runs; this entry moves the pin.
+      - /.github/tools
     schedule:
       interval: daily
     groups:
