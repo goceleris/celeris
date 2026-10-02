@@ -41,6 +41,7 @@ func ExampleNew_scalar() {
 	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
 		Renderer:    swagger.RendererScalar,
+		CDN:         true,
 	}))
 }
 
@@ -60,6 +61,7 @@ func ExampleNew_redoc() {
 	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
 		Renderer:    swagger.RendererReDoc,
+		CDN:         true,
 	}))
 }
 
@@ -100,6 +102,7 @@ func ExampleNew_redocCustom() {
 	server.Use(swagger.New(swagger.Config{
 		SpecContent: spec,
 		Renderer:    swagger.RendererReDoc,
+		CDN:         true,
 		Options: map[string]any{
 			"theme": map[string]any{
 				"colors": map[string]any{"primary": map[string]any{"main": "#32329f"}},

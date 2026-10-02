@@ -1,0 +1,5 @@
+# Upstream Swagger UI files embedded by middleware/swagger (celeris#425). They
+# must stay byte for byte as published (their sha384 is pinned), so git never
+# converts line endings or text-merges them, and they are kept out of diffs
+# and GitHub's language statistics.
+middleware/swagger/assets/swagger-ui-dist/** binary linguist-vendored

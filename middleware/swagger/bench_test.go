@@ -34,3 +34,16 @@ func BenchmarkSwaggerSpec(b *testing.B) {
 		celeristest.ReleaseContext(ctx)
 	}
 }
+
+func BenchmarkSwaggerEmbeddedAsset(b *testing.B) {
+	mw := New(Config{SpecContent: benchSpec})
+	path := embeddedAssetsPrefix("/swagger") + "/swagger-ui-bundle.js"
+	opts := []celeristest.Option{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", path, opts...)
+		_ = mw(ctx)
+		celeristest.ReleaseContext(ctx)
+	}
+}

@@ -19,15 +19,24 @@ import (
 // `\a`, which is not a JS/JSON escape) and U+2028 (a JS line terminator).
 const hostile = "x\"y'z</script>&\a end"
 
-// assetsVariants covers both asset sources in every renderer: the CDN URLs
-// and the AssetsPath-derived URLs.
+// assetsVariants covers the asset sources every renderer has: the pinned
+// CDN URLs and the AssetsPath-derived URLs.
 var assetsVariants = []struct {
 	name       string
 	assetsPath string
+	cdn        bool
 }{
-	{"cdn", ""},
-	{"assets", "/assets"},
+	{"cdn", "", true},
+	{"assets", "/assets", false},
 }
+
+// swaggerUIAssetsVariants adds the embedded assets, which only Swagger UI
+// has (celeris#425).
+var swaggerUIAssetsVariants = append([]struct {
+	name       string
+	assetsPath string
+	cdn        bool
+}{{"embedded", "", false}}, assetsVariants...)
 
 // jsStringLiteral matches a double-quoted string literal (JSON grammar):
 // either a non-quote non-backslash character or a backslash escape pair.
@@ -105,12 +114,13 @@ func assertScriptBlocksBalanced(t *testing.T, body, trailer string) {
 
 func TestSwaggerUIEscapesJSStringLiterals(t *testing.T) {
 	t.Parallel()
-	for _, v := range assetsVariants {
+	for _, v := range swaggerUIAssetsVariants {
 		t.Run(v.name, func(t *testing.T) {
 			t.Parallel()
 			body := servePage(t, Config{
 				SpecURL:    hostile,
 				AssetsPath: v.assetsPath,
+				CDN:        v.cdn,
 				UI: UIConfig{
 					Title:             hostile,
 					OAuth2RedirectURL: hostile,
@@ -143,6 +153,7 @@ func TestScalarEscapesDataURLAttribute(t *testing.T) {
 				SpecURL:    hostile,
 				Renderer:   RendererScalar,
 				AssetsPath: v.assetsPath,
+				CDN:        v.cdn,
 				UI:         UIConfig{Title: hostile},
 			})
 			if o, c := strings.Count(body, "<script"), strings.Count(body, "</script>"); o != c {
@@ -182,6 +193,7 @@ func TestScalarNeutralisesUnsafeSpecURLScheme(t *testing.T) {
 	body := servePage(t, Config{
 		SpecURL:  "javascript:alert(1)",
 		Renderer: RendererScalar,
+		CDN:      true,
 	})
 	if attr := dataURLAttr(t, body); strings.Contains(strings.ToLower(attr), "javascript") {
 		t.Fatalf("data-url attribute %q carries the unsafe scheme", attr)
@@ -197,6 +209,7 @@ func TestReDocEscapesJSStringLiteral(t *testing.T) {
 				SpecURL:    hostile,
 				Renderer:   RendererReDoc,
 				AssetsPath: v.assetsPath,
+				CDN:        v.cdn,
 				UI:         UIConfig{Title: hostile},
 			})
 			assertScriptBlocksBalanced(t, body, `document.getElementById("redoc-container"));`)
@@ -225,6 +238,7 @@ func TestPlainConfigUnchanged(t *testing.T) {
 			body := servePage(t, Config{
 				SpecContent: jsonSpec,
 				AssetsPath:  v.assetsPath,
+				CDN:         v.cdn,
 				UI: UIConfig{
 					OAuth2RedirectURL: "https://example.com/oauth2-redirect",
 					OAuth2:            oauth,
@@ -239,6 +253,7 @@ func TestPlainConfigUnchanged(t *testing.T) {
 				SpecURL:    "https://example.com/openapi.json",
 				Renderer:   RendererScalar,
 				AssetsPath: v.assetsPath,
+				CDN:        v.cdn,
 			})
 			assertContains(t, body, `<script id="api-reference" data-url="https://example.com/openapi.json" data-configuration='`+html.EscapeString(`{"theme":"default"}`)+`'></script>`)
 
@@ -246,6 +261,7 @@ func TestPlainConfigUnchanged(t *testing.T) {
 				SpecContent: jsonSpec,
 				Renderer:    RendererReDoc,
 				AssetsPath:  v.assetsPath,
+				CDN:         v.cdn,
 			})
 			assertContains(t, body, `Redoc.init("/swagger/spec", {}, document.getElementById("redoc-container"));`)
 		})

@@ -141,19 +141,43 @@ type Config struct {
 	//	}
 	Options map[string]any
 
-	// AssetsPath, when set, serves Swagger UI assets from a local path
-	// instead of the default CDN. The HTML template references scripts and
-	// stylesheets from this prefix (e.g. {AssetsPath}/swagger-ui-bundle.js).
+	// AssetsPath, when set, makes the page load the renderer's files from
+	// this URL prefix, which you serve yourself, instead of the embedded
+	// copy or the CDN. The page references:
 	//
-	// Users must serve the assets themselves, for example with a static
-	// file middleware:
+	//   Swagger UI: {AssetsPath}/swagger-ui.css, {AssetsPath}/swagger-ui-bundle.js
+	//               and {AssetsPath}/swagger-ui-standalone-preset.js
+	//   Scalar:     {AssetsPath}/standalone.min.js
+	//   ReDoc:      {AssetsPath}/redoc.standalone.js
+	//
+	// The page is written for the versions in [SwaggerUIVersion],
+	// [ScalarVersion] and [ReDocVersion]. No integrity hash is emitted, as
+	// the files are yours. For example, with the static middleware:
 	//
 	//   server.Use(static.New(static.Config{Root: "./swagger-ui-dist", Prefix: "/swagger-assets"}))
 	//   server.Use(swagger.New(swagger.Config{
 	//       SpecContent: spec,
 	//       AssetsPath:  "/swagger-assets",
 	//   }))
+	//
+	// AssetsPath and CDN are mutually exclusive.
 	AssetsPath string
+
+	// CDN, when true, makes the page load the renderer's files from the
+	// jsDelivr CDN (cdn.jsdelivr.net), pinned to the exact versions in
+	// [SwaggerUIVersion], [ScalarVersion] and [ReDocVersion], with a
+	// Subresource Integrity hash on every script and stylesheet: the
+	// browser refuses a file whose bytes differ from the release this
+	// package was built against. The page then needs cdn.jsdelivr.net in
+	// its Content-Security-Policy and the viewer's browser needs Internet
+	// access. Default: false.
+	//
+	// By default Swagger UI is served from a copy embedded in this package,
+	// under {BasePath}/assets/swagger-ui-dist@{SwaggerUIVersion}/ (with the
+	// upstream LICENSE and NOTICE files), so the page needs no third-party
+	// origin. Scalar and ReDoc are not embedded: they need CDN or
+	// AssetsPath, and New panics if neither is set.
+	CDN bool
 }
 
 // IntPtr returns a pointer to v. Use with [UIConfig].DefaultModelsExpandDepth
@@ -196,10 +220,18 @@ func (cfg Config) validate() {
 		panic("swagger: either SpecContent or SpecURL must be set")
 	}
 	switch cfg.Renderer {
-	case RendererSwaggerUI, RendererScalar, RendererReDoc:
-		// valid
+	case RendererSwaggerUI:
+		// valid; embedded unless AssetsPath or CDN is set
+	case RendererScalar, RendererReDoc:
+		if cfg.AssetsPath == "" && !cfg.CDN {
+			panic(fmt.Sprintf("swagger: Renderer %q has no embedded assets; set CDN: true to load it from jsDelivr "+
+				"(pinned, with an integrity hash) or AssetsPath to serve the files yourself", cfg.Renderer))
+		}
 	default:
 		panic(fmt.Sprintf("swagger: unknown Renderer %q", cfg.Renderer))
+	}
+	if cfg.AssetsPath != "" && cfg.CDN {
+		panic("swagger: AssetsPath and CDN are mutually exclusive")
 	}
 	switch cfg.UI.DocExpansion {
 	case "list", "full", "none":
