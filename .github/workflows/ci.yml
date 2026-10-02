@@ -1123,6 +1123,76 @@ jobs:
             echo "SEND_ZC notification hold a descriptor or stall shutdown, or was a test renamed or skipped?"
             exit 1
           fi
+      # celeris#812: the release backstop gave up a closed connection 5 s after
+      # the close whatever it still owed, to connStatePool with its send buffer.
+      # With a SEND_ZC's notification owed, the kernel was still sending the
+      # unsent tail from that array to a peer that had stopped reading, and the
+      # array's next owner overwrote it: the peer got another connection's
+      # bytes. The backstop now holds such a send buffer until the notification,
+      # off the release walk, keeping the array alone, in gauges, and with no
+      # new SEND_ZC armed while a worker holds 16 MiB; worker shutdown keeps the
+      # buffers the ring closes on. Both arches, by name, at the runner's own
+      # 8 MiB memlock (the pages SEND_ZC pins count against it), -race, three
+      # runs, with a tally: every run of each of the ten tests and their
+      # twenty-four cases must PASS, with no FAIL and no SKIP line. A SKIP
+      # would mean the runner gave the engine no working SEND_ZC.
+      - name: celeris#812 a SEND_ZC's send buffer outlives the release backstop (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestBackstopHoldsASendBufferAZCNotificationStillReads|TestBackstopCountsItsZCHolds|TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline|TestClosedOpsCountsTheZCSendApart|TestDroppingAnIdentityWithAZCOwedIsCounted|TestShutdownRetainsSendBuffersAZCMayStillRead|TestZCHoldIsOffTheReleaseWalk|TestZCHoldKeepsOnlyTheSendBuffer|TestZCHoldCoversACollidingSibling|TestSendZCStopsWhileHeldBuffersReachTheCap'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 24 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
+          grep -E 'celeris812 ' /tmp/zc812.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc812.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc812.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/zc812.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/zc812.log || true)
+          echo "celeris#812 tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did the backstop"
+            echo "give up a send buffer a SEND_ZC still reads, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # Its detector control. .github/scripts/mutant-812-backstop-releases-zc.py
+      # disables the hold, so the backstop releases the connState with its send
+      # buffer as before the fix. Every run of each of the four wire cases must
+      # then report the release (held_past_backstop=false) and bytes on the wire
+      # that were not sent (corrupt_bytes above 0), and FAIL. A runner whose
+      # kernel copied the send before the release would let the wire test pass
+      # with or without the fix; this is what shows it does not. The mutation is
+      # undone before the step ends.
+      - name: celeris#812 detector control (the hold removed; every run of the four wire cases must see foreign bytes)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          python3 .github/scripts/mutant-812-backstop-releases-zc.py
+          runs=3
+          log=/tmp/zc812-mutant.log
+          go test -race -count="$runs" -timeout=300s -v -run '^TestBackstopHoldsASendBufferAZCNotificationStillReads$' \
+            ./engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- engine/iouring/worker.go
+          bad=0
+          for c in notif-only recv-and-notif send-done-after-close detached-notif-only; do
+            lines=$(grep -cE "celeris812 backstop case=$c " "$log" || true)
+            det=$(grep -E "celeris812 backstop case=$c " "$log" | grep -cE ' held_past_backstop=false .* corrupt_bytes=[1-9]' || true)
+            f=$(grep -cE "^    --- FAIL: TestBackstopHoldsASendBufferAZCNotificationStillReads/$c \(" "$log" || true)
+            echo "mutant, case $c: result lines $lines, detected $det, FAIL $f (want $runs, $runs, $runs)"
+            if [ "$lines" -ne "$runs" ] || [ "$det" -ne "$runs" ] || [ "$f" -ne "$runs" ]; then bad=1; fi
+          done
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
+          if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
+          exit "$bad"
       # The detector control. .github/scripts/mutant-685-release-owed-fd.py
       # makes fdOwed report false, which takes the fd-lifetime rule off the
       # close paths, Hijack and shutdown at once. Against that tree every run

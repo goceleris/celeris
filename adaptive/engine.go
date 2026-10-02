@@ -1177,6 +1177,16 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		// close of the standby's residue lands on the standby.
 		CloseFDDeferred: pm.CloseFDDeferred + sm.CloseFDDeferred,
 		CloseFDForced:   pm.CloseFDForced + sm.CloseFDForced,
+		// The send buffers a SEND_ZC may still read (celeris#812): a hold,
+		// a forced release and a retention at shutdown are each an event
+		// on the one sub-engine whose connection it was.
+		CloseZCNotifHeld:      pm.CloseZCNotifHeld + sm.CloseZCNotifHeld,
+		CloseZCNotifForced:    pm.CloseZCNotifForced + sm.CloseZCNotifForced,
+		ShutdownZCBufRetained: pm.ShutdownZCBufRetained + sm.ShutdownZCBufRetained,
+		// Gauges of what each sub-engine's workers hold right now: a held
+		// buffer is held by one of them, so the engine holds the sum.
+		CloseZCNotifHeldNow:   pm.CloseZCNotifHeldNow + sm.CloseZCNotifHeldNow,
+		CloseZCNotifHeldBytes: pm.CloseZCNotifHeldBytes + sm.CloseZCNotifHeldBytes,
 		// The post-switch sweep (celeris#657 PR-3). Both sub-engines sweep,
 		// in opposite directions, and only the one draining runs passes at
 		// all, so the pass count sums as a rate. The residual entries are
