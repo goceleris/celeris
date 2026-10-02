@@ -900,6 +900,35 @@ jobs:
             echo "requests lost (a PASS verdict tolerates up to one per connection)?"
             exit 1
           fi
+      # celeris#616: New decides the port both sub-engines serve on and holds
+      # it until the start engine has bound it in Listen. These tests take the
+      # port in that gap with a Go listener and with a bare socket, on each
+      # start engine, and need the engine to start on the port anyway. The
+      # io_uring arms skip when io_uring cannot be built, and the step above
+      # runs them without a tally, so here they run by name at the runner's
+      # memlock (one io_uring worker) and must all PASS with no SKIP line,
+      # each arm printing its own RESULT line: four from the New-to-Listen
+      # test and four from the in-Listen one, every one refused.
+      - name: celeris#616 port held from New to Listen (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHoldReleasedOnceBound616|TestAdaptiveShutdownWithoutListenFreesPort616'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./adaptive/ 2>&1 | tee /tmp/c616.log
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c616.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c616.log || true)
+          gap=$(grep -cE 'celeris616 result: start=(epoll|iouring) thief=(go-listener|bare-socket) steal_in_gap_refused=true started=true ' /tmp/c616.log || true)
+          inlisten=$(grep -cE 'celeris616 in-Listen steal: start=(epoll|iouring) thief=(go-listener|bare-socket) .* steal_err=.*address already in use listen_err=<nil>$' /tmp/c616.log || true)
+          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ]; then
+            echo "expected all $want celeris#616 tests to PASS with no SKIP line, and every arm on both start"
+            echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
+            exit 1
+          fi
 
   iouring:
     name: io_uring init-failure regression (./engine/iouring)

@@ -119,6 +119,12 @@ type Engine struct {
 	// live, aborted lazy build) never increment it. Surfaced on Metrics as
 	// EngineMetrics.AdaptiveSwitches.
 	switchesTotal atomic.Uint64
+
+	// portHold keeps cfg.Addr's port bound from New until the start engine
+	// has bound its own sockets on it (celeris#616; see holdPort). nil on the
+	// pre-bound-listener path, after releasePortHold, and when New could not
+	// bind the address.
+	portHold atomic.Pointer[os.File]
 }
 
 // ioUringViable reports whether io_uring is worth running at all on this host:
@@ -259,13 +265,26 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	// across different ephemeral ports. The address therefore has to be
 	// decided here, and there are two mutually exclusive ways to decide it.
 	//
-	// A pre-bound Listener has ALREADY decided it. Running resolvePort in that
-	// case invented a SECOND, different port, wrote it into cfg.Addr, and the
-	// sub-engine constructor then rejected the pair it had just been handed
-	// ("ambiguous configuration: Addr=... but Listener is bound to ...") — so
-	// the default engine could not start via Server.StartWithListener at all
-	// (celeris#614). The listener is the source of truth; resolvePort must not
-	// run.
+	// A pre-bound Listener has ALREADY decided it. Binding cfg.Addr here as
+	// well (resolvePort, before celeris#616) invented a SECOND, different
+	// port, wrote it into cfg.Addr, and the sub-engine constructor then
+	// rejected the pair it had just been handed ("ambiguous configuration:
+	// Addr=... but Listener is bound to ...") — so the default engine could
+	// not start via Server.StartWithListener at all (celeris#614). The
+	// listener is the source of truth; holdPort must not run.
+	//
+	// Without a listener, holdPort decides the port AND keeps it: it returns
+	// a bound, non-listening SO_REUSEPORT socket that Listen closes only once
+	// the start engine has bound its own sockets on the port, so no socket
+	// but an SO_REUSEPORT one of this user's can bind the port between New
+	// and Listen (celeris#616). Every return from New below that does not
+	// hand the socket to the engine closes it.
+	var hold *os.File
+	defer func() {
+		if hold != nil {
+			_ = hold.Close()
+		}
+	}()
 	switch {
 	case cfg.Listener != nil:
 		lnAddr, err := reusePortAddr(cfg.Listener)
@@ -274,9 +293,10 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 		}
 		cfg.Addr = lnAddr
 	case cfg.Addr != "":
-		resolved, err := resolvePort(cfg.Addr)
+		resolved, h, err := holdPort(cfg.Addr)
 		if err == nil {
 			cfg.Addr = resolved
+			hold = h
 		}
 	}
 
@@ -408,6 +428,8 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	e.ctrl.loadDownRevert = false
 
 	e.active.Store(&startEngine)
+	e.portHold.Store(hold)
+	hold = nil // the engine owns it now; the deferred close must not run
 	return e, nil
 }
 
@@ -441,6 +463,11 @@ func newFromEngines(primary, secondary engine.Engine, sampler TelemetrySampler, 
 // is built and Listen'd lazily by performSwitch on the first switch (joined
 // under the same ctx + wait group captured here).
 func (e *Engine) Listen(ctx context.Context) error {
+	// Every return gives the port hold back, including the ones before the
+	// start engine bound anything; on success it is given back earlier, as
+	// soon as the start engine has published its address (below).
+	defer e.releasePortHold()
+
 	innerCtx, innerCancel := context.WithCancel(ctx)
 	defer innerCancel()
 
@@ -466,6 +493,9 @@ func (e *Engine) Listen(ctx context.Context) error {
 	errCh := make(chan error, 2)
 
 	active := *e.active.Load()
+	if listenGapHook != nil {
+		listenGapHook(e.cfg.Addr)
+	}
 	wg.Go(func() {
 		if err := active.Listen(innerCtx); err != nil {
 			errCh <- fmt.Errorf("active (%s): %w", active.Type().String(), err)
@@ -523,6 +553,13 @@ bindLoop:
 		wg.Wait()
 		return fmt.Errorf("active sub-engine failed to initialize within 20s deadline")
 	}
+
+	// The start engine has bound and is listening on every one of its
+	// sockets (epoll and io_uring publish Addr only after all their workers
+	// signalled ready), so the port is held by those sockets from here on and
+	// the socket that held it since New can go (celeris#616). Keeping it
+	// would only pin a descriptor for the engine's life.
+	e.releasePortHold()
 
 	// No standby to pause: only the active engine is in the SO_REUSEPORT group,
 	// so publishing Addr cannot expose a dial to a phantom standby listener.
@@ -957,6 +994,10 @@ func (e *Engine) maybeThawLocked() {
 // sub-engines shut down. This is purely a join/sequencing concern; it does not
 // touch the ACTIVE→DRAINING→SUSPENDED worker lifecycle.
 func (e *Engine) Shutdown(ctx context.Context) error {
+	// An engine shut down without ever being started still holds its port
+	// (celeris#616); Listen's own release covers every engine that was.
+	e.releasePortHold()
+
 	e.listenMu.Lock()
 	cancel := e.listenCancel
 	done := e.listenDone
@@ -1364,28 +1405,16 @@ func reusePortAddr(ln net.Listener) (string, error) {
 	}
 }
 
-// resolvePort resolves ":0" to a concrete ":PORT" by briefly binding a
-// listener. Both sub-engines need the same port for SO_REUSEPORT switching,
-// and each of their workers binds cfg.Addr independently, so the port cannot
-// be left at 0.
-//
-// This is a time-of-check-to-time-of-use window: the port is bound, closed,
-// and only bound for real when the start engine Listens, so another process
-// can take it in between. The window is accepted rather than closed here
-// because (a) the callers that most need a stable port — graceful restart,
-// socket activation — supply a pre-bound listener and never reach this
-// function, (b) closing it means holding a bound-but-not-listening
-// SO_REUSEPORT socket across New→Listen, i.e. owning an fd whose lifetime no
-// current Engine method covers, and (c) the failure it leaves is a loud
-// EADDRINUSE at startup, not a silent misbind. It is a separate defect from
-// the pre-bound-listener fix and deliberately out of that fix's scope; do not
-// widen the window (in particular, do not move this call earlier).
-func resolvePort(addr string) (string, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return addr, err
+// listenGapHook, when a test sets it, runs in Listen just before the start
+// engine begins to bind: the last moment the port hold has to cover
+// (celeris#616). nil in production.
+var listenGapHook func(addr string)
+
+// releasePortHold closes the socket that has held the engine's port since New
+// (celeris#616), once. Safe from any goroutine: Listen and Shutdown can both
+// call it, and the Swap hands the socket to exactly one of them.
+func (e *Engine) releasePortHold() {
+	if f := e.portHold.Swap(nil); f != nil {
+		_ = f.Close()
 	}
-	resolved := ln.Addr().String()
-	_ = ln.Close()
-	return resolved, nil
 }
