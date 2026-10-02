@@ -638,15 +638,18 @@ jobs:
       # goroutine must not take the conn's loop or worker with it. The panic's
       # recover used to leave cs.detachMu locked, and closeConn then waited on
       # it forever; a Goexit left the conn owned by a goroutine that no longer
-      # existed. The root race step above runs ./engine/epoll and ./engine/std
-      # without -v, where a test that stops running says nothing, and the
-      # engine/iouring step counts no name of these. So the eight run here by
-      # name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and an exact tally: the
-      # panic, Goexit and handler-error (control) arms of io_uring and epoll,
-      # and std's panic and Goexit arms, must each PASS and print one RESULT
-      # line that reads stopped=true, with no SKIP line. memlock stays at the
-      # runner's 8 MiB: one io_uring worker, the shape the defect wedged in
-      # (its two-worker shape and the adaptive arms run in job `adaptive`).
+      # existed. The root race step above runs ./engine/epoll, ./engine/std
+      # and the root package without -v, where a test that stops running says
+      # nothing, and the engine/iouring step counts no name of these. So the
+      # twelve run here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and an
+      # exact tally: the panic, Goexit and handler-error (control) arms of
+      # io_uring and epoll, std's panic and Goexit arms, and the public-API
+      # arms (an .Async() route that calls runtime.Goexit on each engine, and
+      # its panic control, which the router answers with a 500) must each
+      # PASS and print one RESULT line that reads stopped=true, with no SKIP
+      # line. memlock stays at the runner's 8 MiB: one io_uring worker, the
+      # shape the defect wedged in. Job `adaptive` runs the adaptive arms,
+      # whose adopted-conn arm meets the defect on two io_uring workers.
       - name: celeris#791 handler panic and Goexit on a dispatch goroutine (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -659,10 +662,12 @@ jobs:
           uring='TestIouringAsyncHandlerPanicLeavesItsWorkerServing|TestIouringAsyncHandlerGoexitLeavesItsWorkerServing|TestIouringAsyncHandlerErrorLeavesItsWorkerServing'
           epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing'
           std='TestStdHandlerPanicLeavesTheEngineServing|TestStdHandlerGoexitLeavesTheEngineServing'
+          server='TestServerAsyncRouteGoexitOnEpoll|TestServerAsyncRouteGoexitOnIOUring|TestServerAsyncRoutePanicOnEpoll|TestServerAsyncRoutePanicOnIOUring'
           go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
-          names="${uring}|${epoll}|${std}"
+          go test -race -count=1 -timeout=300s -v -run "^(${server})\$" . 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          names="${uring}|${epoll}|${std}|${server}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791.log || true)
