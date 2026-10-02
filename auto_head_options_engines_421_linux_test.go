@@ -217,7 +217,10 @@ func TestAutoHeadOptionsOnEveryEngine421(t *testing.T) {
 
 // h2HeadDataBytes421 sends one HEAD on a fresh h2c (prior knowledge)
 // connection and returns the response's :status and the DATA payload bytes
-// received on the stream until it ends.
+// received on the stream until it ends. After the response's HEADERS it sends
+// a PING: an async route's frames can sit in the write queue until the event
+// loop next wakes (celeris#837, a lost wakeup that GET streams hit too), and
+// the PING wakes it, so any DATA the server queued still arrives and counts.
 func h2HeadDataBytes421(addr, path string) (status string, data int, err error) {
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -270,6 +273,9 @@ func h2HeadDataBytes421(addr, path string) (status string, data int, err error) 
 			}
 			if f.StreamEnded() {
 				return status, data, nil
+			}
+			if err := fr.WritePing(false, [8]byte{4, 2, 1}); err != nil {
+				return status, data, err
 			}
 		case *http2.DataFrame:
 			if f.StreamID != 1 {
