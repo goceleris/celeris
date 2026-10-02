@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"strconv"
 
 	"github.com/goceleris/celeris"
@@ -57,7 +56,7 @@ type Config struct {
 	// comparing against it for unknown users, rather than letting
 	// bcrypt.CompareHashAndPassword fail instantly on an empty hash.
 	// [VerifyPassword] meets this: it performs one PBKDF2 derivation for
-	// every input, whatever format the stored hash is in.
+	// every input, whatever the stored string is.
 	HashedUsersFunc func(hash, password string) bool
 
 	// Realm is the authentication realm. Default: "Restricted".
@@ -116,9 +115,9 @@ func applyDefaults(cfg Config) Config {
 			if !allPBKDF2(cfg.HashedUsers) {
 				// SHA-256 is fast — adversaries can crack it on commodity
 				// GPUs at billions of guesses per second. There is no
-				// fast-hash default: callers must wire VerifyPassword,
-				// bcrypt / scrypt / argon2 (or equivalent) explicitly.
-				// See package docs for the migration path.
+				// fast-hash default: any format other than pbkdf2-sha256
+				// needs an explicit bcrypt / scrypt / argon2 (or
+				// equivalent) HashedUsersFunc.
 				panic("basicauth: HashedUsers requires HashedUsersFunc unless every hash is pbkdf2-sha256 " +
 					"(use HashPasswordPBKDF2 + VerifyPassword, bcrypt, or argon2; plain SHA-256 is not credential-grade)")
 			}
@@ -182,20 +181,6 @@ func hmacSHA256(key, data []byte) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write(data)
 	return mac.Sum(nil)
-}
-
-// HashPassword returns the hex-encoded SHA-256 hash of password.
-//
-// Deprecated: an unsalted, fast SHA-256 digest is not a credential-storage
-// hash — identical passwords share a digest and it is brute-forceable at
-// GPU speed (CodeQL go/weak-sensitive-data-hashing, celeris#503). Use
-// [HashPasswordPBKDF2] to produce new hashes; [VerifyPassword] accepts both
-// formats so existing stores can migrate one entry at a time. This helper's
-// behaviour is frozen for backwards-compatibility and it may be removed in
-// a future major release.
-func HashPassword(password string) string {
-	h := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(h[:])
 }
 
 func (cfg Config) validate() {

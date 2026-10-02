@@ -229,8 +229,8 @@ func applyDefaults(cfg Config) Config {
 	// When no store is provided, applyDefaults creates a MemoryStore which
 	// spawns a background cleanup goroutine. This is intentional: the
 	// middleware is typically created once at startup and the goroutine
-	// runs for the process lifetime. Use [MemoryStoreConfig].CleanupContext
-	// or the [memoryStore.Close] method for deterministic shutdown.
+	// runs for the process lifetime. Use [store.MemoryKVConfig].CleanupContext
+	// or the [store.MemoryKV.Close] method for deterministic shutdown.
 	if cfg.Store == nil {
 		cfg.Store = NewMemoryStore()
 	}

@@ -40,41 +40,28 @@
 // Use [UsernameFromContext] to retrieve the authenticated username downstream.
 // Set [Config].Skip or [Config].SkipPaths to bypass the middleware selectively.
 //
-// # Migrating from HashPassword (SHA-256)
+// # Hash formats
 //
-// [HashPassword] is deprecated: it produces an unsalted, fast SHA-256 digest,
-// which is not a credential-storage hash (identical passwords collide and
-// the digest is brute-forceable at GPU speed). Nothing breaks for existing
-// deployments — HashPassword's output is unchanged and any HashedUsersFunc
-// you already supply keeps working — but new hashes should come from
-// [HashPasswordPBKDF2] (PBKDF2-HMAC-SHA256, random 16-byte salt, 600,000
-// iterations, 32-byte key; stdlib crypto/pbkdf2, no new dependencies).
-//
-// To migrate an existing HashedUsers store incrementally:
-//
-//  1. Set HashedUsersFunc to [VerifyPassword]. It detects the format of each
-//     stored hash — "pbkdf2-sha256$..." or a bare hex SHA-256 digest — and
-//     compares with crypto/subtle.ConstantTimeCompare either way, so mixed
-//     stores authenticate correctly. Every call costs one PBKDF2 derivation
-//     whatever the format (legacy entries and unknown users burn a
-//     default-cost one), so response time does not reveal which users have
-//     migrated. The one cost-related signal left is a non-default iteration
-//     count in a pbkdf2-sha256 entry, as with any tunable KDF; hashes from
-//     HashPasswordPBKDF2 all carry the default.
-//  2. Re-hash each user with HashPasswordPBKDF2 (at the next password
-//     change, or in one sweep if you hold the plaintexts) and replace the
-//     stored value.
-//  3. Once no legacy digests remain, drop the explicit HashedUsersFunc — the
-//     default kicks in for all-PBKDF2 stores. Mixed or legacy-only stores
-//     without a HashedUsersFunc still panic at [New], by design.
+// [VerifyPassword] accepts only the pbkdf2-sha256 strings
+// [HashPasswordPBKDF2] produces (PBKDF2-HMAC-SHA256, random 16-byte salt,
+// 600,000 iterations, 32-byte key; stdlib crypto/pbkdf2, no new
+// dependencies). v1.6.0 removed the HashPassword helper, which produced an
+// unsalted, fast SHA-256 digest (identical passwords collide and the digest
+// is brute-forceable at GPU speed), and VerifyPassword no longer accepts
+// such digests (celeris#826). Re-hash any with HashPasswordPBKDF2. For
+// another credential-grade format — bcrypt, argon2id, scrypt — supply
+// [Config].HashedUsersFunc.
 //
 // Verification costs one PBKDF2 derivation per request (hundreds of
-// milliseconds at 600k iterations) for every entry, legacy digests
-// included; keep a session or token layer in front of hot endpoints rather
-// than lowering the count. Stored pbkdf2-sha256 parameters are honoured
-// within 600,000–10,000,000 iterations and a salt of at least 16 bytes; a
-// value outside that window never verifies and, in an auto-wired store,
-// makes [New] panic naming the entry.
+// milliseconds at 600k iterations) for every input, unknown users and
+// malformed entries included, so response time does not reveal whether a
+// stored hash is well formed; keep a session or token layer in front of hot
+// endpoints rather than lowering the count. Stored pbkdf2-sha256 parameters
+// are honoured within 600,000–10,000,000 iterations and a salt of at least
+// 16 bytes; a value outside that window never verifies and, in an
+// auto-wired store, makes [New] panic naming the entry. A HashedUsers map
+// with any entry that is not pbkdf2-sha256 and no HashedUsersFunc panics at
+// [New], by design.
 //
 // # Documentation
 //
