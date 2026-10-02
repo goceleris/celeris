@@ -179,6 +179,52 @@ jobs:
             echo "removed or failed?"
             exit 1
           fi
+      # celeris#543: a transplant's carried bytes (Carryover.Buffered) must be
+      # replayed by the adopting engine as if it had read them itself, so under
+      # AsyncHandlers an async route's handler runs on the conn's dispatch
+      # goroutine. Before the fix the io_uring adopt ran every carried request
+      # inline on its worker and the epoll adopt dropped them. The step above
+      # runs the io_uring tests without a name check and the root step runs
+      # the epoll ones without -v, so all of them run here by name: the engine
+      # tests at the runner's memlock (one io_uring worker), with
+      # CELERIS_REQUIRE_IOURING_WORKERS=1, and the adaptive one, which forces a
+      # switch each way and so builds a second engine's rings within the
+      # kernel's uncharge latency, with memlock raised, as job `adaptive` runs
+      # its package. Every test must PASS with no SKIP line; each of the six
+      # scenario arms must print one RESULT line reading carried_started=true,
+      # every other adopted conn served, carried_answered=true, block_runs=1
+      # and follow_up=true, and each of the four pipelined arms its answers in
+      # order.
+      - name: celeris#543 carried bytes replayed under AsyncHandlers (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          uring='TestIouringAdoptCarriedAsyncRoute543|TestIouringAdoptCarriedPartialAsyncRoute543|TestIouringAdoptCarriedPipelinedAsync543|TestIouringAdoptCarriedPipelinedSync543'
+          epoll='TestEpollAdoptCarriedAsyncRoute543|TestEpollAdoptCarriedPartialAsyncRoute543|TestEpollAdoptCarriedPipelinedAsync543|TestEpollAdoptCarriedPipelinedSync543'
+          adaptive='TestAdaptiveSwitchAdoptsCarriedAsyncRequest543'
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c543.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./adaptive/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
+          names="${uring}|${epoll}|${adaptive}"
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c543.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c543.log || true)
+          results=$(grep -cE 'celeris543 RESULT engine=' /tmp/c543.log || true)
+          clean=$(grep -cE 'celeris543 RESULT engine=[^ ]+ split=(true|false) workers=([0-9]+) carried_started=true others_served=\2/\2 carried_answered=true block_runs=1 follow_up=true$' /tmp/c543.log || true)
+          ordered=$(grep -cE 'celeris543 PIPELINED engine=[^ ]+ answers=\["/first" "blocked-done" "/third"\] follow_up=true block_runs=1$' /tmp/c543.log || true)
+          echo "celeris#543 tests: want $want PASS, passed $passed, SKIP lines $skipped, RESULT lines $results (want 6), clean $clean, pipelined in order $ordered (want 4), go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$results" -ne 6 ] || [ "$clean" -ne 6 ] || [ "$ordered" -ne 4 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all $want celeris#543 tests to PASS with no SKIP line, six clean RESULT lines and"
+            echo "four pipelined arms answered in order -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
       # celeris#657: the root step ran ./engine/iouring WITHOUT -v, so a skip
       # there printed nothing and the package still reported `ok`. That is how
       # the celeris#656 leak shipped with no cover. The step above now runs

@@ -218,10 +218,20 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 	cs.detected = true
 	l.initProtocol(cs)
 
-	// Replay any carried pipelined NEXT-request bytes through the fresh parser
-	// (sync path only — the source guaranteed a clean boundary, so for async it
-	// carries nothing). Mirrors drainRead's inline process→flush.
-	if len(carry.Buffered) > 0 && !l.async {
+	// Replay any carried pipelined NEXT-request bytes through the fresh parser.
+	// They get exactly what drainRead would give them had this loop read them
+	// off the socket itself: in sync mode ProcessH1 inline (drainRead's inline
+	// process→flush), and on an AsyncHandlers loop the per-route decision a
+	// fresh conn's first read gets (replayCarriedAsync). Async mode used to
+	// skip them, on the strength of the in-tree source never carrying bytes
+	// under AsyncHandlers; the carry is public API (engine.TransplantTarget),
+	// and a carry that did arrive was dropped, its client left waiting for an
+	// answer to a request no handler saw (celeris#543).
+	if len(carry.Buffered) > 0 {
+		if l.async {
+			l.replayCarriedAsync(cs, fd, carry.Buffered)
+			return
+		}
 		if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, l.handler, cs.writeFn); perr != nil {
 			if !errors.Is(perr, conn.ErrHijacked) {
 				l.closeConn(fd)
@@ -233,6 +243,63 @@ func (l *Loop) attachAdoptedFD(ctx context.Context, fd int, carry engine.Carryov
 				l.closeConn(fd)
 				return
 			}
+		}
+	}
+}
+
+// replayCarriedAsync replays a transplant's carried bytes on an AsyncHandlers
+// loop the way drainRead treats the first bytes a fresh async HTTP/1 conn
+// reads (celeris#543): ProcessH1 runs inline in InlineMode, so sync routes are
+// served here and ProcessH1 stops at the first async route (ErrAsyncDispatch);
+// the conn is then promoted and that request, with whatever follows it, goes
+// to the conn's dispatch goroutine. Each step mirrors drainRead's. Loop
+// thread; the conn is fresh from attachAdoptedFD, so no dispatch goroutine
+// exists yet and the loop owns cs.h1State until the promotion hands it over.
+// The conn's EPOLLIN is already registered, so nothing is left to arm.
+func (l *Loop) replayCarriedAsync(cs *connState, fd int, data []byte) {
+	cs.h1State.InlineMode = true
+	perr := conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, cs.writeFn)
+	// A handler that hijacked inline has had cs released inside the Hijack
+	// call, as in drainRead, so cs is not touched again after ErrHijacked.
+	if errors.Is(perr, conn.ErrHijacked) {
+		return
+	}
+	cs.h1State.InlineMode = false
+	if errors.Is(perr, conn.ErrAsyncDispatch) {
+		// Any response already written inline (a sync request ahead of the
+		// async one) stays in cs.writeBuf and the dispatch path flushes it in
+		// order, as in drainRead.
+		cs.asyncPromoted = true
+		l.asyncPromoted.Add(1)
+		stashed := cs.h1State.TakeBufferedBytes()
+		cs.asyncInMu.Lock()
+		cs.asyncInBuf = append(cs.asyncInBuf, stashed...)
+		starting := !cs.asyncRun
+		if starting {
+			cs.asyncRun = true
+		}
+		cs.asyncInMu.Unlock()
+		if starting {
+			l.asyncWG.Add(1)
+			go l.runAsyncHandler(cs)
+		} else {
+			cs.asyncCond.Signal()
+		}
+		return
+	}
+	if perr != nil {
+		l.closeConn(fd)
+		return
+	}
+	// Inline served the bytes, but if they ended inside a request its
+	// continuation must run on the dispatch goroutine, as in drainRead.
+	if cs.h1State.HasPendingData() {
+		cs.asyncPromoted = true
+		l.asyncPromoted.Add(1)
+	}
+	if csWritePending(cs) {
+		if fErr := l.flushWrites(cs, true); fErr != nil {
+			l.closeConn(fd)
 		}
 	}
 }

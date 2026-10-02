@@ -150,8 +150,9 @@ func (l *Loop) tryTransplant(fd int) {
 	}
 
 	// Sync conn, or async conn whose dispatch goroutine never started: detach +
-	// hand off now. The async path carries no buffered bytes (re-injection on the
-	// destination's async path is out of scope), so require an empty buffer there.
+	// hand off now. The async path carries no buffered bytes, so require an empty
+	// buffer there. (Both destinations replay a carry correctly under
+	// AsyncHandlers since celeris#543; this source just never builds one.)
 	if l.async && cs.h1State.HasPendingData() {
 		return
 	}
