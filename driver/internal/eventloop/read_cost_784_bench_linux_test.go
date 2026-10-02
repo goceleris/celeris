@@ -2,18 +2,22 @@
 
 package eventloop
 
-// The cost of celeris#784's fix on the read paths: every read(2) of a driver
-// conn is issued under the conn's mutex after a closed check (readOpen). These
-// benchmarks run the same code on the base and on the fix, so benchstat
-// compares the two directly. The worker has no goroutine of its own
-// (newWorker, no run): each op drives one read path on the benchmark
-// goroutine with a 64-byte response already queued, the shape of a small
-// redis/memcached reply.
+// The uncontended cost of celeris#784's fix on the read paths: every read(2)
+// of a driver conn is issued under the conn's read lock after a closed check
+// (readOpen), and a WriteAndPoll* call's two EPOLL_CTL_MODs under the conn's
+// mutex after the same check (setEvents). These benchmarks run the same code
+// on the base and on the fix, so benchstat compares the two directly. The
+// worker has no goroutine of its own (newWorker, no run): each op drives one
+// read path on the benchmark goroutine with a 64-byte response already
+// queued, the shape of a small redis/memcached reply.
 //
 //	handleReadable: 2 reads per op (64 bytes, then EAGAIN), plus the peer's write
 //	WriteAndPoll*:  3 reads per op (64 bytes, EAGAIN, the final drain's EAGAIN),
 //	                plus the request write, two epoll_ctl MODs, and the peer's
 //	                write and read
+//
+// The contended side, a read while another goroutine flushes, is
+// read_contended_784_bench_linux_test.go.
 
 import (
 	"testing"

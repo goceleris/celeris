@@ -109,34 +109,43 @@ func c784RegisterParked(t *testing.T, w engine.WorkerLoop, shutWr bool) *c784Con
 }
 
 // c784TakeNumber closes nothing: the caller has closed fd. It opens a new
-// socketpair and moves one end onto fd's number with dup3, the way the next
-// accept or dial of the process would reuse it. It returns the socket now on
-// the number (== fd) and its peer.
+// socketpair and puts one end on fd's number, the way the next accept or dial
+// of the process would reuse it. It returns the socket now on the number
+// (== fd) and its peer. Either end of the new pair may already be fd, the
+// lowest free number; otherwise the first end is moved onto fd with dup3,
+// and the other end is never fd, so dup3 never closes the peer.
 func c784TakeNumber(t *testing.T, fd int, nonblock bool) (int, int) {
 	t.Helper()
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
-	if nonblock {
-		if err := unix.SetNonblock(pair[0], true); err != nil {
-			t.Fatalf("nonblock: %v", err)
-		}
-		if err := unix.SetNonblock(pair[1], true); err != nil {
-			t.Fatalf("nonblock: %v", err)
-		}
-	}
-	if pair[0] != fd {
+	var peer int
+	switch fd {
+	case pair[0]:
+		peer = pair[1]
+	case pair[1]:
+		peer = pair[0]
+	default:
 		if err := unix.Dup3(pair[0], fd, unix.O_CLOEXEC); err != nil {
 			t.Fatalf("dup3 onto %d: %v", fd, err)
 		}
 		_ = unix.Close(pair[0])
+		peer = pair[1]
+	}
+	if nonblock {
+		if err := unix.SetNonblock(fd, true); err != nil {
+			t.Fatalf("nonblock: %v", err)
+		}
+		if err := unix.SetNonblock(peer, true); err != nil {
+			t.Fatalf("nonblock: %v", err)
+		}
 	}
 	t.Cleanup(func() {
 		_ = unix.Close(fd)
-		_ = unix.Close(pair[1])
+		_ = unix.Close(peer)
 	})
-	return fd, pair[1]
+	return fd, peer
 }
 
 // c784Serves reports whether w delivers a byte to another conn within d,
