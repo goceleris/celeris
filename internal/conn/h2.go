@@ -120,8 +120,10 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 	shard.bufs = append(shard.bufs, data)
 	shard.mu.Unlock()
 	// CAS coalescing: only signal the event loop if no prior enqueue already
-	// set pending. If CAS fails, pending is already true and a prior enqueue
-	// already wrote the eventfd — the event loop will drain all shards.
+	// set pending. If CAS fails, pending is already true: an enqueue since
+	// the last drain's clear wrote the eventfd, so a drain is still to come,
+	// and it takes this frame because DrainTo clears pending before it takes
+	// any shard (celeris#837).
 	if q.pending.CompareAndSwap(false, true) {
 		q.wake.Signal()
 	}
@@ -130,7 +132,17 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 // DrainTo drains all enqueued data by calling write for each buffer,
 // then returns buffers to the pool.
 // Called from the event loop thread. The write function must not block.
+//
+// pending is cleared BEFORE the shards are emptied, never after
+// (celeris#837). An Enqueue that lands while the drain is past its shard sees
+// pending false, sets it and signals the loop, so the loop's next drain (gated
+// on pending) takes the frame. Clearing it at the end lost that frame: the
+// Enqueue had seen pending still true and signalled nothing, and the clear
+// then left the frame in its shard with pending false. A streamed response
+// lost its last frames that way. An Enqueue between the clear and its shard's
+// swap is drained here and also signals: one spurious wakeup, one empty drain.
 func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
+	q.pending.Store(false)
 	for i := range q.shards {
 		s := &q.shards[i]
 		s.mu.Lock()
@@ -147,7 +159,6 @@ func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
 			s.spare = s.spare[:0]
 		}
 	}
-	q.pending.Store(false)
 }
 
 // h2StreamEncoder provides goroutine-local HPACK encoding with dynamic table
