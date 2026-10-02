@@ -107,7 +107,7 @@ func HashPasswordPBKDF2(password string) string {
 //     downgrade the derivation below the cost this package emits nor make
 //     it cost minutes of CPU. Anything outside the window fails, after the
 //     same work as below;
-//   - a bare hex SHA-256 digest from the deprecated [HashPassword], kept so
+//   - a bare hex SHA-256 digest from the removed HashPassword, kept so
 //     existing deployments keep authenticating while they migrate.
 //
 // Timing: every call performs exactly one PBKDF2 derivation — at the
@@ -190,14 +190,11 @@ func parsePBKDF2(hash string) (iter int, salt, key []byte, ok bool) {
 }
 
 // verifyLegacySHA256 checks password against a bare hex SHA-256 digest as
-// produced by the deprecated HashPassword. It burns one default-cost PBKDF2
-// derivation first — on the valid-hex and the malformed path alike, ""
-// included — so a legacy entry, an unknown user and a pbkdf2-sha256 entry
-// all cost the same. The candidate digest comes from HashPassword itself,
-// the one deliberately retained (deprecated, CodeQL-tracked) fast-hash
-// site, rather than a second inline SHA-256 over the password; the stored
-// hex is re-encoded so both sides are 64-byte lower-case strings for the
-// constant-time compare.
+// produced by the removed HashPassword (celeris#826). It burns one
+// default-cost PBKDF2 derivation first — on the valid-hex and the malformed
+// path alike, "" included — so a legacy entry, an unknown user and a
+// pbkdf2-sha256 entry all cost the same, then compares the 32-byte digests
+// in constant time.
 func verifyLegacySHA256(hash, password string) bool {
 	burnPBKDF2(password)
 	want, err := hex.DecodeString(hash)
@@ -205,8 +202,8 @@ func verifyLegacySHA256(hash, password string) bool {
 	if malformed {
 		want = make([]byte, sha256.Size)
 	}
-	match := subtle.ConstantTimeCompare(
-		[]byte(HashPassword(password)), []byte(hex.EncodeToString(want))) == 1
+	sum := sha256.Sum256([]byte(password))
+	match := subtle.ConstantTimeCompare(sum[:], want) == 1
 	return match && !malformed
 }
 

@@ -276,7 +276,7 @@ func TestVerifyPasswordWindowEdges(t *testing.T) {
 
 func TestVerifyPasswordLegacySHA256(t *testing.T) {
 	t.Parallel()
-	legacy := HashPassword("secret")
+	legacy := sha256Hex("secret")
 	// HashPassword's behaviour is unchanged: still the plain hex digest.
 	if _, err := hex.DecodeString(legacy); err != nil || len(legacy) != 64 {
 		t.Fatalf("HashPassword output changed: %q", legacy)
@@ -320,7 +320,7 @@ func TestVerifyPasswordCostUniform(t *testing.T) {
 	h := secretHash()
 	parts := strings.Split(h, "$")
 	hostile := parts[0] + "$2147483647$" + parts[2] + "$" + parts[3]
-	legacy := HashPassword("secret")
+	legacy := sha256Hex("secret")
 
 	measure := func(hash string, want bool) time.Duration {
 		start := time.Now()
@@ -400,7 +400,7 @@ func TestHashedUsersLegacyWithoutFuncStillPanics(t *testing.T) {
 	}()
 	New(Config{HashedUsers: map[string]string{
 		"admin": secretHash(),
-		"old":   HashPassword("legacy"),
+		"old":   sha256Hex("legacy"),
 	}})
 }
 
@@ -445,7 +445,7 @@ func TestHashedUsersVerifyPasswordMixedStore(t *testing.T) {
 	mw := New(Config{
 		HashedUsers: map[string]string{
 			"new": secretHash(),
-			"old": HashPassword("legacy"),
+			"old": sha256Hex("legacy"),
 		},
 		HashedUsersFunc: VerifyPassword,
 	})
@@ -483,12 +483,12 @@ func TestPickDummyHash(t *testing.T) {
 		t.Fatalf("pickDummyHash(nil) = %q, want \"\"", got)
 	}
 	for range 16 {
-		mixed := map[string]string{"a": HashPassword("a"), "m": pb, "z": HashPassword("z")}
+		mixed := map[string]string{"a": sha256Hex("a"), "m": pb, "z": sha256Hex("z")}
 		if got := pickDummyHash(mixed); got != pb {
 			t.Fatalf("mixed store: pickDummyHash = %q, want the pbkdf2-sha256 entry", got)
 		}
-		legacyOnly := map[string]string{"zed": HashPassword("z"), "amy": HashPassword("a"), "bob": HashPassword("b")}
-		if got := pickDummyHash(legacyOnly); got != HashPassword("a") {
+		legacyOnly := map[string]string{"zed": sha256Hex("z"), "amy": sha256Hex("a"), "bob": sha256Hex("b")}
+		if got := pickDummyHash(legacyOnly); got != sha256Hex("a") {
 			t.Fatalf("legacy-only store: pickDummyHash = %q, want the entry of the smallest username", got)
 		}
 	}
@@ -507,9 +507,9 @@ func TestHashedUsersUnknownUserDummyPrefersPBKDF2(t *testing.T) {
 		var seen string
 		mw := New(Config{
 			HashedUsers: map[string]string{
-				"old1": HashPassword("a"),
-				"old2": HashPassword("b"),
-				"old3": HashPassword("c"),
+				"old1": sha256Hex("a"),
+				"old2": sha256Hex("b"),
+				"old3": sha256Hex("c"),
 				"new":  pb,
 			},
 			HashedUsersFunc: func(hash, _ string) bool { seen = hash; return false },

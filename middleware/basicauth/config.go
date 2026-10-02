@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"strconv"
 
 	"github.com/goceleris/celeris"
@@ -182,20 +181,6 @@ func hmacSHA256(key, data []byte) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write(data)
 	return mac.Sum(nil)
-}
-
-// HashPassword returns the hex-encoded SHA-256 hash of password.
-//
-// Deprecated: an unsalted, fast SHA-256 digest is not a credential-storage
-// hash — identical passwords share a digest and it is brute-forceable at
-// GPU speed (CodeQL go/weak-sensitive-data-hashing, celeris#503). Use
-// [HashPasswordPBKDF2] to produce new hashes; [VerifyPassword] accepts both
-// formats so existing stores can migrate one entry at a time. This helper's
-// behaviour is frozen for backwards-compatibility and it may be removed in
-// a future major release.
-func HashPassword(password string) string {
-	h := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(h[:])
 }
 
 func (cfg Config) validate() {
