@@ -17,6 +17,14 @@
 // middleware sets Last-Modified, ETag (weak, mtime+size), and optional
 // Cache-Control headers and handles conditional requests (304 Not Modified).
 //
+// A GET with a single byte range gets 206 Partial Content; a range no byte of
+// the file satisfies gets 416 Range Not Satisfiable with
+// "Content-Range: bytes */<size>". If-Range is honoured: the range is served
+// only while the client's validator still matches, otherwise the whole file
+// is sent as a 200. Because the ETag is weak and If-Range uses the strong
+// comparison, only a Last-Modified date can match here (RFC 9110 §13.1.5).
+// HEAD ignores Range, and a request for several ranges gets the whole file.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/static-files

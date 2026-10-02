@@ -64,3 +64,47 @@ func BenchmarkStaticServeWithCacheHeaders(b *testing.B) {
 		celeristest.ReleaseContext(ctx)
 	}
 }
+
+// BenchmarkStaticServeRange serves a single byte range of a cached file
+// (celeris#435: the range is decided by internal/httprange).
+func BenchmarkStaticServeRange(b *testing.B) {
+	mapFS := fstest.MapFS{
+		"style.css": {Data: []byte("body{margin:0}"), ModTime: time.Unix(1_700_000_000, 0)},
+	}
+	mw := New(Config{FS: mapFS, MaxAge: time.Hour})
+	noop := func(_ *celeris.Context) error { return nil }
+	opts := []celeristest.Option{
+		celeristest.WithHandlers(mw, noop),
+		celeristest.WithHeader("range", "bytes=2-9"),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/style.css", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
+// BenchmarkStaticServeRangeIfRange is BenchmarkStaticServeRange with an
+// If-Range date that matches, so the range is served (celeris#435).
+func BenchmarkStaticServeRangeIfRange(b *testing.B) {
+	mod := time.Unix(1_700_000_000, 0)
+	mapFS := fstest.MapFS{
+		"style.css": {Data: []byte("body{margin:0}"), ModTime: mod},
+	}
+	mw := New(Config{FS: mapFS, MaxAge: time.Hour})
+	noop := func(_ *celeris.Context) error { return nil }
+	opts := []celeristest.Option{
+		celeristest.WithHandlers(mw, noop),
+		celeristest.WithHeader("range", "bytes=2-9"),
+		celeristest.WithHeader("if-range", mod.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/style.css", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}

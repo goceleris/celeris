@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goceleris/celeris/internal/httprange"
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
@@ -865,7 +866,20 @@ func (c *Context) SetCookie(cookie *Cookie) {
 }
 
 // File serves the named file. The content type is detected from the file
-// extension. Supports Range requests for partial content (HTTP 206).
+// extension.
+//
+// A GET with a single byte range gets 206 Partial Content (a last-pos past
+// the end, or a suffix longer than the file, is cut to the file). A range
+// set that no byte of the file satisfies gets 416 Range Not Satisfiable with
+// "Content-Range: bytes */<size>" and no body. An If-Range header is
+// honoured against the ETag and Last-Modified response headers already set
+// when File is called (File sets neither itself): the range is served only
+// while the client's validator matches (strong comparison for an
+// entity-tag, so a weak tag never matches; the same instant for a date),
+// otherwise the whole file is sent as a 200. HEAD and other methods ignore
+// Range, as do an unknown range unit, an invalid range set, and a set with
+// more than one satisfiable range (multipart/byteranges is not supported).
+// See RFC 9110 §14 and §13.1.5.
 //
 // The entire file is loaded into memory (capped at 100 MB). Returns
 // [HTTPError] with status 413 if the file exceeds this limit. For large
@@ -899,9 +913,20 @@ func (c *Context) File(filePath string) error {
 	c.SetHeader("accept-ranges", "bytes")
 
 	if rng := c.Header("range"); rng != "" {
-		if start, end, ok := parseRange(rng, size); ok {
+		// If-Range is checked against the validators already on the
+		// response (an ETag / Last-Modified the handler or middleware/static
+		// set before calling File); File itself sets neither.
+		start, end, out := httprange.Decide(c.method, rng, c.Header("if-range"),
+			c.respHeader("etag"), c.respHeader("last-modified"), size)
+		switch out {
+		case httprange.Unsatisfiable:
+			var crBuf [32]byte
+			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(crBuf[:0], size)))
+			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
+		case httprange.Partial:
 			length := end - start + 1
-			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			var crBuf [64]byte
+			c.SetHeader("content-range", string(httprange.AppendContentRange(crBuf[:0], start, end, size)))
 			// Zero-copy sendfile(2) path (epoll). Falls through to the
 			// buffered read+seek path when the engine can't / won't take it.
 			if handled, err := c.trySendFile(f, 206, contentType, start, length); handled {
@@ -1061,42 +1086,15 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 	return c.Blob(200, contentType, data)
 }
 
-func parseRange(header string, size int64) (start, end int64, ok bool) {
-	const prefix = "bytes="
-	if !strings.HasPrefix(header, prefix) {
-		return 0, 0, false
-	}
-	spec := header[len(prefix):]
-	parts := strings.SplitN(spec, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	if parts[0] == "" {
-		n, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || n <= 0 {
-			return 0, 0, false
-		}
-		start = size - n
-		end = size - 1
-	} else {
-		var err error
-		start, err = strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			return 0, 0, false
-		}
-		if parts[1] == "" {
-			end = size - 1
-		} else {
-			end, err = strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				return 0, 0, false
-			}
+// respHeader returns the value of the response header key (lowercase, as
+// SetHeader stores it) set so far, or "".
+func (c *Context) respHeader(key string) string {
+	for _, h := range c.respHeaders {
+		if h[0] == key {
+			return h[1]
 		}
 	}
-	if start < 0 || start >= size || end < start || end >= size {
-		return 0, 0, false
-	}
-	return start, end, true
+	return ""
 }
 
 // Stream reads all data from r (capped at 100 MB) and writes it as the

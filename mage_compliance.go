@@ -23,6 +23,8 @@ var fuzzTargets = []struct {
 	{"FuzzParse", "./internal/negotiate/"},
 	{"FuzzMatchMedia", "./internal/negotiate/"},
 	{"FuzzAccept", "./internal/negotiate/"},
+	{"FuzzParse", "./internal/httprange/"},
+	{"FuzzIfRange", "./internal/httprange/"},
 }
 
 // FullCompliance runs the complete compliance verification suite.
