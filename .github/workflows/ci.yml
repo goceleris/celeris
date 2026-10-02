@@ -634,6 +634,55 @@ jobs:
             echo "expected both tests and all four arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
+      # celeris#791: a handler panic, or runtime.Goexit, on an async dispatch
+      # goroutine must not take the conn's loop or worker with it. The panic's
+      # recover used to leave cs.detachMu locked, and closeConn then waited on
+      # it forever; a Goexit left the conn owned by a goroutine that no longer
+      # existed. The root race step above runs ./engine/epoll, ./engine/std
+      # and the root package without -v, where a test that stops running says
+      # nothing, and the engine/iouring step counts no name of these. So the
+      # eighteen run here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and
+      # an exact tally: the panic, Goexit, handler-error (control),
+      # Detach-then-panic and Detach-then-Goexit arms of io_uring and epoll
+      # (the Detach arms pin that the teardown never releases a lock Detach
+      # already released: that would be a fatal "unlock of unlocked mutex"),
+      # std's panic and Goexit arms, and the public-API arms (an .Async()
+      # route that calls runtime.Goexit, with and without a c.Detach() first,
+      # on each engine, and its panic control, which the router answers with
+      # a 500) must each PASS and print one RESULT line that reads
+      # stopped=true, with no SKIP line. memlock stays at the runner's 8 MiB:
+      # one io_uring worker, the shape the defect wedged in. Job `adaptive`
+      # runs the adaptive arms, whose adopted-conn arm meets the defect on two
+      # io_uring workers.
+      - name: celeris#791 handler panic and Goexit on a dispatch goroutine (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          uring='TestIouringAsyncHandlerPanicLeavesItsWorkerServing|TestIouringAsyncHandlerGoexitLeavesItsWorkerServing|TestIouringAsyncHandlerErrorLeavesItsWorkerServing|TestIouringAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestIouringAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
+          epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
+          std='TestStdHandlerPanicLeavesTheEngineServing|TestStdHandlerGoexitLeavesTheEngineServing'
+          server='TestServerAsyncRouteGoexitOnEpoll|TestServerAsyncRouteGoexitOnIOUring|TestServerAsyncRouteDetachThenGoexitOnEpoll|TestServerAsyncRouteDetachThenGoexitOnIOUring|TestServerAsyncRoutePanicOnEpoll|TestServerAsyncRoutePanicOnIOUring'
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${server})\$" . 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          names="${uring}|${epoll}|${std}|${server}"
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791.log || true)
+          results=$(grep -cE 'celeris791 RESULT engine=' /tmp/c791.log || true)
+          stopped=$(grep -cE 'celeris791 RESULT engine=.* stopped=true( |$)' /tmp/c791.log || true)
+          echo "celeris#791 tests: want $want PASS, passed $passed, SKIP lines $skipped, RESULT lines $results, stopped=true $stopped, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$results" -ne "$want" ] || [ "$stopped" -ne "$want" ] || [ "$failed" -ne 0 ]; then
+            echo "expected all $want celeris#791 tests to PASS with no SKIP line, each with one RESULT line"
+            echo "reading stopped=true -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
@@ -771,6 +820,35 @@ jobs:
           if [ "$gran" -ne "$gwant" ] || [ "$gpassed" -ne "$gwant" ] || [ "$gskipped" -ne 0 ]; then
             echo "expected exactly $gwant celeris#662 adaptive tests to run and PASS with no SKIP line --"
             echo "were they renamed or removed, or did one skip? a skip is not coverage."
+            exit 1
+          fi
+      # celeris#791 through the adaptive engine: a handler panic on the start
+      # engine's (epoll's) dispatch goroutine, and on a connection the switch
+      # handed to io_uring (#383), must leave the worker serving. The step
+      # above runs both tests in the package run; this one runs them by name
+      # with the same raised memlock (two io_uring workers) and requires both
+      # to PASS, each with a RESULT line reading stopped=true, and no SKIP
+      # line. CELERIS_REQUIRE_UPSWITCH=1 turns their "io_uring unavailable"
+      # skip into a failure.
+      - name: celeris#791 adaptive arms (memlock raised, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_UPSWITCH: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestAdaptiveAsyncHandlerPanicLeavesTheStartEngineServing|TestAdaptiveAsyncHandlerPanicOnAnAdoptedConnLeavesItsWorkerServing'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./adaptive/ 2>&1 | tee /tmp/c791a.log
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791a.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791a.log || true)
+          stopped=$(grep -cE 'celeris791 RESULT engine=adaptive shape=(start|adopted) .* stopped=true$' /tmp/c791a.log || true)
+          echo "celeris#791 adaptive tests: want $want, passed $passed, SKIP lines $skipped, RESULT lines with stopped=true $stopped"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$stopped" -ne "$want" ]; then
+            echo "expected both celeris#791 adaptive tests to PASS with no SKIP line and a stopped=true RESULT line"
             exit 1
           fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
@@ -1123,6 +1201,76 @@ jobs:
             echo "SEND_ZC notification hold a descriptor or stall shutdown, or was a test renamed or skipped?"
             exit 1
           fi
+      # celeris#812: the release backstop gave up a closed connection 5 s after
+      # the close whatever it still owed, to connStatePool with its send buffer.
+      # With a SEND_ZC's notification owed, the kernel was still sending the
+      # unsent tail from that array to a peer that had stopped reading, and the
+      # array's next owner overwrote it: the peer got another connection's
+      # bytes. The backstop now holds such a send buffer until the notification,
+      # off the release walk, keeping the array alone, in gauges, and with no
+      # new SEND_ZC armed while a worker holds 16 MiB; worker shutdown keeps the
+      # buffers the ring closes on. Both arches, by name, at the runner's own
+      # 8 MiB memlock (the pages SEND_ZC pins count against it), -race, three
+      # runs, with a tally: every run of each of the ten tests and their
+      # twenty-four cases must PASS, with no FAIL and no SKIP line. A SKIP
+      # would mean the runner gave the engine no working SEND_ZC.
+      - name: celeris#812 a SEND_ZC's send buffer outlives the release backstop (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestBackstopHoldsASendBufferAZCNotificationStillReads|TestBackstopCountsItsZCHolds|TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline|TestClosedOpsCountsTheZCSendApart|TestDroppingAnIdentityWithAZCOwedIsCounted|TestShutdownRetainsSendBuffersAZCMayStillRead|TestZCHoldIsOffTheReleaseWalk|TestZCHoldKeepsOnlyTheSendBuffer|TestZCHoldCoversACollidingSibling|TestSendZCStopsWhileHeldBuffersReachTheCap'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 24 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
+          grep -E 'celeris812 ' /tmp/zc812.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc812.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc812.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/zc812.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/zc812.log || true)
+          echo "celeris#812 tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did the backstop"
+            echo "give up a send buffer a SEND_ZC still reads, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # Its detector control. .github/scripts/mutant-812-backstop-releases-zc.py
+      # disables the hold, so the backstop releases the connState with its send
+      # buffer as before the fix. Every run of each of the four wire cases must
+      # then report the release (held_past_backstop=false) and bytes on the wire
+      # that were not sent (corrupt_bytes above 0), and FAIL. A runner whose
+      # kernel copied the send before the release would let the wire test pass
+      # with or without the fix; this is what shows it does not. The mutation is
+      # undone before the step ends.
+      - name: celeris#812 detector control (the hold removed; every run of the four wire cases must see foreign bytes)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          python3 .github/scripts/mutant-812-backstop-releases-zc.py
+          runs=3
+          log=/tmp/zc812-mutant.log
+          go test -race -count="$runs" -timeout=300s -v -run '^TestBackstopHoldsASendBufferAZCNotificationStillReads$' \
+            ./engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- engine/iouring/worker.go
+          bad=0
+          for c in notif-only recv-and-notif send-done-after-close detached-notif-only; do
+            lines=$(grep -cE "celeris812 backstop case=$c " "$log" || true)
+            det=$(grep -E "celeris812 backstop case=$c " "$log" | grep -cE ' held_past_backstop=false .* corrupt_bytes=[1-9]' || true)
+            f=$(grep -cE "^    --- FAIL: TestBackstopHoldsASendBufferAZCNotificationStillReads/$c \(" "$log" || true)
+            echo "mutant, case $c: result lines $lines, detected $det, FAIL $f (want $runs, $runs, $runs)"
+            if [ "$lines" -ne "$runs" ] || [ "$det" -ne "$runs" ] || [ "$f" -ne "$runs" ]; then bad=1; fi
+          done
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
+          if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
+          exit "$bad"
       # The detector control. .github/scripts/mutant-685-release-owed-fd.py
       # makes fdOwed report false, which takes the fd-lifetime rule off the
       # close paths, Hijack and shutdown at once. Against that tree every run

@@ -584,6 +584,14 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
 		CloseFDDeferred:           e.metrics.handoffLoss.closeFDDeferred.Load(),
 		CloseFDForced:             e.metrics.handoffLoss.closeFDForced.Load(),
+		CloseZCNotifHeld:          e.metrics.handoffLoss.zcNotifHeld.Load(),
+		CloseZCNotifForced:        e.metrics.handoffLoss.zcNotifForced.Load(),
+		ShutdownZCBufRetained:     e.metrics.handoffLoss.zcBufRetained.Load(),
+		// Gauges: each worker takes off only what it added, after it, so
+		// neither goes below 0; the clamp only keeps a bug from showing
+		// as 2^64.
+		CloseZCNotifHeldNow:   uint64(max(0, e.metrics.handoffLoss.zcHeldNow.Load())),
+		CloseZCNotifHeldBytes: uint64(max(0, e.metrics.handoffLoss.zcHeldBytes.Load())),
 
 		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
 		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),
