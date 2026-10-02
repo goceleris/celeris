@@ -27,10 +27,11 @@ import (
 // GET route reaches the middleware. It must answer with the stream's headers
 // and end the response there (no event, no detached stream that never ends),
 // without running the Handler, so the connection serves its next request.
-// OnConnect still gates it: a rejection gives HEAD the status GET gets (401
-// here), and an accepted HEAD runs OnDisconnect once, as a stream that ends
-// at once would. HTTP/1.1 keep-alive and HTTP/2 (h2c, raw frames) on every
-// engine, with and without AsyncHandlers.
+// OnConnect still runs for it, and an accepted HEAD runs OnDisconnect once, as
+// a stream that ends at once would (a rejection is returned as for GET; what it
+// puts on the wire is celeris#835, see TestHeadAnswersWithHeadersOnly421).
+// HTTP/1.1 keep-alive and HTTP/2 (h2c, raw frames) on every engine, with and
+// without AsyncHandlers.
 func TestSSEHeadGetsHeadersOnly421(t *testing.T) {
 	engines := []struct {
 		name string
@@ -42,11 +43,8 @@ func TestSSEHeadGetsHeadersOnly421(t *testing.T) {
 				var handlerRuns, connects, disconnects atomic.Int32
 				addr, stop := startSSEHead421(t, e.eng, async, sse.New(sse.Config{
 					HeartbeatInterval: -1,
-					OnConnect: func(c *celeris.Context, _ *sse.Client) error {
+					OnConnect: func(_ *celeris.Context, _ *sse.Client) error {
 						connects.Add(1)
-						if c.Header("x-deny") != "" {
-							return celeris.NewHTTPError(401, "denied")
-						}
 						return nil
 					},
 					OnDisconnect: func(_ *celeris.Context, _ *sse.Client) { disconnects.Add(1) },
@@ -87,18 +85,6 @@ func TestSSEHeadGetsHeadersOnly421(t *testing.T) {
 				if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
 					t.Fatalf("HEAD /events: %d content-type %q, want 200 text/event-stream", resp.StatusCode, resp.Header.Get("Content-Type"))
 				}
-				// OnConnect rejects: HEAD gets GET's 401, on the same connection.
-				if _, err := io.WriteString(conn, "HEAD /events HTTP/1.1\r\nHost: x\r\nX-Deny: 1\r\n\r\n"); err != nil {
-					t.Fatal(err)
-				}
-				resp, err = http.ReadResponse(br, &http.Request{Method: "HEAD"})
-				if err != nil {
-					t.Fatalf("HEAD /events (denied): %v", err)
-				}
-				_ = resp.Body.Close()
-				if resp.StatusCode != 401 {
-					t.Fatalf("HEAD /events with OnConnect rejecting: %d, want the 401 GET gets", resp.StatusCode)
-				}
 				if _, err := io.WriteString(conn, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 					t.Fatal(err)
 				}
@@ -120,15 +106,14 @@ func TestSSEHeadGetsHeadersOnly421(t *testing.T) {
 				if n := handlerRuns.Load(); n != 0 {
 					t.Fatalf("the SSE Handler ran %d times for HEAD", n)
 				}
-				// Three HEADs reached OnConnect (h1, h1 denied, h2); the two it
-				// accepted each ran OnDisconnect once. The h2 stream can end
-				// on the wire before its handler has returned, so give the
-				// last OnDisconnect a moment.
+				// Both HEADs (h1, h2) ran OnConnect and then OnDisconnect once.
+				// The h2 stream can end on the wire before its handler has
+				// returned, so give the last OnDisconnect a moment.
 				for end := time.Now().Add(2 * time.Second); disconnects.Load() < 2 && time.Now().Before(end); {
 					time.Sleep(5 * time.Millisecond)
 				}
-				if c, d := connects.Load(), disconnects.Load(); c != 3 || d != 2 {
-					t.Fatalf("OnConnect ran %d times, OnDisconnect %d; want 3 and 2", c, d)
+				if c, d := connects.Load(), disconnects.Load(); c != 2 || d != 2 {
+					t.Fatalf("OnConnect ran %d times, OnDisconnect %d; want 2 and 2", c, d)
 				}
 			})
 		}
