@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"strconv"
 	"strings"
 )
@@ -96,40 +95,35 @@ func HashPasswordPBKDF2(password string) string {
 		base64.StdEncoding.EncodeToString(key)
 }
 
-// VerifyPassword reports whether password matches the stored hash. It is
-// a ready-made [Config].HashedUsersFunc that understands both hash formats
-// this package has ever produced:
+// VerifyPassword reports whether password matches the stored hash, a
+// pbkdf2-sha256$<iter>$<salt>$<hash> string from [HashPasswordPBKDF2]. It is
+// a ready-made [Config].HashedUsersFunc, and the one [New] wires in when
+// every [Config].HashedUsers entry is in that format.
 //
-//   - pbkdf2-sha256$<iter>$<salt>$<hash> from [HashPasswordPBKDF2]
-//     (preferred). The stored parameters are honoured only within a fixed
-//     window — 600,000 ≤ iterations ≤ 10,000,000, salt of at least 16
-//     bytes, key of exactly 32 bytes — so a stored value can neither
-//     downgrade the derivation below the cost this package emits nor make
-//     it cost minutes of CPU. Anything outside the window fails, after the
-//     same work as below;
-//   - a bare hex SHA-256 digest from the removed HashPassword, kept so
-//     existing deployments keep authenticating while they migrate.
+// The stored parameters are honoured only within a fixed window — 600,000 ≤
+// iterations ≤ 10,000,000, salt of at least 16 bytes, key of exactly 32
+// bytes — so a stored value can neither downgrade the derivation below the
+// cost this package emits nor make it cost minutes of CPU. Anything else
+// fails: a string outside the window, a malformed one, "" as callers pass
+// for unknown users, and any other format. That includes a bare hex SHA-256
+// digest: the HashPassword helper that produced those was removed in v1.6.0
+// (celeris#826), because an unsalted, fast digest is not a credential hash.
+// Re-hash such entries with HashPasswordPBKDF2.
 //
 // Timing: every call performs exactly one PBKDF2 derivation — at the
 // stored iteration count for a well-formed pbkdf2-sha256 hash, and at
-// [PBKDF2Iterations] for everything else (a legacy digest, a malformed or
-// out-of-window string, or "" as callers pass for unknown users) — followed
-// by a [subtle.ConstantTimeCompare]. The format of the stored hash is
+// [PBKDF2Iterations] for everything else — followed by a
+// [subtle.ConstantTimeCompare]. Whether a stored hash is well formed is
 // therefore not recoverable from response time, which is what the
 // HashedUsersFunc contract asks for. What does remain observable is a
 // non-default iteration count in a pbkdf2-sha256 entry, exactly as
 // bcrypt's cost factor is; the microsecond-scale parsing that differs
-// between the two formats is lost in the hundreds of milliseconds of
-// derivation.
+// between inputs is lost in the hundreds of milliseconds of derivation.
 //
-// That derivation is the per-request cost for every entry, legacy digests
-// included — which is the point: cache authenticated sessions upstream if
-// the endpoint is hot.
+// That derivation is the per-request cost for every entry — which is the
+// point: cache authenticated sessions upstream if the endpoint is hot.
 func VerifyPassword(hash, password string) bool {
-	if isPBKDF2Hash(hash) {
-		return verifyPBKDF2(hash, password)
-	}
-	return verifyLegacySHA256(hash, password)
+	return verifyPBKDF2(hash, password)
 }
 
 // isPBKDF2Hash reports whether hash carries the HashPasswordPBKDF2 tag.
@@ -187,24 +181,6 @@ func parsePBKDF2(hash string) (iter int, salt, key []byte, ok bool) {
 		return 0, nil, nil, false
 	}
 	return int(n), salt, key, true
-}
-
-// verifyLegacySHA256 checks password against a bare hex SHA-256 digest as
-// produced by the removed HashPassword (celeris#826). It burns one
-// default-cost PBKDF2 derivation first — on the valid-hex and the malformed
-// path alike, "" included — so a legacy entry, an unknown user and a
-// pbkdf2-sha256 entry all cost the same, then compares the 32-byte digests
-// in constant time.
-func verifyLegacySHA256(hash, password string) bool {
-	burnPBKDF2(password)
-	want, err := hex.DecodeString(hash)
-	malformed := err != nil || len(want) != sha256.Size
-	if malformed {
-		want = make([]byte, sha256.Size)
-	}
-	sum := sha256.Sum256([]byte(password))
-	match := subtle.ConstantTimeCompare(sum[:], want) == 1
-	return match && !malformed
 }
 
 // allPBKDF2 reports whether every stored hash carries the pbkdf2-sha256

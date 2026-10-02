@@ -19,10 +19,10 @@
 // On every allowed response the middleware sets X-RateLimit-Limit,
 // X-RateLimit-Remaining, and X-RateLimit-Reset headers; denied responses
 // (429) also receive Retry-After. Set [Config.DisableHeaders] to suppress all
-// rate-limit headers. [Config.ErrorHandler] customises the 429 response (it
-// supersedes the deprecated [Config.LimitReached]). The sentinel error
-// [ErrTooManyRequests] is passed to ErrorHandler and is usable with errors.Is.
-// [ErrDynamicLimitersExhausted] is returned when MaxDynamicLimiters is full.
+// rate-limit headers. [Config.ErrorHandler] customises the 429 response. The
+// sentinel error [ErrTooManyRequests] is passed to ErrorHandler and is usable
+// with errors.Is. [ErrDynamicLimitersExhausted] is returned when
+// MaxDynamicLimiters is full.
 //
 // [ValidateConfig] checks a [Config] for errors without panicking, useful when
 // loading configuration from files or untrusted sources before calling [New].

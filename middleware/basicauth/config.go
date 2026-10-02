@@ -56,7 +56,7 @@ type Config struct {
 	// comparing against it for unknown users, rather than letting
 	// bcrypt.CompareHashAndPassword fail instantly on an empty hash.
 	// [VerifyPassword] meets this: it performs one PBKDF2 derivation for
-	// every input, whatever format the stored hash is in.
+	// every input, whatever the stored string is.
 	HashedUsersFunc func(hash, password string) bool
 
 	// Realm is the authentication realm. Default: "Restricted".
@@ -115,9 +115,9 @@ func applyDefaults(cfg Config) Config {
 			if !allPBKDF2(cfg.HashedUsers) {
 				// SHA-256 is fast — adversaries can crack it on commodity
 				// GPUs at billions of guesses per second. There is no
-				// fast-hash default: callers must wire VerifyPassword,
-				// bcrypt / scrypt / argon2 (or equivalent) explicitly.
-				// See package docs for the migration path.
+				// fast-hash default: any format other than pbkdf2-sha256
+				// needs an explicit bcrypt / scrypt / argon2 (or
+				// equivalent) HashedUsersFunc.
 				panic("basicauth: HashedUsers requires HashedUsersFunc unless every hash is pbkdf2-sha256 " +
 					"(use HashPasswordPBKDF2 + VerifyPassword, bcrypt, or argon2; plain SHA-256 is not credential-grade)")
 			}

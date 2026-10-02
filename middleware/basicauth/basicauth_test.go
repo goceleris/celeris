@@ -447,7 +447,8 @@ func FuzzBasicAuthHeader(f *testing.F) {
 // flow end-to-end. Production callers should use bcrypt/argon2.
 
 // sha256Verifier is a HashedUsersFunc using SHA-256, matching what
-// HashPassword produces. Constant-time per the contract.
+// sha256Hex produces: a test-only stand-in for a caller-supplied verifier.
+// Constant-time per the contract.
 func sha256Verifier(stored, pass string) bool {
 	want, err := hex.DecodeString(stored)
 	if err != nil || len(want) != sha256.Size {
