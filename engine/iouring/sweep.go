@@ -107,7 +107,10 @@ func (w *Worker) sweepNoteDeparture() {
 }
 
 // sweepRetract drops everything this worker has published into the
-// engine-wide gauges. Worker thread, at shutdown (celeris#657 R2).
+// engine-wide gauges. Worker thread, at the two places the sweep stops running
+// while the worker may still have residue published: shutdown (celeris#657 R2)
+// and the DRAINING→SUSPENDED park (a parked worker holds nothing, and sweep()
+// does not run again until it wakes, celeris#711).
 func (w *Worker) sweepRetract() {
 	if w.sweepPub == ([numResidual]uint64{}) {
 		return
@@ -145,8 +148,10 @@ func (w *Worker) sweep() {
 	if w.sweepDormant {
 		// Safe ahead of the retraction below for the reason the epoll half
 		// states: removeLiveConn is the one way out of liveConns and it
-		// lifts dormancy, and shutdown calls sweepRetract itself
-		// (celeris#657 R2, MINOR-d).
+		// lifts dormancy, so the retraction is reached at the worker's next
+		// sweep(); where there is none, shutdown (celeris#657 R2, MINOR-d)
+		// and the DRAINING→SUSPENDED park (celeris#711) call sweepRetract
+		// themselves.
 		return
 	}
 	if len(w.liveConns) == 0 {

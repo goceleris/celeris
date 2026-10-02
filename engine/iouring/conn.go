@@ -4,16 +4,21 @@ package iouring
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 
 	"github.com/goceleris/celeris/internal/conn"
+	"github.com/goceleris/celeris/internal/recvtheft"
 )
 
 // maxSendQueueBytes is the per-connection back-pressure limit for
-// H1/H2 connections. When pending send data exceeds this, the
+// H1 connections. When pending send data exceeds this, the
 // connection is closed to prevent unbounded memory growth while a
-// slow peer stalls with un-ACKed responses.
+// slow peer stalls with un-ACKed responses. It is held per request, not
+// per write (celeris#761): a request that finds more than this unsent is not
+// served (conn.H1State.WriteBacklogged), while a response, however large, is
+// staged whole.
 //
 // maxSendQueueBytesDetached is the corresponding limit once a
 // connection is detached (WebSocket / SSE). Detached middleware owns
@@ -21,8 +26,17 @@ import (
 // echo payloads larger than 4 MiB (Autobahn 9.1.6 sends 16 MiB).
 // 64 MiB matches the WS default ReadLimit.
 const (
-	maxSendQueueBytes         = 4 << 20  // 4 MiB (H1/H2)
+	maxSendQueueBytes         = 4 << 20  // 4 MiB (H1)
 	maxSendQueueBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+	// maxSendQueueBytesH2 is the limit for an HTTP/2 connection. Its DATA
+	// is already bounded by the flow-control windows the peer grants, and a
+	// peer that reads keeps up to a window of frames queued, or in a SEND
+	// in flight, as a matter of course (net/http's client grants 4 MiB per
+	// stream, browsers more per connection), so the H1 limit closed healthy
+	// HTTP/2 connections at the window's edge (celeris#761). 64 MiB, as for
+	// a detached connection, still bounds a peer that grants large windows
+	// and stops reading.
+	maxSendQueueBytesH2 = 64 << 20
 	// maxPendingInputBytes caps the async dispatch input buffer
 	// (cs.asyncInBuf) so a client pipelining requests faster than
 	// the dispatch goroutine drains them cannot balloon per-conn
@@ -30,15 +44,32 @@ const (
 	maxPendingInputBytes = 4 << 20
 )
 
-// sendCap returns the effective back-pressure limit for cs, accounting
-// for whether the connection is detached. Async-mode HTTP1 conns set
-// detachMu up front without being truly detached; they keep the H1/H2
-// limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
+// sendCap returns the per-write back-pressure limit for cs: a write is
+// refused when the bytes still queued before it are over it. An HTTP/2 conn
+// has maxSendQueueBytesH2 and a truly-detached one (WS/SSE)
+// maxSendQueueBytesDetached. An HTTP/1 conn has none: its writes are its
+// handlers' responses, and a limit per write cut a response off mid-body, a
+// large body or the chunks of a StreamWriter (celeris#761). Its limit,
+// maxSendQueueBytes, is held per request instead (overBacklogH1), before the
+// handler runs. Async-mode HTTP1 conns set detachMu up front without being
+// truly detached; they are HTTP/1 conns here.
 func (cs *connState) sendCap() int {
+	if cs.h2State != nil {
+		return maxSendQueueBytesH2
+	}
 	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
 		return maxSendQueueBytesDetached
 	}
-	return maxSendQueueBytes
+	return math.MaxInt
+}
+
+// overBacklogH1 is the HTTP/1 back-pressure limit (conn.H1State.WriteBacklogged,
+// celeris#761): whether the responses cs still has unsent, queued or in a
+// SEND in flight, are over maxSendQueueBytes, i.e. its client stopped
+// reading while it kept sending requests. The next request is then not
+// served, and the conn is closed once what is queued has gone out.
+func (cs *connState) overBacklogH1() bool {
+	return len(cs.writeBuf)+len(cs.sendBuf) > maxSendQueueBytes
 }
 
 // iovec mirrors Linux struct iovec (16 bytes on 64-bit platforms).
@@ -84,12 +115,14 @@ type connState struct {
 	detected       bool         // 1
 	sending        bool         // 1: true when a SEND SQE is in-flight
 	closing        bool         // 1: defers close until sends complete
+	writeRefused   bool         // 1: a write hook refused bytes on back-pressure; the conn is closed (celeris#761, makeWriteFn)
 	dirty          bool         // 1: true when data needs flushing
 	fixedFile      bool         // 1: true when fd is fixed file index
 	recvLinked     bool         // 1: RECV was linked to SEND (skip standalone prepareRecv)
 	needsRecv      bool         // 1: recv arm was dropped (SQ ring full); retry on next opportunity
 	recvIntoBody   bool         // 1: next recv CQE fills h1State.bodyBuf directly (skips ProcessH1 + cs.buf memcpy)
 	zcNotifPending bool         // 1: waiting for SEND_ZC notification CQE
+	h2GoAwaySent   bool         // 1: a graceful shutdown sent this H2 conn its GOAWAY (celeris#759)
 	// sendIsZC records how the send SQE currently in flight for this
 	// connection was ARMED: true for IORING_OP_SEND_ZC, false for a plain
 	// SEND / WRITEV / linked SEND. It is the provenance flag the error
@@ -255,6 +288,49 @@ type connState struct {
 	asyncCond   sync.Cond
 	asyncRun    bool
 	asyncClosed atomic.Bool
+	// asyncParked (guarded by asyncInMu) is set while the dispatch goroutine
+	// is in its park loop: waiting for input on asyncCond, or deciding at the
+	// boundary whether to exit. It holds no detachMu there. dispatchBusy reads
+	// it to tell a goroutine that may hold detachMu across a handler from one
+	// that cannot (celeris#704).
+	asyncParked bool
+	// closeOwed (guarded by asyncInMu) is set by closeConn when it finds
+	// detachMu held by this conn's RUNNING dispatch goroutine, i.e. held
+	// across a user handler, and leaves the close to that goroutine instead
+	// of parking the worker on the lock for the rest of the handler
+	// (celeris#704). asyncClosed is already set, so the goroutine exits at its
+	// next check, and the exit that finds closeOwed hands cs back through the
+	// detach queue, whose asyncClosed branch runs closeConn again, on the
+	// worker, with the lock free.
+	closeOwed bool
+	// relinkOwed (guarded by asyncInMu) is set by the dirty-list pass when it
+	// gives the conn up because its dispatch goroutine holds detachMu across
+	// a handler (celeris#704), and by a send completion held for the same
+	// reason (heldSends, celeris#750). The goroutine hands cs back through
+	// the detach queue at the top of its next loop, after the handler's own
+	// flush, and drainDetachQueue applies the held completions and puts it
+	// on the dirty list again.
+	relinkOwed bool
+	// heldSends (worker-thread only) are the ring SEND completions of this
+	// conn that arrived while its dispatch goroutine held detachMu across a
+	// handler, in arrival order (a SEND_ZC gives two). handleSend applies a
+	// completion under detachMu, and waiting for the lock parked the worker,
+	// and every connection of its ring, until the handler returned
+	// (celeris#750, a fifth celeris#704 site). A completion cannot be dropped:
+	// it is held, with relinkOwed set, and replayHeldSends applies it when the
+	// goroutine hands the conn back, or when the conn is closed, before
+	// anything else acts on the conn. Until then cs.sending (or
+	// zcNotifPending) stays set, so no other SEND starts and every raw write
+	// waits (celeris#751), and the dirty-list pass gives the conn up, which
+	// it would spin on otherwise (flushDirty). The kernel's side of each is
+	// done: kernelInflight was settled when it was dispatched.
+	heldSends []completionEntry
+	// closeErr (worker-thread only) is the error handleRecv's peer-FIN or
+	// recv-error branch owes a detached middleware (OnError) when it met a
+	// running handler holding detachMu. The branch used to deliver it under
+	// the lock before closing; it now leaves it to closeConn, which delivers
+	// it under the lock when the close actually runs (celeris#704).
+	closeErr error
 	// transplantPending (#383 reverse, async) is set by the dispatch
 	// goroutine when it reaches a clean park boundary while an io_uring→epoll
 	// drain is active: it marks itself for hand-off, sets asyncRun=false,
@@ -370,6 +446,13 @@ type connState struct {
 	// has repurposed. drainPendingRelease only releases a connState once
 	// this counter reaches zero (with a wall-clock backstop for kernel
 	// anomalies). Mirrors driverConn.inflightOps.
+	//
+	// recvArmSeq (validation builds only; zero-size in production, and not
+	// the last field, so it adds no padding) is the SQ ring sequence number
+	// of this conn's latest recv SQE: the close paths compare it with the
+	// kernel's SQ head to tell a recv the kernel has not consumed yet
+	// (celeris#715, Worker.recvUnsubmitted). Set by noteRecvPlaced.
+	recvArmSeq     recvtheft.ArmSeq
 	kernelInflight int32
 	// recvArmed is true while a recv SQE (single-shot or multishot) is
 	// kernel-held for this conn. Set by prepareRecv / flushSendLink's
@@ -471,12 +554,14 @@ func releaseConnState(cs *connState) {
 	cs.detected = false
 	cs.sending = false
 	cs.closing = false
+	cs.writeRefused = false
 	cs.dirty = false
 	cs.fixedFile = false
 	cs.recvLinked = false
 	cs.needsRecv = false
 	cs.recvIntoBody = false
 	cs.zcNotifPending = false
+	cs.h2GoAwaySent = false
 	cs.sendIsZC = false
 	cs.zcSentBytes = 0
 	cs.lastActivity = 0
@@ -501,6 +586,11 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = cs.asyncOutBuf[:0]
 	cs.asyncRun = false
 	cs.asyncClosed.Store(false)
+	cs.asyncParked = false
+	cs.closeOwed = false
+	cs.relinkOwed = false
+	cs.heldSends = cs.heldSends[:0]
+	cs.closeErr = nil
 	cs.transplantPending.Store(false)
 	cs.sweepKick = nil
 	cs.asyncPromoted.Store(false)
@@ -520,18 +610,77 @@ func releaseConnState(cs *connState) {
 	cs.sendBody = nil
 	// bodyRecvPin is cleared here, after every kernel-held op delivered its
 	// terminal CQE (releaseConnState is only called from drainPendingRelease
-	// once cs.kernelInflight drained — or its backstop fired), so the kernel
-	// can no longer be writing into the pinned bodyBuf array (#256
-	// body-buffer UAF guard).
+	// once cs.kernelInflight drained — or its backstop fired — and from the
+	// backstop's SEND_ZC hold once a SEND_ZC, which writes nothing, is all
+	// that is owed; releaseHeldConnState), so the kernel can no longer be
+	// writing into the pinned bodyBuf array (#256 body-buffer UAF guard).
 	cs.bodyRecvPin = nil
 	cs.detectAccum = cs.detectAccum[:0]
 	// kernelInflight is zero on every normal release (drainPendingRelease
-	// gates on it); reset defensively for the wall-clock-backstop path,
-	// where the worker gave up waiting on a CQE the kernel never produced.
+	// gates on it); reset for the wall-clock-backstop path, where the worker
+	// gave up waiting on a CQE the kernel never produced, and for the
+	// backstop's SEND_ZC hold, which keeps the send buffer's array and lets
+	// the connState go with the SEND_ZC still owed (releaseHeldConnState;
+	// the identity's count, not this one, waits for its notification).
 	cs.kernelInflight = 0
 	cs.recvArmed = false
 	cs.recvOutstanding = 0
 	cs.fd = 0
 	cs.liveIdx = -1
 	connStatePool.Put(cs)
+}
+
+// endDispatch marks cs's dispatch goroutine as gone and reports whether it
+// owes the worker a hand-back: a close or a relink left to it (closeOwed,
+// relinkOwed; celeris#704). The goroutine calls it on every exit path,
+// holding cs.asyncInMu. A path that enqueues cs on its way out ignores the
+// result: that enqueue is the hand-back, and drainDetachQueue settles both
+// debts (the asyncClosed branch runs the close; any other entry puts the conn
+// back on the dirty list). The paths that exit WITHOUT enqueuing must enqueue
+// when it reports true, or the close or the recv arm it stands for is lost.
+func (cs *connState) endDispatch() (owed bool) {
+	cs.asyncRun = false
+	cs.asyncParked = false
+	owed = cs.closeOwed || cs.relinkOwed
+	cs.closeOwed = false
+	cs.relinkOwed = false
+	return owed
+}
+
+// dispatchBusy reports whether cs's dispatch goroutine may be holding
+// cs.detachMu across a user handler: it is alive (asyncRun), not in its park
+// loop (asyncParked), and has not released the lock for good at a Detach
+// (asyncDetachUnlocked). All three are read under asyncInMu. Worker thread.
+//
+// It is how a worker-thread site that found cs.detachMu held (TryLock failed)
+// tells the holders apart (celeris#704, the io_uring twin of celeris#669). The
+// dispatch goroutine holds the lock across ProcessH1, i.e. for as long as the
+// handler runs, and it is running whenever it does. Every other holder, a
+// detached conn's guarded writeFn, holds it for one write. So a site that
+// finds the lock held while this reports true must not wait, and one that
+// finds it held while this reports false may wait as it always has: that wait
+// is bounded.
+//
+// After Detach the goroutine never takes the lock across ProcessH1 again, so
+// it is excluded even while it runs: a handler may keep streaming after
+// Detach, and a close left to it would wait for that handler, which in turn
+// waits for the close's OnDetachClose to learn it should stop.
+//
+// If owe is non-nil and the result is true, *owe is set in the same critical
+// section: the goroutine reads it under asyncInMu at the top of its next loop
+// or at its exit, so it cannot miss it. A running goroutine is not
+// necessarily the holder, and every caller acts on a true only by leaving
+// work to the goroutine, which hands it back; a false positive costs a
+// hand-back, never a lost close or flush.
+func dispatchBusy(cs *connState, owe *bool) bool {
+	if cs.asyncCond.L == nil {
+		return false // no async machinery: sync mode, no dispatch goroutine
+	}
+	cs.asyncInMu.Lock()
+	busy := cs.asyncRun && !cs.asyncParked && !cs.asyncDetachUnlocked
+	if busy && owe != nil {
+		*owe = true
+	}
+	cs.asyncInMu.Unlock()
+	return busy
 }

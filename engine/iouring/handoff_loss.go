@@ -2,7 +2,11 @@
 
 package iouring
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/goceleris/celeris/internal/recvtheft"
+)
 
 // handoffLossStats are the celeris#657 witnesses: the request loss a
 // reverse (io_uring→epoll) hand-off can cause, counted where it happens.
@@ -33,8 +37,13 @@ import "sync/atomic"
 //     the socket lives on under the hijacker's net.Conn, so a recv that
 //     completes with data before its cancel lands has read bytes from a
 //     connection its client is still using. After a close, a recv that
-//     had not reached the kernel yet resolves the fd NUMBER when it does,
-//     and a new connection may hold that number by then.
+//     had not been issued yet resolved the fd NUMBER when it was, and a
+//     new connection could hold that number by then (celeris#715). Both
+//     are closed off by the fd-lifetime rule on those paths
+//     (celeris#685): hijackConn submits its cancels before handing the
+//     socket over, and a close keeps the number while an op is owed.
+//     What Closed still counts is a closed conn's recv reading its OWN
+//     client's late bytes, which that client sees end with the close.
 //
 //     A stale CQE whose (fd, generation) equals the fd's current
 //     occupant's (a generation collision, which needs the process-wide
@@ -79,17 +88,48 @@ import "sync/atomic"
 //     marks the queued claim detachClosed first, and hijack is refused).
 //     Before the checks existed one identity was measured moving twice in
 //     167 runs. Must stay 0.
-//   - claimDeferred: tryTransplant finding a conn whose dispatch goroutine
-//     has claimed its own hand-off (transplantPending) and leaving it to that
-//     claim. Counted before tryTransplant's other gates, so it is ordering,
-//     not a fault: it fires whenever a completion of the conn (its own
-//     response SEND, typically) lands between the goroutine's park and the
-//     drain of its claim. A rate.
+//   - claimDeferred: a worker-side hand-off attempt (tryTransplant, or
+//     rerunHandOff for a reap's retry or landing, celeris#758) finding a
+//     conn whose dispatch goroutine has claimed its own hand-off
+//     (transplantPending) and leaving it to that claim. Counted before the
+//     site's other gates, so it is ordering, not a fault: it fires whenever
+//     a completion of the conn (its own response SEND, typically) or a reap
+//     retry lands between the goroutine's park and the drain of its claim. A
+//     rate.
 //
 // All are direct atomic adds: they fire on the stale-CQE, drain and hand-off
 // paths only, never on the per-request path while no drain is set, and like
 // the celeris#586 witnesses they are per-event invariants that a
 // per-iteration batch could lose at loop exit.
+//
+// The same rule on the close paths (celeris#685; see the close-path section
+// of fd_lifetime.go) keeps two more:
+//
+//   - closeFDDeferred: closes whose descriptor was left open because the
+//     kernel still owed an op on it, and closed at that op's terminal CQE. A
+//     rate, and on an async-handler engine with Connection: close traffic
+//     close to one per request, so it is the one counter here that is
+//     batched per loop iteration (Worker.closeFDDeferredBatch).
+//   - closeFDForced: such descriptors the pendingRelease backstop closed
+//     with an op still owed. Must stay 0.
+//
+// And what a SEND_ZC's send buffer is kept for (celeris#812; see
+// zc_send_buffer.go), three more and two gauges:
+//
+//   - zcNotifHeld: holds the pendingRelease backstop started past its 5 s
+//     because a SEND_ZC was still owed on the send buffer, each until the
+//     notification. A rate: a connection closed on a peer that stopped
+//     reading mid-send.
+//   - zcHeldNow, zcHeldBytes: GAUGES, the send buffers held right now and
+//     their capacity in bytes, summed over the workers: each adds at a hold
+//     and takes off at its end, and a worker that shuts down takes off what
+//     it still held (retractZCHolds).
+//   - zcNotifForced: closed identities whose accounting was dropped with a
+//     SEND_ZC still owed, i.e. a send buffer given up to the pool or the GC
+//     while the kernel may still send from it. Must stay 0. The hold is
+//     decided on the identity, so only a change that breaks it can move this.
+//   - zcBufRetained: send buffers worker shutdown kept for the life of the
+//     process, because a SEND_ZC may still read them when the ring closes.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -103,6 +143,45 @@ type handoffLossStats struct {
 	claimDeferred             atomic.Uint64
 	reapFailed                atomic.Uint64
 	reapUnsupported           atomic.Uint64
+	closeFDDeferred           atomic.Uint64
+	closeFDForced             atomic.Uint64
+	zcNotifHeld               atomic.Uint64
+	zcNotifForced             atomic.Uint64
+	zcBufRetained             atomic.Uint64
+	zcHeldNow                 atomic.Int64
+	zcHeldBytes               atomic.Int64
+}
+
+func (s *handoffLossStats) noteCloseFDForced() {
+	if s != nil {
+		s.closeFDForced.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteCloseZCNotifHeld() {
+	if s != nil {
+		s.zcNotifHeld.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteCloseZCNotifForced() {
+	if s != nil {
+		s.zcNotifForced.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteShutdownZCBufRetained(n uint64) {
+	if s != nil {
+		s.zcBufRetained.Add(n)
+	}
+}
+
+// addZCHeld moves the held-now gauges by n buffers of bytes in all.
+func (s *handoffLossStats) addZCHeld(n, bytes int64) {
+	if s != nil && (n != 0 || bytes != 0) {
+		s.zcHeldNow.Add(n)
+		s.zcHeldBytes.Add(bytes)
+	}
 }
 
 // The fd-lifetime counters are nil-safe: a hand-built test Worker has none.
@@ -174,6 +253,29 @@ func (w *Worker) noteStaleRecvData(ud uint64) {
 	default:
 		s.staleRecvDataClosed.Add(1)
 	}
+}
+
+// noteStaleRecvExemplar hands an armed recvtheft trial what a stale recv
+// with data read: its identity, its result and the first bytes of the closed
+// conn's cs.buf, where every single-shot recv except the direct-body one
+// lands (celeris#715). Validation builds only (the caller is guarded by
+// recvtheft.Enabled). Must run before noteStaleTerminalOp retires the
+// closedOps entry. Worker thread only.
+func (w *Worker) noteStaleRecvExemplar(c *completionEntry, fd int, ud uint64) {
+	var head []byte
+	if e := w.closedOps[connOpKey(ud)]; e != nil && w.bufRing == nil {
+		// The first conn still registered: a SEND_ZC hold may have released
+		// one and left its slot nil (releaseHeldConnState).
+		for _, cs := range e.conns {
+			if cs != nil {
+				buf := cs.buf
+				n := min(int(c.Res), len(buf), 64)
+				head = buf[:n]
+				break
+			}
+		}
+	}
+	recvtheft.NoteStaleRecvData(w.id, fd, decodeGen(ud), c.Res, head)
 }
 
 // noteHandoffInFlight counts a hand-off that detached cs while the kernel

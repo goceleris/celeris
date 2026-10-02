@@ -198,8 +198,11 @@ jobs:
       # added (the fourth list: a connection that joins a cycle past the
       # cursor, the bound on what the rule that catches it may cost, the
       # classifier's lock, a connection that has sent no byte, and the
-      # retraction of the residual gauges). So all forty run again here by
-      # name, with the PASS-count interlock the `iouring` job uses
+      # retraction of the residual gauges), plus the celeris#711 pair (a
+      # worker that parks holding nothing retracts what it published, whether
+      # its last connection left after sweep() or before it). So all
+      # forty-two run again here by name, with the PASS-count interlock the
+      # `iouring` job uses
       # (celeris#664): -v, CELERIS_REQUIRE_IOURING_WORKERS=1 to turn every
       # environment skip into a failure, and an exact tally.
       #
@@ -238,7 +241,8 @@ jobs:
           pr2='TestTransplantNeverHandsOffArmedRecv|TestTransplantReapMissIsRetried|TestHoldReleasedWhenDrainStops|TestHoldRescuedByCheckTimeouts|TestOneOwnerPerHandoff|TestNoDrainSQESequenceIsUnchanged|TestHandoffHasNothingInFlight|TestStaleRecvDataCounted|TestHeldRecvIsReArmedWhenTheHandOffDoesNotHappen|TestWorkerParksWithNothingPending|TestTransplantReapFailureIsNotRetried|TestNoReapWithoutAsyncCancelFlags|TestReapSuppressedAfterFailedHandOff|TestReapedRecvLeavesNoLinkOrBuffer|TestAsyncCancelProbeClassifies|TestAsyncCancelProbeOnThisKernel|TestWorkersCarryTheAsyncCancelProbe|TestReapOnTheRunningKernel'
           pr3='TestWorkerAskWakesTheRing|TestQuiesceMovesAnIdleConn|TestSweepDoesNotSpinWithoutCancelFlags|TestSweepSkipsAConnWithWorkAlreadyOwed|TestSweepDoesNotReClaimAnAsyncHandoff|TestSweepLeavesADetachedConnAlone'
           pr3r2='TestSweepCannotGoDormantWithAnUnexaminedArrival|TestSweepCostIsBoundedUnderContinuousArrivals|TestSweepClassifiesUnderTheLockTheEngineRequires|TestSweepGoesDormantOnAConnThatHasSentNothing|TestResidualGaugeRetractsWhatTheWorkerNoLongerHolds'
-          names="${pr1}|${pr2}|${pr3}|${pr3r2}"
+          c711='TestParkedWorkerRetractsResidueOfAPostSweepClose|TestParkedWorkerRetractsResidueOfAPreSweepClose'
+          names="${pr1}|${pr2}|${pr3}|${pr3r2}|${c711}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./engine/iouring/ 2>&1 | tee /tmp/witness657.log
@@ -264,12 +268,14 @@ jobs:
       # never sends another byte. A rename or an environment skip would take
       # them out of CI with no red.
       #
-      # Seventeen names, in two lists: r1 is the eight this PR first shipped,
+      # Nineteen names, in three lists: r1 is the eight this PR first shipped,
       # r2 the nine the review added (sweep_r2_test.go -- the cycle rule and
       # its cost bound, the classifier's lock under -race, the ask's
       # permanent-class pre-check, the release belt over the batch being
       # drained, the pending count, the two gauge retractions and the
-      # connection that has sent no byte). All seventeen run here by name with
+      # connection that has sent no byte), and c711 the celeris#711 pair (a
+      # loop that parks holding nothing retracts what it published; each
+      # starts a real two-loop engine). All nineteen run here by name with
       # the interlock the step above uses: -v, exact top-level RUN and PASS
       # counts, and no `--- SKIP` line anywhere. Two further censuses make the engine cells impossible to
       # lose quietly. Both build their engine with Resources.Workers=2, so
@@ -291,7 +297,8 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           r1='TestSweepMovesIdleConnsWithoutTraffic|TestSweepMovesIdleAsyncConnsWithoutTraffic|TestSweepStopsWithTheDrain|TestSweepGoesDormantOnPermanentResidue|TestSweepBudgetCoversEveryConnAcrossPasses|TestSweepCadenceBacksOffAndResets|TestAskNeverOutlivesConnState|TestSweepDoesNotBlockOnADetachedConnsLock'
           r2='TestSweepCannotGoDormantWithAnUnexaminedArrival|TestSweepCostIsBoundedUnderContinuousArrivals|TestSweepClassifiesUnderTheLockTheEngineRequires|TestParkAskSkipsWhatTheHandoffCannotAccept|TestDropAskWithdrawsFromTheBatchBeingDrained|TestAskPendingCountsTheQueue|TestResidualGaugeRetractsWhatTheLoopNoLongerHolds|TestResidualGaugeRetractsAtShutdown|TestSweepGoesDormantOnAConnThatHasSentNothing'
-          names="${r1}|${r2}"
+          c711='TestParkedLoopRetractsResidueOfAPostSweepClose|TestParkedLoopRetractsResidueOfAPreSweepClose'
+          names="${r1}|${r2}|${c711}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./engine/epoll/ 2>&1 | tee /tmp/sweep657.log
@@ -496,16 +503,34 @@ jobs:
       # engine, no io_uring ring -- so unlike the `adaptive` and `iouring` jobs
       # this needs nothing raised and has no environment skip to forbid.
       #
+      # celeris#706: the step also runs the tests of the server-start helpers
+      # (`^TestStartNativeServer`, `^TestWaitForReady`), which the backpressure
+      # tests use, in ./middleware/websocket and in ./middleware/static, which
+      # has its own copy of waitForReady: a Start that fails must fail the
+      # helper at once with Start's error. They start no engine (the engine
+      # type is one no factory knows), so they too have no environment skip.
+      #
+      # It first compiles the package's tests under the celeris_closeprobe
+      # tag, which no other step builds: a helper of that file shared a name
+      # with one celeris#671 added, and the tagged build stayed broken
+      # unnoticed.
+      #
       # `-run` is a regex over test names, so a rename would quietly select
       # nothing and go test would still exit 0 ("no tests to run"). The tally
-      # below is the interlock, as in the `iouring` job: exactly these six
-      # regression tests must report PASS at the top level -- the two
+      # below is the interlock, as in the `iouring` job: exactly these
+      # fourteen PASS lines must be reported at the top level -- the two
       # celeris#667 orderings, the celeris#672 stale pause, the pausedMu
       # panic release, SetPauser's ordering with the worker (reported only
-      # under -race, which this step runs), and the WakeFD lock order
-      # (celeris#666) -- and so must each of the ten subtests of the stale
-      # pause, the panic release and the lock order, so a capacity, a callback
-      # site or an interleaving dropped from a sweep turns the step red too.
+      # under -race, which this step runs), the WakeFD lock order
+      # (celeris#666), the two celeris#705 late-spill orders, the close that
+      # must not overtake chunks appended before it and the spilled chunk
+      # that must request the pause (both from the celeris#705 review), the
+      # re-check's spill guard (celeris#716), and the celeris#706 start-helper
+      # tests, TestWaitForReadyFailsFastOnStartError once per package -- and
+      # so must each of the fifteen subtests of the stale pause, the panic
+      # release, the lock order, the late spill and the close, so a capacity,
+      # a callback site or an interleaving dropped from a sweep turns the step
+      # red too.
       # A SKIP cannot satisfy it, because a skipped test prints
       # `--- SKIP`, never `--- PASS`. PASS lines carry the elapsed time after
       # the name, so the pattern ends at ` (`, never at the name.
@@ -522,18 +547,21 @@ jobs:
           WS484_BURST_FRAMES: "1000"
         run: |
           set -o pipefail
+          go vet -tags celeris_closeprobe ./middleware/websocket/
           go test -race -count=1 -timeout=300s -v \
-            -run '^(TestBackpressure|TestChanReader)' \
-            ./middleware/websocket/... 2>&1 | tee /tmp/ws667.log
-          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu'
-          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)'
-          want=6
-          wantsub=10
+            -run '^(TestBackpressure|TestChanReader|TestStartNativeServer|TestWaitForReady)' \
+            ./middleware/websocket/... ./middleware/static/ 2>&1 | tee /tmp/ws667.log
+          names='TestChanReaderLostResumeConverges|TestChanReaderParkedResumeConverges|TestChanReaderStalePauseConverges|TestChanReaderCallbackPanicReleasesPausedMu|TestChanReaderSetPauserOrderedWithAppend|TestChanReaderWakeFDWritersNeverWaitOnPausedMu|TestChanReaderLateSpillReachesParkedRead|TestChanReaderSpillPublishedAfterDrain|TestChanReaderCloseKeepsChunksAppendedBeforeIt|TestChanReaderPauseRecheckHoldsWhileSpilled|TestChanReaderSpillRequestsPauseBelowHighWater|TestStartNativeServerFailsFastOnStartError|TestWaitForReadyFailsFastOnStartError'
+          subs='TestChanReaderStalePauseConverges/cap(1|8|16|256)|TestChanReaderCallbackPanicReleasesPausedMu/(pause-in-requestPause|resume-in-Read|resume-in-stale-recheck)|TestChanReaderWakeFDWritersNeverWaitOnPausedMu/(Close-while-pause-holds-pausedMu|Set-while-resume-holds-pausedMu|Close-queued-behind-in-flight-Signal)|TestChanReaderSpillPublishedAfterDrain/(read-after-publication|closed-before-read|read-waiting-in-window)|TestChanReaderCloseKeepsChunksAppendedBeforeIt/(retried-into-channel|spilled-behind-full-channel)'
+          # 13 names; TestWaitForReadyFailsFastOnStartError passes once in
+          # each package.
+          want=14
+          wantsub=15
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/ws667.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${subs}) \(" /tmp/ws667.log || true)
-          echo "celeris#667/#672 regression tests: want $want, passed $passed; subtests want $wantsub, passed $subpassed"
+          echo "websocket/static regression tests (celeris#667/#672/#705/#706): want $want, passed $passed; subtests want $wantsub, passed $subpassed"
           if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ]; then
-            echo "expected exactly $want celeris#667/#672 regression tests and $wantsub of their subtests to PASS"
+            echo "expected exactly $want PASS lines of the websocket and static regression tests and $wantsub of their subtests"
             echo "-- was one renamed or removed, did a sweep lose a case, or did one skip or fail?"
             exit 1
           fi
@@ -576,6 +604,34 @@ jobs:
           echo "celeris#714 tests: top-level PASS $top (want 4), arm PASS $arms (want 20), io_uring arm PASS $uring (want 8), SKIP lines $skipped, go test runs failed $failed (want 0)"
           if [ "$top" -ne 4 ] || [ "$arms" -ne 20 ] || [ "$uring" -ne 8 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
             echo "expected all four tests and all 20 arms (8 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
+      # celeris#733: the request strings a hijacking handler keeps must not
+      # read another connection's bytes. The root race step above runs
+      # without -v, where the io_uring arm of TestHijackKeepsRequestViews
+      # drops out, and the multishot test skips, without a word when the
+      # probe finds no ring or no multishot receive. So both run here by
+      # name with CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact tally: the
+      # two top-level tests and the four arms (std, epoll, epoll-async,
+      # io_uring) must PASS, with no SKIP line, and go test must exit 0.
+      - name: celeris#733 hijacked request strings (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          tests='TestHijackKeepsRequestViews|TestHijackCopiesRequestValuesUnderMultishotRecv'
+          go test -race -count=1 -timeout=300s -v -run "^(${tests})\$" . 2>&1 | tee /tmp/c733.log || failed=1
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c733.log || true)
+          arms=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/" /tmp/c733.log || true)
+          uring=$(grep -cE "^    --- PASS: TestHijackKeepsRequestViews/io_uring" /tmp/c733.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c733.log || true)
+          echo "celeris#733 tests: top-level PASS $top (want 2), arm PASS $arms (want 4), io_uring arm PASS $uring (want 1), SKIP lines $skipped, go test failed $failed (want 0)"
+          if [ "$top" -ne 2 ] || [ "$arms" -ne 4 ] || [ "$uring" -ne 1 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected both tests and all four arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
 
@@ -824,7 +880,9 @@ jobs:
       # has shut down, two an SQE prepared by a descriptor number the
       # caller closes before the submit, three a driver cancel that
       # outlived its conn (#707), and three a register the worker applies
-      # after the number was closed and taken by an accept.
+      # after the number was closed and taken by an accept. Two more (n735)
+      # pin a driver close that lingers: off the worker, and waited for at
+      # shutdown (celeris#735).
       # TestDriverHTTPZeroOverhead is where the leak was first seen: 2 of 7
       # full-package runs failed on #674's branch (#691).
       #
@@ -838,7 +896,8 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           old='TestDriverRegisterUnregister|TestDriverHTTPZeroOverhead|TestDriverWriteSerialization|TestDriverCancelOnUnregister|TestIouringRegisterConnFDCollision|TestIouringShutdownFiresDriverOnClose|TestDriverUnknownFDReturnsErr|TestShutdownDriversRetainsConnsWithOpsInFlight'
           new='TestDriverUnregisterThenCloseAtOnce|TestDriverUnregisterThenCloseWhileWorkerBusy|TestDriverUnregisterWaitForOnCloseThenClose|TestDriverUnregisterThenCloseNumberReused|TestDriverSendFailureThenUnregisterThenClose|TestDriverRefusedRegisterThenNumberReused|TestDriverCloseBeforeUnregisterSparesReusedNumber|TestDriverUnregisterCyclesReleaseDescriptors|TestDriverShutdownReleasesDescriptors|TestDriverRegisterAfterShutdownIsRefused|TestDriverRegisterRacingShutdownReleasesEverySocket|TestDriverRecvRearmBeforeSubmitSparesReusedNumber|TestDriverSendBeforeSubmitSparesReusedNumber|TestDriverFailureCancelCompletesBeforeRelease|TestDriverFailureCloseCompletionSparesConnOnReusedNumber|TestDriverStrayCloseCompletionSparesConn|TestDriverUnregisterWithSendInFlightThenNumberTakenByHTTP|TestDriverUnregisterQueuedAheadOfRegisterThenNumberTakenByHTTP|TestDriverRefusedRegisterWaitsForItsSend'
-          names="${old}|${new}"
+          n735='TestDriverLingeringCloseDoesNotStallTheWorker|TestDriverShutdownWaitsForAHandedOffClose'
+          names="${old}|${new}|${n735}"
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           go test -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
@@ -888,7 +947,8 @@ jobs:
       #   2. CELERIS_IOURING_SEND_ZC=off: every process PASS with every ZC
       #      witness at 0 (the witnesses track SEND_ZC, not traffic), no race;
       #   3. the MUTANT (.github/scripts/mutant-587-unlock-zc-first-cqe.py
-      #      deletes the detachMu acquire in handleSend's CQE_F_MORE branch):
+      #      releases detachMu before the writes of handleSend's CQE_F_MORE
+      #      branch):
       #      EVERY process FAIL, and every process with its own
       #      "WARNING: DATA RACE" report and "race detected during execution
       #      of test" line. A process that fails for any other reason does
@@ -955,6 +1015,240 @@ jobs:
           tally zcoff pass || ok=1
           tally mutant kill || ok=1
           exit "$ok"
+
+  recv-theft:
+    name: io_uring close paths never release a descriptor an op can still resolve (celeris#685, ${{ matrix.os }})
+    # Both arches: the theft was measured on both (celeris#715).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      # The celeris#715 / celeris#685 trials (-tags=validation only; the
+      # holds are internal/recvtheft). Each parks the worker that closed a
+      # connection A with a recv still able to resolve A's descriptor number
+      # (TestRecvTheft715ArmA: a recv SQE not yet submitted;
+      # TestRecvTheft685Linked: a recv linked behind a SEND, not yet
+      # issued), lets the sibling worker accept a fresh connection B, and
+      # asserts that B is answered and that no stale recv read B's bytes.
+      # On a tree that frees the number at the close, the sibling is given
+      # it and the old recv reads B's request: both fail in every trial.
+      # Their *Hole twins open a free number under A's once the closer is
+      # parked: the sibling's accept of the hole tests nothing and is
+      # skipped, so they must fail the same way (a verdict that counted it
+      # passed a tree without the fix). TestRecvTheft715Control (the ring
+      # submitted before the close) and TestRecvTheft715ArmC (celeris#715
+      # hypothesis (c)) must pass either way.
+      # The three TestRecvTheft685Hijack* arms hold the worker right after a
+      # Hijack and send the hijacker's first bytes meanwhile: with multishot
+      # recv (owed across its request) on a ring without DEFER_TASKRUN, the
+      # recv reads them unless hijackConn submits its cancel first (Coop);
+      # the DEFER_TASKRUN and single-shot arms pass either way.
+      #
+      # The trials need TWO io_uring workers (12 MiB of RLIMIT_MEMLOCK each;
+      # the runner defaults to 8 MiB), so memlock is raised as in the
+      # `iouring` job, and CELERIS_REQUIRE_IOURING_WORKERS=1 turns a missing
+      # sibling into a failure. -v, -count=5, and a tally that requires
+      # every run of every test to PASS, with no FAIL and no SKIP line: a
+      # renamed test selects nothing and go test would still exit 0.
+      - name: celeris#685 recv-theft trials (two workers, skipping forbidden)
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_RECV_THEFT_715: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestRecvTheft715ArmA|TestRecvTheft715ArmAHole|TestRecvTheft715Control|TestRecvTheft715ArmC|TestRecvTheft685Linked|TestRecvTheft685LinkedHole|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer|TestRecvTheft685HijackMultishotCoop'
+          runs=5
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/recvtheft685.log || true
+          grep -E 'RECVTHEFT(715|685) .*result' /tmp/recvtheft685.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/recvtheft685.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/recvtheft685.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/recvtheft685.log || true)
+          for n in ${names//|/ }; do
+            echo "$n: PASS $(grep -cE "^--- PASS: $n \(" /tmp/recvtheft685.log || true) FAIL $(grep -cE "^--- FAIL: $n \(" /tmp/recvtheft685.log || true)"
+          done
+          echo "celeris#685 recv-theft trials: want $want PASS, passed $passed, FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want trial runs to PASS with no FAIL or SKIP line -- did a close path"
+            echo "release a descriptor number a recv could still resolve, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # celeris#798: the rule counts only the ops that name the descriptor. A
+      # SEND_ZC's notification names none, yet a peer that stops reading holds
+      # it for as long as the socket is open. So it must not keep a closed
+      # connection's descriptor (the release backstop forced it after 5 s and
+      # counted CloseFDForced), nor stall worker shutdown's drain, while the
+      # connState, whose send buffer the notification guards, still waits for
+      # it. The unit job runs these two tests in its package step, on x86 only;
+      # here they run on both arches, by name, at the runner's own 8 MiB
+      # memlock (the pages SEND_ZC pins count against it), with a tally: every
+      # run of each of the five cases must PASS, with no FAIL and no SKIP line.
+      # A SKIP would mean the runner's kernel gave the engine no working
+      # SEND_ZC, so nothing was tested.
+      - name: celeris#798 a SEND_ZC notification holds no descriptor (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestCloseReleasesDescriptorWithOnlyAZCNotificationOwed|TestShutdownDoesNotWaitForAZCNotification'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 5 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/zc798.log || true
+          grep -E 'celeris798 ' /tmp/zc798.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc798.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc798.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/zc798.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/zc798.log || true)
+          echo "celeris#798 SEND_ZC tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did a"
+            echo "SEND_ZC notification hold a descriptor or stall shutdown, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # celeris#812: the release backstop gave up a closed connection 5 s after
+      # the close whatever it still owed, to connStatePool with its send buffer.
+      # With a SEND_ZC's notification owed, the kernel was still sending the
+      # unsent tail from that array to a peer that had stopped reading, and the
+      # array's next owner overwrote it: the peer got another connection's
+      # bytes. The backstop now holds such a send buffer until the notification,
+      # off the release walk, keeping the array alone, in gauges, and with no
+      # new SEND_ZC armed while a worker holds 16 MiB; worker shutdown keeps the
+      # buffers the ring closes on. Both arches, by name, at the runner's own
+      # 8 MiB memlock (the pages SEND_ZC pins count against it), -race, three
+      # runs, with a tally: every run of each of the ten tests and their
+      # twenty-four cases must PASS, with no FAIL and no SKIP line. A SKIP
+      # would mean the runner gave the engine no working SEND_ZC.
+      - name: celeris#812 a SEND_ZC's send buffer outlives the release backstop (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestBackstopHoldsASendBufferAZCNotificationStillReads|TestBackstopCountsItsZCHolds|TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline|TestClosedOpsCountsTheZCSendApart|TestDroppingAnIdentityWithAZCOwedIsCounted|TestShutdownRetainsSendBuffersAZCMayStillRead|TestZCHoldIsOffTheReleaseWalk|TestZCHoldKeepsOnlyTheSendBuffer|TestZCHoldCoversACollidingSibling|TestSendZCStopsWhileHeldBuffersReachTheCap'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 24 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
+          grep -E 'celeris812 ' /tmp/zc812.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc812.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc812.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/zc812.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/zc812.log || true)
+          echo "celeris#812 tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did the backstop"
+            echo "give up a send buffer a SEND_ZC still reads, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # Its detector control. .github/scripts/mutant-812-backstop-releases-zc.py
+      # disables the hold, so the backstop releases the connState with its send
+      # buffer as before the fix. Every run of each of the four wire cases must
+      # then report the release (held_past_backstop=false) and bytes on the wire
+      # that were not sent (corrupt_bytes above 0), and FAIL. A runner whose
+      # kernel copied the send before the release would let the wire test pass
+      # with or without the fix; this is what shows it does not. The mutation is
+      # undone before the step ends.
+      - name: celeris#812 detector control (the hold removed; every run of the four wire cases must see foreign bytes)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          python3 .github/scripts/mutant-812-backstop-releases-zc.py
+          runs=3
+          log=/tmp/zc812-mutant.log
+          go test -race -count="$runs" -timeout=300s -v -run '^TestBackstopHoldsASendBufferAZCNotificationStillReads$' \
+            ./engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- engine/iouring/worker.go
+          bad=0
+          for c in notif-only recv-and-notif send-done-after-close detached-notif-only; do
+            lines=$(grep -cE "celeris812 backstop case=$c " "$log" || true)
+            det=$(grep -E "celeris812 backstop case=$c " "$log" | grep -cE ' held_past_backstop=false .* corrupt_bytes=[1-9]' || true)
+            f=$(grep -cE "^    --- FAIL: TestBackstopHoldsASendBufferAZCNotificationStillReads/$c \(" "$log" || true)
+            echo "mutant, case $c: result lines $lines, detected $det, FAIL $f (want $runs, $runs, $runs)"
+            if [ "$lines" -ne "$runs" ] || [ "$det" -ne "$runs" ] || [ "$f" -ne "$runs" ]; then bad=1; fi
+          done
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
+          if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
+          exit "$bad"
+      # The detector control. .github/scripts/mutant-685-release-owed-fd.py
+      # makes fdOwed report false, which takes the fd-lifetime rule off the
+      # close paths, Hijack and shutdown at once. Against that tree every run
+      # of the five trials that judge the rule must DETECT the theft, read
+      # from its result line, not from its --- line: a FAIL for any other
+      # reason (INCONCLUSIVE, a setup error, a race report) is not a
+      # detection. The close-path trials (ArmA, ArmAHole, Linked, LinkedHole)
+      # must report hit=true, reused=true and stolen=true: the sibling was
+      # given A's number and A's stale recv read B's request. The hijack
+      # trial (MultishotCoop) must report op_owed=+1 and hijacker_read=false.
+      # The trials that pass on any tree must still PASS. No trial judges the
+      # shutdown half of the rule (see the script). The mutation is undone
+      # before the step ends.
+      - name: celeris#685 detector control (the rule removed; every run of the five judging trials must detect the theft)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_RECV_THEFT_715: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          python3 .github/scripts/mutant-685-release-owed-fd.py
+          others='TestRecvTheft715Control|TestRecvTheft685HijackSingleShot|TestRecvTheft685HijackMultishotDefer'
+          runs=3
+          log=/tmp/recvtheft685-mutant.log
+          go test -tags=validation -race -count="$runs" -timeout=600s -v \
+            -run "^(TestRecvTheft715ArmA|TestRecvTheft715ArmAHole|TestRecvTheft685Linked|TestRecvTheft685LinkedHole|TestRecvTheft685HijackMultishotCoop|${others})\$" \
+            ./engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- engine/iouring/fd_lifetime.go
+          grep -E 'RECVTHEFT(715|685) .*result' "$log" || true
+          bad=0
+          # judged <test> <its result line> <the detection that line must report>
+          judged() {
+            local n=$1 line=$2 want=$3 lines det p
+            lines=$(grep -cE "$line" "$log" || true)
+            det=$(grep -E "$line" "$log" | grep -cE "$want" || true)
+            p=$(grep -cE "^--- PASS: $n \(" "$log" || true)
+            echo "mutant, judged $n: result lines $lines, detected $det, PASS $p (want $runs, $runs, 0)"
+            if [ "$lines" -ne "$runs" ] || [ "$det" -ne "$runs" ] || [ "$p" -ne 0 ]; then bad=1; fi
+          }
+          stolen=' hit=true .* reused=true .* stolen=true '
+          judged TestRecvTheft715ArmA 'RECVTHEFT715 arm=A result ' "$stolen"
+          judged TestRecvTheft715ArmAHole 'RECVTHEFT715 arm=A-hole result ' "$stolen"
+          judged TestRecvTheft685Linked 'RECVTHEFT685 linked result ' "$stolen"
+          judged TestRecvTheft685LinkedHole 'RECVTHEFT685 linked-hole result ' "$stolen"
+          judged TestRecvTheft685HijackMultishotCoop 'RECVTHEFT685 hijack result tier=2 ' ' op_owed=\+1 .* hijacker_read=false '
+          for n in ${others//|/ }; do
+            p=$(grep -cE "^--- PASS: $n \(" "$log" || true)
+            f=$(grep -cE "^--- FAIL: $n \(" "$log" || true)
+            echo "mutant, control $n: PASS $p FAIL $f (want PASS $runs)"
+            if [ "$p" -ne "$runs" ] || [ "$f" -ne 0 ]; then bad=1; fi
+          done
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
+          if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
+          exit "$bad"
 
   conformance:
     name: Conformance

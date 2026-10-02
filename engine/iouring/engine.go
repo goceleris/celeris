@@ -109,6 +109,11 @@ type Engine struct {
 	// and when the probe got no answer. Every worker gets a copy; the
 	// hand-off's REAP needs them (celeris#657).
 	asyncCancelFlags bool
+
+	// drainBudget is the ctx of the last Shutdown call: the budget of the
+	// wait for HTTP/2 pool handlers the workers run when Listen's context is
+	// cancelled (celeris#759; Worker.h2PoolSettled).
+	drainBudget atomic.Pointer[context.Context]
 }
 
 // New creates a new io_uring engine.
@@ -180,23 +185,30 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 		}
 	}
 
-	// The io_uring→epoll hand-off cancels an armed recv before it moves a
-	// connection (REAP, celeris#657), and that cancel needs
-	// IORING_ASYNC_CANCEL flags, which exist from Linux 5.19. Unless the
-	// probe finds them accepted the hand-off never reaps: a sync connection
-	// whose recv is armed stays on io_uring until that recv completes on its
-	// own, and its next response is then HELD and handed off with nothing in
-	// flight. HOLD needs a worker without a provided-buffer ring. A kernel
-	// that rejects the flags has none (buffer rings arrived in the same
-	// release, 5.19); where one exists because the probe got no answer on a
-	// newer kernel, the connection is not held and stays on io_uring. A
-	// promoted async connection is never offered for the hand-off without
-	// the flags and stays too. Placement only, either way. Only the kernel's
-	// answer is cached: after a probe with no answer (or one it does not
-	// recognise) the next New probes again (celeris#681 N1).
+	// Every cancel the engine submits sets IORING_ASYNC_CANCEL flags, which
+	// exist from Linux 5.19: the close paths' (cancelConnOps), the accept
+	// pause's, the WebSocket backpressure pause's, the driver unregister's
+	// and the io_uring→epoll hand-off's REAP (celeris#657). A kernel that
+	// rejects them fails every one with -EINVAL and leaves its target
+	// running, so it gets no io_uring engine at all (celeris#682): see
+	// requireAsyncCancelFlags.
+	//
+	// From 5.19 a probe with no answer, or one it does not recognise, only
+	// keeps the hand-off's reap off: a sync connection whose recv is armed
+	// stays on io_uring until that recv completes on its own, and its next
+	// response is then HELD and handed off with nothing in flight. HOLD needs
+	// a worker without a provided-buffer ring; where one exists the
+	// connection is not held and stays on io_uring. A promoted async
+	// connection is never offered for the hand-off without the flags and
+	// stays too. Placement only, either way. Only the kernel's answer is
+	// cached: after a probe with no answer (or one it does not recognise) the
+	// next New probes again (celeris#681 N1).
 	asyncCancel, acReason := probeAsyncCancelFlagsCached()
 	asyncCancelFlags := asyncCancel == asyncCancelAccepted
 	logAsyncCancelProbe(cfg.Logger, asyncCancel, acReason, profile.KernelMajor, profile.KernelMinor)
+	if err := requireAsyncCancelFlags(asyncCancel, acReason, profile); err != nil {
+		return nil, err
+	}
 
 	tier := SelectTier(profile, 2*time.Second)
 	if tier == nil {
@@ -232,9 +244,47 @@ func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
 	return e, nil
 }
 
+// requireAsyncCancelFlags is New's gate on the async-cancel-flags probe
+// (celeris#682): io_uring needs Linux 5.19, the release that added the
+// IORING_ASYNC_CANCEL flags. Through 5.18 the kernel fails every cancel the
+// engine submits with -EINVAL and leaves its target running. On 5.15 the
+// recv of a connection the engine closes keeps the socket open, so the peer
+// gets no FIN (measured), and after the 5 s release backstop the pool can
+// hand that recv's buffer to another connection while the recv can still
+// complete into it (the #256 class, read from code).
+//
+// It refuses io_uring, as unavailable, where the kernel rejected the flags,
+// whatever version it claims, and on a kernel whose version predates 5.19
+// unless the probe found the flags accepted (a vendor backport). From 5.19 a
+// probe with no answer, or one it does not recognise, does not refuse: the
+// flags exist there, and the probe's private ring can fail with EMFILE or
+// ENOMEM under load (celeris#681 N1); that engine only keeps the hand-off's
+// reap off. The error starts "io_uring not available on this system", as
+// New's error for a kernel with no io_uring does: the adaptive engine then
+// starts on epoll (and CELERIS_ADAPTIVE_START=iouring falls back to it), and
+// an explicit io_uring engine fails to start with the kernel requirement in
+// its error.
+func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.CapabilityProfile) error {
+	fromFloor := profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19)
+	switch {
+	case p == asyncCancelAccepted:
+		return nil
+	case p == asyncCancelRejected:
+		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
+			"and kernel %s rejects the IORING_ASYNC_CANCEL flags every connection close uses (%s); "+
+			"use the epoll engine (celeris#682)", profile.KernelVersion, reason)
+	case !fromFloor:
+		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
+			"and kernel %s predates it; the IORING_ASYNC_CANCEL flags probe did not find them accepted "+
+			"(%s: %s); use the epoll engine (celeris#682)", profile.KernelVersion, p, reason)
+	}
+	return nil
+}
+
 // logAsyncCancelProbe reports an async-cancel-flags probe that did not find
 // the flags accepted (celeris#681 R2). A rejection is the kernel's answer and
-// expected before 5.19: Info. An answer the probe does not recognise is one
+// expected before 5.19: Info, and New then refuses io_uring
+// (requireAsyncCancelFlags). An answer the probe does not recognise is one
 // no kernel measured gives, on any version: Warn, with the reason, which
 // names the errno (celeris#681 N2). A probe that got no answer says nothing
 // about the kernel; on one whose version has the flags (5.19 and later) it is
@@ -245,7 +295,7 @@ func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kern
 	kernel := fmt.Sprintf("%d.%d", kernelMajor, kernelMinor)
 	switch p {
 	case asyncCancelRejected:
-		l.Info("async cancel flags rejected by the kernel: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
+		l.Info("async cancel flags rejected by the kernel: io_uring needs Linux 5.19 or later and is not used (celeris#682)",
 			"reason", reason, "kernel", kernel)
 	case asyncCancelUnexpected:
 		l.Warn("async cancel flags probe got an answer it does not recognise: the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)",
@@ -420,6 +470,7 @@ func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
 		w.sweepCnt = &e.metrics.sweep          // celeris#657 P9 sweep witnesses
 		w.asyncCancelFlags = e.asyncCancelFlags
 		w.pause = &e.pause // celeris#662 pause linger
+		w.drainBudget = &e.drainBudget
 		workers[i] = w
 	}
 	return workers, nil
@@ -446,18 +497,25 @@ func fallbackTier(current TierStrategy) TierStrategy {
 	}
 }
 
-// Shutdown is a no-op for the io_uring engine — graceful shutdown is
+// Shutdown does not stop the io_uring engine itself — graceful shutdown is
 // driven by context cancellation on Listen's parent context. Workers
 // exit their run loops on ctx.Done, drain the responses still queued for
 // the ring (Worker.hasPendingSends, celeris#595) and call Worker.shutdown,
-// which joins async dispatch goroutines via asyncWG. See epoll engine
-// Shutdown for the same rationale.
+// which joins async dispatch goroutines via asyncWG. Server.Shutdown waits
+// for Listen to return before it runs the OnShutdown hooks (celeris#703).
+// See epoll engine Shutdown for the same rationale.
 //
 // That parent context is always cancellable: every Server.Start* entry
 // point owns one and Server.Shutdown cancels it after the graceful phase.
 // Handing Listen a context.Background() is what made Start hang here
 // (celeris#595), since this method cannot wake it.
-func (e *Engine) Shutdown(_ context.Context) error {
+//
+// What Shutdown does is hand ctx to the workers as the budget of their wait
+// for the HTTP/2 stream handlers still running on the shared worker pool
+// when Listen's context is cancelled (celeris#759): Server.Shutdown calls it
+// before it cancels that context.
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.drainBudget.Store(&ctx)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return nil
@@ -524,6 +582,16 @@ func (e *Engine) Metrics() engine.EngineMetrics {
 		TransplantClaimDeferred:   e.metrics.handoffLoss.claimDeferred.Load(),
 		TransplantReapFailed:      e.metrics.handoffLoss.reapFailed.Load(),
 		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
+		CloseFDDeferred:           e.metrics.handoffLoss.closeFDDeferred.Load(),
+		CloseFDForced:             e.metrics.handoffLoss.closeFDForced.Load(),
+		CloseZCNotifHeld:          e.metrics.handoffLoss.zcNotifHeld.Load(),
+		CloseZCNotifForced:        e.metrics.handoffLoss.zcNotifForced.Load(),
+		ShutdownZCBufRetained:     e.metrics.handoffLoss.zcBufRetained.Load(),
+		// Gauges: each worker takes off only what it added, after it, so
+		// neither goes below 0; the clamp only keeps a bug from showing
+		// as 2^64.
+		CloseZCNotifHeldNow:   uint64(max(0, e.metrics.handoffLoss.zcHeldNow.Load())),
+		CloseZCNotifHeldBytes: uint64(max(0, e.metrics.handoffLoss.zcHeldBytes.Load())),
 
 		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
 		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),

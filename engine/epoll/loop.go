@@ -69,6 +69,21 @@ const maxEpollEvents = 2048
 // connection cleanly (read returns 0 bytes / EOF).
 var errPeerClosed = fmt.Errorf("celeris: peer closed connection: %w", io.EOF)
 
+// shutdownSendDrainFloor is the least time shutdown's send drain gives the
+// responses still queued to reach the kernel before the conns are closed
+// (celeris#760): io_uring's bound, shutdownSendDrainNanos (celeris#595). The
+// budget of the Engine.Shutdown call that stopped the engine extends it to
+// that budget's deadline; a peer that stops reading holds it no longer.
+const shutdownSendDrainFloor = 250 * time.Millisecond
+
+// shutdownSendDrainPoll caps one wait of the drain for a writable socket, so
+// the drain notices a budget that ends early (a cancelled Shutdown ctx).
+const shutdownSendDrainPoll = 20 * time.Millisecond
+
+// h2PoolDrainPollMs caps one epoll_wait while the loop waits out the HTTP/2
+// pool handlers at shutdown (celeris#759).
+const h2PoolDrainPollMs = 10
+
 // Loop is an epoll-based event loop worker.
 type Loop struct {
 	id       int
@@ -179,6 +194,17 @@ type Loop struct {
 	// read only on this thread. reclaimTransplant needs one to build a
 	// connState with (celeris#624).
 	runCtx context.Context
+
+	// drainBudget points at the engine's record of the budget of the last
+	// Engine.Shutdown call (celeris#760): shutdown's send drain may run
+	// until that ctx is done. nil, or no Shutdown yet, leaves the drain its
+	// floor, shutdownSendDrainFloor.
+	drainBudget *atomic.Pointer[context.Context]
+
+	// h2DrainStart is when the loop began waiting, its context cancelled,
+	// for the HTTP/2 stream handlers running on the shared worker pool
+	// (celeris#759; h2PoolSettled). Zero until then. Loop thread.
+	h2DrainStart time.Time
 
 	// transplantInFlight counts connections this loop has detached for a
 	// transplant whose hand-off is not finished yet — the deferred async
@@ -457,8 +483,14 @@ func (l *Loop) run(ctx context.Context) {
 
 	for {
 		if ctx.Err() != nil {
-			l.shutdown()
-			return
+			// Accept nothing more (celeris#759): the loop may keep turning
+			// below, for the HTTP/2 conns it has, and a conn accepted now
+			// would be served and then cut at the budget.
+			l.stopAccepting()
+			if l.h2PoolSettled() {
+				l.shutdown()
+				return
+			}
 		}
 
 		// Cache the atomic load: ACTIVE→LINGERING→DRAINING and
@@ -481,8 +513,9 @@ func (l *Loop) run(ctx context.Context) {
 		// false so a subsequent Pause observes a fresh signal.
 		l.listenFDClosed.Store(paused && l.listenFD < 0)
 
-		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept.
-		if l.listenFD < 0 && !paused {
+		// SUSPENDED → ACTIVE: re-create listen socket after ResumeAccept;
+		// never once shutdown has begun (stopAccepting).
+		if l.listenFD < 0 && !paused && ctx.Err() == nil {
 			fd, err := createListenSocket(l.cfg.Addr, !l.cfg.DisableDeferAccept)
 			l.deferCapable = !l.cfg.DisableDeferAccept
 			if err != nil {
@@ -530,6 +563,12 @@ func (l *Loop) run(ctx context.Context) {
 		// is edge-triggered, so don't block — poll immediately and re-drain.
 		if l.listenHot {
 			timeoutMs = 0
+		}
+		// Waiting out HTTP/2 pool handlers at shutdown (celeris#759): a
+		// handler that ends without a write the loop hears of must not
+		// leave the loop blocked.
+		if !l.h2DrainStart.IsZero() && (timeoutMs < 0 || timeoutMs > h2PoolDrainPollMs) {
+			timeoutMs = h2PoolDrainPollMs
 		}
 
 		n, err := unix.EpollWait(l.epollFD, l.events, timeoutMs)
@@ -679,20 +718,36 @@ func (l *Loop) run(ctx context.Context) {
 
 		// Drain H2 async write queues. Handler goroutines enqueue response
 		// frame bytes; we drain them into writeBuf and flush to the wire.
-		for _, fd := range l.h2Conns {
+		// By index, from the end: a close below swap-removes the conn from
+		// h2Conns, which a range would then skip one entry past.
+		for i := len(l.h2Conns) - 1; i >= 0; i-- {
+			fd := l.h2Conns[i]
 			cs := l.conns[fd]
 			if cs != nil && cs.h2State != nil && cs.h2State.WriteQueuePending() {
 				cs.h2State.DrainWriteQueue(cs.writeFn)
+				if cs.writeRefused {
+					// A frame refused on back-pressure is lost, and the
+					// connection's framing with it: close (celeris#761).
+					l.closeWhenFlushed(cs)
+					continue
+				}
 				if cs.writePos < len(cs.writeBuf) {
 					if fErr := l.flushWrites(cs, true); fErr != nil {
 						l.removeDirty(cs)
 						l.closeConn(fd)
+						continue
 					} else if cs.writePos < len(cs.writeBuf) {
 						// Send buffer full: arm EPOLLOUT instead of the dirty
 						// list so we don't busy-poll the backpressured H2 conn.
 						l.armEpollOut(cs)
 					}
 				}
+				// Resync pendingBytes, as every other flush point does: the
+				// write hook added every frame drained above to it, and left
+				// alone it outgrew what is really queued until the hook
+				// refused frames of a conn that had nothing queued
+				// (celeris#761).
+				cs.pendingBytes = csPendingBytes(cs)
 			}
 		}
 
@@ -772,6 +827,17 @@ func (l *Loop) run(ctx context.Context) {
 		if l.listenFD < 0 && l.connCount == 0 && l.acceptPaused.Load() &&
 			l.transplantInFlight == 0 &&
 			l.detachQPending.Load() == 0 && l.adoptQPending.Load() == 0 {
+			// A parked loop holds nothing, and sweep() — whose empty-set
+			// retraction is what clears this loop's share of the residual
+			// gauges while it runs — does not run again until it wakes. A
+			// last connection that left AFTER this iteration's sweep() (the
+			// tick-gate checkTimeouts above, the detach queue, the dirty
+			// flush, the H2 queue) would otherwise leave its residue
+			// standing in TransplantResidual* for as long as the park lasts
+			// (celeris#711). Retract here, where the sweep stops.
+			if len(l.liveConns) == 0 {
+				l.sweepRetract()
+			}
 			l.wakeMu.Lock()
 			if !l.acceptPaused.Load() ||
 				l.adoptQPending.Load() != 0 || l.detachQPending.Load() != 0 {
@@ -1244,7 +1310,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 				if mu := cs.detachMu; mu != nil {
 					mu.Unlock()
 				}
-				l.closeConn(fd)
+				l.closeWhenFlushed(cs) // celeris#761: the response's tail too
 				return
 			}
 			if len(rest) > 0 {
@@ -1261,7 +1327,7 @@ func (l *Loop) drainRead(fd int, now int64) {
 					if mu := cs.detachMu; mu != nil {
 						mu.Unlock()
 					}
-					l.closeConn(fd)
+					l.closeWhenFlushed(cs) // celeris#761: the response's tail too
 					return
 				}
 			}
@@ -1275,9 +1341,24 @@ func (l *Loop) drainRead(fd int, now int64) {
 				l.closeConn(fd)
 				return
 			}
-			dirty := len(cs.writeBuf)-cs.writePos > 0 || len(cs.bodyBuf) > 0
+			// Resync pendingBytes, as the inline flush below does: the write
+			// hooks add every response to it, and only a flush point brings
+			// it back to what is still queued. Left alone here it grew by
+			// each response answered on this path, until the hooks refused
+			// the writes of a conn that had nothing queued (celeris#761).
+			dirty := csWritePending(cs)
+			if dirty {
+				cs.pendingBytes = csPendingBytes(cs)
+			} else {
+				cs.pendingBytes = 0
+			}
+			refused := cs.writeRefused
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
+			}
+			if refused {
+				l.closeWhenFlushed(cs)
+				return
 			}
 			if dirty {
 				// Send buffer full after the body-recv response flush. This
@@ -1394,7 +1475,12 @@ func (l *Loop) drainRead(fd int, now int64) {
 				cs.h1State.InlineMode = true
 			}
 			processErr = conn.ProcessH1(cs.ctx, data, cs.h1State, l.handler, writeFn)
-			if tryInline {
+			// A handler that ran inline and hijacked has had cs released to
+			// the pool inside the Hijack call (hijackConn's inline branch):
+			// cs.h1State is nil, and cs may already be another accept's
+			// connection. So cs is not touched again once ProcessH1 reports
+			// the hijack; the ErrHijacked return below is the only way out.
+			if tryInline && !errors.Is(processErr, conn.ErrHijacked) {
 				cs.h1State.InlineMode = false
 			}
 			if errors.Is(processErr, conn.ErrAsyncDispatch) {
@@ -1511,7 +1597,10 @@ func (l *Loop) drainRead(fd int, now int64) {
 			if mu := cs.detachMu; mu != nil {
 				mu.Unlock()
 			}
-			l.closeConn(fd)
+			// What that one write could not send (a response larger than
+			// the socket buffers, answering Connection: close) still goes
+			// out before the close (celeris#761).
+			l.closeWhenFlushed(cs)
 			return
 		}
 
@@ -1562,15 +1651,21 @@ func (l *Loop) drainRead(fd int, now int64) {
 				}
 			}
 		}
-		// Capture pendingBytes inside the lock so the check below is safe
+		// Read writeRefused inside the lock so the check below is safe
 		// against concurrent goroutine writes via the guarded writeFn.
-		pending := cs.pendingBytes
+		refused := cs.writeRefused
 		if mu := cs.detachMu; mu != nil {
 			mu.Unlock()
 		}
 
-		if pending > cs.writeCap() {
-			l.closeConn(fd)
+		// Back-pressure close: a write hook refused bytes because the
+		// backlog before them was over writeCap, a peer that stopped
+		// reading while it kept sending requests. A backlog over the cap
+		// by itself is not a reason to close: one response larger than the
+		// cap puts it there, and so does a sendfile body. Closing on it cut
+		// such a response off mid-body (celeris#761).
+		if refused {
+			l.closeWhenFlushed(cs)
 			return
 		}
 
@@ -1598,6 +1693,38 @@ func (l *Loop) drainRead(fd int, now int64) {
 			return
 		}
 	}
+}
+
+// closeWhenFlushed closes cs as closeConn does, but only once the response
+// bytes it still has queued have reached the kernel: closeConn's SHUT_WR
+// commits only what the kernel has already taken, so a response larger than
+// the socket buffers lost its tail when the conn was closed right after it
+// (Connection: close, a request error, a refused write; celeris#761). It
+// stops reading cs, so no request is parsed or answered on a conn that is
+// closing, arms EPOLLOUT and marks the close deferred (peerClosed), which
+// handleWritable and the dirty pass carry out once the conn has drained. A
+// peer that never reads again is reaped by checkTimeouts, like any conn
+// stalled on write back-pressure. A conn with nothing left to send, and a
+// truly-detached one, whose middleware owns its close, are closed at once.
+//
+// Loop thread, with no handler of cs's running: the inline path after its
+// handler returned, or drainDetachQueue after the dispatch goroutine exited.
+func (l *Loop) closeWhenFlushed(cs *connState) {
+	if (cs.h1State != nil && cs.h1State.Detached.Load()) || !csWritePending(cs) {
+		l.closeConn(cs.fd)
+		return
+	}
+	cs.peerClosed = true
+	l.removeDirty(cs)
+	issued, err := l.modEpollOut(cs, unix.EPOLLOUT|unix.EPOLLET|unix.EPOLLRDHUP)
+	if !issued {
+		return // hijacked: drainDetachQueue settles the conn
+	}
+	if err != nil {
+		l.closeConn(cs.fd)
+		return
+	}
+	cs.epollOut = true
 }
 
 // closeOnReadEnd is drainRead's read-error and EOF branch: flush what is
@@ -1774,6 +1901,15 @@ func (l *Loop) hijackConn(fd int) (net.Conn, error) {
 		// drainDetachQueue, which also runs there.
 		l.removeDirty(cs)
 		l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
+		// The request's strings are views of cs.buf (celeris#733). The
+		// handler is still running, and a hijacking handler typically keeps
+		// the path, params and headers for the goroutine that will serve
+		// the connection, so the buffer must not go back to the pool with
+		// cs: the next connection to take cs from the pool would receive its
+		// request into it, on any worker, even before this handler returns.
+		// Dropping it costs one buffer allocation per hijack, when that
+		// connState is next acquired.
+		cs.buf = nil
 		releaseConnState(cs)
 	}
 	return c, err
@@ -1809,11 +1945,16 @@ func (l *Loop) initProtocol(cs *connState) {
 		if !l.cfg.EnableH2Upgrade {
 			cs.h1State.DisableH2CDetect()
 		}
+		// Back-pressure for HTTP/1 is held per request (celeris#761): a
+		// request that finds the conn's unsent responses over the limit is
+		// not served, and the conn is closed once they have gone out.
+		cs.h1State.WriteBacklogged = cs.overBacklogH1
 		// Scatter-gather body writer: handler hands large bodies to the
-		// engine as a zero-copy slice; flushWrites emits writev(2) with
-		// [headers, body] so we save the respBuf → writeBuf memcpy.
-		// Disabled in async mode because cs.bodyBuf access would race
-		// with the dispatch goroutine without a mutex.
+		// engine as a zero-copy slice, which it writes at once with
+		// writev(2) of [headers, body], saving the respBuf → writeBuf
+		// memcpy (see makeWriteBodyFn). Disabled in async mode because
+		// cs.bodyBuf access would race with the dispatch goroutine
+		// without a mutex.
 		if !l.async {
 			cs.h1State.SetWriteBodyFn(l.makeWriteBodyFn(cs))
 			// Zero-copy sendfile(2) for large static-file responses: the
@@ -2105,7 +2246,19 @@ func (l *Loop) switchToH2Local(cs *connState, writeFn func([]byte)) error {
 
 func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	return func(data []byte) {
-		if cs.pendingBytes+len(cs.bodyBuf) > cs.writeCap() {
+		// Back-pressure (an HTTP/2 or detached conn; see writeCap): refuse
+		// the write only when the backlog before it is over the cap, and
+		// say so, so the conn is closed rather than left waiting for bytes
+		// that will not come (celeris#761).
+		if cs.pendingBytes > cs.writeCap() {
+			cs.writeRefused = true
+			return
+		}
+		// A sendfile is staged, and the flush sends writeBuf before it:
+		// bytes written after it (the next pipelined response) would go
+		// out ahead (celeris#802).
+		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true
 			return
 		}
 		cs.writeBuf = append(cs.writeBuf, data...)
@@ -2116,24 +2269,33 @@ func (l *Loop) makeWriteFn(cs *connState) func([]byte) {
 	}
 }
 
-// makeWriteBodyFn stages a zero-copy body slice for scatter-gather
-// writev at flush time. The body is NOT copied — it must remain valid
-// and unmutated until flushWrites drains it. Used by the H1 response
-// adapter for bodies ≥ 8 KiB to skip the respBuf → writeBuf memcpy.
+// makeWriteBodyFn returns the zero-copy body writer of the H1 response
+// adapter, for bodies of 8 KiB or more: the body goes to the kernel straight
+// from the handler's memory, one writev(2) of [writeBuf, body], skipping the
+// respBuf → writeBuf memcpy. The write is made here, in the call, and what
+// the kernel does not take is copied into writeBuf before it returns: the
+// body belongs to the handler, which may reuse it as soon as its write
+// returns. c.JSON puts its buffer back in a pool at once, where the next
+// handler to encode takes it, and a buffered response's body lives on a
+// pooled Context; a body staged for a flush after the handler went out as
+// the next request's bytes, or another connection's (celeris#817). The
+// syscall is the one the flush after the handler would have made. Runs on
+// the loop thread: the hook is installed only in sync mode.
 func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 	return func(body []byte) {
-		if cs.pendingBytes+len(cs.bodyBuf)+len(body) > cs.writeCap() {
-			return
-		}
-		if cs.bodyBuf != nil {
-			// A second large-body write in the same request: fall back
-			// to copying (we only carry one writev body slot per flush).
-			cs.writeBuf = append(cs.writeBuf, body...)
-			cs.pendingBytes += len(body)
+		// A staged sendfile goes out before this body (celeris#802).
+		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true
 			return
 		}
 		cs.bodyBuf = body
-		cs.pendingBytes += len(body)
+		err := l.flushWrites(cs, true)
+		unstage(cs) // what the kernel did not take; no sendfile is staged
+		cs.pendingBytes = csPendingBytes(cs)
+		if err != nil {
+			// The response is lost with the conn: close it.
+			cs.writeRefused = true
+		}
 	}
 }
 
@@ -2153,14 +2315,17 @@ func (l *Loop) makeWriteBodyFn(cs *connState) func([]byte) {
 // closed by flushSendfile on completion or by closeConn / releaseConnState
 // on teardown.
 //
-// Pipelined file requests in a single recv (cs.sendfile already set) and
-// rare dup failures fall back to a buffered copy of this response into
-// writeBuf, so the engine never needs two concurrent sendfile slots and
-// response ordering is always preserved.
+// There is one sendfile slot. A file response pipelined behind another one
+// in a single recv (cs.sendfile already set) first moves the staged one into
+// writeBuf as a buffered copy (unstage), so it stays ahead, and then takes
+// the slot; handing the new one the buffered copy instead sent it before the
+// staged file (celeris#802). A rare dup failure falls back to a buffered
+// copy of this response.
 func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, offset, length int64) error {
 	return func(header []byte, file *os.File, offset, length int64) error {
-		if cs.sendfile != nil {
-			return bufferedFileFallback(cs, header, file, offset, length)
+		if cs.sendfile != nil && !unstage(cs) {
+			cs.writeRefused = true // the staged response is cut: close
+			return errUnstageSendfile
 		}
 		dupfd, err := unix.Dup(int(file.Fd()))
 		if err != nil {
@@ -2185,6 +2350,12 @@ func (l *Loop) makeSendFileFn(cs *connState) func(header []byte, file *os.File, 
 // caller still owns and closes the *os.File. Correctness over zero-copy:
 // the response is delivered byte-exact, just without the syscall savings.
 func bufferedFileFallback(cs *connState, header []byte, file *os.File, offset, length int64) error {
+	// This response is appended to writeBuf, which goes out before a
+	// staged sendfile (celeris#802).
+	if cs.sendfile != nil && !unstage(cs) {
+		cs.writeRefused = true // the staged response is cut: close
+		return errUnstageSendfile
+	}
 	if length <= 0 {
 		fi, err := file.Stat()
 		if err != nil {
@@ -2464,13 +2635,17 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 			}
 		}
 		partial := flushErr == nil && (cs.writePos < len(cs.writeBuf) || len(cs.bodyBuf) > 0)
+		// A refused write (celeris#761) ends the conn as a request error
+		// does: this goroutine exits and the loop closes the conn once what
+		// was staged has gone out (drainDetachQueue, closeWhenFlushed).
+		refused := cs.writeRefused
 		cs.detachMu.Unlock()
 
 		if partial {
 			l.enqueueDetach(cs)
 		}
 
-		if processErr != nil || flushErr != nil {
+		if processErr != nil || flushErr != nil || refused {
 			// Signal the worker to tear down the conn from its own
 			// goroutine. Never close cs.fd directly here — the worker
 			// goroutine still has l.conns[fd] pointing at cs, and a
@@ -2590,9 +2765,20 @@ func (l *Loop) drainDetachQueue() {
 		}
 		// Dispatch goroutine signaled close via asyncClosed. Only the
 		// worker can safely touch l.conns / dirty list, so we handle
-		// the teardown here.
+		// the teardown here. Once the goroutine has exited, the response
+		// it left queued goes out before the close (celeris#761): closing
+		// at once cut off, after Connection: close, any response larger
+		// than the socket buffers. While it still runs, closeConn leaves
+		// the close to it (celeris#669), as before.
 		if cs.asyncClosed.Load() {
-			l.closeConn(cs.fd)
+			cs.asyncInMu.Lock()
+			running := cs.asyncRun
+			cs.asyncInMu.Unlock()
+			if running {
+				l.closeConn(cs.fd)
+			} else {
+				l.closeWhenFlushed(cs)
+			}
 			continue
 		}
 		// Dispatch goroutine promoted the conn to H2 via switchToH2Local.
@@ -3446,6 +3632,13 @@ func (l *Loop) shutdown() {
 	// close fds or recycle connState below.
 	l.asyncWG.Wait()
 
+	// Phase 2b (celeris#760): every response the handlers wrote is queued
+	// now; send what the sockets have not taken yet before phase 3 closes
+	// them, as io_uring does before its shutdown (celeris#595). Closing at
+	// once cut off the tail of any response larger than the socket buffers
+	// to a client that reads more slowly than the loop shuts down.
+	l.drainSends()
+
 	// Phase 3: now that the async dispatch goroutines have exited (phase 2),
 	// close the fds and release the connState back to the pool. The pool
 	// release stays gated on !detached for the same reason as closeConn: a
@@ -3497,6 +3690,161 @@ func (l *Loop) shutdown() {
 	// epoll_ctl, so none of them can operate on this number once it is free
 	// to be recycled.
 	l.closeEpollFD()
+}
+
+// h2PoolSettled reports whether the loop, its context cancelled, may shut
+// down as far as HTTP/2 is concerned (celeris#759). A stream on an async
+// route runs its handler on the shared worker pool, off this loop, and its
+// response comes back through the conn's write queue, which only this loop
+// drains; shutdown cancelled such streams and closed their conns under their
+// handlers, so the client got unexpected EOF, and the hooks ran before the
+// handlers had finished. So the loop keeps turning, reading and writing as
+// usual on the conns it has (it accepts no new one: stopAccepting), until no
+// HTTP/2 conn has a pool handler running, a response still in its write
+// queue, or response DATA waiting for the client's WINDOW_UPDATE. Every
+// HTTP/2 conn is sent GOAWAY first, so its client opens no new stream on it,
+// as net/http's graceful shutdown does, and a stream it opens anyway is
+// refused. The wait is bounded like the send drain (sendDrainWait): the
+// budget of the last Engine.Shutdown, and never less than
+// shutdownSendDrainFloor. Loop thread.
+func (l *Loop) h2PoolSettled() bool {
+	if len(l.h2Conns) == 0 {
+		return true
+	}
+	if l.h2DrainStart.IsZero() {
+		l.h2DrainStart = time.Now()
+	}
+	busy := false
+	for _, fd := range l.h2Conns {
+		cs := l.conns[fd]
+		if cs == nil || cs.h2State == nil {
+			continue
+		}
+		if !cs.h2GoAwaySent {
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			cs.h2GoAwaySent = cs.h2State.GoAway(cs.writeFn)
+			if mu != nil {
+				mu.Unlock()
+			}
+			if cs.h2GoAwaySent {
+				l.markDirty(cs) // the dirty pass flushes the GOAWAY
+			}
+		}
+		if cs.h2State.PoolHandlersRunning() || cs.h2State.WriteQueuePending() || cs.h2State.OutboundPending() {
+			busy = true
+		}
+	}
+	if !busy {
+		return true
+	}
+	_, more := l.sendDrainWait(l.h2DrainStart)
+	return !more
+}
+
+// stopAccepting takes the listener out of the epoll set and closes it, once
+// the loop's context is cancelled (celeris#759). The loop may go on turning
+// after that, for as long as its HTTP/2 conns keep it (h2PoolSettled), and it
+// used to accept and serve new connections meanwhile, which were then cut at
+// the budget; net/http's Shutdown closes its listeners first. What is still
+// in the kernel's accept queue is reset, as the close in shutdown did.
+// Idempotent. Loop thread.
+func (l *Loop) stopAccepting() {
+	if l.listenFD < 0 {
+		return
+	}
+	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, l.listenFD, nil)
+	_ = unix.Close(l.listenFD)
+	l.listenFD = -1
+	l.listenHot = false
+	l.lingerUntil = 0
+}
+
+// drainSends is shutdown's send drain (celeris#760). It flushes every live
+// conn with response bytes still queued, and waits for their sockets to take
+// more, until nothing is queued or the drain's time is up (sendDrainWait). A
+// conn whose write fails is left to phase 3's close. The run loop is no
+// longer turning: the conns are polled directly (poll(2), POLLOUT), not
+// through the epoll set.
+//
+// Loop thread, after phase 2: no dispatch goroutine is left to write, and a
+// detached conn's middleware finds detachClosed set by phase 1 and writes
+// nothing more. detachMu is still taken around each flush, as every flush
+// site does.
+func (l *Loop) drainSends() {
+	start := time.Now()
+	var fds []unix.PollFd
+	for {
+		fds = fds[:0]
+		for i := len(l.liveConns) - 1; i >= 0; i-- {
+			cs := l.liveConns[i]
+			if cs.hijacked.Load() {
+				continue // the application's since the Hijack (celeris#668)
+			}
+			mu := cs.detachMu
+			if mu != nil {
+				mu.Lock()
+			}
+			pending := false
+			if csWritePending(cs) && l.flushWrites(cs, true) == nil {
+				pending = csWritePending(cs)
+			}
+			if mu != nil {
+				mu.Unlock()
+			}
+			if pending {
+				fds = append(fds, unix.PollFd{Fd: int32(cs.fd), Events: unix.POLLOUT})
+			}
+		}
+		if len(fds) == 0 {
+			return
+		}
+		wait, ok := l.sendDrainWait(start)
+		if !ok {
+			return
+		}
+		if _, err := unix.Poll(fds, int(wait/time.Millisecond)+1); err != nil && err != unix.EINTR {
+			return
+		}
+	}
+}
+
+// sendDrainWait reports how long drainSends may wait for a writable socket
+// now, at most shutdownSendDrainPoll, and false once the drain's time is up.
+//
+// The drain, begun at start, runs while the budget the last Engine.Shutdown
+// call handed over (drainBudget) is live: until its ctx's deadline, and for
+// a ctx with none (context.Background, a WithCancel ctx: net/http's "wait as
+// long as it takes") until the ctx is done. Either way no longer than
+// WriteTimeout after the drain began, when that is set: the bound a live
+// conn's stalled write gets, and net/http's, so a client that never reads
+// cannot hold Shutdown(context.Background()) for ever. It never ends before
+// shutdownSendDrainFloor, which is also all it gets once the budget is done
+// (at its deadline, or cancelled before it) or when no Shutdown handed one
+// over.
+func (l *Loop) sendDrainWait(start time.Time) (time.Duration, bool) {
+	end := start.Add(shutdownSendDrainFloor)
+	if l.drainBudget != nil {
+		if p := l.drainBudget.Load(); p != nil && (*p).Err() == nil {
+			ext, bounded := (*p).Deadline()
+			if wt := l.cfg.WriteTimeout; wt > 0 && (!bounded || start.Add(wt).Before(ext)) {
+				ext, bounded = start.Add(wt), true
+			}
+			if !bounded {
+				return shutdownSendDrainPoll, true // until the budget is done
+			}
+			if ext.After(end) {
+				end = ext
+			}
+		}
+	}
+	left := time.Until(end)
+	if left <= 0 {
+		return 0, false
+	}
+	return min(left, shutdownSendDrainPoll), true
 }
 
 // createListenSocket binds and listens on addr. deferAccept asks for

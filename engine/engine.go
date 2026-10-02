@@ -15,8 +15,16 @@ type Engine interface {
 	// Listen starts the engine and blocks until ctx is canceled or a fatal
 	// error occurs. The engine begins accepting connections on the configured address.
 	Listen(ctx context.Context) error
-	// Shutdown gracefully drains in-flight connections. The provided context
-	// controls the deadline; if it expires, remaining connections are closed.
+	// Shutdown gracefully drains in-flight connections, bounded by ctx. On
+	// std Shutdown is the drain: when ctx expires first, it returns ctx's
+	// error. On epoll and io_uring the drain runs in Listen once Listen's
+	// ctx is cancelled, and Shutdown hands it ctx as its budget and returns
+	// nil at once (celeris#759, celeris#760); adaptive hands ctx to its
+	// sub-engines, then cancels its own Listen and waits for it, bounded by
+	// ctx. An HTTP/1 handler runs to completion on every engine whatever
+	// ctx (celeris#753); a handler of an HTTP/2 stream on the shared worker
+	// pool can still be running when the native engines close its
+	// connection at the end of the budget.
 	Shutdown(ctx context.Context) error
 	// Metrics returns a point-in-time snapshot of engine performance counters.
 	Metrics() EngineMetrics
@@ -469,15 +477,15 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	//   - Closed: a connection this engine closed or hijacked (the close
 	//     paths and Hijack register the identity the same way). Usually
 	//     the client's bytes raced a server-side close, and that client
-	//     sees its connection end. It is not always benign, so a non-zero
-	//     Closed does not prove that no live client lost a request. After
-	//     a Hijack the socket lives on under the hijacker's net.Conn, so a
-	//     recv that completes with data before its cancel lands has taken
-	//     the first bytes of a connection its client is still using. And a
-	//     recv that had not reached the kernel when the descriptor was
-	//     closed resolves the descriptor NUMBER when it does; if a new
-	//     connection holds that number by then, the recv reads that
-	//     client's request.
+	//     sees its connection end. It was not always benign: after a
+	//     Hijack, a recv that completed with data before its cancel landed
+	//     took the first bytes of a connection its client was still using,
+	//     and a recv that had not been issued when the descriptor was
+	//     closed resolved the descriptor NUMBER when it was, reading the
+	//     request of whatever new connection held that number by then
+	//     (celeris#715). Since celeris#685 neither can happen (see
+	//     CloseFDDeferred), so what Closed counts is a closed connection's
+	//     recv reading its own client's late bytes.
 	//   - Transplanted: a connection this engine handed to the other
 	//     sub-engine. A recv armed before the hand-off outlived it and
 	//     read a request meant for the new owner — or, through a reused
@@ -552,9 +560,9 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// worker's own path that found the connection's async dispatch
 	// goroutine had already claimed the hand-off, and left it to that claim.
 	// It is ordering, not a fault: it fires whenever a completion of the
-	// connection lands between the goroutine's park and the worker's drain
-	// of the claim. A rate. io_uring-only; on the adaptive engine the sum
-	// over both sub-engines.
+	// connection, or a retry of its hand-off, lands between the goroutine's
+	// park and the worker's drain of the claim. A rate. io_uring-only; on
+	// the adaptive engine the sum over both sub-engines.
 	TransplantClaimDeferred uint64
 	// TransplantReapFailed counts hand-off recv cancels (TransplantReaps)
 	// whose completion was neither a hit nor a miss, for example -EINVAL
@@ -580,6 +588,67 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// probe finds the flags. io_uring-only; on the adaptive engine the sum
 	// over both sub-engines.
 	TransplantReapUnsupported uint64
+	// CloseFDDeferred and CloseFDForced count how the io_uring close paths
+	// keep the same fd-lifetime rule (celeris#685): a connection's descriptor
+	// NUMBER is released only when no operation that names it can still be
+	// issued. Closing it earlier let a receive the kernel had not issued yet
+	// read the request of a new connection that another thread had been
+	// given the freed number for; that request was dropped as
+	// StaleRecvDataClosed, and its client was never answered.
+	//
+	//   - CloseFDDeferred: closes whose descriptor stayed open until the
+	//     last operation the kernel owed on it had completed, and was closed
+	//     then (normally one loop iteration later). A rate: on an
+	//     async-handler engine it is close to one per connection the server
+	//     closes, and on a sync-mode engine it is the server-side closes of
+	//     connections with a receive armed (timeouts).
+	//   - CloseFDForced: such descriptors closed by the release backstop with
+	//     an operation still owed. Must stay 0.
+	//
+	// io_uring-only and cumulative; zero on other engines. On the adaptive
+	// engine each is the sum over both sub-engines.
+	CloseFDDeferred uint64
+	CloseFDForced   uint64
+	// CloseZCNotifHeld, CloseZCNotifHeldNow, CloseZCNotifHeldBytes,
+	// CloseZCNotifForced and ShutdownZCBufRetained show how the io_uring
+	// engine keeps a SEND_ZC's send buffer for as long as the kernel may read
+	// it (celeris#812). A zero-copy send leaves its unsent part queued on the
+	// socket as references to the buffer's pages, and a peer that stops
+	// reading keeps it there, after a close too, until the peer reads or the
+	// kernel gives up on the socket; the kernel then sends it from whatever
+	// the buffer holds. Released to be reused before that, the buffer
+	// delivered another connection's bytes to that peer. So the release
+	// backstop, 5 s after a close, holds such a buffer until the kernel says
+	// it is done, for as long as the peer keeps the socket alive: a peer that
+	// keeps reading, however slowly, can keep it for as long as it likes. A
+	// hold keeps the buffer alone (its connection's other state is released)
+	// and costs no descriptor, no connection slot and no work per event-loop
+	// pass; a worker holding 16 MiB of them stops using SEND_ZC, and copies,
+	// until some are released.
+	//
+	//   - CloseZCNotifHeld: holds started. A rate: a connection the server
+	//     closed while its peer had stopped reading mid-send.
+	//   - CloseZCNotifHeldNow and CloseZCNotifHeldBytes are GAUGES: the send
+	//     buffers held right now, and their capacity in bytes. A worker that
+	//     shuts down takes its share out (its buffers then count in
+	//     ShutdownZCBufRetained).
+	//   - CloseZCNotifForced: send buffers given up while a SEND_ZC was still
+	//     owed on them. Must stay 0. The hold is decided so that the backstop
+	//     never gives one up, so this is a tripwire for a change that breaks
+	//     that decision, not a measure of what peers or the kernel do: it
+	//     cannot move on the shipped code.
+	//   - ShutdownZCBufRetained: send buffers engine shutdown kept for the
+	//     life of the process, because a SEND_ZC may still read them when the
+	//     io_uring ring closes and nothing can say when it stops.
+	//
+	// io_uring-only; zero on other engines. All but the two gauges are
+	// cumulative. On the adaptive engine each is the sum over both
+	// sub-engines.
+	CloseZCNotifHeld      uint64
+	CloseZCNotifHeldNow   uint64
+	CloseZCNotifHeldBytes uint64
+	CloseZCNotifForced    uint64
+	ShutdownZCBufRetained uint64
 	// TransplantSweepPasses counts passes of the post-switch sweep, the
 	// re-examination that moves a connection the drain would otherwise
 	// reach only at that connection's own next event — which, for a

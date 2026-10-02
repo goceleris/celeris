@@ -131,17 +131,27 @@ func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) er
 		onRecv:  onRecv,
 		onClose: onClose,
 	}
+	// Publish the conn before arming the descriptor (celeris#770). The
+	// worker looks a driver conn up only while hasDriverConns is set, and
+	// the event is edge triggered: armed first, a first event the worker
+	// took before hasDriverConns was set went to the HTTP path, which read
+	// nothing, and never came again. Published first, a racing worker finds
+	// hasDriverConns set and waits in lookupDriver for driverMu, which is
+	// held here until the conn is in the map.
+	l.driverConns[fd] = dc
+	l.hasDriverConns.Store(true)
 	// Level-triggered EPOLLOUT is added lazily (on EAGAIN) via armEpollOut
 	// so idle driver conns don't wake the loop on every send-buffer drain.
 	if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
 		Fd:     int32(fd),
 	}); err != nil {
+		delete(l.driverConns, fd)
+		if len(l.driverConns) == 0 {
+			l.hasDriverConns.Store(false)
+		}
 		return fmt.Errorf("celeris/epoll: epoll_ctl ADD fd %d: %w", fd, err)
 	}
-
-	l.driverConns[fd] = dc
-	l.hasDriverConns.Store(true)
 	return nil
 }
 

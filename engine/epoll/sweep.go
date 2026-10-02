@@ -177,9 +177,11 @@ func (l *Loop) sweepNoteDeparture() {
 }
 
 // sweepRetract drops everything this loop has published into the engine-wide
-// gauges. Loop thread, at shutdown: a loop that is gone holds nothing, and
-// nothing else would ever retract its last cycle's residue (celeris#657 R2,
-// MINOR-d).
+// gauges. Loop thread, at the two places the sweep stops running while the
+// loop may still have residue published: shutdown (a loop that is gone holds
+// nothing, celeris#657 R2, MINOR-d) and the DRAINING→SUSPENDED park (a parked
+// loop holds nothing, and sweep() does not run again until it wakes,
+// celeris#711).
 func (l *Loop) sweepRetract() {
 	if l.sweepPub == ([numResidual]uint64{}) {
 		return
@@ -223,10 +225,13 @@ func (l *Loop) sweep() {
 		// Reachable with a stale residue published only if a connection
 		// could leave without sweepNoteDeparture: it cannot. removeLiveConn
 		// is the one way out of liveConns and it lifts dormancy, so the
-		// retraction below is always reached; shutdown, which truncates
-		// liveConns wholesale, calls sweepRetract itself (celeris#657 R2,
-		// MINOR-d). Keeping the dormant return AHEAD of the retraction is
-		// therefore safe, and it is what keeps a dormant sweep free.
+		// retraction below is reached at the loop's NEXT sweep() — if there
+		// is one. Where there is not, the caller retracts itself: shutdown,
+		// which truncates liveConns wholesale (celeris#657 R2, MINOR-d), and
+		// the DRAINING→SUSPENDED park, which a departure after this
+		// iteration's sweep() can reach with nothing live (celeris#711).
+		// Keeping the dormant return AHEAD of the retraction is therefore
+		// safe, and it is what keeps a dormant sweep free.
 		return
 	}
 	if len(l.liveConns) == 0 {

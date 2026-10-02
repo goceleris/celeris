@@ -5,6 +5,7 @@ package epoll
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -13,8 +14,11 @@ import (
 )
 
 // maxPendingBytes is the per-connection back-pressure limit for pending
-// writes on H1/H2 connections. Intentionally small (4 MiB) so a stalled
-// peer cannot fill server memory with un-ACKed responses.
+// writes on H1 connections. Intentionally small (4 MiB) so a stalled
+// peer cannot fill server memory with un-ACKed responses. It is held per
+// request, not per write (celeris#761): a request that finds more than this
+// unsent is not served and the conn is closed (conn.H1State.WriteBacklogged),
+// while a response, however large, is staged whole.
 //
 // maxPendingBytesDetached is the per-connection limit once the
 // connection is detached (WebSocket / SSE). Detached middleware owns
@@ -22,8 +26,17 @@ import (
 // echo payloads larger than 4 MiB (RFC 6455 allows frames up to 2^63,
 // Autobahn 9.1.6 sends 16 MiB). 64 MiB matches the WS default ReadLimit.
 const (
-	maxPendingBytes         = 4 << 20  // 4 MiB (H1/H2)
+	maxPendingBytes         = 4 << 20  // 4 MiB (H1)
 	maxPendingBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
+	// maxPendingBytesH2 is the limit for an HTTP/2 connection. Its DATA is
+	// already bounded by the flow-control windows the peer grants, and a
+	// peer that reads keeps up to a window of frames queued behind the
+	// socket as a matter of course (net/http's client grants 4 MiB per
+	// stream, browsers more per connection), so the H1 limit refused, and
+	// closed, healthy HTTP/2 connections (celeris#761). 64 MiB, as for a
+	// detached connection, still bounds a peer that grants large windows
+	// and stops reading.
+	maxPendingBytesH2 = 64 << 20
 	// maxPendingInputBytes caps the async dispatch input buffer
 	// (cs.asyncInBuf) so a client pipelining requests faster than
 	// the dispatch goroutine drains them cannot balloon per-conn
@@ -57,15 +70,32 @@ func trimPooledBuf(b []byte) []byte {
 	return b[:0]
 }
 
-// writeCap returns the effective back-pressure limit for cs, accounting
-// for whether the connection is detached. Async-mode HTTP1 conns set
-// detachMu up front without being truly detached; they keep the H1/H2
-// limit so a stalled peer cannot balloon per-conn memory to 64 MiB.
+// writeCap returns the per-write back-pressure limit for cs: a write is
+// refused when the bytes still queued before it (cs.pendingBytes) are over
+// it. An HTTP/2 conn has maxPendingBytesH2 and a truly-detached one (WS/SSE)
+// maxPendingBytesDetached. An HTTP/1 conn has none: its writes are its
+// handlers' responses, and a limit per write cut a response off mid-body, a
+// large body or the chunks of a StreamWriter (celeris#761). Its limit,
+// maxPendingBytes, is held per request instead (overBacklogH1), before the
+// handler runs. Async-mode HTTP1 conns set detachMu up front without being
+// truly detached; they are HTTP/1 conns here.
 func (cs *connState) writeCap() int {
+	if cs.h2State != nil {
+		return maxPendingBytesH2
+	}
 	if cs.detachMu != nil && cs.h1State != nil && cs.h1State.Detached.Load() {
 		return maxPendingBytesDetached
 	}
-	return maxPendingBytes
+	return math.MaxInt
+}
+
+// overBacklogH1 is the HTTP/1 back-pressure limit (conn.H1State.WriteBacklogged,
+// celeris#761): whether the responses cs still has unsent, which the write
+// hooks count in pendingBytes, are over maxPendingBytes, i.e. its client
+// stopped reading while it kept sending requests. The next request is then
+// not served, and the conn is closed once what is queued has gone out.
+func (cs *connState) overBacklogH1() bool {
+	return cs.pendingBytes > maxPendingBytes
 }
 
 // connState holds per-connection state for the epoll engine.
@@ -112,7 +142,20 @@ type connState struct {
 	// peerClosed is set when EPOLLRDHUP reports the peer half-closed (FIN) while
 	// a response was still flushing (write backpressure). The conn is closed once
 	// its pending write drains, so the response is not truncated. Reset on release.
+	// closeWhenFlushed sets it too, when the engine itself ends a conn whose
+	// response the kernel has not all taken (Connection: close, a request
+	// error, a refused write; celeris#761): the close it defers is the same.
 	peerClosed bool
+
+	// writeRefused records that response bytes were lost (celeris#761): a
+	// write hook refused them because the conn's backlog was already over
+	// writeCap, or the write the zero-copy body hook made failed, or a
+	// staged file could not be read. It is never silent: the site that ran
+	// the handler closes the conn (closeWhenFlushed) instead of leaving the
+	// client waiting for bytes that will not come. Sticky until release.
+	// Written under detachMu when the conn has one, like the buffers it
+	// guards.
+	writeRefused bool
 
 	// drainDeadline bounds how long checkTimeouts defers the idle-deadline
 	// reap of a truly-detached conn whose terminal bytes (SSE last event, WS
@@ -230,6 +273,11 @@ type connState struct {
 	// this set and does nothing (celeris#668).
 	hijackSettled bool
 
+	// h2GoAwaySent records that a graceful shutdown has sent this HTTP/2
+	// conn its GOAWAY (celeris#759; Loop.h2PoolSettled). Loop thread; reset
+	// on release.
+	h2GoAwaySent bool
+
 	// relinkOwed (guarded by asyncInMu) is set by the dirty pass or the
 	// EPOLLOUT resume when they give the conn up because its dispatch
 	// goroutine holds detachMu across a handler (celeris#669). The goroutine
@@ -319,6 +367,7 @@ func releaseConnState(cs *connState) {
 	cs.asyncOutBuf = trimPooledBuf(cs.asyncOutBuf)
 	cs.writeBuf = trimPooledBuf(cs.writeBuf)
 	cs.peerClosed = false
+	cs.writeRefused = false
 	cs.drainDeadline = 0
 	cs.asyncRun = false
 	cs.asyncParked = false
@@ -333,6 +382,7 @@ func releaseConnState(cs *connState) {
 	cs.liveIdx = -1
 	cs.hijacked.Store(false)
 	cs.hijackSettled = false
+	cs.h2GoAwaySent = false
 	cs.closeOwed = false
 	cs.closeErr = nil
 	cs.relinkOwed = false
