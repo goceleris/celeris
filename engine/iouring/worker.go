@@ -4866,14 +4866,13 @@ func (w *Worker) canRevertToInline(cs *connState) bool {
 // runAsyncHandler is cs's dispatch goroutine: serveAsync, plus the teardown
 // for a serveAsync that does not return (celeris#791).
 //
-// A handler panic, and a runtime.Goexit (t.FailNow in a test handler, for
-// one), unwind serveAsync from wherever they happen, most often inside
-// ProcessH1, where this goroutine holds cs.detachMu. The panic's recover used
-// to hand the conn to the worker with the lock still held: the worker's
-// closeConn then waited on it forever, and with it every connection of the
-// worker's ring. A Goexit was not even recovered, so the conn stayed owned by
-// a goroutine that no longer existed. Both now take the same way out as a
-// handler error: the lock released, then asyncClosed and the hand-back.
+// celeris.Server's router recovers a handler panic itself, on this path as
+// on the inline one, and answers 500. What reaches here is a panic that
+// escapes the router (a stream.Handler used directly, or the engine's own
+// request handling) and a runtime.Goexit (t.FailNow in a test handler, for
+// one), which no recover stops. Either can unwind serveAsync from inside
+// ProcessH1, where this goroutine holds cs.detachMu; abortAsyncHandler
+// releases it and gives the conn the teardown a handler error gets.
 func (w *Worker) runAsyncHandler(cs *connState) {
 	defer w.asyncWG.Done()
 	// held: this goroutine holds cs.detachMu (serveAsync sets it after each
@@ -4900,15 +4899,22 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 // a fatal "unlock of unlocked mutex", cf. celeris#309). That is before the
 // log, too, whose handler is the application's and may be slow, while the
 // worker's shutdown and the guarded writes of a detached conn take the lock
-// unconditionally. Only then does endDispatch clear asyncRun, so a worker
-// that finds the lock held while the goroutine reads as gone (dispatchBusy
-// false) waits only for a bounded holder, never for this one; until then
-// dispatchBusy reads busy and the worker leaves cs alone. The rest is the
-// handler-error teardown below in serveAsync: asyncClosed, then the
-// hand-back through the detach queue, whose asyncClosed branch runs
-// closeConn on the worker. Like that path it never holds two of detachMu,
-// asyncInMu and detachQMu at once. Nothing here touches cs after the
-// enqueue.
+// unconditionally. The rest is the handler-error teardown in serveAsync:
+// asyncClosed, endDispatch under asyncInMu, then the hand-back through the
+// detach queue, whose asyncClosed branch runs closeConn on the worker. Like
+// that path it never holds two of detachMu, asyncInMu and detachQMu at once.
+// Nothing here touches cs after the enqueue.
+//
+// The lock is free from the release on, so a closeConn that meets cs before
+// the hand-back (a recv FIN or error, the timeout reap, shutdown) takes it
+// and closes the conn while this goroutine still logs: the fd is closed and
+// may be reissued, and CloseH1 releases the stream (celeris#844 tracks a
+// panic value that shares its memory). cs stays valid: a conn that has a
+// detachMu is closed by finishCloseDetached, which never pools it
+// (queuePendingReleaseDetached), and the drain skips the hand-back of a conn
+// already detachClosed. endDispatch clears asyncRun after the release, so a
+// worker that finds the lock held while the goroutine reads as gone
+// (dispatchBusy false) waits only for a bounded holder.
 func (w *Worker) abortAsyncHandler(cs *connState, r any, held bool) {
 	if held && !cs.asyncDetachUnlocked {
 		cs.detachMu.Unlock()
