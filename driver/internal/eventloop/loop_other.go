@@ -161,8 +161,13 @@ func (w *worker) readerLoop(c *driverConn) {
 				return
 			}
 			c.fire(err)
+			// Remove the entry only if it is still this conn's. onClose may
+			// have led the owner to unregister and close the fd, and a new
+			// conn may have registered the same number since (celeris#784).
 			w.mu.Lock()
-			delete(w.conns, c.fd)
+			if cur, ok := w.conns[c.fd]; ok && cur == c {
+				delete(w.conns, c.fd)
+			}
 			w.mu.Unlock()
 			return
 		}
@@ -170,7 +175,11 @@ func (w *worker) readerLoop(c *driverConn) {
 }
 
 // UnregisterConn closes the wrapped net.Conn, which unblocks the reader
-// goroutine; onClose(nil) fires once the reader observes the close.
+// goroutine; onClose(nil) fires once the reader observes the close. The
+// reader reads its own duplicate of fd, never fd's number, so the caller may
+// close fd as soon as UnregisterConn returns (celeris#784). A read that
+// completed before the close is still delivered: onRecv can run once more
+// after UnregisterConn has returned.
 func (w *worker) UnregisterConn(fd int) error {
 	w.mu.Lock()
 	c, ok := w.conns[fd]

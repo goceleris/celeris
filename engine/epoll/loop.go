@@ -2399,47 +2399,105 @@ func readFullAt(file *os.File, buf []byte, offset int64) error {
 }
 
 // runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
-// Config.AsyncHandlers is enabled. It takes the currently-buffered
-// bytes via a double-buffer swap, runs ProcessH1 under detachMu (so
-// write paths serialize with worker-initiated flushes), flushes the
-// response, and parks on asyncCond.Wait when the buffer is empty —
-// keeping the goroutine alive across keep-alive requests. The worker
-// calls asyncCond.Signal after each append, and asyncCond.Broadcast
-// in closeConn so the parked goroutine exits cleanly.
+// Config.AsyncHandlers is enabled: serveAsync, plus the teardown for a
+// serveAsync that does not return (celeris#791).
+//
+// A goroutine the engine spawns must not let a panic crash the process
+// (#240). celeris.Server's router recovers a handler panic itself, on this
+// path as on the inline one, and answers 500. What reaches here is a panic
+// that escapes the router (a stream.Handler used directly, or the engine's
+// own request handling) and a runtime.Goexit (t.FailNow in a test handler,
+// for one), which no recover stops. Either can unwind serveAsync from inside
+// ProcessH1, where this goroutine holds cs.detachMu; abortAsyncHandler
+// releases it and gives the conn the teardown a handler error gets.
+func (l *Loop) runAsyncHandler(cs *connState) {
+	defer l.asyncWG.Done()
+	// held: this goroutine holds cs.detachMu (serveAsync sets it after each
+	// Lock and clears it before each Unlock). returned: serveAsync returned,
+	// so neither a panic nor a Goexit is unwinding through here.
+	var held, returned bool
+	defer func() {
+		if !returned {
+			l.abortAsyncHandler(cs, recover(), held)
+		}
+	}()
+	l.serveAsync(cs, &held)
+	returned = true
+}
+
+// abortAsyncHandler tears cs down after its dispatch goroutine's handler
+// panicked (r is the recovered value) or called runtime.Goexit (r is nil, and
+// the goroutine ends when this returns). Deferred by runAsyncHandler, on the
+// dispatch goroutine.
+//
+// It releases cs.detachMu first, if this goroutine still holds it: held, and
+// not already released on this goroutine's behalf by a Detach inside
+// ProcessH1 (asyncDetachUnlocked, celeris#273; Unlocking that again would be
+// a fatal "unlock of unlocked mutex", cf. celeris#309). That is before the
+// log, too, whose handler is the application's and may be slow, while the
+// loop's shutdown and the guarded writes of a detached conn take the lock
+// unconditionally. The rest is the handler-error teardown in serveAsync:
+// asyncClosed, endDispatch under asyncInMu, then the hand-back through the
+// detach queue, whose asyncClosed branch closes the conn on the loop thread
+// (once what it has staged has gone out, celeris#761). Like that path it
+// never holds two of detachMu, asyncInMu and detachQMu at once.
+//
+// The lock is free from the release on, so a closeConn that meets cs before
+// the hand-back (closeOnReadEnd on a peer FIN, the timeout reap, shutdown)
+// takes it and closes the conn while this goroutine still logs: the fd is
+// closed and may be reissued, and CloseH1 releases the stream (celeris#844
+// tracks a panic value that shares its memory). cs stays valid: closeConn
+// never pools a conn that has a detachMu (!detached), and the drain skips
+// the hand-back of a conn already detachClosed. endDispatch clears asyncRun
+// after the release, so a loop that finds the lock held while the goroutine
+// reads as gone (dispatchBusy false) waits only for a bounded holder.
+func (l *Loop) abortAsyncHandler(cs *connState, r any, held bool) {
+	if held && !cs.asyncDetachUnlocked {
+		cs.detachMu.Unlock()
+	}
+	if l.logger != nil {
+		if r != nil {
+			l.logger.Error("async handler panicked",
+				"panic", r,
+				"stack", string(debug.Stack()),
+				"fd", cs.fd,
+			)
+		} else {
+			l.logger.Error("async handler exited without returning (runtime.Goexit)",
+				"stack", string(debug.Stack()),
+				"fd", cs.fd,
+			)
+		}
+	}
+	cs.asyncClosed.Store(true)
+	cs.asyncInMu.Lock()
+	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.endDispatch() // enqueued below: that is the hand-back
+	cs.asyncInMu.Unlock()
+	// Signal worker via detachQueue + eventfd (never close the
+	// fd from this goroutine — races with drainRead on the
+	// worker's stale l.conns slot).
+	l.enqueueDetach(cs)
+}
+
+// serveAsync is the dispatch goroutine's loop (see runAsyncHandler). It
+// takes the currently-buffered bytes via a double-buffer swap, runs
+// ProcessH1 under detachMu (so write paths serialize with worker-initiated
+// flushes), flushes the response, and parks on asyncCond.Wait when the
+// buffer is empty — keeping the goroutine alive across keep-alive requests.
+// The worker calls asyncCond.Signal after each append, and
+// asyncCond.Broadcast in closeConn so the parked goroutine exits cleanly.
 //
 // This preserves HTTP/1.1 pipelining order guarantees: a pipelined
 // burst arrives in one worker read, ProcessH1's offset loop drains
 // every request from that slice in order, and responses appear in the
 // same order on cs.writeBuf before the flush. The "one goroutine at a
 // time per conn" invariant is enforced by cs.asyncRun.
-func (l *Loop) runAsyncHandler(cs *connState) {
-	defer l.asyncWG.Done()
-	// Last-resort panic safety net. User handlers SHOULD use recovery
-	// middleware, but a goroutine spawned by the engine must not let an
-	// unrecovered panic crash the process. routerAdapter has its own
-	// recover for the sync path; async dispatch needs symmetric
-	// protection because the panic would otherwise unwind here,
-	// outside any router code. See #240.
-	defer func() {
-		if r := recover(); r != nil {
-			if l.logger != nil {
-				l.logger.Error("async handler panicked",
-					"panic", r,
-					"stack", string(debug.Stack()),
-					"fd", cs.fd,
-				)
-			}
-			cs.asyncClosed.Store(true)
-			cs.asyncInMu.Lock()
-			cs.asyncInBuf = cs.asyncInBuf[:0]
-			cs.endDispatch() // enqueued below: that is the hand-back
-			cs.asyncInMu.Unlock()
-			// Signal worker via detachQueue + eventfd (never close the
-			// fd from this goroutine — races with drainRead on the
-			// worker's stale l.conns slot).
-			l.enqueueDetach(cs)
-		}
-	}()
+//
+// *held tracks its Lock and Unlock of cs.detachMu, for abortAsyncHandler.
+// It stays set across a Detach inside ProcessH1, which releases the lock on
+// this goroutine's behalf and records that in asyncDetachUnlocked instead.
+func (l *Loop) serveAsync(cs *connState, held *bool) {
 	for {
 		cs.asyncInMu.Lock()
 		if cs.relinkOwed {
@@ -2515,12 +2573,14 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		if !cs.asyncDetachUnlocked {
 			cs.detachMu.Lock()
 			acquiredDetachMu = true
+			*held = true
 		}
 		// Re-check asyncClosed under detachMu when we acquired it;
 		// closeConn sets asyncClosed BEFORE tearing down cs.h1State.
 		// Mirrors the iouring fix.
 		if cs.asyncClosed.Load() {
 			if acquiredDetachMu {
+				*held = false
 				cs.detachMu.Unlock()
 			}
 			// Nor does this one; see the loop-top exit.
@@ -2554,6 +2614,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 					promoteErr = err
 				}
 			}
+			*held = false
 			cs.detachMu.Unlock()
 			if promoteErr != nil {
 				cs.asyncClosed.Store(true)
@@ -2639,6 +2700,7 @@ func (l *Loop) runAsyncHandler(cs *connState) {
 		// does: this goroutine exits and the loop closes the conn once what
 		// was staged has gone out (drainDetachQueue, closeWhenFlushed).
 		refused := cs.writeRefused
+		*held = false
 		cs.detachMu.Unlock()
 
 		if partial {

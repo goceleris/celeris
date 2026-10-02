@@ -610,14 +610,18 @@ func releaseConnState(cs *connState) {
 	cs.sendBody = nil
 	// bodyRecvPin is cleared here, after every kernel-held op delivered its
 	// terminal CQE (releaseConnState is only called from drainPendingRelease
-	// once cs.kernelInflight drained — or its backstop fired), so the kernel
-	// can no longer be writing into the pinned bodyBuf array (#256
-	// body-buffer UAF guard).
+	// once cs.kernelInflight drained — or its backstop fired — and from the
+	// backstop's SEND_ZC hold once a SEND_ZC, which writes nothing, is all
+	// that is owed; releaseHeldConnState), so the kernel can no longer be
+	// writing into the pinned bodyBuf array (#256 body-buffer UAF guard).
 	cs.bodyRecvPin = nil
 	cs.detectAccum = cs.detectAccum[:0]
 	// kernelInflight is zero on every normal release (drainPendingRelease
-	// gates on it); reset defensively for the wall-clock-backstop path,
-	// where the worker gave up waiting on a CQE the kernel never produced.
+	// gates on it); reset for the wall-clock-backstop path, where the worker
+	// gave up waiting on a CQE the kernel never produced, and for the
+	// backstop's SEND_ZC hold, which keeps the send buffer's array and lets
+	// the connState go with the SEND_ZC still owed (releaseHeldConnState;
+	// the identity's count, not this one, waits for its notification).
 	cs.kernelInflight = 0
 	cs.recvArmed = false
 	cs.recvOutstanding = 0

@@ -191,11 +191,19 @@ func clampBufRingCount(n int) int {
 // so that the zero entry holds nothing. Both sit in detached's padding, so the
 // entry stays 24 bytes on 64-bit platforms
 // (TestPendingReleaseEntryStaysTwentyFourBytes).
+//
+// zcHeld marks an entry the backstop found still owing a SEND_ZC and held
+// (celeris#812, see closedZCOwed and holdZCPastBackstop): the kernel may still
+// read cs.sendBuf, so its array is held, off this queue, until that op's
+// notification arrives, however long past releaseAtNanos. It records only
+// that the hold was counted (CloseZCNotifHeld), once per entry, for an entry
+// that comes back to the queue and is held again; the same padding holds it.
 type pendingReleaseEntry struct {
 	cs             *connState
 	releaseAtNanos int64
 	detached       bool
 	holdsFD        bool
+	zcHeld         bool
 	fd             int32
 }
 
@@ -215,6 +223,17 @@ type closedOpsEntry struct {
 	// (TestClosedOpsEntryStaysThirtyTwoBytes). 32-bit platforms have no
 	// padding there, and the entry grows from 16 to 20 bytes.
 	handoff bool
+	// zcOwed is the part of inflight that is a SEND_ZC (celeris#812): the
+	// send, and after its first CQE its notification. The kernel may read
+	// the conn's sendBuf until that notification. noteClosedInflight adds
+	// one per conn whose send in flight is a SEND_ZC, and
+	// noteStaleTerminalOp takes it off at that op's terminal CQE (see
+	// there). closedZCOwed reads it, so the release backstop holds the
+	// connState, and the send buffer with it, until the kernel is done with
+	// the buffer. A conn has one send in flight at most, so a byte is ample
+	// even under a collision; it takes the byte of padding between handoff
+	// and fdOps, and the entry keeps its size on every platform.
+	zcOwed uint8
 	// fdOps is the part of inflight that still names the descriptor
 	// (celeris#798): all of it but the SEND_ZC notifications whose send has
 	// completed. noteClosedInflight adds each conn's fdOps; staleConnCQE
@@ -243,6 +262,24 @@ type closedOpsEntry struct {
 // kernel-held op may still reference cs.buf and releasing is a
 // last-resort trade of a potential use-after-free against an
 // unbounded memory leak.
+//
+// One op is exempt, because for it the trade is not a last resort: a
+// SEND_ZC, whose terminal CQE is its notification (celeris#812). The
+// kernel posts it once no queued segment references the send buffer's
+// pages any more, and a peer that stopped reading keeps the unsent tail
+// queued on the socket for as long as the socket lives: after a close,
+// until the kernel gives up on the orphaned socket, minutes on a peer that
+// keeps acknowledging its closed window. Until then the kernel reads
+// cs.sendBuf whenever the peer opens its window, so a release there was a
+// certain use-after-free, not a potential one: the peer received whatever
+// the array's next owner wrote into it. The backstop holds such a
+// send buffer until the notification arrives instead (closedZCOwed,
+// holdZCPastBackstop). Nothing but the peer decides how long that is: a peer
+// that keeps reading, however slowly, keeps the orphaned socket alive. So the
+// hold is kept off this queue's walk, keeps the array alone once the SEND_ZC
+// is all that is owed, shows in the CloseZCNotifHeldNow/Bytes gauges, and
+// stops the worker arming new SEND_ZCs while it holds zcHoldBytesMax (see
+// zc_send_buffer.go). It never costs a descriptor.
 //
 // 5 s is comfortably above any plausible straggler window: TCP
 // retransmits begin at RTO_MIN = 200 ms and a 4 KiB POST tail
@@ -480,7 +517,9 @@ type Worker struct {
 	// "s.allocCount != s.nelems" span-corruption (v1.4.15/7beebb9, both bench runs). Neither is
 	// race-detectable because the writer is the kernel, not Go code.
 	// releaseAtNanos is only the anomaly backstop — see
-	// pendingReleaseHoldNanos.
+	// pendingReleaseHoldNanos, which also says why it never gives up a
+	// send buffer a SEND_ZC may still read (celeris#812), and holds it off
+	// this queue instead (zcHolds).
 	pendingRelease []pendingReleaseEntry
 	// closeFDOwed counts the pendingRelease entries that still hold their
 	// descriptor open (holdsFD, celeris#685). The worker does not park
@@ -508,6 +547,19 @@ type Worker struct {
 	// releases all colliding conns only after every expected terminal
 	// CQE arrived (errs toward holding longer; see closedOpsEntry).
 	closedOps map[uint64]*closedOpsEntry
+	// zcHolds are the send buffers the pendingRelease backstop holds past
+	// its deadline for a SEND_ZC still owed on them (celeris#812), keyed by
+	// the closed identity (connOpKey) whose CQEs settle them
+	// (settleZCHolds, from noteStaleTerminalOp). Kept off pendingRelease,
+	// which the loop walks every pass, because a hold lasts as long as the
+	// peer keeps its orphaned socket alive (see zc_send_buffer.go).
+	// zcHoldCount and zcHoldBytes are what they hold: the worker's share of
+	// the held-now gauges, and zcHoldBytes is what prepSendSQE checks
+	// against zcHoldBytesMax. Worker thread only; nil/zero whenever nothing
+	// is held.
+	zcHolds     map[uint64][]zcHold
+	zcHoldCount int
+	zcHoldBytes int
 
 	// shutdownDrainDeadline is the wall-clock (UnixNano) bound on the
 	// send drain the run loop performs once its context is cancelled
@@ -1725,7 +1777,11 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 			// still owed (CloseFDForced, must stay 0). Either way the
 			// gen collision comes ON TOP. When it fires, the closed conn's
 			// closedOps entry is left orphaned and the 5 s backstop WARN
-			// in drainPendingRelease is the production signal.
+			// in drainPendingRelease is the production signal. If the CQE
+			// taken was the closed conn's SEND_ZC notification, its zcOwed
+			// stays set and the backstop holds that connState for good
+			// instead (celeris#812, CloseZCNotifHeld): one connState
+			// leaked, the safe side of the trade.
 			if cs.kernelInflight > 0 {
 				cs.kernelInflight--
 			}
@@ -1768,6 +1824,18 @@ func (w *Worker) staleConnCQE(c *completionEntry, fd int, ud uint64) bool {
 // (conn closed with zero in-flight ops, or already backstop-released).
 // namedFD says whether the op still named the descriptor until this CQE
 // (closedOpsEntry.fdOps): false only for a SEND_ZC notification.
+//
+// A send's terminal CQE also ends a SEND_ZC's hold on the send buffer
+// (closedOpsEntry.zcOwed, celeris#812) when it is the SEND_ZC's: its
+// notification (namedFD false), or, for a SEND_ZC whose first CQE came
+// without IORING_CQE_F_MORE and so has no notification to follow, that first
+// CQE. The latter looks like a plain send's CQE, so it is taken for the
+// SEND_ZC's only where the identity holds one conn, whose one send in flight
+// it is. Under an (fd, generation) collision only a notification ends a hold:
+// holding late costs memory, releasing early sends a peer another
+// connection's bytes. Whatever the CQE changed, the send buffers held for the
+// identity past the backstop are then settled (settleZCHolds): the lookup
+// that costs is paid only while some hold exists.
 func (w *Worker) noteStaleTerminalOp(ud uint64, namedFD bool) {
 	if len(w.closedOps) == 0 {
 		return
@@ -1781,11 +1849,21 @@ func (w *Worker) noteStaleTerminalOp(ud uint64, namedFD bool) {
 	if namedFD && e.fdOps > 0 {
 		e.fdOps--
 	}
+	if ud&udMask == udSend && e.zcOwed > 0 && (!namedFD || len(e.conns) == 1) {
+		e.zcOwed--
+	}
+	if len(w.zcHolds) > 0 {
+		w.settleZCHolds(key, e)
+	}
 	if e.inflight > 0 {
 		return
 	}
 	for _, cs := range e.conns {
-		cs.kernelInflight = 0
+		// nil: a conn whose SEND_ZC hold released it and kept its array
+		// alone (releaseHeldConnState); the pool may have handed it on.
+		if cs != nil {
+			cs.kernelInflight = 0
+		}
 	}
 	delete(w.closedOps, key)
 }
@@ -4275,6 +4353,9 @@ func (w *Worker) noteClosedInflight(cs *connState) {
 	}
 	e.inflight += cs.kernelInflight
 	e.fdOps += int16(fdOps(cs))
+	if zcSendOwed(cs) {
+		e.zcOwed++
+	}
 	e.conns = append(e.conns, cs)
 }
 
@@ -4285,11 +4366,21 @@ func (w *Worker) noteClosedInflight(cs *connState) {
 // conn. Any conns colliding on the same identity lose their accounting
 // too and will be reaped by their own backstop — acceptable for a path
 // that only fires on kernel anomalies.
+//
+// It is also where the accounting lets go of a SEND_ZC the kernel may still
+// read cs.sendBuf for (celeris#812): the backstop holds an entry that owes
+// one (closedZCOwed), so an identity dropped with zcOwed above zero is a send
+// buffer given up while the kernel may still send from it. Counted
+// (CloseZCNotifForced); must stay 0.
 func (w *Worker) dropClosedOps(cs *connState) {
 	if len(w.closedOps) == 0 {
 		return
 	}
-	delete(w.closedOps, encodeConnOpKey(cs.fd, cs.generation))
+	key := encodeConnOpKey(cs.fd, cs.generation)
+	if e := w.closedOps[key]; e != nil && e.zcOwed > 0 {
+		w.handoffLoss.noteCloseZCNotifForced()
+	}
+	delete(w.closedOps, key)
 }
 
 // queuePendingRelease enqueues cs for deferred release: drainPendingRelease
@@ -4347,7 +4438,11 @@ func (w *Worker) queuePendingReleaseDetached(cs *connState) {
 // the kernel never delivered a terminal CQE for an op we believe it
 // holds — log a WARN, since releasing now trades a potential
 // use-after-free against an unbounded leak, and scrub the conn from
-// closedOps so a later CQE cannot touch the released memory.
+// closedOps so a later CQE cannot touch the released memory. The one
+// exception is an entry that still owes a SEND_ZC (celeris#812,
+// closedZCOwed): its send buffer is held past the backstop until the
+// notification arrives, off this walk (Worker.zcHolds), see
+// pendingReleaseHoldNanos.
 //
 // Detached entries skip the pool recycle (releaseConnState would
 // reset fields that goroutine closures may still observe via the
@@ -4374,6 +4469,15 @@ func (w *Worker) drainPendingRelease() {
 			}
 			if entry.releaseAtNanos > w.cachedNow {
 				kept = append(kept, *entry)
+				continue
+			}
+			// Past the backstop. A SEND_ZC the kernel may still read
+			// cs.sendBuf for is no anomaly (celeris#812): the send buffer is
+			// held, off this walk, until that op's notification, and the
+			// backstop gives up only the descriptor, as it always has
+			// (holdZCPastBackstop).
+			if w.closedZCOwed(cs) {
+				w.holdZCPastBackstop(entry)
 				continue
 			}
 			// Backstop: kernel anomaly, not normal flow.
@@ -4671,15 +4775,6 @@ func (w *Worker) finishCloseDetached(fd int, cs *connState) {
 	closeUnlessOwed(fd, owed)
 }
 
-// runAsyncHandler is the dispatch goroutine for an HTTP1 conn when
-// Config.AsyncHandlers is enabled. Drains cs.asyncInBuf in a loop: take
-// currently-buffered bytes, run ProcessH1 under cs.detachMu (serializes
-// with worker-initiated writeBuf/sendBuf mutations), enqueue on
-// detachQueue so the worker submits SEND SQEs on its own goroutine
-// (SINGLE_ISSUER — handler Gs cannot call ring.GetSQE directly).
-// Preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
-// request in the slice in order, and responses land on cs.writeBuf in
-// the same order before the flush.
 // promoteConnToAsync hands a conn that bailed from the inline fast path
 // (ErrAsyncDispatch) to its per-conn dispatch goroutine, seeding it with the
 // stashed request bytes. Mirrors the tail of the async-dispatch block. The
@@ -4757,7 +4852,7 @@ func (w *Worker) asyncHeaderDeadline(cs *connState) int64 {
 // inline fast path (celeris#364). True when single-shot recv is in use, the
 // conn recorded the route that promoted it, and that route's promotion has
 // since expired (RouteAsync now false — the route-level TTL de-promotion).
-// Called by runAsyncHandler ONLY while holding asyncInMu with asyncInBuf empty.
+// Called by serveAsync ONLY while holding asyncInMu with asyncInBuf empty.
 func (w *Worker) canRevertToInline(cs *connState) bool {
 	return w.bufRing == nil && cs.promotedPath != "" && cs.h1State != nil &&
 		cs.h1State.RouteAsync != nil &&
@@ -4768,31 +4863,100 @@ func (w *Worker) canRevertToInline(cs *connState) bool {
 		!cs.h1State.RouteAsync(cs.promotedMethod, cs.promotedPath)
 }
 
+// runAsyncHandler is cs's dispatch goroutine: serveAsync, plus the teardown
+// for a serveAsync that does not return (celeris#791).
+//
+// celeris.Server's router recovers a handler panic itself, on this path as
+// on the inline one, and answers 500. What reaches here is a panic that
+// escapes the router (a stream.Handler used directly, or the engine's own
+// request handling) and a runtime.Goexit (t.FailNow in a test handler, for
+// one), which no recover stops. Either can unwind serveAsync from inside
+// ProcessH1, where this goroutine holds cs.detachMu; abortAsyncHandler
+// releases it and gives the conn the teardown a handler error gets.
 func (w *Worker) runAsyncHandler(cs *connState) {
 	defer w.asyncWG.Done()
+	// held: this goroutine holds cs.detachMu (serveAsync sets it after each
+	// Lock and clears it before each Unlock). returned: serveAsync returned,
+	// so neither a panic nor a Goexit is unwinding through here.
+	var held, returned bool
 	defer func() {
-		if r := recover(); r != nil {
-			if w.logger != nil {
-				w.logger.Error("async handler panicked",
-					"panic", r,
-					"stack", string(debug.Stack()),
-					"fd", cs.fd,
-				)
-			}
-			cs.asyncClosed.Store(true)
-			cs.asyncInMu.Lock()
-			cs.asyncInBuf = cs.asyncInBuf[:0]
-			cs.endDispatch() // enqueued below: that is the hand-back
-			cs.asyncInMu.Unlock()
-			// Wake the worker so it observes asyncClosed and tears
-			// down the conn via the detachQueue → drain path.
-			w.detachQMu.Lock()
-			w.detachQueue = append(w.detachQueue, cs)
-			w.detachQPending.Store(1)
-			w.detachQMu.Unlock()
-			w.wakeFD.Signal()
+		if !returned {
+			w.abortAsyncHandler(cs, recover(), held)
 		}
 	}()
+	w.serveAsync(cs, &held)
+	returned = true
+}
+
+// abortAsyncHandler tears cs down after its dispatch goroutine's handler
+// panicked (r is the recovered value) or called runtime.Goexit (r is nil, and
+// the goroutine ends when this returns). Deferred by runAsyncHandler, on the
+// dispatch goroutine.
+//
+// It releases cs.detachMu first, if this goroutine still holds it: held, and
+// not already released on this goroutine's behalf by a Detach inside
+// ProcessH1 (asyncDetachUnlocked, celeris#273; Unlocking that again would be
+// a fatal "unlock of unlocked mutex", cf. celeris#309). That is before the
+// log, too, whose handler is the application's and may be slow, while the
+// worker's shutdown and the guarded writes of a detached conn take the lock
+// unconditionally. The rest is the handler-error teardown in serveAsync:
+// asyncClosed, endDispatch under asyncInMu, then the hand-back through the
+// detach queue, whose asyncClosed branch runs closeConn on the worker. Like
+// that path it never holds two of detachMu, asyncInMu and detachQMu at once.
+// Nothing here touches cs after the enqueue.
+//
+// The lock is free from the release on, so a closeConn that meets cs before
+// the hand-back (a recv FIN or error, the timeout reap, shutdown) takes it
+// and closes the conn while this goroutine still logs: the fd is closed and
+// may be reissued, and CloseH1 releases the stream (celeris#844 tracks a
+// panic value that shares its memory). cs stays valid: a conn that has a
+// detachMu is closed by finishCloseDetached, which never pools it
+// (queuePendingReleaseDetached), and the drain skips the hand-back of a conn
+// already detachClosed. endDispatch clears asyncRun after the release, so a
+// worker that finds the lock held while the goroutine reads as gone
+// (dispatchBusy false) waits only for a bounded holder.
+func (w *Worker) abortAsyncHandler(cs *connState, r any, held bool) {
+	if held && !cs.asyncDetachUnlocked {
+		cs.detachMu.Unlock()
+	}
+	if w.logger != nil {
+		if r != nil {
+			w.logger.Error("async handler panicked",
+				"panic", r,
+				"stack", string(debug.Stack()),
+				"fd", cs.fd,
+			)
+		} else {
+			w.logger.Error("async handler exited without returning (runtime.Goexit)",
+				"stack", string(debug.Stack()),
+				"fd", cs.fd,
+			)
+		}
+	}
+	cs.asyncClosed.Store(true)
+	cs.asyncInMu.Lock()
+	cs.asyncInBuf = cs.asyncInBuf[:0]
+	cs.endDispatch() // enqueued below: that is the hand-back
+	cs.asyncInMu.Unlock()
+	// Wake the worker so it observes asyncClosed and tears
+	// down the conn via the detachQueue → drain path.
+	w.enqueueDetach(cs)
+}
+
+// serveAsync is the dispatch goroutine's loop (see runAsyncHandler). It
+// drains cs.asyncInBuf: it takes the currently-buffered bytes, runs
+// ProcessH1 under cs.detachMu (serializing with the worker's writeBuf and
+// sendBuf mutations), and hands what it could not write to the worker
+// through the detach queue, so the worker submits the SEND SQEs on its own
+// goroutine (SINGLE_ISSUER: a handler goroutine cannot call ring.GetSQE).
+// It preserves HTTP/1.1 pipelining: ProcessH1's offset loop drains every
+// request in the slice in order, and the responses land on cs.writeBuf in
+// the same order before the flush.
+//
+// *held tracks its Lock and Unlock of cs.detachMu, for abortAsyncHandler.
+// It stays set across a Detach inside ProcessH1, which releases the lock on
+// this goroutine's behalf and records that in asyncDetachUnlocked instead.
+func (w *Worker) serveAsync(cs *connState, held *bool) {
 	for {
 		cs.asyncInMu.Lock()
 		if cs.relinkOwed {
@@ -4882,6 +5046,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		if !cs.asyncDetachUnlocked {
 			cs.detachMu.Lock()
 			acquiredDetachMu = true
+			*held = true
 		}
 		// Re-check asyncClosed under detachMu (when we acquired it).
 		// closeConn sets asyncClosed BEFORE taking detachMu to run
@@ -4891,6 +5056,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 		// don't call ProcessH1 on a closed state.
 		if cs.asyncClosed.Load() {
 			if acquiredDetachMu {
+				*held = false
 				cs.detachMu.Unlock()
 			}
 			// Nor does this one; see the loop-top exit.
@@ -4939,6 +5105,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 					promoteErr = werr
 				}
 			}
+			*held = false
 			cs.detachMu.Unlock()
 			if promoteErr != nil {
 				// Fatal — route through the asyncClosed teardown so the
@@ -5045,6 +5212,7 @@ func (w *Worker) runAsyncHandler(cs *connState) {
 				cs.writeBuf = cs.writeBuf[:0]
 			}
 		}
+		*held = false
 		cs.detachMu.Unlock()
 
 		if processErr != nil {
@@ -5722,7 +5890,11 @@ func (w *Worker) prepSendSQE(sqe unsafe.Pointer, cs *connState, linked bool) {
 	// classifier reads cs.sendIsZC, never w.sendZC, because the fallbacks
 	// clear w.sendZC while sends armed under it are still in flight
 	// (celeris#609).
-	cs.sendIsZC = useSendZC(w.sendZC, linked, len(cs.sendBuf))
+	//
+	// A worker holding zcHoldBytesMax of send buffers past the release
+	// backstop arms no new SEND_ZC until those holds end: that is what bounds
+	// them (celeris#812, see zc_send_buffer.go).
+	cs.sendIsZC = useSendZC(w.sendZC && w.zcHoldBytes < zcHoldBytesMax, linked, len(cs.sendBuf))
 	if cs.sendIsZC {
 		// celeris#591 exposure witnesses. Deliberately inside the ZC arm:
 		// every sub-sendZCMinBytes and every linked send — the per-request
@@ -6300,7 +6472,10 @@ func (w *Worker) shutdown() {
 		// still-running sibling worker while this ring's kernel side can
 		// still write into it (same #256-class UAF, shutdown variant).
 		// The conns remain reachable via w.conns until the Worker itself
-		// is collected, well after the ring teardown cancels its ops.
+		// is collected, well after the ring teardown cancels its ops. A
+		// SEND_ZC's send buffer is the exception: no cancel or teardown
+		// ends the kernel's use of it, so retainZCSendBufsAtShutdown keeps
+		// the ones still owed past the Worker (celeris#812).
 	}
 	// celeris#657 R2: this worker is gone, so it must not leave its last
 	// cycle's residue standing in the engine-wide gauges. Nothing else
@@ -6320,6 +6495,12 @@ func (w *Worker) shutdown() {
 	// goroutines this function only joins below — can write this descriptor
 	// number once it is free to be recycled.
 	w.wakeFD.Close()
+	// celeris#812: the ring's last word on which SEND_ZC send buffers the
+	// kernel is done with. Every buffer it cannot clear by now is kept for
+	// the life of the process: nothing would ever say when the kernel lets
+	// go of it, and the Worker, which is all that holds it, can be
+	// collected once the engine is dropped.
+	w.retainZCSendBufsAtShutdown()
 	if w.bufRing != nil && w.ring != nil {
 		w.bufRing.Close(w.ring)
 	}
