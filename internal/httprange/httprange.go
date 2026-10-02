@@ -19,15 +19,15 @@ import (
 type Outcome uint8
 
 const (
-	// Full: ignore the Range header and send the whole representation (200).
+	// Full means: ignore the Range header and send the whole representation (200).
 	// Used when there is no Range header, the method is not GET, If-Range
 	// does not hold, the unit is not "bytes", the range set is invalid, the
 	// representation is empty, or more than one range is satisfiable.
 	Full Outcome = iota
-	// Partial: send 206 with the single range [start, end] (inclusive) and
+	// Partial means: send 206 with the single range [start, end] (inclusive) and
 	// Content-Range: bytes start-end/size.
 	Partial
-	// Unsatisfiable: send 416 with Content-Range: bytes */size. No byte of
+	// Unsatisfiable means: send 416 with Content-Range: bytes */size. No byte of
 	// the representation satisfies the range set.
 	Unsatisfiable
 )
@@ -75,6 +75,12 @@ func IfRange(ifRange, etag, lastModified string) bool {
 	lm := trimOWS(lastModified)
 	if lm == "" {
 		return false
+	}
+	// The client echoes the field value it was given: an exact match needs
+	// no date parsing (two http.ParseTime calls cost ~0.5 µs). A different
+	// spelling of the same instant (RFC 850, asctime) is still accepted below.
+	if v == lm {
+		return true
 	}
 	t, err := http.ParseTime(v)
 	if err != nil {
