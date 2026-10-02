@@ -36,7 +36,8 @@
 //
 // The middleware has no built-in authentication; OpenAPI specs may expose
 // internal API structure, so place it after auth middleware to protect the
-// endpoints.
+// endpoints. Without it, every path above is public, including the
+// embedded Swagger UI bundle, a 1.5 MiB response at a fixed URL.
 //
 //	//go:embed openapi.json
 //	var spec []byte

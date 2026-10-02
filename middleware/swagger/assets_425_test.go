@@ -237,36 +237,38 @@ func TestEmbeddedAssetMethods425(t *testing.T) {
 
 // TestEmbeddedLicenceNoticesServed425: the upstream licence notices are
 // served next to the bundles, including the file each bundle's first line
-// points at.
+// points at, as plain text (a notice served as a script or a stylesheet is
+// not readable as one).
 func TestEmbeddedLicenceNoticesServed425(t *testing.T) {
 	t.Parallel()
 	u := embeddedBundleURL425(t)
 	dir := path.Dir(u)
 	mw := New(Config{SpecContent: jsonSpec})
-	get := func(p string) string {
+	const js, text = "text/javascript; charset=utf-8", "text/plain; charset=utf-8"
+	get := func(p, contentType string) string {
 		t.Helper()
 		rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", p)
 		testutil.AssertNoError(t, err)
 		testutil.AssertStatus(t, rec, 200)
-		testutil.AssertHeaderContains(t, rec, "content-type", "text/")
+		testutil.AssertHeader(t, rec, "content-type", contentType)
 		return rec.BodyString()
 	}
 
-	bundle := get(u)
+	bundle := get(u, js)
 	m := regexp.MustCompile(`^/\*! For license information please see (\S+) \*/`).FindStringSubmatch(bundle)
 	if m == nil {
 		t.Fatalf("bundle does not start with its licence pointer: %.80q", bundle)
 	}
-	if got := get(dir + "/" + m[1]); !strings.Contains(got, "MIT") {
+	if got := get(dir+"/"+m[1], text); !strings.Contains(got, "MIT") {
 		t.Errorf("%s: no MIT notice in %.80q", m[1], got)
 	}
-	if got := get(dir + "/swagger-ui-standalone-preset.js.LICENSE.txt"); !strings.Contains(got, "@license") {
+	if got := get(dir+"/swagger-ui-standalone-preset.js.LICENSE.txt", text); !strings.Contains(got, "@license") {
 		t.Errorf("preset notices: %.80q", got)
 	}
-	if got := get(dir + "/LICENSE"); !strings.Contains(got, "Apache License") || !strings.Contains(got, "Version 2.0") {
+	if got := get(dir+"/LICENSE", text); !strings.Contains(got, "Apache License") || !strings.Contains(got, "Version 2.0") {
 		t.Errorf("LICENSE is not the Apache-2.0 text: %.80q", got)
 	}
-	if got := get(dir + "/NOTICE"); got != "swagger-ui\nCopyright 2020-2021 SmartBear Software Inc.\n" {
+	if got := get(dir+"/NOTICE", text); got != "swagger-ui\nCopyright 2020-2021 SmartBear Software Inc.\n" {
 		t.Errorf("NOTICE = %q, want the upstream swagger-ui NOTICE", got)
 	}
 }
