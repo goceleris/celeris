@@ -112,6 +112,24 @@ import (
 //     batched per loop iteration (Worker.closeFDDeferredBatch).
 //   - closeFDForced: such descriptors the pendingRelease backstop closed
 //     with an op still owed. Must stay 0.
+//
+// And what a SEND_ZC's send buffer is kept for (celeris#812; see
+// zc_send_buffer.go), three more and two gauges:
+//
+//   - zcNotifHeld: holds the pendingRelease backstop started past its 5 s
+//     because a SEND_ZC was still owed on the send buffer, each until the
+//     notification. A rate: a connection closed on a peer that stopped
+//     reading mid-send.
+//   - zcHeldNow, zcHeldBytes: GAUGES, the send buffers held right now and
+//     their capacity in bytes, summed over the workers: each adds at a hold
+//     and takes off at its end, and a worker that shuts down takes off what
+//     it still held (retractZCHolds).
+//   - zcNotifForced: closed identities whose accounting was dropped with a
+//     SEND_ZC still owed, i.e. a send buffer given up to the pool or the GC
+//     while the kernel may still send from it. Must stay 0. The hold is
+//     decided on the identity, so only a change that breaks it can move this.
+//   - zcBufRetained: send buffers worker shutdown kept for the life of the
+//     process, because a SEND_ZC may still read them when the ring closes.
 type handoffLossStats struct {
 	staleRecvDataClosed       atomic.Uint64
 	staleRecvDataTransplanted atomic.Uint64
@@ -127,11 +145,42 @@ type handoffLossStats struct {
 	reapUnsupported           atomic.Uint64
 	closeFDDeferred           atomic.Uint64
 	closeFDForced             atomic.Uint64
+	zcNotifHeld               atomic.Uint64
+	zcNotifForced             atomic.Uint64
+	zcBufRetained             atomic.Uint64
+	zcHeldNow                 atomic.Int64
+	zcHeldBytes               atomic.Int64
 }
 
 func (s *handoffLossStats) noteCloseFDForced() {
 	if s != nil {
 		s.closeFDForced.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteCloseZCNotifHeld() {
+	if s != nil {
+		s.zcNotifHeld.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteCloseZCNotifForced() {
+	if s != nil {
+		s.zcNotifForced.Add(1)
+	}
+}
+
+func (s *handoffLossStats) noteShutdownZCBufRetained(n uint64) {
+	if s != nil {
+		s.zcBufRetained.Add(n)
+	}
+}
+
+// addZCHeld moves the held-now gauges by n buffers of bytes in all.
+func (s *handoffLossStats) addZCHeld(n, bytes int64) {
+	if s != nil && (n != 0 || bytes != 0) {
+		s.zcHeldNow.Add(n)
+		s.zcHeldBytes.Add(bytes)
 	}
 }
 
@@ -214,10 +263,17 @@ func (w *Worker) noteStaleRecvData(ud uint64) {
 // closedOps entry. Worker thread only.
 func (w *Worker) noteStaleRecvExemplar(c *completionEntry, fd int, ud uint64) {
 	var head []byte
-	if e := w.closedOps[connOpKey(ud)]; e != nil && len(e.conns) > 0 && w.bufRing == nil {
-		buf := e.conns[0].buf
-		n := min(int(c.Res), len(buf), 64)
-		head = buf[:n]
+	if e := w.closedOps[connOpKey(ud)]; e != nil && w.bufRing == nil {
+		// The first conn still registered: a SEND_ZC hold may have released
+		// one and left its slot nil (releaseHeldConnState).
+		for _, cs := range e.conns {
+			if cs != nil {
+				buf := cs.buf
+				n := min(int(c.Res), len(buf), 64)
+				head = buf[:n]
+				break
+			}
+		}
 	}
 	recvtheft.NoteStaleRecvData(w.id, fd, decodeGen(ud), c.Res, head)
 }
