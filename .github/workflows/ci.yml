@@ -634,6 +634,46 @@ jobs:
             echo "expected both tests and all four arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
+      # celeris#791: a handler panic, or runtime.Goexit, on an async dispatch
+      # goroutine must not take the conn's loop or worker with it. The panic's
+      # recover used to leave cs.detachMu locked, and closeConn then waited on
+      # it forever; a Goexit left the conn owned by a goroutine that no longer
+      # existed. The root race step above runs ./engine/epoll and ./engine/std
+      # without -v, where a test that stops running says nothing, and the
+      # engine/iouring step counts no name of these. So the eight run here by
+      # name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and an exact tally: the
+      # panic, Goexit and handler-error (control) arms of io_uring and epoll,
+      # and std's panic and Goexit arms, must each PASS and print one RESULT
+      # line that reads stopped=true, with no SKIP line. memlock stays at the
+      # runner's 8 MiB: one io_uring worker, the shape the defect wedged in
+      # (its two-worker shape and the adaptive arms run in job `adaptive`).
+      - name: celeris#791 handler panic and Goexit on a dispatch goroutine (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          uring='TestIouringAsyncHandlerPanicLeavesItsWorkerServing|TestIouringAsyncHandlerGoexitLeavesItsWorkerServing|TestIouringAsyncHandlerErrorLeavesItsWorkerServing'
+          epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing'
+          std='TestStdHandlerPanicLeavesTheEngineServing|TestStdHandlerGoexitLeavesTheEngineServing'
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          names="${uring}|${epoll}|${std}"
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791.log || true)
+          results=$(grep -cE 'celeris791 RESULT engine=' /tmp/c791.log || true)
+          stopped=$(grep -cE 'celeris791 RESULT engine=.* stopped=true( |$)' /tmp/c791.log || true)
+          echo "celeris#791 tests: want $want PASS, passed $passed, SKIP lines $skipped, RESULT lines $results, stopped=true $stopped, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$results" -ne "$want" ] || [ "$stopped" -ne "$want" ] || [ "$failed" -ne 0 ]; then
+            echo "expected all $want celeris#791 tests to PASS with no SKIP line, each with one RESULT line"
+            echo "reading stopped=true -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
@@ -771,6 +811,35 @@ jobs:
           if [ "$gran" -ne "$gwant" ] || [ "$gpassed" -ne "$gwant" ] || [ "$gskipped" -ne 0 ]; then
             echo "expected exactly $gwant celeris#662 adaptive tests to run and PASS with no SKIP line --"
             echo "were they renamed or removed, or did one skip? a skip is not coverage."
+            exit 1
+          fi
+      # celeris#791 through the adaptive engine: a handler panic on the start
+      # engine's (epoll's) dispatch goroutine, and on a connection the switch
+      # handed to io_uring (#383), must leave the worker serving. The step
+      # above runs both tests in the package run; this one runs them by name
+      # with the same raised memlock (two io_uring workers) and requires both
+      # to PASS, each with a RESULT line reading stopped=true, and no SKIP
+      # line. CELERIS_REQUIRE_UPSWITCH=1 turns their "io_uring unavailable"
+      # skip into a failure.
+      - name: celeris#791 adaptive arms (memlock raised, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_UPSWITCH: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestAdaptiveAsyncHandlerPanicLeavesTheStartEngineServing|TestAdaptiveAsyncHandlerPanicOnAnAdoptedConnLeavesItsWorkerServing'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./adaptive/ 2>&1 | tee /tmp/c791a.log
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791a.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791a.log || true)
+          stopped=$(grep -cE 'celeris791 RESULT engine=adaptive shape=(start|adopted) .* stopped=true$' /tmp/c791a.log || true)
+          echo "celeris#791 adaptive tests: want $want, passed $passed, SKIP lines $skipped, RESULT lines with stopped=true $stopped"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$stopped" -ne "$want" ]; then
+            echo "expected both celeris#791 adaptive tests to PASS with no SKIP line and a stopped=true RESULT line"
             exit 1
           fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
