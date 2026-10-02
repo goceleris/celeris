@@ -4,6 +4,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"html"
+	"net/url"
 	"path"
 	"regexp"
 	"strings"
@@ -74,16 +75,34 @@ func servePageAt425(t *testing.T, cfg Config, uiPath string) string {
 	rec, err := testutil.RunMiddlewareWithMethod(t, New(cfg), "GET", uiPath)
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
+	testutil.AssertNoHeader(t, rec, "cache-control")
 	return rec.BodyString()
+}
+
+// resolve425 resolves a page reference the way a browser does, against the
+// URL the page was loaded from.
+func resolve425(t *testing.T, pageURL, ref string) *url.URL {
+	t.Helper()
+	base, err := url.Parse(pageURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := url.Parse(ref)
+	if err != nil {
+		t.Fatalf("reference %q: %v", ref, err)
+	}
+	return base.ResolveReference(r)
 }
 
 // TestDefaultPageIsSelfContained425 loads the default Swagger UI page and
 // fetches every file it references through the same middleware: each must
-// be a same-origin path under BasePath, answered with the exact upstream
-// bytes, the right content type and an immutable cache lifetime.
+// resolve to a same-origin path under BasePath, answered with the exact
+// upstream bytes, the right content type and an immutable cache lifetime.
+// The page and the spec, whose URLs do not change on a redeploy, carry no
+// cache lifetime at all.
 func TestDefaultPageIsSelfContained425(t *testing.T) {
 	t.Parallel()
-	for _, bp := range []string{"", "/docs/api/"} {
+	for _, bp := range []string{"", "/docs/api/", "/"} {
 		t.Run("basepath="+bp, func(t *testing.T) {
 			t.Parallel()
 			trimmed := strings.TrimRight(bp, "/")
@@ -92,6 +111,12 @@ func TestDefaultPageIsSelfContained425(t *testing.T) {
 			}
 			mw := New(Config{SpecContent: jsonSpec, BasePath: bp})
 			body := servePageAt425(t, Config{SpecContent: jsonSpec, BasePath: bp}, trimmed+"/")
+			for _, p := range []string{trimmed + "/", trimmed + "/spec"} {
+				rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", p)
+				testutil.AssertNoError(t, err)
+				testutil.AssertStatus(t, rec, 200)
+				testutil.AssertNoHeader(t, rec, "cache-control")
+			}
 
 			refs := pageRefs425(body)
 			if len(refs) != 3 {
@@ -99,11 +124,12 @@ func TestDefaultPageIsSelfContained425(t *testing.T) {
 			}
 			seen := map[string]bool{}
 			for _, r := range refs {
-				if !strings.HasPrefix(r.url, trimmed+"/") || strings.HasPrefix(r.url, "//") {
-					t.Errorf("reference %q is not a same-origin path under %s/", r.url, trimmed)
+				u := resolve425(t, "http://app.test"+trimmed+"/", r.url)
+				if u.Host != "app.test" || !strings.HasPrefix(u.Path, trimmed+"/") {
+					t.Errorf("reference %q resolves to %s, not to a same-origin path under %s/", r.url, u, trimmed)
 					continue
 				}
-				name := path.Base(r.url)
+				name := path.Base(u.Path)
 				want, ok := upstreamSRI425["swagger-ui-dist@5.33.1/"+name]
 				if !ok {
 					t.Errorf("reference %q is not a Swagger UI file", r.url)
@@ -111,11 +137,11 @@ func TestDefaultPageIsSelfContained425(t *testing.T) {
 				}
 				seen[name] = true
 
-				rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", r.url)
+				rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", u.Path)
 				testutil.AssertNoError(t, err)
 				testutil.AssertStatus(t, rec, 200)
 				if got := sri425(rec.Body); got != want {
-					t.Errorf("GET %s: body %s (%d bytes), want the upstream file %s", r.url, got, len(rec.Body), want)
+					t.Errorf("GET %s: body %s (%d bytes), want the upstream file %s", u.Path, got, len(rec.Body), want)
 				}
 				wantType := "text/javascript"
 				if strings.HasSuffix(name, ".css") {
@@ -131,16 +157,62 @@ func TestDefaultPageIsSelfContained425(t *testing.T) {
 	}
 }
 
-// embeddedBundleURL425 returns the URL of the bundle script in the default
-// page, failing the test if the page loads it from another origin.
+// TestEmbeddedAssetsBehindPrefixStrippingProxy425: a reverse proxy that
+// publishes the app under /ext/ and strips that prefix (the browser asks
+// for /ext/swagger/, the app sees /swagger/) forwards only paths under
+// /ext/. Every file the default page references, resolved against the
+// page's public URL, must stay under /ext/ and, with /ext stripped, be
+// answered by the middleware with the upstream bytes. Such a deployment
+// sets a relative SpecURL, as here.
+func TestEmbeddedAssetsBehindPrefixStrippingProxy425(t *testing.T) {
+	t.Parallel()
+	for _, bp := range []string{"/swagger", "/docs/api", "/"} {
+		t.Run("basepath="+bp, func(t *testing.T) {
+			t.Parallel()
+			uiPath := strings.TrimRight(bp, "/") + "/"
+			cfg := Config{SpecURL: "openapi.json", BasePath: bp}
+			mw := New(cfg)
+			public := "https://proxy.test/ext" + uiPath
+
+			refs := pageRefs425(servePageAt425(t, cfg, uiPath))
+			if len(refs) != 3 {
+				t.Fatalf("page has %d script/stylesheet references, want 3: %+v", len(refs), refs)
+			}
+			for _, r := range refs {
+				u := resolve425(t, public, r.url)
+				if u.Host != "proxy.test" || !strings.HasPrefix(u.Path, "/ext/") {
+					t.Errorf("page at %s: reference %q resolves to %s, which the proxy does not forward", public, r.url, u)
+					continue
+				}
+				internal := strings.TrimPrefix(u.Path, "/ext")
+				want := upstreamSRI425["swagger-ui-dist@5.33.1/"+path.Base(internal)]
+				if want == "" {
+					t.Errorf("reference %q is not a Swagger UI file", r.url)
+					continue
+				}
+				rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", internal)
+				testutil.AssertNoError(t, err)
+				testutil.AssertStatus(t, rec, 200)
+				if got := sri425(rec.Body); got != want {
+					t.Errorf("GET %s (public %s): body %s, want the upstream file %s", internal, u.Path, got, want)
+				}
+			}
+		})
+	}
+}
+
+// embeddedBundleURL425 returns the path of the bundle script in the default
+// page, resolved against the page URL, failing the test if the page loads
+// it from another origin.
 func embeddedBundleURL425(t *testing.T) string {
 	t.Helper()
 	for _, r := range pageRefs425(servePage(t, Config{SpecContent: jsonSpec})) {
 		if path.Base(r.url) == "swagger-ui-bundle.js" {
-			if !strings.HasPrefix(r.url, "/swagger/") {
-				t.Fatalf("the default page loads the bundle from %q, not from /swagger/", r.url)
+			u := resolve425(t, "http://app.test/swagger/", r.url)
+			if u.Host != "app.test" || !strings.HasPrefix(u.Path, "/swagger/") {
+				t.Fatalf("the default page loads the bundle from %q (%s), not from /swagger/", r.url, u)
 			}
-			return r.url
+			return u.Path
 		}
 	}
 	t.Fatal("the default page has no swagger-ui-bundle.js reference")
@@ -200,22 +272,31 @@ func TestEmbeddedLicenceNoticesServed425(t *testing.T) {
 }
 
 // TestUnknownAssetPathPassesThrough425: only the embedded files are
-// answered; other paths under the assets prefix reach the next handler.
+// answered; other paths under the assets prefix reach the next handler, and
+// so does every other path when BasePath is "/".
 func TestUnknownAssetPathPassesThrough425(t *testing.T) {
 	t.Parallel()
 	u := embeddedBundleURL425(t)
 	mw := New(Config{SpecContent: jsonSpec})
-	for _, p := range []string{
-		path.Dir(u) + "/swagger-ui-bundle.js.map",
-		path.Dir(u) + "/",
-		"/swagger/assets/swagger-ui-dist@0.0.0/swagger-ui-bundle.js",
-		"/swagger/assets/",
+	root := New(Config{SpecContent: jsonSpec, BasePath: "/"})
+	for _, c := range []struct {
+		mw celeris.HandlerFunc
+		p  string
+	}{
+		{mw, path.Dir(u) + "/swagger-ui-bundle.js.map"},
+		{mw, path.Dir(u) + "/"},
+		{mw, "/swagger/assets/swagger-ui-dist@0.0.0/swagger-ui-bundle.js"},
+		{mw, "/swagger/assets/"},
+		{root, "/api/users"},
+		{root, "/swagger-ui-bundle.js"},
+		{root, "/assets/swagger-ui-dist@0.0.0/swagger-ui-bundle.js"},
+		{root, strings.TrimPrefix(u, "/swagger") + ".map"},
 	} {
-		rec, err := testutil.RunChain(t, []celeris.HandlerFunc{mw, okHandler}, "GET", p)
+		rec, err := testutil.RunChain(t, []celeris.HandlerFunc{c.mw, okHandler}, "GET", c.p)
 		testutil.AssertNoError(t, err)
 		testutil.AssertStatus(t, rec, 200)
 		if rec.BodyString() != "ok" {
-			t.Errorf("GET %s was answered by the middleware (%d bytes), want the next handler", p, len(rec.Body))
+			t.Errorf("GET %s was answered by the middleware (%d bytes), want the next handler", c.p, len(rec.Body))
 		}
 	}
 }

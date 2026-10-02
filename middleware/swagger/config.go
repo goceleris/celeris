@@ -93,9 +93,17 @@ type Config struct {
 
 	// BasePath is the URL prefix for the swagger endpoints.
 	// Default: "/swagger".
-	// The middleware registers:
-	//   {BasePath}/         — UI page
-	//   {BasePath}/spec     — raw spec file
+	// The middleware answers:
+	//   {BasePath}           — redirect to {BasePath}/
+	//   {BasePath}/          — UI page
+	//   {BasePath}/spec      — raw spec file
+	//   {BasePath}/assets/swagger-ui-dist@{SwaggerUIVersion}/*
+	//                        — the embedded Swagger UI files, when the
+	//                          page uses them (see CDN)
+	//
+	// Every one of these requests must reach the middleware: a router
+	// rule, route list or proxy that forwards only {BasePath}/ and
+	// {BasePath}/spec leaves the default page blank.
 	BasePath string
 
 	// SpecContent is the raw OpenAPI specification content (JSON or YAML).
@@ -151,8 +159,10 @@ type Config struct {
 	//   ReDoc:      {AssetsPath}/redoc.standalone.js
 	//
 	// The page is written for the versions in [SwaggerUIVersion],
-	// [ScalarVersion] and [ReDocVersion]. No integrity hash is emitted, as
-	// the files are yours. For example, with the static middleware:
+	// [ScalarVersion] and [ReDocVersion]. @scalar/api-reference ships its
+	// browser build as dist/browser/standalone.js: serve that file under
+	// the name standalone.min.js. No integrity hash is emitted, as the
+	// files are yours. For example, with the static middleware:
 	//
 	//   server.Use(static.New(static.Config{Root: "./swagger-ui-dist", Prefix: "/swagger-assets"}))
 	//   server.Use(swagger.New(swagger.Config{
@@ -170,13 +180,19 @@ type Config struct {
 	// browser refuses a file whose bytes differ from the release this
 	// package was built against. The page then needs cdn.jsdelivr.net in
 	// its Content-Security-Policy and the viewer's browser needs Internet
-	// access. Default: false.
+	// access. Wherever it is loaded from, Scalar's bundle also names
+	// fonts.scalar.com (its default fonts, Options "withDefaultFonts")
+	// and proxy.scalar.com (its request proxy, Options "proxyUrl").
+	// Default: false.
 	//
 	// By default Swagger UI is served from a copy embedded in this package,
 	// under {BasePath}/assets/swagger-ui-dist@{SwaggerUIVersion}/ (with the
-	// upstream LICENSE and NOTICE files), so the page needs no third-party
-	// origin. Scalar and ReDoc are not embedded: they need CDN or
-	// AssetsPath, and New panics if neither is set.
+	// upstream LICENSE and NOTICE files), so the page loads no script or
+	// stylesheet from a third-party origin. The page references the files
+	// relative to {BasePath}/, so they also load behind a reverse proxy
+	// that serves the page under another prefix. Scalar and ReDoc are not
+	// embedded: they need CDN or AssetsPath, and New panics if neither is
+	// set.
 	CDN bool
 }
 

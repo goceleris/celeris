@@ -64,11 +64,15 @@ var swaggerUIAssets = []embeddedAsset{
 	{"NOTICE", contentTypeText, swaggerUINotice},
 }
 
-// embeddedAssetsPrefix is the URL prefix of the embedded Swagger UI files
-// for a trimmed base path. The version in the path makes each URL name one
-// immutable file, so an upgrade is never served from a stale cache.
+// embeddedAssetsDir is where the embedded Swagger UI files live, relative
+// to the page at {BasePath}/. The version in the path makes each URL name
+// one immutable file, so an upgrade is never served from a stale cache.
+const embeddedAssetsDir = "assets/swagger-ui-dist@" + SwaggerUIVersion
+
+// embeddedAssetsPrefix is the URL path prefix of the embedded Swagger UI
+// files for a trimmed base path.
 func embeddedAssetsPrefix(basePath string) string {
-	return basePath + "/assets/swagger-ui-dist@" + SwaggerUIVersion
+	return basePath + "/" + embeddedAssetsDir
 }
 
 // embeddedAssetRoutes maps each embedded file's full URL path to it.
@@ -92,7 +96,7 @@ type assetRef struct {
 
 // swaggerUIRefs returns the stylesheet, bundle and preset references for
 // the configured asset source.
-func swaggerUIRefs(cfg Config, basePath string) (css, bundle, preset assetRef) {
+func swaggerUIRefs(cfg Config) (css, bundle, preset assetRef) {
 	switch {
 	case cfg.AssetsPath != "":
 		p := strings.TrimRight(cfg.AssetsPath, "/")
@@ -105,7 +109,10 @@ func swaggerUIRefs(cfg Config, basePath string) (css, bundle, preset assetRef) {
 			assetRef{p + "/swagger-ui-bundle.js", sriSwaggerUIBundle},
 			assetRef{p + "/swagger-ui-standalone-preset.js", sriSwaggerUIPreset}
 	default:
-		p := embeddedAssetsPrefix(basePath)
+		// Relative to the page, which is served only at {BasePath}/, so
+		// the files also load when a reverse proxy serves the page under
+		// another prefix (/ext/swagger/ forwarded to /swagger/).
+		p := embeddedAssetsDir
 		return assetRef{URL: p + "/swagger-ui.css"},
 			assetRef{URL: p + "/swagger-ui-bundle.js"},
 			assetRef{URL: p + "/swagger-ui-standalone-preset.js"}

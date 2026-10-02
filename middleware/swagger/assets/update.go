@@ -13,6 +13,11 @@
 // assets/swagger-ui-dist/, replacing the old copy. The files are written
 // byte for byte as published, so the embedded copy and the pinned CDN copy
 // have the same hash. Review the diff of pins.go before committing.
+//
+// The tests keep their own record of the upstream hashes, written by hand
+// so that a wrong pin or a changed embedded byte fails them: after a
+// version bump, update upstreamSRI425 and the swagger-ui-dist@<version>
+// paths in ../assets_425_test.go from the new tarballs too.
 package main
 
 import (

@@ -256,7 +256,7 @@ func TestDefaultEmbeddedAssetsUsed(t *testing.T) {
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `src="/swagger/assets/swagger-ui-dist@`+SwaggerUIVersion+`/swagger-ui-bundle.js"`)
+	assertContains(t, body, `src="assets/swagger-ui-dist@`+SwaggerUIVersion+`/swagger-ui-bundle.js"`)
 	assertNotContains(t, body, "unpkg.com")
 	assertNotContains(t, body, "cdn.jsdelivr.net")
 }
@@ -268,7 +268,7 @@ func TestCDNOptIn(t *testing.T) {
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
 	assertContains(t, body, `src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@`+SwaggerUIVersion+`/swagger-ui-bundle.js"`)
-	assertNotContains(t, body, "/swagger/assets/")
+	assertNotContains(t, body, "assets/swagger-ui-dist@")
 }
 
 func TestAssetsPathTrailingSlash(t *testing.T) {

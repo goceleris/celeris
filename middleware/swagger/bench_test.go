@@ -23,6 +23,23 @@ func BenchmarkSwaggerPassthrough(b *testing.B) {
 	}
 }
 
+// BenchmarkSwaggerPassthroughRootBasePath: with BasePath "/" every request
+// shares the base path, so this is what the middleware adds to every
+// application route.
+func BenchmarkSwaggerPassthroughRootBasePath(b *testing.B) {
+	mw := New(Config{SpecContent: benchSpec, BasePath: "/"})
+	handler := func(c *celeris.Context) error { return c.String(200, "ok") }
+	chain := []celeris.HandlerFunc{mw, handler}
+	opts := []celeristest.Option{celeristest.WithHandlers(chain...)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ctx, _ := celeristest.NewContext("GET", "/api/users", opts...)
+		_ = ctx.Next()
+		celeristest.ReleaseContext(ctx)
+	}
+}
+
 func BenchmarkSwaggerSpec(b *testing.B) {
 	mw := New(Config{SpecContent: benchSpec})
 	opts := []celeristest.Option{}

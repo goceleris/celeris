@@ -170,13 +170,15 @@ func New(config ...Config) celeris.HandlerFunc {
 		specURL = specPath
 	}
 
-	page := buildPage(cfg, basePath, specURL)
+	page := buildPage(cfg, specURL)
 
 	// The embedded Swagger UI files are served only when the page loads
 	// them; with AssetsPath or CDN their paths pass through.
 	var assets map[string]embeddedAsset
+	var assetsPrefix string
 	if cfg.Renderer == RendererSwaggerUI && cfg.AssetsPath == "" && !cfg.CDN {
 		assets = embeddedAssetRoutes(basePath)
+		assetsPrefix = embeddedAssetsPrefix(basePath) + "/"
 	}
 
 	var skip celeris.SkipHelper
@@ -189,14 +191,20 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		path := c.Path()
 
-		// Every path this middleware answers starts with basePath, so
-		// one prefix test lets all other requests through.
+		// Every path this middleware answers starts with basePath, so a
+		// request outside it passes on one prefix test.
 		if !strings.HasPrefix(path, basePath) {
 			return c.Next()
 		}
 
 		var asset embeddedAsset
 		if path != basePath && path != uiPath && path != specPath {
+			// A request that only shares basePath (with BasePath "/",
+			// every request) passes on the assets prefix test, before
+			// the map lookup hashes its path.
+			if assets == nil || !strings.HasPrefix(path, assetsPrefix) {
+				return c.Next()
+			}
 			var ok bool
 			if asset, ok = assets[path]; !ok {
 				return c.Next()
@@ -226,18 +234,18 @@ func New(config ...Config) celeris.HandlerFunc {
 }
 
 // buildPage generates the HTML page for the configured renderer.
-func buildPage(cfg Config, basePath, specURL string) string {
+func buildPage(cfg Config, specURL string) string {
 	switch cfg.Renderer {
 	case RendererScalar:
 		return buildScalarPage(cfg, specURL)
 	case RendererReDoc:
 		return buildReDocPage(cfg, specURL)
 	default:
-		return buildSwaggerUIPage(cfg, basePath, specURL)
+		return buildSwaggerUIPage(cfg, specURL)
 	}
 }
 
-func buildSwaggerUIPage(cfg Config, basePath, specURL string) string {
+func buildSwaggerUIPage(cfg Config, specURL string) string {
 	ui := cfg.UI
 
 	depth := 1 // Swagger UI default
@@ -245,7 +253,7 @@ func buildSwaggerUIPage(cfg Config, basePath, specURL string) string {
 		depth = *ui.DefaultModelsExpandDepth
 	}
 
-	css, bundle, preset := swaggerUIRefs(cfg, basePath)
+	css, bundle, preset := swaggerUIRefs(cfg)
 
 	data := swaggerUIPage{
 		Title:                    ui.Title,

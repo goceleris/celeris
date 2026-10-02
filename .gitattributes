@@ -1,5 +1,9 @@
 # Upstream Swagger UI files embedded by middleware/swagger (celeris#425). They
-# must stay byte for byte as published (their sha384 is pinned), so git never
-# converts line endings or text-merges them, and they are kept out of diffs
-# and GitHub's language statistics.
-middleware/swagger/assets/swagger-ui-dist/** binary linguist-vendored
+# must stay byte for byte as published (the bundles' sha384 is pinned), so git
+# never converts their line endings, and they are kept out of GitHub's language
+# statistics. The minified css and js are also never text-diffed or merged;
+# the licence notices still show in diffs, so a version bump's licence
+# changes can be reviewed.
+middleware/swagger/assets/swagger-ui-dist/** -text linguist-vendored
+middleware/swagger/assets/swagger-ui-dist/*.js -diff -merge
+middleware/swagger/assets/swagger-ui-dist/*.css -diff -merge
