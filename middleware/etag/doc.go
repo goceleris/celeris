@@ -5,9 +5,11 @@
 // requests, computes an ETag validator, and sets the ETag header. When a
 // request carries a matching If-None-Match header, it returns 304 Not
 // Modified with no body. Other methods and non-2xx or empty responses pass
-// through untouched, and so does a 206 Partial Content: its body is one part,
-// whose hash is not the representation's tag. If the downstream handler
-// already set an ETag header, that tag is reused rather than recomputed.
+// through untouched. A 206 Partial Content is never hashed: its body is one
+// part, whose hash is not the representation's tag. If the downstream
+// handler already set an ETag header, that tag is reused rather than
+// recomputed, on a 206 too, where a matching If-None-Match answers 304 as it
+// does for a full response.
 //
 // By default the validator is a CRC-32 (IEEE) checksum of the body, emitted
 // as a weak tag (W/"xxxxxxxx"). Configure behavior through [Config]:

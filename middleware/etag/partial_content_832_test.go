@@ -23,10 +23,11 @@ func run832(t *testing.T, mw, h celeris.HandlerFunc, opts ...celeristest.Option)
 // TestEtagLeavesPartialContentAlone832 is celeris#832 for etag. The
 // middleware hashes the buffered body, and for a 206 that body is the part:
 // the 206 carried an ETag that is not the representation's, and an
-// If-None-Match with that tag on a ranged request was answered 304. A 206
-// goes through untouched: no tag of the middleware's, no If-None-Match
-// evaluation (the middleware cannot know the representation's tag from a
-// part), and a tag the handler set itself is kept.
+// If-None-Match with that tag on a ranged request was answered 304. A 206 is
+// never hashed: no tag of the middleware's, and no If-None-Match evaluation
+// against a part's hash (the middleware cannot know the representation's tag
+// from a part). A tag the handler set itself is the representation's: it is
+// kept, and a matching If-None-Match gets 304, as main answered.
 func TestEtagLeavesPartialContentAlone832(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "f.txt")
 	if err := os.WriteFile(p, []byte("0123456789"), 0o600); err != nil {
@@ -68,5 +69,15 @@ func TestEtagLeavesPartialContentAlone832(t *testing.T) {
 	}
 	if r := run832(t, mw, own); r.StatusCode != 206 || r.Header("etag") != `"v1"` {
 		t.Errorf("206 with the handler's own ETag: %d etag %q, want 206 \"v1\"", r.StatusCode, r.Header("etag"))
+	}
+	// That tag is the representation's, so If-None-Match is evaluated
+	// against it, before the range (RFC 9110 §13.2.2): a match is 304, as a
+	// full response's is; another tag gets the part.
+	ranged := celeristest.WithHeader("range", "bytes=0-3")
+	if r := run832(t, mw, own, ranged, celeristest.WithHeader("if-none-match", `"v1"`)); r.StatusCode != 304 || len(r.Body) != 0 {
+		t.Errorf("ranged GET with If-None-Match of the handler's own tag: %d %q, want 304 with no body", r.StatusCode, r.Body)
+	}
+	if r := run832(t, mw, own, ranged, celeristest.WithHeader("if-none-match", `"v2"`)); r.StatusCode != 206 || string(r.Body) != "0123" || r.Header("etag") != `"v1"` {
+		t.Errorf("ranged GET with If-None-Match of another tag: %d %q etag %q, want 206 \"0123\" \"v1\"", r.StatusCode, r.Body, r.Header("etag"))
 	}
 }
