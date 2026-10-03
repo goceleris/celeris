@@ -194,6 +194,51 @@ func TestUnmatchedBuiltinAnswerNotTimed852(t *testing.T) {
 	}
 }
 
+// TestAsyncHandlersReadWhileStarting852: a driver opened WithEngine(srv)
+// calls Server.AsyncHandlers first, possibly while Start runs on another
+// goroutine with nothing ordering the two. With the sync default that call
+// reads router.unmatchedAdaptive, so Start must not write it then; with the
+// async default it returns before reading it. No route is registered, as an
+// async one would answer hasAsyncRoutes before the flag is read. Under -race
+// a write by Start is a DATA RACE report, which fails the test.
+func TestAsyncHandlersReadWhileStarting852(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		async bool // Config.AsyncHandlers
+		mw    bool // a global middleware
+	}{
+		{"sync-default", false, false},
+		{"sync-default/global-middleware", false, true},
+		{"async-default/global-middleware", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{Engine: Std, AsyncHandlers: tc.async})
+			if tc.mw {
+				s.Use(func(c *Context) error { return c.Next() })
+			}
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
+			for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); {
+				if got := s.AsyncHandlers(); got != tc.async {
+					t.Errorf("AsyncHandlers() = %v during Start, want %v", got, tc.async)
+					break
+				}
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Error("server did not stop within 10s")
+			}
+		})
+	}
+}
+
 // TestDetachedRequestNotAnsweredOnErrorOrPanic852: a global middleware
 // detaches the request and returns without Next (a Use-mounted websocket or
 // sse middleware does); a later global middleware returns an error or

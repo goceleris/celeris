@@ -66,8 +66,13 @@ func (a *routerAdapter) buildUnmatchedChains() {
 	s := a.server
 	a.notFoundChain = newUnmatchedChain(s.middleware, s.notFoundHandler, builtinNotFound)
 	a.methodNotAllowedChain = newUnmatchedChain(s.middleware, s.methodNotAllowedHandler, builtinMethodNotAllowed)
-	s.router.unmatchedAdaptive = s.router.defaultAsync &&
-		(len(s.middleware) > 0 || s.notFoundHandler != nil || s.methodNotAllowedHandler != nil)
+	// Written only when true: Server.AsyncHandlers, which a driver opened
+	// WithEngine may call while Start runs, reads the flag only when the
+	// default is sync, and then nothing writes it.
+	if s.router.defaultAsync &&
+		(len(s.middleware) > 0 || s.notFoundHandler != nil || s.methodNotAllowedHandler != nil) {
+		s.router.unmatchedAdaptive = true
+	}
 }
 
 // newUnmatchedChain is the chain a request no route matches runs
