@@ -542,12 +542,15 @@ jobs:
       # and panic value; otel copies the strings nested in SLICE and MAP
       # custom attributes and the attribute keys; singleflight waiters get
       # copies of the leader's response headers; and request_size_bytes keeps
-      # owned label values. Same shape as the step above: by name, one package
-      # at a time, CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact tally: the
-      # five top-level tests and all 35 arms (std, and epoll, io_uring and
-      # Adaptive with sync and async handlers; 10 of them io_uring and 10
-      # Adaptive) must PASS, with no SKIP line, and every go test must exit 0.
-      - name: celeris#742 request strings kept by slog, OTel SLICE/MAP attributes, singleflight waiters (io_uring arms required)
+      # owned label values. And the handler's error: the span records a copy
+      # of its message, and singleflight waiters and cache followers get the
+      # leader's error and panic value handed off. Same shape as the step
+      # above: by name, one package at a time, CELERIS_REQUIRE_IOURING_WORKERS=1,
+      # and an exact tally: the eight top-level tests and all 84 arms (std, and
+      # epoll, io_uring and Adaptive with sync and async handlers, per mode;
+      # 24 of them io_uring and 24 Adaptive) must PASS, with no SKIP line, and
+      # every go test must exit 0.
+      - name: celeris#742 request strings kept by slog, OTel attributes and errors, singleflight waiters, cache followers (io_uring arms required)
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -559,18 +562,21 @@ jobs:
           failed=0
           go test -race -count=1 -timeout=300s -v -run '^TestHandlerPanicLogSurvivesNextRequest$' . 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestPanicRecordsSurviveNextRequest$' ./middleware/recovery/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run '^TestWaiterResponseHeadersSurviveLeaderNextRequest$' ./middleware/singleflight/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
-          (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^TestCustomSliceMapAttributesSurviveNextRequest$' .) 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestWaiterResponseHeadersSurviveLeaderNextRequest|TestWaiterErrorAndPanicSurviveLeaderNextRequest)$' ./middleware/singleflight/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestFollowerErrorSurvivesLeaderNextRequest$' ./middleware/cache/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^(TestCustomSliceMapAttributesSurviveNextRequest|TestHandlerErrorSurvivesNextRequest)$' .) 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
           (cd middleware/metrics && go test -race -count=1 -timeout=300s -v -run '^TestRequestSizeLabelsSurviveNextRequest$' .) 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
-          tests='TestHandlerPanicLogSurvivesNextRequest|TestPanicRecordsSurviveNextRequest|TestWaiterResponseHeadersSurviveLeaderNextRequest|TestCustomSliceMapAttributesSurviveNextRequest|TestRequestSizeLabelsSurviveNextRequest'
+          tests='TestHandlerPanicLogSurvivesNextRequest|TestPanicRecordsSurviveNextRequest|TestWaiterResponseHeadersSurviveLeaderNextRequest|TestWaiterErrorAndPanicSurviveLeaderNextRequest|TestFollowerErrorSurvivesLeaderNextRequest|TestCustomSliceMapAttributesSurviveNextRequest|TestHandlerErrorSurvivesNextRequest|TestRequestSizeLabelsSurviveNextRequest'
+          # An arm's name is the engine arm, or "<mode>/<arm>" for the tests
+          # that run every arm per mode.
           top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c742.log || true)
           arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c742.log || true)
-          uring=$(grep -cE "^    --- PASS: (${tests})/io_uring" /tmp/c742.log || true)
-          adaptive=$(grep -cE "^    --- PASS: (${tests})/adaptive" /tmp/c742.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/([a-z-]+/)?io_uring" /tmp/c742.log || true)
+          adaptive=$(grep -cE "^    --- PASS: (${tests})/([a-z-]+/)?adaptive" /tmp/c742.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c742.log || true)
-          echo "celeris#742 tests: top-level PASS $top (want 5), arm PASS $arms (want 35), io_uring arm PASS $uring (want 10), adaptive arm PASS $adaptive (want 10), SKIP lines $skipped, go test runs failed $failed (want 0)"
-          if [ "$top" -ne 5 ] || [ "$arms" -ne 35 ] || [ "$uring" -ne 10 ] || [ "$adaptive" -ne 10 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
-            echo "expected all five tests and all 35 arms (10 io_uring, 10 Adaptive) to PASS with no SKIP line"
+          echo "celeris#742 tests: top-level PASS $top (want 8), arm PASS $arms (want 84), io_uring arm PASS $uring (want 24), adaptive arm PASS $adaptive (want 24), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 8 ] || [ "$arms" -ne 84 ] || [ "$uring" -ne 24 ] || [ "$adaptive" -ne 24 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all eight tests and all 84 arms (24 io_uring, 24 Adaptive) to PASS with no SKIP line"
             exit 1
           fi
       - name: middleware/protobuf
