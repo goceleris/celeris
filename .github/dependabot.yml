@@ -44,7 +44,10 @@ updates:
   # bump each of the tool's dependencies past what that release was built
   # with, and a tool can stop compiling that way. A new `tool` directive
   # needs its module added to this list. The rule is on this entry alone,
-  # so the modules above keep the direct-only default.
+  # so the modules above keep the direct-only default. golang.org/x/tools,
+  # which apidump imports, is deliberately not listed: it moves when an
+  # x/vuln bump raises it, so apidump and govulncheck build against the same
+  # x/tools.
   - package-ecosystem: gomod
     directory: /.github/tools
     allow:

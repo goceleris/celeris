@@ -48,7 +48,7 @@ type Stamp struct {
 // Stamps returns every place the version must be updated, in the order a
 // person would edit them.
 func Stamps() []Stamp {
-	out := make([]Stamp, 0, 2+len(SubModules))
+	out := make([]Stamp, 0, 3+len(SubModules))
 	out = append(out, []Stamp{
 		{
 			Path: "server.go",
@@ -59,6 +59,12 @@ func Stamps() []Stamp {
 			Path: "README.md",
 			Re:   regexp.MustCompile(`(?m)^## What's new in v` + SemverCore + `$`),
 			Line: func(v string) string { return "## What's new in v" + v },
+		},
+		{
+			// The root package's API golden file carries Version's value.
+			Path: "api/celeris.txt",
+			Re:   regexp.MustCompile(`(?m)^const Version untyped string = "` + SemverCore + `"$`),
+			Line: func(v string) string { return `const Version untyped string = "` + v + `"` },
 		},
 	}...)
 	for _, sub := range SubModules {

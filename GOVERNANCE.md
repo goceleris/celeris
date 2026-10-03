@@ -79,10 +79,11 @@ so the design can be discussed without a diff attached.
   maintainer runs it from `main` with the version as input
   (`gh workflow run release.yml -f version=vX.Y.Z`, or the Actions UI).
   The workflow checks that every version stamp already says `X.Y.Z`
-  (`mage CheckRelease`: `celeris.Version` in `server.go`, the four
-  `middleware/*/go.mod` pins, the README "What's new" heading), runs the
-  full CI, and only then creates the tag and the GitHub Release. A stale
-  stamp means no tag is created, so there is nothing to undo.
+  (`mage CheckRelease`: `celeris.Version` in `server.go` and its line in
+  `api/celeris.txt`, the four `middleware/*/go.mod` pins, the README
+  "What's new" heading), runs the full CI, and only then creates the tag
+  and the GitHub Release. A stale stamp means no tag is created, so there
+  is nothing to undo.
 - Before that, the stamps are moved in one normal PR, the **last PR before
   the release**: `VERSION=vX.Y.Z mage PrepRelease` rewrites all of them and
   leaves a placeholder under the README heading that `CheckRelease` refuses

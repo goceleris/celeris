@@ -12,6 +12,7 @@ Closes #
 
 - [ ] Unit tests added/updated
 - [ ] `mage check` passes
+- [ ] `mage api` run and `api/` committed, if an exported identifier changed
 - [ ] Tested on Linux (if engine changes)
 
 Tested on: [ ] std [ ] epoll [ ] io_uring — [ ] amd64 [ ] arm64

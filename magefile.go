@@ -39,6 +39,19 @@ func Build() error {
 	return run("go", "build", "./...")
 }
 
+// API rewrites the API golden files under api/ from the exported API of
+// every package (api/README.md). Run it in the PR that changes an exported
+// identifier and commit api/ with the change; CI fails while api/ is stale.
+func API() error {
+	return run("go", "-C", ".github/tools", "run", "./apidump", "-w")
+}
+
+// APICheck checks api/ against the exported API without writing it, as CI
+// does, and prints the diff when it is stale.
+func APICheck() error {
+	return run("go", "-C", ".github/tools", "run", "./apidump")
+}
+
 // Bench runs all benchmarks.
 func Bench() error {
 	return run("go", "test", "-bench=.", "-benchmem", "-run=^$", "./...")

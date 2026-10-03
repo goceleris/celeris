@@ -112,6 +112,7 @@ mage -l    # List all available targets
 - Include tests for new functionality
 - Run `mage check` before submitting (or `mage checkLinux` if touching engine code)
 - Follow existing code style (enforced by golangci-lint)
+- If the PR adds, removes or changes an exported identifier, run `mage api` and commit `api/` with it: the required **Lint** CI job fails at its step *api/ matches the exported API* until `api/` matches the exported API, and the diff of `api/` is how reviewers see the API change ([api/README.md](api/README.md))
 - Write clear commit messages following the `type: description` format (e.g., `feat:`, `fix:`, `perf:`, `security:`, `test:`, `chore:`)
 - Security-sensitive changes should note the CWE number in the commit message
 
