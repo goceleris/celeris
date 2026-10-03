@@ -111,6 +111,15 @@ type router struct {
 	// batching while genuinely-blocking handlers still get goroutine
 	// isolation. Built at registration; read-only while serving.
 	adaptiveRoutes map[string]bool
+	// unmatchedAdaptive (celeris#852) dispatches a request no route matches
+	// (a 404, a 405, an automatic OPTIONS answer) like a route that inherits
+	// the AsyncHandlers=true default: its chain runs the global middleware
+	// and any NotFound / MethodNotAllowed handler, which can block, so it
+	// starts inline and is promoted, under unmatchedAdaptiveKey, once an
+	// inline run is observed to block. Set by buildUnmatchedChains when the
+	// server default is async and that chain runs more than the built-in
+	// answer; read-only while serving.
+	unmatchedAdaptive bool
 	// promoted records adaptive fullPaths that have been promoted to async
 	// after sustained blocking inline runs. sync.Map: concurrent reads on the
 	// hot path, rare writes at promotion time.
@@ -444,15 +453,16 @@ func (r *router) reopenSettled() {
 
 // startSettleReopener starts the background goroutine that calls
 // reopenSettled every adaptiveSettleTTL (celeris#592). Called from
-// Server.doPrepare; a no-op when the server has no adaptive routes (nothing
-// can settle) or when the re-opener is already running. Idempotent.
+// Server.doPrepare; a no-op when the server has no adaptive routes and no
+// adaptive unmatched chain (nothing can settle) or when the re-opener is
+// already running. Idempotent.
 //
 // Off the request path by construction: the alternative designs (sample every
 // Nth request, or stamp the settled entry with a deadline and compare a clock)
 // both put work back on the hot path that celeris#361 removed, for the same
 // detection bound.
 func (r *router) startSettleReopener(interval time.Duration) {
-	if len(r.adaptiveRoutes) == 0 || interval <= 0 {
+	if (len(r.adaptiveRoutes) == 0 && !r.unmatchedAdaptive) || interval <= 0 {
 		return
 	}
 	r.reopenMu.Lock()
@@ -562,19 +572,34 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 	return route
 }
 
-// hasAsyncRoutes reports whether any registered route resolves to async
-// dispatch. The engine uses this (OR'd with the server default) to decide
-// whether to wire up the async dispatch infrastructure at all.
+// hasAsyncRoutes reports whether any registered route, or the unmatched
+// chain (unmatchedAdaptive), can resolve to async dispatch. The engine uses
+// this (OR'd with the server default) to decide whether to wire up the async
+// dispatch infrastructure at all.
 func (r *router) hasAsyncRoutes() bool {
-	return r.asyncRouteCount > 0
+	return r.asyncRouteCount > 0 || r.unmatchedAdaptive
+}
+
+// unmatchedAdaptiveKey is the adaptive key every request no route matches
+// shares (celeris#852): routeAsync cannot tell a 404 from a 405 without the
+// allowed-methods walk, so the dispatch decision is one for all of them. It
+// cannot collide with a route pattern, which starts with '/'.
+const unmatchedAdaptiveKey = "<unmatched>"
+
+// unmatchedPromoted reports whether a request no route matches is dispatched
+// async: unmatchedAdaptive, and an inline run of the unmatched chain blocked
+// (celeris#852).
+func (r *router) unmatchedPromoted() bool {
+	return r.unmatchedAdaptive && r.isPromoted(unmatchedAdaptiveKey)
 }
 
 // routeAsync resolves whether the route matching method+path runs async,
 // without filling a Params slice for the caller. Fully static routes (the
 // common async-annotated case, e.g. /api/...) resolve via the O(1) static
 // map with zero allocation; parameterised routes pay a scratch Params walk.
-// Returns false when no route matches (unmatched → 404 handler, which is
-// never async).
+// When no route matches, the request runs the unmatched chain, which is
+// dispatched like a route inheriting the server default (unmatchedPromoted,
+// celeris#852).
 func (r *router) routeAsync(method, path string) bool {
 	idx := methodIndex(method)
 	if idx >= 0 {
@@ -593,7 +618,10 @@ func (r *router) routeAsync(method, path string) bool {
 	var params Params
 	handlers, fullPath, async := r.find(method, path, &params)
 	if handlers == nil && method == "HEAD" {
-		_, fullPath, async = r.findHEADAsGET(path, &params, 0)
+		handlers, fullPath, async = r.findHEADAsGET(path, &params, 0)
+	}
+	if handlers == nil {
+		return r.unmatchedPromoted()
 	}
 	return async || r.adaptivePromoted(fullPath)
 }
