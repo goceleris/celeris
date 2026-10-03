@@ -35,5 +35,7 @@ func ExampleNew() {
 	if err != nil {
 		return
 	}
-	_ = eng
+	// New holds the port it picked until the engine starts; an engine that is
+	// built and never started must be shut down to give the port back.
+	defer func() { _ = eng.Shutdown(context.Background()) }()
 }
