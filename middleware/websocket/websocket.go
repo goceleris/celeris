@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -380,16 +381,25 @@ func captureParams(c *celeris.Context, clone bool) [][2]string {
 
 // peerAddr turns the peer address the engine reported for the connection
 // ("ip:port") into the net.Addr [Conn.RemoteAddr] returns: a *net.TCPAddr,
-// as the hijack path's net.Conn gives. An address that does not parse is
-// kept as it is.
+// as the hijack path's net.Conn gives. The engines report an IPv4 peer of a
+// dual-stack ("[::]:port") listener as "[a.b.c.d]:port", which
+// netip.ParseAddrPort rejects, so the host and the port are then parsed on
+// their own. An address that does not parse is kept as it is.
 func peerAddr(s string) net.Addr {
 	if s == "" {
 		return nil
 	}
-	if ap, err := netip.ParseAddrPort(s); err == nil {
-		return net.TCPAddrFromAddrPort(ap)
+	ap, err := netip.ParseAddrPort(s)
+	if err != nil {
+		host, port, serr := net.SplitHostPort(s)
+		ip, ierr := netip.ParseAddr(host)
+		p, perr := strconv.ParseUint(port, 10, 16)
+		if serr != nil || ierr != nil || perr != nil {
+			return rawAddr(s)
+		}
+		ap = netip.AddrPortFrom(ip, uint16(p))
 	}
-	return rawAddr(s)
+	return net.TCPAddrFromAddrPort(ap)
 }
 
 // rawAddr is a peer address kept as the engine reported it.
