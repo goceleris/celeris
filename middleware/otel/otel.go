@@ -78,25 +78,155 @@ func ownStrings(ps ...*string) {
 	}
 }
 
-// appendOwned appends attrs to dst with every string value copied. The
-// attributes come from CustomAttributes or CustomMetricAttributes, which
-// typically read request headers (views, see ownStrings). Keys are kept as
-// they are: they are expected to be constants.
+// appendOwned appends attrs to dst with every string in them copied: the
+// keys, STRING and STRINGSLICE values, and the values and map keys nested
+// in SLICE and MAP values, at any depth. The attributes come from
+// CustomAttributes or CustomMetricAttributes, which typically read request
+// headers (views, see ownStrings); a request string can sit in any of those
+// places, including a key (celeris#742). The copies share one allocation.
+// BYTESLICE values are copies already (attribute.ByteSliceValue converts).
 func appendOwned(dst, attrs []attribute.KeyValue) []attribute.KeyValue {
+	var o owner
+	k := 0
 	for _, kv := range attrs {
 		switch kv.Value.Type() {
-		case attribute.STRING:
-			kv = kv.Key.String(strings.Clone(kv.Value.AsString()))
-		case attribute.STRINGSLICE:
-			ss := kv.Value.AsStringSlice()
-			for i := range ss {
-				ss[i] = strings.Clone(ss[i])
-			}
-			kv = kv.Key.StringSlice(ss)
+		case attribute.STRINGSLICE, attribute.SLICE, attribute.MAP:
+			k++
 		}
-		dst = append(dst, kv)
+	}
+	if k > 0 {
+		// Room for the top-level lists; nested ones grow it.
+		o.lists = make([]ownedList, 0, k)
+	}
+	for _, kv := range attrs {
+		o.measureKV(kv)
+	}
+	if o.n == 0 {
+		return append(dst, attrs...)
+	}
+	var b strings.Builder
+	b.Grow(o.n)
+	for _, kv := range attrs {
+		o.writeKV(&b, kv)
+	}
+	o.rest, o.next = b.String(), 0
+	for _, kv := range attrs {
+		dst = append(dst, o.cutKV(kv))
 	}
 	return dst
+}
+
+// owner walks attributes three times in the same order: measure sums the
+// strings' lengths, write copies them into one buffer, and cut builds the
+// owned attributes from that buffer. A STRINGSLICE, SLICE or MAP value is
+// read out of the attribute (each As* call returns a new slice) once, in
+// measure, and the next passes reuse that list.
+type owner struct {
+	n     int
+	lists []ownedList
+	next  int
+	rest  string
+}
+
+// ownedList is one STRINGSLICE, SLICE or MAP value's elements.
+type ownedList struct {
+	ss  []string
+	vs  []attribute.Value
+	kvs []attribute.KeyValue
+}
+
+func (o *owner) measureKV(kv attribute.KeyValue) {
+	o.n += len(kv.Key)
+	o.measure(kv.Value)
+}
+
+func (o *owner) measure(v attribute.Value) {
+	switch v.Type() {
+	case attribute.STRING:
+		o.n += len(v.AsString())
+	case attribute.STRINGSLICE:
+		ss := v.AsStringSlice()
+		o.lists = append(o.lists, ownedList{ss: ss})
+		for _, s := range ss {
+			o.n += len(s)
+		}
+	case attribute.SLICE:
+		vs := v.AsSlice()
+		o.lists = append(o.lists, ownedList{vs: vs})
+		for _, e := range vs {
+			o.measure(e)
+		}
+	case attribute.MAP:
+		kvs := v.AsMap()
+		o.lists = append(o.lists, ownedList{kvs: kvs})
+		for _, e := range kvs {
+			o.measureKV(e)
+		}
+	}
+}
+
+func (o *owner) writeKV(b *strings.Builder, kv attribute.KeyValue) {
+	b.WriteString(string(kv.Key))
+	o.write(b, kv.Value)
+}
+
+func (o *owner) write(b *strings.Builder, v attribute.Value) {
+	switch v.Type() {
+	case attribute.STRING:
+		b.WriteString(v.AsString())
+	case attribute.STRINGSLICE, attribute.SLICE, attribute.MAP:
+		l := o.lists[o.next]
+		o.next++
+		for _, s := range l.ss {
+			b.WriteString(s)
+		}
+		for _, e := range l.vs {
+			o.write(b, e)
+		}
+		for _, e := range l.kvs {
+			o.writeKV(b, e)
+		}
+	}
+}
+
+func (o *owner) cut(l int) string {
+	s := o.rest[:l]
+	o.rest = o.rest[l:]
+	return s
+}
+
+func (o *owner) cutKV(kv attribute.KeyValue) attribute.KeyValue {
+	key := attribute.Key(o.cut(len(kv.Key)))
+	return attribute.KeyValue{Key: key, Value: o.cutValue(kv.Value)}
+}
+
+func (o *owner) cutValue(v attribute.Value) attribute.Value {
+	switch v.Type() {
+	case attribute.STRING:
+		return attribute.StringValue(o.cut(len(v.AsString())))
+	case attribute.STRINGSLICE:
+		l := o.lists[o.next]
+		o.next++
+		for i, s := range l.ss { // the list is a copy: As* returned a new slice
+			l.ss[i] = o.cut(len(s))
+		}
+		return attribute.StringSliceValue(l.ss)
+	case attribute.SLICE:
+		l := o.lists[o.next]
+		o.next++
+		for i, e := range l.vs {
+			l.vs[i] = o.cutValue(e)
+		}
+		return attribute.SliceValue(l.vs...)
+	case attribute.MAP:
+		l := o.lists[o.next]
+		o.next++
+		for i, e := range l.kvs {
+			l.kvs[i] = o.cutKV(e)
+		}
+		return attribute.MapValue(l.kvs...)
+	}
+	return v
 }
 
 // truncateString truncates s to maxLen bytes without splitting multi-byte

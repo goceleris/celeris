@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -161,16 +162,11 @@ func New(config ...Config) celeris.HandlerFunc {
 			// Capture response state (deep copy) only when a waiter will
 			// consume it.
 			entry.status = c.ResponseStatus()
-			entry.ct = c.ResponseContentType()
 			body := c.ResponseBody()
 			if len(body) > 0 {
 				entry.body = append([]byte(nil), body...)
 			}
-			respHeaders := c.ResponseHeaders()
-			if len(respHeaders) > 0 {
-				entry.headers = make([][2]string, len(respHeaders))
-				copy(entry.headers, respHeaders)
-			}
+			entry.headers, entry.ct = ownHeaders(c.ResponseHeaders(), c.ResponseContentType())
 			entry.panicVal = panicVal
 		}
 		entry.wg.Done()
@@ -198,4 +194,41 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		return handlerErr
 	}
+}
+
+// ownHeaders returns a copy of the leader's response headers and content
+// type for its waiters, the strings included; the copies share one
+// allocation.
+//
+// The header values can be request strings: middleware echo request headers
+// into the response (requestid's X-Request-Id, cors's
+// Access-Control-Allow-Origin), and on epoll and io_uring those are views of
+// the leader connection's receive buffer. The leader returns once it has
+// handed the entry over, and the engine receives the connection's next
+// request into that buffer (or, once the connection closes, gives it to
+// another connection), while a waiter may serialize the headers later, for
+// example when an outer middleware buffers its response (celeris#732).
+func ownHeaders(hdrs [][2]string, ct string) ([][2]string, string) {
+	n := len(ct)
+	for _, h := range hdrs {
+		n += len(h[0]) + len(h[1])
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for _, h := range hdrs {
+		b.WriteString(h[0])
+		b.WriteString(h[1])
+	}
+	b.WriteString(ct)
+	rest := b.String()
+	var out [][2]string
+	if len(hdrs) > 0 {
+		out = make([][2]string, len(hdrs))
+		for i, h := range hdrs {
+			k, v := len(h[0]), len(h[1])
+			out[i] = [2]string{rest[:k], rest[k : k+v]}
+			rest = rest[k+v:]
+		}
+	}
+	return out, rest
 }

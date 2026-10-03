@@ -355,10 +355,14 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 	// PanicCount, which probatorium reads via the unix socket to
 	// assert that no panics escape the recover safety net.
 	validation.RecordPanic()
+	// Copies: Config.Logger's handler may keep the record (slog's
+	// Record.Clone shares the strings), and on epoll and io_uring the method
+	// and path are views of the connection's receive buffer, which the engine
+	// reuses for the next request (celeris#732).
 	a.server.logger().Error("handler panic recovered",
 		"error", fmt.Sprint(r),
-		"method", c.method,
-		"path", c.path,
+		"method", strings.Clone(c.method),
+		"path", strings.Clone(c.path),
 		"stack", string(debug.Stack()),
 	)
 	c.statusCode = 500
