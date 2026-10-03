@@ -489,6 +489,41 @@ jobs:
             echo "expected all three tests and all 15 arms (6 of them io_uring) to PASS with no SKIP line"
             exit 1
           fi
+      # celeris#719: an in-memory store (store.MemoryKV, cache.MemoryStore)
+      # and the ratelimit dynamic-limiter map keep their own copy of a key
+      # whose bytes the caller changes later: a retried Idempotency-Key
+      # replays, a cache key from c.Path() still hits, a rate string from a
+      # header still finds its limiter. The engine tests run by name with
+      # CELERIS_REQUIRE_IOURING_WORKERS=1 and an exact tally: the five
+      # top-level tests PASS, the three engine tests' 21 arms (std, and
+      # epoll, io_uring and Adaptive with sync and async handlers; 6 of them
+      # io_uring and 6 Adaptive) PASS, no SKIP line, and every go test exits 0.
+      - name: celeris#719 in-memory store and limiter keys kept as copies (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c719.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^TestMemoryKVKeepsItsOwnKeys$' ./middleware/store/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestMemoryStoreKeepsItsOwnKeys|TestCustomKeyStillHitsAfterNextRequest)$' ./middleware/cache/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestRetriedIdempotencyKeyReplays$' ./middleware/idempotency/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestDynamicLimiterFoundAfterNextRequest$' ./middleware/ratelimit/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          tests='TestMemoryKVKeepsItsOwnKeys|TestMemoryStoreKeepsItsOwnKeys|TestCustomKeyStillHitsAfterNextRequest|TestRetriedIdempotencyKeyReplays|TestDynamicLimiterFoundAfterNextRequest'
+          engine='TestCustomKeyStillHitsAfterNextRequest|TestRetriedIdempotencyKeyReplays|TestDynamicLimiterFoundAfterNextRequest'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c719.log || true)
+          arms=$(grep -cE "^    --- PASS: (${engine})/" /tmp/c719.log || true)
+          uring=$(grep -cE "^    --- PASS: (${engine})/io_uring" /tmp/c719.log || true)
+          adaptive=$(grep -cE "^    --- PASS: (${engine})/adaptive" /tmp/c719.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c719.log || true)
+          echo "celeris#719 tests: top-level PASS $top (want 5), engine arm PASS $arms (want 21), io_uring $uring (want 6), adaptive $adaptive (want 6), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 5 ] || [ "$arms" -ne 21 ] || [ "$uring" -ne 6 ] || [ "$adaptive" -ne 6 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all five tests and the 21 engine arms (6 io_uring, 6 Adaptive) to PASS with no SKIP line"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
