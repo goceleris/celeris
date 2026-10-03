@@ -35,10 +35,12 @@ func (c *Context) SetPath(p string) { c.path = p }
 
 // FullPath returns the matched route pattern (e.g. "/users/:id"). For a
 // request no route matched, which the global middleware also sees, it is a
-// sentinel no pattern can be: "<unmatched>" for a 404,
-// "<method-not-allowed>" for a 405 and "<options>" for the automatic OPTIONS
-// answer. It is empty before routing (in [Server.Pre] middleware) and for a
-// Context that did not come through the router.
+// sentinel no pattern can be, whatever answers the request (the 404 or 405,
+// or a Use-mounted middleware serving its own path, such as healthcheck's
+// /livez): "<unmatched>" for a path with no route, "<method-not-allowed>"
+// for a path whose routes take other methods and "<options>" for the
+// automatic OPTIONS answer. It is empty before routing (in [Server.Pre]
+// middleware) and for a Context that did not come through the router.
 func (c *Context) FullPath() string { return c.fullPath }
 
 // RawQuery returns the raw query string without the leading '?'.

@@ -187,8 +187,9 @@ func (s *Server) loadEngine() engine.Engine {
 // debug, healthcheck, the metrics endpoint or static, answers them with no
 // route registered for them. Group and route middleware do not run for an
 // unmatched request. Under [Config.AsyncHandlers] an unmatched request is
-// dispatched like a route inheriting that default (inline until its chain
-// blocks, then async). A middleware that serves its own paths answers them
+// dispatched like a route inheriting that default, one decision for all
+// unmatched requests ([Config.AsyncHandlers] says when a blocking one still
+// runs inline). A middleware that serves its own paths answers them
 // for every client its AuthFunc admits: pprof's and debug's default admits a
 // loopback peer, which behind a reverse proxy on the same host is every
 // client, and the metrics endpoint has no AuthFunc by default.

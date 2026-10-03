@@ -201,9 +201,15 @@ type Config struct {
 	// A request no route matches (a 404, a 405, the automatic OPTIONS
 	// answer) runs the global middleware ([Server.Use]) and any NotFound /
 	// MethodNotAllowed handler. With this set it is dispatched like a route
-	// that inherits this default: inline until a run of that chain blocks,
-	// then async, so a blocking global middleware does not hold a worker for
-	// unmatched requests either.
+	// that inherits this default: inline until a timed run of that chain
+	// blocks, then async. All unmatched requests share that one state, and a
+	// run of fast ones settles it as it settles a route; from then on an
+	// unmatched request whose chain blocks runs inline on the engine worker,
+	// holding every connection on it, unless it is the one timed after a
+	// settle re-open. With this unset it always runs inline, even when
+	// routes are .Async(). So a global middleware that can block (a remote
+	// session store, an auth upstream, pprof's profile) can hold a worker
+	// for unmatched requests; mount it on .Async() routes where that matters.
 	//
 	// DRIVERS: celeris drivers opened WithEngine(srv) pick their netpoll-park
 	// fast path from the server's EFFECTIVE async state — true when this flag
