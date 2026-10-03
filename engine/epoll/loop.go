@@ -379,6 +379,7 @@ func newLoop(id, cpuID int, handler stream.Handler,
 			InitialWindowSize:    cfg.InitialWindowSize,
 			MaxFrameSize:         cfg.MaxFrameSize,
 			MaxRequestBodySize:   cfg.MaxRequestBodySize,
+			WriteTimeout:         cfg.WriteTimeout,
 		},
 		async: cfg.AsyncHandlers,
 	}
