@@ -26,8 +26,10 @@ import (
 )
 
 // c859Loop is an engine.WorkerLoop that keeps nothing and records every
-// call by number. Like the io_uring engine, its UnregisterConn returns
-// without firing onClose; a test fires onClose itself when it wants to.
+// call by number. Its UnregisterConn returns without firing onClose, as on
+// the io_uring engine and the non-Linux loop, and on the other loops when
+// their own teardown claimed the conn first; a test fires onClose itself
+// when it wants to.
 type c859Loop struct {
 	mu    sync.Mutex
 	calls []c859Call
@@ -97,9 +99,9 @@ func c859Pair(t *testing.T) (int, int) {
 }
 
 // c859Socket returns a new connected socket and its peer. With n >= 0 the
-// socket is put on number n, which must be free: it stands in for the next
-// socket the process opens, which the kernel gives the lowest free number.
-// The caller closes both.
+// socket is put on number n, which must be free (the test fails if it is
+// not): it stands in for the next socket the process opens, which the
+// kernel gives the lowest free number. The caller closes both.
 func c859Socket(t *testing.T, n int) (b, peer int) {
 	t.Helper()
 	b, peer = c859Pair(t)
@@ -110,6 +112,10 @@ func c859Socket(t *testing.T, n int) (b, peer int) {
 		// peer's. Swap the roles rather than dup2 over the peer.
 		b, peer = peer, b
 	default:
+		if c859Open(n) {
+			_, _ = unix.Close(b), unix.Close(peer)
+			t.Fatalf("fixture: number %d is not free; dup2 would close the file on it", n)
+		}
 		if err := unix.Dup2(b, n); err != nil {
 			t.Fatal(err)
 		}
@@ -255,9 +261,11 @@ func TestPgCloseReleasesTheNumberAfterBackgroundCalls859(t *testing.T) {
 	}
 }
 
-// On the io_uring engine, onClose fires after UnregisterConn has returned,
-// possibly after Close has released the number and another socket has taken
-// it. onClose must then leave that socket alone.
+// onClose can fire after UnregisterConn has returned (always on the io_uring
+// engine and the non-Linux loop; on the standalone Linux loop and the epoll
+// engine when their own teardown claimed the conn first), possibly after
+// Close has released the number and another socket has taken it. onClose
+// must then leave that socket alone.
 func TestPgLateOnCloseLeavesTheReusedNumberAlone859(t *testing.T) {
 	loop := newC859Loop()
 	c, _, ino := newC859Conn(t, loop)

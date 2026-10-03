@@ -595,11 +595,12 @@ type pgConn struct {
 	closeWG sync.WaitGroup
 
 	// fdReleased marks the release of fd's number. The event loop's
-	// UnregisterConn does NOT close the fd — see driver/{epoll,iouring}
-	// "caller is responsible for closing the underlying fd" — so the driver
-	// retains fd ownership. Only Close releases the number (closeFDOnce);
-	// onClose shuts the socket down and keeps it (shutdownFD); onRecv's own
-	// writes skip a released number (writeRawFromRecv) (celeris#859).
+	// UnregisterConn does NOT close the fd — the engine.WorkerLoop
+	// UnregisterConn contract: "The caller is responsible for closing the fd
+	// itself" — so the driver retains fd ownership. Only Close releases the
+	// number (closeFDOnce); onClose shuts the socket down and keeps it
+	// (shutdownFD); onRecv's own writes skip a released number
+	// (writeRawFromRecv) (celeris#859).
 	// fdReleased is set with recvWriteMu and fdMu held, and read under
 	// either; lock order recvWriteMu, then fdMu.
 	recvWriteMu sync.Mutex
@@ -653,9 +654,12 @@ func (c *pgConn) closeFDOnce() {
 // shutdownFD shuts c.fd's socket down without releasing its number, unless
 // Close has released it already. onClose calls it: the server sees the
 // client leave as soon as a loop drops the conn, as when onClose closed the
-// fd, while the number stays the conn's until Close. On the io_uring engine
-// onClose can fire after Close has released the number; the check under
-// fdMu leaves alone the socket that has taken it since.
+// fd, while the number stays the conn's until Close. onClose can fire after
+// UnregisterConn has returned, and so after Close has released the number:
+// on the io_uring engine and the non-Linux loop it always does, and on the
+// standalone Linux loop and the epoll engine it does when their own
+// teardown claimed the conn first. The check under fdMu leaves alone the
+// socket that has taken the number since.
 func (c *pgConn) shutdownFD() {
 	c.fdMu.Lock()
 	defer c.fdMu.Unlock()
