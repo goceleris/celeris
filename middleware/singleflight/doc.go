@@ -22,8 +22,9 @@
 // holds; an [errors.As] to a *[celeris.HTTPError] finds a copy whose Message
 // is copied too. Fields of other error types, and other panic values, are
 // the leader's own: build them from copies ([strings.Clone]) if a waiter may
-// read them. A waiter's error is not the leader's error value, so compare
-// with [errors.Is], not ==.
+// read them, as celeris does for [celeris.BindError]'s Value. A waiter's
+// error is not the leader's error value, so compare with [errors.Is], not
+// ==.
 //
 //	server.Use(singleflight.New())
 //

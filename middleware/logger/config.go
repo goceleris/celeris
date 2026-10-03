@@ -86,6 +86,13 @@ type Config struct {
 	// values to include in each log entry. It is called after the
 	// downstream handler completes, so latency and response data are
 	// available.
+	//
+	// For an Output other than [FastHandler], the string values Fields
+	// returns are copied with the middleware's own, inside groups too. Their
+	// keys, and values of other kinds (slog.Any, a slog.LogValuer), are not:
+	// if the handler may keep the record, build those from copies
+	// ([strings.Clone]), not from request strings such as c.Header or
+	// c.RequestHeaders().
 	Fields func(c *celeris.Context, latency time.Duration) []slog.Attr
 
 	// Done is an optional callback invoked after the log entry is written.
