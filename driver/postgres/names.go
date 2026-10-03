@@ -44,6 +44,10 @@ type PoolWorkerStats = async.PoolWorkerStats
 
 // ServerProvider is what [WithEngine] and [Connector.WithEngine] take.
 // *celeris.Server implements it; pass the server to share its event loop.
+// Its one method returns a type defined in an internal package, so in
+// practice *celeris.Server is the only implementation. That type is not
+// supported API until celeris#453; see
+// [github.com/goceleris/celeris.Server.EventLoopProvider].
 type ServerProvider = eventloop.ServerProvider
 
 // ErrQueueFull is returned when the event-loop worker that owns a

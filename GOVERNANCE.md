@@ -126,6 +126,57 @@ so the design can be discussed without a diff attached.
 - Security fixes follow [SECURITY.md](SECURITY.md); a fix may ship as a
   patch release outside the normal cadence.
 
+## Compatibility
+
+From v1.6.0, the supported API is every exported identifier of the
+packages outside `internal/` that are not marked experimental:
+`celeris`, `celeristest`, `observe`, the `middleware/...` packages
+(the four nested modules `compress`, `metrics`, `otel` and `protobuf`
+included), and `driver/postgres`, `driver/redis` and `driver/memcached`.
+
+- **Supported packages follow the
+  [Go 1 compatibility promise](https://go.dev/doc/go1compat)** within a
+  major version, with the same exceptions (security fixes, bugs,
+  unspecified behaviour). A minor or patch release may add API; it does
+  not remove or change an exported identifier, a documented default or
+  documented behaviour in a way that breaks code that uses it as
+  documented. A change that would needs a new major version.
+- **Packages marked experimental** in their package documentation may
+  change or go away in a minor release, and the release notes say when
+  they do. Today that is `validation`.
+- **Not covered:**
+  - `internal/**`. The Go toolchain refuses imports of it from outside
+    this module.
+  - `cmd/celeris`, the validation launcher.
+  - What an exported identifier's documentation says is not supported:
+    the type `Server.EventLoopProvider` returns, and the drivers'
+    `ServerProvider` method that returns it, until
+    [#453](https://github.com/goceleris/celeris/issues/453) defines a
+    public engine interface.
+  - The environment variables marked unsupported below, and every
+    variable only tests and the build read (`CELERIS_REQUIRE_*`, the
+    driver test addresses such as `CELERIS_PG_DSN`, and the numbered
+    ones such as `CELERIS_589_*`).
+
+The tuning variables the engines read at startup (the README's
+[table](README.md#tuning-environment-variables) says what each does):
+
+| Variable | Level |
+|---|---|
+| `CELERIS_ADAPTIVE_START` | supported |
+| `CELERIS_MAX_IOURING_TIER` | supported |
+| `CELERIS_IOURING_SEND_ZC` | supported |
+| `CELERIS_IOURING_MULTISHOT_RECV` | experimental |
+| `CELERIS_IOURING_PBUF_COUNT` | experimental |
+| `CELERIS_IOURING_FIXED_FILES` | unsupported |
+| `CELERIS_ADAPTIVE_DEBUG` | unsupported |
+| `CELERIS_DEBUG_*` | unsupported |
+
+A supported variable keeps its name, its documented values and their
+effect. An experimental one may change or go away in a minor release, with
+a release note. An unsupported one is for development and diagnostics, and
+may change or go away in any release.
+
 ## Changing this document
 
 Governance changes go through a PR like any other change, reviewed by a
