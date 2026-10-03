@@ -55,10 +55,12 @@ type UIConfig struct {
 	// Register that URL with the authorization server. Set this only to use
 	// another redirect page; it must be an absolute URL on the page's
 	// origin, as the redirect page hands the result to the UI page through
-	// window.opener. The middleware answers those two paths before the
-	// router, so its page takes the place of one the app serves at
-	// {BasePath}/oauth2-redirect.html itself; to keep the app's own page,
-	// list both paths in SkipPaths.
+	// window.opener. An app that serves its own page at
+	// {BasePath}/oauth2-redirect.html lists both paths in SkipPaths.
+	// Otherwise its route still runs after this middleware has answered
+	// (returning without Next does not stop the chain): its write fails
+	// with [celeris.ErrResponseWritten], or, behind a buffering middleware
+	// (etag, compress, cache), replaces this middleware's page.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	OAuth2RedirectURL string
 
