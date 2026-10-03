@@ -328,18 +328,21 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	if h := testHookBeforeAdd; h != nil {
 		h(fd)
 	}
-	// The EPOLL_CTL_ADD is issued under w.mu's read lock and c.mu, after a
-	// check of c.closed, like every other epoll_ctl of a conn (flushLocked,
-	// setEvents). shutdown marks every conn in the map closed, then closes
-	// epollFD, under w.mu's write lock: so an ADD issued here can never land
-	// on the number of a closed epoll descriptor, or on another epoll
-	// instance that has taken it (celeris#862). A read lock, so the syscall
-	// does not hold up the worker's lookups. If c was torn down since it
-	// entered the map (by shutdown, or by an UnregisterConn of fd racing this
-	// call), its onClose has fired: no ADD is issued, and the registration is
-	// reported as made, the same as for a conn torn down right after it.
+	// The EPOLL_CTL_ADD is issued under c.mu, after a check of c.closed, like
+	// every other epoll_ctl of a conn (flushLocked, setEvents). c is in the
+	// map, and a conn leaves the map only once it is marked closed. shutdown
+	// marks every conn in the map closed, each under its c.mu, before it
+	// closes epollFD: so it cannot close the epoll fd while this ADD is in
+	// flight, and an ADD issued here never lands on the number of a closed
+	// epoll descriptor, or on another epoll instance that has taken it
+	// (celeris#862). An UnregisterConn of fd marks c closed before its
+	// EPOLL_CTL_DEL, so the ADD comes before that DEL or not at all. w.mu is
+	// not held, so the worker's lookups never wait for the syscall. If c was
+	// torn down since it entered the map (by shutdown, or by an UnregisterConn
+	// of fd racing this call), its onClose has fired: no ADD is issued, and
+	// the registration is reported as made, the same as for a conn torn down
+	// right after it.
 	var err error
-	w.mu.RLock()
 	c.mu.Lock()
 	if !c.closed {
 		err = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
@@ -356,7 +359,6 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 		}
 	}
 	c.mu.Unlock()
-	w.mu.RUnlock()
 	if err != nil {
 		w.mu.Lock()
 		if cur, ok := w.conns[fd]; ok && cur == c {

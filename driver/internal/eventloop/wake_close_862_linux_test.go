@@ -15,8 +15,9 @@ package eventloop
 //   - RegisterConn used to take the epoll fd's number under w.mu, release
 //     w.mu, and issue its EPOLL_CTL_ADD after. A shutdown in between closed
 //     the epoll fd, and the ADD went to a closed number, or to the epoll
-//     instance that had taken it. It now issues the ADD under w.mu's read
-//     lock and c.mu, after a check that the conn has not been torn down.
+//     instance that had taken it. It now issues the ADD under c.mu, after a
+//     check that the conn has not been torn down, so an UnregisterConn of the
+//     same fd in between leaves no ADD behind either.
 
 import (
 	"errors"
@@ -53,10 +54,14 @@ func c862FillSendBuffer(t *testing.T, fd int) int {
 // the pending path: the conn's send buffer is full and its peer never reads,
 // so the flush stops at EAGAIN and the Write calls enqueueFlush, which wakes
 // the worker. Under -race, a wake that reads the eventfd's number with no
-// lock while shutdown closes it and stores -1 is a reported data race. With
-// or without -race, two eventfds opened as soon as Close returns take the
-// numbers it freed (the worker's eventfd and epoll fd): neither may receive a
-// write from a wake that loaded the old number before the close.
+// lock while shutdown closes it and stores -1 is a reported data race, and
+// the test's coverage rests on that report (CI runs this package with
+// -race). Its second check is opportunistic: two eventfds opened as soon as
+// Close returns take the numbers it freed (the worker's eventfd and epoll
+// fd), and neither may receive a write from a wake that loaded the old number
+// before the close. A wake has to land in the few microseconds between the
+// close and the reuse for it to fire, so it seldom does, with or without
+// -race.
 func TestWriteRacingCloseNeverTouchesTheClosedEventfd862(t *testing.T) {
 	const rounds, writers = 64, 4
 	one := []byte{'w'}
@@ -214,6 +219,9 @@ func TestRegisterConnRacingCloseNeverAddsToAClosedEpoll862(t *testing.T) {
 	if !closedInHook {
 		t.Fatal("Close did not finish while RegisterConn was between the map and the ADD: the test did not drive the window")
 	}
+	if !tookNumber {
+		t.Fatalf("no epoll instance took the closed epoll fd's number %d in %d tries: the test cannot check where the ADD landed", epfd, len(takers))
+	}
 	if landed {
 		t.Errorf("RegisterConn's EPOLL_CTL_ADD landed on the epoll instance that took the closed epoll fd's number %d", epfd)
 	}
@@ -225,5 +233,64 @@ func TestRegisterConnRacingCloseNeverAddsToAClosedEpoll862(t *testing.T) {
 	}
 	if rerr == nil && (!gotClose || !errors.Is(closeErr, ErrLoopClosed)) {
 		t.Errorf("RegisterConn returned nil, and Close then ran, but onClose fired %v with %v, want ErrLoopClosed", gotClose, closeErr)
+	}
+}
+
+// TestRegisterConnRacingUnregisterConnLeavesNoEpollEntry862: an
+// UnregisterConn of the same fd runs to completion while RegisterConn is
+// between putting the conn in the map and issuing its EPOLL_CTL_ADD (the hook
+// runs there, with no lock held). Once both have returned, fd must not be in
+// the worker's epoll set: an ADD issued after the unregister's DEL leaves a
+// registration that no map entry owns, and the owner may already have closed
+// the number. The test probes the set with an EPOLL_CTL_ADD of its own, which
+// fails with EEXIST if fd is still in it.
+func TestRegisterConnRacingUnregisterConnLeavesNoEpollEntry862(t *testing.T) {
+	l, err := New(1)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	w := l.WorkerLoop(0).(*worker)
+	a, aPeer := socketPair(t)
+	t.Cleanup(func() { _ = unix.Close(a); _ = unix.Close(aPeer) })
+
+	ran := false
+	uerr := errors.New("not called")
+	testHookBeforeAdd = func(fd int) {
+		if fd != a || ran {
+			return
+		}
+		ran = true
+		uerr = w.UnregisterConn(a)
+	}
+	t.Cleanup(func() { testHookBeforeAdd = nil })
+	var closes atomic.Int32
+	rerr := w.RegisterConn(a, func([]byte) {}, func(error) { closes.Add(1) })
+	testHookBeforeAdd = nil
+	if !ran {
+		t.Fatalf("the hook never ran (RegisterConn returned %v): the test did not reach RegisterConn's EPOLL_CTL_ADD", rerr)
+	}
+	if uerr != nil {
+		t.Fatalf("UnregisterConn in the window returned %v: the conn was not in the map, so the test did not drive the window", uerr)
+	}
+	ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(a)}
+	perr := unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, a, &ev)
+	inSet := errors.Is(perr, unix.EEXIST)
+	if perr == nil {
+		_ = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_DEL, a, nil)
+	}
+	t.Logf("C862 register/unregister: UnregisterConn in the window returned %v; RegisterConn returned %v; onClose fired %d times; A in the epoll set after both returned: %v (probe ADD: %v)",
+		uerr, rerr, closes.Load(), inSet, perr)
+	if perr != nil && !inSet {
+		t.Fatalf("the probe's EPOLL_CTL_ADD failed with %v: the test cannot tell whether A is in the epoll set", perr)
+	}
+	if inSet {
+		t.Errorf("A is in the worker's epoll set after UnregisterConn(A) returned: RegisterConn's EPOLL_CTL_ADD was issued after the unregister's DEL")
+	}
+	if rerr != nil {
+		t.Errorf("RegisterConn returned %v for a conn UnregisterConn had already torn down, want nil (its onClose has fired)", rerr)
+	}
+	if n := closes.Load(); n != 1 {
+		t.Errorf("onClose fired %d times, want once (UnregisterConn's)", n)
 	}
 }
