@@ -364,6 +364,40 @@ func New(config ...Config) celeris.HandlerFunc {
 			return celeris.NewHTTPError(500, "SSE requires streaming support")
 		}
 
+		// celeris#421: HEAD is answered by the GET route. A HEAD client
+		// wants the headers of the stream, not a stream that runs until it
+		// goes away (and, detached, keeps its connection from serving the
+		// next request). OnConnect still runs, and its rejection (auth) is
+		// returned exactly as for GET (what reaches the wire then is
+		// celeris#835). When it accepts, the headers are sent, the response
+		// ends there and OnDisconnect runs at once; the Handler does not
+		// run. The engine sends no body for HEAD.
+		if c.Method() == "HEAD" {
+			// The client's context keeps the request's values but not its
+			// cancellation: it is cancelled before this returns, and a
+			// context derived from an HTTP/2 stream's context starts a
+			// propagation goroutine that can panic once the stream is
+			// pooled (celeris#836).
+			ctx, cancel := context.WithCancel(context.WithoutCancel(c.Context()))
+			client := acquireClient(ctx, sw, cancel, lastEventID)
+			if onConnect != nil {
+				if err := onConnect(c, client); err != nil {
+					cancel()
+					releaseClient(client)
+					return err
+				}
+			}
+			err := sw.WriteHeader(200, sseHeaders)
+			if cerr := client.Close(); err == nil {
+				err = cerr
+			}
+			if onDisconnect != nil {
+				onDisconnect(c, client)
+			}
+			releaseClient(client)
+			return err
+		}
+
 		// Run OnConnect before writing headers so rejection can return
 		// a proper HTTP error code to the client.
 		ctx, cancel := context.WithCancel(c.Context())

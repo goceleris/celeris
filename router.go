@@ -591,7 +591,10 @@ func (r *router) routeAsync(method, path string) bool {
 		}
 	}
 	var params Params
-	_, fullPath, async := r.find(method, path, &params)
+	handlers, fullPath, async := r.find(method, path, &params)
+	if handlers == nil && method == "HEAD" {
+		_, fullPath, async = r.findHEADAsGET(path, &params, 0)
+	}
 	return async || r.adaptivePromoted(fullPath)
 }
 
@@ -625,6 +628,20 @@ func isStaticPath(path string) bool {
 	return true
 }
 
+// findHEADAsGET answers a HEAD request whose path has no HEAD route with the
+// path's GET route (celeris#421; RFC 9110 §9.3.2: HEAD is GET without the
+// content, which the engines drop). find stays the exact lookup, and its two
+// request-path callers call this only after find missed a HEAD, so a hit
+// costs what it did: HandleStream (and so the per-connection route cache,
+// keyed by method) and routeAsync (the dispatch decision), which must agree
+// on the route. n is the length params had before the failed walk.
+func (r *router) findHEADAsGET(path string, params *Params, n int) ([]HandlerFunc, string, bool) {
+	*params = (*params)[:n]
+	return r.find("GET", path, params)
+}
+
+// find returns the handler chain, route pattern and async flag of the route
+// registered for exactly method+path; see findHEADAsGET for HEAD.
 func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
 	idx := methodIndex(method)
 	var root *node
@@ -668,30 +685,50 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 	return search(root, path, params)
 }
 
-// allowedMethods returns the HTTP methods that have a registered handler for
-// the given path, excluding the specified method.
+// allowedMethods returns the methods the path answers, for the Allow header
+// of a 405 and of the automatic OPTIONS answer (celeris#421; RFC 9110
+// §10.2.1), excluding except: every method with a route for the path, HEAD
+// when the path has a GET or HEAD route (a HEAD without its own route is
+// answered by the GET route, findHEADAsGET), and OPTIONS (answered
+// automatically when the path has no OPTIONS route). The order is GET, POST,
+// PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
+// no route at all returns nil.
 func (r *router) allowedMethods(path string, except string) []string {
-	var allowed []string
 	var params Params
-	for i, root := range r.trees {
-		if root == nil {
-			continue
-		}
-		method := methodNames[i]
-		if method == except {
-			continue
-		}
+	has := func(method string) bool {
 		params = params[:0]
-		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
-			allowed = append(allowed, method)
+		handlers, _, _ := r.find(method, path, &params)
+		return handlers != nil
+	}
+	var found [nMethods]bool
+	routed := false
+	for i, root := range r.trees {
+		if root != nil && has(methodNames[i]) {
+			found[i] = true
+			routed = true
 		}
 	}
+	var custom []string
 	for method := range r.customTrees {
-		if method == except {
-			continue
+		if has(method) {
+			custom = append(custom, method)
+			routed = true
 		}
-		params = params[:0]
-		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
+	}
+	if !routed {
+		return nil
+	}
+	found[mHEAD] = found[mHEAD] || found[mGET]
+	found[mOPTIONS] = true
+	allowed := make([]string, 0, nMethods+len(custom))
+	for i, ok := range found {
+		if ok && methodNames[i] != except {
+			allowed = append(allowed, methodNames[i])
+		}
+	}
+	slices.Sort(custom)
+	for _, method := range custom {
+		if method != except {
 			allowed = append(allowed, method)
 		}
 	}

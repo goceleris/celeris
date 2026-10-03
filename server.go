@@ -228,12 +228,20 @@ func (s *Server) PATCH(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("PATCH", path, handlers...)
 }
 
-// HEAD registers a handler for HEAD requests.
+// HEAD registers a handler for HEAD requests. A path without a HEAD route
+// is answered by its GET route, if it has one: the GET handler runs (it sees
+// Method() == "HEAD") and the engine sends its headers without the body
+// (RFC 9110 §9.3.2). Register HEAD only to answer it differently.
 func (s *Server) HEAD(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("HEAD", path, handlers...)
 }
 
-// OPTIONS registers a handler for OPTIONS requests.
+// OPTIONS registers a handler for OPTIONS requests. A path without an
+// OPTIONS route that has any other route is answered automatically: 200 with
+// an Allow header listing the methods the path answers (HEAD whenever it has
+// GET, and OPTIONS) and Content-Length: 0 (RFC 9110 §9.3.7). The global
+// middleware ([Server.Use]) runs first, so a CORS middleware answers its
+// preflight; group and route middleware do not run for it.
 func (s *Server) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("OPTIONS", path, handlers...)
 }
@@ -255,7 +263,9 @@ func (s *Server) NotFound(handler HandlerFunc) *Server {
 }
 
 // MethodNotAllowed registers a custom handler for requests where the path matches
-// but the HTTP method does not. The Allow header is set automatically.
+// but the HTTP method does not. The Allow header is set automatically. HEAD to
+// a path with a GET route, and OPTIONS to a path with any route, are answered
+// (see [Server.HEAD], [Server.OPTIONS]) and never reach this handler.
 func (s *Server) MethodNotAllowed(handler HandlerFunc) *Server {
 	s.methodNotAllowedHandler = handler
 	return s
@@ -907,6 +917,7 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 			ra.methodNotAllowedChain = append(ra.methodNotAllowedChain, s.middleware...)
 			ra.methodNotAllowedChain = append(ra.methodNotAllowedChain, s.methodNotAllowedHandler)
 		}
+		ra.optionsChain = newOptionsChain(s.middleware)
 		ra.errorHandler = s.errorHandler
 		var handler stream.Handler = ra
 

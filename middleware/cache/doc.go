@@ -6,7 +6,10 @@
 // body), encodes it via the versioned wire format in [middleware/store],
 // and persists the result under a request-derived key. Subsequent
 // requests that produce the same key skip the handler and replay the
-// stored response.
+// stored response. A 206 Partial Content or a 416 is never stored: both
+// answer one request's Range, which the default key does not include, and
+// even under a key that includes it a replay would skip the handler's
+// If-Range check.
 //
 // # Backends
 //
@@ -20,8 +23,12 @@
 //
 // When [Config.Singleflight] is true (default), concurrent requests
 // that miss on the same key coalesce: one handler runs, the rest wait
-// for its result. Turn this off when handlers have side effects that
-// must run per-request.
+// for its result. They wait for the handler and the store's Set, not
+// for its client: a cacheable response is stored before it is written,
+// and every request, the one that ran the handler included, writes its
+// own response after the wait, so a client that reads slowly delays
+// only its own response. Turn this off when handlers have side effects
+// that must run per-request.
 //
 // # Cache-Control
 //
