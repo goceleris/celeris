@@ -822,7 +822,7 @@ func (s *Server) EngineInfo() *EngineInfo {
 // socket closes, which is inherent to closing one, and a client whose
 // retransmitted SYN-ACK is lost or goes unanswered on a lossy path. Set
 // [Config.DisableDeferAccept] for a pause that closes the listen sockets at
-// once; see [github.com/goceleris/celeris/internal/resource.Config.DisableDeferAccept].
+// once; its documentation says what the option saves.
 func (s *Server) PauseAccept() error {
 	eng := s.loadEngine()
 	if eng == nil {

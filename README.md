@@ -428,17 +428,19 @@ Bug oracles include slowloris hang detection, malformed-request acceptance, WebS
 ## Project structure
 
 ```
-internal/adaptive/       Adaptive meta-engine (Linux)
 celeristest/    Test helpers (NewContext, NewContextT, ResponseRecorder, With* options)
 cmd/celeris/    CLI launcher — validation / diagnostics entrypoint (see below)
 driver/         First-party event-loop database drivers (postgres, redis, memcached)
-internal/engine/         Engine interface + implementations (iouring, epoll, std)
-internal/       Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts)
+internal/       Not importable outside this module:
+  adaptive/       Adaptive meta-engine (Linux)
+  driver/         Wire codecs of the drivers (redis RESP, postgres, memcached)
+  engine/         Engine interface + implementations (iouring, epoll, std)
+  probe/          System capability detection (kernel version, io_uring feature probe)
+  protocol/       Protocol parsers (h1, h2, detect)
+  resource/       Configuration, presets, defaults
+  ...             Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts, testhooks)
 middleware/     In-tree middleware ecosystem (36 importable packages)
-observe/        Collector, CPUMonitor, Snapshot
-internal/probe/          System capability detection (kernel version, io_uring feature probe)
-internal/protocol/       Protocol parsers (h1, h2, detect)
-internal/resource/       Configuration, presets, defaults
+observe/        Collector, CPUMonitor, Snapshot, EngineMetrics
 test/           Conformance, spec compliance, integration, benchmarks (drivercmp, benchcmp_ws, benchcmp_sse)
 validation/     Runtime invariant assertions + validation hooks (debug builds)
 ```

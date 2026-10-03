@@ -142,8 +142,17 @@ type Config struct {
 	// does so by lingering: it clears the option on each listen socket and
 	// keeps it open for about 1.5 s before closing it, so it blocks that
 	// long. Set this field for a pause that closes the listen sockets at
-	// once. See [resource.Config.DisableDeferAccept] for the mechanism and
-	// what the option saves.
+	// once.
+	//
+	// What the option saves: while it is on, the kernel keeps a connection
+	// that has completed its handshake but sent no data out of the accept
+	// queue, so a client that sends its request at once is accepted with
+	// the request already queued, and the engine saves a wakeup per new
+	// connection. A client that stays silent is accepted about one second
+	// after its SYN and is then subject to ReadHeaderTimeout like any other.
+	// Turning the option off gives up that wakeup, a cost on connection
+	// churn only; keep-alive traffic, where one accept is amortised over
+	// many requests, does not see it.
 	DisableDeferAccept bool
 	// BufferSize is the per-connection I/O buffer size in bytes (0 = engine default).
 	BufferSize int

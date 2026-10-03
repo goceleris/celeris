@@ -82,9 +82,25 @@ component_management:
   individual_components:
     - component_id: core
       name: core (router, context, internal)
+      # core's own internal packages, listed one by one: internal/** would also
+      # count the engines, protocol and driver codecs, which have their own
+      # components below (celeris#443 moved them under internal/).
       paths:
         - "^[^/]+\\.go$"
-        - "internal/**"
+        - "^internal/[^/]+\\.go$"
+        - "internal/conn/**"
+        - "internal/cpumon/**"
+        - "internal/ctxkit/**"
+        - "internal/deferlinger/**"
+        - "internal/httprange/**"
+        - "internal/negotiate/**"
+        - "internal/platform/**"
+        - "internal/recvtheft/**"
+        - "internal/release/**"
+        - "internal/sockopts/**"
+        - "internal/testhooks/**"
+        - "internal/wakefd/**"
+        - "internal/zcwindow/**"
         - "celeristest/**"
         - "observe/**"
         - "internal/resource/**"
@@ -106,6 +122,7 @@ component_management:
       name: drivers
       paths:
         - "driver/**"
+        - "internal/driver/**"
 
 comment:
   layout: "condensed_header, diff, flags, components, condensed_files, condensed_footer"

@@ -100,7 +100,7 @@ Security-relevant changes:
   the store falls back to a per-process counter and multi-instance
   setups will see ID collisions across instances on reconnect.
 
-- **Engine bind retry on `EADDRINUSE`**: `internal/engine/{epoll,iouring}`
+- **Engine bind retry on `EADDRINUSE`**: `engine/{epoll,iouring}`
   retry `unix.Bind` up to 9 times with exponential-jittered backoff
   when EADDRINUSE fires on a SO_REUSEPORT-group join. The retry is
   bounded (~½ second worst case) and does not mask a true conflict —
@@ -122,7 +122,7 @@ Security-relevant changes:
   cache cannot regress to 1.26.2.
 
 - **CVE-2023-44487 "HTTP/2 Rapid Reset" mitigation**: unchanged from
-  prior versions — `internal/protocol/h2/stream/processor.go::handleRSTStream`
+  prior versions — `protocol/h2/stream/processor.go::handleRSTStream`
   enforces a sliding 1-second window with a 100 reset/sec rate limit
   and a 200 burst cap; exceeding it triggers GOAWAY with
   `ENHANCE_YOUR_CALM`. The PR does not regress this path; matrix

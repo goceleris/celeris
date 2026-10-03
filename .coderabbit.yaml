@@ -125,7 +125,7 @@ reviews:
         - Every wait (bind, drain, settle) must also select on ctx.Done() and on shutdown.
         - Controller decisions need hysteresis; flag anything that can oscillate.
         - Metrics aggregated across sub-engines: sums for counters, max for maxima, never a sum of maxima.
-    - path: "internal/**"
+    - path: "internal/{conn,cpumon,ctxkit,deferlinger,httprange,negotiate,platform,recvtheft,release,sockopts,testhooks,wakefd,zcwindow}/**"
       instructions: |
         Shared connection handling (internal/conn: H1 and H2 state used by every engine), socket options and the
         wake-fd. The engine rules apply: hot-path allocations and locks need a measurement, lock order must be
@@ -154,7 +154,7 @@ reviews:
           secret or token in a log line or error message.
         - compress, metrics, otel and protobuf are separate Go modules; their go.mod pin on the root module moves only
           through `mage PrepRelease`.
-    - path: "driver/**"
+    - path: "{driver,internal/driver}/**"
       instructions: |
         The Postgres, Redis and Memcached drivers. Server replies are parsed with bounds checks like untrusted input. A
         connection goes back to the pool only in a clean protocol state; one cancelled mid-request is discarded, not
