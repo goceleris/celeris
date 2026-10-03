@@ -389,9 +389,19 @@ func (l *Loop) run(ctx context.Context) {
 	// a connState but are not called from this frame — reclaimTransplant
 	// (celeris#624). Written and read on this thread only.
 	l.runCtx = ctx
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
+	// celeris#905: the loop changes state that belongs to its OS thread, the
+	// CPU affinity and the NUMA memory policy below, so it never unlocks the
+	// thread. A goroutine that exits locked takes its thread with it: the
+	// runtime terminates the thread instead of handing it, still pinned to
+	// one CPU, to whatever goroutine runs next. The main thread cannot exit;
+	// the runtime parks it for good instead, and a loop often runs on it, so
+	// the affinity and the policy are also put back on the way out.
+	runtime.LockOSThread()
+
+	if prev, err := platform.SaveThreadAffinity(); err == nil {
+		defer func() { _ = prev.Restore() }()
+	}
 	_ = platform.PinToCPU(l.cpuID)
 
 	numaNode := platform.CPUForNode(l.cpuID)
