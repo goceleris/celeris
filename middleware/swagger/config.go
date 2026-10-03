@@ -45,9 +45,34 @@ type UIConfig struct {
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	DefaultModelsExpandDepth *int
 
-	// OAuth2RedirectURL sets the OAuth2 redirect URL for Swagger UI.
+	// OAuth2RedirectURL sets the OAuth2 redirect URL for Swagger UI: the
+	// redirect_uri its authorization-code and implicit flows send. When
+	// empty (the default), Swagger UI uses the page's directory plus
+	// oauth2-redirect.html, which is {BasePath}/oauth2-redirect.html on the
+	// page's own origin, and this middleware serves that page (the one
+	// shipped in swagger-ui-dist, with its script at
+	// {BasePath}/oauth2-redirect.js) whatever the UI's files load from.
+	// Register that URL with the authorization server. Set this only to use
+	// another redirect page; it must be an absolute URL on the page's
+	// origin, as the redirect page hands the result to the UI page through
+	// window.opener. An app that serves its own page at
+	// {BasePath}/oauth2-redirect.html lists both paths in SkipPaths.
+	// Otherwise its route still runs after this middleware has answered
+	// (returning without Next does not stop the chain): its write fails
+	// with [celeris.ErrResponseWritten], or, behind a buffering middleware
+	// (etag, compress, cache), replaces this middleware's page.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	OAuth2RedirectURL string
+
+	// ValidatorURL is the online validator Swagger UI's validator badge
+	// sends the spec's absolute URL to. When empty (the default), the page
+	// sets validatorUrl "none", which turns the badge off, so a viewer's
+	// browser contacts no validator. Set it to a validator you trust to
+	// show the badge; Swagger UI's own default is
+	// https://validator.swagger.io/validator, a third party that then also
+	// fetches the spec itself when it can reach it.
+	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
+	ValidatorURL string
 
 	// OAuth2 pre-fills the OAuth2 authorization dialog in Swagger UI.
 	// All values are embedded in the served HTML page source and visible
@@ -100,10 +125,19 @@ type Config struct {
 	//   {BasePath}/assets/swagger-ui-dist@{SwaggerUIVersion}/*
 	//                        — the embedded Swagger UI files, when the
 	//                          page uses them (see CDN)
+	//   {BasePath}/oauth2-redirect.html, {BasePath}/oauth2-redirect.js
+	//                        — Swagger UI's OAuth2 redirect page (see
+	//                          UIConfig.OAuth2RedirectURL)
 	//
 	// Every one of these requests must reach the middleware: a router
 	// rule, route list or proxy that forwards only {BasePath}/ and
 	// {BasePath}/spec leaves the default page blank.
+	//
+	// The page refers to the spec, the embedded files and the redirect
+	// page relative to itself, and the redirect's Location is relative
+	// too ("./swagger/" for /swagger), so the defaults also work behind a
+	// reverse proxy that publishes the app under another path prefix and
+	// strips it.
 	BasePath string
 
 	// SpecContent is the raw OpenAPI specification content (JSON or YAML).
@@ -111,7 +145,9 @@ type Config struct {
 	SpecContent []byte
 
 	// SpecURL is a URL to an externally hosted spec file. When set,
-	// SpecContent is ignored and no /spec endpoint is registered.
+	// SpecContent is ignored and no /spec endpoint is registered. When
+	// empty, the page loads the spec from "spec", relative to the page
+	// at {BasePath}/, which is {BasePath}/spec.
 	//
 	// Scalar reads it from a URL attribute (data-url), where only relative,
 	// http and https URLs are supported; other schemes are neutralised
@@ -155,14 +191,17 @@ type Config struct {
 	//
 	//   Swagger UI: {AssetsPath}/swagger-ui.css, {AssetsPath}/swagger-ui-bundle.js
 	//               and {AssetsPath}/swagger-ui-standalone-preset.js
-	//   Scalar:     {AssetsPath}/standalone.min.js
+	//               (swagger-ui-dist's files of those names)
+	//   Scalar:     {AssetsPath}/standalone.js
+	//               (@scalar/api-reference's dist/browser/standalone.js)
 	//   ReDoc:      {AssetsPath}/redoc.standalone.js
+	//               (redoc's bundles/redoc.standalone.js)
 	//
 	// The page is written for the versions in [SwaggerUIVersion],
-	// [ScalarVersion] and [ReDocVersion]. @scalar/api-reference ships its
-	// browser build as dist/browser/standalone.js: serve that file under
-	// the name standalone.min.js. No integrity hash is emitted, as the
-	// files are yours. For example, with the static middleware:
+	// [ScalarVersion] and [ReDocVersion]. No integrity hash is emitted, as
+	// the files are yours. Swagger UI's OAuth2 redirect page is still
+	// served by this middleware (see UIConfig.OAuth2RedirectURL). For
+	// example, with the static middleware:
 	//
 	//   server.Use(static.New(static.Config{Root: "./swagger-ui-dist", Prefix: "/swagger-assets"}))
 	//   server.Use(swagger.New(swagger.Config{
