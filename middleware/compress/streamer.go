@@ -69,15 +69,21 @@ func NewCompressedStream(sw *celeris.StreamWriter, encoding string, opts ...Stre
 		o(&cfg)
 	}
 
-	cs := &CompressedStream{sw: sw, encoding: encoding}
+	// cs.encoding is set from the constant, not from the caller's string:
+	// WriteHeader can run after the handler has returned (a detached stream),
+	// and the caller's string can be a request string, a view of the
+	// connection's receive buffer on epoll and io_uring (celeris#732).
+	cs := &CompressedStream{sw: sw}
 	switch encoding {
 	case "gzip":
+		cs.encoding = "gzip"
 		w, err := kgzip.NewWriterLevel(writerFunc(cs.writeRaw), cfg.gzipLevel)
 		if err != nil {
 			return nil
 		}
 		cs.writer = w
 	case "br":
+		cs.encoding = "br"
 		w := brotli.NewWriterLevel(writerFunc(cs.writeRaw), cfg.brotliLevel)
 		cs.writer = w
 	default:

@@ -105,8 +105,12 @@ func TestRingBufferUnknownLastID(t *testing.T) {
 	}
 }
 
-// TestRingBufferAppendAllocs — strict-alloc gate from issue #250: ≤ 1
-// alloc/op. The single permitted alloc covers the canonical ID string.
+// TestRingBufferAppendAllocs — strict-alloc gate from issue #250, ≤ 2
+// allocs/op since celeris#732: one for the canonical ID string, and one for
+// the copy of the event's strings, which the ring keeps after Append returns
+// (they can be another request's views). The ring is first filled past ID
+// 99, so every ID allocates (strconv returns static strings below 100) and
+// the count is exact, not rounded down.
 func TestRingBufferAppendAllocs(t *testing.T) {
 	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
 		t.Skip("alloc counts unstable under -race / coverage / -short")
@@ -114,10 +118,13 @@ func TestRingBufferAppendAllocs(t *testing.T) {
 	r := NewRingBuffer(1024)
 	ctx := context.Background()
 	e := Event{Data: "x"}
+	for range 100 {
+		_, _ = r.Append(ctx, e)
+	}
 	allocs := testing.AllocsPerRun(200, func() {
 		_, _ = r.Append(ctx, e)
 	})
-	const budget = 1.0
+	const budget = 2.0
 	if allocs > budget {
 		t.Fatalf("RingBuffer.Append: %.1f allocs/op (budget %.1f)", allocs, budget)
 	}

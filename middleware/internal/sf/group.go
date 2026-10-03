@@ -9,6 +9,8 @@ package sf
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/goceleris/celeris/middleware/internal/handoff"
 )
 
 // Call is a single in-flight call for a key. Followers block on wg; the
@@ -38,6 +40,12 @@ type Group[T any] struct {
 	pool sync.Pool
 }
 
+// TestHookFollowerJoined is called, when set, under the group's mutex each
+// time a caller joins an in-flight call as a follower. Nil in production;
+// middleware/cache's tests use it to know a follower waits. Cost in
+// production: one nil check per coalesced call.
+var TestHookFollowerJoined func()
+
 // New returns an initialised Group[T].
 func New[T any]() *Group[T] {
 	g := &Group[T]{calls: make(map[string]*Call[T])}
@@ -47,13 +55,17 @@ func New[T any]() *Group[T] {
 
 // Do runs fn for the first caller of a given key and returns its result
 // to every caller. The bool second return is true for the leader (the
-// caller that actually ran fn) and false for followers.
+// caller that actually ran fn) and false for followers. The leader gets
+// fn's error itself; followers get it as [handoff.Error] returns it.
 func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
 		// Follower. Register under the mutex so the leader's delete-time
 		// read of waiters captures us before it decides whether to pool.
 		c.waiters.Add(1)
+		if TestHookFollowerJoined != nil {
+			TestHookFollowerJoined()
+		}
 		g.mu.Unlock()
 		c.wg.Wait()
 		return c.Result, false, c.Err
@@ -77,9 +89,12 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	g.mu.Unlock()
 
 	if numWaiters > 0 {
-		// Followers will read these fields after wg.Done; populate.
+		// Followers will read these fields after wg.Done; populate. The
+		// followers get the error handed off (a copy of its message): the
+		// leader's error can hold its request strings, which a follower
+		// formats after the leader's request has ended (celeris#732).
 		c.Result = result
-		c.Err = err
+		c.Err = handoff.Error(err)
 	}
 	c.wg.Done()
 

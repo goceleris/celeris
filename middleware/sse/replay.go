@@ -28,6 +28,11 @@ type ReplayStore interface {
 	// Append records the event and returns the canonical ID the
 	// middleware will emit on the wire. Implementations SHOULD ignore
 	// e.ID and assign their own monotonically increasing ID.
+	//
+	// e's strings can be another request's strings, views valid only
+	// until Append returns (see [Client.Send]). A store that keeps them
+	// past Append must keep its own copy, as [NewRingBuffer] does;
+	// [NewKVReplayStore] encodes the event before Append returns.
 	Append(ctx context.Context, e Event) (id string, err error)
 
 	// Since returns every event appended strictly after lastID, in

@@ -642,8 +642,11 @@ func (c *Context) parseForm() error {
 	return nil
 }
 
-// RequestHeaders returns all request headers as key-value pairs.
-// The returned slice is a copy safe for concurrent use.
+// RequestHeaders returns all request headers as key-value pairs. Treat the
+// slice as read-only and valid until the handler returns: on HTTP/1.1 it is
+// the request's own header slice (on HTTP/2 a copy of it), and on epoll,
+// io_uring and Adaptive the names and values are views of the connection's
+// receive buffer (see the package documentation). Copy what you keep.
 func (c *Context) RequestHeaders() [][2]string {
 	return c.stream.GetHeaders()
 }

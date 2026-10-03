@@ -24,7 +24,11 @@ type Config struct {
 
 	// Singleflight coalesces concurrent cache-miss requests for the same
 	// key so only one handler invocation runs; waiters reuse the
-	// resulting response. Default: true.
+	// resulting response. When the handler returns an error, each waiter
+	// returns a copy of it made before the leader returns, as
+	// middleware/singleflight does: its message is copied, it unwraps to
+	// the leader's error ([errors.Is] and [errors.As] find what it holds),
+	// and it is not == to it. Default: true.
 	Singleflight bool
 
 	// Methods lists HTTP methods eligible for caching. Default: GET, HEAD.

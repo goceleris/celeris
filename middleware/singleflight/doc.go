@@ -14,6 +14,18 @@
 // non-idempotent methods or large-response endpoints). Waiter responses carry
 // an "x-singleflight: HIT" header.
 //
+// When the leader's handler returns an error or panics, every waiter returns
+// that error or panics with that value, as a copy made before the leader
+// returns: the leader's request strings are valid only until then. A string
+// panic value is copied. An error becomes one whose message is a copy, which
+// unwraps to the leader's error, so [errors.Is] and [errors.As] find what it
+// holds; an [errors.As] to a *[celeris.HTTPError] finds a copy whose Message
+// is copied too. Fields of other error types, and other panic values, are
+// the leader's own: build them from copies ([strings.Clone]) if a waiter may
+// read them, as celeris does for [celeris.BindError]'s Value. A waiter's
+// error is not the leader's error value, so compare with [errors.Is], not
+// ==.
+//
 //	server.Use(singleflight.New())
 //
 // Singleflight buffers the leader's response, so install it after timeout

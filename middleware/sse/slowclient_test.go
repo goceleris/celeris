@@ -350,7 +350,10 @@ func TestSlowClientRace(t *testing.T) {
 
 // TestSlowClientSendNonFullQueueAllocs is a strict-alloc gate on the
 // happy-path enqueue. The queued Send must avoid heap growth in steady state
-// — a regression here would mean per-event garbage on every fan-out.
+// — a regression here would mean per-event garbage on every fan-out. The one
+// permitted allocation is the copy of the event's strings, which the queue
+// keeps after Send returns (they can be another request's views,
+// celeris#732); an event with no strings allocates nothing.
 func TestSlowClientSendNonFullQueueAllocs(t *testing.T) {
 	if raceEnabled || testing.CoverMode() != "" || testing.Short() {
 		t.Skip("alloc counts unstable under -race / coverage / -short")
