@@ -56,3 +56,15 @@ func BenchmarkOTelCustomAttributesNested742(b *testing.B) {
 		}
 	})
 }
+
+// Numeric: no string value at all. appendOwned still copies the attribute
+// keys, which can be request strings too: one allocation per call where
+// main made none.
+func BenchmarkOTelCustomAttributesNumeric742(b *testing.B) {
+	benchCustomAttrs(b, func(c *celeris.Context) []attribute.KeyValue {
+		return []attribute.KeyValue{
+			attribute.Int("shard", 7),
+			attribute.Bool("beta", true),
+		}
+	})
+}
