@@ -23,12 +23,12 @@
 //
 // When [Config.Singleflight] is true (default), concurrent requests
 // that miss on the same key coalesce: one handler runs, the rest wait
-// for its result. They wait for the handler only, not for its client:
-// a cacheable response is stored before it is written, and every
-// request, the one that ran the handler included, writes its own
-// response after the wait, so a client that reads slowly delays only
-// its own response. Turn this off when handlers have side effects that
-// must run per-request.
+// for its result. They wait for the handler and the store's Set, not
+// for its client: a cacheable response is stored before it is written,
+// and every request, the one that ran the handler included, writes its
+// own response after the wait, so a client that reads slowly delays
+// only its own response. Turn this off when handlers have side effects
+// that must run per-request.
 //
 // # Cache-Control
 //
