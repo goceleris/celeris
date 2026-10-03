@@ -88,7 +88,14 @@ func startPromoted905(t *testing.T, base string) (int, func()) {
 	waitGone662(t, port, epollSet, "the outgoing epoll listeners after the promote")
 	wE, wI := workers662(e)
 
-	seen, err := pintest.LockedThreads(64)
+	// More probes than the process has threads, so that every idle thread is
+	// drafted (pintest.LockedThreads).
+	threads, err := pintest.Census()
+	if err != nil {
+		stop()
+		t.Fatalf("census after the promote: %v", err)
+	}
+	seen, err := pintest.LockedThreads(len(threads) + 16)
 	if err != nil {
 		stop()
 		t.Fatalf("locked-thread probe after the promote: %v", err)

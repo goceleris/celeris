@@ -14,8 +14,9 @@ import (
 // engine loops rely on it for the one thread the runtime cannot terminate,
 // the main thread (celeris#905).
 func TestSaveThreadAffinityRestoresThePin(t *testing.T) {
+	// Never unlocked: the test goroutine exits locked, so the runtime ends
+	// its thread even if a Restore below failed and left it pinned.
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
 	var before unix.CPUSet
 	if err := unix.SchedGetaffinity(0, &before); err != nil {

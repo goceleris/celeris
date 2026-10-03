@@ -69,10 +69,11 @@ func TestPinToCPU(t *testing.T) {
 	// On non-linux this is a no-op. On linux it may fail without root but shouldn't panic.
 	//
 	// The pin belongs to the OS thread, not the goroutine (celeris#905): hold
-	// the thread for the whole test and put its mask back, so no other test in
-	// this binary runs on a thread left pinned to CPU 0.
+	// the thread for the whole test, put its mask back, and never unlock it.
+	// The test goroutine exits locked, so the runtime ends its thread even if
+	// Restore failed, and no other test in this binary runs on a thread left
+	// pinned to CPU 0.
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	prev, err := SaveThreadAffinity()
 	if err != nil {
 		t.Fatalf("SaveThreadAffinity: %v", err)
