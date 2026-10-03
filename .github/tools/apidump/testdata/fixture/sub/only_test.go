@@ -1,0 +1,3 @@
+package sub
+
+func ExportedInTest() {}

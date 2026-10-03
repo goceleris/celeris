@@ -44,6 +44,13 @@ func releaseStamps() []releaseStamp {
 			re:   regexp.MustCompile(`(?m)^## What's new in v` + semverCore + `$`),
 			line: func(v string) string { return "## What's new in v" + v },
 		},
+		{
+			// The root package's API golden file carries Version's value
+			// (api/README.md); CI's API check fails while it disagrees.
+			path: "api/celeris.txt",
+			re:   regexp.MustCompile(`(?m)^const Version untyped string = "` + semverCore + `"$`),
+			line: func(v string) string { return `const Version untyped string = "` + v + `"` },
+		},
 	}
 	for _, sub := range releaseSubModules {
 		stamps = append(stamps, releaseStamp{
@@ -189,14 +196,14 @@ func semverParts(v string) semverKey {
 }
 
 // PrepRelease sets every version stamp to VERSION (v1.6.0 or 1.6.0): the
-// Version constant, the four sub-module pins and the README heading. When
-// the README heading moves it leaves a placeholder under the new heading
-// that CheckRelease refuses, so the release prose cannot be forgotten
-// either. Run it in the FINAL PR before the release (it moves the
-// sub-module pins to a tag that does not exist yet, which is only
-// harmless for the short life of that PR; see CheckRelease), then run the
-// Release workflow with the same version; it re-checks everything before
-// tagging.
+// Version constant and its line in api/celeris.txt, the four sub-module pins
+// and the README heading. When the README heading moves it leaves a
+// placeholder under the new heading that CheckRelease refuses, so the
+// release prose cannot be forgotten either. Run it in the FINAL PR before
+// the release (it moves the sub-module pins to a tag that does not exist
+// yet, which is only harmless for the short life of that PR; see
+// CheckRelease), then run the Release workflow with the same version; it
+// re-checks everything before tagging.
 func PrepRelease() error {
 	want := stripV(os.Getenv("VERSION"))
 	if !semverRe.MatchString(want) {
