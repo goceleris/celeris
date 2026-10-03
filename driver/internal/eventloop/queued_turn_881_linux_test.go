@@ -2,11 +2,12 @@
 
 package eventloop
 
-// celeris#881, review round 1 of #934: the read queue's turns and the
-// WriteAndPoll* calls that hold a conn's recvMu, and the worker's epoll_wait
-// timeout while a conn is queued.
+// celeris#881, review rounds 1 and 2 of #934: the read queue's turns and the
+// WriteAndPoll* calls that hold a conn's recvMu, the worker's epoll_wait
+// timeout while a conn is queued, and two conns queued at once.
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -282,6 +283,15 @@ func TestAQueuedTurnKeepsAnEventCollectedWhileACallerPolls881(t *testing.T) {
 		defer close(callDone)
 		_, _ = w.WriteAndPollMulti(x, nil, make([]byte, 1024), func([]byte) {}, func() bool { return true }, nil)
 	}()
+	// However the test ends, the hook is cleared once the call that runs it
+	// has returned (the hook itself waits 5 s at most).
+	t.Cleanup(func() {
+		select {
+		case <-callDone:
+		case <-time.After(10 * time.Second):
+		}
+		testHookAfterRearm = nil
+	})
 	c881Wait(t, rearmed, "the WriteAndPollMulti call re-armed X")
 	p.let()
 	select {
@@ -367,5 +377,166 @@ func TestAWorkerWithAQueuedConnDoesNotWaitInEpollWait881(t *testing.T) {
 	}
 	if bw != 0 {
 		t.Errorf("the worker made %d of its %d epoll_waits with a conn queued with a nonzero timeout: a backlogged conn waits a full timeout per turn when nothing else arrives", bw, q)
+	}
+}
+
+// c881Sink receives one conn's bytes, which carry the pattern
+// byte((offset+seed)%251), and records the first one out of order.
+type c881Sink struct {
+	mu                             sync.Mutex
+	seed, got, bad, reads, atClose int
+	all                            chan struct{}
+	closed                         chan error
+	onRead                         func(reads int) // on the worker, after each read's bytes are counted
+}
+
+func c881NewSink(seed int) *c881Sink {
+	return &c881Sink{seed: seed, bad: -1, atClose: -1, all: make(chan struct{}), closed: make(chan error, 1)}
+}
+
+func (s *c881Sink) onRecv(b []byte) {
+	s.mu.Lock()
+	s.reads++
+	r := s.reads
+	for i, c := range b {
+		if s.bad < 0 && c != byte((s.got+i+s.seed)%251) {
+			s.bad = s.got + i
+		}
+	}
+	s.got += len(b)
+	if s.got == 1<<20 {
+		close(s.all)
+	}
+	h := s.onRead
+	s.mu.Unlock()
+	if h != nil {
+		h(r)
+	}
+}
+
+func (s *c881Sink) onClose(err error) {
+	s.mu.Lock()
+	s.atClose = s.got
+	s.mu.Unlock()
+	s.closed <- err
+}
+
+func c881Pattern(seed int) []byte {
+	p := make([]byte, 1<<20)
+	for i := range p {
+		p[i] = byte((i + seed) % 251)
+	}
+	return p
+}
+
+// TestTwoBackloggedConnsGetEveryByte881: two conns are backlogged at once, so
+// serveReadQ must carry a conn queued during a round's batch over to the next
+// round (the tail of readQ) while it serves a conn owed from an earlier round.
+// X1 is a pipe filled with 1 MiB (64 reads, four turns) before it is
+// registered; X2 is a pipe registered empty. At X1's third read, X1's onRecv
+// fills X2 with 1 MiB, so X2's first event is in the batch of the round that
+// owes X1 its second turn: X2's turn uses up its budget and queues X2 while X1
+// is still queued (the test checks this on the worker, at X2's last read of
+// that turn). Every byte of both must arrive in order, and each conn's
+// onClose(nil) must fire after its last byte once its write end is closed. A
+// worker that dropped the conns queued during a batch would leave X2 queued
+// for a turn that never comes, with one turn (256 KiB) of its bytes read.
+func TestTwoBackloggedConnsGetEveryByte881(t *testing.T) {
+	l, err := New(1)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	w := l.WorkerLoop(0).(*worker)
+
+	const size = 1 << 20
+	x1, x1w := c881Pipe(t)
+	x2, x2w := c881Pipe(t)
+	t.Cleanup(func() { _ = unix.Close(x1); _ = unix.Close(x2) })
+	s1, s2 := c881NewSink(0), c881NewSink(97)
+	var fillErr error
+	filled := make(chan struct{})
+	s1.onRead = func(reads int) {
+		if reads != 3 {
+			return
+		}
+		if n, err := unix.Write(x2w, c881Pattern(97)); n != size || err != nil {
+			fillErr = fmt.Errorf("wrote %d of %d (%v)", n, size, err)
+		}
+		close(filled)
+	}
+	var x1QueuedAtX2Queue atomic.Bool
+	s2.onRead = func(reads int) {
+		if reads == readBudget { // X2's last read of its first turn: readQ is the worker's
+			if c := c784Lookup(w, x1); c != nil && c.readQueued {
+				x1QueuedAtX2Queue.Store(true)
+			}
+		}
+	}
+	if err := w.RegisterConn(x2, s2.onRecv, s2.onClose); err != nil {
+		t.Fatalf("RegisterConn(X2): %v", err)
+	}
+	t.Cleanup(func() { _ = w.UnregisterConn(x2) })
+	if n, err := unix.Write(x1w, c881Pattern(0)); n != size || err != nil {
+		t.Fatalf("fill X1: wrote %d of %d (%v)", n, size, err)
+	}
+	if err := w.RegisterConn(x1, s1.onRecv, s1.onClose); err != nil {
+		t.Fatalf("RegisterConn(X1): %v", err)
+	}
+	t.Cleanup(func() { _ = w.UnregisterConn(x1) })
+	c881Wait(t, filled, "X1's third read, which fills X2")
+	if fillErr != nil {
+		t.Fatalf("fill X2: %v", fillErr)
+	}
+
+	d1, d2 := false, false
+	all1, all2 := s1.all, s2.all
+	deadline := time.After(5 * time.Second)
+wait:
+	for !d1 || !d2 {
+		select {
+		case <-all1:
+			d1, all1 = true, nil
+		case <-all2:
+			d2, all2 = true, nil
+		case <-deadline:
+			break wait
+		}
+	}
+	_ = unix.Close(x1w)
+	_ = unix.Close(x2w)
+	var c1, c2 error
+	f1, f2 := false, false
+	closeDeadline := time.After(5 * time.Second)
+closing:
+	for !f1 || !f2 {
+		select {
+		case c1 = <-s1.closed:
+			f1 = true
+		case c2 = <-s2.closed:
+			f2 = true
+		case <-closeDeadline:
+			break closing
+		}
+	}
+	s1.mu.Lock()
+	g1, b1, r1, a1 := s1.got, s1.bad, s1.reads, s1.atClose
+	s1.mu.Unlock()
+	s2.mu.Lock()
+	g2, b2, r2, a2 := s2.got, s2.bad, s2.reads, s2.atClose
+	s2.mu.Unlock()
+	t.Logf("C881 two backlogs: X2 queued while X1 was queued: %v; X1 %d of %d bytes in %d reads (first wrong byte at %d; onClose fired %v (%v) at %d bytes); X2 %d of %d bytes in %d reads (first wrong byte at %d; onClose fired %v (%v) at %d bytes)",
+		x1QueuedAtX2Queue.Load(), g1, size, r1, b1, f1, c1, a1, g2, size, r2, b2, f2, c2, a2)
+	if !x1QueuedAtX2Queue.Load() {
+		t.Fatal("X2 used up its first turn's budget while X1 was not queued: the test did not backlog two conns at once")
+	}
+	if !d1 || !d2 {
+		t.Errorf("not every byte arrived within 5 s: X1 %d, X2 %d of %d each; a conn queued during a batch was not carried to the next round", g1, g2, size)
+	}
+	if b1 >= 0 || b2 >= 0 {
+		t.Errorf("bytes out of order: X1's first wrong byte at %d, X2's at %d", b1, b2)
+	}
+	if !f1 || c1 != nil || a1 != size || !f2 || c2 != nil || a2 != size {
+		t.Errorf("onClose: X1 fired %v (%v) at %d bytes, X2 fired %v (%v) at %d bytes; want onClose(nil) after the last byte of each", f1, c1, a1, f2, c2, a2)
 	}
 }
