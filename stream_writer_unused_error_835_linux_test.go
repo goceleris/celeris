@@ -33,26 +33,22 @@ func routes835(async bool) func(*celeris.Server) {
 				_ = c.StreamWriter()
 				panic("celeris#835 test panic before the StreamWriter is used")
 			}),
+			// The control: the stream is committed (and ended) before the
+			// error, so the client gets the stream and nothing after it.
+			s.GET("/committed835", func(c *celeris.Context) error {
+				sw := c.StreamWriter()
+				if err := sw.WriteHeader(200, [][2]string{{"content-type", "text/plain"}}); err != nil {
+					return err
+				}
+				if _, err := sw.Write([]byte("part835")); err != nil {
+					return err
+				}
+				if err := sw.Close(); err != nil {
+					return err
+				}
+				return errors.New("an error after the stream ended")
+			}),
 		}
-		// The control: the stream is committed (and ended) before the error,
-		// so the client gets the stream and nothing after it. It is not an
-		// async route even in the async shape (the server's AsyncHandlers
-		// still dispatches its HTTP/1.1 requests): an async route's streamed
-		// HTTP/2 response can lose its last frames to celeris#837 until #900
-		// lands, and this case guards the error path, not the dispatch.
-		s.GET("/committed835", func(c *celeris.Context) error {
-			sw := c.StreamWriter()
-			if err := sw.WriteHeader(200, [][2]string{{"content-type", "text/plain"}}); err != nil {
-				return err
-			}
-			if _, err := sw.Write([]byte("part835")); err != nil {
-				return err
-			}
-			if err := sw.Close(); err != nil {
-				return err
-			}
-			return errors.New("an error after the stream ended")
-		})
 		if async {
 			for _, r := range rs {
 				r.Async()
