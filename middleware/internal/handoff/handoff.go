@@ -31,10 +31,20 @@ import (
 // type finds err's own value, whose fields are shared. The result is not
 // err itself: == and a type assertion on it do not match err. A nil err
 // stays nil.
-func Error(err error) error {
+//
+// An Error method that panics (a typed nil pointer returned as an error,
+// say) does not panic here: Error returns err itself, which the waiter then
+// formats as before. The leader calls Error between taking its waiters and
+// releasing them, so a panic here would never release them.
+func Error(err error) (out error) {
 	if err == nil {
 		return nil
 	}
+	defer func() {
+		if recover() != nil {
+			out = err
+		}
+	}()
 	h := &handedOff{msg: strings.Clone(err.Error()), err: err}
 	var he *celeris.HTTPError
 	if errors.As(err, &he) && he != nil {

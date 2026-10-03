@@ -72,6 +72,29 @@ func TestErrorCopiesWhatAWaiterReads(t *testing.T) {
 	}
 }
 
+type nilPtrError struct{ msg string }
+
+func (e *nilPtrError) Error() string { return e.msg }
+
+// TestErrorWhoseErrorPanics pins that an Error method that panics does not
+// panic the leader, which would never release its waiters: Error returns the
+// error itself, as before handoff.
+func TestErrorWhoseErrorPanics(t *testing.T) {
+	var typedNil *nilPtrError
+	var err error = typedNil
+	got := handoff.Error(err)
+	if got != err {
+		t.Errorf("Error of an error whose Error() panics = %#v, want the error itself", got)
+	}
+	if p := handoff.Panic(err); p != err {
+		t.Errorf("Panic of an error whose Error() panics = %#v, want the error itself", p)
+	}
+	he := celeris.NewHTTPError(500, "wraps a bad error").WithError(err)
+	if got := handoff.Error(he); got != error(he) {
+		t.Errorf("Error of an HTTPError whose wrapped Error() panics = %#v, want the error itself", got)
+	}
+}
+
 // TestPanicCopiesStringsAndErrors pins the panic value a waiter re-panics
 // with.
 func TestPanicCopiesStringsAndErrors(t *testing.T) {
