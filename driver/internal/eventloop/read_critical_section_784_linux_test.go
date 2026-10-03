@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestReadCheckAndReadAreOneCriticalSection784 calls handleReadable on the
+// TestReadCheckAndReadAreOneCriticalSection784 dispatches A's event on the
 // test goroutine (the worker has no goroutine of its own). Inside the hook it
 // starts UnregisterConn(A) on another goroutine and gives it 300 ms. If it
 // returns in that time, the reader has been overtaken between its check and
@@ -79,8 +79,15 @@ func TestReadCheckAndReadAreOneCriticalSection784(t *testing.T) {
 	}, func(error) {}); err != nil {
 		t.Fatalf("RegisterConn(A): %v", err)
 	}
+	ca := c784Lookup(w, a)
+	if ca == nil {
+		t.Fatal("A is not registered")
+	}
+	// The event the worker would collect for A: A's number and the
+	// generation of A's registration (celeris#842).
+	evA := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(a), Pad: int32(ca.gen)}
 
-	w.handleReadable(a, unix.EPOLLIN)
+	w.dispatch(evA)
 	if !hookRan {
 		t.Fatal("testHookBeforeRead never ran for A: the reader did not go through the hooked read")
 	}
@@ -96,7 +103,7 @@ func TestReadCheckAndReadAreOneCriticalSection784(t *testing.T) {
 		reuse()
 		// An event for the old number that the worker collected before the
 		// unregister: the conn is gone, so it must not be read.
-		w.handleReadable(a, unix.EPOLLIN)
+		w.dispatch(evA)
 	}
 
 	got, rerr := c784ReadAll(x)
