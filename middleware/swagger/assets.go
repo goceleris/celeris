@@ -12,6 +12,12 @@ import (
 // bundles carry third-party notices (*.LICENSE.txt). The notices are served
 // next to the bundles, so a binary that serves the UI also serves them.
 //
+// The package's OAuth2 redirect page and its script are embedded too
+// (celeris#850). The page calls window.opener.swaggerUIRedirectOauth2, so it
+// must come from the UI page's origin: it is served at
+// {BasePath}/oauth2-redirect.html, where Swagger UI looks for it by default,
+// whichever source the UI's own files load from.
+//
 // Only Swagger UI, the default renderer, is embedded. The Scalar and ReDoc
 // bundles (4.4 MB and 1.1 MB) would be linked into every binary that
 // imports this package whichever renderer it uses, since the renderer is a
@@ -24,6 +30,10 @@ var (
 	swaggerUIBundle []byte
 	//go:embed assets/swagger-ui-dist/swagger-ui-standalone-preset.js
 	swaggerUIPreset []byte
+	//go:embed assets/swagger-ui-dist/oauth2-redirect.html
+	swaggerUIOAuth2RedirectPage []byte
+	//go:embed assets/swagger-ui-dist/oauth2-redirect.js
+	swaggerUIOAuth2RedirectScript []byte
 	//go:embed assets/swagger-ui-dist/swagger-ui-bundle.js.LICENSE.txt
 	swaggerUIBundleNotices []byte
 	//go:embed assets/swagger-ui-dist/swagger-ui-standalone-preset.js.LICENSE.txt
@@ -36,6 +46,7 @@ var (
 
 const (
 	contentTypeCSS  = "text/css; charset=utf-8"
+	contentTypeHTML = "text/html; charset=utf-8"
 	contentTypeJS   = "text/javascript; charset=utf-8"
 	contentTypeText = "text/plain; charset=utf-8"
 
@@ -63,6 +74,17 @@ var swaggerUIAssets = []embeddedAsset{
 	{"LICENSE", contentTypeText, swaggerUILicense},
 	{"NOTICE", contentTypeText, swaggerUINotice},
 }
+
+// The OAuth2 redirect page and its script, served next to the UI page at
+// {BasePath}/oauth2-redirect.html and {BasePath}/oauth2-redirect.js: Swagger
+// UI's default oauth2RedirectUrl is the page's directory plus
+// "oauth2-redirect.html", and the redirect page loads "oauth2-redirect.js"
+// relative to itself. Their URLs carry no version, so they get no cache
+// lifetime, like the page.
+var (
+	oauth2RedirectPage   = embeddedAsset{"oauth2-redirect.html", contentTypeHTML, swaggerUIOAuth2RedirectPage}
+	oauth2RedirectScript = embeddedAsset{"oauth2-redirect.js", contentTypeJS, swaggerUIOAuth2RedirectScript}
+)
 
 // embeddedAssetsDir is where the embedded Swagger UI files live, relative
 // to the page at {BasePath}/. The version in the path makes each URL name
@@ -120,10 +142,12 @@ func swaggerUIRefs(cfg Config) (css, bundle, preset assetRef) {
 }
 
 // scalarRef returns the Scalar script reference. validate() has ensured
-// AssetsPath or CDN is set: Scalar is not embedded.
+// AssetsPath or CDN is set: Scalar is not embedded. With AssetsPath the file
+// keeps the name @scalar/api-reference publishes it under,
+// dist/browser/standalone.js (celeris#882).
 func scalarRef(cfg Config) assetRef {
 	if cfg.AssetsPath != "" {
-		return assetRef{URL: strings.TrimRight(cfg.AssetsPath, "/") + "/standalone.min.js"}
+		return assetRef{URL: strings.TrimRight(cfg.AssetsPath, "/") + "/standalone.js"}
 	}
 	return assetRef{cdnBase + "@scalar/api-reference@" + ScalarVersion + "/dist/browser/standalone.js", sriScalar}
 }

@@ -178,6 +178,21 @@ func (s *Server) loadEngine() engine.Engine {
 // at route registration time, so Use must be called before registering routes;
 // calling it after panics to surface the silent-divergence bug
 // (some routes would have the middleware, others would not).
+//
+// Global middleware also runs for a request no route matches, before its 404
+// or 405 answer (the [Server.NotFound] / [Server.MethodNotAllowed] handler,
+// or the built-in one). So logger, metrics, otel and requestid see unmatched
+// requests, an authentication middleware answers them as it answers routed
+// ones, and a middleware that serves its own paths, such as swagger, pprof,
+// debug, healthcheck, the metrics endpoint or static, answers them with no
+// route registered for them. Group and route middleware do not run for an
+// unmatched request. Under [Config.AsyncHandlers] an unmatched request is
+// dispatched like a route inheriting that default, one decision for all
+// unmatched requests ([Config.AsyncHandlers] says when a blocking one still
+// runs inline). A middleware that serves its own paths answers them
+// for every client its AuthFunc admits: pprof's and debug's default admits a
+// loopback peer, which behind a reverse proxy on the same host is every
+// client, and the metrics endpoint has no AuthFunc by default.
 func (s *Server) Use(middleware ...HandlerFunc) *Server {
 	if s.routesRegistered {
 		panic("celeris: Server.Use called after routes were registered — chains were already baked at handle() time, so this Use call would only apply to routes registered hereafter and produce silently inconsistent middleware coverage. Move Use calls before any GET/POST/etc.")
@@ -228,12 +243,20 @@ func (s *Server) PATCH(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("PATCH", path, handlers...)
 }
 
-// HEAD registers a handler for HEAD requests.
+// HEAD registers a handler for HEAD requests. A path without a HEAD route
+// is answered by its GET route, if it has one: the GET handler runs (it sees
+// Method() == "HEAD") and the engine sends its headers without the body
+// (RFC 9110 §9.3.2). Register HEAD only to answer it differently.
 func (s *Server) HEAD(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("HEAD", path, handlers...)
 }
 
-// OPTIONS registers a handler for OPTIONS requests.
+// OPTIONS registers a handler for OPTIONS requests. A path without an
+// OPTIONS route that has any other route is answered automatically: 200 with
+// an Allow header listing the methods the path answers (HEAD whenever it has
+// GET, and OPTIONS) and Content-Length: 0 (RFC 9110 §9.3.7). The global
+// middleware ([Server.Use]) runs first, so a CORS middleware answers its
+// preflight; group and route middleware do not run for it.
 func (s *Server) OPTIONS(path string, handlers ...HandlerFunc) *Route {
 	return s.handle("OPTIONS", path, handlers...)
 }
@@ -249,13 +272,22 @@ func (s *Server) Any(path string, handlers ...HandlerFunc) []*Route {
 }
 
 // NotFound registers a custom handler for requests that do not match any route.
+// The global middleware ([Server.Use]) runs first, and the handler runs only if
+// no middleware has answered the request. Without one, the answer is
+// "404 Not Found" (text/plain), written after the global middleware the same
+// way.
 func (s *Server) NotFound(handler HandlerFunc) *Server {
 	s.notFoundHandler = handler
 	return s
 }
 
 // MethodNotAllowed registers a custom handler for requests where the path matches
-// but the HTTP method does not. The Allow header is set automatically.
+// but the HTTP method does not. The Allow header is set automatically. The
+// global middleware ([Server.Use]) runs first, and the handler runs only if no
+// middleware has answered the request; without one, the answer is
+// "405 Method Not Allowed" (text/plain) with the Allow header. HEAD to
+// a path with a GET route, and OPTIONS to a path with any route, are answered
+// (see [Server.HEAD], [Server.OPTIONS]) and never reach this handler.
 func (s *Server) MethodNotAllowed(handler HandlerFunc) *Server {
 	s.methodNotAllowedHandler = handler
 	return s
@@ -897,16 +929,8 @@ func (s *Server) doPrepare(configureFn func(cfg *resource.Config)) (engine.Engin
 		}
 
 		ra := &routerAdapter{server: s}
-		if s.notFoundHandler != nil {
-			ra.notFoundChain = make([]HandlerFunc, 0, len(s.middleware)+1)
-			ra.notFoundChain = append(ra.notFoundChain, s.middleware...)
-			ra.notFoundChain = append(ra.notFoundChain, s.notFoundHandler)
-		}
-		if s.methodNotAllowedHandler != nil {
-			ra.methodNotAllowedChain = make([]HandlerFunc, 0, len(s.middleware)+1)
-			ra.methodNotAllowedChain = append(ra.methodNotAllowedChain, s.middleware...)
-			ra.methodNotAllowedChain = append(ra.methodNotAllowedChain, s.methodNotAllowedHandler)
-		}
+		ra.buildUnmatchedChains()
+		ra.optionsChain = newOptionsChain(s.middleware)
 		ra.errorHandler = s.errorHandler
 		var handler stream.Handler = ra
 

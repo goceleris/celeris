@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/protocol/h2/frame"
@@ -52,6 +53,13 @@ type H2Config struct {
 	InitialWindowSize    uint32
 	MaxFrameSize         uint32
 	MaxRequestBodySize   int64 // 0 = use default (100 MB)
+	// WriteTimeout bounds how long a worker-pool handler waits for the
+	// peer's flow-control window to send a response the connection's
+	// outbound budget would not let it hand off (celeris#893): then its
+	// stream is reset with INTERNAL_ERROR and its write returns an error
+	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
+	// WriteTimeout. 0 = no bound.
+	WriteTimeout time.Duration
 }
 
 // withDefaults returns a copy of cfg with zero fields set to RFC 7540 defaults.
@@ -120,8 +128,10 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 	shard.bufs = append(shard.bufs, data)
 	shard.mu.Unlock()
 	// CAS coalescing: only signal the event loop if no prior enqueue already
-	// set pending. If CAS fails, pending is already true and a prior enqueue
-	// already wrote the eventfd — the event loop will drain all shards.
+	// set pending. If CAS fails, pending is already true: an enqueue since
+	// the last drain's clear wrote the eventfd, so a drain is still to come,
+	// and it takes this frame because DrainTo clears pending before it takes
+	// any shard (celeris#837).
 	if q.pending.CompareAndSwap(false, true) {
 		q.wake.Signal()
 	}
@@ -130,7 +140,17 @@ func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
 // DrainTo drains all enqueued data by calling write for each buffer,
 // then returns buffers to the pool.
 // Called from the event loop thread. The write function must not block.
+//
+// pending is cleared BEFORE the shards are emptied, never after
+// (celeris#837). An Enqueue that lands while the drain is past its shard sees
+// pending false, sets it and signals the loop, so the loop's next drain (gated
+// on pending) takes the frame. Clearing it at the end lost that frame: the
+// Enqueue had seen pending still true and signalled nothing, and the clear
+// then left the frame in its shard with pending false. A streamed response
+// lost its last frames that way. An Enqueue between the clear and its shard's
+// swap is drained here and also signals: one spurious wakeup, one empty drain.
 func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
+	q.pending.Store(false)
 	for i := range q.shards {
 		s := &q.shards[i]
 		s.mu.Lock()
@@ -140,6 +160,11 @@ func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
 			write(*buf)
 			putH2FrameBuf(buf)
 		}
+		// Drop the drained pointers: putH2FrameBuf does not pool a buffer
+		// past 8 KiB, and a pointer left in the spare array kept that buffer
+		// (a whole response's DATA) reachable until a later drain overwrote
+		// its slot (celeris#893).
+		clear(s.spare)
 		// Reclaim capacity if it grew beyond steady-state.
 		if cap(s.spare) > 64 {
 			s.spare = make([]*[]byte, 0, 16)
@@ -147,7 +172,6 @@ func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
 			s.spare = s.spare[:0]
 		}
 	}
-	q.pending.Store(false)
 }
 
 // h2StreamEncoder provides goroutine-local HPACK encoding with dynamic table
@@ -497,6 +521,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 		outBuf:       &s.outBuf,
 		writeQueue:   &s.writeQueue,
 		maxFrameSize: cfg.MaxFrameSize,
+		writeTimeout: cfg.WriteTimeout,
 	}
 	s.inlineAdapter = h2InlineResponseAdapter{
 		outBuf:       &s.outBuf,

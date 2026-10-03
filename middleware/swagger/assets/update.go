@@ -47,12 +47,15 @@ const (
 )
 
 // swaggerUIFiles are copied from the swagger-ui-dist tarball into
-// assetsDir: the three files the page loads and the licence notices
-// (Apache-2.0 LICENSE and NOTICE, and the bundles' third-party notices).
+// assetsDir: the three files the page loads, the OAuth2 redirect page and
+// its script (celeris#850), and the licence notices (Apache-2.0 LICENSE and
+// NOTICE, and the bundles' third-party notices).
 var swaggerUIFiles = []string{
 	"swagger-ui.css",
 	"swagger-ui-bundle.js",
 	"swagger-ui-standalone-preset.js",
+	"oauth2-redirect.html",
+	"oauth2-redirect.js",
 	"swagger-ui-bundle.js.LICENSE.txt",
 	"swagger-ui-standalone-preset.js.LICENSE.txt",
 	"LICENSE",

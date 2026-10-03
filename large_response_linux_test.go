@@ -514,6 +514,13 @@ func skipIouringAsyncPipelined751(t *testing.T, eng celeris.EngineType, asyncRou
 // leaked (see startC714DetachServer).
 func startServer761(t *testing.T, eng celeris.EngineType, asyncServer bool, routes func(*celeris.Server)) string {
 	t.Helper()
+	return startServerConfig761(t, celeris.Config{Engine: eng, AsyncHandlers: asyncServer}, routes)
+}
+
+// startServerConfig761 is startServer761 with a whole Config (its Addr is
+// chosen here).
+func startServerConfig761(t *testing.T, cfg celeris.Config, routes func(*celeris.Server)) string {
+	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -522,7 +529,8 @@ func startServer761(t *testing.T, eng celeris.EngineType, asyncServer bool, rout
 		}
 		addr := ln.Addr().String()
 		_ = ln.Close()
-		s := celeris.New(celeris.Config{Engine: eng, Addr: addr, AsyncHandlers: asyncServer})
+		cfg.Addr = addr
+		s := celeris.New(cfg)
 		s.GET("/ping", func(c *celeris.Context) error { return c.String(http.StatusOK, "ok") })
 		routes(s)
 		startDone := make(chan error, 1)

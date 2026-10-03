@@ -111,6 +111,15 @@ type router struct {
 	// batching while genuinely-blocking handlers still get goroutine
 	// isolation. Built at registration; read-only while serving.
 	adaptiveRoutes map[string]bool
+	// unmatchedAdaptive (celeris#852) dispatches a request no route matches
+	// (a 404, a 405, an automatic OPTIONS answer) like a route that inherits
+	// the AsyncHandlers=true default: its chain runs the global middleware
+	// and any NotFound / MethodNotAllowed handler, which can block, so it
+	// starts inline and is promoted, under unmatchedAdaptiveKey, once an
+	// inline run is observed to block. Set by buildUnmatchedChains when the
+	// server default is async and that chain runs more than the built-in
+	// answer; read-only while serving.
+	unmatchedAdaptive bool
 	// promoted records adaptive fullPaths that have been promoted to async
 	// after sustained blocking inline runs. sync.Map: concurrent reads on the
 	// hot path, rare writes at promotion time.
@@ -444,15 +453,16 @@ func (r *router) reopenSettled() {
 
 // startSettleReopener starts the background goroutine that calls
 // reopenSettled every adaptiveSettleTTL (celeris#592). Called from
-// Server.doPrepare; a no-op when the server has no adaptive routes (nothing
-// can settle) or when the re-opener is already running. Idempotent.
+// Server.doPrepare; a no-op when the server has no adaptive routes and no
+// adaptive unmatched chain (nothing can settle) or when the re-opener is
+// already running. Idempotent.
 //
 // Off the request path by construction: the alternative designs (sample every
 // Nth request, or stamp the settled entry with a deadline and compare a clock)
 // both put work back on the hot path that celeris#361 removed, for the same
 // detection bound.
 func (r *router) startSettleReopener(interval time.Duration) {
-	if len(r.adaptiveRoutes) == 0 || interval <= 0 {
+	if (len(r.adaptiveRoutes) == 0 && !r.unmatchedAdaptive) || interval <= 0 {
 		return
 	}
 	r.reopenMu.Lock()
@@ -562,19 +572,34 @@ func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, 
 	return route
 }
 
-// hasAsyncRoutes reports whether any registered route resolves to async
-// dispatch. The engine uses this (OR'd with the server default) to decide
-// whether to wire up the async dispatch infrastructure at all.
+// hasAsyncRoutes reports whether any registered route, or the unmatched
+// chain (unmatchedAdaptive), can resolve to async dispatch. The engine uses
+// this (OR'd with the server default) to decide whether to wire up the async
+// dispatch infrastructure at all.
 func (r *router) hasAsyncRoutes() bool {
-	return r.asyncRouteCount > 0
+	return r.asyncRouteCount > 0 || r.unmatchedAdaptive
+}
+
+// unmatchedAdaptiveKey is the adaptive key every request no route matches
+// shares (celeris#852): routeAsync cannot tell a 404 from a 405 without the
+// allowed-methods walk, so the dispatch decision is one for all of them. It
+// cannot collide with a route pattern, which starts with '/'.
+const unmatchedAdaptiveKey = "<unmatched>"
+
+// unmatchedPromoted reports whether a request no route matches is dispatched
+// async: unmatchedAdaptive, and an inline run of the unmatched chain blocked
+// (celeris#852).
+func (r *router) unmatchedPromoted() bool {
+	return r.unmatchedAdaptive && r.isPromoted(unmatchedAdaptiveKey)
 }
 
 // routeAsync resolves whether the route matching method+path runs async,
 // without filling a Params slice for the caller. Fully static routes (the
 // common async-annotated case, e.g. /api/...) resolve via the O(1) static
 // map with zero allocation; parameterised routes pay a scratch Params walk.
-// Returns false when no route matches (unmatched → 404 handler, which is
-// never async).
+// When no route matches, the request runs the unmatched chain, which is
+// dispatched like a route inheriting the server default (unmatchedPromoted,
+// celeris#852).
 func (r *router) routeAsync(method, path string) bool {
 	idx := methodIndex(method)
 	if idx >= 0 {
@@ -591,7 +616,13 @@ func (r *router) routeAsync(method, path string) bool {
 		}
 	}
 	var params Params
-	_, fullPath, async := r.find(method, path, &params)
+	handlers, fullPath, async := r.find(method, path, &params)
+	if handlers == nil && method == "HEAD" {
+		handlers, fullPath, async = r.findHEADAsGET(path, &params, 0)
+	}
+	if handlers == nil {
+		return r.unmatchedPromoted()
+	}
 	return async || r.adaptivePromoted(fullPath)
 }
 
@@ -625,6 +656,20 @@ func isStaticPath(path string) bool {
 	return true
 }
 
+// findHEADAsGET answers a HEAD request whose path has no HEAD route with the
+// path's GET route (celeris#421; RFC 9110 §9.3.2: HEAD is GET without the
+// content, which the engines drop). find stays the exact lookup, and its two
+// request-path callers call this only after find missed a HEAD, so a hit
+// costs what it did: HandleStream (and so the per-connection route cache,
+// keyed by method) and routeAsync (the dispatch decision), which must agree
+// on the route. n is the length params had before the failed walk.
+func (r *router) findHEADAsGET(path string, params *Params, n int) ([]HandlerFunc, string, bool) {
+	*params = (*params)[:n]
+	return r.find("GET", path, params)
+}
+
+// find returns the handler chain, route pattern and async flag of the route
+// registered for exactly method+path; see findHEADAsGET for HEAD.
 func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
 	idx := methodIndex(method)
 	var root *node
@@ -668,30 +713,50 @@ func (r *router) find(method, path string, params *Params) ([]HandlerFunc, strin
 	return search(root, path, params)
 }
 
-// allowedMethods returns the HTTP methods that have a registered handler for
-// the given path, excluding the specified method.
+// allowedMethods returns the methods the path answers, for the Allow header
+// of a 405 and of the automatic OPTIONS answer (celeris#421; RFC 9110
+// §10.2.1), excluding except: every method with a route for the path, HEAD
+// when the path has a GET or HEAD route (a HEAD without its own route is
+// answered by the GET route, findHEADAsGET), and OPTIONS (answered
+// automatically when the path has no OPTIONS route). The order is GET, POST,
+// PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
+// no route at all returns nil.
 func (r *router) allowedMethods(path string, except string) []string {
-	var allowed []string
 	var params Params
-	for i, root := range r.trees {
-		if root == nil {
-			continue
-		}
-		method := methodNames[i]
-		if method == except {
-			continue
-		}
+	has := func(method string) bool {
 		params = params[:0]
-		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
-			allowed = append(allowed, method)
+		handlers, _, _ := r.find(method, path, &params)
+		return handlers != nil
+	}
+	var found [nMethods]bool
+	routed := false
+	for i, root := range r.trees {
+		if root != nil && has(methodNames[i]) {
+			found[i] = true
+			routed = true
 		}
 	}
+	var custom []string
 	for method := range r.customTrees {
-		if method == except {
-			continue
+		if has(method) {
+			custom = append(custom, method)
+			routed = true
 		}
-		params = params[:0]
-		if handlers, _, _ := r.find(method, path, &params); handlers != nil {
+	}
+	if !routed {
+		return nil
+	}
+	found[mHEAD] = found[mHEAD] || found[mGET]
+	found[mOPTIONS] = true
+	allowed := make([]string, 0, nMethods+len(custom))
+	for i, ok := range found {
+		if ok && methodNames[i] != except {
+			allowed = append(allowed, methodNames[i])
+		}
+	}
+	slices.Sort(custom)
+	for _, method := range custom {
+		if method != except {
 			allowed = append(allowed, method)
 		}
 	}
