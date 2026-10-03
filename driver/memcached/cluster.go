@@ -12,8 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/goceleris/celeris/driver/internal/eventloop"
 )
 
 // Defaults for cluster failover behavior.
@@ -59,7 +57,7 @@ type ClusterConfig struct {
 
 	// Engine hooks the cluster into a running celeris.Server's event loop.
 	// If nil, a standalone loop is resolved for each node client.
-	Engine eventloop.ServerProvider
+	Engine ServerProvider
 
 	// FailureThreshold is the number of consecutive infrastructure-level
 	// errors (dial failures, I/O errors, protocol corruption) that must

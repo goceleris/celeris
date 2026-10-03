@@ -23,7 +23,6 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis"
-	"github.com/goceleris/celeris/driver/redis/protocol"
 	"github.com/goceleris/celeris/middleware/ratelimit"
 )
 
@@ -238,10 +237,10 @@ func containsNoScript(s string) bool {
 }
 
 // decodeAllowResult expects a 3-element array: {allowed, remaining, reset_ns}.
-// Redis Lua integer returns arrive as protocol.TyInt; Lua numbers arrive
+// Redis Lua integer returns arrive as redis.TyInt; Lua numbers arrive
 // as TyBulk (string) in some RESP2 contexts. Handle both.
-func decodeAllowResult(v *protocol.Value) (bool, int, int64, error) {
-	if v == nil || v.Type != protocol.TyArray || len(v.Array) != 3 {
+func decodeAllowResult(v *redis.Value) (bool, int, int64, error) {
+	if v == nil || v.Type != redis.TyArray || len(v.Array) != 3 {
 		return false, 0, 0, fmt.Errorf("ratelimit/redisstore: unexpected reply shape: %+v", v)
 	}
 	allowed, err := toInt(v.Array[0])
@@ -259,11 +258,11 @@ func decodeAllowResult(v *protocol.Value) (bool, int, int64, error) {
 	return allowed == 1, int(remaining), resetNs, nil
 }
 
-func toInt(v protocol.Value) (int64, error) {
+func toInt(v redis.Value) (int64, error) {
 	switch v.Type {
-	case protocol.TyInt:
+	case redis.TyInt:
 		return v.Int, nil
-	case protocol.TyBulk, protocol.TySimple, protocol.TyVerbatim:
+	case redis.TyBulk, redis.TySimple, redis.TyVerbatim:
 		n, err := parseInt(string(v.Str))
 		if err != nil {
 			return 0, fmt.Errorf("ratelimit/redisstore: cannot parse integer %q: %w", v.Str, err)
