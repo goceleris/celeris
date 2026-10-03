@@ -824,8 +824,9 @@ func h2FrameBufSize(headerLen, dataLen int, maxFrame uint32) int {
 // stageBody appends to frameBuf the sendLen bytes of DATA the flow-control
 // windows let body send with its HEADERS (reserved by the caller), and
 // buffers the rest on the stream when the connection's outbound budget has
-// room for it (celeris#893). It returns the part it could do neither with,
-// for sendRest.
+// room for it (celeris#893) and the stream may be buffered at all (not one
+// that runs on the pool only because of the budget: TryBufferOutbound). It
+// returns the part it could do neither with, for sendRest.
 func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, sendLen int, maxFrame uint32) ([]byte, []byte) {
 	if sendLen > 0 {
 		isEnd := sendLen == len(body)
@@ -845,8 +846,9 @@ func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, s
 }
 
 // sendRest sends the part of a worker-pool handler's response body that the
-// windows did not take and the connection's outbound budget had no room to
-// buffer (celeris#893), the HEADERS having gone out. It waits for the windows
+// windows did not take and TryBufferOutbound did not buffer (celeris#893):
+// the connection's outbound budget had no room, or the stream is a sync one
+// on the pool only because of the budget. Its HEADERS are queued. It waits for the windows
 // and sends what they allow, through the write queue, until the body is out:
 // the handler blocks, as a net/http handler blocks in Write on flow control,
 // instead of the connection copying past its budget. None of it is buffered,

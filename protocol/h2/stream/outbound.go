@@ -92,11 +92,22 @@ func (m *Manager) sendWindowChan() chan struct{} {
 // the worker pool (an inline handler, on the event loop; a stream with no
 // manager) data is buffered as before and the result is true: the event loop
 // keeps inline handlers off a connection that is over its budget instead.
+//
+// A stream that would have run inline but was put on the pool by the budget
+// (flagBudgetPool) is never buffered, whatever the budget holds by now: the
+// HEADERS of a pool handler wait in the write queue, and the event loop
+// flushes a stream's buffered DATA straight to the connection, so its DATA
+// could reach the peer before its HEADERS (#903's mechanism, which an inline
+// stream does not reach). It sends everything through the queue instead.
 func (s *Stream) TryBufferOutbound(data []byte, endStream bool) bool {
 	m := s.manager
-	if m == nil || s.flags.Load()&flagAsyncRunning == 0 {
+	f := s.flags.Load()
+	if m == nil || f&flagAsyncRunning == 0 {
 		s.BufferOutbound(data, endStream)
 		return true
+	}
+	if f&flagBudgetPool != 0 {
+		return false
 	}
 	n := int64(len(data))
 	for {

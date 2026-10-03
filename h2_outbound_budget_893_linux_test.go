@@ -43,7 +43,8 @@ func heapInuse893() uint64 {
 // h2Client893 is a raw h2c client (prior knowledge) that keeps the default
 // 65,535-byte windows and grants no WINDOW_UPDATE until credit is called. It
 // tallies, per stream, the response HEADERS, the DATA bytes (checked against
-// the body893 pattern as they arrive) and END_STREAM.
+// the body893 pattern as they arrive, and against arriving before the
+// stream's HEADERS) and END_STREAM.
 type h2Client893 struct {
 	conn net.Conn
 	fr   *http2.Framer
@@ -122,6 +123,12 @@ func (c *h2Client893) read() {
 		case *http2.DataFrame:
 			c.mu.Lock()
 			off := c.data[f.StreamID]
+			if _, ok := c.headers[f.StreamID]; !ok {
+				if _, seen := c.bad[f.StreamID]; !seen {
+					// A real client treats this as a protocol error (#903).
+					c.bad[f.StreamID] = fmt.Sprintf("DATA (%d bytes at offset %d) before the stream's HEADERS", len(f.Data()), off)
+				}
+			}
 			if _, seen := c.bad[f.StreamID]; !seen {
 				want := c.wants[f.StreamID]
 				for j, b := range f.Data() {
@@ -288,6 +295,9 @@ func TestH2SilentClientCannotPinResponseBodies893(t *testing.T) {
 					if st != "200" {
 						t.Errorf("%s/%s: stream %d answered %s", e.name, route, id, st)
 					}
+				}
+				if len(c.bad) > 0 {
+					t.Errorf("%s/%s: before any WINDOW_UPDATE, pattern errors %v", e.name, route, c.bad)
 				}
 				c.mu.Unlock()
 				if e.name == "std" || route == "swagger-bundle" {

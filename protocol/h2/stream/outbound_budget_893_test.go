@@ -231,3 +231,58 @@ func TestNoInlineHandlerOverTheBudget893(t *testing.T) {
 		t.Fatal("back under the budget, a GET did not run inline")
 	}
 }
+
+// TestBudgetPoolStreamIsNeverBuffered893: a GET that would have run inline
+// but runs on the pool because its connection is over the budget is never
+// given a copy, even once the budget has room again: its response goes
+// through the write queue alone, behind its HEADERS (TryBufferOutbound). A
+// stream that is on the pool for another reason (an async route, a request
+// body) is still copied when the budget has room.
+func TestBudgetPoolStreamIsNeverBuffered893(t *testing.T) {
+	freed := make(chan struct{})
+	got := make(chan [2]bool, 1)
+	var p *Processor
+	h := HandlerFunc(func(_ context.Context, s *Stream) error {
+		if s.ResponseWriter == p.InlineWriter {
+			got <- [2]bool{false, false} // inline, the event loop would wait here: do not
+			return nil
+		}
+		<-freed
+		got <- [2]bool{true, s.TryBufferOutbound(make([]byte, 10), true)}
+		return nil
+	})
+	p, m := newBudgetProcessor893(t, h)
+	p.InlineWriter = newTestResponseWriter()
+	holder := openStream893(t, m, 3)
+	holder.SetWindowSize(0)
+	holder.BufferOutbound(make([]byte, OutboundBudget), true)
+	hdrs := encodeHeaders(t, [][2]string{{":method", "GET"}, {":scheme", "http"}, {":path", "/"}, {":authority", "x"}})
+	if err := p.ProcessFrame(context.Background(), makeHeadersFrame(t, 5, true, true, hdrs)); err != nil {
+		t.Fatal(err)
+	}
+	m.DeleteStream(3)
+	if held := m.OutboundHeld(); held != 0 {
+		t.Fatalf("held %d after the holder was deleted, want 0", held)
+	}
+	close(freed)
+	select {
+	case r := <-got:
+		if !r[0] {
+			t.Fatal("over the budget, the GET ran inline")
+		}
+		if r[1] {
+			t.Fatal("a GET on the pool for the budget was buffered once the budget had room: its DATA could overtake its queued HEADERS")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler did not run")
+	}
+	if held := m.OutboundHeld(); held != 0 {
+		t.Fatalf("held %d, want 0 (a refusal must not charge)", held)
+	}
+	// On the pool for another reason: copied when the budget has room.
+	a := openStream893(t, m, 7)
+	a.flags.Or(flagAsyncRunning)
+	if !a.TryBufferOutbound(make([]byte, 10), true) || a.OutboundBuffer.Len() != 10 {
+		t.Fatal("an async stream's data was not buffered with the budget free")
+	}
+}

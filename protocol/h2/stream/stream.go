@@ -28,6 +28,12 @@ const (
 	flagCancelled    uint32 = 1 << 0
 	flagAsyncRunning uint32 = 1 << 1
 	flagDoneClosed   uint32 = 1 << 2
+	// flagBudgetPool marks an inline-eligible stream that runs on the worker
+	// pool only because its connection was over its outbound budget
+	// (celeris#893). Its response never goes to its OutboundBuffer
+	// (TryBufferOutbound): it all goes through the write queue, behind its
+	// HEADERS.
+	flagBudgetPool uint32 = 1 << 3
 )
 
 // Stream represents an HTTP/2 stream with its associated state and data.

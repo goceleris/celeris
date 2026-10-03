@@ -674,7 +674,8 @@ func (p *Processor) runHandler(stream *Stream) {
 	// refused would be buffered on top; on the worker pool it sends what the
 	// windows allow and waits for the rest (TryBufferOutbound). Its stream is
 	// not held back: a response that fits the windows still goes out at once.
-	if p.canRunInline(stream) && !p.manager.overOutboundBudget() {
+	inline := p.canRunInline(stream)
+	if inline && !p.manager.overOutboundBudget() {
 		p.executeHandlerInline(stream)
 		return
 	}
@@ -684,7 +685,16 @@ func (p *Processor) runHandler(stream *Stream) {
 		return
 	}
 
-	stream.flags.Or(flagAsyncRunning)
+	run := flagAsyncRunning
+	if inline {
+		// On the pool only for the budget: none of its response is buffered,
+		// even if the budget has room again when it writes (flagBudgetPool).
+		// Its HEADERS go through the write queue, and a WINDOW_UPDATE flushes
+		// a stream's buffered DATA straight to the connection, ahead of the
+		// queue: an inline handler's HEADERS never waited there (#903).
+		run |= flagBudgetPool
+	}
+	stream.flags.Or(run)
 	p.poolRunning.Add(1)
 	globalH2Pool.Submit(p, stream)
 }
