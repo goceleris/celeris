@@ -8,7 +8,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // errPipeCmdOrphaned is returned by typed cmd Result() when the owning

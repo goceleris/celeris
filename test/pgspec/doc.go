@@ -3,7 +3,7 @@
 //
 // It follows the h2spec/Autobahn pattern: each test sends raw wire messages
 // over a TCP connection to a live PostgreSQL server, using the celeris
-// protocol package (driver/postgres/protocol) to build and parse messages.
+// protocol package (driver/postgres/internal/protocol) to build and parse messages.
 // This exercises the PROTOCOL layer directly -- wire framing, message types,
 // state transitions -- not application logic or database/sql semantics.
 //

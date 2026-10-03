@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // readOnlyCommands is the set of Redis commands that are safe to route to

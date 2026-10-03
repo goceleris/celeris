@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 // Regression tests for celeris#502: decodeTextInto / decodeBinaryInto

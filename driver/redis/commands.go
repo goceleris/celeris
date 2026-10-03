@@ -9,7 +9,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // do acquires a conn, runs args, and invokes fn with the reply before the

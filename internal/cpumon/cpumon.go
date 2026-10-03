@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // ErrClosed is returned by Sample after the monitor has been closed.

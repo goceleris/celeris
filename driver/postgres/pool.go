@@ -14,8 +14,8 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // PoolConfig controls the worker-affinity pool returned by Open.

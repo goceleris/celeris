@@ -3,12 +3,12 @@
 package conformance
 
 import (
-	"github.com/goceleris/celeris/engine"
-	epollengine "github.com/goceleris/celeris/engine/epoll"
-	iouringengine "github.com/goceleris/celeris/engine/iouring"
-	"github.com/goceleris/celeris/probe"
-	"github.com/goceleris/celeris/protocol/h2/stream"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/engine"
+	epollengine "github.com/goceleris/celeris/internal/engine/epoll"
+	iouringengine "github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/probe"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 func init() {

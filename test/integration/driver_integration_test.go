@@ -31,7 +31,7 @@ import (
 
 	celeris "github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/driver/postgres"
-	pgproto "github.com/goceleris/celeris/driver/postgres/protocol"
+	pgproto "github.com/goceleris/celeris/driver/postgres/internal/protocol"
 	"github.com/goceleris/celeris/driver/redis"
 )
 

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/driver/memcached/internal/protocol"
 )
 
 // ---------------------------------------------------------------------------

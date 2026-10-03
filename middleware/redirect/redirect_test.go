@@ -7,8 +7,8 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/middleware/internal/testutil"
-	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
 func okHandler(c *celeris.Context) error {

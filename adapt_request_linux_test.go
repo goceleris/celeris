@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/probe"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 )
 
 // TestAdaptRequestCarriesHeaders pins celeris#720.
@@ -189,7 +189,7 @@ func keptArms(t *testing.T) []keptArm {
 // retried for up to 10 s: the probe's ring can fail with ENOMEM against
 // RLIMIT_MEMLOCK while the rings of engines stopped moments ago, or of
 // another test binary of the same user, are still charged
-// (engine/iouring/ring_budget_linux_test.go).
+// (internal/engine/iouring/ring_budget_linux_test.go).
 func keptProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
 	p = probe.Probe()
 	usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers

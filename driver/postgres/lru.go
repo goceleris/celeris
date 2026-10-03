@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 // lru is a small string-keyed LRU cache for prepared statements. Zero cap

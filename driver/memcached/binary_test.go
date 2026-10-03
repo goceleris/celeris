@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/driver/memcached/internal/protocol"
 )
 
 // fakeBinaryServer is a minimal in-process server that speaks the binary

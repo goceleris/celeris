@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/driver/memcached/internal/protocol"
 )
 
 // TestBinary_HeaderRoundTrip validates the fixed 24-byte header framing by

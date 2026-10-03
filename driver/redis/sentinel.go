@@ -11,7 +11,7 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // SentinelConfig configures a Sentinel-managed Redis client.

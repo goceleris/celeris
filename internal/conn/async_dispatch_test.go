@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // asyncDispatchHandler records the paths it actually handled, so a test can

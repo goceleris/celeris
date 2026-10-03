@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 var keySeq uint64

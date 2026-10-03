@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // isEAGAIN is a fast check for EAGAIN/EWOULDBLOCK that avoids the reflection

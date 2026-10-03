@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 func TestPool_OpenAndPing(t *testing.T) {

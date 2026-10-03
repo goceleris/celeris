@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 // --- Expect helpers: each reads one message and validates its type ---

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strconv"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // ScanIterator walks the keyspace via SCAN with automatic cursor paging. It

@@ -268,8 +268,8 @@ func (r *chanReader) spillChunk(chunk []byte) (spilled, ok bool) {
 // OPPOSITE order from the one in which they decided. The engine's closures
 // are Swap-based and ignore the previous value — the early return skips only
 // the wakeup, never the state write (the PauseRecv/ResumeRecv closures the
-// engines install on detach, in engine/iouring/worker.go and
-// engine/epoll/loop.go) — so whichever callback arrives last wins outright
+// engines install on detach, in internal/engine/iouring/worker.go and
+// internal/engine/epoll/loop.go) — so whichever callback arrives last wins outright
 // and nothing reconciles. A resume could therefore be applied before
 // the pause it was meant to cancel, leaving the engine's recv paused while
 // this reader believed it was running. Nothing re-evaluates after that, so

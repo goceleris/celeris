@@ -75,7 +75,7 @@ flag_management:
         - "middleware/protobuf/"
 
 # Coverage by area, whichever module's upload it came from. There is no
-# adaptive component: ./adaptive/... is not in the coverage profile (it runs
+# adaptive component: ./internal/adaptive/... is not in the coverage profile (it runs
 # in ci.yml's `adaptive` job at raised memlock; test-coverage.yml says why),
 # so the component could only ever be empty (celeris#725).
 component_management:
@@ -87,17 +87,17 @@ component_management:
         - "internal/**"
         - "celeristest/**"
         - "observe/**"
-        - "resource/**"
+        - "internal/resource/**"
         - "validation/**"
-        - "probe/**"
+        - "internal/probe/**"
     - component_id: engines
       name: engines (epoll, io_uring, std)
       paths:
-        - "engine/**"
+        - "internal/engine/**"
     - component_id: protocol
       name: protocol (h1, h2, detect)
       paths:
-        - "protocol/**"
+        - "internal/protocol/**"
     - component_id: middleware
       name: middleware
       paths:

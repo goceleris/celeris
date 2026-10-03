@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // tcpPair returns two connected TCP sockets and their dup'd file descriptors.

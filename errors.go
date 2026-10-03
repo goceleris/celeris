@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strconv"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // ErrNoCookie is returned by Context.Cookie when the named cookie is not present.

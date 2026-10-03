@@ -4,7 +4,7 @@ import (
 	"database/sql/driver"
 	"errors"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 // pgResult implements driver.Result. PG doesn't expose a generic

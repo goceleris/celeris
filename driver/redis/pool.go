@@ -7,8 +7,8 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // redisPool bundles two async.Pools: one for command-mode connections and a

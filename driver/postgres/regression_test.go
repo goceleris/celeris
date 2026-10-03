@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestPgConnCloseNoDoubleClose asserts Close's fd-close path is idempotent:

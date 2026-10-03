@@ -9,7 +9,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // runWithClient spins up the SSE handler with a no-op stream backing and

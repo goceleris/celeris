@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestH2SpecFull runs the complete h2spec suite (all sections, strict mode)

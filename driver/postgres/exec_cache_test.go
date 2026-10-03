@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 // TestIsCacheableWrite pins the write-side cache predicate: only single-verb

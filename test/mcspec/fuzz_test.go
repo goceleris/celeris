@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/driver/memcached/internal/protocol"
 )
 
 // FuzzTextReaderRobustness feeds arbitrary bytes to a fresh TextReader and

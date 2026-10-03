@@ -78,12 +78,12 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/goceleris/celeris/adaptive"
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/epoll"
-	"github.com/goceleris/celeris/engine/iouring"
-	"github.com/goceleris/celeris/protocol/h2/stream"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/adaptive"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/epoll"
+	"github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 const (

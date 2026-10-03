@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/protocol/h1"
+	"github.com/goceleris/celeris/internal/protocol/h1"
 )
 
 // TestHeaderDeadline_ClearArmCycle pins the v1.4.11 slowloris-defence

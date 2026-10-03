@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/driver/memcached/internal/protocol"
 )
 
 // exptime converts a Go duration to a memcached expiration second-count.

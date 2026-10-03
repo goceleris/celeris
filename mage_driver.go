@@ -219,7 +219,7 @@ func BaselineBench(subsys string) error {
 			"-run=^$",
 			"-bench", "BenchmarkHTTPWith|BenchmarkHTTPNoProvider",
 			"-benchmem", "-count=1",
-			"./engine/...")
+			"./internal/engine/...")
 	case "h2c":
 		benchOut, runErr = output("go", "test",
 			"-run=^$",

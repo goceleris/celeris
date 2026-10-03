@@ -48,8 +48,8 @@ type removal struct {
 var removedBeforeV160 = []removal{
 	{".", "Context.FormValueOk", ".", "Context.FormValueOK", "celeris#830"},
 	{"driver/postgres", "ErrNoLastInsertId", "driver/postgres", "ErrNoLastInsertID", "celeris#830"},
-	{"driver/postgres/protocol", "SimpleQueryState.Tag", "driver/postgres/protocol", "SimpleQueryState.TagBytes", "celeris#830"},
-	{"engine", "EngineMetrics.Throughput", "engine", "EngineMetrics.RequestCount", "celeris#830"},
+	{"driver/postgres/internal/protocol", "SimpleQueryState.Tag", "driver/postgres/internal/protocol", "SimpleQueryState.TagBytes", "celeris#830"},
+	{"internal/engine", "EngineMetrics.Throughput", "internal/engine", "EngineMetrics.RequestCount", "celeris#830"},
 	{"middleware/csrf", "Storage", "middleware/store", "KV", "celeris#830"},
 	{"middleware/csrf", "MemoryStorageConfig", "middleware/store", "MemoryKVConfig", "celeris#830"},
 	{"middleware/session", "Store", "middleware/store", "KV", "celeris#830"},

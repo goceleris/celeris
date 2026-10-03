@@ -23,7 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/redis"
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 	"github.com/goceleris/celeris/middleware/ratelimit"
 )
 

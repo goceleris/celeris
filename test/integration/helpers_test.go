@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/protocol/h2/stream"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 // echoHandler responds to every request with "METHOD PATH".

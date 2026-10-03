@@ -10,7 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // mode tags the current protocol dialect on a single conn.

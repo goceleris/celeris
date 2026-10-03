@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 func TestEncodeTextRow(t *testing.T) {

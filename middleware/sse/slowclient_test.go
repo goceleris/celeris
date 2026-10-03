@@ -8,7 +8,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // gatedStreamer is a mockStreamer variant whose Write+Flush can be paused

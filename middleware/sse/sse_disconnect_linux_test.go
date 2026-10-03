@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/sse"
-	"github.com/goceleris/celeris/probe"
 )
 
 // sseNativeEngineKinds enumerates the native engines under test, mirroring
@@ -295,7 +295,7 @@ func readTicks(tb testing.TB, br *bufio.Reader, n int) {
 //     but engine-driven cancellation can wake it, so this mode proves the
 //     engine → Client.Context() binding rather than write-error luck.
 //     On std the signal is net/http's request context, exposed through
-//     the same SetWSDetachClose hook by engine/std/bridge.go, so std
+//     the same SetWSDetachClose hook by internal/engine/std/bridge.go, so std
 //     runs this mode as well.
 //
 // Half the clients close with SO_LINGER 0 (RST — exercises OnError via

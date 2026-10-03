@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 // FuzzRESPParse feeds random bytes to protocol.Reader.Next and verifies no

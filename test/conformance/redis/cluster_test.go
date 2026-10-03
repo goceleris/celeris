@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/redis"
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 const envClusterAddrs = "CELERIS_REDIS_CLUSTER_ADDRS"

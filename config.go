@@ -4,8 +4,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 // Protocol represents the HTTP protocol version.

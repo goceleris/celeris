@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/driver/redis/internal/protocol"
 )
 
 const (

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 func init() {

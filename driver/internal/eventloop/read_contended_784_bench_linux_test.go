@@ -29,7 +29,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // bench784EchoTCP returns a non-blocking fd of a loopback TCP conn whose

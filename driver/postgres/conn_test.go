@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/driver/postgres/internal/protocol"
 )
 
 // startFakePG launches an in-process PostgreSQL server that answers a scripted

@@ -470,7 +470,7 @@ func callbackRanOutsideDecidingLock(r *chanReader) bool {
 //
 // The engine's closures are Swap-based and ignore the previous value (the
 // PauseRecv/ResumeRecv closures the engines install on detach, in
-// engine/iouring/worker.go and engine/epoll/loop.go), so whichever callback
+// internal/engine/iouring/worker.go and internal/engine/epoll/loop.go), so whichever callback
 // reaches the engine LAST wins outright and nothing reconciles. This test forces the
 // appending goroutine's pause() to be applied after the draining
 // goroutine's resume(), even though the pause was decided first:

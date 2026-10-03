@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // Connector is a database/sql/driver.Connector that opens celeris-backed

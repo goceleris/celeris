@@ -5,8 +5,8 @@ package integration
 import (
 	"testing"
 
-	"github.com/goceleris/celeris/adaptive"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/adaptive"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 func TestAdaptiveEngineLifecycle(t *testing.T) {
