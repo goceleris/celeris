@@ -1066,6 +1066,9 @@ func (w *Worker) run(ctx context.Context) {
 	runtime.LockOSThread()
 	w.runCtx = ctx
 
+	// The save fails on a kernel with more than 1024 possible CPUs, more
+	// than unix.CPUSet holds, where the pin still succeeds: a main thread the
+	// worker ran on is then parked still pinned.
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}

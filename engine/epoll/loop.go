@@ -399,6 +399,9 @@ func (l *Loop) run(ctx context.Context) {
 	// the affinity and the policy are also put back on the way out.
 	runtime.LockOSThread()
 
+	// The save fails on a kernel with more than 1024 possible CPUs, more
+	// than unix.CPUSet holds, where the pin still succeeds: a main thread the
+	// loop ran on is then parked still pinned.
 	if prev, err := platform.SaveThreadAffinity(); err == nil {
 		defer func() { _ = prev.Restore() }()
 	}
