@@ -143,3 +143,26 @@ func TestOAuth2RedirectPageOnlyForSwaggerUI850(t *testing.T) {
 		}
 	}
 }
+
+// TestOAuth2RedirectPageSkipPathsKeepsAppPage850: the opt-out the
+// UIConfig.OAuth2RedirectURL doc names. An app that serves its own
+// {BasePath}/oauth2-redirect.html lists both paths in SkipPaths, and the
+// next handler answers them; without SkipPaths the middleware does.
+func TestOAuth2RedirectPageSkipPathsKeepsAppPage850(t *testing.T) {
+	t.Parallel()
+	paths := []string{"/swagger/oauth2-redirect.html", "/swagger/oauth2-redirect.js"}
+	answering := New(Config{SpecContent: jsonSpec})
+	skipping := New(Config{SpecContent: jsonSpec, SkipPaths: paths})
+	for _, p := range paths {
+		rec, err := testutil.RunMiddlewareWithMethod(t, answering, "GET", p)
+		testutil.AssertNoError(t, err)
+		if rec.StatusCode != 200 || len(rec.Body) == 0 {
+			t.Errorf("no SkipPaths: GET %s: status %d, %d body bytes, want the middleware's page", p, rec.StatusCode, len(rec.Body))
+		}
+		rec, err = testutil.RunChain(t, []celeris.HandlerFunc{skipping, nextHandler850}, "GET", p)
+		testutil.AssertNoError(t, err)
+		if rec.BodyString() != "next handler" {
+			t.Errorf("SkipPaths: GET %s answered by the middleware, want the next handler", p)
+		}
+	}
+}

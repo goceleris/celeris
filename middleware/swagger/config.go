@@ -55,7 +55,10 @@ type UIConfig struct {
 	// Register that URL with the authorization server. Set this only to use
 	// another redirect page; it must be an absolute URL on the page's
 	// origin, as the redirect page hands the result to the UI page through
-	// window.opener.
+	// window.opener. The middleware answers those two paths before the
+	// router, so its page takes the place of one the app serves at
+	// {BasePath}/oauth2-redirect.html itself; to keep the app's own page,
+	// list both paths in SkipPaths.
 	// Swagger UI only; ignored when Renderer is Scalar or ReDoc.
 	OAuth2RedirectURL string
 
