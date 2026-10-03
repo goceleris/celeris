@@ -102,6 +102,14 @@ type Config struct {
 	// OnConnect is called when a new SSE client connects, before Handler.
 	// The celeris.Context is available for extracting request metadata.
 	// Return a non-nil error to reject the connection.
+	//
+	// OnConnect runs before the middleware detaches the stream, so a string
+	// read here (c.Param, c.Query, c.Header, a user ID for a hub key) is, on
+	// epoll and io_uring, a view of the connection's receive buffer, which
+	// the engine keeps receiving into for the life of the stream: copy it
+	// with strings.Clone before the Client, a closure or a map keeps it
+	// (celeris#740). OnDisconnect runs after the detach, and the strings it
+	// reads from the Context are copies.
 	OnConnect func(c *celeris.Context, client *Client) error
 
 	// OnDisconnect is called after the SSE stream closes.

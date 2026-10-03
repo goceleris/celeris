@@ -464,7 +464,11 @@ func (c *Context) Get(key string) (any, bool) {
 }
 
 // Keys returns a copy of all key-value pairs stored on this context.
-// Returns nil if no values have been set.
+// Returns nil if no values have been set. The map is a copy; the values in
+// it are the stored values themselves, so a string that came from the
+// request (a request ID, an API key, a token) is still a view of the
+// receive buffer on epoll, io_uring and Adaptive and must be copied before
+// it is kept past the handler (see the package documentation).
 func (c *Context) Keys() map[string]any {
 	n := len(c.keys) + len(c.stringKeys)
 	if c.requestID != "" {

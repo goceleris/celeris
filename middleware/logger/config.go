@@ -72,6 +72,9 @@ type Config struct {
 	// values, because slog allows it to keep a record after Handle returns
 	// and the request strings are only valid during the request on epoll
 	// and io_uring. The copies share one allocation per logged request.
+	// That includes the default (slog.Default()) and the [JSONConfig]
+	// preset (slog.JSONHandler): only an Output built on [NewFastHandler]
+	// logs without the copy.
 	Output *slog.Logger
 
 	// Level maps an HTTP response status code to a slog.Level, controlling
