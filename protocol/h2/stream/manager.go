@@ -28,6 +28,17 @@ type Manager struct {
 	hasPendingUpdates       atomic.Bool
 	streamsWithData         map[uint32]struct{}
 	RemoteAddr              string
+
+	// outboundHeld counts the bytes the connection's streams hold in their
+	// OutboundBuffers, waiting for the peer's window; sendWindowWaiters the
+	// pool handlers waiting in AwaitSendWindow for a window to open, and
+	// sendWindowCh the channel that wakes them, closed and replaced under
+	// sendWindowMu (a leaf lock) by notifySendWindow (celeris#893,
+	// outbound.go).
+	outboundHeld      atomic.Int64
+	sendWindowWaiters atomic.Int32
+	sendWindowMu      sync.Mutex
+	sendWindowCh      chan struct{}
 }
 
 // NewManager creates a new stream manager. Auxiliary maps

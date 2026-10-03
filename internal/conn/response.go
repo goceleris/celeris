@@ -2,6 +2,8 @@ package conn
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -668,6 +670,9 @@ type h2ResponseAdapter struct {
 	writeQueue   *h2ShardedQueue // async response queue (sharded)
 	maxFrameSize uint32          // our own advertised MAX_FRAME_SIZE (fallback)
 	manager      *stream.Manager // peer-SETTINGS-aware source of max frame size
+	// writeTimeout bounds how long sendRest waits for the peer's window
+	// (H2Config.WriteTimeout; 0 = no bound).
+	writeTimeout time.Duration
 }
 
 // peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE,
@@ -714,32 +719,29 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 				body = nil
 			}
 			maxFrame := a.peerMaxFrame()
+			// Reserve+debit both windows atomically for exactly what we send.
+			sendLen := h2ReserveSend(a.manager, s, len(body))
 
 			pooled := getH2FrameBuf()
 			frameBuf := (*pooled)[:0]
-			estimatedSize := 9 + len(headerBlock) + 9 + len(body)
+			// Room for what goes out now, the HEADERS and the DATA the
+			// windows took; not for the whole body (celeris#893).
+			estimatedSize := h2FrameBufSize(len(headerBlock), sendLen, maxFrame)
 			if cap(frameBuf) < estimatedSize {
 				frameBuf = make([]byte, 0, estimatedSize)
 			}
 			frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
+			var rest []byte
 			if len(body) > 0 {
-				// Reserve+debit both windows atomically for exactly what we send.
-				sendLen := h2ReserveSend(a.manager, s, len(body))
-				if sendLen <= 0 {
-					s.BufferOutbound(body, true)
-				} else {
-					isEnd := sendLen == len(body)
-					// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
-					frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-					if !isEnd {
-						s.BufferOutbound(body[sendLen:], true)
-					}
-				}
+				frameBuf, rest = a.stageBody(s, frameBuf, body, sendLen, maxFrame)
 			}
 			putH2StreamEncoder(enc)
 			*pooled = frameBuf
 			a.writeQueue.Enqueue(s.ID, pooled)
 			s.SetHeadersSent()
+			if len(rest) > 0 {
+				return a.sendRest(s, rest, maxFrame)
+			}
 			return nil
 		}
 	}
@@ -763,33 +765,25 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 
 	endStream := len(body) == 0
 	maxFrame := a.peerMaxFrame()
+	// Reserve+debit both windows atomically for exactly what we send.
+	sendLen := h2ReserveSend(a.manager, s, len(body))
 
 	// Use pooled frame buffer to eliminate per-response allocation.
 	pooled := getH2FrameBuf()
 	frameBuf := (*pooled)[:0]
 
-	// Ensure capacity for headers + body.
-	estimatedSize := 9 + len(headerBlock) + 9 + len(body)
+	// Ensure capacity for what goes out now: the HEADERS and the DATA the
+	// windows took, not the whole body (celeris#893).
+	estimatedSize := h2FrameBufSize(len(headerBlock), sendLen, maxFrame)
 	if cap(frameBuf) < estimatedSize {
 		frameBuf = make([]byte, 0, estimatedSize)
 	}
 
 	frameBuf = appendH2Headers(frameBuf, s.ID, endStream, headerBlock, maxFrame)
 
+	var rest []byte
 	if len(body) > 0 {
-		// Reserve+debit both windows atomically for exactly what we send.
-		sendLen := h2ReserveSend(a.manager, s, len(body))
-		if sendLen <= 0 {
-			s.BufferOutbound(body, true)
-		} else {
-			isEnd := sendLen == len(body)
-			// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
-			frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
-
-			if !isEnd {
-				s.BufferOutbound(body[sendLen:], true)
-			}
-		}
+		frameBuf, rest = a.stageBody(s, frameBuf, body, sendLen, maxFrame)
 	}
 
 	putH2StreamEncoder(enc)
@@ -798,7 +792,126 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	a.writeQueue.Enqueue(s.ID, pooled)
 
 	s.SetHeadersSent()
+	if len(rest) > 0 {
+		return a.sendRest(s, rest, maxFrame)
+	}
 	return nil
+}
+
+// maxH2FrameBufHint bounds the frame-buffer sizes computed up front: a
+// buffer past it is left to grow by append, so a size computation cannot
+// overflow whatever lengths it is given.
+const maxH2FrameBufHint = 1 << 30
+
+// h2DataFramesLen is the size of n bytes of DATA framed by maxFrame, or 0
+// (no up-front size) when n or maxFrame is out of range.
+func h2DataFramesLen(n int, maxFrame uint32) int {
+	if n <= 0 || n > maxH2FrameBufHint || maxFrame == 0 || maxFrame > maxH2FrameBufHint {
+		return 0
+	}
+	return n + 9*((n-1)/int(maxFrame)+1)
+}
+
+// h2FrameBufSize is the capacity for a HEADERS block of headerLen bytes and
+// dataLen bytes of DATA framed by maxFrame: what goes out now, not the whole
+// body (celeris#893). 0 (no up-front size) when a length is out of range.
+func h2FrameBufSize(headerLen, dataLen int, maxFrame uint32) int {
+	if headerLen < 0 || headerLen > maxH2FrameBufHint {
+		return 0
+	}
+	d := h2DataFramesLen(dataLen, maxFrame)
+	if dataLen > 0 && d == 0 {
+		return 0
+	}
+	return 9 + headerLen + d
+}
+
+// stageBody appends to frameBuf the sendLen bytes of DATA the flow-control
+// windows let body send with its HEADERS (reserved by the caller), and
+// buffers the rest on the stream when the connection's outbound budget has
+// room for it (celeris#893) and the stream may be buffered at all (not one
+// that runs on the pool only because of the budget: TryBufferOutbound). It
+// returns the part it could do neither with, for sendRest.
+func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, sendLen int, maxFrame uint32) ([]byte, []byte) {
+	if sendLen > 0 {
+		isEnd := sendLen == len(body)
+		// RFC 7540 §4.2: fragment by peer's MAX_FRAME_SIZE.
+		frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, body[:sendLen], maxFrame)
+		if isEnd {
+			return frameBuf, nil
+		}
+	} else {
+		sendLen = 0
+	}
+	rest := body[sendLen:]
+	if s.TryBufferOutbound(rest, true) {
+		return frameBuf, nil
+	}
+	return frameBuf, rest
+}
+
+// sendRest sends the part of a worker-pool handler's response body that the
+// windows did not take and TryBufferOutbound did not buffer (celeris#893):
+// the connection's outbound budget had no room, or the stream is a sync one
+// on the pool only because of the budget. Its HEADERS are queued. It waits for
+// the windows and sends what they allow, through the write queue, until the
+// body is out: the handler blocks, as a net/http handler blocks in Write on
+// flow control, instead of the connection copying past its budget. None of it
+// is buffered, even once the budget has room again: the event loop writes a
+// stream's buffered DATA straight to the connection, ahead of chunks still in
+// the queue, and the body would arrive out of order.
+//
+// It gives up, sending nothing more, when the stream is reset or its
+// connection closes. And it waits no longer than writeTimeout from now, the
+// server's WriteTimeout, in all: then it resets the stream with
+// INTERNAL_ERROR, as net/http does at a stream's write deadline, and returns
+// an error that wraps os.ErrDeadlineExceeded. The bound is a timer, so it
+// holds when the event loop cannot run: on the native engines a sync handler
+// waiting for this one (a lock it holds across this write, a coalesced call it
+// leads) holds its loop until this handler returns.
+func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uint32) error {
+	var deadline time.Time
+	if a.writeTimeout > 0 {
+		deadline = time.Now().Add(a.writeTimeout)
+	}
+	for {
+		if err := s.AwaitSendWindow(deadline); err != nil {
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				return nil // reset by the peer, or the connection closed
+			}
+			a.resetStream(s, http2.ErrCodeInternal)
+			return fmt.Errorf("h2: stream %d reset: %d bytes of the response still waited for the peer's window at WriteTimeout (%v): %w",
+				s.ID, len(rest), a.writeTimeout, err)
+		}
+		if n := h2ReserveSend(a.manager, s, len(rest)); n > 0 {
+			isEnd := n == len(rest)
+			pooled := getH2FrameBuf()
+			frameBuf := (*pooled)[:0]
+			if need := h2DataFramesLen(n, maxFrame); cap(frameBuf) < need {
+				frameBuf = make([]byte, 0, need)
+			}
+			frameBuf = appendH2DataFragmented(frameBuf, s.ID, isEnd, rest[:n], maxFrame)
+			*pooled = frameBuf
+			a.writeQueue.Enqueue(s.ID, pooled)
+			if isEnd {
+				return nil
+			}
+			rest = rest[n:]
+		}
+	}
+}
+
+// resetStream queues a RST_STREAM for s behind the frames s has queued (all of
+// a stream's frames go to one shard, in order) and cancels s, so its handler's
+// context is done and nothing more of it is sent. A pool handler cannot use
+// the connection's writer, which belongs to the event loop.
+func (a *h2ResponseAdapter) resetStream(s *stream.Stream, code http2.ErrCode) {
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], uint32(code))
+	pooled := getH2FrameBuf()
+	*pooled = appendH2Frame((*pooled)[:0], h2FrameRSTStream, 0, s.ID, payload[:])
+	a.writeQueue.Enqueue(s.ID, pooled)
+	s.Cancel()
 }
 
 // SendGoAway writes a GOAWAY frame via the shared writer.
