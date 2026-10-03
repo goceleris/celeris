@@ -18,13 +18,23 @@ import "sync/atomic"
 //   - a handler on the pool is not given a copy (Stream.TryBufferOutbound):
 //     it sends the rest of its body itself, through the write queue, as the
 //     windows open (Stream.AwaitSendWindow), the way net/http's server blocks
-//     a handler's Write on flow control. It holds nothing extra while it
-//     waits: its body is its own.
+//     a handler's Write on flow control. It makes no copy while it waits.
 //
 // A response is never refused for its size: with nothing held, any one body
-// is buffered whole. So a connection holds at most about the budget plus one
-// body inline plus one on the pool. 4 MiB matches the HTTP/1 per-connection
-// backlog limit (the engines' maxPendingBytes).
+// is buffered whole. So the copies a connection makes for the peer's window
+// come to at most about the budget plus one body. That bounds what it holds
+// for a body its streams share (a static asset, the embedded Swagger UI
+// bundle). It does not bound a body built per request (c.JSON, a rendered
+// page): a waiting handler keeps its own body alive until it is sent, as a
+// net/http handler blocked in Write does, so a connection's waiting handlers
+// hold up to one such body each, for up to MAX_CONCURRENT_STREAMS streams.
+// 4 MiB matches the HTTP/1 per-connection backlog limit (the engines'
+// maxPendingBytes).
+//
+// A waiting handler is blocked for as long as the peer withholds window (the
+// connection's timeouts bound it), as on std: middleware that makes other
+// requests wait for a handler, a cache's coalesced fill for one, waits with
+// it.
 const OutboundBudget = 4 << 20
 
 // OutboundHeld returns how many bytes this connection's streams hold in their
