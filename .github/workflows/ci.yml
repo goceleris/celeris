@@ -729,6 +729,44 @@ jobs:
             echo "reading stopped=true -- was one renamed or removed, did one skip or fail?"
             exit 1
           fi
+      # celeris#905: a stopped engine must leave no thread pinned to one CPU.
+      # The root step runs the epoll test without -v, where a skip prints
+      # nothing, and job `adaptive` and the engine/iouring step above count
+      # no test of it by name. So the three tests run here by name: epoll and
+      # io_uring at the runner's 8 MiB memlock (one io_uring worker), then
+      # adaptive with memlock raised and CELERIS_REQUIRE_UPSWITCH=1, as job
+      # `adaptive` runs its package. Each re-runs itself in a process of its
+      # own and logs that process's output with a "child| " prefix, so the
+      # tally counts this process's lines only: all three must PASS with no
+      # SKIP line, and each child must print one RESULT line with threads
+      # pinned while its engine ran and none off the process mask after the
+      # stop. How many runs had a loop on the main thread, the only thread the
+      # fix's restore matters for, is printed and not enforced.
+      - name: celeris#905 stopped engines leave no thread pinned to one CPU (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          engines='TestStoppedEngineLeavesNoPinnedThread'
+          adaptive='TestStoppedAdaptiveEngineLeavesNoPinnedThread'
+          go test -race -count=1 -timeout=300s -v -run "^(${engines})\$" ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/c905.log || failed=$((failed + 1))
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          CELERIS_REQUIRE_UPSWITCH=1 go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./adaptive/ 2>&1 | tee -a /tmp/c905.log || failed=$((failed + 1))
+          passed=$(grep -cE "^--- PASS: (${engines}|${adaptive}) \(" /tmp/c905.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c905.log || true)
+          results=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) ' /tmp/c905.log || true)
+          clean=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) cycles=[0-9]+ process_mask=[0-9,-]+ pinned_while_running=[1-9][0-9]* main_thread_hosted_a_loop=[0-9]+ off_mask_after_stop=0 locked_probes=[1-9][0-9]* locked_off_mask=0$' /tmp/c905.log || true)
+          m0=$(grep -cE 'celeris905 RESULT .* main_thread_hosted_a_loop=[1-9]' /tmp/c905.log || true)
+          echo "celeris#905 tests: want 3 PASS, passed $passed, SKIP lines $skipped, RESULT lines $results, clean $clean (want 3), a loop on the main thread in $m0, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne 3 ] || [ "$skipped" -ne 0 ] || [ "$results" -ne 3 ] || [ "$clean" -ne 3 ] || [ "$failed" -ne 0 ]; then
+            echo "expected the three celeris#905 tests to PASS with no SKIP line, each child with one RESULT line"
+            echo "showing pinned threads while running and none off the mask after the stop -- was one renamed"
+            echo "or removed, did one skip or fail?"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
