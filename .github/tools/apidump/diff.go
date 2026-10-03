@@ -6,14 +6,14 @@ import (
 )
 
 // unifiedDiff returns a unified diff (3 lines of context) from the committed
-// golden file old to the generated one new. A nil side is a missing file.
-func unifiedDiff(name string, old, new []byte) string {
-	a, b := splitLines(old), splitLines(new)
+// golden file to the generated one. A nil side is a missing file.
+func unifiedDiff(name string, committed, generated []byte) string {
+	a, b := splitLines(committed), splitLines(generated)
 	from, to := "a/"+name, "b/"+name
-	if old == nil {
+	if committed == nil {
 		from = "/dev/null"
 	}
-	if new == nil {
+	if generated == nil {
 		to = "/dev/null"
 	}
 	ops := diffLines(a, b)

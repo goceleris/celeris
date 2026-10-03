@@ -68,7 +68,7 @@ func TestFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, s := range stale {
-		t.Errorf("%s differs from the fixture's output (go test -update rewrites it):\n%s", s.name, unifiedDiff(s.name, s.old, s.new))
+		t.Errorf("%s differs from the fixture's output (go test -update rewrites it):\n%s", s.name, unifiedDiff(s.name, s.committed, s.generated))
 	}
 	var names []string
 	for n := range files {
@@ -131,21 +131,25 @@ func TestCheck(t *testing.T) {
 			if err := os.WriteFile(src, []byte(text), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			defer os.WriteFile(src, orig, 0o644)
+			defer func() {
+				if err := os.WriteFile(src, orig, 0o644); err != nil {
+					t.Error(err)
+				}
+			}()
 			stale, err := compare(root, gen(t, root))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if c.file == "" {
 				for _, s := range stale {
-					t.Errorf("%s is stale, want it to pass:\n%s", s.name, unifiedDiff(s.name, s.old, s.new))
+					t.Errorf("%s is stale, want it to pass:\n%s", s.name, unifiedDiff(s.name, s.committed, s.generated))
 				}
 				return
 			}
 			if len(stale) != 1 || stale[0].name != c.file {
 				t.Fatalf("stale = %v, want only %s", stale, c.file)
 			}
-			d := unifiedDiff(stale[0].name, stale[0].old, stale[0].new)
+			d := unifiedDiff(stale[0].name, stale[0].committed, stale[0].generated)
 			for _, l := range c.diff {
 				if !strings.Contains(d, "\n"+l+"\n") {
 					t.Errorf("diff has no line %q:\n%s", l, d)
@@ -190,10 +194,10 @@ func TestDescribe(t *testing.T) {
 }
 
 func TestDiff(t *testing.T) {
-	old := []byte("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n")
-	new := []byte("a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n")
+	committed := []byte("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n")
+	generated := []byte("a\nB\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n")
 	want := "--- a/x\n+++ b/x\n@@ -1,5 +1,5 @@\n a\n-b\n+B\n c\n d\n e\n@@ -9,3 +9,4 @@\n i\n j\n k\n+l\n"
-	if got := unifiedDiff("x", old, new); got != want {
+	if got := unifiedDiff("x", committed, generated); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
 	if got := unifiedDiff("x", nil, []byte("a\n")); got != "--- /dev/null\n+++ b/x\n@@ -0,0 +1,1 @@\n+a\n" {

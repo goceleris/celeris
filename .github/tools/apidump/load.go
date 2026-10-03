@@ -34,7 +34,7 @@ type config struct {
 }
 
 func configs() []config {
-	var cs []config
+	cs := make([]config, 0, len(platforms)*len(tagSets))
 	for _, p := range platforms {
 		goos, goarch, _ := strings.Cut(p, "/")
 		for _, t := range tagSets {
@@ -303,12 +303,12 @@ func (ck *checker) key(p *packages.Package, c config) string {
 	if ok {
 		return k
 	}
-	h := sha256.New()
-	fmt.Fprintf(h, "%s/%s\x00%s\x00", c.goos, c.goarch, p.PkgPath)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s/%s\x00%s\x00", c.goos, c.goarch, p.PkgPath)
 	files := append([]string(nil), p.GoFiles...)
 	sort.Strings(files)
 	for _, f := range files {
-		fmt.Fprintf(h, "%s\x00", f)
+		fmt.Fprintf(&b, "%s\x00", f)
 	}
 	imps := make([]string, 0, len(p.Imports))
 	for path := range p.Imports {
@@ -316,9 +316,10 @@ func (ck *checker) key(p *packages.Package, c config) string {
 	}
 	sort.Strings(imps)
 	for _, path := range imps {
-		fmt.Fprintf(h, "%s=%s\x00", path, ck.key(p.Imports[path], c))
+		fmt.Fprintf(&b, "%s=%s\x00", path, ck.key(p.Imports[path], c))
 	}
-	k = hex.EncodeToString(h.Sum(nil))
+	sum := sha256.Sum256([]byte(b.String()))
+	k = hex.EncodeToString(sum[:])
 	ck.mu.Lock()
 	ck.keys[p] = k
 	ck.mu.Unlock()

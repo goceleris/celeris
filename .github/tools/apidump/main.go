@@ -36,6 +36,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -90,7 +91,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "apidump: %s/ matches the exported API of %d packages (%s)\n", apiDir, len(files), took)
 		return
 	}
-	report(os.Stdout, stale)
+	if err := report(os.Stdout, stale); err != nil {
+		fatal(err)
+	}
 	os.Exit(1)
 }
 
@@ -226,8 +229,8 @@ func goldenFiles(root string) ([]string, error) {
 
 // staleFile is one golden file that does not match the source.
 type staleFile struct {
-	name     string
-	old, new []byte // nil when the file is missing on that side
+	name                 string
+	committed, generated []byte // nil when the file is missing on that side
 }
 
 // compare returns the golden files that differ from files, sorted by name.
@@ -239,54 +242,66 @@ func compare(root string, files map[string][]byte) ([]staleFile, error) {
 	}
 	for _, name := range existing {
 		if _, ok := files[name]; !ok {
-			old, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+			committed, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
 			if err != nil {
 				return nil, err
 			}
-			stale = append(stale, staleFile{name: name, old: old})
+			stale = append(stale, staleFile{name: name, committed: committed})
 		}
 	}
 	for name, data := range files {
-		old, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		committed, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
-			stale = append(stale, staleFile{name: name, new: data})
+			stale = append(stale, staleFile{name: name, generated: data})
 		case err != nil:
 			return nil, err
-		case !bytes.Equal(old, data):
-			stale = append(stale, staleFile{name: name, old: old, new: data})
+		case !bytes.Equal(committed, data):
+			stale = append(stale, staleFile{name: name, committed: committed, generated: data})
 		}
 	}
 	sort.Slice(stale, func(i, j int) bool { return stale[i].name < stale[j].name })
 	return stale, nil
 }
 
-// report prints what is stale, the diff of each file, and how to fix it.
-func report(w *os.File, stale []staleFile) {
+// report prints what is stale, the diff of each file, and how to fix it. On
+// GitHub Actions it also annotates each stale file and writes the diff to
+// the job summary.
+func report(w io.Writer, stale []staleFile) error {
 	gha := os.Getenv("GITHUB_ACTIONS") == "true"
-	fmt.Fprintf(w, "apidump: the exported API changed, and %d file(s) under %s/ do not match it.\n\n", len(stale), apiDir)
-	var all strings.Builder
+	var out, diffs strings.Builder
+	fmt.Fprintf(&out, "apidump: the exported API changed, and %d file(s) under %s/ do not match it.\n\n", len(stale), apiDir)
 	for _, s := range stale {
-		d := unifiedDiff(s.name, s.old, s.new)
-		all.WriteString(d)
-		fmt.Fprint(w, d)
+		d := unifiedDiff(s.name, s.committed, s.generated)
+		diffs.WriteString(d)
+		out.WriteString(d)
 		if gha {
 			what := "is stale"
 			switch {
-			case s.old == nil:
+			case s.committed == nil:
 				what = "is missing (a new package)"
-			case s.new == nil:
+			case s.generated == nil:
 				what = "names a package that no longer exists"
 			}
-			fmt.Fprintf(w, "::error file=%s,title=API golden file %s::Run %s and commit %s/\n", s.name, what, regenerate, apiDir)
+			fmt.Fprintf(&out, "::error file=%s,title=API golden file %s::Run %s and commit %s/\n", s.name, what, regenerate, apiDir)
 		}
 	}
-	fmt.Fprintf(w, "\nEvery change to an exported identifier updates %s/ in the same pull request,\n"+
+	fmt.Fprintf(&out, "\nEvery change to an exported identifier updates %s/ in the same pull request,\n"+
 		"so the API change shows in the review. Regenerate with\n\n    %s\n\nand commit the result.\n", apiDir, regenerate)
-	if p := os.Getenv("GITHUB_STEP_SUMMARY"); gha && p != "" {
-		if f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644); err == nil {
-			fmt.Fprintf(f, "### API golden files are stale\n\nRun `%s` and commit `%s/`.\n\n```diff\n%s```\n", regenerate, apiDir, all.String())
-			_ = f.Close()
-		}
+	if _, err := io.WriteString(w, out.String()); err != nil {
+		return err
 	}
+	if p := os.Getenv("GITHUB_STEP_SUMMARY"); gha && p != "" {
+		summary := fmt.Sprintf("### API golden files are stale\n\nRun `%s` and commit `%s/`.\n\n```diff\n%s```\n", regenerate, apiDir, diffs.String())
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err := f.WriteString(summary); err != nil {
+			_ = f.Close()
+			return err
+		}
+		return f.Close()
+	}
+	return nil
 }

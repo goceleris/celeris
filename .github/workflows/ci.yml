@@ -71,6 +71,13 @@ jobs:
         with:
           version: v2.13
           working-directory: middleware/protobuf
+      # The tools module holds apidump's source (the API golden files job);
+      # golangci-lint finds the root .golangci.yml from there.
+      - name: Lint .github/tools
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13
+          working-directory: .github/tools
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
         # runner labels, malformed shell, action input misuse — the
