@@ -8,6 +8,19 @@ func PinToCPU(_ int) error {
 	return nil
 }
 
+// ThreadAffinity is empty on non-Linux platforms, where PinToCPU pins nothing.
+type ThreadAffinity struct{}
+
+// SaveThreadAffinity is a no-op on non-Linux platforms.
+func SaveThreadAffinity() (ThreadAffinity, error) {
+	return ThreadAffinity{}, nil
+}
+
+// Restore is a no-op on non-Linux platforms.
+func (ThreadAffinity) Restore() error {
+	return nil
+}
+
 // BindNumaNode is a no-op on non-Linux platforms.
 func BindNumaNode(_ int) error {
 	return nil

@@ -3,9 +3,9 @@ module github.com/goceleris/celeris/middleware/compress
 go 1.27.0
 
 require (
-	github.com/andybalholm/brotli v1.2.4
+	github.com/andybalholm/brotli v1.2.5
 	github.com/goceleris/celeris v1.5.8
-	github.com/klauspost/compress v1.20.0
+	github.com/klauspost/compress v1.20.1
 )
 
 require (
