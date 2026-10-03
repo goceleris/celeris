@@ -40,7 +40,13 @@
 // # Cardinality Protection
 //
 // Unmatched routes (404 with no registered pattern) use the sentinel path
-// label "<unmatched>" to prevent high-cardinality label explosion.
+// label "<unmatched>", and a 405 "<method-not-allowed>", to prevent
+// high-cardinality label explosion. The method label of a request no route
+// matched is the method when it is a standard one (GET, HEAD, POST, PUT,
+// DELETE, PATCH, OPTIONS, TRACE, CONNECT) and "_OTHER" otherwise, as in the
+// otel middleware: such a request's method is whatever the client sent, and
+// every distinct value would be a new series kept for the life of the
+// registry. A route's method keeps its own label, custom methods included.
 //
 // # Histogram Buckets
 //
