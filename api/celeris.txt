@@ -18,23 +18,14 @@ const Version untyped string = "1.6.0"
 const WorkloadHighConcurrency WorkloadHint = 2
 const WorkloadLowConcurrency WorkloadHint = 1
 const WorkloadUnspecified WorkloadHint = 0
-func AcquireTestContext(*github.com/goceleris/celeris/protocol/h2/stream.Stream) *Context
 func Adapt(net/http.Handler) HandlerFunc
 func AdaptFunc(net/http.HandlerFunc) HandlerFunc
-func AddTestParam(*Context, string, string)
 func DeriveMemoryLimit(int) int64
 func EscapeQuotedString(string) string
 func InheritListener(string) (net.Listener, error)
 func New(Config) *Server
 func NewHTTPError(int, string) *HTTPError
-func ReleaseTestContext(*Context)
-func SetTestFullPath(*Context, string)
-func SetTestHandlers(*Context, []HandlerFunc)
-func SetTestScheme(*Context, string)
-func SetTestStartTime(*Context, time.Time)
-func SetTestTrustedNets(*Context, []*net.IPNet)
 func SetValidator(Validator)
-func TestStream(*Context) *github.com/goceleris/celeris/protocol/h2/stream.Stream
 func ToHandler(HandlerFunc) net/http.Handler
 method (*BindError) Error() string
 method (*BindError) Unwrap() error
@@ -186,7 +177,7 @@ method (*Server) AsyncHandlers() bool
 method (*Server) Collector() *github.com/goceleris/celeris/observe.Collector
 method (*Server) DELETE(string, ...HandlerFunc) *Route
 method (*Server) EngineInfo() *EngineInfo
-method (*Server) EventLoopProvider() github.com/goceleris/celeris/engine.EventLoopProvider
+method (*Server) EventLoopProvider() github.com/goceleris/celeris/internal/engine.EventLoopProvider
 method (*Server) GET(string, ...HandlerFunc) *Route
 method (*Server) Group(string, ...HandlerFunc) *RouteGroup
 method (*Server) HEAD(string, ...HandlerFunc) *Route
@@ -275,7 +266,7 @@ type Cookie struct, Value string
 type EngineInfo struct
 type EngineInfo struct, Metrics EngineMetrics
 type EngineInfo struct, Type EngineType
-type EngineMetrics = github.com/goceleris/celeris/engine.EngineMetrics
+type EngineMetrics = github.com/goceleris/celeris/observe.EngineMetrics
 type EngineType uint8
 type HTTPError struct
 type HTTPError struct, Code int
@@ -313,3 +304,11 @@ var ErrResponseWritten error
 var ErrRouteNotFound error
 var ErrServiceUnavailable *HTTPError
 var ErrUnauthorized *HTTPError
+exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
+exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int
+exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, WorkerLoop(int) github.com/goceleris/celeris/internal/engine.WorkerLoop
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, CPUID() int
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, RegisterConn(int, func([]byte), func(error)) error
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, UnregisterConn(int) error
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, Write(int, []byte) error
