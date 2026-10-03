@@ -24,6 +24,11 @@
 // default; configure with [Config.HeartbeatInterval]. The middleware works
 // with all celeris engines and handles stream lifecycle internally.
 //
+// A HEAD request to an SSE route (answered by its GET route) gets the stream's
+// response headers and no body. [Config.OnConnect] runs for it, and a rejection
+// is handled as for GET; when it accepts, [Config.OnDisconnect] runs right
+// after the headers are sent, and [Config.Handler] does not run.
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs/sse

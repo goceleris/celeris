@@ -1055,10 +1055,23 @@ func newWorker(id, cpuID int, tier TierStrategy, handler stream.Handler,
 }
 
 func (w *Worker) run(ctx context.Context) {
+	// celeris#905: the worker changes state that belongs to its OS thread,
+	// the CPU affinity and the NUMA memory policy below and the ring's task
+	// context, so it never unlocks the thread. A goroutine that exits locked
+	// takes its thread with it: the runtime terminates the thread instead of
+	// handing it, still pinned to one CPU, to whatever goroutine runs next.
+	// The main thread cannot exit; the runtime parks it for good instead, and
+	// a worker often runs on it, so the affinity and the policy are also put
+	// back on the way out.
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	w.runCtx = ctx
 
+	// The save fails on a kernel with more than 1024 possible CPUs, more
+	// than unix.CPUSet holds, where the pin still succeeds: a main thread the
+	// worker ran on is then parked still pinned.
+	if prev, err := platform.SaveThreadAffinity(); err == nil {
+		defer func() { _ = prev.Restore() }()
+	}
 	_ = platform.PinToCPU(w.cpuID)
 
 	// Bind memory allocations to this CPU's NUMA node before creating

@@ -17,7 +17,29 @@ type routerAdapter struct {
 	server                *Server
 	notFoundChain         []HandlerFunc
 	methodNotAllowedChain []HandlerFunc
-	errorHandler          func(*Context, error)
+	// optionsChain answers an OPTIONS request to a path that has routes but
+	// no OPTIONS route (celeris#421): the global middleware, so a CORS
+	// middleware installed with Server.Use answers its preflight, then
+	// autoOptions. Built by doPrepare; nil on a bare adapter (tests), where
+	// handleUnmatched builds it per request.
+	optionsChain []HandlerFunc
+	errorHandler func(*Context, error)
+}
+
+// autoOptions is the end of optionsChain: 200 with Content-Length: 0 and the
+// Allow header handleUnmatched already set (RFC 9110 §9.3.7: a successful
+// OPTIONS response without content MUST carry Content-Length: 0, which std's
+// net/http would otherwise replace with chunked framing).
+func autoOptions(c *Context) error {
+	c.SetHeader("content-length", "0")
+	return c.NoContent(200)
+}
+
+// newOptionsChain is the global middleware followed by autoOptions.
+func newOptionsChain(middleware []HandlerFunc) []HandlerFunc {
+	chain := make([]HandlerFunc, 0, len(middleware)+1)
+	chain = append(chain, middleware...)
+	return append(chain, autoOptions)
 }
 
 func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) error {
@@ -113,7 +135,12 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 		fullPath = s.CachedRouteFullPath
 	} else {
 		var routeAsync bool
+		n := len(c.params)
 		handlers, fullPath, routeAsync = a.server.router.find(c.method, c.path, &c.params)
+		if handlers == nil && c.method == "HEAD" {
+			// celeris#421: HEAD without a HEAD route runs the GET route.
+			handlers, fullPath, routeAsync = a.server.router.findHEADAsGET(c.path, &c.params, n)
+		}
 		if handlers != nil && len(c.params) == 0 {
 			s.CachedRouteMethod = strings.Clone(c.method)
 			s.CachedRoutePath = strings.Clone(c.path)
@@ -335,7 +362,9 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 		"stack", string(debug.Stack()),
 	)
 	c.statusCode = 500
-	if !c.written && s.ResponseWriter != nil {
+	// A StreamWriter taken but not used yet has sent nothing: the 500 still
+	// goes out (celeris#835).
+	if (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
 		hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 		hdrs = append(hdrs, c.respHeaders...)
 		hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
@@ -346,6 +375,14 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 }
 
 func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
+	if c.method == "OPTIONS" {
+		// celeris#421: a path with routes but no OPTIONS route is answered
+		// with what it allows (OPTIONS included).
+		if allowed := a.server.router.allowedMethods(c.path, ""); len(allowed) > 0 {
+			a.answerOptions(c, s, strings.Join(allowed, ", "))
+			return
+		}
+	}
 	allowed := a.server.router.allowedMethods(c.path, c.method)
 	if len(allowed) > 0 {
 		c.statusCode = 405
@@ -389,8 +426,40 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 	}
 }
 
+// answerOptions runs optionsChain for an OPTIONS request the router answers
+// itself (celeris#421). The Allow header is set before the chain runs, so it
+// is on the response whether autoOptions or a middleware (a CORS preflight's
+// 204) writes it.
+func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal string) {
+	c.fullPath = "<options>"
+	c.SetHeader("allow", allowVal)
+	chain := a.optionsChain
+	if chain == nil {
+		chain = newOptionsChain(a.server.middleware)
+	}
+	c.handlers = chain
+	a.handleError(c, s, c.Next())
+	if c.buffered && !c.written {
+		c.bufferDepth = 1
+		_ = c.FlushResponse()
+	}
+	if !c.written && s.ResponseWriter != nil {
+		// A middleware returned without writing and without calling Next.
+		hdrs := make([][2]string, 0, len(c.respHeaders)+1)
+		hdrs = append(hdrs, c.respHeaders...)
+		hdrs = append(hdrs, [2]string{"content-length", "0"})
+		c.statusCode = 200
+		_ = s.ResponseWriter.WriteResponse(s, 200, hdrs, nil)
+		c.written = true
+	}
+}
+
 func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
-	if err == nil || c.written {
+	// A response marked written only because a StreamWriter was taken, with
+	// nothing sent through it yet, is still answered (celeris#835): sse.New
+	// takes the writer before OnConnect, whose rejection must reach the
+	// client.
+	if err == nil || c.written && !c.reclaimUnusedStreamWriter() {
 		return
 	}
 	if a.errorHandler != nil {
