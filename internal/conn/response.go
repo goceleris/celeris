@@ -957,6 +957,13 @@ func (a *h1ResponseAdapter) WriteHeader(_ *stream.Stream, status int, headers []
 }
 
 func (a *h1ResponseAdapter) Write(_ *stream.Stream, data []byte) error {
+	// RFC 9110 §9.3.2: a HEAD response has no content. WriteHeader sent
+	// the header block (transfer-encoding: chunked says what a GET would
+	// get); a chunk here would be read as the start of the next response
+	// on the connection.
+	if a.isHEAD {
+		return nil
+	}
 	// Chunked transfer encoding: hex(len)\r\n data \r\n
 	var hexBuf [20]byte
 	chunk := strconv.AppendInt(hexBuf[:0], int64(len(data)), 16)
@@ -972,6 +979,9 @@ func (a *h1ResponseAdapter) Flush(_ *stream.Stream) error {
 }
 
 func (a *h1ResponseAdapter) Close(_ *stream.Stream) error {
+	if a.isHEAD {
+		return nil // no content, so no last-chunk either (see Write)
+	}
 	a.write([]byte("0\r\n\r\n"))
 	return nil
 }
@@ -1016,6 +1026,11 @@ func (a *h2ResponseAdapter) WriteHeader(s *stream.Stream, status int, headers []
 }
 
 func (a *h2ResponseAdapter) Write(s *stream.Stream, data []byte) error {
+	// RFC 9110 §9.3.2 / RFC 9113 §8.1.1: no DATA payload on a HEAD
+	// response. Close still ends the stream with an empty DATA frame.
+	if s.IsHEAD {
+		return nil
+	}
 	maxFrame := a.peerMaxFrame()
 	pooled := getH2FrameBuf()
 	frameBuf := (*pooled)[:0]
