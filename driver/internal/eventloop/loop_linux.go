@@ -63,7 +63,12 @@ type worker struct {
 	mu    sync.RWMutex
 	conns map[int]*driverConn // fd -> state (protected by mu)
 	// gen is the generation of the last registration on this worker
-	// (protected by mu). Each RegisterConn takes the next one, never 0.
+	// (protected by mu). Each RegisterConn takes the next one, never 0, so
+	// the count wraps after 2^32-1 registrations. An event reaches the wrong
+	// conn only if the conn now registered on its number has the event's
+	// generation: a multiple of 2^32-1 registrations on this worker would
+	// have to come between the event's registration and that conn's, while
+	// the event is still waiting to be dispatched.
 	gen uint32
 
 	// pending holds the conns whose outbound buffers have fresh bytes.
@@ -347,7 +352,7 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 		return ErrAlreadyRegistered
 	}
 	// The registration's generation, set before the conn is published
-	// (celeris#842).
+	// (celeris#842). worker.gen says what its wrap would take to misdeliver.
 	w.gen++
 	if w.gen == 0 { // 0 never names a registration
 		w.gen = 1
