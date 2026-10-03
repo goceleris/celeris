@@ -42,7 +42,8 @@ const ui = SwaggerUIBundle({
   docExpansion: {{.DocExpansion}},
   deepLinking: {{.DeepLinking}},
   persistAuthorization: {{.PersistAuthorization}},
-  defaultModelsExpandDepth: {{.DefaultModelsExpandDepth}}{{if .OAuth2RedirectURL}},
+  defaultModelsExpandDepth: {{.DefaultModelsExpandDepth}},
+  validatorUrl: {{.ValidatorURL}}{{if .OAuth2RedirectURL}},
   oauth2RedirectUrl: {{.OAuth2RedirectURL}}{{end}}
 });{{if .InitOAuth}}
 ui.initOAuth({ {{- range $i, $p := .OAuth2}}{{if $i}}, {{end}}{{$p.Key}}: {{$p.Value}}{{end}}});{{end}}
@@ -101,6 +102,7 @@ type swaggerUIPage struct {
 	DeepLinking              template.JS
 	PersistAuthorization     template.JS
 	DefaultModelsExpandDepth template.JS
+	ValidatorURL             string
 	OAuth2RedirectURL        string
 	InitOAuth                bool
 	OAuth2                   []jsProp
@@ -159,15 +161,29 @@ func New(config ...Config) celeris.HandlerFunc {
 	basePath := strings.TrimRight(cfg.BasePath, "/")
 	uiPath := basePath + "/"
 	specPath := basePath + "/spec"
+	// The redirect from basePath to the page is a relative reference, the
+	// last segment of basePath with a slash ("./swagger/" for /swagger):
+	// resolved against the request URL it names the page whether the
+	// browser reached basePath directly or through a reverse proxy that
+	// strips a path prefix (celeris#883). The "./" keeps a segment with a
+	// colon from reading as a URI scheme (RFC 3986 §4.2). With BasePath "/"
+	// only an empty path matches basePath, and it is sent to "/" as before.
+	uiRedirect := "/"
+	if basePath != "" {
+		uiRedirect = "./" + basePath[strings.LastIndexByte(basePath, '/')+1:] + "/"
+	}
 
 	var specContentType string
 	if cfg.SpecContent != nil {
 		specContentType = detectSpecContentType(cfg.SpecContent, cfg.SpecFile)
 	}
 
+	// The default spec URL is relative to the page, which is served only at
+	// {BasePath}/, so it names specPath both directly and behind a reverse
+	// proxy that serves the page under another prefix (celeris#883).
 	specURL := cfg.SpecURL
 	if specURL == "" {
-		specURL = specPath
+		specURL = defaultSpecURL
 	}
 
 	page := buildPage(cfg, specURL)
@@ -179,6 +195,14 @@ func New(config ...Config) celeris.HandlerFunc {
 	if cfg.Renderer == RendererSwaggerUI && cfg.AssetsPath == "" && !cfg.CDN {
 		assets = embeddedAssetRoutes(basePath)
 		assetsPrefix = embeddedAssetsPrefix(basePath) + "/"
+	}
+
+	// Swagger UI's OAuth2 redirect page is served whatever the UI's files
+	// load from: it must share the UI page's origin (celeris#850).
+	var oauth2PagePath, oauth2ScriptPath string
+	if cfg.Renderer == RendererSwaggerUI {
+		oauth2PagePath = basePath + "/" + oauth2RedirectPage.name
+		oauth2ScriptPath = basePath + "/" + oauth2RedirectScript.name
 	}
 
 	var skip celeris.SkipHelper
@@ -198,16 +222,25 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		var asset embeddedAsset
+		immutable := false
 		if path != basePath && path != uiPath && path != specPath {
-			// A request that only shares basePath (with BasePath "/",
-			// every request) passes on the assets prefix test, before
-			// the map lookup hashes its path.
-			if assets == nil || !strings.HasPrefix(path, assetsPrefix) {
-				return c.Next()
-			}
-			var ok bool
-			if asset, ok = assets[path]; !ok {
-				return c.Next()
+			switch {
+			case oauth2PagePath != "" && path == oauth2PagePath:
+				asset = oauth2RedirectPage
+			case oauth2ScriptPath != "" && path == oauth2ScriptPath:
+				asset = oauth2RedirectScript
+			default:
+				// A request that only shares basePath (with BasePath
+				// "/", every request) passes on the assets prefix
+				// test, before the map lookup hashes its path.
+				if assets == nil || !strings.HasPrefix(path, assetsPrefix) {
+					return c.Next()
+				}
+				var ok bool
+				if asset, ok = assets[path]; !ok {
+					return c.Next()
+				}
+				immutable = true
 			}
 		}
 
@@ -218,7 +251,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		switch path {
 		case basePath:
-			return c.Redirect(301, uiPath)
+			return c.Redirect(301, uiRedirect)
 		case uiPath:
 			return c.HTML(200, page)
 		case specPath:
@@ -228,10 +261,22 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Blob(200, specContentType, cfg.SpecContent)
 		}
 
-		c.SetHeader("cache-control", assetCacheControl)
+		if immutable {
+			c.SetHeader("cache-control", assetCacheControl)
+		}
 		return c.Blob(200, asset.contentType, asset.body)
 	}
 }
+
+// defaultSpecURL is the page's spec URL when Config.SpecURL is empty:
+// {BasePath}/spec, relative to the page at {BasePath}/.
+const defaultSpecURL = "spec"
+
+// defaultValidatorURL turns Swagger UI's online validator badge off
+// (celeris#849): the bundle's requiresValidationURL is false for "none", so
+// the page never sends its spec URL to a validator. Swagger UI's own default
+// is https://validator.swagger.io/validator.
+const defaultValidatorURL = "none"
 
 // buildPage generates the HTML page for the configured renderer.
 func buildPage(cfg Config, specURL string) string {
@@ -255,6 +300,11 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 
 	css, bundle, preset := swaggerUIRefs(cfg)
 
+	validatorURL := ui.ValidatorURL
+	if validatorURL == "" {
+		validatorURL = defaultValidatorURL
+	}
+
 	data := swaggerUIPage{
 		Title:                    ui.Title,
 		CSS:                      css,
@@ -265,6 +315,7 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		DeepLinking:              template.JS(strconv.FormatBool(ui.DeepLinking)),
 		PersistAuthorization:     template.JS(strconv.FormatBool(ui.PersistAuthorization)),
 		DefaultModelsExpandDepth: template.JS(strconv.Itoa(depth)),
+		ValidatorURL:             validatorURL,
 		OAuth2RedirectURL:        ui.OAuth2RedirectURL,
 	}
 
