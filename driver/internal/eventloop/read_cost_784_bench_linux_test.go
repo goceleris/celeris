@@ -11,7 +11,8 @@ package eventloop
 // read path on the benchmark goroutine with a 64-byte response already
 // queued, the shape of a small redis/memcached reply.
 //
-//	handleReadable: 2 reads per op (64 bytes, then EAGAIN), plus the peer's write
+//	handleReadable: 2 reads per op (64 bytes, then EAGAIN), plus the peer's write;
+//	                each op dispatches the conn's event, as the worker does
 //	WriteAndPoll*:  3 reads per op (64 bytes, EAGAIN, the final drain's EAGAIN),
 //	                plus the request write, two epoll_ctl MODs, and the peer's
 //	                write and read
@@ -53,13 +54,15 @@ func bench784Worker(b *testing.B) (*worker, int, int) {
 
 func BenchmarkHandleReadable784(b *testing.B) {
 	w, fd, peer := bench784Worker(b)
+	c := c784Lookup(w, fd)
+	ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd), Pad: int32(c.gen)}
 	resp := make([]byte, 64)
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, err := unix.Write(peer, resp); err != nil {
 			b.Fatalf("peer write: %v", err)
 		}
-		w.handleReadable(fd, unix.EPOLLIN)
+		w.dispatch(ev)
 	}
 }
 
