@@ -45,7 +45,7 @@
 # What it measures: the standard `testing.B` benchmarks of the router,
 # Context and handler chain (root bench_test.go), the HTTP/1 parser,
 # protocol detection, the HTTP/1 stream reset (BenchmarkResetH1Stream, in
-# protocol/h2/stream), the core middleware chains (./middleware) and the
+# internal/protocol/h2/stream), the core middleware chains (./middleware) and the
 # logger. Nothing in the benchmarks changed: CodSpeed's Go runner builds them
 # with an overlay of `testing` and measures each one
 # (https://codspeed.io/docs/benchmarks/go).
@@ -82,7 +82,7 @@
 # that leaves out only BenchmarkInternH2HeaderName.
 # The selection, each benchmark run once (54 leaves, on Linux and macOS):
 #   go test -run '^$' -bench '^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' \
-#     -benchtime 1x . ./protocol/... ./middleware ./middleware/logger
+#     -benchtime 1x . ./internal/protocol/... ./middleware ./middleware/logger
 #
 # Where it runs: a CodSpeed Macro Runner, a dedicated bare-metal machine.
 # Go supports only the walltime instrument, and walltime on a shared
@@ -154,9 +154,9 @@ on:
       - "celeristest/**"
       - "internal/ctxkit/**"
       - "observe/**"
-      - "protocol/detect/**"
-      - "protocol/h1/**"
-      - "protocol/h2/stream/**"
+      - "internal/protocol/detect/**"
+      - "internal/protocol/h1/**"
+      - "internal/protocol/h2/stream/**"
       - "middleware/*.go"
       - "middleware/adapters/**"
       - "middleware/circuitbreaker/**"
@@ -180,9 +180,9 @@ on:
       - "!mage*.go"
       - "!**/*_test.go"
       - "*bench*_test.go"
-      - "protocol/**/*bench*_test.go"
-      - "protocol/detect/detect_test.go"
-      - "protocol/h2/stream/stream_test.go"
+      - "internal/protocol/**/*bench*_test.go"
+      - "internal/protocol/detect/detect_test.go"
+      - "internal/protocol/h2/stream/stream_test.go"
       - "middleware/*bench*_test.go"
       - "middleware/logger/*bench*_test.go"
       - "go.mod"
@@ -249,4 +249,4 @@ jobs:
           go-runner-version: "1.3.0"
           # The CodSpeed CLI writes this line to a script and runs it with
           # bash, so the quoted pattern reaches go-runner as one argument.
-          run: go test -bench='^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' -benchtime=1s . ./protocol/... ./middleware ./middleware/logger
+          run: go test -bench='^Benchmark([^I]|I[^n]|In[^t]|Int[^e]|Inte[^r]|Inter[^n]|Intern[^H])' -benchtime=1s . ./internal/protocol/... ./middleware ./middleware/logger

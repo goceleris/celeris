@@ -3,7 +3,7 @@ package postgres
 import (
 	"errors"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
 // ErrSSLNotSupported is returned from Connect / Open when the DSN requests

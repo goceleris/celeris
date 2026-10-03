@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/ratelimit"
-	"github.com/goceleris/celeris/probe"
 )
 
 // TestDynamicLimiterFoundAfterNextRequest pins the ratelimit site of the

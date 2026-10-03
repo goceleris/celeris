@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // The engine sentinels the event loop returns are reachable as

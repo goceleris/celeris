@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
 // pgRows wraps the row buffer accumulated by the state machine. It iterates

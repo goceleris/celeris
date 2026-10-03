@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """celeris#685 detector control: the MUTANT, applied in CI and never committed.
 
-Makes fdOwed (engine/iouring/fd_lifetime.go) report false for every
+Makes fdOwed (internal/engine/iouring/fd_lifetime.go) report false for every
 connection, which takes the fd-lifetime rule off every path it guards at
 once: the close paths close the descriptor at once again (no kept number,
 no read-side shutdown), hijackConn no longer submits its cancels before
@@ -29,7 +29,7 @@ of silently mutating nothing.
 """
 import sys
 
-PATH = sys.argv[1] if len(sys.argv) > 1 else "engine/iouring/fd_lifetime.go"
+PATH = sys.argv[1] if len(sys.argv) > 1 else "internal/engine/iouring/fd_lifetime.go"
 
 BODY = (
     "func fdOwed(cs *connState) bool {\n"

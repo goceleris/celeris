@@ -3,7 +3,7 @@ package memcached
 import (
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // PoolStats reports the occupancy of a client's connection pool, as

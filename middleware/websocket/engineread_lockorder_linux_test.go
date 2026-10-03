@@ -45,8 +45,8 @@ type parkPoint struct {
 }
 
 // wakeShapedEngine builds its pause/resume callbacks the way both engines
-// build PauseRecv/ResumeRecv on detach (engine/iouring/worker.go and
-// engine/epoll/loop.go): a Swap of the desired state that returns early on a
+// build PauseRecv/ResumeRecv on detach (internal/engine/iouring/worker.go and
+// internal/engine/epoll/loop.go): a Swap of the desired state that returns early on a
 // no-op, an append to the detach queue under detachQMu, and, only when that
 // append took the queue from empty to non-empty, a Signal of the loop's
 // WakeFD after detachQMu is released. The WakeFD is the production type, so

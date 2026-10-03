@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/probe"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 )
 
 func engineKinds(t *testing.T) []celeris.EngineType {

@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/probe"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 )
 
 // TestDetachedContextKeepsRequestValues pins celeris#718, the Context.Detach
@@ -259,7 +259,7 @@ func detachedView(c *celeris.Context) map[string]string {
 // An io_uring start that fails only with ENOMEM is retried, with a new
 // server, for up to 10 s. The kernel charges ring memory to RLIMIT_MEMLOCK
 // per UID and gives it back 12-23 ms after a ring closes
-// (engine/iouring/ring_budget_linux_test.go), so at the CI runner's 8 MiB a
+// (internal/engine/iouring/ring_budget_linux_test.go), so at the CI runner's 8 MiB a
 // start made right after the previous arm stopped, or while another
 // package's test binary holds rings, can fail although nothing leaked.
 func startC714DetachServer(t *testing.T, mk func() *celeris.Server) (string, func()) {
@@ -319,7 +319,7 @@ func c714WaitReady(s *celeris.Server, done <-chan error) (string, error) {
 // retried for up to 10 s before the io_uring arms count as missing: the
 // probe's ring can fail with ENOMEM against RLIMIT_MEMLOCK while the rings
 // of engines stopped moments ago, or of another test binary run by the same
-// user, are still charged (engine/iouring/ring_budget_linux_test.go).
+// user, are still charged (internal/engine/iouring/ring_budget_linux_test.go).
 func c714ProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
 	p = probe.Probe()
 	usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers

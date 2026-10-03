@@ -3,7 +3,7 @@ package eventloop
 import (
 	"sync"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // ServerProvider is implemented by *celeris.Server. The indirection avoids a

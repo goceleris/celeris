@@ -14,11 +14,11 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/cache"
 	"github.com/goceleris/celeris/middleware/internal/sf"
 	"github.com/goceleris/celeris/middleware/store"
-	"github.com/goceleris/celeris/probe"
 )
 
 // TestFollowerErrorSurvivesLeaderNextRequest pins the cache site of

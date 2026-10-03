@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestShutdownBeforeTheWatcherLoadsRunsHooksOnce pins the window celeris#728

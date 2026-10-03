@@ -7,7 +7,7 @@ package websocket
 //
 // The audit's claim is that the SEND_ZC first-completion / notification
 // writes to cs.sending, cs.zcNotifPending and cs.zcSentBytes (worker
-// thread, engine/iouring/worker.go handleSend) and the detached
+// thread, internal/engine/iouring/worker.go handleSend) and the detached
 // inline-egress guard that reads them (dispatch goroutine, the `guarded`
 // closure in initProtocol) are synchronised by cs.detachMu, so the raw
 // unix.Write fast path can never interleave with a ring SEND_ZC on the

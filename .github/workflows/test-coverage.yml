@@ -15,8 +15,8 @@
 # push; GitHub-hosted minutes are free for public repositories.
 #
 # What is NOT in the profile, and why (so a low number is read correctly):
-# ./test/... (integration/spec harness, not library code), ./adaptive/...,
-# and ./middleware/websocket. ./adaptive/... runs in ci.yml's `adaptive` job:
+# ./test/... (integration/spec harness, not library code), ./internal/adaptive/...,
+# and ./middleware/websocket. ./internal/adaptive/... runs in ci.yml's `adaptive` job:
 # it needs memlock raised with sudo, and its switch tests are load- and
 # timing-bound, with RESULT-line tallies that the job checks. Instrumenting
 # them would risk what happened to websocket (next sentence) and add the
@@ -26,7 +26,7 @@
 # and those are timing-bound: under coverage instrumentation
 # TestBackpressurePauseDoesNotCancelInflightSend failed on both engines
 # (close-timeouts, write errors) on the same commit whose uninstrumented
-# `unit` job passed (celeris#699), so they are left to ci.yml. ./engine/iouring
+# `unit` job passed (celeris#699), so they are left to ci.yml. ./internal/engine/iouring
 # runs at the runner's 8 MiB memlock, where io_uring gets one worker, so its
 # multi-worker paths read as uncovered here although the
 # goceleris/probatorium cluster runs them. Coverage is per package (no
@@ -74,7 +74,7 @@ jobs:
           go-version: "1.27.0"
 
       # ci.yml's unit job takes `go list ./...` minus the pattern on its one
-      # `go list ./... | grep -vE '...'` line, and runs ./engine/iouring in a
+      # `go list ./... | grep -vE '...'` line, and runs ./internal/engine/iouring in a
       # step of its own; this job runs all of them in one `go test`. The step
       # fails, with the diff, when the two package sets differ, and when
       # ci.yml no longer has exactly one such line or `go list` fails.
@@ -87,11 +87,11 @@ jobs:
             exit 1
           fi
           ci_exclude=$ci_lines
-          echo "ci.yml excludes:        $ci_exclude (+ ./engine/iouring in its own step)"
+          echo "ci.yml excludes:        $ci_exclude (+ ./internal/engine/iouring in its own step)"
           echo "test-coverage excludes: $COVER_EXCLUDE"
           # Outside a process substitution, so that set -e sees a failure.
           all=$(go list ./...)
-          iouring=$(go list ./engine/iouring)
+          iouring=$(go list ./internal/engine/iouring)
           ci_pkgs=$({ grep -vE "$ci_exclude" <<< "$all" || true; echo "$iouring"; } | sort -u)
           cover_pkgs=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | sort -u)
           echo "packages: ci.yml $(grep -c . <<< "$ci_pkgs"), this job $(grep -c . <<< "$cover_pkgs")"

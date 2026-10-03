@@ -2,7 +2,7 @@
 
 package websocket
 
-// Regression test for the inline-egress fast path (engine/{epoll,iouring}
+// Regression test for the inline-egress fast path (internal/engine/{epoll,iouring}
 // detached guarded writeFn) and its ring/worker fallback. Broadcasts large
 // (>= sendZCMinBytes = 4096B, so io_uring uses SEND_ZC) frames to many detached
 // conns from a publisher while the dispatch goroutines issue inline writes,

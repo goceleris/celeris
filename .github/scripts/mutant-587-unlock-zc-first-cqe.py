@@ -2,7 +2,7 @@
 """celeris#587 detector control: the MUTANT, applied in CI and never committed.
 
 Releases cs.detachMu at the top of handleSend's CQE_F_MORE branch
-(engine/iouring/worker.go), i.e. the SEND_ZC first completion then writes
+(internal/engine/iouring/worker.go), i.e. the SEND_ZC first completion then writes
 cs.sending / cs.zcNotifPending / cs.zcSentBytes with no lock, while the
 inline-egress guard on the dispatch goroutine reads them under the lock.
 handleSend takes the lock once, at its top (celeris#750), and the branch
@@ -20,7 +20,7 @@ for the wrong reason).
 """
 import sys
 
-PATH = sys.argv[1] if len(sys.argv) > 1 else "engine/iouring/worker.go"
+PATH = sys.argv[1] if len(sys.argv) > 1 else "internal/engine/iouring/worker.go"
 
 ANCHOR = "\tif cqeHasMore(c.Flags) {\n"
 LOCK = (

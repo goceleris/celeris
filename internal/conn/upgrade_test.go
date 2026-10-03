@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 func TestDecodeHTTP2Settings(t *testing.T) {

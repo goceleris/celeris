@@ -9,14 +9,14 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 	"github.com/goceleris/celeris/internal/wakefd"
-	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
 // celeris#655, the H2 write queue. Both engines hand this queue the wakeup
 // eventfd they will close at shutdown (each engine's NewH2State call sites),
 // and the queue writes it from whichever goroutine enqueued a frame.
-// Non-inline H2 streams run on globalH2Pool (see protocol/h2/stream's
+// Non-inline H2 streams run on globalH2Pool (see internal/protocol/h2/stream's
 // processor), which no engine joins, and CloseH2 → Manager.Close only
 // cancels the streams — so a frame can be enqueued after the descriptor is
 // gone, and the 8 bytes land on whatever reuses it.

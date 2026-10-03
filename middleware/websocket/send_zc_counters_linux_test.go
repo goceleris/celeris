@@ -3,7 +3,7 @@
 package websocket
 
 // End-to-end verification rig for the SEND_ZC exposure counters
-// (celeris#591). The unit tests in engine/iouring/send_zc_gate_test.go pin
+// (celeris#591). The unit tests in internal/engine/iouring/send_zc_gate_test.go pin
 // the gate at the SQE, this one proves the counters move on a real ring
 // with a real detached WebSocket connection — which is the only thing that
 // lets the #585 fabric A/B and the #587 race tier distinguish "SEND_ZC was
@@ -48,8 +48,8 @@ import (
 )
 
 const (
-	// zcMinBytes mirrors engine/iouring.sendZCMinBytes, which is unexported;
-	// engine/iouring/send_zc_gate_test.go pins the real constant, this copy
+	// zcMinBytes mirrors internal/engine/iouring.sendZCMinBytes, which is unexported;
+	// internal/engine/iouring/send_zc_gate_test.go pins the real constant, this copy
 	// only labels the two sides of the threshold in failure messages.
 	zcMinBytes = 4096
 	// zcBigFrame is comfortably above zcMinBytes so every ring send of a

@@ -3,8 +3,8 @@ package postgres
 import (
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TypeCodec encodes and decodes a single PostgreSQL type, identified by its

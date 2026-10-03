@@ -63,10 +63,10 @@ func Fuzz() error {
 	if d := os.Getenv("FUZZ_TIME"); d != "" {
 		duration = d
 	}
-	if err := run("go", "test", "-fuzz=FuzzParseRequest", "-fuzztime="+duration, "./protocol/h1/"); err != nil {
+	if err := run("go", "test", "-fuzz=FuzzParseRequest", "-fuzztime="+duration, "./internal/protocol/h1/"); err != nil {
 		return err
 	}
-	return run("go", "test", "-fuzz=FuzzParseChunkedBody", "-fuzztime="+duration, "./protocol/h1/")
+	return run("go", "test", "-fuzz=FuzzParseChunkedBody", "-fuzztime="+duration, "./internal/protocol/h1/")
 }
 
 // Clean removes build artifacts.
