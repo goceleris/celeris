@@ -34,8 +34,11 @@ type Config struct {
 
 	// StatusFilter decides whether a computed response should be stored.
 	// When nil, only 2xx responses are cached. A 206 Partial Content or a
-	// 416 Range Not Satisfiable is never stored, whatever the filter says:
-	// both answer the request's Range, which the key does not include.
+	// 416 Range Not Satisfiable is never stored, whatever the filter says,
+	// even when the key includes Range (in VaryHeaders or a KeyGenerator):
+	// both answer one request's Range, and a replay would skip the
+	// handler's If-Range check, which can make the same Range get the whole
+	// representation.
 	StatusFilter func(status int) bool
 
 	// VaryHeaders are included in the default cache key. Callers who

@@ -97,3 +97,27 @@ func TestCacheDoesNotStoreRangeNotSatisfiable832(t *testing.T) {
 		t.Errorf("404 with a filter that admits it: %d x-cache %q, want 404 HIT", nf.StatusCode, nf.Header("x-cache"))
 	}
 }
+
+// TestCacheDoesNotStorePartialContentKeyedOnRange832: a 206 is not stored
+// even when the key does include Range (here in VaryHeaders). A stored part
+// would be replayed without the handler's If-Range check: a request with the
+// same Range whose If-Range no longer matches must get the whole
+// representation (RFC 9110 §13.1.5), not the part.
+func TestCacheDoesNotStorePartialContentKeyedOnRange832(t *testing.T) {
+	kv := store.NewMemoryKV()
+	defer kv.Close()
+	p := file832(t)
+	mw := New(Config{Store: kv, TTL: time.Minute, VaryHeaders: []string{"Range"}})
+	h := func(c *celeris.Context) error { return c.File(p) }
+	rng := celeristest.WithHeader("range", "bytes=0-3")
+
+	part := runOnce(t, mw, h, "GET", "/f", rng)
+	if part.StatusCode != 206 || string(part.Body) != "0123" {
+		t.Fatalf("ranged GET: %d %q, want 206 \"0123\" (the handler must produce the 206 under test)", part.StatusCode, part.Body)
+	}
+	stale := runOnce(t, mw, h, "GET", "/f", rng, celeristest.WithHeader("if-range", `"stale"`))
+	if stale.StatusCode != 200 || string(stale.Body) != "0123456789" || stale.Header("x-cache") != "MISS" {
+		t.Errorf("same Range with an If-Range that does not match: %d %q x-cache %q, want 200 \"0123456789\" MISS from the handler",
+			stale.StatusCode, stale.Body, stale.Header("x-cache"))
+	}
+}

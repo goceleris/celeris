@@ -234,9 +234,12 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 
 // answersRange reports a status that answers the request's Range header: a
 // 206 Partial Content carries one part, a 416 says that Range cannot be
-// satisfied. Neither is stored, whatever StatusFilter says: the key does not
-// include Range, so a later request without it (or with another) would get the
-// part, or the 416, back (celeris#832).
+// satisfied. Neither is stored, whatever StatusFilter says: the default key
+// does not include Range, so a later request without it (or with another)
+// would get the part, or the 416, back (celeris#832). They are not stored
+// when a key does include it either (VaryHeaders, a KeyGenerator): a replay
+// skips the handler's If-Range check, which can make the same Range get the
+// whole representation.
 func answersRange(status int) bool {
 	return status == 206 || status == 416
 }
