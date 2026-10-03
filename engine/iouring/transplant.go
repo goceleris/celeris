@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -198,15 +199,28 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 	// before arming the steady recv — mirrors handleRecv's process→flush. The
 	// source guaranteed AtRequestBoundary, so these are whole/partial next
 	// requests, never a mid-request continuation.
+	//
+	// They get exactly what handleRecv would give them had this worker read
+	// them off the socket itself. In sync mode that is ProcessH1 inline. On an
+	// AsyncHandlers worker it is the per-route decision a fresh conn's first
+	// read gets (replayCarriedAsync), never a plain inline ProcessH1: that ran
+	// an async route's handler on this worker thread, stalling every other
+	// conn the worker owns for as long as the handler ran (celeris#543).
 	if len(carry.Buffered) > 0 {
-		if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn); perr != nil {
-			if !errors.Is(perr, conn.ErrHijacked) {
-				w.closeConn(newFD)
+		if w.async {
+			if !w.replayCarriedAsync(cs, newFD, carry.Buffered) {
+				return // promoted (its recv is armed), hijacked, or closed
 			}
-			return // hijacked (handed off) or closed on error — nothing more to arm
-		}
-		if w.flushSend(cs) {
-			w.markDirty(cs)
+		} else {
+			if perr := conn.ProcessH1(cs.ctx, carry.Buffered, cs.h1State, w.handler, cs.writeFn); perr != nil {
+				if !errors.Is(perr, conn.ErrHijacked) {
+					w.closeConn(newFD)
+				}
+				return // hijacked (handed off) or closed on error — nothing more to arm
+			}
+			if w.flushSend(cs) {
+				w.markDirty(cs)
+			}
 		}
 	}
 
@@ -214,4 +228,62 @@ func (w *Worker) attachAdoptedFD(newFD int, carry engine.Carryover) {
 		cs.needsRecv = true
 		w.markDirty(cs)
 	}
+}
+
+// replayCarriedAsync replays a transplant's carried bytes on an AsyncHandlers
+// worker the way handleRecv treats the first bytes a fresh async HTTP/1 conn
+// receives (celeris#543): ProcessH1 runs inline in InlineMode, so sync routes
+// are served here and ProcessH1 stops at the first async route
+// (ErrAsyncDispatch); the conn is then promoted and that request, with
+// whatever follows it, goes to the conn's dispatch goroutine. Each step
+// mirrors the promotion block of handleRecv. Worker thread; the conn is fresh
+// from attachAdoptedFD, so no dispatch goroutine exists yet and the worker
+// owns cs.h1State until the promotion hands it over.
+//
+// It reports whether the caller should arm the conn's recv: false when the
+// promotion has armed it (promoteConnToAsync arms the first recv for a
+// completion without IORING_CQE_F_MORE, and none is armed yet), and when the
+// conn was hijacked or closed.
+func (w *Worker) replayCarriedAsync(cs *connState, fd int, data []byte) bool {
+	cs.h1State.InlineMode = true
+	perr := conn.ProcessH1(cs.ctx, data, cs.h1State, w.handler, cs.writeFn)
+	if cs.h1State != nil {
+		cs.h1State.InlineMode = false
+	}
+	if errors.Is(perr, conn.ErrAsyncDispatch) {
+		// The route that forced the promotion, cloned out of the parser
+		// buffer, for the celeris#364 revert (see handleRecv, celeris#631).
+		if w.bufRing == nil {
+			method, path := cs.h1State.CurrentRoute()
+			cs.promotedMethod, cs.promotedPath = strings.Clone(method), strings.Clone(path)
+		}
+		cs.asyncPromoted.Store(true)
+		w.asyncPromoted.Add(1)
+		stashed := cs.h1State.TakeBufferedBytes()
+		// A sync request served inline before the async one ships now, ahead
+		// of the dispatch goroutine's responses (#300 L1).
+		if len(cs.writeBuf) > 0 && !cs.sending && !cs.zcNotifPending {
+			_ = w.flushSend(cs)
+		}
+		var first completionEntry // no IORING_CQE_F_MORE: no recv is armed yet
+		w.promoteConnToAsync(cs, fd, stashed, &first)
+		return false
+	}
+	if perr != nil {
+		if !errors.Is(perr, conn.ErrHijacked) {
+			w.closeConn(fd)
+		}
+		return false
+	}
+	// Inline served the bytes, but if they ended inside a request (buffered
+	// headers, a chunked body) its continuation must run on the dispatch
+	// goroutine, as in handleRecv.
+	if cs.h1State.HasPendingDispatchState() {
+		cs.asyncPromoted.Store(true)
+		w.asyncPromoted.Add(1)
+	}
+	if w.flushSend(cs) {
+		w.markDirty(cs)
+	}
+	return true
 }

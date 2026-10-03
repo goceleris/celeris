@@ -18,6 +18,12 @@ type Carryover struct {
 	// case (the socket was fully drained at the boundary). Only ever carries
 	// next-request bytes — the source guarantees no in-progress request remains
 	// (AtRequestBoundary), so a fresh parser can consume them correctly.
+	//
+	// The destination treats them exactly as bytes it had read off the socket
+	// itself: inline in sync mode, and under AsyncHandlers by the same
+	// per-route decision a fresh connection's first read gets, so an async
+	// route's handler runs on the connection's dispatch goroutine, never on the
+	// destination's event loop (celeris#543).
 	Buffered []byte
 }
 
