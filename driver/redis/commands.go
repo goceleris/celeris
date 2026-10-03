@@ -951,15 +951,15 @@ func (c *Client) Publish(ctx context.Context, channel, message string) (int64, e
 // ==================== Scripting ====================
 
 // Eval runs a Lua script server-side. keys and args may be empty; numkeys is
-// inferred from len(keys). The returned *protocol.Value is detached and safe
+// inferred from len(keys). The returned *Value is detached and safe
 // to retain.
-func (c *Client) Eval(ctx context.Context, script string, keys []string, args ...any) (*protocol.Value, error) {
+func (c *Client) Eval(ctx context.Context, script string, keys []string, args ...any) (*Value, error) {
 	return c.evalCmd(ctx, "EVAL", script, keys, args...)
 }
 
 // EvalSHA runs a previously-loaded script by sha1. Returns NOSCRIPT as
 // *RedisError when the server does not have the script cached.
-func (c *Client) EvalSHA(ctx context.Context, sha string, keys []string, args ...any) (*protocol.Value, error) {
+func (c *Client) EvalSHA(ctx context.Context, sha string, keys []string, args ...any) (*Value, error) {
 	return c.evalCmd(ctx, "EVALSHA", sha, keys, args...)
 }
 

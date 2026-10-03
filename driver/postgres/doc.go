@@ -29,11 +29,11 @@
 // [Pool.CopyFrom] (feed rows via [CopyFromSource] or [CopyFromSlice]) and
 // [Pool.CopyTo].
 //
-// Server errors surface as [*PGError] (alias of [protocol.PGError]) carrying
-// the SQLSTATE code; match with errors.As. Package sentinels include
-// [ErrPoolClosed], [ErrClosed], [ErrBadConn], [ErrSSLNotSupported],
-// [ErrUnsupportedAuth], and [ErrResultTooBig]. Custom type codecs can be
-// registered with [protocol.RegisterType].
+// Server errors surface as [*PGError] carrying the SQLSTATE code; match
+// with errors.As. Package sentinels include [ErrPoolClosed], [ErrClosed],
+// [ErrBadConn], [ErrSSLNotSupported], [ErrUnsupportedAuth], and
+// [ErrResultTooBig]. Custom type codecs ([TypeCodec]) can be registered
+// with [RegisterType].
 //
 // Current limitations: TLS is not yet supported (use sslmode=disable behind a
 // VPC/loopback/sidecar); authentication is limited to trust, cleartext, MD5,

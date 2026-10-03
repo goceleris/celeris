@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 )
 
@@ -85,7 +84,7 @@ func (c *Client) Close() error {
 // PoolStats returns driver pool occupancy. Named PoolStats rather than
 // Stats so it doesn't collide with the server-side [Client.Stats] command
 // that queries the memcached server's own statistics map.
-func (c *Client) PoolStats() async.PoolStats {
+func (c *Client) PoolStats() PoolStats {
 	return c.pool.Stats()
 }
 

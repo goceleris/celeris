@@ -47,8 +47,13 @@ var ErrResultTooBig = errors.New("celeris-postgres: query result exceeds direct-
 // LISTEN/NOTIFY in a non-async configuration.
 var ErrDirectModeUnsupported = errors.New("celeris-postgres: LISTEN/UNLISTEN/NOTIFY are not supported in direct mode; use a non-async engine pool or a dedicated listener conn")
 
-// PGError re-exports the server-side ErrorResponse type so callers can
-// type-assert without importing the protocol package.
+// PGError is a server-sent ErrorResponse. Match it with errors.As.
+//
+// Its fields are the ErrorResponse fields the driver decodes: Severity,
+// Code (the SQLSTATE), Message, Detail and Hint (all string), Position
+// (int; the 1-based character position in the query, 0 if absent), and
+// Extra (map[byte]string), which holds every other field by its one-byte
+// code.
 type PGError = protocol.PGError
 
 // isPreparedStatementNotFound reports whether err is a PG error with SQLSTATE

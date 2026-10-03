@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/driver/redis/protocol"
 )
 
@@ -35,7 +34,7 @@ type SentinelConfig struct {
 	DialTimeout      time.Duration
 	ReadTimeout      time.Duration
 	WriteTimeout     time.Duration
-	Engine           eventloop.ServerProvider
+	Engine           ServerProvider
 }
 
 // SentinelClient is a Redis client managed by Redis Sentinel. It discovers the
@@ -630,7 +629,7 @@ func (s *SentinelClient) Subscribe(ctx context.Context, channels ...string) (*Pu
 	return c.Subscribe(ctx, channels...)
 }
 
-func (s *SentinelClient) Do(ctx context.Context, args ...any) (*protocol.Value, error) {
+func (s *SentinelClient) Do(ctx context.Context, args ...any) (*Value, error) {
 	c, err := s.getClient()
 	if err != nil {
 		return nil, err
@@ -648,12 +647,12 @@ func (s *SentinelClient) Pipeline() *Pipeline {
 	return c.Pipeline()
 }
 
-func (s *SentinelClient) Stats() async.PoolStats {
+func (s *SentinelClient) Stats() PoolStats {
 	s.mu.RLock()
 	c := s.client
 	s.mu.RUnlock()
 	if c == nil {
-		return async.PoolStats{}
+		return PoolStats{}
 	}
 	return c.Stats()
 }
