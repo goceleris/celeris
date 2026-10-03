@@ -19,6 +19,16 @@
 // thin helpers such as [RecordPanic]; these carry no build tag and
 // inline to nothing in production builds.
 //
+// # Stability
+//
+// EXPERIMENTAL. This package is outside the compatibility promise in
+// celeris's GOVERNANCE.md ("Compatibility"): the counter names, the
+// [Counters] fields, the socket's JSON and the functions may change or go
+// away in a minor release, and the release notes say when they do. It is a
+// property-testing facility for the celeris engines and middleware; it does
+// not validate request input (for that, see
+// [github.com/goceleris/celeris.Context.Bind]).
+//
 // # Documentation
 //
 // Full guides and examples: https://goceleris.dev/docs

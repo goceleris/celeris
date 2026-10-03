@@ -738,6 +738,13 @@ func (s *Server) Addr() net.Addr {
 // has not been started. The returned provider is shared with the HTTP path;
 // drivers register their own file descriptors on it to colocate database or
 // cache I/O on the same worker threads as HTTP requests.
+//
+// It is for the celeris drivers: pass the server itself to
+// [github.com/goceleris/celeris/driver/redis.WithEngine] or its postgres
+// and memcached counterparts. The result's type is defined in an internal
+// package, so code outside this module can pass it on but cannot name it.
+// That type and its methods are not supported API until celeris#453
+// defines a public engine interface; they may change in a minor release.
 func (s *Server) EventLoopProvider() engine.EventLoopProvider {
 	eng := s.loadEngine()
 	if eng == nil {
