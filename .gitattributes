@@ -7,3 +7,7 @@
 middleware/swagger/assets/swagger-ui-dist/** -text linguist-vendored
 middleware/swagger/assets/swagger-ui-dist/*.js -diff -merge
 middleware/swagger/assets/swagger-ui-dist/*.css -diff -merge
+
+# The API golden files (api/README.md) are compared byte for byte, so a
+# checkout with core.autocrlf=true must not give them CRLF line endings.
+api/**/*.txt text eol=lf

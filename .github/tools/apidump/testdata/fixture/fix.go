@@ -13,6 +13,7 @@ const (
 	Typed   Kind = iota
 	Second
 	Ratio      = 0.75
+	Tenth      = 0.1 // not exact in float64: written as a fraction
 	Name       = "fix"
 	Long       = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789+"
 	unexported = 7

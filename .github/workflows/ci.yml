@@ -30,6 +30,12 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
+          # The api/ check type-checks the nested modules too, and apidump
+          # builds from the tools module, so their go.sum files key the cache.
+          cache-dependency-path: |
+            go.sum
+            middleware/*/go.sum
+            .github/tools/go.sum
       # Magefiles carry `//go:build mage`, so `go vet ./...`, `go build` and
       # `go test` ALL skip them — only mage itself compiles them, which means a
       # broken magefile can reach main green. Compile them here.
@@ -46,6 +52,17 @@ jobs:
       # PrepRelease` moves all of them at once.
       - name: Release stamps agree
         run: mage CheckRelease
+      # api/ lists the exported API of every package (api/README.md). A PR
+      # that adds, removes or changes an exported identifier regenerates it
+      # with `mage api`, so the API change is part of the review; this step
+      # fails with the diff when it did not (celeris#443). It runs in this
+      # job because Lint is a required check, so a stale api/ cannot merge.
+      # apidump is built from .github/tools, pinned by its go.sum like
+      # govulncheck.
+      - name: api/ matches the exported API
+        run: go -C .github/tools run ./apidump
+      - name: apidump's own tests
+        run: go -C .github/tools test -count=1 ./apidump
 
       - name: Lint root module
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -71,7 +88,7 @@ jobs:
         with:
           version: v2.13
           working-directory: middleware/protobuf
-      # The tools module holds apidump's source (the API golden files job);
+      # The tools module holds apidump's source (the api/ check above);
       # golangci-lint finds the root .golangci.yml from there.
       - name: Lint .github/tools
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -1705,29 +1722,3 @@ jobs:
       - name: middleware/protobuf
         run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck ./...
         working-directory: middleware/protobuf
-
-  api:
-    name: API golden files
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27.0"
-          # The check type-checks the nested modules too, and apidump builds
-          # from the tools module, so their go.sum files key the cache.
-          cache-dependency-path: |
-            go.sum
-            middleware/*/go.sum
-            .github/tools/go.sum
-      # api/ lists the exported API of every package (api/README.md). A PR
-      # that adds, removes or changes an exported identifier regenerates it
-      # with `mage api`, so the API change is part of the review; this step
-      # fails with the diff when it did not (celeris#443). apidump is built
-      # from .github/tools, pinned by its go.sum like govulncheck.
-      - name: api/ matches the exported API
-        run: go -C .github/tools run ./apidump
-      - name: apidump's own tests
-        run: go -C .github/tools test -count=1 ./apidump

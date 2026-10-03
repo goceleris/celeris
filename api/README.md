@@ -6,8 +6,9 @@ package: `celeris.txt` is the root package, and `middleware/cors.txt` is
 [`.github/tools/apidump`](../.github/tools/apidump) and checked in, so that
 every change to the exported API shows up in the pull request that makes it.
 
-The **API golden files** CI job regenerates them and fails with the diff when
-they differ from what is committed (celeris#443).
+The step *api/ matches the exported API* of the **Lint** CI job, a required
+check, regenerates them and fails with the diff when they differ from what is
+committed (celeris#443), so a pull request with a stale `api/` cannot merge.
 
 ## Updating them
 
@@ -20,6 +21,12 @@ mage api
 or `go -C .github/tools run ./apidump -w` without mage, and commit `api/` with
 the change. To check without writing, as CI does, run `mage apiCheck` or
 `go -C .github/tools run ./apidump`. Do not edit these files by hand.
+Every `.txt` file under `api/` belongs to apidump: `-w` deletes one it did
+not generate, and the check reports it as a package that no longer exists.
+The `go -C .github/tools` form works from any directory. A built `apidump`
+binary looks for the repository root from the working directory, so run it
+from the root or pass `-root`: inside a nested module such as
+`middleware/compress` it would take that module for the root.
 `VERSION=vX.Y.Z mage PrepRelease` also moves the `const Version` line of
 `celeris.txt`, along with the other release stamps.
 
@@ -62,3 +69,26 @@ the change. To check without writing, as CI does, run `mage apiCheck` or
   embeds `time.Time` gets a `type ... struct, embedded time.Time` line but
   none of `time.Time`'s methods, because those are `time`'s API. A Go release
   that adds a method to `time.Time` therefore changes nothing here.
+- **Breaking changes these files do not show** (review them by hand; Go's own
+  `cmd/api` has the same blind spots, and `gorelease` reports them):
+  - an exported struct that stops being comparable, for example because an
+    unexported `_ [0]func()` field is added;
+  - the first unexported field added to a struct whose fields were all
+    exported, which breaks unkeyed composite literals;
+  - exported fields reordered, which also breaks unkeyed literals (the
+    lines are sorted);
+  - a package clause renamed without a change of import path (the header
+    names only the path);
+  - methods that a type of another module or of the standard library
+    supplies through an unexported embedded interface, for example
+    `type hidden interface{ io.Reader }` embedded in an exported struct:
+    no `embedded` line names that field, so replacing `io.Reader` with
+    `io.Writer` changes nothing here (through an unexported embedded
+    struct, the `promoted` field lines do show it);
+  - anything that builds only for a platform or a build tag outside the
+    twelve configurations above, for example a `_freebsd.go` file.
+- **Changes that do show although no exported identifier changed:**
+  renaming an unexported type that the exported API reaches (its `exposed`
+  lines and the signatures that use it name it), and spelling a signature
+  through a new unexported alias. Both are deliberate: a reviewer sees which
+  hidden types the API hands out.

@@ -8,6 +8,7 @@ const PerOS untyped string = "other" // only: darwin/arm64 windows/amd64
 const Ratio untyped float = 0.75
 const Second Kind = 2
 const Tagged untyped bool = true // only: (-tags=validation)
+const Tenth untyped float = 1/10
 const Typed Kind = 1
 const Untyped untyped int = 1048576
 func LinuxOnly() // only: linux/amd64 linux/arm64

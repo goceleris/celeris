@@ -465,7 +465,8 @@ func deref(t types.Type) types.Type {
 }
 
 // constValue writes a constant's value exactly. A string longer than 100
-// bytes is written as its length and SHA-256, so a change still shows.
+// bytes is written as its length and SHA-256, so a change still shows. A
+// float that float64 cannot hold exactly is written as an exact fraction.
 func constValue(v constant.Value) string {
 	switch v.Kind() {
 	case constant.String:
@@ -475,7 +476,10 @@ func constValue(v constant.Value) string {
 		}
 		return strconv.Quote(s)
 	case constant.Float:
-		if f, _ := constant.Float64Val(v); !math.IsInf(f, 0) {
+		// float64 only when it holds the value exactly: 0.1 and
+		// 0.10000000000000000001 are the same float64 but not the same
+		// constant, so either change shows.
+		if f, exact := constant.Float64Val(v); exact && !math.IsInf(f, 0) {
 			return strconv.FormatFloat(f, 'g', -1, 64)
 		}
 	}
