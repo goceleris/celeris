@@ -33,6 +33,14 @@ var ErrNotFound = errors.New("store: key not found")
 //   - All methods are safe for concurrent use from multiple goroutines.
 //   - Values returned by Get are owned by the caller; backends must copy
 //     any internal buffer before returning.
+//   - Keys (and values passed to Set) are borrowed for the call only. A
+//     backend that keeps a key past the call, as an in-memory map does,
+//     must keep its own copy: callers pass request strings (an
+//     Idempotency-Key header, a session ID from a cookie) that on epoll and
+//     io_uring are views of the connection's receive buffer and change once
+//     the request is over (celeris#719). Note that assigning to an existing
+//     key of a Go map replaces the key the map holds with the one given.
+//     Backends that write the key to the wire inside the call keep nothing.
 type KV interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error

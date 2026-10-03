@@ -151,8 +151,14 @@ func (m *MemoryStore) Set(_ context.Context, key string, value []byte, ttl time.
 	}
 	cp := make([]byte, len(value))
 	copy(cp, value)
-	n := &lruNode{key: key, value: cp, expiry: exp}
-	s.items[key] = n
+	// The map and the node keep a copy of the key: a KeyGenerator may return
+	// a request string (c.Path(), a header), which on epoll and io_uring is
+	// a view of the connection's receive buffer and changes once the request
+	// is over (celeris#719). The eviction deletes by the node's key, so both
+	// hold the same copy.
+	k := strings.Clone(key)
+	n := &lruNode{key: k, value: cp, expiry: exp}
+	s.items[k] = n
 	s.pushFront(n)
 	if s.capacity > 0 && len(s.items) > s.capacity {
 		victim := s.tail
