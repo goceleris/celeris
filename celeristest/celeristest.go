@@ -20,6 +20,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // ResponseRecorder captures the response written by a handler.
@@ -230,7 +231,7 @@ func WithHandlers(handlers ...celeris.HandlerFunc) Option {
 // be used after this call.
 func ReleaseContext(ctx *celeris.Context) {
 	// Extract stream and recorder before releasing context (reset nils them).
-	s := celeris.TestStream(ctx)
+	s := testhooks.Stream(ctx)
 	var combo *recorderCombo
 	if s != nil {
 		if w, ok := s.ResponseWriter.(*recorderWriter); ok && w.combo != nil {
@@ -238,7 +239,7 @@ func ReleaseContext(ctx *celeris.Context) {
 		}
 	}
 
-	celeris.ReleaseTestContext(ctx)
+	testhooks.ReleaseContext(ctx)
 
 	// Return stream to pool so NewStream reuses it on the next call. The
 	// context the request handed out (Context.Context) is cancelled and
@@ -321,23 +322,23 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		}
 	}
 
-	ctx := celeris.AcquireTestContext(s)
-	celeris.SetTestStartTime(ctx, time.Now())
+	ctx := testhooks.AcquireContext(s).(*celeris.Context)
+	testhooks.SetStartTime(ctx, time.Now())
 	for _, p := range cfg.params {
-		celeris.AddTestParam(ctx, p[0], p[1])
+		testhooks.AddParam(ctx, p[0], p[1])
 	}
 	if len(cfg.handlers) > 0 {
 		chain := make([]celeris.HandlerFunc, len(cfg.handlers))
 		for i, h := range cfg.handlers {
 			chain[i] = h.(celeris.HandlerFunc)
 		}
-		celeris.SetTestHandlers(ctx, chain)
+		testhooks.SetHandlers(ctx, chain)
 	}
 	if cfg.fullPath != "" {
-		celeris.SetTestFullPath(ctx, cfg.fullPath)
+		testhooks.SetFullPath(ctx, cfg.fullPath)
 	}
 	if cfg.scheme != "" {
-		celeris.SetTestScheme(ctx, cfg.scheme)
+		testhooks.SetScheme(ctx, cfg.scheme)
 	}
 	if len(cfg.trustedProxies) > 0 {
 		nets := make([]*net.IPNet, 0, len(cfg.trustedProxies))
@@ -356,7 +357,7 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 			}
 			nets = append(nets, ipNet)
 		}
-		celeris.SetTestTrustedNets(ctx, nets)
+		testhooks.SetTrustedNets(ctx, nets)
 	}
 
 	cfg.reset()
