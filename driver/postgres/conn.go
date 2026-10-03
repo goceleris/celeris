@@ -594,12 +594,17 @@ type pgConn struct {
 	// leak Gs that outlive the conn.
 	closeWG sync.WaitGroup
 
-	// fdCloseOnce guards syscall.Close(fd) so it runs exactly once regardless
-	// of whether the first close path is Close() or onClose() (fired by the
-	// event loop on peer EOF / error). The event loop's UnregisterConn does
-	// NOT close the fd — see driver/{epoll,iouring} "caller is responsible
-	// for closing the underlying fd" — so the driver retains fd ownership.
-	fdCloseOnce sync.Once
+	// fdReleased marks the release of fd's number. The event loop's
+	// UnregisterConn does NOT close the fd — see driver/{epoll,iouring}
+	// "caller is responsible for closing the underlying fd" — so the driver
+	// retains fd ownership. Only Close releases the number (closeFDOnce);
+	// onClose shuts the socket down and keeps it (shutdownFD); onRecv's own
+	// writes skip a released number (writeRawFromRecv) (celeris#859).
+	// fdReleased is set with recvWriteMu and fdMu held, and read under
+	// either; lock order recvWriteMu, then fdMu.
+	recvWriteMu sync.Mutex
+	fdMu        sync.Mutex
+	fdReleased  bool
 
 	stmtCounter uint64
 
@@ -614,20 +619,64 @@ type pgConn struct {
 	serverParams   map[string]string
 }
 
-// closeFDOnce closes c.fd exactly once. Safe to call from Close() and from
-// onClose() concurrently; only the first winner actually issues the close.
-// We close via c.fdFile.Close() so the *os.File finalizer is satisfied and
-// cannot later run against an fd that may have been reused by the kernel.
+// closeFDOnce closes c.fd exactly once, releasing its number. Only Close
+// calls it, after the conn's last call on the number: once it is released,
+// the next socket the process opens usually gets it, and a Write,
+// WriteAndPoll or UnregisterConn on the number would act on that socket's
+// registration (celeris#859). We close via c.fdFile.Close() so the *os.File
+// finalizer is satisfied and cannot later run against an fd that may have
+// been reused by the kernel.
+//
+// The number is marked released under the locks and closed after them: a
+// shutdownFD or writeRawFromRecv that takes its lock later sees the mark,
+// one that held it first is done with the number before the close, and
+// neither ever waits on a close(2).
 func (c *pgConn) closeFDOnce() {
-	c.fdCloseOnce.Do(func() {
-		if c.fdFile != nil {
-			_ = c.fdFile.Close()
-			return
-		}
-		if c.fd > 0 {
-			_ = syscall.Close(c.fd)
-		}
-	})
+	c.recvWriteMu.Lock()
+	c.fdMu.Lock()
+	released := c.fdReleased
+	c.fdReleased = true
+	c.fdMu.Unlock()
+	c.recvWriteMu.Unlock()
+	if released {
+		return
+	}
+	if c.fdFile != nil {
+		_ = c.fdFile.Close()
+		return
+	}
+	if c.fd > 0 {
+		_ = syscall.Close(c.fd)
+	}
+}
+
+// shutdownFD shuts c.fd's socket down without releasing its number, unless
+// Close has released it already. onClose calls it: the server sees the
+// client leave as soon as a loop drops the conn, as when onClose closed the
+// fd, while the number stays the conn's until Close. On the io_uring engine
+// onClose can fire after Close has released the number; the check under
+// fdMu leaves alone the socket that has taken it since.
+func (c *pgConn) shutdownFD() {
+	c.fdMu.Lock()
+	defer c.fdMu.Unlock()
+	if c.fdReleased || c.fd <= 0 {
+		return
+	}
+	_ = syscall.Shutdown(c.fd, syscall.SHUT_RDWR)
+}
+
+// writeRawFromRecv is writeRaw for onRecv, which writes the startup
+// exchange's responses. A loop can still deliver an onRecv after
+// UnregisterConn has returned, while or after Close releases the number
+// (driver/internal/eventloop UnregisterConn); the write is dropped once the
+// number is released (celeris#859).
+func (c *pgConn) writeRawFromRecv(data []byte) error {
+	c.recvWriteMu.Lock()
+	defer c.recvWriteMu.Unlock()
+	if c.fdReleased {
+		return ErrClosed
+	}
+	return c.writeRaw(data)
 }
 
 // buildMessage serializes writer access. fn runs under writerMu and may use
@@ -1209,7 +1258,7 @@ func (c *pgConn) dispatch(msgType byte, payload []byte) error {
 			head.doneMu.Unlock()
 		}
 		if resp != nil {
-			if werr := c.writeRaw(resp); werr != nil {
+			if werr := c.writeRawFromRecv(resp); werr != nil {
 				head.doneMu.Lock()
 				if head.err == nil {
 					head.err = werr
@@ -1438,17 +1487,19 @@ func promoteToStreaming(req *pgRequest) {
 	}
 }
 
-// onClose is the event-loop callback for an fd-level shutdown. It closes the
-// underlying fd (event loop does not own fd lifetime) via closeFDOnce, then
-// fans the error out to any pending requests. Running concurrently with
-// Close() is safe because both paths funnel through closeFDOnce and failAll
-// is idempotent under closeOnce's covering atomic Store.
+// onClose is the event-loop callback for an fd-level shutdown. It shuts the
+// socket down (shutdownFD) but does not release the fd's number: the conn's
+// Close still writes Terminate and unregisters by number, and only Close
+// releases it (celeris#859). It then fans the error out to any pending
+// requests. Running concurrently with Close() is safe because both paths
+// take fdMu for the fd and failAll is idempotent under closeOnce's covering
+// atomic Store.
 func (c *pgConn) onClose(err error) {
 	if err == nil {
 		err = io.EOF
 	}
 	c.closeErr.Store(err)
-	c.closeFDOnce()
+	c.shutdownFD()
 	c.failAll(err)
 }
 
@@ -2596,11 +2647,13 @@ func boolByte(b bool) byte {
 // Close releases the conn's FD and (if it owns the event loop) releases it.
 //
 // FD-close contract: the event loop's UnregisterConn does NOT close the fd;
-// the driver owns it. We route syscall.Close through closeFDOnce so that if
-// onClose (fired by the event loop on peer EOF) closes the fd first, Close()
-// does not double-close. Without this guard, a worker could reuse the fd
-// number between UnregisterConn and syscall.Close — the classic phantom-
-// socket bug.
+// the driver owns it. Close is the only path that releases the fd's number
+// (closeFDOnce), and it does so last: after its own Terminate write and
+// UnregisterConn, which find the conn by number, and after the conn's
+// background goroutines, which may still write by number. If the number
+// were released earlier, by onClose after a loop teardown or before those
+// goroutines are done, the next socket the process opens could take it, and
+// these calls would reach that socket and its registration (celeris#859).
 func (c *pgConn) Close() error {
 	var firstErr error
 	c.closeOnce.Do(func() {
@@ -2628,7 +2681,6 @@ func (c *pgConn) Close() error {
 			if err := c.loop.UnregisterConn(c.fd); err != nil && firstErr == nil {
 				firstErr = err
 			}
-			c.closeFDOnce()
 		}
 		c.failAll(ErrClosed)
 		if c.closeLoop != nil {
@@ -2639,6 +2691,11 @@ func (c *pgConn) Close() error {
 	// this conn. Safe outside closeOnce because closeWG.Wait() on
 	// a zero WaitGroup returns immediately.
 	c.closeWG.Wait()
+	// Release the number only now: a background goroutine that lost the
+	// race with Close may have written by number until Wait returned.
+	if !c.useDirect && c.loop != nil {
+		c.closeFDOnce()
+	}
 	return firstErr
 }
 

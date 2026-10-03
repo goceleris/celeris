@@ -20,10 +20,10 @@ import (
 )
 
 // TestPgConnCloseNoDoubleClose asserts Close's fd-close path is idempotent:
-// onClose (event loop) and Close (caller) may both race to tear the conn
-// down; syscall.Close must happen at most once. We verify by inspecting the
-// fdCloseOnce guard rather than relying on kernel behavior — the race
-// detector would not catch a stray syscall.Close on an int. (PG-1)
+// concurrent Close calls may race to tear the conn down; syscall.Close must
+// happen at most once. We verify through the closeFDOnce guard rather than
+// relying on kernel behavior — the race detector would not catch a stray
+// syscall.Close on an int. (PG-1)
 func TestPgConnCloseNoDoubleClose(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
 		fakePGTrustStartup(t, c, 1, 2, func(c net.Conn) {
@@ -45,8 +45,8 @@ func TestPgConnCloseNoDoubleClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Race: concurrent Close from two goroutines + a synthetic onClose via
-	// closeFDOnce directly. None of them should double-close.
+	// Race: concurrent Close from four goroutines, then closeFDOnce
+	// directly. None of them should double-close.
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
