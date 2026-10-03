@@ -101,8 +101,11 @@ type BindError struct {
 	Source string
 	// Key is the wire name from the tag.
 	Key string
-	// Value is the raw string that failed to convert: a request string, valid
-	// until the handler returns (see the package doc).
+	// Value is a copy of the raw string that failed to convert (a slice
+	// field's values joined with ","). It stays valid after the handler
+	// returns, so an error that outlives the request (a singleflight waiter
+	// or a cache follower reaching it with errors.As, an asynchronous error
+	// reporter) still reads this request's value (celeris#732).
 	Value string
 	// Err is the underlying conversion error.
 	Err error
@@ -267,11 +270,17 @@ func bindStruct(rv reflect.Value, tagName string, lookup lookupFunc) error {
 		}
 
 		if err := setFieldValue(fv, vals); err != nil {
+			// strings.Join returns a single value as it is: a request
+			// string, a view of the receive buffer on epoll and io_uring.
+			value := strings.Join(vals, ",")
+			if len(vals) == 1 {
+				value = strings.Clone(value)
+			}
 			return &BindError{
 				Field:  field.Name,
 				Source: tagName,
 				Key:    key,
-				Value:  strings.Join(vals, ","),
+				Value:  value,
 				Err:    err,
 			}
 		}
