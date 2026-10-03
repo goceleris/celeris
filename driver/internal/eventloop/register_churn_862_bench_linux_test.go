@@ -3,7 +3,7 @@
 package eventloop
 
 // The cost of RegisterConn's EPOLL_CTL_ADD on the other conns of the worker
-// (celeris#862 issues it under w.mu's read lock, after the conn is in the
+// (celeris#862 issues it under the conn's c.mu, after the conn is in the
 // map; the base issued it with no lock). Conn R's round trip through a
 // running worker (R's peer writes one byte, R's onRecv signals) while
 // `churn` goroutines register and unregister fresh socketpair ends on the
