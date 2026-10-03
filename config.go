@@ -218,6 +218,9 @@ type Config struct {
 	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
 	// If the callback returns false, the server responds with 417 Expectation Failed
 	// and skips reading the body. If nil, the server always sends 100 Continue.
+	// The method, the path and the header strings are request strings, valid only
+	// during the call (on epoll and io_uring, views of the receive buffer; see the
+	// package doc): copy one with [strings.Clone] before anything keeps it.
 	OnExpectContinue func(method, path string, headers [][2]string) bool
 
 	// OnConnect is called when a new connection is accepted. The addr is the
