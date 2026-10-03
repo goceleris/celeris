@@ -3,6 +3,7 @@
 package main
 
 import (
+	"debug/buildinfo"
 	"fmt"
 	"os"
 	"os/exec"
@@ -85,11 +86,17 @@ func CleanBenchmarks() error {
 // the -ldflags of h2spec's own Makefile gives the release's code and its
 // version string, checked against the Go checksum database like any module, for
 // every GOOS/GOARCH (the release ships amd64 binaries only).
+//
+// The version string is the -ldflags stamp, so it would say 2.6.0 for any
+// code. What proves the code is the module version the binary records in
+// its build info, which Tools checks against h2specModVersion.
 const (
-	h2specVersion = "2.6.0"
-	h2specCommit  = "70ac2294010887f48b18e2d64f5cccd48421fad1"
-	h2specModule  = "github.com/summerwind/h2spec/cmd/h2spec@v1.5.1-0.20200804131034-70ac22940108"
-	h2specRelease = "https://github.com/summerwind/h2spec/releases/tag/v2.6.0"
+	h2specVersion    = "2.6.0"
+	h2specCommit     = "70ac2294010887f48b18e2d64f5cccd48421fad1"
+	h2specMod        = "github.com/summerwind/h2spec"
+	h2specModVersion = "v1.5.1-0.20200804131034-70ac22940108"
+	h2specPkg        = h2specMod + "/cmd/h2spec@" + h2specModVersion
+	h2specRelease    = "https://github.com/summerwind/h2spec/releases/tag/v2.6.0"
 )
 
 // Tools installs external test tools (h2spec 2.6.0) and prints the version
@@ -104,9 +111,9 @@ func Tools() error {
 		}
 		fmt.Printf("h2spec: %s reports version %q, not %s; installing %s\n", path, v, h2specVersion, h2specVersion)
 	}
-	fmt.Printf("Installing h2spec %s: go install %s\n", h2specVersion, h2specModule)
+	fmt.Printf("Installing h2spec %s: go install %s\n", h2specVersion, h2specPkg)
 	ldflags := fmt.Sprintf("-ldflags=-X main.VERSION=%s -X main.COMMIT=%s", h2specVersion, h2specCommit)
-	if err := run("go", "install", ldflags, h2specModule); err != nil {
+	if err := run("go", "install", ldflags, h2specPkg); err != nil {
 		return fmt.Errorf("h2spec %s: go install failed (%w); download the release binary from %s and put it on PATH", h2specVersion, err, h2specRelease)
 	}
 	binDir, err := goBinDir()
@@ -121,6 +128,13 @@ func Tools() error {
 	if v := h2specVersionOf(installed); v != h2specVersion {
 		return fmt.Errorf("h2spec: %s reports version %q after the install, not %s; download the release binary from %s", installed, v, h2specVersion, h2specRelease)
 	}
+	built, err := h2specBuiltFrom(installed)
+	if err != nil {
+		return fmt.Errorf("h2spec: cannot read the build info of %s: %w", installed, err)
+	}
+	if want := h2specMod + "@" + h2specModVersion; built != want {
+		return fmt.Errorf("h2spec: %s was built from %s, not %s (the v%s commit); its version string is only the -ldflags stamp", installed, built, want, h2specVersion)
+	}
 	path, err := exec.LookPath("h2spec")
 	if err != nil {
 		return fmt.Errorf("h2spec %s is at %s, but %s is not on PATH, so TestH2Spec would skip; add it to PATH", h2specVersion, installed, binDir)
@@ -128,8 +142,28 @@ func Tools() error {
 	if v := h2specVersionOf(path); v != h2specVersion {
 		return fmt.Errorf("h2spec %s is at %s, but PATH finds %s (version %q) first; remove it or put %s first on PATH", h2specVersion, installed, path, v, binDir)
 	}
-	fmt.Printf("h2spec: %s at %s\n", h2specVersion, path)
+	if sameFile(path, installed) {
+		fmt.Printf("h2spec: %s at %s (built from %s)\n", h2specVersion, path, built)
+	} else {
+		fmt.Printf("h2spec: %s at %s, first on PATH (the install at %s is built from %s)\n", h2specVersion, path, installed, built)
+	}
 	return nil
+}
+
+func sameFile(a, b string) bool {
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(fa, fb)
+}
+
+// h2specBuiltFrom returns the main module path@version that a Go-built
+// binary records in its build info.
+func h2specBuiltFrom(path string) (string, error) {
+	bi, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return bi.Main.Path + "@" + bi.Main.Version, nil
 }
 
 // h2specVersionOf returns the version an h2spec binary reports

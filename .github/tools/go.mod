@@ -1,10 +1,13 @@
-// Versions of the Go tools CI and the repo's scripts run, kept out of the
-// celeris module so they add nothing to its dependency graph. Each is a
-// `tool` directive, pinned by go.sum and bumped by Dependabot
-// (.github/dependabot.yml); a workflow runs one with
-// `go tool -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod <name>`, and
-// .github/scripts/bench-ab.sh runs benchstat the same way (celeris#838).
+// Versions of the Go tools CI runs, kept out of the celeris module so they
+// add nothing to its dependency graph. Each is a `tool` directive, pinned by
+// go.sum and bumped by Dependabot (.github/dependabot.yml); a workflow runs
+// one with `go tool -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod <name>`.
 // This module is never imported or released (celeris#827).
+//
+// benchstat is here for .github/scripts/bench-ab.sh, which runs it the same
+// way (celeris#838). golang.org/x/perf has no tagged release, and Dependabot's
+// version updates propose tagged versions only, so that pin moves by hand:
+// `GOWORK=off go -C .github/tools get golang.org/x/perf@latest`.
 module celeris-ci-tools
 
 go 1.27.0

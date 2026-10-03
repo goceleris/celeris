@@ -50,6 +50,10 @@ updates:
     allow:
       - dependency-name: golang.org/x/vuln
         dependency-type: all
+      # benchstat (celeris#838). golang.org/x/perf has no tagged release and
+      # version updates propose tagged versions only, so this entry opens
+      # nothing until x/perf tags one; .github/tools/go.mod says how to bump
+      # it by hand meanwhile.
       - dependency-name: golang.org/x/perf
         dependency-type: all
     schedule:
