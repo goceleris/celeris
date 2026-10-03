@@ -35,4 +35,5 @@ type UIConfig struct, OAuth2 *OAuth2Config
 type UIConfig struct, OAuth2RedirectURL string
 type UIConfig struct, PersistAuthorization bool
 type UIConfig struct, Title string
+type UIConfig struct, ValidatorURL string
 type UIRenderer string
