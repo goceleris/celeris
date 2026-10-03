@@ -511,6 +511,7 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 						data := make([]byte, sendLen)
 						copy(data, buffered[:sendLen])
 						stream.windowSize.Add(-int32(sendLen))
+						p.manager.refundOutbound(sendLen) // celeris#893
 
 						if sendLen == len(buffered) {
 							stream.OutboundBuffer.Reset()
@@ -531,6 +532,9 @@ func (p *Processor) handleSettings(f *http2.SettingsFrame) error {
 				}
 			}
 			p.manager.mu.Unlock()
+			// The windows changed: a handler waiting for one re-checks
+			// (celeris#893).
+			p.manager.notifySendWindow()
 		case http2.SettingMaxFrameSize:
 			if s.Val < 16384 {
 				validationErr = fmt.Errorf("SETTINGS_MAX_FRAME_SIZE too small: %d", s.Val)
@@ -664,7 +668,13 @@ func (p *Processor) runHandler(stream *Stream) {
 		return
 	}
 
-	if p.canRunInline(stream) {
+	// celeris#893: while the connection holds OutboundBudget bytes of
+	// response DATA for the peer's window, a handler does not run inline. On
+	// the event loop it could not wait for room, and whatever the windows
+	// refused would be buffered on top; on the worker pool it sends what the
+	// windows allow and waits for the rest (TryBufferOutbound). Its stream is
+	// not held back: a response that fits the windows still goes out at once.
+	if p.canRunInline(stream) && !p.manager.overOutboundBudget() {
 		p.executeHandlerInline(stream)
 		return
 	}
@@ -1290,6 +1300,7 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		// ran the connection window to 0 would never resume and the response
 		// would hang.
 		p.flushConnWindowStalledStreams()
+		p.manager.notifySendWindow() // celeris#893
 		return nil
 	}
 
@@ -1323,6 +1334,9 @@ func (p *Processor) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 			break
 		}
 	}
+
+	// A pool handler waiting for this stream's window (celeris#893).
+	p.manager.notifySendWindow()
 
 	// Flush buffered outbound data now that per-stream window space is
 	// available (clamped + debited against the connection window too).
@@ -1379,6 +1393,7 @@ func (p *Processor) flushStreamOutbound(s *Stream) bool {
 	p.flush()
 
 	s.mu.Lock()
+	p.manager.refundOutbound(sendLen) // celeris#893
 	if sendLen == len(buffered) {
 		s.OutboundBuffer.Reset()
 		if isEnd {
@@ -1756,6 +1771,7 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			}
 		}
 		p.flushConnWindowStalledStreams()
+		p.manager.notifySendWindow() // celeris#893
 		return nil
 	}
 
@@ -1788,6 +1804,9 @@ func (p *Processor) HandleRawWindowUpdate(streamID uint32, payload []byte) error
 			break
 		}
 	}
+
+	// A pool handler waiting for this stream's window (celeris#893).
+	p.manager.notifySendWindow()
 
 	// Flush buffered outbound data now that per-stream window space is
 	// available (clamped + debited against the connection window too).

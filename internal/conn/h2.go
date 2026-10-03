@@ -152,6 +152,11 @@ func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
 			write(*buf)
 			putH2FrameBuf(buf)
 		}
+		// Drop the drained pointers: putH2FrameBuf does not pool a buffer
+		// past 8 KiB, and a pointer left in the spare array kept that buffer
+		// (a whole response's DATA) reachable until a later drain overwrote
+		// its slot (celeris#893).
+		clear(s.spare)
 		// Reclaim capacity if it grew beyond steady-state.
 		if cap(s.spare) > 64 {
 			s.spare = make([]*[]byte, 0, 16)

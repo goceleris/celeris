@@ -251,6 +251,11 @@ func (s *Stream) resetAndPool() {
 	}
 	s.rawBody = nil
 	if s.OutboundBuffer != nil {
+		// What is still buffered is dropped with the stream: give it back
+		// to the connection's budget (celeris#893).
+		if m := s.manager; m != nil {
+			m.refundOutbound(s.OutboundBuffer.Len())
+		}
 		s.OutboundBuffer.Reset()
 		bufferPool.Put(s.OutboundBuffer)
 		s.OutboundBuffer = nil
@@ -397,6 +402,9 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	}
 	s.rawBody = nil
 	if s.OutboundBuffer != nil {
+		if m := s.manager; m != nil {
+			m.refundOutbound(s.OutboundBuffer.Len()) // celeris#893
+		}
 		s.OutboundBuffer.Reset()
 	} else {
 		s.OutboundBuffer = getBuf()
@@ -599,8 +607,20 @@ func (s *Stream) SetHandlerStarted() {
 	s.handlerStarted.Store(true)
 }
 
-// BufferOutbound stores data that couldn't be sent due to flow control.
+// BufferOutbound stores data that couldn't be sent due to flow control, and
+// charges it to the connection's outbound budget (celeris#893). A handler on
+// the worker pool uses TryBufferOutbound, which waits for room instead of
+// buffering past the budget.
 func (s *Stream) BufferOutbound(data []byte, endStream bool) {
+	s.bufferOutbound(data, endStream)
+	if m := s.manager; m != nil {
+		m.chargeOutbound(len(data))
+	}
+}
+
+// bufferOutbound appends data to the stream's OutboundBuffer; the caller has
+// charged the budget for it.
+func (s *Stream) bufferOutbound(data []byte, endStream bool) {
 	s.mu.Lock()
 	if s.OutboundBuffer == nil {
 		s.OutboundBuffer = getBuf()
