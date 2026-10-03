@@ -739,9 +739,11 @@ jobs:
       # own and logs that process's output with a "child| " prefix, so the
       # tally counts this process's lines only: all three must PASS with no
       # SKIP line, and each child must print one RESULT line with threads
-      # pinned while its engine ran and none off the process mask after the
-      # stop. How many runs had a loop on the main thread, the only thread the
-      # fix's restore matters for, is printed and not enforced.
+      # pinned while its engine ran (some not the main thread), none off the
+      # process mask after the stop, and none of the pinned threads but the
+      # main thread still alive. How many runs had a loop on the main thread,
+      # the only thread the fix's restore matters for, is printed and not
+      # enforced.
       - name: celeris#905 stopped engines leave no thread pinned to one CPU (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
@@ -758,13 +760,13 @@ jobs:
           passed=$(grep -cE "^--- PASS: (${engines}|${adaptive}) \(" /tmp/c905.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c905.log || true)
           results=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) ' /tmp/c905.log || true)
-          clean=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) cycles=[0-9]+ process_mask=[0-9,-]+ pinned_while_running=[1-9][0-9]* main_thread_hosted_a_loop=[0-9]+ off_mask_after_stop=0 locked_probes=[1-9][0-9]* locked_off_mask=0$' /tmp/c905.log || true)
+          clean=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) cycles=[0-9]+ process_mask=[0-9,-]+ pinned_while_running=[1-9][0-9]* main_thread_hosted_a_loop=[0-9]+ off_mask_after_stop=0 locked_probes=[1-9][0-9]* locked_off_mask=0 pinned_not_main=[1-9][0-9]* alive_after_stop=0$' /tmp/c905.log || true)
           m0=$(grep -cE 'celeris905 RESULT .* main_thread_hosted_a_loop=[1-9]' /tmp/c905.log || true)
           echo "celeris#905 tests: want 3 PASS, passed $passed, SKIP lines $skipped, RESULT lines $results, clean $clean (want 3), a loop on the main thread in $m0, go test runs failed $failed (want 0)"
           if [ "$passed" -ne 3 ] || [ "$skipped" -ne 0 ] || [ "$results" -ne 3 ] || [ "$clean" -ne 3 ] || [ "$failed" -ne 0 ]; then
             echo "expected the three celeris#905 tests to PASS with no SKIP line, each child with one RESULT line"
-            echo "showing pinned threads while running and none off the mask after the stop -- was one renamed"
-            echo "or removed, did one skip or fail?"
+            echo "showing pinned threads while running, none off the mask after the stop, and no pinned thread"
+            echo "but the main thread left alive -- was one renamed or removed, did one skip or fail?"
             exit 1
           fi
 

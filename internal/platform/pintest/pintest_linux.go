@@ -320,12 +320,19 @@ const exitBound = 5 * time.Second
 //     every thread Go can schedule on, so none is left pinned to one CPU, and
 //     also the main thread once the runtime has parked it for good: Go never
 //     runs it again, but its mask is what /proc/<pid>/status and taskset -p
-//     report for the whole process; and
+//     report for the whole process;
+//   - every thread but the main thread that was pinned while the engine ran
+//     has left the process, within exitBound. A loop's goroutine exits locked
+//     to its thread, so the runtime ends the thread rather than hand it, and
+//     the other state the loop put on it, to the next goroutine; and
 //   - a goroutine that locks an OS thread afterwards sees that mask, on every
 //     thread the runtime can give it (LockedThreads).
 //
 // The engine must have pinned a thread while it ran (one per loop): a run in
-// which nothing was pinned checks nothing, and fails.
+// which nothing was pinned checks nothing, and fails. So does a run in which
+// every pinned thread was the main thread. With two or more cycles that cannot
+// happen to the fix: the runtime parks the main thread for good once a loop
+// has exited locked on it, so a later cycle's loops run on other threads.
 //
 // The fix's restore matters only for the main thread (every other loop
 // thread exits), and a loop runs on the main thread only in some runs: a run
@@ -361,7 +368,7 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 			len(off), base, off)
 	}
 	pid := os.Getpid()
-	var pinnedRunning, leftOff, lockedProbe, lockedOff, m0Hosted int
+	var pinnedRunning, leftOff, lockedProbe, lockedOff, m0Hosted, pinnedNotMain, leftAlive int
 	for cycle := 1; cycle <= cycles; cycle++ {
 		// The main thread counts as hosting a loop only if it had the
 		// process's mask when the cycle began, not if an earlier cycle left
@@ -376,16 +383,19 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 			stop()
 			t.Fatalf("cycle %d: census while running: %v", cycle, err)
 		}
-		var pinned []Thread
+		var pinned, notMain []Thread
 		for _, th := range Off(running, base) {
 			if th.Single() {
 				pinned = append(pinned, th)
-				if th.TID == pid && m0Before == base {
+				if th.TID != pid {
+					notMain = append(notMain, th)
+				} else if m0Before == base {
 					m0Hosted++
 				}
 			}
 		}
 		pinnedRunning += len(pinned)
+		pinnedNotMain += len(notMain)
 		t.Logf("cycle %d: %s engine running with %d loop(s); %d of %d threads pinned to one CPU: %v",
 			cycle, engine, loops, len(pinned), len(running), pinned)
 		if loops < 1 || len(pinned) < loops {
@@ -397,23 +407,31 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 
 		stop()
 
-		var off []Thread
+		var off, alive []Thread
 		for deadline := time.Now().Add(exitBound); ; {
 			after, err := Census()
 			if err != nil {
 				t.Fatalf("cycle %d: census after stop: %v", cycle, err)
 			}
-			if off = Off(after, base); len(off) == 0 || time.Now().After(deadline) {
+			off, alive = Off(after, base), stillThere(after, notMain)
+			if len(off)+len(alive) == 0 || time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		leftOff += len(off)
+		leftAlive += len(alive)
 		if len(off) > 0 {
 			t.Errorf("cycle %d: %v after the %s engine stopped, %d thread(s) of the process are still off "+
 				"its mask %s (the scheduler can run any goroutine on such a thread; a parked main thread "+
 				"makes the whole process read as pinned): %v",
 				cycle, exitBound, engine, len(off), base, off)
+		}
+		if len(alive) > 0 {
+			t.Errorf("cycle %d: %v after the %s engine stopped, %d of the %d thread(s) other than the main "+
+				"thread that were pinned while it ran are still threads of the process (a loop that unlocks "+
+				"its thread hands it, and the state the loop put on it, back to the scheduler): %v",
+				cycle, exitBound, engine, len(alive), len(notMain), alive)
 		}
 
 		threads, err := Census()
@@ -446,7 +464,26 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 			"leaves the main thread the process's mask (TestSaveThreadAffinityRestoresThePin covers Restore "+
 			"itself)", cycles)
 	}
+	if pinnedNotMain == 0 {
+		t.Errorf("premise: in %d cycle(s) every thread pinned while the %s engine ran was the main thread, so "+
+			"this run did not check that a stopped loop's thread leaves the process", cycles, engine)
+	}
 	t.Logf("celeris905 RESULT engine=%s cycles=%d process_mask=%s pinned_while_running=%d "+
-		"main_thread_hosted_a_loop=%d off_mask_after_stop=%d locked_probes=%d locked_off_mask=%d",
-		engine, cycles, base, pinnedRunning, m0Hosted, leftOff, lockedProbe, lockedOff)
+		"main_thread_hosted_a_loop=%d off_mask_after_stop=%d locked_probes=%d locked_off_mask=%d "+
+		"pinned_not_main=%d alive_after_stop=%d",
+		engine, cycles, base, pinnedRunning, m0Hosted, leftOff, lockedProbe, lockedOff, pinnedNotMain, leftAlive)
+}
+
+// stillThere returns the threads of want that are still among threads, by TID.
+func stillThere(threads, want []Thread) []Thread {
+	var out []Thread
+	for _, w := range want {
+		for _, th := range threads {
+			if th.TID == w.TID {
+				out = append(out, th)
+				break
+			}
+		}
+	}
+	return out
 }
