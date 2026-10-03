@@ -33,8 +33,12 @@ func (c *Context) Path() string { return c.path }
 // rewrites URLs (e.g. prefix stripping) before downstream handlers see the path.
 func (c *Context) SetPath(p string) { c.path = p }
 
-// FullPath returns the matched route pattern (e.g. "/users/:id").
-// Returns empty string if no route was matched.
+// FullPath returns the matched route pattern (e.g. "/users/:id"). For a
+// request no route matched, which the global middleware also sees, it is a
+// sentinel no pattern can be: "<unmatched>" for a 404,
+// "<method-not-allowed>" for a 405 and "<options>" for the automatic OPTIONS
+// answer. It is empty before routing (in [Server.Pre] middleware) and for a
+// Context that did not come through the router.
 func (c *Context) FullPath() string { return c.fullPath }
 
 // RawQuery returns the raw query string without the leading '?'.
