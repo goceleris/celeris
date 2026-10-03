@@ -110,7 +110,7 @@ type EngineMetrics struct {
 	// router's per-route async flags and exposed for diagnostics so
 	// operators can see how many handlers run on the per-conn dispatch
 	// goroutine vs inline on the worker. Zero on engines whose handler
-	// does not implement [github.com/goceleris/celeris/internal/protocol/h2/stream.AsyncRouteResolver].
+	// does not report per-route async flags (the celeris router does).
 	AsyncRoutes int
 	// AsyncPromotedConns is the cumulative number of connections that
 	// have been promoted from inline-on-worker to the per-conn dispatch
