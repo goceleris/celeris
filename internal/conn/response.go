@@ -721,7 +721,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			frameBuf := (*pooled)[:0]
 			// Room for what goes out now, the HEADERS and the DATA the
 			// windows took; not for the whole body (celeris#893).
-			estimatedSize := 9 + len(headerBlock) + h2DataFramesLen(sendLen, maxFrame)
+			estimatedSize := h2FrameBufSize(len(headerBlock), sendLen, maxFrame)
 			if cap(frameBuf) < estimatedSize {
 				frameBuf = make([]byte, 0, estimatedSize)
 			}
@@ -769,7 +769,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 
 	// Ensure capacity for what goes out now: the HEADERS and the DATA the
 	// windows took, not the whole body (celeris#893).
-	estimatedSize := 9 + len(headerBlock) + h2DataFramesLen(sendLen, maxFrame)
+	estimatedSize := h2FrameBufSize(len(headerBlock), sendLen, maxFrame)
 	if cap(frameBuf) < estimatedSize {
 		frameBuf = make([]byte, 0, estimatedSize)
 	}
@@ -793,12 +793,32 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 	return nil
 }
 
-// h2DataFramesLen is the size of n bytes of DATA framed by maxFrame.
+// maxH2FrameBufHint bounds the frame-buffer sizes computed up front: a
+// buffer past it is left to grow by append, so a size computation cannot
+// overflow whatever lengths it is given.
+const maxH2FrameBufHint = 1 << 30
+
+// h2DataFramesLen is the size of n bytes of DATA framed by maxFrame, or 0
+// (no up-front size) when n or maxFrame is out of range.
 func h2DataFramesLen(n int, maxFrame uint32) int {
-	if n <= 0 {
+	if n <= 0 || n > maxH2FrameBufHint || maxFrame == 0 || maxFrame > maxH2FrameBufHint {
 		return 0
 	}
-	return n + 9*((n+int(maxFrame)-1)/int(maxFrame))
+	return n + 9*((n-1)/int(maxFrame)+1)
+}
+
+// h2FrameBufSize is the capacity for a HEADERS block of headerLen bytes and
+// dataLen bytes of DATA framed by maxFrame: what goes out now, not the whole
+// body (celeris#893). 0 (no up-front size) when a length is out of range.
+func h2FrameBufSize(headerLen, dataLen int, maxFrame uint32) int {
+	if headerLen < 0 || headerLen > maxH2FrameBufHint {
+		return 0
+	}
+	d := h2DataFramesLen(dataLen, maxFrame)
+	if dataLen > 0 && d == 0 {
+		return 0
+	}
+	return 9 + headerLen + d
 }
 
 // stageBody appends to frameBuf the sendLen bytes of DATA the flow-control
