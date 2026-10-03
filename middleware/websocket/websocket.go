@@ -353,6 +353,11 @@ func setupConn(ws *Conn, cfg *Config, compress bool,
 // the engine keeps receiving WebSocket frames into (see captureQuery). After
 // Context.Detach they are copies (Detach copies the params), and clone is
 // false; on the hijack path clone is true and each value is cloned.
+//
+// The names are parsed from the pattern by the rule the router splits it
+// with (router_tree.go, splitPath and findSegmentEnd): ':' up to the next
+// '/', '*' to the end. Context has no accessor for its params' names, so a
+// change to that syntax must change this loop too.
 func captureParams(c *celeris.Context, clone bool) [][2]string {
 	pattern := c.FullPath()
 	var out [][2]string
