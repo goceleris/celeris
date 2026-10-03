@@ -29,7 +29,10 @@ const (
 	maxPendingBytes         = 4 << 20  // 4 MiB (H1)
 	maxPendingBytesDetached = 64 << 20 // 64 MiB (WS/SSE)
 	// maxPendingBytesH2 is the limit for an HTTP/2 connection. Its DATA is
-	// already bounded by the flow-control windows the peer grants, and a
+	// already bounded by the flow-control windows the peer grants (what the
+	// windows refuse waits in the streams' buffers, bounded per connection by
+	// stream.OutboundBudget, celeris#893; a StreamWriter response's is not
+	// yet, celeris#904), and a
 	// peer that reads keeps up to a window of frames queued behind the
 	// socket as a matter of course (net/http's client grants 4 MiB per
 	// stream, browsers more per connection), so the H1 limit refused, and
