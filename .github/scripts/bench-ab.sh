@@ -38,7 +38,10 @@
 # Environment: BENCHTIME (default 1s, as CodSpeed runs it), OUT (a directory
 # to keep the raw outputs in; it must not hold an earlier run's A.txt, B.txt
 # or A2.txt; default a temporary one, removed on exit).
-# Needs benchstat: go install golang.org/x/perf/cmd/benchstat@latest
+# benchstat is the one .github/tools/go.mod pins; `go tool` builds it on first
+# use, so there is nothing to install (celeris#838). GOWORK=off because go
+# refuses -modfile in workspace mode, which a contributor's go.work (.gitignore
+# lists it) turns on.
 set -euo pipefail
 
 if [ "$#" -lt 4 ]; then
@@ -47,9 +50,10 @@ if [ "$#" -lt 4 ]; then
 fi
 base=$1 head=$2 pkg=$3 re=$4 rounds=${5:-20}
 benchtime=${BENCHTIME:-1s}
-command -v benchstat > /dev/null || { echo "benchstat not found: go install golang.org/x/perf/cmd/benchstat@latest" >&2; exit 2; }
 
 repo=$(git rev-parse --show-toplevel)
+benchstat() { GOWORK=off go tool -modfile="$repo/.github/tools/go.mod" benchstat "$@"; }
+GOWORK=off go tool -modfile="$repo/.github/tools/go.mod" -n benchstat > /dev/null || { echo "cannot build benchstat from $repo/.github/tools/go.mod" >&2; exit 2; }
 tmp=$(mktemp -d)
 cleanup() {
   git -C "$repo" worktree remove --force "$tmp/a" 2> /dev/null || true

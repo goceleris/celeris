@@ -16,10 +16,12 @@ Thank you for your interest in contributing to celeris!
 - Go 1.27.0+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
   CI pins the same version. Quote it from there rather than restating it here, so the two
   cannot drift apart again.
-- [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@latest`
+- [Mage](https://magefile.org) build tool: `go install github.com/magefile/mage@v1.17.2`, the version CI
+  installs (`.github/workflows/ci.yml`)
 - Linux (for io_uring/epoll engine tests) or macOS (std engine only)
-- [golangci-lint](https://golangci-lint.run/) v2.9+
-- [h2spec](https://github.com/summerwind/h2spec) (installed automatically by `mage tools`)
+- [golangci-lint](https://golangci-lint.run/) v2.13, the version CI's lint job runs
+- [h2spec](https://github.com/summerwind/h2spec) 2.6.0: `mage tools` installs it and prints the version it
+  ended with
 
 ### Build & Test
 
