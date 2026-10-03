@@ -42,11 +42,13 @@ func autoOptions(c *Context) error {
 	return c.NoContent(200)
 }
 
-// newOptionsChain is the global middleware followed by autoOptions.
+// newOptionsChain is the global middleware followed by autoOptions, which
+// answers only if no middleware has (a CORS preflight's 204 is not answered
+// again: answerUnlessAnswered, celeris#852).
 func newOptionsChain(middleware []HandlerFunc) []HandlerFunc {
 	chain := make([]HandlerFunc, 0, len(middleware)+1)
 	chain = append(chain, middleware...)
-	return append(chain, autoOptions)
+	return append(chain, answerUnlessAnswered(autoOptions))
 }
 
 // buildUnmatchedChains builds the chains a request no route matches runs,
@@ -520,7 +522,7 @@ func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal str
 		c.bufferDepth = 1
 		_ = c.FlushResponse()
 	}
-	if !c.written && s.ResponseWriter != nil {
+	if !c.written && !c.detached && s.ResponseWriter != nil {
 		// A middleware returned without writing and without calling Next.
 		hdrs := make([][2]string, 0, len(c.respHeaders)+1)
 		hdrs = append(hdrs, c.respHeaders...)

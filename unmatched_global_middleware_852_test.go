@@ -300,3 +300,53 @@ func TestUnmatchedDetachedByMiddlewareNotAnswered852(t *testing.T) {
 		})
 	}
 }
+
+// TestAutoOptionsAfterAnsweringMiddleware852: the automatic OPTIONS answer
+// (celeris#421) is the same kind of chain end: a global middleware that answers
+// an OPTIONS request without calling Next (as cors does for a preflight) is not
+// answered again and the middleware above it gets nil from Next, and one that
+// takes the request over gets no response written for it.
+func TestAutoOptionsAfterAnsweringMiddleware852(t *testing.T) {
+	for _, shape := range []string{"answers", "detaches"} {
+		t.Run(shape, func(t *testing.T) {
+			var outerErrs []error
+			var done func()
+			s := New(Config{})
+			s.Use(func(c *Context) error {
+				err := c.Next()
+				outerErrs = append(outerErrs, err)
+				return err
+			})
+			s.Use(func(c *Context) error {
+				if c.Method() != "OPTIONS" {
+					return c.Next()
+				}
+				if shape == "detaches" {
+					done = c.Detach()
+					return nil
+				}
+				return c.NoContent(204)
+			})
+			s.GET("/hello", func(c *Context) error { return c.String(200, "hi") })
+			rws := serve852(t, s, "OPTIONS", "/hello")
+			if done != nil {
+				done()
+			}
+			for arm, rw := range rws {
+				want := 1
+				if shape == "detaches" {
+					want = 0
+				}
+				if len(rw.writes) != want {
+					t.Fatalf("%s: %d responses written, want %d: %+v", arm, len(rw.writes), want, rw.writes)
+				}
+				if want == 1 && rw.writes[0].status != 204 {
+					t.Errorf("%s: status %d, want the middleware's 204", arm, rw.writes[0].status)
+				}
+			}
+			if len(outerErrs) != 1 || outerErrs[0] != nil {
+				t.Errorf("the outermost middleware got %v from Next, want [<nil>]", outerErrs)
+			}
+		})
+	}
+}
