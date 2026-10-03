@@ -142,18 +142,23 @@ type driverConn struct {
 	// it (readOpen). Writers never take it.
 	rmu sync.Mutex
 
-	// recvMu serializes onRecv calls between the event-loop worker
-	// (handleReadable) and WriteAndPoll (caller goroutine). Without this,
-	// an in-flight handleReadable from a prior epoll_wait batch can race
-	// with WriteAndPoll's caller-side reads. Lock order: recvMu, then w.mu,
-	// then mu, then rmu; no path takes them in another order. The teardown
-	// paths never take recvMu: they run inside onRecv/onClose callbacks,
-	// which hold it.
+	// recvMu serializes onRecv calls between the event-loop worker's read
+	// turns (readTurn, for an event or for a turn the conn was queued for)
+	// and the WriteAndPoll* calls on the caller's goroutine. Without this, a
+	// read turn of the worker, for an event of a prior epoll_wait batch or a
+	// queued turn, could race with a WriteAndPoll* call's caller-side reads.
+	// A queued turn only tries the lock (serveReadQ). Lock order: recvMu,
+	// then w.mu, then mu, then rmu; no path takes them in another order. The
+	// teardown paths never take recvMu: they run inside onRecv/onClose
+	// callbacks, which hold it.
 	recvMu sync.Mutex
 
 	// readQueued is set while c is in the worker's readQ, and readEvents
-	// holds the event flags of the turn it is owed (worker goroutine only).
+	// holds the event flags of the turn it is owed. readFresh is set when an
+	// event of c collected while c is queued has been merged into that turn
+	// (see serveReadQ). Worker goroutine only.
 	readQueued bool
+	readFresh  bool
 	readEvents uint32
 }
 
@@ -174,6 +179,25 @@ var testHookBeforeAdd func(fd int)
 // event it drops because the event's registration has ended. Tests only
 // (celeris#842): set before the worker is created, cleared after Close.
 var testHookDroppedEvent func(fd int, events uint32)
+
+// testHookEpollWait, when non-nil, runs on the worker goroutine before each
+// epoll_wait, with the number of conns owed a read turn and the timeout the
+// worker is about to wait with. Tests only (celeris#881): set before the
+// worker is created, cleared after Close.
+var testHookEpollWait func(queued, timeoutMs int)
+
+// testHookQueuedTurnBusy, when non-nil, runs on the worker goroutine when a
+// conn's queued read turn finds the conn's recvMu held, before the worker
+// drops the turn or waits for the lock; fresh reports whether an event of the
+// conn was merged into the turn. Tests only (celeris#881): set before the
+// worker is created, cleared after Close.
+var testHookQueuedTurnBusy func(fd int, fresh bool)
+
+// testHookAfterRearm, when non-nil, runs in setEvents after the EPOLL_CTL_MOD
+// that re-arms EPOLLIN at the end of a WriteAndPoll* call, with the call's
+// recvMu still held and no other lock. Tests only (celeris#881): set before
+// the call, cleared after it returns.
+var testHookAfterRearm func(fd int)
 
 // readOpen reads c.fd into buf unless c has been torn down, in which case it
 // returns engine.ErrUnknownFD without reading. The closed check and the read
@@ -243,6 +267,11 @@ func (c *driverConn) setEvents(epfd int, in bool) {
 		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_MOD, c.fd, &e)
 	}
 	c.mu.Unlock()
+	if in {
+		if h := testHookAfterRearm; h != nil {
+			h(c.fd)
+		}
+	}
 }
 
 func newLoop(workers int) (*Loop, error) {
@@ -689,7 +718,9 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 	// TryLock-based alternative deadlocks: edge-triggered epoll
 	// delivers each edge exactly once, and a skip consumes the edge
 	// without draining, leaving the response stranded when the caller
-	// is already parked on doneCh waiting for it. The conn can be torn
+	// is already parked on doneCh waiting for it. (The worker's queued
+	// turns do skip a held recvMu, but only a turn that consumed no edge:
+	// see serveReadQ.) The conn can be torn
 	// down while we wait for recvMu, and another conn can register its
 	// number: setEvents then masks nothing, so the mask cannot land on
 	// that conn (celeris#784).
@@ -1203,6 +1234,9 @@ func (w *worker) run(ctx context.Context) {
 		if len(w.readQ) > 0 {
 			timeout = 0 // a conn is owed a read turn: collect what is ready, do not wait
 		}
+		if h := testHookEpollWait; h != nil {
+			h(len(w.readQ), timeout)
+		}
 		n, err := unix.EpollWait(w.epollFD, w.events, timeout)
 		if err != nil {
 			if err == syscall.EINTR {
@@ -1277,6 +1311,7 @@ func (w *worker) connFor(fd int, gen uint32) *driverConn {
 func (w *worker) handleReadable(c *driverConn, events uint32) {
 	if c.readQueued {
 		c.readEvents |= events
+		c.readFresh = true
 		return
 	}
 	w.readTurn(c, events)
@@ -1286,6 +1321,18 @@ func (w *worker) handleReadable(c *driverConn, events uint32) {
 // round's batch, the read turn they are owed. The conns queued during the
 // batch stay queued for the next round, and so does a conn that uses up its
 // budget again: each backlogged conn gets one turn per round.
+//
+// A queued turn does not wait for a WriteAndPoll* call that holds the conn's
+// recvMu: every other conn on the worker would wait with it, for up to the
+// call's whole poll loop (about 50 ms for WriteAndPollMulti). The worker
+// drops the turn instead. The call reads the conn until EAGAIN, and the
+// EPOLL_CTL_MOD that re-arms EPOLLIN at its end makes epoll report whatever
+// is left (bytes, EOF, a hang-up) as a new event, which dispatch serves. A
+// turn that an event of this round's batch was merged into is not dropped:
+// that event may be the re-arm's own report, collected before the call let
+// go of recvMu, and no other event would come for the bytes it reports. That
+// turn waits for recvMu, as dispatch does for an event of a conn that is not
+// queued (celeris#931).
 func (w *worker) serveReadQ(owed int) {
 	if owed == 0 {
 		return
@@ -1294,9 +1341,19 @@ func (w *worker) serveReadQ(owed int) {
 	w.readQ = append(w.readQNext[:0], q[owed:]...)
 	for i, c := range q[:owed] {
 		q[i] = nil
-		events := c.readEvents
-		c.readQueued, c.readEvents = false, 0
-		w.readTurn(c, events)
+		events, fresh := c.readEvents, c.readFresh
+		c.readQueued, c.readFresh, c.readEvents = false, false, 0
+		if !c.recvMu.TryLock() {
+			if h := testHookQueuedTurnBusy; h != nil {
+				h(c.fd, fresh)
+			}
+			if !fresh {
+				continue
+			}
+			c.recvMu.Lock()
+		}
+		w.readTurnLocked(c, events)
+		c.recvMu.Unlock()
 	}
 	clear(q[owed:])
 	w.readQNext = q[:0]
@@ -1311,6 +1368,11 @@ func (w *worker) readTurn(c *driverConn, events uint32) {
 	// state machine (driven by onRecv) is never entered concurrently.
 	c.recvMu.Lock()
 	defer c.recvMu.Unlock()
+	w.readTurnLocked(c, events)
+}
+
+// readTurnLocked is readTurn with c.recvMu held by the caller.
+func (w *worker) readTurnLocked(c *driverConn, events uint32) {
 	// Edge-triggered epoll delivers exactly one edge per "not readable" →
 	// "readable" transition. We MUST drain to EAGAIN; stopping early (e.g.
 	// on a short read) leaves bytes in the kernel buffer and, crucially,
@@ -1327,7 +1389,7 @@ func (w *worker) readTurn(c *driverConn, events uint32) {
 	// does not finish this event's EPOLLRDHUP teardown either (celeris#784).
 	for reads := 0; ; reads++ {
 		if reads == readBudget {
-			c.readQueued, c.readEvents = true, events
+			c.readQueued, c.readFresh, c.readEvents = true, false, events
 			w.readQ = append(w.readQ, c)
 			return
 		}
