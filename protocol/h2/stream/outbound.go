@@ -156,7 +156,7 @@ func (s *Stream) TryBufferOutbound(data []byte, endStream bool) bool {
 // grants window a few bytes at a time cannot stretch it.
 //
 // It holds no lock while it waits, and the deadline needs nothing on the
-// event loop to fire: a timer ends the wait. On the native engines the loop
+// event loop to fire: a timer (time.AfterFunc) ends the wait. On the native engines the loop
 // may be the thing waiting (a sync handler blocked on a lock this handler
 // holds, or on a coalesced call it leads), and then it cannot process the
 // WINDOW_UPDATE, the reset or the close that would end the wait. The
@@ -173,19 +173,10 @@ func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 	if s.IsCancelled() {
 		return context.Canceled
 	}
-	var expired <-chan time.Time
-	if !deadline.IsZero() {
-		d := time.Until(deadline)
-		if d <= 0 {
-			return os.ErrDeadlineExceeded
-		}
-		if open() {
-			return nil
-		}
-		t := time.NewTimer(d)
-		defer t.Stop()
-		expired = t.C
-	} else if open() {
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return os.ErrDeadlineExceeded
+	}
+	if open() {
 		return nil
 	}
 	done := s.Context().Done()
@@ -194,10 +185,27 @@ func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 	// channel it holds) or granted before the re-check (which sees it).
 	m.sendWindowWaiters.Add(1)
 	defer m.sendWindowWaiters.Add(-1)
+	// The deadline is not a select case: a waiter would then re-arm a
+	// runtime timer every time a WINDOW_UPDATE wakes it, and every waiter
+	// of the connection wakes on each one. The timer instead sets expired
+	// and wakes the waiters once, like a WINDOW_UPDATE; the loop below took
+	// its channel before it checks expired, so that wakeup is not lost.
+	var expired *atomic.Bool
+	if !deadline.IsZero() {
+		expired = new(atomic.Bool)
+		t := time.AfterFunc(time.Until(deadline), func() {
+			expired.Store(true)
+			m.notifySendWindow()
+		})
+		defer t.Stop()
+	}
 	for {
 		ch := m.sendWindowChan()
 		if s.IsCancelled() {
 			return context.Canceled
+		}
+		if expired != nil && expired.Load() {
+			return os.ErrDeadlineExceeded
 		}
 		if open() {
 			return nil
@@ -206,8 +214,6 @@ func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 		case <-ch:
 		case <-done:
 			return context.Canceled
-		case <-expired:
-			return os.ErrDeadlineExceeded
 		}
 	}
 }
