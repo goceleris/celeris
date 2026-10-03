@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // runWithClient spins up the SSE handler with a no-op stream backing and
@@ -225,7 +225,7 @@ func TestBrokerSlowSubscriberDropPolicy(t *testing.T) {
 func startDelayedClient(t *testing.T, delay time.Duration) (slow *Client, cleanup func()) {
 	t.Helper()
 	ctx, _ := celeristest.NewContextT(t, "GET", "/events")
-	s := celeris.TestStream(ctx)
+	s := testhooks.Stream(ctx)
 	s.ResponseWriter = &delayStreamer{delay: delay}
 
 	ready := make(chan *Client, 1)

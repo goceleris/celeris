@@ -8,6 +8,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // The cost of Adapt on epoll and io_uring when nothing read a header before
@@ -77,9 +78,9 @@ func BenchmarkAdaptHeadersBuilt742(b *testing.B) {
 	s.MaterializeHeaders()
 	b.ReportAllocs()
 	for b.Loop() {
-		c := celeris.AcquireTestContext(s)
+		c := testhooks.AcquireContext(s).(*celeris.Context)
 		_ = h(c)
-		celeris.ReleaseTestContext(c)
+		testhooks.ReleaseContext(c)
 	}
 }
 
@@ -89,9 +90,9 @@ func BenchmarkAdaptHeadersLazy742(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		restore()
-		c := celeris.AcquireTestContext(s)
+		c := testhooks.AcquireContext(s).(*celeris.Context)
 		_ = h(c)
-		celeris.ReleaseTestContext(c)
+		testhooks.ReleaseContext(c)
 	}
 }
 

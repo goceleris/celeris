@@ -9,6 +9,7 @@ import (
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
 	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // gatedStreamer is a mockStreamer variant whose Write+Flush can be paused
@@ -88,7 +89,7 @@ func newGatedContext(t *testing.T) (*celeris.Context, *gatedStreamer) {
 	t.Helper()
 	ctx, _ := celeristest.NewContextT(t, "GET", "/events")
 	g := newGatedStreamer()
-	s := celeris.TestStream(ctx)
+	s := testhooks.Stream(ctx)
 	s.ResponseWriter = g
 	return ctx, g
 }
