@@ -14,9 +14,10 @@ import (
 // escaper, so every interpolated configuration value is escaped for the
 // exact context it lands in — RCDATA for <title>, URL attribute for href /
 // src / data-url (percent-normalised, then HTML-escaped; non-http(s)
-// schemes are neutralised), plain attribute for data-configuration, and a
-// JSON string literal (with '<', '>', '&', U+2028 and U+2029 escaped, so it
-// cannot close the enclosing <script> block) for values inside <script>.
+// schemes are neutralised), plain attribute for data-configuration and
+// integrity, and a JSON string literal (with '<', '>', '&', U+2028 and
+// U+2029 escaped, so it cannot close the enclosing <script> block) for
+// values inside <script>.
 // Bool and int literals are passed as template.JS so html/template does
 // not pad them with spaces; they are never configuration strings.
 var (
@@ -26,12 +27,12 @@ var (
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}}</title>
-<link rel="stylesheet" href="{{.CSSURL}}">
+<link rel="stylesheet" href="{{.CSS.URL}}"{{if .CSS.Integrity}} integrity="{{.CSS.Integrity}}" crossorigin="anonymous"{{end}}>
 </head>
 <body>
 <div id="swagger-ui"></div>
-<script src="{{.BundleURL}}"></script>
-<script src="{{.PresetURL}}"></script>
+<script src="{{.Bundle.URL}}"{{if .Bundle.Integrity}} integrity="{{.Bundle.Integrity}}" crossorigin="anonymous"{{end}}></script>
+<script src="{{.Preset.URL}}"{{if .Preset.Integrity}} integrity="{{.Preset.Integrity}}" crossorigin="anonymous"{{end}}></script>
 <script>
 const ui = SwaggerUIBundle({
   url: {{.SpecURL}},
@@ -58,7 +59,7 @@ ui.initOAuth({ {{- range $i, $p := .OAuth2}}{{if $i}}, {{end}}{{$p.Key}}: {{$p.V
 </head>
 <body>
 <script id="api-reference" data-url="{{.SpecURL}}" data-configuration='{{.Configuration}}'></script>
-<script src="{{.ScriptURL}}"></script>
+<script src="{{.Script.URL}}"{{if .Script.Integrity}} integrity="{{.Script.Integrity}}" crossorigin="anonymous"{{end}}></script>
 </body>
 </html>`))
 
@@ -71,7 +72,7 @@ ui.initOAuth({ {{- range $i, $p := .OAuth2}}{{if $i}}, {{end}}{{$p.Key}}: {{$p.V
 </head>
 <body>
 <div id="redoc-container"></div>
-<script src="{{.ScriptURL}}"></script>
+<script src="{{.Script.URL}}"{{if .Script.Integrity}} integrity="{{.Script.Integrity}}" crossorigin="anonymous"{{end}}></script>
 <script>
 Redoc.init({{.SpecURL}}, {{.Options}}, document.getElementById("redoc-container"));
 </script>
@@ -92,9 +93,9 @@ type jsProp struct {
 // swaggerUIPage is the data for swaggerUITmpl.
 type swaggerUIPage struct {
 	Title                    string
-	CSSURL                   string
-	BundleURL                string
-	PresetURL                string
+	CSS                      assetRef
+	Bundle                   assetRef
+	Preset                   assetRef
 	SpecURL                  string
 	DocExpansion             string
 	DeepLinking              template.JS
@@ -110,15 +111,15 @@ type scalarPage struct {
 	Title         string
 	SpecURL       string
 	Configuration string
-	ScriptURL     string
+	Script        assetRef
 }
 
 // redocPage is the data for redocTmpl.
 type redocPage struct {
-	Title     string
-	ScriptURL string
-	SpecURL   string
-	Options   map[string]any
+	Title   string
+	Script  assetRef
+	SpecURL string
+	Options map[string]any
 }
 
 // marshalOptions serializes the Options map to a JSON string for embedding
@@ -171,6 +172,15 @@ func New(config ...Config) celeris.HandlerFunc {
 
 	page := buildPage(cfg, specURL)
 
+	// The embedded Swagger UI files are served only when the page loads
+	// them; with AssetsPath or CDN their paths pass through.
+	var assets map[string]embeddedAsset
+	var assetsPrefix string
+	if cfg.Renderer == RendererSwaggerUI && cfg.AssetsPath == "" && !cfg.CDN {
+		assets = embeddedAssetRoutes(basePath)
+		assetsPrefix = embeddedAssetsPrefix(basePath) + "/"
+	}
+
 	var skip celeris.SkipHelper
 	skip.Init(cfg.SkipPaths, cfg.Skip)
 
@@ -181,8 +191,24 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		path := c.Path()
 
-		if path != basePath && path != uiPath && path != specPath {
+		// Every path this middleware answers starts with basePath, so a
+		// request outside it passes on one prefix test.
+		if !strings.HasPrefix(path, basePath) {
 			return c.Next()
+		}
+
+		var asset embeddedAsset
+		if path != basePath && path != uiPath && path != specPath {
+			// A request that only shares basePath (with BasePath "/",
+			// every request) passes on the assets prefix test, before
+			// the map lookup hashes its path.
+			if assets == nil || !strings.HasPrefix(path, assetsPrefix) {
+				return c.Next()
+			}
+			var ok bool
+			if asset, ok = assets[path]; !ok {
+				return c.Next()
+			}
 		}
 
 		method := c.Method()
@@ -202,7 +228,8 @@ func New(config ...Config) celeris.HandlerFunc {
 			return c.Blob(200, specContentType, cfg.SpecContent)
 		}
 
-		return c.Next()
+		c.SetHeader("cache-control", assetCacheControl)
+		return c.Blob(200, asset.contentType, asset.body)
 	}
 }
 
@@ -226,16 +253,13 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		depth = *ui.DefaultModelsExpandDepth
 	}
 
-	assets := "https://unpkg.com/swagger-ui-dist@5"
-	if cfg.AssetsPath != "" {
-		assets = strings.TrimRight(cfg.AssetsPath, "/")
-	}
+	css, bundle, preset := swaggerUIRefs(cfg)
 
 	data := swaggerUIPage{
 		Title:                    ui.Title,
-		CSSURL:                   assets + "/swagger-ui.css",
-		BundleURL:                assets + "/swagger-ui-bundle.js",
-		PresetURL:                assets + "/swagger-ui-standalone-preset.js",
+		CSS:                      css,
+		Bundle:                   bundle,
+		Preset:                   preset,
 		SpecURL:                  specURL,
 		DocExpansion:             ui.DocExpansion,
 		DeepLinking:              template.JS(strconv.FormatBool(ui.DeepLinking)),
@@ -272,16 +296,11 @@ func buildScalarPage(cfg Config, specURL string) string {
 		scalarOpts = map[string]any{"theme": "default"}
 	}
 
-	scriptURL := "https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"
-	if cfg.AssetsPath != "" {
-		scriptURL = strings.TrimRight(cfg.AssetsPath, "/") + "/standalone.min.js"
-	}
-
 	return renderPage(scalarTmpl, scalarPage{
 		Title:         cfg.UI.Title,
 		SpecURL:       specURL,
 		Configuration: marshalOptions(scalarOpts),
-		ScriptURL:     scriptURL,
+		Script:        scalarRef(cfg),
 	})
 }
 
@@ -293,15 +312,10 @@ func buildReDocPage(cfg Config, specURL string) string {
 		opts = map[string]any{}
 	}
 
-	scriptURL := "https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"
-	if cfg.AssetsPath != "" {
-		scriptURL = strings.TrimRight(cfg.AssetsPath, "/") + "/redoc.standalone.js"
-	}
-
 	return renderPage(redocTmpl, redocPage{
-		Title:     cfg.UI.Title,
-		ScriptURL: scriptURL,
-		SpecURL:   specURL,
-		Options:   opts,
+		Title:   cfg.UI.Title,
+		Script:  redocRef(cfg),
+		SpecURL: specURL,
+		Options: opts,
 	})
 }

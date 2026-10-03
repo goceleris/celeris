@@ -192,6 +192,7 @@ func TestScalarRenderer(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererScalar,
+		CDN:         true,
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
@@ -207,6 +208,7 @@ func TestScalarRendererWithTitle(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererScalar,
+		CDN:         true,
 		UI: UIConfig{
 			Title: "My Scalar API",
 		},
@@ -248,13 +250,25 @@ func TestAssetsPathScalar(t *testing.T) {
 	assertNotContains(t, body, "cdn.jsdelivr.net")
 }
 
-func TestDefaultCDNUsed(t *testing.T) {
+func TestDefaultEmbeddedAssetsUsed(t *testing.T) {
 	t.Parallel()
 	mw := New(Config{SpecContent: jsonSpec})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, "unpkg.com/swagger-ui-dist@5")
+	assertContains(t, body, `src="assets/swagger-ui-dist@`+SwaggerUIVersion+`/swagger-ui-bundle.js"`)
+	assertNotContains(t, body, "unpkg.com")
+	assertNotContains(t, body, "cdn.jsdelivr.net")
+}
+
+func TestCDNOptIn(t *testing.T) {
+	t.Parallel()
+	mw := New(Config{SpecContent: jsonSpec, CDN: true})
+	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
+	testutil.AssertNoError(t, err)
+	body := rec.BodyString()
+	assertContains(t, body, `src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@`+SwaggerUIVersion+`/swagger-ui-bundle.js"`)
+	assertNotContains(t, body, "assets/swagger-ui-dist@")
 }
 
 func TestAssetsPathTrailingSlash(t *testing.T) {
@@ -482,6 +496,7 @@ func TestReDocRenderer(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
@@ -498,6 +513,7 @@ func TestReDocRendererWithTitle(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 		UI:          UIConfig{Title: "ReDoc API"},
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
@@ -578,6 +594,7 @@ func TestReDocOptionsTheme(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 		Options: map[string]any{
 			"theme": map[string]any{
 				"colors": map[string]any{"primary": map[string]any{"main": "#32329f"}},
@@ -598,6 +615,7 @@ func TestReDocOptionsExpandResponses(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 		Options: map[string]any{
 			"expandResponses": "200,201",
 		},
@@ -613,6 +631,7 @@ func TestReDocOptionsHideDownloadButton(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 		Options: map[string]any{
 			"hideDownloadButton": true,
 		},
@@ -628,6 +647,7 @@ func TestReDocOptionsScrollYOffset(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 		Options: map[string]any{
 			"scrollYOffset": 100,
 		},
@@ -643,6 +663,7 @@ func TestReDocOptionsNoAutoAuth(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 		Options: map[string]any{
 			"noAutoAuth": true,
 		},
@@ -658,6 +679,7 @@ func TestReDocDefaultOptions(t *testing.T) {
 	mw := New(Config{
 		SpecContent: jsonSpec,
 		Renderer:    RendererReDoc,
+		CDN:         true,
 	})
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)

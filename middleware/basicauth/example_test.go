@@ -1,6 +1,8 @@
 package basicauth_test
 
 import (
+	"fmt"
+
 	"github.com/goceleris/celeris"
 
 	"github.com/goceleris/celeris/middleware/basicauth"
@@ -40,16 +42,16 @@ func ExampleNew_hashedUsers() {
 }
 
 func ExampleVerifyPassword() {
-	// Migrating a store that still holds legacy HashPassword digests:
-	// VerifyPassword accepts both formats, so entries can be re-hashed one
-	// at a time.
-	_ = basicauth.New(basicauth.Config{
-		HashedUsers: map[string]string{
-			"admin":  basicauth.HashPasswordPBKDF2("secret"),
-			"legacy": "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b", // sha256("secret")
-		},
-		HashedUsersFunc: basicauth.VerifyPassword,
-	})
+	// VerifyPassword checks a password against a HashPasswordPBKDF2 string
+	// in constant time. New wires it in when every HashedUsers entry is
+	// pbkdf2-sha256; call it directly to check a credential outside the
+	// middleware.
+	stored := basicauth.HashPasswordPBKDF2("secret")
+	fmt.Println(basicauth.VerifyPassword(stored, "secret"))
+	fmt.Println(basicauth.VerifyPassword(stored, "wrong"))
+	// Output:
+	// true
+	// false
 }
 
 func ExampleNew_contextValidator() {

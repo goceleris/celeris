@@ -4,7 +4,6 @@ import (
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,8 +19,8 @@ import (
 // --- HashPasswordPBKDF2 / VerifyPassword (celeris#503) ---
 //
 // Every VerifyPassword call costs one 600k-iteration derivation (~0.2s
-// native, seconds under -race) — legacy digests, "" and malformed input
-// included, by design — so the tests share one pre-computed hash where the
+// native, seconds under -race) — bare SHA-256 digests, "" and malformed
+// input included, by design — so the tests share one pre-computed hash where the
 // salt does not matter, keep their case tables tight, probe the parser
 // window directly where a derivation would prove nothing extra, and run in
 // parallel. TestVerifyPasswordCostUniform is the deliberate exception: it
@@ -274,36 +273,9 @@ func TestVerifyPasswordWindowEdges(t *testing.T) {
 	})
 }
 
-func TestVerifyPasswordLegacySHA256(t *testing.T) {
-	t.Parallel()
-	legacy := HashPassword("secret")
-	// HashPassword's behaviour is unchanged: still the plain hex digest.
-	if _, err := hex.DecodeString(legacy); err != nil || len(legacy) != 64 {
-		t.Fatalf("HashPassword output changed: %q", legacy)
-	}
-	cases := []struct {
-		name, hash, pass string
-		want             bool
-	}{
-		{"valid", legacy, "secret", true},
-		{"wrong password", legacy, "wrong", false},
-		{"upper-case hex", strings.ToUpper(legacy), "secret", true}, // hex is case-insensitive
-		{"truncated", legacy[:63], "secret", false},
-		{"too long", legacy + "00", "secret", false},
-		{"not hex", "zz" + legacy[2:], "secret", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel() // every legacy verification burns a default-cost derivation
-			if got := VerifyPassword(tc.hash, tc.pass); got != tc.want {
-				t.Fatalf("VerifyPassword(%q, %q) = %v, want %v", tc.hash, tc.pass, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestVerifyPasswordCostUniform pins the HashedUsersFunc contract for the
-// built-in verifier: a legacy digest, an empty hash (what callers pass for
+// built-in verifier: a bare SHA-256 digest (the format of the removed
+// HashPassword, now rejected), an empty hash (what callers pass for
 // unknown users) and a hostile out-of-window pbkdf2 string must all cost
 // about one default derivation, the same as a genuine pbkdf2-sha256 entry.
 // Before the legacy path burned a derivation, "" and hex digests returned
@@ -320,7 +292,7 @@ func TestVerifyPasswordCostUniform(t *testing.T) {
 	h := secretHash()
 	parts := strings.Split(h, "$")
 	hostile := parts[0] + "$2147483647$" + parts[2] + "$" + parts[3]
-	legacy := HashPassword("secret")
+	bare := sha256Hex("secret")
 
 	measure := func(hash string, want bool) time.Duration {
 		start := time.Now()
@@ -333,7 +305,7 @@ func TestVerifyPasswordCostUniform(t *testing.T) {
 	}
 	samples := map[string]time.Duration{
 		"pbkdf2":        measure(h, true),
-		"legacy":        measure(legacy, true),
+		"bare sha-256":  measure(bare, false),
 		"empty":         measure("", false),
 		"hostile count": measure(hostile, false),
 	}
@@ -389,18 +361,18 @@ func TestHashedUsersPBKDF2Default(t *testing.T) {
 	}
 }
 
-// Legacy sha256 hashes (or anything else) without a HashedUsersFunc must
+// Bare SHA-256 digests (or anything else) without a HashedUsersFunc must
 // still panic — the default is only safe when every hash is a slow KDF.
 func TestHashedUsersLegacyWithoutFuncStillPanics(t *testing.T) {
 	t.Parallel()
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic: mixed legacy sha256 + pbkdf2 store without HashedUsersFunc")
+			t.Fatal("expected panic: mixed bare sha256 + pbkdf2 store without HashedUsersFunc")
 		}
 	}()
 	New(Config{HashedUsers: map[string]string{
 		"admin": secretHash(),
-		"old":   HashPassword("legacy"),
+		"old":   sha256Hex("legacy"),
 	}})
 }
 
@@ -439,40 +411,6 @@ func TestHashedUsersOutOfWindowPBKDF2Panics(t *testing.T) {
 	}
 }
 
-// Mixed stores migrate incrementally: VerifyPassword accepts both formats.
-func TestHashedUsersVerifyPasswordMixedStore(t *testing.T) {
-	t.Parallel()
-	mw := New(Config{
-		HashedUsers: map[string]string{
-			"new": secretHash(),
-			"old": HashPassword("legacy"),
-		},
-		HashedUsersFunc: VerifyPassword,
-	})
-	for _, tt := range []struct {
-		name, user, pass string
-		wantCode         int
-	}{
-		{"pbkdf2 entry", "new", "secret", 200},
-		{"legacy entry", "old", "legacy", 200},
-		{"pbkdf2 entry wrong password", "new", "legacy", 401},
-		{"legacy entry wrong password", "old", "secret", 401},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			handler := func(c *celeris.Context) error { return c.String(200, "ok") }
-			rec, err := testutil.RunChain(t, []celeris.HandlerFunc{mw, handler}, "GET", "/",
-				celeristest.WithBasicAuth(tt.user, tt.pass))
-			if tt.wantCode == 200 {
-				testutil.AssertNoError(t, err)
-				testutil.AssertStatus(t, rec, 200)
-			} else {
-				testutil.AssertHTTPError(t, err, tt.wantCode)
-			}
-		})
-	}
-}
-
 // pickDummyHash prefers a pbkdf2-sha256 entry and otherwise breaks ties on
 // username, so the unknown-user path never depends on map-iteration order.
 // Repeated because a single map walk could hit the right order by luck.
@@ -483,12 +421,12 @@ func TestPickDummyHash(t *testing.T) {
 		t.Fatalf("pickDummyHash(nil) = %q, want \"\"", got)
 	}
 	for range 16 {
-		mixed := map[string]string{"a": HashPassword("a"), "m": pb, "z": HashPassword("z")}
+		mixed := map[string]string{"a": sha256Hex("a"), "m": pb, "z": sha256Hex("z")}
 		if got := pickDummyHash(mixed); got != pb {
 			t.Fatalf("mixed store: pickDummyHash = %q, want the pbkdf2-sha256 entry", got)
 		}
-		legacyOnly := map[string]string{"zed": HashPassword("z"), "amy": HashPassword("a"), "bob": HashPassword("b")}
-		if got := pickDummyHash(legacyOnly); got != HashPassword("a") {
+		legacyOnly := map[string]string{"zed": sha256Hex("z"), "amy": sha256Hex("a"), "bob": sha256Hex("b")}
+		if got := pickDummyHash(legacyOnly); got != sha256Hex("a") {
 			t.Fatalf("legacy-only store: pickDummyHash = %q, want the entry of the smallest username", got)
 		}
 	}
@@ -507,9 +445,9 @@ func TestHashedUsersUnknownUserDummyPrefersPBKDF2(t *testing.T) {
 		var seen string
 		mw := New(Config{
 			HashedUsers: map[string]string{
-				"old1": HashPassword("a"),
-				"old2": HashPassword("b"),
-				"old3": HashPassword("c"),
+				"old1": sha256Hex("a"),
+				"old2": sha256Hex("b"),
+				"old3": sha256Hex("c"),
 				"new":  pb,
 			},
 			HashedUsersFunc: func(hash, _ string) bool { seen = hash; return false },

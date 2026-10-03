@@ -1515,42 +1515,6 @@ func TestParamDefault(t *testing.T) {
 	}
 }
 
-func TestFormValueOkDeprecated(t *testing.T) {
-	body := "name=alice&empty="
-	s, _ := newTestStream("POST", "/form")
-	s.Headers = append(s.Headers, [2]string{"content-type", "application/x-www-form-urlencoded"})
-	s.GetBuf().Write([]byte(body))
-	defer s.Release()
-
-	c := acquireContext(s)
-	defer releaseContext(c)
-
-	// FormValueOk (deprecated) should return the same results as FormValueOK.
-	v1, ok1 := c.FormValueOK("name")
-	v2, ok2 := c.FormValueOk("name")
-	if v1 != v2 || ok1 != ok2 {
-		t.Fatalf("FormValueOk != FormValueOK: (%q,%v) vs (%q,%v)", v1, ok1, v2, ok2)
-	}
-	if !ok1 || v1 != "alice" {
-		t.Fatalf("expected (alice, true), got (%s, %v)", v1, ok1)
-	}
-
-	v1, ok1 = c.FormValueOK("empty")
-	v2, ok2 = c.FormValueOk("empty")
-	if v1 != v2 || ok1 != ok2 {
-		t.Fatalf("FormValueOk != FormValueOK for empty: (%q,%v) vs (%q,%v)", v1, ok1, v2, ok2)
-	}
-
-	_, ok1 = c.FormValueOK("missing")
-	_, ok2 = c.FormValueOk("missing")
-	if ok1 != ok2 {
-		t.Fatalf("FormValueOk != FormValueOK for missing: %v vs %v", ok1, ok2)
-	}
-	if ok1 {
-		t.Fatal("expected missing field to return false")
-	}
-}
-
 func TestContextProtocolH2(t *testing.T) {
 	s, _ := newTestStream("GET", "/test")
 	defer s.Release()

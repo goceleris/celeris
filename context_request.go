@@ -551,13 +551,6 @@ func (c *Context) FormValueOK(name string) (string, bool) {
 	return vs[0], true
 }
 
-// FormValueOk is a deprecated alias for [Context.FormValueOK].
-//
-// Deprecated: Use [Context.FormValueOK] instead.
-func (c *Context) FormValueOk(name string) (string, bool) {
-	return c.FormValueOK(name)
-}
-
 // FormValues returns all values for the named form field.
 func (c *Context) FormValues(name string) []string {
 	if err := c.parseForm(); err != nil {

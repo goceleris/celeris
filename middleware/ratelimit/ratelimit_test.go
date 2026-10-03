@@ -470,15 +470,17 @@ func TestDisableHeadersOnDeny(t *testing.T) {
 	}
 }
 
-func TestLimitReachedCallback(t *testing.T) {
+func TestErrorHandlerCallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	called := false
+	var gotErr error
 	mw := New(Config{
 		RPS:   0.001,
 		Burst: 1,
-		LimitReached: func(c *celeris.Context) error {
+		ErrorHandler: func(c *celeris.Context, err error) error {
 			called = true
+			gotErr = err
 			return c.String(429, "custom rate limit response")
 		},
 		CleanupInterval: time.Hour,
@@ -490,13 +492,16 @@ func TestLimitReachedCallback(t *testing.T) {
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/", celeristest.WithHeader("x-forwarded-for", "1.2.3.4"))
 	testutil.AssertNoError(t, err)
 	if !called {
-		t.Fatal("expected LimitReached callback to be called")
+		t.Fatal("expected ErrorHandler to be called")
+	}
+	if !errors.Is(gotErr, ErrTooManyRequests) {
+		t.Fatalf("ErrorHandler err = %v, want ErrTooManyRequests", gotErr)
 	}
 	testutil.AssertStatus(t, rec, 429)
 	testutil.AssertBodyContains(t, rec, "custom rate limit response")
 }
 
-func TestLimitReachedNilUsesDefault(t *testing.T) {
+func TestErrorHandlerNilUsesDefault(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	mw := New(Config{RPS: 0.001, Burst: 1, CleanupInterval: time.Hour, CleanupContext: ctx})
@@ -538,7 +543,7 @@ func TestRetryAfterNotSetOnAllowed(t *testing.T) {
 	}
 }
 
-func TestLimitReachedHeadersStillSet(t *testing.T) {
+func TestErrorHandlerHeadersStillSet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var retryAfter string
@@ -546,7 +551,7 @@ func TestLimitReachedHeadersStillSet(t *testing.T) {
 	mw := New(Config{
 		RPS:   0.001,
 		Burst: 1,
-		LimitReached: func(c *celeris.Context) error {
+		ErrorHandler: func(c *celeris.Context, _ error) error {
 			retryAfter = contextHeader(c, "retry-after")
 			limitHeader = contextHeader(c, "x-ratelimit-limit")
 			return celeris.NewHTTPError(429, "custom")
@@ -563,10 +568,10 @@ func TestLimitReachedHeadersStillSet(t *testing.T) {
 	testutil.AssertHTTPError(t, err, 429)
 
 	if limitHeader != "1" {
-		t.Fatalf("expected x-ratelimit-limit=1 before LimitReached, got %q", limitHeader)
+		t.Fatalf("expected x-ratelimit-limit=1 before ErrorHandler, got %q", limitHeader)
 	}
 	if retryAfter == "" {
-		t.Fatal("expected retry-after header before LimitReached")
+		t.Fatal("expected retry-after header before ErrorHandler")
 	}
 }
 
@@ -779,13 +784,15 @@ func TestStoreDenyRetryAfter(t *testing.T) {
 	}
 }
 
-func TestStoreLimitReached(t *testing.T) {
+func TestStoreErrorHandler(t *testing.T) {
 	store := newMockStore(1)
 	called := false
+	var gotErr error
 	mw := New(Config{
 		Store: store,
-		LimitReached: func(c *celeris.Context) error {
+		ErrorHandler: func(c *celeris.Context, err error) error {
 			called = true
+			gotErr = err
 			return c.String(429, "custom")
 		},
 		KeyFunc: func(_ *celeris.Context) string { return "test" },
@@ -795,7 +802,10 @@ func TestStoreLimitReached(t *testing.T) {
 	_, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/")
 	testutil.AssertNoError(t, err)
 	if !called {
-		t.Fatal("expected LimitReached callback")
+		t.Fatal("expected ErrorHandler to be called")
+	}
+	if !errors.Is(gotErr, ErrTooManyRequests) {
+		t.Fatalf("ErrorHandler err = %v, want ErrTooManyRequests", gotErr)
 	}
 }
 

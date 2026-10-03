@@ -150,7 +150,7 @@ All middleware is in-tree under [`middleware/`](middleware/) — 36 importable p
 | [`sse`](middleware/sse) | Server-Sent Events: heartbeat, Last-Event-ID replay, per-client slow-client policy, and a `Broker` for fan-out (see [Streaming](#streaming-sse--websocket--chunked)) |
 | [`static`](middleware/static) | Static file serving with directory browse, ETag / Last-Modified caching |
 | [`store`](middleware/store) | Unified in-memory `KV` (sharded, TTL eviction) shared by session / csrf / ratelimit / cache / idempotency; Redis / Postgres / memcached adapters live under the respective `session/*store` and `ratelimit/*store` subpackages |
-| [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI / Scalar / ReDoc (CDN-loaded) |
+| [`swagger`](middleware/swagger) | OpenAPI spec + Swagger UI (embedded) / Scalar / ReDoc (pinned CDN, opt-in) |
 | [`timeout`](middleware/timeout) | Request timeout with cooperative and preemptive modes |
 | [`websocket`](middleware/websocket) | RFC 6455 WebSocket: permessage-deflate, engine-integrated backpressure, and a `Hub` for fan-out (see [Streaming](#streaming-sse--websocket--chunked)) |
 

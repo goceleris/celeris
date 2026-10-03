@@ -108,6 +108,12 @@ type SendfileCapable interface {
 // adaptive/engine.go was the only reader and it received zeros from
 // both sub-engines, so removing the fields changes nothing observable.
 // SyscallRate, referenced by the issue, never existed in the tree.
+//
+// v1.6.0: Throughput was removed (celeris#653, celeris#830). It was
+// documented as a requests-per-second rate, but no engine ever assigned it,
+// so it always read 0. A snapshot covers no interval, so it has no rate to
+// report: call [Engine.Metrics] twice and divide the RequestCount difference
+// by the time between the calls.
 type EngineMetrics struct { //nolint:revive // user-approved name
 	// RequestCount is the cumulative number of requests handled by this engine.
 	RequestCount uint64
@@ -194,17 +200,6 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// that returned an error. std only — the native engines do not fold a
 	// handler error into ErrorCount.
 	ErrorHandler uint64
-	// Throughput always reads 0: no engine has ever assigned it.
-	//
-	// Deprecated: Throughput was documented as the recent requests-per-second
-	// rate, but no engine computes a rate for EngineMetrics (std, epoll and
-	// io_uring never set it, and adaptive only summed their zeros), and a
-	// snapshot has no interval of its own to compute one over. It therefore
-	// always reads 0, which looks exactly like a measured rate of zero
-	// (celeris#653). Derive a rate from RequestCount instead: call
-	// [Engine.Metrics] twice and divide the RequestCount difference by the time
-	// between the calls. The field is removed in v2.0.0 (celeris#651).
-	Throughput float64
 	// AsyncRoutes is the count of routes registered with .Async(true) on
 	// this engine's handler. Static after Listen — derived from the
 	// router's per-route async flags and exposed for diagnostics so
