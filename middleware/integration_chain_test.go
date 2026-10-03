@@ -43,18 +43,9 @@ func liveServer(t *testing.T, configure func(s *celeris.Server)) string {
 		case <-time.After(2 * time.Second):
 		}
 	})
-	addr := ln.Addr().String()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = c.Close()
-			return "http://" + addr
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("server not ready on %s", addr)
-	return ""
+	// Fails at once with Start's error if Start returns first, instead of
+	// dialling the listener until the deadline (celeris#706).
+	return "http://" + waitServerStarted(t, s, done, 5*time.Second)
 }
 
 // TestChain_AuthRateLimitBodyLimit exercises a realistic API stack:

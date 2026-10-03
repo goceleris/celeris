@@ -31,29 +31,19 @@ func TestAdaptiveImmediatePromote_Epoll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = s.StartWithListener(ln) }()
+	done := make(chan error, 1)
+	go func() { done <- s.StartWithListener(ln) }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.Shutdown(ctx)
 	}()
 
-	base := "http://" + ln.Addr().String()
-	client := &http.Client{}
-	// Readiness on the FAST route only (so /slow is untouched until our 1 probe).
-	deadline := time.Now().Add(5 * time.Second)
-	ready := false
-	for time.Now().Before(deadline) {
-		if resp, err := client.Get(base + "/ping"); err == nil {
-			_ = resp.Body.Close()
-			ready = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !ready {
-		t.Fatal("server did not become ready")
-	}
+	// Readiness by a TCP dial of the engine's own address, which touches no
+	// route (so /slow is untouched until our 1 probe), and which fails at
+	// once with Start's error if Start returns first (celeris#706).
+	base := "http://" + waitServerStarted(t, s, done, 5*time.Second)
+	client := &http.Client{Timeout: 10 * time.Second}
 
 	if s.router.isPromoted("/slow") {
 		t.Fatal("/slow must not be promoted before any request to it")

@@ -51,20 +51,8 @@ func liveEngineServer(t *testing.T, eng celeris.EngineType, configure func(s *ce
 		case <-time.After(5 * time.Second):
 		}
 	})
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if addr := s.Addr(); addr != nil {
-			a := addr.String()
-			c, derr := net.DialTimeout("tcp", a, 100*time.Millisecond)
-			if derr == nil {
-				_ = c.Close()
-				return "http://" + a
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("server not ready within 5s")
-	return ""
+	// Fails at once with Start's error if Start returns first (celeris#706).
+	return "http://" + waitServerStarted(t, s, done, 5*time.Second)
 }
 
 // TestEngineMatrix_AuthRateLimitBodyLimit pins the same chain as

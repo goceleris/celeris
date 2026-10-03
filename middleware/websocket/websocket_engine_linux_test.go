@@ -76,6 +76,8 @@ func TestWebSocketUpgradeOnNativeEngines(t *testing.T) {
 			// iouring/epoll rebind via SO_REUSEPORT. Give them time
 			// to settle. See sse_engine_linux_test.go for context.
 			time.Sleep(500 * time.Millisecond)
+			// A Start that fails after the settle sleep is not missed (celeris#706).
+			waitUpOrStopped(t, srv, done, 30*time.Second)
 			if p := startErr.Load(); p != nil {
 				// Docker / minimal-kernel CI runners may lack io_uring
 				// support. Skip rather than fail — the test exercises a

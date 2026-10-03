@@ -36,8 +36,21 @@ func setupCelerisRedisEnvAsync(b *testing.B, engineType celeris.EngineType) *cel
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.StartWithListenerAndContext(ctx, ln) }()
+	// A Start that returns first, or a server that never publishes its
+	// address, fails here with the cause, not later in srv.Addr().String()
+	// (celeris#706).
 	deadline := time.Now().Add(5 * time.Second)
-	for srv.Addr() == nil && time.Now().Before(deadline) {
+	for srv.Addr() == nil {
+		select {
+		case err := <-done:
+			cancel()
+			b.Fatalf("server stopped before it was ready: Start returned %v", err)
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			cancel()
+			b.Fatal("server did not publish its address within 5s, and Start has not returned")
+		}
 		time.Sleep(2 * time.Millisecond)
 	}
 
