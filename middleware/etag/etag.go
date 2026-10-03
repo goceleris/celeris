@@ -58,6 +58,20 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 		}
 
+		// A 206's body is one part of the representation: its hash is not
+		// the representation's tag, and a 304 for it would answer a ranged
+		// request with a validator nobody can hold (celeris#832). It is never
+		// hashed. A tag the handler set is the representation's, and
+		// If-None-Match is evaluated against it as for a full response
+		// (before the range, RFC 9110 §13.2.2); without one, the 206 goes
+		// through untouched.
+		if status == 206 && existingTag == "" {
+			if ferr := c.FlushResponse(); ferr != nil && err == nil {
+				err = ferr
+			}
+			return err
+		}
+
 		var tag string
 		if existingTag != "" {
 			tag = existingTag

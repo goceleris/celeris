@@ -124,7 +124,11 @@ func New(config ...Config) celeris.HandlerFunc {
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
 
-		if status < 200 || status >= 300 || len(body) == 0 || (minLen > 0 && len(body) < minLen) {
+		// A 206 goes out as it is: its Content-Range counts bytes of the
+		// identity representation, and once a Content-Encoding applies a
+		// range is over the encoded bytes (RFC 9110 §14.1.2), so a
+		// compressed part could not be reassembled (celeris#832).
+		if status < 200 || status >= 300 || status == 206 || len(body) == 0 || (minLen > 0 && len(body) < minLen) {
 			if ferr := flushWithVary(); ferr != nil && err == nil {
 				err = ferr
 			}

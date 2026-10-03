@@ -8,10 +8,11 @@
 // Install it with [New], optionally passing a [Config]. The zero-value
 // configuration deduplicates on method + path + sorted query string +
 // Authorization + Cookie, so requests from different authenticated users are
-// never coalesced. Use [Config.KeyFunc] to change the key, and [Config.Skip]
-// or [Config.SkipPaths] to exclude requests (for example non-idempotent
-// methods or large-response endpoints). Waiter responses carry an
-// "x-singleflight: HIT" header.
+// never coalesced. A request with a Range header is never coalesced either:
+// its response answers that Range. Use [Config.KeyFunc] to change the key,
+// and [Config.Skip] or [Config.SkipPaths] to exclude requests (for example
+// non-idempotent methods or large-response endpoints). Waiter responses carry
+// an "x-singleflight: HIT" header.
 //
 //	server.Use(singleflight.New())
 //

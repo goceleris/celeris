@@ -75,6 +75,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		if skip.ShouldSkip(c) {
 			return c.Next()
 		}
+		// A request with a Range header is not coalesced: its response (a
+		// 206 part) answers that Range, which the key does not include, so a
+		// leader's part would be handed to requests for the whole
+		// representation, and a ranged request waiting on a full one gets
+		// more than it asked for (celeris#832).
+		if c.Header("range") != "" {
+			return c.Next()
+		}
 
 		key := keyFunc(c)
 
