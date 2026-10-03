@@ -352,9 +352,20 @@ func TestRangeRequestFSInvalid(t *testing.T) {
 	}
 	mw := New(Config{FS: fsys})
 
-	// Invalid range should return full content.
+	// A range past the end is unsatisfiable: 416 with the current length
+	// (RFC 9110 §14.2, §15.5.17; celeris#435), not the full content.
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/data.txt",
 		celeristest.WithHeader("range", "bytes=50-100"))
+	testutil.AssertNoError(t, err)
+	testutil.AssertStatus(t, rec, 416)
+	testutil.AssertHeader(t, rec, "content-range", "bytes */10")
+	if rec.BodyString() != "" {
+		t.Fatalf("body: got %q, want none", rec.BodyString())
+	}
+
+	// A syntactically invalid range is still ignored: full content.
+	rec, err = testutil.RunMiddlewareWithMethod(t, mw, "GET", "/data.txt",
+		celeristest.WithHeader("range", "bytes=5-3"))
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 200)
 	if rec.BodyString() != "0123456789" {
@@ -575,43 +586,6 @@ func TestRenderListingHTMLEscape(t *testing.T) {
 	}
 	if !strings.Contains(listing, "&lt;script&gt;") {
 		t.Fatal("expected HTML-escaped display name")
-	}
-}
-
-func TestParseByteRange(t *testing.T) {
-	tests := []struct {
-		header string
-		size   int64
-		start  int64
-		end    int64
-		ok     bool
-	}{
-		{"bytes=0-4", 10, 0, 4, true},
-		{"bytes=5-9", 10, 5, 9, true},
-		{"bytes=-3", 10, 7, 9, true},
-		{"bytes=7-", 10, 7, 9, true},
-		{"bytes=0-0", 10, 0, 0, true},
-		// Invalid ranges
-		{"bytes=10-15", 10, 0, 0, false},
-		{"bytes=-0", 10, 0, 0, false},
-		{"bytes=5-3", 10, 0, 0, false},
-		{"chars=0-4", 10, 0, 0, false},
-		{"", 10, 0, 0, false},
-		{"bytes=abc-def", 10, 0, 0, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%s/%d", tt.header, tt.size), func(t *testing.T) {
-			start, end, ok := parseByteRange(tt.header, tt.size)
-			if ok != tt.ok {
-				t.Fatalf("ok: got %v, want %v", ok, tt.ok)
-			}
-			if ok {
-				if start != tt.start || end != tt.end {
-					t.Fatalf("range: got %d-%d, want %d-%d", start, end, tt.start, tt.end)
-				}
-			}
-		})
 	}
 }
 

@@ -57,7 +57,7 @@ var sessionDataPool = sync.Pool{New: func() any {
 	return &m
 }}
 
-// Session holds per-request session data backed by a [Store].
+// Session holds per-request session data backed by a [store.KV].
 //
 // Session is designed for single-goroutine-per-request access and is NOT
 // safe for concurrent use from multiple goroutines within the same request.

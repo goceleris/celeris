@@ -447,7 +447,8 @@ func FuzzBasicAuthHeader(f *testing.F) {
 // flow end-to-end. Production callers should use bcrypt/argon2.
 
 // sha256Verifier is a HashedUsersFunc using SHA-256, matching what
-// HashPassword produces. Constant-time per the contract.
+// sha256Hex produces: a test-only stand-in for a caller-supplied verifier.
+// Constant-time per the contract.
 func sha256Verifier(stored, pass string) bool {
 	want, err := hex.DecodeString(stored)
 	if err != nil || len(want) != sha256.Size {
@@ -460,30 +461,6 @@ func sha256Verifier(stored, pass string) bool {
 	}
 	got := sha256.Sum256([]byte(pass))
 	return subtle.ConstantTimeCompare(got[:], want) == 1
-}
-
-func TestHashPasswordDeterministic(t *testing.T) {
-	h1 := HashPassword("secret")
-	h2 := HashPassword("secret")
-	if h1 != h2 {
-		t.Fatalf("HashPassword not deterministic: %q != %q", h1, h2)
-	}
-	if len(h1) != 64 {
-		t.Fatalf("HashPassword length: got %d, want 64", len(h1))
-	}
-	if _, err := hex.DecodeString(h1); err != nil {
-		t.Fatalf("HashPassword not valid hex: %v", err)
-	}
-}
-
-func TestHashPasswordMatchesSHA256(t *testing.T) {
-	password := "secret"
-	expected := sha256.Sum256([]byte(password))
-	got := HashPassword(password)
-	if got != hex.EncodeToString(expected[:]) {
-		t.Fatalf("HashPassword mismatch: got %q, want %q",
-			got, hex.EncodeToString(expected[:]))
-	}
 }
 
 func TestHashedUsers(t *testing.T) {
@@ -501,8 +478,8 @@ func TestHashedUsers(t *testing.T) {
 	}
 	mw := New(Config{
 		HashedUsers: map[string]string{
-			"admin": HashPassword("secret"),
-			"user2": HashPassword("pass2"),
+			"admin": sha256Hex("secret"),
+			"user2": sha256Hex("pass2"),
 		},
 		HashedUsersFunc: sha256Verifier,
 	})
@@ -535,15 +512,15 @@ func TestHashedUsersRequiresFuncPanics(t *testing.T) {
 			t.Fatal("expected panic when HashedUsers is set without HashedUsersFunc")
 		}
 	}()
-	New(Config{HashedUsers: map[string]string{"admin": HashPassword("secret")}})
+	New(Config{HashedUsers: map[string]string{"admin": sha256Hex("secret")}})
 }
 
 func TestHashedUsersDeepCopy(t *testing.T) {
-	hashed := map[string]string{"admin": HashPassword("secret")}
+	hashed := map[string]string{"admin": sha256Hex("secret")}
 	mw := New(Config{HashedUsers: hashed, HashedUsersFunc: sha256Verifier})
 
-	hashed["admin"] = HashPassword("changed")
-	hashed["hacker"] = HashPassword("injected")
+	hashed["admin"] = sha256Hex("changed")
+	hashed["hacker"] = sha256Hex("injected")
 
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
@@ -567,7 +544,7 @@ func TestHashedUsersDeepCopy(t *testing.T) {
 func TestUsersMapTakesPrecedenceOverHashedUsers(t *testing.T) {
 	mw := New(Config{
 		Users:       map[string]string{"admin": "plain"},
-		HashedUsers: map[string]string{"admin": HashPassword("hashed")},
+		HashedUsers: map[string]string{"admin": sha256Hex("hashed")},
 	})
 	handler := func(c *celeris.Context) error {
 		return c.String(200, "ok")
