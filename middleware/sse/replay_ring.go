@@ -10,7 +10,9 @@ import (
 // `size` appended events. Append is O(1); Since is O(retained-after-lastID).
 // IDs are sequential decimal strings starting at 1, so a numerically
 // larger ID is always more recent (within a single ring instance). Each
-// entry holds a copy of the appended event's strings.
+// entry holds a copy of the appended event's strings. In queued mode
+// the ring keeps the copy Send made, unless it is wrapped by another store,
+// in which case each event is copied twice.
 //
 // `size` is clamped to 1 if non-positive.
 func NewRingBuffer(size int) ReplayStore {
@@ -47,8 +49,10 @@ func (r *ringStore) Append(_ context.Context, e Event) (string, error) {
 }
 
 // appendOwned appends e as it is, for an event whose strings are already
-// the ring's to keep: Append's copy, or a queued event, which Send copied
-// before it queued it. It returns the ID it assigned.
+// the ring's to keep: Append's copy, or a queued event, which sendQueued
+// copied (ownEvent) before it queued it. Never pass it a caller's event:
+// that precondition is what keeps the ring from holding request strings.
+// It returns the ID it assigned.
 func (r *ringStore) appendOwned(e Event) string {
 	r.mu.Lock()
 	r.nextSeq++
