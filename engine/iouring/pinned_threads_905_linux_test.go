@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
@@ -34,6 +35,48 @@ func TestStoppedEngineLeavesNoPinnedThread(t *testing.T) {
 		return
 	}
 	pintest.StoppedEnginesLeaveNoPinnedThread(t, "io_uring", 2, startIOUring905)
+}
+
+// BenchmarkListenStopCycle905 is what the celeris#905 fix costs a restart.
+// A stopped worker's thread now exits instead of going back to the scheduler,
+// so the next start has the runtime create its worker threads rather than
+// reuse idle ones. One op is New, Listen until bound, cancel, and Listen's
+// return. Run it with an unlimited memlock: at 8 MiB back-to-back starts wait
+// for the kernel to uncharge closed rings (ring_budget_linux_test.go).
+func BenchmarkListenStopCycle905(b *testing.B) {
+	for b.Loop() {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			b.Fatalf("pick port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		e, err := New(resource.Config{
+			Addr:      addr,
+			Protocol:  engine.HTTP1,
+			Resources: resource.Resources{Workers: min(runtime.NumCPU(), 4)},
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}, respondingHandler{})
+		if err != nil {
+			b.Fatalf("New: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- e.Listen(ctx) }()
+		for e.Addr() == nil || e.NumWorkers() == 0 {
+			select {
+			case err := <-done:
+				cancel()
+				b.Fatalf("Listen returned before it bound: %v", err)
+			default:
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+		cancel()
+		if err := <-done; err != nil {
+			b.Fatalf("Listen: %v", err)
+		}
+	}
 }
 
 func startIOUring905(t *testing.T) (int, func()) {

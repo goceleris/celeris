@@ -31,10 +31,23 @@ func TestStoppedEngineLeavesNoPinnedThread(t *testing.T) {
 		pintest.RunInOwnProcess(t, 2*time.Minute)
 		return
 	}
-	pintest.StoppedEnginesLeaveNoPinnedThread(t, "epoll", 2, startEpoll905)
+	pintest.StoppedEnginesLeaveNoPinnedThread(t, "epoll", 2, func(t *testing.T) (int, func()) {
+		return startEpoll905(t)
+	})
 }
 
-func startEpoll905(t *testing.T) (int, func()) {
+// BenchmarkListenStopCycle905 is what the celeris#905 fix costs a restart.
+// A stopped loop's thread now exits instead of going back to the scheduler,
+// so the next start has the runtime create its loop threads rather than reuse
+// idle ones. One op is New, Listen until bound, cancel, and Listen's return.
+func BenchmarkListenStopCycle905(b *testing.B) {
+	for b.Loop() {
+		_, stop := startEpoll905(b)
+		stop()
+	}
+}
+
+func startEpoll905(t testing.TB) (int, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -65,7 +78,7 @@ func startEpoll905(t *testing.T) (int, func()) {
 			cancel()
 			t.Fatal("the epoll engine did not bind within 10s")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(50 * time.Microsecond)
 	}
 	stop := func() {
 		cancel()
