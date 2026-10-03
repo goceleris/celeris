@@ -34,6 +34,13 @@ type MemoryKVConfig struct {
 // MemoryKV is intended as the default/test backend and for single-process
 // deployments. For multi-instance deployments, use a driver-backed adapter
 // (middleware/session/redisstore, etc.).
+//
+// MemoryKV keeps its own copy of every key it stores (see [KV]): callers
+// pass request strings, such as an Idempotency-Key header or a session ID
+// from a cookie, which on epoll and io_uring are views of the connection's
+// receive buffer and change once the request is over (celeris#719). A key is
+// copied once, when it is first stored; reads, deletes and updates of a key
+// already stored copy nothing.
 type MemoryKV struct {
 	shards []memShard
 	mask   uint64
@@ -143,7 +150,7 @@ func (m *MemoryKV) Set(_ context.Context, key string, value []byte, ttl time.Dur
 	}
 	cp := make([]byte, len(value))
 	copy(cp, value)
-	s.items[key] = &memItem{value: cp, expiry: exp}
+	s.items[strings.Clone(key)] = &memItem{value: cp, expiry: exp}
 	return nil
 }
 
@@ -225,10 +232,9 @@ func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.D
 	// SetNX otherwise pays for a defensive value copy it throws away.
 	// Idempotency middleware's lock-vs-replay contention path hits
 	// this frequently.
-	if it, ok := s.items[key]; ok {
-		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
-			return false, nil
-		}
+	it, ok := s.items[key]
+	if ok && (it.expiry == 0 || time.Now().UnixNano() <= it.expiry) {
+		return false, nil
 	}
 	cp := make([]byte, len(value))
 	copy(cp, value)
@@ -236,7 +242,13 @@ func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.D
 	if ttl > 0 {
 		exp = time.Now().Add(ttl).UnixNano()
 	}
-	s.items[key] = &memItem{value: cp, expiry: exp}
+	if ok {
+		// An expired entry is taken over in place: assigning to the map
+		// would replace the key the map holds with the caller's.
+		it.value, it.expiry = cp, exp
+		return true, nil
+	}
+	s.items[strings.Clone(key)] = &memItem{value: cp, expiry: exp}
 	return true, nil
 }
 
@@ -269,7 +281,8 @@ func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (
 		prevExp int64
 		hadKey  bool
 	)
-	if it, ok := s.items[key]; ok {
+	it, present := s.items[key]
+	if present {
 		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
 			n, err := strconv.ParseInt(string(it.value), 10, 64)
 			if err != nil {
@@ -292,7 +305,13 @@ func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (
 	case hadKey:
 		exp = prevExp
 	}
-	s.items[key] = &memItem{value: encoded, expiry: exp}
+	if present {
+		// Updated in place, live or expired: assigning to the map would
+		// replace the key the map holds with the caller's.
+		it.value, it.expiry = encoded, exp
+		return cur, nil
+	}
+	s.items[strings.Clone(key)] = &memItem{value: encoded, expiry: exp}
 	return cur, nil
 }
 

@@ -98,9 +98,13 @@ type Conn struct {
 
 	subprotocol string
 
-	// cachedIP holds the parsed peer IP (host part of RemoteAddr).
-	// Computed lazily on first IP() call so per-message logging loops
-	// don't re-parse RemoteAddr.String() on every iteration.
+	// remote is the peer's address on the engine path, which has no
+	// net.Conn to ask: built at upgrade from the Context's RemoteAddr
+	// (celeris#721). Nil on the hijack path, where RemoteAddr asks conn.
+	remote net.Addr
+
+	// cachedIP holds the parsed peer IP (host part of RemoteAddr), set once
+	// in setupConn so IP only reads it.
 	cachedIP string
 }
 
@@ -876,15 +880,19 @@ func (c *Conn) Context() context.Context { return c.ctx }
 // Subprotocol returns the negotiated subprotocol, or "" if none.
 func (c *Conn) Subprotocol() string { return c.subprotocol }
 
-// RemoteAddr returns the peer's network address.
+// RemoteAddr returns the peer's network address. On every engine it is the
+// address of the TCP peer that sent the upgrade request (a *net.TCPAddr for
+// an IP peer); nil only when the engine did not report one.
 func (c *Conn) RemoteAddr() net.Addr {
 	if c.conn == nil {
-		return nil
+		return c.remote
 	}
 	return c.conn.RemoteAddr()
 }
 
-// LocalAddr returns the local network address, if known.
+// LocalAddr returns the local network address, if known. On epoll and
+// io_uring it is not known (nil): the engine path has no net.Conn, and the
+// upgrade request does not carry the local address.
 func (c *Conn) LocalAddr() net.Addr {
 	if c.conn == nil {
 		return nil
@@ -903,27 +911,28 @@ func (c *Conn) BackpressureDropped() uint64 {
 	return c.engineReader.Dropped()
 }
 
-// IP returns the remote IP address (without port). The result is cached
-// after the first call so per-message log loops don't re-parse
-// RemoteAddr().String() on every iteration.
+// IP returns the remote IP address (without port). It is computed once, at
+// upgrade, so per-message log loops don't re-parse RemoteAddr().String() on
+// every iteration, and IP only reads: the read and the write goroutine may
+// both call it (an IP cached on the first call was a data race between
+// them).
 func (c *Conn) IP() string {
 	if c.cachedIP != "" {
 		return c.cachedIP
 	}
-	if c.conn == nil {
-		return ""
-	}
-	addr := c.conn.RemoteAddr()
+	return ipOf(c.RemoteAddr())
+}
+
+// ipOf returns addr's host part, or the whole address when it has no port.
+func ipOf(addr net.Addr) string {
 	if addr == nil {
 		return ""
 	}
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		c.cachedIP = addr.String()
-	} else {
-		c.cachedIP = host
+		return addr.String()
 	}
-	return c.cachedIP
+	return host
 }
 
 // Locals returns a per-connection value. Safe for concurrent use.
@@ -946,7 +955,8 @@ func (c *Conn) SetLocals(key string, val any) {
 	c.locals[key] = val
 }
 
-// Param returns a URL route parameter captured at upgrade time.
+// Param returns a URL route parameter captured at upgrade time: a named
+// parameter (":room") or a catch-all ("*path") of the matched route.
 func (c *Conn) Param(key string) string {
 	for _, p := range c.params {
 		if p[0] == key {

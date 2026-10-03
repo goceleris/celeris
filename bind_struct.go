@@ -101,7 +101,11 @@ type BindError struct {
 	Source string
 	// Key is the wire name from the tag.
 	Key string
-	// Value is the raw string that failed to convert.
+	// Value is a copy of the raw string that failed to convert (a slice
+	// field's values joined with ","). It stays valid after the handler
+	// returns, so an error that outlives the request (a singleflight waiter
+	// or a cache follower reaching it with errors.As, an asynchronous error
+	// reporter) still reads this request's value (celeris#732).
 	Value string
 	// Err is the underlying conversion error.
 	Err error
@@ -114,6 +118,8 @@ func (e *BindError) Error() string {
 func (e *BindError) Unwrap() error { return e.Err }
 
 // BindQuery fills v from the query string using `query:"name"` tags.
+// A string field is set to the request string itself, valid until the
+// handler returns (see the package doc); copy it before anything keeps it.
 func (c *Context) BindQuery(v any) error {
 	return c.bindSource(v, "query", func(key string) ([]string, bool) {
 		vals := c.QueryValues(key)
@@ -122,7 +128,8 @@ func (c *Context) BindQuery(v any) error {
 }
 
 // BindParams fills v from the route's path parameters using `param:"name"`
-// tags.
+// tags. A string field is set to the request string itself, valid until the
+// handler returns (see the package doc); copy it before anything keeps it.
 func (c *Context) BindParams(v any) error {
 	return c.bindSource(v, "param", func(key string) ([]string, bool) {
 		s := c.Param(key)
@@ -134,7 +141,9 @@ func (c *Context) BindParams(v any) error {
 }
 
 // BindHeader fills v from the request headers using `header:"Name"` tags.
-// Header lookup is case-insensitive, as elsewhere in celeris.
+// Header lookup is case-insensitive, as elsewhere in celeris. A string field
+// is set to the request string itself, valid until the handler returns (see
+// the package doc); copy it before anything keeps it.
 func (c *Context) BindHeader(v any) error {
 	return c.bindSource(v, "header", func(key string) ([]string, bool) {
 		s := c.Header(key)
@@ -147,7 +156,9 @@ func (c *Context) BindHeader(v any) error {
 
 // BindForm fills v from the request's form values using `form:"name"` tags.
 // Parses the body as a form if it has not been parsed already, so it is only
-// meaningful for form content types.
+// meaningful for form content types. A string field is set to the request
+// string itself, valid until the handler returns (see the package doc); copy
+// it before anything keeps it.
 func (c *Context) BindForm(v any) error {
 	return c.bindSource(v, "form", func(key string) ([]string, bool) {
 		vals := c.FormValues(key)
@@ -163,6 +174,10 @@ func (c *Context) BindForm(v any) error {
 //
 // A body that is absent or empty is not an error here (unlike [Context.Bind]),
 // because BindAll is routinely used on GETs that carry only query params.
+//
+// A string field set from a param, the query, a header or the form is the
+// request string itself, valid until the handler returns (see the package
+// doc); copy it before anything keeps it.
 func (c *Context) BindAll(v any) error {
 	if err := c.BindParams(v); err != nil {
 		return err
@@ -255,11 +270,17 @@ func bindStruct(rv reflect.Value, tagName string, lookup lookupFunc) error {
 		}
 
 		if err := setFieldValue(fv, vals); err != nil {
+			// strings.Join returns a single value as it is: a request
+			// string, a view of the receive buffer on epoll and io_uring.
+			value := strings.Join(vals, ",")
+			if len(vals) == 1 {
+				value = strings.Clone(value)
+			}
 			return &BindError{
 				Field:  field.Name,
 				Source: tagName,
 				Key:    key,
-				Value:  strings.Join(vals, ","),
+				Value:  value,
 				Err:    err,
 			}
 		}

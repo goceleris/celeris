@@ -50,7 +50,7 @@ func TestBasePathRedirect(t *testing.T) {
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger")
 	testutil.AssertNoError(t, err)
 	testutil.AssertStatus(t, rec, 301)
-	testutil.AssertHeader(t, rec, "location", "/swagger/")
+	testutil.AssertHeader(t, rec, "location", "./swagger/")
 }
 
 func TestNonSwaggerPathPassesThrough(t *testing.T) {
@@ -246,7 +246,7 @@ func TestAssetsPathScalar(t *testing.T) {
 	rec, err := testutil.RunMiddlewareWithMethod(t, mw, "GET", "/swagger/")
 	testutil.AssertNoError(t, err)
 	body := rec.BodyString()
-	assertContains(t, body, `/assets/standalone.min.js`)
+	assertContains(t, body, `src="/assets/standalone.js"`)
 	assertNotContains(t, body, "cdn.jsdelivr.net")
 }
 

@@ -92,6 +92,8 @@ func TestSSEOnNativeEngines(t *testing.T) {
 			// real test. Mirrors the wait in cmd/runner and the
 			// repro binary that proves the fix on cluster hardware.
 			time.Sleep(500 * time.Millisecond)
+			// A Start that fails after the settle sleep is not missed (celeris#706).
+			waitUpOrStopped(t, srv, done, 30*time.Second)
 			if p := startErr.Load(); p != nil {
 				// Docker / minimal-kernel CI runners may lack io_uring
 				// support (e.g. seccomp filtering, kernel <5.1 emulation).

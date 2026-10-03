@@ -53,6 +53,8 @@ func startRDHUPServer(t *testing.T, sseHandler func(*sse.Client), wsHandler func
 		}
 	}()
 	time.Sleep(500 * time.Millisecond)
+	// A Start that fails after the settle sleep is not missed (celeris#706).
+	waitUpOrStopped(t, srv, done, 30*time.Second)
 	if p := startErr.Load(); p != nil {
 		t.Fatalf("server start: %v", *p)
 	}

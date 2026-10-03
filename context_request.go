@@ -33,8 +33,14 @@ func (c *Context) Path() string { return c.path }
 // rewrites URLs (e.g. prefix stripping) before downstream handlers see the path.
 func (c *Context) SetPath(p string) { c.path = p }
 
-// FullPath returns the matched route pattern (e.g. "/users/:id").
-// Returns empty string if no route was matched.
+// FullPath returns the matched route pattern (e.g. "/users/:id"). For a
+// request no route matched, which the global middleware also sees, it is a
+// sentinel no pattern can be, whatever answers the request (the 404 or 405,
+// or a Use-mounted middleware serving its own path, such as healthcheck's
+// /livez): "<unmatched>" for a path with no route, "<method-not-allowed>"
+// for a path whose routes take other methods and "<options>" for the
+// automatic OPTIONS answer. It is empty before routing (in [Server.Pre]
+// middleware) and for a Context that did not come through the router.
 func (c *Context) FullPath() string { return c.fullPath }
 
 // RawQuery returns the raw query string without the leading '?'.
@@ -636,8 +642,11 @@ func (c *Context) parseForm() error {
 	return nil
 }
 
-// RequestHeaders returns all request headers as key-value pairs.
-// The returned slice is a copy safe for concurrent use.
+// RequestHeaders returns all request headers as key-value pairs. Treat the
+// slice as read-only and valid until the handler returns: on HTTP/1.1 it is
+// the request's own header slice (on HTTP/2 a copy of it), and on epoll,
+// io_uring and Adaptive the names and values are views of the connection's
+// receive buffer (see the package documentation). Copy what you keep.
 func (c *Context) RequestHeaders() [][2]string {
 	return c.stream.GetHeaders()
 }

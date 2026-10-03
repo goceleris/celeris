@@ -80,6 +80,8 @@ func wsrstTorture(t *testing.T, engine celeris.EngineType) {
 		}
 	}()
 	time.Sleep(500 * time.Millisecond) // SO_REUSEPORT rebind settle
+	// A Start that fails after the settle sleep is not missed (celeris#706).
+	waitUpOrStopped(t, srv, done, 30*time.Second)
 	if p := startErr.Load(); p != nil {
 		// Docker / minimal-kernel runners may lack io_uring — skip rather
 		// than fail (feature-gated path, not a celeris bug).

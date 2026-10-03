@@ -489,6 +489,41 @@ jobs:
             echo "expected all three tests and all 15 arms (6 of them io_uring) to PASS with no SKIP line"
             exit 1
           fi
+      # celeris#719: an in-memory store (store.MemoryKV, cache.MemoryStore)
+      # and the ratelimit dynamic-limiter map keep their own copy of a key
+      # whose bytes the caller changes later: a retried Idempotency-Key
+      # replays, a cache key from c.Path() still hits, a rate string from a
+      # header still finds its limiter. The engine tests run by name with
+      # CELERIS_REQUIRE_IOURING_WORKERS=1 and an exact tally: the five
+      # top-level tests PASS, the three engine tests' 21 arms (std, and
+      # epoll, io_uring and Adaptive with sync and async handlers; 6 of them
+      # io_uring and 6 Adaptive) PASS, no SKIP line, and every go test exits 0.
+      - name: celeris#719 in-memory store and limiter keys kept as copies (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c719.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^TestMemoryKVKeepsItsOwnKeys$' ./middleware/store/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestMemoryStoreKeepsItsOwnKeys|TestCustomKeyStillHitsAfterNextRequest)$' ./middleware/cache/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestRetriedIdempotencyKeyReplays$' ./middleware/idempotency/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestDynamicLimiterFoundAfterNextRequest$' ./middleware/ratelimit/ 2>&1 | tee -a /tmp/c719.log || failed=$((failed + 1))
+          tests='TestMemoryKVKeepsItsOwnKeys|TestMemoryStoreKeepsItsOwnKeys|TestCustomKeyStillHitsAfterNextRequest|TestRetriedIdempotencyKeyReplays|TestDynamicLimiterFoundAfterNextRequest'
+          engine='TestCustomKeyStillHitsAfterNextRequest|TestRetriedIdempotencyKeyReplays|TestDynamicLimiterFoundAfterNextRequest'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c719.log || true)
+          arms=$(grep -cE "^    --- PASS: (${engine})/" /tmp/c719.log || true)
+          uring=$(grep -cE "^    --- PASS: (${engine})/io_uring" /tmp/c719.log || true)
+          adaptive=$(grep -cE "^    --- PASS: (${engine})/adaptive" /tmp/c719.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c719.log || true)
+          echo "celeris#719 tests: top-level PASS $top (want 5), engine arm PASS $arms (want 21), io_uring $uring (want 6), adaptive $adaptive (want 6), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 5 ] || [ "$arms" -ne 21 ] || [ "$uring" -ne 6 ] || [ "$adaptive" -ne 6 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all five tests and the 21 engine arms (6 io_uring, 6 Adaptive) to PASS with no SKIP line"
+            exit 1
+          fi
       - name: middleware/compress
         run: go test -race -count=1 -timeout=120s ./...
         working-directory: middleware/compress
@@ -535,6 +570,52 @@ jobs:
           echo "celeris#720/#732 tests: top-level PASS $top (want 7), arm PASS $arms (want 35), io_uring arm PASS $uring (want 14), SKIP lines $skipped, go test runs failed $failed (want 0)"
           if [ "$top" -ne 7 ] || [ "$arms" -ne 35 ] || [ "$uring" -ne 14 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
             echo "expected all seven tests and all 35 arms (14 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
+      # celeris#742, the rest of #732: the server's own panic log and the
+      # recovery middleware hand slog copies of the method, path, request ID
+      # and panic value; otel copies the strings nested in SLICE and MAP
+      # custom attributes and the attribute keys; singleflight waiters get
+      # copies of the leader's response headers; and request_size_bytes keeps
+      # owned label values. And the handler's error: the span records a copy
+      # of its message, and singleflight waiters and cache followers get the
+      # leader's error and panic value handed off. And what outlives a
+      # request in two more places: a BindError's Value, and the SSE event a
+      # handler sends to a connected Client (the queued event and the ring
+      # replay store's entry). Same shape as the step above: by name, one
+      # package at a time, CELERIS_REQUIRE_IOURING_WORKERS=1, and an exact
+      # tally: the ten top-level tests and all 105 arms (std, and epoll,
+      # io_uring and Adaptive with sync and async handlers, per mode; 30 of
+      # them io_uring and 30 Adaptive) must PASS, with no SKIP line, and every
+      # go test must exit 0.
+      - name: celeris#742 request strings kept by slog, OTel attributes and errors, singleflight waiters, cache followers, BindError, SSE events (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c742.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^(TestHandlerPanicLogSurvivesNextRequest|TestBindErrorValueSurvivesNextRequest)$' . 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestPanicRecordsSurviveNextRequest$' ./middleware/recovery/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestSentEventSurvivesSendersNextRequest$' ./middleware/sse/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestWaiterResponseHeadersSurviveLeaderNextRequest|TestWaiterErrorAndPanicSurviveLeaderNextRequest)$' ./middleware/singleflight/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestFollowerErrorSurvivesLeaderNextRequest$' ./middleware/cache/ 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          (cd middleware/otel && go test -race -count=1 -timeout=300s -v -run '^(TestCustomSliceMapAttributesSurviveNextRequest|TestHandlerErrorSurvivesNextRequest)$' .) 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          (cd middleware/metrics && go test -race -count=1 -timeout=300s -v -run '^TestRequestSizeLabelsSurviveNextRequest$' .) 2>&1 | tee -a /tmp/c742.log || failed=$((failed + 1))
+          tests='TestHandlerPanicLogSurvivesNextRequest|TestBindErrorValueSurvivesNextRequest|TestPanicRecordsSurviveNextRequest|TestSentEventSurvivesSendersNextRequest|TestWaiterResponseHeadersSurviveLeaderNextRequest|TestWaiterErrorAndPanicSurviveLeaderNextRequest|TestFollowerErrorSurvivesLeaderNextRequest|TestCustomSliceMapAttributesSurviveNextRequest|TestHandlerErrorSurvivesNextRequest|TestRequestSizeLabelsSurviveNextRequest'
+          # An arm's name is the engine arm, or "<mode>/<arm>" for the tests
+          # that run every arm per mode.
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c742.log || true)
+          arms=$(grep -cE "^    --- PASS: (${tests})/" /tmp/c742.log || true)
+          uring=$(grep -cE "^    --- PASS: (${tests})/([a-z-]+/)?io_uring" /tmp/c742.log || true)
+          adaptive=$(grep -cE "^    --- PASS: (${tests})/([a-z-]+/)?adaptive" /tmp/c742.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c742.log || true)
+          echo "celeris#742 tests: top-level PASS $top (want 10), arm PASS $arms (want 105), io_uring arm PASS $uring (want 30), adaptive arm PASS $adaptive (want 30), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 10 ] || [ "$arms" -ne 105 ] || [ "$uring" -ne 30 ] || [ "$adaptive" -ne 30 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all ten tests and all 105 arms (30 io_uring, 30 Adaptive) to PASS with no SKIP line"
             exit 1
           fi
       - name: middleware/protobuf
@@ -650,6 +731,44 @@ jobs:
           echo "celeris#714 tests: top-level PASS $top (want 4), arm PASS $arms (want 20), io_uring arm PASS $uring (want 8), SKIP lines $skipped, go test runs failed $failed (want 0)"
           if [ "$top" -ne 4 ] || [ "$arms" -ne 20 ] || [ "$uring" -ne 8 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
             echo "expected all four tests and all 20 arms (8 of them io_uring) to PASS with no SKIP line"
+            exit 1
+          fi
+      # celeris#721: a WebSocket Conn answers Param, IP and RemoteAddr from
+      # the upgrade request on every engine (std, and epoll, io_uring and
+      # Adaptive with sync and async handlers), and Conn.IP only reads, so the
+      # read and write goroutines may both call it under -race. celeris#706: every test helper
+      # that starts a server in a goroutine fails at once with Start's error;
+      # the helpers' own tests run here too (root, middleware, sse, websocket,
+      # epoll), since the root race step excludes ./middleware/websocket.
+      # Same shape as the step above: by name, CELERIS_REQUIRE_IOURING_WORKERS=1
+      # and CELERIS_REQUIRE_DUALSTACK=1 (the dual-stack arms fail instead of
+      # skipping), and an exact tally: nine top-level tests, the 14 arms of the #721 test
+      # (7 on a loopback listener and 7 on a dual-stack one; 4 io_uring,
+      # 4 Adaptive), no SKIP line, and every go test exits 0.
+      - name: celeris#721 WebSocket Conn params and peer address, celeris#706 start helpers (io_uring arms required)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+          CELERIS_REQUIRE_DUALSTACK: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          : > /tmp/c721.log
+          failed=0
+          go test -race -count=1 -timeout=300s -v -run '^(TestConnParamsAndPeerAddress|TestConnIPConcurrentCalls|TestPeerAddrParsesEngineForms|TestWaitUpOrStoppedReturnsWhenStartFails)$' ./middleware/websocket/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestWaitUpOrStoppedReturnsWhenStartFails$' ./middleware/sse/ ./engine/epoll/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^(TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError)$' . 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestWaitServerStartedMiddlewareFailsFastOnStartError$' ./middleware/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
+          tests='TestConnParamsAndPeerAddress|TestConnIPConcurrentCalls|TestPeerAddrParsesEngineForms|TestWaitUpOrStoppedReturnsWhenStartFails|TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError|TestWaitServerStartedMiddlewareFailsFastOnStartError'
+          top=$(grep -cE "^--- PASS: (${tests}) \(" /tmp/c721.log || true)
+          arms=$(grep -cE "^    --- PASS: TestConnParamsAndPeerAddress/" /tmp/c721.log || true)
+          uring=$(grep -cE "^    --- PASS: TestConnParamsAndPeerAddress/(dual-stack/)?io_uring" /tmp/c721.log || true)
+          adaptive=$(grep -cE "^    --- PASS: TestConnParamsAndPeerAddress/(dual-stack/)?adaptive" /tmp/c721.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c721.log || true)
+          echo "celeris#721/#706 tests: top-level PASS $top (want 9), #721 arm PASS $arms (want 14), io_uring $uring (want 4), adaptive $adaptive (want 4), SKIP lines $skipped, go test runs failed $failed (want 0)"
+          if [ "$top" -ne 9 ] || [ "$arms" -ne 14 ] || [ "$uring" -ne 4 ] || [ "$adaptive" -ne 4 ] || [ "$skipped" -ne 0 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all nine tests and the 14 #721 arms (4 io_uring, 4 Adaptive) to PASS with no SKIP line"
             exit 1
           fi
       # celeris#733: the request strings a hijacking handler keeps must not

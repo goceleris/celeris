@@ -3,10 +3,14 @@
 // [New] returns a [celeris.HandlerFunc] that serves an interactive API
 // reference page and the raw OpenAPI spec (JSON or YAML, auto-detected) under
 // a configurable base path. By default it answers {BasePath}/ for the UI,
-// {BasePath}/spec for the raw spec and
+// {BasePath}/spec for the raw spec,
 // {BasePath}/assets/swagger-ui-dist@{SwaggerUIVersion}/* for the embedded
-// Swagger UI files, and redirects {BasePath} to {BasePath}/; other paths
-// pass through, and other methods on its paths get 405.
+// Swagger UI files and {BasePath}/oauth2-redirect.html (with its script,
+// {BasePath}/oauth2-redirect.js) for Swagger UI's OAuth2 redirect page, and
+// redirects {BasePath} to {BasePath}/; other paths pass through, and other
+// methods on its paths get 405. The page refers to the spec and to its files
+// relative to itself, and the redirect's Location is relative, so the
+// defaults also work behind a reverse proxy that strips a path prefix.
 //
 // [Config] is the entry point. Provide the spec via Config.SpecContent (an
 // embedded byte slice) or Config.SpecURL (an externally hosted spec, in which
@@ -25,7 +29,9 @@
 // with its upstream licence notices) and served by default under
 // {BasePath}/assets/, so the page works offline and its
 // Content-Security-Policy needs no third-party origin for scripts or
-// stylesheets. Requests under {BasePath}/assets/ must reach the middleware
+// stylesheets. Swagger UI's online validator badge is off by default
+// (UIConfig.ValidatorURL), so the page sends its spec URL to no validator.
+// Requests under {BasePath}/assets/ must reach the middleware
 // as {BasePath}/ does: a mount, route list or proxy rule that forwards only
 // the page and the spec leaves the page blank. Config.CDN opts into loading
 // the renderer from jsDelivr instead, pinned to an exact version with a

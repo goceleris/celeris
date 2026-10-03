@@ -1,10 +1,12 @@
 package singleflight
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/internal/handoff"
 )
 
 type call struct {
@@ -138,13 +140,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.BufferResponse()
 
 		var panicVal any
+		var handlerErr error
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					panicVal = r
 				}
 			}()
-			entry.err = c.Next()
+			handlerErr = c.Next()
 		}()
 
 		// Remove from map BEFORE wg.Done so new requests after Done create
@@ -161,24 +164,19 @@ func New(config ...Config) celeris.HandlerFunc {
 			// Capture response state (deep copy) only when a waiter will
 			// consume it.
 			entry.status = c.ResponseStatus()
-			entry.ct = c.ResponseContentType()
 			body := c.ResponseBody()
 			if len(body) > 0 {
 				entry.body = append([]byte(nil), body...)
 			}
-			respHeaders := c.ResponseHeaders()
-			if len(respHeaders) > 0 {
-				entry.headers = make([][2]string, len(respHeaders))
-				copy(entry.headers, respHeaders)
-			}
-			entry.panicVal = panicVal
+			entry.headers, entry.ct = ownHeaders(c.ResponseHeaders(), c.ResponseContentType())
+			// The error and the panic value can hold the leader's request
+			// strings too (errors.New(c.Param("id")), panic(c.Header("x"))),
+			// which a waiter formats after the leader has returned: hand the
+			// waiters copies (see handoff). The leader keeps its own.
+			entry.err = handoff.Error(handlerErr)
+			entry.panicVal = handoff.Panic(panicVal)
 		}
 		entry.wg.Done()
-
-		// Snapshot any leader-side state BEFORE returning entry to the
-		// pool — otherwise a concurrent acquireCall could race with the
-		// reads below.
-		handlerErr := entry.err
 
 		// Pool-reuse the entry when no waiter referenced it. Entries seen
 		// by waiters stay live until the last reader drops them (the
@@ -198,4 +196,41 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		return handlerErr
 	}
+}
+
+// ownHeaders returns a copy of the leader's response headers and content
+// type for its waiters, the strings included; the copies share one
+// allocation.
+//
+// The header values can be request strings: middleware echo request headers
+// into the response (requestid's X-Request-Id, cors's
+// Access-Control-Allow-Origin), and on epoll and io_uring those are views of
+// the leader connection's receive buffer. The leader returns once it has
+// handed the entry over, and the engine receives the connection's next
+// request into that buffer (or, once the connection closes, gives it to
+// another connection), while a waiter may serialize the headers later, for
+// example when an outer middleware buffers its response (celeris#732).
+func ownHeaders(hdrs [][2]string, ct string) ([][2]string, string) {
+	n := len(ct)
+	for _, h := range hdrs {
+		n += len(h[0]) + len(h[1])
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for _, h := range hdrs {
+		b.WriteString(h[0])
+		b.WriteString(h[1])
+	}
+	b.WriteString(ct)
+	rest := b.String()
+	var out [][2]string
+	if len(hdrs) > 0 {
+		out = make([][2]string, len(hdrs))
+		for i, h := range hdrs {
+			k, v := len(h[0]), len(h[1])
+			out[i] = [2]string{rest[:k], rest[k : k+v]}
+			rest = rest[k+v:]
+		}
+	}
+	return out, rest
 }

@@ -139,7 +139,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// Double-check after acquiring write lock.
 		if e, ok := dynamicLimiters[rateStr]; ok {
 			e.lastUsed = now
-			dynamicLimiters[rateStr] = e
+			dynamicLimiters[strings.Clone(rateStr)] = e // the assignment replaces the key the map holds
 			return e.lim, e.burst, nil
 		}
 		// Reject new entries when map is at capacity (issue #1).
@@ -159,7 +159,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		} else {
 			dl = newShardedLimiter(childCtx, shards, rps, burst, cleanupInterval)
 		}
-		dynamicLimiters[rateStr] = stoppableLimiter{lim: dl, burst: burst, cancel: cancel, lastUsed: now}
+		// rateStr may alias a header view (celeris#719): the map keeps a copy.
+		dynamicLimiters[strings.Clone(rateStr)] = stoppableLimiter{lim: dl, burst: burst, cancel: cancel, lastUsed: now}
 		return dl, burst, nil
 	}
 

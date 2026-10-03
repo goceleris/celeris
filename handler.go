@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,7 +15,13 @@ import (
 )
 
 type routerAdapter struct {
-	server                *Server
+	server *Server
+	// notFoundChain and methodNotAllowedChain answer a request no route
+	// matches (celeris#852, celeris#156): the global middleware, then the
+	// custom NotFound / MethodNotAllowed handler or the built-in answer
+	// (newUnmatchedChain). Built by buildUnmatchedChains when Start
+	// installs the adapter; nil on a bare adapter (tests), where
+	// handleUnmatched builds them per request.
 	notFoundChain         []HandlerFunc
 	methodNotAllowedChain []HandlerFunc
 	// optionsChain answers an OPTIONS request to a path that has routes but
@@ -35,11 +42,83 @@ func autoOptions(c *Context) error {
 	return c.NoContent(200)
 }
 
-// newOptionsChain is the global middleware followed by autoOptions.
+// newOptionsChain is the global middleware followed by autoOptions, which
+// answers only if no middleware has (a CORS preflight's 204 is not answered
+// again: answerUnlessAnswered, celeris#852).
 func newOptionsChain(middleware []HandlerFunc) []HandlerFunc {
 	chain := make([]HandlerFunc, 0, len(middleware)+1)
 	chain = append(chain, middleware...)
-	return append(chain, autoOptions)
+	return append(chain, answerUnlessAnswered(autoOptions))
+}
+
+// buildUnmatchedChains builds the chains a request no route matches runs,
+// once, when Start installs the adapter. The global middleware runs for
+// unmatched requests too, whether or not a NotFound / MethodNotAllowed
+// handler is set (celeris#852).
+//
+// Under the AsyncHandlers default those chains can block an engine worker as
+// a route's can, so when they run more than the built-in answer an
+// unmatched request is dispatched like a route inheriting that default:
+// inline until a run blocks, then async (router.unmatchedAdaptive). Without
+// that, every 404 from a blocking global middleware (a remote session store,
+// an auth upstream) would stall the worker and every connection on it.
+func (a *routerAdapter) buildUnmatchedChains() {
+	s := a.server
+	a.notFoundChain = newUnmatchedChain(s.middleware, s.notFoundHandler, builtinNotFound)
+	a.methodNotAllowedChain = newUnmatchedChain(s.middleware, s.methodNotAllowedHandler, builtinMethodNotAllowed)
+	// Written only when true: Server.AsyncHandlers, which a driver opened
+	// WithEngine may call while Start runs, reads the flag only when the
+	// default is sync, and then nothing writes it.
+	if s.router.defaultAsync &&
+		(len(s.middleware) > 0 || s.notFoundHandler != nil || s.methodNotAllowedHandler != nil) {
+		s.router.unmatchedAdaptive = true
+	}
+}
+
+// newUnmatchedChain is the chain a request no route matches runs
+// (celeris#852): the global middleware ([Server.Use]), so logger, metrics,
+// otel and requestid see the request and a middleware that serves its own
+// paths (swagger, pprof, debug, healthcheck, metrics' endpoint, static)
+// answers them, then custom (the NotFound or MethodNotAllowed handler), or
+// builtin when custom is nil. The end of the chain answers only if nothing
+// before it has (answerUnlessAnswered).
+func newUnmatchedChain(middleware []HandlerFunc, custom, builtin HandlerFunc) []HandlerFunc {
+	end := builtin
+	if custom != nil {
+		end = custom
+	}
+	chain := make([]HandlerFunc, 0, len(middleware)+1)
+	chain = append(chain, middleware...)
+	return append(chain, answerUnlessAnswered(end))
+}
+
+// answerUnlessAnswered runs h only if no handler before it in the chain has
+// answered the request: written the response, had it captured by a buffering
+// middleware (compress, etag, cache, ...) or taken the connection over. A
+// middleware that serves its own path returns without calling Next, which does
+// not stop the chain (only Abort does), so without this check the not-found
+// answer would run after it: on the wire the first write wins, but a buffered
+// page would be overwritten by the 404, and the handler's ErrResponseWritten
+// would reach every middleware above it.
+func answerUnlessAnswered(h HandlerFunc) HandlerFunc {
+	return func(c *Context) error {
+		if c.written || c.buffered || c.detached {
+			return nil
+		}
+		return h(c)
+	}
+}
+
+// builtinNotFound and builtinMethodNotAllowed are the answers to an unmatched
+// request when no NotFound / MethodNotAllowed handler is set. They write
+// through the Context, as a route handler does, so buffering middleware sees
+// the response; handleUnmatched has set the Allow header of a 405.
+func builtinNotFound(c *Context) error {
+	return c.Blob(404, "text/plain", []byte("404 Not Found"))
+}
+
+func builtinMethodNotAllowed(c *Context) error {
+	return c.Blob(405, "text/plain", []byte("405 Method Not Allowed"))
 }
 
 func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) error {
@@ -151,6 +230,19 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	}
 
 	if handlers == nil {
+		// celeris#852: timed and promoted like an adaptive route (below)
+		// while router.unmatchedAdaptive is learning; one key for all
+		// unmatched requests (unmatchedAdaptiveKey).
+		if rt := a.server.router; rt.unmatchedAdaptive && rt.adaptiveLearning(unmatchedAdaptiveKey) {
+			start := time.Now()
+			a.handleUnmatched(c, s)
+			if dur := time.Since(start); dur > adaptiveBlockingThreshold {
+				rt.promoteRouteImmediate(unmatchedAdaptiveKey)
+			} else {
+				rt.recordInlineRun(unmatchedAdaptiveKey, dur > adaptivePromoteThreshold)
+			}
+			return nil
+		}
 		a.handleUnmatched(c, s)
 		return nil
 	}
@@ -355,16 +447,21 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 	// PanicCount, which probatorium reads via the unix socket to
 	// assert that no panics escape the recover safety net.
 	validation.RecordPanic()
+	// Copies: Config.Logger's handler may keep the record (slog's
+	// Record.Clone shares the strings), and on epoll and io_uring the method
+	// and path are views of the connection's receive buffer, which the engine
+	// reuses for the next request (celeris#732).
 	a.server.logger().Error("handler panic recovered",
 		"error", fmt.Sprint(r),
-		"method", c.method,
-		"path", c.path,
+		"method", strings.Clone(c.method),
+		"path", strings.Clone(c.path),
 		"stack", string(debug.Stack()),
 	)
 	c.statusCode = 500
 	// A StreamWriter taken but not used yet has sent nothing: the 500 still
-	// goes out (celeris#835).
-	if (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
+	// goes out (celeris#835). A detached request's response is its taker's
+	// (celeris#852).
+	if !c.detached && (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
 		hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 		hdrs = append(hdrs, c.respHeaders...)
 		hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
@@ -389,19 +486,22 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 		c.fullPath = "<method-not-allowed>"
 		allowVal := strings.Join(allowed, ", ")
 		chain := a.methodNotAllowedChain
-		if chain == nil && a.server.methodNotAllowedHandler != nil {
-			chain = []HandlerFunc{a.server.methodNotAllowedHandler}
+		if chain == nil {
+			chain = newUnmatchedChain(a.server.middleware, a.server.methodNotAllowedHandler, builtinMethodNotAllowed)
 		}
-		if chain != nil {
-			c.SetHeader("allow", allowVal)
-			c.handlers = chain
-			a.handleError(c, s, c.Next())
-		}
-		if !c.written && s.ResponseWriter != nil {
+		// Set before the chain, so the Allow header is on the response
+		// whichever handler writes it.
+		c.SetHeader("allow", allowVal)
+		a.runUnmatched(c, s, chain)
+		if !c.written && !c.detached && s.ResponseWriter != nil {
+			// Nothing answered: a middleware aborted without writing, or
+			// the custom handler wrote nothing.
 			hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 			hdrs = append(hdrs, c.respHeaders...)
 			hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
-			hdrs = append(hdrs, [2]string{"allow", allowVal})
+			if !slices.ContainsFunc(c.respHeaders, func(h [2]string) bool { return h[0] == "allow" }) {
+				hdrs = append(hdrs, [2]string{"allow", allowVal})
+			}
 			_ = s.ResponseWriter.WriteResponse(s, 405, hdrs, []byte("405 Method Not Allowed"))
 			c.written = true
 		}
@@ -409,20 +509,31 @@ func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
 		c.statusCode = 404
 		c.fullPath = "<unmatched>"
 		chain := a.notFoundChain
-		if chain == nil && a.server.notFoundHandler != nil {
-			chain = []HandlerFunc{a.server.notFoundHandler}
+		if chain == nil {
+			chain = newUnmatchedChain(a.server.middleware, a.server.notFoundHandler, builtinNotFound)
 		}
-		if chain != nil {
-			c.handlers = chain
-			a.handleError(c, s, c.Next())
-		}
-		if !c.written && s.ResponseWriter != nil {
+		a.runUnmatched(c, s, chain)
+		if !c.written && !c.detached && s.ResponseWriter != nil {
+			// Nothing answered: a middleware aborted without writing, or
+			// the custom handler wrote nothing.
 			hdrs := make([][2]string, 0, len(c.respHeaders)+1)
 			hdrs = append(hdrs, c.respHeaders...)
 			hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
 			_ = s.ResponseWriter.WriteResponse(s, 404, hdrs, []byte("404 Not Found"))
 			c.written = true
 		}
+	}
+}
+
+// runUnmatched runs an unmatched request's chain (newUnmatchedChain) and,
+// like HandleStream after a route's chain, flushes a response a buffering
+// middleware captured and did not send.
+func (a *routerAdapter) runUnmatched(c *Context, s *stream.Stream, chain []HandlerFunc) {
+	c.handlers = chain
+	a.handleError(c, s, c.Next())
+	if c.buffered && !c.written {
+		c.bufferDepth = 1
+		_ = c.FlushResponse()
 	}
 }
 
@@ -443,7 +554,7 @@ func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal str
 		c.bufferDepth = 1
 		_ = c.FlushResponse()
 	}
-	if !c.written && s.ResponseWriter != nil {
+	if !c.written && !c.detached && s.ResponseWriter != nil {
 		// A middleware returned without writing and without calling Next.
 		hdrs := make([][2]string, 0, len(c.respHeaders)+1)
 		hdrs = append(hdrs, c.respHeaders...)
@@ -467,6 +578,14 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 		if c.written {
 			return
 		}
+	}
+	if c.detached {
+		// A request a middleware detached (WebSocket, SSE) is answered by
+		// whoever took it over (celeris#852): a middleware that detaches and
+		// returns without Next does not stop the chain, so a later
+		// middleware's error reaches here. The Context's writers refuse a
+		// detached request (ErrDetached); the writes below would not.
+		return
 	}
 	hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 	hdrs = append(hdrs, c.respHeaders...)

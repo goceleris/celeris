@@ -198,6 +198,19 @@ type Config struct {
 	// override is honored per-stream (sync routes run inline on the event
 	// loop, async routes dispatch to the worker pool).
 	//
+	// A request no route matches (a 404, a 405, the automatic OPTIONS
+	// answer) runs the global middleware ([Server.Use]) and any NotFound /
+	// MethodNotAllowed handler. With this set it is dispatched like a route
+	// that inherits this default: inline until a timed run of that chain
+	// blocks, then async. All unmatched requests share that one state, and a
+	// run of fast ones settles it as it settles a route; from then on an
+	// unmatched request whose chain blocks runs inline on the engine worker,
+	// holding every connection on it, unless it is the one timed after a
+	// settle re-open. With this unset it always runs inline, even when
+	// routes are .Async(). So a global middleware that can block (a remote
+	// session store, an auth upstream, pprof's profile) can hold a worker
+	// for unmatched requests; mount it on .Async() routes where that matters.
+	//
 	// DRIVERS: celeris drivers opened WithEngine(srv) pick their netpoll-park
 	// fast path from the server's EFFECTIVE async state — true when this flag
 	// is set OR any route is .Async(). So "keep this false + mark DB routes
@@ -218,6 +231,9 @@ type Config struct {
 	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
 	// If the callback returns false, the server responds with 417 Expectation Failed
 	// and skips reading the body. If nil, the server always sends 100 Continue.
+	// The method, the path and the header strings are request strings, valid only
+	// during the call (on epoll and io_uring, views of the receive buffer; see the
+	// package doc): copy one with [strings.Clone] before anything keeps it.
 	OnExpectContinue func(method, path string, headers [][2]string) bool
 
 	// OnConnect is called when a new connection is accepted. The addr is the

@@ -72,6 +72,9 @@ type Config struct {
 	// values, because slog allows it to keep a record after Handle returns
 	// and the request strings are only valid during the request on epoll
 	// and io_uring. The copies share one allocation per logged request.
+	// That includes the default (slog.Default()) and the [JSONConfig]
+	// preset (slog.JSONHandler): only an Output built on [NewFastHandler]
+	// logs without the copy.
 	Output *slog.Logger
 
 	// Level maps an HTTP response status code to a slog.Level, controlling
@@ -83,6 +86,13 @@ type Config struct {
 	// values to include in each log entry. It is called after the
 	// downstream handler completes, so latency and response data are
 	// available.
+	//
+	// For an Output other than [FastHandler], the string values Fields
+	// returns are copied with the middleware's own, inside groups too. Their
+	// keys, and values of other kinds (slog.Any, a slog.LogValuer), are not:
+	// if the handler may keep the record, build those from copies
+	// ([strings.Clone]), not from request strings such as c.Header or
+	// c.RequestHeaders().
 	Fields func(c *celeris.Context, latency time.Duration) []slog.Attr
 
 	// Done is an optional callback invoked after the log entry is written.

@@ -19,6 +19,20 @@
 // [Context.File], [Context.Stream]). Do not retain a *[Context] after the
 // handler returns; use [Context.BodyCopy] to keep body bytes alive.
 //
+// The request strings a Context returns ([Context.Method], [Context.Path],
+// [Context.Header], [Context.Param], [Context.Query], [Context.Cookie],
+// [Context.Host], [Context.ClientIP], [Context.RawQuery] and the strings
+// derived from them) are valid until the handler returns. On [Epoll],
+// [IOUring] and [Adaptive] HTTP/1.1 they are views of the connection's
+// receive buffer, which the engine reuses for the connection's next request
+// and, once the connection closes, for another connection. Compare and read
+// them freely during the request; copy one with [strings.Clone] before
+// anything keeps it past the handler: a map key or cache entry, a goroutine
+// or channel, a closure, a log record a handler may keep, a metric label or
+// a span attribute. A kept view later reads other request bytes, possibly
+// another client's. [Context.Detach] and [Context.Hijack] copy the values
+// the Context holds; see their docs for what they cannot copy.
+//
 // Group routes with [Server.Group], attach middleware with [Server.Use],
 // [RouteGroup.Use] or [Route.Use], and return [HTTPError] (via [NewHTTPError])
 // for HTTP-status errors. The in-tree middleware/* packages (logger, recovery,

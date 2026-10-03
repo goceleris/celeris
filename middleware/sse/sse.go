@@ -75,6 +75,14 @@ type Client struct {
 // panicking, but the contract still belongs to the caller — spawned
 // goroutines that publish into a Client must be joined before the handler
 // returns.
+//
+// e's strings may be another request's strings, as when a handler relays
+// c.Param or c.Query to a connected Client. What Send keeps after it returns
+// is a copy: the event on the queue in queued mode, and the entry of a
+// [NewRingBuffer] replay store (celeris#732). A custom [ReplayStore] is
+// handed that copy in queued mode, but e as given in blocking mode; see
+// [ReplayStore.Append]. In queued mode the copy is made before the enqueue,
+// so a Send the slow-client policy drops pays its one allocation too.
 func (c *Client) Send(e Event) error {
 	if c.queue != nil {
 		return c.sendQueued(e)
@@ -126,6 +134,9 @@ func (c *Client) sendQueued(e Event) error {
 	if err := c.ctx.Err(); err != nil {
 		return err
 	}
+	// The queue keeps e until the drain writes it, after Send has returned
+	// and possibly after the sender's request has ended: keep a copy.
+	e = ownEvent(e)
 	select {
 	case c.queue <- e:
 		return nil
@@ -179,7 +190,7 @@ func (c *Client) drain() {
 		// a transient store hiccup must not kill an otherwise healthy
 		// connection. The next successful Send recovers the order.
 		if c.replayStore != nil {
-			if id, err := c.replayStore.Append(c.ctx, e); err == nil {
+			if id, err := appendQueued(c.ctx, c.replayStore, e); err == nil {
 				e.ID = id
 			}
 		}
@@ -194,6 +205,17 @@ func (c *Client) drain() {
 			return
 		}
 	}
+}
+
+// appendQueued appends an event the drain took off the queue. sendQueued
+// copied it before it queued it, so the ring store keeps it without a
+// second copy; any other store gets it through Append. A store that wraps
+// a ring is not a *ringStore, so its ring copies the event a second time.
+func appendQueued(ctx context.Context, s ReplayStore, e Event) (string, error) {
+	if r, ok := s.(*ringStore); ok {
+		return r.appendOwned(e), nil
+	}
+	return s.Append(ctx, e)
 }
 
 // DroppedEvents returns the cumulative count of events dropped under

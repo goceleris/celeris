@@ -72,12 +72,24 @@ func TestSSEStreamUnwindsOnShutdown(t *testing.T) {
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- s.StartWithListenerAndContext(serverCtx, ln) }()
 
+	// Ready once the server reports its address and that address answers.
+	// A Start that returns first is reported with its error at once, not
+	// as a dial of the listener that fails until the deadline (celeris#706).
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		c, dialErr := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if dialErr == nil {
-			_ = c.Close()
-			break
+		select {
+		case err := <-serverDone:
+			serverDone <- err
+			t.Fatalf("server stopped before it was ready: Start returned %v", err)
+		default:
+		}
+		var dialErr error
+		if a := s.Addr(); a != nil {
+			var c net.Conn
+			if c, dialErr = net.DialTimeout("tcp", a.String(), 100*time.Millisecond); dialErr == nil {
+				_ = c.Close()
+				break
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("server not ready within 5s: %v", dialErr)

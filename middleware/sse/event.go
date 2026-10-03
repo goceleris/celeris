@@ -29,6 +29,33 @@ type Event struct {
 	Retry int
 }
 
+// ownEvent returns e with its strings copied into one allocation, for an
+// Event that is kept after the Send it was given to returns: on the
+// per-client queue until the drain writes it, or in the ring replay store.
+//
+// A sender's strings can be request strings: a handler that relays
+// c.Param or c.Query to a connected Client (celeris#732). On epoll and
+// io_uring (and Adaptive, which runs them) those are views of the sending
+// connection's receive buffer, which the engine reuses for that
+// connection's next request and, once it closes, for another connection.
+// A kept view would later read those bytes, and the drain or a replay would
+// send them to this Client.
+func ownEvent(e Event) Event {
+	n := len(e.ID) + len(e.Event) + len(e.Data)
+	if n == 0 {
+		return e
+	}
+	var b strings.Builder
+	b.Grow(n)
+	b.WriteString(e.ID)
+	b.WriteString(e.Event)
+	b.WriteString(e.Data)
+	s := b.String()
+	e.ID, s = s[:len(e.ID)], s[len(e.ID):]
+	e.Event, e.Data = s[:len(e.Event)], s[len(e.Event):]
+	return e
+}
+
 // FormatEvent formats an SSE event into buf, reusing its capacity.
 // Exported for benchmarking; most users should use [Client.Send] instead.
 func FormatEvent(buf []byte, e Event) []byte {
