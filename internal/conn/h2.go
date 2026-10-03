@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/celeris/internal/wakefd"
 	"github.com/goceleris/celeris/protocol/h2/frame"
@@ -52,6 +53,13 @@ type H2Config struct {
 	InitialWindowSize    uint32
 	MaxFrameSize         uint32
 	MaxRequestBodySize   int64 // 0 = use default (100 MB)
+	// WriteTimeout bounds how long a worker-pool handler waits for the
+	// peer's flow-control window to send a response the connection's
+	// outbound budget would not let it hand off (celeris#893): then its
+	// stream is reset with INTERNAL_ERROR and its write returns an error
+	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
+	// WriteTimeout. 0 = no bound.
+	WriteTimeout time.Duration
 }
 
 // withDefaults returns a copy of cfg with zero fields set to RFC 7540 defaults.
@@ -152,6 +160,11 @@ func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
 			write(*buf)
 			putH2FrameBuf(buf)
 		}
+		// Drop the drained pointers: putH2FrameBuf does not pool a buffer
+		// past 8 KiB, and a pointer left in the spare array kept that buffer
+		// (a whole response's DATA) reachable until a later drain overwrote
+		// its slot (celeris#893).
+		clear(s.spare)
 		// Reclaim capacity if it grew beyond steady-state.
 		if cap(s.spare) > 64 {
 			s.spare = make([]*[]byte, 0, 16)
@@ -508,6 +521,7 @@ func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *
 		outBuf:       &s.outBuf,
 		writeQueue:   &s.writeQueue,
 		maxFrameSize: cfg.MaxFrameSize,
+		writeTimeout: cfg.WriteTimeout,
 	}
 	s.inlineAdapter = h2InlineResponseAdapter{
 		outBuf:       &s.outBuf,
