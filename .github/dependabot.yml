@@ -32,7 +32,8 @@ updates:
 
   # ----- CI tools module -----
   # .github/tools pins the govulncheck that the Vulnerability Check job
-  # runs, through its go.sum (celeris#827). Go records every requirement
+  # runs, and the benchstat that .github/scripts/bench-ab.sh runs, through
+  # its go.sum (celeris#827, celeris#838). Go records every requirement
   # of a module that only holds `tool` directives as `// indirect`,
   # golang.org/x/vuln included. Version updates cover direct
   # dependencies only unless `allow` says otherwise, so without the rule
@@ -48,6 +49,8 @@ updates:
     directory: /.github/tools
     allow:
       - dependency-name: golang.org/x/vuln
+        dependency-type: all
+      - dependency-name: golang.org/x/perf
         dependency-type: all
     schedule:
       interval: daily
