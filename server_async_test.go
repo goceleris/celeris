@@ -43,21 +43,12 @@ func startMixedAsyncServer(t *testing.T, cfg Config) (string, func()) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = s.StartWithListener(ln) }()
+	done := make(chan error, 1)
+	go func() { done <- s.StartWithListener(ln) }()
 
-	base := "http://" + ln.Addr().String()
-	// Wait until the server answers.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(base + "/cpu")
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Fails at once with Start's error if Start returns before the server
+	// is ready (celeris#706).
+	base := "http://" + waitServerStarted(t, s, done, 5*time.Second)
 	return base, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -67,7 +58,8 @@ func startMixedAsyncServer(t *testing.T, cfg Config) (string, func()) {
 
 func getBody(t *testing.T, url string) (int, string) {
 	t.Helper()
-	resp, err := http.Get(url)
+	// Bounded: a server that stops answering fails the test, not the job.
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}

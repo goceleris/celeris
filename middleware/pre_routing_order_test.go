@@ -37,19 +37,10 @@ func startTestServer(t *testing.T, configure func(s *celeris.Server)) string {
 		case <-time.After(2 * time.Second):
 		}
 	})
-	// Wait for the server to be ready.
-	addr := ln.Addr().String()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = c.Close()
-			return addr
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("server never became ready on %s", addr)
-	return ""
+	// Wait for the server to be ready. Fails at once with Start's error if
+	// Start returns first, instead of dialling the listener until the
+	// deadline (celeris#706).
+	return waitServerStarted(t, s, done, 5*time.Second)
 }
 
 // noRedirectClient returns an http.Client that does NOT follow redirects,
