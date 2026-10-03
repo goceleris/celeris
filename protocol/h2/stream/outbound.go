@@ -1,6 +1,11 @@
 package stream
 
-import "sync/atomic"
+import (
+	"context"
+	"os"
+	"sync/atomic"
+	"time"
+)
 
 // OutboundBudget is how many bytes of response DATA one HTTP/2 connection's
 // streams may hold in their OutboundBuffers while they wait for the peer's
@@ -31,10 +36,17 @@ import "sync/atomic"
 // 4 MiB matches the HTTP/1 per-connection backlog limit (the engines'
 // maxPendingBytes).
 //
-// A waiting handler is blocked for as long as the peer withholds window (the
-// connection's timeouts bound it), as on std: middleware that makes other
-// requests wait for a handler, a cache's coalesced fill for one, waits with
-// it.
+// A waiting handler is blocked while the peer withholds window, for no
+// longer than the server's WriteTimeout from its write: then its stream is
+// reset (AwaitSendWindow's deadline, set by the conn layer). The connection's
+// read and idle timeouts do not bound it: they measure the peer's silence, and
+// a peer that withholds window but sends any frame, a PING, keeps them from
+// firing. Whatever waits for a waiting handler waits with it: a request that
+// needs a lock it holds across its write, a cache's coalesced fill it leads
+// (celeris#913). On std that stalls only those requests. On epoll, io_uring
+// and adaptive a sync handler that waits for it holds its event loop, and so
+// every connection on that loop, until the deadline (with WriteTimeout
+// disabled, until the peer grants window).
 const OutboundBudget = 4 << 20
 
 // OutboundHeld returns how many bytes this connection's streams hold in their
@@ -134,26 +146,47 @@ func (s *Stream) TryBufferOutbound(data []byte, endStream bool) bool {
 }
 
 // AwaitSendWindow blocks the pool handler of s until both of s's send windows
-// are open, so some of its DATA can be sent (celeris#893). It reports false
-// when s is cancelled: the peer reset it, or its connection closed
-// (Manager.Close cancels every stream), and nothing more is to be sent.
+// are open, so some of its DATA can be sent (celeris#893), and then returns
+// nil. It returns context.Canceled when s is cancelled: the peer reset it, or
+// its connection closed (Manager.Close cancels every stream), and nothing
+// more is to be sent. It returns os.ErrDeadlineExceeded once deadline has
+// passed, whether or not the windows are open (a zero deadline never
+// passes): the caller is then to reset the stream. Passing the same deadline
+// to every call for one response bounds the whole of its wait, so a peer that
+// grants window a few bytes at a time cannot stretch it.
 //
-// It holds no lock while it waits. The peer decides how long that is, as it
-// does for a net/http handler blocked in Write; the connection's idle and
-// write timeouts bound it.
-func (s *Stream) AwaitSendWindow() bool {
+// It holds no lock while it waits, and the deadline needs nothing on the
+// event loop to fire: a timer ends the wait. On the native engines the loop
+// may be the thing waiting (a sync handler blocked on a lock this handler
+// holds, or on a coalesced call it leads), and then it cannot process the
+// WINDOW_UPDATE, the reset or the close that would end the wait. The
+// connection's read and idle timeouts do not end it either (see
+// OutboundBudget).
+func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 	m := s.manager
 	if m == nil {
-		return true
+		return nil
 	}
 	open := func() bool {
 		return s.windowSize.Load() > 0 && atomic.LoadInt32(&m.connectionWindow) > 0
 	}
 	if s.IsCancelled() {
-		return false
+		return context.Canceled
 	}
-	if open() {
-		return true
+	var expired <-chan time.Time
+	if !deadline.IsZero() {
+		d := time.Until(deadline)
+		if d <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		if open() {
+			return nil
+		}
+		t := time.NewTimer(d)
+		defer t.Stop()
+		expired = t.C
+	} else if open() {
+		return nil
 	}
 	done := s.Context().Done()
 	// Counted before the channel is taken and the windows re-checked, so a
@@ -164,15 +197,17 @@ func (s *Stream) AwaitSendWindow() bool {
 	for {
 		ch := m.sendWindowChan()
 		if s.IsCancelled() {
-			return false
+			return context.Canceled
 		}
 		if open() {
-			return true
+			return nil
 		}
 		select {
 		case <-ch:
 		case <-done:
-			return false
+			return context.Canceled
+		case <-expired:
+			return os.ErrDeadlineExceeded
 		}
 	}
 }

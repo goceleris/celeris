@@ -43,12 +43,16 @@ func BenchmarkWindowUpdateWithWaiters893(b *testing.B) {
 				// The stream the stream-level frames credit: open, nobody waits on it.
 				other := m.CreateStream(uint32(2*streams + 1))
 				other.SetState(StateOpen)
+				// A deadline, as the engines give every wait (the server's
+				// WriteTimeout), so the waiters select on its timer too; far
+				// enough out that it does not pass during the run.
+				deadline := time.Now().Add(time.Hour)
 				var wg sync.WaitGroup
 				for i := 0; i < waiters; i++ {
 					wg.Add(1)
 					go func(s *Stream) {
 						defer wg.Done()
-						for s.AwaitSendWindow() {
+						for s.AwaitSendWindow(deadline) == nil {
 						}
 					}(ss[i])
 				}

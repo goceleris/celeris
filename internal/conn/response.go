@@ -2,6 +2,8 @@ package conn
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -668,6 +670,9 @@ type h2ResponseAdapter struct {
 	writeQueue   *h2ShardedQueue // async response queue (sharded)
 	maxFrameSize uint32          // our own advertised MAX_FRAME_SIZE (fallback)
 	manager      *stream.Manager // peer-SETTINGS-aware source of max frame size
+	// writeTimeout bounds how long sendRest waits for the peer's window
+	// (H2Config.WriteTimeout; 0 = no bound).
+	writeTimeout time.Duration
 }
 
 // peerMaxFrame returns the peer's currently-advertised SETTINGS_MAX_FRAME_SIZE,
@@ -735,7 +740,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 			a.writeQueue.Enqueue(s.ID, pooled)
 			s.SetHeadersSent()
 			if len(rest) > 0 {
-				a.sendRest(s, rest, maxFrame)
+				return a.sendRest(s, rest, maxFrame)
 			}
 			return nil
 		}
@@ -788,7 +793,7 @@ func (a *h2ResponseAdapter) WriteResponse(s *stream.Stream, status int, headers 
 
 	s.SetHeadersSent()
 	if len(rest) > 0 {
-		a.sendRest(s, rest, maxFrame)
+		return a.sendRest(s, rest, maxFrame)
 	}
 	return nil
 }
@@ -848,16 +853,36 @@ func (a *h2ResponseAdapter) stageBody(s *stream.Stream, frameBuf, body []byte, s
 // sendRest sends the part of a worker-pool handler's response body that the
 // windows did not take and TryBufferOutbound did not buffer (celeris#893):
 // the connection's outbound budget had no room, or the stream is a sync one
-// on the pool only because of the budget. Its HEADERS are queued. It waits for the windows
-// and sends what they allow, through the write queue, until the body is out:
-// the handler blocks, as a net/http handler blocks in Write on flow control,
-// instead of the connection copying past its budget. None of it is buffered,
-// even once the budget has room again: the event loop writes a stream's
-// buffered DATA straight to the connection, ahead of chunks still in the
-// queue, and the body would arrive out of order. It gives up, sending
-// nothing more, when the stream is reset or its connection closes.
-func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uint32) {
-	for s.AwaitSendWindow() {
+// on the pool only because of the budget. Its HEADERS are queued. It waits for
+// the windows and sends what they allow, through the write queue, until the
+// body is out: the handler blocks, as a net/http handler blocks in Write on
+// flow control, instead of the connection copying past its budget. None of it
+// is buffered, even once the budget has room again: the event loop writes a
+// stream's buffered DATA straight to the connection, ahead of chunks still in
+// the queue, and the body would arrive out of order.
+//
+// It gives up, sending nothing more, when the stream is reset or its
+// connection closes. And it waits no longer than writeTimeout from now, the
+// server's WriteTimeout, in all: then it resets the stream with
+// INTERNAL_ERROR, as net/http does at a stream's write deadline, and returns
+// an error that wraps os.ErrDeadlineExceeded. The bound is a timer, so it
+// holds when the event loop cannot run: on the native engines a sync handler
+// waiting for this one (a lock it holds across this write, a coalesced call it
+// leads) holds its loop until this handler returns.
+func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uint32) error {
+	var deadline time.Time
+	if a.writeTimeout > 0 {
+		deadline = time.Now().Add(a.writeTimeout)
+	}
+	for {
+		if err := s.AwaitSendWindow(deadline); err != nil {
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				return nil // reset by the peer, or the connection closed
+			}
+			a.resetStream(s, http2.ErrCodeInternal)
+			return fmt.Errorf("h2: stream %d reset: %d bytes of the response still waited for the peer's window at WriteTimeout (%v): %w",
+				s.ID, len(rest), a.writeTimeout, err)
+		}
 		if n := h2ReserveSend(a.manager, s, len(rest)); n > 0 {
 			isEnd := n == len(rest)
 			pooled := getH2FrameBuf()
@@ -869,11 +894,24 @@ func (a *h2ResponseAdapter) sendRest(s *stream.Stream, rest []byte, maxFrame uin
 			*pooled = frameBuf
 			a.writeQueue.Enqueue(s.ID, pooled)
 			if isEnd {
-				return
+				return nil
 			}
 			rest = rest[n:]
 		}
 	}
+}
+
+// resetStream queues a RST_STREAM for s behind the frames s has queued (all of
+// a stream's frames go to one shard, in order) and cancels s, so its handler's
+// context is done and nothing more of it is sent. A pool handler cannot use
+// the connection's writer, which belongs to the event loop.
+func (a *h2ResponseAdapter) resetStream(s *stream.Stream, code http2.ErrCode) {
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], uint32(code))
+	pooled := getH2FrameBuf()
+	*pooled = appendH2Frame((*pooled)[:0], h2FrameRSTStream, 0, s.ID, payload[:])
+	a.writeQueue.Enqueue(s.ID, pooled)
+	s.Cancel()
 }
 
 // SendGoAway writes a GOAWAY frame via the shared writer.

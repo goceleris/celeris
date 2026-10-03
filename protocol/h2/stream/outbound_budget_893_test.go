@@ -2,6 +2,8 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,12 +151,15 @@ func TestAwaitSendWindowWakes893(t *testing.T) {
 			waiter.flags.Or(flagAsyncRunning)
 			waiter.SetWindowSize(0)
 
-			var returned atomic.Int32 // 0 running, 1 true, 2 false
+			var returned atomic.Int32 // 0 running, 1 window open, 2 stream gone, 3 anything else
 			go func() {
-				if waiter.AwaitSendWindow() {
+				switch err := waiter.AwaitSendWindow(time.Now().Add(time.Minute)); {
+				case err == nil:
 					returned.Store(1)
-				} else {
+				case errors.Is(err, context.Canceled):
 					returned.Store(2)
+				default:
+					returned.Store(3)
 				}
 			}()
 			time.Sleep(50 * time.Millisecond)
@@ -182,10 +187,96 @@ func TestAwaitSendWindowWakes893(t *testing.T) {
 				want = 2
 			}
 			if r := returned.Load(); r != want {
-				t.Fatalf("%s: AwaitSendWindow result %d, want %d (1 = window open, 2 = stream gone, 0 = still waiting)", tc.name, r, want)
+				t.Fatalf("%s: AwaitSendWindow result %d, want %d (1 = window open, 2 = stream gone, 3 = another error, 0 = still waiting)", tc.name, r, want)
 			}
 		})
 	}
+}
+
+// TestAwaitSendWindowGivesUpAtItsDeadline893: a waiter whose peer grants no
+// window must return at its deadline, by itself: nothing else (no frame, no
+// event-loop work) happens here. The engines' read and idle timeouts never
+// end such a wait when the peer keeps sending frames, and on the native
+// engines the event loop can itself be waiting for this handler (#906's
+// review round 2: a lock held across the write wedged the server). The
+// deadline covers a whole response: once it has passed, a wait gives up even
+// with the windows open, so a peer that grants a few bytes at a time cannot
+// stretch it. A zero deadline waits for as long as the peer withholds window.
+func TestAwaitSendWindowGivesUpAtItsDeadline893(t *testing.T) {
+	type result struct {
+		err error
+		in  time.Duration
+	}
+	await := func(s *Stream, deadline time.Time) chan result {
+		ch := make(chan result, 1)
+		go func() {
+			start := time.Now()
+			err := s.AwaitSendWindow(deadline)
+			ch <- result{err, time.Since(start)}
+		}()
+		return ch
+	}
+
+	t.Run("closed-windows", func(t *testing.T) {
+		_, m := newBudgetProcessor893(t, nil)
+		waiter := openStream893(t, m, 3)
+		waiter.flags.Or(flagAsyncRunning)
+		waiter.SetWindowSize(0)
+		const d = 200 * time.Millisecond
+		ch := await(waiter, time.Now().Add(d))
+		select {
+		case r := <-ch:
+			if !errors.Is(r.err, os.ErrDeadlineExceeded) {
+				t.Fatalf("returned %v after %v, want os.ErrDeadlineExceeded", r.err, r.in)
+			}
+			if r.in < d-20*time.Millisecond {
+				t.Fatalf("returned after %v, before its %v deadline", r.in, d)
+			}
+		case <-time.After(5 * time.Second):
+			m.Close()
+			t.Fatalf("still waiting 5 s after its %v deadline, with no frame from the peer", d)
+		}
+		if n := m.sendWindowWaiters.Load(); n != 0 {
+			t.Fatalf("waiters %d after the waiter gave up, want 0", n)
+		}
+	})
+
+	t.Run("deadline-passed-windows-open", func(t *testing.T) {
+		_, m := newBudgetProcessor893(t, nil)
+		s := openStream893(t, m, 3)
+		s.flags.Or(flagAsyncRunning)
+		if err := s.AwaitSendWindow(time.Time{}); err != nil {
+			t.Fatalf("windows open, no deadline: %v, want nil", err)
+		}
+		if err := s.AwaitSendWindow(time.Now().Add(time.Minute)); err != nil {
+			t.Fatalf("windows open, deadline ahead: %v, want nil", err)
+		}
+		if err := s.AwaitSendWindow(time.Now().Add(-time.Millisecond)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("windows open, deadline passed: %v, want os.ErrDeadlineExceeded", err)
+		}
+	})
+
+	t.Run("no-deadline", func(t *testing.T) {
+		_, m := newBudgetProcessor893(t, nil)
+		waiter := openStream893(t, m, 3)
+		waiter.flags.Or(flagAsyncRunning)
+		waiter.SetWindowSize(0)
+		ch := await(waiter, time.Time{})
+		select {
+		case r := <-ch:
+			t.Fatalf("returned %v after %v with no deadline and the window closed", r.err, r.in)
+		case <-time.After(300 * time.Millisecond):
+		}
+		m.Close()
+		select {
+		case r := <-ch:
+			if !errors.Is(r.err, context.Canceled) {
+				t.Fatalf("after the connection closed: %v, want context.Canceled", r.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("still waiting after the connection closed")
+		}
+	})
 }
 
 // TestNoInlineHandlerOverTheBudget893: a connection over its budget runs a new
