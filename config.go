@@ -6,6 +6,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/resource"
+	"github.com/goceleris/celeris/observe"
 )
 
 // Protocol represents the HTTP protocol version.
@@ -267,7 +268,7 @@ type Config struct {
 }
 
 // EngineMetrics is a point-in-time snapshot of engine-level performance counters.
-type EngineMetrics = engine.EngineMetrics
+type EngineMetrics = observe.EngineMetrics
 
 // EngineInfo provides read-only information about the running engine.
 type EngineInfo struct {

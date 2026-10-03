@@ -49,7 +49,7 @@ var removedBeforeV160 = []removal{
 	{".", "Context.FormValueOk", ".", "Context.FormValueOK", "celeris#830"},
 	{"driver/postgres", "ErrNoLastInsertId", "driver/postgres", "ErrNoLastInsertID", "celeris#830"},
 	{"internal/driver/postgres/protocol", "SimpleQueryState.Tag", "internal/driver/postgres/protocol", "SimpleQueryState.TagBytes", "celeris#830"},
-	{"internal/engine", "EngineMetrics.Throughput", "internal/engine", "EngineMetrics.RequestCount", "celeris#830"},
+	{"observe", "EngineMetrics.Throughput", "observe", "EngineMetrics.RequestCount", "celeris#830"},
 	{"middleware/csrf", "Storage", "middleware/store", "KV", "celeris#830"},
 	{"middleware/csrf", "MemoryStorageConfig", "middleware/store", "MemoryKVConfig", "celeris#830"},
 	{"middleware/session", "Store", "middleware/store", "KV", "celeris#830"},

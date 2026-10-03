@@ -4,8 +4,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/goceleris/celeris/internal/engine"
 )
 
 const bucketCount = 10
@@ -21,10 +19,6 @@ func init() {
 		defaultBucketBoundsNS[i] = int64(bound * 1e9)
 	}
 }
-
-// EngineMetrics is a type alias for [engine.EngineMetrics], re-exported here so
-// users of the observe package do not need to import engine directly.
-type EngineMetrics = engine.EngineMetrics
 
 // Snapshot is a point-in-time copy of all collected metrics. All fields are
 // read-only values captured at the moment Collector.Snapshot was called.
