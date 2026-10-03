@@ -186,7 +186,12 @@ func (s *Server) loadEngine() engine.Engine {
 // ones, and a middleware that serves its own paths, such as swagger, pprof,
 // debug, healthcheck, the metrics endpoint or static, answers them with no
 // route registered for them. Group and route middleware do not run for an
-// unmatched request.
+// unmatched request. Under [Config.AsyncHandlers] an unmatched request is
+// dispatched like a route inheriting that default (inline until its chain
+// blocks, then async). A middleware that serves its own paths answers them
+// for every client its AuthFunc admits: pprof's and debug's default admits a
+// loopback peer, which behind a reverse proxy on the same host is every
+// client, and the metrics endpoint has no AuthFunc by default.
 func (s *Server) Use(middleware ...HandlerFunc) *Server {
 	if s.routesRegistered {
 		panic("celeris: Server.Use called after routes were registered — chains were already baked at handle() time, so this Use call would only apply to routes registered hereafter and produce silently inconsistent middleware coverage. Move Use calls before any GET/POST/etc.")

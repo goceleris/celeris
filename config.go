@@ -198,6 +198,13 @@ type Config struct {
 	// override is honored per-stream (sync routes run inline on the event
 	// loop, async routes dispatch to the worker pool).
 	//
+	// A request no route matches (a 404, a 405, the automatic OPTIONS
+	// answer) runs the global middleware ([Server.Use]) and any NotFound /
+	// MethodNotAllowed handler. With this set it is dispatched like a route
+	// that inherits this default: inline until a run of that chain blocks,
+	// then async, so a blocking global middleware does not hold a worker for
+	// unmatched requests either.
+	//
 	// DRIVERS: celeris drivers opened WithEngine(srv) pick their netpoll-park
 	// fast path from the server's EFFECTIVE async state — true when this flag
 	// is set OR any route is .Async(). So "keep this false + mark DB routes

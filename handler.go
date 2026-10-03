@@ -55,10 +55,19 @@ func newOptionsChain(middleware []HandlerFunc) []HandlerFunc {
 // once, when Start installs the adapter. The global middleware runs for
 // unmatched requests too, whether or not a NotFound / MethodNotAllowed
 // handler is set (celeris#852).
+//
+// Under the AsyncHandlers default those chains can block an engine worker as
+// a route's can, so when they run more than the built-in answer an
+// unmatched request is dispatched like a route inheriting that default:
+// inline until a run blocks, then async (router.unmatchedAdaptive). Without
+// that, every 404 from a blocking global middleware (a remote session store,
+// an auth upstream) would stall the worker and every connection on it.
 func (a *routerAdapter) buildUnmatchedChains() {
 	s := a.server
 	a.notFoundChain = newUnmatchedChain(s.middleware, s.notFoundHandler, builtinNotFound)
 	a.methodNotAllowedChain = newUnmatchedChain(s.middleware, s.methodNotAllowedHandler, builtinMethodNotAllowed)
+	s.router.unmatchedAdaptive = s.router.defaultAsync &&
+		(len(s.middleware) > 0 || s.notFoundHandler != nil || s.methodNotAllowedHandler != nil)
 }
 
 // newUnmatchedChain is the chain a request no route matches runs
@@ -216,6 +225,19 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 	}
 
 	if handlers == nil {
+		// celeris#852: timed and promoted like an adaptive route (below)
+		// while router.unmatchedAdaptive is learning; one key for all
+		// unmatched requests (unmatchedAdaptiveKey).
+		if rt := a.server.router; rt.unmatchedAdaptive && rt.adaptiveLearning(unmatchedAdaptiveKey) {
+			start := time.Now()
+			a.handleUnmatched(c, s)
+			if dur := time.Since(start); dur > adaptiveBlockingThreshold {
+				rt.promoteRouteImmediate(unmatchedAdaptiveKey)
+			} else {
+				rt.recordInlineRun(unmatchedAdaptiveKey, dur > adaptivePromoteThreshold)
+			}
+			return nil
+		}
 		a.handleUnmatched(c, s)
 		return nil
 	}
@@ -428,8 +450,9 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 	)
 	c.statusCode = 500
 	// A StreamWriter taken but not used yet has sent nothing: the 500 still
-	// goes out (celeris#835).
-	if (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
+	// goes out (celeris#835). A detached request's response is its taker's
+	// (celeris#852).
+	if !c.detached && (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
 		hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 		hdrs = append(hdrs, c.respHeaders...)
 		hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
@@ -546,6 +569,14 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 		if c.written {
 			return
 		}
+	}
+	if c.detached {
+		// A request a middleware detached (WebSocket, SSE) is answered by
+		// whoever took it over (celeris#852): a middleware that detaches and
+		// returns without Next does not stop the chain, so a later
+		// middleware's error reaches here. The Context's writers refuse a
+		// detached request (ErrDetached); the writes below would not.
+		return
 	}
 	hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 	hdrs = append(hdrs, c.respHeaders...)

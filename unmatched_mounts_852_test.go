@@ -145,13 +145,19 @@ func TestUseMountedMiddlewaresAnswerTheirPaths852(t *testing.T) {
 // retried for up to 30 s.
 func startServer852(t *testing.T, eng celeris.EngineType, setup func(*celeris.Server)) string {
 	t.Helper()
+	return startServerConfig852(t, celeris.Config{Engine: eng}, setup)
+}
+
+// startServerConfig852 is startServer852 with a whole Config.
+func startServerConfig852(t *testing.T, cfg celeris.Config, setup func(*celeris.Server)) string {
+	t.Helper()
 	retryUntil := time.Now().Add(30 * time.Second)
 	for tries := 1; ; tries++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := celeris.New(celeris.Config{Engine: eng})
+		s := celeris.New(cfg)
 		setup(s)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
