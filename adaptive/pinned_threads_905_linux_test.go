@@ -29,19 +29,23 @@ func TestStoppedAdaptiveEngineLeavesNoPinnedThread(t *testing.T) {
 		pintest.RunInOwnProcess(t, 2*time.Minute)
 		return
 	}
-	pintest.StoppedEnginesLeaveNoPinnedThread(t, "adaptive", 2, startPromoted905)
-}
-
-// startPromoted905 starts an adaptive engine on epoll, promotes it to
-// io_uring, waits for the epoll listeners to close (the outgoing loops then
-// park), and checks that no goroutine that locks a thread is given a pinned
-// one at that point.
-func startPromoted905(t *testing.T) (int, func()) {
-	t.Helper()
+	// Read once, before any engine has run: on a thread left pinned, the
+	// main thread included, the mask is no longer the process's.
 	base, err := pintest.ProcessMask()
 	if err != nil {
 		t.Fatalf("read the process's CPU mask: %v", err)
 	}
+	pintest.StoppedEnginesLeaveNoPinnedThread(t, "adaptive", 2, func(t *testing.T) (int, func()) {
+		return startPromoted905(t, base)
+	})
+}
+
+// startPromoted905 starts an adaptive engine on epoll, promotes it to
+// io_uring, waits for the epoll listeners to close (the outgoing loops then
+// park), and checks that no goroutine that locks a thread is given one off
+// base, the process's mask, at that point.
+func startPromoted905(t *testing.T, base string) (int, func()) {
+	t.Helper()
 	e, err := New(resource.Config{
 		Addr:     "127.0.0.1:0",
 		Protocol: engine.HTTP1,

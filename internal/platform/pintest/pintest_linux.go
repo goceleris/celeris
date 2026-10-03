@@ -95,9 +95,11 @@ func readStatus(path string) (name, cpus string, err error) {
 	return name, cpus, nil
 }
 
-// ProcessMask returns the Cpus_allowed_list of the thread-group leader, read
-// before anything in the process has changed a thread's affinity, it is the
-// mask every thread of the process starts with.
+// ProcessMask returns the Cpus_allowed_list of the thread-group leader (the
+// main thread). Read before anything in the process has changed a thread's
+// affinity, it is the mask every thread of the process starts with; read
+// later, it may not be: the main thread runs goroutines too, an engine loop
+// among them, and celeris#905 left it pinned.
 func ProcessMask() (string, error) {
 	_, cpus, err := readStatus("/proc/self/status")
 	return cpus, err
