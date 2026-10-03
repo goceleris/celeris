@@ -38,6 +38,12 @@ type Group[T any] struct {
 	pool sync.Pool
 }
 
+// TestHookFollowerJoined is called, when set, under the group's mutex each
+// time a caller joins an in-flight call as a follower. Nil in production;
+// middleware/cache's tests use it to know a follower waits. Cost in
+// production: one nil check per coalesced call.
+var TestHookFollowerJoined func()
+
 // New returns an initialised Group[T].
 func New[T any]() *Group[T] {
 	g := &Group[T]{calls: make(map[string]*Call[T])}
@@ -54,6 +60,9 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 		// Follower. Register under the mutex so the leader's delete-time
 		// read of waiters captures us before it decides whether to pool.
 		c.waiters.Add(1)
+		if TestHookFollowerJoined != nil {
+			TestHookFollowerJoined()
+		}
 		g.mu.Unlock()
 		c.wg.Wait()
 		return c.Result, false, c.Err

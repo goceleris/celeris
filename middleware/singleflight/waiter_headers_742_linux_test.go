@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func TestWaiterResponseHeadersSurviveLeaderNextRequest(t *testing.T) {
 			testHookWaiterJoined = func() { joined <- struct{}{} }
 			t.Cleanup(func() { testHookWaiterJoined = prev })
 			leaderIn := make(chan struct{}, 1)
-			gate := make(chan struct{})
+			gate, release := sfGate()
 
 			addr, stop := sfStartServer(t, func() *celeris.Server {
 				srv := celeris.New(celeris.Config{Engine: a.engine, AsyncHandlers: a.async})
@@ -78,6 +79,9 @@ func TestWaiterResponseHeadersSurviveLeaderNextRequest(t *testing.T) {
 				return srv
 			})
 			defer stop()
+			// Before stop, which waits for the waiter's handler: a failure
+			// below must not leave it blocked on the gate.
+			defer release()
 
 			lconn, lbr := sfDial(t, addr)
 			defer func() { _ = lconn.Close() }()
@@ -106,7 +110,7 @@ func TestWaiterResponseHeadersSurviveLeaderNextRequest(t *testing.T) {
 					t.Fatalf("leader's later response x-echo %q, want echo-%s", got, v)
 				}
 			}
-			close(gate)
+			release()
 			got, ct := sfReadEcho(t, wbr)
 			t.Logf("MW742SINGLEFLIGHT arm=%s waiter x-echo=%q content-type=%q (want %q, %q)", a.name, got, ct, "echo-aaaa", "text/x-aaaa")
 			if got != "echo-aaaa" || ct != "text/x-aaaa" {
@@ -114,6 +118,14 @@ func TestWaiterResponseHeadersSurviveLeaderNextRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// sfGate returns a gate the waiter's middleware blocks on and its release,
+// which closes it once however often it is called.
+func sfGate() (<-chan struct{}, func()) {
+	gate := make(chan struct{})
+	var once sync.Once
+	return gate, func() { once.Do(func() { close(gate) }) }
 }
 
 type sfArm struct {
