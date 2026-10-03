@@ -55,7 +55,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		keyGen = defaultKeyGenerator(cfg.VaryHeaders)
 	}
 
-	group := sf.New[sfResult]()
+	group := sf.New[[]byte]()
 
 	return func(c *celeris.Context) error {
 		if skip.ShouldSkip(c) {
@@ -90,32 +90,34 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		// Singleflight: only the leader runs the handler. Followers decode
 		// the leader's encoded bytes and replay on their own Context.
-		// sfResult carries the encoded bytes plus the effective TTL the
-		// leader computed so followers don't re-derive it (and so the
-		// leader can apply per-response Cache-Control max-age caps).
-		res, leader, err := group.Do(key, func() (sfResult, error) {
+		//
+		// The coalesced call only computes and stores: it returns once the
+		// handler has run and a cacheable response is in the store. Every
+		// request writes its own response after the call, the leader
+		// included. A write waits for its own client, and a client that
+		// reads slowly (an HTTP/2 peer that grants no window) must not hold
+		// every follower of the key, nor, on epoll and io_uring, the event
+		// loop each sync follower runs on; nor may that client's write error
+		// become the followers' result (celeris#913).
+		encoded, leader, err := group.Do(key, func() ([]byte, error) {
 			// nil dst: leader returns the encoded bytes via sf.Do; followers
 			// may still be reading them after this call frame returns, so
 			// we can't share a pooled buffer here.
-			buf, ttl, rerr := executeAndReturnWithTTL(c, cfg, include, exclude, nil)
-			return sfResult{bytes: buf, ttl: ttl}, rerr
+			return captureAndStore(c, cfg, include, exclude, key, nil)
 		})
+		if leader {
+			return writeMiss(c, cfg, err)
+		}
 		if err != nil {
 			return err
 		}
-		if leader {
-			if res.bytes != nil {
-				_ = cfg.Store.Set(ctx, key, res.bytes, res.ttl)
-			}
-			return nil
-		}
 		// Follower path.
-		if res.bytes == nil {
+		if encoded == nil {
 			// Leader determined the response is not cacheable. Followers
 			// fall back to running their own handler.
 			return executeAndStore(c, cfg, include, exclude, key)
 		}
-		rep, derr := store.DecodeResponse(res.bytes)
+		rep, derr := store.DecodeResponse(encoded)
 		if derr != nil {
 			return executeAndStore(c, cfg, include, exclude, key)
 		}
@@ -124,18 +126,11 @@ func New(config ...Config) celeris.HandlerFunc {
 	}
 }
 
-// sfResult bundles the encoded response bytes and the effective TTL
-// (possibly capped by Cache-Control max-age) so the singleflight
-// leader can pass both to its waiters and the store.
-type sfResult struct {
-	bytes []byte
-	ttl   time.Duration
-}
-
-// executeAndStore runs the handler, flushes its response to the wire
-// with the MISS header, and stores the encoded bytes on cache
-// eligibility. Used on the non-singleflight path and by followers that
-// fall back (leader produced no cacheable bytes).
+// executeAndStore runs the handler, stores the encoded bytes on cache
+// eligibility, then writes the response to the wire with the MISS
+// header. Used on the non-singleflight path and by followers that fall
+// back (leader produced no cacheable bytes). The store comes first, so
+// a client that reads slowly does not hold back the fill.
 //
 // Borrows the encode buffer from cacheBufPool — Store.Set copies its
 // input internally (MemoryKV.Set reuses the existing backing array per
@@ -143,22 +138,14 @@ type sfResult struct {
 // buffer is safe to recycle the moment Set returns.
 func executeAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string) error {
 	bufPtr := cacheBufPool.Get().(*[]byte)
-	encoded, ttl, err := executeAndReturnWithTTL(c, cfg, include, exclude, (*bufPtr)[:0])
-	if err != nil {
-		*bufPtr = encoded
-		cacheBufPool.Put(bufPtr)
-		return err
-	}
-	if encoded != nil {
-		_ = cfg.Store.Set(c.Context(), key, encoded, ttl)
-	}
+	encoded, chainErr := captureAndStore(c, cfg, include, exclude, key, (*bufPtr)[:0])
 	if cap(encoded) <= cacheBufMaxPooled {
 		*bufPtr = encoded
 	} else {
 		*bufPtr = (*bufPtr)[:0]
 	}
 	cacheBufPool.Put(bufPtr)
-	return nil
+	return writeMiss(c, cfg, chainErr)
 }
 
 // cacheBufPool recycles encode-buffer backing arrays across
@@ -168,18 +155,19 @@ const cacheBufMaxPooled = 64 * 1024
 
 var cacheBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
 
-// executeAndReturnWithTTL buffers + runs the remaining handler chain
-// on c, flushes the wire with the MISS header set, and returns the
-// (encoded-bytes, effective-ttl) iff the response is cacheable.
-// Effective TTL is min(cfg.TTL, Cache-Control max-age) when
-// RespectCacheControl is enabled. Returns (nil, 0, nil) for ineligible
-// responses (status filter, size cap, no-store/private, etc.).
+// captureAndStore buffers + runs the remaining handler chain on c and,
+// iff the response is cacheable, stores its encoding under key with the
+// effective TTL and returns it; the buffered response is left for
+// [writeMiss] to put on the wire. Effective TTL is min(cfg.TTL,
+// Cache-Control max-age) when RespectCacheControl is enabled. Returns nil
+// bytes for ineligible responses (status filter, size cap,
+// no-store/private, etc.), and the chain's error, if any.
 //
 // dst is an optional pre-allocated buffer to encode into. Pass nil for
 // the singleflight leader (followers hold onto the returned bytes past
 // the caller's stack frame), or a pooled buffer on the non-singleflight
 // path where Store.Set's internal copy lets us recycle immediately.
-func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, dst []byte) ([]byte, time.Duration, error) {
+func captureAndStore(c *celeris.Context, cfg Config, include, exclude map[string]struct{}, key string, dst []byte) ([]byte, error) {
 	c.BufferResponse()
 	chainErr := c.Next()
 	status := c.ResponseStatus()
@@ -219,17 +207,24 @@ func executeAndReturnWithTTL(c *celeris.Context, cfg Config, include, exclude ma
 		cacheBytes = nil
 	}
 
+	if cacheBytes != nil {
+		_ = cfg.Store.Set(c.Context(), key, cacheBytes, effectiveTTL)
+	}
+	return cacheBytes, chainErr
+}
+
+// writeMiss puts c's buffered response on the wire with the MISS header.
+// It returns the write's error, or else chainErr: the handler's error,
+// which the router answers.
+func writeMiss(c *celeris.Context, cfg Config, chainErr error) error {
 	// Set MISS header before flushing so it makes it to the wire.
 	if cfg.HeaderName != "" {
 		c.SetHeader(cfg.HeaderName, "MISS")
 	}
 	if ferr := c.FlushResponse(); ferr != nil {
-		return cacheBytes, effectiveTTL, ferr
+		return ferr
 	}
-	if chainErr != nil {
-		return nil, 0, chainErr
-	}
-	return cacheBytes, effectiveTTL, nil
+	return chainErr
 }
 
 // answersRange reports a status that answers the request's Range header: a
