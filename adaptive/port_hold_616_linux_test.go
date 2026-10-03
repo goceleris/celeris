@@ -352,21 +352,34 @@ func netListenAddr(t *testing.T, in string) string {
 	return a
 }
 
-// requireDualStack616 skips a test that needs a dual-stack host (net.Listen
-// makes ":0" "[::]:PORT") on a host without one, such as disable_ipv6=1, or
+// requireDualStack616 skips a test on a host without the IPv6 it needs, or
 // fails it when CELERIS_REQUIRE_DUALSTACK=1, as the adaptive CI job's
-// celeris#616 step sets it: that step must not go green by skipping.
-func requireDualStack616(t *testing.T) {
+// celeris#616 step sets it: that step must not go green by skipping. Every
+// caller needs net.Listen to make ":0" the dual-stack "[::]:PORT", which a
+// kernel booted with ipv6.disable=1 does not; with loopback it also needs
+// [::1] to be bindable, which disable_ipv6=1 on lo takes away.
+func requireDualStack616(t *testing.T, loopback bool) {
 	t.Helper()
-	a := "no listener"
-	if ln, err := net.Listen("tcp", ":0"); err == nil {
-		a = ln.Addr().String()
+	why := ""
+	if ln, err := net.Listen("tcp", ":0"); err != nil {
+		why = fmt.Sprintf("net.Listen(\":0\"): %v", err)
+	} else {
+		if a := ln.Addr().String(); !strings.HasPrefix(a, "[::]:") {
+			why = fmt.Sprintf("net.Listen(\":0\") gives %s, not a dual-stack [::]:PORT", a)
+		}
 		_ = ln.Close()
 	}
-	if strings.HasPrefix(a, "[::]:") {
+	if why == "" && loopback {
+		if ln, err := net.Listen("tcp6", "[::1]:0"); err != nil {
+			why = fmt.Sprintf("[::1] cannot be bound: %v", err)
+		} else {
+			_ = ln.Close()
+		}
+	}
+	if why == "" {
 		return
 	}
-	msg := fmt.Sprintf("net.Listen(\":0\") gives %s here, not a dual-stack [::]:PORT: this test needs a dual-stack host", a)
+	msg := why + ": this test needs a dual-stack host"
 	if os.Getenv("CELERIS_REQUIRE_DUALSTACK") == "1" {
 		t.Fatal(msg + " -- CELERIS_REQUIRE_DUALSTACK=1 forbids skipping")
 	}
@@ -385,7 +398,7 @@ func TestAdaptivePortHeldWildcard616(t *testing.T) {
 			if se.want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
 				t.Skip("io_uring unavailable here: cannot start adaptive on it")
 			}
-			requireDualStack616(t)
+			requireDualStack616(t, true) // it dials [::1]
 			t.Setenv("CELERIS_ADAPTIVE_START", se.env)
 			e, err := New(resource.Config{Addr: ":0", Protocol: engine.HTTP1, Resources: resource.Resources{Workers: 2}}, respHandler{}, nil)
 			if err != nil {
@@ -477,7 +490,7 @@ func countTimeWait(port int) int {
 // wildcard, and the "[::]:P" forms need it too, so it needs a dual-stack host.
 func leaveTimeWait(t *testing.T) int {
 	t.Helper()
-	requireDualStack616(t)
+	requireDualStack616(t, false)
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("predecessor listen: %v", err)
@@ -551,6 +564,9 @@ func TestAdaptivePortHeldBesideTimeWait616(t *testing.T) {
 			t.Run(se.env+"/"+f.name, func(t *testing.T) {
 				if se.want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
 					t.Skip("io_uring unavailable here: cannot start adaptive on it")
+				}
+				if f.wildcard {
+					requireDualStack616(t, true) // net.Listen gives [::]:P, dialled on [::1]
 				}
 				t.Setenv("CELERIS_ADAPTIVE_START", se.env)
 				port := leaveTimeWait(t)
