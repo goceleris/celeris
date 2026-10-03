@@ -41,16 +41,8 @@ type ThreadAffinity struct {
 // mask the process started with (celeris#905).
 func SaveThreadAffinity() (ThreadAffinity, error) {
 	var a ThreadAffinity
-	// The raw syscall returns the size of the kernel's mask on success, not
-	// 0; only errno says whether it failed.
-	_, _, errno := unix.RawSyscall(
-		unix.SYS_SCHED_GETAFFINITY,
-		0,
-		unsafe.Sizeof(a.set),
-		uintptr(unsafe.Pointer(&a.set)),
-	)
-	if errno != 0 {
-		return ThreadAffinity{}, errno
+	if err := unix.SchedGetaffinity(0, &a.set); err != nil {
+		return ThreadAffinity{}, err
 	}
 	return a, nil
 }
