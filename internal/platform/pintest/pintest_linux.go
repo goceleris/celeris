@@ -99,11 +99,31 @@ func readStatus(path string) (name, cpus string, err error) {
 // main thread). Read before anything in the process has changed a thread's
 // affinity, it is the mask every thread of the process starts with; read
 // later, it may not be: the main thread runs goroutines too, an engine loop
-// among them, and celeris#905 left it pinned.
+// among them, and celeris#905 left it pinned. StartupMask is that early read.
 func ProcessMask() (string, error) {
 	_, cpus, err := readStatus("/proc/self/status")
 	return cpus, err
 }
+
+// startup is the main thread's CPU mask when this package was initialised,
+// before any test of the binary ran and so before anything in the process
+// could have changed a thread's affinity. The runtime runs package
+// initialisation on the main thread.
+var startup struct {
+	mask string // its Cpus_allowed_list
+	set  unix.CPUSet
+	err  error
+}
+
+func init() {
+	if startup.mask, startup.err = ProcessMask(); startup.err == nil {
+		startup.err = unix.SchedGetaffinity(0, &startup.set)
+	}
+}
+
+// StartupMask returns the Cpus_allowed_list the main thread had when this
+// package was initialised, before any test of the binary ran.
+func StartupMask() (string, error) { return startup.mask, startup.err }
 
 // Census returns every task of this process, sorted by TID. A task that exits
 // while the census reads it is left out.
@@ -131,8 +151,9 @@ func Census() ([]Thread, error) {
 	return out, nil
 }
 
-// Off returns the threads Go can schedule on (every task but the kernel's
-// io_uring threads) whose mask is not want.
+// Off returns the tasks other than the kernel's io_uring threads whose mask is
+// not want: the threads Go can schedule on, and the main thread even once the
+// runtime has parked it for good.
 func Off(threads []Thread, want string) []Thread {
 	var off []Thread
 	for _, th := range threads {
@@ -193,6 +214,10 @@ func LockedThreads(n int) ([]Locked, error) {
 // envChild names the test a re-executed process is to run in its own process.
 const envChild = "CELERIS_PINTEST_CHILD"
 
+// envParentMask carries the StartupMask of the process that ran
+// RunInOwnProcess to the process it started.
+const envParentMask = "CELERIS_PINTEST_PARENT_MASK"
+
 // InOwnProcess reports whether this process is the one RunInOwnProcess
 // started for t.
 func InOwnProcess(t *testing.T) bool { return os.Getenv(envChild) == t.Name() }
@@ -205,10 +230,20 @@ func InOwnProcess(t *testing.T) bool { return os.Getenv(envChild) == t.Name() }
 // The child's output is logged with every line prefixed "child| ", so that
 // no line of it starts with "--- " or "=== " and no tally of this binary's
 // output can count the child's lines as this process's results.
+//
+// The child starts with the CPU mask of the thread that forks it, and in a
+// package whose earlier tests left a thread pinned to one CPU (celeris#905)
+// that thread can be the one running t. So the fork is made from a thread t
+// holds, and t fails if that thread's mask is not the one this process
+// started with. The mask is put back before the fork, so the child still
+// tests its own engine, and the child checks it again (envParentMask).
 func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 	t.Helper()
 	if InOwnProcess(t) {
 		t.Fatal("RunInOwnProcess called from inside the process it started")
+	}
+	if startup.err != nil {
+		t.Fatalf("read the process's CPU mask at init: %v", startup.err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), timeout+30*time.Second)
 	defer cancel()
@@ -219,10 +254,31 @@ func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 		"-test.v",
 		"-test.timeout="+timeout.String(),
 	)
-	cmd.Env = append(os.Environ(), envChild+"="+name)
-	out, err := cmd.CombinedOutput()
+	cmd.Env = append(os.Environ(), envChild+"="+name, envParentMask+"="+startup.mask)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	runtime.LockOSThread()
+	var cur unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &cur); err != nil {
+		runtime.UnlockOSThread()
+		t.Fatalf("sched_getaffinity: %v", err)
+	}
+	if cur != startup.set {
+		_, cpus, _ := readStatus("/proc/thread-self/status")
+		t.Errorf("celeris#905 in this process: the thread %s runs on (tid %d) may run on CPU %s only, not on "+
+			"the %s this process started with -- an earlier test left a thread pinned and handed it back to "+
+			"the scheduler", name, unix.Gettid(), cpus, startup.mask)
+		if err := unix.SchedSetaffinity(0, &startup.set); err != nil {
+			t.Errorf("put the process's mask back on that thread before the fork: %v", err)
+		}
+	}
+	err := cmd.Start()
+	runtime.UnlockOSThread()
+	if err == nil {
+		err = cmd.Wait()
+	}
 	var b strings.Builder
-	for line := range strings.SplitSeq(strings.TrimRight(string(out), "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(out.String(), "\n"), "\n") {
 		b.WriteString("child| ")
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -233,8 +289,8 @@ func RunInOwnProcess(t *testing.T, timeout time.Duration) {
 	}
 	t.Logf("%s in its own process (pid %d):\n%s", name, pid, b.String())
 
-	passed := regexp.MustCompile(`(?m)^--- PASS: ` + regexp.QuoteMeta(name) + ` \(`).Match(out)
-	skipped := regexp.MustCompile(`(?m)^--- SKIP: ` + regexp.QuoteMeta(name) + ` \(`).Match(out)
+	passed := regexp.MustCompile(`(?m)^--- PASS: ` + regexp.QuoteMeta(name) + ` \(`).Match(out.Bytes())
+	skipped := regexp.MustCompile(`(?m)^--- SKIP: ` + regexp.QuoteMeta(name) + ` \(`).Match(out.Bytes())
 	switch {
 	case err == nil && passed:
 	case err == nil && skipped:
@@ -255,27 +311,46 @@ type StartFunc func(t *testing.T) (loops int, stop func())
 const exitBound = 5 * time.Second
 
 // StoppedEnginesLeaveNoPinnedThread is the body of the celeris#905
-// regression tests. It starts and stops an engine cycles times, in this
-// process (call it from the process RunInOwnProcess started), and after every
+// regression tests. Call it from the process RunInOwnProcess started. It
+// starts and stops an engine cycles times in this process, and after every
 // stop requires that
 //
-//   - no thread of the process Go can schedule on has a CPU mask other than
-//     the one the process started with (so none is left pinned to one CPU),
-//     within exitBound; and
+//   - no task of the process but the kernel's io_uring threads has a CPU mask
+//     other than the one the process started with, within exitBound. That is
+//     every thread Go can schedule on, so none is left pinned to one CPU, and
+//     also the main thread once the runtime has parked it for good: Go never
+//     runs it again, but its mask is what /proc/<pid>/status and taskset -p
+//     report for the whole process; and
 //   - a goroutine that locks an OS thread afterwards sees that mask, on every
 //     thread the runtime can give it (LockedThreads).
 //
 // The engine must have pinned a thread while it ran (one per loop): a run in
 // which nothing was pinned checks nothing, and fails.
+//
+// The fix's restore matters only for the main thread (every other loop
+// thread exits), and a loop runs on the main thread only in some runs: a run
+// in which none did says so in its log and its RESULT line.
 func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, start StartFunc) {
 	t.Helper()
-	base, err := ProcessMask()
+	base, err := StartupMask()
 	if err != nil {
-		t.Fatalf("read the process's CPU mask: %v", err)
+		t.Fatalf("read the process's CPU mask at init: %v", err)
 	}
-	if n := CountCPUs(base); n < 2 {
+	// The parent's mask decides the skip: a child forked from a thread left
+	// pinned would otherwise skip as a one-CPU process (celeris#905 in the
+	// parent), where it has to fail.
+	parent := os.Getenv(envParentMask)
+	if parent == "" {
+		parent = base
+	}
+	if n := CountCPUs(parent); n < 2 {
 		t.Skipf("the process may run on CPU %s only (%d CPU): a thread pinned to one CPU cannot be told "+
-			"from one that is not", base, n)
+			"from one that is not", parent, n)
+	}
+	if base != parent {
+		t.Fatalf("celeris#905 in the parent process: this process started on CPU mask %s, but the process "+
+			"that forked it started on %s -- it was forked from a thread left pinned and handed back to the "+
+			"scheduler", base, parent)
 	}
 	before, err := Census()
 	if err != nil {
@@ -288,6 +363,13 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 	pid := os.Getpid()
 	var pinnedRunning, leftOff, lockedProbe, lockedOff, m0Hosted int
 	for cycle := 1; cycle <= cycles; cycle++ {
+		// The main thread counts as hosting a loop only if it had the
+		// process's mask when the cycle began, not if an earlier cycle left
+		// it pinned.
+		m0Before, err := ProcessMask()
+		if err != nil {
+			t.Fatalf("cycle %d: read the main thread's mask: %v", cycle, err)
+		}
 		loops, stop := start(t)
 		running, err := Census()
 		if err != nil {
@@ -298,7 +380,7 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 		for _, th := range Off(running, base) {
 			if th.Single() {
 				pinned = append(pinned, th)
-				if th.TID == pid {
+				if th.TID == pid && m0Before == base {
 					m0Hosted++
 				}
 			}
@@ -329,7 +411,8 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 		leftOff += len(off)
 		if len(off) > 0 {
 			t.Errorf("cycle %d: %v after the %s engine stopped, %d thread(s) of the process are still off "+
-				"its mask %s and the scheduler can run any goroutine on them: %v",
+				"its mask %s (the scheduler can run any goroutine on such a thread; a parked main thread "+
+				"makes the whole process read as pinned): %v",
 				cycle, exitBound, engine, len(off), base, off)
 		}
 
@@ -357,6 +440,11 @@ func StoppedEnginesLeaveNoPinnedThread(t *testing.T, engine string, cycles int, 
 			t.Errorf("cycle %d: after the %s engine stopped, %d of %d goroutines that locked an OS thread "+
 				"got one whose mask is not the process's %s: %v", cycle, engine, len(bad), len(seen), base, bad)
 		}
+	}
+	if m0Hosted == 0 {
+		t.Logf("in %d cycle(s) no loop ran on the main thread, so this run did not check the restore that "+
+			"leaves the main thread the process's mask (TestSaveThreadAffinityRestoresThePin covers Restore "+
+			"itself)", cycles)
 	}
 	t.Logf("celeris905 RESULT engine=%s cycles=%d process_mask=%s pinned_while_running=%d "+
 		"main_thread_hosted_a_loop=%d off_mask_after_stop=%d locked_probes=%d locked_off_mask=%d",

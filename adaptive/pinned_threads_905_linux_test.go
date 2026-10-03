@@ -20,6 +20,8 @@ import (
 // thread can reach the scheduler then, and the test checks that after the
 // promote. The loops of both sub-engines exit when the adaptive engine
 // stops, and each used to hand its thread back to the scheduler still pinned.
+// On the base the check after the promote finds nothing in the first cycle;
+// in later cycles it can find the threads an earlier stop left pinned.
 //
 // The test runs in a process of its own (pintest.RunInOwnProcess), because
 // its census is of every thread in the process and the other tests in this
@@ -29,9 +31,9 @@ func TestStoppedAdaptiveEngineLeavesNoPinnedThread(t *testing.T) {
 		pintest.RunInOwnProcess(t, 2*time.Minute)
 		return
 	}
-	// Read once, before any engine has run: on a thread left pinned, the
-	// main thread included, the mask is no longer the process's.
-	base, err := pintest.ProcessMask()
+	// The mask the process started with, read at init: on a thread left
+	// pinned, the main thread included, a later read is no longer it.
+	base, err := pintest.StartupMask()
 	if err != nil {
 		t.Fatalf("read the process's CPU mask: %v", err)
 	}
@@ -101,7 +103,8 @@ func startPromoted905(t *testing.T, base string) (int, func()) {
 		"thread got one off the process mask %s: %v", wE, wI, len(bad), len(seen), base, bad)
 	if len(bad) > 0 {
 		t.Errorf("after a promote, %d goroutine(s) that locked an OS thread got one pinned off the process "+
-			"mask %s: the promote handed a pinned thread back to the scheduler: %v", len(bad), base, bad)
+			"mask %s: a pinned thread is loose in the scheduler, handed back by the promote or by an "+
+			"earlier stop in this process: %v", len(bad), base, bad)
 	}
 	return wE + wI, stop
 }
