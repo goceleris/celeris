@@ -1,6 +1,7 @@
 package otel
 
 import (
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -227,6 +228,39 @@ func (o *owner) cutValue(v attribute.Value) attribute.Value {
 		return attribute.MapValue(l.kvs...)
 	}
 	return v
+}
+
+// recordError records the handler's error on span: an exception event and
+// the error status, both from one copy of its message, made only when the
+// span records.
+//
+// The span keeps both until it is exported. An error's message can be a
+// request string, errors.New(c.Param("id")) or an HTTPError whose Message is
+// a header, and on epoll and io_uring that is a view of the connection's
+// receive buffer, which the engine reuses for the connection's next request
+// and, once the connection closes, for another connection (celeris#732).
+// span.RecordError calls err.Error() itself and keeps what it returns, so
+// the event is built here as the SDK's RecordError builds it.
+func recordError(span trace.Span, err error) {
+	if !span.IsRecording() {
+		return
+	}
+	msg := strings.Clone(err.Error())
+	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
+		semconv.ExceptionType(errorType(err)),
+		semconv.ExceptionMessage(msg),
+	))
+	span.SetStatus(codes.Error, truncateString(msg, maxErrorLen))
+}
+
+// errorType names err's type as the OTel SDK's RecordError does: package
+// path and name, or the type's string for an unnamed type such as a pointer.
+func errorType(err error) string {
+	t := reflect.TypeOf(err)
+	if t.PkgPath() == "" && t.Name() == "" {
+		return t.String()
+	}
+	return t.PkgPath() + "." + t.Name()
 }
 
 // truncateString truncates s to maxLen bytes without splitting multi-byte
@@ -485,8 +519,7 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 
 			if err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, truncateString(err.Error(), maxErrorLen))
+				recordError(span, err)
 			} else if status >= 500 {
 				span.SetStatus(codes.Error, "")
 			}
@@ -523,8 +556,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, truncateString(err.Error(), maxErrorLen))
+			recordError(span, err)
 		} else if status >= 500 {
 			span.SetStatus(codes.Error, "")
 		}

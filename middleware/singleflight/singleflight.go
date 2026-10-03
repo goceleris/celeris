@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/internal/handoff"
 )
 
 type call struct {
@@ -139,13 +140,14 @@ func New(config ...Config) celeris.HandlerFunc {
 		c.BufferResponse()
 
 		var panicVal any
+		var handlerErr error
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					panicVal = r
 				}
 			}()
-			entry.err = c.Next()
+			handlerErr = c.Next()
 		}()
 
 		// Remove from map BEFORE wg.Done so new requests after Done create
@@ -167,14 +169,14 @@ func New(config ...Config) celeris.HandlerFunc {
 				entry.body = append([]byte(nil), body...)
 			}
 			entry.headers, entry.ct = ownHeaders(c.ResponseHeaders(), c.ResponseContentType())
-			entry.panicVal = panicVal
+			// The error and the panic value can hold the leader's request
+			// strings too (errors.New(c.Param("id")), panic(c.Header("x"))),
+			// which a waiter formats after the leader has returned: hand the
+			// waiters copies (see handoff). The leader keeps its own.
+			entry.err = handoff.Error(handlerErr)
+			entry.panicVal = handoff.Panic(panicVal)
 		}
 		entry.wg.Done()
-
-		// Snapshot any leader-side state BEFORE returning entry to the
-		// pool — otherwise a concurrent acquireCall could race with the
-		// reads below.
-		handlerErr := entry.err
 
 		// Pool-reuse the entry when no waiter referenced it. Entries seen
 		// by waiters stay live until the last reader drops them (the

@@ -9,6 +9,8 @@ package sf
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/goceleris/celeris/middleware/internal/handoff"
 )
 
 // Call is a single in-flight call for a key. Followers block on wg; the
@@ -53,7 +55,8 @@ func New[T any]() *Group[T] {
 
 // Do runs fn for the first caller of a given key and returns its result
 // to every caller. The bool second return is true for the leader (the
-// caller that actually ran fn) and false for followers.
+// caller that actually ran fn) and false for followers. The leader gets
+// fn's error itself; followers get it as [handoff.Error] returns it.
 func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
@@ -86,9 +89,12 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	g.mu.Unlock()
 
 	if numWaiters > 0 {
-		// Followers will read these fields after wg.Done; populate.
+		// Followers will read these fields after wg.Done; populate. The
+		// followers get the error handed off (a copy of its message): the
+		// leader's error can hold its request strings, which a follower
+		// formats after the leader's request has ended (celeris#732).
 		c.Result = result
-		c.Err = err
+		c.Err = handoff.Error(err)
 	}
 	c.wg.Done()
 
