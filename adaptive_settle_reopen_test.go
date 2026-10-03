@@ -267,6 +267,13 @@ func TestRouteAdaptive_NoReopenerWhenEngineCreationFails(t *testing.T) {
 	go func() { done <- okSrv.StartWithListenerAndContext(ctx, ln) }()
 	deadline := time.Now().Add(10 * time.Second)
 	for !reopenerStarted(okSrv.router) && time.Now().Before(deadline) {
+		// A Start that returns first never starts the re-opener: report its
+		// error rather than the discriminator's (celeris#706).
+		select {
+		case err := <-done:
+			t.Fatalf("discriminator: the server's Start returned %v before the re-opener started", err)
+		default:
+		}
 		time.Sleep(2 * time.Millisecond)
 	}
 	if !reopenerStarted(okSrv.router) {

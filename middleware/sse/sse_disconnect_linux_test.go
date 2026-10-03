@@ -109,22 +109,25 @@ func startSSEServer(tb testing.TB, engine celeris.EngineType, async, routeAsync 
 
 	// Readiness poll: the native engines rebind the port via SO_REUSEPORT,
 	// so the listener we passed in is not the one that ends up serving.
+	// A Start that returns first is reported (or skipped) at once, with its
+	// own error, not after the 30 s deadline (celeris#706).
 	deadline := time.Now().Add(30 * time.Second)
 	var addr string
 	for addr == "" {
-		if time.Now().After(deadline) {
-			select {
-			case err := <-done:
-				if err != nil {
-					msg := err.Error()
-					if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
-						tb.Skipf("engine unavailable on this runner: %v", err)
-					}
-					tb.Fatalf("server start: %v", err)
+		select {
+		case err := <-done:
+			if err != nil {
+				msg := err.Error()
+				if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
+					tb.Skipf("engine unavailable on this runner: %v", err)
 				}
-			default:
+				tb.Fatalf("server start: %v", err)
 			}
-			tb.Fatal("server not ready within 30s")
+			tb.Fatal("server start returned nil before the server was ready")
+		default:
+		}
+		if time.Now().After(deadline) {
+			tb.Fatal("server not ready within 30s, and Start has not returned")
 		}
 		if a := s.Addr(); a != nil {
 			c, err := net.DialTimeout("tcp", a.String(), 100*time.Millisecond)

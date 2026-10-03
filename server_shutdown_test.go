@@ -35,6 +35,9 @@ func TestServerShutdownDrainsInFlight(t *testing.T) {
 	servCtx, servCancel := context.WithCancel(context.Background())
 	servDone := make(chan error, 1)
 	go func() { servDone <- s.StartWithListenerAndContext(servCtx, ln) }()
+	// A Start that fails is reported as itself, not as a handler that did
+	// not start (celeris#706).
+	addr := waitServerStarted(t, s, servDone, 5*time.Second)
 
 	// Fire the slow request in another goroutine so we can race Shutdown.
 	type result struct {
@@ -43,7 +46,7 @@ func TestServerShutdownDrainsInFlight(t *testing.T) {
 	}
 	res := make(chan result, 1)
 	go func() {
-		resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + ln.Addr().String() + "/slow")
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + addr + "/slow")
 		if err != nil {
 			res <- result{err: err}
 			return
@@ -95,17 +98,10 @@ func TestStartAfterShutdown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.StartWithListenerAndContext(ctx, ln) }()
 
-	// Wait for ready.
-	addr := ln.Addr().String()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c, derr := net.DialTimeout("tcp", addr, 50*time.Millisecond)
-		if derr == nil {
-			_ = c.Close()
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Wait for ready: fails at once with Start's error if Start returns
+	// first, and never goes on against a server that did not start
+	// (celeris#706).
+	waitServerStarted(t, s, done, 5*time.Second)
 
 	// Shutdown.
 	shutdownCtx, sc := context.WithTimeout(context.Background(), 2*time.Second)

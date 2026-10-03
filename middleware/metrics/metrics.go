@@ -174,7 +174,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		// the core router, so the 404 fallback below is redundant in that
 		// case. The fallback is kept for edge cases: middleware running
 		// without the core router (e.g., ToHandler bridge) or pre-v1.2.4.
-		path := c.FullPath()
+		fullPath := c.FullPath()
+		path := fullPath
 		if path == "" {
 			if status == 404 {
 				path = "<unmatched>"
@@ -184,11 +185,24 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		path = strings.ToValidUTF8(path, "")
 
+		// A route's method is one the app registered, so its label values
+		// are bounded by the routes. A request no route matched (FullPath
+		// "<unmatched>", "<method-not-allowed>", or "" without the core
+		// router) carries whatever method the client sent, which the global
+		// middleware sees since celeris#852: one new series per distinct
+		// method, kept for the life of the registry, and WithLabelValues
+		// panics on one that is not valid UTF-8. Outside the standard set it
+		// is "_OTHER", as in the otel middleware.
+		method := c.Method()
+		if (fullPath == "" || fullPath[0] != '/') && !isStandardMethod(method) {
+			method = "_OTHER"
+		}
+
 		// Label values: method, path, status + custom labels, as a lookup
 		// key. The key is built on the stack and the lookup copies
 		// nothing; see seriesSet.
 		var kb [256]byte
-		key := appendLabelValue(kb[:0], c.Method())
+		key := appendLabelValue(kb[:0], method)
 		key = appendLabelValue(key, path)
 		key = appendLabelValue(key, statusStr)
 		for i := range nCustom {
@@ -247,6 +261,16 @@ type series struct {
 	// never carried a body has no request_size_bytes series, as before.
 	reqSize  atomic.Pointer[prometheus.Observer]
 	respSize atomic.Pointer[prometheus.Observer]
+}
+
+// isStandardMethod reports whether m is one of the HTTP methods of RFC 9110
+// §9 or PATCH, the set the otel middleware keeps.
+func isStandardMethod(m string) bool {
+	switch m {
+	case "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT":
+		return true
+	}
+	return false
 }
 
 // appendLabelValue appends v to a lookup key, length-prefixed so that no

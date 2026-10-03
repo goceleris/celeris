@@ -3,6 +3,9 @@ package websocket
 import (
 	"context"
 	"io"
+	"net"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -136,11 +139,19 @@ func New(config ...Config) celeris.HandlerFunc {
 		// cloning them again. On the hijack path nothing has been hijacked
 		// yet, and captureQuery clones them itself.
 		queryParams := captureQuery(c, ws == nil)
+		// The route params likewise (celeris#721): Detach copied them on the
+		// engine path; captureParams clones them on the hijack path.
+		routeParams := captureParams(c, ws == nil)
 
 		if ws != nil {
 			// Engine path: populate conn and run handler in goroutine.
+			// No net.Conn on the engine path to ask for the peer: keep the
+			// address the engine reported for the connection (celeris#721).
+			// Set before setupConn, which derives the Conn's IP from it.
+			ws.remote = peerAddr(c.RemoteAddr())
 			setupConn(ws, &cfg, compress,
 				reqHeaders, queryParams)
+			ws.params = routeParams
 			go func() {
 				defer func() {
 					ws.fragWriting.Store(false) // clear in case handler panicked mid-NextWriter
@@ -173,6 +184,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		setupConn(ws, &cfg, compress,
 			reqHeaders, queryParams)
+		ws.params = routeParams
 
 		defer func() {
 			ws.fragWriting.Store(false) // clear in case handler panicked mid-NextWriter
@@ -324,12 +336,82 @@ func setupConn(ws *Conn, cfg *Config, compress bool,
 	}
 	ws.headers = headers
 	ws.query = query
+	ws.cachedIP = ipOf(ws.RemoteAddr())
 	ws.idleTimeout = cfg.IdleTimeout
 	// WriteBufferPool: only consulted on the hijack (std) path. The native
 	// engine path uses the engine's internal write buffer pool (cs.writeBuf)
 	// and ignores this setting — see Conn.getWriter().
 	ws.writePool = cfg.WriteBufferPool
 }
+
+// captureParams returns the upgrade request's route params for [Conn.Param]:
+// one pair per named parameter (":room") and catch-all ("*path") in the
+// matched route pattern, c.FullPath(), whose names the router owns. Before
+// celeris#721 nothing captured them and Conn.Param always returned "".
+//
+// The values are views of the receive buffer on epoll and io_uring, which
+// the engine keeps receiving WebSocket frames into (see captureQuery). After
+// Context.Detach they are copies (Detach copies the params), and clone is
+// false; on the hijack path clone is true and each value is cloned.
+//
+// The names are parsed from the pattern by the rule the router splits it
+// with (router_tree.go, splitPath and findSegmentEnd): ':' up to the next
+// '/', '*' to the end. Context has no accessor for its params' names, so a
+// change to that syntax must change this loop too.
+func captureParams(c *celeris.Context, clone bool) [][2]string {
+	pattern := c.FullPath()
+	var out [][2]string
+	for i := 0; i < len(pattern); i++ {
+		var name string
+		switch pattern[i] {
+		case ':':
+			j := i + 1
+			for j < len(pattern) && pattern[j] != '/' {
+				j++
+			}
+			name, i = pattern[i+1:j], j
+		case '*':
+			name, i = pattern[i+1:], len(pattern)
+		default:
+			continue
+		}
+		v := c.Param(name)
+		if clone {
+			v = strings.Clone(v)
+		}
+		out = append(out, [2]string{name, v})
+	}
+	return out
+}
+
+// peerAddr turns the peer address the engine reported for the connection
+// ("ip:port") into the net.Addr [Conn.RemoteAddr] returns: a *net.TCPAddr,
+// as the hijack path's net.Conn gives. The engines report an IPv4 peer of a
+// dual-stack ("[::]:port") listener as "[a.b.c.d]:port", which
+// netip.ParseAddrPort rejects, so the host and the port are then parsed on
+// their own. An address that does not parse is kept as it is.
+func peerAddr(s string) net.Addr {
+	if s == "" {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(s)
+	if err != nil {
+		host, port, serr := net.SplitHostPort(s)
+		ip, ierr := netip.ParseAddr(host)
+		p, perr := strconv.ParseUint(port, 10, 16)
+		if serr != nil || ierr != nil || perr != nil {
+			return rawAddr(s)
+		}
+		ap = netip.AddrPortFrom(ip, uint16(p))
+	}
+	return net.TCPAddrFromAddrPort(ap)
+}
+
+// rawAddr is a peer address kept as the engine reported it.
+type rawAddr string
+
+func (rawAddr) Network() string  { return "tcp" }
+func (a rawAddr) String() string { return string(a) }
 
 // captureQuery returns the upgrade request's query parameters for
 // [Conn.Query]. On epoll and io_uring the raw query is a view of the engine's

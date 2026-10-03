@@ -244,7 +244,7 @@ func TestPlainConfigUnchanged(t *testing.T) {
 					OAuth2:            oauth,
 				},
 			})
-			assertContains(t, body, "\n  url: \"/swagger/spec\",\n")
+			assertContains(t, body, "\n  url: \"spec\",\n")
 			assertContains(t, body, `docExpansion: "list",`)
 			assertContains(t, body, `oauth2RedirectUrl: "https://example.com/oauth2-redirect"`)
 			assertContains(t, body, `ui.initOAuth({clientId: "my-client", usePkceWithAuthorizationCodeGrant: true, realm: "my-realm", appName: "My App", scopes: "read write"});`)
@@ -263,7 +263,7 @@ func TestPlainConfigUnchanged(t *testing.T) {
 				AssetsPath:  v.assetsPath,
 				CDN:         v.cdn,
 			})
-			assertContains(t, body, `Redoc.init("/swagger/spec", {}, document.getElementById("redoc-container"));`)
+			assertContains(t, body, `Redoc.init("spec", {}, document.getElementById("redoc-container"));`)
 		})
 	}
 }

@@ -313,6 +313,14 @@ func runT1Cell(t *testing.T, kind celeris.EngineType, engineName, cell string, p
 	// ignored rather than counted as an unjoined record.
 	addr := ""
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		// A Start that returns first is reported with its error at once,
+		// not as a 30 s readiness timeout (celeris#706).
+		select {
+		case err := <-serverDone:
+			serverDone <- err
+			t.Fatalf("server stopped before it was ready: Start returned %v", err)
+		default:
+		}
 		if a := s.Addr(); a != nil {
 			c, err := net.DialTimeout("tcp", a.String(), 100*time.Millisecond)
 			if err == nil {

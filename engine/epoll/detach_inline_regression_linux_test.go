@@ -124,6 +124,8 @@ func TestDetachInlineNoDoubleUnlock(t *testing.T) {
 				}
 			}()
 			time.Sleep(500 * time.Millisecond)
+			// A Start that fails after the settle sleep is not missed (celeris#706).
+			waitUpOrStopped(t, srv, done, 30*time.Second)
 			if p := startErr.Load(); p != nil {
 				msg := (*p).Error()
 				if strings.Contains(msg, "io_uring") || strings.Contains(msg, "not available") {
