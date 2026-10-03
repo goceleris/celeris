@@ -1,6 +1,7 @@
 package celeris
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -155,15 +156,17 @@ func TestRouterAllowedMethods(t *testing.T) {
 	r.addRoute("POST", "/resource", []HandlerFunc{func(_ *Context) error { return nil }})
 	r.addRoute("PUT", "/resource", []HandlerFunc{func(_ *Context) error { return nil }})
 
+	// celeris#421: HEAD (answered by the GET route) and OPTIONS (answered
+	// automatically) are allowed too.
 	allowed := r.allowedMethods("/resource", "DELETE")
-	if len(allowed) != 3 {
-		t.Fatalf("expected 3 allowed methods, got %d: %v", len(allowed), allowed)
+	if got := strings.Join(allowed, ", "); got != "GET, POST, PUT, HEAD, OPTIONS" {
+		t.Fatalf("allowed %q, want %q", got, "GET, POST, PUT, HEAD, OPTIONS")
 	}
 
-	// Exclude GET — should return POST, PUT.
+	// Exclude GET — should return POST, PUT, HEAD, OPTIONS.
 	allowed = r.allowedMethods("/resource", "GET")
-	if len(allowed) != 2 {
-		t.Fatalf("expected 2 allowed methods, got %d: %v", len(allowed), allowed)
+	if got := strings.Join(allowed, ", "); got != "POST, PUT, HEAD, OPTIONS" {
+		t.Fatalf("allowed %q, want %q", got, "POST, PUT, HEAD, OPTIONS")
 	}
 
 	// Unknown path — no methods.
