@@ -331,14 +331,7 @@ const (
 // machine returns to phaseAwaitResult, accepting another RowDescription.
 type SimpleQueryState struct {
 	Columns []ColumnDesc
-	// Tag is left empty on CommandComplete to avoid the per-query string
-	// allocation. Callers should use TagBytes() and RowsAffectedBytes()
-	// instead. If a caller needs the tag as a Go string, they can
-	// materialize it on demand via string(q.TagBytes()).
-	//
-	// Deprecated: use TagBytes() for allocation-free access.
-	Tag string
-	Err *PGError
+	Err     *PGError
 
 	phase simpleQueryPhase
 	// fieldScratch is reused across DataRow payloads within a single
@@ -347,24 +340,20 @@ type SimpleQueryState struct {
 	// backing array from the previous cycle is still large enough).
 	fieldScratch [][]byte
 	// tagBuf holds a copy of the CommandComplete tag bytes. Reused across
-	// life cycles to avoid the per-Query string allocation that the
-	// previous implementation paid via ReadCString.
+	// life cycles to avoid a per-Query string allocation; TagBytes returns
+	// it, and string(q.TagBytes()) materializes the tag when a caller needs
+	// a Go string.
 	tagBuf []byte
-	// tagDirty indicates tagBuf has fresh bytes that Tag has not yet been
-	// materialized from. Currently unused; retained for future use if we
-	// re-introduce lazy string materialization for back-compat.
-	tagDirty bool
 }
 
 // TagBytes returns the CommandComplete tag as an owned byte slice
-// (independent of the wire Reader's buffer). Callers that only need to
-// parse a row count (via RowsAffectedBytes) should use this instead of
-// Tag to avoid the string allocation.
+// (independent of the wire Reader's buffer), for example "INSERT 0 1".
+// Pass it to RowsAffectedBytes to parse a row count without allocating.
 func (q *SimpleQueryState) TagBytes() []byte { return q.tagBuf }
 
 // Reset zeroes the state machine for reuse while preserving the internal
 // fieldScratch / Columns / tagBuf backing arrays. The caller still owns the
-// semantic fields (Columns, Tag, Err): they are re-set to their zero
+// semantic fields (Columns, Err): they are re-set to their zero
 // values with length=0 but cap retained.
 func (q *SimpleQueryState) Reset() {
 	scratch := q.fieldScratch
@@ -456,20 +445,13 @@ func (q *SimpleQueryState) Handle(
 		return false, nil
 	case BackendCommandComplete:
 		tagBytes := commandCompleteTagBytes(payload)
-		// Store the tag into an owned byte buffer; materialize q.Tag
-		// (string) via the Tag accessor only when accessed. This keeps
-		// Query/Exec hot paths allocation-free when the caller uses
-		// TagBytes + RowsAffectedBytes, while still giving Tag-reading
-		// callers (tests, multi-statement enumerations, custom
-		// integrations) the string form on demand.
+		// Copy the tag into the owned buffer TagBytes returns, so the
+		// Query/Exec hot paths stay allocation-free.
 		q.tagBuf = append(q.tagBuf[:0], tagBytes...)
-		q.Tag = ""
-		q.tagDirty = true
 		// Multi-statement: another RowDescription may follow before RFQ.
 		q.phase = sqPhaseAwaitResult
 		return false, nil
 	case BackendEmptyQuery:
-		q.Tag = ""
 		q.phase = sqPhaseAwaitResult
 		return false, nil
 	case BackendErrorResponse:

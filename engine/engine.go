@@ -108,6 +108,12 @@ type SendfileCapable interface {
 // adaptive/engine.go was the only reader and it received zeros from
 // both sub-engines, so removing the fields changes nothing observable.
 // SyscallRate, referenced by the issue, never existed in the tree.
+//
+// v1.6.0: Throughput was removed (celeris#653, celeris#830). It was
+// documented as a requests-per-second rate, but no engine ever assigned it,
+// so it always read 0. A snapshot covers no interval, so it has no rate to
+// report: call [Engine.Metrics] twice and divide the RequestCount difference
+// by the time between the calls.
 type EngineMetrics struct { //nolint:revive // user-approved name
 	// RequestCount is the cumulative number of requests handled by this engine.
 	RequestCount uint64
@@ -194,17 +200,6 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// that returned an error. std only — the native engines do not fold a
 	// handler error into ErrorCount.
 	ErrorHandler uint64
-	// Throughput always reads 0: no engine has ever assigned it.
-	//
-	// Deprecated: Throughput was documented as the recent requests-per-second
-	// rate, but no engine computes a rate for EngineMetrics (std, epoll and
-	// io_uring never set it, and adaptive only summed their zeros), and a
-	// snapshot has no interval of its own to compute one over. It therefore
-	// always reads 0, which looks exactly like a measured rate of zero
-	// (celeris#653). Derive a rate from RequestCount instead: call
-	// [Engine.Metrics] twice and divide the RequestCount difference by the time
-	// between the calls. The field is removed in v2.0.0 (celeris#651).
-	Throughput float64
 	// AsyncRoutes is the count of routes registered with .Async(true) on
 	// this engine's handler. Static after Listen — derived from the
 	// router's per-route async flags and exposed for diagnostics so
@@ -609,6 +604,46 @@ type EngineMetrics struct { //nolint:revive // user-approved name
 	// engine each is the sum over both sub-engines.
 	CloseFDDeferred uint64
 	CloseFDForced   uint64
+	// CloseZCNotifHeld, CloseZCNotifHeldNow, CloseZCNotifHeldBytes,
+	// CloseZCNotifForced and ShutdownZCBufRetained show how the io_uring
+	// engine keeps a SEND_ZC's send buffer for as long as the kernel may read
+	// it (celeris#812). A zero-copy send leaves its unsent part queued on the
+	// socket as references to the buffer's pages, and a peer that stops
+	// reading keeps it there, after a close too, until the peer reads or the
+	// kernel gives up on the socket; the kernel then sends it from whatever
+	// the buffer holds. Released to be reused before that, the buffer
+	// delivered another connection's bytes to that peer. So the release
+	// backstop, 5 s after a close, holds such a buffer until the kernel says
+	// it is done, for as long as the peer keeps the socket alive: a peer that
+	// keeps reading, however slowly, can keep it for as long as it likes. A
+	// hold keeps the buffer alone (its connection's other state is released)
+	// and costs no descriptor, no connection slot and no work per event-loop
+	// pass; a worker holding 16 MiB of them stops using SEND_ZC, and copies,
+	// until some are released.
+	//
+	//   - CloseZCNotifHeld: holds started. A rate: a connection the server
+	//     closed while its peer had stopped reading mid-send.
+	//   - CloseZCNotifHeldNow and CloseZCNotifHeldBytes are GAUGES: the send
+	//     buffers held right now, and their capacity in bytes. A worker that
+	//     shuts down takes its share out (its buffers then count in
+	//     ShutdownZCBufRetained).
+	//   - CloseZCNotifForced: send buffers given up while a SEND_ZC was still
+	//     owed on them. Must stay 0. The hold is decided so that the backstop
+	//     never gives one up, so this is a tripwire for a change that breaks
+	//     that decision, not a measure of what peers or the kernel do: it
+	//     cannot move on the shipped code.
+	//   - ShutdownZCBufRetained: send buffers engine shutdown kept for the
+	//     life of the process, because a SEND_ZC may still read them when the
+	//     io_uring ring closes and nothing can say when it stops.
+	//
+	// io_uring-only; zero on other engines. All but the two gauges are
+	// cumulative. On the adaptive engine each is the sum over both
+	// sub-engines.
+	CloseZCNotifHeld      uint64
+	CloseZCNotifHeldNow   uint64
+	CloseZCNotifHeldBytes uint64
+	CloseZCNotifForced    uint64
+	ShutdownZCBufRetained uint64
 	// TransplantSweepPasses counts passes of the post-switch sweep, the
 	// re-examination that moves a connection the drain would otherwise
 	// reach only at that connection's own next event — which, for a

@@ -179,6 +179,52 @@ jobs:
             echo "removed or failed?"
             exit 1
           fi
+      # celeris#543: a transplant's carried bytes (Carryover.Buffered) must be
+      # replayed by the adopting engine as if it had read them itself, so under
+      # AsyncHandlers an async route's handler runs on the conn's dispatch
+      # goroutine. Before the fix the io_uring adopt ran every carried request
+      # inline on its worker and the epoll adopt dropped them. The step above
+      # runs the io_uring tests without a name check and the root step runs
+      # the epoll ones without -v, so all of them run here by name: the engine
+      # tests at the runner's memlock (one io_uring worker), with
+      # CELERIS_REQUIRE_IOURING_WORKERS=1, and the adaptive one, which forces a
+      # switch each way and so builds a second engine's rings within the
+      # kernel's uncharge latency, with memlock raised, as job `adaptive` runs
+      # its package. Every test must PASS with no SKIP line; each of the six
+      # scenario arms must print one RESULT line reading carried_started=true,
+      # every other adopted conn served, carried_answered=true, block_runs=1
+      # and follow_up=true, and each of the four pipelined arms its answers in
+      # order.
+      - name: celeris#543 carried bytes replayed under AsyncHandlers (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          uring='TestIouringAdoptCarriedAsyncRoute543|TestIouringAdoptCarriedPartialAsyncRoute543|TestIouringAdoptCarriedPipelinedAsync543|TestIouringAdoptCarriedPipelinedSync543'
+          epoll='TestEpollAdoptCarriedAsyncRoute543|TestEpollAdoptCarriedPartialAsyncRoute543|TestEpollAdoptCarriedPipelinedAsync543|TestEpollAdoptCarriedPipelinedSync543'
+          adaptive='TestAdaptiveSwitchAdoptsCarriedAsyncRequest543'
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c543.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./adaptive/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
+          names="${uring}|${epoll}|${adaptive}"
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c543.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c543.log || true)
+          results=$(grep -cE 'celeris543 RESULT engine=' /tmp/c543.log || true)
+          clean=$(grep -cE 'celeris543 RESULT engine=[^ ]+ split=(true|false) workers=([0-9]+) carried_started=true others_served=\2/\2 carried_answered=true block_runs=1 follow_up=true$' /tmp/c543.log || true)
+          ordered=$(grep -cE 'celeris543 PIPELINED engine=[^ ]+ answers=\["/first" "blocked-done" "/third"\] follow_up=true block_runs=1$' /tmp/c543.log || true)
+          echo "celeris#543 tests: want $want PASS, passed $passed, SKIP lines $skipped, RESULT lines $results (want 6), clean $clean, pipelined in order $ordered (want 4), go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$results" -ne 6 ] || [ "$clean" -ne 6 ] || [ "$ordered" -ne 4 ] || [ "$failed" -ne 0 ]; then
+            echo "expected all $want celeris#543 tests to PASS with no SKIP line, six clean RESULT lines and"
+            echo "four pipelined arms answered in order -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
       # celeris#657: the root step ran ./engine/iouring WITHOUT -v, so a skip
       # there printed nothing and the package still reported `ok`. That is how
       # the celeris#656 leak shipped with no cover. The step above now runs
@@ -634,6 +680,95 @@ jobs:
             echo "expected both tests and all four arms (one io_uring) to PASS with no SKIP line"
             exit 1
           fi
+      # celeris#791: a handler panic, or runtime.Goexit, on an async dispatch
+      # goroutine must not take the conn's loop or worker with it. The panic's
+      # recover used to leave cs.detachMu locked, and closeConn then waited on
+      # it forever; a Goexit left the conn owned by a goroutine that no longer
+      # existed. The root race step above runs ./engine/epoll, ./engine/std
+      # and the root package without -v, where a test that stops running says
+      # nothing, and the engine/iouring step counts no name of these. So the
+      # eighteen run here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and
+      # an exact tally: the panic, Goexit, handler-error (control),
+      # Detach-then-panic and Detach-then-Goexit arms of io_uring and epoll
+      # (the Detach arms pin that the teardown never releases a lock Detach
+      # already released: that would be a fatal "unlock of unlocked mutex"),
+      # std's panic and Goexit arms, and the public-API arms (an .Async()
+      # route that calls runtime.Goexit, with and without a c.Detach() first,
+      # on each engine, and its panic control, which the router answers with
+      # a 500) must each PASS and print one RESULT line that reads
+      # stopped=true, with no SKIP line. memlock stays at the runner's 8 MiB:
+      # one io_uring worker, the shape the defect wedged in. Job `adaptive`
+      # runs the adaptive arms, whose adopted-conn arm meets the defect on two
+      # io_uring workers.
+      - name: celeris#791 handler panic and Goexit on a dispatch goroutine (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          uring='TestIouringAsyncHandlerPanicLeavesItsWorkerServing|TestIouringAsyncHandlerGoexitLeavesItsWorkerServing|TestIouringAsyncHandlerErrorLeavesItsWorkerServing|TestIouringAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestIouringAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
+          epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
+          std='TestStdHandlerPanicLeavesTheEngineServing|TestStdHandlerGoexitLeavesTheEngineServing'
+          server='TestServerAsyncRouteGoexitOnEpoll|TestServerAsyncRouteGoexitOnIOUring|TestServerAsyncRouteDetachThenGoexitOnEpoll|TestServerAsyncRouteDetachThenGoexitOnIOUring|TestServerAsyncRoutePanicOnEpoll|TestServerAsyncRoutePanicOnIOUring'
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${server})\$" . 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          names="${uring}|${epoll}|${std}|${server}"
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791.log || true)
+          results=$(grep -cE 'celeris791 RESULT engine=' /tmp/c791.log || true)
+          stopped=$(grep -cE 'celeris791 RESULT engine=.* stopped=true( |$)' /tmp/c791.log || true)
+          echo "celeris#791 tests: want $want PASS, passed $passed, SKIP lines $skipped, RESULT lines $results, stopped=true $stopped, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$results" -ne "$want" ] || [ "$stopped" -ne "$want" ] || [ "$failed" -ne 0 ]; then
+            echo "expected all $want celeris#791 tests to PASS with no SKIP line, each with one RESULT line"
+            echo "reading stopped=true -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
+      # celeris#905: a stopped engine must leave no thread pinned to one CPU.
+      # The root step runs the epoll test without -v, where a skip prints
+      # nothing, and job `adaptive` and the engine/iouring step above count
+      # no test of it by name. So the three tests run here by name: epoll and
+      # io_uring at the runner's 8 MiB memlock (one io_uring worker), then
+      # adaptive with memlock raised and CELERIS_REQUIRE_UPSWITCH=1, as job
+      # `adaptive` runs its package. Each re-runs itself in a process of its
+      # own and logs that process's output with a "child| " prefix, so the
+      # tally counts this process's lines only: all three must PASS with no
+      # SKIP line, and each child must print one RESULT line with threads
+      # pinned while its engine ran (some not the main thread), none off the
+      # process mask after the stop, and none of the pinned threads but the
+      # main thread still alive. How many runs had a loop on the main thread,
+      # the only thread the fix's restore matters for, is printed and not
+      # enforced.
+      - name: celeris#905 stopped engines leave no thread pinned to one CPU (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          failed=0
+          engines='TestStoppedEngineLeavesNoPinnedThread'
+          adaptive='TestStoppedAdaptiveEngineLeavesNoPinnedThread'
+          go test -race -count=1 -timeout=300s -v -run "^(${engines})\$" ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/c905.log || failed=$((failed + 1))
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          CELERIS_REQUIRE_UPSWITCH=1 go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./adaptive/ 2>&1 | tee -a /tmp/c905.log || failed=$((failed + 1))
+          passed=$(grep -cE "^--- PASS: (${engines}|${adaptive}) \(" /tmp/c905.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c905.log || true)
+          results=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) ' /tmp/c905.log || true)
+          clean=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) cycles=[0-9]+ process_mask=[0-9,-]+ pinned_while_running=[1-9][0-9]* main_thread_hosted_a_loop=[0-9]+ off_mask_after_stop=0 locked_probes=[1-9][0-9]* locked_off_mask=0 pinned_not_main=[1-9][0-9]* alive_after_stop=0$' /tmp/c905.log || true)
+          m0=$(grep -cE 'celeris905 RESULT .* main_thread_hosted_a_loop=[1-9]' /tmp/c905.log || true)
+          echo "celeris#905 tests: want 3 PASS, passed $passed, SKIP lines $skipped, RESULT lines $results, clean $clean (want 3), a loop on the main thread in $m0, go test runs failed $failed (want 0)"
+          if [ "$passed" -ne 3 ] || [ "$skipped" -ne 0 ] || [ "$results" -ne 3 ] || [ "$clean" -ne 3 ] || [ "$failed" -ne 0 ]; then
+            echo "expected the three celeris#905 tests to PASS with no SKIP line, each child with one RESULT line"
+            echo "showing pinned threads while running, none off the mask after the stop, and no pinned thread"
+            echo "but the main thread left alive -- was one renamed or removed, did one skip or fail?"
+            exit 1
+          fi
 
   adaptive:
     name: Adaptive engine (./adaptive/...)
@@ -773,6 +908,35 @@ jobs:
             echo "were they renamed or removed, or did one skip? a skip is not coverage."
             exit 1
           fi
+      # celeris#791 through the adaptive engine: a handler panic on the start
+      # engine's (epoll's) dispatch goroutine, and on a connection the switch
+      # handed to io_uring (#383), must leave the worker serving. The step
+      # above runs both tests in the package run; this one runs them by name
+      # with the same raised memlock (two io_uring workers) and requires both
+      # to PASS, each with a RESULT line reading stopped=true, and no SKIP
+      # line. CELERIS_REQUIRE_UPSWITCH=1 turns their "io_uring unavailable"
+      # skip into a failure.
+      - name: celeris#791 adaptive arms (memlock raised, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_UPSWITCH: "1"
+        run: |
+          set -o pipefail
+          sudo prlimit --pid "$$" --memlock=unlimited:unlimited
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestAdaptiveAsyncHandlerPanicLeavesTheStartEngineServing|TestAdaptiveAsyncHandlerPanicOnAnAdoptedConnLeavesItsWorkerServing'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./adaptive/ 2>&1 | tee /tmp/c791a.log
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791a.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791a.log || true)
+          stopped=$(grep -cE 'celeris791 RESULT engine=adaptive shape=(start|adopted) .* stopped=true$' /tmp/c791a.log || true)
+          echo "celeris#791 adaptive tests: want $want, passed $passed, SKIP lines $skipped, RESULT lines with stopped=true $stopped"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$stopped" -ne "$want" ]; then
+            echo "expected both celeris#791 adaptive tests to PASS with no SKIP line and a stopped=true RESULT line"
+            exit 1
+          fi
       # celeris#657 PR-2: the one-worker leg of the two revert tests. The step
       # above raises memlock, so io_uring there runs several workers and
       # TestReverseTransplant / TestBidirectionalFlap never meet the shape in
@@ -820,6 +984,45 @@ jobs:
             echo "io_uring engine at one worker, and each test's summary line to report err=0 -- was one renamed"
             echo "or removed, did one skip or fail, did this runner fund a different worker count, or were"
             echo "requests lost (a PASS verdict tolerates up to one per connection)?"
+            exit 1
+          fi
+      # celeris#616: New decides the port both sub-engines serve on and holds
+      # it until the start engine has bound it in Listen. These tests take the
+      # port in that gap with a Go listener and with a bare socket, on each
+      # start engine, on 127.0.0.1 and on the default dual-stack wildcard, and
+      # beside the TIME_WAIT sockets an ordinary Go server leaves (where only
+      # a shared hold can be taken), and need the engine to start on the port
+      # anyway, on the address net.Listen gives. The io_uring arms skip when
+      # io_uring cannot be built, and the step above runs them without a
+      # tally, so here they run by name at the runner's memlock (one io_uring
+      # worker) and must all PASS with no SKIP line, each arm printing its
+      # own RESULT line, and New must hand the sub-engines net.Listen's
+      # address on every free-port form. CELERIS_REQUIRE_DUALSTACK=1 turns the
+      # dual-stack tests' skip on a host without IPv6 into a failure.
+      - name: celeris#616 port held from New to Listen (skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_DUALSTACK: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHoldReleasedOnceBound616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616'
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
+          go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
+            ./adaptive/ 2>&1 | tee /tmp/c616.log
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c616.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c616.log || true)
+          gap=$(grep -cE 'celeris616 result: start=(epoll|iouring) thief=(go-listener|bare-socket) steal_in_gap_refused=true started=true ' /tmp/c616.log || true)
+          inlisten=$(grep -cE 'celeris616 in-Listen steal: start=(epoll|iouring) thief=(go-listener|bare-socket) .* steal_err=.*address already in use listen_err=<nil>$' /tmp/c616.log || true)
+          wild=$(grep -cE 'celeris616 wildcard: start=(epoll|iouring) addr=\[::\]:[1-9][0-9]* thieves=\[[^]]*\] refused=6/6 started=true v4=200 v6=200$' /tmp/c616.log || true)
+          tw=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=[^ ]+ time_wait=[1-9][0-9]* exclusive_refused=true net_listen=([^ ]+) handed=\2 thief=(EADDRINUSE|-) started=true v4=200 v6=(200|0)$' /tmp/c616.log || true)
+          twheld=$(grep -cE 'celeris616 time-wait: start=(epoll|iouring) form=(wildcard|0\.0\.0\.0|\[::\]) .* thief=EADDRINUSE started=true v4=200 v6=200$' /tmp/c616.log || true)
+          kind=$(grep -cE 'celeris616 hold kind: state=(free-port .* SO_REUSEADDR=0 SO_REUSEPORT=[1-9]|time-wait .* SO_REUSEADDR=[1-9] SO_REUSEPORT=[1-9])$' /tmp/c616.log || true)
+          echo "celeris#616 tests: want $want, passed $passed, SKIP lines $skipped, New-to-Listen arms refused and started $gap (want 4), in-Listen arms refused $inlisten (want 4), wildcard arms 6/6 refused and dual-stack $wild (want 2), TIME_WAIT arms on net.Listen's address $tw (want 10) of which wildcard held $twheld (want 6), hold kinds $kind (want 2)"
+          if [ "$passed" -ne "$want" ] || [ "$skipped" -ne 0 ] || [ "$gap" -ne 4 ] || [ "$inlisten" -ne 4 ] || [ "$wild" -ne 2 ] || [ "$tw" -ne 10 ] || [ "$twheld" -ne 6 ] || [ "$kind" -ne 2 ]; then
+            echo "expected all $want celeris#616 tests to PASS with no SKIP line, and every arm on both start"
+            echo "engines to report a refused steal -- was one renamed or removed, or did an io_uring arm skip?"
             exit 1
           fi
 
@@ -1123,6 +1326,76 @@ jobs:
             echo "SEND_ZC notification hold a descriptor or stall shutdown, or was a test renamed or skipped?"
             exit 1
           fi
+      # celeris#812: the release backstop gave up a closed connection 5 s after
+      # the close whatever it still owed, to connStatePool with its send buffer.
+      # With a SEND_ZC's notification owed, the kernel was still sending the
+      # unsent tail from that array to a peer that had stopped reading, and the
+      # array's next owner overwrote it: the peer got another connection's
+      # bytes. The backstop now holds such a send buffer until the notification,
+      # off the release walk, keeping the array alone, in gauges, and with no
+      # new SEND_ZC armed while a worker holds 16 MiB; worker shutdown keeps the
+      # buffers the ring closes on. Both arches, by name, at the runner's own
+      # 8 MiB memlock (the pages SEND_ZC pins count against it), -race, three
+      # runs, with a tally: every run of each of the ten tests and their
+      # twenty-four cases must PASS, with no FAIL and no SKIP line. A SKIP
+      # would mean the runner gave the engine no working SEND_ZC.
+      - name: celeris#812 a SEND_ZC's send buffer outlives the release backstop (both arches, skipping forbidden)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          names='TestBackstopHoldsASendBufferAZCNotificationStillReads|TestBackstopCountsItsZCHolds|TestPendingReleaseBackstopHoldsAZCSendPastItsDeadline|TestClosedOpsCountsTheZCSendApart|TestDroppingAnIdentityWithAZCOwedIsCounted|TestShutdownRetainsSendBuffersAZCMayStillRead|TestZCHoldIsOffTheReleaseWalk|TestZCHoldKeepsOnlyTheSendBuffer|TestZCHoldCoversACollidingSibling|TestSendZCStopsWhileHeldBuffersReachTheCap'
+          runs=3
+          want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
+          wantsub=$(( 24 * runs ))
+          go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
+            ./engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
+          grep -E 'celeris812 ' /tmp/zc812.log || true
+          passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc812.log || true)
+          subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc812.log || true)
+          failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/zc812.log || true)
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/zc812.log || true)
+          echo "celeris#812 tests: want $want PASS ($wantsub cases), passed $passed ($subpassed cases), FAIL lines $failed, SKIP lines $skipped"
+          if [ "$passed" -ne "$want" ] || [ "$subpassed" -ne "$wantsub" ] || [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "expected exactly $want runs ($wantsub cases) to PASS with no FAIL or SKIP line -- did the backstop"
+            echo "give up a send buffer a SEND_ZC still reads, or was a test renamed or skipped?"
+            exit 1
+          fi
+      # Its detector control. .github/scripts/mutant-812-backstop-releases-zc.py
+      # disables the hold, so the backstop releases the connState with its send
+      # buffer as before the fix. Every run of each of the four wire cases must
+      # then report the release (held_past_backstop=false) and bytes on the wire
+      # that were not sent (corrupt_bytes above 0), and FAIL. A runner whose
+      # kernel copied the send before the release would let the wire test pass
+      # with or without the fix; this is what shows it does not. The mutation is
+      # undone before the step ends.
+      - name: celeris#812 detector control (the hold removed; every run of the four wire cases must see foreign bytes)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CELERIS_REQUIRE_IOURING_WORKERS: "1"
+        run: |
+          set -o pipefail
+          python3 .github/scripts/mutant-812-backstop-releases-zc.py
+          runs=3
+          log=/tmp/zc812-mutant.log
+          go test -race -count="$runs" -timeout=300s -v -run '^TestBackstopHoldsASendBufferAZCNotificationStillReads$' \
+            ./engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- engine/iouring/worker.go
+          bad=0
+          for c in notif-only recv-and-notif send-done-after-close detached-notif-only; do
+            lines=$(grep -cE "celeris812 backstop case=$c " "$log" || true)
+            det=$(grep -E "celeris812 backstop case=$c " "$log" | grep -cE ' held_past_backstop=false .* corrupt_bytes=[1-9]' || true)
+            f=$(grep -cE "^    --- FAIL: TestBackstopHoldsASendBufferAZCNotificationStillReads/$c \(" "$log" || true)
+            echo "mutant, case $c: result lines $lines, detected $det, FAIL $f (want $runs, $runs, $runs)"
+            if [ "$lines" -ne "$runs" ] || [ "$det" -ne "$runs" ] || [ "$f" -ne "$runs" ]; then bad=1; fi
+          done
+          skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$log" || true)
+          if [ "$skipped" -ne 0 ]; then echo "a SKIP is not a result ($skipped SKIP lines)"; bad=1; fi
+          exit "$bad"
       # The detector control. .github/scripts/mutant-685-release-owed-fd.py
       # makes fdOwed report false, which takes the fd-lifetime rule off the
       # close paths, Hijack and shutdown at once. Against that tree every run
@@ -1284,19 +1557,25 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      # govulncheck is a `tool` of the separate .github/tools module, so the
+      # version that runs is the one its go.mod names and its go.sum hashes
+      # (Dependabot bumps it), not whatever @latest resolves to on the day.
+      # -modfile builds the tool from that module while each step stays in the
+      # module it scans; the vulnerability database is still fetched live from
+      # vuln.go.dev on every run (celeris#827).
+      - name: Build govulncheck (pinned by .github/tools/go.sum)
+        run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck -version
       - name: Root module
-        run: govulncheck ./...
+        run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck ./...
       - name: middleware/compress
-        run: govulncheck ./...
+        run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck ./...
         working-directory: middleware/compress
       - name: middleware/metrics
-        run: govulncheck ./...
+        run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck ./...
         working-directory: middleware/metrics
       - name: middleware/otel
-        run: govulncheck ./...
+        run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck ./...
         working-directory: middleware/otel
       - name: middleware/protobuf
-        run: govulncheck ./...
+        run: go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" govulncheck ./...
         working-directory: middleware/protobuf

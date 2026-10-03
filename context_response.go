@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goceleris/celeris/internal/httprange"
 	"github.com/goceleris/celeris/internal/negotiate"
 	"github.com/goceleris/celeris/protocol/h2/stream"
 )
@@ -865,7 +866,20 @@ func (c *Context) SetCookie(cookie *Cookie) {
 }
 
 // File serves the named file. The content type is detected from the file
-// extension. Supports Range requests for partial content (HTTP 206).
+// extension.
+//
+// A GET with a single byte range gets 206 Partial Content (a last-pos past
+// the end, or a suffix longer than the file, is cut to the file). A range
+// set that no byte of the file satisfies gets 416 Range Not Satisfiable with
+// "Content-Range: bytes */<size>" and no body. An If-Range header is
+// honoured against the ETag and Last-Modified response headers already set
+// when File is called (File sets neither itself): the range is served only
+// while the client's validator matches (strong comparison for an
+// entity-tag, so a weak tag never matches; the same instant for a date),
+// otherwise the whole file is sent as a 200. HEAD and other methods ignore
+// Range, as do an unknown range unit, an invalid range set, and a set with
+// more than one satisfiable range (multipart/byteranges is not supported).
+// See RFC 9110 §14 and §13.1.5.
 //
 // The entire file is loaded into memory (capped at 100 MB). Returns
 // [HTTPError] with status 413 if the file exceeds this limit. For large
@@ -899,9 +913,20 @@ func (c *Context) File(filePath string) error {
 	c.SetHeader("accept-ranges", "bytes")
 
 	if rng := c.Header("range"); rng != "" {
-		if start, end, ok := parseRange(rng, size); ok {
+		// If-Range is checked against the validators already on the
+		// response (an ETag / Last-Modified the handler or middleware/static
+		// set before calling File); File itself sets neither.
+		start, end, out := httprange.Decide(c.method, rng, c.Header("if-range"),
+			c.respHeader("etag"), c.respHeader("last-modified"), size)
+		switch out {
+		case httprange.Unsatisfiable:
+			var crBuf [32]byte
+			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(crBuf[:0], size)))
+			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
+		case httprange.Partial:
 			length := end - start + 1
-			c.SetHeader("content-range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			var crBuf [64]byte
+			c.SetHeader("content-range", string(httprange.AppendContentRange(crBuf[:0], start, end, size)))
 			// Zero-copy sendfile(2) path (epoll). Falls through to the
 			// buffered read+seek path when the engine can't / won't take it.
 			if handled, err := c.trySendFile(f, 206, contentType, start, length); handled {
@@ -1061,42 +1086,15 @@ func (c *Context) FileFromFS(name string, fsys fs.FS) error {
 	return c.Blob(200, contentType, data)
 }
 
-func parseRange(header string, size int64) (start, end int64, ok bool) {
-	const prefix = "bytes="
-	if !strings.HasPrefix(header, prefix) {
-		return 0, 0, false
-	}
-	spec := header[len(prefix):]
-	parts := strings.SplitN(spec, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	if parts[0] == "" {
-		n, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || n <= 0 {
-			return 0, 0, false
-		}
-		start = size - n
-		end = size - 1
-	} else {
-		var err error
-		start, err = strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			return 0, 0, false
-		}
-		if parts[1] == "" {
-			end = size - 1
-		} else {
-			end, err = strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				return 0, 0, false
-			}
+// respHeader returns the value of the response header key (lowercase, as
+// SetHeader stores it) set so far, or "".
+func (c *Context) respHeader(key string) string {
+	for _, h := range c.respHeaders {
+		if h[0] == key {
+			return h[1]
 		}
 	}
-	if start < 0 || start >= size || end < start || end >= size {
-		return 0, 0, false
-	}
-	return start, end, true
+	return ""
 }
 
 // Stream reads all data from r (capped at 100 MB) and writes it as the
@@ -1584,15 +1582,29 @@ type StreamWriter struct {
 	streamer     stream.Streamer
 	stream       *stream.Stream
 	bytesWritten atomic.Int64
+	// used is the owning Context's streamUsed, shared by every StreamWriter
+	// taken on the request. Set by the first WriteHeader, Write, Flush or
+	// Close: from then on the response may be on the wire (celeris#835).
+	used *atomic.Bool
+}
+
+// markUsed records that this request's response may have reached the wire.
+// A load first, so a stream of writes does not store on every chunk.
+func (sw *StreamWriter) markUsed() {
+	if !sw.used.Load() {
+		sw.used.Store(true)
+	}
 }
 
 // WriteHeader sends the status line and headers. Must be called once before Write.
 func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
+	sw.markUsed()
 	return sw.streamer.WriteHeader(sw.stream, status, headers)
 }
 
 // Write sends a chunk of the response body. May be called multiple times.
 func (sw *StreamWriter) Write(data []byte) (int, error) {
+	sw.markUsed()
 	err := sw.streamer.Write(sw.stream, data)
 	if err != nil {
 		return 0, err
@@ -1609,12 +1621,14 @@ func (sw *StreamWriter) BytesWritten() int64 {
 
 // Flush ensures buffered data is sent to the network.
 func (sw *StreamWriter) Flush() error {
+	sw.markUsed()
 	return sw.streamer.Flush(sw.stream)
 }
 
 // Close signals end of the response body and syncs the byte count back to
 // the owning Context so that [Context.BytesWritten] reflects the total.
 func (sw *StreamWriter) Close() error {
+	sw.markUsed()
 	return sw.streamer.Close(sw.stream)
 }
 
@@ -1629,6 +1643,15 @@ func (sw *StreamWriter) Close() error {
 // [Context.IsWritten] returns true and [Context.BytesWritten] tracks bytes
 // after StreamWriter is used.
 //
+// Taking the StreamWriter commits nothing by itself. An error the handler
+// returns, or a panic, before anything has been sent through it (no
+// WriteHeader, Write, Flush or Close yet) is still answered as if the writer
+// had never been taken: the error handler or the default error response
+// writes it (celeris#835). This is what lets a handler such as sse.New take
+// the writer, then reject the request (authentication in OnConnect) with a
+// proper status. Once the writer has been used, or the Context detached, the
+// response belongs to the stream and an error is not written.
+//
 // On native engines (epoll, io_uring), the caller must call [Context.Detach]
 // before spawning a goroutine that uses the StreamWriter. Call Close() when done.
 func (c *Context) StreamWriter() *StreamWriter {
@@ -1642,10 +1665,35 @@ func (c *Context) StreamWriter() *StreamWriter {
 	if !ok {
 		return nil
 	}
+	if !c.written {
+		// Nothing was written before the writer was taken: an error before
+		// its first use is still answered (reclaimUnusedStreamWriter).
+		c.streamTakenOnly = true
+	}
+	// reset clears streamWriter, streamTakenOnly and streamUsed only on the
+	// extended path. Without this a StreamWriter used without Detach stayed
+	// on the pooled Context, and the next request on it reported its bytes
+	// as its own (BytesWritten).
+	c.extended = true
 	c.written = true
-	sw := &StreamWriter{streamer: s, stream: c.stream}
+	sw := &StreamWriter{streamer: s, stream: c.stream, used: &c.streamUsed}
 	c.streamWriter = sw
 	return sw
+}
+
+// reclaimUnusedStreamWriter gives the response back when it is "written" only
+// because StreamWriter was taken and nothing has been sent through any writer
+// taken since, on a Context that is not detached (celeris#835). It reports
+// whether it did: the caller (an error or panic path) may then write the
+// response itself.
+func (c *Context) reclaimUnusedStreamWriter() bool {
+	if !c.streamTakenOnly || c.detached || c.streamUsed.Load() {
+		return false
+	}
+	c.streamTakenOnly = false
+	c.streamWriter = nil
+	c.written = false
+	return true
 }
 
 // Attachment sets the Content-Disposition header to "attachment" with the

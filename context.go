@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
@@ -133,6 +134,13 @@ type Context struct {
 	buffered     bool
 	bytesWritten int
 	streamWriter *StreamWriter
+	// streamTakenOnly: StreamWriter was taken while nothing was written, so
+	// the response is marked written by the take alone. streamUsed: a
+	// StreamWriter taken on this request has been used (shared by all of
+	// them). Together they let an error before the first use still be
+	// answered (celeris#835, reclaimUnusedStreamWriter).
+	streamTakenOnly bool
+	streamUsed      atomic.Bool
 
 	detached bool
 	// pooled guards against a double release. Returning one Context to
@@ -649,6 +657,8 @@ func (c *Context) reset() {
 		c.bufferDepth = 0
 		c.buffered = false
 		c.streamWriter = nil
+		c.streamTakenOnly = false
+		c.streamUsed.Store(false)
 		c.detached = false
 		c.detachDone = nil
 		c.detachSnap = nil

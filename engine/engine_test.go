@@ -27,9 +27,6 @@ func TestEngineMetricsZeroValue(t *testing.T) {
 	if m.ErrorCount != 0 {
 		t.Errorf("ErrorCount = %d, want 0", m.ErrorCount)
 	}
-	if m.Throughput != 0 {
-		t.Errorf("Throughput = %f, want 0", m.Throughput)
-	}
 }
 
 func TestMockEngineMetricsReturnsZero(t *testing.T) {
@@ -52,7 +49,6 @@ func TestEngineMetricsFieldValues(t *testing.T) {
 		RequestCount:      1000,
 		ActiveConnections: 50,
 		ErrorCount:        3,
-		Throughput:        12345.67,
 	}
 	if m.RequestCount != 1000 {
 		t.Errorf("RequestCount = %d, want 1000", m.RequestCount)
@@ -62,8 +58,5 @@ func TestEngineMetricsFieldValues(t *testing.T) {
 	}
 	if m.ErrorCount != 3 {
 		t.Errorf("ErrorCount = %d, want 3", m.ErrorCount)
-	}
-	if m.Throughput != 12345.67 {
-		t.Errorf("Throughput = %f, want 12345.67", m.Throughput)
 	}
 }

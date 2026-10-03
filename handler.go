@@ -362,7 +362,9 @@ func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
 		"stack", string(debug.Stack()),
 	)
 	c.statusCode = 500
-	if !c.written && s.ResponseWriter != nil {
+	// A StreamWriter taken but not used yet has sent nothing: the 500 still
+	// goes out (celeris#835).
+	if (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
 		hdrs := make([][2]string, 0, len(c.respHeaders)+2)
 		hdrs = append(hdrs, c.respHeaders...)
 		hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
@@ -453,7 +455,11 @@ func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal str
 }
 
 func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
-	if err == nil || c.written {
+	// A response marked written only because a StreamWriter was taken, with
+	// nothing sent through it yet, is still answered (celeris#835): sse.New
+	// takes the writer before OnConnect, whose rejection must reach the
+	// client.
+	if err == nil || c.written && !c.reclaimUnusedStreamWriter() {
 		return
 	}
 	if a.errorHandler != nil {

@@ -13,11 +13,43 @@ import (
 )
 
 // PinToCPU pins the calling OS thread to the given CPU core via sched_setaffinity.
+//
+// The affinity belongs to the OS thread, not to the goroutine: the caller
+// must hold the thread with runtime.LockOSThread for as long as the pin is
+// wanted, and must not let the thread run any other goroutine afterwards
+// (see SaveThreadAffinity, celeris#905).
 func PinToCPU(cpu int) error {
 	var set unix.CPUSet
 	set.Zero()
 	set.Set(cpu)
 	return schedSetaffinity(0, &set)
+}
+
+// ThreadAffinity is the CPU affinity mask of an OS thread, saved by
+// SaveThreadAffinity so that Restore can put it back.
+type ThreadAffinity struct {
+	set unix.CPUSet
+}
+
+// SaveThreadAffinity returns the calling OS thread's CPU affinity mask.
+//
+// A goroutine that pins its thread (PinToCPU) saves the mask first and
+// restores it before the thread can run Go code again. The engine loops never
+// unlock their thread, so the runtime terminates it when the loop goroutine
+// exits; the one exception is the main thread, which cannot exit and which the
+// runtime parks for good instead, and Restore is what leaves that one with the
+// mask the process started with (celeris#905).
+func SaveThreadAffinity() (ThreadAffinity, error) {
+	var a ThreadAffinity
+	if err := unix.SchedGetaffinity(0, &a.set); err != nil {
+		return ThreadAffinity{}, err
+	}
+	return a, nil
+}
+
+// Restore sets the calling OS thread's CPU affinity mask back to a.
+func (a ThreadAffinity) Restore() error {
+	return schedSetaffinity(0, &a.set)
 }
 
 func schedSetaffinity(pid int, set *unix.CPUSet) error {
