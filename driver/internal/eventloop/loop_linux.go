@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/wakefd"
 )
 
 // isEAGAIN is a fast check for EAGAIN/EWOULDBLOCK that avoids the reflection
@@ -41,10 +42,23 @@ func (l *Loop) shutdownPartial() error {
 }
 
 // worker owns a single epoll instance and the FDs registered on it.
+//
+// Callers on other goroutines reach the worker's own two descriptors, and
+// shutdown closes both, so neither number is used outside a lock shutdown
+// takes before it closes it (celeris#862). The wakeup eventfd is written only
+// through wakeFD, whose Signal and Close share a lock. epollFD is used under
+// w.mu, under the conn's c.mu after a check of c.closed (shutdown marks every
+// registered conn closed, under its c.mu, before it closes epollFD under
+// w.mu), or by the worker goroutine, which Loop.Close joins before shutdown.
 type worker struct {
 	id      int
 	epollFD int
-	eventFD int
+	// wakeFD owns the wakeup eventfd. Producers (enqueueFlush, Loop.Close)
+	// call Signal, never write(2) the number, so a producer that runs after
+	// shutdown has closed the eventfd writes nothing: it cannot reach a
+	// socket or a file that has taken the number (celeris#862, the driver
+	// loop's twin of celeris#655).
+	wakeFD *wakefd.WakeFD
 
 	mu    sync.RWMutex
 	conns map[int]*driverConn // fd -> state (protected by mu)
@@ -107,6 +121,13 @@ type driverConn struct {
 // (celeris#784): a test sets it before it creates the worker and clears it
 // after the worker is shut down.
 var testHookBeforeRead func(fd int)
+
+// testHookBeforeAdd, when non-nil, runs in RegisterConn once the conn is in
+// the worker's map and before the critical section that issues its
+// EPOLL_CTL_ADD, with no lock held: where a shutdown can run in between.
+// Tests only (celeris#862): a test sets it before it creates the worker and
+// clears it after the worker is shut down.
+var testHookBeforeAdd func(fd int)
 
 // readOpen reads c.fd into buf unless c has been torn down, in which case it
 // returns engine.ErrUnknownFD without reading. The closed check and the read
@@ -225,7 +246,7 @@ func newWorker(id int) (*worker, error) {
 	return &worker{
 		id:      id,
 		epollFD: epfd,
-		eventFD: efd,
+		wakeFD:  wakefd.New(efd),
 		conns:   make(map[int]*driverConn),
 		events:  make([]unix.EpollEvent, 128),
 		rbuf:    make([]byte, 16<<10),
@@ -251,12 +272,10 @@ func (w *worker) shutdown() error {
 	}
 	w.conns = map[int]*driverConn{}
 	var first error
-	if w.eventFD >= 0 {
-		if err := unix.Close(w.eventFD); err != nil && first == nil {
-			first = err
-		}
-		w.eventFD = -1
-	}
+	// Waits for a Signal already in flight, and makes every later one a
+	// no-op: a Write that passed its w.closed check before Loop.Close began
+	// can still reach enqueueFlush now (celeris#862).
+	w.wakeFD.Close()
 	if w.epollFD >= 0 {
 		if err := unix.Close(w.epollFD); err != nil && first == nil {
 			first = err
@@ -272,14 +291,11 @@ func (w *worker) shutdown() error {
 	return first
 }
 
-// wake triggers the worker's epoll_wait to return via the eventfd.
+// wake triggers the worker's epoll_wait to return via the eventfd. Safe on
+// any goroutine at any time: once shutdown has closed the eventfd, it writes
+// nothing (celeris#862).
 func (w *worker) wake() {
-	if w.eventFD < 0 {
-		return
-	}
-	var val [8]byte
-	val[0] = 1
-	_, _ = unix.Write(w.eventFD, val[:])
+	w.wakeFD.Signal()
 }
 
 // CPUID reports the CPU the worker is pinned to. Standalone loops do not
@@ -304,16 +320,50 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 		w.mu.Unlock()
 		return ErrAlreadyRegistered
 	}
+	// In the map before the ADD: the worker looks conns up under w.mu, and an
+	// edge it found no conn for would be lost.
 	w.conns[fd] = c
-	epfd := w.epollFD
 	w.mu.Unlock()
 
-	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-		Fd:     int32(fd),
-	}); err != nil {
+	if h := testHookBeforeAdd; h != nil {
+		h(fd)
+	}
+	// The EPOLL_CTL_ADD is issued under c.mu, after a check of c.closed, like
+	// every other epoll_ctl of a conn (flushLocked, setEvents). c is in the
+	// map, and a conn leaves the map only once it is marked closed. shutdown
+	// marks every conn in the map closed, each under its c.mu, before it
+	// closes epollFD: so it cannot close the epoll fd while this ADD is in
+	// flight, and an ADD issued here never lands on the number of a closed
+	// epoll descriptor, or on another epoll instance that has taken it
+	// (celeris#862). An UnregisterConn of fd marks c closed before its
+	// EPOLL_CTL_DEL, so the ADD comes before that DEL or not at all. w.mu is
+	// not held, so the worker's lookups never wait for the syscall. If c was
+	// torn down since it entered the map (by shutdown, or by an UnregisterConn
+	// of fd racing this call), its onClose has fired: no ADD is issued, and
+	// the registration is reported as made, the same as for a conn torn down
+	// right after it.
+	var err error
+	c.mu.Lock()
+	if !c.closed {
+		err = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
+			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
+			Fd:     int32(fd),
+		})
+		if err != nil {
+			// Not registered: marked closed here, under c.mu, so no
+			// teardown fires onClose for it, and the loop never uses fd's
+			// number again (markClosed, inline: c.mu is held).
+			c.rmu.Lock()
+			c.closed, c.closing = true, true
+			c.rmu.Unlock()
+		}
+	}
+	c.mu.Unlock()
+	if err != nil {
 		w.mu.Lock()
-		delete(w.conns, fd)
+		if cur, ok := w.conns[fd]; ok && cur == c {
+			delete(w.conns, fd)
+		}
 		w.mu.Unlock()
 		return fmt.Errorf("epoll_ctl add: %w", err)
 	}
@@ -1086,6 +1136,9 @@ done:
 }
 
 func (w *worker) run(ctx context.Context) {
+	// The eventfd stays open while run runs: shutdown closes it only after
+	// Loop.Close has joined this goroutine.
+	efd := w.wakeFD.FD()
 	for {
 		if ctx.Err() != nil {
 			return
@@ -1100,10 +1153,10 @@ func (w *worker) run(ctx context.Context) {
 		for i := 0; i < n; i++ {
 			ev := w.events[i]
 			fd := int(ev.Fd)
-			if fd == w.eventFD {
+			if fd == efd {
 				var sink [8]byte
 				for {
-					if _, rerr := unix.Read(w.eventFD, sink[:]); rerr != nil {
+					if _, rerr := unix.Read(efd, sink[:]); rerr != nil {
 						break
 					}
 				}
