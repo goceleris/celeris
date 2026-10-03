@@ -45,8 +45,10 @@ import (
 // needs a lock it holds across its write, a cache's coalesced fill it leads
 // (celeris#913). On std that stalls only those requests. On epoll, io_uring
 // and adaptive a sync handler that waits for it holds its event loop, and so
-// every connection on that loop, until the deadline (with WriteTimeout
-// disabled, until the peer grants window).
+// every connection on that loop, until the deadline. With WriteTimeout
+// disabled there is no deadline: the wait lasts until the peer grants window
+// or the connection closes, and never ends if the loop that would see either
+// is the one waiting.
 const OutboundBudget = 4 << 20
 
 // OutboundHeld returns how many bytes this connection's streams hold in their
@@ -156,11 +158,11 @@ func (s *Stream) TryBufferOutbound(data []byte, endStream bool) bool {
 // grants window a few bytes at a time cannot stretch it.
 //
 // It holds no lock while it waits, and the deadline needs nothing on the
-// event loop to fire: a timer (time.AfterFunc) ends the wait. On the native engines the loop
-// may be the thing waiting (a sync handler blocked on a lock this handler
-// holds, or on a coalesced call it leads), and then it cannot process the
-// WINDOW_UPDATE, the reset or the close that would end the wait. The
-// connection's read and idle timeouts do not end it either (see
+// event loop to fire: a timer (time.AfterFunc) ends the wait. On the native
+// engines the loop may be the thing waiting (a sync handler blocked on a lock
+// this handler holds, or on a coalesced call it leads), and then it cannot
+// process the WINDOW_UPDATE, the reset or the close that would end the wait.
+// The connection's read and idle timeouts do not end it either (see
 // OutboundBudget).
 func (s *Stream) AwaitSendWindow(deadline time.Time) error {
 	m := s.manager
