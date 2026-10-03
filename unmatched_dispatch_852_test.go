@@ -20,7 +20,9 @@ import (
 
 // startStd852 starts s on the std engine (Start builds the unmatched chains
 // and decides their dispatch, as on every engine) and returns its base URL
-// and a client; the server stops at cleanup.
+// and a client; the server stops at cleanup. The client keeps one
+// connection, so a request is read only after the previous request's handler
+// has returned (barrier852).
 func startStd852(t *testing.T, s *Server) (string, *http.Client) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -39,7 +41,9 @@ func startStd852(t *testing.T, s *Server) (string, *http.Client) {
 		}
 	})
 	base := "http://" + ln.Addr().String()
-	cl := &http.Client{Timeout: 5 * time.Second}
+	tr := &http.Transport{MaxConnsPerHost: 1}
+	t.Cleanup(tr.CloseIdleConnections)
+	cl := &http.Client{Timeout: 5 * time.Second, Transport: tr}
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		resp, err := cl.Get(base + "/ready-852")
 		if err == nil {
@@ -53,6 +57,16 @@ func startStd852(t *testing.T, s *Server) (string, *http.Client) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return base, cl
+}
+
+// barrier852 returns once the server has finished the client's previous
+// request. std flushes a response from inside the chain, before HandleStream
+// times the run and promotes the unmatched chain, so the client can see the
+// 404 before the run is recorded; the next request on the one connection is
+// read only after that.
+func barrier852(t *testing.T, cl *http.Client, base string) {
+	t.Helper()
+	get852(t, cl, "GET", base+"/ready-852")
 }
 
 // get852 sends one request and returns its status.
@@ -123,6 +137,7 @@ func TestUnmatchedDispatchedLikeDefaultRoute852(t *testing.T) {
 			if st := get852(t, cl, "GET", base+"/block"); st != 404 {
 				t.Fatalf("GET /block: %d, want 404", st)
 			}
+			barrier852(t, cl, base)
 			for _, rq := range unmatched {
 				if got := rt.routeAsync(rq[0], rq[1]); got != tc.wantPromoted {
 					t.Errorf("after a blocking run: routeAsync(%s %s) = %v, want %v", rq[0], rq[1], got, tc.wantPromoted)
@@ -159,6 +174,7 @@ func TestUnmatchedDispatchWithoutRoutes852(t *testing.T) {
 		t.Error("hasAsyncRoutes = false with the async default and a global middleware: H2 would never ask routeAsync")
 	}
 	get852(t, cl, "GET", base+"/block")
+	barrier852(t, cl, base)
 	if !s.router.routeAsync("GET", "/anything") {
 		t.Error("routeAsync(GET /anything) = false after a blocking run, want true")
 	}
@@ -186,6 +202,7 @@ func TestUnmatchedBuiltinAnswerNotTimed852(t *testing.T) {
 	for range 10 {
 		get852(t, cl, "GET", base+"/nope")
 	}
+	barrier852(t, cl, base)
 	if _, timed := s.router.fastStreak.Load("<unmatched>"); timed {
 		t.Error("the built-in 404 was timed as an adaptive chain")
 	}
