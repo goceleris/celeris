@@ -10,9 +10,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
 	"github.com/goceleris/celeris/driver/postgres/protocol"
@@ -20,10 +21,10 @@ import (
 )
 
 // TestPgConnCloseNoDoubleClose asserts Close's fd-close path is idempotent:
-// onClose (event loop) and Close (caller) may both race to tear the conn
-// down; syscall.Close must happen at most once. We verify by inspecting the
-// fdCloseOnce guard rather than relying on kernel behavior — the race
-// detector would not catch a stray syscall.Close on an int. (PG-1)
+// concurrent Close calls may race to tear the conn down; syscall.Close must
+// happen at most once. We verify through the closeFDOnce guard rather than
+// relying on kernel behavior — the race detector would not catch a stray
+// syscall.Close on an int. (PG-1)
 func TestPgConnCloseNoDoubleClose(t *testing.T) {
 	addr := startFakePG(t, func(c net.Conn) {
 		fakePGTrustStartup(t, c, 1, 2, func(c net.Conn) {
@@ -45,8 +46,8 @@ func TestPgConnCloseNoDoubleClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Race: concurrent Close from two goroutines + a synthetic onClose via
-	// closeFDOnce directly. None of them should double-close.
+	// Race: concurrent Close from four goroutines, then closeFDOnce
+	// directly. None of them should double-close.
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
@@ -59,12 +60,11 @@ func TestPgConnCloseNoDoubleClose(t *testing.T) {
 
 	// Re-invoke closeFDOnce: it must be a no-op now.
 	c.closeFDOnce()
-	// Issue syscall.Close(fd) again and expect EBADF (fd already closed) —
-	// proving the real close happened exactly once, not twice. If we had
-	// double-closed, EBADF would have been returned by the FIRST redundant
-	// call inside Close and the fd number would now potentially alias.
-	err = syscall.Close(c.fd)
-	if !errors.Is(err, syscall.EBADF) {
+	// Close must have released the number: F_GETFD on it returns EBADF.
+	// F_GETFD only looks; a second close(2) here would close whatever the
+	// process has opened on the number since (celeris#859).
+	_, err = unix.FcntlInt(uintptr(c.fd), unix.F_GETFD, 0)
+	if !errors.Is(err, unix.EBADF) {
 		t.Fatalf("expected EBADF after Close(), got %v", err)
 	}
 }
