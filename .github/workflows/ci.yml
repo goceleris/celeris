@@ -910,14 +910,18 @@ jobs:
       # io_uring cannot be built, and the step above runs them without a
       # tally, so here they run by name at the runner's memlock (one io_uring
       # worker) and must all PASS with no SKIP line, each arm printing its
-      # own RESULT line.
+      # own RESULT line, and New must hand the sub-engines net.Listen's
+      # address on every free-port form. CELERIS_REQUIRE_DUALSTACK=1 turns the
+      # dual-stack tests' skip on a host without IPv6 into a failure.
       - name: celeris#616 port held from New to Listen (skipping forbidden)
         if: ${{ !cancelled() }}
         shell: bash
+        env:
+          CELERIS_REQUIRE_DUALSTACK: "1"
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHoldReleasedOnceBound616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616'
+          names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHoldReleasedOnceBound616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616'
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
             ./adaptive/ 2>&1 | tee /tmp/c616.log

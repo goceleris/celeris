@@ -352,6 +352,27 @@ func netListenAddr(t *testing.T, in string) string {
 	return a
 }
 
+// requireDualStack616 skips a test that needs a dual-stack host (net.Listen
+// makes ":0" "[::]:PORT") on a host without one, such as disable_ipv6=1, or
+// fails it when CELERIS_REQUIRE_DUALSTACK=1, as the adaptive CI job's
+// celeris#616 step sets it: that step must not go green by skipping.
+func requireDualStack616(t *testing.T) {
+	t.Helper()
+	a := "no listener"
+	if ln, err := net.Listen("tcp", ":0"); err == nil {
+		a = ln.Addr().String()
+		_ = ln.Close()
+	}
+	if strings.HasPrefix(a, "[::]:") {
+		return
+	}
+	msg := fmt.Sprintf("net.Listen(\":0\") gives %s here, not a dual-stack [::]:PORT: this test needs a dual-stack host", a)
+	if os.Getenv("CELERIS_REQUIRE_DUALSTACK") == "1" {
+		t.Fatal(msg + " -- CELERIS_REQUIRE_DUALSTACK=1 forbids skipping")
+	}
+	t.Skip(msg)
+}
+
 // TestAdaptivePortHeldWildcard616 is the New-to-Listen steal on the default
 // address form: a wildcard ":0", which New makes the dual-stack "[::]:PORT"
 // wherever Go does. In the gap every IPv4 and IPv6 socket on the port must be
@@ -364,9 +385,7 @@ func TestAdaptivePortHeldWildcard616(t *testing.T) {
 			if se.want == engine.IOUring && !probe.Probe().IOUringTier.Available() {
 				t.Skip("io_uring unavailable here: cannot start adaptive on it")
 			}
-			if a := netListenAddr(t, ":0"); !strings.HasPrefix(a, "[::]:") {
-				t.Fatalf("net.Listen(\":0\") gives %s here, not a dual-stack [::]:PORT: this test needs a dual-stack host", a)
-			}
+			requireDualStack616(t)
 			t.Setenv("CELERIS_ADAPTIVE_START", se.env)
 			e, err := New(resource.Config{Addr: ":0", Protocol: engine.HTTP1, Resources: resource.Resources{Workers: 2}}, respHandler{}, nil)
 			if err != nil {
@@ -454,9 +473,11 @@ func countTimeWait(port int) int {
 //
 // It asserts that this state is the one the exclusive hold cannot be bound
 // in: a socket with SO_REUSEPORT and without SO_REUSEADDR, bound the way that
-// hold binds, gets EADDRINUSE on the port.
+// hold binds, gets EADDRINUSE on the port. That check binds the dual-stack
+// wildcard, and the "[::]:P" forms need it too, so it needs a dual-stack host.
 func leaveTimeWait(t *testing.T) int {
 	t.Helper()
+	requireDualStack616(t)
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("predecessor listen: %v", err)

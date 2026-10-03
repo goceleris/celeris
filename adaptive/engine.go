@@ -316,8 +316,11 @@ func New(cfg resource.Config, handler stream.Handler, cpuMon engine.CPUMonitor) 
 	case cfg.Addr != "":
 		resolved, h, exclusive, err := holdPort(cfg.Addr)
 		if err != nil {
-			// The address is left as given: net.Listen could not bind it
-			// either (see holdPort), and the start engine's bind reports why.
+			// The address is left as given, as it was when net.Listen could
+			// not bind it either (see holdPort). The start engine binds that
+			// literal address, whose family can differ from the one the holds
+			// tried (":P" binds IPv4 0.0.0.0:P, the holds tried [::]:P): its
+			// bind fails with its own error, or succeeds with no hold taken.
 			logger.Warn("adaptive engine: cannot hold the port until Listen; the start engine binds the address as given",
 				"addr", cfg.Addr, "error", err)
 			break

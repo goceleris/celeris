@@ -69,10 +69,15 @@ import (
 // hold sets every option net.Listen sets, SO_REUSEPORT besides, and binds the
 // same address in the same family; setting either option only ever makes the
 // kernel's bind check more permissive. So when neither hold can be bound,
-// net.Listen could not bind the address either, the bind-and-close version
-// handed the sub-engines the unchanged address in that case too, and the
-// port that is taken is reported by the start engine's own bind at Listen,
-// with its diagnostics.
+// net.Listen could not bind the address either, and the bind-and-close
+// version handed the sub-engines the unchanged address in that case too. The
+// start engine then binds that literal address at Listen, and its family can
+// differ from the one tried here: for a wildcard host ("" or 0.0.0.0) the
+// sub-engines bind IPv4 0.0.0.0:PORT, while net.Listen and both holds try
+// the dual-stack [::]:PORT. So the start engine's bind either fails with its
+// own diagnostics or, beside an IPV6_V6ONLY socket on [::]:PORT that set no
+// reuse option, succeeds with no hold taken, the New-to-Listen gap as open
+// as before celeris#616.
 func holdPort(addr string) (string, *os.File, bool, error) {
 	ta, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
