@@ -4,6 +4,7 @@ package celeris_test
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -55,7 +56,8 @@ func TestHijackWithAsyncHandlersOnEpoll(t *testing.T) {
 		}
 		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
 		if err != nil {
-			return "", err
+			// celeris#936: say from the kernel's side where the request is.
+			return "", fmt.Errorf("%w\n%s", err, c936Report(srv, addr, c, "GET "+path+" unanswered at the 5 s deadline", true))
 		}
 		b, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
