@@ -22,7 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
 // c859Loop is an engine.WorkerLoop that keeps nothing and records every

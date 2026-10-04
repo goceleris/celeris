@@ -473,7 +473,7 @@ func New(config ...Config) celeris.HandlerFunc {
 		// setter publishes WSReady, whose only other effect is nil-ing
 		// PauseRecv/ResumeRecv in closeConn — which SSE never reads.
 		// On std SetWSErrorHandler is a no-op and SetWSDetachClose is
-		// backed by net/http's request context (engine/std/bridge.go),
+		// backed by net/http's request context (internal/engine/std/bridge.go),
 		// so a client that goes away cancels the ctx there as well.
 		// Both are no-ops on H2 streams (no OnWS* hooks).
 		c.SetWSErrorHandler(func(_ error) { cancel() })

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/internal/driver/redis/protocol"
 )
 
 // ----------------- R-1 / R-2: PubSub reconnect -----------------

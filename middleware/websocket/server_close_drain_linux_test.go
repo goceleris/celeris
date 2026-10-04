@@ -20,11 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/internal/sockopts"
-	"github.com/goceleris/celeris/probe"
 	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
+	"github.com/goceleris/celeris/internal/sockopts"
 )
 
 // TestServerInitiatedCloseDrainFINvsRST is Tier 1 of celeris#583: does the

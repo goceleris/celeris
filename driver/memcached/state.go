@@ -9,7 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/driver/memcached/protocol"
+	"github.com/goceleris/celeris/internal/driver/memcached/protocol"
 )
 
 // bytesToString returns a string that aliases b — no copy. Safe only when

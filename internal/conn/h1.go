@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/internal/ctxkit"
-	h1 "github.com/goceleris/celeris/protocol/h1"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	h1 "github.com/goceleris/celeris/internal/protocol/h1"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // timeNow is a package-level alias so tests can stub the clock when
@@ -21,9 +21,9 @@ import (
 var timeNow = time.Now
 
 func init() {
-	// Wire the H1-package helpers so protocol/h2/stream can lazily
+	// Wire the H1-package helpers so internal/protocol/h2/stream can lazily
 	// materialize request headers from raw bytes without taking a
-	// build-time dependency on protocol/h1.
+	// build-time dependency on internal/protocol/h1.
 	stream.SetLazyHeaderHelpers(h1.UnsafeLowerHeader, h1.UnsafeString)
 }
 

@@ -14,8 +14,8 @@ var fuzzTargets = []struct {
 	name string
 	pkg  string
 }{
-	{"FuzzParseRequest", "./protocol/h1/"},
-	{"FuzzParseChunkedBody", "./protocol/h1/"},
+	{"FuzzParseRequest", "./internal/protocol/h1/"},
+	{"FuzzParseChunkedBody", "./internal/protocol/h1/"},
 	{"FuzzCleanPath", "."},
 	{"FuzzRouterFind", "."},
 	{"FuzzParseFormURLEncoded", "."},

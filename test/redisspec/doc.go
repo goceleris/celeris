@@ -16,7 +16,7 @@
 //
 // Tests are gated by the `redisspec` build tag and the CELERIS_REDIS_ADDR
 // environment variable. Every test uses raw TCP connections and the
-// [github.com/goceleris/celeris/driver/redis/protocol] package for RESP
+// [github.com/goceleris/celeris/internal/driver/redis/protocol] package for RESP
 // encoding/decoding — no third-party Redis client is imported.
 //
 // # Documentation

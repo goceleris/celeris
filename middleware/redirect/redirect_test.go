@@ -7,8 +7,9 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
 	"github.com/goceleris/celeris/middleware/internal/testutil"
-	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
 func okHandler(c *celeris.Context) error {
@@ -27,11 +28,15 @@ func newEmptyHostContext(t *testing.T, method, path string, chain []celeris.Hand
 	)
 	rec := &emptyHostRec{}
 	s.ResponseWriter = &emptyHostWriter{rec: rec}
-	ctx := celeris.AcquireTestContext(s)
-	celeris.SetTestStartTime(ctx, time.Now())
-	celeris.SetTestHandlers(ctx, chain)
+	ctx := testhooks.AcquireContext(s).(*celeris.Context)
+	testhooks.SetStartTime(ctx, time.Now())
+	hs := make([]any, len(chain))
+	for i, h := range chain {
+		hs[i] = h
+	}
+	testhooks.SetHandlers(ctx, hs)
 	t.Cleanup(func() {
-		celeris.ReleaseTestContext(ctx)
+		testhooks.ReleaseContext(ctx)
 		stream.ResetForPool(s)
 	})
 	return ctx, rec

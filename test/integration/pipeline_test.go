@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/epoll"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/epoll"
 )
 
 // TestHTTP1PipeliningAsync asserts that the async-dispatch path on the

@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // Connector is a database/sql/driver.Connector that opens celeris-backed
@@ -54,7 +54,7 @@ func newConnector(dsn string) (*Connector, error) {
 // WithEngine rebinds this Connector to sp's event loop. The returned
 // Connector shares the DSN but replaces the provider; it does not own the
 // loop (so Close does not tear it down).
-func (c *Connector) WithEngine(sp eventloop.ServerProvider) *Connector {
+func (c *Connector) WithEngine(sp ServerProvider) *Connector {
 	clone := &Connector{dsn: c.dsn}
 	if sp != nil {
 		if p := sp.EventLoopProvider(); p != nil {

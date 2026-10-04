@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestH1Spec runs raw-TCP HTTP/1.1 compliance tests (RFC 9112) against every available engine.

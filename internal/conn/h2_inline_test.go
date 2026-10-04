@@ -8,8 +8,8 @@ import (
 
 	"golang.org/x/net/http2"
 
-	"github.com/goceleris/celeris/protocol/h2/frame"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/frame"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // inlineStreamerHandler records the writer it was handed: whether it is the

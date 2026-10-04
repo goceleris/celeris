@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
 // pgStmt is a prepared statement backed by a server-side statement plus the

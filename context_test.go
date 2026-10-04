@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 type mockResponseWriter struct {

@@ -2,9 +2,6 @@ package redis
 
 import (
 	"time"
-
-	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
 )
 
 const (
@@ -56,13 +53,13 @@ type Config struct {
 	ForceRESP2 bool
 	// Engine hooks the driver into a running celeris.Server's event loop.
 	// If nil, a standalone loop is resolved on NewClient.
-	Engine eventloop.ServerProvider
+	Engine ServerProvider
 	// OnPush is invoked when a RESP3 push frame arrives on a command
 	// connection. The channel is the first element of the push array
 	// (e.g. "invalidate" for client-tracking invalidations) and data
 	// carries the remaining elements. If nil, push frames on command
 	// connections are silently dropped.
-	OnPush func(channel string, data []protocol.Value)
+	OnPush func(channel string, data []Value)
 }
 
 // Option mutates a Config during NewClient.
@@ -105,7 +102,7 @@ func WithHealthCheckInterval(d time.Duration) Option {
 }
 
 // WithEngine hooks the driver into a celeris.Server's event loop.
-func WithEngine(sp eventloop.ServerProvider) Option {
+func WithEngine(sp ServerProvider) Option {
 	return func(c *Config) { c.Engine = sp }
 }
 
@@ -120,6 +117,6 @@ func WithProto(p int) Option { return func(c *Config) { c.Proto = p } }
 // channel is the push kind (first array element) and data carries the
 // remaining elements. If unset, push frames on command connections are
 // silently dropped.
-func WithOnPush(fn func(channel string, data []protocol.Value)) Option {
+func WithOnPush(fn func(channel string, data []Value)) Option {
 	return func(c *Config) { c.OnPush = fn }
 }

@@ -22,7 +22,7 @@ import (
 
 // TestAuthHandshakeSucceeds is the smoke test: if our Connect against the DSN
 // went through, the handshake worked. SCRAM / MD5 / cleartext differences
-// live in protocol/startup.go and are unit-tested there.
+// live in internal/driver/postgres/protocol/startup.go and are unit-tested there.
 func TestAuthHandshakeSucceeds(t *testing.T) {
 	db := openDB(t)
 	// The openDB helper already does PingContext; if we reach here, auth

@@ -25,7 +25,7 @@ import (
 
 	"github.com/goceleris/celeris/internal/httprange"
 	"github.com/goceleris/celeris/internal/negotiate"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 var smallInts [1000]string

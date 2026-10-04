@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/adaptive"
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/epoll"
+	"github.com/goceleris/celeris/internal/adaptive"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/epoll"
 )
 
 func TestAdaptiveAutoProtocol(t *testing.T) {

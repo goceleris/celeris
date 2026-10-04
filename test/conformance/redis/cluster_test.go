@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/redis"
-	"github.com/goceleris/celeris/driver/redis/protocol"
 )
 
 const envClusterAddrs = "CELERIS_REDIS_CLUSTER_ADDRS"
@@ -148,7 +147,7 @@ func TestClusterPipelineSameSlot(t *testing.T) {
 		if errs[idx] != nil {
 			t.Fatalf("Set[%d]: %v", idx, errs[idx])
 		}
-		if results[idx].Type != protocol.TySimple && results[idx].Type != protocol.TyBulk {
+		if results[idx].Type != redis.TySimple && results[idx].Type != redis.TyBulk {
 			t.Errorf("Set[%d]: got type=%v str=%q, want OK status", idx, results[idx].Type, results[idx].Str)
 		}
 	}

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine/iouring"
+	"github.com/goceleris/celeris/internal/engine/iouring"
 	"github.com/goceleris/celeris/middleware/store"
 )
 
@@ -72,7 +72,7 @@ func (st *stackTally589) capture(t *testing.T) {
 	n := runtime.Stack(buf, true)
 	st.captures++
 	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
-		isLoop := strings.Contains(g, "engine/iouring.(*Worker).run(") || strings.Contains(g, "engine/epoll.(*Loop).run(")
+		isLoop := strings.Contains(g, "internal/engine/iouring.(*Worker).run(") || strings.Contains(g, "internal/engine/epoll.(*Loop).run(")
 		if !isLoop {
 			continue
 		}
@@ -209,7 +209,7 @@ func envInt589(name string, def int) int {
 // the worker still blocks for ≈ D − 30 ms of every D cycle even though every
 // /kv conn is on a dispatch goroutine. A goroutine stack captured mid-stall
 // (CELERIS_589_STACK=1) shows both workers in sync.Mutex.Lock inside
-// Worker.checkTimeouts (engine/iouring/worker.go:4186, the celeris#548
+// Worker.checkTimeouts (internal/engine/iouring/worker.go:4186, the celeris#548
 // h1State snapshot under detachMu) while runAsyncHandler holds cs.detachMu
 // across the whole ProcessH1 (worker.go:3307→3460). The epoll sweep takes no
 // lock. That is a distinct io_uring defect — an async-dispatched HTTP/1 conn
@@ -760,7 +760,7 @@ func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond)
 // settled-route observable is measured against.
 //
 // The gate is the engine's OWN exported pre-flight (iouring.MaxWorkersForMemlock,
-// engine/iouring/ring.go) — the same rlim.Cur/minMemlockPerWorker arithmetic
+// internal/engine/iouring/ring.go) — the same rlim.Cur/minMemlockPerWorker arithmetic
 // capWorkersToMemlock applies at start — so the skip predicate and the cap that
 // would trigger it cannot drift apart. It returns -1 for "no cap" (RLIM_INFINITY
 // or an unreadable limit), in which case the rig runs.
@@ -778,7 +778,7 @@ func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
 	if maxW == -1 || maxW >= workers {
 		return
 	}
-	// The byte figure in the hint mirrors engine/iouring's unexported
+	// The byte figure in the hint mirrors internal/engine/iouring's unexported
 	// minMemlockPerWorker (12 MiB) and is advisory only — the GATE above is
 	// the exported pre-flight, so a change to that constant cannot make the
 	// rig skip or run wrongly, only make this hint generous or tight.
@@ -791,7 +791,7 @@ func skipIfMemlockCaps589(t *testing.T, engType EngineType, workers int) {
 // runner's 8 MiB the three io_uring subtests skip in every CI step
 // (celeris#684). A step that raises memlock and sets
 // CELERIS_REQUIRE_IOURING_WORKERS=1, as the `iouring` job does for
-// engine/iouring's own worker tests, turns the skip into a failure, so that
+// internal/engine/iouring's own worker tests, turns the skip into a failure, so that
 // step cannot go green without running them.
 func skipOrFailIOUring592(t *testing.T, format string, args ...any) {
 	t.Helper()

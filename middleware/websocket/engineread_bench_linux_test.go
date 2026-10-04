@@ -14,8 +14,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/probe"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 )
 
 // This file is the A/B apparatus for celeris#667. The fix moves the engine's
@@ -30,8 +30,8 @@ import (
 // differs between them.
 
 // enginePauseStub reproduces exactly what the engines' PauseRecv/ResumeRecv
-// closures do (installed on detach, in engine/iouring/worker.go and
-// engine/epoll/loop.go): an atomic Swap that early-returns on a
+// closures do (installed on detach, in internal/engine/iouring/worker.go and
+// internal/engine/epoll/loop.go): an atomic Swap that early-returns on a
 // no-op, a detach-queue append under detachQMu, and — only on the queue's
 // empty->non-empty edge — a write to a non-blocking eventfd.
 //

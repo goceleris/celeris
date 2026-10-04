@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // spinIterations is the number of spin loops the caller performs before

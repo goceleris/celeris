@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
 )
 
 // benchPreparedExec measures allocs/op for a prepared-statement Exec against

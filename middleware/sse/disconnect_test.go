@@ -11,6 +11,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // fakeEngineHooks plays the native engine's part for the celeris#494
@@ -52,7 +53,7 @@ func newDetachedSSEContext(t *testing.T) (*celeris.Context, *mockStreamer, *fake
 	ctx, _ := celeristest.NewContext("GET", "/events")
 	ms := &mockStreamer{}
 	hooks := &fakeEngineHooks{}
-	s := celeris.TestStream(ctx)
+	s := testhooks.Stream(ctx)
 	s.ResponseWriter = ms
 	s.OnDetach = func() { hooks.detached.Store(true) }
 	s.OnWSSetError = func(fn func(error)) {

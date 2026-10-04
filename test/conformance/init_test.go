@@ -1,10 +1,10 @@
 package conformance
 
 import (
-	"github.com/goceleris/celeris/engine"
-	stdengine "github.com/goceleris/celeris/engine/std"
-	"github.com/goceleris/celeris/protocol/h2/stream"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/engine"
+	stdengine "github.com/goceleris/celeris/internal/engine/std"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 func init() {

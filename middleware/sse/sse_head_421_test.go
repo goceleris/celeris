@@ -6,6 +6,7 @@ import (
 
 	"github.com/goceleris/celeris"
 	"github.com/goceleris/celeris/celeristest"
+	"github.com/goceleris/celeris/internal/testhooks"
 )
 
 // TestHeadAnswersWithHeadersOnly421: since celeris#421 a HEAD request to an
@@ -19,7 +20,7 @@ func TestHeadAnswersWithHeadersOnly421(t *testing.T) {
 	newHead := func(t *testing.T) (*celeris.Context, *mockStreamer) {
 		ctx, _ := celeristest.NewContextT(t, "HEAD", "/events")
 		ms := &mockStreamer{}
-		celeris.TestStream(ctx).ResponseWriter = ms
+		testhooks.Stream(ctx).ResponseWriter = ms
 		return ctx, ms
 	}
 

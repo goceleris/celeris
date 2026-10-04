@@ -3,7 +3,7 @@
 package validation
 
 // Counter is the no-op stub installed in production builds. It carries
-// no state and inlines to nothing. Importers (engine/iouring,
+// no state and inlines to nothing. Importers (internal/engine/iouring,
 // middleware/...) call validation.X.Add(1) without a build-tag guard at
 // the call site — production simply discards the increment. Add returns
 // nothing so static-check tools cannot flag callers for ignoring an
