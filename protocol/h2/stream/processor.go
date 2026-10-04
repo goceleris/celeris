@@ -758,7 +758,7 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 
 	stream.SetHandlerStarted()
 
-	if err := p.handler.HandleStream(stream.Context(), stream); err != nil {
+	if err := p.handler.HandleStream(bgCtx, stream); err != nil {
 		return
 	}
 
@@ -860,7 +860,7 @@ func (p *Processor) executeHandler(stream *Stream) {
 
 	stream.SetHandlerStarted()
 
-	if err := p.handler.HandleStream(stream.Context(), stream); err != nil {
+	if err := p.handler.HandleStream(bgCtx, stream); err != nil {
 		return
 	}
 

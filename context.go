@@ -255,7 +255,9 @@ func acquireContext(s *stream.Stream) *Context {
 	c.index = -1
 	c.statusCode = 200
 	c.maxFormSize = DefaultMaxFormSize
-	c.ctx = s.Context()
+	// c.ctx stays nil: Context() asks the stream for its context only when
+	// something wants it, so an HTTP/2 request that never does allocates
+	// none (celeris#836).
 	c.extractRequestInfo()
 	return c
 }
@@ -399,10 +401,15 @@ func (c *Context) IsAborted() bool {
 }
 
 // Context returns the request's context.Context. The returned context is
-// always non-nil; it defaults to the stream's context.
+// always non-nil; it defaults to the stream's context. On HTTP/2 that context
+// is cancelled with the stream, and it stays cancelled after the request is
+// over: the stream is pooled, its context is not (celeris#836).
 func (c *Context) Context() context.Context {
 	if c.ctx != nil {
 		return c.ctx
+	}
+	if c.stream != nil {
+		return c.stream.Context()
 	}
 	return context.Background()
 }
@@ -438,7 +445,12 @@ func (c *Context) WorkerID() int {
 	// pre-populated via context.WithValue without going through
 	// routerAdapter.HandleStream. Production hot path uses the field
 	// above and never reaches this Value() walk.
-	id, _ := ctxkit.WorkerIDFrom(c.Context())
+	// The stream's own context carries no values, so it is not asked for
+	// (on HTTP/2 that would make it).
+	if c.ctx == nil {
+		return -1
+	}
+	id, _ := ctxkit.WorkerIDFrom(c.ctx)
 	return id
 }
 

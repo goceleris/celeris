@@ -27,7 +27,6 @@ var streamPool = sync.Pool{New: func() any {
 const (
 	flagCancelled    uint32 = 1 << 0
 	flagAsyncRunning uint32 = 1 << 1
-	flagDoneClosed   uint32 = 1 << 2
 	// flagBudgetPool marks an inline-eligible stream that runs on the worker
 	// pool only because its connection was over its outbound budget
 	// (celeris#893). Its response never goes to its OutboundBuffer
@@ -106,7 +105,7 @@ type Stream struct {
 	h1Mode                 bool  // single-threaded H1 stream; skip mutex in GetHeaders
 	protoMajor             uint8 // 0=infer from h1Mode, 1=HTTP/1.1, 2=HTTP/2
 	flags                  atomic.Uint32
-	doneCh                 atomic.Pointer[chan struct{}]
+	ctx                    atomic.Pointer[streamCtx] // this use's context, made on first ask (celeris#836)
 	phase                  Phase
 	CachedCtx              any                     // per-connection cached context (avoids pool Get/Put per request)
 	OnDetach               func()                  // called by Context.Detach to install write-thread safety
@@ -119,39 +118,83 @@ type Stream struct {
 	hdrBuf                 [16][2]string
 }
 
-// streamContext is a zero-alloc context.Context for streams.
-// It avoids the context.WithCancel allocation on the fast path.
-type streamContext struct{ s *Stream }
-
-func (c streamContext) Deadline() (time.Time, bool) { return time.Time{}, false }
-func (c streamContext) Value(_ any) any             { return nil }
-
-func (c streamContext) Done() <-chan struct{} {
-	if p := c.s.doneCh.Load(); p != nil {
-		return *p
-	}
-	if c.s.flags.Load()&flagCancelled != 0 {
-		ch := make(chan struct{})
-		close(ch)
-		return ch
-	}
-	ch := make(chan struct{})
-	if c.s.doneCh.CompareAndSwap(nil, &ch) {
-		if c.s.flags.Load()&flagCancelled != 0 {
-			if old := c.s.flags.Or(flagDoneClosed); old&flagDoneClosed == 0 {
-				close(ch)
-			}
-		}
-		return ch
-	}
-	return *c.s.doneCh.Load()
+// streamCtx is the context.Context of one use of an HTTP/2 stream.
+//
+// A Stream is pooled and reset for its next use; its context is not. It used
+// to be a view of the Stream (its flags and done channel), and a reset made
+// the context of the use before it read "not cancelled" again: Err returned
+// nil while the Done channel that use had handed out stayed closed. A context
+// derived from it (context.WithCancel, WithTimeout, AfterFunc) runs a
+// propagation goroutine that reads the parent's Err after it sees Done
+// closed, so it got nil, and the context package panicked ("context: internal
+// error: missing cancel error"), which killed the process (celeris#836). Now
+// each use gets its own streamCtx, made the first time the use asks for it,
+// and a reset only detaches it from the Stream after cancelling it. Nothing
+// clears its state, so once Done is closed Err is context.Canceled for good,
+// as the context.Context contract requires, and a context derived from it
+// never watches a later use of the stream.
+type streamCtx struct {
+	state atomic.Uint32 // ctxCancelled | ctxDoneClosed
+	done  atomic.Value  // chan struct{}, made on the first Done that comes before the cancel
 }
 
-func (c streamContext) Err() error {
-	if c.s.flags.Load()&flagCancelled != 0 {
+const (
+	ctxCancelled  uint32 = 1 << 0
+	ctxDoneClosed uint32 = 1 << 1
+)
+
+// closedChan is the Done channel of a context that was cancelled before
+// anything asked for its Done.
+var closedChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+func (c *streamCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *streamCtx) Value(_ any) any             { return nil }
+
+func (c *streamCtx) Done() <-chan struct{} {
+	if d, ok := c.done.Load().(chan struct{}); ok {
+		return d
+	}
+	if c.state.Load()&ctxCancelled != 0 {
+		return closedChan
+	}
+	ch := make(chan struct{})
+	if !c.done.CompareAndSwap(nil, ch) {
+		return c.done.Load().(chan struct{})
+	}
+	// A cancel between the check above and the swap found no channel to
+	// close: close it here. Either way it is closed only after
+	// ctxCancelled is set, so whoever sees it closed reads a non-nil Err.
+	if c.state.Load()&ctxCancelled != 0 {
+		c.closeDone(ch)
+	}
+	return ch
+}
+
+func (c *streamCtx) Err() error {
+	if c.state.Load()&ctxCancelled != 0 {
 		return context.Canceled
 	}
 	return nil
+}
+
+// cancel cancels the context. Idempotent; never undone.
+func (c *streamCtx) cancel() {
+	if c.state.Or(ctxCancelled)&ctxCancelled != 0 {
+		return
+	}
+	if d, ok := c.done.Load().(chan struct{}); ok {
+		c.closeDone(d)
+	}
+}
+
+func (c *streamCtx) closeDone(d chan struct{}) {
+	if c.state.Or(ctxDoneClosed)&ctxDoneClosed == 0 {
+		close(d)
+	}
 }
 
 // NewStream creates a new stream with full H2 initialization.
@@ -200,12 +243,37 @@ func (s *Stream) ProtoMajor() uint8 {
 // SetProtoMajor sets the HTTP major version explicitly.
 func (s *Stream) SetProtoMajor(v uint8) { s.protoMajor = v }
 
-// Context returns the stream's context.
+// Context returns the context of this use of the stream. For an HTTP/1
+// stream it is context.Background(). For an HTTP/2 stream it is cancelled
+// when the stream is (Cancel: RST_STREAM, connection close, Release), and it
+// belongs to this use only: it is made the first time this use asks for it,
+// the stream's next use gets a new one, and once this use is over (Release,
+// or a reset for reuse) it stays cancelled, Err context.Canceled, whatever
+// the stream does next (celeris#836).
 func (s *Stream) Context() context.Context {
 	if s.h1Mode {
 		return bgCtx
 	}
-	return streamContext{s}
+	return s.useCtx()
+}
+
+// useCtx returns this use's context, making it on the first call.
+func (s *Stream) useCtx() *streamCtx {
+	for {
+		if c := s.ctx.Load(); c != nil {
+			return c
+		}
+		c := new(streamCtx)
+		if s.ctx.CompareAndSwap(nil, c) {
+			// Cancel sets flagCancelled before it looks for the context,
+			// and this looks at the flag after publishing the context, so
+			// one of the two cancels it.
+			if s.flags.Load()&flagCancelled != 0 {
+				c.cancel()
+			}
+			return c
+		}
+	}
 }
 
 // Cancel cancels the stream's context.
@@ -214,10 +282,20 @@ func (s *Stream) Cancel() {
 	if old&flagCancelled != 0 {
 		return // already cancelled
 	}
-	if p := s.doneCh.Load(); p != nil {
-		if old2 := s.flags.Or(flagDoneClosed); old2&flagDoneClosed == 0 {
-			close(*p)
-		}
+	if c := s.ctx.Load(); c != nil {
+		c.cancel()
+	}
+}
+
+// endCtx ends this use's context: it is cancelled, if it is not yet, and
+// detached, so the stream's next use gets a new one (celeris#836). Called by
+// every reset that ends a use.
+func (s *Stream) endCtx() {
+	if s.ctx.Load() == nil {
+		return
+	}
+	if c := s.ctx.Swap(nil); c != nil {
+		c.cancel()
 	}
 }
 
@@ -226,10 +304,12 @@ func (s *Stream) IsCancelled() bool {
 	return s.flags.Load()&flagCancelled != 0
 }
 
-// HasDoneCh reports whether a Done channel was created, indicating
-// a derived context (e.g. context.WithTimeout) is watching this stream.
+// HasDoneCh reports whether this use's context has a Done channel,
+// indicating something (e.g. a context.WithTimeout derived from it) is
+// watching it.
 func (s *Stream) HasDoneCh() bool {
-	return s.doneCh.Load() != nil
+	c := s.ctx.Load()
+	return c != nil && c.done.Load() != nil
 }
 
 // Release returns pooled buffers, cancels the context, and returns the stream
@@ -241,10 +321,10 @@ func (s *Stream) Release() {
 	s.resetAndPool()
 }
 
-// ResetForPool returns pooled buffers and returns the stream to its pool
-// WITHOUT cancelling the context. Use this in test harnesses where derived
-// contexts (e.g. from context.WithTimeout) may have propagation goroutines
-// that race with cancellation flag clearing.
+// ResetForPool returns pooled buffers and returns the stream to its pool,
+// like Release but without setting the stream's cancelled flag first. The
+// context this use handed out is cancelled all the same: the use is over,
+// and the stream's next use gets a new context (celeris#836).
 func ResetForPool(s *Stream) {
 	s.resetAndPool()
 }
@@ -289,8 +369,8 @@ func (s *Stream) resetAndPool() {
 	s.IsHEAD = false
 	s.h1Mode = false
 	s.protoMajor = 0
+	s.endCtx()
 	s.flags.Store(0)
-	s.doneCh.Store(nil)
 	s.phase = 0
 	s.CachedCtx = nil
 	s.OnDetach = nil
@@ -433,8 +513,8 @@ func ResetH2StreamInline(s *Stream, id uint32) {
 	s.IsHEAD = false
 	s.h1Mode = false
 	s.protoMajor = 0
+	s.endCtx()
 	s.flags.Store(0)
-	s.doneCh.Store(nil)
 	s.phase = PhaseInit
 	s.CachedCtx = nil
 	s.state.Store(int32(StateIdle))

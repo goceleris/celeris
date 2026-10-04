@@ -20,6 +20,11 @@ type Hijacker interface {
 }
 
 // Handler interface for processing streams.
+//
+// For an HTTP/2 stream the H2 processor passes context.Background() as ctx.
+// The stream's own context, cancelled with the stream, is stream.Context():
+// it is made the first time a use of the stream asks for it (celeris#836),
+// so a stream whose handler never asks costs no allocation.
 type Handler interface {
 	HandleStream(ctx context.Context, stream *Stream) error
 }
