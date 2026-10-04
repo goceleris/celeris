@@ -204,8 +204,10 @@ func (s *Server) Use(middleware ...HandlerFunc) *Server {
 // Pre registers pre-routing middleware that executes before route lookup.
 // Pre-middleware may modify the request method or path (e.g. for rewriting or
 // stripping a prefix) before the router resolves the handler chain.
-// If a pre-middleware handler aborts, no routing occurs and the request is
-// considered handled. Must be called before Start.
+// If a pre-middleware handler aborts, or answers the request (writes the
+// response, has it captured by a buffering middleware, or takes the
+// connection over), no routing occurs and the request is considered handled.
+// Must be called before Start.
 func (s *Server) Pre(middleware ...HandlerFunc) *Server {
 	s.preMiddleware = append(s.preMiddleware, middleware...)
 	return s

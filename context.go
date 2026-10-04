@@ -347,15 +347,36 @@ func (c *Context) extractRequestInfo() {
 // Next executes the next handler in the chain. It returns the first non-nil
 // error from a downstream handler, short-circuiting the remaining chain.
 // Middleware can inspect or swallow errors by checking the return value.
+//
+// A handler that answers the request ends the chain: once it has written the
+// response, had it captured by a buffering middleware (compress, etag,
+// cache, ...) or taken the connection over (Detach, Hijack), the handlers
+// after it do not run, although it returned without calling Next and
+// without Abort. So a middleware that serves its own paths (swagger, pprof,
+// healthcheck, static, cors' preflight) wins over a route that also
+// matches the request (celeris#927). A handler that returns without
+// answering and without calling Next still lets the chain continue.
 func (c *Context) Next() error {
 	c.index++
 	for c.index < int16(len(c.handlers)) {
 		if err := c.handlers[c.index](c); err != nil {
 			return err
 		}
+		if c.answered() {
+			// Every enclosing Next stops too.
+			c.index = abortIndex
+			return nil
+		}
 		c.index++
 	}
 	return nil
+}
+
+// answered reports whether a handler has answered the request: written the
+// response, had a buffering middleware capture it, or taken the connection
+// over.
+func (c *Context) answered() bool {
+	return c.written || c.buffered || c.detached
 }
 
 // Abort prevents pending handlers from being called.
