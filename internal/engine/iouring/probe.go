@@ -291,8 +291,9 @@ func parseSendZCResult(initialRes int32, initialFlags uint32, notifArrived bool,
 // Values:
 //   - "on", "1", "true": force enabled if functional probe passed.
 //   - "off", "0", "false": force disabled.
-//   - "auto", "" (default): enabled when the functional probe passed. Whether that stays the
-//     default is an open measurement owned by celeris#585 (SEND_ZC on/off A/B on the fabric).
+//   - "auto", "" (default): enabled when the functional probe passed. The on/off A/B of
+//     celeris#585 (2026-09-27) kept this default: on neither arch did SEND_ZC carry enough
+//     of a benchmark cell's bytes to vote, and the default changes only on a measured loss.
 //   - any other value: falls back to auto behavior, and returns recognized=false.
 //
 // When the functional probe failed, the value is not examined: the result is

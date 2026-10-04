@@ -339,7 +339,7 @@ The engines read these at startup. None is needed for normal operation; to run a
 |----------|--------|-----------|--------------------------|--------|
 | `CELERIS_ADAPTIVE_START` | Adaptive | supported | `epoll`, `iouring`, **`auto`** | Chooses the engine Adaptive **starts** on. It does not turn off runtime switching. Unrecognized values mean `auto`. |
 | `CELERIS_MAX_IOURING_TIER` | io_uring | supported | `optional`, `high`, `base`, `none` (**unset: detected tier**) | Caps the io_uring feature tier below what the kernel supports; for exercising fallback paths. Any other value, typos included, counts as `none`, and at `none` the io_uring engine reports io_uring as unavailable and Adaptive neither starts on io_uring nor switches to it. The detected kernel version is not capped. |
-| `CELERIS_IOURING_SEND_ZC` | io_uring | supported | `on`/`1`/`true`, `off`/`0`/`false`, **`auto`** | Zero-copy send. `auto` enables it where the startup probe finds SEND_ZC working; `on` cannot enable it where the probe failed. Unrecognized values mean `auto`; one is logged as a warning only where the probe finds SEND_ZC working (elsewhere the variable has no effect). Whether `auto` should keep enabling it is an open measurement ([#585](https://github.com/goceleris/celeris/issues/585)). |
+| `CELERIS_IOURING_SEND_ZC` | io_uring | supported | `on`/`1`/`true`, `off`/`0`/`false`, **`auto`** | Zero-copy send. `auto` enables it where the startup probe finds SEND_ZC working; `on` cannot enable it where the probe failed. Unrecognized values mean `auto`; one is logged as a warning only where the probe finds SEND_ZC working (elsewhere the variable has no effect). |
 | `CELERIS_IOURING_MULTISHOT_RECV` | io_uring | experimental | `1` (**unset: off**) | Multishot receive into a provided-buffer ring (high tier, 5.19+). Any value other than `1` leaves it off. |
 | `CELERIS_IOURING_PBUF_COUNT` | io_uring | experimental | positive integer (**1024**) | Provided-buffer-ring entries per worker; used only with multishot receive. Rounded up to a power of two and clamped to 1024–32768. `0`, a negative value or a non-integer keeps the default. |
 | `CELERIS_IOURING_FIXED_FILES` | io_uring | unsupported | **do not set** | Development only. Fixed-file support is incomplete ([#541](https://github.com/goceleris/celeris/issues/541)); enabling it makes connections read from unrelated descriptors. |
@@ -431,7 +431,7 @@ Bug oracles include slowloris hang detection, malformed-request acceptance, WebS
 celeristest/    Test helpers (NewContext, NewContextT, ResponseRecorder, With* options)
 cmd/celeris/    CLI launcher — validation / diagnostics entrypoint (see below)
 driver/         First-party event-loop database drivers (postgres, redis, memcached)
-internal/       Not importable outside this module:
+internal/       Importable only under github.com/goceleris/celeris/:
   adaptive/       Adaptive meta-engine (Linux)
   driver/         Wire codecs of the drivers (redis RESP, postgres, memcached)
   engine/         Engine interface + implementations (iouring, epoll, std)

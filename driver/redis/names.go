@@ -29,7 +29,8 @@ type Value = protocol.Value
 // or attribute reply.
 type KV = protocol.KV
 
-// Type tags a [Value] with the RESP type of the reply.
+// Type tags a [Value] with the RESP type of the reply. Its String method
+// returns a short name of the type, for diagnostics.
 type Type = protocol.Type
 
 // The RESP types a [Value] can carry.
@@ -68,9 +69,14 @@ const (
 
 // PoolStats reports the occupancy of a client's connection pool, as
 // returned by [Client.Stats] and [SentinelClient.Stats].
+//
+// The fields are Open, the number of connections, idle and in use; Idle,
+// the number on the workers' idle lists; InUse, Open minus Idle; and
+// PerWorker, a []PoolWorkerStats with one entry per event-loop worker.
 type PoolStats = async.PoolStats
 
-// PoolWorkerStats is the per-worker part of [PoolStats].
+// PoolWorkerStats is the per-worker part of [PoolStats]. Its one field,
+// Idle int, is the number of idle connections on that worker's list.
 type PoolWorkerStats = async.PoolWorkerStats
 
 // ServerProvider is what [WithEngine] and the Engine fields of [Config],

@@ -29,17 +29,32 @@ type TypeCodec = protocol.TypeCodec
 // RegisterType registers a custom type codec. Later registrations override
 // earlier ones for the same OID. It is safe to call at init time or at
 // run time. RegisterType panics if c is nil.
+//
+// The registry keeps c itself, and the driver calls it from every
+// goroutine that encodes or decodes a value of that OID. Do not modify c
+// after registering it: register a new codec instead.
 func RegisterType(c *TypeCodec) { protocol.RegisterType(c) }
 
 // LookupOID returns the codec registered for oid, or nil if none is
 // registered.
+//
+// The result is the registered codec itself, shared with the driver, which
+// calls it from every goroutine that encodes or decodes a value of that
+// OID. Do not modify it. To change a codec, for example to wrap its
+// DecodeText, copy the struct, change the copy and pass the copy to
+// [RegisterType].
 func LookupOID(oid uint32) *TypeCodec { return protocol.LookupOID(oid) }
 
 // PoolStats reports the occupancy of a [Pool]'s connections, as returned
 // by [Pool.Stats].
+//
+// The fields are Open, the number of connections, idle and in use; Idle,
+// the number on the workers' idle lists; InUse, Open minus Idle; and
+// PerWorker, a []PoolWorkerStats with one entry per event-loop worker.
 type PoolStats = async.PoolStats
 
-// PoolWorkerStats is the per-worker part of [PoolStats].
+// PoolWorkerStats is the per-worker part of [PoolStats]. Its one field,
+// Idle int, is the number of idle connections on that worker's list.
 type PoolWorkerStats = async.PoolWorkerStats
 
 // ServerProvider is what [WithEngine] and [Connector.WithEngine] take.

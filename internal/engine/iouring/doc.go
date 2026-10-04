@@ -22,8 +22,9 @@
 //     functional probe passes, and "on" cannot enable it where the probe failed. Any other
 //     value is treated as "auto". It is logged as a warning only when the probed profile has
 //     SEND_ZC (the optional tier) and the functional probe passed, because only then is the
-//     value examined. Whether "auto" should keep enabling it is an open measurement, owned by
-//     celeris#585 (SEND_ZC on/off A/B on the real fabric).
+//     value examined. The on/off A/B of celeris#585 (2026-09-27) kept "auto" on: on neither
+//     arch did SEND_ZC carry enough of a benchmark cell's bytes to vote, and the default
+//     changes only on a measured loss.
 //
 //   - CELERIS_IOURING_MULTISHOT_RECV: Opts into multishot receive with provided buffer rings
 //     (IORING_REGISTER_PBUF_RING + IORING_RECV_MULTISHOT). Set to "1" to enable. Disabled by default.
