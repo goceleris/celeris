@@ -337,7 +337,13 @@ func TestH2CUnmatchedThroughTimeoutSingleflight836(t *testing.T) {
 					s.GET("/api/short", func(c *celeris.Context) error { return c.String(200, "ok") })
 				})
 				var tl tally836
-				stop := time.Now().Add(dur836(arm.defaultDur))
+				d := arm.defaultDur
+				if lean761() {
+					// The root package is near its 300 s limit under -race
+					// on CI; the full-length arms run without it.
+					d /= 3
+				}
+				stop := time.Now().Add(dur836(d))
 				var wg sync.WaitGroup
 				for i := range arm.probers {
 					wg.Add(1)
