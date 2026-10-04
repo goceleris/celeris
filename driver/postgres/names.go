@@ -79,3 +79,12 @@ var ErrUnknownFD = engine.ErrUnknownFD
 // header is below the 4-byte minimum or above the driver's 1 GiB limit. The
 // connection is closed. Match it with errors.Is.
 var ErrInvalidLength = protocol.ErrInvalidLength
+
+// PGInfinity and PGNegInfinity are the time.Time values the driver returns
+// when PostgreSQL sends infinity or -infinity for a date, timestamp or
+// timestamptz column: 9999-12-31T23:59:59Z and -4713-01-01T00:00:00Z.
+// Check for them with time.Equal before doing arithmetic on the value.
+var (
+	PGInfinity    = protocol.PGInfinity
+	PGNegInfinity = protocol.PGNegInfinity
+)

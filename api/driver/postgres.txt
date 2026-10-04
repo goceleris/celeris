@@ -103,6 +103,8 @@ var ErrResultTooBig error
 var ErrSSLNotSupported error
 var ErrUnknownFD error
 var ErrUnsupportedAuth error
+var PGInfinity time.Time
+var PGNegInfinity time.Time
 exposed method (*github.com/goceleris/celeris/internal/driver/postgres/protocol.PGError) Error() string
 exposed method (*pgConn) Begin() (database/sql/driver.Tx, error)
 exposed method (*pgConn) BeginTx(context.Context, database/sql/driver.TxOptions) (database/sql/driver.Tx, error)
