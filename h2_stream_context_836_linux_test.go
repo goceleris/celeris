@@ -211,6 +211,102 @@ func TestH2RequestContextEndsWithItsRequest836(t *testing.T) {
 	}
 }
 
+// TestH2DetachedContextIsItsRequests836: a handler that writes its response,
+// calls Detach and leaves a goroutine that calls c.Context() after the
+// handler has returned. On HTTP/2 the processor releases the stream when the
+// handler returns, Detach or not, so that late call must not read the
+// stream: it would race the stream's reset (the race detector reports it),
+// and it would get a context that is not the request's, live, belonging to
+// the stream's next use. The late context must be the one the handler had,
+// and it must end with the request.
+func TestH2DetachedContextIsItsRequests836(t *testing.T) {
+	for _, e := range engines761 {
+		if e.name == "std" {
+			continue // context.Background() on std; nothing to end
+		}
+		t.Run(e.name, func(t *testing.T) {
+			n := n836(800)
+			var wrong atomic.Int64
+			// Each detached goroutine sends what it got. A WaitGroup Add in
+			// the handler would be reported as racing the test's Wait: the
+			// race detector does not see the socket in between.
+			late := make(chan context.Context, n)
+			addr := startServer761(t, e.eng, false, func(s *celeris.Server) {
+				s.GET("/detach", func(c *celeris.Context) error {
+					early := c.Context()
+					if err := c.String(200, "ok"); err != nil {
+						return err
+					}
+					done := c.Detach()
+					go func() {
+						time.Sleep(time.Millisecond) // past the handler's return
+						ctx := c.Context()
+						if ctx != early {
+							wrong.Add(1)
+						}
+						done()
+						late <- ctx
+					}()
+					return nil
+				})
+			})
+			cl := h2cClient836(4)
+			defer cl.CloseIdleConnections()
+			var bad atomic.Int64
+			var cwg sync.WaitGroup
+			sem := make(chan struct{}, 32)
+			for range n {
+				sem <- struct{}{}
+				cwg.Add(1)
+				go func() {
+					defer func() { <-sem; cwg.Done() }()
+					resp, err := cl.Get("http://" + addr + "/detach")
+					if err != nil {
+						bad.Add(1)
+						return
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+					if resp.ProtoMajor != 2 || resp.StatusCode != 200 {
+						bad.Add(1)
+					}
+				}()
+			}
+			cwg.Wait()
+			if b := bad.Load(); b != 0 {
+				t.Fatalf("%d of %d requests were not answered 200 over HTTP/2", b, n)
+			}
+			ctxs := make([]context.Context, 0, n)
+			for range n {
+				select {
+				case ctx := <-late:
+					ctxs = append(ctxs, ctx)
+				case <-time.After(10 * time.Second):
+					t.Fatalf("only %d of %d detached handlers reported", len(ctxs), n)
+				}
+			}
+			if w := wrong.Load(); w != 0 {
+				t.Fatalf("%d of %d detached handlers got a different context from c.Context() once the handler had returned", w, n)
+			}
+			// Every request is over, so every late context must be cancelled
+			// (the stream is released just after its response is written).
+			deadline := time.Now().Add(5 * time.Second)
+			live := 0
+			for _, ctx := range ctxs {
+				for ctx.Err() == nil && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+				}
+				if !errors.Is(ctx.Err(), context.Canceled) {
+					live++
+				}
+			}
+			if live != 0 {
+				t.Fatalf("%d of %d contexts that detached handlers took after returning are still live after their requests ended", live, n)
+			}
+		})
+	}
+}
+
 // The soak arms (evidence: cluster-reads-20261004/soak-37140355449/h2c-hang):
 // the probatorium h2c walker sends `GET /` with Upgrade: h2c to kitchen_sink,
 // whose global chain is timeout(5s) then singleflight, and which has no route
@@ -223,6 +319,15 @@ func TestH2RequestContextEndsWithItsRequest836(t *testing.T) {
 // chain ran for an unmatched request before #916); E: the std engine. Before
 // the fix A and D killed the process on epoll (in 1-6 s in the container
 // repro, 3 of 3), B and E survived.
+//
+// At the length it runs in CI (3 s per arm, a third of that under -race or
+// coverage) this is a shape and liveness check: every upgrade must be
+// answered. It is not what catches #836 coming back. Before the fix every arm
+// survived 3 s; only 30 s runs (adaptive A and D) and the soak reader's 60 s
+// probe panicked, at about one panic per 0.2-1M fires.
+// TestH2DerivedContextDoesNotPanic836 and
+// TestH2RequestContextEndsWithItsRequest836 are the ones that fail without the
+// fix. CELERIS_836_DUR=30s runs each arm longer.
 
 // preamble836 is the walker's h2c upgrade request (probatorium
 // validation/h2c.go at e192920).

@@ -135,7 +135,7 @@ type Stream struct {
 // never watches a later use of the stream.
 type streamCtx struct {
 	state atomic.Uint32 // ctxCancelled | ctxDoneClosed
-	done  atomic.Value  // chan struct{}, made on the first Done that comes before the cancel
+	done  atomic.Value  // chan struct{}, set by the first Done: a new channel, or closedChan once cancelled
 }
 
 const (
@@ -159,7 +159,12 @@ func (c *streamCtx) Done() <-chan struct{} {
 		return d
 	}
 	if c.state.Load()&ctxCancelled != 0 {
-		return closedChan
+		// Cancelled before anything asked: share closedChan, stored so that
+		// every later call returns the same channel. A first call racing
+		// this one may have stored its own; then that one is returned (the
+		// cancel, or that call, closes it).
+		c.done.CompareAndSwap(nil, closedChan)
+		return c.done.Load().(chan struct{})
 	}
 	ch := make(chan struct{})
 	if !c.done.CompareAndSwap(nil, ch) {
@@ -192,6 +197,9 @@ func (c *streamCtx) cancel() {
 }
 
 func (c *streamCtx) closeDone(d chan struct{}) {
+	if d == closedChan {
+		return // closed already, and shared
+	}
 	if c.state.Or(ctxDoneClosed)&ctxDoneClosed == 0 {
 		close(d)
 	}

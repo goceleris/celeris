@@ -77,6 +77,67 @@ func TestH1ContextIsSetWhenAcquired836(t *testing.T) {
 	releaseContext(c)
 }
 
+// TestDetachedH2ContextIsItsRequests836: Detach keeps the Context past the
+// handler, but on HTTP/2 the processor releases the stream when HandleStream
+// returns all the same. A c.Context() called after that, from the goroutine
+// the handler left running, is still the request's own context, cancelled
+// with the request. It must not be made from the released stream: that
+// context would be live, and it would belong to the pooled stream's next use.
+func TestDetachedH2ContextIsItsRequests836(t *testing.T) {
+	for _, askFirst := range []bool{true, false} {
+		name := "asked-before-detach"
+		if !askFirst {
+			name = "first-asked-after-release"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, _ := newTestStream("GET", "/836")
+			c := acquireContext(s)
+			var early context.Context
+			if askFirst {
+				early = c.Context()
+			}
+			done := c.Detach()
+			s.Release() // what the H2 processor does when HandleStream returns
+			late := c.Context()
+			if askFirst && late != early {
+				t.Fatal("after the stream was released, c.Context() of the detached request is not the context it returned during the request")
+			}
+			if !errors.Is(late.Err(), context.Canceled) {
+				t.Fatalf("after the stream was released, c.Context().Err() of the detached request = %v, want context.Canceled", late.Err())
+			}
+
+			// The next use, likely of the same pooled Stream object.
+			s2, _ := newTestStream("GET", "/836")
+			c2 := acquireContext(s2)
+			if next := c2.Context(); next == late || next.Err() != nil {
+				t.Fatalf("the next request's context: same as the detached one's: %v, Err = %v; want a live context of its own", next == late, next.Err())
+			}
+			if c.Context() != late || !errors.Is(late.Err(), context.Canceled) {
+				t.Fatal("the detached request's context changed, or went live, once the next request began")
+			}
+			releaseContext(c2)
+			s2.Release()
+			done()
+			releaseContext(c)
+		})
+	}
+}
+
+// BenchmarkDetachH2836 measures Detach on an HTTP/2 request whose handler
+// has not asked for c.Context(): Detach keeps the request's context, which
+// makes it (celeris#836).
+func BenchmarkDetachH2836(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		s, _ := newTestStream("GET", "/836")
+		c := acquireContext(s)
+		done := c.Detach()
+		s.Release()
+		done()
+		releaseContext(c)
+	}
+}
+
 // BenchmarkHandleStreamContext836 is BenchmarkHandleStreamFull with a
 // handler that asks for c.Context(), as logger, timeout, otel and cache do:
 // on HTTP/2 that makes the request's context (celeris#836).

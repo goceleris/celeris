@@ -1464,11 +1464,23 @@ func (c *Context) EngineSupportsAsyncDetach() bool {
 // [Context.SetContext]), which a detached WebSocket or SSE stream keeps as
 // its own context: on epoll and io_uring those may still refer to the
 // connection's receive buffer, so whoever stores them must clone them.
+//
+// On HTTP/2 the engine ends the stream when the handler returns, detached or
+// not, so [Context.Context] is cancelled then; it stays the request's
+// context, cancelled, when called after that.
 func (c *Context) Detach() (done func()) {
 	if c.detached {
 		return func() {} // already detached — return no-op done
 	}
 	c.cloneRequestValues()
+	// On HTTP/2 Context() asks the stream for its context, and the H2
+	// processor releases the stream when the handler returns, detached or
+	// not. Keep this use's context now, so a c.Context() after that is still
+	// this request's, cancelled when the stream is released, and does not
+	// read the stream (celeris#836).
+	if c.ctx == nil && c.stream != nil {
+		c.ctx = c.stream.Context()
+	}
 
 	c.extended = true
 	c.detached = true

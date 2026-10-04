@@ -186,6 +186,36 @@ func TestStreamContextCancelRaces836(t *testing.T) {
 	}
 }
 
+// TestStreamContextDoneIsOneChannel836: context.Context says successive calls
+// to Done return the same value. Two first calls to Done racing a Cancel must
+// get the same channel, and so must every call after them, and the context
+// must say it has one (HasDoneCh).
+func TestStreamContextDoneIsOneChannel836(t *testing.T) {
+	for i := range 20000 {
+		s := NewStream(uint32(i*2 + 1))
+		c := s.Context()
+		var wg sync.WaitGroup
+		var got [2]<-chan struct{}
+		start := make(chan struct{})
+		for j := range got {
+			wg.Add(1)
+			go func() { defer wg.Done(); <-start; got[j] = c.Done() }()
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); <-start; s.Cancel() }()
+		close(start)
+		wg.Wait()
+		if got[0] != got[1] || c.Done() != got[0] {
+			t.Fatalf("iteration %d: Done returned different channels to callers racing a Cancel", i)
+		}
+		if !s.HasDoneCh() {
+			t.Fatalf("iteration %d: Done was asked for, and HasDoneCh says it was not", i)
+		}
+		<-got[0]
+		s.Release()
+	}
+}
+
 // TestH1StreamContextIsBackground836: an HTTP/1 stream's context is
 // context.Background(), as before (it is never cancelled by the stream).
 func TestH1StreamContextIsBackground836(t *testing.T) {
