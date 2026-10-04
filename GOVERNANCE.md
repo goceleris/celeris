@@ -147,9 +147,10 @@ not marked experimental: `celeris`, `celeristest`, `observe`, the
   that uses it as documented. A change that would do so needs a new
   major version.
 - **An internal type that a supported package names through an alias**
-  (`redis.Value`, `redis.KV`, `redis.Type`, `postgres.PGError`,
-  `postgres.TypeCodec`, the drivers' `PoolStats` and `PoolWorkerStats`)
-  is supported through that alias: its exported fields and methods
+  (for example `redis.Value`, `redis.KV`, `redis.Type`,
+  `postgres.PGError`, `postgres.TypeCodec`, the drivers' `PoolStats` and
+  `PoolWorkerStats`, and `middleware/jwt`'s `Claims` and `Token`) is
+  supported through that alias: its exported fields and methods
   follow the promise above. The one exception is the provider type
   under "Not covered" below.
 - **Packages marked experimental** in their package documentation may

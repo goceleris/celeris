@@ -25,7 +25,7 @@ Full documentation lives at [goceleris.dev](https://goceleris.dev).
 
 ## What's new in v1.6.0
 
-An engine-correctness release, driven by what the [probatorium](https://github.com/goceleris/probatorium) matrix found rather than by features. io_uring: the async-mode teardown and transplant paths were audited end to end and fixed (dead connection states left on the dirty list, a ring SEND still in flight when a connection was handed to epoll, short-submit accounting, detached-count drift, a pause/resume that armed a second recv and corrupted WebSocket streams, `Metrics` racing `Listen`), live heap retained on the refapp that serves both WebSocket and SSE, and a SEND_ZC probe that could never detect copy fallback. epoll: receive drains are bounded. All engines: bytes arriving on a detached connection are no longer parsed as a new request, detached WebSocket connections get a liveness bound, and the HTTP/2 worker pool no longer starves later streams once every worker holds a streaming handler. The std engine regained the h2c Upgrade handshake, so the three engines agree again. Middleware: the rate limiter's eviction actually runs, `basicauth` hashes with a salt, and struct request binding with validation is new. Dependencies: `golang.org/x/net` 0.59.
+An engine-correctness release, driven by what the [probatorium](https://github.com/goceleris/probatorium) matrix found rather than by features. io_uring: the async-mode teardown and transplant paths were audited end to end and fixed (dead connection states left on the dirty list, a ring SEND still in flight when a connection was handed to epoll, short-submit accounting, detached-count drift, a pause/resume that armed a second recv and corrupted WebSocket streams, `Metrics` racing `Listen`), live heap retained on the refapp that serves both WebSocket and SSE, and a SEND_ZC probe that could never detect copy fallback. epoll: receive drains are bounded. All engines: bytes arriving on a detached connection are no longer parsed as a new request, detached WebSocket connections get a liveness bound, and the HTTP/2 worker pool no longer starves later streams once every worker holds a streaming handler. The std engine regained the h2c Upgrade handshake, so the three engines agree again. Middleware: the rate limiter's eviction actually runs, `basicauth` hashes with a salt, and struct request binding with validation is new. Dependencies: `golang.org/x/net` 0.59. **Breaking:** the engine, protocol and driver codec packages moved under `internal/` and can no longer be imported; [Compatibility](GOVERNANCE.md#compatibility) says what is supported from v1.6.0 on.
 ## Features
 
 - **Tiered io_uring** — auto-selects the best io_uring feature set (multishot accept/recv, provided buffers, SQ poll, fixed files) for your kernel.
@@ -113,7 +113,7 @@ s.Pre(methodOverride, urlRewrite)
 
 ## Middleware
 
-All middleware is in-tree under [`middleware/`](middleware/) — 36 importable packages:
+All middleware is in-tree under [`middleware/`](middleware/) — 46 importable packages: the root `middleware` package, the 36 below, and 9 store and cache sub-packages:
 
 | Package | Description |
 |---------|-------------|
@@ -439,7 +439,7 @@ internal/       Importable only under github.com/goceleris/celeris/:
   protocol/       Protocol parsers (h1, h2, detect)
   resource/       Configuration, presets, defaults
   ...             Shared internals (conn, cpumon, ctxkit, negotiate, platform, sockopts, testhooks)
-middleware/     In-tree middleware ecosystem (36 importable packages)
+middleware/     In-tree middleware ecosystem (46 importable packages)
 observe/        Collector, CPUMonitor, Snapshot, EngineMetrics
 test/           Conformance, spec compliance, integration, benchmarks (drivercmp, benchcmp_ws, benchcmp_sse)
 validation/     Runtime invariant assertions + validation hooks (debug builds)
