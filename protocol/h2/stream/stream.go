@@ -208,6 +208,15 @@ func (c *streamCtx) closeDone(d chan struct{}) {
 // NewStream creates a new stream with full H2 initialization.
 func NewStream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
+	// A use starts with no context. Every reset that ends a use detaches
+	// its context, so one is here only if something called Context on the
+	// stream after its release, while it sat in the pool. This use would
+	// hand that context out as its own, and the late caller would hold
+	// this request's context: #836's shape, one hop removed. endCtx ends
+	// it; the check costs one atomic load when there is none.
+	if s.ctx.Load() != nil {
+		s.endCtx()
+	}
 	s.ID = id
 	s.state.Store(int32(StateIdle))
 	s.windowSize.Store(65535)
@@ -219,6 +228,9 @@ func NewStream(id uint32) *Stream {
 // NewH1Stream creates a lightweight stream optimized for H1 requests.
 func NewH1Stream(id uint32) *Stream {
 	s := streamPool.Get().(*Stream)
+	if s.ctx.Load() != nil { // as in NewStream
+		s.endCtx()
+	}
 	s.ID = id
 	s.state.Store(int32(StateIdle))
 	s.h1Mode = true

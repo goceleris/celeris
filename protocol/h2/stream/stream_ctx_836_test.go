@@ -225,3 +225,31 @@ func TestH1StreamContextIsBackground836(t *testing.T) {
 		t.Fatalf("H1 stream context = %T, want context.Background()", s.Context())
 	}
 }
+
+// TestLateContextIsNotTheNextUses836: a caller that kept a stream past its
+// release and then asks it for its context makes a context on the pooled
+// object. The stream's next use must not hand that context out as its own,
+// which would give the late caller the next request's context, live; and
+// the late caller's context must end when that use begins.
+func TestLateContextIsNotTheNextUses836(t *testing.T) {
+	reused := 0
+	for i := 0; i < 200 && reused < 20; i++ {
+		s := NewStream(1)
+		s.Release()
+		late := s.Context() // a use after release
+		s2 := NewStream(3)
+		if s2 == s {
+			reused++
+			if s2.Context() == late {
+				t.Fatal("the stream's next use handed out, as its own, the context a caller made on it after its release")
+			}
+			if err := late.Err(); !errors.Is(err, context.Canceled) {
+				t.Fatalf("the late caller's context: Err = %v once the stream's next use began, want context.Canceled", err)
+			}
+		}
+		s2.Release()
+	}
+	if reused == 0 {
+		t.Fatal("the stream pool never handed back a released stream: this case checked nothing")
+	}
+}
