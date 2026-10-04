@@ -22,14 +22,24 @@ type Config struct {
 	// header listed in [VaryHeaders].
 	KeyGenerator func(*celeris.Context) string
 
-	// Singleflight coalesces concurrent cache-miss requests for the same
-	// key so only one handler invocation runs; waiters reuse the
-	// resulting response. When the handler returns an error, each waiter
-	// returns a copy of it made before the leader returns, as
+	// DisableSingleflight turns off the coalescing of concurrent cache
+	// misses. By default (false) concurrent requests that miss on the same
+	// key coalesce: only one handler invocation runs, and the waiters
+	// reuse the resulting response. When the handler returns an error,
+	// each waiter returns a copy of it made before the leader returns, as
 	// middleware/singleflight does: its message is copied, it unwraps to
 	// the leader's error ([errors.Is] and [errors.As] find what it holds),
-	// and it is not == to it. Default: true.
-	Singleflight bool
+	// and it is not == to it. When the handler (or the store's Set)
+	// panics, the panic is the leader's, and each waiter runs its own
+	// handler. A waiter waits only as long as its request context lives;
+	// on epoll and io_uring an HTTP/1 request context does not end unless
+	// a middleware such as timeout gives it a deadline, so there a waiter
+	// waits for the handler. A request that arrives during the leader's
+	// store Set takes the response too, within the response's TTL.
+	//
+	// It replaces the Singleflight field, which a Config literal that did
+	// not set it turned off (celeris#922).
+	DisableSingleflight bool
 
 	// Methods lists HTTP methods eligible for caching. Default: GET, HEAD.
 	// Methods not in this list pass through without interacting with
@@ -66,11 +76,15 @@ type Config struct {
 	// header set after applying [IncludeHeaders]. Default: "set-cookie".
 	ExcludeHeaders []string
 
-	// RespectCacheControl, when true (default), honors the response's
-	// Cache-Control directive:
+	// IgnoreCacheControl, when true, stores responses whatever their
+	// Cache-Control says. By default (false) the response's Cache-Control
+	// directive is honoured:
 	//   - no-store or private → skip caching
 	//   - max-age=N           → cap TTL to min(cfg.TTL, N)
-	RespectCacheControl bool
+	//
+	// It replaces the RespectCacheControl field, whose false had no effect
+	// (celeris#922).
+	IgnoreCacheControl bool
 
 	// Skip defines a function to skip this middleware for certain
 	// requests.
@@ -80,13 +94,13 @@ type Config struct {
 	SkipPaths []string
 }
 
+// defaultConfig holds the defaults. Every bool field's default is false, so
+// a Config literal that leaves one out gets its default (celeris#922).
 var defaultConfig = Config{
-	TTL:                 time.Minute,
-	Singleflight:        true,
-	Methods:             []string{"GET", "HEAD"},
-	HeaderName:          "X-Cache",
-	MaxBodyBytes:        1 << 20,
-	RespectCacheControl: true,
+	TTL:          time.Minute,
+	Methods:      []string{"GET", "HEAD"},
+	HeaderName:   "X-Cache",
+	MaxBodyBytes: 1 << 20,
 }
 
 func applyDefaults(cfg Config) Config {
@@ -110,15 +124,6 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.ExcludeHeaders == nil {
 		cfg.ExcludeHeaders = []string{"set-cookie"}
-	}
-	// RespectCacheControl defaults to true; preserve explicit false.
-	// Since the zero value is false, we default it to true only when
-	// the entire Config is zero-valued (nothing else set).
-	if !cfg.RespectCacheControl && !cfg.Singleflight &&
-		cfg.Store == nil && cfg.TTL == 0 {
-		cfg.RespectCacheControl = true
-	} else if !cfg.RespectCacheControl {
-		cfg.RespectCacheControl = true
 	}
 	return cfg
 }

@@ -212,6 +212,19 @@ func New(config ...Config) celeris.HandlerFunc {
 			return ErrTooManyRequests
 		}
 
+		if skipFailed {
+			// A handler panic is a failed request (recovery answers 500):
+			// refund it too, then let the panic continue. The refund used
+			// to run only on a normal return, so each panic spent a token
+			// (celeris#921).
+			defer func() {
+				if r := recover(); r != nil {
+					activeLim.undo(key)
+					panic(r)
+				}
+			}()
+		}
+
 		err := c.Next()
 
 		if skipFailed || skipSuccess {
@@ -270,6 +283,17 @@ func newStoreMiddleware(
 				return limitReached(c)
 			}
 			return ErrTooManyRequests
+		}
+
+		if skipFailed && undoer != nil {
+			// A handler panic is a failed request: refund it too, then let
+			// the panic continue (celeris#921).
+			defer func() {
+				if r := recover(); r != nil {
+					_ = undoer.Undo(key)
+					panic(r)
+				}
+			}()
 		}
 
 		nextErr := c.Next()

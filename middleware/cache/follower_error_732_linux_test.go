@@ -68,7 +68,7 @@ func TestFollowerErrorSurvivesLeaderNextRequest(t *testing.T) {
 					}
 					return nil
 				})
-				srv.Use(cache.New(cache.Config{Store: kv, Singleflight: true, KeyGenerator: func(*celeris.Context) string { return "one-key" }}))
+				srv.Use(cache.New(cache.Config{Store: kv, KeyGenerator: func(*celeris.Context) string { return "one-key" }}))
 				srv.GET("/c/:id", func(c *celeris.Context) error {
 					if c.Header("x-hold") == "1" {
 						leaderIn <- struct{}{}

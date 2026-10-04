@@ -170,7 +170,7 @@ func TestSingleflightCoalesce(t *testing.T) {
 		<-ready
 		return c.String(200, "hi")
 	}
-	mw := New(Config{Store: kv, Singleflight: true})
+	mw := New(Config{Store: kv})
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {

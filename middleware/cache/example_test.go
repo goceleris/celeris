@@ -25,10 +25,10 @@ func ExampleConfig() {
 func ExampleConfig_redisStore() {
 	// Stand-in: any store.KV may be assigned here.
 	kv := store.NewMemoryKV()
+	// Coalescing and Cache-Control are on by default: a Config that
+	// leaves DisableSingleflight and IgnoreCacheControl out keeps both.
 	_ = cache.Config{
-		Store:               kv,
-		TTL:                 30 * time.Second,
-		RespectCacheControl: true,
-		Singleflight:        true,
+		Store: kv,
+		TTL:   30 * time.Second,
 	}
 }
