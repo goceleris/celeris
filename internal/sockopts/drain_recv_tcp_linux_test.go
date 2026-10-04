@@ -267,11 +267,14 @@ func TestDrainRecvBufferEmptiesAWindowBlockedPeer(t *testing.T) {
 	if inqAfter != 0 {
 		t.Errorf("the drain left %d bytes queued, so close(2) resets: the window clamp is not holding the peer off (celeris#569)", inqAfter)
 	}
-	if abortOnClose != 0 {
-		t.Errorf("close(2) reset the connection (TCPAbortOnClose +%d): the peer loses the staged send buffer (celeris#569)", abortOnClose)
-	}
+	// abortOnClose is printed above and NOT asserted (celeris#825): it is the
+	// same per-namespace TcpExt counter the NOTE above de-gates, and other
+	// packages' sockets closing with unread data move it (+5 in a Coverage
+	// job with every per-connection column correct). A reset of THIS socket
+	// is what celeris#569 is about, and the peer sees it as ECONNRESET, which
+	// the kind check below catches without the MIB.
 	if kind != "EOF" {
-		t.Errorf("the peer must see the FIN as EOF, got %s", kind)
+		t.Errorf("the peer must see the FIN as EOF, got %s: close(2) reset the connection and the peer loses the staged send buffer (celeris#569)", kind)
 	}
 	// The byte bound on a real TCP socket with megabytes still to come: the
 	// drain must not have chased the peer past the buffer that queue lives
