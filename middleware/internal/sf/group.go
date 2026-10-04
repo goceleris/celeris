@@ -7,11 +7,19 @@
 package sf
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
 	"github.com/goceleris/celeris/middleware/internal/handoff"
 )
+
+// ErrLeaderPanicked is what the followers of a call get when the leader's
+// fn, or its then, panicked before the result was published. The panic
+// itself stays the leader's: it continues, unchanged, in the leader's
+// goroutine.
+var ErrLeaderPanicked = errors.New("sf: the coalesced call's leader panicked")
 
 // Call is a single in-flight call for a key. Followers block on wg; the
 // leader populates Result/Err before calling wg.Done.
@@ -57,7 +65,19 @@ func New[T any]() *Group[T] {
 // to every caller. The bool second return is true for the leader (the
 // caller that actually ran fn) and false for followers. The leader gets
 // fn's error itself; followers get it as [handoff.Error] returns it.
-func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
+//
+// Once fn has returned, its result is published and the followers are
+// released. Then the leader runs then (when not nil) with that result while
+// the key is still held, so a caller that arrives meanwhile takes the
+// published result at once instead of running fn again; middleware/cache
+// stores the result there, so its followers never wait for the store. The
+// key is released when then returns.
+//
+// A follower waits only as long as ctx lives: when ctx ends first, it gets
+// ctx's error. When fn or then panics, the key is released all the same, and
+// a follower that had not yet been given a result gets
+// [ErrLeaderPanicked]; the panic continues in the leader (celeris#921).
+func (g *Group[T]) Do(ctx context.Context, key string, fn func() (T, error), then func(T, error)) (T, bool, error) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
 		// Follower. Register under the mutex so the leader's delete-time
@@ -67,7 +87,10 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 			TestHookFollowerJoined()
 		}
 		g.mu.Unlock()
-		c.wg.Wait()
+		if err := wait(ctx, &c.wg); err != nil {
+			var zero T
+			return zero, false, err
+		}
 		return c.Result, false, c.Err
 	}
 	c := g.pool.Get().(*Call[T])
@@ -79,7 +102,41 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	g.calls[key] = c
 	g.mu.Unlock()
 
+	// release runs on every way out of the leader, a panic in fn or then
+	// included: without it a panic left the key's call in the map and its
+	// followers in wg.Wait for good, and every later caller for the key
+	// joined them (celeris#921).
+	published, finished := false, false
+	defer func() {
+		if finished {
+			return
+		}
+		g.mu.Lock()
+		delete(g.calls, key)
+		g.mu.Unlock()
+		if !published {
+			c.Result = zero
+			c.Err = ErrLeaderPanicked
+			c.wg.Done()
+		}
+		// Never pooled: a follower may still read it.
+	}()
+
 	result, err := fn()
+
+	// Publish before then runs: a follower that joins from here on reads
+	// Result/Err after wg.Done, so they are populated whatever the waiter
+	// count is now. The followers get the error handed off (a copy of its
+	// message): the leader's error can hold its request strings, which a
+	// follower formats after the leader's request has ended (celeris#732).
+	c.Result = result
+	c.Err = handoff.Error(err)
+	published = true
+	c.wg.Done()
+
+	if then != nil {
+		then(result, err)
+	}
 
 	g.mu.Lock()
 	delete(g.calls, key)
@@ -87,16 +144,7 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	// increments. No new follower can find this entry after the delete.
 	numWaiters := c.waiters.Load()
 	g.mu.Unlock()
-
-	if numWaiters > 0 {
-		// Followers will read these fields after wg.Done; populate. The
-		// followers get the error handed off (a copy of its message): the
-		// leader's error can hold its request strings, which a follower
-		// formats after the leader's request has ended (celeris#732).
-		c.Result = result
-		c.Err = handoff.Error(err)
-	}
-	c.wg.Done()
+	finished = true
 
 	if numWaiters == 0 {
 		// No follower ever saw c; safe to recycle. Clear T-side fields
@@ -107,4 +155,24 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (T, bool, error) {
 	}
 
 	return result, true, err
+}
+
+// wait waits for wg, or for ctx to end, whichever comes first, and returns
+// ctx's error in the second case.
+func wait(ctx context.Context, wg *sync.WaitGroup) error {
+	if ctx == nil || ctx.Done() == nil {
+		wg.Wait()
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

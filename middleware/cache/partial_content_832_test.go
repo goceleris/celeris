@@ -37,7 +37,7 @@ func TestCacheDoesNotStorePartialContent832(t *testing.T) {
 			defer kv.Close()
 			p := file832(t)
 			var runs atomic.Int32
-			mw := New(Config{Store: kv, TTL: time.Minute, Singleflight: sf})
+			mw := New(Config{Store: kv, TTL: time.Minute, DisableSingleflight: !sf})
 			h := func(c *celeris.Context) error {
 				runs.Add(1)
 				return c.File(p)

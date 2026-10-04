@@ -1,6 +1,7 @@
 package sf
 
 import (
+	"context"
 	"strconv"
 	"testing"
 )
@@ -16,6 +17,6 @@ func BenchmarkDoMiss(b *testing.B) {
 	for i := 0; b.Loop(); i++ {
 		// Unique key each iter keeps the leader path hot without
 		// accumulating state in g.calls.
-		_, _, _ = g.Do(strconv.Itoa(i), func() (int, error) { return i, nil })
+		_, _, _ = g.Do(context.Background(), strconv.Itoa(i), func() (int, error) { return i, nil }, nil)
 	}
 }
