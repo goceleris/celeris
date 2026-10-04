@@ -104,3 +104,19 @@ func TestTypeCodecNames443(t *testing.T) {
 	}()
 	RegisterType(nil)
 }
+
+// The date codec returns the infinity sentinels, which are named here
+// (celeris#443).
+func TestInfinityNamed443(t *testing.T) {
+	c := LookupOID(protocol.OIDDate)
+	for src, want := range map[string]time.Time{"infinity": PGInfinity, "-infinity": PGNegInfinity} {
+		got, err := c.DecodeText([]byte(src))
+		if err != nil || !got.(time.Time).Equal(want) {
+			t.Fatalf("DecodeText(%q) = %v, %v; want %v", src, got, err, want)
+		}
+	}
+	if !PGInfinity.Equal(time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)) ||
+		!PGNegInfinity.Equal(time.Date(-4713, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatal("PGInfinity/PGNegInfinity are not the documented values")
+	}
+}

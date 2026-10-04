@@ -94,6 +94,8 @@ var ErrPoolClosed error
 var ErrResultTooBig error
 var ErrSSLNotSupported error
 var ErrUnsupportedAuth error
+var PGInfinity time.Time
+var PGNegInfinity time.Time
 exposed method (*pgConn) Begin() (database/sql/driver.Tx, error)
 exposed method (*pgConn) BeginTx(context.Context, database/sql/driver.TxOptions) (database/sql/driver.Tx, error)
 exposed method (*pgConn) CheckNamedValue(*database/sql/driver.NamedValue) error
