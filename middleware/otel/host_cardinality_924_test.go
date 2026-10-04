@@ -179,3 +179,62 @@ func TestMetricsKeepTheirSeriesUnderManyHostsOnARealServer924(t *testing.T) {
 	}
 	t.Logf("%d requests under %d Host values: %d series", count, n+1, len(hist.DataPoints))
 }
+
+// TestMetricsBoundTheScheme924: celeris#924's family. url.scheme is in every
+// metric attribute set, and it is c.Scheme(). The root package now bounds the
+// client's :scheme (TestContextSchemeIsHTTPOrHTTPS924); an override that a
+// middleware sets with SetScheme is returned as set, so the metric bounds it
+// itself, as it does the method: http and https are kept and anything else
+// is _OTHER. The span keeps the value as it was.
+func TestMetricsBoundTheScheme924(t *testing.T) {
+	const n = 50
+	for _, tc := range []struct {
+		name       string
+		scheme     func(i int) string
+		wantScheme string
+	}{
+		{"made-up", func(i int) string { return fmt.Sprintf("x-made-up-%d", i) }, "_OTHER"},
+		{"https", func(int) string { return "https" }, "https"},
+		{"http", func(int) string { return "http" }, "http"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, exp, mp, reader := newTestMetrics(t)
+			defer func() {
+				_ = tp.Shutdown(context.Background())
+				_ = mp.Shutdown(context.Background())
+			}()
+			mw := New(Config{TracerProvider: tp, MeterProvider: mp})
+			h := func(c *celeris.Context) error { return c.String(200, "ok") }
+			for i := range n {
+				if err := runChain(t, []celeris.HandlerFunc{mw, h}, "POST", "/users",
+					celeristest.WithScheme(tc.scheme(i)), celeristest.WithBody([]byte("{}")), celeristest.WithHeader("content-length", "2")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, sets := range metricPoints(t, collectMetrics(t, reader)) {
+				if len(sets) != 1 {
+					t.Errorf("%s: %d series for one route under %d scheme values, want 1", name, len(sets), n)
+				}
+				for _, s := range sets {
+					if v, _ := s.Value(semconv.URLSchemeKey); v.AsString() != tc.wantScheme {
+						t.Errorf("%s: url.scheme %q, want %q", name, v.AsString(), tc.wantScheme)
+						break
+					}
+				}
+			}
+			spans := exp.GetSpans()
+			if len(spans) != n {
+				t.Fatalf("%d spans, want %d", len(spans), n)
+			}
+			found := false
+			for _, a := range spans[n-1].Attributes {
+				if a.Key == semconv.URLSchemeKey && a.Value.AsString() == tc.scheme(n-1) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("the span's url.scheme is not the request's %q", tc.scheme(n-1))
+			}
+		})
+	}
+}

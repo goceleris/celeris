@@ -48,6 +48,19 @@ func normalizeMethod(method string) string {
 	return "_OTHER"
 }
 
+// metricScheme returns the url.scheme a metric attribute set carries: http
+// or https, the package's own constants, or _OTHER for any other value, which
+// only an override set with Context.SetScheme can give (celeris#924).
+func metricScheme(scheme string) string {
+	switch scheme {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	}
+	return "_OTHER"
+}
+
 // ownStrings replaces each *p with a copy. The copies share one allocation,
 // and nothing is allocated when every string is empty.
 //
@@ -480,7 +493,9 @@ func New(config ...Config) celeris.HandlerFunc {
 				metricBuf[mn] = semconv.HTTPRoute(route)
 				mn++
 			}
-			metricBuf[mn] = semconv.URLScheme(scheme)
+			// url.scheme is bounded as the method is: c.Scheme() is http
+			// or https unless a middleware overrode it (celeris#924).
+			metricBuf[mn] = semconv.URLScheme(metricScheme(scheme))
 			mn++
 			// server.address is the client's Host: opt-in on the metrics,
 			// or one client could make unbounded series (celeris#924).

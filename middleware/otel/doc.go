@@ -19,7 +19,9 @@
 // PII controls: client.address is opt-in ([Config].CollectClientIP);
 // user_agent.original is opt-out ([Config].CollectUserAgent).
 // Cardinality: the metric attribute sets hold the method (unknown methods
-// as _OTHER), the route pattern, the scheme, the status and, when
+// as _OTHER), the route pattern, the scheme (http or https; any other
+// value, which only a [celeris.Context.SetScheme] override can give, as
+// _OTHER), the status and, when
 // [Config].ServerPort is set, server.port. server.address, which comes
 // from the client's Host header, is on spans only unless
 // [Config].MetricServerAddress opts in.

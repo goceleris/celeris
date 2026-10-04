@@ -102,7 +102,9 @@ func TestAttributesSurviveNextRequest(t *testing.T) {
 					"request.id":                   "rid-" + v,
 					"tenant":                       "tenant-" + v,
 				})
-				wantSeries = append(wantSeries, method+"|sch"+l+"|host-"+v+".example|tenant-"+v)
+				// The metric records a scheme other than http or https as the
+				// constant _OTHER (celeris#924); the span keeps the request's.
+				wantSeries = append(wantSeries, method+"|_OTHER|host-"+v+".example|tenant-"+v)
 			}
 			sort.Strings(wantSeries)
 
