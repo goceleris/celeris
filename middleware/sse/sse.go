@@ -51,6 +51,14 @@ type Client struct {
 	// next reconnect can resume via Last-Event-ID. Set per-handler from
 	// [Config.ReplayStore] in [New].
 	replayStore ReplayStore
+
+	// brokerRefs counts a [Broker]'s slow-path goroutines that still use
+	// this Client. A publisher adds to it while the Client is subscribed
+	// (under the broker's lock, so before the handler's unsubscribe can
+	// complete), and releaseClient waits for it, so the pooled Client is
+	// never handed to another connection while one of them can still
+	// close it (celeris#926).
+	brokerRefs sync.WaitGroup
 }
 
 // Send sends a complete SSE event. Thread-safe (serialized with heartbeat writes).
@@ -306,6 +314,7 @@ func acquireClient(ctx context.Context, sw *celeris.StreamWriter, cancel context
 }
 
 func releaseClient(c *Client) {
+	c.brokerRefs.Wait()
 	c.sw = nil
 	c.ctx = nil
 	c.cancel = nil

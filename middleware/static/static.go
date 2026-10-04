@@ -32,6 +32,31 @@ type cachedFile struct {
 	modTime         time.Time
 }
 
+// addVary adds Vary: Accept-Encoding to c's response unless a Vary line
+// already names it (or is "*"): a middleware before static that negotiates
+// with Context.AcceptsEncodings, such as compress, has added one since
+// celeris#912. The response then names it once.
+func addVary(c *celeris.Context) {
+	for _, h := range c.ResponseHeaders() {
+		if h[0] != "vary" {
+			continue
+		}
+		for v := h[1]; v != ""; {
+			tok := v
+			if i := strings.IndexByte(v, ','); i >= 0 {
+				tok, v = v[:i], v[i+1:]
+			} else {
+				v = ""
+			}
+			tok = strings.TrimSpace(tok)
+			if tok == "*" || strings.EqualFold(tok, "Accept-Encoding") {
+				return
+			}
+		}
+	}
+	c.AddHeader("vary", "Accept-Encoding")
+}
+
 // maxFSFileSize caps in-memory reads from fs.FS to 100 MB.
 const maxFSFileSize = 100 << 20
 
@@ -190,14 +215,14 @@ func servePreCompressed(c *celeris.Context, cleanRoot, filePath, fullPath string
 	if strings.Contains(ae, "br") {
 		if _, err := os.Stat(fullPath + ".br"); err == nil {
 			c.SetHeader("content-encoding", "br")
-			c.AddHeader("vary", "Accept-Encoding")
+			addVary(c)
 			return true, c.FileFromDir(cleanRoot, filePath+".br")
 		}
 	}
 	if strings.Contains(ae, "gzip") {
 		if _, err := os.Stat(fullPath + ".gz"); err == nil {
 			c.SetHeader("content-encoding", "gzip")
-			c.AddHeader("vary", "Accept-Encoding")
+			addVary(c)
 			return true, c.FileFromDir(cleanRoot, filePath+".gz")
 		}
 	}
@@ -402,7 +427,7 @@ func servePreCompressedFS(c *celeris.Context, fsys fs.FS, filePath string) (bool
 			}
 		}
 		c.SetHeader("content-encoding", v.encoding)
-		c.AddHeader("vary", "Accept-Encoding")
+		addVary(c)
 		return true, c.Blob(200, ct, data)
 	}
 

@@ -66,6 +66,19 @@ type Config struct {
 	// Negative values are clamped to 0 in validate().
 	ServerPort int
 
+	// MetricServerAddress adds the "server.address" attribute (the
+	// request's Host, or :authority on HTTP/2) to the metric attribute
+	// sets. Default: false; spans always carry it. The value comes from
+	// the client, so each distinct Host makes new series: a client that
+	// sends made-up Host values fills an instrument up to the SDK's
+	// cardinality limit (2000 by default), after which every new attribute
+	// set lands in one overflow series, and without a limit memory grows
+	// with it. OTel's semantic conventions make server.address Opt-In on
+	// the HTTP server metrics for that reason. Enable it only where the
+	// Host is bounded upstream, for example by a proxy that rejects
+	// unknown hosts (celeris#924).
+	MetricServerAddress bool
+
 	// NOTE: url.query is intentionally omitted from span attributes because
 	// query parameters frequently contain PII (tokens, emails, session IDs).
 	// Callers who need it can add it via CustomAttributes.

@@ -11,6 +11,7 @@ type Config struct, CustomMetricAttributes func(*github.com/goceleris/celeris.Co
 type Config struct, DisableMetrics bool
 type Config struct, Filter func(*github.com/goceleris/celeris.Context) bool
 type Config struct, MeterProvider go.opentelemetry.io/otel/metric.MeterProvider
+type Config struct, MetricServerAddress bool
 type Config struct, Propagators go.opentelemetry.io/otel/propagation.TextMapPropagator
 type Config struct, ServerPort int
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool

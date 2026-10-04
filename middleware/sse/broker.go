@@ -1,6 +1,7 @@
 package sse
 
 import (
+	"context"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -157,6 +158,9 @@ func (b *Broker) Subscribe(c *Client) (unsubscribe func()) {
 		done:  make(chan struct{}),
 	}
 	b.subscribers[c] = s
+	// The drain goroutine uses c until it exits; releaseClient waits for
+	// it, so c is not pooled while the drain still holds it (celeris#926).
+	c.brokerRefs.Add(1)
 	b.mu.Unlock()
 
 	go b.drain(c, s)
@@ -171,10 +175,27 @@ func (b *Broker) Subscribe(c *Client) (unsubscribe func()) {
 }
 
 // drain consumes the per-subscriber queue and writes each PreparedEvent
-// to the Client. Exits when the queue is closed (graceful) or a wire
-// write fails (unhealthy — client is gone).
+// to the Client. Exits when the queue is closed (graceful) or a wire write
+// fails (unhealthy — client is gone).
+//
+// When the Client's context ends, the subscriber is unsubscribed, which
+// closes the queue and so ends the drain: its writes would fail anyway,
+// and the handler's teardown, which cancels that context, waits for the
+// drain before the Client goes back to its pool (brokerRefs), also when a
+// policy removed the subscriber and the handler does not unsubscribe
+// (celeris#926). context.AfterFunc costs nothing per event; a select on
+// the context in this loop measured +36% on the fan-out benchmark.
+//
+// However the drain exits (a failed write included), it unsubscribes before
+// it is done (deferred calls run last to first): the AfterFunc may still be
+// on its way, and a Client must not reach its pool, once brokerRefs drops,
+// while it is still in the subscriber map.
 func (b *Broker) drain(c *Client, s *brokerSubscriber) {
+	defer c.brokerRefs.Done()
 	defer close(s.done)
+	defer b.removeSubscriber(c, s)
+	stop := context.AfterFunc(c.Context(), func() { b.removeSubscriber(c, s) })
+	defer stop()
 	for pe := range s.queue {
 		if err := c.WritePreparedEvent(pe); err != nil {
 			return
@@ -204,15 +225,22 @@ func (b *Broker) Publish(e Event) *PreparedEvent {
 // blocking send attempt — have the configured [BrokerPolicy] applied.
 //
 // Slow-path concurrency: when N subscribers are slow, the per-
-// subscriber policy callback + cleanup runs in parallel across
-// goroutines bounded by [BrokerConfig.SlowSubscriberConcurrency]
-// (default GOMAXPROCS*4). Total slow-path latency is therefore
-// approximately max(callback) + cleanup rather than the sum across
-// subscribers. PublishPrepared still WAITS for every spawned slow-
-// path goroutine before returning — the join is required so a
-// subsequent [Subscribe] cannot race a [Client.Close] from a prior
-// policy firing (sync.Pool of *Client could otherwise hand a still-
-// closing pointer to a fresh connection).
+// subscriber policy callback runs in parallel across goroutines bounded
+// by [BrokerConfig.SlowSubscriberConcurrency] (default GOMAXPROCS*4).
+// Total slow-path latency is therefore approximately max(callback)
+// rather than the sum across subscribers. PublishPrepared waits for
+// every callback and its policy's unregistration before returning, so
+// when it returns a subscriber the policy removed or closed is no longer
+// registered, and under [BrokerPolicyClose] its context is cancelled.
+//
+// It does not wait for the slow subscriber's client (celeris#926). That
+// client is slow because its writes block: under [BrokerPolicyRemove]
+// its drain goroutine finishes the writes already queued on its own,
+// and under [BrokerPolicyClose] the [Client.Close] that needs the
+// client's lock, held by the blocked write, runs in its own goroutine.
+// A Client stays out of its sync.Pool until such a goroutine is done
+// with it, so a fresh connection never gets a Client that one of them
+// can still close.
 //
 // Panic isolation: a panic inside a user OnSlowSubscriber callback
 // is recovered inside the slow-path goroutine — other slow-path
@@ -228,6 +256,7 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	if pe == nil {
 		return
 	}
+	policy := b.cfg.OnSlowSubscriber
 	var slowClients []*Client
 	var slowStates []*brokerSubscriber
 
@@ -236,6 +265,16 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 		select {
 		case s.queue <- pe:
 		default:
+			if policy == nil {
+				// Default is BrokerPolicyDrop — nothing to clean up: the
+				// event was dropped by this non-blocking send.
+				continue
+			}
+			// The slow path uses c after the lock is released. Count it
+			// on c now, while c is subscribed: the handler's unsubscribe
+			// takes b.mu, so it cannot have completed, and releaseClient
+			// waits for the count before c goes back to its pool.
+			c.brokerRefs.Add(1)
 			slowClients = append(slowClients, c)
 			slowStates = append(slowStates, s)
 		}
@@ -243,13 +282,6 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 	b.mu.RUnlock()
 
 	if len(slowClients) == 0 {
-		return
-	}
-	policy := b.cfg.OnSlowSubscriber
-	if policy == nil {
-		// Default is BrokerPolicyDrop — nothing to clean up. The slow
-		// events were already dropped at the non-blocking-send default
-		// branch above; no further work.
 		return
 	}
 
@@ -265,6 +297,21 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 			sema <- struct{}{}
 		}
 		go func(c *Client, state *brokerSubscriber) {
+			closeClient := false
+			defer func() {
+				if closeClient {
+					// Client.Close takes c.mu, which the stuck write
+					// holds: close it in a goroutine of its own, which
+					// neither the publisher nor a semaphore slot waits
+					// for. c's context is already cancelled.
+					go func() {
+						defer c.brokerRefs.Done()
+						_ = c.Close()
+					}()
+					return
+				}
+				c.brokerRefs.Done()
+			}()
 			defer wg.Done()
 			if sema != nil {
 				defer func() { <-sema }()
@@ -285,19 +332,21 @@ func (b *Broker) PublishPrepared(pe *PreparedEvent) {
 				// Keep the subscriber registered; this Publish dropped
 				// its event but future ones may land.
 			case BrokerPolicyRemove:
+				// The drain writes out what is queued and exits; the
+				// handler's unsubscribe joins it. Waiting for it here
+				// would wait for the slow client (celeris#926).
 				b.removeSubscriber(c, state)
-				<-state.done
 			case BrokerPolicyClose:
 				b.removeSubscriber(c, state)
-				_ = c.Close()
-				<-state.done
+				// Cancel now, without c.mu: the handler, Send and the
+				// heartbeat see the close at once.
+				c.cancel()
+				closeClient = true
 			}
 		}(c, state)
 	}
-	// Wait gates publisher return on every slow-path goroutine. This
-	// is the load-bearing guarantee: a *Client returned to sync.Pool
-	// after the user's handler defer cannot be re-acquired by a fresh
-	// connection while a goroutine here still holds it.
+	// Wait for every policy callback and unregistration; none of them
+	// waits for a slow client's write.
 	wg.Wait()
 }
 
@@ -336,6 +385,13 @@ func (b *Broker) CallbackPanics() uint64 {
 // Close unsubscribes every current subscriber and blocks new Subscribe
 // calls. Pending in-flight Publish calls complete in best-effort order.
 // Idempotent.
+//
+// Close closes every subscriber's queue and returns: it does not wait for
+// the drain goroutines, which write out what is already queued and exit on
+// their own, so a subscriber whose client stopped reading does not hold
+// Close (celeris#926). Each subscriber's handler joins its drain through
+// its unsubscribe, and the Client stays out of its pool until the drain is
+// done with it.
 func (b *Broker) Close() {
 	b.mu.Lock()
 	if b.closed {
@@ -352,8 +408,5 @@ func (b *Broker) Close() {
 
 	for _, s := range states {
 		s.closeQueue()
-	}
-	for _, s := range states {
-		<-s.done
 	}
 }

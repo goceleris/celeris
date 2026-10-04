@@ -324,7 +324,7 @@ func buildSwaggerUIPage(cfg Config, specURL string) string {
 		if oa.ClientID != "" {
 			data.OAuth2 = append(data.OAuth2, jsProp{"clientId", oa.ClientID})
 		}
-		if oa.UsePKCE {
+		if !oa.DisablePKCE {
 			data.OAuth2 = append(data.OAuth2, jsProp{"usePkceWithAuthorizationCodeGrant", template.JS("true")})
 		}
 		if oa.Realm != "" {
