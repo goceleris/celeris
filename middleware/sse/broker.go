@@ -185,9 +185,15 @@ func (b *Broker) Subscribe(c *Client) (unsubscribe func()) {
 // policy removed the subscriber and the handler does not unsubscribe
 // (celeris#926). context.AfterFunc costs nothing per event; a select on
 // the context in this loop measured +36% on the fan-out benchmark.
+//
+// However the drain exits (a failed write included), it unsubscribes before
+// it is done (deferred calls run last to first): the AfterFunc may still be
+// on its way, and a Client must not reach its pool, once brokerRefs drops,
+// while it is still in the subscriber map.
 func (b *Broker) drain(c *Client, s *brokerSubscriber) {
 	defer c.brokerRefs.Done()
 	defer close(s.done)
+	defer b.removeSubscriber(c, s)
 	stop := context.AfterFunc(c.Context(), func() { b.removeSubscriber(c, s) })
 	defer stop()
 	for pe := range s.queue {
