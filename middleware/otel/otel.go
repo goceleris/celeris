@@ -374,6 +374,7 @@ func New(config ...Config) celeris.HandlerFunc {
 	collectClientIP := cfg.CollectClientIP
 	collectUserAgent := cfg.CollectUserAgent == nil || *cfg.CollectUserAgent
 	serverPort := cfg.ServerPort
+	metricServerAddress := cfg.MetricServerAddress
 
 	return func(c *celeris.Context) error {
 		if cfg.Skip != nil && cfg.Skip(c) {
@@ -481,8 +482,12 @@ func New(config ...Config) celeris.HandlerFunc {
 			}
 			metricBuf[mn] = semconv.URLScheme(scheme)
 			mn++
-			metricBuf[mn] = semconv.ServerAddress(host)
-			mn++
+			// server.address is the client's Host: opt-in on the metrics,
+			// or one client could make unbounded series (celeris#924).
+			if metricServerAddress {
+				metricBuf[mn] = semconv.ServerAddress(host)
+				mn++
+			}
 			if serverPort > 0 {
 				metricBuf[mn] = semconv.ServerPort(serverPort)
 				mn++

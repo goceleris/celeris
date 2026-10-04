@@ -65,6 +65,9 @@ func TestAttributesSurviveNextRequest(t *testing.T) {
 					SpanNameFormatter:      func(c *celeris.Context) string { return c.Path() },
 					CustomAttributes:       tenant,
 					CustomMetricAttributes: tenant,
+					// server.address is opt-in on the metrics (celeris#924);
+					// opted in, its copy is checked on the series too.
+					MetricServerAddress: true,
 				}))
 				for _, m := range methods {
 					srv.Handle(m, "/o/:id", func(c *celeris.Context) error { return c.String(200, "ok") })
