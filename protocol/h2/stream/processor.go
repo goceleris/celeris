@@ -850,14 +850,17 @@ func (p *Processor) executeHandler(stream *Stream) {
 		}
 
 		// If there's buffered outbound data waiting for WINDOW_UPDATE,
-		// keep the stream in the map so the event loop can flush it.
-		// Clear asyncRunning so DeleteStream (on connection close) will
-		// release it. handleWindowUpdate will clean up after full flush.
+		// keep the stream in the map so the event loop can flush it:
+		// handOffBuffered clears asyncRunning, so DeleteStream (on a
+		// RST_STREAM or connection close) will release it, and
+		// handleWindowUpdate cleans up after a full flush. A stream that
+		// was taken out of the map while its handler ran is not handed
+		// over: nothing would find it again, so it is released here, with
+		// what it still buffers (celeris#948).
 		stream.mu.RLock()
 		hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
 		stream.mu.RUnlock()
-		if hasPending {
-			stream.flags.And(^flagAsyncRunning)
+		if hasPending && p.manager.handOffBuffered(stream) {
 			return
 		}
 
@@ -1505,26 +1508,20 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 			fmt.Errorf("RST_STREAM rate exceeded %d/s (burst %d)", rstRateLimitPerSec, rstBurstMax))
 	}
 
-	stream, ok := p.manager.GetStream(f.StreamID)
-	if !ok {
-		if f.StreamID <= p.manager.GetLastClientStreamID() {
-			return nil
-		}
-		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
-			[]byte("RST_STREAM on idle stream"),
-			fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID))
+	// Closed, marked, cancelled (which signals a pool handler still
+	// running) and deleted in one step under the manager's lock: the stream
+	// is not looked up first and touched after, when its pool handler's
+	// goroutine may have released it (resetStream, celeris#951). The
+	// goroutine still releases it if its handler runs.
+	if p.manager.resetStream(f.StreamID) {
+		return nil
 	}
-
-	stream.SetState(StateClosed)
-	stream.ClosedByReset = true
-
-	// Cancel the context to signal any async handler goroutine.
-	stream.Cancel()
-
-	// DeleteStream skips Release if asyncRunning=true; the goroutine
-	// will release the stream when it completes.
-	p.manager.DeleteStream(f.StreamID)
-	return nil
+	if f.StreamID <= p.manager.GetLastClientStreamID() {
+		return nil
+	}
+	return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+		[]byte("RST_STREAM on idle stream"),
+		fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID))
 }
 
 // handlePriority processes PRIORITY frames.

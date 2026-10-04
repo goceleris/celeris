@@ -321,7 +321,11 @@ func (s *Stream) HasDoneCh() bool {
 }
 
 // Release returns pooled buffers, cancels the context, and returns the stream
-// to its pool. Safe to call multiple times; subsequent calls are no-ops.
+// to its pool. Call it once per use: it is not idempotent. A second Release
+// puts the object in the pool a second time, and two later streams, on any
+// connections, then share it (celeris#947, celeris#950). For a stream a pool
+// handler runs on, who releases it is decided under its Manager's lock
+// (Manager.takeLocked, Manager.handOffBuffered).
 func (s *Stream) Release() {
 	if !s.h1Mode {
 		s.Cancel()
