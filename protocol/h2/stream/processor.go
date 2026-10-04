@@ -141,12 +141,12 @@ type Processor struct {
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
-	InlineCachedCtx      any       // per-connection cached app context for inline handlers (avoids sync.Pool)
-	hasMoreFrames        bool      // true when more frames follow in current recv (defers inline cleanup)
-	pendingInlineCleanup []*Stream // inline-completed streams deferred until frame loop exits
-	InlineWriter         h2Conn    // direct-to-outBuf writer for inline handlers (set by conn layer)
-	InlineCount          uint64    // number of requests handled inline (for metrics)
-	MaxRequestBodySize   int64     // 0 = use default (100 MB)
+	InlineCachedCtx      any             // per-connection cached app context for inline handlers (avoids sync.Pool)
+	hasMoreFrames        bool            // true when more frames follow in current recv (defers inline cleanup)
+	pendingInlineCleanup []inlineCleanup // inline-completed streams deferred until frame loop exits
+	InlineWriter         h2Conn          // direct-to-outBuf writer for inline handlers (set by conn layer)
+	InlineCount          uint64          // number of requests handled inline (for metrics)
+	MaxRequestBodySize   int64           // 0 = use default (100 MB)
 
 	// asyncResolver, when set, lets per-stream dispatch honor the
 	// per-route .Async() flag: a stream whose route is async is forced
@@ -241,13 +241,26 @@ func (p *Processor) maxBodySize() int64 {
 // when the frame loop has more frames to process.
 func (p *Processor) SetHasMoreFrames(v bool) { p.hasMoreFrames = v }
 
+// inlineCleanup is a stream whose cleanup executeHandlerInline deferred to
+// FlushInlineCleanup, with the ID it had then.
+type inlineCleanup struct {
+	s  *Stream
+	id uint32
+}
+
 // FlushInlineCleanup transitions and removes streams that completed inline
 // during the frame loop but had cleanup deferred (pending outbound data or
 // more frames to process). Called after the frame loop, under H2State.mu.
 func (p *Processor) FlushInlineCleanup() {
-	for _, s := range p.pendingInlineCleanup {
-		// Stream may have been cleaned up by handleWindowUpdate/handleSettings.
-		if existing, ok := p.manager.GetStream(s.ID); !ok || existing != s {
+	for _, e := range p.pendingInlineCleanup {
+		// The stream may have been released since, by a RST_STREAM later in
+		// the read or by handleWindowUpdate/handleSettings. Its object is
+		// then back in the pool, and a HEADERS later in the read can have
+		// it again under a new ID: look it up by the ID it had, never by
+		// the object's current one, which would release that new stream
+		// while its handler runs (celeris#947).
+		s := e.s
+		if existing, ok := p.manager.GetStream(e.id); !ok || existing != s {
 			continue
 		}
 		state := s.GetState()
@@ -258,7 +271,7 @@ func (p *Processor) FlushInlineCleanup() {
 				s.SetState(StateHalfClosedLocal)
 			}
 		}
-		p.manager.RemoveStreamFromMap(s.ID)
+		p.manager.RemoveStreamFromMap(e.id)
 		s.Release()
 	}
 	p.pendingInlineCleanup = p.pendingInlineCleanup[:0]
@@ -758,7 +771,7 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 
 	stream.SetHandlerStarted()
 
-	if err := p.handler.HandleStream(stream.Context(), stream); err != nil {
+	if err := p.handler.HandleStream(bgCtx, stream); err != nil {
 		return
 	}
 
@@ -808,7 +821,7 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 	// transition above already ran; FlushInlineCleanup re-applies it
 	// idempotently before removing the stream.
 	if p.hasMoreFrames {
-		p.pendingInlineCleanup = append(p.pendingInlineCleanup, stream)
+		p.pendingInlineCleanup = append(p.pendingInlineCleanup, inlineCleanup{stream, stream.ID})
 		keepAlive = true
 		return
 	}
@@ -837,14 +850,17 @@ func (p *Processor) executeHandler(stream *Stream) {
 		}
 
 		// If there's buffered outbound data waiting for WINDOW_UPDATE,
-		// keep the stream in the map so the event loop can flush it.
-		// Clear asyncRunning so DeleteStream (on connection close) will
-		// release it. handleWindowUpdate will clean up after full flush.
+		// keep the stream in the map so the event loop can flush it:
+		// handOffBuffered clears asyncRunning, so DeleteStream (on a
+		// RST_STREAM or connection close) will release it, and
+		// handleWindowUpdate cleans up after a full flush. A stream that
+		// was taken out of the map while its handler ran is not handed
+		// over: nothing would find it again, so it is released here, with
+		// what it still buffers (celeris#948).
 		stream.mu.RLock()
 		hasPending := stream.OutboundBuffer != nil && stream.OutboundBuffer.Len() > 0
 		stream.mu.RUnlock()
-		if hasPending {
-			stream.flags.And(^flagAsyncRunning)
+		if hasPending && p.manager.handOffBuffered(stream) {
 			return
 		}
 
@@ -860,7 +876,7 @@ func (p *Processor) executeHandler(stream *Stream) {
 
 	stream.SetHandlerStarted()
 
-	if err := p.handler.HandleStream(stream.Context(), stream); err != nil {
+	if err := p.handler.HandleStream(bgCtx, stream); err != nil {
 		return
 	}
 
@@ -1492,26 +1508,20 @@ func (p *Processor) handleRSTStream(f *http2.RSTStreamFrame) error {
 			fmt.Errorf("RST_STREAM rate exceeded %d/s (burst %d)", rstRateLimitPerSec, rstBurstMax))
 	}
 
-	stream, ok := p.manager.GetStream(f.StreamID)
-	if !ok {
-		if f.StreamID <= p.manager.GetLastClientStreamID() {
-			return nil
-		}
-		return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
-			[]byte("RST_STREAM on idle stream"),
-			fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID))
+	// Closed, marked, cancelled (which signals a pool handler still
+	// running) and deleted in one step under the manager's lock: the stream
+	// is not looked up first and touched after, when its pool handler's
+	// goroutine may have released it (resetStream, celeris#951). The
+	// goroutine still releases it if its handler runs.
+	if p.manager.resetStream(f.StreamID) {
+		return nil
 	}
-
-	stream.SetState(StateClosed)
-	stream.ClosedByReset = true
-
-	// Cancel the context to signal any async handler goroutine.
-	stream.Cancel()
-
-	// DeleteStream skips Release if asyncRunning=true; the goroutine
-	// will release the stream when it completes.
-	p.manager.DeleteStream(f.StreamID)
-	return nil
+	if f.StreamID <= p.manager.GetLastClientStreamID() {
+		return nil
+	}
+	return p.GoAwayErr(p.manager.GetLastStreamID(), http2.ErrCodeProtocol,
+		[]byte("RST_STREAM on idle stream"),
+		fmt.Errorf("RST_STREAM on idle stream %d", f.StreamID))
 }
 
 // handlePriority processes PRIORITY frames.

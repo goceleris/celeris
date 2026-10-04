@@ -404,12 +404,8 @@ func New(config ...Config) celeris.HandlerFunc {
 		// ends there and OnDisconnect runs at once; the Handler does not
 		// run. The engine sends no body for HEAD.
 		if c.Method() == "HEAD" {
-			// The client's context keeps the request's values but not its
-			// cancellation: it is cancelled before this returns, and a
-			// context derived from an HTTP/2 stream's context starts a
-			// propagation goroutine that can panic once the stream is
-			// pooled (celeris#836).
-			ctx, cancel := context.WithCancel(context.WithoutCancel(c.Context()))
+			// The client's context is cancelled before this returns.
+			ctx, cancel := context.WithCancel(c.Context())
 			client := acquireClient(ctx, sw, cancel, lastEventID)
 			if onConnect != nil {
 				if err := onConnect(c, client); err != nil {

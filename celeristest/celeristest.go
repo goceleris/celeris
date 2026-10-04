@@ -240,17 +240,12 @@ func ReleaseContext(ctx *celeris.Context) {
 
 	celeris.ReleaseTestContext(ctx)
 
-	// Return stream to pool so NewStream reuses it on the next call.
+	// Return stream to pool so NewStream reuses it on the next call. The
+	// context the request handed out (Context.Context) is cancelled and
+	// stays cancelled: a derived context still watching it, or a handle a
+	// test kept, never sees the stream's next use (celeris#836).
 	if s != nil {
-		if s.HasDoneCh() {
-			// A derived context (e.g. context.WithTimeout) spawned a
-			// goroutine that holds a reference to this stream. Cancel to
-			// terminate it, but don't pool the stream — the goroutine may
-			// still read Err()/Done() after the pool recycles the struct.
-			s.Cancel()
-		} else {
-			stream.ResetForPool(s)
-		}
+		stream.ResetForPool(s)
 	}
 	if combo != nil {
 		combo.rec.StatusCode = 0

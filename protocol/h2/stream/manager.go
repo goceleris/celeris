@@ -144,7 +144,7 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 // DeleteStream removes a stream and releases its pooled buffers.
 // If the stream has an async handler goroutine running (asyncRunning=true),
 // the stream is removed from the map but NOT released — the goroutine
-// will release it upon completion via ReleaseAsyncStream.
+// will release it when its handler returns (executeHandler).
 //
 // A stream that is still in an active state when it is deleted (e.g. a
 // server-initiated RST_STREAM on a stalled stream, or a half-closed-local
@@ -157,26 +157,100 @@ func (m *Manager) TryOpenStream(id uint32) (*Stream, bool) {
 func (m *Manager) DeleteStream(id uint32) {
 	m.mu.Lock()
 	s, ok := m.streams[id]
-	if ok {
-		delete(m.streams, id)
-		m.priorityTree.RemoveStream(id)
-	}
-	m.mu.Unlock()
-
 	if !ok {
+		m.mu.Unlock()
 		return
 	}
+	release := m.takeLocked(id, s)
+	m.mu.Unlock()
+	m.afterTake(id, s, release)
+}
 
+// resetStream acts on a RST_STREAM from the peer: the stream is closed,
+// marked ClosedByReset, cancelled and deleted, as DeleteStream deletes it. It
+// reports false, and does nothing, when no stream has the ID.
+//
+// Everything it does to the stream happens under m.mu, while the stream is
+// still in the map. A pool handler's goroutine takes its stream out of the
+// map under m.mu before it releases it, so until then the object is still
+// this stream. Looked up and then touched outside the lock, it could already
+// be another stream's, on any connection: the reset closed, marked and
+// cancelled that stream instead (celeris#951).
+func (m *Manager) resetStream(id uint32) bool {
+	m.mu.Lock()
+	s, ok := m.streams[id]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	s.ClosedByReset = true
+	// Cancel takes no lock: it sets a flag and closes the context's Done
+	// channel, if it has one. What waits on the context wakes on its own
+	// goroutine.
+	s.Cancel()
+	release := m.takeLocked(id, s)
+	m.mu.Unlock()
+	m.afterTake(id, s, release)
+	return true
+}
+
+// takeLocked takes s, the stream m.streams[id], out of the map and closes
+// it. m.mu must be held. It reports whether the caller is to release s
+// (afterTake): yes unless a pool handler's goroutine still runs on it
+// (flagAsyncRunning), which then releases it itself.
+//
+// That is decided here, under m.mu, because that is where the goroutine
+// hands the stream over: it takes its stream out of the map under m.mu
+// before it releases it (executeHandler), and it gives a stream whose
+// response is still buffered to the event loop under m.mu too
+// (handOffBuffered). So while s is in the map, the flag says who owns it.
+// Read after the unlock, the flag could already have been cleared by the
+// goroutine's own release (resetAndPool stores 0): the stream was then
+// released a second time and put in the stream pool twice, so two later
+// streams, on any connections, shared one object (celeris#950). Nothing
+// touches s after the unlock unless it is the caller's to release.
+func (m *Manager) takeLocked(id uint32, s *Stream) (release bool) {
+	delete(m.streams, id)
+	m.priorityTree.RemoveStream(id)
 	prev := State(s.state.Swap(int32(StateClosed)))
 	m.updateActiveCount(prev, StateClosed)
+	return s.flags.Load()&flagAsyncRunning == 0
+}
 
+// afterTake finishes what takeLocked began, after m.mu is released: it drops
+// the stream's pending WINDOW_UPDATE credit and releases the stream if it was
+// the caller's to release.
+func (m *Manager) afterTake(id uint32, s *Stream, release bool) {
 	m.windowUpdateMu.Lock()
 	delete(m.pendingStreamUpdates, id)
 	m.windowUpdateMu.Unlock()
 
-	if s.flags.Load()&flagAsyncRunning == 0 {
+	if release {
 		s.Release()
 	}
+}
+
+// handOffBuffered gives a pool stream whose handler has returned with part
+// of its response still buffered for the peer's window to the event loop,
+// which sends the rest on WINDOW_UPDATE and releases the stream (or a
+// RST_STREAM, GOAWAY or Close does). The stream stays in the map. It does
+// this under m.mu, where those decide whether to release a stream
+// (takeLocked, handleGoAway, Close).
+//
+// It reports false, and hands nothing over, when the stream is no longer in
+// the map: a RST_STREAM, a GOAWAY, Close or the WINDOW_UPDATE flush took it
+// out while its handler ran, and left its release to the handler's
+// goroutine, which must then release it. Handed over anyway, as it was, no
+// flush could find it again and nothing released it: its buffered bytes
+// stayed charged to the connection's outbound budget for good (celeris#948).
+func (m *Manager) handOffBuffered(s *Stream) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.streams[s.ID] != s {
+		return false
+	}
+	s.flags.And(^flagAsyncRunning)
+	return true
 }
 
 // RemoveStreamFromMap removes a stream from the manager's map without releasing it.

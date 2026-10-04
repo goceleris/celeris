@@ -33,7 +33,7 @@ type waitBound893 struct {
 	started  time.Time
 	returned time.Time
 	err      error
-	ctxErr   error // the handler's context, read as its write returns
+	ctxErr   error // the stream's context (what c.Context() returns), read as its write returns
 	done     chan struct{}
 }
 
@@ -43,7 +43,7 @@ func newWaitBound893(t *testing.T, route string, writeTimeout time.Duration) *wa
 	for i := range w.body {
 		w.body[i] = byte('a' + i%26)
 	}
-	run := func(ctx context.Context, s *stream.Stream) error {
+	run := func(_ context.Context, s *stream.Stream) error {
 		defer close(w.done)
 		_, onPool := s.ResponseWriter.(*h2ResponseAdapter)
 		w.mu.Lock()
@@ -51,7 +51,9 @@ func newWaitBound893(t *testing.T, route string, writeTimeout time.Duration) *wa
 		w.mu.Unlock()
 		err := s.ResponseWriter.WriteResponse(s, 200, [][2]string{{"content-type", "application/octet-stream"}}, w.body)
 		w.mu.Lock()
-		w.returned, w.err, w.ctxErr = time.Now(), err, ctx.Err()
+		// HandleStream's ctx is context.Background() on HTTP/2; the
+		// stream's context is the one cancelled with it (celeris#836).
+		w.returned, w.err, w.ctxErr = time.Now(), err, s.Context().Err()
 		w.mu.Unlock()
 		return err
 	}

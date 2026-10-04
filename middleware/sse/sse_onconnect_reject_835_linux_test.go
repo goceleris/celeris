@@ -96,10 +96,17 @@ func waitReady835(addr string, startDone <-chan error) error {
 // hung until its timeout), and std and HTTP/2 answered an empty 200. The
 // config documents "Return a non-nil error to reject the connection".
 //
-// Every engine, HTTP/1.1, GET and an explicit HEAD route: the client must get
-// the 401 (with its body, except for HEAD), and the connection must then still
-// serve /ping835. (h2c: see the note in the test body, celeris#836.) /events835-ok is the control on the same
+// Every engine, HTTP/1.1 and h2c, GET and an explicit HEAD route: the client
+// must get the 401 (with its body, except for HEAD). The HTTP/1.1 connection
+// must then still serve /ping835. /events835-ok is the control on the same
 // server: an OnConnect that accepts still gets its stream and first event.
+//
+// The h2c cells are also a regression case for celeris#836: sse.New derives
+// its client's context from the stream's (context.WithCancel(c.Context())),
+// and a rejection returns at once, so the stream is released while that
+// context's propagation goroutine may still be running. Before #836's fix
+// that goroutine could read the context of the stream's next use and panic
+// the process; it did in CI on this test.
 func TestOnConnectRejectionReachesClient835(t *testing.T) {
 	engines := []struct {
 		name string
@@ -160,13 +167,76 @@ func TestOnConnectRejectionReachesClient835(t *testing.T) {
 				checkAcceptedStream835(t, e.name, addr)
 			})
 
-			// No h2c cells: sse.New derives its client's context from the
-			// stream's (context.WithCancel(c.Context())), and on HTTP/2 the
-			// propagation goroutine of that context can panic the process
-			// once the rejected stream is pooled (celeris#836; it did in CI).
-			// The fix itself is below sse.New, in the router's error path,
-			// and TestErrorBeforeStreamWriterUseReachesClient835 checks it on
-			// h2c on every engine. Re-enable h2c here with #836's fix.
+			t.Run("h2c", func(t *testing.T) {
+				p := new(http.Protocols)
+				p.SetUnencryptedHTTP2(true)
+				cl := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Protocols: p}}
+				defer cl.CloseIdleConnections()
+				for _, method := range []string{"GET", "HEAD"} {
+					wantBody := "denied835"
+					if method == "HEAD" {
+						wantBody = ""
+					}
+					desc := fmt.Sprintf("%s h2c %s /events835 (OnConnect rejects with 401)", e.name, method)
+					req, err := http.NewRequestWithContext(context.Background(), method, "http://"+addr+"/events835", nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					resp, err := cl.Do(req)
+					if err != nil {
+						t.Errorf("%s: %v", desc, err)
+						continue
+					}
+					b, err := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					if resp.ProtoMajor != 2 {
+						t.Errorf("%s: answered over %s, want HTTP/2", desc, resp.Proto)
+					}
+					if err != nil || resp.StatusCode != 401 || string(b) != wantBody {
+						t.Errorf("%s: %d %q content-type %q (read error %v), want 401 %q",
+							desc, resp.StatusCode, b, resp.Header.Get("content-type"), err, wantBody)
+					}
+				}
+			})
+
+			// celeris#836: many rejections in flight at once, so the
+			// released streams are reused while the propagation goroutines
+			// of their clients' contexts may still run.
+			t.Run("h2c-burst", func(t *testing.T) {
+				p := new(http.Protocols)
+				p.SetUnencryptedHTTP2(true)
+				cl := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Protocols: p, MaxConnsPerHost: 2}}
+				defer cl.CloseIdleConnections()
+				const n, inFlight = 2000, 32
+				var bad atomic.Int32
+				var first atomic.Value
+				sem := make(chan struct{}, inFlight)
+				done := make(chan struct{}, n)
+				for range n {
+					sem <- struct{}{}
+					go func() {
+						defer func() { <-sem; done <- struct{}{} }()
+						resp, err := cl.Get("http://" + addr + "/events835")
+						if err != nil {
+							bad.Add(1)
+							first.CompareAndSwap(nil, err.Error())
+							return
+						}
+						_, _ = io.Copy(io.Discard, resp.Body)
+						_ = resp.Body.Close()
+						if resp.StatusCode != 401 || resp.ProtoMajor != 2 {
+							bad.Add(1)
+							first.CompareAndSwap(nil, fmt.Sprintf("%d over %s", resp.StatusCode, resp.Proto))
+						}
+					}()
+				}
+				for range n {
+					<-done
+				}
+				if b := bad.Load(); b != 0 {
+					t.Errorf("%s: %d of %d rejected h2c GETs not answered 401 over HTTP/2, first: %v", e.name, b, n, first.Load())
+				}
+			})
 		})
 	}
 }
