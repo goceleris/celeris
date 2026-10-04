@@ -27,7 +27,8 @@
 // away in a minor release, and the release notes say when they do. It is a
 // property-testing facility for the celeris engines and middleware; it does
 // not validate request input (for that, see
-// [github.com/goceleris/celeris.Context.Bind]).
+// [github.com/goceleris/celeris.Context.BindAndValidate] and
+// [github.com/goceleris/celeris.SetValidator]).
 //
 // # Documentation
 //

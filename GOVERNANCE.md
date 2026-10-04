@@ -129,25 +129,44 @@ so the design can be discussed without a diff attached.
 ## Compatibility
 
 From v1.6.0, the supported API is every exported identifier of the
-packages outside `internal/` that are not marked experimental:
-`celeris`, `celeristest`, `observe`, the `middleware/...` packages
-(the four nested modules `compress`, `metrics`, `otel` and `protobuf`
-included), and `driver/postgres`, `driver/redis` and `driver/memcached`.
+packages that have no `internal` element in their import path and are
+not marked experimental: `celeris`, `celeristest`, `observe`, the
+`middleware/...` packages (the four nested modules `compress`,
+`metrics`, `otel` and `protobuf` included), and `driver/postgres`,
+`driver/redis` and `driver/memcached`.
 
 - **Supported packages follow the
   [Go 1 compatibility promise](https://go.dev/doc/go1compat)** within a
-  major version, with the same exceptions (security fixes, bugs,
-  unspecified behaviour). A minor or patch release may add API; it does
-  not remove or change an exported identifier, a documented default or
-  documented behaviour in a way that breaks code that uses it as
-  documented. A change that would needs a new major version.
+  major version, with the exceptions that promise lists, among them
+  security fixes, bugs, unspecified behaviour, struct literals and
+  methods. A minor or patch release may add API, including fields of an
+  exported struct (`observe.EngineMetrics` gains counters this way) and
+  methods of an exported type, so write struct literals of celeris types
+  with field names. It does not remove or change an exported identifier,
+  a documented default or documented behaviour in a way that breaks code
+  that uses it as documented. A change that would do so needs a new
+  major version.
+- **An internal type that a supported package names through an alias**
+  (`redis.Value`, `redis.KV`, `redis.Type`, `postgres.PGError`,
+  `postgres.TypeCodec`, the drivers' `PoolStats` and `PoolWorkerStats`)
+  is supported through that alias: its exported fields and methods
+  follow the promise above. The one exception is the provider type
+  under "Not covered" below.
 - **Packages marked experimental** in their package documentation may
   change or go away in a minor release, and the release notes say when
-  they do. Today that is `validation`.
+  they do. Today that is `validation`. A supported identifier whose type
+  is experimental follows the experimental level: today that is
+  `observe.Snapshot`'s `ValidationCounters` field, of type
+  `validation.Counters`, which exists only under `-tags=validation`.
 - **Not covered:**
-  - `internal/**`. The Go toolchain refuses imports of it from outside
-    this module.
-  - `cmd/celeris`, the validation launcher.
+  - Every package with an `internal` element in its import path:
+    `internal/**`, `driver/internal/**`, `middleware/internal/**` and
+    `middleware/jwt/internal/**`. Go lets only packages under the
+    directory that contains `internal` import one, so code outside
+    `github.com/goceleris/celeris/` cannot; the nested middleware
+    modules, which are under that path, can.
+  - `cmd/celeris`, the validation launcher, and `test/**`, the
+    conformance, spec and benchmark suites, which export nothing.
   - What an exported identifier's documentation says is not supported:
     the type `Server.EventLoopProvider` returns, and the drivers'
     `ServerProvider` method that returns it, until

@@ -130,6 +130,11 @@ reviews:
         Shared connection handling (internal/conn: H1 and H2 state used by every engine), socket options and the
         wake-fd. The engine rules apply: hot-path allocations and locks need a measurement, lock order must be
         consistent, and a descriptor must not be used after close.
+    - path: "observe/**"
+      instructions: |
+        The supported metrics API (Collector, Snapshot, EngineMetrics; the engines fill EngineMetrics from
+        internal/engine). Exported metrics and counters are read by goceleris/probatorium; renaming or removing one
+        breaks it. A field change also shows in api/observe.txt.
     - path: "internal/protocol/**"
       instructions: |
         The HTTP/1.1 and HTTP/2 parsers read untrusted bytes from the network. Check:

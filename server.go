@@ -742,7 +742,8 @@ func (s *Server) Addr() net.Addr {
 // It is for the celeris drivers: pass the server itself to
 // [github.com/goceleris/celeris/driver/redis.WithEngine] or its postgres
 // and memcached counterparts. The result's type is defined in an internal
-// package, so code outside this module can pass it on but cannot name it.
+// package, so code outside github.com/goceleris/celeris can pass it on but
+// cannot name it.
 // That type and its methods are not supported API until celeris#453
 // defines a public engine interface; they may change in a minor release.
 func (s *Server) EventLoopProvider() engine.EventLoopProvider {
