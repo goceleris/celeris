@@ -90,8 +90,8 @@ func TestAdaptiveImmediatePromote_Epoll(t *testing.T) {
 
 	// The fast arm. After each /ping response the route's promotion state is
 	// read; a promotion is EXPLAINED when a run since the last re-arm was
-	// measured, inside the handler, over adaptiveBlockingThreshold, or the
-	// last adaptivePromoteStreak runs were all over adaptivePromoteThreshold
+	// measured, inside the handler, over ping752BlockingBar, or the
+	// last ping752Streak runs were all over ping752StreakBar
 	// (the streak path). The handler's span is inside the router's, so an
 	// explained promotion is one the router was right to make. Either way the
 	// route is re-armed (promotion cleared) so the next run is timed again.
@@ -113,10 +113,10 @@ func TestAdaptiveImmediatePromote_Epoll(t *testing.T) {
 		d := time.Duration(pingLastNs.Load())
 		maxRun = max(maxRun, d)
 		maxSinceArm = max(maxSinceArm, d)
-		if d > adaptiveBlockingThreshold {
+		if d > ping752BlockingBar {
 			slowRuns++
 		}
-		if d > adaptivePromoteThreshold {
+		if d > ping752StreakBar {
 			slowStreak++
 		} else {
 			slowStreak = 0
@@ -124,7 +124,7 @@ func TestAdaptiveImmediatePromote_Epoll(t *testing.T) {
 		if !s.router.isPromoted("/ping") {
 			continue
 		}
-		if maxSinceArm > adaptiveBlockingThreshold || slowStreak >= adaptivePromoteStreak {
+		if maxSinceArm > ping752BlockingBar || slowStreak >= ping752Streak {
 			explained++
 		} else {
 			unexplained++
@@ -142,13 +142,26 @@ func TestAdaptiveImmediatePromote_Epoll(t *testing.T) {
 		ping752Runs, slowRuns, maxRun, explained, unexplained, unexplainedFirst, ping752MaxUnexplained, forceSlowEvery)
 	if unexplained > ping752MaxUnexplained {
 		t.Fatalf("/ping (fast) was promoted %d times in %d runs with no run measured over %s (nor %d consecutive over %s) behind the promotion, first after run %d: the router is promoting a fast route",
-			unexplained, ping752Runs, adaptiveBlockingThreshold, adaptivePromoteStreak, adaptivePromoteThreshold, unexplainedFirst)
+			unexplained, ping752Runs, ping752BlockingBar, ping752Streak, ping752StreakBar, unexplainedFirst)
 	}
 }
 
+// The bars the fast arm judges a promotion against are the router's
+// documented contract (handler.go: adaptiveBlockingThreshold = 2 ms,
+// adaptivePromoteThreshold = 300 us, adaptivePromoteStreak = 8), written out
+// here rather than read from those constants: a router whose bar drifted
+// (to 0, say) would otherwise explain its own wrong promotions. A deliberate
+// change of a bar in handler.go changes these with it, as it does the 3 ms
+// /slow sleep above.
+const (
+	ping752BlockingBar = 2 * time.Millisecond
+	ping752StreakBar   = 300 * time.Microsecond
+	ping752Streak      = 8
+)
+
 // ping752Runs is how many /ping runs the fast arm judges. A router that
 // promotes fast runs promotes on (nearly) every one of them once re-armed,
-// or once per adaptivePromoteStreak runs on the streak path (8 of 64).
+// or once per ping752Streak runs on the streak path (8 of 64).
 const ping752Runs = 64
 
 // ping752MaxUnexplained is the number of promotions with no measured slow run
