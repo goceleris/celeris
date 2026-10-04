@@ -104,19 +104,30 @@ func (cs *CompressedStream) writeRaw(p []byte) (int, error) {
 }
 
 // WriteHeader sends the status line and headers with Content-Encoding and
-// Vary added automatically. Any Content-Length header is stripped because
+// Vary: Accept-Encoding added automatically (Vary only when headers do not
+// name Accept-Encoding already). Any Content-Length header is stripped because
 // streaming responses use chunked transfer encoding. Must be called once
 // before Write.
 func (cs *CompressedStream) WriteHeader(status int, headers [][2]string) error {
+	return cs.sw.WriteHeader(status, streamHeaders(cs.encoding, headers))
+}
+
+// streamHeaders returns the headers WriteHeader sends: Content-Encoding,
+// Vary: Accept-Encoding unless the caller's headers name it already (they
+// can be the Context's response headers, where AcceptsEncodings put it), and
+// the caller's headers without Content-Length.
+func streamHeaders(encoding string, headers [][2]string) [][2]string {
 	extra := make([][2]string, 0, len(headers)+2)
-	extra = append(extra, [2]string{"content-encoding", cs.encoding})
-	extra = append(extra, [2]string{"vary", "Accept-Encoding"})
+	extra = append(extra, [2]string{"content-encoding", encoding})
+	if !varyNamesAcceptEncoding(headers) {
+		extra = append(extra, [2]string{"vary", "Accept-Encoding"})
+	}
 	for _, h := range headers {
 		if h[0] != "content-length" {
 			extra = append(extra, h)
 		}
 	}
-	return cs.sw.WriteHeader(status, extra)
+	return extra
 }
 
 // Write compresses data and sends it to the underlying StreamWriter.
