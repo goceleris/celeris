@@ -180,10 +180,12 @@ func TestH2RequestContextEndsWithItsRequest836(t *testing.T) {
 				for range 4 * kept {
 					get()
 				}
-				close(keptCtx)
-				i := 0
-				for ctx := range keptCtx {
-					i++
+				// Received, not ranged over after a close: the handler's
+				// send happens before its response, but the race detector
+				// does not see the socket in between, and a close would be
+				// reported as racing the sends.
+				for i := 1; i <= kept; i++ {
+					ctx := <-keptCtx
 					// The stream is released just after the response is
 					// written; give that a moment.
 					deadline := time.Now().Add(5 * time.Second)
@@ -203,9 +205,6 @@ func TestH2RequestContextEndsWithItsRequest836(t *testing.T) {
 						t.Fatalf("kept context %d: a context derived from it after its request ended is live", i)
 					}
 					cancel()
-				}
-				if i != kept {
-					t.Fatalf("kept %d contexts, want %d", i, kept)
 				}
 			})
 		}
@@ -314,9 +313,15 @@ func TestH2CUnmatchedThroughTimeoutSingleflight836(t *testing.T) {
 		for _, arm := range arms {
 			t.Run(e.name+"/"+arm.name, func(t *testing.T) {
 				addr := startGlobalChainServer836(t, celeris.Config{
-					Engine:          e.eng,
-					Protocol:        celeris.Auto,
-					AsyncHandlers:   true,
+					Engine:   e.eng,
+					Protocol: celeris.Auto,
+					// kitchen_sink's AsyncHandlers, except under the race
+					// detector: the async h2c upgrade path has a data race
+					// of its own on epoll (celeris#865, switchToH2Local vs
+					// checkTimeouts), which this test would report instead of
+					// testing #836. The handlers of an h2c connection run
+					// inline either way. Lift this with #865's fix.
+					AsyncHandlers:   !raceOn761,
 					ReadTimeout:     30 * time.Second,
 					WriteTimeout:    30 * time.Second,
 					IdleTimeout:     120 * time.Second,
