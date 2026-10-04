@@ -394,8 +394,11 @@ func (c *Context) parseCookies() {
 
 // Scheme returns the request scheme ("http" or "https"). If [Context.SetScheme]
 // has been called (typically by the proxy middleware), the override value is
-// returned. Otherwise it checks the :scheme pseudo-header from the original
-// request. Returns "http" if neither source provides a value.
+// returned as set. Otherwise it is "https" when the request's :scheme
+// pseudo-header is https (in any case) and "http" in every other case, a
+// missing or unknown value included: on an h2c stream the client chooses
+// :scheme freely, and a value Scheme passed through would reach every metric
+// label, log field and URL built from it (celeris#924).
 //
 // To trust X-Forwarded-Proto from reverse proxies, use the proxy middleware
 // which validates the header against trusted proxy networks before calling
@@ -404,8 +407,8 @@ func (c *Context) Scheme() string {
 	if c.schemeOverride != "" {
 		return c.schemeOverride
 	}
-	if scheme := c.Header(":scheme"); scheme != "" {
-		return scheme
+	if scheme := c.Header(":scheme"); scheme == "https" || len(scheme) == 5 && strings.EqualFold(scheme, "https") {
+		return "https"
 	}
 	return "http"
 }
@@ -700,13 +703,19 @@ func (c *Context) Protocol() string {
 }
 
 // AcceptsEncodings returns the best matching encoding from the Accept-Encoding
-// header, or empty string if none match.
+// header, or empty string if none match. The response then depends on
+// Accept-Encoding, so it adds Accept-Encoding to the response's Vary header
+// (once), as [Context.Negotiate] does for Accept.
 func (c *Context) AcceptsEncodings(offers ...string) string {
+	c.varyOn("Accept-Encoding")
 	return negotiate.Accept(c.Header("accept-encoding"), offers)
 }
 
 // AcceptsLanguages returns the best matching language from the Accept-Language
-// header, or empty string if none match.
+// header, or empty string if none match. The response then depends on
+// Accept-Language, so it adds Accept-Language to the response's Vary header
+// (once), as [Context.Negotiate] does for Accept.
 func (c *Context) AcceptsLanguages(offers ...string) string {
+	c.varyOn("Accept-Language")
 	return negotiate.Accept(c.Header("accept-language"), offers)
 }

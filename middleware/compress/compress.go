@@ -14,6 +14,38 @@ import (
 	"github.com/goceleris/celeris"
 )
 
+// addVary adds Vary: Accept-Encoding to c's response unless a Vary line
+// already names it: Context.AcceptsEncodings adds one (celeris#912), and the
+// handler may have too. The response then names it once.
+func addVary(c *celeris.Context) {
+	if !varyNamesAcceptEncoding(c.ResponseHeaders()) {
+		c.AddHeader("vary", "Accept-Encoding")
+	}
+}
+
+// varyNamesAcceptEncoding reports whether a Vary line in headers lists
+// Accept-Encoding (in any case) or is "*".
+func varyNamesAcceptEncoding(headers [][2]string) bool {
+	for _, h := range headers {
+		if len(h[0]) != 4 || !strings.EqualFold(h[0], "vary") {
+			continue
+		}
+		for v := h[1]; v != ""; {
+			tok := v
+			if i := strings.IndexByte(v, ','); i >= 0 {
+				tok, v = v[:i], v[i+1:]
+			} else {
+				v = ""
+			}
+			tok = strings.TrimSpace(tok)
+			if tok == "*" || strings.EqualFold(tok, "Accept-Encoding") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // New creates a compress middleware with the given config.
 func New(config ...Config) celeris.HandlerFunc {
 	cfg := defaultConfig
@@ -88,7 +120,7 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		m := c.Method()
 		if m == "HEAD" || m == "OPTIONS" {
-			c.AddHeader("vary", "Accept-Encoding")
+			addVary(c)
 			return c.Next()
 		}
 
@@ -98,26 +130,29 @@ func New(config ...Config) celeris.HandlerFunc {
 		// downstream handler's StreamWriter() returns nil (because
 		// bufferDepth > 0) and the request fails with 500.
 		if isStreamingRequest(c) {
-			c.AddHeader("vary", "Accept-Encoding")
+			addVary(c)
 			return c.Next()
 		}
 
 		encoding := c.AcceptsEncodings(encodings...)
 		if encoding == "" {
-			// No matching encoding. Still add Vary so caches know the
-			// response varies by Accept-Encoding even when uncompressed.
-			c.AddHeader("vary", "Accept-Encoding")
+			// No matching encoding. Vary still names Accept-Encoding so
+			// caches know the response varies by it even when uncompressed.
+			// AcceptsEncodings has named it (celeris#912); addVary keeps the
+			// line with a core older than that and adds no second one.
+			addVary(c)
 			return c.Next()
 		}
 
 		c.BufferResponse()
 		err := c.Next()
 
-		// flushWithVary adds the Vary header and flushes the (possibly
-		// uncompressed) buffered response. Used by every early-return and
-		// the final success path below.
+		// flushWithVary makes sure Vary names Accept-Encoding (a handler can
+		// have replaced the line AcceptsEncodings added) and flushes the
+		// (possibly uncompressed) buffered response. Used by every
+		// early-return and the final success path below.
 		flushWithVary := func() error {
-			c.AddHeader("vary", "Accept-Encoding")
+			addVary(c)
 			return c.FlushResponse()
 		}
 

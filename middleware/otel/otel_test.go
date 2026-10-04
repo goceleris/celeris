@@ -1329,13 +1329,16 @@ func TestMetricAttributeKeys(t *testing.T) {
 	wantKeys := []attribute.Key{
 		semconv.HTTPRequestMethodKey,
 		semconv.URLSchemeKey,
-		semconv.ServerAddressKey,
 		semconv.HTTPResponseStatusCodeKey,
 	}
 	for _, k := range wantKeys {
 		if _, found := attrs.Value(k); !found {
 			t.Fatalf("expected metric attribute %q not found", k)
 		}
+	}
+	// server.address is the client's Host: opt-in on metrics (celeris#924).
+	if _, found := attrs.Value(semconv.ServerAddressKey); found {
+		t.Fatalf("metric attribute %q present by default", semconv.ServerAddressKey)
 	}
 }
 

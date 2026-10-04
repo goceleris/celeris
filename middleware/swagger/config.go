@@ -77,7 +77,8 @@ type UIConfig struct {
 	// OAuth2 pre-fills the OAuth2 authorization dialog in Swagger UI.
 	// All values are embedded in the served HTML page source and visible
 	// to anyone who can access the page; only public-client material is
-	// supported (no ClientSecret — use PKCE via [OAuth2Config.UsePKCE]).
+	// supported (no ClientSecret; PKCE is on unless
+	// [OAuth2Config.DisablePKCE] is set).
 	// When nil, no OAuth2 initialization is emitted. Swagger UI only;
 	// ignored when Renderer is Scalar or ReDoc.
 	OAuth2 *OAuth2Config
@@ -103,9 +104,12 @@ type OAuth2Config struct {
 	AppName string
 	// Scopes lists the default OAuth2 scopes to request.
 	Scopes []string
-	// UsePKCE enables Proof Key for Code Exchange (RFC 7636), the
-	// recommended public-client flow. Default: true.
-	UsePKCE bool
+	// DisablePKCE turns off Proof Key for Code Exchange (RFC 7636), the
+	// recommended public-client flow. By default (false) Swagger UI uses
+	// PKCE. It replaces the UsePKCE field, documented as true by default
+	// but false in every OAuth2Config literal that left it out
+	// (celeris#922).
+	DisablePKCE bool
 }
 
 // Config defines the swagger middleware configuration.

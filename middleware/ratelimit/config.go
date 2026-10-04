@@ -96,8 +96,8 @@ type Config struct {
 	SlidingWindow bool
 
 	// SkipFailedRequests, when true, refunds the token for requests
-	// whose downstream handler returns a status >= 400. The token is
-	// refunded after c.Next() completes.
+	// whose downstream handler returns a status >= 400, or panics. The
+	// token is refunded after c.Next() completes.
 	SkipFailedRequests bool
 
 	// SkipSuccessfulRequests, when true, refunds the token for requests

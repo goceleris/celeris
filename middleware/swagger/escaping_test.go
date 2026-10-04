@@ -232,7 +232,6 @@ func TestPlainConfigUnchanged(t *testing.T) {
 				Realm:    "my-realm",
 				AppName:  "My App",
 				Scopes:   []string{"read", "write"},
-				UsePKCE:  true,
 			}
 
 			body := servePage(t, Config{

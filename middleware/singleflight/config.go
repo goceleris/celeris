@@ -3,6 +3,7 @@ package singleflight
 import (
 	"net/url"
 	"slices"
+	"strings"
 
 	"github.com/goceleris/celeris"
 )
@@ -19,15 +20,21 @@ type Config struct {
 	// with the same key that arrive while a leader request is in-flight
 	// are coalesced — waiters receive a copy of the leader's response.
 	//
-	// Default: method + "\x00" + path + "\x00" + sorted-query-string
-	// + "\x00" + Authorization header + "\x00" + Cookie header. The
-	// Authorization and Cookie components ensure that requests from
-	// different authenticated users produce different keys, preventing
-	// cross-user data leakage. Unauthenticated requests (no auth/cookie
-	// headers) still coalesce normally.
+	// Default: method + "\x00" + path + "\x00" + sorted-query-string,
+	// then the Authorization, Cookie and Accept-Encoding headers, each
+	// labelled so that one can never read as another. The Authorization
+	// and Cookie components ensure that requests from different
+	// authenticated users produce different keys, preventing cross-user
+	// data leakage. Unauthenticated requests (no auth/cookie headers)
+	// still coalesce normally. Accept-Encoding keeps requests that accept
+	// different encodings apart when compress runs inside singleflight.
 	//
 	// If you provide a custom KeyFunc, ensure it incorporates user
-	// identity for any endpoint that returns user-specific data.
+	// identity for any endpoint that returns user-specific data. Whatever
+	// the key, a waiter whose request differs from the leader's in a
+	// header the leader's response names in Vary (or a response with
+	// Vary: *) runs its own handler instead of taking the leader's
+	// response.
 	KeyFunc func(c *celeris.Context) string
 }
 
@@ -49,11 +56,13 @@ func defaultKeyFunc(c *celeris.Context) string {
 	rq := c.RawQuery()
 	auth := c.Header("authorization")
 	cookie := c.Header("cookie")
+	// The encoding compress negotiates comes from Accept-Encoding, so
+	// requests that accept different encodings get different responses
+	// (celeris#912).
+	ae := c.Header("accept-encoding")
 
-	var key string
-	if rq == "" {
-		key = m + "\x00" + p
-	} else {
+	var q string
+	if rq != "" {
 		// Clone query params before sorting to avoid mutating the
 		// context's cached queryCache.
 		params := c.QueryParams()
@@ -64,13 +73,43 @@ func defaultKeyFunc(c *celeris.Context) string {
 			slices.Sort(cp)
 			sorted[k] = cp
 		}
-		key = m + "\x00" + p + "\x00" + sorted.Encode()
+		q = sorted.Encode()
+	}
+	if q == "" && auth == "" && cookie == "" && ae == "" {
+		return m + "\x00" + p
+	}
+	// Each header component is labelled, so one header's value can never
+	// read as another's (a header value cannot hold a NUL). The key is
+	// built in one allocation.
+	n := len(m) + 1 + len(p)
+	if q != "" {
+		n += 1 + len(q)
+	}
+	for _, v := range [...]string{auth, cookie, ae} {
+		if v != "" {
+			n += 3 + len(v)
+		}
+	}
+	var b strings.Builder
+	b.Grow(n)
+	b.WriteString(m)
+	b.WriteString("\x00")
+	b.WriteString(p)
+	if q != "" {
+		b.WriteString("\x00")
+		b.WriteString(q)
 	}
 	if auth != "" {
-		key += "\x00" + auth
+		b.WriteString("\x00a=")
+		b.WriteString(auth)
 	}
 	if cookie != "" {
-		key += "\x00" + cookie
+		b.WriteString("\x00c=")
+		b.WriteString(cookie)
 	}
-	return key
+	if ae != "" {
+		b.WriteString("\x00e=")
+		b.WriteString(ae)
+	}
+	return b.String()
 }
