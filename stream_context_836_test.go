@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/goceleris/celeris/protocol/h2/stream"
 )
 
 // celeris#836 in the root package: an HTTP/2 request's c.Context() is the
@@ -45,6 +47,34 @@ func TestContextOfH2RequestEndsWithIt836(t *testing.T) {
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("the previous request's context: Err = %v once the next request began, want context.Canceled", ctx.Err())
 	}
+}
+
+// TestH1ContextIsSetWhenAcquired836: on HTTP/1 the request's context is
+// context.Background(), stored when the Context is acquired, as it was
+// before #836's fix. Context() must not read the stream for it: a detached
+// handler (SSE, WebSocket) may call it while the engine releases the
+// stream, which the race detector reports here.
+func TestH1ContextIsSetWhenAcquired836(t *testing.T) {
+	s := stream.NewH1Stream(1)
+	s.Method, s.Path, s.Scheme, s.Authority = "GET", "/836", "http", "localhost"
+	s.ResponseWriter = &mockResponseWriter{}
+	c := acquireContext(s)
+	if c.ctx != context.Background() {
+		t.Fatalf("acquireContext on an HTTP/1 stream set ctx %v, want context.Background()", c.ctx)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			if c.Context() != context.Background() {
+				t.Error("c.Context() on an HTTP/1 request is not context.Background()")
+				return
+			}
+		}
+	}()
+	s.Release()
+	<-done
+	releaseContext(c)
 }
 
 // BenchmarkHandleStreamContext836 is BenchmarkHandleStreamFull with a
