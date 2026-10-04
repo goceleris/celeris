@@ -735,6 +735,35 @@ func (c *Context) AddHeader(key, value string) {
 	c.respHeaders = append(c.respHeaders, [2]string{k, v})
 }
 
+// varyOn adds name to the response's Vary header, unless a Vary line already
+// lists it (in any case) or is "*". name is a canonical header name, clean
+// of CR, LF and NUL.
+func (c *Context) varyOn(name string) {
+	for _, h := range c.respHeaders {
+		if h[0] == "vary" && varyLists(h[1], name) {
+			return
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{"vary", name})
+}
+
+// varyLists reports whether the Vary value v lists name, or is "*".
+func varyLists(v, name string) bool {
+	for v != "" {
+		tok := v
+		if i := strings.IndexByte(v, ','); i >= 0 {
+			tok, v = v[:i], v[i+1:]
+		} else {
+			v = ""
+		}
+		tok = strings.TrimSpace(tok)
+		if tok == "*" || strings.EqualFold(tok, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // sanitizeHeaderKey lowercases and strips CRLF/null bytes. Fast path avoids
 // allocation when the key is already lowercase and clean (common case).
 func sanitizeHeaderKey(s string) string {
@@ -1127,7 +1156,13 @@ func (c *Context) StreamReader(code int, contentType string, r io.Reader) error 
 
 // Negotiate inspects the Accept header and returns the best matching content type
 // from the provided offers. Returns "" if no match. Supports quality values (q=).
+//
+// The response then depends on Accept, so Negotiate adds Accept to the
+// response's Vary header (once): a shared cache, or middleware/singleflight,
+// must not hand this response to a request that asked for another type
+// (celeris#912).
 func (c *Context) Negotiate(offers ...string) string {
+	c.varyOn("Accept")
 	accept := c.Header("accept")
 	if accept == "" {
 		if len(offers) > 0 {
@@ -1140,7 +1175,8 @@ func (c *Context) Negotiate(offers ...string) string {
 
 // Respond writes the response in the format that best matches the Accept header.
 // Supported types: application/json, application/xml, text/plain.
-// Falls back to JSON if no match.
+// Falls back to JSON if no match. Like [Context.Negotiate], it names Accept
+// in the response's Vary header.
 func (c *Context) Respond(code int, v any) error {
 	best := c.Negotiate("application/json", "application/xml", "text/plain")
 	switch best {
