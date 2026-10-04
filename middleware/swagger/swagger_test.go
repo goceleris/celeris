@@ -700,7 +700,6 @@ func TestOAuth2Config(t *testing.T) {
 				Realm:    "my-realm",
 				AppName:  "My App",
 				Scopes:   []string{"read", "write"},
-				UsePKCE:  true,
 			},
 		},
 	})

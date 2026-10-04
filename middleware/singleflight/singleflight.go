@@ -25,6 +25,12 @@ type call struct {
 	ct       string
 	err      error
 	panicVal any
+	// vary holds, for each request header the leader's response names in
+	// Vary, the header and the leader's value for it (a copy); varyAll is
+	// set when the response says Vary: *. A waiter whose request differs
+	// from the leader's in one of them runs its own handler (celeris#912).
+	vary    [][2]string
+	varyAll bool
 }
 
 type group struct {
@@ -53,6 +59,8 @@ func acquireCall() *call {
 	c.ct = ""
 	c.err = nil
 	c.panicVal = nil
+	c.vary = c.vary[:0]
+	c.varyAll = false
 	c.waiters.Store(0)
 	return c
 }
@@ -81,8 +89,10 @@ func New(config ...Config) celeris.HandlerFunc {
 		// 206 part) answers that Range, which the key does not include, so a
 		// leader's part would be handed to requests for the whole
 		// representation, and a ranged request waiting on a full one gets
-		// more than it asked for (celeris#832).
-		if c.Header("range") != "" {
+		// more than it asked for (celeris#832). A conditional request is not
+		// coalesced either: its response (a 304 or a 412) answers its
+		// validator, which the key does not include either (celeris#912).
+		if answersItsOwnHeaders(c) {
 			return c.Next()
 		}
 
@@ -118,6 +128,14 @@ func New(config ...Config) celeris.HandlerFunc {
 
 			if entry.panicVal != nil {
 				panic(entry.panicVal)
+			}
+
+			// The leader's response says it depends on a request header
+			// this request sends differently (an Accept-Encoding that
+			// compress negotiated, for one), and the key did not tell the
+			// two apart: this request runs its own handler (celeris#912).
+			if !entry.sameVariant(c) {
+				return c.Next()
 			}
 
 			c.Abort()
@@ -169,6 +187,7 @@ func New(config ...Config) celeris.HandlerFunc {
 				entry.body = append([]byte(nil), body...)
 			}
 			entry.headers, entry.ct = ownHeaders(c.ResponseHeaders(), c.ResponseContentType())
+			entry.captureVary(c)
 			// The error and the panic value can hold the leader's request
 			// strings too (errors.New(c.Param("id")), panic(c.Header("x"))),
 			// which a waiter formats after the leader has returned: hand the
@@ -196,6 +215,57 @@ func New(config ...Config) celeris.HandlerFunc {
 		}
 		return handlerErr
 	}
+}
+
+// answersItsOwnHeaders reports a request whose response answers one of its
+// own headers that the key does not include, so it must not be coalesced:
+// a Range (the 206 part, celeris#832), or a precondition (If-None-Match and
+// If-Modified-Since give a 304, If-Match and If-Unmodified-Since a 412,
+// celeris#912). If-Range applies only with a Range.
+func answersItsOwnHeaders(c *celeris.Context) bool {
+	return c.Header("range") != "" ||
+		c.Header("if-none-match") != "" ||
+		c.Header("if-modified-since") != "" ||
+		c.Header("if-match") != "" ||
+		c.Header("if-unmodified-since") != ""
+}
+
+// captureVary records, for each request header the leader's response names
+// in Vary (entry.headers, the waiters' copy), the leader's value for it. The
+// values are copied: on epoll and io_uring they are views of the leader
+// connection's receive buffer, and a waiter compares them after the leader
+// has returned.
+func (e *call) captureVary(c *celeris.Context) {
+	for _, h := range e.headers {
+		if h[0] != "vary" {
+			continue
+		}
+		for name := range strings.SplitSeq(h[1], ",") {
+			name = strings.ToLower(strings.TrimSpace(name))
+			switch name {
+			case "":
+			case "*":
+				e.varyAll = true
+			default:
+				e.vary = append(e.vary, [2]string{name, strings.Clone(c.Header(name))})
+			}
+		}
+	}
+}
+
+// sameVariant reports whether the waiter c sends the leader's value for every
+// request header the leader's response varies on, so the leader's response
+// is the one c's own request would get.
+func (e *call) sameVariant(c *celeris.Context) bool {
+	if e.varyAll {
+		return false
+	}
+	for _, v := range e.vary {
+		if c.Header(v[0]) != v[1] {
+			return false
+		}
+	}
+	return true
 }
 
 // ownHeaders returns a copy of the leader's response headers and content

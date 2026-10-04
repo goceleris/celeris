@@ -703,13 +703,19 @@ func (c *Context) Protocol() string {
 }
 
 // AcceptsEncodings returns the best matching encoding from the Accept-Encoding
-// header, or empty string if none match.
+// header, or empty string if none match. The response then depends on
+// Accept-Encoding, so it adds Accept-Encoding to the response's Vary header
+// (once), as [Context.Negotiate] does for Accept.
 func (c *Context) AcceptsEncodings(offers ...string) string {
+	c.varyOn("Accept-Encoding")
 	return negotiate.Accept(c.Header("accept-encoding"), offers)
 }
 
 // AcceptsLanguages returns the best matching language from the Accept-Language
-// header, or empty string if none match.
+// header, or empty string if none match. The response then depends on
+// Accept-Language, so it adds Accept-Language to the response's Vary header
+// (once), as [Context.Negotiate] does for Accept.
 func (c *Context) AcceptsLanguages(offers ...string) string {
+	c.varyOn("Accept-Language")
 	return negotiate.Accept(c.Header("accept-language"), offers)
 }

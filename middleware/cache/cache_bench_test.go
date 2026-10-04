@@ -17,9 +17,9 @@ func BenchmarkCacheHit(b *testing.B) {
 	store := NewMemoryStore()
 	defer store.Close()
 	mw := New(Config{
-		Store:        store,
-		TTL:          5 * time.Minute,
-		Singleflight: false,
+		Store:               store,
+		TTL:                 5 * time.Minute,
+		DisableSingleflight: true,
 	})
 	handler := func(c *celeris.Context) error {
 		return c.Blob(200, "text/plain", []byte("hello world"))
@@ -50,9 +50,8 @@ func BenchmarkCacheMissSingleflight(b *testing.B) {
 	// unique-key MISS (not a Store hit, not a follower).
 	var counter int
 	mw := New(Config{
-		Store:        store,
-		TTL:          time.Hour,
-		Singleflight: true,
+		Store: store,
+		TTL:   time.Hour,
 		KeyGenerator: func(_ *celeris.Context) string {
 			counter++
 			return "k" + strconv.Itoa(counter)
@@ -79,9 +78,9 @@ func BenchmarkCacheMissNoSingleflight(b *testing.B) {
 	defer store.Close()
 	var counter int
 	mw := New(Config{
-		Store:        store,
-		TTL:          time.Hour,
-		Singleflight: false,
+		Store:               store,
+		TTL:                 time.Hour,
+		DisableSingleflight: true,
 		KeyGenerator: func(_ *celeris.Context) string {
 			counter++
 			return "k" + strconv.Itoa(counter)

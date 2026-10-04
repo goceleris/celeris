@@ -7,10 +7,16 @@
 //
 // Install it with [New], optionally passing a [Config]. The zero-value
 // configuration deduplicates on method + path + sorted query string +
-// Authorization + Cookie, so requests from different authenticated users are
-// never coalesced. A request with a Range header is never coalesced either:
-// its response answers that Range. Use [Config.KeyFunc] to change the key,
-// and [Config.Skip] or [Config.SkipPaths] to exclude requests (for example
+// Authorization + Cookie + Accept-Encoding, so requests from different
+// authenticated users are never coalesced, and neither are requests that
+// accept different encodings. A request with a Range header is never
+// coalesced either: its response answers that Range. Nor is a conditional
+// request (If-None-Match, If-Modified-Since, If-Match or If-Unmodified-Since):
+// its 304 or 412 answers its own validator. Whatever the key, a waiter whose
+// request differs from the leader's in a header that the leader's response
+// names in Vary (or a response with Vary: *) runs its own handler instead of
+// taking the leader's response. Use [Config.KeyFunc] to change the key, and
+// [Config.Skip] or [Config.SkipPaths] to exclude requests (for example
 // non-idempotent methods or large-response endpoints). Waiter responses carry
 // an "x-singleflight: HIT" header.
 //

@@ -8,8 +8,9 @@
 //
 // Concurrent duplicates that arrive while the original is still
 // in-flight return 409 Conflict (configurable via [Config.OnConflict]).
-// Crashed handlers leak a lock entry; the lock expires after
-// [Config.LockTimeout] so the next request can retry.
+// A handler that returns an error or panics releases the lock, so the
+// client can retry. A process that dies with the lock held leaks it; the
+// lock expires after [Config.LockTimeout] so the next request can retry.
 //
 // When [Config.BodyHash] is enabled, the request body hash is stored
 // alongside the response; mismatches on replay return 422
@@ -156,7 +157,18 @@ func New(config ...Config) celeris.HandlerFunc {
 
 		// Leader path — run the handler and capture its response.
 		c.BufferResponse()
+		// A handler that panics releases the lock as one that returns an
+		// error does, so the client can retry at once instead of getting
+		// 409 until LockTimeout; the panic continues unchanged
+		// (celeris#921).
+		ran := false
+		defer func() {
+			if !ran {
+				_ = cfg.Store.Delete(ctx, key)
+			}
+		}()
 		chainErr := c.Next()
+		ran = true
 		status := c.ResponseStatus()
 		body := c.ResponseBody()
 		if len(body) > cfg.MaxBodyBytes {

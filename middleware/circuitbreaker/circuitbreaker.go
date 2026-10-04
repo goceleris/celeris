@@ -157,67 +157,75 @@ func NewWithBreaker(config ...Config) (celeris.HandlerFunc, *Breaker) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					brk.window.recordFailure()
-					panic(r) // re-panic after recording the failure
+					// A panic is a failure, with the transition a returned
+					// failure makes: a half-open probe that panicked once
+					// left the breaker HalfOpen with its slot spent, so
+					// every later request got 503 for good (celeris#921).
+					brk.settle(true)
+					panic(r)
 				}
 			}()
 			err = c.Next()
 		}()
 
 		status := responseStatus(c, err)
-		isFailure := brk.isError(err, status)
-
-		if isFailure {
-			brk.window.recordFailure()
-		} else {
-			brk.window.recordSuccess()
-		}
-
-		currentState := State(brk.state.Load())
-		switch currentState {
-		case Closed:
-			total, failures := brk.window.counts()
-			if total >= int64(brk.minRequests) && float64(failures)/float64(total) >= brk.threshold {
-				brk.mu.Lock()
-				// Double-check under lock.
-				if State(brk.state.Load()) == Closed {
-					brk.state.Store(int32(Open))
-					brk.openedAt.Store(time.Now().UnixNano())
-					brk.window.reset()
-					if brk.onStateChange != nil {
-						brk.onStateChange(Closed, Open)
-					}
-				}
-				brk.mu.Unlock()
-			}
-
-		case HalfOpen:
-			brk.mu.Lock()
-			if State(brk.state.Load()) == HalfOpen {
-				if isFailure {
-					brk.state.Store(int32(Open))
-					brk.openedAt.Store(time.Now().UnixNano())
-					brk.halfOpenUsed.Store(0)
-					brk.window.reset()
-					if brk.onStateChange != nil {
-						brk.onStateChange(HalfOpen, Open)
-					}
-				} else {
-					brk.state.Store(int32(Closed))
-					brk.halfOpenUsed.Store(0)
-					brk.window.reset()
-					if brk.onStateChange != nil {
-						brk.onStateChange(HalfOpen, Closed)
-					}
-				}
-			}
-			brk.mu.Unlock()
-		}
-
+		brk.settle(brk.isError(err, status))
 		return err
 	}
 
 	return handler, brk
+}
+
+// settle records a let-through request's outcome in the window and makes the
+// transition it calls for: Closed trips to Open once the failure rate reaches
+// the threshold; a HalfOpen probe moves the breaker to Open on a failure and
+// to Closed otherwise.
+func (b *Breaker) settle(isFailure bool) {
+	if isFailure {
+		b.window.recordFailure()
+	} else {
+		b.window.recordSuccess()
+	}
+
+	switch State(b.state.Load()) {
+	case Closed:
+		total, failures := b.window.counts()
+		if total >= int64(b.minRequests) && float64(failures)/float64(total) >= b.threshold {
+			b.mu.Lock()
+			// Double-check under lock.
+			if State(b.state.Load()) == Closed {
+				b.state.Store(int32(Open))
+				b.openedAt.Store(time.Now().UnixNano())
+				b.window.reset()
+				if b.onStateChange != nil {
+					b.onStateChange(Closed, Open)
+				}
+			}
+			b.mu.Unlock()
+		}
+
+	case HalfOpen:
+		b.mu.Lock()
+		if State(b.state.Load()) == HalfOpen {
+			if isFailure {
+				b.state.Store(int32(Open))
+				b.openedAt.Store(time.Now().UnixNano())
+				b.halfOpenUsed.Store(0)
+				b.window.reset()
+				if b.onStateChange != nil {
+					b.onStateChange(HalfOpen, Open)
+				}
+			} else {
+				b.state.Store(int32(Closed))
+				b.halfOpenUsed.Store(0)
+				b.window.reset()
+				if b.onStateChange != nil {
+					b.onStateChange(HalfOpen, Closed)
+				}
+			}
+		}
+		b.mu.Unlock()
+	}
 }
 
 // responseStatus derives the HTTP status code from the error or context.

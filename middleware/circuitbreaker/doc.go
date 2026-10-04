@@ -4,7 +4,10 @@
 // automatically stops sending requests when failure thresholds are exceeded,
 // giving the failing service time to recover. It operates as a three-state
 // machine: Closed (normal), Open (rejecting all requests with 503), and
-// HalfOpen (allowing limited probe requests to test recovery).
+// HalfOpen (allowing limited probe requests to test recovery). A handler
+// that panics is a failure, with the same transition as a returned one (a
+// half-open probe that panics reopens the breaker); the panic continues to
+// the recovery middleware.
 //
 // Use [New] to create middleware with default settings (50% threshold,
 // minimum 10 requests, 10 s window, 30 s cooldown). Pass a [Config] to

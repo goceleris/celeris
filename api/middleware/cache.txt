@@ -12,14 +12,14 @@ method (*MemoryStore) Get(context.Context, string) ([]byte, error)
 method (*MemoryStore) Scan(context.Context, string) ([]string, error)
 method (*MemoryStore) Set(context.Context, string, []byte, time.Duration) error
 type Config struct
+type Config struct, DisableSingleflight bool
 type Config struct, ExcludeHeaders []string
 type Config struct, HeaderName string
+type Config struct, IgnoreCacheControl bool
 type Config struct, IncludeHeaders []string
 type Config struct, KeyGenerator func(*github.com/goceleris/celeris.Context) string
 type Config struct, MaxBodyBytes int
 type Config struct, Methods []string
-type Config struct, RespectCacheControl bool
-type Config struct, Singleflight bool
 type Config struct, Skip func(*github.com/goceleris/celeris.Context) bool
 type Config struct, SkipPaths []string
 type Config struct, StatusFilter func(int) bool

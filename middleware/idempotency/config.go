@@ -31,7 +31,7 @@ type Config struct {
 	TTL time.Duration
 
 	// LockTimeout is the maximum duration a lock is held before it
-	// expires (recovers after a crashed handler). Default: 30s.
+	// expires (recovers after a process that died holding it). Default: 30s.
 	LockTimeout time.Duration
 
 	// Methods lists HTTP methods the middleware applies to. Default:

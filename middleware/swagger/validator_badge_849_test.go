@@ -46,7 +46,7 @@ func TestValidatorBadgeOffByDefault849(t *testing.T) {
 					cfg := Config{SpecContent: jsonSpec, BasePath: bp, AssetsPath: v.assetsPath, CDN: v.cdn}
 					if oauth {
 						cfg.UI.OAuth2RedirectURL = "https://app.test/swagger/oauth2-redirect.html"
-						cfg.UI.OAuth2 = &OAuth2Config{ClientID: "c", UsePKCE: true}
+						cfg.UI.OAuth2 = &OAuth2Config{ClientID: "c"}
 					}
 					uiPath := strings.TrimRight(bp, "/") + "/"
 					if bp == "" {
