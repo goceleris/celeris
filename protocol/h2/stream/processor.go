@@ -141,12 +141,12 @@ type Processor struct {
 	continuationState    *ContinuationState
 	continuationStateMu  sync.Mutex
 	continuationActive   atomic.Bool
-	InlineCachedCtx      any       // per-connection cached app context for inline handlers (avoids sync.Pool)
-	hasMoreFrames        bool      // true when more frames follow in current recv (defers inline cleanup)
-	pendingInlineCleanup []*Stream // inline-completed streams deferred until frame loop exits
-	InlineWriter         h2Conn    // direct-to-outBuf writer for inline handlers (set by conn layer)
-	InlineCount          uint64    // number of requests handled inline (for metrics)
-	MaxRequestBodySize   int64     // 0 = use default (100 MB)
+	InlineCachedCtx      any             // per-connection cached app context for inline handlers (avoids sync.Pool)
+	hasMoreFrames        bool            // true when more frames follow in current recv (defers inline cleanup)
+	pendingInlineCleanup []inlineCleanup // inline-completed streams deferred until frame loop exits
+	InlineWriter         h2Conn          // direct-to-outBuf writer for inline handlers (set by conn layer)
+	InlineCount          uint64          // number of requests handled inline (for metrics)
+	MaxRequestBodySize   int64           // 0 = use default (100 MB)
 
 	// asyncResolver, when set, lets per-stream dispatch honor the
 	// per-route .Async() flag: a stream whose route is async is forced
@@ -241,13 +241,26 @@ func (p *Processor) maxBodySize() int64 {
 // when the frame loop has more frames to process.
 func (p *Processor) SetHasMoreFrames(v bool) { p.hasMoreFrames = v }
 
+// inlineCleanup is a stream whose cleanup executeHandlerInline deferred to
+// FlushInlineCleanup, with the ID it had then.
+type inlineCleanup struct {
+	s  *Stream
+	id uint32
+}
+
 // FlushInlineCleanup transitions and removes streams that completed inline
 // during the frame loop but had cleanup deferred (pending outbound data or
 // more frames to process). Called after the frame loop, under H2State.mu.
 func (p *Processor) FlushInlineCleanup() {
-	for _, s := range p.pendingInlineCleanup {
-		// Stream may have been cleaned up by handleWindowUpdate/handleSettings.
-		if existing, ok := p.manager.GetStream(s.ID); !ok || existing != s {
+	for _, e := range p.pendingInlineCleanup {
+		// The stream may have been released since, by a RST_STREAM later in
+		// the read or by handleWindowUpdate/handleSettings. Its object is
+		// then back in the pool, and a HEADERS later in the read can have
+		// it again under a new ID: look it up by the ID it had, never by
+		// the object's current one, which would release that new stream
+		// while its handler runs (celeris#947).
+		s := e.s
+		if existing, ok := p.manager.GetStream(e.id); !ok || existing != s {
 			continue
 		}
 		state := s.GetState()
@@ -258,7 +271,7 @@ func (p *Processor) FlushInlineCleanup() {
 				s.SetState(StateHalfClosedLocal)
 			}
 		}
-		p.manager.RemoveStreamFromMap(s.ID)
+		p.manager.RemoveStreamFromMap(e.id)
 		s.Release()
 	}
 	p.pendingInlineCleanup = p.pendingInlineCleanup[:0]
@@ -808,7 +821,7 @@ func (p *Processor) executeHandlerInline(stream *Stream) {
 	// transition above already ran; FlushInlineCleanup re-applies it
 	// idempotently before removing the stream.
 	if p.hasMoreFrames {
-		p.pendingInlineCleanup = append(p.pendingInlineCleanup, stream)
+		p.pendingInlineCleanup = append(p.pendingInlineCleanup, inlineCleanup{stream, stream.ID})
 		keepAlive = true
 		return
 	}
