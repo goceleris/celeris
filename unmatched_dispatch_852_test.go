@@ -272,7 +272,9 @@ func TestDetachedRequestNotAnsweredOnErrorOrPanic852(t *testing.T) {
 					onError = append(onError, err)
 					_ = c.String(500, "from OnError") // refused: ErrDetached
 				})
-				s.Use(func(c *Context) error { done = c.Detach(); return nil })
+				// Detaching answers the request (celeris#927): the middleware
+				// calls Next itself so that the next one still runs.
+				s.Use(func(c *Context) error { done = c.Detach(); return c.Next() })
 				s.Use(func(*Context) error {
 					if shape == "panic" {
 						panic("after detach")

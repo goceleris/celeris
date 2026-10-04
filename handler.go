@@ -94,12 +94,13 @@ func newUnmatchedChain(middleware []HandlerFunc, custom, builtin HandlerFunc) []
 
 // answerUnlessAnswered runs h only if no handler before it in the chain has
 // answered the request: written the response, had it captured by a buffering
-// middleware (compress, etag, cache, ...) or taken the connection over. A
-// middleware that serves its own path returns without calling Next, which does
-// not stop the chain (only Abort does), so without this check the not-found
-// answer would run after it: on the wire the first write wins, but a buffered
-// page would be overwritten by the 404, and the handler's ErrResponseWritten
-// would reach every middleware above it.
+// middleware (compress, etag, cache, ...) or taken the connection over.
+// [Context.Next] already ends the chain when a handler that answered returns
+// (celeris#927); this also covers a middleware that answers and then calls
+// Next itself. Without it the not-found answer would run after such a
+// middleware: on the wire the first write wins, but a buffered page would be
+// overwritten by the 404, and the handler's ErrResponseWritten would reach
+// every middleware above it.
 func answerUnlessAnswered(h HandlerFunc) HandlerFunc {
 	return func(c *Context) error {
 		if c.written || c.buffered || c.detached {
@@ -183,8 +184,9 @@ func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) erro
 			return nil
 		}
 		// Pure abort (handler wrote a response and called Abort with no
-		// error): skip routing and flush.
-		if c.IsAborted() {
+		// error), or a pre-middleware that answered the request without
+		// Abort (celeris#927): skip routing and flush.
+		if c.IsAborted() || c.answered() {
 			if c.buffered && !c.written {
 				c.bufferDepth = 1
 				_ = c.FlushResponse()
@@ -581,10 +583,11 @@ func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
 	}
 	if c.detached {
 		// A request a middleware detached (WebSocket, SSE) is answered by
-		// whoever took it over (celeris#852): a middleware that detaches and
-		// returns without Next does not stop the chain, so a later
-		// middleware's error reaches here. The Context's writers refuse a
-		// detached request (ErrDetached); the writes below would not.
+		// whoever took it over (celeris#852). A middleware that detaches and
+		// returns ends the chain (celeris#927), but one that detaches and
+		// calls Next lets a later handler's error reach here. The Context's
+		// writers refuse a detached request (ErrDetached); the writes below
+		// would not.
 		return
 	}
 	hdrs := make([][2]string, 0, len(c.respHeaders)+2)

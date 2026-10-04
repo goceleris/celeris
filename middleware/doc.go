@@ -10,7 +10,14 @@
 //   - Server.Pre installs pre-routing middleware that runs before matching and
 //     may mutate the request method, path, scheme, host, or client IP
 //     (proxy, redirect, rewrite, methodoverride). Pre-routing middleware that
-//     writes a response MUST return without calling c.Next().
+//     writes a response MUST return without calling c.Next(); routing is
+//     then skipped.
+//
+// A handler that answers the request (writes the response, has it captured
+// by a buffering middleware, or takes the connection over) and returns ends
+// the chain: the handlers after it, a route included, do not run, and Next
+// returns nil to the middleware above. A handler that returns without
+// answering and without calling Next lets the chain continue.
 //
 // Ordering matters: each layer should see the context the layers before it
 // established. See the documentation hub below for the recommended install
