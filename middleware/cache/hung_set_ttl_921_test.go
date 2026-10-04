@@ -17,20 +17,26 @@ import (
 // TTL: a request that comes after the TTL has passed runs its own handler, as
 // it would once the stored entry expired.
 func TestCacheHungSetResultExpiresWithItsTTL921(t *testing.T) {
-	const ttl = 50 * time.Millisecond
+	// The past-TTL arms only need the TTL to have passed, which a sleep
+	// guarantees whatever the scheduling, so their TTL is short. The
+	// within-TTL arm needs the second request served before the TTL ends,
+	// which a GC pause or a loaded -race runner can delay: its TTL is long.
+	const ttl, longTTL = 50 * time.Millisecond, time.Minute
 	for _, arm := range []struct {
 		name    string
 		hangSet bool
+		ttl     time.Duration
 		wait    time.Duration
 		want    string
 		wantHit string
 	}{
 		// The defect: the leader's Set hangs, the TTL is long past.
-		{"set-hangs-past-ttl", true, 6 * ttl, "v2", "MISS"},
-		// Within the TTL the held response is still handed out.
-		{"set-hangs-within-ttl", true, 0, "v1", ""},
+		{"set-hangs-past-ttl", true, ttl, 6 * ttl, "v2", "MISS"},
+		// Within the TTL the held response is still handed out (a HIT: the
+		// handler does not run again).
+		{"set-hangs-within-ttl", true, longTTL, 0, "v1", "HIT"},
 		// Control: the Set returns; the stored entry expires on its own.
-		{"set-returns-past-ttl", false, 6 * ttl, "v2", "MISS"},
+		{"set-returns-past-ttl", false, ttl, 6 * ttl, "v2", "MISS"},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			inSet, release := make(chan struct{}), make(chan struct{})
@@ -54,7 +60,7 @@ func TestCacheHungSetResultExpiresWithItsTTL921(t *testing.T) {
 				}
 				return c.String(200, "v2")
 			}
-			mw := New(Config{Store: kv, TTL: ttl})
+			mw := New(Config{Store: kv, TTL: arm.ttl})
 
 			first := serve921(t, mw, h)
 			select {
@@ -73,7 +79,7 @@ func TestCacheHungSetResultExpiresWithItsTTL921(t *testing.T) {
 			}
 			second := await921(t, "second", serve921(t, mw, h), 3*time.Second)
 			if second.body != arm.want || (arm.wantHit != "" && second.xcache != arm.wantHit) {
-				t.Errorf("a request %v after the fill (TTL %v): body %q x-cache %q, want %q %s", arm.wait, ttl, second.body, second.xcache, arm.want, arm.wantHit)
+				t.Errorf("a request %v after the fill (TTL %v): body %q x-cache %q, want %q %s", arm.wait, arm.ttl, second.body, second.xcache, arm.want, arm.wantHit)
 			}
 			t.Logf("second: %d %q x-cache %q; handler runs %d", second.status, second.body, second.xcache, runs.Load())
 			once.Do(func() { close(release) })

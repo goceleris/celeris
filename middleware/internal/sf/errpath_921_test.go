@@ -83,7 +83,10 @@ func TestDoLeaderErrorReachesItsFollowers(t *testing.T) {
 func TestDoExpiredResultIsNotHandedOut921(t *testing.T) {
 	joined := joinHook(t)
 	g := New[int]()
-	const fresh = 30 * time.Millisecond
+	// The caller within the freshness must reach Do before it ends, which a
+	// GC pause or a loaded -race runner can delay, so it is generous; the
+	// caller after it only needs the sleep below, which outlasts it.
+	const fresh = 500 * time.Millisecond
 	inThen, thenGate := make(chan struct{}), make(chan struct{})
 	first := make(chan result, 1)
 	go func() {
@@ -96,7 +99,12 @@ func TestDoExpiredResultIsNotHandedOut921(t *testing.T) {
 	if r := within(t, "caller within the freshness", goDo(context.Background(), g, "k", func() (int, error) { return 2, nil }, nil), 3*time.Second); r.leader || r.v != 1 {
 		t.Errorf("caller within the freshness: %d leader=%v, want the published 1", r.v, r.leader)
 	}
-	<-joined
+	select {
+	case <-joined:
+	case <-time.After(3 * time.Second):
+		close(thenGate)
+		t.Fatal("the caller within the freshness never joined the published call")
+	}
 	time.Sleep(2 * fresh)
 
 	entered, gate := make(chan struct{}), make(chan struct{})
