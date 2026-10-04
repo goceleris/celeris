@@ -18,6 +18,14 @@ func joinHook(t *testing.T) <-chan struct{} {
 	return joined
 }
 
+// noLimit adapts fn to Do's shape with no freshness limit on its result.
+func noLimit[T any](fn func() (T, error)) func() (T, time.Duration, error) {
+	return func() (T, time.Duration, error) {
+		v, err := fn()
+		return v, 0, err
+	}
+}
+
 type result struct {
 	v      int
 	leader bool
@@ -27,7 +35,7 @@ type result struct {
 func goDo(ctx context.Context, g *Group[int], key string, fn func() (int, error), then func(int, error)) <-chan result {
 	out := make(chan result, 1)
 	go func() {
-		v, leader, err := g.Do(ctx, key, fn, then)
+		v, leader, err := g.Do(ctx, key, noLimit(fn), then)
 		out <- result{v, leader, err}
 	}()
 	return out
@@ -71,7 +79,7 @@ func TestDoReleasesTheKeyWhenTheLeaderPanics921(t *testing.T) {
 			leaderPanic := make(chan any, 1)
 			go func() {
 				defer func() { leaderPanic <- recover() }()
-				_, _, _ = g.Do(context.Background(), "k", fn, then)
+				_, _, _ = g.Do(context.Background(), "k", noLimit(fn), then)
 			}()
 			<-entered
 			follower := goDo(context.Background(), g, "k", func() (int, error) { return 0, errors.New("the follower ran fn") }, nil)

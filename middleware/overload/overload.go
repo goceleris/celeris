@@ -173,15 +173,18 @@ func NewWithController(config ...Config) (celeris.HandlerFunc, *Controller) {
 			return c.AbortWithStatus(rejectStatus)
 		}
 
-		// Passing through: record in-flight + latency around Next().
+		// Passing through: record in-flight + latency around Next(). The
+		// in-flight count is given back on every way out, a handler panic
+		// included: each panic used to leak one, and with DepthThresholds
+		// set enough of them rejected every request for good (celeris#921).
 		inFlight.Add(1)
+		defer inFlight.Add(-1)
 		if effective == StageBackpressure {
 			time.Sleep(backpressureDelay)
 		}
 		start := time.Now()
 		err := c.Next()
 		elapsedNs := uint64(time.Since(start).Nanoseconds())
-		inFlight.Add(-1)
 		// EMA update: ema = ema*(1-α) + sample*α. Atomic CAS loop so
 		// concurrent writers don't lose updates. One contended retry on
 		// burst; noise on steady-state.

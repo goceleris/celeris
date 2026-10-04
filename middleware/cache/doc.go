@@ -27,8 +27,11 @@
 // handler included, writes its own response after the wait, so a client
 // that reads slowly delays only its own response; and not for the store's
 // Set, which the leader makes once the others have their result. A
-// request that arrives during that Set takes the result too. A waiter
-// waits only as long as its request context lives. When the handler, or
+// request that arrives during that Set takes the result too, as long as
+// the result is within its TTL: a Set that never returns does not keep it
+// alive. A waiter waits only as long as its request context lives; on
+// epoll and io_uring an HTTP/1 request context does not end unless a
+// middleware such as timeout gives it a deadline. When the handler, or
 // the store's Set, panics, the panic is the leader's, and each waiter
 // runs its own handler. Set [Config.DisableSingleflight] when handlers
 // have side effects that must run per-request.

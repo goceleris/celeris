@@ -101,15 +101,19 @@ func New(config ...Config) celeris.HandlerFunc {
 		// (celeris#913). The leader stores the response after the followers
 		// are released, while the key is still held, so a Set that hangs (a
 		// remote store) holds no follower either, and a request that comes
-		// during the Set takes the response from the call (celeris#921).
+		// during the Set, within the response's TTL, takes the response from
+		// the call (celeris#921).
 		var ttl time.Duration
-		encoded, leader, err := group.Do(ctx, key, func() ([]byte, error) {
+		encoded, leader, err := group.Do(ctx, key, func() ([]byte, time.Duration, error) {
 			// nil dst: leader returns the encoded bytes via sf.Do; followers
 			// may still be reading them after this call frame returns, so
-			// we can't share a pooled buffer here.
+			// we can't share a pooled buffer here. The response is handed
+			// to a request that arrives during the Set only within its TTL,
+			// as the stored entry would be: a Set that hangs must not serve
+			// it for longer.
 			enc, effectiveTTL, chainErr := capture(c, cfg, include, exclude, nil)
 			ttl = effectiveTTL
-			return enc, chainErr
+			return enc, effectiveTTL, chainErr
 		}, func(enc []byte, _ error) {
 			if enc != nil {
 				_ = cfg.Store.Set(ctx, key, enc, ttl)

@@ -31,7 +31,11 @@ type Config struct {
 	// the leader's error ([errors.Is] and [errors.As] find what it holds),
 	// and it is not == to it. When the handler (or the store's Set)
 	// panics, the panic is the leader's, and each waiter runs its own
-	// handler. A waiter waits only as long as its request context lives.
+	// handler. A waiter waits only as long as its request context lives;
+	// on epoll and io_uring an HTTP/1 request context does not end unless
+	// a middleware such as timeout gives it a deadline, so there a waiter
+	// waits for the handler. A request that arrives during the leader's
+	// store Set takes the response too, within the response's TTL.
 	//
 	// It replaces the Singleflight field, which a Config literal that did
 	// not set it turned off (celeris#922).
