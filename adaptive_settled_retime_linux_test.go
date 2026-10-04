@@ -252,7 +252,7 @@ func envInt589(name string, def int) int {
 const (
 	stall589Delay    = 300 * time.Millisecond // D: injected per-call Set latency (CELERIS_589_DELAY_MS overrides)
 	stall589Workers  = 2                      // CELERIS_589_WORKERS overrides (diagnostic)
-	stall589KVConnsX = 4                      // C = 4×Workers so every worker holds a /kv conn (p≈1-2·2^-8); CELERIS_589_KVCONNS overrides
+	stall589KVConnsX = 4                      // C = 4×Workers /kv conns; placement is the kernel's reuseport hash, so the probe's worker holds none in ~2^-8 of runs, which the settled arm CHECKS (celeris#790, refUnpinned790); CELERIS_589_KVCONNS overrides
 	stall589Window   = 10 * time.Second
 	stall589Spacing  = 10 * time.Millisecond
 	stall589StallBar = 5 * time.Millisecond
@@ -531,6 +531,13 @@ func assertSettledRetimed592(o stall589Obs) error {
 		return errors.New("/kv is not promoted (isPromoted=false) at the end of the window")
 	case o.asyncPromotedConns < 1:
 		return fmt.Errorf("AsyncPromotedConns=%d, want >= 1 (no conn was handed to the dispatch goroutine)", o.asyncPromotedConns)
+	case o.engine == "epoll" && o.refSamples >= stall592MinRefSamples && refUnpinned790(o):
+		// The ratio's premise failed (celeris#790): the reference window was
+		// never pinned, so there is no settled-world median to divide by.
+		// The state assertions above have all held. VOID, not NOT_FIXED.
+		return fmt.Errorf("%w: ref_ping_med %v < queued bar %v over %d reference samples (ref_queued_frac=%.3f, ref_stalled=%d): "+
+			"the /ping probe's worker held no /kv conn, so the route being settled cost it nothing to measure",
+			errRefUnpinned790, o.refPingMed, o.queuedBar, o.refSamples, o.refQueuedFr, o.refStalled)
 	case o.engine == "epoll" && o.refSamples >= stall592MinRefSamples && o.speedup < stall592MinSpeedup:
 		return fmt.Errorf("epoll: /ping median is only %.1fx faster after promotion (want >= %.0fx): %v over %d post-promotion samples "+
 			"against %v over %d samples taken while the route was still settled — same sampler, same blocked store, same run "+
@@ -539,6 +546,42 @@ func assertSettledRetimed592(o stall589Obs) error {
 	}
 	return nil
 }
+
+// errRefUnpinned790 marks a settled run whose reference window was never
+// pinned (celeris#790). The ratio compares the post-promotion /ping median
+// with the median taken while /kv was still settled, and that is a test of
+// celeris#592 only if the settled route was costing the probe's worker
+// something. The rig opens 4×workers /kv conns, but the kernel's reuseport
+// hash places them and the epoll engine attaches no steering program, so in
+// ~2^-8 of runs the probe's worker holds none: the reference window is then
+// as fast as the post-promotion one (CI run 36360645780: 285 samples, median
+// 0.151 ms, ref_queued_frac 0.000, every #592 state assertion held), the
+// ratio is 1.0 and the run used to read NOT_FIXED. That is the apparatus,
+// not the product, so the settled arm reports it as VOID and re-arms the rig
+// (a new engine and new conns, so new hashes) up to stall592Attempts times.
+var errRefUnpinned790 = errors.New("VOID: the reference window was never pinned")
+
+// stall592Attempts bounds the settled arm's re-arms on a VOID run. All of
+// them missing is ~2^-24 at the default placement, and is reported as an
+// apparatus failure distinct from NOT_FIXED.
+const stall592Attempts = 3
+
+// refUnpinned790 is the ratio's premise, checked rather than assumed: a
+// pinned reference window is one whose /ping samples waited for a blocked
+// Set, i.e. whose median is at or over queuedBar589 (D/2). Pinned windows
+// measured 0.29-2.10 s per sample against a 300 ms D (every sample over the
+// bar, ref_queued_frac 1.0); the unpinned one 0.151 ms. The bar is the rig's
+// own injected delay, so it tracks CELERIS_589_DELAY_MS and is three orders
+// of magnitude from both worlds.
+func refUnpinned790(o stall589Obs) bool { return o.refPingMed < o.queuedBar }
+
+// releaseClockStub592 hands the adaptive clock stub back between two
+// attempts of the settled arm. stubNowNano does not nest and releases on the
+// subtest's Cleanup; runStall589 has already joined its engine when it
+// returns normally (stopEngine), so nothing reads the stub any more and a
+// re-arm in the same subtest may take it again. A Fatal inside runStall589
+// ends the subtest, so no attempt follows one.
+func releaseClockStub592() { stubbedNowOn.Store(false) }
 
 // assertCtlWorkerFree628 is the CONTROL arms' latency observable: with every
 // /kv conn on a dispatch goroutine, the engine worker never waits for the
@@ -603,21 +646,40 @@ func TestAdaptiveSettledRouteRetime592(t *testing.T) {
 	}{{"iouring", IOUring}, {"epoll", Epoll}} {
 		t.Run(eng.name, func(t *testing.T) {
 			t.Run("settled", func(t *testing.T) {
-				o := runStall589(t, eng.name, eng.typ, stall589Settled)
 				// The #589 defect signature must be GONE, and the #592 fixed
-				// behaviour must hold. Both directions, one run.
-				claimErr := assertSettledStall589(o)
-				fixErr := assertSettledRetimed592(o)
-				verdict := "FIXED"
-				if fixErr != nil {
-					verdict = "NOT_FIXED"
-				}
-				logStall589(t, o, verdict, claimErr)
-				if fixErr != nil {
-					t.Errorf("celeris#592 fixed-behaviour assertion failed on the settled rig: %v", fixErr)
-				}
-				if claimErr == nil {
-					t.Error("the celeris#589 defect signature still holds on the settled rig (settled, never promoted, stalled_frac >= 0.9)")
+				// behaviour must hold. Both directions, one run. A run whose
+				// reference window was never pinned is VOID (celeris#790):
+				// it is logged and the rig re-armed; only a non-VOID attempt
+				// decides.
+				for attempt := 1; ; attempt++ {
+					if attempt > 1 {
+						releaseClockStub592()
+					}
+					o := runStall589(t, eng.name, eng.typ, stall589Settled)
+					claimErr := assertSettledStall589(o)
+					fixErr := assertSettledRetimed592(o)
+					if errors.Is(fixErr, errRefUnpinned790) {
+						logStall589(t, o, fmt.Sprintf("VOID attempt=%d/%d", attempt, stall592Attempts), claimErr)
+						t.Logf("VOID790 engine=%s attempt=%d/%d: %v", eng.name, attempt, stall592Attempts, fixErr)
+						if attempt < stall592Attempts {
+							continue
+						}
+						t.Errorf("apparatus failure, NOT a celeris#592 regression: the rig could not pin a reference window in %d attempts "+
+							"(the /ping probe's worker held no /kv conn each time; last: %v)", stall592Attempts, fixErr)
+						return
+					}
+					verdict := "FIXED"
+					if fixErr != nil {
+						verdict = "NOT_FIXED"
+					}
+					logStall589(t, o, fmt.Sprintf("%s attempt=%d/%d", verdict, attempt, stall592Attempts), claimErr)
+					if fixErr != nil {
+						t.Errorf("celeris#592 fixed-behaviour assertion failed on the settled rig: %v", fixErr)
+					}
+					if claimErr == nil {
+						t.Error("the celeris#589 defect signature still holds on the settled rig (settled, never promoted, stalled_frac >= 0.9)")
+					}
+					return
 				}
 			})
 			t.Run("negctrl_async", func(t *testing.T) {
