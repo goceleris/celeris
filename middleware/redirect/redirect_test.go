@@ -30,7 +30,11 @@ func newEmptyHostContext(t *testing.T, method, path string, chain []celeris.Hand
 	s.ResponseWriter = &emptyHostWriter{rec: rec}
 	ctx := testhooks.AcquireContext(s).(*celeris.Context)
 	testhooks.SetStartTime(ctx, time.Now())
-	testhooks.SetHandlers(ctx, chain)
+	hs := make([]any, len(chain))
+	for i, h := range chain {
+		hs[i] = h
+	}
+	testhooks.SetHandlers(ctx, hs)
 	t.Cleanup(func() {
 		testhooks.ReleaseContext(ctx)
 		stream.ResetForPool(s)
