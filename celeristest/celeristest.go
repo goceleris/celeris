@@ -328,11 +328,9 @@ func NewContext(method, path string, opts ...Option) (*celeris.Context, *Respons
 		testhooks.AddParam(ctx, p[0], p[1])
 	}
 	if len(cfg.handlers) > 0 {
-		chain := make([]celeris.HandlerFunc, len(cfg.handlers))
-		for i, h := range cfg.handlers {
-			chain[i] = h.(celeris.HandlerFunc)
-		}
-		testhooks.SetHandlers(ctx, chain)
+		// cfg.handlers holds celeris.HandlerFunc values (WithHandlers), and
+		// the hook copies them out before cfg goes back to its pool.
+		testhooks.SetHandlers(ctx, cfg.handlers)
 	}
 	if cfg.fullPath != "" {
 		testhooks.SetFullPath(ctx, cfg.fullPath)

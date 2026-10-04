@@ -28,8 +28,9 @@ func init() {
 // The functions below give the module's test infrastructure (celeristest,
 // and the tests of the middleware) access to a Context's internals. They
 // are not exported: init registers them in internal/testhooks, which
-// cannot import this package, so a *Context and a []HandlerFunc cross it
-// as any. End-user tests use celeristest.
+// cannot import this package, so a *Context crosses it as any and a
+// handler chain as a []any of HandlerFunc values. End-user tests use
+// celeristest.
 
 // acquireTestContext returns a Context from the pool, bound to the given Stream.
 func acquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
@@ -55,15 +56,17 @@ func addTestParam(c *Context, key, value string) {
 }
 
 // setTestHandlers installs a handler chain on a test context, using the
-// inline handlerBuf when the chain is small enough.
-func setTestHandlers(c *Context, handlers []HandlerFunc) {
+// inline handlerBuf when the chain is small enough. Each element of
+// handlers is a HandlerFunc; the chain is copied, never retained.
+func setTestHandlers(c *Context, handlers []any) {
 	n := len(handlers)
 	if n <= len(c.handlerBuf) {
-		copy(c.handlerBuf[:n], handlers)
 		c.handlers = c.handlerBuf[:n]
 	} else {
 		c.handlers = make([]HandlerFunc, n)
-		copy(c.handlers, handlers)
+	}
+	for i, h := range handlers {
+		c.handlers[i] = h.(HandlerFunc)
 	}
 	c.index = -1
 }
@@ -82,7 +85,7 @@ func init() {
 	testhooks.SetFullPath = func(c any, path string) { setTestFullPath(c.(*Context), path) }
 	testhooks.SetTrustedNets = func(c any, nets []*net.IPNet) { setTestTrustedNets(c.(*Context), nets) }
 	testhooks.AddParam = func(c any, key, value string) { addTestParam(c.(*Context), key, value) }
-	testhooks.SetHandlers = func(c any, handlers any) { setTestHandlers(c.(*Context), handlers.([]HandlerFunc)) }
+	testhooks.SetHandlers = func(c any, handlers []any) { setTestHandlers(c.(*Context), handlers) }
 	testhooks.SetScheme = func(c any, scheme string) { setTestScheme(c.(*Context), scheme) }
 }
 
