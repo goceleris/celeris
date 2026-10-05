@@ -261,17 +261,25 @@ func TestDrainRecvBufferEmptiesAWindowBlockedPeer(t *testing.T) {
 	// kernel's own attribution and they are worth reading when a row fails.
 	abortOnClose := after["TCPAbortOnClose"] - before["TCPAbortOnClose"]
 	kind, _ := readToTerminal(peer)
-	t.Logf("TIER0-WINDOWBLOCKED sent=%d inq_before=%d drained=%d inq_after=%d rcvbuf=%d elapsed=%s abortOnClose=%+d peer=%s",
-		sent, inqBefore, drained, inqAfter, rcvbuf, elapsed, abortOnClose, kind)
+	peerSoErr := soError(peer)
+	t.Logf("TIER0-WINDOWBLOCKED sent=%d inq_before=%d drained=%d inq_after=%d rcvbuf=%d elapsed=%s abortOnClose=%+d peer=%s peerSoErr=%s",
+		sent, inqBefore, drained, inqAfter, rcvbuf, elapsed, abortOnClose, kind, peerSoErr)
 
 	if inqAfter != 0 {
 		t.Errorf("the drain left %d bytes queued, so close(2) resets: the window clamp is not holding the peer off (celeris#569)", inqAfter)
 	}
-	if abortOnClose != 0 {
-		t.Errorf("close(2) reset the connection (TCPAbortOnClose +%d): the peer loses the staged send buffer (celeris#569)", abortOnClose)
-	}
+	// The reset itself is judged on THIS connection, not on TCPAbortOnClose
+	// (celeris#825): that counter is the per-namespace TcpExt MIB the NOTE
+	// above de-gates, and other sockets closing with unread data move it (+5
+	// in a Coverage job with every per-connection column correct). The FIN
+	// from SHUT_WR reaches the peer first, so its reader sees EOF even when
+	// close(2) resets; the RST then lands in CLOSE_WAIT and sets the peer's
+	// SO_ERROR to EPIPE (tcp_reset), which is the per-socket witness.
 	if kind != "EOF" {
 		t.Errorf("the peer must see the FIN as EOF, got %s", kind)
+	}
+	if peerSoErr != "0" {
+		t.Errorf("close(2) reset the connection (peer SO_ERROR=%s, TCPAbortOnClose +%d for the namespace): the peer loses the staged send buffer (celeris#569)", peerSoErr, abortOnClose)
 	}
 	// The byte bound on a real TCP socket with megabytes still to come: the
 	// drain must not have chased the peer past the buffer that queue lives
