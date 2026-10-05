@@ -6,7 +6,7 @@ import (
 
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // memcachedPool wraps a single async.Pool of *memcachedConn. Memcached does

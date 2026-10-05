@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """celeris#812 detector control: the MUTANT, applied in CI and never committed.
 
-Disables the hold in drainPendingRelease (engine/iouring/worker.go): past the
+Disables the hold in drainPendingRelease (internal/engine/iouring/worker.go): past the
 release backstop, an entry that still owes a SEND_ZC is released like any
 other, to connStatePool with its send buffer (a detached one to the GC), as
 before the fix. Everything else of the fix stays: the accounting, the
@@ -20,7 +20,7 @@ of silently mutating nothing.
 """
 import sys
 
-PATH = sys.argv[1] if len(sys.argv) > 1 else "engine/iouring/worker.go"
+PATH = sys.argv[1] if len(sys.argv) > 1 else "internal/engine/iouring/worker.go"
 
 HOLD = "\t\t\tif w.closedZCOwed(cs) {\n\t\t\t\tw.holdZCPastBackstop(entry)\n"
 

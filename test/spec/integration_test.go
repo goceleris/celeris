@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestHTTP1Parallel sends concurrent HTTP/1.1 requests to each engine.

@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/store"
-	"github.com/goceleris/celeris/probe"
 )
 
 // These tests pin celeris#731 and the rest of the session IDs the session
@@ -380,7 +380,7 @@ func TestGetByIDSessionKeepsItsID(t *testing.T) {
 //
 // An io_uring start that fails only with ENOMEM is retried for up to 10 s.
 // The kernel charges ring memory to RLIMIT_MEMLOCK per UID and gives it back
-// 12-23 ms after a ring closes (engine/iouring/ring_budget_linux_test.go),
+// 12-23 ms after a ring closes (internal/engine/iouring/ring_budget_linux_test.go),
 // so at the CI runner's 8 MiB a start made right after the previous arm
 // stopped, or while another package's test binary holds rings, can fail
 // although nothing leaked.

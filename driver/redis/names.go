@@ -3,8 +3,8 @@ package redis
 import (
 	"github.com/goceleris/celeris/driver/internal/async"
 	"github.com/goceleris/celeris/driver/internal/eventloop"
-	"github.com/goceleris/celeris/driver/redis/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/driver/redis/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // Value is one decoded RESP2/RESP3 reply. [Client.Do], [Client.Eval],

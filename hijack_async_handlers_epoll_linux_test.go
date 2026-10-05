@@ -14,7 +14,7 @@ import (
 )
 
 // TestHijackWithAsyncHandlersOnEpoll is the user-facing face of the
-// engine/epoll TestInlineHijackOnAsyncLoop: with Config.AsyncHandlers, a
+// internal/engine/epoll TestInlineHijackOnAsyncLoop: with Config.AsyncHandlers, a
 // route that inherits the default starts inline (celeris#356), so its
 // handler runs on the event loop, and Hijack there released the connState
 // that drainRead then dereferenced. The first hijack crashed the process.

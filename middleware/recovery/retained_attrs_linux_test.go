@@ -19,9 +19,9 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	celerisengine "github.com/goceleris/celeris/engine"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
 	"github.com/goceleris/celeris/middleware/recovery"
-	"github.com/goceleris/celeris/probe"
 )
 
 // keepHandler keeps every record, cloned as slog requires, and formats
@@ -222,7 +222,7 @@ func mwArms(t *testing.T) []keptArm {
 // retried for up to 10 s: the probe's ring can fail with ENOMEM against
 // RLIMIT_MEMLOCK while the rings of engines stopped moments ago, or of
 // another test binary of the same user, are still charged
-// (engine/iouring/ring_budget_linux_test.go).
+// (internal/engine/iouring/ring_budget_linux_test.go).
 func keptProbeIOUring() (usable bool, p celerisengine.CapabilityProfile) {
 	p = probe.Probe()
 	usable = p.IOUringTier >= celerisengine.High && p.ProvidedBuffers

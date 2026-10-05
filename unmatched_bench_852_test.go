@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // discardRW852 accepts a response and keeps nothing.

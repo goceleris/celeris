@@ -4,7 +4,7 @@ package conformance
 import (
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 var protocols = []engine.Protocol{

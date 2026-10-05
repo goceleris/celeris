@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 	"github.com/goceleris/celeris/internal/wakefd"
 )
 

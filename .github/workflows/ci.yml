@@ -128,11 +128,11 @@ jobs:
       # on shared GitHub Actions runners and run locally / in the
       # goceleris/probatorium cluster matrix instead.
       #
-      # Excludes ./adaptive/... because it runs in its own job, `adaptive`
+      # Excludes ./internal/adaptive/... because it runs in its own job, `adaptive`
       # below, which raises memlock so the up-switch tests execute
       # (celeris#641).
       #
-      # Excludes ./engine/iouring, which runs in the next step on its own,
+      # Excludes ./internal/engine/iouring, which runs in the next step on its own,
       # with -v and every skip accounted for (celeris#662 r6).
       #
       # Excludes ./middleware/websocket because TestNativeEngineClose
@@ -144,12 +144,12 @@ jobs:
       # autobahn-fuzzingclient test under `mage testAutobahn`.
       # The named-test step at the end of this job is what covers the
       # parts of that package which CAN run here.
-      - name: Root module — race tests (excluding test/ + adaptive/ + websocket + engine/iouring)
+      - name: Root module — race tests (excluding test/ + internal/adaptive/ + websocket + internal/engine/iouring)
         run: |
           pkgs=$(go list ./... | grep -vE '/test/|/adaptive($|/)|/middleware/websocket($|/)|/engine/iouring$')
           # shellcheck disable=SC2086  # word-splitting is intentional — `go test` wants one package per arg
           go test -race -count=1 -timeout=300s $pkgs
-      # celeris#662 r6: ./engine/iouring, on its own, at the runner's own 8 MiB
+      # celeris#662 r6: ./internal/engine/iouring, on its own, at the runner's own 8 MiB
       # memlock, with -v, where no skip goes unseen.
       #
       # It used to run inside the step above, without -v, so a skip printed
@@ -178,16 +178,16 @@ jobs:
       #     a rename or a removal fails it too.
       #
       # 8 MiB funds one io_uring worker through the Listen path (12 MiB per
-      # worker, engine/iouring/ring.go minMemlockPerWorker), the shape the
+      # worker, internal/engine/iouring/ring.go minMemlockPerWorker), the shape the
       # celeris#657 step below also needs. It runs even when the step above
       # failed: the two share no package.
-      - name: engine/iouring — race tests at the runner's memlock (every skip accounted for)
+      - name: internal/engine/iouring — race tests at the runner's memlock (every skip accounted for)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=300s -v ./engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
+          go test -race -count=1 -timeout=300s -v ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring-pkg.log
           allowed='TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails|TestListenClosesListenSocketWhenOneWorkerRingSetupFails|TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails|TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero'
           required='TestListenWithCancelledContextPublishesTheBoundAddress|TestListenRefusesToStartWhenNoWorkerReportsItsAddress'
           want=$(( $(tr '|' '\n' <<<"$required" | wc -l) ))
@@ -195,7 +195,7 @@ jobs:
           passed=$(grep -cE "^--- PASS: (${required}) \(" /tmp/iouring-pkg.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log || true)
           unlisted=$(grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -cvE "^--- SKIP: (${allowed}) \(" || true)
-          echo "engine/iouring: SKIP lines $skipped, not enforced by another step $unlisted; celeris#639 tests want $want, ran $ran, passed $passed"
+          echo "internal/engine/iouring: SKIP lines $skipped, not enforced by another step $unlisted; celeris#639 tests want $want, ran $ran, passed $passed"
           if [ "$unlisted" -ne 0 ] || [ "$ran" -ne "$want" ] || [ "$passed" -ne "$want" ]; then
             grep -E '^[[:space:]]*--- SKIP: ' /tmp/iouring-pkg.log | grep -vE "^--- SKIP: (${allowed}) \(" || true
             echo "expected no SKIP line other than the five that other steps enforce (listed above if any),"
@@ -231,11 +231,11 @@ jobs:
           uring='TestIouringAdoptCarriedAsyncRoute543|TestIouringAdoptCarriedPartialAsyncRoute543|TestIouringAdoptCarriedPipelinedAsync543|TestIouringAdoptCarriedPipelinedSync543'
           epoll='TestEpollAdoptCarriedAsyncRoute543|TestEpollAdoptCarriedPartialAsyncRoute543|TestEpollAdoptCarriedPipelinedAsync543|TestEpollAdoptCarriedPipelinedSync543'
           adaptive='TestAdaptiveSwitchAdoptsCarriedAsyncRequest543'
-          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c543.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./internal/engine/iouring/ 2>&1 | tee /tmp/c543.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./internal/engine/epoll/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./adaptive/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./internal/adaptive/ 2>&1 | tee -a /tmp/c543.log || failed=$((failed + 1))
           names="${uring}|${epoll}|${adaptive}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c543.log || true)
@@ -249,7 +249,7 @@ jobs:
             echo "four pipelined arms answered in order -- was one renamed or removed, did one skip or fail?"
             exit 1
           fi
-      # celeris#657: the root step ran ./engine/iouring WITHOUT -v, so a skip
+      # celeris#657: the root step ran ./internal/engine/iouring WITHOUT -v, so a skip
       # there printed nothing and the package still reported `ok`. That is how
       # the celeris#656 leak shipped with no cover. The step above now runs
       # the package with -v and every skip accounted for; this one adds what
@@ -288,7 +288,7 @@ jobs:
       # later change makes them not fit, the require-workers env turns the
       # ENOMEM into a red job instead of a skip. That is intended.
       #
-      # It runs even when a step above failed: the engine/iouring step above
+      # It runs even when a step above failed: the internal/engine/iouring step above
       # can go red on a pre-existing flake (celeris#691), and that must not
       # hide whether these tests pass.
       #
@@ -315,7 +315,7 @@ jobs:
           names="${pr1}|${pr2}|${pr3}|${pr3r2}|${c711}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/witness657.log
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/witness657.log
           ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/witness657.log || true)
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/witness657.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/witness657.log || true)
@@ -329,7 +329,7 @@ jobs:
             exit 1
           fi
       # celeris#657 PR-3: the same silent-exclusion shape, one package over.
-      # ./engine/epoll is reached only by the root step above, which runs
+      # ./internal/engine/epoll is reached only by the root step above, which runs
       # without -v, so a skip there prints nothing and the package still
       # reports `ok`. Two of the post-switch sweep tests start a REAL
       # epoll engine and t.Skip when it does not come up
@@ -371,7 +371,7 @@ jobs:
           names="${r1}|${r2}|${c711}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./engine/epoll/ 2>&1 | tee /tmp/sweep657.log
+            ./internal/engine/epoll/ 2>&1 | tee /tmp/sweep657.log
           ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/sweep657.log || true)
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/sweep657.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/sweep657.log || true)
@@ -386,10 +386,10 @@ jobs:
             echo "different loop count?"
             exit 1
           fi
-      # celeris#662 / celeris#675: the root step runs ./engine/epoll WITHOUT
+      # celeris#662 / celeris#675: the root step runs ./internal/engine/epoll WITHOUT
       # -v, so a skip there prints nothing and the package still reports
       # `ok`. That is exactly how the celeris#656 leak shipped with no cover.
-      # ./engine/iouring runs with -v in its own step, at 8 MiB; these need
+      # ./internal/engine/iouring runs with -v in its own step, at 8 MiB; these need
       # memlock raised. These are the celeris#662 tests -- the linger
       # (T1-T3, T5, T6), its negative controls (N1, N2), the io_uring accept
       # re-arm during a linger (T7 and its unit twin), and the
@@ -420,7 +420,7 @@ jobs:
       # instead of polling every millisecond.
       #
       # It runs even when a step above failed, like the two before it: a
-      # red engine/iouring step (celeris#691, pre-existing) must not hide
+      # red internal/engine/iouring step (celeris#691, pre-existing) must not hide
       # whether the celeris#662 tests pass.
       - name: celeris#662 pause linger tests (skipping forbidden)
         if: ${{ !cancelled() }}
@@ -437,7 +437,7 @@ jobs:
           names="${both}|${iouringonly}"
           want=$(( 2 * $(tr '|' '\n' <<<"$both" | wc -l) + $(tr '|' '\n' <<<"$iouringonly" | wc -l) ))
           go test -race -count=1 -timeout=600s -v -run "^(${names})\$" \
-            ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/linger662.log
+            ./internal/engine/epoll/ ./internal/engine/iouring/ 2>&1 | tee /tmp/linger662.log
           ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/linger662.log || true)
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/linger662.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/linger662.log || true)
@@ -453,7 +453,7 @@ jobs:
       # also sets TCP_SYNCNT=1 there. T4 proves the guard serves them and N3
       # proves the loss without it. Both skip at any other value, so this
       # step sets the sysctl (restored on exit) and forbids the skip. It runs
-      # even when a step above failed: the engine/iouring step's allow-list
+      # even when a step above failed: the internal/engine/iouring step's allow-list
       # leaves these two to this step.
       - name: celeris#662 tcp_synack_retries=0 guard (skipping forbidden)
         if: ${{ !cancelled() }}
@@ -472,7 +472,7 @@ jobs:
           names='TestPauseAcceptServesDeferredIdleConnectionsSynackRetriesZero|TestPauseAcceptNoGuardLosesAtSynackRetriesZero'
           want=$(( 2 * $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/synack662.log
+            ./internal/engine/epoll/ ./internal/engine/iouring/ 2>&1 | tee /tmp/synack662.log
           ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/synack662.log || true)
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/synack662.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/synack662.log || true)
@@ -781,7 +781,7 @@ jobs:
           : > /tmp/c721.log
           failed=0
           go test -race -count=1 -timeout=300s -v -run '^(TestConnParamsAndPeerAddress|TestConnIPConcurrentCalls|TestPeerAddrParsesEngineForms|TestWaitUpOrStoppedReturnsWhenStartFails)$' ./middleware/websocket/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run '^TestWaitUpOrStoppedReturnsWhenStartFails$' ./middleware/sse/ ./engine/epoll/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run '^TestWaitUpOrStoppedReturnsWhenStartFails$' ./middleware/sse/ ./internal/engine/epoll/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^(TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError)$' . 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run '^TestWaitServerStartedMiddlewareFailsFastOnStartError$' ./middleware/ 2>&1 | tee -a /tmp/c721.log || failed=$((failed + 1))
           tests='TestConnParamsAndPeerAddress|TestConnIPConcurrentCalls|TestPeerAddrParsesEngineForms|TestWaitUpOrStoppedReturnsWhenStartFails|TestWaitServerStartedFailsFastOnStartError|TestWaitServerStartedExtFailsFastOnStartError|TestWaitServerStartedMiddlewareFailsFastOnStartError'
@@ -827,9 +827,9 @@ jobs:
       # goroutine must not take the conn's loop or worker with it. The panic's
       # recover used to leave cs.detachMu locked, and closeConn then waited on
       # it forever; a Goexit left the conn owned by a goroutine that no longer
-      # existed. The root race step above runs ./engine/epoll, ./engine/std
+      # existed. The root race step above runs ./internal/engine/epoll, ./internal/engine/std
       # and the root package without -v, where a test that stops running says
-      # nothing, and the engine/iouring step counts no name of these. So the
+      # nothing, and the internal/engine/iouring step counts no name of these. So the
       # eighteen run here by name, with CELERIS_REQUIRE_IOURING_WORKERS=1 and
       # an exact tally: the panic, Goexit, handler-error (control),
       # Detach-then-panic and Detach-then-Goexit arms of io_uring and epoll
@@ -856,9 +856,9 @@ jobs:
           epoll='TestEpollAsyncHandlerPanicLeavesItsWorkerServing|TestEpollAsyncHandlerGoexitLeavesItsWorkerServing|TestEpollAsyncHandlerErrorLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenPanicLeavesItsWorkerServing|TestEpollAsyncHandlerDetachThenGoexitLeavesItsWorkerServing'
           std='TestStdHandlerPanicLeavesTheEngineServing|TestStdHandlerGoexitLeavesTheEngineServing'
           server='TestServerAsyncRouteGoexitOnEpoll|TestServerAsyncRouteGoexitOnIOUring|TestServerAsyncRouteDetachThenGoexitOnEpoll|TestServerAsyncRouteDetachThenGoexitOnIOUring|TestServerAsyncRoutePanicOnEpoll|TestServerAsyncRoutePanicOnIOUring'
-          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
-          go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${uring})\$" ./internal/engine/iouring/ 2>&1 | tee /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${epoll})\$" ./internal/engine/epoll/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${std})\$" ./internal/engine/std/ 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
           go test -race -count=1 -timeout=300s -v -run "^(${server})\$" . 2>&1 | tee -a /tmp/c791.log || failed=$((failed + 1))
           names="${uring}|${epoll}|${std}|${server}"
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
@@ -874,7 +874,7 @@ jobs:
           fi
       # celeris#905: a stopped engine must leave no thread pinned to one CPU.
       # The root step runs the epoll test without -v, where a skip prints
-      # nothing, and job `adaptive` and the engine/iouring step above count
+      # nothing, and job `adaptive` and the internal/engine/iouring step above count
       # no test of it by name. So the three tests run here by name: epoll and
       # io_uring at the runner's 8 MiB memlock (one io_uring worker), then
       # adaptive with memlock raised and CELERIS_REQUIRE_UPSWITCH=1, as job
@@ -896,10 +896,10 @@ jobs:
           failed=0
           engines='TestStoppedEngineLeavesNoPinnedThread'
           adaptive='TestStoppedAdaptiveEngineLeavesNoPinnedThread'
-          go test -race -count=1 -timeout=300s -v -run "^(${engines})\$" ./engine/epoll/ ./engine/iouring/ 2>&1 | tee /tmp/c905.log || failed=$((failed + 1))
+          go test -race -count=1 -timeout=300s -v -run "^(${engines})\$" ./internal/engine/epoll/ ./internal/engine/iouring/ 2>&1 | tee /tmp/c905.log || failed=$((failed + 1))
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           echo "memlock (KiB): $(ulimit -l)"
-          CELERIS_REQUIRE_UPSWITCH=1 go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./adaptive/ 2>&1 | tee -a /tmp/c905.log || failed=$((failed + 1))
+          CELERIS_REQUIRE_UPSWITCH=1 go test -race -count=1 -timeout=300s -v -run "^(${adaptive})\$" ./internal/adaptive/ 2>&1 | tee -a /tmp/c905.log || failed=$((failed + 1))
           passed=$(grep -cE "^--- PASS: (${engines}|${adaptive}) \(" /tmp/c905.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c905.log || true)
           results=$(grep -cE 'celeris905 RESULT engine=(epoll|io_uring|adaptive) ' /tmp/c905.log || true)
@@ -914,7 +914,7 @@ jobs:
           fi
 
   adaptive:
-    name: Adaptive engine (./adaptive/...)
+    name: Adaptive engine (./internal/adaptive/...)
     runs-on: ubuntu-latest
     # 30, not 20, since celeris#657 PR-3 un-quarantined TestBidirectionalFlapAsync
     # (three promote/revert flaps over 64 loaded keep-alives) into the first step.
@@ -1010,7 +1010,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=900s -v \
             -skip '^(TestRampH1Sync|TestRampH1Async)$' \
-            ./adaptive/... 2>&1 | tee /tmp/adaptive-race.log
+            ./internal/adaptive/... 2>&1 | tee /tmp/adaptive-race.log
           t4='TestFlapConnsPerRing'
           ran=$(grep -cE "^=== RUN   ${t4}\$" /tmp/adaptive-race.log || true)
           passed=$(grep -cE "^--- PASS: ${t4} \(" /tmp/adaptive-race.log || true)
@@ -1071,7 +1071,7 @@ jobs:
           names='TestAdaptiveAsyncHandlerPanicLeavesTheStartEngineServing|TestAdaptiveAsyncHandlerPanicOnAnAdoptedConnLeavesItsWorkerServing'
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./adaptive/ 2>&1 | tee /tmp/c791a.log
+            ./internal/adaptive/ 2>&1 | tee /tmp/c791a.log
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c791a.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c791a.log || true)
           stopped=$(grep -cE 'celeris791 RESULT engine=adaptive shape=(start|adopted) .* stopped=true$' /tmp/c791a.log || true)
@@ -1086,7 +1086,7 @@ jobs:
       # which the io_uring -> epoll hand-off lost requests: every connection
       # on ONE io_uring ring. This step does not raise memlock. At the
       # runner's own 8 MiB io_uring is capped to one worker (12 MiB per
-      # worker, engine/iouring/ring.go minMemlockPerWorker), and the step
+      # worker, internal/engine/iouring/ring.go minMemlockPerWorker), and the step
       # requires at least one "io_uring engine listening" line and every one
       # to read workers=1, so a runner that funds more workers fails here
       # instead of silently testing another shape.
@@ -1113,7 +1113,7 @@ jobs:
           names='TestReverseTransplant|TestBidirectionalFlap'
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./adaptive/ 2>&1 | tee /tmp/revert657.log
+            ./internal/adaptive/ 2>&1 | tee /tmp/revert657.log
           ran=$(grep -cE "^=== RUN   (${names})\$" /tmp/revert657.log || true)
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/revert657.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/revert657.log || true)
@@ -1153,7 +1153,7 @@ jobs:
           names='TestAdaptivePortHeldFromNewToListen616|TestAdaptivePortHeldThroughListenStart616|TestAdaptivePortHoldRefusesDials616|TestAdaptivePortHoldReleasedOnceBound616|TestAdaptiveShutdownWithoutListenFreesPort616|TestAdaptivePortHeldWildcard616|TestAdaptivePortHeldBesideTimeWait616|TestAdaptiveTimeWaitStealFailsLoudly616|TestAdaptiveNoHoldOnlyWhereNetListenFails616|TestAdaptivePortHoldKind616|TestAdaptiveAddrMatchesNetListen616'
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) ))
           go test -race -count=1 -timeout=300s -v -run "^(${names})\$" \
-            ./adaptive/ 2>&1 | tee /tmp/c616.log
+            ./internal/adaptive/ 2>&1 | tee /tmp/c616.log
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/c616.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/c616.log || true)
           gap=$(grep -cE 'celeris616 result: start=(epoll|iouring) thief=(go-listener|bare-socket) steal_in_gap_refused=true started=true ' /tmp/c616.log || true)
@@ -1170,7 +1170,7 @@ jobs:
           fi
 
   iouring:
-    name: io_uring init-failure regression (./engine/iouring)
+    name: io_uring init-failure regression (./internal/engine/iouring)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1182,9 +1182,9 @@ jobs:
           go-version: "1.27.0"
       # celeris#656: the three tests that pin the failed-worker listen-socket
       # leak ask for TWO io_uring workers on one port, and RLIMIT_MEMLOCK funds
-      # one per 12 MiB (engine/iouring/ring.go minMemlockPerWorker). GitHub
+      # one per 12 MiB (internal/engine/iouring/ring.go minMemlockPerWorker). GitHub
       # -hosted runners default to 8 MiB, so in the `unit` job -- which runs
-      # ./engine/iouring without raising memlock and without -v -- all three
+      # ./internal/engine/iouring without raising memlock and without -v -- all three
       # skipped silently and the leak shipped with no CI cover.
       #
       # Same two ingredients as the `adaptive` job (celeris#641): raise memlock
@@ -1193,7 +1193,7 @@ jobs:
       # init_failure_leak_linux_test.go becomes a failure.
       #
       # Scoped to those tests by -run rather than running the whole package
-      # here: the rest of ./engine/iouring keeps running in `unit` at the
+      # here: the rest of ./internal/engine/iouring keeps running in `unit` at the
       # runner's own memlock, the shape it has been green in.
       #
       # `-run` is a regex over test names, so a rename would quietly select
@@ -1209,7 +1209,7 @@ jobs:
           echo "memlock (KiB): $(ulimit -l)"
           go test -race -count=1 -timeout=600s -v \
             -run '^TestListenCloses(ListenSocketsWhenEveryWorkerRingSetupFails|ListenSocketWhenOneWorkerRingSetupFails|ListenSocketRingAndEventfdWhenInitialSubmitFails)$' \
-            ./engine/iouring/ 2>&1 | tee /tmp/iouring656.log
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/iouring656.log
           passed=$(grep -cE '^--- PASS: TestListenCloses' /tmp/iouring656.log || true)
           echo "celeris#656 tests passed: $passed"
           if [ "$passed" -ne 3 ]; then
@@ -1247,7 +1247,7 @@ jobs:
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           go test -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/driver691.log
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/driver691.log
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/driver691.log || true)
           failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/driver691.log || true)
           skipped=$(grep -cE '^[[:space:]]*--- SKIP' /tmp/driver691.log || true)
@@ -1354,7 +1354,7 @@ jobs:
           run zcoff CELERIS587_ZC_WINDOW_HOLD=2ms CELERIS_IOURING_SEND_ZC=off
           python3 .github/scripts/mutant-587-unlock-zc-first-cqe.py
           run mutant CELERIS587_ZC_WINDOW_HOLD=2ms
-          git checkout -- engine/iouring/worker.go
+          git checkout -- internal/engine/iouring/worker.go
           grep -h -A30 'WARNING: DATA RACE' /tmp/zc587-mutant-1.log | head -60 || true
           ok=0
           tally fixed pass || ok=1
@@ -1418,7 +1418,7 @@ jobs:
           runs=5
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           go test -tags=validation -race -count="$runs" -timeout=600s -v -run "^(${names})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/recvtheft685.log || true
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/recvtheft685.log || true
           grep -E 'RECVTHEFT(715|685) .*result' /tmp/recvtheft685.log || true
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/recvtheft685.log || true)
           failed=$(grep -cE '^[[:space:]]*--- FAIL' /tmp/recvtheft685.log || true)
@@ -1457,7 +1457,7 @@ jobs:
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           wantsub=$(( 5 * runs ))
           go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/zc798.log || true
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/zc798.log || true
           grep -E 'celeris798 ' /tmp/zc798.log || true
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc798.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc798.log || true)
@@ -1495,7 +1495,7 @@ jobs:
           want=$(( $(tr '|' '\n' <<<"$names" | wc -l) * runs ))
           wantsub=$(( 24 * runs ))
           go test -race -count="$runs" -timeout=300s -v -run "^(${names})\$" \
-            ./engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
+            ./internal/engine/iouring/ 2>&1 | tee /tmp/zc812.log || true
           grep -E 'celeris812 ' /tmp/zc812.log || true
           passed=$(grep -cE "^--- PASS: (${names}) \(" /tmp/zc812.log || true)
           subpassed=$(grep -cE "^    --- PASS: (${names})/" /tmp/zc812.log || true)
@@ -1526,8 +1526,8 @@ jobs:
           runs=3
           log=/tmp/zc812-mutant.log
           go test -race -count="$runs" -timeout=300s -v -run '^TestBackstopHoldsASendBufferAZCNotificationStillReads$' \
-            ./engine/iouring/ 2>&1 | tee "$log" || true
-          git checkout -- engine/iouring/worker.go
+            ./internal/engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- internal/engine/iouring/worker.go
           bad=0
           for c in notif-only recv-and-notif send-done-after-close detached-notif-only; do
             lines=$(grep -cE "celeris812 backstop case=$c " "$log" || true)
@@ -1567,8 +1567,8 @@ jobs:
           log=/tmp/recvtheft685-mutant.log
           go test -tags=validation -race -count="$runs" -timeout=600s -v \
             -run "^(TestRecvTheft715ArmA|TestRecvTheft715ArmAHole|TestRecvTheft685Linked|TestRecvTheft685LinkedHole|TestRecvTheft685HijackMultishotCoop|${others})\$" \
-            ./engine/iouring/ 2>&1 | tee "$log" || true
-          git checkout -- engine/iouring/fd_lifetime.go
+            ./internal/engine/iouring/ 2>&1 | tee "$log" || true
+          git checkout -- internal/engine/iouring/fd_lifetime.go
           grep -E 'RECVTHEFT(715|685) .*result' "$log" || true
           bad=0
           # judged <test> <its result line> <the detection that line must report>

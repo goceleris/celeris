@@ -261,7 +261,7 @@ func TestHijackCopiesRequestValuesUnderMultishotRecv(t *testing.T) {
 	// trip, so one receive, and one ring buffer, per request.
 	// CELERIS_IOURING_PBUF_COUNT is unset, so the worker sizes the ring to
 	// twice its default conns per worker, raised to bufRingCountMin: 1024
-	// buffers (engine/iouring resolveBufRingCount). Twice that many requests
+	// buffers (internal/engine/iouring resolveBufRingCount). Twice that many requests
 	// cycle it twice.
 	b, br := c733DialWorker(t, addr, h.worker, c733Secret)
 	defer func() { _ = b.Close() }()

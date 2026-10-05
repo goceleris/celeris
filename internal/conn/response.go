@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goceleris/celeris/protocol/h2/frame"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/frame"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 
 	"golang.org/x/net/http2"
 )

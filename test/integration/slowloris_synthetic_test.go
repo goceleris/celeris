@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/engine/epoll"
-	"github.com/goceleris/celeris/engine/iouring"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/epoll"
+	"github.com/goceleris/celeris/internal/engine/iouring"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 // TestSlowlorisSynthetic is the focused per-engine reproducer for the

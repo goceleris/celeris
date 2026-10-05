@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // TestStartWithContextShutsDownWhenListenReturnsFirst pins celeris#673.

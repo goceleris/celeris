@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 func TestH2CLifecycle(t *testing.T) {

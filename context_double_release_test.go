@@ -3,7 +3,7 @@ package celeris
 import (
 	"testing"
 
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // TestReleaseContextIsIdempotent is the celeris#512 regression guard.

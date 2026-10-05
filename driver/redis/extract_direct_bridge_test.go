@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/goceleris/celeris/driver/redis/protocol"
+	"github.com/goceleris/celeris/internal/driver/redis/protocol"
 )
 
 // TestDispatch_BridgeTypedRequest_TakesExtractDirect verifies the

@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
 )
 
 // ResponseRecorder captures the response written by a handler.

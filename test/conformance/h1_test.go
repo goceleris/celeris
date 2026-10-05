@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 func testBasicMethods(t *testing.T, ef EngineFactory, proto engine.Protocol) {

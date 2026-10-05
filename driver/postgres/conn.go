@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/goceleris/celeris/driver/internal/async"
-	"github.com/goceleris/celeris/driver/postgres/protocol"
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris/internal/driver/postgres/protocol"
+	"github.com/goceleris/celeris/internal/engine"
 )
 
 // maxDirectResultBytes is the per-query result buffer cap in direct mode.

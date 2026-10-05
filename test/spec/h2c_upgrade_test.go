@@ -15,8 +15,8 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 
-	"github.com/goceleris/celeris/engine"
-	"github.com/goceleris/celeris/resource"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/resource"
 )
 
 // ---------- H2C test helpers ----------
