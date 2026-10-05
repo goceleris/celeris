@@ -62,11 +62,21 @@ type worker struct {
 
 	mu    sync.RWMutex
 	conns map[int]*driverConn // fd -> state (protected by mu)
+	// gen is the generation of the last registration on this worker
+	// (protected by mu). Each RegisterConn takes the next one, never 0, so
+	// the count wraps after 2^32-1 registrations. An event reaches the wrong
+	// conn only if the conn now registered on its number has the event's
+	// generation: a multiple of 2^32-1 registrations on this worker would
+	// have to come between the event's registration and that conn's, while
+	// the event is still waiting to be dispatched.
+	gen uint32
 
-	// pending holds FDs whose outbound buffers have fresh bytes. Writers
-	// append, the worker goroutine drains. Access guarded by pendingMu.
+	// pending holds the conns whose outbound buffers have fresh bytes.
+	// Writers append, the worker goroutine drains. Access guarded by
+	// pendingMu. It holds conns, not fd numbers, so a flush queued for a
+	// conn that has gone can never act on a conn that took its number.
 	pendingMu sync.Mutex
-	pending   []int
+	pending   []*driverConn
 
 	closed atomic.Bool
 	events []unix.EpollEvent
@@ -90,7 +100,15 @@ type worker struct {
 // goroutine, which reads for every conn on it, must not wait for one conn's
 // writer.
 type driverConn struct {
-	fd      int
+	fd int
+	// gen is the generation of this registration of fd, unique on the
+	// worker. Every epoll_event of the registration carries it in Pad (the
+	// ADD and every MOD; see epollEvent), and the worker dispatches an event
+	// only to the conn whose gen it carries: an event the worker collected
+	// for a conn that has since been unregistered must not reach the conn
+	// that took its number (celeris#842). Set before the conn is published,
+	// then read-only.
+	gen     uint32
 	onRecv  func([]byte)
 	onClose func(error)
 
@@ -129,6 +147,11 @@ var testHookBeforeRead func(fd int)
 // clears it after the worker is shut down.
 var testHookBeforeAdd func(fd int)
 
+// testHookDroppedEvent, when non-nil, runs on the worker goroutine for each
+// event it drops because the event's registration has ended. Tests only
+// (celeris#842): set before the worker is created, cleared after Close.
+var testHookDroppedEvent func(fd int, events uint32)
+
 // readOpen reads c.fd into buf unless c has been torn down, in which case it
 // returns engine.ErrUnknownFD without reading. The closed check and the read
 // are one critical section under c.rmu, a lock every teardown takes to set
@@ -166,6 +189,16 @@ func (c *driverConn) markClosed() (already bool) {
 	return already
 }
 
+// epollEvent returns the epoll_event for c's registration with the given
+// interest: the number in Fd, and the registration's generation in Pad,
+// which the kernel hands back with each event it reports for fd. Every
+// EPOLL_CTL_ADD and EPOLL_CTL_MOD of a conn uses it: a MOD replaces the whole
+// event data, and one without the generation would make the worker drop
+// every later event of the conn (celeris#842).
+func (c *driverConn) epollEvent(events uint32) unix.EpollEvent {
+	return unix.EpollEvent{Events: events, Fd: int32(c.fd), Pad: int32(c.gen)}
+}
+
 // setEvents sets c's epoll interest to EPOLLET|EPOLLRDHUP, plus EPOLLIN when
 // in is set and EPOLLOUT while it is armed, unless c has been torn down. The
 // EPOLL_CTL_MOD is issued by number, so it goes under c.mu after the closed
@@ -183,10 +216,8 @@ func (c *driverConn) setEvents(epfd int, in bool) {
 		if c.epollOut {
 			ev |= unix.EPOLLOUT
 		}
-		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{
-			Events: ev,
-			Fd:     int32(c.fd),
-		})
+		e := c.epollEvent(ev)
+		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_MOD, c.fd, &e)
 	}
 	c.mu.Unlock()
 }
@@ -320,6 +351,13 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 		w.mu.Unlock()
 		return ErrAlreadyRegistered
 	}
+	// The registration's generation, set before the conn is published
+	// (celeris#842). worker.gen says what its wrap would take to misdeliver.
+	w.gen++
+	if w.gen == 0 { // 0 never names a registration
+		w.gen = 1
+	}
+	c.gen = w.gen
 	// In the map before the ADD: the worker looks conns up under w.mu, and an
 	// edge it found no conn for would be lost.
 	w.conns[fd] = c
@@ -345,10 +383,8 @@ func (w *worker) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) 
 	var err error
 	c.mu.Lock()
 	if !c.closed {
-		err = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-			Fd:     int32(fd),
-		})
+		ev := c.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+		err = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_ADD, fd, &ev)
 		if err != nil {
 			// Not registered: marked closed here, under c.mu, so no
 			// teardown fires onClose for it, and the loop never uses fd's
@@ -464,7 +500,7 @@ func (w *worker) Write(fd int, data []byte) error {
 		return err
 	}
 	if pending {
-		w.enqueueFlush(fd)
+		w.enqueueFlush(c)
 	}
 	return nil
 }
@@ -485,10 +521,8 @@ func (w *worker) flushLocked(c *driverConn) error {
 			}
 			if isEAGAIN(err) {
 				if !c.epollOut {
-					modErr := unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{
-						Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLET | unix.EPOLLRDHUP,
-						Fd:     int32(c.fd),
-					})
+					ev := c.epollEvent(unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLET | unix.EPOLLRDHUP)
+					modErr := unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_MOD, c.fd, &ev)
 					if modErr == nil {
 						c.epollOut = true
 					}
@@ -508,20 +542,18 @@ func (w *worker) flushLocked(c *driverConn) error {
 	c.writeBuf = c.writeBuf[:0]
 	c.writePos = 0
 	if c.epollOut {
-		_ = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,
-			Fd:     int32(c.fd),
-		})
+		ev := c.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+		_ = unix.EpollCtl(w.epollFD, unix.EPOLL_CTL_MOD, c.fd, &ev)
 		c.epollOut = false
 	}
 	return nil
 }
 
-// enqueueFlush appends fd to the worker's pending list and wakes the
+// enqueueFlush appends c to the worker's pending list and wakes the
 // goroutine so it retries the write when the socket is writable.
-func (w *worker) enqueueFlush(fd int) {
+func (w *worker) enqueueFlush(c *driverConn) {
 	w.pendingMu.Lock()
-	w.pending = append(w.pending, fd)
+	w.pending = append(w.pending, c)
 	w.pendingMu.Unlock()
 	w.wake()
 }
@@ -621,7 +653,7 @@ func (w *worker) WriteAndPoll(fd int, data []byte, rbuf []byte, onRecv func([]by
 		return false, werr
 	}
 	if pending {
-		w.enqueueFlush(fd)
+		w.enqueueFlush(c)
 	}
 
 	// Step 2: Take recvMu so any in-flight handleReadable (from a prior
@@ -811,7 +843,7 @@ func (w *worker) WriteAndPollBusy(fd int, data []byte, rbuf []byte, onRecv func(
 		return false, werr
 	}
 	if pending {
-		w.enqueueFlush(fd)
+		w.enqueueFlush(c)
 	}
 
 	// Step 2: Mask EPOLLIN under recvMu.
@@ -1007,7 +1039,7 @@ func (w *worker) WriteAndPollMulti(fd int, data []byte, rbuf []byte, onRecv func
 		return false, werr
 	}
 	if pending {
-		w.enqueueFlush(fd)
+		w.enqueueFlush(c)
 	}
 
 	// Step 2: Mask EPOLLIN.
@@ -1152,8 +1184,7 @@ func (w *worker) run(ctx context.Context) {
 		}
 		for i := 0; i < n; i++ {
 			ev := w.events[i]
-			fd := int(ev.Fd)
-			if fd == efd {
+			if int(ev.Fd) == efd {
 				var sink [8]byte
 				for {
 					if _, rerr := unix.Read(efd, sink[:]); rerr != nil {
@@ -1162,26 +1193,52 @@ func (w *worker) run(ctx context.Context) {
 				}
 				continue
 			}
-			if ev.Events&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) != 0 {
-				w.handleReadable(fd, ev.Events)
-			}
-			if ev.Events&unix.EPOLLOUT != 0 {
-				w.handleWritable(fd)
-			}
+			w.dispatch(ev)
 		}
 		w.drainPending()
 	}
 }
 
-// handleReadable drains readable data from fd and invokes onRecv. A zero-byte
-// read (EOF) or an error triggers the close path with the matching error.
-func (w *worker) handleReadable(fd int, events uint32) {
+// dispatch hands one epoll event of a driver conn to the conn it was
+// collected for. The event names that conn by its number (Fd) and by the
+// generation of its registration (Pad). An event the worker collected before
+// the conn was unregistered or torn down is dispatched after it, and by then
+// the number may be registered again, by the conn that took it: that conn has
+// another generation, so the event is dropped instead of being applied to it
+// (celeris#842). Read first, then flush: a peer may send and close at once.
+func (w *worker) dispatch(ev unix.EpollEvent) {
+	fd := int(ev.Fd)
+	c := w.connFor(fd, uint32(ev.Pad))
+	if c == nil {
+		if h := testHookDroppedEvent; h != nil {
+			h(fd, ev.Events)
+		}
+		return
+	}
+	if ev.Events&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) != 0 {
+		w.handleReadable(c, ev.Events)
+	}
+	if ev.Events&unix.EPOLLOUT != 0 {
+		w.drainOne(c)
+	}
+}
+
+// connFor returns the conn registered on fd if it is the registration gen
+// names, or nil: the conn has gone, or another conn has registered the
+// number since.
+func (w *worker) connFor(fd int, gen uint32) *driverConn {
 	w.mu.RLock()
 	c, ok := w.conns[fd]
 	w.mu.RUnlock()
-	if !ok {
-		return
+	if !ok || c.gen != gen {
+		return nil
 	}
+	return c
+}
+
+// handleReadable drains readable data from c and invokes onRecv. A zero-byte
+// read (EOF) or an error triggers the close path with the matching error.
+func (w *worker) handleReadable(c *driverConn, events uint32) {
 	// Serialize with WriteAndPoll's caller-side reads so the protocol
 	// state machine (driven by onRecv) is never entered concurrently.
 	c.recvMu.Lock()
@@ -1222,13 +1279,8 @@ func (w *worker) handleReadable(fd int, events uint32) {
 	}
 }
 
-// handleWritable retries a pending flush when the socket reports writable.
-func (w *worker) handleWritable(fd int) {
-	w.drainOne(fd)
-}
-
-// drainPending processes fds queued by Write after an EAGAIN or by
-// enqueueFlush. A fresh backing array is installed under pendingMu so
+// drainPending processes the conns queued by enqueueFlush after a flush
+// stopped at EAGAIN. A fresh backing array is installed under pendingMu so
 // concurrent enqueueFlush appends don't race with the worker's iteration
 // over the snapshot.
 func (w *worker) drainPending() {
@@ -1236,19 +1288,14 @@ func (w *worker) drainPending() {
 	list := w.pending
 	w.pending = nil
 	w.pendingMu.Unlock()
-	for _, fd := range list {
-		w.drainOne(fd)
+	for _, c := range list {
+		w.drainOne(c)
 	}
 }
 
-// drainOne flushes pending bytes for a single fd under c.mu.
-func (w *worker) drainOne(fd int) {
-	w.mu.RLock()
-	c, ok := w.conns[fd]
-	w.mu.RUnlock()
-	if !ok {
-		return
-	}
+// drainOne flushes c's pending bytes under c.mu, on EPOLLOUT or from the
+// pending list, unless c has been torn down.
+func (w *worker) drainOne(c *driverConn) {
 	c.mu.Lock()
 	if c.closing || c.closed {
 		c.mu.Unlock()
