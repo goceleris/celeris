@@ -187,10 +187,10 @@ func c936FindSocketFD(inode string) (int, []string) {
 		if err != nil {
 			continue
 		}
-		switch {
-		case link == "socket:["+inode+"]":
+		switch link {
+		case "socket:[" + inode + "]":
 			fd = n
-		case link == "anon_inode:[eventpoll]":
+		case "anon_inode:[eventpoll]":
 			epfds = append(epfds, n)
 		}
 	}
