@@ -6,7 +6,7 @@ const ProtocolText Protocol = 0
 func NewClient(string, ...Option) (*Client, error)
 func NewClusterClient(ClusterConfig) (*ClusterClient, error)
 func WithDialTimeout(time.Duration) Option
-func WithEngine(github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider) Option
+func WithEngine(ServerProvider) Option
 func WithHealthCheckInterval(time.Duration) Option
 func WithMaxIdlePerWorker(int) Option
 func WithMaxIdleTime(time.Duration) Option
@@ -33,7 +33,7 @@ method (*Client) Gets(context.Context, string) (CASItem, error)
 method (*Client) IdleConnWorkers() []int
 method (*Client) Incr(context.Context, string, uint64) (uint64, error)
 method (*Client) Ping(context.Context) error
-method (*Client) PoolStats() github.com/goceleris/celeris/driver/internal/async.PoolStats
+method (*Client) PoolStats() PoolStats
 method (*Client) Prepend(context.Context, string, string) error
 method (*Client) Protocol() Protocol
 method (*Client) Replace(context.Context, string, any, time.Duration) error
@@ -84,7 +84,7 @@ type ClusterClient struct
 type ClusterConfig struct
 type ClusterConfig struct, Addrs []string
 type ClusterConfig struct, DialTimeout time.Duration
-type ClusterConfig struct, Engine github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
+type ClusterConfig struct, Engine ServerProvider
 type ClusterConfig struct, FailureThreshold uint32
 type ClusterConfig struct, HealthProbeInterval time.Duration
 type ClusterConfig struct, MaxFailoverHops int
@@ -95,7 +95,7 @@ type ClusterConfig struct, Weights []uint32
 type Config struct
 type Config struct, Addr string
 type Config struct, DialTimeout time.Duration
-type Config struct, Engine github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
+type Config struct, Engine ServerProvider
 type Config struct, HealthCheckInterval time.Duration
 type Config struct, MaxIdlePerWorker int
 type Config struct, MaxIdleTime time.Duration
@@ -112,7 +112,10 @@ type NodeStats struct, ConsecFails int32
 type NodeStats struct, Failing bool
 type NodeStats struct, LastFailAt time.Time
 type Option func(*Config)
+type PoolStats = github.com/goceleris/celeris/driver/internal/async.PoolStats
+type PoolWorkerStats = github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats
 type Protocol uint8
+type ServerProvider = github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider
 var ErrCASConflict error
 var ErrCacheMiss error
 var ErrClosed error
@@ -122,6 +125,8 @@ var ErrNoNodes error
 var ErrNotStored error
 var ErrPoolExhausted error
 var ErrProtocol error
+var ErrQueueFull error
+var ErrUnknownFD error
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, Idle int
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct, InUse int
@@ -130,4 +135,12 @@ exposed type github.com/goceleris/celeris/driver/internal/async.PoolStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct
 exposed type github.com/goceleris/celeris/driver/internal/async.PoolWorkerStats struct, Idle int
 exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider interface
-exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider interface, EventLoopProvider() github.com/goceleris/celeris/engine.EventLoopProvider
+exposed type github.com/goceleris/celeris/driver/internal/eventloop.ServerProvider interface, EventLoopProvider() github.com/goceleris/celeris/internal/engine.EventLoopProvider
+exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface
+exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, NumWorkers() int
+exposed type github.com/goceleris/celeris/internal/engine.EventLoopProvider interface, WorkerLoop(int) github.com/goceleris/celeris/internal/engine.WorkerLoop
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, CPUID() int
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, RegisterConn(int, func([]byte), func(error)) error
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, UnregisterConn(int) error
+exposed type github.com/goceleris/celeris/internal/engine.WorkerLoop interface, Write(int, []byte) error
