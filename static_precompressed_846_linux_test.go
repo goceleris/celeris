@@ -98,7 +98,7 @@ func TestStaticPrecompressedRangeOnEveryEngine846(t *testing.T) {
 					var lm1, etag1 string
 					type step struct {
 						name, method string
-						hdr          map[string]string
+						hdr          func() map[string]string
 						status       int
 						crange       string
 						want         []byte
@@ -107,12 +107,17 @@ func TestStaticPrecompressedRangeOnEveryEngine846(t *testing.T) {
 						before       func()
 						after        func(h http.Header)
 					}
-					gzip := func(kv ...string) map[string]string {
-						m := map[string]string{"Accept-Encoding": "gzip"}
-						for i := 0; i+1 < len(kv); i += 2 {
-							m[kv[i]] = kv[i+1]
+					// A header value "{lm1}" or "{etag1}" is replaced when the step runs
+					// by the validator the server gave in the first download, so a step
+					// can carry what a real client would hold.
+					gzip := func(kv ...string) func() map[string]string {
+						return func() map[string]string {
+							m := map[string]string{"Accept-Encoding": "gzip"}
+							for i := 0; i+1 < len(kv); i += 2 {
+								m[kv[i]] = strings.NewReplacer("{lm1}", lm1, "{etag1}", etag1).Replace(kv[i+1])
+							}
+							return m
 						}
-						return m
 					}
 					steps := []step{
 						{name: "variant", method: "GET", hdr: gzip(), status: 200, want: gz1, ce: "gzip", vary: true,
@@ -129,14 +134,17 @@ func TestStaticPrecompressedRangeOnEveryEngine846(t *testing.T) {
 							status: 416, crange: fmt.Sprintf("bytes */%d", gz1Size)},
 						{name: "after-416-same-conn", method: "GET", hdr: gzip(), status: 200, want: gz1, ce: "gzip", vary: true},
 						{name: "not-modified", method: "GET", hdr: gzip("If-None-Match", weak(gz1Time, gz1Size)), status: 304, vary: true},
-						{name: "identity-resume", method: "GET", hdr: map[string]string{"Range": "bytes=70000-", "If-Range": date(origTime)},
-							status: 206, crange: fmt.Sprintf("bytes 70000-%d/%d", origSize-1, origSize), want: orig[70000:]},
-						{name: "resume-after-rebuild", method: "GET", hdr: gzip("Range", "bytes=1000-", "If-Range", date(gz1Time)),
+						{name: "identity-resume", method: "GET", hdr: func() map[string]string {
+							return map[string]string{"Range": "bytes=70000-", "If-Range": date(origTime)}
+						}, status: 206, crange: fmt.Sprintf("bytes 70000-%d/%d", origSize-1, origSize), want: orig[70000:]},
+						// Only the variant is rebuilt; the original keeps its mtime. The
+						// client resumes with what the server gave it for the variant.
+						{name: "resume-after-rebuild", method: "GET", hdr: gzip("Range", "bytes=1000-", "If-Range", "{lm1}"),
 							status: 200, want: gz2, ce: "gzip", vary: true,
 							before: func() { write("app.js.gz", gz2, gz2Time) }},
-						{name: "unsatisfiable-after-rebuild-stale-if-range", method: "GET", hdr: gzip("Range", "bytes=999999-", "If-Range", date(gz1Time)),
+						{name: "unsatisfiable-after-rebuild-stale-if-range", method: "GET", hdr: gzip("Range", "bytes=999999-", "If-Range", "{lm1}"),
 							status: 200, want: gz2, ce: "gzip", vary: true},
-						{name: "not-modified-of-the-old-variant", method: "GET", hdr: gzip("If-None-Match", weak(gz1Time, gz1Size)),
+						{name: "not-modified-of-the-old-variant", method: "GET", hdr: gzip("If-None-Match", "{etag1}"),
 							status: 200, want: gz2, ce: "gzip", vary: true},
 						{name: "range-of-the-new-variant", method: "GET", hdr: gzip("Range", "bytes=50000-"),
 							status: 206, crange: fmt.Sprintf("bytes 50000-%d/%d", gz2Size-1, gz2Size), want: gz2[50000:], ce: "gzip", vary: true},
@@ -154,7 +162,7 @@ func TestStaticPrecompressedRangeOnEveryEngine846(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						for k, v := range st.hdr {
+						for k, v := range st.hdr() {
 							hr.Header.Set(k, v)
 						}
 						resp, err := cl.Do(hr)
