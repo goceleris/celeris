@@ -63,7 +63,11 @@ func flapConvergesPoll(t *testing.T, h stream.Handler, async bool) {
 			dir = "revert"
 		}
 		before := subActive(e, srcIOU)
-		e.ForceSwitch()
+		if toIOUring {
+			forceSwitchTo(t, e, engine.IOUring)
+		} else {
+			forceSwitchTo(t, e, engine.Epoll)
+		}
 		convergedMs, atBound, trace := pollActive(func() int64 { return subActive(e, srcIOU) }, 2, bound)
 		time.Sleep(settle)
 		t.Logf("celeris657 FLAPPOLL async=%v flap=%d dir=%s before=%d converged_ms=%d at_%dms=%d "+
