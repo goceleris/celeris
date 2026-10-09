@@ -26,7 +26,7 @@ import (
 // newTestEngine spins up a single-worker epoll engine bound to a free
 // loopback port and returns the engine plus a stop func. The stream.Handler
 // is a no-op because the driver tests never dispatch an HTTP request.
-func newTestEngine(t *testing.T) (*Engine, func()) {
+func newTestEngine(t testing.TB) (*Engine, func()) {
 	t.Helper()
 
 	// Pick a free port via net.Listen, close it, and hand the address to
@@ -315,12 +315,11 @@ func TestDriverFDCollisionRejected(t *testing.T) {
 	eng, stop := newTestEngine(t)
 	defer stop()
 
-	// Dialing a real conn would force the worker to write l.conns[fd] on
-	// its own goroutine while this test reads it — a benign TOCTOU race
-	// in production but a race-detector failure under -race. Instead,
-	// plant a fake connState directly at a fd the worker never touches
-	// (our own socketpair half). This still exercises RegisterConn's
-	// HTTP-collision guard without racing with acceptAll/closeConn.
+	// This test checks the guard's verdict, not its synchronization (a real
+	// accept and close against RegisterConn are TestRegisterConnRacesCloseConn775
+	// and TestShutdownRacesRegisterConn775). So plant a fake connState directly
+	// at a fd the worker never touches (our own socketpair half), and write
+	// the slot with the worker's own lock discipline.
 	local, peer := socketpairNonblocking(t)
 	defer func() { _ = unix.Close(local) }()
 	defer func() { _ = unix.Close(peer) }()
@@ -329,9 +328,15 @@ func TestDriverFDCollisionRejected(t *testing.T) {
 	if local >= connTableSize {
 		t.Fatalf("socketpair fd %d exceeds connTableSize %d", local, connTableSize)
 	}
+	l.driverMu.Lock()
 	prev := l.conns[local]
 	l.conns[local] = &connState{fd: local}
-	defer func() { l.conns[local] = prev }()
+	l.driverMu.Unlock()
+	defer func() {
+		l.driverMu.Lock()
+		l.conns[local] = prev
+		l.driverMu.Unlock()
+	}()
 
 	err := eng.WorkerLoop(0).RegisterConn(local, func([]byte) {}, func(error) {})
 	if err == nil {

@@ -3594,6 +3594,18 @@ func (l *Loop) closeConn(fd int) {
 		l.removeH2Conn(fd)
 	}
 	_ = unix.EpollCtl(l.epollFD, unix.EPOLL_CTL_DEL, fd, nil)
+	// Clear the slot before the descriptor is closed, and under driverMu
+	// (celeris#775). The number is free to be reissued the moment the close
+	// returns, and a driver's RegisterConn on it reads this slot, under the
+	// same lock, from its own goroutine: written bare, that is a data race,
+	// and cleared after the close, a window in which the driver is refused
+	// ("already an HTTP connection") for a number that no longer is one. The
+	// slot is read on this thread only by checks keyed by cs (ask, sweep,
+	// the ownership re-check above), none of which runs between here and the
+	// close. One uncontended lock per close, on a path of several syscalls.
+	l.driverMu.Lock()
+	l.conns[fd] = nil
+	l.driverMu.Unlock()
 	// H1 close: SHUT_WR + Close. The shutdown call forces FIN regardless
 	// of the kernel recv-buffer state — important under slowloris where
 	// the peer is still writing drips and a plain Close on a non-empty
@@ -3619,7 +3631,6 @@ func (l *Loop) closeConn(fd int) {
 		_ = unix.Close(fd)
 	}
 	l.removeLiveConn(cs)
-	l.conns[fd] = nil
 	l.connCount--
 	l.activeConns.Add(-1)
 	l.closeCount.Add(1)
@@ -3730,12 +3741,19 @@ func (l *Loop) shutdown() {
 			continue
 		}
 		fd := cs.fd
+		// The slot goes first, under driverMu and around the slot write
+		// alone, never across the close (which can wait on SO_LINGER,
+		// celeris#735): a driver's RegisterConn reads it, under the same
+		// lock, from its own goroutine, and the number is free to be
+		// reissued once the descriptor is closed (celeris#775).
+		l.driverMu.Lock()
+		l.conns[fd] = nil
+		l.driverMu.Unlock()
 		_ = unix.Close(fd)
 		if cs.detachMu == nil {
 			l.dropAsk(cs) // celeris#657 P8: never pool a connState an ask still names
 			releaseConnState(cs)
 		}
-		l.conns[fd] = nil
 	}
 	clear(l.liveConns)
 	l.liveConns = l.liveConns[:0]
