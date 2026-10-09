@@ -6248,6 +6248,24 @@ func (w *Worker) checkTimeouts() {
 				// cleared — the dirty-list loop skips a sending conn, so it
 				// would never unlink it either and the connState would leak
 				// through dirtyHead.
+				//
+				// A send completion held for the dispatch goroutine
+				// (celeris#750) is applied first (celeris#880): the teardown
+				// reads the conn's send state for what the kernel still owes
+				// (fdOwed, zcSendOwed), and a held completion has not changed
+				// it yet. Held again, the goroutine is back in a handler and
+				// owes a hand-back, whose drain applies it; this pass leaves
+				// the conn for the next sweep. Under no lock: handleSend
+				// takes detachMu itself, or holds the completion again.
+				if len(cs.heldSends) > 0 {
+					w.replayHeldSends(cs)
+					if w.conns[fd] != cs {
+						continue // the completion finished the close
+					}
+					if len(cs.heldSends) > 0 {
+						continue
+					}
+				}
 				w.removeDirty(cs)
 				w.finishCloseAny(fd, cs)
 			}

@@ -451,13 +451,29 @@ func fdOwed(cs *connState) bool {
 // (flushSend and flushSendLink wait out cs.sending and cs.zcNotifPending),
 // so zcNotifPending stands for exactly one op.
 //
+// The same holds for a first CQE the worker has read and holds for the
+// dispatch goroutine instead of applying (celeris#750, heldSends): the send is
+// done, zcNotifPending says so only once the completion is applied, and a
+// close that counted it as naming the descriptor kept the socket open past
+// the 5 s backstop (CloseFDForced) for an op that had ended (celeris#880).
+// Only a first CQE (F_MORE) counts: a held notification is a terminal CQE,
+// which staleConnCQE has taken off kernelInflight when it read it.
+//
 // Live connections only: a closed one's count moves in its closedOps entry
 // (closedOpsEntry.fdOps, read by closedFDNamed).
 func fdOps(cs *connState) int32 {
+	n := cs.kernelInflight
 	if cs.zcNotifPending {
-		return cs.kernelInflight - 1
+		n--
+	} else {
+		for i := range cs.heldSends {
+			if cqeHasMore(cs.heldSends[i].Flags) {
+				n--
+				break
+			}
+		}
 	}
-	return cs.kernelInflight
+	return n
 }
 
 // closedFDNamed reports whether an op the kernel still owes closed cs names
