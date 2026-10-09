@@ -186,3 +186,114 @@ func TestStreamWriterFlushH1_875(t *testing.T) {
 		}
 	}
 }
+
+// The same adapter that makes Flush a no-op on the native engines also
+// returns nil from Write (internal/conn/response.go, h1ResponseAdapter): the
+// engine's write hook has no error return, and after the connection is gone
+// it drops the bytes. So on epoll and io_uring over HTTP/1.1 neither Write nor
+// Flush reports a client that has gone away, which the streaming docs said
+// both did (celeris#494 is the SSE middleware's answer: it watches the
+// connection through the engine's callbacks). std reports it, from
+// net/http. The handler detaches (the only way to stream there), waits for the
+// client to reset the connection, then writes and flushes for a while and
+// reports the first error it saw.
+
+func TestStreamWriterWriteErrorAfterPeerGoneH1_875(t *testing.T) {
+	for _, e := range []struct {
+		name string
+		eng  celeris.EngineType
+	}{{"std", celeris.Std}, {"epoll", celeris.Epoll}, {"io_uring", celeris.IOUring}} {
+		t.Run(e.name, func(t *testing.T) {
+			gone := make(chan struct{})
+			var once sync.Once
+			goneNow := func() { once.Do(func() { close(gone) }) }
+			t.Cleanup(goneNow)
+			type result struct {
+				err    error
+				writes int
+			}
+			res := make(chan result, 1)
+			addr := startServerConfig761(t, celeris.Config{Engine: e.eng, Protocol: celeris.HTTP1}, func(s *celeris.Server) {
+				s.GET("/gone875", func(c *celeris.Context) error {
+					sw := c.StreamWriter()
+					if sw == nil {
+						return fmt.Errorf("no StreamWriter")
+					}
+					done := c.Detach()
+					run := func() {
+						defer done()
+						if err := sw.WriteHeader(200, [][2]string{{"content-type", "text/plain"}}); err != nil {
+							res <- result{err: err}
+							return
+						}
+						if _, err := sw.Write([]byte(first875)); err != nil {
+							res <- result{err: err}
+							return
+						}
+						if err := sw.Flush(); err != nil {
+							res <- result{err: err}
+							return
+						}
+						<-gone
+						time.Sleep(300 * time.Millisecond) // the engine sees the reset
+						chunk := make([]byte, 1024)
+						n := 0
+						for ; n < 80; n++ {
+							if _, err := sw.Write(chunk); err != nil {
+								res <- result{err: err, writes: n}
+								return
+							}
+							if err := sw.Flush(); err != nil {
+								res <- result{err: err, writes: n}
+								return
+							}
+							time.Sleep(25 * time.Millisecond)
+						}
+						res <- result{writes: n}
+					}
+					if c.EngineSupportsAsyncDetach() {
+						go run()
+						return nil
+					}
+					run()
+					return nil
+				})
+			})
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Write([]byte("GET /gone875 HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+				t.Fatal(err)
+			}
+			// Read until the first chunk is in, then reset the connection.
+			var got strings.Builder
+			p := make([]byte, 4096)
+			for !strings.Contains(got.String(), first875) {
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				n, rerr := conn.Read(p)
+				got.Write(p[:n])
+				if rerr != nil {
+					t.Fatalf("read before the first chunk: %v (got %q)", rerr, got.String())
+				}
+			}
+			_ = conn.(*net.TCPConn).SetLinger(0)
+			_ = conn.Close()
+			goneNow()
+
+			select {
+			case r := <-res:
+				native := e.eng != celeris.Std
+				t.Logf("%s: first write/flush error after the reset = %v, after %d writes", e.name, r.err, r.writes)
+				if native && r.err != nil {
+					t.Errorf("native Write/Flush reported the gone client: %v (after %d writes); the docs say they do not", r.err, r.writes)
+				}
+				if !native && r.err == nil {
+					t.Errorf("std Write/Flush never reported the gone client in %d writes", r.writes)
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("the handler did not finish")
+			}
+		})
+	}
+}
