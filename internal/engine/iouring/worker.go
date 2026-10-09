@@ -521,6 +521,11 @@ type Worker struct {
 	// send buffer a SEND_ZC may still read (celeris#812), and holds it off
 	// this queue instead (zcHolds).
 	pendingRelease []pendingReleaseEntry
+	// cancelSQEFull, when set (tests only), makes getCancelSQE report a full
+	// SQ ring while it returns true: the case it has to answer with no SQE,
+	// which a ring with room, and a kernel that takes every submit, never
+	// produces (celeris#869).
+	cancelSQEFull func() bool
 	// closeFDOwed counts the pendingRelease entries that still hold their
 	// descriptor open (holdsFD, celeris#685). The worker does not park
 	// while it is non-zero: the terminal CQEs those closes wait for arrive
@@ -4354,6 +4359,9 @@ func (w *Worker) cancelConnOps(fd int, cs *connState) {
 // pending SQ ring once to make room if it is full (the armHeaderTimer
 // pattern). Returns nil only if the ring is full even after the submit.
 func (w *Worker) getCancelSQE() unsafe.Pointer {
+	if w.cancelSQEFull != nil && w.cancelSQEFull() {
+		return nil
+	}
 	sqe := w.ring.GetSQE()
 	if sqe != nil {
 		return sqe
