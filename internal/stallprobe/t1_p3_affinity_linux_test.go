@@ -68,6 +68,11 @@ import (
 //	slow4  on the slowest core type (msr1: the A520s). fast4 next to slow4
 //	       separates "slow cores" from "only 4 CPUs"; compare those two.
 //
+// Cases added after run 37975655016 (19 of 19 stall snapshots had the stuck
+// loop pinned on a Cortex-A520, 0 of 19 on an A720) are described at
+// topo.extraCase: they vary how many loops sit on the slow cores, whether
+// fast CPUs without a loop are left to the client, and GOMAXPROCS.
+//
 // Engines: epoll, io_uring, adaptive (the three that failed) and std (control:
 // no loop threads, the same process shape). io_uring is where 13 of the 25
 // failing leaves of run 37949658832 were. For std, nopin is the same as all.
@@ -126,9 +131,17 @@ func engineType(name string) (celeris.EngineType, error) {
 type caseMode struct {
 	Move  []int // loop k goes to Move[k % len]
 	Unpin bool  // every loop gets the full allowed mask
+	// Plan (the extra cases, topo.extraCase): loop k, the loops in the order of
+	// the CPU the engine pinned them to, goes to Plan[k]; a negative entry
+	// leaves that loop unpinned (full mask). Keep: a loop the engine pinned to
+	// one of these CPUs stays; every other loop is unpinned.
+	Plan    []int
+	Keep    []int
+	HasPlan bool
+	HasKeep bool
 }
 
-func (m caseMode) moves() bool { return m.Unpin || len(m.Move) > 0 }
+func (m caseMode) moves() bool { return m.Unpin || len(m.Move) > 0 || m.HasPlan || m.HasKeep }
 
 type loopThread struct {
 	Tid  int
@@ -187,6 +200,18 @@ func (ls *loopSet) report(msg string, hard bool) {
 func (ls *loopSet) wanted(k int, from int) []int {
 	switch {
 	case ls.mode.Unpin:
+		return ls.full
+	case ls.mode.HasPlan:
+		if k < len(ls.mode.Plan) && ls.mode.Plan[k] >= 0 {
+			return []int{ls.mode.Plan[k]}
+		}
+		return ls.full
+	case ls.mode.HasKeep:
+		for _, c := range ls.mode.Keep {
+			if c == from {
+				return []int{from}
+			}
+		}
 		return ls.full
 	case len(ls.mode.Move) > 0:
 		return []int{ls.mode.Move[k%len(ls.mode.Move)]}
@@ -291,6 +316,26 @@ func p3Child() (any, error) {
 		}
 	}
 	mode.Unpin = os.Getenv("CELERIS_PROBE_ARG_UNPIN") == "1"
+	if v := os.Getenv("CELERIS_PROBE_ARG_PLAN"); v != "" {
+		mode.HasPlan = true
+		for _, f := range strings.Split(v, ",") {
+			if f == "u" {
+				mode.Plan = append(mode.Plan, -1)
+				continue
+			}
+			n, perr := strconv.Atoi(f)
+			if perr != nil {
+				return nil, fmt.Errorf("CELERIS_PROBE_ARG_PLAN %q: %v", v, perr)
+			}
+			mode.Plan = append(mode.Plan, n)
+		}
+	}
+	if v, ok := os.LookupEnv("CELERIS_PROBE_ARG_KEEP"); ok {
+		mode.HasKeep = true
+		if mode.Keep, err = parseCPUList(v); err != nil {
+			return nil, err
+		}
+	}
 	workers := envInt("CELERIS_PROBE_ARG_WORKERS", 0)
 	rounds := envInt("CELERIS_PROBE_ARG_ROUNDS", 1)
 	sizes, err := sizesMiB()
@@ -758,9 +803,16 @@ func TestProbeP3Affinity(t *testing.T) {
 		}
 	}
 	caseCPUs := map[string][]int{}
+	caseSpecs := map[string]caseSpec{}
 	for _, cs := range cases {
-		cpus, note, err := tp.caseCPUs(cs)
-		if err != nil {
+		var cpus []int
+		var note string
+		if sp, ok, err := tp.extraCase(cs); err != nil {
+			t.Fatalf("%v", err)
+		} else if ok {
+			caseSpecs[cs] = sp
+			cpus, note = sp.CPUs, sp.Note
+		} else if cpus, note, err = tp.caseCPUs(cs); err != nil {
 			t.Fatalf("%v", err)
 		}
 		caseCPUs[cs] = cpus
@@ -788,13 +840,47 @@ func TestProbeP3Affinity(t *testing.T) {
 			"CELERIS_PROBE_ARG_ROUNDS=" + strconv.Itoa(rounds),
 		}
 		var mask []int
-		switch cell.Case {
-		case "all":
-		case "nopin":
+		sp, isSpec := caseSpecs[cell.Case]
+		switch {
+		case isSpec:
+			mask = sp.Mask
+			if sp.Workers > 0 {
+				env = append(env, "CELERIS_PROBE_ARG_WORKERS="+strconv.Itoa(sp.Workers))
+			}
+			if sp.GOMAXPROCS > 0 {
+				env = append(env, "GOMAXPROCS="+strconv.Itoa(sp.GOMAXPROCS))
+			}
+			if sp.Plan != nil {
+				var ps []string
+				for _, c := range sp.Plan {
+					if c < 0 {
+						ps = append(ps, "u")
+					} else {
+						ps = append(ps, strconv.Itoa(c))
+					}
+				}
+				env = append(env, "CELERIS_PROBE_ARG_PLAN="+strings.Join(ps, ","))
+			}
+			if sp.Keep != nil {
+				env = append(env, "CELERIS_PROBE_ARG_KEEP="+fmtCPUs(sp.Keep))
+			}
+		case cell.Case == "all":
+		case cell.Case == "nopin":
 			env = append(env, "CELERIS_PROBE_ARG_UNPIN=1")
 		default:
 			mask = cpus
 			env = append(env, "CELERIS_PROBE_ARG_TARGET="+fmtCPUs(cpus), "CELERIS_PROBE_ARG_WORKERS="+strconv.Itoa(len(cpus)))
+		}
+		// Runtime knobs of the child, for A/B runs of the same case (run 37975655016
+		// could not exclude the Go garbage collector's stack scans or async
+		// preemption as the other party of the stall):
+		//   CELERIS_PROBE_CHILD_GOGC=<n|off>   GOGC of the child
+		//   CELERIS_PROBE_CHILD_NOASYNC=1      GODEBUG=asyncpreemptoff=1 in the child
+		if v := os.Getenv("CELERIS_PROBE_CHILD_GOGC"); v != "" {
+			env = append(env, "GOGC="+v)
+		}
+		if os.Getenv("CELERIS_PROBE_CHILD_NOASYNC") == "1" {
+			env = append(env, "GODEBUG=asyncpreemptoff=1")
 		}
 		t0 := time.Now()
 		so, se, err := runChild(childSpec{kind: "p3", env: env, mask: mask, timeout: budget})
